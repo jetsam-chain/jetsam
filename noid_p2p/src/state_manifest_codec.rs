@@ -271,7 +271,11 @@ mod tests {
             active_slot_count: 9,
             alloc_counter: 12,
             eff_log: 16,
-            bridge_tip_height: 95,
+            // ELIDE CHANGE: derived from RECENT_BLOCK_RETENTION_DEPTH instead
+            // of the literal 95. The codec rejects a bridge more than that many
+            // blocks above the tip, and the depth followed finality from 18
+            // down to 8, so 95 - 77 = 18 no longer validates.
+            bridge_tip_height: 77 + noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
             bridge_tip_hash: [0x23; 32],
             bridge_cumulative_chainwork: [0x24; 32],
             segment_ids: vec![0, 1],

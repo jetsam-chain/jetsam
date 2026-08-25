@@ -207,15 +207,18 @@ impl ChainView {
 mod tests {
     use super::*;
 
+    /// ELIDE CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
+    /// which pinned the transaction epoch length in the test name and body.
     #[test]
-    fn next_child_anchor_is_exact_at_143_144_145_boundary() {
+    fn next_child_anchor_is_exact_around_the_epoch_boundary() {
+        let epoch = noid_chain::consensus::params::TX_EPOCH_BLOCKS;
         let genesis = noid_chain::consensus::genesis::genesis_header();
         let mut boundary = genesis;
-        boundary.height = 144;
-        boundary.timestamp = boundary.timestamp.saturating_add(144);
+        boundary.height = epoch;
+        boundary.timestamp = boundary.timestamp.saturating_add(epoch);
         let genesis_id = block_id(&genesis);
         let boundary_id = block_id(&boundary);
-        let headers = HashMap::from([(0, genesis), (144, boundary)]);
+        let headers = HashMap::from([(0, genesis), (epoch, boundary)]);
 
         let view = |tip_height| {
             ChainView::new(
@@ -225,8 +228,10 @@ mod tests {
                 noid_chain::state::ChainState::with_log_slots(8).state,
             )
         };
-        assert_eq!(view(142).user_epoch_anchor_id, genesis_id); // child 143
-        assert_eq!(view(143).user_epoch_anchor_id, genesis_id); // child 144
-        assert_eq!(view(144).user_epoch_anchor_id, boundary_id); // child 145
+        // A boundary block still consumes the preceding anchor; its own id only
+        // becomes active for the block after it.
+        assert_eq!(view(epoch - 2).user_epoch_anchor_id, genesis_id);
+        assert_eq!(view(epoch - 1).user_epoch_anchor_id, genesis_id);
+        assert_eq!(view(epoch).user_epoch_anchor_id, boundary_id);
     }
 }

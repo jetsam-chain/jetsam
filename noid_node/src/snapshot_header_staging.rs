@@ -1299,34 +1299,67 @@ mod tests {
         header
     }
 
+    /// ELIDE CHANGE: every bound is derived from the consensus constants rather
+    /// than written as a literal. Upstream's 36 / 65 / 82 encoded a finality
+    /// depth of 18 and only held while finality equalled the expansion window.
     #[test]
     fn snapshot_validation_uses_only_the_depth_finalized_window() {
-        assert_eq!(consensus_window_len(), 36);
-        let window = (65..=100)
-            .map(|height| occupancy_header(height, if height <= 82 { height } else { u64::MAX }))
+        use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH as DEPTH;
+
+        let span = consensus_window_len();
+        assert_eq!(span, (DEPTH + EXPANSION_WINDOW) as usize);
+
+        // For parent 100 the finalized window ends DEPTH below the tip; the
+        // heights above it are still reorgable and must be ignored.
+        let parent = 100u64;
+        let last_finalized = parent - DEPTH;
+        let first_in_deque = parent - span as u64 + 1;
+        let window = (first_in_deque..=parent)
+            .map(|height| {
+                occupancy_header(
+                    height,
+                    if height <= last_finalized {
+                        height
+                    } else {
+                        u64::MAX
+                    },
+                )
+            })
             .collect::<VecDeque<_>>();
 
-        let (counts, len) = finalized_active_counts_for_parent(100, &window).unwrap();
+        let (counts, len) = finalized_active_counts_for_parent(parent, &window).unwrap();
         assert_eq!(len, EXPANSION_WINDOW as usize);
-        assert_eq!(&counts[..len], &(65..=82).collect::<Vec<_>>());
+        let expected_first = last_finalized - (EXPANSION_WINDOW - 1);
+        assert_eq!(
+            &counts[..len],
+            &(expected_first..=last_finalized).collect::<Vec<_>>()
+        );
         assert!(
             !counts[..len].contains(&u64::MAX),
             "unfinalized tip values must not enter the expansion decision"
         );
     }
 
+    /// ELIDE CHANGE: bounds derived from `EXPANSION_HEADER_LOOKBACK` instead of
+    /// the literals 34 and 66.
     #[test]
     fn snapshot_validation_requires_the_complete_finalized_window() {
-        let early = (0..=34)
+        use noid_chain::consensus::params::EXPANSION_HEADER_LOOKBACK as LOOKBACK;
+
+        // One height below the first parent that can have a complete window.
+        let too_early = LOOKBACK - 1;
+        let early = (0..=too_early)
             .map(|height| occupancy_header(height, u64::MAX))
             .collect::<VecDeque<_>>();
-        let (_, len) = finalized_active_counts_for_parent(34, &early).unwrap();
+        let (_, len) = finalized_active_counts_for_parent(too_early, &early).unwrap();
         assert_eq!(len, 0);
 
-        let incomplete = (66..=100)
+        // A deque that starts one height too late cannot cover the window.
+        let parent = 100u64;
+        let incomplete = (parent - consensus_window_len() as u64 + 2..=parent)
             .map(|height| occupancy_header(height, height))
             .collect::<VecDeque<_>>();
-        assert!(finalized_active_counts_for_parent(100, &incomplete).is_err());
+        assert!(finalized_active_counts_for_parent(parent, &incomplete).is_err());
     }
 
     fn fixture_chain() -> &'static [BlockHeader] {
@@ -1350,9 +1383,9 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    // ELIDE: re-mined after the parent-anchored ASERT change
-                    // hardened this fixture's target (was 58_902 upstream).
-                    nonce: 1_185_295,
+                    // ELIDE: re-mined after the parent-anchored ASERT change and the
+                    // 90s block time, both of which move this fixture's target (58_902 upstream).
+                    nonce: 359_142,
                     // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
                     difficulty_target: next_target(
                         anchor_height,
@@ -1411,9 +1444,9 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        // ELIDE: re-mined after the parent-anchored ASERT change hardened this
+        // ELIDE: re-mined after the parent-anchored ASERT change and the hardened this
         // fixture's target (was 382_055 upstream).
-        .into_block(135_365)
+        .into_block(422_266)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a
