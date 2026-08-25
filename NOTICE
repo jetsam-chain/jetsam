@@ -21,3 +21,30 @@ https://github.com/bcc-research/bolt-rs
 
 Copyright (c) 2026 Bain Capital Crypto, LP and Ron Rothblum
 Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
+
+-------------------------------------------------------------------------------
+
+Elide
+Copyright 2026 trace.protocol
+
+Elide is a derivative work of Parano1d (above), used under the Apache License,
+Version 2.0. The original copyright notices, license and attributions are
+retained in full and are NOT superseded by this section.
+
+Elide is an independent network. It is not endorsed by, affiliated with, or
+supported by Paranoid Zero or Ignotus Nemo.
+
+A complete description of the modifications made to the upstream work is
+maintained in CHANGES-FROM-UPSTREAM.md, as required by section 4(b) of the
+Apache License, Version 2.0.
+
+The proof-of-work function used by Elide is named TowerHash. TowerHash is built
+on the Poseidon2b permutation over binary tower fields, published as:
+
+  "Poseidon(2)b: Binary Field Versions of Poseidon/Poseidon2"
+  Lorenzo Grassi et al., IACR ePrint 2025/1893
+  https://eprint.iacr.org/2025/1893
+
+Elide instantiates that permutation with its own round constants, domain
+separation tags, sponge schedule and nonce lane. The permutation itself is
+unmodified in structure; Elide does not claim to have designed it.

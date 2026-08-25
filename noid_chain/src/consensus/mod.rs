@@ -50,6 +50,7 @@ pub mod fees;
 pub mod fork_choice;
 pub mod genesis;
 pub mod header;
+pub mod identity;
 pub mod params;
 pub mod pow;
 pub mod receipt;
