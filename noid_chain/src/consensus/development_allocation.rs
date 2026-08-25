@@ -3,12 +3,19 @@
 
 //! Deterministic launch-period development allocation.
 //!
-//! For the first three target-time years after genesis, miners receive 90% of
-//! each block subsidy. O(1) Network Fund and ParanO(1)d Lab each receive one
-//! mandatory daily payout calculated from the reward tier active in the payout
-//! block. A state expansion during that day can therefore make the effective
-//! fund share smaller than 5%; the difference is never issued. Fees remain
-//! entirely miner-claimable after the existing state-growth burn.
+//! ELIDE CHANGE: two target-time years, not three, and the recipients are this
+//! chain's own funds — upstream's were inherited by the fork and would have
+//! sent 10% of Elide's emission to Parano1d's developers.
+//!
+//! For the first two target-time years after genesis, miners receive 90% of
+//! each block subsidy. The network fund and the lab fund each receive one
+//! mandatory daily payout, calculated from the reward tier active in the payout
+//! block. A halving during that day can therefore make the effective fund share
+//! smaller than 5%; the difference is never issued. Fees remain entirely
+//! miner-claimable after the existing state-growth burn.
+//!
+//! Over the whole window the two funds receive 1 163 996 ELD, which is 5.54% of
+//! the 21 000 000 maximum supply. There is no premine.
 
 use noid_poseidon2b::primitives::Address;
 
@@ -50,26 +57,28 @@ pub const DEVELOPMENT_ALLOCATION_PAYOUTS: u64 =
 /// One maximum fund share is one twentieth (5%) of the block subsidy.
 pub const DEVELOPMENT_SHARE_DENOMINATOR: u64 = 20;
 
-/// 🚨 ELIDE LAUNCH BLOCKER — THIS IS STILL AN UPSTREAM PARANO1D ADDRESS. 🚨
+/// Network fund recipient.
 ///
-/// This constant is inherited verbatim from the upstream fork base. As long as
-/// it is unchanged, 10% of every Elide block subsidy for the first two years is
-/// paid to Parano1d's development funds, not to this chain's.
+/// ELIDE CHANGE: replaces the upstream Parano1d fund address. Derived from a
+/// 32-byte secret generated with OS entropy and held by this chain's operator;
+/// see `noid_poseidon2b/tests/derive_fund_address.rs` for the derivation, which
+/// is reproducible from the secret alone.
 ///
-/// Replace with an address whose key this chain controls, back the wallet up
-/// per the operator's key-handling rule, and only then launch. The test
-/// `fund_addresses_are_not_upstream` below fails on purpose until that is done.
-///
-/// O(1) Network Fund recipient (UPSTREAM — REPLACE).
-pub const O1_NETWORK_FUND_ADDRESS: Address = Address([
-    0x1c, 0x5b, 0x23, 0x74, 0x54, 0xad, 0xab, 0xeb, 0x0e, 0x95, 0x37, 0xb5, 0x87, 0x02, 0xd7, 0xfe,
-    0x8c, 0x0e, 0x63, 0x30, 0xc3, 0x0b, 0x58, 0xee, 0x9b, 0x3f, 0x19, 0x8a, 0x3b, 0x46, 0xf6, 0x78,
+/// bech32: e1mdes8q5qnlvy8nv548pzwcul42jwvkqp855m4l6jum73slqmv7fqkvdamq
+pub const NETWORK_FUND_ADDRESS: Address = Address([
+    0xdb, 0x73, 0x03, 0x82, 0x80, 0x9f, 0xd8, 0x43, 0xcd, 0x94, 0xa9, 0xc2, 0x27, 0x63, 0x9f, 0xaa,
+    0xa4, 0xe6, 0x58, 0x01, 0x3d, 0x29, 0xba, 0xff, 0x52, 0xe6, 0xfd, 0x18, 0x7c, 0x1b, 0x67, 0x92,
 ]);
 
-/// ParanO(1)d Lab recipient.
-pub const PARANO1D_LAB_ADDRESS: Address = Address([
-    0x36, 0x24, 0xd0, 0xc7, 0x8d, 0x0d, 0x20, 0x87, 0x61, 0x93, 0xdc, 0xbf, 0xc2, 0xc2, 0x91, 0xe5,
-    0x52, 0x6a, 0x6e, 0x37, 0x08, 0x38, 0xc4, 0x3f, 0x99, 0xda, 0x82, 0x35, 0x6c, 0x63, 0x2b, 0x40,
+/// Lab fund recipient.
+///
+/// ELIDE CHANGE: replaces the upstream Parano1d lab address. Same derivation
+/// path as [`NETWORK_FUND_ADDRESS`], from a distinct secret.
+///
+/// bech32: e1eawk89x66rgp342aq2f9asrkdllfvasskkcd7wpk6r08ea07warqjgaj37
+pub const LAB_FUND_ADDRESS: Address = Address([
+    0xcf, 0x5d, 0x63, 0x94, 0xda, 0xd0, 0xd0, 0x18, 0xd5, 0x5d, 0x02, 0x92, 0x5e, 0xc0, 0x76, 0x6f,
+    0xfe, 0x96, 0x76, 0x10, 0xb5, 0xb0, 0xdf, 0x38, 0x36, 0xd0, 0xde, 0x7c, 0xf5, 0xfe, 0x77, 0x46,
 ]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +210,7 @@ mod tests {
     /// the HRP into the test.
     #[test]
     fn mainnet_fund_addresses_are_canonical() {
-        for address in [O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS] {
+        for address in [NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS] {
             let encoded = address.to_bech32();
             let prefix = format!("{}1", noid_poseidon2b::primitives::ADDRESS_HRP);
             assert!(
@@ -225,11 +234,11 @@ mod tests {
     #[test]
     fn fund_addresses_are_not_upstream() {
         assert_ne!(
-            O1_NETWORK_FUND_ADDRESS.0, UPSTREAM_O1_NETWORK_FUND,
+            NETWORK_FUND_ADDRESS.0, UPSTREAM_O1_NETWORK_FUND,
             "network fund still pays the upstream Parano1d fund — replace it before launch"
         );
         assert_ne!(
-            PARANO1D_LAB_ADDRESS.0, UPSTREAM_PARANO1D_LAB,
+            LAB_FUND_ADDRESS.0, UPSTREAM_PARANO1D_LAB,
             "lab fund still pays the upstream Parano1d lab — replace it before launch"
         );
     }

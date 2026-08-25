@@ -1328,12 +1328,12 @@ mod tests {
                 TxOutput {
                     slot_index: 5,
                     amount: 10,
-                    owner: crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS,
+                    owner: crate::consensus::development_allocation::NETWORK_FUND_ADDRESS,
                 },
                 TxOutput {
                     slot_index: 6,
                     amount: 10,
-                    owner: crate::consensus::development_allocation::PARANO1D_LAB_ADDRESS,
+                    owner: crate::consensus::development_allocation::LAB_FUND_ADDRESS,
                 },
             ],
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),

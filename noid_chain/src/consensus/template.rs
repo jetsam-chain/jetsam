@@ -513,7 +513,7 @@ fn build_block_template_with_post_state(
     difficulty_target: Digest,
 ) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
     use crate::consensus::development_allocation::{
-        development_allocation, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
+        development_allocation, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
     };
     use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::fee_breakdown;
@@ -713,12 +713,12 @@ fn build_block_template_with_post_state(
                 TxOutput {
                     slot_index: network_slot,
                     amount,
-                    owner: O1_NETWORK_FUND_ADDRESS,
+                    owner: NETWORK_FUND_ADDRESS,
                 },
                 TxOutput {
                     slot_index: lab_slot,
                     amount,
-                    owner: PARANO1D_LAB_ADDRESS,
+                    owner: LAB_FUND_ADDRESS,
                 },
             ],
             validity_bitmap: noid_tx::output_bitmap_bit(0) | noid_tx::output_bitmap_bit(1),
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn due_template_builds_the_mandatory_two_recipient_payout() {
         use crate::consensus::development_allocation::{
-            development_share_each, miner_subsidy, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
+            development_share_each, miner_subsidy, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
             TARGET_BLOCKS_PER_DAY,
         };
         use crate::consensus::emission::block_reward;
@@ -891,8 +891,8 @@ mod tests {
             .development_payout
             .as_ref()
             .expect("daily payout is mandatory");
-        assert_eq!(payout.body.outputs[0].owner, O1_NETWORK_FUND_ADDRESS);
-        assert_eq!(payout.body.outputs[1].owner, PARANO1D_LAB_ADDRESS);
+        assert_eq!(payout.body.outputs[0].owner, NETWORK_FUND_ADDRESS);
+        assert_eq!(payout.body.outputs[1].owner, LAB_FUND_ADDRESS);
         assert_eq!(payout.body.outputs[0].amount, share * TARGET_BLOCKS_PER_DAY);
         assert_eq!(payout.body.outputs[1].amount, share * TARGET_BLOCKS_PER_DAY);
         assert_eq!(

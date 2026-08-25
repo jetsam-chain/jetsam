@@ -486,12 +486,12 @@ mod tests {
                 TxOutput {
                     slot_index,
                     amount: 500,
-                    owner: noid_chain::consensus::O1_NETWORK_FUND_ADDRESS,
+                    owner: noid_chain::consensus::NETWORK_FUND_ADDRESS,
                 },
                 TxOutput {
                     slot_index: slot_index + 1,
                     amount: 500,
-                    owner: noid_chain::consensus::PARANO1D_LAB_ADDRESS,
+                    owner: noid_chain::consensus::LAB_FUND_ADDRESS,
                 },
             ],
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn incremental_scan_assigns_normal_ids_to_development_payout_outputs() {
-        let owner = noid_chain::consensus::O1_NETWORK_FUND_ADDRESS;
+        let owner = noid_chain::consensus::NETWORK_FUND_ADDRESS;
         let block = block(
             vec![
                 transaction(true, 10, owner),

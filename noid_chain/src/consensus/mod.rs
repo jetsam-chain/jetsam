@@ -68,7 +68,7 @@ pub use development_allocation::{
     development_allocation, development_allocation_active, development_payout_due,
     development_share_each, miner_subsidy, DevelopmentAllocation, DevelopmentAllocationError,
     DEVELOPMENT_ALLOCATION_END_HEIGHT, DEVELOPMENT_ALLOCATION_PAYOUTS,
-    DEVELOPMENT_SHARE_DENOMINATOR, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
+    DEVELOPMENT_SHARE_DENOMINATOR, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
     TARGET_BLOCKS_PER_DAY,
 };
 pub use difficulty::{
