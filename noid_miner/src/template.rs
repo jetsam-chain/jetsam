@@ -325,13 +325,19 @@ impl TemplateBuilder {
 
         // Compute the correct ASERT target for the new block.
         // MUST match what validate_header computes; wrong target = block rejected.
+        //
+        // ELIDE CHANGE (vs upstream Parano1d): ASERT is fed `parent.timestamp`,
+        // not this block's `timestamp`. See the matching comment in
+        // noid_chain::consensus::header::validate_header_inner. The two sites
+        // MUST stay identical: a mismatch produces templates whose target the
+        // network rejects.
         let anchor = &snapshot.anchor;
         let difficulty_target = next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height + 1,
-            timestamp,
+            parent.timestamp,
         );
 
         // Select top txs from mempool (coinbase is added separately by the chain template).

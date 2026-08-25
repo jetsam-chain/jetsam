@@ -175,12 +175,25 @@ fn validate_header_inner(
     }
 
     // 3. Difficulty target matches ASERT expectation.
+    //
+    // ELIDE CHANGE (vs upstream Parano1d): the elapsed time fed to ASERT is the
+    // PARENT's timestamp, never the block's own. Upstream passed
+    // `header.timestamp` here, which let a miner set the fork-choice weight of
+    // its own block through a field it chooses freely: dating a block at
+    // `parent + 1` shrinks `actual`, hardens the target, and — since
+    // `block_work = 2^256 / target` — makes the block heavier. Weight per block
+    // scales as 2^((ideal - actual) / HALFLIFE), so at HALFLIFE = 6 * BLOCK_TIME
+    // a block dated 19 s early carries ~11.6% more weight.
+    //
+    // Anchoring on the parent removes that degree of freedom, and matches the
+    // reference ASERT construction (BCH aserti3-2d), which evaluates elapsed
+    // time at `pindexPrev`, not at the block under validation.
     let expected_target = next_target(
         anchor_height,
         anchor_timestamp,
         anchor_target,
         header.height,
-        header.timestamp,
+        parent.timestamp,
     );
     if header.difficulty_target != expected_target {
         return Err(ConsensusError::BadDifficultyTarget);
@@ -241,6 +254,15 @@ mod tests {
 
     fn make_header(height: u64, timestamp: u64, parent: Option<&BlockHeader>) -> BlockHeader {
         let prev_hash = parent.map(block_id).unwrap_or([0u8; 32]);
+        // ELIDE CHANGE: the target is now anchored on the parent's timestamp, so
+        // a child can no longer carry the trivial TEST_TARGET verbatim — it must
+        // carry exactly what `validate_header_inner` will recompute. Every test
+        // in this module anchors on the genesis block and builds height-1
+        // children, so the anchor is (0, parent.timestamp, TEST_TARGET).
+        let difficulty_target = match parent {
+            Some(p) => next_target(0, p.timestamp, &TEST_TARGET, height, p.timestamp),
+            None => TEST_TARGET,
+        };
         BlockHeader {
             prev_block_hash: prev_hash,
             state_root: [0u8; 32],
@@ -249,7 +271,7 @@ mod tests {
             height,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: TEST_TARGET,
+            difficulty_target,
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -257,9 +279,12 @@ mod tests {
     }
 
     fn mine(header: &mut BlockHeader) {
-        // TEST_TARGET: nonce=0 trivially satisfies any target of [0xFF;32].
-        // search_pow(header, 0, 1) would always return Some(0).
-        header.nonce = 0;
+        // ELIDE CHANGE: upstream hardcoded nonce = 0, relying on the child
+        // carrying [0xFF;32]. With the parent-anchored target the child's target
+        // is slightly harder than trivial (actual < ideal on the first block
+        // after the anchor), so nonce 0 is no longer guaranteed to satisfy it.
+        header.nonce = crate::consensus::pow::search_pow(header, 0, 1 << 20)
+            .expect("near-trivial test target is found well within 2^20 nonces");
     }
 
     #[test]
@@ -354,6 +379,56 @@ mod tests {
             &genesis.difficulty_target,
         )
         .is_ok());
+    }
+
+    /// ELIDE — the invariant that closes the upstream weight-grinding vector.
+    ///
+    /// Two blocks with the same parent and the same height must be assigned the
+    /// SAME difficulty target, whatever timestamp their miner chose. Upstream
+    /// derived the target from `header.timestamp`, so a miner could harden its
+    /// own target — and therefore raise its own fork-choice weight — by dating
+    /// the block early.
+    #[test]
+    fn difficulty_target_is_anchored_on_parent_not_on_self() {
+        let genesis = make_header(0, 1_000_000, None);
+
+        // Same parent, same height, deliberately distant timestamps.
+        let mut early = make_header(1, genesis.timestamp + 1, Some(&genesis));
+        let mut late = make_header(1, genesis.timestamp + 90, Some(&genesis));
+
+        assert_eq!(
+            early.difficulty_target, late.difficulty_target,
+            "two children of one parent must share a single target"
+        );
+
+        mine(&mut early);
+        mine(&mut late);
+        let previous = [genesis.timestamp];
+
+        for (label, child) in [("early", &early), ("late", &late)] {
+            assert!(
+                validate_header_timeless(
+                    child,
+                    &genesis,
+                    &previous,
+                    &[],
+                    0,
+                    genesis.timestamp,
+                    &genesis.difficulty_target,
+                )
+                .is_ok(),
+                "{label} child must accept the parent-anchored target"
+            );
+        }
+
+        // Document precisely what was removed: under the upstream rule the two
+        // children would have been handed different targets, hence different
+        // fork-choice weights, for a field the miner picks freely.
+        assert_ne!(
+            next_target(0, genesis.timestamp, &TEST_TARGET, 1, early.timestamp),
+            next_target(0, genesis.timestamp, &TEST_TARGET, 1, late.timestamp),
+            "upstream rule: target tracked the block's own timestamp"
+        );
     }
 
     #[test]

@@ -2811,12 +2811,16 @@ mod tests {
         let parent = *context.tip_header();
         let timestamp = parent.timestamp.saturating_add(1);
         let anchor = context.anchor_info();
+        // ELIDE CHANGE: ASERT is anchored on the parent's timestamp, never on
+        // the block's own. This helper must feed `next_target` exactly what
+        // `validate_header_inner` will, or every block it builds is rejected
+        // with BadDifficultyTarget.
         let target = crate::consensus::next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height.saturating_add(1),
-            timestamp,
+            parent.timestamp,
         );
         let finalized_active_counts = context.finalized_active_counts().unwrap();
         let (template, _) = crate::consensus::template::build_node_owned_block_template(

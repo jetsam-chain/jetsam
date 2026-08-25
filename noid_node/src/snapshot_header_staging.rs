@@ -1350,13 +1350,16 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 58_902,
+                    // ELIDE: re-mined after the parent-anchored ASERT change
+                    // hardened this fixture's target (was 58_902 upstream).
+                    nonce: 1_185_295,
+                    // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
                         &anchor.difficulty_target,
                         height,
-                        timestamp,
+                        parent.timestamp,
                     ),
                     log_slots: parent.log_slots,
                     active_slot_count: parent.active_slot_count,
@@ -1389,12 +1392,13 @@ mod tests {
         let parent = *chain.tip_header();
         let timestamp = parent.timestamp + BLOCK_TIME;
         let anchor = chain.anchor_info();
+        // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
         let difficulty_target = next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height + 1,
-            timestamp,
+            parent.timestamp,
         );
         noid_chain::consensus::build_block_template(
             &parent,
@@ -1407,7 +1411,9 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        .into_block(382_055)
+        // ELIDE: re-mined after the parent-anchored ASERT change hardened this
+        // fixture's target (was 382_055 upstream).
+        .into_block(135_365)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a

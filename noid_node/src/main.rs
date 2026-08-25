@@ -6506,12 +6506,14 @@ mod tests {
         state: &noid_chain::ChainState,
     ) -> noid_chain::block::Block {
         let timestamp = parent.timestamp + noid_chain::consensus::params::BLOCK_TIME;
+        // ELIDE CHANGE: ASERT anchored on the parent's timestamp, never the
+        // block's own. Must mirror consensus::header::validate_header_inner.
         let difficulty_target = noid_chain::consensus::difficulty::next_target(
             0,
             parent.timestamp,
             &parent.difficulty_target,
             parent.height + 1,
-            timestamp,
+            parent.timestamp,
         );
         let template = noid_chain::consensus::build_block_template(
             parent,
