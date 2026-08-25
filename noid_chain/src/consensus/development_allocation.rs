@@ -33,7 +33,17 @@ pub const DEVELOPMENT_ALLOCATION_PAYOUTS: u64 =
 /// One maximum fund share is one twentieth (5%) of the block subsidy.
 pub const DEVELOPMENT_SHARE_DENOMINATOR: u64 = 20;
 
-/// O(1) Network Fund recipient.
+/// 🚨 ELIDE LAUNCH BLOCKER — THIS IS STILL AN UPSTREAM PARANO1D ADDRESS. 🚨
+///
+/// This constant is inherited verbatim from the upstream fork base. As long as
+/// it is unchanged, 10% of every Elide block subsidy for the first two years is
+/// paid to Parano1d's development funds, not to this chain's.
+///
+/// Replace with an address whose key this chain controls, back the wallet up
+/// per the operator's key-handling rule, and only then launch. The test
+/// `fund_addresses_are_not_upstream` below fails on purpose until that is done.
+///
+/// O(1) Network Fund recipient (UPSTREAM — REPLACE).
 pub const O1_NETWORK_FUND_ADDRESS: Address = Address([
     0x1c, 0x5b, 0x23, 0x74, 0x54, 0xad, 0xab, 0xeb, 0x0e, 0x95, 0x37, 0xb5, 0x87, 0x02, 0xd7, 0xfe,
     0x8c, 0x0e, 0x63, 0x30, 0xc3, 0x0b, 0x58, 0xee, 0x9b, 0x3f, 0x19, 0x8a, 0x3b, 0x46, 0xf6, 0x78,
@@ -151,15 +161,57 @@ mod tests {
     use super::*;
     use crate::consensus::params::{LOG_SLOTS_GENESIS, LOG_SLOTS_MAX};
 
+    /// Upstream Parano1d fund addresses, recorded here so the guard below can
+    /// recognise them. These bytes must NOT appear in a launched Elide chain.
+    const UPSTREAM_O1_NETWORK_FUND: [u8; 32] = [
+        0x1c, 0x5b, 0x23, 0x74, 0x54, 0xad, 0xab, 0xeb, 0x0e, 0x95, 0x37, 0xb5, 0x87, 0x02, 0xd7,
+        0xfe, 0x8c, 0x0e, 0x63, 0x30, 0xc3, 0x0b, 0x58, 0xee, 0x9b, 0x3f, 0x19, 0x8a, 0x3b, 0x46,
+        0xf6, 0x78,
+    ];
+    const UPSTREAM_PARANO1D_LAB: [u8; 32] = [
+        0x36, 0x24, 0xd0, 0xc7, 0x8d, 0x0d, 0x20, 0x87, 0x61, 0x93, 0xdc, 0xbf, 0xc2, 0xc2, 0x91,
+        0xe5, 0x52, 0x6a, 0x6e, 0x37, 0x08, 0x38, 0xc4, 0x3f, 0x99, 0xda, 0x82, 0x35, 0x6c, 0x63,
+        0x2b, 0x40,
+    ];
+
+    /// Addresses must round-trip through the chain's own bech32m HRP.
+    ///
+    /// ELIDE CHANGE: upstream asserted two hardcoded `o1…` literals, which
+    /// silently coupled this test to the address prefix. Deriving the expected
+    /// value from the constant itself tests canonicality without re-encoding
+    /// the HRP into the test.
     #[test]
     fn mainnet_fund_addresses_are_canonical() {
-        assert_eq!(
-            O1_NETWORK_FUND_ADDRESS.to_bech32(),
-            "o1r3djxaz54k47kr54x76cwqkhl6xqucescv943m5m8uvc5w6x7euqct3h07"
+        for address in [O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS] {
+            let encoded = address.to_bech32();
+            let prefix = format!("{}1", noid_poseidon2b::primitives::ADDRESS_HRP);
+            assert!(
+                encoded.starts_with(&prefix),
+                "fund address must use this chain's HRP: {encoded}"
+            );
+            assert_eq!(
+                Address::parse(&encoded).expect("fund address round-trips"),
+                address
+            );
+        }
+    }
+
+    /// 🚨 LAUNCH BLOCKER — expected to FAIL until the fund addresses are ours.
+    ///
+    /// The development allocation pays 10% of every subsidy for two years. The
+    /// recipients are inherited from the fork base, so until they are replaced
+    /// this chain would fund Parano1d's developers out of its own emission.
+    /// This test is the guard: it is not `#[ignore]`d, because an ignored test
+    /// is a forgotten test, and this one must be impossible to miss.
+    #[test]
+    fn fund_addresses_are_not_upstream() {
+        assert_ne!(
+            O1_NETWORK_FUND_ADDRESS.0, UPSTREAM_O1_NETWORK_FUND,
+            "network fund still pays the upstream Parano1d fund — replace it before launch"
         );
-        assert_eq!(
-            PARANO1D_LAB_ADDRESS.to_bech32(),
-            "o1xcjdp3udp5sgwcvnmjlu9s53u4fx5m3hpquvg0uem2pr2mrr9dqq38jple"
+        assert_ne!(
+            PARANO1D_LAB_ADDRESS.0, UPSTREAM_PARANO1D_LAB,
+            "lab fund still pays the upstream Parano1d lab — replace it before launch"
         );
     }
 

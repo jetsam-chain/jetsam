@@ -78,16 +78,20 @@ newtype_digest!(
 // Bech32m encoding for Address
 // ---------------------------------------------------------------------------
 
-/// Human-readable part for Paranoid bech32m addresses.
-/// Produces addresses of the form `o1q...` (~60 chars).
-pub const ADDRESS_HRP: &str = "o";
+/// Human-readable part for Elide bech32m addresses.
+/// Produces addresses of the form `e1q...` (~60 chars).
+///
+/// ELIDE CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Elide uses
+/// `"e"` so that an address cannot be silently mistaken between the two
+/// networks — a mis-sent coinbase is unrecoverable.
+pub const ADDRESS_HRP: &str = "e";
 
 /// Error returned when decoding a bech32m address fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
     /// String is not a valid bech32m address.
     InvalidFormat,
-    /// Bech32m decoded OK but HRP is not `o`.
+    /// Bech32m decoded OK but HRP is not `e`.
     WrongHrp(String),
     /// Decoded payload is not exactly 32 bytes.
     WrongLength(usize),
@@ -96,8 +100,14 @@ pub enum AddressError {
 impl std::fmt::Display for AddressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidFormat => write!(f, "invalid address format (expected bech32m o1…)"),
-            Self::WrongHrp(h) => write!(f, "wrong address network: got '{h}', expected 'o'"),
+            Self::InvalidFormat => write!(
+                f,
+                "invalid address format (expected bech32m {ADDRESS_HRP}1…)"
+            ),
+            Self::WrongHrp(h) => write!(
+                f,
+                "wrong address network: got '{h}', expected '{ADDRESS_HRP}'"
+            ),
             Self::WrongLength(n) => write!(f, "wrong address length: got {n} bytes, expected 32"),
         }
     }
@@ -105,17 +115,17 @@ impl std::fmt::Display for AddressError {
 impl std::error::Error for AddressError {}
 
 impl Address {
-    /// Encode this address as a bech32m string (`o1…`).
+    /// Encode this address as a bech32m string (`e1…`).
     ///
     /// This is the canonical display format. All user-facing output should
     /// call this or use the `Display` impl.
     pub fn to_bech32(&self) -> String {
         use bech32::{Bech32m, Hrp};
-        let hrp = Hrp::parse(ADDRESS_HRP).expect("o is a valid HRP");
+        let hrp = Hrp::parse(ADDRESS_HRP).expect("the chain HRP is a valid bech32m HRP");
         bech32::encode::<Bech32m>(hrp, &self.0).expect("32 bytes always encodes")
     }
 
-    /// Decode an address from canonical bech32m (`o1…`).
+    /// Decode an address from canonical bech32m (`e1…`).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
         parse_address(s)
     }
@@ -459,10 +469,17 @@ mod tests {
             0x23, 0xaf, 0xcd, 0xb2,
         ]);
         let encoded = addr.to_bech32();
-        // Must start with o1
+        // ELIDE: assert against the constant rather than a literal, so the
+        // prefix and the test can never drift apart again.
+        let expected_prefix = format!("{ADDRESS_HRP}1");
         assert!(
-            encoded.starts_with("o1"),
-            "expected o1 prefix, got {encoded}"
+            encoded.starts_with(&expected_prefix),
+            "expected {expected_prefix} prefix, got {encoded}"
+        );
+        // An Elide address must not be parseable as an upstream Parano1d one.
+        assert!(
+            !encoded.starts_with("o1"),
+            "address must not carry the upstream HRP"
         );
         // Must be exactly 60 chars (1 HRP + 52 data + 6 checksum + separator)
         assert_eq!(
