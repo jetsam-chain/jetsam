@@ -274,7 +274,6 @@ pub fn validate_mandatory_coinbase(
 
     let allocation = crate::consensus::development_allocation::development_allocation(
         block.header.height,
-        block.header.log_slots,
     )
     .map_err(|_| ConsensusError::BadDevelopmentPayout)?;
 
@@ -440,7 +439,6 @@ fn validate_block_checks_inner(
                 .amount;
             let max_allowed = max_coinbase_value_from_claimable_fee_sum(
                 block.header.height,
-                block.header.log_slots,
                 claimable_fee_sum,
             );
             if u128::from(cb_value) > max_allowed {
@@ -510,7 +508,6 @@ pub fn validate_block_consensus(
 
             let max_allowed = max_coinbase_value_from_claimable_fee_sum(
                 block.header.height,
-                block.header.log_slots,
                 claimable_fee_sum,
             );
             if u128::from(cb_value) > max_allowed {
@@ -715,8 +712,8 @@ mod tests {
         use crate::consensus::emission::block_reward;
 
         let parent = header(TARGET_BLOCKS_PER_DAY - 1);
-        let share = development_share_each(block_reward(parent.log_slots)).unwrap();
-        let allocation = development_allocation(TARGET_BLOCKS_PER_DAY, parent.log_slots).unwrap();
+        let share = development_share_each(block_reward(TARGET_BLOCKS_PER_DAY)).unwrap();
+        let allocation = development_allocation(TARGET_BLOCKS_PER_DAY).unwrap();
         let amount = allocation.payout_each.unwrap();
         let block = Block {
             header: header(TARGET_BLOCKS_PER_DAY),

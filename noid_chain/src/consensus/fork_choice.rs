@@ -111,12 +111,16 @@ mod tests {
         );
     }
 
+    /// ELIDE CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of literal
+    /// 17/18/19, so the test follows the constant rather than pinning it.
     #[test]
     fn reorg_within_finality_allowed() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH as DEPTH;
         assert!(reorg_allowed(0));
-        assert!(reorg_allowed(17));
-        assert!(reorg_allowed(18)); // preserve the finalized ancestor, replace 18 descendants
-        assert!(!reorg_allowed(19));
+        assert!(reorg_allowed(DEPTH - 1));
+        // Preserve the finalized ancestor, replace DEPTH descendants.
+        assert!(reorg_allowed(DEPTH));
+        assert!(!reorg_allowed(DEPTH + 1));
         assert!(!reorg_allowed(100));
     }
 

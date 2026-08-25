@@ -18,9 +18,14 @@ use super::{
 };
 
 const HEIGHT_BITS: usize = 64;
-const QUOTIENT_BITS: usize = 57;
-const REMAINDER_BITS: usize = 8;
-const _: () = assert!(TX_EPOCH_BLOCKS == 144);
+const QUOTIENT_BITS: usize = 59;
+/// Wide enough to hold `TX_EPOCH_BLOCKS` itself and any remainder below it.
+const REMAINDER_BITS: usize = 6;
+/// ELIDE CHANGE: 32, was 144. Being a power of two, the recomposition below
+/// costs one shift instead of two shifts plus a carry-safe addition.
+const _: () = assert!(TX_EPOCH_BLOCKS == 32);
+const _: () = assert!(TX_EPOCH_BLOCKS < (1 << REMAINDER_BITS));
+const _: () = assert!(QUOTIENT_BITS + 5 <= HEIGHT_BITS);
 
 /// Constrained transaction-epoch decomposition.
 ///
@@ -75,11 +80,11 @@ fn constrain_tx_epoch_boundary_with_decomposition(
     let epoch_bits = range_check_bits(b, &epoch, REMAINDER_BITS);
     pin_lt_strict(b, &remainder_bits, &epoch_bits);
 
-    // 144*q = (q << 7) + (q << 4), with integer carries and no u64 overflow.
-    let q_times_128 = shifted_integer_from_bits(&quotient_bits, 7);
-    let q_times_16 = shifted_integer_from_bits(&quotient_bits, 4);
-    let q_times_144 = integer_add_no_overflow(b, &q_times_128, &q_times_16, HEIGHT_BITS);
-    let recomposed = integer_add_no_overflow(b, &q_times_144, &remainder, HEIGHT_BITS);
+    // ELIDE CHANGE: 32*q = q << 5, a single shift. Upstream's 144 needed
+    // (q << 7) + (q << 4) and a carry-safe addition to combine them; a
+    // power-of-two epoch removes that addition from the circuit entirely.
+    let q_times_32 = shifted_integer_from_bits(&quotient_bits, 5);
+    let recomposed = integer_add_no_overflow(b, &q_times_32, &remainder, HEIGHT_BITS);
     pin_eq(b, height, &recomposed);
 
     // For boolean remainder bits, this product is one exactly for r=0.

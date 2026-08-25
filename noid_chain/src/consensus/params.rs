@@ -8,13 +8,26 @@
 /// ASERT adjusts PoW difficulty so all hardware converges to this target.
 /// Bounded below by `prove_block_time` on the miner's hardware; PoW is
 /// ordering-only, not security-critical.
-pub const BLOCK_TIME: u64 = 20;
+/// ELIDE CHANGE: 90 s, up from upstream's 20 s.
+///
+/// Three independent constraints converge on this value:
+///   1. the 21M schedule at 50 ELD/block requires ~90 s blocks;
+///   2. the recursive prover needs 7–35 s per template — at 20 s a miner sits
+///      idle for a large share of every block (measured duty cycle upstream:
+///      79%), and the prover cannot even keep up in the worst case;
+///   3. that idle window hands a structural head start to whoever found the
+///      previous block, which is what makes a minority miner lose blocks far
+///      beyond its hashrate share.
+///
+/// Must divide one day exactly — see the assertion in `development_allocation`.
+/// 86400 / 90 = 960.
+pub const BLOCK_TIME: u64 = 90;
 
 /// Number of blocks per ASERT epoch.
 pub const EPOCH_LENGTH: u64 = 6;
 
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 120s at BLOCK_TIME=20
+pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 540s at BLOCK_TIME=90
 
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
@@ -112,7 +125,18 @@ pub fn block_class_spend_capacity_for_page_count(page_count: usize) -> Option<us
 /// Number of blocks for the transaction replay-protection epoch.
 ///
 /// This is a separate protocol clock from ASERT's short difficulty epoch.
-pub const TX_EPOCH_BLOCKS: u64 = 144;
+///
+/// ELIDE CHANGE: 32, down from upstream's 144, so that the wall-clock epoch
+/// stays at 48 minutes at 90 s blocks (144 × 20 s = 32 × 90 s = 2880 s) and a
+/// day still divides into whole epochs: 960 / 32 = 30, exactly as upstream had
+/// 4320 / 144 = 30. Leaving it at 144 would make `TARGET_BLOCKS_PER_DAY` a
+/// non-multiple of the epoch and break the daily-payout anchor invariant.
+pub const TX_EPOCH_BLOCKS: u64 = 32;
+
+const _: () = assert!(
+    (24_u64 * 60 * 60 / BLOCK_TIME).is_multiple_of(TX_EPOCH_BLOCKS),
+    "one day must divide into whole transaction epochs"
+);
 
 const _: () = assert!(
     TX_EPOCH_BLOCKS == noid_tx::TX_EPOCH_BLOCKS,
@@ -127,7 +151,11 @@ const _: () = assert!(
 ///
 /// Reorgs that would change the finalized prefix are rejected by fork choice.
 /// This depth is fixed by the public-network consensus profile.
-pub const CONSENSUS_FINALITY_DEPTH: u64 = 18;
+///
+/// ELIDE CHANGE: 8, down from upstream's 18. With BLOCK_TIME raised from 20 s
+/// to 90 s, keeping 18 would push wall-clock finality from 6 to 27 minutes —
+/// too slow for an exchange. 8 blocks × 90 s ≈ 12 minutes.
+pub const CONSENSUS_FINALITY_DEPTH: u64 = 8;
 
 /// Undo-log retention depth for local shallow reorg recovery and incremental
 /// finalized-state snapshot generation.
@@ -163,9 +191,18 @@ pub const RETAINED_BLOCK_SERVING_DEPTH: u64 =
 /// Number of hard-finalized block headers used for the state-expansion trigger.
 ///
 /// Expansion requires a strict majority of this complete window to be at or
-/// above 75% occupancy. With the current even window, a 9/9 tie does not
-/// expand; at least 10 of 18 finalized headers must meet the threshold.
-pub const EXPANSION_WINDOW: u64 = CONSENSUS_FINALITY_DEPTH;
+/// above 75% occupancy. With an even window, a 9/9 tie does not expand; at
+/// least 10 of 18 finalized headers must meet the threshold.
+///
+/// ELIDE CHANGE: pinned to 18 explicitly instead of aliasing
+/// `CONSENSUS_FINALITY_DEPTH`. Upstream tied the two together, so lowering
+/// finality from 18 to 8 — done here purely to keep wall-clock finality near
+/// 12 minutes at 90 s blocks — would silently have changed the state-expansion
+/// rule from 10-of-18 to 5-of-8, deciding expansion on a sample less than half
+/// the size. The two constants answer unrelated questions: how deep a reorg may
+/// go, and how much evidence justifies growing the state domain. Only the first
+/// one was meant to change.
+pub const EXPANSION_WINDOW: u64 = 18;
 
 /// Oldest parent-relative header depth needed to validate state expansion.
 ///
@@ -242,14 +279,57 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // Emission
 // ---------------------------------------------------------------------------
 
-/// Precision: 1 NOID = 1_000_000 μNOID (microNOID).
+/// Precision: 1 ELD = 1_000_000 μELD.
 pub const MICRONOID_PER_NOID: u64 = 1_000_000;
 
-/// Starting block reward at zero occupancy: 50 NOID.
+/// Starting block reward: 50 ELD.
 pub const BASE_REWARD_MICRONOID: u64 = 50 * MICRONOID_PER_NOID;
 
-/// Reward floor: 1 NOID forever.
-pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
+// ---------------------------------------------------------------------------
+// ELIDE CHANGE — height-based halving under a hard cap
+// ---------------------------------------------------------------------------
+//
+// Upstream halved on state expansion (`log_slots += 1` at 75% occupancy) and
+// floored the reward at 1 NOID forever. That floor is why upstream has no
+// maximum supply: on a network that never reaches ~12.6M occupied slots the
+// halving never fires at all, so emission stays at 50/block indefinitely —
+// about 78.8M per year, unbounded. `FLOOR_REWARD_MICRONOID` is deliberately
+// removed; emission reaches exactly zero.
+//
+// Schedule at BLOCK_TIME = 90 s (28 800 blocks/month):
+//
+//   height          0 →      28 800   50      ELD   (1 month)
+//   height     28 800 →     172 800   25      ELD   (to 6 months)
+//   height    172 800 →     831 800   12.5    ELD
+//   height    831 800 →   1 490 800   6.25    ELD
+//   height  1 490 800 →   2 149 800   3.125   ELD
+//   height  2 149 800 →   2 808 800   1.5625  ELD
+//   height  2 808 800 →   3 467 800   0.78125 ELD
+//   height  3 467 800 →         ...   0       (≈9.89 years)
+//
+// The schedule alone sums to 21 000 156.25 ELD, so MAX_SUPPLY_MICRO binds and
+// trims the final blocks. See `emission::total_emission_never_exceeds_cap`.
+
+/// Hard cap on total issuance, in μELD. Enforced in consensus, not merely
+/// implied by the schedule.
+pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICRONOID_PER_NOID as u128;
+
+/// First halving: one month after genesis.
+pub const H1_HEIGHT: u64 = 28_800;
+
+/// Second halving: six months after genesis.
+pub const H2_HEIGHT: u64 = 172_800;
+
+/// Interval between the remaining halvings (H3 … H7).
+pub const HALVING_INTERVAL: u64 = 659_000;
+
+/// Number of halvings. Reaching this one ends emission entirely.
+pub const HALVING_COUNT: u32 = 7;
+
+const _: () = assert!(
+    H1_HEIGHT < H2_HEIGHT,
+    "halving boundaries must be strictly increasing"
+);
 
 // ---------------------------------------------------------------------------
 // Height-tagged coinbase creation ids
@@ -373,7 +453,7 @@ mod tests {
 
     #[test]
     fn transaction_epoch_is_not_asert_epoch() {
-        assert_eq!(TX_EPOCH_BLOCKS, 144);
+        assert_eq!(TX_EPOCH_BLOCKS, 32); // ELIDE: 48 min at 90s blocks
         assert_ne!(TX_EPOCH_BLOCKS, EPOCH_LENGTH);
     }
 }

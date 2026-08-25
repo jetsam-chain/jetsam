@@ -15,9 +15,18 @@ use super::{
 };
 
 const HEIGHT_BITS: usize = 64;
-const PAYOUT_QUOTIENT_BITS: usize = 52;
-const PAYOUT_REMAINDER_BITS: usize = 13;
-const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 12) + (1 << 7) + (1 << 6) + (1 << 5));
+/// ELIDE CHANGE: 55, was 52. `TARGET_BLOCKS_PER_DAY` fell from 4320 to 960, so
+/// the quotient of a u64 height by it needs three more bits. 55 + 9 = 64
+/// exactly fills `HEIGHT_BITS` under the largest shift used below.
+const PAYOUT_QUOTIENT_BITS: usize = 55;
+/// ELIDE CHANGE: 10, was 13 — enough for `TARGET_BLOCKS_PER_DAY` = 960.
+const PAYOUT_REMAINDER_BITS: usize = 10;
+/// ELIDE CHANGE: 960 = 512 + 256 + 128 + 64, was 4320 = 4096 + 128 + 64 + 32.
+/// Still exactly four set bits, so the shift-and-add recomposition below keeps
+/// the same shape — only the shift amounts move.
+const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 9) + (1 << 8) + (1 << 7) + (1 << 6));
+const _: () = assert!(TARGET_BLOCKS_PER_DAY < (1 << PAYOUT_REMAINDER_BITS));
+const _: () = assert!(PAYOUT_QUOTIENT_BITS + 9 <= HEIGHT_BITS);
 
 pub struct DevelopmentAllocationTrace {
     pub active: LinExpr,
@@ -25,6 +34,13 @@ pub struct DevelopmentAllocationTrace {
     pub share_each: LinExpr,
     pub miner_subsidy: LinExpr,
     pub payout_each: LinExpr,
+    /// ELIDE: one-hot over the eight emission tiers, derived from the height.
+    ///
+    /// Exposed so the fee-arithmetic trace can reuse the very same selectors
+    /// instead of recomputing seven boundary comparisons. Sharing them is both
+    /// cheaper and safer: the coinbase ceiling and the development split can
+    /// then never disagree about which tier a block is in.
+    pub emission_tiers: Vec<LinExpr>,
 }
 
 fn shifted_integer_from_bits(bits: &[Wire], shift: usize) -> LinExpr {
@@ -59,6 +75,79 @@ fn constant_bits(value: u64, width: usize) -> Vec<LinExpr> {
         .collect()
 }
 
+/// The seven halving boundaries, in strictly increasing order.
+///
+/// ELIDE: the emission schedule is a function of height, so the circuit must
+/// locate the height among these boundaries instead of reading a table indexed
+/// by state depth.
+fn halving_boundaries() -> Vec<u64> {
+    use noid_chain::consensus::params::{H1_HEIGHT, H2_HEIGHT, HALVING_COUNT, HALVING_INTERVAL};
+    let mut boundaries = vec![H1_HEIGHT, H2_HEIGHT];
+    while boundaries.len() < HALVING_COUNT as usize {
+        boundaries.push(H2_HEIGHT + HALVING_INTERVAL * (boundaries.len() as u64 - 1));
+    }
+    debug_assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+    boundaries
+}
+
+/// One-hot selector over the eight emission tiers, derived from the height.
+///
+/// `below[i]` is `[height < boundary[i]]`. Because the boundaries increase,
+/// those indicators are monotone: once one is set, every later one is too. The
+/// tier indicator is therefore the difference between adjacent indicators —
+/// and in GF(2) a difference is a XOR, so each tier costs a linear combination
+/// and NO additional multiplicative constraint. Exactly one tier is set, so the
+/// selectors sum to one, which is what the constant-table dot product needs.
+fn halving_tier_one_hot(b: &mut FieldR1csBuilder, height_bits: &[LinExpr]) -> Vec<LinExpr> {
+    let below: Vec<LinExpr> = halving_boundaries()
+        .into_iter()
+        .map(|boundary| less_than_bits(b, height_bits, &constant_bits(boundary, HEIGHT_BITS)))
+        .collect();
+
+    let mut tiers = Vec::with_capacity(below.len() + 1);
+    tiers.push(below[0].clone());
+    for pair in below.windows(2) {
+        tiers.push(pair[1].add(&pair[0]));
+    }
+    // Past the last boundary: 1 - below.last() , i.e. its complement.
+    tiers.push(
+        below
+            .last()
+            .expect("at least one halving boundary")
+            .add_const(F128::ONE),
+    );
+    tiers
+}
+
+/// Constant-table lookup driven by the halving-tier one-hot.
+///
+/// Same shape as [`selected_depth_constant`], but eight entries instead of
+/// nine and indexed by emission tier rather than state depth.
+fn selected_tier_constant(tiers: &[LinExpr], values: &[u64]) -> LinExpr {
+    assert_eq!(
+        values.len(),
+        tiers.len(),
+        "one constant per emission tier is required"
+    );
+    tiers
+        .iter()
+        .zip(values)
+        .fold(LinExpr::zero(), |sum, (selector, value)| {
+            sum.add(&selector.scale(flat_const(*value as u128)))
+        })
+}
+
+/// The eight reward tiers, read from the native schedule so the two can never
+/// drift: one representative height per tier.
+pub(crate) fn tier_rewards() -> Vec<u64> {
+    use noid_chain::consensus::emission::block_reward;
+    std::iter::once(0u64)
+        .chain(halving_boundaries())
+        .map(block_reward)
+        .collect()
+}
+
+#[allow(dead_code)]
 fn selected_depth_constant(depth: &StateDepthTrace, values: &[u64]) -> LinExpr {
     assert_eq!(
         values.len(),
@@ -84,11 +173,14 @@ fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u6
     let divisor_bits = range_check_bits(b, &divisor, PAYOUT_REMAINDER_BITS);
     pin_lt_strict(b, &remainder_bits, &divisor_bits);
 
+    // ELIDE CHANGE: shifts follow the set bits of TARGET_BLOCKS_PER_DAY.
+    // 960 = (1<<9) + (1<<8) + (1<<7) + (1<<6); upstream's 4320 was
+    // (1<<12) + (1<<7) + (1<<6) + (1<<5). Same four-term shape.
     let terms = [
-        shifted_integer_from_bits(&quotient_bits, 12),
+        shifted_integer_from_bits(&quotient_bits, 9),
+        shifted_integer_from_bits(&quotient_bits, 8),
         shifted_integer_from_bits(&quotient_bits, 7),
         shifted_integer_from_bits(&quotient_bits, 6),
-        shifted_integer_from_bits(&quotient_bits, 5),
     ];
     let mut product = terms[0].clone();
     for term in &terms[1..] {
@@ -108,7 +200,8 @@ fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u6
 pub fn bind_development_allocation(
     b: &mut FieldR1csBuilder,
     child_height: &LinExpr,
-    child_depth: &StateDepthTrace,
+    // ELIDE CHANGE: the state depth is no longer an input — the emission
+    // schedule is a function of height alone.
     payout_raw_amount: &LinExpr,
 ) -> DevelopmentAllocationTrace {
     use noid_core::hardware::flat_to_tower_u128;
@@ -137,9 +230,12 @@ pub fn bind_development_allocation(
     let interval_boundary = payout_boundary(b, child_height, native_height);
     let payout_due = mul(b, &active, &interval_boundary);
 
-    let rewards = (MIN_EXACT_STATE_DEPTH..=MAX_EXACT_STATE_DEPTH)
-        .map(|depth| noid_chain::consensus::emission::block_reward(depth as u32))
-        .collect::<Vec<_>>();
+    // ELIDE CHANGE: the reward tables are indexed by EMISSION TIER, selected
+    // from the height, instead of by state depth. Upstream could one-hot the
+    // depth because its domain is nine values; a height has 2^64, so the tier
+    // is located by seven comparisons against the halving boundaries instead.
+    let tiers = halving_tier_one_hot(b, &height_bits);
+    let rewards = tier_rewards();
     let shares = rewards.iter().map(|reward| reward / 20).collect::<Vec<_>>();
     let daily_payouts = shares
         .iter()
@@ -154,10 +250,10 @@ pub fn bind_development_allocation(
         .zip(&shares)
         .map(|(reward, share)| reward - 2 * share)
         .collect::<Vec<_>>();
-    let full_subsidy = selected_depth_constant(child_depth, &rewards);
-    let share_each = selected_depth_constant(child_depth, &shares);
-    let daily_payout_each = selected_depth_constant(child_depth, &daily_payouts);
-    let active_miner = selected_depth_constant(child_depth, &miner_active);
+    let full_subsidy = selected_tier_constant(&tiers, &rewards);
+    let share_each = selected_tier_constant(&tiers, &shares);
+    let daily_payout_each = selected_tier_constant(&tiers, &daily_payouts);
+    let active_miner = selected_tier_constant(&tiers, &miner_active);
     let miner_subsidy = full_subsidy.add(&mul(b, &active, &full_subsidy.add(&active_miner)));
 
     let current_share = mul(b, &active, &share_each);
@@ -167,13 +263,7 @@ pub fn bind_development_allocation(
     let selected_payout = mul(b, &payout_due, payout_raw_amount);
     pin_eq(b, &selected_payout, &expected_payout);
 
-    let native_depth = {
-        let flat = child_depth.value.eval(b.values());
-        let tower = flat_to_tower_u128((flat.lo as u128) | ((flat.hi as u128) << 64));
-        u32::try_from(tower).expect("state depth fits u32")
-    };
-    let native =
-        development_allocation(native_height, native_depth).expect("honest development schedule");
+    let native = development_allocation(native_height).expect("honest development schedule");
     let native_payout = native.payout_each.unwrap_or(0);
     debug_assert_eq!(
         selected_payout.eval(b.values()),
@@ -186,6 +276,7 @@ pub fn bind_development_allocation(
         share_each: current_share,
         miner_subsidy,
         payout_each: expected_payout,
+        emission_tiers: tiers,
     }
 }
 
@@ -223,7 +314,7 @@ mod tests {
         let depth = StateDepthTrace::bind(&mut builder, &depth_value);
         let payout_wire = builder.alloc_f128(alloc_block_value(native.payout_each.unwrap_or(0)));
         let payout = LinExpr::from_wire(payout_wire);
-        let trace = bind_development_allocation(&mut builder, &height, &depth, &payout);
+        let trace = bind_development_allocation(&mut builder, &height, &payout);
         let (matrix, witness) = builder.build();
         (
             matrix,

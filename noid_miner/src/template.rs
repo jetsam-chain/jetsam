@@ -459,12 +459,15 @@ mod tests {
 
     #[test]
     fn template_separates_parent_and_child_anchors_at_transaction_epoch_boundary() {
+        // ELIDE CHANGE: derived from TX_EPOCH_BLOCKS instead of the literals
+        // 143/144/145/287/288, which pinned the epoch length at 144.
+        let e = noid_chain::consensus::params::TX_EPOCH_BLOCKS;
         for (parent_height, parent_terminal, child_transactions) in [
-            (143, 0, 0),
-            (144, 0, 144),
-            (145, 144, 144),
-            (287, 144, 144),
-            (288, 144, 288),
+            (e - 1, 0, 0),
+            (e, 0, e),
+            (e + 1, e, e),
+            (2 * e - 1, e, e),
+            (2 * e, e, 2 * e),
         ] {
             assert_eq!(
                 template_epoch_anchor_heights(parent_height),

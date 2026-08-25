@@ -1493,7 +1493,6 @@ fn build_selected_zk_block_slots_core(
     let allocation = bind_development_allocation(
         b,
         &header.fields[hf::HEIGHT],
-        &exact_state_depth.child,
         &spine_inputs[1].leaves[noid_tx::body_hash::TX8X2_LEAF_OUTPUT0_DATA][1],
     );
     let ghost_spine_native =
@@ -1719,12 +1718,16 @@ fn build_selected_zk_block_slots_core(
         "one public-arithmetic trace per physical user body slot"
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: page arithmetic+logical auth");
+    // ELIDE CHANGE: the block reward is now selected by the height-derived
+    // emission tiers built once in `bind_development_allocation`, not by the
+    // child state depth. Reusing those selectors here is what guarantees the
+    // coinbase ceiling and the development split read the same tier.
     let _fee_arithmetic = bind_block_fee_arithmetic(
         b,
         &paged_spend.groups[..tier],
         &start_acc.active_slot_count,
         &exact_state_depth.parent,
-        &exact_state_depth.child,
+        &allocation.emission_tiers,
         &allocation.miner_subsidy,
         &coinbase_amount,
         &coinbase_amount_bits,

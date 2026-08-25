@@ -120,17 +120,21 @@ pub fn resolve_user_epoch_anchor_id(
 mod tests {
     use super::*;
 
+    /// ELIDE CHANGE: heights derived from `TX_EPOCH_BLOCKS` instead of the
+    /// literals 143/144/287/288, which pinned the epoch length at 144.
     #[test]
     fn checked_height_decomposition_marks_exact_boundaries() {
+        let e = TX_EPOCH_BLOCKS;
+        let last = u8::try_from(e - 1).expect("epoch remainder fits u8");
         for (height, quotient, remainder, boundary) in [
             (0, 0, 0, true),
             (1, 0, 1, false),
-            (143, 0, 143, false),
-            (144, 1, 0, true),
-            (145, 1, 1, false),
-            (287, 1, 143, false),
-            (288, 2, 0, true),
-            (289, 2, 1, false),
+            (e - 1, 0, last, false),
+            (e, 1, 0, true),
+            (e + 1, 1, 1, false),
+            (2 * e - 1, 1, last, false),
+            (2 * e, 2, 0, true),
+            (2 * e + 1, 2, 1, false),
         ] {
             let decomposition =
                 checked_tx_epoch_height_decomposition(height).expect("test height decomposes");
@@ -144,18 +148,20 @@ mod tests {
         }
     }
 
+    /// ELIDE CHANGE: derived from `TX_EPOCH_BLOCKS` instead of literal 144s.
     #[test]
     fn boundary_block_consumes_old_anchor_then_advances() {
+        let e = TX_EPOCH_BLOCKS;
         assert_eq!(tx_epoch_anchor_height_for_child(1), 0);
-        assert_eq!(tx_epoch_anchor_height_for_child(143), 0);
-        assert_eq!(tx_epoch_anchor_height_for_child(144), 0);
-        assert_eq!(tx_epoch_anchor_height_for_child(145), 144);
-        assert_eq!(tx_epoch_anchor_height_for_child(288), 144);
-        assert_eq!(tx_epoch_anchor_height_for_child(289), 288);
+        assert_eq!(tx_epoch_anchor_height_for_child(e - 1), 0);
+        assert_eq!(tx_epoch_anchor_height_for_child(e), 0);
+        assert_eq!(tx_epoch_anchor_height_for_child(e + 1), e);
+        assert_eq!(tx_epoch_anchor_height_for_child(2 * e), e);
+        assert_eq!(tx_epoch_anchor_height_for_child(2 * e + 1), 2 * e);
 
         let old = [1u8; 32];
         let boundary = [2u8; 32];
-        assert_eq!(next_tx_epoch_anchor_id(old, 143, boundary), old);
-        assert_eq!(next_tx_epoch_anchor_id(old, 144, boundary), boundary);
+        assert_eq!(next_tx_epoch_anchor_id(old, e - 1, boundary), old);
+        assert_eq!(next_tx_epoch_anchor_id(old, e, boundary), boundary);
     }
 }

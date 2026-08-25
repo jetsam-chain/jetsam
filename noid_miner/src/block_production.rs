@@ -411,20 +411,23 @@ mod tests {
 
     #[test]
     fn production_boundary_uses_parent_anchor_before_advancing_child_anchor() {
+        // ELIDE CHANGE: the epoch boundary is derived from TX_EPOCH_BLOCKS
+        // rather than the literal 144.
+        let epoch = noid_chain::consensus::params::TX_EPOCH_BLOCKS;
         let genesis = noid_chain::consensus::genesis_header();
-        let boundary = header(144, [0x11; 32]);
-        let child = header(145, block_id(&boundary));
+        let boundary = header(epoch, [0x11; 32]);
+        let child = header(epoch + 1, block_id(&boundary));
 
         let start = accumulator_from_header_boundary(&boundary, &genesis);
         start
             .validate_local_header_boundary(&boundary, &genesis)
-            .expect("block 144 terminal still carries the genesis anchor");
+            .expect("the boundary block's terminal still carries the genesis anchor");
 
         let end = start
             .advance(&boundary, &child)
-            .expect("144 -> 145 advances the recursive boundary");
+            .expect("crossing the boundary advances the recursive anchor");
         end.validate_local_header_boundary(&child, &boundary)
-            .expect("block 145 terminal carries the derived block-144 anchor");
+            .expect("the next block's terminal carries the derived boundary anchor");
 
         let conflated = accumulator_from_header_boundary(&boundary, &boundary);
         assert!(matches!(
@@ -432,9 +435,9 @@ mod tests {
             Err(
                 noid_recursive::ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
                     expected: 0,
-                    actual: 144,
+                    actual,
                 }
-            )
+            ) if actual == epoch
         ));
     }
 }

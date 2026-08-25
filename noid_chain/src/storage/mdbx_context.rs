@@ -3013,9 +3013,16 @@ mod tests {
                 .insert(height, occupancy_header(height, active));
         }
 
-        // At parent 52, headers 35..52 are all under unfinalized pressure,
-        // while the deciding finalized window is 17..34 and remains below.
-        context.tip_height = 52;
+        // ELIDE CHANGE: parent heights derived from CONSENSUS_FINALITY_DEPTH
+        // instead of the literals 52 and 61, which encoded a finality of 18.
+        // What the test means is "the parent whose finalized window ends at 34"
+        // and "the parent whose window ends at 43" — those are the invariants,
+        // not the absolute heights.
+        let depth = crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        // Headers 35.. are under unfinalized pressure, while the deciding
+        // finalized window is 17..34 and remains below threshold.
+        context.tip_height = 34 + depth;
         let counts = context.finalized_active_counts().unwrap();
         assert_eq!(counts, vec![threshold - 1; EXPANSION_WINDOW as usize]);
         assert_eq!(
@@ -3023,9 +3030,9 @@ mod tests {
             8
         );
 
-        // Parent 61 sees only nine finalized threshold headers (35..43): tie,
-        // therefore no irreversible expansion.
-        context.tip_height = 61;
+        // The parent whose window ends at 43 sees only nine finalized threshold
+        // headers (35..43): a tie, therefore no irreversible expansion.
+        context.tip_height = 43 + depth;
         let counts = context.finalized_active_counts().unwrap();
         assert_eq!(
             counts.iter().filter(|&&active| active >= threshold).count(),
@@ -3036,8 +3043,8 @@ mod tests {
             8
         );
 
-        // Parent 62 finalizes header 44, producing the required ten of 18.
-        context.tip_height = 62;
+        // One block later finalizes header 44, producing the required ten of 18.
+        context.tip_height = 44 + depth;
         let counts = context.finalized_active_counts().unwrap();
         assert_eq!(
             counts.iter().filter(|&&active| active >= threshold).count(),
@@ -3053,10 +3060,17 @@ mod tests {
     fn missing_finalized_expansion_header_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let mut context = small_context(directory.path());
-        context.recent_headers = (0..=35)
+        // ELIDE CHANGE: the tip is the first height with a complete finalized
+        // window (EXPANSION_HEADER_LOOKBACK), so that window is exactly
+        // 0..=EXPANSION_WINDOW-1 and removing header 7 is guaranteed to punch a
+        // hole *inside* it. Upstream's literal 35 only worked while finality
+        // was 18; at finality 8 the window starts past 7 and the test passed
+        // vacuously.
+        let lookback = crate::consensus::params::EXPANSION_HEADER_LOOKBACK;
+        context.recent_headers = (0..=lookback)
             .map(|height| (height, occupancy_header(height, 0)))
             .collect();
-        context.tip_height = 35;
+        context.tip_height = lookback;
         context.recent_headers.remove(&7);
 
         assert!(matches!(

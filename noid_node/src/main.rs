@@ -2193,7 +2193,9 @@ async fn main() -> anyhow::Result<()> {
             .store
             .encoded_state_bytes()
             .context("read encoded state size for startup banner")?;
-        let reward = block_reward(log_slots) as f64 / 1_000_000.0;
+        // ELIDE CHANGE: the reward is a function of height, not state depth.
+        // Banner shows the reward of the next block to be mined.
+        let reward = block_reward(tip_hdr.height.saturating_add(1)) as f64 / 1_000_000.0;
 
         drop(ctx);
 

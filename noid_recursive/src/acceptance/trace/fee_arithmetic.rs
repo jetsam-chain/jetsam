@@ -324,13 +324,19 @@ fn bind_group_fee(
 }
 
 /// Bind all user fee predicates, checked 72-bit claimable aggregation, and
-/// `coinbase <= reward(child_depth) + claimable_sum`. Underclaiming is valid.
+/// `coinbase <= reward(height) + claimable_sum`. Underclaiming is valid.
+///
+/// ELIDE CHANGE: the block reward is selected by `emission_tiers` — the
+/// height-derived one-hot built by `bind_development_allocation` — instead of
+/// by `child_depth.one_hot`. The selectors are passed in rather than rebuilt so
+/// that the coinbase ceiling and the development split are guaranteed to read
+/// the same tier, and so the seven boundary comparisons are paid for once.
 pub fn bind_block_fee_arithmetic(
     b: &mut FieldR1csBuilder,
     groups: &[PagedSpendGroupTrace],
     parent_active_count: &LinExpr,
     parent_depth: &StateDepthTrace,
-    child_depth: &StateDepthTrace,
+    emission_tiers: &[LinExpr],
     coinbase_subsidy: &LinExpr,
     coinbase_amount: &LinExpr,
     coinbase_amount_bits: &[Wire; U64_BITS],
@@ -363,10 +369,9 @@ pub fn bind_block_fee_arithmetic(
     let claimable_fee_sum = alloc_block(b, Block128::from(aggregate_native));
     pin_eq(b, &claimable_fee_sum, &aggregate_reconstruction);
 
-    let rewards: Vec<u64> = (MIN_EXACT_STATE_DEPTH..=MAX_EXACT_STATE_DEPTH)
-        .map(|depth| noid_chain::consensus::emission::block_reward(depth as u32))
-        .collect();
-    let reward_bits = selected_constant_bits(&child_depth.one_hot, &rewards, MONEY_SUM_BITS);
+    // ELIDE CHANGE: eight height-derived emission tiers, not nine state depths.
+    let rewards = super::development_allocation::tier_rewards();
+    let reward_bits = selected_constant_bits(emission_tiers, &rewards, MONEY_SUM_BITS);
     let block_reward = reconstruct_bits(&reward_bits);
     let mut subsidy_bits: Vec<LinExpr> = range_check_bits(b, coinbase_subsidy, U64_BITS)
         .into_iter()

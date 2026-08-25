@@ -2268,7 +2268,10 @@ impl ParanoidApiServer for RpcHandler {
         let height = chain.tip_height();
         let diff = tip.difficulty_target;
         let diff_bits = noid_chain::consensus::target_leading_zero_bits(&diff);
-        let reward = block_reward(tip.log_slots);
+        // ELIDE CHANGE: the reward is a function of height, not state depth.
+        // Report the reward of the block a miner would build NEXT, which is
+        // what a miner asking for mining info actually needs.
+        let reward = block_reward(height.saturating_add(1));
         Ok(MiningInfo {
             height,
             difficulty_bits: diff_bits,

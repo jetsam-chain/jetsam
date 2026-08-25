@@ -540,10 +540,13 @@ mod tests {
         assert_eq!(asert_anchor_height(100), 96);
     }
 
+    /// ELIDE CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of the
+    /// literal 18, so the test follows the constant rather than pinning it.
     #[test]
     fn finality_check() {
-        assert!(is_final(0, 18));
-        assert!(!is_final(0, 17));
-        assert!(is_final(100, 118));
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH as DEPTH;
+        assert!(is_final(0, DEPTH));
+        assert!(!is_final(0, DEPTH - 1));
+        assert!(is_final(100, 100 + DEPTH));
     }
 }

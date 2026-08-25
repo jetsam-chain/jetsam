@@ -23,8 +23,25 @@ const _: () = assert!(
     "BLOCK_TIME must divide one day exactly"
 );
 
-/// Three 365-day target-time years, excluding built-in genesis height zero.
-pub const DEVELOPMENT_ALLOCATION_END_HEIGHT: u64 = TARGET_BLOCKS_PER_DAY * 365 * 3;
+/// ELIDE CHANGE: TWO 365-day target-time years, down from upstream's three.
+/// Excludes built-in genesis height zero.
+///
+/// At BLOCK_TIME = 90 s this is 960 × 365 × 2 = 700 800 blocks. Over that
+/// window the chain issues 11 640 000 ELD, so the two funds together receive
+/// 1 164 000 ELD — 5.54% of the 21M maximum supply.
+pub const DEVELOPMENT_ALLOCATION_END_HEIGHT: u64 = TARGET_BLOCKS_PER_DAY * 365 * 2;
+
+// `development_share_each` divides the subsidy by twenty and refuses an inexact
+// split; `miner_subsidy` then `.expect()`s it, so an indivisible tier inside the
+// allocation window would PANIC a consensus path. The reward tiers are
+// 50e6 >> k, and the first one that is not a multiple of twenty is k = 6
+// (781_250 μELD, from height 2 808 800). Assert at compile time that the window
+// closes long before that, so extending it can never be done silently.
+const _: () = assert!(
+    crate::consensus::emission::block_reward(DEVELOPMENT_ALLOCATION_END_HEIGHT)
+        .is_multiple_of(DEVELOPMENT_SHARE_DENOMINATOR),
+    "development allocation window reaches a reward tier that is not divisible by twenty"
+);
 
 /// Number of mandatory daily payouts over the allocation period.
 pub const DEVELOPMENT_ALLOCATION_PAYOUTS: u64 =
@@ -102,9 +119,12 @@ pub fn development_share_each(subsidy: u64) -> Result<u64, DevelopmentAllocation
 }
 
 /// Subsidy component available to the primary coinbase at `height`.
+///
+/// ELIDE CHANGE: takes only the height. The reward no longer depends on state
+/// depth, so `log_slots` was dropped rather than left as a dead parameter.
 #[inline]
-pub fn miner_subsidy(height: u64, log_slots: u32) -> u64 {
-    let subsidy = block_reward(log_slots);
+pub fn miner_subsidy(height: u64) -> u64 {
+    let subsidy = block_reward(height);
     if development_allocation_active(height) {
         let share = development_share_each(subsidy)
             .expect("the fixed emission schedule is exactly divisible by twenty");
@@ -122,9 +142,8 @@ pub fn miner_subsidy(height: u64, log_slots: u32) -> u64 {
 /// create additional issuance.
 pub fn development_allocation(
     child_height: u64,
-    child_log_slots: u32,
 ) -> Result<DevelopmentAllocation, DevelopmentAllocationError> {
-    let subsidy = block_reward(child_log_slots);
+    let subsidy = block_reward(child_height);
     if !development_allocation_active(child_height) {
         return Ok(DevelopmentAllocation {
             active: false,
@@ -159,7 +178,7 @@ pub fn development_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::params::{LOG_SLOTS_GENESIS, LOG_SLOTS_MAX};
+    use crate::consensus::params::{H1_HEIGHT, MICRONOID_PER_NOID as MICRONOID_PER_ELD};
 
     /// Upstream Parano1d fund addresses, recorded here so the guard below can
     /// recognise them. These bytes must NOT appear in a launched Elide chain.
@@ -229,54 +248,102 @@ mod tests {
         assert!(!development_allocation_active(
             DEVELOPMENT_ALLOCATION_END_HEIGHT + 1
         ));
-        assert_eq!(DEVELOPMENT_ALLOCATION_PAYOUTS, 1_095);
+        assert_eq!(DEVELOPMENT_ALLOCATION_PAYOUTS, 730); // ELIDE: 2 years, was 3
     }
 
+    /// ELIDE CHANGE: iterates over HEIGHTS, not state depths. The reward tier
+    /// is a function of height now, so walking `log_slots` would no longer
+    /// exercise a single one of the tiers.
     #[test]
     fn every_reward_tier_reserves_at_most_ninety_five_five() {
-        for depth in LOG_SLOTS_GENESIS..=LOG_SLOTS_MAX {
-            let subsidy = block_reward(depth);
+        for height in payout_heights_across_the_window() {
+            let subsidy = block_reward(height);
             let share = development_share_each(subsidy).unwrap();
-            let allocation = development_allocation(1, depth).unwrap();
-            assert_eq!(allocation.share_each, share);
-            assert_eq!(allocation.miner_subsidy + 2 * share, subsidy);
+            let allocation = development_allocation(height).unwrap();
+            assert_eq!(allocation.share_each, share, "at height {height}");
+            assert_eq!(
+                allocation.miner_subsidy + 2 * share,
+                subsidy,
+                "at height {height}"
+            );
         }
     }
 
     #[test]
     fn daily_payout_uses_the_payout_blocks_reward_tier() {
-        for depth in LOG_SLOTS_GENESIS..=LOG_SLOTS_MAX {
-            let share = development_share_each(block_reward(depth)).unwrap();
-            let allocation = development_allocation(TARGET_BLOCKS_PER_DAY, depth).unwrap();
-            assert_eq!(allocation.payout_each, Some(share * TARGET_BLOCKS_PER_DAY));
+        for height in payout_heights_across_the_window() {
+            let share = development_share_each(block_reward(height)).unwrap();
+            let allocation = development_allocation(height).unwrap();
+            assert_eq!(
+                allocation.payout_each,
+                Some(share * TARGET_BLOCKS_PER_DAY),
+                "at height {height}"
+            );
         }
     }
 
+    /// Payout heights that land on a day boundary, spread across the window so
+    /// that more than one reward tier is covered.
+    fn payout_heights_across_the_window() -> Vec<u64> {
+        let mut heights = Vec::new();
+        let mut height = TARGET_BLOCKS_PER_DAY;
+        while height <= DEVELOPMENT_ALLOCATION_END_HEIGHT {
+            heights.push(height);
+            height += TARGET_BLOCKS_PER_DAY * 30;
+        }
+        assert!(heights.len() > 1, "window must span several payouts");
+        heights
+    }
+
+    /// ELIDE CHANGE: replaces upstream's `expansion_day_conservatively_uses_the
+    /// _lower_reward`. Expansion no longer moves the reward — a halving does.
     #[test]
-    fn expansion_day_conservatively_uses_the_lower_reward() {
-        let old_share = development_share_each(block_reward(LOG_SLOTS_GENESIS)).unwrap();
-        let new_share = development_share_each(block_reward(LOG_SLOTS_GENESIS + 1)).unwrap();
-        let allocation =
-            development_allocation(TARGET_BLOCKS_PER_DAY, LOG_SLOTS_GENESIS + 1).unwrap();
-        assert_eq!(
-            allocation.payout_each,
-            Some(new_share * TARGET_BLOCKS_PER_DAY)
+    fn a_halving_lowers_the_payout_from_that_height_on() {
+        let day = TARGET_BLOCKS_PER_DAY;
+        // Last payout height strictly before H1, and the first at or after it.
+        let before = (H1_HEIGHT - 1) / day * day;
+        let after = H1_HEIGHT.div_ceil(day) * day;
+        assert!(before < H1_HEIGHT && after >= H1_HEIGHT);
+
+        let before_each = development_allocation(before).unwrap().payout_each.unwrap();
+        let after_each = development_allocation(after).unwrap().payout_each.unwrap();
+        assert!(
+            after_each < before_each,
+            "payout must drop across the first halving: {before_each} -> {after_each}"
         );
-        assert!(new_share < old_share);
+        assert_eq!(after_each * 2, before_each, "and it must drop by half");
     }
 
     #[test]
     fn final_payout_is_followed_by_full_miner_reward() {
-        let final_allocation =
-            development_allocation(DEVELOPMENT_ALLOCATION_END_HEIGHT, LOG_SLOTS_GENESIS).unwrap();
+        let final_allocation = development_allocation(DEVELOPMENT_ALLOCATION_END_HEIGHT).unwrap();
         assert!(final_allocation.payout_due);
         assert!(final_allocation.payout_each.is_some());
 
-        let post = development_allocation(DEVELOPMENT_ALLOCATION_END_HEIGHT + 1, LOG_SLOTS_GENESIS)
-            .unwrap();
+        let post = development_allocation(DEVELOPMENT_ALLOCATION_END_HEIGHT + 1).unwrap();
         assert!(!post.active);
         assert!(!post.payout_due);
         assert_eq!(post.payout_each, None);
-        assert_eq!(post.miner_subsidy, block_reward(LOG_SLOTS_GENESIS));
+        assert_eq!(
+            post.miner_subsidy,
+            block_reward(DEVELOPMENT_ALLOCATION_END_HEIGHT + 1)
+        );
+    }
+
+    /// The two funds together must receive 5.54% of the maximum supply — the
+    /// number an exchange or a miner will ask about.
+    #[test]
+    fn fund_share_of_max_supply_is_as_documented() {
+        let mut funded: u128 = 0;
+        for height in 1..=DEVELOPMENT_ALLOCATION_END_HEIGHT {
+            let share = development_share_each(block_reward(height)).unwrap();
+            funded += u128::from(2 * share);
+        }
+        let cap = crate::consensus::params::MAX_SUPPLY_MICRO;
+        // Exact sum over heights 1..=700_800 — not the rounded back-of-envelope
+        // 1 164 000: the tier boundaries do not land on day boundaries.
+        assert_eq!(funded / u128::from(MICRONOID_PER_ELD), 1_163_996);
+        let basis_points = funded * 10_000 / cap;
+        assert_eq!(basis_points, 554, "fund share should be 5.54% of the cap");
     }
 }

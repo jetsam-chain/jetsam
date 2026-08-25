@@ -556,7 +556,7 @@ fn build_block_template_with_post_state(
     let new_log_slots =
         expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
     let should_expand = new_log_slots != parent.log_slots;
-    let allocation = development_allocation(child_height, new_log_slots).map_err(|error| {
+    let allocation = development_allocation(child_height).map_err(|error| {
         TemplateBuildError::StateApplyError(format!("development allocation: {error}"))
     })?;
     let system_record_count = usize::from(allocation.payout_due);
@@ -875,7 +875,7 @@ mod tests {
         let mut state = ChainState::with_log_slots(8);
         let mut parent = parent(&mut state);
         parent.height = TARGET_BLOCKS_PER_DAY - 1;
-        let share = development_share_each(block_reward(parent.log_slots)).unwrap();
+        let share = development_share_each(block_reward(TARGET_BLOCKS_PER_DAY)).unwrap();
 
         let template = build_block_template(
             &parent,
@@ -897,7 +897,7 @@ mod tests {
         assert_eq!(payout.body.outputs[1].amount, share * TARGET_BLOCKS_PER_DAY);
         assert_eq!(
             template.coinbase.body.outputs[0].amount,
-            miner_subsidy(TARGET_BLOCKS_PER_DAY, template.log_slots)
+            miner_subsidy(TARGET_BLOCKS_PER_DAY)
         );
         assert_eq!(template.active_slot_count, 3);
         assert_eq!(template.alloc_counter, 3);
@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(template.log_slots, 25);
         assert_eq!(
             template.coinbase.body.outputs[0].amount,
-            miner_subsidy(TARGET_BLOCKS_PER_DAY, 25)
+            miner_subsidy(TARGET_BLOCKS_PER_DAY)
         );
         let payout = template
             .development_payout

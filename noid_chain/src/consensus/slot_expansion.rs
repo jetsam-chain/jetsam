@@ -71,18 +71,22 @@ mod tests {
 
     #[test]
     fn no_expansion_below_threshold() {
-        assert_eq!(expected_child_log_slots(35, 8, &[0; 18]), 8);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &[0; 18]), 8);
     }
 
+    /// ELIDE CHANGE: heights derived from `EXPANSION_HEADER_LOOKBACK` rather
+    /// than the literals 34/35, which were only correct while finality and the
+    /// expansion window were both 18.
     #[test]
     fn expansion_is_impossible_before_the_first_finalized_window() {
-        assert_eq!(expected_child_log_slots(34, 8, &[u64::MAX; 18]), 8);
+        use crate::consensus::params::EXPANSION_HEADER_LOOKBACK as LOOKBACK;
+        assert_eq!(expected_child_log_slots(LOOKBACK - 1, 8, &[u64::MAX; 18]), 8);
     }
 
     #[test]
     fn complete_window_is_required() {
-        assert_eq!(expected_child_log_slots(35, 8, &[u64::MAX; 17]), 8);
-        assert_eq!(expected_child_log_slots(35, 8, &[u64::MAX; 19]), 8);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &[u64::MAX; 17]), 8);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &[u64::MAX; 19]), 8);
     }
 
     #[test]
@@ -91,7 +95,7 @@ mod tests {
         let below = at - 1;
         let mut counts = [below; 18];
         counts[..9].fill(at);
-        assert_eq!(expected_child_log_slots(35, 8, &counts), 8);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &counts), 8);
     }
 
     #[test]
@@ -100,19 +104,32 @@ mod tests {
         let below = at - 1;
         let mut counts = [below; 18];
         counts[..10].fill(at);
-        assert_eq!(expected_child_log_slots(35, 8, &counts), 9);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &counts), 9);
 
         counts.reverse();
-        assert_eq!(expected_child_log_slots(35, 8, &counts), 9);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &counts), 9);
         counts.rotate_left(7);
-        assert_eq!(expected_child_log_slots(35, 8, &counts), 9);
+        assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &counts), 9);
     }
 
+    /// ELIDE CHANGE: derived from the constants instead of the literals
+    /// 34/35/(65,82), which encoded finality == expansion window == 18.
     #[test]
     fn finalized_window_starts_only_after_both_depths_are_available() {
-        assert_eq!(finalized_expansion_window(34), None);
-        assert_eq!(finalized_expansion_window(35), Some((0, 17)));
-        assert_eq!(finalized_expansion_window(100), Some((65, 82)));
+        use crate::consensus::params::{
+            CONSENSUS_FINALITY_DEPTH as DEPTH, EXPANSION_HEADER_LOOKBACK as LOOKBACK,
+            EXPANSION_WINDOW as WINDOW,
+        };
+        assert_eq!(finalized_expansion_window(LOOKBACK - 1), None);
+        assert_eq!(finalized_expansion_window(LOOKBACK), Some((0, WINDOW - 1)));
+
+        // At height 100 the finalized window ends DEPTH below the tip and
+        // spans WINDOW headers.
+        let end = 100 - DEPTH;
+        assert_eq!(
+            finalized_expansion_window(100),
+            Some((end - (WINDOW - 1), end))
+        );
     }
 
     #[test]
