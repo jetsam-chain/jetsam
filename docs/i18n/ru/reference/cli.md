@@ -4,16 +4,16 @@
 
 | Файл | Роль |
 |---|---|
-| `parano1d` | Полная нода, серверная часть кошелька и необязательный внутренний конвейер доказательства и майнинга |
-| `parano1d-cli` | Тонкий JSON-RPC-клиент работающей ноды |
-| `parano1d-miner` | Отдельный вычислитель nonce Poseidon2b |
+| `elide` | Полная нода, серверная часть кошелька и необязательный внутренний конвейер доказательства и майнинга |
+| `elide-cli` | Тонкий JSON-RPC-клиент работающей ноды |
+| `elide-miner` | Отдельный вычислитель nonce Poseidon2b |
 
 ## Демон Core
 
 Обычная нода запускается без режима:
 
 ```sh
-parano1d
+elide
 ```
 
 Публичные параметры демона:
@@ -52,13 +52,13 @@ parano1d
 
 ```sh
 # Ordinary node
-parano1d --data-dir ~/.parano1d/data
+elide --data-dir ~/.elide/data
 
 # Internal miner using 12 logical CPUs
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 Оставляйте RPC на локальном интерфейсе, если он не защищён приватным или
@@ -67,7 +67,7 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 
 ## Внешний майнер
 
-`parano1d-miner` запрашивает уже доказанный неизменяемый шаблон и ищет только
+`elide-miner` запрашивает уже доказанный неизменяемый шаблон и ищет только
 его 128-битный nonce.
 
 | Параметр | По умолчанию | Значение |
@@ -83,7 +83,7 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 Обычный локальный запуск:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
@@ -94,7 +94,7 @@ parano1d-miner \
 
 ## Клиент ноды
 
-`parano1d-cli` — тонкий клиент работающего Core. У него нет отдельного ключа;
+`elide-cli` — тонкий клиент работающего Core. У него нет отдельного ключа;
 операции кошелька выполняются через локальный JSON-RPC.
 
 ### Общие параметры
@@ -105,13 +105,13 @@ parano1d-miner \
 ```
 
 Стандартный адрес — `http://127.0.0.1:9601`. Его можно изменить переменной
-окружения `NOID_RPC`; параметр `--rpc` имеет приоритет.
+окружения `ELIDE_RPC`; параметр `--rpc` имеет приоритет.
 
-Суммы в командах кошелька указываются в NOID, не более шести десятичных
+Суммы в командах кошелька указываются в ELD, не более шести десятичных
 знаков:
 
 ```text
-1 NOID = 1,000,000 μNOID
+1 ELD = 1,000,000 μNOID
 ```
 
 ### Нода и цепь
@@ -133,11 +133,11 @@ parano1d-miner \
 Примеры:
 
 ```sh
-parano1d-cli status
-parano1d-cli block-header 420
-parano1d-cli block 420
-parano1d-cli slot 9700063
-parano1d-cli utxos-of o1...
+elide-cli status
+elide-cli block-header 420
+elide-cli block 420
+elide-cli slot 9700063
+elide-cli utxos-of o1...
 ```
 
 `block` возвращает данные только внутри 18-блочного окна хранения тел.
@@ -152,15 +152,15 @@ parano1d-cli utxos-of o1...
 | `block-template` | `--miner-addr o1…` | Внешний шаблон майнинга, принадлежащий ноде |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Отправить один 16-байтный nonce в порядке от младшего байта к старшему |
 
-Команды внешнего майнинга низкоуровневые. `parano1d-miner` автоматически
+Команды внешнего майнинга низкоуровневые. `elide-miner` автоматически
 обновляет шаблоны и кодирует nonce.
 
 ### Комиссии и мемпул
 
 ```sh
-parano1d-cli estimate-fee 2 --inputs 1
-parano1d-cli mempool
-parano1d-cli mempool-tx TXID
+elide-cli estimate-fee 2 --inputs 1
+elide-cli mempool
+elide-cli mempool-tx TXID
 ```
 
 `estimate-fee` сообщает текущий минимум, принимаемый нодой для заявленного
@@ -170,7 +170,7 @@ parano1d-cli mempool-tx TXID
 ### Проверка адреса
 
 ```sh
-parano1d-cli validate o1...
+elide-cli validate o1...
 ```
 
 Команда сообщает, корректен ли адрес, и выводит его каноническую форму bech32m
@@ -179,11 +179,11 @@ parano1d-cli validate o1...
 ### Адреса кошелька
 
 ```sh
-parano1d-cli address
-parano1d-cli address --list
-parano1d-cli address --new
-parano1d-cli address --index 3
-parano1d-cli address --use 3
+elide-cli address
+elide-cli address --list
+elide-cli address --new
+elide-cli address --index 3
+elide-cli address --use 3
 ```
 
 `--new`, `--index` и `--use` — взаимоисключающие действия. Созданный адрес
@@ -193,9 +193,9 @@ parano1d-cli address --use 3
 ### Баланс и UTXO
 
 ```sh
-parano1d-cli balance
-parano1d-cli utxos
-parano1d-cli scan
+elide-cli balance
+elide-cli utxos
+elide-cli scan
 ```
 
 `balance` отдельно показывает подтверждённые, зарезервированные исходящие,
@@ -207,19 +207,19 @@ parano1d-cli scan
 Предпросмотр:
 
 ```sh
-parano1d-cli send o1... 10.5 --dry-run
+elide-cli send o1... 10.5 --dry-run
 ```
 
 Отправка с автоматической комиссией:
 
 ```sh
-parano1d-cli send o1... 10.5
+elide-cli send o1... 10.5
 ```
 
-Точную комиссию в NOID задавайте только при необходимости:
+Точную комиссию в ELD задавайте только при необходимости:
 
 ```sh
-parano1d-cli send o1... 10.5 --fee 0.012
+elide-cli send o1... 10.5 --fee 0.012
 ```
 
 Возвращаемый ID относится ко всей логической транзакции. Рекомендуется
@@ -230,21 +230,21 @@ parano1d-cli send o1... 10.5 --fee 0.012
 ### История и чеки
 
 ```sh
-parano1d-cli history
-parano1d-cli history --last 20
-parano1d-cli history --address o1...
+elide-cli history
+elide-cli history --last 20
+elide-cli history --address o1...
 ```
 
 Экспорт подтверждённого исходящего чека:
 
 ```sh
-parano1d-cli receipt TXID > receipt.hex
+elide-cli receipt TXID > receipt.hex
 ```
 
 Проверка:
 
 ```sh
-parano1d-cli verify "$(tr -d '\n' < receipt.hex)"
+elide-cli verify "$(tr -d '\n' < receipt.hex)"
 ```
 
 Экспорт возможен только для локально сохранённого платежа другому владельцу.
@@ -252,7 +252,7 @@ parano1d-cli verify "$(tr -d '\n' < receipt.hex)"
 ### Остановка
 
 ```sh
-parano1d-cli stop
+elide-cli stop
 ```
 
 Команда запрашивает корректное завершение демона. Она эквивалентна обычному
@@ -264,7 +264,7 @@ parano1d-cli stop
 
 ```sh
 height="$(
-  parano1d-cli --json status |
+  elide-cli --json status |
     jq -er '.height'
 )"
 ```

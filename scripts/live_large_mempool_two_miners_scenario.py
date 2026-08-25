@@ -17,11 +17,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_LARGE_MEMPOOL_TWO_DIR",
+        "ELIDE_LIVE_LARGE_MEMPOOL_TWO_DIR",
         str(RUN_PARENT / f"large-mempool-two-miners-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_LARGE_MEMPOOL_TWO_BASE_PORT", "21900"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_LARGE_MEMPOOL_TWO_BASE_PORT", "21900"))
 
 # The helper functions are pure RPC/log orchestration. Point both imported
 # modules at this scenario's independent directory and ports before any Node is

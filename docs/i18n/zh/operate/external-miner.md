@@ -10,13 +10,13 @@
 使用 Bearer 令牌以外部矿工模式启动节点：
 
 ```sh
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 在另一个终端运行：
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -27,7 +27,7 @@ token。
 需要时可限制挖矿进程的线程数：
 
 ```sh
-parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## 远程挖矿进程
@@ -38,7 +38,7 @@ parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 限制暴露路径。只有安全传输就绪后才绑定公网 RPC：
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -53,7 +53,7 @@ parano1d \
 若允许挖矿进程请求自己的奖励地址，节点运营者必须显式启用：
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase
@@ -62,7 +62,7 @@ parano1d \
 此后挖矿进程可以使用：
 
 ```sh
-parano1d-miner \
+elide-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -84,7 +84,7 @@ nonce 索引和目标值。挖矿进程搜索随机且互不重叠的 nonce 范�
 运行：
 
 ```sh
-parano1d-miner --check-hardware
+elide-miner --check-hardware
 ```
 
 请求失败时：

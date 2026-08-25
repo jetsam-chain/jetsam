@@ -4,7 +4,7 @@ Parano1d uses libp2p for peer identity, discovery, relay and synchronization.
 The public network protocol is identified as:
 
 ```text
-/noid/mainnet/860e70453390bf81/1
+/elide/mainnet/860e70453390bf81/1
 ```
 
 The default P2P listener is TCP `9600`. JSON-RPC is a separate local

@@ -27,27 +27,27 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
+NODE_BIN = ROOT / "target" / "release" / "elide"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-SCENARIO = os.environ.get("NOID_LIVE_TX_SCENARIO", "single-input").strip()
+SCENARIO = os.environ.get("ELIDE_LIVE_TX_SCENARIO", "single-input").strip()
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_SINGLE_TX_DIR",
+        "ELIDE_LIVE_SINGLE_TX_DIR",
         str(RUN_PARENT / f"transaction-{SCENARIO}-clean-{STAMP}"),
     )
 )
-P2P_PORT = int(os.environ.get("NOID_LIVE_SINGLE_TX_P2P_PORT", "20400"))
+P2P_PORT = int(os.environ.get("ELIDE_LIVE_SINGLE_TX_P2P_PORT", "20400"))
 RPC_PORT = P2P_PORT + 1
-MINE_TO_HEIGHT = int(os.environ.get("NOID_LIVE_TX_MINE_TO_HEIGHT", "3"))
-PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_TX_PAYMENT_MICRONOID", "1000000"))
-EXPECTED_INPUTS = int(os.environ.get("NOID_LIVE_TX_EXPECTED_INPUTS", "1"))
-EXPECTED_OUTPUTS = int(os.environ.get("NOID_LIVE_TX_EXPECTED_OUTPUTS", "2"))
+MINE_TO_HEIGHT = int(os.environ.get("ELIDE_LIVE_TX_MINE_TO_HEIGHT", "3"))
+PAYMENT_MICRO_ELD = int(os.environ.get("ELIDE_LIVE_TX_PAYMENT_MICRO_ELD", "1000000"))
+EXPECTED_INPUTS = int(os.environ.get("ELIDE_LIVE_TX_EXPECTED_INPUTS", "1"))
+EXPECTED_OUTPUTS = int(os.environ.get("ELIDE_LIVE_TX_EXPECTED_OUTPUTS", "2"))
 EXPECTED_PAGES = int(
-    os.environ.get("NOID_LIVE_TX_EXPECTED_PAGES", str((EXPECTED_INPUTS + 7) // 8))
+    os.environ.get("ELIDE_LIVE_TX_EXPECTED_PAGES", str((EXPECTED_INPUTS + 7) // 8))
 )
-EXPECTED_PROOF_CLASS = os.environ.get("NOID_LIVE_TX_EXPECTED_PROOF_CLASS", "B25")
-EXPECT_CHANGE = os.environ.get("NOID_LIVE_TX_EXPECT_CHANGE", "1") != "0"
+EXPECTED_PROOF_CLASS = os.environ.get("ELIDE_LIVE_TX_EXPECTED_PROOF_CLASS", "B25")
+EXPECT_CHANGE = os.environ.get("ELIDE_LIVE_TX_EXPECT_CHANGE", "1") != "0"
 
 
 class LiveTxError(RuntimeError):
@@ -82,7 +82,7 @@ def rpc(method, params=None, timeout=15):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paranoid_") else f"paranoid_{method}",
+            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
             "params": params or [],
         }
     ).encode()
@@ -105,7 +105,7 @@ class Node:
     def __init__(self):
         self.root = BASE / "node"
         self.data_dir = self.root / "data"
-        self.config = self.root / "parano1d.toml"
+        self.config = self.root / "elide.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None
@@ -262,7 +262,7 @@ def main():
         "scenario": SCENARIO,
         "configuration": {
             "mine_to_height": MINE_TO_HEIGHT,
-            "payment_micronoid": PAYMENT_MICRONOID,
+            "payment_micro_eld": PAYMENT_MICRO_ELD,
             "expected_inputs": EXPECTED_INPUTS,
             "expected_outputs": EXPECTED_OUTPUTS,
             "expected_pages": EXPECTED_PAGES,
@@ -300,13 +300,13 @@ def main():
         )
         scan = rpc("walletScan", timeout=120)
         before = rpc("walletGetBalance")
-        require(before["spendable_micronoid"] > PAYMENT_MICRONOID, f"sender not funded: {before}")
+        require(before["spendable_micro_eld"] > PAYMENT_MICRO_ELD, f"sender not funded: {before}")
         require(
             before["utxo_count"] >= EXPECTED_INPUTS,
             f"sender has too few UTXOs for requested shape: {before}",
         )
 
-        plan = rpc("walletPlanSend", [recipient["address"], PAYMENT_MICRONOID, 0], timeout=60)
+        plan = rpc("walletPlanSend", [recipient["address"], PAYMENT_MICRO_ELD, 0], timeout=60)
         require(
             plan["input_count"] == EXPECTED_INPUTS,
             f"payment selected the wrong input count: {plan}",
@@ -316,13 +316,13 @@ def main():
             f"payment selected the wrong output count: {plan}",
         )
         require(
-            (plan["change_micronoid"] > 0) == EXPECT_CHANGE,
+            (plan["change_micro_eld"] > 0) == EXPECT_CHANGE,
             f"payment change shape is wrong: {plan}",
         )
 
         submit_height = int(rpc("getChainInfo")["height"])
         proof_started = time.monotonic()
-        sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRONOID, 0], timeout=300)
+        sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRO_ELD, 0], timeout=300)
         proof_elapsed = time.monotonic() - proof_started
         require(
             proof_elapsed < 120,
@@ -334,7 +334,7 @@ def main():
             and sent["output_count"] == EXPECTED_OUTPUTS,
             f"send shape changed: {sent}",
         )
-        require(sent["fee_micronoid"] == plan["fee_micronoid"], f"send fee changed: {sent} vs {plan}")
+        require(sent["fee_micro_eld"] == plan["fee_micro_eld"], f"send fee changed: {sent} vs {plan}")
         print(f"[submitted] tx={txid} proof_and_admission={proof_elapsed:.3f}s", flush=True)
 
         mempool_started = time.monotonic()
@@ -378,7 +378,7 @@ def main():
         )
         recipient_slots = rpc("getSlotsByOwner", [recipient["address"]])
         require(len(recipient_slots) == 1, f"recipient should own one UTXO: {recipient_slots}")
-        require(recipient_slots[0]["value"] == PAYMENT_MICRONOID, f"recipient amount wrong: {recipient_slots}")
+        require(recipient_slots[0]["value"] == PAYMENT_MICRO_ELD, f"recipient amount wrong: {recipient_slots}")
 
         confirmation_height = int(confirmed["height"])
         parent_header = rpc("getBlockHeader", [confirmation_height - 1])
@@ -463,13 +463,13 @@ def main():
         require(active_recipient["address"] == recipient["address"], "recipient activation failed")
         recipient_scan = rpc("walletScan", timeout=120)
         recipient_balance = rpc("walletGetBalance")
-        require(recipient_balance["balance_micronoid"] == PAYMENT_MICRONOID, f"recipient balance wrong: {recipient_balance}")
+        require(recipient_balance["balance_micro_eld"] == PAYMENT_MICRO_ELD, f"recipient balance wrong: {recipient_balance}")
         require(recipient_balance["utxo_count"] == 1, f"recipient UTXO count wrong: {recipient_balance}")
 
         rpc("walletSetActiveAddress", [0])
         sender_scan = rpc("walletScan", timeout=120)
         sender_after = rpc("walletGetBalance")
-        require(sender_after["pending_outbound_micronoid"] == 0, f"sender reservation survived confirmation: {sender_after}")
+        require(sender_after["pending_outbound_micro_eld"] == 0, f"sender reservation survived confirmation: {sender_after}")
         history = rpc("walletHistory")
         require(any(item["tx_hash"] == txid and item["direction"] == "sent" for item in history), f"sent history missing: {history}")
 

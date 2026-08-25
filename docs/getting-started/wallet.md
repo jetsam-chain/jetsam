@@ -7,31 +7,31 @@ wallet use does not require a terminal.
 ## Choose the package
 
 Download the GUI wallet for the computer from the
-[GitHub release page](https://github.com/ignotusnemo/parano1d/releases):
+[GitHub release page](https://github.com/ignotusnemo/elide/releases):
 
 | Platform | Package |
 |---|---|
-| Debian or Ubuntu, x86-64 | `parano1d-gui-vVERSION-linux-x86_64.deb` |
-| Debian or Ubuntu, ARM64 | `parano1d-gui-vVERSION-linux-aarch64.deb` |
-| Windows x86-64 | `parano1d-gui-vVERSION-windows-x86_64-setup.exe` |
-| macOS Apple Silicon | `parano1d-gui-vVERSION-macos-aarch64.dmg` |
-| macOS Intel | `parano1d-gui-vVERSION-macos-x86_64.dmg` |
+| Debian or Ubuntu, x86-64 | `elide-gui-vVERSION-linux-x86_64.deb` |
+| Debian or Ubuntu, ARM64 | `elide-gui-vVERSION-linux-aarch64.deb` |
+| Windows x86-64 | `elide-gui-vVERSION-windows-x86_64-setup.exe` |
+| macOS Apple Silicon | `elide-gui-vVERSION-macos-aarch64.dmg` |
+| macOS Intel | `elide-gui-vVERSION-macos-x86_64.dmg` |
 
 Download `SHA256SUMS` from the same release. Verify the package before opening
 it:
 
 ```sh
 # Linux
-sha256sum parano1d-gui-vVERSION-linux-x86_64.deb
+sha256sum elide-gui-vVERSION-linux-x86_64.deb
 
 # macOS
-shasum -a 256 parano1d-gui-vVERSION-macos-aarch64.dmg
+shasum -a 256 elide-gui-vVERSION-macos-aarch64.dmg
 ```
 
 On Windows, use PowerShell:
 
 ```powershell
-Get-FileHash .\parano1d-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 The digest must equal the matching line in `SHA256SUMS`.
@@ -43,7 +43,7 @@ The digest must equal the matching line in `SHA256SUMS`.
 Open the `.deb` with the system Software application, or run:
 
 ```sh
-sudo apt install ./parano1d-gui-vVERSION-linux-x86_64.deb
+sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
 ```
 
 Launch **Parano1d** from the application menu.
@@ -104,7 +104,7 @@ To pay:
 
 The wallet forges the private authorization locally and submits the complete
 intent to its node. A successful final panel shows the logical transaction ID.
-See [Send NOID](../wallet/send.md) for status and confirmation behavior.
+See [Send ELD](../wallet/send.md) for status and confirmation behavior.
 
 ## Remove the application
 
@@ -113,12 +113,12 @@ Removing the application does not remove wallet data.
 On Debian or Ubuntu:
 
 ```sh
-sudo apt remove parano1d-gui
+sudo apt remove elide-gui
 ```
 
 On Windows, use **Installed apps → Parano1d → Uninstall**. On macOS, move the
 application from Applications to Trash.
 
-Wallet and node data remain under `.parano1d` in the user profile. Remove that
+Wallet and node data remain under `.elide` in the user profile. Remove that
 directory only after exporting or backing up the master secret and any receipts
 you intend to keep.

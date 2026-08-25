@@ -5,7 +5,7 @@ PINNED_REVISION="8e514ff4eb59e7925992e8274c4f10214d7c6b9f"
 SHORT_REVISION="8e514ff4"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPOSITORY="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/paranoid-frost-gkr.XXXXXX")"
+TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/paraelide-frost-gkr.XXXXXX")"
 WORKTREE="$TEMP_ROOT/source"
 
 cleanup() {

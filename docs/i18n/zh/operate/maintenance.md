@@ -8,18 +8,18 @@ Parano1d 以事务方式持久化 Live State。日常维护无需重放或永久
 使用本地 CLI：
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli state
-parano1d-cli mempool
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli state
+elide-cli mempool
+elide-cli mining
 ```
 
 systemd 环境：
 
 ```sh
-systemctl status parano1d
-journalctl -u parano1d --since today
+systemctl status elide
+journalctl -u elide --since today
 ```
 
 应监控 MDBX 中的 Live State 和证明缓存实际使用的磁盘空间，而不是假设一个固定
@@ -30,7 +30,7 @@ journalctl -u parano1d --since today
 复制数据库或替换二进制文件前，必须停止进程：
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 等待服务进入 inactive。不要用普通文件复制工具复制正在运行的 MDBX
@@ -60,7 +60,7 @@ P2P 身份文件用于维持稳定的对等节点 ID，但没有花费权限。
 1. 下载新压缩包和对应的 `SHA256SUMS`；
 2. 校验摘要；
 3. 停止服务；
-4. 同时替换 `parano1d`、`parano1d-cli` 和 `parano1d-miner`；
+4. 同时替换 `elide`、`elide-cli` 和 `elide-miner`；
 5. 启动服务；
 6. 检查启动和同步状态。
 
@@ -71,7 +71,7 @@ P2P 身份文件用于维持稳定的对等节点 ID，但没有花费权限。
 如果怀疑链数据或 State 损坏，并且网络中有健康对等节点：
 
 ```sh
-parano1d --purge-state
+elide --purge-state
 ```
 
 该命令会清除完整链数据库，包括区块头、保留的完整区块、链索引、撤销数据和

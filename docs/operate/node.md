@@ -30,11 +30,11 @@ choosing disk and memory limits.
 ## Install the Core release
 
 Download the archive for the server architecture and `SHA256SUMS` from the
-[release page](https://github.com/ignotusnemo/parano1d/releases). Verify the
+[release page](https://github.com/ignotusnemo/elide/releases). Verify the
 archive before extracting it. Replace `VERSION` with the release number:
 
 ```sh
-grep '  parano1d-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
+grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -44,8 +44,8 @@ The command must report `OK`. For ARM64, replace `linux-x86_64` with
 Extract the archive and run the hardware check:
 
 ```sh
-tar -xzf parano1d-core-vVERSION-linux-x86_64.tar.gz
-./parano1d --check-hardware
+tar -xzf elide-core-vVERSION-linux-x86_64.tar.gz
+./elide --check-hardware
 ```
 
 A supported machine ends with:
@@ -57,7 +57,7 @@ NODE READY
 Install the node and CLI:
 
 ```sh
-sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
+sudo install -m 0755 elide elide-cli /usr/local/bin/
 ```
 
 ## Create the service account
@@ -65,13 +65,13 @@ sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
 Keep node data separate from interactive user accounts:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/parano1d \
-  --create-home --shell /usr/sbin/nologin parano1d
-sudo install -d -o parano1d -g parano1d -m 0700 /var/lib/parano1d
-sudo install -d -o root -g parano1d -m 0750 /etc/parano1d
+sudo useradd --system --home-dir /var/lib/elide \
+  --create-home --shell /usr/sbin/nologin elide
+sudo install -d -o elide -g elide -m 0700 /var/lib/elide
+sudo install -d -o root -g elide -m 0750 /etc/elide
 ```
 
-Create `/etc/parano1d/parano1d.toml`:
+Create `/etc/elide/elide.toml`:
 
 ```toml
 [network]
@@ -80,7 +80,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "/var/lib/parano1d"
+path = "/var/lib/elide"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -93,8 +93,8 @@ miner_address = ""
 Protect the configuration:
 
 ```sh
-sudo chown root:parano1d /etc/parano1d/parano1d.toml
-sudo chmod 0640 /etc/parano1d/parano1d.toml
+sudo chown root:elide /etc/elide/elide.toml
+sudo chmod 0640 /etc/elide/elide.toml
 ```
 
 No seed address is required. The released binary discovers the public network
@@ -102,7 +102,7 @@ through its built-in DNS seeds and remembers successful outbound peers.
 
 ## Run under systemd
 
-Create `/etc/systemd/system/parano1d.service`:
+Create `/etc/systemd/system/elide.service`:
 
 ```ini
 [Unit]
@@ -112,9 +112,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=parano1d
-Group=parano1d
-ExecStart=/usr/local/bin/parano1d --config /etc/parano1d/parano1d.toml
+User=elide
+Group=elide
+ExecStart=/usr/local/bin/elide --config /etc/elide/elide.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
@@ -132,14 +132,14 @@ Load the unit and start the node:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now parano1d
-sudo systemctl status parano1d
+sudo systemctl enable --now elide
+sudo systemctl status elide
 ```
 
 Follow startup and synchronization:
 
 ```sh
-sudo journalctl -u parano1d -f
+sudo journalctl -u elide -f
 ```
 
 ## Check the node
@@ -147,9 +147,9 @@ sudo journalctl -u parano1d -f
 The CLI connects to the local RPC endpoint by default:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli state
+elide-cli status
+elide-cli peers
+elide-cli state
 ```
 
 `status` should report the current height, `peers` should become non-zero, and
@@ -170,17 +170,17 @@ tunnel or another authenticated private transport.
 Stop the service before replacing binaries or copying its data:
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 Install the verified replacement binaries, then restart:
 
 ```sh
-sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
-sudo systemctl start parano1d
-parano1d-cli status
+sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo systemctl start elide
+elide-cli status
 ```
 
-Do not remove `/var/lib/parano1d` during an ordinary software update. If the
-node's wallet receives funds, back up `/var/lib/parano1d/wallet.key`
+Do not remove `/var/lib/elide` during an ordinary software update. If the
+node's wallet receives funds, back up `/var/lib/elide/wallet.key`
 separately and protect it as a private secret.

@@ -24,7 +24,7 @@ support SSE4.1 and PCLMULQDQ, but the hypervisor must expose them.
 Run the non-mutating check:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 ## No peers
@@ -32,7 +32,7 @@ parano1d --check-hardware
 Check:
 
 ```sh
-parano1d-cli peers
+elide-cli peers
 ```
 
 Confirm outbound DNS and TCP access, local time, and the P2P listener setting.
@@ -54,9 +54,9 @@ Mining needs:
 Use:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 An ordinary node started with `--mode node` never mines even if an old TOML

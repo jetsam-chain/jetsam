@@ -9,6 +9,6 @@ publish = false
 [workspace]
 
 [dependencies]
-noid_core = { path = "../../noid_core" }
-noid_gkr = { path = "../../noid_gkr" }
-noid_poseidon2b = { path = "../../noid_poseidon2b" }
+elide_core = { path = "../../elide_core" }
+elide_gkr = { path = "../../elide_gkr" }
+elide_poseidon2b = { path = "../../elide_poseidon2b" }

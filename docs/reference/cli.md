@@ -4,16 +4,16 @@ The Core archive contains three executables:
 
 | Executable | Role |
 |---|---|
-| `parano1d` | Full node, wallet backend and optional internal proof/mining pipeline |
-| `parano1d-cli` | Thin JSON-RPC client for a running node |
-| `parano1d-miner` | Separate Poseidon2b nonce-search worker |
+| `elide` | Full node, wallet backend and optional internal proof/mining pipeline |
+| `elide-cli` | Thin JSON-RPC client for a running node |
+| `elide-miner` | Separate Poseidon2b nonce-search worker |
 
 ## Core daemon
 
 Run an ordinary node with no mode argument:
 
 ```sh
-parano1d
+elide
 ```
 
 Public daemon options are:
@@ -53,13 +53,13 @@ Examples:
 
 ```sh
 # Ordinary node
-parano1d --data-dir ~/.parano1d/data
+elide --data-dir ~/.elide/data
 
 # Internal miner using 12 logical CPUs
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 Keep RPC on loopback unless it is protected by a private or authenticated
@@ -67,7 +67,7 @@ transport. A bearer key authenticates requests but does not encrypt them.
 
 ## External miner
 
-`parano1d-miner` requests an already-proved, immutable template and searches
+`elide-miner` requests an already-proved, immutable template and searches
 only its 128-bit nonce.
 
 | Option | Default | Meaning |
@@ -83,7 +83,7 @@ only its 128-bit nonce.
 Typical local use:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
@@ -94,7 +94,7 @@ custom-payout boundaries.
 
 ## Node client
 
-`parano1d-cli` is a thin client for a running Core node. It holds no separate key
+`elide-cli` is a thin client for a running Core node. It holds no separate key
 and performs wallet operations through local JSON-RPC.
 
 ### Global options
@@ -105,13 +105,13 @@ and performs wallet operations through local JSON-RPC.
 ```
 
 The default endpoint is `http://127.0.0.1:9601`. Environment variable
-`NOID_RPC` changes it. `--rpc` takes precedence.
+`ELIDE_RPC` changes it. `--rpc` takes precedence.
 
-Amounts entered by CLI wallet commands are in NOID with up to six decimal
+Amounts entered by CLI wallet commands are in ELD with up to six decimal
 places:
 
 ```text
-1 NOID = 1,000,000 μNOID
+1 ELD = 1,000,000 μNOID
 ```
 
 ### Node and chain
@@ -133,11 +133,11 @@ places:
 Examples:
 
 ```sh
-parano1d-cli status
-parano1d-cli block-header 420
-parano1d-cli block 420
-parano1d-cli slot 9700063
-parano1d-cli utxos-of o1...
+elide-cli status
+elide-cli block-header 420
+elide-cli block 420
+elide-cli slot 9700063
+elide-cli utxos-of o1...
 ```
 
 `block` returns data only inside the 18-block body-retention window. `header`
@@ -152,15 +152,15 @@ and `block-header` remain available for every canonical height.
 | `block-template` | `--miner-addr o1…` | Node-owned external mining template |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Submit one 16-byte little-endian nonce |
 
-The external-mining commands are low-level. `parano1d-miner` handles template
+The external-mining commands are low-level. `elide-miner` handles template
 refresh and nonce encoding automatically.
 
 ### Fees and mempool
 
 ```sh
-parano1d-cli estimate-fee 2 --inputs 1
-parano1d-cli mempool
-parano1d-cli mempool-tx TXID
+elide-cli estimate-fee 2 --inputs 1
+elide-cli mempool
+elide-cli mempool-tx TXID
 ```
 
 `estimate-fee` reports the current node-accepted minimum for the declared live
@@ -170,7 +170,7 @@ individual physical pages.
 ### Address validation
 
 ```sh
-parano1d-cli validate o1...
+elide-cli validate o1...
 ```
 
 The command reports validity, canonical bech32m form and raw 32-byte payload.
@@ -178,11 +178,11 @@ The command reports validity, canonical bech32m form and raw 32-byte payload.
 ### Wallet addresses
 
 ```sh
-parano1d-cli address
-parano1d-cli address --list
-parano1d-cli address --new
-parano1d-cli address --index 3
-parano1d-cli address --use 3
+elide-cli address
+elide-cli address --list
+elide-cli address --new
+elide-cli address --index 3
+elide-cli address --use 3
 ```
 
 `--new`, `--index` and `--use` are mutually exclusive actions. A generated
@@ -192,9 +192,9 @@ and return change to that owner.
 ### Balance and UTXOs
 
 ```sh
-parano1d-cli balance
-parano1d-cli utxos
-parano1d-cli scan
+elide-cli balance
+elide-cli utxos
+elide-cli scan
 ```
 
 `balance` separates confirmed, reserved outbound, pending incoming and
@@ -206,19 +206,19 @@ owner index.
 Preview:
 
 ```sh
-parano1d-cli send o1... 10.5 --dry-run
+elide-cli send o1... 10.5 --dry-run
 ```
 
 Submit with automatic fee:
 
 ```sh
-parano1d-cli send o1... 10.5
+elide-cli send o1... 10.5
 ```
 
-Specify an exact fee in NOID only when needed:
+Specify an exact fee in ELD only when needed:
 
 ```sh
-parano1d-cli send o1... 10.5 --fee 0.012
+elide-cli send o1... 10.5 --fee 0.012
 ```
 
 The returned ID names the complete logical spend. Automatic fee selection is
@@ -227,21 +227,21 @@ recommended because occupancy and relay floor can change.
 ### History and receipts
 
 ```sh
-parano1d-cli history
-parano1d-cli history --last 20
-parano1d-cli history --address o1...
+elide-cli history
+elide-cli history --last 20
+elide-cli history --address o1...
 ```
 
 Export a confirmed outgoing receipt:
 
 ```sh
-parano1d-cli receipt TXID > receipt.hex
+elide-cli receipt TXID > receipt.hex
 ```
 
 Verify it:
 
 ```sh
-parano1d-cli verify "$(tr -d '\n' < receipt.hex)"
+elide-cli verify "$(tr -d '\n' < receipt.hex)"
 ```
 
 Receipt export works only for a locally saved different-owner payment.
@@ -249,7 +249,7 @@ Receipt export works only for a locally saved different-owner payment.
 ### Stop
 
 ```sh
-parano1d-cli stop
+elide-cli stop
 ```
 
 This requests graceful daemon shutdown. It is equivalent to the GUI's normal
@@ -261,7 +261,7 @@ Use `--json` and check the process exit status:
 
 ```sh
 height="$(
-  parano1d-cli --json status |
+  elide-cli --json status |
     jq -er '.height'
 )"
 ```

@@ -65,7 +65,7 @@ release_build_pack_tools 1
 
 CURRENT_STAGE='canonical HistoryStep matrix generation'
 printf '\n==> Generating B25/m22 and B255/m24 matrices at zstd level 19\n'
-NOID_ARTIFACT_ZSTD_LEVEL=19 "$RELEASE_MATRIX_GENERATOR" "$STAGING_DIR"
+ELIDE_ARTIFACT_ZSTD_LEVEL=19 "$RELEASE_MATRIX_GENERATOR" "$STAGING_DIR"
 
 CURRENT_STAGE='pack authentication'
 printf '\n==> Authenticating generated artifacts and deriving release pins\n'

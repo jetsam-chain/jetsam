@@ -1,0 +1,11 @@
+[package]
+name = "elide_fri"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+elide_core = { path = "../elide_core" }
+elide_poseidon2b = { path = "../elide_poseidon2b" }
+rayon = "1.10"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }

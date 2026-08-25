@@ -27,7 +27,7 @@
 - атомарно принимает и распространяет полный пакет
   `{block, HistoryStep terminal}`.
 
-Поиск nonce может выполняться в том же процессе либо в `parano1d-miner`. Роль
+Поиск nonce может выполняться в том же процессе либо в `elide-miner`. Роль
 внешнего вычислителя значительно уже:
 
 - получить одно неизменяемое расписание заголовка Poseidon2b и целевое
@@ -73,7 +73,7 @@
 | Режим | Построение доказательства | Поиск nonce | Подходит для |
 |---|---|---|---|
 | Встроенный | Нода Core | Нода Core | GUI-кошелёк, соло-майнер, один сервер |
-| Внешний | Нода Core | `parano1d-miner` | Отдельный CPU-вычислитель, приватная майнинговая сеть или пул |
+| Внешний | Нода Core | `elide-miner` | Отдельный CPU-вычислитель, приватная майнинговая сеть или пул |
 
 Оба режима следуют одним правилам консенсуса и создают одинаковые блоки.
 Внешний режим переносит через RPC только поиск nonce.
@@ -100,13 +100,13 @@
 До создания данных проверьте реальную машину:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 Запустите Core со встроенным майнером:
 
 ```sh
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 ```
 
 Без `--cpu-threads` используются все логические CPU, видимые процессу. Если
@@ -114,15 +114,15 @@ parano1d --mode miner --cpu-threads 12
 Отдельный канонический адрес bech32m можно зафиксировать так:
 
 ```sh
-parano1d --mode miner --miner-address o1...
+elide --mode miner --miner-address o1...
 ```
 
 Следите за готовностью и цепью из другого терминала:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 Если Core не синхронизирован или нет аутентифицированного пира, он ждёт и не
@@ -136,7 +136,7 @@ parano1d-cli mining
 доказательства:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --mining-key '<long-random-token>'
 ```
@@ -144,7 +144,7 @@ parano1d \
 Подключите вычислитель к RPC ноды через локальный интерфейс:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key '<long-random-token>' \
   --threads 12
@@ -214,7 +214,7 @@ ASERT регулирует целевое значение PoW Poseidon2b по �
 Текущая награда следует активному уровню `State`. Её показывает:
 
 ```sh
-parano1d-cli mining
+elide-cli mining
 ```
 
 В течение трёхлетнего периода финансирования разработки майнер получает 90%

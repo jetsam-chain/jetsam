@@ -3,7 +3,7 @@
 По умолчанию Core читает конфигурацию TOML из файла:
 
 ```text
-~/.parano1d/parano1d.toml
+~/.elide/elide.toml
 ```
 
 Другой файл можно указать через `--config`. Отсутствующий файл создаётся
@@ -19,7 +19,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "~/.parano1d/data"
+path = "~/.elide/data"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -84,9 +84,9 @@ TLS-прокси.
 Режим процесса задаётся явно:
 
 ```sh
-parano1d --mode node
-parano1d --mode miner
-parano1d --mode extminer --mining-key TOKEN
+elide --mode node
+elide --mode miner
+elide --mode extminer --mining-key TOKEN
 ```
 
 Устаревшее поле `mining.enabled` не переопределяет `--mode`. Пустой
@@ -103,7 +103,7 @@ parano1d --mode extminer --mining-key TOKEN
 создаёт значительно больше записей.
 
 Под systemd вывод попадает в journal. GUI перенаправляет вывод собственной ноды в
-`parano1d-node.log` выбранного каталога данных.
+`elide-node.log` выбранного каталога данных.
 
 ## Предварительная проверка
 
@@ -111,7 +111,7 @@ parano1d --mode extminer --mining-key TOKEN
 базы:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 Успешный отчёт заканчивается строкой `NODE READY`.

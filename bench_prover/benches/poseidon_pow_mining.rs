@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Poseidon2b PoW mining benchmark.
 //!
@@ -9,9 +10,9 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use noid_chain::consensus::genesis::genesis_header;
-use noid_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
-use noid_core::packed::PACKED_LANES;
+use elide_chain::consensus::genesis::genesis_header;
+use elide_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
+use elide_core::packed::PACKED_LANES;
 use rayon::prelude::*;
 
 const DIGEST_BATCH: usize = 256;
@@ -47,8 +48,8 @@ fn xor_digest(lhs: &mut [u8; 32], rhs: [u8; 32]) {
 }
 
 fn main() {
-    let seq_attempts = env_u64("NOID_POSEIDON_POW_SEQ", 20_000);
-    let par_attempts = env_u64("NOID_POSEIDON_POW_PAR", 200_000);
+    let seq_attempts = env_u64("ELIDE_POSEIDON_POW_SEQ", 20_000);
+    let par_attempts = env_u64("ELIDE_POSEIDON_POW_PAR", 200_000);
 
     let header = genesis_header();
     let seq_fields = pow_header_fields(&header);
@@ -58,7 +59,7 @@ fn main() {
     println!("  PARANOID Poseidon2b PoW Mining Benchmark");
     println!("  =====================================================================");
     println!("  Measures production H_POSEIDON_POW(header fields with patched nonce).");
-    println!("  Override: NOID_POSEIDON_POW_SEQ=20000 NOID_POSEIDON_POW_PAR=200000");
+    println!("  Override: ELIDE_POSEIDON_POW_SEQ=20000 ELIDE_POSEIDON_POW_PAR=200000");
     println!();
 
     let start = Instant::now();
@@ -140,7 +141,7 @@ fn main() {
     );
     println!(
         "  CPU backend:              {}",
-        noid_core::cpu::selected_backend()
+        elide_core::cpu::selected_backend()
     );
     println!("  logical packed lanes:     {PACKED_LANES}");
     println!(

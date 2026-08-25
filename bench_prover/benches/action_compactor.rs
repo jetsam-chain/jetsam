@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Bitmap-driven action-compactor row/RSS gate.
 //!
-//! Defaults to B25. Use `NOID_ACTION_TIERS=25,255`; B255 intentionally
+//! Defaults to B25. Use `ELIDE_ACTION_TIERS=25,255`; B255 intentionally
 //! builds the real 4,096-row sorting network and may be expensive.
 
 use std::time::Instant;
 
 use bench_prover::legal_block_scenarios;
-use noid_core::mem_profile::current_mem_snapshot;
-use noid_core::Block128;
-use noid_recursive::acceptance::shape::ShapeClass;
-use noid_recursive::acceptance::trace::action_compaction::{
+use elide_core::mem_profile::current_mem_snapshot;
+use elide_core::Block128;
+use elide_recursive::acceptance::shape::ShapeClass;
+use elide_recursive::acceptance::trace::action_compaction::{
     bind_mint_packed_values_body_order, compact_action_rows,
 };
-use noid_recursive::acceptance::trace::action_surface::ActionRowTrace;
-use noid_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
+use elide_recursive::acceptance::trace::action_surface::ActionRowTrace;
+use elide_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
 
 fn requested_tiers() -> Vec<usize> {
-    let raw = std::env::var("NOID_ACTION_TIERS").unwrap_or_else(|_| "25".into());
+    let raw = std::env::var("ELIDE_ACTION_TIERS").unwrap_or_else(|_| "25".into());
     let tiers: Vec<_> = raw
         .split(',')
         .filter_map(|part| part.trim().parse().ok())
@@ -27,7 +28,7 @@ fn requested_tiers() -> Vec<usize> {
     assert!(!tiers.is_empty());
     assert!(tiers
         .iter()
-        .all(|tier| noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(tier)));
+        .all(|tier| elide_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(tier)));
     tiers
 }
 
@@ -51,7 +52,7 @@ fn row(b: &mut FieldR1csBuilder, ordinal: usize, live: bool, is_mint: bool) -> A
 
 fn main() {
     println!("PARANOID bitmap action-compactor gate");
-    println!("NOID_ACTION_TIERS=25,255 selects class runs.\n");
+    println!("ELIDE_ACTION_TIERS=25,255 selects class runs.\n");
 
     for tier in requested_tiers() {
         let class = ShapeClass { tier };
@@ -61,11 +62,11 @@ fn main() {
         pattern.push(true); // canonical coinbase mint
         kinds.push(true);
         for scenario in &scenarios {
-            for input in 0..noid_tx::TX_INPUTS {
+            for input in 0..elide_tx::TX_INPUTS {
                 pattern.push(scenario.body.input_is_live(input));
                 kinds.push(false);
             }
-            for output in 0..noid_tx::TX_OUTPUTS {
+            for output in 0..elide_tx::TX_OUTPUTS {
                 pattern.push(scenario.body.output_is_live(output));
                 kinds.push(true);
             }
@@ -112,7 +113,7 @@ fn main() {
         let rows_before_build = b.num_wires();
         let (r1cs, witness) = b.build();
         let build = started.elapsed() - assembly;
-        let verify = std::env::var_os("NOID_ACTION_VERIFY").is_some() || tier != 255;
+        let verify = std::env::var_os("ELIDE_ACTION_VERIFY").is_some() || tier != 255;
         let verify_started = Instant::now();
         if verify {
             assert!(r1cs.satisfies(&witness));
@@ -134,7 +135,7 @@ fn main() {
                 verify_started.elapsed().as_secs_f64()
             );
         } else {
-            println!("    satisfy:          skipped (set NOID_ACTION_VERIFY=1)");
+            println!("    satisfy:          skipped (set ELIDE_ACTION_VERIFY=1)");
         }
         if let (Some(before), Some(after)) = (before, after) {
             println!("    RSS:              {:.1} MiB", after.rss_mb());

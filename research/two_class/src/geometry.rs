@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Research-facing names for the production B25/B255 geometry.
 
-pub use noid_chain::consensus::paged_spend::BlockProofClass as ProofClass;
+pub use elide_chain::consensus::paged_spend::BlockProofClass as ProofClass;
 
-pub const BLOCK_TARGET_SECONDS: usize = noid_chain::consensus::params::BLOCK_TIME as usize;
+pub const BLOCK_TARGET_SECONDS: usize = elide_chain::consensus::params::BLOCK_TIME as usize;
 
 pub const B25_PAGE_CAPACITY: usize = ProofClass::B25.page_capacity();
 pub const B25_AUTHORIZATION_CAPACITY: usize = ProofClass::B25.live_authorization_capacity();
 pub const B25_INPUT_CAPACITY: usize = ProofClass::B25.input_capacity();
 pub const B25_OUTPUT_CAPACITY: usize = ProofClass::B25.output_capacity();
 pub const B25_TOUCHED_CAPACITY: usize = B25_INPUT_CAPACITY + B25_OUTPUT_CAPACITY + 1;
-pub const B25_ACTION_CANDIDATES: usize = B25_PAGE_CAPACITY * noid_tx::TX_ACTIONS + 1;
+pub const B25_ACTION_CANDIDATES: usize = B25_PAGE_CAPACITY * elide_tx::TX_ACTIONS + 1;
 pub const B25_ACTION_SORT_CAPACITY: usize = B25_ACTION_CANDIDATES.next_power_of_two();
 pub const B25_OUTER_M: usize = ProofClass::B25.outer_m();
 
@@ -22,13 +23,13 @@ pub const B255_AUTHORIZATION_TILE_CAPACITY: usize = ProofClass::B255.authorizati
 pub const B255_INPUT_CAPACITY: usize = ProofClass::B255.input_capacity();
 pub const B255_OUTPUT_CAPACITY: usize = ProofClass::B255.output_capacity();
 pub const B255_TOUCHED_CAPACITY: usize = B255_INPUT_CAPACITY + B255_OUTPUT_CAPACITY + 1;
-pub const B255_ACTION_CANDIDATES: usize = B255_PAGE_CAPACITY * noid_tx::TX_ACTIONS + 1;
+pub const B255_ACTION_CANDIDATES: usize = B255_PAGE_CAPACITY * elide_tx::TX_ACTIONS + 1;
 pub const B255_ACTION_SORT_CAPACITY: usize = B255_ACTION_CANDIDATES.next_power_of_two();
 pub const B255_OUTER_M: usize = ProofClass::B255.outer_m();
 
-pub const LOGICAL_PAGE_CAPACITY: usize = noid_tx::MAX_PAGED_SPEND_PAGES;
-pub const LOGICAL_INPUT_CAPACITY: usize = noid_tx::MAX_PAGED_SPEND_INPUTS;
-pub const LOGICAL_OUTPUT_CAPACITY: usize = noid_tx::MAX_PAGED_SPEND_OUTPUTS;
+pub const LOGICAL_PAGE_CAPACITY: usize = elide_tx::MAX_PAGED_SPEND_PAGES;
+pub const LOGICAL_INPUT_CAPACITY: usize = elide_tx::MAX_PAGED_SPEND_INPUTS;
+pub const LOGICAL_OUTPUT_CAPACITY: usize = elide_tx::MAX_PAGED_SPEND_OUTPUTS;
 
 pub fn b25_saturated_tps() -> f64 {
     B25_PAGE_CAPACITY as f64 / BLOCK_TARGET_SECONDS as f64

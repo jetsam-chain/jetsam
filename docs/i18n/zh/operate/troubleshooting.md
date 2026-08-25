@@ -21,7 +21,7 @@ ARM64 要求 NEON 和 PMULL。发布版不会退回标量参考实现。
 运行不修改数据的检查：
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 ## 没有对等节点
@@ -29,7 +29,7 @@ parano1d --check-hardware
 检查：
 
 ```sh
-parano1d-cli peers
+elide-cli peers
 ```
 
 确认出站 DNS 和 TCP 可用、本机时间正确、P2P 监听配置无误。若要接受入站
@@ -50,9 +50,9 @@ parano1d-cli peers
 运行：
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 以 `--mode node` 启动的普通节点永远不会挖矿，即使旧 TOML 中包含

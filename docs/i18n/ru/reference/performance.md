@@ -28,7 +28,7 @@
 задержка и построение блочного `HistoryStep` в измерение не входят.
 
 ```sh
-NOID_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
+ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
   --manifest-path research/two_class/Cargo.toml \
   --bin two-class-wallet-bench
 ```
@@ -43,16 +43,16 @@ NOID_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
 классы по отдельности, чтобы вывод однозначно указывал классы родителя и потомка.
 
 ```sh
-NOID_PACK_ROOT=../parano1d-artifacts/history-step-pack-v1
-source "$NOID_PACK_ROOT/pins.env"
-export NOID_HISTORY_STEP_PACK_DIR="$NOID_PACK_ROOT"
+ELIDE_PACK_ROOT=../elide-artifacts/history-step-pack-v1
+source "$ELIDE_PACK_ROOT/pins.env"
+export ELIDE_HISTORY_STEP_PACK_DIR="$ELIDE_PACK_ROOT"
 
-NOID_HISTORY_STEP_BENCH_FILTER=B25 \
-NOID_HISTORY_STEP_BENCH_SAMPLES=20 \
+ELIDE_HISTORY_STEP_BENCH_FILTER=B25 \
+ELIDE_HISTORY_STEP_BENCH_SAMPLES=20 \
 cargo bench --locked -p bench_prover --bench history_step_proof
 
-NOID_HISTORY_STEP_BENCH_FILTER=B255 \
-NOID_HISTORY_STEP_BENCH_SAMPLES=20 \
+ELIDE_HISTORY_STEP_BENCH_FILTER=B255 \
+ELIDE_HISTORY_STEP_BENCH_SAMPLES=20 \
 cargo bench --locked -p bench_prover --bench history_step_proof
 ```
 

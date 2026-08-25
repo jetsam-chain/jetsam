@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Isolated B25/B255 PagedSpend laboratory.
 //!

@@ -47,21 +47,21 @@ done
 BIN_DIR="$(CDPATH='' cd -- "$BIN_DIR" && pwd -P)"
 mkdir -p -- "$OUTPUT_DIR"
 OUTPUT_DIR="$(CDPATH='' cd -- "$OUTPUT_DIR" && pwd -P)"
-for binary in parano1d-gui parano1d; do
+for binary in elide-gui elide; do
   [[ -f $BIN_DIR/$binary && -x $BIN_DIR/$binary ]] || {
     echo "release binary is missing or not executable: $BIN_DIR/$binary" >&2
     exit 1
   }
 done
 
-TEMPORARY=$(mktemp -d "${TMPDIR:-/tmp}/parano1d-macos-gui.XXXXXX")
+TEMPORARY=$(mktemp -d "${TMPDIR:-/tmp}/elide-macos-gui.XXXXXX")
 MOUNTED=0
 cleanup() {
   local status=$?
   if [[ $MOUNTED == 1 ]]; then
     hdiutil detach "$TEMPORARY/mount" -quiet || true
   fi
-  if [[ -d $TEMPORARY && $TEMPORARY == "${TMPDIR:-/tmp}"/parano1d-macos-gui.* ]]; then
+  if [[ -d $TEMPORARY && $TEMPORARY == "${TMPDIR:-/tmp}"/elide-macos-gui.* ]]; then
     rm -r -- "$TEMPORARY" || true
   fi
   exit "$status"
@@ -76,8 +76,8 @@ ICONSET="$TEMPORARY/Parano1d.iconset"
 DMG_ROOT="$TEMPORARY/dmg"
 mkdir -p -- "$MACOS" "$RESOURCES" "$ICONSET" "$DMG_ROOT"
 
-install -m 0755 "$BIN_DIR/parano1d-gui" "$MACOS/Parano1d"
-install -m 0755 "$BIN_DIR/parano1d" "$MACOS/parano1d-node"
+install -m 0755 "$BIN_DIR/elide-gui" "$MACOS/Parano1d"
+install -m 0755 "$BIN_DIR/elide" "$MACOS/elide-node"
 install -m 0644 "$RELEASE_ROOT_DIR/LICENSE" "$RESOURCES/LICENSE.txt"
 install -m 0644 "$RELEASE_ROOT_DIR/NOTICE" "$RESOURCES/NOTICE.txt"
 
@@ -103,7 +103,7 @@ for specification in \
 do
   size=${specification%% *}
   name=${specification#* }
-  icon="$RELEASE_ROOT_DIR/noid_gui/assets/app-icons/Parano1d-${size}.png"
+  icon="$RELEASE_ROOT_DIR/elide_gui/assets/app-icons/Parano1d-${size}.png"
   [[ -f $icon ]] || {
     echo "macOS icon source is missing: $icon" >&2
     exit 1
@@ -113,23 +113,23 @@ done
 iconutil -c icns "$ICONSET" -o "$RESOURCES/Parano1d.icns"
 
 xattr -cr "$APP"
-SIGN_IDENTITY=${NOID_MACOS_SIGN_IDENTITY:--}
+SIGN_IDENTITY=${ELIDE_MACOS_SIGN_IDENTITY:--}
 if [[ $SIGN_IDENTITY == - ]]; then
-  codesign --force --sign - --timestamp=none "$MACOS/parano1d-node"
+  codesign --force --sign - --timestamp=none "$MACOS/elide-node"
   codesign --force --sign - --timestamp=none "$MACOS/Parano1d"
   codesign --force --deep --sign - --timestamp=none "$APP"
 else
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/parano1d-node"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/elide-node"
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/Parano1d"
   codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
 "$MACOS/Parano1d" --release-self-check >/dev/null
-"$MACOS/parano1d-node" --check-hardware >/dev/null
+"$MACOS/elide-node" --check-hardware >/dev/null
 
 cp -R "$APP" "$DMG_ROOT/Parano1d.app"
 ln -s /Applications "$DMG_ROOT/Applications"
-ARTIFACT="$OUTPUT_DIR/parano1d-gui-v${VERSION}-${PLATFORM}.dmg"
+ARTIFACT="$OUTPUT_DIR/elide-gui-v${VERSION}-${PLATFORM}.dmg"
 hdiutil create \
   -volname "Parano1d" \
   -srcfolder "$DMG_ROOT" \
@@ -142,13 +142,13 @@ hdiutil attach -readonly -nobrowse -mountpoint "$TEMPORARY/mount" "$ARTIFACT" >/
 MOUNTED=1
 "$TEMPORARY/mount/Parano1d.app/Contents/MacOS/Parano1d" \
   --release-self-check >/dev/null
-"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-node" \
+"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/elide-node" \
   --check-hardware >/dev/null
 [[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/LICENSE.txt ]]
 [[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/NOTICE.txt ]]
-[[ -s $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-node ]]
-[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-cli ]]
-[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-miner ]]
+[[ -s $TEMPORARY/mount/Parano1d.app/Contents/MacOS/elide-node ]]
+[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/elide-cli ]]
+[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/elide-miner ]]
 hdiutil detach "$TEMPORARY/mount" -quiet
 MOUNTED=0
 printf '%s\n' "$ARTIFACT"

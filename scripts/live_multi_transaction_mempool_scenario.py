@@ -20,15 +20,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
+NODE_BIN = ROOT / "target" / "release" / "elide"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_MULTI_TX_DIR", str(RUN_PARENT / f"multi-tx-mempool-clean-{STAMP}")
+        "ELIDE_LIVE_MULTI_TX_DIR", str(RUN_PARENT / f"multi-tx-mempool-clean-{STAMP}")
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_MULTI_TX_BASE_PORT", "20500"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_MULTI_TX_BASE_PORT", "20500"))
 AMOUNTS = (1_000_000, 2_000_000, 3_000_000)
 
 
@@ -64,7 +64,7 @@ def rpc(port, method, params=None, timeout=15):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paranoid_") else f"paranoid_{method}",
+            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
             "params": params or [],
         }
     ).encode()
@@ -90,7 +90,7 @@ class Node:
         self.rpc_port = rpc_port
         self.root = BASE / name
         self.data_dir = self.root / "data"
-        self.config = self.root / "parano1d.toml"
+        self.config = self.root / "elide.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None
@@ -282,7 +282,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": binary_hash,
         "binary_size": NODE_BIN.stat().st_size,
-        "amounts_micronoid": list(AMOUNTS),
+        "amounts_micro_eld": list(AMOUNTS),
         "status": "running",
     }
     error = None
@@ -313,7 +313,7 @@ def main():
             lambda: exact_tip(miner, observer),
             timeout=300,
         )
-        require(rpc(observer.rpc_port, "walletGetBalance")["balance_micronoid"] == 0, "recipient pre-funded")
+        require(rpc(observer.rpc_port, "walletGetBalance")["balance_micro_eld"] == 0, "recipient pre-funded")
 
         sends = []
         submit_started = time.monotonic()
@@ -393,7 +393,7 @@ def main():
 
         recipient_balance = rpc(observer.rpc_port, "walletGetBalance")
         require(
-            recipient_balance["balance_micronoid"] == sum(AMOUNTS),
+            recipient_balance["balance_micro_eld"] == sum(AMOUNTS),
             f"observer wallet did not update incrementally: {recipient_balance}",
         )
         require(recipient_balance["utxo_count"] == len(AMOUNTS), f"recipient UTXO count wrong: {recipient_balance}")

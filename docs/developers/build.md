@@ -44,9 +44,9 @@ Build ordinary development binaries:
 
 ```sh
 cargo build --locked \
-  -p noid_node \
-  -p noid-extminer \
-  -p noid_gui \
+  -p elide_node \
+  -p elide-extminer \
+  -p elide_gui \
   --bins
 ```
 
@@ -57,12 +57,12 @@ described below.
 ## Reproduce the soundness certificate
 
 The production calculations and proof documents are in
-[`noid_soundness`](https://github.com/ignotusnemo/parano1d/tree/main/noid_soundness).
+[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness).
 
 ```sh
-cargo run --release --locked -p noid_soundness
-cargo run --release --locked -p noid_soundness -- --exact
-cargo test --release --locked -p noid_soundness
+cargo run --release --locked -p elide_soundness
+cargo run --release --locked -p elide_soundness -- --exact
+cargo test --release --locked -p elide_soundness
 ```
 
 ## Generate the proof pack
@@ -80,9 +80,9 @@ SHA256SUMS
 Generate B25 and B255 matrices from honest fixtures:
 
 ```sh
-mkdir -p ../parano1d-artifacts
+mkdir -p ../elide-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-pack-v1
+  ../elide-artifacts/history-step-pack-v1
 ```
 
 Generation is expensive and only needs to be performed once for an unchanged
@@ -96,7 +96,7 @@ overwrite an existing output path.
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../parano1d-artifacts/history-step-pack-v1
+  --pack ../elide-artifacts/history-step-pack-v1
 ```
 
 The script:
@@ -138,9 +138,9 @@ to zero. The Core archive has a fixed member set:
 README.txt
 LICENSE
 NOTICE
-parano1d
-parano1d-cli
-parano1d-miner
+elide
+elide-cli
+elide-miner
 ```
 
 The GUI package contains only the application and its private node. It does not

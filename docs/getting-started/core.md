@@ -2,9 +2,9 @@
 
 The Core archive is for node operators, miners and developers. It contains:
 
-- `parano1d`, the full node and built-in miner;
-- `parano1d-cli`, the local node and wallet client;
-- `parano1d-miner`, the external PoW worker.
+- `elide`, the full node and built-in miner;
+- `elide-cli`, the local node and wallet client;
+- `elide-miner`, the external PoW worker.
 
 The GUI wallet is distributed separately.
 
@@ -13,11 +13,11 @@ The GUI wallet is distributed separately.
 Choose the Core archive for the host:
 
 ```text
-parano1d-core-vVERSION-linux-x86_64.tar.gz
-parano1d-core-vVERSION-linux-aarch64.tar.gz
-parano1d-core-vVERSION-windows-x86_64.zip
-parano1d-core-vVERSION-macos-aarch64.tar.gz
-parano1d-core-vVERSION-macos-x86_64.tar.gz
+elide-core-vVERSION-linux-x86_64.tar.gz
+elide-core-vVERSION-linux-aarch64.tar.gz
+elide-core-vVERSION-windows-x86_64.zip
+elide-core-vVERSION-macos-aarch64.tar.gz
+elide-core-vVERSION-macos-x86_64.tar.gz
 ```
 
 Compare its SHA-256 digest with `SHA256SUMS` from the same release before
@@ -28,13 +28,13 @@ extracting it.
 On Linux or macOS:
 
 ```sh
-./parano1d --check-hardware
+./elide --check-hardware
 ```
 
 On Windows PowerShell:
 
 ```powershell
-.\parano1d.exe --check-hardware
+.\elide.exe --check-hardware
 ```
 
 The final line must be:
@@ -55,22 +55,22 @@ For virtual-machine caveats, memory and disk planning, see
 Run Core in the foreground:
 
 ```sh
-./parano1d
+./elide
 ```
 
 On first start it creates:
 
 ```text
-~/.parano1d/parano1d.toml
-~/.parano1d/data/
+~/.elide/elide.toml
+~/.elide/data/
 ```
 
 In another terminal:
 
 ```sh
-./parano1d-cli status
-./parano1d-cli peers
-./parano1d-cli state
+./elide-cli status
+./elide-cli peers
+./elide-cli state
 ```
 
 The default P2P listener is `0.0.0.0:9600`. RPC remains on
@@ -79,7 +79,7 @@ The default P2P listener is `0.0.0.0:9600`. RPC remains on
 Stop cleanly with:
 
 ```sh
-./parano1d-cli stop
+./elide-cli stop
 ```
 
 For a permanent system service, firewall guidance and updates, continue with

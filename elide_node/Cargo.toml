@@ -1,0 +1,78 @@
+[package]
+name = "elide_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# --- Daemon ---
+[[bin]]
+name = "elide"
+path = "src/main.rs"
+
+# --- CLI client ---
+[[bin]]
+name = "elide-cli"
+path = "src/bin/elide_cli.rs"
+
+[dependencies]
+elide_chain      = { path = "../elide_chain" }
+elide_block      = { path = "../elide_block" }
+elide_recursive  = { path = "../elide_recursive" }
+elide_tx         = { path = "../elide_tx" }
+elide_poseidon2b = { path = "../elide_poseidon2b" }
+elide_gkr        = { path = "../elide_gkr" }
+elide_core       = { path = "../elide_core" }
+elide_mempool    = { path = "../elide_mempool" }
+elide_miner      = { path = "../elide_miner" }
+elide-ivc-core   = { path = "../elide_ivc_core" }
+elide_p2p        = { path = "../elide_p2p" }
+elide_rpc        = { path = "../elide_rpc" }
+
+# Async runtime
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+bincode            = "1"
+
+# Error handling
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+
+# CLI
+clap    = { version = "4", features = ["derive", "env"] }
+toml    = "0.8"
+hex     = "0.4"
+blake3  = "1"
+
+# Networking
+libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Wallet security: key derivation, zeroization, and owner-only file handling
+rand             = "0.8"
+zeroize          = { version = "1", features = ["zeroize_derive"] }
+libc             = "0.2"
+
+# Memory: jemalloc as global allocator.
+# glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)
+# indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
+# the OS aggressively via background threads (dirty_decay_ms=1000).
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+[dev-dependencies]
+bench_prover = { path = "../bench_prover" }
+tempfile = "3"
+static_assertions = "1.1"
+
+[build-dependencies]
+elide_recursive  = { path = "../elide_recursive" }
+elide_miner      = { path = "../elide_miner" }
+elide-ivc-core   = { path = "../elide_ivc_core" }
+zstd            = "0.13"

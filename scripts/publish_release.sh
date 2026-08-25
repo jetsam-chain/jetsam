@@ -25,11 +25,11 @@ CHANNEL must be one of:
 
 Examples:
   ./scripts/publish_release.sh 0.0.4 \
-    /home/neo/rust/parano1d-artifacts/history-step-pack-v1 \
+    /home/neo/rust/elide-artifacts/history-step-pack-v1 \
     --channel prerelease
 
   ./scripts/publish_release.sh 1.0.0 \
-    /home/neo/rust/parano1d-artifacts/history-step-pack-v1 \
+    /home/neo/rust/elide-artifacts/history-step-pack-v1 \
     --channel stable
 EOF
 }
@@ -191,10 +191,10 @@ if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
   release_die "release publication requires GNU tar for a normalized pack archive"
 fi
 
-TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/parano1d-release.XXXXXX")
+TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/elide-release.XXXXXX")
 cleanup() {
   local status=$?
-  if [[ -d $TEMP_DIR && $TEMP_DIR == "${TMPDIR:-/tmp}"/parano1d-release.* ]]; then
+  if [[ -d $TEMP_DIR && $TEMP_DIR == "${TMPDIR:-/tmp}"/elide-release.* ]]; then
     rm -r -- "$TEMP_DIR" || true
   fi
   exit "$status"
@@ -293,16 +293,16 @@ fi
   release_die "published GitHub release channel does not match $CHANNEL"
 
 EXPECTED_ASSETS=(
-  "parano1d-core-$TAG-linux-x86_64.tar.gz"
-  "parano1d-core-$TAG-linux-aarch64.tar.gz"
-  "parano1d-core-$TAG-windows-x86_64.zip"
-  "parano1d-core-$TAG-macos-aarch64.tar.gz"
-  "parano1d-core-$TAG-macos-x86_64.tar.gz"
-  "parano1d-gui-$TAG-linux-x86_64.deb"
-  "parano1d-gui-$TAG-linux-aarch64.deb"
-  "parano1d-gui-$TAG-windows-x86_64-setup.exe"
-  "parano1d-gui-$TAG-macos-aarch64.dmg"
-  "parano1d-gui-$TAG-macos-x86_64.dmg"
+  "elide-core-$TAG-linux-x86_64.tar.gz"
+  "elide-core-$TAG-linux-aarch64.tar.gz"
+  "elide-core-$TAG-windows-x86_64.zip"
+  "elide-core-$TAG-macos-aarch64.tar.gz"
+  "elide-core-$TAG-macos-x86_64.tar.gz"
+  "elide-gui-$TAG-linux-x86_64.deb"
+  "elide-gui-$TAG-linux-aarch64.deb"
+  "elide-gui-$TAG-windows-x86_64-setup.exe"
+  "elide-gui-$TAG-macos-aarch64.dmg"
+  "elide-gui-$TAG-macos-x86_64.dmg"
   history-step-pack-v1.tar.gz
   SHA256SUMS
 )

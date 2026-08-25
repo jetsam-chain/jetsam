@@ -3,7 +3,7 @@
 Core 默认从以下位置读取 TOML 配置：
 
 ```text
-~/.parano1d/parano1d.toml
+~/.elide/elide.toml
 ```
 
 也可通过 `--config` 指定其他文件。文件不存在时会以安全默认值原子创建。
@@ -18,7 +18,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "~/.parano1d/data"
+path = "~/.elide/data"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -77,9 +77,9 @@ RPC 应保持监听：
 进程模式具有决定性：
 
 ```sh
-parano1d --mode node
-parano1d --mode miner
-parano1d --mode extminer --mining-key TOKEN
+elide --mode node
+elide --mode miner
+elide --mode extminer --mining-key TOKEN
 ```
 
 旧的 `mining.enabled` 字段不会覆盖 `--mode`。`miner_address` 为空时，
@@ -94,14 +94,14 @@ parano1d --mode extminer --mining-key TOKEN
 `info`。`debug` 适合有时间边界的诊断，但日志量会明显增加。
 
 systemd 环境下输出进入 journal。GUI 则把私有节点日志写入所选数据目录的
-`parano1d-node.log`。
+`elide-node.log`。
 
 ## 启动前检查
 
 无需创建配置、钱包或数据库即可检查 CPU：
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 检查成功时，最后一行是 `NODE READY`。

@@ -25,7 +25,7 @@ A mining node owns the block. It:
 - validates the winning nonce;
 - commits and broadcasts the complete `{block, HistoryStep terminal}` bundle.
 
-Nonce search may run inside that process or in `parano1d-miner`. An external
+Nonce search may run inside that process or in `elide-miner`. An external
 worker has a much narrower role:
 
 - receive one immutable Poseidon2b header schedule and target;
@@ -66,7 +66,7 @@ chooses between valid competing chains.
 | Mode | Proof construction | Nonce search | Best fit |
 |---|---|---|---|
 | Internal | Core node | Core node | GUI wallet, solo miner, one server |
-| External | Core node | `parano1d-miner` | Separate CPU worker, private mining network or pool |
+| External | Core node | `elide-miner` | Separate CPU worker, private mining network or pool |
 
 Both modes use the same consensus rules and produce the same blocks. External
 mining moves only nonce search across the RPC boundary.
@@ -94,13 +94,13 @@ block table.
 Check the actual host before creating node data:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 Start Core with its built-in miner:
 
 ```sh
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 ```
 
 Omit `--cpu-threads` to use every logical CPU visible to the process. When no
@@ -108,15 +108,15 @@ explicit payout is configured, Core uses the active address in its local
 wallet. A separate canonical bech32m payout can be fixed with:
 
 ```sh
-parano1d --mode miner --miner-address o1...
+elide --mode miner --miner-address o1...
 ```
 
 Watch readiness and chain progress from another terminal:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 Core waits rather than mining an isolated local view when it is unsynchronized
@@ -128,7 +128,7 @@ procedure is in [Internal mining](../operate/internal-mining.md).
 Start a node that owns and proves external-mining templates:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --mining-key '<long-random-token>'
 ```
@@ -136,7 +136,7 @@ parano1d \
 Run the worker against its loopback RPC endpoint:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key '<long-random-token>' \
   --threads 12
@@ -205,7 +205,7 @@ the canonical block-hash tie-break.
 The current reward follows the active State level and is displayed by:
 
 ```sh
-parano1d-cli mining
+elide-cli mining
 ```
 
 During the three-year development allocation, the miner receives 90% of newly

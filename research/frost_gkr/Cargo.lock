@@ -43,9 +43,9 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 name = "frost-gkr-bench"
 version = "0.1.0"
 dependencies = [
- "noid_core",
- "noid_gkr",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_gkr",
+ "elide_poseidon2b",
 ]
 
 [[package]]
@@ -66,17 +66,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "noid_air"
+name = "elide_air"
 version = "0.1.0"
 dependencies = [
- "noid_core",
- "noid_poseidon2b",
- "noid_tx",
+ "elide_core",
+ "elide_poseidon2b",
+ "elide_tx",
  "rayon",
 ]
 
 [[package]]
-name = "noid_core"
+name = "elide_core"
 version = "0.1.0"
 dependencies = [
  "rand",
@@ -86,32 +86,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "noid_gkr"
+name = "elide_gkr"
 version = "0.1.0"
 dependencies = [
- "noid_air",
- "noid_core",
- "noid_poseidon2b",
- "noid_tx",
+ "elide_air",
+ "elide_core",
+ "elide_poseidon2b",
+ "elide_tx",
  "rayon",
 ]
 
 [[package]]
-name = "noid_poseidon2b"
+name = "elide_poseidon2b"
 version = "0.1.0"
 dependencies = [
- "noid_core",
+ "elide_core",
  "rand",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "noid_tx"
+name = "elide_tx"
 version = "0.1.0"
 dependencies = [
- "noid_core",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_poseidon2b",
 ]
 
 [[package]]

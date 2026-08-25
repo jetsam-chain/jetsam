@@ -12,13 +12,13 @@
 Запустите ноду в режиме внешнего майнера с токеном доступа:
 
 ```sh
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 В другом терминале:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -29,7 +29,7 @@ parano1d-miner \
 При необходимости ограничьте число потоков:
 
 ```sh
-parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## Удалённый вычислитель
@@ -43,7 +43,7 @@ RPC только
 после настройки защищённого транспорта:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -61,7 +61,7 @@ parano1d \
 включить эту возможность:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase
@@ -70,7 +70,7 @@ parano1d \
 Тогда вычислитель может передать:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -95,7 +95,7 @@ parano1d-miner \
 Выполните:
 
 ```sh
-parano1d-miner --check-hardware
+elide-miner --check-hardware
 ```
 
 Если запросы не проходят:

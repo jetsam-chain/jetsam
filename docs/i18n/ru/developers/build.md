@@ -44,9 +44,9 @@ cargo check --locked --workspace --all-targets
 
 ```sh
 cargo build --locked \
-  -p noid_node \
-  -p noid-extminer \
-  -p noid_gui \
+  -p elide_node \
+  -p elide-extminer \
+  -p elide_gui \
   --bins
 ```
 
@@ -58,12 +58,12 @@ cargo build --locked \
 ## Воспроизведение сертификата безопасности
 
 Штатные расчёты и доказательства находятся в
-[`noid_soundness`](https://github.com/ignotusnemo/parano1d/tree/main/noid_soundness).
+[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness).
 
 ```sh
-cargo run --release --locked -p noid_soundness
-cargo run --release --locked -p noid_soundness -- --exact
-cargo test --release --locked -p noid_soundness
+cargo run --release --locked -p elide_soundness
+cargo run --release --locked -p elide_soundness -- --exact
+cargo test --release --locked -p elide_soundness
 ```
 
 ## Создание пакета матриц доказательства
@@ -81,9 +81,9 @@ SHA256SUMS
 Сгенерируйте матрицы B25 и B255 по корректным тестовым данным:
 
 ```sh
-mkdir -p ../parano1d-artifacts
+mkdir -p ../elide-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-pack-v1
+  ../elide-artifacts/history-step-pack-v1
 ```
 
 Генерация ресурсоёмка и нужна один раз, пока отношение не меняется. Храните
@@ -97,7 +97,7 @@ mkdir -p ../parano1d-artifacts
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../parano1d-artifacts/history-step-pack-v1
+  --pack ../elide-artifacts/history-step-pack-v1
 ```
 
 Скрипт:
@@ -140,9 +140,9 @@ cat target/release-builds/LAST_RELEASE
 README.txt
 LICENSE
 NOTICE
-parano1d
-parano1d-cli
-parano1d-miner
+elide
+elide-cli
+elide-miner
 ```
 
 GUI-пакет содержит только приложение и встроенную в него ноду. Операторский CLI и

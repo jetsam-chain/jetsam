@@ -13,7 +13,7 @@ operators and wallet users should run its latest patch release.
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities privately to
-<dev@parano1d.org>. Do not open a public issue or discuss an unpatched
+<dev@elide.org>. Do not open a public issue or discuss an unpatched
 vulnerability in a public channel.
 
 Include the affected release or commit, component, platform, expected and

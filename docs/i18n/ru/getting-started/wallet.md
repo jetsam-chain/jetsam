@@ -7,30 +7,30 @@
 ## Выбор пакета
 
 Скачайте GUI-кошелёк для своей платформы со
-[страницы релизов GitHub](https://github.com/ignotusnemo/parano1d/releases):
+[страницы релизов GitHub](https://github.com/ignotusnemo/elide/releases):
 
 | Платформа | Пакет |
 |---|---|
-| Debian или Ubuntu, x86-64 | `parano1d-gui-vVERSION-linux-x86_64.deb` |
-| Debian или Ubuntu, ARM64 | `parano1d-gui-vVERSION-linux-aarch64.deb` |
-| Windows x86-64 | `parano1d-gui-vVERSION-windows-x86_64-setup.exe` |
-| macOS Apple Silicon | `parano1d-gui-vVERSION-macos-aarch64.dmg` |
-| macOS Intel | `parano1d-gui-vVERSION-macos-x86_64.dmg` |
+| Debian или Ubuntu, x86-64 | `elide-gui-vVERSION-linux-x86_64.deb` |
+| Debian или Ubuntu, ARM64 | `elide-gui-vVERSION-linux-aarch64.deb` |
+| Windows x86-64 | `elide-gui-vVERSION-windows-x86_64-setup.exe` |
+| macOS Apple Silicon | `elide-gui-vVERSION-macos-aarch64.dmg` |
+| macOS Intel | `elide-gui-vVERSION-macos-x86_64.dmg` |
 
 Скачайте `SHA256SUMS` из того же релиза и до открытия пакета проверьте его:
 
 ```sh
 # Linux
-sha256sum parano1d-gui-vVERSION-linux-x86_64.deb
+sha256sum elide-gui-vVERSION-linux-x86_64.deb
 
 # macOS
-shasum -a 256 parano1d-gui-vVERSION-macos-aarch64.dmg
+shasum -a 256 elide-gui-vVERSION-macos-aarch64.dmg
 ```
 
 В Windows используйте PowerShell:
 
 ```powershell
-Get-FileHash .\parano1d-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 Полученный хэш должен совпасть с соответствующей строкой в `SHA256SUMS`.
@@ -42,7 +42,7 @@ Get-FileHash .\parano1d-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 Откройте `.deb` в системном центре приложений или выполните:
 
 ```sh
-sudo apt install ./parano1d-gui-vVERSION-linux-x86_64.deb
+sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
 ```
 
 Запустите **Parano1d** из меню приложений.
@@ -107,7 +107,7 @@ TCP `9600` также помогает связности сети.
 Кошелёк локально создаёт доказательство авторизации с нулевым разглашением и передаёт
 полную логическую транзакцию своей ноде. Финальная панель успешной отправки показывает
 логический идентификатор транзакции. Статусы и подтверждение подробно описаны
-в разделе [Отправка NOID](../wallet/send.md).
+в разделе [Отправка ELD](../wallet/send.md).
 
 ## Удаление приложения
 
@@ -116,12 +116,12 @@ TCP `9600` также помогает связности сети.
 В Debian или Ubuntu:
 
 ```sh
-sudo apt remove parano1d-gui
+sudo apt remove elide-gui
 ```
 
 В Windows откройте **Установленные приложения → Parano1d → Удалить**. В
 macOS переместите приложение из Applications в корзину.
 
-Данные кошелька и ноды останутся в каталоге `.parano1d` профиля пользователя.
+Данные кошелька и ноды останутся в каталоге `.elide` профиля пользователя.
 Удаляйте этот каталог только после экспорта или резервного копирования
 мастер-секрета и всех чеков, которые нужно сохранить.

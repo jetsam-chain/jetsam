@@ -6,7 +6,7 @@ Core exposes JSON-RPC 2.0 over HTTP. The default endpoint is:
 http://127.0.0.1:9601
 ```
 
-Every method has the `paranoid_` namespace prefix. Parameters are positional
+Every method has the `paraelide_` namespace prefix. Parameters are positional
 JSON arrays.
 
 ```sh
@@ -15,7 +15,7 @@ curl --silent --show-error \
   --data '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "paranoid_getChainInfo",
+    "method": "paraelide_getChainInfo",
     "params": []
   }' \
   http://127.0.0.1:9601
@@ -24,7 +24,7 @@ curl --silent --show-error \
 ## Conventions
 
 - Monetary integer fields are in μNOID.
-- One NOID equals 1,000,000 μNOID.
+- One ELD equals 1,000,000 μNOID.
 - Hashes are lowercase hexadecimal without `0x`.
 - Targets and nonce bytes use their canonical little-endian encoding.
 - Addresses use canonical bech32m `o1…` unless a field explicitly says hex.
@@ -32,8 +32,8 @@ curl --silent --show-error \
 - Old block bodies return `null` after the 18-block retention window; their
   headers remain queryable.
 - Decimal strings carry aggregates that may exceed exact JSON-number range.
-- `*_noid` floating-point fields are display conveniences. Accounting code
-  should use the corresponding `*_micronoid` integer.
+- `*_eld` floating-point fields are display conveniences. Accounting code
+  should use the corresponding `*_micro_eld` integer.
 
 ## Authentication
 
@@ -203,7 +203,7 @@ ChainInfo {
   difficulty_target: string
   active_slot_count: u64
   log_slots: u32
-  circulating_supply_micronoid: decimal string
+  circulating_supply_micro_eld: decimal string
 }
 
 BlockHeaderInfo {
@@ -237,7 +237,7 @@ TxInfo {
 }
 ```
 
-`circulating_supply_micronoid` is the exact sum of all UTXO values in Live
+`circulating_supply_micro_eld` is the exact sum of all UTXO values in Live
 State, expressed in μNOID. It is encoded as a decimal string so JSON does not
 lose precision.
 
@@ -278,9 +278,9 @@ RetainedBlockInfo {
   user_pages: u16
   live_inputs: u16
   live_outputs: u16
-  reward_micronoid: u64
-  reward_noid: number
-  total_fees_micronoid: decimal string
+  reward_micro_eld: u64
+  reward_eld: number
+  total_fees_micro_eld: decimal string
   block_bytes: u64
   history_step_bytes: u64
   bundle_bytes: u64
@@ -295,13 +295,13 @@ BlockTransactionInfo {
   page_count: u16
   live_inputs: u16
   live_outputs: u16
-  fee_micronoid: u64
+  fee_micro_eld: u64
   coinbase: bool
   development_payout: bool
   epoch_anchor: string
   input_owner: string | null
-  input_sum_micronoid: decimal string
-  output_sum_micronoid: decimal string
+  input_sum_micro_eld: decimal string
+  output_sum_micro_eld: decimal string
   page_hashes: string[]
   inputs: BlockTransactionInputInfo[]
   outputs: BlockTransactionOutputInfo[]
@@ -311,7 +311,7 @@ BlockTransactionInputInfo {
   page: u16
   lane: u8
   slot_index: u32
-  amount_micronoid: u64
+  amount_micro_eld: u64
   creation_id: u64
 }
 
@@ -319,7 +319,7 @@ BlockTransactionOutputInfo {
   page: u16
   lane: u8
   slot_index: u32
-  amount_micronoid: u64
+  amount_micro_eld: u64
   owner: string
   creation_id: u64
 }
@@ -346,14 +346,14 @@ RecentTransactionInfo {
   page_count: u16
   live_inputs: u16
   live_outputs: u16
-  fee_micronoid: u64
+  fee_micro_eld: u64
   coinbase: bool
   development_payout: bool
   input_owner: string | null
-  input_sum_micronoid: decimal string
-  output_sum_micronoid: decimal string
-  address_spent_micronoid: decimal string | null
-  address_received_micronoid: decimal string | null
+  input_sum_micro_eld: decimal string
+  output_sum_micro_eld: decimal string
+  address_spent_micro_eld: decimal string | null
+  address_received_micro_eld: decimal string | null
 }
 ```
 
@@ -364,8 +364,8 @@ MiningInfo {
   height: u64
   difficulty_bits: u32
   difficulty_target: string
-  block_reward_micronoid: u64
-  block_reward_noid: number
+  block_reward_micro_eld: u64
+  block_reward_eld: number
   active_slot_count: u64
 }
 
@@ -395,7 +395,7 @@ FeeEstimate {
   net_new_slots: u64
   active_slot_count: u64
   log_slots: u32
-  fee_micronoid: u64
+  fee_micro_eld: u64
   breakdown: FeeBreakdownInfo
 }
 
@@ -433,7 +433,7 @@ MempoolStats {
 
 MempoolTxInfo {
   tx_hash: string
-  fee_micronoid: u64
+  fee_micro_eld: u64
   fee_rate: u64
   n_inputs: usize
   n_outputs: usize
@@ -478,29 +478,29 @@ WalletStatus {
   exists: bool
   address: string
   active_index: u32
-  balance_micronoid: u64
-  balance_noid: number
+  balance_micro_eld: u64
+  balance_eld: number
   utxo_count: usize
   address_count: u32
 }
 
 WalletBalance {
-  balance_micronoid: u64
-  balance_noid: number
+  balance_micro_eld: u64
+  balance_eld: number
   utxo_count: usize
-  pending_outbound_micronoid: u64
-  pending_incoming_micronoid: u64
-  spendable_micronoid: u64
-  spendable_noid: number
+  pending_outbound_micro_eld: u64
+  pending_incoming_micro_eld: u64
+  spendable_micro_eld: u64
+  spendable_eld: number
 }
 ```
 
 ```text
 WalletUtxoInfo {
   slot_index: u32
-  value_micronoid: u64
+  value_micro_eld: u64
   creation_id: u64
-  value_noid: number
+  value_eld: number
   address: string
   key_index: u32
   confirmed_height: u64
@@ -512,8 +512,8 @@ WalletHistoryEntry {
   height: u64
   direction: "sent" | "received"
   is_coinbase: bool
-  amount_micronoid: u64
-  amount_noid: number
+  amount_micro_eld: u64
+  amount_eld: number
   peer_address: string | null
   timestamp: u64
   own_address: string | null
@@ -525,19 +525,19 @@ WalletHistoryEntry {
 
 ```text
 WalletSendPlan {
-  amount_micronoid: u64
-  fee_micronoid: u64
-  total_spend_micronoid: u64
+  amount_micro_eld: u64
+  fee_micro_eld: u64
+  total_spend_micro_eld: u64
   input_count: usize
   output_count: usize
-  change_micronoid: u64
+  change_micro_eld: u64
   fee_breakdown: FeeBreakdownInfo
 }
 
 WalletSendResult {
   txid: string
-  amount_micronoid: u64
-  fee_micronoid: u64
+  amount_micro_eld: u64
+  fee_micro_eld: u64
   input_count: usize
   output_count: usize
 }
@@ -545,11 +545,11 @@ WalletSendResult {
 
 ```text
 WalletConsolidationPlan {
-  input_value_micronoid: u64
-  fee_micronoid: u64
-  output_value_micronoid: u64
-  balance_before_micronoid: u64
-  balance_after_micronoid: u64
+  input_value_micro_eld: u64
+  fee_micro_eld: u64
+  output_value_micro_eld: u64
+  balance_before_micro_eld: u64
+  balance_after_micro_eld: u64
   input_count: usize
   untouched_count: usize
   remaining_count: usize
@@ -560,9 +560,9 @@ WalletConsolidationPlan {
 
 WalletConsolidationResult {
   txid: string
-  input_value_micronoid: u64
-  fee_micronoid: u64
-  output_value_micronoid: u64
+  input_value_micro_eld: u64
+  fee_micro_eld: u64
+  output_value_micro_eld: u64
   input_count: usize
   output_count: usize
   freed_slots: usize
@@ -574,8 +574,8 @@ WalletConsolidationResult {
 ```text
 WalletScanResult {
   found_utxos: usize
-  balance_micronoid: u64
-  balance_noid: number
+  balance_micro_eld: u64
+  balance_eld: number
   active_index: u32
   snapshot_height: u64
   snapshot_tip_hash: string
@@ -596,8 +596,8 @@ WalletReceiptInfo {
   txid: string
   height: u64
   timestamp: u64
-  amount_micronoid: u64
-  fee_micronoid: u64
+  amount_micro_eld: u64
+  fee_micro_eld: u64
   peer_address: string | null
   own_address: string | null
   own_key_index: u32 | null
@@ -621,8 +621,8 @@ WalletMinedBlockInfo {
   block_hash: string
   coinbase_txid: string
   timestamp: u64
-  reward_micronoid: u64
-  reward_noid: number
+  reward_micro_eld: u64
+  reward_eld: number
   payout_address: string
   payout_key_index: u32
   confirmations: u64
@@ -647,7 +647,7 @@ ReceiptSummaryInfo {
   confirmed_unix: u64
   tx_index: u16
   tx_count: u16
-  fee_micronoid: u64
+  fee_micro_eld: u64
   inputs: ReceiptInputInfo[]
   outputs: ReceiptOutputInfo[]
 }
@@ -659,7 +659,7 @@ ReceiptInputInfo {
 
 ReceiptOutputInfo {
   slot_index: u32
-  amount_micronoid: u64
+  amount_micro_eld: u64
   owner: string
 }
 ```
@@ -679,8 +679,8 @@ BlockTemplateResponse {
   n_txs: usize
   tx_input_counts?: usize[]
   tx_output_counts?: usize[]
-  coinbase_value_micronoid: u64
-  claimable_fees_micronoid: u64
+  coinbase_value_micro_eld: u64
+  claimable_fees_micro_eld: u64
 }
 ```
 

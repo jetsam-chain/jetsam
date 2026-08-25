@@ -27,13 +27,13 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_STATE_SLOT_DIR",
+        "ELIDE_LIVE_STATE_SLOT_DIR",
         str(RUN_PARENT / f"state-slot-lifecycle-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_STATE_SLOT_BASE_PORT", "22700"))
-INITIAL_HEIGHT = int(os.environ.get("NOID_LIVE_STATE_SLOT_INITIAL_HEIGHT", "3"))
-PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_STATE_SLOT_PAYMENT", "1000000"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_BASE_PORT", "22700"))
+INITIAL_HEIGHT = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_INITIAL_HEIGHT", "3"))
+PAYMENT_MICRO_ELD = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_PAYMENT", "1000000"))
 SEGMENT_LOG = 16
 SEGMENT_RAM_BYTES = 3 * (1 << SEGMENT_LOG) * 16
 SPARSE_SEGMENT_HEADER_BYTES = 9
@@ -178,7 +178,7 @@ def main():
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
         "initial_height_target": INITIAL_HEIGHT,
-        "payment_micronoid": PAYMENT_MICRONOID,
+        "payment_micro_eld": PAYMENT_MICRO_ELD,
         "dense_segment_ram_bytes": SEGMENT_RAM_BYTES,
         "sparse_segment_header_bytes": SPARSE_SEGMENT_HEADER_BYTES,
         "sparse_entry_bytes": SPARSE_ENTRY_BYTES,
@@ -230,14 +230,14 @@ def main():
         plan = rpc(
             node.rpc_port,
             "walletPlanSend",
-            [recipient["address"], PAYMENT_MICRONOID, 0],
+            [recipient["address"], PAYMENT_MICRO_ELD, 0],
         )
         require(int(plan["input_count"]) == 1, f"scenario requires one input: {plan}")
         before_slots = {int(utxo["slot_index"]) for utxo in before_utxos}
         sent = rpc(
             node.rpc_port,
             "walletSend",
-            [recipient["address"], PAYMENT_MICRONOID, 0],
+            [recipient["address"], PAYMENT_MICRO_ELD, 0],
             timeout=300,
         )
         txid = sent.get("txid") or sent.get("tx_hash")
@@ -255,7 +255,7 @@ def main():
         recipient_slots = rpc(node.rpc_port, "getSlotsByOwner", [recipient["address"]])
         require(len(recipient_slots) == 1, f"recipient output missing: {recipient_slots}")
         require(
-            int(recipient_slots[0]["value"]) == PAYMENT_MICRONOID,
+            int(recipient_slots[0]["value"]) == PAYMENT_MICRO_ELD,
             f"recipient amount changed: {recipient_slots}",
         )
         require(

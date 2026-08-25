@@ -23,8 +23,8 @@
 Запустите предварительную проверку на целевой машине:
 
 ```sh
-parano1d --check-hardware
-parano1d-miner --check-hardware
+elide --check-hardware
+elide-miner --check-hardware
 ```
 
 Успешный отчёт ноды заканчивается строкой:
@@ -122,8 +122,8 @@ RSS равен их сумме. Память также расходуют ма�
 Контролируйте реальный путь:
 
 ```sh
-du -sh ~/.parano1d/data
-parano1d-cli state
+du -sh ~/.elide/data
+elide-cli state
 ```
 
 Для синхронизации по снимку требуется временное место под полную копию `State`
@@ -146,10 +146,10 @@ RPC на TCP `9601` — административный интерфейс. О�
 Пересматривайте ресурсы при заметном изменении размера Live State или трафика:
 
 ```sh
-parano1d-cli status
-parano1d-cli state
-parano1d-cli peers
-du -sh ~/.parano1d/data
+elide-cli status
+elide-cli state
+elide-cli peers
+du -sh ~/.elide/data
 ```
 
 Настройте предупреждения о нехватке диска, постоянной потере пиров,

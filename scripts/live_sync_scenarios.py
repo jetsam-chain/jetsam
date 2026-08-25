@@ -21,15 +21,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
+NODE_BIN = ROOT / "target" / "release" / "elide"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_SYNC_DIR", str(RUN_PARENT / f"sync-clean-{STAMP}")
+        "ELIDE_LIVE_SYNC_DIR", str(RUN_PARENT / f"sync-clean-{STAMP}")
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_SYNC_BASE_PORT", "20300"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_SYNC_BASE_PORT", "20300"))
 PRIMARY_P2P = BASE_PORT
 PRIMARY_RPC = BASE_PORT + 1
 SECONDARY_P2P = BASE_PORT + 10
@@ -50,7 +50,7 @@ def rpc(port, method, params=None, timeout=10):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paranoid_") else f"paranoid_{method}",
+            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
             "params": params or [],
         }
     ).encode()
@@ -106,7 +106,7 @@ class Node:
         self.rpc_port = rpc_port
         self.root = BASE / name
         self.data_dir = self.root / "data"
-        self.config = self.root / "parano1d.toml"
+        self.config = self.root / "elide.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

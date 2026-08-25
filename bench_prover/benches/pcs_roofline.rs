@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Production PCS commit/open roofline for the B255 feasibility gate.
 //!
@@ -11,9 +12,9 @@
 //! fresh process (so Linux `VmHWM` is attributable to one case):
 //!
 //! ```text
-//! NOID_PCS_ROOFLINE_DOMAINS=22 cargo bench -p bench_prover --bench pcs_roofline
-//! NOID_PCS_ROOFLINE_DOMAINS=23 cargo bench -p bench_prover --bench pcs_roofline
-//! NOID_PCS_ROOFLINE_DOMAINS=24 cargo bench -p bench_prover --bench pcs_roofline
+//! ELIDE_PCS_ROOFLINE_DOMAINS=22 cargo bench -p bench_prover --bench pcs_roofline
+//! ELIDE_PCS_ROOFLINE_DOMAINS=23 cargo bench -p bench_prover --bench pcs_roofline
+//! ELIDE_PCS_ROOFLINE_DOMAINS=24 cargo bench -p bench_prover --bench pcs_roofline
 //! ```
 //!
 //! A comma-separated sweep is supported for convenience, but its `VmHWM` is
@@ -26,12 +27,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bench_prover::{fmt_bytes, fmt_ms};
-use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
-use noid_ivc_prover::challenger::FsLaneChallenger;
-use noid_ivc_prover::field::F128;
-use noid_ivc_prover::pcs::{self, PcsParams, QuirkyDirectClaim, QuirkyDirectClaimRef};
-use noid_ivc_prover::proof::bind_statement_field_parts;
-use noid_ivc_prover::zerocheck::multilinear::lagrange_weights_naive;
+use elide_core::mem_profile::{current_mem_snapshot, MemSnapshot};
+use elide_ivc_prover::challenger::FsLaneChallenger;
+use elide_ivc_prover::field::F128;
+use elide_ivc_prover::pcs::{self, PcsParams, QuirkyDirectClaim, QuirkyDirectClaimRef};
+use elide_ivc_prover::proof::bind_statement_field_parts;
+use elide_ivc_prover::zerocheck::multilinear::lagrange_weights_naive;
 use rayon::prelude::*;
 
 const DOMAIN: &[u8] = b"pcs-roofline-field-v0";
@@ -109,7 +110,7 @@ fn quirky_eval(witness: &[F128], logical_m: usize, z_skip: F128, x_rest: &[F128]
 
 fn requested_domains() -> Vec<usize> {
     let raw =
-        env::var("NOID_PCS_ROOFLINE_DOMAINS").unwrap_or_else(|_| DEFAULT_LOGICAL_M.to_string());
+        env::var("ELIDE_PCS_ROOFLINE_DOMAINS").unwrap_or_else(|_| DEFAULT_LOGICAL_M.to_string());
     let mut domains = Vec::new();
     for part in raw.split(',') {
         let logical_m = part
@@ -409,7 +410,7 @@ fn run_case(logical_m: usize) {
     drop(commitment);
     drop(claim);
     drop(witness);
-    noid_ivc_prover::scratch::clear();
+    elide_ivc_prover::scratch::clear();
 }
 
 fn main() {
@@ -417,7 +418,7 @@ fn main() {
     if env::var_os("NOIDH_COMMIT_TIMING").is_none() {
         env::set_var("NOIDH_COMMIT_TIMING", "1");
     }
-    noid_ivc_prover::init_perf_thread_pool();
+    elide_ivc_prover::init_perf_thread_pool();
 
     let domains = requested_domains();
     print_manifest(&domains);

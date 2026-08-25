@@ -6,8 +6,8 @@ Poseidon2b 执行的全局承诺执行轨迹协议。**
 FROST 是 **Frobenius Reduction over Shifted Tables** 的缩写。该协议将整批
 含四个状态元素的 Poseidon2b 执行归约为三个已承诺[多线性多项式](../reference/glossary.md#multilinear-extension)的打开。
 
-[阅读论文](https://lab.parano1d.org/papers/FROST_GKR.pdf) ·
-[阅读 Parano1d Lab 研究文章](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/) ·
+[阅读论文](https://lab.elide.org/papers/FROST_GKR.pdf) ·
+[阅读 Parano1d Lab 研究文章](https://lab.elide.org/research/frost-gkr-global-trace-protocol/) ·
 [查看参考实现](https://github.com/ignotusnemo/frost-gkr)
 
 ## 重复计算问题

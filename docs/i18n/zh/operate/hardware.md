@@ -20,8 +20,8 @@ Parano1d 不会让链龄成为永久的历史执行负担，但节点仍需要�
 在计划使用的主机上运行预检：
 
 ```sh
-parano1d --check-hardware
-parano1d-miner --check-hardware
+elide --check-hardware
+elide-miner --check-hardware
 ```
 
 节点检查成功时以以下内容结束：
@@ -107,8 +107,8 @@ CPU 代际、时钟、内存带宽和选中的无进位乘法后端，比服务�
 监控真实路径：
 
 ```sh
-du -sh ~/.parano1d/data
-parano1d-cli state
+du -sh ~/.elide/data
+elide-cli state
 ```
 
 快照同步在原子安装前，需要临时保存一份完整候选 State。请为已经安装的 Live State、
@@ -127,10 +127,10 @@ TCP `9601` 上的 RPC 是管理接口。除非有私有或认证传输保护，�
 Live State 规模或流量显著变化后，应重新检查容量：
 
 ```sh
-parano1d-cli status
-parano1d-cli state
-parano1d-cli peers
-du -sh ~/.parano1d/data
+elide-cli status
+elide-cli state
+elide-cli peers
+du -sh ~/.elide/data
 ```
 
 请监控磁盘不足、反复掉线、持续同步落后和服务重启。部署方法见

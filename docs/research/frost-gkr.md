@@ -7,8 +7,8 @@ The name expands to **Frobenius Reduction over Shifted Tables**. The protocol
 turns an entire batch of width-four Poseidon2b executions into openings of
 three committed multilinear polynomials.
 
-[Read the paper](https://lab.parano1d.org/papers/FROST_GKR.pdf) ·
-[Open the Parano1d Lab research article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/) ·
+[Read the paper](https://lab.elide.org/papers/FROST_GKR.pdf) ·
+[Open the Parano1d Lab research article](https://lab.elide.org/research/frost-gkr-global-trace-protocol/) ·
 [Inspect the reference implementation](https://github.com/ignotusnemo/frost-gkr)
 
 ## The repeated-computation problem

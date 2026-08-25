@@ -8,15 +8,15 @@ and block submission in one Core process.
 Run the production hardware check:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 Obtain a payout address from the node wallet:
 
 ```sh
-parano1d
-parano1d-cli address --list
-parano1d-cli stop
+elide
+elide-cli address --list
+elide-cli stop
 ```
 
 The active wallet address is used automatically when no explicit payout is
@@ -27,14 +27,14 @@ configured.
 In the foreground:
 
 ```sh
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 ```
 
 Or update a systemd unit:
 
 ```ini
-ExecStart=/usr/local/bin/parano1d \
-  --config /etc/parano1d/parano1d.toml \
+ExecStart=/usr/local/bin/elide \
+  --config /etc/elide/elide.toml \
   --mode miner \
   --cpu-threads 12
 ```
@@ -43,7 +43,7 @@ Then reload and restart:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart parano1d
+sudo systemctl restart elide
 ```
 
 ## Readiness
@@ -52,9 +52,9 @@ Ordinary mining requires one authenticated peer and a synchronized chain.
 Check:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 The process prepares its embedded B25 and B255 proof matrices and selects the
@@ -83,7 +83,7 @@ template cannot have its payout rewritten.
 To pin a separate payout for the process:
 
 ```sh
-parano1d --mode miner --miner-address o1...
+elide --mode miner --miner-address o1...
 ```
 
 Use the complete bech32m address.
@@ -93,11 +93,11 @@ Use the complete bech32m address.
 Stop through RPC or the service manager:
 
 ```sh
-parano1d-cli stop
+elide-cli stop
 ```
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 Graceful shutdown cancels mining, closes networking and flushes MDBX. Do not

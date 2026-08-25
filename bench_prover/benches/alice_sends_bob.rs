@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Wallet authorization benchmark for the sole Tx8x2 form.
 
@@ -11,7 +12,7 @@ use bench_prover::{
 const DEFAULT_SAMPLES: usize = 5;
 
 fn samples() -> usize {
-    std::env::var("NOID_WALLET_BENCH_SAMPLES")
+    std::env::var("ELIDE_WALLET_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)
@@ -34,7 +35,7 @@ fn print_case(fixture: &MinimalTxFixture, result: &WalletBench) {
 }
 
 fn main() {
-    let _ = noid_ivc_prover::init_perf_thread_pool();
+    let _ = elide_ivc_prover::init_perf_thread_pool();
     let samples = samples();
     println!("PARANOID wallet authorization — Tx8x2, samples={samples}");
     println!("Current measurements only; no pre-Tx8x2 golden comparison.\n");

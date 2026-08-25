@@ -11,13 +11,13 @@ The worker receives no block body or proving witness.
 Start the node in external-miner mode with a bearer token:
 
 ```sh
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 In another terminal:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -28,7 +28,7 @@ The token is required even on loopback when the node was started with
 Limit worker threads when needed:
 
 ```sh
-parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## Remote worker
@@ -41,7 +41,7 @@ and restrict the exposed path at a reverse proxy. Bind public RPC only after
 that transport is in place:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -57,7 +57,7 @@ safer solo-mining mode.
 To let a worker request its own payout, the node operator must opt in:
 
 ```sh
-parano1d \
+elide \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase
@@ -66,7 +66,7 @@ parano1d \
 The worker can then use:
 
 ```sh
-parano1d-miner \
+elide-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -89,7 +89,7 @@ normal and the worker requests another template after its poll interval.
 Run:
 
 ```sh
-parano1d-miner --check-hardware
+elide-miner --check-hardware
 ```
 
 If requests fail:

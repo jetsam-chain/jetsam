@@ -8,18 +8,18 @@ replay or retain historical block bodies.
 Use the local CLI:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli state
-parano1d-cli mempool
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli state
+elide-cli mempool
+elide-cli mining
 ```
 
 With systemd:
 
 ```sh
-systemctl status parano1d
-journalctl -u parano1d --since today
+systemctl status elide
+journalctl -u elide --since today
 ```
 
 Monitor disk space for the live MDBX State and proof cache, not an assumed
@@ -30,7 +30,7 @@ fixed allocation. State storage follows current UTXO usage.
 Always stop the process before copying its database or replacing binaries:
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 Wait for the service to become inactive. Do not copy a live MDBX directory
@@ -61,7 +61,7 @@ authority.
 1. download the new archive and matching `SHA256SUMS`;
 2. verify its digest;
 3. stop the service;
-4. replace `parano1d`, `parano1d-cli` and `parano1d-miner` together;
+4. replace `elide`, `elide-cli` and `elide-miner` together;
 5. start the service;
 6. inspect startup and synchronization.
 
@@ -72,7 +72,7 @@ Do not delete the data directory during a normal update.
 If State corruption is suspected and a healthy peer network is available:
 
 ```sh
-parano1d --purge-state
+elide --purge-state
 ```
 
 This clears the complete chain database, including headers, retained blocks,

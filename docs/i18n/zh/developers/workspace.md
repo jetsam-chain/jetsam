@@ -6,39 +6,39 @@
 
 | Crate | 职责 |
 |---|---|
-| `noid_core` | 二进制塔域、向量化内核与 CPU 运行时分派 |
-| `noid_poseidon2b` | Poseidon2b 置换、域、哈希与批量执行 |
-| `noid_fri` | FRI 原语 |
-| `noid_fri_binius` | 二进制域 FRI-Binius/BaseFold 集成 |
-| `noid_ivc_core` | 递归公共 I/O 与验证者基础组件 |
-| `noid_ivc_prover` | 递归证明者实现 |
-| `noid_gkr` | [FROST-GKR](../research/frost-gkr.md) 关系与钱包授权 |
-| `noid_recursive` | `HistoryStep`、精确 State 关系与递归接受 |
-| `noid_soundness` | 与源码绑定的 Block–Tiwari、QROM 与 Category 1 证书 |
+| `elide_core` | 二进制塔域、向量化内核与 CPU 运行时分派 |
+| `elide_poseidon2b` | Poseidon2b 置换、域、哈希与批量执行 |
+| `elide_fri` | FRI 原语 |
+| `elide_fri_binius` | 二进制域 FRI-Binius/BaseFold 集成 |
+| `elide_ivc_core` | 递归公共 I/O 与验证者基础组件 |
+| `elide_ivc_prover` | 递归证明者实现 |
+| `elide_gkr` | [FROST-GKR](../research/frost-gkr.md) 关系与钱包授权 |
+| `elide_recursive` | `HistoryStep`、精确 State 关系与递归接受 |
+| `elide_soundness` | 与源码绑定的 Block–Tiwari、QROM 与 Category 1 证书 |
 | `bench_prover` | 矩阵生成、固定值工具与证明基准测试 |
 
 ## 协议对象
 
 | Crate | 职责 |
 |---|---|
-| `noid_tx` | 固定 `Tx8x2`、逻辑 `PagedSpend`、ID 与授权绑定 |
-| `noid_block` | 区块级证明组合 |
-| `noid_chain` | 区块头、共识、State、费用、收据、MDBX 与快照 |
+| `elide_tx` | 固定 `Tx8x2`、逻辑 `PagedSpend`、ID 与授权绑定 |
+| `elide_block` | 区块级证明组合 |
+| `elide_chain` | 区块头、共识、State、费用、收据、MDBX 与快照 |
 
-`noid_tx` 包含无需链上下文即可检查的表示层规则。`noid_chain` 再加入当前
+`elide_tx` 包含无需链上下文即可检查的表示层规则。`elide_chain` 再加入当前
 周期、Live State、发行、分配和分叉上下文。
 
 ## 运行时
 
 | Crate | 职责 |
 |---|---|
-| `noid_mempool` | 交易意图准入、CPU 许可、冲突与选择元数据 |
-| `noid_miner` | 共享 CPU 计划、模板构建、证明和 PoW |
-| `noid_p2p` | libp2p 发现、Gossip 转发、同步与资源限制 |
-| `noid_rpc` | 类型化 JSON-RPC API 与钱包操作 |
-| `noid_node` | 守护进程、CLI、钱包状态与子系统协调 |
-| `noid_gui` | 原生多语言钱包及私有节点管理 |
-| `noid_extminer` | 外部 Poseidon2b nonce 搜索进程 |
+| `elide_mempool` | 交易意图准入、CPU 许可、冲突与选择元数据 |
+| `elide_miner` | 共享 CPU 计划、模板构建、证明和 PoW |
+| `elide_p2p` | libp2p 发现、Gossip 转发、同步与资源限制 |
+| `elide_rpc` | 类型化 JSON-RPC API 与钱包操作 |
+| `elide_node` | 守护进程、CLI、钱包状态与子系统协调 |
+| `elide_gui` | 原生多语言钱包及私有节点管理 |
+| `elide_extminer` | 外部 Poseidon2b nonce 搜索进程 |
 
 ## 依赖方向
 

@@ -2,10 +2,10 @@
 
 **Proof-native Layer 1 ordered by proof of work.**
 
-[Website](https://parano1d.org) ·
-[Documentation](https://docs.parano1d.org) ·
-[Research](https://lab.parano1d.org) ·
-[Releases](https://github.com/ignotusnemo/parano1d/releases)
+[Website](https://elide.org) ·
+[Documentation](https://docs.elide.org) ·
+[Research](https://lab.elide.org) ·
+[Releases](https://github.com/ignotusnemo/elide/releases)
 
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
@@ -84,7 +84,7 @@ B255 profiles gives 127 provable bits and 127 conjectured bits against a
 128-bit target. Both expected-work values lie in the exact interval
 `[127, 128)`. The complete substitutions, integer optimization and comparison
 with the systems in their published table are given in the
-[Block–Tiwari derivation](noid_soundness/docs/block-tiwari.md).
+[Block–Tiwari derivation](elide_soundness/docs/block-tiwari.md).
 
 ### End-to-end Category 1
 
@@ -108,13 +108,13 @@ provable end-to-end post-quantum soundness for state validation from genesis at
 NIST PQC Category 1: every adversary inside the Category 1 resource envelope
 has success probability below one half in the from-genesis invalid-State game.
 The complete theorem is in the
-[end-to-end QROM and Category 1 derivation](noid_soundness/docs/category-one.md).
+[end-to-end QROM and Category 1 derivation](elide_soundness/docs/category-one.md).
 
 ## How It Works
 
 ### Execution Is Local
 
-When sending NOID, the wallet selects its UTXOs and creates one atomic
+When sending ELD, the wallet selects its UTXOs and creates one atomic
 `PagedSpend`. It then produces a freshly randomized, witness-hiding
 authorization for `{logical_txid, input_owner}`. The spending secret never
 leaves the wallet.
@@ -175,7 +175,7 @@ required.
 
 Fees distinguish ordinary I/O from net-new state. The state-growth component
 rises with occupancy and is burned; consolidation pays no growth burn. Block
-reward halves when the state domain actually expands, with a permanent 1 NOID
+reward halves when the state domain actually expands, with a permanent 1 ELD
 floor.
 
 ### Signatureless Ownership
@@ -220,7 +220,7 @@ relation without a trusted setup. One joint `GF(2^256)` transcript binds the
 three Link and six Block recursive regions into the outer PCS batch. The two
 authenticated production matrices, B25 at `m=22` and B255 at `m=24`, are embedded
 in the official binary and can be regenerated from source. The Parano1d Lab
-[FROST-GKR research article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
+[FROST-GKR research article](https://lab.elide.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
 
@@ -304,55 +304,55 @@ Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
 
 ```sh
-parano1d
-parano1d --miner
+elide
+elide --miner
 ```
 
 An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-parano1d --seed <host>:9600
+elide --seed <host>:9600
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
 
 ```sh
-parano1d --extminer --mining-key <token>
-parano1d-miner --key <token>
+elide --extminer --mining-key <token>
+elide-miner --key <token>
 ```
 
 Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
-creates `~/.parano1d/parano1d.toml`, the MDBX state and the built-in wallet
-under `~/.parano1d/data/`.
+creates `~/.elide/elide.toml`, the MDBX state and the built-in wallet
+under `~/.elide/data/`.
 
 The current `wallet.key` is not password-encrypted. It is created with
 owner-only permissions; back it up and protect it.
 
 ### CLI
 
-Addresses use bech32m and begin with `o1`. `1 NOID = 1,000,000 μNOID`.
-`NOID` is the ticker; the wallet uses `①` as its interface symbol.
+Addresses use bech32m and begin with `o1`. `1 ELD = 1,000,000 μNOID`.
+`ELD` is the ticker; the wallet uses `①` as its interface symbol.
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli state
-parano1d-cli mining
-parano1d-cli address
-parano1d-cli address --new
-parano1d-cli balance
-parano1d-cli utxos
-parano1d-cli send <o1-address> 10.5 --dry-run
-parano1d-cli send <o1-address> 10.5
-parano1d-cli mempool
-parano1d-cli history
-parano1d-cli receipt <txid> > receipt.hex
-parano1d-cli verify "$(tr -d '\n' < receipt.hex)"
-parano1d-cli stop
+elide-cli status
+elide-cli peers
+elide-cli state
+elide-cli mining
+elide-cli address
+elide-cli address --new
+elide-cli balance
+elide-cli utxos
+elide-cli send <o1-address> 10.5 --dry-run
+elide-cli send <o1-address> 10.5
+elide-cli mempool
+elide-cli history
+elide-cli receipt <txid> > receipt.hex
+elide-cli verify "$(tr -d '\n' < receipt.hex)"
+elide-cli stop
 ```
 
-Run `parano1d --help`, `parano1d-cli help` or `parano1d-miner --help` for the full
+Run `elide --help`, `elide-cli help` or `elide-miner --help` for the full
 interface.
 
 ## Building from Source
@@ -367,7 +367,7 @@ the host before entering proof code. Production requires SSE4.1 and
 PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects the
 `pclmul`, `avx2+vpclmul`, `avx512bw+vpclmul` or `neon+pmull` backend at runtime. The
 scalar implementation is a differential-test oracle and is never used by a
-production node. Run `parano1d --check-hardware` before installation to see
+production node. Run `elide --check-hardware` before installation to see
 the selected backend without creating configuration, wallet or chain data.
 
 To reproduce a published release, check out the tag shown on its GitHub release
@@ -377,12 +377,12 @@ matrix bytes supplied by the project. Keep the pack outside the repository's
 disposable `target/` tree:
 
 ```sh
-git clone https://github.com/ignotusnemo/parano1d.git
-cd parano1d
+git clone https://github.com/ignotusnemo/elide.git
+cd elide
 
-mkdir -p ../parano1d-artifacts
+mkdir -p ../elide-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-pack-v1
+  ../elide-artifacts/history-step-pack-v1
 ```
 
 Generation is expensive but only needs to be performed once.
@@ -390,13 +390,13 @@ Generation is expensive but only needs to be performed once.
 Build for the current machine. The script authenticates the pack, embeds it
 into the node and produces two independent deliverables:
 
-- a Core archive containing `parano1d`, `parano1d-cli` and `parano1d-miner`;
-- a native GUI Wallet package containing `parano1d-gui` and its private,
-  locally supervised `parano1d` node.
+- a Core archive containing `elide`, `elide-cli` and `elide-miner`;
+- a native GUI Wallet package containing `elide-gui` and its private,
+  locally supervised `elide` node.
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../parano1d-artifacts/history-step-pack-v1
+  --pack ../elide-artifacts/history-step-pack-v1
 
 cat target/release-builds/LAST_RELEASE
 ```
@@ -414,14 +414,14 @@ tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 ```
 
 To reproduce the production soundness calculation, see
-[`noid_soundness`](noid_soundness/README.md) and run:
+[`elide_soundness`](elide_soundness/README.md) and run:
 
 ```sh
-cargo run --release --locked -p noid_soundness
+cargo run --release --locked -p elide_soundness
 ```
 
 Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the
 [security policy](.github/SECURITY.md).
 
-Contact: [dev@parano1d.org](mailto:dev@parano1d.org)
+Contact: [dev@elide.org](mailto:dev@elide.org)

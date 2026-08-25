@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Poseidon2b permutation-kernel microbench — the P6 gate.
 //!
@@ -19,14 +20,14 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use noid_core::packed::PackedBlock128;
-use noid_core::Block128;
-use noid_poseidon2b::batch::{
+use elide_core::packed::PackedBlock128;
+use elide_core::Block128;
+use elide_poseidon2b::batch::{
     compress_flat_ff_batch_interleaved_with_tag_into, leaf_sponge_flat_batch_with_iv_into,
     packed_poseidon2b_permute_flat, POSEIDON2B_BATCH_LANES,
 };
-use noid_poseidon2b::native::domain::{capacity_iv_flat, DomainTag};
-use noid_poseidon2b::native::permutation::{permute_flat_u128, STATE_SIZE};
+use elide_poseidon2b::native::domain::{capacity_iv_flat, DomainTag};
+use elide_poseidon2b::native::permutation::{permute_flat_u128, STATE_SIZE};
 
 fn splitmix(x: &mut u64) -> u64 {
     *x = x.wrapping_add(0x9E3779B97F4A7C15);

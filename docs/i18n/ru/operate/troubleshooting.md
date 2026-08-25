@@ -25,7 +25,7 @@ REQUIRED x86-64 SSE4.1 + PCLMULQDQ
 Запустите проверку без изменения данных:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 ## Нет пиров
@@ -33,7 +33,7 @@ parano1d --check-hardware
 Проверьте:
 
 ```sh
-parano1d-cli peers
+elide-cli peers
 ```
 
 Убедитесь, что доступны исходящие DNS и TCP, системное время верно, а
@@ -55,9 +55,9 @@ P2P-интерфейс настроен правильно. Для входящ�
 Используйте:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 Обычная нода с `--mode node` не майнит, даже если старый TOML содержит

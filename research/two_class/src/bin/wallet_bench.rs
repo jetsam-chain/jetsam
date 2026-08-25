@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! End-to-end wallet-local PagedSpend benchmark.
 //!
@@ -9,13 +10,13 @@
 
 use std::time::{Duration, Instant};
 
-use noid_gkr::{
+use elide_gkr::{
     prove_paged_spend_authorization, verify_paged_spend_authorization, OwnerAuthWitness,
     WalletAuthorizationBundle,
 };
-use noid_poseidon2b::primitives::{derive_address, SpendSecret};
-use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
-use paranoid_two_class_research::paged_spend::{
+use elide_poseidon2b::primitives::{derive_address, SpendSecret};
+use elide_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+use paraelide_two_class_research::paged_spend::{
     hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, PAGED_SPEND_END_BIT,
     PAGED_SPEND_START_BIT,
 };
@@ -70,7 +71,7 @@ fn fmt_bytes(bytes: usize) -> String {
 }
 
 fn samples() -> usize {
-    std::env::var("NOID_WALLET_BENCH_SAMPLES")
+    std::env::var("ELIDE_WALLET_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)

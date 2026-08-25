@@ -3,7 +3,7 @@
 Core reads TOML configuration from:
 
 ```text
-~/.parano1d/parano1d.toml
+~/.elide/elide.toml
 ```
 
 unless `--config` selects another file. A missing file is created atomically
@@ -19,7 +19,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "~/.parano1d/data"
+path = "~/.elide/data"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -81,9 +81,9 @@ is remote.
 Process mode is authoritative:
 
 ```sh
-parano1d --mode node
-parano1d --mode miner
-parano1d --mode extminer --mining-key TOKEN
+elide --mode node
+elide --mode miner
+elide --mode extminer --mining-key TOKEN
 ```
 
 The legacy `mining.enabled` field does not override `--mode`. An empty
@@ -100,14 +100,14 @@ apply to ordinary node mode or to the separate external worker.
 substantially noisier.
 
 Under systemd, output goes to the journal. The GUI redirects its private node
-to `parano1d-node.log` in the selected data directory.
+to `elide-node.log` in the selected data directory.
 
 ## Preflight
 
 Validate CPU support without creating configuration, wallet or database files:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 The successful final line is `NODE READY`.

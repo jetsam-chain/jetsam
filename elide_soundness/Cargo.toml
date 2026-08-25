@@ -1,0 +1,18 @@
+[package]
+name = "elide_soundness"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+readme = "README.md"
+description = "Executable soundness certificates for the production Parano1d protocol."
+
+[dependencies]
+elide_fri_binius = { path = "../elide_fri_binius" }
+elide_gkr = { path = "../elide_gkr" }
+elide-ivc-core = { path = "../elide_ivc_core" }
+elide_poseidon2b = { path = "../elide_poseidon2b" }
+elide_recursive = { path = "../elide_recursive" }
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"

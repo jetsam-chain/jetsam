@@ -18,12 +18,12 @@ cargo test --locked -p CHANGED_CRATE
 
 ```sh
 cargo test --locked \
-  -p noid_tx \
-  -p noid_chain \
-  -p noid_mempool \
-  -p noid_miner \
-  -p noid_rpc \
-  -p noid_node
+  -p elide_tx \
+  -p elide_chain \
+  -p elide_mempool \
+  -p elide_miner \
+  -p elide_rpc \
+  -p elide_node
 ```
 
 ## Вычислительные ядра системы доказательств
@@ -32,25 +32,25 @@ cargo test --locked \
 
 ```sh
 cargo test --locked --release \
-  -p noid_core \
-  -p noid_poseidon2b \
-  -p noid-ivc-core
+  -p elide_core \
+  -p elide_poseidon2b \
+  -p elide-ivc-core
 ```
 
 На x86-64 принудительно проверьте минимальную штатную реализацию:
 
 ```sh
-NOID_CPU_BACKEND=pclmul \
+ELIDE_CPU_BACKEND=pclmul \
   cargo test --locked --release \
-  -p noid_core -p noid_poseidon2b -p noid-ivc-core
+  -p elide_core -p elide_poseidon2b -p elide-ivc-core
 ```
 
 Скалярная реализация используется только для дифференциальной проверки:
 
 ```sh
-NOID_CPU_BACKEND=scalar \
+ELIDE_CPU_BACKEND=scalar \
   cargo test --locked --release \
-  -p noid_core -p noid_poseidon2b
+  -p elide_core -p elide_poseidon2b
 ```
 
 ## Обязательные проверки релиза

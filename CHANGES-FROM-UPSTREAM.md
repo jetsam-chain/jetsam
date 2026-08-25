@@ -1,6 +1,6 @@
 # Changes from upstream
 
-Elide is a derivative work of [Parano1d](https://github.com/ignotusnemo/parano1d)
+Elide is a derivative work of [Parano1d](https://github.com/ignotusnemo/elide)
 v1.0.0, used under the Apache License 2.0. This file satisfies section 4(b) of
 that license: *"You must cause any modified files to carry prominent notices
 stating that You changed the files."*

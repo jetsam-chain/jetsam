@@ -479,19 +479,19 @@ name = "bench_prover"
 version = "1.0.0"
 dependencies = [
  "bincode",
+ "elide-ivc-core",
+ "elide-ivc-prover",
+ "elide_block",
+ "elide_chain",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_gkr",
+ "elide_miner",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_tx",
  "hex",
- "noid-ivc-core",
- "noid-ivc-prover",
- "noid_block",
- "noid_chain",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_gkr",
- "noid_miner",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_tx",
  "rayon",
  "tracing-subscriber",
  "zstd",
@@ -1380,6 +1380,336 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "elide-extminer"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "elide_core",
+ "elide_poseidon2b",
+ "hex",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "elide-ivc-core"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "elide_core",
+ "elide_poseidon2b",
+ "rayon",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "elide-ivc-prover"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "elide-ivc-core",
+ "elide_core",
+ "elide_poseidon2b",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "elide_block"
+version = "1.0.0"
+dependencies = [
+ "elide_chain",
+ "elide_core",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_tx",
+]
+
+[[package]]
+name = "elide_chain"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_poseidon2b",
+ "elide_tx",
+ "libmdbx",
+ "rayon",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "elide_core"
+version = "1.0.0"
+dependencies = [
+ "rand 0.8.6",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "elide_fri"
+version = "1.0.0"
+dependencies = [
+ "elide_core",
+ "elide_poseidon2b",
+ "rand 0.8.6",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "elide_fri_binius"
+version = "1.0.0"
+dependencies = [
+ "elide_core",
+ "elide_fri",
+ "elide_poseidon2b",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "elide_gkr"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_poseidon2b",
+ "elide_tx",
+ "hex",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "rayon",
+ "serde",
+ "static_assertions",
+ "zeroize",
+]
+
+[[package]]
+name = "elide_gui"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "iced",
+ "image",
+ "rand 0.8.6",
+ "reqwest",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "winresource",
+ "zeroize",
+]
+
+[[package]]
+name = "elide_mempool"
+version = "1.0.0"
+dependencies = [
+ "elide_chain",
+ "elide_core",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_tx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "elide_miner"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "elide-ivc-core",
+ "elide-ivc-prover",
+ "elide_block",
+ "elide_chain",
+ "elide_core",
+ "elide_gkr",
+ "elide_mempool",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_tx",
+ "hex",
+ "libc",
+ "rayon",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "elide_node"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "bench_prover",
+ "bincode",
+ "blake3",
+ "clap",
+ "elide-ivc-core",
+ "elide_block",
+ "elide_chain",
+ "elide_core",
+ "elide_gkr",
+ "elide_mempool",
+ "elide_miner",
+ "elide_p2p",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_rpc",
+ "elide_tx",
+ "futures",
+ "hex",
+ "libc",
+ "libp2p",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "static_assertions",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tikv-jemallocator",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "elide_p2p"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "elide_chain",
+ "elide_mempool",
+ "elide_poseidon2b",
+ "elide_tx",
+ "futures",
+ "libc",
+ "libp2p",
+ "libp2p-connection-limits",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "elide_poseidon2b"
+version = "1.0.0"
+dependencies = [
+ "bech32",
+ "elide_core",
+ "hex",
+ "rand 0.8.6",
+ "rayon",
+ "serde",
+ "static_assertions",
+ "zeroize",
+]
+
+[[package]]
+name = "elide_recursive"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "elide-ivc-core",
+ "elide-ivc-prover",
+ "elide_chain",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_tx",
+ "rayon",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "elide_rpc"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "elide_chain",
+ "elide_mempool",
+ "elide_miner",
+ "elide_p2p",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_tx",
+ "hex",
+ "http 1.4.1",
+ "jsonrpsee",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
+name = "elide_soundness"
+version = "1.0.0"
+dependencies = [
+ "elide-ivc-core",
+ "elide_fri_binius",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
+name = "elide_tx"
+version = "1.0.0"
+dependencies = [
+ "elide_core",
+ "elide_poseidon2b",
+ "serde",
+]
 
 [[package]]
 name = "endi"
@@ -3956,336 +4286,6 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
-
-[[package]]
-name = "noid-extminer"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "noid_core",
- "noid_poseidon2b",
- "rayon",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "noid-ivc-core"
-version = "1.0.0"
-dependencies = [
- "bincode",
- "noid_core",
- "noid_poseidon2b",
- "rayon",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "noid-ivc-prover"
-version = "1.0.0"
-dependencies = [
- "bincode",
- "noid-ivc-core",
- "noid_core",
- "noid_poseidon2b",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "noid_block"
-version = "1.0.0"
-dependencies = [
- "noid_chain",
- "noid_core",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_tx",
-]
-
-[[package]]
-name = "noid_chain"
-version = "1.0.0"
-dependencies = [
- "bincode",
- "libmdbx",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_poseidon2b",
- "noid_tx",
- "rayon",
- "serde",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "noid_core"
-version = "1.0.0"
-dependencies = [
- "rand 0.8.6",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "noid_fri"
-version = "1.0.0"
-dependencies = [
- "noid_core",
- "noid_poseidon2b",
- "rand 0.8.6",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "noid_fri_binius"
-version = "1.0.0"
-dependencies = [
- "noid_core",
- "noid_fri",
- "noid_poseidon2b",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "noid_gkr"
-version = "1.0.0"
-dependencies = [
- "bincode",
- "hex",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_poseidon2b",
- "noid_tx",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "rayon",
- "serde",
- "static_assertions",
- "zeroize",
-]
-
-[[package]]
-name = "noid_gui"
-version = "1.0.0"
-dependencies = [
- "blake3",
- "hex",
- "iced",
- "image",
- "rand 0.8.6",
- "reqwest",
- "rfd",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokio",
- "winresource",
- "zeroize",
-]
-
-[[package]]
-name = "noid_mempool"
-version = "1.0.0"
-dependencies = [
- "noid_chain",
- "noid_core",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_tx",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "noid_miner"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "bincode",
- "hex",
- "libc",
- "noid-ivc-core",
- "noid-ivc-prover",
- "noid_block",
- "noid_chain",
- "noid_core",
- "noid_gkr",
- "noid_mempool",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_tx",
- "rayon",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "noid_node"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "bench_prover",
- "bincode",
- "blake3",
- "clap",
- "futures",
- "hex",
- "libc",
- "libp2p",
- "noid-ivc-core",
- "noid_block",
- "noid_chain",
- "noid_core",
- "noid_gkr",
- "noid_mempool",
- "noid_miner",
- "noid_p2p",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_rpc",
- "noid_tx",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "static_assertions",
- "tempfile",
- "thiserror 1.0.69",
- "tikv-jemallocator",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "noid_p2p"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "futures",
- "libc",
- "libp2p",
- "libp2p-connection-limits",
- "noid_chain",
- "noid_mempool",
- "noid_poseidon2b",
- "noid_tx",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "noid_poseidon2b"
-version = "1.0.0"
-dependencies = [
- "bech32",
- "hex",
- "noid_core",
- "rand 0.8.6",
- "rayon",
- "serde",
- "static_assertions",
- "zeroize",
-]
-
-[[package]]
-name = "noid_recursive"
-version = "1.0.0"
-dependencies = [
- "bincode",
- "noid-ivc-core",
- "noid-ivc-prover",
- "noid_chain",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_tx",
- "rayon",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "noid_rpc"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "hex",
- "http 1.4.1",
- "jsonrpsee",
- "noid_chain",
- "noid_mempool",
- "noid_miner",
- "noid_p2p",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_tx",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tower 0.4.13",
- "tracing",
-]
-
-[[package]]
-name = "noid_soundness"
-version = "1.0.0"
-dependencies = [
- "noid-ivc-core",
- "noid_fri_binius",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_recursive",
- "num-bigint",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
-name = "noid_tx"
-version = "1.0.0"
-dependencies = [
- "noid_core",
- "noid_poseidon2b",
- "serde",
-]
 
 [[package]]
 name = "nom"

@@ -4,9 +4,9 @@
 
 | 路径 | 用途 | 权限性质 |
 |---|---|---|
-| `~/.parano1d/parano1d.toml` | Core 配置 | 运营者 |
-| `~/.parano1d/gui-settings.json` | GUI 偏好 | 本地 UI |
-| `~/.parano1d/data/` | Core 与 GUI 节点默认数据 | 共识数据 |
+| `~/.elide/elide.toml` | Core 配置 | 运营者 |
+| `~/.elide/gui-settings.json` | GUI 偏好 | 本地 UI |
+| `~/.elide/data/` | Core 与 GUI 节点默认数据 | 共识数据 |
 | `DATA_DIR/wallet.key` | 256 位钱包主密钥 | 花费权限 |
 | `DATA_DIR/wallet.receipts` | 已保存的外发收据 | 本地付款证据 |
 | `DATA_DIR/wallet.history` | 本地钱包历史 | 本地展示 |
@@ -14,8 +14,8 @@
 | `DATA_DIR/peers.json` | 成功连接过的公网出站节点 | 发现提示 |
 | `DATA_DIR/history-step-cache/` | 派生的本地证明矩阵缓存 | 可重建 |
 | `DATA_DIR/snapshot-staging/` | 接收快照临时数据 | 永不作为规范 State |
-| `DATA_DIR/parano1d-gui.toml` | GUI 管理的节点配置 | 私有节点 |
-| `DATA_DIR/parano1d-node.log` | GUI 管理的节点日志 | 诊断 |
+| `DATA_DIR/elide-gui.toml` | GUI 管理的节点配置 | 私有节点 |
+| `DATA_DIR/elide-node.log` | GUI 管理的节点日志 | 诊断 |
 
 Windows 中的 `~` 表示用户配置文件目录。
 
@@ -38,8 +38,8 @@ Unix 上，`wallet.key` 和 `p2p_identity.key` 仅允许所有者访问。前者
 |---|---|
 | 网络 | `mainnet` |
 | 创世区块 ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
-| 网络魔数（network magic） | `NOID` |
-| libp2p 协议 | `/noid/mainnet/860e70453390bf81/1` |
+| 网络魔数（network magic） | `ELD` |
+| libp2p 协议 | `/elide/mainnet/860e70453390bf81/1` |
 | 交易与区块 gossip | GossipSub |
 | 发现 | DNS 种子、Kademlia、mDNS |
 

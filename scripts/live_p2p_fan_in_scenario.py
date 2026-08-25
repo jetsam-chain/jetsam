@@ -23,12 +23,12 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_P2P_FAN_IN_DIR",
+        "ELIDE_LIVE_P2P_FAN_IN_DIR",
         str(RUN_PARENT / f"p2p-fan-in-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_P2P_FAN_IN_BASE_PORT", "21000"))
-PEER_COUNT = int(os.environ.get("NOID_LIVE_P2P_FAN_IN_PEERS", "96"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_P2P_FAN_IN_BASE_PORT", "21000"))
+PEER_COUNT = int(os.environ.get("ELIDE_LIVE_P2P_FAN_IN_PEERS", "96"))
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

@@ -1,0 +1,29 @@
+[package]
+name = "elide_rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+elide_chain      = { path = "../elide_chain" }
+elide_tx         = { path = "../elide_tx" }
+elide_poseidon2b = { path = "../elide_poseidon2b" }
+elide_mempool    = { path = "../elide_mempool" }
+elide_miner      = { path = "../elide_miner" }
+elide_p2p        = { path = "../elide_p2p" }
+elide_recursive  = { path = "../elide_recursive" }
+jsonrpsee    = { version = "0.24", features = ["server", "macros"] }
+tower        = { version = "0.4", features = ["util"] }
+http         = "1"
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+
+hex          = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

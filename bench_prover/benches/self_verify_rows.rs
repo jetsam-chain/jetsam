@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Row-count measurement for the recursion slot: how many FieldR1cs
 //! constraints does the in-trace FieldR1cs verifier replay
@@ -24,17 +25,17 @@
 use std::time::Instant;
 
 use bench_prover::poseidon_chain_field_instance;
-use noid_ivc_prover::challenger::FsLaneChallenger;
-use noid_ivc_prover::field::F128;
-use noid_ivc_prover::field_circuit::FsChannelTrace;
-use noid_ivc_prover::field_prover::prove_field;
-use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
-use noid_ivc_prover::pcs::{self, PcsParams};
-use noid_ivc_prover::verifier::verify_field;
-use noid_recursive::acceptance::trace::self_verify::{
+use elide_ivc_prover::challenger::FsLaneChallenger;
+use elide_ivc_prover::field::F128;
+use elide_ivc_prover::field_circuit::FsChannelTrace;
+use elide_ivc_prover::field_prover::prove_field;
+use elide_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+use elide_ivc_prover::pcs::{self, PcsParams};
+use elide_ivc_prover::verifier::verify_field;
+use elide_recursive::acceptance::trace::self_verify::{
     alloc_flat_digest, verify_field_trace, FieldR1csProofTrace,
 };
-use noid_recursive::acceptance::trace::FieldR1csBuilder;
+use elide_recursive::acceptance::trace::FieldR1csBuilder;
 
 const DOMAIN: &[u8] = b"self-verify-rows-bench-v0";
 
@@ -98,7 +99,7 @@ fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
 }
 
 fn main() {
-    noid_ivc_prover::init_perf_thread_pool();
+    elide_ivc_prover::init_perf_thread_pool();
     println!(
         "== [R] row-count measurement — rayon threads: {} ==\n",
         rayon::current_num_threads()

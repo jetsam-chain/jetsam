@@ -15,7 +15,7 @@ samples         20 after one untimed warm-up per case
 Command:
 
 ```text
-NOID_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
+ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
   --manifest-path research/two_class/Cargo.toml \
   --bin two-class-wallet-bench
 ```

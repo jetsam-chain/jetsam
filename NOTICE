@@ -28,8 +28,14 @@ Elide
 Copyright 2026 trace.protocol
 
 Elide is a derivative work of Parano1d (above), used under the Apache License,
-Version 2.0. The original copyright notices, license and attributions are
-retained in full and are NOT superseded by this section.
+Version 2.0. The upstream copyright and attribution notices are reproduced in
+full at the top of this file and are NOT superseded by this section.
+
+Source files carry the copyright of trace.protocol for the modifications made
+to them, together with a pointer to this NOTICE for the upstream attribution.
+Nothing in that arrangement is intended to disclaim, replace or diminish the
+upstream copyright recorded above; this file is the authoritative attribution
+for the whole work.
 
 Elide is an independent network. It is not endorsed by, affiliated with, or
 supported by Paranoid Zero or Ignotus Nemo.

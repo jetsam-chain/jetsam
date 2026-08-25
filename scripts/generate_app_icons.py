@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "noid_gui" / "assets" / "app-icons"
+OUTPUT = ROOT / "elide_gui" / "assets" / "app-icons"
 PNG_SIZES = (16, 32, 48, 64, 128, 256, 512, 1024)
 ICO_SIZES = (16, 32, 48, 64, 128, 256)
 

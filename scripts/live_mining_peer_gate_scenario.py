@@ -15,11 +15,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_MINING_GATE_DIR",
+        "ELIDE_LIVE_MINING_GATE_DIR",
         str(RUN_PARENT / f"mining-peer-gate-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_MINING_GATE_BASE_PORT", "23600"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_MINING_GATE_BASE_PORT", "23600"))
 NO_PEER_HOLD_SECONDS = 35
 PEER_LOSS_HOLD_SECONDS = 25
 

@@ -16,16 +16,16 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_WALLET_RECEIVE_OFFLINE_SHALLOW_DIR",
+        "ELIDE_LIVE_WALLET_RECEIVE_OFFLINE_SHALLOW_DIR",
         str(RUN_PARENT / f"wallet-receive-offline-shallow-clean-{STAMP}"),
     )
 )
 BASE_PORT = int(
-    os.environ.get("NOID_LIVE_WALLET_RECEIVE_OFFLINE_SHALLOW_BASE_PORT", "22200")
+    os.environ.get("ELIDE_LIVE_WALLET_RECEIVE_OFFLINE_SHALLOW_BASE_PORT", "22200")
 )
 FUNDING_HEIGHT = 4
 TRAILING_BLOCKS = 3
-PAYMENT_MICRONOID = 250_000
+PAYMENT_MICRO_ELD = 250_000
 RETAINED_DEPTH = 18
 
 live.BASE = BASE
@@ -100,7 +100,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
-        "payment_micronoid": PAYMENT_MICRONOID,
+        "payment_micro_eld": PAYMENT_MICRO_ELD,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -117,7 +117,7 @@ def main():
         recipient.start(wallet_label)
         labels.append(wallet_label)
         recipient_address = rpc(recipient.rpc_port, "walletActiveAddress")
-        require(balance(recipient)["balance_micronoid"] == 0, "recipient funded at h0")
+        require(balance(recipient)["balance_micro_eld"] == 0, "recipient funded at h0")
         recipient.stop()
 
         miner_label = "02-sender-mines-and-pays-offline-recipient"
@@ -131,7 +131,7 @@ def main():
         sender_scan = rpc(sender.rpc_port, "walletScan", timeout=180)
         sender_before = balance(sender)
         require(
-            int(sender_before["spendable_micronoid"]) > PAYMENT_MICRONOID,
+            int(sender_before["spendable_micro_eld"]) > PAYMENT_MICRO_ELD,
             f"sender lacks funds: {sender_before}",
         )
 
@@ -139,7 +139,7 @@ def main():
         sent = rpc(
             sender.rpc_port,
             "walletSend",
-            [recipient_address["address"], PAYMENT_MICRONOID, 0],
+            [recipient_address["address"], PAYMENT_MICRO_ELD, 0],
             timeout=300,
         )
         proof_s = time.monotonic() - proof_started
@@ -180,7 +180,7 @@ def main():
         sync_s = time.monotonic() - sync_started
         recipient_balance = balance(recipient)
         require(
-            int(recipient_balance["balance_micronoid"]) == PAYMENT_MICRONOID,
+            int(recipient_balance["balance_micro_eld"]) == PAYMENT_MICRO_ELD,
             f"shallow-synced recipient balance is wrong: {recipient_balance}",
         )
         require(
@@ -195,7 +195,7 @@ def main():
             recipient.rpc_port, "getSlotsByOwner", [recipient_address["address"]]
         )
         require(
-            len(owned) == 1 and int(owned[0]["value"]) == PAYMENT_MICRONOID,
+            len(owned) == 1 and int(owned[0]["value"]) == PAYMENT_MICRO_ELD,
             f"recipient owner index is wrong: {owned}",
         )
 

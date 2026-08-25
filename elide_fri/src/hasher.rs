@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
+
+//! Cryptographic hasher trait + concrete implementations used by the FRI
+//! Merkle layer.
+//!
+//! Production callers use Poseidon2b (`Poseidon2bSponge` from
+//! `elide_poseidon2b`) as the arithmetization-friendly hasher. The FRI
+//! prover/verifier take `&dyn CryptographicHasher`, and production uses the
+//! Poseidon2b implementation from `elide_poseidon2b`.
+
+pub use elide_poseidon2b::hasher::{CryptographicHasher, HashOutput};

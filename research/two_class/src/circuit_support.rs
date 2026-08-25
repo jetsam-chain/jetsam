@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Minimal Field-R1CS vocabulary used by the parent-union certificate.
 
-pub use noid_ivc_core::field::F128;
-pub use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
+pub use elide_ivc_core::field::F128;
+pub use elide_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
 
 #[inline]
 pub fn mul(builder: &mut FieldR1csBuilder, left: &LinExpr, right: &LinExpr) -> LinExpr {

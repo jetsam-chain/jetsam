@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Current Tx8x2 owner-auth and body-spine component measurements.
 
 use bench_prover::{fmt_bytes, fmt_ms, time_once, tx8x2_scenario};
-use noid_core::Block128;
-use noid_gkr::{
+use elide_core::Block128;
+use elide_gkr::{
     discharge_block_spine_reductions_native, prove_block_spine_killshot,
     prove_wallet_authorization, reconstruct_slot_states, spine_inputs_from_body,
     verify_block_spine_killshot, verify_wallet_authorization_proof, BlockSpineMle,
     OwnerAuthWitness, SpineCircuit, N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
 };
-use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_poseidon2b::primitives::TxBodyHash;
+use elide_poseidon2b::channel::Poseidon2bChannel;
+use elide_poseidon2b::primitives::TxBodyHash;
 
 fn requested_sizes() -> Vec<usize> {
-    std::env::var("NOID_KILLSHOT_TX_COUNTS")
+    std::env::var("ELIDE_KILLSHOT_TX_COUNTS")
         .unwrap_or_else(|_| "1,8".into())
         .split(',')
         .filter_map(|part| part.trim().parse().ok())
@@ -102,7 +103,7 @@ fn bench_body_spine(n: usize) {
 }
 
 fn main() {
-    let _ = noid_ivc_prover::init_perf_thread_pool();
+    let _ = elide_ivc_prover::init_perf_thread_pool();
     assert_eq!(SpineCircuit::build().slots.len(), 31);
     assert_eq!(N_SPINE_SLOTS, 31);
     assert_eq!(N_SPINE_SLOTS_PADDED, 32);

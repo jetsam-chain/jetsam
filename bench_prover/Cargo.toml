@@ -5,18 +5,18 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-noid_core = { path = "../noid_core" }
-noid_fri = { path = "../noid_fri" }
-noid_fri_binius = { path = "../noid_fri_binius" }
-noid_poseidon2b = { path = "../noid_poseidon2b" }
-noid_gkr = { path = "../noid_gkr" }
-noid_tx = { path = "../noid_tx" }
-noid_chain = { path = "../noid_chain" }
-noid_block = { path = "../noid_block" }
-noid_recursive = { path = "../noid_recursive" }
-noid_miner = { path = "../noid_miner" }
-noid-ivc-core = { path = "../noid_ivc_core" }
-noid-ivc-prover = { path = "../noid_ivc_prover" }
+elide_core = { path = "../elide_core" }
+elide_fri = { path = "../elide_fri" }
+elide_fri_binius = { path = "../elide_fri_binius" }
+elide_poseidon2b = { path = "../elide_poseidon2b" }
+elide_gkr = { path = "../elide_gkr" }
+elide_tx = { path = "../elide_tx" }
+elide_chain = { path = "../elide_chain" }
+elide_block = { path = "../elide_block" }
+elide_recursive = { path = "../elide_recursive" }
+elide_miner = { path = "../elide_miner" }
+elide-ivc-core = { path = "../elide_ivc_core" }
+elide-ivc-prover = { path = "../elide_ivc_prover" }
 rayon = "1.10"
 bincode = "1"
 hex = "0.4"

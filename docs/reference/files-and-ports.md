@@ -4,9 +4,9 @@
 
 | Path | Purpose | Authority |
 |---|---|---|
-| `~/.parano1d/parano1d.toml` | Core configuration | Operator |
-| `~/.parano1d/gui-settings.json` | GUI preferences | Local UI |
-| `~/.parano1d/data/` | Default Core and GUI node data | Consensus data |
+| `~/.elide/elide.toml` | Core configuration | Operator |
+| `~/.elide/gui-settings.json` | GUI preferences | Local UI |
+| `~/.elide/data/` | Default Core and GUI node data | Consensus data |
 | `DATA_DIR/wallet.key` | 256-bit wallet master secret | Spending authority |
 | `DATA_DIR/wallet.receipts` | Saved outgoing receipts | Local payment evidence |
 | `DATA_DIR/wallet.history` | Local wallet history | Local presentation |
@@ -14,8 +14,8 @@
 | `DATA_DIR/peers.json` | Successful public outbound peers | Discovery hint |
 | `DATA_DIR/history-step-cache/` | Derived local proof-matrix cache | Rebuildable |
 | `DATA_DIR/snapshot-staging/` | Incoming snapshot scratch data | Never canonical |
-| `DATA_DIR/parano1d-gui.toml` | GUI-owned node configuration | Private node |
-| `DATA_DIR/parano1d-node.log` | GUI-owned node log | Diagnostics |
+| `DATA_DIR/elide-gui.toml` | GUI-owned node configuration | Private node |
+| `DATA_DIR/elide-node.log` | GUI-owned node log | Diagnostics |
 
 On Windows, `~` means the user profile directory.
 
@@ -38,8 +38,8 @@ transport. A bearer token authenticates requests but does not encrypt them.
 |---|---|
 | Network | `mainnet` |
 | Genesis block ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
-| Network magic | `NOID` |
-| libp2p protocol | `/noid/mainnet/860e70453390bf81/1` |
+| Network magic | `ELD` |
+| libp2p protocol | `/elide/mainnet/860e70453390bf81/1` |
 | Transaction and block gossip | GossipSub |
 | Discovery | DNS seeds, Kademlia, mDNS |
 

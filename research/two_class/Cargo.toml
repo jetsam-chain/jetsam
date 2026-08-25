@@ -1,5 +1,5 @@
 [package]
-name = "paranoid-two-class-research"
+name = "paraelide-two-class-research"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -14,15 +14,15 @@ resolver = "2"
 path = "src/lib.rs"
 
 [dependencies]
-noid_chain = { path = "../../noid_chain" }
-noid_core = { path = "../../noid_core" }
-noid_fri = { path = "../../noid_fri" }
-noid_fri_binius = { path = "../../noid_fri_binius" }
-noid_gkr = { path = "../../noid_gkr" }
-noid-ivc-core = { path = "../../noid_ivc_core" }
-noid_poseidon2b = { path = "../../noid_poseidon2b" }
-noid_recursive = { path = "../../noid_recursive" }
-noid_tx = { path = "../../noid_tx" }
+elide_chain = { path = "../../elide_chain" }
+elide_core = { path = "../../elide_core" }
+elide_fri = { path = "../../elide_fri" }
+elide_fri_binius = { path = "../../elide_fri_binius" }
+elide_gkr = { path = "../../elide_gkr" }
+elide-ivc-core = { path = "../../elide_ivc_core" }
+elide_poseidon2b = { path = "../../elide_poseidon2b" }
+elide_recursive = { path = "../../elide_recursive" }
+elide_tx = { path = "../../elide_tx" }
 
 [[bin]]
 name = "two-class-census"

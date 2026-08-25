@@ -9,8 +9,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
-CLI_BIN = ROOT / "target" / "release" / "parano1d-cli"
+NODE_BIN = ROOT / "target" / "release" / "elide"
+CLI_BIN = ROOT / "target" / "release" / "elide-cli"
 BASE = ROOT / "target" / "live-tests" / "cli-wallet"
 LOGS = BASE / "logs"
 
@@ -125,7 +125,7 @@ def rpc(url, method, params=None, timeout=8):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": f"paranoid_{method}",
+            "method": f"paraelide_{method}",
             "params": params or [],
         }
     ).encode()
@@ -230,7 +230,7 @@ def cleanup(nodes):
 def main():
     if not NODE_BIN.exists() or not CLI_BIN.exists():
         raise LiveTestError(
-            "release binaries missing; run cargo build --release -p noid_node --bin parano1d --bin parano1d-cli"
+            "release binaries missing; run cargo build --release -p elide_node --bin elide --bin elide-cli"
         )
     if BASE.exists():
         shutil.rmtree(BASE)
@@ -325,7 +325,7 @@ def main():
         cli(n1, ["scan"], timeout=180)
         bal1 = cli_json(n1, ["balance"])
         assert_true(
-            bal1["spendable_micronoid"] >= 100_000_000,
+            bal1["spendable_micro_eld"] >= 100_000_000,
             f"node1 spendable too low: {bal1}",
         )
         out, _, _ = cli(n1, ["balance"])
@@ -408,13 +408,13 @@ def main():
         cli_json(n3, ["address", "--use", str(new1["key_index"])])
         scan3 = cli_json(n3, ["scan"], timeout=180)
         assert_true(
-            scan3["balance_micronoid"] == 1_250_000
+            scan3["balance_micro_eld"] == 1_250_000
             and scan3["found_utxos"] == 1,
             f"first recipient scan did not find the exact funds: {scan3}",
         )
         bal3 = cli_json(n3, ["balance"])
         assert_true(
-            bal3["balance_micronoid"] == 1_250_000 and bal3["utxo_count"] == 1,
+            bal3["balance_micro_eld"] == 1_250_000 and bal3["utxo_count"] == 1,
             f"first recipient balance wrong: {bal3}",
         )
         out, _, _ = cli(n3, ["balance"])
@@ -423,13 +423,13 @@ def main():
         cli_json(n3, ["address", "--use", str(new2["key_index"])])
         scan3 = cli_json(n3, ["scan"], timeout=180)
         assert_true(
-            scan3["balance_micronoid"] == 750_000
+            scan3["balance_micro_eld"] == 750_000
             and scan3["found_utxos"] == 1,
             f"second recipient scan did not find the exact funds: {scan3}",
         )
         bal3 = cli_json(n3, ["balance"])
         assert_true(
-            bal3["balance_micronoid"] == 750_000 and bal3["utxo_count"] == 1,
+            bal3["balance_micro_eld"] == 750_000 and bal3["utxo_count"] == 1,
             f"second recipient balance wrong: {bal3}",
         )
         out, _, _ = cli(n3, ["balance"])

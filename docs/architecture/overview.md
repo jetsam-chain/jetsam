@@ -105,14 +105,14 @@ transactions and State root cannot be changed by the external worker.
 
 | Component | Responsibility |
 |---|---|
-| `noid_tx` | Logical `PagedSpend`, transaction identifiers and authorization binding |
-| `noid_mempool` | Intent admission, conflict reservations and relay policy |
-| `noid_miner` | Transaction selection, State witness, block preparation and PoW |
-| `noid_recursive` | `HistoryStep` relation, terminal verification and recursion |
-| `noid_chain` | Consensus rules, MDBX State, headers, reorgs and snapshots |
-| `noid_p2p` | GossipSub relay, discovery and synchronization protocols |
-| `noid_node` | Runtime orchestration, wallet integration and shutdown |
-| `noid_rpc` | Local node, wallet and external-mining interface |
+| `elide_tx` | Logical `PagedSpend`, transaction identifiers and authorization binding |
+| `elide_mempool` | Intent admission, conflict reservations and relay policy |
+| `elide_miner` | Transaction selection, State witness, block preparation and PoW |
+| `elide_recursive` | `HistoryStep` relation, terminal verification and recursion |
+| `elide_chain` | Consensus rules, MDBX State, headers, reorgs and snapshots |
+| `elide_p2p` | GossipSub relay, discovery and synchronization protocols |
+| `elide_node` | Runtime orchestration, wallet integration and shutdown |
+| `elide_rpc` | Local node, wallet and external-mining interface |
 
 For deployment rather than implementation details, continue with
 [Run a node on Linux](../operate/node.md).

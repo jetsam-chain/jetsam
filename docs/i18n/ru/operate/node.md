@@ -30,11 +30,11 @@ P2P-соединения принимаются на TCP `9600`. JSON-RPC дол
 ## Установка релиза Core
 
 Скачайте архив нужной архитектуры и `SHA256SUMS` со
-[страницы релизов](https://github.com/ignotusnemo/parano1d/releases). Проверьте
+[страницы релизов](https://github.com/ignotusnemo/elide/releases). Проверьте
 архив до распаковки, заменив `VERSION` номером версии:
 
 ```sh
-grep '  parano1d-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
+grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -44,8 +44,8 @@ grep '  parano1d-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
 Распакуйте архив и проверьте оборудование:
 
 ```sh
-tar -xzf parano1d-core-vVERSION-linux-x86_64.tar.gz
-./parano1d --check-hardware
+tar -xzf elide-core-vVERSION-linux-x86_64.tar.gz
+./elide --check-hardware
 ```
 
 На поддерживаемой машине отчёт заканчивается:
@@ -57,7 +57,7 @@ NODE READY
 Установите ноду и CLI:
 
 ```sh
-sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
+sudo install -m 0755 elide elide-cli /usr/local/bin/
 ```
 
 ## Системный пользователь
@@ -65,13 +65,13 @@ sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
 Храните данные ноды отдельно от интерактивных пользователей:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/parano1d \
-  --create-home --shell /usr/sbin/nologin parano1d
-sudo install -d -o parano1d -g parano1d -m 0700 /var/lib/parano1d
-sudo install -d -o root -g parano1d -m 0750 /etc/parano1d
+sudo useradd --system --home-dir /var/lib/elide \
+  --create-home --shell /usr/sbin/nologin elide
+sudo install -d -o elide -g elide -m 0700 /var/lib/elide
+sudo install -d -o root -g elide -m 0750 /etc/elide
 ```
 
-Создайте `/etc/parano1d/parano1d.toml`:
+Создайте `/etc/elide/elide.toml`:
 
 ```toml
 [network]
@@ -80,7 +80,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "/var/lib/parano1d"
+path = "/var/lib/elide"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -93,8 +93,8 @@ miner_address = ""
 Защитите конфигурацию:
 
 ```sh
-sudo chown root:parano1d /etc/parano1d/parano1d.toml
-sudo chmod 0640 /etc/parano1d/parano1d.toml
+sudo chown root:elide /etc/elide/elide.toml
+sudo chmod 0640 /etc/elide/elide.toml
 ```
 
 Указывать сид вручную не нужно. Релизный бинарник находит публичную сеть через
@@ -102,7 +102,7 @@ sudo chmod 0640 /etc/parano1d/parano1d.toml
 
 ## Запуск под systemd
 
-Создайте `/etc/systemd/system/parano1d.service`:
+Создайте `/etc/systemd/system/elide.service`:
 
 ```ini
 [Unit]
@@ -112,9 +112,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=parano1d
-Group=parano1d
-ExecStart=/usr/local/bin/parano1d --config /etc/parano1d/parano1d.toml
+User=elide
+Group=elide
+ExecStart=/usr/local/bin/elide --config /etc/elide/elide.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
@@ -132,14 +132,14 @@ WantedBy=multi-user.target
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now parano1d
-sudo systemctl status parano1d
+sudo systemctl enable --now elide
+sudo systemctl status elide
 ```
 
 Следите за запуском и синхронизацией:
 
 ```sh
-sudo journalctl -u parano1d -f
+sudo journalctl -u elide -f
 ```
 
 ## Проверка ноды
@@ -147,9 +147,9 @@ sudo journalctl -u parano1d -f
 По умолчанию CLI подключается к локальному RPC:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli state
+elide-cli status
+elide-cli peers
+elide-cli state
 ```
 
 `status` должен показывать актуальную высоту, число в `peers` должно стать
@@ -169,17 +169,17 @@ SSH-туннель или другой аутентифицированный п
 Перед заменой бинарников или копированием данных остановите службу:
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 Установите проверенные новые бинарники и запустите:
 
 ```sh
-sudo install -m 0755 parano1d parano1d-cli /usr/local/bin/
-sudo systemctl start parano1d
-parano1d-cli status
+sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo systemctl start elide
+elide-cli status
 ```
 
-При обычном обновлении не удаляйте `/var/lib/parano1d`. Если кошелёк ноды
-получает средства, отдельно сохраните `/var/lib/parano1d/wallet.key` и
+При обычном обновлении не удаляйте `/var/lib/elide`. Если кошелёк ноды
+получает средства, отдельно сохраните `/var/lib/elide/wallet.key` и
 защищайте его как приватный секрет.

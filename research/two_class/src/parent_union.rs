@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Canonical m22/m24 parent-proof union layout.
 //!
@@ -10,7 +11,7 @@
 //! from growing an accidental `current × parent` matrix bank while those
 //! primitives are made shape-polymorphic.
 
-use noid_ivc_core::pcs::{
+use elide_ivc_core::pcs::{
     compute_fri_arities, default_fri_queries, fri_commit_layout, PcsParams, LOG_PACKING,
 };
 
@@ -159,7 +160,7 @@ impl ParentUnionLayout {
 fn build_suffix_relation(
     class: ParentProofClass,
     corrupt_first_inactive: bool,
-) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>) {
+) -> (elide_ivc_core::field_r1cs::FieldR1cs, Vec<F128>) {
     let layout = ParentUnionLayout::canonical();
     let mut builder = FieldR1csBuilder::new();
     let parent_is_m24 = LinExpr::from_wire(builder.alloc_bool(class.is_m24()));

@@ -67,13 +67,13 @@ Parano1d 把每一项证明责任放在相应[见证数据](../reference/glossar
 
 | 组件 | 职责 |
 |---|---|
-| `noid_tx` | 逻辑 `PagedSpend`、交易标识与授权绑定 |
-| `noid_mempool` | 交易意图准入、冲突预留与转发策略 |
-| `noid_miner` | 交易选择、State 见证数据、区块准备与 PoW |
-| `noid_recursive` | `HistoryStep` 关系、终端验证与递归 |
-| `noid_chain` | 共识规则、MDBX State、区块头、重组与快照 |
-| `noid_p2p` | GossipSub 转发、发现与同步协议 |
-| `noid_node` | 运行时编排、钱包集成与关闭流程 |
-| `noid_rpc` | 本地节点、钱包与外部挖矿接口 |
+| `elide_tx` | 逻辑 `PagedSpend`、交易标识与授权绑定 |
+| `elide_mempool` | 交易意图准入、冲突预留与转发策略 |
+| `elide_miner` | 交易选择、State 见证数据、区块准备与 PoW |
+| `elide_recursive` | `HistoryStep` 关系、终端验证与递归 |
+| `elide_chain` | 共识规则、MDBX State、区块头、重组与快照 |
+| `elide_p2p` | GossipSub 转发、发现与同步协议 |
+| `elide_node` | 运行时编排、钱包集成与关闭流程 |
+| `elide_rpc` | 本地节点、钱包与外部挖矿接口 |
 
 部署说明见[在 Linux 上运行节点](../operate/node.md)。

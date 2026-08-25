@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Direct production C1 matrix-fold benchmark.
 //!
@@ -13,26 +14,26 @@ use std::io::{BufReader, Read as _};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
-use noid_ivc_core::field::{F128, F256};
-use noid_ivc_core::field_r1cs::CompactFieldR1cs;
-use noid_ivc_core::matrix_claim::c1::{
+use elide_ivc_core::challenger::{Challenger, FsLaneChallenger};
+use elide_ivc_core::field::{F128, F256};
+use elide_ivc_core::field_r1cs::CompactFieldR1cs;
+use elide_ivc_core::matrix_claim::c1::{
     prove_matrix_claim_fold_compact_c1, verify_matrix_claim_fold_c1, C1FreshLincheckClaim,
     C1MatrixAccClaim, C1MatrixClaimEvaluator,
 };
-use noid_miner::history_step_artifacts::{
+use elide_miner::history_step_artifacts::{
     history_step_matrix_file_name, HISTORY_STEP_PACK_VERSION_DIRECTORY,
     HISTORY_STEP_RUNTIME_METADATA_FILE, HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
-use noid_recursive::{canonical_history_step_shape, CanonicalHistoryStepClassId};
+use elide_recursive::{canonical_history_step_shape, CanonicalHistoryStepClassId};
 
-const PACK_DIRECTORY_ENV: &str = "NOID_HISTORY_STEP_PACK_DIR";
-const SAMPLE_COUNT_ENV: &str = "NOID_MATRIX_FOLD_SAMPLES";
-const NODE_CPU_POOL_ENV: &str = "NOID_HISTORY_STEP_NODE_CPU_POOL";
+const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
+const SAMPLE_COUNT_ENV: &str = "ELIDE_MATRIX_FOLD_SAMPLES";
+const NODE_CPU_POOL_ENV: &str = "ELIDE_HISTORY_STEP_NODE_CPU_POOL";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
-const TRANSCRIPT_DOMAIN: &[u8] = b"NOID/BENCH/MATRIX-CLAIM-C1/V1";
+const TRANSCRIPT_DOMAIN: &[u8] = b"ELD/BENCH/MATRIX-CLAIM-C1/V1";
 
 fn read_regular_bounded(path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     let metadata = std::fs::symlink_metadata(path)
@@ -70,7 +71,7 @@ fn load_b25_matrix() -> Result<CompactFieldR1cs, String> {
     let digest = metadata[trailer..]
         .try_into()
         .map_err(|_| "runtime metadata digest width".to_owned())?;
-    let runtime = noid_miner::decode_history_step_runtime_metadata_pinned(&metadata, digest)
+    let runtime = elide_miner::decode_history_step_runtime_metadata_pinned(&metadata, digest)
         .map_err(|error| format!("authenticate {}: {error}", metadata_path.display()))?;
     let class = CanonicalHistoryStepClassId::new(0).expect("B25 class is canonical");
     let matrix_path = version.join(history_step_matrix_file_name(class));
@@ -159,10 +160,10 @@ fn sample_count() -> Result<usize, String> {
 
 fn run() -> Result<(), String> {
     if std::env::var_os(NODE_CPU_POOL_ENV).is_some() {
-        noid_miner::configure_process_cpu_budget(noid_miner::ProcessCpuBudgetMode::ProofOnly)
+        elide_miner::configure_process_cpu_budget(elide_miner::ProcessCpuBudgetMode::ProofOnly)
             .map_err(|error| format!("configure production CPU pool: {error}"))?;
     } else {
-        noid_ivc_prover::init_perf_thread_pool();
+        elide_ivc_prover::init_perf_thread_pool();
     }
     let mut matrix = load_b25_matrix()?;
     let (fresh, incoming) = valid_claims(&mut matrix)?;

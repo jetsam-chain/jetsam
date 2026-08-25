@@ -247,10 +247,10 @@ UTXO 中记录的 32 字节公开值，由对应的 256 位支出秘密通过 Po
 钱包保存一个 256 位主密钥，并由它确定性派生各地址的 256 位支出秘密。知道
 相应秘密即拥有支出权限。
 
-<a id="micronoid"></a>
+<a id="micro_eld"></a>
 ### μNOID
 
-最小货币单位。1 NOID 等于 1,000,000 μNOID。
+最小货币单位。1 ELD 等于 1,000,000 μNOID。
 
 <a id="state-growth-fee"></a>
 ### State 增长费（State-growth fee）

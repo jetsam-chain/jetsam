@@ -8,15 +8,15 @@ nonce и отправку блока в одном процессе Core.
 Запустите проверку совместимости оборудования:
 
 ```sh
-parano1d --check-hardware
+elide --check-hardware
 ```
 
 Получите адрес выплаты из кошелька ноды:
 
 ```sh
-parano1d
-parano1d-cli address --list
-parano1d-cli stop
+elide
+elide-cli address --list
+elide-cli stop
 ```
 
 Если отдельная выплата не задана, автоматически используется активный адрес
@@ -27,14 +27,14 @@ parano1d-cli stop
 В текущем терминале:
 
 ```sh
-parano1d --mode miner --cpu-threads 12
+elide --mode miner --cpu-threads 12
 ```
 
 Либо обновите файл службы systemd:
 
 ```ini
-ExecStart=/usr/local/bin/parano1d \
-  --config /etc/parano1d/parano1d.toml \
+ExecStart=/usr/local/bin/elide \
+  --config /etc/elide/elide.toml \
   --mode miner \
   --cpu-threads 12
 ```
@@ -43,7 +43,7 @@ ExecStart=/usr/local/bin/parano1d \
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart parano1d
+sudo systemctl restart elide
 ```
 
 ## Готовность
@@ -52,9 +52,9 @@ sudo systemctl restart parano1d
 цепь. Проверьте:
 
 ```sh
-parano1d-cli status
-parano1d-cli peers
-parano1d-cli mining
+elide-cli status
+elide-cli peers
+elide-cli mining
 ```
 
 Процесс готовит встроенные матрицы доказательств B25 и B255 и выбирает лучшую
@@ -83,7 +83,7 @@ P2P-сервису. Выделенный майнер может использ�
 Для постоянной отдельной выплаты процесса:
 
 ```sh
-parano1d --mode miner --miner-address o1...
+elide --mode miner --miner-address o1...
 ```
 
 Используйте полный адрес bech32m.
@@ -93,11 +93,11 @@ parano1d --mode miner --miner-address o1...
 Остановите ноду через RPC или менеджер служб:
 
 ```sh
-parano1d-cli stop
+elide-cli stop
 ```
 
 ```sh
-sudo systemctl stop parano1d
+sudo systemctl stop elide
 ```
 
 Корректное завершение отменяет майнинг, закрывает сеть и сбрасывает MDBX на

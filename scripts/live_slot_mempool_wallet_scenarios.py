@@ -10,9 +10,9 @@ Covers:
 - final chain convergence and empty mempools.
 
 Environment knobs:
-  NOID_LIVE_TX_ROUNDS   default 2  (each round submits 6 txs: A->B,A->C,B->C,B->A,C->A,C->B)
-  NOID_LIVE_START_BLOCKS default 20
-  NOID_LIVE_BASE_PORT   default 19600
+  ELIDE_LIVE_TX_ROUNDS   default 2  (each round submits 6 txs: A->B,A->C,B->C,B->A,C->A,C->B)
+  ELIDE_LIVE_START_BLOCKS default 20
+  ELIDE_LIVE_BASE_PORT   default 19600
 """
 
 import json
@@ -24,14 +24,14 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
+NODE_BIN = ROOT / "target" / "release" / "elide"
 BASE = ROOT / "target" / "live-tests" / "slot-mempool-wallet"
 LOGS = BASE / "logs"
 
-START_BLOCKS = int(os.environ.get("NOID_LIVE_START_BLOCKS", "20"))
-TX_ROUNDS = int(os.environ.get("NOID_LIVE_TX_ROUNDS", "2"))
-BASE_PORT = int(os.environ.get("NOID_LIVE_BASE_PORT", "19600"))
-AMOUNT_BASE = 100_000  # 0.1 NOID in micronoid; small enough for many rounds
+START_BLOCKS = int(os.environ.get("ELIDE_LIVE_START_BLOCKS", "20"))
+TX_ROUNDS = int(os.environ.get("ELIDE_LIVE_TX_ROUNDS", "2"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_BASE_PORT", "19600"))
+AMOUNT_BASE = 100_000  # 0.1 ELD in micro_eld; small enough for many rounds
 
 
 class LiveTestError(Exception):
@@ -180,7 +180,7 @@ class Node:
 
 
 def rpc(url, method, params=None, timeout=8):
-    method_full = method if method.startswith("paranoid_") else f"paranoid_{method}"
+    method_full = method if method.startswith("paraelide_") else f"paraelide_{method}"
     body = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": method_full, "params": params or []}
     ).encode()
@@ -285,7 +285,7 @@ def wait_tx_confirmed(nodes, tx_hash, timeout=480):
 def main():
     if not NODE_BIN.exists():
         raise LiveTestError(
-            f"release binary missing: {NODE_BIN}; run cargo build --release -p noid_node --bin parano1d"
+            f"release binary missing: {NODE_BIN}; run cargo build --release -p elide_node --bin elide"
         )
     if BASE.exists():
         shutil.rmtree(BASE)
@@ -324,7 +324,7 @@ def main():
         scan = rpc(n1.rpc_url, "walletScan", timeout=180)
         print(f"[scan] n1 initial: {scan}", flush=True)
         assert_true(
-            n1.balance()["spendable_micronoid"] >= 100_000_000,
+            n1.balance()["spendable_micro_eld"] >= 100_000_000,
             f"n1 low spendable: {n1.balance()}",
         )
 
@@ -366,7 +366,7 @@ def main():
             assert_true(tx_hash, f"walletSend omitted transaction id: {send}")
             tx_hashes.append(tx_hash)
             print(
-                f"[send funding] A->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micronoid']}",
+                f"[send funding] A->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micro_eld']}",
                 flush=True,
             )
             wait_until(
@@ -397,8 +397,8 @@ def main():
                     "B": n2.balance(),
                     "C": n3.balance(),
                 }
-                if n2.balance()["total_micronoid"] > 0
-                and n3.balance()["total_micronoid"] > 0
+                if n2.balance()["total_micro_eld"] > 0
+                and n3.balance()["total_micro_eld"] > 0
                 else False
             ),
             timeout=120,
@@ -410,11 +410,11 @@ def main():
         for r in range(TX_ROUNDS):
             for j, (src, dst) in enumerate(pairs):
                 bal = src.balance()
-                if bal["spendable_micronoid"] < 50_000:
+                if bal["spendable_micro_eld"] < 50_000:
                     print(f"[skip] {src.name} spendable too low: {bal}", flush=True)
                     continue
                 amount = 20_000 + r * 1_000 + j * 500
-                pre_dst = dst.balance()["total_micronoid"]
+                pre_dst = dst.balance()["total_micro_eld"]
                 hints_before = rpc(src.rpc_url, "getSlotHints", [8], timeout=10)
                 assert_true(
                     len(hints_before) >= 2,
@@ -430,7 +430,7 @@ def main():
                 assert_true(tx_hash, f"walletSend omitted transaction id: {send}")
                 tx_hashes.append(tx_hash)
                 print(
-                    f"[send r{r}] {src.name}->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micronoid']} hints={hints_before[:3]}",
+                    f"[send r{r}] {src.name}->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micro_eld']} hints={hints_before[:3]}",
                     flush=True,
                 )
                 wait_until(
@@ -469,8 +469,8 @@ def main():
                 wait_until(
                     f"{dst.name} balance increases without rescan",
                     lambda: (
-                        dst.balance()["total_micronoid"]
-                        if dst.balance()["total_micronoid"] >= pre_dst + amount
+                        dst.balance()["total_micro_eld"]
+                        if dst.balance()["total_micro_eld"] >= pre_dst + amount
                         else False
                     ),
                     timeout=120,

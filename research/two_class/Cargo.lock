@@ -274,45 +274,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "noid-ivc-core"
+name = "elide-ivc-core"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "noid_core",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_poseidon2b",
  "rayon",
  "serde",
  "toml",
 ]
 
 [[package]]
-name = "noid-ivc-prover"
+name = "elide-ivc-prover"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "noid-ivc-core",
+ "elide-ivc-core",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "noid_chain"
+name = "elide_chain"
 version = "0.0.2"
 dependencies = [
  "bincode",
  "libmdbx",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_poseidon2b",
- "noid_tx",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_poseidon2b",
+ "elide_tx",
  "rayon",
  "serde",
  "tracing",
 ]
 
 [[package]]
-name = "noid_core"
+name = "elide_core"
 version = "0.0.2"
 dependencies = [
  "rand",
@@ -322,23 +322,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "noid_fri"
+name = "elide_fri"
 version = "0.0.2"
 dependencies = [
- "noid_core",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_poseidon2b",
  "rand",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "noid_fri_binius"
+name = "elide_fri_binius"
 version = "0.0.2"
 dependencies = [
- "noid_core",
- "noid_fri",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_fri",
+ "elide_poseidon2b",
  "rand_core",
  "rayon",
  "serde",
@@ -346,15 +346,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "noid_gkr"
+name = "elide_gkr"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_poseidon2b",
- "noid_tx",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_poseidon2b",
+ "elide_tx",
  "rand_core",
  "rayon",
  "serde",
@@ -362,12 +362,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "noid_poseidon2b"
+name = "elide_poseidon2b"
 version = "0.0.2"
 dependencies = [
  "bech32",
  "hex",
- "noid_core",
+ "elide_core",
  "rand",
  "rayon",
  "serde",
@@ -375,30 +375,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "noid_recursive"
+name = "elide_recursive"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "noid-ivc-core",
- "noid-ivc-prover",
- "noid_chain",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_tx",
+ "elide-ivc-core",
+ "elide-ivc-prover",
+ "elide_chain",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_tx",
  "rayon",
  "serde",
  "tracing",
 ]
 
 [[package]]
-name = "noid_tx"
+name = "elide_tx"
 version = "0.0.2"
 dependencies = [
- "noid_core",
- "noid_poseidon2b",
+ "elide_core",
+ "elide_poseidon2b",
  "serde",
 ]
 
@@ -419,18 +419,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "paranoid-two-class-research"
+name = "paraelide-two-class-research"
 version = "0.0.0"
 dependencies = [
- "noid-ivc-core",
- "noid_chain",
- "noid_core",
- "noid_fri",
- "noid_fri_binius",
- "noid_gkr",
- "noid_poseidon2b",
- "noid_recursive",
- "noid_tx",
+ "elide-ivc-core",
+ "elide_chain",
+ "elide_core",
+ "elide_fri",
+ "elide_fri_binius",
+ "elide_gkr",
+ "elide_poseidon2b",
+ "elide_recursive",
+ "elide_tx",
 ]
 
 [[package]]

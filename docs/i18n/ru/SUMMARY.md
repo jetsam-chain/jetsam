@@ -52,7 +52,7 @@
 - [Первый запуск и мастер-секрет](wallet/first-run.md)
 - [Ключ из фотографии](wallet/photo-key.md)
 - [Адреса](wallet/addresses.md)
-- [Отправка NOID](wallet/send.md)
+- [Отправка ELD](wallet/send.md)
 - [Чеки](wallet/receipts.md)
 - [Консолидация](wallet/consolidation.md)
 - [Scope](wallet/scope.md)

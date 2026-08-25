@@ -21,8 +21,8 @@ unsupported host exits before opening the wallet or chain database.
 Run the preflight on the intended host:
 
 ```sh
-parano1d --check-hardware
-parano1d-miner --check-hardware
+elide --check-hardware
+elide-miner --check-hardware
 ```
 
 A successful node report ends with:
@@ -118,8 +118,8 @@ segments. MDBX grows in 64 MiB steps as needed.
 Monitor the real path:
 
 ```sh
-du -sh ~/.parano1d/data
-parano1d-cli state
+du -sh ~/.elide/data
+elide-cli state
 ```
 
 Snapshot synchronization requires temporary space for a complete candidate
@@ -141,10 +141,10 @@ private or authenticated transport protects it.
 Revisit capacity after material changes in Live State or traffic:
 
 ```sh
-parano1d-cli status
-parano1d-cli state
-parano1d-cli peers
-du -sh ~/.parano1d/data
+elide-cli status
+elide-cli state
+elide-cli peers
+du -sh ~/.elide/data
 ```
 
 Alert on low disk space, repeated peer loss, sustained synchronization lag and

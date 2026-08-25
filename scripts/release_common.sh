@@ -119,11 +119,11 @@ release_read_pin_file() {
   while IFS= read -r line || [[ -n $line ]]; do
     (( line_count += 1 ))
     case "$line" in
-      NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=*)
+      ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=*)
         [[ -z $metadata_digest ]] || release_die "duplicate runtime metadata pin in $pin_file"
         metadata_digest=${line#*=}
         ;;
-      NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=*)
+      ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=*)
         [[ -z $leaf_digests ]] || release_die "duplicate matrix leaf pins in $pin_file"
         leaf_digests=${line#*=}
         ;;
@@ -150,9 +150,9 @@ release_write_pin_file() {
     release_die "cannot write pins.env without a computed runtime metadata digest"
   [[ ${RELEASE_LEAF_DIGESTS:-} =~ ^[0-9a-f]{128}$ ]] || \
     release_die "cannot write pins.env without two computed matrix digests"
-  printf 'NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\n' \
+  printf 'ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\n' \
     "$RELEASE_METADATA_DIGEST" > "$temporary"
-  printf 'NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
+  printf 'ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
     "$RELEASE_LEAF_DIGESTS" >> "$temporary"
   mv -- "$temporary" "$pin_file"
 }
@@ -216,15 +216,15 @@ release_tool_executable() {
 
 release_build_pack_tools() {
   local include_generator=${1:-0}
-  local build_args=(--bin noid_pack_pins)
+  local build_args=(--bin elide_pack_pins)
   local tool_rustflags='-C target-cpu=native'
 
   release_require_command cargo
   release_require_command rustc
   release_require_command tr
-  RELEASE_TOOL_TARGET_DIR=${NOID_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
+  RELEASE_TOOL_TARGET_DIR=${ELIDE_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
   if [[ $include_generator == 1 ]]; then
-    build_args+=(--bin noid_matrix_gen)
+    build_args+=(--bin elide_matrix_gen)
   fi
   case "$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')" in
     *-windows-*)
@@ -237,19 +237,19 @@ release_build_pack_tools() {
   printf '\n==> Building release pack tools\n'
   (
     unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS
-    unset NOID_HISTORY_STEP_PACK_DIR
-    unset NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
-    unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
+    unset ELIDE_HISTORY_STEP_PACK_DIR
+    unset ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
+    unset ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS
     export CARGO_TARGET_DIR="$RELEASE_TOOL_TARGET_DIR"
     export RUSTFLAGS="$tool_rustflags"
     cd "$RELEASE_ROOT_DIR" || exit 1
     cargo build --locked --release -p bench_prover "${build_args[@]}"
   )
 
-  RELEASE_PIN_TOOL=$(release_tool_executable noid_pack_pins)
+  RELEASE_PIN_TOOL=$(release_tool_executable elide_pack_pins)
   [[ -x $RELEASE_PIN_TOOL ]] || release_die "pin tool was not built: $RELEASE_PIN_TOOL"
   if [[ $include_generator == 1 ]]; then
-    RELEASE_MATRIX_GENERATOR=$(release_tool_executable noid_matrix_gen)
+    RELEASE_MATRIX_GENERATOR=$(release_tool_executable elide_matrix_gen)
     [[ -x $RELEASE_MATRIX_GENERATOR ]] || \
       release_die "matrix generator was not built: $RELEASE_MATRIX_GENERATOR"
   fi
@@ -265,11 +265,11 @@ release_compute_pack_pins() {
   printf '%s\n' "$output"
   metadata_digest=$(
     printf '%s\n' "$output" |
-      sed -n 's/^NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=//p'
+      sed -n 's/^ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=//p'
   )
   leaf_digests=$(
     printf '%s\n' "$output" |
-      sed -n 's/^NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
+      sed -n 's/^ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
   )
   [[ $metadata_digest =~ ^[0-9a-f]{64}$ ]] || \
     release_die "computed runtime metadata pin is not 64 lowercase hex characters"
@@ -304,8 +304,8 @@ release_workspace_version() {
   local node_pkg extminer_pkg node_version extminer_version
 
   release_require_command tr
-  node_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p noid_node | tr -d '\r')
-  extminer_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p noid-extminer | tr -d '\r')
+  node_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p elide_node | tr -d '\r')
+  extminer_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p elide-extminer | tr -d '\r')
   if [[ $node_pkg == *@* ]]; then
     node_version=${node_pkg##*@}
   else
@@ -317,7 +317,7 @@ release_workspace_version() {
     extminer_version=${extminer_pkg##*#}
   fi
   [[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || \
-    release_die "cannot determine noid_node version from: $node_pkg"
+    release_die "cannot determine elide_node version from: $node_pkg"
   [[ $node_version == "$extminer_version" ]] || \
     release_die "node version $node_version differs from external miner version $extminer_version"
   # shellcheck disable=SC2034 # Read by scripts that source this helper.

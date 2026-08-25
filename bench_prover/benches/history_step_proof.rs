@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid Zero.
+// Copyright (C) 2026 trace.protocol.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Isolated production HistoryStep proving benchmark.
 //!
@@ -7,13 +8,13 @@
 //!
 //! ```text
 //! source "$PACK_ROOT/pins.env"
-//! export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
+//! export ELIDE_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
 //! cargo bench -p bench_prover --bench history_step_proof
 //! ```
 //!
-//! Set `NOID_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
+//! Set `ELIDE_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
 //! B25 parent. Use `B255-B255` for the B255-parent case. With no filter, both
-//! launch classes run. `NOID_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
+//! launch classes run. `ELIDE_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
 //! parent and authenticated matrix pack for N production samples, then reports
 //! nearest-rank p50/p95 values; the default is one sample.
 //!
@@ -35,14 +36,14 @@ use bench_prover::{
     HonestHistoryStepFixtureProvider, PreparedHistoryStepBackboneInput,
     PreparedHistoryStepTierFixture,
 };
-use noid_ivc_core::field_r1cs::CompactFieldR1cs;
-use noid_miner::history_step_artifacts::{
+use elide_ivc_core::field_r1cs::CompactFieldR1cs;
+use elide_miner::history_step_artifacts::{
     history_step_matrix_file_name, HISTORY_STEP_PACK_LEAF_HASH_DOMAIN,
     HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
     HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
-use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
-use noid_recursive::{
+use elide_poseidon2b::native::poseidon2b_hash_byte_slices;
+use elide_recursive::{
     canonical_history_step_shape, decode_history_step_terminal,
     decode_verify_history_step_terminal, encode_history_step_terminal,
     prepare_history_step_for_pow, prove_built_history_step_terminal, prove_history_step,
@@ -52,11 +53,11 @@ use noid_recursive::{
 };
 
 const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
-const PACK_DIRECTORY_ENV: &str = "NOID_HISTORY_STEP_PACK_DIR";
-const BENCH_FILTER_ENV: &str = "NOID_HISTORY_STEP_BENCH_FILTER";
-const BENCH_SAMPLES_ENV: &str = "NOID_HISTORY_STEP_BENCH_SAMPLES";
-const METADATA_DIGEST_ENV: &str = "NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
-const LEAF_DIGESTS_ENV: &str = "NOID_HISTORY_STEP_PACK_LEAF_DIGESTS";
+const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
+const BENCH_FILTER_ENV: &str = "ELIDE_HISTORY_STEP_BENCH_FILTER";
+const BENCH_SAMPLES_ENV: &str = "ELIDE_HISTORY_STEP_BENCH_SAMPLES";
+const METADATA_DIGEST_ENV: &str = "ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
+const LEAF_DIGESTS_ENV: &str = "ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
@@ -260,7 +261,7 @@ fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), S
         &metadata_path,
         HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES as u64,
     )?;
-    let metadata = noid_miner::decode_history_step_runtime_metadata_pinned(
+    let metadata = elide_miner::decode_history_step_runtime_metadata_pinned(
         &encoded,
         parse_digest(METADATA_DIGEST_ENV)?,
     )
@@ -285,7 +286,7 @@ fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), S
 
 fn finish_fixture<const TIER: usize>(
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(noid_chain::Block, HistoryStepBlockInput<TIER>), String> {
+) -> Result<(elide_chain::Block, HistoryStepBlockInput<TIER>), String> {
     let (witness, nonce, start, end) = fixture.into_parts();
     witness
         .finish(nonce, &start, &end)
@@ -294,7 +295,7 @@ fn finish_fixture<const TIER: usize>(
 
 fn finish_fixture_template<const TIER: usize>(
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(noid_chain::Block, HistoryStepBlockInput<TIER>, u128), String> {
+) -> Result<(elide_chain::Block, HistoryStepBlockInput<TIER>, u128), String> {
     let (witness, nonce, start, end) = fixture.into_parts();
     let (mut block, input) = witness
         .finish_template(&start, &end)
@@ -307,7 +308,7 @@ fn prove_parent_step<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(noid_chain::Block, HistoryStepTerminal), String> {
+) -> Result<(elide_chain::Block, HistoryStepTerminal), String> {
     let (block, input) = finish_fixture(fixture)?;
     let terminal = prove_history_step(runtime, parent, input)
         .map_err(|error| format!("prove honest B{TIER} setup step: {error}"))?;
@@ -318,8 +319,8 @@ fn build_parent(
     runtime: &HistoryStepRuntime,
     provider: &mut HonestHistoryStepFixtureProvider,
     target_parent_slot: usize,
-) -> Result<(noid_chain::Block, HistoryStepTerminal), String> {
-    let mut expected = noid_recursive::genesis_accumulator();
+) -> Result<(elide_chain::Block, HistoryStepTerminal), String> {
+    let mut expected = elide_recursive::genesis_accumulator();
     let mut parent = None;
     loop {
         let step = provider.next_backbone(&expected)?.ok_or_else(|| {
@@ -391,7 +392,7 @@ fn benchmark_tier<const TIER: usize>(
     let prove_encode_ms = prove_started.elapsed().as_millis();
     let history_step_ms = (input_preparation + history_step_started.elapsed()).as_millis();
     let terminal_bytes = encoded.len();
-    let epoch_anchor = noid_chain::consensus::genesis_header();
+    let epoch_anchor = elide_chain::consensus::genesis_header();
     let verify_started = Instant::now();
     let accepted =
         decode_verify_history_step_terminal(runtime, &encoded, &block.header, &epoch_anchor)
@@ -508,7 +509,7 @@ fn run_on_production_pool() -> Result<(), String> {
         &runtime,
         &parent_wire,
         &parent_block.header,
-        &noid_chain::consensus::genesis_header(),
+        &elide_chain::consensus::genesis_header(),
     )
     .map_err(|error| format!("verify benchmark parent: {error}"))?;
     if accepted_parent.class_id() != parent.class_id()
@@ -546,14 +547,14 @@ fn run_on_production_pool() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let cpu_plan =
-        noid_miner::configure_process_cpu_budget(noid_miner::ProcessCpuBudgetMode::ProofOnly)
+        elide_miner::configure_process_cpu_budget(elide_miner::ProcessCpuBudgetMode::ProofOnly)
             .map_err(|error| format!("configure production CPU pool: {error}"))?;
-    let hardware = noid_core::cpu::ProductionHardwareReport::detect();
+    let hardware = elide_core::cpu::ProductionHardwareReport::detect();
     println!(
         "HistoryStep benchmark backend={} threads={}",
         hardware.backend, cpu_plan.history_step_phase_threads,
     );
-    noid_miner::install_history_step_phase_cpu(run_on_production_pool)
+    elide_miner::install_history_step_phase_cpu(run_on_production_pool)
         .map_err(|error| format!("enter production HistoryStep CPU phase: {error}"))?
 }
 

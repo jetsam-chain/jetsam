@@ -22,17 +22,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_BIN = Path(
-    os.environ.get("NOID_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "parano1d"))
+    os.environ.get("ELIDE_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "elide"))
 ).resolve()
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_FORK_REORG_DIR",
+        "ELIDE_LIVE_FORK_REORG_DIR",
         str(RUN_PARENT / f"two-miner-fork-reorg-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_FORK_REORG_BASE_PORT", "20600"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_FORK_REORG_BASE_PORT", "20600"))
 COMMON_HEIGHT = 2
 FORK_HEIGHT = COMMON_HEIGHT + 1
 WINNER_HEIGHT = FORK_HEIGHT + 1
@@ -70,7 +70,7 @@ def rpc(port, method, params=None, timeout=15, host="127.0.0.1"):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paranoid_") else f"paranoid_{method}",
+            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
             "params": params or [],
         }
     ).encode()
@@ -107,7 +107,7 @@ class Node:
         self.command_prefix = tuple(command_prefix)
         self.root = BASE / name
         self.data_dir = self.root / "data"
-        self.config = self.root / "parano1d.toml"
+        self.config = self.root / "elide.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

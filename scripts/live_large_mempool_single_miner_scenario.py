@@ -24,11 +24,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_LARGE_MEMPOOL_SINGLE_DIR",
+        "ELIDE_LIVE_LARGE_MEMPOOL_SINGLE_DIR",
         str(RUN_PARENT / f"large-mempool-single-miner-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("NOID_LIVE_LARGE_MEMPOOL_SINGLE_BASE_PORT", "21800"))
+BASE_PORT = int(os.environ.get("ELIDE_LIVE_LARGE_MEMPOOL_SINGLE_BASE_PORT", "21800"))
 INITIAL_HEIGHT = 4
 LOWER_CLASS_PAGES = 25
 LOWER_PROOF_CLASS = "B25"
@@ -278,7 +278,7 @@ def main():
                 {
                     "round": round_index,
                     "submitted": count,
-                    "amount_micronoid": amount,
+                    "amount_micro_eld": amount,
                     "submission_s": round(submit_seconds, 3),
                     "confirmation_heights": confirmation_heights,
                     "drained_tip": drained,
@@ -427,7 +427,7 @@ def main():
                 "drain_samples": samples,
                 "confirmation_distribution": distribution,
                 "mining_blocks": mined_blocks,
-                "fee_counts": dict(Counter(send["fee_micronoid"] for send in spam_sends)),
+                "fee_counts": dict(Counter(send["fee_micro_eld"] for send in spam_sends)),
             }
         )
         print(f"[PASS] one B25 miner drained {SPAM_COUNT} TXs as {distribution}", flush=True)
