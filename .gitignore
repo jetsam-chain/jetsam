@@ -1,0 +1,10 @@
+/target/
+**/target/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+__pycache__/
+*.py[cod]
