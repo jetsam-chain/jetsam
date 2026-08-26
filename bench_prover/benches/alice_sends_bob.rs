@@ -12,7 +12,7 @@ use bench_prover::{
 const DEFAULT_SAMPLES: usize = 5;
 
 fn samples() -> usize {
-    std::env::var("ELIDE_WALLET_BENCH_SAMPLES")
+    std::env::var("JETSAM_WALLET_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)

@@ -27,9 +27,9 @@ use jetsam_miner::history_step_artifacts::{
 };
 use jetsam_recursive::{canonical_history_step_shape, CanonicalHistoryStepClassId};
 
-const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
-const SAMPLE_COUNT_ENV: &str = "ELIDE_MATRIX_FOLD_SAMPLES";
-const NODE_CPU_POOL_ENV: &str = "ELIDE_HISTORY_STEP_NODE_CPU_POOL";
+const PACK_DIRECTORY_ENV: &str = "JETSAM_HISTORY_STEP_PACK_DIR";
+const SAMPLE_COUNT_ENV: &str = "JETSAM_MATRIX_FOLD_SAMPLES";
+const NODE_CPU_POOL_ENV: &str = "JETSAM_HISTORY_STEP_NODE_CPU_POOL";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;

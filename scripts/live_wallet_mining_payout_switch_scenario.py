@@ -14,11 +14,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_WALLET_PAYOUT_SWITCH_DIR",
+        "JETSAM_LIVE_WALLET_PAYOUT_SWITCH_DIR",
         str(RUN_PARENT / f"wallet-payout-switch-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_WALLET_PAYOUT_SWITCH_BASE_PORT", "23900"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_WALLET_PAYOUT_SWITCH_BASE_PORT", "23900"))
 
 live.BASE = BASE
 Node = live.Node

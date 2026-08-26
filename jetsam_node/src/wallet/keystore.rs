@@ -31,7 +31,7 @@ use super::encryption::{self, ENCRYPTED_FILE_LEN};
 /// Argon2id + XChaCha20-Poly1305 instead of in the clear. When it is not, the
 /// cleartext format is still used and the caller is warned - refusing outright
 /// would lock a developer out of an existing node for no gain.
-pub const PASSPHRASE_ENV: &str = "ELIDE_WALLET_PASSPHRASE";
+pub const PASSPHRASE_ENV: &str = "JETSAM_WALLET_PASSPHRASE";
 
 /// Test-only passphrase override.
 ///

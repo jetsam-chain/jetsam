@@ -71,7 +71,7 @@ fn fmt_bytes(bytes: usize) -> String {
 }
 
 fn samples() -> usize {
-    std::env::var("ELIDE_WALLET_BENCH_SAMPLES")
+    std::env::var("JETSAM_WALLET_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)

@@ -23,11 +23,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_INBOUND_SYBIL_DIR",
+        "JETSAM_LIVE_INBOUND_SYBIL_DIR",
         str(RUN_PARENT / f"p2p-inbound-sybil-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_INBOUND_SYBIL_BASE_PORT", "21700"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_INBOUND_SYBIL_BASE_PORT", "21700"))
 TARGET_IP = "11.1.0.1"
 ATTACKER_COUNT = 40
 MAX_SAME_IP_PEERS = 32
@@ -40,10 +40,10 @@ require = live.require
 
 
 def enter_network_namespace():
-    if os.environ.get("ELIDE_LIVE_ECLIPSE_NETNS") == "1":
+    if os.environ.get("JETSAM_LIVE_ECLIPSE_NETNS") == "1":
         return
     env = os.environ.copy()
-    env["ELIDE_LIVE_ECLIPSE_NETNS"] = "1"
+    env["JETSAM_LIVE_ECLIPSE_NETNS"] = "1"
     os.execvpe(
         "unshare",
         ["unshare", "--user", "--map-root-user", "--net", "--", sys.executable, __file__],

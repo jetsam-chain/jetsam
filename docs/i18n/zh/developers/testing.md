@@ -39,7 +39,7 @@ cargo test --locked --release \
 x86-64 上强制测试发布版最低后端：
 
 ```sh
-ELIDE_CPU_BACKEND=pclmul \
+JETSAM_CPU_BACKEND=pclmul \
   cargo test --locked --release \
   -p jetsam_core -p jetsam_poseidon2b -p jetsam-ivc-core
 ```
@@ -47,7 +47,7 @@ ELIDE_CPU_BACKEND=pclmul \
 标量后端只用于差分检查：
 
 ```sh
-ELIDE_CPU_BACKEND=scalar \
+JETSAM_CPU_BACKEND=scalar \
   cargo test --locked --release \
   -p jetsam_core -p jetsam_poseidon2b
 ```

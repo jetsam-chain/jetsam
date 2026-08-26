@@ -16,12 +16,12 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_WALLET_RECEIVE_OFFLINE_SNAPSHOT_DIR",
+        "JETSAM_LIVE_WALLET_RECEIVE_OFFLINE_SNAPSHOT_DIR",
         str(RUN_PARENT / f"wallet-receive-offline-snapshot-clean-{STAMP}"),
     )
 )
 BASE_PORT = int(
-    os.environ.get("ELIDE_LIVE_WALLET_RECEIVE_OFFLINE_SNAPSHOT_BASE_PORT", "22300")
+    os.environ.get("JETSAM_LIVE_WALLET_RECEIVE_OFFLINE_SNAPSHOT_BASE_PORT", "22300")
 )
 FUNDING_HEIGHT = 4
 RETAINED_DEPTH = 18

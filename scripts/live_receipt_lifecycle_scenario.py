@@ -30,13 +30,13 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_RECEIPT_DIR",
+        "JETSAM_LIVE_RECEIPT_DIR",
         str(RUN_PARENT / f"receipt-lifecycle-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_RECEIPT_BASE_PORT", "22900"))
-PAYMENT_MICRO_ELD = int(os.environ.get("ELIDE_LIVE_RECEIPT_PAYMENT", "1000000"))
-FUNDING_HEIGHT = int(os.environ.get("ELIDE_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_RECEIPT_BASE_PORT", "22900"))
+PAYMENT_MICRO_ELD = int(os.environ.get("JETSAM_LIVE_RECEIPT_PAYMENT", "1000000"))
+FUNDING_HEIGHT = int(os.environ.get("JETSAM_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
 # Full bodies remain serveable beyond the 18-block authenticated suffix so a
 # peer can recover a moving non-final branch.  Receipt independence must be
 # tested only after that complete operational serving window has elapsed.

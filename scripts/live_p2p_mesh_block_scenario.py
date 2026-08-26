@@ -16,13 +16,13 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_P2P_MESH_BLOCK_DIR",
+        "JETSAM_LIVE_P2P_MESH_BLOCK_DIR",
         str(RUN_PARENT / f"p2p-mesh-block-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_P2P_MESH_BLOCK_BASE_PORT", "21400"))
-PEER_COUNT = int(os.environ.get("ELIDE_LIVE_P2P_MESH_BLOCK_PEERS", "16"))
-TARGET_HEIGHT = int(os.environ.get("ELIDE_LIVE_P2P_MESH_BLOCK_HEIGHT", "2"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_P2P_MESH_BLOCK_BASE_PORT", "21400"))
+PEER_COUNT = int(os.environ.get("JETSAM_LIVE_P2P_MESH_BLOCK_PEERS", "16"))
+TARGET_HEIGHT = int(os.environ.get("JETSAM_LIVE_P2P_MESH_BLOCK_HEIGHT", "2"))
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

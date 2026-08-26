@@ -105,7 +105,7 @@ and performs wallet operations through local JSON-RPC.
 ```
 
 The default endpoint is `http://127.0.0.1:9601`. Environment variable
-`ELIDE_RPC` changes it. `--rpc` takes precedence.
+`JETSAM_RPC` changes it. `--rpc` takes precedence.
 
 Amounts entered by CLI wallet commands are in ELD with up to six decimal
 places:

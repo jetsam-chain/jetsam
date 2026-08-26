@@ -197,8 +197,8 @@ fn main() {
     );
 
     println!(
-        "\nELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST={}",
+        "\nJETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST={}",
         hex::encode(metadata_digest)
     );
-    println!("ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS={leaf_pins}");
+    println!("JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS={leaf_pins}");
 }

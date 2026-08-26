@@ -473,14 +473,14 @@ mod tests {
     /// corrupted one at a time → native rejects AND the trace is
     /// unsatisfiable. 0 surviving mutants.
     ///
-    /// Full sweep by default; `ELIDE_TRACE_MUTATE_STRIDE=k` samples every
+    /// Full sweep by default; `JETSAM_TRACE_MUTATE_STRIDE=k` samples every
     /// k-th field for quicker local iteration.
     #[test]
     fn accepted_claim_hash_proof_mutator_kills_all() {
         let inputs = vec![fixture_input(9)];
         let proof = prove_fixture(&inputs);
         let n_fields = count_proof_fields(&proof);
-        let stride: usize = std::env::var("ELIDE_TRACE_MUTATE_STRIDE")
+        let stride: usize = std::env::var("JETSAM_TRACE_MUTATE_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
@@ -515,7 +515,7 @@ mod tests {
     fn accepted_claim_hash_statement_mutator_kills_all() {
         let inputs = vec![fixture_input(17)];
         let proof = prove_fixture(&inputs);
-        let stride: usize = std::env::var("ELIDE_TRACE_MUTATE_STRIDE")
+        let stride: usize = std::env::var("JETSAM_TRACE_MUTATE_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
@@ -547,10 +547,10 @@ mod tests {
     /// Cross-test "trace accepts ⇔ native accepts" on randomized cases:
     /// honest proofs (must both accept) and single-field random mutations
     /// (must both reject). Case count: 100 by default,
-    /// `ELIDE_TRACE_CROSS_CASES=n` to override.
+    /// `JETSAM_TRACE_CROSS_CASES=n` to override.
     #[test]
     fn accepted_claim_hash_native_trace_equivalence() {
-        let cases: usize = std::env::var("ELIDE_TRACE_CROSS_CASES")
+        let cases: usize = std::env::var("JETSAM_TRACE_CROSS_CASES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);

@@ -561,7 +561,7 @@ mod tests {
             let mut c = f.proof.clone();
             visit_proof_fields(&mut c, &mut |_| n_fields += 1);
         }
-        let stride: usize = std::env::var("ELIDE_TRACE_MUTATE_STRIDE")
+        let stride: usize = std::env::var("JETSAM_TRACE_MUTATE_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
@@ -635,7 +635,7 @@ mod tests {
     /// Cross-test "trace ⇔ native" on randomized honest/mutated cases.
     #[test]
     fn batched_merkle_native_trace_equivalence() {
-        let cases: usize = std::env::var("ELIDE_TRACE_CROSS_CASES")
+        let cases: usize = std::env::var("JETSAM_TRACE_CROSS_CASES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);

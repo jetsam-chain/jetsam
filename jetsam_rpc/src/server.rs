@@ -1024,14 +1024,14 @@ impl RpcHandler {
     ///
     /// DEFAUT depuis l'integration (CHANGES-FROM-UPSTREAM §5) : le
     /// comportement NOGATE s'applique sans configuration. Echappatoire :
-    /// `ELIDE_TEMPLATE_STRICT_GATE=1` retablit la porte historique complete
+    /// `JETSAM_TEMPLATE_STRICT_GATE=1` retablit la porte historique complete
     /// (`require_mining_network`), qui refuse aussi les templates pendant tout
-    /// fetch P2P d'un bloc concurrent. L'ancien opt-in `ELIDE_TEMPLATE_NOGATE`
+    /// fetch P2P d'un bloc concurrent. L'ancien opt-in `JETSAM_TEMPLATE_NOGATE`
     /// n'existe plus.
     fn require_template_gate(&self) -> RpcResult<()> {
         static TEMPLATE_STRICT_GATE: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| {
-                std::env::var("ELIDE_TEMPLATE_STRICT_GATE").is_ok_and(|v| v == "1")
+                std::env::var("JETSAM_TEMPLATE_STRICT_GATE").is_ok_and(|v| v == "1")
             });
         if *TEMPLATE_STRICT_GATE {
             return self.require_mining_network();

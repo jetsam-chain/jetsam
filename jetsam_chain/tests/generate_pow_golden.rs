@@ -27,7 +27,7 @@
 //! reviewer can regenerate it and diff.
 //!
 //! ```text
-//! ELIDE_GOLDEN_COUNT=12000 \
+//! JETSAM_GOLDEN_COUNT=12000 \
 //!   cargo test --release -p jetsam_chain --test generate_pow_golden \
 //!   -- --ignored --nocapture > golden.txt
 //! ```
@@ -58,7 +58,7 @@ impl SplitMix {
 #[test]
 #[ignore = "operator tool; writes golden vectors to stdout"]
 fn emit_golden_vectors() {
-    let count: usize = std::env::var("ELIDE_GOLDEN_COUNT")
+    let count: usize = std::env::var("JETSAM_GOLDEN_COUNT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(12_000);

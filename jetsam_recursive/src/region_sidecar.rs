@@ -1232,7 +1232,7 @@ pub fn verify_merkle_region_sidecar<Ch: Challenger>(
         challenger,
     )
     .map_err(|error| {
-        if std::env::var_os("ELIDE_HISTORY_STEP_AUX_DEBUG").is_some() {
+        if std::env::var_os("JETSAM_HISTORY_STEP_AUX_DEBUG").is_some() {
             eprintln!("[merkle-sidecar verify] complete proof: {error:?}");
         }
         RegionSidecarError::InvalidProof

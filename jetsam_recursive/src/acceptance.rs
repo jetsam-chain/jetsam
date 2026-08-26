@@ -18,7 +18,7 @@ pub(crate) fn row_ledger_mark(
     last: &mut usize,
     label: &str,
 ) {
-    if std::env::var_os("ELIDE_ROW_LEDGER").is_some() {
+    if std::env::var_os("JETSAM_ROW_LEDGER").is_some() {
         let now = builder.num_wires();
         eprintln!(
             "[ledger] {label:<32} +{:>9}  (total {:>9})",

@@ -26,10 +26,10 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_SYNC_DIR", str(RUN_PARENT / f"sync-clean-{STAMP}")
+        "JETSAM_LIVE_SYNC_DIR", str(RUN_PARENT / f"sync-clean-{STAMP}")
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_SYNC_BASE_PORT", "20300"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_SYNC_BASE_PORT", "20300"))
 PRIMARY_P2P = BASE_PORT
 PRIMARY_RPC = BASE_PORT + 1
 SECONDARY_P2P = BASE_PORT + 10

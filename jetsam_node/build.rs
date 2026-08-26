@@ -18,8 +18,8 @@ use jetsam_miner::history_step_artifacts::{
 };
 use jetsam_recursive::acceptance::history_step_bank::CanonicalHistoryStepClassId;
 
-const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
-const METADATA_DIGEST_ENV: &str = "ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
+const PACK_DIRECTORY_ENV: &str = "JETSAM_HISTORY_STEP_PACK_DIR";
+const METADATA_DIGEST_ENV: &str = "JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
 
 const GENERATED_FILE: &str = "history_step_pack.rs";
 const STAGED_DIRECTORY: &str = "embedded-history-step";

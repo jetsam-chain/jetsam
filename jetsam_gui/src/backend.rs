@@ -1494,7 +1494,7 @@ impl Backend {
 
 impl BackendConfig {
     fn from_env() -> Self {
-        let settings_path = std::env::var_os("ELIDE_GUI_SETTINGS_FILE")
+        let settings_path = std::env::var_os("JETSAM_GUI_SETTINGS_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(default_gui_settings_path);
         let persisted = std::fs::read(&settings_path)
@@ -1504,7 +1504,7 @@ impl BackendConfig {
         // Keep the selected data directory long enough to locate the storage
         // marker, but do not carry old GUI/network preferences into mainnet.
         // The daemon creates the marker only after its one-time full reset.
-        let data_dir = std::env::var_os("ELIDE_GUI_DATA_DIR")
+        let data_dir = std::env::var_os("JETSAM_GUI_DATA_DIR")
             .map(PathBuf::from)
             .or_else(|| persisted.as_ref().map(|settings| settings.data_dir.clone()))
             .unwrap_or_else(default_data_dir);
@@ -1516,21 +1516,21 @@ impl BackendConfig {
         let persisted_preferences = (!reset_mainnet_settings)
             .then_some(persisted.as_ref())
             .flatten();
-        let rpc_url = std::env::var("ELIDE_RPC").unwrap_or_else(|_| DEFAULT_RPC_URL.into());
-        let rpc_listen = std::env::var("ELIDE_GUI_RPC_LISTEN").unwrap_or_else(|_| {
+        let rpc_url = std::env::var("JETSAM_RPC").unwrap_or_else(|_| DEFAULT_RPC_URL.into());
+        let rpc_listen = std::env::var("JETSAM_GUI_RPC_LISTEN").unwrap_or_else(|_| {
             rpc_listen_from_url(&rpc_url)
                 .unwrap_or(DEFAULT_RPC_LISTEN)
                 .into()
         });
-        let p2p_listen = std::env::var("ELIDE_GUI_P2P_LISTEN").unwrap_or_else(|_| {
+        let p2p_listen = std::env::var("JETSAM_GUI_P2P_LISTEN").unwrap_or_else(|_| {
             persisted_preferences
                 .map(|settings| settings.p2p_listen.clone())
                 .unwrap_or_else(|| DEFAULT_P2P_LISTEN.into())
         });
-        let node_binary = std::env::var_os("ELIDE_GUI_NODE_BIN")
+        let node_binary = std::env::var_os("JETSAM_GUI_NODE_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(find_node_binary);
-        let seeds = std::env::var("ELIDE_GUI_SEEDS")
+        let seeds = std::env::var("JETSAM_GUI_SEEDS")
             .ok()
             .map(|seeds| {
                 seeds
@@ -1542,12 +1542,12 @@ impl BackendConfig {
             })
             .or_else(|| persisted_preferences.map(|settings| settings.seeds.clone()))
             .unwrap_or_default();
-        let log_level = std::env::var("ELIDE_GUI_LOG")
+        let log_level = std::env::var("JETSAM_GUI_LOG")
             .ok()
             .and_then(|level| parse_log_level(&level))
             .or_else(|| persisted_preferences.map(|settings| settings.log_level))
             .unwrap_or_default();
-        let language = std::env::var("ELIDE_GUI_LANGUAGE")
+        let language = std::env::var("JETSAM_GUI_LANGUAGE")
             .ok()
             .and_then(
                 |language| match language.trim().to_ascii_lowercase().as_str() {
@@ -1558,7 +1558,7 @@ impl BackendConfig {
                 },
             )
             .or_else(|| persisted_preferences.and_then(|settings| settings.language));
-        let mock = std::env::var("ELIDE_GUI_MOCK")
+        let mock = std::env::var("JETSAM_GUI_MOCK")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         Self {
             rpc_url,
@@ -2942,7 +2942,7 @@ fn mock_receipt_hex(txid: &str) -> String {
         .into_iter()
         .find(|receipt| receipt.txid == txid)
         .map_or(1_146, |receipt| receipt.receipt_bytes);
-    let mut payload = format!("PARAELIDE_RECEIPT:{txid}:").into_bytes();
+    let mut payload = format!("PARAJETSAM_RECEIPT:{txid}:").into_bytes();
     payload.resize(receipt_bytes, b'0');
     hex::encode(payload)
 }
@@ -2952,7 +2952,7 @@ fn mock_verify_receipt_hex(receipt_hex: &str) -> ReceiptVerificationSnapshot {
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| {
-            let payload = text.strip_prefix("PARAELIDE_RECEIPT:")?;
+            let payload = text.strip_prefix("PARAJETSAM_RECEIPT:")?;
             payload.get(..64).map(str::to_owned)
         });
     txid.as_deref().map_or_else(

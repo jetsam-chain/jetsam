@@ -15,11 +15,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_WALLET_ACTIVE_ADDRESS_DIR",
+        "JETSAM_LIVE_WALLET_ACTIVE_ADDRESS_DIR",
         str(RUN_PARENT / f"wallet-active-address-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_WALLET_ACTIVE_ADDRESS_BASE_PORT", "22400"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_WALLET_ACTIVE_ADDRESS_BASE_PORT", "22400"))
 FUNDING_HEIGHT = 4
 PAYMENT_MICRO_ELD = 450_000
 

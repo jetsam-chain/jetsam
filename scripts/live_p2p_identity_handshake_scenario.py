@@ -15,11 +15,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_P2P_IDENTITY_DIR",
+        "JETSAM_LIVE_P2P_IDENTITY_DIR",
         str(RUN_PARENT / f"p2p-identity-handshake-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_P2P_IDENTITY_BASE_PORT", "20800"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_P2P_IDENTITY_BASE_PORT", "20800"))
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

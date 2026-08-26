@@ -22,11 +22,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_CONNECTED_MINERS_DIR",
+        "JETSAM_LIVE_CONNECTED_MINERS_DIR",
         str(RUN_PARENT / f"connected-miner-restart-sync-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_CONNECTED_MINERS_BASE_PORT", "20700"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_CONNECTED_MINERS_BASE_PORT", "20700"))
 OFFLINE_GAP = 5
 
 # Reuse the process/RPC harness while giving this scenario its own fresh root.

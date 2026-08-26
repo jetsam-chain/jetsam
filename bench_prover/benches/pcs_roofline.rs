@@ -12,9 +12,9 @@
 //! fresh process (so Linux `VmHWM` is attributable to one case):
 //!
 //! ```text
-//! ELIDE_PCS_ROOFLINE_DOMAINS=22 cargo bench -p bench_prover --bench pcs_roofline
-//! ELIDE_PCS_ROOFLINE_DOMAINS=23 cargo bench -p bench_prover --bench pcs_roofline
-//! ELIDE_PCS_ROOFLINE_DOMAINS=24 cargo bench -p bench_prover --bench pcs_roofline
+//! JETSAM_PCS_ROOFLINE_DOMAINS=22 cargo bench -p bench_prover --bench pcs_roofline
+//! JETSAM_PCS_ROOFLINE_DOMAINS=23 cargo bench -p bench_prover --bench pcs_roofline
+//! JETSAM_PCS_ROOFLINE_DOMAINS=24 cargo bench -p bench_prover --bench pcs_roofline
 //! ```
 //!
 //! A comma-separated sweep is supported for convenience, but its `VmHWM` is
@@ -110,7 +110,7 @@ fn quirky_eval(witness: &[F128], logical_m: usize, z_skip: F128, x_rest: &[F128]
 
 fn requested_domains() -> Vec<usize> {
     let raw =
-        env::var("ELIDE_PCS_ROOFLINE_DOMAINS").unwrap_or_else(|_| DEFAULT_LOGICAL_M.to_string());
+        env::var("JETSAM_PCS_ROOFLINE_DOMAINS").unwrap_or_else(|_| DEFAULT_LOGICAL_M.to_string());
     let mut domains = Vec::new();
     for part in raw.split(',') {
         let logical_m = part

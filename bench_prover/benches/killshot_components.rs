@@ -16,7 +16,7 @@ use jetsam_poseidon2b::channel::Poseidon2bChannel;
 use jetsam_poseidon2b::primitives::TxBodyHash;
 
 fn requested_sizes() -> Vec<usize> {
-    std::env::var("ELIDE_KILLSHOT_TX_COUNTS")
+    std::env::var("JETSAM_KILLSHOT_TX_COUNTS")
         .unwrap_or_else(|_| "1,8".into())
         .split(',')
         .filter_map(|part| part.trim().parse().ok())

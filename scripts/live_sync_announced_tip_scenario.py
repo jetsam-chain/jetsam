@@ -15,11 +15,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_SYNC_ANNOUNCED_TIP_DIR",
+        "JETSAM_LIVE_SYNC_ANNOUNCED_TIP_DIR",
         str(RUN_PARENT / f"sync-announced-tip-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_SYNC_ANNOUNCED_TIP_BASE_PORT", "22000"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_SYNC_ANNOUNCED_TIP_BASE_PORT", "22000"))
 DIRECT_TIP = 2
 GOSSIP_TIP = 3
 

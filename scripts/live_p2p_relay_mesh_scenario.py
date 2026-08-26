@@ -27,13 +27,13 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_RELAY_MESH_DIR",
+        "JETSAM_LIVE_RELAY_MESH_DIR",
         str(RUN_PARENT / f"relay-mesh-clean-{STAMP}"),
     )
 )
-CLIENT_COUNT = int(os.environ.get("ELIDE_LIVE_RELAY_MESH_CLIENTS", "16"))
-SETTLE_SECONDS = int(os.environ.get("ELIDE_LIVE_RELAY_MESH_SETTLE_SECONDS", "45"))
-TARGET_HEIGHT = int(os.environ.get("ELIDE_LIVE_RELAY_MESH_TARGET_HEIGHT", "2"))
+CLIENT_COUNT = int(os.environ.get("JETSAM_LIVE_RELAY_MESH_CLIENTS", "16"))
+SETTLE_SECONDS = int(os.environ.get("JETSAM_LIVE_RELAY_MESH_SETTLE_SECONDS", "45"))
+TARGET_HEIGHT = int(os.environ.get("JETSAM_LIVE_RELAY_MESH_TARGET_HEIGHT", "2"))
 SEED_IPS = ("11.1.0.1", "12.1.0.1", "13.1.0.1", "14.1.0.1")
 SEED_P2P_BASE = 9600
 SEED_RPC_BASE = 27100

@@ -54,7 +54,7 @@ pub const COMPACT_NUM_QUERIES: usize = 64;
 pub const COMPACT_NUM_QUERIES: usize = 8;
 
 fn compact_profile_enabled() -> bool {
-    std::env::var("ELIDE_PROVE_BLOCK_PROFILE")
+    std::env::var("JETSAM_PROVE_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -65,7 +65,7 @@ fn compact_profile_enabled() -> bool {
 }
 
 fn compact_verify_profile_enabled() -> bool {
-    std::env::var("ELIDE_VERIFY_BLOCK_PROFILE")
+    std::env::var("JETSAM_VERIFY_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),

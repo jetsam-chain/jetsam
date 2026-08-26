@@ -148,7 +148,7 @@ impl MixedOpenProfiler {
 }
 
 fn prove_profile_enabled() -> bool {
-    std::env::var("ELIDE_PROVE_BLOCK_PROFILE")
+    std::env::var("JETSAM_PROVE_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -159,7 +159,7 @@ fn prove_profile_enabled() -> bool {
 }
 
 fn verify_profile_enabled() -> bool {
-    std::env::var("ELIDE_VERIFY_BLOCK_PROFILE")
+    std::env::var("JETSAM_VERIFY_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -1434,7 +1434,7 @@ impl SourceBindingProof {
             .map(|b| b.siblings.len() * hash_bytes)
             .sum();
         let total = h + roots + source_symbols + source_batch + folded_symbols + folded_batches;
-        if std::env::var("ELIDE_SOURCE_BINDING_PROFILE").is_ok() {
+        if std::env::var("JETSAM_SOURCE_BINDING_PROFILE").is_ok() {
             eprintln!(
                 "source_binding bytes h={} roots={} source_symbols={} source_batch={} folded_symbols={} folded_batches={} total={}",
                 h,

@@ -25,10 +25,10 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_MULTI_TX_DIR", str(RUN_PARENT / f"multi-tx-mempool-clean-{STAMP}")
+        "JETSAM_LIVE_MULTI_TX_DIR", str(RUN_PARENT / f"multi-tx-mempool-clean-{STAMP}")
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_MULTI_TX_BASE_PORT", "20500"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_MULTI_TX_BASE_PORT", "20500"))
 AMOUNTS = (1_000_000, 2_000_000, 3_000_000)
 
 

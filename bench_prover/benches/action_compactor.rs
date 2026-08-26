@@ -4,7 +4,7 @@
 
 //! Bitmap-driven action-compactor row/RSS gate.
 //!
-//! Defaults to B25. Use `ELIDE_ACTION_TIERS=25,255`; B255 intentionally
+//! Defaults to B25. Use `JETSAM_ACTION_TIERS=25,255`; B255 intentionally
 //! builds the real 4,096-row sorting network and may be expensive.
 
 use std::time::Instant;
@@ -20,7 +20,7 @@ use jetsam_recursive::acceptance::trace::action_surface::ActionRowTrace;
 use jetsam_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
 
 fn requested_tiers() -> Vec<usize> {
-    let raw = std::env::var("ELIDE_ACTION_TIERS").unwrap_or_else(|_| "25".into());
+    let raw = std::env::var("JETSAM_ACTION_TIERS").unwrap_or_else(|_| "25".into());
     let tiers: Vec<_> = raw
         .split(',')
         .filter_map(|part| part.trim().parse().ok())
@@ -52,7 +52,7 @@ fn row(b: &mut FieldR1csBuilder, ordinal: usize, live: bool, is_mint: bool) -> A
 
 fn main() {
     println!("PARANOID bitmap action-compactor gate");
-    println!("ELIDE_ACTION_TIERS=25,255 selects class runs.\n");
+    println!("JETSAM_ACTION_TIERS=25,255 selects class runs.\n");
 
     for tier in requested_tiers() {
         let class = ShapeClass { tier };
@@ -113,7 +113,7 @@ fn main() {
         let rows_before_build = b.num_wires();
         let (r1cs, witness) = b.build();
         let build = started.elapsed() - assembly;
-        let verify = std::env::var_os("ELIDE_ACTION_VERIFY").is_some() || tier != 255;
+        let verify = std::env::var_os("JETSAM_ACTION_VERIFY").is_some() || tier != 255;
         let verify_started = Instant::now();
         if verify {
             assert!(r1cs.satisfies(&witness));
@@ -135,7 +135,7 @@ fn main() {
                 verify_started.elapsed().as_secs_f64()
             );
         } else {
-            println!("    satisfy:          skipped (set ELIDE_ACTION_VERIFY=1)");
+            println!("    satisfy:          skipped (set JETSAM_ACTION_VERIFY=1)");
         }
         if let (Some(before), Some(after)) = (before, after) {
             println!("    RSS:              {:.1} MiB", after.rss_mb());

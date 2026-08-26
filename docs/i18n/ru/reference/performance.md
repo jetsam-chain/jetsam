@@ -28,7 +28,7 @@
 задержка и построение блочного `HistoryStep` в измерение не входят.
 
 ```sh
-ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
+JETSAM_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
   --manifest-path research/two_class/Cargo.toml \
   --bin two-class-wallet-bench
 ```
@@ -43,16 +43,16 @@ ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
 классы по отдельности, чтобы вывод однозначно указывал классы родителя и потомка.
 
 ```sh
-ELIDE_PACK_ROOT=../jetsam-artifacts/history-step-pack-v1
-source "$ELIDE_PACK_ROOT/pins.env"
-export ELIDE_HISTORY_STEP_PACK_DIR="$ELIDE_PACK_ROOT"
+JETSAM_PACK_ROOT=../jetsam-artifacts/history-step-pack-v1
+source "$JETSAM_PACK_ROOT/pins.env"
+export JETSAM_HISTORY_STEP_PACK_DIR="$JETSAM_PACK_ROOT"
 
-ELIDE_HISTORY_STEP_BENCH_FILTER=B25 \
-ELIDE_HISTORY_STEP_BENCH_SAMPLES=20 \
+JETSAM_HISTORY_STEP_BENCH_FILTER=B25 \
+JETSAM_HISTORY_STEP_BENCH_SAMPLES=20 \
 cargo bench --locked -p bench_prover --bench history_step_proof
 
-ELIDE_HISTORY_STEP_BENCH_FILTER=B255 \
-ELIDE_HISTORY_STEP_BENCH_SAMPLES=20 \
+JETSAM_HISTORY_STEP_BENCH_FILTER=B255 \
+JETSAM_HISTORY_STEP_BENCH_SAMPLES=20 \
 cargo bench --locked -p bench_prover --bench history_step_proof
 ```
 

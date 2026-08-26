@@ -7,7 +7,7 @@
 //! appears in the output — only the derived public address does.
 //!
 //! ```text
-//! ELIDE_SECRET_FILE=/root/wallet/elide/fund-network.key \
+//! JETSAM_SECRET_FILE=/root/wallet/elide/fund-network.key \
 //!   cargo test --release -p jetsam_poseidon2b --test derive_fund_address \
 //!   -- --ignored --nocapture
 //! ```
@@ -15,10 +15,10 @@
 use jetsam_poseidon2b::primitives::{derive_address, SpendSecret};
 
 #[test]
-#[ignore = "operator tool; needs ELIDE_SECRET_FILE"]
+#[ignore = "operator tool; needs JETSAM_SECRET_FILE"]
 fn derive_address_from_secret_file() {
-    let path = std::env::var("ELIDE_SECRET_FILE")
-        .expect("set ELIDE_SECRET_FILE to the path of a 64-hex-character secret");
+    let path = std::env::var("JETSAM_SECRET_FILE")
+        .expect("set JETSAM_SECRET_FILE to the path of a 64-hex-character secret");
     let raw = std::fs::read_to_string(&path).expect("read secret file");
     let hex = raw.trim();
     assert_eq!(

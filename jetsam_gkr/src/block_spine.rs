@@ -153,7 +153,7 @@ impl BlockSpineProfiler {
 }
 
 fn block_spine_profile_enabled() -> bool {
-    std::env::var("ELIDE_PROVE_BLOCK_PROFILE")
+    std::env::var("JETSAM_PROVE_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),

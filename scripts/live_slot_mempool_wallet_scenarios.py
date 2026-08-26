@@ -10,9 +10,9 @@ Covers:
 - final chain convergence and empty mempools.
 
 Environment knobs:
-  ELIDE_LIVE_TX_ROUNDS   default 2  (each round submits 6 txs: A->B,A->C,B->C,B->A,C->A,C->B)
-  ELIDE_LIVE_START_BLOCKS default 20
-  ELIDE_LIVE_BASE_PORT   default 19600
+  JETSAM_LIVE_TX_ROUNDS   default 2  (each round submits 6 txs: A->B,A->C,B->C,B->A,C->A,C->B)
+  JETSAM_LIVE_START_BLOCKS default 20
+  JETSAM_LIVE_BASE_PORT   default 19600
 """
 
 import json
@@ -28,9 +28,9 @@ NODE_BIN = ROOT / "target" / "release" / "jetsam"
 BASE = ROOT / "target" / "live-tests" / "slot-mempool-wallet"
 LOGS = BASE / "logs"
 
-START_BLOCKS = int(os.environ.get("ELIDE_LIVE_START_BLOCKS", "20"))
-TX_ROUNDS = int(os.environ.get("ELIDE_LIVE_TX_ROUNDS", "2"))
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_BASE_PORT", "19600"))
+START_BLOCKS = int(os.environ.get("JETSAM_LIVE_START_BLOCKS", "20"))
+TX_ROUNDS = int(os.environ.get("JETSAM_LIVE_TX_ROUNDS", "2"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_BASE_PORT", "19600"))
 AMOUNT_BASE = 100_000  # 0.1 ELD in micro_eld; small enough for many rounds
 
 

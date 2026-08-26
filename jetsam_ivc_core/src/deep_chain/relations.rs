@@ -1188,7 +1188,7 @@ mod tests {
         // The override turns this parity test into a narrow release microbench
         // without burdening the default test suite (for example, set it to
         // 14 to make allocator overhead visible).
-        let w_log = std::env::var("ELIDE_RELATION_PARITY_W_LOG")
+        let w_log = std::env::var("JETSAM_RELATION_PARITY_W_LOG")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(8usize);
@@ -1285,7 +1285,7 @@ mod tests {
             &mut optimized_challenger,
         );
         let optimized_elapsed = optimized_started.elapsed();
-        if std::env::var_os("ELIDE_RELATION_PARITY_W_LOG").is_some() {
+        if std::env::var_os("JETSAM_RELATION_PARITY_W_LOG").is_some() {
             eprintln!(
                 "recording relation w_log={w_log}: allocating={reference_elapsed:?} reused={optimized_elapsed:?} speedup={:.2}x",
                 reference_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64(),

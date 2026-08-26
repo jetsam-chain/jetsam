@@ -30,24 +30,24 @@ ROOT = Path(__file__).resolve().parents[1]
 NODE_BIN = ROOT / "target" / "release" / "jetsam"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-SCENARIO = os.environ.get("ELIDE_LIVE_TX_SCENARIO", "single-input").strip()
+SCENARIO = os.environ.get("JETSAM_LIVE_TX_SCENARIO", "single-input").strip()
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_SINGLE_TX_DIR",
+        "JETSAM_LIVE_SINGLE_TX_DIR",
         str(RUN_PARENT / f"transaction-{SCENARIO}-clean-{STAMP}"),
     )
 )
-P2P_PORT = int(os.environ.get("ELIDE_LIVE_SINGLE_TX_P2P_PORT", "20400"))
+P2P_PORT = int(os.environ.get("JETSAM_LIVE_SINGLE_TX_P2P_PORT", "20400"))
 RPC_PORT = P2P_PORT + 1
-MINE_TO_HEIGHT = int(os.environ.get("ELIDE_LIVE_TX_MINE_TO_HEIGHT", "3"))
-PAYMENT_MICRO_ELD = int(os.environ.get("ELIDE_LIVE_TX_PAYMENT_MICRO_ELD", "1000000"))
-EXPECTED_INPUTS = int(os.environ.get("ELIDE_LIVE_TX_EXPECTED_INPUTS", "1"))
-EXPECTED_OUTPUTS = int(os.environ.get("ELIDE_LIVE_TX_EXPECTED_OUTPUTS", "2"))
+MINE_TO_HEIGHT = int(os.environ.get("JETSAM_LIVE_TX_MINE_TO_HEIGHT", "3"))
+PAYMENT_MICRO_ELD = int(os.environ.get("JETSAM_LIVE_TX_PAYMENT_MICRO_ELD", "1000000"))
+EXPECTED_INPUTS = int(os.environ.get("JETSAM_LIVE_TX_EXPECTED_INPUTS", "1"))
+EXPECTED_OUTPUTS = int(os.environ.get("JETSAM_LIVE_TX_EXPECTED_OUTPUTS", "2"))
 EXPECTED_PAGES = int(
-    os.environ.get("ELIDE_LIVE_TX_EXPECTED_PAGES", str((EXPECTED_INPUTS + 7) // 8))
+    os.environ.get("JETSAM_LIVE_TX_EXPECTED_PAGES", str((EXPECTED_INPUTS + 7) // 8))
 )
-EXPECTED_PROOF_CLASS = os.environ.get("ELIDE_LIVE_TX_EXPECTED_PROOF_CLASS", "B25")
-EXPECT_CHANGE = os.environ.get("ELIDE_LIVE_TX_EXPECT_CHANGE", "1") != "0"
+EXPECTED_PROOF_CLASS = os.environ.get("JETSAM_LIVE_TX_EXPECTED_PROOF_CLASS", "B25")
+EXPECT_CHANGE = os.environ.get("JETSAM_LIVE_TX_EXPECT_CHANGE", "1") != "0"
 
 
 class LiveTxError(RuntimeError):

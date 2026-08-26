@@ -15,11 +15,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_PROOF_CANCEL_DIR",
+        "JETSAM_LIVE_PROOF_CANCEL_DIR",
         str(RUN_PARENT / f"mining-proof-cancel-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_PROOF_CANCEL_BASE_PORT", "23700"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_PROOF_CANCEL_BASE_PORT", "23700"))
 
 live.BASE = BASE
 Node = live.Node

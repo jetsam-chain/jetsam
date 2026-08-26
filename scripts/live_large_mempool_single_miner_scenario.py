@@ -24,11 +24,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_LARGE_MEMPOOL_SINGLE_DIR",
+        "JETSAM_LIVE_LARGE_MEMPOOL_SINGLE_DIR",
         str(RUN_PARENT / f"large-mempool-single-miner-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_LARGE_MEMPOOL_SINGLE_BASE_PORT", "21800"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_LARGE_MEMPOOL_SINGLE_BASE_PORT", "21800"))
 INITIAL_HEIGHT = 4
 LOWER_CLASS_PAGES = 25
 LOWER_PROOF_CLASS = "B25"

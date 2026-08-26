@@ -147,7 +147,7 @@ struct Cli {
         long,
         short = 'r',
         default_value = "http://127.0.0.1:9701",
-        env = "ELIDE_RPC",
+        env = "JETSAM_RPC",
         value_name = "URL",
         global = true
     )]
@@ -2176,7 +2176,7 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
                     "Node is not responding.\n\
                      \tIs the elide daemon running?  Try: elide --mode miner\n\
                      \tRPC endpoint: {}\n\
-                     \tOverride with --rpc <URL> or ELIDE_RPC env var",
+                     \tOverride with --rpc <URL> or JETSAM_RPC env var",
                     ctx.rpc
                 )
             } else {

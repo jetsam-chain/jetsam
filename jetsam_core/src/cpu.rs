@@ -6,7 +6,7 @@
 //! Runtime CPU capability detection shared by the proof stack.
 //!
 //! A process selects the widest safe implementation embedded in its
-//! architecture's binary. `ELIDE_CPU_BACKEND` is a diagnostic/test hook which
+//! architecture's binary. `JETSAM_CPU_BACKEND` is a diagnostic/test hook which
 //! may restrict that selection to `scalar`, `pclmul`, `avx2`, `avx512`,
 //! `neon`, or `neon-pmull`. Official artifacts keep their process-wide
 //! baseline portable enough to inspect the host before proof code runs, then
@@ -252,12 +252,12 @@ pub fn pmull_available() -> bool {
 fn backend_request() -> BackendRequest {
     static REQUEST: OnceLock<BackendRequest> = OnceLock::new();
     *REQUEST.get_or_init(|| {
-        let Ok(value) = std::env::var("ELIDE_CPU_BACKEND") else {
+        let Ok(value) = std::env::var("JETSAM_CPU_BACKEND") else {
             return BackendRequest::Auto;
         };
         parse_backend_request(&value).unwrap_or_else(|| {
             panic!(
-                "invalid ELIDE_CPU_BACKEND={value:?}; expected auto, scalar, pclmul, avx2, \
+                "invalid JETSAM_CPU_BACKEND={value:?}; expected auto, scalar, pclmul, avx2, \
                  avx512, neon, or neon-pmull"
             )
         })
@@ -303,10 +303,10 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
                 CpuBackend::Avx512
             }
             BackendRequest::Neon | BackendRequest::NeonPmull => {
-                panic!("ELIDE_CPU_BACKEND requests an AArch64 backend on x86_64")
+                panic!("JETSAM_CPU_BACKEND requests an AArch64 backend on x86_64")
             }
             forced => panic!(
-                "ELIDE_CPU_BACKEND={forced:?} is not supported by this x86_64 CPU; detected \
+                "JETSAM_CPU_BACKEND={forced:?} is not supported by this x86_64 CPU; detected \
                  capabilities: {caps:?}"
             ),
         };
@@ -327,10 +327,10 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
             BackendRequest::Neon if caps.neon => CpuBackend::Neon,
             BackendRequest::NeonPmull if caps.neon && caps.pmull => CpuBackend::NeonPmull,
             BackendRequest::Pclmul | BackendRequest::Avx2 | BackendRequest::Avx512 => {
-                panic!("ELIDE_CPU_BACKEND requests an x86_64 backend on AArch64")
+                panic!("JETSAM_CPU_BACKEND requests an x86_64 backend on AArch64")
             }
             forced => panic!(
-                "ELIDE_CPU_BACKEND={forced:?} is not supported by this AArch64 CPU; detected \
+                "JETSAM_CPU_BACKEND={forced:?} is not supported by this AArch64 CPU; detected \
                  capabilities: {caps:?}"
             ),
         };
@@ -341,7 +341,7 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
         match request {
             BackendRequest::Auto | BackendRequest::Scalar => CpuBackend::Scalar,
             forced => panic!(
-                "ELIDE_CPU_BACKEND={forced:?} is not supported on architecture {}",
+                "JETSAM_CPU_BACKEND={forced:?} is not supported on architecture {}",
                 std::env::consts::ARCH
             ),
         }

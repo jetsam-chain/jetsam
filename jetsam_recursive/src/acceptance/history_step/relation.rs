@@ -103,7 +103,7 @@ pub enum HistoryStepError {
 }
 
 fn auxiliary_sidecar_error(label: &str, error: RegionSidecarError) -> VerifyError {
-    if std::env::var_os("ELIDE_HISTORY_STEP_AUX_DEBUG").is_some() {
+    if std::env::var_os("JETSAM_HISTORY_STEP_AUX_DEBUG").is_some() {
         eprintln!("[history-step auxiliary] {label}: {error:?}");
     }
     VerifyError::Auxiliary

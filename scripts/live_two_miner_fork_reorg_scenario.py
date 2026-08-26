@@ -22,17 +22,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_BIN = Path(
-    os.environ.get("ELIDE_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "jetsam"))
+    os.environ.get("JETSAM_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "jetsam"))
 ).resolve()
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_FORK_REORG_DIR",
+        "JETSAM_LIVE_FORK_REORG_DIR",
         str(RUN_PARENT / f"two-miner-fork-reorg-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_FORK_REORG_BASE_PORT", "20600"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_FORK_REORG_BASE_PORT", "20600"))
 COMMON_HEIGHT = 2
 FORK_HEIGHT = COMMON_HEIGHT + 1
 WINNER_HEIGHT = FORK_HEIGHT + 1

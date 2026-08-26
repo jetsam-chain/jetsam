@@ -119,11 +119,11 @@ release_read_pin_file() {
   while IFS= read -r line || [[ -n $line ]]; do
     (( line_count += 1 ))
     case "$line" in
-      ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=*)
+      JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=*)
         [[ -z $metadata_digest ]] || release_die "duplicate runtime metadata pin in $pin_file"
         metadata_digest=${line#*=}
         ;;
-      ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=*)
+      JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS=*)
         [[ -z $leaf_digests ]] || release_die "duplicate matrix leaf pins in $pin_file"
         leaf_digests=${line#*=}
         ;;
@@ -150,9 +150,9 @@ release_write_pin_file() {
     release_die "cannot write pins.env without a computed runtime metadata digest"
   [[ ${RELEASE_LEAF_DIGESTS:-} =~ ^[0-9a-f]{128}$ ]] || \
     release_die "cannot write pins.env without two computed matrix digests"
-  printf 'ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\n' \
+  printf 'JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\n' \
     "$RELEASE_METADATA_DIGEST" > "$temporary"
-  printf 'ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
+  printf 'JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
     "$RELEASE_LEAF_DIGESTS" >> "$temporary"
   mv -- "$temporary" "$pin_file"
 }
@@ -222,7 +222,7 @@ release_build_pack_tools() {
   release_require_command cargo
   release_require_command rustc
   release_require_command tr
-  RELEASE_TOOL_TARGET_DIR=${ELIDE_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
+  RELEASE_TOOL_TARGET_DIR=${JETSAM_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
   if [[ $include_generator == 1 ]]; then
     build_args+=(--bin jetsam_matrix_gen)
   fi
@@ -237,9 +237,9 @@ release_build_pack_tools() {
   printf '\n==> Building release pack tools\n'
   (
     unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS
-    unset ELIDE_HISTORY_STEP_PACK_DIR
-    unset ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
-    unset ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS
+    unset JETSAM_HISTORY_STEP_PACK_DIR
+    unset JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
+    unset JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS
     export CARGO_TARGET_DIR="$RELEASE_TOOL_TARGET_DIR"
     export RUSTFLAGS="$tool_rustflags"
     cd "$RELEASE_ROOT_DIR" || exit 1
@@ -265,11 +265,11 @@ release_compute_pack_pins() {
   printf '%s\n' "$output"
   metadata_digest=$(
     printf '%s\n' "$output" |
-      sed -n 's/^ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=//p'
+      sed -n 's/^JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=//p'
   )
   leaf_digests=$(
     printf '%s\n' "$output" |
-      sed -n 's/^ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
+      sed -n 's/^JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
   )
   [[ $metadata_digest =~ ^[0-9a-f]{64}$ ]] || \
     release_die "computed runtime metadata pin is not 64 lowercase hex characters"

@@ -30,7 +30,7 @@ Options:
   -h, --help       Show this help.
 
 Environment:
-  ELIDE_MACOS_SIGN_IDENTITY        Optional Developer ID identity; defaults to
+  JETSAM_MACOS_SIGN_IDENTITY        Optional Developer ID identity; defaults to
                                   an ad-hoc macOS application signature.
   SOURCE_DATE_EPOCH               Archive timestamp on GNU tar hosts (default 0).
 
@@ -186,8 +186,8 @@ exec > >(tee "$LOG_FILE") 2>&1
 cd "$RELEASE_ROOT_DIR"
 
 unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
-unset ELIDE_HISTORY_STEP_PACK_DIR
-unset ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
+unset JETSAM_HISTORY_STEP_PACK_DIR
+unset JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
 unset TAR_OPTIONS GZIP GZIP_OPT
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
@@ -209,8 +209,8 @@ release_read_pin_file "$PACK_DIR/pins.env"
 RELEASE_METADATA_DIGEST=$RELEASE_FILE_METADATA_DIGEST
 
 export RUSTFLAGS="$RELEASE_RUSTFLAGS"
-export ELIDE_HISTORY_STEP_PACK_DIR="$PACK_DIR"
-export ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
+export JETSAM_HISTORY_STEP_PACK_DIR="$PACK_DIR"
+export JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'

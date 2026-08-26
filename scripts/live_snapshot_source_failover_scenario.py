@@ -24,11 +24,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_SNAPSHOT_FAILOVER_DIR",
+        "JETSAM_LIVE_SNAPSHOT_FAILOVER_DIR",
         str(RUN_PARENT / f"snapshot-source-failover-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_SNAPSHOT_FAILOVER_BASE_PORT", "25300"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_SNAPSHOT_FAILOVER_BASE_PORT", "25300"))
 
 live.BASE = BASE
 Node = live.Node
@@ -36,7 +36,7 @@ require = live.require
 
 
 def last_sync_run():
-    explicit = os.environ.get("ELIDE_LIVE_SNAPSHOT_FAILOVER_FIXTURE")
+    explicit = os.environ.get("JETSAM_LIVE_SNAPSHOT_FAILOVER_FIXTURE")
     if explicit:
         return Path(explicit).resolve()
     marker = RUN_PARENT / "LAST_SYNC_RUN"

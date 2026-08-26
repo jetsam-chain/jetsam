@@ -27,13 +27,13 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_STATE_SLOT_DIR",
+        "JETSAM_LIVE_STATE_SLOT_DIR",
         str(RUN_PARENT / f"state-slot-lifecycle-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_BASE_PORT", "22700"))
-INITIAL_HEIGHT = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_INITIAL_HEIGHT", "3"))
-PAYMENT_MICRO_ELD = int(os.environ.get("ELIDE_LIVE_STATE_SLOT_PAYMENT", "1000000"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_STATE_SLOT_BASE_PORT", "22700"))
+INITIAL_HEIGHT = int(os.environ.get("JETSAM_LIVE_STATE_SLOT_INITIAL_HEIGHT", "3"))
+PAYMENT_MICRO_ELD = int(os.environ.get("JETSAM_LIVE_STATE_SLOT_PAYMENT", "1000000"))
 SEGMENT_LOG = 16
 SEGMENT_RAM_BYTES = 3 * (1 << SEGMENT_LOG) * 16
 SPARSE_SEGMENT_HEADER_BYTES = 9

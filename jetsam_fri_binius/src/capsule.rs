@@ -150,11 +150,11 @@ pub const CAPSULE_GRIND_BITS: u32 = 6;
 const CAPSULE_OPEN_TAG: u128 = 0xCA95_01E0_0AE4_1102;
 
 /// Stage-timing profile for the capsule prover, printed to stderr when
-/// `ELIDE_CAPSULE_PROFILE` is set (same convention as the auth-PCS byte
+/// `JETSAM_CAPSULE_PROFILE` is set (same convention as the auth-PCS byte
 /// profile). Zero cost when the variable is absent.
 fn capsule_profile() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ELIDE_CAPSULE_PROFILE").is_ok())
+    *ON.get_or_init(|| std::env::var("JETSAM_CAPSULE_PROFILE").is_ok())
 }
 
 macro_rules! capsule_stage {

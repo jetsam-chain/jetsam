@@ -113,7 +113,7 @@ done
 iconutil -c icns "$ICONSET" -o "$RESOURCES/Parano1d.icns"
 
 xattr -cr "$APP"
-SIGN_IDENTITY=${ELIDE_MACOS_SIGN_IDENTITY:--}
+SIGN_IDENTITY=${JETSAM_MACOS_SIGN_IDENTITY:--}
 if [[ $SIGN_IDENTITY == - ]]; then
   codesign --force --sign - --timestamp=none "$MACOS/jetsam-node"
   codesign --force --sign - --timestamp=none "$MACOS/Parano1d"

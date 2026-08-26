@@ -8,13 +8,13 @@
 //!
 //! ```text
 //! source "$PACK_ROOT/pins.env"
-//! export ELIDE_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
+//! export JETSAM_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
 //! cargo bench -p bench_prover --bench history_step_proof
 //! ```
 //!
-//! Set `ELIDE_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
+//! Set `JETSAM_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
 //! B25 parent. Use `B255-B255` for the B255-parent case. With no filter, both
-//! launch classes run. `ELIDE_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
+//! launch classes run. `JETSAM_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
 //! parent and authenticated matrix pack for N production samples, then reports
 //! nearest-rank p50/p95 values; the default is one sample.
 //!
@@ -53,11 +53,11 @@ use jetsam_recursive::{
 };
 
 const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
-const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
-const BENCH_FILTER_ENV: &str = "ELIDE_HISTORY_STEP_BENCH_FILTER";
-const BENCH_SAMPLES_ENV: &str = "ELIDE_HISTORY_STEP_BENCH_SAMPLES";
-const METADATA_DIGEST_ENV: &str = "ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
-const LEAF_DIGESTS_ENV: &str = "ELIDE_HISTORY_STEP_PACK_LEAF_DIGESTS";
+const PACK_DIRECTORY_ENV: &str = "JETSAM_HISTORY_STEP_PACK_DIR";
+const BENCH_FILTER_ENV: &str = "JETSAM_HISTORY_STEP_BENCH_FILTER";
+const BENCH_SAMPLES_ENV: &str = "JETSAM_HISTORY_STEP_BENCH_SAMPLES";
+const METADATA_DIGEST_ENV: &str = "JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
+const LEAF_DIGESTS_ENV: &str = "JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;

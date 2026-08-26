@@ -22,12 +22,12 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_STATE_RESTART_DIR",
+        "JETSAM_LIVE_STATE_RESTART_DIR",
         str(RUN_PARENT / f"state-restart-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_STATE_RESTART_BASE_PORT", "22500"))
-INITIAL_HEIGHT = int(os.environ.get("ELIDE_LIVE_STATE_RESTART_INITIAL_HEIGHT", "3"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_STATE_RESTART_BASE_PORT", "22500"))
+INITIAL_HEIGHT = int(os.environ.get("JETSAM_LIVE_STATE_RESTART_INITIAL_HEIGHT", "3"))
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

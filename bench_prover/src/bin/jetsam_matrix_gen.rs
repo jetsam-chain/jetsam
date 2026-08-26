@@ -218,12 +218,12 @@ impl HistoryStepFreezeMatrixStore for CanonicalMatrixStore {
 }
 
 fn parse_zstd_level() -> i32 {
-    match std::env::var("ELIDE_ARTIFACT_ZSTD_LEVEL") {
+    match std::env::var("JETSAM_ARTIFACT_ZSTD_LEVEL") {
         Ok(value) => value
             .parse::<i32>()
-            .unwrap_or_else(|error| panic!("ELIDE_ARTIFACT_ZSTD_LEVEL must be an integer: {error}")),
+            .unwrap_or_else(|error| panic!("JETSAM_ARTIFACT_ZSTD_LEVEL must be an integer: {error}")),
         Err(std::env::VarError::NotPresent) => DEFAULT_ZSTD_LEVEL,
-        Err(error) => panic!("read ELIDE_ARTIFACT_ZSTD_LEVEL: {error}"),
+        Err(error) => panic!("read JETSAM_ARTIFACT_ZSTD_LEVEL: {error}"),
     }
 }
 
@@ -270,7 +270,7 @@ fn main() {
     });
 
     let zstd_level = parse_zstd_level();
-    let debug = std::env::var_os("ELIDE_HISTORY_STEP_GENERATOR_DEBUG").is_some();
+    let debug = std::env::var_os("JETSAM_HISTORY_STEP_GENERATOR_DEBUG").is_some();
     println!("PARANOID canonical HistoryStep v1 freezer");
     println!("  pack:          {}", version.display());
     println!("  rayon threads: {}", rayon::current_num_threads());

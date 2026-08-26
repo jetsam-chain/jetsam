@@ -40,7 +40,7 @@ cargo test --locked --release \
 On x86-64, force the production floor:
 
 ```sh
-ELIDE_CPU_BACKEND=pclmul \
+JETSAM_CPU_BACKEND=pclmul \
   cargo test --locked --release \
   -p jetsam_core -p jetsam_poseidon2b -p jetsam-ivc-core
 ```
@@ -48,7 +48,7 @@ ELIDE_CPU_BACKEND=pclmul \
 The scalar backend is used only for differential checking:
 
 ```sh
-ELIDE_CPU_BACKEND=scalar \
+JETSAM_CPU_BACKEND=scalar \
   cargo test --locked --release \
   -p jetsam_core -p jetsam_poseidon2b
 ```

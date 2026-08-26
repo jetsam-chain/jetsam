@@ -23,11 +23,11 @@ RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
     os.environ.get(
-        "ELIDE_LIVE_INCREMENTAL_SNAPSHOT_DIR",
+        "JETSAM_LIVE_INCREMENTAL_SNAPSHOT_DIR",
         str(RUN_PARENT / f"incremental-snapshot-clean-{STAMP}"),
     )
 )
-BASE_PORT = int(os.environ.get("ELIDE_LIVE_INCREMENTAL_SNAPSHOT_BASE_PORT", "22900"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_INCREMENTAL_SNAPSHOT_BASE_PORT", "22900"))
 SERVING_DEPTH = 42
 MIN_SOURCE_HEIGHT = 21
 
