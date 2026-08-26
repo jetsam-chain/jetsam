@@ -25,5 +25,5 @@ release artifacts are especially important.
 We will confirm receipt, assess the report, and coordinate remediation and
 disclosure with the reporter.
 
-Parano1d does not currently operate a formal bug bounty. Receipt of a report
+Jetsam does not currently operate a formal bug bounty. Receipt of a report
 does not imply compensation.

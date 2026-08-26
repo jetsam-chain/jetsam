@@ -1,4 +1,4 @@
-# Contributing to Parano1d
+# Contributing to Jetsam
 
 Bug reports and focused pull requests are welcome. Open an issue before
 starting a consensus, proof-system, wire-format, storage-format, or other
