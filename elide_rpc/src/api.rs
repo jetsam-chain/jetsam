@@ -15,7 +15,9 @@ use crate::types::{
     WalletUtxoInfo,
 };
 
-#[rpc(server, namespace = "paranoid")]
+// ELIDE CHANGE: namespace was "paranoid", which prefixed every RPC method name
+// on the wire. It is a functional identifier, not branding.
+#[rpc(server, namespace = "elide")]
 pub trait ElideApi {
     // =========================================================================
     // Chain
