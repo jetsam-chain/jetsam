@@ -24,16 +24,16 @@
 #endif
 
 [Setup]
-AppId={{8EAD67A1-91AB-497A-81A5-8A73CF4A6F31}
-AppName=Parano1d
+AppId={{C36DA503-269C-4BAA-ACD9-D3EC3632F445}
+AppName=Jetsam
 AppVersion={#MyAppVersion}
-AppVerName=Parano1d {#MyAppVersion}
-AppPublisher=Paranoid Zero
-AppPublisherURL=https://parano1d.org/
-AppSupportURL=https://github.com/ignotusnemo/parano1d/issues
-AppUpdatesURL=https://github.com/ignotusnemo/parano1d/releases
-DefaultDirName={localappdata}\Programs\Parano1d
-DefaultGroupName=Parano1d
+AppVerName=Jetsam {#MyAppVersion}
+AppPublisher=trace.protocol
+AppPublisherURL=https://jetsam.org/
+AppSupportURL=https://github.com/ignotusnemo/jetsam/issues
+AppUpdatesURL=https://github.com/ignotusnemo/jetsam/releases
+DefaultDirName={localappdata}\Programs\Jetsam
+DefaultGroupName=Jetsam
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
 PrivilegesRequired=lowest
@@ -44,7 +44,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
 SetupIconFile={#IconFile}
 LicenseFile={#LicenseFile}
-UninstallDisplayIcon={app}\Parano1d.exe
+UninstallDisplayIcon={app}\Jetsam.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -52,9 +52,9 @@ CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
 VersionInfoVersion={#NumericVersion}
-VersionInfoCompany=Paranoid Zero
-VersionInfoDescription=Parano1d Wallet Installer
-VersionInfoProductName=Parano1d
+VersionInfoCompany=trace.protocol
+VersionInfoDescription=Jetsam Wallet Installer
+VersionInfoProductName=Jetsam
 VersionInfoProductVersion={#MyAppVersion}
 
 [Languages]
@@ -66,14 +66,14 @@ Name: "chinesesimplified"; MessagesFile: "{#SourcePath}\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\parano1d-gui.exe"; DestDir: "{app}"; DestName: "Parano1d.exe"; Flags: ignoreversion
-Source: "{#SourceDir}\parano1d.exe"; DestDir: "{app}"; DestName: "parano1d-node.exe"; Flags: ignoreversion
+Source: "{#SourceDir}\jetsam-gui.exe"; DestDir: "{app}"; DestName: "Jetsam.exe"; Flags: ignoreversion
+Source: "{#SourceDir}\jetsam.exe"; DestDir: "{app}"; DestName: "jetsam-node.exe"; Flags: ignoreversion
 Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#NoticeFile}"; DestDir: "{app}"; DestName: "NOTICE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Parano1d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\Parano1d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\Jetsam"; Filename: "{app}\Jetsam.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\Jetsam"; Filename: "{app}\Jetsam.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\Parano1d.exe"; Description: "{cm:LaunchProgram,Parano1d}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Jetsam.exe"; Description: "{cm:LaunchProgram,Jetsam}"; Flags: nowait postinstall skipifsilent

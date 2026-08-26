@@ -99,7 +99,7 @@ appstreamcli validate --no-net \
   "$PACKAGE_ROOT/usr/share/metainfo/org.jetsam.wallet.metainfo.xml"
 for size in 16 32 48 64 128 256 512; do
   install -m 0644 \
-    "$RELEASE_ROOT_DIR/jetsam_gui/assets/app-icons/Parano1d-${size}.png" \
+    "$RELEASE_ROOT_DIR/jetsam_gui/assets/app-icons/Jetsam-${size}.png" \
     "$PACKAGE_ROOT/usr/share/icons/hicolor/${size}x${size}/apps/org.jetsam.wallet.png"
 done
 

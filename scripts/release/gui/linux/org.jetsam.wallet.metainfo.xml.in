@@ -1,31 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>org.parano1d.wallet</id>
+  <id>org.jetsam.wallet</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>Apache-2.0</project_license>
-  <name>Parano1d</name>
+  <name>Jetsam</name>
   <summary>Private proof-native wallet</summary>
   <description>
     <p>
-      Parano1d is a native wallet for the NOID network. It supervises its
+      Jetsam is a native wallet for the Jetsam network. It supervises its
       bundled full node locally, so the wallet can be used without a terminal
       or a separately managed daemon.
     </p>
   </description>
-  <launchable type="desktop-id">org.parano1d.wallet.desktop</launchable>
-  <icon type="stock">org.parano1d.wallet</icon>
+  <launchable type="desktop-id">org.jetsam.wallet.desktop</launchable>
+  <icon type="stock">org.jetsam.wallet</icon>
   <provides>
-    <binary>parano1d-gui</binary>
+    <binary>jetsam-gui</binary>
   </provides>
   <categories>
     <category>Finance</category>
     <category>Network</category>
   </categories>
-  <developer id="org.parano1d">
-    <name>Paranoid Zero</name>
+  <developer id="org.jetsam">
+    <name>trace.protocol</name>
   </developer>
-  <url type="homepage">https://parano1d.org/</url>
-  <url type="bugtracker">https://github.com/ignotusnemo/parano1d/issues</url>
+  <url type="homepage">https://jetsam.org/</url>
+  <url type="bugtracker">https://github.com/ignotusnemo/jetsam/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="@VERSION@" date="@RELEASE_DATE@"/>

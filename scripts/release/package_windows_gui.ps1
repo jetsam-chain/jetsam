@@ -26,7 +26,7 @@ $BinDir = (Resolve-Path $BinDir).Path
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $OutputDir = (Resolve-Path $OutputDir).Path
 
-foreach ($Binary in @("parano1d-gui.exe", "parano1d.exe")) {
+foreach ($Binary in @("jetsam-gui.exe", "jetsam.exe")) {
     $Path = Join-Path $BinDir $Binary
     if (-not (Test-Path -Path $Path -PathType Leaf)) {
         throw "Release binary is missing: $Path"
@@ -44,11 +44,11 @@ if (-not $Compiler) {
     throw "Inno Setup 6 compiler was not found"
 }
 
-$Definition = Join-Path $ScriptDir "gui\windows\Parano1d.iss"
-$Icon = Join-Path $ReleaseRoot "noid_gui\assets\app-icons\Parano1d.ico"
+$Definition = Join-Path $ScriptDir "gui\windows\Jetsam.iss"
+$Icon = Join-Path $ReleaseRoot "jetsam_gui\assets\app-icons\Jetsam.ico"
 $License = Join-Path $ReleaseRoot "LICENSE"
 $Notice = Join-Path $ReleaseRoot "NOTICE"
-$OutputBaseFilename = "parano1d-gui-v$Version-$Platform-setup"
+$OutputBaseFilename = "jetsam-gui-v$Version-$Platform-setup"
 $NumericVersion = [regex]::Match($Version, '^([0-9]+\.[0-9]+\.[0-9]+)').Groups[1].Value
 
 & $Compiler `
@@ -71,7 +71,7 @@ if (-not (Test-Path -Path $Artifact -PathType Leaf)) {
 }
 
 $InstallDir = Join-Path ([System.IO.Path]::GetTempPath()) (
-    "Parano1d-release-smoke-" + [guid]::NewGuid().ToString("N")
+    "Jetsam-release-smoke-" + [guid]::NewGuid().ToString("N")
 )
 try {
     $Install = Start-Process `
@@ -90,8 +90,8 @@ try {
         throw "GUI installer smoke-test exited with code $($Install.ExitCode)"
     }
 
-    $Wallet = Join-Path $InstallDir "Parano1d.exe"
-    $Node = Join-Path $InstallDir "parano1d-node.exe"
+    $Wallet = Join-Path $InstallDir "Jetsam.exe"
+    $Node = Join-Path $InstallDir "jetsam-node.exe"
     $InstalledLicense = Join-Path $InstallDir "LICENSE.txt"
     $InstalledNotice = Join-Path $InstallDir "NOTICE.txt"
     if (-not (Test-Path -Path $Wallet -PathType Leaf) -or
@@ -100,7 +100,7 @@ try {
         -not (Test-Path -Path $InstalledNotice -PathType Leaf)) {
         throw "GUI installer payload is incomplete"
     }
-    foreach ($ForbiddenBinary in @("parano1d-cli.exe", "parano1d-miner.exe")) {
+    foreach ($ForbiddenBinary in @("jetsam-cli.exe", "jetsam-miner.exe")) {
         if (Test-Path -Path (Join-Path $InstallDir $ForbiddenBinary)) {
             throw "GUI installer contains forbidden operator tool: $ForbiddenBinary"
         }

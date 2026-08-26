@@ -5,17 +5,17 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>Parano1d</string>
+  <string>Jetsam</string>
   <key>CFBundleExecutable</key>
-  <string>Parano1d</string>
+  <string>Jetsam</string>
   <key>CFBundleIconFile</key>
-  <string>Parano1d</string>
+  <string>Jetsam</string>
   <key>CFBundleIdentifier</key>
-  <string>org.parano1d.wallet</string>
+  <string>org.jetsam.wallet</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Parano1d</string>
+  <string>Jetsam</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -29,7 +29,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>
-  <string>Copyright © 2026 Paranoid Zero</string>
+  <string>Copyright © 2026 trace.protocol</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

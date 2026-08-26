@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: package_macos_gui.sh BIN_DIR OUTPUT_DIR VERSION PLATFORM
 
-Build a native Parano1d .app and compressed DMG.
+Build a native Jetsam .app and compressed DMG.
 PLATFORM must be macos-aarch64 or macos-x86_64.
 EOF
 }
@@ -68,15 +68,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-APP="$TEMPORARY/Parano1d.app"
+APP="$TEMPORARY/Jetsam.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-ICONSET="$TEMPORARY/Parano1d.iconset"
+ICONSET="$TEMPORARY/Jetsam.iconset"
 DMG_ROOT="$TEMPORARY/dmg"
 mkdir -p -- "$MACOS" "$RESOURCES" "$ICONSET" "$DMG_ROOT"
 
-install -m 0755 "$BIN_DIR/jetsam-gui" "$MACOS/Parano1d"
+install -m 0755 "$BIN_DIR/jetsam-gui" "$MACOS/Jetsam"
 install -m 0755 "$BIN_DIR/jetsam" "$MACOS/jetsam-node"
 install -m 0644 "$RELEASE_ROOT_DIR/LICENSE" "$RESOURCES/LICENSE.txt"
 install -m 0644 "$RELEASE_ROOT_DIR/NOTICE" "$RESOURCES/NOTICE.txt"
@@ -103,35 +103,35 @@ for specification in \
 do
   size=${specification%% *}
   name=${specification#* }
-  icon="$RELEASE_ROOT_DIR/jetsam_gui/assets/app-icons/Parano1d-${size}.png"
+  icon="$RELEASE_ROOT_DIR/jetsam_gui/assets/app-icons/Jetsam-${size}.png"
   [[ -f $icon ]] || {
     echo "macOS icon source is missing: $icon" >&2
     exit 1
   }
   install -m 0644 "$icon" "$ICONSET/$name"
 done
-iconutil -c icns "$ICONSET" -o "$RESOURCES/Parano1d.icns"
+iconutil -c icns "$ICONSET" -o "$RESOURCES/Jetsam.icns"
 
 xattr -cr "$APP"
 SIGN_IDENTITY=${JETSAM_MACOS_SIGN_IDENTITY:--}
 if [[ $SIGN_IDENTITY == - ]]; then
   codesign --force --sign - --timestamp=none "$MACOS/jetsam-node"
-  codesign --force --sign - --timestamp=none "$MACOS/Parano1d"
+  codesign --force --sign - --timestamp=none "$MACOS/Jetsam"
   codesign --force --deep --sign - --timestamp=none "$APP"
 else
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/jetsam-node"
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/Parano1d"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/Jetsam"
   codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
-"$MACOS/Parano1d" --release-self-check >/dev/null
+"$MACOS/Jetsam" --release-self-check >/dev/null
 "$MACOS/jetsam-node" --check-hardware >/dev/null
 
-cp -R "$APP" "$DMG_ROOT/Parano1d.app"
+cp -R "$APP" "$DMG_ROOT/Jetsam.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 ARTIFACT="$OUTPUT_DIR/jetsam-gui-v${VERSION}-${PLATFORM}.dmg"
 hdiutil create \
-  -volname "Parano1d" \
+  -volname "Jetsam" \
   -srcfolder "$DMG_ROOT" \
   -format UDZO \
   -ov \
@@ -140,15 +140,15 @@ hdiutil verify "$ARTIFACT" >/dev/null
 mkdir "$TEMPORARY/mount"
 hdiutil attach -readonly -nobrowse -mountpoint "$TEMPORARY/mount" "$ARTIFACT" >/dev/null
 MOUNTED=1
-"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/Parano1d" \
+"$TEMPORARY/mount/Jetsam.app/Contents/MacOS/Jetsam" \
   --release-self-check >/dev/null
-"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/jetsam-node" \
+"$TEMPORARY/mount/Jetsam.app/Contents/MacOS/jetsam-node" \
   --check-hardware >/dev/null
-[[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/LICENSE.txt ]]
-[[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/NOTICE.txt ]]
-[[ -s $TEMPORARY/mount/Parano1d.app/Contents/MacOS/jetsam-node ]]
-[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/jetsam-cli ]]
-[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/jetsam-miner ]]
+[[ -s $TEMPORARY/mount/Jetsam.app/Contents/Resources/LICENSE.txt ]]
+[[ -s $TEMPORARY/mount/Jetsam.app/Contents/Resources/NOTICE.txt ]]
+[[ -s $TEMPORARY/mount/Jetsam.app/Contents/MacOS/jetsam-node ]]
+[[ ! -e $TEMPORARY/mount/Jetsam.app/Contents/MacOS/jetsam-cli ]]
+[[ ! -e $TEMPORARY/mount/Jetsam.app/Contents/MacOS/jetsam-miner ]]
 hdiutil detach "$TEMPORARY/mount" -quiet
 MOUNTED=0
 printf '%s\n' "$ARTIFACT"

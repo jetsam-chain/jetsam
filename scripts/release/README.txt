@@ -1,23 +1,23 @@
-Parano1d Native Release
+Jetsam Native Release
 =======================
 
 Each GitHub release contains two independent product lines.
 
 GUI Wallet packages (ordinary users):
 
-  Linux:   parano1d-gui-vVERSION-linux-ARCH.deb
-  Windows: parano1d-gui-vVERSION-windows-x86_64-setup.exe
-  macOS:   parano1d-gui-vVERSION-macos-ARCH.dmg
+  Linux:   jetsam-gui-vVERSION-linux-ARCH.deb
+  Windows: jetsam-gui-vVERSION-windows-x86_64-setup.exe
+  macOS:   jetsam-gui-vVERSION-macos-ARCH.dmg
 
-The GUI package exposes only the Parano1d wallet application. Its full node
+The GUI package exposes only the Jetsam wallet application. Its full node
 is bundled as a private application component and is supervised by the wallet.
 The user does not need to start a daemon or use a terminal.
 
 Core archives (node operators and miners):
 
-  parano1d        full node and built-in miner
-  parano1d-cli    wallet and node command-line client
-  parano1d-miner  external proof-of-work miner
+  jetsam        full node and built-in miner
+  jetsam-cli    wallet and node command-line client
+  jetsam-miner  external proof-of-work miner
   LICENSE/NOTICE  Apache-2.0 distribution terms and project notices
 
 Hardware check
@@ -25,7 +25,7 @@ Hardware check
 
 Before creating node or wallet data, run:
 
-  parano1d --check-hardware
+  jetsam --check-hardware
 
 Production requires SSE4.1 and PCLMULQDQ on x86-64, or NEON and PMULL on
 ARM64. The executable selects wider AVX2+VPCLMULQDQ or AVX-512 kernels
@@ -37,7 +37,7 @@ Verify the download
 
 Download SHA256SUMS from the same GitHub release as this archive:
 
-  https://github.com/ignotusnemo/parano1d/releases
+  https://github.com/ignotusnemo/jetsam/releases
 
 Before extracting or running anything, compute the archive's SHA-256 digest
 and compare it with the matching line in SHA256SUMS.
@@ -62,15 +62,15 @@ GUI Wallet — Linux
 Open the downloaded .deb in the system Software application, or install it
 from a terminal:
 
-  sudo apt install ./parano1d-gui-vVERSION-linux-ARCH.deb
+  sudo apt install ./jetsam-gui-vVERSION-linux-ARCH.deb
 
-Launch Parano1d from the desktop application menu. Removing the package does
+Launch Jetsam from the desktop application menu. Removing the package does
 not remove wallet data from the user's home directory.
 
 GUI Wallet — Windows
 --------------------
 
-Run the downloaded setup.exe and launch Parano1d from the Start menu. The
+Run the downloaded setup.exe and launch Jetsam from the Start menu. The
 installer is per-user and does not require administrator privileges by
 default.
 
@@ -81,11 +81,11 @@ SmartScreen may display a warning. After verifying SHA256SUMS, select
 GUI Wallet — macOS
 ------------------
 
-Open the downloaded DMG and drag Parano1d.app to Applications. Launch it from
+Open the downloaded DMG and drag Jetsam.app to Applications. Launch it from
 Applications like any other app.
 
 Until the project uses an Apple Developer ID certificate, macOS may block the
-first launch. After verifying SHA256SUMS, Control-click Parano1d, choose Open,
+first launch. After verifying SHA256SUMS, Control-click Jetsam, choose Open,
 and confirm. If necessary, use Privacy & Security -> Open Anyway.
 
 Core archive — Linux
@@ -93,9 +93,9 @@ Core archive — Linux
 
 Open a terminal in the extracted directory:
 
-  ./parano1d --help
-  ./parano1d-cli --help
-  ./parano1d-miner --help
+  ./jetsam --help
+  ./jetsam-cli --help
+  ./jetsam-miner --help
 
 Core archive — macOS
 --------------------
@@ -103,14 +103,14 @@ Core archive — macOS
 If Gatekeeper blocks a verified download, remove only the quarantine
 attributes from the three extracted binaries:
 
-  xattr -d com.apple.quarantine ./parano1d
-  xattr -d com.apple.quarantine ./parano1d-cli
-  xattr -d com.apple.quarantine ./parano1d-miner
+  xattr -d com.apple.quarantine ./jetsam
+  xattr -d com.apple.quarantine ./jetsam-cli
+  xattr -d com.apple.quarantine ./jetsam-miner
 
 If xattr reports that an attribute does not exist, no action is required.
 Then run:
 
-  ./parano1d --help
+  ./jetsam --help
 
 Core archive — Windows
 ----------------------
@@ -121,18 +121,18 @@ PowerShell can unblock all three verified extracted executables at once:
 
 Then run:
 
-  .\parano1d.exe --help
+  .\jetsam.exe --help
 
 Node data
 ---------
 
 The first node start creates its configuration and persistent data under:
 
-  Linux/macOS:  ~/.parano1d/
-  Windows:      %USERPROFILE%\.parano1d\
+  Linux/macOS:  ~/.jetsam/
+  Windows:      %USERPROFILE%\.jetsam\
 
 The wallet key is stored in data/wallet.key and is not password-encrypted.
 Back it up and protect it before receiving funds.
 
-Documentation: https://docs.parano1d.org/
-Source:        https://github.com/ignotusnemo/parano1d
+Documentation: https://docs.jetsam.org/
+Source:        https://github.com/ignotusnemo/jetsam

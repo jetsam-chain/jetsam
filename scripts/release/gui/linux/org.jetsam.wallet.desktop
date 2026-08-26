@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Parano1d
+Name=Jetsam
 Comment=Private proof-native wallet
-Exec=/usr/lib/parano1d/parano1d-gui
-Icon=org.parano1d.wallet
+Exec=/usr/lib/jetsam/jetsam-gui
+Icon=org.jetsam.wallet
 Terminal=false
 Categories=Finance;Network;
 StartupNotify=true
-StartupWMClass=org.parano1d.wallet
+StartupWMClass=org.jetsam.wallet
