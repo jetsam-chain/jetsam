@@ -1022,13 +1022,18 @@ impl RpcHandler {
     /// le churn de suffix-sync : il ne tombe que sur deconnexion/expiration
     /// (TTL 45 s) ou incompatibilite d'ancetre, pas sur une simple annonce.
     ///
-    /// Opt-in par env `ELIDE_TEMPLATE_NOGATE=1` ; sans lui, comportement
-    /// strictement identique a l'existant.
+    /// DEFAUT depuis l'integration (CHANGES-FROM-UPSTREAM §5) : le
+    /// comportement NOGATE s'applique sans configuration. Echappatoire :
+    /// `ELIDE_TEMPLATE_STRICT_GATE=1` retablit la porte historique complete
+    /// (`require_mining_network`), qui refuse aussi les templates pendant tout
+    /// fetch P2P d'un bloc concurrent. L'ancien opt-in `ELIDE_TEMPLATE_NOGATE`
+    /// n'existe plus.
     fn require_template_gate(&self) -> RpcResult<()> {
-        static TEMPLATE_NOGATE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("ELIDE_TEMPLATE_NOGATE").is_ok_and(|v| v == "1")
-        });
-        if !*TEMPLATE_NOGATE {
+        static TEMPLATE_STRICT_GATE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("ELIDE_TEMPLATE_STRICT_GATE").is_ok_and(|v| v == "1")
+            });
+        if *TEMPLATE_STRICT_GATE {
             return self.require_mining_network();
         }
         if !*self.initial_sync_ready.borrow() {
@@ -1333,7 +1338,7 @@ impl RpcHandler {
         // La version precedente prenait le plus TOT legal (parent + 1 s) pour
         // maximiser le travail cumule et gagner les arbitrages, a une epoque ou
         // nos blocs mettaient ~30 s a se propager via 18 relais. Ce n'est plus
-        // le cas : le port 9600 est ouvert, 18 pairs entrants, zero relais.
+        // le cas : le port 9700 est ouvert, 18 pairs entrants, zero relais.
         //
         // Le cout de cette avance etait lourd et mesure le 22/08 : ASERT tire la
         // cible de l'horodatage du bloc lui-meme. Nos blocs, dates a 1 s de leur
@@ -3469,7 +3474,7 @@ pub async fn start_rpc_server(
     // When mining_key is None it is a transparent pass-through.
     // When Some(key), all requests must carry `Authorization: Bearer <key>`.
     //
-    // Pool operators:  elide --rpc-listen 0.0.0.0:9601 --mining-key <secret>
+    // Pool operators:  elide --rpc-listen 0.0.0.0:9701 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
     let server = Server::builder()
