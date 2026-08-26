@@ -4,7 +4,7 @@
 
 //! Typed cryptographic primitives for the transparent UTXO layer.
 //!
-//! Paranoid is a transparent, Bitcoin-style chain: every UTXO discloses
+//! Elide is a transparent, Bitcoin-style chain: every UTXO discloses
 //! value and owner address on-chain. Authorization is still signatureless
 //! — a spend is authorized by an owner proof bound to the canonical
 //! transaction statement transcript. All privacy

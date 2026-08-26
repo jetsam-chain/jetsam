@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Chain layer for Paranoid.
+//! Chain layer for Elide.
 //!
 //! Ties transactions (`elide_tx`) to the on-chain state: the segmented raw UTXO
 //! vector, exact state commitments, and block-header hash.

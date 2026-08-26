@@ -4,7 +4,7 @@
 
 //! Canonical transparent transaction types.
 //!
-//! Paranoid has one fixed transaction form: eight possible spends and two
+//! Elide has one fixed transaction form: eight possible spends and two
 //! possible outputs. Liveness is represented only by `TxBody::validity_bitmap`;
 //! dead records are the all-zero record. Wallet secrets are not transaction
 //! fields and enter proving only through `elide_gkr::OwnerAuthWitness`.

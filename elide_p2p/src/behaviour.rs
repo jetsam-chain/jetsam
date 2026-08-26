@@ -2,11 +2,11 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Combined libp2p NetworkBehaviour for the Paranoid full node.
+//! Combined libp2p NetworkBehaviour for the Elide full node.
 //!
 //! ## Peer discovery stack
 //!
-//! Paranoid uses three complementary mechanisms, mirroring the approach taken
+//! Elide uses three complementary mechanisms, mirroring the approach taken
 //! by Substrate/Polkadot:
 //!
 //! 1. **Bootstrap nodes** — hard-coded seed addresses dialled on startup.

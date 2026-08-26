@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide_p2p — libp2p Networking for Paranoid
+//! # elide_p2p — libp2p Networking for Elide
 //!
 //! Implements:
 //! - GossipSub broadcast: blocks (/paranoid/blocks/1), txs (/paranoid/txs/1)

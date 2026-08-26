@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide-miner — External Poseidon2b PoW miner for the ParanO(1)d.
+//! # elide-miner — External Poseidon2b PoW miner for Elide.
 //!
 //! Connects to any `elide` full node via JSON-RPC, fetches a block template,
 //! searches for a valid PoW nonce using all available CPU cores (rayon), and
@@ -12,13 +12,13 @@
 //!
 //! ```bash
 //! # Solo (node on localhost, no auth)
-//! elide-miner --rpc http://127.0.0.1:9601
+//! elide-miner --rpc http://127.0.0.1:9701
 //!
 //! # Pool (remote node with bearer token)
-//! elide-miner --rpc https://pool.example.com:9601 --key my-secret-token
+//! elide-miner --rpc https://pool.example.com:9701 --key my-secret-token
 //!
 //! # Limit threads
-//! elide-miner --rpc http://127.0.0.1:9601 --threads 4
+//! elide-miner --rpc http://127.0.0.1:9701 --threads 4
 //! ```
 //!
 //! ## Template protocol
@@ -54,8 +54,8 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "elide-miner",
     version,
-    about = "External Poseidon2b PoW miner for ParanO(1)d",
-    long_about = "Fetches block templates from a ParanO(1)d node and mines blocks \
+    about = "External Poseidon2b PoW miner for Elide",
+    long_about = "Fetches block templates from an Elide node and mines blocks \
                   using all available CPU cores.\n\n\
                   The node builds the proven template; this worker only does PoW.\n\
                   Coinbase is the node payout address unless the node enables \
@@ -66,8 +66,8 @@ struct Cli {
     #[arg(long, exclusive = true)]
     check_hardware: bool,
 
-    /// JSON-RPC endpoint of the ParanO(1)d node or pool.
-    #[arg(long, default_value = "http://127.0.0.1:9601", value_name = "URL")]
+    /// JSON-RPC endpoint of the Elide node or pool.
+    #[arg(long, default_value = "http://127.0.0.1:9701", value_name = "URL")]
     rpc: String,
 
     /// Bearer token for pool/external RPC access.

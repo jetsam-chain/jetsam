@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide_rpc — JSON-RPC Server for Paranoid Full Node
+//! # elide_rpc — JSON-RPC Server for the Elide Full Node
 
 pub mod api;
 pub mod server;

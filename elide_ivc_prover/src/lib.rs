@@ -1,4 +1,4 @@
-//! `elide-ivc-prover`: prover orchestration for Paranoid recursive proof
+//! `elide-ivc-prover`: prover orchestration for the Elide recursive proof
 //! backends.
 //!
 //! Builds on [`elide_ivc_core`] (the protocol library + verifier) with the

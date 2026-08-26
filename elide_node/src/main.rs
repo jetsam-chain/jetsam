@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide — ParanO(1)d Full Node Binary
+//! # elide — Elide Full Node Binary
 //!
 //! Startup sequence:
 //! 1. Load config + init tracing

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide_mempool — Async Mempool for the Paranoid Full Node
+//! # elide_mempool — Async Mempool for the Elide Full Node
 //!
 //! This crate wraps the synchronous `elide_chain::Mempool` in an async
 //! (`tokio`-based) interface that drives the full node's transaction pipeline:

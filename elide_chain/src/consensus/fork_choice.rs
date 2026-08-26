@@ -4,7 +4,7 @@
 
 //! Fork choice rule: heaviest chain wins.
 //!
-//! Paranoid uses **cumulative PoW work** as the canonical chain selector,
+//! Elide uses **cumulative PoW work** as the canonical chain selector,
 //! identical to Bitcoin's "most work" rule. Since PoW provides ordering
 //! only (not security), the rule keeps the chain deterministic.
 //!

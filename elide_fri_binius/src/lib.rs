@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! FRI-Binius Polynomial Commitment Scheme for the Paranoid STARK.
+//! FRI-Binius Polynomial Commitment Scheme for the Elide STARK.
 //!
 //! Optimized interleaved commitment + compact FRI opening:
 //! - Single Merkle cap for ALL columns (binding commitment)

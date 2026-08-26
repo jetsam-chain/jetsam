@@ -30,7 +30,7 @@ use elide_mempool::AsyncMempool;
 use elide_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 use elide_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
-use crate::api::ParanoidApiServer;
+use crate::api::ElideApiServer;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
     BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
@@ -1649,7 +1649,7 @@ impl RpcHandler {
 }
 
 #[async_trait]
-impl ParanoidApiServer for RpcHandler {
+impl ElideApiServer for RpcHandler {
     // -----------------------------------------------------------------------
     // Chain state (always available)
     // -----------------------------------------------------------------------

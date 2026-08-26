@@ -4,7 +4,7 @@
 
 //! Consensus logic — pure, I/O-free validation functions.
 //!
-//! This module contains every consensus rule for Paranoid. All functions
+//! This module contains every consensus rule for Elide. All functions
 //! are deterministic and produce identical results on any architecture.
 //! No networking, no disk I/O, no mutable global state.
 //!
