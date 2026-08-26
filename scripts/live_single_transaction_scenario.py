@@ -40,7 +40,7 @@ BASE = Path(
 P2P_PORT = int(os.environ.get("JETSAM_LIVE_SINGLE_TX_P2P_PORT", "20400"))
 RPC_PORT = P2P_PORT + 1
 MINE_TO_HEIGHT = int(os.environ.get("JETSAM_LIVE_TX_MINE_TO_HEIGHT", "3"))
-PAYMENT_MICRO_ELD = int(os.environ.get("JETSAM_LIVE_TX_PAYMENT_MICRO_ELD", "1000000"))
+PAYMENT_MICRO_JTM = int(os.environ.get("JETSAM_LIVE_TX_PAYMENT_MICRO_JTM", "1000000"))
 EXPECTED_INPUTS = int(os.environ.get("JETSAM_LIVE_TX_EXPECTED_INPUTS", "1"))
 EXPECTED_OUTPUTS = int(os.environ.get("JETSAM_LIVE_TX_EXPECTED_OUTPUTS", "2"))
 EXPECTED_PAGES = int(
@@ -262,7 +262,7 @@ def main():
         "scenario": SCENARIO,
         "configuration": {
             "mine_to_height": MINE_TO_HEIGHT,
-            "payment_micro_eld": PAYMENT_MICRO_ELD,
+            "payment_micro_jtm": PAYMENT_MICRO_JTM,
             "expected_inputs": EXPECTED_INPUTS,
             "expected_outputs": EXPECTED_OUTPUTS,
             "expected_pages": EXPECTED_PAGES,
@@ -300,13 +300,13 @@ def main():
         )
         scan = rpc("walletScan", timeout=120)
         before = rpc("walletGetBalance")
-        require(before["spendable_micro_eld"] > PAYMENT_MICRO_ELD, f"sender not funded: {before}")
+        require(before["spendable_micro_jtm"] > PAYMENT_MICRO_JTM, f"sender not funded: {before}")
         require(
             before["utxo_count"] >= EXPECTED_INPUTS,
             f"sender has too few UTXOs for requested shape: {before}",
         )
 
-        plan = rpc("walletPlanSend", [recipient["address"], PAYMENT_MICRO_ELD, 0], timeout=60)
+        plan = rpc("walletPlanSend", [recipient["address"], PAYMENT_MICRO_JTM, 0], timeout=60)
         require(
             plan["input_count"] == EXPECTED_INPUTS,
             f"payment selected the wrong input count: {plan}",
@@ -316,13 +316,13 @@ def main():
             f"payment selected the wrong output count: {plan}",
         )
         require(
-            (plan["change_micro_eld"] > 0) == EXPECT_CHANGE,
+            (plan["change_micro_jtm"] > 0) == EXPECT_CHANGE,
             f"payment change shape is wrong: {plan}",
         )
 
         submit_height = int(rpc("getChainInfo")["height"])
         proof_started = time.monotonic()
-        sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRO_ELD, 0], timeout=300)
+        sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRO_JTM, 0], timeout=300)
         proof_elapsed = time.monotonic() - proof_started
         require(
             proof_elapsed < 120,
@@ -334,7 +334,7 @@ def main():
             and sent["output_count"] == EXPECTED_OUTPUTS,
             f"send shape changed: {sent}",
         )
-        require(sent["fee_micro_eld"] == plan["fee_micro_eld"], f"send fee changed: {sent} vs {plan}")
+        require(sent["fee_micro_jtm"] == plan["fee_micro_jtm"], f"send fee changed: {sent} vs {plan}")
         print(f"[submitted] tx={txid} proof_and_admission={proof_elapsed:.3f}s", flush=True)
 
         mempool_started = time.monotonic()
@@ -378,7 +378,7 @@ def main():
         )
         recipient_slots = rpc("getSlotsByOwner", [recipient["address"]])
         require(len(recipient_slots) == 1, f"recipient should own one UTXO: {recipient_slots}")
-        require(recipient_slots[0]["value"] == PAYMENT_MICRO_ELD, f"recipient amount wrong: {recipient_slots}")
+        require(recipient_slots[0]["value"] == PAYMENT_MICRO_JTM, f"recipient amount wrong: {recipient_slots}")
 
         confirmation_height = int(confirmed["height"])
         parent_header = rpc("getBlockHeader", [confirmation_height - 1])
@@ -463,13 +463,13 @@ def main():
         require(active_recipient["address"] == recipient["address"], "recipient activation failed")
         recipient_scan = rpc("walletScan", timeout=120)
         recipient_balance = rpc("walletGetBalance")
-        require(recipient_balance["balance_micro_eld"] == PAYMENT_MICRO_ELD, f"recipient balance wrong: {recipient_balance}")
+        require(recipient_balance["balance_micro_jtm"] == PAYMENT_MICRO_JTM, f"recipient balance wrong: {recipient_balance}")
         require(recipient_balance["utxo_count"] == 1, f"recipient UTXO count wrong: {recipient_balance}")
 
         rpc("walletSetActiveAddress", [0])
         sender_scan = rpc("walletScan", timeout=120)
         sender_after = rpc("walletGetBalance")
-        require(sender_after["pending_outbound_micro_eld"] == 0, f"sender reservation survived confirmation: {sender_after}")
+        require(sender_after["pending_outbound_micro_jtm"] == 0, f"sender reservation survived confirmation: {sender_after}")
         history = rpc("walletHistory")
         require(any(item["tx_hash"] == txid and item["direction"] == "sent" for item in history), f"sent history missing: {history}")
 

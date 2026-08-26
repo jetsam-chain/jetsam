@@ -58,7 +58,7 @@ macro_rules! c {
 
 const MICRO_PER_ELD: u64 = 1_000_000;
 
-/// Parse a human amount like "10.5" or "0.000001" as ELD → μELD.
+/// Parse a human amount like "10.5" or "0.000001" as ELD → μJTM.
 fn parse_jetsam_amount(s: &str) -> anyhow::Result<u64> {
     let (whole, fractional) = match s.split_once('.') {
         Some((whole, fractional)) if !fractional.contains('.') => (whole, fractional),
@@ -102,11 +102,11 @@ fn parse_jetsam_amount(s: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("amount {s:?} is out of range"))
 }
 
-fn jetsam_str(micro_eld: u64) -> String {
+fn jetsam_str(micro_jtm: u64) -> String {
     format!(
         "{}.{:06}",
-        micro_eld / MICRO_PER_ELD,
-        micro_eld % MICRO_PER_ELD
+        micro_jtm / MICRO_PER_ELD,
+        micro_jtm % MICRO_PER_ELD
     )
 }
 
@@ -136,7 +136,7 @@ QUICK START:
 
 AMOUNT FORMAT:
   Amounts are in ELD (e.g. 10.5, 0.000001).
-  1 ELD = 1,000,000 μELD — the CLI converts automatically.
+  1 ELD = 1,000,000 μJTM — the CLI converts automatically.
 
 DAEMON:
   The daemon must be running: elide --mode miner --data-dir ~/.jetsam/data",
@@ -280,7 +280,7 @@ enum Command {
         use_index: Option<u32>,
     },
 
-    /// Confirmed wallet balance (ELD and μELD).
+    /// Confirmed wallet balance (ELD and μJTM).
     #[command(alias = "bal")]
     Balance,
 
@@ -290,7 +290,7 @@ enum Command {
 
     /// Send ELD to a recipient address.
     ///
-    /// Amount is in ELD (e.g. 10.5 → 10,500,000 μELD).
+    /// Amount is in ELD (e.g. 10.5 → 10,500,000 μJTM).
     /// Fee is auto-computed if not specified (recommended).
     ///
     /// Examples:
@@ -300,13 +300,13 @@ enum Command {
         /// Recipient address (canonical bech32m o1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount in ELD  (1 ELD = 1 000 000 μELD).
-        /// Examples: "50" = 50 ELD, "0.5" = 500 000 μELD, "0.000001" = 1 μELD (minimum).
-        /// Tip: for programmatic use the RPC walletSend accepts raw μELD directly.
+        /// Amount in ELD  (1 ELD = 1 000 000 μJTM).
+        /// Examples: "50" = 50 ELD, "0.5" = 500 000 μJTM, "0.000001" = 1 μJTM (minimum).
+        /// Tip: for programmatic use the RPC walletSend accepts raw μJTM directly.
         #[arg(value_name = "AMOUNT")]
         amount: String,
         /// Transaction fee in ELD. Omit for automatic fee calculation.
-        #[arg(long, value_name = "FEE_MICRO_ELD")]
+        #[arg(long, value_name = "FEE_MICRO_JTM")]
         fee: Option<String>,
         /// Show the ordinary-transaction plan without submitting.
         #[arg(long)]
@@ -731,7 +731,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
         kv2(
             "Value",
             &format!("{} ELD", jetsam_str(value)),
-            &format!("({value} μELD)"),
+            &format!("({value} μJTM)"),
         );
         kv("Creation ID", &creation_id.to_string());
         kv("Owner", ctx.h(owner));
@@ -966,7 +966,7 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let height = result["height"].as_u64().unwrap_or(0);
     let diff_bits = result["difficulty_bits"].as_u64().unwrap_or(0);
     let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
-    let reward_micro = result["block_reward_micro_eld"].as_u64().unwrap_or(0);
+    let reward_micro = result["block_reward_micro_jtm"].as_u64().unwrap_or(0);
     let active = result["active_slot_count"].as_u64().unwrap_or(0);
     section("Mining info");
     kv("Height", &height.to_string());
@@ -1008,7 +1008,7 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyho
     if ctx.json {
         return print_json(&result);
     }
-    let fee_micro = result["fee_micro_eld"].as_u64().unwrap_or(0);
+    let fee_micro = result["fee_micro_jtm"].as_u64().unwrap_or(0);
     let b = &result["breakdown"];
     section(&format!(
         "Fee estimate ({n_inputs} input(s), {n_outputs} output(s))"
@@ -1016,27 +1016,27 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyho
     kv2(
         "Min relay fee",
         &format!("{} ELD", jetsam_str(fee_micro)),
-        &format!("({fee_micro} μELD)"),
+        &format!("({fee_micro} μJTM)"),
     );
     kv(
         "Base",
-        &format!("{} μELD", b["base"].as_u64().unwrap_or(0)),
+        &format!("{} μJTM", b["base"].as_u64().unwrap_or(0)),
     );
     kv(
         "Inputs",
-        &format!("{} μELD", b["input"].as_u64().unwrap_or(0)),
+        &format!("{} μJTM", b["input"].as_u64().unwrap_or(0)),
     );
     kv(
         "Outputs",
-        &format!("{} μELD", b["output"].as_u64().unwrap_or(0)),
+        &format!("{} μJTM", b["output"].as_u64().unwrap_or(0)),
     );
     kv(
         "State growth burned",
-        &format!("{} μELD", b["state_growth"].as_u64().unwrap_or(0)),
+        &format!("{} μJTM", b["state_growth"].as_u64().unwrap_or(0)),
     );
     kv(
         "Miner claimable",
-        &format!("{} μELD", b["miner_claimable"].as_u64().unwrap_or(0)),
+        &format!("{} μJTM", b["miner_claimable"].as_u64().unwrap_or(0)),
     );
     println!();
     println!(
@@ -1081,7 +1081,7 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     }
     section("Mempool transaction");
     kv("tx_hash", result["tx_hash"].as_str().unwrap_or("?"));
-    let fee = result["fee_micro_eld"].as_u64().unwrap_or(0);
+    let fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
     kv2(
         "Fee",
         &format!("{} ELD", jetsam_str(fee)),
@@ -1162,7 +1162,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv2(
         "Fee floor",
         &format!("{} ELD", jetsam_str(fee_floor)),
-        &format!("({fee_floor} μELD minimum)"),
+        &format!("({fee_floor} μJTM minimum)"),
     );
 
     if txs.is_empty() {
@@ -1176,12 +1176,12 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}{}",
-            BOLD, "tx hash", "fee (μELD)", "pages", "in", "out", "class", "proof", RST
+            BOLD, "tx hash", "fee (μJTM)", "pages", "in", "out", "class", "proof", RST
         );
     } else {
         println!(
             "  {:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}",
-            "tx hash", "fee (μELD)", "pages", "in", "out", "class", "proof"
+            "tx hash", "fee (μJTM)", "pages", "in", "out", "class", "proof"
         );
     }
     separator(100);
@@ -1189,7 +1189,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let show = txs.len().min(20);
     for tx in txs.iter().take(show) {
         let hash = tx["tx_hash"].as_str().unwrap_or("?");
-        let fee = tx["fee_micro_eld"].as_u64().unwrap_or(0);
+        let fee = tx["fee_micro_jtm"].as_u64().unwrap_or(0);
         let pages = tx["page_count"].as_u64().unwrap_or(0);
         let nin = tx["n_inputs"].as_u64().unwrap_or(0);
         let nout = tx["n_outputs"].as_u64().unwrap_or(0);
@@ -1370,10 +1370,10 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         return print_json(&result);
     }
 
-    let micro = result["balance_micro_eld"].as_u64().unwrap_or(0);
+    let micro = result["balance_micro_jtm"].as_u64().unwrap_or(0);
     let utxos = result["utxo_count"].as_u64().unwrap_or(0);
-    let pending_out = result["pending_outbound_micro_eld"].as_u64().unwrap_or(0);
-    let spendable = result["spendable_micro_eld"]
+    let pending_out = result["pending_outbound_micro_jtm"].as_u64().unwrap_or(0);
+    let spendable = result["spendable_micro_jtm"]
         .as_u64()
         .unwrap_or_else(|| micro.saturating_sub(pending_out));
 
@@ -1465,7 +1465,7 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     // Compute total
     let total: u64 = utxos
         .iter()
-        .map(|u| u["value_micro_eld"].as_u64().unwrap_or(0))
+        .map(|u| u["value_micro_jtm"].as_u64().unwrap_or(0))
         .sum();
 
     separator(96);
@@ -1487,7 +1487,7 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         let creation_id = u["creation_id"]
             .as_u64()
             .context("walletListUtxos response missing creation_id")?;
-        let micro = u["value_micro_eld"].as_u64().unwrap_or(0);
+        let micro = u["value_micro_jtm"].as_u64().unwrap_or(0);
         let key = u["key_index"].as_u64().unwrap_or(0);
         let height = u["confirmed_height"].as_u64().unwrap_or(0);
         let addr = u["address"].as_str().unwrap_or("?");
@@ -1534,13 +1534,13 @@ async fn cmd_send(
         bail!("Amount cannot be zero.");
     }
 
-    // Warn if the amount looks suspiciously large (> 1 000 000 ELD = 1e12 μELD).
-    // This catches the common mistake of passing μELD to a ELD-denomination CLI.
-    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M ELD in μELD
+    // Warn if the amount looks suspiciously large (> 1 000 000 ELD = 1e12 μJTM).
+    // This catches the common mistake of passing μJTM to a ELD-denomination CLI.
+    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M ELD in μJTM
     if amount_micro > MAX_WARN_MICRO {
         eprintln!(
-            "⚠  Large amount: {} ELD ({} μELD). \
-             Note: this CLI takes ELD, not μELD. Press Ctrl-C to cancel.",
+            "⚠  Large amount: {} ELD ({} μJTM). \
+             Note: this CLI takes ELD, not μJTM. Press Ctrl-C to cancel.",
             jetsam_str(amount_micro),
             amount_micro
         );
@@ -1590,14 +1590,14 @@ async fn cmd_send(
         kv2(
             "Amount",
             &format!("{} ELD", jetsam_str(amount_micro)),
-            &format!("({amount_micro} μELD)"),
+            &format!("({amount_micro} μJTM)"),
         );
-        let planned_fee = result["fee_micro_eld"].as_u64().unwrap_or(0);
+        let planned_fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Fee",
             &format!("{} ELD", jetsam_str(planned_fee)),
             &format!(
-                "({planned_fee} μELD){}",
+                "({planned_fee} μJTM){}",
                 if fee.is_none() { " auto" } else { "" }
             ),
         );
@@ -1609,11 +1609,11 @@ async fn cmd_send(
             "Outputs",
             &result["output_count"].as_u64().unwrap_or(0).to_string(),
         );
-        let change = result["change_micro_eld"].as_u64().unwrap_or(0);
+        let change = result["change_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Change",
             &format!("{} ELD", jetsam_str(change)),
-            &format!("({change} μELD)"),
+            &format!("({change} μJTM)"),
         );
         println!();
         println!(
@@ -1655,7 +1655,7 @@ async fn cmd_send(
     match result {
         Ok(r) if ctx.json => return print_json(&r),
         Ok(r) => {
-            let actual_fee = r["fee_micro_eld"].as_u64().unwrap_or(0);
+            let actual_fee = r["fee_micro_jtm"].as_u64().unwrap_or(0);
             let auto_tag = if fee.is_none() { " (auto)" } else { "" };
 
             section("Transaction submitted");
@@ -1665,12 +1665,12 @@ async fn cmd_send(
             kv2(
                 "Amount",
                 &format!("{} ELD", jetsam_str(amount_micro)),
-                &format!("({amount_micro} μELD)"),
+                &format!("({amount_micro} μJTM)"),
             );
             kv2(
                 "Fee",
                 &format!("{} ELD", jetsam_str(actual_fee)),
-                &format!("({actual_fee} μELD){auto_tag}"),
+                &format!("({actual_fee} μJTM){auto_tag}"),
             );
             println!();
             println!(
@@ -1693,7 +1693,7 @@ async fn cmd_send(
                 // Try to extract amounts
                 format!(
                     "Insufficient funds.\n\
-                     \t  Requested: {} ELD  ({amount_micro} μELD)\n\
+                     \t  Requested: {} ELD  ({amount_micro} μJTM)\n\
                      \t  Run 'jetsam-cli balance' to check your current balance.",
                     jetsam_str(amount_micro)
                 )
@@ -1793,7 +1793,7 @@ async fn cmd_history(
     for e in &filtered {
         let height = e["height"].as_u64().unwrap_or(0);
         let dir = e["direction"].as_str().unwrap_or("?");
-        let micro = e["amount_micro_eld"].as_u64().unwrap_or(0);
+        let micro = e["amount_micro_jtm"].as_u64().unwrap_or(0);
 
         let (sign, arrow, colour) = if dir == "received" || dir == "recv" {
             ("+", "\u{2190} recv", GRN)
@@ -1878,7 +1878,7 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     let found = result["found_utxos"].as_u64().unwrap_or(0);
-    let balance_micro_eld = result["balance_micro_eld"].as_u64().unwrap_or(0);
+    let balance_micro_jtm = result["balance_micro_jtm"].as_u64().unwrap_or(0);
     let active_index = result["active_index"].as_u64().unwrap_or(0);
     let snapshot_height = result["snapshot_height"].as_u64().unwrap_or(0);
 
@@ -1888,7 +1888,7 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         active_index,
         snapshot_height,
         found,
-        jetsam_str(balance_micro_eld)
+        jetsam_str(balance_micro_jtm)
     );
 
     if found == 0 {
@@ -1997,7 +1997,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
         let fee = summary
-            .get("fee_micro_eld")
+            .get("fee_micro_jtm")
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
         let inputs = summary
@@ -2018,16 +2018,16 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             &format!("#{height}"),
             &format!("unix {confirmed_unix}"),
         );
-        kv("Fee", &format!("{} ({} μELD)", jetsam_str(fee), fee));
+        kv("Fee", &format!("{} ({} μJTM)", jetsam_str(fee), fee));
         kv("Inputs", &inputs.to_string());
         kv("Outputs", &outputs.len().to_string());
         for (index, output) in outputs.iter().enumerate() {
             let owner = output["owner"].as_str().unwrap_or("?");
-            let amount = output["amount_micro_eld"].as_u64().unwrap_or(0);
+            let amount = output["amount_micro_jtm"].as_u64().unwrap_or(0);
             let slot = output["slot_index"].as_u64().unwrap_or(0);
             kv2(
                 &format!("  Output {}", index + 1),
-                &format!("{} ({} μELD)", jetsam_str(amount), amount),
+                &format!("{} ({} μJTM)", jetsam_str(amount), amount),
                 &format!("to {owner}, slot {slot}"),
             );
         }
@@ -2069,8 +2069,8 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
 
     let height = result["height"].as_u64().unwrap_or(0);
     let n_txs = result["n_txs"].as_u64().unwrap_or(0);
-    let claimable_fees = result["claimable_fees_micro_eld"].as_u64().unwrap_or(0);
-    let coinbase_value = result["coinbase_value_micro_eld"].as_u64().unwrap_or(0);
+    let claimable_fees = result["claimable_fees_micro_jtm"].as_u64().unwrap_or(0);
+    let coinbase_value = result["coinbase_value_micro_jtm"].as_u64().unwrap_or(0);
     let template_id = result["template_id"].as_str().unwrap_or("");
     let expires_in_seconds = result["expires_in_seconds"].as_u64().unwrap_or(0);
     let nonce_field_index = result["nonce_field_index"].as_u64().unwrap_or(0);
@@ -2084,8 +2084,8 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     kv("Expires in", &format!("{expires_in_seconds} s"));
     kv("Nonce field", &nonce_field_index.to_string());
     kv("Difficulty", difficulty_target);
-    kv("Claimable fees", &format!("{claimable_fees} μELD"));
-    kv("Coinbase value", &format!("{coinbase_value} μELD"));
+    kv("Claimable fees", &format!("{claimable_fees} μJTM"));
+    kv("Coinbase value", &format!("{coinbase_value} μJTM"));
     if !pow_fields.is_empty() {
         kv2(
             "PoW fields",

@@ -119,7 +119,7 @@ pub trait ElideApi {
     #[method(name = "getNodeStatus")]
     async fn get_node_status(&self) -> RpcResult<NodeStatus>;
 
-    /// Estimated minimum fee in μELD for a transaction with `n_outputs` outputs.
+    /// Estimated minimum fee in μJTM for a transaction with `n_outputs` outputs.
     /// Simple u64 method: assumes one live input.
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
@@ -261,25 +261,25 @@ pub trait ElideApi {
     ) -> RpcResult<Vec<WalletAddressInfo>>;
 
     /// Dry-run wallet send planning without proving or submitting.
-    /// `fee_micro_eld = 0` computes the automatic fee.
+    /// `fee_micro_jtm = 0` computes the automatic fee.
     #[method(name = "walletPlanSend")]
     async fn wallet_plan_send(
         &self,
         to_address: String,
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
     ) -> RpcResult<WalletSendPlan>;
 
     /// Send ELD to a recipient address.
     /// `to_address`: recipient bech32m address.
-    /// `amount_micro_eld`: amount in μELD.
-    /// `fee_micro_eld`: exact fee (0 = automatic fee).
+    /// `amount_micro_jtm`: amount in μJTM.
+    /// `fee_micro_jtm`: exact fee (0 = automatic fee).
     #[method(name = "walletSend")]
     async fn wallet_send(
         &self,
         to_address: String,
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
     ) -> RpcResult<WalletSendResult>;
 
     /// Exact live quote for merging up to 64 of the active wallet's smallest
@@ -292,8 +292,8 @@ pub trait ElideApi {
     async fn wallet_consolidate(
         &self,
         selected_input_slots: Vec<u32>,
-        expected_fee_micro_eld: u64,
-        expected_output_value_micro_eld: u64,
+        expected_fee_micro_jtm: u64,
+        expected_output_value_micro_jtm: u64,
     ) -> RpcResult<WalletConsolidationResult>;
 
     /// Export a receipt for a confirmed transaction (hex-encoded bytes).

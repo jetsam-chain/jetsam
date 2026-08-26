@@ -21,7 +21,7 @@ BASE = Path(
 )
 BASE_PORT = int(os.environ.get("JETSAM_LIVE_WALLET_ACTIVE_ADDRESS_BASE_PORT", "22400"))
 FUNDING_HEIGHT = 4
-PAYMENT_MICRO_ELD = 450_000
+PAYMENT_MICRO_JTM = 450_000
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT
@@ -113,7 +113,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
-        "payment_micro_eld": PAYMENT_MICRO_ELD,
+        "payment_micro_jtm": PAYMENT_MICRO_JTM,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -138,7 +138,7 @@ def main():
         require(not address1["is_active"], f"new address activated itself: {address1}")
         list_after_generate1 = assert_address_list(node, 2, 0)
         require(active(node) == address0, "address generation changed the active owner")
-        require(balance(node)["balance_micro_eld"] == 0, "active balance changed at h0")
+        require(balance(node)["balance_micro_jtm"] == 0, "active balance changed at h0")
 
         invalid_switch_error = expected_rpc_error(
             node,
@@ -161,14 +161,14 @@ def main():
         index0_scan = rpc(node.rpc_port, "walletScan", timeout=180)
         index0_before = balance(node)
         require(
-            int(index0_before["spendable_micro_eld"]) > PAYMENT_MICRO_ELD,
+            int(index0_before["spendable_micro_jtm"]) > PAYMENT_MICRO_JTM,
             f"index 0 lacks funds: {index0_before}",
         )
 
         sent = rpc(
             node.rpc_port,
             "walletSend",
-            [address1["address"], PAYMENT_MICRO_ELD, 0],
+            [address1["address"], PAYMENT_MICRO_JTM, 0],
             timeout=300,
         )
         txid = sent["txid"]
@@ -196,7 +196,7 @@ def main():
         require(activated1["address"] == address1["address"], "index 1 address changed")
         index1_balance = balance(node)
         require(
-            int(index1_balance["balance_micro_eld"]) == PAYMENT_MICRO_ELD
+            int(index1_balance["balance_micro_jtm"]) == PAYMENT_MICRO_JTM
             and int(index1_balance["utxo_count"]) == 1,
             f"index 1 balance did not load: {index1_balance}",
         )
@@ -204,7 +204,7 @@ def main():
         require(
             len(index1_utxos) == 1
             and int(index1_utxos[0]["key_index"]) == 1
-            and int(index1_utxos[0]["value_micro_eld"]) == PAYMENT_MICRO_ELD,
+            and int(index1_utxos[0]["value_micro_jtm"]) == PAYMENT_MICRO_JTM,
             f"index 1 UTXO view is wrong: {index1_utxos}",
         )
         index1_history = rpc(node.rpc_port, "walletHistory")

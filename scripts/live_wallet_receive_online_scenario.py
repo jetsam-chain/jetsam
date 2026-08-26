@@ -103,7 +103,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
-        "payments_micro_eld": PAYMENTS,
+        "payments_micro_jtm": PAYMENTS,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -125,7 +125,7 @@ def main():
             f"unexpected recipient account: {recipient_address}",
         )
         require(
-            balance(recipient)["balance_micro_eld"] == 0,
+            balance(recipient)["balance_micro_jtm"] == 0,
             "fresh recipient is not empty",
         )
 
@@ -142,7 +142,7 @@ def main():
         sender_scan = rpc(miner.rpc_port, "walletScan", timeout=180)
         sender_before = balance(miner)
         require(
-            int(sender_before["spendable_micro_eld"]) > sum(PAYMENTS),
+            int(sender_before["spendable_micro_jtm"]) > sum(PAYMENTS),
             f"sender lacks funds: {sender_before}",
         )
 
@@ -151,7 +151,7 @@ def main():
         for index, amount in enumerate(PAYMENTS, start=1):
             before = balance(recipient)
             require(
-                int(before["balance_micro_eld"]) == expected_balance,
+                int(before["balance_micro_jtm"]) == expected_balance,
                 f"recipient balance drift before payment {index}: {before}",
             )
             submitted_at_height = miner.height()
@@ -183,7 +183,7 @@ def main():
                 f"recipient balance reflects payment {index} without scan",
                 lambda expected=expected_balance, count=index: (
                     current
-                    if int(current["balance_micro_eld"]) == expected
+                    if int(current["balance_micro_jtm"]) == expected
                     and int(current["utxo_count"]) == count
                     else False
                 )
@@ -194,7 +194,7 @@ def main():
             observations.append(
                 {
                     "index": index,
-                    "amount_micro_eld": amount,
+                    "amount_micro_jtm": amount,
                     "submitted_at_height": submitted_at_height,
                     "txid": txid,
                     "send": sent,
@@ -208,7 +208,7 @@ def main():
             )
             print(
                 f"[payment] {index}/{len(PAYMENTS)} h={confirmed['height']} "
-                f"balance={updated['balance_micro_eld']} utxos={updated['utxo_count']}",
+                f"balance={updated['balance_micro_jtm']} utxos={updated['utxo_count']}",
                 flush=True,
             )
 
@@ -219,7 +219,7 @@ def main():
         )
         final_balance = balance(recipient)
         require(
-            int(final_balance["balance_micro_eld"]) == sum(PAYMENTS),
+            int(final_balance["balance_micro_jtm"]) == sum(PAYMENTS),
             f"final recipient balance is wrong: {final_balance}",
         )
         require(

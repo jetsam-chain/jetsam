@@ -56,8 +56,8 @@ pub struct TxHistoryEntry {
     /// True only for the canonical coinbase at logical transaction zero.
     #[serde(default)]
     pub is_coinbase: bool,
-    /// Net amount in μELD (sent: net sent, received: total received).
-    pub amount_micro_eld: u64,
+    /// Net amount in μJTM (sent: net sent, received: total received).
+    pub amount_micro_jtm: u64,
     /// Counterparty address (None if unknown).
     pub peer_address: Option<[u8; 32]>,
     /// Block timestamp (Unix seconds).
@@ -77,7 +77,7 @@ pub struct TxHistoryEntry {
 pub struct WalletUtxo {
     /// Global slot index in the chain state.
     pub slot_index: u32,
-    /// Value in μELD.
+    /// Value in μJTM.
     pub value: u64,
     /// Incarnation assigned when this UTXO was minted: the monotone
     /// alloc-counter value for user mints, or the height-tagged coinbase
@@ -247,7 +247,7 @@ impl WalletState {
         Ok(())
     }
 
-    /// Confirmed balance of the ACTIVE address in μELD.
+    /// Confirmed balance of the ACTIVE address in μJTM.
     pub fn balance(&self) -> u64 {
         self.utxos
             .values()
@@ -339,7 +339,7 @@ impl WalletState {
     pub fn record_pending_send(
         &mut self,
         tx_hash: [u8; 32],
-        amount_micro_eld: u64,
+        amount_micro_jtm: u64,
         to_address: [u8; 32],
     ) -> Result<(), String> {
         let now = std::time::SystemTime::now()
@@ -352,7 +352,7 @@ impl WalletState {
             height: 0, // updated to real height when block is confirmed
             direction: TxDirection::Sent,
             is_coinbase: false,
-            amount_micro_eld,
+            amount_micro_jtm,
             peer_address: Some(to_address),
             timestamp: now,
             own_address: Some(self.active_address().to_bech32()),
@@ -954,7 +954,7 @@ mod tests {
             "tx_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
             "height":7,
             "direction":"Received",
-            "amount_micro_eld":50000000,
+            "amount_micro_jtm":50000000,
             "peer_address":null,
             "timestamp":9,
             "own_address":null,
@@ -1353,7 +1353,7 @@ mod tests {
             height: 3,
             direction: TxDirection::Sent,
             is_coinbase: false,
-            amount_micro_eld: 9,
+            amount_micro_jtm: 9,
             peer_address: None,
             timestamp: 7,
             own_address: Some(previous_address.to_bech32()),
@@ -1464,7 +1464,7 @@ mod tests {
             height: 9,
             direction: TxDirection::Sent,
             is_coinbase: false,
-            amount_micro_eld: 77,
+            amount_micro_jtm: 77,
             peer_address: Some([0x22; 32]),
             timestamp: 123,
             own_address: Some(wallet.active_address().to_bech32()),

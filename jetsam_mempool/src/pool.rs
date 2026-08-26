@@ -92,7 +92,7 @@ pub(crate) struct MempoolState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MempoolEntryMetadata {
     pub tx_hash: TxBodyHash,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub fee_rate: u64,
     pub n_inputs: u16,
     pub n_outputs: u16,
@@ -136,7 +136,7 @@ fn entry_metadata(
 ) -> MempoolEntryMetadata {
     MempoolEntryMetadata {
         tx_hash: hash,
-        fee_micro_eld: entry.spend.fee,
+        fee_micro_jtm: entry.spend.fee,
         fee_rate: entry.fee_rate,
         n_inputs: entry.spend.live_inputs,
         n_outputs: entry.spend.live_outputs,
@@ -634,7 +634,7 @@ impl AsyncMempool {
         self.len().await == 0
     }
 
-    /// Current dynamic fee floor (μELD).
+    /// Current dynamic fee floor (μJTM).
     pub async fn fee_floor(&self) -> u64 {
         self.state.lock().await.floor.current()
     }

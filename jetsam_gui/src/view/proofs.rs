@@ -10,7 +10,7 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::app::{App, Message};
 use crate::i18n::{text, text_input, translate};
 use crate::model::{
-    format_micro_eld, grouped, ProofsTab, ReceiptSnapshot, ReceiptSummarySnapshot,
+    format_micro_jtm, grouped, ProofsTab, ReceiptSnapshot, ReceiptSummarySnapshot,
     ReceiptVerificationSnapshot,
 };
 use crate::theme::{self, ButtonKind};
@@ -213,7 +213,7 @@ fn receipt_row(
     button(
         column![
             row![
-                text(format!("{} ①", format_micro_eld(receipt.amount_micro_eld)))
+                text(format!("{} ①", format_micro_jtm(receipt.amount_micro_jtm)))
                     .size(13)
                     .color(theme::ACCENT),
                 Space::new().width(Length::Fill),
@@ -460,7 +460,7 @@ fn authenticated_payment<'a>(
             row![
                 metric(
                     "FEE / ELD",
-                    format_micro_eld(summary.fee_micro_eld),
+                    format_micro_jtm(summary.fee_micro_jtm),
                     theme::WARNING,
                 ),
                 metric(
@@ -487,7 +487,7 @@ fn authenticated_payment<'a>(
             ),
             metric(
                 "FEE / ELD",
-                format_micro_eld(summary.fee_micro_eld),
+                format_micro_jtm(summary.fee_micro_jtm),
                 theme::WARNING,
             ),
             metric(
@@ -579,7 +579,7 @@ fn receipt_outputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Ele
                         Space::new().width(Length::Fill),
                         text(format!(
                             "{} ①{}",
-                            format_micro_eld(output.amount_micro_eld),
+                            format_micro_jtm(output.amount_micro_jtm),
                             if change { " · CHANGE" } else { "" }
                         ))
                         .size(13)

@@ -475,7 +475,7 @@ impl WalletOps for WalletHandle {
                 exists: false,
                 address: String::new(),
                 active_index: 0,
-                balance_micro_eld: 0,
+                balance_micro_jtm: 0,
                 balance_eld: 0.0,
                 utxo_count: 0,
                 address_count: 0,
@@ -486,7 +486,7 @@ impl WalletOps for WalletHandle {
                     exists: true,
                     address: w.active_address().to_bech32(),
                     active_index: w.active_index,
-                    balance_micro_eld: balance,
+                    balance_micro_jtm: balance,
                     balance_eld: microjetsam_to_eld(balance),
                     utxo_count: w.utxos.len(),
                     address_count: w.next_index,
@@ -506,12 +506,12 @@ impl WalletOps for WalletHandle {
         let guard = self.inner.lock().unwrap();
         match &*guard {
             None => WalletBalance {
-                balance_micro_eld: 0,
+                balance_micro_jtm: 0,
                 balance_eld: 0.0,
                 utxo_count: 0,
-                pending_outbound_micro_eld: 0,
-                pending_incoming_micro_eld: 0,
-                spendable_micro_eld: 0,
+                pending_outbound_micro_jtm: 0,
+                pending_incoming_micro_jtm: 0,
+                spendable_micro_jtm: 0,
                 spendable_eld: 0.0,
             },
             Some(w) => {
@@ -525,12 +525,12 @@ impl WalletOps for WalletHandle {
                     .sum();
                 let spendable = total.saturating_sub(pending_out);
                 WalletBalance {
-                    balance_micro_eld: total,
+                    balance_micro_jtm: total,
                     balance_eld: microjetsam_to_eld(total),
                     utxo_count: w.utxos.len(),
-                    pending_outbound_micro_eld: pending_out,
-                    pending_incoming_micro_eld: 0,
-                    spendable_micro_eld: spendable,
+                    pending_outbound_micro_jtm: pending_out,
+                    pending_incoming_micro_jtm: 0,
+                    spendable_micro_jtm: spendable,
                     spendable_eld: microjetsam_to_eld(spendable),
                 }
             }
@@ -546,7 +546,7 @@ impl WalletOps for WalletHandle {
                 .values()
                 .map(|u| WalletUtxoInfo {
                     slot_index: u.slot_index,
-                    value_micro_eld: u.value,
+                    value_micro_jtm: u.value,
                     creation_id: u.creation_id,
                     value_eld: microjetsam_to_eld(u.value),
                     address: u.address.to_bech32(),
@@ -574,8 +574,8 @@ impl WalletOps for WalletHandle {
                         state::TxDirection::Received => "received".into(),
                     },
                     is_coinbase: h.is_coinbase,
-                    amount_micro_eld: h.amount_micro_eld,
-                    amount_eld: microjetsam_to_eld(h.amount_micro_eld),
+                    amount_micro_jtm: h.amount_micro_jtm,
+                    amount_eld: microjetsam_to_eld(h.amount_micro_jtm),
                     peer_address: h
                         .peer_address
                         .map(|a| jetsam_poseidon2b::primitives::Address(a).to_bech32()),
@@ -629,8 +629,8 @@ impl WalletOps for WalletHandle {
                 txid: *txid,
                 height: receipt.claimed_height,
                 timestamp: receipt.summary.confirmed_unix,
-                amount_micro_eld: sent.map_or(derived_amount, |entry| entry.amount_micro_eld),
-                fee_micro_eld: receipt.summary.fee_micro_eld,
+                amount_micro_jtm: sent.map_or(derived_amount, |entry| entry.amount_micro_jtm),
+                fee_micro_jtm: receipt.summary.fee_micro_jtm,
                 peer_address: sent
                     .and_then(|entry| entry.peer_address)
                     .map(|owner| jetsam_poseidon2b::primitives::Address(owner).to_bech32())
@@ -683,7 +683,7 @@ impl WalletOps for WalletHandle {
                     block_hash: entry.block_hash,
                     height: entry.height,
                     timestamp: entry.timestamp,
-                    reward_micro_eld: entry.amount_micro_eld,
+                    reward_micro_jtm: entry.amount_micro_jtm,
                     payout_address: entry.own_address.clone()?,
                     payout_key_index: entry.own_key_index?,
                 })
@@ -819,7 +819,7 @@ impl WalletOps for WalletHandle {
         };
         let scan_result = WalletScanResult {
             found_utxos: found,
-            balance_micro_eld: balance,
+            balance_micro_jtm: balance,
             balance_eld: microjetsam_to_eld(balance),
             active_index: w.active_index,
             snapshot_height,
@@ -835,13 +835,13 @@ impl WalletOps for WalletHandle {
 
     fn plan_send(
         &self,
-        amount_micro_eld: u64,
-        explicit_fee_micro_eld: Option<u64>,
+        amount_micro_jtm: u64,
+        explicit_fee_micro_jtm: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
         relay_floor: u64,
     ) -> Result<WalletSendPlan, WalletSendPlanError> {
-        if amount_micro_eld == 0 {
+        if amount_micro_jtm == 0 {
             return Err(WalletSendPlanError::Other(
                 "amount cannot be zero".to_string(),
             ));
@@ -878,26 +878,26 @@ impl WalletOps for WalletHandle {
         let one_input_one_output =
             jetsam_chain::consensus::fee_breakdown(1, 1, active_slot_count, log_slots);
         let one_input_one_output_minimum = one_input_one_output.required_total.max(relay_floor);
-        if let Some(fee) = explicit_fee_micro_eld {
+        if let Some(fee) = explicit_fee_micro_jtm {
             if fee < one_input_one_output_minimum {
                 return Err(WalletSendPlanError::Other(format!(
-                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} μELD, got {fee} μELD"
+                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} μJTM, got {fee} μJTM"
                 )));
             }
         }
-        let minimum_fee = explicit_fee_micro_eld.unwrap_or(one_input_one_output_minimum);
-        let minimum_total = amount_micro_eld.checked_add(minimum_fee).ok_or_else(|| {
+        let minimum_fee = explicit_fee_micro_jtm.unwrap_or(one_input_one_output_minimum);
+        let minimum_total = amount_micro_jtm.checked_add(minimum_fee).ok_or_else(|| {
             WalletSendPlanError::Other("payment amount plus fee overflows u64".to_string())
         })?;
         if spendable < minimum_total {
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: minimum_total,
-                available_micro_eld: spendable,
+                needed_micro_jtm: minimum_total,
+                available_micro_jtm: spendable,
             });
         }
 
         let mut selected_value = 0u64;
-        let mut planned = explicit_fee_micro_eld.and_then(|fee| {
+        let mut planned = explicit_fee_micro_jtm.and_then(|fee| {
             available
                 .iter()
                 .find(|utxo| utxo.value == minimum_total)
@@ -914,7 +914,7 @@ impl WalletOps for WalletHandle {
                 WalletSendPlanError::Other("wallet balance arithmetic overflow".to_string())
             })?;
 
-            if let Some(fee) = explicit_fee_micro_eld {
+            if let Some(fee) = explicit_fee_micro_jtm {
                 if selected_value < minimum_total {
                     continue;
                 }
@@ -929,7 +929,7 @@ impl WalletOps for WalletHandle {
                 let minimum = breakdown.required_total.max(relay_floor);
                 if fee < minimum {
                     return Err(WalletSendPlanError::Other(format!(
-                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μELD, got {fee} μELD"
+                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μJTM, got {fee} μJTM"
                     )));
                 }
                 planned = Some((input_count, fee, output_count, change, breakdown));
@@ -943,7 +943,7 @@ impl WalletOps for WalletHandle {
                 log_slots,
             );
             let one_output_fee = one_output_breakdown.required_total.max(relay_floor);
-            if selected_value > amount_micro_eld {
+            if selected_value > amount_micro_jtm {
                 let two_output_breakdown = jetsam_chain::consensus::fee_breakdown(
                     input_count as u64,
                     2,
@@ -952,7 +952,7 @@ impl WalletOps for WalletHandle {
                 );
                 let two_output_fee = two_output_breakdown.required_total.max(relay_floor);
                 let two_output_need =
-                    amount_micro_eld
+                    amount_micro_jtm
                         .checked_add(two_output_fee)
                         .ok_or_else(|| {
                             WalletSendPlanError::Other(
@@ -970,8 +970,8 @@ impl WalletOps for WalletHandle {
                     break;
                 }
             }
-            if selected_value >= amount_micro_eld {
-                let no_change_fee = selected_value - amount_micro_eld;
+            if selected_value >= amount_micro_jtm {
+                let no_change_fee = selected_value - amount_micro_jtm;
                 if no_change_fee >= one_output_fee {
                     planned = Some((input_count, no_change_fee, 1, 0, one_output_breakdown));
                     break;
@@ -979,22 +979,22 @@ impl WalletOps for WalletHandle {
             }
         }
 
-        let Some((_, fee_micro_eld, _, _, _)) = planned else {
+        let Some((_, fee_micro_jtm, _, _, _)) = planned else {
             if available.len() > MAX_PAGED_SPEND_INPUTS {
                 return Err(WalletSendPlanError::InputLimitExceeded {
                     max_inputs: MAX_PAGED_SPEND_INPUTS,
                 });
             }
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: minimum_total,
-                available_micro_eld: spendable,
+                needed_micro_jtm: minimum_total,
+                available_micro_jtm: spendable,
             });
         };
         // Re-run the shared exact-single-before-greedy selector with the final
         // fee. This is cheap and guarantees that dry-run counts cannot diverge
         // from the builder's selected shape.
-        let Some((selected, change_micro_eld)) =
-            wallet.select_utxos(amount_micro_eld, fee_micro_eld)
+        let Some((selected, change_micro_jtm)) =
+            wallet.select_utxos(amount_micro_jtm, fee_micro_jtm)
         else {
             if available.len() > MAX_PAGED_SPEND_INPUTS {
                 return Err(WalletSendPlanError::InputLimitExceeded {
@@ -1002,12 +1002,12 @@ impl WalletOps for WalletHandle {
                 });
             }
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: amount_micro_eld.saturating_add(fee_micro_eld),
-                available_micro_eld: spendable,
+                needed_micro_jtm: amount_micro_jtm.saturating_add(fee_micro_jtm),
+                available_micro_jtm: spendable,
             });
         };
         let input_count = selected.len();
-        let output_count = 1 + usize::from(change_micro_eld > 0);
+        let output_count = 1 + usize::from(change_micro_jtm > 0);
         let breakdown = jetsam_chain::consensus::fee_breakdown(
             input_count as u64,
             output_count as u64,
@@ -1015,30 +1015,30 @@ impl WalletOps for WalletHandle {
             log_slots,
         );
         let minimum = breakdown.required_total.max(relay_floor);
-        if fee_micro_eld < minimum {
+        if fee_micro_jtm < minimum {
             return Err(WalletSendPlanError::Other(format!(
-                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μELD, got {fee_micro_eld} μELD"
+                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μJTM, got {fee_micro_jtm} μJTM"
             )));
         }
-        let total_spend_micro_eld =
-            amount_micro_eld.checked_add(fee_micro_eld).ok_or_else(|| {
+        let total_spend_micro_jtm =
+            amount_micro_jtm.checked_add(fee_micro_jtm).ok_or_else(|| {
                 WalletSendPlanError::Other("payment amount plus fee overflows u64".to_string())
             })?;
         Ok(WalletSendPlan {
-            amount_micro_eld,
-            fee_micro_eld,
-            total_spend_micro_eld,
+            amount_micro_jtm,
+            fee_micro_jtm,
+            total_spend_micro_jtm,
             input_count,
             output_count,
-            change_micro_eld,
-            fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micro_eld),
+            change_micro_jtm,
+            fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micro_jtm),
         })
     }
     fn build_send(
         &self,
         to_address: [u8; 32],
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
@@ -1054,8 +1054,8 @@ impl WalletOps for WalletHandle {
             let pending_outputs = w.pending_output_slots.clone();
             let data = builder::extract_build_data(
                 w,
-                amount_micro_eld,
-                fee_micro_eld,
+                amount_micro_jtm,
+                fee_micro_jtm,
                 epoch_anchor,
                 slot_hints,
                 log_slots,
@@ -1069,7 +1069,7 @@ impl WalletOps for WalletHandle {
 
         // Prove outside the lock (CPU-heavy, ~0.3–3 s).
         let (_txid, intent_bytes) =
-            builder::build_and_prove_tx(to_address, amount_micro_eld, fee_micro_eld, build_data)
+            builder::build_and_prove_tx(to_address, amount_micro_jtm, fee_micro_jtm, build_data)
                 .map_err(|e| e.to_string())?;
 
         Ok((intent_bytes, input_slots))
@@ -1116,7 +1116,7 @@ impl WalletOps for WalletHandle {
             ));
         }
 
-        let balance_before_micro_eld = available
+        let balance_before_micro_jtm = available
             .iter()
             .map(|utxo| utxo.value)
             .try_fold(0u64, u64::checked_add)
@@ -1125,7 +1125,7 @@ impl WalletOps for WalletHandle {
             })?;
         let input_count = available.len().min(max_inputs);
         let selected = &available[..input_count];
-        let input_value_micro_eld = selected
+        let input_value_micro_jtm = selected
             .iter()
             .map(|utxo| utxo.value)
             .try_fold(0u64, u64::checked_add)
@@ -1138,41 +1138,41 @@ impl WalletOps for WalletHandle {
             active_slot_count,
             log_slots,
         );
-        let fee_micro_eld = breakdown.required_total.max(relay_floor);
-        let Some(output_value_micro_eld) = input_value_micro_eld.checked_sub(fee_micro_eld) else {
+        let fee_micro_jtm = breakdown.required_total.max(relay_floor);
+        let Some(output_value_micro_jtm) = input_value_micro_jtm.checked_sub(fee_micro_jtm) else {
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: fee_micro_eld.saturating_add(1),
-                available_micro_eld: input_value_micro_eld,
+                needed_micro_jtm: fee_micro_jtm.saturating_add(1),
+                available_micro_jtm: input_value_micro_jtm,
             });
         };
-        if output_value_micro_eld == 0 {
+        if output_value_micro_jtm == 0 {
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: fee_micro_eld.saturating_add(1),
-                available_micro_eld: input_value_micro_eld,
+                needed_micro_jtm: fee_micro_jtm.saturating_add(1),
+                available_micro_jtm: input_value_micro_jtm,
             });
         }
 
         let untouched_count = available.len() - input_count;
         Ok(WalletConsolidationPlan {
-            input_value_micro_eld,
-            fee_micro_eld,
-            output_value_micro_eld,
-            balance_before_micro_eld,
-            balance_after_micro_eld: balance_before_micro_eld - fee_micro_eld,
+            input_value_micro_jtm,
+            fee_micro_jtm,
+            output_value_micro_jtm,
+            balance_before_micro_jtm,
+            balance_after_micro_jtm: balance_before_micro_jtm - fee_micro_jtm,
             input_count,
             untouched_count,
             remaining_count: untouched_count + 1,
             freed_slots: input_count - 1,
             selected_input_slots: selected.iter().map(|utxo| utxo.slot_index).collect(),
-            fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micro_eld),
+            fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micro_jtm),
         })
     }
 
     fn build_consolidation(
         &self,
         selected_input_slots: Vec<u32>,
-        output_value_micro_eld: u64,
-        fee_micro_eld: u64,
+        output_value_micro_jtm: u64,
+        fee_micro_jtm: u64,
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         _log_slots: u32,
@@ -1186,8 +1186,8 @@ impl WalletOps for WalletHandle {
             let data = builder::extract_consolidation_build_data(
                 wallet,
                 &selected_input_slots,
-                output_value_micro_eld,
-                fee_micro_eld,
+                output_value_micro_jtm,
+                fee_micro_jtm,
                 epoch_anchor,
                 slot_hints,
                 &pending_outputs,
@@ -1198,8 +1198,8 @@ impl WalletOps for WalletHandle {
 
         let (_txid, intent_bytes) = builder::build_and_prove_tx(
             active_address,
-            output_value_micro_eld,
-            fee_micro_eld,
+            output_value_micro_jtm,
+            fee_micro_jtm,
             build_data,
         )
         .map_err(|error| error.to_string())?;
@@ -1211,7 +1211,7 @@ impl WalletOps for WalletHandle {
         txid: [u8; 32],
         input_slots: &[u32],
         output_slots: &[u32],
-        amount_micro_eld: u64,
+        amount_micro_jtm: u64,
         peer_address: [u8; 32],
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().unwrap();
@@ -1220,7 +1220,7 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
         wallet.add_pending_inputs(input_slots);
         wallet.add_pending_outputs(output_slots);
-        wallet.record_pending_send(txid, amount_micro_eld, peer_address)?;
+        wallet.record_pending_send(txid, amount_micro_jtm, peer_address)?;
         Ok(())
     }
 
@@ -1524,14 +1524,14 @@ mod tests {
         assert_eq!(plan.remaining_count, 1);
         assert_eq!(plan.freed_slots, 62);
         assert_eq!(plan.selected_input_slots, (0..63).collect::<Vec<_>>());
-        assert_eq!(plan.input_value_micro_eld, expected_balance);
+        assert_eq!(plan.input_value_micro_jtm, expected_balance);
         assert_eq!(
-            plan.output_value_micro_eld + plan.fee_micro_eld,
+            plan.output_value_micro_jtm + plan.fee_micro_jtm,
             expected_balance
         );
         assert_eq!(
-            plan.balance_after_micro_eld,
-            expected_balance - plan.fee_micro_eld
+            plan.balance_after_micro_jtm,
+            expected_balance - plan.fee_micro_jtm
         );
     }
 
@@ -1556,11 +1556,11 @@ mod tests {
         assert_eq!(plan.remaining_count, 2);
         assert_eq!(plan.freed_slots, 63);
         assert_eq!(plan.selected_input_slots, expected_selected_slots);
-        assert_eq!(plan.input_value_micro_eld, expected_input_value);
-        assert_eq!(plan.balance_before_micro_eld, expected_balance);
+        assert_eq!(plan.input_value_micro_jtm, expected_input_value);
+        assert_eq!(plan.balance_before_micro_jtm, expected_balance);
         assert_eq!(
-            plan.balance_after_micro_eld,
-            expected_balance - plan.fee_micro_eld
+            plan.balance_after_micro_jtm,
+            expected_balance - plan.fee_micro_jtm
         );
     }
 
@@ -1571,7 +1571,7 @@ mod tests {
         assert_eq!(
             error,
             WalletSendPlanError::Other(
-                "fee too low for transaction with 1 input and 1 output: required 5800 μELD, got 1 μELD"
+                "fee too low for transaction with 1 input and 1 output: required 5800 μJTM, got 1 μJTM"
                     .to_string()
             )
         );
@@ -1583,8 +1583,8 @@ mod tests {
         let plan = handle.plan_send(90_000, Some(5_800), 0, 24, 0).unwrap();
         assert_eq!(plan.input_count, 1);
         assert_eq!(plan.output_count, 1);
-        assert_eq!(plan.change_micro_eld, 0);
-        assert_eq!(plan.fee_micro_eld, 5_800);
+        assert_eq!(plan.change_micro_jtm, 0);
+        assert_eq!(plan.fee_micro_jtm, 5_800);
 
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
@@ -1656,8 +1656,8 @@ mod tests {
         assert_eq!(
             err,
             WalletSendPlanError::InsufficientFunds {
-                needed_micro_eld: 15_000,
-                available_micro_eld: 4_000,
+                needed_micro_jtm: 15_000,
+                available_micro_jtm: 4_000,
             }
         );
     }
@@ -1673,9 +1673,9 @@ mod tests {
 
         assert!(handle.plan_send(3_000, None, 0, 24, 0).is_err());
         let balance = handle.get_balance();
-        assert_eq!(balance.balance_micro_eld, 4_000);
-        assert_eq!(balance.pending_outbound_micro_eld, 2_000);
-        assert_eq!(balance.spendable_micro_eld, 2_000);
+        assert_eq!(balance.balance_micro_jtm, 4_000);
+        assert_eq!(balance.pending_outbound_micro_jtm, 2_000);
+        assert_eq!(balance.spendable_micro_jtm, 2_000);
         assert_eq!(handle.status().utxo_count, 2);
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
                 height: 7,
                 direction: state::TxDirection::Sent,
                 is_coinbase: false,
-                amount_micro_eld: 100,
+                amount_micro_jtm: 100,
                 peer_address: Some(active.0),
                 timestamp: 8,
                 own_address: Some(active.to_bech32()),
@@ -1720,7 +1720,7 @@ mod tests {
                 height: 7,
                 direction: state::TxDirection::Received,
                 is_coinbase: false,
-                amount_micro_eld: 20,
+                amount_micro_jtm: 20,
                 peer_address: None,
                 timestamp: 8,
                 own_address: Some(wallet.address_at(1).to_bech32()),
@@ -1746,7 +1746,7 @@ mod tests {
                     height,
                     direction: state::TxDirection::Received,
                     is_coinbase,
-                    amount_micro_eld: height * 1_000,
+                    amount_micro_jtm: height * 1_000,
                     peer_address: None,
                     timestamp: height + 100,
                     own_address: Some(wallet.address_at(key_index).to_bech32()),
@@ -1820,8 +1820,8 @@ mod tests {
         assert!(addresses[0].is_active);
         let balance_after = handle.get_balance();
         assert_eq!(
-            balance_after.balance_micro_eld,
-            balance_before.balance_micro_eld
+            balance_after.balance_micro_jtm,
+            balance_before.balance_micro_jtm
         );
         assert_eq!(balance_after.utxo_count, balance_before.utxo_count);
         assert_eq!(
@@ -1841,7 +1841,7 @@ mod tests {
         let slots_before = handle
             .list_utxos()
             .into_iter()
-            .map(|utxo| (utxo.slot_index, utxo.value_micro_eld, utxo.creation_id))
+            .map(|utxo| (utxo.slot_index, utxo.value_micro_jtm, utxo.creation_id))
             .collect::<Vec<_>>();
         let generated = handle.create_next_address().unwrap();
         assert_eq!(generated.key_index, 1);
@@ -1854,21 +1854,21 @@ mod tests {
         let balance_after = handle.get_balance();
         assert_eq!(
             (
-                balance_after.balance_micro_eld,
+                balance_after.balance_micro_jtm,
                 balance_after.utxo_count,
-                balance_after.spendable_micro_eld,
+                balance_after.spendable_micro_jtm,
             ),
             (
-                balance_before.balance_micro_eld,
+                balance_before.balance_micro_jtm,
                 balance_before.utxo_count,
-                balance_before.spendable_micro_eld,
+                balance_before.spendable_micro_jtm,
             )
         );
         assert_eq!(
             handle
                 .list_utxos()
                 .into_iter()
-                .map(|utxo| (utxo.slot_index, utxo.value_micro_eld, utxo.creation_id))
+                .map(|utxo| (utxo.slot_index, utxo.value_micro_jtm, utxo.creation_id))
                 .collect::<Vec<_>>(),
             slots_before
         );
@@ -1936,7 +1936,7 @@ mod tests {
                 height: 9,
                 direction: state::TxDirection::Sent,
                 is_coinbase: false,
-                amount_micro_eld: 7,
+                amount_micro_jtm: 7,
                 peer_address: None,
                 timestamp: 8,
                 own_address: Some(wallet.active_address().to_bech32()),
@@ -1989,7 +1989,7 @@ mod tests {
                 height: 9,
                 direction: state::TxDirection::Received,
                 is_coinbase: true,
-                amount_micro_eld: 45_000_000,
+                amount_micro_jtm: 45_000_000,
                 peer_address: None,
                 timestamp: 8,
                 own_address: Some(owner.to_bech32()),
@@ -2104,7 +2104,7 @@ mod tests {
         let amount = 200_000_001;
         let fee = 18_500;
         let plan = handle.plan_send(amount, Some(fee), 0, 24, 0).unwrap();
-        assert_eq!(plan.amount_micro_eld, amount);
+        assert_eq!(plan.amount_micro_jtm, amount);
         assert_eq!(plan.input_count, 5);
 
         let guard = handle.inner.lock().unwrap();
@@ -2118,7 +2118,7 @@ mod tests {
     fn plan_keeps_small_payment_fee_at_baseline() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
         let plan = handle.plan_send(50_000, None, 0, 24, 0).unwrap();
-        assert_eq!(plan.fee_micro_eld, 9_000);
+        assert_eq!(plan.fee_micro_jtm, 9_000);
         assert_eq!(plan.input_count, 1);
         assert_eq!(plan.output_count, 2);
         assert_eq!(plan.fee_breakdown.burned, 2_500);
@@ -2128,9 +2128,9 @@ mod tests {
     fn plan_handles_no_change_boundary_without_oscillation() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
         let plan = handle.plan_send(91_000, None, 0, 24, 0).unwrap();
-        assert_eq!(plan.fee_micro_eld, 9_000);
+        assert_eq!(plan.fee_micro_jtm, 9_000);
         assert_eq!(plan.output_count, 1);
-        assert_eq!(plan.change_micro_eld, 0);
+        assert_eq!(plan.change_micro_jtm, 0);
         assert_eq!(plan.fee_breakdown.paid_total, 9_000);
         assert_eq!(plan.fee_breakdown.relay_total, 5_800);
     }
@@ -2141,7 +2141,7 @@ mod tests {
         let plan = handle.plan_send(200_000_001, None, 0, 24, 0).unwrap();
         assert_eq!(plan.input_count, 5);
         assert_eq!(plan.output_count, 2);
-        assert_eq!(plan.fee_micro_eld, 6_900);
+        assert_eq!(plan.fee_micro_jtm, 6_900);
         assert_eq!(plan.fee_breakdown.state_growth, 0);
     }
 }

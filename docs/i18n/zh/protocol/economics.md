@@ -9,7 +9,7 @@ Parano1d 把发行量与 [Live State](../reference/glossary.md#live-state) 容�
 ```
 
 ELD 是币种代码；钱包界面中使用符号 ①。
-所有共识金额都以 [μNOID](../reference/glossary.md#micro_eld) 整数表示。
+所有共识金额都以 [μNOID](../reference/glossary.md#micro_jtm) 整数表示。
 
 ## 区块奖励
 

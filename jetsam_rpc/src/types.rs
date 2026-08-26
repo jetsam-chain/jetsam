@@ -18,7 +18,7 @@ pub struct ChainInfo {
     pub log_slots: u32,
     /// Exact sum of all live UTXO values, encoded as a decimal string so the
     /// JSON boundary never loses precision.
-    pub circulating_supply_micro_eld: String,
+    pub circulating_supply_micro_jtm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub struct ReceiptSummaryInfo {
     pub confirmed_unix: u64,
     pub tx_index: u16,
     pub tx_count: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub inputs: Vec<ReceiptInputInfo>,
     pub outputs: Vec<ReceiptOutputInfo>,
 }
@@ -65,7 +65,7 @@ pub struct ReceiptInputInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptOutputInfo {
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub owner: String,
 }
 
@@ -94,10 +94,10 @@ pub struct BlockTemplateResponse {
     /// Live output counts per user transaction in canonical block order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_output_counts: Vec<usize>,
-    /// Coinbase output value in μELD.
-    pub coinbase_value_micro_eld: u64,
+    /// Coinbase output value in μJTM.
+    pub coinbase_value_micro_jtm: u64,
     /// Sum of user fees claimable by the miner after burned state-growth fees.
-    pub claimable_fees_micro_eld: u64,
+    pub claimable_fees_micro_jtm: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +126,8 @@ pub struct WalletStatus {
     pub address: String,
     /// The active address's key index.
     pub active_index: u32,
-    /// Confirmed balance of the ACTIVE address in μELD.
-    pub balance_micro_eld: u64,
+    /// Confirmed balance of the ACTIVE address in μJTM.
+    pub balance_micro_jtm: u64,
     /// Active-address balance in ELD (6 decimal places).
     pub balance_eld: f64,
     /// Number of confirmed UTXOs at the active address.
@@ -141,19 +141,19 @@ pub struct WalletStatus {
 pub struct WalletBalance {
     /// Confirmed balance of the ACTIVE address (the spendable pool under
     /// the one-owner-per-tx rule).
-    pub balance_micro_eld: u64,
+    pub balance_micro_jtm: u64,
     pub balance_eld: f64,
     /// Number of confirmed UTXOs at the active address.
     pub utxo_count: usize,
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
-    pub pending_outbound_micro_eld: u64,
+    pub pending_outbound_micro_jtm: u64,
     /// Pending external outputs addressed to the ACTIVE address. Change from
     /// this same address is deliberately excluded.
     #[serde(default)]
-    pub pending_incoming_micro_eld: u64,
+    pub pending_incoming_micro_jtm: u64,
     /// Spendable = active balance - pending_outbound.
-    pub spendable_micro_eld: u64,
+    pub spendable_micro_jtm: u64,
     pub spendable_eld: f64,
 }
 
@@ -161,7 +161,7 @@ pub struct WalletBalance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletUtxoInfo {
     pub slot_index: u32,
-    pub value_micro_eld: u64,
+    pub value_micro_jtm: u64,
     /// Alloc-counter incarnation committed alongside the amount.
     pub creation_id: u64,
     pub value_eld: f64,
@@ -182,7 +182,7 @@ pub struct WalletHistoryEntry {
     /// True only for the canonical coinbase at logical transaction zero.
     #[serde(default)]
     pub is_coinbase: bool,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub amount_eld: f64,
     pub peer_address: Option<String>,
     pub timestamp: u64,
@@ -198,8 +198,8 @@ pub struct WalletReceiptInfo {
     pub txid: String,
     pub height: u64,
     pub timestamp: u64,
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
     pub peer_address: Option<String>,
     pub own_address: Option<String>,
     pub own_key_index: Option<u32>,
@@ -226,7 +226,7 @@ pub struct WalletMinedBlockInfo {
     pub block_hash: String,
     pub coinbase_txid: String,
     pub timestamp: u64,
-    pub reward_micro_eld: u64,
+    pub reward_micro_jtm: u64,
     pub reward_eld: f64,
     pub payout_address: String,
     pub payout_key_index: u32,
@@ -252,7 +252,7 @@ pub struct WalletMinedBlocksPage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletScanResult {
     pub found_utxos: usize,
-    pub balance_micro_eld: u64,
+    pub balance_micro_jtm: u64,
     pub balance_eld: f64,
     pub active_index: u32,
     pub snapshot_height: u64,
@@ -297,19 +297,19 @@ pub struct FeeEstimate {
     pub net_new_slots: u64,
     pub active_slot_count: u64,
     pub log_slots: u32,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub breakdown: FeeBreakdownInfo,
 }
 
 /// Dry-run plan for one ordinary Tx8x2 payment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendPlan {
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
-    pub total_spend_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
+    pub total_spend_micro_jtm: u64,
     pub input_count: usize,
     pub output_count: usize,
-    pub change_micro_eld: u64,
+    pub change_micro_jtm: u64,
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
@@ -329,8 +329,8 @@ pub struct WalletInputLimitExceeded {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
     pub txid: String,
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
     pub input_count: usize,
     pub output_count: usize,
 }
@@ -345,11 +345,11 @@ pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
 /// Exact live consolidation quote produced from the active wallet snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConsolidationPlan {
-    pub input_value_micro_eld: u64,
-    pub fee_micro_eld: u64,
-    pub output_value_micro_eld: u64,
-    pub balance_before_micro_eld: u64,
-    pub balance_after_micro_eld: u64,
+    pub input_value_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
+    pub output_value_micro_jtm: u64,
+    pub balance_before_micro_jtm: u64,
+    pub balance_after_micro_jtm: u64,
     pub input_count: usize,
     pub untouched_count: usize,
     pub remaining_count: usize,
@@ -362,9 +362,9 @@ pub struct WalletConsolidationPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConsolidationResult {
     pub txid: String,
-    pub input_value_micro_eld: u64,
-    pub fee_micro_eld: u64,
-    pub output_value_micro_eld: u64,
+    pub input_value_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
+    pub output_value_micro_jtm: u64,
     pub input_count: usize,
     pub output_count: usize,
     pub freed_slots: usize,
@@ -406,7 +406,7 @@ pub struct BlockTransactionInfo {
     pub page_count: u16,
     pub live_inputs: u16,
     pub live_outputs: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub coinbase: bool,
     /// Deterministic batched payout of the two development-reward shares.
     #[serde(default)]
@@ -416,8 +416,8 @@ pub struct BlockTransactionInfo {
     /// One owner shared by every live input. Coinbase has no input owner.
     pub input_owner: Option<String>,
     /// Decimal u128 strings preserve exact aggregate values in JSON.
-    pub input_sum_micro_eld: String,
-    pub output_sum_micro_eld: String,
+    pub input_sum_micro_jtm: String,
+    pub output_sum_micro_jtm: String,
     /// Hash of every physical Tx8x2 page composing this logical transaction.
     pub page_hashes: Vec<String>,
     pub inputs: Vec<BlockTransactionInputInfo>,
@@ -430,7 +430,7 @@ pub struct BlockTransactionInputInfo {
     pub page: u16,
     pub lane: u8,
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub creation_id: u64,
 }
 
@@ -440,7 +440,7 @@ pub struct BlockTransactionOutputInfo {
     pub page: u16,
     pub lane: u8,
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub owner: String,
     /// Incarnation assigned when this output was applied to the state.
     pub creation_id: u64,
@@ -456,10 +456,10 @@ pub struct RetainedBlockInfo {
     pub live_inputs: u16,
     /// Includes all system-mint outputs.
     pub live_outputs: u16,
-    pub reward_micro_eld: u64,
+    pub reward_micro_jtm: u64,
     pub reward_eld: f64,
     /// Decimal u128 string; a complete block can aggregate more than u64.
-    pub total_fees_micro_eld: String,
+    pub total_fees_micro_jtm: String,
     pub block_bytes: u64,
     pub history_step_bytes: u64,
     pub bundle_bytes: u64,
@@ -486,19 +486,19 @@ pub struct RecentTransactionInfo {
     pub page_count: u16,
     pub live_inputs: u16,
     pub live_outputs: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub coinbase: bool,
     /// Deterministic batched payout of the two development-reward shares.
     #[serde(default)]
     pub development_payout: bool,
     pub input_owner: Option<String>,
     /// Decimal u128 strings preserve exact aggregates in JSON.
-    pub input_sum_micro_eld: String,
-    pub output_sum_micro_eld: String,
+    pub input_sum_micro_jtm: String,
+    pub output_sum_micro_jtm: String,
     /// Present only when the request filters by an address.
-    pub address_spent_micro_eld: Option<String>,
+    pub address_spent_micro_jtm: Option<String>,
     /// Present only when the request filters by an address.
-    pub address_received_micro_eld: Option<String>,
+    pub address_received_micro_jtm: Option<String>,
 }
 
 /// One bounded page over logical transactions in retained full blocks.
@@ -536,8 +536,8 @@ pub struct MiningInfo {
     pub difficulty_bits: u32,
     /// Difficulty target as 64-char hex (LE 256-bit).
     pub difficulty_target: String,
-    /// Block reward for the next block in μELD.
-    pub block_reward_micro_eld: u64,
+    /// Block reward for the next block in μJTM.
+    pub block_reward_micro_jtm: u64,
     /// Block reward in ELD.
     pub block_reward_eld: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
@@ -642,10 +642,10 @@ pub struct AddressInfo {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Convert μELD to ELD with 6 decimal places.
+/// Convert μJTM to ELD with 6 decimal places.
 #[inline]
-pub fn microjetsam_to_eld(micro_eld: u64) -> f64 {
-    micro_eld as f64 / 1_000_000.0
+pub fn microjetsam_to_eld(micro_jtm: u64) -> f64 {
+    micro_jtm as f64 / 1_000_000.0
 }
 
 // ---------------------------------------------------------------------------
@@ -657,8 +657,8 @@ pub fn microjetsam_to_eld(micro_eld: u64) -> f64 {
 pub struct MempoolTxInfo {
     /// Canonical logical transaction id (hex).
     pub tx_hash: String,
-    /// Fee in μELD.
-    pub fee_micro_eld: u64,
+    /// Fee in μJTM.
+    pub fee_micro_jtm: u64,
     /// Fee rate using weighted resource units (`inputs + outputs + 4 × net_new_slots`).
     pub fee_rate: u64,
     /// Number of live inputs.
@@ -682,7 +682,7 @@ pub struct MempoolTxInfo {
 pub struct MempoolInfo {
     /// Number of pending transactions.
     pub size: usize,
-    /// Current dynamic fee floor in μELD.
+    /// Current dynamic fee floor in μJTM.
     pub fee_floor: u64,
     /// All pending transactions.
     pub txs: Vec<MempoolTxInfo>,

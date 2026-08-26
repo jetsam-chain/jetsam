@@ -282,7 +282,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": binary_hash,
         "binary_size": NODE_BIN.stat().st_size,
-        "amounts_micro_eld": list(AMOUNTS),
+        "amounts_micro_jtm": list(AMOUNTS),
         "status": "running",
     }
     error = None
@@ -313,7 +313,7 @@ def main():
             lambda: exact_tip(miner, observer),
             timeout=300,
         )
-        require(rpc(observer.rpc_port, "walletGetBalance")["balance_micro_eld"] == 0, "recipient pre-funded")
+        require(rpc(observer.rpc_port, "walletGetBalance")["balance_micro_jtm"] == 0, "recipient pre-funded")
 
         sends = []
         submit_started = time.monotonic()
@@ -393,7 +393,7 @@ def main():
 
         recipient_balance = rpc(observer.rpc_port, "walletGetBalance")
         require(
-            recipient_balance["balance_micro_eld"] == sum(AMOUNTS),
+            recipient_balance["balance_micro_jtm"] == sum(AMOUNTS),
             f"observer wallet did not update incrementally: {recipient_balance}",
         )
         require(recipient_balance["utxo_count"] == len(AMOUNTS), f"recipient UTXO count wrong: {recipient_balance}")

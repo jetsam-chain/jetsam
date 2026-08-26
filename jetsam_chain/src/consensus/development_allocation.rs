@@ -43,7 +43,7 @@ pub const DEVELOPMENT_ALLOCATION_END_HEIGHT: u64 = TARGET_BLOCKS_PER_DAY * 365 *
 // split; `miner_subsidy` then `.expect()`s it, so an indivisible tier inside the
 // allocation window would PANIC a consensus path. The reward tiers are
 // 50e6 >> k, and the first one that is not a multiple of twenty is k = 6
-// (781_250 μELD, from height 2 808 800). Assert at compile time that the window
+// (781_250 μJTM, from height 2 808 800). Assert at compile time that the window
 // closes long before that, so extending it can never be done silently.
 const _: () = assert!(
     crate::consensus::emission::block_reward(DEVELOPMENT_ALLOCATION_END_HEIGHT)
@@ -188,7 +188,7 @@ pub fn development_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::params::{H1_HEIGHT, MICROELIDE_PER_ELD};
+    use crate::consensus::params::{H1_HEIGHT, MICRO_PER_JTM};
 
     /// Upstream Parano1d fund addresses, recorded here so the guard below can
     /// recognise them. These bytes must NOT appear in a launched Elide chain.
@@ -352,7 +352,7 @@ mod tests {
         let cap = crate::consensus::params::MAX_SUPPLY_MICRO;
         // Exact sum over heights 1..=700_800 — not the rounded back-of-envelope
         // 1 164 000: the tier boundaries do not land on day boundaries.
-        assert_eq!(funded / u128::from(MICROELIDE_PER_ELD), 1_163_996);
+        assert_eq!(funded / u128::from(MICRO_PER_JTM), 1_163_996);
         let basis_points = funded * 10_000 / cap;
         assert_eq!(basis_points, 554, "fund share should be 5.54% of the cap");
     }

@@ -521,7 +521,7 @@ pub fn decode_chain_tip(bytes: &[u8]) -> Option<(u64, [u8; 32])> {
 // state_meta v1:
 //   log_slots(u32) + active_slot_count(u64) + alloc_counter(u64) = 20 bytes
 // state_meta v2 appends:
-//   circulating_supply_micro_eld(u128) = 16 bytes
+//   circulating_supply_micro_jtm(u128) = 16 bytes
 //
 // The first 20 bytes remain unchanged so pre-v2 databases can be upgraded by
 // one dense verification pass instead of being discarded.
@@ -532,13 +532,13 @@ pub fn encode_state_meta(
     log_slots: u32,
     active: u64,
     alloc: u64,
-    circulating_supply_micro_eld: u128,
+    circulating_supply_micro_jtm: u128,
 ) -> [u8; ENCODED_STATE_META_BYTES] {
     let mut out = [0u8; ENCODED_STATE_META_BYTES];
     out[0..4].copy_from_slice(&log_slots.to_le_bytes());
     out[4..12].copy_from_slice(&active.to_le_bytes());
     out[12..20].copy_from_slice(&alloc.to_le_bytes());
-    out[20..36].copy_from_slice(&circulating_supply_micro_eld.to_le_bytes());
+    out[20..36].copy_from_slice(&circulating_supply_micro_jtm.to_le_bytes());
     out
 }
 

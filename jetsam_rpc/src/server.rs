@@ -211,14 +211,14 @@ fn retained_transaction_summaries(
             page_count: 1,
             live_inputs: 0,
             live_outputs: coinbase_outputs,
-            fee_micro_eld: 0,
+            fee_micro_jtm: 0,
             coinbase: true,
             development_payout: false,
             input_owner: None,
-            input_sum_micro_eld: "0".into(),
-            output_sum_micro_eld: coinbase_output_sum.to_string(),
-            address_spent_micro_eld: address.map(|_| "0".into()),
-            address_received_micro_eld: coinbase_received.map(|value| value.to_string()),
+            input_sum_micro_jtm: "0".into(),
+            output_sum_micro_jtm: coinbase_output_sum.to_string(),
+            address_spent_micro_jtm: address.map(|_| "0".into()),
+            address_received_micro_jtm: coinbase_received.map(|value| value.to_string()),
         });
     }
 
@@ -247,14 +247,14 @@ fn retained_transaction_summaries(
                 page_count: 1,
                 live_inputs: 0,
                 live_outputs: 2,
-                fee_micro_eld: 0,
+                fee_micro_jtm: 0,
                 coinbase: true,
                 development_payout: true,
                 input_owner: None,
-                input_sum_micro_eld: "0".into(),
-                output_sum_micro_eld: payout_output_sum.to_string(),
-                address_spent_micro_eld: address.map(|_| "0".into()),
-                address_received_micro_eld: payout_received.map(|value| value.to_string()),
+                input_sum_micro_jtm: "0".into(),
+                output_sum_micro_jtm: payout_output_sum.to_string(),
+                address_spent_micro_jtm: address.map(|_| "0".into()),
+                address_received_micro_jtm: payout_received.map(|value| value.to_string()),
             });
         }
     }
@@ -298,14 +298,14 @@ fn retained_transaction_summaries(
             page_count: group.page_count,
             live_inputs: group.spend.live_inputs,
             live_outputs: group.spend.live_outputs,
-            fee_micro_eld: group.spend.fee,
+            fee_micro_jtm: group.spend.fee,
             coinbase: false,
             development_payout: false,
             input_owner: Some(group.spend.input_owner.to_bech32()),
-            input_sum_micro_eld: group.spend.input_sum.to_string(),
-            output_sum_micro_eld: group.spend.output_sum.to_string(),
-            address_spent_micro_eld: address_spent,
-            address_received_micro_eld: address_received,
+            input_sum_micro_jtm: group.spend.input_sum.to_string(),
+            output_sum_micro_jtm: group.spend.output_sum.to_string(),
+            address_spent_micro_jtm: address_spent,
+            address_received_micro_jtm: address_received,
         });
     }
     Ok(transactions)
@@ -525,7 +525,7 @@ fn mempool_tx_info(entry: jetsam_mempool::MempoolEntryMetadata) -> MempoolTxInfo
     let requires_b255_miner = matches!(proof_class, BlockProofClass::B255);
     MempoolTxInfo {
         tx_hash: hex::encode(entry.tx_hash.0),
-        fee_micro_eld: entry.fee_micro_eld,
+        fee_micro_jtm: entry.fee_micro_jtm,
         fee_rate: entry.fee_rate,
         n_inputs: usize::from(entry.n_inputs),
         n_outputs: usize::from(entry.n_outputs),
@@ -981,11 +981,11 @@ enum WalletSubmissionBuild {
 #[derive(Clone)]
 struct WalletSubmissionRequest {
     to_address: [u8; 32],
-    amount_micro_eld: u64,
-    fee_micro_eld: u64,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
     expected_input_count: usize,
     expected_output_count: usize,
-    pending_history_amount_micro_eld: u64,
+    pending_history_amount_micro_jtm: u64,
     build: WalletSubmissionBuild,
     failure_label: &'static str,
 }
@@ -1089,11 +1089,11 @@ impl RpcHandler {
     ) -> RpcResult<WalletSendResult> {
         let WalletSubmissionRequest {
             to_address,
-            amount_micro_eld,
-            fee_micro_eld,
+            amount_micro_jtm,
+            fee_micro_jtm,
             expected_input_count,
             expected_output_count,
-            pending_history_amount_micro_eld,
+            pending_history_amount_micro_jtm,
             build,
             failure_label,
         } = request;
@@ -1144,8 +1144,8 @@ impl RpcHandler {
                 jetsam_miner::install_wallet_proof_cpu(|| match build_attempt {
                     WalletSubmissionBuild::Payment => wallet.build_send(
                         to_address,
-                        amount_micro_eld,
-                        fee_micro_eld,
+                        amount_micro_jtm,
+                        fee_micro_jtm,
                         epoch_anchor,
                         slot_hints,
                         log_slots,
@@ -1154,8 +1154,8 @@ impl RpcHandler {
                         selected_input_slots,
                     } => wallet.build_consolidation(
                         selected_input_slots,
-                        amount_micro_eld,
-                        fee_micro_eld,
+                        amount_micro_jtm,
+                        fee_micro_jtm,
                         epoch_anchor,
                         slot_hints,
                         log_slots,
@@ -1196,12 +1196,12 @@ impl RpcHandler {
                 .flat_map(|page| page.body.live_outputs())
                 .map(|(_, output)| output.slot_index)
                 .collect();
-            if actual_fee != fee_micro_eld
+            if actual_fee != fee_micro_jtm
                 || input_count != expected_input_count
                 || output_count != expected_output_count
             {
                 last_error = format!(
-                    "wallet builder diverged from plan: expected fee/counts {fee_micro_eld}/{expected_input_count}/{expected_output_count}, got {actual_fee}/{input_count}/{output_count}"
+                    "wallet builder diverged from plan: expected fee/counts {fee_micro_jtm}/{expected_input_count}/{expected_output_count}, got {actual_fee}/{input_count}/{output_count}"
                 );
                 break;
             }
@@ -1211,7 +1211,7 @@ impl RpcHandler {
                 failed_txid,
                 input_slots,
                 output_slots,
-                pending_history_amount_micro_eld,
+                pending_history_amount_micro_jtm,
                 to_address,
             ) {
                 Ok(reservation) => reservation,
@@ -1236,8 +1236,8 @@ impl RpcHandler {
                     }
                     return Ok(WalletSendResult {
                         txid: hex::encode(txid.0),
-                        amount_micro_eld,
-                        fee_micro_eld: actual_fee,
+                        amount_micro_jtm,
+                        fee_micro_jtm: actual_fee,
                         input_count,
                         output_count,
                     });
@@ -1389,14 +1389,14 @@ impl RpcHandler {
             .iter()
             .map(|tx| tx.body.live_output_count())
             .collect();
-        let coinbase_value_micro_eld: u64 = tmpl
+        let coinbase_value_micro_jtm: u64 = tmpl
             .inner
             .coinbase
             .body
             .live_outputs()
             .map(|(_, output)| output.amount)
             .fold(0u64, |acc, value| acc.saturating_add(value));
-        let claimable_fees_micro_eld = tmpl
+        let claimable_fees_micro_jtm = tmpl
             .inner
             .txs
             .iter()
@@ -1427,8 +1427,8 @@ impl RpcHandler {
             n_txs,
             tx_input_counts: tx_input_counts.clone(),
             tx_output_counts: tx_output_counts.clone(),
-            coinbase_value_micro_eld,
-            claimable_fees_micro_eld,
+            coinbase_value_micro_jtm,
+            claimable_fees_micro_jtm,
         };
         publish_pow_preview(&early_template, preview_parent_height, preview_parent_id);
         if let Ok(mut slot) = early.lock() {
@@ -1526,8 +1526,8 @@ impl RpcHandler {
             n_txs,
             tx_input_counts,
             tx_output_counts,
-            coinbase_value_micro_eld,
-            claimable_fees_micro_eld,
+            coinbase_value_micro_jtm,
+            claimable_fees_micro_jtm,
         })
     }
 
@@ -1668,7 +1668,7 @@ impl ElideApiServer for RpcHandler {
             difficulty_target: hex::encode(tip.difficulty_target),
             active_slot_count: tip.active_slot_count,
             log_slots: tip.log_slots,
-            circulating_supply_micro_eld: chain.state.circulating_supply_micro_eld.to_string(),
+            circulating_supply_micro_jtm: chain.state.circulating_supply_micro_jtm.to_string(),
         })
     }
 
@@ -1987,7 +1987,7 @@ impl ElideApiServer for RpcHandler {
             .transactions
             .first()
             .ok_or_else(|| rpc_err("retained block is missing coinbase"))?;
-        let reward_micro_eld = coinbase
+        let reward_micro_jtm = coinbase
             .body
             .live_outputs()
             .map(|(_, output)| output.amount)
@@ -2019,7 +2019,7 @@ impl ElideApiServer for RpcHandler {
                 page: 0,
                 lane: lane as u8,
                 slot_index: output.slot_index,
-                amount_micro_eld: output.amount,
+                amount_micro_jtm: output.amount,
                 owner: output.owner.to_bech32(),
                 creation_id: jetsam_chain::consensus::params::coinbase_creation_id(header.height),
             });
@@ -2031,13 +2031,13 @@ impl ElideApiServer for RpcHandler {
             page_count: 1,
             live_inputs: 0,
             live_outputs: coinbase_outputs,
-            fee_micro_eld: 0,
+            fee_micro_jtm: 0,
             coinbase: true,
             development_payout: false,
             epoch_anchor: hex::encode(coinbase.body.epoch_anchor),
             input_owner: None,
-            input_sum_micro_eld: "0".into(),
-            output_sum_micro_eld: reward_micro_eld.to_string(),
+            input_sum_micro_jtm: "0".into(),
+            output_sum_micro_jtm: reward_micro_jtm.to_string(),
             page_hashes: vec![coinbase_txid],
             inputs: Vec::new(),
             outputs: coinbase_output_details,
@@ -2058,7 +2058,7 @@ impl ElideApiServer for RpcHandler {
                     page: 0,
                     lane: lane as u8,
                     slot_index: output.slot_index,
-                    amount_micro_eld: output.amount,
+                    amount_micro_jtm: output.amount,
                     owner: output.owner.to_bech32(),
                     creation_id: alloc_cursor,
                 });
@@ -2070,13 +2070,13 @@ impl ElideApiServer for RpcHandler {
                 page_count: 1,
                 live_inputs: 0,
                 live_outputs: development_outputs,
-                fee_micro_eld: 0,
+                fee_micro_jtm: 0,
                 coinbase: true,
                 development_payout: true,
                 epoch_anchor: hex::encode(payout.body.epoch_anchor),
                 input_owner: None,
-                input_sum_micro_eld: "0".into(),
-                output_sum_micro_eld: payout_output_sum.to_string(),
+                input_sum_micro_jtm: "0".into(),
+                output_sum_micro_jtm: payout_output_sum.to_string(),
                 page_hashes: vec![payout_txid],
                 inputs: Vec::new(),
                 outputs: payout_outputs,
@@ -2103,7 +2103,7 @@ impl ElideApiServer for RpcHandler {
                         page: page_index as u16,
                         lane: lane as u8,
                         slot_index: input.slot_index,
-                        amount_micro_eld: input.amount,
+                        amount_micro_jtm: input.amount,
                         creation_id: input.creation_id,
                     });
                 }
@@ -2115,7 +2115,7 @@ impl ElideApiServer for RpcHandler {
                         page: page_index as u16,
                         lane: lane as u8,
                         slot_index: output.slot_index,
-                        amount_micro_eld: output.amount,
+                        amount_micro_jtm: output.amount,
                         owner: output.owner.to_bech32(),
                         creation_id: alloc_cursor,
                     });
@@ -2128,13 +2128,13 @@ impl ElideApiServer for RpcHandler {
                 page_count: group.page_count,
                 live_inputs: group.spend.live_inputs,
                 live_outputs: group.spend.live_outputs,
-                fee_micro_eld: group.spend.fee,
+                fee_micro_jtm: group.spend.fee,
                 coinbase: false,
                 development_payout: false,
                 epoch_anchor: hex::encode(group.spend.epoch_anchor),
                 input_owner: Some(group.spend.input_owner.to_bech32()),
-                input_sum_micro_eld: group.spend.input_sum.to_string(),
-                output_sum_micro_eld: group.spend.output_sum.to_string(),
+                input_sum_micro_jtm: group.spend.input_sum.to_string(),
+                output_sum_micro_jtm: group.spend.output_sum.to_string(),
                 page_hashes,
                 inputs,
                 outputs,
@@ -2145,7 +2145,7 @@ impl ElideApiServer for RpcHandler {
                 "retained transaction outputs do not match the header allocator counter",
             ));
         }
-        let total_fees_micro_eld = stream
+        let total_fees_micro_jtm = stream
             .groups
             .iter()
             .map(|group| u128::from(group.spend.fee))
@@ -2165,9 +2165,9 @@ impl ElideApiServer for RpcHandler {
                 .live_outputs
                 .saturating_add(coinbase_outputs)
                 .saturating_add(development_outputs),
-            reward_micro_eld,
-            reward_eld: crate::types::microjetsam_to_eld(reward_micro_eld),
-            total_fees_micro_eld,
+            reward_micro_jtm,
+            reward_eld: crate::types::microjetsam_to_eld(reward_micro_jtm),
+            total_fees_micro_jtm,
             block_bytes: bundle.block_bytes().len() as u64,
             history_step_bytes: bundle.history_step_terminal_bytes().len() as u64,
             bundle_bytes: bundle_bytes.len() as u64,
@@ -2282,7 +2282,7 @@ impl ElideApiServer for RpcHandler {
             height,
             difficulty_bits: diff_bits,
             difficulty_target: hex::encode(diff),
-            block_reward_micro_eld: reward,
+            block_reward_micro_jtm: reward,
             block_reward_eld: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
         })
@@ -2348,7 +2348,7 @@ impl ElideApiServer for RpcHandler {
             net_new_slots: (n_outputs as u64).saturating_sub(n_inputs as u64),
             active_slot_count,
             log_slots,
-            fee_micro_eld: info.relay_total,
+            fee_micro_jtm: info.relay_total,
             breakdown: info,
         })
     }
@@ -2444,7 +2444,7 @@ impl ElideApiServer for RpcHandler {
             confirmed_unix: receipt.summary.confirmed_unix,
             tx_index: receipt.tx_index,
             tx_count: receipt.tx_count,
-            fee_micro_eld: receipt.summary.fee_micro_eld,
+            fee_micro_jtm: receipt.summary.fee_micro_jtm,
             inputs: receipt
                 .summary
                 .inputs
@@ -2458,9 +2458,9 @@ impl ElideApiServer for RpcHandler {
                 .summary
                 .outputs
                 .iter()
-                .map(|(slot_index, amount_micro_eld, owner)| ReceiptOutputInfo {
+                .map(|(slot_index, amount_micro_jtm, owner)| ReceiptOutputInfo {
                     slot_index: *slot_index,
-                    amount_micro_eld: *amount_micro_eld,
+                    amount_micro_jtm: *amount_micro_jtm,
                     owner: owner.to_bech32(),
                 })
                 .collect(),
@@ -2622,7 +2622,7 @@ impl ElideApiServer for RpcHandler {
         if let Some((_, address)) = self.wallet.active_address() {
             let owner = jetsam_poseidon2b::primitives::Address::parse(&address)
                 .map_err(|error| rpc_err(format!("active wallet address: {error}")))?;
-            balance.pending_incoming_micro_eld =
+            balance.pending_incoming_micro_jtm =
                 self.mempool.pending_incoming_for_owner(&owner).await;
         }
         Ok(balance)
@@ -2665,8 +2665,8 @@ impl ElideApiServer for RpcHandler {
                 txid: hex::encode(receipt.txid),
                 height: receipt.height,
                 timestamp: receipt.timestamp,
-                amount_micro_eld: receipt.amount_micro_eld,
-                fee_micro_eld: receipt.fee_micro_eld,
+                amount_micro_jtm: receipt.amount_micro_jtm,
+                fee_micro_jtm: receipt.fee_micro_jtm,
                 peer_address: receipt.peer_address,
                 own_address: receipt.own_address,
                 own_key_index: receipt.own_key_index,
@@ -2743,8 +2743,8 @@ impl ElideApiServer for RpcHandler {
                 block_hash: displayed_hash.map(hex::encode).unwrap_or_default(),
                 coinbase_txid: hex::encode(record.coinbase_txid),
                 timestamp: record.timestamp,
-                reward_micro_eld: record.reward_micro_eld,
-                reward_eld: crate::types::microjetsam_to_eld(record.reward_micro_eld),
+                reward_micro_jtm: record.reward_micro_jtm,
+                reward_eld: crate::types::microjetsam_to_eld(record.reward_micro_jtm),
                 payout_address: record.payout_address,
                 payout_key_index: record.payout_key_index,
                 canonical,
@@ -2831,8 +2831,8 @@ impl ElideApiServer for RpcHandler {
     async fn wallet_plan_send(
         &self,
         to_address: String,
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
     ) -> RpcResult<WalletSendPlan> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -2841,11 +2841,11 @@ impl ElideApiServer for RpcHandler {
         let floor = self.mempool.fee_floor().await;
         self.wallet
             .plan_send(
-                amount_micro_eld,
-                if fee_micro_eld == 0 {
+                amount_micro_jtm,
+                if fee_micro_jtm == 0 {
                     None
                 } else {
-                    Some(fee_micro_eld)
+                    Some(fee_micro_jtm)
                 },
                 active_slot_count,
                 log_slots,
@@ -2857,8 +2857,8 @@ impl ElideApiServer for RpcHandler {
     async fn wallet_send(
         &self,
         to_address: String,
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
     ) -> RpcResult<WalletSendResult> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -2869,16 +2869,16 @@ impl ElideApiServer for RpcHandler {
         let plan = self
             .wallet
             .plan_send(
-                amount_micro_eld,
-                (fee_micro_eld != 0).then_some(fee_micro_eld),
+                amount_micro_jtm,
+                (fee_micro_jtm != 0).then_some(fee_micro_jtm),
                 fee_active_slot_count,
                 fee_log_slots,
                 fee_floor,
             )
             .map_err(wallet_plan_error)?;
         tracing::info!(
-            amount_micro_eld,
-            fee_micro_eld = plan.fee_micro_eld,
+            amount_micro_jtm,
+            fee_micro_jtm = plan.fee_micro_jtm,
             input_count = plan.input_count,
             output_count = plan.output_count,
             "wallet_send deterministic plan ready"
@@ -2886,11 +2886,11 @@ impl ElideApiServer for RpcHandler {
 
         self.submit_wallet_transaction(WalletSubmissionRequest {
             to_address,
-            amount_micro_eld,
-            fee_micro_eld: plan.fee_micro_eld,
+            amount_micro_jtm,
+            fee_micro_jtm: plan.fee_micro_jtm,
             expected_input_count: plan.input_count,
             expected_output_count: plan.output_count,
-            pending_history_amount_micro_eld: amount_micro_eld,
+            pending_history_amount_micro_jtm: amount_micro_jtm,
             build: WalletSubmissionBuild::Payment,
             failure_label: "wallet send",
         })
@@ -2915,8 +2915,8 @@ impl ElideApiServer for RpcHandler {
     async fn wallet_consolidate(
         &self,
         selected_input_slots: Vec<u32>,
-        expected_fee_micro_eld: u64,
-        expected_output_value_micro_eld: u64,
+        expected_fee_micro_jtm: u64,
+        expected_output_value_micro_jtm: u64,
     ) -> RpcResult<WalletConsolidationResult> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -2937,8 +2937,8 @@ impl ElideApiServer for RpcHandler {
             )
             .map_err(wallet_plan_error)?;
         if selected_input_slots != plan.selected_input_slots
-            || expected_fee_micro_eld != plan.fee_micro_eld
-            || expected_output_value_micro_eld != plan.output_value_micro_eld
+            || expected_fee_micro_jtm != plan.fee_micro_jtm
+            || expected_output_value_micro_jtm != plan.output_value_micro_jtm
         {
             return Err(rpc_err(
                 "consolidation quote changed; request a new live quote before submitting",
@@ -2946,9 +2946,9 @@ impl ElideApiServer for RpcHandler {
         }
         tracing::info!(
             input_count = plan.input_count,
-            input_value_micro_eld = plan.input_value_micro_eld,
-            fee_micro_eld = plan.fee_micro_eld,
-            output_value_micro_eld = plan.output_value_micro_eld,
+            input_value_micro_jtm = plan.input_value_micro_jtm,
+            fee_micro_jtm = plan.fee_micro_jtm,
+            output_value_micro_jtm = plan.output_value_micro_jtm,
             untouched_count = plan.untouched_count,
             "wallet_consolidate deterministic plan ready"
         );
@@ -2956,11 +2956,11 @@ impl ElideApiServer for RpcHandler {
         let submitted = self
             .submit_wallet_transaction(WalletSubmissionRequest {
                 to_address: active_address,
-                amount_micro_eld: plan.output_value_micro_eld,
-                fee_micro_eld: plan.fee_micro_eld,
+                amount_micro_jtm: plan.output_value_micro_jtm,
+                fee_micro_jtm: plan.fee_micro_jtm,
                 expected_input_count: plan.input_count,
                 expected_output_count: 1,
-                pending_history_amount_micro_eld: plan.fee_micro_eld,
+                pending_history_amount_micro_jtm: plan.fee_micro_jtm,
                 build: WalletSubmissionBuild::Consolidation {
                     selected_input_slots: plan.selected_input_slots.clone(),
                 },
@@ -2969,9 +2969,9 @@ impl ElideApiServer for RpcHandler {
             .await?;
         Ok(WalletConsolidationResult {
             txid: submitted.txid,
-            input_value_micro_eld: plan.input_value_micro_eld,
-            fee_micro_eld: submitted.fee_micro_eld,
-            output_value_micro_eld: submitted.amount_micro_eld,
+            input_value_micro_jtm: plan.input_value_micro_jtm,
+            fee_micro_jtm: submitted.fee_micro_jtm,
+            output_value_micro_jtm: submitted.amount_micro_jtm,
             input_count: submitted.input_count,
             output_count: submitted.output_count,
             freed_slots: plan.freed_slots,
@@ -3307,7 +3307,7 @@ mod tests {
     fn mempool_status_exposes_the_exact_b25_b255_boundary() {
         let metadata = |page_count| jetsam_mempool::MempoolEntryMetadata {
             tx_hash: jetsam_poseidon2b::primitives::TxBodyHash([page_count as u8; 32]),
-            fee_micro_eld: 7,
+            fee_micro_jtm: 7,
             fee_rate: 3,
             n_inputs: 1,
             n_outputs: 1,
@@ -3357,8 +3357,8 @@ mod tests {
             n_txs: 3,
             tx_input_counts: vec![2, 5],
             tx_output_counts: vec![2, 1],
-            coinbase_value_micro_eld: 50,
-            claimable_fees_micro_eld: 9,
+            coinbase_value_micro_jtm: 50,
+            claimable_fees_micro_jtm: 9,
         };
 
         let json = serde_json::to_value(response).expect("serialize template response");

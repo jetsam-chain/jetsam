@@ -981,7 +981,7 @@ mod tests {
             .unwrap();
         state.active_slot_count = 1;
         state.alloc_counter = 1;
-        state.circulating_supply_micro_eld = 1_000_000;
+        state.circulating_supply_micro_jtm = 1_000_000;
         let mut parent = parent(&mut state);
         parent.height = TARGET_BLOCKS_PER_DAY - 1;
 
@@ -1053,7 +1053,7 @@ mod tests {
         state.state.apply_delta_unrooted(&occupied).unwrap();
         state.active_slot_count = occupied.len() as u64;
         state.alloc_counter = occupied.len() as u64;
-        state.circulating_supply_micro_eld = occupied
+        state.circulating_supply_micro_jtm = occupied
             .iter()
             .map(|(_, slot)| u128::from(slot.amount()))
             .sum();
@@ -1101,7 +1101,7 @@ mod tests {
         state.state.apply_delta_unrooted(&occupied).unwrap();
         state.active_slot_count = occupied.len() as u64;
         state.alloc_counter = occupied.len() as u64;
-        state.circulating_supply_micro_eld = occupied
+        state.circulating_supply_micro_jtm = occupied
             .iter()
             .map(|(_, slot)| u128::from(slot.amount()))
             .sum();
@@ -1204,7 +1204,7 @@ mod tests {
             .unwrap();
         state.active_slot_count = 1;
         state.alloc_counter = 1;
-        state.circulating_supply_micro_eld = 1_000_000;
+        state.circulating_supply_micro_jtm = 1_000_000;
         let mut parent = parent(&mut state);
         parent.height = mint_height;
 
@@ -1242,7 +1242,7 @@ mod tests {
         }
         state.active_slot_count = 2;
         state.alloc_counter = 1;
-        state.circulating_supply_micro_eld = 2_000_000;
+        state.circulating_supply_micro_jtm = 2_000_000;
         let parent = parent(&mut state);
         let a = user(1, 3, 1_000_000, owner, &parent);
         let b = user(2, 1, 1_000_000, owner, &parent);

@@ -703,14 +703,14 @@ fn reconstruct_touched_segment(
 ) -> Result<(), HistoricalStateError> {
     let columns = load_source_segment(snapshot, state, source_tip, segment_id, effective_log)?;
     state.restore_evicted_segment(segment_id, columns)?;
-    let circulating_supply_micro_eld =
+    let circulating_supply_micro_jtm =
         state
             .supply_after_slot_updates(changes)
             .ok_or(HistoricalStateError::Corrupt(
                 "historical circulating-supply rollback failed",
             ))?;
     state.state.apply_delta_unrooted(changes)?;
-    state.circulating_supply_micro_eld = circulating_supply_micro_eld;
+    state.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
     validate_resident_segment(state, segment_id, target_alloc_counter, target_height)?;
 
     // Refresh only the consensus exact summary. FRI summaries deliberately

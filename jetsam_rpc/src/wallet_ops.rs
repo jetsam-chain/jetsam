@@ -21,10 +21,10 @@ use crate::types::{
 /// prevents the RPC layer from scraping human-readable wallet errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WalletSendPlanError {
-    #[error("InsufficientFunds: need {needed_micro_eld} μELD, have {available_micro_eld} μELD spendable")]
+    #[error("InsufficientFunds: need {needed_micro_jtm} μJTM, have {available_micro_jtm} μJTM spendable")]
     InsufficientFunds {
-        needed_micro_eld: u64,
-        available_micro_eld: u64,
+        needed_micro_jtm: u64,
+        available_micro_jtm: u64,
     },
 
     #[error("InputLimitExceeded: canonical payments support at most {max_inputs} inputs")]
@@ -60,7 +60,7 @@ pub struct WalletMinedBlockRecord {
     pub block_hash: Option<[u8; 32]>,
     pub height: u64,
     pub timestamp: u64,
-    pub reward_micro_eld: u64,
+    pub reward_micro_jtm: u64,
     pub payout_address: String,
     pub payout_key_index: u32,
 }
@@ -77,8 +77,8 @@ pub struct WalletReceiptRecord {
     pub txid: [u8; 32],
     pub height: u64,
     pub timestamp: u64,
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
     pub peer_address: Option<String>,
     pub own_address: Option<String>,
     pub own_key_index: Option<u32>,
@@ -159,13 +159,13 @@ pub trait WalletOps: Send + Sync {
     /// Deterministically plan one ordinary canonical payment transaction using
     /// at most eight active-owner UTXOs.
     ///
-    /// `explicit_fee_micro_eld = Some(fee)` applies that exact fee and rejects
+    /// `explicit_fee_micro_jtm = Some(fee)` applies that exact fee and rejects
     /// it if below the deterministic minimum for the resulting I/O. `None`
     /// computes the automatic relay fee from the actual input/output counts.
     fn plan_send(
         &self,
-        amount_micro_eld: u64,
-        explicit_fee_micro_eld: Option<u64>,
+        amount_micro_jtm: u64,
+        explicit_fee_micro_jtm: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
         relay_floor: u64,
@@ -181,16 +181,16 @@ pub trait WalletOps: Send + Sync {
     ///
     /// # Parameters
     /// - `to_address`: recipient 32-byte address
-    /// - `amount_micro_eld`: payment amount in μELD
-    /// - `fee_micro_eld`: transaction fee in μELD
+    /// - `amount_micro_jtm`: payment amount in μJTM
+    /// - `fee_micro_jtm`: transaction fee in μJTM
     /// - `epoch_anchor`: exact transaction-epoch anchor for the next block
     /// - `slot_hints`: one or two empty slot indices for outputs
     /// - `log_slots`: current chain `log_slots` (from `tip_header().log_slots`)
     fn build_send(
         &self,
         to_address: [u8; 32],
-        amount_micro_eld: u64,
-        fee_micro_eld: u64,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
@@ -216,8 +216,8 @@ pub trait WalletOps: Send + Sync {
     fn build_consolidation(
         &self,
         selected_input_slots: Vec<u32>,
-        output_value_micro_eld: u64,
-        fee_micro_eld: u64,
+        output_value_micro_jtm: u64,
+        fee_micro_jtm: u64,
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
@@ -236,7 +236,7 @@ pub trait WalletOps: Send + Sync {
         txid: [u8; 32],
         input_slots: &[u32],
         output_slots: &[u32],
-        amount_micro_eld: u64,
+        amount_micro_jtm: u64,
         peer_address: [u8; 32],
     ) -> Result<(), String>;
 

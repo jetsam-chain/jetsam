@@ -42,7 +42,7 @@
 use crate::consensus::fees::claimable_fee_for_tx_body;
 use crate::consensus::params::{
     BASE_REWARD_MICRO, EMISSION_END_HEIGHT, HALVING_COUNT, HALVING_INTERVAL, H1_HEIGHT, H2_HEIGHT,
-    MICROELIDE_PER_ELD,
+    MICRO_PER_JTM,
 };
 use jetsam_tx::types::TxBody;
 
@@ -70,7 +70,7 @@ pub const fn halvings_at(height: u64) -> u32 {
     }
 }
 
-/// Block reward in μELD at `height`. This IS what a block may mint: the
+/// Block reward in μJTM at `height`. This IS what a block may mint: the
 /// schedule sums to exactly [`crate::consensus::params::MAX_SUPPLY_MICRO`]
 /// over the coinbase-carrying heights (h ≥ 1), because the final tier ends at
 /// [`EMISSION_END_HEIGHT`] rather than the naive seventh boundary.
@@ -95,7 +95,7 @@ pub const fn block_reward(height: u64) -> u64 {
     BASE_REWARD_MICRO >> halvings
 }
 
-/// Sum all gross transaction fees (non-coinbase) in μELD.
+/// Sum all gross transaction fees (non-coinbase) in μJTM.
 ///
 /// A block can contain 255 `u64` fees, so aggregation uses `u128`; consensus
 /// predicates never silently saturate a monetary total. This is accounting
@@ -108,7 +108,7 @@ pub fn total_fees(txs: &[TxBody]) -> u128 {
         .sum()
 }
 
-/// Maximum value the coinbase output is permitted to carry (μELD).
+/// Maximum value the coinbase output is permitted to carry (μJTM).
 ///
 /// Only miner-claimable fees are included. The deterministic state-growth
 /// component is burned and can never be recovered through coinbase.
@@ -150,10 +150,10 @@ pub fn max_coinbase_value_from_claimable_fee_sum(
     )) + claimable_fee_sum
 }
 
-/// Format a μELD amount as a human-readable string (not consensus-critical).
-pub fn format_eld(micro_eld: u64) -> String {
-    let whole = micro_eld / MICROELIDE_PER_ELD;
-    let frac = micro_eld % MICROELIDE_PER_ELD;
+/// Format a μJTM amount as a human-readable string (not consensus-critical).
+pub fn format_eld(micro_jtm: u64) -> String {
+    let whole = micro_jtm / MICRO_PER_JTM;
+    let frac = micro_jtm % MICRO_PER_JTM;
     format!("{}.{:06} ELD", whole, frac)
 }
 

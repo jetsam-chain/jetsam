@@ -50,12 +50,12 @@ pub struct ChainState {
     /// live output stores `creation_id = alloc_counter + 1`; the updated value
     /// also seeds deterministic wallet slot hints.
     pub alloc_counter: u64,
-    /// Exact sum of every live UTXO amount in μELD.
+    /// Exact sum of every live UTXO amount in μJTM.
     ///
     /// This is derived local metadata, not a header or proof input. Snapshot
     /// installation accumulates it while already streaming authenticated
     /// slots; normal transitions update it from their bounded touched set.
-    pub circulating_supply_micro_eld: u128,
+    pub circulating_supply_micro_jtm: u128,
     /// Compact exact-root hierarchy: one 32-byte root per 2^16-slot segment
     /// plus its upper binary tree.  Raw columns remain an MDBX-backed cache;
     /// exact root updates therefore need only the segments touched by a block.
@@ -390,7 +390,7 @@ impl ChainState {
             utxo_root,
             active_slot_count: 0,
             alloc_counter: 0,
-            circulating_supply_micro_eld: 0,
+            circulating_supply_micro_jtm: 0,
             exact_roots: ExactSegmentRootCache::empty(log_slots),
         }
     }
@@ -402,7 +402,7 @@ impl ChainState {
             utxo_root: self.utxo_root,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
-            circulating_supply_micro_eld: self.circulating_supply_micro_eld,
+            circulating_supply_micro_jtm: self.circulating_supply_micro_jtm,
             exact_roots: self.exact_roots.clone(),
         })
     }
@@ -413,14 +413,14 @@ impl ChainState {
         active_slot_count: u64,
         alloc_counter: u64,
     ) -> Result<Self, ExactStateReadError> {
-        let circulating_supply_micro_eld = Self::loaded_circulating_supply(&state)?;
+        let circulating_supply_micro_jtm = Self::loaded_circulating_supply(&state)?;
         let exact_roots = ExactSegmentRootCache::empty(state.log_slots());
         let mut out = Self {
             utxo_root: zero_slot_roots(state.log_slots())[state.log_slots()],
             state,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             exact_roots,
         };
         out.rebuild_exact_utxo_root_loaded()?;
@@ -434,7 +434,7 @@ impl ChainState {
         state: SegmentedFriState,
         active_slot_count: u64,
         alloc_counter: u64,
-        circulating_supply_micro_eld: u128,
+        circulating_supply_micro_jtm: u128,
         expected_root: StateHash,
         exact_segment_roots: &[(u16, StateHash)],
     ) -> Result<Self, ExactStateReadError> {
@@ -453,7 +453,7 @@ impl ChainState {
             utxo_root: expected_root,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             exact_roots,
         })
     }
@@ -506,7 +506,7 @@ impl ChainState {
         // it cannot be reconstructed from the live sparse set. Callers must
         // supply the trusted header/checkpoint counter explicitly.
         state.alloc_counter = alloc_counter;
-        state.circulating_supply_micro_eld = slots
+        state.circulating_supply_micro_jtm = slots
             .iter()
             .map(|(_, slot)| u128::from(slot.amount()))
             .sum();
@@ -550,7 +550,7 @@ impl ChainState {
             canonical.insert(slot_index, value);
         }
 
-        let mut supply = self.circulating_supply_micro_eld;
+        let mut supply = self.circulating_supply_micro_jtm;
         let current_slots = self.state.num_slots();
         let effective_log = self.state.effective_log_segment_size();
         for (slot_index, value) in canonical {
@@ -885,7 +885,7 @@ impl ChainState {
         if computed_child != child_state_root {
             return Err(ApplyExactTransitionError::CachedRootMismatch);
         }
-        let circulating_supply_micro_eld = self
+        let circulating_supply_micro_jtm = self
             .supply_after_slot_updates(slot_updates)
             .ok_or(ApplyExactTransitionError::CirculatingSupplyInvariant)?;
         if log_slots as usize == current_log_slots + 1 {
@@ -905,7 +905,7 @@ impl ChainState {
         debug_assert_eq!(applied_root, computed_child);
         self.active_slot_count = active_slot_count;
         self.alloc_counter = alloc_counter;
-        self.circulating_supply_micro_eld = circulating_supply_micro_eld;
+        self.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
         Ok(applied_root)
     }
 }
@@ -1128,7 +1128,7 @@ pub(crate) fn apply_tx_checked_deferred_root(
         ));
     }
 
-    let circulating_supply_micro_eld = state
+    let circulating_supply_micro_jtm = state
         .supply_after_slot_updates(&deltas)
         .ok_or(ApplyError::CirculatingSupplyInvariant)?;
     state
@@ -1137,7 +1137,7 @@ pub(crate) fn apply_tx_checked_deferred_root(
         .expect("all transaction delta indices were preflighted");
     state.active_slot_count = active_after;
     state.alloc_counter = final_alloc_counter;
-    state.circulating_supply_micro_eld = circulating_supply_micro_eld;
+    state.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
     Ok(())
 }
 
@@ -1158,7 +1158,7 @@ mod tests {
             .unwrap();
         state.active_slot_count = 1;
         state.alloc_counter = 7;
-        state.circulating_supply_micro_eld = 11;
+        state.circulating_supply_micro_jtm = 11;
         state
     }
 
@@ -1195,20 +1195,20 @@ mod tests {
         assert_eq!(state.state.slot(2).creation_id(), 8);
         assert_eq!(state.active_slot_count, 1);
         assert_eq!(state.alloc_counter, 8);
-        assert_eq!(state.circulating_supply_micro_eld, 10);
+        assert_eq!(state.circulating_supply_micro_jtm, 10);
     }
 
     #[test]
     fn wrong_owner_and_occupied_output_fail_atomically() {
         let mut state = funded();
         let root = state.state_root();
-        let supply = state.circulating_supply_micro_eld;
+        let supply = state.circulating_supply_micro_jtm;
         assert_eq!(
             apply_tx(&mut state, &body(Address([9u8; 32]), 1, 2)),
             Err(ApplyError::UnknownOrSpentInput)
         );
         assert_eq!(state.state_root(), root);
-        assert_eq!(state.circulating_supply_micro_eld, supply);
+        assert_eq!(state.circulating_supply_micro_jtm, supply);
 
         let overlap = body(Address([1u8; 32]), 1, 1);
         assert_eq!(
@@ -1256,7 +1256,7 @@ mod tests {
         assert!(is_coinbase_creation_id(minted.creation_id()));
         assert_eq!(state.alloc_counter, 1);
         assert_eq!(state.active_slot_count, 1);
-        assert_eq!(state.circulating_supply_micro_eld, 50);
+        assert_eq!(state.circulating_supply_micro_jtm, 50);
 
         // ABA: a spend binds the EXACT tagged creation id. The untagged
         // allocator id the coinbase burned does not match the stored slot.
@@ -1294,7 +1294,7 @@ mod tests {
         apply_tx(&mut state, &spend(coinbase_creation_id(42))).unwrap();
         // The user mint after the coinbase continues the untagged namespace.
         assert_eq!(state.state.slot(6).creation_id(), 2);
-        assert_eq!(state.circulating_supply_micro_eld, 49);
+        assert_eq!(state.circulating_supply_micro_jtm, 49);
     }
 
     #[test]
@@ -1348,7 +1348,7 @@ mod tests {
         assert!(!is_coinbase_creation_id(state.state.slot(6).creation_id()));
         assert_eq!(state.alloc_counter, 3);
         assert_eq!(state.active_slot_count, 3);
-        assert_eq!(state.circulating_supply_micro_eld, 65);
+        assert_eq!(state.circulating_supply_micro_jtm, 65);
     }
 
     #[test]
@@ -1443,7 +1443,7 @@ mod tests {
             utxo_root: old_root,
             active_slot_count: 0,
             alloc_counter: 0,
-            circulating_supply_micro_eld: 0,
+            circulating_supply_micro_jtm: 0,
             exact_roots: ExactSegmentRootCache::empty(log_slots),
         };
 
@@ -1572,7 +1572,7 @@ mod tests {
             .apply_verified_exact_transition(4, child_root, &updates, 1, 2)
             .unwrap();
 
-        assert_eq!(state.circulating_supply_micro_eld, 8);
+        assert_eq!(state.circulating_supply_micro_jtm, 8);
         assert_eq!(state.cached_state_root(), child_root);
     }
 }

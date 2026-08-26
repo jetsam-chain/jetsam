@@ -139,7 +139,7 @@ pub fn revert_block(
     state: &mut ChainState,
     undo: &BlockUndoLog,
 ) -> Result<(), crate::state::ApplyError> {
-    let circulating_supply_micro_eld = state
+    let circulating_supply_micro_jtm = state
         .supply_after_slot_updates(&undo.slot_changes)
         .ok_or(crate::state::ApplyError::CirculatingSupplyInvariant)?;
     // Undo entries are unique by construction. Restore them as one unrooted
@@ -159,7 +159,7 @@ pub fn revert_block(
         .state
         .apply_delta_unrooted(&restored_slots)
         .map_err(|_| crate::state::ApplyError::SlotOutOfRange)?;
-    state.circulating_supply_micro_eld = circulating_supply_micro_eld;
+    state.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
     Ok(())
 }
 
@@ -266,7 +266,7 @@ mod tests {
         crate::block::apply_block(&mut state, &orphaned).unwrap();
         assert_eq!(state.active_slot_count, 3);
         assert_eq!(state.alloc_counter, 3);
-        assert!(state.circulating_supply_micro_eld > 0);
+        assert!(state.circulating_supply_micro_jtm > 0);
 
         revert_block(&mut state, &undo).unwrap();
         state.active_slot_count = undo.active_slot_count_before;
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(state.state_root(), parent_root);
         assert_eq!(state.active_slot_count, 0);
         assert_eq!(state.alloc_counter, 0);
-        assert_eq!(state.circulating_supply_micro_eld, 0);
+        assert_eq!(state.circulating_supply_micro_jtm, 0);
 
         let replacement = build(&state, Address([3u8; 32]), 3);
         crate::block::apply_block(&mut state, &replacement).unwrap();

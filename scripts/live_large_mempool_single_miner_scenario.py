@@ -278,7 +278,7 @@ def main():
                 {
                     "round": round_index,
                     "submitted": count,
-                    "amount_micro_eld": amount,
+                    "amount_micro_jtm": amount,
                     "submission_s": round(submit_seconds, 3),
                     "confirmation_heights": confirmation_heights,
                     "drained_tip": drained,
@@ -427,7 +427,7 @@ def main():
                 "drain_samples": samples,
                 "confirmation_distribution": distribution,
                 "mining_blocks": mined_blocks,
-                "fee_counts": dict(Counter(send["fee_micro_eld"] for send in spam_sends)),
+                "fee_counts": dict(Counter(send["fee_micro_jtm"] for send in spam_sends)),
             }
         )
         print(f"[PASS] one B25 miner drained {SPAM_COUNT} TXs as {distribution}", flush=True)

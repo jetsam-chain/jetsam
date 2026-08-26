@@ -31,7 +31,7 @@ pub struct TxSummary {
     pub logical_txid: [u8; 32],
     pub inputs: Vec<(u32, Address)>,
     pub outputs: Vec<(u32, u64, Address)>,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub confirmed_height: u64,
     pub confirmed_unix: u64,
 }
@@ -138,7 +138,7 @@ pub fn summary_from_pages(
                     .map(|(_, output)| (output.slot_index, output.amount, output.owner))
             })
             .collect(),
-        fee_micro_eld: facts.fee,
+        fee_micro_jtm: facts.fee,
         confirmed_height,
         confirmed_unix,
     }

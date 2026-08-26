@@ -586,7 +586,7 @@ fn block_details<'a>(
                 "REWARD",
                 format!(
                     "{} ①",
-                    crate::model::format_micro_eld(retained.reward_micro_eld)
+                    crate::model::format_micro_jtm(retained.reward_micro_jtm)
                 ),
                 theme::ACCENT,
             ),
@@ -596,7 +596,7 @@ fn block_details<'a>(
             detail("BLOCK", format_bytes(retained.block_bytes)),
             detail("HISTORYSTEP", format_bytes(retained.history_step_bytes)),
             detail("BUNDLE", format_bytes(retained.bundle_bytes)),
-            detail("FEES", format!("{} μELD", retained.total_fees_micro_eld)),
+            detail("FEES", format!("{} μJTM", retained.total_fees_micro_jtm)),
         ]
         .spacing(18);
         let tx_header = container(
@@ -607,7 +607,7 @@ fn block_details<'a>(
                 table_cell("PAGES".into(), 2, theme::INK),
                 table_cell("IN".into(), 2, theme::INK),
                 table_cell("OUT".into(), 2, theme::INK),
-                table_cell("FEE / μELD".into(), 4, theme::INK),
+                table_cell("FEE / μJTM".into(), 4, theme::INK),
                 text("OPEN")
                     .size(13)
                     .color(theme::INK)
@@ -644,7 +644,7 @@ fn block_details<'a>(
                         table_cell(transaction.page_count.to_string(), 2, theme::TEXT),
                         table_cell(transaction.live_inputs.to_string(), 2, theme::TEXT),
                         table_cell(transaction.live_outputs.to_string(), 2, theme::TEXT),
-                        table_cell(transaction.fee_micro_eld.to_string(), 4, theme::WARNING),
+                        table_cell(transaction.fee_micro_jtm.to_string(), 4, theme::WARNING),
                         text("VIEW")
                             .size(12)
                             .color(theme::CYAN)
@@ -822,9 +822,9 @@ fn transaction_details<'a>(
             "FEE",
             format!(
                 "{} ①",
-                crate::model::format_micro_eld(transaction.fee_micro_eld)
+                crate::model::format_micro_jtm(transaction.fee_micro_jtm)
             ),
-            if transaction.fee_micro_eld == 0 {
+            if transaction.fee_micro_jtm == 0 {
                 theme::DIM
             } else {
                 theme::WARNING
@@ -846,7 +846,7 @@ fn transaction_details<'a>(
             text("BLOCK REWARD").size(12).color(theme::DIM),
             text(format!(
                 "{} ① paid to the block miner. Coinbase has no spend inputs.",
-                format_microjetsam_string(&transaction.output_sum_micro_eld)
+                format_microjetsam_string(&transaction.output_sum_micro_jtm)
             ))
             .size(13)
             .color(theme::ACCENT),
@@ -865,21 +865,21 @@ fn transaction_details<'a>(
                     "INPUT TOTAL",
                     format!(
                         "{} ①",
-                        format_microjetsam_string(&transaction.input_sum_micro_eld)
+                        format_microjetsam_string(&transaction.input_sum_micro_jtm)
                     ),
                 ),
                 detail(
                     "OUTPUT TOTAL",
                     format!(
                         "{} ①",
-                        format_microjetsam_string(&transaction.output_sum_micro_eld)
+                        format_microjetsam_string(&transaction.output_sum_micro_jtm)
                     ),
                 ),
                 detail(
                     "FEE",
                     format!(
                         "{} ①",
-                        crate::model::format_micro_eld(transaction.fee_micro_eld)
+                        crate::model::format_micro_jtm(transaction.fee_micro_jtm)
                     ),
                 ),
             ]
@@ -991,7 +991,7 @@ fn transaction_inputs(
                     table_cell(input.slot_index.to_string(), 3, theme::TEXT),
                     table_cell(format_creation_origin(input.creation_id), 4, theme::MUTED),
                     table_cell(
-                        crate::model::format_micro_eld(input.amount_micro_eld),
+                        crate::model::format_micro_jtm(input.amount_micro_jtm),
                         5,
                         theme::TEXT,
                     ),
@@ -1041,7 +1041,7 @@ fn transaction_outputs<'a>(
                         iced::widget::Space::new().width(Length::Fill),
                         text(format!(
                             "{} ①{}",
-                            crate::model::format_micro_eld(output.amount_micro_eld),
+                            crate::model::format_micro_jtm(output.amount_micro_jtm),
                             if change { " · CHANGE" } else { "" }
                         ))
                         .size(13)

@@ -292,13 +292,13 @@ pub(crate) fn apply_state_delta(
     // Keep the exact old operation order, but avoid `set_slot()` because it
     // recomputes the FRI/Merkle root after every individual slot update.
     let mut deltas = Vec::new();
-    let mut circulating_supply_micro_eld = snap.circulating_supply_micro_eld;
+    let mut circulating_supply_micro_jtm = snap.circulating_supply_micro_jtm;
     for tx in &block.transactions {
         for (_, inp) in tx.body.live_inputs() {
             // The exact state certificate established that this slot matched the claim.
             // Just zero it out; no read needed.
             deltas.push((inp.slot_index, SlotValue::EMPTY));
-            circulating_supply_micro_eld = circulating_supply_micro_eld
+            circulating_supply_micro_jtm = circulating_supply_micro_jtm
                 .checked_sub(u128::from(inp.amount))
                 .ok_or(BlockApplyError::Tx(
                     crate::state::ApplyError::CirculatingSupplyInvariant,
@@ -336,7 +336,7 @@ pub(crate) fn apply_state_delta(
                     ))?;
             let sv = SlotValue::with_owner_fields(out.amount, creation_id, out.owner.as_fields());
             deltas.push((out.slot_index, sv));
-            circulating_supply_micro_eld = circulating_supply_micro_eld
+            circulating_supply_micro_jtm = circulating_supply_micro_jtm
                 .checked_add(u128::from(out.amount))
                 .ok_or(BlockApplyError::Tx(
                     crate::state::ApplyError::CirculatingSupplyInvariant,
@@ -348,7 +348,7 @@ pub(crate) fn apply_state_delta(
     snap.state
         .apply_delta_unrooted(&deltas)
         .map_err(|_| BlockApplyError::Tx(crate::state::ApplyError::SlotOutOfRange))?;
-    snap.circulating_supply_micro_eld = circulating_supply_micro_eld;
+    snap.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
 
     // 3. Check counters (these are cheap, O(n_outputs) above).
     if block.header.active_slot_count != snap.active_slot_count {
@@ -760,7 +760,7 @@ mod tests {
             .unwrap();
         state.active_slot_count = 1;
         state.alloc_counter = 1;
-        state.circulating_supply_micro_eld = 11;
+        state.circulating_supply_micro_jtm = 11;
         state
     }
 

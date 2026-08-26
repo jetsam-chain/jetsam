@@ -35,7 +35,7 @@ BASE = Path(
     )
 )
 BASE_PORT = int(os.environ.get("JETSAM_LIVE_RECEIPT_BASE_PORT", "22900"))
-PAYMENT_MICRO_ELD = int(os.environ.get("JETSAM_LIVE_RECEIPT_PAYMENT", "1000000"))
+PAYMENT_MICRO_JTM = int(os.environ.get("JETSAM_LIVE_RECEIPT_PAYMENT", "1000000"))
 FUNDING_HEIGHT = int(os.environ.get("JETSAM_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
 # Full bodies remain serveable beyond the 18-block authenticated suffix so a
 # peer can recover a moving non-final branch.  Receipt independence must be
@@ -152,13 +152,13 @@ def assert_verified(result, txid, height, sender, recipient, amount, fee, label)
     require(summary is not None, f"{label}: authenticated summary missing")
     require(summary["txid"] == txid, f"{label}: wrong txid: {summary}")
     require(int(summary["claimed_height"]) == height, f"{label}: wrong height: {summary}")
-    require(int(summary["fee_micro_eld"]) == fee, f"{label}: wrong fee: {summary}")
+    require(int(summary["fee_micro_jtm"]) == fee, f"{label}: wrong fee: {summary}")
     require(len(summary["inputs"]) == 1, f"{label}: wrong input count: {summary}")
     require(summary["inputs"][0]["owner"] == sender, f"{label}: wrong input owner")
     recipient_outputs = [
         output
         for output in summary["outputs"]
-        if output["owner"] == recipient and int(output["amount_micro_eld"]) == amount
+        if output["owner"] == recipient and int(output["amount_micro_jtm"]) == amount
     ]
     require(len(recipient_outputs) == 1, f"{label}: payment output missing: {summary}")
     require(
@@ -215,7 +215,7 @@ def main():
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
         "cli_sha256": live.sha256(CLI_BIN),
-        "payment_micro_eld": PAYMENT_MICRO_ELD,
+        "payment_micro_jtm": PAYMENT_MICRO_JTM,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -254,7 +254,7 @@ def main():
         sent = rpc(
             sender_node.rpc_port,
             "walletSend",
-            [recipient_info["address"], PAYMENT_MICRO_ELD, 0],
+            [recipient_info["address"], PAYMENT_MICRO_JTM, 0],
             timeout=300,
         )
         txid = sent["txid"]
@@ -272,8 +272,8 @@ def main():
             tx_height,
             sender_info["address"],
             recipient_info["address"],
-            PAYMENT_MICRO_ELD,
-            int(sent["fee_micro_eld"]),
+            PAYMENT_MICRO_JTM,
+            int(sent["fee_micro_jtm"]),
             "sender verification",
         )
         assert_verified(
@@ -282,8 +282,8 @@ def main():
             tx_height,
             sender_info["address"],
             recipient_info["address"],
-            PAYMENT_MICRO_ELD,
-            int(sent["fee_micro_eld"]),
+            PAYMENT_MICRO_JTM,
+            int(sent["fee_micro_jtm"]),
             "independent verification",
         )
 
@@ -347,8 +347,8 @@ def main():
             tx_height,
             sender_info["address"],
             recipient_info["address"],
-            PAYMENT_MICRO_ELD,
-            int(sent["fee_micro_eld"]),
+            PAYMENT_MICRO_JTM,
+            int(sent["fee_micro_jtm"]),
             "post-restart verification",
         )
 
@@ -375,8 +375,8 @@ def main():
             tx_height,
             sender_info["address"],
             recipient_info["address"],
-            PAYMENT_MICRO_ELD,
-            int(sent["fee_micro_eld"]),
+            PAYMENT_MICRO_JTM,
+            int(sent["fee_micro_jtm"]),
             "post-prune independent verification",
         )
 
@@ -394,8 +394,8 @@ def main():
             tx_height,
             sender_info["address"],
             recipient_info["address"],
-            PAYMENT_MICRO_ELD,
-            int(sent["fee_micro_eld"]),
+            PAYMENT_MICRO_JTM,
+            int(sent["fee_micro_jtm"]),
             "post-prune restart verification",
         )
         require(

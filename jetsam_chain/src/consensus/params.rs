@@ -281,11 +281,11 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // Emission
 // ---------------------------------------------------------------------------
 
-/// Precision: 1 ELD = 1_000_000 μELD.
-pub const MICROELIDE_PER_ELD: u64 = 1_000_000;
+/// Precision: 1 ELD = 1_000_000 μJTM.
+pub const MICRO_PER_JTM: u64 = 1_000_000;
 
 /// Starting block reward: 50 ELD.
-pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_ELD;
+pub const BASE_REWARD_MICRO: u64 = 50 * MICRO_PER_JTM;
 
 // ---------------------------------------------------------------------------
 // ELIDE CHANGE — height-based halving under a hard cap
@@ -295,7 +295,7 @@ pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_ELD;
 // floored the reward at 1 ELD forever. That floor is why upstream has no
 // maximum supply: on a network that never reaches ~12.6M occupied slots the
 // halving never fires at all, so emission stays at 50/block indefinitely —
-// about 78.8M per year, unbounded. `FLOOR_REWARD_MICRO_ELD` is deliberately
+// about 78.8M per year, unbounded. `FLOOR_REWARD_MICRO_JTM` is deliberately
 // removed; emission reaches exactly zero.
 //
 // Schedule at BLOCK_TIME = 90 s (28 800 blocks/month):
@@ -315,9 +315,9 @@ pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_ELD;
 // the schedule sums to the cap BY HEIGHT and consensus needs no cumulative
 // issuance counter. See `emission::total_emission_is_exactly_the_cap`.
 
-/// Hard cap on total issuance, in μELD. Enforced in consensus through
+/// Hard cap on total issuance, in μJTM. Enforced in consensus through
 /// [`EMISSION_END_HEIGHT`]: the height schedule alone sums to exactly this cap.
-pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICROELIDE_PER_ELD as u128;
+pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICRO_PER_JTM as u128;
 
 /// First halving: one month after genesis.
 pub const H1_HEIGHT: u64 = 28_800;
@@ -428,7 +428,7 @@ pub const fn creation_id_within_boundary(
 // Fee policy
 // ---------------------------------------------------------------------------
 
-/// Base minimum fee in μELD per non-coinbase transaction.
+/// Base minimum fee in μJTM per non-coinbase transaction.
 pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 ELD
 
 /// Small anti-DoS fee charged per live input verified by a transaction.
@@ -442,7 +442,7 @@ pub const FEE_PER_INPUT: u64 = 100; // 0.0001 ELD per input
 ///
 /// Outputs are the main user-visible driver of fee because they create UTXOs and
 /// may increase state pressure. The 1-input/2-output low-pressure send remains
-/// at the historical 9_000 μELD baseline together with state-growth burn.
+/// at the historical 9_000 μJTM baseline together with state-growth burn.
 pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 ELD per output
 
 /// Base fee charged per net-new live UTXO slot at low occupancy.

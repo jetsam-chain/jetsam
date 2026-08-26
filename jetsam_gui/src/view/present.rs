@@ -11,8 +11,8 @@ use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
-    format_compact_count, format_compact_difficulty, format_compact_micro_eld,
-    format_creation_origin, format_hashrate, format_micro_eld, format_microjetsam_trimmed,
+    format_compact_count, format_compact_difficulty, format_compact_micro_jtm,
+    format_creation_origin, format_hashrate, format_micro_jtm, format_microjetsam_trimmed,
     AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
@@ -190,7 +190,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
             "CIRC SUPPLY",
             format!(
                 "{} ELD",
-                format_compact_micro_eld(network.circulating_supply_micro_eld)
+                format_compact_micro_jtm(network.circulating_supply_micro_jtm)
             ),
             theme::ACCENT,
         ),
@@ -198,7 +198,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
             "BLOCK REWARD",
             format!(
                 "{} ELD",
-                format_microjetsam_trimmed(network.block_reward_micro_eld)
+                format_microjetsam_trimmed(network.block_reward_micro_jtm)
             ),
             theme::ACCENT,
         ),
@@ -519,7 +519,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
         amount_stat(
             "PENDING",
             address.pending_outbound(),
-            if address.pending_outbound_micro_eld == 0 {
+            if address.pending_outbound_micro_jtm == 0 {
                 theme::DIM
             } else {
                 theme::WARNING
@@ -531,7 +531,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
         amount_stat(
             "INCOMING",
             address.incoming(),
-            if address.incoming_micro_eld == 0 {
+            if address.incoming_micro_jtm == 0 {
                 theme::DIM
             } else {
                 theme::ACCENT
@@ -1002,7 +1002,7 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
             .iter()
             .filter(|utxo| utxo.segment == segment)
             .fold((0usize, 0u64), |(count, total), utxo| {
-                (count + 1, total.saturating_add(utxo.value_micro_eld))
+                (count + 1, total.saturating_add(utxo.value_micro_jtm))
             });
         let live_count = state.map(|state| state.live_count).unwrap_or(0);
         let capacity = state.map(|state| state.capacity).unwrap_or(0);
@@ -1019,7 +1019,7 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
             row![
                 state_detail("NETWORK", format!("{live_count}/{capacity}"), theme::CYAN),
                 state_detail("MINE", mine_count.to_string(), theme::PROOF),
-                state_detail("VALUE", format_micro_eld(mine_value), theme::ACCENT),
+                state_detail("VALUE", format_micro_jtm(mine_value), theme::ACCENT),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -1618,18 +1618,18 @@ fn consolidation_confirmation<'a>(
                 "{} smallest of {} · {} ELD",
                 plan.input_count,
                 original_count,
-                format_micro_eld(plan.input_value_micro_eld)
+                format_micro_jtm(plan.input_value_micro_jtm)
             ),
             compact,
         ),
         form_line(
             "NETWORK FEE",
-            format!("{} ELD", format_micro_eld(plan.fee_micro_eld)),
+            format!("{} ELD", format_micro_jtm(plan.fee_micro_jtm)),
             compact,
         ),
         form_line(
             "NEW OUTPUT",
-            format!("1 · {} ELD", format_micro_eld(plan.output_value_micro_eld)),
+            format!("1 · {} ELD", format_micro_jtm(plan.output_value_micro_jtm)),
             compact,
         ),
         form_line(
@@ -1644,7 +1644,7 @@ fn consolidation_confirmation<'a>(
             column![
                 text("TOTAL BALANCE").size(12).color(theme::DIM),
                 row![
-                    text(format_micro_eld(plan.balance_before_micro_eld))
+                    text(format_micro_jtm(plan.balance_before_micro_jtm))
                         .size(16)
                         .color(theme::TEXT),
                     text("①")
@@ -1653,7 +1653,7 @@ fn consolidation_confirmation<'a>(
                         .font(theme::SYMBOL_FONT)
                         .color(theme::ACCENT),
                     text("→").size(14).color(theme::DIM),
-                    text(format_micro_eld(plan.balance_after_micro_eld))
+                    text(format_micro_jtm(plan.balance_after_micro_jtm))
                         .size(16)
                         .color(theme::TEXT),
                     text("①")
@@ -1727,7 +1727,7 @@ fn consolidation_success<'a>(
         send_result_metric("OUTPUTS", result.output_count.to_string()),
         send_result_metric(
             "FEE",
-            format!("{} ①", format_micro_eld(result.fee_micro_eld)),
+            format!("{} ①", format_micro_jtm(result.fee_micro_jtm)),
         ),
         send_result_metric("FREED", result.freed_slots.to_string()),
     ]
@@ -1750,14 +1750,14 @@ fn consolidation_success<'a>(
         metrics,
         form_line(
             "NEW OUTPUT",
-            format!("{} ELD", format_micro_eld(result.output_value_micro_eld)),
+            format!("{} ELD", format_micro_jtm(result.output_value_micro_jtm)),
             compact,
         ),
         form_line(
             "INPUT VALUE",
             format!(
                 "{} ELD selected",
-                format_micro_eld(result.input_value_micro_eld),
+                format_micro_jtm(result.input_value_micro_jtm),
             ),
             compact,
         ),
@@ -1773,8 +1773,8 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
     }
     let address = app.snapshot.active_address();
     let spendable = address
-        .balance_micro_eld
-        .saturating_sub(address.pending_outbound_micro_eld);
+        .balance_micro_jtm
+        .saturating_sub(address.pending_outbound_micro_jtm);
     let recipient = send_input_line(
         "RECIPIENT",
         "Paste an o1 address",
@@ -1885,7 +1885,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
                 "[{}] {} · {} ① spendable",
                 address.key_index,
                 address_label(&address.label),
-                format_micro_eld(spendable)
+                format_micro_jtm(spendable)
             ),
             compact,
         ),
@@ -1948,11 +1948,11 @@ fn send_success<'a>(
     let metrics = row![
         send_result_metric(
             "AMOUNT",
-            format!("{} ①", format_micro_eld(result.amount_micro_eld)),
+            format!("{} ①", format_micro_jtm(result.amount_micro_jtm)),
         ),
         send_result_metric(
             "FEE",
-            format!("{} ①", format_micro_eld(result.fee_micro_eld)),
+            format!("{} ①", format_micro_jtm(result.fee_micro_jtm)),
         ),
         send_result_metric("INPUTS", result.input_count.to_string()),
         send_result_metric("OUTPUTS", result.output_count.to_string()),

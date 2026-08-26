@@ -39,14 +39,14 @@ impl PendingAdmissionGuard {
         txid: [u8; 32],
         input_slots: Vec<u32>,
         output_slots: Vec<u32>,
-        amount_micro_eld: u64,
+        amount_micro_jtm: u64,
         peer_address: [u8; 32],
     ) -> Result<Self, String> {
         wallet.reserve_pending_submission(
             txid,
             &input_slots,
             &output_slots,
-            amount_micro_eld,
+            amount_micro_jtm,
             peer_address,
         )?;
         Ok(Self::armed(move || {

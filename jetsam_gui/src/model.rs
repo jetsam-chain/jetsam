@@ -181,8 +181,8 @@ pub struct NetworkSnapshot {
     pub cpu_load: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
-    pub circulating_supply_micro_eld: u128,
-    pub block_reward_micro_eld: u64,
+    pub circulating_supply_micro_jtm: u128,
+    pub block_reward_micro_jtm: u64,
     pub network_hashrate_hps: Option<f64>,
     pub average_block_time_ms: u64,
     pub difficulty: f64,
@@ -206,24 +206,24 @@ pub struct AddressSnapshot {
     pub key_index: u32,
     pub address: String,
     pub label: String,
-    pub balance_micro_eld: u64,
+    pub balance_micro_jtm: u64,
     pub utxo_count: usize,
     pub reserved_utxo_count: usize,
-    pub pending_outbound_micro_eld: u64,
-    pub incoming_micro_eld: u64,
+    pub pending_outbound_micro_jtm: u64,
+    pub incoming_micro_jtm: u64,
 }
 
 impl AddressSnapshot {
     pub fn balance(&self) -> String {
-        format_micro_eld(self.balance_micro_eld)
+        format_micro_jtm(self.balance_micro_jtm)
     }
 
     pub fn pending_outbound(&self) -> String {
-        format_micro_eld(self.pending_outbound_micro_eld)
+        format_micro_jtm(self.pending_outbound_micro_jtm)
     }
 
     pub fn incoming(&self) -> String {
-        format_micro_eld(self.incoming_micro_eld)
+        format_micro_jtm(self.incoming_micro_jtm)
     }
 
     pub fn spendable_utxo_count(&self) -> usize {
@@ -254,7 +254,7 @@ pub struct SegmentSnapshot {
 #[derive(Debug, Clone)]
 pub struct UtxoSnapshot {
     pub slot_index: u32,
-    pub value_micro_eld: u64,
+    pub value_micro_jtm: u64,
     pub creation_id: u64,
     pub segment: u8,
     pub reserved: bool,
@@ -262,7 +262,7 @@ pub struct UtxoSnapshot {
 
 impl UtxoSnapshot {
     pub fn value(&self) -> String {
-        format_micro_eld(self.value_micro_eld)
+        format_micro_jtm(self.value_micro_jtm)
     }
 }
 
@@ -307,8 +307,8 @@ pub struct ReceiptSnapshot {
     pub txid: String,
     pub height: u64,
     pub timestamp: u64,
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
     pub peer_address: Option<String>,
     pub own_address: Option<String>,
     pub own_key_index: Option<u32>,
@@ -339,7 +339,7 @@ pub struct ReceiptSummarySnapshot {
     pub confirmed_unix: u64,
     pub tx_index: u16,
     pub tx_count: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub inputs: Vec<ReceiptInputSnapshot>,
     pub outputs: Vec<ReceiptOutputSnapshot>,
 }
@@ -353,7 +353,7 @@ pub struct ReceiptInputSnapshot {
 #[derive(Debug, Clone)]
 pub struct ReceiptOutputSnapshot {
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub owner: String,
 }
 
@@ -373,7 +373,7 @@ pub struct MinedBlockSnapshot {
     pub height: u64,
     pub block_hash: String,
     pub timestamp: u64,
-    pub reward_micro_eld: u64,
+    pub reward_micro_jtm: u64,
     pub payout_key_index: u32,
     pub canonical: bool,
     pub confirmations: u64,
@@ -382,7 +382,7 @@ pub struct MinedBlockSnapshot {
 
 impl MinedBlockSnapshot {
     pub fn reward(&self) -> String {
-        format_micro_eld(self.reward_micro_eld)
+        format_micro_jtm(self.reward_micro_jtm)
     }
 
     pub fn short_hash(&self) -> String {
@@ -429,8 +429,8 @@ pub struct RetainedBlockSnapshot {
     pub user_pages: u16,
     pub live_inputs: u16,
     pub live_outputs: u16,
-    pub reward_micro_eld: u64,
-    pub total_fees_micro_eld: String,
+    pub reward_micro_jtm: u64,
+    pub total_fees_micro_jtm: String,
     pub block_bytes: u64,
     pub history_step_bytes: u64,
     pub bundle_bytes: u64,
@@ -444,13 +444,13 @@ pub struct BlockTransactionSnapshot {
     pub page_count: u16,
     pub live_inputs: u16,
     pub live_outputs: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub coinbase: bool,
     pub development_payout: bool,
     pub epoch_anchor: String,
     pub input_owner: Option<String>,
-    pub input_sum_micro_eld: String,
-    pub output_sum_micro_eld: String,
+    pub input_sum_micro_jtm: String,
+    pub output_sum_micro_jtm: String,
     pub page_hashes: Vec<String>,
     pub inputs: Vec<BlockTransactionInputSnapshot>,
     pub outputs: Vec<BlockTransactionOutputSnapshot>,
@@ -461,7 +461,7 @@ pub struct BlockTransactionInputSnapshot {
     pub page: u16,
     pub lane: u8,
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub creation_id: u64,
 }
 
@@ -470,7 +470,7 @@ pub struct BlockTransactionOutputSnapshot {
     pub page: u16,
     pub lane: u8,
     pub slot_index: u32,
-    pub amount_micro_eld: u64,
+    pub amount_micro_jtm: u64,
     pub owner: String,
     pub creation_id: u64,
 }
@@ -534,17 +534,17 @@ pub struct RecentTransactionSnapshot {
     pub txid: String,
     pub live_inputs: u16,
     pub live_outputs: u16,
-    pub fee_micro_eld: u64,
+    pub fee_micro_jtm: u64,
     pub coinbase: bool,
     pub development_payout: bool,
-    pub address_spent_micro_eld: Option<String>,
-    pub address_received_micro_eld: Option<String>,
+    pub address_spent_micro_jtm: Option<String>,
+    pub address_received_micro_jtm: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExplorerSlotSnapshot {
     pub slot_index: u32,
-    pub value_micro_eld: u64,
+    pub value_micro_jtm: u64,
     pub creation_id: u64,
     pub owner: String,
     pub empty: bool,
@@ -553,7 +553,7 @@ pub struct ExplorerSlotSnapshot {
 #[derive(Debug, Clone)]
 pub struct ExplorerAddressSnapshot {
     pub address: String,
-    pub balance_micro_eld: u128,
+    pub balance_micro_jtm: u128,
     pub slots: Vec<ExplorerSlotSnapshot>,
     pub recent_transactions: RecentTransactionsSnapshot,
 }
@@ -603,11 +603,11 @@ impl AppSnapshot {
                 key_index
             ),
             label: format!("Address {key_index}"),
-            balance_micro_eld: 0,
+            balance_micro_jtm: 0,
             utxo_count: 0,
             reserved_utxo_count: 0,
-            pending_outbound_micro_eld: 0,
-            incoming_micro_eld: 0,
+            pending_outbound_micro_jtm: 0,
+            incoming_micro_jtm: 0,
         });
     }
 
@@ -641,8 +641,8 @@ impl AppSnapshot {
                 cpu_load: 0.0,
                 memory_used_bytes: 0,
                 memory_total_bytes: 1,
-                circulating_supply_micro_eld: 0,
-                block_reward_micro_eld: 50_000_000,
+                circulating_supply_micro_jtm: 0,
+                block_reward_micro_jtm: 50_000_000,
                 network_hashrate_hps: None,
                 average_block_time_ms: 15_000,
                 difficulty: 1.0,
@@ -658,11 +658,11 @@ impl AppSnapshot {
                 key_index: 0,
                 address: "Local wallet is starting…".into(),
                 label: "Main".into(),
-                balance_micro_eld: 0,
+                balance_micro_jtm: 0,
                 utxo_count: 0,
                 reserved_utxo_count: 0,
-                pending_outbound_micro_eld: 0,
-                incoming_micro_eld: 0,
+                pending_outbound_micro_jtm: 0,
+                incoming_micro_jtm: 0,
             }],
             active_address: 0,
             segments: vec![
@@ -689,7 +689,7 @@ impl AppSnapshot {
     pub fn design_preview() -> Self {
         const PREVIEW_ADDRESS_COUNT: usize = 20;
         const PREVIEW_UTXO_COUNT: usize = 72;
-        const PREVIEW_BALANCE_MICRO_ELD: u64 = 100_000_000_000;
+        const PREVIEW_BALANCE_MICRO_JTM: u64 = 100_000_000_000;
 
         let segments = (0u32..256)
             .map(|index| {
@@ -715,13 +715,13 @@ impl AppSnapshot {
             .collect();
 
         let owned_segments = [28u8, 73, 119, 164, 213];
-        let base_value = PREVIEW_BALANCE_MICRO_ELD / PREVIEW_UTXO_COUNT as u64;
-        let remainder = PREVIEW_BALANCE_MICRO_ELD % PREVIEW_UTXO_COUNT as u64;
+        let base_value = PREVIEW_BALANCE_MICRO_JTM / PREVIEW_UTXO_COUNT as u64;
+        let remainder = PREVIEW_BALANCE_MICRO_JTM % PREVIEW_UTXO_COUNT as u64;
         let utxos = (0..PREVIEW_UTXO_COUNT)
             .rev()
             .map(|index| UtxoSnapshot {
                 slot_index: 73 + index as u32 * 73,
-                value_micro_eld: base_value + u64::from((index as u64) < remainder),
+                value_micro_jtm: base_value + u64::from((index as u64) < remainder),
                 creation_id: 1_284_088 + index as u64 * 3,
                 segment: owned_segments[index % owned_segments.len()],
                 reserved: false,
@@ -733,31 +733,31 @@ impl AppSnapshot {
                 key_index: 0,
                 address: "o12p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt".into(),
                 label: "Main".into(),
-                balance_micro_eld: PREVIEW_BALANCE_MICRO_ELD,
+                balance_micro_jtm: PREVIEW_BALANCE_MICRO_JTM,
                 utxo_count: PREVIEW_UTXO_COUNT,
                 reserved_utxo_count: 0,
-                pending_outbound_micro_eld: 100_000_000_000,
-                incoming_micro_eld: 100_000_000_000,
+                pending_outbound_micro_jtm: 100_000_000_000,
+                incoming_micro_jtm: 100_000_000_000,
             },
             AddressSnapshot {
                 key_index: 1,
                 address: "o17z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj".into(),
                 label: "Savings".into(),
-                balance_micro_eld: 312_000_000,
+                balance_micro_jtm: 312_000_000,
                 utxo_count: 6,
                 reserved_utxo_count: 0,
-                pending_outbound_micro_eld: 0,
-                incoming_micro_eld: 0,
+                pending_outbound_micro_jtm: 0,
+                incoming_micro_jtm: 0,
             },
             AddressSnapshot {
                 key_index: 2,
                 address: "o1ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6".into(),
                 label: "Shop".into(),
-                balance_micro_eld: 0,
+                balance_micro_jtm: 0,
                 utxo_count: 0,
                 reserved_utxo_count: 0,
-                pending_outbound_micro_eld: 0,
-                incoming_micro_eld: 0,
+                pending_outbound_micro_jtm: 0,
+                incoming_micro_jtm: 0,
             },
         ];
         addresses.extend((addresses.len()..PREVIEW_ADDRESS_COUNT).map(|key_index| {
@@ -767,11 +767,11 @@ impl AppSnapshot {
                     "o1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
                 ),
                 label: format!("Address {key_index}"),
-                balance_micro_eld: 0,
+                balance_micro_jtm: 0,
                 utxo_count: 0,
                 reserved_utxo_count: 0,
-                pending_outbound_micro_eld: 0,
-                incoming_micro_eld: 0,
+                pending_outbound_micro_jtm: 0,
+                incoming_micro_jtm: 0,
             }
         }));
 
@@ -788,8 +788,8 @@ impl AppSnapshot {
                 cpu_load: 0.147,
                 memory_used_bytes: 12_300_000_000,
                 memory_total_bytes: 31_000_000_000,
-                circulating_supply_micro_eld: 118_982_430_000,
-                block_reward_micro_eld: 50_000_000,
+                circulating_supply_micro_jtm: 118_982_430_000,
+                block_reward_micro_jtm: 50_000_000,
                 network_hashrate_hps: Some(689_853.0),
                 average_block_time_ms: 15_200,
                 difficulty: 40.0,
@@ -834,7 +834,7 @@ fn preview_mined_blocks(page: u32) -> MinedBlocksSnapshot {
                 height,
                 block_hash: format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height)),
                 timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
-                reward_micro_eld: 50_000_000,
+                reward_micro_jtm: 50_000_000,
                 payout_key_index: 0,
                 canonical: true,
                 confirmations,
@@ -879,14 +879,14 @@ pub fn format_creation_origin(creation_id: u64) -> String {
     }
 }
 
-pub fn format_micro_eld(value: u64) -> String {
+pub fn format_micro_jtm(value: u64) -> String {
     let whole = value / 1_000_000;
     let fractional = value % 1_000_000;
     format!("{whole}.{fractional:06}")
 }
 
 pub fn format_microjetsam_trimmed(value: u64) -> String {
-    let mut formatted = format_micro_eld(value);
+    let mut formatted = format_micro_jtm(value);
     while formatted.ends_with('0') {
         formatted.pop();
     }
@@ -1050,9 +1050,9 @@ fn compact_decimal(value: f64) -> String {
 
 /// Compact whole-network monetary value with at most two decimal places.
 ///
-/// The caller supplies μELD; the returned text deliberately omits the final
+/// The caller supplies μJTM; the returned text deliberately omits the final
 /// `ELD` suffix so views can retain it unconditionally at every window size.
-pub fn format_compact_micro_eld(value: u128) -> String {
+pub fn format_compact_micro_jtm(value: u128) -> String {
     const UNITS: [(&str, u128); 5] = [
         ("", 1_000_000),
         ("K", 1_000_000_000),
@@ -1093,7 +1093,7 @@ pub fn format_compact_micro_eld(value: u128) -> String {
 mod tests {
     use super::{
         display_pow_target, format_compact_count, format_compact_difficulty,
-        format_compact_micro_eld, format_creation_origin, format_expected_pow_hashes,
+        format_compact_micro_jtm, format_creation_origin, format_expected_pow_hashes,
         format_hashrate, format_microjetsam_trimmed, format_pow_work_change, AppSnapshot,
         SensitiveString,
     };
@@ -1106,14 +1106,14 @@ mod tests {
 
     #[test]
     fn compacts_network_supply_without_losing_the_unit_scale() {
-        assert_eq!(format_compact_micro_eld(0), "0");
-        assert_eq!(format_compact_micro_eld(950_000_000), "950");
-        assert_eq!(format_compact_micro_eld(999_995_000), "1K");
-        assert_eq!(format_compact_micro_eld(118_982_430_000), "118.98K");
-        assert_eq!(format_compact_micro_eld(105_120_000_000_000), "105.12M");
-        assert_eq!(format_compact_micro_eld(1_230_000_000_000_000), "1.23B");
+        assert_eq!(format_compact_micro_jtm(0), "0");
+        assert_eq!(format_compact_micro_jtm(950_000_000), "950");
+        assert_eq!(format_compact_micro_jtm(999_995_000), "1K");
+        assert_eq!(format_compact_micro_jtm(118_982_430_000), "118.98K");
+        assert_eq!(format_compact_micro_jtm(105_120_000_000_000), "105.12M");
+        assert_eq!(format_compact_micro_jtm(1_230_000_000_000_000), "1.23B");
         assert_eq!(
-            format_compact_micro_eld(12_350_000_000_000_000_000),
+            format_compact_micro_jtm(12_350_000_000_000_000_000),
             "12.35T"
         );
     }

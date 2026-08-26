@@ -1777,7 +1777,7 @@ mod tests {
                 &[],
                 &[],
                 None,
-                state.circulating_supply_micro_eld,
+                state.circulating_supply_micro_jtm,
                 &genesis_meta,
                 true,
             )
@@ -1848,7 +1848,7 @@ mod tests {
                 Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
                     &bundle,
                 )),
-                state.circulating_supply_micro_eld,
+                state.circulating_supply_micro_jtm,
                 &child_meta,
                 false,
             )
@@ -1891,7 +1891,7 @@ mod tests {
             .state
             .apply_delta_unrooted(&[(7, changed_slot)])
             .unwrap();
-        changed_state.circulating_supply_micro_eld = u128::from(changed_slot.amount());
+        changed_state.circulating_supply_micro_jtm = u128::from(changed_slot.amount());
         let changed_root = changed_state.try_state_root().unwrap();
         let mut grandchild = child;
         grandchild.height = 2;
@@ -1946,7 +1946,7 @@ mod tests {
                 Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
                     &bundle,
                 )),
-                changed_state.circulating_supply_micro_eld,
+                changed_state.circulating_supply_micro_jtm,
                 &grandchild_meta,
                 false,
             )

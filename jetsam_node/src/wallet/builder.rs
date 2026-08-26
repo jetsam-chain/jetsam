@@ -55,7 +55,7 @@ pub struct TxBuildData {
 /// Errors that can occur during transaction construction.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    #[error("insufficient funds: need {need} μELD, have {have} μELD")]
+    #[error("insufficient funds: need {need} μJTM, have {have} μJTM")]
     InsufficientFunds { need: u64, have: u64 },
 
     #[error("payment needs more than {max} active UTXOs (selected at least {selected})")]
@@ -77,7 +77,7 @@ pub enum BuildError {
     ConsolidationInputUnavailable { slot_index: u32 },
 
     #[error(
-        "consolidation value mismatch: selected inputs total {selected_total} μELD, expected output+fee {expected_total} μELD"
+        "consolidation value mismatch: selected inputs total {selected_total} μJTM, expected output+fee {expected_total} μJTM"
     )]
     ConsolidationValueMismatch {
         selected_total: u64,
@@ -121,26 +121,26 @@ fn active_owner_witness(
 /// # Errors
 ///
 /// - [`BuildError::InsufficientFunds`] — confirmed balance is below
-///   `amount_micro_eld + fee_micro_eld`.
+///   `amount_micro_jtm + fee_micro_jtm`.
 /// - [`BuildError::TooManyInputs`] — the payment cannot be covered by one
 ///   canonical PagedSpend transaction.
 /// - [`BuildError::NotEnoughSlots`] — `slot_hints` did not supply enough
 ///   free-slot indices for all outputs (1 for payment, +1 if change > 0).
 pub fn extract_build_data(
     wallet: &WalletState,
-    amount_micro_eld: u64,
-    fee_micro_eld: u64,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
     epoch_anchor: [u8; 32],
     slot_hints: Vec<u32>,
     _log_slots: u32,
     pending_output_slots: &std::collections::HashSet<u32>,
 ) -> Result<TxBuildData, BuildError> {
-    let total_needed = amount_micro_eld
-        .checked_add(fee_micro_eld)
+    let total_needed = amount_micro_jtm
+        .checked_add(fee_micro_jtm)
         .ok_or(BuildError::AmountOverflow)?;
 
     // Coin selection — largest-first, returns (selected, change_amount).
-    let (selected_refs, change_amount) = match wallet.select_utxos(amount_micro_eld, fee_micro_eld)
+    let (selected_refs, change_amount) = match wallet.select_utxos(amount_micro_jtm, fee_micro_jtm)
     {
         Some(selection) => selection,
         None => {
@@ -204,8 +204,8 @@ pub fn extract_build_data(
 pub fn extract_consolidation_build_data(
     wallet: &WalletState,
     selected_input_slots: &[u32],
-    output_value_micro_eld: u64,
-    fee_micro_eld: u64,
+    output_value_micro_jtm: u64,
+    fee_micro_jtm: u64,
     epoch_anchor: [u8; 32],
     slot_hints: Vec<u32>,
     pending_output_slots: &std::collections::HashSet<u32>,
@@ -238,8 +238,8 @@ pub fn extract_consolidation_build_data(
         .iter()
         .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
         .ok_or(BuildError::AmountOverflow)?;
-    let expected_total = output_value_micro_eld
-        .checked_add(fee_micro_eld)
+    let expected_total = output_value_micro_jtm
+        .checked_add(fee_micro_jtm)
         .ok_or(BuildError::AmountOverflow)?;
     if selected_total != expected_total {
         return Err(BuildError::ConsolidationValueMismatch {
@@ -300,8 +300,8 @@ pub fn extract_consolidation_build_data(
 /// - [`BuildError::ProveFailed`] — wallet authorization generation returned an error.
 pub fn build_and_prove_tx(
     to_address: [u8; 32],
-    amount_micro_eld: u64,
-    fee_micro_eld: u64,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
     data: TxBuildData,
 ) -> Result<([u8; 32], Vec<u8>), BuildError> {
     // -----------------------------------------------------------------------
@@ -313,11 +313,11 @@ pub fn build_and_prove_tx(
         .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
         .ok_or(BuildError::AmountOverflow)?;
     let change_amount = total_selected
-        .checked_sub(amount_micro_eld)
-        .and_then(|remaining| remaining.checked_sub(fee_micro_eld))
+        .checked_sub(amount_micro_jtm)
+        .and_then(|remaining| remaining.checked_sub(fee_micro_jtm))
         .ok_or(BuildError::InsufficientFunds {
-            need: amount_micro_eld
-                .checked_add(fee_micro_eld)
+            need: amount_micro_jtm
+                .checked_add(fee_micro_jtm)
                 .ok_or(BuildError::AmountOverflow)?,
             have: total_selected,
         })?;
@@ -325,7 +325,7 @@ pub fn build_and_prove_tx(
     let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     outputs[0] = TxOutput {
         slot_index: data.output_slot_hints[0],
-        amount: amount_micro_eld,
+        amount: amount_micro_jtm,
         owner: Address(to_address),
     };
     let mut validity_bitmap = output_bitmap_bit(0);
@@ -369,7 +369,7 @@ pub fn build_and_prove_tx(
         pages.push(
             TxPage::new(TxBody {
                 epoch_anchor: data.epoch_anchor,
-                fee: if page_index == 0 { fee_micro_eld } else { 0 },
+                fee: if page_index == 0 { fee_micro_jtm } else { 0 },
                 input_owner: data.change_address,
                 inputs: page_inputs,
                 outputs: page_outputs,

@@ -148,19 +148,19 @@ pub struct BackendSnapshot {
 pub struct PaymentSubmission {
     pub recipient: String,
     pub txid: String,
-    pub amount_micro_eld: u64,
-    pub fee_micro_eld: u64,
+    pub amount_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
     pub input_count: usize,
     pub output_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsolidationPlan {
-    pub input_value_micro_eld: u64,
-    pub fee_micro_eld: u64,
-    pub output_value_micro_eld: u64,
-    pub balance_before_micro_eld: u64,
-    pub balance_after_micro_eld: u64,
+    pub input_value_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
+    pub output_value_micro_jtm: u64,
+    pub balance_before_micro_jtm: u64,
+    pub balance_after_micro_jtm: u64,
     pub input_count: usize,
     pub untouched_count: usize,
     pub remaining_count: usize,
@@ -171,9 +171,9 @@ pub struct ConsolidationPlan {
 #[derive(Debug, Clone)]
 pub struct ConsolidationSubmission {
     pub txid: String,
-    pub input_value_micro_eld: u64,
-    pub fee_micro_eld: u64,
-    pub output_value_micro_eld: u64,
+    pub input_value_micro_jtm: u64,
+    pub fee_micro_jtm: u64,
+    pub output_value_micro_jtm: u64,
     pub input_count: usize,
     pub output_count: usize,
     pub freed_slots: usize,
@@ -187,22 +187,22 @@ fn mock_consolidation_plan() -> ConsolidationPlan {
         .iter()
         .filter(|utxo| !utxo.reserved)
         .collect::<Vec<_>>();
-    spendable.sort_by_key(|utxo| (utxo.value_micro_eld, utxo.slot_index));
+    spendable.sort_by_key(|utxo| (utxo.value_micro_jtm, utxo.slot_index));
     let input_count = spendable.len().min(WALLET_CONSOLIDATION_INPUT_LIMIT);
     let selected = spendable.into_iter().take(input_count).collect::<Vec<_>>();
-    let input_value_micro_eld = selected
+    let input_value_micro_jtm = selected
         .iter()
-        .fold(0u64, |sum, utxo| sum.saturating_add(utxo.value_micro_eld));
-    let fee_micro_eld = 5_000u64
+        .fold(0u64, |sum, utxo| sum.saturating_add(utxo.value_micro_jtm));
+    let fee_micro_jtm = 5_000u64
         .saturating_add(100u64.saturating_mul(input_count as u64))
         .saturating_add(700);
     let untouched_count = address.spendable_utxo_count().saturating_sub(input_count);
     ConsolidationPlan {
-        input_value_micro_eld,
-        fee_micro_eld,
-        output_value_micro_eld: input_value_micro_eld.saturating_sub(fee_micro_eld),
-        balance_before_micro_eld: address.balance_micro_eld,
-        balance_after_micro_eld: address.balance_micro_eld.saturating_sub(fee_micro_eld),
+        input_value_micro_jtm,
+        fee_micro_jtm,
+        output_value_micro_jtm: input_value_micro_jtm.saturating_sub(fee_micro_jtm),
+        balance_before_micro_jtm: address.balance_micro_jtm,
+        balance_after_micro_jtm: address.balance_micro_jtm.saturating_sub(fee_micro_jtm),
         input_count,
         untouched_count,
         remaining_count: untouched_count + usize::from(input_count > 0),
@@ -706,14 +706,14 @@ impl Backend {
     pub async fn send_payment(
         &self,
         recipient: String,
-        amount_micro_eld: u64,
+        amount_micro_jtm: u64,
     ) -> Result<PaymentSubmission, String> {
         if self.is_mock() {
             return Ok(PaymentSubmission {
                 recipient,
                 txid: "8f3ca28a5a7191de79dbea850f1679965f43c33c79c557107ec01e04ae45d908".into(),
-                amount_micro_eld,
-                fee_micro_eld: 5_800,
+                amount_micro_jtm,
+                fee_micro_jtm: 5_800,
                 input_count: 1,
                 output_count: 2,
             });
@@ -721,15 +721,15 @@ impl Backend {
         let result = self
             .rpc_with_timeout::<WalletSendResult>(
                 "walletSend",
-                json!([recipient.clone(), amount_micro_eld, 0]),
+                json!([recipient.clone(), amount_micro_jtm, 0]),
                 Duration::from_secs(120),
             )
             .await?;
         Ok(PaymentSubmission {
             recipient,
             txid: result.txid,
-            amount_micro_eld: result.amount_micro_eld,
-            fee_micro_eld: result.fee_micro_eld,
+            amount_micro_jtm: result.amount_micro_jtm,
+            fee_micro_jtm: result.fee_micro_jtm,
             input_count: result.input_count,
             output_count: result.output_count,
         })
@@ -752,9 +752,9 @@ impl Backend {
         if self.is_mock() {
             return Ok(ConsolidationSubmission {
                 txid: "a74d1db8ee61aa359e753f9724788d4077c554a408bac1380caf17133e90335c".into(),
-                input_value_micro_eld: plan.input_value_micro_eld,
-                fee_micro_eld: plan.fee_micro_eld,
-                output_value_micro_eld: plan.output_value_micro_eld,
+                input_value_micro_jtm: plan.input_value_micro_jtm,
+                fee_micro_jtm: plan.fee_micro_jtm,
+                output_value_micro_jtm: plan.output_value_micro_jtm,
                 input_count: plan.input_count,
                 output_count: 1,
                 freed_slots: plan.freed_slots,
@@ -765,8 +765,8 @@ impl Backend {
                 "walletConsolidate",
                 json!([
                     plan.selected_input_slots,
-                    plan.fee_micro_eld,
-                    plan.output_value_micro_eld
+                    plan.fee_micro_jtm,
+                    plan.output_value_micro_jtm
                 ]),
                 Duration::from_secs(120),
             )
@@ -812,8 +812,8 @@ impl Backend {
             ),
         )?;
         sort_wallet_utxos_newest_first(&mut wallet_utxos);
-        let circulating_supply_micro_eld = chain
-            .circulating_supply_micro_eld
+        let circulating_supply_micro_jtm = chain
+            .circulating_supply_micro_jtm
             .parse::<u128>()
             .map_err(|_| "getChainInfo returned an invalid circulating supply".to_owned())?;
 
@@ -877,8 +877,8 @@ impl Backend {
                     } else {
                         format!("Address {}", address.key_index)
                     },
-                    balance_micro_eld: if is_active {
-                        balance.balance_micro_eld
+                    balance_micro_jtm: if is_active {
+                        balance.balance_micro_jtm
                     } else {
                         0
                     },
@@ -888,13 +888,13 @@ impl Backend {
                     } else {
                         0
                     },
-                    pending_outbound_micro_eld: if is_active {
-                        balance.pending_outbound_micro_eld
+                    pending_outbound_micro_jtm: if is_active {
+                        balance.pending_outbound_micro_jtm
                     } else {
                         0
                     },
-                    incoming_micro_eld: if is_active {
-                        balance.pending_incoming_micro_eld
+                    incoming_micro_jtm: if is_active {
+                        balance.pending_incoming_micro_jtm
                     } else {
                         0
                     },
@@ -906,11 +906,11 @@ impl Backend {
                 key_index: active_address.key_index,
                 address: active_address.address.clone(),
                 label: "Main".into(),
-                balance_micro_eld: balance.balance_micro_eld,
+                balance_micro_jtm: balance.balance_micro_jtm,
                 utxo_count: balance.utxo_count,
                 reserved_utxo_count: wallet_utxos.iter().filter(|utxo| utxo.reserved).count(),
-                pending_outbound_micro_eld: balance.pending_outbound_micro_eld,
-                incoming_micro_eld: balance.pending_incoming_micro_eld,
+                pending_outbound_micro_jtm: balance.pending_outbound_micro_jtm,
+                incoming_micro_jtm: balance.pending_incoming_micro_jtm,
             });
         }
         let active_position = address_snapshots
@@ -936,7 +936,7 @@ impl Backend {
                 owned_buckets.insert(bucket);
                 UtxoSnapshot {
                     slot_index: utxo.slot_index,
-                    value_micro_eld: utxo.value_micro_eld,
+                    value_micro_jtm: utxo.value_micro_jtm,
                     creation_id: utxo.creation_id,
                     segment: bucket,
                     reserved: utxo.reserved,
@@ -980,8 +980,8 @@ impl Backend {
                 cpu_load,
                 memory_used_bytes,
                 memory_total_bytes,
-                circulating_supply_micro_eld,
-                block_reward_micro_eld: mining.block_reward_micro_eld,
+                circulating_supply_micro_jtm,
+                block_reward_micro_jtm: mining.block_reward_micro_jtm,
                 network_hashrate_hps,
                 average_block_time_ms,
                 difficulty: target_difficulty(&mining.difficulty_target),
@@ -1017,7 +1017,7 @@ impl Backend {
                         height: block.height,
                         block_hash: block.block_hash,
                         timestamp: block.timestamp,
-                        reward_micro_eld: block.reward_micro_eld,
+                        reward_micro_jtm: block.reward_micro_jtm,
                         payout_key_index: block.payout_key_index,
                         canonical: block.canonical,
                         confirmations: block.confirmations,
@@ -1125,9 +1125,9 @@ impl Backend {
                 .into_iter()
                 .map(RpcSlotInfo::into_snapshot)
                 .collect::<Vec<_>>();
-            let balance_micro_eld = slots
+            let balance_micro_jtm = slots
                 .iter()
-                .map(|slot| u128::from(slot.value_micro_eld))
+                .map(|slot| u128::from(slot.value_micro_jtm))
                 .sum();
             let recent_transactions = self
                 .rpc::<RpcRecentTransactionsPage>(
@@ -1139,7 +1139,7 @@ impl Backend {
             return Ok(ExplorerLookup::Result(
                 ExplorerSearchResultSnapshot::Address(ExplorerAddressSnapshot {
                     address,
-                    balance_micro_eld,
+                    balance_micro_jtm,
                     slots,
                     recent_transactions,
                 }),
@@ -1985,7 +1985,7 @@ struct ChainInfo {
     #[allow(dead_code)]
     active_slot_count: u64,
     log_slots: u32,
-    circulating_supply_micro_eld: String,
+    circulating_supply_micro_jtm: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2011,7 +2011,7 @@ struct MiningInfo {
     #[allow(dead_code)]
     difficulty_bits: u32,
     difficulty_target: String,
-    block_reward_micro_eld: u64,
+    block_reward_micro_jtm: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2088,7 +2088,7 @@ impl RpcSlotInfo {
     fn into_snapshot(self) -> ExplorerSlotSnapshot {
         ExplorerSlotSnapshot {
             slot_index: self.slot_index,
-            value_micro_eld: self.value,
+            value_micro_jtm: self.value,
             creation_id: self.creation_id,
             owner: self.owner,
             empty: self.empty,
@@ -2139,12 +2139,12 @@ struct RpcRecentTransaction {
     txid: String,
     live_inputs: u16,
     live_outputs: u16,
-    fee_micro_eld: u64,
+    fee_micro_jtm: u64,
     coinbase: bool,
     #[serde(default)]
     development_payout: bool,
-    address_spent_micro_eld: Option<String>,
-    address_received_micro_eld: Option<String>,
+    address_spent_micro_jtm: Option<String>,
+    address_received_micro_jtm: Option<String>,
 }
 
 impl RpcRecentTransaction {
@@ -2156,11 +2156,11 @@ impl RpcRecentTransaction {
             txid: self.txid,
             live_inputs: self.live_inputs,
             live_outputs: self.live_outputs,
-            fee_micro_eld: self.fee_micro_eld,
+            fee_micro_jtm: self.fee_micro_jtm,
             coinbase: self.coinbase,
             development_payout: self.development_payout,
-            address_spent_micro_eld: self.address_spent_micro_eld,
-            address_received_micro_eld: self.address_received_micro_eld,
+            address_spent_micro_jtm: self.address_spent_micro_jtm,
+            address_received_micro_jtm: self.address_received_micro_jtm,
         }
     }
 }
@@ -2174,29 +2174,29 @@ struct WalletAddressInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 struct WalletBalance {
-    balance_micro_eld: u64,
+    balance_micro_jtm: u64,
     utxo_count: usize,
-    pending_outbound_micro_eld: u64,
+    pending_outbound_micro_jtm: u64,
     #[serde(default)]
-    pending_incoming_micro_eld: u64,
+    pending_incoming_micro_jtm: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct WalletSendResult {
     txid: String,
-    amount_micro_eld: u64,
-    fee_micro_eld: u64,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
     input_count: usize,
     output_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct WalletConsolidationPlan {
-    input_value_micro_eld: u64,
-    fee_micro_eld: u64,
-    output_value_micro_eld: u64,
-    balance_before_micro_eld: u64,
-    balance_after_micro_eld: u64,
+    input_value_micro_jtm: u64,
+    fee_micro_jtm: u64,
+    output_value_micro_jtm: u64,
+    balance_before_micro_jtm: u64,
+    balance_after_micro_jtm: u64,
     input_count: usize,
     untouched_count: usize,
     remaining_count: usize,
@@ -2207,11 +2207,11 @@ struct WalletConsolidationPlan {
 impl From<WalletConsolidationPlan> for ConsolidationPlan {
     fn from(plan: WalletConsolidationPlan) -> Self {
         Self {
-            input_value_micro_eld: plan.input_value_micro_eld,
-            fee_micro_eld: plan.fee_micro_eld,
-            output_value_micro_eld: plan.output_value_micro_eld,
-            balance_before_micro_eld: plan.balance_before_micro_eld,
-            balance_after_micro_eld: plan.balance_after_micro_eld,
+            input_value_micro_jtm: plan.input_value_micro_jtm,
+            fee_micro_jtm: plan.fee_micro_jtm,
+            output_value_micro_jtm: plan.output_value_micro_jtm,
+            balance_before_micro_jtm: plan.balance_before_micro_jtm,
+            balance_after_micro_jtm: plan.balance_after_micro_jtm,
             input_count: plan.input_count,
             untouched_count: plan.untouched_count,
             remaining_count: plan.remaining_count,
@@ -2224,9 +2224,9 @@ impl From<WalletConsolidationPlan> for ConsolidationPlan {
 #[derive(Debug, Clone, Deserialize)]
 struct WalletConsolidationResult {
     txid: String,
-    input_value_micro_eld: u64,
-    fee_micro_eld: u64,
-    output_value_micro_eld: u64,
+    input_value_micro_jtm: u64,
+    fee_micro_jtm: u64,
+    output_value_micro_jtm: u64,
     input_count: usize,
     output_count: usize,
     freed_slots: usize,
@@ -2236,9 +2236,9 @@ impl From<WalletConsolidationResult> for ConsolidationSubmission {
     fn from(result: WalletConsolidationResult) -> Self {
         Self {
             txid: result.txid,
-            input_value_micro_eld: result.input_value_micro_eld,
-            fee_micro_eld: result.fee_micro_eld,
-            output_value_micro_eld: result.output_value_micro_eld,
+            input_value_micro_jtm: result.input_value_micro_jtm,
+            fee_micro_jtm: result.fee_micro_jtm,
+            output_value_micro_jtm: result.output_value_micro_jtm,
             input_count: result.input_count,
             output_count: result.output_count,
             freed_slots: result.freed_slots,
@@ -2249,7 +2249,7 @@ impl From<WalletConsolidationResult> for ConsolidationSubmission {
 #[derive(Debug, Clone, Deserialize)]
 struct WalletUtxoInfo {
     slot_index: u32,
-    value_micro_eld: u64,
+    value_micro_jtm: u64,
     creation_id: u64,
     confirmed_height: u64,
     #[serde(default)]
@@ -2296,8 +2296,8 @@ struct RpcWalletReceipt {
     txid: String,
     height: u64,
     timestamp: u64,
-    amount_micro_eld: u64,
-    fee_micro_eld: u64,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
     peer_address: Option<String>,
     own_address: Option<String>,
     own_key_index: Option<u32>,
@@ -2312,8 +2312,8 @@ impl RpcWalletReceipt {
             txid: self.txid,
             height: self.height,
             timestamp: self.timestamp,
-            amount_micro_eld: self.amount_micro_eld,
-            fee_micro_eld: self.fee_micro_eld,
+            amount_micro_jtm: self.amount_micro_jtm,
+            fee_micro_jtm: self.fee_micro_jtm,
             peer_address: self.peer_address,
             own_address: self.own_address,
             own_key_index: self.own_key_index,
@@ -2354,7 +2354,7 @@ struct RpcReceiptSummary {
     confirmed_unix: u64,
     tx_index: u16,
     tx_count: u16,
-    fee_micro_eld: u64,
+    fee_micro_jtm: u64,
     inputs: Vec<RpcReceiptInput>,
     outputs: Vec<RpcReceiptOutput>,
 }
@@ -2367,7 +2367,7 @@ impl RpcReceiptSummary {
             confirmed_unix: self.confirmed_unix,
             tx_index: self.tx_index,
             tx_count: self.tx_count,
-            fee_micro_eld: self.fee_micro_eld,
+            fee_micro_jtm: self.fee_micro_jtm,
             inputs: self
                 .inputs
                 .into_iter()
@@ -2381,7 +2381,7 @@ impl RpcReceiptSummary {
                 .into_iter()
                 .map(|output| ReceiptOutputSnapshot {
                     slot_index: output.slot_index,
-                    amount_micro_eld: output.amount_micro_eld,
+                    amount_micro_jtm: output.amount_micro_jtm,
                     owner: output.owner,
                 })
                 .collect(),
@@ -2398,7 +2398,7 @@ struct RpcReceiptInput {
 #[derive(Debug, Clone, Deserialize)]
 struct RpcReceiptOutput {
     slot_index: u32,
-    amount_micro_eld: u64,
+    amount_micro_jtm: u64,
     owner: String,
 }
 
@@ -2409,7 +2409,7 @@ struct RpcMinedBlock {
     #[allow(dead_code)]
     coinbase_txid: String,
     timestamp: u64,
-    reward_micro_eld: u64,
+    reward_micro_jtm: u64,
     #[allow(dead_code)]
     reward_eld: f64,
     #[allow(dead_code)]
@@ -2442,10 +2442,10 @@ struct RpcRetainedBlock {
     user_pages: u16,
     live_inputs: u16,
     live_outputs: u16,
-    reward_micro_eld: u64,
+    reward_micro_jtm: u64,
     #[allow(dead_code)]
     reward_eld: f64,
-    total_fees_micro_eld: String,
+    total_fees_micro_jtm: String,
     block_bytes: u64,
     history_step_bytes: u64,
     bundle_bytes: u64,
@@ -2460,8 +2460,8 @@ impl RpcRetainedBlock {
             user_pages: self.user_pages,
             live_inputs: self.live_inputs,
             live_outputs: self.live_outputs,
-            reward_micro_eld: self.reward_micro_eld,
-            total_fees_micro_eld: self.total_fees_micro_eld,
+            reward_micro_jtm: self.reward_micro_jtm,
+            total_fees_micro_jtm: self.total_fees_micro_jtm,
             block_bytes: self.block_bytes,
             history_step_bytes: self.history_step_bytes,
             bundle_bytes: self.bundle_bytes,
@@ -2474,13 +2474,13 @@ impl RpcRetainedBlock {
                     page_count: transaction.page_count,
                     live_inputs: transaction.live_inputs,
                     live_outputs: transaction.live_outputs,
-                    fee_micro_eld: transaction.fee_micro_eld,
+                    fee_micro_jtm: transaction.fee_micro_jtm,
                     coinbase: transaction.coinbase,
                     development_payout: transaction.development_payout,
                     epoch_anchor: transaction.epoch_anchor,
                     input_owner: transaction.input_owner,
-                    input_sum_micro_eld: transaction.input_sum_micro_eld,
-                    output_sum_micro_eld: transaction.output_sum_micro_eld,
+                    input_sum_micro_jtm: transaction.input_sum_micro_jtm,
+                    output_sum_micro_jtm: transaction.output_sum_micro_jtm,
                     page_hashes: transaction.page_hashes,
                     inputs: transaction
                         .inputs
@@ -2489,7 +2489,7 @@ impl RpcRetainedBlock {
                             page: input.page,
                             lane: input.lane,
                             slot_index: input.slot_index,
-                            amount_micro_eld: input.amount_micro_eld,
+                            amount_micro_jtm: input.amount_micro_jtm,
                             creation_id: input.creation_id,
                         })
                         .collect(),
@@ -2500,7 +2500,7 @@ impl RpcRetainedBlock {
                             page: output.page,
                             lane: output.lane,
                             slot_index: output.slot_index,
-                            amount_micro_eld: output.amount_micro_eld,
+                            amount_micro_jtm: output.amount_micro_jtm,
                             owner: output.owner,
                             creation_id: output.creation_id,
                         })
@@ -2518,14 +2518,14 @@ struct RpcBlockTransaction {
     page_count: u16,
     live_inputs: u16,
     live_outputs: u16,
-    fee_micro_eld: u64,
+    fee_micro_jtm: u64,
     coinbase: bool,
     #[serde(default)]
     development_payout: bool,
     epoch_anchor: String,
     input_owner: Option<String>,
-    input_sum_micro_eld: String,
-    output_sum_micro_eld: String,
+    input_sum_micro_jtm: String,
+    output_sum_micro_jtm: String,
     page_hashes: Vec<String>,
     inputs: Vec<RpcBlockTransactionInput>,
     outputs: Vec<RpcBlockTransactionOutput>,
@@ -2536,7 +2536,7 @@ struct RpcBlockTransactionInput {
     page: u16,
     lane: u8,
     slot_index: u32,
-    amount_micro_eld: u64,
+    amount_micro_jtm: u64,
     creation_id: u64,
 }
 
@@ -2545,7 +2545,7 @@ struct RpcBlockTransactionOutput {
     page: u16,
     lane: u8,
     slot_index: u32,
-    amount_micro_eld: u64,
+    amount_micro_jtm: u64,
     owner: String,
     creation_id: u64,
 }
@@ -2578,8 +2578,8 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
             user_pages: 2,
             live_inputs: 9,
             live_outputs: 5,
-            reward_micro_eld: 50_018_500,
-            total_fees_micro_eld: "18500".into(),
+            reward_micro_jtm: 50_018_500,
+            total_fees_micro_jtm: "18500".into(),
             block_bytes: 1_284_096,
             history_step_bytes: 132_640,
             bundle_bytes: 1_416_748,
@@ -2590,20 +2590,20 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     page_count: 1,
                     live_inputs: 0,
                     live_outputs: 1,
-                    fee_micro_eld: 0,
+                    fee_micro_jtm: 0,
                     coinbase: true,
                     development_payout: false,
                     epoch_anchor: format!("{:064x}", 0),
                     input_owner: None,
-                    input_sum_micro_eld: "0".into(),
-                    output_sum_micro_eld: "50018500".into(),
+                    input_sum_micro_jtm: "0".into(),
+                    output_sum_micro_jtm: "50018500".into(),
                     page_hashes: vec![coinbase_txid],
                     inputs: Vec::new(),
                     outputs: vec![BlockTransactionOutputSnapshot {
                         page: 0,
                         lane: 0,
                         slot_index: 1_284_161,
-                        amount_micro_eld: 50_018_500,
+                        amount_micro_jtm: 50_018_500,
                         owner: miner.into(),
                         creation_id: (1u64 << 63) | height,
                     }],
@@ -2614,13 +2614,13 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     page_count: 2,
                     live_inputs: 9,
                     live_outputs: 4,
-                    fee_micro_eld: 12_000,
+                    fee_micro_jtm: 12_000,
                     coinbase: false,
                     development_payout: false,
                     epoch_anchor: format!("{:064x}", height.saturating_sub(1)),
                     input_owner: Some(miner.into()),
-                    input_sum_micro_eld: "9000000".into(),
-                    output_sum_micro_eld: "8988000".into(),
+                    input_sum_micro_jtm: "9000000".into(),
+                    output_sum_micro_jtm: "8988000".into(),
                     page_hashes: vec![
                         format!("{:064x}", height.wrapping_mul(7)),
                         format!("{:064x}", height.wrapping_mul(11)),
@@ -2630,7 +2630,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                             page: index / 8,
                             lane: (index % 8) as u8,
                             slot_index: 73 + u32::from(index) * 73,
-                            amount_micro_eld: 1_000_000,
+                            amount_micro_jtm: 1_000_000,
                             creation_id: 1_284_088 + u64::from(index),
                         })
                         .collect(),
@@ -2641,7 +2641,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                             page: (index / 2) as u16,
                             lane: (index % 2) as u8,
                             slot_index: 30_000 + index as u32,
-                            amount_micro_eld: amount,
+                            amount_micro_jtm: amount,
                             owner: if index == 3 { miner } else { recipient }.into(),
                             creation_id: 1_284_162 + index as u64,
                         })
@@ -2668,13 +2668,13 @@ fn mock_recent_transactions(page: u32, address: Option<&str>) -> RecentTransacti
                     .input_owner
                     .as_deref()
                     .filter(|input_owner| *input_owner == owner)
-                    .map(|_| transaction.input_sum_micro_eld.clone())
+                    .map(|_| transaction.input_sum_micro_jtm.clone())
                     .unwrap_or_else(|| "0".into());
                 let received = transaction
                     .outputs
                     .iter()
                     .filter(|output| output.owner == owner)
-                    .map(|output| u128::from(output.amount_micro_eld))
+                    .map(|output| u128::from(output.amount_micro_jtm))
                     .sum::<u128>()
                     .to_string();
                 if spent == "0" && received == "0" {
@@ -2691,11 +2691,11 @@ fn mock_recent_transactions(page: u32, address: Option<&str>) -> RecentTransacti
                 txid: transaction.txid,
                 live_inputs: transaction.live_inputs,
                 live_outputs: transaction.live_outputs,
-                fee_micro_eld: transaction.fee_micro_eld,
+                fee_micro_jtm: transaction.fee_micro_jtm,
                 coinbase: transaction.coinbase,
                 development_payout: transaction.development_payout,
-                address_spent_micro_eld: spent,
-                address_received_micro_eld: received,
+                address_spent_micro_jtm: spent,
+                address_received_micro_jtm: received,
             });
         }
     }
@@ -2763,7 +2763,7 @@ fn mock_explorer_search(query: &str, transaction_page: u32) -> Result<ExplorerLo
                 .into_iter()
                 .map(|slot| ExplorerSlotSnapshot {
                     slot_index: slot.slot_index,
-                    value_micro_eld: slot.value_micro_eld,
+                    value_micro_jtm: slot.value_micro_jtm,
                     creation_id: slot.creation_id,
                     owner: query.into(),
                     empty: false,
@@ -2772,14 +2772,14 @@ fn mock_explorer_search(query: &str, transaction_page: u32) -> Result<ExplorerLo
         } else {
             Vec::new()
         };
-        let balance_micro_eld = slots
+        let balance_micro_jtm = slots
             .iter()
-            .map(|slot| u128::from(slot.value_micro_eld))
+            .map(|slot| u128::from(slot.value_micro_jtm))
             .sum();
         return Ok(ExplorerLookup::Result(
             ExplorerSearchResultSnapshot::Address(ExplorerAddressSnapshot {
                 address: query.into(),
-                balance_micro_eld,
+                balance_micro_jtm,
                 slots,
                 recent_transactions: mock_recent_transactions(transaction_page, Some(query)),
             }),
@@ -2793,7 +2793,7 @@ fn mock_explorer_search(query: &str, transaction_page: u32) -> Result<ExplorerLo
         return Ok(ExplorerLookup::Result(ExplorerSearchResultSnapshot::Slot(
             ExplorerSlotSnapshot {
                 slot_index,
-                value_micro_eld: 125_000_000,
+                value_micro_jtm: 125_000_000,
                 creation_id: 1_284_088,
                 owner: AppSnapshot::design_preview()
                     .active_address()
@@ -2907,8 +2907,8 @@ fn mock_receipt_records() -> Vec<ReceiptSnapshot> {
             ),
             height: 18_418 - index * 9,
             timestamp: 1_784_732_170 - index * 137,
-            amount_micro_eld: 12_500_000 + index * 750_000,
-            fee_micro_eld: 9_000 + index * 100,
+            amount_micro_jtm: 12_500_000 + index * 750_000,
+            fee_micro_jtm: 9_000 + index * 100,
             peer_address: Some(RECIPIENTS[index as usize % RECIPIENTS.len()].into()),
             own_address: Some(SENDER.into()),
             own_key_index: Some(if index < 8 { 0 } else { 1 }),
@@ -2993,7 +2993,7 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
             confirmed_unix: receipt.timestamp,
             tx_index: 1,
             tx_count: 7,
-            fee_micro_eld: receipt.fee_micro_eld,
+            fee_micro_jtm: receipt.fee_micro_jtm,
             inputs: (0..receipt.input_count)
                 .map(|index| ReceiptInputSnapshot {
                     slot_index: 9_693_928 + index as u32 * 73,
@@ -3003,12 +3003,12 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
             outputs: vec![
                 ReceiptOutputSnapshot {
                     slot_index: 9_728_645,
-                    amount_micro_eld: receipt.amount_micro_eld,
+                    amount_micro_jtm: receipt.amount_micro_jtm,
                     owner: recipient,
                 },
                 ReceiptOutputSnapshot {
                     slot_index: 9_728_646,
-                    amount_micro_eld: 37_491_000,
+                    amount_micro_jtm: 37_491_000,
                     owner: sender,
                 },
             ],
@@ -3138,21 +3138,21 @@ mod tests {
         let mut utxos = vec![
             WalletUtxoInfo {
                 slot_index: 10,
-                value_micro_eld: 1,
+                value_micro_jtm: 1,
                 creation_id: 100,
                 confirmed_height: 40,
                 reserved: false,
             },
             WalletUtxoInfo {
                 slot_index: 30,
-                value_micro_eld: 1,
+                value_micro_jtm: 1,
                 creation_id: 90,
                 confirmed_height: 42,
                 reserved: false,
             },
             WalletUtxoInfo {
                 slot_index: 20,
-                value_micro_eld: 1,
+                value_micro_jtm: 1,
                 creation_id: 110,
                 confirmed_height: 42,
                 reserved: false,
@@ -3173,7 +3173,7 @@ mod tests {
             .rev()
             .map(|slot_index| WalletUtxoInfo {
                 slot_index,
-                value_micro_eld: 1,
+                value_micro_jtm: 1,
                 creation_id: u64::from(slot_index),
                 confirmed_height: u64::from(slot_index / 4),
                 reserved: false,
@@ -3230,12 +3230,12 @@ mod tests {
         assert_eq!(plan.remaining_count, plan.untouched_count.saturating_add(1));
         assert_eq!(plan.freed_slots, plan.input_count - 1);
         assert_eq!(
-            plan.input_value_micro_eld,
-            plan.output_value_micro_eld + plan.fee_micro_eld
+            plan.input_value_micro_jtm,
+            plan.output_value_micro_jtm + plan.fee_micro_jtm
         );
         assert_eq!(
-            plan.balance_after_micro_eld,
-            plan.balance_before_micro_eld - plan.fee_micro_eld
+            plan.balance_after_micro_jtm,
+            plan.balance_before_micro_jtm - plan.fee_micro_jtm
         );
     }
 

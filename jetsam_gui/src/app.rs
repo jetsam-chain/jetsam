@@ -634,7 +634,7 @@ impl App {
                     self.send_error = Some("Enter a recipient address.".into());
                     return Task::none();
                 }
-                let amount_micro_eld = match parse_jetsam_amount(&self.send_amount) {
+                let amount_micro_jtm = match parse_jetsam_amount(&self.send_amount) {
                     Ok(amount) => amount,
                     Err(error) => {
                         self.send_error = Some(error);
@@ -647,7 +647,7 @@ impl App {
                 self.send_error = None;
                 let backend = self.backend.clone();
                 return Task::perform(
-                    async move { backend.send_payment(recipient, amount_micro_eld).await },
+                    async move { backend.send_payment(recipient, amount_micro_jtm).await },
                     Message::SendFinished,
                 );
             }

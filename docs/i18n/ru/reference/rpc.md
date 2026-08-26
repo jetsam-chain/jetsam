@@ -36,7 +36,7 @@ curl --silent --show-error \
 - Десятичные строки используются для агрегатов, которые могут выйти за
   диапазон точного представления чисел JSON.
 - Поля с плавающей точкой `*_eld` предназначены для отображения. Учётный код
-  должен использовать соответствующее целое поле `*_micro_eld`.
+  должен использовать соответствующее целое поле `*_micro_jtm`.
 
 ## Аутентификация
 
@@ -210,7 +210,7 @@ ChainInfo {
   difficulty_target: string
   active_slot_count: u64
   log_slots: u32
-  circulating_supply_micro_eld: decimal string
+  circulating_supply_micro_jtm: decimal string
 }
 
 BlockHeaderInfo {
@@ -244,7 +244,7 @@ TxInfo {
 }
 ```
 
-`circulating_supply_micro_eld` — точная сумма стоимости всех UTXO в Live State,
+`circulating_supply_micro_jtm` — точная сумма стоимости всех UTXO в Live State,
 выраженная в μNOID. Поле передаётся десятичной строкой, чтобы JSON не
 терял точность.
 
@@ -285,9 +285,9 @@ RetainedBlockInfo {
   user_pages: u16
   live_inputs: u16
   live_outputs: u16
-  reward_micro_eld: u64
+  reward_micro_jtm: u64
   reward_eld: number
-  total_fees_micro_eld: decimal string
+  total_fees_micro_jtm: decimal string
   block_bytes: u64
   history_step_bytes: u64
   bundle_bytes: u64
@@ -302,13 +302,13 @@ BlockTransactionInfo {
   page_count: u16
   live_inputs: u16
   live_outputs: u16
-  fee_micro_eld: u64
+  fee_micro_jtm: u64
   coinbase: bool
   development_payout: bool
   epoch_anchor: string
   input_owner: string | null
-  input_sum_micro_eld: decimal string
-  output_sum_micro_eld: decimal string
+  input_sum_micro_jtm: decimal string
+  output_sum_micro_jtm: decimal string
   page_hashes: string[]
   inputs: BlockTransactionInputInfo[]
   outputs: BlockTransactionOutputInfo[]
@@ -318,7 +318,7 @@ BlockTransactionInputInfo {
   page: u16
   lane: u8
   slot_index: u32
-  amount_micro_eld: u64
+  amount_micro_jtm: u64
   creation_id: u64
 }
 
@@ -326,7 +326,7 @@ BlockTransactionOutputInfo {
   page: u16
   lane: u8
   slot_index: u32
-  amount_micro_eld: u64
+  amount_micro_jtm: u64
   owner: string
   creation_id: u64
 }
@@ -353,14 +353,14 @@ RecentTransactionInfo {
   page_count: u16
   live_inputs: u16
   live_outputs: u16
-  fee_micro_eld: u64
+  fee_micro_jtm: u64
   coinbase: bool
   development_payout: bool
   input_owner: string | null
-  input_sum_micro_eld: decimal string
-  output_sum_micro_eld: decimal string
-  address_spent_micro_eld: decimal string | null
-  address_received_micro_eld: decimal string | null
+  input_sum_micro_jtm: decimal string
+  output_sum_micro_jtm: decimal string
+  address_spent_micro_jtm: decimal string | null
+  address_received_micro_jtm: decimal string | null
 }
 ```
 
@@ -371,7 +371,7 @@ MiningInfo {
   height: u64
   difficulty_bits: u32
   difficulty_target: string
-  block_reward_micro_eld: u64
+  block_reward_micro_jtm: u64
   block_reward_eld: number
   active_slot_count: u64
 }
@@ -402,7 +402,7 @@ FeeEstimate {
   net_new_slots: u64
   active_slot_count: u64
   log_slots: u32
-  fee_micro_eld: u64
+  fee_micro_jtm: u64
   breakdown: FeeBreakdownInfo
 }
 
@@ -440,7 +440,7 @@ MempoolStats {
 
 MempoolTxInfo {
   tx_hash: string
-  fee_micro_eld: u64
+  fee_micro_jtm: u64
   fee_rate: u64
   n_inputs: usize
   n_outputs: usize
@@ -485,19 +485,19 @@ WalletStatus {
   exists: bool
   address: string
   active_index: u32
-  balance_micro_eld: u64
+  balance_micro_jtm: u64
   balance_eld: number
   utxo_count: usize
   address_count: u32
 }
 
 WalletBalance {
-  balance_micro_eld: u64
+  balance_micro_jtm: u64
   balance_eld: number
   utxo_count: usize
-  pending_outbound_micro_eld: u64
-  pending_incoming_micro_eld: u64
-  spendable_micro_eld: u64
+  pending_outbound_micro_jtm: u64
+  pending_incoming_micro_jtm: u64
+  spendable_micro_jtm: u64
   spendable_eld: number
 }
 ```
@@ -505,7 +505,7 @@ WalletBalance {
 ```text
 WalletUtxoInfo {
   slot_index: u32
-  value_micro_eld: u64
+  value_micro_jtm: u64
   creation_id: u64
   value_eld: number
   address: string
@@ -519,7 +519,7 @@ WalletHistoryEntry {
   height: u64
   direction: "sent" | "received"
   is_coinbase: bool
-  amount_micro_eld: u64
+  amount_micro_jtm: u64
   amount_eld: number
   peer_address: string | null
   timestamp: u64
@@ -532,19 +532,19 @@ WalletHistoryEntry {
 
 ```text
 WalletSendPlan {
-  amount_micro_eld: u64
-  fee_micro_eld: u64
-  total_spend_micro_eld: u64
+  amount_micro_jtm: u64
+  fee_micro_jtm: u64
+  total_spend_micro_jtm: u64
   input_count: usize
   output_count: usize
-  change_micro_eld: u64
+  change_micro_jtm: u64
   fee_breakdown: FeeBreakdownInfo
 }
 
 WalletSendResult {
   txid: string
-  amount_micro_eld: u64
-  fee_micro_eld: u64
+  amount_micro_jtm: u64
+  fee_micro_jtm: u64
   input_count: usize
   output_count: usize
 }
@@ -552,11 +552,11 @@ WalletSendResult {
 
 ```text
 WalletConsolidationPlan {
-  input_value_micro_eld: u64
-  fee_micro_eld: u64
-  output_value_micro_eld: u64
-  balance_before_micro_eld: u64
-  balance_after_micro_eld: u64
+  input_value_micro_jtm: u64
+  fee_micro_jtm: u64
+  output_value_micro_jtm: u64
+  balance_before_micro_jtm: u64
+  balance_after_micro_jtm: u64
   input_count: usize
   untouched_count: usize
   remaining_count: usize
@@ -567,9 +567,9 @@ WalletConsolidationPlan {
 
 WalletConsolidationResult {
   txid: string
-  input_value_micro_eld: u64
-  fee_micro_eld: u64
-  output_value_micro_eld: u64
+  input_value_micro_jtm: u64
+  fee_micro_jtm: u64
+  output_value_micro_jtm: u64
   input_count: usize
   output_count: usize
   freed_slots: usize
@@ -581,7 +581,7 @@ WalletConsolidationResult {
 ```text
 WalletScanResult {
   found_utxos: usize
-  balance_micro_eld: u64
+  balance_micro_jtm: u64
   balance_eld: number
   active_index: u32
   snapshot_height: u64
@@ -603,8 +603,8 @@ WalletReceiptInfo {
   txid: string
   height: u64
   timestamp: u64
-  amount_micro_eld: u64
-  fee_micro_eld: u64
+  amount_micro_jtm: u64
+  fee_micro_jtm: u64
   peer_address: string | null
   own_address: string | null
   own_key_index: u32 | null
@@ -628,7 +628,7 @@ WalletMinedBlockInfo {
   block_hash: string
   coinbase_txid: string
   timestamp: u64
-  reward_micro_eld: u64
+  reward_micro_jtm: u64
   reward_eld: number
   payout_address: string
   payout_key_index: u32
@@ -654,7 +654,7 @@ ReceiptSummaryInfo {
   confirmed_unix: u64
   tx_index: u16
   tx_count: u16
-  fee_micro_eld: u64
+  fee_micro_jtm: u64
   inputs: ReceiptInputInfo[]
   outputs: ReceiptOutputInfo[]
 }
@@ -666,7 +666,7 @@ ReceiptInputInfo {
 
 ReceiptOutputInfo {
   slot_index: u32
-  amount_micro_eld: u64
+  amount_micro_jtm: u64
   owner: string
 }
 ```
@@ -687,8 +687,8 @@ BlockTemplateResponse {
   n_txs: usize
   tx_input_counts?: usize[]
   tx_output_counts?: usize[]
-  coinbase_value_micro_eld: u64
-  claimable_fees_micro_eld: u64
+  coinbase_value_micro_jtm: u64
+  claimable_fees_micro_jtm: u64
 }
 ```
 

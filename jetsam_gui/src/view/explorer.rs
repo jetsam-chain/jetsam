@@ -502,7 +502,7 @@ fn transaction_row<'a>(
     };
     let spent = if address_mode {
         transaction
-            .address_spent_micro_eld
+            .address_spent_micro_jtm
             .as_deref()
             .map(format_microjetsam_string)
             .unwrap_or_else(|| "0.000000".into())
@@ -511,7 +511,7 @@ fn transaction_row<'a>(
     };
     let received = if address_mode {
         transaction
-            .address_received_micro_eld
+            .address_received_micro_jtm
             .as_deref()
             .map(format_microjetsam_string)
             .unwrap_or_else(|| "0.000000".into())
@@ -550,7 +550,7 @@ fn transaction_row<'a>(
                     theme::TEXT
                 }
             ),
-            table_cell(transaction.fee_micro_eld.to_string(), 3, theme::WARNING),
+            table_cell(transaction.fee_micro_jtm.to_string(), 3, theme::WARNING),
             open,
         ]
         .spacing(7)
@@ -577,12 +577,12 @@ fn compact_transaction<'a>(
         format!(
             "−{} ①  +{} ①",
             transaction
-                .address_spent_micro_eld
+                .address_spent_micro_jtm
                 .as_deref()
                 .map(format_microjetsam_string)
                 .unwrap_or_else(|| "0.000000".into()),
             transaction
-                .address_received_micro_eld
+                .address_received_micro_jtm
                 .as_deref()
                 .map(format_microjetsam_string)
                 .unwrap_or_else(|| "0.000000".into()),
@@ -590,7 +590,7 @@ fn compact_transaction<'a>(
     } else {
         format!(
             "{} in · {} out · fee {} μ",
-            transaction.live_inputs, transaction.live_outputs, transaction.fee_micro_eld
+            transaction.live_inputs, transaction.live_outputs, transaction.fee_micro_jtm
         )
     };
     container(
@@ -678,7 +678,7 @@ fn address_result<'a>(
     .spacing(4);
     let balance = metric(
         "BALANCE",
-        format!("{} ①", format_u128_micro_eld(address.balance_micro_eld)),
+        format!("{} ①", format_u128_micro_jtm(address.balance_micro_jtm)),
         theme::ACCENT,
     );
     let live_slots = metric(
@@ -758,7 +758,7 @@ fn address_slots<'a>(
                         Space::new().width(Length::Fill),
                         text(format!(
                             "{} ①",
-                            crate::model::format_micro_eld(slot.value_micro_eld)
+                            crate::model::format_micro_jtm(slot.value_micro_jtm)
                         ))
                         .size(13)
                         .color(theme::ACCENT),
@@ -789,7 +789,7 @@ fn address_slots<'a>(
                     row![
                         table_cell(grouped(u64::from(slot.slot_index)), 3, theme::CYAN),
                         table_cell(
-                            crate::model::format_micro_eld(slot.value_micro_eld),
+                            crate::model::format_micro_jtm(slot.value_micro_jtm),
                             4,
                             theme::ACCENT,
                         ),
@@ -863,7 +863,7 @@ fn slot_result<'a>(
     let slot_metric = metric("SLOT", grouped(u64::from(slot.slot_index)), theme::CYAN);
     let value_metric = metric(
         "VALUE",
-        format!("{} ①", crate::model::format_micro_eld(slot.value_micro_eld)),
+        format!("{} ①", crate::model::format_micro_jtm(slot.value_micro_jtm)),
         state.1,
     );
     let creation_metric = metric(
@@ -1040,7 +1040,7 @@ fn format_age(timestamp: u64) -> String {
     }
 }
 
-fn format_u128_micro_eld(value: u128) -> String {
+fn format_u128_micro_jtm(value: u128) -> String {
     let whole = value / 1_000_000;
     let fractional = value % 1_000_000;
     format!("{whole}.{fractional:06}")
@@ -1049,7 +1049,7 @@ fn format_u128_micro_eld(value: u128) -> String {
 fn format_microjetsam_string(value: &str) -> String {
     value
         .parse::<u128>()
-        .map(format_u128_micro_eld)
+        .map(format_u128_micro_jtm)
         .unwrap_or_else(|_| value.to_owned())
 }
 

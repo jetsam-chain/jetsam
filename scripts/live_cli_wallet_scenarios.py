@@ -325,7 +325,7 @@ def main():
         cli(n1, ["scan"], timeout=180)
         bal1 = cli_json(n1, ["balance"])
         assert_true(
-            bal1["spendable_micro_eld"] >= 100_000_000,
+            bal1["spendable_micro_jtm"] >= 100_000_000,
             f"node1 spendable too low: {bal1}",
         )
         out, _, _ = cli(n1, ["balance"])
@@ -408,13 +408,13 @@ def main():
         cli_json(n3, ["address", "--use", str(new1["key_index"])])
         scan3 = cli_json(n3, ["scan"], timeout=180)
         assert_true(
-            scan3["balance_micro_eld"] == 1_250_000
+            scan3["balance_micro_jtm"] == 1_250_000
             and scan3["found_utxos"] == 1,
             f"first recipient scan did not find the exact funds: {scan3}",
         )
         bal3 = cli_json(n3, ["balance"])
         assert_true(
-            bal3["balance_micro_eld"] == 1_250_000 and bal3["utxo_count"] == 1,
+            bal3["balance_micro_jtm"] == 1_250_000 and bal3["utxo_count"] == 1,
             f"first recipient balance wrong: {bal3}",
         )
         out, _, _ = cli(n3, ["balance"])
@@ -423,13 +423,13 @@ def main():
         cli_json(n3, ["address", "--use", str(new2["key_index"])])
         scan3 = cli_json(n3, ["scan"], timeout=180)
         assert_true(
-            scan3["balance_micro_eld"] == 750_000
+            scan3["balance_micro_jtm"] == 750_000
             and scan3["found_utxos"] == 1,
             f"second recipient scan did not find the exact funds: {scan3}",
         )
         bal3 = cli_json(n3, ["balance"])
         assert_true(
-            bal3["balance_micro_eld"] == 750_000 and bal3["utxo_count"] == 1,
+            bal3["balance_micro_jtm"] == 750_000 and bal3["utxo_count"] == 1,
             f"second recipient balance wrong: {bal3}",
         )
         out, _, _ = cli(n3, ["balance"])

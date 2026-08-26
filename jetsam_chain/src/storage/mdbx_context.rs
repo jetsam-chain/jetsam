@@ -411,7 +411,7 @@ impl MdbxChainContext {
             .map_err(|_| MdbxContextError::Corrupt("invalid durable state depth"))?;
         let mut exact_segment_roots = Vec::new();
         let mut counted_live = 0u64;
-        let mut circulating_supply_micro_eld = 0u128;
+        let mut circulating_supply_micro_jtm = 0u128;
         store.visit_segments(|segment_id, stored_log, columns| {
             if usize::from(stored_log) != effective_log
                 || columns.values.len() != expected_segment_len
@@ -443,7 +443,7 @@ impl MdbxChainContext {
                 segment_live = segment_live
                     .checked_add(1)
                     .ok_or(StoreError::Decode("durable segment live-count overflow"))?;
-                circulating_supply_micro_eld = circulating_supply_micro_eld
+                circulating_supply_micro_jtm = circulating_supply_micro_jtm
                     .checked_add(u128::from(slot.amount()))
                     .ok_or(StoreError::Decode("durable circulating supply overflow"))?;
                 exact
@@ -489,7 +489,7 @@ impl MdbxChainContext {
             segmented,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             root,
             &exact_segment_roots,
         )
@@ -504,7 +504,7 @@ impl MdbxChainContext {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
-        circulating_supply_micro_eld: u128,
+        circulating_supply_micro_jtm: u128,
         expected_root: [u8; 32],
     ) -> Result<Option<ChainState>, MdbxContextError> {
         let segment_ids = store.segment_ids()?;
@@ -556,7 +556,7 @@ impl MdbxChainContext {
             segmented,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             expected_root,
             &exact_segment_roots,
         ) {
@@ -570,17 +570,17 @@ impl MdbxChainContext {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
-        persisted_circulating_supply_micro_eld: Option<u128>,
+        persisted_circulating_supply_micro_jtm: Option<u128>,
         tip_height: u64,
         expected_root: [u8; 32],
     ) -> Result<ChainState, MdbxContextError> {
-        if let Some(circulating_supply_micro_eld) = persisted_circulating_supply_micro_eld {
+        if let Some(circulating_supply_micro_jtm) = persisted_circulating_supply_micro_jtm {
             if let Some(state) = Self::try_load_compact_chain_state(
                 store,
                 log_slots,
                 active_slot_count,
                 alloc_counter,
-                circulating_supply_micro_eld,
+                circulating_supply_micro_jtm,
                 expected_root,
             )? {
                 tracing::info!(
@@ -727,7 +727,7 @@ impl MdbxChainContext {
             &[],
             &[],
             None, // genesis is built in and has no accepted bundle
-            self.state.circulating_supply_micro_eld,
+            self.state.circulating_supply_micro_jtm,
             &meta,
             false,
         )?;
@@ -766,7 +766,7 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
-        let circulating_supply_micro_eld = store.get_circulating_supply()?;
+        let circulating_supply_micro_jtm = store.get_circulating_supply()?;
         // 3. Validate canonical metadata before restoring compact state.
         let tip_hdr = store
             .get_header(tip_height)?
@@ -804,7 +804,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             tip_height,
             tip_hdr.state_root,
         )?;
@@ -878,7 +878,7 @@ impl MdbxChainContext {
             .store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
-        let circulating_supply_micro_eld = self.store.get_circulating_supply()?;
+        let circulating_supply_micro_jtm = self.store.get_circulating_supply()?;
         let tip_header = self
             .store
             .get_header(meta.tip_height)?
@@ -904,7 +904,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             tip_header.height,
             tip_header.state_root,
         )?;
@@ -979,7 +979,7 @@ impl MdbxChainContext {
                 "uncommitted block has invalid rollback geometry",
             ));
         }
-        let circulating_supply_micro_eld = self
+        let circulating_supply_micro_jtm = self
             .state
             .supply_after_slot_updates(&undo.slot_changes)
             .ok_or(MdbxContextError::Corrupt(
@@ -1026,7 +1026,7 @@ impl MdbxChainContext {
         }
         self.state.active_slot_count = undo.active_slot_count_before;
         self.state.alloc_counter = undo.alloc_counter_before;
-        self.state.circulating_supply_micro_eld = circulating_supply_micro_eld;
+        self.state.circulating_supply_micro_jtm = circulating_supply_micro_jtm;
         if self.state.state.log_slots() as u32 != parent.log_slots
             || self.state.active_slot_count != parent.active_slot_count
             || self.state.alloc_counter != parent.alloc_counter
@@ -1149,7 +1149,7 @@ impl MdbxChainContext {
                     &tx_hashes,
                     &[],
                     Some(accepted_block),
-                    self.state.circulating_supply_micro_eld,
+                    self.state.circulating_supply_micro_jtm,
                     &consensus_meta,
                     false,
                 )
@@ -2156,7 +2156,7 @@ impl MdbxChainContext {
                 &reclaimed_tx_hashes,
                 replacement_objects,
                 &staged,
-                self.state.circulating_supply_micro_eld,
+                self.state.circulating_supply_micro_jtm,
                 &consensus_meta,
             )?;
             Ok(())
@@ -2915,7 +2915,7 @@ mod tests {
                 &[],
                 &[],
                 None,
-                state.circulating_supply_micro_eld,
+                state.circulating_supply_micro_jtm,
                 &ConsensusMeta {
                     tip_height: 0,
                     tip_hash: hash,

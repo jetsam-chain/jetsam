@@ -2350,7 +2350,7 @@ impl MdbxStore {
             .map_err(|_| StoreError::Decode("invalid staged snapshot exact-root depth"))?;
         let mut exact_segment_roots = Vec::with_capacity(staging.descriptors().len());
         let mut counted_live = 0u64;
-        let mut circulating_supply_micro_eld = 0u128;
+        let mut circulating_supply_micro_jtm = 0u128;
         let mut previous_segment = None;
 
         let txn = self.db.begin_rw_txn()?;
@@ -2706,7 +2706,7 @@ impl MdbxStore {
                 counted_live = counted_live
                     .checked_add(1)
                     .ok_or(StoreError::Decode("staged snapshot active-count overflow"))?;
-                circulating_supply_micro_eld = circulating_supply_micro_eld
+                circulating_supply_micro_jtm = circulating_supply_micro_jtm
                     .checked_add(u128::from(slot.amount()))
                     .ok_or(StoreError::Decode(
                         "staged snapshot circulating supply overflow",
@@ -2784,7 +2784,7 @@ impl MdbxStore {
             segmented,
             tip_header.active_slot_count,
             tip_header.alloc_counter,
-            circulating_supply_micro_eld,
+            circulating_supply_micro_jtm,
             exact_root,
             &exact_segment_roots,
         )
@@ -2815,7 +2815,7 @@ impl MdbxStore {
                 tip_header.log_slots,
                 tip_header.active_slot_count,
                 tip_header.alloc_counter,
-                circulating_supply_micro_eld,
+                circulating_supply_micro_jtm,
             ),
             WriteFlags::empty(),
         )?;
@@ -2945,7 +2945,7 @@ impl MdbxStore {
                 header.log_slots,
                 header.active_slot_count,
                 header.alloc_counter,
-                state.circulating_supply_micro_eld,
+                state.circulating_supply_micro_jtm,
             ),
             WriteFlags::empty(),
         )?;
@@ -3003,7 +3003,7 @@ impl MdbxStore {
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
         accepted_block: Option<AcceptedBlockCommit<'_>>,
-        circulating_supply_micro_eld: u128,
+        circulating_supply_micro_jtm: u128,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
     ) -> Result<(), StoreError> {
@@ -3306,7 +3306,7 @@ impl MdbxStore {
                 header.log_slots,
                 header.active_slot_count,
                 header.alloc_counter,
-                circulating_supply_micro_eld,
+                circulating_supply_micro_jtm,
             ),
             WriteFlags::empty(),
         )?;
@@ -3517,7 +3517,7 @@ impl MdbxStore {
         reverted_tx_hashes: &[TxBodyHash],
         replacement_objects: &[AcceptedBlockCommit<'_>],
         replacement: &[StagedAcceptedBlockCommit],
-        circulating_supply_micro_eld: u128,
+        circulating_supply_micro_jtm: u128,
         consensus_meta: &ConsensusMeta,
     ) -> Result<(), StoreError> {
         if final_dirty_segments.len() != final_dirty_segment_summaries.len()
@@ -3984,7 +3984,7 @@ impl MdbxStore {
                 final_header.log_slots,
                 final_header.active_slot_count,
                 final_header.alloc_counter,
-                circulating_supply_micro_eld,
+                circulating_supply_micro_jtm,
             ),
             WriteFlags::empty(),
         )?;
@@ -4284,14 +4284,14 @@ mod tests {
                 &[],
                 &[],
                 None,
-                state.circulating_supply_micro_eld,
+                state.circulating_supply_micro_jtm,
                 &meta,
                 true,
             )
             .unwrap();
         assert_eq!(
             store.get_circulating_supply().unwrap(),
-            Some(state.circulating_supply_micro_eld)
+            Some(state.circulating_supply_micro_jtm)
         );
         (state, header, hash)
     }
@@ -4396,8 +4396,8 @@ mod tests {
         .unwrap();
         assert_eq!(restored.cached_state_root(), state.cached_state_root());
         assert_eq!(
-            restored.circulating_supply_micro_eld,
-            state.circulating_supply_micro_eld
+            restored.circulating_supply_micro_jtm,
+            state.circulating_supply_micro_jtm
         );
         assert_eq!(store.segment_summaries().unwrap().len(), 1);
     }
@@ -4433,12 +4433,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            restored.circulating_supply_micro_eld,
-            state.circulating_supply_micro_eld
+            restored.circulating_supply_micro_jtm,
+            state.circulating_supply_micro_jtm
         );
         assert_eq!(
             store.get_circulating_supply().unwrap(),
-            Some(state.circulating_supply_micro_eld)
+            Some(state.circulating_supply_micro_jtm)
         );
     }
 
