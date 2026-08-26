@@ -62,12 +62,12 @@ jobs:
 
       - name: Smoke-test native executables
         run: |
-          target/x86_64-unknown-linux-gnu/debug/parano1d --check-hardware
-          target/x86_64-unknown-linux-gnu/debug/parano1d --help
-          target/x86_64-unknown-linux-gnu/debug/parano1d-cli --help
-          target/x86_64-unknown-linux-gnu/debug/parano1d-miner --check-hardware
-          target/x86_64-unknown-linux-gnu/debug/parano1d-miner --help
-          target/x86_64-unknown-linux-gnu/debug/parano1d-gui --release-self-check
+          target/x86_64-unknown-linux-gnu/debug/jetsam --check-hardware
+          target/x86_64-unknown-linux-gnu/debug/jetsam --help
+          target/x86_64-unknown-linux-gnu/debug/jetsam-cli --help
+          target/x86_64-unknown-linux-gnu/debug/jetsam-miner --check-hardware
+          target/x86_64-unknown-linux-gnu/debug/jetsam-miner --help
+          target/x86_64-unknown-linux-gnu/debug/jetsam-gui --release-self-check
 
       - name: Reject a legacy virtual CPU without illegal instructions
         shell: bash
@@ -75,7 +75,7 @@ jobs:
           set +e
           legacy_output="$(
             qemu-x86_64 -cpu qemu64 \
-              target/x86_64-unknown-linux-gnu/debug/parano1d \
+              target/x86_64-unknown-linux-gnu/debug/jetsam \
               --check-hardware 2>&1
           )"
           legacy_status=$?
@@ -177,9 +177,9 @@ jobs:
         run: |
           suffix=
           if [[ "${{ runner.os }}" == Windows ]]; then suffix=.exe; fi
-          target/${{ matrix.target }}/debug/parano1d$suffix --check-hardware
-          target/${{ matrix.target }}/debug/parano1d$suffix --help
-          target/${{ matrix.target }}/debug/parano1d-cli$suffix --help
-          target/${{ matrix.target }}/debug/parano1d-miner$suffix --check-hardware
-          target/${{ matrix.target }}/debug/parano1d-miner$suffix --help
-          target/${{ matrix.target }}/debug/parano1d-gui$suffix --release-self-check
+          target/${{ matrix.target }}/debug/jetsam$suffix --check-hardware
+          target/${{ matrix.target }}/debug/jetsam$suffix --help
+          target/${{ matrix.target }}/debug/jetsam-cli$suffix --help
+          target/${{ matrix.target }}/debug/jetsam-miner$suffix --check-hardware
+          target/${{ matrix.target }}/debug/jetsam-miner$suffix --help
+          target/${{ matrix.target }}/debug/jetsam-gui$suffix --release-self-check

@@ -97,16 +97,16 @@ jobs:
           test "$(jq -r .name <<<"$release_state")" = "$expected_title"
           allowed_assets=(
             history-step-pack-v1.tar.gz
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz"
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz"
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip"
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz"
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz"
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb"
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb"
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe"
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg"
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg"
+            "jetsam-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+            "jetsam-core-$RELEASE_TAG-linux-aarch64.tar.gz"
+            "jetsam-core-$RELEASE_TAG-windows-x86_64.zip"
+            "jetsam-core-$RELEASE_TAG-macos-aarch64.tar.gz"
+            "jetsam-core-$RELEASE_TAG-macos-x86_64.tar.gz"
+            "jetsam-gui-$RELEASE_TAG-linux-x86_64.deb"
+            "jetsam-gui-$RELEASE_TAG-linux-aarch64.deb"
+            "jetsam-gui-$RELEASE_TAG-windows-x86_64-setup.exe"
+            "jetsam-gui-$RELEASE_TAG-macos-aarch64.dmg"
+            "jetsam-gui-$RELEASE_TAG-macos-x86_64.dmg"
             SHA256SUMS
           )
           pack_count=0
@@ -173,28 +173,28 @@ jobs:
           - name: Linux x86-64
             id: linux-x86_64
             runner: ubuntu-22.04
-            artifact: parano1d-core-${{ inputs.tag }}-linux-x86_64.tar.gz
-            gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-x86_64.deb
+            artifact: jetsam-core-${{ inputs.tag }}-linux-x86_64.tar.gz
+            gui_artifact: jetsam-gui-${{ inputs.tag }}-linux-x86_64.deb
           - name: Linux ARM64
             id: linux-aarch64
             runner: ubuntu-22.04-arm
-            artifact: parano1d-core-${{ inputs.tag }}-linux-aarch64.tar.gz
-            gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-aarch64.deb
+            artifact: jetsam-core-${{ inputs.tag }}-linux-aarch64.tar.gz
+            gui_artifact: jetsam-gui-${{ inputs.tag }}-linux-aarch64.deb
           - name: Windows x86-64
             id: windows-x86_64
             runner: windows-2025
-            artifact: parano1d-core-${{ inputs.tag }}-windows-x86_64.zip
-            gui_artifact: parano1d-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
+            artifact: jetsam-core-${{ inputs.tag }}-windows-x86_64.zip
+            gui_artifact: jetsam-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
           - name: macOS Apple Silicon
             id: macos-aarch64
             runner: macos-15
-            artifact: parano1d-core-${{ inputs.tag }}-macos-aarch64.tar.gz
-            gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-aarch64.dmg
+            artifact: jetsam-core-${{ inputs.tag }}-macos-aarch64.tar.gz
+            gui_artifact: jetsam-gui-${{ inputs.tag }}-macos-aarch64.dmg
           - name: macOS Intel
             id: macos-x86_64
             runner: macos-15-intel
-            artifact: parano1d-core-${{ inputs.tag }}-macos-x86_64.tar.gz
-            gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-x86_64.dmg
+            artifact: jetsam-core-${{ inputs.tag }}-macos-x86_64.tar.gz
+            gui_artifact: jetsam-gui-${{ inputs.tag }}-macos-x86_64.dmg
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -316,16 +316,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           for asset in \
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg"
+            "jetsam-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "jetsam-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "jetsam-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "jetsam-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "jetsam-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "jetsam-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "jetsam-gui-$RELEASE_TAG-macos-x86_64.dmg"
           do
             test -s "release-assets/$asset"
           done
@@ -347,29 +347,29 @@ jobs:
           set -Eeuo pipefail
           cd release-assets
           sha256sum \
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
+            "jetsam-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "jetsam-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "jetsam-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "jetsam-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "jetsam-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "jetsam-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "jetsam-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             > SHA256SUMS
           gh release upload "$RELEASE_TAG" \
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
+            "jetsam-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "jetsam-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "jetsam-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "jetsam-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "jetsam-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "jetsam-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "jetsam-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             SHA256SUMS \
             --clobber
           if [[ "$RELEASE_CHANNEL" == prerelease ]]; then
@@ -389,16 +389,16 @@ jobs:
           test "$(jq -r .tagName <<<"$release_state")" = "$RELEASE_TAG"
           test "$(jq '.assets | length' <<<"$release_state")" = 12
           for asset in \
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
+            "jetsam-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "jetsam-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "jetsam-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "jetsam-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "jetsam-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "jetsam-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "jetsam-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "jetsam-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             SHA256SUMS
           do
