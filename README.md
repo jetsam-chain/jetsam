@@ -2,9 +2,9 @@
 
 **Proof-native Layer 1 ordered by proof of work.**
 
-[Website](https://elide.org) ·
-[Documentation](https://docs.elide.org) ·
-[Research](https://lab.elide.org) ·
+[Website](https://jetsam.org) ·
+[Documentation](https://docs.jetsam.org) ·
+[Research](https://lab.jetsam.org) ·
 [Releases](https://github.com/ignotusnemo/elide/releases)
 
 Blockchains have a fundamental architectural flaw: the present does not prove
@@ -220,7 +220,7 @@ relation without a trusted setup. One joint `GF(2^256)` transcript binds the
 three Link and six Block recursive regions into the outer PCS batch. The two
 authenticated production matrices, B25 at `m=22` and B255 at `m=24`, are embedded
 in the official binary and can be regenerated from source. The Parano1d Lab
-[FROST-GKR research article](https://lab.elide.org/research/frost-gkr-global-trace-protocol/)
+[FROST-GKR research article](https://lab.jetsam.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
 
@@ -424,4 +424,4 @@ Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the
 [security policy](.github/SECURITY.md).
 
-Contact: [dev@elide.org](mailto:dev@elide.org)
+Contact: [dev@jetsam.org](mailto:dev@jetsam.org)

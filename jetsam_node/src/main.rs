@@ -880,11 +880,11 @@ impl HistoryStepCacheClass {
     name = "jetsam",
     about = "Elide full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run an Elide node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.elide/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
+    long_about = "Run an Elide node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.jetsam/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
-    /// Default: ~/.elide/elide.toml
+    /// Default: ~/.jetsam/jetsam.toml
     #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -921,7 +921,7 @@ struct Cli {
     cpu_threads: Option<usize>,
 
     /// Data directory for the MDBX database and wallet key.
-    /// Default: ~/.elide/data
+    /// Default: ~/.jetsam/data
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
@@ -5040,7 +5040,7 @@ mod tests {
     #[test]
     fn default_install_reset_discards_legacy_preferences_but_preserves_new_gui_settings() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join(".elide");
+        let root = directory.path().join(".jetsam");
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(root.join("gui-settings.json"), b"legacy GUI settings").unwrap();

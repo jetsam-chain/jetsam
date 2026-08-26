@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Network configuration for Elide mainnet.
+//! Network configuration for Jetsam mainnet.
 //!
 //! Every network participant shares these magic bytes, ports, protocol ID,
 //! and gossipsub topics. libp2p protocol IDs prevent cross-network connections.
@@ -20,7 +20,7 @@
 //!
 //! | Network  | Magic (ASCII)     |
 //! |----------|-------------------|
-//! | Mainnet  | 0x454C4431 "ELD1" |
+//! | Mainnet  | 0x4A544D31 "JTM1" |
 //!
 //! Upstream Parano1d uses 0x4E4F4944 "NOID"; the object-codec anti-injection
 //! gate relies on the two values being different.
@@ -39,7 +39,7 @@ use std::str::FromStr;
 /// an error at startup so misconfigured nodes fail fast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NetworkKind {
-    /// Elide mainnet.
+    /// Jetsam mainnet.
     #[default]
     Mainnet,
 }
@@ -108,14 +108,14 @@ impl NetworkConfig {
     pub fn mainnet() -> Self {
         Self {
             kind: NetworkKind::Mainnet,
-            // "ELD1" — ticker plus wire-format version. Upstream Parano1d
+            // "JTM1" — ticker plus wire-format version. Upstream Parano1d
             // uses "NOID"; the object codec rejects any stream whose magic
             // differs, which is what keeps the two networks from injecting
             // messages into each other.
-            magic: *b"ELD1",
+            magic: *b"JTM1",
             default_p2p_port: identity::DEFAULT_P2P_PORT,
             default_rpc_port: identity::DEFAULT_RPC_PORT,
-            // Mainnet is isolated by its genesis-bound namespace. The exact
+            // Mainnet is isolated by its protocol namespace. The exact
             // authenticated network profile adds a second fail-closed gate.
             p2p_protocol_id: identity::PROTOCOL_ID,
             topic_blocks: concat!(crate::protocol_namespace!(), "/blocks/1"),
@@ -129,7 +129,7 @@ impl NetworkConfig {
             // 2. "dnsaddr:<hostname>" → dialled as /dnsaddr/<hostname>
             //    Resolves _dnsaddr.<hostname> TXT records.  Each TXT entry
             //    encodes a full multiaddr including PeerID, e.g.:
-            //      _dnsaddr.elide.org TXT
+            //      _dnsaddr.jetsam.org TXT
             //        "dnsaddr=/ip4/1.2.3.4/tcp/9600/p2p/12D3KooW..."
             //    Connection is cryptographically verified against PeerID.
             //    This is the libp2p standard (used by IPFS, Filecoin).
@@ -139,10 +139,10 @@ impl NetworkConfig {
             // Each hostname creates an independent startup dial; unresolved
             // future seeds fail independently without delaying usable seeds.
             dns_seeds: &[
-                "mseed1.elide.org",
-                "mseed2.elide.org",
-                "mseed3.elide.org",
-                "mseed4.elide.org",
+                "mseed1.jetsam.org",
+                "mseed2.jetsam.org",
+                "mseed3.jetsam.org",
+                "mseed4.jetsam.org",
             ],
         }
     }
@@ -174,9 +174,9 @@ mod tests {
     /// fork inherited — "NOID" on the wire would let Parano1d messages through
     /// the object-codec anti-injection gate.
     #[test]
-    fn mainnet_magic_is_eld1_and_not_upstream() {
+    fn mainnet_magic_is_jtm1_and_not_upstream() {
         let magic = NetworkConfig::mainnet().magic;
-        assert_eq!(magic, *b"ELD1");
+        assert_eq!(magic, *b"JTM1");
         assert_ne!(magic, *b"NOID", "magic must differ from upstream Parano1d");
     }
 
@@ -193,12 +193,9 @@ mod tests {
     #[test]
     fn mainnet_protocol_id() {
         let mainnet = NetworkConfig::mainnet();
-        assert_eq!(mainnet.p2p_protocol_id, "/elide/mainnet/6e592c07be6fd1b4/1");
-        assert_eq!(
-            mainnet.topic_blocks,
-            "/elide/mainnet/6e592c07be6fd1b4/blocks/1"
-        );
-        assert_eq!(mainnet.topic_txs, "/elide/mainnet/6e592c07be6fd1b4/txs/1");
+        assert_eq!(mainnet.p2p_protocol_id, "/jetsam/mainnet/1.0.0");
+        assert_eq!(mainnet.topic_blocks, "/jetsam/mainnet/blocks/1");
+        assert_eq!(mainnet.topic_txs, "/jetsam/mainnet/txs/1");
     }
 
     #[test]
@@ -206,10 +203,10 @@ mod tests {
         assert_eq!(
             NetworkConfig::mainnet().dns_seeds,
             &[
-                "mseed1.elide.org",
-                "mseed2.elide.org",
-                "mseed3.elide.org",
-                "mseed4.elide.org",
+                "mseed1.jetsam.org",
+                "mseed2.jetsam.org",
+                "mseed3.jetsam.org",
+                "mseed4.jetsam.org",
             ]
         );
     }

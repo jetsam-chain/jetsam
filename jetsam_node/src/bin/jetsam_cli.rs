@@ -139,7 +139,7 @@ AMOUNT FORMAT:
   1 ELD = 1,000,000 μELD — the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: elide --mode miner --data-dir ~/.elide/data",
+  The daemon must be running: elide --mode miner --data-dir ~/.jetsam/data",
 )]
 struct Cli {
     /// JSON-RPC endpoint of the running elide daemon.

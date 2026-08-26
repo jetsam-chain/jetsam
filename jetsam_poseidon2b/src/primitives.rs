@@ -79,20 +79,20 @@ newtype_digest!(
 // Bech32m encoding for Address
 // ---------------------------------------------------------------------------
 
-/// Human-readable part for Elide bech32m addresses.
-/// Produces addresses of the form `e1q...` (~60 chars).
+/// Human-readable part for Jetsam bech32m addresses.
+/// Produces addresses of the form `j1q...` (~60 chars).
 ///
-/// ELIDE CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Elide uses
-/// `"e"` so that an address cannot be silently mistaken between the two
+/// ELIDE CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Jetsam uses
+/// `"j"` so that an address cannot be silently mistaken between the two
 /// networks — a mis-sent coinbase is unrecoverable.
-pub const ADDRESS_HRP: &str = "e";
+pub const ADDRESS_HRP: &str = "j";
 
 /// Error returned when decoding a bech32m address fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
     /// String is not a valid bech32m address.
     InvalidFormat,
-    /// Bech32m decoded OK but HRP is not `e`.
+    /// Bech32m decoded OK but HRP is not `j`.
     WrongHrp(String),
     /// Decoded payload is not exactly 32 bytes.
     WrongLength(usize),
@@ -116,7 +116,7 @@ impl std::fmt::Display for AddressError {
 impl std::error::Error for AddressError {}
 
 impl Address {
-    /// Encode this address as a bech32m string (`e1…`).
+    /// Encode this address as a bech32m string (`j1…`).
     ///
     /// This is the canonical display format. All user-facing output should
     /// call this or use the `Display` impl.
@@ -126,7 +126,7 @@ impl Address {
         bech32::encode::<Bech32m>(hrp, &self.0).expect("32 bytes always encodes")
     }
 
-    /// Decode an address from canonical bech32m (`e1…`).
+    /// Decode an address from canonical bech32m (`j1…`).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
         parse_address(s)
     }

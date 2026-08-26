@@ -8,20 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Default `~`-style node root, derived from the chain identity's data-dir
-/// name (`~/.elide`). The single source for every default path below.
+/// name (`~/.jetsam`). The single source for every default path below.
 pub fn default_home_root() -> String {
     format!("~/.{}", jetsam_chain::consensus::identity::DATA_DIR_NAME)
 }
 
-/// Default `~`-style data directory (`~/.elide/data`). Also the config
+/// Default `~`-style data directory (`~/.jetsam/data`). Also the config
 /// sentinel: a stored path equal to this string means "use the default".
 pub fn default_data_dir() -> PathBuf {
     PathBuf::from(format!("{}/data", default_home_root()))
 }
 
-/// Default `~`-style config file path (`~/.elide/elide.toml`).
+/// Default `~`-style config file path (`~/.jetsam/jetsam.toml`).
 pub fn default_config_path() -> PathBuf {
-    PathBuf::from(format!("{}/elide.toml", default_home_root()))
+    PathBuf::from(format!("{}/jetsam.toml", default_home_root()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +57,7 @@ pub struct NetworkConfig {
 pub struct StorageConfig {
     /// Storage backend: "mdbx" or "ram".
     pub backend: String,
-    /// Data directory override. Default: ~/.elide/data.
+    /// Data directory override. Default: ~/.jetsam/data.
     pub path: PathBuf,
 }
 

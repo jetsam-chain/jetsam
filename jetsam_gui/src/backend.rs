@@ -1713,7 +1713,7 @@ async fn run_node_maintenance(
 
 fn default_data_dir() -> PathBuf {
     let mut home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.push(".elide");
+    home.push(".jetsam");
     #[cfg(feature = "dev-genesis")]
     home.push("gui-dev");
     home.push("data");
@@ -1722,7 +1722,7 @@ fn default_data_dir() -> PathBuf {
 
 fn default_gui_settings_path() -> PathBuf {
     let mut path = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".elide");
+    path.push(".jetsam");
     #[cfg(feature = "dev-genesis")]
     path.push("gui-dev");
     path.push("gui-settings.json");
@@ -3257,7 +3257,7 @@ mod tests {
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
             node_binary: PathBuf::from("jetsam"),
-            seeds: vec!["seed-a.example:9700".into(), "dnsaddr:elide.network".into()],
+            seeds: vec!["seed-a.example:9700".into(), "dnsaddr:jetsam.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
             settings_path: settings_path.clone(),

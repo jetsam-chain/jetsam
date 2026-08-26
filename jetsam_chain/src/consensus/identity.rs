@@ -23,57 +23,57 @@
 //! its name. The two must not be coupled.
 
 /// Human-readable chain name, for logs, banners and user interfaces.
-pub const CHAIN_NAME: &str = "Elide";
+pub const CHAIN_NAME: &str = "Jetsam";
 
 /// Ticker used by exchanges, wallets and the block explorer.
-pub const TICKER: &str = "ELD";
+pub const TICKER: &str = "JTM";
 
-/// Smallest unit name: 1 ELD = 1_000_000 μELD.
-pub const SUBUNIT_NAME: &str = "uELD";
+/// Smallest unit name: 1 JTM = 1_000_000 μJTM.
+pub const SUBUNIT_NAME: &str = "uJTM";
 
 /// Human-readable part of bech32m addresses.
 ///
-/// Upstream Parano1d uses `"o"`, producing `o1…` addresses. Elide uses `"e"`,
-/// producing `e1…`, so an address cannot be mistaken between the two networks.
+/// Upstream Parano1d uses `"o"`, producing `o1…` addresses. Jetsam uses `"j"`,
+/// producing `j1…`, so an address cannot be mistaken between the two networks.
 ///
 /// The consensus-critical definition lives next to the address codec in
 /// `jetsam_poseidon2b`; this is the same constant, re-exposed on the identity
 /// surface rather than duplicated.
 pub const ADDRESS_HRP: &str = jetsam_poseidon2b::primitives::ADDRESS_HRP;
 
-/// Genesis-bound libp2p protocol namespace. Every stream protocol id and
-/// gossipsub topic is built from this prefix (a macro so `concat!` can build
-/// `&'static str` ids from it).
+/// libp2p protocol namespace. Every stream protocol id and gossipsub topic is
+/// built from this prefix (a macro so `concat!` can build `&'static str` ids
+/// from it).
 ///
 /// Distinct from upstream's `/noid/mainnet/...`, so the two networks refuse
 /// each other at the handshake rather than at the block-validation layer.
 #[macro_export]
 macro_rules! protocol_namespace {
     () => {
-        "/elide/mainnet/6e592c07be6fd1b4"
+        "/jetsam/mainnet"
     };
 }
 
-/// Base libp2p protocol id, version 1.
-pub const PROTOCOL_ID: &str = concat!(crate::protocol_namespace!(), "/1");
+/// Base libp2p protocol id, version 1.0.0.
+pub const PROTOCOL_ID: &str = concat!(crate::protocol_namespace!(), "/1.0.0");
 
 /// Default P2P listen port.
 ///
-/// Upstream Parano1d listens on 9600 (RPC 9601); Elide moves both so a single
-/// machine can run an Elide node and a Parano1d node without a port clash.
+/// Upstream Parano1d listens on 9600 (RPC 9601); Jetsam moves both so a single
+/// machine can run a Jetsam node and a Parano1d node without a port clash.
 pub const DEFAULT_P2P_PORT: u16 = 9700;
 
 /// Default RPC listen port (loopback only).
 pub const DEFAULT_RPC_PORT: u16 = 9701;
 
 /// On-disk data directory name, relative to the user's data root.
-pub const DATA_DIR_NAME: &str = "elide";
+pub const DATA_DIR_NAME: &str = "jetsam";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The address HRP must be distinct from upstream's, or an Elide address
+    /// The address HRP must be distinct from upstream's, or a Jetsam address
     /// and a Parano1d address could be confused by a human or a wallet.
     #[test]
     fn address_hrp_differs_from_upstream() {
@@ -93,7 +93,7 @@ mod tests {
             !PROTOCOL_ID.starts_with("/noid/"),
             "protocol id must not sit in the upstream /noid/ namespace"
         );
-        assert_eq!(PROTOCOL_ID, concat!(crate::protocol_namespace!(), "/1"));
+        assert_eq!(PROTOCOL_ID, concat!(crate::protocol_namespace!(), "/1.0.0"));
         assert!(PROTOCOL_ID.starts_with('/'), "libp2p ids start with '/'");
     }
 

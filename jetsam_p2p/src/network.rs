@@ -10238,8 +10238,8 @@ mod tests {
     fn aggregate_and_individual_dns_sources_count_one_target_peer() {
         let local = PeerId::random();
         let peer = PeerId::random();
-        let aggregate: Multiaddr = "/dnsaddr/elide.network".parse().unwrap();
-        let individual: Multiaddr = "/dns4/seed1.elide.org/tcp/9500".parse().unwrap();
+        let aggregate: Multiaddr = "/dnsaddr/jetsam.network".parse().unwrap();
+        let individual: Multiaddr = "/dns4/seed1.jetsam.org/tcp/9500".parse().unwrap();
         let first = libp2p::swarm::ConnectionId::new_unchecked(71);
         let duplicate = libp2p::swarm::ConnectionId::new_unchecked(72);
         let mut state = AutomaticPeerState::new(local);

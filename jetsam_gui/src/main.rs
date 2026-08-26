@@ -17,7 +17,7 @@ mod widgets;
 use iced::{window, Size};
 
 #[cfg(target_os = "linux")]
-const LINUX_APPLICATION_ID: &str = "org.elide.wallet";
+const LINUX_APPLICATION_ID: &str = "org.jetsam.wallet";
 
 fn app_theme(_: &app::App) -> iced::Theme {
     theme::parajetsam_theme()
