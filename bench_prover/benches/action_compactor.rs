@@ -51,7 +51,7 @@ fn row(b: &mut FieldR1csBuilder, ordinal: usize, live: bool, is_mint: bool) -> A
 }
 
 fn main() {
-    println!("PARANOID bitmap action-compactor gate");
+    println!("JETSAM bitmap action-compactor gate");
     println!("JETSAM_ACTION_TIERS=25,255 selects class runs.\n");
 
     for tier in requested_tiers() {

@@ -37,7 +37,7 @@ fn print_case(fixture: &MinimalTxFixture, result: &WalletBench) {
 fn main() {
     let _ = jetsam_ivc_prover::init_perf_thread_pool();
     let samples = samples();
-    println!("PARANOID wallet authorization — Tx8x2, samples={samples}");
+    println!("JETSAM wallet authorization — Tx8x2, samples={samples}");
     println!("Current measurements only; no pre-Tx8x2 golden comparison.\n");
 
     let cases = [

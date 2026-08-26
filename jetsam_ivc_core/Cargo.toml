@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Paranoid recursive proof core over GF(2)."
+description = "Jetsam recursive proof core over GF(2)."
 
 [features]
 # Count hash invocations via global relaxed atomics. Off by default.

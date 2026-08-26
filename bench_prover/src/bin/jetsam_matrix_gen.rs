@@ -271,7 +271,7 @@ fn main() {
 
     let zstd_level = parse_zstd_level();
     let debug = std::env::var_os("JETSAM_HISTORY_STEP_GENERATOR_DEBUG").is_some();
-    println!("PARANOID canonical HistoryStep v1 freezer");
+    println!("JETSAM canonical HistoryStep v1 freezer");
     println!("  pack:          {}", version.display());
     println!("  rayon threads: {}", rayon::current_num_threads());
     println!("  witnesses:     real genesis chain + two exact parent checkpoints");

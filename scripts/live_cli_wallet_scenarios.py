@@ -264,7 +264,7 @@ def main():
 
         print("\n=== CLI Scenario 2: basic user command output ===", flush=True)
         out, _, _ = cli(n1, ["status"])
-        assert_contains(out, "Paranoid node status", "status output")
+        assert_contains(out, "Jetsam node status", "status output")
         assert_contains(out, "Height", "status output")
         assert_contains(out, "Mempool", "status output")
 

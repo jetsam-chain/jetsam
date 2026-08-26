@@ -84,7 +84,7 @@ pub const LAB_FUND_ADDRESS: Address = Address([
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevelopmentAllocation {
-    /// The block subsidy is still inside the three-year allocation period.
+    /// The block subsidy is still inside the two-year allocation period.
     pub active: bool,
     /// The block must carry the mandatory two-output daily payout.
     pub payout_due: bool,

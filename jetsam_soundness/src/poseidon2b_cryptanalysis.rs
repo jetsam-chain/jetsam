@@ -5,7 +5,7 @@
 //! Production correspondence for the algebraic attacks in ePrint 2026/306.
 //!
 //! This module records the exact classical attack-cost projection that can be
-//! instantiated from the paper for the fixed Parano1d profile. The production
+//! instantiated from the paper for the fixed Jetsam profile. The production
 //! QROM delta remains a separate premise of the end-to-end theorem.
 
 use jetsam_poseidon2b::native::permutation::{MDS_FULL, MDS_PARTIAL};

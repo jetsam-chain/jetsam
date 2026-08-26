@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Executable soundness certificates for the production Parano1d protocol.
+//! Executable soundness certificates for the production Jetsam protocol.
 
 pub mod block_tiwari;
 pub mod exact;

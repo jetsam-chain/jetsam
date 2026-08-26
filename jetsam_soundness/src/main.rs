@@ -25,7 +25,7 @@ fn main() -> Result<(), String> {
     let ideal = &certificate.ideal_qrom;
     let category_one = &certificate.category_one;
 
-    println!("PARANO1D SOUNDNESS CERTIFICATE");
+    println!("JETSAM SOUNDNESS CERTIFICATE");
     println!("production parameter correspondence: PASS");
     println!(
         "profile: W{}/H{}, challenge support=2^{}, digest={} bits",

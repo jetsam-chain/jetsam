@@ -208,7 +208,7 @@ pub trait JetsamApi {
     // Node control
     // =========================================================================
 
-    /// Gracefully stop the Parano1d daemon.
+    /// Gracefully stop the Jetsam daemon.
     #[method(name = "stop")]
     async fn stop(&self) -> RpcResult<String>;
 

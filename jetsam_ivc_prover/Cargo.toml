@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Paranoid recursive proof prover over GF(2)."
+description = "Jetsam recursive proof prover over GF(2)."
 
 [features]
 # Forwarded to jetsam-ivc-core.

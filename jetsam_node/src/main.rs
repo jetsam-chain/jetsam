@@ -13752,7 +13752,7 @@ fn print_startup_banner(
     println!("{line}");
     // Title line: name + version + network
     let title = format!(
-        "PARANOID  {}   {}",
+        "JETSAM  {}   {}",
         b(&format!("v{version}")),
         dim(&format!(
             "·  {net_kind}{}",

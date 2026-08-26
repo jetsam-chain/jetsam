@@ -108,7 +108,7 @@ fn main() {
     assert_eq!(N_SPINE_SLOTS, 31);
     assert_eq!(N_SPINE_SLOTS_PADDED, 32);
     assert_eq!(N_SPINE_SLOT_VARS, 5);
-    println!("PARANOID current component bench — Tx8x2 only");
+    println!("JETSAM current component bench — Tx8x2 only");
     println!("Single current transaction axis; no pre-cutover golden.\n");
     bench_owner_auth();
     for n in requested_sizes() {

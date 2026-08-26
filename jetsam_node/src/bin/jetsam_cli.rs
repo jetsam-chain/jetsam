@@ -344,7 +344,7 @@ enum Command {
     },
 
     // ---- Node control ---------------------------------------------------------
-    /// Gracefully stop the Parano1d daemon.
+    /// Gracefully stop the Jetsam daemon.
     Stop,
 
     // ---- Mining (external miner API) ------------------------------------------

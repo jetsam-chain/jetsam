@@ -179,7 +179,7 @@ fn run_sample(case: Case) -> Sample {
 
 fn main() {
     let sample_count = samples();
-    println!("PARANOID PagedSpend wallet-local path, samples={sample_count}");
+    println!("JETSAM PagedSpend wallet-local path, samples={sample_count}");
     println!(
         "Includes build + logical hash + one capsule + local admission; excludes network RTT.\n"
     );

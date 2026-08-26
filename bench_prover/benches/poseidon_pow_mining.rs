@@ -56,7 +56,7 @@ fn main() {
 
     println!();
     println!("  =====================================================================");
-    println!("  PARANOID Poseidon2b PoW Mining Benchmark");
+    println!("  JETSAM Poseidon2b PoW Mining Benchmark");
     println!("  =====================================================================");
     println!("  Measures production H_POSEIDON_POW(header fields with patched nonce).");
     println!("  Override: JETSAM_POSEIDON_POW_SEQ=20000 JETSAM_POSEIDON_POW_PAR=200000");
