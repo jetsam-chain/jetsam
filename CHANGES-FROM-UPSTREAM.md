@@ -43,9 +43,15 @@ height     172 800 →     831 800   12.5    ELD/block
 height     831 800 →   1 490 800   6.25    ELD/block
 height   1 490 800 →   2 149 800   3.125   ELD/block
 height   2 149 800 →   2 808 800   1.5625  ELD/block
-height   2 808 800 →   3 467 800   0.78125 ELD/block
-height   3 467 800 →         ...   0       (emission ends, ≈9.89 years)
+height   2 808 800 →   3 467 664   0.78125 ELD/block
+height   3 467 664 →         ...   0       (emission ends, ≈9.89 years)
 ```
+
+The final tier ends at `EMISSION_END_HEIGHT` = 3 467 664, not at the naive
+seventh boundary 3 467 800: the last 136 blocks are trimmed so that the sum of
+`block_reward(h)` over every coinbase-carrying height (h ≥ 1 — genesis has no
+coinbase) equals 21 000 000 ELD exactly. The cap is enforced by the height
+schedule itself; no cumulative issuance counter exists.
 
 ## 2. Consensus — reorg fairness
 
@@ -84,8 +90,15 @@ network's miner can produce valid work for the other.
 
 - crates renamed `noid_*` → `elide_*`
 - address HRP `o` → `e` (bech32m addresses become `e1…`)
-- new protocol id, network ports, and genesis
-- chain identity consolidated into one module, `consensus/identity.rs`
+- network magic `NOID` → `ELD1`, and every stream/file magic re-prefixed
+  (leading byte `E`) so none is byte-identical to upstream's
+- default ports 9600/9601 (upstream) → 9700/9701, new protocol id
+  (`/elide/mainnet/<genesis-namespace>/1`), new genesis
+- chain identity consolidated into `consensus/identity.rs`, which is the
+  consumed source of truth: `NetworkConfig` takes its ports and protocol
+  namespace from it, the address HRP is re-exposed from the codec constant in
+  `elide_poseidon2b`, and the node's default `~/.elide` paths derive from its
+  `DATA_DIR_NAME`
 
 Domain separation tags are deliberately **not** derived from the coin name, so
 that a rebrand can never alter consensus.
@@ -96,12 +109,17 @@ Local patches previously carried out-of-tree against Parano1d are integrated
 here as defaults rather than environment flags:
 
 - template overlap (proving the next template while still mining the current)
-- `NOID_TEMPLATE_NOGATE` behaviour, which upstream requires as an environment
-  variable and without which the block template dies
+- the `NOID_TEMPLATE_NOGATE` behaviour, which upstream requires as an
+  environment variable and without which the block template dies, is now the
+  DEFAULT: templates are fabricated whenever initial sync is complete and one
+  healthy authenticated peer exists, without closing during a competing
+  block's P2P fetch. `ELIDE_TEMPLATE_STRICT_GATE=1` restores the historical
+  strict gate
 
 ## Not changed
 
 - the recursive `HistoryStep` architecture and its soundness argument
 - the FRI-Binius proving stack
 - the transparent (non-private) transaction model
-- zero premine; the genesis coinbase is still sent to an unspendable address
+- zero premine; the genesis block carries no coinbase at all — emission starts
+  at height 1

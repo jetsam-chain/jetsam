@@ -2,23 +2,30 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Network configuration for Parano1d mainnet.
+//! Network configuration for Elide mainnet.
 //!
 //! Every network participant shares these magic bytes, ports, protocol ID,
 //! and gossipsub topics. libp2p protocol IDs prevent cross-network connections.
+//! Ports and protocol ids come from [`super::identity`] — the chain's single
+//! identity surface — and are only assembled here.
 //!
-//! # Ports (no conflicts with Bitcoin 8333/8332, Ethereum 30303/8545, Monero 18080/18081)
+//! # Ports (no conflicts with upstream Parano1d 9600/9601, Bitcoin 8333/8332,
+//! Ethereum 30303/8545, Monero 18080/18081)
 //!
 //! | Network  | P2P   | RPC   |
 //! |----------|-------|-------|
-//! | Mainnet  | 9600  | 9601  |
+//! | Mainnet  | 9700  | 9701  |
 //!
 //! # Magic bytes
 //!
-//! | Network  | Magic (ASCII) |
-//! |----------|---------------|
-//! | Mainnet  | 0x4E4F4944 "ELD" |
+//! | Network  | Magic (ASCII)     |
+//! |----------|-------------------|
+//! | Mainnet  | 0x454C4431 "ELD1" |
+//!
+//! Upstream Parano1d uses 0x4E4F4944 "NOID"; the object-codec anti-injection
+//! gate relies on the two values being different.
 
+use super::identity;
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
@@ -32,7 +39,7 @@ use std::str::FromStr;
 /// an error at startup so misconfigured nodes fail fast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NetworkKind {
-    /// Parano1d mainnet.
+    /// Elide mainnet.
     #[default]
     Mainnet,
 }
@@ -101,14 +108,18 @@ impl NetworkConfig {
     pub fn mainnet() -> Self {
         Self {
             kind: NetworkKind::Mainnet,
-            magic: [0x4E, 0x4F, 0x49, 0x44], // "ELD"
-            default_p2p_port: 9600,
-            default_rpc_port: 9601,
+            // "ELD1" — ticker plus wire-format version. Upstream Parano1d
+            // uses "NOID"; the object codec rejects any stream whose magic
+            // differs, which is what keeps the two networks from injecting
+            // messages into each other.
+            magic: *b"ELD1",
+            default_p2p_port: identity::DEFAULT_P2P_PORT,
+            default_rpc_port: identity::DEFAULT_RPC_PORT,
             // Mainnet is isolated by its genesis-bound namespace. The exact
             // authenticated network profile adds a second fail-closed gate.
-            p2p_protocol_id: "/elide/mainnet/6e592c07be6fd1b4/1",
-            topic_blocks: "/elide/mainnet/6e592c07be6fd1b4/blocks/1",
-            topic_txs: "/elide/mainnet/6e592c07be6fd1b4/txs/1",
+            p2p_protocol_id: identity::PROTOCOL_ID,
+            topic_blocks: concat!(crate::protocol_namespace!(), "/blocks/1"),
+            topic_txs: concat!(crate::protocol_namespace!(), "/txs/1"),
             // DNS seeds — two formats supported:
             //
             // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9600
@@ -159,16 +170,24 @@ impl NetworkConfig {
 mod tests {
     use super::*;
 
+    /// Freeze OUR magic, and pin that it differs from the upstream value the
+    /// fork inherited — "NOID" on the wire would let Parano1d messages through
+    /// the object-codec anti-injection gate.
     #[test]
-    fn mainnet_magic_is_eld() {
-        assert_eq!(NetworkConfig::mainnet().magic, [0x4E, 0x4F, 0x49, 0x44]);
+    fn mainnet_magic_is_eld1_and_not_upstream() {
+        let magic = NetworkConfig::mainnet().magic;
+        assert_eq!(magic, *b"ELD1");
+        assert_ne!(magic, *b"NOID", "magic must differ from upstream Parano1d");
     }
 
     #[test]
     fn mainnet_ports() {
         let m = NetworkConfig::mainnet();
-        assert_eq!(m.default_p2p_port, 9600);
-        assert_eq!(m.default_rpc_port, 9601);
+        assert_eq!(m.default_p2p_port, identity::DEFAULT_P2P_PORT);
+        assert_eq!(m.default_rpc_port, identity::DEFAULT_RPC_PORT);
+        // Upstream Parano1d occupies 9600/9601.
+        assert_ne!(m.default_p2p_port, 9600);
+        assert_ne!(m.default_rpc_port, 9601);
     }
 
     #[test]

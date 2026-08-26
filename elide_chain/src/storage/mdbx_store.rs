@@ -1997,7 +1997,7 @@ impl MdbxStore {
         Ok(Some(bytes))
     }
 
-    /// Encode one canonical NAB1 block + HistoryStep terminal from a single
+    /// Encode one canonical EAB1 block + HistoryStep terminal from a single
     /// accepted-state snapshot.
     pub fn get_recent_accepted_block_bundle_bounded(
         &self,

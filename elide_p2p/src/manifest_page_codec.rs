@@ -21,8 +21,10 @@ use crate::{
     },
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"PMQ1";
-const RESPONSE_MAGIC: [u8; 4] = *b"PMS1";
+// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// stream or file magic is byte-identical to Parano1d's.
+const REQUEST_MAGIC: [u8; 4] = *b"EMQ1";
+const RESPONSE_MAGIC: [u8; 4] = *b"EMS1";
 const OBJECT_ID_BYTES: usize = 8 + 32 + 32 + 32 + 4 + 2 + 32 + 4 + 2;
 const REQUEST_BYTES: usize = 4 + OBJECT_ID_BYTES;
 const RESPONSE_HEADER_BYTES: usize = 4 + 1 + 1 + 2 + OBJECT_ID_BYTES;

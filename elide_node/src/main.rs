@@ -880,7 +880,7 @@ impl HistoryStepCacheClass {
     name = "elide",
     about = "ParanO(1)d full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.elide/data\n  elide --p2p-listen 0.0.0.0:9600 --seed 1.2.3.4:9600",
+    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.elide/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -925,16 +925,16 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
-    /// P2P listen address in HOST:PORT format. Default: 0.0.0.0:9600
+    /// P2P listen address in HOST:PORT format. Default: 0.0.0.0:9700
     #[arg(long, value_name = "HOST:PORT")]
     p2p_listen: Option<String>,
 
-    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601
+    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9701
     #[arg(long, value_name = "HOST:PORT")]
     rpc_listen: Option<String>,
 
     /// Seed peer address (HOST:PORT). Repeat for multiple seeds.
-    /// Example: --seed 1.2.3.4:9600 --seed 5.6.7.8:9600
+    /// Example: --seed 1.2.3.4:9700 --seed 5.6.7.8:9700
     #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
     seed: Vec<String>,
 
@@ -954,7 +954,7 @@ struct Cli {
     /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
     ///
     /// Pool example:
-    ///   elide --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t
+    ///   elide --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
     ///   # External miner: Authorization: Bearer s3cr3t
     #[arg(long, value_name = "TOKEN")]
     mining_key: Option<String>,
@@ -969,7 +969,7 @@ struct Cli {
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   elide --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t --allow-custom-coinbase
+    ///   elide --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
@@ -1012,8 +1012,8 @@ struct Cli {
 /// easy multi-node seed rotation via DNS.
 ///
 /// DNS setup for format 4:
-///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9600/p2p/12D3KooW..."
-///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9600/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9700/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9700/p2p/12D3KooW..."
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
     let seed = s.trim();
 
@@ -1138,7 +1138,7 @@ fn split_host_port(addr: &str) -> anyhow::Result<(&str, &str)> {
     }
     addr.rsplit_once(':').with_context(|| {
         format!(
-            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9600)",
+            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9700)",
             addr
         )
     })
@@ -1161,8 +1161,8 @@ fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> 
 
 /// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
 ///
-/// Users type:  `127.0.0.1:9600`  or  `0.0.0.0:9600`
-/// libp2p needs: `/ip4/127.0.0.1/tcp/9600`
+/// Users type:  `127.0.0.1:9700`  or  `0.0.0.0:9700`
+/// libp2p needs: `/ip4/127.0.0.1/tcp/9700`
 ///
 /// This conversion is purely internal — users never see multiaddrs.
 fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
@@ -1389,7 +1389,7 @@ fn reset_default_install_preferences(
     config_path: &Path,
     gui_supervised: bool,
 ) -> anyhow::Result<()> {
-    let root = expand_tilde(Path::new("~/.elide"));
+    let root = expand_tilde(Path::new(&config::default_home_root()));
     reset_install_preferences_at_root(&root, data_dir, config_path, gui_supervised)
 }
 
@@ -1532,7 +1532,7 @@ async fn main() -> anyhow::Result<()> {
     // --- Config file ---
     let config_path = cli
         .config
-        .unwrap_or_else(|| expand_tilde(&PathBuf::from("~/.elide/elide.toml")));
+        .unwrap_or_else(|| expand_tilde(&config::default_config_path()));
     let mut config_defaults = NodeConfig::default();
     config_defaults.network.listen = Some(format!("0.0.0.0:{}", net.default_p2p_port));
     config_defaults.rpc.listen = Some(net.default_rpc_listen());
@@ -1546,8 +1546,8 @@ async fn main() -> anyhow::Result<()> {
     // Resolve the selected storage directory before any matrix cache, wallet,
     // database or P2P identity is opened. The one-time mainnet reset must be
     // the first writer and carries no testnet data into mainnet.
-    let data_dir = if cfg.storage.path == Path::new("~/.elide/data") {
-        expand_tilde(Path::new("~/.elide/data"))
+    let data_dir = if cfg.storage.path == config::default_data_dir() {
+        expand_tilde(&config::default_data_dir())
     } else {
         expand_tilde(&cfg.storage.path)
     };
@@ -5077,15 +5077,15 @@ mod tests {
         )
         .unwrap();
         let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9600".into());
-        defaults.rpc.listen = Some("127.0.0.1:9601".into());
+        defaults.network.listen = Some("0.0.0.0:9700".into());
+        defaults.rpc.listen = Some("127.0.0.1:9701".into());
         defaults.storage.path = directory.path().join("mainnet-data");
 
         reset_node_config(&config_path, &defaults).unwrap();
         let (loaded, created) = load_or_create_config(&config_path, &defaults).unwrap();
         assert!(!created);
-        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9600"));
-        assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9601"));
+        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9700"));
+        assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9701"));
         assert_eq!(loaded.storage.path, defaults.storage.path);
     }
 
@@ -5652,14 +5652,14 @@ mod tests {
     #[test]
     fn p2p_listener_accepts_socket_and_multiaddr_forms() {
         assert_eq!(
-            p2p_listen_to_multiaddr("0.0.0.0:9600").unwrap().to_string(),
-            "/ip4/0.0.0.0/tcp/9600"
+            p2p_listen_to_multiaddr("0.0.0.0:9700").unwrap().to_string(),
+            "/ip4/0.0.0.0/tcp/9700"
         );
         assert_eq!(
-            p2p_listen_to_multiaddr("/ip4/0.0.0.0/tcp/9600")
+            p2p_listen_to_multiaddr("/ip4/0.0.0.0/tcp/9700")
                 .unwrap()
                 .to_string(),
-            "/ip4/0.0.0.0/tcp/9600"
+            "/ip4/0.0.0.0/tcp/9700"
         );
     }
 
@@ -5667,32 +5667,32 @@ mod tests {
     fn seed_parser_accepts_gui_and_operator_forms_without_losing_peer_id() {
         let peer = libp2p::PeerId::random();
         assert_eq!(
-            seed_to_multiaddr("seed.example:9600", 9600)
+            seed_to_multiaddr("seed.example:9700", 9700)
                 .unwrap()
                 .to_string(),
-            "/dns/seed.example/tcp/9600"
+            "/dns/seed.example/tcp/9700"
         );
         assert_eq!(
-            seed_to_multiaddr("203.0.113.10:9600", 9600)
+            seed_to_multiaddr("203.0.113.10:9700", 9700)
                 .unwrap()
                 .to_string(),
-            "/ip4/203.0.113.10/tcp/9600"
+            "/ip4/203.0.113.10/tcp/9700"
         );
         assert_eq!(
-            seed_to_multiaddr("[2001:db8::10]:9600", 9600)
+            seed_to_multiaddr("[2001:db8::10]:9700", 9700)
                 .unwrap()
                 .to_string(),
-            "/ip6/2001:db8::10/tcp/9600"
+            "/ip6/2001:db8::10/tcp/9700"
         );
         assert_eq!(
-            seed_to_multiaddr("dnsaddr:example.net", 9600)
+            seed_to_multiaddr("dnsaddr:example.net", 9700)
                 .unwrap()
                 .to_string(),
             "/dnsaddr/example.net"
         );
-        let explicit = format!("/ip4/203.0.113.10/tcp/9600/p2p/{peer}");
+        let explicit = format!("/ip4/203.0.113.10/tcp/9700/p2p/{peer}");
         assert_eq!(
-            seed_to_multiaddr(&explicit, 9600).unwrap().to_string(),
+            seed_to_multiaddr(&explicit, 9700).unwrap().to_string(),
             explicit
         );
     }
@@ -5700,25 +5700,25 @@ mod tests {
     #[test]
     fn system_seed_resolution_is_deduplicated_and_bounded() {
         let mut answers = vec![
-            "203.0.113.10:9600".parse().unwrap(),
-            "[2001:db8::10]:9600".parse().unwrap(),
-            "203.0.113.10:9600".parse().unwrap(),
+            "203.0.113.10:9700".parse().unwrap(),
+            "[2001:db8::10]:9700".parse().unwrap(),
+            "203.0.113.10:9700".parse().unwrap(),
         ];
         answers.extend((1..=20).map(|host| {
             std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, host)),
-                9600,
+                9700,
             )
         }));
-        let resolved = resolved_system_seed_addrs(answers, 9600);
+        let resolved = resolved_system_seed_addrs(answers, 9700);
         assert_eq!(resolved.len(), MAX_SYSTEM_ADDRS_PER_SEED);
-        assert_eq!(resolved[0].to_string(), "/ip4/203.0.113.10/tcp/9600");
-        assert_eq!(resolved[1].to_string(), "/ip6/2001:db8::10/tcp/9600");
+        assert_eq!(resolved[0].to_string(), "/ip4/203.0.113.10/tcp/9700");
+        assert_eq!(resolved[1].to_string(), "/ip6/2001:db8::10/tcp/9700");
     }
 
     #[tokio::test]
     async fn system_seed_resolution_uses_native_localhost_lookup() {
-        let resolved = resolve_embedded_seed_with_system_dns("localhost", 9600)
+        let resolved = resolve_embedded_seed_with_system_dns("localhost", 9700)
             .await
             .unwrap();
         assert!(!resolved.is_empty());
@@ -5729,17 +5729,17 @@ mod tests {
                 Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
             ) && matches!(
                 protocols.next(),
-                Some(libp2p::multiaddr::Protocol::Tcp(9600))
+                Some(libp2p::multiaddr::Protocol::Tcp(9700))
             )
         }));
     }
 
     #[tokio::test]
     async fn embedded_seed_keeps_dns_reresolution_after_native_lookup() {
-        let resolved = embedded_seed_multiaddrs("localhost", 9600).await.unwrap();
+        let resolved = embedded_seed_multiaddrs("localhost", 9700).await.unwrap();
         assert!(resolved
             .iter()
-            .any(|addr| addr.to_string() == "/dns/localhost/tcp/9600"));
+            .any(|addr| addr.to_string() == "/dns/localhost/tcp/9700"));
         assert!(resolved.iter().any(|addr| {
             matches!(
                 addr.iter().next(),
@@ -5774,8 +5774,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("nested/elide.toml");
         let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9600".into());
-        defaults.rpc.listen = Some("127.0.0.1:9601".into());
+        defaults.network.listen = Some("0.0.0.0:9700".into());
+        defaults.rpc.listen = Some("127.0.0.1:9701".into());
 
         let (created_config, created) = load_or_create_config(&path, &defaults).unwrap();
         assert!(created);

@@ -21,9 +21,11 @@ use crate::{
     protocol::{GetHistoryStepTerminalRequest, GetHistoryStepTerminalResponse},
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NTR1";
+// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// stream or file magic is byte-identical to Parano1d's.
+const REQUEST_MAGIC: [u8; 4] = *b"ETR1";
 const REQUEST_BYTES: usize = 4 + 8 + 32;
-const RESPONSE_MAGIC: [u8; 4] = *b"NTS2";
+const RESPONSE_MAGIC: [u8; 4] = *b"ETS2";
 const RESPONSE_HEADER_BYTES: usize = 4 + 4 + 8 + 32 + 1 + 1 + 2;
 const NONE_LEN: u32 = u32::MAX;
 

@@ -41,9 +41,9 @@ use crate::model::{
     WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 
-const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9601";
-const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9601";
-const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9600";
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9701";
+const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9701";
+const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9700";
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
 const NETWORK_STORAGE_EPOCH: &[u8] = b"elide/mainnet/network-storage/v1/6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44\n";
 const STATE_SEGMENT_LOG: u32 = 16;
@@ -3096,8 +3096,8 @@ mod tests {
     #[test]
     fn loopback_rpc_url_yields_a_daemon_listen_address() {
         assert_eq!(
-            rpc_listen_from_url("http://127.0.0.1:9601"),
-            Some("127.0.0.1:9601")
+            rpc_listen_from_url("http://127.0.0.1:9701"),
+            Some("127.0.0.1:9701")
         );
         assert_eq!(
             rpc_listen_from_url("http://127.0.0.1:9411/rpc"),
@@ -3257,7 +3257,7 @@ mod tests {
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
             node_binary: PathBuf::from("elide"),
-            seeds: vec!["seed-a.example:9600".into(), "dnsaddr:elide.network".into()],
+            seeds: vec!["seed-a.example:9700".into(), "dnsaddr:elide.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
             settings_path: settings_path.clone(),

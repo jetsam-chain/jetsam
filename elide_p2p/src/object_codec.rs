@@ -20,8 +20,10 @@ use crate::{
     },
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NOQ2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NOS2";
+// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// stream or file magic is byte-identical to Parano1d's.
+const REQUEST_MAGIC: [u8; 4] = *b"EOQ2";
+const RESPONSE_MAGIC: [u8; 4] = *b"EOS2";
 const FIXED_HEADER_BYTES: usize = 8;
 const TERMINAL_ID_BYTES: usize = 1 + 8 + 32 + 1 + 32 + 4;
 const AVAILABLE: u8 = 1;

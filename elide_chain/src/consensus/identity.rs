@@ -9,7 +9,9 @@
 //!
 //! Renaming the chain must be a one-file edit, not an archaeology exercise. Every
 //! value below is brand-facing: it can change freely up to the mainnet genesis,
-//! and never after.
+//! and never after. [`crate::consensus::network::NetworkConfig`] builds the
+//! wire-level configuration from these constants; nothing else may restate
+//! them.
 //!
 //! # What is deliberately NOT here
 //!
@@ -33,22 +35,36 @@ pub const SUBUNIT_NAME: &str = "uELD";
 ///
 /// Upstream Parano1d uses `"o"`, producing `o1…` addresses. Elide uses `"e"`,
 /// producing `e1…`, so an address cannot be mistaken between the two networks.
-pub const ADDRESS_HRP: &str = "e";
-
-/// libp2p protocol id prefix. All sync stream protocols are built from this.
 ///
-/// Distinct from upstream's `/elide/mainnet/1.0.0`, so the two networks refuse
+/// The consensus-critical definition lives next to the address codec in
+/// `elide_poseidon2b`; this is the same constant, re-exposed on the identity
+/// surface rather than duplicated.
+pub const ADDRESS_HRP: &str = elide_poseidon2b::primitives::ADDRESS_HRP;
+
+/// Genesis-bound libp2p protocol namespace. Every stream protocol id and
+/// gossipsub topic is built from this prefix (a macro so `concat!` can build
+/// `&'static str` ids from it).
+///
+/// Distinct from upstream's `/noid/mainnet/...`, so the two networks refuse
 /// each other at the handshake rather than at the block-validation layer.
-pub const PROTOCOL_ID: &str = "/elide/mainnet/1.0.0";
+#[macro_export]
+macro_rules! protocol_namespace {
+    () => {
+        "/elide/mainnet/6e592c07be6fd1b4"
+    };
+}
+
+/// Base libp2p protocol id, version 1.
+pub const PROTOCOL_ID: &str = concat!(crate::protocol_namespace!(), "/1");
 
 /// Default P2P listen port.
 ///
-/// Chosen away from upstream's 9500 so a single machine can run both an Elide
-/// node and a Parano1d node without a port clash.
-pub const DEFAULT_P2P_PORT: u16 = 9600;
+/// Upstream Parano1d listens on 9600 (RPC 9601); Elide moves both so a single
+/// machine can run an Elide node and a Parano1d node without a port clash.
+pub const DEFAULT_P2P_PORT: u16 = 9700;
 
 /// Default RPC listen port (loopback only).
-pub const DEFAULT_RPC_PORT: u16 = 9601;
+pub const DEFAULT_RPC_PORT: u16 = 9701;
 
 /// On-disk data directory name, relative to the user's data root.
 pub const DATA_DIR_NAME: &str = "elide";
@@ -73,18 +89,40 @@ mod tests {
     /// separate at the handshake.
     #[test]
     fn protocol_id_differs_from_upstream() {
-        assert_ne!(
-            PROTOCOL_ID, "/noid/mainnet/1.0.0",
-            "protocol id must differ from the upstream one"
+        assert!(
+            !PROTOCOL_ID.starts_with("/noid/"),
+            "protocol id must not sit in the upstream /noid/ namespace"
         );
+        assert_eq!(PROTOCOL_ID, concat!(crate::protocol_namespace!(), "/1"));
         assert!(PROTOCOL_ID.starts_with('/'), "libp2p ids start with '/'");
     }
 
-    /// Ports must not collide with upstream defaults.
+    /// Ports must not collide with the upstream defaults, which are 9600 (P2P)
+    /// and 9601 (RPC) — not 9500, as a previous revision of this test assumed.
     #[test]
     fn ports_do_not_collide_with_upstream() {
-        assert_ne!(DEFAULT_P2P_PORT, 9500);
-        assert_ne!(DEFAULT_RPC_PORT, 9500);
+        assert_ne!(DEFAULT_P2P_PORT, 9600, "upstream P2P port");
+        assert_ne!(DEFAULT_RPC_PORT, 9601, "upstream RPC port");
         assert_ne!(DEFAULT_P2P_PORT, DEFAULT_RPC_PORT);
+    }
+
+    /// The identity constants are the single source of truth: the wire-level
+    /// network configuration must consume them, not restate them.
+    #[test]
+    fn network_config_consumes_the_identity_constants() {
+        let mainnet = crate::consensus::network::NetworkConfig::mainnet();
+        assert_eq!(mainnet.default_p2p_port, DEFAULT_P2P_PORT);
+        assert_eq!(mainnet.default_rpc_port, DEFAULT_RPC_PORT);
+        assert_eq!(mainnet.p2p_protocol_id, PROTOCOL_ID);
+        assert!(mainnet
+            .topic_blocks
+            .starts_with(crate::protocol_namespace!()));
+        assert!(mainnet.topic_txs.starts_with(crate::protocol_namespace!()));
+    }
+
+    /// The identity HRP is the address codec's HRP — one constant, two names.
+    #[test]
+    fn address_hrp_is_the_codec_constant() {
+        assert_eq!(ADDRESS_HRP, elide_poseidon2b::primitives::ADDRESS_HRP);
     }
 }

@@ -1669,7 +1669,7 @@ fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
 }
 
 fn network_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
-    let listen = text_input("0.0.0.0:9600", &app.settings_p2p_listen)
+    let listen = text_input("0.0.0.0:9700", &app.settings_p2p_listen)
         .on_input(Message::SettingsP2pListenChanged)
         .size(14)
         .padding([8, 10])

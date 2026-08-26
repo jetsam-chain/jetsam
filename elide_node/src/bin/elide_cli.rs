@@ -146,7 +146,7 @@ struct Cli {
     #[arg(
         long,
         short = 'r',
-        default_value = "http://127.0.0.1:9601",
+        default_value = "http://127.0.0.1:9701",
         env = "ELIDE_RPC",
         value_name = "URL",
         global = true
@@ -492,7 +492,7 @@ fn print_error(msg: &str) {
     {
         "Node is not responding.\n\
              Is the elide daemon running?  Try: elide --mode miner\n\
-             Default RPC: http://127.0.0.1:9601  (override with --rpc)"
+             Default RPC: http://127.0.0.1:9701  (override with --rpc)"
             .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
         // Extract amounts from error if possible
