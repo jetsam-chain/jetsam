@@ -5,7 +5,7 @@
 //! # jetsam_p2p — libp2p Networking for Jetsam
 //!
 //! Implements:
-//! - GossipSub broadcast: blocks (/paranoid/blocks/1), txs (/paranoid/txs/1)
+//! - GossipSub broadcast: blocks (`<namespace>/blocks/1`), txs (`<namespace>/txs/1`)
 //! - Request-Response: headers, complete recent-block bundles, and HistoryStep terminals
 //! - Identify + Ping for peer management
 

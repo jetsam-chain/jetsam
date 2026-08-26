@@ -279,7 +279,7 @@ mod tests {
             page: SnapshotManifestPageRef {
                 page_index: 0,
                 byte_digest: jetsam_poseidon2b::native::poseidon2b_hash_bytes(
-                    b"PARANO1D/P2P/SNAPSHOT-MANIFEST-PAGE/V1",
+                    b"JTM/P2P/SNAPSHOT-MANIFEST-PAGE/V1",
                     bytes,
                 ),
                 encoded_len: bytes.len() as u32,

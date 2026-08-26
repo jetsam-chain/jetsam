@@ -2385,7 +2385,7 @@ fn schedule_manifest_page_requests(
                     .collect::<Vec<_>>();
                 providers.sort_by_key(|peer| {
                     let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"PARANO1D/P2P/MANIFEST-PAGE-SOURCE/V1");
+                    hasher.update(b"JTM/P2P/MANIFEST-PAGE-SOURCE/V1");
                     hasher.update(&swarm.local_peer_id().to_bytes());
                     hasher.update(&key.snapshot.manifest_digest);
                     hasher.update(&page_index.to_le_bytes());
