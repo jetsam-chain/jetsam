@@ -41,8 +41,16 @@ pub fn next_target(
     height: u64,
     timestamp: u64,
 ) -> [u8; 32] {
+    // `actual` below spans anchor → PARENT (the caller feeds the parent's
+    // timestamp), which is `height - anchor_height - 1` block intervals. The
+    // ideal elapsed time must count the same number of intervals; counting
+    // `height - anchor_height` would overstate `ideal` by one BLOCK_TIME per
+    // call, a constant bias that compounds at every epoch-anchor refresh and
+    // shifts the only stationary cadence from BLOCK_TIME to
+    // BLOCK_TIME × EPOCH_LENGTH / (EPOCH_LENGTH - 1).
     let ideal = height
         .saturating_sub(anchor_height)
+        .saturating_sub(1)
         .saturating_mul(BLOCK_TIME) as i64;
     // Saturate: if timestamp < anchor, treat as 0 elapsed (can't go negative).
     // Cap at i64::MAX to avoid overflow when casting for the exponent calculation.
@@ -452,14 +460,18 @@ mod tests {
     use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE};
 
     fn as_u128(t: &[u8; 32]) -> u128 {
-        // Use only low 16 bytes for approximate comparison.
-        u128::from_le_bytes(t[..16].try_into().unwrap())
+        // Compare the HIGH 16 bytes. Real targets live near 2^238, so their low
+        // 128 bits are zero — the previous helper read `t[..16]` and silently
+        // compared 0 against 0, making the ratio assertions vacuous.
+        u128::from_le_bytes(t[16..32].try_into().unwrap())
     }
 
     #[test]
     fn on_time_target_unchanged() {
+        // The caller feeds the PARENT's timestamp: the parent of the child at
+        // height h sits at height h-1, on schedule at (h-1) × BLOCK_TIME.
         for h in [1u64, 6, 100] {
-            let new = next_target(0, 0, &GENESIS_TARGET, h, h * BLOCK_TIME);
+            let new = next_target(0, 0, &GENESIS_TARGET, h, (h - 1) * BLOCK_TIME);
             // Rounding in fixed-point ≤ 1 bit difference.
             let orig = as_u128(&GENESIS_TARGET);
             let got = as_u128(&new);
@@ -470,11 +482,11 @@ mod tests {
 
     #[test]
     fn fast_blocks_raise_difficulty() {
-        // 6 blocks in half the ideal time → difficulty doubles (target halves).
-        // Use BLOCK_TIME-relative values so the test stays correct regardless of
-        // what BLOCK_TIME is set to.
-        let ideal = 6 * BLOCK_TIME; // ideal elapsed for 6 blocks
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal / 2); // 2× fast
+        // Child at height 13: the anchor→parent span is 12 intervals. Blocks
+        // arriving 2× fast put the parent HALFLIFE = 6 × BLOCK_TIME seconds
+        // ahead of schedule, so the target halves (difficulty doubles).
+        let ideal = 12 * BLOCK_TIME; // ideal anchor→parent elapsed
+        let new = next_target(0, 0, &GENESIS_TARGET, 13, ideal / 2); // 2× fast
         assert!(
             le256_lt(&new, &GENESIS_TARGET),
             "fast: target must decrease (got >= genesis)"
@@ -492,26 +504,35 @@ mod tests {
 
     #[test]
     fn slow_blocks_behavior() {
-        // 6 blocks in 2× the ideal time → ASERT doubles the target.
+        // Child at height 13: 12 intervals at 2× the ideal time puts the parent
+        // two halflives behind schedule → ASERT quadruples the target.
         // In test mode: no floor, so target CAN exceed GENESIS_TARGET.
         // In production: floor clamps result to GENESIS_TARGET.
-        let ideal = 6 * BLOCK_TIME;
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal * 2); // 2× slow
+        let ideal = 12 * BLOCK_TIME;
+        let new = next_target(0, 0, &GENESIS_TARGET, 13, ideal * 2); // 2× slow
 
-        // test mode: ASERT freely doubles the target above genesis
+        // test mode: ASERT freely raises the target above genesis
         assert!(
             le256_lt(&GENESIS_TARGET, &new),
             "test mode: 2× slow blocks from genesis anchor should exceed GENESIS_TARGET"
         );
+        let orig = as_u128(&GENESIS_TARGET);
+        let got = as_u128(&new);
+        let quad = orig * 4;
+        let tol = quad / 50;
+        assert!(
+            got >= quad - tol && got <= quad + tol,
+            "slow: expected ~4×orig={quad}, got={got}"
+        );
 
         // If anchor is harder than genesis, ASERT eases difficulty toward genesis.
         let hard_anchor = {
-            let orig = as_u128(&GENESIS_TARGET);
-            let mut t = [0u8; 32];
-            t[..16].copy_from_slice(&(orig / 2).to_le_bytes());
+            let mut t = GENESIS_TARGET;
+            // Halve 2^238: clear bit 6 of byte 29, set bit 5 → 2^237.
+            t[29] = 0x20;
             t
         };
-        let new2 = next_target(0, 0, &hard_anchor, 6, ideal * 2);
+        let new2 = next_target(0, 0, &hard_anchor, 13, ideal * 2);
         // Easier than anchor (difficulty decreased)
         assert!(
             le256_lt(&hard_anchor, &new2),
@@ -568,8 +589,10 @@ mod tests {
 
     #[test]
     fn halflife_doubles_target() {
-        // HALFLIFE seconds behind schedule → target should double.
-        let t = next_target(0, 0, &GENESIS_TARGET, 1, BLOCK_TIME + HALFLIFE);
+        // HALFLIFE seconds behind schedule → target should double. For the
+        // child at height 1 the anchor→parent span is zero intervals, so the
+        // parent timestamp itself is the lateness.
+        let t = next_target(0, 0, &GENESIS_TARGET, 1, HALFLIFE);
         let orig = as_u128(&GENESIS_TARGET);
         let got = as_u128(&t);
         let dbl = orig * 2;

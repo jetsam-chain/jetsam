@@ -424,10 +424,13 @@ mod tests {
 
         // Document precisely what was removed: under the upstream rule the two
         // children would have been handed different targets, hence different
-        // fork-choice weights, for a field the miner picks freely.
+        // fork-choice weights, for a field the miner picks freely. Evaluate on
+        // GENESIS_TARGET rather than the trivial TEST_TARGET so the two
+        // results are not both flattened by the MAX_TARGET clamp.
+        use crate::consensus::params::GENESIS_TARGET;
         assert_ne!(
-            next_target(0, genesis.timestamp, &TEST_TARGET, 1, early.timestamp),
-            next_target(0, genesis.timestamp, &TEST_TARGET, 1, late.timestamp),
+            next_target(0, genesis.timestamp, &GENESIS_TARGET, 1, early.timestamp),
+            next_target(0, genesis.timestamp, &GENESIS_TARGET, 1, late.timestamp),
             "upstream rule: target tracked the block's own timestamp"
         );
     }
