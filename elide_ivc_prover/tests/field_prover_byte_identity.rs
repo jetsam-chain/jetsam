@@ -38,12 +38,16 @@ fn field_proof_byte_digest() {
         all.extend_from_slice(&digest);
     }
     let top = elide_poseidon2b::native::poseidon2b_hash_byte_slices(b"BYTE-IDENTITY-TOP", &[&all]);
-    // Pinned after the selected History query floor changed from 125 to 133.
-    // The resident and authenticated compact provers below remain byte-exact,
-    // so this pin still catches accidental transcript perturbations.
+    // Re-pinned after the TowerHash round-constant regeneration: the
+    // Fiat-Shamir challenger runs on Poseidon2b, so swapping the permutation's
+    // round constants changed every transcript byte, and the previous pin
+    // (daf191ff…, taken after the History query floor moved 125 -> 133) was
+    // never re-derived. The resident and authenticated compact provers below
+    // remain byte-exact to each other, so this pin still catches accidental
+    // transcript perturbations.
     assert_eq!(
         hex(&top),
-        "daf191ff9a2fccc3036a0b45abe3623d3f6bf986d6cddb601848ffaab4641f72",
+        "075323479e3aea937d9c10538ff74b23c08cccd4d3ec7cf1398871c05c0abc89",
         "proof bytes changed — the transcript must be byte-stable"
     );
 }
