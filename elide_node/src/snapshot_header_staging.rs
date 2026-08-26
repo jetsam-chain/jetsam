@@ -1384,9 +1384,10 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    // ELIDE: re-mined after the parent-anchored ASERT change and the
-                    // 90s block time, both of which move this fixture's target (58_902 upstream).
-                    nonce: 359_142,
+                    // ELIDE: re-mined (print_new_fixture_nonce) after TowerHash
+                    // and the ASERT interval-count fix, both of which move this
+                    // fixture's target (58_902 upstream, then 359_142).
+                    nonce: 162_878,
                     // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
                     difficulty_target: next_target(
                         anchor_height,
@@ -1445,9 +1446,10 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        // ELIDE: re-mined after the parent-anchored ASERT change and the hardened this
-        // fixture's target (was 382_055 upstream).
-        .into_block(422_266)
+        // ELIDE: re-mined (print_new_native_coinbase_child_nonce) after
+        // TowerHash and the ASERT interval-count fix, both of which move this
+        // fixture's target (382_055 upstream, then 422_266).
+        .into_block(31_746)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a

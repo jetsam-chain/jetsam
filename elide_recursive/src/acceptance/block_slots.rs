@@ -254,7 +254,12 @@ const _: () =
 
 /// Class-independent nonce-free suffix: direct accumulator transition plus
 /// the exact semantic `SEMHDR` replay. Every row is known at template time.
-const DIRECT_BLOCK_TAIL_ROWS: usize = 4_042;
+///
+/// ELIDE: 3_774, was 4_042 — the power-of-two `TX_EPOCH_BLOCKS` slimmed the
+/// epoch recomposition of the accumulator transition. Cross-checked at run
+/// time by the `debug_assert` in the direct-tail builder and the row-count
+/// assertion in `direct_tail_is_nonce_free_across_the_epoch_edge`.
+const DIRECT_BLOCK_TAIL_ROWS: usize = 3_774;
 
 fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
     pin_eq(b, &a[0], &c[0]);

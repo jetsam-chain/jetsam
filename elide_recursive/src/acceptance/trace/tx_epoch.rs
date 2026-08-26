@@ -2,10 +2,10 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Exact 144-block transaction-epoch boundary arithmetic.
+//! Exact `TX_EPOCH_BLOCKS`-block transaction-epoch boundary arithmetic.
 //!
-//! The trace proves `height = 144 * quotient + remainder`, `remainder < 144`,
-//! and derives `boundary = (remainder == 0)`. Only quotient and remainder are
+//! The trace proves `height = TX_EPOCH_BLOCKS * quotient + remainder`,
+//! `remainder < TX_EPOCH_BLOCKS`, and derives `boundary = (remainder == 0)`. Only quotient and remainder are
 //! witness values. The boundary selector is an expression over constrained
 //! remainder bits and is never supplied by the prover as an independent bit.
 
@@ -130,12 +130,12 @@ mod tests {
         for (height, expected_boundary) in [
             (0, true),
             (1, false),
-            (143, false),
-            (144, true),
-            (145, false),
-            (287, false),
-            (288, true),
-            (289, false),
+            (TX_EPOCH_BLOCKS - 1, false),
+            (TX_EPOCH_BLOCKS, true),
+            (TX_EPOCH_BLOCKS + 1, false),
+            (2 * TX_EPOCH_BLOCKS - 1, false),
+            (2 * TX_EPOCH_BLOCKS, true),
+            (2 * TX_EPOCH_BLOCKS + 1, false),
         ] {
             let decomposition = checked_tx_epoch_height_decomposition(height).unwrap();
             assert!(
@@ -165,8 +165,9 @@ mod tests {
 
     #[test]
     fn quotient_remainder_boundary_and_height_mutations_are_unsatisfiable() {
+        let epoch = TX_EPOCH_BLOCKS;
         assert!(satisfies(
-            144,
+            epoch,
             TxEpochHeightDecomposition {
                 quotient: 1,
                 remainder: 0,
@@ -174,46 +175,46 @@ mod tests {
             true,
         ));
 
-        // q mutation: 0*144+0 != 144.
+        // q mutation: 0*epoch+0 != epoch.
         assert!(!satisfies(
-            144,
+            epoch,
             TxEpochHeightDecomposition {
                 quotient: 0,
                 remainder: 0,
             },
             true,
         ));
-        // r mutation: 1*144+2 != 145.
+        // r mutation: 1*epoch+2 != epoch+1.
         assert!(!satisfies(
-            145,
+            epoch + 1,
             TxEpochHeightDecomposition {
                 quotient: 1,
                 remainder: 2,
             },
             false,
         ));
-        // Non-canonical alternative decomposition 144 = 0*144 + 144 is
+        // Non-canonical alternative decomposition epoch = 0*epoch + epoch is
         // rejected by the strict remainder bound.
         assert!(!satisfies(
-            144,
+            epoch,
             TxEpochHeightDecomposition {
                 quotient: 0,
-                remainder: 144,
+                remainder: u8::try_from(epoch).unwrap(),
             },
             false,
         ));
         // Boundary mutation: r=0 derives one, so claiming zero is impossible.
         assert!(!satisfies(
-            144,
+            epoch,
             TxEpochHeightDecomposition {
                 quotient: 1,
                 remainder: 0,
             },
             false,
         ));
-        // Height mutation against the honest decomposition for 144.
+        // Height mutation against the honest decomposition for the boundary.
         assert!(!satisfies(
-            145,
+            epoch + 1,
             TxEpochHeightDecomposition {
                 quotient: 1,
                 remainder: 0,

@@ -5802,28 +5802,34 @@ mod tests {
     #[test]
     fn sync_mode_uses_guaranteed_object_serving_window_boundary() {
         let retention = elide_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
-        assert_eq!(
-            retention, 42,
-            "the operational exact-object serving window is 42 blocks"
-        );
         let local_height = 100;
 
         assert!(!gap_requires_snapshot_sync(local_height, local_height));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 41));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 42));
-        assert!(gap_requires_snapshot_sync(local_height, local_height + 43));
+        assert!(!gap_requires_snapshot_sync(
+            local_height,
+            local_height + retention - 1
+        ));
+        assert!(!gap_requires_snapshot_sync(
+            local_height,
+            local_height + retention
+        ));
+        assert!(gap_requires_snapshot_sync(
+            local_height,
+            local_height + retention + 1
+        ));
     }
 
     #[test]
     fn serving_reserve_does_not_change_finality_or_snapshot_suffix() {
-        assert_eq!(elide_chain::consensus::params::CONSENSUS_FINALITY_DEPTH, 18);
+        use elide_chain::consensus::params::{
+            CONSENSUS_FINALITY_DEPTH, RECENT_BLOCK_RETENTION_DEPTH, RETAINED_BLOCK_SERVING_DEPTH,
+        };
+        // The authenticated snapshot suffix stays pinned to consensus finality,
+        // and the serving reserve only ADDS the bounded fork-recovery margin.
+        assert_eq!(RECENT_BLOCK_RETENTION_DEPTH, CONSENSUS_FINALITY_DEPTH);
         assert_eq!(
-            elide_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
-            18
-        );
-        assert_eq!(
-            elide_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH,
-            42
+            RETAINED_BLOCK_SERVING_DEPTH,
+            CONSENSUS_FINALITY_DEPTH + RECENT_BLOCK_RETENTION_DEPTH + 6
         );
     }
 
@@ -5867,8 +5873,17 @@ mod tests {
 
     #[test]
     fn shorter_peer_discovery_reads_only_the_complete_nonfinal_window() {
-        assert_eq!(nonfinal_header_discovery_range(100), Some((82, 19)));
-        assert_eq!(nonfinal_header_discovery_range(10), Some((0, 11)));
+        let finality = elide_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
+        assert_eq!(
+            nonfinal_header_discovery_range(100),
+            Some((100 - finality, finality as u16 + 1))
+        );
+        // Below one finality window the floor saturates at genesis.
+        let shallow = finality / 2;
+        assert_eq!(
+            nonfinal_header_discovery_range(shallow),
+            Some((0, shallow as u16 + 1))
+        );
         assert_eq!(nonfinal_header_discovery_range(0), None);
     }
 
@@ -5936,7 +5951,6 @@ mod tests {
             CONNECTED_TIP_PROBE_HEADERS,
             elide_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
         );
-        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
     }
 
     #[test]
@@ -6138,8 +6152,12 @@ mod tests {
 
     #[test]
     fn ancestor_search_stops_after_the_complete_nonfinal_window() {
-        assert!(header_batch_exhausts_nonfinal_window(100, 82));
-        assert!(!header_batch_exhausts_nonfinal_window(100, 83));
+        let finality = elide_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
+        assert!(header_batch_exhausts_nonfinal_window(100, 100 - finality));
+        assert!(!header_batch_exhausts_nonfinal_window(
+            100,
+            100 - finality + 1
+        ));
         assert!(header_batch_exhausts_nonfinal_window(10, 0));
     }
 
@@ -6598,13 +6616,14 @@ mod tests {
 
     #[test]
     fn snapshot_epoch_anchor_obeys_start_of_block_boundaries() {
+        let epoch = elide_chain::consensus::params::TX_EPOCH_BLOCKS;
         for (tip_height, expected_epoch_height) in [
-            (143, 0),
-            (144, 0),
-            (145, 144),
-            (5_327, 5_184),
-            (5_328, 5_184),
-            (5_329, 5_328),
+            (epoch - 1, 0),
+            (epoch, 0),
+            (epoch + 1, epoch),
+            (37 * epoch - 1, 36 * epoch),
+            (37 * epoch, 36 * epoch),
+            (37 * epoch + 1, 37 * epoch),
         ] {
             let mut tip_header = elide_chain::consensus::genesis_header();
             tip_header.height = tip_height;

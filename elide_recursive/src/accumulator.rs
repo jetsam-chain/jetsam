@@ -428,22 +428,25 @@ mod tests {
 
     #[test]
     fn epoch_switches_to_the_derived_parent_id_after_the_boundary() {
+        const EPOCH: u64 = elide_chain::consensus::params::TX_EPOCH_BLOCKS;
         let mut accumulator = genesis_accumulator();
         let genesis_epoch = accumulator.epoch_anchor_id;
         let mut parent = genesis_header();
         let mut boundary_id = None;
-        for height in 1..=146 {
+        for height in 1..=EPOCH + 2 {
             let header = child_of(&parent, height);
             accumulator = accumulator.advance(&parent, &header).unwrap();
             match height {
-                // The boundary block 144 itself still consumes the previous
-                // anchor; its own id becomes the anchor for 145..=288.
-                h if h <= elide_chain::consensus::params::TX_EPOCH_BLOCKS => assert_eq!(accumulator.epoch_anchor_id, genesis_epoch),
-                h if h == elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1 => {
+                // The boundary block itself still consumes the previous
+                // anchor; its own id becomes the anchor for the next epoch.
+                h if h <= EPOCH => assert_eq!(accumulator.epoch_anchor_id, genesis_epoch),
+                h if h == EPOCH + 1 => {
                     boundary_id = Some(hash_block_header(&parent));
                     assert_eq!(accumulator.epoch_anchor_id, boundary_id.unwrap());
                 }
-                146 => assert_eq!(accumulator.epoch_anchor_id, boundary_id.unwrap()),
+                h if h == EPOCH + 2 => {
+                    assert_eq!(accumulator.epoch_anchor_id, boundary_id.unwrap())
+                }
                 _ => unreachable!(),
             }
             parent = header;
@@ -466,8 +469,8 @@ mod tests {
             }
         }
 
-        // The anchor a tip's own transactions bind: 143 -> 0, 144 -> 0
-        // (boundary block still consumes the old anchor), 145 -> 144.
+        // The anchor a tip's own transactions bind: EPOCH-1 -> 0, EPOCH -> 0
+        // (boundary block still consumes the old anchor), EPOCH+1 -> EPOCH.
         for (boundary, epoch_height) in edge_boundaries.iter().zip([0usize, 0, elide_chain::consensus::params::TX_EPOCH_BLOCKS as usize]) {
             boundary
                 .validate_local_header_boundary(
@@ -510,7 +513,7 @@ mod tests {
             honest.validate_local_header_boundary(tip, &headers[(elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1) as usize]),
             Err(ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
                 expected: elide_chain::consensus::params::TX_EPOCH_BLOCKS,
-                actual: 143,
+                actual: elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1,
             })
         );
         let mut competing_epoch = *epoch;

@@ -313,12 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_epoch_edges_143_to_144_and_144_to_145() {
+    fn exact_epoch_edges_on_both_sides_of_the_boundary() {
         for parent_height in [elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1, elide_chain::consensus::params::TX_EPOCH_BLOCKS] {
             let (start, child, end) = fixture(parent_height);
             assert!(satisfies(&start, &child, &end));
-            // The boundary block 144 itself keeps the previous anchor; the
-            // derived id of parent 144 becomes the anchor for child 145.
+            // The boundary block itself keeps the previous anchor; the derived
+            // id of a boundary parent becomes the anchor for its child.
             let expected = if parent_height % elide_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
                 child.parent_block_id
             } else {
@@ -344,8 +344,10 @@ mod tests {
 
     #[test]
     fn direct_transition_rejects_parent_height_link_and_epoch_mutations() {
+        use elide_chain::consensus::params::TX_EPOCH_BLOCKS;
         // Start height drives the successor relation and the epoch boundary.
-        let (start, child, end) = fixture(143);
+        // A non-boundary parent: the epoch lanes pass through unchanged.
+        let (start, child, end) = fixture(TX_EPOCH_BLOCKS - 1);
         let bad_start = mutate_accumulator_lane(&start, 0);
         assert!(!satisfies(&bad_start, &child, &end), "start height lane");
         // Start semantic-tip lanes are deliberately not read by the
@@ -361,11 +363,13 @@ mod tests {
         unlinked.prev_block_hash[0] ^= 1;
         assert!(!satisfies(&start, &unlinked, &end), "prev link");
 
-        // At the 144→145 transition the old epoch is intentionally
-        // overwritten by the derived parent id, so the incoming epoch lanes
-        // are dead for that one step; a consistently re-linked wrong parent
-        // id must still fail the epoch write against the honest end.
-        let (start, child, end) = fixture(144);
+        // At the boundary→boundary+1 transition the old epoch is
+        // intentionally overwritten by the derived parent id, so the incoming
+        // epoch lanes are dead for that one step; a consistently re-linked
+        // wrong parent id must still fail the epoch write against the honest
+        // end. The parent height must be a multiple of TX_EPOCH_BLOCKS or the
+        // rewrite branch is not exercised at all.
+        let (start, child, end) = fixture(TX_EPOCH_BLOCKS);
         let mut wrong_parent = child.clone();
         wrong_parent.parent_block_id[0] ^= 1;
         wrong_parent.prev_block_hash[0] ^= 1;
@@ -377,7 +381,7 @@ mod tests {
 
     #[test]
     fn direct_transition_rejects_every_child_projection_mutation() {
-        let (start, child, end) = fixture(143);
+        let (start, child, end) = fixture(elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1);
         for target in 0..10 {
             let mut bad = child.clone();
             match target {
@@ -406,7 +410,8 @@ mod tests {
         ] {
             let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut b = FieldR1csBuilder::new();
-                let mut native = fixture(143).0.to_lanes();
+                let mut native =
+                    fixture(elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1).0.to_lanes();
                 native[lane] = Block128::from(value);
                 let wires = native.map(|value| alloc_block(&mut b, value));
                 let boundary = AccumulatorWires::from_ordered_lanes(wires);
