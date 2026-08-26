@@ -71,16 +71,21 @@ pub struct BlockHeader {
 ///
 /// Header identity is also used by the separate 144-block transaction epoch.
 /// and for chain linking (`prev_block_hash`).
+/// ELIDE CHANGE: the nonce is absorbed FIRST, mirroring
+/// `consensus::pow::pow_header_fields_into`. The two orders MUST stay identical:
+/// the recursive parent-seal replays this hash in-circuit from the PoW field
+/// vector, so a divergence compiles cleanly and then makes every HistoryStep
+/// proof unsatisfiable. `pow::tests::header_order_matches_block_id` is the guard.
 pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_BLOCKHDR));
 
+    s.absorb(Block128::from(hdr.nonce));
     absorb_digest(&mut s, &hdr.prev_block_hash);
     absorb_digest(&mut s, &hdr.state_root);
     absorb_digest(&mut s, &hdr.tx_root);
     s.absorb(Block128::from(hdr.timestamp as u128));
     s.absorb(Block128::from(hdr.height as u128));
     absorb_digest(&mut s, hdr.miner_address.as_bytes());
-    s.absorb(Block128::from(hdr.nonce));
     absorb_digest(&mut s, &hdr.difficulty_target);
     s.absorb(Block128::from(hdr.log_slots as u128));
     s.absorb(Block128::from(hdr.active_slot_count as u128));

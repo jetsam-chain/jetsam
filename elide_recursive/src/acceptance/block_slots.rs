@@ -1107,7 +1107,12 @@ impl ParentSealTrace {
             .map(|(_, wire)| wire.clone())
             .collect();
         let semantic_id = sponge_lanes_trace(b, TAG_SEMHDR, &semantic);
-        let height = fields[header_fields::HEIGHT].clone();
+        // ELIDE CHANGE: index the NONCE-FREE vector. `header_fields::HEIGHT` is
+        // an offset into the 15-field semantic schedule; indexing the 16-field
+        // vector with it only ever worked because the nonce sat after height.
+        // With the nonce at lane 0 that read would silently return `timestamp`,
+        // and nothing would fail to compile.
+        let height = semantic[header_fields::HEIGHT].clone();
         Self {
             block_id,
             semantic_id,
@@ -1971,9 +1976,10 @@ mod tx_epoch_anchor_tests {
 
     #[test]
     fn direct_tail_is_nonce_free_across_the_epoch_edge() {
-        // Parent heights 143 (child 144: boundary block keeps the previous
-        // anchor) and 144 (child 145: anchor becomes the derived parent id).
-        for parent_height in [143u64, 144] {
+        // ELIDE: derived from TX_EPOCH_BLOCKS. Parent E-1 (child E: the boundary
+        // block keeps the previous
+        // anchor) and parent E (child E+1: anchor becomes the derived parent id).
+        for parent_height in [elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1, elide_chain::consensus::params::TX_EPOCH_BLOCKS] {
             let parent = tail_parent_header(parent_height);
             let start = tail_start(&parent);
             let template = tail_child(&parent, 0);
@@ -1984,7 +1990,7 @@ mod tx_epoch_anchor_tests {
             let renonced_end = start.advance(&parent, &renonced).unwrap();
             // The complete boundary is nonce-invariant.
             assert_eq!(end, renonced_end);
-            if parent_height == 144 {
+            if parent_height == elide_chain::consensus::params::TX_EPOCH_BLOCKS {
                 assert_eq!(end.epoch_anchor_id, elide_chain::hash_block_header(&parent));
             } else {
                 assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
@@ -2041,7 +2047,7 @@ mod tx_epoch_anchor_tests {
 
     fn start_accumulator() -> ChainAccumulator {
         ChainAccumulator {
-            height: 143,
+            height: elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1,
             tip_semantic_id: [0x11; 32],
             state_root: [0x22; 32],
             log_slots: 24,

@@ -106,9 +106,9 @@ impl NetworkConfig {
             default_rpc_port: 9601,
             // Mainnet is isolated by its genesis-bound namespace. The exact
             // authenticated network profile adds a second fail-closed gate.
-            p2p_protocol_id: "/elide/mainnet/860e70453390bf81/1",
-            topic_blocks: "/elide/mainnet/860e70453390bf81/blocks/1",
-            topic_txs: "/elide/mainnet/860e70453390bf81/txs/1",
+            p2p_protocol_id: "/elide/mainnet/6e592c07be6fd1b4/1",
+            topic_blocks: "/elide/mainnet/6e592c07be6fd1b4/blocks/1",
+            topic_txs: "/elide/mainnet/6e592c07be6fd1b4/txs/1",
             // DNS seeds — two formats supported:
             //
             // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9600
@@ -174,12 +174,12 @@ mod tests {
     #[test]
     fn mainnet_protocol_id() {
         let mainnet = NetworkConfig::mainnet();
-        assert_eq!(mainnet.p2p_protocol_id, "/elide/mainnet/860e70453390bf81/1");
+        assert_eq!(mainnet.p2p_protocol_id, "/elide/mainnet/6e592c07be6fd1b4/1");
         assert_eq!(
             mainnet.topic_blocks,
-            "/elide/mainnet/860e70453390bf81/blocks/1"
+            "/elide/mainnet/6e592c07be6fd1b4/blocks/1"
         );
-        assert_eq!(mainnet.topic_txs, "/elide/mainnet/860e70453390bf81/txs/1");
+        assert_eq!(mainnet.topic_txs, "/elide/mainnet/6e592c07be6fd1b4/txs/1");
     }
 
     #[test]

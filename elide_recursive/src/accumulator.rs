@@ -310,7 +310,7 @@ mod tests {
             miner_address: Address([0x44; 32]),
             nonce: height as u128,
             difficulty_target: GENESIS_TARGET,
-            log_slots: 24 + u32::from(height >= 145),
+            log_slots: 24 + u32::from(height >= elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1),
             active_slot_count: height * 2,
             alloc_counter: height * 3,
         }
@@ -438,8 +438,8 @@ mod tests {
             match height {
                 // The boundary block 144 itself still consumes the previous
                 // anchor; its own id becomes the anchor for 145..=288.
-                1..=144 => assert_eq!(accumulator.epoch_anchor_id, genesis_epoch),
-                145 => {
+                h if h <= elide_chain::consensus::params::TX_EPOCH_BLOCKS => assert_eq!(accumulator.epoch_anchor_id, genesis_epoch),
+                h if h == elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1 => {
                     boundary_id = Some(hash_block_header(&parent));
                     assert_eq!(accumulator.epoch_anchor_id, boundary_id.unwrap());
                 }
@@ -456,19 +456,19 @@ mod tests {
         let mut headers = vec![genesis];
         let mut accumulator = genesis_accumulator();
         let mut edge_boundaries = Vec::new();
-        for height in 1..=145 {
+        for height in 1..=elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1 {
             let parent = headers[height as usize - 1];
             let header = child_of(&parent, height);
             accumulator = accumulator.advance(&parent, &header).unwrap();
             headers.push(header);
-            if matches!(height, 143..=145) {
+            if (elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1..=elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1).contains(&height) {
                 edge_boundaries.push(accumulator.clone());
             }
         }
 
         // The anchor a tip's own transactions bind: 143 -> 0, 144 -> 0
         // (boundary block still consumes the old anchor), 145 -> 144.
-        for (boundary, epoch_height) in edge_boundaries.iter().zip([0usize, 0, 144]) {
+        for (boundary, epoch_height) in edge_boundaries.iter().zip([0usize, 0, elide_chain::consensus::params::TX_EPOCH_BLOCKS as usize]) {
             boundary
                 .validate_local_header_boundary(
                     &headers[boundary.height as usize],
@@ -478,8 +478,8 @@ mod tests {
         }
 
         let honest = &edge_boundaries[2];
-        let tip = &headers[145];
-        let epoch = &headers[144];
+        let tip = &headers[(elide_chain::consensus::params::TX_EPOCH_BLOCKS + 1) as usize];
+        let epoch = &headers[elide_chain::consensus::params::TX_EPOCH_BLOCKS as usize];
         for lane in 0..CHAIN_ACCUMULATOR_LANES {
             let mut lanes = honest.to_lanes();
             lanes[lane] = Block128::from(lanes[lane].to_u128() ^ 1);
@@ -507,9 +507,9 @@ mod tests {
         );
 
         assert_eq!(
-            honest.validate_local_header_boundary(tip, &headers[143]),
+            honest.validate_local_header_boundary(tip, &headers[(elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1) as usize]),
             Err(ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
-                expected: 144,
+                expected: elide_chain::consensus::params::TX_EPOCH_BLOCKS,
                 actual: 143,
             })
         );

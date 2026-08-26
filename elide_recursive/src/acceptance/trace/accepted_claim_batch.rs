@@ -238,7 +238,7 @@ mod tests {
             log_slots: child.log_slots,
             active_slot_count: child.active_slot_count,
             alloc_counter: child.alloc_counter,
-            epoch_anchor_id: if parent_height % 144 == 0 {
+            epoch_anchor_id: if parent_height % elide_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
                 parent_block_id
             } else {
                 start.epoch_anchor_id
@@ -314,12 +314,12 @@ mod tests {
 
     #[test]
     fn exact_epoch_edges_143_to_144_and_144_to_145() {
-        for parent_height in [143, 144] {
+        for parent_height in [elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1, elide_chain::consensus::params::TX_EPOCH_BLOCKS] {
             let (start, child, end) = fixture(parent_height);
             assert!(satisfies(&start, &child, &end));
             // The boundary block 144 itself keeps the previous anchor; the
             // derived id of parent 144 becomes the anchor for child 145.
-            let expected = if parent_height % 144 == 0 {
+            let expected = if parent_height % elide_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
                 child.parent_block_id
             } else {
                 start.epoch_anchor_id
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn direct_transition_rejects_every_end_lane_mutation() {
-        for parent_height in [143, 144] {
+        for parent_height in [elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1, elide_chain::consensus::params::TX_EPOCH_BLOCKS] {
             let (start, child, end) = fixture(parent_height);
             for lane in 0..CHAIN_ACCUMULATOR_LANES {
                 let bad_end = mutate_accumulator_lane(&end, lane);

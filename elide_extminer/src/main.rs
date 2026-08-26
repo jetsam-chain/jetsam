@@ -26,7 +26,7 @@
 //! `getBlockTemplate("")` returns:
 //!   - `template_id`              — opaque, single-use node capability
 //!   - `pow_fields_hex`           — 16-field Poseidon2b PoW input
-//!   - `nonce_field_index`        — nonce lane (canonical value: 10)
+//!   - `nonce_field_index`        — nonce lane (canonical value: 0)
 //!   - `difficulty_target_hex`    — 256-bit LE target
 //!   - block metadata             — operator display only
 //!
@@ -199,7 +199,10 @@ impl RpcClient {
 const CHUNK_SIZE: u128 = 10_000_000;
 const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
-const POW_NONCE_FIELD_INDEX: usize = 10;
+// ELIDE CHANGE: 0, was 10. This constant is DUPLICATED from
+// elide_chain::consensus::pow so the external miner stays dependency-free;
+// the two must move together. The runtime check below is the safety net.
+const POW_NONCE_FIELD_INDEX: usize = 0;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` if cancelled.

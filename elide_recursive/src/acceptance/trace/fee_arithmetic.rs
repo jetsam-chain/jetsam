@@ -458,6 +458,9 @@ mod tests {
         elide_chain::consensus::fees::claimable_fee_for_tx_body(body, active, depth)
     }
 
+    /// Height used by these cases: tier 0, full base reward.
+    const TEST_HEIGHT: u64 = 0;
+
     fn build_case(
         bodies: &[TxBody],
         parent_active: u64,
@@ -524,12 +527,16 @@ mod tests {
                 }
             })
             .collect();
+        // ELIDE CHANGE: the reward follows the HEIGHT now, not the state depth.
+        // These cases exercise fee arithmetic and the coinbase ceiling, so they
+        // pin a fixed test height in the first emission tier and let the depth
+        // vary independently, as it always did.
+        let height_value = alloc_block(&mut b, Block128::from(TEST_HEIGHT as u128));
+        let emission_tiers = crate::acceptance::trace::development_allocation::tier_one_hot_for_height(&mut b, &height_value);
         let coinbase = alloc_block(&mut b, Block128::from(coinbase as u128));
         let subsidy = alloc_block(
             &mut b,
-            Block128::from(
-                elide_chain::consensus::emission::block_reward(child_depth_native) as u128,
-            ),
+            Block128::from(elide_chain::consensus::emission::block_reward(TEST_HEIGHT) as u128),
         );
         let coinbase_bits: [Wire; U64_BITS] = range_check_bits(&mut b, &coinbase, U64_BITS)
             .try_into()
@@ -539,7 +546,7 @@ mod tests {
             &groups,
             &parent_active,
             &parent_depth,
-            &child_depth,
+            &emission_tiers,
             &subsidy,
             &coinbase,
             &coinbase_bits,
@@ -561,7 +568,7 @@ mod tests {
         let fee = required(&provisional, active, depth);
         let body = body(1, 2, fee);
         let claimable = claimable(&body, active, depth);
-        let reward = elide_chain::consensus::emission::block_reward(depth);
+        let reward = elide_chain::consensus::emission::block_reward(TEST_HEIGHT);
         let coinbase = reward + claimable - 1;
         let (r1cs, witness, trace) = build_case(&[body], active, depth, depth, coinbase);
         assert!(r1cs.satisfies(&witness));
@@ -598,7 +605,7 @@ mod tests {
         let fee = required(&provisional, active, depth);
         let body = body(1, 2, fee);
         let claimable = claimable(&body, active, depth);
-        let reward = elide_chain::consensus::emission::block_reward(depth);
+        let reward = elide_chain::consensus::emission::block_reward(TEST_HEIGHT);
         let (r1cs, witness, trace) = build_case(&[body], active, depth, depth, reward + claimable);
         assert!(r1cs.satisfies(&witness));
 
@@ -620,7 +627,7 @@ mod tests {
         let fee = required(&provisional, 0, depth);
         let body = body(1, 1, fee);
         let maximum =
-            elide_chain::consensus::emission::block_reward(depth) + claimable(&body, 0, depth);
+            elide_chain::consensus::emission::block_reward(TEST_HEIGHT) + claimable(&body, 0, depth);
         let (r1cs, witness, _) = build_case(&[body], 0, depth, depth, maximum + 1);
         assert!(!r1cs.satisfies(&witness));
     }
@@ -677,7 +684,7 @@ mod tests {
             let fee = required(&provisional, 0, depth);
             let user = body(1, 1, fee);
             let claimable = claimable(&user, 0, depth);
-            let reward = elide_chain::consensus::emission::block_reward(depth);
+            let reward = elide_chain::consensus::emission::block_reward(TEST_HEIGHT);
             let (r1cs, witness, trace) = build_case(&[user], 0, depth, depth, reward + claimable);
             assert!(r1cs.satisfies(&witness), "child depth {depth}");
             assert_eq!(value(&witness, &trace.block_reward), reward as u128);
@@ -698,9 +705,9 @@ mod tests {
         let dense_fee = required(&dense0, dense_active, 32);
         let dense = body(8, 2, dense_fee);
         let sparse_max =
-            elide_chain::consensus::emission::block_reward(24) + claimable(&sparse, 0, 24);
+            elide_chain::consensus::emission::block_reward(TEST_HEIGHT) + claimable(&sparse, 0, 24);
         let dense_max =
-            elide_chain::consensus::emission::block_reward(32) + claimable(&dense, dense_active, 32);
+            elide_chain::consensus::emission::block_reward(TEST_HEIGHT) + claimable(&dense, dense_active, 32);
         let (a, aw, _) = build_case(&[sparse], 0, 24, 24, sparse_max);
         let (c, cw, _) = build_case(&[dense], dense_active, 32, 32, dense_max);
         let ghost = elide_gkr::ghost_tx::ghost_tx_body();
@@ -710,7 +717,7 @@ mod tests {
             dense_active,
             32,
             32,
-            elide_chain::consensus::emission::block_reward(32),
+            elide_chain::consensus::emission::block_reward(TEST_HEIGHT),
         );
         assert!(a.satisfies(&aw));
         assert!(c.satisfies(&cw));

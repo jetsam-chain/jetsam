@@ -9,6 +9,16 @@
 //! word holds `LABEL_u64 << 64`, the low holds `LABEL_u64`. Distinct
 //! halves prevent trivial cancellation.
 
+// ELIDE CHANGE - every domain tag differs from the upstream set, so no hash
+// computed by this chain can collide with one computed by the chain this code
+// was forked from, in any construction.
+//
+// The "E_" prefix is an OPAQUE discriminator for this tag generation. It is
+// deliberately not a reference to the chain's name: tags are absorbed into
+// every hash and are baked into the HistoryStep matrices, so deriving them
+// from the brand would mean a rebrand silently forks the chain. Renaming the
+// chain must never require touching this file.
+
 use elide_core::Block128;
 
 /// An 8-byte ASCII domain-separation label.
@@ -52,77 +62,77 @@ pub fn capacity_iv_flat(tag: DomainTag) -> [u128; 2] {
     ]
 }
 
-pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
-pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
-pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");
+pub const TAG_LEAF: DomainTag = DomainTag::new(b"E_LEAF__");
+pub const TAG_COMMIT: DomainTag = DomainTag::new(b"E_COMMIT");
+pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"E_ADDRFX");
 /// Canonical flattened Tx8x2 body: raw 16-leaf tree plus one wrap permutation.
-pub const TAG_TX8X2: DomainTag = DomainTag::new(b"TX8X2___");
+pub const TAG_TX8X2: DomainTag = DomainTag::new(b"E_TX8X2_");
 /// Count-bound universal 256-leaf block transaction root.
-pub const TAG_TXROOT: DomainTag = DomainTag::new(b"TXROOT__");
-pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
+pub const TAG_TXROOT: DomainTag = DomainTag::new(b"E_TXROOT");
+pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"E_BLKHDR");
 /// Proof-of-work header digest. Distinct from `BLOCKHDR`: the same semantic
 /// header has separate chain-link and mining-difficulty hash domains.
-pub const TAG_POWHDR: DomainTag = DomainTag::new(b"POWHDR__");
+pub const TAG_POWHDR: DomainTag = DomainTag::new(b"E_POWHDR");
 /// Nonce-free semantic header projection. Distinct from `BLOCKHDR` (chain
 /// link, nonce included) and `POWHDR__` (mining digest): one template has
 /// exactly one projection across every nonce, so a HistoryStep terminal
 /// minted before PoW binds any winning encoding of the same template.
-pub const TAG_SEMHDR: DomainTag = DomainTag::new(b"SEMHDR__");
+pub const TAG_SEMHDR: DomainTag = DomainTag::new(b"E_SEMHDR");
 /// Byte-oriented Fiat-Shamir challenger (`FsChallenger`: op headers +
 /// length-prefixed byte absorbs).
-pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
+pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"E_FSCHAL");
 /// C1 byte-oriented Fiat-Shamir challenger with 255-bit extension-field
 /// challenges. Its framing is intentionally disjoint from `FSCHALNG`.
-pub const TAG_FSCH256: DomainTag = DomainTag::new(b"FSCH256_");
+pub const TAG_FSCH256: DomainTag = DomainTag::new(b"E_FSC256");
 /// Lane-oriented Fiat-Shamir challenger for the proof-core transcripts
 /// (`FsLaneChallenger` and its in-trace twin). Distinct from the other
 /// Fiat-Shamir families so no transcript state can be replayed across
 /// challenger constructions that absorb different framings.
-pub const TAG_LANECHAL: DomainTag = DomainTag::new(b"LANECHAL");
+pub const TAG_LANECHAL: DomainTag = DomainTag::new(b"E_LANECH");
 /// C1 lane-oriented Fiat-Shamir challenger with 255-bit extension-field
 /// challenges and a two-coordinate absorb schedule.
-pub const TAG_LANE256: DomainTag = DomainTag::new(b"LANE256_");
+pub const TAG_LANE256: DomainTag = DomainTag::new(b"E_LAN256");
 /// Killshot Fiat-Shamir channel (`Poseidon2bChannel`, the bare rate-2
 /// duplex every GKR verifier runs on) and its replays.
-pub const TAG_KSCHANNL: DomainTag = DomainTag::new(b"KSCHANNL");
+pub const TAG_KSCHANNL: DomainTag = DomainTag::new(b"E_KSCHAN");
 /// C1 GKR/Wallet channel. Every algebraic message occupies one complete
 /// two-lane rate block and every squeeze returns one GF(2^256) challenge.
-pub const TAG_KSCH256: DomainTag = DomainTag::new(b"KSCH256_");
+pub const TAG_KSCH256: DomainTag = DomainTag::new(b"E_KSC256");
 /// Wallet-capsule FRI transcript (`elide_fri::Channel`) and its replays.
-pub const TAG_FRICHANL: DomainTag = DomainTag::new(b"FRICHANL");
-pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
-pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
-pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
+pub const TAG_FRICHANL: DomainTag = DomainTag::new(b"E_FRICHA");
+pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"E_COMPRS");
+pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"E_DAWTNS");
+pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"E_FRISTA");
 /// Segment-level Merkle tree: Poseidon2b binary tree over per-segment
 /// FRI roots. The root is the global `state_root` when `num_segments > 1`.
-pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
+pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"E_SEGTRE");
 /// Claims commitment: Poseidon2b sponge over all claimed slot data
 /// (inputs + outputs). Bridges WalletAuthorizationBundle to exact state proof.
-pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
+pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"E_CLAIMS");
 /// Exact UTXO state slot leaf: `PARANOID/EXACT-STATE-SLOT/256/v1`.
-pub const TAG_EXSTSLT: DomainTag = DomainTag::new(b"EXSTSLT_");
+pub const TAG_EXSTSLT: DomainTag = DomainTag::new(b"E_EXSSLT");
 /// Exact UTXO state binary Merkle node: `PARANOID/EXACT-STATE-NODE/256/v1`.
-pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"EXSTNOD_");
+pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"E_EXSNOD");
 /// Accepted-block claim field transcript for recursive chain accumulation.
-pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
+pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"E_ACCBLK");
 /// Accepted history/state transition digest for O(1) state sync.
-pub const TAG_HISTTRN: DomainTag = DomainTag::new(b"HISTTRN_");
+pub const TAG_HISTTRN: DomainTag = DomainTag::new(b"E_HISTTR");
 /// Accepted history/state claim digest for O(1) state sync.
-pub const TAG_HISTCLM: DomainTag = DomainTag::new(b"HISTCLM_");
+pub const TAG_HISTCLM: DomainTag = DomainTag::new(b"E_HISTCL");
 /// Constant public history proof envelope digest for O(1) state sync.
-pub const TAG_HISTPRF: DomainTag = DomainTag::new(b"HISTPRF_");
+pub const TAG_HISTPRF: DomainTag = DomainTag::new(b"E_HISTPR");
 /// Variable-length byte hashing with an explicit absorbed domain string.
-pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
+pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"E_BYTEHS");
 /// Wallet-capsule PCS tree leaf (flat sponge over one 16-symbol fold coset).
-pub const TAG_CAPSLEAF: DomainTag = DomainTag::new(b"CAPSLEAF");
+pub const TAG_CAPSLEAF: DomainTag = DomainTag::new(b"E_CAPSLF");
 /// C1 Wallet-capsule PCS leaf containing sixteen GF(2^256) symbols.
-pub const TAG_CAPS256: DomainTag = DomainTag::new(b"CAPS256_");
+pub const TAG_CAPS256: DomainTag = DomainTag::new(b"E_CAP256");
 /// C1 Wallet source leaf containing eight GF(2^128) bank symbols and eight
 /// GF(2^256) companion symbols in a canonical packed representation.
-pub const TAG_CAPSMIX: DomainTag = DomainTag::new(b"CAPSMIX_");
+pub const TAG_CAPSMIX: DomainTag = DomainTag::new(b"E_CAPMIX");
 /// Wallet-capsule PCS tree inner node (1-permutation flat feed-forward
 /// compress — the same node shape as the proof-core PCS Merkle).
-pub const TAG_CAPSNODE: DomainTag = DomainTag::new(b"CAPSNODE");
+pub const TAG_CAPSNODE: DomainTag = DomainTag::new(b"E_CAPSND");
 
 #[cfg(test)]
 mod tests {
@@ -181,7 +191,10 @@ mod tests {
 
     #[test]
     fn tx8x2_tag_bytes_are_frozen() {
-        assert_eq!(TAG_TX8X2.0, *b"TX8X2___");
-        assert_eq!(TAG_TX8X2.as_u64(), 0x5458_3858_325f_5f5f);
+        // ELIDE CHANGE: freezes THIS chain's tag, not the upstream one.
+        assert_eq!(TAG_TX8X2.0, *b"E_TX8X2_");
+        assert_eq!(TAG_TX8X2.as_u64(), 0x455f54583858325f);
+        // And it must never drift back to the upstream value.
+        assert_ne!(TAG_TX8X2.0, *b"TX8X2___");
     }
 }

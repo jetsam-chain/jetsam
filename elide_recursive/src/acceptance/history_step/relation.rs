@@ -2586,7 +2586,7 @@ mod tests {
             DirectChildWires,
         };
 
-        for parent_height in [143u64, 144] {
+        for parent_height in [elide_chain::consensus::params::TX_EPOCH_BLOCKS - 1, elide_chain::consensus::params::TX_EPOCH_BLOCKS] {
             let parent = seal_fixture_parent(parent_height);
             let parent_id = elide_chain::hash_block_header(&parent);
             let start = ChainAccumulator {
@@ -2612,7 +2612,7 @@ mod tests {
                 alloc_counter: 10,
             };
             let end = start.advance(&parent, &child).unwrap();
-            if parent_height % 144 == 0 {
+            if parent_height % elide_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
                 assert_eq!(end.epoch_anchor_id, parent_id);
             } else {
                 assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);

@@ -41,7 +41,21 @@ pub type BlockHash = [u8; 32];
 pub const POW_HEADER_FIELD_COUNT: usize = 16;
 
 /// Index of the nonce field in the fixed PoW field schedule.
-pub const POW_NONCE_FIELD_INDEX: usize = 10;
+///
+/// ELIDE CHANGE: 0, was 10 upstream.
+///
+/// A Poseidon2b sponge absorbs two fields per permutation, so with the nonce at
+/// lane 10 of 16 the first five permutations cover only template-fixed fields
+/// and can be precomputed once as a midstate: a highly optimised miner replays
+/// three permutations per attempt instead of eight, a 2.67x advantage over a
+/// straightforward implementation. A sponge cannot be run backwards, so putting
+/// the nonce in the FIRST absorbed pair removes that shortcut entirely — every
+/// attempt runs the full eight permutations, for everyone.
+///
+/// This costs us nothing: the in-tree hasher never exploited the midstate. It
+/// removes an edge that a third party could have taken, and narrows the gap a
+/// future ASIC could open.
+pub const POW_NONCE_FIELD_INDEX: usize = 0;
 
 pub type PowHeaderFields = [Block128; POW_HEADER_FIELD_COUNT];
 
@@ -72,8 +86,17 @@ pub fn block_id(h: &BlockHeader) -> BlockHash {
 }
 
 /// Fill the fixed Poseidon2b PoW field schedule for a header.
+/// ELIDE CHANGE: the nonce is emitted FIRST, so it lands in the first absorbed
+/// pair and no midstate can be precomputed across attempts. `block_header::
+/// hash_block_header` MUST absorb in exactly this order — nothing links the two
+/// at compile time, and a divergence would not fail to build, it would make
+/// every HistoryStep proof unsatisfiable. `header_order_matches_block_id` in
+/// this module is the guard.
 pub fn pow_header_fields_into(h: &BlockHeader, out: &mut PowHeaderFields) {
     let mut i = 0usize;
+    debug_assert_eq!(i, POW_NONCE_FIELD_INDEX);
+    out[i] = Block128::from(h.nonce);
+    i += 1;
     put_digest(out, &mut i, &h.prev_block_hash);
     put_digest(out, &mut i, &h.state_root);
     put_digest(out, &mut i, &h.tx_root);
@@ -82,9 +105,6 @@ pub fn pow_header_fields_into(h: &BlockHeader, out: &mut PowHeaderFields) {
     out[i] = Block128::from(h.height as u128);
     i += 1;
     put_digest(out, &mut i, h.miner_address.as_bytes());
-    debug_assert_eq!(i, POW_NONCE_FIELD_INDEX);
-    out[i] = Block128::from(h.nonce);
-    i += 1;
     put_digest(out, &mut i, &h.difficulty_target);
     out[i] = Block128::from(h.log_slots as u128);
     i += 1;
@@ -216,23 +236,71 @@ mod tests {
 
         let fields = pow_header_fields(&h);
         assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
-        assert_eq!(POW_NONCE_FIELD_INDEX, 10);
-        assert_eq!(fields[0], digest_half(&h.prev_block_hash, 0));
-        assert_eq!(fields[1], digest_half(&h.prev_block_hash, 1));
-        assert_eq!(fields[2], digest_half(&h.state_root, 0));
-        assert_eq!(fields[3], digest_half(&h.state_root, 1));
-        assert_eq!(fields[4], digest_half(&h.tx_root, 0));
-        assert_eq!(fields[5], digest_half(&h.tx_root, 1));
-        assert_eq!(fields[6], Block128::from(h.timestamp as u128));
-        assert_eq!(fields[7], Block128::from(h.height as u128));
-        assert_eq!(fields[8], digest_half(h.miner_address.as_bytes(), 0));
-        assert_eq!(fields[9], digest_half(h.miner_address.as_bytes(), 1));
-        assert_eq!(fields[10], Block128::from(h.nonce));
+        // ELIDE CHANGE: the nonce leads the schedule so no midstate is possible.
+        assert_eq!(POW_NONCE_FIELD_INDEX, 0);
+        assert_eq!(fields[0], Block128::from(h.nonce));
+        assert_eq!(fields[1], digest_half(&h.prev_block_hash, 0));
+        assert_eq!(fields[2], digest_half(&h.prev_block_hash, 1));
+        assert_eq!(fields[3], digest_half(&h.state_root, 0));
+        assert_eq!(fields[4], digest_half(&h.state_root, 1));
+        assert_eq!(fields[5], digest_half(&h.tx_root, 0));
+        assert_eq!(fields[6], digest_half(&h.tx_root, 1));
+        assert_eq!(fields[7], Block128::from(h.timestamp as u128));
+        assert_eq!(fields[8], Block128::from(h.height as u128));
+        assert_eq!(fields[9], digest_half(h.miner_address.as_bytes(), 0));
+        assert_eq!(fields[10], digest_half(h.miner_address.as_bytes(), 1));
         assert_eq!(fields[11], digest_half(&h.difficulty_target, 0));
         assert_eq!(fields[12], digest_half(&h.difficulty_target, 1));
         assert_eq!(fields[13], Block128::from(h.log_slots as u128));
         assert_eq!(fields[14], Block128::from(h.active_slot_count as u128));
         assert_eq!(fields[15], Block128::from(h.alloc_counter as u128));
+    }
+
+    /// ELIDE — the guard against a SILENT divergence.
+    ///
+    /// `pow_header_fields_into` and `block_header::hash_block_header` must
+    /// absorb the same fields in the same order: the recursive parent-seal
+    /// replays the block id in-circuit from the PoW field vector. Nothing links
+    /// the two functions at compile time, so if one moves without the other the
+    /// build stays green and every HistoryStep proof becomes unsatisfiable.
+    /// This test recomputes the block id from the PoW schedule and requires the
+    /// two to agree.
+    #[test]
+    fn header_order_matches_block_id() {
+        use elide_poseidon2b::native::compression::Poseidon2bSponge;
+
+        let mut h = dummy_header();
+        h.prev_block_hash = [0xA1; 32];
+        h.state_root = [0xB2; 32];
+        h.tx_root = [0xC3; 32];
+        h.timestamp = 1_700_000_000;
+        h.height = 987_654;
+        h.miner_address = Address([0xD4; 32]);
+        h.nonce = 0x1234_5678_9abc_def0_1122_3344_5566_7788;
+        h.difficulty_target = [0xE5; 32];
+        h.log_slots = 24;
+        h.active_slot_count = 4_242;
+        h.alloc_counter = 9_999;
+
+        let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_BLOCKHDR));
+        for field in pow_header_fields(&h) {
+            sponge.absorb(field);
+        }
+        assert_eq!(
+            sponge.finalize(),
+            crate::block_header::hash_block_header(&h),
+            "the PoW field order and hash_block_header have diverged"
+        );
+    }
+
+    /// The nonce must sit in the FIRST absorbed pair, or a midstate becomes
+    /// possible again. A Poseidon2b sponge absorbs two fields per permutation.
+    #[test]
+    fn nonce_is_inside_the_first_absorbed_pair() {
+        assert!(
+            POW_NONCE_FIELD_INDEX < 2,
+            "nonce at lane {POW_NONCE_FIELD_INDEX} leaves a precomputable prefix"
+        );
     }
 
     #[test]

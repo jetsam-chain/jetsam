@@ -120,6 +120,19 @@ fn halving_tier_one_hot(b: &mut FieldR1csBuilder, height_bits: &[LinExpr]) -> Ve
     tiers
 }
 
+/// Build the emission-tier one-hot directly from a height expression.
+///
+/// Convenience wrapper for callers that hold a height but not its bit
+/// decomposition — chiefly test harnesses. Production code takes the selectors
+/// from `DevelopmentAllocationTrace::emission_tiers`, which are built once.
+pub(crate) fn tier_one_hot_for_height(b: &mut FieldR1csBuilder, height: &LinExpr) -> Vec<LinExpr> {
+    let bits: Vec<LinExpr> = range_check_bits(b, height, HEIGHT_BITS)
+        .into_iter()
+        .map(LinExpr::from_wire)
+        .collect();
+    halving_tier_one_hot(b, &bits)
+}
+
 /// Constant-table lookup driven by the halving-tier one-hot.
 ///
 /// Same shape as [`selected_depth_constant`], but eight entries instead of
@@ -308,7 +321,7 @@ mod tests {
         DevelopmentAllocationTrace,
         CaseWires,
     ) {
-        let native = development_allocation(height, depth).unwrap();
+        let native = development_allocation(height).unwrap();
         let mut builder = FieldR1csBuilder::new();
         let height = alloc_block(&mut builder, Block128::from(height as u128));
         let depth_value = alloc_block(&mut builder, Block128::from(depth as u128));
@@ -337,7 +350,7 @@ mod tests {
             DEVELOPMENT_ALLOCATION_END_HEIGHT,
             DEVELOPMENT_ALLOCATION_END_HEIGHT + 1,
         ] {
-            let native = development_allocation(height, 24).unwrap();
+            let native = development_allocation(height).unwrap();
             let (matrix, witness, trace, _) = case(height, 24);
             assert!(matrix.satisfies(&witness), "height {height}");
             assert_eq!(
@@ -368,7 +381,7 @@ mod tests {
     fn expansion_day_uses_the_current_lower_reward_tier() {
         let (matrix, witness, trace, _) = case(TARGET_BLOCKS_PER_DAY, 25);
         assert!(matrix.satisfies(&witness));
-        let native = development_allocation(TARGET_BLOCKS_PER_DAY, 25).unwrap();
+        let native = development_allocation(TARGET_BLOCKS_PER_DAY).unwrap();
         assert_eq!(
             trace.payout_each.eval(&witness),
             alloc_block_value(native.payout_each.unwrap())
