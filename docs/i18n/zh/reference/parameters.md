@@ -65,13 +65,13 @@ Category 1 门数与深度乘积下界 173.273866314232 位
 ## 货币
 
 ```text
-1 JTM                  1,000,000 μNOID
+1 JTM                  1,000,000 μJTM
 初始补贴                50 JTM
 补贴下限                1 JTM
-基础费                  5,000 μNOID
-输入费                  100 μNOID
-输出费                  700 μNOID
-基础 State 增长费       2,500 μNOID / 净新增槽位
+基础费                  5,000 μJTM
+输入费                  100 μJTM
+输出费                  700 μJTM
+基础 State 增长费       2,500 μJTM / 净新增槽位
 ```
 
 解释和边界规则见[共识参数](../protocol/parameters.md)。

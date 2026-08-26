@@ -22,8 +22,8 @@ curl --silent --show-error \
 
 ## 约定
 
-- 货币整数字段以 μNOID 为单位。
-- 1 JTM 等于 1,000,000 μNOID。
+- 货币整数字段以 μJTM 为单位。
+- 1 JTM 等于 1,000,000 μJTM。
 - 哈希使用不带 `0x` 的小写十六进制。
 - 目标值（target）与 nonce 字节使用各自规范的小端编码。
 - 地址默认使用规范 bech32m `o1…`，除非字段明确要求 hex。
@@ -82,7 +82,7 @@ HTTP `401`，没有 JSON-RPC 结果。Token 只负责认证，不加密连接；
 | `getMiningInfo` | `[]` | `MiningInfo` |
 | `getPeerCount` | `[]` | 已连接对等节点数量 |
 | `getNodeStatus` | `[]` | `NodeStatus` |
-| `estimateFee` | `[n_outputs: u32]` | 假设一个输入时可接受的最低 μNOID |
+| `estimateFee` | `[n_outputs: u32]` | 假设一个输入时可接受的最低 μJTM |
 | `estimateFeeDetailed` | `[n_inputs: u32, n_outputs: u32]` | `FeeEstimate` |
 
 详细费用要求 1–1,020 个输入和 1–256 个输出。返回费用包含当前中继费率
@@ -169,7 +169,7 @@ HTTP `401`，没有 JSON-RPC 结果。Token 只负责认证，不加密连接；
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
 
-金额和费用均为 μNOID。发送或计划费用设为零表示请求自动选费。
+金额和费用均为 μJTM。发送或计划费用设为零表示请求自动选费。
 
 收据和已挖区块页从 1 开始，页面大小接受 1–50。
 `walletDiscoverAddresses` 接受 1–20，并在第一个空派生所有者处停止。
@@ -225,7 +225,7 @@ TxInfo {
 ```
 
 `circulating_supply_micro_jtm` 是 Live State 中所有 UTXO 数值之和，以
-μNOID 为单位。该字段使用十进制字符串编码，避免 JSON 数字精度造成截断。
+μJTM 为单位。该字段使用十进制字符串编码，避免 JSON 数字精度造成截断。
 
 ```text
 StateInfo {

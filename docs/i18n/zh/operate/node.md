@@ -1,6 +1,6 @@
 # 在 Linux 上运行节点
 
-普通 Parano1d 节点验证完整区块、维护 [Live State](../reference/glossary.md#live-state)、中继交易并提供
+普通 Jetsam 节点验证完整区块、维护 [Live State](../reference/glossary.md#live-state)、中继交易并提供
 同步数据，但不参与挖矿。
 
 本指南在带有 systemd 的 64 位 Linux 服务器上，把发布版 Core 安装为
@@ -104,7 +104,7 @@ sudo chmod 0640 /etc/jetsam/jetsam.toml
 
 ```ini
 [Unit]
-Description=Parano1d node
+Description=Jetsam node
 Wants=network-online.target
 After=network-online.target
 

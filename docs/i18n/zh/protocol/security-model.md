@@ -1,6 +1,6 @@
 # 安全模型
 
-Parano1d 组合[工作量证明](../reference/glossary.md#proof-of-work)、[递归有效性](../reference/glossary.md#recursive-validity)、[Live State](../reference/glossary.md#live-state) 以及无签名钱包授权。每种机制各司其职。
+Jetsam 组合[工作量证明](../reference/glossary.md#proof-of-work)、[递归有效性](../reference/glossary.md#recursive-validity)、[Live State](../reference/glossary.md#live-state) 以及无签名钱包授权。每种机制各司其职。
 
 ## 共识确立什么
 
@@ -74,7 +74,7 @@ NIST 后量子密码学 Category 1 的全部 `MAXDEPTH` 点。成功概率为二
 [端到端 QROM 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)给出可靠性游戏、
 归约、有限规模修正项和全部前提。[`jetsam_soundness` 证书](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness)
 从实际部署代码导入常量，并用精确整数或有理数算术计算所有用于结论判定的不等式。这是
-Category 1 的密码学资源评估，不代表 NIST 审查或认证了 Parano1d。
+Category 1 的密码学资源评估，不代表 NIST 审查或认证了 Jetsam。
 
 ## 信任边界
 
@@ -102,7 +102,7 @@ Category 1 的密码学资源评估，不代表 NIST 审查或认证了 Parano1d
 
 ## 透明性
 
-Parano1d 不是匿名系统。交易所有者、金额、槽位和手续费都是公开信息；区块体被普通节点裁剪后，第三方仍可能保留其归档。零知识隐藏钱包秘密并证明执行，但不会隐藏公开账本命题。
+Jetsam 不是匿名系统。交易所有者、金额、槽位和手续费都是公开信息；区块体被普通节点裁剪后，第三方仍可能保留其归档。零知识隐藏钱包秘密并证明执行，但不会隐藏公开账本命题。
 
 ## 最终性假设
 

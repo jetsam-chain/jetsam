@@ -1,6 +1,6 @@
 # 安装并使用钱包
 
-原生 GUI 安装包同时包含 Parano1d 钱包及其私有完整节点。应用会自行
+原生 GUI 安装包同时包含 Jetsam 钱包及其私有完整节点。应用会自行
 启动、监控并停止该节点，日常使用无需终端。
 
 ## 选择安装包
@@ -44,7 +44,7 @@ Get-FileHash .\jetsam-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 ```
 
-然后从应用菜单启动 **Parano1d**。
+然后从应用菜单启动 **Jetsam**。
 
 ### Windows
 
@@ -55,7 +55,7 @@ sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 
 ### macOS
 
-打开 DMG，将 **Parano1d** 拖入 Applications。
+打开 DMG，将 **Jetsam** 拖入 Applications。
 
 在版本尚未通过 Apple Developer ID 公证时，请按住 Control 点击应用，
 选择 **打开** 并确认。如果 macOS 仍然阻止启动，请在校验下载文件后
@@ -107,7 +107,7 @@ Debian 或 Ubuntu：
 sudo apt remove jetsam-gui
 ```
 
-Windows 请使用 **已安装的应用 → Parano1d → 卸载**；macOS 则将
+Windows 请使用 **已安装的应用 → Jetsam → 卸载**；macOS 则将
 Applications 中的应用移到废纸篓。
 
 钱包和节点数据仍保存在用户目录下的 `.jetsam` 中。只有在导出或

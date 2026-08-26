@@ -105,7 +105,7 @@ jetsam-miner \
 CLI 钱包命令输入的金额以 JTM 为单位，最多六位小数：
 
 ```text
-1 JTM = 1,000,000 μNOID
+1 JTM = 1,000,000 μJTM
 ```
 
 ### 节点与链

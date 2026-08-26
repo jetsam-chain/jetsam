@@ -23,8 +23,8 @@ curl --silent --show-error \
 
 ## Соглашения
 
-- Целочисленные денежные поля выражены в μNOID.
-- Один JTM равен 1 000 000 μNOID.
+- Целочисленные денежные поля выражены в μJTM.
+- Один JTM равен 1 000 000 μJTM.
 - Хэши передаются в нижнем регистре hex без `0x`.
 - Целевое значение PoW и байты nonce используют канонический порядок от
   младшего байта к старшему (little-endian).
@@ -91,7 +91,7 @@ Authorization: Bearer TOKEN
 | `getMiningInfo` | `[]` | `MiningInfo` |
 | `getPeerCount` | `[]` | Число подключённых пиров |
 | `getNodeStatus` | `[]` | `NodeStatus` |
-| `estimateFee` | `[n_outputs: u32]` | Принимаемый минимум в μNOID для одного входа |
+| `estimateFee` | `[n_outputs: u32]` | Принимаемый минимум в μJTM для одного входа |
 | `estimateFeeDetailed` | `[n_inputs: u32, n_outputs: u32]` | `FeeEstimate` |
 
 Подробный расчёт принимает от 1 до 1 020 входов и от 1 до 256 выходов.
@@ -185,7 +185,7 @@ Authorization: Bearer TOKEN
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
 
-Суммы и комиссии выражены в μNOID. Нулевая комиссия в отправке или плане
+Суммы и комиссии выражены в μJTM. Нулевая комиссия в отправке или плане
 запрашивает автоматический подбор.
 
 Страницы чеков и добытых блоков начинаются с единицы и принимают размер 1–50.
@@ -245,7 +245,7 @@ TxInfo {
 ```
 
 `circulating_supply_micro_jtm` — точная сумма стоимости всех UTXO в Live State,
-выраженная в μNOID. Поле передаётся десятичной строкой, чтобы JSON не
+выраженная в μJTM. Поле передаётся десятичной строкой, чтобы JSON не
 терял точность.
 
 ```text

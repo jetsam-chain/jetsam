@@ -1,6 +1,6 @@
 # 网络
 
-Parano1d 使用 libp2p 完成[对等节点身份](../reference/glossary.md#peer-identity)、发现、转发与同步。公网协议标识为：
+Jetsam 使用 libp2p 完成[对等节点身份](../reference/glossary.md#peer-identity)、发现、转发与同步。公网协议标识为：
 
 ```text
 /jetsam/mainnet/860e70453390bf81/1

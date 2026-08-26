@@ -1,6 +1,6 @@
 # Запуск ноды на Linux
 
-Обычная нода Parano1d проверяет полные блоки, поддерживает Live State,
+Обычная нода Jetsam проверяет полные блоки, поддерживает Live State,
 ретранслирует транзакции и обслуживает синхронизацию. Она не майнит.
 
 Это руководство устанавливает официальный релиз Core как системную службу на
@@ -106,7 +106,7 @@ sudo chmod 0640 /etc/jetsam/jetsam.toml
 
 ```ini
 [Unit]
-Description=Parano1d node
+Description=Jetsam node
 Wants=network-online.target
 After=network-online.target
 
