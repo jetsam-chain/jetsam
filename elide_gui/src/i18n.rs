@@ -919,7 +919,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "USE KEY" => ("ИСПОЛЬЗОВАТЬ КЛЮЧ", "使用密钥"),
         "HEADER →" => ("ЗАГОЛОВОК →", "区块头 →"),
         "FEE / ELD" => ("КОМИССИЯ / ELD", "手续费 / ELD"),
-        "FEE / μNOID" => ("КОМИССИЯ / μNOID", "手续费 / μNOID"),
+        "FEE / μELD" => ("КОМИССИЯ / μELD", "手续费 / μELD"),
         "256 BITS · GENERATED LOCALLY" => (
             "256 БИТ · СОЗДАН ЛОКАЛЬНО",
             "256 位 · 本机生成",

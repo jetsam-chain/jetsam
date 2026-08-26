@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-//! JSON response types for the Paranoid RPC API.
+//! JSON response types for the Elide RPC API.
 
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +94,7 @@ pub struct BlockTemplateResponse {
     /// Live output counts per user transaction in canonical block order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_output_counts: Vec<usize>,
-    /// Coinbase output value in μNOID.
+    /// Coinbase output value in μELD.
     pub coinbase_value_micro_eld: u64,
     /// Sum of user fees claimable by the miner after burned state-growth fees.
     pub claimable_fees_micro_eld: u64,
@@ -126,7 +126,7 @@ pub struct WalletStatus {
     pub address: String,
     /// The active address's key index.
     pub active_index: u32,
-    /// Confirmed balance of the ACTIVE address in μNOID.
+    /// Confirmed balance of the ACTIVE address in μELD.
     pub balance_micro_eld: u64,
     /// Active-address balance in ELD (6 decimal places).
     pub balance_eld: f64,
@@ -536,7 +536,7 @@ pub struct MiningInfo {
     pub difficulty_bits: u32,
     /// Difficulty target as 64-char hex (LE 256-bit).
     pub difficulty_target: String,
-    /// Block reward for the next block in μNOID.
+    /// Block reward for the next block in μELD.
     pub block_reward_micro_eld: u64,
     /// Block reward in ELD.
     pub block_reward_eld: f64,
@@ -642,7 +642,7 @@ pub struct AddressInfo {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Convert μNOID to ELD with 6 decimal places.
+/// Convert μELD to ELD with 6 decimal places.
 #[inline]
 pub fn microelide_to_eld(micro_eld: u64) -> f64 {
     micro_eld as f64 / 1_000_000.0
@@ -657,7 +657,7 @@ pub fn microelide_to_eld(micro_eld: u64) -> f64 {
 pub struct MempoolTxInfo {
     /// Canonical logical transaction id (hex).
     pub tx_hash: String,
-    /// Fee in μNOID.
+    /// Fee in μELD.
     pub fee_micro_eld: u64,
     /// Fee rate using weighted resource units (`inputs + outputs + 4 × net_new_slots`).
     pub fee_rate: u64,
@@ -682,7 +682,7 @@ pub struct MempoolTxInfo {
 pub struct MempoolInfo {
     /// Number of pending transactions.
     pub size: usize,
-    /// Current dynamic fee floor in μNOID.
+    /// Current dynamic fee floor in μELD.
     pub fee_floor: u64,
     /// All pending transactions.
     pub txs: Vec<MempoolTxInfo>,

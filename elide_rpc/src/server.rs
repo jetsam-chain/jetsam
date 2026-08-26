@@ -2423,7 +2423,7 @@ impl ParanoidApiServer for RpcHandler {
 
         let bytes = decode_bounded_hex("receipt", &receipt_hex, MAX_RPC_RECEIPT_BYTES)?;
 
-        let receipt = elide_chain::consensus::receipt::ParanoidReceipt::from_bytes(&bytes)
+        let receipt = elide_chain::consensus::receipt::ElideReceipt::from_bytes(&bytes)
             .map_err(|e| rpc_err(format!("decode receipt: {e:?}")))?;
 
         // Verify Merkle inclusion (offline, math only).

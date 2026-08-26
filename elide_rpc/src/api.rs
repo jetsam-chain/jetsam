@@ -117,7 +117,7 @@ pub trait ParanoidApi {
     #[method(name = "getNodeStatus")]
     async fn get_node_status(&self) -> RpcResult<NodeStatus>;
 
-    /// Estimated minimum fee in μNOID for a transaction with `n_outputs` outputs.
+    /// Estimated minimum fee in μELD for a transaction with `n_outputs` outputs.
     /// Simple u64 method: assumes one live input.
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
@@ -270,7 +270,7 @@ pub trait ParanoidApi {
 
     /// Send ELD to a recipient address.
     /// `to_address`: recipient bech32m address.
-    /// `amount_micro_eld`: amount in μNOID.
+    /// `amount_micro_eld`: amount in μELD.
     /// `fee_micro_eld`: exact fee (0 = automatic fee).
     #[method(name = "walletSend")]
     async fn wallet_send(

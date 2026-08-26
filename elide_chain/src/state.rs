@@ -50,7 +50,7 @@ pub struct ChainState {
     /// live output stores `creation_id = alloc_counter + 1`; the updated value
     /// also seeds deterministic wallet slot hints.
     pub alloc_counter: u64,
-    /// Exact sum of every live UTXO amount in μNOID.
+    /// Exact sum of every live UTXO amount in μELD.
     ///
     /// This is derived local metadata, not a header or proof input. Snapshot
     /// installation accumulates it while already streaming authenticated

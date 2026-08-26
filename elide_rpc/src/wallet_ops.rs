@@ -21,7 +21,7 @@ use crate::types::{
 /// prevents the RPC layer from scraping human-readable wallet errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WalletSendPlanError {
-    #[error("InsufficientFunds: need {needed_micro_eld} μNOID, have {available_micro_eld} μNOID spendable")]
+    #[error("InsufficientFunds: need {needed_micro_eld} μELD, have {available_micro_eld} μELD spendable")]
     InsufficientFunds {
         needed_micro_eld: u64,
         available_micro_eld: u64,
@@ -181,8 +181,8 @@ pub trait WalletOps: Send + Sync {
     ///
     /// # Parameters
     /// - `to_address`: recipient 32-byte address
-    /// - `amount_micro_eld`: payment amount in μNOID
-    /// - `fee_micro_eld`: transaction fee in μNOID
+    /// - `amount_micro_eld`: payment amount in μELD
+    /// - `fee_micro_eld`: transaction fee in μELD
     /// - `epoch_anchor`: exact transaction-epoch anchor for the next block
     /// - `slot_hints`: one or two empty slot indices for outputs
     /// - `log_slots`: current chain `log_slots` (from `tip_header().log_slots`)

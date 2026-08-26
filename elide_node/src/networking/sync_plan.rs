@@ -15,7 +15,7 @@ use super::{
     },
 };
 
-const PLAN_ID_DOMAIN: &[u8] = b"PARANO1D/NETWORK/SYNC-PLAN/V3";
+const PLAN_ID_DOMAIN: &[u8] = b"ELIDE/NETWORK/SYNC-PLAN/V3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPlanKind {

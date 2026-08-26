@@ -178,7 +178,8 @@ pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 /// Local full-block serving window for bounded fork recovery.
 ///
 /// This is deliberately not a finality or snapshot parameter.  Nodes still
-/// authenticate and apply the same 18-block compact suffix, while retaining a
+/// authenticate and apply the same `RECENT_BLOCK_RETENTION_DEPTH` compact
+/// suffix, while retaining a
 /// bounded set of older complete bundles for peers recovering a non-final
 /// fork.  In the worst automatically recoverable case the receiver may need
 /// `CONSENSUS_FINALITY_DEPTH` replacement blocks below its tip plus
@@ -281,10 +282,10 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // ---------------------------------------------------------------------------
 
 /// Precision: 1 ELD = 1_000_000 μELD.
-pub const MICROELIDE_PER_NOID: u64 = 1_000_000;
+pub const MICROELIDE_PER_ELD: u64 = 1_000_000;
 
 /// Starting block reward: 50 ELD.
-pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_NOID;
+pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_ELD;
 
 // ---------------------------------------------------------------------------
 // ELIDE CHANGE — height-based halving under a hard cap
@@ -316,7 +317,7 @@ pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_NOID;
 
 /// Hard cap on total issuance, in μELD. Enforced in consensus through
 /// [`EMISSION_END_HEIGHT`]: the height schedule alone sums to exactly this cap.
-pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICROELIDE_PER_NOID as u128;
+pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICROELIDE_PER_ELD as u128;
 
 /// First halving: one month after genesis.
 pub const H1_HEIGHT: u64 = 28_800;
@@ -427,7 +428,7 @@ pub const fn creation_id_within_boundary(
 // Fee policy
 // ---------------------------------------------------------------------------
 
-/// Base minimum fee in μNOID per non-coinbase transaction.
+/// Base minimum fee in μELD per non-coinbase transaction.
 pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 ELD
 
 /// Small anti-DoS fee charged per live input verified by a transaction.
@@ -441,7 +442,7 @@ pub const FEE_PER_INPUT: u64 = 100; // 0.0001 ELD per input
 ///
 /// Outputs are the main user-visible driver of fee because they create UTXOs and
 /// may increase state pressure. The 1-input/2-output low-pressure send remains
-/// at the historical 9_000 μNOID baseline together with state-growth burn.
+/// at the historical 9_000 μELD baseline together with state-growth burn.
 pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 ELD per output
 
 /// Base fee charged per net-new live UTXO slot at low occupancy.

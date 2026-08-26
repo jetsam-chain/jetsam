@@ -188,7 +188,7 @@ pub fn development_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::params::{H1_HEIGHT, MICROELIDE_PER_NOID as MICROELIDE_PER_ELD};
+    use crate::consensus::params::{H1_HEIGHT, MICROELIDE_PER_ELD};
 
     /// Upstream Parano1d fund addresses, recorded here so the guard below can
     /// recognise them. These bytes must NOT appear in a launched Elide chain.
@@ -225,13 +225,13 @@ mod tests {
         }
     }
 
-    /// 🚨 LAUNCH BLOCKER — expected to FAIL until the fund addresses are ours.
+    /// Launch guard — PASSES now that the fund addresses are this chain's own.
     ///
     /// The development allocation pays 10% of every subsidy for two years. The
-    /// recipients are inherited from the fork base, so until they are replaced
-    /// this chain would fund Parano1d's developers out of its own emission.
-    /// This test is the guard: it is not `#[ignore]`d, because an ignored test
-    /// is a forgotten test, and this one must be impossible to miss.
+    /// recipients were inherited from the fork base; had they stayed, this
+    /// chain would have funded Parano1d's developers out of its own emission.
+    /// The guard stays, not `#[ignore]`d, so a future upstream merge can never
+    /// silently reintroduce the inherited addresses.
     #[test]
     fn fund_addresses_are_not_upstream() {
         assert_ne!(

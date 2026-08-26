@@ -43,7 +43,7 @@ impl FeeFloor {
         self.current = self.compute();
     }
 
-    /// Return the current dynamic fee floor (μNOID).
+    /// Return the current dynamic fee floor (μELD).
     #[inline]
     pub fn current(&self) -> u64 {
         self.current

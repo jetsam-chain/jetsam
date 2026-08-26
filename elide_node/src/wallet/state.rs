@@ -56,7 +56,7 @@ pub struct TxHistoryEntry {
     /// True only for the canonical coinbase at logical transaction zero.
     #[serde(default)]
     pub is_coinbase: bool,
-    /// Net amount in μNOID (sent: net sent, received: total received).
+    /// Net amount in μELD (sent: net sent, received: total received).
     pub amount_micro_eld: u64,
     /// Counterparty address (None if unknown).
     pub peer_address: Option<[u8; 32]>,
@@ -77,7 +77,7 @@ pub struct TxHistoryEntry {
 pub struct WalletUtxo {
     /// Global slot index in the chain state.
     pub slot_index: u32,
-    /// Value in μNOID.
+    /// Value in μELD.
     pub value: u64,
     /// Incarnation assigned when this UTXO was minted: the monotone
     /// alloc-counter value for user mints, or the height-tagged coinbase
@@ -123,7 +123,7 @@ pub struct WalletState {
     pub active_snapshot: Option<ActiveWalletSnapshot>,
     /// Transaction history (most recent last).
     pub history: Vec<TxHistoryEntry>,
-    /// Cached different-address receipts: txid → serialized ParanoidReceipt.
+    /// Cached different-address receipts: txid → serialized ElideReceipt.
     /// Same-owner consolidations are omitted.
     pub receipts: HashMap<[u8; 32], Vec<u8>>,
     /// A failed durable write is retried by the next accepted block.
@@ -247,7 +247,7 @@ impl WalletState {
         Ok(())
     }
 
-    /// Confirmed balance of the ACTIVE address in μNOID.
+    /// Confirmed balance of the ACTIVE address in μELD.
     pub fn balance(&self) -> u64 {
         self.utxos
             .values()

@@ -237,7 +237,7 @@ pub fn reconcile_receipts_at_startup(
 ) -> Result<(usize, usize), String> {
     use elide_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
     use elide_chain::consensus::receipt::{
-        verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
+        verify_against_header, verify_merkle_inclusion, ElideReceipt,
     };
 
     let mut removed = 0usize;
@@ -246,7 +246,7 @@ pub fn reconcile_receipts_at_startup(
         let receipt = wallet
             .receipts
             .get(&tx_hash)
-            .and_then(|bytes| ParanoidReceipt::from_bytes(bytes).ok());
+            .and_then(|bytes| ElideReceipt::from_bytes(bytes).ok());
         let valid = match receipt {
             Some(receipt)
                 if receipt.summary.logical_txid == tx_hash
@@ -588,7 +588,7 @@ impl WalletOps for WalletHandle {
     }
 
     fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String> {
-        use elide_chain::consensus::receipt::ParanoidReceipt;
+        use elide_chain::consensus::receipt::ElideReceipt;
 
         let guard = self.inner.lock().unwrap();
         let wallet = guard
@@ -596,7 +596,7 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
         let mut receipts = Vec::with_capacity(wallet.receipts.len());
         for (txid, bytes) in &wallet.receipts {
-            let receipt = ParanoidReceipt::from_bytes(bytes).map_err(|error| {
+            let receipt = ElideReceipt::from_bytes(bytes).map_err(|error| {
                 format!("decode durable receipt {}: {error}", hex::encode(txid))
             })?;
             if receipt.summary.logical_txid != *txid {
@@ -881,7 +881,7 @@ impl WalletOps for WalletHandle {
         if let Some(fee) = explicit_fee_micro_eld {
             if fee < one_input_one_output_minimum {
                 return Err(WalletSendPlanError::Other(format!(
-                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} μNOID, got {fee} μNOID"
+                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} μELD, got {fee} μELD"
                 )));
             }
         }
@@ -929,7 +929,7 @@ impl WalletOps for WalletHandle {
                 let minimum = breakdown.required_total.max(relay_floor);
                 if fee < minimum {
                     return Err(WalletSendPlanError::Other(format!(
-                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μNOID, got {fee} μNOID"
+                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μELD, got {fee} μELD"
                     )));
                 }
                 planned = Some((input_count, fee, output_count, change, breakdown));
@@ -1017,7 +1017,7 @@ impl WalletOps for WalletHandle {
         let minimum = breakdown.required_total.max(relay_floor);
         if fee_micro_eld < minimum {
             return Err(WalletSendPlanError::Other(format!(
-                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μNOID, got {fee_micro_eld} μNOID"
+                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μELD, got {fee_micro_eld} μELD"
             )));
         }
         let total_spend_micro_eld =
@@ -1293,7 +1293,7 @@ impl WalletOps for WalletHandle {
 
         match w.get_receipt(&tx_hash) {
             Some(bytes) => {
-                let receipt = elide_chain::consensus::receipt::ParanoidReceipt::from_bytes(bytes)
+                let receipt = elide_chain::consensus::receipt::ElideReceipt::from_bytes(bytes)
                     .map_err(|error| format!("decode durable receipt: {error}"))?;
                 let has_recipient =
                     receipt
@@ -1385,7 +1385,7 @@ mod tests {
     fn retained_body_rebuilds_missing_outgoing_receipt_without_history_marker() {
         use elide_chain::block_header::BlockHeader;
         use elide_chain::consensus::receipt::{
-            verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
+            verify_against_header, verify_merkle_inclusion, ElideReceipt,
         };
         use elide_poseidon2b::primitives::Address;
         use elide_tx::{
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(recovered, 1);
         assert!(!history_changed);
         let tx_hash = elide_chain::try_compute_logical_txids(&block.transactions).unwrap()[1].0;
-        let receipt = ParanoidReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
+        let receipt = ElideReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
         assert!(verify_merkle_inclusion(&receipt));
         assert!(verify_against_header(&receipt, &block.header));
 
@@ -1571,7 +1571,7 @@ mod tests {
         assert_eq!(
             error,
             WalletSendPlanError::Other(
-                "fee too low for transaction with 1 input and 1 output: required 5800 μNOID, got 1 μNOID"
+                "fee too low for transaction with 1 input and 1 output: required 5800 μELD, got 1 μELD"
                     .to_string()
             )
         );

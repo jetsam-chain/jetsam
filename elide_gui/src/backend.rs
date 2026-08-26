@@ -1114,7 +1114,7 @@ impl Backend {
             if !validated.valid {
                 return Err(validated
                     .error
-                    .unwrap_or_else(|| "Invalid ParanO(1)d address.".into()));
+                    .unwrap_or_else(|| "Invalid Elide address.".into()));
             }
             let address = validated
                 .bech32
@@ -1628,7 +1628,7 @@ fn ensure_node_hardware(node_binary: &Path) -> Result<(), String> {
         .join("\n");
     if detail.is_empty() {
         Err(format!(
-            "this computer does not satisfy the ParanO(1)d production CPU requirements ({})",
+            "this computer does not satisfy the Elide production CPU requirements ({})",
             output.status
         ))
     } else {

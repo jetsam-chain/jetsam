@@ -878,9 +878,9 @@ impl HistoryStepCacheClass {
 #[derive(Parser, Debug)]
 #[command(
     name = "elide",
-    about = "ParanO(1)d full node daemon — proof-native HistoryStep UTXO network",
+    about = "Elide full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.elide/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
+    long_about = "Run an Elide node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.elide/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.

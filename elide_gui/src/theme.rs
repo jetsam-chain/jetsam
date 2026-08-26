@@ -69,7 +69,7 @@ fn soft_shadow() -> Shadow {
 
 pub fn paraelide_theme() -> Theme {
     Theme::custom(
-        "ParanO(1)d System",
+        "Elide System",
         Palette {
             background: BACKGROUND,
             text: TEXT,

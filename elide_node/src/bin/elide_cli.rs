@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-//! elide-cli — Paranoid full node CLI client.
+//! elide-cli — Elide full node CLI client.
 //!
 //! Connects to a running `elide` daemon via JSON-RPC (no local keys, no crypto).
 //! All operations happen inside the daemon; the CLI is a thin terminal UI.
@@ -56,9 +56,9 @@ macro_rules! c {
 // Units
 // ---------------------------------------------------------------------------
 
-const MICRO_PER_NOID: u64 = 1_000_000;
+const MICRO_PER_ELD: u64 = 1_000_000;
 
-/// Parse a human amount like "10.5" or "0.000001" as ELD → μNOID.
+/// Parse a human amount like "10.5" or "0.000001" as ELD → μELD.
 fn parse_elide_amount(s: &str) -> anyhow::Result<u64> {
     let (whole, fractional) = match s.split_once('.') {
         Some((whole, fractional)) if !fractional.contains('.') => (whole, fractional),
@@ -97,7 +97,7 @@ fn parse_elide_amount(s: &str) -> anyhow::Result<u64> {
             .ok_or_else(|| anyhow::anyhow!("amount {s:?} is out of range"))?
     };
     whole
-        .checked_mul(MICRO_PER_NOID)
+        .checked_mul(MICRO_PER_ELD)
         .and_then(|value| value.checked_add(fractional))
         .ok_or_else(|| anyhow::anyhow!("amount {s:?} is out of range"))
 }
@@ -105,8 +105,8 @@ fn parse_elide_amount(s: &str) -> anyhow::Result<u64> {
 fn elide_str(micro_eld: u64) -> String {
     format!(
         "{}.{:06}",
-        micro_eld / MICRO_PER_NOID,
-        micro_eld % MICRO_PER_NOID
+        micro_eld / MICRO_PER_ELD,
+        micro_eld % MICRO_PER_ELD
     )
 }
 
@@ -121,10 +121,10 @@ fn fmt_hash(h: &str) -> &str {
 #[derive(Parser)]
 #[command(
     name = "elide-cli",
-    about = "ParanO(1)d thin client — control a running elide daemon",
+    about = "Elide thin client — control a running elide daemon",
     version = env!("CARGO_PKG_VERSION"),
     long_about = "\
-ParanO(1)d thin client. Connects to a running elide daemon via JSON-RPC.
+Elide thin client. Connects to a running elide daemon via JSON-RPC.
 
 QUICK START:
   elide-cli status              Node info (height, hash, slots)
@@ -136,7 +136,7 @@ QUICK START:
 
 AMOUNT FORMAT:
   Amounts are in ELD (e.g. 10.5, 0.000001).
-  1 ELD = 1,000,000 μNOID — the CLI converts automatically.
+  1 ELD = 1,000,000 μELD — the CLI converts automatically.
 
 DAEMON:
   The daemon must be running: elide --mode miner --data-dir ~/.elide/data",
@@ -280,7 +280,7 @@ enum Command {
         use_index: Option<u32>,
     },
 
-    /// Confirmed wallet balance (ELD and μNOID).
+    /// Confirmed wallet balance (ELD and μELD).
     #[command(alias = "bal")]
     Balance,
 
@@ -290,7 +290,7 @@ enum Command {
 
     /// Send ELD to a recipient address.
     ///
-    /// Amount is in ELD (e.g. 10.5 → 10,500,000 μNOID).
+    /// Amount is in ELD (e.g. 10.5 → 10,500,000 μELD).
     /// Fee is auto-computed if not specified (recommended).
     ///
     /// Examples:
@@ -300,13 +300,13 @@ enum Command {
         /// Recipient address (canonical bech32m o1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount in ELD  (1 ELD = 1 000 000 μNOID).
-        /// Examples: "50" = 50 ELD, "0.5" = 500 000 μNOID, "0.000001" = 1 μNOID (minimum).
-        /// Tip: for programmatic use the RPC walletSend accepts raw μNOID directly.
+        /// Amount in ELD  (1 ELD = 1 000 000 μELD).
+        /// Examples: "50" = 50 ELD, "0.5" = 500 000 μELD, "0.000001" = 1 μELD (minimum).
+        /// Tip: for programmatic use the RPC walletSend accepts raw μELD directly.
         #[arg(value_name = "AMOUNT")]
         amount: String,
         /// Transaction fee in ELD. Omit for automatic fee calculation.
-        #[arg(long, value_name = "FEE_NOID")]
+        #[arg(long, value_name = "FEE_MICRO_ELD")]
         fee: Option<String>,
         /// Show the ordinary-transaction plan without submitting.
         #[arg(long)]
@@ -576,7 +576,7 @@ async fn cmd_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .map(|target| elide_chain::consensus::target_leading_zero_bits(&target));
 
-    section("Paranoid node status");
+    section("Elide node status");
     kv("Height", &height.to_string());
     kv("Best hash", ctx.h(best_hash));
     kv2(
@@ -731,7 +731,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
         kv2(
             "Value",
             &format!("{} ELD", elide_str(value)),
-            &format!("({value} μNOID)"),
+            &format!("({value} μELD)"),
         );
         kv("Creation ID", &creation_id.to_string());
         kv("Owner", ctx.h(owner));
@@ -1016,27 +1016,27 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyho
     kv2(
         "Min relay fee",
         &format!("{} ELD", elide_str(fee_micro)),
-        &format!("({fee_micro} μNOID)"),
+        &format!("({fee_micro} μELD)"),
     );
     kv(
         "Base",
-        &format!("{} μNOID", b["base"].as_u64().unwrap_or(0)),
+        &format!("{} μELD", b["base"].as_u64().unwrap_or(0)),
     );
     kv(
         "Inputs",
-        &format!("{} μNOID", b["input"].as_u64().unwrap_or(0)),
+        &format!("{} μELD", b["input"].as_u64().unwrap_or(0)),
     );
     kv(
         "Outputs",
-        &format!("{} μNOID", b["output"].as_u64().unwrap_or(0)),
+        &format!("{} μELD", b["output"].as_u64().unwrap_or(0)),
     );
     kv(
         "State growth burned",
-        &format!("{} μNOID", b["state_growth"].as_u64().unwrap_or(0)),
+        &format!("{} μELD", b["state_growth"].as_u64().unwrap_or(0)),
     );
     kv(
         "Miner claimable",
-        &format!("{} μNOID", b["miner_claimable"].as_u64().unwrap_or(0)),
+        &format!("{} μELD", b["miner_claimable"].as_u64().unwrap_or(0)),
     );
     println!();
     println!(
@@ -1162,7 +1162,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv2(
         "Fee floor",
         &format!("{} ELD", elide_str(fee_floor)),
-        &format!("({fee_floor} μNOID minimum)"),
+        &format!("({fee_floor} μELD minimum)"),
     );
 
     if txs.is_empty() {
@@ -1176,12 +1176,12 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}{}",
-            BOLD, "tx hash", "fee (μNOID)", "pages", "in", "out", "class", "proof", RST
+            BOLD, "tx hash", "fee (μELD)", "pages", "in", "out", "class", "proof", RST
         );
     } else {
         println!(
             "  {:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}",
-            "tx hash", "fee (μNOID)", "pages", "in", "out", "class", "proof"
+            "tx hash", "fee (μELD)", "pages", "in", "out", "class", "proof"
         );
     }
     separator(100);
@@ -1534,13 +1534,13 @@ async fn cmd_send(
         bail!("Amount cannot be zero.");
     }
 
-    // Warn if the amount looks suspiciously large (> 1 000 000 ELD = 1e12 μNOID).
-    // This catches the common mistake of passing μNOID to a ELD-denomination CLI.
-    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M ELD in μNOID
+    // Warn if the amount looks suspiciously large (> 1 000 000 ELD = 1e12 μELD).
+    // This catches the common mistake of passing μELD to a ELD-denomination CLI.
+    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M ELD in μELD
     if amount_micro > MAX_WARN_MICRO {
         eprintln!(
-            "⚠  Large amount: {} ELD ({} μNOID). \
-             Note: this CLI takes ELD, not μNOID. Press Ctrl-C to cancel.",
+            "⚠  Large amount: {} ELD ({} μELD). \
+             Note: this CLI takes ELD, not μELD. Press Ctrl-C to cancel.",
             elide_str(amount_micro),
             amount_micro
         );
@@ -1590,14 +1590,14 @@ async fn cmd_send(
         kv2(
             "Amount",
             &format!("{} ELD", elide_str(amount_micro)),
-            &format!("({amount_micro} μNOID)"),
+            &format!("({amount_micro} μELD)"),
         );
         let planned_fee = result["fee_micro_eld"].as_u64().unwrap_or(0);
         kv2(
             "Fee",
             &format!("{} ELD", elide_str(planned_fee)),
             &format!(
-                "({planned_fee} μNOID){}",
+                "({planned_fee} μELD){}",
                 if fee.is_none() { " auto" } else { "" }
             ),
         );
@@ -1613,7 +1613,7 @@ async fn cmd_send(
         kv2(
             "Change",
             &format!("{} ELD", elide_str(change)),
-            &format!("({change} μNOID)"),
+            &format!("({change} μELD)"),
         );
         println!();
         println!(
@@ -1665,12 +1665,12 @@ async fn cmd_send(
             kv2(
                 "Amount",
                 &format!("{} ELD", elide_str(amount_micro)),
-                &format!("({amount_micro} μNOID)"),
+                &format!("({amount_micro} μELD)"),
             );
             kv2(
                 "Fee",
                 &format!("{} ELD", elide_str(actual_fee)),
-                &format!("({actual_fee} μNOID){auto_tag}"),
+                &format!("({actual_fee} μELD){auto_tag}"),
             );
             println!();
             println!(
@@ -1693,7 +1693,7 @@ async fn cmd_send(
                 // Try to extract amounts
                 format!(
                     "Insufficient funds.\n\
-                     \t  Requested: {} ELD  ({amount_micro} μNOID)\n\
+                     \t  Requested: {} ELD  ({amount_micro} μELD)\n\
                      \t  Run 'elide-cli balance' to check your current balance.",
                     elide_str(amount_micro)
                 )
@@ -2018,7 +2018,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             &format!("#{height}"),
             &format!("unix {confirmed_unix}"),
         );
-        kv("Fee", &format!("{} ({} μNOID)", elide_str(fee), fee));
+        kv("Fee", &format!("{} ({} μELD)", elide_str(fee), fee));
         kv("Inputs", &inputs.to_string());
         kv("Outputs", &outputs.len().to_string());
         for (index, output) in outputs.iter().enumerate() {
@@ -2027,7 +2027,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             let slot = output["slot_index"].as_u64().unwrap_or(0);
             kv2(
                 &format!("  Output {}", index + 1),
-                &format!("{} ({} μNOID)", elide_str(amount), amount),
+                &format!("{} ({} μELD)", elide_str(amount), amount),
                 &format!("to {owner}, slot {slot}"),
             );
         }
@@ -2084,8 +2084,8 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     kv("Expires in", &format!("{expires_in_seconds} s"));
     kv("Nonce field", &nonce_field_index.to_string());
     kv("Difficulty", difficulty_target);
-    kv("Claimable fees", &format!("{claimable_fees} μNOID"));
-    kv("Coinbase value", &format!("{coinbase_value} μNOID"));
+    kv("Claimable fees", &format!("{claimable_fees} μELD"));
+    kv("Coinbase value", &format!("{coinbase_value} μELD"));
     if !pow_fields.is_empty() {
         kv2(
             "PoW fields",

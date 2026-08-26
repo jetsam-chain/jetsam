@@ -42,7 +42,7 @@
 use crate::consensus::fees::claimable_fee_for_tx_body;
 use crate::consensus::params::{
     BASE_REWARD_MICRO, EMISSION_END_HEIGHT, HALVING_COUNT, HALVING_INTERVAL, H1_HEIGHT, H2_HEIGHT,
-    MICROELIDE_PER_NOID,
+    MICROELIDE_PER_ELD,
 };
 use elide_tx::types::TxBody;
 
@@ -95,7 +95,7 @@ pub const fn block_reward(height: u64) -> u64 {
     BASE_REWARD_MICRO >> halvings
 }
 
-/// Sum all gross transaction fees (non-coinbase) in μNOID.
+/// Sum all gross transaction fees (non-coinbase) in μELD.
 ///
 /// A block can contain 255 `u64` fees, so aggregation uses `u128`; consensus
 /// predicates never silently saturate a monetary total. This is accounting
@@ -108,7 +108,7 @@ pub fn total_fees(txs: &[TxBody]) -> u128 {
         .sum()
 }
 
-/// Maximum value the coinbase output is permitted to carry (μNOID).
+/// Maximum value the coinbase output is permitted to carry (μELD).
 ///
 /// Only miner-claimable fees are included. The deterministic state-growth
 /// component is burned and can never be recovered through coinbase.
@@ -150,10 +150,10 @@ pub fn max_coinbase_value_from_claimable_fee_sum(
     )) + claimable_fee_sum
 }
 
-/// Format a μNOID amount as a human-readable string (not consensus-critical).
+/// Format a μELD amount as a human-readable string (not consensus-critical).
 pub fn format_eld(micro_eld: u64) -> String {
-    let whole = micro_eld / MICROELIDE_PER_NOID;
-    let frac = micro_eld % MICROELIDE_PER_NOID;
+    let whole = micro_eld / MICROELIDE_PER_ELD;
+    let frac = micro_eld % MICROELIDE_PER_ELD;
     format!("{}.{:06} ELD", whole, frac)
 }
 

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! ParanoidReceipt — unforgeable proof of transaction inclusion.
+//! ElideReceipt — unforgeable proof of transaction inclusion.
 //!
 //! Reference for Merkle inclusion proof structure:
 //!   Bitcoin Core `src/merkle.cpp` (transaction inclusion proofs).
@@ -38,7 +38,7 @@ pub struct TxSummary {
 
 /// Cryptographic proof that a transaction is in the canonical chain.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ParanoidReceipt {
+pub struct ElideReceipt {
     /// Fixed construction marker. This is not a negotiable protocol version.
     pub construction_marker: u8,
     /// Canonical PagedSpend intent encoding with an empty authorization field.
@@ -55,10 +55,10 @@ pub struct ParanoidReceipt {
     pub summary: TxSummary,
 }
 
-impl ParanoidReceipt {
+impl ElideReceipt {
     /// Serialize to compact bincode bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("ParanoidReceipt serialize")
+        bincode::serialize(self).expect("ElideReceipt serialize")
     }
 
     /// Deserialize from bytes.
@@ -86,7 +86,7 @@ pub fn generate_receipt(
     pages: &[Transaction],
     tx_index: usize,
     block_tx_hashes: &[[u8; 32]],
-) -> ParanoidReceipt {
+) -> ElideReceipt {
     let pages: Vec<_> = pages
         .iter()
         .map(|transaction| TxPage {
@@ -99,7 +99,7 @@ pub fn generate_receipt(
     assert_eq!(block_tx_hashes.get(tx_index), Some(&logical_txid));
     let merkle_path = tx_tree::path_from_hashes(block_tx_hashes, tx_index);
     let summary = summary_from_pages(&intent.pages, header.height, header.timestamp);
-    ParanoidReceipt {
+    ElideReceipt {
         construction_marker: RECEIPT_CONSTRUCTION_MARKER,
         paged_spend: intent
             .to_bytes()
@@ -150,7 +150,7 @@ pub fn summary_from_pages(
 /// (amounts, addresses) while keeping the Merkle proof valid.
 ///
 /// Uses Poseidon2b COMPRESS to match `compute_tx_root` in `elide_chain::block`.
-pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
+pub fn verify_merkle_inclusion(receipt: &ElideReceipt) -> bool {
     if receipt.construction_marker != RECEIPT_CONSTRUCTION_MARKER {
         return false;
     }
@@ -180,7 +180,7 @@ pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
 }
 
 /// Verify receipt against a canonical header (online step).
-pub fn verify_against_header(receipt: &ParanoidReceipt, canonical_header: &BlockHeader) -> bool {
+pub fn verify_against_header(receipt: &ElideReceipt, canonical_header: &BlockHeader) -> bool {
     canonical_header.height == receipt.claimed_height
         && canonical_header.tx_root == receipt.claimed_root
         && canonical_header.timestamp == receipt.summary.confirmed_unix
@@ -313,7 +313,7 @@ mod tests {
             assert!(verify_merkle_inclusion(&receipt), "index {index}");
             assert!(verify_against_header(&receipt, &header));
             assert_eq!(
-                ParanoidReceipt::from_bytes(&receipt.to_bytes())
+                ElideReceipt::from_bytes(&receipt.to_bytes())
                     .unwrap()
                     .paged_spend,
                 receipt.paged_spend

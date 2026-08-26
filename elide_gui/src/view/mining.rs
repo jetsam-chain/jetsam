@@ -596,7 +596,7 @@ fn block_details<'a>(
             detail("BLOCK", format_bytes(retained.block_bytes)),
             detail("HISTORYSTEP", format_bytes(retained.history_step_bytes)),
             detail("BUNDLE", format_bytes(retained.bundle_bytes)),
-            detail("FEES", format!("{} μNOID", retained.total_fees_micro_eld)),
+            detail("FEES", format!("{} μELD", retained.total_fees_micro_eld)),
         ]
         .spacing(18);
         let tx_header = container(
@@ -607,7 +607,7 @@ fn block_details<'a>(
                 table_cell("PAGES".into(), 2, theme::INK),
                 table_cell("IN".into(), 2, theme::INK),
                 table_cell("OUT".into(), 2, theme::INK),
-                table_cell("FEE / μNOID".into(), 4, theme::INK),
+                table_cell("FEE / μELD".into(), 4, theme::INK),
                 text("OPEN")
                     .size(13)
                     .color(theme::INK)

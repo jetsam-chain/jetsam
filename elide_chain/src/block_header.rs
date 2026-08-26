@@ -69,7 +69,8 @@ pub struct BlockHeader {
 /// Compute the semantic `block_id` — the Poseidon2b hash of the canonical
 /// semantic header.
 ///
-/// Header identity is also used by the separate 144-block transaction epoch.
+/// Header identity is also used by the separate `TX_EPOCH_BLOCKS` transaction
+/// epoch
 /// and for chain linking (`prev_block_hash`).
 /// ELIDE CHANGE: the nonce is absorbed FIRST, mirroring
 /// `consensus::pow::pow_header_fields_into`. The two orders MUST stay identical:

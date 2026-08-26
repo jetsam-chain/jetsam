@@ -634,7 +634,7 @@ impl AsyncMempool {
         self.len().await == 0
     }
 
-    /// Current dynamic fee floor (μNOID).
+    /// Current dynamic fee floor (μELD).
     pub async fn fee_floor(&self) -> u64 {
         self.state.lock().await.floor.current()
     }

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Transaction builder for the Paranoid wallet.
+//! Transaction builder for the Elide wallet.
 //!
 //! This is the only place that assembles a complete [`PagedSpendIntent`] from UTXOs
 //! and one active-owner proving capability. The two-phase API separates
@@ -55,7 +55,7 @@ pub struct TxBuildData {
 /// Errors that can occur during transaction construction.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    #[error("insufficient funds: need {need} μNOID, have {have} μNOID")]
+    #[error("insufficient funds: need {need} μELD, have {have} μELD")]
     InsufficientFunds { need: u64, have: u64 },
 
     #[error("payment needs more than {max} active UTXOs (selected at least {selected})")]
@@ -77,7 +77,7 @@ pub enum BuildError {
     ConsolidationInputUnavailable { slot_index: u32 },
 
     #[error(
-        "consolidation value mismatch: selected inputs total {selected_total} μNOID, expected output+fee {expected_total} μNOID"
+        "consolidation value mismatch: selected inputs total {selected_total} μELD, expected output+fee {expected_total} μELD"
     )]
     ConsolidationValueMismatch {
         selected_total: u64,
