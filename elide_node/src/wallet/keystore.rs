@@ -23,6 +23,51 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use elide_poseidon2b::primitives::{Address, SpendSecret};
 
+use super::encryption::{self, ENCRYPTED_FILE_LEN};
+
+/// Environment variable holding the wallet passphrase.
+///
+/// ELIDE CHANGE: when it is set, the master secret is written encrypted with
+/// Argon2id + XChaCha20-Poly1305 instead of in the clear. When it is not, the
+/// cleartext format is still used and the caller is warned - refusing outright
+/// would lock a developer out of an existing node for no gain.
+pub const PASSPHRASE_ENV: &str = "ELIDE_WALLET_PASSPHRASE";
+
+/// Test-only passphrase override.
+///
+/// Thread-local on purpose. The obvious alternative - having tests set and
+/// unset the environment variable - mutates process-wide state while the other
+/// tests run in parallel, which makes unrelated wallet tests fail at random.
+/// A thread-local is read only by the thread that set it, so the cases stay
+/// independent and the suite does not have to be pinned to one thread.
+#[cfg(test)]
+thread_local! {
+    static PASSPHRASE_OVERRIDE: std::cell::RefCell<Option<Option<Vec<u8>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with the passphrase forced to `value` on this thread.
+#[cfg(test)]
+pub(super) fn with_passphrase<R>(value: Option<&[u8]>, body: impl FnOnce() -> R) -> R {
+    PASSPHRASE_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(value.map(<[u8]>::to_vec));
+    });
+    let out = body();
+    PASSPHRASE_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    out
+}
+
+fn passphrase() -> Option<Zeroizing<Vec<u8>>> {
+    #[cfg(test)]
+    if let Some(override_value) = PASSPHRASE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return override_value.map(Zeroizing::new);
+    }
+    match std::env::var(PASSPHRASE_ENV) {
+        Ok(value) if !value.is_empty() => Some(Zeroizing::new(value.into_bytes())),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -45,6 +90,10 @@ pub enum KeystoreError {
     Io(#[from] std::io::Error),
     #[error("wallet artifact: {0}")]
     Artifact(String),
+    #[error("this wallet is encrypted; set {} to open it", PASSPHRASE_ENV)]
+    PassphraseRequired,
+    #[error("wallet encryption: {0}")]
+    Encryption(#[from] super::encryption::EncryptionError),
 }
 
 // ---------------------------------------------------------------------------
@@ -157,9 +206,20 @@ impl Keystore {
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         rand::thread_rng().fill_bytes(&mut *secret);
 
-        let mut buf = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN));
-        buf.extend_from_slice(PLAIN_MAGIC);
-        buf.extend_from_slice(&*secret);
+        // ELIDE CHANGE: encrypt when a passphrase is available.
+        let buf = match passphrase() {
+            Some(pass) => encryption::encode(&secret, &pass)?,
+            None => {
+                tracing::warn!(
+                    "{PASSPHRASE_ENV} is not set: the wallet master secret is being written \
+                     in cleartext. Anyone who can read this file takes the funds."
+                );
+                let mut plain = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN));
+                plain.extend_from_slice(PLAIN_MAGIC);
+                plain.extend_from_slice(&*secret);
+                plain
+            }
+        };
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -212,6 +272,12 @@ impl Keystore {
     /// Load a plaintext wallet key file.
     pub(super) fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
         let data = self.read_plain_bytes()?;
+        // ELIDE CHANGE: dispatch on the on-disk magic.
+        if encryption::is_encrypted(&data) {
+            let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
+            let secret = encryption::decode(&data, &pass)?;
+            return Ok(MasterSecret(*secret));
+        }
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         secret.copy_from_slice(&data[16..]);
         let master = MasterSecret(*secret);
@@ -225,6 +291,14 @@ impl Keystore {
     /// exposed to the user-facing import/export surface.
     pub(super) fn export_master_secret_hex(&self) -> Result<Zeroizing<String>, KeystoreError> {
         let data = self.read_plain_bytes()?;
+        // ELIDE CHANGE: on an encrypted file the bytes after the magic are
+        // ciphertext, not the secret. Exporting them would hand the user a
+        // useless string and call it their key.
+        if encryption::is_encrypted(&data) {
+            let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
+            let secret = encryption::decode(&data, &pass)?;
+            return Ok(Zeroizing::new(hex::encode(*secret)));
+        }
         Ok(Zeroizing::new(hex::encode(&data[PLAIN_MAGIC.len()..])))
     }
 
@@ -269,9 +343,18 @@ impl Keystore {
                 return Err(KeystoreError::WrongOwner { actual, expected });
             }
         }
-        let mut data = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN + 1));
-        file.take((PLAIN_FILE_LEN + 1) as u64)
-            .read_to_end(&mut data)?;
+        // ELIDE CHANGE: accept BOTH the cleartext format and the encrypted one.
+        // An existing wallet must never become unreadable because the format
+        // moved on - losing a keystore loses the coins for good.
+        let cap = ENCRYPTED_FILE_LEN.max(PLAIN_FILE_LEN) + 1;
+        let mut data = Zeroizing::new(Vec::with_capacity(cap));
+        file.take(cap as u64).read_to_end(&mut data)?;
+        if super::encryption::is_encrypted(&data) {
+            if data.len() != ENCRYPTED_FILE_LEN {
+                return Err(KeystoreError::InvalidFormat);
+            }
+            return Ok(data);
+        }
         if data.len() != PLAIN_FILE_LEN {
             return Err(KeystoreError::InvalidFormat);
         }
@@ -290,6 +373,49 @@ impl Keystore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// ELIDE — the wallet round-trips through the encrypted format, refuses to
+    /// open without the passphrase, and fails closed on a wrong one.
+    #[test]
+    fn create_and_load_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let ks = Keystore::new(path.clone());
+
+        let created = with_passphrase(Some(b"a real passphrase"), || ks.create_plain().unwrap());
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            super::encryption::is_encrypted(&raw),
+            "a passphrase was set, so the file must be encrypted"
+        );
+
+        let loaded = with_passphrase(Some(b"a real passphrase"), || ks.load_plain().unwrap());
+        assert_eq!(created.derive_address(0), loaded.derive_address(0));
+        assert_eq!(created.derive_address(99), loaded.derive_address(99));
+
+        // No passphrase: refuse, rather than crash or return something wrong.
+        assert!(matches!(
+            with_passphrase(None, || ks.load_plain()),
+            Err(KeystoreError::PassphraseRequired)
+        ));
+
+        // Wrong passphrase: fail closed.
+        assert!(with_passphrase(Some(b"the wrong passphrase"), || ks.load_plain()).is_err());
+    }
+
+    /// A cleartext wallet written before encryption existed must still open,
+    /// with or without a passphrase set. Losing a keystore loses the coins.
+    #[test]
+    fn cleartext_wallet_still_opens() {
+        let dir = TempDir::new().unwrap();
+        let ks = Keystore::new(dir.path().join("wallet.key"));
+        let created = with_passphrase(None, || ks.create_plain().unwrap());
+        for pass in [None, Some(b"irrelevant".as_slice())] {
+            let loaded = with_passphrase(pass, || ks.load_plain().unwrap());
+            assert_eq!(created.derive_address(0), loaded.derive_address(0));
+        }
+    }
 
     #[test]
     fn create_and_load_plain() {

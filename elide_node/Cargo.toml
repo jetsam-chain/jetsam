@@ -57,6 +57,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rand             = "0.8"
 zeroize          = { version = "1", features = ["zeroize_derive"] }
 libc             = "0.2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
 
 # Memory: jemalloc as global allocator.
 # glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)

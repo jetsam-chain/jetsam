@@ -26,6 +26,7 @@
 //!   4. submit to own mempool
 //! ```
 
+pub mod encryption;
 pub mod builder;
 pub mod keystore;
 pub mod prover;
