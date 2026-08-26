@@ -1,11 +1,16 @@
-# Parano1d ①
+# Jetsam
 
-**Proof-native Layer 1 ordered by proof of work.**
+**Proof-native Layer 1 ordered by proof of work. 21,000,000 JTM, zero premine.**
 
 [Website](https://jetsam.org) ·
 [Documentation](https://docs.jetsam.org) ·
 [Research](https://lab.jetsam.org) ·
 [Releases](https://github.com/ignotusnemo/jetsam/releases)
+
+> **Status: pre-launch.** The Jetsam network has not launched. No public
+> network is running and no block has ever been produced. Every figure in
+> this document is a protocol constant or a local measurement, not a live
+> network metric.
 
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
@@ -19,9 +24,9 @@ by prior historical validation.
 
 This is not a temporary limitation. It is baked into the model.
 
-Parano1d removes this requirement.
+Jetsam removes this requirement.
 
-In Parano1d, validity is established once, where the complete information
+In Jetsam, validity is established once, where the complete information
 already exists. Authorization is proved locally by the party with the private
 witness — the wallet owner. The miner proves the public transaction logic and
 the exact state transition. The network verifies those proofs instead of
@@ -30,7 +35,8 @@ repeating the same execution.
 Every accepted block carries a recursive `HistoryStep` that proves the block's
 exact state transition, including its new UTXO root, and verifies the preceding
 `HistoryStep` terminal. A new node can therefore authenticate the current state
-and verify the recent reorg suffix without executing the chain from genesis.
+and verify the recent reorg suffix without executing the chain from genesis —
+synchronization cost is constant in chain age.
 
 Once the present state carries its own proof, a different architecture becomes
 possible. Spent state can be deleted and reused. Ownership no longer needs a
@@ -42,7 +48,7 @@ verify the network without replaying the chain's lifetime.
 
 ## The Fundamental Shift
 
-| | Conventional blockchain | Parano1d |
+| | Conventional blockchain | Jetsam |
 |---|---|---|
 | Validation | Every full node re-executes | The witness holder proves; the network verifies |
 | Bootstrap | Rebuild state from genesis | Authenticate current state and verify the recent suffix |
@@ -52,7 +58,7 @@ verify the network without replaying the chain's lifetime.
 | Proof of work | Orders an execution log | Orders proof-valid state transitions |
 | Post-quantum migration | Replace the ownership scheme | No elliptic-curve transaction scheme to replace |
 
-Parano1d is transparent, not a privacy chain. Current values and owners are
+Jetsam is transparent, not a privacy chain. Current values and owners are
 public, and transactions are visible when relayed. The protocol turns history
 into proof: every node carries an authenticated present instead of an
 ever-growing transaction graph. Anyone may build an external tracer, but it
@@ -61,7 +67,38 @@ make every node carry that burden. Privacy here comes from non-retention, not
 concealment. Zero knowledge protects the spending witness; proof-native
 validation removes redundant execution.
 
+## Monetary Policy
+
+Jetsam has a hard maximum supply of **21,000,000 JTM** and **zero premine**:
+the genesis block carries no coinbase, so every coin in existence is mined
+under the public schedule. Emission halves by block height — seven times in
+total, the first at height 28,800, the second at 172,800, then every 659,000
+blocks — and stops entirely at height **3,467,664**, roughly 9.9 years after
+launch at the 90-second block target:
+
+```
+height           0 →      28 800   50      JTM/block
+height      28 800 →     172 800   25      JTM/block
+height     172 800 →     831 800   12.5    JTM/block
+height     831 800 →   1 490 800   6.25    JTM/block
+height   1 490 800 →   2 149 800   3.125   JTM/block
+height   2 149 800 →   2 808 800   1.5625  JTM/block
+height   2 808 800 →   3 467 664   0.78125 JTM/block
+height   3 467 664 →         ...   0       (emission ends)
+```
+
+The final tier is trimmed by 136 blocks so that the summed schedule equals
+21,000,000 JTM exactly. The cap is enforced by the height schedule itself; no
+cumulative issuance counter exists, and there is no perpetual reward floor.
+The deterministic state-growth fee burn is independent of this schedule and
+remains in force after emission ends.
+
 ## Soundness
+
+The production proof profile is inherited unchanged from the upstream proof
+stack (see [NOTICE](NOTICE)); the assessment below is recomputed directly from
+the constants compiled into this repository by
+[`jetsam_soundness`](jetsam_soundness/README.md).
 
 | Security statement | Current production result |
 |---|---:|
@@ -148,12 +185,12 @@ terminal inside the same relation. Proof size and verification work do not
 increase with block height.
 
 An active node keeps the exact live state, compact headers for cumulative work,
-and the latest 18 canonical block bodies for competing miners and reorgs. A
+and the latest 8 canonical block bodies for competing miners and reorgs. A
 joining node authenticates a finalized current state with its matching
 terminal, then verifies one recursive terminal at the recent suffix tip before
 applying the linked bodies.
 
-Parano1d is history-stateless, not state-free. State transfer scales with the
+Jetsam is history-stateless, not state-free. State transfer scales with the
 live UTXO set. What no longer scales with chain age is the execution required
 to prove why that state is valid.
 
@@ -168,27 +205,29 @@ reference.
 
 State is divided into `2^16`-slot segments. Empty segments are virtual and a
 segment disappears again when its last UTXO is spent. The slot domain begins
-at `2^24`. It expands after a strict majority of the complete 18-header
-hard-finalized window records at least 75% occupancy, attaching a canonical
-empty half to the existing root. No state copy, migration or network pause is
-required.
+at `2^24`. It expands after a strict majority of the complete finalized
+18-header expansion window records at least 75% occupancy, attaching a
+canonical empty half to the existing root. No state copy, migration or network
+pause is required.
 
 Fees distinguish ordinary I/O from net-new state. The state-growth component
-rises with occupancy and is burned; consolidation pays no growth burn. Block
-reward halves when the state domain actually expands, with a permanent 1 JTM
-floor.
+rises with occupancy and is burned; consolidation pays no growth burn. State
+expansion prices state — it has no effect on the block reward, which follows
+the height schedule above.
 
 ### Signatureless Ownership
 
 An address is the Poseidon2b image of a 256-bit spending secret. Ownership is a
 zero-knowledge proof of knowledge of that preimage, bound to the complete
 logical transaction. There is no public key or transaction signature on the
-wire.
+wire, so transaction consensus is post-quantum by construction: there is no
+elliptic-curve ownership scheme to migrate away from.
 
 The capsule is independently randomized on every spend, including repeated use
-of the same address. Transaction consensus contains no elliptic curves. The
-Ed25519 key used by libp2p identifies a peer only and has no spending or
-consensus authority.
+of the same address. One honest nuance: the peer-to-peer layer still uses
+Ed25519 identities over a Noise handshake. That key identifies a peer only —
+it has no spending or consensus authority, and replacing it never touches
+funds.
 
 ### PagedSpend
 
@@ -209,17 +248,19 @@ terminal claims and recursive region authentication into `GF(2^256)`.
 Poseidon2b is the common permutation for addresses, transactions, Merkle trees,
 state roots, transcripts, block identifiers and PoW.
 
-For Parano1d, we developed FROST-GKR (Frobenius Reduction Over Shifted
-Tables). It packs entire Poseidon2b batches and Merkle paths into direct
-degree-seven relations over shared Boolean hypercubes instead of running a
-low-degree sumcheck chain for every permutation. In a like-for-like
-59-permutation benchmark, this reduces median prover time by 10.69×, median
-protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
-Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
-relation without a trusted setup. One joint `GF(2^256)` transcript binds the
-three Link and six Block recursive regions into the outer PCS batch. The two
-authenticated production matrices, B25 at `m=22` and B255 at `m=24`, are embedded
-in the official binary and can be regenerated from source. The Parano1d Lab
+The proof stack uses FROST-GKR (Frobenius Reduction Over Shifted Tables),
+developed by the upstream project this chain derives from (see
+[NOTICE](NOTICE)) and inherited here unchanged. It packs entire Poseidon2b
+batches and Merkle paths into direct degree-seven relations over shared
+Boolean hypercubes instead of running a low-degree sumcheck chain for every
+permutation. In a like-for-like 59-permutation benchmark, this reduces median
+prover time by 10.69×, median protocol-verifier time by 14.80× and raw
+algebraic proof bytes by 51.67×. Batched sumchecks, zerocheck, lincheck and
+FRI-Binius close the GF(2) R1CS relation without a trusted setup. One joint
+`GF(2^256)` transcript binds the three Link and six Block recursive regions
+into the outer PCS batch. The two authenticated production matrices, B25 at
+`m=22` and B255 at `m=24`, are embedded in the official binary and can be
+regenerated from source. The
 [FROST-GKR research article](https://lab.jetsam.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
@@ -228,38 +269,54 @@ This common arithmetic is what lets wallet authorization, exact state and
 recursive chain verification compose as one protocol instead of independent
 proof systems glued together afterward.
 
-### Proof-Native PoW
+### Proof-Native PoW: TowerHash
 
 **Hashpower alone cannot produce blocks. Mining is stateful and proof-gated.**
 A producer must follow the canonical state and complete the nonce-independent
 `HistoryStep` before its internal or external worker can search the fixed
 header.
 
+Jetsam's PoW is **TowerHash**: a sponge over the Poseidon2b permutation in a
+binary tower field, following the design of Grassi et al.
+([IACR ePrint 2025/1893](https://eprint.iacr.org/2025/1893)). Jetsam did not
+design the permutation and does not claim to; what it instantiates is its own:
+fresh round constants derived from a documented nothing-up-my-sleeve seed, its
+own domain-separation tags, and the nonce moved to the first sponge lane so
+every attempt runs all eight permutations with no midstate shortcut. Jetsam
+work is invalid on any other network, and vice versa.
+
 PoW has one job: choose the order of valid transitions. Hash power cannot make
 an invalid `HistoryStep` acceptable.
 
 The miner proves the nonce-independent block first, then searches a fixed
-Poseidon2b header with a 128-bit nonce. ASERT targets the complete interval
-between accepted blocks, including proof preparation, nonce search and
-propagation, at a 20-second mean. Cumulative work selects the chain. An external
+TowerHash header with a 128-bit nonce. ASERT targets the complete interval
+between accepted blocks — proof preparation, nonce search and propagation —
+at a 90-second mean, anchored on the parent's timestamp so a block cannot
+grind weight out of its own. Cumulative work selects the chain. An external
 miner receives an immutable, single-use template and returns only a nonce; it
 cannot alter the transactions or state root.
 
-## Mainnet Profile
+A CUDA GPU miner exists and is validated bit-exact against the CPU reference
+(12,000/12,000 test vectors), sustaining 1.40 MH/s on an RTX 5060.
+
+## Network Profile
 
 | Parameter | Value |
 |---|---:|
-| Genesis timestamp | 2026-08-21 16:00:00 UTC |
-| Genesis block ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
-| Mean block target | 20 seconds |
+| Maximum supply | 21,000,000 JTM |
+| Premine | none — the genesis block has no coinbase |
+| Mean block target | 90 seconds |
+| Consensus finality depth | 8 blocks (~12 minutes) |
+| Halvings | 7, ending at height 3,467,664 (~9.9 years) |
 | Default miner class | B25, `m=22`, up to 25 effective page positions |
 | Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
-| Maximum one-page throughput | 12.75 TPS |
+| Maximum one-page throughput | ~2.8 TPS |
 | Maximum inputs in one transaction | 1,020 |
 | Maximum outputs in one transaction | 256 |
-| Recent block / reorg suffix | 18 blocks |
+| Recent block / reorg suffix | 8 blocks |
 | State domain | `2^24` to `2^32` slots |
+| Default ports | 9700 (P2P), 9701 (RPC, loopback) |
 
 B25 is the laptop-class mining floor, not the protocol ceiling. The production
 capacity selector measures complete preparation on each host and uses B255 only
@@ -268,26 +325,26 @@ verifies both classes.
 
 ## Development Allocation
 
-Parano1d has no premine. For blocks 1 through 6,307,200 — exactly three
-365-day target-time years — each block reward is divided by consensus:
+Jetsam has no premine. For blocks 1 through 700,800 — two 365-day target-time
+years — 10% of each block subsidy is allocated by consensus:
 
 - 90% to the miner;
-- 5% to the O(1) Network Fund;
-- 5% to Parano1d Lab.
+- 5% to the Network Fund;
+- 5% to the Lab Fund.
 
 Transaction fees remain entirely miner-claimable after the existing
-state-growth burn. Beginning with block 6,307,201, the development allocation
-ends and 100% of every new block reward goes to miners.
+state-growth burn. Beginning with block 700,801, the development allocation
+ends and 100% of every new block reward goes to miners. Summed over the
+schedule, the allocation is **1,163,996 JTM — 5.54% of the maximum supply**.
 
-The O(1) Network Fund finances operation, maintenance, security and adoption
-of the live network. Parano1d Lab supports the founders, core developers,
-researchers and contributors advancing the protocol. Both will publish
-periodic reports covering funds received, major expenditures, completed work
-and current priorities.
+The Network Fund finances operation, maintenance, security and adoption of the
+network. The Lab Fund supports the developers, researchers and contributors
+advancing the protocol. Both will publish periodic reports covering funds
+received, major expenditures, completed work and current priorities.
 
 ## Network
 
-Parano1d uses libp2p GossipSub for blocks and transaction intents, typed
+Jetsam uses libp2p GossipSub for blocks and transaction intents, typed
 request-response protocols for synchronization, Kademlia and DNS seeds for
 discovery, and mDNS for local networks. Persistent peers, connection limits,
 and IPv4/IPv6 network-group diversity reduce simple eclipse and connection
@@ -298,7 +355,7 @@ ordinary recent-block sync. Finalized transaction bodies are not required by
 active consensus. Exportable Merkle receipts preserve proof of inclusion after
 a body leaves the recent suffix.
 
-## Running Parano1d
+## Running Jetsam
 
 Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
@@ -312,7 +369,7 @@ An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-jetsam --seed <host>:9600
+jetsam --seed <host>:9700
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
@@ -322,7 +379,7 @@ jetsam --extminer --mining-key <token>
 jetsam-miner --key <token>
 ```
 
-Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
+Default ports are `9700` for P2P and `127.0.0.1:9701` for JSON-RPC. First start
 creates `~/.jetsam/jetsam.toml`, the MDBX state and the built-in wallet
 under `~/.jetsam/data/`.
 
@@ -331,7 +388,7 @@ owner-only permissions; back it up and protect it.
 
 ### CLI
 
-Addresses use bech32m and begin with `o1`. `1 JTM = 1,000,000 μNOID`.
+Addresses use bech32m and begin with `j1`. `1 JTM = 1,000,000 μJTM`.
 `JTM` is the ticker; the wallet uses `①` as its interface symbol.
 
 ```sh
@@ -343,8 +400,8 @@ jetsam-cli address
 jetsam-cli address --new
 jetsam-cli balance
 jetsam-cli utxos
-jetsam-cli send <o1-address> 10.5 --dry-run
-jetsam-cli send <o1-address> 10.5
+jetsam-cli send <j1-address> 10.5 --dry-run
+jetsam-cli send <j1-address> 10.5
 jetsam-cli mempool
 jetsam-cli history
 jetsam-cli receipt <txid> > receipt.hex
@@ -420,8 +477,16 @@ To reproduce the production soundness calculation, see
 cargo run --release --locked -p jetsam_soundness
 ```
 
-Designed and developed by **Ignotus Nemo**. Licensed under the
-[Apache License 2.0](LICENSE). Please report security issues according to the
-[security policy](.github/SECURITY.md).
+## Provenance and License
+
+Jetsam is an independent derivative of an Apache-2.0 licensed upstream
+project. Attribution is preserved in [NOTICE](NOTICE), and every divergence
+from the upstream protocol is documented in
+[CHANGES-FROM-UPSTREAM.md](CHANGES-FROM-UPSTREAM.md). Jetsam is not endorsed
+by or affiliated with the upstream developers, and the two networks reject
+each other's peers, addresses and proof-of-work.
+
+Licensed under the [Apache License 2.0](LICENSE). Please report security
+issues according to the [security policy](.github/SECURITY.md).
 
 Contact: [dev@jetsam.org](mailto:dev@jetsam.org)
