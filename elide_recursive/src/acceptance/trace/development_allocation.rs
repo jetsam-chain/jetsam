@@ -82,11 +82,17 @@ fn constant_bits(value: u64, width: usize) -> Vec<LinExpr> {
 /// locate the height among these boundaries instead of reading a table indexed
 /// by state depth.
 fn halving_boundaries() -> Vec<u64> {
-    use elide_chain::consensus::params::{H1_HEIGHT, H2_HEIGHT, HALVING_COUNT, HALVING_INTERVAL};
+    use elide_chain::consensus::params::{
+        EMISSION_END_HEIGHT, H1_HEIGHT, H2_HEIGHT, HALVING_COUNT, HALVING_INTERVAL,
+    };
     let mut boundaries = vec![H1_HEIGHT, H2_HEIGHT];
-    while boundaries.len() < HALVING_COUNT as usize {
+    while boundaries.len() < HALVING_COUNT as usize - 1 {
         boundaries.push(H2_HEIGHT + HALVING_INTERVAL * (boundaries.len() as u64 - 1));
     }
+    // The seventh (final) boundary ends emission at the trimmed height that
+    // makes the schedule sum to exactly the 21M cap — NOT at
+    // `H2 + 5 × HALVING_INTERVAL`. Same constant `halvings_at` uses natively.
+    boundaries.push(EMISSION_END_HEIGHT);
     debug_assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
     boundaries
 }

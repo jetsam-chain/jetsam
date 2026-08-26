@@ -26,25 +26,36 @@
 //!   831 800 →   1 490 800     |    3   |  6.250000 ELD
 //! 1 490 800 →   2 149 800     |    4   |  3.125000 ELD
 //! 2 149 800 →   2 808 800     |    5   |  1.562500 ELD
-//! 2 808 800 →   3 467 800     |    6   |  0.781250 ELD
-//! 3 467 800 →       ...       |    7   |  0
+//! 2 808 800 →   3 467 664     |    6   |  0.781250 ELD
+//! 3 467 664 →       ...       |    7   |  0
 //! ```
+//!
+//! The final boundary is `EMISSION_END_HEIGHT`, not the naive
+//! `H2 + 5 × HALVING_INTERVAL` = 3 467 800: the last tier is trimmed by the
+//! 136 blocks that would overshoot the 21M cap, so the schedule sums to the
+//! cap exactly over the coinbase-carrying heights (h ≥ 1) and consensus needs
+//! no cumulative-issuance counter.
 //!
 //! State growth is still priced directly: the deterministic state-growth burn
 //! in [`crate::consensus::fees`] is unchanged. Only the halving trigger moved.
 
 use crate::consensus::fees::claimable_fee_for_tx_body;
 use crate::consensus::params::{
-    BASE_REWARD_MICRO, HALVING_COUNT, HALVING_INTERVAL, H1_HEIGHT, H2_HEIGHT, MAX_SUPPLY_MICRO,
+    BASE_REWARD_MICRO, EMISSION_END_HEIGHT, HALVING_COUNT, HALVING_INTERVAL, H1_HEIGHT, H2_HEIGHT,
     MICROELIDE_PER_NOID,
 };
 use elide_tx::types::TxBody;
 
 /// Number of halvings that have occurred at `height`.
 ///
-/// Saturates at [`HALVING_COUNT`]; the schedule has no tier beyond it.
+/// Saturates at [`HALVING_COUNT`]; the schedule has no tier beyond it. The
+/// seventh boundary is [`EMISSION_END_HEIGHT`], not `H2 + 5×INTERVAL`: the
+/// final tier is trimmed so the whole schedule sums to exactly the 21M cap.
 #[inline]
 pub const fn halvings_at(height: u64) -> u32 {
+    if height >= EMISSION_END_HEIGHT {
+        return HALVING_COUNT;
+    }
     let n = if height < H1_HEIGHT {
         0
     } else if height < H2_HEIGHT {
@@ -59,10 +70,10 @@ pub const fn halvings_at(height: u64) -> u32 {
     }
 }
 
-/// Scheduled block reward in μELD at `height`, ignoring the supply cap.
-///
-/// Prefer [`capped_block_reward`] anywhere the value is actually issued: this
-/// function describes the schedule, not what a block may mint.
+/// Block reward in μELD at `height`. This IS what a block may mint: the
+/// schedule sums to exactly [`crate::consensus::params::MAX_SUPPLY_MICRO`]
+/// over the coinbase-carrying heights (h ≥ 1), because the final tier ends at
+/// [`EMISSION_END_HEIGHT`] rather than the naive seventh boundary.
 ///
 /// # Examples
 ///
@@ -71,7 +82,8 @@ pub const fn halvings_at(height: u64) -> u32 {
 /// assert_eq!(block_reward(0), 50_000_000);          // 50 ELD
 /// assert_eq!(block_reward(28_800), 25_000_000);     // first halving
 /// assert_eq!(block_reward(172_800), 12_500_000);    // second halving
-/// assert_eq!(block_reward(3_467_800), 0);           // emission ends
+/// assert_eq!(block_reward(3_467_663), 781_250);     // last paying height
+/// assert_eq!(block_reward(3_467_664), 0);           // emission ends
 /// assert_eq!(block_reward(9_000_000), 0);           // and stays ended
 /// ```
 #[inline]
@@ -81,24 +93,6 @@ pub const fn block_reward(height: u64) -> u64 {
         return 0;
     }
     BASE_REWARD_MICRO >> halvings
-}
-
-/// Block reward actually issuable at `height`, given what has already been
-/// issued.
-///
-/// The schedule sums to slightly more than [`MAX_SUPPLY_MICRO`], so the cap
-/// binds on the final blocks and trims the last subsidy. Enforcing it here — in
-/// consensus, from a value the chain can recompute — means the cap is a rule,
-/// not a comment.
-#[inline]
-pub fn capped_block_reward(height: u64, already_issued_micro: u128) -> u64 {
-    let scheduled = block_reward(height) as u128;
-    let remaining = MAX_SUPPLY_MICRO.saturating_sub(already_issued_micro);
-    if scheduled <= remaining {
-        scheduled as u64
-    } else {
-        remaining as u64
-    }
 }
 
 /// Sum all gross transaction fees (non-coinbase) in μNOID.
@@ -166,6 +160,7 @@ pub fn format_eld(micro_eld: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::params::MAX_SUPPLY_MICRO;
     use elide_poseidon2b::primitives::Address;
     use elide_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
@@ -191,7 +186,7 @@ mod tests {
             H2_HEIGHT + 2 * HALVING_INTERVAL,
             H2_HEIGHT + 3 * HALVING_INTERVAL,
             H2_HEIGHT + 4 * HALVING_INTERVAL,
-            H2_HEIGHT + 5 * HALVING_INTERVAL,
+            EMISSION_END_HEIGHT,
         ];
         assert_eq!(boundaries.len(), HALVING_COUNT as usize);
 
@@ -222,48 +217,68 @@ mod tests {
     /// gone: no height may ever pay the old 1-coin floor after emission ends.
     #[test]
     fn there_is_no_perpetual_reward_floor() {
-        let after_end = H2_HEIGHT + 5 * HALVING_INTERVAL;
-        for height in [after_end, after_end + 1, after_end * 2, u64::MAX / 2] {
+        for height in [
+            EMISSION_END_HEIGHT,
+            EMISSION_END_HEIGHT + 1,
+            EMISSION_END_HEIGHT * 2,
+            u64::MAX / 2,
+        ] {
             assert_eq!(block_reward(height), 0, "height {height} still emits");
         }
     }
 
-    /// THE cap test: sum the entire schedule, block by block, and assert the
-    /// chain can never issue more than 21 000 000 ELD.
+    /// THE cap test: sum `block_reward` alone, block by block over every
+    /// coinbase-carrying height (h ≥ 1; genesis has no coinbase), and assert
+    /// the chain issues exactly 21 000 000 ELD — no cumulative counter, no
+    /// separate capping function.
     #[test]
     fn total_emission_is_exactly_the_cap() {
         let mut issued: u128 = 0;
-        let mut height: u64 = 0;
+        let mut height: u64 = 1;
         while block_reward(height) > 0 {
-            issued += u128::from(capped_block_reward(height, issued));
+            issued += u128::from(block_reward(height));
             height += 1;
         }
         assert_eq!(
             issued, MAX_SUPPLY_MICRO,
             "total issuance {issued} != cap {MAX_SUPPLY_MICRO}"
         );
-        assert!(
-            height < 3_500_000,
-            "emission should end near height 3 467 800, ended at {height}"
+        assert_eq!(
+            height, EMISSION_END_HEIGHT,
+            "first zero-reward height must be EMISSION_END_HEIGHT"
         );
-
-        // Past the end, the cap keeps binding at zero.
-        assert_eq!(capped_block_reward(height, issued), 0);
     }
 
-    /// The uncapped schedule slightly overshoots, which is why the cap must be
-    /// enforced rather than merely documented.
+    /// The naive schedule (final boundary at `H2 + 5×INTERVAL`) overshoots the
+    /// cap, which is why `EMISSION_END_HEIGHT` must trim the final tier: the
+    /// trimmed tail is exactly the overshoot, a whole number of 0.78125-ELD
+    /// blocks.
     #[test]
-    fn schedule_overshoots_so_the_cap_must_bind() {
-        let mut scheduled: u128 = 0;
-        let mut height: u64 = 0;
+    fn emission_end_height_trims_exactly_the_naive_overshoot() {
+        let naive_end = H2_HEIGHT + 5 * HALVING_INTERVAL;
+        assert!(EMISSION_END_HEIGHT < naive_end, "the trim must be non-empty");
+
+        let final_tier_reward = u128::from(BASE_REWARD_MICRO >> (HALVING_COUNT - 1));
+        let trimmed_blocks = u128::from(naive_end - EMISSION_END_HEIGHT);
+
+        // Sum the naive schedule over h >= 1 by walking the real reward
+        // function below the trim and the final tier's own rate inside it.
+        let mut naive_total: u128 = 0;
+        let mut height: u64 = 1;
         while block_reward(height) > 0 {
-            scheduled += u128::from(block_reward(height));
+            naive_total += u128::from(block_reward(height));
             height += 1;
         }
+        naive_total += trimmed_blocks * final_tier_reward;
+
+        assert_eq!(
+            naive_total - MAX_SUPPLY_MICRO,
+            trimmed_blocks * final_tier_reward,
+            "the trimmed tail must equal the naive overshoot exactly"
+        );
         assert!(
-            scheduled > MAX_SUPPLY_MICRO,
-            "schedule sums to {scheduled}, cap would never bind"
+            naive_total > MAX_SUPPLY_MICRO,
+            "naive schedule sums to {naive_total}, the trim would be pointless"
         );
     }
 

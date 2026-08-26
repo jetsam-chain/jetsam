@@ -305,14 +305,17 @@ pub const BASE_REWARD_MICRO: u64 = 50 * MICROELIDE_PER_NOID;
 //   height    831 800 →   1 490 800   6.25    ELD
 //   height  1 490 800 →   2 149 800   3.125   ELD
 //   height  2 149 800 →   2 808 800   1.5625  ELD
-//   height  2 808 800 →   3 467 800   0.78125 ELD
-//   height  3 467 800 →         ...   0       (≈9.89 years)
+//   height  2 808 800 →   3 467 664   0.78125 ELD
+//   height  3 467 664 →         ...   0       (≈9.89 years)
 //
-// The schedule alone sums to 21 000 156.25 ELD, so MAX_SUPPLY_MICRO binds and
-// trims the final blocks. See `emission::total_emission_never_exceeds_cap`.
+// A naive final boundary at 3 467 800 would sum to 21 000 106.25 ELD over the
+// heights that carry a coinbase (h ≥ 1; genesis has none) — 136 final-tier
+// blocks over the cap. `EMISSION_END_HEIGHT` trims exactly those blocks, so
+// the schedule sums to the cap BY HEIGHT and consensus needs no cumulative
+// issuance counter. See `emission::total_emission_is_exactly_the_cap`.
 
-/// Hard cap on total issuance, in μELD. Enforced in consensus, not merely
-/// implied by the schedule.
+/// Hard cap on total issuance, in μELD. Enforced in consensus through
+/// [`EMISSION_END_HEIGHT`]: the height schedule alone sums to exactly this cap.
 pub const MAX_SUPPLY_MICRO: u128 = 21_000_000 * MICROELIDE_PER_NOID as u128;
 
 /// First halving: one month after genesis.
@@ -327,9 +330,43 @@ pub const HALVING_INTERVAL: u64 = 659_000;
 /// Number of halvings. Reaching this one ends emission entirely.
 pub const HALVING_COUNT: u32 = 7;
 
+/// First height with zero subsidy — the seventh (final) halving boundary.
+///
+/// The naive schedule would end the last 0.78125-ELD tier at
+/// `H2_HEIGHT + 5 × HALVING_INTERVAL` = 3 467 800, but summed over the heights
+/// that actually carry a coinbase (h ≥ 1 — genesis has none) that pays
+/// 21 000 106.25 ELD: 106.25 ELD, exactly 136 final-tier blocks, over the cap.
+/// The boundary is therefore derived by trimming the excess off the final
+/// tier, making the end of emission exact BY HEIGHT with no cumulative-issuance
+/// state: `Σ block_reward(h) for h ≥ 1` equals [`MAX_SUPPLY_MICRO`] exactly
+/// (verified block-by-block in `emission::total_emission_is_exactly_the_cap`).
+pub const EMISSION_END_HEIGHT: u64 = {
+    let final_tier_reward = (BASE_REWARD_MICRO >> (HALVING_COUNT - 1)) as u128;
+    // What the naive schedule pays over h ∈ [1, H2 + 5×INTERVAL).
+    let naive_total: u128 = (H1_HEIGHT - 1) as u128 * BASE_REWARD_MICRO as u128
+        + (H2_HEIGHT - H1_HEIGHT) as u128 * (BASE_REWARD_MICRO >> 1) as u128
+        + HALVING_INTERVAL as u128
+            * ((BASE_REWARD_MICRO >> 2) as u128
+                + (BASE_REWARD_MICRO >> 3) as u128
+                + (BASE_REWARD_MICRO >> 4) as u128
+                + (BASE_REWARD_MICRO >> 5) as u128
+                + final_tier_reward);
+    let excess = naive_total - MAX_SUPPLY_MICRO;
+    assert!(
+        excess % final_tier_reward == 0,
+        "the schedule overshoot must be a whole number of final-tier blocks"
+    );
+    H2_HEIGHT + 5 * HALVING_INTERVAL - (excess / final_tier_reward) as u64
+};
+
 const _: () = assert!(
     H1_HEIGHT < H2_HEIGHT,
     "halving boundaries must be strictly increasing"
+);
+
+const _: () = assert!(
+    H2_HEIGHT + (HALVING_COUNT as u64 - 3) * HALVING_INTERVAL < EMISSION_END_HEIGHT,
+    "the emission end must come after the last halving that pays"
 );
 
 // ---------------------------------------------------------------------------
