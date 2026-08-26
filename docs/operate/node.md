@@ -1,6 +1,6 @@
 # Run a node on Linux
 
-An ordinary Parano1d node verifies complete blocks, maintains the live UTXO
+An ordinary Jetsam node verifies complete blocks, maintains the live UTXO
 State, relays transactions and serves synchronization data. It does not mine.
 
 This guide installs the official Core release as a system service. It assumes a
@@ -106,7 +106,7 @@ Create `/etc/systemd/system/jetsam.service`:
 
 ```ini
 [Unit]
-Description=Parano1d node
+Description=Jetsam node
 Wants=network-online.target
 After=network-online.target
 

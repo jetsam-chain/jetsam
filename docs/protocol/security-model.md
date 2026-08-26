@@ -1,6 +1,6 @@
 # Security model
 
-Parano1d combines proof of work, recursive validity, exact Live State and
+Jetsam combines proof of work, recursive validity, exact Live State and
 signatureless wallet authorization. Each mechanism has a distinct job.
 
 ## What consensus establishes
@@ -131,7 +131,7 @@ infrastructure.
 
 ## Transparency
 
-Parano1d is not an anonymity system. Transaction owners, amounts, slots and
+Jetsam is not an anonymity system. Transaction owners, amounts, slots and
 fees are transparent while bodies are available. Zero knowledge hides the
 wallet secret and proves execution; it does not conceal the public ledger
 statement.

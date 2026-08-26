@@ -4,7 +4,7 @@ Performance belongs to one source revision, proof profile, authenticated matrix
 pack, build profile and host. It is not a consensus constant and cannot be
 inferred from core count alone.
 
-The measurements below use Parano1d revision
+The measurements below use Jetsam revision
 `39626b22d53cf2f2c480a7e28446c197dca68043`, the production C1 profile and the
 authenticated B25/B255 matrix pack. The table contains isolated production
 benchmarks only.

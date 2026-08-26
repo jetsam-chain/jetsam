@@ -23,8 +23,8 @@ curl --silent --show-error \
 
 ## Conventions
 
-- Monetary integer fields are in μNOID.
-- One JTM equals 1,000,000 μNOID.
+- Monetary integer fields are in μJTM.
+- One JTM equals 1,000,000 μJTM.
 - Hashes are lowercase hexadecimal without `0x`.
 - Targets and nonce bytes use their canonical little-endian encoding.
 - Addresses use canonical bech32m `o1…` unless a field explicitly says hex.
@@ -86,7 +86,7 @@ owner string.
 | `getMiningInfo` | `[]` | `MiningInfo` |
 | `getPeerCount` | `[]` | Connected-peer count |
 | `getNodeStatus` | `[]` | `NodeStatus` |
-| `estimateFee` | `[n_outputs: u32]` | Accepted minimum in μNOID, assuming one input |
+| `estimateFee` | `[n_outputs: u32]` | Accepted minimum in μJTM, assuming one input |
 | `estimateFeeDetailed` | `[n_inputs: u32, n_outputs: u32]` | `FeeEstimate` |
 
 Detailed fee counts must be 1–1,020 inputs and 1–256 outputs. The returned fee
@@ -178,7 +178,7 @@ process is exiting.
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
 
-Amounts and fees are μNOID. A send or plan fee of zero requests automatic fee
+Amounts and fees are μJTM. A send or plan fee of zero requests automatic fee
 selection.
 
 Receipt and mined-block pages start at one and accept sizes 1–50.
@@ -238,7 +238,7 @@ TxInfo {
 ```
 
 `circulating_supply_micro_jtm` is the exact sum of all UTXO values in Live
-State, expressed in μNOID. It is encoded as a decimal string so JSON does not
+State, expressed in μJTM. It is encoded as a decimal string so JSON does not
 lose precision.
 
 ```text

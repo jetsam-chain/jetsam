@@ -1,6 +1,6 @@
 # Maintenance
 
-Parano1d persists Live State transactionally. Routine maintenance does not
+Jetsam persists Live State transactionally. Routine maintenance does not
 replay or retain historical block bodies.
 
 ## Observe

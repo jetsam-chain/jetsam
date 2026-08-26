@@ -1,6 +1,6 @@
 # Install and use the wallet
 
-The native GUI package contains the Parano1d wallet and its private full
+The native GUI package contains the Jetsam wallet and its private full
 node. The application starts, monitors and stops that node itself. Ordinary
 wallet use does not require a terminal.
 
@@ -46,7 +46,7 @@ Open the `.deb` with the system Software application, or run:
 sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 ```
 
-Launch **Parano1d** from the application menu.
+Launch **Jetsam** from the application menu.
 
 ### Windows
 
@@ -59,7 +59,7 @@ publisher. After verifying the SHA-256 digest, choose **More info** and
 
 ### macOS
 
-Open the DMG and drag **Parano1d** to Applications.
+Open the DMG and drag **Jetsam** to Applications.
 
 Until releases are notarized with an Apple Developer ID, Control-click the
 application, choose **Open**, and confirm. If macOS still blocks it, use
@@ -116,7 +116,7 @@ On Debian or Ubuntu:
 sudo apt remove jetsam-gui
 ```
 
-On Windows, use **Installed apps → Parano1d → Uninstall**. On macOS, move the
+On Windows, use **Installed apps → Jetsam → Uninstall**. On macOS, move the
 application from Applications to Trash.
 
 Wallet and node data remain under `.jetsam` in the user profile. Remove that

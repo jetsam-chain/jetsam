@@ -2,7 +2,7 @@
 
 This glossary defines protocol-specific language used throughout the
 documentation. A capitalized term such as `State` or `HistoryStep` names a
-particular Parano1d object; ordinary lowercase use keeps its general meaning.
+particular Jetsam object; ordinary lowercase use keeps its general meaning.
 
 ## Accepted block bundle
 
@@ -25,7 +25,7 @@ an output owner without publishing a public key.
 ## ASERT
 
 The absolutely scheduled exponentially weighted target algorithm used to
-derive the exact proof-of-work target at every height. Parano1d uses a
+derive the exact proof-of-work target at every height. Jetsam uses a
 six-block reference epoch, a 120-second half-life and a 20-second target
 interval.
 
@@ -135,7 +135,7 @@ longer current.
 ## Fiat-Shamir transcript
 
 The ordered record of public statements, commitments and derived challenges
-used to compile an interactive proof into a non-interactive one. Parano1d
+used to compile an interactive proof into a non-interactive one. Jetsam
 derives transcript challenges with domain-separated Poseidon2b.
 
 ## Fork choice
@@ -147,7 +147,7 @@ ID as a tie-break.
 ## FRI / FRI-Binius
 
 FRI is an interactive-oracle proof of proximity to a low-degree codeword.
-FRI-Binius is Parano1d's binary-field polynomial commitment layer built from
+FRI-Binius is Jetsam's binary-field polynomial commitment layer built from
 that family and a BaseFold schedule.
 
 ## [FROST-GKR](../research/frost-gkr.md)
@@ -170,7 +170,7 @@ pinned binary tower representation.
 
 ## GF(2^256)
 
-The quadratic extension of Parano1d's `GF(2^128)` field used for production C1
+The quadratic extension of Jetsam's `GF(2^128)` field used for production C1
 Fiat–Shamir challenges, terminal claims and recursive region authentication.
 
 ## GKR
@@ -279,9 +279,9 @@ The unique multilinear polynomial agreeing with a table on the Boolean
 hypercube. Sumcheck and GKR-style protocols use MLEs to reduce table-wide
 relations to evaluations at sampled points.
 
-## μNOID
+## μJTM
 
-The atomic currency unit. One JTM is 1,000,000 μNOID.
+The atomic currency unit. One JTM is 1,000,000 μJTM.
 
 ## Network identity
 
@@ -297,7 +297,7 @@ diversity and resource limits. It has no role in consensus or wallet identity.
 ## NIST Post-Quantum Cryptography Category 1
 
 The NIST resource target referenced to exhaustive key search against AES-128,
-including the published `MAXDEPTH` limits. Parano1d evaluates this target for
+including the published `MAXDEPTH` limits. Jetsam evaluates this target for
 the end-to-end from-genesis invalid-State game.
 
 ## Nonce
@@ -352,7 +352,7 @@ trace.
 ## Rank-1 constraint system (R1CS)
 
 An arithmetic representation of computation as multiplication constraints
-between linear combinations. Parano1d uses a binary R1CS relation closed by
+between linear combinations. Jetsam uses a binary R1CS relation closed by
 sumcheck, zerocheck, lincheck and FRI-Binius.
 
 ## Receipt
@@ -363,7 +363,7 @@ inclusion under a claimed canonical header transaction root.
 ## Reorganization (reorg)
 
 Replacement of recent canonical blocks by a different eligible branch with
-greater cumulative work. Parano1d accepts at most a 17-block rollback.
+greater cumulative work. Jetsam accepts at most a 17-block rollback.
 
 ## Round-by-round knowledge bound (RBR)
 
@@ -449,7 +449,7 @@ label and is not interchangeable with an RBR or end-to-end security claim.
 ## Trusted setup
 
 A ceremony that creates secret public parameters whose compromise could
-invalidate security. Parano1d's transparent proof stack requires no such
+invalidate security. Jetsam's transparent proof stack requires no such
 ceremony.
 
 ## Tx8x2
@@ -471,7 +471,7 @@ owner and fresh `creation_id` at one indexed slot.
 ## Zero-knowledge proof
 
 A proof that establishes a statement without revealing the secret witness.
-In Parano1d it hides wallet spending secrets; public owners, amounts, fees
+In Jetsam it hides wallet spending secrets; public owners, amounts, fees
 and relayed transactions remain transparent.
 
 ## Zerocheck

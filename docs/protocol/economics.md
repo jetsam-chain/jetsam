@@ -1,16 +1,16 @@
 # Network economics
 
-Parano1d ties issuance to Live State capacity and prices persistent State
+Jetsam ties issuance to Live State capacity and prices persistent State
 growth separately from ordinary transaction work.
 
 ## Unit
 
 ```text
-1 JTM = 1,000,000 μNOID
+1 JTM = 1,000,000 μJTM
 ```
 
 JTM is the currency ticker; the wallet uses ① as its interface symbol.
-All consensus amounts are integers in μNOID.
+All consensus amounts are integers in μJTM.
 
 ## Block reward
 
@@ -37,7 +37,7 @@ For the first three target-time years, each block subsidy is divided:
 
 - 90% to the miner;
 - 5% to the O(1) Network Fund;
-- 5% to Parano1d Lab.
+- 5% to Jetsam Lab.
 
 There is no premine. After height 6,307,200, the complete block subsidy goes to
 the miner.
@@ -55,10 +55,10 @@ redirect or defer a due payout.
 
 The minimum transaction fee consists of:
 
-- 5,000 μNOID per logical transaction;
-- 100 μNOID per live input;
-- 700 μNOID per live output;
-- 2,500 μNOID times occupancy pressure for each net-new live slot.
+- 5,000 μJTM per logical transaction;
+- 100 μJTM per live input;
+- 700 μJTM per live output;
+- 2,500 μJTM times occupancy pressure for each net-new live slot.
 
 Pressure multipliers are:
 
@@ -79,7 +79,7 @@ pays no growth burn.
 
 The default mempool relays a transaction only when its fee satisfies both
 consensus minimum and current relay policy. The dynamic floor is the greater
-of 5,000 μNOID and 90% of the median fee among the last 50 transactions
+of 5,000 μJTM and 90% of the median fee among the last 50 transactions
 admitted to that node's mempool.
 
 This relay floor is local policy. Consensus fee accounting remains

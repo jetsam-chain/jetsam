@@ -70,14 +70,14 @@ development payout counts as one position.
 
 | Parameter | Value |
 |---|---:|
-| Atomic unit | 1 μNOID |
+| Atomic unit | 1 μJTM |
 | Units per JTM | 1,000,000 |
 | Starting subsidy | 50 JTM |
 | Permanent subsidy floor | 1 JTM |
-| Base transaction fee | 5,000 μNOID |
-| Fee per live input | 100 μNOID |
-| Fee per live output | 700 μNOID |
-| Base growth fee per net-new slot | 2,500 μNOID |
+| Base transaction fee | 5,000 μJTM |
+| Fee per live input | 100 μJTM |
+| Fee per live output | 700 μJTM |
+| Base growth fee per net-new slot | 2,500 μJTM |
 | Development allocation period | 6,307,200 blocks |
 | Development payout interval | 5,760 blocks |
 

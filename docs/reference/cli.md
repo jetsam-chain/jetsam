@@ -111,7 +111,7 @@ Amounts entered by CLI wallet commands are in JTM with up to six decimal
 places:
 
 ```text
-1 JTM = 1,000,000 μNOID
+1 JTM = 1,000,000 μJTM
 ```
 
 ### Node and chain

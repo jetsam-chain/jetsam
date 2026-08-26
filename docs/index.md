@@ -1,4 +1,4 @@
-# Parano1d ①
+# Jetsam ①
 
 **Proof-native Layer 1 ordered by proof of work.**
 
@@ -14,7 +14,7 @@ by prior historical validation.
 
 This is not a temporary limitation. It is baked into the model.
 
-Parano1d is designed to remove this requirement.
+Jetsam is designed to remove this requirement.
 
 Validity is established once, where the complete information already exists.
 The wallet proves authorization with its private witness. The miner proves the
@@ -35,7 +35,7 @@ hardware requirement.
 
 ## The fundamental shift
 
-| | Conventional blockchain | Parano1d |
+| | Conventional blockchain | Jetsam |
 |---|---|---|
 | Validation | Every full node re-executes | The witness holder proves; the network verifies |
 | Bootstrap | Rebuild state from genesis | Authenticate current State and verify the recent suffix |
@@ -97,7 +97,7 @@ joining node authenticates a finalized State with its matching terminal, then
 verifies one recursive terminal at the recent suffix tip before applying the
 linked bodies.
 
-Parano1d is history-stateless, not state-free. `State` transfer scales with the
+Jetsam is history-stateless, not state-free. `State` transfer scales with the
 live UTXO set. What no longer scales with chain age is the execution required
 to prove why that State is valid.
 
@@ -113,7 +113,7 @@ including repeated use of the same address. Transaction consensus contains no
 elliptic curves. The Ed25519 key used by libp2p identifies a peer only and has
 no spending or consensus authority.
 
-Parano1d is transparent, not a privacy chain. Values, owners and relayed
+Jetsam is transparent, not a privacy chain. Values, owners and relayed
 transactions are public. Zero knowledge protects the spending witness.
 Protocol storage reduces routine transaction-body retention, but it cannot
 prevent third parties from archiving public transactions.

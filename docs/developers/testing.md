@@ -1,6 +1,6 @@
 # Testing
 
-Parano1d uses three layers of tests: crate-level invariants, cross-crate
+Jetsam uses three layers of tests: crate-level invariants, cross-crate
 release tests and fresh-process live scenarios.
 
 ## Fast checks

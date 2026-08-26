@@ -65,13 +65,13 @@ Category 1 gate-depth floor 173.273866314232 bits
 ## Monetary
 
 ```text
-1 JTM                   1,000,000 μNOID
+1 JTM                   1,000,000 μJTM
 initial subsidy          50 JTM
 subsidy floor            1 JTM
-base fee                 5,000 μNOID
-input fee                100 μNOID
-output fee               700 μNOID
-base growth fee          2,500 μNOID / net-new slot
+base fee                 5,000 μJTM
+input fee                100 μJTM
+output fee               700 μJTM
+base growth fee          2,500 μJTM / net-new slot
 ```
 
 The explanatory and boundary rules are in
