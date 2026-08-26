@@ -131,6 +131,7 @@ fn halving_tier_one_hot(b: &mut FieldR1csBuilder, height_bits: &[LinExpr]) -> Ve
 /// Convenience wrapper for callers that hold a height but not its bit
 /// decomposition — chiefly test harnesses. Production code takes the selectors
 /// from `DevelopmentAllocationTrace::emission_tiers`, which are built once.
+#[cfg(test)]
 pub(crate) fn tier_one_hot_for_height(b: &mut FieldR1csBuilder, height: &LinExpr) -> Vec<LinExpr> {
     let bits: Vec<LinExpr> = range_check_bits(b, height, HEIGHT_BITS)
         .into_iter()
