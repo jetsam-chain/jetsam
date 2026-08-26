@@ -4,7 +4,7 @@
 
 | Файл | Роль |
 |---|---|
-| `elide` | Полная нода, серверная часть кошелька и необязательный внутренний конвейер доказательства и майнинга |
+| `jetsam` | Полная нода, серверная часть кошелька и необязательный внутренний конвейер доказательства и майнинга |
 | `jetsam-cli` | Тонкий JSON-RPC-клиент работающей ноды |
 | `jetsam-miner` | Отдельный вычислитель nonce Poseidon2b |
 
@@ -13,7 +13,7 @@
 Обычная нода запускается без режима:
 
 ```sh
-elide
+jetsam
 ```
 
 Публичные параметры демона:
@@ -52,13 +52,13 @@ elide
 
 ```sh
 # Ordinary node
-elide --data-dir ~/.elide/data
+jetsam --data-dir ~/.jetsam/data
 
 # Internal miner using 12 logical CPUs
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 Оставляйте RPC на локальном интерфейсе, если он не защищён приватным или
@@ -107,11 +107,11 @@ jetsam-miner \
 Стандартный адрес — `http://127.0.0.1:9601`. Его можно изменить переменной
 окружения `JETSAM_RPC`; параметр `--rpc` имеет приоритет.
 
-Суммы в командах кошелька указываются в ELD, не более шести десятичных
+Суммы в командах кошелька указываются в JTM, не более шести десятичных
 знаков:
 
 ```text
-1 ELD = 1,000,000 μNOID
+1 JTM = 1,000,000 μNOID
 ```
 
 ### Нода и цепь
@@ -216,7 +216,7 @@ jetsam-cli send o1... 10.5 --dry-run
 jetsam-cli send o1... 10.5
 ```
 
-Точную комиссию в ELD задавайте только при необходимости:
+Точную комиссию в JTM задавайте только при необходимости:
 
 ```sh
 jetsam-cli send o1... 10.5 --fee 0.012

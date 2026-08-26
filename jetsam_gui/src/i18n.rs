@@ -255,10 +255,10 @@ fn translate_localized(language: Language, source: &str) -> String {
             Language::English => source.to_owned(),
         };
     }
-    if let Some(value) = source.strip_suffix(" ELD selected") {
+    if let Some(value) = source.strip_suffix(" JTM selected") {
         return match language {
-            Language::Russian => format!("ВЫБРАНО {value} ELD"),
-            Language::Chinese => format!("已选择 {value} ELD"),
+            Language::Russian => format!("ВЫБРАНО {value} JTM"),
+            Language::Chinese => format!("已选择 {value} JTM"),
             Language::English => source.to_owned(),
         };
     }
@@ -637,7 +637,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "DIFFICULTY" => ("СЛОЖНОСТЬ", "难度"),
         "ACTIVE ADDRESS" => ("АКТИВНЫЙ АДРЕС", "当前地址"),
         "SWITCH" => ("СМЕНИТЬ", "切换"),
-        "ELD BALANCE" => ("БАЛАНС ELD", "ELD 余额"),
+        "JTM BALANCE" => ("БАЛАНС JTM", "JTM 余额"),
         "SPENDABLE OUTPUTS" => ("ДОСТУПНЫЕ ВЫХОДЫ", "可用输出"),
         "CONSOLIDATE" => ("ОБЪЕДИНИТЬ", "整合"),
         "CONSOLIDATION RECOMMENDED" => ("РЕКОМЕНДУЕТСЯ ОБЪЕДИНЕНИЕ", "建议整合 UTXO"),
@@ -651,7 +651,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "LIVE SLOTS" => ("ЗАНЯТЫЕ СЛОТЫ", "实时槽位"),
         "SEGMENT" => ("СЕГМЕНТ", "分段"),
         "SLOT" => ("СЛОТ", "槽位"),
-        "VALUE / ELD" => ("СУММА / ELD", "金额 / ELD"),
+        "VALUE / JTM" => ("СУММА / JTM", "金额 / JTM"),
         "ORIGIN" => ("ИСТОЧНИК", "来源"),
         "SELECTED OUTPUT" => ("ВЫБРАННЫЙ ВЫХОД", "已选输出"),
         "FILTER ACTIVE" => ("ФИЛЬТР ВКЛЮЧЁН", "筛选已启用"),
@@ -693,7 +693,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "PROVE & SEND" => ("ПОСТРОИТЬ И ОТПРАВИТЬ", "生成证明并发送"),
         "RECIPIENT" => ("ПОЛУЧАТЕЛЬ", "收款地址"),
         "Paste an o1 address" => ("Вставьте адрес o1", "粘贴 o1 地址"),
-        "AMOUNT / ELD" => ("СУММА / ELD", "金额 / ELD"),
+        "AMOUNT / JTM" => ("СУММА / JTM", "金额 / JTM"),
         "AUTOMATIC · calculated by the wallet" => (
             "АВТОМАТИЧЕСКИ · РАССЧИТАНО КОШЕЛЬКОМ",
             "自动 · 由钱包计算",
@@ -891,9 +891,9 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "OUTPUT TOTAL" => ("СУММА ВЫХОДОВ", "输出总额"),
         "BLOCK REWARD" => ("ВОЗНАГРАЖДЕНИЕ ЗА БЛОК", "区块奖励"),
         "REWARD SHARE" => ("ДОЛЯ НАГРАДЫ", "奖励份额"),
-        "Block-reward shares paid to the Elide Network Fund and Lab Fund. This protocol payout has no spend inputs." => (
-            "Доли вознаграждения за блок выплачены фондам Elide Network Fund и Lab Fund. У этой протокольной выплаты нет расходуемых входов.",
-            "区块奖励份额支付给 Elide Network Fund 和 Lab Fund。该协议付款不消耗任何输入。",
+        "Block-reward shares paid to the Jetsam Network Fund and Lab Fund. This protocol payout has no spend inputs." => (
+            "Доли вознаграждения за блок выплачены фондам Jetsam Network Fund и Lab Fund. У этой протокольной выплаты нет расходуемых входов.",
+            "区块奖励份额支付给 Jetsam Network Fund 和 Lab Fund。该协议付款不消耗任何输入。",
         ),
         "INPUT UTXOS" => ("ВХОДНЫЕ UTXO", "输入 UTXO"),
         "OUTPUT UTXOS" => ("ВЫХОДНЫЕ UTXO", "输出 UTXO"),
@@ -918,7 +918,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "SEND" => ("ОТПРАВИТЬ", "发送"),
         "USE KEY" => ("ИСПОЛЬЗОВАТЬ КЛЮЧ", "使用密钥"),
         "HEADER →" => ("ЗАГОЛОВОК →", "区块头 →"),
-        "FEE / ELD" => ("КОМИССИЯ / ELD", "手续费 / ELD"),
+        "FEE / JTM" => ("КОМИССИЯ / JTM", "手续费 / JTM"),
         "FEE / μJTM" => ("КОМИССИЯ / μJTM", "手续费 / μJTM"),
         "256 BITS · GENERATED LOCALLY" => (
             "256 БИТ · СОЗДАН ЛОКАЛЬНО",
@@ -1026,22 +1026,22 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         ),
         "Master secret ready." => ("Мастер-ключ готов.", "主密钥已就绪。"),
         "Enter an amount." => ("Введите сумму.", "请输入金额。"),
-        "Amount must be a positive ELD value." => (
-            "Сумма ELD должна быть положительной.",
-            "ELD 金额必须大于零。",
+        "Amount must be a positive JTM value." => (
+            "Сумма JTM должна быть положительной.",
+            "JTM 金额必须大于零。",
         ),
-        "Use a decimal ELD amount, for example 12.500000." => (
-            "Введите десятичную сумму ELD, например 12.500000.",
-            "请输入十进制 ELD 金额，例如 12.500000。",
+        "Use a decimal JTM amount, for example 12.500000." => (
+            "Введите десятичную сумму JTM, например 12.500000.",
+            "请输入十进制 JTM 金额，例如 12.500000。",
         ),
-        "ELD supports at most 6 decimal places." => (
-            "ELD поддерживает не более 6 знаков после запятой.",
-            "ELD 最多支持 6 位小数。",
+        "JTM supports at most 6 decimal places." => (
+            "JTM поддерживает не более 6 знаков после запятой.",
+            "JTM 最多支持 6 位小数。",
         ),
         "Amount is too large." => ("Сумма слишком велика.", "金额过大。"),
-        "Amount must be at least 0.000001 ELD." => (
-            "Минимальная сумма — 0.000001 ELD.",
-            "金额不得低于 0.000001 ELD。",
+        "Amount must be at least 0.000001 JTM." => (
+            "Минимальная сумма — 0.000001 JTM.",
+            "金额不得低于 0.000001 JTM。",
         ),
         "HISTORYSTEP" => ("HISTORYSTEP", "HISTORYSTEP"),
         "genesis" => ("генезис", "创世区块"),

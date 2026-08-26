@@ -2,11 +2,11 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Transparent transaction layer for Elide.
+//! Transparent transaction layer for Jetsam.
 //!
 //! Defines the on-wire shape of a transaction — inputs, outputs, body
 //! roots, auth tags — and the canonical body hash that binds all of it.
-//! Elide is a transparent UTXO chain: values and owner addresses are
+//! Jetsam is a transparent UTXO chain: values and owner addresses are
 //! on-chain, spends are authorized by signatureless owner proofs.
 
 pub mod body_hash;

@@ -8,13 +8,13 @@
 先运行发布版硬件检查：
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 从节点钱包获取奖励地址：
 
 ```sh
-elide
+jetsam
 jetsam-cli address --list
 jetsam-cli stop
 ```
@@ -26,14 +26,14 @@ jetsam-cli stop
 在前台运行：
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 也可更新 systemd unit：
 
 ```ini
-ExecStart=/usr/local/bin/elide \
-  --config /etc/elide/elide.toml \
+ExecStart=/usr/local/bin/jetsam \
+  --config /etc/jetsam/jetsam.toml \
   --mode miner \
   --cpu-threads 12
 ```
@@ -42,7 +42,7 @@ ExecStart=/usr/local/bin/elide \
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart elide
+sudo systemctl restart jetsam
 ```
 
 ## 就绪条件
@@ -78,7 +78,7 @@ jetsam-cli mining
 若要固定独立的进程奖励地址：
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 请使用完整 bech32m 地址。
@@ -92,7 +92,7 @@ jetsam-cli stop
 ```
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 正常关闭会取消挖矿、关闭网络并刷入 MDBX。不要仅因活动证明需要几秒到达

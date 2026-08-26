@@ -5,7 +5,7 @@
 
 ## 选择安装包
 
-请从 [GitHub 发布页面](https://github.com/ignotusnemo/elide/releases)
+请从 [GitHub 发布页面](https://github.com/ignotusnemo/jetsam/releases)
 下载与电脑匹配的 GUI 钱包：
 
 | 平台 | 安装包 |
@@ -89,13 +89,13 @@ sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 
 1. 打开 **发送**，或按 `F3`；
 2. 粘贴有效的 `o1…` 地址；
-3. 输入 ELD 数量；
+3. 输入 JTM 数量；
 4. 核对选定输入、输出和网络费；
 5. 选择 **证明并发送**。
 
 钱包在本机生成私有授权证明，再将完整交易意图提交给自己的节点。发送
 成功后，最终面板会显示逻辑交易 ID。状态与确认行为详见
-[发送 ELD](../wallet/send.md)。
+[发送 JTM](../wallet/send.md)。
 
 ## 卸载应用
 
@@ -110,5 +110,5 @@ sudo apt remove jetsam-gui
 Windows 请使用 **已安装的应用 → Parano1d → 卸载**；macOS 则将
 Applications 中的应用移到废纸篓。
 
-钱包和节点数据仍保存在用户目录下的 `.elide` 中。只有在导出或
+钱包和节点数据仍保存在用户目录下的 `.jetsam` 中。只有在导出或
 备份主密钥以及需要保留的收据后，才应删除该目录。

@@ -2812,7 +2812,7 @@ mod tests {
         let parent = *context.tip_header();
         let timestamp = parent.timestamp.saturating_add(1);
         let anchor = context.anchor_info();
-        // ELIDE CHANGE: ASERT is anchored on the parent's timestamp, never on
+        // JETSAM CHANGE: ASERT is anchored on the parent's timestamp, never on
         // the block's own. This helper must feed `next_target` exactly what
         // `validate_header_inner` will, or every block it builds is rejected
         // with BadDifficultyTarget.
@@ -3014,7 +3014,7 @@ mod tests {
                 .insert(height, occupancy_header(height, active));
         }
 
-        // ELIDE CHANGE: parent heights derived from CONSENSUS_FINALITY_DEPTH
+        // JETSAM CHANGE: parent heights derived from CONSENSUS_FINALITY_DEPTH
         // instead of the literals 52 and 61, which encoded a finality of 18.
         // What the test means is "the parent whose finalized window ends at 34"
         // and "the parent whose window ends at 43" — those are the invariants,
@@ -3061,7 +3061,7 @@ mod tests {
     fn missing_finalized_expansion_header_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let mut context = small_context(directory.path());
-        // ELIDE CHANGE: the tip is the first height with a complete finalized
+        // JETSAM CHANGE: the tip is the first height with a complete finalized
         // window (EXPANSION_HEADER_LOOKBACK), so that window is exactly
         // 0..=EXPANSION_WINDOW-1 and removing header 7 is guaranteed to punch a
         // hole *inside* it. Upstream's literal 35 only worked while finality

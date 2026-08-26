@@ -71,9 +71,9 @@ development payout counts as one position.
 | Parameter | Value |
 |---|---:|
 | Atomic unit | 1 μNOID |
-| Units per ELD | 1,000,000 |
-| Starting subsidy | 50 ELD |
-| Permanent subsidy floor | 1 ELD |
+| Units per JTM | 1,000,000 |
+| Starting subsidy | 50 JTM |
+| Permanent subsidy floor | 1 JTM |
 | Base transaction fee | 5,000 μNOID |
 | Fee per live input | 100 μNOID |
 | Fee per live output | 700 μNOID |

@@ -57,7 +57,7 @@ described below.
 ## Reproduce the soundness certificate
 
 The production calculations and proof documents are in
-[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness).
 
 ```sh
 cargo run --release --locked -p jetsam_soundness
@@ -138,7 +138,7 @@ to zero. The Core archive has a fixed member set:
 README.txt
 LICENSE
 NOTICE
-elide
+jetsam
 jetsam-cli
 jetsam-miner
 ```

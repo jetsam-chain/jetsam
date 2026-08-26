@@ -12,7 +12,7 @@
 Запустите ноду в режиме внешнего майнера с токеном доступа:
 
 ```sh
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 В другом терминале:
@@ -43,7 +43,7 @@ RPC только
 после настройки защищённого транспорта:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -61,7 +61,7 @@ elide \
 включить эту возможность:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase

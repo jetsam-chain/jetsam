@@ -75,7 +75,7 @@ mod tests {
     fn floor_rises_with_high_fees() {
         let mut f = FeeFloor::new(10);
         for _ in 0..10 {
-            f.record(100_000); // 0.1 ELD
+            f.record(100_000); // 0.1 JTM
         }
         assert!(f.current() > MIN_FEE_BASE, "floor must rise above minimum");
     }

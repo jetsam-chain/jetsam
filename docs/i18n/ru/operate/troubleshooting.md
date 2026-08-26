@@ -25,7 +25,7 @@ REQUIRED x86-64 SSE4.1 + PCLMULQDQ
 Запустите проверку без изменения данных:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 ## Нет пиров

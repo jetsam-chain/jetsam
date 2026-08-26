@@ -177,7 +177,7 @@ fn validate_header_inner(
 
     // 3. Difficulty target matches ASERT expectation.
     //
-    // ELIDE CHANGE (vs upstream Parano1d): the elapsed time fed to ASERT is the
+    // JETSAM CHANGE (vs upstream Parano1d): the elapsed time fed to ASERT is the
     // PARENT's timestamp, never the block's own. Upstream passed
     // `header.timestamp` here, which let a miner set the fork-choice weight of
     // its own block through a field it chooses freely: dating a block at
@@ -255,7 +255,7 @@ mod tests {
 
     fn make_header(height: u64, timestamp: u64, parent: Option<&BlockHeader>) -> BlockHeader {
         let prev_hash = parent.map(block_id).unwrap_or([0u8; 32]);
-        // ELIDE CHANGE: the target is now anchored on the parent's timestamp, so
+        // JETSAM CHANGE: the target is now anchored on the parent's timestamp, so
         // a child can no longer carry the trivial TEST_TARGET verbatim — it must
         // carry exactly what `validate_header_inner` will recompute. Every test
         // in this module anchors on the genesis block and builds height-1
@@ -280,7 +280,7 @@ mod tests {
     }
 
     fn mine(header: &mut BlockHeader) {
-        // ELIDE CHANGE: upstream hardcoded nonce = 0, relying on the child
+        // JETSAM CHANGE: upstream hardcoded nonce = 0, relying on the child
         // carrying [0xFF;32]. With the parent-anchored target the child's target
         // is slightly harder than trivial (actual < ideal on the first block
         // after the anchor), so nonce 0 is no longer guaranteed to satisfy it.
@@ -382,7 +382,7 @@ mod tests {
         .is_ok());
     }
 
-    /// ELIDE — the invariant that closes the upstream weight-grinding vector.
+    /// JETSAM — the invariant that closes the upstream weight-grinding vector.
     ///
     /// Two blocks with the same parent and the same height must be assigned the
     /// SAME difficulty target, whatever timestamp their miner chose. Upstream
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(asert_anchor_height(100), 96);
     }
 
-    /// ELIDE CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of the
+    /// JETSAM CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of the
     /// literal 18, so the test follows the constant rather than pinning it.
     #[test]
     fn finality_check() {

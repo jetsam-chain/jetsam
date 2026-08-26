@@ -6,26 +6,26 @@ growth separately from ordinary transaction work.
 ## Unit
 
 ```text
-1 ELD = 1,000,000 μNOID
+1 JTM = 1,000,000 μNOID
 ```
 
-ELD is the currency ticker; the wallet uses ① as its interface symbol.
+JTM is the currency ticker; the wallet uses ① as its interface symbol.
 All consensus amounts are integers in μNOID.
 
 ## Block reward
 
-The starting subsidy is 50 ELD. It halves whenever the State domain expands
-and never falls below 1 ELD:
+The starting subsidy is 50 JTM. It halves whenever the State domain expands
+and never falls below 1 JTM:
 
 | `log_slots` | Capacity | Block reward |
 |---:|---:|---:|
-| 24 | 16,777,216 slots | 50.000000 ELD |
-| 25 | 33,554,432 slots | 25.000000 ELD |
-| 26 | 67,108,864 slots | 12.500000 ELD |
-| 27 | 134,217,728 slots | 6.250000 ELD |
-| 28 | 268,435,456 slots | 3.125000 ELD |
-| 29 | 536,870,912 slots | 1.562500 ELD |
-| 30–32 | Up to 4,294,967,296 slots | 1.000000 ELD |
+| 24 | 16,777,216 slots | 50.000000 JTM |
+| 25 | 33,554,432 slots | 25.000000 JTM |
+| 26 | 67,108,864 slots | 12.500000 JTM |
+| 27 | 134,217,728 slots | 6.250000 JTM |
+| 28 | 268,435,456 slots | 3.125000 JTM |
+| 29 | 536,870,912 slots | 1.562500 JTM |
+| 30–32 | Up to 4,294,967,296 slots | 1.000000 JTM |
 
 Expansion requires sustained 75% occupancy in a hard-finalized window. The
 network therefore moves to a lower inflation tier only after materially using

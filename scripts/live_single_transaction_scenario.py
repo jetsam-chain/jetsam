@@ -105,7 +105,7 @@ class Node:
     def __init__(self):
         self.root = BASE / "node"
         self.data_dir = self.root / "data"
-        self.config = self.root / "elide.toml"
+        self.config = self.root / "jetsam.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

@@ -753,7 +753,7 @@ struct RelayReservations {
 impl RelayReservations {
     fn new(target: usize, local_peer: PeerId) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"elide/relay-selection/v1");
+        hasher.update(b"jetsam/relay-selection/v1");
         hasher.update(&local_peer.to_bytes());
         Self {
             target: target.min(MAX_RELAY_RESERVATIONS),
@@ -766,7 +766,7 @@ impl RelayReservations {
 
     fn candidate_rank(&self, peer: PeerId) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"elide/relay-candidate/v1");
+        hasher.update(b"jetsam/relay-candidate/v1");
         hasher.update(&self.selection_salt);
         hasher.update(&peer.to_bytes());
         *hasher.finalize().as_bytes()

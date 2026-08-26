@@ -21,7 +21,7 @@ ARM64 要求 NEON 和 PMULL。发布版不会退回标量参考实现。
 运行不修改数据的检查：
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 ## 没有对等节点

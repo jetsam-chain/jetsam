@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &[0; 18]), 8);
     }
 
-    /// ELIDE CHANGE: heights derived from `EXPANSION_HEADER_LOOKBACK` rather
+    /// JETSAM CHANGE: heights derived from `EXPANSION_HEADER_LOOKBACK` rather
     /// than the literals 34/35, which were only correct while finality and the
     /// expansion window were both 18.
     #[test]
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(expected_child_log_slots(crate::consensus::params::EXPANSION_HEADER_LOOKBACK, 8, &counts), 9);
     }
 
-    /// ELIDE CHANGE: derived from the constants instead of the literals
+    /// JETSAM CHANGE: derived from the constants instead of the literals
     /// 34/35/(65,82), which encoded finality == expansion window == 18.
     #[test]
     fn finalized_window_starts_only_after_both_depths_are_available() {

@@ -1,4 +1,4 @@
-//! `jetsam-ivc-prover`: prover orchestration for the Elide recursive proof
+//! `jetsam-ivc-prover`: prover orchestration for the Jetsam recursive proof
 //! backends.
 //!
 //! Builds on [`jetsam_ivc_core`] (the protocol library + verifier) with the

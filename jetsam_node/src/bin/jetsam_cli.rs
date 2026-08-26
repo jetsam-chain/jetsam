@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-//! jetsam-cli — Elide full node CLI client.
+//! jetsam-cli — Jetsam full node CLI client.
 //!
-//! Connects to a running `elide` daemon via JSON-RPC (no local keys, no crypto).
+//! Connects to a running `jetsam` daemon via JSON-RPC (no local keys, no crypto).
 //! All operations happen inside the daemon; the CLI is a thin terminal UI.
 //!
 //! Quick start:
 //!   jetsam-cli status            — node health at a glance
 //!   jetsam-cli balance           — wallet balance
-//!   jetsam-cli send <addr> 10.5  — send 10.5 ELD
+//!   jetsam-cli send <addr> 10.5  — send 10.5 JTM
 //!   jetsam-cli help              — full command list
 
 #![allow(clippy::format_in_format_args, clippy::print_literal)]
@@ -58,7 +58,7 @@ macro_rules! c {
 
 const MICRO_PER_ELD: u64 = 1_000_000;
 
-/// Parse a human amount like "10.5" or "0.000001" as ELD → μJTM.
+/// Parse a human amount like "10.5" or "0.000001" as JTM → μJTM.
 fn parse_jetsam_amount(s: &str) -> anyhow::Result<u64> {
     let (whole, fractional) = match s.split_once('.') {
         Some((whole, fractional)) if !fractional.contains('.') => (whole, fractional),
@@ -121,28 +121,28 @@ fn fmt_hash(h: &str) -> &str {
 #[derive(Parser)]
 #[command(
     name = "jetsam-cli",
-    about = "Elide thin client — control a running elide daemon",
+    about = "Jetsam thin client — control a running jetsam daemon",
     version = env!("CARGO_PKG_VERSION"),
     long_about = "\
-Elide thin client. Connects to a running elide daemon via JSON-RPC.
+Jetsam thin client. Connects to a running jetsam daemon via JSON-RPC.
 
 QUICK START:
   jetsam-cli status              Node info (height, hash, slots)
   jetsam-cli balance             Wallet balance
-  jetsam-cli send <addr> 10.5   Send 10.5 ELD to address
+  jetsam-cli send <addr> 10.5   Send 10.5 JTM to address
   jetsam-cli history             Transaction history
   jetsam-cli mempool             Pending transactions
   jetsam-cli help                All commands
 
 AMOUNT FORMAT:
-  Amounts are in ELD (e.g. 10.5, 0.000001).
-  1 ELD = 1,000,000 μJTM — the CLI converts automatically.
+  Amounts are in JTM (e.g. 10.5, 0.000001).
+  1 JTM = 1,000,000 μJTM — the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: elide --mode miner --data-dir ~/.jetsam/data",
+  The daemon must be running: jetsam --mode miner --data-dir ~/.jetsam/data",
 )]
 struct Cli {
-    /// JSON-RPC endpoint of the running elide daemon.
+    /// JSON-RPC endpoint of the running jetsam daemon.
     #[arg(
         long,
         short = 'r',
@@ -280,7 +280,7 @@ enum Command {
         use_index: Option<u32>,
     },
 
-    /// Confirmed wallet balance (ELD and μJTM).
+    /// Confirmed wallet balance (JTM and μJTM).
     #[command(alias = "bal")]
     Balance,
 
@@ -288,9 +288,9 @@ enum Command {
     #[command(alias = "ls")]
     Utxos,
 
-    /// Send ELD to a recipient address.
+    /// Send JTM to a recipient address.
     ///
-    /// Amount is in ELD (e.g. 10.5 → 10,500,000 μJTM).
+    /// Amount is in JTM (e.g. 10.5 → 10,500,000 μJTM).
     /// Fee is auto-computed if not specified (recommended).
     ///
     /// Examples:
@@ -300,12 +300,12 @@ enum Command {
         /// Recipient address (canonical bech32m o1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount in ELD  (1 ELD = 1 000 000 μJTM).
-        /// Examples: "50" = 50 ELD, "0.5" = 500 000 μJTM, "0.000001" = 1 μJTM (minimum).
+        /// Amount in JTM  (1 JTM = 1 000 000 μJTM).
+        /// Examples: "50" = 50 JTM, "0.5" = 500 000 μJTM, "0.000001" = 1 μJTM (minimum).
         /// Tip: for programmatic use the RPC walletSend accepts raw μJTM directly.
         #[arg(value_name = "AMOUNT")]
         amount: String,
-        /// Transaction fee in ELD. Omit for automatic fee calculation.
+        /// Transaction fee in JTM. Omit for automatic fee calculation.
         #[arg(long, value_name = "FEE_MICRO_JTM")]
         fee: Option<String>,
         /// Show the ordinary-transaction plan without submitting.
@@ -491,7 +491,7 @@ fn print_error(msg: &str) {
         || msg.contains("Node is not responding")
     {
         "Node is not responding.\n\
-             Is the elide daemon running?  Try: elide --mode miner\n\
+             Is the jetsam daemon running?  Try: jetsam --mode miner\n\
              Default RPC: http://127.0.0.1:9701  (override with --rpc)"
             .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
@@ -576,7 +576,7 @@ async fn cmd_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .map(|target| jetsam_chain::consensus::target_leading_zero_bits(&target));
 
-    section("Elide node status");
+    section("Jetsam node status");
     kv("Height", &height.to_string());
     kv("Best hash", ctx.h(best_hash));
     kv2(
@@ -730,7 +730,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
         kv("Status", &c!(GRN, "live UTXO"));
         kv2(
             "Value",
-            &format!("{} ELD", jetsam_str(value)),
+            &format!("{} JTM", jetsam_str(value)),
             &format!("({value} μJTM)"),
         );
         kv("Creation ID", &creation_id.to_string());
@@ -823,7 +823,7 @@ async fn cmd_utxos_of(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
     }
     let total: u64 = slots.iter().map(|s| s["value"].as_u64().unwrap_or(0)).sum();
     separator(74);
-    println!("  {:<12}  {:>20}  {:>14}", "slot", "creation id", "ELD");
+    println!("  {:<12}  {:>20}  {:>14}", "slot", "creation id", "JTM");
     separator(74);
     for s in &slots {
         let slot = s["slot_index"].as_u64().unwrap_or(0);
@@ -977,8 +977,8 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     );
     kv2(
         "Block reward",
-        &format!("{} ELD/block", jetsam_str(reward_micro)),
-        &format!("({reward_micro} \u{03bc}ELD)"),
+        &format!("{} JTM/block", jetsam_str(reward_micro)),
+        &format!("({reward_micro} \u{03bc}JTM)"),
     );
     kv("Active UTXOs", &active.to_string());
     Ok(())
@@ -1015,7 +1015,7 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyho
     ));
     kv2(
         "Min relay fee",
-        &format!("{} ELD", jetsam_str(fee_micro)),
+        &format!("{} JTM", jetsam_str(fee_micro)),
         &format!("({fee_micro} μJTM)"),
     );
     kv(
@@ -1084,8 +1084,8 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     let fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
     kv2(
         "Fee",
-        &format!("{} ELD", jetsam_str(fee)),
-        &format!("({fee} \u{03bc}ELD)"),
+        &format!("{} JTM", jetsam_str(fee)),
+        &format!("({fee} \u{03bc}JTM)"),
     );
     kv(
         "Inputs",
@@ -1161,7 +1161,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv2("Pending", &size.to_string(), "transactions");
     kv2(
         "Fee floor",
-        &format!("{} ELD", jetsam_str(fee_floor)),
+        &format!("{} JTM", jetsam_str(fee_floor)),
         &format!("({fee_floor} μJTM minimum)"),
     );
 
@@ -1255,7 +1255,7 @@ async fn cmd_address(
         } else {
             println!("  {}", addr);
         }
-        println!("  Balance: {bal:.6} ELD");
+        println!("  Balance: {bal:.6} JTM");
         println!();
         println!(
             "  {} Sends now spend from this address only; change returns here.",
@@ -1350,7 +1350,7 @@ async fn cmd_address(
         }
         println!();
         println!(
-            "  {} Sends spend from this address; share it to receive ELD here.",
+            "  {} Sends spend from this address; share it to receive JTM here.",
             c!(DIM, "↑")
         );
         println!(
@@ -1380,7 +1380,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     section("Wallet balance (active address)");
     if is_tty() {
         println!(
-            "  {}Balance:{} {}{} ELD{} {}({} \u{03bc}ELD){}  {}({} UTXOs){}",
+            "  {}Balance:{} {}{} JTM{} {}({} \u{03bc}JTM){}  {}({} UTXOs){}",
             CYN,
             RST,
             BOLD,
@@ -1395,7 +1395,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         );
     } else {
         println!(
-            "  Balance:           {} ELD  ({micro} \u{03bc}ELD)  ({utxos} UTXOs)",
+            "  Balance:           {} JTM  ({micro} \u{03bc}JTM)  ({utxos} UTXOs)",
             jetsam_str(micro)
         );
     }
@@ -1403,7 +1403,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if pending_out > 0 {
         if is_tty() {
             println!(
-                "  {}Pending:{}  -{} ELD outbound  {}({} \u{03bc}ELD locked){}",
+                "  {}Pending:{}  -{} JTM outbound  {}({} \u{03bc}JTM locked){}",
                 YLW,
                 RST,
                 jetsam_str(pending_out),
@@ -1412,7 +1412,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
                 RST
             );
             println!(
-                "  {}Spendable:{} {}{} ELD{}",
+                "  {}Spendable:{} {}{} JTM{}",
                 CYN,
                 RST,
                 BOLD,
@@ -1421,10 +1421,10 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             );
         } else {
             println!(
-                "  Pending:           -{} ELD outbound ({pending_out} \u{03bc}ELD locked)",
+                "  Pending:           -{} JTM outbound ({pending_out} \u{03bc}JTM locked)",
                 jetsam_str(pending_out)
             );
-            println!("  Spendable:         {} ELD", jetsam_str(spendable));
+            println!("  Spendable:         {} JTM", jetsam_str(spendable));
         }
     }
 
@@ -1472,12 +1472,12 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}{}",
-            BOLD, "slot", "creation id", "ELD", "key", "at block", "address", RST
+            BOLD, "slot", "creation id", "JTM", "key", "at block", "address", RST
         );
     } else {
         println!(
             "  {:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}",
-            "slot", "creation id", "ELD", "key", "at block", "address"
+            "slot", "creation id", "JTM", "key", "at block", "address"
         );
     }
     separator(96);
@@ -1534,13 +1534,13 @@ async fn cmd_send(
         bail!("Amount cannot be zero.");
     }
 
-    // Warn if the amount looks suspiciously large (> 1 000 000 ELD = 1e12 μJTM).
-    // This catches the common mistake of passing μJTM to a ELD-denomination CLI.
-    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M ELD in μJTM
+    // Warn if the amount looks suspiciously large (> 1 000 000 JTM = 1e12 μJTM).
+    // This catches the common mistake of passing μJTM to a JTM-denomination CLI.
+    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M JTM in μJTM
     if amount_micro > MAX_WARN_MICRO {
         eprintln!(
-            "⚠  Large amount: {} ELD ({} μJTM). \
-             Note: this CLI takes ELD, not μJTM. Press Ctrl-C to cancel.",
+            "⚠  Large amount: {} JTM ({} μJTM). \
+             Note: this CLI takes JTM, not μJTM. Press Ctrl-C to cancel.",
             jetsam_str(amount_micro),
             amount_micro
         );
@@ -1589,13 +1589,13 @@ async fn cmd_send(
         kv("To", to_clean);
         kv2(
             "Amount",
-            &format!("{} ELD", jetsam_str(amount_micro)),
+            &format!("{} JTM", jetsam_str(amount_micro)),
             &format!("({amount_micro} μJTM)"),
         );
         let planned_fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Fee",
-            &format!("{} ELD", jetsam_str(planned_fee)),
+            &format!("{} JTM", jetsam_str(planned_fee)),
             &format!(
                 "({planned_fee} μJTM){}",
                 if fee.is_none() { " auto" } else { "" }
@@ -1612,7 +1612,7 @@ async fn cmd_send(
         let change = result["change_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Change",
-            &format!("{} ELD", jetsam_str(change)),
+            &format!("{} JTM", jetsam_str(change)),
             &format!("({change} μJTM)"),
         );
         println!();
@@ -1624,9 +1624,9 @@ async fn cmd_send(
     }
 
     // --- Confirm interactively for large amounts ---
-    if amount_micro >= 1_000_000_000 /* 1000 ELD */ && is_tty() {
+    if amount_micro >= 1_000_000_000 /* 1000 JTM */ && is_tty() {
         print!(
-            "  {} Send {}{} ELD{} to {}{}{}? [y/N] ",
+            "  {} Send {}{} JTM{} to {}{}{}? [y/N] ",
             c!(YLW, "⚠"),
             BOLD,
             jetsam_str(amount_micro),
@@ -1664,12 +1664,12 @@ async fn cmd_send(
             kv("To", to_clean);
             kv2(
                 "Amount",
-                &format!("{} ELD", jetsam_str(amount_micro)),
+                &format!("{} JTM", jetsam_str(amount_micro)),
                 &format!("({amount_micro} μJTM)"),
             );
             kv2(
                 "Fee",
-                &format!("{} ELD", jetsam_str(actual_fee)),
+                &format!("{} JTM", jetsam_str(actual_fee)),
                 &format!("({actual_fee} μJTM){auto_tag}"),
             );
             println!();
@@ -1693,7 +1693,7 @@ async fn cmd_send(
                 // Try to extract amounts
                 format!(
                     "Insufficient funds.\n\
-                     \t  Requested: {} ELD  ({amount_micro} μJTM)\n\
+                     \t  Requested: {} JTM  ({amount_micro} μJTM)\n\
                      \t  Run 'jetsam-cli balance' to check your current balance.",
                     jetsam_str(amount_micro)
                 )
@@ -1776,12 +1776,12 @@ async fn cmd_history(
     if is_tty() {
         println!(
             "  {}  {:<8}  {:<8}  {:>14}  {:<16}  {}{}",
-            BOLD, "block", "dir", "ELD", "own[idx]", "counterparty", RST
+            BOLD, "block", "dir", "JTM", "own[idx]", "counterparty", RST
         );
     } else {
         println!(
             "  {:<8}  {:<8}  {:>14}  {:<16}  {}",
-            "block", "dir", "ELD", "own[idx]", "counterparty"
+            "block", "dir", "JTM", "own[idx]", "counterparty"
         );
     }
     separator(88);
@@ -1845,9 +1845,9 @@ async fn cmd_history(
             "",
             "",
             GRN,
-            format!("+ {} ELD received", jetsam_str(received)),
+            format!("+ {} JTM received", jetsam_str(received)),
             RED,
-            format!("  - {} ELD sent", jetsam_str(sent)),
+            format!("  - {} JTM sent", jetsam_str(sent)),
             RST
         );
     } else {
@@ -1884,7 +1884,7 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     section("Active address reloaded");
     println!(
-        "  Index {}  \u{2022}  Snapshot height {}  \u{2022}  Found {} UTXO(s)  \u{2022}  Balance: {} ELD",
+        "  Index {}  \u{2022}  Snapshot height {}  \u{2022}  Found {} UTXO(s)  \u{2022}  Balance: {} JTM",
         active_index,
         snapshot_height,
         found,
@@ -2174,7 +2174,7 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
             if e.is_connect() || e.is_timeout() {
                 anyhow::anyhow!(
                     "Node is not responding.\n\
-                     \tIs the elide daemon running?  Try: elide --mode miner\n\
+                     \tIs the jetsam daemon running?  Try: jetsam --mode miner\n\
                      \tRPC endpoint: {}\n\
                      \tOverride with --rpc <URL> or JETSAM_RPC env var",
                     ctx.rpc

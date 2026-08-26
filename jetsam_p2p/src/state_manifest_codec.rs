@@ -25,7 +25,7 @@ use crate::protocol::{
     MAX_SNAPSHOT_MANIFEST_PAGES, SNAPSHOT_MANIFEST_FORMAT_VERSION,
 };
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JMQ7";
 const RESPONSE_MAGIC: [u8; 4] = *b"JMH7";
@@ -259,7 +259,7 @@ mod tests {
     use crate::protocol::GetStateManifestResponse;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/manifest/7")
+        StreamProtocol::new("/jetsam/test/sync/manifest/7")
     }
 
     fn populated() -> (GetStateManifestHeader, Vec<std::sync::Arc<[u8]>>) {
@@ -274,7 +274,7 @@ mod tests {
             active_slot_count: 9,
             alloc_counter: 12,
             eff_log: 16,
-            // ELIDE CHANGE: derived from RECENT_BLOCK_RETENTION_DEPTH instead
+            // JETSAM CHANGE: derived from RECENT_BLOCK_RETENTION_DEPTH instead
             // of the literal 95. The codec rejects a bridge more than that many
             // blocks above the tip, and the depth followed finality from 18
             // down to 8, so 95 - 77 = 18 no longer validates.

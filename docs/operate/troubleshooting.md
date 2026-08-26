@@ -24,7 +24,7 @@ support SSE4.1 and PCLMULQDQ, but the hypervisor must expose them.
 Run the non-mutating check:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 ## No peers

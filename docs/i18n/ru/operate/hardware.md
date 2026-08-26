@@ -23,7 +23,7 @@
 Запустите предварительную проверку на целевой машине:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 jetsam-miner --check-hardware
 ```
 
@@ -122,7 +122,7 @@ RSS равен их сумме. Память также расходуют ма�
 Контролируйте реальный путь:
 
 ```sh
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 jetsam-cli state
 ```
 
@@ -149,7 +149,7 @@ RPC на TCP `9601` — административный интерфейс. О�
 jetsam-cli status
 jetsam-cli state
 jetsam-cli peers
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 ```
 
 Настройте предупреждения о нехватке диска, постоянной потере пиров,

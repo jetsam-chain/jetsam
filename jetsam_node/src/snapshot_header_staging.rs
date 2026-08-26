@@ -29,7 +29,7 @@ use jetsam_chain::storage::{MdbxStore, SnapshotHeaderInstallSource, VerifiedHead
 use jetsam_chain::wire::BLOCK_HEADER_WIRE_SIZE;
 use jetsam_chain::{hash_block_header, HeaderChainAnchor};
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const FILE_MAGIC: [u8; 8] = *b"JHSTAGE1";
 const FILE_VERSION: u32 = 2;
@@ -1302,7 +1302,7 @@ mod tests {
         header
     }
 
-    /// ELIDE CHANGE: every bound is derived from the consensus constants rather
+    /// JETSAM CHANGE: every bound is derived from the consensus constants rather
     /// than written as a literal. Upstream's 36 / 65 / 82 encoded a finality
     /// depth of 18 and only held while finality equalled the expansion window.
     #[test]
@@ -1343,7 +1343,7 @@ mod tests {
         );
     }
 
-    /// ELIDE CHANGE: bounds derived from `EXPANSION_HEADER_LOOKBACK` instead of
+    /// JETSAM CHANGE: bounds derived from `EXPANSION_HEADER_LOOKBACK` instead of
     /// the literals 34 and 66.
     #[test]
     fn snapshot_validation_requires_the_complete_finalized_window() {
@@ -1386,11 +1386,11 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    // ELIDE: re-mined (print_new_fixture_nonce) after TowerHash
+                    // JETSAM: re-mined (print_new_fixture_nonce) after TowerHash
                     // and the ASERT interval-count fix, both of which move this
                     // fixture's target (58_902 upstream, then 359_142).
                     nonce: 162_878,
-                    // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
+                    // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1429,7 +1429,7 @@ mod tests {
         let parent = *chain.tip_header();
         let timestamp = parent.timestamp + BLOCK_TIME;
         let anchor = chain.anchor_info();
-        // ELIDE CHANGE: ASERT anchored on the parent's timestamp.
+        // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
         let difficulty_target = next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
@@ -1448,7 +1448,7 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        // ELIDE: re-mined (print_new_native_coinbase_child_nonce) after
+        // JETSAM: re-mined (print_new_native_coinbase_child_nonce) after
         // TowerHash and the ASERT interval-count fix, both of which move this
         // fixture's target (382_055 upstream, then 422_266).
         .into_block(31_746)

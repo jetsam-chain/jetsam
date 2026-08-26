@@ -65,9 +65,9 @@ Category 1 gate-depth floor 173.273866314232 bits
 ## Monetary
 
 ```text
-1 ELD                   1,000,000 μNOID
-initial subsidy          50 ELD
-subsidy floor            1 ELD
+1 JTM                   1,000,000 μNOID
+initial subsidy          50 JTM
+subsidy floor            1 JTM
 base fee                 5,000 μNOID
 input fee                100 μNOID
 output fee               700 μNOID

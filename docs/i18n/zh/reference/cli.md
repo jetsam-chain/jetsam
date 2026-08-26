@@ -4,7 +4,7 @@ Core 压缩包包含三个可执行文件：
 
 | 可执行文件 | 角色 |
 |---|---|
-| `elide` | 完整节点、钱包后端，以及可选的内置证明/挖矿流水线 |
+| `jetsam` | 完整节点、钱包后端，以及可选的内置证明/挖矿流水线 |
 | `jetsam-cli` | 连接运行中节点的轻量 JSON-RPC 客户端 |
 | `jetsam-miner` | 独立的 Poseidon2b nonce 搜索进程 |
 
@@ -13,7 +13,7 @@ Core 压缩包包含三个可执行文件：
 不带模式参数即可运行普通节点：
 
 ```sh
-elide
+jetsam
 ```
 
 守护进程公共参数：
@@ -50,13 +50,13 @@ elide
 
 ```sh
 # Ordinary node
-elide --data-dir ~/.elide/data
+jetsam --data-dir ~/.jetsam/data
 
 # Internal miner using 12 logical CPUs
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 除非由私有或认证传输保护，否则 RPC 应保持在回环地址上。Bearer 密钥用于认证
@@ -102,10 +102,10 @@ jetsam-miner \
 默认端点是 `http://127.0.0.1:9601`。环境变量 `JETSAM_RPC` 可修改；
 `--rpc` 优先级更高。
 
-CLI 钱包命令输入的金额以 ELD 为单位，最多六位小数：
+CLI 钱包命令输入的金额以 JTM 为单位，最多六位小数：
 
 ```text
-1 ELD = 1,000,000 μNOID
+1 JTM = 1,000,000 μNOID
 ```
 
 ### 节点与链
@@ -205,7 +205,7 @@ jetsam-cli send o1... 10.5 --dry-run
 jetsam-cli send o1... 10.5
 ```
 
-仅在确有需要时指定精确 ELD 费用：
+仅在确有需要时指定精确 JTM 费用：
 
 ```sh
 jetsam-cli send o1... 10.5 --fee 0.012

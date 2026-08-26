@@ -23,7 +23,7 @@ curl --silent --show-error \
 ## 约定
 
 - 货币整数字段以 μNOID 为单位。
-- 1 ELD 等于 1,000,000 μNOID。
+- 1 JTM 等于 1,000,000 μNOID。
 - 哈希使用不带 `0x` 的小写十六进制。
 - 目标值（target）与 nonce 字节使用各自规范的小端编码。
 - 地址默认使用规范 bech32m `o1…`，除非字段明确要求 hex。

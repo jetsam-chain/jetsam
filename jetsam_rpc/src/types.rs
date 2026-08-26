@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-//! JSON response types for the Elide RPC API.
+//! JSON response types for the Jetsam RPC API.
 
 use serde::{Deserialize, Serialize};
 
@@ -128,7 +128,7 @@ pub struct WalletStatus {
     pub active_index: u32,
     /// Confirmed balance of the ACTIVE address in μJTM.
     pub balance_micro_jtm: u64,
-    /// Active-address balance in ELD (6 decimal places).
+    /// Active-address balance in JTM (6 decimal places).
     pub balance_eld: f64,
     /// Number of confirmed UTXOs at the active address.
     pub utxo_count: usize,
@@ -538,7 +538,7 @@ pub struct MiningInfo {
     pub difficulty_target: String,
     /// Block reward for the next block in μJTM.
     pub block_reward_micro_jtm: u64,
-    /// Block reward in ELD.
+    /// Block reward in JTM.
     pub block_reward_eld: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
     pub active_slot_count: u64,
@@ -642,7 +642,7 @@ pub struct AddressInfo {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Convert μJTM to ELD with 6 decimal places.
+/// Convert μJTM to JTM with 6 decimal places.
 #[inline]
 pub fn microjetsam_to_eld(micro_jtm: u64) -> f64 {
     micro_jtm as f64 / 1_000_000.0

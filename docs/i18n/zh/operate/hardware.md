@@ -20,7 +20,7 @@ Parano1d 不会让链龄成为永久的历史执行负担，但节点仍需要�
 在计划使用的主机上运行预检：
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 jetsam-miner --check-hardware
 ```
 
@@ -107,7 +107,7 @@ CPU 代际、时钟、内存带宽和选中的无进位乘法后端，比服务�
 监控真实路径：
 
 ```sh
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 jetsam-cli state
 ```
 
@@ -130,7 +130,7 @@ Live State 规模或流量显著变化后，应重新检查容量：
 jetsam-cli status
 jetsam-cli state
 jetsam-cli peers
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 ```
 
 请监控磁盘不足、反复掉线、持续同步落后和服务重启。部署方法见

@@ -4,9 +4,9 @@
 
 | 路径 | 用途 | 权限性质 |
 |---|---|---|
-| `~/.elide/elide.toml` | Core 配置 | 运营者 |
-| `~/.elide/gui-settings.json` | GUI 偏好 | 本地 UI |
-| `~/.elide/data/` | Core 与 GUI 节点默认数据 | 共识数据 |
+| `~/.jetsam/jetsam.toml` | Core 配置 | 运营者 |
+| `~/.jetsam/gui-settings.json` | GUI 偏好 | 本地 UI |
+| `~/.jetsam/data/` | Core 与 GUI 节点默认数据 | 共识数据 |
 | `DATA_DIR/wallet.key` | 256 位钱包主密钥 | 花费权限 |
 | `DATA_DIR/wallet.receipts` | 已保存的外发收据 | 本地付款证据 |
 | `DATA_DIR/wallet.history` | 本地钱包历史 | 本地展示 |
@@ -38,8 +38,8 @@ Unix 上，`wallet.key` 和 `p2p_identity.key` 仅允许所有者访问。前者
 |---|---|
 | 网络 | `mainnet` |
 | 创世区块 ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
-| 网络魔数（network magic） | `ELD` |
-| libp2p 协议 | `/elide/mainnet/860e70453390bf81/1` |
+| 网络魔数（network magic） | `JTM` |
+| libp2p 协议 | `/jetsam/mainnet/860e70453390bf81/1` |
 | 交易与区块 gossip | GossipSub |
 | 发现 | DNS 种子、Kademlia、mDNS |
 

@@ -31,7 +31,7 @@ LOGS = BASE / "logs"
 START_BLOCKS = int(os.environ.get("JETSAM_LIVE_START_BLOCKS", "20"))
 TX_ROUNDS = int(os.environ.get("JETSAM_LIVE_TX_ROUNDS", "2"))
 BASE_PORT = int(os.environ.get("JETSAM_LIVE_BASE_PORT", "19600"))
-AMOUNT_BASE = 100_000  # 0.1 ELD in micro_jtm; small enough for many rounds
+AMOUNT_BASE = 100_000  # 0.1 JTM in micro_jtm; small enough for many rounds
 
 
 class LiveTestError(Exception):

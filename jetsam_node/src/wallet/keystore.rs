@@ -27,7 +27,7 @@ use super::encryption::{self, ENCRYPTED_FILE_LEN};
 
 /// Environment variable holding the wallet passphrase.
 ///
-/// ELIDE CHANGE: when it is set, the master secret is written encrypted with
+/// JETSAM CHANGE: when it is set, the master secret is written encrypted with
 /// Argon2id + XChaCha20-Poly1305 instead of in the clear. When it is not, the
 /// cleartext format is still used and the caller is warned - refusing outright
 /// would lock a developer out of an existing node for no gain.
@@ -100,7 +100,7 @@ pub enum KeystoreError {
 // On-disk format (plaintext)
 // ---------------------------------------------------------------------------
 
-// ELIDE CHANGE: distinct on-disk magic so an Elide keystore can never be
+// JETSAM CHANGE: distinct on-disk magic so an Jetsam keystore can never be
 // opened as an upstream one, or the reverse. Must stay exactly 16 bytes.
 const PLAIN_MAGIC: &[u8; 16] = b"jetsam_plainkey1";
 const SECRET_LEN: usize = 32;
@@ -206,7 +206,7 @@ impl Keystore {
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         rand::thread_rng().fill_bytes(&mut *secret);
 
-        // ELIDE CHANGE: encrypt when a passphrase is available.
+        // JETSAM CHANGE: encrypt when a passphrase is available.
         let buf = match passphrase() {
             Some(pass) => encryption::encode(&secret, &pass)?,
             None => {
@@ -272,7 +272,7 @@ impl Keystore {
     /// Load a plaintext wallet key file.
     pub(super) fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
         let data = self.read_plain_bytes()?;
-        // ELIDE CHANGE: dispatch on the on-disk magic.
+        // JETSAM CHANGE: dispatch on the on-disk magic.
         if encryption::is_encrypted(&data) {
             let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
             let secret = encryption::decode(&data, &pass)?;
@@ -291,7 +291,7 @@ impl Keystore {
     /// exposed to the user-facing import/export surface.
     pub(super) fn export_master_secret_hex(&self) -> Result<Zeroizing<String>, KeystoreError> {
         let data = self.read_plain_bytes()?;
-        // ELIDE CHANGE: on an encrypted file the bytes after the magic are
+        // JETSAM CHANGE: on an encrypted file the bytes after the magic are
         // ciphertext, not the secret. Exporting them would hand the user a
         // useless string and call it their key.
         if encryption::is_encrypted(&data) {
@@ -343,7 +343,7 @@ impl Keystore {
                 return Err(KeystoreError::WrongOwner { actual, expected });
             }
         }
-        // ELIDE CHANGE: accept BOTH the cleartext format and the encrypted one.
+        // JETSAM CHANGE: accept BOTH the cleartext format and the encrypted one.
         // An existing wallet must never become unreadable because the format
         // moved on - losing a keystore loses the coins for good.
         let cap = ENCRYPTED_FILE_LEN.max(PLAIN_FILE_LEN) + 1;
@@ -374,7 +374,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// ELIDE — the wallet round-trips through the encrypted format, refuses to
+    /// JETSAM — the wallet round-trips through the encrypted format, refuses to
     /// open without the passphrase, and fails closed on a wrong one.
     #[test]
     fn create_and_load_encrypted() {

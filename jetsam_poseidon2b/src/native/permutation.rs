@@ -182,7 +182,7 @@ fn sbox_x7_flat_u128(x: u128) -> u128 {
     clmul_gcm(x6, x4)
 }
 
-// ELIDE CHANGE - TowerHash round constants.
+// JETSAM CHANGE - TowerHash round constants.
 //
 // Upstream's table held only eight distinct values across all 264 entries, all
 // inside {0x0 ..= 0x7}. Together with MDS_FULL, which lies in the same range,

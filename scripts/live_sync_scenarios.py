@@ -106,7 +106,7 @@ class Node:
         self.rpc_port = rpc_port
         self.root = BASE / name
         self.data_dir = self.root / "data"
-        self.config = self.root / "elide.toml"
+        self.config = self.root / "jetsam.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

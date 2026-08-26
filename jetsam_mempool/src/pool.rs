@@ -150,7 +150,7 @@ fn entry_metadata(
 // AsyncMempool
 // ---------------------------------------------------------------------------
 
-/// Async, thread-safe mempool for the Elide full node.
+/// Async, thread-safe mempool for the Jetsam full node.
 ///
 /// Clone is O(1) — the inner state is reference-counted.
 #[derive(Clone)]

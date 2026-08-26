@@ -30,7 +30,7 @@ P2P-соединения принимаются на TCP `9600`. JSON-RPC дол
 ## Установка релиза Core
 
 Скачайте архив нужной архитектуры и `SHA256SUMS` со
-[страницы релизов](https://github.com/ignotusnemo/elide/releases). Проверьте
+[страницы релизов](https://github.com/ignotusnemo/jetsam/releases). Проверьте
 архив до распаковки, заменив `VERSION` номером версии:
 
 ```sh
@@ -45,7 +45,7 @@ grep '  jetsam-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
 
 ```sh
 tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 На поддерживаемой машине отчёт заканчивается:
@@ -57,7 +57,7 @@ NODE READY
 Установите ноду и CLI:
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
 ```
 
 ## Системный пользователь
@@ -65,13 +65,13 @@ sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 Храните данные ноды отдельно от интерактивных пользователей:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/elide \
-  --create-home --shell /usr/sbin/nologin elide
-sudo install -d -o elide -g elide -m 0700 /var/lib/elide
-sudo install -d -o root -g elide -m 0750 /etc/elide
+sudo useradd --system --home-dir /var/lib/jetsam \
+  --create-home --shell /usr/sbin/nologin jetsam
+sudo install -d -o jetsam -g jetsam -m 0700 /var/lib/jetsam
+sudo install -d -o root -g jetsam -m 0750 /etc/jetsam
 ```
 
-Создайте `/etc/elide/elide.toml`:
+Создайте `/etc/jetsam/jetsam.toml`:
 
 ```toml
 [network]
@@ -80,7 +80,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "/var/lib/elide"
+path = "/var/lib/jetsam"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -93,8 +93,8 @@ miner_address = ""
 Защитите конфигурацию:
 
 ```sh
-sudo chown root:elide /etc/elide/elide.toml
-sudo chmod 0640 /etc/elide/elide.toml
+sudo chown root:jetsam /etc/jetsam/jetsam.toml
+sudo chmod 0640 /etc/jetsam/jetsam.toml
 ```
 
 Указывать сид вручную не нужно. Релизный бинарник находит публичную сеть через
@@ -102,7 +102,7 @@ sudo chmod 0640 /etc/elide/elide.toml
 
 ## Запуск под systemd
 
-Создайте `/etc/systemd/system/elide.service`:
+Создайте `/etc/systemd/system/jetsam.service`:
 
 ```ini
 [Unit]
@@ -112,9 +112,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=elide
-Group=elide
-ExecStart=/usr/local/bin/elide --config /etc/elide/elide.toml
+User=jetsam
+Group=jetsam
+ExecStart=/usr/local/bin/jetsam --config /etc/jetsam/jetsam.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
@@ -132,14 +132,14 @@ WantedBy=multi-user.target
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now elide
-sudo systemctl status elide
+sudo systemctl enable --now jetsam
+sudo systemctl status jetsam
 ```
 
 Следите за запуском и синхронизацией:
 
 ```sh
-sudo journalctl -u elide -f
+sudo journalctl -u jetsam -f
 ```
 
 ## Проверка ноды
@@ -169,17 +169,17 @@ SSH-туннель или другой аутентифицированный п
 Перед заменой бинарников или копированием данных остановите службу:
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Установите проверенные новые бинарники и запустите:
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
-sudo systemctl start elide
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
+sudo systemctl start jetsam
 jetsam-cli status
 ```
 
-При обычном обновлении не удаляйте `/var/lib/elide`. Если кошелёк ноды
-получает средства, отдельно сохраните `/var/lib/elide/wallet.key` и
+При обычном обновлении не удаляйте `/var/lib/jetsam`. Если кошелёк ноды
+получает средства, отдельно сохраните `/var/lib/jetsam/wallet.key` и
 защищайте его как приватный секрет.

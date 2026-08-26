@@ -9,10 +9,10 @@
 /// ASERT adjusts PoW difficulty so all hardware converges to this target.
 /// Bounded below by `prove_block_time` on the miner's hardware; PoW is
 /// ordering-only, not security-critical.
-/// ELIDE CHANGE: 90 s, up from upstream's 20 s.
+/// JETSAM CHANGE: 90 s, up from upstream's 20 s.
 ///
 /// Three independent constraints converge on this value:
-///   1. the 21M schedule at 50 ELD/block requires ~90 s blocks;
+///   1. the 21M schedule at 50 JTM/block requires ~90 s blocks;
 ///   2. the recursive prover needs 7–35 s per template — at 20 s a miner sits
 ///      idle for a large share of every block (measured duty cycle upstream:
 ///      79%), and the prover cannot even keep up in the worst case;
@@ -127,7 +127,7 @@ pub fn block_class_spend_capacity_for_page_count(page_count: usize) -> Option<us
 ///
 /// This is a separate protocol clock from ASERT's short difficulty epoch.
 ///
-/// ELIDE CHANGE: 32, down from upstream's 144, so that the wall-clock epoch
+/// JETSAM CHANGE: 32, down from upstream's 144, so that the wall-clock epoch
 /// stays at 48 minutes at 90 s blocks (144 × 20 s = 32 × 90 s = 2880 s) and a
 /// day still divides into whole epochs: 960 / 32 = 30, exactly as upstream had
 /// 4320 / 144 = 30. Leaving it at 144 would make `TARGET_BLOCKS_PER_DAY` a
@@ -153,7 +153,7 @@ const _: () = assert!(
 /// Reorgs that would change the finalized prefix are rejected by fork choice.
 /// This depth is fixed by the public-network consensus profile.
 ///
-/// ELIDE CHANGE: 8, down from upstream's 18. With BLOCK_TIME raised from 20 s
+/// JETSAM CHANGE: 8, down from upstream's 18. With BLOCK_TIME raised from 20 s
 /// to 90 s, keeping 18 would push wall-clock finality from 6 to 27 minutes —
 /// too slow for an exchange. 8 blocks × 90 s ≈ 12 minutes.
 pub const CONSENSUS_FINALITY_DEPTH: u64 = 8;
@@ -196,7 +196,7 @@ pub const RETAINED_BLOCK_SERVING_DEPTH: u64 =
 /// above 75% occupancy. With an even window, a 9/9 tie does not expand; at
 /// least 10 of 18 finalized headers must meet the threshold.
 ///
-/// ELIDE CHANGE: pinned to 18 explicitly instead of aliasing
+/// JETSAM CHANGE: pinned to 18 explicitly instead of aliasing
 /// `CONSENSUS_FINALITY_DEPTH`. Upstream tied the two together, so lowering
 /// finality from 18 to 8 — done here purely to keep wall-clock finality near
 /// 12 minutes at 90 s blocks — would silently have changed the state-expansion
@@ -281,18 +281,18 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // Emission
 // ---------------------------------------------------------------------------
 
-/// Precision: 1 ELD = 1_000_000 μJTM.
+/// Precision: 1 JTM = 1_000_000 μJTM.
 pub const MICRO_PER_JTM: u64 = 1_000_000;
 
-/// Starting block reward: 50 ELD.
+/// Starting block reward: 50 JTM.
 pub const BASE_REWARD_MICRO: u64 = 50 * MICRO_PER_JTM;
 
 // ---------------------------------------------------------------------------
-// ELIDE CHANGE — height-based halving under a hard cap
+// JETSAM CHANGE — height-based halving under a hard cap
 // ---------------------------------------------------------------------------
 //
 // Upstream halved on state expansion (`log_slots += 1` at 75% occupancy) and
-// floored the reward at 1 ELD forever. That floor is why upstream has no
+// floored the reward at 1 JTM forever. That floor is why upstream has no
 // maximum supply: on a network that never reaches ~12.6M occupied slots the
 // halving never fires at all, so emission stays at 50/block indefinitely —
 // about 78.8M per year, unbounded. `FLOOR_REWARD_MICRO_JTM` is deliberately
@@ -300,16 +300,16 @@ pub const BASE_REWARD_MICRO: u64 = 50 * MICRO_PER_JTM;
 //
 // Schedule at BLOCK_TIME = 90 s (28 800 blocks/month):
 //
-//   height          0 →      28 800   50      ELD   (1 month)
-//   height     28 800 →     172 800   25      ELD   (to 6 months)
-//   height    172 800 →     831 800   12.5    ELD
-//   height    831 800 →   1 490 800   6.25    ELD
-//   height  1 490 800 →   2 149 800   3.125   ELD
-//   height  2 149 800 →   2 808 800   1.5625  ELD
-//   height  2 808 800 →   3 467 664   0.78125 ELD
+//   height          0 →      28 800   50      JTM   (1 month)
+//   height     28 800 →     172 800   25      JTM   (to 6 months)
+//   height    172 800 →     831 800   12.5    JTM
+//   height    831 800 →   1 490 800   6.25    JTM
+//   height  1 490 800 →   2 149 800   3.125   JTM
+//   height  2 149 800 →   2 808 800   1.5625  JTM
+//   height  2 808 800 →   3 467 664   0.78125 JTM
 //   height  3 467 664 →         ...   0       (≈9.89 years)
 //
-// A naive final boundary at 3 467 800 would sum to 21 000 106.25 ELD over the
+// A naive final boundary at 3 467 800 would sum to 21 000 106.25 JTM over the
 // heights that carry a coinbase (h ≥ 1; genesis has none) — 136 final-tier
 // blocks over the cap. `EMISSION_END_HEIGHT` trims exactly those blocks, so
 // the schedule sums to the cap BY HEIGHT and consensus needs no cumulative
@@ -333,10 +333,10 @@ pub const HALVING_COUNT: u32 = 7;
 
 /// First height with zero subsidy — the seventh (final) halving boundary.
 ///
-/// The naive schedule would end the last 0.78125-ELD tier at
+/// The naive schedule would end the last 0.78125-JTM tier at
 /// `H2_HEIGHT + 5 × HALVING_INTERVAL` = 3 467 800, but summed over the heights
 /// that actually carry a coinbase (h ≥ 1 — genesis has none) that pays
-/// 21 000 106.25 ELD: 106.25 ELD, exactly 136 final-tier blocks, over the cap.
+/// 21 000 106.25 JTM: 106.25 JTM, exactly 136 final-tier blocks, over the cap.
 /// The boundary is therefore derived by trimming the excess off the final
 /// tier, making the end of emission exact BY HEIGHT with no cumulative-issuance
 /// state: `Σ block_reward(h) for h ≥ 1` equals [`MAX_SUPPLY_MICRO`] exactly
@@ -429,25 +429,25 @@ pub const fn creation_id_within_boundary(
 // ---------------------------------------------------------------------------
 
 /// Base minimum fee in μJTM per non-coinbase transaction.
-pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 ELD
+pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 JTM
 
 /// Small anti-DoS fee charged per live input verified by a transaction.
 ///
 /// Inputs do not grow chain state, so this intentionally stays much lower than
 /// the output fee. It keeps very large-input transactions from becoming free
 /// relay/prover spam without penalising useful state-shrinking transactions.
-pub const FEE_PER_INPUT: u64 = 100; // 0.0001 ELD per input
+pub const FEE_PER_INPUT: u64 = 100; // 0.0001 JTM per input
 
 /// Fee charged per live output created by a transaction.
 ///
 /// Outputs are the main user-visible driver of fee because they create UTXOs and
 /// may increase state pressure. The 1-input/2-output low-pressure send remains
 /// at the historical 9_000 μJTM baseline together with state-growth burn.
-pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 ELD per output
+pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 JTM per output
 
 /// Base fee charged per net-new live UTXO slot at low occupancy.
 /// This state-growth component is burned by consensus.
-pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 ELD per net-new slot
+pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 JTM per net-new slot
 
 #[cfg(test)]
 mod tests {
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn transaction_epoch_is_not_asert_epoch() {
-        assert_eq!(TX_EPOCH_BLOCKS, 32); // ELIDE: 48 min at 90s blocks
+        assert_eq!(TX_EPOCH_BLOCKS, 32); // JETSAM: 48 min at 90s blocks
         assert_ne!(TX_EPOCH_BLOCKS, EPOCH_LENGTH);
     }
 }

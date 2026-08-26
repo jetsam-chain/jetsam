@@ -327,7 +327,7 @@ fn bind_group_fee(
 /// Bind all user fee predicates, checked 72-bit claimable aggregation, and
 /// `coinbase <= reward(height) + claimable_sum`. Underclaiming is valid.
 ///
-/// ELIDE CHANGE: the block reward is selected by `emission_tiers` — the
+/// JETSAM CHANGE: the block reward is selected by `emission_tiers` — the
 /// height-derived one-hot built by `bind_development_allocation` — instead of
 /// by `child_depth.one_hot`. The selectors are passed in rather than rebuilt so
 /// that the coinbase ceiling and the development split are guaranteed to read
@@ -370,7 +370,7 @@ pub fn bind_block_fee_arithmetic(
     let claimable_fee_sum = alloc_block(b, Block128::from(aggregate_native));
     pin_eq(b, &claimable_fee_sum, &aggregate_reconstruction);
 
-    // ELIDE CHANGE: eight height-derived emission tiers, not nine state depths.
+    // JETSAM CHANGE: eight height-derived emission tiers, not nine state depths.
     let rewards = super::development_allocation::tier_rewards();
     let reward_bits = selected_constant_bits(emission_tiers, &rewards, MONEY_SUM_BITS);
     let block_reward = reconstruct_bits(&reward_bits);
@@ -527,7 +527,7 @@ mod tests {
                 }
             })
             .collect();
-        // ELIDE CHANGE: the reward follows the HEIGHT now, not the state depth.
+        // JETSAM CHANGE: the reward follows the HEIGHT now, not the state depth.
         // These cases exercise fee arithmetic and the coinbase ceiling, so they
         // pin a fixed test height in the first emission tier and let the depth
         // vary independently, as it always did.

@@ -11,7 +11,7 @@ The worker receives no block body or proving witness.
 Start the node in external-miner mode with a bearer token:
 
 ```sh
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 In another terminal:
@@ -41,7 +41,7 @@ and restrict the exposed path at a reverse proxy. Bind public RPC only after
 that transport is in place:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -57,7 +57,7 @@ safer solo-mining mode.
 To let a worker request its own payout, the node operator must opt in:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase

@@ -30,7 +30,7 @@ Parano1d 的设计目标就是消除这项要求。
 
 ## 一次转换，只证明一次
 
-发送 ELD 时，钱包选择自己的 UTXO，并构造一笔原子的 [`PagedSpend`](reference/glossary.md#pagedspend)。它针对 `{logical_txid, input_owner}` 生成全新随机化、隐藏见证数据的[授权证明封装](reference/glossary.md#authorization-envelope)。256 位支出秘密始终留在钱包内。
+发送 JTM 时，钱包选择自己的 UTXO，并构造一笔原子的 [`PagedSpend`](reference/glossary.md#pagedspend)。它针对 `{logical_txid, input_owner}` 生成全新随机化、隐藏见证数据的[授权证明封装](reference/glossary.md#authorization-envelope)。256 位支出秘密始终留在钱包内。
 
 该授权与 State 无关：其中不含 UTXO Merkle 路径，也不绑定某一个 State 根。矿工持有公开的 State 见证数据，并单独证明每个输入确实存在、每个输出槽为空、数值与手续费守恒，以及转换后的 State 根完全正确。
 
@@ -72,7 +72,7 @@ State 是一个精确的、带索引的稀疏 UTXO 向量。支出会清空槽�
 
 向量按每段 `2^16` 个槽位切分。空段是虚拟的；最后一个 UTXO 被花费后，整段便会消失。槽位域从 `2^24` 开始扩展，无需复制 State、迁移输出或暂停网络。
 
-手续费区分普通 I/O 与净新增 State。[State 增长费](reference/glossary.md#state-growth-fee)随占用率上升并被销毁；归集不支付 State 增长费。每次扩展 State 域时，区块奖励减半，但永久保留 1 ELD 的下限。
+手续费区分普通 I/O 与净新增 State。[State 增长费](reference/glossary.md#state-growth-fee)随占用率上升并被销毁；归集不支付 State 增长费。每次扩展 State 域时，区块奖励减半，但永久保留 1 JTM 的下限。
 
 ## 统一的二进制证明栈
 
@@ -100,13 +100,13 @@ State 是一个精确的、带索引的稀疏 UTXO 向量。支出会清空槽�
 在所有正整数查询预算中，期望经典随机预言机查询工作量的最小值。对实际部署的
 B25 与 B255 配置应用其定义和整数位表示后，可证明值与基于猜想的值均为 127 位。
 完整计算以及与已发布系统的比较见
-[Block–Tiwari 推导](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/block-tiwari.md)。
+[Block–Tiwari 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md)。
 
 另一项端到端可靠性游戏考察单个能够跨查询保留状态的量子对手能否使实际部署的
 验证器接受一个递归证明链始于创世区块的无效终端 State。在定理明确给出的固定
 Poseidon2b 偏差上界与相干响应成本前提下，网络当前状态自创世块起的端到端后量子可靠性，已证明达到
 NIST PQC Category 1 水平。完整推导见
-[QROM 与 Category 1 推导](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/category-one.md)，命题边界见
+[QROM 与 Category 1 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)，命题边界见
 [安全模型](protocol/security-model.md)。
 
 ## 协议概况
@@ -125,10 +125,10 @@ NIST PQC Category 1 水平。完整推导见
 
 ## 开始使用
 
-- 从[最新版本](https://github.com/ignotusnemo/elide/releases)安装原生 GUI 钱包。钱包自带并管理一个完整节点。
+- 从[最新版本](https://github.com/ignotusnemo/jetsam/releases)安装原生 GUI 钱包。钱包自带并管理一个完整节点。
 - 阅读[架构概览](architecture/overview.md)，跟踪交易从钱包进入已接受的 State 的完整过程。
 - [在 Linux 上运行普通节点](operate/node.md)。
 - [运行内置或外部矿工](mining/index.md)。
-- 使用项目固定的 Rust toolchain 查看或构建[源代码](https://github.com/ignotusnemo/elide)。
+- 使用项目固定的 Rust toolchain 查看或构建[源代码](https://github.com/ignotusnemo/jetsam)。
 
 源代码是共识行为的规范定义。协议规范以稳定、独立于具体实现的形式记录这些规则。

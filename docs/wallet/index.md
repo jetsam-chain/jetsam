@@ -55,15 +55,15 @@ wallet later saves a receipt.
 The default data directory is:
 
 ```text
-~/.elide/data
+~/.jetsam/data
 ```
 
-on Linux and macOS, and the equivalent `.elide\data` directory under the
+on Linux and macOS, and the equivalent `.jetsam\data` directory under the
 Windows user profile.
 
 The master secret is stored in `wallet.key`. Saved receipts are stored in
 `wallet.receipts`. Interface preferences are in
-`~/.elide/gui-settings.json`.
+`~/.jetsam/gui-settings.json`.
 
 The master-secret file is not password-encrypted. Protect the operating-system
 account and back up the secret before receiving funds.

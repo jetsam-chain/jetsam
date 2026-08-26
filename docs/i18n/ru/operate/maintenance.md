@@ -18,8 +18,8 @@ jetsam-cli mining
 С systemd:
 
 ```sh
-systemctl status elide
-journalctl -u elide --since today
+systemctl status jetsam
+journalctl -u jetsam --since today
 ```
 
 Следите за свободным местом для Live State в MDBX и кеша доказательств, а
@@ -31,7 +31,7 @@ UTXO.
 Всегда останавливайте процесс перед копированием базы или заменой бинарников:
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Дождитесь неактивного состояния службы. Обычное копирование работающего
@@ -62,7 +62,7 @@ DATA_DIR/wallet.receipts
 1. скачайте новый архив и соответствующий `SHA256SUMS`;
 2. проверьте хэш;
 3. остановите службу;
-4. одновременно замените `elide`, `jetsam-cli` и `jetsam-miner`;
+4. одновременно замените `jetsam`, `jetsam-cli` и `jetsam-miner`;
 5. запустите службу;
 6. проверьте запуск и синхронизацию.
 
@@ -73,7 +73,7 @@ DATA_DIR/wallet.receipts
 Если вы подозреваете повреждение `State` и доступны здоровые пиры:
 
 ```sh
-elide --purge-state
+jetsam --purge-state
 ```
 
 Команда очищает всю базу цепи: заголовки, индексы, сохранённые полные блоки,

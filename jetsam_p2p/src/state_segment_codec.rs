@@ -357,7 +357,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/segment/5")
+        StreamProtocol::new("/jetsam/test/sync/segment/5")
     }
 
     fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {

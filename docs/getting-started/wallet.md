@@ -7,7 +7,7 @@ wallet use does not require a terminal.
 ## Choose the package
 
 Download the GUI wallet for the computer from the
-[GitHub release page](https://github.com/ignotusnemo/elide/releases):
+[GitHub release page](https://github.com/ignotusnemo/jetsam/releases):
 
 | Platform | Package |
 |---|---|
@@ -104,7 +104,7 @@ To pay:
 
 The wallet forges the private authorization locally and submits the complete
 intent to its node. A successful final panel shows the logical transaction ID.
-See [Send ELD](../wallet/send.md) for status and confirmation behavior.
+See [Send JTM](../wallet/send.md) for status and confirmation behavior.
 
 ## Remove the application
 
@@ -119,6 +119,6 @@ sudo apt remove jetsam-gui
 On Windows, use **Installed apps → Parano1d → Uninstall**. On macOS, move the
 application from Applications to Trash.
 
-Wallet and node data remain under `.elide` in the user profile. Remove that
+Wallet and node data remain under `.jetsam` in the user profile. Remove that
 directory only after exporting or backing up the master secret and any receipts
 you intend to keep.

@@ -4,7 +4,7 @@
 
 //! Fork choice rule: heaviest chain wins.
 //!
-//! Elide uses **cumulative PoW work** as the canonical chain selector,
+//! Jetsam uses **cumulative PoW work** as the canonical chain selector,
 //! identical to Bitcoin's "most work" rule. Since PoW provides ordering
 //! only (not security), the rule keeps the chain deterministic.
 //!
@@ -112,7 +112,7 @@ mod tests {
         );
     }
 
-    /// ELIDE CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of literal
+    /// JETSAM CHANGE: derived from `CONSENSUS_FINALITY_DEPTH` instead of literal
     /// 17/18/19, so the test follows the constant rather than pinning it.
     #[test]
     fn reorg_within_finality_allowed() {

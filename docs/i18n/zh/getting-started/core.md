@@ -2,7 +2,7 @@
 
 Core 压缩包面向节点运营者、矿工和开发者，其中包含：
 
-- `elide`：完整节点与内置矿工；
+- `jetsam`：完整节点与内置矿工；
 - `jetsam-cli`：本地节点及钱包客户端；
 - `jetsam-miner`：外部 PoW 工作进程。
 
@@ -27,13 +27,13 @@ jetsam-core-vVERSION-macos-x86_64.tar.gz
 Linux 或 macOS：
 
 ```sh
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 Windows PowerShell：
 
 ```powershell
-.\elide.exe --check-hardware
+.\jetsam.exe --check-hardware
 ```
 
 最后一行必须是：
@@ -54,14 +54,14 @@ PMULL。运行时会自动选择 `pclmul`、`avx2+vpclmul`、`avx512bw+vpclmul`
 在前台运行 Core：
 
 ```sh
-./elide
+./jetsam
 ```
 
 首次启动会创建：
 
 ```text
-~/.elide/elide.toml
-~/.elide/data/
+~/.jetsam/jetsam.toml
+~/.jetsam/data/
 ```
 
 在另一个终端中可以检查节点：

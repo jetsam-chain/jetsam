@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    /// ELIDE helper: reprint the golden vectors after any change to the hash
+    /// JETSAM helper: reprint the golden vectors after any change to the hash
     /// (round constants, domain tags, permutation). Run with
     /// `cargo test --release -p jetsam_chain --lib print_zero_root_golden -- --ignored --nocapture`
     #[test]
@@ -114,7 +114,7 @@ mod tests {
 
     fn zero_root_golden_vectors_are_stable() {
         let roots = zero_slot_roots(32);
-        // ELIDE CHANGE: recomputed. New round constants and domain tags
+        // JETSAM CHANGE: recomputed. New round constants and domain tags
         // change every digest the chain produces. Regenerate with
         // print_zero_root_golden above.
         let vectors = [

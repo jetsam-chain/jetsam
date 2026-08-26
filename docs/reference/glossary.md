@@ -281,7 +281,7 @@ relations to evaluations at sampled points.
 
 ## μNOID
 
-The atomic currency unit. One ELD is 1,000,000 μNOID.
+The atomic currency unit. One JTM is 1,000,000 μNOID.
 
 ## Network identity
 

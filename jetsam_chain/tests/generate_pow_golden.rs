@@ -14,7 +14,7 @@
 //! Kept byte-compatible with the existing miner's `--selftest` parser:
 //!
 //! ```text
-//! # elide towerhash golden vectors  n=<count>
+//! # jetsam towerhash golden vectors  n=<count>
 //! V <f0> <f1> … <f15> <skip0> … <skip4> <digest>
 //! ```
 //!
@@ -66,7 +66,7 @@ fn emit_golden_vectors() {
     let mut rng = SplitMix(0x454C_4944_4520_5057); // "ELIDE PW"
     let zeros = "0".repeat(32);
 
-    println!("# elide towerhash golden vectors  n={count}");
+    println!("# jetsam towerhash golden vectors  n={count}");
     for _ in 0..count {
         let mut fields: PowHeaderFields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
         let mut line = String::from("V");

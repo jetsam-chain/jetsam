@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JMQ1";
 const RESPONSE_MAGIC: [u8; 4] = *b"JMS1";
@@ -265,7 +265,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/manifest-page/1")
+        StreamProtocol::new("/jetsam/test/sync/manifest-page/1")
     }
 
     fn object(bytes: &[u8]) -> SnapshotManifestPageObjectId {

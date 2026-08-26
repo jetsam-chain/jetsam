@@ -21,7 +21,7 @@ unsupported host exits before opening the wallet or chain database.
 Run the preflight on the intended host:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 jetsam-miner --check-hardware
 ```
 
@@ -118,7 +118,7 @@ segments. MDBX grows in 64 MiB steps as needed.
 Monitor the real path:
 
 ```sh
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 jetsam-cli state
 ```
 
@@ -144,7 +144,7 @@ Revisit capacity after material changes in Live State or traffic:
 jetsam-cli status
 jetsam-cli state
 jetsam-cli peers
-du -sh ~/.elide/data
+du -sh ~/.jetsam/data
 ```
 
 Alert on low disk space, repeated peer loss, sustained synchronization lag and

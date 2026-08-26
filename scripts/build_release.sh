@@ -221,7 +221,7 @@ cargo build --locked --release --target "$HOST_TRIPLE" \
   -p jetsam_gui --bin jetsam-gui
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"
-for binary in elide jetsam-cli jetsam-miner; do
+for binary in jetsam jetsam-cli jetsam-miner; do
   [[ -f $TARGET_BIN_DIR/$binary$BINARY_SUFFIX ]] || \
     release_die "release binary is missing: $TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
 done
@@ -230,8 +230,8 @@ done
 
 CURRENT_STAGE='native smoke test'
 printf '\n==> Smoke-testing native executables\n'
-"$TARGET_BIN_DIR/elide$BINARY_SUFFIX" --check-hardware >/dev/null
-"$TARGET_BIN_DIR/elide$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/jetsam$BINARY_SUFFIX" --check-hardware >/dev/null
+"$TARGET_BIN_DIR/jetsam$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/jetsam-cli$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --check-hardware >/dev/null
 "$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --help >/dev/null
@@ -240,7 +240,7 @@ printf '\n==> Smoke-testing native executables\n'
 CURRENT_STAGE='binary packaging'
 printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
 mkdir -- "$BIN_DIR"
-for binary in elide jetsam-cli jetsam-miner; do
+for binary in jetsam jetsam-cli jetsam-miner; do
   cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
   chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
 done
@@ -250,10 +250,10 @@ printf '\n==> Packaging %s\n' "$GUI_ARTIFACT_NAME"
 mkdir -- "$GUI_BIN_DIR"
 cp -- "$TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX" \
   "$GUI_BIN_DIR/jetsam-gui$BINARY_SUFFIX"
-cp -- "$TARGET_BIN_DIR/elide$BINARY_SUFFIX" \
-  "$GUI_BIN_DIR/elide$BINARY_SUFFIX"
+cp -- "$TARGET_BIN_DIR/jetsam$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/jetsam$BINARY_SUFFIX"
 chmod 0755 "$GUI_BIN_DIR/jetsam-gui$BINARY_SUFFIX" 2>/dev/null || true
-chmod 0755 "$GUI_BIN_DIR/elide$BINARY_SUFFIX" 2>/dev/null || true
+chmod 0755 "$GUI_BIN_DIR/jetsam$BINARY_SUFFIX" 2>/dev/null || true
 case "$PLATFORM" in
   linux-*)
     "$RELEASE_ROOT_DIR/scripts/release/package_linux_gui.sh" \
@@ -285,7 +285,7 @@ archive_entries=(
   README.txt
   LICENSE
   NOTICE
-  "elide$BINARY_SUFFIX"
+  "jetsam$BINARY_SUFFIX"
   "jetsam-cli$BINARY_SUFFIX"
   "jetsam-miner$BINARY_SUFFIX"
 )

@@ -52,7 +52,7 @@
 - [首次运行与主密钥](wallet/first-run.md)
 - [从照片派生密钥](wallet/photo-key.md)
 - [地址](wallet/addresses.md)
-- [发送 ELD](wallet/send.md)
+- [发送 JTM](wallet/send.md)
 - [收据](wallet/receipts.md)
 - [归集](wallet/consolidation.md)
 - [Scope 浏览器](wallet/scope.md)

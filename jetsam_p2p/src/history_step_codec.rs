@@ -21,7 +21,7 @@ use crate::{
     protocol::{GetHistoryStepTerminalRequest, GetHistoryStepTerminalResponse},
 };
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JTR1";
 const REQUEST_BYTES: usize = 4 + 8 + 32;
@@ -321,7 +321,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/history-step/1")
+        StreamProtocol::new("/jetsam/test/sync/history-step/1")
     }
 
     fn terminal(height: u64, semantic_id: [u8; 32], fill: u8) -> Vec<u8> {

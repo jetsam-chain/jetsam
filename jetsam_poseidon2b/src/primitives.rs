@@ -4,7 +4,7 @@
 
 //! Typed cryptographic primitives for the transparent UTXO layer.
 //!
-//! Elide is a transparent, Bitcoin-style chain: every UTXO discloses
+//! Jetsam is a transparent, Bitcoin-style chain: every UTXO discloses
 //! value and owner address on-chain. Authorization is still signatureless
 //! — a spend is authorized by an owner proof bound to the canonical
 //! transaction statement transcript. All privacy
@@ -82,7 +82,7 @@ newtype_digest!(
 /// Human-readable part for Jetsam bech32m addresses.
 /// Produces addresses of the form `j1q...` (~60 chars).
 ///
-/// ELIDE CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Jetsam uses
+/// JETSAM CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Jetsam uses
 /// `"j"` so that an address cannot be silently mistaken between the two
 /// networks — a mis-sent coinbase is unrecoverable.
 pub const ADDRESS_HRP: &str = "j";
@@ -470,14 +470,14 @@ mod tests {
             0x23, 0xaf, 0xcd, 0xb2,
         ]);
         let encoded = addr.to_bech32();
-        // ELIDE: assert against the constant rather than a literal, so the
+        // JETSAM: assert against the constant rather than a literal, so the
         // prefix and the test can never drift apart again.
         let expected_prefix = format!("{ADDRESS_HRP}1");
         assert!(
             encoded.starts_with(&expected_prefix),
             "expected {expected_prefix} prefix, got {encoded}"
         );
-        // An Elide address must not be parseable as an upstream Parano1d one.
+        // An Jetsam address must not be parseable as an upstream Parano1d one.
         assert!(
             !encoded.starts_with("o1"),
             "address must not carry the upstream HRP"

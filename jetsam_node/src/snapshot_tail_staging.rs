@@ -21,7 +21,7 @@ use jetsam_chain::{
     Block, BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const FILE_MAGIC: [u8; 4] = *b"JST3";
 const FILE_HEADER_BYTES: u64 = 4 + 8 + 32 + 32;

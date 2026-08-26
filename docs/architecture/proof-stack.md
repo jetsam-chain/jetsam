@@ -95,7 +95,7 @@ The Category 1 result concerns the separate end-to-end from-genesis
 invalid-State game and is conditional on the fixed Poseidon2b delta and
 coherent response-cost premises stated in the theorem. Production constants,
 reductions and exact calculations are in
-[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness).
 
 For claim boundaries and non-proof assumptions, see
 [Security model](../protocol/security-model.md). Implementation crates are

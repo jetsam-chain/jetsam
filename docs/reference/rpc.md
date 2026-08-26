@@ -24,7 +24,7 @@ curl --silent --show-error \
 ## Conventions
 
 - Monetary integer fields are in μNOID.
-- One ELD equals 1,000,000 μNOID.
+- One JTM equals 1,000,000 μNOID.
 - Hashes are lowercase hexadecimal without `0x`.
 - Targets and nonce bytes use their canonical little-endian encoding.
 - Addresses use canonical bech32m `o1…` unless a field explicitly says hex.

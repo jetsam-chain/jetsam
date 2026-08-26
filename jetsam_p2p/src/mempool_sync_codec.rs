@@ -348,7 +348,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/mempool/3")
+        StreamProtocol::new("/jetsam/test/sync/mempool/3")
     }
 
     fn request_wire(kind: u8, payload_len: u32, payload: &[u8]) -> Vec<u8> {

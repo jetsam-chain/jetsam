@@ -5,7 +5,7 @@
 [Website](https://jetsam.org) ·
 [Documentation](https://docs.jetsam.org) ·
 [Research](https://lab.jetsam.org) ·
-[Releases](https://github.com/ignotusnemo/elide/releases)
+[Releases](https://github.com/ignotusnemo/jetsam/releases)
 
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
@@ -114,7 +114,7 @@ The complete theorem is in the
 
 ### Execution Is Local
 
-When sending ELD, the wallet selects its UTXOs and creates one atomic
+When sending JTM, the wallet selects its UTXOs and creates one atomic
 `PagedSpend`. It then produces a freshly randomized, witness-hiding
 authorization for `{logical_txid, input_owner}`. The spending secret never
 leaves the wallet.
@@ -175,7 +175,7 @@ required.
 
 Fees distinguish ordinary I/O from net-new state. The state-growth component
 rises with occupancy and is burned; consolidation pays no growth burn. Block
-reward halves when the state domain actually expands, with a permanent 1 ELD
+reward halves when the state domain actually expands, with a permanent 1 JTM
 floor.
 
 ### Signatureless Ownership
@@ -304,35 +304,35 @@ Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
 
 ```sh
-elide
-elide --miner
+jetsam
+jetsam --miner
 ```
 
 An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-elide --seed <host>:9600
+jetsam --seed <host>:9600
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
 
 ```sh
-elide --extminer --mining-key <token>
+jetsam --extminer --mining-key <token>
 jetsam-miner --key <token>
 ```
 
 Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
-creates `~/.elide/elide.toml`, the MDBX state and the built-in wallet
-under `~/.elide/data/`.
+creates `~/.jetsam/jetsam.toml`, the MDBX state and the built-in wallet
+under `~/.jetsam/data/`.
 
 The current `wallet.key` is not password-encrypted. It is created with
 owner-only permissions; back it up and protect it.
 
 ### CLI
 
-Addresses use bech32m and begin with `o1`. `1 ELD = 1,000,000 μNOID`.
-`ELD` is the ticker; the wallet uses `①` as its interface symbol.
+Addresses use bech32m and begin with `o1`. `1 JTM = 1,000,000 μNOID`.
+`JTM` is the ticker; the wallet uses `①` as its interface symbol.
 
 ```sh
 jetsam-cli status
@@ -352,7 +352,7 @@ jetsam-cli verify "$(tr -d '\n' < receipt.hex)"
 jetsam-cli stop
 ```
 
-Run `elide --help`, `jetsam-cli help` or `jetsam-miner --help` for the full
+Run `jetsam --help`, `jetsam-cli help` or `jetsam-miner --help` for the full
 interface.
 
 ## Building from Source
@@ -367,7 +367,7 @@ the host before entering proof code. Production requires SSE4.1 and
 PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects the
 `pclmul`, `avx2+vpclmul`, `avx512bw+vpclmul` or `neon+pmull` backend at runtime. The
 scalar implementation is a differential-test oracle and is never used by a
-production node. Run `elide --check-hardware` before installation to see
+production node. Run `jetsam --check-hardware` before installation to see
 the selected backend without creating configuration, wallet or chain data.
 
 To reproduce a published release, check out the tag shown on its GitHub release
@@ -377,8 +377,8 @@ matrix bytes supplied by the project. Keep the pack outside the repository's
 disposable `target/` tree:
 
 ```sh
-git clone https://github.com/ignotusnemo/elide.git
-cd elide
+git clone https://github.com/ignotusnemo/jetsam.git
+cd jetsam
 
 mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
@@ -390,9 +390,9 @@ Generation is expensive but only needs to be performed once.
 Build for the current machine. The script authenticates the pack, embeds it
 into the node and produces two independent deliverables:
 
-- a Core archive containing `elide`, `jetsam-cli` and `jetsam-miner`;
+- a Core archive containing `jetsam`, `jetsam-cli` and `jetsam-miner`;
 - a native GUI Wallet package containing `jetsam-gui` and its private,
-  locally supervised `elide` node.
+  locally supervised `jetsam` node.
 
 ```sh
 ./scripts/build_release.sh \

@@ -1051,7 +1051,7 @@ fn compact_decimal(value: f64) -> String {
 /// Compact whole-network monetary value with at most two decimal places.
 ///
 /// The caller supplies μJTM; the returned text deliberately omits the final
-/// `ELD` suffix so views can retain it unconditionally at every window size.
+/// `JTM` suffix so views can retain it unconditionally at every window size.
 pub fn format_compact_micro_jtm(value: u128) -> String {
     const UNITS: [(&str, u128); 5] = [
         ("", 1_000_000),

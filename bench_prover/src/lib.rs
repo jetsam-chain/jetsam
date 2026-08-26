@@ -746,7 +746,7 @@ impl HonestHistoryStepFixtureProvider {
             .timestamp
             .checked_add(jetsam_chain::consensus::params::BLOCK_TIME)
             .ok_or_else(|| "fixture timestamp overflow".to_owned())?;
-        // ELIDE CHANGE: ASERT anchored on the parent's timestamp, never the
+        // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
         // block's own. Must mirror consensus::header::validate_header_inner.
         let target = jetsam_chain::consensus::next_target(
             checkpoint.asert_anchor.anchor_height,

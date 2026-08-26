@@ -69,7 +69,7 @@ fn soft_shadow() -> Shadow {
 
 pub fn parajetsam_theme() -> Theme {
     Theme::custom(
-        "Elide System",
+        "Jetsam System",
         Palette {
             background: BACKGROUND,
             text: TEXT,

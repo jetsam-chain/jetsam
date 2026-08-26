@@ -100,13 +100,13 @@
 До создания данных проверьте реальную машину:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 Запустите Core со встроенным майнером:
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 Без `--cpu-threads` используются все логические CPU, видимые процессу. Если
@@ -114,7 +114,7 @@ elide --mode miner --cpu-threads 12
 Отдельный канонический адрес bech32m можно зафиксировать так:
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 Следите за готовностью и цепью из другого терминала:
@@ -136,7 +136,7 @@ jetsam-cli mining
 доказательства:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key '<long-random-token>'
 ```

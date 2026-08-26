@@ -774,7 +774,7 @@ fn address_slots<'a>(
         let header = container(
             row![
                 table_cell("SLOT", 3, theme::MUTED),
-                table_cell("VALUE / ELD", 4, theme::MUTED),
+                table_cell("VALUE / JTM", 4, theme::MUTED),
                 table_cell("ORIGIN", 4, theme::MUTED),
                 table_cell("STATE", 2, theme::MUTED),
             ]

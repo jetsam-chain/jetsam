@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Proof components for the Elide transaction system.
+//! Proof components for the Jetsam transaction system.
 //!
 //! This crate provides:
 //!

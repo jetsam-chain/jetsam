@@ -22,7 +22,7 @@ const HEIGHT_BITS: usize = 64;
 const QUOTIENT_BITS: usize = 59;
 /// Wide enough to hold `TX_EPOCH_BLOCKS` itself and any remainder below it.
 const REMAINDER_BITS: usize = 6;
-/// ELIDE CHANGE: 32, was 144. Being a power of two, the recomposition below
+/// JETSAM CHANGE: 32, was 144. Being a power of two, the recomposition below
 /// costs one shift instead of two shifts plus a carry-safe addition.
 const _: () = assert!(TX_EPOCH_BLOCKS == 32);
 const _: () = assert!(TX_EPOCH_BLOCKS < (1 << REMAINDER_BITS));
@@ -81,7 +81,7 @@ fn constrain_tx_epoch_boundary_with_decomposition(
     let epoch_bits = range_check_bits(b, &epoch, REMAINDER_BITS);
     pin_lt_strict(b, &remainder_bits, &epoch_bits);
 
-    // ELIDE CHANGE: 32*q = q << 5, a single shift. Upstream's 144 needed
+    // JETSAM CHANGE: 32*q = q << 5, a single shift. Upstream's 144 needed
     // (q << 7) + (q << 4) and a carry-safe addition to combine them; a
     // power-of-two epoch removes that addition from the circuit entirely.
     let q_times_32 = shifted_integer_from_bits(&quotient_bits, 5);

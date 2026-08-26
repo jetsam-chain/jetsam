@@ -53,7 +53,7 @@ the production B25 and B255 profiles gives exact expected-work values in
 `[127, 128)` for both the provable and conjectured RBR premises. Their equality
 after integer presentation does not identify those premises.
 
-The [Block–Tiwari derivation](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/block-tiwari.md) proves
+The [Block–Tiwari derivation](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md) proves
 the local RBR inputs for every production layer, solves both integer
 optimizations and reproduces the comparison with the systems in their
 published table.
@@ -86,9 +86,9 @@ genesis at NIST PQC Category 1: every adversary inside the Category 1 resource
 envelope has success probability below one half in the from-genesis
 invalid-State game.
 
-The [end-to-end QROM derivation](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/category-one.md)
+The [end-to-end QROM derivation](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)
 states the game, reductions, finite terms and assumptions. The
-[`jetsam_soundness` certificate](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness) imports the
+[`jetsam_soundness` certificate](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness) imports the
 production constants and evaluates every normative inequality with exact
 integer or rational arithmetic. This is a cryptographic Category 1 resource
 assessment, not a claim of NIST review or certification.

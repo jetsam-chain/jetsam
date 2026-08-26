@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # jetsam_p2p — libp2p Networking for Elide
+//! # jetsam_p2p — libp2p Networking for Jetsam
 //!
 //! Implements:
 //! - GossipSub broadcast: blocks (/paranoid/blocks/1), txs (/paranoid/txs/1)

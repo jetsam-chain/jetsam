@@ -4,7 +4,7 @@
 
 //! Canonical transparent transaction types.
 //!
-//! Elide has one fixed transaction form: eight possible spends and two
+//! Jetsam has one fixed transaction form: eight possible spends and two
 //! possible outputs. Liveness is represented only by `TxBody::validity_bitmap`;
 //! dead records are the all-zero record. Wallet secrets are not transaction
 //! fields and enter proving only through `jetsam_gkr::OwnerAuthWitness`.
@@ -105,7 +105,7 @@ pub struct TxBody {
 /// Transaction anti-replay epoch length in blocks. The exact boundary update
 /// rule is enforced by the chain accumulator and block validator.
 ///
-/// ELIDE CHANGE: 32, down from upstream's 144. This preserves the wall-clock
+/// JETSAM CHANGE: 32, down from upstream's 144. This preserves the wall-clock
 /// epoch exactly — 144 × 20 s and 32 × 90 s are both 48 minutes — while keeping
 /// the invariant that a day divides into whole epochs, which upstream relied on
 /// (4320 / 144 = 30) and which 90 s blocks would otherwise break

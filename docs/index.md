@@ -47,7 +47,7 @@ hardware requirement.
 
 ## One transition, proved once
 
-When sending ELD, the wallet selects its UTXOs and creates one atomic
+When sending JTM, the wallet selects its UTXOs and creates one atomic
 `PagedSpend`. It produces a freshly randomized, witness-hiding authorization
 for `{logical_txid, input_owner}`. The 256-bit spending secret never leaves the
 wallet.
@@ -132,7 +132,7 @@ network.
 
 Fees distinguish ordinary I/O from net-new State. The State-growth component
 rises with occupancy and is burned; consolidation pays no growth burn. The
-block reward halves when the State domain expands, with a permanent 1 ELD
+block reward halves when the State domain expands, with a permanent 1 JTM
 floor.
 
 ## One binary proof stack
@@ -168,14 +168,14 @@ security as the minimum expected classical random-oracle query work over every
 positive integer query budget. Their definitions and whole-bit presentation
 give 127 provable bits and 127 conjectured bits for the production B25 and B255
 profiles. The complete calculation and published-system comparison are in the
-[Block–Tiwari derivation](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/block-tiwari.md).
+[Block–Tiwari derivation](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md).
 
 The separate end-to-end game asks whether one stateful quantum adversary can
 make the production verifier accept an invalid terminal State whose recursive
 ancestry starts at genesis. Under the fixed Poseidon2b delta and coherent
 response-cost premises stated in the theorem, the result is provable end-to-end
 post-quantum soundness for state validation from genesis at NIST PQC Category 1. See the
-complete [QROM and Category 1 derivation](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/category-one.md)
+complete [QROM and Category 1 derivation](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)
 and the [security model](protocol/security-model.md).
 
 ## Protocol profile
@@ -195,14 +195,14 @@ and the [security model](protocol/security-model.md).
 ## Start
 
 - Install the native GUI wallet from the
-  [latest release](https://github.com/ignotusnemo/elide/releases). It
+  [latest release](https://github.com/ignotusnemo/jetsam/releases). It
   includes and supervises its own full node.
 - Read the [architecture overview](architecture/overview.md) to follow a
   transaction from the wallet to accepted State.
 - [Run an ordinary node on Linux](operate/node.md).
 - [Run an internal or external miner](mining/index.md).
 - Inspect or build the
-  [source](https://github.com/ignotusnemo/elide) with the pinned Rust
+  [source](https://github.com/ignotusnemo/jetsam) with the pinned Rust
   toolchain.
 
 The source code is the canonical definition of consensus behavior. The

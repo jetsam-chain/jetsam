@@ -47,7 +47,7 @@ done
 BIN_DIR="$(CDPATH='' cd -- "$BIN_DIR" && pwd -P)"
 mkdir -p -- "$OUTPUT_DIR"
 OUTPUT_DIR="$(CDPATH='' cd -- "$OUTPUT_DIR" && pwd -P)"
-for binary in jetsam-gui elide; do
+for binary in jetsam-gui jetsam; do
   [[ -f $BIN_DIR/$binary && -x $BIN_DIR/$binary ]] || {
     echo "release binary is missing or not executable: $BIN_DIR/$binary" >&2
     exit 1
@@ -77,7 +77,7 @@ DMG_ROOT="$TEMPORARY/dmg"
 mkdir -p -- "$MACOS" "$RESOURCES" "$ICONSET" "$DMG_ROOT"
 
 install -m 0755 "$BIN_DIR/jetsam-gui" "$MACOS/Parano1d"
-install -m 0755 "$BIN_DIR/elide" "$MACOS/jetsam-node"
+install -m 0755 "$BIN_DIR/jetsam" "$MACOS/jetsam-node"
 install -m 0644 "$RELEASE_ROOT_DIR/LICENSE" "$RESOURCES/LICENSE.txt"
 install -m 0644 "$RELEASE_ROOT_DIR/NOTICE" "$RESOURCES/NOTICE.txt"
 

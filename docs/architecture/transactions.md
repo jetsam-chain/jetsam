@@ -116,4 +116,4 @@ wallet, are retained as outgoing payment evidence.
 
 For normative validity rules, see
 [Transaction protocol](../protocol/transactions.md). For user-facing behavior,
-see [Send ELD](../wallet/send.md).
+see [Send JTM](../wallet/send.md).

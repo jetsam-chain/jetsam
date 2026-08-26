@@ -4,7 +4,7 @@ The Core archive contains three executables:
 
 | Executable | Role |
 |---|---|
-| `elide` | Full node, wallet backend and optional internal proof/mining pipeline |
+| `jetsam` | Full node, wallet backend and optional internal proof/mining pipeline |
 | `jetsam-cli` | Thin JSON-RPC client for a running node |
 | `jetsam-miner` | Separate Poseidon2b nonce-search worker |
 
@@ -13,7 +13,7 @@ The Core archive contains three executables:
 Run an ordinary node with no mode argument:
 
 ```sh
-elide
+jetsam
 ```
 
 Public daemon options are:
@@ -53,13 +53,13 @@ Examples:
 
 ```sh
 # Ordinary node
-elide --data-dir ~/.elide/data
+jetsam --data-dir ~/.jetsam/data
 
 # Internal miner using 12 logical CPUs
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 Keep RPC on loopback unless it is protected by a private or authenticated
@@ -107,11 +107,11 @@ and performs wallet operations through local JSON-RPC.
 The default endpoint is `http://127.0.0.1:9601`. Environment variable
 `JETSAM_RPC` changes it. `--rpc` takes precedence.
 
-Amounts entered by CLI wallet commands are in ELD with up to six decimal
+Amounts entered by CLI wallet commands are in JTM with up to six decimal
 places:
 
 ```text
-1 ELD = 1,000,000 μNOID
+1 JTM = 1,000,000 μNOID
 ```
 
 ### Node and chain
@@ -215,7 +215,7 @@ Submit with automatic fee:
 jetsam-cli send o1... 10.5
 ```
 
-Specify an exact fee in ELD only when needed:
+Specify an exact fee in JTM only when needed:
 
 ```sh
 jetsam-cli send o1... 10.5 --fee 0.012

@@ -18,8 +18,8 @@ jetsam-cli mining
 systemd 环境：
 
 ```sh
-systemctl status elide
-journalctl -u elide --since today
+systemctl status jetsam
+journalctl -u jetsam --since today
 ```
 
 应监控 MDBX 中的 Live State 和证明缓存实际使用的磁盘空间，而不是假设一个固定
@@ -30,7 +30,7 @@ journalctl -u elide --since today
 复制数据库或替换二进制文件前，必须停止进程：
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 等待服务进入 inactive。不要用普通文件复制工具复制正在运行的 MDBX
@@ -60,7 +60,7 @@ P2P 身份文件用于维持稳定的对等节点 ID，但没有花费权限。
 1. 下载新压缩包和对应的 `SHA256SUMS`；
 2. 校验摘要；
 3. 停止服务；
-4. 同时替换 `elide`、`jetsam-cli` 和 `jetsam-miner`；
+4. 同时替换 `jetsam`、`jetsam-cli` 和 `jetsam-miner`；
 5. 启动服务；
 6. 检查启动和同步状态。
 
@@ -71,7 +71,7 @@ P2P 身份文件用于维持稳定的对等节点 ID，但没有花费权限。
 如果怀疑链数据或 State 损坏，并且网络中有健康对等节点：
 
 ```sh
-elide --purge-state
+jetsam --purge-state
 ```
 
 该命令会清除完整链数据库，包括区块头、保留的完整区块、链索引、撤销数据和

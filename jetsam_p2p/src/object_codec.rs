@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JOQ2";
 const RESPONSE_MAGIC: [u8; 4] = *b"JOS2";

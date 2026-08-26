@@ -208,7 +208,7 @@ impl ChainView {
 mod tests {
     use super::*;
 
-    /// ELIDE CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
+    /// JETSAM CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
     /// which pinned the transaction epoch length in the test name and body.
     #[test]
     fn next_child_anchor_is_exact_around_the_epoch_boundary() {

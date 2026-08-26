@@ -189,7 +189,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
         telemetry_value(
             "CIRC SUPPLY",
             format!(
-                "{} ELD",
+                "{} JTM",
                 format_compact_micro_jtm(network.circulating_supply_micro_jtm)
             ),
             theme::ACCENT,
@@ -197,7 +197,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
         telemetry_value(
             "BLOCK REWARD",
             format!(
-                "{} ELD",
+                "{} JTM",
                 format_microjetsam_trimmed(network.block_reward_micro_jtm)
             ),
             theme::ACCENT,
@@ -480,7 +480,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     let metric_value_size = if compact { 16.0 } else { 18.0 };
     let balance_metric = container(
         column![
-            text("ELD BALANCE")
+            text("JTM BALANCE")
                 .size(metric_label_size)
                 .color(theme::DIM),
             row![
@@ -764,7 +764,7 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let header = table_columns("SLOT", "VALUE / ELD", "ORIGIN", "SEGMENT", "STATUS");
+    let header = table_columns("SLOT", "VALUE / JTM", "ORIGIN", "SEGMENT", "STATUS");
     let mut rows = column![].spacing(0);
     for (index, utxo) in app
         .snapshot
@@ -1615,7 +1615,7 @@ fn consolidation_confirmation<'a>(
         form_line(
             "INPUTS",
             format!(
-                "{} smallest of {} · {} ELD",
+                "{} smallest of {} · {} JTM",
                 plan.input_count,
                 original_count,
                 format_micro_jtm(plan.input_value_micro_jtm)
@@ -1624,12 +1624,12 @@ fn consolidation_confirmation<'a>(
         ),
         form_line(
             "NETWORK FEE",
-            format!("{} ELD", format_micro_jtm(plan.fee_micro_jtm)),
+            format!("{} JTM", format_micro_jtm(plan.fee_micro_jtm)),
             compact,
         ),
         form_line(
             "NEW OUTPUT",
-            format!("1 · {} ELD", format_micro_jtm(plan.output_value_micro_jtm)),
+            format!("1 · {} JTM", format_micro_jtm(plan.output_value_micro_jtm)),
             compact,
         ),
         form_line(
@@ -1750,13 +1750,13 @@ fn consolidation_success<'a>(
         metrics,
         form_line(
             "NEW OUTPUT",
-            format!("{} ELD", format_micro_jtm(result.output_value_micro_jtm)),
+            format!("{} JTM", format_micro_jtm(result.output_value_micro_jtm)),
             compact,
         ),
         form_line(
             "INPUT VALUE",
             format!(
-                "{} ELD selected",
+                "{} JTM selected",
                 format_micro_jtm(result.input_value_micro_jtm),
             ),
             compact,
@@ -1784,7 +1784,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         app.send_in_flight,
     );
     let amount = send_input_line(
-        "AMOUNT / ELD",
+        "AMOUNT / JTM",
         "0.000000",
         &app.send_amount,
         Message::SendAmountChanged,

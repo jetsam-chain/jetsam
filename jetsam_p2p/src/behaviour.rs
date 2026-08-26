@@ -2,11 +2,11 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Combined libp2p NetworkBehaviour for the Elide full node.
+//! Combined libp2p NetworkBehaviour for the Jetsam full node.
 //!
 //! ## Peer discovery stack
 //!
-//! Elide uses three complementary mechanisms, mirroring the approach taken
+//! Jetsam uses three complementary mechanisms, mirroring the approach taken
 //! by Substrate/Polkadot:
 //!
 //! 1. **Bootstrap nodes** — hard-coded seed addresses dialled on startup.
@@ -459,7 +459,7 @@ impl NodeBehaviour {
         // Without this, Kademlia cannot populate its routing table because
         // the DHT only stores addresses it has been explicitly told about.
         let identify = identify::Behaviour::new(
-            identify::Config::new("/elide/1.0.0".into(), key.public())
+            identify::Config::new("/jetsam/1.0.0".into(), key.public())
                 .with_push_listen_addr_updates(true)
                 // Re-identify periodically so address changes propagate.
                 .with_interval(Duration::from_secs(300)),

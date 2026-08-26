@@ -3,7 +3,7 @@
 Core reads TOML configuration from:
 
 ```text
-~/.elide/elide.toml
+~/.jetsam/jetsam.toml
 ```
 
 unless `--config` selects another file. A missing file is created atomically
@@ -19,7 +19,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "~/.elide/data"
+path = "~/.jetsam/data"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -81,9 +81,9 @@ is remote.
 Process mode is authoritative:
 
 ```sh
-elide --mode node
-elide --mode miner
-elide --mode extminer --mining-key TOKEN
+jetsam --mode node
+jetsam --mode miner
+jetsam --mode extminer --mining-key TOKEN
 ```
 
 The legacy `mining.enabled` field does not override `--mode`. An empty
@@ -107,7 +107,7 @@ to `jetsam-node.log` in the selected data directory.
 Validate CPU support without creating configuration, wallet or database files:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 The successful final line is `NODE READY`.

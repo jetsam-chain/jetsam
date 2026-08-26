@@ -52,7 +52,7 @@
 - [First run and the master secret](wallet/first-run.md)
 - [Photo-derived key](wallet/photo-key.md)
 - [Addresses](wallet/addresses.md)
-- [Send ELD](wallet/send.md)
+- [Send JTM](wallet/send.md)
 - [Receipts](wallet/receipts.md)
 - [Consolidation](wallet/consolidation.md)
 - [Scope](wallet/scope.md)

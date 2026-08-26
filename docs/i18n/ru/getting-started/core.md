@@ -2,7 +2,7 @@
 
 Архив Core предназначен для операторов нод, майнеров и разработчиков. В него входят:
 
-- `elide` — полная нода со встроенным майнером;
+- `jetsam` — полная нода со встроенным майнером;
 - `jetsam-cli` — локальный клиент ноды и кошелька;
 - `jetsam-miner` — внешний вычислитель PoW.
 
@@ -28,13 +28,13 @@ jetsam-core-vVERSION-macos-x86_64.tar.gz
 На Linux или macOS:
 
 ```sh
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 В Windows PowerShell:
 
 ```powershell
-.\elide.exe --check-hardware
+.\jetsam.exe --check-hardware
 ```
 
 Последняя строка должна выглядеть так:
@@ -56,14 +56,14 @@ NODE READY
 Запустите Core в текущем терминале:
 
 ```sh
-./elide
+./jetsam
 ```
 
 При первом запуске будут созданы:
 
 ```text
-~/.elide/elide.toml
-~/.elide/data/
+~/.jetsam/jetsam.toml
+~/.jetsam/data/
 ```
 
 В другом терминале можно проверить состояние:

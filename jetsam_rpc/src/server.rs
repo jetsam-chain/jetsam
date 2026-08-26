@@ -30,7 +30,7 @@ use jetsam_mempool::AsyncMempool;
 use jetsam_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 use jetsam_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
-use crate::api::ElideApiServer;
+use crate::api::JetsamApiServer;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
     BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
@@ -1649,7 +1649,7 @@ impl RpcHandler {
 }
 
 #[async_trait]
-impl ElideApiServer for RpcHandler {
+impl JetsamApiServer for RpcHandler {
     // -----------------------------------------------------------------------
     // Chain state (always available)
     // -----------------------------------------------------------------------
@@ -2274,7 +2274,7 @@ impl ElideApiServer for RpcHandler {
         let height = chain.tip_height();
         let diff = tip.difficulty_target;
         let diff_bits = jetsam_chain::consensus::target_leading_zero_bits(&diff);
-        // ELIDE CHANGE: the reward is a function of height, not state depth.
+        // JETSAM CHANGE: the reward is a function of height, not state depth.
         // Report the reward of the block a miner would build NEXT, which is
         // what a miner asking for mining info actually needs.
         let reward = block_reward(height.saturating_add(1));
@@ -2423,7 +2423,7 @@ impl ElideApiServer for RpcHandler {
 
         let bytes = decode_bounded_hex("receipt", &receipt_hex, MAX_RPC_RECEIPT_BYTES)?;
 
-        let receipt = jetsam_chain::consensus::receipt::ElideReceipt::from_bytes(&bytes)
+        let receipt = jetsam_chain::consensus::receipt::JetsamReceipt::from_bytes(&bytes)
             .map_err(|e| rpc_err(format!("decode receipt: {e:?}")))?;
 
         // Verify Merkle inclusion (offline, math only).
@@ -3474,7 +3474,7 @@ pub async fn start_rpc_server(
     // When mining_key is None it is a transparent pass-through.
     // When Some(key), all requests must carry `Authorization: Bearer <key>`.
     //
-    // Pool operators:  elide --rpc-listen 0.0.0.0:9701 --mining-key <secret>
+    // Pool operators:  jetsam --rpc-listen 0.0.0.0:9701 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
     let server = Server::builder()

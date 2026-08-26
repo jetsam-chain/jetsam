@@ -72,7 +72,7 @@ pub struct BlockHeader {
 /// Header identity is also used by the separate `TX_EPOCH_BLOCKS` transaction
 /// epoch
 /// and for chain linking (`prev_block_hash`).
-/// ELIDE CHANGE: the nonce is absorbed FIRST, mirroring
+/// JETSAM CHANGE: the nonce is absorbed FIRST, mirroring
 /// `consensus::pow::pow_header_fields_into`. The two orders MUST stay identical:
 /// the recursive parent-seal replays this hash in-circuit from the PoW field
 /// vector, so a divergence compiles cleanly and then makes every HistoryStep

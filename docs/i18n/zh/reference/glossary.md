@@ -250,7 +250,7 @@ UTXO 中记录的 32 字节公开值，由对应的 256 位支出秘密通过 Po
 <a id="micro_jtm"></a>
 ### μNOID
 
-最小货币单位。1 ELD 等于 1,000,000 μNOID。
+最小货币单位。1 JTM 等于 1,000,000 μNOID。
 
 <a id="state-growth-fee"></a>
 ### State 增长费（State-growth fee）

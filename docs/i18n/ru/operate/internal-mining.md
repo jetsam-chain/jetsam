@@ -8,13 +8,13 @@ nonce и отправку блока в одном процессе Core.
 Запустите проверку совместимости оборудования:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 Получите адрес выплаты из кошелька ноды:
 
 ```sh
-elide
+jetsam
 jetsam-cli address --list
 jetsam-cli stop
 ```
@@ -27,14 +27,14 @@ jetsam-cli stop
 В текущем терминале:
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 Либо обновите файл службы systemd:
 
 ```ini
-ExecStart=/usr/local/bin/elide \
-  --config /etc/elide/elide.toml \
+ExecStart=/usr/local/bin/jetsam \
+  --config /etc/jetsam/jetsam.toml \
   --mode miner \
   --cpu-threads 12
 ```
@@ -43,7 +43,7 @@ ExecStart=/usr/local/bin/elide \
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart elide
+sudo systemctl restart jetsam
 ```
 
 ## Готовность
@@ -83,7 +83,7 @@ P2P-сервису. Выделенный майнер может использ�
 Для постоянной отдельной выплаты процесса:
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 Используйте полный адрес bech32m.
@@ -97,7 +97,7 @@ jetsam-cli stop
 ```
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Корректное завершение отменяет майнинг, закрывает сеть и сбрасывает MDBX на

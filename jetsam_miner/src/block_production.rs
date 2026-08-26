@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn production_boundary_uses_parent_anchor_before_advancing_child_anchor() {
-        // ELIDE CHANGE: the epoch boundary is derived from TX_EPOCH_BLOCKS
+        // JETSAM CHANGE: the epoch boundary is derived from TX_EPOCH_BLOCKS
         // rather than the literal 144.
         let epoch = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
         let genesis = jetsam_chain::consensus::genesis_header();

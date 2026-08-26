@@ -3,7 +3,7 @@
 По умолчанию Core читает конфигурацию TOML из файла:
 
 ```text
-~/.elide/elide.toml
+~/.jetsam/jetsam.toml
 ```
 
 Другой файл можно указать через `--config`. Отсутствующий файл создаётся
@@ -19,7 +19,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "~/.elide/data"
+path = "~/.jetsam/data"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -84,9 +84,9 @@ TLS-прокси.
 Режим процесса задаётся явно:
 
 ```sh
-elide --mode node
-elide --mode miner
-elide --mode extminer --mining-key TOKEN
+jetsam --mode node
+jetsam --mode miner
+jetsam --mode extminer --mining-key TOKEN
 ```
 
 Устаревшее поле `mining.enabled` не переопределяет `--mode`. Пустой
@@ -111,7 +111,7 @@ elide --mode extminer --mining-key TOKEN
 базы:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 Успешный отчёт заканчивается строкой `NODE READY`.

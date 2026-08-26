@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Wire message types for the Elide P2P protocol.
+//! Wire message types for the Jetsam P2P protocol.
 //!
 //! Block propagation is header-first. Gossip carries one fixed header
 //! announcement; bodies and recursive terminals move only through the exact
@@ -759,8 +759,8 @@ pub struct GetMempoolResponse {
 pub struct Topics;
 
 impl Topics {
-    pub const BLOCKS: &'static str = "/elide/devnet/blocks/1";
-    pub const TXS: &'static str = "/elide/devnet/txs/1";
+    pub const BLOCKS: &'static str = "/jetsam/devnet/blocks/1";
+    pub const TXS: &'static str = "/jetsam/devnet/txs/1";
 }
 
 #[derive(Debug, Clone)]

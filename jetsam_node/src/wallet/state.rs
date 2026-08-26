@@ -123,7 +123,7 @@ pub struct WalletState {
     pub active_snapshot: Option<ActiveWalletSnapshot>,
     /// Transaction history (most recent last).
     pub history: Vec<TxHistoryEntry>,
-    /// Cached different-address receipts: txid → serialized ElideReceipt.
+    /// Cached different-address receipts: txid → serialized JetsamReceipt.
     /// Same-owner consolidations are omitted.
     pub receipts: HashMap<[u8; 32], Vec<u8>>,
     /// A failed durable write is retried by the next accepted block.

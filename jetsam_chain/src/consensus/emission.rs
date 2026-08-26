@@ -4,29 +4,29 @@
 
 //! Block reward schedule.
 //!
-//! ELIDE CHANGE — the reward halves by BLOCK HEIGHT, under a hard cap.
+//! JETSAM CHANGE — the reward halves by BLOCK HEIGHT, under a hard cap.
 //!
 //! Upstream halved once per state expansion (`log_slots += 1` at ~75% capacity)
-//! and floored the reward at 1 ELD forever. Two properties of that model made
+//! and floored the reward at 1 JTM forever. Two properties of that model made
 //! a maximum supply impossible:
 //!
 //!   * the trigger is occupancy, not time — a chain that never reaches ~12.6M
 //!     occupied slots never halves at all, so emission stays at 50/block;
 //!   * the floor is perpetual, so the chain issues ~2.1M coins a year forever.
 //!
-//! Elide replaces both: halvings occur at fixed heights, and emission reaches
+//! Jetsam replaces both: halvings occur at fixed heights, and emission reaches
 //! exactly zero at the seventh.
 //!
 //! ```text
 //! height range                halvings | reward
 //! ----------------------------|--------|---------------
-//!         0 →      28 800     |    0   | 50.000000 ELD
-//!    28 800 →     172 800     |    1   | 25.000000 ELD
-//!   172 800 →     831 800     |    2   | 12.500000 ELD
-//!   831 800 →   1 490 800     |    3   |  6.250000 ELD
-//! 1 490 800 →   2 149 800     |    4   |  3.125000 ELD
-//! 2 149 800 →   2 808 800     |    5   |  1.562500 ELD
-//! 2 808 800 →   3 467 664     |    6   |  0.781250 ELD
+//!         0 →      28 800     |    0   | 50.000000 JTM
+//!    28 800 →     172 800     |    1   | 25.000000 JTM
+//!   172 800 →     831 800     |    2   | 12.500000 JTM
+//!   831 800 →   1 490 800     |    3   |  6.250000 JTM
+//! 1 490 800 →   2 149 800     |    4   |  3.125000 JTM
+//! 2 149 800 →   2 808 800     |    5   |  1.562500 JTM
+//! 2 808 800 →   3 467 664     |    6   |  0.781250 JTM
 //! 3 467 664 →       ...       |    7   |  0
 //! ```
 //!
@@ -79,7 +79,7 @@ pub const fn halvings_at(height: u64) -> u32 {
 ///
 /// ```
 /// use jetsam_chain::consensus::emission::block_reward;
-/// assert_eq!(block_reward(0), 50_000_000);          // 50 ELD
+/// assert_eq!(block_reward(0), 50_000_000);          // 50 JTM
 /// assert_eq!(block_reward(28_800), 25_000_000);     // first halving
 /// assert_eq!(block_reward(172_800), 12_500_000);    // second halving
 /// assert_eq!(block_reward(3_467_663), 781_250);     // last paying height
@@ -113,7 +113,7 @@ pub fn total_fees(txs: &[TxBody]) -> u128 {
 /// Only miner-claimable fees are included. The deterministic state-growth
 /// component is burned and can never be recovered through coinbase.
 ///
-/// ELIDE CHANGE: `child_log_slots` was dropped — the subsidy is now a function
+/// JETSAM CHANGE: `child_log_slots` was dropped — the subsidy is now a function
 /// of height. `parent_log_slots` stays: it still prices the state-growth burn.
 pub fn max_coinbase_value(
     child_height: u64,
@@ -154,7 +154,7 @@ pub fn max_coinbase_value_from_claimable_fee_sum(
 pub fn format_eld(micro_jtm: u64) -> String {
     let whole = micro_jtm / MICRO_PER_JTM;
     let frac = micro_jtm % MICRO_PER_JTM;
-    format!("{}.{:06} ELD", whole, frac)
+    format!("{}.{:06} JTM", whole, frac)
 }
 
 #[cfg(test)]
@@ -229,7 +229,7 @@ mod tests {
 
     /// THE cap test: sum `block_reward` alone, block by block over every
     /// coinbase-carrying height (h ≥ 1; genesis has no coinbase), and assert
-    /// the chain issues exactly 21 000 000 ELD — no cumulative counter, no
+    /// the chain issues exactly 21 000 000 JTM — no cumulative counter, no
     /// separate capping function.
     #[test]
     fn total_emission_is_exactly_the_cap() {
@@ -251,7 +251,7 @@ mod tests {
 
     /// The naive schedule (final boundary at `H2 + 5×INTERVAL`) overshoots the
     /// cap, which is why `EMISSION_END_HEIGHT` must trim the final tier: the
-    /// trimmed tail is exactly the overshoot, a whole number of 0.78125-ELD
+    /// trimmed tail is exactly the overshoot, a whole number of 0.78125-JTM
     /// blocks.
     #[test]
     fn emission_end_height_trims_exactly_the_naive_overshoot() {

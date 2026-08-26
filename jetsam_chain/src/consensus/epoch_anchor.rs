@@ -121,7 +121,7 @@ pub fn resolve_user_epoch_anchor_id(
 mod tests {
     use super::*;
 
-    /// ELIDE CHANGE: heights derived from `TX_EPOCH_BLOCKS` instead of the
+    /// JETSAM CHANGE: heights derived from `TX_EPOCH_BLOCKS` instead of the
     /// literals 143/144/287/288, which pinned the epoch length at 144.
     #[test]
     fn checked_height_decomposition_marks_exact_boundaries() {
@@ -149,7 +149,7 @@ mod tests {
         }
     }
 
-    /// ELIDE CHANGE: derived from `TX_EPOCH_BLOCKS` instead of literal 144s.
+    /// JETSAM CHANGE: derived from `TX_EPOCH_BLOCKS` instead of literal 144s.
     #[test]
     fn boundary_block_consumes_old_anchor_then_advances() {
         let e = TX_EPOCH_BLOCKS;

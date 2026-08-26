@@ -42,7 +42,7 @@ pub const POW_HEADER_FIELD_COUNT: usize = 16;
 
 /// Index of the nonce field in the fixed PoW field schedule.
 ///
-/// ELIDE CHANGE: 0, was 10 upstream.
+/// JETSAM CHANGE: 0, was 10 upstream.
 ///
 /// A Poseidon2b sponge absorbs two fields per permutation, so with the nonce at
 /// lane 10 of 16 the first five permutations cover only template-fixed fields
@@ -86,7 +86,7 @@ pub fn block_id(h: &BlockHeader) -> BlockHash {
 }
 
 /// Fill the fixed Poseidon2b PoW field schedule for a header.
-/// ELIDE CHANGE: the nonce is emitted FIRST, so it lands in the first absorbed
+/// JETSAM CHANGE: the nonce is emitted FIRST, so it lands in the first absorbed
 /// pair and no midstate can be precomputed across attempts. `block_header::
 /// hash_block_header` MUST absorb in exactly this order — nothing links the two
 /// at compile time, and a divergence would not fail to build, it would make
@@ -236,7 +236,7 @@ mod tests {
 
         let fields = pow_header_fields(&h);
         assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
-        // ELIDE CHANGE: the nonce leads the schedule so no midstate is possible.
+        // JETSAM CHANGE: the nonce leads the schedule so no midstate is possible.
         assert_eq!(POW_NONCE_FIELD_INDEX, 0);
         assert_eq!(fields[0], Block128::from(h.nonce));
         assert_eq!(fields[1], digest_half(&h.prev_block_hash, 0));
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(fields[15], Block128::from(h.alloc_counter as u128));
     }
 
-    /// ELIDE — the guard against a SILENT divergence.
+    /// JETSAM — the guard against a SILENT divergence.
     ///
     /// `pow_header_fields_into` and `block_header::hash_block_header` must
     /// absorb the same fields in the same order: the recursive parent-seal

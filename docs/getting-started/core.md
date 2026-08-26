@@ -2,7 +2,7 @@
 
 The Core archive is for node operators, miners and developers. It contains:
 
-- `elide`, the full node and built-in miner;
+- `jetsam`, the full node and built-in miner;
 - `jetsam-cli`, the local node and wallet client;
 - `jetsam-miner`, the external PoW worker.
 
@@ -28,13 +28,13 @@ extracting it.
 On Linux or macOS:
 
 ```sh
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 On Windows PowerShell:
 
 ```powershell
-.\elide.exe --check-hardware
+.\jetsam.exe --check-hardware
 ```
 
 The final line must be:
@@ -55,14 +55,14 @@ For virtual-machine caveats, memory and disk planning, see
 Run Core in the foreground:
 
 ```sh
-./elide
+./jetsam
 ```
 
 On first start it creates:
 
 ```text
-~/.elide/elide.toml
-~/.elide/data/
+~/.jetsam/jetsam.toml
+~/.jetsam/data/
 ```
 
 In another terminal:

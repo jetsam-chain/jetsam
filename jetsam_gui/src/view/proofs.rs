@@ -459,7 +459,7 @@ fn authenticated_payment<'a>(
             .spacing(7),
             row![
                 metric(
-                    "FEE / ELD",
+                    "FEE / JTM",
                     format_micro_jtm(summary.fee_micro_jtm),
                     theme::WARNING,
                 ),
@@ -486,7 +486,7 @@ fn authenticated_payment<'a>(
                 theme::PROOF,
             ),
             metric(
-                "FEE / ELD",
+                "FEE / JTM",
                 format_micro_jtm(summary.fee_micro_jtm),
                 theme::WARNING,
             ),

@@ -327,7 +327,7 @@ impl TemplateBuilder {
         // Compute the correct ASERT target for the new block.
         // MUST match what validate_header computes; wrong target = block rejected.
         //
-        // ELIDE CHANGE (vs upstream Parano1d): ASERT is fed `parent.timestamp`,
+        // JETSAM CHANGE (vs upstream Parano1d): ASERT is fed `parent.timestamp`,
         // not this block's `timestamp`. See the matching comment in
         // jetsam_chain::consensus::header::validate_header_inner. The two sites
         // MUST stay identical: a mismatch produces templates whose target the
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn template_separates_parent_and_child_anchors_at_transaction_epoch_boundary() {
-        // ELIDE CHANGE: derived from TX_EPOCH_BLOCKS instead of the literals
+        // JETSAM CHANGE: derived from TX_EPOCH_BLOCKS instead of the literals
         // 143/144/145/287/288, which pinned the epoch length at 144.
         let e = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
         for (parent_height, parent_terminal, child_transactions) in [

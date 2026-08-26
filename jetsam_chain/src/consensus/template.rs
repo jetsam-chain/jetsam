@@ -19,7 +19,7 @@
 //! Including `state_root` in the PoW hash prevents external miners from changing
 //! the coinbase address: a different coinbase → different post-state → different
 //! `state_root` → different Poseidon2b PoW input → must redo PoW from scratch.
-//! This is Elide's block-withholding protection.
+//! This is Jetsam's block-withholding protection.
 
 use std::collections::{BTreeSet, HashSet};
 

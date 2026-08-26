@@ -836,7 +836,7 @@ fn transaction_details<'a>(
     let flow = if transaction.development_payout {
         column![
             text("REWARD SHARE").size(12).color(theme::DIM),
-            text("Block-reward shares paid to the Elide Network Fund and Lab Fund. This protocol payout has no spend inputs.")
+            text("Block-reward shares paid to the Jetsam Network Fund and Lab Fund. This protocol payout has no spend inputs.")
                 .size(13)
                 .color(theme::PROOF),
         ]
@@ -976,7 +976,7 @@ fn transaction_inputs(
             table_cell("REF".into(), 2, theme::INK),
             table_cell("SLOT".into(), 3, theme::INK),
             table_cell("ORIGIN".into(), 4, theme::INK),
-            table_cell("AMOUNT / ELD".into(), 5, theme::INK),
+            table_cell("AMOUNT / JTM".into(), 5, theme::INK),
         ]
         .spacing(6),
     )

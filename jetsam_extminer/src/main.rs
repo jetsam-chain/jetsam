@@ -2,9 +2,9 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # jetsam-miner — External Poseidon2b PoW miner for Elide.
+//! # jetsam-miner — External Poseidon2b PoW miner for Jetsam.
 //!
-//! Connects to any `elide` full node via JSON-RPC, fetches a block template,
+//! Connects to any `jetsam` full node via JSON-RPC, fetches a block template,
 //! searches for a valid PoW nonce using all available CPU cores (rayon), and
 //! returns only that nonce to the node-owned template.
 //!
@@ -54,8 +54,8 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "jetsam-miner",
     version,
-    about = "External Poseidon2b PoW miner for Elide",
-    long_about = "Fetches block templates from an Elide node and mines blocks \
+    about = "External Poseidon2b PoW miner for Jetsam",
+    long_about = "Fetches block templates from an Jetsam node and mines blocks \
                   using all available CPU cores.\n\n\
                   The node builds the proven template; this worker only does PoW.\n\
                   Coinbase is the node payout address unless the node enables \
@@ -66,7 +66,7 @@ struct Cli {
     #[arg(long, exclusive = true)]
     check_hardware: bool,
 
-    /// JSON-RPC endpoint of the Elide node or pool.
+    /// JSON-RPC endpoint of the Jetsam node or pool.
     #[arg(long, default_value = "http://127.0.0.1:9701", value_name = "URL")]
     rpc: String,
 
@@ -199,7 +199,7 @@ impl RpcClient {
 const CHUNK_SIZE: u128 = 10_000_000;
 const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
-// ELIDE CHANGE: 0, was 10. This constant is DUPLICATED from
+// JETSAM CHANGE: 0, was 10. This constant is DUPLICATED from
 // jetsam_chain::consensus::pow so the external miner stays dependency-free;
 // the two must move together. The runtime check below is the safety net.
 const POW_NONCE_FIELD_INDEX: usize = 0;

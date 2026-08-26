@@ -18,8 +18,8 @@ jetsam-cli mining
 With systemd:
 
 ```sh
-systemctl status elide
-journalctl -u elide --since today
+systemctl status jetsam
+journalctl -u jetsam --since today
 ```
 
 Monitor disk space for the live MDBX State and proof cache, not an assumed
@@ -30,7 +30,7 @@ fixed allocation. State storage follows current UTXO usage.
 Always stop the process before copying its database or replacing binaries:
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Wait for the service to become inactive. Do not copy a live MDBX directory
@@ -61,7 +61,7 @@ authority.
 1. download the new archive and matching `SHA256SUMS`;
 2. verify its digest;
 3. stop the service;
-4. replace `elide`, `jetsam-cli` and `jetsam-miner` together;
+4. replace `jetsam`, `jetsam-cli` and `jetsam-miner` together;
 5. start the service;
 6. inspect startup and synchronization.
 
@@ -72,7 +72,7 @@ Do not delete the data directory during a normal update.
 If State corruption is suspected and a healthy peer network is available:
 
 ```sh
-elide --purge-state
+jetsam --purge-state
 ```
 
 This clears the complete chain database, including headers, retained blocks,

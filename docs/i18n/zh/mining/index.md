@@ -83,20 +83,20 @@ Nonce 搜索可以在该进程内部运行，也可以交给 `jetsam-miner`。�
 创建节点数据前，先检查实际主机：
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 以内置矿工模式启动 Core：
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 省略 `--cpu-threads` 时，使用进程可见的全部逻辑 CPU。未配置奖励地址时，
 Core 使用本地钱包活动地址。也可固定一个独立的规范 bech32m 地址：
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 在另一个终端观察就绪状态和链进度：
@@ -116,7 +116,7 @@ jetsam-cli mining
 启动负责持有并证明外部挖矿模板的节点：
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key '<long-random-token>'
 ```

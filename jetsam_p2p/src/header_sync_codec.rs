@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
-// ELIDE: the leading byte E replaces the upstream magic's initial, so no
+// JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JHQ5";
 const LEGACY_REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
@@ -432,11 +432,11 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/headers/5")
+        StreamProtocol::new("/jetsam/test/sync/headers/5")
     }
 
     fn legacy_protocol() -> StreamProtocol {
-        StreamProtocol::new("/elide/test/sync/headers/4")
+        StreamProtocol::new("/jetsam/test/sync/headers/4")
     }
 
     fn response_header(count: u16, compressed_len: usize) -> Vec<u8> {

@@ -61,7 +61,7 @@ pub fn genesis_state_root() -> [u8; 32] {
 }
 
 /// Pre-computed genesis state root. All 2^24 slots are zero.
-// ELIDE CHANGE: recomputed. The TowerHash round constants and domain tags
+// JETSAM CHANGE: recomputed. The TowerHash round constants and domain tags
 // changed, so every hash in the chain changed with them.
 const GENESIS_STATE_ROOT: [u8; 32] = [
     0x02, 0x19, 0xf9, 0xd6, 0x5c, 0x10, 0x64, 0xbf, 0xa4, 0x78, 0x36, 0x2e, 0x7b, 0x6f, 0xcd, 0xce,
@@ -71,7 +71,7 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
 /// Mined for the canonical 16-field PoW schedule.
-// ELIDE CHANGE: re-mined against the new TowerHash schedule.
+// JETSAM CHANGE: re-mined against the new TowerHash schedule.
 const GENESIS_NONCE: u128 = 131_160;
 
 /// Find and return a valid genesis nonce at runtime.

@@ -30,7 +30,7 @@ choosing disk and memory limits.
 ## Install the Core release
 
 Download the archive for the server architecture and `SHA256SUMS` from the
-[release page](https://github.com/ignotusnemo/elide/releases). Verify the
+[release page](https://github.com/ignotusnemo/jetsam/releases). Verify the
 archive before extracting it. Replace `VERSION` with the release number:
 
 ```sh
@@ -45,7 +45,7 @@ Extract the archive and run the hardware check:
 
 ```sh
 tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 A supported machine ends with:
@@ -57,7 +57,7 @@ NODE READY
 Install the node and CLI:
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
 ```
 
 ## Create the service account
@@ -65,13 +65,13 @@ sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 Keep node data separate from interactive user accounts:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/elide \
-  --create-home --shell /usr/sbin/nologin elide
-sudo install -d -o elide -g elide -m 0700 /var/lib/elide
-sudo install -d -o root -g elide -m 0750 /etc/elide
+sudo useradd --system --home-dir /var/lib/jetsam \
+  --create-home --shell /usr/sbin/nologin jetsam
+sudo install -d -o jetsam -g jetsam -m 0700 /var/lib/jetsam
+sudo install -d -o root -g jetsam -m 0750 /etc/jetsam
 ```
 
-Create `/etc/elide/elide.toml`:
+Create `/etc/jetsam/jetsam.toml`:
 
 ```toml
 [network]
@@ -80,7 +80,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "/var/lib/elide"
+path = "/var/lib/jetsam"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -93,8 +93,8 @@ miner_address = ""
 Protect the configuration:
 
 ```sh
-sudo chown root:elide /etc/elide/elide.toml
-sudo chmod 0640 /etc/elide/elide.toml
+sudo chown root:jetsam /etc/jetsam/jetsam.toml
+sudo chmod 0640 /etc/jetsam/jetsam.toml
 ```
 
 No seed address is required. The released binary discovers the public network
@@ -102,7 +102,7 @@ through its built-in DNS seeds and remembers successful outbound peers.
 
 ## Run under systemd
 
-Create `/etc/systemd/system/elide.service`:
+Create `/etc/systemd/system/jetsam.service`:
 
 ```ini
 [Unit]
@@ -112,9 +112,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=elide
-Group=elide
-ExecStart=/usr/local/bin/elide --config /etc/elide/elide.toml
+User=jetsam
+Group=jetsam
+ExecStart=/usr/local/bin/jetsam --config /etc/jetsam/jetsam.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
@@ -132,14 +132,14 @@ Load the unit and start the node:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now elide
-sudo systemctl status elide
+sudo systemctl enable --now jetsam
+sudo systemctl status jetsam
 ```
 
 Follow startup and synchronization:
 
 ```sh
-sudo journalctl -u elide -f
+sudo journalctl -u jetsam -f
 ```
 
 ## Check the node
@@ -170,17 +170,17 @@ tunnel or another authenticated private transport.
 Stop the service before replacing binaries or copying its data:
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Install the verified replacement binaries, then restart:
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
-sudo systemctl start elide
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
+sudo systemctl start jetsam
 jetsam-cli status
 ```
 
-Do not remove `/var/lib/elide` during an ordinary software update. If the
-node's wallet receives funds, back up `/var/lib/elide/wallet.key`
+Do not remove `/var/lib/jetsam` during an ordinary software update. If the
+node's wallet receives funds, back up `/var/lib/jetsam/wallet.key`
 separately and protect it as a private secret.

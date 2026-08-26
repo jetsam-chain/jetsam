@@ -51,13 +51,13 @@
 Linux 和 macOS 的默认数据目录为：
 
 ```text
-~/.elide/data
+~/.jetsam/data
 ```
 
-Windows 使用用户配置文件下对应的 `.elide\data` 目录。
+Windows 使用用户配置文件下对应的 `.jetsam\data` 目录。
 
 主密钥保存在 `wallet.key`，收据保存在 `wallet.receipts`，界面偏好位于
-`~/.elide/gui-settings.json`。
+`~/.jetsam/gui-settings.json`。
 
 主密钥文件没有密码加密。请保护操作系统账户，并在收款前备份密钥。
 

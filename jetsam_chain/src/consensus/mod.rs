@@ -4,7 +4,7 @@
 
 //! Consensus logic — pure, I/O-free validation functions.
 //!
-//! This module contains every consensus rule for Elide. All functions
+//! This module contains every consensus rule for Jetsam. All functions
 //! are deterministic and produce identical results on any architecture.
 //! No networking, no disk I/O, no mutable global state.
 //!
@@ -16,7 +16,7 @@
 //! - [`difficulty`]     — ASERT difficulty adjustment (no floats).
 //! - [`pow`]            — Poseidon2b PoW over semantic header fields.
 //! - [`timestamps`]     — Median-time-past and future-drift rules.
-//! - [`receipt`]        — ElideReceipt generation and verification.
+//! - [`receipt`]        — JetsamReceipt generation and verification.
 //! - [`header`]         — Per-block header validation rules.
 //! - [`checks`]         — Slot-conflict and tx-consensus validation.
 //! - [`allocator`]      — Slot hint generation (splitmix64, zone-based).
@@ -104,7 +104,7 @@ pub use pow::{
     block_id, poseidon_pow_digest, pow_header_fields, search_pow, validate_pow, BlockHash,
 };
 pub use receipt::{
-    generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ElideReceipt,
+    generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, JetsamReceipt,
     ReceiptVerifyResult, TxSummary,
 };
 pub use reorg::ReorgResult;

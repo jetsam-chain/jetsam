@@ -4,9 +4,9 @@
 
 //! Deterministic launch-period development allocation.
 //!
-//! ELIDE CHANGE: two target-time years, not three, and the recipients are this
+//! JETSAM CHANGE: two target-time years, not three, and the recipients are this
 //! chain's own funds — upstream's were inherited by the fork and would have
-//! sent 10% of Elide's emission to Parano1d's developers.
+//! sent 10% of Jetsam's emission to Parano1d's developers.
 //!
 //! For the first two target-time years after genesis, miners receive 90% of
 //! each block subsidy. The network fund and the lab fund each receive one
@@ -15,7 +15,7 @@
 //! smaller than 5%; the difference is never issued. Fees remain entirely
 //! miner-claimable after the existing state-growth burn.
 //!
-//! Over the whole window the two funds receive 1 163 996 ELD, which is 5.54% of
+//! Over the whole window the two funds receive 1 163 996 JTM, which is 5.54% of
 //! the 21 000 000 maximum supply. There is no premine.
 
 use jetsam_poseidon2b::primitives::Address;
@@ -31,12 +31,12 @@ const _: () = assert!(
     "BLOCK_TIME must divide one day exactly"
 );
 
-/// ELIDE CHANGE: TWO 365-day target-time years, down from upstream's three.
+/// JETSAM CHANGE: TWO 365-day target-time years, down from upstream's three.
 /// Excludes built-in genesis height zero.
 ///
 /// At BLOCK_TIME = 90 s this is 960 × 365 × 2 = 700 800 blocks. Over that
-/// window the chain issues 11 640 000 ELD, so the two funds together receive
-/// 1 164 000 ELD — 5.54% of the 21M maximum supply.
+/// window the chain issues 11 640 000 JTM, so the two funds together receive
+/// 1 164 000 JTM — 5.54% of the 21M maximum supply.
 pub const DEVELOPMENT_ALLOCATION_END_HEIGHT: u64 = TARGET_BLOCKS_PER_DAY * 365 * 2;
 
 // `development_share_each` divides the subsidy by twenty and refuses an inexact
@@ -60,7 +60,7 @@ pub const DEVELOPMENT_SHARE_DENOMINATOR: u64 = 20;
 
 /// Network fund recipient.
 ///
-/// ELIDE CHANGE: replaces the upstream Parano1d fund address. Derived from a
+/// JETSAM CHANGE: replaces the upstream Parano1d fund address. Derived from a
 /// 32-byte secret generated with OS entropy and held by this chain's operator;
 /// see `jetsam_poseidon2b/tests/derive_fund_address.rs` for the derivation, which
 /// is reproducible from the secret alone.
@@ -73,7 +73,7 @@ pub const NETWORK_FUND_ADDRESS: Address = Address([
 
 /// Lab fund recipient.
 ///
-/// ELIDE CHANGE: replaces the upstream Parano1d lab address. Same derivation
+/// JETSAM CHANGE: replaces the upstream Parano1d lab address. Same derivation
 /// path as [`NETWORK_FUND_ADDRESS`], from a distinct secret.
 ///
 /// bech32: j1eawk89x66rgp342aq2f9asrkdllfvasskkcd7wpk6r08ea07warqn6mgws
@@ -130,7 +130,7 @@ pub fn development_share_each(subsidy: u64) -> Result<u64, DevelopmentAllocation
 
 /// Subsidy component available to the primary coinbase at `height`.
 ///
-/// ELIDE CHANGE: takes only the height. The reward no longer depends on state
+/// JETSAM CHANGE: takes only the height. The reward no longer depends on state
 /// depth, so `log_slots` was dropped rather than left as a dead parameter.
 #[inline]
 pub fn miner_subsidy(height: u64) -> u64 {
@@ -191,7 +191,7 @@ mod tests {
     use crate::consensus::params::{H1_HEIGHT, MICRO_PER_JTM};
 
     /// Upstream Parano1d fund addresses, recorded here so the guard below can
-    /// recognise them. These bytes must NOT appear in a launched Elide chain.
+    /// recognise them. These bytes must NOT appear in a launched Jetsam chain.
     const UPSTREAM_O1_NETWORK_FUND: [u8; 32] = [
         0x1c, 0x5b, 0x23, 0x74, 0x54, 0xad, 0xab, 0xeb, 0x0e, 0x95, 0x37, 0xb5, 0x87, 0x02, 0xd7,
         0xfe, 0x8c, 0x0e, 0x63, 0x30, 0xc3, 0x0b, 0x58, 0xee, 0x9b, 0x3f, 0x19, 0x8a, 0x3b, 0x46,
@@ -205,7 +205,7 @@ mod tests {
 
     /// Addresses must round-trip through the chain's own bech32m HRP.
     ///
-    /// ELIDE CHANGE: upstream asserted two hardcoded `o1…` literals, which
+    /// JETSAM CHANGE: upstream asserted two hardcoded `o1…` literals, which
     /// silently coupled this test to the address prefix. Deriving the expected
     /// value from the constant itself tests canonicality without re-encoding
     /// the HRP into the test.
@@ -258,10 +258,10 @@ mod tests {
         assert!(!development_allocation_active(
             DEVELOPMENT_ALLOCATION_END_HEIGHT + 1
         ));
-        assert_eq!(DEVELOPMENT_ALLOCATION_PAYOUTS, 730); // ELIDE: 2 years, was 3
+        assert_eq!(DEVELOPMENT_ALLOCATION_PAYOUTS, 730); // JETSAM: 2 years, was 3
     }
 
-    /// ELIDE CHANGE: iterates over HEIGHTS, not state depths. The reward tier
+    /// JETSAM CHANGE: iterates over HEIGHTS, not state depths. The reward tier
     /// is a function of height now, so walking `log_slots` would no longer
     /// exercise a single one of the tiers.
     #[test]
@@ -305,7 +305,7 @@ mod tests {
         heights
     }
 
-    /// ELIDE CHANGE: replaces upstream's `expansion_day_conservatively_uses_the
+    /// JETSAM CHANGE: replaces upstream's `expansion_day_conservatively_uses_the
     /// _lower_reward`. Expansion no longer moves the reward — a halving does.
     #[test]
     fn a_halving_lowers_the_payout_from_that_height_on() {

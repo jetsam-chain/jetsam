@@ -5,7 +5,7 @@
 //! Native GUI boundary around the production node.
 //!
 //! The GUI never implements consensus, wallet proving, mining, or networking.
-//! It supervises the `elide` daemon and talks to its loopback JSON-RPC
+//! It supervises the `jetsam` daemon and talks to its loopback JSON-RPC
 //! endpoint. This keeps one production path for both headless and graphical
 //! users while still allowing the GUI to own the daemon lifecycle.
 
@@ -1114,7 +1114,7 @@ impl Backend {
             if !validated.valid {
                 return Err(validated
                     .error
-                    .unwrap_or_else(|| "Invalid Elide address.".into()));
+                    .unwrap_or_else(|| "Invalid Jetsam address.".into()));
             }
             let address = validated
                 .bech32
@@ -1628,7 +1628,7 @@ fn ensure_node_hardware(node_binary: &Path) -> Result<(), String> {
         .join("\n");
     if detail.is_empty() {
         Err(format!(
-            "this computer does not satisfy the Elide production CPU requirements ({})",
+            "this computer does not satisfy the Jetsam production CPU requirements ({})",
             output.status
         ))
     } else {
@@ -3290,7 +3290,7 @@ mod tests {
     fn legacy_gui_settings_require_a_one_time_language_choice() {
         let decoded: PersistedGuiSettings = serde_json::from_str(
             r#"{
-                "data_dir": "/tmp/elide",
+                "data_dir": "/tmp/jetsam",
                 "p2p_listen": "127.0.0.1:9500",
                 "seeds": [],
                 "log_level": "info"

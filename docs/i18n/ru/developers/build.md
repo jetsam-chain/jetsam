@@ -58,7 +58,7 @@ cargo build --locked \
 ## Воспроизведение сертификата безопасности
 
 Штатные расчёты и доказательства находятся в
-[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness).
 
 ```sh
 cargo run --release --locked -p jetsam_soundness
@@ -140,7 +140,7 @@ cat target/release-builds/LAST_RELEASE
 README.txt
 LICENSE
 NOTICE
-elide
+jetsam
 jetsam-cli
 jetsam-miner
 ```

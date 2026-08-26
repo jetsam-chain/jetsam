@@ -16,13 +16,13 @@ use super::{
 };
 
 const HEIGHT_BITS: usize = 64;
-/// ELIDE CHANGE: 55, was 52. `TARGET_BLOCKS_PER_DAY` fell from 4320 to 960, so
+/// JETSAM CHANGE: 55, was 52. `TARGET_BLOCKS_PER_DAY` fell from 4320 to 960, so
 /// the quotient of a u64 height by it needs three more bits. 55 + 9 = 64
 /// exactly fills `HEIGHT_BITS` under the largest shift used below.
 const PAYOUT_QUOTIENT_BITS: usize = 55;
-/// ELIDE CHANGE: 10, was 13 — enough for `TARGET_BLOCKS_PER_DAY` = 960.
+/// JETSAM CHANGE: 10, was 13 — enough for `TARGET_BLOCKS_PER_DAY` = 960.
 const PAYOUT_REMAINDER_BITS: usize = 10;
-/// ELIDE CHANGE: 960 = 512 + 256 + 128 + 64, was 4320 = 4096 + 128 + 64 + 32.
+/// JETSAM CHANGE: 960 = 512 + 256 + 128 + 64, was 4320 = 4096 + 128 + 64 + 32.
 /// Still exactly four set bits, so the shift-and-add recomposition below keeps
 /// the same shape — only the shift amounts move.
 const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 9) + (1 << 8) + (1 << 7) + (1 << 6));
@@ -35,7 +35,7 @@ pub struct DevelopmentAllocationTrace {
     pub share_each: LinExpr,
     pub miner_subsidy: LinExpr,
     pub payout_each: LinExpr,
-    /// ELIDE: one-hot over the eight emission tiers, derived from the height.
+    /// JETSAM: one-hot over the eight emission tiers, derived from the height.
     ///
     /// Exposed so the fee-arithmetic trace can reuse the very same selectors
     /// instead of recomputing seven boundary comparisons. Sharing them is both
@@ -78,7 +78,7 @@ fn constant_bits(value: u64, width: usize) -> Vec<LinExpr> {
 
 /// The seven halving boundaries, in strictly increasing order.
 ///
-/// ELIDE: the emission schedule is a function of height, so the circuit must
+/// JETSAM: the emission schedule is a function of height, so the circuit must
 /// locate the height among these boundaries instead of reading a table indexed
 /// by state depth.
 fn halving_boundaries() -> Vec<u64> {
@@ -194,7 +194,7 @@ fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u6
     let divisor_bits = range_check_bits(b, &divisor, PAYOUT_REMAINDER_BITS);
     pin_lt_strict(b, &remainder_bits, &divisor_bits);
 
-    // ELIDE CHANGE: shifts follow the set bits of TARGET_BLOCKS_PER_DAY.
+    // JETSAM CHANGE: shifts follow the set bits of TARGET_BLOCKS_PER_DAY.
     // 960 = (1<<9) + (1<<8) + (1<<7) + (1<<6); upstream's 4320 was
     // (1<<12) + (1<<7) + (1<<6) + (1<<5). Same four-term shape.
     let terms = [
@@ -221,7 +221,7 @@ fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u6
 pub fn bind_development_allocation(
     b: &mut FieldR1csBuilder,
     child_height: &LinExpr,
-    // ELIDE CHANGE: the state depth is no longer an input — the emission
+    // JETSAM CHANGE: the state depth is no longer an input — the emission
     // schedule is a function of height alone.
     payout_raw_amount: &LinExpr,
 ) -> DevelopmentAllocationTrace {
@@ -251,7 +251,7 @@ pub fn bind_development_allocation(
     let interval_boundary = payout_boundary(b, child_height, native_height);
     let payout_due = mul(b, &active, &interval_boundary);
 
-    // ELIDE CHANGE: the reward tables are indexed by EMISSION TIER, selected
+    // JETSAM CHANGE: the reward tables are indexed by EMISSION TIER, selected
     // from the height, instead of by state depth. Upstream could one-hot the
     // depth because its domain is nine values; a height has 2^64, so the tier
     // is located by seven comparisons against the halving boundaries instead.

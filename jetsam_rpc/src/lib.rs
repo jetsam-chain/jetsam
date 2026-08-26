@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # jetsam_rpc — JSON-RPC Server for the Elide Full Node
+//! # jetsam_rpc — JSON-RPC Server for the Jetsam Full Node
 
 pub mod api;
 pub mod server;

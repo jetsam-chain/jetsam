@@ -94,13 +94,13 @@ block table.
 Check the actual host before creating node data:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 Start Core with its built-in miner:
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 Omit `--cpu-threads` to use every logical CPU visible to the process. When no
@@ -108,7 +108,7 @@ explicit payout is configured, Core uses the active address in its local
 wallet. A separate canonical bech32m payout can be fixed with:
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 Watch readiness and chain progress from another terminal:
@@ -128,7 +128,7 @@ procedure is in [Internal mining](../operate/internal-mining.md).
 Start a node that owns and proves external-mining templates:
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key '<long-random-token>'
 ```

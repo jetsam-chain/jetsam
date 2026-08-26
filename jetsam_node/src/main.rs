@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! # elide — Elide Full Node Binary
+//! # jetsam — Jetsam Full Node Binary
 //!
 //! Startup sequence:
 //! 1. Load config + init tracing
@@ -878,9 +878,9 @@ impl HistoryStepCacheClass {
 #[derive(Parser, Debug)]
 #[command(
     name = "jetsam",
-    about = "Elide full node daemon — proof-native HistoryStep UTXO network",
+    about = "Jetsam full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run an Elide node and wallet.\n\nExample:\n  elide --miner --data-dir ~/.jetsam/data\n  elide --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
+    long_about = "Run an Jetsam node and wallet.\n\nExample:\n  jetsam --miner --data-dir ~/.jetsam/data\n  jetsam --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -954,7 +954,7 @@ struct Cli {
     /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
     ///
     /// Pool example:
-    ///   elide --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
+    ///   jetsam --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
     ///   # External miner: Authorization: Bearer s3cr3t
     #[arg(long, value_name = "TOKEN")]
     mining_key: Option<String>,
@@ -969,7 +969,7 @@ struct Cli {
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   elide --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t --allow-custom-coinbase
+    ///   jetsam --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
@@ -1361,7 +1361,7 @@ fn reset_install_preferences_at_root(
     config_path: &Path,
     gui_supervised: bool,
 ) -> anyhow::Result<()> {
-    let default_config = root.join("elide.toml");
+    let default_config = root.join("jetsam.toml");
     if data_dir != root.join("data") && expand_tilde(config_path) != default_config {
         return Ok(());
     }
@@ -2194,7 +2194,7 @@ async fn main() -> anyhow::Result<()> {
             .store
             .encoded_state_bytes()
             .context("read encoded state size for startup banner")?;
-        // ELIDE CHANGE: the reward is a function of height, not state depth.
+        // JETSAM CHANGE: the reward is a function of height, not state depth.
         // Banner shows the reward of the next block to be mined.
         let reward = block_reward(tip_hdr.height.saturating_add(1)) as f64 / 1_000_000.0;
 
@@ -5044,30 +5044,30 @@ mod tests {
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(root.join("gui-settings.json"), b"legacy GUI settings").unwrap();
-        std::fs::write(root.join("elide.toml"), b"legacy Core settings").unwrap();
+        std::fs::write(root.join("jetsam.toml"), b"legacy Core settings").unwrap();
 
-        reset_install_preferences_at_root(&root, &data, &root.join("elide.toml"), false)
+        reset_install_preferences_at_root(&root, &data, &root.join("jetsam.toml"), false)
             .unwrap();
 
         assert!(!root.join("gui-settings.json").exists());
-        assert!(!root.join("elide.toml").exists());
+        assert!(!root.join("jetsam.toml").exists());
         assert!(data.is_dir());
 
         std::fs::write(root.join("gui-settings.json"), b"new mainnet settings").unwrap();
-        std::fs::write(root.join("elide.toml"), b"legacy Core settings").unwrap();
+        std::fs::write(root.join("jetsam.toml"), b"legacy Core settings").unwrap();
         reset_install_preferences_at_root(&root, &data, &data.join("jetsam-gui.toml"), true)
             .unwrap();
         assert_eq!(
             std::fs::read(root.join("gui-settings.json")).unwrap(),
             b"new mainnet settings"
         );
-        assert!(!root.join("elide.toml").exists());
+        assert!(!root.join("jetsam.toml").exists());
     }
 
     #[test]
     fn mainnet_reset_replaces_selected_node_config_for_the_next_start() {
         let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("elide.toml");
+        let config_path = directory.path().join("jetsam.toml");
         std::fs::write(
             &config_path,
             "[network]\nlisten = \"0.0.0.0:9500\"\nseeds = []\n\
@@ -5772,7 +5772,7 @@ mod tests {
     #[test]
     fn first_start_creates_and_reuses_default_config() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("nested/elide.toml");
+        let path = temp.path().join("nested/jetsam.toml");
         let mut defaults = NodeConfig::default();
         defaults.network.listen = Some("0.0.0.0:9700".into());
         defaults.rpc.listen = Some("127.0.0.1:9701".into());
@@ -5792,7 +5792,7 @@ mod tests {
     #[test]
     fn malformed_config_is_reported_instead_of_silently_ignored() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("elide.toml");
+        let path = temp.path().join("jetsam.toml");
         std::fs::write(&path, "[network\n").unwrap();
 
         let error = load_or_create_config(&path, &NodeConfig::default()).unwrap_err();
@@ -6527,7 +6527,7 @@ mod tests {
         state: &jetsam_chain::ChainState,
     ) -> jetsam_chain::block::Block {
         let timestamp = parent.timestamp + jetsam_chain::consensus::params::BLOCK_TIME;
-        // ELIDE CHANGE: ASERT anchored on the parent's timestamp, never the
+        // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
         // block's own. Must mirror consensus::header::validate_header_inner.
         let difficulty_target = jetsam_chain::consensus::difficulty::next_target(
             0,
@@ -13804,7 +13804,7 @@ fn print_startup_banner(
         row(
             "mining",
             &format!(
-                "{reward:.2} ELD/block   coinbase  {cb}",
+                "{reward:.2} JTM/block   coinbase  {cb}",
                 reward = block_reward_eld
             ),
         );

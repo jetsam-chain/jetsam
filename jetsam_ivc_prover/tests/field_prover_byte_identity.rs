@@ -39,7 +39,7 @@ fn field_proof_byte_digest() {
     }
     let top = jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"BYTE-IDENTITY-TOP", &[&all]);
     // Re-pinned after the Jetsam rename moved the transcript byte-hash
-    // domain strings from the ELD/ prefix to JTM/ (ELD/IVC/FIELD-R1CS-STMT
+    // domain strings from the JTM/ prefix to JTM/ (JTM/IVC/FIELD-R1CS-STMT
     // and friends): those domains are absorbed into the Fiat-Shamir
     // transcript, so every proof byte moved with them. The previous pin
     // (07532347…) was taken after the TowerHash round-constant regeneration.

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Transaction builder for the Elide wallet.
+//! Transaction builder for the Jetsam wallet.
 //!
 //! This is the only place that assembles a complete [`PagedSpendIntent`] from UTXOs
 //! and one active-owner proving capability. The two-phase API separates

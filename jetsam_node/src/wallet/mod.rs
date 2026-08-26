@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Built-in wallet for the `elide` daemon.
+//! Built-in wallet for the `jetsam` daemon.
 //!
 //! The wallet lives inside the daemon process. The master secret is generated
 //! once and stored by the keystore; the active address's `SpendSecret` is
@@ -237,7 +237,7 @@ pub fn reconcile_receipts_at_startup(
 ) -> Result<(usize, usize), String> {
     use jetsam_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
     use jetsam_chain::consensus::receipt::{
-        verify_against_header, verify_merkle_inclusion, ElideReceipt,
+        verify_against_header, verify_merkle_inclusion, JetsamReceipt,
     };
 
     let mut removed = 0usize;
@@ -246,7 +246,7 @@ pub fn reconcile_receipts_at_startup(
         let receipt = wallet
             .receipts
             .get(&tx_hash)
-            .and_then(|bytes| ElideReceipt::from_bytes(bytes).ok());
+            .and_then(|bytes| JetsamReceipt::from_bytes(bytes).ok());
         let valid = match receipt {
             Some(receipt)
                 if receipt.summary.logical_txid == tx_hash
@@ -588,7 +588,7 @@ impl WalletOps for WalletHandle {
     }
 
     fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String> {
-        use jetsam_chain::consensus::receipt::ElideReceipt;
+        use jetsam_chain::consensus::receipt::JetsamReceipt;
 
         let guard = self.inner.lock().unwrap();
         let wallet = guard
@@ -596,7 +596,7 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
         let mut receipts = Vec::with_capacity(wallet.receipts.len());
         for (txid, bytes) in &wallet.receipts {
-            let receipt = ElideReceipt::from_bytes(bytes).map_err(|error| {
+            let receipt = JetsamReceipt::from_bytes(bytes).map_err(|error| {
                 format!("decode durable receipt {}: {error}", hex::encode(txid))
             })?;
             if receipt.summary.logical_txid != *txid {
@@ -1293,7 +1293,7 @@ impl WalletOps for WalletHandle {
 
         match w.get_receipt(&tx_hash) {
             Some(bytes) => {
-                let receipt = jetsam_chain::consensus::receipt::ElideReceipt::from_bytes(bytes)
+                let receipt = jetsam_chain::consensus::receipt::JetsamReceipt::from_bytes(bytes)
                     .map_err(|error| format!("decode durable receipt: {error}"))?;
                 let has_recipient =
                     receipt
@@ -1385,7 +1385,7 @@ mod tests {
     fn retained_body_rebuilds_missing_outgoing_receipt_without_history_marker() {
         use jetsam_chain::block_header::BlockHeader;
         use jetsam_chain::consensus::receipt::{
-            verify_against_header, verify_merkle_inclusion, ElideReceipt,
+            verify_against_header, verify_merkle_inclusion, JetsamReceipt,
         };
         use jetsam_poseidon2b::primitives::Address;
         use jetsam_tx::{
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(recovered, 1);
         assert!(!history_changed);
         let tx_hash = jetsam_chain::try_compute_logical_txids(&block.transactions).unwrap()[1].0;
-        let receipt = ElideReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
+        let receipt = JetsamReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
         assert!(verify_merkle_inclusion(&receipt));
         assert!(verify_against_header(&receipt, &block.header));
 

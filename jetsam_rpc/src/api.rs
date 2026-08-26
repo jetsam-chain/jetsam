@@ -15,10 +15,10 @@ use crate::types::{
     WalletUtxoInfo,
 };
 
-// ELIDE CHANGE: namespace was "paranoid", which prefixed every RPC method name
+// JETSAM CHANGE: namespace was "paranoid", which prefixed every RPC method name
 // on the wire. It is a functional identifier, not branding.
 #[rpc(server, namespace = "jetsam")]
-pub trait ElideApi {
+pub trait JetsamApi {
     // =========================================================================
     // Chain
     // =========================================================================
@@ -270,7 +270,7 @@ pub trait ElideApi {
         fee_micro_jtm: u64,
     ) -> RpcResult<WalletSendPlan>;
 
-    /// Send ELD to a recipient address.
+    /// Send JTM to a recipient address.
     /// `to_address`: recipient bech32m address.
     /// `amount_micro_jtm`: amount in μJTM.
     /// `fee_micro_jtm`: exact fee (0 = automatic fee).

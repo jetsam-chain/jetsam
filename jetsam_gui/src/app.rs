@@ -2509,7 +2509,7 @@ fn parse_jetsam_amount(input: &str) -> Result<u64, String> {
         return Err("Enter an amount.".into());
     }
     if normalized.starts_with('-') || normalized.starts_with('+') {
-        return Err("Amount must be a positive ELD value.".into());
+        return Err("Amount must be a positive JTM value.".into());
     }
     let mut parts = normalized.split('.');
     let whole = parts.next().unwrap_or_default();
@@ -2519,10 +2519,10 @@ fn parse_jetsam_amount(input: &str) -> Result<u64, String> {
         || !whole.bytes().all(|byte| byte.is_ascii_digit())
         || !fractional.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Err("Use a decimal ELD amount, for example 12.500000.".into());
+        return Err("Use a decimal JTM amount, for example 12.500000.".into());
     }
     if fractional.len() > 6 {
-        return Err("ELD supports at most 6 decimal places.".into());
+        return Err("JTM supports at most 6 decimal places.".into());
     }
     let whole = whole
         .parse::<u64>()
@@ -2542,7 +2542,7 @@ fn parse_jetsam_amount(input: &str) -> Result<u64, String> {
         .and_then(|value| value.checked_add(fractional))
         .ok_or_else(|| "Amount is too large.".to_string())?;
     if amount == 0 {
-        return Err("Amount must be at least 0.000001 ELD.".into());
+        return Err("Amount must be at least 0.000001 JTM.".into());
     }
     Ok(amount)
 }

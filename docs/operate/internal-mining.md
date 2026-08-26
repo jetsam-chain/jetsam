@@ -8,13 +8,13 @@ and block submission in one Core process.
 Run the production hardware check:
 
 ```sh
-elide --check-hardware
+jetsam --check-hardware
 ```
 
 Obtain a payout address from the node wallet:
 
 ```sh
-elide
+jetsam
 jetsam-cli address --list
 jetsam-cli stop
 ```
@@ -27,14 +27,14 @@ configured.
 In the foreground:
 
 ```sh
-elide --mode miner --cpu-threads 12
+jetsam --mode miner --cpu-threads 12
 ```
 
 Or update a systemd unit:
 
 ```ini
-ExecStart=/usr/local/bin/elide \
-  --config /etc/elide/elide.toml \
+ExecStart=/usr/local/bin/jetsam \
+  --config /etc/jetsam/jetsam.toml \
   --mode miner \
   --cpu-threads 12
 ```
@@ -43,7 +43,7 @@ Then reload and restart:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart elide
+sudo systemctl restart jetsam
 ```
 
 ## Readiness
@@ -83,7 +83,7 @@ template cannot have its payout rewritten.
 To pin a separate payout for the process:
 
 ```sh
-elide --mode miner --miner-address o1...
+jetsam --mode miner --miner-address o1...
 ```
 
 Use the complete bech32m address.
@@ -97,7 +97,7 @@ jetsam-cli stop
 ```
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 Graceful shutdown cancels mining, closes networking and flushes MDBX. Do not

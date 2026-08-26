@@ -255,7 +255,7 @@ const _: () =
 /// Class-independent nonce-free suffix: direct accumulator transition plus
 /// the exact semantic `SEMHDR` replay. Every row is known at template time.
 ///
-/// ELIDE: 3_774, was 4_042 — the power-of-two `TX_EPOCH_BLOCKS` slimmed the
+/// JETSAM: 3_774, was 4_042 — the power-of-two `TX_EPOCH_BLOCKS` slimmed the
 /// epoch recomposition of the accumulator transition. Cross-checked at run
 /// time by the `debug_assert` in the direct-tail builder and the row-count
 /// assertion in `direct_tail_is_nonce_free_across_the_epoch_edge`.
@@ -1112,7 +1112,7 @@ impl ParentSealTrace {
             .map(|(_, wire)| wire.clone())
             .collect();
         let semantic_id = sponge_lanes_trace(b, TAG_SEMHDR, &semantic);
-        // ELIDE CHANGE: index the NONCE-FREE vector. `header_fields::HEIGHT` is
+        // JETSAM CHANGE: index the NONCE-FREE vector. `header_fields::HEIGHT` is
         // an offset into the 15-field semantic schedule; indexing the 16-field
         // vector with it only ever worked because the nonce sat after height.
         // With the nonce at lane 0 that read would silently return `timestamp`,
@@ -1729,7 +1729,7 @@ fn build_selected_zk_block_slots_core(
         "one public-arithmetic trace per physical user body slot"
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: page arithmetic+logical auth");
-    // ELIDE CHANGE: the block reward is now selected by the height-derived
+    // JETSAM CHANGE: the block reward is now selected by the height-derived
     // emission tiers built once in `bind_development_allocation`, not by the
     // child state depth. Reusing those selectors here is what guarantees the
     // coinbase ceiling and the development split read the same tier.
@@ -1981,7 +1981,7 @@ mod tx_epoch_anchor_tests {
 
     #[test]
     fn direct_tail_is_nonce_free_across_the_epoch_edge() {
-        // ELIDE: derived from TX_EPOCH_BLOCKS. Parent E-1 (child E: the boundary
+        // JETSAM: derived from TX_EPOCH_BLOCKS. Parent E-1 (child E: the boundary
         // block keeps the previous
         // anchor) and parent E (child E+1: anchor becomes the derived parent id).
         for parent_height in [jetsam_chain::consensus::params::TX_EPOCH_BLOCKS - 1, jetsam_chain::consensus::params::TX_EPOCH_BLOCKS] {

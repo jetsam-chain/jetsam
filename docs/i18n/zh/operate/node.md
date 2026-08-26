@@ -27,7 +27,7 @@
 
 ## 安装 Core
 
-从[发布页面](https://github.com/ignotusnemo/elide/releases)下载与服务器
+从[发布页面](https://github.com/ignotusnemo/jetsam/releases)下载与服务器
 架构匹配的压缩包和 `SHA256SUMS`。解压前先校验，把 `VERSION` 换成实际
 版本号：
 
@@ -43,7 +43,7 @@ grep '  jetsam-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
 
 ```sh
 tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
-./elide --check-hardware
+./jetsam --check-hardware
 ```
 
 支持的机器会以以下内容结束：
@@ -55,7 +55,7 @@ NODE READY
 安装节点和 CLI：
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
 ```
 
 ## 创建服务账户
@@ -63,13 +63,13 @@ sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 节点数据应与交互式用户账户分离：
 
 ```sh
-sudo useradd --system --home-dir /var/lib/elide \
-  --create-home --shell /usr/sbin/nologin elide
-sudo install -d -o elide -g elide -m 0700 /var/lib/elide
-sudo install -d -o root -g elide -m 0750 /etc/elide
+sudo useradd --system --home-dir /var/lib/jetsam \
+  --create-home --shell /usr/sbin/nologin jetsam
+sudo install -d -o jetsam -g jetsam -m 0700 /var/lib/jetsam
+sudo install -d -o root -g jetsam -m 0750 /etc/jetsam
 ```
 
-创建 `/etc/elide/elide.toml`：
+创建 `/etc/jetsam/jetsam.toml`：
 
 ```toml
 [network]
@@ -78,7 +78,7 @@ seeds = []
 
 [storage]
 backend = "mdbx"
-path = "/var/lib/elide"
+path = "/var/lib/jetsam"
 
 [rpc]
 listen = "127.0.0.1:9601"
@@ -91,8 +91,8 @@ miner_address = ""
 保护配置：
 
 ```sh
-sudo chown root:elide /etc/elide/elide.toml
-sudo chmod 0640 /etc/elide/elide.toml
+sudo chown root:jetsam /etc/jetsam/jetsam.toml
+sudo chmod 0640 /etc/jetsam/jetsam.toml
 ```
 
 无需填写种子地址。发布版二进制会通过内置 [DNS 种子](../reference/glossary.md#dns-seed)发现公网，并记住成功
@@ -100,7 +100,7 @@ sudo chmod 0640 /etc/elide/elide.toml
 
 ## 通过 systemd 运行
 
-创建 `/etc/systemd/system/elide.service`：
+创建 `/etc/systemd/system/jetsam.service`：
 
 ```ini
 [Unit]
@@ -110,9 +110,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=elide
-Group=elide
-ExecStart=/usr/local/bin/elide --config /etc/elide/elide.toml
+User=jetsam
+Group=jetsam
+ExecStart=/usr/local/bin/jetsam --config /etc/jetsam/jetsam.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
@@ -129,14 +129,14 @@ WantedBy=multi-user.target
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now elide
-sudo systemctl status elide
+sudo systemctl enable --now jetsam
+sudo systemctl status jetsam
 ```
 
 跟踪启动与同步：
 
 ```sh
-sudo journalctl -u elide -f
+sudo journalctl -u jetsam -f
 ```
 
 ## 检查节点
@@ -166,16 +166,16 @@ TCP `9600` 转发给节点。节点只靠出站连接也能同步，但接受入
 替换二进制或复制数据前先停止服务：
 
 ```sh
-sudo systemctl stop elide
+sudo systemctl stop jetsam
 ```
 
 安装已校验的新二进制，再启动：
 
 ```sh
-sudo install -m 0755 elide jetsam-cli /usr/local/bin/
-sudo systemctl start elide
+sudo install -m 0755 jetsam jetsam-cli /usr/local/bin/
+sudo systemctl start jetsam
 jetsam-cli status
 ```
 
-普通软件更新不应删除 `/var/lib/elide`。若节点钱包收到资金，请单独
-备份 `/var/lib/elide/wallet.key`，并把它作为私密密钥保护。
+普通软件更新不应删除 `/var/lib/jetsam`。若节点钱包收到资金，请单独
+备份 `/var/lib/jetsam/wallet.key`，并把它作为私密密钥保护。

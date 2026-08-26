@@ -114,7 +114,7 @@ fn schedule() -> &'static FlatSchedule {
                 mds_partial[i][j] = f128_of_u128(tower_to_flat_u128(MDS_PARTIAL[i][j]));
             }
         }
-        // The hot MDS kernels below elide exactly these protocol-fixed
+        // The hot MDS kernels below jetsam exactly these protocol-fixed
         // identity products.  Validate the sparse layout once in every build
         // (not merely under debug assertions), so any future constant drift
         // fails before a proof can be authored with the wrong linear layer.

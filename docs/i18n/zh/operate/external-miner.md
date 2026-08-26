@@ -10,7 +10,7 @@
 使用 Bearer 令牌以外部矿工模式启动节点：
 
 ```sh
-elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
 在另一个终端运行：
@@ -38,7 +38,7 @@ jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 限制暴露路径。只有安全传输就绪后才绑定公网 RPC：
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
   --mining-key 'LONG-RANDOM-TOKEN'
@@ -53,7 +53,7 @@ elide \
 若允许挖矿进程请求自己的奖励地址，节点运营者必须显式启用：
 
 ```sh
-elide \
+jetsam \
   --mode extminer \
   --mining-key 'LONG-RANDOM-TOKEN' \
   --allow-custom-coinbase
