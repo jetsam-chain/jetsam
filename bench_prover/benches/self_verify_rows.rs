@@ -25,17 +25,17 @@
 use std::time::Instant;
 
 use bench_prover::poseidon_chain_field_instance;
-use elide_ivc_prover::challenger::FsLaneChallenger;
-use elide_ivc_prover::field::F128;
-use elide_ivc_prover::field_circuit::FsChannelTrace;
-use elide_ivc_prover::field_prover::prove_field;
-use elide_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
-use elide_ivc_prover::pcs::{self, PcsParams};
-use elide_ivc_prover::verifier::verify_field;
-use elide_recursive::acceptance::trace::self_verify::{
+use jetsam_ivc_prover::challenger::FsLaneChallenger;
+use jetsam_ivc_prover::field::F128;
+use jetsam_ivc_prover::field_circuit::FsChannelTrace;
+use jetsam_ivc_prover::field_prover::prove_field;
+use jetsam_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+use jetsam_ivc_prover::pcs::{self, PcsParams};
+use jetsam_ivc_prover::verifier::verify_field;
+use jetsam_recursive::acceptance::trace::self_verify::{
     alloc_flat_digest, verify_field_trace, FieldR1csProofTrace,
 };
-use elide_recursive::acceptance::trace::FieldR1csBuilder;
+use jetsam_recursive::acceptance::trace::FieldR1csBuilder;
 
 const DOMAIN: &[u8] = b"self-verify-rows-bench-v0";
 
@@ -99,7 +99,7 @@ fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
 }
 
 fn main() {
-    elide_ivc_prover::init_perf_thread_pool();
+    jetsam_ivc_prover::init_perf_thread_pool();
     println!(
         "== [R] row-count measurement — rayon threads: {} ==\n",
         rayon::current_num_threads()

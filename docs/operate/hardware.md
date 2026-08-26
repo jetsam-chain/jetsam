@@ -22,7 +22,7 @@ Run the preflight on the intended host:
 
 ```sh
 elide --check-hardware
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 A successful node report ends with:
@@ -119,7 +119,7 @@ Monitor the real path:
 
 ```sh
 du -sh ~/.elide/data
-elide-cli state
+jetsam-cli state
 ```
 
 Snapshot synchronization requires temporary space for a complete candidate
@@ -141,9 +141,9 @@ private or authenticated transport protects it.
 Revisit capacity after material changes in Live State or traffic:
 
 ```sh
-elide-cli status
-elide-cli state
-elide-cli peers
+jetsam-cli status
+jetsam-cli state
+jetsam-cli peers
 du -sh ~/.elide/data
 ```
 

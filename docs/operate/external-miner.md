@@ -17,7 +17,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 In another terminal:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -28,7 +28,7 @@ The token is required even on loopback when the node was started with
 Limit worker threads when needed:
 
 ```sh
-elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## Remote worker
@@ -66,7 +66,7 @@ elide \
 The worker can then use:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -89,7 +89,7 @@ normal and the worker requests another template after its poll interval.
 Run:
 
 ```sh
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 If requests fail:

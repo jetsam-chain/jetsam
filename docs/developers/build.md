@@ -44,9 +44,9 @@ Build ordinary development binaries:
 
 ```sh
 cargo build --locked \
-  -p elide_node \
-  -p elide-extminer \
-  -p elide_gui \
+  -p jetsam_node \
+  -p jetsam-extminer \
+  -p jetsam_gui \
   --bins
 ```
 
@@ -57,12 +57,12 @@ described below.
 ## Reproduce the soundness certificate
 
 The production calculations and proof documents are in
-[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
 
 ```sh
-cargo run --release --locked -p elide_soundness
-cargo run --release --locked -p elide_soundness -- --exact
-cargo test --release --locked -p elide_soundness
+cargo run --release --locked -p jetsam_soundness
+cargo run --release --locked -p jetsam_soundness -- --exact
+cargo test --release --locked -p jetsam_soundness
 ```
 
 ## Generate the proof pack
@@ -80,9 +80,9 @@ SHA256SUMS
 Generate B25 and B255 matrices from honest fixtures:
 
 ```sh
-mkdir -p ../elide-artifacts
+mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../elide-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1
 ```
 
 Generation is expensive and only needs to be performed once for an unchanged
@@ -96,7 +96,7 @@ overwrite an existing output path.
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../elide-artifacts/history-step-pack-v1
+  --pack ../jetsam-artifacts/history-step-pack-v1
 ```
 
 The script:
@@ -139,8 +139,8 @@ README.txt
 LICENSE
 NOTICE
 elide
-elide-cli
-elide-miner
+jetsam-cli
+jetsam-miner
 ```
 
 The GUI package contains only the application and its private node. It does not

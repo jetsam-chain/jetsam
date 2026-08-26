@@ -10,13 +10,13 @@
 
 use std::time::{Duration, Instant};
 
-use elide_gkr::{
+use jetsam_gkr::{
     prove_paged_spend_authorization, verify_paged_spend_authorization, OwnerAuthWitness,
     WalletAuthorizationBundle,
 };
-use elide_poseidon2b::primitives::{derive_address, SpendSecret};
-use elide_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
-use paraelide_two_class_research::paged_spend::{
+use jetsam_poseidon2b::primitives::{derive_address, SpendSecret};
+use jetsam_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+use parajetsam_two_class_research::paged_spend::{
     hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, PAGED_SPEND_END_BIT,
     PAGED_SPEND_START_BIT,
 };

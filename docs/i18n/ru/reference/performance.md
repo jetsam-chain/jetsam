@@ -43,7 +43,7 @@ ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
 классы по отдельности, чтобы вывод однозначно указывал классы родителя и потомка.
 
 ```sh
-ELIDE_PACK_ROOT=../elide-artifacts/history-step-pack-v1
+ELIDE_PACK_ROOT=../jetsam-artifacts/history-step-pack-v1
 source "$ELIDE_PACK_ROOT/pins.env"
 export ELIDE_HISTORY_STEP_PACK_DIR="$ELIDE_PACK_ROOT"
 

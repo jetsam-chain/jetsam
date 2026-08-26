@@ -88,7 +88,7 @@ network's miner can produce valid work for the other.
 
 ## 4. Chain identity
 
-- crates renamed `noid_*` → `elide_*`
+- crates renamed `noid_*` → `jetsam_*`
 - address HRP `o` → `e` (bech32m addresses become `e1…`)
 - network magic `NOID` → `ELD1`, and every stream/file magic re-prefixed
   (leading byte `E`) so none is byte-identical to upstream's
@@ -97,7 +97,7 @@ network's miner can produce valid work for the other.
 - chain identity consolidated into `consensus/identity.rs`, which is the
   consumed source of truth: `NetworkConfig` takes its ports and protocol
   namespace from it, the address HRP is re-exposed from the codec constant in
-  `elide_poseidon2b`, and the node's default `~/.elide` paths derive from its
+  `jetsam_poseidon2b`, and the node's default `~/.elide` paths derive from its
   `DATA_DIR_NAME`
 
 Domain separation tags are deliberately **not** derived from the coin name, so

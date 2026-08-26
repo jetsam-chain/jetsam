@@ -17,12 +17,12 @@ cargo test --locked -p CHANGED_CRATE
 
 ```sh
 cargo test --locked \
-  -p elide_tx \
-  -p elide_chain \
-  -p elide_mempool \
-  -p elide_miner \
-  -p elide_rpc \
-  -p elide_node
+  -p jetsam_tx \
+  -p jetsam_chain \
+  -p jetsam_mempool \
+  -p jetsam_miner \
+  -p jetsam_rpc \
+  -p jetsam_node
 ```
 
 ## 证明内核
@@ -31,9 +31,9 @@ cargo test --locked \
 
 ```sh
 cargo test --locked --release \
-  -p elide_core \
-  -p elide_poseidon2b \
-  -p elide-ivc-core
+  -p jetsam_core \
+  -p jetsam_poseidon2b \
+  -p jetsam-ivc-core
 ```
 
 x86-64 上强制测试发布版最低后端：
@@ -41,7 +41,7 @@ x86-64 上强制测试发布版最低后端：
 ```sh
 ELIDE_CPU_BACKEND=pclmul \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b -p elide-ivc-core
+  -p jetsam_core -p jetsam_poseidon2b -p jetsam-ivc-core
 ```
 
 标量后端只用于差分检查：
@@ -49,7 +49,7 @@ ELIDE_CPU_BACKEND=pclmul \
 ```sh
 ELIDE_CPU_BACKEND=scalar \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b
+  -p jetsam_core -p jetsam_poseidon2b
 ```
 
 ## 发布门禁

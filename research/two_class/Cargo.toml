@@ -1,5 +1,5 @@
 [package]
-name = "paraelide-two-class-research"
+name = "parajetsam-two-class-research"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -14,15 +14,15 @@ resolver = "2"
 path = "src/lib.rs"
 
 [dependencies]
-elide_chain = { path = "../../elide_chain" }
-elide_core = { path = "../../elide_core" }
-elide_fri = { path = "../../elide_fri" }
-elide_fri_binius = { path = "../../elide_fri_binius" }
-elide_gkr = { path = "../../elide_gkr" }
-elide-ivc-core = { path = "../../elide_ivc_core" }
-elide_poseidon2b = { path = "../../elide_poseidon2b" }
-elide_recursive = { path = "../../elide_recursive" }
-elide_tx = { path = "../../elide_tx" }
+jetsam_chain = { path = "../../jetsam_chain" }
+jetsam_core = { path = "../../jetsam_core" }
+jetsam_fri = { path = "../../jetsam_fri" }
+jetsam_fri_binius = { path = "../../jetsam_fri_binius" }
+jetsam_gkr = { path = "../../jetsam_gkr" }
+jetsam-ivc-core = { path = "../../jetsam_ivc_core" }
+jetsam_poseidon2b = { path = "../../jetsam_poseidon2b" }
+jetsam_recursive = { path = "../../jetsam_recursive" }
+jetsam_tx = { path = "../../jetsam_tx" }
 
 [[bin]]
 name = "two-class-census"

@@ -5,8 +5,8 @@
 | Файл | Роль |
 |---|---|
 | `elide` | Полная нода, серверная часть кошелька и необязательный внутренний конвейер доказательства и майнинга |
-| `elide-cli` | Тонкий JSON-RPC-клиент работающей ноды |
-| `elide-miner` | Отдельный вычислитель nonce Poseidon2b |
+| `jetsam-cli` | Тонкий JSON-RPC-клиент работающей ноды |
+| `jetsam-miner` | Отдельный вычислитель nonce Poseidon2b |
 
 ## Демон Core
 
@@ -67,7 +67,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 
 ## Внешний майнер
 
-`elide-miner` запрашивает уже доказанный неизменяемый шаблон и ищет только
+`jetsam-miner` запрашивает уже доказанный неизменяемый шаблон и ищет только
 его 128-битный nonce.
 
 | Параметр | По умолчанию | Значение |
@@ -83,7 +83,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 Обычный локальный запуск:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
@@ -94,7 +94,7 @@ elide-miner \
 
 ## Клиент ноды
 
-`elide-cli` — тонкий клиент работающего Core. У него нет отдельного ключа;
+`jetsam-cli` — тонкий клиент работающего Core. У него нет отдельного ключа;
 операции кошелька выполняются через локальный JSON-RPC.
 
 ### Общие параметры
@@ -133,11 +133,11 @@ elide-miner \
 Примеры:
 
 ```sh
-elide-cli status
-elide-cli block-header 420
-elide-cli block 420
-elide-cli slot 9700063
-elide-cli utxos-of o1...
+jetsam-cli status
+jetsam-cli block-header 420
+jetsam-cli block 420
+jetsam-cli slot 9700063
+jetsam-cli utxos-of o1...
 ```
 
 `block` возвращает данные только внутри 18-блочного окна хранения тел.
@@ -152,15 +152,15 @@ elide-cli utxos-of o1...
 | `block-template` | `--miner-addr o1…` | Внешний шаблон майнинга, принадлежащий ноде |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Отправить один 16-байтный nonce в порядке от младшего байта к старшему |
 
-Команды внешнего майнинга низкоуровневые. `elide-miner` автоматически
+Команды внешнего майнинга низкоуровневые. `jetsam-miner` автоматически
 обновляет шаблоны и кодирует nonce.
 
 ### Комиссии и мемпул
 
 ```sh
-elide-cli estimate-fee 2 --inputs 1
-elide-cli mempool
-elide-cli mempool-tx TXID
+jetsam-cli estimate-fee 2 --inputs 1
+jetsam-cli mempool
+jetsam-cli mempool-tx TXID
 ```
 
 `estimate-fee` сообщает текущий минимум, принимаемый нодой для заявленного
@@ -170,7 +170,7 @@ elide-cli mempool-tx TXID
 ### Проверка адреса
 
 ```sh
-elide-cli validate o1...
+jetsam-cli validate o1...
 ```
 
 Команда сообщает, корректен ли адрес, и выводит его каноническую форму bech32m
@@ -179,11 +179,11 @@ elide-cli validate o1...
 ### Адреса кошелька
 
 ```sh
-elide-cli address
-elide-cli address --list
-elide-cli address --new
-elide-cli address --index 3
-elide-cli address --use 3
+jetsam-cli address
+jetsam-cli address --list
+jetsam-cli address --new
+jetsam-cli address --index 3
+jetsam-cli address --use 3
 ```
 
 `--new`, `--index` и `--use` — взаимоисключающие действия. Созданный адрес
@@ -193,9 +193,9 @@ elide-cli address --use 3
 ### Баланс и UTXO
 
 ```sh
-elide-cli balance
-elide-cli utxos
-elide-cli scan
+jetsam-cli balance
+jetsam-cli utxos
+jetsam-cli scan
 ```
 
 `balance` отдельно показывает подтверждённые, зарезервированные исходящие,
@@ -207,19 +207,19 @@ elide-cli scan
 Предпросмотр:
 
 ```sh
-elide-cli send o1... 10.5 --dry-run
+jetsam-cli send o1... 10.5 --dry-run
 ```
 
 Отправка с автоматической комиссией:
 
 ```sh
-elide-cli send o1... 10.5
+jetsam-cli send o1... 10.5
 ```
 
 Точную комиссию в ELD задавайте только при необходимости:
 
 ```sh
-elide-cli send o1... 10.5 --fee 0.012
+jetsam-cli send o1... 10.5 --fee 0.012
 ```
 
 Возвращаемый ID относится ко всей логической транзакции. Рекомендуется
@@ -230,21 +230,21 @@ elide-cli send o1... 10.5 --fee 0.012
 ### История и чеки
 
 ```sh
-elide-cli history
-elide-cli history --last 20
-elide-cli history --address o1...
+jetsam-cli history
+jetsam-cli history --last 20
+jetsam-cli history --address o1...
 ```
 
 Экспорт подтверждённого исходящего чека:
 
 ```sh
-elide-cli receipt TXID > receipt.hex
+jetsam-cli receipt TXID > receipt.hex
 ```
 
 Проверка:
 
 ```sh
-elide-cli verify "$(tr -d '\n' < receipt.hex)"
+jetsam-cli verify "$(tr -d '\n' < receipt.hex)"
 ```
 
 Экспорт возможен только для локально сохранённого платежа другому владельцу.
@@ -252,7 +252,7 @@ elide-cli verify "$(tr -d '\n' < receipt.hex)"
 ### Остановка
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 Команда запрашивает корректное завершение демона. Она эквивалентна обычному
@@ -264,7 +264,7 @@ elide-cli stop
 
 ```sh
 height="$(
-  elide-cli --json status |
+  jetsam-cli --json status |
     jq -er '.height'
 )"
 ```

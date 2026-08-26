@@ -27,12 +27,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bench_prover::{fmt_bytes, fmt_ms};
-use elide_core::mem_profile::{current_mem_snapshot, MemSnapshot};
-use elide_ivc_prover::challenger::FsLaneChallenger;
-use elide_ivc_prover::field::F128;
-use elide_ivc_prover::pcs::{self, PcsParams, QuirkyDirectClaim, QuirkyDirectClaimRef};
-use elide_ivc_prover::proof::bind_statement_field_parts;
-use elide_ivc_prover::zerocheck::multilinear::lagrange_weights_naive;
+use jetsam_core::mem_profile::{current_mem_snapshot, MemSnapshot};
+use jetsam_ivc_prover::challenger::FsLaneChallenger;
+use jetsam_ivc_prover::field::F128;
+use jetsam_ivc_prover::pcs::{self, PcsParams, QuirkyDirectClaim, QuirkyDirectClaimRef};
+use jetsam_ivc_prover::proof::bind_statement_field_parts;
+use jetsam_ivc_prover::zerocheck::multilinear::lagrange_weights_naive;
 use rayon::prelude::*;
 
 const DOMAIN: &[u8] = b"pcs-roofline-field-v0";
@@ -410,7 +410,7 @@ fn run_case(logical_m: usize) {
     drop(commitment);
     drop(claim);
     drop(witness);
-    elide_ivc_prover::scratch::clear();
+    jetsam_ivc_prover::scratch::clear();
 }
 
 fn main() {
@@ -418,7 +418,7 @@ fn main() {
     if env::var_os("NOIDH_COMMIT_TIMING").is_none() {
         env::set_var("NOIDH_COMMIT_TIMING", "1");
     }
-    elide_ivc_prover::init_perf_thread_pool();
+    jetsam_ivc_prover::init_perf_thread_pool();
 
     let domains = requested_domains();
     print_manifest(&domains);

@@ -45,7 +45,7 @@ matrix pack. Run each class separately so the output identifies the exact
 parent and child class.
 
 ```sh
-ELIDE_PACK_ROOT=../elide-artifacts/history-step-pack-v1
+ELIDE_PACK_ROOT=../jetsam-artifacts/history-step-pack-v1
 source "$ELIDE_PACK_ROOT/pins.env"
 export ELIDE_HISTORY_STEP_PACK_DIR="$ELIDE_PACK_ROOT"
 

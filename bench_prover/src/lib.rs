@@ -8,14 +8,14 @@
 
 use std::time::{Duration, Instant};
 
-use elide_core::Block128;
-use elide_gkr::zk_authorization::ZkAuthorizationProof;
-use elide_gkr::{
+use jetsam_core::Block128;
+use jetsam_gkr::zk_authorization::ZkAuthorizationProof;
+use jetsam_gkr::{
     prove_paged_spend_authorization, prove_wallet_authorization, verify_wallet_authorization_proof,
     OwnerAuthWitness, WalletAuthorizationBundle,
 };
-use elide_poseidon2b::primitives::{derive_address, SpendSecret, TxBodyHash};
-use elide_tx::{
+use jetsam_poseidon2b::primitives::{derive_address, SpendSecret, TxBodyHash};
+use jetsam_tx::{
     hash_paged_spend, output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TxPage,
     PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
 };
@@ -103,12 +103,12 @@ where
 pub fn poseidon_chain_field_instance(
     chain: usize,
 ) -> (
-    elide_ivc_prover::field_r1cs::FieldR1cs,
-    Vec<elide_ivc_prover::field::F128>,
+    jetsam_ivc_prover::field_r1cs::FieldR1cs,
+    Vec<jetsam_ivc_prover::field::F128>,
 ) {
-    use elide_ivc_prover::field_circuit::{flat_const, poseidon2b_permute, LinExpr};
-    use elide_poseidon2b::native::permutation::{Poseidon2bPermutation, STATE_SIZE};
-    use elide_recursive::acceptance::trace::FieldR1csBuilder;
+    use jetsam_ivc_prover::field_circuit::{flat_const, poseidon2b_permute, LinExpr};
+    use jetsam_poseidon2b::native::permutation::{Poseidon2bPermutation, STATE_SIZE};
+    use jetsam_recursive::acceptance::trace::FieldR1csBuilder;
 
     let seed: [Block128; STATE_SIZE] =
         std::array::from_fn(|index| Block128(0x1234_5678_9abc_def0 + index as u128));
@@ -212,8 +212,8 @@ pub fn legal_block_scenarios(
     user_txs: usize,
     seed_base: u128,
 ) -> Vec<BenchScenario> {
-    assert!(elide_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(&user_txs));
-    if user_txs == elide_chain::consensus::params::BLOCK_MAX_USER_PAGES {
+    assert!(jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(&user_txs));
+    if user_txs == jetsam_chain::consensus::params::BLOCK_MAX_USER_PAGES {
         return b255_saturation_scenarios(label, seed_base);
     }
     (0..user_txs)
@@ -287,8 +287,8 @@ pub fn b255_saturation_scenarios(label: &'static str, seed_base: u128) -> Vec<Be
 }
 
 fn maximally_dispersed_b255_touched_slots() -> Vec<u32> {
-    let mut slots = Vec::with_capacity(elide_chain::consensus::params::BLOCK_MAX_ACTIONS);
-    for segment_rank in 0..elide_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
+    let mut slots = Vec::with_capacity(jetsam_chain::consensus::params::BLOCK_MAX_ACTIONS);
+    for segment_rank in 0..jetsam_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
         let segment = (segment_rank as u32).reverse_bits() >> 24;
         let local_count = if segment_rank < 251 { 6 } else { 5 };
         for local_rank in 0..local_count {
@@ -296,12 +296,12 @@ fn maximally_dispersed_b255_touched_slots() -> Vec<u32> {
             if segment == 0 || segment == u8::MAX as u32 {
                 local ^= u16::MAX as u32;
             }
-            slots.push((segment << elide_chain::consensus::params::LOG_SEGMENT_SIZE) | local);
+            slots.push((segment << jetsam_chain::consensus::params::LOG_SEGMENT_SIZE) | local);
         }
     }
     assert_eq!(
         slots.len(),
-        elide_chain::consensus::params::BLOCK_MAX_ACTIONS
+        jetsam_chain::consensus::params::BLOCK_MAX_ACTIONS
     );
     slots
 }
@@ -332,10 +332,10 @@ fn tx8x2_scenario_with_layout(
         };
         validity_bitmap |= 1 << position;
     }
-    let fee = elide_chain::consensus::fees::fee_breakdown(
+    let fee = jetsam_chain::consensus::fees::fee_breakdown(
         input_slots.len() as u64,
         TX_OUTPUTS as u64,
-        elide_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS as u64,
+        jetsam_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS as u64,
         BENCH_LOG_SLOTS,
     )
     .required_total;
@@ -470,13 +470,13 @@ impl TrackedSpendable {
 
 #[derive(Clone)]
 struct HistoryStepFixtureCheckpoint {
-    parent_header: elide_chain::BlockHeader,
-    tx_epoch_anchor_header: elide_chain::BlockHeader,
-    parent_state: elide_chain::state::ChainState,
-    start_accumulator: elide_recursive::ChainAccumulator,
+    parent_header: jetsam_chain::BlockHeader,
+    tx_epoch_anchor_header: jetsam_chain::BlockHeader,
+    parent_state: jetsam_chain::state::ChainState,
+    start_accumulator: jetsam_recursive::ChainAccumulator,
     previous_timestamps: Vec<u64>,
     finalized_active_counts: Vec<u64>,
-    asert_anchor: elide_chain::consensus::AnchorInfo,
+    asert_anchor: jetsam_chain::consensus::AnchorInfo,
     spendables: Vec<TrackedSpendable>,
     output_slot_cursor: u32,
 }
@@ -487,10 +487,10 @@ struct HistoryStepFixtureCheckpoint {
 /// freezer can consume the input immediately without retaining borrowed
 /// chain state or reconstructing any boundary.
 pub struct PreparedHistoryStepTierFixture<const TIER: usize> {
-    witness: elide_block::PreparedHistoryStepInputWitness<TIER>,
+    witness: jetsam_block::PreparedHistoryStepInputWitness<TIER>,
     nonce: u128,
-    start_accumulator: elide_recursive::ChainAccumulator,
-    end_accumulator: elide_recursive::ChainAccumulator,
+    start_accumulator: jetsam_recursive::ChainAccumulator,
+    end_accumulator: jetsam_recursive::ChainAccumulator,
     input_preparation: Duration,
     user_pages: usize,
 }
@@ -500,11 +500,11 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
         self.nonce
     }
 
-    pub fn start_accumulator(&self) -> &elide_recursive::ChainAccumulator {
+    pub fn start_accumulator(&self) -> &jetsam_recursive::ChainAccumulator {
         &self.start_accumulator
     }
 
-    pub fn end_accumulator(&self) -> &elide_recursive::ChainAccumulator {
+    pub fn end_accumulator(&self) -> &jetsam_recursive::ChainAccumulator {
         &self.end_accumulator
     }
 
@@ -522,10 +522,10 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
     pub fn into_parts(
         self,
     ) -> (
-        elide_block::PreparedHistoryStepInputWitness<TIER>,
+        jetsam_block::PreparedHistoryStepInputWitness<TIER>,
         u128,
-        elide_recursive::ChainAccumulator,
-        elide_recursive::ChainAccumulator,
+        jetsam_recursive::ChainAccumulator,
+        jetsam_recursive::ChainAccumulator,
     ) {
         (
             self.witness,
@@ -537,7 +537,7 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
 
     fn into_history_step_input(
         self,
-    ) -> Result<elide_recursive::HistoryStepBlockInput<TIER>, String> {
+    ) -> Result<jetsam_recursive::HistoryStepBlockInput<TIER>, String> {
         let (witness, nonce, start, end) = self.into_parts();
         witness
             .finish(nonce, &start, &end)
@@ -560,7 +560,7 @@ pub struct HonestHistoryStepBackboneStep {
 
 struct BuiltFixtureChild<const TIER: usize> {
     prepared: PreparedHistoryStepTierFixture<TIER>,
-    sealed_block: elide_chain::Block,
+    sealed_block: jetsam_chain::Block,
     next_spendables: Vec<TrackedSpendable>,
     next_output_slot_cursor: u32,
 }
@@ -573,21 +573,21 @@ struct BuiltFixtureChild<const TIER: usize> {
 /// requested witness is materialized.
 pub struct HonestHistoryStepFixtureProvider {
     seed: u128,
-    ghost: elide_recursive::PreparedHistoryStepGhostAuthorization,
+    ghost: jetsam_recursive::PreparedHistoryStepGhostAuthorization,
     authorization_proofs:
         std::cell::RefCell<std::collections::HashMap<TxBodyHash, ZkAuthorizationProof>>,
     mined_nonces: std::cell::RefCell<std::collections::HashMap<[u8; 32], u128>>,
     backbone_index: usize,
     live: HistoryStepFixtureCheckpoint,
     checkpoints:
-        [Option<HistoryStepFixtureCheckpoint>; elide_recursive::HISTORY_STEP_TIER_SLOT_COUNT],
+        [Option<HistoryStepFixtureCheckpoint>; jetsam_recursive::HISTORY_STEP_TIER_SLOT_COUNT],
 }
 
 impl HonestHistoryStepFixtureProvider {
     pub fn new(seed: u128) -> Result<Self, String> {
-        let ghost = elide_gkr::ghost_tx::prove_selected_ghost_authorization()
+        let ghost = jetsam_gkr::ghost_tx::prove_selected_ghost_authorization()
             .map_err(|error| format!("prove canonical ghost authorization: {error}"))?;
-        let ghost = elide_recursive::prepare_history_step_ghost_authorization(ghost)
+        let ghost = jetsam_recursive::prepare_history_step_ghost_authorization(ghost)
             .map_err(|error| format!("prepare canonical ghost authorization: {error}"))?;
         let live = genesis_fixture_checkpoint();
         Ok(Self {
@@ -611,7 +611,7 @@ impl HonestHistoryStepFixtureProvider {
 
     pub fn next_backbone(
         &mut self,
-        expected_start: &elide_recursive::ChainAccumulator,
+        expected_start: &jetsam_recursive::ChainAccumulator,
     ) -> Result<Option<HonestHistoryStepBackboneStep>, String> {
         if self.backbone_index == HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS.len() {
             return Ok(None);
@@ -627,7 +627,7 @@ impl HonestHistoryStepFixtureProvider {
             6 => Some(1),
             _ => None,
         };
-        let input = match elide_chain::consensus::params::block_page_class_tier(user_count) {
+        let input = match jetsam_chain::consensus::params::block_page_class_tier(user_count) {
             Some(25) => self
                 .build_child::<25>(user_count, step as u128)?
                 .map_into(&mut self.live)?,
@@ -649,8 +649,8 @@ impl HonestHistoryStepFixtureProvider {
 
     pub fn b25(
         &self,
-        class_id: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
+        class_id: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
     ) -> Result<PreparedHistoryStepTierFixture<25>, String> {
         self.fork::<25>(
             class_id,
@@ -664,16 +664,16 @@ impl HonestHistoryStepFixtureProvider {
     /// B25 class shape.
     pub fn b25_coinbase_only(
         &self,
-        class_id: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
+        class_id: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
     ) -> Result<PreparedHistoryStepTierFixture<25>, String> {
         self.fork::<25>(class_id, expected_start, 0)
     }
 
     pub fn b255(
         &self,
-        class_id: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
+        class_id: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
     ) -> Result<PreparedHistoryStepTierFixture<255>, String> {
         self.fork::<255>(
             class_id,
@@ -685,7 +685,7 @@ impl HonestHistoryStepFixtureProvider {
     pub fn parent_accumulator(
         &self,
         parent_slot: usize,
-    ) -> Option<&elide_recursive::ChainAccumulator> {
+    ) -> Option<&jetsam_recursive::ChainAccumulator> {
         self.checkpoints
             .get(parent_slot)?
             .as_ref()
@@ -694,8 +694,8 @@ impl HonestHistoryStepFixtureProvider {
 
     fn fork<const TIER: usize>(
         &self,
-        class_id: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
+        class_id: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
         user_count: usize,
     ) -> Result<PreparedHistoryStepTierFixture<TIER>, String> {
         if class_id.current_tier() != TIER {
@@ -736,7 +736,7 @@ impl HonestHistoryStepFixtureProvider {
         user_count: usize,
         nonce_domain: u128,
     ) -> Result<BuiltFixtureChild<TIER>, String> {
-        if elide_chain::consensus::params::block_page_class_tier(user_count) != Some(TIER) {
+        if jetsam_chain::consensus::params::block_page_class_tier(user_count) != Some(TIER) {
             return Err(format!("{user_count} users do not select B{TIER}"));
         }
         let (candidates, authorities, next_user_spendables, next_output_slot_cursor) =
@@ -744,11 +744,11 @@ impl HonestHistoryStepFixtureProvider {
         let timestamp = checkpoint
             .parent_header
             .timestamp
-            .checked_add(elide_chain::consensus::params::BLOCK_TIME)
+            .checked_add(jetsam_chain::consensus::params::BLOCK_TIME)
             .ok_or_else(|| "fixture timestamp overflow".to_owned())?;
         // ELIDE CHANGE: ASERT anchored on the parent's timestamp, never the
         // block's own. Must mirror consensus::header::validate_header_inner.
-        let target = elide_chain::consensus::next_target(
+        let target = jetsam_chain::consensus::next_target(
             checkpoint.asert_anchor.anchor_height,
             checkpoint.asert_anchor.anchor_timestamp,
             &checkpoint.asert_anchor.anchor_target,
@@ -760,7 +760,7 @@ impl HonestHistoryStepFixtureProvider {
             .wrapping_add(0x3000_0000)
             .wrapping_add(nonce_domain << 12)
             .wrapping_add(checkpoint.parent_header.height as u128);
-        let template = elide_chain::consensus::build_block_template(
+        let template = jetsam_chain::consensus::build_block_template(
             &checkpoint.parent_header,
             &checkpoint.parent_state,
             &checkpoint.finalized_active_counts,
@@ -820,7 +820,7 @@ impl HonestHistoryStepFixtureProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         let block = template.into_block(0);
-        let nonce_key = elide_chain::hash_block_header(&block.header);
+        let nonce_key = jetsam_chain::hash_block_header(&block.header);
         let cached_nonce = { self.mined_nonces.borrow().get(&nonce_key).copied() };
         let nonce = if let Some(nonce) = cached_nonce {
             nonce
@@ -835,7 +835,7 @@ impl HonestHistoryStepFixtureProvider {
             .start_accumulator
             .advance(&checkpoint.parent_header, &sealed_block.header)
             .map_err(|error| format!("advance honest B{TIER} accumulator: {error:?}"))?;
-        let context = elide_block::HistoryStepPreparationContext {
+        let context = jetsam_block::HistoryStepPreparationContext {
             parent_header: &checkpoint.parent_header,
             tx_epoch_anchor_header: &checkpoint.tx_epoch_anchor_header,
             parent_state: &checkpoint.parent_state,
@@ -856,7 +856,7 @@ impl HonestHistoryStepFixtureProvider {
             .checked_add(authorization_weight)
             .ok_or_else(|| "honest block byte weight overflow".to_owned())?;
         std::hint::black_box(payload_weight);
-        let stream = elide_chain::validate_block_page_stream(&block.transactions)
+        let stream = jetsam_chain::validate_block_page_stream(&block.transactions)
             .map_err(|error| format!("honest block body is non-canonical: {error}"))?;
         if usize::from(stream.page_count) != user_count {
             return Err(format!(
@@ -873,7 +873,7 @@ impl HonestHistoryStepFixtureProvider {
                     .map_err(|error| format!("decode honest wallet authorization {index}: {error}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let witness = elide_block::prepare_history_step_input_witness::<TIER>(
+        let witness = jetsam_block::prepare_history_step_input_witness::<TIER>(
             block,
             context,
             authorization_proofs,
@@ -915,7 +915,7 @@ impl HonestHistoryStepFixtureProvider {
     }
 }
 
-impl elide_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtureProvider {
+impl jetsam_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtureProvider {
     type Error = String;
 
     fn reset_backbone(&mut self) -> Result<(), Self::Error> {
@@ -925,34 +925,34 @@ impl elide_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtur
 
     fn next_backbone(
         &mut self,
-        expected_start: &elide_recursive::ChainAccumulator,
-    ) -> Result<Option<elide_recursive::HistoryStepFreezeInput>, Self::Error> {
+        expected_start: &jetsam_recursive::ChainAccumulator,
+    ) -> Result<Option<jetsam_recursive::HistoryStepFreezeInput>, Self::Error> {
         HonestHistoryStepFixtureProvider::next_backbone(self, expected_start)?
             .map(|step| match step.input {
                 PreparedHistoryStepBackboneInput::B25(input) => input
                     .into_history_step_input()
-                    .map(elide_recursive::HistoryStepFreezeInput::B25),
+                    .map(jetsam_recursive::HistoryStepFreezeInput::B25),
                 PreparedHistoryStepBackboneInput::B255(input) => input
                     .into_history_step_input()
-                    .map(elide_recursive::HistoryStepFreezeInput::B255),
+                    .map(jetsam_recursive::HistoryStepFreezeInput::B255),
             })
             .transpose()
     }
 
     fn b25(
         &mut self,
-        class: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
-    ) -> Result<elide_recursive::HistoryStepBlockInput<25>, Self::Error> {
+        class: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
+    ) -> Result<jetsam_recursive::HistoryStepBlockInput<25>, Self::Error> {
         HonestHistoryStepFixtureProvider::b25(self, class, expected_start)?
             .into_history_step_input()
     }
 
     fn b255(
         &mut self,
-        class: elide_recursive::CanonicalHistoryStepClassId,
-        expected_start: &elide_recursive::ChainAccumulator,
-    ) -> Result<elide_recursive::HistoryStepBlockInput<255>, Self::Error> {
+        class: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
+    ) -> Result<jetsam_recursive::HistoryStepBlockInput<255>, Self::Error> {
         HonestHistoryStepFixtureProvider::b255(self, class, expected_start)?
             .into_history_step_input()
     }
@@ -978,7 +978,7 @@ macro_rules! impl_advance_honest_backbone {
                     next_spendables,
                     next_output_slot_cursor,
                 } = self;
-                elide_chain::consensus::validate_block_checks(
+                jetsam_chain::consensus::validate_block_checks(
                     &sealed_block,
                     &live.parent_header,
                     &live.previous_timestamps,
@@ -987,7 +987,7 @@ macro_rules! impl_advance_honest_backbone {
                     &live.asert_anchor,
                 )
                 .map_err(|error| format!("validate honest B{} backbone: {error}", $tier))?;
-                elide_chain::materialize_accepted_block_state(&mut live.parent_state, &sealed_block)
+                jetsam_chain::materialize_accepted_block_state(&mut live.parent_state, &sealed_block)
                     .map_err(|error| {
                         format!("materialize honest B{} backbone: {error:?}", $tier)
                     })?;
@@ -1009,19 +1009,19 @@ impl_advance_honest_backbone!(25, B25);
 impl_advance_honest_backbone!(255, B255);
 
 fn genesis_fixture_checkpoint() -> HistoryStepFixtureCheckpoint {
-    let genesis = elide_chain::consensus::genesis_header();
-    let state = elide_chain::state::ChainState::with_log_slots(genesis.log_slots as usize);
+    let genesis = jetsam_chain::consensus::genesis_header();
+    let state = jetsam_chain::state::ChainState::with_log_slots(genesis.log_slots as usize);
     assert_eq!(state.cached_state_root(), genesis.state_root);
     HistoryStepFixtureCheckpoint {
         parent_header: genesis,
         tx_epoch_anchor_header: genesis,
         parent_state: state,
-        start_accumulator: elide_recursive::genesis_accumulator(),
+        start_accumulator: jetsam_recursive::genesis_accumulator(),
         previous_timestamps: vec![genesis.timestamp],
         // This short release fixture never reaches the first complete
         // hard-finalized expansion window.
         finalized_active_counts: Vec::new(),
-        asert_anchor: elide_chain::consensus::AnchorInfo {
+        asert_anchor: jetsam_chain::consensus::AnchorInfo {
             anchor_height: genesis.height,
             anchor_timestamp: genesis.timestamp,
             anchor_target: genesis.difficulty_target,
@@ -1070,7 +1070,7 @@ fn child_user_transactions(
         let mut output_slots = [0u32; TX_OUTPUTS];
         for output_slot in &mut output_slots {
             while checkpoint.parent_state.state.slot(output_slot_cursor)
-                != elide_chain::SlotValue::EMPTY
+                != jetsam_chain::SlotValue::EMPTY
                 || reserved.contains(&output_slot_cursor)
             {
                 output_slot_cursor = output_slot_cursor
@@ -1116,7 +1116,7 @@ fn child_user_transactions(
                 | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         };
-        body.fee = elide_chain::consensus::fees::required_fee_for_tx_body(
+        body.fee = jetsam_chain::consensus::fees::required_fee_for_tx_body(
             &body,
             checkpoint.parent_state.active_slot_count,
             checkpoint.parent_header.log_slots,
@@ -1146,7 +1146,7 @@ fn child_user_transactions(
     ))
 }
 
-fn mine_history_step_fixture_header(header: &elide_chain::BlockHeader) -> u128 {
+fn mine_history_step_fixture_header(header: &jetsam_chain::BlockHeader) -> u128 {
     use rayon::prelude::*;
 
     const NONCES_PER_LANE: u128 = 65_536;
@@ -1157,7 +1157,7 @@ fn mine_history_step_fixture_header(header: &elide_chain::BlockHeader) -> u128 {
         if let Some(nonce) = (0..lanes)
             .into_par_iter()
             .filter_map(|lane| {
-                elide_chain::consensus::pow::search_pow(
+                jetsam_chain::consensus::pow::search_pow(
                     header,
                     batch_start + NONCES_PER_LANE * lane as u128,
                     NONCES_PER_LANE,
@@ -1180,10 +1180,10 @@ mod two_class_history_step_fixture_tests {
     #[test]
     fn freezer_page_counts_select_only_b25_and_b255() {
         let backbone = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS
-            .map(|count| elide_chain::consensus::params::block_page_class_tier(count).unwrap());
+            .map(|count| jetsam_chain::consensus::params::block_page_class_tier(count).unwrap());
         assert_eq!(backbone, [25, 25, 25, 25, 25, 25, 255]);
         let forks = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
-            .map(|count| elide_chain::consensus::params::block_page_class_tier(count).unwrap());
+            .map(|count| jetsam_chain::consensus::params::block_page_class_tier(count).unwrap());
         assert_eq!(forks, [25, 255]);
     }
 
@@ -1191,7 +1191,7 @@ mod two_class_history_step_fixture_tests {
     #[ignore = "runs real wallet proving and production PoW"]
     fn first_backbone_step_is_a_coinbase_only_b25_block() {
         let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550).unwrap();
-        let genesis = elide_recursive::genesis_accumulator();
+        let genesis = jetsam_recursive::genesis_accumulator();
         let step = provider.next_backbone(&genesis).unwrap().unwrap();
         assert!(step.capture_parent_slot.is_none());
         let PreparedHistoryStepBackboneInput::B25(prepared) = step.input else {

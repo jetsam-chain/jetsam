@@ -41,7 +41,7 @@ FUNDING_HEIGHT = int(os.environ.get("ELIDE_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
 # peer can recover a moving non-final branch.  Receipt independence must be
 # tested only after that complete operational serving window has elapsed.
 RETAINED_BLOCK_SERVING_DEPTH = 42
-CLI_BIN = ROOT / "target" / "release" / "elide-cli"
+CLI_BIN = ROOT / "target" / "release" / "jetsam-cli"
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

@@ -5,8 +5,8 @@ Core 压缩包包含三个可执行文件：
 | 可执行文件 | 角色 |
 |---|---|
 | `elide` | 完整节点、钱包后端，以及可选的内置证明/挖矿流水线 |
-| `elide-cli` | 连接运行中节点的轻量 JSON-RPC 客户端 |
-| `elide-miner` | 独立的 Poseidon2b nonce 搜索进程 |
+| `jetsam-cli` | 连接运行中节点的轻量 JSON-RPC 客户端 |
+| `jetsam-miner` | 独立的 Poseidon2b nonce 搜索进程 |
 
 ## Core 守护进程
 
@@ -64,7 +64,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 
 ## 外部矿工
 
-`elide-miner` 请求已经证明且不可变的模板，只搜索它的 128 位 nonce。
+`jetsam-miner` 请求已经证明且不可变的模板，只搜索它的 128 位 nonce。
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -79,7 +79,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 典型本地用法：
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
@@ -89,7 +89,7 @@ elide-miner \
 
 ## 节点客户端
 
-`elide-cli` 是运行中 Core 节点的轻量客户端。它不持有独立密钥，而是通过
+`jetsam-cli` 是运行中 Core 节点的轻量客户端。它不持有独立密钥，而是通过
 本地 JSON-RPC 执行钱包操作。
 
 ### 全局参数
@@ -127,11 +127,11 @@ CLI 钱包命令输入的金额以 ELD 为单位，最多六位小数：
 示例：
 
 ```sh
-elide-cli status
-elide-cli block-header 420
-elide-cli block 420
-elide-cli slot 9700063
-elide-cli utxos-of o1...
+jetsam-cli status
+jetsam-cli block-header 420
+jetsam-cli block 420
+jetsam-cli slot 9700063
+jetsam-cli utxos-of o1...
 ```
 
 `block` 只在 18 区块体保留窗口内返回数据。每个规范高度的 `header` 和
@@ -146,14 +146,14 @@ elide-cli utxos-of o1...
 | `block-template` | `--miner-addr o1…` | 节点持有的外部挖矿模板 |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | 提交一个 16 字节 little-endian nonce |
 
-外部挖矿命令属于低层接口。`elide-miner` 会自动刷新模板并编码 nonce。
+外部挖矿命令属于低层接口。`jetsam-miner` 会自动刷新模板并编码 nonce。
 
 ### 手续费与内存池
 
 ```sh
-elide-cli estimate-fee 2 --inputs 1
-elide-cli mempool
-elide-cli mempool-tx TXID
+jetsam-cli estimate-fee 2 --inputs 1
+jetsam-cli mempool
+jetsam-cli mempool-tx TXID
 ```
 
 `estimate-fee` 报告节点当前针对所声明有效输入和输出数量接受的最低费用。
@@ -162,7 +162,7 @@ elide-cli mempool-tx TXID
 ### 地址验证
 
 ```sh
-elide-cli validate o1...
+jetsam-cli validate o1...
 ```
 
 命令报告有效性、规范 bech32m 形式和原始 32 字节载荷。
@@ -170,11 +170,11 @@ elide-cli validate o1...
 ### 钱包地址
 
 ```sh
-elide-cli address
-elide-cli address --list
-elide-cli address --new
-elide-cli address --index 3
-elide-cli address --use 3
+jetsam-cli address
+jetsam-cli address --list
+jetsam-cli address --new
+jetsam-cli address --index 3
+jetsam-cli address --use 3
 ```
 
 `--new`、`--index` 和 `--use` 是互斥操作。生成的地址在被选中前保持
@@ -183,9 +183,9 @@ elide-cli address --use 3
 ### 余额与 UTXO
 
 ```sh
-elide-cli balance
-elide-cli utxos
-elide-cli scan
+jetsam-cli balance
+jetsam-cli utxos
+jetsam-cli scan
 ```
 
 `balance` 分别列出已确认、预留外发、待定入账和可花费金额。`scan` 从
@@ -196,19 +196,19 @@ elide-cli scan
 预览：
 
 ```sh
-elide-cli send o1... 10.5 --dry-run
+jetsam-cli send o1... 10.5 --dry-run
 ```
 
 自动费用提交：
 
 ```sh
-elide-cli send o1... 10.5
+jetsam-cli send o1... 10.5
 ```
 
 仅在确有需要时指定精确 ELD 费用：
 
 ```sh
-elide-cli send o1... 10.5 --fee 0.012
+jetsam-cli send o1... 10.5 --fee 0.012
 ```
 
 返回 ID 指向完整逻辑花费。建议使用自动费用，因为占用率和中继费率下限
@@ -217,21 +217,21 @@ elide-cli send o1... 10.5 --fee 0.012
 ### 历史与收据
 
 ```sh
-elide-cli history
-elide-cli history --last 20
-elide-cli history --address o1...
+jetsam-cli history
+jetsam-cli history --last 20
+jetsam-cli history --address o1...
 ```
 
 导出已确认的外发收据：
 
 ```sh
-elide-cli receipt TXID > receipt.hex
+jetsam-cli receipt TXID > receipt.hex
 ```
 
 验证：
 
 ```sh
-elide-cli verify "$(tr -d '\n' < receipt.hex)"
+jetsam-cli verify "$(tr -d '\n' < receipt.hex)"
 ```
 
 只有本机保存的不同所有者付款才能导出收据。
@@ -239,7 +239,7 @@ elide-cli verify "$(tr -d '\n' < receipt.hex)"
 ### 停止
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 该命令请求守护进程正常关闭，等同于 GUI 的普通退出流程，而不是强制终止进程。
@@ -250,7 +250,7 @@ elide-cli stop
 
 ```sh
 height="$(
-  elide-cli --json status |
+  jetsam-cli --json status |
     jq -er '.height'
 )"
 ```

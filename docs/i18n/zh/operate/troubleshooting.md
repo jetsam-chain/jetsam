@@ -29,7 +29,7 @@ elide --check-hardware
 检查：
 
 ```sh
-elide-cli peers
+jetsam-cli peers
 ```
 
 确认出站 DNS 和 TCP 可用、本机时间正确、P2P 监听配置无误。若要接受入站
@@ -50,9 +50,9 @@ elide-cli peers
 运行：
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 以 `--mode node` 启动的普通节点永远不会挖矿，即使旧 TOML 中包含

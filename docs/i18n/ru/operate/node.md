@@ -34,7 +34,7 @@ P2P-соединения принимаются на TCP `9600`. JSON-RPC дол
 архив до распаковки, заменив `VERSION` номером версии:
 
 ```sh
-grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
+grep '  jetsam-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -44,7 +44,7 @@ grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
 Распакуйте архив и проверьте оборудование:
 
 ```sh
-tar -xzf elide-core-vVERSION-linux-x86_64.tar.gz
+tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
 ./elide --check-hardware
 ```
 
@@ -57,7 +57,7 @@ NODE READY
 Установите ноду и CLI:
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 ```
 
 ## Системный пользователь
@@ -147,9 +147,9 @@ sudo journalctl -u elide -f
 По умолчанию CLI подключается к локальному RPC:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
 ```
 
 `status` должен показывать актуальную высоту, число в `peers` должно стать
@@ -175,9 +175,9 @@ sudo systemctl stop elide
 Установите проверенные новые бинарники и запустите:
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 sudo systemctl start elide
-elide-cli status
+jetsam-cli status
 ```
 
 При обычном обновлении не удаляйте `/var/lib/elide`. Если кошелёк ноды

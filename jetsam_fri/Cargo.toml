@@ -1,0 +1,11 @@
+[package]
+name = "jetsam_fri"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+rayon = "1.10"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }

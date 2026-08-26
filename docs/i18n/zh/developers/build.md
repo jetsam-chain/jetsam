@@ -43,9 +43,9 @@ cargo check --locked --workspace --all-targets
 
 ```sh
 cargo build --locked \
-  -p elide_node \
-  -p elide-extminer \
-  -p elide_gui \
+  -p jetsam_node \
+  -p jetsam-extminer \
+  -p jetsam_gui \
   --bins
 ```
 
@@ -55,12 +55,12 @@ cargo build --locked \
 ## 复现可靠性证书
 
 实际部署计算与证明文档位于
-[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness)。
+[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness)。
 
 ```sh
-cargo run --release --locked -p elide_soundness
-cargo run --release --locked -p elide_soundness -- --exact
-cargo test --release --locked -p elide_soundness
+cargo run --release --locked -p jetsam_soundness
+cargo run --release --locked -p jetsam_soundness -- --exact
+cargo test --release --locked -p jetsam_soundness
 ```
 
 ## 生成证明矩阵包
@@ -78,9 +78,9 @@ SHA256SUMS
 从诚实执行样例生成 B25 和 B255 矩阵：
 
 ```sh
-mkdir -p ../elide-artifacts
+mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../elide-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1
 ```
 
 生成开销很高；证明关系不变时只需执行一次。矩阵包应保存在 `target/`
@@ -93,7 +93,7 @@ mkdir -p ../elide-artifacts
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../elide-artifacts/history-step-pack-v1
+  --pack ../jetsam-artifacts/history-step-pack-v1
 ```
 
 脚本会：
@@ -136,8 +136,8 @@ README.txt
 LICENSE
 NOTICE
 elide
-elide-cli
-elide-miner
+jetsam-cli
+jetsam-miner
 ```
 
 GUI 包只包含应用及其私有节点，不包含运营 CLI 或外部挖矿工具。

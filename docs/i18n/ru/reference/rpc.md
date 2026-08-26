@@ -6,7 +6,7 @@ Core предоставляет JSON-RPC 2.0 через HTTP. Стандартн
 http://127.0.0.1:9601
 ```
 
-Имена всех методов начинаются с префикса пространства имён `paraelide_`. Параметры
+Имена всех методов начинаются с префикса пространства имён `parajetsam_`. Параметры
 передаются позиционными JSON-массивами.
 
 ```sh
@@ -15,7 +15,7 @@ curl --silent --show-error \
   --data '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "paraelide_getChainInfo",
+    "method": "parajetsam_getChainInfo",
     "params": []
   }' \
   http://127.0.0.1:9601

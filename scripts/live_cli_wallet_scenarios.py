@@ -9,8 +9,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "elide"
-CLI_BIN = ROOT / "target" / "release" / "elide-cli"
+NODE_BIN = ROOT / "target" / "release" / "jetsam"
+CLI_BIN = ROOT / "target" / "release" / "jetsam-cli"
 BASE = ROOT / "target" / "live-tests" / "cli-wallet"
 LOGS = BASE / "logs"
 
@@ -125,7 +125,7 @@ def rpc(url, method, params=None, timeout=8):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": f"paraelide_{method}",
+            "method": f"parajetsam_{method}",
             "params": params or [],
         }
     ).encode()
@@ -230,7 +230,7 @@ def cleanup(nodes):
 def main():
     if not NODE_BIN.exists() or not CLI_BIN.exists():
         raise LiveTestError(
-            "release binaries missing; run cargo build --release -p elide_node --bin elide --bin elide-cli"
+            "release binaries missing; run cargo build --release -p jetsam_node --bin jetsam --bin jetsam-cli"
         )
     if BASE.exists():
         shutil.rmtree(BASE)

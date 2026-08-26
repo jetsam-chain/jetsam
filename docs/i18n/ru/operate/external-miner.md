@@ -18,7 +18,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 В другом терминале:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -29,7 +29,7 @@ elide-miner \
 При необходимости ограничьте число потоков:
 
 ```sh
-elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## Удалённый вычислитель
@@ -70,7 +70,7 @@ elide \
 Тогда вычислитель может передать:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -95,7 +95,7 @@ elide-miner \
 Выполните:
 
 ```sh
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 Если запросы не проходят:

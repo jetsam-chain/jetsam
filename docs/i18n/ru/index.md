@@ -183,7 +183,7 @@ Parano1d прозрачен и не является приватным блок
 штатных профилей B25 и B255 их определения и целочисленное представление дают
 127 доказуемых и 127 предполагаемых бит. Полный расчёт и сравнение с
 опубликованными системами приведены в
-[доказательстве по Block–Tiwari](https://github.com/ignotusnemo/elide/blob/main/elide_soundness/docs/block-tiwari.md).
+[доказательстве по Block–Tiwari](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/block-tiwari.md).
 
 Отдельная сквозная игра корректности проверяет, способен ли один квантовый
 противник, сохраняющий состояние между запросами, заставить штатную проверяющую
@@ -192,7 +192,7 @@ Parano1d прозрачен и не является приватным блок
 Poseidon2b и стоимости когерентного ответа сквозная постквантовая корректность
 проверки текущего состояния сети доказана от генезиса на уровне NIST PQC
 Category 1. Полный вывод приведён в
-[доказательстве QROM и Category 1](https://github.com/ignotusnemo/elide/blob/main/elide_soundness/docs/category-one.md),
+[доказательстве QROM и Category 1](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/category-one.md),
 границы утверждения описаны в [модели безопасности](protocol/security-model.md).
 
 ## Профиль протокола

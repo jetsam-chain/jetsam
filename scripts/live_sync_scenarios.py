@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "elide"
+NODE_BIN = ROOT / "target" / "release" / "jetsam"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
@@ -50,7 +50,7 @@ def rpc(port, method, params=None, timeout=10):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
+            "method": method if method.startswith("parajetsam_") else f"parajetsam_{method}",
             "params": params or [],
         }
     ).encode()

@@ -44,9 +44,9 @@ cargo check --locked --workspace --all-targets
 
 ```sh
 cargo build --locked \
-  -p elide_node \
-  -p elide-extminer \
-  -p elide_gui \
+  -p jetsam_node \
+  -p jetsam-extminer \
+  -p jetsam_gui \
   --bins
 ```
 
@@ -58,12 +58,12 @@ cargo build --locked \
 ## Воспроизведение сертификата безопасности
 
 Штатные расчёты и доказательства находятся в
-[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
 
 ```sh
-cargo run --release --locked -p elide_soundness
-cargo run --release --locked -p elide_soundness -- --exact
-cargo test --release --locked -p elide_soundness
+cargo run --release --locked -p jetsam_soundness
+cargo run --release --locked -p jetsam_soundness -- --exact
+cargo test --release --locked -p jetsam_soundness
 ```
 
 ## Создание пакета матриц доказательства
@@ -81,9 +81,9 @@ SHA256SUMS
 Сгенерируйте матрицы B25 и B255 по корректным тестовым данным:
 
 ```sh
-mkdir -p ../elide-artifacts
+mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../elide-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1
 ```
 
 Генерация ресурсоёмка и нужна один раз, пока отношение не меняется. Храните
@@ -97,7 +97,7 @@ mkdir -p ../elide-artifacts
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../elide-artifacts/history-step-pack-v1
+  --pack ../jetsam-artifacts/history-step-pack-v1
 ```
 
 Скрипт:
@@ -141,8 +141,8 @@ README.txt
 LICENSE
 NOTICE
 elide
-elide-cli
-elide-miner
+jetsam-cli
+jetsam-miner
 ```
 
 GUI-пакет содержит только приложение и встроенную в него ноду. Операторский CLI и

@@ -10,26 +10,26 @@
 
 | 平台 | 安装包 |
 |---|---|
-| Debian 或 Ubuntu，x86-64 | `elide-gui-vVERSION-linux-x86_64.deb` |
-| Debian 或 Ubuntu，ARM64 | `elide-gui-vVERSION-linux-aarch64.deb` |
-| Windows x86-64 | `elide-gui-vVERSION-windows-x86_64-setup.exe` |
-| macOS Apple 芯片 | `elide-gui-vVERSION-macos-aarch64.dmg` |
-| macOS Intel | `elide-gui-vVERSION-macos-x86_64.dmg` |
+| Debian 或 Ubuntu，x86-64 | `jetsam-gui-vVERSION-linux-x86_64.deb` |
+| Debian 或 Ubuntu，ARM64 | `jetsam-gui-vVERSION-linux-aarch64.deb` |
+| Windows x86-64 | `jetsam-gui-vVERSION-windows-x86_64-setup.exe` |
+| macOS Apple 芯片 | `jetsam-gui-vVERSION-macos-aarch64.dmg` |
+| macOS Intel | `jetsam-gui-vVERSION-macos-x86_64.dmg` |
 
 同时下载该版本的 `SHA256SUMS`，打开安装包前先进行校验：
 
 ```sh
 # Linux
-sha256sum elide-gui-vVERSION-linux-x86_64.deb
+sha256sum jetsam-gui-vVERSION-linux-x86_64.deb
 
 # macOS
-shasum -a 256 elide-gui-vVERSION-macos-aarch64.dmg
+shasum -a 256 jetsam-gui-vVERSION-macos-aarch64.dmg
 ```
 
 Windows 请使用 PowerShell：
 
 ```powershell
-Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\jetsam-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 输出摘要必须与 `SHA256SUMS` 中对应的一行完全一致。
@@ -41,7 +41,7 @@ Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 用系统的软件中心打开 `.deb`，或执行：
 
 ```sh
-sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
+sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 ```
 
 然后从应用菜单启动 **Parano1d**。
@@ -104,7 +104,7 @@ sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
 Debian 或 Ubuntu：
 
 ```sh
-sudo apt remove elide-gui
+sudo apt remove jetsam-gui
 ```
 
 Windows 请使用 **已安装的应用 → Parano1d → 卸载**；macOS 则将

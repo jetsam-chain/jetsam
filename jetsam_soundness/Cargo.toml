@@ -1,0 +1,18 @@
+[package]
+name = "jetsam_soundness"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+readme = "README.md"
+description = "Executable soundness certificates for the production Parano1d protocol."
+
+[dependencies]
+jetsam_fri_binius = { path = "../jetsam_fri_binius" }
+jetsam_gkr = { path = "../jetsam_gkr" }
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_recursive = { path = "../jetsam_recursive" }
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"

@@ -4,8 +4,8 @@
 
 //! Minimal Field-R1CS vocabulary used by the parent-union certificate.
 
-pub use elide_ivc_core::field::F128;
-pub use elide_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
+pub use jetsam_ivc_core::field::F128;
+pub use jetsam_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
 
 #[inline]
 pub fn mul(builder: &mut FieldR1csBuilder, left: &LinExpr, right: &LinExpr) -> LinExpr {

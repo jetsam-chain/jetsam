@@ -36,14 +36,14 @@ use bench_prover::{
     HonestHistoryStepFixtureProvider, PreparedHistoryStepBackboneInput,
     PreparedHistoryStepTierFixture,
 };
-use elide_ivc_core::field_r1cs::CompactFieldR1cs;
-use elide_miner::history_step_artifacts::{
+use jetsam_ivc_core::field_r1cs::CompactFieldR1cs;
+use jetsam_miner::history_step_artifacts::{
     history_step_matrix_file_name, HISTORY_STEP_PACK_LEAF_HASH_DOMAIN,
     HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
     HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
-use elide_poseidon2b::native::poseidon2b_hash_byte_slices;
-use elide_recursive::{
+use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
+use jetsam_recursive::{
     canonical_history_step_shape, decode_history_step_terminal,
     decode_verify_history_step_terminal, encode_history_step_terminal,
     prepare_history_step_for_pow, prove_built_history_step_terminal, prove_history_step,
@@ -261,7 +261,7 @@ fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), S
         &metadata_path,
         HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES as u64,
     )?;
-    let metadata = elide_miner::decode_history_step_runtime_metadata_pinned(
+    let metadata = jetsam_miner::decode_history_step_runtime_metadata_pinned(
         &encoded,
         parse_digest(METADATA_DIGEST_ENV)?,
     )
@@ -286,7 +286,7 @@ fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), S
 
 fn finish_fixture<const TIER: usize>(
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(elide_chain::Block, HistoryStepBlockInput<TIER>), String> {
+) -> Result<(jetsam_chain::Block, HistoryStepBlockInput<TIER>), String> {
     let (witness, nonce, start, end) = fixture.into_parts();
     witness
         .finish(nonce, &start, &end)
@@ -295,7 +295,7 @@ fn finish_fixture<const TIER: usize>(
 
 fn finish_fixture_template<const TIER: usize>(
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(elide_chain::Block, HistoryStepBlockInput<TIER>, u128), String> {
+) -> Result<(jetsam_chain::Block, HistoryStepBlockInput<TIER>, u128), String> {
     let (witness, nonce, start, end) = fixture.into_parts();
     let (mut block, input) = witness
         .finish_template(&start, &end)
@@ -308,7 +308,7 @@ fn prove_parent_step<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(elide_chain::Block, HistoryStepTerminal), String> {
+) -> Result<(jetsam_chain::Block, HistoryStepTerminal), String> {
     let (block, input) = finish_fixture(fixture)?;
     let terminal = prove_history_step(runtime, parent, input)
         .map_err(|error| format!("prove honest B{TIER} setup step: {error}"))?;
@@ -319,8 +319,8 @@ fn build_parent(
     runtime: &HistoryStepRuntime,
     provider: &mut HonestHistoryStepFixtureProvider,
     target_parent_slot: usize,
-) -> Result<(elide_chain::Block, HistoryStepTerminal), String> {
-    let mut expected = elide_recursive::genesis_accumulator();
+) -> Result<(jetsam_chain::Block, HistoryStepTerminal), String> {
+    let mut expected = jetsam_recursive::genesis_accumulator();
     let mut parent = None;
     loop {
         let step = provider.next_backbone(&expected)?.ok_or_else(|| {
@@ -392,7 +392,7 @@ fn benchmark_tier<const TIER: usize>(
     let prove_encode_ms = prove_started.elapsed().as_millis();
     let history_step_ms = (input_preparation + history_step_started.elapsed()).as_millis();
     let terminal_bytes = encoded.len();
-    let epoch_anchor = elide_chain::consensus::genesis_header();
+    let epoch_anchor = jetsam_chain::consensus::genesis_header();
     let verify_started = Instant::now();
     let accepted =
         decode_verify_history_step_terminal(runtime, &encoded, &block.header, &epoch_anchor)
@@ -509,7 +509,7 @@ fn run_on_production_pool() -> Result<(), String> {
         &runtime,
         &parent_wire,
         &parent_block.header,
-        &elide_chain::consensus::genesis_header(),
+        &jetsam_chain::consensus::genesis_header(),
     )
     .map_err(|error| format!("verify benchmark parent: {error}"))?;
     if accepted_parent.class_id() != parent.class_id()
@@ -547,14 +547,14 @@ fn run_on_production_pool() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let cpu_plan =
-        elide_miner::configure_process_cpu_budget(elide_miner::ProcessCpuBudgetMode::ProofOnly)
+        jetsam_miner::configure_process_cpu_budget(jetsam_miner::ProcessCpuBudgetMode::ProofOnly)
             .map_err(|error| format!("configure production CPU pool: {error}"))?;
-    let hardware = elide_core::cpu::ProductionHardwareReport::detect();
+    let hardware = jetsam_core::cpu::ProductionHardwareReport::detect();
     println!(
         "HistoryStep benchmark backend={} threads={}",
         hardware.backend, cpu_plan.history_step_phase_threads,
     );
-    elide_miner::install_history_step_phase_cpu(run_on_production_pool)
+    jetsam_miner::install_history_step_phase_cpu(run_on_production_pool)
         .map_err(|error| format!("enter production HistoryStep CPU phase: {error}"))?
 }
 

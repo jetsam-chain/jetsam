@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_BIN = Path(
-    os.environ.get("ELIDE_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "elide"))
+    os.environ.get("ELIDE_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "jetsam"))
 ).resolve()
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -70,7 +70,7 @@ def rpc(port, method, params=None, timeout=15, host="127.0.0.1"):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("paraelide_") else f"paraelide_{method}",
+            "method": method if method.startswith("parajetsam_") else f"parajetsam_{method}",
             "params": params or [],
         }
     ).encode()

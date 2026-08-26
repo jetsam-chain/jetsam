@@ -30,7 +30,7 @@ ELIDE_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
 隔离式实际部署基准测试需要完整且经过认证的矩阵包。分别运行两个类别，以便输出明确标识父类别和子类别。
 
 ```sh
-ELIDE_PACK_ROOT=../elide-artifacts/history-step-pack-v1
+ELIDE_PACK_ROOT=../jetsam-artifacts/history-step-pack-v1
 source "$ELIDE_PACK_ROOT/pins.env"
 export ELIDE_HISTORY_STEP_PACK_DIR="$ELIDE_PACK_ROOT"
 

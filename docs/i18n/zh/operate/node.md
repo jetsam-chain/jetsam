@@ -32,7 +32,7 @@
 版本号：
 
 ```sh
-grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
+grep '  jetsam-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -42,7 +42,7 @@ grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
 解压并运行硬件检查：
 
 ```sh
-tar -xzf elide-core-vVERSION-linux-x86_64.tar.gz
+tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
 ./elide --check-hardware
 ```
 
@@ -55,7 +55,7 @@ NODE READY
 安装节点和 CLI：
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 ```
 
 ## 创建服务账户
@@ -144,9 +144,9 @@ sudo journalctl -u elide -f
 CLI 默认连接本地 RPC：
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
 ```
 
 `status` 应报告当前高度，`peers` 应变为非零，`state` 则显示经过认证的
@@ -172,9 +172,9 @@ sudo systemctl stop elide
 安装已校验的新二进制，再启动：
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 sudo systemctl start elide
-elide-cli status
+jetsam-cli status
 ```
 
 普通软件更新不应删除 `/var/lib/elide`。若节点钱包收到资金，请单独

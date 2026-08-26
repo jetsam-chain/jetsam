@@ -100,7 +100,7 @@ apply to ordinary node mode or to the separate external worker.
 substantially noisier.
 
 Under systemd, output goes to the journal. The GUI redirects its private node
-to `elide-node.log` in the selected data directory.
+to `jetsam-node.log` in the selected data directory.
 
 ## Preflight
 

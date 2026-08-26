@@ -1,0 +1,13 @@
+[package]
+name = "jetsam_block"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+jetsam_core       = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_tx         = { path = "../jetsam_tx" }
+jetsam_gkr        = { path = "../jetsam_gkr" }
+jetsam_chain      = { path = "../jetsam_chain" }
+jetsam_recursive  = { path = "../jetsam_recursive" }

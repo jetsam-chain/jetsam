@@ -5,13 +5,13 @@
 //! Research imports the production PagedSpend primitive and stream validator.
 //! No consensus candidate is duplicated here.
 
-pub use elide_chain::consensus::paged_spend::{
+pub use jetsam_chain::consensus::paged_spend::{
     validate_paged_spend_tx_page_stream as validate_paged_spend_stream,
     validate_paged_spend_tx_page_stream_for_class as validate_paged_spend_stream_for_class,
     BlockProofClass as ProofClass, PagedSpendGroupFacts, PagedSpendStreamError,
     PagedSpendStreamFacts,
 };
-pub use elide_tx::{
+pub use jetsam_tx::{
     canonical_paged_spend_auth, hash_paged_spend, validate_paged_spend, CanonicalPagedSpendAuth,
     PagedSpendError, PagedSpendFacts, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS,
     MAX_PAGED_SPEND_INTENT_BYTES, MAX_PAGED_SPEND_OUTPUTS, MAX_PAGED_SPEND_PAGES,

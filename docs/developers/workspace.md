@@ -6,40 +6,40 @@ The repository is split by proof and trust boundary rather than by binary.
 
 | Crate | Responsibility |
 |---|---|
-| `elide_core` | Binary tower field, packed kernels and CPU dispatch |
-| `elide_poseidon2b` | Poseidon2b permutation, domains, hashes and batch execution |
-| `elide_fri` | FRI primitives |
-| `elide_fri_binius` | Binary-field FRI-Binius/BaseFold integration |
-| `elide_ivc_core` | Recursive public I/O and verifier foundations |
-| `elide_ivc_prover` | Recursive prover implementation |
-| `elide_gkr` | [FROST-GKR](../research/frost-gkr.md) relations and wallet authorization |
-| `elide_recursive` | `HistoryStep`, exact-State relation and recursive acceptance |
-| `elide_soundness` | Source-bound Block–Tiwari, QROM and Category 1 certificate |
+| `jetsam_core` | Binary tower field, packed kernels and CPU dispatch |
+| `jetsam_poseidon2b` | Poseidon2b permutation, domains, hashes and batch execution |
+| `jetsam_fri` | FRI primitives |
+| `jetsam_fri_binius` | Binary-field FRI-Binius/BaseFold integration |
+| `jetsam_ivc_core` | Recursive public I/O and verifier foundations |
+| `jetsam_ivc_prover` | Recursive prover implementation |
+| `jetsam_gkr` | [FROST-GKR](../research/frost-gkr.md) relations and wallet authorization |
+| `jetsam_recursive` | `HistoryStep`, exact-State relation and recursive acceptance |
+| `jetsam_soundness` | Source-bound Block–Tiwari, QROM and Category 1 certificate |
 | `bench_prover` | Matrix generation, pin tools and proof benchmarks |
 
 ## Protocol objects
 
 | Crate | Responsibility |
 |---|---|
-| `elide_tx` | Fixed `Tx8x2`, logical `PagedSpend`, IDs and authorization binding |
-| `elide_block` | Block-level proof composition |
-| `elide_chain` | Headers, consensus, State, fees, receipts, MDBX and snapshots |
+| `jetsam_tx` | Fixed `Tx8x2`, logical `PagedSpend`, IDs and authorization binding |
+| `jetsam_block` | Block-level proof composition |
+| `jetsam_chain` | Headers, consensus, State, fees, receipts, MDBX and snapshots |
 
-`elide_tx` contains representation-level rules that can be checked without a
-chain. `elide_chain` adds current epoch, Live State, issuance, allocation and
+`jetsam_tx` contains representation-level rules that can be checked without a
+chain. `jetsam_chain` adds current epoch, Live State, issuance, allocation and
 fork context.
 
 ## Runtime
 
 | Crate | Responsibility |
 |---|---|
-| `elide_mempool` | Intent admission, CPU permits, conflicts and selection metadata |
-| `elide_miner` | Shared CPU plan, template construction, proof and PoW |
-| `elide_p2p` | libp2p discovery, gossip, sync and resource limits |
-| `elide_rpc` | Typed JSON-RPC API and wallet operations |
-| `elide_node` | Daemon, CLI, wallet state and subsystem orchestration |
-| `elide_gui` | Native multilingual wallet and private-node supervision |
-| `elide_extminer` | External Poseidon2b nonce worker |
+| `jetsam_mempool` | Intent admission, CPU permits, conflicts and selection metadata |
+| `jetsam_miner` | Shared CPU plan, template construction, proof and PoW |
+| `jetsam_p2p` | libp2p discovery, gossip, sync and resource limits |
+| `jetsam_rpc` | Typed JSON-RPC API and wallet operations |
+| `jetsam_node` | Daemon, CLI, wallet state and subsystem orchestration |
+| `jetsam_gui` | Native multilingual wallet and private-node supervision |
+| `jetsam_extminer` | External Poseidon2b nonce worker |
 
 ## Dependency direction
 

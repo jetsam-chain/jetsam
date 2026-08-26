@@ -91,7 +91,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="elide-gui-v$RELEASE_VERSION-linux-x86_64.deb"
+    GUI_ARTIFACT_NAME="jetsam-gui-v$RELEASE_VERSION-linux-x86_64.deb"
     ;;
   aarch64-unknown-linux-gnu)
     PLATFORM=linux-aarch64
@@ -99,7 +99,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable AArch64 control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="elide-gui-v$RELEASE_VERSION-linux-aarch64.deb"
+    GUI_ARTIFACT_NAME="jetsam-gui-v$RELEASE_VERSION-linux-aarch64.deb"
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
@@ -107,7 +107,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
-    GUI_ARTIFACT_NAME="elide-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
+    GUI_ARTIFACT_NAME="jetsam-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
     ;;
   aarch64-apple-darwin)
     PLATFORM=macos-aarch64
@@ -115,7 +115,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable Apple Silicon control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="elide-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
+    GUI_ARTIFACT_NAME="jetsam-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
     ;;
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
@@ -123,7 +123,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable Intel x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="elide-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
+    GUI_ARTIFACT_NAME="jetsam-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
     ;;
   *) release_die "unsupported release host: $HOST_TRIPLE" ;;
 esac
@@ -133,10 +133,10 @@ if [[ $PLATFORM == macos-* ]]; then
 fi
 
 if [[ $ARCHIVE_KIND == zip ]]; then
-  ARCHIVE_NAME="elide-core-v$RELEASE_VERSION-$PLATFORM.zip"
+  ARCHIVE_NAME="jetsam-core-v$RELEASE_VERSION-$PLATFORM.zip"
   release_require_command 7z
 else
-  ARCHIVE_NAME="elide-core-v$RELEASE_VERSION-$PLATFORM.tar.gz"
+  ARCHIVE_NAME="jetsam-core-v$RELEASE_VERSION-$PLATFORM.tar.gz"
 fi
 
 RELEASE_PARENT=$(dirname -- "$RELEASE_DIR")
@@ -214,33 +214,33 @@ export ELIDE_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIG
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'
-cargo build --locked --release --target "$HOST_TRIPLE" -p elide_node --bins
+cargo build --locked --release --target "$HOST_TRIPLE" -p jetsam_node --bins
 cargo build --locked --release --target "$HOST_TRIPLE" \
-  -p elide-extminer --bin elide-miner
+  -p jetsam-extminer --bin jetsam-miner
 cargo build --locked --release --target "$HOST_TRIPLE" \
-  -p elide_gui --bin elide-gui
+  -p jetsam_gui --bin jetsam-gui
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"
-for binary in elide elide-cli elide-miner; do
+for binary in elide jetsam-cli jetsam-miner; do
   [[ -f $TARGET_BIN_DIR/$binary$BINARY_SUFFIX ]] || \
     release_die "release binary is missing: $TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
 done
-[[ -f $TARGET_BIN_DIR/elide-gui$BINARY_SUFFIX ]] || \
-  release_die "release GUI is missing: $TARGET_BIN_DIR/elide-gui$BINARY_SUFFIX"
+[[ -f $TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX ]] || \
+  release_die "release GUI is missing: $TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX"
 
 CURRENT_STAGE='native smoke test'
 printf '\n==> Smoke-testing native executables\n'
 "$TARGET_BIN_DIR/elide$BINARY_SUFFIX" --check-hardware >/dev/null
 "$TARGET_BIN_DIR/elide$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/elide-cli$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/elide-miner$BINARY_SUFFIX" --check-hardware >/dev/null
-"$TARGET_BIN_DIR/elide-miner$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/elide-gui$BINARY_SUFFIX" --release-self-check >/dev/null
+"$TARGET_BIN_DIR/jetsam-cli$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --check-hardware >/dev/null
+"$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX" --release-self-check >/dev/null
 
 CURRENT_STAGE='binary packaging'
 printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
 mkdir -- "$BIN_DIR"
-for binary in elide elide-cli elide-miner; do
+for binary in elide jetsam-cli jetsam-miner; do
   cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
   chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
 done
@@ -248,11 +248,11 @@ done
 CURRENT_STAGE='GUI wallet packaging'
 printf '\n==> Packaging %s\n' "$GUI_ARTIFACT_NAME"
 mkdir -- "$GUI_BIN_DIR"
-cp -- "$TARGET_BIN_DIR/elide-gui$BINARY_SUFFIX" \
-  "$GUI_BIN_DIR/elide-gui$BINARY_SUFFIX"
+cp -- "$TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/jetsam-gui$BINARY_SUFFIX"
 cp -- "$TARGET_BIN_DIR/elide$BINARY_SUFFIX" \
   "$GUI_BIN_DIR/elide$BINARY_SUFFIX"
-chmod 0755 "$GUI_BIN_DIR/elide-gui$BINARY_SUFFIX" 2>/dev/null || true
+chmod 0755 "$GUI_BIN_DIR/jetsam-gui$BINARY_SUFFIX" 2>/dev/null || true
 chmod 0755 "$GUI_BIN_DIR/elide$BINARY_SUFFIX" 2>/dev/null || true
 case "$PLATFORM" in
   linux-*)
@@ -286,8 +286,8 @@ archive_entries=(
   LICENSE
   NOTICE
   "elide$BINARY_SUFFIX"
-  "elide-cli$BINARY_SUFFIX"
-  "elide-miner$BINARY_SUFFIX"
+  "jetsam-cli$BINARY_SUFFIX"
+  "jetsam-miner$BINARY_SUFFIX"
 )
 
 if [[ $ARCHIVE_KIND == zip ]]; then

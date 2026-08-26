@@ -25,7 +25,7 @@ A mining node owns the block. It:
 - validates the winning nonce;
 - commits and broadcasts the complete `{block, HistoryStep terminal}` bundle.
 
-Nonce search may run inside that process or in `elide-miner`. An external
+Nonce search may run inside that process or in `jetsam-miner`. An external
 worker has a much narrower role:
 
 - receive one immutable Poseidon2b header schedule and target;
@@ -66,7 +66,7 @@ chooses between valid competing chains.
 | Mode | Proof construction | Nonce search | Best fit |
 |---|---|---|---|
 | Internal | Core node | Core node | GUI wallet, solo miner, one server |
-| External | Core node | `elide-miner` | Separate CPU worker, private mining network or pool |
+| External | Core node | `jetsam-miner` | Separate CPU worker, private mining network or pool |
 
 Both modes use the same consensus rules and produce the same blocks. External
 mining moves only nonce search across the RPC boundary.
@@ -114,9 +114,9 @@ elide --mode miner --miner-address o1...
 Watch readiness and chain progress from another terminal:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 Core waits rather than mining an isolated local view when it is unsynchronized
@@ -136,7 +136,7 @@ elide \
 Run the worker against its loopback RPC endpoint:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key '<long-random-token>' \
   --threads 12
@@ -205,7 +205,7 @@ the canonical block-hash tie-break.
 The current reward follows the active State level and is displayed by:
 
 ```sh
-elide-cli mining
+jetsam-cli mining
 ```
 
 During the three-year development allocation, the miner receives 90% of newly

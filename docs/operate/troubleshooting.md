@@ -32,7 +32,7 @@ elide --check-hardware
 Check:
 
 ```sh
-elide-cli peers
+jetsam-cli peers
 ```
 
 Confirm outbound DNS and TCP access, local time, and the P2P listener setting.
@@ -54,9 +54,9 @@ Mining needs:
 Use:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 An ordinary node started with `--mode node` never mines even if an old TOML

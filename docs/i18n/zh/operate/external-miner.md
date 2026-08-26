@@ -16,7 +16,7 @@ elide --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 在另一个终端运行：
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN'
 ```
@@ -27,7 +27,7 @@ token。
 需要时可限制挖矿进程的线程数：
 
 ```sh
-elide-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
 ## 远程挖矿进程
@@ -62,7 +62,7 @@ elide \
 此后挖矿进程可以使用：
 
 ```sh
-elide-miner \
+jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
   --coinbase o1...
 ```
@@ -84,7 +84,7 @@ nonce 索引和目标值。挖矿进程搜索随机且互不重叠的 nonce 范�
 运行：
 
 ```sh
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 请求失败时：

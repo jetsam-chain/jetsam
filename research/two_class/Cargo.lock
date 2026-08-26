@@ -274,45 +274,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "elide-ivc-core"
+name = "jetsam-ivc-core"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "elide_core",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_poseidon2b",
  "rayon",
  "serde",
  "toml",
 ]
 
 [[package]]
-name = "elide-ivc-prover"
+name = "jetsam-ivc-prover"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "elide-ivc-core",
+ "jetsam-ivc-core",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "elide_chain"
+name = "jetsam_chain"
 version = "0.0.2"
 dependencies = [
  "bincode",
  "libmdbx",
- "elide_core",
- "elide_fri",
- "elide_fri_binius",
- "elide_poseidon2b",
- "elide_tx",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
  "rayon",
  "serde",
  "tracing",
 ]
 
 [[package]]
-name = "elide_core"
+name = "jetsam_core"
 version = "0.0.2"
 dependencies = [
  "rand",
@@ -322,23 +322,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "elide_fri"
+name = "jetsam_fri"
 version = "0.0.2"
 dependencies = [
- "elide_core",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_poseidon2b",
  "rand",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "elide_fri_binius"
+name = "jetsam_fri_binius"
 version = "0.0.2"
 dependencies = [
- "elide_core",
- "elide_fri",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_poseidon2b",
  "rand_core",
  "rayon",
  "serde",
@@ -346,15 +346,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "elide_gkr"
+name = "jetsam_gkr"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "elide_core",
- "elide_fri",
- "elide_fri_binius",
- "elide_poseidon2b",
- "elide_tx",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
  "rand_core",
  "rayon",
  "serde",
@@ -362,12 +362,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "elide_poseidon2b"
+name = "jetsam_poseidon2b"
 version = "0.0.2"
 dependencies = [
  "bech32",
  "hex",
- "elide_core",
+ "jetsam_core",
  "rand",
  "rayon",
  "serde",
@@ -375,30 +375,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "elide_recursive"
+name = "jetsam_recursive"
 version = "0.0.2"
 dependencies = [
  "bincode",
- "elide-ivc-core",
- "elide-ivc-prover",
- "elide_chain",
- "elide_core",
- "elide_fri",
- "elide_fri_binius",
- "elide_gkr",
- "elide_poseidon2b",
- "elide_tx",
+ "jetsam-ivc-core",
+ "jetsam-ivc-prover",
+ "jetsam_chain",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_gkr",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
  "rayon",
  "serde",
  "tracing",
 ]
 
 [[package]]
-name = "elide_tx"
+name = "jetsam_tx"
 version = "0.0.2"
 dependencies = [
- "elide_core",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_poseidon2b",
  "serde",
 ]
 
@@ -419,18 +419,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "paraelide-two-class-research"
+name = "parajetsam-two-class-research"
 version = "0.0.0"
 dependencies = [
- "elide-ivc-core",
- "elide_chain",
- "elide_core",
- "elide_fri",
- "elide_fri_binius",
- "elide_gkr",
- "elide_poseidon2b",
- "elide_recursive",
- "elide_tx",
+ "jetsam-ivc-core",
+ "jetsam_chain",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_gkr",
+ "jetsam_poseidon2b",
+ "jetsam_recursive",
+ "jetsam_tx",
 ]
 
 [[package]]

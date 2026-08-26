@@ -1,0 +1,29 @@
+[package]
+name        = "jetsam-extminer"
+version.workspace = true
+edition     = "2021"
+license     = "Apache-2.0"
+description = "External Poseidon2b PoW miner for ParanO(1)d"
+default-run = "jetsam-miner"
+
+[[bin]]
+name = "jetsam-miner"
+path = "src/main.rs"
+
+[dependencies]
+# PoW hashing
+jetsam_core      = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+rayon      = "1"
+
+# HTTP / JSON-RPC
+reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde      = { version = "1",    features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Misc
+hex    = "0.4"
+anyhow = "1"

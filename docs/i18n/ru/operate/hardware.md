@@ -24,7 +24,7 @@
 
 ```sh
 elide --check-hardware
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 Успешный отчёт ноды заканчивается строкой:
@@ -123,7 +123,7 @@ RSS равен их сумме. Память также расходуют ма�
 
 ```sh
 du -sh ~/.elide/data
-elide-cli state
+jetsam-cli state
 ```
 
 Для синхронизации по снимку требуется временное место под полную копию `State`
@@ -146,9 +146,9 @@ RPC на TCP `9601` — административный интерфейс. О�
 Пересматривайте ресурсы при заметном изменении размера Live State или трафика:
 
 ```sh
-elide-cli status
-elide-cli state
-elide-cli peers
+jetsam-cli status
+jetsam-cli state
+jetsam-cli peers
 du -sh ~/.elide/data
 ```
 

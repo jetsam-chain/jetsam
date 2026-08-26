@@ -18,12 +18,12 @@ cargo test --locked -p CHANGED_CRATE
 
 ```sh
 cargo test --locked \
-  -p elide_tx \
-  -p elide_chain \
-  -p elide_mempool \
-  -p elide_miner \
-  -p elide_rpc \
-  -p elide_node
+  -p jetsam_tx \
+  -p jetsam_chain \
+  -p jetsam_mempool \
+  -p jetsam_miner \
+  -p jetsam_rpc \
+  -p jetsam_node
 ```
 
 ## Вычислительные ядра системы доказательств
@@ -32,9 +32,9 @@ cargo test --locked \
 
 ```sh
 cargo test --locked --release \
-  -p elide_core \
-  -p elide_poseidon2b \
-  -p elide-ivc-core
+  -p jetsam_core \
+  -p jetsam_poseidon2b \
+  -p jetsam-ivc-core
 ```
 
 На x86-64 принудительно проверьте минимальную штатную реализацию:
@@ -42,7 +42,7 @@ cargo test --locked --release \
 ```sh
 ELIDE_CPU_BACKEND=pclmul \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b -p elide-ivc-core
+  -p jetsam_core -p jetsam_poseidon2b -p jetsam-ivc-core
 ```
 
 Скалярная реализация используется только для дифференциальной проверки:
@@ -50,7 +50,7 @@ ELIDE_CPU_BACKEND=pclmul \
 ```sh
 ELIDE_CPU_BACKEND=scalar \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b
+  -p jetsam_core -p jetsam_poseidon2b
 ```
 
 ## Обязательные проверки релиза

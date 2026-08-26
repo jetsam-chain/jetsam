@@ -1,0 +1,17 @@
+[package]
+name = "jetsam_fri_binius"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+jetsam_core = { path = "../jetsam_core" }
+jetsam_fri = { path = "../jetsam_fri" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+rand_core = "0.6"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+rand = "0.8"

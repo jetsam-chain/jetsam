@@ -43,9 +43,9 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 name = "frost-gkr-bench"
 version = "0.1.0"
 dependencies = [
- "elide_core",
- "elide_gkr",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_gkr",
+ "jetsam_poseidon2b",
 ]
 
 [[package]]
@@ -66,17 +66,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "elide_air"
+name = "jetsam_air"
 version = "0.1.0"
 dependencies = [
- "elide_core",
- "elide_poseidon2b",
- "elide_tx",
+ "jetsam_core",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
  "rayon",
 ]
 
 [[package]]
-name = "elide_core"
+name = "jetsam_core"
 version = "0.1.0"
 dependencies = [
  "rand",
@@ -86,32 +86,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "elide_gkr"
+name = "jetsam_gkr"
 version = "0.1.0"
 dependencies = [
- "elide_air",
- "elide_core",
- "elide_poseidon2b",
- "elide_tx",
+ "jetsam_air",
+ "jetsam_core",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
  "rayon",
 ]
 
 [[package]]
-name = "elide_poseidon2b"
+name = "jetsam_poseidon2b"
 version = "0.1.0"
 dependencies = [
- "elide_core",
+ "jetsam_core",
  "rand",
  "rayon",
  "serde",
 ]
 
 [[package]]
-name = "elide_tx"
+name = "jetsam_tx"
 version = "0.1.0"
 dependencies = [
- "elide_core",
- "elide_poseidon2b",
+ "jetsam_core",
+ "jetsam_poseidon2b",
 ]
 
 [[package]]

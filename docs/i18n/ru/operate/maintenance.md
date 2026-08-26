@@ -8,11 +8,11 @@ Parano1d транзакционно хранит Live State. Для обычно
 Используйте локальный CLI:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
-elide-cli mempool
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
+jetsam-cli mempool
+jetsam-cli mining
 ```
 
 С systemd:
@@ -62,7 +62,7 @@ DATA_DIR/wallet.receipts
 1. скачайте новый архив и соответствующий `SHA256SUMS`;
 2. проверьте хэш;
 3. остановите службу;
-4. одновременно замените `elide`, `elide-cli` и `elide-miner`;
+4. одновременно замените `elide`, `jetsam-cli` и `jetsam-miner`;
 5. запустите службу;
 6. проверьте запуск и синхронизацию.
 

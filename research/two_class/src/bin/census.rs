@@ -2,7 +2,7 @@
 // Copyright (C) 2026 trace.protocol.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-use paraelide_two_class_research::{geometry, parent_union};
+use parajetsam_two_class_research::{geometry, parent_union};
 
 fn main() {
     println!("B25/B255 isolated PagedSpend research census");

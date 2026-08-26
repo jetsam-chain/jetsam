@@ -6,12 +6,12 @@ use std::hint::black_box;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use elide_core::Block128;
-use elide_gkr::{
+use jetsam_core::Block128;
+use jetsam_gkr::{
     compute_tx_body_hash, discharge_boundary_native, discharge_reductions_native, prove_spine,
     prove_spine_killshot, verify_spine, verify_spine_killshot, SpineCircuit, SpineInputs,
 };
-use elide_poseidon2b::channel::Poseidon2bChannel;
+use jetsam_poseidon2b::channel::Poseidon2bChannel;
 
 const PINNED_REVISION: &str = "8e514ff4eb59e7925992e8274c4f10214d7c6b9f";
 const ARTIFACT_URL: &str = "https://github.com/ignotusnemo/elide/tree/main/research/frost_gkr";

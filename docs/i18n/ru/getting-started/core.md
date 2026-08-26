@@ -3,8 +3,8 @@
 Архив Core предназначен для операторов нод, майнеров и разработчиков. В него входят:
 
 - `elide` — полная нода со встроенным майнером;
-- `elide-cli` — локальный клиент ноды и кошелька;
-- `elide-miner` — внешний вычислитель PoW.
+- `jetsam-cli` — локальный клиент ноды и кошелька;
+- `jetsam-miner` — внешний вычислитель PoW.
 
 GUI-кошелёк распространяется отдельно.
 
@@ -13,11 +13,11 @@ GUI-кошелёк распространяется отдельно.
 Выберите архив Core для своей платформы:
 
 ```text
-elide-core-vVERSION-linux-x86_64.tar.gz
-elide-core-vVERSION-linux-aarch64.tar.gz
-elide-core-vVERSION-windows-x86_64.zip
-elide-core-vVERSION-macos-aarch64.tar.gz
-elide-core-vVERSION-macos-x86_64.tar.gz
+jetsam-core-vVERSION-linux-x86_64.tar.gz
+jetsam-core-vVERSION-linux-aarch64.tar.gz
+jetsam-core-vVERSION-windows-x86_64.zip
+jetsam-core-vVERSION-macos-aarch64.tar.gz
+jetsam-core-vVERSION-macos-x86_64.tar.gz
 ```
 
 Перед распаковкой сравните SHA-256 архива со значением в файле
@@ -69,9 +69,9 @@ NODE READY
 В другом терминале можно проверить состояние:
 
 ```sh
-./elide-cli status
-./elide-cli peers
-./elide-cli state
+./jetsam-cli status
+./jetsam-cli peers
+./jetsam-cli state
 ```
 
 По умолчанию P2P-нода слушает `0.0.0.0:9600`, а RPC доступен только на
@@ -80,7 +80,7 @@ NODE READY
 Для корректной остановки выполните:
 
 ```sh
-./elide-cli stop
+./jetsam-cli stop
 ```
 
 Настройка постоянной системной службы, межсетевого экрана и обновлений

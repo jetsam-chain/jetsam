@@ -94,7 +94,7 @@ elide --mode extminer --mining-key TOKEN
 `info`。`debug` 适合有时间边界的诊断，但日志量会明显增加。
 
 systemd 环境下输出进入 journal。GUI 则把私有节点日志写入所选数据目录的
-`elide-node.log`。
+`jetsam-node.log`。
 
 ## 启动前检查
 

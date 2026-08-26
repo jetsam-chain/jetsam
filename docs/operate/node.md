@@ -34,7 +34,7 @@ Download the archive for the server architecture and `SHA256SUMS` from the
 archive before extracting it. Replace `VERSION` with the release number:
 
 ```sh
-grep '  elide-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
+grep '  jetsam-core-vVERSION-linux-x86_64.tar.gz$' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -44,7 +44,7 @@ The command must report `OK`. For ARM64, replace `linux-x86_64` with
 Extract the archive and run the hardware check:
 
 ```sh
-tar -xzf elide-core-vVERSION-linux-x86_64.tar.gz
+tar -xzf jetsam-core-vVERSION-linux-x86_64.tar.gz
 ./elide --check-hardware
 ```
 
@@ -57,7 +57,7 @@ NODE READY
 Install the node and CLI:
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 ```
 
 ## Create the service account
@@ -147,9 +147,9 @@ sudo journalctl -u elide -f
 The CLI connects to the local RPC endpoint by default:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
 ```
 
 `status` should report the current height, `peers` should become non-zero, and
@@ -176,9 +176,9 @@ sudo systemctl stop elide
 Install the verified replacement binaries, then restart:
 
 ```sh
-sudo install -m 0755 elide elide-cli /usr/local/bin/
+sudo install -m 0755 elide jetsam-cli /usr/local/bin/
 sudo systemctl start elide
-elide-cli status
+jetsam-cli status
 ```
 
 Do not remove `/var/lib/elide` during an ordinary software update. If the

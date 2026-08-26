@@ -1,0 +1,10 @@
+[package]
+name = "jetsam_tx"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+serde = { version = "1", features = ["derive"] }

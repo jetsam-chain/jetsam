@@ -21,7 +21,7 @@ Parano1d 不会让链龄成为永久的历史执行负担，但节点仍需要�
 
 ```sh
 elide --check-hardware
-elide-miner --check-hardware
+jetsam-miner --check-hardware
 ```
 
 节点检查成功时以以下内容结束：
@@ -108,7 +108,7 @@ CPU 代际、时钟、内存带宽和选中的无进位乘法后端，比服务�
 
 ```sh
 du -sh ~/.elide/data
-elide-cli state
+jetsam-cli state
 ```
 
 快照同步在原子安装前，需要临时保存一份完整候选 State。请为已经安装的 Live State、
@@ -127,9 +127,9 @@ TCP `9601` 上的 RPC 是管理接口。除非有私有或认证传输保护，�
 Live State 规模或流量显著变化后，应重新检查容量：
 
 ```sh
-elide-cli status
-elide-cli state
-elide-cli peers
+jetsam-cli status
+jetsam-cli state
+jetsam-cli peers
 du -sh ~/.elide/data
 ```
 

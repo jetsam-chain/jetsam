@@ -33,7 +33,7 @@ elide --check-hardware
 Проверьте:
 
 ```sh
-elide-cli peers
+jetsam-cli peers
 ```
 
 Убедитесь, что доступны исходящие DNS и TCP, системное время верно, а
@@ -55,9 +55,9 @@ P2P-интерфейс настроен правильно. Для входящ�
 Используйте:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 Обычная нода с `--mode node` не майнит, даже если старый TOML содержит

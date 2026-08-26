@@ -5,8 +5,8 @@ The Core archive contains three executables:
 | Executable | Role |
 |---|---|
 | `elide` | Full node, wallet backend and optional internal proof/mining pipeline |
-| `elide-cli` | Thin JSON-RPC client for a running node |
-| `elide-miner` | Separate Poseidon2b nonce-search worker |
+| `jetsam-cli` | Thin JSON-RPC client for a running node |
+| `jetsam-miner` | Separate Poseidon2b nonce-search worker |
 
 ## Core daemon
 
@@ -67,7 +67,7 @@ transport. A bearer key authenticates requests but does not encrypt them.
 
 ## External miner
 
-`elide-miner` requests an already-proved, immutable template and searches
+`jetsam-miner` requests an already-proved, immutable template and searches
 only its 128-bit nonce.
 
 | Option | Default | Meaning |
@@ -83,7 +83,7 @@ only its 128-bit nonce.
 Typical local use:
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
@@ -94,7 +94,7 @@ custom-payout boundaries.
 
 ## Node client
 
-`elide-cli` is a thin client for a running Core node. It holds no separate key
+`jetsam-cli` is a thin client for a running Core node. It holds no separate key
 and performs wallet operations through local JSON-RPC.
 
 ### Global options
@@ -133,11 +133,11 @@ places:
 Examples:
 
 ```sh
-elide-cli status
-elide-cli block-header 420
-elide-cli block 420
-elide-cli slot 9700063
-elide-cli utxos-of o1...
+jetsam-cli status
+jetsam-cli block-header 420
+jetsam-cli block 420
+jetsam-cli slot 9700063
+jetsam-cli utxos-of o1...
 ```
 
 `block` returns data only inside the 18-block body-retention window. `header`
@@ -152,15 +152,15 @@ and `block-header` remain available for every canonical height.
 | `block-template` | `--miner-addr o1…` | Node-owned external mining template |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Submit one 16-byte little-endian nonce |
 
-The external-mining commands are low-level. `elide-miner` handles template
+The external-mining commands are low-level. `jetsam-miner` handles template
 refresh and nonce encoding automatically.
 
 ### Fees and mempool
 
 ```sh
-elide-cli estimate-fee 2 --inputs 1
-elide-cli mempool
-elide-cli mempool-tx TXID
+jetsam-cli estimate-fee 2 --inputs 1
+jetsam-cli mempool
+jetsam-cli mempool-tx TXID
 ```
 
 `estimate-fee` reports the current node-accepted minimum for the declared live
@@ -170,7 +170,7 @@ individual physical pages.
 ### Address validation
 
 ```sh
-elide-cli validate o1...
+jetsam-cli validate o1...
 ```
 
 The command reports validity, canonical bech32m form and raw 32-byte payload.
@@ -178,11 +178,11 @@ The command reports validity, canonical bech32m form and raw 32-byte payload.
 ### Wallet addresses
 
 ```sh
-elide-cli address
-elide-cli address --list
-elide-cli address --new
-elide-cli address --index 3
-elide-cli address --use 3
+jetsam-cli address
+jetsam-cli address --list
+jetsam-cli address --new
+jetsam-cli address --index 3
+jetsam-cli address --use 3
 ```
 
 `--new`, `--index` and `--use` are mutually exclusive actions. A generated
@@ -192,9 +192,9 @@ and return change to that owner.
 ### Balance and UTXOs
 
 ```sh
-elide-cli balance
-elide-cli utxos
-elide-cli scan
+jetsam-cli balance
+jetsam-cli utxos
+jetsam-cli scan
 ```
 
 `balance` separates confirmed, reserved outbound, pending incoming and
@@ -206,19 +206,19 @@ owner index.
 Preview:
 
 ```sh
-elide-cli send o1... 10.5 --dry-run
+jetsam-cli send o1... 10.5 --dry-run
 ```
 
 Submit with automatic fee:
 
 ```sh
-elide-cli send o1... 10.5
+jetsam-cli send o1... 10.5
 ```
 
 Specify an exact fee in ELD only when needed:
 
 ```sh
-elide-cli send o1... 10.5 --fee 0.012
+jetsam-cli send o1... 10.5 --fee 0.012
 ```
 
 The returned ID names the complete logical spend. Automatic fee selection is
@@ -227,21 +227,21 @@ recommended because occupancy and relay floor can change.
 ### History and receipts
 
 ```sh
-elide-cli history
-elide-cli history --last 20
-elide-cli history --address o1...
+jetsam-cli history
+jetsam-cli history --last 20
+jetsam-cli history --address o1...
 ```
 
 Export a confirmed outgoing receipt:
 
 ```sh
-elide-cli receipt TXID > receipt.hex
+jetsam-cli receipt TXID > receipt.hex
 ```
 
 Verify it:
 
 ```sh
-elide-cli verify "$(tr -d '\n' < receipt.hex)"
+jetsam-cli verify "$(tr -d '\n' < receipt.hex)"
 ```
 
 Receipt export works only for a locally saved different-owner payment.
@@ -249,7 +249,7 @@ Receipt export works only for a locally saved different-owner payment.
 ### Stop
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 This requests graceful daemon shutdown. It is equivalent to the GUI's normal
@@ -261,7 +261,7 @@ Use `--json` and check the process exit status:
 
 ```sh
 height="$(
-  elide-cli --json status |
+  jetsam-cli --json status |
     jq -er '.height'
 )"
 ```

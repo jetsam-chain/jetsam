@@ -27,12 +27,12 @@
 use std::time::{Duration, Instant};
 
 use bench_prover::{fmt_bytes, fmt_ms, poseidon_chain_field_instance};
-use elide_ivc_prover::challenger::FsLaneChallenger;
-use elide_ivc_prover::field::F128;
-use elide_ivc_prover::field_prover::prove_field;
-use elide_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
-use elide_ivc_prover::pcs::{self, PcsParams};
-use elide_ivc_prover::verifier::verify_field;
+use jetsam_ivc_prover::challenger::FsLaneChallenger;
+use jetsam_ivc_prover::field::F128;
+use jetsam_ivc_prover::field_prover::prove_field;
+use jetsam_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+use jetsam_ivc_prover::pcs::{self, PcsParams};
+use jetsam_ivc_prover::verifier::verify_field;
 
 const DOMAIN: &[u8] = b"field-r1cs-g1-bench-v0";
 const G1_BUDGET: Duration = Duration::from_secs(4);
@@ -116,7 +116,7 @@ fn run_case(
 }
 
 fn main() {
-    elide_ivc_prover::init_perf_thread_pool();
+    jetsam_ivc_prover::init_perf_thread_pool();
     let threads = rayon::current_num_threads();
     println!("== FieldR1cs substrate bench — rayon threads: {threads} ==\n");
 

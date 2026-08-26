@@ -14,8 +14,8 @@
 | `DATA_DIR/peers.json` | 成功连接过的公网出站节点 | 发现提示 |
 | `DATA_DIR/history-step-cache/` | 派生的本地证明矩阵缓存 | 可重建 |
 | `DATA_DIR/snapshot-staging/` | 接收快照临时数据 | 永不作为规范 State |
-| `DATA_DIR/elide-gui.toml` | GUI 管理的节点配置 | 私有节点 |
-| `DATA_DIR/elide-node.log` | GUI 管理的节点日志 | 诊断 |
+| `DATA_DIR/jetsam-gui.toml` | GUI 管理的节点配置 | 私有节点 |
+| `DATA_DIR/jetsam-node.log` | GUI 管理的节点日志 | 诊断 |
 
 Windows 中的 `~` 表示用户配置文件目录。
 

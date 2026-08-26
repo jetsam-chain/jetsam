@@ -6,7 +6,7 @@ Core 通过 HTTP 提供 JSON-RPC 2.0。默认端点：
 http://127.0.0.1:9601
 ```
 
-所有方法都带有 `paraelide_` namespace 前缀。参数使用位置 JSON 数组。
+所有方法都带有 `parajetsam_` namespace 前缀。参数使用位置 JSON 数组。
 
 ```sh
 curl --silent --show-error \
@@ -14,7 +14,7 @@ curl --silent --show-error \
   --data '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "paraelide_getChainInfo",
+    "method": "parajetsam_getChainInfo",
     "params": []
   }' \
   http://127.0.0.1:9601

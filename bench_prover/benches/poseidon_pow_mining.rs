@@ -10,9 +10,9 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use elide_chain::consensus::genesis::genesis_header;
-use elide_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
-use elide_core::packed::PACKED_LANES;
+use jetsam_chain::consensus::genesis::genesis_header;
+use jetsam_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
+use jetsam_core::packed::PACKED_LANES;
 use rayon::prelude::*;
 
 const DIGEST_BATCH: usize = 256;
@@ -141,7 +141,7 @@ fn main() {
     );
     println!(
         "  CPU backend:              {}",
-        elide_core::cpu::selected_backend()
+        jetsam_core::cpu::selected_backend()
     );
     println!("  logical packed lanes:     {PACKED_LANES}");
     println!(

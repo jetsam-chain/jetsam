@@ -23,7 +23,7 @@ nonce 前，区块生产者必须跟随[规范链](../reference/glossary.md#cano
 - 验证获胜 nonce；
 - 原子提交并广播完整的 `{block, HistoryStep 终端证明}` 区块包。
 
-Nonce 搜索可以在该进程内部运行，也可以交给 `elide-miner`。外部
+Nonce 搜索可以在该进程内部运行，也可以交给 `jetsam-miner`。外部
 挖矿进程的职责窄得多：
 
 - 接收一份不可变的 Poseidon2b 区块头输入序列和目标值；
@@ -59,7 +59,7 @@ Nonce 搜索可以在该进程内部运行，也可以交给 `elide-miner`。外
 | 模式 | 证明构建 | Nonce 搜索 | 适合场景 |
 |---|---|---|---|
 | 内置 | Core 节点 | Core 节点 | GUI 钱包、单机矿工、单台服务器 |
-| 外部 | Core 节点 | `elide-miner` | 独立 CPU 挖矿进程、私有挖矿网络或矿池 |
+| 外部 | Core 节点 | `jetsam-miner` | 独立 CPU 挖矿进程、私有挖矿网络或矿池 |
 
 两种模式遵循同一套共识规则，生成完全相同的区块。外部挖矿只把 nonce
 搜索移过 RPC 边界。
@@ -102,9 +102,9 @@ elide --mode miner --miner-address o1...
 在另一个终端观察就绪状态和链进度：
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 如果未同步或已完成身份认证的对等节点少于两个，Core 会等待，不会在孤立的本地视图上
@@ -124,7 +124,7 @@ elide \
 让挖矿进程连接节点的本地回环 RPC：
 
 ```sh
-elide-miner \
+jetsam-miner \
   --rpc http://127.0.0.1:9601 \
   --key '<long-random-token>' \
   --threads 12
@@ -181,7 +181,7 @@ ASERT 根据已接受区块之间的完整间隔调整 Poseidon2b 目标值。�
 当前奖励取决于 State 级别，可通过以下命令查看：
 
 ```sh
-elide-cli mining
+jetsam-cli mining
 ```
 
 在三年开发分配期内，矿工获得每个新区块发行奖励的 90%。扣除共识规定的

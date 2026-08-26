@@ -216,7 +216,7 @@ release_tool_executable() {
 
 release_build_pack_tools() {
   local include_generator=${1:-0}
-  local build_args=(--bin elide_pack_pins)
+  local build_args=(--bin jetsam_pack_pins)
   local tool_rustflags='-C target-cpu=native'
 
   release_require_command cargo
@@ -224,7 +224,7 @@ release_build_pack_tools() {
   release_require_command tr
   RELEASE_TOOL_TARGET_DIR=${ELIDE_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
   if [[ $include_generator == 1 ]]; then
-    build_args+=(--bin elide_matrix_gen)
+    build_args+=(--bin jetsam_matrix_gen)
   fi
   case "$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')" in
     *-windows-*)
@@ -246,10 +246,10 @@ release_build_pack_tools() {
     cargo build --locked --release -p bench_prover "${build_args[@]}"
   )
 
-  RELEASE_PIN_TOOL=$(release_tool_executable elide_pack_pins)
+  RELEASE_PIN_TOOL=$(release_tool_executable jetsam_pack_pins)
   [[ -x $RELEASE_PIN_TOOL ]] || release_die "pin tool was not built: $RELEASE_PIN_TOOL"
   if [[ $include_generator == 1 ]]; then
-    RELEASE_MATRIX_GENERATOR=$(release_tool_executable elide_matrix_gen)
+    RELEASE_MATRIX_GENERATOR=$(release_tool_executable jetsam_matrix_gen)
     [[ -x $RELEASE_MATRIX_GENERATOR ]] || \
       release_die "matrix generator was not built: $RELEASE_MATRIX_GENERATOR"
   fi
@@ -304,8 +304,8 @@ release_workspace_version() {
   local node_pkg extminer_pkg node_version extminer_version
 
   release_require_command tr
-  node_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p elide_node | tr -d '\r')
-  extminer_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p elide-extminer | tr -d '\r')
+  node_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p jetsam_node | tr -d '\r')
+  extminer_pkg=$(cd "$RELEASE_ROOT_DIR" && cargo pkgid -p jetsam-extminer | tr -d '\r')
   if [[ $node_pkg == *@* ]]; then
     node_version=${node_pkg##*@}
   else
@@ -317,7 +317,7 @@ release_workspace_version() {
     extminer_version=${extminer_pkg##*#}
   fi
   [[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || \
-    release_die "cannot determine elide_node version from: $node_pkg"
+    release_die "cannot determine jetsam_node version from: $node_pkg"
   [[ $node_version == "$extminer_version" ]] || \
     release_die "node version $node_version differs from external miner version $extminer_version"
   # shellcheck disable=SC2034 # Read by scripts that source this helper.

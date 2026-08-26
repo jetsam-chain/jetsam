@@ -1,0 +1,29 @@
+[package]
+name = "jetsam_rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jetsam_chain      = { path = "../jetsam_chain" }
+jetsam_tx         = { path = "../jetsam_tx" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_mempool    = { path = "../jetsam_mempool" }
+jetsam_miner      = { path = "../jetsam_miner" }
+jetsam_p2p        = { path = "../jetsam_p2p" }
+jetsam_recursive  = { path = "../jetsam_recursive" }
+jsonrpsee    = { version = "0.24", features = ["server", "macros"] }
+tower        = { version = "0.4", features = ["util"] }
+http         = "1"
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+
+hex          = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

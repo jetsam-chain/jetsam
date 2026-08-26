@@ -15,8 +15,8 @@ Obtain a payout address from the node wallet:
 
 ```sh
 elide
-elide-cli address --list
-elide-cli stop
+jetsam-cli address --list
+jetsam-cli stop
 ```
 
 The active wallet address is used automatically when no explicit payout is
@@ -52,9 +52,9 @@ Ordinary mining requires one authenticated peer and a synchronized chain.
 Check:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 The process prepares its embedded B25 and B255 proof matrices and selects the
@@ -93,7 +93,7 @@ Use the complete bech32m address.
 Stop through RPC or the service manager:
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 ```sh

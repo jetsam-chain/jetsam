@@ -14,8 +14,8 @@
 | `DATA_DIR/peers.json` | Successful public outbound peers | Discovery hint |
 | `DATA_DIR/history-step-cache/` | Derived local proof-matrix cache | Rebuildable |
 | `DATA_DIR/snapshot-staging/` | Incoming snapshot scratch data | Never canonical |
-| `DATA_DIR/elide-gui.toml` | GUI-owned node configuration | Private node |
-| `DATA_DIR/elide-node.log` | GUI-owned node log | Diagnostics |
+| `DATA_DIR/jetsam-gui.toml` | GUI-owned node configuration | Private node |
+| `DATA_DIR/jetsam-node.log` | GUI-owned node log | Diagnostics |
 
 On Windows, `~` means the user profile directory.
 

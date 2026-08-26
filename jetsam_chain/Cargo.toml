@@ -1,0 +1,21 @@
+[package]
+name = "jetsam_chain"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+tracing = { workspace = true }
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_tx = { path = "../jetsam_tx" }
+jetsam_fri = { path = "../jetsam_fri" }
+jetsam_fri_binius = { path = "../jetsam_fri_binius" }
+rayon = "1.10"
+libmdbx = "0.6"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+rayon     = "1.10"

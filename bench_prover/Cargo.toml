@@ -5,18 +5,18 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-elide_core = { path = "../elide_core" }
-elide_fri = { path = "../elide_fri" }
-elide_fri_binius = { path = "../elide_fri_binius" }
-elide_poseidon2b = { path = "../elide_poseidon2b" }
-elide_gkr = { path = "../elide_gkr" }
-elide_tx = { path = "../elide_tx" }
-elide_chain = { path = "../elide_chain" }
-elide_block = { path = "../elide_block" }
-elide_recursive = { path = "../elide_recursive" }
-elide_miner = { path = "../elide_miner" }
-elide-ivc-core = { path = "../elide_ivc_core" }
-elide-ivc-prover = { path = "../elide_ivc_prover" }
+jetsam_core = { path = "../jetsam_core" }
+jetsam_fri = { path = "../jetsam_fri" }
+jetsam_fri_binius = { path = "../jetsam_fri_binius" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_gkr = { path = "../jetsam_gkr" }
+jetsam_tx = { path = "../jetsam_tx" }
+jetsam_chain = { path = "../jetsam_chain" }
+jetsam_block = { path = "../jetsam_block" }
+jetsam_recursive = { path = "../jetsam_recursive" }
+jetsam_miner = { path = "../jetsam_miner" }
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
+jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }
 rayon = "1.10"
 bincode = "1"
 hex = "0.4"

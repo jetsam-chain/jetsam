@@ -3,8 +3,8 @@
 The Core archive is for node operators, miners and developers. It contains:
 
 - `elide`, the full node and built-in miner;
-- `elide-cli`, the local node and wallet client;
-- `elide-miner`, the external PoW worker.
+- `jetsam-cli`, the local node and wallet client;
+- `jetsam-miner`, the external PoW worker.
 
 The GUI wallet is distributed separately.
 
@@ -13,11 +13,11 @@ The GUI wallet is distributed separately.
 Choose the Core archive for the host:
 
 ```text
-elide-core-vVERSION-linux-x86_64.tar.gz
-elide-core-vVERSION-linux-aarch64.tar.gz
-elide-core-vVERSION-windows-x86_64.zip
-elide-core-vVERSION-macos-aarch64.tar.gz
-elide-core-vVERSION-macos-x86_64.tar.gz
+jetsam-core-vVERSION-linux-x86_64.tar.gz
+jetsam-core-vVERSION-linux-aarch64.tar.gz
+jetsam-core-vVERSION-windows-x86_64.zip
+jetsam-core-vVERSION-macos-aarch64.tar.gz
+jetsam-core-vVERSION-macos-x86_64.tar.gz
 ```
 
 Compare its SHA-256 digest with `SHA256SUMS` from the same release before
@@ -68,9 +68,9 @@ On first start it creates:
 In another terminal:
 
 ```sh
-./elide-cli status
-./elide-cli peers
-./elide-cli state
+./jetsam-cli status
+./jetsam-cli peers
+./jetsam-cli state
 ```
 
 The default P2P listener is `0.0.0.0:9600`. RPC remains on
@@ -79,7 +79,7 @@ The default P2P listener is `0.0.0.0:9600`. RPC remains on
 Stop cleanly with:
 
 ```sh
-./elide-cli stop
+./jetsam-cli stop
 ```
 
 For a permanent system service, firewall guidance and updates, continue with

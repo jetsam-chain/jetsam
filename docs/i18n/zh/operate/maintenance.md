@@ -8,11 +8,11 @@ Parano1d 以事务方式持久化 Live State。日常维护无需重放或永久
 使用本地 CLI：
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
-elide-cli mempool
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
+jetsam-cli mempool
+jetsam-cli mining
 ```
 
 systemd 环境：
@@ -60,7 +60,7 @@ P2P 身份文件用于维持稳定的对等节点 ID，但没有花费权限。
 1. 下载新压缩包和对应的 `SHA256SUMS`；
 2. 校验摘要；
 3. 停止服务；
-4. 同时替换 `elide`、`elide-cli` 和 `elide-miner`；
+4. 同时替换 `elide`、`jetsam-cli` 和 `jetsam-miner`；
 5. 启动服务；
 6. 检查启动和同步状态。
 

@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "elide"
+NODE_BIN = ROOT / "target" / "release" / "jetsam"
 BASE = ROOT / "target" / "live-tests" / "slot-mempool-wallet"
 LOGS = BASE / "logs"
 
@@ -180,7 +180,7 @@ class Node:
 
 
 def rpc(url, method, params=None, timeout=8):
-    method_full = method if method.startswith("paraelide_") else f"paraelide_{method}"
+    method_full = method if method.startswith("parajetsam_") else f"parajetsam_{method}"
     body = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": method_full, "params": params or []}
     ).encode()
@@ -285,7 +285,7 @@ def wait_tx_confirmed(nodes, tx_hash, timeout=480):
 def main():
     if not NODE_BIN.exists():
         raise LiveTestError(
-            f"release binary missing: {NODE_BIN}; run cargo build --release -p elide_node --bin elide"
+            f"release binary missing: {NODE_BIN}; run cargo build --release -p jetsam_node --bin jetsam"
         )
     if BASE.exists():
         shutil.rmtree(BASE)

@@ -99,7 +99,7 @@ History. Для него получены следующие результат�
 принятия недопустимого `State` от генезиса и зависит от явно указанных в
 теореме предпосылок для фиксированной Poseidon2b и стоимости когерентного
 ответа. Штатные константы, редукции и точные расчёты находятся в
-[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness).
+[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness).
 
 Границы утверждений и допущения за пределами системы доказательств описаны в
 [модели безопасности](../protocol/security-model.md). Крейты реализации

@@ -8,11 +8,11 @@ replay or retain historical block bodies.
 Use the local CLI:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
-elide-cli mempool
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
+jetsam-cli mempool
+jetsam-cli mining
 ```
 
 With systemd:
@@ -61,7 +61,7 @@ authority.
 1. download the new archive and matching `SHA256SUMS`;
 2. verify its digest;
 3. stop the service;
-4. replace `elide`, `elide-cli` and `elide-miner` together;
+4. replace `elide`, `jetsam-cli` and `jetsam-miner` together;
 5. start the service;
 6. inspect startup and synchronization.
 

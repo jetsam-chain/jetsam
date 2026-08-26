@@ -57,7 +57,7 @@ log2(минимальной ожидаемой классической рабо
 RBR-предпосылки. Совпадение после округления до целых бит не отождествляет эти
 предпосылки.
 
-[Доказательство по Block–Tiwari](https://github.com/ignotusnemo/elide/blob/main/elide_soundness/docs/block-tiwari.md)
+[Доказательство по Block–Tiwari](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/block-tiwari.md)
 выводит локальные RBR-границы для каждого штатного слоя, точно решает обе
 целочисленные задачи оптимизации и воспроизводит сравнение с системами из их
 опубликованной таблицы.
@@ -94,9 +94,9 @@ RBR-предпосылки. Совпадение после округления
 вероятность успеха любого противника внутри ресурсной области Category 1 меньше
 1/2 в сквозной игре принятия недопустимого `State` от генезиса.
 
-[Сквозное доказательство в QROM](https://github.com/ignotusnemo/elide/blob/main/elide_soundness/docs/category-one.md)
+[Сквозное доказательство в QROM](https://github.com/ignotusnemo/elide/blob/main/jetsam_soundness/docs/category-one.md)
 задаёт игру, редукции, поправки конечного размера и предпосылки. Сертификат
-[`elide_soundness`](https://github.com/ignotusnemo/elide/tree/main/elide_soundness) импортирует штатные
+[`jetsam_soundness`](https://github.com/ignotusnemo/elide/tree/main/jetsam_soundness) импортирует штатные
 константы и проверяет все определяющие результат неравенства в точной целой или
 рациональной арифметике. Это криптографическая ресурсная оценка Category 1, а
 не утверждение о проверке или сертификации Parano1d институтом NIST.

@@ -1,0 +1,19 @@
+[package]
+name = "jetsam_recursive"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_chain = { path = "../jetsam_chain" }
+jetsam_tx = { path = "../jetsam_tx" }
+jetsam_gkr = { path = "../jetsam_gkr" }
+jetsam_fri = { path = "../jetsam_fri" }
+jetsam_fri_binius = { path = "../jetsam_fri_binius" }
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
+jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tracing = { workspace = true }

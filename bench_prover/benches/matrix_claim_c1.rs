@@ -14,18 +14,18 @@ use std::io::{BufReader, Read as _};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use elide_ivc_core::challenger::{Challenger, FsLaneChallenger};
-use elide_ivc_core::field::{F128, F256};
-use elide_ivc_core::field_r1cs::CompactFieldR1cs;
-use elide_ivc_core::matrix_claim::c1::{
+use jetsam_ivc_core::challenger::{Challenger, FsLaneChallenger};
+use jetsam_ivc_core::field::{F128, F256};
+use jetsam_ivc_core::field_r1cs::CompactFieldR1cs;
+use jetsam_ivc_core::matrix_claim::c1::{
     prove_matrix_claim_fold_compact_c1, verify_matrix_claim_fold_c1, C1FreshLincheckClaim,
     C1MatrixAccClaim, C1MatrixClaimEvaluator,
 };
-use elide_miner::history_step_artifacts::{
+use jetsam_miner::history_step_artifacts::{
     history_step_matrix_file_name, HISTORY_STEP_PACK_VERSION_DIRECTORY,
     HISTORY_STEP_RUNTIME_METADATA_FILE, HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
-use elide_recursive::{canonical_history_step_shape, CanonicalHistoryStepClassId};
+use jetsam_recursive::{canonical_history_step_shape, CanonicalHistoryStepClassId};
 
 const PACK_DIRECTORY_ENV: &str = "ELIDE_HISTORY_STEP_PACK_DIR";
 const SAMPLE_COUNT_ENV: &str = "ELIDE_MATRIX_FOLD_SAMPLES";
@@ -71,7 +71,7 @@ fn load_b25_matrix() -> Result<CompactFieldR1cs, String> {
     let digest = metadata[trailer..]
         .try_into()
         .map_err(|_| "runtime metadata digest width".to_owned())?;
-    let runtime = elide_miner::decode_history_step_runtime_metadata_pinned(&metadata, digest)
+    let runtime = jetsam_miner::decode_history_step_runtime_metadata_pinned(&metadata, digest)
         .map_err(|error| format!("authenticate {}: {error}", metadata_path.display()))?;
     let class = CanonicalHistoryStepClassId::new(0).expect("B25 class is canonical");
     let matrix_path = version.join(history_step_matrix_file_name(class));
@@ -160,10 +160,10 @@ fn sample_count() -> Result<usize, String> {
 
 fn run() -> Result<(), String> {
     if std::env::var_os(NODE_CPU_POOL_ENV).is_some() {
-        elide_miner::configure_process_cpu_budget(elide_miner::ProcessCpuBudgetMode::ProofOnly)
+        jetsam_miner::configure_process_cpu_budget(jetsam_miner::ProcessCpuBudgetMode::ProofOnly)
             .map_err(|error| format!("configure production CPU pool: {error}"))?;
     } else {
-        elide_ivc_prover::init_perf_thread_pool();
+        jetsam_ivc_prover::init_perf_thread_pool();
     }
     let mut matrix = load_b25_matrix()?;
     let (fresh, incoming) = valid_claims(&mut matrix)?;

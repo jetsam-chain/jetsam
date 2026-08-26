@@ -11,26 +11,26 @@
 
 | Платформа | Пакет |
 |---|---|
-| Debian или Ubuntu, x86-64 | `elide-gui-vVERSION-linux-x86_64.deb` |
-| Debian или Ubuntu, ARM64 | `elide-gui-vVERSION-linux-aarch64.deb` |
-| Windows x86-64 | `elide-gui-vVERSION-windows-x86_64-setup.exe` |
-| macOS Apple Silicon | `elide-gui-vVERSION-macos-aarch64.dmg` |
-| macOS Intel | `elide-gui-vVERSION-macos-x86_64.dmg` |
+| Debian или Ubuntu, x86-64 | `jetsam-gui-vVERSION-linux-x86_64.deb` |
+| Debian или Ubuntu, ARM64 | `jetsam-gui-vVERSION-linux-aarch64.deb` |
+| Windows x86-64 | `jetsam-gui-vVERSION-windows-x86_64-setup.exe` |
+| macOS Apple Silicon | `jetsam-gui-vVERSION-macos-aarch64.dmg` |
+| macOS Intel | `jetsam-gui-vVERSION-macos-x86_64.dmg` |
 
 Скачайте `SHA256SUMS` из того же релиза и до открытия пакета проверьте его:
 
 ```sh
 # Linux
-sha256sum elide-gui-vVERSION-linux-x86_64.deb
+sha256sum jetsam-gui-vVERSION-linux-x86_64.deb
 
 # macOS
-shasum -a 256 elide-gui-vVERSION-macos-aarch64.dmg
+shasum -a 256 jetsam-gui-vVERSION-macos-aarch64.dmg
 ```
 
 В Windows используйте PowerShell:
 
 ```powershell
-Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\jetsam-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 Полученный хэш должен совпасть с соответствующей строкой в `SHA256SUMS`.
@@ -42,7 +42,7 @@ Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 Откройте `.deb` в системном центре приложений или выполните:
 
 ```sh
-sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
+sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 ```
 
 Запустите **Parano1d** из меню приложений.
@@ -116,7 +116,7 @@ TCP `9600` также помогает связности сети.
 В Debian или Ubuntu:
 
 ```sh
-sudo apt remove elide-gui
+sudo apt remove jetsam-gui
 ```
 
 В Windows откройте **Установленные приложения → Parano1d → Удалить**. В

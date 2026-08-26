@@ -84,7 +84,7 @@ B255 profiles gives 127 provable bits and 127 conjectured bits against a
 128-bit target. Both expected-work values lie in the exact interval
 `[127, 128)`. The complete substitutions, integer optimization and comparison
 with the systems in their published table are given in the
-[Block–Tiwari derivation](elide_soundness/docs/block-tiwari.md).
+[Block–Tiwari derivation](jetsam_soundness/docs/block-tiwari.md).
 
 ### End-to-end Category 1
 
@@ -108,7 +108,7 @@ provable end-to-end post-quantum soundness for state validation from genesis at
 NIST PQC Category 1: every adversary inside the Category 1 resource envelope
 has success probability below one half in the from-genesis invalid-State game.
 The complete theorem is in the
-[end-to-end QROM and Category 1 derivation](elide_soundness/docs/category-one.md).
+[end-to-end QROM and Category 1 derivation](jetsam_soundness/docs/category-one.md).
 
 ## How It Works
 
@@ -319,7 +319,7 @@ External nonce search keeps transaction selection and proving inside the node:
 
 ```sh
 elide --extminer --mining-key <token>
-elide-miner --key <token>
+jetsam-miner --key <token>
 ```
 
 Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
@@ -335,24 +335,24 @@ Addresses use bech32m and begin with `o1`. `1 ELD = 1,000,000 μNOID`.
 `ELD` is the ticker; the wallet uses `①` as its interface symbol.
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli state
-elide-cli mining
-elide-cli address
-elide-cli address --new
-elide-cli balance
-elide-cli utxos
-elide-cli send <o1-address> 10.5 --dry-run
-elide-cli send <o1-address> 10.5
-elide-cli mempool
-elide-cli history
-elide-cli receipt <txid> > receipt.hex
-elide-cli verify "$(tr -d '\n' < receipt.hex)"
-elide-cli stop
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli state
+jetsam-cli mining
+jetsam-cli address
+jetsam-cli address --new
+jetsam-cli balance
+jetsam-cli utxos
+jetsam-cli send <o1-address> 10.5 --dry-run
+jetsam-cli send <o1-address> 10.5
+jetsam-cli mempool
+jetsam-cli history
+jetsam-cli receipt <txid> > receipt.hex
+jetsam-cli verify "$(tr -d '\n' < receipt.hex)"
+jetsam-cli stop
 ```
 
-Run `elide --help`, `elide-cli help` or `elide-miner --help` for the full
+Run `elide --help`, `jetsam-cli help` or `jetsam-miner --help` for the full
 interface.
 
 ## Building from Source
@@ -380,9 +380,9 @@ disposable `target/` tree:
 git clone https://github.com/ignotusnemo/elide.git
 cd elide
 
-mkdir -p ../elide-artifacts
+mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../elide-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1
 ```
 
 Generation is expensive but only needs to be performed once.
@@ -390,13 +390,13 @@ Generation is expensive but only needs to be performed once.
 Build for the current machine. The script authenticates the pack, embeds it
 into the node and produces two independent deliverables:
 
-- a Core archive containing `elide`, `elide-cli` and `elide-miner`;
-- a native GUI Wallet package containing `elide-gui` and its private,
+- a Core archive containing `elide`, `jetsam-cli` and `jetsam-miner`;
+- a native GUI Wallet package containing `jetsam-gui` and its private,
   locally supervised `elide` node.
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../elide-artifacts/history-step-pack-v1
+  --pack ../jetsam-artifacts/history-step-pack-v1
 
 cat target/release-builds/LAST_RELEASE
 ```
@@ -414,10 +414,10 @@ tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 ```
 
 To reproduce the production soundness calculation, see
-[`elide_soundness`](elide_soundness/README.md) and run:
+[`jetsam_soundness`](jetsam_soundness/README.md) and run:
 
 ```sh
-cargo run --release --locked -p elide_soundness
+cargo run --release --locked -p jetsam_soundness
 ```
 
 Designed and developed by **Ignotus Nemo**. Licensed under the

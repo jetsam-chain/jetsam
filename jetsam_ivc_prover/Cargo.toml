@@ -1,0 +1,23 @@
+[package]
+name = "jetsam-ivc-prover"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Paranoid recursive proof prover over GF(2)."
+
+[features]
+# Forwarded to jetsam-ivc-core.
+hash-count = ["jetsam-ivc-core/hash-count"]
+unsound-challenger = ["jetsam-ivc-core/unsound-challenger"]
+
+[dependencies]
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[dev-dependencies]
+jetsam-ivc-core = { path = "../jetsam_ivc_core", features = ["unsound-challenger"] }
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }

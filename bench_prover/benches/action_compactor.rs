@@ -10,14 +10,14 @@
 use std::time::Instant;
 
 use bench_prover::legal_block_scenarios;
-use elide_core::mem_profile::current_mem_snapshot;
-use elide_core::Block128;
-use elide_recursive::acceptance::shape::ShapeClass;
-use elide_recursive::acceptance::trace::action_compaction::{
+use jetsam_core::mem_profile::current_mem_snapshot;
+use jetsam_core::Block128;
+use jetsam_recursive::acceptance::shape::ShapeClass;
+use jetsam_recursive::acceptance::trace::action_compaction::{
     bind_mint_packed_values_body_order, compact_action_rows,
 };
-use elide_recursive::acceptance::trace::action_surface::ActionRowTrace;
-use elide_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
+use jetsam_recursive::acceptance::trace::action_surface::ActionRowTrace;
+use jetsam_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
 
 fn requested_tiers() -> Vec<usize> {
     let raw = std::env::var("ELIDE_ACTION_TIERS").unwrap_or_else(|_| "25".into());
@@ -28,7 +28,7 @@ fn requested_tiers() -> Vec<usize> {
     assert!(!tiers.is_empty());
     assert!(tiers
         .iter()
-        .all(|tier| elide_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(tier)));
+        .all(|tier| jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(tier)));
     tiers
 }
 
@@ -62,11 +62,11 @@ fn main() {
         pattern.push(true); // canonical coinbase mint
         kinds.push(true);
         for scenario in &scenarios {
-            for input in 0..elide_tx::TX_INPUTS {
+            for input in 0..jetsam_tx::TX_INPUTS {
                 pattern.push(scenario.body.input_is_live(input));
                 kinds.push(false);
             }
-            for output in 0..elide_tx::TX_OUTPUTS {
+            for output in 0..jetsam_tx::TX_OUTPUTS {
                 pattern.push(scenario.body.output_is_live(output));
                 kinds.push(true);
             }

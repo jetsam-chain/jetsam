@@ -11,27 +11,27 @@ Download the GUI wallet for the computer from the
 
 | Platform | Package |
 |---|---|
-| Debian or Ubuntu, x86-64 | `elide-gui-vVERSION-linux-x86_64.deb` |
-| Debian or Ubuntu, ARM64 | `elide-gui-vVERSION-linux-aarch64.deb` |
-| Windows x86-64 | `elide-gui-vVERSION-windows-x86_64-setup.exe` |
-| macOS Apple Silicon | `elide-gui-vVERSION-macos-aarch64.dmg` |
-| macOS Intel | `elide-gui-vVERSION-macos-x86_64.dmg` |
+| Debian or Ubuntu, x86-64 | `jetsam-gui-vVERSION-linux-x86_64.deb` |
+| Debian or Ubuntu, ARM64 | `jetsam-gui-vVERSION-linux-aarch64.deb` |
+| Windows x86-64 | `jetsam-gui-vVERSION-windows-x86_64-setup.exe` |
+| macOS Apple Silicon | `jetsam-gui-vVERSION-macos-aarch64.dmg` |
+| macOS Intel | `jetsam-gui-vVERSION-macos-x86_64.dmg` |
 
 Download `SHA256SUMS` from the same release. Verify the package before opening
 it:
 
 ```sh
 # Linux
-sha256sum elide-gui-vVERSION-linux-x86_64.deb
+sha256sum jetsam-gui-vVERSION-linux-x86_64.deb
 
 # macOS
-shasum -a 256 elide-gui-vVERSION-macos-aarch64.dmg
+shasum -a 256 jetsam-gui-vVERSION-macos-aarch64.dmg
 ```
 
 On Windows, use PowerShell:
 
 ```powershell
-Get-FileHash .\elide-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\jetsam-gui-vVERSION-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 The digest must equal the matching line in `SHA256SUMS`.
@@ -43,7 +43,7 @@ The digest must equal the matching line in `SHA256SUMS`.
 Open the `.deb` with the system Software application, or run:
 
 ```sh
-sudo apt install ./elide-gui-vVERSION-linux-x86_64.deb
+sudo apt install ./jetsam-gui-vVERSION-linux-x86_64.deb
 ```
 
 Launch **Parano1d** from the application menu.
@@ -113,7 +113,7 @@ Removing the application does not remove wallet data.
 On Debian or Ubuntu:
 
 ```sh
-sudo apt remove elide-gui
+sudo apt remove jetsam-gui
 ```
 
 On Windows, use **Installed apps → Parano1d → Uninstall**. On macOS, move the

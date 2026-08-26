@@ -1,0 +1,80 @@
+[package]
+name = "jetsam_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# --- Daemon ---
+[[bin]]
+name = "jetsam"
+path = "src/main.rs"
+
+# --- CLI client ---
+[[bin]]
+name = "jetsam-cli"
+path = "src/bin/jetsam_cli.rs"
+
+[dependencies]
+jetsam_chain      = { path = "../jetsam_chain" }
+jetsam_block      = { path = "../jetsam_block" }
+jetsam_recursive  = { path = "../jetsam_recursive" }
+jetsam_tx         = { path = "../jetsam_tx" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_gkr        = { path = "../jetsam_gkr" }
+jetsam_core       = { path = "../jetsam_core" }
+jetsam_mempool    = { path = "../jetsam_mempool" }
+jetsam_miner      = { path = "../jetsam_miner" }
+jetsam-ivc-core   = { path = "../jetsam_ivc_core" }
+jetsam_p2p        = { path = "../jetsam_p2p" }
+jetsam_rpc        = { path = "../jetsam_rpc" }
+
+# Async runtime
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+bincode            = "1"
+
+# Error handling
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+
+# CLI
+clap    = { version = "4", features = ["derive", "env"] }
+toml    = "0.8"
+hex     = "0.4"
+blake3  = "1"
+
+# Networking
+libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Wallet security: key derivation, zeroization, and owner-only file handling
+rand             = "0.8"
+zeroize          = { version = "1", features = ["zeroize_derive"] }
+libc             = "0.2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+
+# Memory: jemalloc as global allocator.
+# glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)
+# indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
+# the OS aggressively via background threads (dirty_decay_ms=1000).
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+[dev-dependencies]
+bench_prover = { path = "../bench_prover" }
+tempfile = "3"
+static_assertions = "1.1"
+
+[build-dependencies]
+jetsam_recursive  = { path = "../jetsam_recursive" }
+jetsam_miner      = { path = "../jetsam_miner" }
+jetsam-ivc-core   = { path = "../jetsam_ivc_core" }
+zstd            = "0.13"

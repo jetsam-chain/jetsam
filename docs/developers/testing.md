@@ -18,12 +18,12 @@ requires at least:
 
 ```sh
 cargo test --locked \
-  -p elide_tx \
-  -p elide_chain \
-  -p elide_mempool \
-  -p elide_miner \
-  -p elide_rpc \
-  -p elide_node
+  -p jetsam_tx \
+  -p jetsam_chain \
+  -p jetsam_mempool \
+  -p jetsam_miner \
+  -p jetsam_rpc \
+  -p jetsam_node
 ```
 
 ## Proof kernels
@@ -32,9 +32,9 @@ Production kernel tests should run in release mode:
 
 ```sh
 cargo test --locked --release \
-  -p elide_core \
-  -p elide_poseidon2b \
-  -p elide-ivc-core
+  -p jetsam_core \
+  -p jetsam_poseidon2b \
+  -p jetsam-ivc-core
 ```
 
 On x86-64, force the production floor:
@@ -42,7 +42,7 @@ On x86-64, force the production floor:
 ```sh
 ELIDE_CPU_BACKEND=pclmul \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b -p elide-ivc-core
+  -p jetsam_core -p jetsam_poseidon2b -p jetsam-ivc-core
 ```
 
 The scalar backend is used only for differential checking:
@@ -50,7 +50,7 @@ The scalar backend is used only for differential checking:
 ```sh
 ELIDE_CPU_BACKEND=scalar \
   cargo test --locked --release \
-  -p elide_core -p elide_poseidon2b
+  -p jetsam_core -p jetsam_poseidon2b
 ```
 
 ## Release gates

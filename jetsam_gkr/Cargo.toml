@@ -1,0 +1,23 @@
+[package]
+name = "jetsam_gkr"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+jetsam_core = { path = "../jetsam_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_fri = { path = "../jetsam_fri" }
+jetsam_fri_binius = { path = "../jetsam_fri_binius" }
+jetsam_tx = { path = "../jetsam_tx" }
+rayon = "1.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+rand = "0.8"
+bincode = "1"
+hex = "0.4"
+static_assertions = "1.1"

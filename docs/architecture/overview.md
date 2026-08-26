@@ -105,14 +105,14 @@ transactions and State root cannot be changed by the external worker.
 
 | Component | Responsibility |
 |---|---|
-| `elide_tx` | Logical `PagedSpend`, transaction identifiers and authorization binding |
-| `elide_mempool` | Intent admission, conflict reservations and relay policy |
-| `elide_miner` | Transaction selection, State witness, block preparation and PoW |
-| `elide_recursive` | `HistoryStep` relation, terminal verification and recursion |
-| `elide_chain` | Consensus rules, MDBX State, headers, reorgs and snapshots |
-| `elide_p2p` | GossipSub relay, discovery and synchronization protocols |
-| `elide_node` | Runtime orchestration, wallet integration and shutdown |
-| `elide_rpc` | Local node, wallet and external-mining interface |
+| `jetsam_tx` | Logical `PagedSpend`, transaction identifiers and authorization binding |
+| `jetsam_mempool` | Intent admission, conflict reservations and relay policy |
+| `jetsam_miner` | Transaction selection, State witness, block preparation and PoW |
+| `jetsam_recursive` | `HistoryStep` relation, terminal verification and recursion |
+| `jetsam_chain` | Consensus rules, MDBX State, headers, reorgs and snapshots |
+| `jetsam_p2p` | GossipSub relay, discovery and synchronization protocols |
+| `jetsam_node` | Runtime orchestration, wallet integration and shutdown |
+| `jetsam_rpc` | Local node, wallet and external-mining interface |
 
 For deployment rather than implementation details, continue with
 [Run a node on Linux](../operate/node.md).

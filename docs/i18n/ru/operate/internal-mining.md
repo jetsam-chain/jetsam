@@ -15,8 +15,8 @@ elide --check-hardware
 
 ```sh
 elide
-elide-cli address --list
-elide-cli stop
+jetsam-cli address --list
+jetsam-cli stop
 ```
 
 Если отдельная выплата не задана, автоматически используется активный адрес
@@ -52,9 +52,9 @@ sudo systemctl restart elide
 цепь. Проверьте:
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 Процесс готовит встроенные матрицы доказательств B25 и B255 и выбирает лучшую
@@ -93,7 +93,7 @@ elide --mode miner --miner-address o1...
 Остановите ноду через RPC или менеджер служб:
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 ```sh

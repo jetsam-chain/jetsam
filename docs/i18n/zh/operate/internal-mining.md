@@ -15,8 +15,8 @@ elide --check-hardware
 
 ```sh
 elide
-elide-cli address --list
-elide-cli stop
+jetsam-cli address --list
+jetsam-cli stop
 ```
 
 未显式配置奖励地址时，会自动使用钱包活动地址。
@@ -50,9 +50,9 @@ sudo systemctl restart elide
 普通挖矿需要一个经过认证的对等节点，以及已同步的链。检查：
 
 ```sh
-elide-cli status
-elide-cli peers
-elide-cli mining
+jetsam-cli status
+jetsam-cli peers
+jetsam-cli mining
 ```
 
 进程会准备内嵌的 B25 与 B255 证明矩阵，并选择最合适的 CPU 后端。每个
@@ -88,7 +88,7 @@ elide --mode miner --miner-address o1...
 通过 RPC 或服务管理器停止：
 
 ```sh
-elide-cli stop
+jetsam-cli stop
 ```
 
 ```sh
