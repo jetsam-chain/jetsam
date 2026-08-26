@@ -115,10 +115,10 @@ const _: () = assert!(
     "HistoryStep and consensus proof-class dimensions must match"
 );
 
-const HISTORY_STEP_BANK_POST_COMMIT_DOMAIN: &[u8] = b"ELD/HISTORY-STEP/BANK-POST-COMMIT/V1";
-const HISTORY_STEP_BANK_DIGEST_DOMAIN: &[u8] = b"ELD/HISTORY-STEP/CLASS-BANK/V1";
+const HISTORY_STEP_BANK_POST_COMMIT_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/BANK-POST-COMMIT/V1";
+const HISTORY_STEP_BANK_DIGEST_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/CLASS-BANK/V1";
 pub(crate) const HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN: &[u8] = b"history-step-bank-fold-v1";
-const HISTORY_STEP_BANK_FOLD_ROUTE_DOMAIN: &[u8] = b"ELD/HISTORY-STEP/BANK-FOLD-ROUTE/V1";
+const HISTORY_STEP_BANK_FOLD_ROUTE_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/BANK-FOLD-ROUTE/V1";
 
 /// Canonical class id: exactly the current block tier slot.
 #[derive(

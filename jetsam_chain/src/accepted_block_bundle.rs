@@ -32,7 +32,7 @@ use crate::history_step::{
 /// Fixed marker for the canonical all-or-none accepted-block bundle wire.
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-pub const ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"EAB1";
+pub const ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"JAB1";
 
 /// `magic || block_len:u32 || history_step_terminal_len:u32`.
 pub const ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES: usize = 4 + 4 + 4;

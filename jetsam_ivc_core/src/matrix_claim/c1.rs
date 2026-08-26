@@ -17,7 +17,7 @@ use crate::zerocheck::field_c1::{build_eq_table, lagrange_weights};
 use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 use rayon::prelude::*;
 
-const C1_MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"ELD/IVC/MATRIX-CLAIM-REQUEST/C1/V1";
+const C1_MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"JTM/IVC/MATRIX-CLAIM-REQUEST/C1/V1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct C1MatrixAccClaim {

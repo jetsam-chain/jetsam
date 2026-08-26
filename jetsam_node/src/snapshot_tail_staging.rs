@@ -23,7 +23,7 @@ use jetsam_chain::{
 
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-const FILE_MAGIC: [u8; 4] = *b"EST3";
+const FILE_MAGIC: [u8; 4] = *b"JST3";
 const FILE_HEADER_BYTES: u64 = 4 + 8 + 32 + 32;
 const RECORD_HEADER_BYTES: u64 = 4;
 static NEXT_TAIL_FILE_ID: AtomicU64 = AtomicU64::new(0);

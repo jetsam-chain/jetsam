@@ -38,7 +38,7 @@ use libp2p_connection_limits as connection_limits;
 use jetsam_chain::consensus::wire_limits::MAX_TX_INTENT_BYTES_GLOBAL;
 use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 
-const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"ELIDE_P2P_GOSSIPSUB_MESSAGE_ID";
+const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"JETSAM_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::availability_codec::AvailabilityCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;

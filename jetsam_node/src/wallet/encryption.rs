@@ -30,7 +30,7 @@
 //! # On-disk layout (105 bytes)
 //!
 //! ```text
-//! magic       16  "elide_aead_key_1"
+//! magic       16  "jetsam_aead_key1"
 //! version      1  0x01
 //! salt        16  Argon2id salt
 //! nonce       24  XChaCha20-Poly1305 nonce
@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 
 /// Distinct from the cleartext magic, so `load` can tell the two apart without
 /// guessing and an upstream file can never be read as one of ours.
-pub(super) const ENCRYPTED_MAGIC: &[u8; 16] = b"elide_aead_key_1";
+pub(super) const ENCRYPTED_MAGIC: &[u8; 16] = b"jetsam_aead_key1";
 pub(super) const FORMAT_VERSION: u8 = 1;
 
 const SECRET_LEN: usize = 32;
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn a_cleartext_file_is_not_mistaken_for_an_encrypted_one() {
-        let mut plain = Vec::from(*b"elide_plainkey_1");
+        let mut plain = Vec::from(*b"jetsam_plainkey1");
         plain.extend_from_slice(&SECRET);
         assert!(!is_encrypted(&plain));
         assert!(matches!(

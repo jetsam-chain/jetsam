@@ -22,9 +22,9 @@ use libp2p::{request_response, swarm::StreamProtocol};
 
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-const REQUEST_MAGIC: [u8; 4] = *b"EHQ5";
+const REQUEST_MAGIC: [u8; 4] = *b"JHQ5";
 const LEGACY_REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
-const RESPONSE_MAGIC: [u8; 4] = *b"EHB5";
+const RESPONSE_MAGIC: [u8; 4] = *b"JHB5";
 const LEGACY_RESPONSE_MAGIC: [u8; 4] = *b"NHB4";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
 // magic + count + flags + status + retry + reserved + compressed length +

@@ -33,7 +33,7 @@ const NODE_CPU_POOL_ENV: &str = "ELIDE_HISTORY_STEP_NODE_CPU_POOL";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
-const TRANSCRIPT_DOMAIN: &[u8] = b"ELD/BENCH/MATRIX-CLAIM-C1/V1";
+const TRANSCRIPT_DOMAIN: &[u8] = b"JTM/BENCH/MATRIX-CLAIM-C1/V1";
 
 fn read_regular_bounded(path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     let metadata = std::fs::symlink_metadata(path)

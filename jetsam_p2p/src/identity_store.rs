@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use libp2p::identity::{KeyType, Keypair};
 
 const IDENTITY_FILE: &str = "p2p_identity.key";
-const IDENTITY_MAGIC: &[u8; 16] = b"ELIDE-P2P-KEY-v1";
+const IDENTITY_MAGIC: &[u8; 16] = b"JETSAM-P2P-KEYv1";
 const MAX_IDENTITY_BYTES: usize = 512;
 
 pub(crate) fn load_or_create(data_dir: &Path) -> Result<Keypair> {

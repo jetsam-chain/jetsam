@@ -168,9 +168,9 @@ pub(crate) fn selected_zk_block_geometry_for_auth_tiles(
 
 const SELECTED_ZK_AUTH_QUERY_LOG: usize = 6;
 
-const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V6";
+const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V6";
 const BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"ELD/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V6";
+    b"JTM/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V6";
 const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v6";
 
 /// Outer-channel label preceding the child-transcript seed draw.

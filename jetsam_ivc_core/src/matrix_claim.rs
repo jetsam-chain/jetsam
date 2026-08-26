@@ -52,7 +52,7 @@ use rayon::prelude::*;
 
 pub mod c1;
 
-const MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"ELD/IVC/MATRIX-CLAIM-REQUEST/V1";
+const MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"JTM/IVC/MATRIX-CLAIM-REQUEST/V1";
 
 /// A plain accumulated claim `M̂~(point) = value` on the stacked matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]

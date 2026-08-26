@@ -27,8 +27,8 @@ use crate::protocol::{
 
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-const REQUEST_MAGIC: [u8; 4] = *b"EMQ7";
-const RESPONSE_MAGIC: [u8; 4] = *b"EMH7";
+const REQUEST_MAGIC: [u8; 4] = *b"JMQ7";
+const RESPONSE_MAGIC: [u8; 4] = *b"JMH7";
 const REQUEST_BYTES: usize = 4 + 8 + 32;
 const RESPONSE_HEADER_BYTES: usize =
     4 + 8 + 32 + 32 + 4 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4 + 2;

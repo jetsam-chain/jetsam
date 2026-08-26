@@ -102,7 +102,7 @@ pub enum KeystoreError {
 
 // ELIDE CHANGE: distinct on-disk magic so an Elide keystore can never be
 // opened as an upstream one, or the reverse. Must stay exactly 16 bytes.
-const PLAIN_MAGIC: &[u8; 16] = b"elide_plainkey_1";
+const PLAIN_MAGIC: &[u8; 16] = b"jetsam_plainkey1";
 const SECRET_LEN: usize = 32;
 const PLAIN_FILE_LEN: usize = 16 + SECRET_LEN; // 48 bytes
 

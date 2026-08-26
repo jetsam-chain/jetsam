@@ -79,8 +79,8 @@ use super::{mul, pin_eq, with_pin_gate};
 
 const DOMAIN_LA: &[u8] = b"r-pcs-leaf-union-v0";
 const DOMAIN_LB: &[u8] = b"r-pcs-merkle-union-v0";
-const LINK_R_PCS_LEAF_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/LINK-R-PCS-LEAF-A/V1";
-const LINK_R_PCS_PATH_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/LINK-R-PCS-PATH-B/V1";
+const LINK_R_PCS_LEAF_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/LINK-R-PCS-LEAF-A/V1";
+const LINK_R_PCS_PATH_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/LINK-R-PCS-PATH-B/V1";
 
 /// Canonical role identifier for link-local `[R]` leaf Walk L-A.
 pub fn link_r_pcs_leaf_sidecar_purpose() -> [u8; 32] {
@@ -92,7 +92,7 @@ pub fn link_r_pcs_path_sidecar_purpose() -> [u8; 32] {
     poseidon2b_hash_byte_slices(LINK_R_PCS_PATH_SIDECAR_PURPOSE_DOMAIN, &[DOMAIN_LB])
 }
 
-const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/HISTORY-STEP-RECORDINGS/V1";
+const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/HISTORY-STEP-RECORDINGS/V1";
 /// Canonical role identifier for HistoryStep's recordings vertical (walk
 /// L-C): two possible predecessor Block-child transcripts followed by two
 /// possible `[R]_prev` transcripts. Exactly one block in each bank is live.

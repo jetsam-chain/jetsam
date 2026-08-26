@@ -1203,7 +1203,7 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
 // The marker binds both the storage schema and genesis so a future genesis
 // replacement cannot accidentally reuse this database.
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
-const NETWORK_STORAGE_SCHEMA: &[u8] = b"elide/mainnet/network-storage/v1/";
+const NETWORK_STORAGE_SCHEMA: &[u8] = b"jetsam/mainnet/network-storage/v1/";
 const NODE_LOG_FILE: &str = "jetsam-node.log";
 
 fn network_storage_epoch_bytes() -> Vec<u8> {

@@ -242,7 +242,7 @@ pub struct PairedExactStateCells {
     pub upper: Vec<PairedUpperExactStateCells>,
 }
 
-const AUTH_PCS_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/AUTH-PCS-PRODUCTION/V1";
+const AUTH_PCS_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/AUTH-PCS-PRODUCTION/V1";
 
 fn auth_pcs_region_sidecar_purpose(role: &[u8], walk_domain: &[u8]) -> [u8; 32] {
     jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(

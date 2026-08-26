@@ -194,7 +194,7 @@ impl BlockR1cs {
             absorb_matrix(&mut bytes, &self.a_0);
             absorb_matrix(&mut bytes, &self.b_0);
             absorb_matrix(&mut bytes, &self.c_0);
-            jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"ELD/IVC/R1CS-STMT", &[&bytes])
+            jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"JTM/IVC/R1CS-STMT", &[&bytes])
         })
     }
 

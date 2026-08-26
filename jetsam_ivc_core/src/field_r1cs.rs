@@ -1878,7 +1878,7 @@ impl FieldR1cs {
                 top.extend_from_slice(&digest);
             }
         }
-        jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"ELD/IVC/FIELD-R1CS-STMT", &[&top])
+        jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"JTM/IVC/FIELD-R1CS-STMT", &[&top])
     }
 
     /// Install a precomputed statement digest — the per-shape-class protocol
@@ -2302,7 +2302,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
             .and_then(|n| n.checked_add(2 * 16))
             .and_then(|n| n.checked_add((2 * spans * 32) as u64))
             .ok_or(FieldR1csArtifactError::LengthArithmetic)?;
-        let mut top = StreamingOnePieceByteHash::new(b"ELD/IVC/FIELD-R1CS-STMT", top_payload_len);
+        let mut top = StreamingOnePieceByteHash::new(b"JTM/IVC/FIELD-R1CS-STMT", top_payload_len);
         for value in [
             self.shape.m as u64,
             self.shape.k_log as u64,
@@ -2420,7 +2420,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
                 })
                 .ok_or(FieldR1csArtifactError::LengthArithmetic)?;
             let mut span =
-                StreamingOnePieceByteHash::new(b"ELD/IVC/FIELD-R1CS-SPAN", span_payload_len);
+                StreamingOnePieceByteHash::new(b"JTM/IVC/FIELD-R1CS-SPAN", span_payload_len);
 
             let mut absolute_entry = entries_committed;
             let mut fresh_row = F128::ZERO;
@@ -5124,7 +5124,7 @@ fn matrix_span_digests(m: &SparseFieldMatrix) -> Vec<[u8; 32]> {
                 }
             }
             jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(
-                b"ELD/IVC/FIELD-R1CS-SPAN",
+                b"JTM/IVC/FIELD-R1CS-SPAN",
                 &[&bytes],
             )
         })

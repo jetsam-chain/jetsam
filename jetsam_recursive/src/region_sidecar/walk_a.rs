@@ -67,8 +67,8 @@ pub const MAX_WALK_A_TX_LOG: usize = 8;
 pub const MAX_WALK_A_QUERY_LOG: usize = 6;
 
 const MAX_WALK_A_FIXED_CELLS: usize = 1 << 22;
-const WALK_A_LAYOUT_DIGEST_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/WALK-A-LAYOUT/V1";
-const WALK_A_VK_DIGEST_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/WALK-A-VK/V1";
+const WALK_A_LAYOUT_DIGEST_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/WALK-A-LAYOUT/V1";
+const WALK_A_VK_DIGEST_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/WALK-A-VK/V1";
 const WALK_A_SIDECAR_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-walk-a-v1";
 
 const WALLET_IN0: usize = 0;

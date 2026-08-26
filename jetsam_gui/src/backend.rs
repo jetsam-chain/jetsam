@@ -45,7 +45,7 @@ const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9701";
 const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9701";
 const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9700";
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
-const NETWORK_STORAGE_EPOCH: &[u8] = b"elide/mainnet/network-storage/v1/6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44\n";
+const NETWORK_STORAGE_EPOCH: &[u8] = b"jetsam/mainnet/network-storage/v1/6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44\n";
 const STATE_SEGMENT_LOG: u32 = 16;
 const STATE_MAP_BUCKETS: usize = 256;
 const GENESIS_DIFFICULTY_LOG2: f64 = 238.0;
@@ -3112,7 +3112,7 @@ mod tests {
         assert!(!mainnet_gui_settings_reset_pending(directory.path(), false));
         std::fs::write(
             directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
-            b"elide/testnet/network-storage/v1/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
+            b"jetsam/testnet/network-storage/v1/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
         )
         .unwrap();
         assert!(mainnet_gui_settings_reset_pending(directory.path(), true));

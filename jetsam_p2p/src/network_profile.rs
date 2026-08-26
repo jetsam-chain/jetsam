@@ -19,11 +19,11 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 
 use crate::header_sync_codec::MAX_HEADERS_PER_BATCH;
 
-const PROFILE_ID_DOMAIN: &[u8] = b"ELD/P2P/NETWORK-PROFILE/V7";
+const PROFILE_ID_DOMAIN: &[u8] = b"JTM/P2P/NETWORK-PROFILE/V7";
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-const REQUEST_MAGIC: [u8; 4] = *b"EPQ6";
-const RESPONSE_MAGIC: [u8; 4] = *b"EPS6";
+const REQUEST_MAGIC: [u8; 4] = *b"JPQ6";
+const RESPONSE_MAGIC: [u8; 4] = *b"JPS6";
 const REQUEST_BYTES: usize = 4 + 32;
 const PROFILE_BYTES: usize = 2 + 32 + 32 + 4 + 4 + 4 + 2 + 2 + 1 + 1;
 const RESPONSE_BYTES: usize = 4 + PROFILE_BYTES + 32;

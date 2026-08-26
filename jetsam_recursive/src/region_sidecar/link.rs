@@ -79,9 +79,9 @@ use super::{
 
 pub const LINK_REGION_SIDECAR_VERSION: u8 = 5;
 
-const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"ELD/REGION-SIDECAR/LINK-VK/V5";
+const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"JTM/REGION-SIDECAR/LINK-VK/V5";
 const LINK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"ELD/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V5";
+    b"JTM/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V5";
 const LINK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-link-v5";
 
 /// Canonical key for the three mandatory link-region verticals.

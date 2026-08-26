@@ -572,7 +572,7 @@ fn state_cap_odd_pad(level: u64, layer_len: usize) -> [u8; 32] {
     let mut pad = [0u8; 32];
     pad[..8].copy_from_slice(&level.to_le_bytes());
     pad[8..16].copy_from_slice(&(layer_len as u64).to_le_bytes());
-    pad[16..].copy_from_slice(b"ELIDE_STATE_PAD_v");
+    pad[16..].copy_from_slice(b"JETSAM_STATE_PADv");
     pad
 }
 

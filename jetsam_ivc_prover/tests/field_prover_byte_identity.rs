@@ -38,16 +38,17 @@ fn field_proof_byte_digest() {
         all.extend_from_slice(&digest);
     }
     let top = jetsam_poseidon2b::native::poseidon2b_hash_byte_slices(b"BYTE-IDENTITY-TOP", &[&all]);
-    // Re-pinned after the TowerHash round-constant regeneration: the
-    // Fiat-Shamir challenger runs on Poseidon2b, so swapping the permutation's
-    // round constants changed every transcript byte, and the previous pin
-    // (daf191ff…, taken after the History query floor moved 125 -> 133) was
-    // never re-derived. The resident and authenticated compact provers below
-    // remain byte-exact to each other, so this pin still catches accidental
-    // transcript perturbations.
+    // Re-pinned after the Jetsam rename moved the transcript byte-hash
+    // domain strings from the ELD/ prefix to JTM/ (ELD/IVC/FIELD-R1CS-STMT
+    // and friends): those domains are absorbed into the Fiat-Shamir
+    // transcript, so every proof byte moved with them. The previous pin
+    // (07532347…) was taken after the TowerHash round-constant regeneration.
+    // The resident and authenticated compact provers below remain byte-exact
+    // to each other, so this pin still catches accidental transcript
+    // perturbations.
     assert_eq!(
         hex(&top),
-        "075323479e3aea937d9c10538ff74b23c08cccd4d3ec7cf1398871c05c0abc89",
+        "9032a0ed09a18be1f77557211da31bc8d5a7d2f98757582f356f25cac4e5359b",
         "proof bytes changed — the transcript must be byte-stable"
     );
 }

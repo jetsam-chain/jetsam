@@ -48,8 +48,8 @@ use crate::storage::serial::{
     max_encoded_segment_len_for_eff_log, SparseSegmentView,
 };
 use crate::storage::{MdbxStore, StoreError};
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"ELIDE_DISK_SNAPSHOT_GENERATION_MANIFEST_V6";
-const SNAPSHOT_PAYLOAD_DOMAIN: &[u8] = b"ELIDE_DISK_SNAPSHOT_GENERATION_PAYLOAD_V1";
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"JETSAM_DISK_SNAPSHOT_GENERATION_MANIFEST_V6";
+const SNAPSHOT_PAYLOAD_DOMAIN: &[u8] = b"JETSAM_DISK_SNAPSHOT_GENERATION_PAYLOAD_V1";
 const SNAPSHOT_GENERATION_VERSION: u32 = 6;
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";

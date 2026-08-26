@@ -31,7 +31,7 @@ use jetsam_chain::{hash_block_header, HeaderChainAnchor};
 
 // ELIDE: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
-const FILE_MAGIC: [u8; 8] = *b"EHSTAGE1";
+const FILE_MAGIC: [u8; 8] = *b"JHSTAGE1";
 const FILE_VERSION: u32 = 2;
 const FILE_HEADER_SIZE: u64 = 8 + 4 + 4 + 8 + 32 + 32 + 8;
 const RECORD_SIZE: usize = BLOCK_HEADER_WIRE_SIZE + 32 + 32;

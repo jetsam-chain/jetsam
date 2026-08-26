@@ -116,7 +116,7 @@ pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
         .map(|tier| ShapeClass { tier })
 }
 
-const SHAPE_CLASS_DOMAIN: &[u8] = b"ELD-TX8X2-SHAPE-CLASS-V4";
+const SHAPE_CLASS_DOMAIN: &[u8] = b"JTM-TX8X2-SHAPE-CLASS-V4";
 
 #[cfg(test)]
 mod tests {
