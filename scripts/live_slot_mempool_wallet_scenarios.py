@@ -180,7 +180,7 @@ class Node:
 
 
 def rpc(url, method, params=None, timeout=8):
-    method_full = method if method.startswith("parajetsam_") else f"parajetsam_{method}"
+    method_full = method if method.startswith("jetsam_") else f"jetsam_{method}"
     body = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": method_full, "params": params or []}
     ).encode()

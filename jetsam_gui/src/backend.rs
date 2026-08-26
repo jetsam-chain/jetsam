@@ -1280,7 +1280,7 @@ impl Backend {
         let body = RpcRequest {
             jsonrpc: "2.0",
             id,
-            method: format!("parajetsam_{method}"),
+            method: format!("jetsam_{method}"),
             params,
         };
         let rpc_url = self.config_snapshot()?.rpc_url;
@@ -2942,7 +2942,7 @@ fn mock_receipt_hex(txid: &str) -> String {
         .into_iter()
         .find(|receipt| receipt.txid == txid)
         .map_or(1_146, |receipt| receipt.receipt_bytes);
-    let mut payload = format!("PARAJETSAM_RECEIPT:{txid}:").into_bytes();
+    let mut payload = format!("JETSAM_RECEIPT:{txid}:").into_bytes();
     payload.resize(receipt_bytes, b'0');
     hex::encode(payload)
 }
@@ -2952,7 +2952,7 @@ fn mock_verify_receipt_hex(receipt_hex: &str) -> ReceiptVerificationSnapshot {
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| {
-            let payload = text.strip_prefix("PARAJETSAM_RECEIPT:")?;
+            let payload = text.strip_prefix("JETSAM_RECEIPT:")?;
             payload.get(..64).map(str::to_owned)
         });
     txid.as_deref().map_or_else(

@@ -6,7 +6,7 @@ Core exposes JSON-RPC 2.0 over HTTP. The default endpoint is:
 http://127.0.0.1:9601
 ```
 
-Every method has the `parajetsam_` namespace prefix. Parameters are positional
+Every method has the `jetsam_` namespace prefix. Parameters are positional
 JSON arrays.
 
 ```sh
@@ -15,7 +15,7 @@ curl --silent --show-error \
   --data '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "parajetsam_getChainInfo",
+    "method": "jetsam_getChainInfo",
     "params": []
   }' \
   http://127.0.0.1:9601

@@ -20,7 +20,7 @@ use iced::{window, Size};
 const LINUX_APPLICATION_ID: &str = "org.jetsam.wallet";
 
 fn app_theme(_: &app::App) -> iced::Theme {
-    theme::parajetsam_theme()
+    theme::jetsam_theme()
 }
 
 fn window_settings() -> window::Settings {

@@ -2156,7 +2156,7 @@ fn input_limit_exceeded_message(error: &anyhow::Error) -> Option<String> {
 }
 
 async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Value> {
-    let method_full = format!("parajetsam_{method}");
+    let method_full = format!("jetsam_{method}");
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id":      1,

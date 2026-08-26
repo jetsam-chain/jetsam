@@ -67,7 +67,7 @@ fn soft_shadow() -> Shadow {
     }
 }
 
-pub fn parajetsam_theme() -> Theme {
+pub fn jetsam_theme() -> Theme {
     Theme::custom(
         "Jetsam System",
         Palette {

@@ -183,12 +183,12 @@ impl RpcClient {
     }
 
     fn get_template(&self, coinbase: &str) -> Result<BlockTemplateResponse> {
-        self.call("parajetsam_getBlockTemplate", [coinbase])
+        self.call("jetsam_getBlockTemplate", [coinbase])
     }
 
     fn submit_nonce(&self, template_id: &str, nonce: u128) -> Result<String> {
         let nonce_hex = hex::encode(nonce.to_le_bytes());
-        self.call("parajetsam_submitBlock", (template_id, nonce_hex))
+        self.call("jetsam_submitBlock", (template_id, nonce_hex))
     }
 }
 

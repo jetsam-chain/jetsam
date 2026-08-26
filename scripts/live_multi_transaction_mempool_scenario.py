@@ -64,7 +64,7 @@ def rpc(port, method, params=None, timeout=15):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method if method.startswith("parajetsam_") else f"parajetsam_{method}",
+            "method": method if method.startswith("jetsam_") else f"jetsam_{method}",
             "params": params or [],
         }
     ).encode()

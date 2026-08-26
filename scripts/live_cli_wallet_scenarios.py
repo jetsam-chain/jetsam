@@ -125,7 +125,7 @@ def rpc(url, method, params=None, timeout=8):
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": f"parajetsam_{method}",
+            "method": f"jetsam_{method}",
             "params": params or [],
         }
     ).encode()

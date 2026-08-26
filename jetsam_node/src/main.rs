@@ -2227,7 +2227,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Shutdown ---
-    // Wait for either Ctrl-C or a `parajetsam_stop` RPC call.
+    // Wait for either Ctrl-C or a `jetsam_stop` RPC call.
     let fatal_runtime_error = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C received");

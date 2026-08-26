@@ -3394,7 +3394,7 @@ mod tests {
 ///
 /// The server runs until `handle.stop()` is called or it is dropped.
 /// Start the RPC server and return (handle, stop_rx).
-/// `stop_rx` fires when `parajetsam_stop` is called via RPC.
+/// `stop_rx` fires when `jetsam_stop` is called via RPC.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     listen: SocketAddr,
@@ -3558,7 +3558,7 @@ where
                     .status(http::StatusCode::UNAUTHORIZED)
                     .header(
                         http::header::WWW_AUTHENTICATE,
-                        "Bearer realm=\"parajetsam-rpc\"",
+                        "Bearer realm=\"jetsam-rpc\"",
                     )
                     .body(jsonrpsee::server::HttpBody::empty())
                     .expect("static 401 response"))

@@ -210,6 +210,150 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetsam-ivc-core"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "jetsam_core",
+ "jetsam_poseidon2b",
+ "rayon",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "jetsam-ivc-prover"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "jetsam-ivc-core",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "jetsam-two-class-research"
+version = "0.0.0"
+dependencies = [
+ "jetsam-ivc-core",
+ "jetsam_chain",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_gkr",
+ "jetsam_poseidon2b",
+ "jetsam_recursive",
+ "jetsam_tx",
+]
+
+[[package]]
+name = "jetsam_chain"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
+ "libmdbx",
+ "rayon",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "jetsam_core"
+version = "1.0.0"
+dependencies = [
+ "rand",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "jetsam_fri"
+version = "1.0.0"
+dependencies = [
+ "jetsam_core",
+ "jetsam_poseidon2b",
+ "rand",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "jetsam_fri_binius"
+version = "1.0.0"
+dependencies = [
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_poseidon2b",
+ "rand_core",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "jetsam_gkr"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
+ "rand_core",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "jetsam_poseidon2b"
+version = "1.0.0"
+dependencies = [
+ "bech32",
+ "hex",
+ "jetsam_core",
+ "rand",
+ "rayon",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "jetsam_recursive"
+version = "1.0.0"
+dependencies = [
+ "bincode",
+ "jetsam-ivc-core",
+ "jetsam-ivc-prover",
+ "jetsam_chain",
+ "jetsam_core",
+ "jetsam_fri",
+ "jetsam_fri_binius",
+ "jetsam_gkr",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
+ "rayon",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "jetsam_tx"
+version = "1.0.0"
+dependencies = [
+ "jetsam_core",
+ "jetsam_poseidon2b",
+ "serde",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -274,135 +418,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "jetsam-ivc-core"
-version = "0.0.2"
-dependencies = [
- "bincode",
- "jetsam_core",
- "jetsam_poseidon2b",
- "rayon",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "jetsam-ivc-prover"
-version = "0.0.2"
-dependencies = [
- "bincode",
- "jetsam-ivc-core",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "jetsam_chain"
-version = "0.0.2"
-dependencies = [
- "bincode",
- "libmdbx",
- "jetsam_core",
- "jetsam_fri",
- "jetsam_fri_binius",
- "jetsam_poseidon2b",
- "jetsam_tx",
- "rayon",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "jetsam_core"
-version = "0.0.2"
-dependencies = [
- "rand",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "jetsam_fri"
-version = "0.0.2"
-dependencies = [
- "jetsam_core",
- "jetsam_poseidon2b",
- "rand",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "jetsam_fri_binius"
-version = "0.0.2"
-dependencies = [
- "jetsam_core",
- "jetsam_fri",
- "jetsam_poseidon2b",
- "rand_core",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "jetsam_gkr"
-version = "0.0.2"
-dependencies = [
- "bincode",
- "jetsam_core",
- "jetsam_fri",
- "jetsam_fri_binius",
- "jetsam_poseidon2b",
- "jetsam_tx",
- "rand_core",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "jetsam_poseidon2b"
-version = "0.0.2"
-dependencies = [
- "bech32",
- "hex",
- "jetsam_core",
- "rand",
- "rayon",
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "jetsam_recursive"
-version = "0.0.2"
-dependencies = [
- "bincode",
- "jetsam-ivc-core",
- "jetsam-ivc-prover",
- "jetsam_chain",
- "jetsam_core",
- "jetsam_fri",
- "jetsam_fri_binius",
- "jetsam_gkr",
- "jetsam_poseidon2b",
- "jetsam_tx",
- "rayon",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "jetsam_tx"
-version = "0.0.2"
-dependencies = [
- "jetsam_core",
- "jetsam_poseidon2b",
- "serde",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,21 +432,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "parajetsam-two-class-research"
-version = "0.0.0"
-dependencies = [
- "jetsam-ivc-core",
- "jetsam_chain",
- "jetsam_core",
- "jetsam_fri",
- "jetsam_fri_binius",
- "jetsam_gkr",
- "jetsam_poseidon2b",
- "jetsam_recursive",
- "jetsam_tx",
-]
 
 [[package]]
 name = "parking_lot"
