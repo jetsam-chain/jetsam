@@ -4,7 +4,7 @@
 
 use iced::window;
 
-const APPLICATION_ICON: &[u8] = include_bytes!("../assets/app-icons/Parano1d-64.png");
+const APPLICATION_ICON: &[u8] = include_bytes!("../assets/app-icons/Jetsam-64.png");
 
 pub fn icon() -> window::Icon {
     let icon = image::load_from_memory(APPLICATION_ICON)

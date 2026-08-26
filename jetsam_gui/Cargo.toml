@@ -3,7 +3,7 @@ name = "jetsam_gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native Parano1d wallet application"
+description = "Native Jetsam wallet application"
 
 [features]
 default = []
