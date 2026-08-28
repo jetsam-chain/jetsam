@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 
 //! Passphrase encryption for the wallet master secret.
 //!

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 
 //! Operator tool: derive a chain address from a 32-byte secret held in a file.
 //!

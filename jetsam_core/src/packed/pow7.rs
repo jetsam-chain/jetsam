@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-// Copyright (C) 2026 trace.protocol. All rights reserved.
+// Copyright (C) 2026 the Jetsam developers. All rights reserved.
 
 //! Fast `x ↦ x^7` on `Block128` for the Poseidon2b S-box.
 //!

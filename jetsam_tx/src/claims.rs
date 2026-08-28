@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Commitment to the canonical live state claims of one Tx8x2 body.

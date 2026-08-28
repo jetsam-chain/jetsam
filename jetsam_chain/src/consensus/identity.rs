@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-// Modifications (C) 2026 trace.protocol — chain identity extracted into one module.
+// Modifications (C) 2026 the Jetsam developers — chain identity extracted into one module.
 
 //! Chain identity — the single place the network's name lives.
 //!

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 //! Wallet authorization benchmark for the sole Tx8x2 form.

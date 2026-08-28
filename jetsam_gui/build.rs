@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
         .set("FileVersion", &version)
         .set("InternalName", "Jetsam")
         .set("OriginalFilename", "jetsam-gui.exe")
-        .set("LegalCopyright", "Copyright © 2026 trace.protocol")
+        .set("LegalCopyright", "Copyright © 2026 the Jetsam developers")
         .set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

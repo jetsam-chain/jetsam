@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 trace.protocol.
-// Copyright (C) 2026 trace.protocol.
+// Ported from hekate-math. Copyright (C) 2026 the Jetsam developers.
+// Copyright (C) 2026 the Jetsam developers.
 
 //! GF(2^16) — quadratic extension of GF(2^8) with TAU = (0x20 left-shifted).
 

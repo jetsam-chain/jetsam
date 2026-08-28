@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from binius64. Copyright (C) 2026 trace.protocol.
-// Copyright (C) 2026 trace.protocol.
+// Adapted from binius64. Copyright (C) 2026 the Jetsam developers.
+// Copyright (C) 2026 the Jetsam developers.
 
 #![allow(clippy::needless_range_loop)]
 

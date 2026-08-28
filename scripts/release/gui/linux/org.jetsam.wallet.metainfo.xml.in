@@ -22,7 +22,7 @@
     <category>Network</category>
   </categories>
   <developer id="org.jetsam">
-    <name>trace.protocol</name>
+    <name>Jetsam</name>
   </developer>
   <url type="homepage">https://jetsam.org/</url>
   <url type="bugtracker">https://github.com/ignotusnemo/jetsam/issues</url>

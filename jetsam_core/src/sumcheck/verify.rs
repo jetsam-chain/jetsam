@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from binius64. Copyright (C) 2026 trace.protocol.
+// Adapted from binius64. Copyright (C) 2026 the Jetsam developers.
 
 //! Sum-Check Verifier for binary tower fields.
 

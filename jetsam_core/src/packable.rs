@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 trace.protocol.
+// Ported from hekate-math. Copyright (C) 2026 the Jetsam developers.
 
 //! `PackableField` trait and `PackedFlat<T>` fallback (WIDTH=1).
 

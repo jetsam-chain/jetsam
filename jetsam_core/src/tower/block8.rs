@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 trace.protocol.
-// Copyright (C) 2026 trace.protocol.
+// Ported from hekate-math. Copyright (C) 2026 the Jetsam developers.
+// Copyright (C) 2026 the Jetsam developers.
 
 //! GF(2^8) — AES polynomial: x^8 + x^4 + x^3 + x + 1 (0x11B)
 

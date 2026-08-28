@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-// Copyright (C) 2026 trace.protocol.
+// Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
-// Copyright (C) 2026 trace.protocol. All rights reserved.
+// Copyright (C) 2026 the Jetsam developers. All rights reserved.
 
 //! GF(2^256) as a quadratic extension of the proof core's flat GF(2^128).
 //!

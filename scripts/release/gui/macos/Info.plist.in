@@ -29,7 +29,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>
-  <string>Copyright © 2026 trace.protocol</string>
+  <string>Copyright © 2026 the Jetsam developers</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>
