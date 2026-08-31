@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: utils
 Priority: optional
 Architecture: @ARCHITECTURE@
-Maintainer: Jetsam <jetsamchain@protonmail.com>
+Maintainer: Jetsam <dev@jetsamchain.com>
 Depends: libc6 (>= 2.35), libgcc-s1, xdg-desktop-portal
 Homepage: https://jetsamchain.com/
 Description: Native Jetsam wallet
