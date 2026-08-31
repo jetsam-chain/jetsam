@@ -1,11 +1,27 @@
-# Jetsam
+<p align="center">
+  <img src="docs/assets/readme/banner.png" alt="Jetsam — the past goes overboard, the chain stays afloat" width="100%">
+</p>
 
-**Proof-native Layer 1 ordered by proof of work. 21,000,000 JTM, zero premine.**
+<p align="center">
+  <img alt="status" src="https://img.shields.io/badge/status-pre--launch-e8c56a?style=flat-square&labelColor=040e17">
+  <img alt="hard cap" src="https://img.shields.io/badge/hard%20cap-21%2C000%2C000%20JTM-3fe3c5?style=flat-square&labelColor=040e17">
+  <img alt="premine" src="https://img.shields.io/badge/premine-zero-3fe3c5?style=flat-square&labelColor=040e17">
+  <img alt="block time" src="https://img.shields.io/badge/block-90%20s-8fa9b5?style=flat-square&labelColor=040e17">
+  <img alt="node size" src="https://img.shields.io/badge/node%20size-O(1)-8fa9b5?style=flat-square&labelColor=040e17">
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-8fa9b5?style=flat-square&labelColor=040e17">
+</p>
 
-[Website](https://jetsam.org) ·
-[Documentation](https://docs.jetsam.org) ·
-[Research](https://lab.jetsam.org) ·
-[Releases](https://github.com/ignotusnemo/jetsam/releases)
+<p align="center">
+  <b>Proof-native Layer 1 ordered by proof of work. 21,000,000 JTM, zero premine.</b><br>
+  <sub>
+    <a href="docs/index.md">Documentation</a> ·
+    <a href="docs/architecture/overview.md">Architecture</a> ·
+    <a href="CHANGES-FROM-UPSTREAM.md">Changes from upstream</a> ·
+    <a href="https://github.com/jetsam-chain/jetsam/releases">Releases</a>
+  </sub>
+</p>
+
+---
 
 > **Status: pre-launch.** The Jetsam network has not launched. No public
 > network is running and no block has ever been produced. Every figure in
@@ -45,6 +61,34 @@ work can order transitions whose validity is already established. The result
 is an L1 whose age does not become a hardware requirement. Years later, an
 ordinary laptop can still hold the complete live state and independently
 verify the network without replaying the chain's lifetime.
+
+## What that looks like
+
+**Two nodes join the same chain at the same moment.** One replays three million
+blocks. The other authenticates the head, verifies one recursive proof of all
+history, checks an 8-block suffix — and is at the tip.
+
+<p align="center">
+  <img src="docs/assets/readme/sync.png" alt="A replay-from-genesis node and a Jetsam node joining the same chain" width="88%">
+</p>
+
+**The subsidy reaches exactly zero.** Seven halvings by height, ending at height
+3,467,664 — about 9.9 years in. The schedule sums to the cap to the micro-unit;
+the final era is trimmed by 136 blocks so the total lands *on* 21,000,000, not
+near it.
+
+<p align="center">
+  <img src="docs/assets/readme/emission.png" alt="Cumulative supply and block subsidy, ending at exactly 21,000,000 JTM" width="78%">
+</p>
+
+**Blocks you find are blocks you keep.** On the codebase Jetsam descends from, a
+miner producing ~35% of blocks kept roughly 3% of them — difficulty read from a
+block's own timestamp, and an interval below prover latency. Jetsam anchors
+difficulty on the parent and mines 90 s blocks.
+
+<p align="center">
+  <img src="docs/assets/readme/mining.png" alt="The same 35% miner under timestamp-anchored rules and under Jetsam rules" width="78%">
+</p>
 
 ## The Fundamental Shift
 
@@ -261,7 +305,7 @@ FRI-Binius close the GF(2) R1CS relation without a trusted setup. One joint
 into the outer PCS batch. The two authenticated production matrices, B25 at
 `m=22` and B255 at `m=24`, are embedded in the official binary and can be
 regenerated from source. The
-[FROST-GKR research article](https://lab.jetsam.org/research/frost-gkr-global-trace-protocol/)
+[FROST-GKR research note](docs/research/frost-gkr.md)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
 
@@ -434,7 +478,7 @@ matrix bytes supplied by the project. Keep the pack outside the repository's
 disposable `target/` tree:
 
 ```sh
-git clone https://github.com/ignotusnemo/jetsam.git
+git clone https://github.com/jetsam-chain/jetsam.git
 cd jetsam
 
 mkdir -p ../jetsam-artifacts
@@ -489,4 +533,4 @@ each other's peers, addresses and proof-of-work.
 Licensed under the [Apache License 2.0](LICENSE). Please report security
 issues according to the [security policy](.github/SECURITY.md).
 
-Contact: [dev@jetsam.org](mailto:dev@jetsam.org)
+Contact: [jetsamchain@protonmail.com](mailto:jetsamchain@protonmail.com)
