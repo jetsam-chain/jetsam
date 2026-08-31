@@ -7,8 +7,8 @@ FROST расшифровывается как **Frobenius Reduction over Shifted
 сводит проверку всего пакета перестановок ширины четыре к открытиям трёх
 многолинейных полиномов.
 
-[Прочитать статью](https://lab.jetsam.org/papers/FROST_GKR.pdf) ·
-[Открыть публикацию Jetsam Lab](https://lab.jetsam.org/research/frost-gkr-global-trace-protocol/) ·
+[Прочитать статью](https://jetsamchain.com/research/) ·
+[Открыть публикацию Jetsam Lab](https://jetsamchain.com/research/) ·
 [Изучить эталонную реализацию](https://github.com/ignotusnemo/frost-gkr)
 
 ## Зачем понадобился новый протокол
