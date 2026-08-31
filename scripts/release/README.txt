@@ -134,5 +134,5 @@ The first node start creates its configuration and persistent data under:
 The wallet key is stored in data/wallet.key and is not password-encrypted.
 Back it up and protect it before receiving funds.
 
-Documentation: https://docs.jetsam.org/
+Documentation: https://docs.jetsamchain.com/
 Source:        https://github.com/ignotusnemo/jetsam

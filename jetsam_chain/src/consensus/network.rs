@@ -129,7 +129,7 @@ impl NetworkConfig {
             // 2. "dnsaddr:<hostname>" → dialled as /dnsaddr/<hostname>
             //    Resolves _dnsaddr.<hostname> TXT records.  Each TXT entry
             //    encodes a full multiaddr including PeerID, e.g.:
-            //      _dnsaddr.jetsam.org TXT
+            //      _dnsaddr.jetsamchain.com TXT
             //        "dnsaddr=/ip4/1.2.3.4/tcp/9600/p2p/12D3KooW..."
             //    Connection is cryptographically verified against PeerID.
             //    This is the libp2p standard (used by IPFS, Filecoin).
@@ -139,10 +139,10 @@ impl NetworkConfig {
             // Each hostname creates an independent startup dial; unresolved
             // future seeds fail independently without delaying usable seeds.
             dns_seeds: &[
-                "mseed1.jetsam.org",
-                "mseed2.jetsam.org",
-                "mseed3.jetsam.org",
-                "mseed4.jetsam.org",
+                "mseed1.jetsamchain.com",
+                "mseed2.jetsamchain.com",
+                "mseed3.jetsamchain.com",
+                "mseed4.jetsamchain.com",
             ],
         }
     }
@@ -203,10 +203,10 @@ mod tests {
         assert_eq!(
             NetworkConfig::mainnet().dns_seeds,
             &[
-                "mseed1.jetsam.org",
-                "mseed2.jetsam.org",
-                "mseed3.jetsam.org",
-                "mseed4.jetsam.org",
+                "mseed1.jetsamchain.com",
+                "mseed2.jetsamchain.com",
+                "mseed3.jetsamchain.com",
+                "mseed4.jetsamchain.com",
             ]
         );
     }
