@@ -534,4 +534,5 @@ each other's peers, addresses and proof-of-work.
 Licensed under the [Apache License 2.0](LICENSE). Please report security
 issues according to the [security policy](.github/SECURITY.md).
 
-Contact: [jetsamchain@protonmail.com](mailto:jetsamchain@protonmail.com)
+Questions, ideas and mining discussion happen in
+[Discussions](https://github.com/jetsam-chain/jetsam/discussions).
