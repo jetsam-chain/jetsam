@@ -17,7 +17,7 @@ jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 
 ```sh
 jetsam-miner \
-  --rpc http://127.0.0.1:9601 \
+  --rpc http://127.0.0.1:9701 \
   --key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -40,7 +40,7 @@ jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```sh
 jetsam \
   --mode extminer \
-  --rpc-listen 0.0.0.0:9601 \
+  --rpc-listen 0.0.0.0:9701 \
   --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -64,7 +64,7 @@ jetsam \
 ```sh
 jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
-  --coinbase o1...
+  --coinbase j1...
 ```
 
 自定义 coinbase 只改变证明构建前嵌入的奖励地址，挖矿进程仍无法修改已经

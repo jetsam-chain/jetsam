@@ -17,8 +17,8 @@ Runtime dispatch selects the `pclmul`, `avx2+vpclmul`,
 `avx512bw+vpclmul` or `neon+pmull` backend automatically. The scalar reference
 backend is not used by a production node.
 
-The node listens for P2P connections on TCP port `9600`. Its JSON-RPC endpoint
-should remain bound to `127.0.0.1:9601`.
+The node listens for P2P connections on TCP port `9700`. Its JSON-RPC endpoint
+should remain bound to `127.0.0.1:9701`.
 
 The dominant mutable storage follows the live UTXO set. Compact 212-byte
 headers remain permanent, while complete block bodies are retained only for
@@ -75,7 +75,7 @@ Create `/etc/jetsam/jetsam.toml`:
 
 ```toml
 [network]
-listen = "0.0.0.0:9600"
+listen = "0.0.0.0:9700"
 seeds = []
 
 [storage]
@@ -83,7 +83,7 @@ backend = "mdbx"
 path = "/var/lib/jetsam"
 
 [rpc]
-listen = "127.0.0.1:9601"
+listen = "127.0.0.1:9701"
 
 [mining]
 enabled = false
@@ -157,12 +157,12 @@ jetsam-cli state
 
 ## Network access
 
-Allow inbound TCP `9600` in the host and provider firewalls. If the server is
-behind NAT, forward TCP `9600` to it. A node can synchronize through outbound
+Allow inbound TCP `9700` in the host and provider firewalls. If the server is
+behind NAT, forward TCP `9700` to it. A node can synchronize through outbound
 connections without an inbound route, but accepting inbound peers makes it
 useful to the network.
 
-Do not expose TCP `9601` publicly. Remote administration should use an SSH
+Do not expose TCP `9701` publicly. Remote administration should use an SSH
 tunnel or another authenticated private transport.
 
 ## Stop or update

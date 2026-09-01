@@ -19,7 +19,7 @@ jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 
 ```sh
 jetsam-miner \
-  --rpc http://127.0.0.1:9601 \
+  --rpc http://127.0.0.1:9701 \
   --key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -45,7 +45,7 @@ RPC только
 ```sh
 jetsam \
   --mode extminer \
-  --rpc-listen 0.0.0.0:9601 \
+  --rpc-listen 0.0.0.0:9701 \
   --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -72,7 +72,7 @@ jetsam \
 ```sh
 jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
-  --coinbase o1...
+  --coinbase j1...
 ```
 
 Пользовательский адрес меняет только выплату, зафиксированную до построения

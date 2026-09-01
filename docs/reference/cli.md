@@ -29,8 +29,8 @@ Public daemon options are:
 | `--miner-address ADDRESS` | Mining payout address; active wallet owner is the default |
 | `--cpu-threads N` | Shared internal-miner thread budget |
 | `--data-dir PATH` | Chain, wallet and runtime data directory |
-| `--p2p-listen HOST:PORT` | P2P listener; default `0.0.0.0:9600` |
-| `--rpc-listen HOST:PORT` | JSON-RPC listener; default `127.0.0.1:9601` |
+| `--p2p-listen HOST:PORT` | P2P listener; default `0.0.0.0:9700` |
+| `--rpc-listen HOST:PORT` | JSON-RPC listener; default `127.0.0.1:9701` |
 | `--seed ENDPOINT` | Add a bootstrap endpoint; repeatable |
 | `--log LEVEL` | Tracing filter such as `error`, `warn`, `info` or `debug` |
 | `--mining-key TOKEN` | Require a bearer token on RPC |
@@ -72,7 +72,7 @@ only its 128-bit nonce.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--rpc URL` | `http://127.0.0.1:9601` | Node JSON-RPC endpoint |
+| `--rpc URL` | `http://127.0.0.1:9701` | Node JSON-RPC endpoint |
 | `--key TOKEN` | — | Bearer token matching the node's `--mining-key` |
 | `--threads N` | `0` | PoW threads; zero uses every visible logical CPU |
 | `--coinbase ADDRESS` | — | Custom `o1…` payout when the node explicitly permits it |
@@ -84,7 +84,7 @@ Typical local use:
 
 ```sh
 jetsam-miner \
-  --rpc http://127.0.0.1:9601 \
+  --rpc http://127.0.0.1:9701 \
   --key 'LONG-RANDOM-TOKEN' \
   --threads 12
 ```
@@ -104,7 +104,7 @@ and performs wallet operations through local JSON-RPC.
 -j, --json      raw JSON output
 ```
 
-The default endpoint is `http://127.0.0.1:9601`. Environment variable
+The default endpoint is `http://127.0.0.1:9701`. Environment variable
 `JETSAM_RPC` changes it. `--rpc` takes precedence.
 
 Amounts entered by CLI wallet commands are in JTM with up to six decimal
@@ -137,7 +137,7 @@ jetsam-cli status
 jetsam-cli block-header 420
 jetsam-cli block 420
 jetsam-cli slot 9700063
-jetsam-cli utxos-of o1...
+jetsam-cli utxos-of j1...
 ```
 
 `block` returns data only inside the 18-block body-retention window. `header`
@@ -170,7 +170,7 @@ individual physical pages.
 ### Address validation
 
 ```sh
-jetsam-cli validate o1...
+jetsam-cli validate j1...
 ```
 
 The command reports validity, canonical bech32m form and raw 32-byte payload.
@@ -206,19 +206,19 @@ owner index.
 Preview:
 
 ```sh
-jetsam-cli send o1... 10.5 --dry-run
+jetsam-cli send j1... 10.5 --dry-run
 ```
 
 Submit with automatic fee:
 
 ```sh
-jetsam-cli send o1... 10.5
+jetsam-cli send j1... 10.5
 ```
 
 Specify an exact fee in JTM only when needed:
 
 ```sh
-jetsam-cli send o1... 10.5 --fee 0.012
+jetsam-cli send j1... 10.5 --fee 0.012
 ```
 
 The returned ID names the complete logical spend. Automatic fee selection is
@@ -229,7 +229,7 @@ recommended because occupancy and relay floor can change.
 ```sh
 jetsam-cli history
 jetsam-cli history --last 20
-jetsam-cli history --address o1...
+jetsam-cli history --address j1...
 ```
 
 Export a confirmed outgoing receipt:

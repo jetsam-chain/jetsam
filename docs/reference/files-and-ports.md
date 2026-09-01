@@ -26,8 +26,8 @@ controls funds; the second does not.
 
 | Port | Bind | Use | Public |
 |---:|---|---|---|
-| TCP 9600 | `0.0.0.0` | libp2p | Yes |
-| TCP 9601 | `127.0.0.1` | JSON-RPC | No |
+| TCP 9700 | `0.0.0.0` | libp2p | Yes |
+| TCP 9701 | `127.0.0.1` | JSON-RPC | No |
 
 Remote external mining may use RPC only through a protected private or TLS
 transport. A bearer token authenticates requests but does not encrypt them.
