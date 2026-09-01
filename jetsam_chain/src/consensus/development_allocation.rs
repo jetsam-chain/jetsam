@@ -65,10 +65,15 @@ pub const DEVELOPMENT_SHARE_DENOMINATOR: u64 = 20;
 /// see `jetsam_poseidon2b/tests/derive_fund_address.rs` for the derivation, which
 /// is reproducible from the secret alone.
 ///
-/// bech32: j1mdes8q5qnlvy8nv548pzwcul42jwvkqp855m4l6jum73slqmv7fqh7t8yw
+/// bech32: j1wl99gzalncqhk052zw07jymxh5qdhr9q2xx3zwjzqeny620sgncqkfyv2z
+///
+/// Regenerated after the TowerHash commit replaced the Poseidon2b domain tags
+/// and round constants: the first generation predated that change, so the
+/// operator's secret no longer opened the address the consensus paid. Pinned
+/// by `fund_addresses_match_the_operator_derivation`.
 pub const NETWORK_FUND_ADDRESS: Address = Address([
-    0xdb, 0x73, 0x03, 0x82, 0x80, 0x9f, 0xd8, 0x43, 0xcd, 0x94, 0xa9, 0xc2, 0x27, 0x63, 0x9f, 0xaa,
-    0xa4, 0xe6, 0x58, 0x01, 0x3d, 0x29, 0xba, 0xff, 0x52, 0xe6, 0xfd, 0x18, 0x7c, 0x1b, 0x67, 0x92,
+    0x77, 0xca, 0x54, 0x0b, 0xbf, 0x9e, 0x01, 0x7b, 0x3e, 0x8a, 0x13, 0x9f, 0xe9, 0x13, 0x66, 0xbd,
+    0x00, 0xdb, 0x8c, 0xa0, 0x51, 0x8d, 0x11, 0x3a, 0x42, 0x06, 0x66, 0x4d, 0x29, 0xf0, 0x44, 0xf0,
 ]);
 
 /// Lab fund recipient.
@@ -76,10 +81,12 @@ pub const NETWORK_FUND_ADDRESS: Address = Address([
 /// JETSAM CHANGE: replaces the upstream Parano1d lab address. Same derivation
 /// path as [`NETWORK_FUND_ADDRESS`], from a distinct secret.
 ///
-/// bech32: j1eawk89x66rgp342aq2f9asrkdllfvasskkcd7wpk6r08ea07warqn6mgws
+/// bech32: j1w809r3dfelzxytrzg7plk080k8vpq3cg5ukpqxgac99lcuq50k8sg8vuhv
+///
+/// Regenerated together with [`NETWORK_FUND_ADDRESS`] for the same reason.
 pub const LAB_FUND_ADDRESS: Address = Address([
-    0xcf, 0x5d, 0x63, 0x94, 0xda, 0xd0, 0xd0, 0x18, 0xd5, 0x5d, 0x02, 0x92, 0x5e, 0xc0, 0x76, 0x6f,
-    0xfe, 0x96, 0x76, 0x10, 0xb5, 0xb0, 0xdf, 0x38, 0x36, 0xd0, 0xde, 0x7c, 0xf5, 0xfe, 0x77, 0x46,
+    0x71, 0xde, 0x51, 0xc5, 0xa9, 0xcf, 0xc4, 0x62, 0x2c, 0x62, 0x47, 0x83, 0xfb, 0x3c, 0xef, 0xb1,
+    0xd8, 0x10, 0x47, 0x08, 0xa7, 0x2c, 0x10, 0x19, 0x1d, 0xc1, 0x4b, 0xfc, 0x70, 0x14, 0x7d, 0x8f,
 ]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +248,31 @@ mod tests {
         assert_ne!(
             LAB_FUND_ADDRESS.0, UPSTREAM_PARANO1D_LAB,
             "lab fund still pays the upstream Parano1d lab — replace it before launch"
+        );
+    }
+
+    /// Launch guard — pins the EXACT bech32 of both fund recipients.
+    ///
+    /// The first generation of these constants was derived before the
+    /// TowerHash commit changed the Poseidon2b domain tags and round
+    /// constants, so the operator's secrets no longer opened the addresses
+    /// the consensus paid: two years of allocation would have been burned.
+    /// `fund_addresses_are_not_upstream` cannot catch that class of bug —
+    /// only an exact pin of the expected encoding can. These strings are the
+    /// output of `derive_fund_address` over the operator's key files under
+    /// the CURRENT derivation; regenerate BOTH together if the sponge, its
+    /// domain tags or the address derivation ever change again.
+    #[test]
+    fn fund_addresses_match_the_operator_derivation() {
+        assert_eq!(
+            NETWORK_FUND_ADDRESS.to_bech32(),
+            "j1wl99gzalncqhk052zw07jymxh5qdhr9q2xx3zwjzqeny620sgncqkfyv2z",
+            "network fund address no longer matches the operator's derived key"
+        );
+        assert_eq!(
+            LAB_FUND_ADDRESS.to_bech32(),
+            "j1w809r3dfelzxytrzg7plk080k8vpq3cg5ukpqxgac99lcuq50k8sg8vuhv",
+            "lab fund address no longer matches the operator's derived key"
         );
     }
 
