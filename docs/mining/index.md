@@ -137,7 +137,7 @@ Run the worker against its loopback RPC endpoint:
 
 ```sh
 jetsam-miner \
-  --rpc http://127.0.0.1:9601 \
+  --rpc http://127.0.0.1:9701 \
   --key '<long-random-token>' \
   --threads 12
 ```

@@ -73,8 +73,8 @@ In another terminal:
 ./jetsam-cli state
 ```
 
-The default P2P listener is `0.0.0.0:9600`. RPC remains on
-`127.0.0.1:9601`.
+The default P2P listener is `0.0.0.0:9700`. RPC remains on
+`127.0.0.1:9701`.
 
 Stop cleanly with:
 

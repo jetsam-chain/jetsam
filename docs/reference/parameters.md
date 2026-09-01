@@ -3,7 +3,7 @@
 ## Core
 
 ```text
-block target             20 seconds
+block target             90 seconds
 ASERT epoch               6 blocks
 ASERT half-life         120 seconds
 median-time-past         11 headers

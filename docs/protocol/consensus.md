@@ -61,7 +61,7 @@ boundary from height and reject deeper alternatives.
 
 ## Difficulty
 
-The target interval between accepted blocks is 20 seconds. Proof preparation,
+The target interval between accepted blocks is 90 seconds. Proof preparation,
 nonce search and propagation share that interval. ASERT adjusts the target
 using six-block reference epochs and a 120-second half-life. The target is
 encoded as a 256-bit little-endian integer.

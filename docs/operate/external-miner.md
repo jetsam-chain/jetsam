@@ -18,7 +18,7 @@ In another terminal:
 
 ```sh
 jetsam-miner \
-  --rpc http://127.0.0.1:9601 \
+  --rpc http://127.0.0.1:9701 \
   --key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -43,7 +43,7 @@ that transport is in place:
 ```sh
 jetsam \
   --mode extminer \
-  --rpc-listen 0.0.0.0:9601 \
+  --rpc-listen 0.0.0.0:9701 \
   --mining-key 'LONG-RANDOM-TOKEN'
 ```
 
@@ -68,7 +68,7 @@ The worker can then use:
 ```sh
 jetsam-miner \
   --key 'LONG-RANDOM-TOKEN' \
-  --coinbase o1...
+  --coinbase j1...
 ```
 
 Custom coinbase changes only the payout embedded before proof construction.

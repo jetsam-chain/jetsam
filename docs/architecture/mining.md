@@ -41,7 +41,7 @@ The proof stack ships two authenticated matrix classes:
 
 Every miner begins with B25. The node may use B255 when complete proof
 preparation timing shows that the larger relation is appropriate for the
-20-second block target. The decision uses measured end-to-end preparation, not
+90-second block target. The decision uses measured end-to-end preparation, not
 only one internal proving phase.
 
 ASERT applies that target to the complete interval between accepted blocks.

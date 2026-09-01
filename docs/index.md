@@ -182,7 +182,7 @@ and the [security model](protocol/security-model.md).
 
 | Parameter | Value |
 |---|---:|
-| Mean block target | 20 seconds |
+| Mean block target | 90 seconds |
 | Default miner class | B25, `m=22`, up to 25 effective page positions |
 | Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |

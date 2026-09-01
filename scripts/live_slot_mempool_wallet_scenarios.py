@@ -12,7 +12,7 @@ Covers:
 Environment knobs:
   JETSAM_LIVE_TX_ROUNDS   default 2  (each round submits 6 txs: A->B,A->C,B->C,B->A,C->A,C->B)
   JETSAM_LIVE_START_BLOCKS default 20
-  JETSAM_LIVE_BASE_PORT   default 19600
+  JETSAM_LIVE_BASE_PORT   default 19700
 """
 
 import json
@@ -30,7 +30,7 @@ LOGS = BASE / "logs"
 
 START_BLOCKS = int(os.environ.get("JETSAM_LIVE_START_BLOCKS", "20"))
 TX_ROUNDS = int(os.environ.get("JETSAM_LIVE_TX_ROUNDS", "2"))
-BASE_PORT = int(os.environ.get("JETSAM_LIVE_BASE_PORT", "19600"))
+BASE_PORT = int(os.environ.get("JETSAM_LIVE_BASE_PORT", "19700"))
 AMOUNT_BASE = 100_000  # 0.1 JTM in micro_jtm; small enough for many rounds
 
 
