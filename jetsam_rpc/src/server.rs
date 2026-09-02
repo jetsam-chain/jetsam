@@ -51,7 +51,20 @@ use crate::wallet_submit::{
 /// External workers receive only a short-lived capability for immutable
 /// node-owned material.  The server retains exactly one attempt across its
 /// preparation, PoW, proof and commit lifecycle.
-const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(30);
+///
+/// JETSAM CHANGE: 120 s, was 30 s. The upstream value assumed a ~20 s block
+/// target; Jetsam mines 90 s blocks with a cache-hard hash, so a modest
+/// external CPU miner needs close to the whole window just to find one nonce
+/// at the young-network difficulty. A 30 s TTL expired the node-owned template
+/// before such a miner could ever submit, wasting every solution it found. The
+/// TTL must exceed one block interval; the compile-time guard below pins that.
+const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    EXTERNAL_MINING_TEMPLATE_TTL.as_secs() > jetsam_chain::consensus::params::BLOCK_TIME,
+    "external template TTL must exceed one block interval, or a slow miner can never \
+     complete a template within its validity window"
+);
 
 // --- OVERLAP ---------------------------------------------------------------
 // Le travail PoW (pow_fields + cible) est entierement determine AVANT la preuve
@@ -3349,7 +3362,7 @@ mod tests {
             nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: "ff".into(),
             height: 7,
-            expires_in_seconds: 30,
+            expires_in_seconds: 120,
             n_txs: 3,
             tx_input_counts: vec![2, 5],
             tx_output_counts: vec![2, 1],
@@ -3361,7 +3374,7 @@ mod tests {
         assert_eq!(json["tx_input_counts"][1], 5);
         assert_eq!(json["template_id"], "00112233445566778899aabbccddeeff");
         assert_eq!(json["nonce_field_index"], POW_NONCE_FIELD_INDEX);
-        assert_eq!(json["expires_in_seconds"], 30);
+        assert_eq!(json["expires_in_seconds"], 120);
         assert_eq!(json.as_object().unwrap().len(), 11);
     }
 
