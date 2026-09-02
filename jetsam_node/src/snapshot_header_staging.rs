@@ -1457,7 +1457,7 @@ mod tests {
     fn native_coinbase_child(chain: &jetsam_chain::storage::MdbxChainContext) -> jetsam_chain::Block {
         let parent = *chain.tip_header();
         let timestamp = parent.timestamp + BLOCK_TIME;
-        let anchor = chain.anchor_info();
+        let anchor = chain.anchor_info().unwrap();
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
         let difficulty_target = next_target(
             anchor.anchor_height,
