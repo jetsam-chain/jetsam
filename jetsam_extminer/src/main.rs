@@ -92,6 +92,12 @@ struct Cli {
     /// Log level (error | warn | info | debug).
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
+
+    /// Benchmark this machine's TowerHash rate for N seconds and exit, without
+    /// touching the network. Reports hashes/second at the chosen --threads, so
+    /// you can size how many threads each CPU needs to pull its weight.
+    #[arg(long, value_name = "SECONDS")]
+    bench: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +450,46 @@ fn mine(cli: &Cli) -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
+fn run_bench(cli: &Cli) {
+    if cli.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.threads)
+            .build_global()
+            .expect("thread pool");
+    }
+    let threads = rayon::current_num_threads();
+    let secs = cli.bench.unwrap_or(10).max(1);
+    // A fixed dummy header; the hash rate does not depend on its contents.
+    let fields = [Block128::from(0x9e37_79b9_7f4a_7c15u128); POW_HEADER_FIELD_COUNT];
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    eprintln!("benchmarking TowerHash on {threads} thread(s) for {secs}s...");
+    let counts: Vec<u128> = (0..threads)
+        .into_par_iter()
+        .map(|tid| {
+            let mut hasher =
+                FixedFieldNonceBatch::new(TAG_POWHDR, &fields, POW_NONCE_FIELD_INDEX);
+            let mut digests = [[0u8; 32]; DIGEST_BATCH];
+            let mut nonce = (tid as u128) << 96;
+            let mut done: u128 = 0;
+            while Instant::now() < deadline {
+                hasher.hash_into(nonce, &mut digests);
+                nonce = nonce.wrapping_add(DIGEST_BATCH as u128);
+                done += DIGEST_BATCH as u128;
+            }
+            done
+        })
+        .collect();
+    let total: u128 = counts.iter().sum();
+    let hps = (total as f64) / (secs as f64);
+    let unit = if hps >= 1.0e6 {
+        format!("{:.2} MH/s", hps / 1.0e6)
+    } else {
+        format!("{:.1} kH/s", hps / 1.0e3)
+    };
+    println!("TowerHash rate: {unit}  ({threads} threads, {:.1} kH/s per thread)",
+             hps / 1.0e3 / threads as f64);
+}
+
 fn main() {
     let cli = Cli::parse();
     if cli.check_hardware {
@@ -458,6 +504,10 @@ fn main() {
     if let Err(error) = jetsam_core::cpu::ensure_production_hardware() {
         eprintln!("fatal: {error}");
         std::process::exit(1);
+    }
+    if cli.bench.is_some() {
+        run_bench(&cli);
+        return;
     }
     if let Err(e) = mine(&cli) {
         eprintln!("fatal: {e}");
