@@ -3279,6 +3279,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libmdbx"
 version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da773dcce45661428e2b51ca984eb3c64c08f2aa54865397e4b77d1f61c9f07"
 dependencies = [
  "bitflags 2.11.1",
  "derive_more",

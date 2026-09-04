@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Generate deterministic ParanO(1)d application icons without external tools."""
+"""Generate deterministic Jetsam application icons without external tools."""
 
 from __future__ import annotations
 
