@@ -10,13 +10,16 @@ use zeroize::Zeroize;
 use crate::model::SensitiveString;
 
 const MAX_SECRET_PHOTO_BYTES: u64 = 256 << 20;
-// Domain-separation tags inherited from upstream. They are key-derivation
-// inputs, not labels: changing either string derives different secrets and
-// different key identifiers, so any wallet created with the image-key
-// feature would stop resolving. They are renamed together with a version
-// bump of this feature, never on their own.
-const IMAGE_SECRET_CONTEXT: &str = "ParanO(1)d master secret from canonical image pixels v1";
-const KEY_ID_CONTEXT: &str = "ParanO(1)d master secret fingerprint v1";
+// Domain-separation tags. They are key-derivation inputs, not labels: the same
+// photo under a different tag derives a different secret. Naming another
+// network here would defeat the separation exactly — one image would produce
+// one secret on both chains.
+//
+// Changing either string strands every wallet already derived under the old
+// one, so they move only with a version bump of this feature. The `v1` suffix
+// is that version.
+const IMAGE_SECRET_CONTEXT: &str = "Jetsam master secret from canonical image pixels v1";
+const KEY_ID_CONTEXT: &str = "Jetsam master secret fingerprint v1";
 
 #[derive(Clone)]
 pub struct PreparedPhoto {
@@ -170,7 +173,7 @@ mod tests {
         let second = derive_image_secret(2, 2, &pixels);
         assert_eq!(
             hex::encode(first),
-            "8d96ff98f464d528b9a1dd123059276dd34bf9735a5c99e2dba17273a5f8286c"
+            "2fbdac301df4838258b610482e4cb453ba074c8ab971e49696c2d14b27002397"
         );
         assert_eq!(first, second);
 
@@ -212,7 +215,7 @@ mod tests {
         );
         assert_eq!(
             plain.master_secret().as_str(),
-            "8d96ff98f464d528b9a1dd123059276dd34bf9735a5c99e2dba17273a5f8286c"
+            "2fbdac301df4838258b610482e4cb453ba074c8ab971e49696c2d14b27002397"
         );
         assert_eq!(plain.key_id, with_metadata.key_id);
     }
@@ -235,7 +238,7 @@ mod tests {
         let photo = prepare_secret_photo(path).unwrap();
         assert_eq!(
             photo.master_secret().as_str(),
-            "3e1d4c86a64e7e0560e3306b69d2ada97b08ea3736f5d7192b3d2b73fc37955d"
+            "f22a861b082dc15231d2a6de944cc3a3fdf1c46694937671996b2b96da62cb5c"
         );
     }
 
