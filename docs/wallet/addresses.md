@@ -23,7 +23,7 @@ Select **New address**. The next derivation index is created and added to the
 wallet. A new address is inactive until selected explicitly.
 
 Copy an address with the control beside it. Jetsam addresses use the
-bech32m `o1…` display form; use the complete string.
+bech32m `j1…` display form; use the complete string.
 
 ## Change the active address
 

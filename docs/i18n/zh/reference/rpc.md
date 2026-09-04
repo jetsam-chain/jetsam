@@ -26,7 +26,7 @@ curl --silent --show-error \
 - 1 JTM 等于 1,000,000 μJTM。
 - 哈希使用不带 `0x` 的小写十六进制。
 - 目标值（target）与 nonce 字节使用各自规范的小端编码。
-- 地址默认使用规范 bech32m `o1…`，除非字段明确要求 hex。
+- 地址默认使用规范 bech32m `j1…`，除非字段明确要求 hex。
 - 未知的永久对象通常返回 `null`。
 - 超出 18 区块保留窗口的旧区块体返回 `null`，其区块头仍可查询。
 - 可能超出 JSON number 精确范围的聚合值使用 decimal string。
@@ -352,6 +352,8 @@ MiningInfo {
   block_reward_micro_jtm: u64
   block_reward_eld: number
   active_slot_count: u64
+  pow_hashrate_hps: number | null
+  pow_hashes_total: u64
 }
 
 NodeStatus {

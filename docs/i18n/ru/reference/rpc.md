@@ -28,7 +28,7 @@ curl --silent --show-error \
 - Хэши передаются в нижнем регистре hex без `0x`.
 - Целевое значение PoW и байты nonce используют канонический порядок от
   младшего байта к старшему (little-endian).
-- Адреса имеют каноническую форму bech32m `o1…`, если поле явно не требует
+- Адреса имеют каноническую форму bech32m `j1…`, если поле явно не требует
   hex.
 - Неизвестный постоянный объект обычно возвращает `null`.
 - После 18-блочного окна старое тело блока возвращает `null`, но его заголовок
@@ -374,6 +374,8 @@ MiningInfo {
   block_reward_micro_jtm: u64
   block_reward_eld: number
   active_slot_count: u64
+  pow_hashrate_hps: number | null
+  pow_hashes_total: u64
 }
 
 NodeStatus {

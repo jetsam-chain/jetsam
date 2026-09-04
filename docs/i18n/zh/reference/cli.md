@@ -71,7 +71,7 @@ jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 | `--rpc URL` | `http://127.0.0.1:9701` | 节点 JSON-RPC 端点 |
 | `--key TOKEN` | — | 与节点 `--mining-key` 匹配的 Bearer 令牌 |
 | `--threads N` | `0` | PoW 线程；零表示使用全部可见逻辑 CPU |
-| `--coinbase ADDRESS` | — | 节点显式允许时使用的自定义 `o1…` 奖励地址 |
+| `--coinbase ADDRESS` | — | 节点显式允许时使用的自定义 `j1…` 奖励地址 |
 | `--poll-ms MS` | `500` | 请求新模板前的延迟 |
 | `--log LEVEL` | `info` | 挖矿进程日志过滤器 |
 | `--check-hardware` | — | 报告发布版 CPU 支持情况后退出 |
@@ -120,7 +120,7 @@ CLI 钱包命令输入的金额以 JTM 为单位，最多六位小数：
 | `history-step-terminal` | — | 当前本地终端证明的十六进制编码 |
 | `tx` | `TXID` | 永久确认位置 |
 | `slot` | `INDEX` | 当前槽位内容 |
-| `utxos-of` | `o1…` | 某地址当前拥有的 UTXO |
+| `utxos-of` | `j1…` | 某地址当前拥有的 UTXO |
 | `state` | — | 容量、占用和 State 编码大小 |
 | `epoch` | — | 当前 144 区块用户[交易周期（epoch）锚点](glossary.md#transaction-epoch-anchor) |
 
@@ -131,7 +131,7 @@ jetsam-cli status
 jetsam-cli block-header 420
 jetsam-cli block 420
 jetsam-cli slot 9700063
-jetsam-cli utxos-of o1...
+jetsam-cli utxos-of j1...
 ```
 
 `block` 只在 18 区块体保留窗口内返回数据。每个规范高度的 `header` 和
@@ -143,7 +143,7 @@ jetsam-cli utxos-of o1...
 |---|---|---|
 | `peers` | — | 已连接对等节点数 |
 | `mining` | — | 难度、下一奖励和挖矿状态 |
-| `block-template` | `--miner-addr o1…` | 节点持有的外部挖矿模板 |
+| `block-template` | `--miner-addr j1…` | 节点持有的外部挖矿模板 |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | 提交一个 16 字节 little-endian nonce |
 
 外部挖矿命令属于低层接口。`jetsam-miner` 会自动刷新模板并编码 nonce。
@@ -162,7 +162,7 @@ jetsam-cli mempool-tx TXID
 ### 地址验证
 
 ```sh
-jetsam-cli validate o1...
+jetsam-cli validate j1...
 ```
 
 命令报告有效性、规范 bech32m 形式和原始 32 字节载荷。
@@ -196,19 +196,19 @@ jetsam-cli scan
 预览：
 
 ```sh
-jetsam-cli send o1... 10.5 --dry-run
+jetsam-cli send j1... 10.5 --dry-run
 ```
 
 自动费用提交：
 
 ```sh
-jetsam-cli send o1... 10.5
+jetsam-cli send j1... 10.5
 ```
 
 仅在确有需要时指定精确 JTM 费用：
 
 ```sh
-jetsam-cli send o1... 10.5 --fee 0.012
+jetsam-cli send j1... 10.5 --fee 0.012
 ```
 
 返回 ID 指向完整逻辑花费。建议使用自动费用，因为占用率和中继费率下限
@@ -219,7 +219,7 @@ jetsam-cli send o1... 10.5 --fee 0.012
 ```sh
 jetsam-cli history
 jetsam-cli history --last 20
-jetsam-cli history --address o1...
+jetsam-cli history --address j1...
 ```
 
 导出已确认的外发收据：

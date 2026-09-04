@@ -9,7 +9,7 @@ recent full-data window. Open it with `F6`.
 
 The search field accepts:
 
-- a bech32m `o1…` address;
+- a bech32m `j1…` address;
 - a block height;
 - a block hash;
 - a logical transaction ID;

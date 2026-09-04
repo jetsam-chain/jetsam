@@ -51,6 +51,9 @@ pub use history_step_artifacts::{
     HISTORY_STEP_RUNTIME_METADATA_VERSION,
 };
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
-pub use pow::{search_pow_parallel, PowSolution};
+pub use pow::{
+    bench_towerhash, format_hashrate, local_hashrate_hps, local_pow_hashes, search_pow_parallel,
+    BenchResult, PowSolution,
+};
 pub use proof_capacity::AdaptiveProofCapacity;
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};

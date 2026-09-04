@@ -10,7 +10,7 @@ the owner whose UTXOs you intend to spend.
 
 Open **Send** or press `F3`, then enter:
 
-- the recipient's complete `o1…` address;
+- the recipient's complete `j1…` address;
 - the amount in JTM.
 
 The wallet obtains current empty-slot hints and an exact fee quote. It selects

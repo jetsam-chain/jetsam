@@ -97,6 +97,16 @@ Check the actual host before creating node data:
 jetsam --check-hardware
 ```
 
+Measure what the machine is worth before committing it. `--bench` opens no
+wallet, no chain database and no socket; it reports the whole-machine rate and
+the per-thread rate, which is the figure that says how many threads a given CPU
+needs to pull its weight:
+
+```sh
+jetsam --bench
+jetsam --bench 60 --cpu-threads 8
+```
+
 Start Core with its built-in miner:
 
 ```sh
@@ -108,10 +118,16 @@ explicit payout is configured, Core uses the active address in its local
 wallet. A separate canonical bech32m payout can be fixed with:
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
-Watch readiness and chain progress from another terminal:
+While it searches, the miner reports its measured rate every 15 seconds:
+
+```
+12:04:31  INFO miner: 2.79 MH/s (16 threads, 41068544 hashes total) height=257
+```
+
+Watch readiness, chain progress and that same rate from another terminal:
 
 ```sh
 jetsam-cli status

@@ -83,7 +83,7 @@ P2P-сервису. Выделенный майнер может использ�
 Для постоянной отдельной выплаты процесса:
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
 Используйте полный адрес bech32m.

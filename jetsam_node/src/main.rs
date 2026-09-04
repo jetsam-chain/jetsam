@@ -932,7 +932,37 @@ impl HistoryStepCacheClass {
     name = "jetsam",
     about = "Jetsam full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run an Jetsam node and wallet.\n\nExample:\n  jetsam --miner --data-dir ~/.jetsam/data\n  jetsam --p2p-listen 0.0.0.0:9700 --seed 1.2.3.4:9700",
+    long_about = "\
+Run a Jetsam node and wallet. The node mines on its own CPU: there is no
+separate miner program to install and no pool account to create.
+
+MINING
+  jetsam --mode miner                    mine to this wallet's own address
+  jetsam --mode miner --cpu-threads 8    keep the miner to 8 logical CPUs
+  jetsam --bench                         measure this machine's rate, then exit
+  jetsam --check-hardware                check CPU support, then exit
+
+  The measured hashrate is printed every 15 seconds while the node searches,
+  and `jetsam-cli mining` reports it on demand. Blocks pay the wallet's active
+  address unless --miner-address names another one.
+
+WHILE THE NODE RUNS (second terminal, node left running)
+  jetsam-cli status                      sync state, peers, tip height
+  jetsam-cli mining                      difficulty, block reward, your hashrate
+  jetsam-cli address                     the j1... address blocks are paid to
+  jetsam-cli balance                     what has been mined
+  jetsam-cli send <j1-address> 10.5      send 10.5 JTM
+  jetsam-cli stop                        shut the node down cleanly
+
+NETWORK
+  jetsam                                 ordinary node: verify and relay only
+  jetsam --seed <host>:9700              add an explicit entry point
+  Ports: 9700 peer-to-peer, open it inbound. 9701 JSON-RPC, keep it local.
+
+FILES
+  ~/.jetsam/jetsam.toml                  configuration, written on first start
+  ~/.jetsam/data/wallet.key              your keys — back this file up
+",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -961,7 +991,7 @@ struct Cli {
     #[arg(long, hide = true)]
     genesis: bool,
 
-    /// Miner payout address (canonical bech32m, beginning with `o1`).
+    /// Miner payout address (canonical bech32m, beginning with `j1`).
     /// Defaults to the wallet's active address.
     #[arg(long, value_name = "ADDRESS")]
     miner_address: Option<String>,
@@ -1035,6 +1065,12 @@ struct Cli {
     /// Check production CPU support and exit without touching node data.
     #[arg(long, exclusive = true)]
     check_hardware: bool,
+
+    /// Measure this machine's TowerHash mining rate for SECONDS, then exit.
+    /// Touches no wallet, no chain data and no network. Default: 10 seconds.
+    /// Honours --cpu-threads to size a single worker.
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "10")]
+    bench: Option<u64>,
 
     /// Print the generated master secret as 64 hexadecimal characters, then exit.
     #[arg(long, hide = true, conflicts_with = "import_wallet_secret")]
@@ -1478,6 +1514,27 @@ fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Report this machine's TowerHash rate and exit.
+///
+/// Runs before tracing is configured and before any node state is opened, so it
+/// prints directly and never creates a wallet, a config file or a database.
+fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
+    let seconds = seconds.clamp(1, 3600);
+    let width = match cpu_threads.filter(|n| *n > 0) {
+        Some(n) => n.to_string(),
+        None => "all".to_string(),
+    };
+    eprintln!("Benchmarking TowerHash for {seconds}s on {width} thread(s)...");
+    let result = jetsam_miner::bench_towerhash(Duration::from_secs(seconds), cpu_threads);
+    println!(
+        "TowerHash rate: {}  ({} threads, {} per thread)",
+        jetsam_miner::format_hashrate(result.hashes_per_second()),
+        result.threads,
+        jetsam_miner::format_hashrate(result.per_thread_hps()),
+    );
+    println!("This is the rate `jetsam --mode miner` searches at on this machine.");
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
@@ -1491,6 +1548,11 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let production_hardware = jetsam_core::cpu::ensure_production_hardware()?;
+
+    if let Some(seconds) = cli.bench {
+        run_bench(seconds, cli.cpu_threads);
+        return Ok(());
+    }
 
     // Shorthand role flags override the default mode; clap already rejects
     // combining them with each other.
@@ -14286,7 +14348,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
     }
 }
 
-/// Parse a miner/wallet address from canonical bech32m (`o1…`).
+/// Parse a miner/wallet address from canonical bech32m (`j1…`).
 fn parse_address(s: &str) -> anyhow::Result<jetsam_poseidon2b::primitives::Address> {
     if s.is_empty() {
         return Ok(jetsam_poseidon2b::primitives::Address([0u8; 32]));

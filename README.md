@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-pre--launch-e8c56a?style=flat-square&labelColor=040e17">
+  <img alt="status" src="https://img.shields.io/badge/status-mainnet%20live-3fe3c5?style=flat-square&labelColor=040e17">
   <img alt="hard cap" src="https://img.shields.io/badge/hard%20cap-21%2C000%2C000%20JTM-3fe3c5?style=flat-square&labelColor=040e17">
   <img alt="premine" src="https://img.shields.io/badge/premine-zero-3fe3c5?style=flat-square&labelColor=040e17">
   <img alt="block time" src="https://img.shields.io/badge/block-90%20s-8fa9b5?style=flat-square&labelColor=040e17">
@@ -24,10 +24,12 @@
 
 ---
 
-> **Status: pre-launch.** The Jetsam network has not launched. No public
-> network is running and no block has ever been produced. Every figure in
-> this document is a protocol constant or a local measurement, not a live
-> network metric.
+> **Status: mainnet.** The Jetsam network is live and producing blocks under
+> the emission schedule below. Genesis is
+> `6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44`; the
+> current height is visible at
+> [explorer.jetsamchain.com](https://explorer.jetsamchain.com). Every figure in
+> this document is a protocol constant or a measurement, each labelled as such.
 
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
@@ -402,12 +404,40 @@ a body leaves the recent suffix.
 
 ## Running Jetsam
 
+### Install
+
+Signed-by-checksum binaries are published on the
+[releases page](https://github.com/jetsam-chain/jetsam/releases). Fetch the node,
+the wallet and the checksums, verify them, and make them runnable:
+
+```sh
+curl -sL -O https://github.com/jetsam-chain/jetsam/releases/latest/download/jetsam-node-linux-x86_64 \
+        -O https://github.com/jetsam-chain/jetsam/releases/latest/download/jetsam-cli-linux-x86_64 \
+        -O https://github.com/jetsam-chain/jetsam/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+chmod +x jetsam-node-linux-x86_64 jetsam-cli-linux-x86_64
+```
+
+`sha256sum -c` must print `OK` for both binaries. Rename them to `jetsam` and
+`jetsam-cli` if you prefer the short commands used below.
+
+### Run
+
 Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
 
 ```sh
 jetsam
 jetsam --miner
+```
+
+A mining node prints its measured hashrate every 15 seconds while it searches,
+and `jetsam-cli mining` reports it on demand. To measure a machine before
+committing it — no wallet, no chain data, no network:
+
+```sh
+jetsam --bench
+jetsam --bench 60 --cpu-threads 8
 ```
 
 An explicit seed may be supplied when diagnosing discovery or operating a

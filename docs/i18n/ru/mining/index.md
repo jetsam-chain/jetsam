@@ -114,7 +114,7 @@ jetsam --mode miner --cpu-threads 12
 Отдельный канонический адрес bech32m можно зафиксировать так:
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
 Следите за готовностью и цепью из другого терминала:
