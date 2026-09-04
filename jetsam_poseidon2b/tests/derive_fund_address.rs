@@ -7,7 +7,7 @@
 //! appears in the output — only the derived public address does.
 //!
 //! ```text
-//! JETSAM_SECRET_FILE=/root/wallet/jetsam/fund-network.key \
+//! JETSAM_SECRET_FILE=/path/to/secret.key \
 //!   cargo test --release -p jetsam_poseidon2b --test derive_fund_address \
 //!   -- --ignored --nocapture
 //! ```
