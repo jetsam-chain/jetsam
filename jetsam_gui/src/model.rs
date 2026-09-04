@@ -599,7 +599,7 @@ impl AppSnapshot {
         self.addresses.push(AddressSnapshot {
             key_index,
             address: format!(
-                "o1q{:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc",
+                "j1q{:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc",
                 key_index
             ),
             label: format!("Address {key_index}"),
@@ -731,7 +731,7 @@ impl AppSnapshot {
         let mut addresses = vec![
             AddressSnapshot {
                 key_index: 0,
-                address: "o12p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt".into(),
+                address: "j12p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt".into(),
                 label: "Main".into(),
                 balance_micro_jtm: PREVIEW_BALANCE_MICRO_JTM,
                 utxo_count: PREVIEW_UTXO_COUNT,
@@ -741,7 +741,7 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 1,
-                address: "o17z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj".into(),
+                address: "j17z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj".into(),
                 label: "Savings".into(),
                 balance_micro_jtm: 312_000_000,
                 utxo_count: 6,
@@ -751,7 +751,7 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 2,
-                address: "o1ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6".into(),
+                address: "j1ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6".into(),
                 label: "Shop".into(),
                 balance_micro_jtm: 0,
                 utxo_count: 0,
@@ -764,7 +764,7 @@ impl AppSnapshot {
             AddressSnapshot {
                 key_index: key_index as u32,
                 address: format!(
-                    "o1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
+                    "j1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
                 ),
                 label: format!("Address {key_index}"),
                 balance_micro_jtm: 0,

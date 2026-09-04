@@ -24,6 +24,9 @@ iced = { version = "0.14", features = [
     "qr_code",
     "tokio",
 ] }
+# Source of truth for the address HRP. Hard-coding the prefix here is what
+# let the upstream `o1` check survive this chain's rename.
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
 blake3 = "1"
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = [

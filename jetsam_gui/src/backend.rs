@@ -1107,7 +1107,7 @@ impl Backend {
             return Err("Enter an address, block, transaction, or slot.".into());
         }
 
-        if query.to_ascii_lowercase().starts_with("o1") {
+        if looks_like_address(query) {
             let validated = self
                 .rpc::<RpcAddressInfo>("validateAddress", json!([query]))
                 .await?;
@@ -2552,8 +2552,8 @@ struct RpcBlockTransactionOutput {
 
 fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
     let hash = format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height));
-    let miner = "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp";
-    let recipient = "o1k3v8s5q2nc7r4m9x6df0wa8h1yt5p3j7u9e2l6b4z8g0cm5nr";
+    let miner = "j1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp";
+    let recipient = "j1k3v8s5q2nc7r4m9x6df0wa8h1yt5p3j7u9e2l6b4z8g0cm5nr";
     let coinbase_txid = format!("{:064x}", height.wrapping_mul(3));
     let spend_txid = format!("{:064x}", height.wrapping_mul(5));
     BlockDetailsSnapshot {
@@ -2753,9 +2753,22 @@ fn mock_explorer_snapshot(block_page: u32, transaction_page: u32) -> ExplorerSna
     }
 }
 
+/// True when a string is shaped like an address of THIS network.
+///
+/// The prefix is derived from the protocol constant, never written out: a
+/// literal is exactly how the upstream `o1` test survived the rename and made
+/// the explorer search refuse every real address.
+fn looks_like_address(candidate: &str) -> bool {
+    let prefix = format!("{}1", jetsam_poseidon2b::primitives::ADDRESS_HRP);
+    candidate
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase())
+}
+
 fn mock_explorer_search(query: &str, transaction_page: u32) -> Result<ExplorerLookup, String> {
     let query = query.trim();
-    if query.to_ascii_lowercase().starts_with("o1") {
+    if looks_like_address(query) {
         let preview = AppSnapshot::design_preview();
         let slots = if preview.active_address().address == query {
             preview
@@ -2893,11 +2906,11 @@ async fn read_node_log_tail(
 }
 
 fn mock_receipt_records() -> Vec<ReceiptSnapshot> {
-    const SENDER: &str = "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp";
+    const SENDER: &str = "j1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp";
     const RECIPIENTS: [&str; 3] = [
-        "o1k3v8s5q2nc7r4m9x6df0wa8h1yt5p3j7u9e2l6b4z8g0cm5nr",
-        "o1y7m4h2p8vz5k9c3d6ta0er4wn8qx2f5j7l9s3u6g1b4n8kp2mc",
-        "o1mw9w0ak0kexrt8nge0d30wxqe2ghqah5m6fkqjkv3upjwfgpg02stde4s0",
+        "j1k3v8s5q2nc7r4m9x6df0wa8h1yt5p3j7u9e2l6b4z8g0cm5nr",
+        "j1y7m4h2p8vz5k9c3d6ta0er4wn8qx2f5j7l9s3u6g1b4n8kp2mc",
+        "j1mw9w0ak0kexrt8nge0d30wxqe2ghqah5m6fkqjkv3upjwfgpg02stde4s0",
     ];
     (0..12u64)
         .map(|index| ReceiptSnapshot {
@@ -3019,6 +3032,31 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_shape_follows_this_network_not_the_upstream_one() {
+        // Real addresses of this network.
+        assert!(looks_like_address(
+            "j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
+        ));
+        assert!(looks_like_address(
+            "  J19FE83J2L7UKELK63477JDHLR2PRSMXYTQU8LZU8Q3HHFHEGZXS6QEFC03U  "
+        ));
+        // The upstream prefix belongs to a different chain.
+        assert!(!looks_like_address(
+            "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp"
+        ));
+        assert!(!looks_like_address("847221"));
+        assert!(!looks_like_address(""));
+    }
+
+    #[test]
+    fn the_design_preview_uses_addresses_of_this_network() {
+        // The preview feeds the offline explorer search; upstream-shaped
+        // fixtures would make it answer nothing for its own data.
+        let preview = AppSnapshot::design_preview();
+        assert!(looks_like_address(&preview.active_address().address));
+    }
 
     #[test]
     fn sibling_node_discovery_rejects_the_gui_itself() {
@@ -3257,7 +3295,10 @@ mod tests {
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
             node_binary: PathBuf::from("jetsam"),
-            seeds: vec!["seed-a.example:9700".into(), "dnsaddr:jetsam.network".into()],
+            seeds: vec![
+                "seed-a.example:9700".into(),
+                "dnsaddr:jetsam.network".into(),
+            ],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
             settings_path: settings_path.clone(),
