@@ -3,8 +3,6 @@
 The first-run flow creates or restores the single 256-bit secret from which the
 wallet derives every address.
 
-![Master-secret setup](../assets/wallet/first-run.png)
-
 ## Generate
 
 **Create a new 256-bit key** uses operating-system randomness and installs the

@@ -2,8 +2,6 @@
 
 首次运行流程会创建或恢复一个 256 位[主密钥](../reference/glossary.md#master-secret)，钱包的所有地址都由它派生。
 
-![主密钥设置](../../../assets/wallet/first-run.png)
-
 ## 生成
 
 **创建新的 256 位密钥** 使用操作系统随机源，并将新主密钥安装在本机。

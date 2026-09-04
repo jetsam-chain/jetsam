@@ -3,8 +3,6 @@
 Scope is the wallet's view into canonical headers, current Live State and the
 recent full-data window. Open it with `F6`.
 
-![Scope canonical-chain view](../assets/wallet/scope.png)
-
 ## Search
 
 The search field accepts:

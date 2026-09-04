@@ -3,8 +3,6 @@
 The Mining page controls the full node's built-in proof and PoW pipeline. Open
 it with `F5`.
 
-![Internal mining controls and mined blocks](../assets/wallet/mining.png)
-
 ## Requirements
 
 Mining becomes available when:

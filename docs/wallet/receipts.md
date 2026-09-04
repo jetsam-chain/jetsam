@@ -3,8 +3,6 @@
 The Receipts section preserves and verifies durable proof of outgoing payments.
 Open it with `F4`.
 
-![Locally saved payment receipts](../assets/wallet/receipts.png)
-
 ## My receipts
 
 **My receipts** lists confirmed payments made from a wallet owner to a distinct

@@ -4,8 +4,6 @@ The wallet can derive its 256-bit master secret from an image. It does not hide
 an existing key inside the file: the decoded pixels are the source of the key.
 The same pixels recreate the same wallet and every address derived from it.
 
-![Deriving a wallet key from photo pixels](../assets/wallet/photo-key.png)
-
 ## What the wallet reads
 
 The wallet decodes the selected image, converts it to a canonical RGBA pixel
