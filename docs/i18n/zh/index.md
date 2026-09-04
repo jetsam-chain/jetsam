@@ -100,13 +100,13 @@ State 是一个精确的、带索引的稀疏 UTXO 向量。支出会清空槽�
 在所有正整数查询预算中，期望经典随机预言机查询工作量的最小值。对实际部署的
 B25 与 B255 配置应用其定义和整数位表示后，可证明值与基于猜想的值均为 127 位。
 完整计算以及与已发布系统的比较见
-[Block–Tiwari 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md)。
+[Block–Tiwari 推导](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/block-tiwari.md)。
 
 另一项端到端可靠性游戏考察单个能够跨查询保留状态的量子对手能否使实际部署的
 验证器接受一个递归证明链始于创世区块的无效终端 State。在定理明确给出的固定
 Poseidon2b 偏差上界与相干响应成本前提下，网络当前状态自创世块起的端到端后量子可靠性，已证明达到
 NIST PQC Category 1 水平。完整推导见
-[QROM 与 Category 1 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)，命题边界见
+[QROM 与 Category 1 推导](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/category-one.md)，命题边界见
 [安全模型](protocol/security-model.md)。
 
 ## 协议概况
@@ -125,10 +125,10 @@ NIST PQC Category 1 水平。完整推导见
 
 ## 开始使用
 
-- 从[最新版本](https://github.com/ignotusnemo/jetsam/releases)安装原生 GUI 钱包。钱包自带并管理一个完整节点。
+- 从[最新版本](https://github.com/jetsam-chain/jetsam/releases)安装原生 GUI 钱包。钱包自带并管理一个完整节点。
 - 阅读[架构概览](architecture/overview.md)，跟踪交易从钱包进入已接受的 State 的完整过程。
 - [在 Linux 上运行普通节点](operate/node.md)。
 - [运行内置或外部矿工](mining/index.md)。
-- 使用项目固定的 Rust toolchain 查看或构建[源代码](https://github.com/ignotusnemo/jetsam)。
+- 使用项目固定的 Rust toolchain 查看或构建[源代码](https://github.com/jetsam-chain/jetsam)。
 
 源代码是共识行为的规范定义。协议规范以稳定、独立于具体实现的形式记录这些规则。

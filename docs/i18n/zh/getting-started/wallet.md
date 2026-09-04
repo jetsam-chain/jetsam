@@ -5,7 +5,7 @@
 
 ## 选择安装包
 
-请从 [GitHub 发布页面](https://github.com/ignotusnemo/jetsam/releases)
+请从 [GitHub 发布页面](https://github.com/jetsam-chain/jetsam/releases)
 下载与电脑匹配的 GUI 钱包：
 
 | 平台 | 安装包 |

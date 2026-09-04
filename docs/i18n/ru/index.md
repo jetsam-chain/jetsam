@@ -183,7 +183,7 @@ Jetsam прозрачен и не является приватным блокч
 штатных профилей B25 и B255 их определения и целочисленное представление дают
 127 доказуемых и 127 предполагаемых бит. Полный расчёт и сравнение с
 опубликованными системами приведены в
-[доказательстве по Block–Tiwari](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md).
+[доказательстве по Block–Tiwari](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/block-tiwari.md).
 
 Отдельная сквозная игра корректности проверяет, способен ли один квантовый
 противник, сохраняющий состояние между запросами, заставить штатную проверяющую
@@ -192,7 +192,7 @@ Jetsam прозрачен и не является приватным блокч
 Poseidon2b и стоимости когерентного ответа сквозная постквантовая корректность
 проверки текущего состояния сети доказана от генезиса на уровне NIST PQC
 Category 1. Полный вывод приведён в
-[доказательстве QROM и Category 1](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md),
+[доказательстве QROM и Category 1](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/category-one.md),
 границы утверждения описаны в [модели безопасности](protocol/security-model.md).
 
 ## Профиль протокола
@@ -212,14 +212,14 @@ Category 1. Полный вывод приведён в
 ## Начало работы
 
 - Установите нативный GUI-кошелёк из
-  [последнего релиза](https://github.com/ignotusnemo/jetsam/releases). Он
+  [последнего релиза](https://github.com/jetsam-chain/jetsam/releases). Он
   включает и самостоятельно управляет собственной полной нодой.
 - Прочитайте [обзор архитектуры](architecture/overview.md), чтобы проследить
   путь транзакции от кошелька до принятого `State`.
 - [Запустите обычную ноду в Linux](operate/node.md).
 - [Запустите встроенный или внешний майнер](mining/index.md).
 - Изучите или соберите
-  [исходный код](https://github.com/ignotusnemo/jetsam) с закреплённой версией
+  [исходный код](https://github.com/jetsam-chain/jetsam) с закреплённой версией
   Rust toolchain.
 
 Исходный код является каноническим определением поведения консенсуса.

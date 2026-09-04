@@ -55,7 +55,7 @@ cargo build --locked \
 ## 复现可靠性证书
 
 实际部署计算与证明文档位于
-[`jetsam_soundness`](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness)。
+[`jetsam_soundness`](https://github.com/jetsam-chain/jetsam/tree/master/jetsam_soundness)。
 
 ```sh
 cargo run --release --locked -p jetsam_soundness

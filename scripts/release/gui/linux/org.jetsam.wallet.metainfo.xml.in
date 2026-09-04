@@ -25,7 +25,7 @@
     <name>Jetsam</name>
   </developer>
   <url type="homepage">https://jetsamchain.com/</url>
-  <url type="bugtracker">https://github.com/ignotusnemo/jetsam/issues</url>
+  <url type="bugtracker">https://github.com/jetsam-chain/jetsam/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="@VERSION@" date="@RELEASE_DATE@"/>

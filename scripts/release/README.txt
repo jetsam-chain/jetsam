@@ -37,7 +37,7 @@ Verify the download
 
 Download SHA256SUMS from the same GitHub release as this archive:
 
-  https://github.com/ignotusnemo/jetsam/releases
+  https://github.com/jetsam-chain/jetsam/releases
 
 Before extracting or running anything, compute the archive's SHA-256 digest
 and compare it with the matching line in SHA256SUMS.
@@ -134,5 +134,5 @@ The first node start creates its configuration and persistent data under:
 The wallet key is stored in data/wallet.key and is not password-encrypted.
 Back it up and protect it before receiving funds.
 
-Documentation: https://docs.jetsamchain.com/
-Source:        https://github.com/ignotusnemo/jetsam
+Documentation: https://github.com/jetsam-chain/jetsam/tree/master/docs/
+Source:        https://github.com/jetsam-chain/jetsam

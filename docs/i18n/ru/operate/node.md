@@ -30,7 +30,7 @@ P2P-соединения принимаются на TCP `9700`. JSON-RPC дол
 ## Установка релиза Core
 
 Скачайте архив нужной архитектуры и `SHA256SUMS` со
-[страницы релизов](https://github.com/ignotusnemo/jetsam/releases). Проверьте
+[страницы релизов](https://github.com/jetsam-chain/jetsam/releases). Проверьте
 архив до распаковки, заменив `VERSION` номером версии:
 
 ```sh
