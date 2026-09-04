@@ -7,7 +7,7 @@ wallet use does not require a terminal.
 ## Choose the package
 
 Download the GUI wallet for the computer from the
-[GitHub release page](https://github.com/ignotusnemo/jetsam/releases):
+[GitHub release page](https://github.com/jetsam-chain/jetsam/releases):
 
 | Platform | Package |
 |---|---|

@@ -7,7 +7,7 @@
 ## Выбор пакета
 
 Скачайте GUI-кошелёк для своей платформы со
-[страницы релизов GitHub](https://github.com/ignotusnemo/jetsam/releases):
+[страницы релизов GitHub](https://github.com/jetsam-chain/jetsam/releases):
 
 | Платформа | Пакет |
 |---|---|

@@ -12,9 +12,13 @@ operators and wallet users should run its latest patch release.
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately to
-<security@jetsamchain.com>. Do not open a public issue or discuss an unpatched
-vulnerability in a public channel.
+Use **[Report a vulnerability](https://github.com/jetsam-chain/jetsam/security/advisories/new)**
+on this repository's Security tab. The report stays private to the maintainers
+until an advisory is published, and it needs nothing beyond a GitHub account.
+
+**Do not open an issue, a discussion, or any other public thread for an
+unpatched vulnerability.** Jetsam secures a live network: a public report arms
+an attacker before a fix exists.
 
 Include the affected release or commit, component, platform, expected and
 observed behavior, security impact, and a minimal reproducer when possible.
@@ -27,3 +31,22 @@ disclosure with the reporter.
 
 Jetsam does not currently operate a formal bug bounty. Receipt of a report
 does not imply compensation.
+
+## Everything that is not a vulnerability
+
+- **A bug in the node, the wallet or the miner** —
+  [open an issue](https://github.com/jetsam-chain/jetsam/issues/new/choose).
+- **A question, an idea, mining or operations talk** —
+  [Discussions](https://github.com/jetsam-chain/jetsam/discussions).
+
+## Verifying a release
+
+Every release publishes `SHA256SUMS` next to its binaries. Check what you
+downloaded before you run it:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+A binary whose checksum does not match the release page did not come from this
+project. Report that through the vulnerability channel above.

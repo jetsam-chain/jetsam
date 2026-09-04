@@ -45,7 +45,7 @@ log2(期望经典随机预言机查询工作量的最小值)，
 256 位随机预言机设定和整数位表示后，可证明 RBR 前提与基于猜想的 RBR 前提都
 得到位于 `[127, 128)` 的精确期望工作量。整数表示相同并不意味着两个前提相同。
 
-[Block–Tiwari 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/block-tiwari.md)证明每个实际部署
+[Block–Tiwari 推导](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/block-tiwari.md)证明每个实际部署
 层的局部 RBR 输入，精确求解两项整数优化，并复现与其已发布表格中其他系统的比较。
 
 ### 端到端 Category 1
@@ -71,8 +71,8 @@ NIST 后量子密码学 Category 1 的全部 `MAXDEPTH` 点。成功概率为二
 可靠性游戏中，成功概率均小于二分之一。因此，网络当前状态自创世块起的端到端后量子
 可靠性，已证明达到 NIST PQC Category 1 水平。
 
-[端到端 QROM 推导](https://github.com/ignotusnemo/jetsam/blob/main/jetsam_soundness/docs/category-one.md)给出可靠性游戏、
-归约、有限规模修正项和全部前提。[`jetsam_soundness` 证书](https://github.com/ignotusnemo/jetsam/tree/main/jetsam_soundness)
+[端到端 QROM 推导](https://github.com/jetsam-chain/jetsam/blob/master/jetsam_soundness/docs/category-one.md)给出可靠性游戏、
+归约、有限规模修正项和全部前提。[`jetsam_soundness` 证书](https://github.com/jetsam-chain/jetsam/tree/master/jetsam_soundness)
 从实际部署代码导入常量，并用精确整数或有理数算术计算所有用于结论判定的不等式。这是
 Category 1 的密码学资源评估，不代表 NIST 审查或认证了 Jetsam。
 
