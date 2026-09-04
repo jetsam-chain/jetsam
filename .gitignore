@@ -11,3 +11,6 @@ __pycache__/
 
 # Golden vectors are 8.7 MB and reproducible in one command; see miner/README.md
 miner/golden.txt
+
+# GPU miner sources are distributed privately, never in this repository.
+/miner/

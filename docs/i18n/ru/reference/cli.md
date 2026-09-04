@@ -75,7 +75,7 @@ jetsam --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 | `--rpc URL` | `http://127.0.0.1:9701` | Адрес JSON-RPC ноды |
 | `--key TOKEN` | — | Токен доступа, совпадающий с `--mining-key` ноды |
 | `--threads N` | `0` | Потоки PoW; ноль использует все видимые логические CPU |
-| `--coinbase ADDRESS` | — | Пользовательская выплата `o1…`, если нода явно её разрешила |
+| `--coinbase ADDRESS` | — | Пользовательская выплата `j1…`, если нода явно её разрешила |
 | `--poll-ms MS` | `500` | Задержка перед запросом следующего шаблона |
 | `--log LEVEL` | `info` | Фильтр журнала вычислителя |
 | `--check-hardware` | — | Проверить совместимость CPU и выйти |
@@ -126,7 +126,7 @@ jetsam-miner \
 | `history-step-terminal` | — | Текущее локальное терминальное доказательство в hex |
 | `tx` | `TXID` | Постоянное место подтверждения |
 | `slot` | `INDEX` | Текущее содержимое слота |
-| `utxos-of` | `o1…` | Текущие UTXO указанного адреса |
+| `utxos-of` | `j1…` | Текущие UTXO указанного адреса |
 | `state` | — | Вместимость, заполнение и размер Live State |
 | `epoch` | — | Текущий якорь пользовательской эпохи в 144 блока |
 
@@ -137,7 +137,7 @@ jetsam-cli status
 jetsam-cli block-header 420
 jetsam-cli block 420
 jetsam-cli slot 9700063
-jetsam-cli utxos-of o1...
+jetsam-cli utxos-of j1...
 ```
 
 `block` возвращает данные только внутри 18-блочного окна хранения тел.
@@ -149,7 +149,7 @@ jetsam-cli utxos-of o1...
 |---|---|---|
 | `peers` | — | Число подключённых пиров |
 | `mining` | — | Сложность, следующая награда и состояние майнинга |
-| `block-template` | `--miner-addr o1…` | Внешний шаблон майнинга, принадлежащий ноде |
+| `block-template` | `--miner-addr j1…` | Внешний шаблон майнинга, принадлежащий ноде |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Отправить один 16-байтный nonce в порядке от младшего байта к старшему |
 
 Команды внешнего майнинга низкоуровневые. `jetsam-miner` автоматически
@@ -170,7 +170,7 @@ jetsam-cli mempool-tx TXID
 ### Проверка адреса
 
 ```sh
-jetsam-cli validate o1...
+jetsam-cli validate j1...
 ```
 
 Команда сообщает, корректен ли адрес, и выводит его каноническую форму bech32m
@@ -207,19 +207,19 @@ jetsam-cli scan
 Предпросмотр:
 
 ```sh
-jetsam-cli send o1... 10.5 --dry-run
+jetsam-cli send j1... 10.5 --dry-run
 ```
 
 Отправка с автоматической комиссией:
 
 ```sh
-jetsam-cli send o1... 10.5
+jetsam-cli send j1... 10.5
 ```
 
 Точную комиссию в JTM задавайте только при необходимости:
 
 ```sh
-jetsam-cli send o1... 10.5 --fee 0.012
+jetsam-cli send j1... 10.5 --fee 0.012
 ```
 
 Возвращаемый ID относится ко всей логической транзакции. Рекомендуется
@@ -232,7 +232,7 @@ jetsam-cli send o1... 10.5 --fee 0.012
 ```sh
 jetsam-cli history
 jetsam-cli history --last 20
-jetsam-cli history --address o1...
+jetsam-cli history --address j1...
 ```
 
 Экспорт подтверждённого исходящего чека:

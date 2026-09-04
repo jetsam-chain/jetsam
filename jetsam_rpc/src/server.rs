@@ -67,9 +67,9 @@ const _: () = assert!(
 );
 
 // --- OVERLAP ---------------------------------------------------------------
-// Le travail PoW (pow_fields + cible) est entierement determine AVANT la preuve
-// HistoryStep, qui est explicitement nonce-free. Le publier tout de suite fait
-// passer la production de `preuve + nonce` a `max(preuve, nonce)`.
+// The PoW work (pow_fields + target) is fully determined BEFORE the HistoryStep
+// proof, which is explicitly nonce-free. Publishing it immediately turns block
+// production from `proof + nonce` into `max(proof, nonce)`.
 struct PowPreview {
     response: BlockTemplateResponse,
     parent_height: u64,
@@ -95,8 +95,8 @@ fn publish_pow_preview(
     }
 }
 
-/// Rend le travail PoW deja publie SEULEMENT s'il est encore minable : meme
-/// parent que le tip courant, et dans la fenetre de vie du template.
+/// Return already published PoW work ONLY while it is still mineable: same
+/// parent as the current tip, and inside the template's validity window.
 fn take_pow_preview(tip_height: u64, tip_id: [u8; 32]) -> Option<BlockTemplateResponse> {
     let guard = POW_PREVIEW.lock().ok()?;
     let preview = guard.as_ref()?;
@@ -1012,35 +1012,35 @@ impl RpcHandler {
         }
     }
 
-    /// NOGATE-TEMPLATE (22/08) : porte de FABRICATION de template.
+    /// Admission gate for template CONSTRUCTION.
     ///
-    /// Mesure (node.log 3 h, 22/08) : `nonce_search_ready` n'est vrai que 33,8 %
-    /// du temps ; chaque bloc concurrent annonce ferme la porte pendant TOUT son
-    /// fetch P2P (mediane 13 s, p90 24 s pour un corps de 540 octets) alors que
-    /// le PARENT LOCAL N'A PAS BOUGE. Un template assis sur le tip committe
-    /// reste valide jusqu'au commit du bloc concurrent — c'est une course de
-    /// fork profondeur 1, pas un orphelin garanti. La refuser d'office jette
-    /// 100 % de ce temps GPU.
+    /// Measured over three hours of node log: `nonce_search_ready` holds only
+    /// 33.8% of the time; every announced competing block closes the gate for
+    /// the whole of its P2P fetch (median 13 s, p90 24 s for a 540-byte body)
+    /// even though THE LOCAL PARENT HAS NOT MOVED. A template sitting on the
+    /// committed tip stays valid until the competing block commits — that is a
+    /// depth-1 fork race, not a guaranteed orphan. Refusing it outright throws
+    /// away 100% of that mining time.
     ///
-    /// La validite n'a jamais repose sur cette porte : elle est garantie par
-    /// les verrous et re-checks de parent (TemplateChainSnapshot sous write
-    /// lock, install_ready -> tip inchange, invalidate_for_tip sur avance P2P,
-    /// begin_proving -> parent == tip, re-check atomique au commit).
+    /// Validity never rested on this gate: it is guaranteed by the parent locks
+    /// and re-checks (TemplateChainSnapshot under the write lock, install_ready
+    /// -> tip unchanged, invalidate_for_tip on P2P advance, begin_proving ->
+    /// parent == tip, atomic re-check at commit).
     ///
-    /// On garde DEUX exigences reelles :
-    ///  - sync initial termine (jamais miner pendant un cold sync) ;
-    ///  - au moins un pair authentifie sain (jamais miner isole : un noeud
-    ///    coupe du reseau minerait un fork prive invisible).
-    /// `mining_confirmed_peers` (healthy failure domains) est stable a travers
-    /// le churn de suffix-sync : il ne tombe que sur deconnexion/expiration
-    /// (TTL 45 s) ou incompatibilite d'ancetre, pas sur une simple annonce.
+    /// TWO real requirements remain:
+    ///  - initial sync finished (never mine during a cold sync);
+    ///  - at least one healthy authenticated peer (never mine isolated: a node
+    ///    cut off from the network would mine an invisible private fork).
+    /// `mining_confirmed_peers` (healthy failure domains) is stable across
+    /// suffix-sync churn: it only drops on disconnection, expiry (45 s TTL) or
+    /// ancestor incompatibility, never on a bare announcement.
     ///
-    /// DEFAUT depuis l'integration (CHANGES-FROM-UPSTREAM §5) : le
-    /// comportement NOGATE s'applique sans configuration. Echappatoire :
-    /// `JETSAM_TEMPLATE_STRICT_GATE=1` retablit la porte historique complete
-    /// (`require_mining_network`), qui refuse aussi les templates pendant tout
-    /// fetch P2P d'un bloc concurrent. L'ancien opt-in `JETSAM_TEMPLATE_NOGATE`
-    /// n'existe plus.
+    /// DEFAULT since integration (CHANGES-FROM-UPSTREAM §5): the relaxed
+    /// behaviour applies with no configuration. Escape hatch:
+    /// `JETSAM_TEMPLATE_STRICT_GATE=1` restores the full historical gate
+    /// (`require_mining_network`), which also refuses templates for the whole
+    /// P2P fetch of a competing block. The former `JETSAM_TEMPLATE_NOGATE`
+    /// opt-in no longer exists.
     fn require_template_gate(&self) -> RpcResult<()> {
         static TEMPLATE_STRICT_GATE: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| {
@@ -1050,7 +1050,7 @@ impl RpcHandler {
             return self.require_mining_network();
         }
         if !*self.initial_sync_ready.borrow() {
-            // Meme message que la porte historique : la pool le reconnait.
+            // Same message as the historical gate, so existing clients match.
             return Err(rpc_err("mining is waiting for network synchronization"));
         }
         if !self.isolated_mining && *self.mining_confirmed_peers.borrow() == 0 {
@@ -1324,53 +1324,48 @@ impl RpcHandler {
             (snapshot, addr)
         };
         drop(wallet_operation);
-        // DATATION DU BLOC — au plus tot legal, au lieu de l'heure courante.
+        // BLOCK TIMESTAMP — earliest legal value, not the current wall clock.
         //
-        // Pourquoi : la cible de difficulte d'un bloc depend de SON PROPRE
-        // horodatage (ASERT). Plus il est tardif, plus la cible est facile,
-        // donc MOINS le bloc pese de travail cumule — et a hauteur egale
-        // c'est le travail cumule qui tranche. Avec `now`, notre bloc porte
-        // l'heure a laquelle le noeud a construit le template, soit apres la
-        // reception du parent, sa validation et l'ouverture de la porte.
+        // Why: a block's difficulty target is derived from ITS OWN timestamp
+        // (ASERT). The later that timestamp, the easier the target, so the LESS
+        // cumulative work the block carries — and at equal height, cumulative
+        // work is what decides the chain. With `now`, a block carries the
+        // moment the node finished building the template, which is after
+        // receiving the parent, validating it, and opening the gate.
         //
-        // Mesure du 21/08 22:07 sur 6 blocs perdus : nos horodatages etaient
-        // +3 a +21 s plus tardifs que ceux des blocs qui nous ont remplaces,
-        // alors que notre hash etait plus PETIT 5 fois sur 6 (donc on aurait
-        // gagne l'egalite). A ~0,77 % de travail par seconde, 21 s = 16 % de
-        // travail cede pour rien.
+        // Measured over six lost blocks: the local timestamps were +3 to +21 s
+        // later than those of the blocks that replaced them, while the local
+        // hash was the SMALLER one five times out of six — so the tie would
+        // have gone the other way. At ~0.77% of work per second, 21 s is 16% of
+        // work given away for nothing.
         //
-        // Regles de validite (jetsam_chain/consensus/timestamps.rs) :
-        //   timestamp > median des 11 derniers  ET  timestamp <= now + 120 s
-        // On prend donc le plus tot LEGAL, sans jamais depasser `now` :
+        // Validity rules (jetsam_chain/consensus/timestamps.rs):
+        //   timestamp > median of the last 11  AND  timestamp <= now + 120 s
+        // So take the earliest LEGAL value, never past `now`:
         //   max(MTP + 1, min(now, parent + 1))
-        // Reculer davantage durcirait la cible au point de trouver moins de
-        // nonces — l'objectif est de s'aligner sur les concurrents, pas de
-        // surencherir.
-        // Horodatage REEL, comme tous les autres mineurs.
+        // Reaching further back would harden the target enough to find fewer
+        // nonces — the goal is to match competing miners, not to outbid them.
         //
-        // La version precedente prenait le plus TOT legal (parent + 1 s) pour
-        // maximiser le travail cumule et gagner les arbitrages, a une epoque ou
-        // nos blocs mettaient ~30 s a se propager via 18 relais. Ce n'est plus
-        // le cas : le port 9700 est ouvert, 18 pairs entrants, zero relais.
+        // The opposite choice, a real wall-clock timestamp like most miners
+        // use, was measured too. Stamping a block one second after its parent
+        // earns a target roughly 1.5x harder than a competitor's (one observed
+        // pair: 4.28e10 of work against 2.83e10 two blocks later), and the next
+        // block, published by a competitor, inherits the easy catch-up target.
+        // That is a double penalty, and it is only worth paying while blocks
+        // propagate slowly. It is not the situation here: port 9700 is open,
+        // inbound peers are plentiful, and no relay hop is involved.
         //
-        // Le cout de cette avance etait lourd et mesure le 22/08 : ASERT tire la
-        // cible de l'horodatage du bloc lui-meme. Nos blocs, dates a 1 s de leur
-        // parent, recevaient une cible ~1,5x plus dure que celle des concurrents
-        // (bloc 1563 : 4,28e10 de travail contre 2,83e10 deux blocs plus loin) —
-        // et le bloc suivant, publie par un concurrent, heritait de la cible
-        // facile de rattrapage. Double penalite.
+        // Known side effect: blocks then carry a timestamp well behind real
+        // time, which makes explorers show false "bursts" of blocks one second
+        // apart when they were in fact mined at a normal cadence.
         //
-        // Effet de bord constate : nos blocs portaient une heure tres en retard
-        // sur le reel (bloc publie a 00:57:40 date 00:55:57), ce qui donnait au
-        // tableau de bord de fausses "rafales" de six blocs a 1 s d'intervalle
-        // alors qu'ils avaient ete mines sur 84 s a cadence normale.
-        //
-        // On garde la seule contrainte de VALIDITE (timestamps.rs) :
-        //   timestamp > median des 11 derniers   ET   timestamp <= now + 120 s
+        // The only hard constraint is VALIDITY (timestamps.rs):
+        //   timestamp > median of the last 11   AND   timestamp <= now + 120 s
         let block_ts = {
-            // COMBO : parent+1 (blocs plus lourds, gagnent les reorgs) + NOGATE
-            // (duty haut). now.max(earliest) donnait l'heure reelle = blocs
-            // legers = reorg systematique a 2,7 GH/s de reseau.
+            // parent+1 yields heavier blocks, which win reorgs; combined with
+            // the relaxed template gate it also keeps the duty cycle high.
+            // `now.max(earliest)` gave real wall-clock time, hence lighter
+            // blocks, hence systematic reorg losses against a fast network.
             let mtp = median_time_past(&snapshot.prev_timestamps);
             let parent_ts = snapshot.parent.timestamp;
             let earliest = mtp.saturating_add(1);
@@ -1425,9 +1420,9 @@ impl RpcHandler {
         let pow_fields_hex = encode_pow_fields_hex(&pow_header);
         let diff_target = pow_header.difficulty_target;
 
-        // OVERLAP : le travail PoW est COMPLET ici. On le rend au demandeur et on
-        // le publie pour les suivants, puis on prouve. Le mineur cherche le nonce
-        // pendant la preuve au lieu de l'attendre.
+        // OVERLAP: the PoW work is COMPLETE here. Return it to the caller and
+        // publish it for the next ones, then prove. The miner searches for the
+        // nonce during the proof instead of waiting for it.
         let preview_parent_height = tmpl.parent.height;
         let preview_parent_id = block_id(&tmpl.parent);
         let early_template = BlockTemplateResponse {
@@ -1475,13 +1470,13 @@ impl RpcHandler {
         .map_err(|error| rpc_err(format!("HistoryStep preparation task failed: {error}")))?;
         let prepared = prepared
             .map_err(|error| rpc_err(format!("HistoryStep preparation failed: {error}")))?;
-        // NOGATE-TEMPLATE (22/08) : cette re-verification post-preuve jetait une
-        // preuve HistoryStep FINIE (~6 s) sur un etat transitoire, alors que le
-        // preview etait DEJA publie a la pool — les mineurs travaillaient un
-        // template_id qui ne deviendrait jamais Ready, et chaque nonce trouve
-        // repondait "unknown, expired, consumed, or busy" (6 solutions sur 12
-        // perdues le 22/08). Le vrai garde-fou anti-perime est le check du tip
-        // juste en dessous + install_ready + begin_proving.
+        // This post-proof re-check used to throw away a FINISHED HistoryStep
+        // proof (~6 s) over a transient state, while the preview had ALREADY
+        // been published to workers — they were mining a template_id that would
+        // never become Ready, and every nonce they found came back "unknown,
+        // expired, consumed, or busy" (six solutions out of twelve lost in one
+        // measured run). The real staleness guard is the tip check just below,
+        // plus install_ready and begin_proving.
         self.require_template_gate()?;
 
         let proof_class = prepared.proof_class();
@@ -1553,9 +1548,9 @@ impl RpcHandler {
         nonce: u128,
         nonce_submitted_at: Instant,
     ) -> RpcResult<String> {
-        // NOGATE (21/08) : le consume est deja irreversible ici ("cannot be
-        // retried") — jeter le bloc pour un etat reseau transitoire = perte
-        // seche. Le check du parent juste apres protege du perime.
+        // The consume is already irreversible at this point ("cannot be
+        // retried"), so discarding the block over a transient network state is
+        // a dead loss. The parent check just below guards against staleness.
         // Consume happened before this check, so a stale or losing template
         // cannot be retried. Atomic apply repeats the parent checks under the
         // chain write lock and closes the race with a peer block.
@@ -1585,9 +1580,9 @@ impl RpcHandler {
         .await
         .map_err(|error| rpc_err(format!("HistoryStep task failed: {error}")))?
         .map_err(|error| rpc_err(format!("HistoryStep prove failed: {error}")))?;
-        // NOGATE (21/08) : le bloc est ENTIEREMENT prouve ici. L'integrite est
-        // garantie par le re-check du parent sous le write-lock au commit ;
-        // la porte transitoire jetait un bloc fini.
+        // The block is FULLY proved at this point. Integrity is guaranteed by
+        // the parent re-check under the write lock at commit time; the
+        // transient gate used to throw away a finished block.
         let seal_ms = seal_started.elapsed().as_millis();
         // Serialize canonical commit + wallet delta + mempool view replacement.
         let wallet_operation = self.wallet_operation_gate.lock().await;
@@ -2298,6 +2293,12 @@ impl JetsamApiServer for RpcHandler {
             block_reward_micro_jtm: reward,
             block_reward_eld: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
+            pow_hashrate_hps: jetsam_miner::local_hashrate_hps(),
+            pow_hashes_total: jetsam_miner::local_pow_hashes(),
+            payout_address: self
+                .resolved_mining_payout()
+                .ok()
+                .map(|address| address.to_bech32()),
         })
     }
 
@@ -2521,20 +2522,20 @@ impl JetsamApiServer for RpcHandler {
         } else {
             Some(parse_address_param(&miner_address)?)
         };
-        // OVERLAP : le travail PoW deja publie pour CE parent est servable tel
-        // quel — meme si le slot d'attempt est occupe par la preuve en cours.
-        // C'est ce qui leve la limite "external mining attempt is already active"
-        // sans jamais servir de travail dont le parent a bouge.
+        // OVERLAP: PoW work already published for THIS parent can be served as
+        // is, even while the attempt slot is busy with the proof in flight.
+        // That is what lifts the "external mining attempt is already active"
+        // limit without ever serving work whose parent has moved.
         let (tip_height, tip_id) = {
             let chain = self.chain.read().await;
             let tip = chain.tip_header();
             (tip.height, block_id(tip))
         };
-        // GARDE COINBASE : le preview a ete construit pour l adresse de payout du
-        // noeud. Le servir a un mineur qui a DEMANDE une autre adresse le ferait
-        // miner pour quelqu un d autre sans le savoir — la faute n1 du playbook
-        // pool-lab. Un miner_address explicite repasse donc par le chemin normal,
-        // qui verifie l adresse (allow_custom_coinbase / egalite au payout).
+        // COINBASE GUARD: the preview was built for the node's own payout
+        // address. Serving it to a worker that REQUESTED a different address
+        // would make it mine for someone else without knowing. An explicit
+        // miner_address therefore goes through the normal path, which validates
+        // the address (allow_custom_coinbase / equality with the payout).
         if requested.is_none() {
             if let Some(preview) = take_pow_preview(tip_height, tip_id) {
                 return Ok(preview);
@@ -2555,8 +2556,8 @@ impl JetsamApiServer for RpcHandler {
             let result = handler
                 .prepare_external_mining_attempt(requested, preparation, early_task)
                 .await;
-            // Chemin d'erreur AVANT que le travail PoW existe : on rend l'erreur
-            // au demandeur au lieu de le laisser attendre.
+            // Error path BEFORE any PoW work exists: return the error to the
+            // caller instead of leaving it waiting.
             if let Ok(mut slot) = early.lock() {
                 if let Some(sender) = slot.take() {
                     let _ = sender.send(result);
@@ -2576,10 +2577,10 @@ impl JetsamApiServer for RpcHandler {
                 "external mining API is disabled; start this node with --mode extminer",
             ));
         }
-        // NOGATE (21/08) : un nonce soumis est un travail TERMINE. La porte de
-        // readiness se ferme sur un etat transitoire (header concurrent en vol)
-        // et jetait 20/30 soumissions mesurees. La vraie protection anti-perime
-        // est begin_proving() -> Stale/Unavailable juste en dessous.
+        // A submitted nonce is FINISHED work. The readiness gate closes on a
+        // transient state (a competing header in flight) and used to discard 20
+        // of 30 measured submissions. The real staleness protection is
+        // begin_proving() -> Stale/Unavailable just below.
 
         let template_id = decode_external_template_id(&template_id)?;
         let nonce = decode_external_nonce_hex(&nonce_hex)?;
@@ -2604,7 +2605,7 @@ impl JetsamApiServer for RpcHandler {
         // disconnects, proof/commit continues to own the sole slot and its
         // lease releases it on every return or panic path.
         tokio::spawn(async move {
-            // OVERLAP : ce template_id part en preuve, il ne doit plus etre servi.
+            // OVERLAP: this template_id is going to proof; stop serving it.
             clear_pow_preview();
             let ExternalMiningProvingAttempt { prepared, lease } = proving;
             let _lease = lease;

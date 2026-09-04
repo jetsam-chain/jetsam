@@ -100,7 +100,7 @@ pub enum KeystoreError {
 // On-disk format (plaintext)
 // ---------------------------------------------------------------------------
 
-// JETSAM CHANGE: distinct on-disk magic so an Jetsam keystore can never be
+// JETSAM CHANGE: distinct on-disk magic so a Jetsam keystore can never be
 // opened as an upstream one, or the reverse. Must stay exactly 16 bytes.
 const PLAIN_MAGIC: &[u8; 16] = b"jetsam_plainkey1";
 const SECRET_LEN: usize = 32;

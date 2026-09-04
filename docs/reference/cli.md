@@ -75,7 +75,7 @@ only its 128-bit nonce.
 | `--rpc URL` | `http://127.0.0.1:9701` | Node JSON-RPC endpoint |
 | `--key TOKEN` | — | Bearer token matching the node's `--mining-key` |
 | `--threads N` | `0` | PoW threads; zero uses every visible logical CPU |
-| `--coinbase ADDRESS` | — | Custom `o1…` payout when the node explicitly permits it |
+| `--coinbase ADDRESS` | — | Custom `j1…` payout when the node explicitly permits it |
 | `--poll-ms MS` | `500` | Delay before requesting another template |
 | `--log LEVEL` | `info` | Worker log filter |
 | `--check-hardware` | — | Report production CPU support and exit |
@@ -126,7 +126,7 @@ places:
 | `history-step-terminal` | — | Current local terminal hex |
 | `tx` | `TXID` | Permanent confirmation location |
 | `slot` | `INDEX` | Current slot contents |
-| `utxos-of` | `o1…` | Current UTXOs owned by an address |
+| `utxos-of` | `j1…` | Current UTXOs owned by an address |
 | `state` | — | Capacity, occupancy and encoded State size |
 | `epoch` | — | Current 144-block user transaction anchor |
 
@@ -149,7 +149,7 @@ and `block-header` remain available for every canonical height.
 |---|---|---|
 | `peers` | — | Connected peer count |
 | `mining` | — | Difficulty, next reward and mining state |
-| `block-template` | `--miner-addr o1…` | Node-owned external mining template |
+| `block-template` | `--miner-addr j1…` | Node-owned external mining template |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Submit one 16-byte little-endian nonce |
 
 The external-mining commands are low-level. `jetsam-miner` handles template

@@ -27,7 +27,7 @@ curl --silent --show-error \
 - One JTM equals 1,000,000 μJTM.
 - Hashes are lowercase hexadecimal without `0x`.
 - Targets and nonce bytes use their canonical little-endian encoding.
-- Addresses use canonical bech32m `o1…` unless a field explicitly says hex.
+- Addresses use canonical bech32m `j1…` unless a field explicitly says hex.
 - Unknown permanent objects generally return `null`.
 - Old block bodies return `null` after the 18-block retention window; their
   headers remain queryable.
@@ -367,6 +367,8 @@ MiningInfo {
   block_reward_micro_jtm: u64
   block_reward_eld: number
   active_slot_count: u64
+  pow_hashrate_hps: number | null
+  pow_hashes_total: u64
 }
 
 NodeStatus {

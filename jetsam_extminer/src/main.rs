@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
     name = "jetsam-miner",
     version,
     about = "External Poseidon2b PoW miner for Jetsam",
-    long_about = "Fetches block templates from an Jetsam node and mines blocks \
+    long_about = "Fetches block templates from a Jetsam node and mines blocks \
                   using all available CPU cores.\n\n\
                   The node builds the proven template; this worker only does PoW.\n\
                   Coinbase is the node payout address unless the node enables \
@@ -78,7 +78,7 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
 
-    /// Your own payout address (bech32m o1...).
+    /// Your own payout address (bech32m j1...).
     /// Only works when the node is started with --allow-custom-coinbase.
     /// Leave empty to use the node's configured payout address (pool mode).
     #[arg(long, value_name = "ADDRESS", default_value = "")]

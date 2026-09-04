@@ -97,7 +97,7 @@ and give it to the sender.
 To pay:
 
 1. open **Send** or press `F3`;
-2. paste a valid `o1…` address;
+2. paste a valid `j1…` address;
 3. enter the amount;
 4. review selected inputs, outputs and network fee;
 5. choose **Proof & Send**.

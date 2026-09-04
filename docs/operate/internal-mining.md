@@ -83,7 +83,7 @@ template cannot have its payout rewritten.
 To pin a separate payout for the process:
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
 Use the complete bech32m address.

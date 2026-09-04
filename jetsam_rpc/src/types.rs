@@ -542,6 +542,16 @@ pub struct MiningInfo {
     pub block_reward_eld: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
     pub active_slot_count: u64,
+    /// Measured PoW rate of this node's built-in miner, in hashes per second.
+    /// `null` when the node is not mining, or is proving rather than searching.
+    pub pow_hashrate_hps: Option<f64>,
+    /// Total PoW hashes this node has computed since it started.
+    pub pow_hashes_total: u64,
+    /// Address this node pays its blocks to. `null` when the node is not
+    /// mining. When it is set and the local wallet does not own it, mined
+    /// coins land outside this wallet — which is the intended effect of
+    /// `--miner-address`, and a common surprise.
+    pub payout_address: Option<String>,
 }
 
 /// Runtime status of the daemon which serves this RPC endpoint.
@@ -630,7 +640,7 @@ pub struct StateMapInfo {
 pub struct AddressInfo {
     /// Whether the address is valid.
     pub valid: bool,
-    /// Canonical bech32m form (`o1…`).
+    /// Canonical bech32m form (`j1…`).
     pub bech32: Option<String>,
     /// Raw 32-byte payload as hex.
     pub hex: Option<String>,

@@ -78,7 +78,7 @@ jetsam-cli mining
 若要固定独立的进程奖励地址：
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
 请使用完整 bech32m 地址。

@@ -96,7 +96,7 @@ jetsam --mode miner --cpu-threads 12
 Core 使用本地钱包活动地址。也可固定一个独立的规范 bech32m 地址：
 
 ```sh
-jetsam --mode miner --miner-address o1...
+jetsam --mode miner --miner-address j1...
 ```
 
 在另一个终端观察就绪状态和链进度：

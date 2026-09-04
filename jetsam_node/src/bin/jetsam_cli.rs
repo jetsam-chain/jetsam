@@ -206,7 +206,7 @@ enum Command {
     /// All UTXOs owned by an address (bech32m).
     #[command(name = "utxos-of")]
     UtxosOf {
-        /// Owner address (bech32m o1…).
+        /// Owner address (bech32m j1…).
         #[arg(value_name = "ADDRESS")]
         address: String,
     },
@@ -297,7 +297,7 @@ enum Command {
     ///   jetsam-cli send f784...b61e 10.5
     ///   jetsam-cli send f784...b61e 10.5 --fee 0.01
     Send {
-        /// Recipient address (canonical bech32m o1...).
+        /// Recipient address (canonical bech32m j1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
         /// Amount in JTM  (1 JTM = 1 000 000 μJTM).
@@ -351,7 +351,7 @@ enum Command {
     /// Get a block template for an external Poseidon2b PoW miner.
     #[command(name = "block-template", alias = "template")]
     BlockTemplate {
-        /// Coinbase address for this template (bech32m o1...). Defaults to wallet address.
+        /// Coinbase address for this template (bech32m j1...). Defaults to wallet address.
         #[arg(long, value_name = "ADDRESS", default_value = "")]
         miner_addr: String,
     },
@@ -503,7 +503,7 @@ fn print_error(msg: &str) {
         || msg.contains("invalid address")
         || msg.contains("WrongHrp")
     {
-        "Invalid address.\nUse a bech32m address (o1…).\nExample: jetsam-cli send o1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
+        "Invalid address.\nUse a bech32m address (j1…).\nExample: jetsam-cli send j1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
     } else {
         msg.to_string()
     };
@@ -968,6 +968,9 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
     let reward_micro = result["block_reward_micro_jtm"].as_u64().unwrap_or(0);
     let active = result["active_slot_count"].as_u64().unwrap_or(0);
+    let hashrate = result["pow_hashrate_hps"].as_f64();
+    let hashes_total = result["pow_hashes_total"].as_u64().unwrap_or(0);
+    let payout = result["payout_address"].as_str().unwrap_or("").to_string();
     section("Mining info");
     kv("Height", &height.to_string());
     kv2(
@@ -981,6 +984,26 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         &format!("({reward_micro} \u{03bc}JTM)"),
     );
     kv("Active UTXOs", &active.to_string());
+    if !payout.is_empty() {
+        kv("Blocks paid to", &payout);
+    }
+    match hashrate {
+        Some(hps) => kv2(
+            "Your hashrate",
+            &jetsam_miner::format_hashrate(hps),
+            &format!("({hashes_total} hashes since start)"),
+        ),
+        None if hashes_total > 0 => kv2(
+            "Your hashrate",
+            "—",
+            "(node is proving, not searching right now)",
+        ),
+        None => kv2(
+            "Your hashrate",
+            "—",
+            "(this node is not mining — start it with --mode miner)",
+        ),
+    }
     Ok(())
 }
 
@@ -1361,6 +1384,21 @@ async fn cmd_address(
     Ok(())
 }
 
+/// The address this node actually pays its blocks to, when it is not the
+/// wallet's own active address.
+///
+/// A node started with `--miner-address` credits an address whose key lives
+/// elsewhere, so the local wallet stays empty forever. Reporting an empty
+/// wallet without saying that sends the operator hunting for a wrong data
+/// directory, which is the one thing that is not wrong.
+async fn foreign_payout_address(ctx: &Ctx<'_>) -> Option<String> {
+    let mining = rpc(ctx, "getMiningInfo", &[]).await.ok()?;
+    let payout = mining["payout_address"].as_str()?.to_string();
+    let wallet = rpc(ctx, "walletActiveAddress", &[]).await.ok()?;
+    let active = wallet["address"].as_str()?;
+    (payout != active).then_some(payout)
+}
+
 async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let result = rpc(ctx, "walletGetBalance", &[])
         .await
@@ -1431,11 +1469,20 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if micro == 0 && utxos == 0 {
         println!();
         warn_msg("No UTXOs found on the active address.");
-        println!(
-            "       Run {} to reload the active address; use {} to switch accounts.",
-            c!(BOLD, "'jetsam-cli scan'"),
-            c!(BOLD, "'address --list'")
-        );
+        if let Some(payout) = foreign_payout_address(ctx).await {
+            println!("       This node mines to {payout},");
+            println!("       which this wallet does not own — that is what --miner-address does.");
+            println!(
+                "       Those coins are spendable only from the wallet holding that key. Check them with:"
+            );
+            println!("         {}", c!(BOLD, format!("jetsam-cli utxos-of {payout}")));
+        } else {
+            println!(
+                "       Run {} to reload the active address; use {} to switch accounts.",
+                c!(BOLD, "'jetsam-cli scan'"),
+                c!(BOLD, "'address --list'")
+            );
+        }
     }
 
     Ok(())
@@ -1559,9 +1606,9 @@ async fn cmd_send(
     if !looks_like_bech32 {
         bail!(
             "Invalid address format.\n\
-             \tExpected: bech32m address (o1…)\n\
+             \tExpected: bech32m address (j1…)\n\
              \tGot:      {:?}\n\
-             \tExample:  o1q9gnyj0z…",
+             \tExample:  j1q9gnyj0z…",
             &to_clean[..to_clean.len().min(30)]
         );
     }
@@ -1893,9 +1940,17 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     if found == 0 {
         println!();
-        warn_msg(
-            "No UTXOs found. If you expect a balance, check that you're using the right data directory.",
-        );
+        if let Some(payout) = foreign_payout_address(ctx).await {
+            warn_msg("No UTXOs found — and this wallet is not the one being paid.");
+            println!("       This node mines to {payout}, an address this wallet does not own.");
+            println!(
+                "       Scanning again cannot change that: the coins are credited to that key."
+            );
+        } else {
+            warn_msg(
+                "No UTXOs found. If you expect a balance, check that you're using the right data directory.",
+            );
+        }
     }
 
     Ok(())
