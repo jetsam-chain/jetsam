@@ -191,7 +191,7 @@ unset JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
 unset TAR_OPTIONS GZIP GZIP_OPT
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
-printf 'ParanO(1)d self-contained release build\n'
+printf 'Jetsam self-contained release build\n'
 printf '  source:       %s\n' "$RELEASE_ROOT_DIR"
 printf '  matrix pack:  %s\n' "$PACK_DIR"
 printf '  release dir:  %s\n' "$RELEASE_DIR"

@@ -147,7 +147,7 @@ PACK_DIR=$(release_canonical_directory "$PACK_DIR")
 
 cd "$RELEASE_ROOT_DIR"
 [[ $(git rev-parse --show-toplevel) == "$RELEASE_ROOT_DIR" ]] || \
-  release_die "run this command from the ParanO(1)d repository"
+  release_die "run this command from the Jetsam repository"
 [[ $(git branch --show-current) == main ]] || \
   release_die "releases may be published only from main"
 [[ -z $(git status --porcelain=v1 --untracked-files=all) ]] || \

@@ -10,6 +10,11 @@ use zeroize::Zeroize;
 use crate::model::SensitiveString;
 
 const MAX_SECRET_PHOTO_BYTES: u64 = 256 << 20;
+// Domain-separation tags inherited from upstream. They are key-derivation
+// inputs, not labels: changing either string derives different secrets and
+// different key identifiers, so any wallet created with the image-key
+// feature would stop resolving. They are renamed together with a version
+// bump of this feature, never on their own.
 const IMAGE_SECRET_CONTEXT: &str = "ParanO(1)d master secret from canonical image pixels v1";
 const KEY_ID_CONTEXT: &str = "ParanO(1)d master secret fingerprint v1";
 
