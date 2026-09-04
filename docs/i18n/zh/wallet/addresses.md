@@ -3,8 +3,6 @@
 钱包由同一个[主密钥](../reference/glossary.md#master-secret)派生带索引的[地址](../reference/glossary.md#address)。初始化时会创建地址 `0`，并命名为
 **[主地址](../reference/glossary.md#main-address)**。其他地址可在地址簿中生成。
 
-![地址簿与活动地址选择](../../../assets/wallet/addresses.png)
-
 ## 打开地址簿
 
 按 `F2` 或选择 **地址**。表格会列出：

@@ -2,8 +2,6 @@
 
 Open Settings with `F7`.
 
-![Wallet settings](../assets/wallet/settings.png)
-
 ## Secret
 
 The Secret tab shows the active master-secret mode and exposes explicit

@@ -3,7 +3,7 @@ name        = "jetsam-extminer"
 version.workspace = true
 edition     = "2021"
 license     = "Apache-2.0"
-description = "External Poseidon2b PoW miner for ParanO(1)d"
+description = "External Poseidon2b PoW miner for Jetsam"
 default-run = "jetsam-miner"
 
 [[bin]]

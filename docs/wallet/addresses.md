@@ -4,8 +4,6 @@ The wallet derives indexed addresses from one master secret. Address `0` is
 created during setup and named **Main**. Further addresses can be generated
 from the Addresses dialog.
 
-![Address book and active-owner selection](../assets/wallet/addresses.png)
-
 ## Open the address book
 
 Press `F2` or select **Addresses**. The table shows:
