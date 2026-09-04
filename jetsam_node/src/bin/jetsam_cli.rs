@@ -1602,7 +1602,7 @@ async fn cmd_send(
     // Actual parsing/validation happens in the daemon; we just do a basic
     // sanity check to catch obvious typos before sending to RPC.
     let to_clean = to.trim();
-    let looks_like_bech32 = to_clean.to_ascii_lowercase().starts_with("o1");
+    let looks_like_bech32 = looks_like_address(to_clean);
     if !looks_like_bech32 {
         bail!(
             "Invalid address format.\n\
@@ -2261,6 +2261,49 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
 fn print_json(v: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+/// Cheap client-side sanity check before the daemon does the real parsing.
+///
+/// The prefix is derived from the protocol constant, never written out here:
+/// a hard-coded prefix is exactly how the upstream `o1` check survived this
+/// chain's rename and rejected every valid address it was handed.
+fn looks_like_address(candidate: &str) -> bool {
+    let prefix = format!("{}1", jetsam_chain::consensus::identity::ADDRESS_HRP);
+    candidate
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::looks_like_address;
+
+    #[test]
+    fn a_canonical_address_is_accepted_and_the_upstream_prefix_is_not() {
+        // Real addresses from this network.
+        assert!(looks_like_address(
+            "j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
+        ));
+        assert!(looks_like_address(
+            "j19fe83j2l7ukelk63477jdhlr2prsmxytqu8lzu8q3hhfhegzxs6qefc03u"
+        ));
+        // Leading and trailing whitespace is a paste artefact, not a typo.
+        assert!(looks_like_address(
+            "  j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf\n"
+        ));
+        // Upper case is still the same address.
+        assert!(looks_like_address(
+            "J1SNYEEYHQRKYN303Q3CTWN0YZK4AJ4F3C64QTGU2ETSJ6NN6LUDJQ5ZT8NF"
+        ));
+        // The upstream prefix is a different network's address.
+        assert!(!looks_like_address(
+            "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp"
+        ));
+        assert!(!looks_like_address("not-an-address"));
+        assert!(!looks_like_address(""));
+    }
 }
 
 #[cfg(test)]
