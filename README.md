@@ -15,6 +15,8 @@
   <b>Proof-native Layer 1 ordered by proof of work. 21,000,000 JTM, zero premine.</b><br>
   <sub>
     <a href="https://jetsamchain.com">Website</a> ·
+    <a href="https://explorer.jetsamchain.com">Explorer</a> ·
+    <a href="https://discord.gg/yjNgkyEw2W">Discord</a> ·
     <a href="docs/index.md">Documentation</a> ·
     <a href="docs/architecture/overview.md">Architecture</a> ·
     <a href="CHANGES-FROM-UPSTREAM.md">Changes from upstream</a> ·
@@ -565,4 +567,5 @@ Licensed under the [Apache License 2.0](LICENSE). Please report security
 issues according to the [security policy](.github/SECURITY.md).
 
 Questions, ideas and mining discussion happen in
-[Discussions](https://github.com/jetsam-chain/jetsam/discussions).
+[Discussions](https://github.com/jetsam-chain/jetsam/discussions) and on
+[Discord](https://discord.gg/yjNgkyEw2W).

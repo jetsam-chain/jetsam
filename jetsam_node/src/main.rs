@@ -547,13 +547,26 @@ impl MiningPeerQuorum {
         self.publish_at(now);
     }
 
+    /// A peer whose headers anchor to nothing we know stops counting toward the
+    /// quorum, and stops being a synchronization source.
+    ///
+    /// It does NOT block our own block production. The verdict that brings us
+    /// here is reached before any proof of work in the batch is validated, so
+    /// blocking on it meant a free peer identity plus a batch of junk headers
+    /// could switch off any miner on the network, for as long as the sender
+    /// cared to repeat it. Losing trust in a peer and losing our own block
+    /// production are different things.
+    ///
+    /// A genuinely stronger competing branch still pauses production through
+    /// `unresolved_better_header`, which is reached only after its headers
+    /// validate.
     fn reject_incompatible(&mut self, peer: libp2p::PeerId) {
         let now = Instant::now();
         let Some(failure_domain) = self.connected.get(&peer).copied() else {
             return;
         };
         self.readiness
-            .renew_health(peer, failure_domain, self.expiry_ms(now), false, true);
+            .renew_health(peer, failure_domain, self.expiry_ms(now), false, false);
         self.frontier_confirmed.remove(&peer);
         self.publish_at(now);
     }
@@ -1589,11 +1602,16 @@ async fn main() -> anyhow::Result<()> {
         log_filter = log_filter.add_directive("libp2p_kad=error".parse().unwrap_or_default());
     }
 
+    // Colour a terminal, never a file. Redirected output carried escape
+    // sequences into every log file, which made `grep` match on invisible
+    // bytes and turned an ordinary log into noise wherever it was read.
+    let colour = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .with_timer(UtcHms) // HH:MM:SS instead of full ISO timestamp
         .with_target(false) // no module path clutter
         .with_thread_ids(false)
+        .with_ansi(colour)
         .compact() // single-line events
         .init();
 
@@ -5594,6 +5612,43 @@ mod tests {
                 now,
             ),
             Some(alternate)
+        );
+    }
+
+    #[test]
+    fn an_unanchorable_peer_cannot_switch_this_miner_off() {
+        // The attack this closes: a peer identity costs nothing, and a batch of
+        // headers that anchors to nothing costs no proof of work. Answering
+        // that with a mining-blocking lease let anyone reachable on the network
+        // stop any miner, for free, for as long as they cared to repeat it.
+        //
+        // Losing trust in the peer is the right response. Losing our own block
+        // production is not.
+        let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let honest = libp2p::PeerId::random();
+        let hostile = libp2p::PeerId::random();
+        let height = 42;
+        let hash = [0x42; 32];
+
+        quorum.set_canonical_tip(height, hash, false);
+        quorum.set_sync_state(true, false);
+        quorum.connect(honest, jetsam_node::networking::FailureDomain(1));
+        quorum.confirm_tip(honest, height, hash);
+        assert!(*proof_rx.borrow(), "the honest peer alone authorizes proving");
+
+        quorum.connect(hostile, jetsam_node::networking::FailureDomain(2));
+        quorum.reject_incompatible(hostile);
+
+        assert!(
+            *proof_rx.borrow(),
+            "an unanchorable peer must not stop this node from proving"
+        );
+        assert!(
+            *ready_rx.borrow(),
+            "nor from searching, while an honest peer still confirms the tip"
         );
     }
 

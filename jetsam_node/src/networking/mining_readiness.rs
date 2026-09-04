@@ -264,6 +264,43 @@ mod tests {
     }
 
     #[test]
+    fn an_incompatible_peer_leaves_the_quorum_without_halting_our_miner() {
+        // A peer that hands us headers we cannot anchor is a peer we stop
+        // trusting for synchronization. It must not be able to stop this node
+        // from producing: doing so let anyone with a free peer identity and a
+        // batch of junk headers switch off any miner it could reach.
+        let (mut readiness, first, second) = ready_fixture();
+        assert!(readiness.snapshot(0).nonce_search_ready);
+
+        // The verdict marks it incompatible, exactly as the header-inventory
+        // handler does, and never sets the mining-blocking flag.
+        readiness.renew_health(first, FailureDomain(1), 100, false, false);
+
+        let snapshot = readiness.snapshot(0);
+        assert!(
+            snapshot.proof_build_ready,
+            "an unanchorable batch must not stop block production"
+        );
+        // It does leave the quorum: one healthy domain remains, two are needed.
+        assert!(
+            !snapshot.nonce_search_ready,
+            "the peer no longer counts toward the failure-domain quorum"
+        );
+
+        // The second peer alone cannot restore the quorum either.
+        readiness.renew_health(second, FailureDomain(2), 100, true, false);
+        assert!(readiness.snapshot(0).proof_build_ready);
+    }
+
+    #[test]
+    fn a_peer_that_blocks_mining_still_halts_production() {
+        // The flag keeps its meaning where it is genuinely set.
+        let (mut readiness, first, _second) = ready_fixture();
+        readiness.renew_health(first, FailureDomain(1), 100, false, true);
+        assert!(!readiness.snapshot(0).proof_build_ready);
+    }
+
+    #[test]
     fn ordinary_canonical_child_preserves_mining_authorization() {
         let (mut readiness, first, second) = ready_fixture();
         assert!(readiness.snapshot(0).nonce_search_ready);
