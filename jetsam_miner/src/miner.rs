@@ -694,12 +694,17 @@ impl BlockMiner {
                                 tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
                                 break 'mining;
                             }
-                            if !*self.proof_network_ready.borrow()
-                                || !*self.nonce_network_ready.borrow()
-                            {
-                                tracing::info!(height, "miner: network authority changed after PoW; discarding nonce");
-                                continue;
-                            }
+                            // A found nonce is finished work. The readiness
+                            // watches are a local heuristic about peers, not a
+                            // consensus rule, and they flip several times a
+                            // second while suffix plans come and go. Discarding
+                            // here threw away blocks this node had actually won.
+                            //
+                            // The authoritative check is atomic and happens
+                            // anyway: commit_locally_proved_next_block rejects a
+                            // moved parent under the chain write lock
+                            // (BadParentHash / BadHeight). The external mining
+                            // path dropped this same guard for the same reason.
                             let nonce_found_at = Instant::now();
                             let sealed_header = attempt.pow_header(sol.nonce);
                             let hash = block_id(&sealed_header);
@@ -759,12 +764,8 @@ impl BlockMiner {
                                 tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
                                 break 'mining;
                             }
-                            if !*self.proof_network_ready.borrow()
-                                || !*self.nonce_network_ready.borrow()
-                            {
-                                tracing::info!(height, "miner: network authority changed during seal; discarding proved block");
-                                continue;
-                            }
+                            // Fully proved at this point: same reasoning as
+                            // above. The parent re-check at commit decides.
 
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
