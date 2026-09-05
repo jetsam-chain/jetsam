@@ -16,6 +16,8 @@ libp2p       = { version = "0.55", features = [
     # NAT traversal
     "relay",     # circuit relay v2 (client + server modes)
     "dcutr",     # direct connection upgrade through relay (hole punching)
+    "upnp",      # ask the router to map the P2P port — no manual forwarding
+    "autonat",   # learn whether this node is actually reachable from outside
 ] }
 libp2p-connection-limits = "0.5"
 futures  = "0.3"
