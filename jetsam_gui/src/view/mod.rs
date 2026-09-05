@@ -21,6 +21,9 @@ use crate::widgets::{InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge,
 
 const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
 const HEADER_WORDMARK_SIZE: u32 = 17;
+/// Set the same way the website sets it: the name in capitals, the accent
+/// carried by the mark and the status colours rather than by the letters.
+const BRAND_WORDMARK: &str = "JETSAM";
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let body: Element<'_, Message> = responsive(|size| {
@@ -173,16 +176,22 @@ fn shutdown_forge_overlay(app: &App) -> Element<'_, Message> {
     )
 }
 
+/// The wordmark, written once.
+///
+/// It used to be spelled out at each header that shows it. The rename away
+/// from the upstream project changed the crate, the ticker and the address
+/// prefix, and missed both copies here — every window of this wallet still
+/// greeted the user with the upstream's name.
+fn brand_wordmark() -> Element<'static, Message> {
+    rich_text([span::<(), iced::Font>(BRAND_WORDMARK).color(theme::TEXT)])
+        .size(HEADER_WORDMARK_SIZE)
+        .line_height(1.0)
+        .font(theme::BRAND_REGULAR_FONT)
+        .into()
+}
+
 fn wallet_setup(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> {
-    let brand = rich_text([
-        span::<(), iced::Font>("Paran").color(theme::TEXT),
-        span::<(), iced::Font>("O(1)").color(theme::ACCENT),
-        span::<(), iced::Font>("d").color(theme::TEXT),
-    ])
-    .size(HEADER_WORDMARK_SIZE)
-    .line_height(1.0)
-    .font(theme::BRAND_REGULAR_FONT);
-    let identity = row![brand, network_version_label()]
+    let identity = row![brand_wordmark(), network_version_label()]
         .spacing(9)
         .align_y(Alignment::Center);
     let header = container(
@@ -721,15 +730,7 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         ("MINING OFF", theme::DIM)
     };
 
-    let wordmark = rich_text([
-        span::<(), iced::Font>("Paran").color(theme::TEXT),
-        span::<(), iced::Font>("O(1)").color(theme::ACCENT),
-        span::<(), iced::Font>("d").color(theme::TEXT),
-    ])
-    .size(HEADER_WORDMARK_SIZE)
-    .line_height(1.0)
-    .font(theme::BRAND_REGULAR_FONT);
-    let identity = row![wordmark, network_version_label()]
+    let identity = row![brand_wordmark(), network_version_label()]
         .spacing(9)
         .align_y(Alignment::Center);
 

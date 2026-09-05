@@ -30,6 +30,66 @@ pub const EPOCH_LENGTH: u64 = 6;
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
 pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 540s at BLOCK_TIME=90
 
+/// Dormant hardfork: first block height whose ASERT target is computed with
+/// the corrected `2^(frac/65536)` polynomial. **`u64::MAX` means "never".**
+///
+/// The polynomial shipped at genesis (`difficulty::asert_factor_legacy`) was
+/// mis-transcribed from the BCH reference: the quadratic term is divided by
+/// 65536 once too often and the cubic term is identically zero. It is up to
+/// 15.2 % below `2^x` and steps by 18 % at every halflife crossing. The
+/// corrected polynomial (`difficulty::asert_factor_fixed`) is within 0.012 %
+/// of `2^x` and continuous. See `difficulty.rs` for both.
+///
+/// Semantics: a child block at `height < ASERT_POLYNOMIAL_FIX_HEIGHT` must
+/// carry the legacy target; a child at `height >= ASERT_POLYNOMIAL_FIX_HEIGHT`
+/// must carry the corrected one. The block at exactly this height is the
+/// first one affected. Nothing else in header validation changes.
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// The real height is decided with the network operator and must sit far
+/// enough above the tip that every node and every miner is running a binary
+/// that carries this constant *before* the height is reached; any node still
+/// on the old rule rejects block `H` with `BadDifficultyTarget` and forks.
+/// `difficulty::tests::asert_polynomial_fix_is_not_armed` fails the moment
+/// this value is anything but `u64::MAX`, so arming is visible in CI.
+///
+/// The target is not part of the HistoryStep relation: the circuit binds the
+/// header's `difficulty_target` lanes only through the `SEMHDR` hash and never
+/// recomputes them (`jetsam_recursive::acceptance::block_slots`,
+/// `append_direct_block_tail`), so the proof bank and the v7 network profile
+/// are unchanged by this switch.
+///
+/// # ASERT anchor at activation: kept, not reset
+///
+/// Jetsam's anchor rolls every `EPOCH_LENGTH` (6) blocks
+/// (`header::asert_anchor_height`), so unlike BCH's single genesis-era anchor
+/// there is no long-lived exponent to reinterpret under the new curve: at any
+/// block the exponent spans at most five intervals, and the only state carried
+/// across an epoch edge is the anchor block's own target, which is a valid
+/// number under either polynomial. Resetting the anchor to `H` would buy
+/// nothing and would touch every anchor-derivation site (node, snapshot
+/// staging, external template builders) for no consensus benefit. Activation
+/// therefore changes exactly one thing: which polynomial maps `frac` to a
+/// factor.
+///
+/// Expected effect: the first affected blocks get a target up to 18 % easier
+/// than the legacy rule would have given (only when `frac` is near its top;
+/// nothing at `frac = 0`), and the legacy bias that hardened every early
+/// parent by up to 15 % disappears. Monte-Carlo of the rolling-anchor loop at
+/// constant hashrate (40 000 blocks): legacy ≈ 99 s per block, corrected ≈
+/// 90 s; stationary difficulty ≈ 8–9 % lower after the fix.
+/// # Armed for mainnet
+///
+/// Height 2000, chosen with the operator on 2026-09-05 with the tip at 1897 —
+/// about three hours of notice at the interval the chain was actually
+/// producing. This is a hardfork: a node older than v1.1.0 keeps computing the
+/// legacy target from height 2000 on and rejects blocks that follow the
+/// corrected curve. Below 2000 the two versions agree byte for byte, which
+/// `difficulty::tests::production_next_target_replays_mainnet_headers_exactly`
+/// proves against real mainnet headers.
+pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
+
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
 

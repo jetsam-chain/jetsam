@@ -34,6 +34,7 @@
 //! exactly the 16-byte little-endian nonce in lowercase hex. The worker never
 //! receives or submits a block body, HistoryStep witness or proof.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -172,6 +173,18 @@ impl RpcClient {
         if let Some(ref token) = self.key {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
+        // A pool cannot see how fast a worker hashes: it only observes template
+        // requests, and a solution is far too rare to measure anything from.
+        // Reporting the rate the worker actually measured is the only honest
+        // source. A node ignores the header, so nothing else changes.
+        let measured = MEASURED_HASHES_PER_SECOND.load(Ordering::Relaxed);
+        if measured > 0 {
+            req = req.header("X-Jetsam-Hashrate", measured.to_string());
+        }
+        // The binary declares its own version — what is actually running, not
+        // what a file on disk says — so the pool can show which release each
+        // machine is on. A node ignores the header.
+        req = req.header("X-Jetsam-Version", env!("CARGO_PKG_VERSION"));
         let resp = req.send().with_context(|| format!("POST {}", self.url))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -205,6 +218,10 @@ impl RpcClient {
 // PoW
 // ---------------------------------------------------------------------------
 
+/// Hashes per second this worker last measured over a full search pass.
+/// Reported to the pool, which has no other way to know what a machine weighs.
+static MEASURED_HASHES_PER_SECOND: AtomicU64 = AtomicU64::new(0);
+
 const CHUNK_SIZE: u128 = 10_000_000;
 const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
@@ -228,6 +245,17 @@ fn template_search_deadline(received_at: Instant, expires_in_seconds: u64) -> In
 /// Returns `Some(nonce)` or `None` when the node-owned template is too close
 /// to expiry to submit safely.
 ///
+/// Record what this pass actually achieved, so the next request can tell the
+/// pool what this machine weighs. Passes shorter than a tenth of a second say
+/// nothing useful and are ignored.
+fn publish_rate(hashed: &AtomicU64, started: Instant) {
+    let elapsed = started.elapsed().as_secs_f64();
+    let done = hashed.load(Ordering::Relaxed);
+    if elapsed >= 0.1 && done > 0 {
+        MEASURED_HASHES_PER_SECOND.store((done as f64 / elapsed) as u64, Ordering::Relaxed);
+    }
+}
+
 /// `cursor` is where this worker's search resumes, and it only ever moves
 /// forward. A template that expires mid-search is fetched again and searched
 /// again; restarting from a fresh point re-hashed the range the previous pass
@@ -242,10 +270,22 @@ fn search_nonce(
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
 
     let mut chunk_start = *cursor;
+    // Counted, not derived from the cursor: a pass cut short by the deadline
+    // leaves its last chunk unfinished, and charging the worker for the whole
+    // chunk would report a machine as faster than it is.
+    let hashed = AtomicU64::new(0);
+    let started = Instant::now();
+    // Raised by the thread that finds a solution, so the others stop within a
+    // batch. Each thread otherwise runs its share of the chunk to the end, or
+    // to the deadline, before the solution is handed back — and on a machine
+    // that cannot finish a chunk inside the search budget that is the deadline
+    // every time, where the mining loop discards the solution as too late.
+    let found = AtomicBool::new(false);
 
     loop {
         if Instant::now() >= deadline {
             *cursor = chunk_start;
+            publish_rate(&hashed, started);
             return None;
         }
 
@@ -262,13 +302,15 @@ fn search_nonce(
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
             let mut nonce = ts;
             while nonce < te {
-                if Instant::now() >= deadline {
+                if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     return None;
                 }
                 let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
                 hasher.hash_into(nonce, &mut digests[..n]);
+                hashed.fetch_add(n as u64, Ordering::Relaxed);
                 for (i, hash) in digests[..n].iter().enumerate() {
                     if le256_lt(hash, target) {
+                        found.store(true, Ordering::Relaxed);
                         return Some(nonce + i as u128);
                     }
                 }
@@ -280,6 +322,7 @@ fn search_nonce(
         chunk_start = chunk_start.wrapping_add(CHUNK_SIZE);
         if solution.is_some() {
             *cursor = chunk_start;
+            publish_rate(&hashed, started);
             return solution;
         }
     }
@@ -619,6 +662,58 @@ mod tests {
             second,
             700 + CHUNK_SIZE,
             "the second pass restarted inside the range the first pass had covered"
+        );
+    }
+
+    #[test]
+    fn a_pass_cut_short_by_the_deadline_still_moves_the_cursor_forward() {
+        // An all-zero target is never met, so this pass can only end on the
+        // deadline — long before a 10M-nonce chunk is finished on any machine.
+        // Resuming from the same place would hash the same nonces again on
+        // every pass; the cursor must move past the chunk that was started.
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let start = 5_000u128;
+        let mut cursor = start;
+        // Spawning the thread pool takes longer than a short deadline; in
+        // production it is long warm by the time a template arrives.
+        rayon::current_num_threads();
+        let soon = Instant::now() + Duration::from_millis(300);
+        assert_eq!(search_nonce(&fields, &[0u8; 32], soon, &mut cursor), None);
+        assert!(
+            cursor > start,
+            "the cursor went back to {cursor} after a pass that started at {start}"
+        );
+        assert_eq!(cursor, start + CHUNK_SIZE, "the interrupted chunk must be skipped whole");
+    }
+
+    #[test]
+    fn a_solution_surfaces_as_soon_as_one_thread_finds_it() {
+        // Two threads split a chunk into halves of 5M nonces. The first half
+        // starts one nonce before a known solution, so its thread finds it
+        // within the first batch. One nonce in 2^28 meets this target, so the
+        // other half holds nothing its thread could reach in seconds: left
+        // alone it hashes on until the deadline. The solution must not wait
+        // for it. When a machine cannot finish a chunk inside the search
+        // budget, waiting hands every solution back exactly at the deadline,
+        // where the mining loop discards it as too late to submit.
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let mut target = [0u8; 32];
+        target[28] = 0x10; // hash < 2^228
+        const KNOWN_SOLUTION: u128 = 304_511_652;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-thread pool");
+        let mut cursor = KNOWN_SOLUTION - 1;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let found = pool.install(|| search_nonce(&fields, &target, deadline, &mut cursor));
+        let returned_at = Instant::now();
+
+        assert_eq!(found, Some(KNOWN_SOLUTION));
+        assert!(
+            returned_at < deadline,
+            "the solution was found within milliseconds but only surfaced at the deadline"
         );
     }
 

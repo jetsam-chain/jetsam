@@ -1175,7 +1175,7 @@ impl Backend {
         let hash = forced_tx.or(forced_block).unwrap_or(query);
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(
-                "Search accepts an o1 address, block height/hash, txid, or slot:<number>.".into(),
+                crate::i18n::SEARCH_SCOPE_HINT.into(),
             );
         }
 
@@ -2831,7 +2831,7 @@ fn mock_explorer_search(query: &str, transaction_page: u32) -> Result<ExplorerLo
             details,
         });
     }
-    Err("Search accepts an o1 address, block height/hash, txid, or slot:<number>.".into())
+    Err(crate::i18n::SEARCH_SCOPE_HINT.into())
 }
 
 fn normalize_receipt_hex(text: &str) -> Result<String, String> {

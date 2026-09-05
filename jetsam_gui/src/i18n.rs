@@ -21,6 +21,17 @@ pub fn active() -> Language {
     ACTIVE_LANGUAGE.get()
 }
 
+/// The two places the address prefix is spelled out for a human to read.
+///
+/// `backend::looks_like_address` derives the prefix from the protocol
+/// constant; these sentences cannot, so they went on saying `o1` — the
+/// upstream's prefix — long after the wallet had started rejecting `o1`
+/// addresses. The test at the bottom of this file pins them to the real
+/// prefix, in all three languages.
+pub const SEND_RECIPIENT_HINT: &str = "Paste a j1 address";
+pub const SEARCH_SCOPE_HINT: &str =
+    "Search accepts a j1 address, block height/hash, txid, or slot:<number>.";
+
 pub fn navigation_label(source: &'static str) -> &'static str {
     match (active(), source) {
         (Language::Russian, "Main") => "Главная",
@@ -692,7 +703,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         ),
         "PROVE & SEND" => ("ПОСТРОИТЬ И ОТПРАВИТЬ", "生成证明并发送"),
         "RECIPIENT" => ("ПОЛУЧАТЕЛЬ", "收款地址"),
-        "Paste an o1 address" => ("Вставьте адрес o1", "粘贴 o1 地址"),
+        "Paste a j1 address" => ("Вставьте адрес j1", "粘贴 j1 地址"),
         "AMOUNT / JTM" => ("СУММА / JTM", "金额 / JTM"),
         "AUTOMATIC · calculated by the wallet" => (
             "АВТОМАТИЧЕСКИ · РАССЧИТАНО КОШЕЛЬКОМ",
@@ -990,9 +1001,9 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
             "Канонический блок или транзакция с таким хешем не найдены.",
             "没有与此哈希匹配的规范链区块或交易。",
         ),
-        "Search accepts an o1 address, block height/hash, txid, or slot:<number>." => (
-            "Поиск принимает адрес o1, высоту или хеш блока, TXID либо slot:<номер>.",
-            "可搜索 o1 地址、区块高度/哈希、TXID 或 slot:<编号>。",
+        "Search accepts a j1 address, block height/hash, txid, or slot:<number>." => (
+            "Поиск принимает адрес j1, высоту или хеш блока, TXID либо slot:<номер>.",
+            "可搜索 j1 地址、区块高度/哈希、TXID 或 slot:<编号>。",
         ),
         "Receipt text exceeds the 128 KiB protocol limit." => (
             "Текст чека превышает протокольный лимит 128 KiB.",
@@ -1137,7 +1148,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{activate, navigation_label, translate};
+    use super::{activate, navigation_label, translate, SEARCH_SCOPE_HINT, SEND_RECIPIENT_HINT};
     use crate::model::Language;
 
     #[test]
@@ -1180,5 +1191,31 @@ mod tests {
             translate("75 → 12 outputs · 63 slots freed"),
             "75 → 12 个输出 · 释放 63 个槽位"
         );
+    }
+
+    #[test]
+    fn the_address_hints_name_this_network_prefix_in_every_language() {
+        // `translate` returns its argument unchanged when no entry matches,
+        // so a hint whose wording drifts away from its table key loses its
+        // translations in silence. Both failures are checked here at once:
+        // the prefix must be this chain's, in Russian and Chinese too.
+        let prefix = format!("{}1", jetsam_poseidon2b::primitives::ADDRESS_HRP);
+        for hint in [SEND_RECIPIENT_HINT, SEARCH_SCOPE_HINT] {
+            for language in Language::ALL {
+                activate(language);
+                let shown = translate(hint);
+                assert!(
+                    shown.contains(&prefix),
+                    "{language:?}: {shown:?} never names the {prefix} prefix"
+                );
+                if language != Language::English {
+                    assert_ne!(
+                        shown, hint,
+                        "{language:?}: {hint:?} has no entry in the table"
+                    );
+                }
+            }
+        }
+        activate(Language::English);
     }
 }

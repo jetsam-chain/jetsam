@@ -143,7 +143,11 @@ impl NetworkConfig {
             // that looked half-broken, and told a reader of this file that the
             // network has entry points it does not have. Each new seed is added
             // here when it is online, in the release that follows.
-            dns_seeds: &["mseed1.jetsamchain.com"],
+            dns_seeds: &[
+                "mseed1.jetsamchain.com",
+                "mseed2.jetsamchain.com",
+                "mseed3.jetsamchain.com",
+            ],
         }
     }
 
@@ -205,7 +209,11 @@ mod tests {
         // been provisioned.
         assert_eq!(
             NetworkConfig::mainnet().dns_seeds,
-            &["mseed1.jetsamchain.com"]
+            &[
+                "mseed1.jetsamchain.com",
+                "mseed2.jetsamchain.com",
+                "mseed3.jetsamchain.com",
+            ]
         );
     }
 

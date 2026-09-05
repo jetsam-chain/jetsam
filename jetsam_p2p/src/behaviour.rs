@@ -30,9 +30,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour},
-    StreamProtocol,
+    upnp, StreamProtocol,
 };
 use libp2p_connection_limits as connection_limits;
 use jetsam_chain::consensus::wire_limits::MAX_TX_INTENT_BYTES_GLOBAL;
@@ -136,6 +136,27 @@ pub struct NodeBehaviour {
     /// simultaneous TCP/UDP connection attempts to punch through both NATs.
     /// On success the relay connection is replaced by a direct connection.
     pub dcutr: dcutr::Behaviour,
+
+    /// UPnP / IGD — ask the router to map the listening port outward.
+    ///
+    /// Without it, an operator behind a home router receives blocks but serves
+    /// nobody: the node dials out and is never dialled. Relay and DCUtR above
+    /// are the fallback for when this fails; this is the path that yields a
+    /// real, direct, inbound-capable address and costs no third party.
+    ///
+    /// Many routers ship with UPnP disabled, and it can do nothing against a
+    /// carrier-grade NAT, so a failed mapping is an ordinary outcome rather
+    /// than an error. Disabled on a node that already declares a routable
+    /// address — a datacentre host has nothing to ask a router for.
+    pub upnp: Toggle<upnp::tokio::Behaviour>,
+
+    /// AutoNAT — have peers dial us back so the node learns its own
+    /// reachability instead of assuming it.
+    ///
+    /// Without it a node cannot tell a working inbound path from a broken one,
+    /// so it reserves relay circuits it may not need and cannot know whether
+    /// its UPnP mapping actually worked.
+    pub autonat: autonat::Behaviour,
 
     /// State manifest sync — small control header only.
     pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
@@ -473,6 +494,24 @@ impl NodeBehaviour {
         // DCUtR: coordinates simultaneous dial attempts between two NAT'd
         // nodes connected through a relay, upgrading to a direct connection.
         let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+        // UPnP: only a node that does NOT already declare a routable address
+        // has anything to ask a router for. `serve_relay` is exactly that
+        // signal, so the two are mutually exclusive by construction.
+        let upnp = Toggle::from((!serve_relay).then(upnp::tokio::Behaviour::default));
+
+        // AutoNAT client: peers dial us back, and the answer tells us whether
+        // the mapping above (or a manual port forward) actually works. The
+        // defaults probe rarely enough to cost nothing on a small network.
+        let autonat = autonat::Behaviour::new(
+            key.public().to_peer_id(),
+            autonat::Config {
+                // A young network has few servers; asking three of them keeps
+                // one unlucky peer from deciding our reachability alone.
+                confidence_max: 3,
+                ..autonat::Config::default()
+            },
+        );
         let relay_server = serve_relay
             .then(|| {
                 relay::Behaviour::new(
@@ -535,6 +574,8 @@ impl NodeBehaviour {
             relay_client,
             relay_server,
             dcutr,
+            upnp,
+            autonat,
             state_manifest_sync,
             manifest_page_sync,
             state_segment_sync,

@@ -1777,7 +1777,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         .saturating_sub(address.pending_outbound_micro_jtm);
     let recipient = send_input_line(
         "RECIPIENT",
-        "Paste an o1 address",
+        crate::i18n::SEND_RECIPIENT_HINT,
         &app.send_recipient,
         Message::SendRecipientChanged,
         compact,

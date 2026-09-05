@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent, Multiaddr,
-    PeerId,
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
+    upnp, Multiaddr, PeerId,
 };
 use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
@@ -6789,6 +6789,74 @@ async fn handle_swarm_event(
                 );
             }
         },
+
+        // --- UPnP: did the router agree to map our port? ---
+        //
+        // This is the one NAT outcome an operator must be able to read from
+        // the log, because it decides whether their node serves the network or
+        // only consumes it. Success and definitive failure are therefore INFO,
+        // not debug: a silent failure here is what leaves a node a leaf.
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Upnp(ev)) => match ev {
+            upnp::Event::NewExternalAddr(addr) => {
+                tracing::info!(
+                    %addr,
+                    "upnp: router mapped our port — this node is reachable from outside"
+                );
+            }
+            upnp::Event::ExpiredExternalAddr(addr) => {
+                tracing::info!(%addr, "upnp: port mapping expired");
+            }
+            upnp::Event::GatewayNotFound => {
+                // The port comes from the swarm, not from a literal: an
+                // operator told to forward the wrong port forwards nothing.
+                let listening = swarm.listeners().find_map(|addr| {
+                    addr.iter().find_map(|segment| match segment {
+                        libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+                        _ => None,
+                    })
+                });
+                match listening {
+                    Some(port) => tracing::info!(
+                        port,
+                        "upnp: no router answered — if this node should serve peers, \
+                         forward this TCP port to it manually, or rely on relay and \
+                         hole punching"
+                    ),
+                    None => tracing::info!(
+                        "upnp: no router answered — if this node should serve peers, \
+                         forward its TCP listening port manually, or rely on relay \
+                         and hole punching"
+                    ),
+                }
+            }
+            upnp::Event::NonRoutableGateway => {
+                tracing::info!(
+                    "upnp: the router itself has no public address (carrier-grade NAT) — \
+                     relay and hole punching are the only inbound paths here"
+                );
+            }
+        },
+
+        // --- AutoNAT: are we actually reachable? ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Autonat(autonat::Event::StatusChanged {
+            old,
+            new,
+        })) => {
+            match new {
+                autonat::NatStatus::Public(ref addr) => tracing::info!(
+                    %addr, ?old,
+                    "autonat: peers can dial us — serving the network directly"
+                ),
+                autonat::NatStatus::Private => tracing::info!(
+                    ?old,
+                    "autonat: peers cannot dial us — inbound goes through relay \
+                     and hole punching, and blocks we find take one extra hop"
+                ),
+                autonat::NatStatus::Unknown => tracing::debug!(
+                    ?old, "autonat: reachability still undetermined"
+                ),
+            }
+        }
 
         // --- Exact network-v7 profile handshake ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
