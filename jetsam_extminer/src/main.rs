@@ -113,6 +113,11 @@ struct BlockTemplateResponse {
     height: u64,
     expires_in_seconds: u64,
     n_txs: usize,
+    /// Nonce region this worker owns, assigned by a pool that serves one
+    /// template to several machines. A node answering a solo miner does not
+    /// send it, and the miner then keeps its own starting point.
+    #[serde(default)]
+    nonce_prefix: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,6 +214,10 @@ const POW_HEADER_FIELD_COUNT: usize = 16;
 const POW_NONCE_FIELD_INDEX: usize = 0;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
 const TEMPLATE_SUBMIT_MARGIN: Duration = Duration::from_secs(1);
+/// A pool-assigned region is the top 32 bits of the 128-bit nonce, leaving
+/// 2^96 nonces to each worker — more than any machine can exhaust before the
+/// template expires, so two workers never meet.
+const NONCE_REGION_SHIFT: u32 = 96;
 
 fn template_search_deadline(received_at: Instant, expires_in_seconds: u64) -> Instant {
     let usable = Duration::from_secs(expires_in_seconds).saturating_sub(TEMPLATE_SUBMIT_MARGIN);
@@ -218,27 +227,25 @@ fn template_search_deadline(received_at: Instant, expires_in_seconds: u64) -> In
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` when the node-owned template is too close
 /// to expiry to submit safely.
+///
+/// `cursor` is where this worker's search resumes, and it only ever moves
+/// forward. A template that expires mid-search is fetched again and searched
+/// again; restarting from a fresh point re-hashed the range the previous pass
+/// had already covered.
 fn search_nonce(
     pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
     target: &[u8; 32],
     deadline: Instant,
+    cursor: &mut u128,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
 
-    // Random start so multiple miners on the same template don't collide.
-    let start_nonce: u128 = {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u128;
-        t & 0xFFFF_FFFF_FFFF_FFFF
-    };
-
-    let mut chunk_start = start_nonce;
+    let mut chunk_start = *cursor;
 
     loop {
         if Instant::now() >= deadline {
+            *cursor = chunk_start;
             return None;
         }
 
@@ -270,11 +277,11 @@ fn search_nonce(
             None
         });
 
+        chunk_start = chunk_start.wrapping_add(CHUNK_SIZE);
         if solution.is_some() {
+            *cursor = chunk_start;
             return solution;
         }
-
-        chunk_start = chunk_start.wrapping_add(CHUNK_SIZE);
     }
 }
 
@@ -346,6 +353,29 @@ fn mine(cli: &Cli) -> Result<()> {
     let mut blocks_found: u64 = 0;
     let mut last_height: u64 = 0;
 
+    let clock_entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u128;
+
+    // Where this worker's nonce search resumes. Until a pool assigns a region,
+    // the start is drawn from the sub-second clock, as before.
+    let mut cursor: u128 = clock_entropy & 0xFFFF_FFFF_FFFF_FFFF;
+    let mut cursor_region: Option<u32> = None;
+
+    // Where inside an assigned region this process starts.
+    //
+    // A pool derives the region from the client address, so a second miner on
+    // this machine — or another machine behind the same NAT — is handed the
+    // same one. Both would then start at the region's first nonce and advance
+    // by the same step, hashing identical work forever. This offset separates
+    // them. It occupies bits 64..96, so it can never reach the neighbouring
+    // region: 2^64 nonces remain above the highest offset.
+    let region_offset: u128 = {
+        let pid = u128::from(std::process::id());
+        ((clock_entropy ^ (pid << 12)) & 0xFFFF_FFFF) << 64
+    };
+
     loop {
         // Fetch template.
         let (tmpl, template_received_at) = match rpc.get_template(&cli.coinbase) {
@@ -356,6 +386,18 @@ fn mine(cli: &Cli) -> Result<()> {
                 continue;
             }
         };
+
+        // One template, several machines: each is given a region of the nonce
+        // space to itself. Without it every worker starts somewhere in
+        // [0, 10^9) and spends most of its time re-hashing what its neighbours
+        // already covered.
+        if tmpl.nonce_prefix != cursor_region {
+            if let Some(prefix) = tmpl.nonce_prefix {
+                cursor = (u128::from(prefix) << NONCE_REGION_SHIFT) | region_offset;
+                eprintln!("nonce region {prefix} assigned by the pool");
+            }
+            cursor_region = tmpl.nonce_prefix;
+        }
 
         // Skip if height unchanged and we already solved it.
         if tmpl.height == last_height {
@@ -406,7 +448,7 @@ fn mine(cli: &Cli) -> Result<()> {
         let t0 = Instant::now();
         let deadline = template_search_deadline(template_received_at, tmpl.expires_in_seconds);
 
-        let nonce = match search_nonce(&pow_fields, &target, deadline) {
+        let nonce = match search_nonce(&pow_fields, &target, deadline, &mut cursor) {
             Some(n) => n,
             None => {
                 eprintln!("└─ EXPIRED  refreshing node-owned template");
@@ -519,7 +561,10 @@ fn main() {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{search_nonce, template_search_deadline, Block128, POW_HEADER_FIELD_COUNT};
+    use super::{
+        search_nonce, template_search_deadline, Block128, BlockTemplateResponse, CHUNK_SIZE,
+        NONCE_REGION_SHIFT, POW_HEADER_FIELD_COUNT,
+    };
 
     #[test]
     fn nonce_submission_is_canonical_little_endian_hex() {
@@ -545,8 +590,90 @@ mod tests {
     }
 
     #[test]
-    fn expired_template_stops_before_hashing() {
+    fn expired_template_stops_before_hashing_and_keeps_its_place() {
         let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
-        assert_eq!(search_nonce(&fields, &[0xff; 32], Instant::now()), None);
+        let mut cursor = 4_242u128;
+        assert_eq!(
+            search_nonce(&fields, &[0xff; 32], Instant::now(), &mut cursor),
+            None
+        );
+        assert_eq!(
+            cursor, 4_242,
+            "an expired pass hashed nothing, so it must not skip that range"
+        );
+    }
+
+    #[test]
+    fn the_cursor_never_re_searches_a_range_it_already_covered() {
+        // An all-ones target accepts the first nonce tried, so each pass ends
+        // exactly at the point the search resumed from.
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let far = Instant::now() + Duration::from_secs(30);
+        let mut cursor = 700u128;
+
+        let first = search_nonce(&fields, &[0xff; 32], far, &mut cursor).expect("easy target");
+        assert_eq!(first, 700);
+
+        let second = search_nonce(&fields, &[0xff; 32], far, &mut cursor).expect("easy target");
+        assert_eq!(
+            second,
+            700 + CHUNK_SIZE,
+            "the second pass restarted inside the range the first pass had covered"
+        );
+    }
+
+    #[test]
+    fn a_second_miner_in_the_same_region_starts_somewhere_else() {
+        // The pool derives a region from the client address, so two processes
+        // on one machine get the same one. Starting both at the region's first
+        // nonce would make them hash identical work forever.
+        let offset = |clock: u128, pid: u128| ((clock ^ (pid << 12)) & 0xFFFF_FFFF) << 64;
+        let region = u128::from(7u32) << NONCE_REGION_SHIFT;
+
+        let first = region | offset(1_111, 4_242);
+        let second = region | offset(1_111, 9_999);
+        assert_ne!(first, second, "same clock, different pid must diverge");
+        assert!(
+            first.abs_diff(second) > u128::from(CHUNK_SIZE) * 1_000,
+            "the two starts must be far more than a search apart"
+        );
+
+        // Whatever the offset, the search stays inside its own region.
+        let highest = region | offset(u128::MAX, u128::MAX);
+        assert_eq!(highest >> NONCE_REGION_SHIFT, 7);
+        let next_region = u128::from(8u32) << NONCE_REGION_SHIFT;
+        assert!(
+            (next_region - highest) / CHUNK_SIZE > 1_000_000_000_000u128,
+            "no worker can walk out of its region"
+        );
+    }
+
+    #[test]
+    fn a_pool_region_is_wider_than_any_machine_can_search() {
+        // Neighbouring regions are 2^96 apart and a pass advances by
+        // CHUNK_SIZE, so no worker can ever walk into its neighbour's range.
+        let first = u128::from(0u32) << NONCE_REGION_SHIFT;
+        let second = u128::from(1u32) << NONCE_REGION_SHIFT;
+        assert_eq!(second - first, 1u128 << 96);
+        assert!((second - first) / CHUNK_SIZE > 1_000_000_000_000_000_000_000u128);
+        // The last region must still fit: u32::MAX << 96 is the final start.
+        assert_eq!(
+            u128::from(u32::MAX) << NONCE_REGION_SHIFT,
+            u128::MAX - ((1u128 << 96) - 1)
+        );
+    }
+
+    #[test]
+    fn a_template_without_a_pool_region_still_parses() {
+        let solo = r#"{"template_id":"ab","pow_fields_hex":"00","nonce_field_index":0,
+            "difficulty_target_hex":"ff","height":7,"expires_in_seconds":120,"n_txs":0}"#;
+        let parsed: BlockTemplateResponse = serde_json::from_str(solo).expect("node template");
+        assert_eq!(parsed.nonce_prefix, None);
+
+        let pooled = r#"{"template_id":"ab","pow_fields_hex":"00","nonce_field_index":0,
+            "difficulty_target_hex":"ff","height":7,"expires_in_seconds":120,"n_txs":0,
+            "nonce_prefix":3}"#;
+        let parsed: BlockTemplateResponse = serde_json::from_str(pooled).expect("pool template");
+        assert_eq!(parsed.nonce_prefix, Some(3));
     }
 }

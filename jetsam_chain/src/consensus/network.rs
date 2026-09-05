@@ -138,12 +138,12 @@ impl NetworkConfig {
             // Keep one individual A-record hostname per planned seed as well.
             // Each hostname creates an independent startup dial; unresolved
             // future seeds fail independently without delaying usable seeds.
-            dns_seeds: &[
-                "mseed1.jetsamchain.com",
-                "mseed2.jetsamchain.com",
-                "mseed3.jetsamchain.com",
-                "mseed4.jetsamchain.com",
-            ],
+            // Only seeds that actually resolve belong here. Listing hosts that
+            // do not exist made every first run print warnings about a network
+            // that looked half-broken, and told a reader of this file that the
+            // network has entry points it does not have. Each new seed is added
+            // here when it is online, in the release that follows.
+            dns_seeds: &["mseed1.jetsamchain.com"],
         }
     }
 
@@ -199,15 +199,13 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_has_live_individual_dns_seeds() {
+    fn mainnet_seeds_are_only_hosts_that_exist() {
+        // This list is a promise: a node dials every entry at startup and warns
+        // when one does not resolve. It must never name a seed that has not
+        // been provisioned.
         assert_eq!(
             NetworkConfig::mainnet().dns_seeds,
-            &[
-                "mseed1.jetsamchain.com",
-                "mseed2.jetsamchain.com",
-                "mseed3.jetsamchain.com",
-                "mseed4.jetsamchain.com",
-            ]
+            &["mseed1.jetsamchain.com"]
         );
     }
 

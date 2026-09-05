@@ -137,6 +137,15 @@ pub struct WalletState {
     /// Used to avoid double-spending the same UTXO when a send is retried or
     /// another send starts before the first transaction is confirmed.
     pub pending_input_slots: std::collections::HashSet<u32>,
+    /// Which slots each submitted-but-unconfirmed send reserved, so a send the
+    /// mempool later drops can release exactly its own reservation.
+    ///
+    /// Filled when a send is submitted and dropped when it confirms, rolls
+    /// back, or is evicted. Never written to disk and not rebuilt at startup:
+    /// the mempool is not persisted either, so after a restart a send that was
+    /// still pending has no reservation to release — the same position as
+    /// before this map existed.
+    pub(super) pending_send_slots: HashMap<[u8; 32], (Vec<u32>, Vec<u32>)>,
     /// The ACTIVE address key index. One owner per transaction (consensus
     /// rule): sends spend ONLY this address's UTXOs and change returns to it.
     /// Inactive addresses are not scanned or cached.
@@ -170,6 +179,7 @@ impl WalletState {
             history_dirty: false,
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
+            pending_send_slots: HashMap::new(),
             active_index: 0,
         };
         wallet.load_metadata();
@@ -374,6 +384,43 @@ impl WalletState {
         Ok(())
     }
 
+    /// Remember which slots a submitted send reserved, so that send alone can
+    /// be undone later without knowing the caller's local variables.
+    pub fn track_pending_send_slots(
+        &mut self,
+        tx_hash: [u8; 32],
+        input_slots: &[u32],
+        output_slots: &[u32],
+    ) {
+        self.pending_send_slots
+            .insert(tx_hash, (input_slots.to_vec(), output_slots.to_vec()));
+    }
+
+    /// Forget a tracked reservation whose slots the caller is releasing itself.
+    pub fn forget_pending_send_slots(&mut self, tx_hash: &[u8; 32]) {
+        self.pending_send_slots.remove(tx_hash);
+    }
+
+    /// A send that was accepted into the mempool and then dropped from it
+    /// without ever being mined.
+    ///
+    /// Nothing used to undo this: the history kept a "sent" line that could
+    /// never confirm, and the slots it reserved stayed reserved, so those UTXOs
+    /// were excluded from every later coin selection for the rest of the
+    /// process's life. Releases exactly that send's reservation and removes its
+    /// pending record. `false` means this wallet did not send it.
+    pub fn release_dropped_send(&mut self, tx_hash: &[u8; 32]) -> Result<bool, String> {
+        let Some((input_slots, output_slots)) = self.pending_send_slots.remove(tx_hash) else {
+            return Ok(false);
+        };
+        self.remove_pending_inputs(&input_slots);
+        self.remove_pending_outputs(&output_slots);
+        // Only an entry still at height 0 is removed, so a send confirmed in
+        // the meantime keeps its place in the record.
+        self.remove_pending_send(tx_hash)?;
+        Ok(true)
+    }
+
     /// Update the height of a pending (height=0) tx once it is confirmed.
     /// The block-level caller persists the complete history once after all
     /// transactions have been applied, avoiding one fsync per transaction.
@@ -388,6 +435,9 @@ impl WalletState {
                 entry.height = confirmed_height;
                 entry.block_hash = Some(confirmed_block_hash);
                 self.history_dirty = true;
+                // Confirmed: a later mempool eviction of this txid must not be
+                // able to reach the record or free slots that are now spent.
+                self.pending_send_slots.remove(tx_hash);
                 return true;
             }
         }
@@ -652,12 +702,28 @@ pub fn import_generated_master_secret(
         };
     }
 
-    std::fs::remove_dir_all(&rollback).map_err(|error| {
+    // The previous wallet is kept, not destroyed. An import that succeeds is
+    // still an import of the wrong secret half the time — a mistyped character,
+    // the wrong file — and the key it replaced is the only copy its owner had.
+    // Deleting it here made a recoverable mistake permanent.
+    let kept = parent.join(format!(
+        "wallet-replaced-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    ));
+    std::fs::rename(&rollback, &kept).map_err(|error| {
         format!(
-            "discard previous master secret after import {}: {error}",
-            rollback.display()
+            "keep previous wallet after import {} -> {}: {error}",
+            rollback.display(),
+            kept.display()
         )
     })?;
+    tracing::warn!(
+        path = %kept.display(),
+        "the wallet that was replaced is kept here — delete it yourself once the          imported one is confirmed, and never before"
+    );
     sync_directory(parent, "wallet directory")
 }
 
@@ -918,7 +984,19 @@ fn persist_atomically(
     label: &str,
 ) -> Result<(), String> {
     let temporary = path.with_extension(temporary_extension);
-    let mut file = std::fs::File::create(&temporary)
+    // Owner-only, like the keystore beside it. These files carry the wallet's
+    // transaction history and its receipts: who was paid, how much, and when.
+    // `File::create` left them world-readable, so every account on the machine
+    // could read the owner's payment record.
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&temporary)
         .map_err(|error| format!("create temporary {label}: {error}"))?;
     file.write_all(bytes)
         .map_err(|error| format!("write {label}: {error}"))?;
