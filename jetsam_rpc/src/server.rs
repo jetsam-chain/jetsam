@@ -1381,53 +1381,40 @@ impl RpcHandler {
             (snapshot, addr)
         };
         drop(wallet_operation);
-        // BLOCK TIMESTAMP — earliest legal value, not the current wall clock.
+        // BLOCK TIMESTAMP — the wall clock, never `parent + 1`.
         //
-        // Why: a block's difficulty target is derived from ITS OWN timestamp
-        // (ASERT). The later that timestamp, the easier the target, so the LESS
-        // cumulative work the block carries — and at equal height, cumulative
-        // work is what decides the chain. With `now`, a block carries the
-        // moment the node finished building the template, which is after
-        // receiving the parent, validating it, and opening the gate.
+        // A block's difficulty target is NOT derived from its own timestamp. It
+        // is derived from its PARENT's, and every accepting node recomputes it
+        // that way — `header.rs::validate_header_inner`, and the test
+        // `difficulty_target_is_anchored_on_parent_not_on_self` which proves two
+        // children of one parent get the same target whatever they stamp.
         //
-        // Measured over six lost blocks: the local timestamps were +3 to +21 s
-        // later than those of the blocks that replaced them, while the local
-        // hash was the SMALLER one five times out of six — so the tie would
-        // have gone the other way. At ~0.77% of work per second, 21 s is 16% of
-        // work given away for nothing.
+        // The previous rule here took `max(MTP + 1, min(parent + 1, now))`,
+        // which is `parent + 1` in every practical case. It was introduced on
+        // the belief that an earlier stamp makes a block heavier and wins ties.
+        // That belief is wrong under the rule above: stamping early wins the
+        // stamper nothing at all. What it does instead is tell ASERT that the
+        // interval since the parent was one second, so ASERT hardens the target
+        // of the NEXT block — for everyone, the stamper included.
         //
-        // Validity rules (jetsam_chain/consensus/timestamps.rs):
-        //   timestamp > median of the last 11  AND  timestamp <= now + 120 s
-        // So take the earliest LEGAL value, never past `now`:
-        //   max(MTP + 1, min(now, parent + 1))
-        // Reaching further back would harden the target enough to find fewer
-        // nonces — the goal is to match competing miners, not to outbid them.
+        // Measured on mainnet before this fix: the share of blocks stamped
+        // `parent + 1` went 0% (h 1019-1118) → 38% → 53% → 62% (last 50) as
+        // miners upgraded, because every upgraded node stamps this way. Each
+        // such block pushed the target up by up to +29% in one step; the chain
+        // stalled 38 minutes between h=1619 and h=1620 under a target inflated
+        // 155% in thirteen blocks. With every miner upgraded the ratchet is
+        // unbounded: ×1.77 per six-block epoch.
         //
-        // The opposite choice, a real wall-clock timestamp like most miners
-        // use, was measured too. Stamping a block one second after its parent
-        // earns a target roughly 1.5x harder than a competitor's (one observed
-        // pair: 4.28e10 of work against 2.83e10 two blocks later), and the next
-        // block, published by a competitor, inherits the easy catch-up target.
-        // That is a double penalty, and it is only worth paying while blocks
-        // propagate slowly. It is not the situation here: port 9700 is open,
-        // inbound peers are plentiful, and no relay hop is involved.
+        // The in-process miner never had this problem — it has always used the
+        // wall clock (`jetsam_miner/src/template.rs`), and none of its blocks
+        // carry a `+1` stamp. This restores the same rule for the RPC template
+        // path, so both producers behave identically.
         //
-        // Known side effect: blocks then carry a timestamp well behind real
-        // time, which makes explorers show false "bursts" of blocks one second
-        // apart when they were in fact mined at a normal cadence.
-        //
-        // The only hard constraint is VALIDITY (timestamps.rs):
+        // Validity, unchanged (jetsam_chain/consensus/timestamps.rs):
         //   timestamp > median of the last 11   AND   timestamp <= now + 120 s
         let block_ts = {
-            // parent+1 yields heavier blocks, which win reorgs; combined with
-            // the relaxed template gate it also keeps the duty cycle high.
-            // `now.max(earliest)` gave real wall-clock time, hence lighter
-            // blocks, hence systematic reorg losses against a fast network.
             let mtp = median_time_past(&snapshot.prev_timestamps);
-            let parent_ts = snapshot.parent.timestamp;
-            let earliest = mtp.saturating_add(1);
-            let wanted = parent_ts.saturating_add(1).min(now);
-            wanted.max(earliest).min(now)
+            now.max(mtp.saturating_add(1))
         };
         let snapshot_ts = snapshot;
         let max_user_pages = self
@@ -3503,6 +3490,47 @@ mod tests {
         assert!(decode_external_nonce_hex(&encoded.to_uppercase()).is_err());
         assert!(decode_external_nonce_hex(&format!("0x{encoded}")).is_err());
         assert!(decode_external_nonce_hex(&encoded[..30]).is_err());
+    }
+
+    /// The rule the served template must follow, kept here so a regression in
+    /// `getBlockTemplate` fails a test instead of quietly throttling the chain.
+    fn template_block_timestamp(now: u64, prev_timestamps: &[u64]) -> u64 {
+        now.max(median_time_past(prev_timestamps).saturating_add(1))
+    }
+
+    #[test]
+    fn a_served_template_carries_the_wall_clock_not_parent_plus_one() {
+        // Eleven parents one minute apart, the newest at 10_000.
+        let prev: Vec<u64> = (0..11).map(|i| 10_000 - i * 60).collect();
+        let parent = prev[0];
+        let mtp = median_time_past(&prev);
+
+        // A template built well after its parent must say so. Stamping
+        // `parent + 1` told ASERT the interval was one second and hardened the
+        // next block's target for the whole network — measured at up to +29%
+        // in a single step on mainnet.
+        let now = parent + 95;
+        let stamped = template_block_timestamp(now, &prev);
+        assert_eq!(stamped, now, "the template must carry the wall clock");
+        assert_ne!(
+            stamped,
+            parent + 1,
+            "parent + 1 is the rule that stalled the chain; it must not come back"
+        );
+        assert_eq!(
+            stamped - parent,
+            95,
+            "the interval ASERT reads must be the real one"
+        );
+
+        // Validity is preserved: strictly above the median of the last eleven.
+        assert!(stamped > mtp);
+
+        // A clock behind the median still yields a legal stamp rather than an
+        // invalid one — this is the only case where the result is not `now`.
+        let stamped_behind = template_block_timestamp(mtp - 500, &prev);
+        assert_eq!(stamped_behind, mtp + 1);
+        assert!(stamped_behind > mtp);
     }
 
     #[test]
