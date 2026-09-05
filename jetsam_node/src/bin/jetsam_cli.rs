@@ -1598,6 +1598,26 @@ async fn cmd_send(
         None => 0, // auto
     };
 
+    // `--fee` is in JTM, and an ordinary fee is a few thousandths of one. A
+    // figure typed as if it were micro-JTM, or a stray zero, hands the whole
+    // amount to a miner with no way back. Refuse anything absurd rather than
+    // let a typo cost a hundred times the transfer.
+    const FEE_SANITY_LIMIT_MICRO: u64 = 1_000_000; // 1 JTM
+    if fee_micro > FEE_SANITY_LIMIT_MICRO || (amount_micro > 0 && fee_micro > amount_micro) {
+        bail!(
+            "Refusing a fee of {} JTM.\n\
+             \tA fee is normally a few thousandths of one JTM, and this one is \n\
+             \t{}. Fees are paid to a miner and cannot be recovered.\n\
+             \tOmit --fee to let the node price it, or pass a smaller figure.",
+            jetsam_str(fee_micro),
+            if fee_micro > FEE_SANITY_LIMIT_MICRO {
+                "above the one-JTM sanity limit".to_string()
+            } else {
+                format!("larger than the {} JTM you are sending", jetsam_str(amount_micro))
+            }
+        );
+    }
+
     // Validate address encoding before sending to the daemon.
     // Actual parsing/validation happens in the daemon; we just do a basic
     // sanity check to catch obvious typos before sending to RPC.

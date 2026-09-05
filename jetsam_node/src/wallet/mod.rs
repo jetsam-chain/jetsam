@@ -330,6 +330,48 @@ pub fn reconcile_receipts_at_startup(
     Ok((removed, recovered))
 }
 
+/// A send this wallet made has left the mempool without being mined.
+///
+/// Until this existed nothing ever undid a submitted send that the mempool
+/// later dropped: the wallet kept showing a payment that could never confirm,
+/// and the UTXOs it had reserved stayed out of every later coin selection.
+/// Returns whether the send belonged to this wallet.
+pub fn forget_evicted_send(wallet: &SharedWallet, tx_hash: &[u8; 32]) -> Result<bool, String> {
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| "wallet state lock is poisoned".to_string())?;
+    match guard.as_mut() {
+        None => Ok(false),
+        Some(wallet) => wallet.release_dropped_send(tx_hash),
+    }
+}
+
+/// Whether a history entry whose block left the canonical chain stays in the
+/// record, and in what shape.
+///
+/// Called only for entries the reorganization reclaimed.
+fn keep_reclaimed_entry(entry: &mut state::TxHistoryEntry) -> bool {
+    // A locally mined block remains part of the wallet's mining record after it
+    // loses a reorganization. Its exact block hash lets RPC and GUI report
+    // ORPHANED without pretending the reward is spendable.
+    if entry.is_coinbase {
+        return true;
+    }
+    if entry.direction == state::TxDirection::Sent {
+        // The payment left the canonical chain. It is still a payment this
+        // wallet made: it may sit in the mempool and confirm again on the
+        // replacement branch, and the caller then gives it its new height.
+        // Dropping it erased the only record that money ever left here while
+        // the coins reappeared in the balance — the owner saw a refund with no
+        // explanation. Back to pending is what actually happened on chain.
+        entry.height = 0;
+        entry.block_hash = None;
+        return true;
+    }
+    // A received output that no longer exists is not ours to show.
+    false
+}
+
 /// Install the one exact post-reorg active-owner snapshot, then derive only
 /// history/receipt artifacts from replacement block bodies. No replacement
 /// block is ever replayed onto the old-branch UTXO cache.
@@ -370,32 +412,9 @@ pub fn install_reorg_snapshot_and_artifacts(
     for tx_hash in &reclaimed {
         wallet.receipts.remove(tx_hash);
     }
-    let replacement: std::collections::HashSet<[u8; 32]> = replacement_blocks
-        .iter()
-        .flat_map(|block| {
-            jetsam_chain::try_compute_logical_txids(&block.transactions)
-                .expect("committed replacement block has a canonical logical tx stream")
-        })
-        .map(|txid| txid.0)
-        .collect();
-    wallet.history.retain_mut(|entry| {
-        if !reclaimed.contains(&entry.tx_hash) {
-            return true;
-        }
-        // A locally mined block remains part of the wallet's mining record
-        // after it loses a reorganization. Its exact block hash lets RPC and
-        // GUI report ORPHANED without pretending the reward is spendable.
-        if entry.is_coinbase {
-            return true;
-        }
-        if replacement.contains(&entry.tx_hash) && entry.direction == state::TxDirection::Sent {
-            // Preserve the local source-account tag so the replacement-chain
-            // confirmation can produce a receipt at its new height.
-            entry.height = 0;
-            return true;
-        }
-        false
-    });
+    wallet
+        .history
+        .retain_mut(|entry| !reclaimed.contains(&entry.tx_hash) || keep_reclaimed_entry(entry));
 
     let active_address = wallet.active_address();
     let active_index = wallet.active_index;
@@ -1220,6 +1239,7 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
         wallet.add_pending_inputs(input_slots);
         wallet.add_pending_outputs(output_slots);
+        wallet.track_pending_send_slots(txid, input_slots, output_slots);
         wallet.record_pending_send(txid, amount_micro_jtm, peer_address)?;
         Ok(())
     }
@@ -1234,6 +1254,7 @@ impl WalletOps for WalletHandle {
         if let Some(wallet) = guard.as_mut() {
             wallet.remove_pending_inputs(input_slots);
             wallet.remove_pending_outputs(output_slots);
+            wallet.forget_pending_send_slots(&txid);
             if let Err(error) = wallet.remove_pending_send(&txid) {
                 tracing::error!(%error, "failed to durably roll back pending wallet send");
             }
@@ -1646,6 +1667,65 @@ mod tests {
     }
 
     #[test]
+    fn a_send_the_mempool_drops_stops_holding_the_wallet_hostage() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        let txid = [0xE1; 32];
+        handle
+            .reserve_pending_submission(txid, &[3], &[9], 250, [2; 32])
+            .unwrap();
+        {
+            let guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_ref().unwrap();
+            assert!(wallet.pending_input_slots.contains(&3));
+            assert!(wallet.pending_output_slots.contains(&9));
+            assert_eq!(wallet.history.len(), 1);
+        }
+
+        assert!(super::forget_evicted_send(&handle.inner, &txid).unwrap());
+
+        {
+            let guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_ref().unwrap();
+            assert!(
+                !wallet.pending_input_slots.contains(&3),
+                "the UTXO must become spendable again"
+            );
+            assert!(!wallet.pending_output_slots.contains(&9));
+            assert!(
+                wallet.history.is_empty(),
+                "a payment that never reached a block must not stay in the record"
+            );
+        }
+
+        // An eviction for a transaction this wallet never sent is ordinary.
+        assert!(!super::forget_evicted_send(&handle.inner, &[0xAB; 32]).unwrap());
+    }
+
+    #[test]
+    fn a_confirmed_send_survives_a_late_eviction_event() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        let txid = [0xE2; 32];
+        handle
+            .reserve_pending_submission(txid, &[4], &[8], 250, [2; 32])
+            .unwrap();
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            assert!(guard
+                .as_mut()
+                .unwrap()
+                .confirm_pending_tx(&txid, 91, [5; 32]));
+        }
+
+        assert!(
+            !super::forget_evicted_send(&handle.inner, &txid).unwrap(),
+            "a confirmed send is no longer pending and must be untouchable"
+        );
+        let guard = handle.inner.lock().unwrap();
+        let entry = &guard.as_ref().unwrap().history[0];
+        assert_eq!(entry.height, 91, "the confirmed payment keeps its block");
+    }
+
+    #[test]
     fn planner_excludes_pending_inputs_from_spendable_balance() {
         let (_dir, handle) = handle_with_utxos(&[10_000, 1_000, 1_000, 1_000, 1_000]);
         {
@@ -1705,6 +1785,40 @@ mod tests {
             handle.export_receipt(&hex::encode(tx_hash)).unwrap_err(),
             "same-owner consolidations do not create payment receipts"
         );
+    }
+
+    #[test]
+    fn a_reorganized_payment_returns_to_pending_instead_of_vanishing() {
+        let entry = |direction, is_coinbase| state::TxHistoryEntry {
+            tx_hash: [9; 32],
+            block_hash: Some([7; 32]),
+            height: 42,
+            direction,
+            is_coinbase,
+            amount_micro_jtm: 500,
+            peer_address: None,
+            timestamp: 1,
+            own_address: None,
+            own_key_index: Some(0),
+        };
+
+        // The payment this wallet made must survive its block being replaced:
+        // the coins came back to the balance, and without the record the owner
+        // sees a refund with no trace of the send.
+        let mut sent = entry(state::TxDirection::Sent, false);
+        assert!(super::keep_reclaimed_entry(&mut sent));
+        assert_eq!(sent.height, 0, "a reclaimed payment must read as pending");
+        assert_eq!(sent.block_hash, None, "its old block no longer exists");
+
+        // A coinbase stays, with its block hash, so it can be shown ORPHANED.
+        let mut coinbase = entry(state::TxDirection::Received, true);
+        assert!(super::keep_reclaimed_entry(&mut coinbase));
+        assert_eq!(coinbase.height, 42);
+        assert_eq!(coinbase.block_hash, Some([7; 32]));
+
+        // A received output that no longer exists is not ours to show.
+        let mut received = entry(state::TxDirection::Received, false);
+        assert!(!super::keep_reclaimed_entry(&mut received));
     }
 
     #[test]
@@ -1960,11 +2074,19 @@ mod tests {
 
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
+        // The receipt commits to the orphaned block header, so it must go.
         assert!(!wallet.receipts.contains_key(&orphan_hash));
-        assert!(wallet
+        // The payment itself must not. It is still a payment this wallet made,
+        // it may confirm again from the mempool, and its coins are back in the
+        // balance — deleting the line left the owner with an unexplained
+        // refund. It reads as pending, which is what it now is.
+        let entry = wallet
             .history
             .iter()
-            .all(|entry| entry.tx_hash != orphan_hash));
+            .find(|entry| entry.tx_hash == orphan_hash)
+            .expect("the reorganized payment stays in the record");
+        assert_eq!(entry.height, 0);
+        assert_eq!(entry.block_hash, None);
         drop(guard);
 
         let reloaded = state::WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();

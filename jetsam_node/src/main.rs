@@ -1727,6 +1727,19 @@ async fn main() -> anyhow::Result<()> {
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
 
+    // An RPC endpoint reachable from outside this machine, with no bearer, is
+    // the wallet handed to whoever finds the port: `walletSend` needs no other
+    // secret. The node still starts — an operator may be fronting it with their
+    // own authentication — but it says so, loudly, every time.
+    if !rpc_listen.ip().is_loopback() && cli.mining_key.is_none() {
+        tracing::warn!(
+            listen = %rpc_listen,
+            "the JSON-RPC endpoint is reachable beyond this machine and has no \
+             --mining-key: anyone who can reach it can spend this wallet and stop \
+             this node. Bind 127.0.0.1, or set --mining-key."
+        );
+    }
+
     // Establish the process-wide bounded phase pool before the embedded
     // registry/matrix prewarm or any verifier can enter Rayon. Internal PoW,
     // HistoryStep and inbound verification reuse this same fixed worker set;
@@ -2083,9 +2096,11 @@ async fn main() -> anyhow::Result<()> {
         .await
     });
 
-    // Relay mempool TxAdmitted → P2P gossip.
+    // Relay mempool TxAdmitted → P2P gossip, and let the wallet learn when one
+    // of its own sends leaves the pool without being mined.
     let mut mp_events = mempool.subscribe();
     let p2p_tx_relay = p2p.cmd_tx.clone();
+    let evicted_send_wallet = shared_wallet.clone();
     tokio::spawn(async move {
         loop {
             match mp_events.recv().await {
@@ -2093,6 +2108,29 @@ async fn main() -> anyhow::Result<()> {
                     let _ = p2p_tx_relay
                         .send(jetsam_p2p::NetworkCommand::BroadcastTx { intent_bytes })
                         .await;
+                }
+                Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason })
+                    // Pool pressure drops a transaction that is still perfectly
+                    // valid — another node can mine it at any time. Releasing
+                    // its inputs here would let the owner build a conflicting
+                    // second payment from the same UTXOs, so only the reasons
+                    // the chain itself has settled clear the record.
+                    if !matches!(reason, jetsam_mempool::EvictReason::CapacityPressure) =>
+                {
+                    // Nothing used to undo this: the wallet kept a "sent" line
+                    // that could never confirm, and held that send's UTXOs
+                    // reserved for the rest of the process's life.
+                    match wallet::forget_evicted_send(&evicted_send_wallet, &hash.0) {
+                        Ok(true) => tracing::info!(
+                            txid = %hex::encode(hash.0),
+                            ?reason,
+                            "wallet: a pending send left the mempool without being mined"
+                        ),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "wallet: could not release an evicted send")
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -2153,6 +2191,7 @@ async fn main() -> anyhow::Result<()> {
         mining_payout_address,
         cli.mining_key,
         cli.allow_custom_coinbase,
+        rpc_listen.ip().is_loopback(),
     )
     .await
     .context("start RPC server")?;

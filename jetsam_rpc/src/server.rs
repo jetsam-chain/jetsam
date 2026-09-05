@@ -77,6 +77,27 @@ struct PowPreview {
     published_at: Instant,
 }
 
+/// Compare a presented bearer against the expected one without leaking where
+/// they first differ.
+///
+/// `==` on strings stops at the first differing byte, and the time it takes says
+/// how many bytes were right. Repeated against a network endpoint that is the
+/// difference between guessing a token byte by byte and guessing it whole.
+///
+/// The length comparison is deliberate and standard: a token's length is not
+/// the secret, its content is.
+fn bearer_matches(presented: &str, expected: &str) -> bool {
+    let (presented, expected) = (presented.as_bytes(), expected.as_bytes());
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in presented.iter().zip(expected) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
 static POW_PREVIEW: std::sync::LazyLock<Mutex<Option<PowPreview>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
@@ -697,6 +718,25 @@ impl<T> ExternalMiningAttemptSlot<T> {
         }
     }
 
+    /// Read the staged attempt without consuming it.
+    ///
+    /// `begin_proving` moves the prepared template out of the slot, and the
+    /// node holds exactly one. Checking a submitted nonce only after that move
+    /// meant any nonce that failed to be a proof of work destroyed the template
+    /// every worker was still mining.
+    fn peek_ready<R>(
+        &self,
+        template_id: ExternalMiningTemplateId,
+        read: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        match &self.state {
+            ExternalMiningAttemptState::Ready(cached) if cached.template_id == template_id => {
+                Some(read(&cached.prepared))
+            }
+            _ => None,
+        }
+    }
+
     fn begin_proving(
         &mut self,
         template_id: ExternalMiningTemplateId,
@@ -799,6 +839,20 @@ impl ExternalMiningAttemptInvalidator {
             template_id,
             armed: true,
         })
+    }
+
+    /// The sealed PoW header for a nonce against the staged attempt, leaving
+    /// that attempt in place. `None` means no attempt with that id is staged;
+    /// the consume below then reports the exact reason.
+    fn pow_header_for(
+        &self,
+        template_id: ExternalMiningTemplateId,
+        nonce: u128,
+    ) -> Option<jetsam_chain::BlockHeader> {
+        self.inner
+            .lock()
+            .ok()?
+            .peek_ready(template_id, |prepared| prepared.pow_header(nonce))
     }
 
     fn begin_proving(
@@ -968,6 +1022,9 @@ pub struct RpcHandler {
     /// any valid address as `miner_address` in getBlockTemplate and receive
     /// block rewards directly. The node operator earns via off-chain service fees.
     pub allow_custom_coinbase: bool,
+    /// True when this endpoint only answers this machine. Read-only detail that
+    /// would identify the operator stays behind it.
+    pub rpc_is_loopback: bool,
     /// Pinned self-recursive HistoryStep runtime shared with local mining and
     /// inbound bundle verification.
     pub history_step_runtime:
@@ -2295,10 +2352,13 @@ impl JetsamApiServer for RpcHandler {
             active_slot_count: tip.active_slot_count,
             pow_hashrate_hps: jetsam_miner::local_hashrate_hps(),
             pow_hashes_total: jetsam_miner::local_pow_hashes(),
-            payout_address: self
-                .resolved_mining_payout()
-                .ok()
-                .map(|address| address.to_bech32()),
+            // Where the rewards land is told to a local client, or to a caller
+            // that already holds the bearer. On an endpoint reachable from
+            // outside with no bearer, publishing it tied an IP address to an
+            // amount of money for anyone who asked.
+            payout_address: (self.rpc_is_loopback || self.mining_key.is_some())
+                .then(|| self.resolved_mining_payout().ok().map(|a| a.to_bech32()))
+                .flatten(),
         })
     }
 
@@ -2589,6 +2649,17 @@ impl JetsamApiServer for RpcHandler {
             let tip = chain.tip_header();
             (tip.height, block_id(tip))
         };
+        // Check the proof of work BEFORE consuming the attempt. Consuming
+        // first meant a nonce that is not a proof of work destroyed the sole
+        // template every worker was still mining, and the next template_id is
+        // guessable (a namespace plus a counter), so a caller sending junk
+        // nonces could keep the pool permanently without work.
+        if let Some(header) = self
+            .external_mining_attempts
+            .pow_header_for(template_id, nonce)
+        {
+            validate_pow(&header).map_err(|error| rpc_err(format!("proof of work: {error}")))?;
+        }
         let proving = self
             .external_mining_attempts
             .begin_proving(template_id, Instant::now(), tip_height, tip_id)
@@ -3226,6 +3297,45 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_staged_attempt_leaves_it_available_to_every_worker() {
+        // A submitted nonce is checked against the staged attempt before that
+        // attempt is consumed. Reading it must therefore leave the slot exactly
+        // as it was, or one worker's bad nonce would take the template away
+        // from all the others.
+        let now = Instant::now();
+        let mut slot = ExternalMiningAttemptSlot::new(13);
+        let template_id = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(
+            template_id,
+            "prepared",
+            11,
+            [3u8; 32],
+            now + Duration::from_secs(30),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                slot.peek_ready(template_id, |prepared| *prepared),
+                Some("prepared"),
+                "reading the attempt must not consume it"
+            );
+        }
+
+        let mut unknown = template_id;
+        unknown[15] ^= 1;
+        assert_eq!(slot.peek_ready(unknown, |prepared| *prepared), None);
+
+        // The attempt is still there for the worker that does find a proof.
+        assert_eq!(
+            slot.begin_proving(template_id, now, 11, [3u8; 32]),
+            Ok("prepared")
+        );
+        // Once consumed there is nothing left to read.
+        assert_eq!(slot.peek_ready(template_id, |prepared| *prepared), None);
+    }
+
+    #[test]
     fn external_mining_slot_drops_expired_and_stale_ready_attempts() {
         let now = Instant::now();
         let mut slot = ExternalMiningAttemptSlot::new(9);
@@ -3443,6 +3553,7 @@ pub async fn start_rpc_server(
     mining_payout_address: Option<jetsam_poseidon2b::primitives::Address>,
     mining_key: Option<String>,
     allow_custom_coinbase: bool,
+    rpc_is_loopback: bool,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -3482,6 +3593,7 @@ pub async fn start_rpc_server(
         mining_payout_address,
         mining_key: mining_key.clone(),
         allow_custom_coinbase,
+        rpc_is_loopback,
         history_step_runtime,
         history_step_ghost,
         external_mining_attempts,
@@ -3582,7 +3694,7 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if auth == expected {
+        if bearer_matches(auth, &expected) {
             let fut = self.inner.call(req);
             Box::pin(fut)
         } else {
