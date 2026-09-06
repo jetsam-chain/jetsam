@@ -33,6 +33,7 @@
 - [Internal miner](operate/internal-mining.md)
 - [External miner](operate/external-miner.md)
 - [Mining in the wallet](wallet/mining.md)
+- [Stratum protocol and TowerHash specification](mining/stratum.md)
 
 ## Protocol
 

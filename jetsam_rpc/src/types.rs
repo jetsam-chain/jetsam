@@ -75,8 +75,9 @@ pub struct BlockTemplateResponse {
     /// The external miner cannot use it to mutate the block body or witnesses.
     pub template_id: String,
     /// Fixed 16-field Poseidon2b PoW input as hex, with the nonce field zeroed.
-    /// Each field is serialized as 16 little-endian bytes. Patch field 10
-    /// with the LE u128 nonce. A valid nonce satisfies:
+    /// Each field is serialized as 16 little-endian bytes. Patch the field at
+    /// `nonce_field_index` with the LE u128 nonce — read the index from the
+    /// response, never hardcode it. A valid nonce satisfies:
     /// `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`.
     pub pow_fields_hex: String,
     /// Field index to replace with the canonical 16-byte little-endian nonce.

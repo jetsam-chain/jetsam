@@ -33,6 +33,7 @@
 - [内置矿工](operate/internal-mining.md)
 - [外部矿工](operate/external-miner.md)
 - [在钱包中挖矿](wallet/mining.md)
+- [Stratum 协议与 TowerHash 规范（英文）](../../mining/stratum.md)
 
 ## 协议
 

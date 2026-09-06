@@ -33,6 +33,7 @@
 - [Встроенный майнер](operate/internal-mining.md)
 - [Внешний майнер](operate/external-miner.md)
 - [Майнинг в кошельке](wallet/mining.md)
+- [Протокол Stratum и спецификация TowerHash (на английском)](../../mining/stratum.md)
 
 ## Протокол
 
