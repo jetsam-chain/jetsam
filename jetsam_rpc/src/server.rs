@@ -20,7 +20,8 @@ use tokio::sync::RwLock;
 use jetsam_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use jetsam_chain::consensus::timestamps::median_time_past;
 use jetsam_chain::consensus::pow::{
-    block_id, pow_header_fields, validate_pow, POW_NONCE_FIELD_INDEX,
+    block_id, poseidon_pow_digest_from_fields, pow_header_fields, validate_pow,
+    PowHeaderFields, POW_HEADER_FIELD_COUNT, POW_NONCE_FIELD_INDEX,
 };
 use jetsam_chain::consensus::wire_limits::{
     hex_chars_for_bytes, MAX_RPC_RECEIPT_BYTES, MAX_RPC_SALT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
@@ -42,6 +43,9 @@ use crate::types::{
     WalletMinedBlocksPage, WalletReceiptInfo, WalletReceiptsPage, WalletScanResult, WalletSendPlan,
     WalletSendResult, WalletStatus, WalletUtxoInfo, WALLET_CONSOLIDATION_INPUT_LIMIT,
     WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+};
+use crate::types::{
+    ERR_INVALID_POW, ERR_TEMPLATE_CONSUMED, ERR_TEMPLATE_STALE, ERR_TEMPLATE_UNKNOWN,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -101,6 +105,54 @@ fn bearer_matches(presented: &str, expected: &str) -> bool {
 static POW_PREVIEW: std::sync::LazyLock<Mutex<Option<PowPreview>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// Strictly increasing identifier for the work a template carries.
+///
+/// A pool serving many miners needs to know whether two responses describe the
+/// same job. Comparing `template_id` does not answer that — a preview and the
+/// ready template it becomes share an id — and diffing `pow_fields_hex` costs a
+/// 512-character comparison per poll. This is one integer, and it never repeats
+/// within a node process.
+static TEMPLATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_template_seq() -> u64 {
+    TEMPLATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The block's difficulty in decimal — `2^256 / target`, the number a pool
+/// compares its share difficulty against.
+///
+/// The arithmetic is consensus code that already exists and is already tested
+/// (`difficulty::block_work`): reusing it means this display value can never
+/// disagree with the work the chain actually accounts for. Only the decimal
+/// rendering is new.
+fn difficulty_from_target(target_le: &[u8; 32]) -> String {
+    decimal_from_le_u256(&jetsam_chain::consensus::difficulty::block_work(target_le))
+}
+
+/// Render a little-endian 256-bit integer as decimal.
+///
+/// Schoolbook long division by 10 over big-endian bytes: 256 bits does not fit
+/// any primitive, and pulling in a bignum crate to print one field would be a
+/// poor trade.
+fn decimal_from_le_u256(value_le: &[u8; 32]) -> String {
+    let mut be: Vec<u8> = value_le.iter().rev().copied().collect();
+    let mut digits = Vec::new();
+    while be.iter().any(|byte| *byte != 0) {
+        let mut carry = 0u16;
+        for byte in be.iter_mut() {
+            let current = carry * 256 + u16::from(*byte);
+            *byte = (current / 10) as u8;
+            carry = current % 10;
+        }
+        digits.push(b'0' + carry as u8);
+    }
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("ascii digits")
+}
+
 fn publish_pow_preview(
     response: &BlockTemplateResponse,
     parent_height: u64,
@@ -124,15 +176,80 @@ fn take_pow_preview(tip_height: u64, tip_id: [u8; 32]) -> Option<BlockTemplateRe
     if preview.parent_height != tip_height || preview.parent_id != tip_id {
         return None;
     }
-    if preview.published_at.elapsed() >= EXTERNAL_MINING_TEMPLATE_TTL {
+    let age = preview.published_at.elapsed();
+    if age >= EXTERNAL_MINING_TEMPLATE_TTL {
         return None;
     }
-    Some(preview.response.clone())
+    // The stored response was built when the preview was published, so its
+    // `ttl_remaining_ms` says "the whole window" forever. A pool re-served this
+    // template 40 s later would hand its miners work it believes has 120 s left
+    // and watch it die at 80. Restate the lifetime as it actually is.
+    let mut response = preview.response.clone();
+    response.ttl_remaining_ms = (EXTERNAL_MINING_TEMPLATE_TTL - age).as_millis() as u64;
+    Some(response)
 }
 
 fn clear_pow_preview() {
     if let Ok(mut guard) = POW_PREVIEW.lock() {
         *guard = None;
+    }
+}
+
+/// The PoW input published for a template, by id, regardless of the tip.
+///
+/// [`take_pow_preview`] refuses a preview whose parent moved, which is right
+/// when handing out work. Judging a nonce that has already been found is a
+/// different question: the miner did the work, and the answer is "is this
+/// digest below that target", not "should I still be mining this".
+fn pow_preview_work_for(template_id: &str) -> Option<(PowHeaderFields, [u8; 32])> {
+    let guard = POW_PREVIEW.lock().ok()?;
+    let preview = guard.as_ref()?;
+    if preview.response.template_id != template_id {
+        return None;
+    }
+    let bytes = hex::decode(&preview.response.pow_fields_hex).ok()?;
+    if bytes.len() != POW_HEADER_FIELD_COUNT * 16 {
+        return None;
+    }
+    let mut fields: PowHeaderFields = Default::default();
+    for (index, field) in fields.iter_mut().enumerate() {
+        let mut chunk = [0u8; 16];
+        chunk.copy_from_slice(&bytes[index * 16..(index + 1) * 16]);
+        *field = jetsam_core::Block128::from(u128::from_le_bytes(chunk));
+    }
+    let target_bytes = hex::decode(&preview.response.difficulty_target_hex).ok()?;
+    let target: [u8; 32] = target_bytes.try_into().ok()?;
+    Some((fields, target))
+}
+
+/// Drops a published preview unless the template reached `Ready`.
+///
+/// A preview is published BEFORE the proof exists, so the miner can search
+/// while the node proves. When preparation then fails — gate closed, tip moved,
+/// proving error — the preview stayed on offer for its full 120 s with an id
+/// that would never become submittable: every miner in the pool worked on a
+/// template whose block could not be built. Tying the cleanup to a guard means
+/// it happens on every early return, including the ones added later.
+struct PreviewGuard {
+    armed: bool,
+}
+
+impl PreviewGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    /// The template became submittable: the preview is legitimate, keep it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreviewGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            clear_pow_preview();
+        }
     }
 }
 // --- fin OVERLAP -----------------------------------------------------------
@@ -142,6 +259,23 @@ type ExternalMiningTemplateId = [u8; 16];
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
 }
+
+/// A mining rejection a caller can act on.
+///
+/// Every mining failure used to arrive as `-32000` with prose, so a pool had to
+/// match on sentences to tell "your nonce is wrong" from "you lost the race"
+/// from "fetch a new template" — three situations with three different
+/// responses. The code carries that distinction; the message stays for humans.
+fn mining_err(code: i32, msg: impl Into<String>) -> ErrorObject<'static> {
+    ErrorObject::owned(code, msg.into(), None::<()>)
+}
+
+/// How long a submission holds while the node finishes proving the template its
+/// nonce was found against.
+///
+/// Long enough to cover a proof already in flight, short enough that a client
+/// gets an answer rather than a hung socket.
+const EXTERNAL_MINING_PREVIEW_WAIT: Duration = Duration::from_secs(30);
 
 fn mined_record_is_canonical(
     recorded_block_hash: Option<[u8; 32]>,
@@ -1469,6 +1603,12 @@ impl RpcHandler {
         // nonce during the proof instead of waiting for it.
         let preview_parent_height = tmpl.parent.height;
         let preview_parent_id = block_id(&tmpl.parent);
+        // One sequence for this job. The preview and the ready template it
+        // becomes describe the SAME work, so they must carry the same number —
+        // a pool that saw the sequence change would re-publish an identical job
+        // to every miner for nothing.
+        let template_seq = next_template_seq();
+        let preview_published_at = Instant::now();
         let early_template = BlockTemplateResponse {
             template_id: hex::encode(preparation.template_id()),
             pow_fields_hex: pow_fields_hex.clone(),
@@ -1481,8 +1621,19 @@ impl RpcHandler {
             tx_output_counts: tx_output_counts.clone(),
             coinbase_value_micro_jtm,
             claimable_fees_micro_jtm,
+            template_seq,
+            parent_id: hex::encode(preview_parent_id),
+            miner_address: addr.to_bech32(),
+            timestamp: pow_header.timestamp,
+            state: "preview".to_string(),
+            // Freshly published, so the whole window is genuinely left. Every
+            // later re-serving recomputes this from the publication instant.
+            ttl_remaining_ms: EXTERNAL_MINING_TEMPLATE_TTL.as_millis() as u64,
+            difficulty: difficulty_from_target(&diff_target),
         };
         publish_pow_preview(&early_template, preview_parent_height, preview_parent_id);
+        // From here every early return must take the preview back down with it.
+        let mut preview_guard = PreviewGuard::new();
         if let Ok(mut slot) = early.lock() {
             if let Some(sender) = slot.take() {
                 let _ = sender.send(Ok(early_template));
@@ -1568,6 +1719,9 @@ impl RpcHandler {
         preparation
             .install_ready(prepared, parent_height, parent_id, Instant::now())
             .map_err(|error| rpc_err(format!("install external mining attempt: {error}")))?;
+        // The template is submittable now, so the published preview describes
+        // real, usable work. Everything before this point was a failure path.
+        preview_guard.disarm();
         Ok(BlockTemplateResponse {
             template_id: hex::encode(template_id),
             pow_fields_hex,
@@ -1580,6 +1734,19 @@ impl RpcHandler {
             tx_output_counts,
             coinbase_value_micro_jtm,
             claimable_fees_micro_jtm,
+            // Same job as the preview above, so the same sequence.
+            template_seq,
+            parent_id: hex::encode(parent_id),
+            miner_address: addr.to_bech32(),
+            timestamp: pow_header.timestamp,
+            state: "ready".to_string(),
+            // Measured from publication, not assumed: proving took real time,
+            // and a pool told it had the full window would hand out work that
+            // dies under its miners.
+            ttl_remaining_ms: EXTERNAL_MINING_TEMPLATE_TTL
+                .saturating_sub(preview_published_at.elapsed())
+                .as_millis() as u64,
+            difficulty: difficulty_from_target(&diff_target),
         })
     }
 
@@ -2616,6 +2783,44 @@ impl JetsamApiServer for RpcHandler {
         })?
     }
 
+    async fn wait_block_template(
+        &self,
+        miner_address: String,
+        known_seq: u64,
+        timeout_s: u64,
+    ) -> RpcResult<BlockTemplateResponse> {
+        if !self.mining_api_enabled {
+            return Err(rpc_err(
+                "external mining API is disabled; start this node with --mode extminer",
+            ));
+        }
+        // Bound the hold: an unbounded wait would pin a connection for as long
+        // as the chain is quiet, and no HTTP client tolerates that.
+        let deadline = Instant::now() + Duration::from_secs(timeout_s.clamp(1, 120));
+
+        loop {
+            // Ask the ordinary path. It serves a live preview when one exists
+            // and prepares a template when none does, so a caller that arrives
+            // on an idle node is not left waiting for work nobody asked for.
+            let current = self.get_block_template(miner_address.clone()).await?;
+            if current.template_seq != known_seq {
+                return Ok(current);
+            }
+            if Instant::now() >= deadline {
+                // Same work as the caller already has. Say so by returning it:
+                // an error here would make a quiet chain look like a fault.
+                return Ok(current);
+            }
+            // Poll rather than subscribe. A watch channel would have to be
+            // threaded through preview publication, proof installation, tip
+            // invalidation and expiry — four call sites, each a chance to miss
+            // a wake-up and hang the caller for the whole timeout. Half a
+            // second of latency on a 90-second block costs nothing, and the
+            // check is a mutex and a clone, never a chain read.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Consume one node-owned template and submit its canonical LE nonce.
     async fn submit_block(&self, template_id: String, nonce_hex: String) -> RpcResult<String> {
         let nonce_submitted_at = Instant::now();
@@ -2645,18 +2850,56 @@ impl JetsamApiServer for RpcHandler {
             .external_mining_attempts
             .pow_header_for(template_id, nonce)
         {
-            validate_pow(&header).map_err(|error| rpc_err(format!("proof of work: {error}")))?;
+            validate_pow(&header)
+                .map_err(|error| mining_err(ERR_INVALID_POW, format!("proof of work: {error}")))?;
+        } else if let Some((fields, target)) =
+            pow_preview_work_for(&hex::encode(template_id))
+        {
+            // The slot is still proving, so there is no prepared header to
+            // check against — but the PoW input was published before the proof
+            // started, which is the whole point of the overlap. A nonce found
+            // against it is finished work; losing it because the node had not
+            // caught up would throw away a block the miner genuinely won.
+            let mut patched = fields;
+            patched[POW_NONCE_FIELD_INDEX] = jetsam_core::Block128::from(nonce);
+            let digest = poseidon_pow_digest_from_fields(&patched);
+            if !jetsam_chain::consensus::difficulty::le256_lt(&digest, &target) {
+                // Rejected in microseconds, and the slot is untouched: junk
+                // nonces still cannot cost anyone their template.
+                return Err(mining_err(
+                    ERR_INVALID_POW,
+                    "proof of work: digest is not below the target",
+                ));
+            }
+            // Genuine. Wait for the proof to land, bounded — a client that
+            // hangs forever is worse than one told to retry.
+            let deadline = Instant::now() + EXTERNAL_MINING_PREVIEW_WAIT;
+            while self
+                .external_mining_attempts
+                .pow_header_for(template_id, nonce)
+                .is_none()
+            {
+                if Instant::now() >= deadline {
+                    return Err(mining_err(
+                        ERR_TEMPLATE_UNKNOWN,
+                        "external mining template was still being prepared; retry",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
         let proving = self
             .external_mining_attempts
             .begin_proving(template_id, Instant::now(), tip_height, tip_id)
             .map_err(|error| match error {
-                ExternalMiningConsumeError::Unavailable => {
-                    rpc_err("external mining template is unknown, expired, consumed, or busy")
-                }
-                ExternalMiningConsumeError::Stale => {
-                    rpc_err("stale external mining template parent")
-                }
+                ExternalMiningConsumeError::Unavailable => mining_err(
+                    ERR_TEMPLATE_CONSUMED,
+                    "external mining template is unknown, expired, consumed, or busy",
+                ),
+                ExternalMiningConsumeError::Stale => mining_err(
+                    ERR_TEMPLATE_STALE,
+                    "stale external mining template parent",
+                ),
             })?;
         let handler = self.clone();
         // Keep the Proving marker in an owned task. If the RPC client
@@ -3466,6 +3709,13 @@ mod tests {
             tx_output_counts: vec![2, 1],
             coinbase_value_micro_jtm: 50,
             claimable_fees_micro_jtm: 9,
+            template_seq: 12,
+            parent_id: "aa".repeat(32),
+            miner_address: "j1example".into(),
+            timestamp: 1_700_000_000,
+            state: "ready".into(),
+            ttl_remaining_ms: 118_500,
+            difficulty: "4096".into(),
         };
 
         let json = serde_json::to_value(response).expect("serialize template response");
@@ -3473,7 +3723,16 @@ mod tests {
         assert_eq!(json["template_id"], "00112233445566778899aabbccddeeff");
         assert_eq!(json["nonce_field_index"], POW_NONCE_FIELD_INDEX);
         assert_eq!(json["expires_in_seconds"], 120);
-        assert_eq!(json.as_object().unwrap().len(), 11);
+        // The template now describes itself, so a pool can answer "same work?"
+        // and "how long have I got?" without guessing.
+        assert_eq!(json["template_seq"], 12);
+        assert_eq!(json["state"], "ready");
+        assert_eq!(json["ttl_remaining_ms"], 118_500);
+        assert_eq!(json["miner_address"], "j1example");
+        assert_eq!(json["difficulty"], "4096");
+        // The count is pinned on purpose: a field added without thinking about
+        // the miners already parsing this shape shows up right here.
+        assert_eq!(json.as_object().unwrap().len(), 18);
     }
 
     #[test]
@@ -3816,5 +4075,188 @@ mod access_control_tests {
             .await
             .unwrap();
         assert_eq!(authorized.status(), http::StatusCode::OK);
+    }
+
+    // --- P0: what a pool needs the template to say about itself -------------
+
+    #[test]
+    fn difficulty_is_the_work_the_chain_accounts_for() {
+        // The displayed difficulty must be the same number the chain uses for
+        // cumulative work, or a dashboard and the consensus disagree about how
+        // hard a block was. Anchor on the one value we can compute both ways.
+        let target = jetsam_chain::consensus::params::GENESIS_TARGET;
+        let work = jetsam_chain::consensus::difficulty::block_work(&target);
+        assert_eq!(difficulty_from_target(&target), decimal_from_le_u256(&work));
+    }
+
+    #[test]
+    fn decimal_rendering_handles_zero_one_and_the_full_width() {
+        let mut zero = [0u8; 32];
+        assert_eq!(decimal_from_le_u256(&zero), "0");
+        zero[0] = 1;
+        assert_eq!(decimal_from_le_u256(&zero), "1");
+        // 2^256 - 1, the widest value block_work can saturate to. Getting the
+        // carry wrong shows up here and nowhere else.
+        assert_eq!(
+            decimal_from_le_u256(&[0xFFu8; 32]),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        // A byte in the high limb: catches a big/little-endian slip, which
+        // would otherwise be off by a factor of 2^248 and still look plausible.
+        let mut high = [0u8; 32];
+        high[31] = 1;
+        assert_eq!(
+            decimal_from_le_u256(&high),
+            "452312848583266388373324160190187140051835877600158453279131187530910662656"
+        );
+    }
+
+    #[test]
+    fn a_re_served_preview_reports_the_lifetime_it_actually_has_left() {
+        // The stored response is built once, at publication. Serving it later
+        // used to repeat the full window, so a pool handed its miners work it
+        // believed had 120 s left and watched it expire early.
+        let published = BlockTemplateResponse {
+            template_id: "aa".repeat(16),
+            pow_fields_hex: "00".repeat(256),
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
+            difficulty_target_hex: "ff".repeat(32),
+            height: 7,
+            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            n_txs: 1,
+            tx_input_counts: vec![],
+            tx_output_counts: vec![],
+            coinbase_value_micro_jtm: 0,
+            claimable_fees_micro_jtm: 0,
+            template_seq: 42,
+            parent_id: "bb".repeat(32),
+            miner_address: String::new(),
+            timestamp: 0,
+            state: "preview".to_string(),
+            ttl_remaining_ms: EXTERNAL_MINING_TEMPLATE_TTL.as_millis() as u64,
+            difficulty: "1".to_string(),
+        };
+        let parent_id = [0xbbu8; 32];
+        publish_pow_preview(&published, 7, parent_id);
+
+        // Backdate the publication instead of sleeping: the property under test
+        // is "the lifetime is recomputed", not "time passes".
+        if let Ok(mut guard) = POW_PREVIEW.lock() {
+            if let Some(preview) = guard.as_mut() {
+                preview.published_at = Instant::now() - Duration::from_secs(40);
+            }
+        }
+
+        let served = take_pow_preview(7, parent_id).expect("still inside its window");
+        assert_eq!(served.template_seq, 42, "same work, same sequence");
+        let left = Duration::from_millis(served.ttl_remaining_ms);
+        assert!(
+            left <= EXTERNAL_MINING_TEMPLATE_TTL - Duration::from_secs(39)
+                && left >= EXTERNAL_MINING_TEMPLATE_TTL - Duration::from_secs(41),
+            "expected about 80 s left, got {left:?}"
+        );
+        assert_eq!(
+            served.expires_in_seconds,
+            EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            "the old constant stays for compatibility"
+        );
+        clear_pow_preview();
+    }
+
+    #[test]
+    fn a_failed_preparation_takes_its_preview_down_with_it() {
+        // Publishing happens before the proof exists. When preparation then
+        // fails, the preview used to stay on offer for its whole window with an
+        // id that could never be submitted — every miner working for nothing.
+        let published = BlockTemplateResponse {
+            template_id: "cc".repeat(16),
+            pow_fields_hex: "00".repeat(256),
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
+            difficulty_target_hex: "ff".repeat(32),
+            height: 9,
+            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            n_txs: 1,
+            tx_input_counts: vec![],
+            tx_output_counts: vec![],
+            coinbase_value_micro_jtm: 0,
+            claimable_fees_micro_jtm: 0,
+            template_seq: 1,
+            parent_id: "dd".repeat(32),
+            miner_address: String::new(),
+            timestamp: 0,
+            state: "preview".to_string(),
+            ttl_remaining_ms: 0,
+            difficulty: "1".to_string(),
+        };
+        let parent_id = [0xddu8; 32];
+
+        publish_pow_preview(&published, 9, parent_id);
+        {
+            let _guard = PreviewGuard::new(); // never disarmed: preparation failed
+        }
+        assert!(
+            take_pow_preview(9, parent_id).is_none(),
+            "a preview whose template never became ready must not stay on offer"
+        );
+
+        publish_pow_preview(&published, 9, parent_id);
+        {
+            let mut guard = PreviewGuard::new();
+            guard.disarm(); // install_ready succeeded
+        }
+        assert!(
+            take_pow_preview(9, parent_id).is_some(),
+            "a preview backed by a ready template must survive"
+        );
+        clear_pow_preview();
+    }
+
+    #[test]
+    fn preview_work_is_returned_only_for_the_template_that_published_it() {
+        // submit_block judges a nonce against this. Handing back another
+        // template's fields would validate a nonce against the wrong work.
+        let fields_hex = (0..16)
+            .map(|i| format!("{:02x}", i).repeat(16))
+            .collect::<String>();
+        let published = BlockTemplateResponse {
+            template_id: "ee".repeat(16),
+            pow_fields_hex: fields_hex,
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
+            difficulty_target_hex: "ab".repeat(32),
+            height: 11,
+            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            n_txs: 1,
+            tx_input_counts: vec![],
+            tx_output_counts: vec![],
+            coinbase_value_micro_jtm: 0,
+            claimable_fees_micro_jtm: 0,
+            template_seq: 3,
+            parent_id: String::new(),
+            miner_address: String::new(),
+            timestamp: 0,
+            state: "preview".to_string(),
+            ttl_remaining_ms: 0,
+            difficulty: "1".to_string(),
+        };
+        publish_pow_preview(&published, 11, [0u8; 32]);
+
+        assert!(
+            pow_preview_work_for(&"ff".repeat(16)).is_none(),
+            "another template's id must not be served this work"
+        );
+        let (fields, target) =
+            pow_preview_work_for(&"ee".repeat(16)).expect("its own id resolves");
+        assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
+        assert_eq!(target, [0xabu8; 32]);
+        clear_pow_preview();
+    }
+
+    #[test]
+    fn template_sequences_never_repeat() {
+        // Two responses carrying one sequence must describe one job; a repeat
+        // would make a pool skip work it has not published.
+        let first = next_template_seq();
+        let second = next_template_seq();
+        assert!(second > first, "the sequence must strictly increase");
     }
 }

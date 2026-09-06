@@ -98,6 +98,42 @@ pub struct BlockTemplateResponse {
     pub coinbase_value_micro_jtm: u64,
     /// Sum of user fees claimable by the miner after burned state-growth fees.
     pub claimable_fees_micro_jtm: u64,
+
+    // --- Template self-description -----------------------------------------
+    //
+    // Everything below lets a pool answer "is this the same work I already
+    // handed out, and how long have I got?" without guessing. All fields carry
+    // `serde(default)`, so a client built against an earlier node keeps
+    // deserializing these responses unchanged.
+    /// Strictly increasing per node process. Two responses carrying the same
+    /// sequence describe the same work; a pool compares this instead of
+    /// diffing `pow_fields_hex`.
+    #[serde(default)]
+    pub template_seq: u64,
+    /// Block id of the parent, hex. A pool detects "the tip moved" from this
+    /// alone, without decoding fields 1 and 2.
+    #[serde(default)]
+    pub parent_id: String,
+    /// The bech32m address actually sealed into the coinbase. A pool checks
+    /// this is its own before handing the job to anyone.
+    #[serde(default)]
+    pub miner_address: String,
+    /// Header timestamp. Two templates on one parent differ by it.
+    #[serde(default)]
+    pub timestamp: u64,
+    /// `"preview"` while the proof is still being built (a submission waits),
+    /// `"ready"` when a submission can be served immediately.
+    #[serde(default)]
+    pub state: String,
+    /// Lifetime left, measured when this response was built.
+    ///
+    /// `expires_in_seconds` is a constant and always reports the full TTL, so a
+    /// pool re-served a preview 40 s old believed it had the whole window.
+    #[serde(default)]
+    pub ttl_remaining_ms: u64,
+    /// `ceil(2^256 / target)` in decimal — the difficulty a dashboard shows.
+    #[serde(default)]
+    pub difficulty: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +359,49 @@ pub const WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE: &str = "InputLimitExceeded";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletInputLimitExceeded {
     pub max_inputs: usize,
+}
+
+// --- Mining error codes ----------------------------------------------------
+//
+// A pool has to act on a rejection, not read it. "template unavailable" told a
+// caller nothing about whether to retry the same nonce, fetch a new template,
+// or stop mining altogether — so `jetsampool.py` matched on message text, which
+// breaks the day a sentence is reworded. These codes are the contract instead.
+//
+// -32011 is already taken by WalletInputLimitExceeded, hence the -3202x block.
+
+/// The template id was never issued by this node, or has been purged.
+pub const ERR_TEMPLATE_UNKNOWN: i32 = -32020;
+/// The template existed and its lifetime ran out. Fetch a new one.
+pub const ERR_TEMPLATE_EXPIRED: i32 = -32021;
+/// Another submission already claimed this template. The race was lost; the
+/// nonce is not wrong.
+pub const ERR_TEMPLATE_CONSUMED: i32 = -32022;
+/// The template's parent is no longer the tip. The work is stale, not invalid.
+pub const ERR_TEMPLATE_STALE: i32 = -32024;
+/// The digest is not below the target. This one is the miner's fault.
+pub const ERR_INVALID_POW: i32 = -32025;
+/// The nonce could not be decoded (length or encoding).
+pub const ERR_INVALID_NONCE: i32 = -32026;
+/// The node will not hand out work yet. `data.reason` says why, so an operator
+/// can tell "still syncing" from "no peers" without reading logs.
+pub const ERR_MINING_NOT_READY: i32 = -32027;
+
+/// Error data attached to every mining rejection.
+///
+/// The tip is included on purpose: a pool that gets `TemplateStale` needs to
+/// know what the tip became, and asking again costs another round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiningErrorData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_seq: Option<u64>,
+    pub tip_height: u64,
+    pub tip_id: String,
+    /// Only set for [`ERR_MINING_NOT_READY`]: "sync" | "no_peer" | "better_header".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One successfully admitted ordinary payment transaction.

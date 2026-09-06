@@ -21,6 +21,19 @@ use libp2p::{multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
 // group preserve provider/NAT usability without letting one cheap prefix fill
 // a 64-connection outbound budget.
 const MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP: usize = 2;
+// A relayed address carries the RELAY's IP, not the peer's: two peers reached
+// through one relay may sit on opposite sides of the planet. Counting them in
+// the relay's /16 capped a node at two relayed peers — every further circuit
+// was opened, closed within the same second, dropped from Kademlia,
+// rediscovered and dialled again. Measured on five rented machines (Nevada,
+// Poland, Quebec, South Korea, Vietnam) on 2026-09-06: up to 42 of 49
+// established circuits closed this way, and DCUtR never completed a punch.
+//
+// Relayed peers still deserve a bound, but on the axis they actually share:
+// the carrier. Losing one relay drops every peer behind it, so this caps how
+// much of the neighbourhood depends on a single one.
+const MAX_OUTBOUND_PEERS_PER_RELAY: usize = 16;
+const MAX_INBOUND_PEERS_PER_RELAY: usize = 32;
 // Shared VPN exits, carrier-grade NAT and enterprise gateways routinely place
 // many unrelated wallets behind one public address. Permit a useful cohort,
 // while retaining a hard per-address bound against one-source exhaustion.
@@ -59,11 +72,31 @@ pub(crate) fn public_network_group(addr: &Multiaddr) -> Option<PublicNetworkGrou
     public_ip(addr).map(PublicNetworkGroup::from_ip)
 }
 
+/// The relay carrying this address, when it is a circuit.
+///
+/// A circuit reads `/ip4/<relay>/tcp/<port>/p2p/<relay-id>/p2p-circuit/p2p/<dest>`:
+/// the identity immediately before the `p2p-circuit` marker is the carrier, and
+/// everything after it belongs to the destination. Returning `None` for a direct
+/// address is what keeps the ordinary IP budget in charge of ordinary dials.
+pub(crate) fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
+    let mut previous = None;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::P2pCircuit => return previous,
+            Protocol::P2p(peer) => previous = Some(peer),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DiversityRejection {
     OutboundGroupFull { group: PublicNetworkGroup },
+    OutboundRelayFull { relay: PeerId },
     InboundIpFull { ip: IpAddr },
     InboundGroupFull { group: PublicNetworkGroup },
+    InboundRelayFull { relay: PeerId },
     InboundDiversityReserve { group: PublicNetworkGroup },
     InboundUnclassifiedReserve,
 }
@@ -80,6 +113,10 @@ struct TrackedConnection {
     ip: IpAddr,
     group: PublicNetworkGroup,
     direction: TrackedDirection,
+    /// Set when the session rides a circuit. The group is still recorded, so
+    /// `failure_domain` keeps treating everyone behind one relay as sharing a
+    /// fate — which they do — while admission is budgeted per carrier.
+    relay: Option<PeerId>,
 }
 
 /// Tracks admitted public connections so limits are released exactly when the
@@ -93,6 +130,9 @@ pub(crate) struct PeerDiversity {
     outbound_groups: HashMap<PublicNetworkGroup, HashMap<PeerId, usize>>,
     inbound_ips: HashMap<IpAddr, HashMap<PeerId, usize>>,
     inbound_groups: HashMap<PublicNetworkGroup, HashMap<PeerId, usize>>,
+    // Circuits are budgeted by carrier, not by the carrier's IP prefix.
+    outbound_relays: HashMap<PeerId, HashMap<PeerId, usize>>,
+    inbound_relays: HashMap<PeerId, HashMap<PeerId, usize>>,
     unclassified_inbound: HashSet<ConnectionId>,
 }
 
@@ -156,6 +196,47 @@ impl PeerDiversity {
             return Ok(());
         };
         let group = PublicNetworkGroup::from_ip(ip);
+        let relay = circuit_relay(remote_addr);
+
+        if let Some(relay) = relay {
+            // The IP in this address belongs to the carrier. Budget by carrier.
+            if outbound {
+                if distinct_peer_count(&self.outbound_relays, &relay, peer)
+                    >= MAX_OUTBOUND_PEERS_PER_RELAY
+                {
+                    return Err(DiversityRejection::OutboundRelayFull { relay });
+                }
+                increment_peer_count(&mut self.outbound_relays, relay, peer);
+            } else {
+                if distinct_peer_count(&self.inbound_relays, &relay, peer)
+                    >= MAX_INBOUND_PEERS_PER_RELAY
+                {
+                    return Err(DiversityRejection::InboundRelayFull { relay });
+                }
+                // A relayed inbound session still occupies a swarm slot, so it
+                // consumes the unreserved pool like any other.
+                if self.inbound_connection_count() >= INBOUND_UNRESERVED_PEERS {
+                    return Err(DiversityRejection::InboundUnclassifiedReserve);
+                }
+                increment_peer_count(&mut self.inbound_relays, relay, peer);
+            }
+            let previous = self.connections.insert(
+                connection_id,
+                Some(TrackedConnection {
+                    peer,
+                    ip,
+                    group,
+                    direction: if outbound {
+                        TrackedDirection::Outbound
+                    } else {
+                        TrackedDirection::Inbound
+                    },
+                    relay: Some(relay),
+                }),
+            );
+            debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
+            return Ok(());
+        }
 
         if outbound {
             if distinct_peer_count(&self.outbound_groups, &group, peer)
@@ -194,6 +275,7 @@ impl PeerDiversity {
                 ip,
                 group,
                 direction,
+                relay: None,
             }),
         );
         debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
@@ -208,11 +290,19 @@ impl PeerDiversity {
         let Some(connection) = connection else {
             return true;
         };
-        match connection.direction {
-            TrackedDirection::Outbound => {
+        // Release from the same budget that admitted it, or the counters drift
+        // and the node slowly stops accepting anyone.
+        match (connection.relay, connection.direction) {
+            (Some(relay), TrackedDirection::Outbound) => {
+                decrement_peer_count(&mut self.outbound_relays, relay, connection.peer);
+            }
+            (Some(relay), TrackedDirection::Inbound) => {
+                decrement_peer_count(&mut self.inbound_relays, relay, connection.peer);
+            }
+            (None, TrackedDirection::Outbound) => {
                 decrement_peer_count(&mut self.outbound_groups, connection.group, connection.peer);
             }
-            TrackedDirection::Inbound => {
+            (None, TrackedDirection::Inbound) => {
                 decrement_peer_count(&mut self.inbound_ips, connection.ip, connection.peer);
                 decrement_peer_count(&mut self.inbound_groups, connection.group, connection.peer);
             }
@@ -226,6 +316,13 @@ impl PeerDiversity {
         remote_addr: &Multiaddr,
         pending_same_group: usize,
     ) -> bool {
+        // A circuit must be judged against the carrier budget here too, or the
+        // node refuses to place the dial that admission would have accepted.
+        if let Some(relay) = circuit_relay(remote_addr) {
+            return distinct_peer_count(&self.outbound_relays, &relay, peer)
+                .saturating_add(pending_same_group)
+                < MAX_OUTBOUND_PEERS_PER_RELAY;
+        }
         let Some(group) = public_network_group(remote_addr) else {
             return false;
         };
@@ -253,12 +350,24 @@ impl PeerDiversity {
             return Ok(());
         };
         let group = PublicNetworkGroup::from_ip(ip);
-        if distinct_peer_count(&self.outbound_groups, &group, peer)
-            >= MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP
-        {
-            return Err(DiversityRejection::OutboundGroupFull { group });
+        // Identify can reveal a circuit here too; budget it by carrier like
+        // every other relayed session rather than by the carrier's prefix.
+        let relay = circuit_relay(remote_addr);
+        if let Some(relay) = relay {
+            if distinct_peer_count(&self.outbound_relays, &relay, peer)
+                >= MAX_OUTBOUND_PEERS_PER_RELAY
+            {
+                return Err(DiversityRejection::OutboundRelayFull { relay });
+            }
+            increment_peer_count(&mut self.outbound_relays, relay, peer);
+        } else {
+            if distinct_peer_count(&self.outbound_groups, &group, peer)
+                >= MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP
+            {
+                return Err(DiversityRejection::OutboundGroupFull { group });
+            }
+            increment_peer_count(&mut self.outbound_groups, group, peer);
         }
-        increment_peer_count(&mut self.outbound_groups, group, peer);
         self.connections.insert(
             connection_id,
             Some(TrackedConnection {
@@ -266,6 +375,7 @@ impl PeerDiversity {
                 ip,
                 group,
                 direction: TrackedDirection::Outbound,
+                relay,
             }),
         );
         Ok(())
@@ -660,5 +770,138 @@ mod tests {
             diversity.classify_outbound_dns_connection(id3, third, &addr("/ip4/8.8.3.3/tcp/9500"),),
             Err(DiversityRejection::OutboundGroupFull { .. })
         ));
+    }
+
+    /// One relay carries peers that share nothing but their carrier. Budgeting
+    /// them in the relay's /16 capped the node at two, and every further
+    /// circuit was admitted then closed within the same second.
+    #[test]
+    fn peers_behind_one_relay_are_not_capped_at_two_by_the_relay_prefix() {
+        let mut diversity = PeerDiversity::default();
+        let relay = PeerId::random();
+        let base = format!("/ip4/82.66.133.163/tcp/9700/p2p/{relay}/p2p-circuit/p2p/");
+
+        // Well past MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP, which used to reject
+        // the third peer outright.
+        for index in 0..MAX_OUTBOUND_PEERS_PER_RELAY {
+            let peer = PeerId::random();
+            diversity
+                .try_admit(
+                    ConnectionId::new_unchecked(index + 1),
+                    peer,
+                    &addr(&format!("{base}{peer}")),
+                    true,
+                )
+                .expect("a circuit is budgeted by its carrier, not by the carrier's prefix");
+        }
+
+        // The carrier bound still exists: losing one relay must not be able to
+        // cost us the whole neighbourhood.
+        let extra = PeerId::random();
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(9_000),
+                extra,
+                &addr(&format!("{base}{extra}")),
+                true,
+            ),
+            Err(DiversityRejection::OutboundRelayFull { .. })
+        ));
+    }
+
+    /// Direct dials must keep the tight prefix budget: the relaxation is for
+    /// circuits alone, where the address names a carrier and not a location.
+    #[test]
+    fn direct_addresses_keep_the_two_per_prefix_outbound_budget() {
+        let mut diversity = PeerDiversity::default();
+        for index in 0..MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP {
+            diversity
+                .try_admit(
+                    ConnectionId::new_unchecked(index + 1),
+                    PeerId::random(),
+                    &addr(&format!("/ip4/8.8.{index}.1/tcp/9700")),
+                    true,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(50),
+                PeerId::random(),
+                &addr("/ip4/8.8.9.9/tcp/9700"),
+                true,
+            ),
+            Err(DiversityRejection::OutboundGroupFull { .. })
+        ));
+    }
+
+    /// A closed circuit must release the slot it took, or the carrier budget
+    /// leaks and the node quietly stops dialling through that relay.
+    #[test]
+    fn closing_a_circuit_releases_its_carrier_slot() {
+        let mut diversity = PeerDiversity::default();
+        let relay = PeerId::random();
+        let peer = PeerId::random();
+        let remote = addr(&format!(
+            "/ip4/82.66.133.163/tcp/9700/p2p/{relay}/p2p-circuit/p2p/{peer}"
+        ));
+        let id = ConnectionId::new_unchecked(1);
+        diversity.try_admit(id, peer, &remote, true).unwrap();
+        // Read the map directly: `distinct_peer_count` deliberately excludes
+        // the candidate, so it answers "how many OTHERS" and would read zero
+        // here whether or not the slot was actually taken.
+        assert_eq!(
+            diversity.outbound_relays.get(&relay).map(HashMap::len),
+            Some(1),
+            "the carrier slot must be taken while the circuit is open"
+        );
+        assert!(diversity.remove(id));
+        assert_eq!(
+            diversity
+                .outbound_relays
+                .get(&relay)
+                .map_or(0, HashMap::len),
+            0,
+            "closing the circuit must give the carrier slot back"
+        );
+    }
+
+    /// The pre-dial check and admission must agree: a node that refuses to
+    /// place a dial admission would accept never opens the connection at all.
+    #[test]
+    fn the_pre_dial_check_uses_the_carrier_budget_for_circuits() {
+        let mut diversity = PeerDiversity::default();
+        let relay = PeerId::random();
+        let base = format!("/ip4/82.66.133.163/tcp/9700/p2p/{relay}/p2p-circuit/p2p/");
+        for index in 0..MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP + 3 {
+            let peer = PeerId::random();
+            let remote = addr(&format!("{base}{peer}"));
+            assert!(
+                diversity.outbound_candidate_allowed_with_pending(peer, &remote, 0),
+                "the dial must be allowed while the carrier budget has room"
+            );
+            diversity
+                .try_admit(ConnectionId::new_unchecked(index + 1), peer, &remote, true)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn circuit_relay_names_the_carrier_and_ignores_direct_addresses() {
+        let relay = PeerId::random();
+        let dest = PeerId::random();
+        assert_eq!(
+            circuit_relay(&addr(&format!(
+                "/ip4/1.2.3.4/tcp/9700/p2p/{relay}/p2p-circuit/p2p/{dest}"
+            ))),
+            Some(relay),
+            "the identity before the circuit marker is the carrier"
+        );
+        assert_eq!(circuit_relay(&addr("/ip4/1.2.3.4/tcp/9700")), None);
+        assert_eq!(
+            circuit_relay(&addr(&format!("/ip4/1.2.3.4/tcp/9700/p2p/{dest}"))),
+            None,
+            "a direct address that merely names its peer is not a circuit"
+        );
     }
 }
