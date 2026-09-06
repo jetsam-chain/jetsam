@@ -93,4 +93,4 @@ development payout counts as one position.
 | Mempool transaction count | 1,024 |
 | Mempool intent-byte budget | 384 MiB |
 | Peer-store entries | 500 |
-| External template lifetime | 30 seconds |
+| External template lifetime | 120 seconds |

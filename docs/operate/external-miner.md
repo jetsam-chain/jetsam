@@ -80,7 +80,7 @@ The worker still cannot modify the proved template.
 nonce index and target. The worker searches random, independent nonce ranges
 and calls `submitBlock` with exactly 16 little-endian nonce bytes.
 
-A template expires after 30 seconds. It is also invalidated by a canonical tip
+A template expires after 120 seconds. It is also invalidated by a canonical tip
 change, successful submission or node-side cancellation. A stale result is
 normal and the worker requests another template after its poll interval.
 

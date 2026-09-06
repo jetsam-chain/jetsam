@@ -137,6 +137,7 @@ that is not on this node's canonical chain.
 | Method suffix | Positional params | Result |
 |---|---|---|
 | `getBlockTemplate` | `[miner_address: string]` | `BlockTemplateResponse` |
+| `waitBlockTemplate` | `[miner_address: string, known_seq: u64, timeout_s: u64]` | `BlockTemplateResponse` |
 | `submitBlock` | `[template_id: string, nonce_hex: string]` | Accepted block ID |
 
 The node must run in external-miner mode. An empty `miner_address` uses the
@@ -144,7 +145,13 @@ node payout. A non-empty address is accepted only when the node enabled custom
 coinbase.
 
 `nonce_hex` is exactly 32 lowercase hex characters encoding 16 little-endian
-bytes. Templates are single-use and expire after 30 seconds.
+bytes. Templates are single-use and expire after 120 seconds.
+
+`waitBlockTemplate` returns as soon as `template_seq` differs from `known_seq`,
+so a pool learns about new work without polling. Pass `known_seq = 0` to be
+served immediately. `timeout_s` is clamped to the range 1…120; returning the
+same sequence after the timeout means "nothing changed", and the caller simply
+loops.
 
 ## Node control
 
@@ -683,11 +690,40 @@ BlockTemplateResponse {
   tx_output_counts?: usize[]
   coinbase_value_micro_jtm: u64
   claimable_fees_micro_jtm: u64
+
+  template_seq: u64
+  parent_id: string
+  miner_address: string
+  timestamp: u64
+  state: string
+  ttl_remaining_ms: u64
+  difficulty: string
 }
 ```
 
 `pow_fields_hex` contains 16 consecutive 16-byte little-endian fields. The
-worker replaces field `nonce_field_index`, canonically 10.
+worker replaces the field at `nonce_field_index` — read that index from the
+response rather than hardcoding it. On this chain it is **0**.
+
+The seven fields below the blank line let a pool answer "is this the same work
+I already handed out, and how long have I got?" without diffing hex. They carry
+`serde(default)`, so a client written against an earlier node keeps
+deserializing these responses unchanged.
+
+| Field | Meaning |
+|---|---|
+| `template_seq` | Strictly increasing per node process. Two responses with the same sequence describe the same work. |
+| `parent_id` | Block id of the parent. Detects "the tip moved" without decoding fields 1 and 2. |
+| `miner_address` | The bech32m address actually sealed into the coinbase. Check it is yours before handing the job out. |
+| `timestamp` | Header timestamp. Two templates on one parent differ by it. |
+| `state` | `"preview"` while the proof is still being built, `"ready"` when a submission is served immediately. |
+| `ttl_remaining_ms` | Lifetime left, measured when this response was built. |
+| `difficulty` | `ceil(2^256 / target)` in decimal — the number a dashboard shows. |
+
+`expires_in_seconds` is a constant and always reports the full TTL. A pool
+re-serving a template that is already 40 seconds old must read
+`ttl_remaining_ms`, not `expires_in_seconds`, or it hands out work that dies
+before its miners finish it.
 
 ## Errors
 
@@ -716,6 +752,42 @@ One wallet planning error has a stable machine-readable contract:
 
 This means sufficient value may exist, but no legal payment can be built inside
 the canonical input bound.
+
+### Mining errors
+
+Every external-mining rejection carries a stable code, so a pool can branch on
+the failure instead of matching on prose:
+
+| Code | Meaning | What the caller should do |
+|---|---|---|
+| `-32020` | Template unknown or purged | Fetch a new template |
+| `-32021` | Template expired | Fetch a new template |
+| `-32022` | Already claimed by another submission | Drop the share, keep mining |
+| `-32024` | The parent is no longer the tip | Fetch a new template |
+| `-32025` | The digest is not below the target | The nonce is wrong; check your implementation |
+| `-32026` | The nonce could not be decoded | Send 32 lowercase hex characters |
+| `-32027` | The node will not hand out work yet | Read `data.reason`, wait, retry |
+
+Every one of them attaches the same data object:
+
+```text
+MiningErrorData {
+  template_id?: string
+  tip_height: u64
+  tip_id: string
+  reason?: string
+}
+```
+
+`tip_height` and `tip_id` are included because a caller that just lost a race
+needs to know what the tip became, and asking again costs another round trip.
+`reason` is set only for `-32027` and is one of `"sync"`, `"no_peer"` or
+`"better_header"`, so an operator can tell "still syncing" from "no peers"
+without reading logs.
+
+A wrong nonce is rejected in microseconds and never touches anyone else's
+template. A correct nonce submitted while the node is still proving is held,
+not refused: a won block is not thrown away because of timing.
 
 Clients should:
 

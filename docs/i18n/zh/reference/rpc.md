@@ -130,13 +130,19 @@ HTTP `401`，没有 JSON-RPC 结果。Token 只负责认证，不加密连接；
 | 方法后缀 | 位置参数 | 结果 |
 |---|---|---|
 | `getBlockTemplate` | `[miner_address: string]` | `BlockTemplateResponse` |
+| `waitBlockTemplate` | `[miner_address: string, known_seq: u64, timeout_s: u64]` | `BlockTemplateResponse` |
 | `submitBlock` | `[template_id: string, nonce_hex: string]` | 已接受区块 ID |
 
 节点必须运行在外部矿工模式。`miner_address` 为空时使用节点奖励地址；
 非空地址只有在节点启用 custom coinbase 后才会接受。
 
 `nonce_hex` 必须恰好是 32 个小写 hex 字符，编码 16 个 little-endian
-字节。模板一次性使用，30 秒后过期。
+字节。模板一次性使用，120 秒后过期。
+
+`waitBlockTemplate` 在 `template_seq` 与 `known_seq` 不同时立即返回，
+矿池无需轮询即可获知新任务。传入 `known_seq = 0` 可立即得到响应。
+`timeout_s` 被限制在 1…120 之间；超时后返回相同的序号表示「没有变化」，
+调用方直接重新循环即可。
 
 ## 节点控制
 
@@ -666,11 +672,38 @@ BlockTemplateResponse {
   tx_output_counts?: usize[]
   coinbase_value_micro_jtm: u64
   claimable_fees_micro_jtm: u64
+
+  template_seq: u64
+  parent_id: string
+  miner_address: string
+  timestamp: u64
+  state: string
+  ttl_remaining_ms: u64
+  difficulty: string
 }
 ```
 
 `pow_fields_hex` 包含 16 个连续的 16 字节小端字段。外部挖矿进程替换
-`nonce_field_index` 指向的字段，规范值为 10。
+`nonce_field_index` 指向的字段——请从响应中读取该索引，不要硬编码。
+在本链上它的值为 **0**。
+
+空行之后的七个字段让矿池无需比对 hex 即可回答「这是不是我已经派发过的任务，
+我还剩多少时间？」。它们都带有 `serde(default)`，因此针对旧节点编写的客户端
+仍能原样解析这些响应。
+
+| 字段 | 含义 |
+|---|---|
+| `template_seq` | 在单个节点进程内严格递增。序号相同的两个响应描述同一份任务。 |
+| `parent_id` | 父区块 ID。无需解码字段 1 和 2 即可发现链尖已改变。 |
+| `miner_address` | 实际写入 coinbase 的 bech32m 地址。派发任务前请确认它是你自己的。 |
+| `timestamp` | 区块头时间戳。同一父区块上的两个模板以此区分。 |
+| `state` | 证明仍在构建时为 `"preview"`，可以立即处理提交时为 `"ready"`。 |
+| `ttl_remaining_ms` | 构建此响应时测得的剩余生命周期。 |
+| `difficulty` | 十进制的 `ceil(2^256 / target)`——面板显示的那个数字。 |
+
+`expires_in_seconds` 是常量，永远报告完整的 TTL。重新派发一个已有 40 秒历史的
+模板时，矿池必须读取 `ttl_remaining_ms` 而不是 `expires_in_seconds`，否则派出的
+任务会在矿工算完之前就失效。
 
 ## 错误
 
@@ -697,6 +730,40 @@ BlockTemplateResponse {
 ```
 
 这表示余额可能足够，但在规范输入上限内无法构建合法付款。
+
+### 挖矿错误
+
+每一次外部挖矿的拒绝都带有稳定的错误代码，矿池可以据此分支，
+而不必匹配消息文字：
+
+| 代码 | 含义 | 调用方应当做什么 |
+|---|---|---|
+| `-32020` | 模板未知或已被清除 | 获取新模板 |
+| `-32021` | 模板已过期 | 获取新模板 |
+| `-32022` | 已被另一次提交占用 | 丢弃该份额，继续挖矿 |
+| `-32024` | 父区块不再是链尖 | 获取新模板 |
+| `-32025` | 摘要不小于目标值 | nonce 有误；请检查你的实现 |
+| `-32026` | nonce 无法解码 | 发送 32 个小写 hex 字符 |
+| `-32027` | 节点尚不派发任务 | 读取 `data.reason`，等待后重试 |
+
+它们都附带同一个数据对象：
+
+```text
+MiningErrorData {
+  template_id?: string
+  tip_height: u64
+  tip_id: string
+  reason?: string
+}
+```
+
+附带 `tip_height` 和 `tip_id` 是因为刚刚输掉竞争的调用方需要知道链尖变成了什么，
+而再问一次要多花一个往返。`reason` 仅在 `-32027` 时设置，取值为 `"sync"`、
+`"no_peer"` 或 `"better_header"`，运营者无需翻日志就能区分「仍在同步」
+和「没有对等节点」。
+
+错误的 nonce 会在微秒级被拒绝，且不会影响任何人的模板。在节点仍在构建证明时
+提交的正确 nonce 会被保留而不是被拒绝：不会因为时机问题而丢掉一个已挖到的区块。
 
 客户端应：
 

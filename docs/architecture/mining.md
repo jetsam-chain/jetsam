@@ -95,8 +95,10 @@ opaque, single-use template containing:
 
 It returns one little-endian 128-bit nonce. The node verifies the nonce against
 the still-live template, seals the already-proved block and invalidates the
-template. External templates expire after 30 seconds and cannot be replayed
-after a tip change or successful submission.
+template. External templates expire after 120 seconds and cannot be replayed
+after a tip change or successful submission. The lifetime must exceed one block
+interval, or a slow worker could never finish an attempt; a compile-time guard
+pins that relation.
 
 The external worker never receives authority to replace transactions, alter
 State, change fees or recompute coinbase. Custom coinbase use requires both an

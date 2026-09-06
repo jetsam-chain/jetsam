@@ -160,7 +160,7 @@ jetsam-miner \
 
 The node prepares a complete proof before returning a template. The worker
 searches its nonce and submits only the result. Templates are single-use,
-expire after 30 seconds and become stale immediately after a competing tip is
+expire after 120 seconds and become stale immediately after a competing tip is
 accepted.
 
 A remote worker should connect through an authenticated private network or a
@@ -172,6 +172,12 @@ By default, the node controls the payout. Allowing authenticated workers to
 request their own payout is an explicit operator decision. The full remote
 configuration and trust boundary are documented in
 [External miner](../operate/external-miner.md).
+
+Writing a miner or a pool from scratch, without any Jetsam mining software, is
+covered by [Stratum protocol and TowerHash specification](stratum.md). That
+document defines the proof of work down to the bit, with test vectors and a
+dependency-free reference implementation, and a Stratum-style pool protocol
+carrying it.
 
 ## CPU and proof capacity
 
