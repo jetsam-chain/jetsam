@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 jetsam_chain      = { path = "../jetsam_chain" }
+# Block128: writing a nonce into a PoW field when a submission must be judged
+# against a template whose proof is still in flight.
+jetsam_core       = { path = "../jetsam_core" }
 jetsam_tx         = { path = "../jetsam_tx" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
 jetsam_mempool    = { path = "../jetsam_mempool" }

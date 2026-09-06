@@ -199,6 +199,25 @@ pub trait JetsamApi {
     #[method(name = "getBlockTemplate")]
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse>;
 
+    /// Return the current template as soon as its sequence differs from
+    /// `known_seq`, or after `timeout_s` seconds, whichever comes first.
+    ///
+    /// A pool must publish new work the instant a block lands. Polling
+    /// `getBlockTemplate` in a loop either burns a request a second or reacts
+    /// late — our own pool ended up tailing the node's log file instead. One
+    /// call that blocks until there is genuinely something new replaces both.
+    ///
+    /// Pass `known_seq = 0` to be served immediately. `timeout_s` is clamped to
+    /// 120. Coming back with the same sequence after the timeout is normal and
+    /// means "nothing changed"; the caller simply loops.
+    #[method(name = "waitBlockTemplate")]
+    async fn wait_block_template(
+        &self,
+        miner_address: String,
+        known_seq: u64,
+        timeout_s: u64,
+    ) -> RpcResult<BlockTemplateResponse>;
+
     /// Submit only a nonce for a single-use, node-owned prepared template.
     /// `nonce_hex` is exactly 16 little-endian bytes encoded as 32 lowercase hex chars.
     #[method(name = "submitBlock")]
