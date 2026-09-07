@@ -138,7 +138,12 @@ mod tests {
             jetsam_tx::MAX_PAGED_SPEND_INTENT_BYTES
         );
         assert_eq!(MAX_BLOCK_BYTES, 82_905);
-        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES > 580_495);
+        // Measured terminals: 971_732 bytes for the 25-page class, 1_081_108
+        // for the 255-page class. The old bound of 580_495 was left over from
+        // an earlier bank and kept passing while the larger class sat 32_532
+        // bytes above this cap — unpublishable since genesis, and unnoticed
+        // until it stopped the chain at block 3575 on 2026-09-07.
+        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES >= 971_732);
     }
 
     #[test]

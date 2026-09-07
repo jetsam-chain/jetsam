@@ -15,7 +15,7 @@ pub use acceptance::history_step::{
     decode_history_step_terminal, decode_verify_history_step_terminal,
     derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
     encode_history_step_terminal, freeze_history_step_bank, history_step_terminal_max_wire_bytes,
-    pin_history_step_class_bank, prepare_history_step_authorizations, prepare_history_step_for_pow,
+    history_step_terminal_wire_bytes, pin_history_step_class_bank, prepare_history_step_authorizations, prepare_history_step_for_pow,
     prepare_history_step_ghost_authorization, prove_built_history_step_terminal,
     prove_history_step, verify_history_step_terminal, AcceptedHistoryStepTerminal,
     AuthorizationComponentInput, BuiltHistoryStep, ExactStateStructuralFrontierInputs,

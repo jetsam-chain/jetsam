@@ -97,6 +97,7 @@ pub use runtime_parts_codec::{
 pub use wire::{
     decode_history_step_terminal, decode_verify_history_step_terminal,
     encode_history_step_terminal, history_step_terminal_max_wire_bytes,
+    history_step_terminal_wire_bytes,
 };
 
 /// Canonical authorization statement consumed by the direct block relation.

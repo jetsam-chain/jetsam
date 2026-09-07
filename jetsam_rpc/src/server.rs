@@ -2517,8 +2517,19 @@ impl JetsamApiServer for RpcHandler {
     }
 
     async fn get_peer_count(&self) -> RpcResult<usize> {
-        let count = jetsam_p2p::P2PNetwork::peer_count_via(&self.p2p_cmd).await;
-        Ok(count)
+        // An unanswerable question is an error, not a zero. Returning 0 when
+        // the P2P task cannot be reached told a wallet "you have no peers",
+        // which sends its owner looking for a firewall problem instead of a
+        // node that is still starting or already stopping. Callers that
+        // display this — the desktop app among them — already show nothing at
+        // all on an RPC error, which is the honest rendering.
+        match jetsam_p2p::P2PNetwork::peer_count_via(&self.p2p_cmd).await {
+            Some(count) => Ok(count),
+            None => Err(mining_err(
+                crate::types::ERR_MINING_NOT_READY,
+                "the P2P task did not answer; the node is starting or stopping",
+            )),
+        }
     }
 
     async fn get_node_status(&self) -> RpcResult<NodeStatus> {
@@ -3857,6 +3868,23 @@ pub async fn start_rpc_server(
                     })?
                 },
             ));
+    // External miners get their page budget from the same controller as the
+    // in-process one, so they must inherit the same ceiling. On 2026-09-07 this
+    // path handed 26-page templates to a pool for 68 minutes; every solution it
+    // returned was refused by the node that had asked for it.
+    let external_mining_page_ceiling = match history_step_runtime.as_deref() {
+        Some(runtime) => jetsam_miner::publishable_page_ceiling_from_runtime(runtime)
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?,
+        // No proof runtime means nothing can be proved here at all, so this
+        // ceiling never gates a real template. Take the most conservative tier
+        // rather than a number that would read like a measurement.
+        None => jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[0],
+    };
+    tracing::info!(
+        external_mining_page_ceiling,
+        "mining API page ceiling measured"
+    );
+
     let handler = RpcHandler {
         chain,
         mempool,
@@ -3885,7 +3913,9 @@ pub async fn start_rpc_server(
         history_step_ghost,
         external_mining_attempts,
         mining_template_changes,
-        external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::default())),
+        external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::new(
+            external_mining_page_ceiling,
+        ))),
     };
 
     // Always add the RPC access-control middleware layer. Browser-originated
