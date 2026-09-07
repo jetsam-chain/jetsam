@@ -3379,7 +3379,7 @@ impl P2PNetwork {
     /// stream protocol IDs to use for sync — use
     /// `NetworkTopics::for_network_cfg(cfg)` to get the right network.
     pub fn start(
-        listen_addr: Multiaddr,
+        listen_addrs: Vec<Multiaddr>,
         public_addresses: Vec<Multiaddr>,
         chain: Arc<RwLock<MdbxChainContext>>,
         mempool: AsyncMempool,
@@ -3402,7 +3402,7 @@ impl P2PNetwork {
         let gossip_event_tx_clone = gossip_event_tx.clone();
         let handle = tokio::spawn(async move {
             run_swarm(
-                listen_addr,
+                listen_addrs,
                 public_addresses,
                 cmd_rx,
                 gossip_event_tx_clone,
@@ -3541,19 +3541,26 @@ impl P2PNetwork {
     }
 
     /// Get peer count via an existing command channel (for RPC handler).
-    pub async fn peer_count_via(cmd: &NetworkCommandSender) -> usize {
+    /// The number of connected peers, or `None` when the P2P task could not
+    /// be asked.
+    ///
+    /// This used to answer `0` in both cases. A caller — and through it a
+    /// user — could not tell "this node is alone on the network" from "the
+    /// question never reached the swarm", and the first reading sends someone
+    /// hunting for a firewall problem that does not exist. The two are
+    /// different facts and now have different values.
+    pub async fn peer_count_via(cmd: &NetworkCommandSender) -> Option<usize> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = cmd.send(NetworkCommand::PeerCount { reply: tx }).await;
-        rx.await.unwrap_or(0)
+        if cmd.send(NetworkCommand::PeerCount { reply: tx }).await.is_err() {
+            return None;
+        }
+        rx.await.ok()
     }
 
-    pub async fn peer_count(&self) -> usize {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(NetworkCommand::PeerCount { reply: tx })
-            .await;
-        rx.await.unwrap_or(0)
+    /// See [`Self::peer_count_via`]: `None` means the P2P task did not answer,
+    /// which is not the same fact as having no peers.
+    pub async fn peer_count(&self) -> Option<usize> {
+        Self::peer_count_via(&self.cmd_tx).await
     }
 }
 
@@ -3561,8 +3568,30 @@ impl P2PNetwork {
 // Swarm event loop
 // ---------------------------------------------------------------------------
 
+/// The reason a listen address could not be bound, in words an operator can act on.
+///
+/// `TransportError::Other` renders as an empty string through `Display`, and
+/// through `Debug` as five nested wrappers around the one line that matters.
+/// Walking to the end of the source chain yields the operating system's own
+/// message — "Cannot assign requested address", "Address already in use",
+/// "Address family not supported by protocol" — which says what to change.
+fn listen_failure_reason(error: &libp2p::TransportError<std::io::Error>) -> String {
+    match error {
+        libp2p::TransportError::MultiaddrNotSupported(addr) => {
+            format!("no transport handles {addr}")
+        }
+        libp2p::TransportError::Other(io) => {
+            let mut source: &dyn std::error::Error = io;
+            while let Some(inner) = std::error::Error::source(source) {
+                source = inner;
+            }
+            source.to_string()
+        }
+    }
+}
+
 async fn run_swarm(
-    listen_addr: Multiaddr,
+    listen_addrs: Vec<Multiaddr>,
     public_addresses: Vec<Multiaddr>,
     mut cmd_rx: NetworkCommandReceiver,
     gossip_event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
@@ -3656,7 +3685,29 @@ async fn run_swarm(
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
 
-    swarm.listen_on(listen_addr)?;
+    // One failed bind must not take the node down. A host with IPv6 disabled
+    // in the kernel, or a container without a v6 stack, answers EAFNOSUPPORT
+    // for `[::]` — and a dual-stack listen list would then stop that node from
+    // starting at all, over a listener it never needed. Bind what can be
+    // bound, say what could not, and fail only when nothing is left: a node
+    // with no listener has no P2P at all, which is worth refusing loudly.
+    let mut bound = 0usize;
+    for addr in listen_addrs {
+        match swarm.listen_on(addr.clone()) {
+            Ok(_) => {
+                tracing::info!(%addr, "P2P listening");
+                bound += 1;
+            }
+            Err(error) => tracing::warn!(
+                %addr,
+                reason = %listen_failure_reason(&error),
+                "could not listen on this address; continuing with the others"
+            ),
+        }
+    }
+    if bound == 0 {
+        anyhow::bail!("no P2P listen address could be bound");
+    }
 
     // After subscribing and listening, kick off Kademlia bootstrap.
     // This triggers FIND_NODE walks starting from any peers already in the
