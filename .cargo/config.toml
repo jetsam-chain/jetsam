@@ -18,4 +18,8 @@ rustflags = [
     "--remap-path-prefix=/root/.cargo=/cargo",
     "--remap-path-prefix=/opt/elide/src=/jetsam",
     "--remap-path-prefix=/opt/jetsam-build-src=/jetsam",
+    # The Windows node is cross-built against a patched libmdbx copied out of
+    # the crate registry, and that copy's path was travelling in the binary
+    # alongside the cargo one. Remapping only /root/.cargo left it behind.
+    "--remap-path-prefix=/opt/libmdbx-0.6.6-mingw=/libmdbx",
 ]
