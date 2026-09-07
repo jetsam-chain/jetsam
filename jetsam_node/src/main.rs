@@ -1020,9 +1020,11 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
-    /// P2P listen address in HOST:PORT format. Default: 0.0.0.0:9700
-    #[arg(long, value_name = "HOST:PORT")]
-    p2p_listen: Option<String>,
+    /// P2P listen address in HOST:PORT format. Repeat for several
+    /// (for example --p2p-listen 0.0.0.0:9700 --p2p-listen [::]:9700).
+    /// Default: 0.0.0.0:9700
+    #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
+    p2p_listen: Vec<String>,
 
     /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9701
     #[arg(long, value_name = "HOST:PORT")]
@@ -1666,7 +1668,10 @@ async fn main() -> anyhow::Result<()> {
         .config
         .unwrap_or_else(|| expand_tilde(&config::default_config_path()));
     let mut config_defaults = NodeConfig::default();
-    config_defaults.network.listen = Some(format!("0.0.0.0:{}", net.default_p2p_port));
+    config_defaults.network.listen = Some(config::ListenAddresses::One(format!(
+        "0.0.0.0:{}",
+        net.default_p2p_port
+    )));
     config_defaults.rpc.listen = Some(net.default_rpc_listen());
     let (mut cfg, config_created) = load_or_create_config(&config_path, &config_defaults)?;
     if config_created {
@@ -1701,14 +1706,32 @@ async fn main() -> anyhow::Result<()> {
     }
     // Validate both listeners before artifact prewarm, database opening, or
     // wallet creation. A typo in user configuration must fail immediately.
-    let p2p_listen_str = cli.p2p_listen.unwrap_or_else(|| {
-        cfg.network
-            .listen
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| net.default_p2p_listen())
-    });
-    let listen_addr = p2p_listen_to_multiaddr(&p2p_listen_str).context("--p2p-listen")?;
+    // CLI wins over the config file, and the config file over the compiled
+    // default — as everywhere else. Each entry is parsed here so a typo fails
+    // before any database is opened, and duplicates are dropped so a listener
+    // is never bound twice.
+    let p2p_listen_strs: Vec<String> = if !cli.p2p_listen.is_empty() {
+        cli.p2p_listen.clone()
+    } else {
+        match cfg.network.listen.as_ref() {
+            Some(listen) if !listen.as_slice().is_empty() => {
+                listen.as_slice().into_iter().map(str::to_owned).collect()
+            }
+            _ => vec![net.default_p2p_listen()],
+        }
+    };
+    let mut listen_addrs: Vec<libp2p::Multiaddr> = Vec::new();
+    for entry in &p2p_listen_strs {
+        let addr = p2p_listen_to_multiaddr(entry)
+            .with_context(|| format!("--p2p-listen {entry:?}"))?;
+        if !listen_addrs.contains(&addr) {
+            listen_addrs.push(addr);
+        }
+    }
+    let listen_addr = listen_addrs
+        .first()
+        .cloned()
+        .context("no P2P listen address configured")?;
     let public_p2p_addresses = cfg
         .network
         .public_addresses
@@ -1987,7 +2010,7 @@ async fn main() -> anyhow::Result<()> {
         jetsam_p2p::BackgroundCapacity::MiningReserved
     };
     let (p2p, mut p2p_task) = P2PNetwork::start(
-        listen_addr.clone(),
+        listen_addrs.clone(),
         public_p2p_addresses,
         chain.clone(),
         mempool.clone(),
@@ -5248,14 +5271,17 @@ mod tests {
         )
         .unwrap();
         let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9700".into());
+        defaults.network.listen = Some(crate::config::ListenAddresses::One("0.0.0.0:9700".into()));
         defaults.rpc.listen = Some("127.0.0.1:9701".into());
         defaults.storage.path = directory.path().join("mainnet-data");
 
         reset_node_config(&config_path, &defaults).unwrap();
         let (loaded, created) = load_or_create_config(&config_path, &defaults).unwrap();
         assert!(!created);
-        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9700"));
+        assert_eq!(
+            loaded.network.listen.as_ref().map(crate::config::ListenAddresses::as_slice),
+            Some(vec!["0.0.0.0:9700"])
+        );
         assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9701"));
         assert_eq!(loaded.storage.path, defaults.storage.path);
     }
@@ -6080,7 +6106,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("nested/jetsam.toml");
         let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9700".into());
+        defaults.network.listen = Some(crate::config::ListenAddresses::One("0.0.0.0:9700".into()));
         defaults.rpc.listen = Some("127.0.0.1:9701".into());
 
         let (created_config, created) = load_or_create_config(&path, &defaults).unwrap();
