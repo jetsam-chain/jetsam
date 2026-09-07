@@ -1418,18 +1418,151 @@ fn remove_network_storage_entry(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Every wallet artifact shares this file-name prefix: key, metadata, history,
+/// receipts. Matched by prefix rather than by an explicit list so an artifact
+/// added later is protected the day it appears, not the day someone remembers.
+const WALLET_ARTIFACT_PREFIX: &str = "wallet.";
+const WALLET_BACKUP_PREFIX: &str = "wallet-backup-";
+/// Built under this name and renamed only once every copy has reached the disk,
+/// so a directory carrying the final name is always a complete wallet.
+const WALLET_BACKUP_INCOMPLETE_PREFIX: &str = "wallet-backup-incomplete-";
+
+/// Entries the reset must never delete, whoever wrote them.
+///
+/// Three kinds, all of them somebody's only copy of a key: our own
+/// `wallet-backup-*`, the `wallet-replaced-*` an import keeps on purpose, and
+/// the `.wallet-import-rollback-*` an import killed halfway leaves behind.
+fn is_preserved_wallet_copy(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|text| text.starts_with("wallet-") || text.starts_with(".wallet-"))
+}
+
+/// Copy the wallet aside before the one-time reset empties the directory.
+///
+/// The reset removes everything the data directory holds, and the wallet sits
+/// in there with the rest. Chain data lost that way costs a resynchronisation;
+/// the key file costs the coins, and there is no second copy anywhere. Nothing
+/// warns the owner first, and the reset runs on any invocation of the binary —
+/// including `--export-wallet-secret`, which is the command someone runs
+/// precisely to rescue that file.
+///
+/// The copy is written before the first deletion, is skipped by every later
+/// reset, and is never removed by this program.
+fn back_up_wallet_before_reset(data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let mut artifacts = Vec::new();
+    for entry in std::fs::read_dir(data_dir)
+        .with_context(|| format!("enumerate data directory {}", data_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", data_dir.display()))?;
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue };
+        if text.starts_with(WALLET_ARTIFACT_PREFIX) && entry.path().is_file() {
+            artifacts.push(entry.path());
+        }
+    }
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut final_name = format!("{WALLET_BACKUP_PREFIX}{stamp}");
+    let mut attempt = 1u32;
+    while data_dir.join(&final_name).exists() {
+        final_name = format!("{WALLET_BACKUP_PREFIX}{stamp}-{attempt}");
+        attempt = attempt.saturating_add(1);
+    }
+    // Assembled under a name that admits it is unfinished. A crash between the
+    // first copy and the last must never leave a directory that looks like a
+    // whole wallet but holds half of one.
+    let staging = data_dir.join(format!("{WALLET_BACKUP_INCOMPLETE_PREFIX}{stamp}-{attempt}"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).with_context(|| {
+            format!("clear stale wallet backup staging {}", staging.display())
+        })?;
+    }
+    std::fs::create_dir(&staging)
+        .with_context(|| format!("create wallet backup directory {}", staging.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect wallet backup {}", staging.display()))?;
+    }
+
+    for source in &artifacts {
+        let name = source
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("wallet artifact {} has no name", source.display()))?;
+        let target = staging.join(name);
+        // `fs::copy` carries the mode across on Unix, which the keystore
+        // requires: it refuses to read a key file that is not exactly 0600.
+        std::fs::copy(source, &target).with_context(|| {
+            format!(
+                "copy wallet artifact {} into {}",
+                source.display(),
+                staging.display()
+            )
+        })?;
+        // The original was written with sync_all before it was trusted
+        // (`wallet/keystore.rs`); the copy about to replace it deserves no less.
+        // Losing power here would otherwise leave an empty file where the only
+        // key used to be.
+        std::fs::File::open(&target)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("flush wallet backup {}", target.display()))?;
+    }
+    let destination = data_dir.join(&final_name);
+    std::fs::rename(&staging, &destination).with_context(|| {
+        format!(
+            "publish wallet backup {} as {}",
+            staging.display(),
+            destination.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        // Make the rename itself durable before anything is deleted.
+        let _ = std::fs::File::open(data_dir).and_then(|dir| dir.sync_all());
+    }
+    Ok(Some(destination))
+}
+
 fn prepare_network_storage_epoch(data_dir: &Path) -> anyhow::Result<bool> {
     if network_storage_epoch_is_current(data_dir)? {
         return Ok(false);
     }
 
     validate_network_storage_reset_target(data_dir)?;
+    if let Some(backup) = back_up_wallet_before_reset(data_dir)? {
+        tracing::warn!(
+            backup = %backup.display(),
+            "wallet copied aside before the one-time data reset; this copy is never deleted"
+        );
+        // Also on stderr, unconditionally. The node about to start will create
+        // a brand-new wallet, and every screen the owner then looks at shows a
+        // balance of zero with no hint that their old key still exists. A log
+        // line they never open is not a warning.
+        eprintln!(
+            "\nNOTICE: this data directory belongs to an earlier network and is being reset.\n\
+             Your previous wallet was NOT deleted. It was copied to:\n  {}\n\
+             The node will now start with a new, empty wallet. To read the old secret:\n  \
+             jetsam --data-dir {} --export-wallet-secret\n",
+            backup.display(),
+            backup.display()
+        );
+    }
     let mut removed = 0usize;
     for entry in std::fs::read_dir(data_dir)
         .with_context(|| format!("enumerate legacy data directory {}", data_dir.display()))?
     {
         let entry = entry.with_context(|| format!("read entry in {}", data_dir.display()))?;
         if entry.file_name() == std::ffi::OsStr::new(NODE_LOG_FILE) {
+            continue;
+        }
+        if is_preserved_wallet_copy(&entry.file_name()) {
             continue;
         }
         remove_network_storage_entry(&entry.path())?;
@@ -1690,7 +1823,17 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
-    if prepare_network_storage_epoch(&data_dir)? {
+    // Only the read-only export opts out. It is what someone runs to rescue a
+    // wallet from an old data directory, and running a reset first would move
+    // the very file they asked to be shown.
+    //
+    // `--import-wallet-secret` must NOT opt out, however tempting the symmetry.
+    // The reset is what writes the epoch marker, and the import returns before
+    // reaching it: skip the reset here and the marker is never written, so the
+    // next ordinary start resets, files the freshly imported wallet away as a
+    // backup, and creates a different one. The owner then mines to an address
+    // whose secret they have never seen.
+    if !cli.export_wallet_secret && prepare_network_storage_epoch(&data_dir)? {
         cfg = config_defaults.clone();
         cfg.storage.path = data_dir.clone();
         let gui_supervised = expand_tilde(&config_path) == data_dir.join("jetsam-gui.toml");
@@ -4886,6 +5029,7 @@ mod tests {
         merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
         nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
         persist_network_storage_epoch_marker, prepare_network_storage_epoch,
+        WALLET_BACKUP_INCOMPLETE_PREFIX, WALLET_BACKUP_PREFIX,
         prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
         record_snapshot_terminal_transport_failure, reset_install_preferences_at_root,
         reset_node_config, resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
@@ -5197,9 +5341,19 @@ mod tests {
         assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
         persist_network_storage_epoch_marker(directory.path()).unwrap();
         assert!(!wallet.exists());
+        // Removed from where the node reads it, but not from the disk: a copy
+        // is kept, and it is the only entry besides the log and the marker that
+        // a reset may leave behind.
+        let backups = wallet_backup_directories(directory.path());
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(backups[0].join("wallet.key")).unwrap(),
+            b"canonical-wallet-secret"
+        );
         let mut names = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
+            .filter(|name| !name.to_string_lossy().starts_with(WALLET_BACKUP_PREFIX))
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(
@@ -5220,6 +5374,135 @@ mod tests {
             std::fs::read(directory.path().join("peers.json")).unwrap(),
             b"new peers"
         );
+    }
+
+    /// The reset empties the whole data directory, and the wallet lives in it.
+    /// Losing chain data costs a resync; losing this file costs the money.
+    #[test]
+    fn a_reset_copies_the_wallet_aside_before_deleting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("wallet.key"), b"the-only-copy").unwrap();
+        std::fs::write(directory.path().join("wallet.meta"), b"metadata").unwrap();
+        std::fs::write(directory.path().join("wallet.receipts"), b"receipts").unwrap();
+        std::fs::write(directory.path().join("peers.json"), b"peers").unwrap();
+
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+
+        assert!(!directory.path().join("wallet.key").exists());
+        assert!(!directory.path().join("peers.json").exists());
+
+        let backup = wallet_backup_directories(directory.path());
+        assert_eq!(backup.len(), 1, "expected exactly one backup, got {backup:?}");
+        assert_eq!(
+            std::fs::read(backup[0].join("wallet.key")).unwrap(),
+            b"the-only-copy"
+        );
+        assert_eq!(
+            std::fs::read(backup[0].join("wallet.meta")).unwrap(),
+            b"metadata"
+        );
+        assert_eq!(
+            std::fs::read(backup[0].join("wallet.receipts")).unwrap(),
+            b"receipts"
+        );
+    }
+
+    /// A backup a later reset deletes is not a backup.
+    #[test]
+    fn a_later_reset_never_destroys_an_earlier_wallet_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("wallet.key"), b"first-wallet").unwrap();
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+        let first = wallet_backup_directories(directory.path());
+        assert_eq!(first.len(), 1);
+
+        // A stale marker, so the reset runs a second time.
+        std::fs::write(directory.path().join(".network-storage-epoch"), b"stale").unwrap();
+        std::fs::write(directory.path().join("wallet.key"), b"second-wallet").unwrap();
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read(first[0].join("wallet.key")).unwrap(),
+            b"first-wallet",
+            "the second reset destroyed the first backup"
+        );
+        assert_eq!(wallet_backup_directories(directory.path()).len(), 2);
+    }
+
+    /// An import keeps the wallet it replaced in `wallet-replaced-<secs>`, and
+    /// an import killed halfway leaves `.wallet-import-rollback-<hex>`. Both
+    /// are directories holding the only copy of a previous key; the reset must
+    /// not treat them as chain data.
+    #[test]
+    fn a_reset_never_deletes_a_wallet_an_import_set_aside() {
+        let directory = tempfile::tempdir().unwrap();
+        let replaced = directory.path().join("wallet-replaced-1788800000");
+        std::fs::create_dir(&replaced).unwrap();
+        std::fs::write(replaced.join("wallet.key"), b"replaced-by-an-import").unwrap();
+        let interrupted = directory.path().join(".wallet-import-rollback-0123456789abcdef");
+        std::fs::create_dir(&interrupted).unwrap();
+        std::fs::write(interrupted.join("wallet.key"), b"an-import-that-was-killed").unwrap();
+        std::fs::write(directory.path().join("peers.json"), b"peers").unwrap();
+
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+
+        assert!(!directory.path().join("peers.json").exists());
+        assert_eq!(
+            std::fs::read(replaced.join("wallet.key")).unwrap(),
+            b"replaced-by-an-import"
+        );
+        assert_eq!(
+            std::fs::read(interrupted.join("wallet.key")).unwrap(),
+            b"an-import-that-was-killed"
+        );
+    }
+
+    /// A directory carrying the final name must always be complete: it is built
+    /// under a name that says otherwise and renamed once every copy landed.
+    #[test]
+    fn a_finished_backup_leaves_no_half_built_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("wallet.key"), b"secret").unwrap();
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WALLET_BACKUP_INCOMPLETE_PREFIX)
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        assert_eq!(wallet_backup_directories(directory.path()).len(), 1);
+    }
+
+    /// Nothing to copy must not fail the reset — a fresh install has no wallet.
+    #[test]
+    fn a_reset_without_a_wallet_writes_no_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("peers.json"), b"peers").unwrap();
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+        assert!(wallet_backup_directories(directory.path()).is_empty());
+    }
+
+    fn wallet_backup_directories(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WALLET_BACKUP_PREFIX)
+                    .then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
     }
 
     #[test]
