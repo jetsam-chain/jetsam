@@ -176,6 +176,28 @@ impl PreparedBlockAttempt {
         let stream = jetsam_chain::validate_block_page_stream(&block.transactions)
             .map_err(|error| format!("prepared block body is non-canonical: {error}"))?;
         let proof_class = stream.proof_class;
+        // Last line of defence, before any proof of work is spent on this
+        // template. A terminal too large for the wire cap is refused by every
+        // node including the one that built it, and the refusal only arrives at
+        // submitBlock — by which point the transactions are frozen into the
+        // hash, so nothing can be dropped to rescue the solution. Refuse here,
+        // where refusing costs nothing.
+        let class_id = jetsam_recursive::canonical_history_step_class_id(proof_class.page_capacity())
+            .ok_or_else(|| {
+                format!(
+                    "no proof class registered for the {}-page tier",
+                    proof_class.page_capacity()
+                )
+            })?;
+        let terminal_bytes = jetsam_recursive::history_step_terminal_wire_bytes(runtime, class_id)
+            .map_err(|error| format!("terminal size for {proof_class:?} is unknown: {error:?}"))?;
+        if terminal_bytes > jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+            return Err(format!(
+                "refusing to prepare a {proof_class:?} template: its terminal is {terminal_bytes} \
+                 bytes and the consensus cap is {}",
+                jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
+            ));
+        }
         let context = jetsam_block::HistoryStepPreparationContext {
             parent_header: &parent,
             tx_epoch_anchor_header: &parent_tx_epoch_anchor_header,

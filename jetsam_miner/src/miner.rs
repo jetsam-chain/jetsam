@@ -348,7 +348,24 @@ impl BlockMiner {
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
-        let mut proof_capacity = AdaptiveProofCapacity::default();
+        // Measured once, from this node's own frozen bank: a class whose
+        // terminal exceeds the consensus cap can never be published, and a
+        // template built in it wastes the proof of work that found it.
+        let publishable_page_ceiling =
+            match crate::proof_capacity::publishable_page_ceiling_from_runtime(
+                &self.history_step_runtime,
+            ) {
+                Ok(ceiling) => ceiling,
+                Err(reason) => {
+                    tracing::error!(
+                        %reason,
+                        "miner not starting: cannot tell which proof classes this node may publish"
+                    );
+                    return;
+                }
+            };
+        tracing::info!(publishable_page_ceiling, "miner page ceiling measured");
+        let mut proof_capacity = AdaptiveProofCapacity::new(publishable_page_ceiling);
 
         tracing::debug!("BlockMiner started");
 

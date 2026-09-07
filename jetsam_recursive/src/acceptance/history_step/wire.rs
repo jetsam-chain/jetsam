@@ -167,6 +167,20 @@ fn terminal_len_for_class(
     Ok(len)
 }
 
+/// Exact serialized terminal length for one canonical class.
+///
+/// A terminal's size is fixed by its class: neither chain height nor the
+/// contents of the block enter it. So this answers, before a single page is
+/// selected, whether a class can ever be published under the consensus wire
+/// cap — which is the question a miner must ask when it chooses a page budget,
+/// instead of discovering the answer after spending its proof of work.
+pub fn history_step_terminal_wire_bytes(
+    runtime: &HistoryStepRuntime,
+    class: CanonicalHistoryStepClassId,
+) -> Result<usize, HistoryStepError> {
+    terminal_len_for_class(runtime, class)
+}
+
 pub fn history_step_terminal_max_wire_bytes(
     runtime: &HistoryStepRuntime,
 ) -> Result<usize, HistoryStepError> {
