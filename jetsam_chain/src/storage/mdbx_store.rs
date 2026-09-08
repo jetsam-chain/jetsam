@@ -477,7 +477,7 @@ const BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT: usize =
 const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
 /// One retained block plus terminal is bounded by the canonical wire caps.
 const RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT: usize = crate::consensus::wire_limits::MAX_BLOCK_BYTES
-    + crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES;
+    + crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 /// A normal retired height deletes a block and terminal; advancing the exact
 /// boundary additionally removes one block body.
 const RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT: usize = RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT * 2;
@@ -624,13 +624,18 @@ fn archive_history_step_proof_object(
     txn: &Transaction<'_, RW, NoWriteMap>,
     terminal_bytes: &[u8],
 ) -> Result<(), StoreError> {
-    if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES {
         return Err(StoreError::Decode(
             "archived HistoryStep terminal exceeds hard bounds",
         ));
     }
     let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(terminal_bytes)
         .map_err(|_| StoreError::Decode("archived HistoryStep terminal metadata is malformed"))?;
+    if terminal_bytes.len() > crate::consensus::wire_limits::history_step_terminal_bytes_limit(metadata.terminal_height()) {
+        return Err(StoreError::Decode(
+            "archived HistoryStep terminal exceeds its active height cap",
+        ));
+    }
     if recursive_suffix_marker_authority(
         terminal_bytes,
         metadata.terminal_height(),
@@ -784,7 +789,7 @@ fn recursive_suffix_marker_has_durable_authority(
     let Some(ObjectLength(length)) = txn.get(&terminals, &u64_key(authority_tip_height))? else {
         return Ok(false);
     };
-    if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(authority_tip_height) {
         return Err(StoreError::Decode(
             "recursive suffix authority terminal exceeds hard bounds",
         ));
@@ -837,7 +842,7 @@ fn validate_history_step_parent_boundary_in_rw_txn(
         let ObjectLength(length) = txn
             .get(&terminals, &u64_key(parent_height))?
             .ok_or(StoreError::Decode("HistoryStep parent terminal is missing"))?;
-        if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(parent_height) {
             return Err(StoreError::Decode(
                 "HistoryStep parent terminal exceeds hard bounds",
             ));
@@ -1004,7 +1009,7 @@ fn read_history_step_terminal(
     let Some(ObjectLength(length)) = txn.get(&terminals, &u64_key(height))? else {
         return Ok(None);
     };
-    if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(height) {
         return Err(StoreError::Decode(
             "HistoryStep terminal stored length exceeds hard bounds",
         ));
@@ -1042,7 +1047,7 @@ fn read_history_step_proof_object(
     let Some(ObjectLength(length)) = txn.get(&table, &key)? else {
         return Ok(None);
     };
-    if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(height) {
         return Err(StoreError::Decode(
             "HistoryStep proof-object length exceeds hard bounds",
         ));
@@ -1174,9 +1179,7 @@ fn prune_retained_payloads_bounded(
         let ObjectLength(terminal_len) = txn.get(&terminals, &key)?.ok_or(StoreError::Decode(
             "retained HistoryStep terminal is missing",
         ))?;
-        if terminal_len == 0
-            || terminal_len > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
-        {
+        if terminal_len == 0 || terminal_len > crate::consensus::wire_limits::history_step_terminal_bytes_limit(height) {
             return Err(StoreError::Decode(
                 "retained HistoryStep terminal length is invalid",
             ));
@@ -1247,9 +1250,7 @@ fn prune_retained_payloads_bounded(
         let ObjectLength(terminal_len) = txn.get(&terminals, &key)?.ok_or(StoreError::Decode(
             "retained boundary HistoryStep terminal is missing",
         ))?;
-        if terminal_len == 0
-            || terminal_len > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
-        {
+        if terminal_len == 0 || terminal_len > crate::consensus::wire_limits::history_step_terminal_bytes_limit(cutoff) {
             return Err(StoreError::Decode(
                 "retained boundary HistoryStep terminal length is invalid",
             ));
@@ -1736,9 +1737,7 @@ impl MdbxStore {
         for proof_class in 0..crate::history_step::HISTORY_STEP_CLASS_COUNT {
             let key = history_step_proof_object_key(height, semantic_id, proof_class);
             if let Some(ObjectLength(length)) = txn.get(&table, &key)? {
-                if length == 0
-                    || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
-                {
+                if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(height) {
                     return Err(StoreError::Decode(
                         "HistoryStep proof-object length exceeds hard bounds",
                     ));
@@ -1772,7 +1771,7 @@ impl MdbxStore {
         let Some(ObjectLength(length)) = txn.get(&terminals, &key)? else {
             return Ok(false);
         };
-        if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        if length == 0 || length > crate::consensus::wire_limits::history_step_terminal_bytes_limit(height) {
             return Err(StoreError::Decode(
                 "HistoryStep terminal length exceeds hard bounds",
             ));

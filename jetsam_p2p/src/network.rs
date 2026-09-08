@@ -22,7 +22,7 @@ use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use jetsam_chain::consensus::wire_limits::{
-    MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS,
+    MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS,
     MAX_SEGMENT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use jetsam_chain::storage::{
@@ -457,7 +457,8 @@ const SNAPSHOT_EXPORT_PER_SEGMENT_ALLOWANCE: Duration = Duration::from_secs(2);
 /// live tip and remains useful without racing the payload pruner.
 const SNAPSHOT_BOUNDARY_MAX_LIVE_GAP: u64 =
     jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH - 6;
-const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
+const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize =
+    MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 const MAX_PENDING_NETWORK_PROFILE_REQUESTS: usize = 256;
 const MAX_PENDING_OBJECT_REQUESTS: usize = 64;
 const MAX_PENDING_HEADER_REQUESTS: usize = 64;
@@ -11091,7 +11092,7 @@ mod tests {
     fn canonical_wire_caps_are_ordered() {
         assert!(crate::header_protocol::HEADER_ANNOUNCE_BYTES < MAX_TX_INTENT_BYTES_GLOBAL);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES > MAX_TX_INTENT_BYTES_GLOBAL);
+        assert!(MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES > MAX_TX_INTENT_BYTES_GLOBAL);
     }
 
     #[tokio::test]

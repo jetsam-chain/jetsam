@@ -56,6 +56,8 @@ pub use pow::{
     BenchResult, PowSolution,
 };
 pub use proof_capacity::{
-    publishable_page_ceiling, publishable_page_ceiling_from_runtime, AdaptiveProofCapacity,
+    measured_terminal_bytes_from_runtime, publishable_page_ceiling,
+    publishable_page_ceiling_at_height, publishable_page_ceiling_from_runtime,
+    AdaptiveProofCapacity,
 };
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};

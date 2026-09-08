@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use jetsam_chain::consensus::paged_spend::BlockProofClass;
 use jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS;
-use jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES;
+use jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit;
 use jetsam_recursive::acceptance::history_step::HistoryStepRuntime;
 use jetsam_recursive::{history_step_terminal_wire_bytes, HISTORY_STEP_CLASS_COUNT};
 
@@ -34,14 +34,30 @@ pub fn publishable_page_ceiling(terminal_bytes: &[usize], cap: usize) -> Option<
         .max()
 }
 
-/// Measure every class against the consensus cap using this node's own bank.
+/// The largest publishable page tier at one block height.
 ///
-/// Fails rather than guessing: a node that cannot determine which classes it
-/// may publish would mine blocks it can only discard, which is exactly the
+/// From v1.2 the consensus cap is a function of height, so the ceiling is too.
+/// The measured terminal sizes are not: a terminal's length is a property of
+/// its class, so they are measured once and only the cap moves.
+///
+/// The comparison deliberately uses the **plain** terminal length even after
+/// activation, where the shared-path encoding is at least as short. That is an
+/// upper bound on what will actually be published, so this guard can never
+/// grant a class whose terminal would then be refused — and our 1 200 000-byte
+/// cap admits the 255-page class in both forms, so nothing is lost by being
+/// conservative here.
+pub fn publishable_page_ceiling_at_height(terminal_bytes: &[usize], height: u64) -> Option<usize> {
+    publishable_page_ceiling(terminal_bytes, history_step_terminal_bytes_limit(height))
+}
+
+/// Measure every class once against this node's own frozen bank.
+///
+/// Fails rather than guessing: a node that cannot determine the size of its
+/// own terminals would mine blocks it can only discard, which is exactly the
 /// failure this guard exists to prevent.
-pub fn publishable_page_ceiling_from_runtime(
+pub fn measured_terminal_bytes_from_runtime(
     runtime: &HistoryStepRuntime,
-) -> Result<usize, String> {
+) -> Result<Vec<usize>, String> {
     let mut terminal_bytes = Vec::with_capacity(HISTORY_STEP_CLASS_COUNT);
     for tier in BLOCK_PAGE_CLASS_TIERS {
         let class = jetsam_recursive::canonical_history_step_class_id(tier)
@@ -51,10 +67,21 @@ pub fn publishable_page_ceiling_from_runtime(
                 .map_err(|e| format!("terminal size for the {tier}-page tier is unknown: {e:?}"))?,
         );
     }
-    publishable_page_ceiling(&terminal_bytes, MAX_HISTORY_STEP_TERMINAL_BYTES).ok_or_else(|| {
+    Ok(terminal_bytes)
+}
+
+/// Measure every class against the consensus cap in force at `height`, using
+/// this node's own bank.
+pub fn publishable_page_ceiling_from_runtime(
+    runtime: &HistoryStepRuntime,
+    height: u64,
+) -> Result<usize, String> {
+    let terminal_bytes = measured_terminal_bytes_from_runtime(runtime)?;
+    publishable_page_ceiling_at_height(&terminal_bytes, height).ok_or_else(|| {
         format!(
-            "no proof class can be published: terminals are {terminal_bytes:?} bytes \
-             and the consensus cap is {MAX_HISTORY_STEP_TERMINAL_BYTES}"
+            "no proof class can be published at height {height}: terminals are \
+             {terminal_bytes:?} bytes and the consensus cap is {}",
+            history_step_terminal_bytes_limit(height)
         )
     })
 }
@@ -70,31 +97,42 @@ pub fn publishable_page_ceiling_from_runtime(
 pub struct AdaptiveProofCapacity {
     b25_prepare_ms_ewma: Option<f64>,
     b255_prepare_ms_ewma: Option<f64>,
-    /// Largest tier this node may actually publish. Deliberately not
-    /// defaultable: on 2026-09-07 a node granted itself 255 pages purely
-    /// because it proved quickly, built seventeen templates whose terminal
-    /// exceeded the consensus cap, and stopped the chain for 6 146 seconds.
-    /// The ceiling must be stated by whoever holds the proof runtime.
-    publishable_page_ceiling: usize,
+    /// Terminal size of each class tier, measured once from this node's own
+    /// frozen bank. Deliberately not defaultable: on 2026-09-07 a node granted
+    /// itself 255 pages purely because it proved quickly, built seventeen
+    /// templates whose terminal exceeded the consensus cap, and stopped the
+    /// chain for 6 146 seconds. These sizes must come from whoever holds the
+    /// proof runtime.
+    ///
+    /// A size is a property of its class, so it is measured once. The cap it
+    /// is compared against is a function of block height from v1.2 on, so the
+    /// ceiling is recomputed for every template.
+    terminal_bytes: Vec<usize>,
 }
 
 impl AdaptiveProofCapacity {
-    pub fn new(publishable_page_ceiling: usize) -> Self {
+    pub fn new(terminal_bytes: Vec<usize>) -> Self {
         Self {
             b25_prepare_ms_ewma: None,
             b255_prepare_ms_ewma: None,
-            publishable_page_ceiling,
+            terminal_bytes,
         }
     }
 
-    /// Effective page-position budget for the next template: 25 or 255.
-    /// A mandatory system payout consumes one position inside that budget.
+    /// Largest tier publishable at `height`, or 0 if none is — a node that can
+    /// publish nothing must not silently fall back to the smallest class.
+    pub fn publishable_page_ceiling_at(&self, height: u64) -> usize {
+        publishable_page_ceiling_at_height(&self.terminal_bytes, height).unwrap_or(0)
+    }
+
+    /// Effective page-position budget for a template built at `height`: 25 or
+    /// 255. A mandatory system payout consumes one position inside that budget.
     ///
     /// Speed alone decided this until the halt of block 3575. Speed now only
-    /// chooses among the classes this node can publish — the fast node was the
-    /// one at risk, because it was the one confident enough to pick the class
-    /// that never fitted.
-    pub fn page_limit(&self) -> usize {
+    /// chooses among the classes this node can publish at that height — the
+    /// fast node was the one at risk, because it was the one confident enough
+    /// to pick the class that never fitted.
+    pub fn page_limit(&self, height: u64) -> usize {
         let target_ms = target_prepare_ms();
         let b255_fits = match self.b255_prepare_ms_ewma {
             Some(measured_ms) => measured_ms <= target_ms,
@@ -107,7 +145,7 @@ impl AdaptiveProofCapacity {
         } else {
             BlockProofClass::B25.page_capacity()
         };
-        by_speed.min(self.publishable_page_ceiling)
+        by_speed.min(self.publishable_page_ceiling_at(height))
     }
 
     /// Record one complete nonce-independent HistoryStep preparation.
@@ -153,6 +191,20 @@ mod tests {
         Duration::from_millis(value)
     }
 
+    /// Terminal sizes that make exactly `tier` publishable under the dormant
+    /// v1 cap, so timing behaviour can be tested apart from the height rule.
+    fn capacity_capped_at(tier: usize) -> AdaptiveProofCapacity {
+        let over = CONSENSUS_CAP + 1;
+        AdaptiveProofCapacity::new(match tier {
+            25 => vec![B25_TERMINAL_BYTES, over],
+            255 => vec![B25_TERMINAL_BYTES, B25_TERMINAL_BYTES],
+            other => panic!("unsupported test tier {other}"),
+        })
+    }
+
+    /// Height used by tests that are about timing, not about the fork.
+    const ANY_HEIGHT: u64 = 4004;
+
     const B25_TERMINAL_BYTES: usize = 971_732;
     const B255_TERMINAL_BYTES: usize = 1_081_108;
     const CONSENSUS_CAP: usize =
@@ -171,6 +223,47 @@ mod tests {
             publishable_page_ceiling(&[B25_TERMINAL_BYTES, B255_TERMINAL_BYTES], CONSENSUS_CAP),
             Some(25)
         );
+    }
+
+    /// The v1.2 cap is no longer a constant, it is a function of height. A
+    /// ceiling measured once at startup would keep refusing the larger class
+    /// forever after activation: our own v1.1.2 guard would silently cancel
+    /// the fork it is supposed to let through.
+    ///
+    /// Terminal sizes remain a property of the class, so they are measured
+    /// once; only the cap they are compared against moves with the height.
+    #[test]
+    fn the_ceiling_follows_the_height_selected_cap_across_the_fork() {
+        use jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit_at_activation;
+
+        const ACTIVATION: u64 = 42;
+        let measured = [B25_TERMINAL_BYTES, B255_TERMINAL_BYTES];
+        for (height, expected) in
+            [(0, 25), (ACTIVATION - 1, 25), (ACTIVATION, 255), (u64::MAX, 255)]
+        {
+            assert_eq!(
+                publishable_page_ceiling(
+                    &measured,
+                    history_step_terminal_bytes_limit_at_activation(height, Some(ACTIVATION))
+                ),
+                Some(expected),
+                "height {height}"
+            );
+        }
+    }
+
+    /// While the fork is dormant every height still yields the small class,
+    /// exactly as the live chain runs today.
+    #[test]
+    fn the_ceiling_is_the_small_class_at_every_height_until_the_fork_is_armed() {
+        let measured = [B25_TERMINAL_BYTES, B255_TERMINAL_BYTES];
+        for height in [0, 1, 4004, u64::MAX] {
+            assert_eq!(
+                publishable_page_ceiling_at_height(&measured, height),
+                Some(25),
+                "height {height}"
+            );
+        }
     }
 
     /// Raising the cap must free the larger class on its own. This is why the
@@ -194,11 +287,11 @@ mod tests {
     /// pages to any node fast enough, and 255 pages cannot be published.
     #[test]
     fn never_grants_a_class_whose_terminal_cannot_be_published() {
-        let mut capacity = AdaptiveProofCapacity::new(25);
+        let mut capacity = capacity_capped_at(25);
         capacity.observe_preparation(BlockProofClass::B25, millis(3_000));
-        assert_eq!(capacity.page_limit(), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
         capacity.observe_preparation(BlockProofClass::B255, millis(1_000));
-        assert_eq!(capacity.page_limit(), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
     }
 
     /// Whatever the machine measured, the ceiling holds. A fast node was the
@@ -207,11 +300,11 @@ mod tests {
     fn the_ceiling_holds_for_every_timing_history() {
         for b25 in [1u64, 3_000, 22_000, 22_500, 60_000, 200_000] {
             for b255 in [1u64, 1_000, 40_000, 90_000, 300_000] {
-                let mut capacity = AdaptiveProofCapacity::new(25);
+                let mut capacity = capacity_capped_at(25);
                 capacity.observe_preparation(BlockProofClass::B25, millis(b25));
                 capacity.observe_preparation(BlockProofClass::B255, millis(b255));
                 assert_eq!(
-                    capacity.page_limit(),
+                    capacity.page_limit(ANY_HEIGHT),
                     25,
                     "b25={b25} ms, b255={b255} ms escaped the ceiling"
                 );
@@ -221,46 +314,46 @@ mod tests {
 
     #[test]
     fn starts_at_b25_and_has_no_intermediate_limits() {
-        let mut capacity = AdaptiveProofCapacity::new(255);
-        assert_eq!(capacity.page_limit(), 25);
+        let mut capacity = capacity_capped_at(255);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
 
         let predicted_b255_boundary = (target_prepare_ms() / class_work_ratio()).round() as u64;
         capacity.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary + 1));
-        assert_eq!(capacity.page_limit(), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
 
-        let mut exact_boundary = AdaptiveProofCapacity::new(255);
+        let mut exact_boundary = capacity_capped_at(255);
         exact_boundary.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary));
-        assert_eq!(exact_boundary.page_limit(), 255);
-        assert!(matches!(capacity.page_limit(), 25 | 255));
+        assert_eq!(exact_boundary.page_limit(ANY_HEIGHT), 255);
+        assert!(matches!(capacity.page_limit(ANY_HEIGHT), 25 | 255));
     }
 
     #[test]
     fn fast_b25_predicts_b255_then_real_b255_becomes_authoritative() {
-        let mut capacity = AdaptiveProofCapacity::new(255);
+        let mut capacity = capacity_capped_at(255);
         capacity.observe_preparation(BlockProofClass::B25, millis(3_000));
-        assert_eq!(capacity.page_limit(), 255);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
 
         capacity.observe_preparation(BlockProofClass::B255, millis(14_000));
-        assert_eq!(capacity.page_limit(), 255);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
 
         // Later B25 occupancy does not erase direct B255 evidence.
         capacity.observe_preparation(BlockProofClass::B25, millis(20_000));
-        assert_eq!(capacity.page_limit(), 255);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
     }
 
     #[test]
     fn slow_real_b255_falls_back_without_oscillation() {
-        let mut capacity = AdaptiveProofCapacity::new(255);
+        let mut capacity = capacity_capped_at(255);
         capacity.observe_preparation(BlockProofClass::B25, millis(3_000));
-        assert_eq!(capacity.page_limit(), 255);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
 
         capacity.observe_preparation(
             BlockProofClass::B255,
             millis(target_prepare_ms() as u64 + 1),
         );
-        assert_eq!(capacity.page_limit(), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
 
         capacity.observe_preparation(BlockProofClass::B25, millis(1_000));
-        assert_eq!(capacity.page_limit(), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
     }
 }

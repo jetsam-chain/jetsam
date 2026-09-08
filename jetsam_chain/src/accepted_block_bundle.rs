@@ -23,7 +23,9 @@ use jetsam_tx::wire::WireError;
 use crate::block::Block;
 use crate::block_header::semantic_header_id;
 use crate::consensus::pow::block_id;
-use crate::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
+use crate::consensus::wire_limits::{
+    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+};
 use crate::history_step::{
     HistoryStepTerminalMetadata, HistoryStepTerminalMetadataError,
     HISTORY_STEP_TERMINAL_BINDING_BYTES,
@@ -38,8 +40,9 @@ pub const ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"JAB1";
 pub const ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES: usize = 4 + 4 + 4;
 
 /// Maximum complete encoded bundle, including its fixed framing header.
-pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize =
-    ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES + MAX_BLOCK_BYTES + MAX_HISTORY_STEP_TERMINAL_BYTES;
+pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
+    + MAX_BLOCK_BYTES
+    + MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 
 /// One structurally complete, not-yet-cryptographically-decided block bundle.
 ///
@@ -75,6 +78,7 @@ impl AcceptedBlockBundle {
             history_step_terminal_bytes.len() as u64,
         )?;
         let height = block.header.height;
+        validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
             &history_step_terminal_bytes,
@@ -110,6 +114,7 @@ impl AcceptedBlockBundle {
             return Err(AcceptedBlockBundleError::GenesisIsNotTransported);
         }
         let height = block.header.height;
+        validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
             &history_step_terminal_bytes,
@@ -217,11 +222,36 @@ impl AcceptedBlockBundle {
     }
 
     /// Preflight declared payload lengths before a streaming codec allocates.
+    ///
+    /// Absolute transport bounds only. This does **not** replace the
+    /// height-selected consensus check below: a caller that knows the block
+    /// height must ask that question too.
     pub fn validate_declared_lengths(
         block_len: u64,
         history_step_terminal_len: u64,
     ) -> Result<usize, AcceptedBlockBundleError> {
         validate_payload_lengths(block_len, history_step_terminal_len)
+    }
+
+    /// Explicit name for the preflight bound, for call sites that have no
+    /// height yet — a streaming codec reading a framing header, for instance.
+    pub fn validate_declared_transport_lengths(
+        block_len: u64,
+        history_step_terminal_len: u64,
+    ) -> Result<usize, AcceptedBlockBundleError> {
+        validate_payload_lengths(block_len, history_step_terminal_len)
+    }
+
+    /// Validate allocation bounds *and* the consensus cap active at one block
+    /// height, without decoding either payload.
+    pub fn validate_declared_lengths_at_height(
+        block_len: u64,
+        history_step_terminal_len: u64,
+        height: u64,
+    ) -> Result<usize, AcceptedBlockBundleError> {
+        let payload_len = validate_payload_lengths(block_len, history_step_terminal_len)?;
+        validate_terminal_length_at_height(history_step_terminal_len, height)?;
+        Ok(payload_len)
     }
 }
 
@@ -241,10 +271,10 @@ fn validate_payload_lengths(
     if terminal_len <= HISTORY_STEP_TERMINAL_BINDING_BYTES as u64 {
         return Err(AcceptedBlockBundleError::MissingHistoryStepTerminal);
     }
-    if terminal_len > MAX_HISTORY_STEP_TERMINAL_BYTES as u64 {
+    if terminal_len > MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES as u64 {
         return Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
             actual: terminal_len,
-            max: MAX_HISTORY_STEP_TERMINAL_BYTES,
+            max: MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
         });
     }
     let block_len =
@@ -254,6 +284,22 @@ fn validate_payload_lengths(
     block_len
         .checked_add(terminal_len)
         .ok_or(AcceptedBlockBundleError::LengthOverflow)
+}
+
+/// The consensus cap in force at one block height, which is the rule a peer
+/// is actually judged by.
+fn validate_terminal_length_at_height(
+    terminal_len: u64,
+    height: u64,
+) -> Result<(), AcceptedBlockBundleError> {
+    let max = history_step_terminal_bytes_limit(height);
+    if terminal_len > max as u64 {
+        return Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+            actual: terminal_len,
+            max,
+        });
+    }
+    Ok(())
 }
 
 fn validate_terminal_binding(
@@ -527,12 +573,62 @@ mod tests {
         oversized_terminal[..4].copy_from_slice(&ACCEPTED_BLOCK_BUNDLE_MAGIC);
         oversized_terminal[4..8].copy_from_slice(&1u32.to_le_bytes());
         oversized_terminal[8..12].copy_from_slice(
-            &(u32::try_from(MAX_HISTORY_STEP_TERMINAL_BYTES).unwrap() + 1).to_le_bytes(),
+            &(u32::try_from(MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES).unwrap() + 1).to_le_bytes(),
         );
         assert!(matches!(
             AcceptedBlockBundle::decode(&oversized_terminal),
             Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge { .. })
         ));
+    }
+
+    /// Transport headroom is not a relaxed rule. This binary allocates for the
+    /// v1.2 cap so nothing has to be re-dimensioned at the fork, but a terminal
+    /// above the v1 cap must still be refused at every height while the fork is
+    /// dormant — the preflight bound and the consensus rule are two different
+    /// questions, asked in that order.
+    #[test]
+    fn transport_headroom_does_not_activate_the_raised_cap_early() {
+        use crate::consensus::wire_limits::V1_MAX_HISTORY_STEP_TERMINAL_BYTES;
+
+        let terminal_len = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
+        assert!(AcceptedBlockBundle::validate_declared_transport_lengths(1, terminal_len).is_ok());
+        for height in [1, 4004, u64::MAX] {
+            assert!(matches!(
+                AcceptedBlockBundle::validate_declared_lengths_at_height(1, terminal_len, height),
+                Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                    max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// A terminal only the raised cap admits is refused below the activation
+    /// height and accepted from it on — the switch is the block height,
+    /// nothing else.
+    #[test]
+    fn the_consensus_cap_switches_exactly_at_the_activation_height() {
+        use crate::consensus::wire_limits::{
+            history_step_terminal_bytes_limit_with_activation,
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+        };
+
+        const ACTIVATION: u64 = 42;
+        const B255_TERMINAL_BYTES: u64 = 1_081_108;
+        assert!(B255_TERMINAL_BYTES > V1_MAX_HISTORY_STEP_TERMINAL_BYTES as u64);
+        assert!(B255_TERMINAL_BYTES <= V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES as u64);
+        assert!(
+            B255_TERMINAL_BYTES
+                > history_step_terminal_bytes_limit_with_activation(
+                    ACTIVATION - 1,
+                    Some(ACTIVATION)
+                ) as u64
+        );
+        assert!(
+            B255_TERMINAL_BYTES
+                <= history_step_terminal_bytes_limit_with_activation(ACTIVATION, Some(ACTIVATION))
+                    as u64
+        );
     }
 
     #[test]
