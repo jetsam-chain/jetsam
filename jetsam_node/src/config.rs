@@ -82,6 +82,26 @@ pub struct NetworkConfig {
     /// Config file: list of IP:PORT strings or libp2p multiaddrs.
     #[serde(default)]
     pub public_addresses: Vec<String>,
+    /// Discover peers by mDNS broadcast on the local segment.
+    ///
+    /// Off by default. It is useful on a LAN you own and unwanted anywhere
+    /// else: on a VPS the local segment belongs to the provider and is shared
+    /// with other tenants, so the broadcast reaches machines that never asked
+    /// for it. Config file: `lan_discovery = true`. CLI flag: --lan-discovery.
+    #[serde(default)]
+    pub lan_discovery: bool,
+    /// Ask the router to map the P2P port outward (UPnP/IGD).
+    ///
+    /// On by default: without it, an operator behind a home router receives
+    /// blocks but serves nobody. Some routers answer badly and some networks
+    /// forbid it, so it can be turned off. Config file: `upnp = false`.
+    /// CLI flag: --no-upnp.
+    #[serde(default = "default_true")]
+    pub upnp: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +135,8 @@ impl Default for NodeConfig {
                 listen: None, // determined by --network at runtime
                 seeds: vec![],
                 public_addresses: vec![],
+                lan_discovery: false, // a broadcast nobody asked for
+                upnp: true,           // a home router serves nobody without it
             },
             storage: StorageConfig {
                 backend: "mdbx".into(),

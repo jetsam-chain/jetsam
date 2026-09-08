@@ -102,11 +102,15 @@ pub struct NodeBehaviour {
     /// must call `kad.add_address()` to populate the routing table.
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
 
-    /// mDNS — LAN peer discovery (zero-config for local clusters and dev).
+    /// mDNS — LAN peer discovery, off unless the operator asks for it.
     ///
-    /// Silent on the public internet (UDP broadcast is LAN-scoped).
-    /// Discovered peers are immediately dialled.
-    pub mdns: mdns::tokio::Behaviour,
+    /// "LAN-scoped" is not the reassurance it sounds like. On a VPS the local
+    /// segment belongs to the host and is shared with other tenants: the node
+    /// broadcast there every minute and dialled whatever answered. Providers
+    /// treat that traffic as noise at best, and a datacentre neighbour is not
+    /// a peer anybody chose. Adding a peer by hand costs one flag, so this is
+    /// opt-in and belongs to local clusters and development.
+    pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
 
     /// Peer identification — required for Kademlia routing table population.
     ///
@@ -195,6 +199,8 @@ impl NodeBehaviour {
         relay_client: relay::client::Behaviour,
         background_capacity: BackgroundCapacity,
         serve_relay: bool,
+        lan_discovery: bool,
+        upnp_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -456,18 +462,23 @@ impl NodeBehaviour {
         // mDNS (LAN discovery)
         // ----------------------------------------------------------------
         //
-        // Broadcasts UDP packets on the local network. Peers that respond
-        // are immediately dialled. Completely harmless on the public internet
-        // (broadcast is LAN-scoped; no external packets are sent).
-        // This makes local clusters and dev setups zero-config.
-        let mdns = mdns::tokio::Behaviour::new(
-            mdns::Config {
-                // Re-query every 60s so long-lived LANs stay connected.
-                query_interval: Duration::from_secs(60),
-                ..Default::default()
-            },
-            key.public().to_peer_id(),
-        )?;
+        // Broadcasts UDP packets on every interface and dials whatever
+        // answers. That is what makes a local cluster zero-config, and it is
+        // also why it is off by default: on a VPS the "local network" is the
+        // provider's segment, shared with other tenants who never agreed to
+        // receive a query a minute. Enable it deliberately, on a LAN you own.
+        let mdns = if lan_discovery {
+            libp2p::swarm::behaviour::toggle::Toggle::from(Some(mdns::tokio::Behaviour::new(
+                mdns::Config {
+                    // Re-query every 60s so long-lived LANs stay connected.
+                    query_interval: Duration::from_secs(60),
+                    ..Default::default()
+                },
+                key.public().to_peer_id(),
+            )?))
+        } else {
+            libp2p::swarm::behaviour::toggle::Toggle::from(None)
+        };
 
         // ----------------------------------------------------------------
         // Identify
@@ -498,7 +509,12 @@ impl NodeBehaviour {
         // UPnP: only a node that does NOT already declare a routable address
         // has anything to ask a router for. `serve_relay` is exactly that
         // signal, so the two are mutually exclusive by construction.
-        let upnp = Toggle::from((!serve_relay).then(upnp::tokio::Behaviour::default));
+        // A node that advertises a public address has no router to ask, so it
+        // never needed this. Everyone else does, and the operator can still
+        // refuse: some routers answer UPnP badly, and some networks forbid it.
+        let upnp = Toggle::from(
+            (upnp_enabled && !serve_relay).then(upnp::tokio::Behaviour::default),
+        );
 
         // AutoNAT client: peers dial us back, and the answer tells us whether
         // the mapping above (or a manual port forward) actually works. The
