@@ -196,10 +196,21 @@ mod tests {
 
     #[test]
     fn mainnet_protocol_id() {
-        let mainnet = NetworkConfig::mainnet();
-        assert_eq!(mainnet.p2p_protocol_id, "/jetsam/mainnet/1.0.0");
-        assert_eq!(mainnet.topic_blocks, "/jetsam/mainnet/blocks/1");
-        assert_eq!(mainnet.topic_txs, "/jetsam/mainnet/txs/1");
+        let config = NetworkConfig::mainnet();
+        // The namespace follows the build profile: two nodes on different
+        // namespaces part at the libp2p handshake, before a block is offered.
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(config.p2p_protocol_id, "/jetsam/mainnet/1.0.0");
+            assert_eq!(config.topic_blocks, "/jetsam/mainnet/blocks/1");
+            assert_eq!(config.topic_txs, "/jetsam/mainnet/txs/1");
+        }
+        #[cfg(feature = "testnet")]
+        {
+            assert_eq!(config.p2p_protocol_id, "/jetsam/testnet/1.0.0");
+            assert_eq!(config.topic_blocks, "/jetsam/testnet/blocks/1");
+            assert_eq!(config.topic_txs, "/jetsam/testnet/txs/1");
+        }
     }
 
     #[test]

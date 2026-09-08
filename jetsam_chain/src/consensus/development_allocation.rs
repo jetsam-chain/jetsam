@@ -71,9 +71,24 @@ pub const DEVELOPMENT_SHARE_DENOMINATOR: u64 = 20;
 /// and round constants: the first generation predated that change, so the
 /// operator's secret no longer opened the address the consensus paid. Pinned
 /// by `fund_addresses_match_the_operator_derivation`.
+#[cfg(not(feature = "testnet"))]
 pub const NETWORK_FUND_ADDRESS: Address = Address([
     0x77, 0xca, 0x54, 0x0b, 0xbf, 0x9e, 0x01, 0x7b, 0x3e, 0x8a, 0x13, 0x9f, 0xe9, 0x13, 0x66, 0xbd,
     0x00, 0xdb, 0x8c, 0xa0, 0x51, 0x8d, 0x11, 0x3a, 0x42, 0x06, 0x66, 0x4d, 0x29, 0xf0, 0x44, 0xf0,
+]);
+
+/// Test-chain network fund.
+///
+/// A **separate secret**, generated with OS entropy for this chain alone. The
+/// mainnet fund key is never used here: one key on two chains means a flaw
+/// found on the worthless chain costs the real one. Test coins are free, so
+/// there is nothing to gain by sharing the key and everything to lose.
+///
+/// bech32: tj1ss6agplrv4hr0hp5u4ctjjk2ak4j3c0qkfpgnwu9lhfuq7n4vwfs8qd7hk
+#[cfg(feature = "testnet")]
+pub const NETWORK_FUND_ADDRESS: Address = Address([
+    0x84, 0x35, 0xd4, 0x07, 0xe3, 0x65, 0x6e, 0x37, 0xdc, 0x34, 0xe5, 0x70, 0xb9, 0x4a, 0xca, 0xed,
+    0xab, 0x28, 0xe1, 0xe0, 0xb2, 0x42, 0x89, 0xbb, 0x85, 0xfd, 0xd3, 0xc0, 0x7a, 0x75, 0x63, 0x93,
 ]);
 
 /// Lab fund recipient.
@@ -84,9 +99,19 @@ pub const NETWORK_FUND_ADDRESS: Address = Address([
 /// bech32: j1w809r3dfelzxytrzg7plk080k8vpq3cg5ukpqxgac99lcuq50k8sg8vuhv
 ///
 /// Regenerated together with [`NETWORK_FUND_ADDRESS`] for the same reason.
+#[cfg(not(feature = "testnet"))]
 pub const LAB_FUND_ADDRESS: Address = Address([
     0x71, 0xde, 0x51, 0xc5, 0xa9, 0xcf, 0xc4, 0x62, 0x2c, 0x62, 0x47, 0x83, 0xfb, 0x3c, 0xef, 0xb1,
     0xd8, 0x10, 0x47, 0x08, 0xa7, 0x2c, 0x10, 0x19, 0x1d, 0xc1, 0x4b, 0xfc, 0x70, 0x14, 0x7d, 0x8f,
+]);
+
+/// Test-chain lab fund. Separate secret, same reasoning as above.
+///
+/// bech32: tj1jqgz9ndkvatw7qnag4fpxx8u8u9my3xdwzvgjr4sn5qtga96ahxqlgfcjw
+#[cfg(feature = "testnet")]
+pub const LAB_FUND_ADDRESS: Address = Address([
+    0x90, 0x10, 0x22, 0xcd, 0xb6, 0x67, 0x56, 0xef, 0x02, 0x7d, 0x45, 0x52, 0x13, 0x18, 0xfc, 0x3f,
+    0x0b, 0xb2, 0x44, 0xcd, 0x70, 0x98, 0x89, 0x0e, 0xb0, 0x9d, 0x00, 0xb4, 0x74, 0xba, 0xed, 0xcc,
 ]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,16 +289,49 @@ mod tests {
     /// domain tags or the address derivation ever change again.
     #[test]
     fn fund_addresses_match_the_operator_derivation() {
-        assert_eq!(
-            NETWORK_FUND_ADDRESS.to_bech32(),
-            "j1wl99gzalncqhk052zw07jymxh5qdhr9q2xx3zwjzqeny620sgncqkfyv2z",
-            "network fund address no longer matches the operator's derived key"
-        );
-        assert_eq!(
-            LAB_FUND_ADDRESS.to_bech32(),
-            "j1w809r3dfelzxytrzg7plk080k8vpq3cg5ukpqxgac99lcuq50k8sg8vuhv",
-            "lab fund address no longer matches the operator's derived key"
-        );
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(
+                NETWORK_FUND_ADDRESS.to_bech32(),
+                "j1wl99gzalncqhk052zw07jymxh5qdhr9q2xx3zwjzqeny620sgncqkfyv2z",
+                "network fund address no longer matches the operator's derived key"
+            );
+            assert_eq!(
+                LAB_FUND_ADDRESS.to_bech32(),
+                "j1w809r3dfelzxytrzg7plk080k8vpq3cg5ukpqxgac99lcuq50k8sg8vuhv",
+                "lab fund address no longer matches the operator's derived key"
+            );
+        }
+        // The test chain pays two funds of its own, derived from two secrets
+        // generated for it alone. Sharing the mainnet key here would mean a
+        // flaw found on a chain whose coins are worth nothing could be turned
+        // against the chain where they are not.
+        #[cfg(feature = "testnet")]
+        {
+            assert_eq!(
+                NETWORK_FUND_ADDRESS.to_bech32(),
+                "tj1ss6agplrv4hr0hp5u4ctjjk2ak4j3c0qkfpgnwu9lhfuq7n4vwfs8qd7hk",
+                "testnet network fund address no longer matches its derived key"
+            );
+            assert_eq!(
+                LAB_FUND_ADDRESS.to_bech32(),
+                "tj1jqgz9ndkvatw7qnag4fpxx8u8u9my3xdwzvgjr4sn5qtga96ahxqlgfcjw",
+                "testnet lab fund address no longer matches its derived key"
+            );
+            // The two chains must not pay the same 32 bytes.
+            const MAINNET_NETWORK_FUND: [u8; 32] = [
+                0x77, 0xca, 0x54, 0x0b, 0xbf, 0x9e, 0x01, 0x7b, 0x3e, 0x8a, 0x13, 0x9f, 0xe9, 0x13,
+                0x66, 0xbd, 0x00, 0xdb, 0x8c, 0xa0, 0x51, 0x8d, 0x11, 0x3a, 0x42, 0x06, 0x66, 0x4d,
+                0x29, 0xf0, 0x44, 0xf0,
+            ];
+            const MAINNET_LAB_FUND: [u8; 32] = [
+                0x71, 0xde, 0x51, 0xc5, 0xa9, 0xcf, 0xc4, 0x62, 0x2c, 0x62, 0x47, 0x83, 0xfb, 0x3c,
+                0xef, 0xb1, 0xd8, 0x10, 0x47, 0x08, 0xa7, 0x2c, 0x10, 0x19, 0x1d, 0xc1, 0x4b, 0xfc,
+                0x70, 0x14, 0x7d, 0x8f,
+            ];
+            assert_ne!(NETWORK_FUND_ADDRESS.0, MAINNET_NETWORK_FUND);
+            assert_ne!(LAB_FUND_ADDRESS.0, MAINNET_LAB_FUND);
+        }
     }
 
     #[test]
