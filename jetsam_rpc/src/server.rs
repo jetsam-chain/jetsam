@@ -1550,12 +1550,15 @@ impl RpcHandler {
             let mtp = median_time_past(&snapshot.prev_timestamps);
             now.max(mtp.saturating_add(1))
         };
+        // The cap the block will be judged by is the one active at its own
+        // height, the child of this parent.
+        let child_height = snapshot.parent.height.saturating_add(1);
         let snapshot_ts = snapshot;
         let max_user_pages = self
             .external_mining_capacity
             .lock()
             .map_err(|_| rpc_err("external mining capacity lock poisoned"))?
-            .page_limit();
+            .page_limit(child_height);
         let tmpl = builder
             .build_from_snapshot_with_limit(snapshot_ts, addr, block_ts, max_user_pages)
             .await
@@ -1681,11 +1684,12 @@ impl RpcHandler {
                 .external_mining_capacity
                 .lock()
                 .map_err(|_| rpc_err("external mining capacity lock poisoned"))?;
-            let previous = capacity.page_limit();
+            let observed_child_height = prepared.expected_parent_height().saturating_add(1);
+            let previous = capacity.page_limit(observed_child_height);
             capacity.observe_preparation(proof_class, prepare_elapsed);
             (
                 previous,
-                capacity.page_limit(),
+                capacity.page_limit(observed_child_height),
                 capacity.prepare_ms_ewma(jetsam_chain::consensus::paged_spend::BlockProofClass::B25),
                 capacity.prepare_ms_ewma(jetsam_chain::consensus::paged_spend::BlockProofClass::B255),
             )
@@ -3869,20 +3873,23 @@ pub async fn start_rpc_server(
                 },
             ));
     // External miners get their page budget from the same controller as the
-    // in-process one, so they must inherit the same ceiling. On 2026-09-07 this
-    // path handed 26-page templates to a pool for 68 minutes; every solution it
-    // returned was refused by the node that had asked for it.
-    let external_mining_page_ceiling = match history_step_runtime.as_deref() {
-        Some(runtime) => jetsam_miner::publishable_page_ceiling_from_runtime(runtime)
+    // in-process one, so they must inherit the same measurements. On 2026-09-07
+    // this path handed 26-page templates to a pool for 68 minutes; every
+    // solution it returned was refused by the node that had asked for it.
+    //
+    // The sizes are measured once; the cap they are compared against is
+    // selected per template by the block's own height.
+    let external_mining_terminal_bytes = match history_step_runtime.as_deref() {
+        Some(runtime) => jetsam_miner::measured_terminal_bytes_from_runtime(runtime)
             .map_err(|reason| anyhow::anyhow!("{reason}"))?,
         // No proof runtime means nothing can be proved here at all, so this
-        // ceiling never gates a real template. Take the most conservative tier
+        // ceiling never gates a real template. Declare every class unpublishable
         // rather than a number that would read like a measurement.
-        None => jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[0],
+        None => vec![usize::MAX; jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.len()],
     };
     tracing::info!(
-        external_mining_page_ceiling,
-        "mining API page ceiling measured"
+        ?external_mining_terminal_bytes,
+        "mining API terminal sizes measured"
     );
 
     let handler = RpcHandler {
@@ -3914,7 +3921,7 @@ pub async fn start_rpc_server(
         external_mining_attempts,
         mining_template_changes,
         external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::new(
-            external_mining_page_ceiling,
+            external_mining_terminal_bytes,
         ))),
     };
 

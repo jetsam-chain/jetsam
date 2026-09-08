@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::{
-    consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES, HistoryStepTerminalMetadata,
+    consensus::wire_limits::history_step_terminal_bytes_limit, HistoryStepTerminalMetadata,
     HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
 
@@ -143,7 +143,7 @@ impl request_response::Codec for HistoryStepTerminalCodec {
             validate_terminal_envelope(terminal, height)?;
         }
         let terminal_len = optional_len(terminal_bytes.as_deref(), "HistoryStep terminal")?;
-        validate_length(terminal_len)?;
+        validate_length(terminal_len, height)?;
         let payload_len = decoded_len(terminal_len);
         let outbound_memory_permit = match outbound_memory_permit {
             Some(permit) => Some(permit),
@@ -207,8 +207,10 @@ fn parse_response_header(
         ));
     }
     let terminal_len = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    validate_length(terminal_len)?;
+    // Read the height first: which cap applies is a property of the terminal's
+    // own height, not of the node's tip.
     let height = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    validate_length(terminal_len, height)?;
     let block_hash = header[16..48].try_into().unwrap();
     if header[49] != 0 {
         return Err(invalid_data("non-zero HistoryStep response reserved byte"));
@@ -228,13 +230,13 @@ fn parse_response_header(
     Ok((terminal_len, height, block_hash, status))
 }
 
-fn validate_length(terminal_len: u32) -> io::Result<()> {
+fn validate_length(terminal_len: u32, height: u64) -> io::Result<()> {
     let terminal_is_present = terminal_len != NONE_LEN;
     let terminal_len = decoded_len(terminal_len);
     if terminal_is_present && terminal_len <= HISTORY_STEP_TERMINAL_BINDING_BYTES {
         return Err(invalid_data("declared HistoryStep terminal is truncated"));
     }
-    if terminal_len > MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if terminal_len > history_step_terminal_bytes_limit(height) {
         return Err(invalid_data(
             "declared HistoryStep terminal exceeds wire cap",
         ));
@@ -461,7 +463,11 @@ mod tests {
     async fn malicious_length_is_rejected_before_payload_read() {
         let mut header = vec![0u8; RESPONSE_HEADER_BYTES];
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
-        header[4..8].copy_from_slice(&((MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u32).to_le_bytes());
+        header[4..8].copy_from_slice(
+            &((jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES + 1)
+                as u32)
+                .to_le_bytes(),
+        );
         assert_eq!(
             HistoryStepTerminalCodec::default()
                 .read_response(&protocol(), &mut Cursor::new(header))

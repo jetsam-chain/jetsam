@@ -357,7 +357,24 @@ mod tests {
              one: that headroom is exactly what lets it stay connected to \
              legacy peers until the activation height"
         );
+        // Anchored digest of every advertised field for a fixed bank id. Any
+        // change to a profile field — not just the two above — moves this and
+        // partitions the network at installation.
+        assert_eq!(
+            profile.profile_id, PRE_ACTIVATION_PROFILE_ID,
+            "the advertised network profile is no longer the one live peers speak"
+        );
     }
+
+    /// Profile id for `TEST_PROOF_BANK_ID` under the pre-activation baseline,
+    /// i.e. the profile v1.1.2 nodes on the live chain advertise today:
+    /// `e05175deb0ddd4592d7cca7f708f9ff63b97852c5750c2a9c4ab80a4224ddf3d`.
+    const PRE_ACTIVATION_PROFILE_ID: [u8; 32] = [
+        0xe0, 0x51, 0x75, 0xde, 0xb0, 0xdd, 0xd4, 0x59,
+        0x2d, 0x7c, 0xca, 0x7f, 0x70, 0x8f, 0x9f, 0xf6,
+        0x3b, 0x97, 0x85, 0x2c, 0x57, 0x50, 0xc2, 0xa9,
+        0xc4, 0xab, 0x80, 0xa4, 0x22, 0x4d, 0xdf, 0x3d,
+    ];
 
     #[test]
     fn proof_bank_identity_is_part_of_the_network_profile() {

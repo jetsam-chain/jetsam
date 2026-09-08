@@ -9,7 +9,7 @@ use std::{collections::HashSet, io, sync::Arc};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use jetsam_chain::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
+use jetsam_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES};
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
@@ -304,7 +304,8 @@ fn validate_object_id(object: ObjectId) -> io::Result<()> {
         ObjectId::Terminal(object) => {
             if object.claim.height == 0
                 || object.encoded_len == 0
-                || object.encoded_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+                || object.encoded_len as usize
+                    > history_step_terminal_bytes_limit(object.claim.height)
                 || object.claim.proof_class >= jetsam_chain::history_step::HISTORY_STEP_CLASS_COUNT
             {
                 return Err(invalid_data(

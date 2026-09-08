@@ -191,11 +191,14 @@ impl PreparedBlockAttempt {
             })?;
         let terminal_bytes = jetsam_recursive::history_step_terminal_wire_bytes(runtime, class_id)
             .map_err(|error| format!("terminal size for {proof_class:?} is unknown: {error:?}"))?;
-        if terminal_bytes > jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        // The cap this block will be judged by is the one active at its own
+        // height — the child of this parent — not at the tip we happen to see.
+        let child_height = expected_parent_height.saturating_add(1);
+        let terminal_cap = jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit(child_height);
+        if terminal_bytes > terminal_cap {
             return Err(format!(
-                "refusing to prepare a {proof_class:?} template: its terminal is {terminal_bytes} \
-                 bytes and the consensus cap is {}",
-                jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
+                "refusing to prepare a {proof_class:?} template at height {child_height}: its \
+                 terminal is {terminal_bytes} bytes and the consensus cap is {terminal_cap}"
             ));
         }
         let context = jetsam_block::HistoryStepPreparationContext {

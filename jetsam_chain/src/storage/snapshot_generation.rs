@@ -34,7 +34,7 @@ use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
 use crate::consensus::wire_limits::{
-    MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_SEGMENT_BYTES,
+    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS,
 };
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
@@ -180,7 +180,7 @@ impl SnapshotGeneration {
             &self.directory.join(BOUNDARY_TERMINAL_FILE_NAME),
             self.manifest.boundary_terminal_len,
             self.manifest.boundary_terminal_digest,
-            MAX_HISTORY_STEP_TERMINAL_BYTES,
+            history_step_terminal_bytes_limit(self.manifest.target_height),
             "snapshot boundary terminal",
         )
     }
@@ -194,7 +194,7 @@ impl SnapshotGeneration {
             &self.directory.join(BRIDGE_TERMINAL_FILE_NAME),
             self.manifest.bridge_terminal_len,
             self.manifest.bridge_terminal_digest,
-            MAX_HISTORY_STEP_TERMINAL_BYTES,
+            history_step_terminal_bytes_limit(self.manifest.bridge_tip_height),
             "snapshot bridge terminal",
         )
     }
@@ -758,7 +758,8 @@ fn export_snapshot_generation_inner(
                     target_height,
                 ))?,
         };
-        if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
+        if terminal.is_empty() || terminal.len() > history_step_terminal_bytes_limit(target_height)
+        {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot boundary terminal length is outside bounds",
             ));
@@ -850,7 +851,9 @@ fn export_snapshot_generation_inner(
                     bridge_tip_height,
                 ))?,
         };
-        if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
+        if terminal.is_empty()
+            || terminal.len() > history_step_terminal_bytes_limit(bridge_tip_height)
+        {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot bridge terminal length is outside bounds",
             ));
@@ -1323,7 +1326,8 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             ));
         }
     } else if manifest.boundary_terminal_len == 0
-        || manifest.boundary_terminal_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+        || manifest.boundary_terminal_len as usize
+            > history_step_terminal_bytes_limit(manifest.target_height)
     {
         return Err(SnapshotGenerationError::Corrupt(
             "snapshot boundary terminal length is outside bounds",
@@ -1347,7 +1351,8 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             ));
         }
     } else if manifest.bridge_terminal_len == 0
-        || manifest.bridge_terminal_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+        || manifest.bridge_terminal_len as usize
+            > history_step_terminal_bytes_limit(manifest.bridge_tip_height)
     {
         return Err(SnapshotGenerationError::Corrupt(
             "snapshot bridge terminal length is outside bounds",

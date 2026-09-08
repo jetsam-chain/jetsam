@@ -93,6 +93,22 @@ pub const fn history_step_terminal_bytes_limit(height: u64) -> usize {
     )
 }
 
+/// Twin of [`history_step_terminal_bytes_limit`] with the schedule injected.
+///
+/// This is a pure arithmetic answer to "how many bytes would the cap be at
+/// height H under schedule S". It grants no admission capability of any kind:
+/// what a node actually accepts is decided by the fixed schedule above, and
+/// the decoders never take a caller-chosen activation height. Public so that a
+/// miner-side guard in another crate can be tested across the fork boundary
+/// while the real schedule stays dormant.
+#[inline]
+pub const fn history_step_terminal_bytes_limit_at_activation(
+    height: u64,
+    activation_height: Option<u64>,
+) -> usize {
+    history_step_terminal_bytes_limit_with_activation(height, activation_height)
+}
+
 /// Testable twin of [`history_step_terminal_bytes_limit`] with the activation
 /// height injected.
 #[inline]

@@ -351,21 +351,21 @@ impl BlockMiner {
         // Measured once, from this node's own frozen bank: a class whose
         // terminal exceeds the consensus cap can never be published, and a
         // template built in it wastes the proof of work that found it.
-        let publishable_page_ceiling =
-            match crate::proof_capacity::publishable_page_ceiling_from_runtime(
+        let measured_terminal_bytes =
+            match crate::proof_capacity::measured_terminal_bytes_from_runtime(
                 &self.history_step_runtime,
             ) {
-                Ok(ceiling) => ceiling,
+                Ok(sizes) => sizes,
                 Err(reason) => {
                     tracing::error!(
                         %reason,
-                        "miner not starting: cannot tell which proof classes this node may publish"
+                        "miner not starting: cannot tell how large this node's terminals are"
                     );
                     return;
                 }
             };
-        tracing::info!(publishable_page_ceiling, "miner page ceiling measured");
-        let mut proof_capacity = AdaptiveProofCapacity::new(publishable_page_ceiling);
+        tracing::info!(?measured_terminal_bytes, "miner terminal sizes measured");
+        let mut proof_capacity = AdaptiveProofCapacity::new(measured_terminal_bytes);
 
         tracing::debug!("BlockMiner started");
 
@@ -428,7 +428,10 @@ impl BlockMiner {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            let max_effective_pages = proof_capacity.page_limit();
+            // The cap the block will be judged by is the one active at the
+            // block's own height, which is the child of this parent.
+            let child_height = snapshot.parent.height.saturating_add(1);
+            let max_effective_pages = proof_capacity.page_limit(child_height);
             let tmpl = match builder
                 .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
                 .await
@@ -544,9 +547,10 @@ impl BlockMiner {
             // Complete class cost is independent of live-page occupancy. A
             // coinbase-only B25 therefore calibrates the hardware just as a
             // full B25 block does.
-            let previous_page_limit = proof_capacity.page_limit();
+            let observed_child_height = attempt.expected_parent_height().saturating_add(1);
+            let previous_page_limit = proof_capacity.page_limit(observed_child_height);
             proof_capacity.observe_preparation(proof_class, prepare_elapsed);
-            let next_page_limit = proof_capacity.page_limit();
+            let next_page_limit = proof_capacity.page_limit(observed_child_height);
             let b25_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B25);
             let b255_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B255);
             if previous_page_limit != next_page_limit {
