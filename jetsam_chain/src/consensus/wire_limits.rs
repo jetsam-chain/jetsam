@@ -56,6 +56,57 @@ pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 /// an exact serialization snapshot. This remains constant in chain height.
 pub const MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1024 * 1024;
 
+/// v1 consensus cap for one serialized fused `HistoryStep` terminal.
+///
+/// The rule the chain has run under since genesis. It admits the 24/25-page
+/// class (971 732 bytes measured) and nothing else: the 255-page class has
+/// never fitted here, which is what stopped the chain at block 3575 on
+/// 2026-09-07.
+pub const V1_MAX_HISTORY_STEP_TERMINAL_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
+
+/// v1.2 consensus cap for one serialized fused `HistoryStep` terminal.
+///
+/// 1 200 000 bytes, not upstream's 1 100 000. Upstream sized its cap tightly
+/// around its own compressed terminal; ours admits the 255-page terminal in
+/// **both** forms — 1 081 108 bytes plain, at most 994 452 with shared Merkle
+/// paths — so a future terminal that grows by a few kilobytes does not need a
+/// second fork to travel. Those extra 100 000 bytes cost nothing today: they
+/// are an admission bound, never an allocation that is actually made.
+pub const V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1_200_000;
+
+/// Absolute allocation, storage and transport bound understood by this binary.
+///
+/// Sized for the largest cap this binary knows, so nothing has to be
+/// re-dimensioned at the fork height. Consensus admission still selects the
+/// smaller height-dependent cap below: a pre-activation terminal above
+/// [`V1_MAX_HISTORY_STEP_TERMINAL_BYTES`] decodes and is then rejected by the
+/// rule, which is the correct order — bound first, judge second.
+pub const MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES: usize =
+    V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES;
+
+/// Active consensus cap for a terminal belonging to `height`.
+#[inline]
+pub const fn history_step_terminal_bytes_limit(height: u64) -> usize {
+    history_step_terminal_bytes_limit_with_activation(
+        height,
+        crate::consensus::params::V1_2_ACTIVATION_HEIGHT,
+    )
+}
+
+/// Testable twin of [`history_step_terminal_bytes_limit`] with the activation
+/// height injected.
+#[inline]
+pub(crate) const fn history_step_terminal_bytes_limit_with_activation(
+    height: u64,
+    activation_height: Option<u64>,
+) -> usize {
+    if crate::consensus::params::v1_2_active_with(height, activation_height) {
+        V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
+    } else {
+        V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+    }
+}
+
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;
 
@@ -144,6 +195,88 @@ mod tests {
         // bytes above this cap — unpublishable since genesis, and unnoticed
         // until it stopped the chain at block 3575 on 2026-09-07.
         assert!(MAX_HISTORY_STEP_TERMINAL_BYTES >= 971_732);
+    }
+
+    /// The v1.2 cap is height-selected, and until the operator arms the fork
+    /// every height keeps the v1 cap. This test fails the moment
+    /// `V1_2_ACTIVATION_HEIGHT` is anything but `None`, so arming is visible
+    /// in CI and can never be a routine edit.
+    #[test]
+    fn the_raised_terminal_cap_is_not_armed() {
+        assert_eq!(V1_MAX_HISTORY_STEP_TERMINAL_BYTES, 1024 * 1024);
+        assert_eq!(V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, 1_200_000);
+        assert_eq!(
+            crate::consensus::params::V1_2_ACTIVATION_HEIGHT,
+            None,
+            "arming the v1.2 fork is decided with the network operator, never here"
+        );
+        for height in [0, 1, 2000, 4004, u64::MAX] {
+            assert_eq!(
+                history_step_terminal_bytes_limit(height),
+                V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                "height {height} must still be governed by the v1 cap"
+            );
+        }
+    }
+
+    /// The switch happens at exactly the activation height, not one block
+    /// either side of it.
+    #[test]
+    fn an_injected_activation_switches_at_its_own_height() {
+        for (height, expected) in [
+            (0, V1_MAX_HISTORY_STEP_TERMINAL_BYTES),
+            (41, V1_MAX_HISTORY_STEP_TERMINAL_BYTES),
+            (42, V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES),
+            (43, V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES),
+            (u64::MAX, V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES),
+        ] {
+            assert_eq!(
+                history_step_terminal_bytes_limit_with_activation(height, Some(42)),
+                expected,
+                "height {height}"
+            );
+        }
+    }
+
+    /// What the raised cap buys, in measured bytes (jetsam.md §20.1, §21.2).
+    ///
+    /// Both classes fit after activation — the 255-page class even in its
+    /// uncompressed form, which is why 1 200 000 and not upstream's 1 100 000:
+    /// the extra 100 000 bytes cost nothing now and would need another fork
+    /// later.
+    #[test]
+    fn the_raised_cap_admits_both_measured_classes() {
+        const B24_TERMINAL: usize = 971_732;
+        const B255_TERMINAL: usize = 1_081_108;
+        const B255_TERMINAL_SHARED_PATHS_BOUND: usize = 994_452;
+
+        assert!(B24_TERMINAL <= V1_MAX_HISTORY_STEP_TERMINAL_BYTES);
+        assert!(
+            B255_TERMINAL > V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+            "if the 255-page class already fitted the v1 cap, the halt of \
+             block 3575 could not have happened — re-read §20 before relaxing"
+        );
+        assert!(B255_TERMINAL <= V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES);
+        assert_eq!(
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES - B255_TERMINAL,
+            118_892
+        );
+        assert_eq!(
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES - B255_TERMINAL_SHARED_PATHS_BOUND,
+            205_548
+        );
+    }
+
+    /// Allocation, storage and transport are sized for the largest cap this
+    /// binary understands, so a pre-activation node never has to re-allocate
+    /// at the fork height. Admission still uses the height-selected cap.
+    #[test]
+    fn transport_is_sized_for_the_largest_cap_this_binary_knows() {
+        assert_eq!(
+            MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+        assert!(MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES >= V1_MAX_HISTORY_STEP_TERMINAL_BYTES);
     }
 
     #[test]

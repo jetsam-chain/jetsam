@@ -90,6 +90,40 @@ pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 540s at BLOCK_TIME=90
 /// proves against real mainnet headers.
 pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
 
+/// First block height governed by the complete v1.2 consensus rules.
+///
+/// **`None` keeps every v1.2 rule disabled.** One activation height is set
+/// once, for the whole upgrade: the shared-path terminal encoding, the raised
+/// terminal cap, the 24-page small class and the two-epoch transaction anchor
+/// all switch on this single clock. Individual v1.2 changes must never
+/// introduce an independent one — two clocks are two forks, and the second one
+/// partitions the network on a day nobody watched.
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// The height is decided with the network operator and must sit far enough
+/// above the tip that every node and every miner runs a binary carrying this
+/// constant *before* the height is reached. rplant places about 96 % of the
+/// blocks: if that miner misses the date, **we** are the minority chain. The
+/// three hours of notice taken for `ASERT_POLYNOMIAL_FIX_HEIGHT` are not a
+/// precedent — that fork was native-only and touched no proof artifact.
+///
+/// `wire_limits::tests::the_raised_terminal_cap_is_not_armed` fails the moment
+/// this value is anything but `None`, so arming is visible in CI.
+pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Whether one candidate block height is governed by the v1.2 consensus rules.
+#[inline]
+pub const fn v1_2_active(height: u64) -> bool {
+    v1_2_active_with(height, V1_2_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_2_active`] with the activation height injected.
+#[inline]
+pub(crate) const fn v1_2_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
 

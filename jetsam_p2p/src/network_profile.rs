@@ -323,6 +323,42 @@ mod tests {
         assert!(decode_response(&trailing).await.is_err());
     }
 
+    /// The v1.2 fork must partition the network **at its activation height**
+    /// and nowhere else. This profile is exchanged before a connection becomes
+    /// usable, so raising either of these two fields here would partition at
+    /// *installation* instead: an upgraded node and a legacy node would refuse
+    /// each other weeks before the fork, and the upgrade could never spread.
+    ///
+    /// Both therefore stay on the pre-activation baseline. Height-selected
+    /// consensus admits the wider terminal and the shared-path encoding on its
+    /// own, at the height where every node switches together.
+    #[test]
+    fn the_advertised_profile_stays_on_the_pre_activation_baseline() {
+        use jetsam_chain::consensus::wire_limits::{
+            MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+        };
+        use jetsam_chain::history_step::HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION;
+
+        let profile = NetworkProfile::for_proof_bank(TEST_PROOF_BANK_ID);
+        assert_eq!(profile.wire_version, 7);
+        assert_eq!(
+            profile.max_terminal_bytes,
+            V1_MAX_HISTORY_STEP_TERMINAL_BYTES as u32
+        );
+        assert_eq!(profile.max_terminal_bytes, 1_048_576);
+        assert_eq!(profile.history_terminal_version, 4);
+        assert_ne!(
+            profile.history_terminal_version,
+            HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION
+        );
+        assert!(
+            MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES > profile.max_terminal_bytes as usize,
+            "this binary allocates for the raised cap while advertising the old \
+             one: that headroom is exactly what lets it stay connected to \
+             legacy peers until the activation height"
+        );
+    }
+
     #[test]
     fn proof_bank_identity_is_part_of_the_network_profile() {
         let first = NetworkProfile::for_proof_bank([1; 32]);
