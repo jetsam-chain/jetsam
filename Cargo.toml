@@ -50,3 +50,11 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# The published libmdbx 0.6.6 does not compile for x86_64-pc-windows-gnu: it
+# assumes every Windows build is MSVC, while bindgen picks a different integer
+# type under mingw. The fix is two `#[cfg]` attributes, vendored in-tree so the
+# Windows binaries can be rebuilt from a clone rather than from one machine.
+# See third_party/libmdbx-0.6.6-mingw/PATCH.md. No effect on other targets.
+[patch.crates-io]
+libmdbx = { path = "third_party/libmdbx-0.6.6-mingw" }
