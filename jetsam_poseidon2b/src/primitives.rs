@@ -85,7 +85,20 @@ newtype_digest!(
 /// JETSAM CHANGE: upstream Parano1d uses `"o"`, producing `o1…`. Jetsam uses
 /// `"j"` so that an address cannot be silently mistaken between the two
 /// networks — a mis-sent coinbase is unrecoverable.
+///
+/// The test chain uses `"tj"`, producing `tj1…`. This is the barrier that
+/// makes a test coin unusable as a real one: a mainnet build does not merely
+/// discourage a testnet address, it **cannot decode it** — bech32m fails on
+/// the HRP and `AddressError::WrongHrp` names the reason. Nobody can be paid
+/// in test coins by accident, and nobody can present a testnet address as a
+/// mainnet one.
+///
+/// It is a display and parsing constant only: it enters no hash, no domain tag
+/// and no proof matrix, so the two chains still run the identical circuit.
+#[cfg(not(feature = "testnet"))]
 pub const ADDRESS_HRP: &str = "j";
+#[cfg(feature = "testnet")]
+pub const ADDRESS_HRP: &str = "tj";
 
 /// Error returned when decoding a bech32m address fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
