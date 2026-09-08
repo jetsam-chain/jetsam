@@ -3387,6 +3387,8 @@ impl P2PNetwork {
         history_proof_bank_id: [u8; 32],
         data_dir: std::path::PathBuf,
         background_capacity: BackgroundCapacity,
+        lan_discovery: bool,
+        upnp_enabled: bool,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<anyhow::Result<()>>)> {
         // Load before spawning so an absent, corrupt, symlinked, or publicly
         // readable private identity fails node startup instead of silently
@@ -3415,6 +3417,8 @@ impl P2PNetwork {
                 identity,
                 health_tx,
                 background_capacity,
+                lan_discovery,
+                upnp_enabled,
             )
             .await
         });
@@ -3604,6 +3608,8 @@ async fn run_swarm(
     identity: libp2p::identity::Keypair,
     health_tx: tokio::sync::watch::Sender<P2PHealthSnapshot>,
     background_capacity: BackgroundCapacity,
+    lan_discovery: bool,
+    upnp_enabled: bool,
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
@@ -3637,6 +3643,8 @@ async fn run_swarm(
                 relay_client,
                 background_capacity,
                 public_relay_enabled,
+                lan_discovery,
+                upnp_enabled,
             )
         })?
         .with_swarm_config(|cfg| {

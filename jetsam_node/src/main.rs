@@ -1020,6 +1020,22 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
+    /// Do not ask the router to map the P2P port outward (UPnP/IGD).
+    ///
+    /// Mapping is attempted by default, because a node behind a home router
+    /// otherwise receives blocks and serves nobody. Use this where the router
+    /// answers UPnP badly, or the network forbids it.
+    #[arg(long)]
+    no_upnp: bool,
+
+    /// Discover peers by mDNS broadcast on the local network segment.
+    ///
+    /// Off unless asked for: on a VPS that segment is the provider's, shared
+    /// with other tenants. Use it on a LAN you own; elsewhere add peers with
+    /// --seed.
+    #[arg(long)]
+    lan_discovery: bool,
+
     /// P2P listen address in HOST:PORT format. Repeat for several
     /// (for example --p2p-listen 0.0.0.0:9700 --p2p-listen [::]:9700).
     /// Default: 0.0.0.0:9700
@@ -1958,6 +1974,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         jetsam_p2p::BackgroundCapacity::MiningReserved
     };
+    // Say which flag turns it off, in the same line that says it is on. An
+    // operator who does not want UPnP should not have to go looking.
+    let upnp_enabled = cfg.network.upnp && !cli.no_upnp;
+    if upnp_enabled {
+        tracing::info!("asking the router to map the P2P port (UPnP); disable with --no-upnp");
+    } else {
+        tracing::info!("not asking the router for a port mapping (UPnP off)");
+    }
     let (p2p, mut p2p_task) = P2PNetwork::start(
         listen_addrs.clone(),
         public_p2p_addresses,
@@ -1967,6 +1991,8 @@ async fn main() -> anyhow::Result<()> {
         history_proof_bank_id,
         data_dir.clone(),
         p2p_background_capacity,
+        cli.lan_discovery || cfg.network.lan_discovery,
+        upnp_enabled,
     )
     .context("start P2P network")?;
     let p2p_health_rx = p2p.health_receiver();
