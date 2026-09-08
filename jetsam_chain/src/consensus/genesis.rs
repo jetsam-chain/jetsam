@@ -21,7 +21,17 @@ use crate::consensus::{
 use jetsam_poseidon2b::primitives::Address;
 
 /// Fixed mainnet genesis timestamp (2026-08-21 16:00:00 UTC).
+#[cfg(not(feature = "testnet"))]
 pub const GENESIS_TIMESTAMP: u64 = 1_787_328_000;
+
+/// Test-chain genesis timestamp (2026-09-09 00:00:00 UTC).
+///
+/// A different genesis is what actually keeps the two networks apart: it
+/// changes the genesis hash, therefore the network `profile_id`, and two nodes
+/// with different profiles refuse each other **before** any block is offered.
+/// The ticker and the address HRP protect humans; this protects the protocol.
+#[cfg(feature = "testnet")]
+pub const GENESIS_TIMESTAMP: u64 = 1_788_912_000;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -72,7 +82,14 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
 /// Mined for the canonical 16-field PoW schedule.
 // JETSAM CHANGE: re-mined against the new TowerHash schedule.
+#[cfg(not(feature = "testnet"))]
 const GENESIS_NONCE: u128 = 131_160;
+
+/// Test-chain genesis nonce, re-mined for the test-chain timestamp.
+/// `genesis_nonce_is_valid` below proves it satisfies the target, whichever
+/// profile is compiled.
+#[cfg(feature = "testnet")]
+const GENESIS_NONCE: u128 = 300_173;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -169,7 +186,10 @@ mod tests {
         );
     }
 
+    /// The mainnet genesis id, anchored. This is the chain that exists; the
+    /// value must never move again.
     #[test]
+    #[cfg(not(feature = "testnet"))]
     fn genesis_block_id_is_canonical() {
         assert_eq!(
             crate::block_header::block_id(&genesis_header()),
@@ -181,9 +201,34 @@ mod tests {
         );
     }
 
+    /// The test chain's genesis id, anchored the same way — and required to
+    /// differ from the mainnet one. That difference is the whole separation:
+    /// it changes the network `profile_id`, so a testnet node and a mainnet
+    /// node refuse each other at the handshake instead of exchanging blocks.
+    #[test]
+    #[cfg(feature = "testnet")]
+    fn testnet_genesis_block_id_is_canonical_and_differs_from_mainnet() {
+        const MAINNET_GENESIS_ID: [u8; 32] = [
+            0x6e, 0x59, 0x2c, 0x07, 0xbe, 0x6f, 0xd1, 0xb4, 0x25, 0x9e, 0xea, 0xcb, 0xf4, 0xeb,
+            0x7e, 0xb2, 0x94, 0x8a, 0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1, 0x2f, 0xda, 0xb4, 0x2c,
+            0x44, 0x8c, 0x5f, 0x44,
+        ];
+        let id = crate::block_header::block_id(&genesis_header());
+        assert_ne!(id, MAINNET_GENESIS_ID, "the two chains must not share a genesis");
+        const TESTNET_GENESIS_ID: [u8; 32] = [
+            0xb3, 0xef, 0xb3, 0xc1, 0xd3, 0x1f, 0xee, 0x8b, 0x9a, 0xee, 0x7b, 0x06, 0xcb, 0x11,
+            0x2f, 0xae, 0xa5, 0xab, 0xc1, 0xce, 0xb7, 0x35, 0xd2, 0x1c, 0xa5, 0xa3, 0x90, 0x1b,
+            0x11, 0x0f, 0x99, 0x6d,
+        ];
+        assert_eq!(id, TESTNET_GENESIS_ID);
+    }
+
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn genesis_timestamp_is_reasonable() {
+        #[cfg(not(feature = "testnet"))]
         assert_eq!(GENESIS_TIMESTAMP, 1_787_328_000);
+        #[cfg(feature = "testnet")]
+        assert_eq!(GENESIS_TIMESTAMP, 1_788_912_000);
     }
 }

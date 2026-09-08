@@ -3,6 +3,11 @@ name = "jetsam_poseidon2b"
 version.workspace = true
 edition = "2021"
 
+[features]
+# Test-chain identity. Never enable for a mainnet release: it changes the
+# address HRP, so a build carrying it cannot read or write mainnet addresses.
+testnet = []
+
 [dependencies]
 jetsam_core = { path = "../jetsam_core" }
 rayon = "1.10"
