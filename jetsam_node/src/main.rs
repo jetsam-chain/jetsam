@@ -773,6 +773,81 @@ fn stale_gap_recovery_is_due(
     stale_secs >= 30 && highest_announced > local_height && !canonical_transition_active
 }
 
+/// Consecutive stale-gap recovery rounds a node may burn on one height before
+/// the log stops treating the gap as routine.
+///
+/// Rounds fire at most every 30 s, so this is five minutes during which peers
+/// kept announcing higher blocks and not one of them applied here.
+const STALE_GAP_ROUNDS_BEFORE_ALARM: u32 = 10;
+
+/// Counts consecutive stale-gap recovery rounds spent on a single height.
+///
+/// A node that is merely slow advances between rounds and resets the count; a
+/// node the network has left behind - an old release facing a fork it cannot
+/// verify - never does. Every diagnostic an operator needs was already in the
+/// existing INFO lines except this one number, which is precisely the number
+/// that separates "catching up" from "will never catch up".
+#[derive(Default)]
+struct StaleGapStreak {
+    height: u64,
+    rounds: u32,
+}
+
+impl StaleGapStreak {
+    fn record_round(&mut self, local_height: u64) {
+        if self.height != local_height {
+            self.height = local_height;
+            self.rounds = 0;
+        }
+        self.rounds = self.rounds.saturating_add(1);
+    }
+
+    fn rounds(&self) -> u32 {
+        self.rounds
+    }
+
+    fn cause_is_worth_naming(&self) -> bool {
+        self.rounds >= STALE_GAP_ROUNDS_BEFORE_ALARM
+    }
+}
+
+/// Reports one stale-gap recovery round, naming the likely cause once the gap
+/// has stopped looking transient.
+///
+/// `routine` is the message for a gap that is still plausibly closing; both
+/// call sites pass their own, because a deep gap and a recent one are
+/// recovered differently. The alarm is shared: the cause is the same.
+fn log_stale_gap_round(
+    streak: &StaleGapStreak,
+    our_height: u64,
+    highest_announced: u64,
+    stale_secs: u64,
+    peer: libp2p::PeerId,
+    routine: &'static str,
+) {
+    if streak.cause_is_worth_naming() {
+        tracing::warn!(
+            our_height,
+            highest_announced,
+            stale_secs,
+            rounds = streak.rounds(),
+            peer = %peer,
+            "stuck behind the network — this node has not applied a single block across \
+             repeated recovery rounds while peers keep announcing higher ones; the usual \
+             cause is a release too old for this chain, so check for a newer one before \
+             suspecting the network"
+        );
+    } else {
+        tracing::info!(
+            our_height,
+            highest_announced,
+            stale_secs,
+            peer = %peer,
+            message = routine
+        );
+    }
+}
+
 fn terminal_transport_can_retry_same_peer(kind: jetsam_p2p::RequestFailureKind) -> bool {
     matches!(
         kind,
@@ -2107,26 +2182,36 @@ async fn main() -> anyhow::Result<()> {
                         .send(jetsam_p2p::NetworkCommand::BroadcastTx { intent_bytes })
                         .await;
                 }
-                Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason })
+                Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason }) => {
+                    // The pool used to drop transactions in silence: no log
+                    // line, whoever sent one had nothing to read. Every
+                    // eviction is now on the record, whether or not the
+                    // transaction belongs to a wallet this node holds.
+                    tracing::info!(
+                        txid = %hex::encode(hash.0),
+                        ?reason,
+                        explanation = reason.operator_explanation(),
+                        "mempool: a transaction left the pool without being mined"
+                    );
                     // Pool pressure drops a transaction that is still perfectly
                     // valid — another node can mine it at any time. Releasing
                     // its inputs here would let the owner build a conflicting
                     // second payment from the same UTXOs, so only the reasons
                     // the chain itself has settled clear the record.
-                    if !matches!(reason, jetsam_mempool::EvictReason::CapacityPressure) =>
-                {
-                    // Nothing used to undo this: the wallet kept a "sent" line
-                    // that could never confirm, and held that send's UTXOs
-                    // reserved for the rest of the process's life.
-                    match wallet::forget_evicted_send(&evicted_send_wallet, &hash.0) {
-                        Ok(true) => tracing::info!(
-                            txid = %hex::encode(hash.0),
-                            ?reason,
-                            "wallet: a pending send left the mempool without being mined"
-                        ),
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::error!(%error, "wallet: could not release an evicted send")
+                    if !matches!(reason, jetsam_mempool::EvictReason::CapacityPressure) {
+                        // Nothing used to undo this: the wallet kept a "sent" line
+                        // that could never confirm, and held that send's UTXOs
+                        // reserved for the rest of the process's life.
+                        match wallet::forget_evicted_send(&evicted_send_wallet, &hash.0) {
+                            Ok(true) => tracing::info!(
+                                txid = %hex::encode(hash.0),
+                                ?reason,
+                                "wallet: a pending send left the mempool without being mined"
+                            ),
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::error!(%error, "wallet: could not release an evicted send")
+                            }
                         }
                     }
                 }
@@ -4869,6 +4954,7 @@ mod tests {
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
+        log_stale_gap_round, StaleGapStreak, STALE_GAP_ROUNDS_BEFORE_ALARM,
         superseded_snapshot_install, terminal_alternate_peer,
         terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
         unresolved_tip_probe_range, validate_history_step_tip_future_drift,
@@ -6883,6 +6969,113 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_gap_streak_ends_the_moment_our_own_tip_moves() {
+        let mut streak = StaleGapStreak::default();
+        for expected in 1..=4 {
+            streak.record_round(879);
+            assert_eq!(streak.rounds(), expected);
+        }
+        // One block applied is enough: this node is behind, not left behind.
+        streak.record_round(880);
+        assert_eq!(streak.rounds(), 1);
+        assert!(!streak.cause_is_worth_naming());
+    }
+
+    #[test]
+    fn a_stale_gap_names_its_likely_cause_only_after_repeated_rounds() {
+        let mut streak = StaleGapStreak::default();
+        for _ in 1..STALE_GAP_ROUNDS_BEFORE_ALARM {
+            streak.record_round(879);
+            assert!(
+                !streak.cause_is_worth_naming(),
+                "a transient gap must stay routine"
+            );
+        }
+        streak.record_round(879);
+        assert!(streak.cause_is_worth_naming());
+        // And it keeps saying so: the node stayed at 879 through the fork.
+        streak.record_round(879);
+        assert!(streak.cause_is_worth_naming());
+    }
+
+    #[test]
+    fn a_node_that_advances_every_round_never_raises_the_alarm() {
+        let mut streak = StaleGapStreak::default();
+        for height in 0..STALE_GAP_ROUNDS_BEFORE_ALARM * 4 {
+            streak.record_round(u64::from(height));
+            assert!(!streak.cause_is_worth_naming());
+        }
+    }
+
+    /// Captures what a subscriber actually prints, so the assertions below are
+    /// about the line an operator reads and not about the call we wrote.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn rendered_stale_gap(rounds: u32) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let mut streak = StaleGapStreak::default();
+        for _ in 0..rounds {
+            streak.record_round(879);
+        }
+        tracing::subscriber::with_default(subscriber, || {
+            log_stale_gap_round(
+                &streak,
+                879,
+                901,
+                30,
+                libp2p::PeerId::random(),
+                "stale recent gap — re-requesting authenticated headers",
+            );
+        });
+        let bytes = captured.0.lock().expect("capture buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    #[test]
+    fn a_gap_that_still_looks_transient_reads_exactly_as_it_used_to() {
+        let line = rendered_stale_gap(1);
+        assert!(line.contains("INFO"), "{line}");
+        assert!(
+            line.contains("stale recent gap — re-requesting authenticated headers"),
+            "the routine wording must stay the message, not become a field: {line}"
+        );
+        assert!(line.contains("our_height=879"), "{line}");
+    }
+
+    #[test]
+    fn a_gap_that_never_closes_says_so_out_loud_and_names_the_cause() {
+        let line = rendered_stale_gap(STALE_GAP_ROUNDS_BEFORE_ALARM);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("release too old for this chain"), "{line}");
+        assert!(
+            line.contains(&format!("rounds={STALE_GAP_ROUNDS_BEFORE_ALARM}")),
+            "the operator must see how long this has been going on: {line}"
+        );
+    }
+
+    #[test]
     fn snapshot_header_progress_rejects_delayed_and_oversized_batches() {
         assert_eq!(
             snapshot_header_next_action(10, 20).unwrap(),
@@ -8671,6 +8864,10 @@ async fn handle_p2p_events(
     // detects when our chain hasn't advanced despite seeing higher announcements
     // and re-requests from a random connected peer.
     let mut last_tip_advance: Instant = Instant::now();
+    // `last_tip_advance` is reset by every dispatched recovery, so it measures
+    // the wait between two attempts and never how long the node has been stuck.
+    // This does.
+    let mut stale_gap_streak = StaleGapStreak::default();
     let mut highest_announced: u64 = 0;
     let mut last_announcement_peer: Option<libp2p::PeerId> = None;
     let mut bootstrap_complete_sent = false;
@@ -13777,12 +13974,14 @@ async fn handle_p2p_events(
                                 if try_request_manifest!(peer, our_height, [0; 32]) {
                                     recovery_dispatched = true;
                                     manifest_force_snapshot_peers.insert(peer);
-                                    tracing::info!(
+                                    stale_gap_streak.record_round(our_height);
+                                    log_stale_gap_round(
+                                        &stale_gap_streak,
                                         our_height,
                                         highest_announced,
                                         stale_secs,
-                                        peer = %peer,
-                                        "stale deep gap — requesting snapshot manifest"
+                                        peer,
+                                        "stale deep gap — requesting snapshot manifest",
                                     );
                                 }
                             }
@@ -13800,12 +13999,14 @@ async fn handle_p2p_events(
                                 Instant::now(),
                             );
                             if recovery_dispatched {
-                                tracing::info!(
+                                stale_gap_streak.record_round(our_height);
+                                log_stale_gap_round(
+                                    &stale_gap_streak,
                                     our_height,
                                     highest_announced,
                                     stale_secs,
-                                    peer = %peer,
-                                    "stale recent gap — re-requesting authenticated headers"
+                                    peer,
+                                    "stale recent gap — re-requesting authenticated headers",
                                 );
                             }
                         }

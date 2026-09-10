@@ -1069,6 +1069,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transaction_left_behind_by_an_epoch_boundary_announces_why() {
+        use crate::event::{EvictReason, MempoolEvent};
+
+        let state = ChainState::with_log_slots(6);
+        let mut view = ChainView::new(0, HashMap::new(), 0, state.state);
+        let anchor = [0x11; 32];
+        view.user_epoch_anchor_id = anchor;
+        let pool = AsyncMempool::new(view.clone(), MempoolConfig::default());
+        let pages = user_pages(anchor, 300, 1);
+        let txid = validate_paged_spend(&pages).unwrap().logical_txid;
+        {
+            let mut locked = pool.state.lock().await;
+            locked.pool.admit(pages, 0).expect("admit");
+        }
+        let mut events = pool.subscribe();
+
+        // A boundary block installs a new anchor, and nothing built on the old
+        // one can ever be mined. This is the ordinary fate of a transaction no
+        // miner picked up within TX_EPOCH_BLOCKS, and it used to be silent.
+        let mut after_boundary = view.clone();
+        after_boundary.user_epoch_anchor_id = [0x22; 32];
+        pool.on_new_block(&[], 1, after_boundary).await;
+
+        let mut evicted = None;
+        while let Ok(event) = events.try_recv() {
+            if let MempoolEvent::TxEvicted { hash, reason } = event {
+                evicted = Some((hash, reason));
+            }
+        }
+        let (hash, reason) = evicted.expect("the pool must say what it dropped");
+        assert_eq!(hash, txid);
+        assert_eq!(reason, EvictReason::EpochAnchorChanged);
+        assert!(
+            reason.operator_explanation().contains("epoch"),
+            "the words the operator reads must name the cause"
+        );
+    }
+
+    #[tokio::test]
     async fn anchored_selection_filters_before_cloning_bounded_prefix() {
         let state = ChainState::with_log_slots(6);
         let pool = AsyncMempool::new(

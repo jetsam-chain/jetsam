@@ -52,3 +52,57 @@ pub enum EvictReason {
     /// The wallet should rebuild/re-prove with fresh slot hints.
     OutputSlotOccupied,
 }
+
+impl EvictReason {
+    /// What the sender needs to know, in the words an operator can act on.
+    ///
+    /// The variant names describe the mechanism; a person watching a payment
+    /// disappear needs the consequence. The `match` is deliberately exhaustive:
+    /// a new reason must not be able to reach a log line without an explanation.
+    pub fn operator_explanation(&self) -> &'static str {
+        match self {
+            // TX_EPOCH_BLOCKS is 32, so this fires roughly every 48 minutes for
+            // anything still waiting. It is the ordinary fate of a transaction
+            // that no miner picked up, and nothing used to say so.
+            Self::EpochAnchorChanged => {
+                "it was still waiting when its transaction epoch ended; \
+                 the wallet must rebuild and send it again"
+            }
+            Self::CapacityPressure => {
+                "the pool was full and this fee was among the lowest; \
+                 another node may still mine it, or it can be re-sent with a higher fee"
+            }
+            Self::InputConsumed => {
+                "the coins it spends were already spent by a confirmed block"
+            }
+            Self::OutputSlotOccupied => {
+                "a confirmed block took a state slot it had claimed; \
+                 the wallet must rebuild it with fresh slot hints"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EvictReason;
+
+    #[test]
+    fn every_eviction_reason_tells_the_sender_what_actually_happened() {
+        let reasons = [
+            EvictReason::EpochAnchorChanged,
+            EvictReason::CapacityPressure,
+            EvictReason::InputConsumed,
+            EvictReason::OutputSlotOccupied,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for reason in &reasons {
+            let words = reason.operator_explanation();
+            assert!(!words.is_empty(), "{reason:?} explains nothing");
+            assert!(
+                seen.insert(words),
+                "{reason:?} reuses another reason's words, so the log cannot tell them apart"
+            );
+        }
+    }
+}
