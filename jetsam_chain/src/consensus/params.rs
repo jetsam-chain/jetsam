@@ -112,14 +112,16 @@ pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
 /// moment this value disagrees with the declaration beside it, so arming is
 /// visible in CI and cannot happen as a side effect of an unrelated edit.
 ///
-/// **Armed at 8200 on 2026-09-11.** The tip was 7232 at 11:00:58 UTC and the
-/// measured interval over the preceding 960 blocks was 90.2 s, over the last
-/// 100 blocks 92.4 s — so 968 blocks is between 24.2 and 24.9 hours of notice,
-/// landing on 2026-09-12 around 11:15-11:52 UTC. The margin is deliberately on
-/// the late side: an operator who is given more time than announced loses
-/// nothing, one who is given less loses the ability to sync at all.
+/// **Armed at 8450 on 2026-09-11.** The tip was 7249 at 11:26:15 UTC and the
+/// measured interval was 90.2 s over the preceding 960 blocks, 92.4 s over the
+/// last 100 — so 1201 blocks is between 30.1 and 30.8 hours of notice, landing
+/// on 2026-09-12 around 17:30-18:15 UTC.
+///
+/// The margin is deliberately on the late side. An operator given more time
+/// than announced loses nothing; one given less loses the ability to sync at
+/// all, and the largest miner on this chain places about 96 % of the blocks.
 #[cfg(not(feature = "testnet"))]
-pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(8200);
+pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(8450);
 
 /// The test chain arms the fork, so the crossing can be watched on a real chain
 /// with real pre-fork history behind it — the one thing no bench stands in for.
