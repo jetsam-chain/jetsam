@@ -213,10 +213,34 @@ mod tests {
         assert!(MAX_HISTORY_STEP_TERMINAL_BYTES >= 971_732);
     }
 
+    /// The test chain arms the fork on purpose, so the mainnet guard above is
+    /// compiled out here and replaced by its mirror: the armed height is an
+    /// operator decision too, and changing it by accident must still fail CI.
+    /// Below the height the v1 cap governs; at and above it, the raised one.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn the_test_chain_arms_the_fork_at_its_agreed_height() {
+        let armed = crate::consensus::params::V1_2_ACTIVATION_HEIGHT
+            .expect("the test chain is armed; see params::V1_2_ACTIVATION_HEIGHT");
+        assert_eq!(
+            armed, 880,
+            "the armed height is chosen against the test chain's tip, never edited in passing"
+        );
+        assert_eq!(
+            history_step_terminal_bytes_limit(armed - 1),
+            V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+        assert_eq!(
+            history_step_terminal_bytes_limit(armed),
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+    }
+
     /// The v1.2 cap is height-selected, and until the operator arms the fork
     /// every height keeps the v1 cap. This test fails the moment
     /// `V1_2_ACTIVATION_HEIGHT` is anything but `None`, so arming is visible
     /// in CI and can never be a routine edit.
+    #[cfg(not(feature = "testnet"))]
     #[test]
     fn the_raised_terminal_cap_is_not_armed() {
         assert_eq!(V1_MAX_HISTORY_STEP_TERMINAL_BYTES, 1024 * 1024);

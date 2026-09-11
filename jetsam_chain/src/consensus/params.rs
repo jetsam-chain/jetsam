@@ -110,7 +110,19 @@ pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
 ///
 /// `wire_limits::tests::the_raised_terminal_cap_is_not_armed` fails the moment
 /// this value is anything but `None`, so arming is visible in CI.
+#[cfg(not(feature = "testnet"))]
 pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// The test chain arms the fork, so the crossing can be watched on a real chain
+/// with real pre-fork history behind it — the one thing no bench stands in for.
+/// Chosen against that chain's own tip, which was 859 when this was set.
+///
+/// A mainnet build never sees this value: the `cfg` above keeps mainnet `None`,
+/// and the test-chain identity is a separate feature, so arming one cannot arm
+/// the other. A binary carrying this constant also carries the `tj1…` address
+/// prefix and its own genesis, and therefore cannot join the mainnet at all.
+#[cfg(feature = "testnet")]
+pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(880);
 
 /// Whether one candidate block height is governed by the v1.2 consensus rules.
 #[inline]

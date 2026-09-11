@@ -586,6 +586,7 @@ mod tests {
     /// above the v1 cap must still be refused at every height while the fork is
     /// dormant — the preflight bound and the consensus rule are two different
     /// questions, asked in that order.
+    #[cfg(not(feature = "testnet"))]
     #[test]
     fn transport_headroom_does_not_activate_the_raised_cap_early() {
         use crate::consensus::wire_limits::V1_MAX_HISTORY_STEP_TERMINAL_BYTES;
@@ -707,5 +708,43 @@ mod tests {
         let second = AcceptedBlockBundle::try_from_parts(renonced.to_bytes(), terminal).unwrap();
         assert_eq!(first.height(), second.height());
         assert_ne!(first.block_hash(), second.block_hash());
+    }
+}
+
+#[cfg(all(test, feature = "testnet"))]
+mod armed_chain_tests {
+    use super::*;
+    use crate::consensus::params::V1_2_ACTIVATION_HEIGHT;
+    use crate::consensus::wire_limits::{
+        V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+    };
+
+    /// Mirror of `transport_headroom_does_not_activate_the_raised_cap_early`
+    /// for the armed test chain: the raised cap must begin at the agreed
+    /// height and not one block before it.
+    #[test]
+    fn the_raised_cap_begins_exactly_at_the_armed_height() {
+        let armed = V1_2_ACTIVATION_HEIGHT.expect("the test chain is armed");
+        let over_v1 = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
+
+        assert!(matches!(
+            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, armed - 1),
+            Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                ..
+            })
+        ));
+        assert!(
+            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, armed).is_ok()
+        );
+
+        let over_v1_2 = (V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
+        assert!(matches!(
+            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1_2, armed),
+            Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                max: V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                ..
+            })
+        ));
     }
 }
