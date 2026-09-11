@@ -2183,36 +2183,56 @@ async fn main() -> anyhow::Result<()> {
                         .await;
                 }
                 Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason }) => {
-                    // The pool used to drop transactions in silence: no log
-                    // line, whoever sent one had nothing to read. Every
-                    // eviction is now on the record, whether or not the
-                    // transaction belongs to a wallet this node holds.
-                    tracing::info!(
-                        txid = %hex::encode(hash.0),
-                        ?reason,
-                        explanation = reason.operator_explanation(),
-                        "mempool: a transaction left the pool without being mined"
-                    );
+                    // The wallet release runs first, and the log second. An
+                    // epoch boundary evicts the whole pool in one burst, and
+                    // formatting a line per transaction ahead of the release is
+                    // how a slow subscriber turns that burst into a dropped
+                    // event — which costs a log line, and a send whose coins
+                    // stay reserved for the life of the process.
+                    //
                     // Pool pressure drops a transaction that is still perfectly
                     // valid — another node can mine it at any time. Releasing
                     // its inputs here would let the owner build a conflicting
                     // second payment from the same UTXOs, so only the reasons
                     // the chain itself has settled clear the record.
-                    if !matches!(reason, jetsam_mempool::EvictReason::CapacityPressure) {
-                        // Nothing used to undo this: the wallet kept a "sent" line
-                        // that could never confirm, and held that send's UTXOs
-                        // reserved for the rest of the process's life.
-                        match wallet::forget_evicted_send(&evicted_send_wallet, &hash.0) {
-                            Ok(true) => tracing::info!(
-                                txid = %hex::encode(hash.0),
-                                ?reason,
-                                "wallet: a pending send left the mempool without being mined"
-                            ),
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::error!(%error, "wallet: could not release an evicted send")
+                    let was_our_pending_send =
+                        if matches!(reason, jetsam_mempool::EvictReason::CapacityPressure) {
+                            false
+                        } else {
+                            // Nothing used to undo this: the wallet kept a
+                            // "sent" line that could never confirm, and held
+                            // that send's UTXOs reserved for the rest of the
+                            // process's life.
+                            match wallet::forget_evicted_send(&evicted_send_wallet, &hash.0) {
+                                Ok(released) => released,
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        "wallet: could not release an evicted send"
+                                    );
+                                    false
+                                }
                             }
-                        }
+                        };
+
+                    // The pool used to drop transactions in silence: no log
+                    // line, whoever sent one had nothing to read. Every
+                    // eviction is now on the record, whether or not the
+                    // transaction belongs to a wallet this node holds.
+                    if was_our_pending_send {
+                        tracing::info!(
+                            txid = %hex::encode(hash.0),
+                            ?reason,
+                            explanation = reason.operator_explanation(),
+                            "wallet: a pending send left the mempool without being mined"
+                        );
+                    } else {
+                        tracing::info!(
+                            txid = %hex::encode(hash.0),
+                            ?reason,
+                            explanation = reason.operator_explanation(),
+                            "mempool: a transaction left the pool without being mined"
+                        );
                     }
                 }
                 Ok(_) => {}
@@ -7054,14 +7074,36 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_that_still_looks_transient_reads_exactly_as_it_used_to() {
+    fn a_gap_that_still_looks_transient_renders_its_own_wording_as_the_message() {
         let line = rendered_stale_gap(1);
-        assert!(line.contains("INFO"), "{line}");
-        assert!(
-            line.contains("stale recent gap — re-requesting authenticated headers"),
-            "the routine wording must stay the message, not become a field: {line}"
+        let body = line
+            .split_once("INFO ")
+            .expect("an INFO line")
+            .1
+            .trim_end()
+            .to_string();
+        // Pinned in full, not by `contains`. A substring check passed happily
+        // while the wording moved from the head of the line to its tail, and
+        // would also have passed if it had degraded into a `routine="…"` field.
+        // Fields are emitted in declaration order and `message` is not special
+        // enough to jump the queue, so the wording trails them.
+        let peer = body
+            .split_once("peer=")
+            .expect("a peer field")
+            .1
+            .split_once(' ')
+            .expect("something after the peer id")
+            .0;
+        // `jetsam:` is the event target, which the subscriber prints ahead of
+        // the fields. An isolated probe of this macro does not show it; only
+        // rendering it from inside this binary does.
+        assert_eq!(
+            body,
+            format!(
+                "jetsam: our_height=879 highest_announced=901 stale_secs=30 peer={peer} \
+                 stale recent gap — re-requesting authenticated headers"
+            )
         );
-        assert!(line.contains("our_height=879"), "{line}");
     }
 
     #[test]

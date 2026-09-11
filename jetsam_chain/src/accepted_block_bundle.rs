@@ -582,22 +582,62 @@ mod tests {
     }
 
     /// Transport headroom is not a relaxed rule. This binary allocates for the
-    /// v1.2 cap so nothing has to be re-dimensioned at the fork, but a terminal
-    /// above the v1 cap must still be refused at every height while the fork is
-    /// dormant — the preflight bound and the consensus rule are two different
-    /// questions, asked in that order.
-    #[cfg(not(feature = "testnet"))]
+    /// v1.2 cap so nothing has to be re-dimensioned at the fork, but the
+    /// preflight bound and the consensus rule are two different questions,
+    /// asked in that order: a terminal above the v1 cap passes transport and is
+    /// then refused by consensus at every height below the activation — which
+    /// is every height at all while the fork is dormant.
     #[test]
-    fn transport_headroom_does_not_activate_the_raised_cap_early() {
-        use crate::consensus::wire_limits::V1_MAX_HISTORY_STEP_TERMINAL_BYTES;
+    fn transport_headroom_never_activates_the_raised_cap_early() {
+        use crate::consensus::params::V1_2_ACTIVATION_HEIGHT;
+        use crate::consensus::wire_limits::{
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+        };
 
-        let terminal_len = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
-        assert!(AcceptedBlockBundle::validate_declared_transport_lengths(1, terminal_len).is_ok());
+        let over_v1 = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
+        assert!(AcceptedBlockBundle::validate_declared_transport_lengths(1, over_v1).is_ok());
+
         for height in [1, 4004, u64::MAX] {
+            let governed_by_v1_2 = V1_2_ACTIVATION_HEIGHT.is_some_and(|a| height >= a);
+            let verdict =
+                AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, height);
+            if governed_by_v1_2 {
+                assert!(verdict.is_ok(), "height {height} is past the activation");
+            } else {
+                assert!(
+                    matches!(
+                        verdict,
+                        Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                            max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                            ..
+                        })
+                    ),
+                    "height {height} must still be governed by the v1 cap"
+                );
+            }
+        }
+
+        // Where the fork is armed, the raised cap begins at exactly that block,
+        // and is itself a cap rather than an absence of one.
+        if let Some(armed) = V1_2_ACTIVATION_HEIGHT {
+            if let Some(below) = armed.checked_sub(1) {
+                assert!(matches!(
+                    AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, below),
+                    Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                        max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                        ..
+                    })
+                ));
+            }
+            assert!(
+                AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, armed).is_ok()
+            );
+
+            let over_v1_2 = (V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
             assert!(matches!(
-                AcceptedBlockBundle::validate_declared_lengths_at_height(1, terminal_len, height),
+                AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1_2, armed),
                 Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
-                    max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                    max: V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
                     ..
                 })
             ));
@@ -711,40 +751,3 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "testnet"))]
-mod armed_chain_tests {
-    use super::*;
-    use crate::consensus::params::V1_2_ACTIVATION_HEIGHT;
-    use crate::consensus::wire_limits::{
-        V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
-    };
-
-    /// Mirror of `transport_headroom_does_not_activate_the_raised_cap_early`
-    /// for the armed test chain: the raised cap must begin at the agreed
-    /// height and not one block before it.
-    #[test]
-    fn the_raised_cap_begins_exactly_at_the_armed_height() {
-        let armed = V1_2_ACTIVATION_HEIGHT.expect("the test chain is armed");
-        let over_v1 = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
-
-        assert!(matches!(
-            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, armed - 1),
-            Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
-                max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
-                ..
-            })
-        ));
-        assert!(
-            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1, armed).is_ok()
-        );
-
-        let over_v1_2 = (V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
-        assert!(matches!(
-            AcceptedBlockBundle::validate_declared_lengths_at_height(1, over_v1_2, armed),
-            Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
-                max: V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
-                ..
-            })
-        ));
-    }
-}

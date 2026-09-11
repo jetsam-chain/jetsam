@@ -5,20 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-isolated-v1-2-testnet = ["jetsam_chain/isolated-v1-2-testnet"]
-
 # Test-chain identity (JTMT, tj1… addresses, its own genesis, ports and data
-# directory). Orthogonal to the fork profile above: a testnet build can carry
-# the v1.2 fork dormant or armed, exactly like a mainnet build.
+# directory). Orthogonal to the fork: a testnet build can carry the v1.2 fork
+# dormant or armed, exactly like a mainnet build.
 testnet = ["jetsam_chain/testnet"]
-
-# A separately named executable for local fork fixtures. The regular daemon
-# target is never overwritten when this example is built, so an isolated build
-# can never be mistaken for — or deployed as — the mainnet node.
-[[example]]
-name = "isolated_v1_2_node"
-path = "src/main.rs"
-required-features = ["isolated-v1-2-testnet"]
 
 # --- Daemon ---
 [[bin]]

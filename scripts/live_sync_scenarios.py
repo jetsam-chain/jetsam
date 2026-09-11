@@ -326,6 +326,10 @@ SYNC_FAILURES = (
     "block sync request failed",
     "unknown or delayed retained-block response",
     "stale recent gap",
+    # After ten fruitless rounds the routine line above is replaced by this one,
+    # so a list watching only for "stale recent gap" went blind at exactly the
+    # point where the gap stopped being transient.
+    "stuck behind the network",
     "ERROR",
 )
 

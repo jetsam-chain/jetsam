@@ -185,44 +185,42 @@ mod tests {
         );
     }
 
-    /// Mirror for the armed test chain: version 4 below the agreed height,
-    /// version 5 at it and above. The boundary is the whole point of the fork,
-    /// so it is asserted on both sides of the exact block.
-    #[cfg(feature = "testnet")]
+    /// Version 4 below the activation height, version 5 at it and above — and
+    /// version 4 at every height while the fork is dormant, which is the byte a
+    /// live peer expects today. The boundary is the whole point of the fork, so
+    /// where one exists it is asserted on both sides of the exact block.
     #[test]
-    fn the_shared_path_encoding_begins_exactly_at_the_armed_height() {
-        let armed = crate::consensus::params::V1_2_ACTIVATION_HEIGHT
-            .expect("the test chain is armed");
+    fn the_shared_path_encoding_follows_the_activation_height() {
         assert_eq!(HISTORY_STEP_TERMINAL_VERSION, 4);
         assert_eq!(HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION, 5);
-        for height in [0, 1, armed - 1] {
-            assert_eq!(
-                history_step_terminal_wire_version(height),
-                HISTORY_STEP_TERMINAL_VERSION,
-                "height {height} is below the fork"
-            );
-        }
-        for height in [armed, armed + 1, u64::MAX] {
-            assert_eq!(
-                history_step_terminal_wire_version(height),
-                HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION,
-                "height {height} is at or above the fork"
-            );
-        }
-    }
 
-    /// Until the fork is armed, every height still encodes and decodes as
-    /// version 4 — the byte a live peer expects today.
-    #[cfg(not(feature = "testnet"))]
-    #[test]
-    fn the_shared_path_encoding_is_not_armed() {
-        assert_eq!(HISTORY_STEP_TERMINAL_VERSION, 4);
-        assert_eq!(HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION, 5);
+        let armed = crate::consensus::params::V1_2_ACTIVATION_HEIGHT;
         for height in [0, 1, 4004, u64::MAX] {
+            let expected = match armed {
+                Some(activation) if height >= activation => {
+                    HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION
+                }
+                _ => HISTORY_STEP_TERMINAL_VERSION,
+            };
             assert_eq!(
                 history_step_terminal_wire_version(height),
-                HISTORY_STEP_TERMINAL_VERSION,
-                "height {height}"
+                expected,
+                "height {height}, activation {armed:?}"
+            );
+        }
+
+        if let Some(activation) = armed {
+            if let Some(below) = activation.checked_sub(1) {
+                assert_eq!(
+                    history_step_terminal_wire_version(below),
+                    HISTORY_STEP_TERMINAL_VERSION,
+                    "the block before the fork is still version 4"
+                );
+            }
+            assert_eq!(
+                history_step_terminal_wire_version(activation),
+                HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION,
+                "the fork block itself is version 5"
             );
         }
     }

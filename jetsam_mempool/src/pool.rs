@@ -41,7 +41,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use jetsam_chain::consensus::params::BLOCK_MAX_USER_PAGES;
-use jetsam_chain::consensus::wire_limits::{MAX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL};
+use jetsam_chain::consensus::wire_limits::{
+    MAX_AUTHORIZATION_BYTES, MAX_MEMPOOL_TXS, MAX_TX_INTENT_BYTES_GLOBAL,
+};
 use jetsam_chain::consensus::{fee_breakdown, tx_epoch_anchor_height_for_child};
 use jetsam_chain::fri_state::SlotValue;
 use jetsam_chain::Mempool;
@@ -165,6 +167,20 @@ pub struct AsyncMempool {
     auth_verify_executor: AuthorizationVerificationExecutor,
 }
 
+/// Largest number of events one `on_new_block` can emit before any subscriber
+/// gets a chance to run: every transaction in the block confirmed, and — at an
+/// epoch boundary — every transaction left in the pool evicted, all inside one
+/// lock.
+///
+/// The channel used to hold exactly `MAX_MEMPOOL_TXS`, which is the eviction
+/// half alone, so the confirmations on top of it had nowhere to go. A dropped
+/// event is not merely a missing log line: this channel is how the node's
+/// wallet learns that one of its own sends will never confirm, and a lagged
+/// receiver silently leaves that send's coins reserved for the life of the
+/// process — the exact bug `forget_evicted_send` exists to prevent, reappearing
+/// only under load, which is when nobody is watching.
+const EVENT_CHANNEL_CAPACITY: usize = MAX_MEMPOOL_TXS + BLOCK_MAX_USER_PAGES + 1;
+
 impl AsyncMempool {
     // -----------------------------------------------------------------------
     // Construction
@@ -172,7 +188,7 @@ impl AsyncMempool {
 
     /// Create a new empty mempool with the given initial chain view.
     pub fn new(view: ChainView, config: MempoolConfig) -> Self {
-        let (events, _) = broadcast::channel(1024);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let floor = FeeFloor::new(config.fee_floor_window);
         let state = MempoolState {
             pool: Mempool::new(config.capacity),
@@ -1013,7 +1029,10 @@ mod tests {
         PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
-    use super::{check_input_slots, run_admission_checks, AsyncMempool, MempoolState};
+    use super::{
+        broadcast, check_input_slots, run_admission_checks, AsyncMempool, MempoolState,
+        BLOCK_MAX_USER_PAGES, EVENT_CHANNEL_CAPACITY, MAX_MEMPOOL_TXS,
+    };
     use crate::config::MempoolConfig;
     use crate::view::ChainView;
     use std::collections::HashSet;
@@ -1066,6 +1085,30 @@ mod tests {
         pool.on_new_block(&[], 1, view).await;
 
         assert_eq!(pool.fee_floor().await, MIN_FEE_BASE);
+    }
+
+    /// The worst burst is the whole pool evicted at a boundary while the block
+    /// that caused it confirms its own transactions. Expressed against the
+    /// constants that bound each half, so raising either one without raising
+    /// the channel fails here rather than in production under load.
+    #[test]
+    fn the_event_channel_absorbs_a_whole_pool_evicted_beside_a_full_block() {
+        let worst_burst = MAX_MEMPOOL_TXS + BLOCK_MAX_USER_PAGES + 1;
+        assert!(
+            EVENT_CHANNEL_CAPACITY >= worst_burst,
+            "channel holds {EVENT_CHANNEL_CAPACITY}, one on_new_block can emit {worst_burst}"
+        );
+
+        // And the channel really does keep that many before dropping the
+        // oldest — the property the arithmetic above is standing in for.
+        let (tx, mut rx) = broadcast::channel::<u64>(EVENT_CHANNEL_CAPACITY);
+        for value in 0..worst_burst as u64 {
+            tx.send(value).expect("a live receiver");
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(0)),
+            "the oldest event was dropped, which is how a wallet loses a send"
+        );
     }
 
     #[tokio::test]

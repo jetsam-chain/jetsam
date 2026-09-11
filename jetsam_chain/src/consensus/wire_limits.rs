@@ -213,48 +213,69 @@ mod tests {
         assert!(MAX_HISTORY_STEP_TERMINAL_BYTES >= 971_732);
     }
 
-    /// The test chain arms the fork on purpose, so the mainnet guard above is
-    /// compiled out here and replaced by its mirror: the armed height is an
-    /// operator decision too, and changing it by accident must still fail CI.
-    /// Below the height the v1 cap governs; at and above it, the raised one.
+    /// What the operator has decided the activation height is, on this profile.
+    ///
+    /// Arming the fork is two deliberate edits in two files, never one: this
+    /// declaration and `params::V1_2_ACTIVATION_HEIGHT`. Changing only one
+    /// fails CI, so arming can never be an accident or the side effect of an
+    /// unrelated edit — while arming on purpose leaves the suite green.
+    ///
+    /// That second half matters as much as the first. The earlier form of this
+    /// guard asserted `None` outright, which meant the day we armed mainnet
+    /// four tests would fail by construction and whoever built the release
+    /// would be repairing guard-rails under time pressure, on the one day
+    /// nobody should be touching them.
+    #[cfg(not(feature = "testnet"))]
+    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// The test chain is armed on purpose, at a height chosen against its own
+    /// tip. Editing it in passing must still fail CI.
     #[cfg(feature = "testnet")]
+    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(880);
+
     #[test]
-    fn the_test_chain_arms_the_fork_at_its_agreed_height() {
-        let armed = crate::consensus::params::V1_2_ACTIVATION_HEIGHT
-            .expect("the test chain is armed; see params::V1_2_ACTIVATION_HEIGHT");
+    fn arming_the_fork_takes_two_deliberate_edits() {
         assert_eq!(
-            armed, 880,
-            "the armed height is chosen against the test chain's tip, never edited in passing"
-        );
-        assert_eq!(
-            history_step_terminal_bytes_limit(armed - 1),
-            V1_MAX_HISTORY_STEP_TERMINAL_BYTES
-        );
-        assert_eq!(
-            history_step_terminal_bytes_limit(armed),
-            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
+            crate::consensus::params::V1_2_ACTIVATION_HEIGHT,
+            DECLARED_ACTIVATION_HEIGHT,
+            "arming the v1.2 fork is decided with the network operator: change \
+             this declaration and params::V1_2_ACTIVATION_HEIGHT in one commit, \
+             or neither"
         );
     }
 
-    /// The v1.2 cap is height-selected, and until the operator arms the fork
-    /// every height keeps the v1 cap. This test fails the moment
-    /// `V1_2_ACTIVATION_HEIGHT` is anything but `None`, so arming is visible
-    /// in CI and can never be a routine edit.
-    #[cfg(not(feature = "testnet"))]
+    /// The rule, whether the fork is armed or not: the v1 cap governs every
+    /// height below the activation, the raised cap every height at or above it,
+    /// and a dormant profile keeps the v1 cap everywhere.
     #[test]
-    fn the_raised_terminal_cap_is_not_armed() {
+    fn the_terminal_cap_follows_the_activation_height() {
         assert_eq!(V1_MAX_HISTORY_STEP_TERMINAL_BYTES, 1024 * 1024);
         assert_eq!(V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES, 1_200_000);
-        assert_eq!(
-            crate::consensus::params::V1_2_ACTIVATION_HEIGHT,
-            None,
-            "arming the v1.2 fork is decided with the network operator, never here"
-        );
+
+        let armed = crate::consensus::params::V1_2_ACTIVATION_HEIGHT;
         for height in [0, 1, 2000, 4004, u64::MAX] {
+            let expected = match armed {
+                Some(activation) if height >= activation => V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                _ => V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+            };
             assert_eq!(
                 history_step_terminal_bytes_limit(height),
-                V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
-                "height {height} must still be governed by the v1 cap"
+                expected,
+                "height {height}, activation {armed:?}"
+            );
+        }
+
+        // And exactly at the boundary, on both sides of the block itself.
+        if let Some(activation) = armed {
+            if let Some(below) = activation.checked_sub(1) {
+                assert_eq!(
+                    history_step_terminal_bytes_limit(below),
+                    V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+                );
+            }
+            assert_eq!(
+                history_step_terminal_bytes_limit(activation),
+                V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
             );
         }
     }

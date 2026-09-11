@@ -518,7 +518,12 @@ impl BlockMiner {
             let (attempt, prepare_elapsed) = match prepare_result {
                 Ok((Ok(Some(attempt)), elapsed)) => (attempt, elapsed),
                 Ok((Ok(None), elapsed)) => {
-                    tracing::debug!(
+                    // Was debug, and therefore off. A cancelled preparation is
+                    // work this node paid for and threw away, and the longest
+                    // preparations are the likeliest to be cancelled — so the
+                    // node that is too slow for the class it chose is exactly
+                    // the node whose losses were invisible.
+                    tracing::info!(
                         height,
                         prepare_ms = elapsed.as_millis(),
                         "HistoryStep preparation cancelled before completion"
@@ -562,6 +567,24 @@ impl BlockMiner {
                     b25_prepare_ms_ewma,
                     b255_prepare_ms_ewma,
                     "miner proof capacity changed"
+                );
+            } else if crate::proof_capacity::preparation_starves_proof_of_work(prepare_elapsed) {
+                // The limit only moves when the admissible class moves, so a
+                // node that keeps its class and merely becomes too slow to use
+                // it says nothing at all: it stops winning blocks during the
+                // busy stretch that made its templates large, and the operator
+                // is left guessing. Before a node owns a real large-class
+                // sample its budget is a prediction, and this is the line that
+                // reports the prediction being wrong.
+                tracing::warn!(
+                    ?proof_class,
+                    page_limit = next_page_limit,
+                    prepare_ms = prepare_elapsed.as_millis(),
+                    block_time_secs = jetsam_chain::consensus::params::BLOCK_TIME,
+                    b25_prepare_ms_ewma,
+                    b255_prepare_ms_ewma,
+                    "proving consumed most of the block interval — little of it was left to \
+                     search for a nonce, so this node is barely competing at this proof class"
                 );
             }
 
