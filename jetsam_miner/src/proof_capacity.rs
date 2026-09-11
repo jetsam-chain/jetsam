@@ -89,10 +89,11 @@ pub fn publishable_page_ceiling_from_runtime(
 /// Miner-local capacity evidence for the two launch proof classes.
 ///
 /// Every process starts conservatively at B25. Before a real B255 sample
-/// exists, its cost is predicted from the `m22 -> m24` expansion. A
-/// real B255 EWMA then becomes authoritative. If that EWMA exceeds the block
-/// interval, the process stays at B25 until restart rather than oscillating
-/// between an already-known slow B255 sample and B25.
+/// exists, its cost is predicted with `PREDICTED_B255_WORK_RATIO` — a measured
+/// multiple, not a property of the circuit shapes. A real B255 EWMA then
+/// becomes authoritative. If that EWMA exceeds the block interval, the process
+/// stays at B25 until restart rather than oscillating between an already-known
+/// slow B255 sample and B25.
 #[derive(Clone, Debug)]
 pub struct AdaptiveProofCapacity {
     b25_prepare_ms_ewma: Option<f64>,
@@ -138,7 +139,7 @@ impl AdaptiveProofCapacity {
             Some(measured_ms) => measured_ms <= target_ms,
             None => self
                 .b25_prepare_ms_ewma
-                .is_some_and(|measured_ms| measured_ms * class_work_ratio() <= target_ms),
+                .is_some_and(|measured_ms| measured_ms * PREDICTED_B255_WORK_RATIO <= target_ms),
         };
         let by_speed = if b255_fits {
             BlockProofClass::B255.page_capacity()
@@ -177,11 +178,36 @@ fn target_prepare_ms() -> f64 {
     jetsam_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0
 }
 
-#[inline]
-fn class_work_ratio() -> f64 {
-    let delta = BlockProofClass::B255.outer_m() - BlockProofClass::B25.outer_m();
-    (1usize << delta) as f64
-}
+/// Assumed cost of a large-class preparation, as a multiple of a small one.
+///
+/// Used only while this node owns no real B255 sample; one measured block
+/// replaces it permanently. It is therefore a bootstrap guess, and the only
+/// question worth asking of it is which way it should be wrong.
+///
+/// This was `2^(24 - 22) = 4`, taken from the two circuits' outer dimensions
+/// on the assumption that preparation cost scales with `m` alone. Three
+/// independent measurements say it does not:
+///
+/// | measurement | B25 | B255 | ratio |
+/// |---|---|---|---|
+/// | test chain, block 1066, one machine, one minute | 22 776 ms | 58 816 ms | 2.58 |
+/// | bench, 256 threads, warm, 3 samples | 9 500 ms | 24 600 ms | 2.59 |
+///
+/// The 4 was not merely wasteful. It admitted the large class only below
+/// 22 500 ms of small-class preparation, and the very machine that went on to
+/// prove a real B255 block in 58 816 ms — comfortably inside the 90 s interval,
+/// with a third of it to spare — measured 22 776 ms. It would have been refused
+/// permission to attempt the class it could demonstrably prove.
+///
+/// That refusal is permanent rather than cautious, because the only evidence
+/// that overturns the prediction is a real B255 sample, and a node that is
+/// never allowed to build one never earns it. The guess decided the outcome.
+///
+/// 3.0 stays 16 % above the worst measured ratio, so the prediction is still
+/// pessimistic — a node that clears it has real headroom — while the band of
+/// machines between 22.5 s and 30 s stops being turned away from a class they
+/// can prove in time.
+const PREDICTED_B255_WORK_RATIO: f64 = 3.0;
 
 #[cfg(test)]
 mod tests {
@@ -312,12 +338,63 @@ mod tests {
         }
     }
 
+    /// Measured on the test chain at block 1066, on one machine within one
+    /// minute: the node prepared a small-class template in 22 776 ms, then
+    /// rebuilt the same height in the large class in 58 816 ms. A ratio of
+    /// 2.58, and the large-class block was produced and accepted.
+    const MEASURED_B25_PREPARE_MS: u64 = 22_776;
+    const MEASURED_B255_PREPARE_MS: u64 = 58_816;
+
+    fn measured_class_work_ratio() -> f64 {
+        MEASURED_B255_PREPARE_MS as f64 / MEASURED_B25_PREPARE_MS as f64
+    }
+
+    /// Predicting below the measured ratio would let a node choose a class it
+    /// cannot prove before the interval ends, which is the failure this guard
+    /// exists to prevent. The prediction is allowed to be pessimistic; it is
+    /// never allowed to be optimistic.
+    #[test]
+    fn the_prediction_never_falls_below_what_the_chain_measured() {
+        assert!(
+            PREDICTED_B255_WORK_RATIO > measured_class_work_ratio(),
+            "predicted {PREDICTED_B255_WORK_RATIO}, measured {}",
+            measured_class_work_ratio()
+        );
+    }
+
+    /// The machine that actually produced a large-class block must be allowed
+    /// to attempt one. Refusing it is not a conservative choice, it is a
+    /// permanent one: the only evidence that would overturn the refusal is a
+    /// real B255 sample, and a refused node never earns it.
+    #[test]
+    fn the_machine_that_proved_a_real_b255_block_is_allowed_to_try_one() {
+        assert!(
+            MEASURED_B255_PREPARE_MS < target_prepare_ms() as u64,
+            "this machine really did prove the large class inside the interval"
+        );
+
+        let mut capacity = capacity_capped_at(255);
+        capacity.observe_preparation(BlockProofClass::B25, millis(MEASURED_B25_PREPARE_MS));
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
+    }
+
+    /// Recovering the pessimism must not turn into recklessness: a node whose
+    /// large-class preparation would run past the interval still gets 25.
+    #[test]
+    fn a_node_too_slow_for_the_large_class_is_still_refused() {
+        let far_too_slow =
+            (target_prepare_ms() / measured_class_work_ratio()).ceil() as u64 + 10_000;
+        let mut capacity = capacity_capped_at(255);
+        capacity.observe_preparation(BlockProofClass::B25, millis(far_too_slow));
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+    }
+
     #[test]
     fn starts_at_b25_and_has_no_intermediate_limits() {
         let mut capacity = capacity_capped_at(255);
         assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
 
-        let predicted_b255_boundary = (target_prepare_ms() / class_work_ratio()).round() as u64;
+        let predicted_b255_boundary = (target_prepare_ms() / PREDICTED_B255_WORK_RATIO).round() as u64;
         capacity.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary + 1));
         assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
 
