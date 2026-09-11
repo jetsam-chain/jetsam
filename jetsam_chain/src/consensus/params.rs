@@ -108,10 +108,18 @@ pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
 /// three hours of notice taken for `ASERT_POLYNOMIAL_FIX_HEIGHT` are not a
 /// precedent — that fork was native-only and touched no proof artifact.
 ///
-/// `wire_limits::tests::the_raised_terminal_cap_is_not_armed` fails the moment
-/// this value is anything but `None`, so arming is visible in CI.
+/// `wire_limits::tests::arming_the_fork_takes_two_deliberate_edits` fails the
+/// moment this value disagrees with the declaration beside it, so arming is
+/// visible in CI and cannot happen as a side effect of an unrelated edit.
+///
+/// **Armed at 8200 on 2026-09-11.** The tip was 7232 at 11:00:58 UTC and the
+/// measured interval over the preceding 960 blocks was 90.2 s, over the last
+/// 100 blocks 92.4 s — so 968 blocks is between 24.2 and 24.9 hours of notice,
+/// landing on 2026-09-12 around 11:15-11:52 UTC. The margin is deliberately on
+/// the late side: an operator who is given more time than announced loses
+/// nothing, one who is given less loses the ability to sync at all.
 #[cfg(not(feature = "testnet"))]
-pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(8200);
 
 /// The test chain arms the fork, so the crossing can be watched on a real chain
 /// with real pre-fork history behind it — the one thing no bench stands in for.
