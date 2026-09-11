@@ -178,6 +178,20 @@ fn target_prepare_ms() -> f64 {
     jetsam_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0
 }
 
+/// Share of the block interval a preparation may consume before whatever is
+/// left is too little to search a nonce in.
+const PREPARATION_INTERVAL_SHARE_BEFORE_ALARM: f64 = 2.0 / 3.0;
+
+/// Whether a completed preparation left enough of the interval to mine in.
+///
+/// The page limit only moves when the admissible class moves, so a node that
+/// keeps its class and merely becomes too slow to use it changes nothing an
+/// operator can see: it simply stops finding blocks, during exactly the busy
+/// stretch that made its templates large. This is the line that says so.
+pub fn preparation_starves_proof_of_work(elapsed: Duration) -> bool {
+    elapsed.as_secs_f64() * 1_000.0 > target_prepare_ms() * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM
+}
+
 /// Assumed cost of a large-class preparation, as a multiple of a small one.
 ///
 /// Used only while this node owns no real B255 sample; one measured block
@@ -186,12 +200,18 @@ fn target_prepare_ms() -> f64 {
 ///
 /// This was `2^(24 - 22) = 4`, taken from the two circuits' outer dimensions
 /// on the assumption that preparation cost scales with `m` alone. Three
-/// independent measurements say it does not:
+/// measurements say it does not:
 ///
 /// | measurement | B25 | B255 | ratio |
 /// |---|---|---|---|
 /// | test chain, block 1066, one machine, one minute | 22 776 ms | 58 816 ms | 2.58 |
 /// | bench, 256 threads, warm, 3 samples | 9 500 ms | 24 600 ms | 2.59 |
+/// | test chain, external-miner path, block 1531 | 25 430 ms | 64 072 ms | 2.52 |
+///
+/// All three are the same 128-core machine, so they agree on its scaling and
+/// say nothing about a smaller one. The exposure from that is bounded rather
+/// than unknown: a machine only meets this predictor at all if it prepares the
+/// small class in under 30 s, which already makes it a large machine.
 ///
 /// The 4 was not merely wasteful. It admitted the large class only below
 /// 22 500 ms of small-class preparation, and the very machine that went on to
@@ -207,6 +227,19 @@ fn target_prepare_ms() -> f64 {
 /// pessimistic — a node that clears it has real headroom — while the band of
 /// machines between 22.5 s and 30 s stops being turned away from a class they
 /// can prove in time.
+///
+/// Be honest about what that 16 % is worth: the small-class figure it is
+/// measured against is itself noisy. The same reference machine produced
+/// 20 878 ms and 34 852 ms for B25 within one day, under different load. The
+/// margin on the ratio is therefore smaller than the spread of the input, and
+/// a node near the top of the band can be admitted on an optimistic sample.
+///
+/// What makes that survivable is not the margin, it is that the prediction is
+/// short-lived and its failure is now audible: the first real large-class
+/// preparation replaces it with a measurement, and
+/// `BlockMiner` reports a preparation that overruns the interval or is
+/// cancelled, so an operator sees the mistake being corrected instead of
+/// wondering why the node stopped finding blocks during a busy stretch.
 const PREDICTED_B255_WORK_RATIO: f64 = 3.0;
 
 #[cfg(test)]
@@ -281,13 +314,22 @@ mod tests {
     /// While the fork is dormant every height still yields the small class,
     /// exactly as the live chain runs today.
     #[test]
-    fn the_ceiling_is_the_small_class_at_every_height_until_the_fork_is_armed() {
+    fn the_ceiling_follows_the_activation_height() {
+        use jetsam_chain::consensus::params::V1_2_ACTIVATION_HEIGHT;
+
         let measured = [B25_TERMINAL_BYTES, B255_TERMINAL_BYTES];
         for height in [0, 1, 4004, u64::MAX] {
+            // The large class only becomes publishable once the raised cap is
+            // in force: 1 081 108 bytes fits under 1 200 000 and not under
+            // 1 048 576. While the fork is dormant that is never, at any height.
+            let expected = match V1_2_ACTIVATION_HEIGHT {
+                Some(activation) if height >= activation => Some(255),
+                _ => Some(25),
+            };
             assert_eq!(
                 publishable_page_ceiling_at_height(&measured, height),
-                Some(25),
-                "height {height}"
+                expected,
+                "height {height}, activation {V1_2_ACTIVATION_HEIGHT:?}"
             );
         }
     }
@@ -376,6 +418,31 @@ mod tests {
         let mut capacity = capacity_capped_at(255);
         capacity.observe_preparation(BlockProofClass::B25, millis(MEASURED_B25_PREPARE_MS));
         assert_eq!(capacity.page_limit(ANY_HEIGHT), 255);
+    }
+
+    /// The predictor is a guess, and a guess that is wrong upward is paid for
+    /// in whole blocks. What makes that survivable is that it is audible: a
+    /// preparation that eats the interval must be reported even though the page
+    /// limit has not moved, because the limit only moves when the class does.
+    #[test]
+    fn a_preparation_that_eats_the_interval_is_reported_even_when_the_class_holds() {
+        let interval_ms = target_prepare_ms() as u64;
+
+        // The measured large class on the reference machine: 65 % of the
+        // interval. Tight, but it left a third of it to mine in and it did
+        // produce blocks — routine, not worth a warning.
+        assert!(!preparation_starves_proof_of_work(millis(58_816)));
+
+        // A node admitted at the top of the band whose real ratio is worse:
+        // 30 s of small class at a true ratio of 2.9 is 87 s of large class,
+        // and the nonce search gets what is left of ninety.
+        assert!(preparation_starves_proof_of_work(millis(87_000)));
+
+        // The boundary belongs to the healthy side.
+        let boundary = (target_prepare_ms() * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM) as u64;
+        assert!(!preparation_starves_proof_of_work(millis(boundary)));
+        assert!(preparation_starves_proof_of_work(millis(boundary + 1)));
+        assert!(preparation_starves_proof_of_work(millis(interval_ms)));
     }
 
     /// Recovering the pessimism must not turn into recklessness: a node whose

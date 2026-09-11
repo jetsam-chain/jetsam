@@ -5,11 +5,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [features]
-# Isolated live fork tests only. NEVER enable for a public-network release:
-# it arms every v1.2 rule at height 5 on a chain whose genesis is the mainnet
-# genesis, so a build carrying it must never reach a public interface.
-isolated-v1-2-testnet = []
-
 # Test-chain identity: distinct genesis, address HRP, protocol namespace,
 # ports and data directory. Never enable for a mainnet release.
 testnet = ["jetsam_poseidon2b/testnet"]
