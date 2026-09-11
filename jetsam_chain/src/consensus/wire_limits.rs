@@ -225,10 +225,10 @@ mod tests {
     /// four tests would fail by construction and whoever built the release
     /// would be repairing guard-rails under time pressure, on the one day
     /// nobody should be touching them.
-    /// Armed at 8200 on 2026-09-11, against a tip of 7232 — see the reasoning
+    /// Armed at 8450 on 2026-09-11, against a tip of 7249 — see the reasoning
     /// and the measured block interval on `params::V1_2_ACTIVATION_HEIGHT`.
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(8200);
+    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(8450);
 
     /// The test chain is armed on purpose, at a height chosen against its own
     /// tip. Editing it in passing must still fail CI.
