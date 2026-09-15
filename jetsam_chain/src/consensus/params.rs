@@ -132,7 +132,7 @@ pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(8450);
 /// the other. A binary carrying this constant also carries the `tj1…` address
 /// prefix and its own genesis, and therefore cannot join the mainnet at all.
 #[cfg(feature = "testnet")]
-pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(200);
+pub const V1_2_ACTIVATION_HEIGHT: Option<u64> = Some(0);
 
 /// Whether one candidate block height is governed by the v1.2 consensus rules.
 #[inline]
