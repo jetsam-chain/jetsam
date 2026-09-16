@@ -2597,6 +2597,7 @@ mod tests {
                 active_slot_count: parent.active_slot_count,
                 alloc_counter: parent.alloc_counter,
                 epoch_anchor_id: [0x33; 32],
+                previous_epoch_anchor_id: [0x33; 32],
             };
             let child = jetsam_chain::BlockHeader {
                 prev_block_hash: parent_id,

@@ -1919,6 +1919,7 @@ mod tx_epoch_anchor_tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
             epoch_anchor_id: [0x33; 32],
+            previous_epoch_anchor_id: [0x33; 32],
         }
     }
 
@@ -2059,6 +2060,7 @@ mod tx_epoch_anchor_tests {
             active_slot_count: 7,
             alloc_counter: 9,
             epoch_anchor_id: [0x33; 32],
+            previous_epoch_anchor_id: [0x33; 32],
         }
     }
 

@@ -6,19 +6,27 @@
 
 use jetsam_chain::block_header::{semantic_header_id, BlockHeader};
 use jetsam_chain::consensus::{
-    checked_tx_epoch_height_decomposition, genesis_header, tx_epoch_anchor_height_for_child,
+    checked_tx_epoch_height_decomposition, genesis_header,
+    previous_tx_epoch_anchor_height_for_child, tx_epoch_anchor_height_for_child,
+    HistoryStepPackGeneration,
 };
 use jetsam_chain::fri_state::StateRoot;
 use jetsam_chain::hash_block_header;
 use jetsam_core::Block128;
 use jetsam_poseidon2b::primitives::Digest;
 
-/// Canonical number of `Block128` lanes in [`ChainAccumulator`].
+/// Canonical number of `Block128` lanes in [`ChainAccumulator`] under the
+/// launch generation — the width of every boundary the chain has encoded so
+/// far, and of every fixed-size lane API in this crate.
+///
+/// v1.3 widens the boundary by two lanes; that width is never a constant
+/// here, it is asked of the generation
+/// ([`HistoryStepPackGeneration::chain_accumulator_lanes`]) and encoded
+/// through [`ChainAccumulator::to_generation_lanes`].
 pub const CHAIN_ACCUMULATOR_LANES: usize = 10;
 
 const _: () = assert!(
-    CHAIN_ACCUMULATOR_LANES
-        == jetsam_chain::consensus::HistoryStepPackGeneration::V1.chain_accumulator_lanes(),
+    CHAIN_ACCUMULATOR_LANES == HistoryStepPackGeneration::V1.chain_accumulator_lanes(),
     "the boundary this crate encodes is the launch generation's, ten lanes wide"
 );
 
@@ -42,11 +50,28 @@ const _: () = assert!(
 /// active_slot_count
 /// alloc_counter
 /// epoch_anchor_id[2]
+/// previous_epoch_anchor_id[2]   (v1.3 only)
 /// ```
 ///
 /// `epoch_anchor_id` is the block id consumed by the boundary block's own
 /// transactions (`tx_epoch_anchor_height_for_child`); it is written from the
-/// derived parent block id exactly when the parent height is a 144-boundary.
+/// derived parent block id exactly when the parent height is an epoch
+/// boundary.
+///
+/// `previous_epoch_anchor_id` is the same value one epoch behind
+/// (`previous_tx_epoch_anchor_height_for_child`): the anchor that was current
+/// before the last boundary. From v1.3 a user page may bind either of the
+/// two, which turns a transaction's life from "90 seconds to 48 minutes
+/// depending on luck" into 49 to 96 minutes guaranteed. It is *remembered*,
+/// never looked up: both are ids of canonical headers, and headers are
+/// permanent, but a rule that had to re-read one 64 blocks back would still
+/// be unimplementable for a freshly synced node if it needed anything but
+/// the header.
+///
+/// Under the launch generation the field is not a lane at all and the
+/// canonical form carries it equal to `epoch_anchor_id` — which is what
+/// [`ChainAccumulator::advance`] produces there and what the ten-lane codec
+/// round-trips. The launch boundary is therefore unchanged, byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainAccumulator {
     pub height: u64,
@@ -56,6 +81,7 @@ pub struct ChainAccumulator {
     pub active_slot_count: u64,
     pub alloc_counter: u64,
     pub epoch_anchor_id: Digest,
+    pub previous_epoch_anchor_id: Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +90,11 @@ pub enum ChainAccumulatorLaneError {
     LogSlotsOutOfRange,
     ActiveSlotCountOutOfRange,
     AllocCounterOutOfRange,
+    /// The lane vector is not the width of the generation being decoded.
+    LaneCount {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +128,13 @@ pub enum ChainAccumulatorLocalBoundaryError {
     AllocCounter,
     EpochAnchorHeight { expected: u64, actual: u64 },
     EpochAnchorId,
+    PreviousEpochAnchorHeight { expected: u64, actual: u64 },
+    PreviousEpochAnchorId,
+    /// v1.3 binds two anchors and the caller supplied only one header.
+    PreviousEpochAnchorMissing,
+    /// The launch generation binds one anchor and the caller supplied a
+    /// header for a second.
+    PreviousEpochAnchorUnexpected,
 }
 
 impl core::fmt::Display for ChainAccumulatorLocalBoundaryError {
@@ -119,6 +157,22 @@ impl core::fmt::Display for ChainAccumulatorLocalBoundaryError {
             Self::EpochAnchorId => write!(
                 f,
                 "accumulator epoch anchor does not match the local canonical epoch header"
+            ),
+            Self::PreviousEpochAnchorHeight { expected, actual } => write!(
+                f,
+                "local previous epoch-anchor header has height {actual}, expected {expected}"
+            ),
+            Self::PreviousEpochAnchorId => write!(
+                f,
+                "accumulator previous epoch anchor does not match the local canonical header"
+            ),
+            Self::PreviousEpochAnchorMissing => write!(
+                f,
+                "this pack generation binds two epoch anchors and only one header was given"
+            ),
+            Self::PreviousEpochAnchorUnexpected => write!(
+                f,
+                "this pack generation binds one epoch anchor and a second header was given"
             ),
         }
     }
@@ -146,6 +200,19 @@ impl ChainAccumulator {
         ]
     }
 
+    /// This boundary in the lane encoding of `generation`.
+    ///
+    /// The launch encoding is exactly [`Self::to_lanes`]; v1.3 appends the
+    /// two lanes of the previous epoch anchor, in the same order otherwise.
+    pub fn to_generation_lanes(&self, generation: HistoryStepPackGeneration) -> Vec<Block128> {
+        let mut lanes = self.to_lanes().to_vec();
+        if generation.binds_two_epoch_anchors() {
+            lanes.extend(digest_to_lanes(self.previous_epoch_anchor_id));
+        }
+        debug_assert_eq!(lanes.len(), generation.chain_accumulator_lanes());
+        lanes
+    }
+
     /// Decode the canonical ten-lane recursive boundary.
     ///
     /// Scalar lanes are range-checked before conversion. In particular, this
@@ -153,6 +220,7 @@ impl ChainAccumulator {
     pub fn from_lanes(
         lanes: [Block128; CHAIN_ACCUMULATOR_LANES],
     ) -> Result<Self, ChainAccumulatorLaneError> {
+        let epoch_anchor_id = digest_from_lanes([lanes[8], lanes[9]]);
         Ok(Self {
             height: u64::try_from(lanes[0].to_u128())
                 .map_err(|_| ChainAccumulatorLaneError::HeightOutOfRange)?,
@@ -164,8 +232,38 @@ impl ChainAccumulator {
                 .map_err(|_| ChainAccumulatorLaneError::ActiveSlotCountOutOfRange)?,
             alloc_counter: u64::try_from(lanes[7].to_u128())
                 .map_err(|_| ChainAccumulatorLaneError::AllocCounterOutOfRange)?,
-            epoch_anchor_id: digest_from_lanes([lanes[8], lanes[9]]),
+            epoch_anchor_id,
+            previous_epoch_anchor_id: epoch_anchor_id,
         })
+    }
+
+    /// Decode a boundary written in `generation`'s lane encoding.
+    ///
+    /// The width is checked before anything is read. A launch boundary has no
+    /// previous-anchor lanes to decode, so the field is filled with the
+    /// current anchor — the canonical launch form, the one [`Self::advance`]
+    /// produces and [`Self::to_generation_lanes`] round-trips. Anything else
+    /// would make a decoded boundary compare unequal to the identical boundary
+    /// the prover built, and every terminal would be refused for metadata
+    /// that is not actually part of it.
+    pub fn from_generation_lanes(
+        generation: HistoryStepPackGeneration,
+        lanes: &[Block128],
+    ) -> Result<Self, ChainAccumulatorLaneError> {
+        if lanes.len() != generation.chain_accumulator_lanes() {
+            return Err(ChainAccumulatorLaneError::LaneCount {
+                expected: generation.chain_accumulator_lanes(),
+                actual: lanes.len(),
+            });
+        }
+        let launch: [Block128; CHAIN_ACCUMULATOR_LANES] = lanes[..CHAIN_ACCUMULATOR_LANES]
+            .try_into()
+            .expect("the launch prefix of a width-checked lane vector");
+        let mut decoded = Self::from_lanes(launch)?;
+        if generation.binds_two_epoch_anchors() {
+            decoded.previous_epoch_anchor_id = digest_from_lanes([lanes[10], lanes[11]]);
+        }
+        Ok(decoded)
     }
 
     /// Advance by one canonical child header, glued through the exact parent
@@ -176,10 +274,40 @@ impl ChainAccumulator {
     /// current height; the child must chain-link to `H_BLOCKHDR(parent)` and
     /// increment height exactly. The child's semantic projection becomes the
     /// new tip; the transaction epoch switches to the derived parent block id
-    /// exactly when the parent height is a 144-boundary (the anchor consumed
-    /// by the child's own transactions).
+    /// exactly when the parent height is an epoch boundary (the anchor
+    /// consumed by the child's own transactions).
+    ///
+    /// The boundary a block produces belongs to that block's own generation,
+    /// so the fixed clock is read from the *child's* height.
     pub fn advance(
         &self,
+        parent_header: &BlockHeader,
+        child_header: &BlockHeader,
+    ) -> Result<Self, ChainAccumulatorAdvanceError> {
+        self.advance_in(
+            HistoryStepPackGeneration::at_height(child_header.height),
+            parent_header,
+            child_header,
+        )
+    }
+
+    /// [`Self::advance`] with the generation injected.
+    ///
+    /// Injecting it lets both relations be exercised while the real clock is
+    /// dormant, and it is the only way a test can build a v1.3 boundary in a
+    /// mainnet build.
+    ///
+    /// One boundary bit drives both anchor lanes: at a boundary the pair
+    /// shifts by exactly one epoch — the derived parent id becomes current and
+    /// the anchor that was current becomes the previous one. Deriving both
+    /// from the same bit is what keeps the pair from ever naming two epochs
+    /// that are not adjacent. Under the launch generation the older anchor is
+    /// not a lane, so the canonical form carries it equal to the current one;
+    /// leaving it lagging would produce a boundary that no longer survives its
+    /// own lane round-trip.
+    pub fn advance_in(
+        &self,
+        generation: HistoryStepPackGeneration,
         parent_header: &BlockHeader,
         child_header: &BlockHeader,
     ) -> Result<Self, ChainAccumulatorAdvanceError> {
@@ -206,6 +334,14 @@ impl ChainAccumulator {
                 actual: child_header.height,
             });
         }
+        let boundary = checked_tx_epoch_height_decomposition(self.height)
+            .expect("every u64 height has a checked transaction-epoch decomposition")
+            .is_boundary();
+        let epoch_anchor_id = if boundary {
+            parent_block_id
+        } else {
+            self.epoch_anchor_id
+        };
         Ok(Self {
             height: child_header.height,
             tip_semantic_id: semantic_header_id(child_header),
@@ -213,15 +349,66 @@ impl ChainAccumulator {
             log_slots: child_header.log_slots,
             active_slot_count: child_header.active_slot_count,
             alloc_counter: child_header.alloc_counter,
-            epoch_anchor_id: if checked_tx_epoch_height_decomposition(self.height)
-                .expect("every u64 height has a checked transaction-epoch decomposition")
-                .is_boundary()
-            {
-                parent_block_id
-            } else {
+            epoch_anchor_id,
+            previous_epoch_anchor_id: if !generation.binds_two_epoch_anchors() {
+                epoch_anchor_id
+            } else if boundary {
                 self.epoch_anchor_id
+            } else {
+                self.previous_epoch_anchor_id
             },
         })
+    }
+
+    /// [`Self::validate_local_header_boundary`] with the generation injected,
+    /// covering the previous-anchor lanes v1.3 adds.
+    ///
+    /// Under v1.3 the caller supplies the header at
+    /// `previous_tx_epoch_anchor_height_for_child(tip_height)` as well; both
+    /// are looked up by height in the header store, which is the only store
+    /// deep enough — at the 64 blocks the older anchor reaches, bodies have
+    /// been pruned for 42 blocks and a freshly synced node never had them.
+    /// During the first two epochs both lookups land on genesis.
+    ///
+    /// Under the launch generation the older anchor is not a lane of the
+    /// boundary at all, so there is no header to bind it to and no second
+    /// lookup to make. What is checked instead is that the boundary is in
+    /// canonical launch form: a lagging older anchor here would not survive
+    /// its own lane round-trip.
+    pub fn validate_local_header_boundary_in(
+        &self,
+        generation: HistoryStepPackGeneration,
+        tip_header: &BlockHeader,
+        epoch_anchor_header: &BlockHeader,
+        previous_epoch_anchor_header: Option<&BlockHeader>,
+    ) -> Result<(), ChainAccumulatorLocalBoundaryError> {
+        self.validate_local_header_boundary(tip_header, epoch_anchor_header)?;
+        let Some(previous_epoch_anchor_header) = previous_epoch_anchor_header else {
+            if generation.binds_two_epoch_anchors() {
+                return Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorMissing);
+            }
+            if self.previous_epoch_anchor_id != self.epoch_anchor_id {
+                return Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorId);
+            }
+            return Ok(());
+        };
+        if !generation.binds_two_epoch_anchors() {
+            return Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorUnexpected);
+        }
+        let expected_previous_epoch_height =
+            previous_tx_epoch_anchor_height_for_child(tip_header.height);
+        if previous_epoch_anchor_header.height != expected_previous_epoch_height {
+            return Err(
+                ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorHeight {
+                    expected: expected_previous_epoch_height,
+                    actual: previous_epoch_anchor_header.height,
+                },
+            );
+        }
+        if self.previous_epoch_anchor_id != hash_block_header(previous_epoch_anchor_header) {
+            return Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorId);
+        }
+        Ok(())
     }
 
     /// Bind all ten recursive lanes to the locally selected canonical chain.
@@ -271,10 +458,12 @@ impl ChainAccumulator {
 
 /// Canonical blockless bootstrap boundary.
 ///
-/// The tip carries the genesis semantic projection; the epoch anchor is the
-/// genesis block id — the anchor every transaction in blocks 1..=144 binds.
+/// The tip carries the genesis semantic projection; both epoch anchors are
+/// the genesis block id — the anchor every transaction in the first epoch
+/// binds, and the older one saturating at genesis.
 pub fn genesis_accumulator() -> ChainAccumulator {
     let header = genesis_header();
+    let genesis_id = hash_block_header(&header);
     ChainAccumulator {
         height: header.height,
         tip_semantic_id: semantic_header_id(&header),
@@ -282,7 +471,8 @@ pub fn genesis_accumulator() -> ChainAccumulator {
         log_slots: header.log_slots,
         active_slot_count: header.active_slot_count,
         alloc_counter: header.alloc_counter,
-        epoch_anchor_id: hash_block_header(&header),
+        epoch_anchor_id: genesis_id,
+        previous_epoch_anchor_id: genesis_id,
     }
 }
 
@@ -335,6 +525,7 @@ mod tests {
                 active_slot_count: 0,
                 alloc_counter: 0,
                 epoch_anchor_id: hash_block_header(&header),
+                previous_epoch_anchor_id: hash_block_header(&header),
             }
         );
     }
@@ -349,10 +540,199 @@ mod tests {
             active_slot_count: u64::MAX - 1,
             alloc_counter: u64::MAX - 2,
             epoch_anchor_id: [0x33; 32],
+            previous_epoch_anchor_id: [0x33; 32],
         };
         assert_eq!(
             ChainAccumulator::from_lanes(accumulator.to_lanes()),
             Ok(accumulator)
+        );
+    }
+
+    /// The launch encoding is untouched: ten lanes, one anchor, and the
+    /// generation-aware codec answers exactly what the fixed one does.
+    #[test]
+    fn the_launch_generation_encodes_ten_lanes_and_one_anchor() {
+        use HistoryStepPackGeneration::{V1, V1_3};
+
+        let accumulator = genesis_accumulator();
+        assert_eq!(accumulator.previous_epoch_anchor_id, accumulator.epoch_anchor_id);
+        let lanes = accumulator.to_generation_lanes(V1);
+        assert_eq!(lanes.len(), CHAIN_ACCUMULATOR_LANES);
+        assert_eq!(lanes.as_slice(), &accumulator.to_lanes());
+        assert_eq!(
+            ChainAccumulator::from_generation_lanes(V1, &lanes),
+            Ok(accumulator.clone())
+        );
+
+        // The width is checked before anything is decoded, in both directions.
+        let twelve = accumulator.to_generation_lanes(V1_3);
+        assert_eq!(twelve.len(), 12);
+        assert_eq!(
+            ChainAccumulator::from_generation_lanes(V1, &twelve),
+            Err(ChainAccumulatorLaneError::LaneCount {
+                expected: 10,
+                actual: 12,
+            })
+        );
+        assert_eq!(
+            ChainAccumulator::from_generation_lanes(V1_3, &lanes),
+            Err(ChainAccumulatorLaneError::LaneCount {
+                expected: 12,
+                actual: 10,
+            })
+        );
+        // A launch boundary decoded from twelve lanes is the same boundary.
+        assert_eq!(
+            ChainAccumulator::from_generation_lanes(V1_3, &twelve),
+            Ok(accumulator)
+        );
+    }
+
+    /// Under the launch generation the pair never separates, so every
+    /// boundary the fixed clock produces today is exactly the ten-lane one.
+    #[test]
+    fn under_the_launch_generation_the_pair_never_separates() {
+        const EPOCH: u64 = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let mut accumulator = genesis_accumulator();
+        let mut parent = genesis_header();
+        for height in 1..=2 * EPOCH + 2 {
+            let header = child_of(&parent, height);
+            let launch = accumulator
+                .advance_in(HistoryStepPackGeneration::V1, &parent, &header)
+                .unwrap();
+            assert_eq!(launch.previous_epoch_anchor_id, launch.epoch_anchor_id, "height {height}");
+            assert_eq!(
+                launch.to_generation_lanes(HistoryStepPackGeneration::V1).as_slice(),
+                &launch.to_lanes()
+            );
+            // The fixed clock reads the child's own height.
+            assert_eq!(
+                accumulator.advance(&parent, &header).unwrap(),
+                accumulator
+                    .advance_in(HistoryStepPackGeneration::at_height(height), &parent, &header)
+                    .unwrap()
+            );
+            accumulator = launch;
+            parent = header;
+        }
+    }
+
+    /// From v1.3 the boundary remembers the anchor that was current before
+    /// the last epoch edge, in two more lanes, and the pair shifts by exactly
+    /// one epoch at every edge — never two, never zero.
+    #[test]
+    fn the_v1_3_boundary_carries_the_previous_anchor_one_epoch_behind() {
+        use HistoryStepPackGeneration::V1_3;
+        const EPOCH: u64 = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+
+        let mut accumulator = genesis_accumulator();
+        let genesis_id = accumulator.epoch_anchor_id;
+        let mut parent = genesis_header();
+        let mut first_boundary_id = None;
+        let mut second_boundary_id = None;
+        for height in 1..=2 * EPOCH + 2 {
+            let header = child_of(&parent, height);
+            accumulator = accumulator.advance_in(V1_3, &parent, &header).unwrap();
+            let (current, previous) = match height {
+                h if h <= EPOCH => (genesis_id, genesis_id),
+                h if h == EPOCH + 1 => {
+                    first_boundary_id = Some(hash_block_header(&parent));
+                    (first_boundary_id.unwrap(), genesis_id)
+                }
+                h if h <= 2 * EPOCH => (first_boundary_id.unwrap(), genesis_id),
+                h if h == 2 * EPOCH + 1 => {
+                    second_boundary_id = Some(hash_block_header(&parent));
+                    (second_boundary_id.unwrap(), first_boundary_id.unwrap())
+                }
+                _ => (second_boundary_id.unwrap(), first_boundary_id.unwrap()),
+            };
+            assert_eq!(accumulator.epoch_anchor_id, current, "height {height}");
+            assert_eq!(accumulator.previous_epoch_anchor_id, previous, "height {height}");
+
+            // Twelve lanes: the ten launch lanes, then the previous anchor.
+            let lanes = accumulator.to_generation_lanes(V1_3);
+            assert_eq!(lanes.len(), 12);
+            assert_eq!(&lanes[..CHAIN_ACCUMULATOR_LANES], &accumulator.to_lanes());
+            assert_eq!(
+                ChainAccumulator::from_generation_lanes(V1_3, &lanes),
+                Ok(accumulator.clone())
+            );
+            parent = header;
+        }
+        assert_ne!(
+            accumulator.epoch_anchor_id, accumulator.previous_epoch_anchor_id,
+            "after two edges the pair names two distinct epochs"
+        );
+    }
+
+    /// The local header binding covers the previous-anchor lanes under v1.3
+    /// and refuses a second header under the launch generation.
+    #[test]
+    fn local_header_boundary_binds_the_previous_anchor_from_v1_3() {
+        use HistoryStepPackGeneration::{V1, V1_3};
+        const EPOCH: u64 = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+
+        let mut headers = vec![genesis_header()];
+        let mut accumulator = genesis_accumulator();
+        for height in 1..=2 * EPOCH + 1 {
+            let parent = headers[height as usize - 1];
+            let header = child_of(&parent, height);
+            accumulator = accumulator.advance_in(V1_3, &parent, &header).unwrap();
+            headers.push(header);
+        }
+        let tip = &headers[(2 * EPOCH + 1) as usize];
+        let current = &headers[(2 * EPOCH) as usize];
+        let previous = &headers[EPOCH as usize];
+
+        accumulator
+            .validate_local_header_boundary_in(V1_3, tip, current, Some(previous))
+            .unwrap();
+        assert_eq!(
+            accumulator.validate_local_header_boundary_in(V1_3, tip, current, None),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorMissing)
+        );
+        assert_eq!(
+            accumulator.validate_local_header_boundary_in(V1_3, tip, current, Some(&headers[0])),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorHeight {
+                expected: EPOCH,
+                actual: 0,
+            })
+        );
+        let mut competing_previous = *previous;
+        competing_previous.nonce = competing_previous.nonce.wrapping_add(1);
+        assert_eq!(
+            accumulator.validate_local_header_boundary_in(
+                V1_3,
+                tip,
+                current,
+                Some(&competing_previous)
+            ),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorId)
+        );
+        // A v1.3 boundary is not in launch form: it names two epochs.
+        assert_eq!(
+            accumulator.validate_local_header_boundary_in(V1, tip, current, None),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorId)
+        );
+
+        // The same chain under the launch generation: one anchor, no second
+        // header, and the pair in canonical form.
+        let mut launch = genesis_accumulator();
+        for height in 1..=2 * EPOCH + 1 {
+            launch = launch
+                .advance_in(V1, &headers[height as usize - 1], &headers[height as usize])
+                .unwrap();
+        }
+        launch
+            .validate_local_header_boundary_in(V1, tip, current, None)
+            .unwrap();
+        assert_eq!(
+            launch.validate_local_header_boundary_in(V1, tip, current, Some(previous)),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorUnexpected)
+        );
+        assert_eq!(
+            launch.validate_local_header_boundary_in(V1_3, tip, current, Some(previous)),
+            Err(ChainAccumulatorLocalBoundaryError::PreviousEpochAnchorId)
         );
     }
 

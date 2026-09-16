@@ -70,10 +70,14 @@ fn decode_template_authorizations(
         .collect()
 }
 
+/// The launch-generation boundary at `header`: one anchor, carried in
+/// canonical form. A v1.3 boundary also needs the previous anchor header and
+/// is built by its own generation-aware path.
 fn accumulator_from_header_boundary(
     header: &jetsam_chain::BlockHeader,
     epoch_anchor_header: &jetsam_chain::BlockHeader,
 ) -> jetsam_recursive::ChainAccumulator {
+    let epoch_anchor_id = block_id(epoch_anchor_header);
     jetsam_recursive::ChainAccumulator {
         height: header.height,
         tip_semantic_id: jetsam_chain::block_header::semantic_header_id(header),
@@ -81,7 +85,8 @@ fn accumulator_from_header_boundary(
         log_slots: header.log_slots,
         active_slot_count: header.active_slot_count,
         alloc_counter: header.alloc_counter,
-        epoch_anchor_id: block_id(epoch_anchor_header),
+        epoch_anchor_id,
+        previous_epoch_anchor_id: epoch_anchor_id,
     }
 }
 
