@@ -464,6 +464,28 @@ impl AsyncMempool {
             .collect()
     }
 
+    /// [`Self::select_for_block_at_anchor`] over the pair of anchors a
+    /// generation accepts; the launch generation consults only the current
+    /// one.
+    pub async fn select_for_block_at_anchors(
+        &self,
+        max_pages: usize,
+        accepted: jetsam_chain::consensus::AcceptedEpochAnchors,
+        generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+    ) -> Vec<SelectedMempoolEntry> {
+        let st = self.state.lock().await;
+        let limit = max_pages.min(BLOCK_MAX_USER_PAGES);
+        st.pool
+            .select_for_block_at_anchors(limit, accepted, generation)
+            .into_iter()
+            .map(|entry| SelectedMempoolEntry {
+                pages: entry.pages.clone(),
+                logical_txid: entry.spend.logical_txid,
+                cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Block confirmation
     // -----------------------------------------------------------------------
@@ -493,11 +515,15 @@ impl AsyncMempool {
         // Update chain view BEFORE eviction so anchor check uses new state.
         st.view = new_view;
 
-        // Evict transactions from the previous exact epoch after a boundary.
+        // Evict transactions whose anchor the next block's generation no
+        // longer accepts. At launch that is every anchor but the current one;
+        // from v1.3 a transaction bound to the previous epoch survives its
+        // own boundary, which is the whole point of the second anchor.
+        let (accepted_anchors, generation) = st.view.accepted_user_epoch_anchors();
         let stale_anchor: Vec<TxBodyHash> = st
             .pool
             .iter()
-            .filter(|(_, entry)| entry.spend.epoch_anchor != st.view.user_epoch_anchor_id)
+            .filter(|(_, entry)| !accepted_anchors.accepts(entry.spend.epoch_anchor, generation))
             .map(|(hash, _)| *hash)
             .collect();
         for hash in stale_anchor {
@@ -859,11 +885,13 @@ fn run_admission_checks(
         ));
     }
 
-    // Epoch anchor is the one start-of-next-block transaction-epoch anchor.
-    // Returns its height for deterministic mempool bookkeeping.
+    // Epoch anchor is one the next block's generation accepts: the single
+    // start-of-next-block anchor at launch, either of the two from v1.3.
+    // Returns the current anchor's height for deterministic bookkeeping.
     let anchor_height = tx_epoch_anchor_height_for_child(st.view.tip_height + 1);
+    let (accepted_anchors, generation) = st.view.accepted_user_epoch_anchors();
     if st.view.user_epoch_anchor_id == [0u8; 32]
-        || spend.epoch_anchor != st.view.user_epoch_anchor_id
+        || !accepted_anchors.accepts(spend.epoch_anchor, generation)
     {
         return Err(SubmitError::Consensus(
             jetsam_chain::consensus::ConsensusError::BadEpochAnchor,
@@ -1327,6 +1355,122 @@ mod tests {
         let facts = validate_paged_spend(&candidate).unwrap();
         run_admission_checks(&candidate, &facts, &probe_state)
             .expect("accepted tip reward is spendable in its child block");
+    }
+
+    /// Admission asks the view for the anchors the *next block's* generation
+    /// accepts, and nothing else decides. With the v1.3 clock dormant that is
+    /// the single current anchor at every height — a page bound to the older
+    /// one is refused exactly as it always was — and the pair the same view
+    /// hands out is the one that would open under v1.3. The clock is the only
+    /// thing holding that door.
+    #[test]
+    fn admission_asks_the_next_blocks_generation_which_anchors_it_accepts() {
+        use crate::SubmitError;
+        use jetsam_chain::consensus::params::{coinbase_creation_id, HistoryStepPackGeneration};
+
+        let owner = Address([0xA5; 32]);
+        let mint_height = 3;
+        let mut state = ChainState::with_log_slots(6);
+        state
+            .state
+            .set_slot(
+                7,
+                SlotValue::with_owner_fields(
+                    1_000_000,
+                    coinbase_creation_id(mint_height),
+                    owner.as_fields(),
+                ),
+            )
+            .unwrap();
+        let genesis = genesis_header();
+        let mut tip = genesis.clone();
+        tip.height = mint_height;
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis);
+        headers.insert(mint_height, tip);
+        let mut view = ChainView::new(mint_height, headers, 1, state.state);
+        let current = [0x5C; 32];
+        let previous = [0x6D; 32];
+        let stale = [0x7E; 32];
+        view.user_epoch_anchor_id = current;
+        view.previous_user_epoch_anchor_id = previous;
+
+        let st = MempoolState {
+            pool: jetsam_chain::Mempool::new(16),
+            view,
+            floor: crate::floor::FeeFloor::new(4),
+            admitted_input_slots: HashSet::new(),
+            admitted_output_slots: HashSet::new(),
+        };
+        let required = jetsam_chain::consensus::fee_breakdown(
+            1,
+            1,
+            st.view.active_slot_count,
+            st.view.log_slots(),
+        )
+        .required_total;
+        let spend_at = |anchor: [u8; 32]| {
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: 7,
+                amount: 1_000_000,
+                creation_id: coinbase_creation_id(mint_height),
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 8,
+                amount: 1_000_000 - required,
+                owner: Address([0xB6; 32]),
+            };
+            vec![TxPage::new(TxBody {
+                epoch_anchor: anchor,
+                fee: required,
+                input_owner: owner,
+                inputs,
+                outputs,
+                validity_bitmap: 1
+                    | output_bitmap_bit(0)
+                    | PAGED_SPEND_START_BIT
+                    | PAGED_SPEND_END_BIT,
+                is_coinbase: false,
+            })
+            .unwrap()]
+        };
+        let verdict = |anchor: [u8; 32]| {
+            let pages = spend_at(anchor);
+            let facts = validate_paged_spend(&pages).unwrap();
+            run_admission_checks(&pages, &facts, &st).map(|_| ())
+        };
+
+        verdict(current).expect("the current anchor is accepted by every generation");
+        assert!(
+            matches!(
+                verdict(previous),
+                Err(SubmitError::Consensus(
+                    jetsam_chain::consensus::ConsensusError::BadEpochAnchor
+                ))
+            ),
+            "with the v1.3 clock dormant the older anchor is refused, as it always was"
+        );
+        assert!(matches!(
+            verdict(stale),
+            Err(SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::BadEpochAnchor
+            ))
+        ));
+
+        // The discriminant: same view, same pair — only the generation moves.
+        let (accepted, generation) = st.view.accepted_user_epoch_anchors();
+        assert_eq!(
+            generation,
+            HistoryStepPackGeneration::at_height(mint_height + 1),
+            "admission judges by the generation of the block being built"
+        );
+        assert_eq!(generation, HistoryStepPackGeneration::V1);
+        assert!(accepted.accepts(current, HistoryStepPackGeneration::V1));
+        assert!(!accepted.accepts(previous, HistoryStepPackGeneration::V1));
+        assert!(accepted.accepts(previous, HistoryStepPackGeneration::V1_3));
+        assert!(!accepted.accepts(stale, HistoryStepPackGeneration::V1_3));
     }
 
     #[test]

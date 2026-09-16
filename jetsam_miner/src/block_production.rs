@@ -9,6 +9,7 @@
 //! and atomically commit one [`jetsam_chain::AcceptedBlockBundle`].
 
 use jetsam_chain::block::Block;
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::pow::{block_id, validate_pow};
 use jetsam_chain::storage::{MdbxChainContext, MdbxContextError};
 
@@ -20,7 +21,12 @@ type PreparedGhost =
 type PreparedStateCommit = jetsam_chain::consensus::template::PreparedBlockStateCommit;
 type LocallyProvedStateCommit = jetsam_chain::consensus::template::LocallyProvedBlockCommit;
 
+/// The witness, at the page-position tier of the class *and generation* that
+/// proves it. The small class holds 25 positions under the launch relation
+/// and 24 under v1.3; the large class holds 255 in both, so it needs no
+/// second arm.
 enum PreparedWitness {
+    B24(jetsam_block::PreparedHistoryStepWitness<24>),
     B25(jetsam_block::PreparedHistoryStepWitness<25>),
     B255(jetsam_block::PreparedHistoryStepWitness<255>),
 }
@@ -28,6 +34,11 @@ enum PreparedWitness {
 /// A single-use, nonce-independent block witness prepared entirely by the
 /// node. The external PoW worker never receives it and can change only nonce.
 pub struct PreparedBlockAttempt {
+    /// The relation this attempt was prepared under — the generation of the
+    /// block's own height. Every class question asked of the block later is
+    /// answered by it, so an attempt cannot be read under one ladder and
+    /// proved under the other.
+    generation: HistoryStepPackGeneration,
     block: Block,
     terminal_bytes: Vec<u8>,
     end_accumulator: jetsam_recursive::ChainAccumulator,
@@ -71,23 +82,22 @@ fn decode_template_authorizations(
 }
 
 /// The launch-generation boundary at `header`: one anchor, carried in
-/// canonical form. A v1.3 boundary also needs the previous anchor header and
-/// is built by its own generation-aware path.
+/// canonical form, the older lane conflated with it.
+///
+/// This is [`jetsam_recursive::ChainAccumulator::from_canonical_headers`]
+/// under the launch generation, and exists so that the tests below read as
+/// the one-anchor statement they are.
+#[cfg(test)]
 fn accumulator_from_header_boundary(
     header: &jetsam_chain::BlockHeader,
     epoch_anchor_header: &jetsam_chain::BlockHeader,
 ) -> jetsam_recursive::ChainAccumulator {
-    let epoch_anchor_id = block_id(epoch_anchor_header);
-    jetsam_recursive::ChainAccumulator {
-        height: header.height,
-        tip_semantic_id: jetsam_chain::block_header::semantic_header_id(header),
-        state_root: header.state_root,
-        log_slots: header.log_slots,
-        active_slot_count: header.active_slot_count,
-        alloc_counter: header.alloc_counter,
-        epoch_anchor_id,
-        previous_epoch_anchor_id: epoch_anchor_id,
-    }
+    jetsam_recursive::ChainAccumulator::from_canonical_headers(
+        HistoryStepPackGeneration::V1,
+        header,
+        epoch_anchor_header,
+        None,
+    )
 }
 
 impl PreparedBlockAttempt {
@@ -137,6 +147,7 @@ impl PreparedBlockAttempt {
             previous_timestamps,
             asert_anchor,
             parent_tx_epoch_anchor_header,
+            parent_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             prepared_state_commit,
             ..
@@ -144,6 +155,20 @@ impl PreparedBlockAttempt {
 
         let expected_parent_id = block_id(&parent);
         let expected_parent_height = parent.height;
+        // The relation this block is proved under is the one its own height
+        // selects — never the tip's, never the compiled ladder's. The runtime
+        // was resolved from the same height by the caller's selector; if the
+        // two disagree the wrong pack is in hand, and refusing here costs
+        // nothing while proving against it would waste the whole attempt.
+        let child_height = expected_parent_height.saturating_add(1);
+        let generation = HistoryStepPackGeneration::at_height(child_height);
+        if runtime.bank().generation() != generation {
+            return Err(format!(
+                "height {child_height} is proved by {generation:?} but the supplied HistoryStep \
+                 runtime carries {:?}",
+                runtime.bank().generation()
+            ));
+        }
         let authorization_weight = authorization_bytes
             .iter()
             .filter_map(|bytes| bytes.as_ref())
@@ -153,8 +178,12 @@ impl PreparedBlockAttempt {
         if cancelled() {
             return Ok(None);
         }
-        let start_accumulator =
-            accumulator_from_header_boundary(&parent, &parent_tx_epoch_anchor_header);
+        let start_accumulator = jetsam_recursive::ChainAccumulator::from_canonical_headers(
+            generation,
+            &parent,
+            &parent_tx_epoch_anchor_header,
+            parent_previous_tx_epoch_anchor_header.as_ref(),
+        );
         let parent_terminal = match (parent.height, parent_history_step_terminal_bytes) {
             (0, None) => None,
             (0, Some(_)) => {
@@ -178,27 +207,22 @@ impl PreparedBlockAttempt {
             .len()
             .checked_add(authorization_weight)
             .ok_or_else(|| "prepared block byte weight overflow".to_string())?;
-        let stream = jetsam_chain::validate_block_page_stream(&block.transactions)
+        let stream = jetsam_chain::validate_block_page_stream_in(&block.transactions, generation)
             .map_err(|error| format!("prepared block body is non-canonical: {error}"))?;
         let proof_class = stream.proof_class;
+        let tier = proof_class.page_capacity_in_generation(generation);
         // Last line of defence, before any proof of work is spent on this
         // template. A terminal too large for the wire cap is refused by every
         // node including the one that built it, and the refusal only arrives at
         // submitBlock — by which point the transactions are frozen into the
         // hash, so nothing can be dropped to rescue the solution. Refuse here,
         // where refusing costs nothing.
-        let class_id = jetsam_recursive::canonical_history_step_class_id(proof_class.page_capacity())
-            .ok_or_else(|| {
-                format!(
-                    "no proof class registered for the {}-page tier",
-                    proof_class.page_capacity()
-                )
-            })?;
+        let class_id = jetsam_recursive::canonical_history_step_class_id_in(generation, tier)
+            .ok_or_else(|| format!("no proof class registered for the {tier}-page tier"))?;
         let terminal_bytes = jetsam_recursive::history_step_terminal_wire_bytes(runtime, class_id)
             .map_err(|error| format!("terminal size for {proof_class:?} is unknown: {error:?}"))?;
         // The cap this block will be judged by is the one active at its own
         // height — the child of this parent — not at the tip we happen to see.
-        let child_height = expected_parent_height.saturating_add(1);
         let terminal_cap = jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit(child_height);
         if terminal_bytes > terminal_cap {
             return Err(format!(
@@ -215,29 +239,45 @@ impl PreparedBlockAttempt {
             finalized_active_counts: &finalized_active_counts,
             asert_anchor: &asert_anchor,
             local_time,
+            generation,
+            previous_tx_epoch_anchor_header: parent_previous_tx_epoch_anchor_header.as_ref(),
         };
-        let witness = match proof_class {
-            jetsam_chain::consensus::paged_spend::BlockProofClass::B25 => {
-                jetsam_block::prepare_history_step_witness::<25>(
-                    block,
-                    context,
-                    authorization_proofs,
-                    ghost,
-                    runtime,
-                    parent_terminal.as_ref(),
-                )
-                .map(PreparedWitness::B25)
-            }
-            jetsam_chain::consensus::paged_spend::BlockProofClass::B255 => {
-                jetsam_block::prepare_history_step_witness::<255>(
-                    block,
-                    context,
-                    authorization_proofs,
-                    ghost,
-                    runtime,
-                    parent_terminal.as_ref(),
-                )
-                .map(PreparedWitness::B255)
+        // Dispatch on the tier, not on the class name: the small class is
+        // `<25>` under the launch relation and `<24>` under v1.3, and the
+        // tier is the only value that names the right one in both.
+        let witness = match tier {
+            24 => jetsam_block::prepare_history_step_witness::<24>(
+                block,
+                context,
+                authorization_proofs,
+                ghost,
+                runtime,
+                parent_terminal.as_ref(),
+            )
+            .map(PreparedWitness::B24),
+            25 => jetsam_block::prepare_history_step_witness::<25>(
+                block,
+                context,
+                authorization_proofs,
+                ghost,
+                runtime,
+                parent_terminal.as_ref(),
+            )
+            .map(PreparedWitness::B25),
+            255 => jetsam_block::prepare_history_step_witness::<255>(
+                block,
+                context,
+                authorization_proofs,
+                ghost,
+                runtime,
+                parent_terminal.as_ref(),
+            )
+            .map(PreparedWitness::B255),
+            other => {
+                return Err(format!(
+                    "{generation:?} selected a {other}-page tier for {proof_class:?}, which this \
+                     binary has no witness for"
+                ));
             }
         }
         .map_err(|error| error.to_string())?;
@@ -292,6 +332,7 @@ impl PreparedBlockAttempt {
             }};
         }
         let (block, terminal_bytes, end_accumulator) = match witness {
+            PreparedWitness::B24(witness) => finish_and_prove!(witness),
             PreparedWitness::B25(witness) => finish_and_prove!(witness),
             PreparedWitness::B255(witness) => finish_and_prove!(witness),
         };
@@ -301,6 +342,7 @@ impl PreparedBlockAttempt {
             .ok_or_else(|| "prepared HistoryStep retained-byte weight overflow".to_string())?;
 
         Ok(Some(Self {
+            generation,
             block,
             terminal_bytes,
             end_accumulator,
@@ -322,14 +364,19 @@ impl PreparedBlockAttempt {
 
     pub fn user_page_count(&self) -> usize {
         usize::from(
-            jetsam_chain::validate_block_page_stream(&self.block.transactions)
+            jetsam_chain::validate_block_page_stream_in(&self.block.transactions, self.generation)
                 .expect("prepared block has a canonical body")
                 .page_count,
         )
     }
 
+    /// The relation this attempt was prepared and proved under.
+    pub const fn generation(&self) -> HistoryStepPackGeneration {
+        self.generation
+    }
+
     pub fn proof_class(&self) -> jetsam_chain::consensus::paged_spend::BlockProofClass {
-        jetsam_chain::validate_block_page_stream(&self.block.transactions)
+        jetsam_chain::validate_block_page_stream_in(&self.block.transactions, self.generation)
             .expect("prepared block has a canonical body")
             .proof_class
     }
@@ -470,5 +517,94 @@ mod tests {
                 }
             ) if actual == epoch
         ));
+    }
+
+    /// The start boundary the miner hands the witness has the shape of the
+    /// generation proving the child, and of nothing else: one anchor with the
+    /// older lane conflated at launch, two distinct anchors from v1.3. Under
+    /// the launch generation the previous-anchor header is not consulted even
+    /// when one is supplied, which is what keeps the pre-fork path fixed.
+    #[test]
+    fn the_start_boundary_has_the_shape_of_the_childs_generation() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        let epoch = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let parent = header(3 * epoch + 1, [0x11; 32]);
+        let current = header(3 * epoch, [0x22; 32]);
+        let previous = header(2 * epoch, [0x33; 32]);
+
+        let launch =
+            jetsam_recursive::ChainAccumulator::from_canonical_headers(V1, &parent, &current, None);
+        assert_eq!(launch, accumulator_from_header_boundary(&parent, &current));
+        assert_eq!(launch.previous_epoch_anchor_id, launch.epoch_anchor_id);
+        assert_eq!(
+            jetsam_recursive::ChainAccumulator::from_canonical_headers(
+                V1,
+                &parent,
+                &current,
+                Some(&previous)
+            ),
+            launch,
+            "the launch relation has no older lane to fill"
+        );
+
+        let v1_3 = jetsam_recursive::ChainAccumulator::from_canonical_headers(
+            V1_3,
+            &parent,
+            &current,
+            Some(&previous),
+        );
+        assert_eq!(v1_3.epoch_anchor_id, launch.epoch_anchor_id);
+        assert_eq!(v1_3.previous_epoch_anchor_id, block_id(&previous));
+        assert_ne!(v1_3.previous_epoch_anchor_id, v1_3.epoch_anchor_id);
+        v1_3.validate_local_header_boundary_in(V1_3, &parent, &current, Some(&previous))
+            .expect("both anchors are bound to their canonical headers");
+        launch
+            .validate_local_header_boundary_in(V1, &parent, &current, None)
+            .expect("the launch boundary binds the one anchor it has");
+    }
+
+    /// The witness tier the miner dispatches on is the generation's page
+    /// capacity for the class it selected, and this binary carries an arm and
+    /// a registered proof class for every tier either generation can name.
+    /// The twenty-fifth page is the small class at launch and the large class
+    /// under v1.3 — the same block, sorted by the relation proving it.
+    #[test]
+    fn the_witness_tier_is_the_generations_and_every_tier_has_an_arm() {
+        use jetsam_chain::consensus::paged_spend::BlockProofClass;
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        for (pages, generation, expected_tier) in [
+            (0, V1, 25),
+            (24, V1, 25),
+            (25, V1, 25),
+            (26, V1, 255),
+            (255, V1, 255),
+            (0, V1_3, 24),
+            (24, V1_3, 24),
+            (25, V1_3, 255),
+            (255, V1_3, 255),
+        ] {
+            let class = BlockProofClass::for_page_count_in_generation(pages, generation)
+                .expect("both ladders hold 255 pages");
+            let tier = class.page_capacity_in_generation(generation);
+            assert_eq!(tier, expected_tier, "{pages} pages under {generation:?}");
+            // Exactly the three arms of `PreparedWitness`.
+            assert!(
+                matches!(tier, 24 | 25 | 255),
+                "no witness arm for the {tier}-page tier"
+            );
+            assert!(
+                jetsam_recursive::canonical_history_step_class_id_in(generation, tier).is_some(),
+                "no proof class registered for the {tier}-page tier of {generation:?}"
+            );
+        }
+        // A block too large for either ladder has no class, and so no tier.
+        for generation in [V1, V1_3] {
+            assert_eq!(
+                BlockProofClass::for_page_count_in_generation(256, generation),
+                None
+            );
+        }
     }
 }
