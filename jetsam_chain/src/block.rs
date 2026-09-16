@@ -423,8 +423,33 @@ pub fn apply_genesis_block(
 }
 
 /// Validate coinbase placement and the complete physical user-page stream.
+///
+/// The class in the returned facts is the launch generation's. A caller that
+/// consumes the class — the witness tier, the terminal class slot — asks
+/// [`validate_block_page_stream_at_height`] instead; every other fact is the
+/// same under both generations.
 pub fn validate_block_page_stream(
     txs: &[Transaction],
+) -> Result<BlockPageStreamFacts, BlockPageStreamError> {
+    validate_block_page_stream_in(txs, crate::consensus::params::HistoryStepPackGeneration::V1)
+}
+
+/// [`validate_block_page_stream`] under the generation in force at `height`,
+/// on the fixed activation clock.
+pub fn validate_block_page_stream_at_height(
+    txs: &[Transaction],
+    height: u64,
+) -> Result<BlockPageStreamFacts, BlockPageStreamError> {
+    validate_block_page_stream_in(
+        txs,
+        crate::consensus::params::HistoryStepPackGeneration::at_height(height),
+    )
+}
+
+/// [`validate_block_page_stream`] under one generation's ladder.
+pub fn validate_block_page_stream_in(
+    txs: &[Transaction],
+    generation: crate::consensus::params::HistoryStepPackGeneration,
 ) -> Result<BlockPageStreamFacts, BlockPageStreamError> {
     let Some(coinbase) = txs.first() else {
         return Err(BlockPageStreamError::MissingCoinbase);
@@ -448,13 +473,17 @@ pub fn validate_block_page_stream(
     {
         return Err(BlockPageStreamError::InvalidDevelopmentPayout);
     }
-    let user = crate::consensus::paged_spend::validate_paged_spend_transaction_stream(
+    let user = crate::consensus::paged_spend::validate_paged_spend_transaction_stream_in(
         &txs[user_start_index..],
+        generation,
     )
     .map_err(BlockPageStreamError::PagedSpend)?;
     let effective_page_count = usize::from(user.page_count) + usize::from(has_development_payout);
     let proof_class =
-        crate::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
+        crate::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+            effective_page_count,
+            generation,
+        )
             .ok_or(BlockPageStreamError::PagedSpend(
                 crate::consensus::paged_spend::PagedSpendStreamError::BlockPageLimit {
                     actual: effective_page_count,
@@ -921,6 +950,54 @@ mod tests {
             canonical_block_wire_len(BLOCK_MAX_TXS + 1),
             Err(WireError::LengthOverflow)
         );
+    }
+
+    /// The block-level class is asked of the generation in force at the
+    /// block's height. With the v1.3 clock dormant every height answers the
+    /// launch verdict; under v1.3 the same twenty-five effective pages are the
+    /// large class. Nothing but the class differs, so the logical txids — and
+    /// with them the tx root every header commits to — are the same in both.
+    #[test]
+    fn the_block_class_is_selected_by_the_generation_of_its_height() {
+        use crate::consensus::paged_spend::BlockProofClass;
+        use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        let with_users = |count: usize| {
+            let mut txs = vec![coinbase(), development_payout()];
+            txs.extend((0..count).map(|index| {
+                let mut tx = user_tx_at(1_000 + index as u32, 2_000 + index as u32);
+                tx.body.inputs[0].creation_id = index as u64 + 1;
+                tx
+            }));
+            txs
+        };
+
+        for (user_pages, v1_3_class) in [
+            (0usize, BlockProofClass::B25),
+            (23, BlockProofClass::B25),
+            (24, BlockProofClass::B255),
+            (25, BlockProofClass::B255),
+        ] {
+            let txs = with_users(user_pages);
+            let launch = validate_block_page_stream(&txs).unwrap();
+            for height in [0u64, 1, 8_450, u64::MAX] {
+                assert_eq!(
+                    validate_block_page_stream_at_height(&txs, height).unwrap(),
+                    launch,
+                    "{user_pages} user pages at height {height}: the clock is dormant"
+                );
+            }
+            assert_eq!(validate_block_page_stream_in(&txs, V1).unwrap(), launch);
+            let v1_3 = validate_block_page_stream_in(&txs, V1_3).unwrap();
+            assert_eq!(v1_3.proof_class, v1_3_class, "{user_pages} user pages");
+            assert_eq!(v1_3.groups, launch.groups);
+            assert_eq!(v1_3.page_count, launch.page_count);
+            assert_eq!(v1_3.logical_count, launch.logical_count);
+            assert_eq!(v1_3.live_inputs, launch.live_inputs);
+            assert_eq!(v1_3.live_outputs, launch.live_outputs);
+            assert_eq!(v1_3.has_development_payout, launch.has_development_payout);
+            assert_eq!(v1_3.user_start_index, launch.user_start_index);
+        }
     }
 
     #[test]

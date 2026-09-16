@@ -83,8 +83,9 @@ pub use epoch_anchor::{
     checked_tx_epoch_height_decomposition, next_tx_epoch_anchor_id,
     previous_tx_epoch_anchor_height_for_child, resolve_accepted_user_epoch_anchor_ids,
     resolve_user_epoch_anchor_id, tx_epoch_anchor_height_for_child,
-    tx_epoch_anchor_is_acceptable_for_child, validate_block_epoch_anchors, AcceptedEpochAnchors,
-    TxEpochHeightDecomposition, TX_EPOCH_ACCEPTED_ANCHORS,
+    tx_epoch_anchor_is_acceptable_for_child, validate_block_epoch_anchors,
+    validate_block_epoch_anchors_in, AcceptedEpochAnchors, TxEpochHeightDecomposition,
+    TX_EPOCH_ACCEPTED_ANCHORS,
 };
 pub use fees::{
     burned_fee_for_tx_body, claimable_fee_for_tx_body, fee_breakdown, fee_breakdown_for_tx_body,
@@ -98,7 +99,8 @@ pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use paged_spend::{
     validate_paged_spend_transaction_stream, validate_paged_spend_transaction_stream_for_class,
-    validate_paged_spend_tx_page_stream, validate_paged_spend_tx_page_stream_for_class,
+    validate_paged_spend_transaction_stream_in, validate_paged_spend_tx_page_stream,
+    validate_paged_spend_tx_page_stream_for_class, validate_paged_spend_tx_page_stream_in,
     BlockProofClass, PagedSpendGroupFacts, PagedSpendStreamError, PagedSpendStreamFacts,
     BLOCK_PROOF_CLASS_TIERS,
 };

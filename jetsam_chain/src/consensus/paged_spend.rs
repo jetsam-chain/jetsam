@@ -13,8 +13,8 @@ use std::collections::HashSet;
 use jetsam_tx::{validate_paged_spend, PagedSpendError, PagedSpendFacts, Transaction, TxPage};
 
 use super::params::{
-    BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_PAGES, BLOCK_PAGE_CLASS_TIERS,
-    MAX_INPUTS, MAX_OUTPUTS,
+    HistoryStepPackGeneration, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS,
+    BLOCK_MAX_USER_PAGES, BLOCK_PAGE_CLASS_TIERS, MAX_INPUTS, MAX_OUTPUTS,
 };
 
 /// The complete launch proof-class ladder, indexed by physical user pages.
@@ -99,6 +99,38 @@ impl BlockProofClass {
     /// Maximum live logical groups/capsules.
     pub const fn live_authorization_capacity(self) -> usize {
         self.page_capacity()
+    }
+
+    /// [`Self::live_authorization_capacity`] under one generation's ladder.
+    pub const fn live_authorization_capacity_in_generation(
+        self,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> usize {
+        self.page_capacity_in_generation(generation)
+    }
+
+    /// [`Self::input_capacity`] under one generation's ladder: the small
+    /// class holds eight inputs per page position it has, so it follows the
+    /// generation's small tier. The large class is the block maximum in both.
+    pub const fn input_capacity_in_generation(
+        self,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> usize {
+        match self {
+            Self::B25 => generation.small_tier() * MAX_INPUTS,
+            Self::B255 => BLOCK_MAX_LIVE_INPUTS,
+        }
+    }
+
+    /// [`Self::output_capacity`] under one generation's ladder.
+    pub const fn output_capacity_in_generation(
+        self,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> usize {
+        match self {
+            Self::B25 => generation.small_tier() * MAX_OUTPUTS,
+            Self::B255 => BLOCK_MAX_USER_OUTPUTS,
+        }
     }
 
     pub const fn authorization_tile_capacity(self) -> usize {
@@ -244,53 +276,77 @@ impl PageBody for Transaction {
 pub fn validate_paged_spend_transaction_stream(
     pages: &[Transaction],
 ) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
-    let class = BlockProofClass::for_page_count(pages.len()).ok_or(
+    validate_paged_spend_transaction_stream_in(pages, HistoryStepPackGeneration::V1)
+}
+
+/// [`validate_paged_spend_transaction_stream`] under one generation's
+/// ladder. The class is the only fact that can differ between generations:
+/// group parsing, counts and slot conflicts are the same stream either way,
+/// and the small-class slot capacities are implied by its page count.
+pub fn validate_paged_spend_transaction_stream_in(
+    pages: &[Transaction],
+    generation: HistoryStepPackGeneration,
+) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
+    let class = BlockProofClass::for_page_count_in_generation(pages.len(), generation).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
             capacity: BLOCK_MAX_USER_PAGES,
         },
     )?;
-    validate_stream_for_class(pages, class)
+    validate_stream_for_class_in(pages, class, generation)
 }
 
 pub fn validate_paged_spend_transaction_stream_for_class(
     pages: &[Transaction],
     proof_class: BlockProofClass,
 ) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
-    validate_stream_for_class(pages, proof_class)
+    validate_stream_for_class_in(pages, proof_class, HistoryStepPackGeneration::V1)
 }
 
 /// Validate the same canonical stream directly from wallet/mempool pages.
 pub fn validate_paged_spend_tx_page_stream(
     pages: &[TxPage],
 ) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
-    let class = BlockProofClass::for_page_count(pages.len()).ok_or(
+    validate_paged_spend_tx_page_stream_in(pages, HistoryStepPackGeneration::V1)
+}
+
+/// [`validate_paged_spend_tx_page_stream`] under one generation's ladder.
+pub fn validate_paged_spend_tx_page_stream_in(
+    pages: &[TxPage],
+    generation: HistoryStepPackGeneration,
+) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
+    let class = BlockProofClass::for_page_count_in_generation(pages.len(), generation).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
             capacity: BLOCK_MAX_USER_PAGES,
         },
     )?;
-    validate_stream_for_class(pages, class)
+    validate_stream_for_class_in(pages, class, generation)
 }
 
 pub fn validate_paged_spend_tx_page_stream_for_class(
     pages: &[TxPage],
     proof_class: BlockProofClass,
 ) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
-    validate_stream_for_class(pages, proof_class)
+    validate_stream_for_class_in(pages, proof_class, HistoryStepPackGeneration::V1)
 }
 
-fn validate_stream_for_class<T: PageBody>(
+/// The one stream validator, over the ladder of `generation`. Every launch
+/// entry point above passes `V1`, whose ladder and capacities are the compiled
+/// constants, so the pre-fork verdict is unchanged.
+fn validate_stream_for_class_in<T: PageBody>(
     pages: &[T],
     proof_class: BlockProofClass,
+    generation: HistoryStepPackGeneration,
 ) -> Result<PagedSpendStreamFacts, PagedSpendStreamError> {
-    if pages.len() > proof_class.page_capacity() {
+    let page_capacity = proof_class.page_capacity_in_generation(generation);
+    if pages.len() > page_capacity {
         return Err(PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
-            capacity: proof_class.page_capacity(),
+            capacity: page_capacity,
         });
     }
-    let expected = BlockProofClass::for_page_count(pages.len()).ok_or(
+    let expected = BlockProofClass::for_page_count_in_generation(pages.len(), generation).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
             capacity: BLOCK_MAX_USER_PAGES,
@@ -321,37 +377,40 @@ fn validate_stream_for_class<T: PageBody>(
             page_count: (end - start) as u16,
             spend,
         });
-        if groups.len() > proof_class.live_authorization_capacity() {
+        let group_capacity = proof_class.live_authorization_capacity_in_generation(generation);
+        if groups.len() > group_capacity {
             return Err(PagedSpendStreamError::TooManyGroups {
                 actual: groups.len(),
-                capacity: proof_class.live_authorization_capacity(),
+                capacity: group_capacity,
             });
         }
         cursor = end;
     }
 
+    let input_capacity = proof_class.input_capacity_in_generation(generation);
     let live_inputs = checked_group_sum(&groups, |group| group.spend.live_inputs as usize).ok_or(
         PagedSpendStreamError::BlockInputLimit {
             actual: usize::MAX,
-            capacity: proof_class.input_capacity(),
+            capacity: input_capacity,
         },
     )?;
-    if live_inputs > proof_class.input_capacity() {
+    if live_inputs > input_capacity {
         return Err(PagedSpendStreamError::BlockInputLimit {
             actual: live_inputs,
-            capacity: proof_class.input_capacity(),
+            capacity: input_capacity,
         });
     }
 
+    let output_capacity = proof_class.output_capacity_in_generation(generation);
     let live_outputs = checked_group_sum(&groups, |group| group.spend.live_outputs as usize)
         .ok_or(PagedSpendStreamError::BlockOutputLimit {
             actual: usize::MAX,
-            capacity: proof_class.output_capacity(),
+            capacity: output_capacity,
         })?;
-    if live_outputs > proof_class.output_capacity() {
+    if live_outputs > output_capacity {
         return Err(PagedSpendStreamError::BlockOutputLimit {
             actual: live_outputs,
-            capacity: proof_class.output_capacity(),
+            capacity: output_capacity,
         });
     }
 
@@ -568,6 +627,96 @@ mod tests {
         assert_eq!(facts.groups[0].start_page, 0);
         assert_eq!(facts.groups[0].page_count, 128);
         assert_eq!(facts.groups[0].end_page_exclusive(), 128);
+    }
+
+    /// The class ladder is the generation's, not the compiled one. The
+    /// launch twin answers exactly what the launch generation does, so every
+    /// caller that never learned about generations still gets the pre-fork
+    /// verdict; and under v1.3 the twenty-fifth page moves a stream into the
+    /// large class, while every fact that is not the class is unchanged.
+    #[test]
+    fn the_stream_class_is_selected_by_the_generation() {
+        use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        for count in [0usize, 24, 25, 26, 255] {
+            let pages = independent_stream(count);
+            let launch = validate_paged_spend_tx_page_stream(&pages).unwrap();
+            assert_eq!(
+                validate_paged_spend_tx_page_stream_in(&pages, V1).unwrap(),
+                launch,
+                "{count} pages: the launch twin is the V1 relation"
+            );
+            let v1_3 = validate_paged_spend_tx_page_stream_in(&pages, V1_3).unwrap();
+            let expected_class = if count <= 24 {
+                BlockProofClass::B25
+            } else {
+                BlockProofClass::B255
+            };
+            assert_eq!(v1_3.proof_class, expected_class, "{count} pages under v1.3");
+            assert_eq!(v1_3.groups, launch.groups, "{count} pages: same groups");
+            assert_eq!(v1_3.page_count, launch.page_count);
+            assert_eq!(v1_3.logical_count, launch.logical_count);
+            assert_eq!(v1_3.live_inputs, launch.live_inputs);
+            assert_eq!(v1_3.live_outputs, launch.live_outputs);
+
+            let transactions: Vec<_> = pages
+                .iter()
+                .map(|page| Transaction::new(page.body.clone()))
+                .collect();
+            assert_eq!(
+                validate_paged_spend_transaction_stream_in(&transactions, V1_3).unwrap(),
+                v1_3
+            );
+        }
+        assert_eq!(
+            validate_paged_spend_tx_page_stream_in(&independent_stream(256), V1_3),
+            Err(PagedSpendStreamError::BlockPageLimit {
+                actual: 256,
+                capacity: 255,
+            })
+        );
+    }
+
+    /// The small class's slot capacities follow its page count: 24 pages of
+    /// eight inputs and two outputs under v1.3, 25 at launch. The large class
+    /// is the same in both.
+    #[test]
+    fn small_class_capacities_follow_the_generation_ladder() {
+        use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        assert_eq!(BlockProofClass::B25.input_capacity_in_generation(V1), 200);
+        assert_eq!(BlockProofClass::B25.output_capacity_in_generation(V1), 50);
+        assert_eq!(BlockProofClass::B25.live_authorization_capacity_in_generation(V1), 25);
+        assert_eq!(BlockProofClass::B25.input_capacity_in_generation(V1_3), 192);
+        assert_eq!(BlockProofClass::B25.output_capacity_in_generation(V1_3), 48);
+        assert_eq!(BlockProofClass::B25.live_authorization_capacity_in_generation(V1_3), 24);
+        for generation in [V1, V1_3] {
+            assert_eq!(
+                BlockProofClass::B25.input_capacity_in_generation(generation),
+                generation.small_tier() * MAX_INPUTS
+            );
+            assert_eq!(
+                BlockProofClass::B255.input_capacity_in_generation(generation),
+                BLOCK_MAX_LIVE_INPUTS
+            );
+            assert_eq!(
+                BlockProofClass::B255.output_capacity_in_generation(generation),
+                BLOCK_MAX_USER_OUTPUTS
+            );
+            assert_eq!(
+                BlockProofClass::B255.live_authorization_capacity_in_generation(generation),
+                255
+            );
+        }
+        // The launch accessors are the V1 arm.
+        for class in [BlockProofClass::B25, BlockProofClass::B255] {
+            assert_eq!(class.input_capacity(), class.input_capacity_in_generation(V1));
+            assert_eq!(class.output_capacity(), class.output_capacity_in_generation(V1));
+            assert_eq!(
+                class.live_authorization_capacity(),
+                class.live_authorization_capacity_in_generation(V1)
+            );
+        }
     }
 
     #[test]
