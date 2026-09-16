@@ -858,6 +858,22 @@ impl ValidatedSnapshotHeaderStaging {
         self.staging.discard()
     }
 
+    /// Read one header of the branch this candidate describes.
+    ///
+    /// The suffix on disk is the candidate branch; below its base the branch
+    /// and the canonical chain are the same block, so the store answers. A
+    /// verifier deriving the boundary a terminal must be rooted on has to ask
+    /// the branch being judged, not the one this node happens to be on — the
+    /// two are the same question only until someone forks.
+    ///
+    /// The descriptor is re-checked first, like every other read of a
+    /// validated staging: the file was validated once and nothing after that
+    /// may assume it stayed that way.
+    pub fn header_at(&mut self, store: &MdbxStore, height: u64) -> Result<Option<BlockHeader>> {
+        self.assert_file_unchanged_before_read()?;
+        self.staging.header_at(store, height)
+    }
+
     fn assert_file_unchanged_before_read(&self) -> Result<()> {
         let current = StagingFileIdentity::capture(&self.staging.file)?;
         if current != self.file_identity {

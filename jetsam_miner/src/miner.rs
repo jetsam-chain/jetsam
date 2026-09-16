@@ -44,6 +44,20 @@ use jetsam_mempool::{AsyncMempool, MempoolEvent};
 use jetsam_poseidon2b::primitives::Address;
 
 use crate::block_production::{PreparedBlockAttempt, ProvedBlock};
+
+/// The prover for a block at a given height.
+///
+/// A hardfork that changes the relation changes the matrices, so the pack
+/// that proves a block is a function of that block's height, not of the tip
+/// the node happened to have when it started. A producer that resolved this
+/// once would prove the first post-fork block with the pre-fork matrices and
+/// halt until someone restarted it — a one-block restart window nobody can
+/// hit on purpose.
+pub type HistoryStepRuntimeSelector = Arc<
+    dyn Fn(u64) -> Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>
+        + Send
+        + Sync,
+>;
 use crate::cpu_budget::{
     configure_process_cpu_budget, configured_process_cpu_budget, install_history_step_phase_cpu,
     install_pow_phase_cpu, ProcessCpuBudgetMode,
@@ -195,7 +209,7 @@ pub struct BlockMiner {
     /// Keep the channel open for library-only miners even when their caller
     /// does not retain a sender after construction.
     _template_change_sender: broadcast::Sender<()>,
-    history_step_runtime: Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>,
+    history_step_runtime_for_height: HistoryStepRuntimeSelector,
     ghost_authorization:
         Arc<jetsam_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
     /// Optional hook called synchronously after block is applied to chain, before
@@ -220,7 +234,7 @@ impl BlockMiner {
         proof_network_ready: watch::Receiver<bool>,
         nonce_network_ready: watch::Receiver<bool>,
         template_change_sender: broadcast::Sender<()>,
-        history_step_runtime: Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>,
+        history_step_runtime_for_height: HistoryStepRuntimeSelector,
         ghost_authorization: Arc<
             jetsam_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization,
         >,
@@ -254,7 +268,7 @@ impl BlockMiner {
             nonce_network_ready,
             template_changes: template_change_sender.subscribe(),
             _template_change_sender: template_change_sender,
-            history_step_runtime,
+            history_step_runtime_for_height,
             ghost_authorization,
             on_block_applied: None,
             payout_resolver: None,
@@ -351,10 +365,22 @@ impl BlockMiner {
         // Measured once, from this node's own frozen bank: a class whose
         // terminal exceeds the consensus cap can never be published, and a
         // template built in it wastes the proof of work that found it.
+        // Measured against the pack that governs the next block. A pack
+        // switch at the fork height changes the terminal sizes, so this is
+        // re-measured when the producer first builds a template past it.
+        let next_height = {
+            let ctx = self.chain.read().await;
+            ctx.tip_height().saturating_add(1)
+        };
+        let Some(capacity_runtime) = (self.history_step_runtime_for_height)(next_height) else {
+            tracing::error!(
+                next_height,
+                "miner: no HistoryStep pack for the next block; not producing"
+            );
+            return;
+        };
         let measured_terminal_bytes =
-            match crate::proof_capacity::measured_terminal_bytes_from_runtime(
-                &self.history_step_runtime,
-            ) {
+            match crate::proof_capacity::measured_terminal_bytes_from_runtime(&capacity_runtime) {
                 Ok(sizes) => sizes,
                 Err(reason) => {
                     tracing::error!(
@@ -456,7 +482,16 @@ impl BlockMiner {
 
             let expected_parent_height = tmpl.parent.height;
             let expected_parent_hash = block_id(&tmpl.parent);
-            let prepare_runtime = Arc::clone(&self.history_step_runtime);
+            // The pack that proves this block is chosen by *this block's*
+            // height, and the same one seals it after the nonce is found.
+            let Some(block_runtime) = (self.history_step_runtime_for_height)(height) else {
+                tracing::error!(
+                    height,
+                    "miner: no HistoryStep pack for this block height; skipping template"
+                );
+                continue;
+            };
+            let prepare_runtime = Arc::clone(&block_runtime);
             let prepare_ghost = Arc::clone(&self.ghost_authorization);
             let prepare_cancellation = Arc::new(AtomicBool::new(false));
             let worker_cancellation = Arc::clone(&prepare_cancellation);
@@ -776,7 +811,7 @@ impl BlockMiner {
                                 "PoW nonce found; sealing prepared HistoryStep"
                             );
 
-                            let seal_runtime = Arc::clone(&self.history_step_runtime);
+                            let seal_runtime = Arc::clone(&block_runtime);
                             let seal_handle = tokio::task::spawn_blocking(move || {
                                 let started = Instant::now();
                                 let result = install_history_step_phase_cpu(|| {

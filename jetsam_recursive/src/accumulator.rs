@@ -454,6 +454,45 @@ impl ChainAccumulator {
         }
         Ok(())
     }
+
+    /// The recursive boundary of a canonical header, read off headers alone.
+    ///
+    /// Every lane is a header field or a projection of one: the tip is the
+    /// nonce-free semantic projection, and the two epoch anchors are the ids
+    /// of the canonical headers at their heights. Nothing here needs a body,
+    /// an undo log or the state at that height — which is exactly why a node
+    /// that resynced cold, or one standing at the block before a fork it has
+    /// never crossed, can compute this boundary for itself instead of being
+    /// handed a checkpoint to trust.
+    ///
+    /// The caller supplies the anchor headers because only it knows the
+    /// canonical chain; [`Self::validate_local_header_boundary_in`] is the
+    /// inverse check and takes the same headers. Under the launch generation
+    /// the previous anchor is not a lane and the boundary is in canonical
+    /// launch form whatever header is passed for it.
+    pub fn from_canonical_headers(
+        generation: HistoryStepPackGeneration,
+        header: &BlockHeader,
+        epoch_anchor_header: &BlockHeader,
+        previous_epoch_anchor_header: Option<&BlockHeader>,
+    ) -> Self {
+        let epoch_anchor_id = hash_block_header(epoch_anchor_header);
+        Self {
+            height: header.height,
+            tip_semantic_id: semantic_header_id(header),
+            state_root: header.state_root,
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            epoch_anchor_id,
+            previous_epoch_anchor_id: match previous_epoch_anchor_header {
+                Some(previous) if generation.binds_two_epoch_anchors() => {
+                    hash_block_header(previous)
+                }
+                _ => epoch_anchor_id,
+            },
+        }
+    }
 }
 
 /// Canonical blockless bootstrap boundary.

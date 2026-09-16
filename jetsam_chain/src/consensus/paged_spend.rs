@@ -81,6 +81,21 @@ impl BlockProofClass {
         }
     }
 
+    /// The class holding `page_count` under the ladder in force at `height`,
+    /// on the fixed activation clock. With the v1.3 clock at `None` this is
+    /// [`Self::for_page_count`] at every height.
+    pub const fn for_page_count_at_height(page_count: usize, height: u64) -> Option<Self> {
+        Self::for_page_count_in_generation(
+            page_count,
+            super::params::HistoryStepPackGeneration::at_height(height),
+        )
+    }
+
+    /// Page capacity of this class under the ladder in force at `height`.
+    pub const fn page_capacity_at_height(self, height: u64) -> usize {
+        self.page_capacity_in_generation(super::params::HistoryStepPackGeneration::at_height(height))
+    }
+
     /// Maximum live logical groups/capsules.
     pub const fn live_authorization_capacity(self) -> usize {
         self.page_capacity()

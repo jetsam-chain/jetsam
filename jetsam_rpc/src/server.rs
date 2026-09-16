@@ -1159,10 +1159,13 @@ pub struct RpcHandler {
     /// True when this endpoint only answers this machine. Read-only detail that
     /// would identify the operator stays behind it.
     pub rpc_is_loopback: bool,
-    /// Pinned self-recursive HistoryStep runtime shared with local mining and
-    /// inbound bundle verification.
-    pub history_step_runtime:
-        Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    /// The HistoryStep prover for a block at a given height.
+    ///
+    /// External mining goes through here, so this is the path most of the
+    /// chain's blocks are produced on. The pack is chosen per template, by
+    /// the height of the block being built: resolving it once would have the
+    /// producer prove the first post-fork block with the pre-fork matrices.
+    pub history_step_runtime_for_height: Option<jetsam_miner::HistoryStepRuntimeSelector>,
     /// Process-wide prepared ghost authorization reused by every block attempt.
     pub history_step_ghost: Option<
         Arc<jetsam_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
@@ -1646,10 +1649,15 @@ impl RpcHandler {
         // Build and prove the complete nonce-independent HistoryStep before
         // exposing the capability. The worker's only remaining job is PoW.
         let runtime = self
-            .history_step_runtime
+            .history_step_runtime_for_height
             .as_ref()
-            .cloned()
-            .ok_or_else(|| rpc_err("HistoryStep runtime is unavailable"))?;
+            .and_then(|select| select(tmpl.inner.height))
+            .ok_or_else(|| {
+                rpc_err(format!(
+                    "no HistoryStep pack for a block at height {}",
+                    tmpl.inner.height
+                ))
+            })?;
         let ghost = self
             .history_step_ghost
             .as_ref()
@@ -1783,11 +1791,18 @@ impl RpcHandler {
             .map_err(|error| rpc_err(format!("proof of work: {error}")))?;
 
         let seal_started = Instant::now();
+        // The same pack that prepared this attempt seals it: the height is
+        // the one the attempt was built for, not the tip as it is now.
+        let sealed_height = prepared.pow_header(nonce).height;
         let runtime = self
-            .history_step_runtime
+            .history_step_runtime_for_height
             .as_ref()
-            .cloned()
-            .ok_or_else(|| rpc_err("HistoryStep runtime is unavailable"))?;
+            .and_then(|select| select(sealed_height))
+            .ok_or_else(|| {
+                rpc_err(format!(
+                    "no HistoryStep pack for a block at height {sealed_height}"
+                ))
+            })?;
         let proved = tokio::task::spawn_blocking(move || {
             jetsam_miner::install_history_step_phase_cpu(|| prepared.prove(&runtime, nonce))
                 .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))?
@@ -3845,7 +3860,7 @@ pub async fn start_rpc_server(
     cpu_backend: String,
     available_threads: usize,
     worker_threads: usize,
-    history_step_runtime: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    history_step_runtime_for_height: Option<jetsam_miner::HistoryStepRuntimeSelector>,
     history_step_ghost: Option<
         Arc<jetsam_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
     >,
@@ -3879,8 +3894,19 @@ pub async fn start_rpc_server(
     //
     // The sizes are measured once; the cap they are compared against is
     // selected per template by the block's own height.
-    let external_mining_terminal_bytes = match history_step_runtime.as_deref() {
-        Some(runtime) => jetsam_miner::measured_terminal_bytes_from_runtime(runtime)
+    // Measured against the pack that governs the next block this node would
+    // build. A pack switch at the fork height changes the sizes, and the
+    // ceiling is re-measured when the process next starts past it.
+    //
+    // The tip is read before the selector runs, not inside it: this is an
+    // async function, and `blocking_read` on a runtime thread is not a slow
+    // path, it is a panic.
+    let next_block_height = chain.read().await.tip_height().saturating_add(1);
+    let external_mining_terminal_bytes = match history_step_runtime_for_height
+        .as_ref()
+        .and_then(|select| select(next_block_height))
+    {
+        Some(runtime) => jetsam_miner::measured_terminal_bytes_from_runtime(&runtime)
             .map_err(|reason| anyhow::anyhow!("{reason}"))?,
         // No proof runtime means nothing can be proved here at all, so this
         // ceiling never gates a real template. Declare every class unpublishable
@@ -3916,7 +3942,7 @@ pub async fn start_rpc_server(
         mining_key: mining_key.clone(),
         allow_custom_coinbase,
         rpc_is_loopback,
-        history_step_runtime,
+        history_step_runtime_for_height,
         history_step_ghost,
         external_mining_attempts,
         mining_template_changes,

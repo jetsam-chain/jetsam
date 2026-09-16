@@ -914,10 +914,141 @@ fn embedded_history_step_cache_ready(data_dir: &Path, class: HistoryStepCacheCla
         .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
-fn embedded_history_step_runtime(
+/// The verifiers this build carries, one per pack generation.
+///
+/// A block below the activation height was proved against the v1 matrices and
+/// can only be verified against them; a block at or above it, against the
+/// v1.3 matrices. Selection is by the **block's own height**, never by the
+/// node's tip, so a node syncing from genesis keeps verifying every pre-fork
+/// block with the pack that produced it, for ever.
+#[derive(Clone, Default)]
+struct EmbeddedHistoryStepRuntimes {
+    pre_fork: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    post_fork: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+}
+
+impl EmbeddedHistoryStepRuntimes {
+    /// The verifier for a block at `height`, if this build embeds its pack.
+    fn for_height(
+        &self,
+        height: u64,
+    ) -> Option<&Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>> {
+        match embedded_history_step_pack::history_step_pack_generation(height) {
+            embedded_history_step_pack::HistoryStepPackGeneration::V1 => self.pre_fork.as_ref(),
+            embedded_history_step_pack::HistoryStepPackGeneration::V1_3 => self.post_fork.as_ref(),
+        }
+    }
+
+    /// Whether this build can verify anything at all.
+    fn is_empty(&self) -> bool {
+        self.pre_fork.is_none() && self.post_fork.is_none()
+    }
+
+    /// The prover for the block at `height`, as the miner and the external
+    /// mining handler ask for it: per template, never once at startup.
+    fn selector(&self) -> jetsam_miner::HistoryStepRuntimeSelector {
+        let runtimes = self.clone();
+        Arc::new(move |height: u64| runtimes.for_height(height).cloned())
+    }
+}
+
+fn embedded_history_step_runtimes(
     data_dir: &Path,
+) -> Result<EmbeddedHistoryStepRuntimes, String> {
+    // Each generation is rooted at a **height**, which is a schedule every
+    // node shares. The boundary's content at that height is a fact about one
+    // branch and is derived per verification, never pinned here: two valid
+    // blocks can sit at the root height, and a node that fixed one of them at
+    // startup would refuse every peer on the other and could not reorg onto
+    // it — not until a restart, which would re-derive the same answer.
+    //
+    // Both verifiers are attached as soon as their pack is embedded. Making
+    // the v1.3 one wait for the tip to reach H - 1 would have meant every
+    // node had to restart inside a one-block window.
+    Ok(EmbeddedHistoryStepRuntimes {
+        pre_fork: embedded_history_step_runtime_from_pack(
+            data_dir,
+            embedded_history_step_pack::embedded_history_step_pack(),
+            0,
+            embedded_history_step_pack::HistoryStepPackGeneration::V1,
+        )?,
+        post_fork: match jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT {
+            None => None,
+            Some(activation) => embedded_history_step_runtime_from_pack(
+                data_dir,
+                embedded_history_step_pack::embedded_history_step_pack_for_height(activation),
+                activation
+                    .checked_sub(1)
+                    .ok_or("the v1.3 activation height cannot be genesis")?,
+                embedded_history_step_pack::HistoryStepPackGeneration::V1_3,
+            )?,
+        },
+    })
+}
+
+/// Prefix every failure to derive a branch boundary carries.
+///
+/// A rejection that reaches the peer-fault classifier without it is charged to
+/// whoever sent the terminal; one that reaches it with this prefix is charged
+/// to nobody, because "I cannot see that branch's header" says nothing about
+/// the sender. The classifier matches on text, so the marker has to travel in
+/// the text.
+const BRANCH_BOUNDARY_UNAVAILABLE: &str = "branch boundary unavailable:";
+
+/// The boundary a terminal of `generation` rooted at `root_height` must carry,
+/// for the branch whose headers `header_at` serves.
+///
+/// Derived at verification time, from the branch being evaluated. For the pack
+/// the chain has run on since block one `root_height` is zero and the boundary
+/// is genesis, needing no lookup at all; for the v1.3 pack it is the boundary
+/// at the block before the activation height, read off that branch's headers —
+/// permanent data that headers-first sync already has.
+///
+/// It takes the generation and the height rather than the runtime that holds
+/// them so that the derivation can be exercised without a matrix pack: what it
+/// does is arithmetic on headers, and a test should not have to embed sixteen
+/// mebibytes of matrices to check it.
+fn expected_recursion_root(
+    generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+    root_height: u64,
+    header_at: &mut dyn FnMut(u64) -> Option<jetsam_chain::BlockHeader>,
+) -> Result<jetsam_recursive::acceptance::history_step_bank::RecursionRoot, String> {
+    use jetsam_recursive::acceptance::history_step_bank::RecursionRoot;
+    if root_height == 0 {
+        return Ok(RecursionRoot::genesis());
+    }
+    let missing = |what: &str, height: u64| {
+        format!("{BRANCH_BOUNDARY_UNAVAILABLE} branch {what} header {height} is not available")
+    };
+    let header = header_at(root_height).ok_or_else(|| missing("boundary", root_height))?;
+    let epoch_anchor_height = jetsam_chain::consensus::tx_epoch_anchor_height_for_child(root_height);
+    let epoch_anchor = header_at(epoch_anchor_height)
+        .ok_or_else(|| missing("epoch-anchor", epoch_anchor_height))?;
+    let previous_epoch_anchor = if generation.binds_two_epoch_anchors() {
+        let height =
+            jetsam_chain::consensus::previous_tx_epoch_anchor_height_for_child(root_height);
+        Some(header_at(height).ok_or_else(|| missing("previous epoch-anchor", height))?)
+    } else {
+        None
+    };
+    Ok(RecursionRoot::new(
+        jetsam_recursive::ChainAccumulator::from_canonical_headers(
+            generation,
+            &header,
+            &epoch_anchor,
+            previous_epoch_anchor.as_ref(),
+        ),
+        jetsam_chain::block_header::block_id(&header),
+    ))
+}
+
+fn embedded_history_step_runtime_from_pack(
+    data_dir: &Path,
+    pack: Option<&'static embedded_history_step_pack::EmbeddedHistoryStepPack>,
+    recursion_root_height: u64,
+    expected_generation: embedded_history_step_pack::HistoryStepPackGeneration,
 ) -> Result<Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>, String> {
-    let Some(pack) = embedded_history_step_pack::embedded_history_step_pack() else {
+    let Some(pack) = pack else {
         return Ok(None);
     };
     let metadata = jetsam_miner::decode_history_step_runtime_metadata_pinned(
@@ -925,6 +1056,18 @@ fn embedded_history_step_runtime(
         pack.runtime_metadata_digest(),
     )
     .map_err(|error| format!("embedded HistoryStep metadata rejected: {error}"))?;
+    // The pack says which relation it is; this slot says which relation it is
+    // for. A build that staged them the wrong way round would verify pre-fork
+    // blocks against post-fork matrices and refuse the whole chain — and it
+    // would do so on every node at once, which is why this is a refusal to
+    // start rather than a warning.
+    let actual_generation = metadata.bank().generation();
+    if actual_generation != expected_generation {
+        return Err(format!(
+            "embedded HistoryStep pack is {actual_generation:?} but was staged as \
+             {expected_generation:?}"
+        ));
+    }
     // The packed runtime layout is derived from the embedded canonical
     // leaves once per release build (keyed by the pinned metadata digest)
     // and reused on later starts.
@@ -934,7 +1077,7 @@ fn embedded_history_step_runtime(
         .map_err(|error| format!("embedded HistoryStep matrices rejected: {error}"))?;
     let (bank, runtime_parts) = metadata.into_parts();
     let runtime = jetsam_recursive::acceptance::history_step::HistoryStepRuntime::new(
-        bank,
+        bank.rooted_at_height(recursion_root_height),
         Box::new(matrix_source),
         runtime_parts,
     )
@@ -1858,21 +2001,20 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    let history_proof_bank_id = embedded_history_step_pack::embedded_history_step_pack()
-        .map(|pack| pack.runtime_metadata_digest())
-        .unwrap_or([0; 32]);
-    let history_step_runtime =
-        embedded_history_step_runtime(&data_dir).map_err(anyhow::Error::msg)?;
-    match &history_step_runtime {
-        None => tracing::warn!(
-            "HistoryStep verification unavailable in this pack-free development build"
-        ),
-        Some(_) => {
-            tracing::debug!("HistoryStep verifier uses executable-embedded registry and matrices")
-        }
+    // The advertised bank does not move with the tip. This binary can serve
+    // either side of the fork, so it has no reason to close a peer over which
+    // side that peer is on — and a tip-dependent id would split upgraded
+    // nodes into two handshake groups at the activation height.
+    let history_proof_bank_id = embedded_history_step_pack::advertised_history_proof_bank_id();
+    let history_step_runtimes =
+        embedded_history_step_runtimes(&data_dir).map_err(anyhow::Error::msg)?;
+    if history_step_runtimes.is_empty() {
+        tracing::warn!("HistoryStep verification unavailable in this pack-free development build");
+    } else {
+        tracing::debug!("HistoryStep verifier uses executable-embedded registry and matrices");
     }
     if let Some(class) = cli.prepare_history_step_cache {
-        let runtime = history_step_runtime.clone().ok_or_else(|| {
+        let runtime = history_step_runtimes.pre_fork.clone().ok_or_else(|| {
             anyhow::anyhow!("matrix preparation requires an embedded release pack")
         })?;
         tokio::task::spawn_blocking(move || runtime.prepare_matrix_cache(class.class_id()))
@@ -1906,7 +2048,7 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let block_production_enabled = cli.mode != NodeMode::Node;
-    if block_production_enabled && history_step_runtime.is_none() {
+    if block_production_enabled && history_step_runtimes.is_empty() {
         anyhow::bail!(
             "block production requires the release-pinned HistoryStep runtime and 2 matrices"
         );
@@ -2147,7 +2289,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
-    let p2p_history_step_runtime = history_step_runtime.clone();
+    let p2p_history_step_runtimes = history_step_runtimes.clone();
     let p2p_external_mining_attempts = external_mining_attempts.clone();
     let p2p_canonical_tip_changes = canonical_tip_change_rx;
     let mut p2p_event_task = tokio::spawn(async move {
@@ -2162,7 +2304,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_template_changes,
             p2p_wallet_operation_gate,
             p2p_snapshot_staging_root,
-            p2p_history_step_runtime,
+            p2p_history_step_runtimes,
             p2p_external_mining_attempts,
             p2p_canonical_tip_changes,
         )
@@ -2286,7 +2428,10 @@ async fn main() -> anyhow::Result<()> {
         jetsam_core::cpu::selected_backend().to_string(),
         cpu_plan.available_threads,
         cpu_plan.shared_pool_threads,
-        history_step_runtime.clone(),
+        // External mining prepares and seals through this handler, so it
+        // takes the same per-height selector the internal producer does: the
+        // pack that proves a block is a function of that block's height.
+        (!history_step_runtimes.is_empty()).then(|| history_step_runtimes.selector()),
         history_step_ghost.clone(),
         external_mining_attempts,
         template_change_tx.clone(),
@@ -2326,11 +2471,11 @@ async fn main() -> anyhow::Result<()> {
             mining_proof_ready_rx,
             mining_network_ready_rx,
             template_change_tx.clone(),
-            Arc::clone(
-                history_step_runtime
-                    .as_ref()
-                    .expect("producer runtime checked at startup"),
-            ),
+            // The prover is chosen per template, by the height of the block
+            // being produced. Resolving it once at startup would have the
+            // producer prove the first post-fork block with the pre-fork
+            // matrices and halt until a restart.
+            history_step_runtimes.selector(),
             Arc::clone(
                 history_step_ghost
                     .as_ref()
@@ -3819,8 +3964,8 @@ fn snapshot_header_completion_base_moved(error: &SnapshotHeaderStagingError) -> 
 
 fn verify_terminal_against_validated_snapshot_headers(
     chain: &RwLock<MdbxChainContext>,
-    runtime: &jetsam_recursive::acceptance::history_step::HistoryStepRuntime,
-    authority: RetainedSnapshotHeaderAuthority,
+    runtimes: &EmbeddedHistoryStepRuntimes,
+    mut authority: RetainedSnapshotHeaderAuthority,
     terminal_bytes: Vec<u8>,
     inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> (SnapshotBoundaryVerificationOutcome, SyncPhaseMeasurement) {
@@ -3848,11 +3993,19 @@ fn verify_terminal_against_validated_snapshot_headers(
     let terminal_started = Instant::now();
     let terminal_result = {
         let ctx = chain.blocking_read();
+        // The branch being judged is the candidate's, not this node's: the
+        // staged suffix is what the snapshot claims, and below its base the
+        // two are the same block anyway. Reading the boundary out of this
+        // node's canonical chain instead would be asking the wrong branch
+        // whenever the candidate is a rebase.
+        let staged = &mut authority.headers;
+        let store = &ctx.store;
+        let mut header_at = |height: u64| staged.header_at(store, height).ok().flatten();
         ctx.verify_snapshot_boundary(
             boundary.tip_header,
             boundary.epoch_anchor_header,
             terminal_bytes,
-            |claim| verify_history_step_terminal(claim, Some(runtime)),
+            |claim| verify_history_step_terminal_on_branch(claim, runtimes, &mut header_at),
         )
     };
     let measurement = SyncPhaseMeasurement::new(
@@ -3879,6 +4032,16 @@ fn verify_terminal_against_validated_snapshot_headers(
                 SnapshotBoundaryVerificationOutcome::TerminalRejected {
                     error: message,
                     authority,
+                }
+            } else if history_step_context_error_is_branch_boundary_gap(&error) {
+                // The staged headers are the sender's data. If they do not
+                // reach the boundary this terminal has to be rooted on, the
+                // candidate is unjudgeable, not the node broken — retire this
+                // plan and take the next one. Anything else here would hand a
+                // peer a way to end the process by omission.
+                SnapshotBoundaryVerificationOutcome::CandidateRejected {
+                    error: message,
+                    authority: Some(authority),
                 }
             } else {
                 SnapshotBoundaryVerificationOutcome::Fatal {
@@ -4006,20 +4169,71 @@ fn validate_snapshot_staged_header_boundary(
     Ok(())
 }
 
-/// Verify the fused HistoryStep terminal for the exact uncommitted block.
-fn verify_history_step_terminal(
+/// Verify the fused HistoryStep terminal for the exact uncommitted block,
+/// rooting it on the branch `header_at` describes.
+///
+/// The root is resolved here, per verification, rather than fixed when the
+/// runtime was built: a terminal on a competing branch at the root height
+/// carries a different and equally valid root, and a node that had pinned one
+/// of them would quarantine every peer on the other.
+///
+/// `header_at` is not optional. Every caller is judging some branch — the
+/// canonical one out of the store, or a candidate one out of the suffix or the
+/// snapshot staging that came with it — and the one thing none of them may do
+/// is judge a terminal's root against a branch that is not the terminal's own.
+/// While the only generation in service is rooted at genesis this costs a
+/// lookup nobody makes; the moment a second one is armed it is the difference
+/// between a chain and a stall at the activation height.
+fn verify_history_step_terminal_on_branch(
     claim: &jetsam_chain::storage::HistoryStepTerminalClaim<'_>,
-    runtime: Option<&jetsam_recursive::acceptance::history_step::HistoryStepRuntime>,
+    runtimes: &EmbeddedHistoryStepRuntimes,
+    header_at: &mut dyn FnMut(u64) -> Option<jetsam_chain::BlockHeader>,
 ) -> Result<(), String> {
-    let Some(runtime) = runtime else {
-        return Err("embedded HistoryStep verifier unavailable".to_string());
+    // The pack is chosen by the height of the block being verified, not by
+    // the node's tip: a terminal proved before the fork is only ever
+    // verifiable against the matrices that produced it.
+    let Some(runtime) = runtimes.for_height(claim.header.height) else {
+        return Err(format!(
+            "no embedded HistoryStep verifier for a block at height {}",
+            claim.header.height
+        ));
+    };
+    let generation = runtime.bank().generation();
+    // The launch relation has no root lanes to compare: its root is pinned
+    // inside the matrices as this chain's genesis, so a terminal that carries
+    // any other one cannot exist. Asking for the check there is not a
+    // stricter node, it is a node that refuses every block of its own chain.
+    let recursion_root = generation
+        .carries_recursion_root()
+        .then(|| {
+            expected_recursion_root(generation, runtime.bank().recursion_root_height(), header_at)
+        })
+        .transpose()?;
+    // Likewise it binds one anchor and has no lane for a second. Under v1.3
+    // the older anchor is a canonical header of the same branch, read the
+    // same way as the root: the claim carries what every generation binds,
+    // and the branch supplies what only this one does.
+    let previous_epoch_anchor_header = if generation.binds_two_epoch_anchors() {
+        let height = jetsam_chain::consensus::previous_tx_epoch_anchor_height_for_child(
+            claim.header.height,
+        );
+        Some(header_at(height).ok_or_else(|| {
+            format!(
+                "{BRANCH_BOUNDARY_UNAVAILABLE} branch previous epoch-anchor header {height} \
+                 is not available"
+            )
+        })?)
+    } else {
+        None
     };
     jetsam_miner::install_inbound_verifier_cpu(|| {
-        jetsam_recursive::acceptance::history_step::decode_verify_history_step_terminal(
+        jetsam_recursive::acceptance::history_step::decode_verify_history_step_terminal_rooted(
             runtime,
             claim.terminal_bytes,
             &claim.header,
             &claim.epoch_anchor_header,
+            previous_epoch_anchor_header.as_ref(),
+            recursion_root.as_ref(),
         )
     })
     .map_err(|error| format!("HistoryStep verification CPU admission failed: {error}"))?
@@ -4034,13 +4248,45 @@ fn history_step_context_error_is_terminal_peer_fault(
         jetsam_chain::storage::MdbxContextError::Consensus(
             jetsam_chain::consensus::ConsensusError::BadHistoryStepTerminal(message),
         ) => {
-            message.contains("terminal exceeds the wire cap")
-                || message.contains("terminal metadata is invalid")
-                || message.contains("terminal does not bind")
-                || message.contains("HistoryStep terminal rejected:")
+            // Every rejected terminal is charged to the peer that sent it,
+            // and must stay that way while "not a peer fault" is a synonym
+            // for "kill the process". `ForeignRecursionRoot` included: the
+            // root a terminal is measured against is derived from the branch
+            // the terminal itself arrived on, so a peer honestly serving the
+            // other side of a fork is judged against its own side and
+            // matches; a mismatch means the terminal contradicts the headers
+            // that came with it, which is forgery whichever branch it claims.
+            //
+            // What genuinely is neither the sender's fault nor a reason to
+            // stop is failing to *derive* that boundary at all: the branch's
+            // header at the root height was not there to read. Those carry
+            // `BRANCH_BOUNDARY_UNAVAILABLE` and are answered below.
+            !message.contains(BRANCH_BOUNDARY_UNAVAILABLE)
+                && (message.contains("terminal exceeds the wire cap")
+                    || message.contains("terminal metadata is invalid")
+                    || message.contains("terminal does not bind")
+                    || message.contains("HistoryStep terminal rejected:"))
         }
         _ => false,
     }
+}
+
+/// Whether a rejection means "I could not read that branch's boundary".
+///
+/// The third outcome. It is not the sender's fault — a header this node cannot
+/// see says nothing about who sent the terminal — and it is not a reason to
+/// stop, because the next candidate may well carry the headers this one did
+/// not. The callers that would otherwise treat "not a peer fault" as "stop the
+/// node" ask this first and retire the candidate instead.
+fn history_step_context_error_is_branch_boundary_gap(
+    error: &jetsam_chain::storage::MdbxContextError,
+) -> bool {
+    matches!(
+        error,
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::BadHistoryStepTerminal(message),
+        ) if message.contains(BRANCH_BOUNDARY_UNAVAILABLE)
+    )
 }
 
 fn exact_suffix_context_error_is_body_peer_fault(
@@ -4104,7 +4350,7 @@ async fn apply_exact_suffix_offthread(
     mempool: &AsyncMempool,
     wallet: &SharedWallet,
     fetched: jetsam_node::networking::suffix_sync::FetchedSuffix,
-    history_step_runtime: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    history_step_runtimes: EmbeddedHistoryStepRuntimes,
     wallet_operation_gate: &WalletOperationGate,
 ) -> Result<AppliedExactSuffix, ExactSuffixApplyError> {
     use jetsam_node::networking::sync_plan::SyncPlanKind;
@@ -4200,11 +4446,27 @@ async fn apply_exact_suffix_offthread(
         // capability still has to pass exact base/finality checks after the
         // lock is acquired and cannot mutate storage by itself.
         let terminal_started = Instant::now();
+        // The same split as the epoch anchor above, and for the same reason:
+        // above the plan base the branch under judgement is the candidate's,
+        // and a reorg suffix is precisely the case where this node's
+        // canonical headers describe someone else's chain.
+        let mut header_at = |height: u64| -> Option<jetsam_chain::BlockHeader> {
+            if height <= plan.base().height {
+                apply_store.get_header(height).ok().flatten()
+            } else {
+                blocks
+                    .iter()
+                    .find(|block| block.header.height == height)
+                    .map(|block| block.header)
+            }
+        };
         let verified_terminal = jetsam_chain::storage::verify_history_step_terminal_candidate(
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
-            |claim| verify_history_step_terminal(claim, history_step_runtime.as_deref()),
+            |claim| {
+                verify_history_step_terminal_on_branch(claim, &history_step_runtimes, &mut header_at)
+            },
         )
         .map_err(|error| {
             let message = format!("verify exact suffix terminal: {error}");
@@ -4959,8 +5221,10 @@ mod tests {
     use super::{
         admit_exact_suffix_offer, advertise_inventory_for_known_headers, advertised_terminal_peer,
         classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
-        competing_suffix_wins, embedded_seed_multiaddrs, gap_requires_snapshot_sync,
-        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
+        competing_suffix_wins, embedded_seed_multiaddrs, expected_recursion_root,
+        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
+        header_inventory_validation_anchor, history_step_context_error_is_branch_boundary_gap,
+        history_step_context_error_is_terminal_peer_fault,
         initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
@@ -7319,6 +7583,201 @@ mod tests {
         );
     }
 
+    fn bad_terminal(message: String) -> jetsam_chain::storage::MdbxContextError {
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::BadHistoryStepTerminal(message),
+        )
+    }
+
+    /// A rejected terminal is charged to the peer that sent it.
+    ///
+    /// Not a style rule: the alternative branch of this predicate does not
+    /// merely spare the sender, it ends at `fatal_runtime_error` and stops
+    /// the node. Any rejection reason that escapes this classification is a
+    /// remote kill switch.
+    ///
+    /// The match below has no wildcard arm, which is the whole mechanism: the
+    /// day the verifier grows an error, this test stops compiling and whoever
+    /// added it has to come here and say which side of the classification it
+    /// falls on. A list written by hand goes stale in silence; a list the
+    /// compiler checks against the verifier's own type cannot.
+    #[test]
+    fn every_terminal_rejection_is_charged_to_the_peer_not_to_the_process() {
+        use jetsam_recursive::acceptance::history_step::HistoryStepError;
+
+        /// Whether this rejection reaches the classifier under the prefix
+        /// `verify_history_step_terminal_on_branch` puts on everything the
+        /// verifier returns. Every variant does — that `map_err` is the last
+        /// thing that function does — and the arm exists so that a new
+        /// variant cannot quietly assume it.
+        fn travels_as_a_verifier_rejection(error: &HistoryStepError) -> bool {
+            match error {
+                HistoryStepError::Cancelled
+                | HistoryStepError::Input(_)
+                | HistoryStepError::Bank(_)
+                | HistoryStepError::Region(_)
+                | HistoryStepError::Sidecar { .. }
+                | HistoryStepError::Verify(_)
+                | HistoryStepError::InvalidClass
+                | HistoryStepError::InvalidIo
+                | HistoryStepError::ForeignRecursionRoot
+                | HistoryStepError::ForeignIoLayout { .. }
+                | HistoryStepError::RootlessGeneration
+                | HistoryStepError::ParentBoundary
+                | HistoryStepError::ParentRecording
+                | HistoryStepError::ClassPin
+                | HistoryStepError::PcsParams
+                | HistoryStepError::RuntimeMatrix(_)
+                | HistoryStepError::RuntimeParentVk
+                | HistoryStepError::RuntimeBlockVk(_)
+                | HistoryStepError::RuntimeWitnessShape { .. }
+                | HistoryStepError::RuntimeUsefulRows { .. }
+                | HistoryStepError::RuntimeLayout
+                | HistoryStepError::StagedSeal
+                | HistoryStepError::TerminalMetadata
+                | HistoryStepError::HeaderBinding
+                | HistoryStepError::WireVersion
+                | HistoryStepError::WireLength { .. }
+                | HistoryStepError::WireEncoding
+                | HistoryStepError::ShapeOverflow { .. } => true,
+            }
+        }
+
+        let reasons = [
+            // `ForeignRecursionRoot` is in this list on purpose. Since the
+            // root is derived from the branch the terminal arrived on, a peer
+            // honestly serving the other side of a fork is judged against its
+            // own side and matches; a mismatch means the terminal contradicts
+            // the headers that came with it.
+            HistoryStepError::ForeignRecursionRoot,
+            HistoryStepError::InvalidIo,
+            HistoryStepError::TerminalMetadata,
+            HistoryStepError::WireVersion,
+            HistoryStepError::ForeignIoLayout {
+                expected: 232,
+                actual: 216,
+            },
+        ];
+        for reason in reasons {
+            assert!(travels_as_a_verifier_rejection(&reason));
+            let error = bad_terminal(format!("HistoryStep terminal rejected: {reason}"));
+            assert!(
+                history_step_context_error_is_terminal_peer_fault(&error),
+                "{reason} would take the node down instead of the peer"
+            );
+            assert!(
+                !history_step_context_error_is_branch_boundary_gap(&error),
+                "{reason} is the sender's, not a boundary this node could not read"
+            );
+        }
+    }
+
+    /// The third outcome: a boundary this node could not read.
+    ///
+    /// Failing to *derive* the branch boundary is not a verdict on the
+    /// terminal — nothing about it was examined. Charging it to the sender
+    /// would ban peers for a header this node is missing; charging it to the
+    /// process would let a peer end the node by omitting one. It is neither,
+    /// and the snapshot path retires the candidate instead.
+    #[test]
+    fn a_boundary_this_node_cannot_read_is_charged_to_neither_the_peer_nor_the_process() {
+        let mut absent = |_height: u64| None;
+        let error = expected_recursion_root(
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_3,
+            4_003,
+            &mut absent,
+        )
+        .expect_err("no branch header can answer for the boundary");
+        assert!(
+            error.contains("4003"),
+            "the refusal must name the height: {error}"
+        );
+
+        let context = bad_terminal(format!("verify snapshot HistoryStep boundary: {error}"));
+        assert!(history_step_context_error_is_branch_boundary_gap(&context));
+        assert!(
+            !history_step_context_error_is_terminal_peer_fault(&context),
+            "a header this node is missing is not the sender's doing"
+        );
+
+        // A build with no verifier for the height is a different thing and
+        // keeps the loud answer: nothing a peer does can produce it, and a
+        // binary that cannot verify its own chain should stop rather than
+        // carry on quietly.
+        let unbuilt =
+            bad_terminal("no embedded HistoryStep verifier for a block at height 4004".to_owned());
+        assert!(!history_step_context_error_is_branch_boundary_gap(&unbuilt));
+        assert!(!history_step_context_error_is_terminal_peer_fault(&unbuilt));
+    }
+
+    fn branch_header_at(height: u64, nonce: u128) -> jetsam_chain::BlockHeader {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = height;
+        header.nonce = nonce;
+        header
+    }
+
+    /// A terminal rooted at the fork takes its boundary from the branch it
+    /// arrived on, not from a constant fixed when the runtime was built.
+    #[test]
+    fn a_rooted_generation_derives_its_boundary_from_the_branch_it_is_served() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+        use jetsam_recursive::acceptance::history_step_bank::RecursionRoot;
+
+        // The v1.3 activation height is not armed, so pick one and inject it
+        // the way the runtime would: the relation is rooted at H - 1.
+        let activation = 4_004u64;
+        let root_height = activation - 1;
+        let mut branch = |height: u64| Some(branch_header_at(height, 1));
+        let root =
+            expected_recursion_root(HistoryStepPackGeneration::V1_3, root_height, &mut branch)
+                .expect("the branch serves every header the boundary needs");
+        assert_eq!(root.height(), root_height);
+        assert_eq!(
+            root.block_id(),
+            jetsam_chain::block_header::block_id(&branch_header_at(root_height, 1))
+        );
+
+        // The launch relation pins its root as this chain's genesis, so it
+        // asks the branch nothing at all — which is why a node running it
+        // today never noticed there was no header source.
+        let mut absent = |_height: u64| None;
+        assert_eq!(
+            expected_recursion_root(HistoryStepPackGeneration::V1, 0, &mut absent)
+                .expect("a genesis-rooted generation needs no branch"),
+            RecursionRoot::genesis()
+        );
+    }
+
+    /// Two valid blocks can sit at the root height. The boundary a node
+    /// derives is a function of the branch it is shown, and of nothing else —
+    /// a node that had pinned one of them would refuse every peer on the
+    /// other and could not reorg onto it.
+    #[test]
+    fn two_branches_at_the_root_height_give_two_boundaries_and_neither_is_pinned() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+
+        let root_height = 4_003u64;
+        let mut branch_a = |height: u64| Some(branch_header_at(height, 1));
+        let mut branch_b = |height: u64| Some(branch_header_at(height, 2));
+        let root_a =
+            expected_recursion_root(HistoryStepPackGeneration::V1_3, root_height, &mut branch_a)
+                .unwrap();
+        let root_b =
+            expected_recursion_root(HistoryStepPackGeneration::V1_3, root_height, &mut branch_b)
+                .unwrap();
+        assert_ne!(root_a, root_b);
+        assert_eq!(root_a.height(), root_b.height());
+
+        // Order changes nothing: having derived B, this node derives A again
+        // from A's headers. Nothing was retained between the two.
+        assert_eq!(
+            expected_recursion_root(HistoryStepPackGeneration::V1_3, root_height, &mut branch_a)
+                .unwrap(),
+            root_a
+        );
+    }
+
     #[test]
     fn snapshot_history_step_tip_obeys_local_future_drift_admission() {
         let local_time = 1_000_000u64;
@@ -7371,7 +7830,7 @@ async fn handle_p2p_events(
     template_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
     snapshot_staging_root: PathBuf,
-    history_step_runtime: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    history_step_runtimes: EmbeddedHistoryStepRuntimes,
     external_mining_attempts: ExternalMiningAttemptInvalidator,
     mut canonical_tip_changes: tokio::sync::watch::Receiver<jetsam_p2p::object_protocol::ChainPoint>,
 ) -> anyhow::Result<()> {
@@ -8283,7 +8742,8 @@ async fn handle_p2p_events(
             let payload = $payload;
             let terminal_from = payload.from;
             let terminal_request_token = payload.token;
-            let Some(runtime) = history_step_runtime.clone() else {
+            let runtimes = history_step_runtimes.clone();
+            if runtimes.for_height(sync.manifest.tip_height).is_none() {
                 tracing::error!(
                     preferred_peer = %sync.preferred_peer,
                     tip = sync.manifest.tip_height,
@@ -8433,7 +8893,7 @@ async fn handle_p2p_events(
                     }
                     let (outcome, measurement) = verify_terminal_against_validated_snapshot_headers(
                         verification_chain.as_ref(),
-                        runtime.as_ref(),
+                        &runtimes,
                         authority,
                         terminal_bytes,
                         inbound_memory_permit,
@@ -8471,7 +8931,8 @@ async fn handle_p2p_events(
             let snapshot = authority.snapshot;
             let terminal_from = payload.from;
             let terminal_request_token = payload.token;
-            let Some(runtime) = history_step_runtime.clone() else {
+            let runtimes = history_step_runtimes.clone();
+            if runtimes.for_height(snapshot.boundary.height).is_none() {
                 cleanup_validated_snapshot_headers_offthread(authority.headers);
                 drop(payload);
                 tracing::error!(
@@ -8530,7 +8991,7 @@ async fn handle_p2p_events(
                         let (outcome, measurement) =
                             verify_terminal_against_validated_snapshot_headers(
                                 verification_chain.as_ref(),
-                                runtime.as_ref(),
+                                &runtimes,
                                 authority,
                                 terminal_bytes,
                                 inbound_memory_permit,
@@ -8561,7 +9022,8 @@ async fn handle_p2p_events(
             let from = $from;
             let terminal_bytes = $terminal_bytes;
             let inbound_memory_permit = $permit;
-            let Some(runtime) = history_step_runtime.clone() else {
+            let runtimes = history_step_runtimes.clone();
+            if runtimes.for_height(target.height()).is_none() {
                 drop(terminal_bytes);
                 drop(inbound_memory_permit);
                 tracing::warn!(
@@ -8577,11 +9039,18 @@ async fn handle_p2p_events(
             tokio::task::spawn_blocking(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let ctx = verification_chain.blocking_read();
+                    // Re-proving a boundary of this node's own canonical
+                    // chain: the branch under judgement is the canonical one,
+                    // and the store is what describes it.
+                    let mut header_at =
+                        |height: u64| ctx.get_header_from_store(height).ok().flatten();
                     match ctx.verify_snapshot_boundary(
                         target.header,
                         target.epoch_anchor_header,
                         terminal_bytes,
-                        |claim| verify_history_step_terminal(claim, Some(runtime.as_ref())),
+                        |claim| {
+                            verify_history_step_terminal_on_branch(claim, &runtimes, &mut header_at)
+                        },
                     ) {
                         Ok(boundary) => match ctx.cache_verified_snapshot_boundary_proof(&boundary)
                         {
@@ -8840,7 +9309,7 @@ async fn handle_p2p_events(
                         let apply_chain = Arc::clone(&chain);
                         let apply_mempool = mempool.clone();
                         let apply_wallet = Arc::clone(&wallet);
-                        let apply_runtime = history_step_runtime.clone();
+                        let apply_runtime = history_step_runtimes.clone();
                         let apply_gate = wallet_operation_gate.clone();
                         let completion = exact_suffix_apply_tx.clone();
                         tokio::spawn(async move {
@@ -10690,7 +11159,7 @@ async fn handle_p2p_events(
                 manifest_response_count += 1;
                 if manifest.tip_height == 0 {
                     tracing::debug!(from = %from, "manifest tip_height=0, peer has no state yet");
-                } else if history_step_runtime.is_none() {
+                } else if history_step_runtimes.is_empty() {
                     tracing::warn!(
                         from = %from,
                         tip = manifest.tip_height,
