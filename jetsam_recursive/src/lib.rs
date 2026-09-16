@@ -31,10 +31,12 @@ pub use acceptance::history_step::{
 };
 pub use acceptance::history_step_bank::{
     canonical_history_step_class_id, canonical_history_step_pcs_params,
-    canonical_history_step_shape, history_step_bank_io_layout, history_step_bank_io_spec,
-    CanonicalHistoryStepClassId, HistoryStepBankEntryPins, HistoryStepBankError,
-    HistoryStepBankIoLayout, PinnedHistoryStepBankEntry, PinnedHistoryStepClassBank,
+    canonical_history_step_shape, history_step_bank_io_layout, history_step_bank_io_layout_for,
+    history_step_bank_io_spec, history_step_bank_io_spec_for, CanonicalHistoryStepClassId,
+    HistoryStepBankEntryPins, HistoryStepBankError, HistoryStepBankIoLayout,
+    PinnedHistoryStepBankEntry, PinnedHistoryStepClassBank, RecursionRoot,
     HISTORY_STEP_CLASS_COUNT, HISTORY_STEP_CURRENT_CLASS_MS, HISTORY_STEP_TIER_SLOT_COUNT,
+    V1_3_RECURSION_ROOT_LANES,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
