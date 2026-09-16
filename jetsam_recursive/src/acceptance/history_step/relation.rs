@@ -960,7 +960,7 @@ impl HistoryStepTerminal {
 /// rooted at genesis and wrong for a v1.3 pack, whose root is the block
 /// before the activation height. It stays an equality either way: a base
 /// accepted at a height of the prover's choosing is a terminal replay.
-pub(crate) const fn is_base_terminal_height(root_height: u64, height: u64) -> bool {
+pub const fn is_base_terminal_height(root_height: u64, height: u64) -> bool {
     match root_height.checked_add(1) {
         Some(base_height) => height == base_height,
         None => false,
