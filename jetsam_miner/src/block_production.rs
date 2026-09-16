@@ -184,18 +184,31 @@ impl PreparedBlockAttempt {
             &parent_tx_epoch_anchor_header,
             parent_previous_tx_epoch_anchor_header.as_ref(),
         );
-        let parent_terminal = match (parent.height, parent_history_step_terminal_bytes) {
-            (0, None) => None,
-            (0, Some(_)) => {
-                return Err("genesis parent unexpectedly has a HistoryStep terminal".into());
-            }
-            (_, Some(bytes)) => Some(
+        if parent.height == 0 && parent_history_step_terminal_bytes.is_some() {
+            return Err("genesis parent unexpectedly has a HistoryStep terminal".into());
+        }
+        // The first block of a relation recurses over nothing. The launch pack
+        // is rooted at genesis, so its base is block one; the v1.3 pack is
+        // rooted at the block before the activation height, so its base is the
+        // first block of the fork. In both cases the parent's terminal was
+        // written by the relation that ends at the root, its public IO is a
+        // different width, and only the pack that produced it can read it —
+        // asking this one to decode it is what stalled the crossing at the
+        // activation height, before a single proof row was built.
+        let parent_terminal = if jetsam_recursive::acceptance::history_step::is_base_terminal_height(
+            runtime.bank().recursion_root_height(),
+            child_height,
+        ) {
+            None
+        } else {
+            let bytes = parent_history_step_terminal_bytes
+                .ok_or_else(|| "non-genesis parent HistoryStep terminal is missing".to_string())?;
+            Some(
                 jetsam_recursive::acceptance::history_step::decode_history_step_terminal(
                     runtime, &bytes,
                 )
                 .map_err(|error| format!("parent HistoryStep terminal: {error}"))?,
-            ),
-            (_, None) => return Err("non-genesis parent HistoryStep terminal is missing".into()),
+            )
         };
         if cancelled() {
             return Ok(None);

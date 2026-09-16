@@ -752,6 +752,45 @@ fn decode_terminal_with_activation(
     )
 }
 
+/// Refuse a frame the reader's relation did not write.
+///
+/// An object is decoded under the generation of the height it was *written*
+/// at, never under the one it is read at. A pack proves the blocks strictly
+/// above the height its recursion is rooted at — genesis for the launch pack,
+/// the block before the activation height for a v1.3 one — so a frame at or
+/// below that root belongs to the relation that ends there, and carries the
+/// other relation's public-IO width.
+///
+/// Length alone cannot catch this. Under the v1.2 shared-path encoding the
+/// accepted length is a *range*: the Merkle paths it omits are wider than the
+/// sixteen IO lanes v1.3 added, so the previous relation's frame fits inside
+/// it, is then read with the wrong IO width, desynchronises the field proof
+/// and dies as `WireEncoding` — a peer blamed for a frame it encoded
+/// correctly, and a producer told its own parent is malformed. The height
+/// says it outright, before a byte of the body is parsed.
+fn ensure_bank_wrote_terminal_at(
+    bank: &crate::acceptance::history_step_bank::PinnedHistoryStepClassBank,
+    height: u64,
+) -> Result<(), HistoryStepError> {
+    use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+
+    if height > bank.recursion_root_height() {
+        return Ok(());
+    }
+    let generation = bank.generation();
+    let other = match generation {
+        HistoryStepPackGeneration::V1 => HistoryStepPackGeneration::V1_3,
+        HistoryStepPackGeneration::V1_3 => HistoryStepPackGeneration::V1,
+    };
+    let io_len = |generation| {
+        crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation).io_len
+    };
+    Err(HistoryStepError::ForeignIoLayout {
+        expected: io_len(generation),
+        actual: io_len(other),
+    })
+}
+
 // Private format decoding is also exercised by the lossless-codec audit below.
 // Only the height-gated public entry point is used by node/consensus admission.
 fn decode_terminal_in_format(
@@ -781,6 +820,8 @@ fn decode_terminal_in_format(
     let class_id = CanonicalHistoryStepClassId::from_index(prefix.u8()? as usize)
         .ok_or(HistoryStepError::InvalidClass)?;
     prefix.finish()?;
+    ensure_bank_wrote_terminal_at(runtime.bank(), height)?;
+    let generation = runtime.bank().generation();
     let entry = runtime.bank().entry(class_id);
     let frame_fits = |generation| -> Result<bool, HistoryStepError> {
         let expected = terminal_len_for_class_in(runtime, class_id, generation)?;
@@ -798,7 +839,6 @@ fn decode_terminal_in_format(
             && bytes.len()
                 <= jetsam_chain::consensus::wire_limits::V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES)
     };
-    let generation = runtime.bank().generation();
     let expected = terminal_len_for_class_in(runtime, class_id, generation)?;
     if !frame_fits(generation)? {
         // Before charging the sender, ask whether this frame is simply the
@@ -1078,8 +1118,101 @@ pub fn decode_verify_history_step_terminal_rooted(
 mod tests {
     use super::*;
     use crate::acceptance::history_step_bank::{
-        canonical_history_step_pcs_params, HISTORY_STEP_FRI_QUERIES,
+        canonical_history_step_pcs_params, canonical_history_step_shape,
+        history_step_bank_post_commit_digest, HistoryStepBankEntryPins,
+        PinnedHistoryStepClassBank, HISTORY_STEP_FRI_QUERIES,
     };
+    use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+
+    /// A bank of `generation`, pinned over that generation's own public-IO
+    /// spec. Only the spec the digests are taken over matters here: the
+    /// question under test is which terminals a bank will read, and that is
+    /// decided before a matrix is touched.
+    fn bank_of(generation: HistoryStepPackGeneration) -> PinnedHistoryStepClassBank {
+        let spec = crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation);
+        let pins = std::array::from_fn(|index| {
+            let class_id = CanonicalHistoryStepClassId::from_index(index).unwrap();
+            let shape = canonical_history_step_shape(class_id);
+            let pcs_params = canonical_history_step_pcs_params(class_id);
+            let matrix_digest = [index as u8 + 1; 32];
+            let parent_recursion_vk_digest = [0x21; 32];
+            let direct_block_vk_digest = [class_id.current_slot() as u8 + 0x41; 32];
+            let post_commit_digest = history_step_bank_post_commit_digest(
+                class_id,
+                &matrix_digest,
+                &spec,
+                &pcs_params,
+                parent_recursion_vk_digest,
+                direct_block_vk_digest,
+            );
+            HistoryStepBankEntryPins {
+                class_id,
+                shape,
+                pcs_params,
+                matrix_digest,
+                parent_recursion_vk_digest,
+                direct_block_vk_digest,
+                post_commit_digest,
+            }
+        });
+        PinnedHistoryStepClassBank::validate_for(generation, pins).unwrap()
+    }
+
+    /// A terminal is read under the relation that wrote it, and a reader
+    /// holding another one must say so instead of decoding the frame.
+    ///
+    /// This is the crossing that stalled the test chain: block 1303 was
+    /// written by the launch relation, block 1304 was the first governed by
+    /// v1.3, and its producer handed 1303's terminal to the v1.3 pack. The
+    /// two IO widths are 216 and 232 lanes — 256 bytes apart — and the v1.2
+    /// shared-path length range is wide enough to swallow the difference, so
+    /// the frame was decoded with the wrong width and blamed as malformed.
+    #[test]
+    fn a_pack_refuses_the_terminal_of_the_relation_it_replaces() {
+        const ACTIVATION: u64 = 1304;
+
+        let launch = bank_of(HistoryStepPackGeneration::V1);
+        let post_fork = bank_of(HistoryStepPackGeneration::V1_3).rooted_at_height(ACTIVATION - 1);
+
+        // The frame the producer of 1304 actually held: written at 1303, by
+        // the relation the v1.3 pack replaces. The widths it names are the
+        // two relations', in the reader's order.
+        assert!(
+            matches!(
+                ensure_bank_wrote_terminal_at(&post_fork, ACTIVATION - 1),
+                Err(HistoryStepError::ForeignIoLayout {
+                    expected: 232,
+                    actual: 216,
+                })
+            ),
+            "a v1.3 pack must name the launch relation's terminal, not decode it: {:?}",
+            ensure_bank_wrote_terminal_at(&post_fork, ACTIVATION - 1)
+        );
+
+        // Everything the v1.3 pack did write, it reads: its own base at the
+        // activation height and every block above it.
+        assert!(ensure_bank_wrote_terminal_at(&post_fork, ACTIVATION).is_ok());
+        assert!(ensure_bank_wrote_terminal_at(&post_fork, ACTIVATION + 1).is_ok());
+
+        // And the launch pack keeps reading its own history for ever: it is
+        // rooted at genesis, so every block of the chain is above its root.
+        assert!(ensure_bank_wrote_terminal_at(&launch, ACTIVATION - 1).is_ok());
+        assert!(ensure_bank_wrote_terminal_at(&launch, 1).is_ok());
+    }
+
+    /// The block that opens a relation recurses over nothing, so no reader
+    /// ever has to cross a generation boundary to find a parent terminal.
+    #[test]
+    fn the_block_that_opens_a_relation_is_the_one_after_its_root() {
+        // Launch pack, rooted at genesis: block one is its base.
+        assert!(is_base_terminal_height(0, 1));
+        assert!(!is_base_terminal_height(0, 2));
+        // v1.3 pack rooted at the block before the activation height: the
+        // first post-fork block is its base and reads no parent terminal, and
+        // the block after it recurses over a terminal its own pack wrote.
+        assert!(is_base_terminal_height(1303, 1304));
+        assert!(!is_base_terminal_height(1303, 1305));
+    }
 
     // Codec fixtures have consistent shared-node labels, but are not complete
     // valid FRI proofs. Real Merkle paths are tested in shared_paths.rs.
