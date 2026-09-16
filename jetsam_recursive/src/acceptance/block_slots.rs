@@ -103,6 +103,7 @@ use crate::acceptance::history_step::HistoryStepBlockComponents;
 use crate::accumulator::ChainAccumulator;
 use crate::region_sidecar::{BlockRegionPreparation, BlockRegionSidecarVk, RegionSidecarError};
 use jetsam_chain::block_header::BlockHeader;
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_gkr::SpineInputs;
 use jetsam_ivc_core::deep_chain::spine::SpineInstanceFlat;
 use jetsam_ivc_core::field_circuit::f128_to_u128;
@@ -255,11 +256,23 @@ const _: () =
 /// Class-independent nonce-free suffix: direct accumulator transition plus
 /// the exact semantic `SEMHDR` replay. Every row is known at template time.
 ///
-/// JETSAM: 3_774, was 4_042 — the power-of-two `TX_EPOCH_BLOCKS` slimmed the
-/// epoch recomposition of the accumulator transition. Cross-checked at run
-/// time by the `debug_assert` in the direct-tail builder and the row-count
-/// assertion in `direct_tail_is_nonce_free_across_the_epoch_edge`.
-const DIRECT_BLOCK_TAIL_ROWS: usize = 3_774;
+/// JETSAM: 3_774 under the launch relation (was 4_042 before the
+/// power-of-two `TX_EPOCH_BLOCKS` slimmed the epoch recomposition of the
+/// accumulator transition), 3_778 under v1.3. The four added rows are the
+/// second anchor lane pair: one multiplexer and one pin per lane, driven by
+/// the same boundary bit as the first pair.
+///
+/// Both numbers are held here rather than one of them being derived, because
+/// the launch figure is a fact about matrices that already exist and can
+/// never be renegotiated. Cross-checked at run time by the `debug_assert` in
+/// the direct-tail builder and by the row-count assertion in
+/// `direct_tail_is_nonce_free_across_the_epoch_edge`.
+const fn direct_block_tail_rows(generation: HistoryStepPackGeneration) -> usize {
+    match generation {
+        HistoryStepPackGeneration::V1 => 3_774,
+        HistoryStepPackGeneration::V1_3 => 3_778,
+    }
+}
 
 fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
     pin_eq(b, &a[0], &c[0]);
@@ -739,12 +752,60 @@ fn spine_region_data_from_wires(
     SpineRegionData { instances }
 }
 
+/// The witness bit one page uses to choose between the two accepted epoch
+/// anchors: zero selects the previous epoch, one selects the current one.
+///
+/// The value is *derived* here and *checked* by the caller, which is what
+/// makes the choice sound: the caller pins the bit boolean and pins the
+/// selected anchor against the page. A page matching neither anchor is given
+/// one, and its selection pin then fails — the refusal we want. Nothing here
+/// can widen what the relation accepts; it only spares the prover from
+/// carrying a bit it can always recompute.
+fn alloc_tx_epoch_anchor_selector(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    previous_user_anchor: &[LinExpr; 2],
+) -> LinExpr {
+    const L0: usize = jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR;
+    let takes_previous = (0..2).all(|lane| {
+        spine.leaves[L0][lane].eval(b.values()) == previous_user_anchor[lane].eval(b.values())
+    });
+    alloc_block(b, Block128::from(u128::from(!takes_previous)))
+}
+
 /// Bind the Tx8x2 L0 domain anchor for the coinbase, selected payout view and
 /// fixed user-capacity views. Dead user views are complete protocol ghosts.
+///
+/// Coinbase and a live payout bind the immediate parent id and are untouched
+/// by K: they are minted by the block that carries them and have no lifetime
+/// to extend.
+///
+/// Under the launch relation (`previous_user_anchor` is `None`) every live
+/// user page binds the one accepted anchor, row for row what the launch
+/// matrices hold. Under v1.3 it binds ONE of the two accepted anchors. The
+/// selection is a single witness bit per page, pinned boolean, used for BOTH
+/// lanes of the digest:
+///
+/// ```text
+/// selected[lane] = previous[lane] + b * (current[lane] - previous[lane])
+/// live * (L0[lane] - selected[lane]) = 0
+/// ```
+///
+/// The shape of that construction is the security property, not a matter of
+/// style. Deciding lane by lane — as the per-lane product
+/// `live * (L0 - current) * (L0 - previous) = 0` — accepts a **chimera**: the
+/// low half of the digest taken from the current anchor and the high half
+/// from the previous one, an anchor that never existed on any chain. One bit
+/// shared by both lanes makes that unrepresentable.
+///
+/// The field has characteristic two, so `add` is XOR and subtraction is the
+/// same operation as addition: `previous + b * (current + previous)` is the
+/// familiar multiplexer, not a sign error.
 fn bind_tx_epoch_anchors(
     b: &mut FieldR1csBuilder,
     parent_block_id: &[LinExpr; 2],
     user_anchor: &[LinExpr; 2],
+    previous_user_anchor: Option<&[LinExpr; 2]>,
     coinbase: &SpineInputsTrace,
     payout: &SpineInputsTrace,
     user_spines: &[SpineInputsTrace],
@@ -764,11 +825,37 @@ fn bind_tx_epoch_anchors(
     let ghost =
         jetsam_gkr::spine_statement::spine_inputs_from_body(&jetsam_gkr::ghost_tx::ghost_tx_body());
     for (spine, live) in user_spines.iter().zip(user_live_bits) {
-        for lane in 0..2 {
-            let epoch_diff = spine.leaves[L0][lane].add(&user_anchor[lane]);
-            let gated = mul(b, live, &epoch_diff);
-            pin_zero(b, &gated);
+        match previous_user_anchor {
+            // K = 1: one anchor, bound directly. This is the launch relation,
+            // row for row — no selector is allocated and no multiplexer is
+            // built, so the matrices it produces are the ones the chain has
+            // been verifying against since block one.
+            None => {
+                for lane in 0..2 {
+                    let epoch_diff = spine.leaves[L0][lane].add(&user_anchor[lane]);
+                    let gated = mul(b, live, &epoch_diff);
+                    pin_zero(b, &gated);
+                }
+            }
+            // K = 2: one bit per page, allocated for every page whether live
+            // or dead, so the matrix shape stays a function of the class
+            // alone.
+            Some(previous_user_anchor) => {
+                let selector = alloc_tx_epoch_anchor_selector(b, spine, previous_user_anchor);
+                let selector_squared = mul(b, &selector, &selector);
+                pin_eq(b, &selector_squared, &selector);
+                for lane in 0..2 {
+                    let span = user_anchor[lane].add(&previous_user_anchor[lane]);
+                    let selected = previous_user_anchor[lane].add(&mul(b, &selector, &span));
+                    let epoch_diff = spine.leaves[L0][lane].add(&selected);
+                    let gated = mul(b, live, &epoch_diff);
+                    pin_zero(b, &gated);
+                }
+            }
         }
+        // A dead view is a complete protocol ghost in both relations. These
+        // rows sit right after the anchor rows of the same page, as they do
+        // in the launch matrices.
         let dead = live.add_const(F128::ONE);
         for leaf in 0..jetsam_tx::body_hash::BODY_HASH_LEAVES {
             for lane in 0..2 {
@@ -869,13 +956,17 @@ fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
 /// four protocol constants are materialized later by the selected assembly.
 fn mint_canonical_selected_zk_authorization_capability(
     b: &mut FieldR1csBuilder,
+    tier: usize,
     groups: &[PagedSpendGroupTrace],
 ) -> CanonicalSelectedZkAuthorizationCapability {
     let auth_slots = groups.len();
-    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(auth_slots)
+    // By the tier, never by the tiling: the two small classes share one
+    // authorization tiling and differ exactly in the page capacity this line
+    // reads, so a lookup by tile count would silently pick one of them.
+    let geometry = crate::region_sidecar::selected_zk_block_geometry(tier)
         .expect("selected authorization capacity is canonical");
     let body_auth_slots = geometry.tier;
-    assert_eq!(body_auth_slots, geometry.tier);
+    assert_eq!(body_auth_slots, tier);
     assert_eq!(auth_slots, geometry.auth_tiles);
     for group in &groups[body_auth_slots..] {
         assert_eq!(group.live.eval(b.values()), F128::ZERO);
@@ -1001,7 +1092,7 @@ pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tie
         });
     }
     let before_mint = b.num_wires();
-    let capability = mint_canonical_selected_zk_authorization_capability(&mut b, &groups);
+    let capability = mint_canonical_selected_zk_authorization_capability(&mut b, tier, &groups);
     assert_eq!(
         b.num_wires() - before_mint,
         4 * body_auth_slots,
@@ -1163,6 +1254,7 @@ pub(in crate::acceptance) struct SelectedZkBlockSlotsAssembly {
 }
 
 struct DirectBlockNonceSeal {
+    generation: HistoryStepPackGeneration,
     template_header: BlockHeader,
     start_accumulator: ChainAccumulator,
     parent_header: BlockHeader,
@@ -1184,7 +1276,7 @@ impl DirectBlockNonceSeal {
         }
         let expected_end = self
             .start_accumulator
-            .advance(&self.parent_header, sealed_header)
+            .advance_in(self.generation, &self.parent_header, sealed_header)
             .map_err(|_| DirectBlockSealError::EndAccumulator)?;
         if expected_end != *end_accumulator {
             return Err(DirectBlockSealError::EndAccumulator);
@@ -1259,6 +1351,7 @@ pub(in crate::acceptance) fn finalize_selected_zk_block_region(
 /// omitted, replaced by a transparent proof, or selected by a runtime mode.
 pub(in crate::acceptance) fn build_block_slots_selected_zk(
     b: &mut FieldR1csBuilder,
+    generation: HistoryStepPackGeneration,
     start_accumulator: &ChainAccumulator,
     end_accumulator: &ChainAccumulator,
     components: &HistoryStepBlockComponents,
@@ -1270,6 +1363,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
 ) -> SelectedZkBlockSlotsAssembly {
     let mut assembly = build_block_slots_selected_zk_prefix(
         b,
+        generation,
         start_accumulator,
         end_accumulator,
         components,
@@ -1291,6 +1385,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
 /// after its public-IO pins in one canonical row order.
 pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     b: &mut FieldR1csBuilder,
+    generation: HistoryStepPackGeneration,
     start_accumulator: &ChainAccumulator,
     end_accumulator: &ChainAccumulator,
     components: &HistoryStepBlockComponents,
@@ -1301,11 +1396,13 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     parent_block_id: &[LinExpr; 2],
 ) -> SelectedZkBlockSlotsAssembly {
     assert!(
-        crate::region_sidecar::selected_zk_block_geometry(tier).is_some(),
-        "selected backend tier is not canonical"
+        generation.tiers().contains(&tier)
+            && crate::region_sidecar::selected_zk_block_geometry(tier).is_some(),
+        "selected backend tier is not canonical for this pack generation"
     );
     let mut assembly = build_selected_zk_block_slots_core(
         b,
+        generation,
         start_accumulator,
         end_accumulator,
         components,
@@ -1329,6 +1426,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
 
 fn build_selected_zk_block_slots_core(
     b: &mut FieldR1csBuilder,
+    generation: HistoryStepPackGeneration,
     start_accumulator: &ChainAccumulator,
     end_accumulator: &ChainAccumulator,
     components: &HistoryStepBlockComponents,
@@ -1345,8 +1443,11 @@ fn build_selected_zk_block_slots_core(
     let n_real_pages = components.user_page_count;
     let effective_page_count = components.effective_page_count();
     assert_eq!(
-        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
-            .map(|class| class.page_capacity()),
+        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+            effective_page_count,
+            generation,
+        )
+        .map(|class| class.page_capacity_in_generation(generation)),
         Some(tier),
         "selected Block capacity must match its physical page class"
     );
@@ -1355,8 +1456,8 @@ fn build_selected_zk_block_slots_core(
 
     // ---- Primary statement wires: exact header and accumulator boundary.
     let header = DirectHeaderTrace::alloc(b, sealed_header);
-    let start_acc = AccumulatorWires::alloc(b, start_accumulator);
-    let end_acc = AccumulatorWires::alloc(b, end_accumulator);
+    let start_acc = AccumulatorWires::alloc_in(b, generation, start_accumulator);
+    let end_acc = AccumulatorWires::alloc_in(b, generation, end_accumulator);
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: statement wires");
     use header_fields as hf;
@@ -1559,6 +1660,7 @@ fn build_selected_zk_block_slots_core(
         b,
         parent_block_id,
         &end_acc.epoch_anchor_id,
+        end_acc.previous_epoch_anchor_id.as_ref(),
         &spine_inputs[0],
         &payout_spine,
         &user_spine_inputs,
@@ -1722,7 +1824,7 @@ fn build_selected_zk_block_slots_core(
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: PagedSpend+logical tx-root");
 
     let canonical_authorization =
-        mint_canonical_selected_zk_authorization_capability(b, &paged_spend.groups);
+        mint_canonical_selected_zk_authorization_capability(b, tier, &paged_spend.groups);
     assert_eq!(
         user_public_arithmetic.len(),
         body_user_slots,
@@ -1746,6 +1848,7 @@ fn build_selected_zk_block_slots_core(
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
     let selected_region = Some(bind_selected_zk_block_region(
         b,
+        tier,
         canonical_authorization,
         authorization_proofs,
         es_region_data
@@ -1833,6 +1936,7 @@ fn build_selected_zk_block_slots_core(
         slots,
         selected_region,
         nonce_seal: DirectBlockNonceSeal {
+            generation,
             template_header: *sealed_header,
             start_accumulator: start_accumulator.clone(),
             parent_header: *parent_header,
@@ -1883,7 +1987,7 @@ fn append_direct_block_tail(
     bind_direct_semantic_id(b, header);
     debug_assert_eq!(
         b.num_wires() - ledger,
-        DIRECT_BLOCK_TAIL_ROWS,
+        direct_block_tail_rows(start_accumulator.generation()),
         "canonical direct tail row drift"
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: direct accumulator + header hash");
@@ -1940,6 +2044,7 @@ mod tx_epoch_anchor_tests {
     }
 
     fn direct_tail_fixture(
+        generation: HistoryStepPackGeneration,
         parent: &BlockHeader,
         sealed_header: &BlockHeader,
         start: &ChainAccumulator,
@@ -1947,8 +2052,8 @@ mod tx_epoch_anchor_tests {
     ) -> (jetsam_ivc_core::field_r1cs::FieldR1cs, Vec<F128>, usize) {
         let mut builder = FieldR1csBuilder::new();
         let header = DirectHeaderTrace::alloc(&mut builder, sealed_header);
-        let start_wires = AccumulatorWires::alloc(&mut builder, start);
-        let end_wires = AccumulatorWires::alloc(&mut builder, end);
+        let start_wires = AccumulatorWires::alloc_in(&mut builder, generation, start);
+        let end_wires = AccumulatorWires::alloc_in(&mut builder, generation, end);
         let parent_block_id = digest_lanes(&jetsam_chain::hash_block_header(parent))
             .map(|lane| alloc_block(&mut builder, lane));
 
@@ -1961,6 +2066,7 @@ mod tx_epoch_anchor_tests {
             });
         }
         let seal = DirectBlockNonceSeal {
+            generation,
             template_header: *sealed_header,
             start_accumulator: start.clone(),
             parent_header: *parent,
@@ -1980,43 +2086,71 @@ mod tx_epoch_anchor_tests {
         (matrix, witness, tail_rows)
     }
 
+    /// The class-independent tail is nonce-free, and it costs exactly the
+    /// rows each relation says it does.
+    ///
+    /// Both generations are exercised, and the launch figure is the one that
+    /// matters most: 3 774 rows is a fact about matrices that already exist
+    /// and are verified by every node on the network. A drift there is not a
+    /// number to update, it is a bug.
     #[test]
     fn direct_tail_is_nonce_free_across_the_epoch_edge() {
         // JETSAM: derived from TX_EPOCH_BLOCKS. Parent E-1 (child E: the boundary
         // block keeps the previous
         // anchor) and parent E (child E+1: anchor becomes the derived parent id).
-        for parent_height in [jetsam_chain::consensus::params::TX_EPOCH_BLOCKS - 1, jetsam_chain::consensus::params::TX_EPOCH_BLOCKS] {
-            let parent = tail_parent_header(parent_height);
-            let start = tail_start(&parent);
-            let template = tail_child(&parent, 0);
-            let mut renonced = template;
-            renonced.nonce = 0xDEAD_BEEF_CAFE_BABEu128;
+        for generation in [
+            HistoryStepPackGeneration::V1,
+            HistoryStepPackGeneration::V1_3,
+        ] {
+            for parent_height in [
+                jetsam_chain::consensus::params::TX_EPOCH_BLOCKS - 1,
+                jetsam_chain::consensus::params::TX_EPOCH_BLOCKS,
+            ] {
+                let parent = tail_parent_header(parent_height);
+                let mut start = tail_start(&parent);
+                if generation.binds_two_epoch_anchors() {
+                    // Two anchors apart, so the twelfth lane is observable.
+                    start.previous_epoch_anchor_id = [0x32; 32];
+                }
+                let template = tail_child(&parent, 0);
+                let mut renonced = template;
+                renonced.nonce = 0xDEAD_BEEF_CAFE_BABEu128;
 
-            let end = start.advance(&parent, &template).unwrap();
-            let renonced_end = start.advance(&parent, &renonced).unwrap();
-            // The complete boundary is nonce-invariant.
-            assert_eq!(end, renonced_end);
-            if parent_height == jetsam_chain::consensus::params::TX_EPOCH_BLOCKS {
-                assert_eq!(end.epoch_anchor_id, jetsam_chain::hash_block_header(&parent));
-            } else {
-                assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
+                let end = start.advance_in(generation, &parent, &template).unwrap();
+                let renonced_end = start.advance_in(generation, &parent, &renonced).unwrap();
+                // The complete boundary is nonce-invariant.
+                assert_eq!(end, renonced_end);
+                if parent_height == jetsam_chain::consensus::params::TX_EPOCH_BLOCKS {
+                    assert_eq!(end.epoch_anchor_id, jetsam_chain::hash_block_header(&parent));
+                    if generation.binds_two_epoch_anchors() {
+                        assert_eq!(end.previous_epoch_anchor_id, start.epoch_anchor_id);
+                    }
+                } else {
+                    assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
+                    if generation.binds_two_epoch_anchors() {
+                        assert_eq!(
+                            end.previous_epoch_anchor_id,
+                            start.previous_epoch_anchor_id
+                        );
+                    }
+                }
+
+                let (matrix, witness, tail_rows) =
+                    direct_tail_fixture(generation, &parent, &template, &start, &end);
+                let (renonced_matrix, renonced_witness, renonced_tail_rows) =
+                    direct_tail_fixture(generation, &parent, &renonced, &start, &renonced_end);
+
+                assert_eq!(tail_rows, direct_block_tail_rows(generation));
+                assert_eq!(renonced_tail_rows, tail_rows);
+                assert_eq!(
+                    matrix.structural_statement_digest(),
+                    renonced_matrix.structural_statement_digest()
+                );
+                // The witness itself is identical for every nonce of one
+                // template: the relation is nonce-free.
+                assert_eq!(witness, renonced_witness);
+                assert!(matrix.satisfies(&witness));
             }
-
-            let (matrix, witness, tail_rows) =
-                direct_tail_fixture(&parent, &template, &start, &end);
-            let (renonced_matrix, renonced_witness, renonced_tail_rows) =
-                direct_tail_fixture(&parent, &renonced, &start, &renonced_end);
-
-            assert_eq!(tail_rows, DIRECT_BLOCK_TAIL_ROWS);
-            assert_eq!(renonced_tail_rows, tail_rows);
-            assert_eq!(
-                matrix.structural_statement_digest(),
-                renonced_matrix.structural_statement_digest()
-            );
-            // The witness itself is identical for every nonce of one
-            // template: the relation is nonce-free.
-            assert_eq!(witness, renonced_witness);
-            assert!(matrix.satisfies(&witness));
         }
     }
 
@@ -2143,7 +2277,9 @@ mod tx_epoch_anchor_tests {
         );
     }
 
-    fn bodies(start: &ChainAccumulator) -> Vec<SpineInputs> {
+    /// One coinbase bound to the parent id, one user page bound to `anchor`,
+    /// and the protocol ghost in the unused slot.
+    fn bodies_anchored_to(anchor: [Block128; 2]) -> Vec<SpineInputs> {
         let mut coinbase = SpineInputs {
             leaves: [[Block128::ZERO; 2]; jetsam_tx::body_hash::BODY_HASH_LEAVES],
         };
@@ -2152,14 +2288,26 @@ mod tx_epoch_anchor_tests {
         let mut user = SpineInputs {
             leaves: [[Block128::ZERO; 2]; jetsam_tx::body_hash::BODY_HASH_LEAVES],
         };
-        user.leaves[jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
-            digest_lanes(&start.epoch_anchor_id);
+        user.leaves[jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] = anchor;
         let ghost =
             jetsam_gkr::spine_statement::spine_inputs_from_body(&jetsam_gkr::ghost_tx::ghost_tx_body());
         vec![coinbase, user, ghost]
     }
 
+    fn bodies(start: &ChainAccumulator) -> Vec<SpineInputs> {
+        bodies_anchored_to(digest_lanes(&start.epoch_anchor_id))
+    }
+
+    /// The start boundary with the two anchors apart, for the v1.3 arm.
+    fn start_accumulator_two_anchors() -> ChainAccumulator {
+        let mut start = start_accumulator();
+        start.previous_epoch_anchor_id = [0x32; 32];
+        assert_ne!(start.epoch_anchor_id, start.previous_epoch_anchor_id);
+        start
+    }
+
     fn build_relation(
+        generation: HistoryStepPackGeneration,
         start: &ChainAccumulator,
         bodies: &[SpineInputs],
         real_users: usize,
@@ -2167,7 +2315,7 @@ mod tx_epoch_anchor_tests {
         assert_eq!(bodies.len(), 3, "test tier has coinbase + two user slots");
         assert!(real_users <= 2);
         let mut b = FieldR1csBuilder::new();
-        let start = AccumulatorWires::alloc(&mut b, start);
+        let start = AccumulatorWires::alloc_in(&mut b, generation, start);
         let traces: Vec<_> = bodies
             .iter()
             .map(|body| SpineInputsTrace::alloc(&mut b, body))
@@ -2187,6 +2335,7 @@ mod tx_epoch_anchor_tests {
             &mut b,
             &parent_id,
             &start.epoch_anchor_id,
+            start.previous_epoch_anchor_id.as_ref(),
             &traces[0],
             &payout,
             &traces[1..],
@@ -2196,9 +2345,14 @@ mod tx_epoch_anchor_tests {
         b.build()
     }
 
-    fn satisfies(start: &ChainAccumulator, bodies: &[SpineInputs], real_users: usize) -> bool {
+    fn satisfies(
+        generation: HistoryStepPackGeneration,
+        start: &ChainAccumulator,
+        bodies: &[SpineInputs],
+        real_users: usize,
+    ) -> bool {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (r1cs, witness) = build_relation(start, bodies, real_users);
+            let (r1cs, witness) = build_relation(generation, start, bodies, real_users);
             r1cs.satisfies(&witness)
         }))
         .unwrap_or(false)
@@ -2206,42 +2360,150 @@ mod tx_epoch_anchor_tests {
 
     #[test]
     fn coinbase_user_and_ghost_anchor_recombination() {
-        let start = start_accumulator();
-        let honest = bodies(&start);
-        assert!(satisfies(&start, &honest, 1));
-
-        for (body, leaf, lane) in [
-            (0usize, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 0usize),
-            (1, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
-            (2, jetsam_tx::body_hash::TX8X2_LEAF_FEE, 0),
-            (2, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
+        for generation in [
+            HistoryStepPackGeneration::V1,
+            HistoryStepPackGeneration::V1_3,
         ] {
-            let mut bad = honest.clone();
-            bad[body].leaves[leaf][lane] += Block128::ONE;
-            assert!(
-                !satisfies(&start, &bad, 1),
-                "body {body} leaf {leaf} lane {lane} recombination accepted"
-            );
+            let start = start_accumulator_two_anchors();
+            let honest = bodies(&start);
+            assert!(satisfies(generation, &start, &honest, 1));
+
+            for (body, leaf, lane) in [
+                (0usize, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 0usize),
+                (1, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
+                (2, jetsam_tx::body_hash::TX8X2_LEAF_FEE, 0),
+                (2, jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
+            ] {
+                let mut bad = honest.clone();
+                bad[body].leaves[leaf][lane] += Block128::ONE;
+                assert!(
+                    !satisfies(generation, &start, &bad, 1),
+                    "{generation:?}: body {body} leaf {leaf} lane {lane} recombination accepted"
+                );
+            }
         }
     }
 
     #[test]
     fn capacity_matrix_is_identical_across_real_user_counts() {
-        let start = start_accumulator();
-        let one_user = bodies(&start);
-        let mut two_users = one_user.clone();
-        two_users[2] = SpineInputs {
-            leaves: [[Block128::ZERO; 2]; jetsam_tx::body_hash::BODY_HASH_LEAVES],
-        };
-        two_users[2].leaves[jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
-            digest_lanes(&start.epoch_anchor_id);
+        for generation in [
+            HistoryStepPackGeneration::V1,
+            HistoryStepPackGeneration::V1_3,
+        ] {
+            let start = start_accumulator_two_anchors();
+            let one_user = bodies(&start);
+            let mut two_users = one_user.clone();
+            two_users[2] = SpineInputs {
+                leaves: [[Block128::ZERO; 2]; jetsam_tx::body_hash::BODY_HASH_LEAVES],
+            };
+            two_users[2].leaves[jetsam_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
+                digest_lanes(&start.epoch_anchor_id);
 
-        let (one_r1cs, one_witness) = build_relation(&start, &one_user, 1);
-        let (two_r1cs, two_witness) = build_relation(&start, &two_users, 2);
-        assert!(one_r1cs.satisfies(&one_witness));
-        assert!(two_r1cs.satisfies(&two_witness));
-        assert_eq!(one_r1cs.statement_digest(), two_r1cs.statement_digest());
-        assert_eq!(one_r1cs.useful_rows, two_r1cs.useful_rows);
+            let (one_r1cs, one_witness) = build_relation(generation, &start, &one_user, 1);
+            let (two_r1cs, two_witness) = build_relation(generation, &start, &two_users, 2);
+            assert!(one_r1cs.satisfies(&one_witness));
+            assert!(two_r1cs.satisfies(&two_witness));
+            assert_eq!(one_r1cs.statement_digest(), two_r1cs.statement_digest());
+            assert_eq!(one_r1cs.useful_rows, two_r1cs.useful_rows);
+        }
+    }
+
+    /// Under the launch relation a page binds the one accepted anchor and
+    /// nothing else. Under v1.3 it binds either of the two, the choice is
+    /// witness data that never reaches the matrix, and a third epoch, the
+    /// parent id or any stranger stays refused: the window is exactly two
+    /// epochs wide, and the far edge matters as much as the near one — an
+    /// anchor that never dies is no TTL at all.
+    #[test]
+    fn a_page_binds_the_anchors_its_generation_accepts_and_no_other() {
+        let start = start_accumulator_two_anchors();
+        let current = bodies_anchored_to(digest_lanes(&start.epoch_anchor_id));
+        let previous = bodies_anchored_to(digest_lanes(&start.previous_epoch_anchor_id));
+
+        assert!(satisfies(HistoryStepPackGeneration::V1, &start, &current, 1));
+        assert!(
+            !satisfies(HistoryStepPackGeneration::V1, &start, &previous, 1),
+            "the launch relation accepted the older anchor"
+        );
+
+        let mut digests = Vec::new();
+        for bodies in [&current, &previous] {
+            assert!(
+                satisfies(HistoryStepPackGeneration::V1_3, &start, bodies, 1),
+                "an accepted anchor was refused"
+            );
+            let (r1cs, _) = build_relation(HistoryStepPackGeneration::V1_3, &start, bodies, 1);
+            digests.push(r1cs.statement_digest());
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "the anchor a page chose changed the class shape"
+        );
+
+        for stranger in [[0x01u8; 32], TEST_PARENT_BLOCK_ID, [0xAB; 32]] {
+            let bodies = bodies_anchored_to(digest_lanes(&stranger));
+            for generation in [
+                HistoryStepPackGeneration::V1,
+                HistoryStepPackGeneration::V1_3,
+            ] {
+                assert!(
+                    !satisfies(generation, &start, &bodies, 1),
+                    "{generation:?}: anchor {stranger:?} was accepted"
+                );
+            }
+        }
+    }
+
+    /// The chimera: half of the digest taken from the current anchor, half
+    /// from the previous one — an anchor no block ever had.
+    ///
+    /// Checking each 128-bit lane on its own, as the product
+    /// `live * (L0 - current) * (L0 - previous) = 0`, accepts exactly this.
+    /// The relation must instead commit to ONE witness bit per page and use
+    /// it for BOTH lanes, so the two halves can never come from two different
+    /// epochs. Both mixtures are tested: the bug is symmetric.
+    #[test]
+    fn a_chimera_anchor_mixing_the_two_epochs_is_refused() {
+        let start = start_accumulator_two_anchors();
+        let current = digest_lanes(&start.epoch_anchor_id);
+        let previous = digest_lanes(&start.previous_epoch_anchor_id);
+        assert_ne!(current[0], previous[0]);
+        assert_ne!(current[1], previous[1]);
+
+        for chimera in [[current[0], previous[1]], [previous[0], current[1]]] {
+            let bodies = bodies_anchored_to(chimera);
+            assert!(
+                !satisfies(HistoryStepPackGeneration::V1_3, &start, &bodies, 1),
+                "a chimera anchor was accepted: every lane matched an anchor, \
+                 but no single anchor matched every lane"
+            );
+        }
+    }
+
+    /// The relation must not become cheaper to satisfy when the two accepted
+    /// anchors happen to be equal, which is the whole of the first two epochs
+    /// — the previous anchor saturates at genesis there.
+    #[test]
+    fn the_first_epochs_bind_one_anchor_accepted_twice() {
+        let start = start_accumulator();
+        assert_eq!(start.previous_epoch_anchor_id, start.epoch_anchor_id);
+        let honest = bodies_anchored_to(digest_lanes(&start.epoch_anchor_id));
+        assert!(satisfies(HistoryStepPackGeneration::V1_3, &start, &honest, 1));
+        let stranger = bodies_anchored_to(digest_lanes(&[0x7Eu8; 32]));
+        assert!(!satisfies(HistoryStepPackGeneration::V1_3, &start, &stranger, 1));
+    }
+
+    /// K = 2 is paid in rows and only in rows: one selector, its boolean
+    /// pin and one multiplexer per lane per page. The launch relation pays
+    /// none of them.
+    #[test]
+    fn the_second_anchor_costs_the_launch_relation_nothing() {
+        let start = start_accumulator_two_anchors();
+        let honest = bodies(&start);
+        let (launch, _) = build_relation(HistoryStepPackGeneration::V1, &start, &honest, 1);
+        let (current, _) = build_relation(HistoryStepPackGeneration::V1_3, &start, &honest, 1);
+        assert!(launch.useful_rows < current.useful_rows);
+        assert_ne!(launch.statement_digest(), current.statement_digest());
     }
 
     fn scheduled_system_anchor_satisfies(payout_anchor: [u8; 32]) -> bool {
@@ -2273,6 +2535,7 @@ mod tx_epoch_anchor_tests {
             &mut b,
             &parent_id,
             &start_w.epoch_anchor_id,
+            None,
             &traces[0],
             &traces[1],
             &traces[2..],
@@ -2324,6 +2587,7 @@ mod tx_epoch_anchor_tests {
             &mut b,
             &parent_id,
             &start_w.epoch_anchor_id,
+            None,
             &traces[0],
             &payout,
             &traces[1..],

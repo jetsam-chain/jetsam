@@ -1176,7 +1176,7 @@ fn bind_auth_pcs_meta_paired_handoff(
 
 fn preflight_selected_zk_authorization_draft(
     authorization: &super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
-) -> Result<crate::region_sidecar::SelectedZkBlockGeometry, SelectedZkAuthPcsRegionAllocationError>
+) -> Result<crate::region_sidecar::SelectedZkAuthTiling, SelectedZkAuthPcsRegionAllocationError>
 {
     let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
         authorization.owner().challenges.len(),
@@ -1364,13 +1364,23 @@ fn alloc_selected_columns<const N: usize>(
 /// Block assembly, never a post-commit preparation or finalization token.
 pub(super) fn allocate_selected_zk_auth_pcs_region(
     b: &mut FieldR1csBuilder,
+    tier: usize,
     authorization: super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
     es: &ExactStateRegionData,
     txr: &TxRootRegionData,
     spine: &SpineRegionData,
 ) -> Result<SelectedZkAuthPcsRegionAllocation, SelectedZkAuthPcsRegionAllocationError> {
     let geometry = preflight_selected_zk_authorization_draft(&authorization)?;
-    preflight_selected_zk_meta_inputs(es, txr, spine, geometry)?;
+    // By the block's own tier, never by the authorization tiling: the two
+    // small classes share one tiling of 32 slots and differ in exactly the
+    // three fields this preflight reads — the tier itself and the two slot
+    // capacities. Asking the tiling would answer 25 for a 24-page block.
+    let class = crate::region_sidecar::selected_zk_block_geometry(tier)
+        .ok_or(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)?;
+    if class.auth_tiles != geometry.auth_tiles {
+        return Err(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape);
+    }
+    preflight_selected_zk_meta_inputs(es, txr, spine, class)?;
 
     let (owner, main, wallet_a, wallet_b, overflow) = authorization.into_parts();
     let (wallet_a_columns, wallet_a_s0, wallet_a_s_out) = wallet_a.into_parts();
@@ -1450,7 +1460,7 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     // One canonical allocation ordered to minimize alignment loss at the
     // production HistoryStep boundary. The six family domains and their
     // committed contents are unchanged.
-    let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires(), geometry);
+    let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires(), class);
     let mut main_slices = None;
     let mut owner_slices = None;
     let mut wallet_b_slices = None;

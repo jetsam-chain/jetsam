@@ -47,7 +47,10 @@ const HISTORY_STEP_PCS_LOG_BATCH_SIZE: usize = 5;
 pub const HISTORY_STEP_FRI_QUERIES: usize = BASEFOLD_RATE_QUARTER_C1_QUERIES;
 
 /// The launch encoding of a boundary: ten lanes, what every terminal of this
-/// chain has carried since block one. Untouched by v1.3.
+/// chain has carried since block one. Production reads it through
+/// [`block_acc_lanes_for`] under the launch generation; the tests keep this
+/// fixed-width form to pin that the two agree.
+#[cfg(test)]
 pub(crate) fn block_acc_lanes(accumulator: &ChainAccumulator) -> [F128; ACC_LANES] {
     accumulator.to_lanes().map(flat_of)
 }
@@ -259,8 +262,18 @@ impl CanonicalHistoryStepClassId {
         self.index()
     }
 
+    /// The page-position tier this slot holds under the launch ladder.
     pub fn current_tier(self) -> usize {
         BLOCK_PAGE_CLASS_TIERS[self.current_slot()]
+    }
+
+    /// The page-position tier this slot holds under `generation`.
+    ///
+    /// Slot zero is 25 pages under the launch relation and 24 under v1.3; the
+    /// slot index is the same in both, which is why a terminal's class id
+    /// stays meaningful either side of the fork while its tier does not.
+    pub const fn current_tier_in(self, generation: HistoryStepPackGeneration) -> usize {
+        generation.tiers()[self.current_slot()]
     }
 
     pub const fn wire_id(self) -> u8 {
@@ -272,9 +285,23 @@ impl CanonicalHistoryStepClassId {
     }
 }
 
-/// Resolve a class by the consensus tier value rather than registry position.
+/// Resolve a class by the consensus tier value rather than registry position,
+/// under the launch ladder.
 pub fn canonical_history_step_class_id(current_tier: usize) -> Option<CanonicalHistoryStepClassId> {
     let current_slot = BLOCK_PAGE_CLASS_TIERS
+        .iter()
+        .position(|tier| *tier == current_tier)?;
+    CanonicalHistoryStepClassId::new(current_slot)
+}
+
+/// Resolve a class by the tier value of `generation`'s ladder: 24 names slot
+/// zero under v1.3 and nothing under the launch ladder, 25 the reverse.
+pub fn canonical_history_step_class_id_in(
+    generation: HistoryStepPackGeneration,
+    current_tier: usize,
+) -> Option<CanonicalHistoryStepClassId> {
+    let current_slot = generation
+        .tiers()
         .iter()
         .position(|tier| *tier == current_tier)?;
     CanonicalHistoryStepClassId::new(current_slot)
@@ -499,6 +526,11 @@ pub struct PinnedHistoryStepClassBank {
     layout: HistoryStepBankIoLayout,
     spec: PublicIoSpec,
     digest: [u8; 32],
+    /// The height a base step of this bank starts from: zero for the pack
+    /// the chain has run on since block one, the block before the activation
+    /// height for a v1.3 pack. Not part of the bank's digest — it is a fact
+    /// about which chain the pack serves, not about the pack.
+    recursion_root_height: u64,
 }
 
 impl PinnedHistoryStepClassBank {
@@ -571,7 +603,24 @@ impl PinnedHistoryStepClassBank {
             layout,
             spec,
             digest,
+            recursion_root_height: 0,
         })
+    }
+
+    /// Set the height this bank's recursion starts from.
+    ///
+    /// Used for a v1.3 pack, whose first terminal is the one at the
+    /// activation height, so its base boundary is the block before it. A
+    /// launch bank is rooted at genesis and never calls this.
+    #[must_use]
+    pub fn rooted_at_height(mut self, recursion_root_height: u64) -> Self {
+        self.recursion_root_height = recursion_root_height;
+        self
+    }
+
+    /// The height a base step of this bank starts from.
+    pub const fn recursion_root_height(&self) -> u64 {
+        self.recursion_root_height
     }
 
     pub fn entry(&self, class_id: CanonicalHistoryStepClassId) -> &PinnedHistoryStepBankEntry {

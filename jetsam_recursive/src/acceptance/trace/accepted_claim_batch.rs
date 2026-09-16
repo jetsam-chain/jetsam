@@ -23,6 +23,7 @@ use super::{
     range_check_bits, FieldR1csBuilder, LinExpr, Wire, F128,
 };
 use crate::accumulator::{ChainAccumulator, CHAIN_ACCUMULATOR_LANES};
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 
 /// Digest as two little-endian u128 lanes (the `digest_to_fields`
 /// convention).
@@ -83,15 +84,39 @@ pub struct AccumulatorWires {
     pub active_slot_count: LinExpr,
     pub alloc_counter: LinExpr,
     pub epoch_anchor_id: [LinExpr; 2],
+    /// The older accepted anchor, or `None` under the launch relation, which
+    /// has no such lane. The option *is* the generation here: a boundary
+    /// that carries the lane and one that does not are two different widths
+    /// of public IO, and no code path may guess which it is holding.
+    pub previous_epoch_anchor_id: Option<[LinExpr; 2]>,
 }
 
 impl AccumulatorWires {
+    /// The launch boundary: ten lanes, no previous anchor. Untouched by
+    /// v1.3; [`Self::alloc_in`] is the generation-aware twin.
     pub fn alloc(b: &mut FieldR1csBuilder, native: &ChainAccumulator) -> Self {
         let lanes = native.to_lanes().map(|lane| alloc_block(b, lane));
         Self::from_ordered_lanes(lanes)
     }
 
-    /// Build named wires from the consensus-significant lane order.
+    /// Allocate the boundary in the lane encoding of `generation`: exactly
+    /// [`Self::alloc`] under the launch generation, two lanes more under
+    /// v1.3.
+    pub fn alloc_in(
+        b: &mut FieldR1csBuilder,
+        generation: HistoryStepPackGeneration,
+        native: &ChainAccumulator,
+    ) -> Self {
+        let lanes: Vec<LinExpr> = native
+            .to_generation_lanes(generation)
+            .into_iter()
+            .map(|lane| alloc_block(b, lane))
+            .collect();
+        Self::from_generation_lanes(&lanes)
+    }
+
+    /// Build named wires from the consensus-significant lane order of the
+    /// launch boundary.
     pub fn from_ordered_lanes(lanes: [LinExpr; CHAIN_ACCUMULATOR_LANES]) -> Self {
         Self {
             height: lanes[0].clone(),
@@ -101,12 +126,47 @@ impl AccumulatorWires {
             active_slot_count: lanes[6].clone(),
             alloc_counter: lanes[7].clone(),
             epoch_anchor_id: [lanes[8].clone(), lanes[9].clone()],
+            previous_epoch_anchor_id: None,
         }
     }
 
-    /// Return the exact lane order used by block/link public IO.
-    pub fn ordered_lanes(&self) -> [LinExpr; CHAIN_ACCUMULATOR_LANES] {
-        [
+    /// Build named wires from a lane vector of either generation's width.
+    ///
+    /// Ten lanes is the launch boundary, twelve is v1.3's; the first ten are
+    /// the same lanes in the same order in both, which is the only reason
+    /// one decoder can serve two relations.
+    pub fn from_generation_lanes(lanes: &[LinExpr]) -> Self {
+        let v1_3_lanes = HistoryStepPackGeneration::V1_3.chain_accumulator_lanes();
+        assert!(
+            lanes.len() == CHAIN_ACCUMULATOR_LANES || lanes.len() == v1_3_lanes,
+            "accumulator lane count {} is not a pack generation's boundary width",
+            lanes.len()
+        );
+        let launch: [LinExpr; CHAIN_ACCUMULATOR_LANES] = lanes[..CHAIN_ACCUMULATOR_LANES]
+            .to_vec()
+            .try_into()
+            .expect("the launch prefix of a width-checked lane vector");
+        let mut wires = Self::from_ordered_lanes(launch);
+        if lanes.len() == v1_3_lanes {
+            wires.previous_epoch_anchor_id = Some([lanes[10].clone(), lanes[11].clone()]);
+        }
+        wires
+    }
+
+    /// The pack generation this boundary belongs to, decided by the one
+    /// thing that differs: whether it carries the older anchor.
+    pub fn generation(&self) -> HistoryStepPackGeneration {
+        if self.previous_epoch_anchor_id.is_some() {
+            HistoryStepPackGeneration::V1_3
+        } else {
+            HistoryStepPackGeneration::V1
+        }
+    }
+
+    /// Return the exact lane order used by block/link public IO: ten lanes
+    /// for a launch boundary, twelve for a v1.3 one.
+    pub fn ordered_lanes(&self) -> Vec<LinExpr> {
+        let mut lanes = vec![
             self.height.clone(),
             self.tip_semantic_id[0].clone(),
             self.tip_semantic_id[1].clone(),
@@ -117,7 +177,12 @@ impl AccumulatorWires {
             self.alloc_counter.clone(),
             self.epoch_anchor_id[0].clone(),
             self.epoch_anchor_id[1].clone(),
-        ]
+        ];
+        if let Some(previous) = &self.previous_epoch_anchor_id {
+            lanes.push(previous[0].clone());
+            lanes.push(previous[1].clone());
+        }
+        lanes
     }
 }
 
@@ -189,6 +254,29 @@ pub fn build_direct_accumulator_transition_slot(
         let delta = start.epoch_anchor_id[lane].add(&parent_block_id[lane]);
         let selected = start.epoch_anchor_id[lane].add(&mul(b, &epoch.boundary, &delta));
         pin_eq(b, &selected, &end.epoch_anchor_id[lane]);
+
+        // The launch relation stops here: it has one anchor and emits exactly
+        // the three rows above per lane. The four rows below are the whole of
+        // what K = 2 costs in this slot, and they must stay inside this loop
+        // and after that pin, or the v1 branch would no longer reproduce the
+        // launch matrices row for row. The same boundary bit drives both
+        // pairs: at a boundary the older anchor becomes what the current one
+        // was, so the two lanes name adjacent epochs and never drift apart.
+        let (Some(start_previous), Some(end_previous)) = (
+            start.previous_epoch_anchor_id.as_ref(),
+            end.previous_epoch_anchor_id.as_ref(),
+        ) else {
+            assert!(
+                start.previous_epoch_anchor_id.is_none()
+                    && end.previous_epoch_anchor_id.is_none(),
+                "a transition may not mix a one-anchor boundary with a two-anchor one"
+            );
+            continue;
+        };
+        let previous_delta = start_previous[lane].add(&start.epoch_anchor_id[lane]);
+        let selected_previous =
+            start_previous[lane].add(&mul(b, &epoch.boundary, &previous_delta));
+        pin_eq(b, &selected_previous, &end_previous[lane]);
     }
 }
 
@@ -403,6 +491,108 @@ mod tests {
             }
             assert!(!satisfies(&start, &bad, &end), "child target {target}");
         }
+    }
+
+    /// The v1.3 fixture: the launch one with the two anchors apart, and the
+    /// end boundary carrying what `advance_in` would produce — at a boundary
+    /// the older anchor becomes the current one and the current one becomes
+    /// the derived parent id; elsewhere both pass through.
+    fn fixture_v1_3(parent_height: u64) -> (ChainAccumulator, NativeChild, ChainAccumulator) {
+        let (mut start, child, mut end) = fixture(parent_height);
+        start.previous_epoch_anchor_id = [0x77; 32];
+        end.previous_epoch_anchor_id =
+            if parent_height % jetsam_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
+                start.epoch_anchor_id
+            } else {
+                start.previous_epoch_anchor_id
+            };
+        (start, child, end)
+    }
+
+    fn satisfies_in(
+        generation: HistoryStepPackGeneration,
+        start: &ChainAccumulator,
+        child: &NativeChild,
+        end: &ChainAccumulator,
+    ) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let start = AccumulatorWires::alloc_in(&mut b, generation, start);
+            let (child, parent_block_id) = alloc_child(&mut b, child);
+            let end = AccumulatorWires::alloc_in(&mut b, generation, end);
+            build_direct_accumulator_transition_slot(
+                &mut b,
+                &start,
+                &child,
+                &end,
+                &parent_block_id,
+            );
+            let (r1cs, witness) = b.build();
+            r1cs.satisfies(&witness)
+        }))
+        .unwrap_or(false)
+    }
+
+    /// Under v1.3 the transition carries the older anchor along, driven by
+    /// the same boundary bit as the current one, and refuses any other
+    /// value in its lanes. Under the launch generation the same boundary,
+    /// allocated ten lanes wide, is the transition it always was.
+    #[test]
+    fn the_v1_3_transition_shifts_both_anchors_on_one_boundary_bit() {
+        use jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        for parent_height in [TX_EPOCH_BLOCKS - 1, TX_EPOCH_BLOCKS] {
+            let (start, child, end) = fixture_v1_3(parent_height);
+            assert!(
+                satisfies_in(HistoryStepPackGeneration::V1_3, &start, &child, &end),
+                "honest v1.3 transition refused at parent height {parent_height}"
+            );
+            // The launch encoding of the same boundaries drops the older
+            // anchor, and the launch transition accepts them as before.
+            assert!(
+                satisfies_in(HistoryStepPackGeneration::V1, &start, &child, &end),
+                "launch transition refused at parent height {parent_height}"
+            );
+
+            // A stale older anchor — the pair naming two non-adjacent epochs
+            // — is refused, and so is a chimera that shifted only one lane.
+            let mut stale = end.clone();
+            stale.previous_epoch_anchor_id = [0x99; 32];
+            assert!(
+                !satisfies_in(HistoryStepPackGeneration::V1_3, &start, &child, &stale),
+                "a stale older anchor was accepted at parent height {parent_height}"
+            );
+            let mut unshifted = end.clone();
+            unshifted.previous_epoch_anchor_id = if parent_height % TX_EPOCH_BLOCKS == 0 {
+                start.previous_epoch_anchor_id
+            } else {
+                start.epoch_anchor_id
+            };
+            assert!(
+                !satisfies_in(HistoryStepPackGeneration::V1_3, &start, &child, &unshifted),
+                "an older anchor shifted on the wrong bit was accepted at {parent_height}"
+            );
+        }
+    }
+
+    /// The two widths are two relations: a one-anchor start may not meet a
+    /// two-anchor end, and the builder says so rather than emitting rows.
+    #[test]
+    fn a_transition_never_mixes_the_two_boundary_widths() {
+        let (start, child, end) = fixture_v1_3(jetsam_chain::consensus::params::TX_EPOCH_BLOCKS);
+        let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let start = AccumulatorWires::alloc_in(&mut b, HistoryStepPackGeneration::V1, &start);
+            let (child, parent_block_id) = alloc_child(&mut b, &child);
+            let end = AccumulatorWires::alloc_in(&mut b, HistoryStepPackGeneration::V1_3, &end);
+            build_direct_accumulator_transition_slot(
+                &mut b,
+                &start,
+                &child,
+                &end,
+                &parent_block_id,
+            );
+        }));
+        assert!(mixed.is_err(), "a mixed-width transition was built");
     }
 
     #[test]

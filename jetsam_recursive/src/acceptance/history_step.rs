@@ -82,11 +82,13 @@ pub use freezer::{
 pub use relation::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
     assemble_history_step_base, assemble_history_step_recursive,
-    derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
+    derive_history_step_direct_block_vk, derive_history_step_direct_block_vk_in,
+    derive_history_step_runtime_parts, derive_history_step_runtime_parts_in,
     pin_history_step_class_bank, prepare_history_step_for_pow, prove_built_history_step_terminal,
     prove_built_history_step_terminal_cancellable, prove_history_step,
-    verify_history_step_terminal, AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep,
-    HistoryStepError, HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
+    verify_history_step_terminal, verify_history_step_terminal_rooted,
+    AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep, HistoryStepError,
+    HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
     HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
     HistoryStepSidecarOperation, HistoryStepTerminal, PreparedHistoryStepForPow,
     HISTORY_STEP_WIRE_VERSION,
@@ -96,8 +98,8 @@ pub use runtime_parts_codec::{
 };
 pub use wire::{
     audit_history_step_terminal_encodings, decode_history_step_terminal,
-    decode_verify_history_step_terminal, encode_history_step_terminal,
-    history_step_terminal_max_wire_bytes, HistoryStepWireAudit,
+    decode_verify_history_step_terminal, decode_verify_history_step_terminal_rooted,
+    encode_history_step_terminal, history_step_terminal_max_wire_bytes, HistoryStepWireAudit,
     history_step_terminal_wire_bytes,
 };
 
@@ -205,16 +207,39 @@ pub fn prepare_history_step_ghost_authorization(
     })
 }
 
+/// [`prepare_history_step_authorizations_in`] under the launch generation.
 pub fn prepare_history_step_authorizations<const TIER: usize>(
     effective_page_count: usize,
     inputs: &[AuthorizationComponentInput],
     proofs: Vec<jetsam_gkr::zk_authorization::ZkAuthorizationProof>,
     ghost: &PreparedHistoryStepGhostAuthorization,
 ) -> Result<PreparedHistoryStepAuthorizations, HistoryStepAuthorizationError> {
+    prepare_history_step_authorizations_in::<TIER>(
+        jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
+        effective_page_count,
+        inputs,
+        proofs,
+        ghost,
+    )
+}
+
+/// Prepare the live authorizations of a block proved under `generation`,
+/// whose ladder decides which class `effective_page_count` selects.
+pub fn prepare_history_step_authorizations_in<const TIER: usize>(
+    generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+    effective_page_count: usize,
+    inputs: &[AuthorizationComponentInput],
+    proofs: Vec<jetsam_gkr::zk_authorization::ZkAuthorizationProof>,
+    ghost: &PreparedHistoryStepGhostAuthorization,
+) -> Result<PreparedHistoryStepAuthorizations, HistoryStepAuthorizationError> {
     let actual_tier =
-        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
-            .map(|class| class.page_capacity());
-    if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
+        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+            effective_page_count,
+            generation,
+        )
+        .map(|class| class.page_capacity_in_generation(generation));
+    if !generation.tiers().contains(&TIER)
+        || crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
         || actual_tier != Some(TIER)
         || inputs.len() > TIER
     {
@@ -255,6 +280,7 @@ pub struct HistoryStepBlockInput<const TIER: usize> {
 }
 
 impl<const TIER: usize> HistoryStepBlockInput<TIER> {
+    /// [`Self::try_new_in`] under the launch generation.
     pub fn try_new(
         start_accumulator: &ChainAccumulator,
         end_accumulator: &ChainAccumulator,
@@ -263,7 +289,32 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         sealed_header: &BlockHeader,
         parent_header: &BlockHeader,
     ) -> Result<Self, HistoryStepInputError> {
-        if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none() {
+        Self::try_new_in(
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
+            start_accumulator,
+            end_accumulator,
+            components,
+            authorizations,
+            sealed_header,
+            parent_header,
+        )
+    }
+
+    /// The input of a block proved under `generation`: its ladder decides
+    /// the class, and its boundary rule glues the end accumulator to the
+    /// start one.
+    pub fn try_new_in(
+        generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+        start_accumulator: &ChainAccumulator,
+        end_accumulator: &ChainAccumulator,
+        components: HistoryStepBlockComponents,
+        authorizations: PreparedHistoryStepAuthorizations,
+        sealed_header: &BlockHeader,
+        parent_header: &BlockHeader,
+    ) -> Result<Self, HistoryStepInputError> {
+        if !generation.tiers().contains(&TIER)
+            || crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
+        {
             return Err(HistoryStepInputError::NonCanonicalTier { tier: TIER });
         }
         let live_authorizations = components.authorization_inputs.len();
@@ -275,10 +326,12 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         }
         let user_page_count = components.user_page_count;
         let effective_page_count = components.effective_page_count();
-        let actual_tier = jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count(
-            effective_page_count,
-        )
-        .map(|class| class.page_capacity());
+        let actual_tier =
+            jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+                effective_page_count,
+                generation,
+            )
+            .map(|class| class.page_capacity_in_generation(generation));
         if actual_tier != Some(TIER) {
             return Err(HistoryStepInputError::WrongTier {
                 expected_tier: TIER,
@@ -302,7 +355,7 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         // semantic tip, the chain link, the height successor and the shifted
         // epoch-anchor rule in one place.
         if start_accumulator
-            .advance(parent_header, sealed_header)
+            .advance_in(generation, parent_header, sealed_header)
             .ok()
             .as_ref()
             != Some(end_accumulator)

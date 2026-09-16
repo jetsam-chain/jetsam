@@ -46,6 +46,41 @@ impl BlockProofClass {
         }
     }
 
+    /// The class holding `page_count` under one pack generation's ladder.
+    ///
+    /// This is the *proof* side's question — which class shape is being
+    /// built or verified — and it is answered by the generation of the
+    /// matrices in hand, never by the compiled ladder, because one binary
+    /// carries two. The variant names keep their launch spelling: `B25` is
+    /// the small class, and it holds 24 page positions under v1.3.
+    /// [`Self::for_page_count`] is this under the launch generation.
+    pub const fn for_page_count_in_generation(
+        page_count: usize,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> Option<Self> {
+        let tiers = generation.tiers();
+        if page_count <= tiers[0] {
+            Some(Self::B25)
+        } else if page_count <= tiers[1] {
+            Some(Self::B255)
+        } else {
+            None
+        }
+    }
+
+    /// Page capacity of this class under one pack generation's ladder.
+    /// [`Self::page_capacity`] is this under the launch generation.
+    pub const fn page_capacity_in_generation(
+        self,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> usize {
+        let tiers = generation.tiers();
+        match self {
+            Self::B25 => tiers[0],
+            Self::B255 => tiers[1],
+        }
+    }
+
     /// Maximum live logical groups/capsules.
     pub const fn live_authorization_capacity(self) -> usize {
         self.page_capacity()
