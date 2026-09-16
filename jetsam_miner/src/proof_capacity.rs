@@ -8,6 +8,7 @@
 //! physical page slots are live. Capacity decisions therefore use complete
 //! B25/B255 preparation timings, never `milliseconds / populated pages`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use jetsam_chain::consensus::paged_spend::BlockProofClass;
@@ -122,6 +123,41 @@ pub fn publishable_page_ceiling_from_runtime(
         })
 }
 
+/// Bring `capacity`'s terminal sizes onto the ladder that governs `height`.
+///
+/// This is the re-measurement site the startup comment promised and never
+/// had. Both of our producers — the in-process miner and the mining API —
+/// call it with the height of the block they are about to build, so the two
+/// see the same sizes at the same heights.
+///
+/// It is a generation comparison and nothing else while the relation holds,
+/// so a node that never crosses a fork measures exactly once, at startup, and
+/// produces the same bytes it always did. Measuring walks every class of a
+/// frozen bank, which is far too slow to pay per template; it is paid once
+/// per relation, on the block that crosses.
+pub fn align_terminal_measurement_to_height<F>(
+    capacity: &mut AdaptiveProofCapacity,
+    height: u64,
+    select_runtime: F,
+) -> Result<(), String>
+where
+    F: FnOnce(u64) -> Option<Arc<HistoryStepRuntime>>,
+{
+    let governing = HistoryStepPackGeneration::at_height(height);
+    if capacity.measured_generation() == governing {
+        return Ok(());
+    }
+    let runtime = select_runtime(height).ok_or_else(|| {
+        format!("no HistoryStep pack serves height {height}, so its terminal sizes are unknown")
+    })?;
+    let terminal_bytes = measured_terminal_bytes_from_runtime(&runtime)?;
+    // The bank's own generation, not the one the schedule names: if a node
+    // were handed the wrong pack, recording what it actually measured lets
+    // the ceiling refuse rather than answer from the wrong ladder.
+    capacity.install_measurement(runtime.bank().generation(), terminal_bytes);
+    Ok(())
+}
+
 /// Miner-local capacity evidence for the two launch proof classes.
 ///
 /// Every process starts conservatively at B25. Before a real B255 sample
@@ -141,25 +177,82 @@ pub struct AdaptiveProofCapacity {
     /// chain for 6 146 seconds. These sizes must come from whoever holds the
     /// proof runtime.
     ///
-    /// A size is a property of its class, so it is measured once. The cap it
-    /// is compared against is a function of block height from v1.2 on, so the
-    /// ceiling is recomputed for every template.
+    /// A size is a property of its class *inside one relation*, so it is
+    /// measured once per relation. The cap it is compared against is a
+    /// function of block height from v1.2 on, so the ceiling is recomputed for
+    /// every template.
     terminal_bytes: Vec<usize>,
+    /// The relation `terminal_bytes` was measured on.
+    ///
+    /// The v1.3 pack holds a different small class, so a size taken from the
+    /// launch bank says nothing at all about the v1.3 ladder. A process
+    /// started below the activation height therefore has to take the sizes
+    /// again once the schedule crosses, and until it has it may publish
+    /// nothing: zipping launch sizes against `[24, 255]` would name a tier no
+    /// measurement of this node's had ever been taken on.
+    measured_generation: HistoryStepPackGeneration,
 }
 
 impl AdaptiveProofCapacity {
+    /// Sizes measured on the launch relation's bank.
     pub fn new(terminal_bytes: Vec<usize>) -> Self {
+        Self::new_in(HistoryStepPackGeneration::V1, terminal_bytes)
+    }
+
+    /// Sizes measured on a named relation's bank.
+    pub fn new_in(generation: HistoryStepPackGeneration, terminal_bytes: Vec<usize>) -> Self {
         Self {
             b25_prepare_ms_ewma: None,
             b255_prepare_ms_ewma: None,
             terminal_bytes,
+            measured_generation: generation,
         }
+    }
+
+    /// The relation the sizes on file were measured on.
+    pub fn measured_generation(&self) -> HistoryStepPackGeneration {
+        self.measured_generation
+    }
+
+    /// Replace the sizes with ones measured on `generation`'s own bank.
+    ///
+    /// The timing history survives: a preparation cost is a property of the
+    /// machine that paid it, and a node that forgot its samples on the fork
+    /// height would drop back to the small class for no reason at exactly the
+    /// moment operators are watching.
+    pub fn install_measurement(
+        &mut self,
+        generation: HistoryStepPackGeneration,
+        terminal_bytes: Vec<usize>,
+    ) {
+        self.measured_generation = generation;
+        self.terminal_bytes = terminal_bytes;
     }
 
     /// Largest tier publishable at `height`, or 0 if none is — a node that can
     /// publish nothing must not silently fall back to the smallest class.
     pub fn publishable_page_ceiling_at(&self, height: u64) -> usize {
-        publishable_page_ceiling_at_height(&self.terminal_bytes, height).unwrap_or(0)
+        self.publishable_page_ceiling_at_in(HistoryStepPackGeneration::at_height(height), height)
+    }
+
+    /// The same, over one named relation's ladder. Production always passes
+    /// the generation the schedule names for `height`; this exists so both
+    /// relations can be exercised across a boundary while the real clock
+    /// stays dormant.
+    pub fn publishable_page_ceiling_at_in(
+        &self,
+        generation: HistoryStepPackGeneration,
+        height: u64,
+    ) -> usize {
+        // The single place the relation is checked. Sizes on file belong to
+        // one ladder; zipped against another they name a tier nothing was
+        // measured on, which is how a miner started before the fork would
+        // have judged the `[24, 255]` ladder with `[25, 255]` measurements.
+        // `align_terminal_measurement_to_height` is the only way across.
+        if generation != self.measured_generation {
+            return 0;
+        }
+        publishable_page_ceiling_at_height_in(generation, &self.terminal_bytes, height).unwrap_or(0)
     }
 
     /// Effective page-position budget for a template built at `height`: 25 or
@@ -170,6 +263,11 @@ impl AdaptiveProofCapacity {
     /// fast node was the one at risk, because it was the one confident enough
     /// to pick the class that never fitted.
     pub fn page_limit(&self, height: u64) -> usize {
+        self.page_limit_in(HistoryStepPackGeneration::at_height(height), height)
+    }
+
+    /// The same, over one named relation's ladder.
+    pub fn page_limit_in(&self, generation: HistoryStepPackGeneration, height: u64) -> usize {
         let target_ms = target_prepare_ms();
         let b255_fits = match self.b255_prepare_ms_ewma {
             Some(measured_ms) => measured_ms <= target_ms,
@@ -182,11 +280,11 @@ impl AdaptiveProofCapacity {
         // above it, and a miner that read the wrong ladder would either give
         // a page away or build a class the pack cannot prove.
         let by_speed = if b255_fits {
-            BlockProofClass::B255.page_capacity_at_height(height)
+            BlockProofClass::B255.page_capacity_in_generation(generation)
         } else {
-            BlockProofClass::B25.page_capacity_at_height(height)
+            BlockProofClass::B25.page_capacity_in_generation(generation)
         };
-        by_speed.min(self.publishable_page_ceiling_at(height))
+        by_speed.min(self.publishable_page_ceiling_at_in(generation, height))
     }
 
     /// Record one complete nonce-independent HistoryStep preparation.
@@ -410,6 +508,58 @@ mod tests {
                 CONSENSUS_CAP
             ),
             Some(24)
+        );
+    }
+
+    /// The v1.3 defect: sizes taken once at startup were zipped against every
+    /// later height's ladder. Both of our miners will be running from before
+    /// the activation height when the fork arms, so both would hold launch
+    /// sizes — `[25, 255]` measurements — and read them off the `[24, 255]`
+    /// ladder the moment the schedule crossed. The small tier they named
+    /// would be one no measurement of theirs had ever been taken on.
+    ///
+    /// The clock is dormant, so the generation is injected by hand, exactly
+    /// as the generation tests above do.
+    #[test]
+    fn the_sizes_follow_the_ladder_of_the_height_not_of_the_start() {
+        use HistoryStepPackGeneration::{V1, V1_3};
+
+        const ACTIVATION: u64 = 42;
+        // Slow enough that the large class is never in play: this test is
+        // about which ladder is read, not about timing.
+        let mut capacity =
+            AdaptiveProofCapacity::new_in(V1, vec![B25_TERMINAL_BYTES, B255_TERMINAL_BYTES]);
+        capacity.observe_preparation(BlockProofClass::B25, millis(200_000));
+
+        // Below the activation height the launch bank governs and its small
+        // class holds 25 pages. This is today's behaviour, unchanged.
+        assert_eq!(capacity.measured_generation(), V1);
+        assert_eq!(capacity.page_limit_in(V1, ACTIVATION - 1), 25);
+
+        // At and past it the schedule names the other relation. Sizes from
+        // the launch bank are not a statement about that ladder, so nothing
+        // may be published until they are taken again.
+        assert_eq!(
+            capacity.page_limit_in(V1_3, ACTIVATION),
+            0,
+            "launch-bank sizes were read off the v1.3 ladder"
+        );
+        assert_eq!(capacity.publishable_page_ceiling_at_in(V1_3, ACTIVATION), 0);
+
+        // Re-measured on the v1.3 bank, the small class is 24 pages.
+        capacity.install_measurement(V1_3, vec![B25_TERMINAL_BYTES, B255_TERMINAL_BYTES]);
+        assert_eq!(capacity.measured_generation(), V1_3);
+        assert_eq!(capacity.page_limit_in(V1_3, ACTIVATION), 24);
+
+        // And the launch ladder stops being answerable, for the same reason
+        // in the other direction: this process now holds v1.3 sizes.
+        assert_eq!(capacity.page_limit_in(V1, ACTIVATION - 1), 0);
+
+        // The timing history is not a property of the relation, so it does
+        // not reset on the boundary.
+        assert_eq!(
+            capacity.prepare_ms_ewma(BlockProofClass::B25),
+            Some(200_000.0)
         );
     }
 

@@ -1557,11 +1557,28 @@ impl RpcHandler {
         // height, the child of this parent.
         let child_height = snapshot.parent.height.saturating_add(1);
         let snapshot_ts = snapshot;
-        let max_user_pages = self
-            .external_mining_capacity
-            .lock()
-            .map_err(|_| rpc_err("external mining capacity lock poisoned"))?
-            .page_limit(child_height);
+        let max_user_pages = {
+            let mut capacity = self
+                .external_mining_capacity
+                .lock()
+                .map_err(|_| rpc_err("external mining capacity lock poisoned"))?;
+            // The same re-measurement the in-process miner does, on the same
+            // height, so a pool asking for a template past the activation
+            // height is told the same page budget the node would have used
+            // itself. Without it this path would read launch-pack sizes off
+            // the v1.3 ladder for as long as the process lived.
+            jetsam_miner::align_terminal_measurement_to_height(
+                &mut capacity,
+                child_height,
+                |height| {
+                    self.history_step_runtime_for_height
+                        .as_ref()
+                        .and_then(|select| select(height))
+                },
+            )
+            .map_err(rpc_err)?;
+            capacity.page_limit(child_height)
+        };
         let tmpl = builder
             .build_from_snapshot_with_limit(snapshot_ts, addr, block_ts, max_user_pages)
             .await
@@ -3892,28 +3909,38 @@ pub async fn start_rpc_server(
     // this path handed 26-page templates to a pool for 68 minutes; every
     // solution it returned was refused by the node that had asked for it.
     //
-    // The sizes are measured once; the cap they are compared against is
-    // selected per template by the block's own height.
+    // The sizes are measured once per relation; the cap they are compared
+    // against is selected per template by the block's own height.
     // Measured against the pack that governs the next block this node would
-    // build. A pack switch at the fork height changes the sizes, and the
-    // ceiling is re-measured when the process next starts past it.
+    // build, and taken again on the boundary by the same call the in-process
+    // miner makes, inside the template handler.
     //
     // The tip is read before the selector runs, not inside it: this is an
     // async function, and `blocking_read` on a runtime thread is not a slow
     // path, it is a panic.
     let next_block_height = chain.read().await.tip_height().saturating_add(1);
-    let external_mining_terminal_bytes = match history_step_runtime_for_height
-        .as_ref()
-        .and_then(|select| select(next_block_height))
-    {
-        Some(runtime) => jetsam_miner::measured_terminal_bytes_from_runtime(&runtime)
-            .map_err(|reason| anyhow::anyhow!("{reason}"))?,
-        // No proof runtime means nothing can be proved here at all, so this
-        // ceiling never gates a real template. Declare every class unpublishable
-        // rather than a number that would read like a measurement.
-        None => vec![usize::MAX; jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.len()],
-    };
+    let (external_mining_generation, external_mining_terminal_bytes) =
+        match history_step_runtime_for_height
+            .as_ref()
+            .and_then(|select| select(next_block_height))
+        {
+            Some(runtime) => (
+                runtime.bank().generation(),
+                jetsam_miner::measured_terminal_bytes_from_runtime(&runtime)
+                    .map_err(|reason| anyhow::anyhow!("{reason}"))?,
+            ),
+            // No proof runtime means nothing can be proved here at all, so this
+            // ceiling never gates a real template. Declare every class unpublishable
+            // rather than a number that would read like a measurement.
+            None => (
+                jetsam_chain::consensus::params::HistoryStepPackGeneration::at_height(
+                    next_block_height,
+                ),
+                vec![usize::MAX; jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.len()],
+            ),
+        };
     tracing::info!(
+        ?external_mining_generation,
         ?external_mining_terminal_bytes,
         "mining API terminal sizes measured"
     );
@@ -3946,7 +3973,8 @@ pub async fn start_rpc_server(
         history_step_ghost,
         external_mining_attempts,
         mining_template_changes,
-        external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::new(
+        external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::new_in(
+            external_mining_generation,
             external_mining_terminal_bytes,
         ))),
     };

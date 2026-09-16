@@ -367,7 +367,9 @@ impl BlockMiner {
         // template built in it wastes the proof of work that found it.
         // Measured against the pack that governs the next block. A pack
         // switch at the fork height changes the terminal sizes, so this is
-        // re-measured when the producer first builds a template past it.
+        // re-measured when the producer first builds a template past it —
+        // see the `align_terminal_measurement_to_height` call below, which
+        // runs before every template and measures only on the boundary.
         let next_height = {
             let ctx = self.chain.read().await;
             ctx.tip_height().saturating_add(1)
@@ -391,7 +393,10 @@ impl BlockMiner {
                 }
             };
         tracing::info!(?measured_terminal_bytes, "miner terminal sizes measured");
-        let mut proof_capacity = AdaptiveProofCapacity::new(measured_terminal_bytes);
+        let mut proof_capacity = AdaptiveProofCapacity::new_in(
+            capacity_runtime.bank().generation(),
+            measured_terminal_bytes,
+        );
 
         tracing::debug!("BlockMiner started");
 
@@ -457,6 +462,24 @@ impl BlockMiner {
             // The cap the block will be judged by is the one active at the
             // block's own height, which is the child of this parent.
             let child_height = snapshot.parent.height.saturating_add(1);
+            // The ladder is a function of that height too, and the sizes on
+            // file were taken on one relation's bank. Crossing the activation
+            // height therefore means taking them again, here, rather than
+            // reading launch-pack measurements off the v1.3 ladder. While the
+            // relation holds this is a comparison and costs nothing.
+            if let Err(reason) = crate::proof_capacity::align_terminal_measurement_to_height(
+                &mut proof_capacity,
+                child_height,
+                |height| (self.history_step_runtime_for_height)(height),
+            ) {
+                tracing::error!(
+                    child_height,
+                    %reason,
+                    "miner: cannot measure this node's terminals for this height; retrying in 1s"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             let max_effective_pages = proof_capacity.page_limit(child_height);
             let tmpl = match builder
                 .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
