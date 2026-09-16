@@ -16,6 +16,12 @@ use jetsam_poseidon2b::primitives::Digest;
 /// Canonical number of `Block128` lanes in [`ChainAccumulator`].
 pub const CHAIN_ACCUMULATOR_LANES: usize = 10;
 
+const _: () = assert!(
+    CHAIN_ACCUMULATOR_LANES
+        == jetsam_chain::consensus::HistoryStepPackGeneration::V1.chain_accumulator_lanes(),
+    "the boundary this crate encodes is the launch generation's, ten lanes wide"
+);
+
 /// Direct recursive continuity state.
 ///
 /// The tip lanes carry the nonce-free semantic header projection, so the
