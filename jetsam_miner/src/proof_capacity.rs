@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use jetsam_chain::consensus::paged_spend::BlockProofClass;
-use jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS;
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit;
 use jetsam_recursive::acceptance::history_step::HistoryStepRuntime;
 use jetsam_recursive::{history_step_terminal_wire_bytes, HISTORY_STEP_CLASS_COUNT};
@@ -26,7 +26,22 @@ const EWMA_PREVIOUS_WEIGHT: f64 = 0.75;
 /// class becomes available here with no edit, and until that day it cannot be
 /// selected by a node however fast it proves.
 pub fn publishable_page_ceiling(terminal_bytes: &[usize], cap: usize) -> Option<usize> {
-    BLOCK_PAGE_CLASS_TIERS
+    publishable_page_ceiling_in(HistoryStepPackGeneration::V1, terminal_bytes, cap)
+}
+
+/// The same, over the ladder the measurements were taken on.
+///
+/// `terminal_bytes` is measured class by class from one node's own bank, and
+/// that bank belongs to one relation. Zipping it against the wrong ladder
+/// would name the wrong tier: it would offer 24 pages where the class holds
+/// 25, or the reverse.
+pub fn publishable_page_ceiling_in(
+    generation: HistoryStepPackGeneration,
+    terminal_bytes: &[usize],
+    cap: usize,
+) -> Option<usize> {
+    generation
+        .tiers()
         .iter()
         .zip(terminal_bytes.iter())
         .filter(|(_, terminal)| **terminal <= cap)
@@ -47,7 +62,24 @@ pub fn publishable_page_ceiling(terminal_bytes: &[usize], cap: usize) -> Option<
 /// cap admits the 255-page class in both forms, so nothing is lost by being
 /// conservative here.
 pub fn publishable_page_ceiling_at_height(terminal_bytes: &[usize], height: u64) -> Option<usize> {
-    publishable_page_ceiling(terminal_bytes, history_step_terminal_bytes_limit(height))
+    publishable_page_ceiling_at_height_in(
+        HistoryStepPackGeneration::at_height(height),
+        terminal_bytes,
+        height,
+    )
+}
+
+/// The same, over one named relation's ladder.
+pub fn publishable_page_ceiling_at_height_in(
+    generation: HistoryStepPackGeneration,
+    terminal_bytes: &[usize],
+    height: u64,
+) -> Option<usize> {
+    publishable_page_ceiling_in(
+        generation,
+        terminal_bytes,
+        history_step_terminal_bytes_limit(height),
+    )
 }
 
 /// Measure every class once against this node's own frozen bank.
@@ -59,8 +91,11 @@ pub fn measured_terminal_bytes_from_runtime(
     runtime: &HistoryStepRuntime,
 ) -> Result<Vec<usize>, String> {
     let mut terminal_bytes = Vec::with_capacity(HISTORY_STEP_CLASS_COUNT);
-    for tier in BLOCK_PAGE_CLASS_TIERS {
-        let class = jetsam_recursive::canonical_history_step_class_id(tier)
+    // This runtime's own ladder, not the compiled one: a node holding the
+    // launch pack measures the launch classes.
+    let generation = runtime.bank().generation();
+    for tier in generation.tiers() {
+        let class = jetsam_recursive::canonical_history_step_class_id_in(generation, tier)
             .ok_or_else(|| format!("no proof class registered for the {tier}-page tier"))?;
         terminal_bytes.push(
             history_step_terminal_wire_bytes(runtime, class)
@@ -77,13 +112,14 @@ pub fn publishable_page_ceiling_from_runtime(
     height: u64,
 ) -> Result<usize, String> {
     let terminal_bytes = measured_terminal_bytes_from_runtime(runtime)?;
-    publishable_page_ceiling_at_height(&terminal_bytes, height).ok_or_else(|| {
-        format!(
-            "no proof class can be published at height {height}: terminals are \
-             {terminal_bytes:?} bytes and the consensus cap is {}",
-            history_step_terminal_bytes_limit(height)
-        )
-    })
+    publishable_page_ceiling_at_height_in(runtime.bank().generation(), &terminal_bytes, height)
+        .ok_or_else(|| {
+            format!(
+                "no proof class can be published at height {height}: terminals are \
+                 {terminal_bytes:?} bytes and the consensus cap is {}",
+                history_step_terminal_bytes_limit(height)
+            )
+        })
 }
 
 /// Miner-local capacity evidence for the two launch proof classes.
@@ -141,10 +177,14 @@ impl AdaptiveProofCapacity {
                 .b25_prepare_ms_ewma
                 .is_some_and(|measured_ms| measured_ms * PREDICTED_B255_WORK_RATIO <= target_ms),
         };
+        // At this block's own height, not the compiled ladder's: the small
+        // class holds 25 pages below the v1.3 activation height and 24 at or
+        // above it, and a miner that read the wrong ladder would either give
+        // a page away or build a class the pack cannot prove.
         let by_speed = if b255_fits {
-            BlockProofClass::B255.page_capacity()
+            BlockProofClass::B255.page_capacity_at_height(height)
         } else {
-            BlockProofClass::B25.page_capacity()
+            BlockProofClass::B25.page_capacity_at_height(height)
         };
         by_speed.min(self.publishable_page_ceiling_at(height))
     }
@@ -332,6 +372,45 @@ mod tests {
                 "height {height}, activation {V1_2_ACTIVATION_HEIGHT:?}"
             );
         }
+    }
+
+    /// The small class the miner is entitled to follows the block's height on
+    /// the activation clock: 25 pages below the v1.3 activation height, 24 at
+    /// or above it. With the clock dormant every height answers 25, which is
+    /// what every test above relies on.
+    #[test]
+    fn the_small_class_follows_the_block_height_on_the_activation_clock() {
+        const ACTIVATION: u64 = 42;
+        for (height, expected) in [(0u64, 25usize), (ACTIVATION - 1, 25), (ACTIVATION, 24)] {
+            assert_eq!(
+                BlockProofClass::B25.page_capacity_in_generation(
+                    HistoryStepPackGeneration::at_activation(height, Some(ACTIVATION))
+                ),
+                expected,
+                "height {height}"
+            );
+        }
+        for height in [0u64, 1, ANY_HEIGHT, u64::MAX] {
+            assert_eq!(BlockProofClass::B25.page_capacity_at_height(height), 25);
+            assert_eq!(BlockProofClass::B255.page_capacity_at_height(height), 255);
+        }
+        // The launch ladder measured by a launch bank names the launch tiers.
+        assert_eq!(
+            publishable_page_ceiling_in(
+                HistoryStepPackGeneration::V1,
+                &[B25_TERMINAL_BYTES, B255_TERMINAL_BYTES],
+                CONSENSUS_CAP
+            ),
+            Some(25)
+        );
+        assert_eq!(
+            publishable_page_ceiling_in(
+                HistoryStepPackGeneration::V1_3,
+                &[B25_TERMINAL_BYTES, B255_TERMINAL_BYTES],
+                CONSENSUS_CAP
+            ),
+            Some(24)
+        );
     }
 
     /// Raising the cap must free the larger class on its own. This is why the
