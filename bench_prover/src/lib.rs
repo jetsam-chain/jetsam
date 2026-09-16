@@ -844,6 +844,10 @@ impl HonestHistoryStepFixtureProvider {
             finalized_active_counts: &checkpoint.finalized_active_counts,
             asert_anchor: &checkpoint.asert_anchor,
             local_time: timestamp,
+            // The freezer fixtures are launch-relation blocks: one epoch
+            // anchor, and the launch class ladder.
+            generation: jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
+            previous_tx_epoch_anchor_header: None,
         };
         let input_preparation_started = Instant::now();
         let authorization_weight = authorization_bytes

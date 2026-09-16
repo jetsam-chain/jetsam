@@ -25,7 +25,11 @@ use std::{
 };
 
 use jetsam_chain::block_header::BlockHeader;
-use jetsam_chain::consensus::{pow::block_id, tx_epoch_anchor_height_for_child};
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+use jetsam_chain::consensus::{
+    pow::block_id, previous_tx_epoch_anchor_height_for_child, tx_epoch_anchor_height_for_child,
+    AcceptedEpochAnchors,
+};
 use jetsam_chain::fri_state::SlotValue;
 use jetsam_chain::segmented_state::SegmentedFriState;
 use jetsam_chain::storage::MdbxStore;
@@ -75,6 +79,14 @@ pub struct ChainView {
     /// Exact anchor id accepted by user transactions in the next child block.
     pub user_epoch_anchor_id: [u8; 32],
 
+    /// The older anchor those transactions may *also* bind, from v1.3 on.
+    ///
+    /// Equal to `user_epoch_anchor_id` under the launch generation, where a
+    /// second anchor does not exist, and wherever the older header cannot be
+    /// resolved — degrading to the single anchor the chain has always had,
+    /// never to a value no transaction can match.
+    pub previous_user_epoch_anchor_id: [u8; 32],
+
     /// Canonical tip hash paired with `tip_height` for atomic durable reads.
     pub tip_hash: [u8; 32],
 
@@ -99,6 +111,15 @@ impl ChainView {
             .get(&anchor_height)
             .map(block_id)
             .unwrap_or([0u8; 32]);
+        let previous_user_epoch_anchor_id =
+            if child_generation(tip_height).binds_two_epoch_anchors() {
+                recent_headers
+                    .get(&previous_tx_epoch_anchor_height_for_child(tip_height + 1))
+                    .map(block_id)
+                    .unwrap_or(user_epoch_anchor_id)
+            } else {
+                user_epoch_anchor_id
+            };
         let tip_hash = recent_headers
             .get(&tip_height)
             .map(block_id)
@@ -109,6 +130,7 @@ impl ChainView {
             num_slots,
             active_slot_count,
             user_epoch_anchor_id,
+            previous_user_epoch_anchor_id,
             tip_hash,
             state,
             store: None,
@@ -200,8 +222,43 @@ impl ChainView {
             .flatten()
             .map(|header| block_id(&header))
             .unwrap_or([0u8; 32]);
+        view.previous_user_epoch_anchor_id =
+            if child_generation(ctx.tip_height).binds_two_epoch_anchors() {
+                ctx.get_header_from_store(previous_tx_epoch_anchor_height_for_child(
+                    ctx.tip_height + 1,
+                ))
+                .ok()
+                .flatten()
+                .map(|header| block_id(&header))
+                .unwrap_or(view.user_epoch_anchor_id)
+            } else {
+                view.user_epoch_anchor_id
+            };
         view
     }
+
+    /// The anchors a transaction admitted against this view may bind, and the
+    /// generation that decides how many of them count.
+    ///
+    /// Under the launch generation the pair carries the one anchor twice and
+    /// the generation consults only the first, so this is exactly the
+    /// equality the mempool has always tested.
+    pub fn accepted_user_epoch_anchors(&self) -> (AcceptedEpochAnchors, HistoryStepPackGeneration) {
+        (
+            AcceptedEpochAnchors {
+                current: self.user_epoch_anchor_id,
+                previous: self.previous_user_epoch_anchor_id,
+            },
+            child_generation(self.tip_height),
+        )
+    }
+}
+
+/// The generation of the block this view is admitting transactions for — the
+/// child of the view's tip, never the tip itself.
+#[inline]
+fn child_generation(tip_height: u64) -> HistoryStepPackGeneration {
+    HistoryStepPackGeneration::at_height(tip_height.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -234,5 +291,24 @@ mod tests {
         assert_eq!(view(epoch - 2).user_epoch_anchor_id, genesis_id);
         assert_eq!(view(epoch - 1).user_epoch_anchor_id, genesis_id);
         assert_eq!(view(epoch).user_epoch_anchor_id, boundary_id);
+
+        // The older anchor exists only under a generation that binds two. With
+        // the v1.3 clock dormant every view answers the one anchor twice, so
+        // the pair the mempool tests is the equality it always tested.
+        for tip_height in [epoch - 2, epoch - 1, epoch] {
+            let view = view(tip_height);
+            assert_eq!(
+                view.previous_user_epoch_anchor_id, view.user_epoch_anchor_id,
+                "tip {tip_height}"
+            );
+            let (accepted, generation) = view.accepted_user_epoch_anchors();
+            assert_eq!(generation, HistoryStepPackGeneration::V1);
+            assert_eq!(accepted.previous, accepted.current);
+            assert_eq!(
+                generation,
+                HistoryStepPackGeneration::at_height(tip_height + 1),
+                "the generation is the child's, never the tip's"
+            );
+        }
     }
 }

@@ -4,10 +4,12 @@
 
 //! One-shot, nonce-independent HistoryStep witness preparation.
 
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::validation::validate_block_checks_template;
 use jetsam_chain::consensus::{
-    validate_block_checks, validate_block_epoch_anchors, validate_block_resource_preflight,
-    validate_mandatory_coinbase, validate_tx_consensus, AnchorInfo, ConsensusError,
+    validate_block_checks, validate_block_epoch_anchors_in, validate_block_resource_preflight,
+    validate_mandatory_coinbase, validate_tx_consensus, AcceptedEpochAnchors, AnchorInfo,
+    ConsensusError,
 };
 use jetsam_chain::exact_state_hash::{slot_leaf_hash, StateHash};
 use jetsam_chain::sparse_merkle::{
@@ -16,14 +18,14 @@ use jetsam_chain::sparse_merkle::{
 use jetsam_chain::state::{ChainState, ExactFrontierError};
 use jetsam_chain::{
     build_exact_action_surface_for_transactions_at_log_slots, compute_tx_root,
-    validate_block_page_stream, Block, BlockHeader, StateDeltaError,
+    validate_block_page_stream_in, Block, BlockHeader, StateDeltaError,
 };
 use jetsam_core::{Block128, TowerField};
 use jetsam_gkr::zk_authorization::ZkAuthorizationProof;
 use jetsam_gkr::{spine_inputs_from_body, MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH};
 use jetsam_poseidon2b::native::compress;
 use jetsam_recursive::acceptance::history_step::{
-    prepare_history_step_authorizations, prepare_history_step_for_pow,
+    prepare_history_step_authorizations_in, prepare_history_step_for_pow,
     HistoryStepAuthorizationError, HistoryStepBlockInput, HistoryStepError, HistoryStepInputError,
     HistoryStepRuntime, HistoryStepTerminal, PreparedHistoryStepAuthorizations,
     PreparedHistoryStepForPow, PreparedHistoryStepGhostAuthorization,
@@ -48,9 +50,18 @@ pub struct HistoryStepPreparationContext<'a> {
     pub finalized_active_counts: &'a [u64],
     pub asert_anchor: &'a AnchorInfo,
     pub local_time: u64,
+    /// The relation this template is proved under — the generation of the
+    /// template's own height. It decides the class ladder, the anchors a
+    /// user page may bind and the form of the start boundary.
+    pub generation: HistoryStepPackGeneration,
+    /// The header the start boundary's older anchor binds, required under a
+    /// generation that binds two anchors and refused under one that binds
+    /// one; see `ChainAccumulator::validate_local_header_boundary_in`.
+    pub previous_tx_epoch_anchor_header: Option<&'a BlockHeader>,
 }
 
 struct PreparedNativeHistoryStep<const TIER: usize> {
+    generation: HistoryStepPackGeneration,
     template: Block,
     parent_header: BlockHeader,
     expected_start: ChainAccumulator,
@@ -77,6 +88,10 @@ pub struct PreparedHistoryStepInputWitness<const TIER: usize> {
 /// authority; finishing it consumes that authority exactly once.
 #[must_use = "dropping the prepared witness cancels this block attempt"]
 pub struct PreparedHistoryStepWitness<const TIER: usize> {
+    /// The relation this witness was prepared under, kept so that every
+    /// question asked of the template afterwards — its class above all — is
+    /// answered by the same generation that built it.
+    generation: HistoryStepPackGeneration,
     template: Block,
     parent_header: BlockHeader,
     expected_start: ChainAccumulator,
@@ -97,6 +112,7 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
         end_accumulator: &ChainAccumulator,
     ) -> Result<(Block, HistoryStepBlockInput<TIER>), HistoryStepWitnessError> {
         let PreparedNativeHistoryStep {
+            generation,
             template,
             parent_header,
             expected_start,
@@ -124,7 +140,8 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
         if end_accumulator != &expected_end {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
         }
-        let input = HistoryStepBlockInput::try_new(
+        let input = HistoryStepBlockInput::try_new_in(
+            generation,
             start_accumulator,
             end_accumulator,
             components,
@@ -142,6 +159,7 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
         end_accumulator: &ChainAccumulator,
     ) -> Result<(Block, HistoryStepBlockInput<TIER>), HistoryStepWitnessError> {
         let PreparedNativeHistoryStep {
+            generation,
             mut template,
             parent_header,
             expected_start,
@@ -170,7 +188,8 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
         if end_accumulator != &expected_end {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
         }
-        let input = HistoryStepBlockInput::try_new(
+        let input = HistoryStepBlockInput::try_new_in(
+            generation,
             start_accumulator,
             end_accumulator,
             components,
@@ -193,10 +212,18 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
 
     pub fn user_page_count(&self) -> usize {
         usize::from(
-            jetsam_chain::validate_block_page_stream(&self.template.transactions)
-                .expect("prepared HistoryStep template has a canonical block body")
-                .page_count,
+            jetsam_chain::validate_block_page_stream_in(
+                &self.template.transactions,
+                self.generation,
+            )
+            .expect("prepared HistoryStep template has a canonical block body")
+            .page_count,
         )
+    }
+
+    /// The relation this witness was prepared under.
+    pub const fn generation(&self) -> HistoryStepPackGeneration {
+        self.generation
     }
 
     pub fn retained_witness_bytes(&self) -> usize {
@@ -217,6 +244,9 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
     ) -> Result<(Block, jetsam_recursive::BuiltHistoryStep, ChainAccumulator), HistoryStepWitnessError>
     {
         let Self {
+            // The generation is already sealed into `prepared_history_step`;
+            // nothing left to decide here is generation-dependent.
+            generation: _,
             template,
             parent_header,
             expected_start,
@@ -267,6 +297,7 @@ pub fn prepare_history_step_witness<const TIER: usize>(
         ghost_authorization,
     )?;
     let PreparedNativeHistoryStep {
+        generation,
         template,
         parent_header,
         expected_start,
@@ -282,7 +313,8 @@ pub fn prepare_history_step_witness<const TIER: usize>(
     let template_end = expected_start
         .advance(&parent_header, &template.header)
         .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
-    let current = HistoryStepBlockInput::try_new(
+    let current = HistoryStepBlockInput::try_new_in(
+        generation,
         &expected_start,
         &template_end,
         components,
@@ -292,6 +324,7 @@ pub fn prepare_history_step_witness<const TIER: usize>(
     )?;
     let prepared_history_step = prepare_history_step_for_pow(runtime, parent_terminal, current)?;
     Ok(PreparedHistoryStepWitness {
+        generation,
         template,
         parent_header,
         expected_start,
@@ -332,18 +365,29 @@ fn prepare_native_history_step<const TIER: usize>(
         return Err(HistoryStepWitnessError::TemplateNonceNotZero);
     }
 
+    // The start boundary is bound to the local headers in the form of the
+    // generation proving this template: one anchor at launch, two from v1.3.
     context
         .start_accumulator
-        .validate_local_header_boundary(context.parent_header, context.tx_epoch_anchor_header)
+        .validate_local_header_boundary_in(
+            context.generation,
+            context.parent_header,
+            context.tx_epoch_anchor_header,
+            context.previous_tx_epoch_anchor_header,
+        )
         .map_err(HistoryStepWitnessError::StartBoundary)?;
     validate_parent_state_boundary(context.parent_header, context.parent_state)?;
     validate_nonce_independent_block(&template, &context)?;
 
-    let components = build_history_step_components(&template, context.parent_state)?;
+    let components =
+        build_history_step_components(&template, context.parent_state, context.generation)?;
     let effective_pages = components.effective_page_count();
     let actual_tier =
-        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_pages)
-            .map(|class| class.page_capacity());
+        jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+            effective_pages,
+            context.generation,
+        )
+        .map(|class| class.page_capacity_in_generation(context.generation));
     if actual_tier != Some(TIER) {
         return Err(HistoryStepWitnessError::WrongTier {
             expected: TIER,
@@ -351,13 +395,15 @@ fn prepare_native_history_step<const TIER: usize>(
             user_pages: effective_pages,
         });
     }
-    let authorizations = prepare_history_step_authorizations::<TIER>(
+    let authorizations = prepare_history_step_authorizations_in::<TIER>(
+        context.generation,
         effective_pages,
         &components.authorization_inputs,
         live_authorization_proofs,
         ghost_authorization,
     )?;
     Ok(PreparedNativeHistoryStep {
+        generation: context.generation,
         template,
         parent_header: *context.parent_header,
         expected_start: context.start_accumulator.clone(),
@@ -410,19 +456,37 @@ fn validate_nonce_independent_block(
     validate_mandatory_coinbase(block, context.parent_header)?;
     jetsam_chain::consensus::checks::validate_block_slot_conflicts(&block.transactions)?;
     validate_tx_consensus(&block.transactions[0])?;
-    validate_block_page_stream(&block.transactions)
+    // The class this stream selects — and with it the per-class input, output
+    // and live-authorization capacities it is judged against — is the one of
+    // the relation proving this template, not of the compiled ladder.
+    validate_block_page_stream_in(&block.transactions, context.generation)
         .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
     let parent_block_id = jetsam_chain::hash_block_header(context.parent_header);
-    let user_epoch_anchor = if context
+    // The anchors this child's pages may bind are the ones the end boundary
+    // will carry: at an epoch edge the pair shifts by one — the derived
+    // parent id becomes current and the current anchor becomes the previous
+    // one. The launch relation consults only the current anchor.
+    let at_epoch_edge = context
         .start_accumulator
         .height
-        .is_multiple_of(jetsam_chain::consensus::params::TX_EPOCH_BLOCKS)
-    {
-        parent_block_id
+        .is_multiple_of(jetsam_chain::consensus::params::TX_EPOCH_BLOCKS);
+    let user_epoch_anchors = if at_epoch_edge {
+        AcceptedEpochAnchors {
+            current: parent_block_id,
+            previous: context.start_accumulator.epoch_anchor_id,
+        }
     } else {
-        context.start_accumulator.epoch_anchor_id
+        AcceptedEpochAnchors {
+            current: context.start_accumulator.epoch_anchor_id,
+            previous: context.start_accumulator.previous_epoch_anchor_id,
+        }
     };
-    validate_block_epoch_anchors(block, user_epoch_anchor, parent_block_id)?;
+    validate_block_epoch_anchors_in(
+        block,
+        user_epoch_anchors,
+        parent_block_id,
+        context.generation,
+    )?;
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(HistoryStepWitnessError::TransactionRootMismatch);
     }
@@ -432,8 +496,9 @@ fn validate_nonce_independent_block(
 fn build_history_step_components(
     block: &Block,
     parent_state: &ChainState,
+    generation: HistoryStepPackGeneration,
 ) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
-    let stream = validate_block_page_stream(&block.transactions)
+    let stream = validate_block_page_stream_in(&block.transactions, generation)
         .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
     let normalized_bodies = block
         .transactions
@@ -830,6 +895,149 @@ mod tests {
         assert_eq!(frontier.new_root, block.header.state_root);
         assert_eq!(block.header.active_slot_count, 1);
         assert_eq!(block.header.alloc_counter, 1);
+    }
+
+    /// One tx-bearing template at height 36 on an eight-bit state at its
+    /// expansion threshold; the user page binds `user_anchor`.
+    fn expansion_fixture(user_anchor: [u8; 32]) -> (Block, BlockHeader, ChainState) {
+        use jetsam_chain::consensus::fees::required_fee_for_tx_body;
+        use jetsam_chain::fri_state::SlotValue;
+        use jetsam_tx::{
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+        };
+
+        let owner = Address([0x31; 32]);
+        let occupied = (0..192u32)
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(
+                        100_000_000,
+                        u64::from(slot) + 1,
+                        owner.as_fields(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = ChainState::from_sparse_utxos(8, &occupied, occupied.len() as u64)
+            .expect("threshold state");
+        let parent_root = state.state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: parent_root,
+            tx_root: [0u8; 32],
+            timestamp: 1_000,
+            height: 35,
+            miner_address: Address([0x11; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: 8,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        };
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 0,
+            amount: 100_000_000,
+            creation_id: 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 220,
+            amount: 100_000_000,
+            owner,
+        };
+        let mut body = TxBody {
+            epoch_anchor: user_anchor,
+            fee: 0,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        };
+        body.fee = required_fee_for_tx_body(&body, parent.active_slot_count, parent.log_slots);
+        body.outputs[0].amount -= body.fee;
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[192; 18],
+            vec![Transaction::new(body)],
+            Address([0x22; 32]),
+            1_015,
+            GENESIS_TARGET,
+        )
+        .expect("expansion template");
+        let block = Block {
+            header: template.to_pow_header(0),
+            transactions: template.all_txs(),
+        };
+        (block, parent, state)
+    }
+
+    /// The witness asks the generation which anchors the template's pages
+    /// may bind. A page bound to the previous epoch's anchor is refused by
+    /// the launch relation and accepted by v1.3 — the same template, judged
+    /// by the generation the context names, and by nothing else.
+    #[test]
+    fn a_page_bound_to_the_previous_anchor_is_refused_by_the_launch_relation_and_accepted_by_v1_3()
+    {
+        use jetsam_chain::block_header::semantic_header_id;
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        let current = [0x51u8; 32];
+        let previous = [0x62u8; 32];
+        for (user_anchor, launch_accepts) in [(current, true), (previous, false)] {
+            let (block, parent, state) = expansion_fixture(user_anchor);
+            // Height 35 is not an epoch boundary: the child's pages bind the
+            // anchors the start boundary carries, not the parent id.
+            let start = ChainAccumulator {
+                height: parent.height,
+                tip_semantic_id: semantic_header_id(&parent),
+                state_root: parent.state_root,
+                log_slots: parent.log_slots,
+                active_slot_count: parent.active_slot_count,
+                alloc_counter: parent.alloc_counter,
+                epoch_anchor_id: current,
+                previous_epoch_anchor_id: previous,
+            };
+            let asert_anchor = AnchorInfo {
+                anchor_height: 0,
+                anchor_timestamp: 0,
+                anchor_target: GENESIS_TARGET,
+            };
+            for (generation, accepts) in [(V1, launch_accepts), (V1_3, true)] {
+                let context = HistoryStepPreparationContext {
+                    parent_header: &parent,
+                    tx_epoch_anchor_header: &parent,
+                    parent_state: &state,
+                    start_accumulator: &start,
+                    previous_timestamps: &[],
+                    finalized_active_counts: &[],
+                    asert_anchor: &asert_anchor,
+                    local_time: 1_015,
+                    generation,
+                    previous_tx_epoch_anchor_header: None,
+                };
+                let verdict = validate_nonce_independent_block(&block, &context);
+                if accepts {
+                    verdict.unwrap_or_else(|error| {
+                        panic!("{generation:?} must accept anchor {user_anchor:?}: {error}")
+                    });
+                } else {
+                    assert!(
+                        matches!(
+                            verdict,
+                            Err(HistoryStepWitnessError::Consensus(
+                                ConsensusError::BadEpochAnchor
+                            ))
+                        ),
+                        "{generation:?} must refuse anchor {user_anchor:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

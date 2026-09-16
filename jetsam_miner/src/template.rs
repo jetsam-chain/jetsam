@@ -23,9 +23,10 @@ use std::collections::{HashMap, HashSet};
 use jetsam_chain::block::Block;
 use jetsam_chain::block_header::BlockHeader;
 use jetsam_chain::consensus::difficulty::next_target;
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::pow::block_id;
 use jetsam_chain::consensus::template::BlockTemplate as ChainTemplate;
-use jetsam_chain::consensus::AnchorInfo;
+use jetsam_chain::consensus::{AcceptedEpochAnchors, AnchorInfo};
 use jetsam_chain::state::ChainState;
 use jetsam_chain::storage::{MdbxChainContext, MdbxContextError, MdbxStore};
 use jetsam_mempool::AsyncMempool;
@@ -75,6 +76,9 @@ pub struct BlockTemplate {
     /// distinct from the anchor selected for this template's child
     /// transactions at a 144-block boundary.
     pub parent_tx_epoch_anchor_header: BlockHeader,
+    /// The older anchor of the parent boundary, present exactly when the
+    /// generation proving this template binds two anchors.
+    pub parent_previous_tx_epoch_anchor_header: Option<BlockHeader>,
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
     /// One-shot post-state/undo capability minted by the same canonical
     /// builder that fixed `inner.state_root`.
@@ -120,6 +124,11 @@ pub struct TemplateChainSnapshot {
     pub parent_tx_epoch_anchor_header: BlockHeader,
     /// Anchor that user transactions in the next child block must bind.
     pub child_tx_epoch_anchor_header: BlockHeader,
+    /// The older anchor of the parent boundary and the older anchor the
+    /// child's pages may also bind; both present exactly when the child's
+    /// generation binds two anchors.
+    pub parent_previous_tx_epoch_anchor_header: Option<BlockHeader>,
+    pub child_previous_tx_epoch_anchor_header: Option<BlockHeader>,
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
     store: MdbxStore,
 }
@@ -128,13 +137,42 @@ pub struct TemplateChainSnapshot {
 struct TemplateEpochAnchorHeights {
     parent_terminal: u64,
     child_transactions: u64,
+    /// The older anchor of the parent boundary, in the form of the child's
+    /// generation. `None` under a generation that binds one anchor.
+    parent_previous_terminal: Option<u64>,
+    /// The older anchor the child's user pages may also bind. `None` under a
+    /// generation that binds one anchor.
+    child_previous_transactions: Option<u64>,
 }
 
 fn template_epoch_anchor_heights(parent_height: u64) -> Option<TemplateEpochAnchorHeights> {
     let child_height = parent_height.checked_add(1)?;
+    template_epoch_anchor_heights_in(
+        HistoryStepPackGeneration::at_height(child_height),
+        parent_height,
+    )
+}
+
+/// The anchor headers a template needs, under the generation proving the
+/// child. The generation is the child's, for both anchors of the *parent*
+/// boundary as well: the start boundary a template consumes is in the form
+/// of the relation proving it, which is what the v1.3 verifier's recursion
+/// root — read off headers at the block before the fork — is built from.
+fn template_epoch_anchor_heights_in(
+    child_generation: HistoryStepPackGeneration,
+    parent_height: u64,
+) -> Option<TemplateEpochAnchorHeights> {
+    let child_height = parent_height.checked_add(1)?;
+    let binds_two = child_generation.binds_two_epoch_anchors();
     Some(TemplateEpochAnchorHeights {
         parent_terminal: jetsam_chain::consensus::tx_epoch_anchor_height_for_child(parent_height),
         child_transactions: jetsam_chain::consensus::tx_epoch_anchor_height_for_child(child_height),
+        parent_previous_terminal: binds_two.then(|| {
+            jetsam_chain::consensus::previous_tx_epoch_anchor_height_for_child(parent_height)
+        }),
+        child_previous_transactions: binds_two.then(|| {
+            jetsam_chain::consensus::previous_tx_epoch_anchor_height_for_child(child_height)
+        }),
     })
 }
 
@@ -158,6 +196,21 @@ impl TemplateChainSnapshot {
                         "child transaction epoch anchor header missing",
                     ))?
             };
+        let parent_previous_tx_epoch_anchor_header = match anchor_heights.parent_previous_terminal {
+            Some(height) => Some(ctx.get_header_from_store(height)?.ok_or(
+                MdbxContextError::Corrupt(
+                    "parent terminal previous transaction epoch anchor header missing",
+                ),
+            )?),
+            None => None,
+        };
+        let child_previous_tx_epoch_anchor_header = match anchor_heights.child_previous_transactions
+        {
+            Some(height) => Some(ctx.get_header_from_store(height)?.ok_or(
+                MdbxContextError::Corrupt("child previous transaction epoch anchor header missing"),
+            )?),
+            None => None,
+        };
         let parent_history_step_terminal_bytes = if parent.height == 0 {
             None
         } else {
@@ -182,6 +235,8 @@ impl TemplateChainSnapshot {
                 ))?,
             parent_tx_epoch_anchor_header,
             child_tx_epoch_anchor_header,
+            parent_previous_tx_epoch_anchor_header,
+            child_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             store: ctx.store.clone(),
         })
@@ -343,14 +398,31 @@ impl TemplateBuilder {
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;
+        // The child's generation decides which anchors its pages may bind:
+        // the one current anchor at launch, the current or the previous one
+        // from v1.3. The pair is only consulted through the generation.
+        let child_generation = HistoryStepPackGeneration::at_height(parent.height + 1);
         let user_epoch_anchor = block_id(&snapshot.child_tx_epoch_anchor_header);
+        let user_epoch_anchors = AcceptedEpochAnchors {
+            current: user_epoch_anchor,
+            previous: snapshot
+                .child_previous_tx_epoch_anchor_header
+                .as_ref()
+                .map(block_id)
+                .unwrap_or(user_epoch_anchor),
+        };
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
         // while cloning only the authorization bundles selected for this block.
-        let entries = self
-            .mempool
-            .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
-            .await;
+        let entries = if child_generation.binds_two_epoch_anchors() {
+            self.mempool
+                .select_for_block_at_anchors(max_user_pages, user_epoch_anchors, child_generation)
+                .await
+        } else {
+            self.mempool
+                .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
+                .await
+        };
         // Keep each authorization paired with its indivisible logical group;
         // flatten only the public pages passed into the chain template.
         let (authorization_bytes, groups): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
@@ -364,9 +436,9 @@ impl TemplateBuilder {
             .into_iter()
             .zip(groups)
             .filter(|(_, (_, pages))| {
-                pages
-                    .first()
-                    .is_some_and(|page| page.body.epoch_anchor == user_epoch_anchor)
+                pages.first().is_some_and(|page| {
+                    user_epoch_anchors.accepts(page.body.epoch_anchor, child_generation)
+                })
             })
             .unzip();
         let mut proof_by_hash: HashMap<jetsam_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
@@ -443,6 +515,7 @@ impl TemplateBuilder {
             previous_timestamps: snapshot.prev_timestamps,
             asert_anchor: snapshot.anchor,
             parent_tx_epoch_anchor_header: snapshot.parent_tx_epoch_anchor_header,
+            parent_previous_tx_epoch_anchor_header: snapshot.parent_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes: snapshot.parent_history_step_terminal_bytes,
             prepared_state_commit,
         })
@@ -512,11 +585,53 @@ mod tests {
                 Some(TemplateEpochAnchorHeights {
                     parent_terminal,
                     child_transactions,
+                    parent_previous_terminal: None,
+                    child_previous_transactions: None,
                 }),
                 "parent height {parent_height}",
             );
         }
         assert_eq!(template_epoch_anchor_heights(u64::MAX), None);
+    }
+
+    /// The template asks the generation of the *child* which anchors it
+    /// needs: under the launch generation the two it always needed, and
+    /// nothing else; under v1.3 also the older anchor of the parent boundary
+    /// (in the form the v1.3 relation consumes) and the older anchor the
+    /// child's pages may bind. With the clock dormant, every parent height
+    /// answers the launch pair.
+    #[test]
+    fn the_template_asks_the_childs_generation_for_its_anchors() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        let e = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        for parent_height in [0, e - 1, e, 2 * e, 2 * e + 1, 3 * e + 1] {
+            let launch = template_epoch_anchor_heights_in(V1, parent_height).unwrap();
+            assert_eq!(template_epoch_anchor_heights(parent_height), Some(launch));
+            assert_eq!(launch.parent_previous_terminal, None);
+            assert_eq!(launch.child_previous_transactions, None);
+
+            let v1_3 = template_epoch_anchor_heights_in(V1_3, parent_height).unwrap();
+            assert_eq!(v1_3.parent_terminal, launch.parent_terminal);
+            assert_eq!(v1_3.child_transactions, launch.child_transactions);
+            assert_eq!(
+                v1_3.parent_previous_terminal,
+                Some(launch.parent_terminal.saturating_sub(e)),
+                "parent height {parent_height}"
+            );
+            assert_eq!(
+                v1_3.child_previous_transactions,
+                Some(launch.child_transactions.saturating_sub(e)),
+                "parent height {parent_height}"
+            );
+        }
+        // Past two epochs the two v1.3 anchors name distinct headers.
+        let v1_3 = template_epoch_anchor_heights_in(V1_3, 3 * e + 1).unwrap();
+        assert_eq!(v1_3.parent_terminal, 3 * e);
+        assert_eq!(v1_3.parent_previous_terminal, Some(2 * e));
+        assert_eq!(v1_3.child_transactions, 3 * e);
+        assert_eq!(v1_3.child_previous_transactions, Some(2 * e));
+        assert_eq!(template_epoch_anchor_heights_in(V1_3, u64::MAX), None);
     }
 
     #[test]
