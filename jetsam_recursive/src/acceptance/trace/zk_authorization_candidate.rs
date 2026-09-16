@@ -671,6 +671,7 @@ impl SelectedZkBlockRegionBinding {
 /// finalization seal, or partially bound sidecar is returned.
 pub(in crate::acceptance) fn bind_selected_zk_block_region(
     b: &mut FieldR1csBuilder,
+    tier: usize,
     canonical: CanonicalSelectedZkAuthorizationCapability,
     prepared: PreparedSelectedZkAuthorizations,
     exact_state: &ExactStateRegionData,
@@ -706,9 +707,9 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
         .into_canonical_and_raw_draft()
         .expect("selected raw authorization draft");
     let allocation =
-        allocate_selected_zk_auth_pcs_region(b, authorization, exact_state, tx_root, spine)
+        allocate_selected_zk_auth_pcs_region(b, tier, authorization, exact_state, tx_root, spine)
             .expect("selected authorization/Meta allocation");
-    bind_selected_zk_authorization_all_tiles_trace(b, allocation.draft(), &canonical)
+    bind_selected_zk_authorization_all_tiles_trace(b, tier, allocation.draft(), &canonical)
         .expect("selected all-tiles binding");
     let (draft, paired) = allocation.into_parts();
     SelectedZkBlockRegionBinding { draft, paired }
@@ -814,6 +815,7 @@ fn materialize_selected_zk_authorization_statements(
 /// slice. It returns no token, draft or preparation.
 fn bind_selected_zk_authorization_all_tiles_trace(
     b: &mut FieldR1csBuilder,
+    tier: usize,
     draft: &SelectedZkBlockRegionDraft,
     canonical: &CanonicalSelectedZkAuthorizationCapability,
 ) -> Result<(), ZkAuthorizationAllTilesTraceError> {
@@ -855,8 +857,11 @@ fn bind_selected_zk_authorization_all_tiles_trace(
         .expect("selected Meta-A child has eight committed slices");
     let meta_b = *vk.meta_b().slices();
 
+    // The PAD range starts at the block's own page capacity, which the tiling
+    // does not know: 32 slots is the tiling of both small classes and they
+    // hold 24 and 25 pages.
     let ghost_statement = canonical_selected_zk_ghost_statement();
-    for index in geometry.tier..geometry.auth_tiles {
+    for index in tier..geometry.auth_tiles {
         assert_eq!(canonical.slot(index).native_statement(), ghost_statement);
     }
     let fallback = canonical
@@ -893,7 +898,7 @@ fn bind_selected_zk_authorization_all_tiles_trace(
                     assert_eq!(slot.native_statement(), ghost_statement);
                 }
                 CanonicalSelectedZkAuthorizationSlotKind::Pad => {
-                    assert!(index >= geometry.tier && index < geometry.auth_tiles);
+                    assert!(index >= tier && index < geometry.auth_tiles);
                     assert_eq!(live, F128::ZERO);
                     assert!(slot.body_aliases().is_none());
                     assert_eq!(slot.native_statement(), ghost_statement);

@@ -254,7 +254,13 @@ pub fn bind_paged_spend_stream(
     arithmetic: &[UserPublicArithmeticTrace],
 ) -> PagedSpendBlockTrace {
     let tier = spines.len();
-    assert!(matches!(tier, 25 | 255));
+    // Any class either relation knows: 25 and 255 at launch, 24 from v1.3.
+    // The launch small class stays for as long as a pre-fork block can be
+    // proved — which is for ever.
+    assert!(
+        crate::region_sidecar::selected_zk_block_geometry(tier).is_some(),
+        "page stream tier {tier} is not a canonical proof class"
+    );
     assert_eq!(page_hashes.len(), tier);
     assert_eq!(page_live.len(), tier);
     assert_eq!(surfaces.len(), tier);

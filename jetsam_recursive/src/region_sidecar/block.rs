@@ -12,6 +12,7 @@
 //! nine-instance ragged walk on Block's derived child channel. Terminal PCS
 //! claims are verifier output and never appear in the serialized proof.
 
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_fri_binius::zk_capsule_pcs::{
     ZK_CAPSULE_PCS_MID_PATH_DEPTH, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
 };
@@ -110,6 +111,38 @@ pub(crate) struct SelectedZkBlockGeometry {
 
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
     let geometry = match tier {
+        // JETSAM CHANGE (v1.3): the small class holds 24 pages, not 25. Every
+        // packing field of the 24 arm is the 25 arm's unchanged — 24 and 25
+        // land in the same authorization tiling, the same transaction log and
+        // the same exact-state region, because `next_pow2(4 * 241)` and
+        // `next_pow2(4 * 251)` are both 2^10. Only the two slot capacities
+        // shrink, which is why the terminal keeps its size and the class
+        // gives back circuit rows.
+        //
+        // The 25 arm stays here, and must stay here, for as long as any block
+        // below the v1.3 activation height can be verified — which is for
+        // ever.
+        24 => SelectedZkBlockGeometry {
+            tier: 24,
+            auth_tiles: 32,
+            tx_log: 5,
+            owner_w_log: 12,
+            main_w_log: 13,
+            wallet_a_w_log: 16,
+            wallet_b_w_log: 15,
+            exact_state_region_log: 10,
+            spine_cap_log: 0,
+            meta_a_w_log: 12,
+            meta_b_w_log: 16,
+            meta_b_block_log: 11,
+            touched_capacity: 241,
+            segment_capacity: 241,
+            paired_caps_per_block: [8, 8],
+            paired_bases: [0, 512],
+            tx_root_base: 1_024,
+            tx_root_paths_per_block: 8,
+            wallet_overflow_bases: [1_152, 1_162],
+        },
         25 => SelectedZkBlockGeometry {
             tier: 25,
             auth_tiles: 32,
@@ -157,13 +190,126 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
     Some(geometry)
 }
 
+/// Every class certificate this binary knows, both generations, in ladder
+/// order and without repeats: 25, 255, then 24.
+pub(crate) fn known_selected_zk_block_geometries() -> impl Iterator<Item = SelectedZkBlockGeometry>
+{
+    let mut seen: Vec<usize> = Vec::with_capacity(3);
+    [
+        HistoryStepPackGeneration::V1,
+        HistoryStepPackGeneration::V1_3,
+    ]
+    .into_iter()
+    .flat_map(|generation| generation.tiers())
+    .filter(move |tier| {
+        let fresh = !seen.contains(tier);
+        if fresh {
+            seen.push(*tier);
+        }
+        fresh
+    })
+    .filter_map(selected_zk_block_geometry)
+}
+
+/// The packing an authorization tiling determines — and nothing else.
+///
+/// The two small classes, 25 at launch and 24 from v1.3, share one tiling of
+/// 32 slots and one packing in every field below. They differ in exactly
+/// three: the page capacity itself and the two slot capacities. A lookup by
+/// tile count therefore *cannot* answer those three, and this type exists so
+/// that it cannot be asked to. A caller that needs a class capacity holds the
+/// tier and calls [`selected_zk_block_geometry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedZkAuthTiling {
+    pub auth_tiles: usize,
+    pub tx_log: usize,
+    pub owner_w_log: usize,
+    pub main_w_log: usize,
+    pub wallet_a_w_log: usize,
+    pub wallet_b_w_log: usize,
+    pub exact_state_region_log: usize,
+    pub spine_cap_log: usize,
+    pub meta_a_w_log: usize,
+    pub meta_b_w_log: usize,
+    pub meta_b_block_log: usize,
+    pub wallet_overflow_bases: [usize; 2],
+    pub paired_caps_per_block: [usize; 2],
+    pub paired_bases: [usize; 2],
+    pub tx_root_base: usize,
+    pub tx_root_paths_per_block: usize,
+}
+
+impl SelectedZkAuthTiling {
+    const fn of(geometry: &SelectedZkBlockGeometry) -> Self {
+        Self {
+            auth_tiles: geometry.auth_tiles,
+            tx_log: geometry.tx_log,
+            owner_w_log: geometry.owner_w_log,
+            main_w_log: geometry.main_w_log,
+            wallet_a_w_log: geometry.wallet_a_w_log,
+            wallet_b_w_log: geometry.wallet_b_w_log,
+            exact_state_region_log: geometry.exact_state_region_log,
+            spine_cap_log: geometry.spine_cap_log,
+            meta_a_w_log: geometry.meta_a_w_log,
+            meta_b_w_log: geometry.meta_b_w_log,
+            meta_b_block_log: geometry.meta_b_block_log,
+            wallet_overflow_bases: geometry.wallet_overflow_bases,
+            paired_caps_per_block: geometry.paired_caps_per_block,
+            paired_bases: geometry.paired_bases,
+            tx_root_base: geometry.tx_root_base,
+            tx_root_paths_per_block: geometry.tx_root_paths_per_block,
+        }
+    }
+}
+
 pub(crate) fn selected_zk_block_geometry_for_auth_tiles(
     auth_tiles: usize,
-) -> Option<SelectedZkBlockGeometry> {
-    jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
-        .into_iter()
-        .filter_map(selected_zk_block_geometry)
+) -> Option<SelectedZkAuthTiling> {
+    known_selected_zk_block_geometries()
         .find(|geometry| geometry.auth_tiles == auth_tiles)
+        .map(|geometry| SelectedZkAuthTiling::of(&geometry))
+}
+
+#[cfg(test)]
+mod selected_zk_block_geometry_tests {
+    use super::*;
+
+    /// The two small classes differ in exactly the three fields a tiling
+    /// cannot answer, and the tiling lookup answers the same packing for
+    /// both.
+    #[test]
+    fn the_two_small_classes_share_one_tiling_and_differ_in_three_fields() {
+        let launch = selected_zk_block_geometry(25).unwrap();
+        let current = selected_zk_block_geometry(24).unwrap();
+        assert_eq!(launch.tier, 25);
+        assert_eq!(current.tier, 24);
+        assert_eq!(launch.touched_capacity, 251);
+        assert_eq!(current.touched_capacity, 241);
+        assert_eq!(launch.segment_capacity, 251);
+        assert_eq!(current.segment_capacity, 241);
+        assert_eq!(
+            SelectedZkAuthTiling::of(&launch),
+            SelectedZkAuthTiling::of(&current)
+        );
+        assert_eq!(
+            selected_zk_block_geometry_for_auth_tiles(32),
+            Some(SelectedZkAuthTiling::of(&launch))
+        );
+        assert_eq!(
+            selected_zk_block_geometry_for_auth_tiles(256),
+            Some(SelectedZkAuthTiling::of(&selected_zk_block_geometry(255).unwrap()))
+        );
+        assert_eq!(selected_zk_block_geometry_for_auth_tiles(64), None);
+        // Classes outside either ladder have no certificate at all.
+        assert_eq!(selected_zk_block_geometry(23), None);
+        assert_eq!(selected_zk_block_geometry(26), None);
+        assert_eq!(
+            known_selected_zk_block_geometries()
+                .map(|geometry| geometry.tier)
+                .collect::<Vec<_>>(),
+            [25, 255, 24]
+        );
+    }
 }
 
 const SELECTED_ZK_AUTH_QUERY_LOG: usize = 6;
@@ -414,9 +560,10 @@ impl BlockRegionSidecarVk {
             } => tx_log,
             _ => return Err(RegionSidecarError::UnsupportedVkShape),
         };
-        let geometry = jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
-            .into_iter()
-            .filter_map(selected_zk_block_geometry)
+        // Every field read below is shared by the two small classes, so the
+        // first certificate with this transaction log — the launch one —
+        // answers for both.
+        let geometry = known_selected_zk_block_geometries()
             .find(|geometry| geometry.tx_log == tx_log)
             .ok_or(RegionSidecarError::UnsupportedVkShape)?;
 

@@ -393,13 +393,22 @@ impl HistoryStepRuntimeParts {
                 .map(|transcript| transcript.r_prev().clone())
                 .collect(),
         )?;
-        let parent_recursion_vk = geometry
-            .canonical_vk(&crate::acceptance::history_step_bank::history_step_bank_io_spec())?;
+        // Which relation this pack belongs to is read out of the pack, not
+        // configured beside it: the recording layouts it carries are the
+        // fixed point of exactly one generation's derivation.
+        let generation = super::relation::discover_history_step_pack_generation(
+            &direct_block_vks,
+            &parent_transcripts,
+        )?;
+        let parent_recursion_vk = geometry.canonical_vk(
+            &crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation),
+        )?;
         Ok(HistoryStepRuntimeParts::from_canonical_geometry(
             parent_recursion_vk,
             direct_block_vks,
             parent_transcripts,
             geometry,
+            generation,
         ))
     }
 }

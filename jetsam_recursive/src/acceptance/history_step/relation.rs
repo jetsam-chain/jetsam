@@ -13,16 +13,18 @@
 use super::gated_recorder::BaseSelectableParentRecorder;
 use super::*;
 use crate::acceptance::history_step_bank::{
-    block_acc_lanes, canonical_history_step_class_id, canonical_history_step_pcs_params,
-    canonical_history_step_shape, history_step_bank_base_output_io,
+    block_acc_lanes_for, canonical_history_step_class_id_in, canonical_history_step_pcs_params,
+    canonical_history_step_shape, history_step_bank_base_output_io_rooted,
+    history_step_bank_recursion_root_lanes,
     history_step_bank_block_accumulator, history_step_bank_post_commit_digest,
     history_step_bank_tip_class, observe_history_step_bank_fold_route_trace,
     route_carry_and_fold_history_step_lane_canonical, AcceptedHistoryStepBankTip,
     CanonicalHistoryStepClassId, HistoryStepBankEntryPins, HistoryStepBankError,
-    PendingHistoryStepBankDecision, PinnedHistoryStepClassBank, ACC_LANES,
+    PendingHistoryStepBankDecision, PinnedHistoryStepClassBank, RecursionRoot,
     HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN, HISTORY_STEP_CLASS_COUNT,
     HISTORY_STEP_TIER_SLOT_COUNT,
 };
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_ivc_core::deep_chain::schedule::TranscriptOp;
 use jetsam_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
 pub const HISTORY_STEP_WIRE_VERSION: u8 = 4;
@@ -99,6 +101,21 @@ pub enum HistoryStepError {
         tier: usize,
         used: usize,
         limit: usize,
+    },
+    /// The terminal is rooted on a boundary the evaluated branch does not
+    /// carry: a valid terminal of another branch at the root height, not a
+    /// malformed one.
+    ForeignRecursionRoot,
+    /// A caller asked for a recursion-root check against a generation whose
+    /// relation pins its root inside the matrices. The sender is not at
+    /// fault; the call is.
+    RootlessGeneration,
+    /// The frame is a well-formed terminal of the other pack generation: its
+    /// public IO is the other relation's width. Not a malformed frame, and
+    /// not the sender's fault.
+    ForeignIoLayout {
+        expected: usize,
+        actual: usize,
     },
 }
 
@@ -177,6 +194,16 @@ impl core::fmt::Display for HistoryStepError {
             Self::ShapeOverflow { tier, used, limit } => {
                 write!(f, "HistoryStep B{tier} uses {used} rows, limit {limit}")
             }
+            Self::ForeignRecursionRoot => f.write_str(
+                "HistoryStep terminal is rooted on a boundary this branch does not carry",
+            ),
+            Self::RootlessGeneration => f.write_str(
+                "HistoryStep pack generation carries no recursion root to check",
+            ),
+            Self::ForeignIoLayout { expected, actual } => write!(
+                f,
+                "HistoryStep public IO is {actual} lanes, this pack generation uses {expected}",
+            ),
         }
     }
 }
@@ -244,6 +271,7 @@ pub struct HistoryStepRuntimeParts {
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
     parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
     parent_geometry: HistoryStepParentGeometry,
+    generation: HistoryStepPackGeneration,
 }
 
 impl HistoryStepRuntimeParts {
@@ -252,16 +280,43 @@ impl HistoryStepRuntimeParts {
         direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
         parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
         parent_geometry: HistoryStepParentGeometry,
+        generation: HistoryStepPackGeneration,
     ) -> Self {
         Self {
             parent_recursion_vk,
             direct_block_vks,
             parent_transcripts,
             parent_geometry,
+            generation,
         }
     }
 
+    /// [`Self::new_in`] under the launch generation.
     pub fn new(
+        parent_recursion_vk: LinkRegionSidecarVk,
+        direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+        parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    ) -> Result<Self, HistoryStepError> {
+        Self::new_in(
+            HistoryStepPackGeneration::V1,
+            parent_recursion_vk,
+            direct_block_vks,
+            parent_transcripts,
+        )
+    }
+
+    /// Build runtime parts for one named relation.
+    ///
+    /// The generation is an input, not a guess. It cannot be recovered from
+    /// the parent recursion VK: that VK's transcript digest is taken over the
+    /// public-IO *witness slice*, and both relations' lengths — 216 lanes and
+    /// 232 — land in the same power-of-two bucket, so the two canonical VKs
+    /// are indistinguishable by digest. What does distinguish them is the
+    /// `[R]_prev` recording layout, wider under v1.3 because the parent
+    /// replay absorbs sixteen more public-IO lanes;
+    /// [`discover_history_step_pack_generation`] reads a pack that way.
+    pub fn new_in(
+        generation: HistoryStepPackGeneration,
         parent_recursion_vk: LinkRegionSidecarVk,
         direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
         parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
@@ -285,17 +340,16 @@ impl HistoryStepRuntimeParts {
                 .collect(),
         )?;
         if geometry
-            .canonical_vk(&crate::acceptance::history_step_bank::history_step_bank_io_spec())?
+            .canonical_vk(
+                &crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation),
+            )?
             .transcript_digest()
             != parent_recursion_vk.transcript_digest()
         {
             return Err(HistoryStepError::RuntimeParentVk);
         }
         for (slot, vk) in direct_block_vks.iter().enumerate() {
-            if crate::region_sidecar::selected_zk_block_geometry(
-                jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[slot],
-            )
-            .is_none()
+            if crate::region_sidecar::selected_zk_block_geometry(generation.tiers()[slot]).is_none()
                 || vk.version() != crate::region_sidecar::BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
             {
                 return Err(HistoryStepError::RuntimeBlockVk(slot));
@@ -306,7 +360,13 @@ impl HistoryStepRuntimeParts {
             direct_block_vks,
             parent_transcripts,
             parent_geometry: geometry,
+            generation,
         })
+    }
+
+    /// The relation generation these parts were derived under.
+    pub const fn generation(&self) -> HistoryStepPackGeneration {
+        self.generation
     }
 
     pub fn parent_recursion_vk(&self) -> &LinkRegionSidecarVk {
@@ -333,7 +393,8 @@ impl HistoryStepRuntimeParts {
         }
         let mut direct_block_vks = self.direct_block_vks.clone();
         direct_block_vks[slot] = vk;
-        Self::new(
+        Self::new_in(
+            self.generation,
             self.parent_recursion_vk.clone(),
             direct_block_vks,
             self.parent_transcripts.clone(),
@@ -348,7 +409,8 @@ pub fn pin_history_step_class_bank(
     matrix_digests: [[u8; 32]; HISTORY_STEP_CLASS_COUNT],
     parts: &HistoryStepRuntimeParts,
 ) -> Result<PinnedHistoryStepClassBank, HistoryStepError> {
-    let spec = crate::acceptance::history_step_bank::history_step_bank_io_spec();
+    let spec =
+        crate::acceptance::history_step_bank::history_step_bank_io_spec_for(parts.generation);
     let parent_recursion_vk_digest = parts.parent_recursion_vk.transcript_digest();
     let pins = std::array::from_fn(|index| {
         let class_id = CanonicalHistoryStepClassId::from_index(index)
@@ -375,7 +437,7 @@ pub fn pin_history_step_class_bank(
             ),
         }
     });
-    PinnedHistoryStepClassBank::validate(pins).map_err(Into::into)
+    PinnedHistoryStepClassBank::validate_for(parts.generation, pins).map_err(Into::into)
 }
 
 struct RejectingHistoryStepMatrixSource;
@@ -396,7 +458,17 @@ impl HistoryStepMatrixSource for RejectingHistoryStepMatrixSource {
 pub fn derive_history_step_direct_block_vk<const TIER: usize>(
     current: HistoryStepBlockInput<TIER>,
 ) -> Result<BlockRegionSidecarVk, HistoryStepError> {
-    if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none() {
+    derive_history_step_direct_block_vk_in(HistoryStepPackGeneration::V1, current)
+}
+
+/// [`derive_history_step_direct_block_vk`] under `generation`'s relation.
+pub fn derive_history_step_direct_block_vk_in<const TIER: usize>(
+    generation: HistoryStepPackGeneration,
+    current: HistoryStepBlockInput<TIER>,
+) -> Result<BlockRegionSidecarVk, HistoryStepError> {
+    if !generation.tiers().contains(&TIER)
+        || crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
+    {
         return Err(HistoryStepError::InvalidClass);
     }
     let HistoryStepBlockInput {
@@ -412,6 +484,7 @@ pub fn derive_history_step_direct_block_vk<const TIER: usize>(
     let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
     let assembly = build_block_slots_selected_zk(
         &mut builder,
+        generation,
         &start_accumulator,
         &end_accumulator,
         &components,
@@ -443,6 +516,14 @@ fn history_step_query_lane_count(params: &PcsParams) -> usize {
 pub fn derive_history_step_runtime_parts(
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
 ) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
+    derive_history_step_runtime_parts_in(HistoryStepPackGeneration::V1, direct_block_vks)
+}
+
+/// [`derive_history_step_runtime_parts`] under `generation`'s relation.
+pub fn derive_history_step_runtime_parts_in(
+    generation: HistoryStepPackGeneration,
+    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
     let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
         canonical_history_step_pcs_params(
             CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
@@ -454,75 +535,150 @@ pub fn derive_history_step_runtime_parts(
         std::array::from_fn(|_| placeholder_history_step_recording_layout(1usize << 14));
 
     for _ in 0..16 {
-        let geometry = HistoryStepParentGeometry::new(
+        let pass = history_step_runtime_parts_pass(
+            generation,
             &parent_params,
-            child_layouts.to_vec(),
-            r_prev_layouts.to_vec(),
+            &direct_block_vks,
+            &child_layouts,
+            &r_prev_layouts,
         )?;
-        let parent_recursion_vk = geometry
-            .canonical_vk(&crate::acceptance::history_step_bank::history_step_bank_io_spec())?;
-        let transcripts = std::array::from_fn(|slot| {
-            HistoryStepParentTranscriptLayout::new(
-                child_layouts[slot].clone(),
-                r_prev_layouts[slot].clone(),
-            )
-        });
-        let parts = HistoryStepRuntimeParts::new(
-            parent_recursion_vk,
-            direct_block_vks.clone(),
-            transcripts,
-        )?;
-        let bank = pin_history_step_class_bank([[0u8; 32]; HISTORY_STEP_CLASS_COUNT], &parts)?;
-        let runtime = HistoryStepRuntime::new(
-            bank,
-            Box::new(RejectingHistoryStepMatrixSource),
-            parts.clone(),
-        )?;
-        let mut derived_children = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
-        let mut derived_r_prev = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
-        for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
-            let class_id =
-                CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
-            let entry = runtime.bank().entry(class_id);
-            let (field_proof, commitment_root) =
-                shape_only_field_r1cs_proof_c1(&entry.shape(), entry.pcs_params());
-            let envelope = HistoryStepProof {
-                field_proof,
-                commitment: Commitment {
-                    root: commitment_root,
-                    params: entry.pcs_params().clone(),
-                },
-                io: vec![F128::ZERO; runtime.bank().spec().io_len],
-                sidecar: shape_only_joint_c1_region_sidecar_proof(
-                    runtime.parent_recursion_vk(),
-                    runtime
-                        .direct_block_vk(slot)
-                        .ok_or(HistoryStepError::RuntimeBlockVk(slot))?,
-                    entry.shape().m,
-                )?,
-            };
-            let complete = run_scratch_parent_recording_pass(
-                &runtime,
-                class_id,
-                &envelope,
-                &entry.matrix_digest(),
-                &entry.post_commit_digest(),
-            )?;
-            let child = complete.child.ok_or(HistoryStepError::ParentRecording)?;
-            derived_children.push(child.layout);
-            derived_r_prev.push(complete.r_prev.layout);
+        if pass.derived_children == child_layouts && pass.derived_r_prev == r_prev_layouts {
+            return Ok(pass.parts);
         }
-        let derived_children: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = derived_children
+        child_layouts = pass.derived_children;
+        r_prev_layouts = pass.derived_r_prev;
+    }
+    Err(HistoryStepError::RuntimeLayout)
+}
+
+struct HistoryStepRuntimePartsPass {
+    parts: HistoryStepRuntimeParts,
+    derived_children: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    derived_r_prev: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+}
+
+/// One round of the transcript fixed point: assume these recording layouts,
+/// build the runtime they imply under `generation`, and record what the
+/// parent replay actually emits.
+///
+/// A converged pack is a fixed point of this map, and the map depends on the
+/// generation — the parent replay absorbs the parent public IO, which is 216
+/// lanes under the launch relation and 232 under v1.3. That is what makes a
+/// single round enough to tell which relation a pack was frozen for.
+fn history_step_runtime_parts_pass(
+    generation: HistoryStepPackGeneration,
+    parent_params: &[PcsParams; HISTORY_STEP_TIER_SLOT_COUNT],
+    direct_block_vks: &[BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    child_layouts: &[DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    r_prev_layouts: &[DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+) -> Result<HistoryStepRuntimePartsPass, HistoryStepError> {
+    let geometry = HistoryStepParentGeometry::new(
+        parent_params,
+        child_layouts.to_vec(),
+        r_prev_layouts.to_vec(),
+    )?;
+    let parent_recursion_vk = geometry.canonical_vk(
+        &crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation),
+    )?;
+    let transcripts = std::array::from_fn(|slot| {
+        HistoryStepParentTranscriptLayout::new(
+            child_layouts[slot].clone(),
+            r_prev_layouts[slot].clone(),
+        )
+    });
+    let parts = HistoryStepRuntimeParts::new_in(
+        generation,
+        parent_recursion_vk,
+        direct_block_vks.clone(),
+        transcripts,
+    )?;
+    let bank = pin_history_step_class_bank([[0u8; 32]; HISTORY_STEP_CLASS_COUNT], &parts)?;
+    let runtime = HistoryStepRuntime::new(
+        bank,
+        Box::new(RejectingHistoryStepMatrixSource),
+        parts.clone(),
+    )?;
+    let mut derived_children = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
+    let mut derived_r_prev = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
+    for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
+        let class_id =
+            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
+        let entry = runtime.bank().entry(class_id);
+        let (field_proof, commitment_root) =
+            shape_only_field_r1cs_proof_c1(&entry.shape(), entry.pcs_params());
+        let envelope = HistoryStepProof {
+            field_proof,
+            commitment: Commitment {
+                root: commitment_root,
+                params: entry.pcs_params().clone(),
+            },
+            io: vec![F128::ZERO; runtime.bank().spec().io_len],
+            sidecar: shape_only_joint_c1_region_sidecar_proof(
+                runtime.parent_recursion_vk(),
+                runtime
+                    .direct_block_vk(slot)
+                    .ok_or(HistoryStepError::RuntimeBlockVk(slot))?,
+                entry.shape().m,
+            )?,
+        };
+        let complete = run_scratch_parent_recording_pass(
+            &runtime,
+            class_id,
+            &envelope,
+            &entry.matrix_digest(),
+            &entry.post_commit_digest(),
+        )?;
+        let child = complete.child.ok_or(HistoryStepError::ParentRecording)?;
+        derived_children.push(child.layout);
+        derived_r_prev.push(complete.r_prev.layout);
+    }
+    Ok(HistoryStepRuntimePartsPass {
+        parts,
+        derived_children: derived_children
             .try_into()
-            .map_err(|_| HistoryStepError::RuntimeLayout)?;
-        let derived_r_prev: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = derived_r_prev
+            .map_err(|_| HistoryStepError::RuntimeLayout)?,
+        derived_r_prev: derived_r_prev
             .try_into()
-            .map_err(|_| HistoryStepError::RuntimeLayout)?;
-        if derived_children == child_layouts && derived_r_prev == r_prev_layouts {
-            return Ok(parts);
+            .map_err(|_| HistoryStepError::RuntimeLayout)?,
+    })
+}
+
+/// Identify which relation a decoded pack was frozen for.
+///
+/// A pack does not say what it is; it is what it is. The `[R]_prev` recording
+/// layout it carries is the fixed point of one generation's derivation and of
+/// no other: the parent replay absorbs the parent public IO, sixteen lanes
+/// wider under v1.3. Running one round under each candidate therefore settles
+/// it from the pack's own bytes — no side channel, no build flag, and no way
+/// for a v1.3 binary to be talked into reading a launch pack as its own. The
+/// launch generation is tried first, so a launch pack costs one round.
+pub(super) fn discover_history_step_pack_generation(
+    direct_block_vks: &[BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    transcripts: &[HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+) -> Result<HistoryStepPackGeneration, HistoryStepError> {
+    let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
+        canonical_history_step_pcs_params(
+            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
+        )
+    });
+    let child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].child.clone());
+    let r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].r_prev.clone());
+    for candidate in [
+        HistoryStepPackGeneration::V1,
+        HistoryStepPackGeneration::V1_3,
+    ] {
+        let pass = history_step_runtime_parts_pass(
+            candidate,
+            &parent_params,
+            direct_block_vks,
+            &child_layouts,
+            &r_prev_layouts,
+        )?;
+        if pass.derived_children == child_layouts && pass.derived_r_prev == r_prev_layouts {
+            return Ok(candidate);
         }
-        child_layouts = derived_children;
-        r_prev_layouts = derived_r_prev;
     }
     Err(HistoryStepError::RuntimeLayout)
 }
@@ -559,7 +715,14 @@ impl HistoryStepRuntime {
             direct_block_vks,
             parent_transcripts: _,
             parent_geometry,
+            generation,
         } = parts;
+        // The bank was pinned under a public-IO spec and these parts were
+        // derived under one; if they disagree the two halves of the pack do
+        // not belong together.
+        if generation != bank.generation() {
+            return Err(HistoryStepError::RuntimeParentVk);
+        }
         if parent_recursion_vk.transcript_digest()
             != bank
                 .entry(CanonicalHistoryStepClassId::from_index(0).expect("class zero is canonical"))
@@ -789,10 +952,26 @@ impl HistoryStepTerminal {
     }
 }
 
+/// Whether a terminal at `height` is the base of a recursion rooted at
+/// `root_height`.
+///
+/// A base step proves exactly the block after its root and no other. The
+/// rule used to be `height == 1`, which is the same thing for a recursion
+/// rooted at genesis and wrong for a v1.3 pack, whose root is the block
+/// before the activation height. It stays an equality either way: a base
+/// accepted at a height of the prover's choosing is a terminal replay.
+pub(crate) const fn is_base_terminal_height(root_height: u64, height: u64) -> bool {
+    match root_height.checked_add(1) {
+        Some(base_height) => height == base_height,
+        None => false,
+    }
+}
+
 pub(super) fn validate_terminal_metadata(
     runtime: &HistoryStepRuntime,
     terminal: &HistoryStepTerminal,
-    expected_boundary: Option<(&BlockHeader, &BlockHeader)>,
+    expected_boundary: Option<(&BlockHeader, &BlockHeader, Option<&BlockHeader>)>,
+    expected_recursion_root: Option<&RecursionRoot>,
 ) -> Result<ChainAccumulator, HistoryStepError> {
     validate_envelope_against_runtime(runtime, terminal.class_id, &terminal.proof)?;
     let accumulator = history_step_bank_block_accumulator(runtime.bank(), &terminal.proof.io)?;
@@ -801,13 +980,43 @@ pub(super) fn validate_terminal_metadata(
         || terminal.semantic_id != accumulator.tip_semantic_id
         || terminal.accumulator != accumulator
         || terminal.height == 0
-        || base != (terminal.height == 1)
+        || base
+            != is_base_terminal_height(
+                runtime.bank().recursion_root_height(),
+                terminal.height,
+            )
     {
         return Err(HistoryStepError::TerminalMetadata);
     }
-    if let Some((tip_header, epoch_anchor_header)) = expected_boundary {
+    // The root the terminal was proved against is public. Which root is
+    // acceptable is a question about the *branch* this terminal belongs to,
+    // so the caller answers it: it is the only one that knows which chain of
+    // headers is being evaluated. A node that decided it here, against a
+    // boundary fixed once at startup, would quarantine every peer on the
+    // other side of a natural fork at the root height and never reorg onto
+    // it — permanently, because restarting re-derives the same answer.
+    if let Some(expected_root) = expected_recursion_root {
+        let carried = history_step_bank_recursion_root_lanes(runtime.bank(), &terminal.proof.io)?;
+        // A generation that pins its root inside the matrices carries no root
+        // lanes, so there is nothing to compare and nothing a caller could
+        // have got wrong: asking for one is the caller's mistake, not the
+        // sender's, and it must not be charged to the peer.
+        match carried {
+            Some(carried) if carried == expected_root.lanes() => {}
+            Some(_) => return Err(HistoryStepError::ForeignRecursionRoot),
+            None => return Err(HistoryStepError::RootlessGeneration),
+        }
+    }
+    if let Some((tip_header, epoch_anchor_header, previous_epoch_anchor_header)) =
+        expected_boundary
+    {
         accumulator
-            .validate_local_header_boundary(tip_header, epoch_anchor_header)
+            .validate_local_header_boundary_in(
+                runtime.bank().generation(),
+                tip_header,
+                epoch_anchor_header,
+                previous_epoch_anchor_header,
+            )
             .map_err(|_| HistoryStepError::HeaderBinding)?;
     }
     Ok(accumulator)
@@ -851,7 +1060,7 @@ impl<'a> HistoryStepParent<'a> {
         runtime: &HistoryStepRuntime,
         terminal: &'a HistoryStepTerminal,
     ) -> Result<Self, HistoryStepError> {
-        validate_terminal_metadata(runtime, terminal, None)?;
+        validate_terminal_metadata(runtime, terminal, None, None)?;
         Ok(Self { terminal })
     }
 
@@ -1313,15 +1522,43 @@ fn prepare_history_step_base<'a, const TIER: usize>(
     runtime: &HistoryStepRuntime,
     current: &HistoryStepBlockInput<TIER>,
 ) -> Result<PreparedHistoryStepParent<'a>, HistoryStepError> {
-    let genesis = genesis_accumulator();
-    if current.start_accumulator != genesis || current.end_accumulator.height != 1 {
-        return Err(HistoryStepError::ParentBoundary);
+    let generation = runtime.bank().generation();
+    if generation.carries_recursion_root() {
+        // A base step's root *is* its own start boundary: the accumulator at
+        // the block before it, and the id of that block's header. Both
+        // travel with the witness, so nothing is looked up and nothing is
+        // pinned — the prover roots the recursion on the branch it is
+        // actually building on. The height is the pack's business and is
+        // fixed: a base at any other height would be a terminal replay.
+        let root_height = runtime.bank().recursion_root_height();
+        if !is_base_terminal_height(root_height, current.end_accumulator.height)
+            || current.start_accumulator.height != root_height
+        {
+            return Err(HistoryStepError::ParentBoundary);
+        }
+    } else {
+        // The launch relation has exactly one acceptable base boundary, and
+        // it is this chain's genesis: the base arm pins the genesis
+        // constants in the matrices.
+        let genesis = genesis_accumulator();
+        if current.start_accumulator != genesis || current.end_accumulator.height != 1 {
+            return Err(HistoryStepError::ParentBoundary);
+        }
     }
+    let root = RecursionRoot::new(
+        current.start_accumulator.clone(),
+        jetsam_chain::hash_block_header(&current.parent_header),
+    );
     let selected_class = CanonicalHistoryStepClassId::from_index(0)
         .expect("class zero is the canonical internal base shape");
-    let current_class =
-        canonical_history_step_class_id(TIER).ok_or(HistoryStepError::InvalidClass)?;
-    let base_io = history_step_bank_base_output_io(runtime.bank(), selected_class, &genesis)?;
+    let current_class = canonical_history_step_class_id_in(generation, TIER)
+        .ok_or(HistoryStepError::InvalidClass)?;
+    let base_io = history_step_bank_base_output_io_rooted(
+        runtime.bank(),
+        selected_class,
+        root.accumulator(),
+        &root,
+    )?;
     let class_0 = CanonicalHistoryStepClassId::new(0).expect("class zero");
     let (envelope_0, scratch_0) = shape_only_parent_arm(runtime, class_0, base_io.clone())?;
     let class_1 = CanonicalHistoryStepClassId::new(1).expect("class one");
@@ -1342,10 +1579,11 @@ fn prepare_history_step_base<'a, const TIER: usize>(
             r_prev_recordings: vec![scratch_0.r_prev, scratch_1.r_prev],
         },
         fold_proofs,
-        io: history_step_bank_base_output_io(
+        io: history_step_bank_base_output_io_rooted(
             runtime.bank(),
             current_class,
             &current.end_accumulator,
+            &root,
         )?,
         envelopes: [
             PreparedParentEnvelope::Local(envelope_0),
@@ -1365,10 +1603,12 @@ fn prepare_history_step_recursive<'a, const TIER: usize>(
     if selected_class != parent.terminal.class_id {
         return Err(HistoryStepError::InvalidClass);
     }
-    let current_class =
-        canonical_history_step_class_id(TIER).ok_or(HistoryStepError::InvalidClass)?;
-    if block_acc_lanes(&current.start_accumulator)
-        != envelope.io[bank.layout().block_accumulator..bank.layout().block_accumulator + ACC_LANES]
+    let current_class = canonical_history_step_class_id_in(bank.generation(), TIER)
+        .ok_or(HistoryStepError::InvalidClass)?;
+    let accumulator_lanes = bank.layout().accumulator_lanes();
+    if block_acc_lanes_for(bank.generation(), &current.start_accumulator)
+        != envelope.io
+            [bank.layout().block_accumulator..bank.layout().block_accumulator + accumulator_lanes]
     {
         return Err(HistoryStepError::ParentBoundary);
     }
@@ -1579,22 +1819,61 @@ pub fn verify_history_step_pending(
     PendingHistoryStepBankDecision::begin(bank, &envelope.io, replay).map_err(Into::into)
 }
 
+/// Verify a terminal of the launch relation against the branch's tip and
+/// epoch-anchor headers. [`verify_history_step_terminal_rooted`] with neither
+/// a previous anchor nor a root named, which is all the launch relation has.
 pub fn verify_history_step_terminal(
     runtime: &HistoryStepRuntime,
     terminal: &HistoryStepTerminal,
     expected_header: &BlockHeader,
     epoch_anchor_header: &BlockHeader,
 ) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
+    verify_history_step_terminal_rooted(
+        runtime,
+        terminal,
+        expected_header,
+        epoch_anchor_header,
+        None,
+        None,
+    )
+}
+
+/// Verify a terminal against the branch it belongs to.
+///
+/// `previous_epoch_anchor_header` is the header the older accepted anchor
+/// binds, required under a generation that binds two anchors and refused
+/// under one that binds one. `expected_recursion_root` is the boundary the
+/// caller derived for this branch at the bank's root height; when named, a
+/// terminal rooted anywhere else is `ForeignRecursionRoot` — a valid terminal
+/// of another branch, not a malformed one.
+pub fn verify_history_step_terminal_rooted(
+    runtime: &HistoryStepRuntime,
+    terminal: &HistoryStepTerminal,
+    expected_header: &BlockHeader,
+    epoch_anchor_header: &BlockHeader,
+    previous_epoch_anchor_header: Option<&BlockHeader>,
+    expected_recursion_root: Option<&RecursionRoot>,
+) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
     let accumulator = validate_terminal_metadata(
         runtime,
         terminal,
-        Some((expected_header, epoch_anchor_header)),
+        Some((
+            expected_header,
+            epoch_anchor_header,
+            previous_epoch_anchor_header,
+        )),
+        expected_recursion_root,
     )?;
     let pending = verify_history_step_pending(runtime, terminal.class_id, &terminal.proof)?;
     let accepted = runtime.decide(pending)?;
     if accepted.tip_class() != terminal.class_id
-        || accepted.block_accumulator() != &block_acc_lanes(&accumulator)
-        || accepted.base() != (terminal.height == 1)
+        || accepted.block_accumulator()
+            != block_acc_lanes_for(runtime.bank().generation(), &accumulator).as_slice()
+        || accepted.base()
+            != is_base_terminal_height(
+                runtime.bank().recursion_root_height(),
+                terminal.height,
+            )
     {
         return Err(HistoryStepError::TerminalMetadata);
     }
@@ -1620,10 +1899,17 @@ enum HistoryStepAssemblyOutput {
 struct DeferredHistoryStepIo {
     tip_block_id: [DeferredWitnessSlot; 2],
     epoch_anchor_id: [DeferredWitnessSlot; 2],
+    /// The v1.3 lanes, absent under the launch relation. Sealed with the pair
+    /// above because they move together: one epoch boundary shifts both, and
+    /// a step that sealed only one of them would publish an accumulator
+    /// naming two non-adjacent epochs.
+    previous_epoch_anchor_id: Option<[DeferredWitnessSlot; 2]>,
+    generation: HistoryStepPackGeneration,
 }
 
 fn allocate_deferred_history_step_io(
     builder: &mut FieldR1csBuilder,
+    generation: HistoryStepPackGeneration,
     spec: &PublicIoSpec,
     values: &[F128],
     block_accumulator: usize,
@@ -1638,6 +1924,8 @@ fn allocate_deferred_history_step_io(
     let mut tip_1 = None;
     let mut epoch_0 = None;
     let mut epoch_1 = None;
+    let mut previous_epoch_0 = None;
+    let mut previous_epoch_1 = None;
     let cells = values
         .iter()
         .copied()
@@ -1649,6 +1937,8 @@ fn allocate_deferred_history_step_io(
                 Some(2) => &mut tip_1,
                 Some(8) => &mut epoch_0,
                 Some(9) => &mut epoch_1,
+                Some(10) if generation.binds_two_epoch_anchors() => &mut previous_epoch_0,
+                Some(11) if generation.binds_two_epoch_anchors() => &mut previous_epoch_1,
                 _ => return LinExpr::from_wire(builder.alloc_f128(value)),
             };
             let (wire, deferred) = builder.alloc_deferred_f128(value);
@@ -1667,6 +1957,13 @@ fn allocate_deferred_history_step_io(
                 epoch_0.expect("HistoryStep IO has epoch lane zero"),
                 epoch_1.expect("HistoryStep IO has epoch lane one"),
             ],
+            previous_epoch_anchor_id: generation.binds_two_epoch_anchors().then(|| {
+                [
+                    previous_epoch_0.expect("HistoryStep IO has previous epoch lane zero"),
+                    previous_epoch_1.expect("HistoryStep IO has previous epoch lane one"),
+                ]
+            }),
+            generation,
         },
     )
 }
@@ -1679,13 +1976,18 @@ impl DeferredHistoryStepIo {
         block_accumulator: usize,
         end_accumulator: &ChainAccumulator,
     ) -> Result<(), HistoryStepError> {
-        let lanes = block_acc_lanes(end_accumulator);
-        io[block_accumulator..block_accumulator + ACC_LANES].copy_from_slice(&lanes);
+        let lanes = block_acc_lanes_for(self.generation, end_accumulator);
+        io[block_accumulator..block_accumulator + lanes.len()].copy_from_slice(&lanes);
+        let previous = self
+            .previous_epoch_anchor_id
+            .map(|slots| slots.into_iter().zip([lanes[10], lanes[11]]).collect())
+            .unwrap_or_else(Vec::new);
         for (slot, value) in self
             .tip_block_id
             .into_iter()
             .zip([lanes[1], lanes[2]])
             .chain(self.epoch_anchor_id.into_iter().zip([lanes[8], lanes[9]]))
+            .chain(previous)
         {
             builder
                 .seal_deferred_f128(slot, value)
@@ -1748,9 +2050,13 @@ fn prepare_history_step_assembly<const TIER: usize>(
         io,
     } = prepared;
     let envelope = envelopes[selected_parent_class.current_slot()].proof();
+    let generation = bank.generation();
     let effective_pages = current.components.effective_page_count();
-    if jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_pages)
-        .map(|class| class.page_capacity())
+    if jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+        effective_pages,
+        generation,
+    )
+    .map(|class| class.page_capacity_in_generation(generation))
         != Some(TIER)
     {
         return Err(HistoryStepError::InvalidClass);
@@ -1768,8 +2074,13 @@ fn prepare_history_step_assembly<const TIER: usize>(
         HistoryStepAssemblyMode::Frozen => FieldR1csBuilder::new(),
         HistoryStepAssemblyMode::WitnessOnly => FieldR1csBuilder::new_witness_only(),
     };
-    let (io_cells, io_seal) =
-        allocate_deferred_history_step_io(&mut builder, &spec, &io, layout.block_accumulator);
+    let (io_cells, io_seal) = allocate_deferred_history_step_io(
+        &mut builder,
+        generation,
+        &spec,
+        &io,
+        layout.block_accumulator,
+    );
     debug_assert_eq!(
         io_cells[layout.base].eval(builder.values()) == F128::ONE,
         base
@@ -1830,6 +2141,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
     let block_assembly: SelectedZkBlockSlotsAssembly = build_block_slots_selected_zk_prefix(
         &mut builder,
+        generation,
         &start_accumulator,
         &end_accumulator,
         &components,
@@ -2046,11 +2358,31 @@ fn prepare_history_step_assembly<const TIER: usize>(
     })?;
     lap("parent region source binding", &mut stage_started);
 
+    // JETSAM CHANGE (v1.3): the recursion root travels in the public IO and
+    // is carried unchanged by every step — the parent's root is this step's
+    // root — so the relation no longer contains the genesis of any particular
+    // chain; the native bank check decides whether the carried root is this
+    // branch's. The launch relation has no root lanes: its base case pins
+    // this chain's genesis as constants below, and the range here is empty,
+    // so the v1 arm emits exactly the rows it always did. Nothing may be
+    // inserted between this block and the start-boundary loop below.
+    let root_lanes = layout.recursion_root_range();
+    if let Some(range) = root_lanes.clone() {
+        for index in range {
+            pin_eq(&mut builder, &io_cells[index], &prev_io[index]);
+        }
+    }
+
     // Parent-seal glue. Recursive case: the replayed header must project to
     // the verified parent terminal tip (semantic lanes of the parent public
-    // IO). Base case: the header witness must be the exact canonical genesis
-    // header, pinned through both derived ids.
+    // IO). Base case: the header witness must be the exact header the root
+    // names, pinned through both derived ids — under the launch relation the
+    // canonical genesis header as constants; under v1.3 the block id from the
+    // root's own lanes and the semantic projection from the root
+    // accumulator's tip.
     {
+        let root_accumulator = layout.recursion_root;
+        let root_block_id = layout.recursion_root + layout.accumulator_lanes();
         let genesis = jetsam_chain::consensus::genesis_header();
         let genesis_id = digest_lanes(&jetsam_chain::hash_block_header(&genesis));
         let genesis_semantic =
@@ -2064,21 +2396,41 @@ fn prepare_history_step_assembly<const TIER: usize>(
                 );
             });
             with_pin_gate(&io_cells[layout.base], || {
-                pin_eq(
-                    &mut builder,
-                    &parent_seal.block_id[lane],
-                    &LinExpr::constant(flat_of(genesis_id[lane])),
-                );
-                pin_eq(
-                    &mut builder,
-                    &parent_seal.semantic_id[lane],
-                    &LinExpr::constant(flat_of(genesis_semantic[lane])),
-                );
+                if root_lanes.is_some() {
+                    pin_eq(
+                        &mut builder,
+                        &parent_seal.block_id[lane],
+                        &io_cells[root_block_id + lane],
+                    );
+                    pin_eq(
+                        &mut builder,
+                        &parent_seal.semantic_id[lane],
+                        &io_cells[root_accumulator + 1 + lane],
+                    );
+                } else {
+                    pin_eq(
+                        &mut builder,
+                        &parent_seal.block_id[lane],
+                        &LinExpr::constant(flat_of(genesis_id[lane])),
+                    );
+                    pin_eq(
+                        &mut builder,
+                        &parent_seal.semantic_id[lane],
+                        &LinExpr::constant(flat_of(genesis_semantic[lane])),
+                    );
+                }
             });
         }
     }
 
-    let genesis_lanes = block_acc_lanes(&genesis_accumulator());
+    // The start boundary of a base step is the root itself, height lane
+    // included — or, under the launch relation, the constant genesis
+    // boundary. The height binding stays exact for the same reason it was
+    // exact against constants: it is one lane of one pinned boundary, and the
+    // native check refuses any root but this branch's — a base accepted at a
+    // height of the prover's choosing is a terminal replay.
+    let genesis_lanes = block_acc_lanes_for(generation, &genesis_accumulator());
+    let root_accumulator = layout.recursion_root;
     for (index, start) in block_slots.start_acc.ordered_lanes().iter().enumerate() {
         with_pin_gate(&parent_gate, || {
             pin_eq(
@@ -2088,11 +2440,15 @@ fn prepare_history_step_assembly<const TIER: usize>(
             );
         });
         with_pin_gate(&io_cells[layout.base], || {
-            pin_eq(
-                &mut builder,
-                start,
-                &LinExpr::constant(genesis_lanes[index]),
-            );
+            if root_lanes.is_some() {
+                pin_eq(&mut builder, start, &io_cells[root_accumulator + index]);
+            } else {
+                pin_eq(
+                    &mut builder,
+                    start,
+                    &LinExpr::constant(genesis_lanes[index]),
+                );
+            }
         });
     }
     for (index, end) in block_slots.end_acc.ordered_lanes().iter().enumerate() {

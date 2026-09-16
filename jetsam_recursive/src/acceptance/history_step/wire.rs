@@ -169,10 +169,28 @@ fn terminal_len_for_class(
     runtime: &HistoryStepRuntime,
     class: CanonicalHistoryStepClassId,
 ) -> Result<usize, HistoryStepError> {
+    terminal_len_for_class_in(runtime, class, runtime.bank().generation())
+}
+
+/// The frame length one class would have under `generation`.
+///
+/// Everything in a terminal except the public IO is the same width in both
+/// relations — the class shape, the PCS parameters and both sidecar VKs are
+/// shared — so the two lengths differ by exactly the sixteen extra IO lanes
+/// v1.3 carries. That is what lets a decoder tell "this frame is the wrong
+/// size" apart from "this frame belongs to the other relation", which is the
+/// difference between blaming a peer and recognising pre-fork history.
+fn terminal_len_for_class_in(
+    runtime: &HistoryStepRuntime,
+    class: CanonicalHistoryStepClassId,
+    generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+) -> Result<usize, HistoryStepError> {
     let entry = runtime.bank().entry(class);
+    let io_len =
+        crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation).io_len;
     let mut len = PREFIX_BYTES;
     len = add(len, HASH_BYTES)?;
-    len = add(len, mul(runtime.bank().spec().io_len, F128_BYTES)?)?;
+    len = add(len, mul(io_len, F128_BYTES)?)?;
     len = add(len, field_proof_len(entry.shape(), entry.pcs_params())?)?;
     len = add(
         len,
@@ -663,7 +681,7 @@ fn encode_terminal_in_format(
     ) {
         return Err(HistoryStepError::WireVersion);
     }
-    validate_terminal_metadata(runtime, terminal, None)?;
+    validate_terminal_metadata(runtime, terminal, None, None)?;
     let entry = runtime.bank().entry(terminal.class_id);
     let expected = terminal_len_for_class(runtime, terminal.class_id)?;
     let shared = version == HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION;
@@ -763,22 +781,47 @@ fn decode_terminal_in_format(
     let class_id = CanonicalHistoryStepClassId::from_index(prefix.u8()? as usize)
         .ok_or(HistoryStepError::InvalidClass)?;
     prefix.finish()?;
-    let expected = terminal_len_for_class(runtime, class_id)?;
     let entry = runtime.bank().entry(class_id);
-    let minimum = expected
-        .checked_sub(BaseFoldWireShape::derive(entry.pcs_params())?.full_path_bytes()?)
-        .ok_or(HistoryStepError::WireEncoding)?;
-    let allowed_length = if shared {
+    let frame_fits = |generation| -> Result<bool, HistoryStepError> {
+        let expected = terminal_len_for_class_in(runtime, class_id, generation)?;
+        if !shared {
+            return Ok(bytes.len() == expected);
+        }
         // Both input and expanded allocations are bounded before decoding.
         // The expanded proof has the exact original class-derived shape.
-        expected <= jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES
+        let minimum = expected
+            .checked_sub(BaseFoldWireShape::derive(entry.pcs_params())?.full_path_bytes()?)
+            .ok_or(HistoryStepError::WireEncoding)?;
+        Ok(expected
+            <= jetsam_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES
             && (minimum..=expected).contains(&bytes.len())
             && bytes.len()
-                <= jetsam_chain::consensus::wire_limits::V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES
-    } else {
-        bytes.len() == expected
+                <= jetsam_chain::consensus::wire_limits::V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES)
     };
-    if !allowed_length {
+    let generation = runtime.bank().generation();
+    let expected = terminal_len_for_class_in(runtime, class_id, generation)?;
+    if !frame_fits(generation)? {
+        // Before charging the sender, ask whether this frame is simply the
+        // other relation's. A real pre-fork terminal offered to the post-fork
+        // verifier is 256 bytes short of this one and would otherwise die
+        // here, as a malformed frame from a peer that did nothing wrong.
+        for other in [
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_3,
+        ] {
+            if other != generation && frame_fits(other)? {
+                return Err(HistoryStepError::ForeignIoLayout {
+                    expected: crate::acceptance::history_step_bank::history_step_bank_io_spec_for(
+                        generation,
+                    )
+                    .io_len,
+                    actual: crate::acceptance::history_step_bank::history_step_bank_io_spec_for(
+                        other,
+                    )
+                    .io_len,
+                });
+            }
+        }
         return Err(HistoryStepError::WireLength {
             expected,
             actual: bytes.len(),
@@ -823,7 +866,7 @@ fn decode_terminal_in_format(
         accumulator,
         proof,
     };
-    validate_terminal_metadata(runtime, &terminal, None)?;
+    validate_terminal_metadata(runtime, &terminal, None, None)?;
     Ok(terminal)
 }
 
@@ -1006,6 +1049,29 @@ pub fn decode_verify_history_step_terminal(
 ) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
     let terminal = decode_history_step_terminal(runtime, bytes)?;
     verify_history_step_terminal(runtime, &terminal, expected_header, epoch_anchor_header)
+}
+
+/// [`decode_verify_history_step_terminal`] with the v1.3 boundary named: the
+/// previous epoch anchor header under a generation that binds two, and the
+/// recursion root the caller derived for the branch this terminal belongs
+/// to. See [`super::relation::verify_history_step_terminal_rooted`].
+pub fn decode_verify_history_step_terminal_rooted(
+    runtime: &HistoryStepRuntime,
+    bytes: &[u8],
+    expected_header: &BlockHeader,
+    epoch_anchor_header: &BlockHeader,
+    previous_epoch_anchor_header: Option<&BlockHeader>,
+    expected_recursion_root: Option<&crate::acceptance::history_step_bank::RecursionRoot>,
+) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
+    let terminal = decode_history_step_terminal(runtime, bytes)?;
+    super::relation::verify_history_step_terminal_rooted(
+        runtime,
+        &terminal,
+        expected_header,
+        epoch_anchor_header,
+        previous_epoch_anchor_header,
+        expected_recursion_root,
+    )
 }
 
 #[cfg(test)]
