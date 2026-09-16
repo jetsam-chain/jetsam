@@ -180,9 +180,13 @@ pub(crate) const fn v1_2_active_with(height: u64, activation_height: Option<u64>
 #[cfg(not(feature = "testnet"))]
 pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// The test chain will cross v1.3 first, at a height chosen against its own
-/// tip, so the crossing is watched on a chain that has real pre-fork history
-/// behind it. Dormant until that height is chosen with the operator.
+/// The test chain crosses v1.3 first, so the crossing is watched on a chain
+/// that carries real pre-fork history. Dormant again until that height is
+/// chosen with the operator against the tip of the day: the first attempt was
+/// armed at 1304 and stalled there, and the height has to be re-picked above
+/// whatever tip the upgraded binary is deployed at. Nothing is armed on the
+/// public network until this crossing has happened and the chain has run
+/// under the new relation.
 #[cfg(feature = "testnet")]
 pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 

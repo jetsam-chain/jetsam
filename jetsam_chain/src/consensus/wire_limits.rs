@@ -250,6 +250,11 @@ mod tests {
     /// clock, and it exists precisely because v1.2 is behind us — the class
     /// ladder, the two-epoch anchor and the matrix pack generation must not
     /// switch on a height the chain crossed days ago.
+    ///
+    /// The test chain still crosses first, at a height chosen against its own
+    /// tip with the operator. The first attempt was armed at 1304 and stalled
+    /// there; the height is re-picked above the tip the upgraded binary is
+    /// deployed at, and arming it is again two deliberate edits.
     const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
