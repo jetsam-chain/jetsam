@@ -230,10 +230,13 @@ mod tests {
     #[cfg(not(feature = "testnet"))]
     const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(8450);
 
-    /// The test chain is armed on purpose, at a height chosen against its own
-    /// tip. Editing it in passing must still fail CI.
+    /// The test chain is armed on purpose. It crossed v1.2 at height 880 on a
+    /// chain that has since been rebuilt from genesis, and the rebuilt chain
+    /// runs under v1.2 from its first block — so the height is 0 here, not
+    /// because the fork was skipped but because there is no pre-fork history
+    /// left to govern. Editing it in passing must still fail CI.
     #[cfg(feature = "testnet")]
-    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(880);
+    const DECLARED_ACTIVATION_HEIGHT: Option<u64> = Some(0);
 
     #[test]
     fn arming_the_fork_takes_two_deliberate_edits() {
