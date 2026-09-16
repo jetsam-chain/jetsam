@@ -72,7 +72,9 @@ pub use accepted_block_bundle::{
 pub use block::{
     apply_genesis_block, canonical_block_wire_len, compute_tx_root,
     materialize_accepted_block_state, try_compute_logical_txids, try_compute_tx_root,
-    validate_block_page_stream, Block, BlockApplyError, BlockPageStreamError, BlockPageStreamFacts,
+    validate_block_page_stream, validate_block_page_stream_at_height,
+    validate_block_page_stream_in, Block, BlockApplyError, BlockPageStreamError,
+    BlockPageStreamFacts,
     BLOCK_MAX_TXS, BLOCK_WIRE_FIXED_OVERHEAD, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER,
     BLOCK_WIRE_NONCE_OFFSET,
 };

@@ -353,6 +353,20 @@ impl Mempool {
         self.select_for_block_matching(max_pages, |entry| &entry.spend.epoch_anchor == epoch_anchor)
     }
 
+    /// [`Self::select_for_block_at_anchor`] over the pair of anchors a
+    /// generation accepts. Under the launch generation only the current one
+    /// is consulted, so this is the single-anchor selection there.
+    pub fn select_for_block_at_anchors(
+        &self,
+        max_pages: usize,
+        accepted: crate::consensus::AcceptedEpochAnchors,
+        generation: crate::consensus::params::HistoryStepPackGeneration,
+    ) -> Vec<&MempoolEntry> {
+        self.select_for_block_matching(max_pages, |entry| {
+            accepted.accepts(entry.spend.epoch_anchor, generation)
+        })
+    }
+
     fn select_for_block_matching(
         &self,
         max_pages: usize,

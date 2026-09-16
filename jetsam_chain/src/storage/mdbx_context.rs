@@ -55,12 +55,16 @@ use crate::block_header::BlockHeader;
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block, BlockUndoLog},
     difficulty::{add_work, block_work},
-    epoch_anchor::{tx_epoch_anchor_height_for_child, validate_block_epoch_anchors},
+    epoch_anchor::{
+        previous_tx_epoch_anchor_height_for_child, tx_epoch_anchor_height_for_child,
+        validate_block_epoch_anchors_in, AcceptedEpochAnchors,
+    },
     genesis::genesis_header,
     header::asert_anchor_height,
     params::{
-        BLOCK_MAX_DISTINCT_SEGMENTS, CONSENSUS_FINALITY_DEPTH, EXPANSION_HEADER_LOOKBACK,
-        EXPANSION_WINDOW, GENESIS_TARGET, LOG_SEGMENT_SIZE, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
+        HistoryStepPackGeneration, BLOCK_MAX_DISTINCT_SEGMENTS, CONSENSUS_FINALITY_DEPTH,
+        EXPANSION_HEADER_LOOKBACK, EXPANSION_WINDOW, GENESIS_TARGET, LOG_SEGMENT_SIZE,
+        MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
     },
     pow::{block_id, validate_pow},
     slot_expansion::finalized_expansion_window,
@@ -1191,6 +1195,37 @@ impl MdbxChainContext {
         Ok(())
     }
 
+    /// The anchors a child block's user pages may bind, resolved by height
+    /// from the canonical header store under the child's generation.
+    ///
+    /// Under the launch generation this is the one lookup the chain has
+    /// always made, accepted twice. From v1.3 the older anchor is read the
+    /// same way — headers are permanent, so it is there for a cold-synced
+    /// node as well.
+    fn accepted_user_epoch_anchors_for_child(
+        &self,
+        child_height: u64,
+    ) -> Result<AcceptedEpochAnchors, MdbxContextError> {
+        let current = self
+            .get_header_from_store(tx_epoch_anchor_height_for_child(child_height))?
+            .ok_or(MdbxContextError::Corrupt(
+                "canonical transaction epoch-anchor header missing",
+            ))?;
+        let current = block_id(&current);
+        if !HistoryStepPackGeneration::at_height(child_height).binds_two_epoch_anchors() {
+            return Ok(AcceptedEpochAnchors::single(current));
+        }
+        let previous = self
+            .get_header_from_store(previous_tx_epoch_anchor_height_for_child(child_height))?
+            .ok_or(MdbxContextError::Corrupt(
+                "canonical previous transaction epoch-anchor header missing",
+            ))?;
+        Ok(AcceptedEpochAnchors {
+            current,
+            previous: block_id(&previous),
+        })
+    }
+
     fn current_terminal_epoch_anchor_header(
         &self,
         current_header: &BlockHeader,
@@ -1340,14 +1375,13 @@ impl MdbxChainContext {
         let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
         let anchor = self.anchor_info()?;
-        let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
-        let tx_anchor_header =
-            self.get_header_from_store(tx_anchor_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "canonical transaction epoch-anchor header missing",
-                ))?;
-        let tx_epoch_anchor_id = block_id(&tx_anchor_header);
-        validate_block_epoch_anchors(block, tx_epoch_anchor_id, block_id(&parent))?;
+        let accepted_anchors = self.accepted_user_epoch_anchors_for_child(block.header.height)?;
+        validate_block_epoch_anchors_in(
+            block,
+            accepted_anchors,
+            block_id(&parent),
+            HistoryStepPackGeneration::at_height(block.header.height),
+        )?;
         // All deterministic cheap checks, including bitmap-live resources
         // and the segment cap, precede proof decode, segment hydration, state
         // cloning, and undo allocation.
@@ -1510,13 +1544,13 @@ impl MdbxChainContext {
         let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
         let anchor = self.anchor_info()?;
-        let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
-        let tx_anchor_header =
-            self.get_header_from_store(tx_anchor_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "canonical transaction epoch-anchor header missing",
-                ))?;
-        validate_block_epoch_anchors(&block, block_id(&tx_anchor_header), block_id(&parent))?;
+        let accepted_anchors = self.accepted_user_epoch_anchors_for_child(block.header.height)?;
+        validate_block_epoch_anchors_in(
+            &block,
+            accepted_anchors,
+            block_id(&parent),
+            HistoryStepPackGeneration::at_height(block.header.height),
+        )?;
         validate_block_checks(
             &block,
             &parent,

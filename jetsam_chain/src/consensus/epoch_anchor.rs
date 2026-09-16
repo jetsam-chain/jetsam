@@ -95,6 +95,34 @@ pub fn validate_block_epoch_anchors(
     Ok(())
 }
 
+/// [`validate_block_epoch_anchors`] with the pair of anchors a generation
+/// accepts.
+///
+/// Under the launch generation this *is* [`validate_block_epoch_anchors`]
+/// with `accepted.current`: the older anchor is never consulted, whatever
+/// the pair carries. From v1.3 a user page may bind either; the coinbase
+/// still binds the immediate parent, in both.
+pub fn validate_block_epoch_anchors_in(
+    block: &Block,
+    accepted: AcceptedEpochAnchors,
+    parent_id: Digest,
+    generation: HistoryStepPackGeneration,
+) -> Result<(), ConsensusError> {
+    if !generation.binds_two_epoch_anchors() {
+        return validate_block_epoch_anchors(block, accepted.current, parent_id);
+    }
+    for tx in &block.transactions {
+        if tx.body.is_coinbase {
+            if tx.body.epoch_anchor != parent_id {
+                return Err(ConsensusError::BadCoinbaseAnchor);
+            }
+        } else if !accepted.accepts(tx.body.epoch_anchor, generation) {
+            return Err(ConsensusError::BadEpochAnchor);
+        }
+    }
+    Ok(())
+}
+
 /// Deterministic accumulator transition for the epoch-anchor lane.
 #[inline]
 pub fn next_tx_epoch_anchor_id(
@@ -366,6 +394,77 @@ mod tests {
         assert_eq!(single.current, single.previous);
         assert!(single.accepts([7u8; 32], V1));
         assert!(single.accepts([7u8; 32], V1_3));
+    }
+
+    /// A block whose user page binds the previous epoch's anchor is a v1.3
+    /// block: the launch relation refuses it, v1.3 accepts it, and the
+    /// coinbase binds the parent under both. This is the consensus-side
+    /// statement that a block built under one generation is refused by the
+    /// other.
+    #[test]
+    fn a_page_bound_to_the_previous_anchor_is_a_v1_3_block() {
+        use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+        use jetsam_poseidon2b::primitives::Address;
+        use jetsam_tx::{Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+
+        let parent_id = [0x0Au8; 32];
+        let current = [0x1Bu8; 32];
+        let previous = [0x2Cu8; 32];
+        let stale = [0x3Du8; 32];
+        let page = |anchor: Digest, is_coinbase: bool| {
+            Transaction::new(TxBody {
+                epoch_anchor: anchor,
+                fee: 0,
+                input_owner: Address([0x44; 32]),
+                inputs: [TxInput::dummy(); TX_INPUTS],
+                outputs: [TxOutput::dummy(); TX_OUTPUTS],
+                validity_bitmap: 0,
+                is_coinbase,
+            })
+        };
+        let block_with = |user_anchor: Digest, coinbase_anchor: Digest| Block {
+            header: crate::consensus::genesis_header(),
+            transactions: vec![page(coinbase_anchor, true), page(user_anchor, false)],
+        };
+        let pair = AcceptedEpochAnchors { current, previous };
+
+        // The current anchor is accepted by both relations.
+        assert_eq!(
+            validate_block_epoch_anchors_in(&block_with(current, parent_id), pair, parent_id, V1),
+            Ok(())
+        );
+        assert_eq!(
+            validate_block_epoch_anchors_in(&block_with(current, parent_id), pair, parent_id, V1_3),
+            Ok(())
+        );
+        // The previous one only by v1.3.
+        assert_eq!(
+            validate_block_epoch_anchors_in(&block_with(previous, parent_id), pair, parent_id, V1),
+            Err(ConsensusError::BadEpochAnchor)
+        );
+        assert_eq!(
+            validate_block_epoch_anchors_in(&block_with(previous, parent_id), pair, parent_id, V1_3),
+            Ok(())
+        );
+        // A stale anchor by neither.
+        for generation in [V1, V1_3] {
+            assert_eq!(
+                validate_block_epoch_anchors_in(&block_with(stale, parent_id), pair, parent_id, generation),
+                Err(ConsensusError::BadEpochAnchor)
+            );
+            // The coinbase binds the parent, never an epoch anchor.
+            assert_eq!(
+                validate_block_epoch_anchors_in(&block_with(current, current), pair, parent_id, generation),
+                Err(ConsensusError::BadCoinbaseAnchor)
+            );
+        }
+        // Under the launch generation the twin is the launch rule, verbatim.
+        for (user, coinbase) in [(current, parent_id), (previous, parent_id), (current, current)] {
+            assert_eq!(
+                validate_block_epoch_anchors_in(&block_with(user, coinbase), pair, parent_id, V1),
+                validate_block_epoch_anchors(&block_with(user, coinbase), current, parent_id)
+            );
+        }
     }
 
     /// Both anchors come from the header store, by height, and a missing

@@ -983,8 +983,25 @@ fn history_step_terminal_metadata(bytes: &[u8]) -> Option<(u64, [u8; 32], usize)
     ))
 }
 
-fn history_step_class_slot(effective_page_count: usize) -> Option<usize> {
-    match crate::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)? {
+/// The terminal class slot a block's page count selects, under the ladder in
+/// force at the block's own height. The slot is the class's position in the
+/// generation's ladder, which is what the terminal metadata carries and what
+/// `canonical_history_step_class_id_in` names.
+fn history_step_class_slot(effective_page_count: usize, height: u64) -> Option<usize> {
+    history_step_class_slot_in(
+        effective_page_count,
+        crate::consensus::params::HistoryStepPackGeneration::at_height(height),
+    )
+}
+
+fn history_step_class_slot_in(
+    effective_page_count: usize,
+    generation: crate::consensus::params::HistoryStepPackGeneration,
+) -> Option<usize> {
+    match crate::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+        effective_page_count,
+        generation,
+    )? {
         crate::consensus::paged_spend::BlockProofClass::B25 => Some(0),
         crate::consensus::paged_spend::BlockProofClass::B255 => Some(1),
     }
@@ -3126,9 +3143,10 @@ impl MdbxStore {
                     .ok_or(StoreError::Decode(
                         "accepted block is missing its coinbase record",
                     ))?;
-            let expected_class = history_step_class_slot(effective_page_count).ok_or(
-                StoreError::Decode("accepted block page count has no canonical HistoryStep tier"),
-            )?;
+            let expected_class = history_step_class_slot(effective_page_count, header.height)
+                .ok_or(StoreError::Decode(
+                    "accepted block page count has no canonical HistoryStep tier",
+                ))?;
             let terminal_bytes: Cow<'_, [u8]> = match complete_terminal {
                 Some(terminal) => {
                     if !history_step_terminal_matches_class(
@@ -3933,7 +3951,7 @@ impl MdbxStore {
                     .transactions
                     .len()
                     .checked_sub(1)
-                    .and_then(history_step_class_slot)
+                    .and_then(|pages| history_step_class_slot(pages, staged.header.height))
                     .ok_or(StoreError::Decode(
                         "staged reorg transaction count has no canonical HistoryStep tier",
                     ))?;
@@ -4185,6 +4203,32 @@ mod tests {
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
         PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
+
+    /// The terminal class slot a committed block is checked against follows
+    /// the ladder of the block's own height: with the clock dormant every
+    /// height answers the launch slot, and under v1.3 twenty-five effective
+    /// pages sit in the large class. A launch terminal for such a block
+    /// (slot 0) would be refused at a v1.3 height, which is the storage-side
+    /// statement that a block proved under one generation is refused by the
+    /// other.
+    #[test]
+    fn terminal_class_slot_follows_the_ladder_of_the_block_height() {
+        use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
+
+        for height in [1u64, 8_450, u64::MAX] {
+            assert_eq!(history_step_class_slot(24, height), Some(0));
+            assert_eq!(history_step_class_slot(25, height), Some(0));
+            assert_eq!(history_step_class_slot(26, height), Some(1));
+            assert_eq!(history_step_class_slot(255, height), Some(1));
+            assert_eq!(history_step_class_slot(256, height), None);
+        }
+        assert_eq!(history_step_class_slot_in(24, V1), Some(0));
+        assert_eq!(history_step_class_slot_in(25, V1), Some(0));
+        assert_eq!(history_step_class_slot_in(24, V1_3), Some(0));
+        assert_eq!(history_step_class_slot_in(25, V1_3), Some(1));
+        assert_eq!(history_step_class_slot_in(255, V1_3), Some(1));
+        assert_eq!(history_step_class_slot_in(256, V1_3), None);
+    }
 
     fn coinbase(tag: u8) -> Transaction {
         let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
