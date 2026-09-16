@@ -19,7 +19,7 @@
 //! claim from the tip verifier and every live accumulated lane have been
 //! evaluated against locally authenticated matrix rows.
 
-use jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS;
+use jetsam_chain::consensus::params::{HistoryStepPackGeneration, BLOCK_PAGE_CLASS_TIERS};
 use jetsam_core::Block128;
 use jetsam_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use jetsam_ivc_core::field::{F128, F256};
@@ -46,8 +46,116 @@ const HISTORY_STEP_PCS_LOG_INV_RATE: usize = 2;
 const HISTORY_STEP_PCS_LOG_BATCH_SIZE: usize = 5;
 pub const HISTORY_STEP_FRI_QUERIES: usize = BASEFOLD_RATE_QUARTER_C1_QUERIES;
 
+/// The launch encoding of a boundary: ten lanes, what every terminal of this
+/// chain has carried since block one. Untouched by v1.3.
 pub(crate) fn block_acc_lanes(accumulator: &ChainAccumulator) -> [F128; ACC_LANES] {
     accumulator.to_lanes().map(flat_of)
+}
+
+/// The boundary in the lane encoding of `generation`: exactly
+/// [`block_acc_lanes`] under the launch generation, two lanes more under
+/// v1.3. The bank writes and reads its accumulator span through this so
+/// that one bank serves either relation.
+pub(crate) fn block_acc_lanes_for(
+    generation: HistoryStepPackGeneration,
+    accumulator: &ChainAccumulator,
+) -> Vec<F128> {
+    accumulator
+        .to_generation_lanes(generation)
+        .into_iter()
+        .map(flat_of)
+        .collect()
+}
+
+/// Public-IO lanes of a v1.3 recursion root: the twelve accumulator lanes,
+/// then the two lanes of the block id of the header that produced them.
+///
+/// v1 carries no root at all — its relation pins this chain's genesis as
+/// constants — so a caller sizing a span asks the generation
+/// ([`HistoryStepPackGeneration::recursion_root_lanes`]), never this
+/// constant, unless it is laying out a [`RecursionRoot`] itself.
+pub const V1_3_RECURSION_ROOT_LANES: usize =
+    HistoryStepPackGeneration::V1_3.recursion_root_lanes();
+
+const _: () = assert!(
+    HistoryStepPackGeneration::V1.recursion_root_lanes() == 0
+        && HistoryStepPackGeneration::V1.chain_accumulator_lanes() == ACC_LANES,
+    "the launch layout carries the ten-lane boundary and no recursion root"
+);
+
+/// The boundary a chain of recursive proofs starts from.
+///
+/// JETSAM CHANGE (v1.3): under the v1.3 generation the root travels in the
+/// public IO instead of being pinned as constants inside the R1CS, so which
+/// root is acceptable becomes a *native* question, answered when the public
+/// IO is parsed. Under the launch generation the type exists but never
+/// reaches the IO: the launch relation is what it always was.
+///
+/// The block id is carried beside the accumulator rather than read out of
+/// its anchor lanes. At genesis the two coincide — a genesis accumulator's
+/// epoch anchor *is* the genesis block id — but that identity holds only at
+/// genesis, and a v1.3 root is the boundary at the activation height, not
+/// genesis. It is deliberately not a checkpoint constant: every field is
+/// readable from canonical headers, so each node derives it from its own
+/// chain and no digest has to be shipped or trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecursionRoot {
+    accumulator: ChainAccumulator,
+    block_id: jetsam_poseidon2b::primitives::Digest,
+}
+
+impl RecursionRoot {
+    /// The boundary named by an accumulator and the block id of the header
+    /// that produced it.
+    pub fn new(
+        accumulator: ChainAccumulator,
+        block_id: jetsam_poseidon2b::primitives::Digest,
+    ) -> Self {
+        Self {
+            accumulator,
+            block_id,
+        }
+    }
+
+    /// This chain's genesis boundary — the root every launch base starts
+    /// from, and the root of a v1.3 chain that starts at genesis.
+    pub fn genesis() -> Self {
+        Self::new(
+            crate::accumulator::genesis_accumulator(),
+            jetsam_chain::hash_block_header(&jetsam_chain::consensus::genesis_header()),
+        )
+    }
+
+    pub fn accumulator(&self) -> &ChainAccumulator {
+        &self.accumulator
+    }
+
+    pub fn block_id(&self) -> jetsam_poseidon2b::primitives::Digest {
+        self.block_id
+    }
+
+    /// Height of the boundary. A base step proves the block at `height + 1`
+    /// and no other: a base accepted at some other height is a terminal
+    /// replay.
+    pub fn height(&self) -> u64 {
+        self.accumulator.height
+    }
+
+    /// Public-IO lane image under the v1.3 generation, in the same encoding
+    /// as every other accumulator lane — a tower value through `flat_of`,
+    /// never the raw byte encoding used for verifier-key digests.
+    pub(crate) fn lanes(&self) -> [F128; V1_3_RECURSION_ROOT_LANES] {
+        let generation = HistoryStepPackGeneration::V1_3;
+        let accumulator_lanes = generation.chain_accumulator_lanes();
+        let mut lanes = [F128::ZERO; V1_3_RECURSION_ROOT_LANES];
+        lanes[..accumulator_lanes]
+            .copy_from_slice(&block_acc_lanes_for(generation, &self.accumulator));
+        lanes[accumulator_lanes..].copy_from_slice(
+            &crate::acceptance::trace::accepted_claim_batch::digest_lanes(&self.block_id)
+                .map(flat_of),
+        );
+        lanes
+    }
 }
 
 pub const HISTORY_STEP_TIER_SLOT_COUNT: usize = BLOCK_PAGE_CLASS_TIERS.len();
@@ -234,11 +342,57 @@ pub struct HistoryStepBankIoLayout {
     /// Two flat-F128 lanes for the ordered aggregate bank digest.
     pub bank_digest: usize,
     pub matrix_lanes: [HistoryStepBankLaneLayout; HISTORY_STEP_CLASS_COUNT],
+    /// First of `generation.chain_accumulator_lanes()` lanes: ten at launch,
+    /// twelve from v1.3.
     pub block_accumulator: usize,
+    /// First of `generation.recursion_root_lanes()` lanes naming the boundary
+    /// this chain of proofs starts from, carried unchanged by every recursive
+    /// step and checked natively.
+    ///
+    /// The launch generation has none of them: its relation pins this
+    /// chain's genesis as constants, and the run is empty. Read it through
+    /// [`Self::recursion_root_range`], which answers `None` there rather than
+    /// handing back an empty span a caller could index past.
+    pub recursion_root: usize,
     pub len: usize,
+    /// The generation whose relation this layout describes. Every width
+    /// above follows from it.
+    pub generation: HistoryStepPackGeneration,
 }
 
+impl HistoryStepBankIoLayout {
+    /// Accumulator lanes this layout carries.
+    #[inline]
+    pub const fn accumulator_lanes(&self) -> usize {
+        self.generation.chain_accumulator_lanes()
+    }
+
+    /// The public-IO span naming the recursion root, or `None` when the
+    /// generation pins its root inside the matrices instead.
+    #[inline]
+    pub fn recursion_root_range(&self) -> Option<std::ops::Range<usize>> {
+        let lanes = self.generation.recursion_root_lanes();
+        (lanes != 0).then(|| self.recursion_root..self.recursion_root + lanes)
+    }
+}
+
+/// The public-IO layout of the launch relation — what every terminal of this
+/// chain has carried since block one, and what every caller without a height
+/// in hand still reads. Anything judging a block of the other generation asks
+/// [`history_step_bank_io_layout_for`] with that block's own generation.
 pub fn history_step_bank_io_layout() -> HistoryStepBankIoLayout {
+    history_step_bank_io_layout_for(HistoryStepPackGeneration::V1)
+}
+
+/// The public-IO layout of `generation`'s relation.
+///
+/// Both generations agree lane for lane up to and including the first ten
+/// accumulator lanes; v1.3 then carries two more accumulator lanes and the
+/// recursion root. A launch IO is therefore a prefix of a v1.3 one, and the
+/// launch layout is byte for byte what it was before v1.3 existed.
+pub fn history_step_bank_io_layout_for(
+    generation: HistoryStepPackGeneration,
+) -> HistoryStepBankIoLayout {
     let base = 0;
     let tip_class = 1;
     let matrix_whitelist = 2;
@@ -260,12 +414,22 @@ pub fn history_step_bank_io_layout() -> HistoryStepBankIoLayout {
         bank_digest,
         matrix_lanes,
         block_accumulator: offset,
-        len: offset + ACC_LANES,
+        recursion_root: offset + generation.chain_accumulator_lanes(),
+        len: offset + generation.chain_accumulator_lanes() + generation.recursion_root_lanes(),
+        generation,
     }
 }
 
+/// The public-IO spec of the launch relation. See
+/// [`history_step_bank_io_layout`].
 pub fn history_step_bank_io_spec() -> PublicIoSpec {
-    let layout = history_step_bank_io_layout();
+    history_step_bank_io_spec_for(HistoryStepPackGeneration::V1)
+}
+
+/// The public-IO spec of `generation`'s relation — what its post-commit
+/// digests are taken over.
+pub fn history_step_bank_io_spec_for(generation: HistoryStepPackGeneration) -> PublicIoSpec {
+    let layout = history_step_bank_io_layout_for(generation);
     PublicIoSpec {
         io_slice: WitnessSlice {
             log2_len: layout.len.next_power_of_two().trailing_zeros() as usize,
@@ -343,8 +507,22 @@ impl PinnedHistoryStepClassBank {
     pub fn validate(
         pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
     ) -> Result<Self, HistoryStepBankError> {
-        let layout = history_step_bank_io_layout();
-        let spec = history_step_bank_io_spec();
+        Self::validate_for(HistoryStepPackGeneration::V1, pins)
+    }
+
+    /// Validate a bank belonging to `generation`.
+    ///
+    /// The generation is not a preference: it fixes the public-IO layout the
+    /// post-commit digests were taken over, so a pack validated under the
+    /// wrong one fails on its first entry rather than loading and
+    /// misbehaving later. [`Self::validate`] is this under the launch
+    /// generation, unchanged.
+    pub fn validate_for(
+        generation: HistoryStepPackGeneration,
+        pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
+    ) -> Result<Self, HistoryStepBankError> {
+        let layout = history_step_bank_io_layout_for(generation);
+        let spec = history_step_bank_io_spec_for(generation);
         for (index, pin) in pins.iter().enumerate() {
             let expected_id = CanonicalHistoryStepClassId::from_index(index)
                 .expect("fixed-size bank has only canonical indices");
@@ -406,6 +584,11 @@ impl PinnedHistoryStepClassBank {
 
     pub fn layout(&self) -> &HistoryStepBankIoLayout {
         &self.layout
+    }
+
+    /// The relation generation this bank authenticates.
+    pub const fn generation(&self) -> HistoryStepPackGeneration {
+        self.layout.generation
     }
 
     pub fn spec(&self) -> &PublicIoSpec {
@@ -578,12 +761,34 @@ pub fn history_step_bank_base_output_io(
     class_id: CanonicalHistoryStepClassId,
     block_accumulator: &ChainAccumulator,
 ) -> Result<Vec<F128>, HistoryStepBankError> {
+    history_step_bank_base_output_io_rooted(
+        bank,
+        class_id,
+        block_accumulator,
+        &RecursionRoot::genesis(),
+    )
+}
+
+/// [`history_step_bank_base_output_io`] with the recursion root named.
+///
+/// Under the launch generation the root has no lanes and this is exactly the
+/// genesis-rooted base, whatever root is passed. Under v1.3 the root is
+/// written into its public-IO span, and a base rooted anywhere but on the
+/// boundary the verifier derives for that branch is refused natively.
+pub fn history_step_bank_base_output_io_rooted(
+    bank: &PinnedHistoryStepClassBank,
+    class_id: CanonicalHistoryStepClassId,
+    block_accumulator: &ChainAccumulator,
+    recursion_root: &RecursionRoot,
+) -> Result<Vec<F128>, HistoryStepBankError> {
     let mut io = vec![F128::ZERO; bank.layout.len];
     io[bank.layout.base] = F128::ONE;
     io[bank.layout.tip_class] = f128_from_u128(class_id.wire_id() as u128);
     write_bank_pins(bank, &mut io);
-    io[bank.layout.block_accumulator..bank.layout.block_accumulator + ACC_LANES]
-        .copy_from_slice(&block_acc_lanes(block_accumulator));
+    install_current_block_accumulator(bank, &mut io, block_accumulator);
+    if let Some(range) = bank.layout.recursion_root_range() {
+        io[range].copy_from_slice(&recursion_root.lanes());
+    }
     Ok(io)
 }
 
@@ -592,7 +797,10 @@ struct ParsedHistoryStepBankIo {
     base: bool,
     tip_class: CanonicalHistoryStepClassId,
     lanes: [Option<C1MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT],
-    block_accumulator: [F128; ACC_LANES],
+    /// `bank.layout.accumulator_lanes()` wide.
+    block_accumulator: Vec<F128>,
+    /// `None` under a generation that pins its root in the matrices.
+    recursion_root: Option<Vec<F128>>,
 }
 
 fn parse_history_step_bank_io(
@@ -661,15 +869,33 @@ fn parse_history_step_bank_io(
             _ => return Err(HistoryStepBankError::LaneLiveness(class_id)),
         }
     }
-    let mut block_accumulator = [F128::ZERO; ACC_LANES];
-    block_accumulator
-        .copy_from_slice(&io[layout.block_accumulator..layout.block_accumulator + ACC_LANES]);
+    let block_accumulator = io
+        [layout.block_accumulator..layout.block_accumulator + layout.accumulator_lanes()]
+        .to_vec();
+    // The root is carried, not judged: whether it is *the* root of the branch
+    // this terminal arrived on is decided by the caller that knows the
+    // branch. Deciding it here, against a boundary fixed once, is how a node
+    // quarantines every honest peer on the other side of a natural fork.
+    let recursion_root = layout
+        .recursion_root_range()
+        .map(|range| io[range].to_vec());
     Ok(ParsedHistoryStepBankIo {
         base,
         tip_class,
         lanes: parsed_lanes,
         block_accumulator,
+        recursion_root,
     })
+}
+
+/// The recursion-root lanes a terminal carries, or `None` under a generation
+/// whose relation pins its root in the matrices. Every bank pin and lane
+/// canonicality check has passed before these are handed out.
+pub fn history_step_bank_recursion_root_lanes(
+    bank: &PinnedHistoryStepClassBank,
+    io: &[F128],
+) -> Result<Option<Vec<F128>>, HistoryStepBankError> {
+    Ok(parse_history_step_bank_io(bank, io)?.recursion_root)
 }
 
 /// Decode one exact accumulated lane after validating every bank pin.
@@ -696,11 +922,16 @@ pub fn history_step_bank_block_accumulator(
     io: &[F128],
 ) -> Result<ChainAccumulator, HistoryStepBankError> {
     let parsed = parse_history_step_bank_io(bank, io)?;
-    let lanes = parsed.block_accumulator.map(|lane| {
-        let flat = (lane.lo as u128) | ((lane.hi as u128) << 64);
-        Block128::from(jetsam_core::hardware::flat_to_tower_u128(flat))
-    });
-    ChainAccumulator::from_lanes(lanes).map_err(|_| HistoryStepBankError::BlockAccumulator)
+    let lanes = parsed
+        .block_accumulator
+        .into_iter()
+        .map(|lane| {
+            let flat = (lane.lo as u128) | ((lane.hi as u128) << 64);
+            Block128::from(jetsam_core::hardware::flat_to_tower_u128(flat))
+        })
+        .collect::<Vec<_>>();
+    ChainAccumulator::from_generation_lanes(bank.generation(), &lanes)
+        .map_err(|_| HistoryStepBankError::BlockAccumulator)
 }
 
 fn install_folded_lane(
@@ -738,8 +969,9 @@ fn install_current_block_accumulator(
     io: &mut [F128],
     current: &ChainAccumulator,
 ) {
-    io[bank.layout.block_accumulator..bank.layout.block_accumulator + ACC_LANES]
-        .copy_from_slice(&block_acc_lanes(current));
+    let start = bank.layout.block_accumulator;
+    io[start..start + bank.layout.accumulator_lanes()]
+        .copy_from_slice(&block_acc_lanes_for(bank.generation(), current));
 }
 
 /// Prefix the native and trace fold transcripts identically.  Keeping this in
@@ -920,7 +1152,7 @@ pub struct PendingHistoryStepBankDecision {
     requirements: [MatrixRequirement; HISTORY_STEP_CLASS_COUNT],
     bank_digest: [u8; 32],
     base: bool,
-    block_accumulator: [F128; ACC_LANES],
+    block_accumulator: Vec<F128>,
 }
 
 impl PendingHistoryStepBankDecision {
@@ -1156,7 +1388,7 @@ pub struct AcceptedHistoryStepBankTip {
     tip_class: CanonicalHistoryStepClassId,
     bank_digest: [u8; 32],
     base: bool,
-    block_accumulator: [F128; ACC_LANES],
+    block_accumulator: Vec<F128>,
 }
 
 impl AcceptedHistoryStepBankTip {
@@ -1172,7 +1404,9 @@ impl AcceptedHistoryStepBankTip {
         self.base
     }
 
-    pub const fn block_accumulator(&self) -> &[F128; ACC_LANES] {
+    /// The accepted boundary, in the lane encoding of the bank's generation:
+    /// ten lanes at launch, twelve under v1.3.
+    pub fn block_accumulator(&self) -> &[F128] {
         &self.block_accumulator
     }
 }
@@ -1382,7 +1616,13 @@ mod tests {
     use jetsam_ivc_core::field_circuit::{FsChannelOps, LinExpr};
 
     fn test_pins() -> [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT] {
-        let spec = history_step_bank_io_spec();
+        test_pins_for(HistoryStepPackGeneration::V1)
+    }
+
+    fn test_pins_for(
+        generation: HistoryStepPackGeneration,
+    ) -> [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT] {
+        let spec = history_step_bank_io_spec_for(generation);
         std::array::from_fn(|index| {
             let class_id = CanonicalHistoryStepClassId::from_index(index).unwrap();
             let shape = canonical_history_step_shape(class_id);
@@ -1419,6 +1659,207 @@ mod tests {
         assert_eq!(last.index(), 1);
         assert_eq!(last.current_tier(), 255);
         assert!(CanonicalHistoryStepClassId::new(2).is_none());
+    }
+
+    /// The launch layout, in numbers. These are the lane indices every
+    /// terminal of this chain has been proved against since block one and
+    /// the post-commit digests of `/opt/jetsam-pack-v2` are taken over the
+    /// spec that follows from them: a change here is a change to what the
+    /// network verifies, whatever the v1.3 clock says.
+    #[test]
+    fn the_launch_layout_is_what_it_was_before_v1_3_existed() {
+        let layout = history_step_bank_io_layout();
+        assert_eq!(layout.generation, HistoryStepPackGeneration::V1);
+        assert_eq!(layout.base, 0);
+        assert_eq!(layout.tip_class, 1);
+        assert_eq!(layout.matrix_whitelist, 2);
+        assert_eq!(layout.post_commit_whitelist, 6);
+        assert_eq!(layout.bank_digest, 10);
+        assert_eq!(layout.matrix_lanes[0].point, 12);
+        assert_eq!(layout.matrix_lanes[1].point, 105);
+        assert_eq!(layout.block_accumulator, 206);
+        assert_eq!(layout.accumulator_lanes(), ACC_LANES);
+        assert_eq!(layout.recursion_root_range(), None);
+        assert_eq!(layout.len, 216);
+
+        let spec = history_step_bank_io_spec();
+        assert_eq!(spec.io_len, 216);
+        assert_eq!(spec.io_slice.log2_len, 8);
+        assert_eq!(spec.io_slice.index, 1);
+        assert!(spec.claims.is_empty());
+    }
+
+    /// The two relations' public IO agree lane for lane up to the point where
+    /// v1.3 starts carrying more, and differ by exactly what it added: two
+    /// accumulator lanes and the fourteen-lane recursion root.
+    #[test]
+    fn the_launch_public_io_is_the_prefix_of_the_v1_3_one() {
+        let launch = history_step_bank_io_layout_for(HistoryStepPackGeneration::V1);
+        let current = history_step_bank_io_layout_for(HistoryStepPackGeneration::V1_3);
+
+        assert_eq!(launch, history_step_bank_io_layout());
+        assert_eq!(launch.base, current.base);
+        assert_eq!(launch.tip_class, current.tip_class);
+        assert_eq!(launch.matrix_whitelist, current.matrix_whitelist);
+        assert_eq!(launch.post_commit_whitelist, current.post_commit_whitelist);
+        assert_eq!(launch.bank_digest, current.bank_digest);
+        assert_eq!(launch.matrix_lanes, current.matrix_lanes);
+        assert_eq!(launch.block_accumulator, current.block_accumulator);
+
+        assert_eq!(launch.accumulator_lanes(), 10);
+        assert_eq!(current.accumulator_lanes(), 12);
+        assert_eq!(launch.recursion_root_range(), None);
+        assert_eq!(
+            current.recursion_root_range(),
+            Some(current.recursion_root..current.recursion_root + V1_3_RECURSION_ROOT_LANES)
+        );
+        assert_eq!(current.recursion_root, current.block_accumulator + 12);
+        assert_eq!(launch.len + 2 + V1_3_RECURSION_ROOT_LANES, current.len);
+        assert_eq!(current.len, 232);
+
+        // The specs the post-commit digests are taken over follow the
+        // layouts. Both lengths land in the same power-of-two witness slice,
+        // so the slice cannot tell the relations apart — only the length can.
+        let launch_spec = history_step_bank_io_spec_for(HistoryStepPackGeneration::V1);
+        let current_spec = history_step_bank_io_spec_for(HistoryStepPackGeneration::V1_3);
+        assert_eq!(launch_spec.io_len, launch.len);
+        assert_eq!(current_spec.io_len, current.len);
+        assert_eq!(launch_spec.io_slice, current_spec.io_slice);
+        assert_ne!(
+            launch_spec.transcript_lanes(),
+            current_spec.transcript_lanes(),
+            "the two specs must digest differently or a pack could be validated under either"
+        );
+    }
+
+    /// A bank validated under one generation refuses pins whose post-commit
+    /// digests were taken over the other's spec: the generation is how a
+    /// loader identifies the pack it was handed.
+    #[test]
+    fn a_bank_validated_under_the_wrong_generation_fails_on_its_first_entry() {
+        assert!(PinnedHistoryStepClassBank::validate(test_pins()).is_ok());
+        assert!(PinnedHistoryStepClassBank::validate_for(
+            HistoryStepPackGeneration::V1_3,
+            test_pins_for(HistoryStepPackGeneration::V1_3)
+        )
+        .is_ok());
+        assert!(matches!(
+            PinnedHistoryStepClassBank::validate_for(
+                HistoryStepPackGeneration::V1_3,
+                test_pins()
+            ),
+            Err(HistoryStepBankError::EntryPostCommit(class)) if class.index() == 0
+        ));
+        assert!(matches!(
+            PinnedHistoryStepClassBank::validate(test_pins_for(HistoryStepPackGeneration::V1_3)),
+            Err(HistoryStepBankError::EntryPostCommit(class)) if class.index() == 0
+        ));
+    }
+
+    /// A v1.3 boundary with the two anchors apart, so that the twelfth lane
+    /// is observable.
+    fn v1_3_boundary() -> ChainAccumulator {
+        let mut accumulator = crate::accumulator::genesis_accumulator();
+        accumulator.height = 7;
+        accumulator.epoch_anchor_id = [0x5A; 32];
+        accumulator.previous_epoch_anchor_id = [0xA5; 32];
+        accumulator
+    }
+
+    #[test]
+    fn every_field_of_a_root_reaches_its_lanes() {
+        let root = RecursionRoot::new(v1_3_boundary(), [0x3C; 32]);
+        let lanes = root.lanes();
+        assert_eq!(lanes.len(), V1_3_RECURSION_ROOT_LANES);
+        assert_eq!(
+            &lanes[..12],
+            block_acc_lanes_for(HistoryStepPackGeneration::V1_3, root.accumulator()).as_slice()
+        );
+        assert_eq!(&lanes[..ACC_LANES], &block_acc_lanes(root.accumulator()));
+        assert_eq!(
+            &lanes[12..],
+            &crate::acceptance::trace::accepted_claim_batch::digest_lanes(&root.block_id())
+                .map(flat_of)
+        );
+        assert_eq!(root.height(), 7);
+
+        // The genesis root names the genesis header, not the anchor lanes.
+        let genesis = RecursionRoot::genesis();
+        assert_eq!(genesis.height(), 0);
+        assert_eq!(
+            genesis.block_id(),
+            jetsam_chain::hash_block_header(&jetsam_chain::consensus::genesis_header())
+        );
+    }
+
+    /// Under the launch generation a base carries no root and decodes the
+    /// ten-lane boundary it always did; under v1.3 the same call writes the
+    /// root into its span and the boundary comes back twelve lanes wide,
+    /// previous anchor included.
+    #[test]
+    fn a_base_carries_its_root_exactly_when_the_generation_does() {
+        let class = CanonicalHistoryStepClassId::new(0).unwrap();
+        let boundary = v1_3_boundary();
+        let root = RecursionRoot::new(boundary.clone(), [0x3C; 32]);
+
+        let launch = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
+        assert_eq!(launch.generation(), HistoryStepPackGeneration::V1);
+        let launch_io =
+            history_step_bank_base_output_io_rooted(&launch, class, &boundary, &root).unwrap();
+        assert_eq!(launch_io.len(), 216);
+        assert_eq!(
+            launch_io,
+            history_step_bank_base_output_io(&launch, class, &boundary).unwrap(),
+            "under the launch generation the root passed is never observable"
+        );
+        assert_eq!(
+            history_step_bank_recursion_root_lanes(&launch, &launch_io).unwrap(),
+            None
+        );
+        let decoded = history_step_bank_block_accumulator(&launch, &launch_io).unwrap();
+        assert_eq!(decoded.to_lanes(), boundary.to_lanes());
+        assert_eq!(
+            decoded.previous_epoch_anchor_id, decoded.epoch_anchor_id,
+            "a ten-lane boundary has no previous anchor lane to decode"
+        );
+
+        let current = PinnedHistoryStepClassBank::validate_for(
+            HistoryStepPackGeneration::V1_3,
+            test_pins_for(HistoryStepPackGeneration::V1_3),
+        )
+        .unwrap();
+        assert_eq!(current.generation(), HistoryStepPackGeneration::V1_3);
+        let current_io =
+            history_step_bank_base_output_io_rooted(&current, class, &boundary, &root).unwrap();
+        assert_eq!(current_io.len(), 232);
+        let range = current.layout().recursion_root_range().unwrap();
+        assert_eq!(&current_io[range], &root.lanes());
+        assert_eq!(
+            history_step_bank_recursion_root_lanes(&current, &current_io).unwrap(),
+            Some(root.lanes().to_vec())
+        );
+        assert_eq!(
+            history_step_bank_block_accumulator(&current, &current_io).unwrap(),
+            boundary,
+            "the twelve-lane boundary round-trips with its previous anchor"
+        );
+        assert!(parse_history_step_bank_io(&current, &current_io).unwrap().base);
+
+        // The rootless call under v1.3 roots the base at genesis, which is
+        // what its contract says and the only root a fresh chain has.
+        let genesis_rooted =
+            history_step_bank_base_output_io(&current, class, &boundary).unwrap();
+        let range = current.layout().recursion_root_range().unwrap();
+        assert_eq!(&genesis_rooted[range], &RecursionRoot::genesis().lanes());
+
+        // And a launch IO is refused by a v1.3 bank on length alone.
+        assert!(matches!(
+            parse_history_step_bank_io(&current, &launch_io),
+            Err(HistoryStepBankError::IoLength {
+                expected: 232,
+                actual: 216
+            })
+        ));
     }
 
     #[test]
