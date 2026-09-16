@@ -219,6 +219,7 @@ mod tests {
             active_slot_count: 17,
             alloc_counter: 29,
             epoch_anchor_id: [0x33; 32],
+            previous_epoch_anchor_id: [0x33; 32],
         };
         let parent_block_id = [0x66; 32];
         let child = NativeChild {
@@ -231,6 +232,12 @@ mod tests {
             active_slot_count: 19,
             alloc_counter: 31,
         };
+        let epoch_anchor_id =
+            if parent_height % jetsam_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
+                parent_block_id
+            } else {
+                start.epoch_anchor_id
+            };
         let end = ChainAccumulator {
             height: child.height,
             tip_semantic_id: child.semantic_id,
@@ -238,11 +245,8 @@ mod tests {
             log_slots: child.log_slots,
             active_slot_count: child.active_slot_count,
             alloc_counter: child.alloc_counter,
-            epoch_anchor_id: if parent_height % jetsam_chain::consensus::params::TX_EPOCH_BLOCKS == 0 {
-                parent_block_id
-            } else {
-                start.epoch_anchor_id
-            },
+            epoch_anchor_id,
+            previous_epoch_anchor_id: epoch_anchor_id,
         };
         (start, child, end)
     }
