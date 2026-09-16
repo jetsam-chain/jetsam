@@ -146,6 +146,58 @@ pub(crate) const fn v1_2_active_with(height: u64, activation_height: Option<u64>
     matches!(activation_height, Some(activation) if height >= activation)
 }
 
+/// First block height governed by the v1.3 consensus rules.
+///
+/// **`None` keeps every v1.3 rule disabled**, and that is what every profile
+/// carries today. One activation height for the whole upgrade: the 24-page
+/// small class, the two-epoch transaction anchor, the second matrix pack
+/// generation and the recursion root carried in the public IO all switch on
+/// this single clock, and on nothing else. A binary with this constant at
+/// `None` proves, verifies and encodes byte for byte what v1.2.0 does.
+///
+/// # Why this is not [`V1_2_ACTIVATION_HEIGHT`]
+///
+/// v1.2 is armed and past — 8450 on mainnet, genesis on the test chain.
+/// Hanging the v1.3 rules off that constant would arm them retroactively, at
+/// a height the chain crossed days ago, against blocks that were proved by a
+/// pack whose small class held 25 pages. A node built that way judges live
+/// history by a ladder that has never existed and rejects the chain it is
+/// syncing. Two clocks are two forks, and this is the second one.
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// The height is decided with the network operator and must sit far enough
+/// above the tip that every node and every miner runs a binary carrying this
+/// constant *before* the height is reached. rplant places about 96 % of the
+/// blocks: if that miner misses the date, **we** are the minority chain.
+/// This fork changes the proof relation itself, so the notice has to cover
+/// the time it takes every operator to install a binary that carries the
+/// second matrix pack.
+///
+/// `wire_limits::tests::arming_v1_3_takes_two_deliberate_edits` fails the
+/// moment this value disagrees with the declaration beside it, so arming is
+/// visible in CI and cannot happen as a side effect of an unrelated edit.
+#[cfg(not(feature = "testnet"))]
+pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// The test chain will cross v1.3 first, at a height chosen against its own
+/// tip, so the crossing is watched on a chain that has real pre-fork history
+/// behind it. Dormant until that height is chosen with the operator.
+#[cfg(feature = "testnet")]
+pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Whether one candidate block height is governed by the v1.3 consensus rules.
+#[inline]
+pub const fn v1_3_active(height: u64) -> bool {
+    v1_3_active_with(height, V1_3_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_3_active`] with the activation height injected.
+#[inline]
+pub(crate) const fn v1_3_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
 
@@ -238,6 +290,173 @@ pub fn block_class_touched_capacity(user_tier: usize) -> usize {
 pub fn block_class_spend_capacity_for_page_count(page_count: usize) -> Option<usize> {
     block_page_class_tier(page_count).map(block_class_spend_capacity)
 }
+
+/// Page positions held by the small class of the v1.3 matrices.
+///
+/// One less than at launch. The page given up returns no terminal bytes —
+/// the terminal is a function of the class *shape*, and B24 and B25 pack
+/// into the same one — it returns circuit rows, which is what the second
+/// epoch anchor spends. It is never read below [`V1_3_ACTIVATION_HEIGHT`].
+pub const V1_3_TIER_SMALL: usize = 24;
+
+/// The class ladder in force at `height`.
+///
+/// [`BLOCK_PAGE_CLASS_TIERS`] is the ladder of the matrices this binary
+/// carries and is what the proof side builds against today. Admission that
+/// has to judge blocks proved by another pack asks this instead. With the
+/// v1.3 clock at `None` it answers the launch ladder at every height.
+#[inline]
+pub const fn block_page_class_tiers_at_height(height: u64) -> [usize; 2] {
+    block_page_class_tiers_at_activation(height, V1_3_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`block_page_class_tiers_at_height`] with the schedule
+/// injected.
+#[inline]
+pub const fn block_page_class_tiers_at_activation(
+    height: u64,
+    activation_height: Option<u64>,
+) -> [usize; 2] {
+    HistoryStepPackGeneration::at_activation(height, activation_height).tiers()
+}
+
+/// Proof class tier for a block's effective page-position count, under the
+/// ladder in force at the block's own height.
+#[inline]
+pub fn block_page_class_tier_at_height(page_count: usize, height: u64) -> Option<usize> {
+    block_page_class_tier_at_activation(page_count, height, V1_3_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`block_page_class_tier_at_height`] with the schedule
+/// injected.
+#[inline]
+pub fn block_page_class_tier_at_activation(
+    page_count: usize,
+    height: u64,
+    activation_height: Option<u64>,
+) -> Option<usize> {
+    class_tier_for(
+        &block_page_class_tiers_at_activation(height, activation_height),
+        page_count,
+    )
+}
+
+/// Which matrix pack — which *relation* — a block belongs to.
+///
+/// The v1.3 upgrade changes the relation itself: the small class holds 24
+/// page positions instead of 25, the recursive boundary carries a second
+/// epoch anchor, and the recursion root travels in the public IO instead of
+/// being pinned as this chain's genesis. None of that is expressible in one
+/// set of matrices, so a block below the activation height was proved
+/// against the launch pack and is only ever verifiable against the launch
+/// pack — for ever, whatever the tip is.
+///
+/// One binary therefore carries **both relations** and picks by the block's
+/// own height, never by its tip. Everything the two generations disagree
+/// about is a method on this enum, so that the disagreement is enumerable
+/// rather than scattered: a reader sees the whole of what the fork changes by
+/// reading the methods below. The pre-fork answers are the constants the
+/// chain launched with, and a `V1` answer never changes.
+///
+/// v1.2 is deliberately not a generation. It raised the terminal byte cap and
+/// changed a wire encoding, neither of which touches a matrix; the chain
+/// crossed it on the pack it already had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryStepPackGeneration {
+    /// The relation the chain has run on since block one.
+    V1,
+    /// The relation that starts at [`V1_3_ACTIVATION_HEIGHT`].
+    V1_3,
+}
+
+impl HistoryStepPackGeneration {
+    /// The generation that governs `height`, under the fixed schedule.
+    #[inline]
+    pub const fn at_height(height: u64) -> Self {
+        Self::at_activation(height, V1_3_ACTIVATION_HEIGHT)
+    }
+
+    /// Testable twin with the schedule injected. Production always reads the
+    /// fixed clock; this exists so both relations can be exercised across a
+    /// boundary while the real clock stays dormant.
+    #[inline]
+    pub const fn at_activation(height: u64, activation_height: Option<u64>) -> Self {
+        if v1_3_active_with(height, activation_height) {
+            Self::V1_3
+        } else {
+            Self::V1
+        }
+    }
+
+    /// The class ladder this generation's matrices were built for.
+    #[inline]
+    pub const fn tiers(self) -> [usize; 2] {
+        match self {
+            Self::V1 => BLOCK_PAGE_CLASS_TIERS,
+            Self::V1_3 => [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]],
+        }
+    }
+
+    /// Page positions held by this generation's small class.
+    #[inline]
+    pub const fn small_tier(self) -> usize {
+        self.tiers()[0]
+    }
+
+    /// Page positions held by this generation's large class. The same in both,
+    /// and named rather than indexed so a reader never has to count.
+    #[inline]
+    pub const fn large_tier(self) -> usize {
+        self.tiers()[1]
+    }
+
+    /// `Block128` lanes in this generation's recursive boundary.
+    ///
+    /// Ten at launch; twelve from v1.3, the two added ones carrying the
+    /// previous epoch anchor. This is the width of the accumulator wherever it
+    /// is encoded: public IO, in-circuit wires, the terminal wire frame.
+    #[inline]
+    pub const fn chain_accumulator_lanes(self) -> usize {
+        match self {
+            Self::V1 => 10,
+            Self::V1_3 => 12,
+        }
+    }
+
+    /// Public-IO lanes naming the boundary the recursion starts from, or zero
+    /// when the relation pins this chain's genesis as constants instead.
+    ///
+    /// v1.3 carries the root — the accumulator lanes plus the two block-id
+    /// lanes of the header that produced it — because its own recursion starts
+    /// at the activation height, not at genesis.
+    #[inline]
+    pub const fn recursion_root_lanes(self) -> usize {
+        match self {
+            Self::V1 => 0,
+            Self::V1_3 => self.chain_accumulator_lanes() + 2,
+        }
+    }
+
+    /// Whether a live user page may bind either of two accepted epoch anchors.
+    ///
+    /// K = 1 at launch: one anchor, and a transaction built one block before a
+    /// boundary had 90 seconds to be mined. K = 2 from v1.3.
+    #[inline]
+    pub const fn binds_two_epoch_anchors(self) -> bool {
+        matches!(self, Self::V1_3)
+    }
+
+    /// Whether the recursion root travels in the public IO.
+    #[inline]
+    pub const fn carries_recursion_root(self) -> bool {
+        self.recursion_root_lanes() != 0
+    }
+}
+
+const _: () = assert!(
+    V1_3_TIER_SMALL < BLOCK_PAGE_CLASS_TIERS[0],
+    "the v1.3 small class gives up a page position, it never adds one"
+);
 
 /// Number of blocks for the transaction replay-protection epoch.
 ///
@@ -610,5 +829,112 @@ mod tests {
     fn transaction_epoch_is_not_asert_epoch() {
         assert_eq!(TX_EPOCH_BLOCKS, 32); // JETSAM: 48 min at 90s blocks
         assert_ne!(TX_EPOCH_BLOCKS, EPOCH_LENGTH);
+    }
+
+    /// The pack generation is a function of the block's own height and the
+    /// schedule, and of nothing else. Under a dormant clock every height is
+    /// the launch generation.
+    #[test]
+    fn the_pack_generation_is_chosen_by_the_blocks_own_height() {
+        use HistoryStepPackGeneration::{V1, V1_3};
+        const ACTIVATION: u64 = 42;
+
+        assert_eq!(HistoryStepPackGeneration::at_activation(0, Some(ACTIVATION)), V1);
+        assert_eq!(HistoryStepPackGeneration::at_activation(41, Some(ACTIVATION)), V1);
+        assert_eq!(HistoryStepPackGeneration::at_activation(42, Some(ACTIVATION)), V1_3);
+        assert_eq!(HistoryStepPackGeneration::at_activation(43, Some(ACTIVATION)), V1_3);
+        assert_eq!(
+            HistoryStepPackGeneration::at_activation(u64::MAX, Some(ACTIVATION)),
+            V1_3
+        );
+        for height in [0, 1, 4_004, 8450, u64::MAX] {
+            assert_eq!(HistoryStepPackGeneration::at_activation(height, None), V1);
+            assert!(!v1_3_active_with(height, None));
+        }
+    }
+
+    /// Everything the fork changes, enumerated: what `V1` answers is what the
+    /// chain launched with, and it is what every height answers while the
+    /// clock is dormant.
+    #[test]
+    fn the_launch_generation_answers_the_launch_constants() {
+        let v1 = HistoryStepPackGeneration::V1;
+        assert_eq!(v1.tiers(), BLOCK_PAGE_CLASS_TIERS);
+        assert_eq!(v1.tiers(), [25, 255]);
+        assert_eq!(v1.small_tier(), 25);
+        assert_eq!(v1.large_tier(), 255);
+        assert_eq!(v1.chain_accumulator_lanes(), 10);
+        assert_eq!(v1.recursion_root_lanes(), 0);
+        assert!(!v1.binds_two_epoch_anchors());
+        assert!(!v1.carries_recursion_root());
+
+        let v1_3 = HistoryStepPackGeneration::V1_3;
+        assert_eq!(v1_3.tiers(), [V1_3_TIER_SMALL, 255]);
+        assert_eq!(v1_3.tiers(), [24, 255]);
+        assert_eq!(v1_3.small_tier(), 24);
+        assert_eq!(v1_3.large_tier(), v1.large_tier());
+        assert_eq!(v1_3.chain_accumulator_lanes(), 12);
+        assert_eq!(v1_3.recursion_root_lanes(), 14);
+        assert!(v1_3.binds_two_epoch_anchors());
+        assert!(v1_3.carries_recursion_root());
+    }
+
+    /// A block is judged by the class ladder in force at its own height.
+    ///
+    /// The v1.3 pack holds 24 pages in the small class; every block below the
+    /// activation height was proved against a pack that held 25. A node
+    /// replaying history therefore has to resolve a 25-position block to the
+    /// *small* class, exactly as the pack that produced it did — otherwise it
+    /// asks the large class for a terminal the chain never made, and rejects
+    /// a block the network accepted long before.
+    #[test]
+    fn the_class_ladder_is_the_one_in_force_at_the_blocks_own_height() {
+        const ACTIVATION: u64 = 42;
+
+        // Below the fork: the ladder the chain launched with.
+        assert_eq!(block_page_class_tiers_at_activation(41, Some(ACTIVATION)), [25, 255]);
+        assert_eq!(
+            block_page_class_tier_at_activation(25, 41, Some(ACTIVATION)),
+            Some(25)
+        );
+        assert_eq!(
+            block_page_class_tier_at_activation(26, 41, Some(ACTIVATION)),
+            Some(255)
+        );
+
+        // At and above it: the v1.3 ladder.
+        assert_eq!(
+            block_page_class_tiers_at_activation(ACTIVATION, Some(ACTIVATION)),
+            [24, 255]
+        );
+        assert_eq!(
+            block_page_class_tier_at_activation(24, ACTIVATION, Some(ACTIVATION)),
+            Some(24)
+        );
+        assert_eq!(
+            block_page_class_tier_at_activation(25, ACTIVATION, Some(ACTIVATION)),
+            Some(255)
+        );
+        assert_eq!(
+            block_page_class_tier_at_activation(256, ACTIVATION, Some(ACTIVATION)),
+            None
+        );
+
+        // Dormant: every height keeps the launch ladder, so this binary
+        // judges the live chain exactly as v1.2.0 does.
+        for height in [0, 1, 4_004, 8450, u64::MAX] {
+            assert_eq!(
+                block_page_class_tiers_at_height(height),
+                BLOCK_PAGE_CLASS_TIERS,
+                "height {height}"
+            );
+            for page_count in [0, 24, 25, 26, 255, 256] {
+                assert_eq!(
+                    block_page_class_tier_at_height(page_count, height),
+                    block_page_class_tier(page_count),
+                    "height {height}, {page_count} pages"
+                );
+            }
+        }
     }
 }

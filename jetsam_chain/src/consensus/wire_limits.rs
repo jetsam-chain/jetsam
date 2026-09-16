@@ -246,6 +246,49 @@ mod tests {
         );
     }
 
+    /// `None` on every profile: v1.3 is written and dormant. It is the second
+    /// clock, and it exists precisely because v1.2 is behind us — the class
+    /// ladder, the two-epoch anchor and the matrix pack generation must not
+    /// switch on a height the chain crossed days ago.
+    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// The same two-edit rule as the v1.2 guard above, for the second clock.
+    #[test]
+    fn arming_v1_3_takes_two_deliberate_edits() {
+        assert_eq!(
+            crate::consensus::params::V1_3_ACTIVATION_HEIGHT,
+            DECLARED_V1_3_ACTIVATION_HEIGHT,
+            "arming the v1.3 fork is decided with the network operator: change \
+             this declaration and params::V1_3_ACTIVATION_HEIGHT in one commit, \
+             or neither"
+        );
+    }
+
+    /// The two clocks are read by two disjoint sets of rules, and the terminal
+    /// cap is on the first one.
+    ///
+    /// A regression that made the cap follow v1.3 would silently un-arm a rule
+    /// the mainnet has been running under since block 8450 — every node would
+    /// start refusing terminals its peers consider valid.
+    #[test]
+    fn the_terminal_cap_is_on_the_v1_2_clock_not_the_v1_3_one() {
+        use crate::consensus::params::{V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT};
+
+        assert_ne!(
+            V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT,
+            "the two clocks must not be the same value, or nothing here proves \
+             which one a rule reads"
+        );
+        if let Some(armed) = V1_2_ACTIVATION_HEIGHT {
+            assert_eq!(
+                history_step_terminal_bytes_limit(armed),
+                V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
+                "the raised cap is in force from the v1.2 height, whatever v1.3 \
+                 is set to"
+            );
+        }
+    }
+
     /// The rule, whether the fork is armed or not: the v1 cap governs every
     /// height below the activation, the raised cap every height at or above it,
     /// and a dormant profile keeps the v1 cap everywhere.
