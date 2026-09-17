@@ -249,15 +249,28 @@ mod tests {
         );
     }
 
-    /// `None` on every profile: v1.3 is written and dormant. It is the second
-    /// clock, and it exists precisely because v1.2 is behind us — the class
-    /// ladder, the two-epoch anchor and the matrix pack generation must not
-    /// switch on a height the chain crossed days ago.
+    /// The second clock. It exists precisely because v1.2 is behind us — the
+    /// class ladder, the two-epoch anchor and the matrix pack generation must
+    /// not switch on a height the chain crossed days ago.
     ///
-    /// The test chain still crosses first, at a height chosen against its own
-    /// tip with the operator. The first attempt was armed at 1304 and stalled
-    /// there; the height is re-picked above the tip the upgraded binary is
-    /// deployed at, and arming it is again two deliberate edits.
+    /// **This declaration is per profile, exactly like the constant it
+    /// mirrors.** One declaration for both profiles makes the guard fail on
+    /// whichever profile is not armed — which is precisely the profile whose
+    /// dormancy matters most, and the failure looks like a bug in the guard
+    /// rather than what it is.
+    ///
+    /// The test chain crosses first, at a height chosen against its own tip
+    /// with the operator. The first attempt was armed at 1304 and stalled
+    /// there on a decoding defect since fixed; 1419 was re-picked above the
+    /// tip the corrected binary was deployed at, and the chain crossed it on
+    /// 2026-09-17.
+    #[cfg(feature = "testnet")]
+    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(1419);
+
+    /// `None` on the public network: nothing is armed there until the test
+    /// chain has crossed and run under the new relation — and then only at a
+    /// height decided with the network operator.
+    #[cfg(not(feature = "testnet"))]
     const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
