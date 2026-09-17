@@ -10,16 +10,20 @@ source "$SCRIPT_DIR/release_common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/generate_history_step_pack.sh OUTPUT_DIR
+Usage: ./scripts/generate_history_step_pack.sh OUTPUT_DIR [--generation v1|v1.3]
 
-Generate the canonical two-class HistoryStep v1 pack once from honest genesis
+Generate one canonical two-class HistoryStep pack from honest genesis
 fixtures, authenticate it, and publish it atomically at OUTPUT_DIR. Matrix
 generation can take roughly 90 minutes on the reference laptop. OUTPUT_DIR
 must not exist; keep it outside the disposable repository target/ directory.
+
+Without --generation this builds the launch pack, unchanged. A generation is
+the relation the whole build runs under, not a label on the output, so a pack
+belongs for ever to the one it was frozen under.
 EOF
 }
 
-if (( $# != 1 )); then
+if (( $# < 1 )); then
   usage >&2
   exit 2
 fi
@@ -28,7 +32,29 @@ if [[ $1 == -h || $1 == --help ]]; then
   exit 0
 fi
 
-OUTPUT_DIR=$(release_absolute_from_root "$1")
+OUTPUT_ARGUMENT=$1
+shift
+GENERATOR_GENERATION=()
+while (( $# > 0 )); do
+  case $1 in
+    --generation)
+      (( $# >= 2 )) || release_die "--generation needs a value"
+      case $2 in
+        v1|v1.3) ;;
+        *) release_die "unknown pack generation: $2" ;;
+      esac
+      (( ${#GENERATOR_GENERATION[@]} == 0 )) || release_die "--generation given twice"
+      GENERATOR_GENERATION=(--generation "$2")
+      shift 2
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+OUTPUT_DIR=$(release_absolute_from_root "$OUTPUT_ARGUMENT")
 OUTPUT_PARENT=$(dirname -- "$OUTPUT_DIR")
 OUTPUT_NAME=$(basename -- "$OUTPUT_DIR")
 [[ $OUTPUT_NAME != . && $OUTPUT_NAME != .. && -n $OUTPUT_NAME ]] || \
@@ -64,8 +90,9 @@ cd "$RELEASE_ROOT_DIR"
 release_build_pack_tools 1
 
 CURRENT_STAGE='canonical HistoryStep matrix generation'
-printf '\n==> Generating B25/m22 and B255/m24 matrices at zstd level 19\n'
-JETSAM_ARTIFACT_ZSTD_LEVEL=19 "$RELEASE_MATRIX_GENERATOR" "$STAGING_DIR"
+printf '\n==> Generating the m22 and m24 class matrices at zstd level 19\n'
+JETSAM_ARTIFACT_ZSTD_LEVEL=19 "$RELEASE_MATRIX_GENERATOR" "$STAGING_DIR" \
+  ${GENERATOR_GENERATION[@]+"${GENERATOR_GENERATION[@]}"}
 
 CURRENT_STAGE='pack authentication'
 printf '\n==> Authenticating generated artifacts and deriving release pins\n'
