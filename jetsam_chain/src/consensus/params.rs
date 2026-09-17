@@ -188,7 +188,7 @@ pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 /// public network until this crossing has happened and the chain has run
 /// under the new relation.
 #[cfg(feature = "testnet")]
-pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(1419);
 
 /// Whether one candidate block height is governed by the v1.3 consensus rules.
 #[inline]
