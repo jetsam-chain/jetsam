@@ -328,6 +328,9 @@ fn build_parent(
         })?;
         let capture = step.capture_parent_slot;
         let (block, terminal) = match step.input {
+            PreparedHistoryStepBackboneInput::B24(fixture) => {
+                prove_parent_step(runtime, parent.as_ref(), fixture)?
+            }
             PreparedHistoryStepBackboneInput::B25(fixture) => {
                 prove_parent_step(runtime, parent.as_ref(), fixture)?
             }

@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use jetsam_ivc_core::field_r1cs::FieldR1cs;
 
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+
 use super::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
-    derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
+    derive_history_step_direct_block_vk_in, derive_history_step_runtime_parts_in,
     pin_history_step_class_bank, prove_history_step, BlockRegionSidecarVk, ChainAccumulator,
     HistoryStepBlockInput, HistoryStepError, HistoryStepMatrixLease, HistoryStepMatrixSource,
     HistoryStepMatrixSourceError, HistoryStepParent, HistoryStepRuntime, HistoryStepRuntimeParts,
@@ -29,7 +31,13 @@ use crate::acceptance::history_step_bank::{
 
 /// One consuming backbone witness. The variant is the compile-time Block tier;
 /// no runtime tier value can disagree with its relation type.
+///
+/// Slot zero has one variant per generation, because the tier itself is what
+/// the v1.3 ladder moves: 25 page positions at launch and 24 from v1.3. The
+/// slot they occupy is the same, so both carry `current_slot() == 0`, and a
+/// freeze pass uses exactly the one its generation names.
 pub enum HistoryStepFreezeInput {
+    B24(HistoryStepBlockInput<24>),
     B25(HistoryStepBlockInput<25>),
     B255(HistoryStepBlockInput<255>),
 }
@@ -37,13 +45,14 @@ pub enum HistoryStepFreezeInput {
 impl HistoryStepFreezeInput {
     fn current_slot(&self) -> usize {
         match self {
-            Self::B25(_) => 0,
+            Self::B24(_) | Self::B25(_) => 0,
             Self::B255(_) => 1,
         }
     }
 
     fn start_accumulator(&self) -> &ChainAccumulator {
         match self {
+            Self::B24(input) => input.start_accumulator(),
             Self::B25(input) => input.start_accumulator(),
             Self::B255(input) => input.start_accumulator(),
         }
@@ -51,6 +60,7 @@ impl HistoryStepFreezeInput {
 
     fn end_accumulator(&self) -> &ChainAccumulator {
         match self {
+            Self::B24(input) => input.end_accumulator(),
             Self::B25(input) => input.end_accumulator(),
             Self::B255(input) => input.end_accumulator(),
         }
@@ -67,6 +77,14 @@ pub trait HistoryStepFreezeInputProvider {
         &mut self,
         expected_start: &ChainAccumulator,
     ) -> Result<Option<HistoryStepFreezeInput>, Self::Error>;
+
+    /// The slot-zero witness of the v1.3 ladder, whose small class holds 24
+    /// page positions. A launch-only provider may refuse it.
+    fn b24(
+        &mut self,
+        class: CanonicalHistoryStepClassId,
+        expected_start: &ChainAccumulator,
+    ) -> Result<HistoryStepBlockInput<24>, Self::Error>;
 
     fn b25(
         &mut self,
@@ -259,6 +277,7 @@ fn prove_input(
     input: HistoryStepFreezeInput,
 ) -> Result<HistoryStepTerminal, HistoryStepError> {
     match input {
+        HistoryStepFreezeInput::B24(input) => prove_history_step(runtime, parent, input),
         HistoryStepFreezeInput::B25(input) => prove_history_step(runtime, parent, input),
         HistoryStepFreezeInput::B255(input) => prove_history_step(runtime, parent, input),
     }
@@ -282,12 +301,14 @@ fn assemble_input(
         };
     }
     match input {
+        HistoryStepFreezeInput::B24(input) => assemble!(input),
         HistoryStepFreezeInput::B25(input) => assemble!(input),
         HistoryStepFreezeInput::B255(input) => assemble!(input),
     }
 }
 
 fn derive_provisional_parts<P, S>(
+    generation: HistoryStepPackGeneration,
     provider: &mut P,
 ) -> Result<HistoryStepRuntimeParts, HistoryStepFreezeError<P::Error, S>>
 where
@@ -313,8 +334,15 @@ where
             let class =
                 CanonicalHistoryStepClassId::new(slot).expect("backbone tier slot is canonical");
             let vk = match input {
-                HistoryStepFreezeInput::B25(input) => derive_history_step_direct_block_vk(input),
-                HistoryStepFreezeInput::B255(input) => derive_history_step_direct_block_vk(input),
+                HistoryStepFreezeInput::B24(input) => {
+                    derive_history_step_direct_block_vk_in(generation, input)
+                }
+                HistoryStepFreezeInput::B25(input) => {
+                    derive_history_step_direct_block_vk_in(generation, input)
+                }
+                HistoryStepFreezeInput::B255(input) => {
+                    derive_history_step_direct_block_vk_in(generation, input)
+                }
             }
             .map_err(|source| {
                 HistoryStepFreezeError::relation(
@@ -329,15 +357,17 @@ where
     provider
         .reset_backbone()
         .map_err(HistoryStepFreezeError::Provider)?;
-    derive_history_step_runtime_parts(vks.map(|vk| vk.expect("all tier VKs derived"))).map_err(
-        |source| {
-            HistoryStepFreezeError::relation(
-                HistoryStepFreezeStage::ProvisionalRuntimeParts,
-                None,
-                source,
-            )
-        },
+    derive_history_step_runtime_parts_in(
+        generation,
+        vks.map(|vk| vk.expect("all tier VKs derived")),
     )
+    .map_err(|source| {
+        HistoryStepFreezeError::relation(
+            HistoryStepFreezeStage::ProvisionalRuntimeParts,
+            None,
+            source,
+        )
+    })
 }
 
 fn prove_backbone<P, S>(
@@ -397,15 +427,23 @@ where
 
 fn class_input<P, S>(
     provider: &mut P,
+    generation: HistoryStepPackGeneration,
     class: CanonicalHistoryStepClassId,
     start: &ChainAccumulator,
 ) -> Result<HistoryStepFreezeInput, HistoryStepFreezeError<P::Error, S>>
 where
     P: HistoryStepFreezeInputProvider,
 {
-    match class.current_slot() {
-        0 => provider.b25(class, start).map(HistoryStepFreezeInput::B25),
-        1 => provider
+    // The slot is the class; the generation is what says which tier that slot
+    // holds, and therefore which typed witness the relation accepts.
+    match (class.current_slot(), generation) {
+        (0, HistoryStepPackGeneration::V1) => {
+            provider.b25(class, start).map(HistoryStepFreezeInput::B25)
+        }
+        (0, HistoryStepPackGeneration::V1_3) => {
+            provider.b24(class, start).map(HistoryStepFreezeInput::B24)
+        }
+        (1, _) => provider
             .b255(class, start)
             .map(HistoryStepFreezeInput::B255),
         _ => unreachable!("canonical class current slot"),
@@ -413,7 +451,9 @@ where
     .map_err(HistoryStepFreezeError::Provider)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_all_classes<P, S>(
+    generation: HistoryStepPackGeneration,
     runtime: &HistoryStepRuntime,
     parts: &HistoryStepRuntimeParts,
     provider: &mut P,
@@ -435,7 +475,7 @@ where
         // parent checkpoint below. The two-arm relation must make those
         // matrices byte-identical for a fixed current class.
         let parent = &checkpoints[0];
-        let input = class_input::<P, S::Error>(provider, class, parent.accumulator())?;
+        let input = class_input::<P, S::Error>(provider, generation, class, parent.accumulator())?;
         let built = assemble_input(runtime, Some(parent), input)
             .map_err(|source| HistoryStepFreezeError::relation(stage, Some(class), source))?;
         if built.class_id() != class
@@ -453,8 +493,12 @@ where
         let digest = built.matrix().structural_statement_digest();
         let wires = built.useful_rows();
         for alternate_parent in checkpoints.iter().skip(1) {
-            let alternate_input =
-                class_input::<P, S::Error>(provider, class, alternate_parent.accumulator())?;
+            let alternate_input = class_input::<P, S::Error>(
+                provider,
+                generation,
+                class,
+                alternate_parent.accumulator(),
+            )?;
             let alternate = assemble_input(runtime, Some(alternate_parent), alternate_input)
                 .map_err(|source| HistoryStepFreezeError::relation(stage, Some(class), source))?;
             if alternate.class_id() != class
@@ -495,7 +539,27 @@ where
     P: HistoryStepFreezeInputProvider,
     S: HistoryStepFreezeMatrixStore + 'static,
 {
-    let mut parts = derive_provisional_parts::<P, S::Error>(provider)?;
+    freeze_history_step_bank_in(HistoryStepPackGeneration::V1, provider, store)
+}
+
+/// [`freeze_history_step_bank`] for the classes of one named relation.
+///
+/// The generation is not a label written on the result: it decides the tier
+/// each slot holds, the width of the recursive boundary, and whether the
+/// recursion root travels in the public IO — so it is threaded through the
+/// whole build, from the provisional direct-Block verifier shapes to the
+/// final bank. A pack frozen under one generation is only ever a pack of
+/// that relation.
+pub fn freeze_history_step_bank_in<P, S>(
+    generation: HistoryStepPackGeneration,
+    provider: &mut P,
+    store: Arc<S>,
+) -> Result<FrozenHistoryStepBank, HistoryStepFreezeError<P::Error, S::Error>>
+where
+    P: HistoryStepFreezeInputProvider,
+    S: HistoryStepFreezeMatrixStore + 'static,
+{
+    let mut parts = derive_provisional_parts::<P, S::Error>(generation, provider)?;
     let mut digests = [[0u8; 32]; HISTORY_STEP_CLASS_COUNT];
     let mut known = [false; HISTORY_STEP_CLASS_COUNT];
 
@@ -613,6 +677,7 @@ where
         HistoryStepFreezeStage::CandidateBackbone,
     )?;
     let candidate = build_all_classes(
+        generation,
         &partial,
         &parts,
         provider,
@@ -646,6 +711,7 @@ where
         HistoryStepFreezeStage::FinalBackbone,
     )?;
     build_all_classes(
+        generation,
         &final_runtime,
         &parts,
         provider,

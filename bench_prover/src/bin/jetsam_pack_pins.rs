@@ -99,18 +99,42 @@ fn open_launch_matrix(
     .map_err(|error| format!("authenticate {}: {error}", path.display()))
 }
 
+/// Prove that the packed relation still accepts a witness this source builds,
+/// under the relation the pack itself declares. A v1.3 pack is checked with a
+/// v1.3 witness; anything else would be comparing two relations.
 fn validate_launch_compatibility(
     runtime: &HistoryStepRuntime,
 ) -> Result<(CanonicalHistoryStepClassId, usize), String> {
-    let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
+    let generation = runtime.bank().generation();
+    let mut provider = HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, generation)?;
     let genesis = jetsam_recursive::genesis_accumulator();
     let step = provider
         .next_backbone(&genesis)?
         .ok_or_else(|| "honest HistoryStep launch fixture is missing".to_owned())?;
-    let PreparedHistoryStepBackboneInput::B25(prepared) = step.input else {
-        return Err("honest HistoryStep launch fixture is not B25".to_owned());
+    let built = match step.input {
+        PreparedHistoryStepBackboneInput::B24(prepared) => {
+            base_step_of(runtime, prepared.into_parts())?
+        }
+        PreparedHistoryStepBackboneInput::B25(prepared) => {
+            base_step_of(runtime, prepared.into_parts())?
+        }
+        PreparedHistoryStepBackboneInput::B255(_) => {
+            return Err("honest HistoryStep launch fixture is not a small-class block".to_owned())
+        }
     };
-    let (witness, nonce, start, end) = prepared.into_parts();
+    Ok(built)
+}
+
+fn base_step_of<const TIER: usize>(
+    runtime: &HistoryStepRuntime,
+    parts: (
+        jetsam_block::PreparedHistoryStepInputWitness<TIER>,
+        u128,
+        jetsam_recursive::ChainAccumulator,
+        jetsam_recursive::ChainAccumulator,
+    ),
+) -> Result<(CanonicalHistoryStepClassId, usize), String> {
+    let (witness, nonce, start, end) = parts;
     let (_, input) = witness
         .finish(nonce, &start, &end)
         .map_err(|error| format!("finish honest HistoryStep launch fixture: {error}"))?;

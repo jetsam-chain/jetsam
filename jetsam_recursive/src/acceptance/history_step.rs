@@ -75,9 +75,9 @@ pub use crate::acceptance::history_step_bank::HistoryStepMatrixLease;
 pub(crate) const HISTORY_STEP_PROOF_DOMAIN: &[u8] = b"history-step-v1";
 
 pub use freezer::{
-    freeze_history_step_bank, FrozenHistoryStepBank, HistoryStepFreezeError,
-    HistoryStepFreezeInput, HistoryStepFreezeInputProvider, HistoryStepFreezeMatrixStore,
-    HistoryStepFreezeStage,
+    freeze_history_step_bank, freeze_history_step_bank_in, FrozenHistoryStepBank,
+    HistoryStepFreezeError, HistoryStepFreezeInput, HistoryStepFreezeInputProvider,
+    HistoryStepFreezeMatrixStore, HistoryStepFreezeStage,
 };
 pub use relation::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
