@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_core::Block128;
 use jetsam_gkr::zk_authorization::ZkAuthorizationProof;
 use jetsam_gkr::{
@@ -456,6 +457,39 @@ pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 7] = [0, 1, 3, 7, 1
 /// One honest current-block member for each fixed HistoryStep tier.
 pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 2] = [25, 26];
 
+/// [`HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS`] for the ladder of
+/// `generation`.
+///
+/// The shape of the walk is what matters and it does not change: five blocks
+/// growing the spendable pool geometrically, one block filling the small
+/// class exactly, then one page more to land in the large class. Only the
+/// two last counts move, because only the small tier moves.
+pub fn history_step_freezer_backbone_user_counts(
+    generation: HistoryStepPackGeneration,
+) -> [usize; 7] {
+    let small = generation.small_tier();
+    [0, 1, 3, 7, 15, small, small + 1]
+}
+
+/// [`HISTORY_STEP_FREEZER_FORK_USER_COUNTS`] for the ladder of `generation`.
+pub fn history_step_freezer_fork_user_counts(
+    generation: HistoryStepPackGeneration,
+) -> [usize; 2] {
+    let small = generation.small_tier();
+    [small, small + 1]
+}
+
+/// The tier of `generation`'s ladder that holds `page_count`, or `None` past
+/// its top tier.
+fn freezer_class_tier_in(generation: HistoryStepPackGeneration, page_count: usize) -> Option<usize> {
+    jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
+        page_count,
+        generation,
+    )
+    .map(|class| class.page_capacity_in_generation(generation))
+}
+
+
 #[derive(Clone)]
 struct TrackedSpendable {
     slot_index: u32,
@@ -548,6 +582,7 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
 
 /// Heterogeneous streaming item used while the freezer proves the backbone.
 pub enum PreparedHistoryStepBackboneInput {
+    B24(PreparedHistoryStepTierFixture<24>),
     B25(PreparedHistoryStepTierFixture<25>),
     B255(PreparedHistoryStepTierFixture<255>),
 }
@@ -573,6 +608,10 @@ struct BuiltFixtureChild<const TIER: usize> {
 /// requested witness is materialized.
 pub struct HonestHistoryStepFixtureProvider {
     seed: u128,
+    /// The relation these witnesses are built for. It selects the class
+    /// ladder the backbone walks, the boundary rule the accumulator advances
+    /// under, and the anchors each block binds.
+    generation: HistoryStepPackGeneration,
     ghost: jetsam_recursive::PreparedHistoryStepGhostAuthorization,
     authorization_proofs:
         std::cell::RefCell<std::collections::HashMap<TxBodyHash, ZkAuthorizationProof>>,
@@ -584,7 +623,13 @@ pub struct HonestHistoryStepFixtureProvider {
 }
 
 impl HonestHistoryStepFixtureProvider {
+    /// [`Self::new_in`] under the launch generation.
     pub fn new(seed: u128) -> Result<Self, String> {
+        Self::new_in(seed, HistoryStepPackGeneration::V1)
+    }
+
+    /// A witness stream for the classes of one named relation.
+    pub fn new_in(seed: u128, generation: HistoryStepPackGeneration) -> Result<Self, String> {
         let ghost = jetsam_gkr::ghost_tx::prove_selected_ghost_authorization()
             .map_err(|error| format!("prove canonical ghost authorization: {error}"))?;
         let ghost = jetsam_recursive::prepare_history_step_ghost_authorization(ghost)
@@ -592,6 +637,7 @@ impl HonestHistoryStepFixtureProvider {
         let live = genesis_fixture_checkpoint();
         Ok(Self {
             seed,
+            generation,
             ghost,
             authorization_proofs: std::cell::RefCell::new(std::collections::HashMap::new()),
             mined_nonces: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -599,6 +645,11 @@ impl HonestHistoryStepFixtureProvider {
             live,
             checkpoints: std::array::from_fn(|_| None),
         })
+    }
+
+    /// The relation this stream builds witnesses for.
+    pub const fn generation(&self) -> HistoryStepPackGeneration {
+        self.generation
     }
 
     /// Start a fresh deterministic freezer pass at the canonical genesis
@@ -613,7 +664,8 @@ impl HonestHistoryStepFixtureProvider {
         &mut self,
         expected_start: &jetsam_recursive::ChainAccumulator,
     ) -> Result<Option<HonestHistoryStepBackboneStep>, String> {
-        if self.backbone_index == HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS.len() {
+        let backbone = history_step_freezer_backbone_user_counts(self.generation);
+        if self.backbone_index == backbone.len() {
             return Ok(None);
         }
         if &self.live.start_accumulator != expected_start {
@@ -621,13 +673,16 @@ impl HonestHistoryStepFixtureProvider {
         }
 
         let step = self.backbone_index;
-        let user_count = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS[step];
+        let user_count = backbone[step];
         let capture_parent_slot = match step {
             5 => Some(0),
             6 => Some(1),
             _ => None,
         };
-        let input = match jetsam_chain::consensus::params::block_page_class_tier(user_count) {
+        let input = match freezer_class_tier_in(self.generation, user_count) {
+            Some(24) => self
+                .build_child::<24>(user_count, step as u128)?
+                .map_into(&mut self.live)?,
             Some(25) => self
                 .build_child::<25>(user_count, step as u128)?
                 .map_into(&mut self.live)?,
@@ -647,6 +702,19 @@ impl HonestHistoryStepFixtureProvider {
         }))
     }
 
+    /// The small-class fork of the v1.3 ladder.
+    pub fn b24(
+        &self,
+        class_id: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<24>, String> {
+        self.fork::<24>(
+            class_id,
+            expected_start,
+            history_step_freezer_fork_user_counts(self.generation)[0],
+        )
+    }
+
     pub fn b25(
         &self,
         class_id: jetsam_recursive::CanonicalHistoryStepClassId,
@@ -655,7 +723,7 @@ impl HonestHistoryStepFixtureProvider {
         self.fork::<25>(
             class_id,
             expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[0],
+            history_step_freezer_fork_user_counts(self.generation)[0],
         )
     }
 
@@ -678,7 +746,7 @@ impl HonestHistoryStepFixtureProvider {
         self.fork::<255>(
             class_id,
             expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[1],
+            history_step_freezer_fork_user_counts(self.generation)[1],
         )
     }
 
@@ -698,11 +766,11 @@ impl HonestHistoryStepFixtureProvider {
         expected_start: &jetsam_recursive::ChainAccumulator,
         user_count: usize,
     ) -> Result<PreparedHistoryStepTierFixture<TIER>, String> {
-        if class_id.current_tier() != TIER {
+        if class_id.current_tier_in(self.generation) != TIER {
             return Err(format!(
                 "class {} selects B{}, not requested B{TIER}",
                 class_id.index(),
-                class_id.current_tier(),
+                class_id.current_tier_in(self.generation),
             ));
         }
         // The requested start boundary identifies the parent checkpoint;
@@ -736,7 +804,7 @@ impl HonestHistoryStepFixtureProvider {
         user_count: usize,
         nonce_domain: u128,
     ) -> Result<BuiltFixtureChild<TIER>, String> {
-        if jetsam_chain::consensus::params::block_page_class_tier(user_count) != Some(TIER) {
+        if freezer_class_tier_in(self.generation, user_count) != Some(TIER) {
             return Err(format!("{user_count} users do not select B{TIER}"));
         }
         let (candidates, authorities, next_user_spendables, next_output_slot_cursor) =
@@ -833,7 +901,11 @@ impl HonestHistoryStepFixtureProvider {
         sealed_block.header.nonce = nonce;
         let end_accumulator = checkpoint
             .start_accumulator
-            .advance(&checkpoint.parent_header, &sealed_block.header)
+            .advance_in(
+                self.generation,
+                &checkpoint.parent_header,
+                &sealed_block.header,
+            )
             .map_err(|error| format!("advance honest B{TIER} accumulator: {error:?}"))?;
         let context = jetsam_block::HistoryStepPreparationContext {
             parent_header: &checkpoint.parent_header,
@@ -844,10 +916,15 @@ impl HonestHistoryStepFixtureProvider {
             finalized_active_counts: &checkpoint.finalized_active_counts,
             asert_anchor: &checkpoint.asert_anchor,
             local_time: timestamp,
-            // The freezer fixtures are launch-relation blocks: one epoch
-            // anchor, and the launch class ladder.
-            generation: jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
-            previous_tx_epoch_anchor_header: None,
+            generation: self.generation,
+            // This walk is seven blocks long and `TX_EPOCH_BLOCKS` is 32, so
+            // both anchors of a generation that binds two are the genesis
+            // header, which is where this checkpoint's single anchor already
+            // sits. A generation that binds one refuses a second header.
+            previous_tx_epoch_anchor_header: self
+                .generation
+                .binds_two_epoch_anchors()
+                .then_some(&checkpoint.tx_epoch_anchor_header),
         };
         let input_preparation_started = Instant::now();
         let authorization_weight = authorization_bytes
@@ -860,8 +937,9 @@ impl HonestHistoryStepFixtureProvider {
             .checked_add(authorization_weight)
             .ok_or_else(|| "honest block byte weight overflow".to_owned())?;
         std::hint::black_box(payload_weight);
-        let stream = jetsam_chain::validate_block_page_stream(&block.transactions)
-            .map_err(|error| format!("honest block body is non-canonical: {error}"))?;
+        let stream =
+            jetsam_chain::validate_block_page_stream_in(&block.transactions, self.generation)
+                .map_err(|error| format!("honest block body is non-canonical: {error}"))?;
         if usize::from(stream.page_count) != user_count {
             return Err(format!(
                 "honest block has {} user pages, expected {user_count}",
@@ -933,6 +1011,9 @@ impl jetsam_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtu
     ) -> Result<Option<jetsam_recursive::HistoryStepFreezeInput>, Self::Error> {
         HonestHistoryStepFixtureProvider::next_backbone(self, expected_start)?
             .map(|step| match step.input {
+                PreparedHistoryStepBackboneInput::B24(input) => input
+                    .into_history_step_input()
+                    .map(jetsam_recursive::HistoryStepFreezeInput::B24),
                 PreparedHistoryStepBackboneInput::B25(input) => input
                     .into_history_step_input()
                     .map(jetsam_recursive::HistoryStepFreezeInput::B25),
@@ -941,6 +1022,15 @@ impl jetsam_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtu
                     .map(jetsam_recursive::HistoryStepFreezeInput::B255),
             })
             .transpose()
+    }
+
+    fn b24(
+        &mut self,
+        class: jetsam_recursive::CanonicalHistoryStepClassId,
+        expected_start: &jetsam_recursive::ChainAccumulator,
+    ) -> Result<jetsam_recursive::HistoryStepBlockInput<24>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b24(self, class, expected_start)?
+            .into_history_step_input()
     }
 
     fn b25(
@@ -1009,6 +1099,7 @@ macro_rules! impl_advance_honest_backbone {
     };
 }
 
+impl_advance_honest_backbone!(24, B24);
 impl_advance_honest_backbone!(25, B25);
 impl_advance_honest_backbone!(255, B255);
 
@@ -1189,6 +1280,49 @@ mod two_class_history_step_fixture_tests {
         let forks = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
             .map(|count| jetsam_chain::consensus::params::block_page_class_tier(count).unwrap());
         assert_eq!(forks, [25, 255]);
+    }
+
+    /// The generation-aware counts answer the launch constants under the
+    /// launch generation, so a run that names no generation walks exactly the
+    /// witness stream the shipped pack was frozen from.
+    #[test]
+    fn the_launch_generation_walks_the_shipped_freezer_counts() {
+        assert_eq!(
+            history_step_freezer_backbone_user_counts(HistoryStepPackGeneration::V1),
+            HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS,
+        );
+        assert_eq!(
+            history_step_freezer_fork_user_counts(HistoryStepPackGeneration::V1),
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS,
+        );
+        assert_eq!(
+            HonestHistoryStepFixtureProvider::new(0)
+                .map(|provider| provider.generation())
+                .unwrap_or(HistoryStepPackGeneration::V1_3),
+            HistoryStepPackGeneration::V1,
+        );
+    }
+
+    /// v1.3 moves the small tier by one page and nothing else about the walk:
+    /// five growth blocks, one block filling the small class exactly, then one
+    /// page more to land in the large class.
+    #[test]
+    fn the_v1_3_generation_walks_the_same_shape_one_page_lower() {
+        let backbone = history_step_freezer_backbone_user_counts(HistoryStepPackGeneration::V1_3);
+        assert_eq!(backbone, [0, 1, 3, 7, 15, 24, 25]);
+        assert_eq!(
+            backbone.map(|count| freezer_class_tier_in(HistoryStepPackGeneration::V1_3, count)
+                .unwrap()),
+            [24, 24, 24, 24, 24, 24, 255],
+        );
+        let forks = history_step_freezer_fork_user_counts(HistoryStepPackGeneration::V1_3);
+        assert_eq!(forks, [24, 25]);
+        assert_eq!(
+            forks.map(
+                |count| freezer_class_tier_in(HistoryStepPackGeneration::V1_3, count).unwrap()
+            ),
+            [24, 255],
+        );
     }
 
     #[test]

@@ -2,15 +2,24 @@
 // Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Build the canonical `HistoryStep` v1 release pack from honest chain data.
+//! Build a canonical `HistoryStep` release pack from honest chain data.
 //!
-//! Usage: `jetsam_matrix_gen <pack-root>`
+//! Usage: `jetsam_matrix_gen <pack-root> [--generation v1|v1.3]`
 //!
 //! The fixture provider starts at the real genesis state, mines every header,
 //! verifies every wallet authorization and materializes every backbone state.
-//! It saves the exact B25 and B255 parent boundaries, then forks native-valid
-//! children for both current classes. The two resulting matrices are assembled
-//! from native-valid block witnesses rather than shape-only or synthetic inputs.
+//! It saves the exact small-class and large-class parent boundaries, then
+//! forks native-valid children for both current classes. The two resulting
+//! matrices are assembled from native-valid block witnesses rather than
+//! shape-only or synthetic inputs.
+//!
+//! Without `--generation` this builds the launch pack, exactly as it always
+//! has. The generation is not a label written on the output: it is the
+//! relation the whole build runs under — which tier each class slot holds,
+//! how wide the recursive boundary is, and whether the recursion root travels
+//! in the public IO. Naming it here is the only way to obtain a v1.3 pack
+//! without moving the launch ladder, which is a consensus constant and must
+//! keep answering 25 for every block the chain has already proved.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read as _, Write as _};
@@ -19,6 +28,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use bench_prover::HonestHistoryStepFixtureProvider;
+use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_ivc_core::field_r1cs::FieldR1cs;
 use jetsam_ivc_core::proof::FieldShape;
 use jetsam_miner::history_step_artifacts::{
@@ -27,7 +37,7 @@ use jetsam_miner::history_step_artifacts::{
     HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
 };
 use jetsam_recursive::{
-    canonical_history_step_shape, freeze_history_step_bank, CanonicalHistoryStepClassId,
+    canonical_history_step_shape, freeze_history_step_bank_in, CanonicalHistoryStepClassId,
     HistoryStepFreezeMatrixStore, HistoryStepMatrixLease, HistoryStepMatrixSource,
     HistoryStepMatrixSourceError,
 };
@@ -38,8 +48,55 @@ const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 
+/// The generation this run builds, named once and read everywhere a tier is
+/// printed. It is a process-wide fact of the run, not of a class.
+static BUILD_GENERATION: std::sync::OnceLock<HistoryStepPackGeneration> =
+    std::sync::OnceLock::new();
+
+fn build_generation() -> HistoryStepPackGeneration {
+    *BUILD_GENERATION.get_or_init(|| HistoryStepPackGeneration::V1)
+}
+
 fn class_label(class: CanonicalHistoryStepClassId) -> String {
-    format!("H(B{})", class.current_tier())
+    format!("H(B{})", class.current_tier_in(build_generation()))
+}
+
+/// Parse `[--generation v1|v1.3]`, defaulting to the launch relation.
+fn parse_arguments() -> (PathBuf, HistoryStepPackGeneration) {
+    const USAGE: &str = "usage: jetsam_matrix_gen <pack-root> [--generation v1|v1.3]";
+    let mut root: Option<PathBuf> = None;
+    let mut generation: Option<HistoryStepPackGeneration> = None;
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--generation" => {
+                let value = arguments.next().unwrap_or_else(|| panic!("{USAGE}"));
+                let parsed = match value.as_str() {
+                    "v1" => HistoryStepPackGeneration::V1,
+                    "v1.3" => HistoryStepPackGeneration::V1_3,
+                    other => panic!("unknown pack generation {other:?}; {USAGE}"),
+                };
+                assert!(
+                    generation.replace(parsed).is_none(),
+                    "--generation given twice; {USAGE}"
+                );
+            }
+            other => {
+                assert!(
+                    !other.starts_with("--"),
+                    "unknown option {other:?}; {USAGE}"
+                );
+                assert!(
+                    root.replace(PathBuf::from(other)).is_none(),
+                    "more than one pack root; {USAGE}"
+                );
+            }
+        }
+    }
+    (
+        root.unwrap_or_else(|| panic!("{USAGE}")),
+        generation.unwrap_or(HistoryStepPackGeneration::V1),
+    )
 }
 
 struct CanonicalMatrixStore {
@@ -208,7 +265,7 @@ impl HistoryStepFreezeMatrixStore for CanonicalMatrixStore {
         println!(
             "  c{:02} current=B{} wires={wires} bytes={bytes} build_export_ms={}",
             class.index(),
-            class.current_tier(),
+            class.current_tier_in(build_generation()),
             elapsed.as_millis(),
         );
         std::io::stdout()
@@ -247,14 +304,10 @@ fn write_metadata(path: &Path, bytes: &[u8]) {
 
 fn main() {
     jetsam_ivc_prover::init_perf_thread_pool();
-    let root = std::env::args()
-        .nth(1)
-        .expect("usage: jetsam_matrix_gen <pack-root>");
-    assert!(
-        std::env::args().nth(2).is_none(),
-        "usage: jetsam_matrix_gen <pack-root>"
-    );
-    let root = PathBuf::from(root);
+    let (root, generation) = parse_arguments();
+    BUILD_GENERATION
+        .set(generation)
+        .expect("the build generation is named once");
     let version = root.join(HISTORY_STEP_PACK_VERSION_DIRECTORY);
     std::fs::create_dir(&root).unwrap_or_else(|error| {
         panic!(
@@ -271,19 +324,39 @@ fn main() {
 
     let zstd_level = parse_zstd_level();
     let debug = std::env::var_os("JETSAM_HISTORY_STEP_GENERATOR_DEBUG").is_some();
-    println!("JETSAM canonical HistoryStep v1 freezer");
+    let [small_tier, large_tier] = generation.tiers();
+    let [small_m, large_m] = jetsam_recursive::HISTORY_STEP_CURRENT_CLASS_MS;
+    println!("JETSAM canonical HistoryStep freezer");
     println!("  pack:          {}", version.display());
+    println!(
+        "  generation:    {}",
+        match generation {
+            HistoryStepPackGeneration::V1 => "v1 (launch)",
+            HistoryStepPackGeneration::V1_3 => "v1.3",
+        }
+    );
     println!("  rayon threads: {}", rayon::current_num_threads());
     println!("  witnesses:     real genesis chain + two exact parent checkpoints");
-    println!("  classes:       2 (B25/m22 and B255/m24)");
+    println!(
+        "  classes:       2 (B{small_tier}/m{small_m} and B{large_tier}/m{large_m})"
+    );
     println!("\nBuilding and exporting canonical matrices:");
 
     let started = Instant::now();
-    let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)
+    let mut provider = HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, generation)
         .unwrap_or_else(|error| panic!("initialize honest HistoryStep fixtures: {error}"));
     let store = std::sync::Arc::new(CanonicalMatrixStore::new(version.clone(), zstd_level));
-    let frozen = freeze_history_step_bank(&mut provider, std::sync::Arc::clone(&store))
-        .unwrap_or_else(|error| panic!("freeze honest HistoryStep bank: {error}"));
+    let frozen = freeze_history_step_bank_in(
+        generation,
+        &mut provider,
+        std::sync::Arc::clone(&store),
+    )
+    .unwrap_or_else(|error| panic!("freeze honest HistoryStep bank: {error}"));
+    assert_eq!(
+        frozen.bank().generation(),
+        generation,
+        "the frozen bank does not belong to the requested relation"
+    );
 
     let metadata = encode_history_step_runtime_metadata(frozen.bank(), frozen.parts())
         .unwrap_or_else(|error| panic!("encode HistoryStep runtime metadata: {error}"));
