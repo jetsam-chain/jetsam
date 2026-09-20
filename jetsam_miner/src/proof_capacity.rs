@@ -476,25 +476,49 @@ mod tests {
         }
     }
 
-    /// While the fork is dormant every height still yields the small class,
-    /// exactly as the live chain runs today.
+    /// The ceiling on the fixed clocks — both of them.
+    ///
+    /// The cap is on the v1.2 clock, and the tier the cap admits is named by
+    /// the v1.3 one: until the raised cap is in force only the small class is
+    /// publishable, and how many page positions "small" means is the v1.3
+    /// ladder's business. Writing 25 there was true only while the second
+    /// clock was dormant at that height, and neither profile could show it —
+    /// the public one has the v1.3 clock at `None`, and the test chain has
+    /// the raised cap from genesis, so every height answers the large class
+    /// and the ladder never appears.
     #[test]
     fn the_ceiling_follows_the_activation_height() {
-        use jetsam_chain::consensus::params::V1_2_ACTIVATION_HEIGHT;
+        use jetsam_chain::consensus::params::{V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT};
 
         let measured = [B25_TERMINAL_BYTES, B255_TERMINAL_BYTES];
-        for height in [0, 1, 4004, u64::MAX] {
+        let mut heights = vec![0u64, 1, 4004, u64::MAX];
+        for armed in [V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT] {
+            if let Some(activation) = armed {
+                heights.extend([
+                    activation.saturating_sub(1),
+                    activation,
+                    activation.saturating_add(1),
+                ]);
+            }
+        }
+        for height in heights {
             // The large class only becomes publishable once the raised cap is
             // in force: 1 081 108 bytes fits under 1 200 000 and not under
-            // 1 048 576. While the fork is dormant that is never, at any height.
+            // 1 048 576. Below that height the answer is the small class of
+            // the ladder governing the block: 25 page positions, or 24 from
+            // the v1.3 activation height on.
             let expected = match V1_2_ACTIVATION_HEIGHT {
                 Some(activation) if height >= activation => Some(255),
-                _ => Some(25),
+                _ => Some(match V1_3_ACTIVATION_HEIGHT {
+                    Some(activation) if height >= activation => 24,
+                    _ => 25,
+                }),
             };
             assert_eq!(
                 publishable_page_ceiling_at_height(&measured, height),
                 expected,
-                "height {height}, activation {V1_2_ACTIVATION_HEIGHT:?}"
+                "height {height}, v1.2 {V1_2_ACTIVATION_HEIGHT:?}, \
+                 v1.3 {V1_3_ACTIVATION_HEIGHT:?}"
             );
         }
     }
