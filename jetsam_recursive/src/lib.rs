@@ -11,6 +11,11 @@ pub mod acceptance;
 pub mod accumulator;
 pub mod region_sidecar;
 
+pub use acceptance::development_payout_pins::{
+    development_payout_owner_pins, development_payout_owner_pins_for,
+    verify_relation_development_payout_pins, DevelopmentPayoutPinError, DevelopmentPayoutPinScan,
+    DevelopmentPayoutRelationError, DEVELOPMENT_PAYOUT_PIN_COUNT, DEVELOPMENT_PAYOUT_PIN_LABELS,
+};
 pub use acceptance::history_step::{
     decode_history_step_terminal, decode_verify_history_step_terminal,
     decode_verify_history_step_terminal_rooted, derive_history_step_direct_block_vk,

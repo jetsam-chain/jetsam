@@ -4078,6 +4078,48 @@ impl CompactFieldR1cs {
         self.backing.canonical_len()
     }
 
+    /// Independently scannable row groups of `B`.
+    ///
+    /// Groups are the unit of parallelism for every hot scan in this file;
+    /// exposing the count lets a caller outside the crate fan one out the same
+    /// way [`apply_b`](Self::apply_b) does internally.
+    pub fn b_group_count(&self) -> usize {
+        self.matrices[1].retained_group_count()
+    }
+
+    /// Visit `(row, coefficient)` for every nonzero of `B` in `column` within
+    /// one row group, in canonical row order.
+    ///
+    /// One column of an authenticated protocol matrix is a statement about the
+    /// relation, and the constant-pinned column is where a gate's literal
+    /// operands live. Reading it costs a walk of the already-authenticated
+    /// planar or packed rows and materializes nothing: a caller that wants a
+    /// handful of frozen constants out of a several-hundred-megabyte relation
+    /// does not have to build a CSR copy of it to find them.
+    pub fn for_each_b_group_column_entry(
+        &self,
+        group: usize,
+        column: u32,
+        mut visit: impl FnMut(usize, F128),
+    ) {
+        self.matrices[1].for_each_group_entry(
+            self.backing.planar_hot_bytes(),
+            group,
+            |row, at, coefficient| {
+                if at == column {
+                    visit(row, coefficient);
+                }
+            },
+        );
+    }
+
+    /// The whole of one `B` column, in canonical row order.
+    pub fn for_each_b_column_entry(&self, column: u32, mut visit: impl FnMut(usize, F128)) {
+        for group in 0..self.b_group_count() {
+            self.for_each_b_group_column_entry(group, column, &mut visit);
+        }
+    }
+
     /// Stable diagnostic label used by live timing logs.
     pub fn storage_name(&self) -> &'static str {
         if matches!(&self.backing, CompactArtifactBacking::Packed(_)) {
@@ -6514,6 +6556,52 @@ mod tests {
         let z = (0..r1cs.n()).map(|_| rng.f128()).collect::<Vec<_>>();
         assert_eq!(compact.apply_a(&z), r1cs.apply_a(&z));
         assert_eq!(compact.apply_b(&z), r1cs.apply_b(&z));
+    }
+
+    /// One column read off the compact view is the same column the resident
+    /// CSR matrix holds — in both hot layouts, since the packed one releases
+    /// the planar bytes the walk would otherwise read.
+    #[test]
+    fn compact_artifact_lists_one_b_column_like_the_resident_matrix() {
+        let (r1cs, shape, digest, bytes) = artifact_fixture(0xC01D_C011);
+        let planar = CompactFieldR1cs::open(bytes.clone().into_boxed_slice(), shape, digest)
+            .expect("canonical artifact opens as an authenticated compact view");
+        let packed = CompactFieldR1cs::open(bytes.into_boxed_slice(), shape, digest)
+            .expect("canonical artifact opens as an authenticated compact view")
+            .into_startup_packed()
+            .expect("startup-packed layout");
+        assert!(packed.is_packed());
+
+        let mut total = 0usize;
+        for column in 0..r1cs.b_0.num_cols as u32 {
+            let mut resident = Vec::new();
+            for row in 0..r1cs.b_0.num_rows {
+                for (at, coefficient) in r1cs.b_0.row(row) {
+                    if at == column {
+                        resident.push((row, coefficient));
+                    }
+                }
+            }
+            total += resident.len();
+            for view in [&planar, &packed] {
+                let mut seen = Vec::new();
+                view.for_each_b_column_entry(column, |row, coefficient| {
+                    seen.push((row, coefficient));
+                });
+                assert_eq!(
+                    seen,
+                    resident,
+                    "column {column} of a {} view",
+                    view.storage_name()
+                );
+            }
+        }
+        assert_eq!(
+            total,
+            r1cs.b_0.nnz(),
+            "every B nonzero belongs to one column"
+        );
+        assert!(total > 0, "an empty fixture would make this test vacuous");
     }
 
     #[test]

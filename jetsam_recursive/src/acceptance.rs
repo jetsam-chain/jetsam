@@ -5,6 +5,7 @@
 //! Atomic self-recursive `HistoryStep` relation and its verifier traces.
 
 pub mod block_slots;
+pub mod development_payout_pins;
 pub mod history_step;
 pub mod history_step_bank;
 pub mod shape;
