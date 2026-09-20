@@ -573,6 +573,12 @@ mod tests {
         // JETSAM CHANGE: derived from TX_EPOCH_BLOCKS instead of the literals
         // 143/144/145/287/288, which pinned the epoch length at 144.
         let e = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        // How many anchors the child binds is the child's generation's
+        // business, and the test above owns that question; this one is about
+        // *which* heights the boundary names. It still has to survive an
+        // arming, so the second pair is derived from the clock rather than
+        // asserted absent.
+        let armed = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
         for (parent_height, parent_terminal, child_transactions) in [
             (e - 1, 0, 0),
             (e, 0, e),
@@ -580,15 +586,18 @@ mod tests {
             (2 * e - 1, e, e),
             (2 * e, e, 2 * e),
         ] {
+            let binds_two = matches!(armed, Some(activation) if parent_height + 1 >= activation);
             assert_eq!(
                 template_epoch_anchor_heights(parent_height),
                 Some(TemplateEpochAnchorHeights {
                     parent_terminal,
                     child_transactions,
-                    parent_previous_terminal: None,
-                    child_previous_transactions: None,
+                    parent_previous_terminal: binds_two
+                        .then(|| parent_terminal.saturating_sub(e)),
+                    child_previous_transactions: binds_two
+                        .then(|| child_transactions.saturating_sub(e)),
                 }),
-                "parent height {parent_height}",
+                "parent height {parent_height}, activation {armed:?}",
             );
         }
         assert_eq!(template_epoch_anchor_heights(u64::MAX), None);
@@ -598,20 +607,37 @@ mod tests {
     /// needs: under the launch generation the two it always needed, and
     /// nothing else; under v1.3 also the older anchor of the parent boundary
     /// (in the form the v1.3 relation consumes) and the older anchor the
-    /// child's pages may bind. With the clock dormant, every parent height
-    /// answers the launch pair.
+    /// child's pages may bind. Which of the two the fixed clock answers is
+    /// derived from the activation height, not assumed: while it is `None`
+    /// every parent height answers the launch pair, but that is the
+    /// constant's answer of today and not a property of the template.
     #[test]
     fn the_template_asks_the_childs_generation_for_its_anchors() {
         use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
 
         let e = jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let armed = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
         for parent_height in [0, e - 1, e, 2 * e, 2 * e + 1, 3 * e + 1] {
             let launch = template_epoch_anchor_heights_in(V1, parent_height).unwrap();
-            assert_eq!(template_epoch_anchor_heights(parent_height), Some(launch));
             assert_eq!(launch.parent_previous_terminal, None);
             assert_eq!(launch.child_previous_transactions, None);
 
             let v1_3 = template_epoch_anchor_heights_in(V1_3, parent_height).unwrap();
+            // On the fixed clock the child's generation decides, so this is
+            // the launch pair below the activation height — and at every
+            // height while the clock is `None` — and the v1.3 one from the
+            // activation height on.
+            assert_eq!(
+                template_epoch_anchor_heights(parent_height),
+                Some(
+                    if matches!(armed, Some(activation) if parent_height + 1 >= activation) {
+                        v1_3
+                    } else {
+                        launch
+                    }
+                ),
+                "parent height {parent_height}, activation {armed:?}"
+            );
             assert_eq!(v1_3.parent_terminal, launch.parent_terminal);
             assert_eq!(v1_3.child_transactions, launch.child_transactions);
             assert_eq!(

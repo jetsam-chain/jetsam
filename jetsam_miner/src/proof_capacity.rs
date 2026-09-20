@@ -388,15 +388,42 @@ mod tests {
         Duration::from_millis(value)
     }
 
-    /// Terminal sizes that make exactly `tier` publishable under the dormant
-    /// v1 cap, so timing behaviour can be tested apart from the height rule.
+    /// Terminal sizes that make exactly `tier` — the small class alone, or
+    /// both — publishable, so timing behaviour can be tested apart from the
+    /// height rule.
+    ///
+    /// Measured on the relation that governs [`ANY_HEIGHT`], and sized
+    /// against the cap in force there — neither the launch relation nor the
+    /// v1 cap by name.
+    ///
+    /// Both are properties of two clocks, not of this controller. A capacity
+    /// holding launch sizes publishes nothing at a post-fork height by
+    /// design, and a size chosen to overflow the v1 cap fits comfortably
+    /// under the v1.2 one: pinning either would make every timing test below
+    /// fail on a profile that has armed a fork, for a reason that has nothing
+    /// to do with what they test.
     fn capacity_capped_at(tier: usize) -> AdaptiveProofCapacity {
-        let over = CONSENSUS_CAP + 1;
-        AdaptiveProofCapacity::new(match tier {
-            25 => vec![B25_TERMINAL_BYTES, over],
-            255 => vec![B25_TERMINAL_BYTES, B25_TERMINAL_BYTES],
-            other => panic!("unsupported test tier {other}"),
-        })
+        let over = history_step_terminal_bytes_limit(ANY_HEIGHT) + 1;
+        AdaptiveProofCapacity::new_in(
+            any_height_generation(),
+            match tier {
+                25 => vec![B25_TERMINAL_BYTES, over],
+                255 => vec![B25_TERMINAL_BYTES, B25_TERMINAL_BYTES],
+                other => panic!("unsupported test tier {other}"),
+            },
+        )
+    }
+
+    /// The relation that governs [`ANY_HEIGHT`] on this build's own clock.
+    fn any_height_generation() -> HistoryStepPackGeneration {
+        HistoryStepPackGeneration::at_height(ANY_HEIGHT)
+    }
+
+    /// Page positions the small class holds at [`ANY_HEIGHT`]: 25 on the
+    /// launch ladder, 24 on the v1.3 one. The large class holds 255 on both,
+    /// so only the small one has to be derived.
+    fn small_pages() -> usize {
+        BlockProofClass::B25.page_capacity_in_generation(any_height_generation())
     }
 
     /// Height used by tests that are about timing, not about the fork.
@@ -474,12 +501,16 @@ mod tests {
 
     /// The small class the miner is entitled to follows the block's height on
     /// the activation clock: 25 pages below the v1.3 activation height, 24 at
-    /// or above it. With the clock dormant every height answers 25, which is
-    /// what every test above relies on.
+    /// or above it. With the clock dormant every height answers 25.
     #[test]
     fn the_small_class_follows_the_block_height_on_the_activation_clock() {
         const ACTIVATION: u64 = 42;
-        for (height, expected) in [(0u64, 25usize), (ACTIVATION - 1, 25), (ACTIVATION, 24)] {
+        for (height, expected) in [
+            (0u64, 25usize),
+            (ACTIVATION - 1, 25),
+            (ACTIVATION, 24),
+            (ACTIVATION + 1, 24),
+        ] {
             assert_eq!(
                 BlockProofClass::B25.page_capacity_in_generation(
                     HistoryStepPackGeneration::at_activation(height, Some(ACTIVATION))
@@ -488,9 +519,32 @@ mod tests {
                 "height {height}"
             );
         }
-        for height in [0u64, 1, ANY_HEIGHT, u64::MAX] {
-            assert_eq!(BlockProofClass::B25.page_capacity_at_height(height), 25);
-            assert_eq!(BlockProofClass::B255.page_capacity_at_height(height), 255);
+        // And on the fixed clock, at whatever height this profile has it set
+        // to. Answering 25 everywhere is what a dormant clock does, not what
+        // this code does, so it is derived here instead of assumed: the day a
+        // profile arms, this test has to describe the arming rather than
+        // contradict it.
+        let armed = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
+        let mut heights = vec![0u64, 1, ANY_HEIGHT, u64::MAX];
+        if let Some(activation) = armed {
+            heights.extend([
+                activation.saturating_sub(1),
+                activation,
+                activation.saturating_add(1),
+            ]);
+        }
+        for height in heights {
+            let post_fork = matches!(armed, Some(activation) if height >= activation);
+            assert_eq!(
+                BlockProofClass::B25.page_capacity_at_height(height),
+                if post_fork { 24 } else { 25 },
+                "height {height}, activation {armed:?}"
+            );
+            assert_eq!(
+                BlockProofClass::B255.page_capacity_at_height(height),
+                255,
+                "height {height}"
+            );
         }
         // The launch ladder measured by a launch bank names the launch tiers.
         assert_eq!(
@@ -586,9 +640,9 @@ mod tests {
     fn never_grants_a_class_whose_terminal_cannot_be_published() {
         let mut capacity = capacity_capped_at(25);
         capacity.observe_preparation(BlockProofClass::B25, millis(3_000));
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
         capacity.observe_preparation(BlockProofClass::B255, millis(1_000));
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
     }
 
     /// Whatever the machine measured, the ceiling holds. A fast node was the
@@ -602,7 +656,7 @@ mod tests {
                 capacity.observe_preparation(BlockProofClass::B255, millis(b255));
                 assert_eq!(
                     capacity.page_limit(ANY_HEIGHT),
-                    25,
+                    small_pages(),
                     "b25={b25} ms, b255={b255} ms escaped the ceiling"
                 );
             }
@@ -682,22 +736,23 @@ mod tests {
             (target_prepare_ms() / measured_class_work_ratio()).ceil() as u64 + 10_000;
         let mut capacity = capacity_capped_at(255);
         capacity.observe_preparation(BlockProofClass::B25, millis(far_too_slow));
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
     }
 
     #[test]
     fn starts_at_b25_and_has_no_intermediate_limits() {
         let mut capacity = capacity_capped_at(255);
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 
         let predicted_b255_boundary = (target_prepare_ms() / PREDICTED_B255_WORK_RATIO).round() as u64;
         capacity.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary + 1));
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 
         let mut exact_boundary = capacity_capped_at(255);
         exact_boundary.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary));
         assert_eq!(exact_boundary.page_limit(ANY_HEIGHT), 255);
-        assert!(matches!(capacity.page_limit(ANY_HEIGHT), 25 | 255));
+        let limit = capacity.page_limit(ANY_HEIGHT);
+        assert!(limit == small_pages() || limit == 255, "limit {limit}");
     }
 
     #[test]
@@ -724,9 +779,9 @@ mod tests {
             BlockProofClass::B255,
             millis(target_prepare_ms() as u64 + 1),
         );
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 
         capacity.observe_preparation(BlockProofClass::B25, millis(1_000));
-        assert_eq!(capacity.page_limit(ANY_HEIGHT), 25);
+        assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
     }
 }

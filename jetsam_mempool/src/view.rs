@@ -287,23 +287,42 @@ mod tests {
             )
         };
         // A boundary block still consumes the preceding anchor; its own id only
-        // becomes active for the block after it.
-        assert_eq!(view(epoch - 2).user_epoch_anchor_id, genesis_id);
-        assert_eq!(view(epoch - 1).user_epoch_anchor_id, genesis_id);
-        assert_eq!(view(epoch).user_epoch_anchor_id, boundary_id);
-
-        // The older anchor exists only under a generation that binds two. With
-        // the v1.3 clock dormant every view answers the one anchor twice, so
-        // the pair the mempool tests is the equality it always tested.
-        for tip_height in [epoch - 2, epoch - 1, epoch] {
+        // becomes active for the block after it. The older anchor exists only
+        // under a generation that binds two: the launch relation carries the
+        // one anchor twice, and v1.3 carries the anchor of the preceding
+        // epoch — the same id only while there is no earlier boundary header
+        // to name.
+        //
+        // Which of the two a view answers is derived from the activation
+        // height rather than assumed. The launch pair is what a dormant clock
+        // produces, not what this code guarantees, and asserting it outright
+        // would make the day a profile arms look like a mempool regression.
+        let armed = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
+        for (tip_height, current, post_fork_previous) in [
+            (epoch - 2, genesis_id, genesis_id),
+            (epoch - 1, genesis_id, genesis_id),
+            (epoch, boundary_id, genesis_id),
+        ] {
             let view = view(tip_height);
+            let post_fork = matches!(armed, Some(activation) if tip_height + 1 >= activation);
+            let expected_previous = if post_fork { post_fork_previous } else { current };
+            assert_eq!(view.user_epoch_anchor_id, current, "tip {tip_height}");
             assert_eq!(
-                view.previous_user_epoch_anchor_id, view.user_epoch_anchor_id,
-                "tip {tip_height}"
+                view.previous_user_epoch_anchor_id, expected_previous,
+                "tip {tip_height}, activation {armed:?}"
             );
             let (accepted, generation) = view.accepted_user_epoch_anchors();
-            assert_eq!(generation, HistoryStepPackGeneration::V1);
-            assert_eq!(accepted.previous, accepted.current);
+            assert_eq!(
+                generation,
+                if post_fork {
+                    HistoryStepPackGeneration::V1_3
+                } else {
+                    HistoryStepPackGeneration::V1
+                },
+                "tip {tip_height}, activation {armed:?}"
+            );
+            assert_eq!(accepted.current, current);
+            assert_eq!(accepted.previous, expected_previous);
             assert_eq!(
                 generation,
                 HistoryStepPackGeneration::at_height(tip_height + 1),

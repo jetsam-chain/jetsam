@@ -953,10 +953,11 @@ mod tests {
     }
 
     /// The block-level class is asked of the generation in force at the
-    /// block's height. With the v1.3 clock dormant every height answers the
-    /// launch verdict; under v1.3 the same twenty-five effective pages are the
-    /// large class. Nothing but the class differs, so the logical txids — and
-    /// with them the tx root every header commits to — are the same in both.
+    /// block's height: the launch verdict below the activation height — and
+    /// at every height while the clock is dormant — and under v1.3 the same
+    /// twenty-five effective pages are the large class. Nothing but the class
+    /// differs, so the logical txids — and with them the tx root every header
+    /// commits to — are the same in both.
     #[test]
     fn the_block_class_is_selected_by_the_generation_of_its_height() {
         use crate::consensus::paged_spend::BlockProofClass;
@@ -980,13 +981,6 @@ mod tests {
         ] {
             let txs = with_users(user_pages);
             let launch = validate_block_page_stream(&txs).unwrap();
-            for height in [0u64, 1, 8_450, u64::MAX] {
-                assert_eq!(
-                    validate_block_page_stream_at_height(&txs, height).unwrap(),
-                    launch,
-                    "{user_pages} user pages at height {height}: the clock is dormant"
-                );
-            }
             assert_eq!(validate_block_page_stream_in(&txs, V1).unwrap(), launch);
             let v1_3 = validate_block_page_stream_in(&txs, V1_3).unwrap();
             assert_eq!(v1_3.proof_class, v1_3_class, "{user_pages} user pages");
@@ -997,6 +991,35 @@ mod tests {
             assert_eq!(v1_3.live_outputs, launch.live_outputs);
             assert_eq!(v1_3.has_development_payout, launch.has_development_payout);
             assert_eq!(v1_3.user_start_index, launch.user_start_index);
+
+            // And on the fixed clock, at whatever height this profile has it
+            // set to: the launch verdict below the activation height, the
+            // v1.3 one at and above it, and the launch verdict everywhere
+            // while the clock is `None`. Pinning the dormant answer here
+            // would make an arming look like a regression in block
+            // validation, which is the last place to be reading a false
+            // alarm.
+            let armed = crate::consensus::params::V1_3_ACTIVATION_HEIGHT;
+            let mut heights = vec![0u64, 1, 8_450, u64::MAX];
+            if let Some(activation) = armed {
+                heights.extend([
+                    activation.saturating_sub(1),
+                    activation,
+                    activation.saturating_add(1),
+                ]);
+            }
+            for height in heights {
+                let expected = if matches!(armed, Some(activation) if height >= activation) {
+                    &v1_3
+                } else {
+                    &launch
+                };
+                assert_eq!(
+                    &validate_block_page_stream_at_height(&txs, height).unwrap(),
+                    expected,
+                    "{user_pages} user pages at height {height}, activation {armed:?}"
+                );
+            }
         }
     }
 

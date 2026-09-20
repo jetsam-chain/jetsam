@@ -4205,22 +4205,40 @@ mod tests {
     };
 
     /// The terminal class slot a committed block is checked against follows
-    /// the ladder of the block's own height: with the clock dormant every
-    /// height answers the launch slot, and under v1.3 twenty-five effective
-    /// pages sit in the large class. A launch terminal for such a block
-    /// (slot 0) would be refused at a v1.3 height, which is the storage-side
-    /// statement that a block proved under one generation is refused by the
-    /// other.
+    /// the ladder of the block's own height: the launch slot below the
+    /// activation height — and at every height while the clock is dormant —
+    /// and under v1.3 twenty-five effective pages sit in the large class. A
+    /// launch terminal for such a block (slot 0) would be refused at a v1.3
+    /// height, which is the storage-side statement that a block proved under
+    /// one generation is refused by the other.
     #[test]
     fn terminal_class_slot_follows_the_ladder_of_the_block_height() {
         use crate::consensus::params::HistoryStepPackGeneration::{V1, V1_3};
 
-        for height in [1u64, 8_450, u64::MAX] {
-            assert_eq!(history_step_class_slot(24, height), Some(0));
-            assert_eq!(history_step_class_slot(25, height), Some(0));
-            assert_eq!(history_step_class_slot(26, height), Some(1));
-            assert_eq!(history_step_class_slot(255, height), Some(1));
-            assert_eq!(history_step_class_slot(256, height), None);
+        // The rule, whatever the clock is set to on this profile — the block
+        // before the crossing, the crossing itself and the block after it
+        // included. A test that asserted the dormant slot outright would go
+        // red on the day of an arming and read as a storage regression.
+        let armed = crate::consensus::params::V1_3_ACTIVATION_HEIGHT;
+        let mut heights = vec![1u64, 8_450, u64::MAX];
+        if let Some(activation) = armed {
+            heights.extend([
+                activation.saturating_sub(1),
+                activation,
+                activation.saturating_add(1),
+            ]);
+        }
+        for height in heights {
+            let post_fork = matches!(armed, Some(activation) if height >= activation);
+            assert_eq!(history_step_class_slot(24, height), Some(0), "height {height}");
+            assert_eq!(
+                history_step_class_slot(25, height),
+                if post_fork { Some(1) } else { Some(0) },
+                "height {height}, activation {armed:?}"
+            );
+            assert_eq!(history_step_class_slot(26, height), Some(1), "height {height}");
+            assert_eq!(history_step_class_slot(255, height), Some(1), "height {height}");
+            assert_eq!(history_step_class_slot(256, height), None, "height {height}");
         }
         assert_eq!(history_step_class_slot_in(24, V1), Some(0));
         assert_eq!(history_step_class_slot_in(25, V1), Some(0));
