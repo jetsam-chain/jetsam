@@ -64,7 +64,12 @@ impl EmbeddedHistoryStepPack {
     }
 }
 
-/// Runtime-metadata digest of the pack the live chain runs on today.
+/// Runtime-metadata digest of the pack the **public** chain runs on today.
+///
+/// One network's, not every network's: a pack freezes the development-payout
+/// recipients of the profile its generator was compiled under, so the test
+/// chain's launch pack is a different artifact and this id says nothing about
+/// it.
 ///
 /// This is a consensus-visible identity, not a build detail: it is the
 /// `history_proof_bank_id` field of the network profile, and two nodes whose
@@ -254,7 +259,37 @@ mod advertised_bank_identity_tests {
         );
     }
 
-    /// A build that carries a pre-fork pack carries the live chain's.
+    /// The launch pack this build's own network runs on, when there is a
+    /// frozen artifact to name.
+    ///
+    /// `Some` on the public network: that digest is the `history_proof_bank_id`
+    /// two nodes compare at the handshake, so a release built against another
+    /// pack directory has to fail in CI rather than at its first peer.
+    ///
+    /// `None` on the test chain, and deliberately. Its pack is regenerated
+    /// with the chain, so there is no lasting id to pin — and pinning the
+    /// public chain's for every profile is not a stricter test, it is a wrong
+    /// one: the only test-chain build that satisfies it is one carrying the
+    /// **mainnet** pack, which is the defect that ran 959 blocks out of 960
+    /// and stopped the test chain at block 1920 on 2026-09-17. What makes a
+    /// pack this build's own is the development-payout recipients its
+    /// matrices freeze, and that is checked where the answer is the identity
+    /// itself rather than a digest of a pack we already have:
+    /// `verify_embedded_development_payout_pins` reads them out of every
+    /// embedded pack at startup, and `jetsam_pack_pins` reads them where the
+    /// pack is made.
+    ///
+    /// The profile is read from `jetsam_chain`, never from a local `cfg`:
+    /// this crate's own `testnet` feature is off in a build that selects the
+    /// profile with `--features jetsam_chain/testnet`, which is exactly how
+    /// the test chain's suite is run — so a `cfg` here would silently take
+    /// the mainnet arm on the profile the guard is about.
+    #[cfg(has_pre_fork_pack)]
+    fn pinned_pre_fork_pack_id() -> Option<[u8; 32]> {
+        (jetsam_chain::consensus::identity::TICKER == "JTM").then_some(V1_HISTORY_STEP_PACK_ID)
+    }
+
+    /// A build that carries a pre-fork pack carries its own chain's.
     ///
     /// Its twin below compiles when no pack is staged, so exactly one of the
     /// two runs and neither returns early: a guard that skips itself in the
@@ -264,9 +299,21 @@ mod advertised_bank_identity_tests {
     fn a_packed_build_embeds_the_live_pack_for_the_pre_fork_range() {
         let pack = embedded_history_step_pack_for_height(0)
             .expect("a staged pre-fork pack is embedded");
-        assert_eq!(pack.runtime_metadata_digest(), V1_HISTORY_STEP_PACK_ID);
-        assert_eq!(pre_fork_pack_id(), V1_HISTORY_STEP_PACK_ID);
-        assert_eq!(advertised_history_proof_bank_id(), V1_HISTORY_STEP_PACK_ID);
+        // Whatever the profile: the pre-fork range selects the staged launch
+        // pack, and that one pack is what this node names and advertises.
+        assert_ne!(pack.runtime_metadata_digest(), [0; 32]);
+        assert_eq!(pre_fork_pack_id(), pack.runtime_metadata_digest());
+        assert_eq!(
+            advertised_history_proof_bank_id(),
+            pack.runtime_metadata_digest()
+        );
+        if let Some(pinned) = pinned_pre_fork_pack_id() {
+            assert_eq!(
+                pack.runtime_metadata_digest(),
+                pinned,
+                "a release for this network embeds its own launch pack"
+            );
+        }
     }
 
     /// A pack-free development build embeds nothing and advertises the
