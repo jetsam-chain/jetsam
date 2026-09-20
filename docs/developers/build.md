@@ -82,11 +82,19 @@ Generate B25 and B255 matrices from honest fixtures:
 ```sh
 mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../jetsam-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1 \
+  --profile mainnet
 ```
 
 Generation is expensive and only needs to be performed once for an unchanged
 relation. Keep the pack outside `target/`.
+
+`--profile` is required and has no default. The matrices freeze that profile's
+development-fund addresses, because the payout constraint names them, and that
+constraint is armed once per target-time day: a pack built for the wrong
+network runs 959 blocks out of 960 and stops the chain dead on the 960th. The
+finished pack records its profile and both addresses in `pins.env`, and a node
+refuses to start on a pack that does not pin its own.
 
 The script writes to a staging directory, derives semantic pins, authenticates
 every artifact and publishes the completed directory atomically. It refuses to
@@ -98,6 +106,11 @@ overwrite an existing output path.
 ./scripts/build_release.sh \
   --pack ../jetsam-artifacts/history-step-pack-v1
 ```
+
+Add `--pack-v1-3 DIR` whenever the v1.3 fork is armed. A binary whose
+`V1_3_ACTIVATION_HEIGHT` is set but which carries no v1.3 pack can verify no
+block from that height on, and refuses to start rather than stop every node
+running it at the same block.
 
 The script:
 

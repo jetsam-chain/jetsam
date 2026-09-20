@@ -196,6 +196,20 @@ fn main() {
         leaf_pins.push_str(&encoded);
     }
 
+    // Which network the matrices were frozen for, read out of the matrices.
+    //
+    // The launch-compatibility proof below cannot see this: it assembles a
+    // witness for block 1, and `development_payout_due` is false on every
+    // height that is not a multiple of TARGET_BLOCKS_PER_DAY, so the rows that
+    // name the fund addresses are satisfied by any constant at all. That is
+    // exactly how a pack generated on the mainnet profile authenticated
+    // cleanly and then stopped the test chain at block 1920 on 2026-09-17.
+    let class_digests: [[u8; 32]; HISTORY_STEP_PACK_LEAF_COUNT] = std::array::from_fn(|index| {
+        let class = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
+        runtime_metadata.bank().entry(class).matrix_digest()
+    });
+    verify_development_payout_profile(&version, &class_digests);
+
     let launch_digest = runtime_metadata.bank().entry(launch_class).matrix_digest();
     let launch_matrix = open_launch_matrix(&launch_path, launch_class, launch_digest)
         .unwrap_or_else(|error| panic!("{error}"));
@@ -225,4 +239,61 @@ fn main() {
         hex::encode(metadata_digest)
     );
     println!("JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS={leaf_pins}");
+    println!(
+        "JETSAM_PACK_PROFILE={}",
+        if cfg!(feature = "testnet") {
+            "testnet"
+        } else {
+            "mainnet"
+        }
+    );
+    println!(
+        "JETSAM_PACK_NETWORK_FUND_ADDRESS={}",
+        hex::encode(jetsam_chain::consensus::NETWORK_FUND_ADDRESS.0)
+    );
+    println!(
+        "JETSAM_PACK_LAB_FUND_ADDRESS={}",
+        hex::encode(jetsam_chain::consensus::LAB_FUND_ADDRESS.0)
+    );
+}
+
+/// Every class matrix must freeze this build's own development-payout
+/// recipients in its constant-pinned column.
+///
+/// The matrices are opened from the pack's own files and authenticated
+/// against the structural digests the runtime metadata pins, so a file that
+/// is not the one this pack shipped cannot reach the measurement.
+fn verify_development_payout_profile(
+    version: &Path,
+    class_digests: &[[u8; 32]; HISTORY_STEP_PACK_LEAF_COUNT],
+) {
+    for index in 0..HISTORY_STEP_PACK_LEAF_COUNT {
+        let class = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
+        let path = version.join(history_step_matrix_file_name(class));
+        let compressed = read_regular_bounded(&path, MAX_COMPRESSED_MATRIX_BYTES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(compressed.as_slice()))
+            .unwrap_or_else(|error| panic!("open zstd {}: {error}", path.display()));
+        decoder
+            .window_log_max(ZSTD_WINDOW_LOG_MAX)
+            .unwrap_or_else(|error| panic!("bound zstd window {}: {error}", path.display()));
+        let mut canonical = Vec::new();
+        decoder
+            .take((MAX_CANONICAL_MATRIX_BYTES + 1) as u64)
+            .read_to_end(&mut canonical)
+            .unwrap_or_else(|error| panic!("decode {}: {error}", path.display()));
+        let shape = canonical_history_step_shape(class);
+        let relation =
+            CompactFieldR1cs::open(canonical.into_boxed_slice(), shape, class_digests[index])
+                .unwrap_or_else(|error| panic!("authenticate {}: {error:?}", path.display()));
+        jetsam_recursive::verify_relation_development_payout_pins(&relation).unwrap_or_else(
+            |error| {
+                panic!(
+                    "class c{index:02} of this pack was generated for another network: {error}. \
+                     Regenerate it with ./scripts/generate_history_step_pack.sh --profile"
+                )
+            },
+        );
+        println!("class c{index:02}: development payout recipients match this build's profile");
+    }
 }
