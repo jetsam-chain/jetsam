@@ -140,6 +140,66 @@ pub fn embedded_history_step_pack() -> Option<&'static EmbeddedHistoryStepPack> 
     GENERATED_HISTORY_STEP_PACK.as_ref()
 }
 
+/// The post-fork pack, whether or not the activation clock is armed.
+///
+/// Deliberately not a function of the clock: the question "was this pack
+/// staged into the binary" is a build fact, and the coverage rule below has
+/// to be able to ask it separately from "will the schedule ever select it".
+pub fn embedded_history_step_pack_v1_3() -> Option<&'static EmbeddedHistoryStepPack> {
+    GENERATED_HISTORY_STEP_PACK_V1_3.as_ref()
+}
+
+/// What a build's embedded packs say about the activation clock it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedPackCoverage {
+    /// Every height this build's clock can reach has a relation to verify it.
+    Complete,
+    /// No pack at all. A development build: it verifies nothing, advertises
+    /// the all-zero bank id no real peer accepts, and is already refused
+    /// block production elsewhere.
+    PackFree,
+    /// A v1.3 pack is carried while the clock is dormant. The schedule never
+    /// selects it, so it is sixteen unused mebibytes and not a fault — but it
+    /// is also half of an arming, and the operator should know which half.
+    UnusedPostForkPack,
+}
+
+/// Refuse a binary whose activation clock reaches heights it cannot verify.
+///
+/// This is the trap the v1.3 work left open. `embedded_history_step_pack_for_height`
+/// returns `None` for a post-fork height in a build that carries no v1.3
+/// pack, and every layer above turned that `None` into silence: startup logged
+/// nothing, and the first block at the activation height failed with "no
+/// embedded HistoryStep verifier", which is classified as neither a peer fault
+/// nor a branch-boundary gap — so the node stops. Every node runs the same
+/// binary, so every node stops at the same height, days after the release
+/// looked healthy.
+///
+/// A refusal to start is the cheap version of that failure: it happens on one
+/// operator's terminal, before the binary is anywhere near the network.
+pub fn embedded_pack_coverage(
+    activation: Option<u64>,
+    has_pre_fork_pack: bool,
+    has_post_fork_pack: bool,
+) -> Result<EmbeddedPackCoverage, String> {
+    match (activation, has_pre_fork_pack, has_post_fork_pack) {
+        (_, false, false) => Ok(EmbeddedPackCoverage::PackFree),
+        (_, false, true) => Err(
+            "this binary embeds the v1.3 HistoryStep pack but not the launch pack: it could \
+             verify no block of the chain as it runs today. Rebuild with --pack."
+                .to_owned(),
+        ),
+        (Some(activation), true, false) => Err(format!(
+            "this binary arms the v1.3 fork at height {activation} but embeds no v1.3 \
+             HistoryStep pack: from that height on it can verify no block at all, and every \
+             node running it would stop together at the same block. Rebuild with --pack-v1-3, \
+             or leave V1_3_ACTIVATION_HEIGHT unset."
+        )),
+        (None, true, true) => Ok(EmbeddedPackCoverage::UnusedPostForkPack),
+        (_, true, _) => Ok(EmbeddedPackCoverage::Complete),
+    }
+}
+
 include!(concat!(env!("OUT_DIR"), "/history_step_pack.rs"));
 
 #[cfg(test)]
@@ -209,6 +269,105 @@ mod advertised_bank_identity_tests {
         assert!(embedded_history_step_pack_for_height(0).is_none());
         assert_eq!(pre_fork_pack_id(), [0; 32]);
         assert_eq!(advertised_history_proof_bank_id(), [0; 32]);
+    }
+
+    /// An armed clock with no relation to verify past it is refused at
+    /// startup, and the refusal says which height and which build input.
+    ///
+    /// The alternative is the failure this guard replaces: the binary starts,
+    /// runs for days, and stops at the activation height on every node at
+    /// once. A refusal is the same information, delivered before deployment
+    /// instead of after.
+    #[test]
+    fn an_armed_clock_without_its_v1_3_pack_is_refused_at_startup() {
+        let refusal = embedded_pack_coverage(Some(4_004), true, false)
+            .expect_err("an armed clock with no v1.3 pack cannot verify its own chain");
+        assert!(
+            refusal.contains("4004"),
+            "the refusal must name the height it cannot verify past: {refusal}"
+        );
+        assert!(
+            refusal.contains("--pack-v1-3"),
+            "the refusal must name the build input that fixes it: {refusal}"
+        );
+        assert!(
+            refusal.contains("V1_3_ACTIVATION_HEIGHT"),
+            "the refusal must name the other way out: {refusal}"
+        );
+
+        // Armed and carrying both relations is the shipping configuration.
+        assert_eq!(
+            embedded_pack_coverage(Some(4_004), true, true),
+            Ok(EmbeddedPackCoverage::Complete)
+        );
+        // Dormant with the launch pack alone is every release before this one.
+        assert_eq!(
+            embedded_pack_coverage(None, true, false),
+            Ok(EmbeddedPackCoverage::Complete)
+        );
+        // A pack-free development build is not a release and keeps working:
+        // it verifies nothing whatever the clock says, advertises an id no
+        // peer accepts, and is already refused block production.
+        assert_eq!(
+            embedded_pack_coverage(Some(4_004), false, false),
+            Ok(EmbeddedPackCoverage::PackFree)
+        );
+        assert_eq!(
+            embedded_pack_coverage(None, false, false),
+            Ok(EmbeddedPackCoverage::PackFree)
+        );
+    }
+
+    /// The reciprocal: a v1.3 pack carried while the clock is dormant.
+    ///
+    /// Tolerated, and said out loud. The schedule cannot select it — every
+    /// height resolves to the launch pack while the clock is `None` — so the
+    /// cost is sixteen unused mebibytes, against an outage if a refusal here
+    /// stopped a binary whose only fault is being ready early. It is reported
+    /// because it is half an arming, and the missing half is a source edit
+    /// nobody can see from the outside.
+    #[test]
+    fn a_dormant_clock_tolerates_but_reports_a_v1_3_pack_it_will_never_select() {
+        assert_eq!(
+            embedded_pack_coverage(None, true, true),
+            Ok(EmbeddedPackCoverage::UnusedPostForkPack)
+        );
+        for height in [0, 1, 4_004, u64::MAX] {
+            assert_eq!(
+                history_step_pack_generation_at(height, None),
+                HistoryStepPackGeneration::V1,
+                "a dormant clock selects the launch relation at height {height}",
+            );
+        }
+    }
+
+    /// A build carrying only the post-fork relation cannot serve the chain as
+    /// it runs today, whatever its clock says.
+    #[test]
+    fn a_build_without_the_launch_pack_is_refused() {
+        for activation in [None, Some(4_004)] {
+            let refusal = embedded_pack_coverage(activation, false, true)
+                .expect_err("a build with no launch pack cannot verify today's chain");
+            assert!(
+                refusal.contains("--pack"),
+                "the refusal must name the build input that fixes it: {refusal}"
+            );
+        }
+    }
+
+    /// The rule above, applied to what this binary actually carries.
+    ///
+    /// In a pack-free test build this is the `PackFree` arm; in a release
+    /// build's test run it is the real thing, and it fails the build rather
+    /// than the network.
+    #[test]
+    fn this_build_covers_its_own_activation_clock() {
+        embedded_pack_coverage(
+            jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT,
+            embedded_history_step_pack().is_some(),
+            embedded_history_step_pack_v1_3().is_some(),
+        )
+        .expect("this build's embedded packs cover its own activation clock");
     }
 
     /// The two packs are selected by the block's own height, on the one
