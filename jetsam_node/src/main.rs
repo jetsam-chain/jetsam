@@ -986,6 +986,24 @@ fn embedded_history_step_runtimes(
             );
         }
     }
+    // And does every pack it carries pay this build's own network? Both of
+    // them, not just the one the current clock selects: the launch pack
+    // carries the same constraint, and a v1.3 pack staged ahead of the arming
+    // is checked while the mistake is still cheap to fix.
+    for (label, pack) in [
+        (
+            "launch",
+            embedded_history_step_pack::embedded_history_step_pack(),
+        ),
+        (
+            "v1.3",
+            embedded_history_step_pack::embedded_history_step_pack_v1_3(),
+        ),
+    ] {
+        if let Some(pack) = pack {
+            verify_embedded_development_payout_pins(label, pack)?;
+        }
+    }
     Ok(EmbeddedHistoryStepRuntimes {
         pre_fork: embedded_history_step_runtime_from_pack(
             data_dir,
@@ -1061,6 +1079,64 @@ fn expected_recursion_root(
         ),
         jetsam_chain::block_header::block_id(&header),
     ))
+}
+
+/// Refuse a pack whose matrices pay another network's development funds.
+///
+/// The development payout constraint names the two fund addresses of the
+/// profile its generator was compiled under, so a matrix pack is not
+/// profile-neutral: it freezes one network's recipients for ever. The gate
+/// that reads them is armed once per target-time day, which is why a pack
+/// built on the wrong profile runs 959 blocks out of 960 and stops the chain
+/// dead on the 960th — the test chain did exactly that at block 1920 on
+/// 2026-09-17.
+///
+/// Nothing else compares the pack to the binary. The release pin tool
+/// assembles a witness for block 1, where `development_payout_due` is false,
+/// so it cannot see this defect by construction; the startup refusal above
+/// checks the pack's *generation*, which is orthogonal to its profile.
+///
+/// The check is the identity itself, not a digest of a pack we already know:
+/// a digest pin protects only the pack it was taken from, and the one that
+/// matters is the next pack, generated in a year by someone who was not there
+/// in September. Every embedded pack is checked, the launch pack included —
+/// it carries the same constraint and the same way of getting it wrong.
+///
+/// It reads one column of each class relation straight from the canonical
+/// bytes in the executable, without the runtime cache, so it neither
+/// materializes a CSR copy nor decides what this node keeps on disk.
+fn verify_embedded_development_payout_pins(
+    pack_label: &str,
+    pack: &'static embedded_history_step_pack::EmbeddedHistoryStepPack,
+) -> Result<(), String> {
+    let mut open_time = std::time::Duration::ZERO;
+    let mut scan_time = std::time::Duration::ZERO;
+    for leaf in pack.leaves() {
+        let class = leaf.class().index();
+        let opening = std::time::Instant::now();
+        let relation = leaf.open_canonical().map_err(|error| {
+            format!(
+                "embedded {pack_label} HistoryStep class c{class:02} could not be read: {error}"
+            )
+        })?;
+        open_time += opening.elapsed();
+        let scanning = std::time::Instant::now();
+        let verdict = jetsam_recursive::verify_relation_development_payout_pins(&relation);
+        scan_time += scanning.elapsed();
+        verdict.map_err(|error| {
+            format!(
+                "embedded {pack_label} HistoryStep pack was generated for another network: \
+                 class c{class:02}: {error}"
+            )
+        })?;
+    }
+    tracing::debug!(
+        pack = pack_label,
+        open_ms = open_time.as_millis() as u64,
+        scan_ms = scan_time.as_millis() as u64,
+        "embedded HistoryStep matrices pin this build's development payout recipients"
+    );
+    Ok(())
 }
 
 fn embedded_history_step_runtime_from_pack(

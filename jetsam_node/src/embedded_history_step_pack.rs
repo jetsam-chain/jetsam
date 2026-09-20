@@ -45,6 +45,15 @@ impl EmbeddedHistoryStepPack {
         })
     }
 
+    /// The canonical class relations this pack stages, in dense class order.
+    ///
+    /// Exposed so a startup check can read a frozen fact out of the relations
+    /// themselves — which recipients the development payout gate names, for
+    /// one — rather than trusting a label beside them.
+    pub fn leaves(&self) -> &[EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT] {
+        &self.leaves
+    }
+
     pub fn embedded_bytes_total(&self) -> usize {
         self.runtime_metadata.len()
             + self

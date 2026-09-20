@@ -288,6 +288,47 @@ impl EmbeddedHistoryStepMatrixLeaf {
     pub const fn build_seal(&self) -> BuildAuthenticatedFieldR1csSeal {
         self.build_seal
     }
+
+    /// Decode this leaf straight from the canonical bytes in the executable.
+    ///
+    /// Neither the runtime cache nor the packed startup layout is involved.
+    /// This is the cheapest way to read a frozen fact out of the relation —
+    /// which constants a gate holds, say — and it leaves no cache image
+    /// behind: a startup check that wanted one answer should not also decide
+    /// what this node keeps on disk.
+    ///
+    /// The binary is the trust root, exactly as for
+    /// [`EmbeddedHistoryStepMatrixSource`]: the canonical-pack preflight ran
+    /// the complete `CompactFieldR1cs::open`, structural Poseidon pass
+    /// included, over precisely these bytes when it minted the seal.
+    pub fn open_canonical(&self) -> Result<CompactFieldR1cs, EmbeddedHistoryStepMatrixError> {
+        let class = self.class.index();
+        let expected = self.build_seal.canonical_bytes();
+        let decoder = zstd::stream::read::Decoder::new(self.compressed_canonical)
+            .map_err(|source| EmbeddedHistoryStepMatrixError::Compression { class, source })?;
+        let mut canonical = Vec::with_capacity(expected);
+        decoder
+            .take(expected as u64 + 1)
+            .read_to_end(&mut canonical)
+            .map_err(|source| EmbeddedHistoryStepMatrixError::Compression { class, source })?;
+        if canonical.len() != expected {
+            return Err(EmbeddedHistoryStepMatrixError::DecodedLength {
+                class,
+                expected,
+                actual: canonical.len(),
+            });
+        }
+        // SAFETY: `canonical` is the exact decompressed embedded payload the
+        // pack preflight paired with `build_seal` after running the complete
+        // `CompactFieldR1cs::open` over it.
+        unsafe {
+            CompactFieldR1cs::open_build_authenticated(
+                canonical.into_boxed_slice(),
+                self.build_seal,
+            )
+        }
+        .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix { class, source })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -437,42 +478,7 @@ impl EmbeddedHistoryStepMatrixSource {
         class: CanonicalHistoryStepClassId,
     ) -> Result<Arc<CompactFieldR1cs>, EmbeddedHistoryStepMatrixError> {
         let leaf = &self.leaves[class.index()];
-        let expected = leaf.build_seal.canonical_bytes();
-        let decoder =
-            zstd::stream::read::Decoder::new(leaf.compressed_canonical).map_err(|source| {
-                EmbeddedHistoryStepMatrixError::Compression {
-                    class: class.index(),
-                    source,
-                }
-            })?;
-        let mut canonical = Vec::new();
-        decoder
-            .take(expected as u64 + 1)
-            .read_to_end(&mut canonical)
-            .map_err(|source| EmbeddedHistoryStepMatrixError::Compression {
-                class: class.index(),
-                source,
-            })?;
-        if canonical.len() != expected {
-            return Err(EmbeddedHistoryStepMatrixError::DecodedLength {
-                class: class.index(),
-                expected,
-                actual: canonical.len(),
-            });
-        }
-        // SAFETY: `canonical` is the exact decompressed embedded payload the
-        // pack preflight paired with `build_seal` after running the complete
-        // `CompactFieldR1cs::open` over it.
-        let relation = unsafe {
-            CompactFieldR1cs::open_build_authenticated(
-                canonical.into_boxed_slice(),
-                leaf.build_seal,
-            )
-        }
-        .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix {
-            class: class.index(),
-            source,
-        })?;
+        let relation = leaf.open_canonical()?;
         let packed = relation.into_startup_packed().map_err(|source| {
             EmbeddedHistoryStepMatrixError::Matrix {
                 class: class.index(),
