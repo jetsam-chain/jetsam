@@ -290,7 +290,7 @@ fn select_expr(
     when_zero.add(&mul(b, selector, &when_one.add(when_zero)))
 }
 
-fn constant_spine_inputs_trace(native: &SpineInputs) -> SpineInputsTrace {
+pub(crate) fn constant_spine_inputs_trace(native: &SpineInputs) -> SpineInputsTrace {
     SpineInputsTrace {
         leaves: std::array::from_fn(|leaf| {
             std::array::from_fn(|lane| const_block(native.leaves[leaf][lane]))
@@ -298,7 +298,7 @@ fn constant_spine_inputs_trace(native: &SpineInputs) -> SpineInputsTrace {
     }
 }
 
-fn select_spine_inputs_trace(
+pub(crate) fn select_spine_inputs_trace(
     b: &mut FieldR1csBuilder,
     selector: &LinExpr,
     when_one: &SpineInputsTrace,
