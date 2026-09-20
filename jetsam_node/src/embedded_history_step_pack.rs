@@ -380,19 +380,40 @@ mod advertised_bank_identity_tests {
     }
 
     /// The two packs are selected by the block's own height, on the one
-    /// activation clock. While that clock is `None` every height resolves to
-    /// the pre-fork pack, so this binary behaves exactly like v1.2.
+    /// activation clock: the pre-fork pack below the activation height, the
+    /// v1.3 pack at and above it. While that clock is `None` every height
+    /// resolves to the pre-fork pack, so this binary behaves exactly like
+    /// v1.2 — but that is the answer of today's constant, not a property of
+    /// the selector, and this test derives it rather than assuming it.
     #[test]
     fn the_pack_is_selected_by_height_on_the_single_activation_clock() {
-        for height in [0, 1, 4_004, u64::MAX] {
+        fn address(
+            pack: Option<&'static EmbeddedHistoryStepPack>,
+        ) -> *const EmbeddedHistoryStepPack {
+            pack.map_or(std::ptr::null(), |pack| pack as *const _)
+        }
+
+        let armed = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
+        let mut heights = vec![0u64, 1, 4_004, u64::MAX];
+        if let Some(activation) = armed {
+            heights.extend([
+                activation.saturating_sub(1),
+                activation,
+                activation.saturating_add(1),
+            ]);
+        }
+        for height in heights {
+            let expected = if matches!(armed, Some(activation) if height >= activation) {
+                embedded_history_step_pack_v1_3()
+            } else {
+                embedded_history_step_pack()
+            };
             assert!(
                 std::ptr::eq(
-                    embedded_history_step_pack_for_height(height)
-                        .map_or(std::ptr::null(), |pack| pack as *const _),
-                    embedded_history_step_pack_for_height(0)
-                        .map_or(std::ptr::null(), |pack| pack as *const _),
+                    address(embedded_history_step_pack_for_height(height)),
+                    address(expected),
                 ),
-                "height {height} selected a different pack while the fork is dormant"
+                "height {height} selected the wrong relation, activation {armed:?}"
             );
         }
         // With an injected schedule the switch happens at exactly the height,

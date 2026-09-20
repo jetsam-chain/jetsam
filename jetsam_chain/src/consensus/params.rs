@@ -924,19 +924,53 @@ mod tests {
             None
         );
 
-        // Dormant: every height keeps the launch ladder, so this binary
+        // And the same rule on the fixed clock, at whatever height this
+        // profile has it set to — including the block before the crossing,
+        // the crossing itself and the block after it. While the clock is
+        // `None` that is the launch ladder at every height, so this binary
         // judges the live chain exactly as v1.2.0 does.
-        for height in [0, 1, 4_004, 8450, u64::MAX] {
+        //
+        // Asserting the dormant ladder outright instead would state a
+        // property of today's constant as a property of the code: green while
+        // the fork sleeps, red on the morning a profile arms, and
+        // indistinguishable from a regression on the one day nobody should be
+        // repairing guard-rails.
+        let armed = V1_3_ACTIVATION_HEIGHT;
+        let mut heights = vec![0, 1, 4_004, 8450, u64::MAX];
+        if let Some(activation) = armed {
+            heights.extend([
+                activation.saturating_sub(1),
+                activation,
+                activation.saturating_add(1),
+            ]);
+        }
+        for height in heights {
+            let post_fork = matches!(armed, Some(activation) if height >= activation);
             assert_eq!(
                 block_page_class_tiers_at_height(height),
-                BLOCK_PAGE_CLASS_TIERS,
-                "height {height}"
+                if post_fork {
+                    [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]]
+                } else {
+                    BLOCK_PAGE_CLASS_TIERS
+                },
+                "height {height}, activation {armed:?}"
             );
-            for page_count in [0, 24, 25, 26, 255, 256] {
+            for (page_count, post_fork_tier) in [
+                (0usize, Some(24usize)),
+                (24, Some(24)),
+                (25, Some(255)),
+                (26, Some(255)),
+                (255, Some(255)),
+                (256, None),
+            ] {
                 assert_eq!(
                     block_page_class_tier_at_height(page_count, height),
-                    block_page_class_tier(page_count),
-                    "height {height}, {page_count} pages"
+                    if post_fork {
+                        post_fork_tier
+                    } else {
+                        block_page_class_tier(page_count)
+                    },
+                    "height {height}, {page_count} pages, activation {armed:?}"
                 );
             }
         }
