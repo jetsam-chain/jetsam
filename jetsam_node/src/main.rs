@@ -965,6 +965,27 @@ fn embedded_history_step_runtimes(
     // Both verifiers are attached as soon as their pack is embedded. Making
     // the v1.3 one wait for the tip to reach H - 1 would have meant every
     // node had to restart inside a one-block window.
+    //
+    // Before any of that: does this binary carry a relation for every height
+    // its own activation clock can reach? An armed clock with no v1.3 pack
+    // verifies nothing from the activation height on, and stops every node
+    // running it at the same block. That refusal belongs here, on one
+    // operator's terminal.
+    match embedded_history_step_pack::embedded_pack_coverage(
+        jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT,
+        embedded_history_step_pack::embedded_history_step_pack().is_some(),
+        embedded_history_step_pack::embedded_history_step_pack_v1_3().is_some(),
+    )? {
+        embedded_history_step_pack::EmbeddedPackCoverage::Complete => {}
+        embedded_history_step_pack::EmbeddedPackCoverage::PackFree => {}
+        embedded_history_step_pack::EmbeddedPackCoverage::UnusedPostForkPack => {
+            tracing::warn!(
+                "this binary embeds a v1.3 HistoryStep pack while V1_3_ACTIVATION_HEIGHT is \
+                 unset: the fork schedule will never select it. Arming the fork is a source \
+                 edit, not a build input."
+            );
+        }
+    }
     Ok(EmbeddedHistoryStepRuntimes {
         pre_fork: embedded_history_step_runtime_from_pack(
             data_dir,
