@@ -12,20 +12,30 @@ BUILD_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 DEFAULT_RELEASE_DIR="$RELEASE_ROOT_DIR/target/release-builds/$BUILD_ID"
 LAST_RELEASE_FILE="$RELEASE_ROOT_DIR/target/release-builds/LAST_RELEASE"
 PACK_DIR=
+PACK_DIR_V1_3=
 RELEASE_DIR=
 usage() {
   cat <<'EOF'
-Usage: ./scripts/build_release.sh --pack PACK_DIR [--output RELEASE_DIR]
+Usage: ./scripts/build_release.sh --pack PACK_DIR [--pack-v1-3 PACK_DIR]
+                                  [--output RELEASE_DIR]
 
-Embed one already authenticated canonical HistoryStep pack into the node and
+Embed the already authenticated canonical HistoryStep packs into the node and
 build two native deliverables for the current host:
 the operator bundle (node, CLI, external miner) and the independently
 installable GUI wallet (GUI plus its private node). This command never
 regenerates or re-authenticates matrices. Source checks and tests are separate
 pre-build gates.
 
+The v1.3 pack is a second, separate relation, selected by block height from the
+v1.3 activation onwards. A binary whose activation height is armed but which
+carries no v1.3 pack cannot verify a single block from that height on, and
+refuses to start rather than stop the chain later; pass --pack-v1-3 whenever
+the fork is armed.
+
 Options:
-  --pack DIR       Canonical HistoryStep pack root (required).
+  --pack DIR       Canonical HistoryStep pack root for the launch relation
+                   (required).
+  --pack-v1-3 DIR  Canonical HistoryStep pack root for the post-fork relation.
   --output DIR     Fresh output directory. Defaults under target/release-builds/.
   -h, --help       Show this help.
 
@@ -44,6 +54,11 @@ while (( $# > 0 )); do
     --pack)
       (( $# >= 2 )) || release_die "--pack requires a directory"
       PACK_DIR=$2
+      shift 2
+      ;;
+    --pack-v1-3)
+      (( $# >= 2 )) || release_die "--pack-v1-3 requires a directory"
+      PACK_DIR_V1_3=$2
       shift 2
       ;;
     --output)
@@ -68,6 +83,12 @@ done
 }
 PACK_DIR=$(release_absolute_from_root "$PACK_DIR")
 PACK_DIR=$(release_canonical_directory "$PACK_DIR")
+if [[ -n $PACK_DIR_V1_3 ]]; then
+  PACK_DIR_V1_3=$(release_absolute_from_root "$PACK_DIR_V1_3")
+  PACK_DIR_V1_3=$(release_canonical_directory "$PACK_DIR_V1_3")
+  [[ $PACK_DIR_V1_3 != "$PACK_DIR" ]] || \
+    release_die "--pack and --pack-v1-3 name the same pack: they are two different relations"
+fi
 if [[ -z $RELEASE_DIR ]]; then
   RELEASE_DIR=$DEFAULT_RELEASE_DIR
 else
@@ -188,12 +209,15 @@ cd "$RELEASE_ROOT_DIR"
 unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
 unset JETSAM_HISTORY_STEP_PACK_DIR
 unset JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
+unset JETSAM_HISTORY_STEP_PACK_DIR_V1_3
+unset JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST_V1_3
 unset TAR_OPTIONS GZIP GZIP_OPT
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
 printf 'Jetsam self-contained release build\n'
 printf '  source:       %s\n' "$RELEASE_ROOT_DIR"
 printf '  matrix pack:  %s\n' "$PACK_DIR"
+printf '  v1.3 pack:    %s\n' "${PACK_DIR_V1_3:-<none>}"
 printf '  release dir:  %s\n' "$RELEASE_DIR"
 printf '  version:      %s\n' "$RELEASE_VERSION"
 printf '  target:       %s\n' "$HOST_TRIPLE"
@@ -207,10 +231,32 @@ CURRENT_STAGE='pack metadata load'
 release_validate_pack_layout "$PACK_DIR" 1
 release_read_pin_file "$PACK_DIR/pins.env"
 RELEASE_METADATA_DIGEST=$RELEASE_FILE_METADATA_DIGEST
+# This script builds the public-network node: no testnet feature reaches cargo
+# below. A pack that declares another network freezes that network's fund
+# addresses in its matrices, and the node would refuse to start on it — better
+# to say so here, with the pack named, than after a full release build.
+if [[ -n $RELEASE_FILE_PACK_PROFILE && $RELEASE_FILE_PACK_PROFILE != mainnet ]]; then
+  release_die "pack $PACK_DIR declares the '$RELEASE_FILE_PACK_PROFILE' profile; this script builds the public-network node"
+fi
+
+if [[ -n $PACK_DIR_V1_3 ]]; then
+  release_validate_pack_layout "$PACK_DIR_V1_3" 1
+  release_read_pin_file "$PACK_DIR_V1_3/pins.env"
+  RELEASE_METADATA_DIGEST_V1_3=$RELEASE_FILE_METADATA_DIGEST
+  if [[ -n $RELEASE_FILE_PACK_PROFILE && $RELEASE_FILE_PACK_PROFILE != mainnet ]]; then
+    release_die "pack $PACK_DIR_V1_3 declares the '$RELEASE_FILE_PACK_PROFILE' profile; this script builds the public-network node"
+  fi
+  [[ $RELEASE_METADATA_DIGEST_V1_3 != "$RELEASE_METADATA_DIGEST" ]] || \
+    release_die "--pack and --pack-v1-3 carry the same runtime metadata: they are two different relations"
+fi
 
 export RUSTFLAGS="$RELEASE_RUSTFLAGS"
 export JETSAM_HISTORY_STEP_PACK_DIR="$PACK_DIR"
 export JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
+if [[ -n $PACK_DIR_V1_3 ]]; then
+  export JETSAM_HISTORY_STEP_PACK_DIR_V1_3="$PACK_DIR_V1_3"
+  export JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST_V1_3="$RELEASE_METADATA_DIGEST_V1_3"
+fi
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'

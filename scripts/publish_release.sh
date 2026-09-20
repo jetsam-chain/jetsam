@@ -183,6 +183,15 @@ gh auth status >/dev/null
 [[ $(gh repo view --json visibility --jq .visibility) == PUBLIC ]] || \
   release_die "make the GitHub repository public before opening the release window"
 
+# The pack states which network it was frozen for; the tools that re-derive its
+# pins have to be compiled for that same network, or they authenticate it
+# against fund addresses it never carried. A pack published before pins.env
+# recorded an identity cannot say, and is regenerated rather than guessed at.
+release_read_pin_file "$PACK_DIR/pins.env"
+[[ -n $RELEASE_FILE_PACK_PROFILE ]] || \
+  release_die "pack $PACK_DIR does not record its network profile; regenerate it with ./scripts/generate_history_step_pack.sh --profile"
+release_set_pack_profile "$RELEASE_FILE_PACK_PROFILE"
+
 release_build_pack_tools 0
 printf '\n==> Authenticating publishable HistoryStep pack\n'
 release_authenticate_pack "$PACK_DIR" 1

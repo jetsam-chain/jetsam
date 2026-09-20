@@ -80,7 +80,8 @@ SHA256SUMS
 ```sh
 mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../jetsam-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1 \
+  --profile mainnet
 ```
 
 生成开销很高；证明关系不变时只需执行一次。矩阵包应保存在 `target/`

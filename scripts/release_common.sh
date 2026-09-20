@@ -10,6 +10,21 @@ fi
 RELEASE_ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly RELEASE_ROOT_DIR
 
+# Which network the pack tools are built for. The matrices they generate freeze
+# that profile's fund addresses — the development payout constraint names them
+# — so a pack built for the wrong network satisfies its rows on 959 blocks out
+# of 960 and stops the chain dead on the 960th. The test chain learned this at
+# block 1920 on 2026-09-17.
+#
+# It is therefore a declared build input and never an ambient one: whatever the
+# environment carried is dropped here, and a caller that never declares a
+# profile gets a refusal rather than a default. An inherited variable deciding
+# which chain's money a pack pays is exactly the failure this file now refuses
+# to make possible.
+unset JETSAM_PACK_TOOL_FEATURES
+RELEASE_PACK_PROFILE=
+RELEASE_PACK_TOOL_FEATURES=
+
 release_die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -17,6 +32,23 @@ release_die() {
 
 release_require_command() {
   command -v "$1" >/dev/null 2>&1 || release_die "required command not found: $1"
+}
+
+# Declare the network the pack tools — and so the matrices they generate and
+# the pins they authenticate — belong to. Callers must state this; there is no
+# default, and the value never comes from the environment.
+release_set_pack_profile() {
+  case "$1" in
+    mainnet)
+      RELEASE_PACK_PROFILE=mainnet
+      RELEASE_PACK_TOOL_FEATURES=
+      ;;
+    testnet)
+      RELEASE_PACK_PROFILE=testnet
+      RELEASE_PACK_TOOL_FEATURES=testnet
+      ;;
+    *) release_die "unknown network profile: $1 (mainnet|testnet)" ;;
+  esac
 }
 
 release_absolute_from_root() {
@@ -108,12 +140,26 @@ release_validate_pack_layout() {
   fi
 }
 
+## Read one pack's `pins.env`.
+##
+## Two assignments are the legacy form, published before a pack carried its own
+## identity; five are the current one, which adds the profile the generator was
+## compiled under and the two fund addresses its matrices froze. A legacy pack
+## still reads, and reports an empty profile.
+##
+## The file is read line by line rather than grepped on purpose: `grep` without
+## `-a` treats a file it believes to be binary as matchless and hands back an
+## empty digest, which only surfaces much later as a 64-character length
+## assertion in the build.
 release_read_pin_file() {
   local pin_file=$1
   local line
   local line_count=0
   local metadata_digest=
   local leaf_digests=
+  local pack_profile=
+  local network_fund=
+  local lab_fund=
 
   [[ -f $pin_file && ! -L $pin_file ]] || release_die "invalid pin file: $pin_file"
   while IFS= read -r line || [[ -n $line ]]; do
@@ -127,18 +173,44 @@ release_read_pin_file() {
         [[ -z $leaf_digests ]] || release_die "duplicate matrix leaf pins in $pin_file"
         leaf_digests=${line#*=}
         ;;
+      JETSAM_PACK_PROFILE=*)
+        [[ -z $pack_profile ]] || release_die "duplicate pack profile in $pin_file"
+        pack_profile=${line#*=}
+        ;;
+      JETSAM_PACK_NETWORK_FUND_ADDRESS=*)
+        [[ -z $network_fund ]] || release_die "duplicate network fund address in $pin_file"
+        network_fund=${line#*=}
+        ;;
+      JETSAM_PACK_LAB_FUND_ADDRESS=*)
+        [[ -z $lab_fund ]] || release_die "duplicate lab fund address in $pin_file"
+        lab_fund=${line#*=}
+        ;;
       *) release_die "unexpected line in $pin_file" ;;
     esac
   done < "$pin_file"
 
-  (( line_count == 2 )) || release_die "$pin_file must contain exactly two assignments"
+  (( line_count == 2 || line_count == 5 )) || \
+    release_die "$pin_file must contain either two or five assignments"
   [[ $metadata_digest =~ ^[0-9a-f]{64}$ ]] || \
     release_die "runtime metadata pin in $pin_file is not 64 lowercase hex characters"
   [[ $leaf_digests =~ ^[0-9a-f]{128}$ ]] || \
     release_die "matrix leaf pins in $pin_file are not two lowercase hex digests"
+  if (( line_count == 5 )); then
+    case "$pack_profile" in
+      mainnet|testnet) ;;
+      *) release_die "pack profile in $pin_file is not mainnet or testnet" ;;
+    esac
+    [[ $network_fund =~ ^[0-9a-f]{64}$ ]] || \
+      release_die "network fund address in $pin_file is not 64 lowercase hex characters"
+    [[ $lab_fund =~ ^[0-9a-f]{64}$ ]] || \
+      release_die "lab fund address in $pin_file is not 64 lowercase hex characters"
+  fi
 
   RELEASE_FILE_METADATA_DIGEST=$metadata_digest
   RELEASE_FILE_LEAF_DIGESTS=$leaf_digests
+  RELEASE_FILE_PACK_PROFILE=$pack_profile
+  RELEASE_FILE_NETWORK_FUND_ADDRESS=$network_fund
+  RELEASE_FILE_LAB_FUND_ADDRESS=$lab_fund
 }
 
 release_write_pin_file() {
@@ -150,10 +222,24 @@ release_write_pin_file() {
     release_die "cannot write pins.env without a computed runtime metadata digest"
   [[ ${RELEASE_LEAF_DIGESTS:-} =~ ^[0-9a-f]{128}$ ]] || \
     release_die "cannot write pins.env without two computed matrix digests"
+  # A pack carries its own identity. Without these three lines the only way to
+  # learn which network a pack pays is to regenerate it, which is how a pack
+  # frozen under the wrong profile reached a running chain.
+  [[ ${RELEASE_PACK_PROFILE:-} == mainnet || ${RELEASE_PACK_PROFILE:-} == testnet ]] || \
+    release_die "cannot write pins.env without a declared pack profile"
+  [[ ${RELEASE_PACK_NETWORK_FUND_ADDRESS:-} =~ ^[0-9a-f]{64}$ ]] || \
+    release_die "cannot write pins.env without the network fund address the pack froze"
+  [[ ${RELEASE_PACK_LAB_FUND_ADDRESS:-} =~ ^[0-9a-f]{64}$ ]] || \
+    release_die "cannot write pins.env without the lab fund address the pack froze"
   printf 'JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\n' \
     "$RELEASE_METADATA_DIGEST" > "$temporary"
   printf 'JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
     "$RELEASE_LEAF_DIGESTS" >> "$temporary"
+  printf 'JETSAM_PACK_PROFILE=%s\n' "$RELEASE_PACK_PROFILE" >> "$temporary"
+  printf 'JETSAM_PACK_NETWORK_FUND_ADDRESS=%s\n' \
+    "$RELEASE_PACK_NETWORK_FUND_ADDRESS" >> "$temporary"
+  printf 'JETSAM_PACK_LAB_FUND_ADDRESS=%s\n' \
+    "$RELEASE_PACK_LAB_FUND_ADDRESS" >> "$temporary"
   mv -- "$temporary" "$pin_file"
 }
 
@@ -219,10 +305,19 @@ release_build_pack_tools() {
   local build_args=(--bin jetsam_pack_pins)
   local tool_rustflags='-C target-cpu=native'
 
+  # Refuse before doing any work: the profile decides which chain's fund
+  # addresses the tools compile in, and a tool built under an undeclared
+  # profile authenticates a pack against addresses nobody chose.
+  [[ -n $RELEASE_PACK_PROFILE ]] || \
+    release_die "no pack profile was declared: call release_set_pack_profile mainnet|testnet"
+
   release_require_command cargo
   release_require_command rustc
   release_require_command tr
   RELEASE_TOOL_TARGET_DIR=${JETSAM_RELEASE_TOOL_TARGET_DIR:-$RELEASE_ROOT_DIR/target/release-tools}
+  if [[ -n $RELEASE_PACK_TOOL_FEATURES ]]; then
+    build_args+=(--features "$RELEASE_PACK_TOOL_FEATURES")
+  fi
   if [[ $include_generator == 1 ]]; then
     build_args+=(--bin jetsam_matrix_gen)
   fi
@@ -257,7 +352,7 @@ release_build_pack_tools() {
 
 release_compute_pack_pins() {
   local pack_root=$1
-  local output metadata_digest leaf_digests
+  local output metadata_digest leaf_digests tool_profile network_fund lab_fund
 
   [[ -x ${RELEASE_PIN_TOOL:-} ]] || release_die "release pin tool is unavailable"
   output=$("$RELEASE_PIN_TOOL" "$pack_root")
@@ -271,13 +366,29 @@ release_compute_pack_pins() {
     printf '%s\n' "$output" |
       sed -n 's/^JETSAM_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
   )
+  tool_profile=$(printf '%s\n' "$output" | sed -n 's/^JETSAM_PACK_PROFILE=//p')
+  network_fund=$(
+    printf '%s\n' "$output" | sed -n 's/^JETSAM_PACK_NETWORK_FUND_ADDRESS=//p'
+  )
+  lab_fund=$(printf '%s\n' "$output" | sed -n 's/^JETSAM_PACK_LAB_FUND_ADDRESS=//p')
   [[ $metadata_digest =~ ^[0-9a-f]{64}$ ]] || \
     release_die "computed runtime metadata pin is not 64 lowercase hex characters"
   [[ $leaf_digests =~ ^[0-9a-f]{128}$ ]] || \
     release_die "computed matrix pins are not two lowercase hex digests"
+  # The tool reports the profile it was compiled under, not the one that was
+  # asked for. A mismatch means the declared profile never reached the build,
+  # which is the whole failure this guard exists to stop.
+  [[ $tool_profile == "$RELEASE_PACK_PROFILE" ]] || \
+    release_die "pack tool was built for '${tool_profile:-<none>}' but the declared profile is '$RELEASE_PACK_PROFILE'"
+  [[ $network_fund =~ ^[0-9a-f]{64}$ ]] || \
+    release_die "pack tool did not report a network fund address"
+  [[ $lab_fund =~ ^[0-9a-f]{64}$ ]] || \
+    release_die "pack tool did not report a lab fund address"
 
   RELEASE_METADATA_DIGEST=$metadata_digest
   RELEASE_LEAF_DIGESTS=$leaf_digests
+  RELEASE_PACK_NETWORK_FUND_ADDRESS=$network_fund
+  RELEASE_PACK_LAB_FUND_ADDRESS=$lab_fund
 }
 
 release_authenticate_pack() {
@@ -295,6 +406,14 @@ release_authenticate_pack() {
       release_die "pins.env runtime metadata digest does not match the pack"
     [[ $RELEASE_FILE_LEAF_DIGESTS == "$RELEASE_LEAF_DIGESTS" ]] || \
       release_die "pins.env matrix digests do not match the pack"
+    if [[ -n $RELEASE_FILE_PACK_PROFILE ]]; then
+      [[ $RELEASE_FILE_PACK_PROFILE == "$RELEASE_PACK_PROFILE" ]] || \
+        release_die "pins.env declares the '$RELEASE_FILE_PACK_PROFILE' profile but this run declared '$RELEASE_PACK_PROFILE'"
+      [[ $RELEASE_FILE_NETWORK_FUND_ADDRESS == "$RELEASE_PACK_NETWORK_FUND_ADDRESS" ]] || \
+        release_die "pins.env network fund address does not match the profile these tools were built for"
+      [[ $RELEASE_FILE_LAB_FUND_ADDRESS == "$RELEASE_PACK_LAB_FUND_ADDRESS" ]] || \
+        release_die "pins.env lab fund address does not match the profile these tools were built for"
+    fi
   elif [[ $require_manifest == 1 ]]; then
     release_die "publishable pack is missing pins.env"
   fi

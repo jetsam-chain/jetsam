@@ -4,6 +4,17 @@ version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+# The pack generator lives in this crate, and the matrices it writes freeze the
+# fund addresses of the profile it was built under: the development payout
+# constraint names them, so a pack built for the wrong network satisfies its
+# rows on 959 blocks out of 960 and stops the chain dead on the 960th. The test
+# chain learned this at block 1920 on 2026-09-17.
+#
+# `jetsam_chain` is where those constants are chosen, so forwarding to it is all
+# that is needed: every other crate reads them through it.
+testnet = ["jetsam_chain/testnet"]
+
 [dependencies]
 jetsam_core = { path = "../jetsam_core" }
 jetsam_fri = { path = "../jetsam_fri" }

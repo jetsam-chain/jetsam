@@ -83,7 +83,8 @@ SHA256SUMS
 ```sh
 mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../jetsam-artifacts/history-step-pack-v1
+  ../jetsam-artifacts/history-step-pack-v1 \
+  --profile mainnet
 ```
 
 Генерация ресурсоёмка и нужна один раз, пока отношение не меняется. Храните

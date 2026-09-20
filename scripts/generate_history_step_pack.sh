@@ -10,12 +10,20 @@ source "$SCRIPT_DIR/release_common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/generate_history_step_pack.sh OUTPUT_DIR [--generation v1|v1.3]
+Usage: ./scripts/generate_history_step_pack.sh OUTPUT_DIR --profile mainnet|testnet
+                                                 [--generation v1|v1.3]
 
 Generate one canonical two-class HistoryStep pack from honest genesis
 fixtures, authenticate it, and publish it atomically at OUTPUT_DIR. Matrix
 generation can take roughly 90 minutes on the reference laptop. OUTPUT_DIR
 must not exist; keep it outside the disposable repository target/ directory.
+
+--profile is required and has no default. The matrices freeze that profile's
+fund addresses, because the development payout constraint names them, so a
+pack built for the wrong network satisfies its rows on 959 blocks out of 960
+and stops the chain dead on the 960th. The test chain learned this at block
+1920 on 2026-09-17. The finished pack records its profile and both addresses
+in pins.env, so it can be read back without being regenerated.
 
 Without --generation this builds the launch pack, unchanged. A generation is
 the relation the whole build runs under, not a label on the output, so a pack
@@ -47,12 +55,29 @@ while (( $# > 0 )); do
       GENERATOR_GENERATION=(--generation "$2")
       shift 2
       ;;
+    --profile)
+      # Which network the pack is for. The matrices freeze this profile's fund
+      # addresses — the development payout constraint names them — so a pack
+      # built for the wrong network satisfies its rows on 959 blocks out of 960
+      # and stops the chain dead on the 960th. The test chain learned this at
+      # block 1920 on 2026-09-17. There is no default: guessing is what cost
+      # the test chain 1920 blocks.
+      (( $# >= 2 )) || release_die "--profile needs a value"
+      [[ -z $RELEASE_PACK_PROFILE ]] || release_die "--profile given twice"
+      release_set_pack_profile "$2"
+      shift 2
+      ;;
     *)
       usage >&2
       exit 2
       ;;
   esac
 done
+
+[[ -n $RELEASE_PACK_PROFILE ]] || {
+  usage >&2
+  release_die "--profile is required (mainnet|testnet); this pack's matrices freeze that network's fund addresses"
+}
 
 OUTPUT_DIR=$(release_absolute_from_root "$OUTPUT_ARGUMENT")
 OUTPUT_PARENT=$(dirname -- "$OUTPUT_DIR")
@@ -108,5 +133,8 @@ mv -- "$STAGING_DIR" "$OUTPUT_DIR"
 CURRENT_STAGE=complete
 printf '\nSUCCESS\n'
 printf '  canonical pack: %s\n' "$OUTPUT_DIR"
+printf '  profile:        %s\n' "$RELEASE_PACK_PROFILE"
+printf '  network fund:   %s\n' "$RELEASE_PACK_NETWORK_FUND_ADDRESS"
+printf '  lab fund:       %s\n' "$RELEASE_PACK_LAB_FUND_ADDRESS"
 printf '  pins:           %s\n' "$OUTPUT_DIR/pins.env"
 printf '  checksums:      %s\n' "$OUTPUT_DIR/SHA256SUMS"
