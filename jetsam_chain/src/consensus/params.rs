@@ -177,8 +177,20 @@ pub(crate) const fn v1_2_active_with(height: u64, activation_height: Option<u64>
 /// `wire_limits::tests::arming_v1_3_takes_two_deliberate_edits` fails the
 /// moment this value disagrees with the declaration beside it, so arming is
 /// visible in CI and cannot happen as a side effect of an unrelated edit.
+///
+/// **Armed at 17750 on 2026-09-21**, decided with the network operator against
+/// a tip of 16950 and a measured rate of 89.3 s per block — about seventeen
+/// hours of notice from the announcement, published as a height rather than a
+/// time, because the hour depends on everyone's hashrate and the height does
+/// not.
+///
+/// What earned this height: the test chain crossed at block 20 and has run
+/// past both development payout blocks, 960 and 1920, under two competing
+/// miners and through 50 reorganisations, with no proof failure. The large
+/// proof class — the one that stopped the chain in v1.2 — has been produced,
+/// sealed at block 2629, and re-verified by a peer that had never seen it.
 #[cfg(not(feature = "testnet"))]
-pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(17_750);
 
 /// The test chain crosses v1.3 first, so the crossing is watched before the
 /// public network is ever armed.
