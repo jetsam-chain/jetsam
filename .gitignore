@@ -1,5 +1,9 @@
 /target/
 **/target/
+# Build directories from parallel verification runs. A release refuses to
+# publish from a tree that is not clean, and these grow to tens of gigabytes,
+# so leaving them untracked would block it.
+/target-*/
 .idea/
 .vscode/
 *.swp

@@ -180,15 +180,25 @@ pub(crate) const fn v1_2_active_with(height: u64, activation_height: Option<u64>
 #[cfg(not(feature = "testnet"))]
 pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// The test chain crosses v1.3 first, so the crossing is watched on a chain
-/// that carries real pre-fork history. Dormant again until that height is
-/// chosen with the operator against the tip of the day: the first attempt was
-/// armed at 1304 and stalled there, and the height has to be re-picked above
-/// whatever tip the upgraded binary is deployed at. Nothing is armed on the
-/// public network until this crossing has happened and the chain has run
-/// under the new relation.
+/// The test chain crosses v1.3 first, so the crossing is watched before the
+/// public network is ever armed.
+///
+/// Two earlier attempts are worth remembering. The first was armed at 1304 and
+/// stalled there on a decoding defect, since fixed: the first block of a new
+/// relation is its base and reads no parent terminal. The second crossed at
+/// 1419, ran 500 blocks, and stopped dead at 1920 — the first development
+/// payout after the fork — because the pack had been generated under the
+/// public profile and had frozen that network's fund addresses. Such a
+/// disagreement is invisible on 959 blocks out of 960 and fatal on the 960th.
+///
+/// The chain was then rebuilt from genesis with a pack generated under this
+/// profile, which is why the height is low: 20 is simply above the tip the
+/// corrected binary was deployed at. It crossed, and has since passed both
+/// 960 and 1920 — the two payout blocks — without a proof failure. Nothing is
+/// armed on the public network until a height is chosen there with the
+/// operator, against the tip of the day.
 #[cfg(feature = "testnet")]
-pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(1419);
+pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 
 /// Whether one candidate block height is governed by the v1.3 consensus rules.
 #[inline]

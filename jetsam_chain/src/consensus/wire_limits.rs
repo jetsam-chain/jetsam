@@ -259,13 +259,15 @@ mod tests {
     /// dormancy matters most, and the failure looks like a bug in the guard
     /// rather than what it is.
     ///
-    /// The test chain crosses first, at a height chosen against its own tip
-    /// with the operator. The first attempt was armed at 1304 and stalled
-    /// there on a decoding defect since fixed; 1419 was re-picked above the
-    /// tip the corrected binary was deployed at, and the chain crossed it on
-    /// 2026-09-17.
+    /// The test chain crosses first, at a height chosen against its own tip.
+    /// Two attempts preceded this one: 1304 stalled on a decoding defect since
+    /// fixed, and 1419 crossed but stopped at the first development payout
+    /// because the pack had been built under the other profile. The chain was
+    /// rebuilt from genesis with a pack generated under this one, so 20 is
+    /// simply above the tip of the redeployed binary; it has since passed both
+    /// payout blocks, 960 and 1920.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(1419);
+    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 
     /// `None` on the public network: nothing is armed there until the test
     /// chain has crossed and run under the new relation — and then only at a
