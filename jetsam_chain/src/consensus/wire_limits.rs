@@ -269,11 +269,12 @@ mod tests {
     #[cfg(feature = "testnet")]
     const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 
-    /// `None` on the public network: nothing is armed there until the test
-    /// chain has crossed and run under the new relation — and then only at a
-    /// height decided with the network operator.
+    /// Armed at 17750 on the public network, 2026-09-21. The test chain had
+    /// crossed and run under the new relation — past both payout blocks, with
+    /// the large class sealed and re-verified by a peer — before this height
+    /// was decided with the network operator.
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(17_750);
 
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
     #[test]
