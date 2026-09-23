@@ -42,43 +42,46 @@ unsafe fn sbox_x7(x: __m256i) -> __m256i {
     mul_gcm_x2(x6, x4)
 }
 
-/// Full-round MDS: generic 4×4 with the is-one entries as bare XORs.
+/// Full-round MDS in four constant products.
+///
+/// `M = [5 7 1 3; 4 6 1 1; 1 3 5 7; 1 1 4 6]`. In characteristic two the
+/// entries decompose additively — `3 = 2+1`, `5 = 4+1`, `6 = 4+2`, `7 = 4+2+1`
+/// — and the tower→flat change of basis is GF(2)-linear, so the decomposition
+/// survives it. Applying that alone costs six products (`4a, 2b, 4b, 4c, 2d,
+/// 4d`). Sharing `u0 = a+b` and `u1 = c+d` brings it to four:
+///
+/// ```text
+/// y1 = 4u0 + 2b + u1
+/// y0 = y1  + u0 + 2d
+/// y3 = u0  + 4u1 + 2d
+/// y2 = y3  + u1  + 2b
+/// ```
+///
+/// Expanded, those are the four matrix rows exactly — `y1 = 4a+4b+2b+c+d`,
+/// `y0 = y1+a+b+2d`, and so on. Same linear map, same bits, two carry-less
+/// multiplies fewer per application; this MDS runs once initially and after
+/// every full round. Scheme taken from the CUDA kernel.
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &KernelTables) {
-    // M = [5 7 1 3; 4 6 1 1; 1 3 5 7; 1 1 4 6]. In characteristic two,
-    // 3x=2x+x, 5x=4x+x, 6x=4x+2x, 7x=4x+2x+x. Six products by 2/4 therefore
-    // replace the generic ten non-identity products without changing the
-    // linear map. This MDS runs once initially and after every full round.
     let [a, b, c, d] = *s;
     let two = bcast(t.mds_full_two);
     let four = bcast(t.mds_full_four);
-    let a4 = mul_gcm_x2(a, four);
+    let u0 = _mm256_xor_si256(a, b);
+    let u1 = _mm256_xor_si256(c, d);
     let b2 = mul_gcm_x2(b, two);
-    let b4 = mul_gcm_x2(b, four);
-    let c4 = mul_gcm_x2(c, four);
     let d2 = mul_gcm_x2(d, two);
-    let d4 = mul_gcm_x2(d, four);
+    let u0x4 = mul_gcm_x2(u0, four);
+    let u1x4 = mul_gcm_x2(u1, four);
 
-    s[0] = _mm256_xor_si256(
-        _mm256_xor_si256(_mm256_xor_si256(a4, a), _mm256_xor_si256(b4, b2)),
-        _mm256_xor_si256(_mm256_xor_si256(b, c), _mm256_xor_si256(d2, d)),
-    );
-    s[1] = _mm256_xor_si256(
-        _mm256_xor_si256(a4, _mm256_xor_si256(b4, b2)),
-        _mm256_xor_si256(c, d),
-    );
-    s[2] = _mm256_xor_si256(
-        _mm256_xor_si256(a, _mm256_xor_si256(b2, b)),
-        _mm256_xor_si256(
-            _mm256_xor_si256(c4, c),
-            _mm256_xor_si256(d4, _mm256_xor_si256(d2, d)),
-        ),
-    );
-    s[3] = _mm256_xor_si256(
-        _mm256_xor_si256(a, b),
-        _mm256_xor_si256(c4, _mm256_xor_si256(d4, d2)),
-    );
+    let y1 = _mm256_xor_si256(_mm256_xor_si256(u0x4, b2), u1);
+    let y0 = _mm256_xor_si256(_mm256_xor_si256(y1, u0), d2);
+    let y3 = _mm256_xor_si256(_mm256_xor_si256(u0, u1x4), d2);
+    let y2 = _mm256_xor_si256(_mm256_xor_si256(y3, u1), b2);
+    s[0] = y0;
+    s[1] = y1;
+    s[2] = y2;
+    s[3] = y3;
 }
 
 /// Partial-round MDS: diagonal entries `c_i`, all off-diagonals 1, so
