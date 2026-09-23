@@ -156,7 +156,7 @@ pub fn poseidon_pow_digest_nonce_batch(
 /// `pow_digest < header.difficulty_target` as little-endian 256-bit integers.
 /// Equality is rejected.
 pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
-    let digest = poseidon_pow_digest(header);
+    let digest = pow_digest(header);
     if le256_lt(&digest, &header.difficulty_target) {
         Ok(digest)
     } else {
@@ -164,11 +164,114 @@ pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
     }
 }
 
+/// The mining digest a block at this height must satisfy.
+///
+/// Below [`params::V1_4_ACTIVATION_HEIGHT`] — which ships as `None`, so everywhere
+/// today — this is exactly [`poseidon_pow_digest`], byte for byte. From that height
+/// on, the sponge digest becomes the **seed** of the cache-resident walk and the
+/// walk's output is what must beat the target.
+///
+/// Seeding the walk from the sponge rather than from the raw header is what keeps
+/// the fork free: the field schedule, the domain tag and the nonce position are
+/// untouched, so `pow_header_fields` and every proof that depends on it keep
+/// working, and the nonce still never enters the circuit.
+///
+/// **Cost, measured 2026-09-23.** Best of ten runs of 150 headers on each machine,
+/// one binary, production dispatch:
+///
+/// | | sponge only | sponge + walk | factor |
+/// |---|---:|---:|---:|
+/// | EPYC 7742, Zen 2 | 21.6 µs | 1.523 ms | **71x** |
+/// | Ryzen 5950X, Zen 3 | 18.6 µs | 1.241 ms | 67x |
+/// | Ryzen 7950X3D, Zen 4 | 15.1 µs | 1.069 ms | 71x |
+///
+/// A second harness, on an *exclusive* EPYC 7742 core and reporting the **mean** of
+/// five runs rather than the best of ten, gives **21.4 µs and 1.854 ms — 87x** on
+/// the same production function. Both are real; best-of-ten on a busy machine picks
+/// the luckiest window, a mean does not. **Size anything operational on the slower
+/// end**: a resync estimate that is optimistic is worse than one that is not.
+///
+/// The factor barely moves across three microarchitectures. Its machine-independent
+/// form, from `perf stat` — instruction counts, unlike cycles, are trustworthy on a
+/// loaded machine — is **133 149 instructions per header before, 10 991 148 after:
+/// 82.5x**. Wall-clock comes out lower than that because the walk retires more per
+/// cycle than the sponge does (IPC 2.10 against 1.80).
+///
+/// Resyncing 500 000 headers goes from 11 s to between **12.7 and 15.5 minutes
+/// single-threaded** on Zen 2, the spread being the two harnesses above. Header PoW depends on nothing outside its own header, so the mitigation is
+/// threads and not consensus: on the same machine 32 of them do it in **33 s, at
+/// 78 % scaling efficiency**. Past one thread per *physical* core, two pads share
+/// one 512 KiB L2 and the efficiency falls — bulk verification should be sized on
+/// cores, not on hyperthreads.
+///
+/// Against a node running *today's* release the factor is smaller: that release has
+/// no PCLMULQDQ kernel, so its sponge costs several times the 21.6 µs above. The
+/// release that carries this fork carries the kernel too. Both numbers are true and
+/// they answer different questions; quote the one that matches what is compared.
+#[inline]
+pub fn pow_digest(header: &BlockHeader) -> BlockHash {
+    pow_digest_with(header, crate::consensus::params::V1_4_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`pow_digest`] with the activation height injected.
+///
+/// The production constant is `None`, so without this the walk branch of the
+/// consensus digest cannot be executed by any test in the tree — the first header
+/// ever to take it would be a real one, on a real network, at a height chosen
+/// months earlier. Same dormant-twin device as `params::v1_4_active_with` and
+/// `header::asert_anchor_height_with`.
+pub(crate) fn pow_digest_with(header: &BlockHeader, activation: Option<u64>) -> BlockHash {
+    let seed = poseidon_pow_digest(header);
+    if crate::consensus::params::v1_4_active_with(header.height, activation) {
+        // The scratchpad is held per thread, not allocated per header. A fresh
+        // `Vec` would be 512 KiB of `calloc` and 128 page faults on top of a hash
+        // that already costs 1.5 ms, on the one path — initial sync, snapshot
+        // staging — that runs it thousands of times in a row. The fill overwrites
+        // every cell before it is read, so a reused pad gives a bit-identical
+        // digest (`a_reused_scratchpad_leaks_no_state` is the guard).
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<crate::consensus::pow_walk::Scratch> =
+                std::cell::RefCell::new(crate::consensus::pow_walk::Scratch::new());
+        }
+        SCRATCH.with(|scratch| {
+            crate::consensus::pow_walk::towerwalk_digest_with(&mut scratch.borrow_mut(), &seed)
+        })
+    } else {
+        seed
+    }
+}
+
 /// Search for a valid PoW nonce in `[start, start + range)`.
+///
+/// Above [`params::V1_4_ACTIVATION_HEIGHT`] each candidate seed is walked before it
+/// is compared, so the batched sponge stays exactly as profitable as it was — which
+/// is to say, not at all: the walk dominates by four orders of magnitude and the
+/// batch only amortises the seed. The scratchpad is allocated once for the whole
+/// search, never per nonce.
 pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128) -> Option<u128> {
+    search_pow_with(
+        header_template,
+        start_nonce,
+        range,
+        crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
+    )
+}
+
+/// Testable twin of [`search_pow`], for the same reason as [`pow_digest_with`]:
+/// a miner and a node that disagreed about which digest a height demands would
+/// mine forever and be refused forever, and nothing below the activation height
+/// can tell them apart.
+pub(crate) fn search_pow_with(
+    header_template: &BlockHeader,
+    start_nonce: u128,
+    range: u128,
+    activation: Option<u64>,
+) -> Option<u128> {
     let fields = pow_header_fields(header_template);
     let mut hasher = PowNonceBatchHasher::new(&fields);
     let target = &header_template.difficulty_target;
+    let walk = crate::consensus::params::v1_4_active_with(header_template.height, activation);
+    let mut scratch = walk.then(crate::consensus::pow_walk::Scratch::new);
     let mut digests = [[0u8; 32]; 64];
     let mut done = 0u128;
     while done < range {
@@ -176,7 +279,11 @@ pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128)
         let nonce_base = start_nonce.saturating_add(done);
         hasher.hash_into(nonce_base, &mut digests[..batch_len]);
         for (i, digest) in digests[..batch_len].iter().enumerate() {
-            if le256_lt(digest, target) {
+            let candidate = match scratch.as_mut() {
+                Some(sc) => crate::consensus::pow_walk::towerwalk_digest_with(sc, digest),
+                None => *digest,
+            };
+            if le256_lt(&candidate, target) {
                 return Some(nonce_base.saturating_add(i as u128));
             }
         }
@@ -342,6 +449,70 @@ mod tests {
         let nonce = search_pow(&h, 0, 16).expect("max target should accept quickly");
         h.nonce = nonce;
         assert!(validate_pow(&h).is_ok());
+    }
+
+    /// The fork's money path, on the one branch no production constant can reach.
+    ///
+    /// `V1_4_ACTIVATION_HEIGHT` is `None`, so the walk branch of `pow_digest` and
+    /// the walk branch of `search_pow` are dead code in every build that ships. The
+    /// first header to take either of them would otherwise be a real one, at a
+    /// height chosen months earlier, on a network that cannot be rolled back. This
+    /// arms both through their dormant twins and checks the only property that
+    /// matters: **what the miner searched for is what the node demands.**
+    ///
+    /// The target is deliberately not the maximum one — at `[0xFF; 32]` the first
+    /// nonce tried wins on either algorithm and the test would pass without the
+    /// walk ever mattering. One byte in sixteen means the search has to reject
+    /// walked candidates before it accepts one.
+    #[test]
+    fn the_armed_walk_is_what_the_miner_searches_and_what_the_node_demands() {
+        let armed = Some(7u64);
+        let mut h = dummy_header();
+        h.height = 7;
+        h.difficulty_target = {
+            let mut t = [0xFFu8; 32];
+            t[31] = 0x10;
+            t
+        };
+
+        let nonce = search_pow_with(&h, 0, 4_096, armed)
+            .expect("a target this easy is found in a few dozen walks");
+        h.nonce = nonce;
+
+        let walked = pow_digest_with(&h, armed);
+        let sponge = poseidon_pow_digest(&h);
+
+        assert!(
+            le256_lt(&walked, &h.difficulty_target),
+            "the miner returned a nonce the node would reject"
+        );
+        assert_ne!(
+            walked, sponge,
+            "the armed digest is the sponge: the walk branch did not run"
+        );
+        assert_eq!(
+            walked,
+            crate::consensus::pow_walk::towerwalk_digest(&sponge),
+            "the node's armed digest is not the published walk of the sponge"
+        );
+
+        // One height below activation the same header keeps the old digest, and the
+        // old search still satisfies it. The fork is a switch, not a replacement.
+        assert_eq!(
+            pow_digest_with(&h, Some(8)),
+            sponge,
+            "height 7 took the walk under an activation height of 8"
+        );
+        let mut old = dummy_header();
+        old.height = 7;
+        old.difficulty_target = h.difficulty_target;
+        let old_nonce =
+            search_pow_with(&old, 0, 4_096, Some(8)).expect("the sponge search still terminates");
+        old.nonce = old_nonce;
+        assert!(
+            le256_lt(&pow_digest_with(&old, Some(8)), &old.difficulty_target),
+            "the pre-fork path no longer agrees with itself"
+        );
     }
 
     #[test]

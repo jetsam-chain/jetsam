@@ -1640,6 +1640,7 @@ impl RpcHandler {
             height,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs,
+            pow_walk: jetsam_chain::consensus::params::v1_4_active(height),
             tx_input_counts: tx_input_counts.clone(),
             tx_output_counts: tx_output_counts.clone(),
             coinbase_value_micro_jtm,
@@ -1759,6 +1760,7 @@ impl RpcHandler {
             height,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs,
+            pow_walk: jetsam_chain::consensus::params::v1_4_active(height),
             tx_input_counts,
             tx_output_counts,
             coinbase_value_micro_jtm,
@@ -2909,7 +2911,19 @@ impl JetsamApiServer for RpcHandler {
             // caught up would throw away a block the miner genuinely won.
             let mut patched = fields;
             patched[POW_NONCE_FIELD_INDEX] = jetsam_core::Block128::from(nonce);
-            let digest = poseidon_pow_digest_from_fields(&patched);
+            let seed = poseidon_pow_digest_from_fields(&patched);
+            // The preview check must be the SAME function the sealed header will
+            // face. Below the v1.4 activation the walk is the identity and this is
+            // byte for byte what it was; above it, checking the seed alone would
+            // call a nonce genuine for work that costs 1/88th of a real attempt,
+            // and the node would then wait on a proof for a block it will reject.
+            // The previewed work is for the child of the tip: that is the height
+            // whose rules the nonce will be judged under.
+            let digest = if jetsam_chain::consensus::params::v1_4_active(tip_height + 1) {
+                jetsam_chain::consensus::pow_walk::towerwalk_digest(&seed)
+            } else {
+                seed
+            };
             if !jetsam_chain::consensus::difficulty::le256_lt(&digest, &target) {
                 // Rejected in microseconds, and the slot is untouched: junk
                 // nonces still cannot cost anyone their template.
@@ -3752,6 +3766,7 @@ mod tests {
             height: 7,
             expires_in_seconds: 120,
             n_txs: 3,
+            pow_walk: false,
             tx_input_counts: vec![2, 5],
             tx_output_counts: vec![2, 1],
             coinbase_value_micro_jtm: 50,
@@ -4215,6 +4230,7 @@ mod access_control_tests {
             height: 7,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs: 1,
+            pow_walk: false,
             tx_input_counts: vec![],
             tx_output_counts: vec![],
             coinbase_value_micro_jtm: 0,
@@ -4267,6 +4283,7 @@ mod access_control_tests {
             height: 9,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs: 1,
+            pow_walk: false,
             tx_input_counts: vec![],
             tx_output_counts: vec![],
             coinbase_value_micro_jtm: 0,
@@ -4317,6 +4334,7 @@ mod access_control_tests {
             height: 11,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs: 1,
+            pow_walk: false,
             tx_input_counts: vec![],
             tx_output_counts: vec![],
             coinbase_value_micro_jtm: 0,

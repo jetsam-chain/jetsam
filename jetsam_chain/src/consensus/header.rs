@@ -189,13 +189,24 @@ fn validate_header_inner(
     // Anchoring on the parent removes that degree of freedom, and matches the
     // reference ASERT construction (BCH aserti3-2d), which evaluates elapsed
     // time at `pindexPrev`, not at the block under validation.
-    let expected_target = next_target(
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
-        header.height,
-        parent.timestamp,
-    );
+    //
+    // JETSAM CHANGE (v1.4): the first block of the new proof-of-work carries a
+    // target given by a constant, not by ASERT. The digest becomes about twenty
+    // times more expensive at that height, and ASERT anchors on the parent's
+    // timestamp — so a block that does not arrive never makes the target easier,
+    // and carrying the pre-fork target across the boundary would stall the chain
+    // rather than slow it. See `params::V1_4_ANCHOR_TARGET`. Below the activation
+    // height, and today on every profile, this returns `None` and nothing changes.
+    let expected_target = match crate::consensus::params::v1_4_boundary_target(header.height) {
+        Some(target) => target,
+        None => next_target(
+            anchor_height,
+            anchor_timestamp,
+            anchor_target,
+            header.height,
+            parent.timestamp,
+        ),
+    };
     if header.difficulty_target != expected_target {
         return Err(ConsensusError::BadDifficultyTarget);
     }
@@ -236,8 +247,33 @@ fn validate_header_inner(
 ///
 /// The anchor is the block at the most recent epoch boundary:
 /// `anchor_height = largest H ≤ current_height where H % EPOCH_LENGTH == 0`.
+///
+/// JETSAM CHANGE (v1.4): once the cache-resident proof-of-work is armed, the
+/// anchor is additionally floored at the activation height. Without that floor a
+/// block just past the fork would be anchored on a target calibrated for a digest
+/// twenty times cheaper, and would inherit a difficulty that has no meaning under
+/// the new one. The floor is a no-op below the activation height, and `None` —
+/// which is what every profile ships — makes it a no-op everywhere.
 pub fn asert_anchor_height(current_height: u64) -> u64 {
-    (current_height / EPOCH_LENGTH) * EPOCH_LENGTH
+    asert_anchor_height_with(
+        current_height,
+        crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
+    )
+}
+
+/// Testable twin of [`asert_anchor_height`] with the activation height injected.
+///
+/// The production constant is `None`, so the floor cannot be exercised through
+/// [`asert_anchor_height`] while the fork is dormant. This seam is how the armed
+/// behaviour is tested before it is armed, rather than the first time it runs on a
+/// live chain.
+#[inline]
+pub(crate) fn asert_anchor_height_with(current_height: u64, activation: Option<u64>) -> u64 {
+    let epoch_anchor = (current_height / EPOCH_LENGTH) * EPOCH_LENGTH;
+    match activation {
+        Some(activation) if current_height >= activation => epoch_anchor.max(activation),
+        _ => epoch_anchor,
+    }
 }
 
 /// Returns `true` if a block at `height` is considered final (cannot be reorged).
@@ -532,6 +568,76 @@ mod tests {
             &genesis.difficulty_target,
         );
         assert_eq!(result, Err(ConsensusError::BadLogSlotsExpansion));
+    }
+
+    /// The anchor floor, exercised on a height the production constant does not
+    /// carry. Blocks below the activation keep the plain epoch anchor; blocks at
+    /// or above it can never be anchored on a pre-fork target.
+    #[test]
+    fn the_pow_activation_floors_the_asert_anchor() {
+        // Activation at 1000, which is NOT a multiple of EPOCH_LENGTH (6) — the
+        // case that would otherwise pick an anchor below the fork.
+        let armed = Some(1_000u64);
+        // Below the fork: unchanged.
+        assert_eq!(asert_anchor_height_with(996, armed), 996);
+        assert_eq!(asert_anchor_height_with(999, armed), 996);
+        // At the fork and in the gap before the next epoch boundary: floored to
+        // the activation. 996 is a valid epoch boundary and would otherwise be
+        // chosen — that is exactly the pre-fork target this floor keeps out.
+        assert_eq!(asert_anchor_height_with(1_000, armed), 1_000);
+        assert_eq!(asert_anchor_height_with(1_001, armed), 1_000);
+        // 1002 is the first epoch boundary past the fork, so the ordinary rule
+        // takes over from there and the floor stops mattering.
+        assert_eq!(asert_anchor_height_with(1_002, armed), 1_002);
+        assert_eq!(asert_anchor_height_with(1_003, armed), 1_002);
+        assert_eq!(asert_anchor_height_with(1_008, armed), 1_008);
+        // Whatever the height, the anchor is never below the activation once the
+        // fork is crossed — the property the floor exists for.
+        for h in 1_000u64..1_200 {
+            assert!(asert_anchor_height_with(h, armed) >= 1_000);
+        }
+        // Dormant: identical to the plain rule at every height.
+        for h in [0u64, 5, 6, 999, 1_000, 1_007] {
+            assert_eq!(
+                asert_anchor_height_with(h, None),
+                (h / EPOCH_LENGTH) * EPOCH_LENGTH
+            );
+        }
+    }
+
+    /// Exactly one height carries a constant target, whatever the constants say.
+    ///
+    /// This deliberately does NOT assert that the fork is dormant. A dormancy
+    /// assertion here would fail the day the operator arms the fork, in a module
+    /// that has nothing to do with arming, with a message that reads like a bug —
+    /// and it would make arming take three edits where the documented contract,
+    /// enforced in `wire_limits`, says two.
+    #[test]
+    fn only_the_fork_block_bypasses_asert() {
+        use crate::consensus::params::{
+            v1_4_active_with, v1_4_boundary_target, V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET,
+        };
+        match (V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET) {
+            (Some(activation), Some(target)) => {
+                assert_eq!(v1_4_boundary_target(activation), Some(target));
+                for offset in [1u64, 2, 6, 1_000] {
+                    assert!(v1_4_boundary_target(activation.saturating_sub(offset)).is_none());
+                    assert!(v1_4_boundary_target(activation.saturating_add(offset)).is_none());
+                }
+            }
+            _ => {
+                // Half-armed or dormant: no height is special. The guard that
+                // makes half-armed impossible lives in `wire_limits`.
+                for h in [0u64, 1, 1_000, 17_750, u64::MAX] {
+                    assert!(v1_4_boundary_target(h).is_none());
+                }
+            }
+        }
+        // The predicate itself, on an injected height, armed or not.
+        assert!(!v1_4_active_with(999, Some(1_000)));
+        assert!(v1_4_active_with(1_000, Some(1_000)));
+        assert!(v1_4_active_with(1_001, Some(1_000)));
+        assert!(!v1_4_active_with(u64::MAX, None));
     }
 
     #[test]

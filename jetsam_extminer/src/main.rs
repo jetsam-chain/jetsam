@@ -119,6 +119,15 @@ struct BlockTemplateResponse {
     /// send it, and the miner then keeps its own starting point.
     #[serde(default)]
     nonce_prefix: Option<u32>,
+    /// `true` when a valid nonce must also satisfy the cache-resident walk:
+    /// `TowerWalk(Poseidon2b(POWHDR__, patched)) < difficulty_target`.
+    ///
+    /// The NODE decides this, never the miner. The activation height is a
+    /// consensus constant and hardcoding it here would mean mining an invalid
+    /// chain the day it moved. Absent means `false`, so this binary keeps working
+    /// against a node that has never heard of the field.
+    #[serde(default)]
+    pow_walk: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +233,8 @@ static MEASURED_HASHES_PER_SECOND: AtomicU64 = AtomicU64::new(0);
 
 const CHUNK_SIZE: u128 = 10_000_000;
 const DIGEST_BATCH: usize = 256;
+/// Batch size once the node asks for the cache-resident walk. See `search_nonce`.
+const WALK_BATCH: usize = 4;
 const POW_HEADER_FIELD_COUNT: usize = 16;
 // JETSAM CHANGE: 0, was 10. This constant is DUPLICATED from
 // jetsam_chain::consensus::pow so the external miner stays dependency-free;
@@ -265,6 +276,7 @@ fn search_nonce(
     target: &[u8; 32],
     deadline: Instant,
     cursor: &mut u128,
+    pow_walk: bool,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
@@ -300,16 +312,29 @@ fn search_nonce(
             let fields = *pow_fields;
             let mut hasher = FixedFieldNonceBatch::new(TAG_POWHDR, &fields, POW_NONCE_FIELD_INDEX);
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
+            // One 512 KiB scratchpad per thread, allocated once for the whole
+            // chunk. Allocating one per nonce would cost more than the walk.
+            let mut scratch = pow_walk.then(jetsam_poseidon2b::towerwalk::Scratch::new);
+            // A batch is the deadline-check granularity. 256 sponge digests is a
+            // few milliseconds; 256 walked digests would be half a second, long
+            // enough to keep grinding a template that has already expired.
+            let batch = if pow_walk { WALK_BATCH } else { DIGEST_BATCH };
             let mut nonce = ts;
             while nonce < te {
                 if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     return None;
                 }
-                let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
+                let n = ((te - nonce).min(batch as u128)) as usize;
                 hasher.hash_into(nonce, &mut digests[..n]);
                 hashed.fetch_add(n as u64, Ordering::Relaxed);
-                for (i, hash) in digests[..n].iter().enumerate() {
-                    if le256_lt(hash, target) {
+                for (i, seed) in digests[..n].iter().enumerate() {
+                    let hash = match scratch.as_mut() {
+                        Some(sc) => {
+                            jetsam_poseidon2b::towerwalk::towerwalk_digest_with(sc, seed)
+                        }
+                        None => *seed,
+                    };
+                    if le256_lt(&hash, target) {
                         found.store(true, Ordering::Relaxed);
                         return Some(nonce + i as u128);
                     }
@@ -491,7 +516,7 @@ fn mine(cli: &Cli) -> Result<()> {
         let t0 = Instant::now();
         let deadline = template_search_deadline(template_received_at, tmpl.expires_in_seconds);
 
-        let nonce = match search_nonce(&pow_fields, &target, deadline, &mut cursor) {
+        let nonce = match search_nonce(&pow_fields, &target, deadline, &mut cursor, tmpl.pow_walk) {
             Some(n) => n,
             None => {
                 eprintln!("└─ EXPIRED  refreshing node-owned template");
@@ -637,7 +662,7 @@ mod tests {
         let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
         let mut cursor = 4_242u128;
         assert_eq!(
-            search_nonce(&fields, &[0xff; 32], Instant::now(), &mut cursor),
+            search_nonce(&fields, &[0xff; 32], Instant::now(), &mut cursor, false),
             None
         );
         assert_eq!(
@@ -654,10 +679,10 @@ mod tests {
         let far = Instant::now() + Duration::from_secs(30);
         let mut cursor = 700u128;
 
-        let first = search_nonce(&fields, &[0xff; 32], far, &mut cursor).expect("easy target");
+        let first = search_nonce(&fields, &[0xff; 32], far, &mut cursor, false).expect("easy target");
         assert_eq!(first, 700);
 
-        let second = search_nonce(&fields, &[0xff; 32], far, &mut cursor).expect("easy target");
+        let second = search_nonce(&fields, &[0xff; 32], far, &mut cursor, false).expect("easy target");
         assert_eq!(
             second,
             700 + CHUNK_SIZE,
@@ -678,7 +703,7 @@ mod tests {
         // production it is long warm by the time a template arrives.
         rayon::current_num_threads();
         let soon = Instant::now() + Duration::from_millis(300);
-        assert_eq!(search_nonce(&fields, &[0u8; 32], soon, &mut cursor), None);
+        assert_eq!(search_nonce(&fields, &[0u8; 32], soon, &mut cursor, false), None);
         assert!(
             cursor > start,
             "the cursor went back to {cursor} after a pass that started at {start}"
@@ -707,7 +732,7 @@ mod tests {
             .expect("two-thread pool");
         let mut cursor = KNOWN_SOLUTION - 1;
         let deadline = Instant::now() + Duration::from_secs(3);
-        let found = pool.install(|| search_nonce(&fields, &target, deadline, &mut cursor));
+        let found = pool.install(|| search_nonce(&fields, &target, deadline, &mut cursor, false));
         let returned_at = Instant::now();
 
         assert_eq!(found, Some(KNOWN_SOLUTION));
@@ -770,5 +795,49 @@ mod tests {
             "nonce_prefix":3}"#;
         let parsed: BlockTemplateResponse = serde_json::from_str(pooled).expect("pool template");
         assert_eq!(parsed.nonce_prefix, Some(3));
+    }
+
+    /// A node that has never heard of the walk must keep this binary working,
+    /// and a node that asks for it must be obeyed. Getting the default wrong in
+    /// either direction means mining a chain nobody else accepts.
+    #[test]
+    fn the_walk_is_off_unless_the_node_asks_for_it() {
+        let without = r#"{"template_id":"ab","pow_fields_hex":"00","nonce_field_index":0,
+            "difficulty_target_hex":"ff","height":7,"expires_in_seconds":120,"n_txs":0}"#;
+        let parsed: BlockTemplateResponse = serde_json::from_str(without).expect("old node");
+        assert!(!parsed.pow_walk, "absent must mean off");
+
+        let with = r#"{"template_id":"ab","pow_fields_hex":"00","nonce_field_index":0,
+            "difficulty_target_hex":"ff","height":7,"expires_in_seconds":120,"n_txs":0,
+            "pow_walk":true}"#;
+        let parsed: BlockTemplateResponse = serde_json::from_str(with).expect("forked node");
+        assert!(parsed.pow_walk);
+    }
+
+    /// With the walk on, a trivial target is still satisfied — the search path
+    /// reaches the walk and compares its output, not the seed.
+    ///
+    /// A target of all-ones is met by any digest, so this cannot pass by
+    /// accident of which value is compared; what it proves is that the walked
+    /// path runs at all and returns a nonce. One walked hash is ~1.9 ms, so this
+    /// stays a unit test rather than a benchmark.
+    #[test]
+    fn the_walked_search_finds_a_nonce_under_a_trivial_target() {
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let mut cursor = 0u128;
+        let far = Instant::now() + Duration::from_secs(60);
+        let nonce = search_nonce(&fields, &[0xff; 32], far, &mut cursor, true)
+            .expect("any digest beats an all-ones target");
+        // And the walk really is applied, not skipped: the digest it produces
+        // for that nonce differs from the seed it was computed from.
+        let mut hasher = super::FixedFieldNonceBatch::new(
+            super::TAG_POWHDR,
+            &fields,
+            super::POW_NONCE_FIELD_INDEX,
+        );
+        let mut seeds = [[0u8; 32]; 1];
+        hasher.hash_into(nonce, &mut seeds);
+        let walked = jetsam_poseidon2b::towerwalk::towerwalk_digest(&seeds[0]);
+        assert_ne!(walked, seeds[0], "the walk must not be the identity");
     }
 }

@@ -54,6 +54,7 @@ pub mod header;
 pub mod identity;
 pub mod params;
 pub mod pow;
+pub mod pow_walk;
 pub mod receipt;
 pub mod slot_expansion;
 pub mod timestamps;

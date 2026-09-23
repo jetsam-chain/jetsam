@@ -89,6 +89,18 @@ pub struct BlockTemplateResponse {
     pub expires_in_seconds: u64,
     /// Total transaction count including coinbase.
     pub n_txs: usize,
+    /// `true` when a valid nonce must additionally satisfy the cache-resident
+    /// walk: `TowerWalk(Poseidon2b(POWHDR__, patched_fields)) < difficulty_target`.
+    ///
+    /// **Read this field; do not derive it from the height.** The activation
+    /// height is a consensus constant of the node, not of the miner, and a miner
+    /// that hardcoded it would mine an invalid chain for everyone the day it moved.
+    /// Absent means `false`, so a miner built before the fork keeps working
+    /// unchanged until the node tells it otherwise — and a node past the fork
+    /// serving a miner that ignores this field simply rejects its nonces, which is
+    /// the loud failure rather than the silent one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pow_walk: bool,
     /// Live input counts per user transaction in canonical block order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_input_counts: Vec<usize>,

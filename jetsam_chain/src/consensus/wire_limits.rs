@@ -276,6 +276,70 @@ mod tests {
     #[cfg(not(feature = "testnet"))]
     const DECLARED_V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(17_750);
 
+    /// Dormant on the public network. It stays dormant until the test chain has
+    /// crossed, been watched, and been mined against by a GPU that failed.
+    #[cfg(not(feature = "testnet"))]
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// Armed at 4650 on the test chain, 2026-09-23, against a tip of 4560 and a
+    /// measured 98 s per block.
+    ///
+    /// The declaration is split per profile now that one of them is armed — a
+    /// shared declaration across two differently-armed profiles makes this guard
+    /// fail on the dormant one and look like a bug in the guard rather than what
+    /// it is.
+    #[cfg(feature = "testnet")]
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(4_650);
+
+    /// The same two-edit rule, for the third clock.
+    ///
+    /// This fork changes what a valid block hash *is*. Every miner and every pool
+    /// on the network stops working at the height, so arming it is a decision
+    /// taken with the operator against the tip of the day, with notice — never a
+    /// side effect of an unrelated edit.
+    #[test]
+    fn arming_v1_4_takes_two_deliberate_edits() {
+        assert_eq!(
+            crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
+            DECLARED_V1_4_ACTIVATION_HEIGHT,
+            "arming the v1.4 proof-of-work is decided with the network operator: \
+             change this declaration and params::V1_4_ACTIVATION_HEIGHT in one \
+             commit, or neither"
+        );
+    }
+
+    /// An armed PoW height without an anchor target would stall the chain at the
+    /// fork: ASERT anchors on the parent's timestamp, so a target that is twenty
+    /// times too hard never gets easier on its own.
+    ///
+    /// The two constants must therefore be armed together, and this fails loudly
+    /// if only one of them is.
+    #[test]
+    fn the_pow_fork_cannot_be_armed_without_its_anchor_target() {
+        use crate::consensus::params::{V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET};
+        assert_eq!(
+            V1_4_ACTIVATION_HEIGHT.is_some(),
+            V1_4_ANCHOR_TARGET.is_some(),
+            "V1_4_ACTIVATION_HEIGHT and V1_4_ANCHOR_TARGET are armed together or \
+             not at all: a height without a target stops the chain at the fork, \
+             and ASERT does not recover from a stall"
+        );
+    }
+
+    /// The three clocks are read by three disjoint sets of rules. Hanging the PoW
+    /// off an earlier one would arm it retroactively, against blocks proved under
+    /// the Poseidon2b sponge, and every node would reject the chain it is syncing.
+    #[test]
+    fn the_pow_clock_is_not_one_of_the_earlier_clocks() {
+        use crate::consensus::params::{
+            V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT,
+        };
+        if V1_4_ACTIVATION_HEIGHT.is_some() {
+            assert_ne!(V1_4_ACTIVATION_HEIGHT, V1_2_ACTIVATION_HEIGHT);
+            assert_ne!(V1_4_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT);
+        }
+    }
+
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
     #[test]
     fn arming_v1_3_takes_two_deliberate_edits() {
