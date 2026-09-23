@@ -117,6 +117,15 @@ impl PowMeter {
 
 static POW_METER: PowMeter = PowMeter::new();
 
+/// Serialises the tests that observe the process-wide [`POW_METER`].
+///
+/// One of them asserts the counter is unchanged across a call; another runs a
+/// real search, which moves it. Cargo runs both on threads of one process, so
+/// without this they race and the assertion fails for a reason that has nothing
+/// to do with what it tests.
+#[cfg(test)]
+static METER_OBSERVERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Measured PoW rate of this process's built-in miner, in hashes per second.
 ///
 /// `None` when the node is not mining, or when it is currently proving a block
@@ -354,6 +363,7 @@ mod tests {
 
     #[test]
     fn a_bench_does_not_pollute_the_miner_counters() {
+        let _serialised = METER_OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
         let before = local_pow_hashes();
         bench_towerhash(Duration::from_millis(50), Some(1));
         assert_eq!(local_pow_hashes(), before);
@@ -386,6 +396,13 @@ fn report_rate(ticker: &mut SearchTicker, height: u64, threads: usize) {
     }
 }
 
+/// Nonces handed out per pass, split evenly across the pool's threads.
+///
+/// At module scope because a thread's share of it — `CHUNK_SIZE / threads` —
+/// is what a thread must stop grinding once another has won, and the
+/// regression test sizes its shares from the same constant the search uses.
+const CHUNK_SIZE: u128 = 1_000_000;
+
 /// Search for a valid PoW nonce using the current Rayon pool.
 /// Internal miner calls this inside the process-wide all-core PoW phase.
 ///
@@ -398,9 +415,6 @@ pub fn search_pow_parallel(
     header_template: &BlockHeader,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Option<PowSolution> {
-    use rayon::prelude::*;
-    use std::sync::atomic::Ordering;
-
     // Start from a random nonce to avoid all miners/restarts colliding on nonce=0.
     // Uses a simple time-based seed — not cryptographic, just for nonce diversity.
     let random_start: u128 = {
@@ -412,13 +426,42 @@ pub fn search_pow_parallel(
         (t ^ (header_template.height as u128).wrapping_mul(0x9E3779B97F4A7C15))
             & 0xFFFF_FFFF_FFFF_FFFF // 64-bit random start
     };
+    search_pow_parallel_from(header_template, cancel, random_start)
+}
+
+/// Testable twin of [`search_pow_parallel`] with the first nonce injected.
+///
+/// Production always draws its own start; this exists so a test can place a
+/// known solution inside one thread's share and watch how long it takes to
+/// surface. Nothing else differs.
+fn search_pow_parallel_from(
+    header_template: &BlockHeader,
+    cancel: &std::sync::atomic::AtomicBool,
+    first_nonce: u128,
+) -> Option<PowSolution> {
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering;
+
+    let random_start = first_nonce;
 
     // Partition the 128-bit nonce space into thread-sized chunks.
     // Each thread checks cancel once per nonce batch; this keeps cancellation
     // responsive without paying an atomic load for every permutation.
-    const CHUNK_SIZE: u128 = 1_000_000;
     const DIGEST_BATCH: usize = 256;
+    /// Batch size once the cache-resident walk is armed.
+    ///
+    /// A batch is the cancellation granularity: the thread checks `cancel` once
+    /// per batch. At 21.8 µs per sponge digest, 256 of them is 5.6 ms and nobody
+    /// notices. At 1.92 ms per walked digest, 256 would be **half a second** of
+    /// deafness — long enough for a miner to keep grinding a template whose parent
+    /// has already been replaced. Four keeps it at about 8 ms, the same order as
+    /// today, and the batch buys nothing anyway: the walk dominates the sponge by
+    /// a factor of eighty-eight, so there is no amortisation left to chase.
+    const WALK_BATCH: usize = 4;
     let target = header_template.difficulty_target;
+    // The digest a block at this height must satisfy. `None` on every profile
+    // today, so this whole path is byte-for-byte what it was.
+    let walk = jetsam_chain::consensus::params::v1_4_active(header_template.height);
 
     let mut start_nonce: u128 = random_start;
 
@@ -430,6 +473,21 @@ pub fn search_pow_parallel(
     // Measures only the time actually spent searching, so the reported rate is
     // this machine's TowerHash speed and not an average diluted by proving.
     let mut ticker = SearchTicker::start();
+
+    // Raised by the thread that wins, so the others stop within a batch instead
+    // of grinding their whole share out.
+    //
+    // `find_map_any` does not interrupt a closure that is already running: every
+    // thread finishes its `CHUNK_SIZE / threads` nonces before the solution is
+    // handed back. Below the walk a share cost 0.15 s and nobody noticed. At
+    // 4.66 ms per walked digest the same share is 31 s — measured on the testnet
+    // at the v1.4 crossing, where `pow_ms` collapsed onto multiples of one chunk
+    // and every block was announced that long after it had been won. Every one
+    // of those seconds goes to whoever else is mining the same parent.
+    //
+    // The external miner has carried this flag since before the fork; this is
+    // the same fix on the stage that had been left without it.
+    let found = std::sync::atomic::AtomicBool::new(false);
 
     loop {
         if cancel.load(Ordering::Relaxed) || crate::cpu_budget::pow_preemption_requested() {
@@ -450,22 +508,34 @@ pub fn search_pow_parallel(
                 let fields = fields;
                 let mut hasher = PowNonceBatchHasher::new(&fields);
                 let mut digests = [[0u8; 32]; DIGEST_BATCH];
+                // One scratchpad per thread, allocated once for the whole chunk.
+                // 512 KiB per nonce would cost more than the walk itself.
+                let mut scratch = walk.then(jetsam_chain::consensus::pow_walk::Scratch::new);
+                let batch = if walk { WALK_BATCH } else { DIGEST_BATCH };
                 let mut nonce = thread_start;
 
                 while nonce < thread_end {
-                    if cancel.load(Ordering::Relaxed)
+                    if found.load(Ordering::Relaxed)
+                        || cancel.load(Ordering::Relaxed)
                         || crate::cpu_budget::pow_preemption_requested()
                     {
                         return None;
                     }
-                    let n = ((thread_end - nonce).min(DIGEST_BATCH as u128)) as usize;
+                    let n = ((thread_end - nonce).min(batch as u128)) as usize;
                     hasher.hash_into(nonce, &mut digests[..n]);
                     POW_METER.add_hashes(n as u64);
-                    for (i, hash) in digests[..n].iter().enumerate() {
-                        if le256_lt(hash, &target) {
+                    for (i, seed) in digests[..n].iter().enumerate() {
+                        let hash = match scratch.as_mut() {
+                            Some(sc) => {
+                                jetsam_chain::consensus::pow_walk::towerwalk_digest_with(sc, seed)
+                            }
+                            None => *seed,
+                        };
+                        if le256_lt(&hash, &target) {
+                            found.store(true, Ordering::Relaxed);
                             return Some(PowSolution {
                                 nonce: nonce + i as u128,
-                                pow_hash: *hash,
+                                pow_hash: hash,
                             });
                         }
                     }
@@ -493,5 +563,77 @@ pub fn search_pow_parallel(
             // Nonce space exhausted (extremely unlikely with 128-bit nonce).
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod pow_search_tests {
+    use super::*;
+    use jetsam_chain::block_header::BlockHeader;
+    use jetsam_poseidon2b::primitives::Address;
+    use std::sync::atomic::AtomicBool;
+
+    /// About one nonce in 2^24 satisfies this.
+    const TEST_TARGET: [u8; 32] = {
+        let mut t = [0u8; 32];
+        t[29] = 0x01; // hash < 2^232
+        t
+    };
+
+    /// Found once, offline, against the header below. Re-derive it with the
+    /// same header if either ever changes — the target is part of the hashed
+    /// field schedule, so a different target is a different solution.
+    const KNOWN_SOLUTION: u128 = 24_491_018;
+
+    fn test_header() -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: [1u8; 32],
+            tx_root: [2u8; 32],
+            timestamp: 1_700_000_000,
+            height: 1,
+            miner_address: Address([3u8; 32]),
+            nonce: 0,
+            difficulty_target: TEST_TARGET,
+            log_slots: 24,
+            active_slot_count: 0,
+            alloc_counter: 0,
+        }
+    }
+
+    #[test]
+    fn a_solution_surfaces_as_soon_as_one_thread_finds_it() {
+        // Two threads split the chunk into halves of 500 000 nonces. The first
+        // half starts one nonce before the known solution, so its thread finds
+        // it inside the first batch. One nonce in 2^24 meets this target, so the
+        // other half almost certainly holds nothing its thread can reach: left
+        // alone it grinds all 500 000 before returning None, and `find_map_any`
+        // does not interrupt a closure already running.
+        //
+        // Before the cache-resident walk a share cost 0.15 s and nobody noticed.
+        // At 4.66 ms per walked digest the same share is 31 s — measured on the
+        // testnet at the v1.4 crossing, where every block was announced that
+        // long after it had been won, and every one of those seconds is handed
+        // to a competitor mining the same parent.
+        let _serialised = METER_OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+        let header = test_header();
+        let cancel = AtomicBool::new(false);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-thread pool");
+
+        let started = Instant::now();
+        let solution =
+            pool.install(|| search_pow_parallel_from(&header, &cancel, KNOWN_SOLUTION - 1));
+        let elapsed = started.elapsed();
+
+        let solution = solution.expect("the known solution sits in the first thread's share");
+        assert_eq!(solution.nonce, KNOWN_SOLUTION);
+        assert!(le256_lt(&solution.pow_hash, &TEST_TARGET));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "a won block waited {elapsed:?} on threads that had already lost"
+        );
     }
 }
