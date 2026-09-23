@@ -212,6 +212,141 @@ pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(17_750);
 #[cfg(feature = "testnet")]
 pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 
+/// First block height whose proof-of-work digest is [`crate::consensus::pow_walk`].
+///
+/// **`None` keeps the cache-resident PoW dormant**, and that is what every profile
+/// carries today. A binary with this constant at `None` mines, verifies and
+/// encodes byte for byte what v1.3.1 does.
+///
+/// # Why this is its own clock
+///
+/// It is not [`V1_3_ACTIVATION_HEIGHT`] and it must never be hung off it. v1.3 is
+/// armed and past — 17750 on mainnet, block 20 on the test chain — so reusing that
+/// constant would arm the new digest retroactively, at heights the chains crossed
+/// days ago, against blocks proved under the Poseidon2b sponge. Every node built
+/// that way would reject the chain it is syncing. Three clocks are three forks, and
+/// this is the third.
+///
+/// # What crossing this height changes, and what it does not
+///
+/// The nonce appears nowhere in the R1CS and nowhere in HistoryStep
+/// (`block_slots.rs`), so this fork costs **zero relation rows, zero pack, zero
+/// network identity**. What it does change: header verification goes from
+/// **21.8 µs to 1.92 ms, a factor of 88** [MEASURED 2026-09-23, idle EPYC 7742
+/// core]. That is the number to know before announcing a height. Resyncing 500 000
+/// blocks goes from 11 s to 16 minutes on one thread; a 2 GB seed VPS that boots in
+/// 105 s today will not, unless the verification is threaded first.
+///
+/// It also invalidates every existing miner and pool. They are not warned by a
+/// failure; they are warned by us, before the height, or they mine a chain nobody
+/// else accepts.
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// `wire_limits::tests::arming_v1_4_takes_two_deliberate_edits` fails the moment
+/// this value disagrees with the declaration beside it, so arming is visible in CI
+/// and cannot happen as a side effect of an unrelated edit.
+///
+/// **The public network is NOT armed and will not be until the test chain has
+/// crossed and been watched.** The two profiles are declared separately, exactly
+/// like [`V1_3_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
+#[cfg(not(feature = "testnet"))]
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// **Armed at 4650 on the test chain, 2026-09-23.** The tip was 4560 and the
+/// measured rate 98 s per block over the preceding twenty, so ninety blocks is
+/// about two and a half hours — enough to build, rehearse the binary against a
+/// copy of the live data directory, deploy to all three nodes, and still hold a
+/// margin.
+///
+/// The test chain carries every node of this network: the two miners on epyc1 and
+/// the public seed VPS. Nothing about this crossing is simulated.
+#[cfg(feature = "testnet")]
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(4_650);
+
+/// Whether one candidate block height is governed by the v1.4 proof-of-work.
+#[inline]
+pub const fn v1_4_active(height: u64) -> bool {
+    v1_4_active_with(height, V1_4_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_4_active`] with the activation height injected.
+#[inline]
+pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// The ASERT anchor target the first post-v1.4 block carries, verbatim.
+///
+/// # Why a constant is needed at all
+///
+/// ASERT anchors a block's target on its **parent's** timestamp
+/// (`difficulty.rs`, `header.rs`), not on wall-clock. A block that never arrives
+/// therefore never makes the target easier: the miners keep hammering the same
+/// value. ASERT absorbs a loss of hashrate; it does not absorb a stall.
+///
+/// The new digest costs 1.85 ms where the old one costs about 90 µs. Carrying the
+/// pre-fork target across the boundary would make the first post-fork block take
+/// roughly twenty times longer — half an hour instead of ninety seconds, on a
+/// chain whose whole point that day is to be watched.
+///
+/// # Why it is set on the easy side, deliberately
+///
+/// The unknown is not our hashrate, it is everyone else's on an algorithm nobody
+/// has run. The two errors do not cost the same:
+///
+/// * too **hard** — the chain stops, and it does not restart without a new binary;
+/// * too **easy** — a burst of fast blocks, and ASERT tightens by about 10 % per
+///   block at a 540 s halflife, reaching equilibrium in roughly thirty blocks.
+///
+/// So this is chosen as the measured equilibrium target made **eight times
+/// easier**: three halflives of tightening if we judged right, and enough margin to
+/// absorb a third-party kernel two to four times faster than ours without stopping
+/// the chain.
+///
+/// `None` while the fork is dormant — the value is decided from a fresh
+/// measurement taken **after** the optimised CPU kernel has shipped and ASERT has
+/// settled, never before. Shipping both at once makes the ratio unknowable at the
+/// exact moment it has to be carved into a constant.
+#[cfg(not(feature = "testnet"))]
+pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
+
+/// The test chain crosses on [`GENESIS_TARGET`] — the easiest target the protocol
+/// allows, and 25x easier than this chain's measured equilibrium.
+///
+/// That is deliberate, and it is the direction the design argues for: a target set
+/// too hard stops the chain and it does not restart without a new binary, while one
+/// set too easy costs a burst of fast blocks that ASERT tightens away in about
+/// thirty. Twenty-five times is more slack than the eight the design proposes, and
+/// on a test chain that is a feature — watching ASERT climb back from a known
+/// distance is precisely the rehearsal the public network needs before it is armed.
+///
+/// ⚠️ **The public network must NOT copy this value.** Its own anchor is chosen
+/// from a fresh measurement of the network's rate taken after the optimised CPU
+/// kernel has shipped and ASERT has settled, never before, and never from a test
+/// chain whose hashrate is two processes on one machine.
+#[cfg(feature = "testnet")]
+pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(GENESIS_TARGET);
+
+/// The target a block at `height` carries verbatim, bypassing ASERT.
+///
+/// Exactly one height has one: the first block of the new proof-of-work. Every
+/// other height, and every height at all while the fork is dormant, gets `None`
+/// and is governed by ASERT as before.
+///
+/// This is deliberately not "the first few blocks": one constant, one height, one
+/// discontinuity. From `activation + 1` onward ASERT resumes normally against an
+/// anchor floored at the activation height (`header::asert_anchor_height`), so the
+/// new regime is found by the usual mechanism rather than by a second constant
+/// nobody would think to re-measure.
+#[inline]
+pub const fn v1_4_boundary_target(height: u64) -> Option<[u8; 32]> {
+    match (V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET) {
+        (Some(activation), Some(target)) if height == activation => Some(target),
+        _ => None,
+    }
+}
+
 /// Whether one candidate block height is governed by the v1.3 consensus rules.
 #[inline]
 pub const fn v1_3_active(height: u64) -> bool {

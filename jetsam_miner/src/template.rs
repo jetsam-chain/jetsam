@@ -387,14 +387,25 @@ impl TemplateBuilder {
         // jetsam_chain::consensus::header::validate_header_inner. The two sites
         // MUST stay identical: a mismatch produces templates whose target the
         // network rejects.
+        //
+        // JETSAM CHANGE (v1.4): the first block of the new proof-of-work carries a
+        // constant target, not an ASERT one. `validate_header_inner` demands it, so
+        // a template that computed ASERT here would be rejected at that one height
+        // and the chain would stall at `activation - 1` — the exact failure the
+        // constant exists to prevent. `None` on every profile today.
         let anchor = &snapshot.anchor;
-        let difficulty_target = next_target(
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
-            parent.height + 1,
-            parent.timestamp,
-        );
+        let child_height = parent.height + 1;
+        let difficulty_target =
+            match jetsam_chain::consensus::params::v1_4_boundary_target(child_height) {
+                Some(target) => target,
+                None => next_target(
+                    anchor.anchor_height,
+                    anchor.anchor_timestamp,
+                    &anchor.anchor_target,
+                    child_height,
+                    parent.timestamp,
+                ),
+            };
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;

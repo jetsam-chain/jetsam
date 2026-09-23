@@ -13,11 +13,14 @@ pub(crate) mod batch_aarch64;
 pub(crate) mod batch_avx2;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod batch_avx512;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod batch_pclmul;
 pub mod channel;
 pub mod hasher;
 pub mod hasher_impl;
 pub mod native;
 pub mod primitives;
+pub mod towerwalk;
 
 pub use channel::{Poseidon2bChannel, Poseidon2bWideChannel};
 pub use hasher::*;
