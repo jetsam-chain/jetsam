@@ -442,3 +442,120 @@ release_workspace_version() {
   # shellcheck disable=SC2034 # Read by scripts that source this helper.
   RELEASE_VERSION=$node_version
 }
+
+# ---------------------------------------------------------------------------
+# glibc floor — a hard gate, not a note
+#
+# A Linux deliverable must run on the bases people actually rent: Ubuntu 22.04
+# (glibc 2.35), Debian 12 (2.36), Rocky 9 (2.34). 2.34 is the floor all three
+# satisfy, so it is the ceiling a released binary may import.
+#
+# WHY THIS IS A GATE AND NOT A COMMENT. The same defect has shipped three
+# times. `mdbx.c` (crate mdbx-sys) sets `_GNU_SOURCE` itself; in glibc >= 2.38
+# `features.h` turns that into `_ISOC2X_SOURCE`, so `stdlib.h` redirects
+# `strtol` to `__isoc23_strtol@GLIBC_2.38`. The guard is `_GNU_SOURCE`, not
+# `__STDC_VERSION__`, which is why `-std=gnu17` and every other compiler flag
+# is inert by construction: the only working lever is to compile against glibc
+# headers older than 2.38. A binary built on this host therefore refuses to
+# start on 22.04, Debian 12 and Rocky 9 — and the native smoke test cannot see
+# it, because it runs the binary on the machine that built it.
+#
+# Two gates follow. The host gate fails in a second and names the fix; the
+# symbol gate is the ground truth and runs on every binary that goes into a
+# published artifact, whatever produced it.
+# ---------------------------------------------------------------------------
+
+# Highest GLIBC_* symbol version a published Linux binary may import.
+RELEASE_GLIBC_SYMBOL_CEILING=2.34
+readonly RELEASE_GLIBC_SYMBOL_CEILING
+
+# Highest host glibc a Linux release may be built on. Ubuntu 22.04 is the
+# declared build base; anything newer supplies headers that silently raise the
+# floor of the binary above the ceiling.
+RELEASE_GLIBC_BUILD_HOST_CEILING=2.35
+readonly RELEASE_GLIBC_BUILD_HOST_CEILING
+
+# True when $1 is strictly newer than $2 under version ordering.
+release_version_is_newer() {
+  [[ $1 != "$2" ]] || return 1
+  [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]
+}
+
+# Refuse to start a Linux release build on a host whose glibc headers are newer
+# than the oldest base we target. Runs before the build, not after it.
+release_assert_glibc_build_host() {
+  local raw version
+
+  release_require_command ldd
+  release_require_command sort
+  # Required here too, so a build host missing binutils is refused before the
+  # build rather than at the gate that follows it.
+  release_require_command objdump
+  raw=$(ldd --version 2>/dev/null | head -n 1)
+  version=$(printf '%s\n' "$raw" | awk '{print $NF}')
+  [[ $version =~ ^[0-9]+\.[0-9]+$ ]] || \
+    release_die "cannot read the host glibc version from: $raw"
+  if release_version_is_newer "$version" "$RELEASE_GLIBC_BUILD_HOST_CEILING"; then
+    printf '\n' >&2
+    printf 'This host runs glibc %s. Its headers redirect strtol to\n' "$version" >&2
+    printf '__isoc23_strtol@GLIBC_2.38 inside libmdbx, which raises the floor of every\n' >&2
+    printf 'binary built here above GLIBC_%s and makes it refuse to start on Ubuntu\n' \
+      "$RELEASE_GLIBC_SYMBOL_CEILING" >&2
+    printf '22.04, Debian 12 and Rocky 9. No compiler flag prevents it: the guard is\n' >&2
+    printf '_GNU_SOURCE, which mdbx.c sets itself.\n\n' >&2
+    printf 'Build the release inside the pinned container instead:\n\n' >&2
+    printf '  docker build -t jetsam-build:22.04 -f docker/release-linux.Dockerfile docker\n' >&2
+    printf '  docker run --rm -v "$PWD":/src -w /src jetsam-build:22.04 \\\n' >&2
+    printf '    ./scripts/build_release.sh --pack ...\n\n' >&2
+    printf 'See docs/developers/build.md, "Build native deliverables".\n' >&2
+    release_die "release host glibc $version is newer than the supported build base $RELEASE_GLIBC_BUILD_HOST_CEILING"
+  fi
+  printf '  glibc host:   %s (ceiling %s)\n' "$version" "$RELEASE_GLIBC_BUILD_HOST_CEILING"
+}
+
+# Fail if a binary imports any glibc symbol newer than the ceiling. This is the
+# check that decides whether an artifact may be packaged; it reads the binary
+# itself, so it holds no matter which machine or container produced it.
+release_assert_glibc_floor() {
+  local binary=$1
+  local dynsyms version offenders=()
+
+  release_require_command objdump
+  release_require_command sort
+  [[ -f $binary ]] || release_die "glibc floor gate: not a file: $binary"
+
+  # Read the table once, and refuse rather than pass when it cannot be read: a
+  # gate that answers "clean" because objdump failed is worse than no gate.
+  dynsyms=$(objdump -T -- "$binary") || \
+    release_die "glibc floor gate: objdump could not read the dynamic symbols of $binary"
+  grep -q 'GLIBC_' <<<"$dynsyms" || \
+    release_die "glibc floor gate: $binary imports no glibc symbol at all — not the binary this gate expects"
+
+  while IFS= read -r version; do
+    [[ -n $version ]] || continue
+    if release_version_is_newer "$version" "$RELEASE_GLIBC_SYMBOL_CEILING"; then
+      offenders+=("$version")
+    fi
+  done < <(printf '%s\n' "$dynsyms" |
+    grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
+    sed 's/^GLIBC_//' |
+    sort -Vu)
+
+  if (( ${#offenders[@]} > 0 )); then
+    printf '\n' >&2
+    printf 'glibc floor gate FAILED for %s\n' "$binary" >&2
+    printf 'It imports symbols newer than GLIBC_%s, so it cannot start on Ubuntu\n' \
+      "$RELEASE_GLIBC_SYMBOL_CEILING" >&2
+    printf '22.04, Debian 12 or Rocky 9:\n\n' >&2
+    for version in "${offenders[@]}"; do
+      printf '%s\n' "$dynsyms" |
+        grep -F "GLIBC_$version)" |
+        awk '{ printf "  %s  %s\n", $NF, $(NF - 1) }' |
+        sort -u >&2
+    done
+    printf '\nBuild the release inside docker/release-linux.Dockerfile (Ubuntu 22.04).\n' >&2
+    release_die "release binary requires glibc newer than $RELEASE_GLIBC_SYMBOL_CEILING: $binary"
+  fi
+
+  printf '  glibc floor OK (<= %s): %s\n' "$RELEASE_GLIBC_SYMBOL_CEILING" "$binary"
+}

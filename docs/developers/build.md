@@ -102,10 +102,45 @@ overwrite an existing output path.
 
 ## Build native deliverables
 
+Linux artifacts are built inside the pinned container, never on the host:
+
 ```sh
-./scripts/build_release.sh \
-  --pack ../jetsam-artifacts/history-step-pack-v1
+docker build -t jetsam-build:22.04 -f docker/release-linux.Dockerfile docker
+
+docker run --rm \
+  -v "$PWD":/src \
+  -v "$PWD/../jetsam-artifacts":/packs:ro \
+  -w /src jetsam-build:22.04 \
+  ./scripts/build_release.sh --pack /packs/history-step-pack-v1
 ```
+
+On macOS and Windows, run the script directly; there is no glibc to pin.
+
+### Why Linux goes through a container
+
+The container is not a convenience. `mdbx.c`, in the `mdbx-sys` crate, does
+`#define _GNU_SOURCE` itself. In glibc 2.38 and later, `features.h` turns
+`_GNU_SOURCE` into `_ISOC2X_SOURCE`, which makes `stdlib.h` redirect `strtol`
+to `__isoc23_strtol@GLIBC_2.38`. The node then imports a 2.38 symbol and
+refuses to start on Ubuntu 22.04, Debian 12 and Rocky 9 — the three bases most
+miners rent. That binary shipped in v1.1.0 and has been produced twice since.
+
+The guard is `_GNU_SOURCE`, not `__STDC_VERSION__`, so `-std=gnu17` and every
+other compiler flag is inert by construction, and `-DMDBX_DISABLE_GNU_SOURCE=1`
+does not compile. The only lever that works is compiling against glibc headers
+older than 2.38.
+
+Two gates enforce it rather than trusting this paragraph:
+
+- `build_release.sh` refuses to start a Linux build on a host whose glibc is
+  newer than 2.35, before spending the build time;
+- after linking and before packaging, it runs `objdump -T` on `jetsam`,
+  `jetsam-cli`, `jetsam-miner` and `jetsam-gui` and **fails** if any of them
+  imports a symbol newer than `GLIBC_2.34`.
+
+The second gate is the one that decides. The native smoke test cannot catch
+this defect: it runs the binaries on the machine that built them, where they
+work.
 
 Add `--pack-v1-3 DIR` whenever the v1.3 fork is armed. A binary whose
 `V1_3_ACTIVATION_HEIGHT` is set but which carries no v1.3 pack can verify no
@@ -120,8 +155,9 @@ The script:
 4. builds Core, external miner and GUI;
 5. runs the native release tests;
 6. smoke-tests every executable;
-7. packages the Core archive and native GUI installer;
-8. verifies archive membership and writes SHA-256 sums.
+7. checks the glibc floor of every Linux binary and fails above `GLIBC_2.34`;
+8. packages the Core archive and native GUI installer;
+9. verifies archive membership and writes SHA-256 sums.
 
 Find the output:
 

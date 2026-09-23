@@ -227,6 +227,15 @@ printf '  GUI package:  %s\n' "$GUI_ARTIFACT_NAME"
 printf '  rustc:        %s\n' "$(rustc --version)"
 printf '  cargo:        %s\n' "$(cargo --version)"
 
+# Refuse a Linux release from a host whose glibc headers are newer than the
+# oldest base we target, before spending twelve minutes producing a binary the
+# symbol gate below would reject anyway. See release_common.sh for why no
+# compiler flag substitutes for this.
+if [[ $PLATFORM == linux-* ]]; then
+  CURRENT_STAGE='glibc build host gate'
+  release_assert_glibc_build_host
+fi
+
 CURRENT_STAGE='pack metadata load'
 release_validate_pack_layout "$PACK_DIR" 1
 release_read_pin_file "$PACK_DIR/pins.env"
@@ -282,6 +291,18 @@ printf '\n==> Smoke-testing native executables\n'
 "$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --check-hardware >/dev/null
 "$TARGET_BIN_DIR/jetsam-miner$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/jetsam-gui$BINARY_SUFFIX" --release-self-check >/dev/null
+
+# The smoke test above runs the binaries on the machine that built them, so it
+# passes for a binary that no target base can start. This gate reads the
+# binaries instead of running them, and it decides whether anything may be
+# packaged at all.
+if [[ $PLATFORM == linux-* ]]; then
+  CURRENT_STAGE='glibc floor gate'
+  printf '\n==> Checking the glibc floor of every Linux deliverable\n'
+  for binary in jetsam jetsam-cli jetsam-miner jetsam-gui; do
+    release_assert_glibc_floor "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
+  done
+fi
 
 CURRENT_STAGE='binary packaging'
 printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
