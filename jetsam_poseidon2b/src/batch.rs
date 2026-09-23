@@ -554,38 +554,43 @@ fn flat_tables() -> &'static FlatTables {
 /// (Alder/Raptor-Lake class cores and every AVX-512 part pass). New ISA
 /// tiers (AVX-512, aarch64 PMULL) plug their kernels into the same dispatch
 /// points.
+/// The static short-circuits these gates used to carry are gone on purpose.
+///
+/// `-C target-cpu=native` statically enables these features, and a gate that
+/// folded to `true` on that basis ignored `JETSAM_CPU_BACKEND` — the hook
+/// `kernel_differential` and `pow_golden_vectors` document as the way to pin a
+/// tier. A developer who built with `target-cpu=native` and ran
+/// `JETSAM_CPU_BACKEND=scalar` got `selected_backend() == Scalar` in the report
+/// and the vector kernel in the dispatch: a differential test comparing a kernel
+/// to itself, and reporting that it agreed.
+///
+/// `jetsam_core::cpu` caches its answer in a `OnceLock`, so consulting it is a
+/// relaxed atomic load — nothing worth trading a trustworthy test hook for.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx2_vpclmul_runtime() -> bool {
-    #[cfg(all(target_feature = "avx2", target_feature = "vpclmulqdq"))]
-    return true;
-    #[cfg(not(all(target_feature = "avx2", target_feature = "vpclmulqdq")))]
     jetsam_core::cpu::avx2_vpclmul_available()
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx512_vpclmul_runtime() -> bool {
-    #[cfg(all(
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq"
-    ))]
-    return true;
-    #[cfg(not(all(
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq"
-    )))]
     jetsam_core::cpu::avx512_vpclmul_available()
+}
+
+/// Runtime gate for the SSE4.1+PCLMULQDQ kernels — the production floor, and
+/// the widest tier on every x86-64 CPU up to and including Zen 2. Always
+/// consulted **after** the AVX2 and AVX-512 gates, so a wider part keeps its
+/// wider kernel.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn pclmul_runtime() -> bool {
+    jetsam_core::cpu::pclmul_available()
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn pmull_runtime() -> bool {
-    #[cfg(target_feature = "aes")]
-    return true;
-    #[cfg(not(target_feature = "aes"))]
     jetsam_core::cpu::pmull_available()
 }
 
@@ -661,6 +666,11 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
         return unsafe { crate::batch_avx2::permute_flat_groups(states, kernel_tables()) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if pclmul_runtime() {
+        // SAFETY: gated on runtime SSE4.1+PCLMULQDQ detection.
+        return unsafe { crate::batch_pclmul::permute_flat_groups(states, kernel_tables()) };
+    }
     #[cfg(target_arch = "aarch64")]
     if pmull_runtime() {
         // SAFETY: gated on runtime/static PMULL detection.
@@ -709,6 +719,11 @@ pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE])
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
         return unsafe { crate::batch_avx2::permute_flat_one(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if pclmul_runtime() {
+        // SAFETY: gated on runtime SSE4.1+PCLMULQDQ detection.
+        return unsafe { crate::batch_pclmul::permute_flat_one(states, kernel_tables()) };
     }
     #[cfg(target_arch = "aarch64")]
     if pmull_runtime() {
@@ -1048,6 +1063,25 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
         // the specialized kernel's alignment-independent slice contract.
         unsafe {
             crate::batch_avx2::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
+        }
+        return;
+    }
+
+    // The production floor. Unlike the wider kernels this one carries its own
+    // tail loop, so it needs no leaf-count multiple — only the no-pad,
+    // block-aligned shape the register-domain sponge assumes.
+    #[cfg(target_arch = "x86_64")]
+    if !pad && leaf_size.is_multiple_of(32) && pclmul_runtime() {
+        // SAFETY: the runtime ISA gate and public preconditions above prove
+        // the specialized kernel's alignment-independent slice contract.
+        unsafe {
+            crate::batch_pclmul::leaf_sponge_flat_no_pad_into(
                 iv,
                 data,
                 leaf_size,

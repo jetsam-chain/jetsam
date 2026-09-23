@@ -815,14 +815,22 @@ impl HonestHistoryStepFixtureProvider {
             .checked_add(jetsam_chain::consensus::params::BLOCK_TIME)
             .ok_or_else(|| "fixture timestamp overflow".to_owned())?;
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
-        // block's own. Must mirror consensus::header::validate_header_inner.
-        let target = jetsam_chain::consensus::next_target(
-            checkpoint.asert_anchor.anchor_height,
-            checkpoint.asert_anchor.anchor_timestamp,
-            &checkpoint.asert_anchor.anchor_target,
-            checkpoint.parent_header.height + 1,
-            checkpoint.parent_header.timestamp,
-        );
+        // block's own. Must mirror consensus::header::validate_header_inner —
+        // including the v1.4 boundary block, which carries a constant target
+        // rather than an ASERT one. A fixture that forgot it would build
+        // unvalidatable blocks at exactly one height, and only once the fork is
+        // armed, which is the worst moment to discover it.
+        let child_height = checkpoint.parent_header.height + 1;
+        let target = match jetsam_chain::consensus::params::v1_4_boundary_target(child_height) {
+            Some(boundary) => boundary,
+            None => jetsam_chain::consensus::next_target(
+                checkpoint.asert_anchor.anchor_height,
+                checkpoint.asert_anchor.anchor_timestamp,
+                &checkpoint.asert_anchor.anchor_target,
+                child_height,
+                checkpoint.parent_header.timestamp,
+            ),
+        };
         let miner_seed = self
             .seed
             .wrapping_add(0x3000_0000)

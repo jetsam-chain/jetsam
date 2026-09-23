@@ -56,6 +56,13 @@ pub fn permute_flat_u128(flat: &mut [u128; STATE_SIZE]) {
             crate::batch_avx2::permute_flat_single_u128(flat, crate::batch::kernel_tables())
         };
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::batch::pclmul_runtime() {
+        // SAFETY: gated on runtime SSE4.1+PCLMULQDQ detection.
+        return unsafe {
+            crate::batch_pclmul::permute_flat_single_u128(flat, crate::batch::kernel_tables())
+        };
+    }
     #[cfg(target_arch = "aarch64")]
     if crate::batch::pmull_runtime() {
         // SAFETY: gated on runtime/static PMULL detection.
