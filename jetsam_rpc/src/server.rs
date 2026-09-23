@@ -195,13 +195,19 @@ fn clear_pow_preview() {
     }
 }
 
-/// The PoW input published for a template, by id, regardless of the tip.
+/// The PoW input published for a template, by id, regardless of the tip, with
+/// the height whose rules that input is to be judged under.
 ///
 /// [`take_pow_preview`] refuses a preview whose parent moved, which is right
 /// when handing out work. Judging a nonce that has already been found is a
 /// different question: the miner did the work, and the answer is "is this
 /// digest below that target", not "should I still be mining this".
-fn pow_preview_work_for(template_id: &str) -> Option<(PowHeaderFields, [u8; 32])> {
+///
+/// The height comes from the preview's own parent for the same reason. The tip
+/// may have moved since the work was published, and the rule that decides which
+/// digest a nonce has to produce is a rule of the block's own height — not of
+/// whatever height the node happens to be building on when the nonce arrives.
+fn pow_preview_work_for(template_id: &str) -> Option<(PowHeaderFields, [u8; 32], u64)> {
     let guard = POW_PREVIEW.lock().ok()?;
     let preview = guard.as_ref()?;
     if preview.response.template_id != template_id {
@@ -219,7 +225,7 @@ fn pow_preview_work_for(template_id: &str) -> Option<(PowHeaderFields, [u8; 32])
     }
     let target_bytes = hex::decode(&preview.response.difficulty_target_hex).ok()?;
     let target: [u8; 32] = target_bytes.try_into().ok()?;
-    Some((fields, target))
+    Some((fields, target, preview.parent_height.saturating_add(1)))
 }
 
 /// Drops a published preview unless the template reached `Ready`.
@@ -2901,7 +2907,7 @@ impl JetsamApiServer for RpcHandler {
         {
             validate_pow(&header)
                 .map_err(|error| mining_err(ERR_INVALID_POW, format!("proof of work: {error}")))?;
-        } else if let Some((fields, target)) =
+        } else if let Some((fields, target, preview_height)) =
             pow_preview_work_for(&hex::encode(template_id))
         {
             // The slot is still proving, so there is no prepared header to
@@ -2915,11 +2921,22 @@ impl JetsamApiServer for RpcHandler {
             // The preview check must be the SAME function the sealed header will
             // face. Below the v1.4 activation the walk is the identity and this is
             // byte for byte what it was; above it, checking the seed alone would
-            // call a nonce genuine for work that costs 1/88th of a real attempt,
-            // and the node would then wait on a proof for a block it will reject.
-            // The previewed work is for the child of the tip: that is the height
-            // whose rules the nonce will be judged under.
-            let digest = if jetsam_chain::consensus::params::v1_4_active(tip_height + 1) {
+            // call a nonce genuine for work that costs 1/87th of a real attempt
+            // [MEASURED 2026-09-23, one idle EPYC 7742 core; table in
+            // `jetsam_chain::consensus::pow::pow_digest`], and the node would then
+            // wait on a proof for a block it will reject.
+            //
+            // The height is the previewed template's own child height, not the
+            // tip's. The tip can move between publishing the work and the nonce
+            // coming back, and judging the nonce under `tip + 1` then applies the
+            // rules of a height the miner was never working on: one block either
+            // side of the activation that is the difference between the sponge
+            // and the walk, and the miner is told its proof of work is invalid
+            // when the truth is that its template is stale. This path never
+            // decides consensus — the nonce still goes through
+            // `validate_pow(&prepared.pow_header(nonce))` on the sealed header —
+            // but it is the only answer the miner sees, so it has to be true.
+            let digest = if jetsam_chain::consensus::params::v1_4_active(preview_height) {
                 jetsam_chain::consensus::pow_walk::towerwalk_digest(&seed)
             } else {
                 seed
@@ -4323,6 +4340,14 @@ mod access_control_tests {
     fn preview_work_is_returned_only_for_the_template_that_published_it() {
         // submit_block judges a nonce against this. Handing back another
         // template's fields would validate a nonce against the wrong work.
+        //
+        // It also carries the height the nonce will be judged under, which is
+        // the preview's own child height and not the current tip's. The two
+        // differ exactly when the tip has moved under the template — and at the
+        // v1.4 boundary that difference is the difference between the sponge
+        // and the walk, so a miner holding a genuine nonce would be told its
+        // proof of work is invalid when the truth is that its template is
+        // stale.
         let fields_hex = (0..16)
             .map(|i| format!("{:02x}", i).repeat(16))
             .collect::<String>();
@@ -4331,7 +4356,7 @@ mod access_control_tests {
             pow_fields_hex: fields_hex,
             nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: "ab".repeat(32),
-            height: 11,
+            height: 12,
             expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
             n_txs: 1,
             pow_walk: false,
@@ -4353,10 +4378,18 @@ mod access_control_tests {
             pow_preview_work_for(&"ff".repeat(16)).is_none(),
             "another template's id must not be served this work"
         );
-        let (fields, target) =
+        let (fields, target, child_height) =
             pow_preview_work_for(&"ee".repeat(16)).expect("its own id resolves");
         assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
         assert_eq!(target, [0xabu8; 32]);
+        assert_eq!(
+            child_height, 12,
+            "the nonce is judged under the preview's own child height"
+        );
+        assert_eq!(
+            child_height, published.height,
+            "and that height is the one the template was published with"
+        );
         clear_pow_preview();
     }
 

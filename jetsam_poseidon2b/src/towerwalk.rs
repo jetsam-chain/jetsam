@@ -219,10 +219,13 @@ impl Default for Scratch {
 /// the circuit.
 ///
 /// Verification cost is symmetric with mining cost: checking one header is exactly
-/// one hash, **1.85 ms on an EPYC 7742 core**. There is no short proof for a
-/// memory-hard function without a SNARK, and that was given up deliberately. The
-/// asymmetry that makes PoW work still exists at the block level: the miner tries
-/// about `D` nonces, the verifier checks one.
+/// one hash, **1.85 ms on an EPYC 7742 core** [MEASURED 2026-09-23, one core with
+/// the machine to itself, mean of five runs of 150 headers — the *unit cost*, not
+/// the 4.66 ms a thread sees once every core is busy;
+/// `jetsam_chain::consensus::pow::pow_digest` is the table of record for both].
+/// There is no short proof for a memory-hard function without a SNARK, and that was
+/// given up deliberately. The asymmetry that makes PoW work still exists at the
+/// block level: the miner tries about `D` nonces, the verifier checks one.
 pub fn towerwalk_digest_with(scratch: &mut Scratch, seed: &[u8; 32]) -> [u8; 32] {
     let mut s = [0u64; 4];
     for i in 0..4 {

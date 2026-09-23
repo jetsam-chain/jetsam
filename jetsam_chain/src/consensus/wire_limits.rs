@@ -314,6 +314,12 @@ mod tests {
     ///
     /// The two constants must therefore be armed together, and this fails loudly
     /// if only one of them is.
+    ///
+    /// This answers *when*. The *value* is answered at compile time by the
+    /// `const _: ()` assertion beside `params::V1_4_ANCHOR_TARGET`, which refuses
+    /// to build a binary whose anchor falls outside `[MIN_TARGET, GENESIS_TARGET]`
+    /// — a zero target stops the chain at the activation block just as surely as a
+    /// missing one, and it is not caught here.
     #[test]
     fn the_pow_fork_cannot_be_armed_without_its_anchor_target() {
         use crate::consensus::params::{V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET};

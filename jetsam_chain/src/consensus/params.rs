@@ -232,10 +232,12 @@ pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 /// The nonce appears nowhere in the R1CS and nowhere in HistoryStep
 /// (`block_slots.rs`), so this fork costs **zero relation rows, zero pack, zero
 /// network identity**. What it does change: header verification goes from
-/// **21.8 µs to 1.92 ms, a factor of 88** [MEASURED 2026-09-23, idle EPYC 7742
-/// core]. That is the number to know before announcing a height. Resyncing 500 000
-/// blocks goes from 11 s to 16 minutes on one thread; a 2 GB seed VPS that boots in
-/// 105 s today will not, unless the verification is threaded first.
+/// **21.8 µs to 1.92 ms, a factor of 88** [MEASURED 2026-09-23, one idle EPYC 7742
+/// core — the *unit cost* of a single digest; `pow::pow_digest` is the table of
+/// record and names the three regimes]. That is the number to know before announcing
+/// a height. Resyncing 500 000 blocks goes from 11 s to 16 minutes on one thread; a
+/// 2 GB seed VPS that boots in 105 s today will not, unless the verification is
+/// threaded first.
 ///
 /// It also invalidates every existing miner and pool. They are not warned by a
 /// failure; they are warned by us, before the height, or they mine a chain nobody
@@ -285,10 +287,13 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 /// therefore never makes the target easier: the miners keep hammering the same
 /// value. ASERT absorbs a loss of hashrate; it does not absorb a stall.
 ///
-/// The new digest costs 1.85 ms where the old one costs about 90 µs. Carrying the
-/// pre-fork target across the boundary would make the first post-fork block take
-/// roughly twenty times longer — half an hour instead of ninety seconds, on a
-/// chain whose whole point that day is to be watched.
+/// The new digest costs 1.85 ms [MEASURED 2026-09-23, one idle EPYC 7742 core, unit
+/// cost] where the old one costs about 90 µs **on the release the network runs
+/// today**, whose sponge has no PCLMULQDQ kernel — not the 21.4 µs the release that
+/// carries this fork measures. Carrying the pre-fork target across the boundary
+/// would make the first post-fork block take roughly twenty times longer — half an
+/// hour instead of ninety seconds, on a chain whose whole point that day is to be
+/// watched.
 ///
 /// # Why it is set on the easy side, deliberately
 ///
@@ -303,6 +308,54 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 /// easier**: three halflives of tightening if we judged right, and enough margin to
 /// absorb a third-party kernel two to four times faster than ours without stopping
 /// the chain.
+///
+/// # It also sizes a reorg window — weigh this before carving the value
+///
+/// For [`CONSENSUS_FINALITY_DEPTH`] blocks after the crossing, the heights *below*
+/// the activation are still mineable under the sponge, by exactly the hardware the
+/// fork removes. Fork choice is cumulative work (`fork_choice.rs`) and work is
+/// `2^256 / target`, a number with no unit: a post-fork block and a pre-fork block
+/// are compared as integers although one cost a walk and the other a sponge.
+///
+/// An adversary replacing the `d` blocks below the activation with minimal
+/// timestamps makes ASERT tighten each of *its own* blocks by about
+/// `2^(BLOCK_TIME/540) = 1.12`, so its branch weighs `Phi(d) = sum(2^(i/6), i < d)`
+/// where the honest one weighs `d` — a surplus of 0.12 blocks at `d = 2`, 4.4 at
+/// `d = 8`. The honest chain cannot answer that with post-fork work: on the test
+/// chain the anchor was 2^9.73 (about 850x) easier than the last pre-fork target
+/// (block 4649 carried 2^228.3, block 4650 carried GENESIS_TARGET = 2^238), so a
+/// post-fork block weighed 1/850 of a pre-fork one and it would take ~105 of them
+/// to answer a 0.12-block surplus. What closes the window is the depth limit
+/// alone: a reorg
+/// is refused once `d + n > CONSENSUS_FINALITY_DEPTH`, i.e. after `9 - d`
+/// post-fork blocks.
+///
+/// That leaves the anchor as the only lever the fork itself has here, and it points
+/// the opposite way from "set it harder to be safe". Writing `E` for how many times
+/// **faster** the anchor makes the first post-fork blocks than the pre-fork ones,
+/// the attack needs
+///
+/// ```text
+/// H_adversary / H_pre-fork-network  >  E · Phi(d) / (9 - d)
+/// ```
+///
+/// which is smallest at `d = 2`, where it is `0.30 · E`. The window is shut — the
+/// attack costs more than the entire pre-fork network — from about `E = 3.3`, and
+/// the eightfold margin above lands at `2.4x`. That is the second reason for it.
+///
+/// **`E` is not the target ratio, and the test chain is the warning.** The anchor
+/// there was 860x easier in target terms, but the post-fork network is also far
+/// slower in hashes per second, so the first post-fork blocks arrived 49–56 s apart
+/// against 19–100 s before the crossing: `E` ≈ 1, and 30 % of the pre-fork hashrate
+/// would have been enough for a two-deep reorg. Choose the public network's anchor
+/// against a **measured post-fork block interval**, not against a target ratio.
+///
+/// Two limits on raising `E`: `BLOCK_TIME / E` has to stay above the time this node
+/// needs to produce a block at all, and an adversary that starts its private branch
+/// when the fork point appears buys `d · BLOCK_TIME` more (at `E = 8, d = 2` the bar
+/// falls from 2.4x to 0.74x; shutting the window against *that* would take `E ≈ 57`,
+/// i.e. 1.6 s blocks, which the proving pipeline cannot do). So the residual risk is
+/// managed by watching the first eight blocks, not by the anchor alone.
 ///
 /// `None` while the fork is dormant — the value is decided from a fresh
 /// measurement taken **after** the optimised CPU kernel has shipped and ASERT has
@@ -327,6 +380,74 @@ pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
 /// chain whose hashrate is two processes on one machine.
 #[cfg(feature = "testnet")]
 pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(GENESIS_TARGET);
+
+/// Whether a candidate anchor target is one this protocol can ever mine.
+///
+/// # What it catches
+///
+/// * **zero** — the value an uninitialised `[u8; 32]` carries. `digest < 0`
+///   holds for no digest, so the activation block is unmineable and the chain
+///   stops at it permanently: ASERT anchors on the parent's timestamp, and a
+///   block that never arrives never makes the target easier.
+/// * anything **easier than [`GENESIS_TARGET`]** — ASERT clamps it away at
+///   `activation + 1`, but the activation block itself would still carry a
+///   weight below anything the difficulty ladder can issue.
+///
+/// # What it does NOT catch
+///
+/// A target whose 32 bytes were written in the wrong order. Reversing
+/// [`GENESIS_TARGET`] — the classic slip on a little-endian constant — gives
+/// 2^22, which is *inside* `[MIN_TARGET, GENESIS_TARGET]` and would stop the
+/// chain exactly like a zero would. This is a floor and a ceiling, not a
+/// plausibility check: before a public network is armed the value still has to
+/// be read back against the measurement it came from, and the sanity check for
+/// that is wall-clock — `2^256 / target` attempts at the measured cost of one
+/// walked digest has to come out near [`BLOCK_TIME`] at the network's rate.
+#[inline]
+pub(crate) const fn anchor_target_is_mineable(target: [u8; 32]) -> bool {
+    !le256_lt_const(&target, &MIN_TARGET) && !le256_lt_const(&GENESIS_TARGET, &target)
+}
+
+/// `a < b` on two little-endian 256-bit integers, in a `const` context.
+///
+/// This is [`crate::consensus::difficulty::le256_lt`] with a `while` loop in
+/// place of its `for` loop, because iterators are not available in a `const
+/// fn`. The two are pinned to each other — and to an independent big-endian
+/// oracle — by `tests::the_compile_time_target_order_is_the_consensus_target_order`.
+///
+/// Byte 0 is the least significant one here, so the derived order on
+/// `[u8; 32]` answers a different question: it would reject a valid constant
+/// and accept a reversed one.
+const fn le256_lt_const(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut i = 32;
+    while i > 0 {
+        i -= 1;
+        if a[i] < b[i] {
+            return true;
+        }
+        if a[i] > b[i] {
+            return false;
+        }
+    }
+    false
+}
+
+/// This binary does not link if it carries an anchor the chain cannot mine.
+///
+/// `wire_limits::tests::the_pow_fork_cannot_be_armed_without_its_anchor_target`
+/// proves the height and the target are armed together; nothing proved the
+/// *value* of the armed one, and the cost of getting it wrong is a public
+/// network that stops at its activation block and does not restart without a
+/// new binary. A build failure is the cheap end of that trade.
+const _: () = assert!(
+    match V1_4_ANCHOR_TARGET {
+        Some(target) => anchor_target_is_mineable(target),
+        None => true,
+    },
+    "V1_4_ANCHOR_TARGET must lie in [MIN_TARGET, GENESIS_TARGET]: below it the \
+     activation block can never be mined and the chain stops there for good, \
+     above it that block carries a weight the difficulty ladder never issues"
+);
 
 /// The target a block at `height` carries verbatim, bypassing ASERT.
 ///
@@ -1129,6 +1250,86 @@ mod tests {
                     },
                     "height {height}, {page_count} pages, activation {armed:?}"
                 );
+            }
+        }
+    }
+
+    /// The truth table of the compile-time guard that sits beside
+    /// [`V1_4_ANCHOR_TARGET`].
+    ///
+    /// The anchor is carved by hand from a measurement, and the two ways of
+    /// getting it wrong do not cost the same: a value the chain can still mine
+    /// costs a burst of fast blocks ASERT takes away, a value it cannot mine
+    /// stops the chain at the activation block and it does not restart without
+    /// a new binary.
+    #[test]
+    fn an_anchor_target_the_chain_cannot_mine_is_refused() {
+        // The two endpoints the protocol itself allows, both inclusive.
+        assert!(anchor_target_is_mineable(GENESIS_TARGET));
+        assert!(anchor_target_is_mineable(MIN_TARGET));
+
+        // Zero: `digest < 0` holds for no digest, so the activation block can
+        // never be mined. This is what an uninitialised `[u8; 32]` holds, and
+        // it is the value that stops the chain for good.
+        assert!(!anchor_target_is_mineable([0u8; 32]));
+
+        // Easier than genesis: ASERT clamps it away at `activation + 1`, but the
+        // activation block itself would carry a weight below anything the
+        // difficulty ladder can issue.
+        assert!(!anchor_target_is_mineable(MAX_TARGET));
+        let mut one_above_genesis = GENESIS_TARGET;
+        one_above_genesis[0] = 1;
+        assert!(!anchor_target_is_mineable(one_above_genesis));
+
+        // Inside the range: the guard is an interval and not an equality,
+        // because the public network's anchor is a measurement nobody can
+        // predict here.
+        let mut half_of_genesis = GENESIS_TARGET;
+        half_of_genesis[29] = 0x20; // 2^237
+        assert!(anchor_target_is_mineable(half_of_genesis));
+    }
+
+    /// The compile-time comparison and the one consensus uses must agree.
+    ///
+    /// Two answers to "which of these two 256-bit targets is smaller" that
+    /// disagree would make the guard green on a value the chain rejects, or red
+    /// on one it accepts — and the naive order on `[u8; 32]` is one of those
+    /// wrong answers, because byte 0 is the least significant one here.
+    #[test]
+    fn the_compile_time_target_order_is_the_consensus_target_order() {
+        use crate::consensus::difficulty::le256_lt;
+
+        let mut corpus: Vec<[u8; 32]> = vec![[0u8; 32], MIN_TARGET, GENESIS_TARGET, MAX_TARGET];
+        // GENESIS_TARGET written the wrong way round — the classic slip on a
+        // 32-byte little-endian constant.
+        let mut reversed = GENESIS_TARGET;
+        reversed.reverse();
+        corpus.push(reversed);
+        // A deterministic spread that differs at every byte position, so the
+        // pairs that agree on all but their most significant byte are covered.
+        let mut x = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..192 {
+            let mut t = [0u8; 32];
+            for byte in t.iter_mut() {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *byte = (x >> 33) as u8;
+            }
+            corpus.push(t);
+            // Near-ties: the same value with one low byte moved.
+            let mut near = t;
+            near[0] ^= 1;
+            corpus.push(near);
+        }
+        for a in &corpus {
+            for b in &corpus {
+                // An independent oracle: big-endian byte order IS numeric order
+                // for an unsigned integer, so reading both arrays backwards and
+                // comparing lexicographically answers the same question.
+                let oracle = a.iter().rev().cmp(b.iter().rev()) == std::cmp::Ordering::Less;
+                assert_eq!(le256_lt(a, b), oracle, "consensus order: {a:?} < {b:?}");
+                assert_eq!(le256_lt_const(a, b), oracle, "guard order: {a:?} < {b:?}");
             }
         }
     }
