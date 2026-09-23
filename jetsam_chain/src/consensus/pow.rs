@@ -191,6 +191,18 @@ pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
 /// the luckiest window, a mean does not. **Size anything operational on the slower
 /// end**: a resync estimate that is optimistic is worse than one that is not.
 ///
+/// **Two different quantities go by "the cost of a walked digest" in this tree, and
+/// they must not be swapped.** Everything above is the *unit cost of one digest on
+/// one core that has the machine to itself*. What a mining thread actually gets once
+/// every core is busy is the *per-thread throughput at saturation*: **4.66 ms per
+/// walked digest** [MEASURED 2026-09-23 on the test chain at the v1.4 crossing, the
+/// mining node at `--cpu-threads 80` on a 256-thread EPYC 7742 under a load average
+/// near 190], **2.5x the exclusive-core cost** — two pads sharing one 512 KiB L2, the
+/// same effect the 78 % scaling figure below reports. Verification and resync
+/// estimates take the unit cost; anything about how long a miner waits takes the
+/// saturated one. Every figure quoted elsewhere in this tree names which of the two
+/// it is, and this is the table of record.
+///
 /// The factor barely moves across three microarchitectures. Its machine-independent
 /// form, from `perf stat` — instruction counts, unlike cycles, are trustworthy on a
 /// loaded machine — is **133 149 instructions per header before, 10 991 148 after:

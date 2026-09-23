@@ -457,6 +457,11 @@ fn search_pow_parallel_from(
     /// has already been replaced. Four keeps it at about 8 ms, the same order as
     /// today, and the batch buys nothing anyway: the walk dominates the sponge by
     /// a factor of eighty-eight, so there is no amortisation left to chase.
+    ///
+    /// Both figures are the **unit cost on one idle EPYC 7742 core** [MEASURED
+    /// 2026-09-23; `jetsam_chain::consensus::pow::pow_digest` is the table of
+    /// record]. A thread on a saturated machine sees 4.66 ms instead, which only
+    /// makes this batch size more right, never less.
     const WALK_BATCH: usize = 4;
     let target = header_template.difficulty_target;
     // The digest a block at this height must satisfy. `None` on every profile
@@ -480,10 +485,13 @@ fn search_pow_parallel_from(
     // `find_map_any` does not interrupt a closure that is already running: every
     // thread finishes its `CHUNK_SIZE / threads` nonces before the solution is
     // handed back. Below the walk a share cost 0.15 s and nobody noticed. At
-    // 4.66 ms per walked digest the same share is 31 s — measured on the testnet
-    // at the v1.4 crossing, where `pow_ms` collapsed onto multiples of one chunk
-    // and every block was announced that long after it had been won. Every one
-    // of those seconds goes to whoever else is mining the same parent.
+    // 4.66 ms per walked digest the same share is 31 s — [MEASURED 2026-09-23 on
+    // the test chain at the v1.4 crossing: per-thread throughput with every core
+    // busy, 2.5x the 1.85 ms unit cost of one digest on an idle core], where
+    // `pow_ms` collapsed onto multiples of one chunk and every block was announced
+    // that long after it had been won. Every one of those seconds goes to whoever
+    // else is mining the same parent. The saturated figure is the right one here:
+    // this is about what a thread in the pool actually waits.
     //
     // The external miner has carried this flag since before the fork; this is
     // the same fix on the stage that had been left without it.
@@ -611,10 +619,12 @@ mod pow_search_tests {
         // does not interrupt a closure already running.
         //
         // Before the cache-resident walk a share cost 0.15 s and nobody noticed.
-        // At 4.66 ms per walked digest the same share is 31 s — measured on the
-        // testnet at the v1.4 crossing, where every block was announced that
-        // long after it had been won, and every one of those seconds is handed
-        // to a competitor mining the same parent.
+        // At 4.66 ms per walked digest the same share is 31 s — [MEASURED
+        // 2026-09-23 on the test chain at the v1.4 crossing: per-thread
+        // throughput with every core busy, 2.5x the 1.85 ms unit cost of one
+        // digest on an idle core], where every block was announced that long
+        // after it had been won, and every one of those seconds is handed to a
+        // competitor mining the same parent.
         let _serialised = METER_OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
         let header = test_header();
         let cancel = AtomicBool::new(false);
