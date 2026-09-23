@@ -535,6 +535,14 @@ into the node and produces two independent deliverables:
 cat target/release-builds/LAST_RELEASE
 ```
 
+On Linux this has to run inside `docker/release-linux.Dockerfile` (Ubuntu
+22.04). Building on a newer host makes libmdbx import
+`__isoc23_strtol@GLIBC_2.38`, and the binary then refuses to start on Ubuntu
+22.04, Debian 12 or Rocky 9; no compiler flag prevents it. The script refuses
+to run on such a host, and checks every produced binary with `objdump` before
+packaging. See
+[docs/developers/build.md](docs/developers/build.md#build-native-deliverables).
+
 For a faster build, the corresponding GitHub release also carries the
 authenticated `history-step-pack-v1.tar.gz`. Extract it and pass the contained
 directory to the same build command:
