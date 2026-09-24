@@ -26,6 +26,7 @@
 //! the coinbase or any other semantic field; the miner only returns a nonce.
 
 pub mod block_production;
+pub mod colour;
 mod cpu_budget;
 pub mod history_step_artifacts;
 pub mod miner;
