@@ -393,20 +393,47 @@ pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(GENESIS_TARGET);
 ///   `activation + 1`, but the activation block itself would still carry a
 ///   weight below anything the difficulty ladder can issue.
 ///
-/// # What it does NOT catch
+/// * anything **harder than [`V1_4_ANCHOR_FLOOR`]** — see below.
 ///
-/// A target whose 32 bytes were written in the wrong order. Reversing
-/// [`GENESIS_TARGET`] — the classic slip on a little-endian constant — gives
-/// 2^22, which is *inside* `[MIN_TARGET, GENESIS_TARGET]` and would stop the
-/// chain exactly like a zero would. This is a floor and a ceiling, not a
-/// plausibility check: before a public network is armed the value still has to
-/// be read back against the measurement it came from, and the sanity check for
-/// that is wall-clock — `2^256 / target` attempts at the measured cost of one
-/// walked digest has to come out near [`BLOCK_TIME`] at the network's rate.
+/// # Why the floor, and not just `MIN_TARGET`
+///
+/// `MIN_TARGET` is 1: the hardest target the wire format can express, and one
+/// no network will ever mine. An interval that only excludes zero therefore
+/// admits every typo between 1 and genesis, including the one that actually
+/// happens. Reversing the 32 bytes of [`GENESIS_TARGET`] — the classic slip on
+/// a little-endian constant — gives 2^22, which sits *inside*
+/// `[MIN_TARGET, GENESIS_TARGET]` and would stop the chain exactly like a zero
+/// would.
+///
+/// The floor separates a target a network could plausibly be mining from one
+/// that is a mistake. At one terahash per second under the walked digest —
+/// orders of magnitude beyond anything this chain has seen — the equilibrium
+/// target sits near 2^209, still far above the floor. Nothing legitimate lands
+/// below it; a reversed constant does.
+///
+/// # What it still does NOT catch
+///
+/// A target that is wrong but plausible. This is a range check, not a
+/// measurement: before a public network is armed the value has to be read back
+/// against the measurement it came from, and the sanity check for that is
+/// wall-clock — `2^256 / target` attempts at the measured cost of one walked
+/// digest has to come out near [`BLOCK_TIME`] at the network's rate.
 #[inline]
 pub(crate) const fn anchor_target_is_mineable(target: [u8; 32]) -> bool {
-    !le256_lt_const(&target, &MIN_TARGET) && !le256_lt_const(&GENESIS_TARGET, &target)
+    !le256_lt_const(&target, &V1_4_ANCHOR_FLOOR) && !le256_lt_const(&GENESIS_TARGET, &target)
 }
+
+/// The hardest anchor target a real network could be asking for: genesis
+/// shifted right by 32 bits, i.e. 2^206.
+///
+/// Derived from [`GENESIS_TARGET`] rather than written out, so the two cannot
+/// drift apart. `GENESIS_TARGET` sets bit 6 of byte 29; moving that byte four
+/// places down divides the value by 2^32.
+pub const V1_4_ANCHOR_FLOOR: [u8; 32] = {
+    let mut t = [0u8; 32];
+    t[29 - 4] = GENESIS_TARGET[29];
+    t
+};
 
 /// `a < b` on two little-endian 256-bit integers, in a `const` context.
 ///
@@ -1264,9 +1291,17 @@ mod tests {
     /// a new binary.
     #[test]
     fn an_anchor_target_the_chain_cannot_mine_is_refused() {
-        // The two endpoints the protocol itself allows, both inclusive.
+        // The two endpoints the guard allows, both inclusive.
         assert!(anchor_target_is_mineable(GENESIS_TARGET));
-        assert!(anchor_target_is_mineable(MIN_TARGET));
+        assert!(anchor_target_is_mineable(V1_4_ANCHOR_FLOOR));
+
+        // `MIN_TARGET` is 1 -- expressible on the wire, and no network will
+        // ever mine it. It sat inside the old interval; the floor excludes it,
+        // along with every typo between it and 2^206.
+        assert!(!anchor_target_is_mineable(MIN_TARGET));
+        let mut just_under_floor = V1_4_ANCHOR_FLOOR;
+        just_under_floor[25] = 0x3f; // one notch below 2^206
+        assert!(!anchor_target_is_mineable(just_under_floor));
 
         // Zero: `digest < 0` holds for no digest, so the activation block can
         // never be mined. This is what an uninitialised `[u8; 32]` holds, and
@@ -1287,6 +1322,34 @@ mod tests {
         let mut half_of_genesis = GENESIS_TARGET;
         half_of_genesis[29] = 0x20; // 2^237
         assert!(anchor_target_is_mineable(half_of_genesis));
+    }
+
+    /// A constant written back to front must not build.
+    ///
+    /// Reversing the 32 bytes of a little-endian constant is the classic slip,
+    /// and it is the one an interval check cannot see: reversed,
+    /// [`GENESIS_TARGET`] becomes 2^22, which sits comfortably inside
+    /// `[MIN_TARGET, GENESIS_TARGET]` while stopping the chain exactly like a
+    /// zero would. The floor is what separates a target the network could
+    /// plausibly be mining from one that is a typo.
+    #[test]
+    fn an_anchor_target_written_back_to_front_is_refused() {
+        let mut reversed = GENESIS_TARGET;
+        reversed.reverse();
+
+        // It really is inside the interval -- that is the whole problem.
+        assert!(!le256_lt_const(&reversed, &MIN_TARGET));
+        assert!(!le256_lt_const(&GENESIS_TARGET, &reversed));
+
+        // And it is refused anyway.
+        assert!(!anchor_target_is_mineable(reversed));
+
+        // The floor leaves every plausible anchor alone. A network mining at
+        // one terahash per second under the walked digest settles near 2^209,
+        // three orders of magnitude above the floor.
+        let mut terahash_era = [0u8; 32];
+        terahash_era[26] = 0x02; // 2^209
+        assert!(anchor_target_is_mineable(terahash_era));
     }
 
     /// The compile-time comparison and the one consensus uses must agree.
