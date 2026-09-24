@@ -387,11 +387,17 @@ mod tests {
 /// prints nothing looks broken.
 fn report_rate(ticker: &mut SearchTicker, height: u64, threads: usize) {
     if let Some(rate) = ticker.tick() {
+        // This is what an operator checks to know the machine is working, and
+        // it used to arrive in the same grey as the sync chatter scrolling
+        // past it. `kH/s` stays outside the escape codes: scripts grep for it.
         tracing::info!(
             height,
-            "miner: {} ({threads} threads, {} hashes total)",
-            format_hashrate(rate),
-            POW_METER.total_hashes(),
+            "⛏  {}  {}",
+            crate::colour::rate(&format_hashrate(rate)),
+            crate::colour::faint(&format!(
+                "{threads} threads · {} hashes total",
+                POW_METER.total_hashes()
+            )),
         );
     }
 }
