@@ -2302,21 +2302,26 @@ mod address_tests {
 
     #[test]
     fn a_canonical_address_is_accepted_and_the_upstream_prefix_is_not() {
-        // Real addresses from this network.
-        assert!(looks_like_address(
-            "j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
-        ));
-        assert!(looks_like_address(
-            "j19fe83j2l7ukelk63477jdhlr2prsmxytqu8lzu8q3hhfhegzxs6qefc03u"
-        ));
+        // Real addresses from this network. The prefix is read from the
+        // protocol constant for the same reason `looks_like_address` reads it:
+        // the test chain's is `tj`, so a literal pins one of the two networks
+        // and makes the other one's addresses look foreign.
+        let hrp = jetsam_chain::consensus::identity::ADDRESS_HRP;
+        assert!(looks_like_address(&format!(
+            "{hrp}1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
+        )));
+        assert!(looks_like_address(&format!(
+            "{hrp}19fe83j2l7ukelk63477jdhlr2prsmxytqu8lzu8q3hhfhegzxs6qefc03u"
+        )));
         // Leading and trailing whitespace is a paste artefact, not a typo.
-        assert!(looks_like_address(
-            "  j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf\n"
-        ));
+        assert!(looks_like_address(&format!(
+            "  {hrp}1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf\n"
+        )));
         // Upper case is still the same address.
-        assert!(looks_like_address(
-            "J1SNYEEYHQRKYN303Q3CTWN0YZK4AJ4F3C64QTGU2ETSJ6NN6LUDJQ5ZT8NF"
-        ));
+        assert!(looks_like_address(&format!(
+            "{}1SNYEEYHQRKYN303Q3CTWN0YZK4AJ4F3C64QTGU2ETSJ6NN6LUDJQ5ZT8NF",
+            hrp.to_ascii_uppercase()
+        )));
         // The upstream prefix is a different network's address.
         assert!(!looks_like_address(
             "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp"

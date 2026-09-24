@@ -461,7 +461,7 @@ pub enum HeaderAnnounceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jetsam_chain::{history_step::HISTORY_STEP_TERMINAL_VERSION, Block};
+    use jetsam_chain::Block;
 
     fn bundle() -> AcceptedBlockBundle {
         let mut header = jetsam_chain::consensus::genesis_header();
@@ -471,11 +471,15 @@ mod tests {
             header,
             transactions: Vec::new(),
         };
-        let mut terminal = Vec::new();
-        terminal.push(HISTORY_STEP_TERMINAL_VERSION);
-        terminal.extend_from_slice(&header.height.to_le_bytes());
-        terminal.extend_from_slice(&semantic_header_id(&header));
-        terminal.push(0);
+        // The terminal's wire version is a property of its own height, and the
+        // activation height that decides it differs between networks: writing
+        // the pre-v1.2 constant here built a terminal no test chain would ever
+        // accept, and the fixture — not the codec — was what failed.
+        let mut terminal =
+            HistoryStepTerminalMetadata::new(header.height, semantic_header_id(&header), 0)
+                .expect("canonical HistoryStep class")
+                .encode_prefix()
+                .to_vec();
         terminal.push(0xA5);
         AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
     }

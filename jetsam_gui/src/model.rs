@@ -2,6 +2,16 @@
 // Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
+/// A preview address carrying the prefix of the network this binary was built
+/// for.
+///
+/// The offline explorer search matches candidates on that prefix, so a fixture
+/// that spells the prefix out answers nothing for its own data on the chain
+/// whose prefix is the other one — which is what a test-chain build did.
+fn preview_address(body: &str) -> String {
+    format!("{}1{body}", jetsam_poseidon2b::primitives::ADDRESS_HRP)
+}
+
 pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
 pub const MINED_BLOCK_PAGE_SIZE: u32 = 8;
 pub const EXPLORER_PAGE_SIZE: u32 = 8;
@@ -598,10 +608,9 @@ impl AppSnapshot {
         let key_index = self.addresses.len() as u32;
         self.addresses.push(AddressSnapshot {
             key_index,
-            address: format!(
-                "j1q{:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc",
-                key_index
-            ),
+            address: preview_address(&format!(
+                "q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc"
+            )),
             label: format!("Address {key_index}"),
             balance_micro_jtm: 0,
             utxo_count: 0,
@@ -731,7 +740,9 @@ impl AppSnapshot {
         let mut addresses = vec![
             AddressSnapshot {
                 key_index: 0,
-                address: "j12p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt".into(),
+                address: preview_address(
+                    "2p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt",
+                ),
                 label: "Main".into(),
                 balance_micro_jtm: PREVIEW_BALANCE_MICRO_JTM,
                 utxo_count: PREVIEW_UTXO_COUNT,
@@ -741,7 +752,9 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 1,
-                address: "j17z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj".into(),
+                address: preview_address(
+                    "7z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj",
+                ),
                 label: "Savings".into(),
                 balance_micro_jtm: 312_000_000,
                 utxo_count: 6,
@@ -751,7 +764,9 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 2,
-                address: "j1ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6".into(),
+                address: preview_address(
+                    "ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6",
+                ),
                 label: "Shop".into(),
                 balance_micro_jtm: 0,
                 utxo_count: 0,
@@ -763,9 +778,9 @@ impl AppSnapshot {
         addresses.extend((addresses.len()..PREVIEW_ADDRESS_COUNT).map(|key_index| {
             AddressSnapshot {
                 key_index: key_index as u32,
-                address: format!(
-                    "j1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
-                ),
+                address: preview_address(&format!(
+                    "q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
+                )),
                 label: format!("Address {key_index}"),
                 balance_micro_jtm: 0,
                 utxo_count: 0,
@@ -1221,10 +1236,15 @@ mod tests {
 
     #[test]
     fn preview_addresses_match_the_canonical_display_width() {
+        // A 32-byte address is always the HRP, its separator, 52 bech32m data
+        // characters and a 6-character checksum. Only the HRP length is a
+        // property of the network — 60 on the public chain, 61 on the test
+        // chain — so writing the total out pinned one of the two.
+        let width = jetsam_poseidon2b::primitives::ADDRESS_HRP.len() + 1 + 52 + 6;
         let snapshot = AppSnapshot::design_preview();
         assert!(snapshot
             .addresses
             .iter()
-            .all(|address| address.address.chars().count() == 60));
+            .all(|address| address.address.chars().count() == width));
     }
 }

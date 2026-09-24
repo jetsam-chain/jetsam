@@ -6859,8 +6859,16 @@ mod tests {
             None
         );
 
+        // Equal work does not settle fork choice on its own: `choose_chain_by_work`
+        // then compares the two tip hashes, and the manifest's is peer-supplied.
+        // `[0xA3; 32]` lost that comparison against this fixture's tip on the public
+        // network and won it on the test chain, whose genesis moves every header
+        // hash below it — so the assertion was reading a coin flip. The all-ones
+        // hash is the one value that can never win it, which is what makes "not
+        // more work" the only reason this manifest is refused.
         let losing = jetsam_p2p::protocol::GetStateManifestResponse {
             cumulative_chainwork: selected_work,
+            tip_hash: [0xFF; 32],
             ..farther.clone()
         };
         assert!(validate_rebase_snapshot_selection(&dag, hint, &losing).is_err());

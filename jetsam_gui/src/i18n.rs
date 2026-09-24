@@ -28,9 +28,21 @@ pub fn active() -> Language {
 /// upstream's prefix — long after the wallet had started rejecting `o1`
 /// addresses. The test at the bottom of this file pins them to the real
 /// prefix, in all three languages.
+///
+/// They stay written for the public network because they are the keys of the
+/// translation table, and a key has to be one fixed string. The prefix a build
+/// actually speaks is substituted by [`translate`], which is the last step
+/// before the sentence reaches a screen — so a test-chain wallet no longer
+/// tells its user to paste a `j1` address it would then refuse.
 pub const SEND_RECIPIENT_HINT: &str = "Paste a j1 address";
 pub const SEARCH_SCOPE_HINT: &str =
     "Search accepts a j1 address, block height/hash, txid, or slot:<number>.";
+
+/// The written form of the network's address prefix: `j1` here, `tj1` on the
+/// test chain.
+fn address_prefix() -> String {
+    format!("{}1", jetsam_poseidon2b::primitives::ADDRESS_HRP)
+}
 
 pub fn navigation_label(source: &'static str) -> &'static str {
     match (active(), source) {
@@ -66,10 +78,18 @@ pub fn address_label(label: &str) -> Cow<'_, str> {
 }
 
 pub fn translate(source: &str) -> String {
-    match active() {
+    let rendered = match active() {
         Language::English => source.to_owned(),
         language => translate_localized(language, source),
+    };
+    // The two address hints name the prefix, and the prefix is decided by the
+    // build, not by the table. Each sentence spells it exactly once, in every
+    // language, so one replacement puts this network's prefix in front of the
+    // reader without touching anything else.
+    if source == SEND_RECIPIENT_HINT || source == SEARCH_SCOPE_HINT {
+        return rendered.replacen("j1", &address_prefix(), 1);
     }
+    rendered
 }
 
 pub fn text<'a>(content: impl ToString) -> Text<'a> {

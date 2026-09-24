@@ -3035,13 +3035,18 @@ mod tests {
 
     #[test]
     fn address_shape_follows_this_network_not_the_upstream_one() {
-        // Real addresses of this network.
-        assert!(looks_like_address(
-            "j1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
-        ));
-        assert!(looks_like_address(
-            "  J19FE83J2L7UKELK63477JDHLR2PRSMXYTQU8LZU8Q3HHFHEGZXS6QEFC03U  "
-        ));
+        // Real addresses of this network. The prefix is read from the protocol
+        // constant for exactly the reason `looks_like_address` reads it: the
+        // test chain's is `tj`, so a literal pins one of the two networks and
+        // makes the other one's addresses look foreign.
+        let hrp = jetsam_poseidon2b::primitives::ADDRESS_HRP;
+        assert!(looks_like_address(&format!(
+            "{hrp}1snyeeyhqrkyn303q3ctwn0yzk4aj4f3c64qtgu2etsj6nn6ludjq5zt8nf"
+        )));
+        assert!(looks_like_address(&format!(
+            "  {}19FE83J2L7UKELK63477JDHLR2PRSMXYTQU8LZU8Q3HHFHEGZXS6QEFC03U  ",
+            hrp.to_ascii_uppercase()
+        )));
         // The upstream prefix belongs to a different chain.
         assert!(!looks_like_address(
             "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp"

@@ -495,11 +495,17 @@ mod tests {
             !encoded.starts_with("o1"),
             "address must not carry the upstream HRP"
         );
-        // Must be exactly 60 chars (1 HRP + 52 data + 6 checksum + separator)
+        // 32 bytes is always 52 data characters plus a 6-character checksum,
+        // after the HRP and its separator. Only the HRP length is a property of
+        // the network, so only that part is read from the constant: writing 60
+        // out was the same drift as writing the prefix out, one line below the
+        // comment that says so.
+        const BECH32M_PAYLOAD_AND_CHECKSUM: usize = 52 + 6;
+        let expected_len = ADDRESS_HRP.len() + 1 + BECH32M_PAYLOAD_AND_CHECKSUM;
         assert_eq!(
             encoded.len(),
-            60,
-            "expected 60 chars, got {}",
+            expected_len,
+            "expected {expected_len} chars, got {}",
             encoded.len()
         );
         // Round-trip
