@@ -1,83 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 the Jetsam developers.
 
-//! Colour for the two lines a miner actually watches.
+//! Why the two lines a miner watches carry a symbol and not colour.
 //!
 //! A mining node prints a great deal that matters to the node and nothing to
-//! the person running it. Two lines matter to the person: how fast the machine
-//! is searching, and whether it won a block. Both used to arrive in the same
-//! grey as the snapshot chatter scrolling past them, and operators reported
-//! seeing neither.
+//! the person running it. Two lines matter to that person: how fast the
+//! machine is searching, and whether it won a block. Both used to arrive in
+//! the same shape as the sync chatter scrolling past them, and the first
+//! operator to run this reported seeing neither — while the log in front of
+//! them held three rate lines and a won block.
 //!
-//! # Rules
+//! # Colour is not available here, and that is deliberate upstream
 //!
-//! * **A terminal, never a file.** Escape sequences written to a redirected
-//!   log make `grep` match on invisible bytes and turn a log into noise
-//!   wherever it is later read. The node's subscriber already decides this the
-//!   same way; this decides it once, for message bodies, which the subscriber
-//!   does not touch.
-//! * **`NO_COLOR` is honoured**, as an environment variable of any value —
-//!   the convention at <https://no-color.org>.
-//! * **The keywords stay outside the colour.** `block accepted` and `kH/s`
-//!   remain plain text at a stable position, because scripts grep for them and
-//!   a colour code between the words would break every one of them.
+//! `tracing` escapes control characters in anything the caller supplies, for
+//! both the message body and structured fields:
+//!
+//! ```text
+//! tracing::info!("{}", "\x1b[1;36mX\x1b[0m")  ->  message: \x1b[1;36mX\x1b[0m
+//! tracing::info!(f = "\x1b[1;36mX\x1b[0m")     ->  f="\u{1b}[1;36mX\u{1b}[0m"
+//! ```
+//!
+//! That is a defence against escape-sequence injection through log content,
+//! and it applies to us exactly as it applies to a hostile peer name. The
+//! subscriber colours what it owns — the level, the target — and nothing an
+//! event carries. An earlier attempt at colouring these two lines shipped in
+//! v1.4.1 and printed the escape codes as literal text on every terminal.
+//!
+//! # What is used instead
+//!
+//! A leading symbol, which is an ordinary UTF-8 character and survives
+//! untouched, plus word order: the thing worth reading comes first. This also
+//! behaves identically in a terminal, in a file and under `journalctl`, where
+//! colour never applied anyway.
 
-use std::io::IsTerminal;
-use std::sync::OnceLock;
+/// Marks a measured search rate.
+pub const MINING: &str = "⛏";
 
-fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
-    })
-}
-
-fn wrap(code: &str, s: &str) -> String {
-    if enabled() {
-        format!("\x1b[{code}m{s}\x1b[0m")
-    } else {
-        s.to_string()
-    }
-}
-
-/// A measured rate: the number an operator checks to know the machine works.
-pub fn rate(s: &str) -> String {
-    wrap("1;36", s) // bold cyan
-}
-
-/// A block this node won. The one line worth scrolling back for.
-pub fn won(s: &str) -> String {
-    wrap("1;32", s) // bold green
-}
-
-/// Context that should stay readable without competing with the two above.
-pub fn faint(s: &str) -> String {
-    wrap("2", s)
-}
+/// Marks a block this node won.
+pub const WON: &str = "✅";
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// Nothing may be wrapped when the sink is not a terminal.
+    /// No escape byte may ever reach a `tracing` event from this crate.
     ///
-    /// Tests capture stdout, so `enabled()` is false here and every helper is
-    /// the identity. That is the property worth pinning: a redirected log — a
-    /// file, a pipe, a systemd journal — must carry no escape byte at all.
+    /// The earlier version of this module wrapped strings in ANSI codes and
+    /// was proven only against a redirected sink, where the wrapping was
+    /// disabled — so the test passed on the one path that could not fail. The
+    /// property that matters is unconditional: never hand `tracing` a control
+    /// character, because it will escape it and print it as text.
     #[test]
-    fn a_redirected_sink_gets_no_escape_bytes() {
-        for painted in [rate("8.30 kH/s"), won("block accepted"), faint("h=5629")] {
+    fn the_markers_carry_no_control_characters() {
+        for marker in [super::MINING, super::WON] {
             assert!(
-                !painted.contains('\x1b'),
-                "escape sequence reached a non-terminal sink: {painted:?}"
+                !marker.chars().any(char::is_control),
+                "a control character would be printed literally by tracing: {marker:?}"
             );
         }
-    }
-
-    /// The words scripts grep for must survive colouring untouched.
-    #[test]
-    fn keywords_are_never_split_by_a_colour_code() {
-        assert!(rate("8.30 kH/s").contains("kH/s"));
-        assert!(won("block accepted").contains("block accepted"));
     }
 }

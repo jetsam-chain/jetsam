@@ -893,16 +893,13 @@ impl BlockMiner {
                                 history_step_ms = prepare_elapsed.as_millis(),
                                 seal_ms = seal_elapsed.as_millis(),
                                 nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
-                                "{} {}  {}",
-                                crate::colour::won("✅ BLOCK WON — block accepted"),
-                                crate::colour::won(&format!("#{height}")),
-                                crate::colour::faint(&format!(
-                                    "{} JTM · pow {:.1}s · proof {:.1}s",
-                                    jetsam_chain::consensus::emission::block_reward(height)
-                                        / jetsam_chain::consensus::params::MICRO_PER_JTM,
-                                    elapsed.as_secs_f64(),
-                                    prepare_elapsed.as_secs_f64(),
-                                )),
+                                "{} BLOCK WON #{height} — {} JTM  ·  block accepted  ·  \
+                                 pow {:.1}s · proof {:.1}s",
+                                crate::colour::WON,
+                                jetsam_chain::consensus::emission::block_reward(height)
+                                    / jetsam_chain::consensus::params::MICRO_PER_JTM,
+                                elapsed.as_secs_f64(),
+                                prepare_elapsed.as_secs_f64(),
                             );
 
                             // Now safe to announce: the complete bundle is durable.
