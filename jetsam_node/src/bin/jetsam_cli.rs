@@ -17,6 +17,22 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
+
+/// Where the daemon of *this* build listens by default.
+///
+/// A testnet daemon listens on 9711, not 9701. A client that assumes the
+/// public network's port refuses to connect to the very daemon it shipped
+/// with, and says "connection refused" rather than "wrong network" — which
+/// sends the reader looking for a firewall.
+///
+/// `clap` needs a literal here, so the port cannot be interpolated from
+/// [`identity::DEFAULT_RPC_PORT`]. The two are pinned to each other by
+/// `the_default_endpoint_matches_this_build` below: change one without the
+/// other and the test fails.
+#[cfg(not(feature = "testnet"))]
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9701";
+#[cfg(feature = "testnet")]
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9711";
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 
@@ -146,7 +162,7 @@ struct Cli {
     #[arg(
         long,
         short = 'r',
-        default_value = "http://127.0.0.1:9701",
+        default_value = DEFAULT_RPC_URL,
         env = "JETSAM_RPC",
         value_name = "URL",
         global = true
@@ -490,10 +506,11 @@ fn print_error(msg: &str) {
         || msg.contains("ConnectError")
         || msg.contains("Node is not responding")
     {
-        "Node is not responding.\n\
+        format!(
+            "Node is not responding.\n\
              Is the jetsam daemon running?  Try: jetsam --mode miner\n\
-             Default RPC: http://127.0.0.1:9701  (override with --rpc)"
-            .to_string()
+             Default RPC: {DEFAULT_RPC_URL}  (override with --rpc)"
+        )
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
         // Extract amounts from error if possible
         msg.replace("InsufficientFunds", "Insufficient funds")
@@ -2358,5 +2375,26 @@ mod amount_tests {
             input_limit_exceeded_message(&error).as_deref(),
             Some("Payment cannot be created: it requires more than 8 inputs.")
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::DEFAULT_RPC_URL;
+
+    /// The advertised endpoint and the daemon's own port must agree.
+    ///
+    /// `clap` needs a literal for `default_value`, so `DEFAULT_RPC_URL`
+    /// restates a port that `identity` already owns. Two declarations of one
+    /// truth drift apart in silence unless something reads both: a testnet
+    /// client pointed at 9701 says "connection refused", and the reader goes
+    /// looking for a firewall instead of a port.
+    #[test]
+    fn the_default_endpoint_matches_this_build() {
+        let expected = format!(
+            "http://127.0.0.1:{}",
+            jetsam_chain::consensus::identity::DEFAULT_RPC_PORT
+        );
+        assert_eq!(DEFAULT_RPC_URL, expected);
     }
 }
