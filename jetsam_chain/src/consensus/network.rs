@@ -34,23 +34,39 @@ use std::str::FromStr;
 
 /// Which network this node participates in.
 ///
-/// Only mainnet is supported by this release. Attempting to parse
-/// any other string returns
-/// an error at startup so misconfigured nodes fail fast.
+/// One binary serves exactly one network: the chain identity, the genesis and
+/// the address prefix are all fixed at compile time, so a node cannot switch at
+/// runtime and the enum has a single variant on purpose.
+///
+/// What that variant is *called* does depend on the build, and it did not:
+/// a testnet node announced `· mainnet` in its startup banner and in its logs
+/// while mining an entirely different chain. That line is what an operator
+/// reads when asked which network they are on, and reading it wrong is how a
+/// coordinated fork goes wrong.
+///
+/// Parsing follows the same rule: a build rejects the other network's name, so
+/// a stale command line fails at startup instead of being quietly ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NetworkKind {
-    /// Jetsam mainnet.
+    /// The one network this build serves.
     #[default]
     Mainnet,
 }
 
+/// The name of the network this binary was built for.
+pub const THIS_NETWORK: &str = if cfg!(feature = "testnet") {
+    "testnet"
+} else {
+    "mainnet"
+};
+
 impl NetworkKind {
     pub fn as_str(&self) -> &'static str {
-        "mainnet"
+        THIS_NETWORK
     }
 
     pub fn is_mainnet(&self) -> bool {
-        true
+        !cfg!(feature = "testnet")
     }
 }
 
@@ -64,9 +80,9 @@ impl FromStr for NetworkKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "mainnet" => Ok(Self::Mainnet),
+            s if s == THIS_NETWORK => Ok(Self::Mainnet),
             other => Err(format!(
-                "unknown network '{other}'; only 'mainnet' is supported"
+                "unknown network '{other}'; this build serves '{THIS_NETWORK}'"
             )),
         }
     }
@@ -228,16 +244,47 @@ mod tests {
         );
     }
 
+    /// What the node prints is the network it actually mines.
+    ///
+    /// The banner, the logs and `is_mainnet()` all read this, and a build that
+    /// names the wrong one is worse than a build that names none: it answers
+    /// "which network are you on?" confidently and wrongly.
     #[test]
-    fn parse_mainnet() {
-        let k: NetworkKind = "mainnet".parse().unwrap();
-        assert_eq!(k.to_string(), "mainnet");
-        assert!(k.is_mainnet());
+    fn a_build_names_the_network_it_serves() {
+        let k = NetworkKind::default();
+
+        #[cfg(feature = "testnet")]
+        {
+            assert_eq!(k.as_str(), "testnet");
+            assert_eq!(k.to_string(), "testnet");
+            assert!(!k.is_mainnet());
+        }
+
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(k.as_str(), "mainnet");
+            assert_eq!(k.to_string(), "mainnet");
+            assert!(k.is_mainnet());
+        }
+
+        // Parsing round-trips with whatever this build is.
+        let parsed: NetworkKind = THIS_NETWORK.parse().unwrap();
+        assert_eq!(parsed, k);
     }
 
+    /// A stale command line must fail loudly, not be ignored.
     #[test]
-    fn parse_unknown_fails() {
+    fn parse_rejects_every_other_network() {
         assert!("devnet".parse::<NetworkKind>().is_err());
-        assert!("testnet".parse::<NetworkKind>().is_err());
+
+        // Including the *other* real network: a testnet binary handed
+        // `mainnet` on its command line is a misconfiguration, and refusing it
+        // at startup is cheaper than discovering it from a fork.
+        let other = if THIS_NETWORK == "mainnet" {
+            "testnet"
+        } else {
+            "mainnet"
+        };
+        assert!(other.parse::<NetworkKind>().is_err());
     }
 }
