@@ -1202,6 +1202,7 @@ fn prepare_history_step_ghost_authorization() -> Result<
 
 mod config;
 mod embedded_history_step_pack;
+mod log_highlight;
 mod sync_phase_telemetry;
 mod wallet;
 use config::NodeConfig;
@@ -1880,12 +1881,18 @@ async fn main() -> anyhow::Result<()> {
     // sequences into every log file, which made `grep` match on invisible
     // bytes and turned an ordinary log into noise wherever it was read.
     let colour = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // The miner's two lines are tinted by `log_highlight` as they are written,
+    // not by the event that carries them: `tracing` escapes control characters
+    // in anything an event supplies, so colour put in a message prints as
+    // literal `\x1b[...]` text. See that module for the whole story.
+    let writer = move || log_highlight::Highlighter::new(std::io::stdout(), colour);
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .with_timer(UtcHms) // HH:MM:SS instead of full ISO timestamp
         .with_target(false) // no module path clutter
         .with_thread_ids(false)
         .with_ansi(colour)
+        .with_writer(writer)
         .compact() // single-line events
         .init();
 
@@ -15117,7 +15124,8 @@ fn print_startup_banner(
         row(
             "mining",
             &format!(
-                "{reward:.2} JTM/block   coinbase  {cb}",
+                "{reward:.2} {}/block   coinbase  {cb}",
+                jetsam_chain::consensus::identity::TICKER,
                 reward = block_reward_eld
             ),
         );
