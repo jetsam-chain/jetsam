@@ -361,20 +361,85 @@ mod tests {
         // change to a profile field — not just the two above — moves this and
         // partitions the network at installation.
         assert_eq!(
-            profile.profile_id, PRE_ACTIVATION_PROFILE_ID,
+            profile.profile_id,
+            pre_activation_profile_id(),
             "the advertised network profile is no longer the one live peers speak"
         );
     }
 
-    /// Profile id for `TEST_PROOF_BANK_ID` under the pre-activation baseline,
-    /// i.e. the profile v1.1.2 nodes on the live chain advertise today:
-    /// `e05175deb0ddd4592d7cca7f708f9ff63b97852c5750c2a9c4ab80a4224ddf3d`.
-    const PRE_ACTIVATION_PROFILE_ID: [u8; 32] = [
-        0xe0, 0x51, 0x75, 0xde, 0xb0, 0xdd, 0xd4, 0x59,
-        0x2d, 0x7c, 0xca, 0x7f, 0x70, 0x8f, 0x9f, 0xf6,
-        0x3b, 0x97, 0x85, 0x2c, 0x57, 0x50, 0xc2, 0xa9,
-        0xc4, 0xab, 0x80, 0xa4, 0x22, 0x4d, 0xdf, 0x3d,
-    ];
+    /// The anchored profile id of the network **this build is linked against**.
+    ///
+    /// # Why it is chosen by the genesis and not by a `cfg`
+    ///
+    /// Every field the digest covers is shared by the two chains except
+    /// `genesis_hash`, and that one must differ: it is what makes a node of one
+    /// chain refuse a node of the other at the profile exchange, before a block
+    /// is ever offered. So there are two anchors, and one of them has to be
+    /// picked.
+    ///
+    /// `jetsam_p2p` declares no `testnet` feature — the profile is a property of
+    /// the `jetsam_chain` it links, not of this crate — so
+    /// `cfg(feature = "testnet")` here is always false and would silently pick
+    /// the public network's anchor inside a test-chain build. Reading the
+    /// genesis cannot drift that way: it is the very input that makes the two
+    /// digests differ, and an unknown one stops the test instead of passing it.
+    fn pre_activation_profile_id() -> [u8; 32] {
+        /// Profile id for `TEST_PROOF_BANK_ID` under the pre-activation
+        /// baseline, i.e. what v1.1.2 nodes on the live public chain advertise:
+        /// `e05175deb0ddd4592d7cca7f708f9ff63b97852c5750c2a9c4ab80a4224ddf3d`.
+        const MAINNET: [u8; 32] = [
+            0xe0, 0x51, 0x75, 0xde, 0xb0, 0xdd, 0xd4, 0x59,
+            0x2d, 0x7c, 0xca, 0x7f, 0x70, 0x8f, 0x9f, 0xf6,
+            0x3b, 0x97, 0x85, 0x2c, 0x57, 0x50, 0xc2, 0xa9,
+            0xc4, 0xab, 0x80, 0xa4, 0x22, 0x4d, 0xdf, 0x3d,
+        ];
+        /// The same digest over the test chain's genesis:
+        /// `8a84d9a6f9440c1c74c432d0c5dd937754b554978d2bda7727f22a2d998c03f3`.
+        ///
+        /// Captured from this source tree, which is the source the nodes of that
+        /// chain run — so it is the profile those peers speak. It has never been
+        /// read off the wire: the exchange happens inside the Noise session and
+        /// the node prints the id at `debug` only. What it guarantees is what
+        /// the public anchor guarantees: no later edit to an advertised field
+        /// moves the id without a test saying so.
+        const TESTNET: [u8; 32] = [
+            0x8a, 0x84, 0xd9, 0xa6, 0xf9, 0x44, 0x0c, 0x1c,
+            0x74, 0xc4, 0x32, 0xd0, 0xc5, 0xdd, 0x93, 0x77,
+            0x54, 0xb5, 0x54, 0x97, 0x8d, 0x2b, 0xda, 0x77,
+            0x27, 0xf2, 0x2a, 0x2d, 0x99, 0x8c, 0x03, 0xf3,
+        ];
+        /// `jetsam_chain::consensus::genesis`, anchored there by
+        /// `genesis_block_id_is_canonical`.
+        const MAINNET_GENESIS_ID: [u8; 32] = [
+            0x6e, 0x59, 0x2c, 0x07, 0xbe, 0x6f, 0xd1, 0xb4,
+            0x25, 0x9e, 0xea, 0xcb, 0xf4, 0xeb, 0x7e, 0xb2,
+            0x94, 0x8a, 0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1,
+            0x2f, 0xda, 0xb4, 0x2c, 0x44, 0x8c, 0x5f, 0x44,
+        ];
+        /// Anchored there by
+        /// `testnet_genesis_block_id_is_canonical_and_differs_from_mainnet`.
+        const TESTNET_GENESIS_ID: [u8; 32] = [
+            0xb3, 0xef, 0xb3, 0xc1, 0xd3, 0x1f, 0xee, 0x8b,
+            0x9a, 0xee, 0x7b, 0x06, 0xcb, 0x11, 0x2f, 0xae,
+            0xa5, 0xab, 0xc1, 0xce, 0xb7, 0x35, 0xd2, 0x1c,
+            0xa5, 0xa3, 0x90, 0x1b, 0x11, 0x0f, 0x99, 0x6d,
+        ];
+
+        let genesis = block_id(&genesis_header());
+        match genesis {
+            MAINNET_GENESIS_ID => MAINNET,
+            TESTNET_GENESIS_ID => TESTNET,
+            other => panic!(
+                "this build speaks a network with genesis {}, which has no anchored \
+                 network profile: add one rather than leaving the exchange untested",
+                hex_lower(&other)
+            ),
+        }
+    }
+
+    fn hex_lower(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 
     #[test]
     fn proof_bank_identity_is_part_of_the_network_profile() {

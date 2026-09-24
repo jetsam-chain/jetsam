@@ -675,14 +675,31 @@ mod tests {
     fn the_cursor_never_re_searches_a_range_it_already_covered() {
         // An all-ones target accepts the first nonce tried, so each pass ends
         // exactly at the point the search resumed from.
+        //
+        // The chunk is cut into one slice per rayon thread and collected with
+        // `find_map_any`, which returns *a* solution, not the lowest one.
+        // Against a target every nonce meets, every slice starts on a solution
+        // at once, so on the shared pool the nonce that came back was whichever
+        // thread won the race — 256 slices on this machine, 256 possible
+        // answers, and the assertion below held only when slice zero won.
+        // Pinning a one-thread pool leaves a single slice, which is what makes
+        // these two nonces the only ones the search can return.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool");
         let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
         let far = Instant::now() + Duration::from_secs(30);
         let mut cursor = 700u128;
 
-        let first = search_nonce(&fields, &[0xff; 32], far, &mut cursor, false).expect("easy target");
+        let first = pool
+            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false))
+            .expect("easy target");
         assert_eq!(first, 700);
 
-        let second = search_nonce(&fields, &[0xff; 32], far, &mut cursor, false).expect("easy target");
+        let second = pool
+            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false))
+            .expect("easy target");
         assert_eq!(
             second,
             700 + CHUNK_SIZE,

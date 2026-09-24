@@ -1410,6 +1410,37 @@ mod tests {
         assert!(finalized_active_counts_for_parent(parent, &incomplete).is_err());
     }
 
+    /// Pre-mined nonce for the height-1 header of [`fixture_chain`]. Keeping it
+    /// fixed avoids debug-mode PoW work in CI.
+    ///
+    /// JETSAM: re-mined (`print_new_fixture_nonce`) after TowerHash and the
+    /// ASERT interval-count fix, both of which move this fixture's target
+    /// (58_902 upstream, then 359_142).
+    ///
+    /// One per network, like `consensus::genesis::GENESIS_NONCE`. This header is
+    /// a child of `genesis_header()`, and the two chains do not share a genesis,
+    /// so it is not the same proof-of-work preimage: a nonce mined for the
+    /// public network is not a solution on the test chain. Every test that
+    /// appends this fixture failed there with `InvalidPoW`.
+    #[cfg(not(feature = "testnet"))]
+    const FIXTURE_CHAIN_NONCE: u128 = 162_878;
+    /// Mined for the test chain's genesis by `print_new_fixture_nonce` under
+    /// `--features testnet`.
+    #[cfg(feature = "testnet")]
+    const FIXTURE_CHAIN_NONCE: u128 = 289_608;
+
+    /// Pre-mined nonce for [`native_coinbase_child`]'s coinbase-only template.
+    ///
+    /// JETSAM: re-mined (`print_new_native_coinbase_child_nonce`) after TowerHash
+    /// and the ASERT interval-count fix (382_055 upstream, then 422_266). One per
+    /// network, for the reason given on [`FIXTURE_CHAIN_NONCE`].
+    #[cfg(not(feature = "testnet"))]
+    const NATIVE_COINBASE_CHILD_NONCE: u128 = 31_746;
+    /// Mined for the test chain's genesis by
+    /// `print_new_native_coinbase_child_nonce` under `--features testnet`.
+    #[cfg(feature = "testnet")]
+    const NATIVE_COINBASE_CHILD_NONCE: u128 = 67_139;
+
     fn fixture_chain() -> &'static [BlockHeader] {
         static HEADERS: OnceLock<Vec<BlockHeader>> = OnceLock::new();
         HEADERS.get_or_init(|| {
@@ -1429,12 +1460,7 @@ mod tests {
                     timestamp,
                     height,
                     miner_address: parent.miner_address,
-                    // Pre-mined for this exact deterministic fixture. Keeping
-                    // it fixed avoids debug-mode PoW work in CI.
-                    // JETSAM: re-mined (print_new_fixture_nonce) after TowerHash
-                    // and the ASERT interval-count fix, both of which move this
-                    // fixture's target (58_902 upstream, then 359_142).
-                    nonce: 162_878,
+                    nonce: FIXTURE_CHAIN_NONCE,
                     // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
                     difficulty_target: next_target(
                         anchor_height,
@@ -1492,11 +1518,7 @@ mod tests {
             difficulty_target,
         )
         .expect("build native-valid coinbase child")
-        // Pre-mined for this exact deterministic coinbase-only template.
-        // JETSAM: re-mined (print_new_native_coinbase_child_nonce) after
-        // TowerHash and the ASERT interval-count fix, both of which move this
-        // fixture's target (382_055 upstream, then 422_266).
-        .into_block(31_746)
+        .into_block(NATIVE_COINBASE_CHILD_NONCE)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a
