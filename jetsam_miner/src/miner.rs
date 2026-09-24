@@ -893,11 +893,12 @@ impl BlockMiner {
                                 history_step_ms = prepare_elapsed.as_millis(),
                                 seal_ms = seal_elapsed.as_millis(),
                                 nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
-                                "{} BLOCK WON #{height} — {} JTM  ·  block accepted  ·  \
+                                "{} BLOCK WON #{height} — {} {}  ·  block accepted  ·  \
                                  pow {:.1}s · proof {:.1}s",
                                 crate::colour::WON,
                                 jetsam_chain::consensus::emission::block_reward(height)
                                     / jetsam_chain::consensus::params::MICRO_PER_JTM,
+                                jetsam_chain::consensus::identity::TICKER,
                                 elapsed.as_secs_f64(),
                                 prepare_elapsed.as_secs_f64(),
                             );
