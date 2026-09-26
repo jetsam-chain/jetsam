@@ -9885,6 +9885,24 @@ async fn handle_p2p_events(
                                     );
                                 }
                             }
+                        } else if header_rejection_looks_like_a_fork(&e) {
+                            // Loud on purpose. This is what a consensus change
+                            // looks like from the inside, and it used to be
+                            // invisible: both sides reject each other, neither
+                            // bans, nothing is logged above `debug`, and the
+                            // operator finds out from a stalled explorer hours
+                            // later. Naming the peer is the point — it is the
+                            // list of who has not upgraded.
+                            tracing::warn!(
+                                peer = %from,
+                                height,
+                                err = %e,
+                                "this peer's block was refused by a CONSENSUS rule — \
+                                 one of us is on the wrong side of a fork. Check that \
+                                 both nodes run the release the activation height \
+                                 belongs to; neither side will follow the other until \
+                                 they do."
+                            );
                         } else {
                             tracing::debug!(
                                 peer = %from,
@@ -15060,6 +15078,50 @@ impl tracing_subscriber::fmt::time::FormatTime for UtcHms {
 // ---------------------------------------------------------------------------
 // Startup banner
 // ---------------------------------------------------------------------------
+
+/// Whether a rejected header means the peer is on the other side of a fork.
+///
+/// A consensus change makes two honest nodes reject each other's blocks, and
+/// the rejection is the only sign of it. [`ConsensusError::BadDifficultyTarget`]
+/// is what a node that has not upgraded returns for the activation block, whose
+/// target is the anchor constant rather than its own ASERT expectation;
+/// [`ConsensusError::InvalidPoW`] is what a node past the fork returns for a
+/// block still proved under the old digest. Either way both sides go quiet and
+/// keep extending chains the other will never read.
+///
+/// Every other precheck failure is ordinary traffic — a stale announcement, a
+/// competing parent, a peer mid-sync — and stays at `debug`. Raising all of them
+/// would bury this one, which is the outcome this exists to prevent.
+fn header_rejection_looks_like_a_fork(error: &jetsam_chain::consensus::ConsensusError) -> bool {
+    use jetsam_chain::consensus::ConsensusError::{BadDifficultyTarget, InvalidPoW};
+    matches!(error, BadDifficultyTarget | InvalidPoW)
+}
+
+#[cfg(test)]
+mod fork_rejection_tests {
+    use super::header_rejection_looks_like_a_fork as looks_like_a_fork;
+    use jetsam_chain::consensus::ConsensusError;
+
+    /// The two a consensus change produces, on either side of it.
+    #[test]
+    fn the_two_signatures_of_a_crossing_are_recognised() {
+        assert!(looks_like_a_fork(&ConsensusError::BadDifficultyTarget));
+        assert!(looks_like_a_fork(&ConsensusError::InvalidPoW));
+    }
+
+    /// Ordinary rejections must stay quiet, or the one that matters is buried.
+    #[test]
+    fn ordinary_rejections_stay_quiet() {
+        for error in [
+            ConsensusError::BadParentHash,
+            ConsensusError::BadHeight,
+            ConsensusError::BadTimestamp,
+            ConsensusError::TooManyTxs,
+        ] {
+            assert!(!looks_like_a_fork(&error), "{error:?} would be shouted about");
+        }
+    }
+}
 
 /// The notice shown when this start created the wallet instead of loading one.
 ///
