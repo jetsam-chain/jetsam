@@ -3325,6 +3325,14 @@ impl NetworkEventReceiver {
     }
 }
 
+/// Queue depth at which the control plane is actually backed up.
+///
+/// Reserved control and header lanes are short by design; a single queued
+/// request is normal traffic. Warning on one made the log cry wolf every
+/// fifteen seconds, which is worse than silence: it trains the reader to
+/// ignore the level that carries a fork partition.
+const CONTROL_QUEUE_PRESSURE: usize = 16;
+
 // Recoverable gossip is deliberately separate from required exact-object and
 // snapshot results. Backpressure begins before a second data wave can
 // accumulate without delaying header/control delivery.
@@ -4325,10 +4333,18 @@ async fn run_swarm(
                     active_data_serving_slots,
                     outstanding_data_serving_slots,
                 });
-                if queues.control != 0
-                    || queues.header != 0
-                    || command_queues.control != 0
-                    || command_queues.header != 0
+                // "Pressure" used to mean any non-empty queue. One request
+                // waiting is how a healthy node works, so the warning fired
+                // every fifteen seconds forever and taught its reader to skip
+                // warnings — at which point the one that matters, a peer
+                // refused by a consensus rule on fork day, is skipped too.
+                //
+                // The threshold is a backlog, not an occupant. Below it the same
+                // figures still go out at `debug` for anyone who wants them.
+                if queues.control >= CONTROL_QUEUE_PRESSURE
+                    || queues.header >= CONTROL_QUEUE_PRESSURE
+                    || command_queues.control >= CONTROL_QUEUE_PRESSURE
+                    || command_queues.header >= CONTROL_QUEUE_PRESSURE
                 {
                     tracing::warn!(
                         control_queue = queues.control,
