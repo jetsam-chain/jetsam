@@ -1842,15 +1842,53 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
         Some(n) => n.to_string(),
         None => "all".to_string(),
     };
-    eprintln!("Benchmarking TowerHash for {seconds}s on {width} thread(s)...");
-    let result = jetsam_miner::bench_towerhash(Duration::from_secs(seconds), cpu_threads);
-    println!(
-        "TowerHash rate: {}  ({} threads, {} per thread)",
-        jetsam_miner::format_hashrate(result.hashes_per_second()),
-        result.threads,
-        jetsam_miner::format_hashrate(result.per_thread_hps()),
-    );
-    println!("This is the rate `jetsam --mode miner` searches at on this machine.");
+    // Two digests, and the one that matters depends on the height. Reporting
+    // only the sponge was wrong by about 88x once the fork is armed, and an
+    // operator sizing their thread count on it drives the machine into SMT
+    // contention. Both are printed, and the line that says which one applies
+    // is not optional.
+    let activation = jetsam_chain::consensus::params::V1_4_ACTIVATION_HEIGHT;
+    let line = |label: &str, r: &jetsam_miner::BenchResult| {
+        println!(
+            "{label}: {}  ({} threads, {} per thread)",
+            jetsam_miner::format_hashrate(r.hashes_per_second()),
+            r.threads,
+            jetsam_miner::format_hashrate(r.per_thread_hps()),
+        );
+    };
+
+    eprintln!("Benchmarking the sponge digest for {seconds}s on {width} thread(s)...");
+    let sponge = jetsam_miner::bench_towerhash(Duration::from_secs(seconds), cpu_threads);
+    line("sponge digest", &sponge);
+
+    match activation {
+        Some(height) => {
+            eprintln!("Benchmarking the walked digest for {seconds}s on {width} thread(s)...");
+            let walk = jetsam_miner::bench_towerwalk(Duration::from_secs(seconds), cpu_threads);
+            line("walked digest", &walk);
+            let ratio = if walk.hashes_per_second() > 0.0 {
+                sponge.hashes_per_second() / walk.hashes_per_second()
+            } else {
+                f64::INFINITY
+            };
+            println!();
+            println!(
+                "From block {height} the chain uses the WALKED digest: that is the rate \
+                 `jetsam --mode miner` searches at, and it is {ratio:.0}x below the sponge."
+            );
+            println!(
+                "Size your --cpu-threads on the walked figure. The sponge one is kept \
+                 only to read pre-fork blocks."
+            );
+        }
+        None => {
+            println!("This is the rate `jetsam --mode miner` searches at on this machine.");
+            println!(
+                "This build has no proof-of-work activation height, so the walked digest \
+                 never runs on it."
+            );
+        }
+    }
 }
 
 #[tokio::main]
