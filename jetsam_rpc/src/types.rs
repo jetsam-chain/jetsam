@@ -644,6 +644,19 @@ pub struct MiningInfo {
     /// coins land outside this wallet — which is the intended effect of
     /// `--miner-address`, and a common surprise.
     pub payout_address: Option<String>,
+    /// Whether the next block is governed by the walked proof-of-work.
+    ///
+    /// **Read this field; never derive it from the height.** The activation
+    /// height is a consensus constant of the node, and anything that hardcoded
+    /// it would be wrong the day it moved — the same rule the block template's
+    /// own `pow_walk` states. A desktop wallet uses this to stop offering GPU
+    /// mining the moment the fork takes, without carrying a date or a height of
+    /// its own.
+    ///
+    /// Absent means `false`, so a caller talking to a node built before this
+    /// field keeps behaving exactly as it did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pow_walk: bool,
 }
 
 /// Runtime status of the daemon which serves this RPC endpoint.
