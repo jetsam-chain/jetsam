@@ -400,12 +400,65 @@ fn report_rate(ticker: &mut SearchTicker, height: u64, threads: usize) {
     }
 }
 
-/// Nonces handed out per pass, split evenly across the pool's threads.
+/// Nonces handed out on the first pass, before any measurement exists.
 ///
 /// At module scope because a thread's share of it — `CHUNK_SIZE / threads` —
 /// is what a thread must stop grinding once another has won, and the
 /// regression test sizes its shares from the same constant the search uses.
 const CHUNK_SIZE: u128 = 1_000_000;
+
+/// How long one pass should take, whatever the machine.
+///
+/// A pass is the granularity of everything outside the search itself:
+/// cancellation when the tip moves, preemption, and the rate line. A fixed
+/// nonce count makes that granularity a function of how fast the miner is,
+/// which is exactly backwards.
+///
+/// 1,000,000 nonces cost a 150-thread machine 9 seconds and a 4-thread one
+/// **five and a half minutes** [MEASURED 2026-09-26 on the test chain:
+/// 2.96 kH/s across four threads]. The small miner spent every pass grinding a
+/// parent the network had already replaced, finished, threw the work away, and
+/// started over — it could not win a block at any hashrate. Blocks come every
+/// 90 seconds; a pass has to be far shorter than that or the miner is
+/// permanently answering the previous question.
+const CHUNK_TARGET: Duration = Duration::from_millis(500);
+
+/// Floor and ceiling for the adaptive size.
+///
+/// The floor keeps per-pass overhead — building the pool's work, the atomics,
+/// the rate bookkeeping — from dominating on a very slow machine. The ceiling
+/// keeps a very fast one from drifting back into the behaviour this replaces.
+const CHUNK_MIN: u128 = 1_024;
+const CHUNK_MAX: u128 = 4_000_000;
+
+/// Where the first pass starts, before anything has been measured.
+///
+/// It starts at the floor and grows, rather than starting large and shrinking.
+/// Growing costs a handful of very short passes — from the floor to the
+/// ceiling is six of them — while starting large costs a slow machine its
+/// first **five and a half minutes** on a parent the network may already have
+/// replaced. That first pass is the one that decides whether a new miner ever
+/// gets into the race, so it is the one that must not be long.
+const CHUNK_START: u128 = CHUNK_MIN;
+
+/// Size the next pass from how long the last one took.
+///
+/// Damped on purpose: at most a quadrupling or a quartering per pass, so one
+/// slow pass — a scheduler hiccup, another job landing on the machine — can
+/// neither collapse the size nor blow it up. Convergence still takes a handful
+/// of passes from either end.
+fn next_chunk_size(current: u128, elapsed: Duration) -> u128 {
+    let target = CHUNK_TARGET.as_nanos().max(1);
+    let took = elapsed.as_nanos().max(1);
+    let scaled = if took >= target {
+        let down = (took / target).clamp(1, 4) as u128;
+        current / down
+    } else {
+        let up = (target / took).clamp(1, 4) as u128;
+        current.saturating_mul(up)
+    };
+    scaled.clamp(CHUNK_MIN, CHUNK_MAX)
+}
 
 /// Search for a valid PoW nonce using the current Rayon pool.
 /// Internal miner calls this inside the process-wide all-core PoW phase.
@@ -476,7 +529,11 @@ fn search_pow_parallel_from(
 
     // Hoist thread count — it never changes during a chunk.
     let num_threads = rayon::current_num_threads();
-    let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
+    // Sized from the previous pass, so a pass costs about `CHUNK_TARGET`
+    // whatever the machine. A thread's share — and therefore how long it keeps
+    // grinding a parent the network has already replaced — follows from this.
+    let mut chunk_size = CHUNK_START;
+    let mut per_thread = chunk_size.div_ceil(num_threads as u128);
     let fields = pow_header_fields(header_template);
 
     // Measures only the time actually spent searching, so the reported rate is
@@ -509,7 +566,8 @@ fn search_pow_parallel_from(
 
         // Search this chunk in parallel. Each thread reuses one canonical field
         // schedule and computes nonce digests in packed Poseidon2b batches.
-        let chunk_end = start_nonce + CHUNK_SIZE;
+        let pass_started = Instant::now();
+        let chunk_end = start_nonce + chunk_size;
         let solution: Option<PowSolution> =
             (0..num_threads).into_par_iter().find_map_any(|thread_id| {
                 let thread_start = start_nonce + (thread_id as u128) * per_thread;
@@ -569,8 +627,14 @@ fn search_pow_parallel_from(
 
         report_rate(&mut ticker, header_template.height, num_threads);
 
+        // Re-size the next pass from what this one actually cost. Done here,
+        // after the cancellation checks, so a pass that ended early on a moved
+        // tip does not teach the miner that it is faster than it is.
+        chunk_size = next_chunk_size(chunk_size, pass_started.elapsed());
+        per_thread = chunk_size.div_ceil(num_threads as u128);
+
         // Advance to the next chunk.
-        start_nonce = start_nonce.saturating_add(CHUNK_SIZE);
+        start_nonce = start_nonce.saturating_add(chunk_size);
         if start_nonce == 0 {
             // Nonce space exhausted (extremely unlikely with 128-bit nonce).
             return None;
@@ -649,5 +713,91 @@ mod pow_search_tests {
             elapsed < Duration::from_secs(10),
             "a won block waited {elapsed:?} on threads that had already lost"
         );
+    }
+
+    /// The pass has to shrink until it costs about `CHUNK_TARGET`, whatever
+    /// the machine — that duration is how long a thread keeps grinding a
+    /// parent the network has already replaced.
+    #[test]
+    fn a_pass_converges_on_its_target_duration() {
+        for hps in [740.0_f64, 2_960.0, 50_000.0, 5_000_000.0] {
+            let mut size = super::CHUNK_SIZE;
+            for _ in 0..24 {
+                let took = Duration::from_secs_f64(size as f64 / hps);
+                size = super::next_chunk_size(size, took);
+            }
+            let settled = Duration::from_secs_f64(size as f64 / hps);
+            assert!(
+                settled <= super::CHUNK_TARGET * 2 || size == super::CHUNK_MIN,
+                "at {hps} H/s a pass still costs {settled:?} (size {size})"
+            );
+        }
+    }
+
+    /// The case this exists for. A four-thread miner on the test chain ran at
+    /// 2.96 kH/s; one pass of 1,000,000 nonces took it five and a half minutes,
+    /// on a chain that produces a block every 90 seconds. It could not win.
+    #[test]
+    fn a_small_miner_reacts_faster_than_the_block_interval() {
+        const MEASURED_HPS: f64 = 2_960.0;
+        const BLOCK_INTERVAL: Duration = Duration::from_secs(90);
+
+        let before = Duration::from_secs_f64(super::CHUNK_SIZE as f64 / MEASURED_HPS);
+        assert!(
+            before > BLOCK_INTERVAL,
+            "the regression this guards no longer reproduces: {before:?}"
+        );
+
+        let mut size = super::CHUNK_SIZE;
+        for _ in 0..24 {
+            let took = Duration::from_secs_f64(size as f64 / MEASURED_HPS);
+            size = super::next_chunk_size(size, took);
+        }
+        let after = Duration::from_secs_f64(size as f64 / MEASURED_HPS);
+        assert!(
+            after * 10 < BLOCK_INTERVAL,
+            "a four-thread miner still spends {after:?} per pass against a \
+             {BLOCK_INTERVAL:?} block interval"
+        );
+    }
+
+    /// The first pass is the one that decides whether a new miner joins the
+    /// race at all. Starting it at 1,000,000 nonces cost the measured
+    /// four-thread machine five and a half minutes before it could even notice
+    /// the tip had moved — adapting from the second pass onward was too late.
+    #[test]
+    fn the_very_first_pass_is_short_on_a_slow_machine() {
+        const MEASURED_HPS: f64 = 2_960.0;
+        let first = Duration::from_secs_f64(super::CHUNK_START as f64 / MEASURED_HPS);
+        assert!(
+            first <= Duration::from_secs(1),
+            "the first pass already costs {first:?} before anything is measured"
+        );
+        let old = Duration::from_secs_f64(super::CHUNK_SIZE as f64 / MEASURED_HPS);
+        assert!(
+            old > Duration::from_secs(60),
+            "the regression this guards no longer reproduces: {old:?}"
+        );
+    }
+
+    /// One slow pass must not collapse the size, and one fast pass must not
+    /// blow it up: a machine shared with other work would oscillate.
+    #[test]
+    fn a_single_odd_pass_moves_the_size_by_at_most_four() {
+        let size = 100_000_u128;
+        assert_eq!(super::next_chunk_size(size, super::CHUNK_TARGET * 1000), size / 4);
+        assert_eq!(super::next_chunk_size(size, super::CHUNK_TARGET / 1000), size * 4);
+        assert_eq!(super::next_chunk_size(size, super::CHUNK_TARGET), size);
+    }
+
+    /// Never zero, never unbounded — a zero pass would spin without hashing.
+    #[test]
+    fn the_size_stays_inside_its_floor_and_ceiling() {
+        assert_eq!(super::next_chunk_size(1, Duration::from_secs(3600)), super::CHUNK_MIN);
+        assert_eq!(
+            super::next_chunk_size(u128::MAX, Duration::from_nanos(1)),
+            super::CHUNK_MAX
+        );
+        assert!(super::next_chunk_size(super::CHUNK_MIN, Duration::from_secs(9)) >= super::CHUNK_MIN);
     }
 }
