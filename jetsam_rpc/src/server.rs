@@ -2557,6 +2557,10 @@ impl JetsamApiServer for RpcHandler {
             payout_address: (self.rpc_is_loopback || self.mining_key.is_some())
                 .then(|| self.resolved_mining_payout().ok().map(|a| a.to_bech32()))
                 .flatten(),
+            // The block a miner would build NEXT, same height the reward above
+            // is computed for. A caller that asked about the tip instead would
+            // flip one block late, i.e. exactly once, on the block that matters.
+            pow_walk: jetsam_chain::consensus::params::v1_4_active(height.saturating_add(1)),
         })
     }
 
