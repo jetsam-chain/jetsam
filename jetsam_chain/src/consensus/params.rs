@@ -423,17 +423,268 @@ pub(crate) const fn anchor_target_is_mineable(target: [u8; 32]) -> bool {
     !le256_lt_const(&target, &V1_4_ANCHOR_FLOOR) && !le256_lt_const(&GENESIS_TARGET, &target)
 }
 
-/// The hardest anchor target a real network could be asking for: genesis
-/// shifted right by 32 bits, i.e. 2^206.
+/// `2^exp` as a little-endian 256-bit target.
 ///
-/// Derived from [`GENESIS_TARGET`] rather than written out, so the two cannot
-/// drift apart. `GENESIS_TARGET` sets bit 6 of byte 29; moving that byte four
-/// places down divides the value by 2^32.
-pub const V1_4_ANCHOR_FLOOR: [u8; 32] = {
+/// Targets in this protocol are compared as 256-bit integers, and every value
+/// this module carves is a power of two — one bit set, the rest zero. Writing
+/// the byte and the bit by hand is how a constant ends up one byte off, so it
+/// is arithmetic here instead.
+pub const fn two_pow_target(exp: u32) -> [u8; 32] {
+    assert!(exp < 256, "a 256-bit target cannot hold 2^256 or beyond");
     let mut t = [0u8; 32];
-    t[29 - 4] = GENESIS_TARGET[29];
+    t[(exp / 8) as usize] = 1u8 << (exp % 8);
     t
-};
+}
+
+const fn targets_eq(a: [u8; 32], b: [u8; 32]) -> bool {
+    let mut i = 0;
+    while i < 32 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Ties [`two_pow_target`] to the constant the genesis block actually carries.
+/// If either moves, this stops the build rather than letting the two drift.
+const _: () = assert!(
+    targets_eq(two_pow_target(238), GENESIS_TARGET),
+    "GENESIS_TARGET is 2^238; two_pow_target no longer agrees with it"
+);
+
+/// The hardest anchor target a real network could be asking for: **2^226**.
+///
+/// # Why it moved up from 2^206
+///
+/// 2^206 excluded zero and a byte-reversed genesis, and nothing else. It did
+/// **not** exclude the mistake that actually threatens this fork: copying the
+/// target the live network carries the day it is armed. The public chain runs at
+/// **2^220.62** [MEASURED 2026-09-26 over blocks 21437-21537, 95.6 s per block],
+/// which is 4.5e10 attempts — about 470 MH/s of the sponge on GPUs. The same
+/// number under the walked digest is **four days for the first block on the
+/// operator's whole measured CPU fleet** (213 kH/s), and **seventeen days on a
+/// single EPYC socket** (46.7 kH/s) — the "fifteen days" quoted while this was
+/// being decided was the per-socket figure, not the fleet's. Either way ASERT
+/// never recovers from a block that does not arrive, and that value sat
+/// comfortably inside the old interval.
+///
+/// # What 2^226 admits and rejects
+///
+/// It rejects everything at or below 2^226. The live target sits at 2^220.62,
+/// so it is out by a factor of **42** — not a comfortable margin, a deliberate
+/// one: the floor has to sit close enough to plausible values to catch this
+/// mistake, and any looser lets it through.
+///
+/// 2^226 is equilibrium for a network of about **12 MH/s** of walked digest.
+/// With the eightfold easing the design applies, the largest fleet whose anchor
+/// still clears the floor runs at roughly **1.5 MH/s** — seven times the 213 kH/s
+/// measured here. Beyond that the floor would have to move too, and whoever
+/// moves it will be re-measuring anyway: the anchor is read exactly once, at one
+/// height, from a measurement taken just before arming. Sizing this interval for
+/// a network that does not exist is what made the old floor useless.
+pub const V1_4_ANCHOR_FLOOR: [u8; 32] = two_pow_target(226);
+
+/// The floor has to reject the one value that would stop the chain for good.
+const _: () = assert!(
+    le256_lt_const(&two_pow_target(221), &V1_4_ANCHOR_FLOOR),
+    "the floor must reject the target the live network carries (2^220.62): \
+     copying it across the fork is fifteen days for the first block"
+);
+const _: () = assert!(
+    le256_lt_const(&V1_4_ANCHOR_FLOOR, &GENESIS_TARGET),
+    "the floor must stay below the easiest target the ladder can issue"
+);
+
+/// The value the public network should carry when it is armed: **2^235**.
+///
+/// Not wired to anything — [`V1_4_ANCHOR_TARGET`] is still `None` on this
+/// profile, and `wire_limits::tests::the_pow_fork_cannot_be_armed_without_its_anchor_target`
+/// keeps the height and the target armed together or not at all. Arming is then
+/// two edits whose number has already been checked by the tests below.
+///
+/// # Where it comes from
+///
+/// [MEASURED 2026-09-26] the operator's CPU fleet produces **213 kH/s** of
+/// walked digest in its current state (Veld running on most machines), rounded
+/// down to **200 kH/s** as the nominal. epyc1 alone gives 93.4 kH/s across 256
+/// threads — 46.7 kH/s per socket, not the 34.6 estimated earlier.
+///
+/// Equilibrium at that rate is `2^256 / (200_000 * 90)` = 2^231.9. The design
+/// asks for eight times easier, which lands on **2^235** once rounded to a
+/// single set bit: `2^21` = 2 097 152 attempts per block, 10.5 s of search at
+/// the nominal rate, on top of 14-31 s of HistoryStep proving.
+///
+/// # Why not 2^234, the literal fourfold
+///
+/// The operator's constraint is that the **first block must never exceed ten
+/// minutes**. Simulated over 400 draws: 2^235 holds that down to an eighth of
+/// the measured fleet (102 s mean, 378 s at p99), while 2^234 fails 3 % of the
+/// time at an eighth and 29 % at a tenth. The cost of the extra slack is a burst
+/// of 25-40 s blocks for one to two hours while ASERT climbs back — coins
+/// arriving sooner in wall-clock, never more of them, since emission is indexed
+/// on height.
+pub const V1_4_MAINNET_ANCHOR_CANDIDATE: [u8; 32] = two_pow_target(235);
+
+const _: () = assert!(
+    anchor_target_is_mineable(V1_4_MAINNET_ANCHOR_CANDIDATE),
+    "the candidate anchor must itself pass the range check it will be held to"
+);
+
+// ---------------------------------------------------------------------------
+// Reading an anchor back against the measurement it came from
+// ---------------------------------------------------------------------------
+
+/// Expected attempts before one digest satisfies `target`: `2^256 / target`.
+///
+/// `f64` on purpose. This is not consensus — nothing here is read while a block
+/// is validated — it is the arithmetic an operator has to be able to run before
+/// carving a constant, and 53 bits of mantissa is four more digits than the
+/// decision needs.
+pub fn expected_attempts(target: &[u8; 32]) -> f64 {
+    let mut value = 0.0_f64;
+    // Little-endian: byte 31 is the most significant.
+    for byte in target.iter().rev() {
+        value = value * 256.0 + *byte as f64;
+    }
+    if value <= 0.0 {
+        return f64::INFINITY;
+    }
+    2.0_f64.powi(256) / value
+}
+
+/// Seconds one block takes at `hashes_per_second`, search only.
+///
+/// The HistoryStep proof comes on top and is not a function of the target:
+/// 14 s on 254 threads, 31 s on four [MEASURED 2026-09-26 on the test chain].
+pub fn expected_search_seconds(target: &[u8; 32], hashes_per_second: f64) -> f64 {
+    if !(hashes_per_second > 0.0) {
+        return f64::INFINITY;
+    }
+    expected_attempts(target) / hashes_per_second
+}
+
+/// The check the comment above [`V1_4_ANCHOR_FLOOR`] asks for, as code.
+///
+/// An anchor is only ever right *relative to a measured rate*. This says how
+/// many times easier than equilibrium a candidate is at that rate: the design
+/// asks for 4 to 8, a value near 1 means the chain will not accelerate at all,
+/// and a value below 1 means the first block is **slower** than the target
+/// interval — the direction that stops the chain.
+///
+/// Returns `None` when the rate is not a measurement.
+pub fn anchor_easing_factor(target: &[u8; 32], hashes_per_second: f64) -> Option<f64> {
+    if !(hashes_per_second > 0.0) {
+        return None;
+    }
+    let equilibrium_seconds = BLOCK_TIME as f64;
+    Some(equilibrium_seconds / expected_search_seconds(target, hashes_per_second))
+}
+
+#[cfg(test)]
+mod anchor_arithmetic_tests {
+    use super::*;
+
+    /// The fleet rate this candidate was carved from [MEASURED 2026-09-26].
+    const FLEET_HPS: f64 = 200_000.0;
+    /// The operator's hard constraint on the first post-fork block.
+    const FIRST_BLOCK_CEILING_SECONDS: f64 = 600.0;
+    /// Worst HistoryStep proof measured, four threads.
+    const PROOF_SECONDS: f64 = 31.0;
+
+    #[test]
+    fn the_helper_agrees_with_the_genesis_constant() {
+        // 2^256 / 2^238 = 2^18.
+        let attempts = expected_attempts(&GENESIS_TARGET);
+        assert!((attempts - 2.0_f64.powi(18)).abs() < 1.0, "{attempts}");
+    }
+
+    /// The number in the docs: 2^21 attempts, about ten and a half seconds.
+    #[test]
+    fn the_candidate_asks_for_the_attempts_its_comment_claims() {
+        let attempts = expected_attempts(&V1_4_MAINNET_ANCHOR_CANDIDATE);
+        assert!(
+            (attempts - 2_097_152.0).abs() < 1.0,
+            "the candidate no longer asks for 2^21 attempts: {attempts}"
+        );
+        let search = expected_search_seconds(&V1_4_MAINNET_ANCHOR_CANDIDATE, FLEET_HPS);
+        assert!(
+            (10.0..11.0).contains(&search),
+            "search at the measured fleet rate is {search:.1} s, not ~10.5"
+        );
+    }
+
+    /// The design asks for four to eight times easier than equilibrium.
+    #[test]
+    fn the_candidate_sits_in_the_easing_band_the_design_asks_for() {
+        let easing = anchor_easing_factor(&V1_4_MAINNET_ANCHOR_CANDIDATE, FLEET_HPS)
+            .expect("a measured rate");
+        assert!(
+            (4.0..=16.0).contains(&easing),
+            "easing factor is {easing:.1}x; the design argues for 4-8x and \
+             anything at or below 1x stops the chain"
+        );
+    }
+
+    /// The operator's constraint, at the nominal rate and down to an eighth of
+    /// it. This is the assertion that would have caught a copied mainnet target.
+    #[test]
+    fn the_first_block_stays_under_ten_minutes_down_to_an_eighth_of_the_fleet() {
+        for divisor in [1.0, 2.0, 4.0, 8.0] {
+            let hps = FLEET_HPS / divisor;
+            let first = expected_search_seconds(&V1_4_MAINNET_ANCHOR_CANDIDATE, hps)
+                + PROOF_SECONDS;
+            assert!(
+                first < FIRST_BLOCK_CEILING_SECONDS,
+                "at 1/{divisor} of the measured fleet the first block takes \
+                 {first:.0} s, past the {FIRST_BLOCK_CEILING_SECONDS:.0} s ceiling"
+            );
+        }
+    }
+
+    /// The mistake the floor exists for, stated as a measurement rather than a
+    /// range: the live network's own target is fifteen days per block once the
+    /// GPUs are gone.
+    #[test]
+    fn the_live_mainnet_target_would_stall_the_chain_and_is_rejected() {
+        // 2^220.62 measured; 2^220 is the nearest power of two below it, so the
+        // real value is harder still.
+        let live = two_pow_target(220);
+        let days = expected_search_seconds(&live, FLEET_HPS) / 86_400.0;
+        assert!(
+            days > 3.0,
+            "the premise of the floor no longer holds: {days:.1} days on the \
+             whole fleet"
+        );
+        // And on one socket, which is what a single operator would bring.
+        let socket_days = expected_search_seconds(&live, 46_700.0) / 86_400.0;
+        assert!(socket_days > 14.0, "{socket_days:.1} days on one socket");
+        assert!(
+            !anchor_target_is_mineable(live),
+            "the floor must reject the live target; it is the error that stops \
+             the chain with no way back"
+        );
+    }
+
+    /// The classic slip on a little-endian constant, for this exact value.
+    #[test]
+    fn the_candidate_reversed_is_rejected() {
+        let mut reversed = V1_4_MAINNET_ANCHOR_CANDIDATE;
+        reversed.reverse();
+        assert!(
+            !anchor_target_is_mineable(reversed),
+            "a byte-reversed anchor must not pass the range check"
+        );
+    }
+
+    #[test]
+    fn a_rate_that_is_not_a_measurement_yields_nothing() {
+        assert!(anchor_easing_factor(&GENESIS_TARGET, 0.0).is_none());
+        assert!(anchor_easing_factor(&GENESIS_TARGET, -1.0).is_none());
+        assert_eq!(expected_attempts(&[0u8; 32]), f64::INFINITY);
+    }
+}
 
 /// `a < b` on two little-endian 256-bit integers, in a `const` context.
 ///
@@ -1299,8 +1550,23 @@ mod tests {
         // ever mine it. It sat inside the old interval; the floor excludes it,
         // along with every typo between it and 2^206.
         assert!(!anchor_target_is_mineable(MIN_TARGET));
-        let mut just_under_floor = V1_4_ANCHOR_FLOOR;
-        just_under_floor[25] = 0x3f; // one notch below 2^206
+        // One notch below the floor, derived from it so the two cannot drift:
+        // the floor is a single set bit, so clearing it and setting every lower
+        // bit gives exactly `floor - 1`.
+        let just_under_floor = {
+            let mut t = [0u8; 32];
+            let mut i = 0;
+            while i < 32 {
+                if V1_4_ANCHOR_FLOOR[i] != 0 {
+                    t[i] = V1_4_ANCHOR_FLOOR[i] - 1;
+                    break;
+                }
+                t[i] = 0xff;
+                i += 1;
+            }
+            t
+        };
+        assert!(le256_lt_const(&just_under_floor, &V1_4_ANCHOR_FLOOR));
         assert!(!anchor_target_is_mineable(just_under_floor));
 
         // Zero: `digest < 0` holds for no digest, so the activation block can
@@ -1344,12 +1610,20 @@ mod tests {
         // And it is refused anyway.
         assert!(!anchor_target_is_mineable(reversed));
 
-        // The floor leaves every plausible anchor alone. A network mining at
-        // one terahash per second under the walked digest settles near 2^209,
-        // three orders of magnitude above the floor.
-        let mut terahash_era = [0u8; 32];
-        terahash_era[26] = 0x02; // 2^209
-        assert!(anchor_target_is_mineable(terahash_era));
+        // The floor leaves alone every anchor a network of this era would pick.
+        // Equilibrium for the measured fleet is 2^231.9 and the candidate sits
+        // at 2^235; both clear the floor with room.
+        assert!(anchor_target_is_mineable(two_pow_target(232)));
+        assert!(anchor_target_is_mineable(V1_4_MAINNET_ANCHOR_CANDIDATE));
+
+        // ⚠️ CHANGED 2026-09-26 with the floor. A terahash-era network settles
+        // near 2^209 and is now **refused**, where the 2^206 floor admitted it.
+        // That is the price of catching the mistake that actually threatens this
+        // fork — copying the live 2^220.62 target, four days per block on the
+        // whole fleet. The anchor is read once, at one height, from a fresh
+        // measurement; a network three orders of magnitude larger than this one
+        // would be moving this floor in the same edit.
+        assert!(!anchor_target_is_mineable(two_pow_target(209)));
     }
 
     /// The compile-time comparison and the one consensus uses must agree.
