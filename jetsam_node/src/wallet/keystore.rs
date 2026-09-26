@@ -103,6 +103,19 @@ pub enum KeystoreError {
 // JETSAM CHANGE: distinct on-disk magic so a Jetsam keystore can never be
 // opened as an upstream one, or the reverse. Must stay exactly 16 bytes.
 const PLAIN_MAGIC: &[u8; 16] = b"jetsam_plainkey1";
+
+/// A wallet holding one spend secret supplied from outside, rather than a seed
+/// it derives addresses from.
+///
+/// The development-fund addresses are built this way: an operator tool drew 32
+/// bytes, called them the spend secret, and published `H(secret)` as the
+/// address. There is no seed above them, so the ordinary keystore could not
+/// hold them — and the coins at those addresses could not be moved at all.
+/// Handing that secret to the ordinary import produces a valid, empty,
+/// unrelated address, because the wallet hashes a seed once more to reach a
+/// spend secret. A separate magic makes the two impossible to confuse.
+const PLAIN_SPEND_MAGIC: &[u8; 16] = b"jetsam_spendkey1";
+
 const SECRET_LEN: usize = 32;
 const PLAIN_FILE_LEN: usize = 16 + SECRET_LEN; // 48 bytes
 
@@ -148,6 +161,79 @@ impl MasterSecret {
     pub(super) fn derive_address(&self, index: u32) -> Address {
         let secret = self.derive_spend_secret(index);
         jetsam_poseidon2b::primitives::derive_address(&secret)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WalletSecret
+// ---------------------------------------------------------------------------
+
+/// What a wallet file holds, and therefore how many addresses it can own.
+///
+/// `Seed` is the ordinary wallet: one secret, an unlimited series of addresses
+/// derived from it by index. `ImportedSpend` is one address and nothing more —
+/// its spend secret was produced elsewhere, so there is no seed to walk.
+pub(super) enum WalletSecret {
+    Seed(MasterSecret),
+    ImportedSpend(ImportedSpendSecret),
+}
+
+/// Which kind of secret a wallet file holds, for the export surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretKind {
+    /// A seed the wallet derives every address from.
+    Seed,
+    /// One spend secret supplied from outside; one address, no more.
+    ImportedSpend,
+}
+
+impl SecretKind {
+    /// The flag that restores this secret. Naming the wrong one loses the
+    /// address, so the export says it rather than leaving it to be guessed.
+    pub fn restore_flag(self) -> &'static str {
+        match self {
+            Self::Seed => "--import-wallet-secret",
+            Self::ImportedSpend => "--import-spend-secret",
+        }
+    }
+}
+
+/// A spend secret supplied from outside, held exactly as given.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub(super) struct ImportedSpendSecret([u8; SECRET_LEN]);
+
+impl ImportedSpendSecret {
+    fn spend_secret(&self) -> SpendSecret {
+        SpendSecret::from_bytes(self.0)
+    }
+}
+
+impl WalletSecret {
+    /// True when this wallet owns exactly one address and cannot derive more.
+    pub(super) fn holds_one_imported_address(&self) -> bool {
+        matches!(self, Self::ImportedSpend(_))
+    }
+
+    /// The spending secret for address index `n`.
+    ///
+    /// An imported wallet has only index 0. Callers are held to that by
+    /// `next_index`, which the loader pins to 1, so a higher index cannot be
+    /// reached through the address list, the active-address switch or a send.
+    pub(super) fn derive_spend_secret(&self, index: u32) -> SpendSecret {
+        match self {
+            Self::Seed(master) => master.derive_spend_secret(index),
+            Self::ImportedSpend(imported) => imported.spend_secret(),
+        }
+    }
+
+    /// The public address for index `n` (safe to share).
+    pub(super) fn derive_address(&self, index: u32) -> Address {
+        match self {
+            Self::Seed(master) => master.derive_address(index),
+            Self::ImportedSpend(imported) => {
+                jetsam_poseidon2b::primitives::derive_address(&imported.spend_secret())
+            }
+        }
     }
 }
 
@@ -269,37 +355,66 @@ impl Keystore {
         Ok(master)
     }
 
-    /// Load a plaintext wallet key file.
-    pub(super) fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
+    /// Load a wallet key file, whichever of the two kinds it is.
+    pub(super) fn load_plain(&self) -> Result<WalletSecret, KeystoreError> {
         let data = self.read_plain_bytes()?;
-        // JETSAM CHANGE: dispatch on the on-disk magic.
-        if encryption::is_encrypted(&data) {
-            let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
-            let secret = encryption::decode(&data, &pass)?;
-            return Ok(MasterSecret(*secret));
-        }
+        // JETSAM CHANGE: dispatch on the on-disk magic. Four shapes reach here
+        // — seed or imported spend secret, each in cleartext or sealed — and
+        // the magic is the only thing that tells them apart. Guessing is not an
+        // option: both secrets are 32 opaque bytes, and the wrong guess spends
+        // nothing while looking entirely healthy.
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
-        secret.copy_from_slice(&data[16..]);
-        let master = MasterSecret(*secret);
+        let imported = match encryption::encrypted_magic_of(&data) {
+            Some(magic) => {
+                let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
+                secret.copy_from_slice(&*encryption::decode_as(magic, &data, &pass)?);
+                magic == encryption::ENCRYPTED_SPEND_MAGIC
+            }
+            None => {
+                secret.copy_from_slice(&data[16..]);
+                &data[..16] == PLAIN_SPEND_MAGIC.as_ref()
+            }
+        };
+        let loaded = if imported {
+            WalletSecret::ImportedSpend(ImportedSpendSecret(*secret))
+        } else {
+            WalletSecret::Seed(MasterSecret(*secret))
+        };
         secret.zeroize();
-        Ok(master)
+        Ok(loaded)
     }
 
-    /// Export only the 32-byte master secret as lowercase hexadecimal.
+    /// Export the 32 secret bytes as lowercase hexadecimal, and say which kind
+    /// of secret they are.
     ///
-    /// The on-disk magic is an implementation detail and is deliberately not
-    /// exposed to the user-facing import/export surface.
-    pub(super) fn export_master_secret_hex(&self) -> Result<Zeroizing<String>, KeystoreError> {
+    /// The kind is not decoration. The same 64 characters restore a wallet only
+    /// through the matching import: fed to the other one they yield a valid,
+    /// empty, unrelated address, and a backup that restores to the wrong
+    /// address is not a backup. The on-disk magic stays an implementation
+    /// detail; what it means does not.
+    pub(super) fn export_secret_hex(
+        &self,
+    ) -> Result<(SecretKind, Zeroizing<String>), KeystoreError> {
         let data = self.read_plain_bytes()?;
         // JETSAM CHANGE: on an encrypted file the bytes after the magic are
         // ciphertext, not the secret. Exporting them would hand the user a
         // useless string and call it their key.
-        if encryption::is_encrypted(&data) {
+        if let Some(magic) = encryption::encrypted_magic_of(&data) {
             let pass = passphrase().ok_or(KeystoreError::PassphraseRequired)?;
-            let secret = encryption::decode(&data, &pass)?;
-            return Ok(Zeroizing::new(hex::encode(*secret)));
+            let secret = encryption::decode_as(magic, &data, &pass)?;
+            let kind = if magic == encryption::ENCRYPTED_SPEND_MAGIC {
+                SecretKind::ImportedSpend
+            } else {
+                SecretKind::Seed
+            };
+            return Ok((kind, Zeroizing::new(hex::encode(*secret))));
         }
-        Ok(Zeroizing::new(hex::encode(&data[PLAIN_MAGIC.len()..])))
+        let kind = if &data[..16] == PLAIN_SPEND_MAGIC.as_ref() {
+            SecretKind::ImportedSpend
+        } else {
+            SecretKind::Seed
+        };
+        Ok((kind, Zeroizing::new(hex::encode(&data[PLAIN_MAGIC.len()..]))))
     }
 
     /// Build the private on-disk key artifact from one validated master
@@ -310,6 +425,33 @@ impl Keystore {
         encoded.extend_from_slice(PLAIN_MAGIC);
         encoded.extend_from_slice(master_secret);
         encoded
+    }
+
+    /// The same artifact for a spend secret supplied from outside, sealed under
+    /// the passphrase when one is set.
+    ///
+    /// An imported secret is a treasury key far more often than a pocket one:
+    /// writing it in the clear on a machine whose operator asked for a
+    /// passphrase would be the wrong default to choose in new code. Encryption
+    /// failing is an error and not a reason to fall back to cleartext.
+    pub(super) fn encode_imported_spend_file(
+        spend_secret: &[u8; SECRET_LEN],
+    ) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
+        if let Some(pass) = passphrase() {
+            return Ok(encryption::encode_as(
+                encryption::ENCRYPTED_SPEND_MAGIC,
+                spend_secret,
+                &pass,
+            )?);
+        }
+        tracing::warn!(
+            "{PASSPHRASE_ENV} is not set: this imported spend secret is being written \
+             in cleartext. Anyone who can read this file takes the funds."
+        );
+        let mut encoded = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN));
+        encoded.extend_from_slice(PLAIN_SPEND_MAGIC);
+        encoded.extend_from_slice(spend_secret);
+        Ok(encoded)
     }
 
     fn read_plain_bytes(&self) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
@@ -358,7 +500,7 @@ impl Keystore {
         if data.len() != PLAIN_FILE_LEN {
             return Err(KeystoreError::InvalidFormat);
         }
-        if &data[..16] != PLAIN_MAGIC.as_ref() {
+        if &data[..16] != PLAIN_MAGIC.as_ref() && &data[..16] != PLAIN_SPEND_MAGIC.as_ref() {
             return Err(KeystoreError::InvalidFormat);
         }
         Ok(data)
@@ -425,6 +567,136 @@ mod tests {
         let loaded = ks.load_plain().unwrap();
         assert_eq!(secret.derive_address(0), loaded.derive_address(0));
         assert_eq!(secret.derive_address(99), loaded.derive_address(99));
+    }
+
+    /// 32 bytes drawn by an operator tool, the way the development-fund
+    /// addresses were made.
+    const RAW_SPEND: [u8; SECRET_LEN] = [0x2C; SECRET_LEN];
+
+    /// The address that secret is published as: one hash, no seed above it.
+    fn published_address(raw: [u8; SECRET_LEN]) -> Address {
+        jetsam_poseidon2b::primitives::derive_address(&SpendSecret::from_bytes(raw))
+    }
+
+    fn write_wallet(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// The whole point: a wallet carrying an imported spend secret owns the
+    /// address that secret was published as. Before this existed, the coins on
+    /// the development-fund addresses could not be moved by any binary we ship.
+    #[test]
+    fn an_imported_spend_secret_owns_the_address_it_was_published_as() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let ks = Keystore::new(&path);
+        write_wallet(
+            &path,
+            &with_passphrase(None, || {
+                Keystore::encode_imported_spend_file(&RAW_SPEND).unwrap()
+            }),
+        );
+
+        let loaded = with_passphrase(None, || ks.load_plain().unwrap());
+        assert!(loaded.holds_one_imported_address());
+        assert_eq!(loaded.derive_address(0), published_address(RAW_SPEND));
+    }
+
+    /// The trap that cost an evening: the same 64 characters restored the wrong
+    /// way give a valid, empty, entirely unrelated address. Nothing warns you —
+    /// which is why the two files carry different magics.
+    #[test]
+    fn the_same_bytes_as_a_seed_reach_a_different_address() {
+        let dir = TempDir::new().unwrap();
+        let as_seed = dir.path().join("seed.key");
+        let as_spend = dir.path().join("spend.key");
+        write_wallet(&as_seed, &Keystore::encode_plain_file(&RAW_SPEND));
+        write_wallet(
+            &as_spend,
+            &with_passphrase(None, || {
+                Keystore::encode_imported_spend_file(&RAW_SPEND).unwrap()
+            }),
+        );
+
+        let seed_address = with_passphrase(None, || {
+            Keystore::new(&as_seed).load_plain().unwrap().derive_address(0)
+        });
+        let spend_address = with_passphrase(None, || {
+            Keystore::new(&as_spend)
+                .load_plain()
+                .unwrap()
+                .derive_address(0)
+        });
+
+        assert_eq!(spend_address, published_address(RAW_SPEND));
+        assert_ne!(
+            seed_address, spend_address,
+            "reading a spend secret as a seed must not silently land on the right address"
+        );
+    }
+
+    /// An imported secret is a treasury key more often than a pocket one, so it
+    /// is sealed wherever the ordinary wallet would be — and it round-trips.
+    #[test]
+    fn an_imported_spend_secret_round_trips_through_the_sealed_format() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let ks = Keystore::new(&path);
+        write_wallet(
+            &path,
+            &with_passphrase(Some(b"a real passphrase"), || {
+                Keystore::encode_imported_spend_file(&RAW_SPEND).unwrap()
+            }),
+        );
+        assert!(
+            super::encryption::is_encrypted(&std::fs::read(&path).unwrap()),
+            "a passphrase was set, so the file must be encrypted"
+        );
+
+        let loaded = with_passphrase(Some(b"a real passphrase"), || ks.load_plain().unwrap());
+        assert!(loaded.holds_one_imported_address());
+        assert_eq!(loaded.derive_address(0), published_address(RAW_SPEND));
+
+        assert!(matches!(
+            with_passphrase(None, || ks.load_plain()),
+            Err(KeystoreError::PassphraseRequired)
+        ));
+    }
+
+    /// A backup is only a backup if it says how to restore it.
+    #[test]
+    fn the_export_names_the_import_that_restores_it() {
+        let dir = TempDir::new().unwrap();
+        let seed_path = dir.path().join("seed.key");
+        let spend_path = dir.path().join("spend.key");
+        write_wallet(&seed_path, &Keystore::encode_plain_file(&RAW_SPEND));
+        write_wallet(
+            &spend_path,
+            &with_passphrase(None, || {
+                Keystore::encode_imported_spend_file(&RAW_SPEND).unwrap()
+            }),
+        );
+
+        let expected = hex::encode(RAW_SPEND);
+        for (path, kind, flag) in [
+            (&seed_path, SecretKind::Seed, "--import-wallet-secret"),
+            (
+                &spend_path,
+                SecretKind::ImportedSpend,
+                "--import-spend-secret",
+            ),
+        ] {
+            let (found, hex_secret) =
+                with_passphrase(None, || Keystore::new(path).export_secret_hex().unwrap());
+            assert_eq!(found, kind);
+            assert_eq!(hex_secret.as_str(), expected);
+            assert_eq!(found.restore_flag(), flag);
+        }
     }
 
     #[test]

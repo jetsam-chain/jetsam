@@ -21,7 +21,7 @@ use jetsam_chain::storage::VerifiedOwnerSnapshot;
 use jetsam_poseidon2b::primitives::{Address, SpendSecret};
 use zeroize::Zeroizing;
 
-use super::keystore::{Keystore, KeystoreError, MasterSecret};
+use super::keystore::{Keystore, KeystoreError, SecretKind, WalletSecret};
 
 /// Maximum number of local addresses the built-in wallet will derive.
 /// Valid key indices are `0..MAX_WALLET_ADDRESSES`.
@@ -113,8 +113,9 @@ pub struct ActiveWalletSnapshot {
 pub struct WalletState {
     /// Path to the key file on disk.
     pub keystore_path: PathBuf,
-    /// Master secret (always present, loaded from disk at startup).
-    secret: MasterSecret,
+    /// What this wallet holds: a seed it derives addresses from, or one
+    /// imported spend secret that is a single address and nothing more.
+    secret: WalletSecret,
     /// UTXOs owned by the active address only (slot_index → utxo).
     pub utxos: HashMap<u32, WalletUtxo>,
     /// Next unused key index.
@@ -164,8 +165,12 @@ impl WalletState {
             ks.load_plain()?
         } else {
             tracing::info!(path = %key_path.display(), "creating new wallet");
-            ks.create_plain()?
+            WalletSecret::Seed(ks.create_plain()?)
         };
+        // An imported wallet owns exactly one address. Pinning the cursor here,
+        // before any stored metadata is read, is what keeps every later caller
+        // — the address list, the active-address switch, a send — on index 0.
+        let one_address_only = secret.holds_one_imported_address();
 
         let mut wallet = Self {
             keystore_path: key_path,
@@ -182,7 +187,14 @@ impl WalletState {
             pending_send_slots: HashMap::new(),
             active_index: 0,
         };
-        wallet.load_metadata();
+        if one_address_only {
+            tracing::info!(
+                address = %wallet.active_address().to_bech32(),
+                "this wallet holds one imported spend secret: one address, and no more can be derived"
+            );
+        } else {
+            wallet.load_metadata();
+        }
         wallet.load_receipts().map_err(KeystoreError::Artifact)?;
         wallet.load_history().map_err(KeystoreError::Artifact)?;
         Ok(wallet)
@@ -217,6 +229,14 @@ impl WalletState {
     /// Persist exactly one new inactive address. The active owner, UTXO cache,
     /// pending transaction state, and mining payout remain unchanged.
     pub fn create_next_inactive_address(&mut self) -> Result<(u32, Address), String> {
+        // An imported spend secret is one address. There is no seed above it to
+        // walk, so refusing here is the truth rather than a restriction.
+        if self.secret.holds_one_imported_address() {
+            return Err(
+                "this wallet holds one imported spend secret and cannot derive a second address"
+                    .into(),
+            );
+        }
         if self.next_index >= MAX_WALLET_ADDRESSES {
             return Err("wallet address limit reached".into());
         }
@@ -553,13 +573,18 @@ struct WalletMetadata {
 
 const MASTER_SECRET_HEX_LEN: usize = 64;
 
-/// Return the one 32-byte master secret that deterministically derives every
-/// wallet address. The GUI displays this explicit export and never invents a
-/// second backup-file format.
-pub fn export_generated_master_secret(wallet_key_path: &Path) -> Result<Zeroizing<String>, String> {
+/// Return this wallet's 32 secret bytes, and which kind of secret they are.
+///
+/// The GUI displays this explicit export and never invents a second backup-file
+/// format. The kind travels with the bytes because the two imports are not
+/// interchangeable: restoring a spend secret as a seed lands on an empty
+/// address that looks perfectly healthy.
+pub fn export_wallet_secret(
+    wallet_key_path: &Path,
+) -> Result<(SecretKind, Zeroizing<String>), String> {
     Keystore::new(wallet_key_path)
-        .export_master_secret_hex()
-        .map_err(|error| format!("export generated master secret: {error}"))
+        .export_secret_hex()
+        .map_err(|error| format!("export wallet secret: {error}"))
 }
 
 /// Replace the generated master secret and reset the local address cursor to
@@ -569,19 +594,51 @@ pub fn import_generated_master_secret(
     wallet_key_path: &Path,
     master_secret: &str,
 ) -> Result<(), String> {
+    let decoded = decode_secret_hex(master_secret, "Master secret")?;
+    install_replacement_wallet(wallet_key_path, Keystore::encode_plain_file(&decoded))
+}
+
+/// Make one spend secret supplied from outside this wallet's only address.
+///
+/// This is the path the development-fund addresses need and never had. Their
+/// secrets were produced by an operator tool, not by a wallet, so they are
+/// spend secrets with no seed above them — and until this existed, the coins
+/// sitting on those addresses could not be moved by any shipped binary.
+///
+/// Like its counterpart, the wallet being replaced is kept, never deleted.
+pub fn import_spend_secret(wallet_key_path: &Path, spend_secret: &str) -> Result<(), String> {
+    let decoded = decode_secret_hex(spend_secret, "Spend secret")?;
+    let key_bytes = Keystore::encode_imported_spend_file(&decoded)
+        .map_err(|error| format!("encode imported spend secret: {error}"))?;
+    install_replacement_wallet(wallet_key_path, key_bytes)
+}
+
+/// Read 64 hexadecimal characters, ignoring whitespace, into 32 bytes.
+fn decode_secret_hex(input: &str, label: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     let normalized = Zeroizing::new(
-        master_secret
+        input
             .chars()
             .filter(|character| !character.is_ascii_whitespace())
             .collect::<String>(),
     );
     if normalized.len() != MASTER_SECRET_HEX_LEN {
-        return Err("Master secret must contain exactly 64 hexadecimal characters.".into());
+        return Err(format!(
+            "{label} must contain exactly 64 hexadecimal characters."
+        ));
     }
     let mut decoded = Zeroizing::new([0u8; 32]);
     hex::decode_to_slice(normalized.as_bytes(), &mut *decoded)
-        .map_err(|_| "Master secret contains a non-hexadecimal character.".to_string())?;
-    let key_bytes = Keystore::encode_plain_file(&decoded);
+        .map_err(|_| format!("{label} contains a non-hexadecimal character."))?;
+    Ok(decoded)
+}
+
+/// Install `key_bytes` as the wallet at `wallet_key_path`, transactionally, and
+/// reset the local address cursor to address zero. Old wallet records are moved
+/// aside for rollback during this call and kept on success.
+fn install_replacement_wallet(
+    wallet_key_path: &Path,
+    key_bytes: Zeroizing<Vec<u8>>,
+) -> Result<(), String> {
     let metadata_bytes = serde_json::to_vec(&WalletMetadata {
         next_index: 1,
         active_index: 0,
@@ -1403,6 +1460,65 @@ mod tests {
         );
     }
 
+    /// A wallet built from an imported spend secret owns that one address, says
+    /// so, and refuses to invent a second one it could never spend from.
+    #[test]
+    fn an_imported_spend_secret_is_one_address_and_refuses_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("wallet.key");
+        // A wallet has to exist first, so that the import has something to keep.
+        drop(WalletState::create_or_load(key.clone()).unwrap());
+
+        let raw = [0x2C_u8; 32];
+        import_spend_secret(&key, &hex::encode(raw)).unwrap();
+
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        let expected = jetsam_poseidon2b::primitives::derive_address(
+            &jetsam_poseidon2b::primitives::SpendSecret::from_bytes(raw),
+        );
+        assert_eq!(wallet.active_address(), expected);
+        assert_eq!(wallet.next_index, 1);
+        assert_eq!(wallet.active_index, 0);
+        assert!(wallet.create_next_inactive_address().is_err());
+
+        let (kind, exported) = export_wallet_secret(&key).unwrap();
+        assert_eq!(kind, SecretKind::ImportedSpend);
+        assert_eq!(exported.as_str(), hex::encode(raw));
+
+        // The wallet that was replaced is still on disk, as it is for the other
+        // import. Losing it here would be losing someone's only key.
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wallet-replaced-")),
+            "the replaced wallet must be kept"
+        );
+    }
+
+    /// Stale metadata claiming more addresses must not move an imported wallet
+    /// off the only index it can spend from.
+    #[test]
+    fn stale_metadata_cannot_move_an_imported_wallet_off_its_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("wallet.key");
+        drop(WalletState::create_or_load(key.clone()).unwrap());
+        let raw = [0x7E_u8; 32];
+        import_spend_secret(&key, &hex::encode(raw)).unwrap();
+        std::fs::write(metadata_path(&key), r#"{"next_index":9,"active_index":4}"#).unwrap();
+
+        let wallet = WalletState::create_or_load(key).unwrap();
+        assert_eq!(wallet.active_index, 0);
+        assert_eq!(wallet.next_index, 1);
+        assert_eq!(
+            wallet.active_address(),
+            jetsam_poseidon2b::primitives::derive_address(
+                &jetsam_poseidon2b::primitives::SpendSecret::from_bytes(raw),
+            )
+        );
+    }
+
     #[test]
     fn generated_master_secret_round_trip_resets_local_wallet_records() {
         let source_dir = tempfile::tempdir().unwrap();
@@ -1413,7 +1529,8 @@ mod tests {
             source.address_at(4),
             source.address_at(8),
         ];
-        let master_secret = export_generated_master_secret(&source_key).unwrap();
+        let (kind, master_secret) = export_wallet_secret(&source_key).unwrap();
+        assert_eq!(kind, SecretKind::Seed);
         assert_eq!(master_secret.len(), 64);
         assert!(master_secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(!master_secret.bytes().any(|byte| byte.is_ascii_uppercase()));

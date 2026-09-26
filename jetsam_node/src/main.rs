@@ -1291,6 +1291,17 @@ NETWORK
 FILES
   ~/.jetsam/jetsam.toml                  configuration, written on first start
   ~/.jetsam/data/wallet.key              your keys — back this file up
+
+  This is the default directory, used whenever --data-dir is absent. A start
+  that finds no wallet.key there makes a new one, so the same executable run
+  two different ways holds two different wallets. The startup banner names the
+  directory in use, and says so when the wallet was created rather than loaded.
+
+  jetsam --export-wallet-secret          print this wallet's secret, and say
+                                         which import restores it
+  jetsam --import-wallet-secret          restore a wallet seed, read from stdin
+  jetsam --import-spend-secret           hold one address whose spend secret was
+                                         made outside a wallet, read from stdin
 ",
 )]
 struct Cli {
@@ -1419,13 +1430,32 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "10")]
     bench: Option<u64>,
 
-    /// Print the generated master secret as 64 hexadecimal characters, then exit.
-    #[arg(long, hide = true, conflicts_with = "import_wallet_secret")]
+    // No longer `hide`: this and its counterpart are how a wallet is backed up
+    // and recovered, and hiding them left the only rescue this node offers
+    // undiscoverable by the people who came looking for it.
+    /// Print this wallet's master secret as 64 hexadecimal characters, then exit.
+    /// Those characters derive every address the wallet holds: keep them safe,
+    /// and show them to nobody.
+    #[arg(long, conflicts_with = "import_wallet_secret")]
     export_wallet_secret: bool,
 
-    /// Read a 64-character master secret from stdin, replace the wallet, then exit.
-    #[arg(long, hide = true, conflicts_with = "export_wallet_secret")]
+    /// Read a 64-character master secret from stdin and make it this wallet's,
+    /// then exit. The node must be stopped. The wallet being replaced is kept
+    /// alongside it in `wallet-replaced-<timestamp>`, never deleted.
+    #[arg(long, conflicts_with_all = ["export_wallet_secret", "import_spend_secret"])]
     import_wallet_secret: bool,
+
+    /// Read a 64-character SPEND secret from stdin and make it this wallet's
+    /// only address, then exit. The node must be stopped.
+    ///
+    /// Use this for an address built outside a wallet — the development-fund
+    /// addresses are the case this exists for. Such an address has no seed
+    /// above it, so the wallet holds it as given and cannot derive a second
+    /// one. Feeding the same characters to --import-wallet-secret instead
+    /// produces a different, empty address. The wallet being replaced is kept
+    /// alongside it in `wallet-replaced-<timestamp>`, never deleted.
+    #[arg(long, conflicts_with_all = ["export_wallet_secret", "import_wallet_secret"])]
+    import_spend_secret: bool,
 
     /// Materialize one HistoryStep packed cache image, then exit.
     #[arg(long, value_enum, value_name = "CLASS", hide = true)]
@@ -2082,21 +2112,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let wallet_path = data_dir.join("wallet.key");
+    // Read before anything can create it: this is the only moment at which the
+    // difference between "loaded yours" and "made a new one" is still visible.
+    let wallet_was_created = !wallet_path.exists();
     if cli.export_wallet_secret {
-        let master_secret = wallet::state::export_generated_master_secret(&wallet_path)
-            .map_err(anyhow::Error::msg)?;
-        println!("{}", master_secret.as_str());
+        let (kind, secret) =
+            wallet::state::export_wallet_secret(&wallet_path).map_err(anyhow::Error::msg)?;
+        println!("{}", secret.as_str());
+        // The 64 characters above restore this wallet only through the import
+        // that matches them. On stderr, so that piping stdout to a file still
+        // captures the secret alone.
+        eprintln!("restore with: jetsam {}", kind.restore_flag());
         return Ok(());
     }
-    if cli.import_wallet_secret {
-        let mut master_secret = zeroize::Zeroizing::new(String::new());
+    if cli.import_wallet_secret || cli.import_spend_secret {
+        let mut secret = zeroize::Zeroizing::new(String::new());
         std::io::stdin()
             .take(4_097)
-            .read_to_string(&mut master_secret)
-            .context("read master secret from stdin")?;
-        wallet::state::import_generated_master_secret(&wallet_path, &master_secret)
-            .map_err(anyhow::Error::msg)?;
-        println!("Master secret imported");
+            .read_to_string(&mut secret)
+            .context("read secret from stdin")?;
+        if cli.import_spend_secret {
+            wallet::state::import_spend_secret(&wallet_path, &secret)
+                .map_err(anyhow::Error::msg)?;
+            println!("Spend secret imported");
+        } else {
+            wallet::state::import_generated_master_secret(&wallet_path, &secret)
+                .map_err(anyhow::Error::msg)?;
+            println!("Master secret imported");
+        }
         return Ok(());
     }
     if let Some(class) = cli.prepare_history_step_cache {
@@ -2742,7 +2785,9 @@ async fn main() -> anyhow::Result<()> {
             num_segs,
             encoded_state_bytes,
             reward,
+            &data_dir,
             wallet_bech32.as_deref(),
+            wallet_was_created,
             cfg.mining.enabled,
             miner_bech32.as_deref(),
             env!("CARGO_PKG_VERSION"),
@@ -14978,6 +15023,47 @@ impl tracing_subscriber::fmt::time::FormatTime for UtcHms {
 // Startup banner
 // ---------------------------------------------------------------------------
 
+/// The notice shown when this start created the wallet instead of loading one.
+///
+/// A node started with no `--data-dir` takes `~/.jetsam/data`, and finding no
+/// key there it makes one. That is correct, and it is also how someone mined a
+/// week into a wallet they never saw: the desktop application unpacks this same
+/// executable beside its own data folder, so double-clicking it starts a second
+/// node pointed somewhere else entirely. The only trace was one INFO line in the
+/// sync chatter. A key that did not exist a second ago is worth interrupting for.
+fn new_wallet_notice(data_dir: &Path, wallet_was_created: bool) -> Option<String> {
+    if !wallet_was_created {
+        return None;
+    }
+    Some(format!(
+        "a NEW wallet was created in {} because no wallet.key was found there.\n  \
+         If you expected an existing wallet, it is in another directory — not lost. \
+         Stop, and start again with --data-dir pointing at it.",
+        data_dir.display()
+    ))
+}
+
+#[cfg(test)]
+mod new_wallet_notice_tests {
+    use super::new_wallet_notice;
+    use std::path::Path;
+
+    #[test]
+    fn loading_an_existing_wallet_says_nothing() {
+        assert!(new_wallet_notice(Path::new("/home/someone/.jetsam/data"), false).is_none());
+    }
+
+    #[test]
+    fn a_created_wallet_names_the_directory_it_landed_in() {
+        let notice = new_wallet_notice(Path::new("/home/someone/.jetsam/data"), true)
+            .expect("a wallet that was just created must be announced");
+        assert!(
+            notice.contains("/home/someone/.jetsam/data"),
+            "the notice is useless without the directory: {notice}"
+        );
+    }
+}
+
 /// Print a startup banner after all components are initialised.
 ///
 /// Professional, dense, information-rich. Everything an operator needs
@@ -14997,7 +15083,9 @@ fn print_startup_banner(
     total_segs: usize,
     encoded_state_bytes: u64,
     block_reward_eld: f64,
+    data_dir: &Path,
     wallet_addr: Option<&str>,
+    wallet_was_created: bool,
     mining: bool,
     coinbase: Option<&str>,
     version: &str,
@@ -15113,6 +15201,11 @@ fn print_startup_banner(
         ),
     );
 
+    // Which directory this node is actually serving. Two nodes started two
+    // different ways hold two different wallets, and until this line was here
+    // the banner gave no way to tell which one was on screen.
+    row("data", &dim(&data_dir.display().to_string()));
+
     // Wallet
     if let Some(addr) = wallet_addr {
         row("wallet", &b(addr));
@@ -15135,6 +15228,11 @@ fn print_startup_banner(
 
     println!("{line}");
     println!();
+
+    if let Some(notice) = new_wallet_notice(data_dir, wallet_was_created) {
+        println!("  {} {notice}", ylw("NEW WALLET"));
+        println!();
+    }
 
     // If state is near expansion threshold, warn the operator
     if fill_pct >= 70.0 {
