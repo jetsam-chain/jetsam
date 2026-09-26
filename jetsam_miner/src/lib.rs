@@ -55,7 +55,8 @@ pub use miner::{
     BlockAppliedHook, BlockMiner, HistoryStepRuntimeSelector, MinerConfig, MinerEvent,
 };
 pub use pow::{
-    bench_towerhash, format_hashrate, local_hashrate_hps, local_pow_hashes, search_pow_parallel,
+    bench_towerhash, bench_towerwalk, format_hashrate, local_hashrate_hps, local_pow_hashes,
+    search_pow_parallel,
     BenchResult, PowSolution,
 };
 pub use proof_capacity::{

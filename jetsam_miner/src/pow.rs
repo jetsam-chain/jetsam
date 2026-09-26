@@ -215,6 +215,59 @@ impl BenchResult {
 /// `threads` selects the width; `None` uses every logical CPU the process can
 /// see. The benchmark runs in its own Rayon pool and deliberately does not feed
 /// the mining counters: a benchmark is not mining.
+/// Benchmark the **walked** digest — the one the chain uses from
+/// [`jetsam_chain::consensus::params::V1_4_ACTIVATION_HEIGHT`] onward.
+///
+/// [`bench_towerhash`] measures the sponge alone, which is what the chain used
+/// before the fork and is about **88 times faster** than the walk. An operator
+/// who sized their thread count on the sponge figure after the fork would be
+/// off by that factor and would drive the machine straight into SMT contention
+/// [the ratio is `pow.rs`'s own cost table: 21.4 µs against 1.85 ms]. So both
+/// are reported, and neither is presented as "the hashrate".
+pub fn bench_towerwalk(duration: Duration, threads: Option<usize>) -> BenchResult {
+    use jetsam_chain::consensus::pow_walk::{towerwalk_digest_with, Scratch};
+    use rayon::prelude::*;
+
+    let width = threads
+        .filter(|n| *n > 0)
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .build()
+        .expect("benchmark thread pool");
+
+    let started = Instant::now();
+    let deadline = started + duration;
+    let hashes: u64 = pool.install(|| {
+        (0..width)
+            .into_par_iter()
+            .map(|thread_id| {
+                // One pad per thread, allocated once — the same shape the
+                // consensus path uses, so the figure describes that path.
+                let mut scratch = Scratch::new();
+                let mut seed = [0u8; 32];
+                seed[..16].copy_from_slice(&((thread_id as u128) << 96).to_le_bytes());
+                let mut done: u64 = 0;
+                while Instant::now() < deadline {
+                    let digest = towerwalk_digest_with(&mut scratch, &seed);
+                    // Chain the digests so nothing can be hoisted out of the loop.
+                    seed = digest;
+                    done += 1;
+                }
+                done
+            })
+            .sum()
+    });
+
+    BenchResult {
+        threads: width,
+        seconds: started.elapsed().as_secs_f64(),
+        hashes,
+    }
+}
+
 pub fn bench_towerhash(duration: Duration, threads: Option<usize>) -> BenchResult {
     use jetsam_chain::consensus::pow::POW_HEADER_FIELD_COUNT;
     use rayon::prelude::*;
@@ -400,11 +453,15 @@ fn report_rate(ticker: &mut SearchTicker, height: u64, threads: usize) {
     }
 }
 
-/// Nonces handed out on the first pass, before any measurement exists.
+/// The fixed pass size this module used until 2026-09-26, kept as the value the
+/// regression tests measure against.
 ///
-/// At module scope because a thread's share of it — `CHUNK_SIZE / threads` —
-/// is what a thread must stop grinding once another has won, and the
-/// regression test sizes its shares from the same constant the search uses.
+/// Not production any more: a pass is sized by time now ([`CHUNK_TARGET`]) and
+/// starts at [`CHUNK_START`]. The tests that prove the regression reproduce —
+/// `a_small_miner_reacts_faster_than_the_block_interval`,
+/// `the_very_first_pass_is_short_on_a_slow_machine` — need the old number to
+/// show what it cost, so it lives here rather than as a literal in each of them.
+#[cfg(test)]
 const CHUNK_SIZE: u128 = 1_000_000;
 
 /// How long one pass should take, whatever the machine.
@@ -712,6 +769,28 @@ mod pow_search_tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "a won block waited {elapsed:?} on threads that had already lost"
+        );
+    }
+
+    /// The regression that shipped: `--bench` measured the sponge and the
+    /// operator read it as their mining rate. After the fork the two differ by
+    /// about 88x, so the number was not slightly off — it was the wrong
+    /// quantity. If these two ever come out close, one of them is measuring the
+    /// other's digest.
+    #[test]
+    fn the_walk_bench_does_not_measure_the_sponge() {
+        let d = Duration::from_millis(600);
+        let sponge = super::bench_towerhash(d, Some(1));
+        let walk = super::bench_towerwalk(d, Some(1));
+        assert!(walk.hashes > 0, "the walk bench computed nothing");
+        let ratio = sponge.hashes_per_second() / walk.hashes_per_second();
+        assert!(
+            ratio > 10.0,
+            "the walk bench is only {ratio:.1}x slower than the sponge; at that \
+             distance it is measuring the sponge, not the walk \
+             (sponge {:.0} H/s, walk {:.0} H/s)",
+            sponge.hashes_per_second(),
+            walk.hashes_per_second()
         );
     }
 
