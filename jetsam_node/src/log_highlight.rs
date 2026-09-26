@@ -80,7 +80,25 @@ impl<W: Write> Highlighter<W> {
             Some(on) => {
                 let body = line.strip_suffix(b"\n").unwrap_or(line);
                 self.inner.write_all(on)?;
-                self.inner.write_all(body)?;
+                // Re-arm after every reset the formatter itself emitted.
+                //
+                // `tracing` styles the timestamp and the level and turns
+                // styling off after each. Colouring once at the head of the
+                // line therefore ends a dozen bytes in: the clock came out
+                // tinted and the rate — the only part worth reading — arrived
+                // plain. Shipped that way in v1.4.2, because every test in
+                // this module fed it a line with no escape codes in it.
+                let mut rest = body;
+                while let Some(at) = find(rest, OFF) {
+                    let after = at + OFF.len();
+                    self.inner.write_all(&rest[..after])?;
+                    rest = &rest[after..];
+                    // Nothing left to colour: do not leave a dangling code.
+                    if !rest.is_empty() {
+                        self.inner.write_all(on)?;
+                    }
+                }
+                self.inner.write_all(rest)?;
                 self.inner.write_all(OFF)?;
                 if line.ends_with(b"\n") {
                     self.inner.write_all(b"\n")?;
@@ -93,7 +111,14 @@ impl<W: Write> Highlighter<W> {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+    find(haystack, needle).is_some()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 impl<W: Write> Write for Highlighter<W> {
@@ -177,5 +202,60 @@ mod tests {
     fn the_colour_never_bleeds_into_the_next_line() {
         let out = run(&["12:00:00 INFO ⛏  8.3 kH/s\n"], true);
         assert!(out.ends_with("\x1b[0m\n"), "reset is misplaced: {out:?}");
+    }
+
+    /// A real line, as `tracing` hands it over — it styles the clock and the
+    /// level and turns styling **off** after each.
+    const REAL: &str = "\x1b[2m00:25:12\x1b[0m \x1b[32m INFO\x1b[0m ⛏  2.96 kH/s  ·  \
+                        4 threads · 1000636 hashes total \x1b[3mheight\x1b[0m\x1b[2m=\x1b[0m6906\n";
+
+    /// Is `needle` inside an active colour span, or did a reset end it first?
+    fn is_tinted(out: &str, needle: &str) -> bool {
+        let at = out.find(needle).expect("needle absent");
+        let mut armed = false;
+        let mut rest = &out[..at];
+        while let Some(esc) = rest.find('\x1b') {
+            let tail = &rest[esc..];
+            let end = tail.find('m').map(|i| i + 1).unwrap_or(tail.len());
+            armed = &tail[..end] != "\x1b[0m";
+            rest = &tail[end..];
+        }
+        armed
+    }
+
+    /// What every earlier test in this module missed, and what shipped broken:
+    /// colouring from the head of the line dies at the formatter's first
+    /// reset. The clock came out tinted and the rate — the only part worth
+    /// reading — arrived plain.
+    #[test]
+    fn a_real_line_stays_coloured_past_the_formatters_own_resets() {
+        let out = run(&[REAL], true);
+        assert!(
+            is_tinted(&out, "2.96 kH/s"),
+            "the rate is not inside a colour span: {out:?}"
+        );
+        assert!(
+            is_tinted(&out, "hashes total"),
+            "the tail of the message lost the colour: {out:?}"
+        );
+        assert!(
+            is_tinted(&out, "6906"),
+            "the field values lost the colour: {out:?}"
+        );
+    }
+
+    /// Re-arming must not survive the line it belongs to.
+    #[test]
+    fn a_real_line_still_ends_reset() {
+        let out = run(&[REAL], true);
+        assert!(out.ends_with("\x1b[0m\n"), "reset is misplaced: {out:?}");
+        assert!(!out.contains("\x1b[0m\x1b[1;36m\n"), "re-armed for nothing: {out:?}");
+    }
+
+    /// An ordinary line keeps the formatter's own colours untouched.
+    #[test]
+    fn an_ordinary_line_is_passed_through_byte_for_byte() {
+        let plain = "\x1b[2m00:25:12\x1b[0m \x1b[32m INFO\x1b[0m peer connected\n";
+        assert_eq!(run(&[plain], true), plain);
     }
 }
