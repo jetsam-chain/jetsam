@@ -255,16 +255,22 @@ pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 #[cfg(not(feature = "testnet"))]
 pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// **Armed at 4650 on the test chain, 2026-09-23.** The tip was 4560 and the
-/// measured rate 98 s per block over the preceding twenty, so ninety blocks is
-/// about two and a half hours — enough to build, rehearse the binary against a
-/// copy of the live data directory, deploy to all three nodes, and still hold a
-/// margin.
+/// **Disarmed on 2026-09-26, for the rehearsal from a clean start.** It had been
+/// armed at 4650 on the test chain on 2026-09-23, on a chain that was reset that
+/// day at height 7477 and whose genesis no longer exists in any binary.
 ///
-/// The test chain carries every node of this network: the two miners on epyc1 and
-/// the public seed VPS. Nothing about this crossing is simulated.
+/// The pre-fork chain of the final rehearsal must be *exactly* the binary the
+/// public network runs, in its test profile — and the public network is dormant.
+/// A test chain that started already armed would rehearse nothing: the height
+/// would be behind the tip from the first block, and the crossing — which is the
+/// event being rehearsed — would never be observable.
+///
+/// Arming it again is the rehearsal itself: it is decided against the tip of the
+/// day, with the operator, and it moves this constant, the declaration beside it
+/// in `wire_limits`, and [`V1_4_ANCHOR_TARGET`] in one commit. Three edits,
+/// three guards.
 #[cfg(feature = "testnet")]
-pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(4_650);
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
 
 /// Whether one candidate block height is governed by the v1.4 proof-of-work.
 #[inline]
@@ -364,22 +370,27 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 #[cfg(not(feature = "testnet"))]
 pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
 
-/// The test chain crosses on [`GENESIS_TARGET`] — the easiest target the protocol
-/// allows, and 25x easier than this chain's measured equilibrium.
+/// **Disarmed on 2026-09-26 together with [`V1_4_ACTIVATION_HEIGHT`]**, because
+/// `wire_limits::tests::the_pow_fork_cannot_be_armed_without_its_anchor_target`
+/// allows no other combination: a height without a target stops the chain at the
+/// fork, and ASERT does not recover from a stall.
 ///
-/// That is deliberate, and it is the direction the design argues for: a target set
-/// too hard stops the chain and it does not restart without a new binary, while one
-/// set too easy costs a burst of fast blocks that ASERT tightens away in about
-/// thirty. Twenty-five times is more slack than the eight the design proposes, and
-/// on a test chain that is a feature — watching ASERT climb back from a known
-/// distance is precisely the rehearsal the public network needs before it is armed.
+/// When the test chain is armed again, the value it carried before the reset was
+/// `Some(GENESIS_TARGET)` — the easiest target the protocol allows, and 25x easier
+/// than the measured equilibrium of the chain that has just been retired. That
+/// direction is the one the design argues for: a target set too hard stops the
+/// chain and it does not restart without a new binary, while one set too easy
+/// costs a burst of fast blocks that ASERT tightens away in about thirty.
+/// Watching ASERT climb back from a known distance is precisely the rehearsal the
+/// public network needs. The equilibrium of the *new* chain is the number to
+/// measure before choosing again, not the old one.
 ///
-/// ⚠️ **The public network must NOT copy this value.** Its own anchor is chosen
-/// from a fresh measurement of the network's rate taken after the optimised CPU
-/// kernel has shipped and ASERT has settled, never before, and never from a test
-/// chain whose hashrate is two processes on one machine.
+/// ⚠️ **The public network must NOT copy the test chain's value.** Its own anchor
+/// is chosen from a fresh measurement of the network's rate taken after the
+/// optimised CPU kernel has shipped and ASERT has settled, never before, and never
+/// from a test chain whose hashrate is a handful of processes on three machines.
 #[cfg(feature = "testnet")]
-pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(GENESIS_TARGET);
+pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
 
 /// Whether a candidate anchor target is one this protocol can ever mine.
 ///

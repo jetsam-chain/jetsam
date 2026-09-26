@@ -24,14 +24,30 @@ use jetsam_poseidon2b::primitives::Address;
 #[cfg(not(feature = "testnet"))]
 pub const GENESIS_TIMESTAMP: u64 = 1_787_328_000;
 
-/// Test-chain genesis timestamp (2026-09-09 00:00:00 UTC).
+/// Test-chain genesis timestamp (2026-09-26 00:00:00 UTC).
 ///
 /// A different genesis is what actually keeps the two networks apart: it
 /// changes the genesis hash, therefore the network `profile_id`, and two nodes
 /// with different profiles refuse each other **before** any block is offered.
 /// The ticker and the address HRP protect humans; this protects the protocol.
+///
+/// # Why this value moved on 2026-09-26 (it was `1_788_912_000`, 2026-09-09)
+///
+/// The v1.4 proof-of-work fork is rehearsed on this chain from a clean start, and
+/// a clean start is not a directory somebody emptied. Keeping the old genesis
+/// would leave every node that still holds the 7477-block history able to offer
+/// it, and branch choice on cumulative work would bury the new chain under it.
+/// With a new genesis, `refuse_foreign_chain_data` (`jetsam_node/src/main.rs`)
+/// reads the genesis header out of the old `mdbx.dat` and refuses to run against
+/// it at all — the old chain becomes unreachable rather than merely unwanted, and
+/// nothing has to be deleted to make that true.
+///
+/// Moving the timestamp is the smallest edit that moves the genesis id: every
+/// other field of `genesis_header()` is either structurally fixed (a zero
+/// previous hash, the empty-state root, height 0) or shared with the public
+/// network, which must not move.
 #[cfg(feature = "testnet")]
-pub const GENESIS_TIMESTAMP: u64 = 1_788_912_000;
+pub const GENESIS_TIMESTAMP: u64 = 1_790_380_800;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -86,10 +102,15 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 const GENESIS_NONCE: u128 = 131_160;
 
 /// Test-chain genesis nonce, re-mined for the test-chain timestamp.
-/// `genesis_nonce_is_valid` below proves it satisfies the target, whichever
+/// `genesis_nonce_satisfies_pow` below proves it satisfies the target, whichever
 /// profile is compiled.
+///
+/// Re-mined on 2026-09-26 for `GENESIS_TIMESTAMP = 1_790_380_800` (it was
+/// `300_173`, for the 2026-09-09 timestamp). The nonce is a function of the
+/// header, so moving the timestamp invalidates it: `genesis_nonce_satisfies_pow`
+/// is what refuses a build whose genesis cannot be proved.
 #[cfg(feature = "testnet")]
-const GENESIS_NONCE: u128 = 300_173;
+const GENESIS_NONCE: u128 = 501_920;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -205,6 +226,12 @@ mod tests {
     /// differ from the mainnet one. That difference is the whole separation:
     /// it changes the network `profile_id`, so a testnet node and a mainnet
     /// node refuse each other at the handshake instead of exchanging blocks.
+    ///
+    /// It also differs from the id the **previous** test chain carried
+    /// (`b3efb3c1…996d`, genesis timestamp 2026-09-09), and that is asserted here
+    /// too: the whole point of the 2026-09-26 reset is that a node built from this
+    /// source cannot be talked into the old history, and a silent revert of the
+    /// timestamp would undo it without any other test noticing.
     #[test]
     #[cfg(feature = "testnet")]
     fn testnet_genesis_block_id_is_canonical_and_differs_from_mainnet() {
@@ -213,12 +240,24 @@ mod tests {
             0x7e, 0xb2, 0x94, 0x8a, 0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1, 0x2f, 0xda, 0xb4, 0x2c,
             0x44, 0x8c, 0x5f, 0x44,
         ];
-        let id = crate::block_header::block_id(&genesis_header());
-        assert_ne!(id, MAINNET_GENESIS_ID, "the two chains must not share a genesis");
-        const TESTNET_GENESIS_ID: [u8; 32] = [
+        /// The chain that was reset on 2026-09-26 at height 7477. Its data
+        /// directories still exist, moved aside; this build must never agree with
+        /// them.
+        const RETIRED_TESTNET_GENESIS_ID: [u8; 32] = [
             0xb3, 0xef, 0xb3, 0xc1, 0xd3, 0x1f, 0xee, 0x8b, 0x9a, 0xee, 0x7b, 0x06, 0xcb, 0x11,
             0x2f, 0xae, 0xa5, 0xab, 0xc1, 0xce, 0xb7, 0x35, 0xd2, 0x1c, 0xa5, 0xa3, 0x90, 0x1b,
             0x11, 0x0f, 0x99, 0x6d,
+        ];
+        let id = crate::block_header::block_id(&genesis_header());
+        assert_ne!(id, MAINNET_GENESIS_ID, "the two chains must not share a genesis");
+        assert_ne!(
+            id, RETIRED_TESTNET_GENESIS_ID,
+            "the reset test chain must not share a genesis with the one it replaced"
+        );
+        const TESTNET_GENESIS_ID: [u8; 32] = [
+            0xb3, 0xd4, 0x22, 0x0c, 0xe6, 0xdb, 0xb2, 0xa8, 0xda, 0x03, 0xd7, 0xcc, 0xc9, 0x69,
+            0x5b, 0x24, 0xb1, 0xc8, 0xe6, 0xc7, 0xd8, 0x49, 0x30, 0x88, 0x36, 0x93, 0xce, 0x63,
+            0xcc, 0xb4, 0x55, 0xf8,
         ];
         assert_eq!(id, TESTNET_GENESIS_ID);
     }
@@ -228,7 +267,9 @@ mod tests {
     fn genesis_timestamp_is_reasonable() {
         #[cfg(not(feature = "testnet"))]
         assert_eq!(GENESIS_TIMESTAMP, 1_787_328_000);
+        // 2026-09-26 00:00:00 UTC — the reset test chain. The retired value was
+        // 1_788_912_000.
         #[cfg(feature = "testnet")]
-        assert_eq!(GENESIS_TIMESTAMP, 1_788_912_000);
+        assert_eq!(GENESIS_TIMESTAMP, 1_790_380_800);
     }
 }
