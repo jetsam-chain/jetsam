@@ -394,7 +394,7 @@ mod tests {
             0xc4, 0xab, 0x80, 0xa4, 0x22, 0x4d, 0xdf, 0x3d,
         ];
         /// The same digest over the test chain's genesis:
-        /// `8a84d9a6f9440c1c74c432d0c5dd937754b554978d2bda7727f22a2d998c03f3`.
+        /// `7fd23dfe873821d0ad207dcf73806a1ff7c0ca11892c4506cf55420eac490cb7`.
         ///
         /// Captured from this source tree, which is the source the nodes of that
         /// chain run — so it is the profile those peers speak. It has never been
@@ -402,11 +402,17 @@ mod tests {
         /// the node prints the id at `debug` only. What it guarantees is what
         /// the public anchor guarantees: no later edit to an advertised field
         /// moves the id without a test saying so.
+        ///
+        /// Moved on 2026-09-26: the digest covers `genesis_hash`, so resetting the
+        /// test chain moved it. The retired value was
+        /// `8a84d9a6f9440c1c74c432d0c5dd937754b554978d2bda7727f22a2d998c03f3` —
+        /// a node still carrying it cannot complete the profile exchange with this
+        /// build, which is the whole point.
         const TESTNET: [u8; 32] = [
-            0x8a, 0x84, 0xd9, 0xa6, 0xf9, 0x44, 0x0c, 0x1c,
-            0x74, 0xc4, 0x32, 0xd0, 0xc5, 0xdd, 0x93, 0x77,
-            0x54, 0xb5, 0x54, 0x97, 0x8d, 0x2b, 0xda, 0x77,
-            0x27, 0xf2, 0x2a, 0x2d, 0x99, 0x8c, 0x03, 0xf3,
+            0x7f, 0xd2, 0x3d, 0xfe, 0x87, 0x38, 0x21, 0xd0,
+            0xad, 0x20, 0x7d, 0xcf, 0x73, 0x80, 0x6a, 0x1f,
+            0xf7, 0xc0, 0xca, 0x11, 0x89, 0x2c, 0x45, 0x06,
+            0xcf, 0x55, 0x42, 0x0e, 0xac, 0x49, 0x0c, 0xb7,
         ];
         /// `jetsam_chain::consensus::genesis`, anchored there by
         /// `genesis_block_id_is_canonical`.
@@ -418,11 +424,17 @@ mod tests {
         ];
         /// Anchored there by
         /// `testnet_genesis_block_id_is_canonical_and_differs_from_mainnet`.
+        ///
+        /// Moved on 2026-09-26 with the test chain's genesis timestamp (the
+        /// retired id was `b3efb3c1…996d`). The `panic!` arm below is what made
+        /// that edit compulsory rather than optional: a new genesis with no
+        /// anchored profile stops the test instead of quietly advertising the
+        /// public network's id.
         const TESTNET_GENESIS_ID: [u8; 32] = [
-            0xb3, 0xef, 0xb3, 0xc1, 0xd3, 0x1f, 0xee, 0x8b,
-            0x9a, 0xee, 0x7b, 0x06, 0xcb, 0x11, 0x2f, 0xae,
-            0xa5, 0xab, 0xc1, 0xce, 0xb7, 0x35, 0xd2, 0x1c,
-            0xa5, 0xa3, 0x90, 0x1b, 0x11, 0x0f, 0x99, 0x6d,
+            0xb3, 0xd4, 0x22, 0x0c, 0xe6, 0xdb, 0xb2, 0xa8,
+            0xda, 0x03, 0xd7, 0xcc, 0xc9, 0x69, 0x5b, 0x24,
+            0xb1, 0xc8, 0xe6, 0xc7, 0xd8, 0x49, 0x30, 0x88,
+            0x36, 0x93, 0xce, 0x63, 0xcc, 0xb4, 0x55, 0xf8,
         ];
 
         let genesis = block_id(&genesis_header());

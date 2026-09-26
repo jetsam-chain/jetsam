@@ -281,15 +281,17 @@ mod tests {
     #[cfg(not(feature = "testnet"))]
     const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
 
-    /// Armed at 4650 on the test chain, 2026-09-23, against a tip of 4560 and a
-    /// measured 98 s per block.
+    /// Disarmed on 2026-09-26. It had been armed at 4650 on 2026-09-23, on the
+    /// test chain that was reset that day at height 7477; the rehearsal restarts
+    /// from a pre-fork chain, so the test profile is dormant again and the height
+    /// will be chosen against the new chain's own tip.
     ///
-    /// The declaration is split per profile now that one of them is armed — a
-    /// shared declaration across two differently-armed profiles makes this guard
-    /// fail on the dormant one and look like a bug in the guard rather than what
-    /// it is.
+    /// The declaration stays split per profile even though both now read `None`:
+    /// re-arming the test chain alone is exactly what this file exists to make
+    /// visible, and a shared declaration would make that edit fail on the public
+    /// profile and look like a bug in the guard rather than what it is.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(4_650);
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
 
     /// The same two-edit rule, for the third clock.
     ///
