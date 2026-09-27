@@ -291,7 +291,7 @@ mod tests {
     /// visible, and a shared declaration would make that edit fail on the public
     /// profile and look like a bug in the guard rather than what it is.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(750);
 
     /// The same two-edit rule, for the third clock.
     ///

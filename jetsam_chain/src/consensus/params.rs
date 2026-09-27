@@ -270,7 +270,7 @@ pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
 /// in `wire_limits`, and [`V1_4_ANCHOR_TARGET`] in one commit. Three edits,
 /// three guards.
 #[cfg(feature = "testnet")]
-pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(750);
 
 /// Whether one candidate block height is governed by the v1.4 proof-of-work.
 #[inline]
@@ -390,7 +390,7 @@ pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
 /// optimised CPU kernel has shipped and ASERT has settled, never before, and never
 /// from a test chain whose hashrate is a handful of processes on three machines.
 #[cfg(feature = "testnet")]
-pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
+pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(GENESIS_TARGET);
 
 /// Whether a candidate anchor target is one this protocol can ever mine.
 ///
