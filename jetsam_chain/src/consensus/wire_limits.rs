@@ -279,7 +279,7 @@ mod tests {
     /// Dormant on the public network. It stays dormant until the test chain has
     /// crossed, been watched, and been mined against by a GPU that failed.
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(24846);
 
     /// Disarmed on 2026-09-26. It had been armed at 4650 on 2026-09-23, on the
     /// test chain that was reset that day at height 7477; the rehearsal restarts
