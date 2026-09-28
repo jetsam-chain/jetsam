@@ -544,6 +544,127 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
+// Hard checkpoints
+// ---------------------------------------------------------------------------
+
+/// Block ids pinned in the binary, as `(height, block_id)`.
+///
+/// A header at a pinned height whose id is not the pinned one is refused
+/// outright, whatever work it carries — step 0 of
+/// `header::validate_header_inner`, which every acceptance path goes through,
+/// including the header staging of a snapshot sync.
+///
+/// # Why the activation block
+///
+/// A block past the v1.4 fork weighs `2^256 / target`, and the anchor makes that
+/// target far easier than the last pre-fork one: 1/182 of a pre-fork block on the
+/// test chain [MEASURED 2026-09-27, blocks 749 and 750], about 1/21 600 on the
+/// public network at the candidate anchor. For thousands of blocks after the
+/// fork the honest chain therefore carries less work than a single competing
+/// pre-fork block, and what keeps a synchronized node on it is the depth limit
+/// (`fork_choice::reorg_allowed`) — see the comment on [`V1_4_ANCHOR_TARGET`].
+/// A node that does not hold the prefix — a fresh sync, an explorer, an exchange
+/// reinstalling — chooses by work alone, and the depth limit protects nobody
+/// there. Pinning the activation block closes exactly that case: every
+/// candidate chain has to contain it.
+///
+/// The id exists only once the block is mined, so a pin ships in the release
+/// **after** a crossing. It replaces neither the anchor nor the depth limit; it
+/// covers the one population they cannot.
+///
+/// # A pin belongs to one genesis
+///
+/// [`HARD_CHECKPOINTS_GENESIS`] names the chain the pins were taken on, and
+/// `hard_checkpoints_belong_to_this_profiles_genesis` fails as soon as the
+/// genesis moves without the pins being cleared. The test chain gets reset; a
+/// pin left over from the previous one would stop the new chain dead at the
+/// pinned height, exactly like an unmineable anchor.
+#[cfg(not(feature = "testnet"))]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
+
+/// The test chain's v1.4 activation block, crossed on 2026-09-27 at 18:28 UTC.
+/// Read back from two nodes that reached it by different paths — cpu13 by
+/// sequential validation, the seed by a snapshot jump from 749 to 772 — and
+/// equal to the `prev_block_hash` of block 751.
+#[cfg(feature = "testnet")]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[(
+    750,
+    [
+        0xac, 0xad, 0xac, 0xcb, 0x06, 0xf9, 0xa2, 0x29, 0x19, 0x49, 0x03, 0x0c, 0x3b, 0x43,
+        0x8e, 0xaf, 0xb7, 0x62, 0xa4, 0x7e, 0x53, 0xab, 0xd4, 0x88, 0x99, 0x59, 0x03, 0xf4,
+        0x1d, 0x60, 0x38, 0xe0,
+    ],
+)];
+
+/// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
+#[cfg(not(feature = "testnet"))]
+pub const HARD_CHECKPOINTS_GENESIS: [u8; 32] = [
+    0x6e, 0x59, 0x2c, 0x07, 0xbe, 0x6f, 0xd1, 0xb4, 0x25, 0x9e, 0xea, 0xcb, 0xf4, 0xeb, 0x7e,
+    0xb2, 0x94, 0x8a, 0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1, 0x2f, 0xda, 0xb4, 0x2c, 0x44, 0x8c,
+    0x5f, 0x44,
+];
+
+/// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
+#[cfg(feature = "testnet")]
+pub const HARD_CHECKPOINTS_GENESIS: [u8; 32] = [
+    0xb3, 0xd4, 0x22, 0x0c, 0xe6, 0xdb, 0xb2, 0xa8, 0xda, 0x03, 0xd7, 0xcc, 0xc9, 0x69, 0x5b,
+    0x24, 0xb1, 0xc8, 0xe6, 0xc7, 0xd8, 0x49, 0x30, 0x88, 0x36, 0x93, 0xce, 0x63, 0xcc, 0xb4,
+    0x55, 0xf8,
+];
+
+/// The block id pinned at `height` on this profile, if any.
+#[inline]
+pub fn hard_checkpoint(height: u64) -> Option<[u8; 32]> {
+    hard_checkpoint_in(HARD_CHECKPOINTS, height)
+}
+
+/// Testable twin of [`hard_checkpoint`] with the pin list injected.
+#[inline]
+pub(crate) fn hard_checkpoint_in(pins: &[(u64, [u8; 32])], height: u64) -> Option<[u8; 32]> {
+    pins.iter()
+        .find(|(pinned, _)| *pinned == height)
+        .map(|(_, id)| *id)
+}
+
+#[cfg(test)]
+mod hard_checkpoint_tests {
+    use super::*;
+    use crate::block_header::block_id;
+    use crate::consensus::genesis::genesis_header;
+
+    /// A pin taken on another genesis stops the chain at its height. This is
+    /// what makes a test-chain reset clear the pins instead of inheriting them.
+    #[test]
+    fn hard_checkpoints_belong_to_this_profiles_genesis() {
+        assert_eq!(
+            HARD_CHECKPOINTS_GENESIS,
+            block_id(&genesis_header()),
+            "the genesis moved: clear HARD_CHECKPOINTS, and pin again only once \
+             the new chain has crossed its own fork"
+        );
+    }
+
+    #[test]
+    fn a_pin_is_found_only_at_its_own_height() {
+        let pins = [(750, [0xAA; 32]), (1_200, [0xBB; 32])];
+        assert_eq!(hard_checkpoint_in(&pins, 750), Some([0xAA; 32]));
+        assert_eq!(hard_checkpoint_in(&pins, 1_200), Some([0xBB; 32]));
+        assert_eq!(hard_checkpoint_in(&pins, 749), None);
+        assert_eq!(hard_checkpoint_in(&pins, 751), None);
+        assert_eq!(hard_checkpoint_in(&[], 750), None);
+    }
+
+    /// The block worth pinning is the activation block — the one whose absence
+    /// the work comparison cannot see. A pin typed one block off would still
+    /// build, still pass every other test, and protect nothing.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn the_test_chain_pins_its_activation_block() {
+        assert_eq!(Some(HARD_CHECKPOINTS[0].0), V1_4_ACTIVATION_HEIGHT);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reading an anchor back against the measurement it came from
 // ---------------------------------------------------------------------------
 

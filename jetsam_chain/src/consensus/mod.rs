@@ -137,6 +137,9 @@ pub enum ConsensusError {
     BadHeight,
     /// §16.4 — `difficulty_target` differs from ASERT expectation.
     BadDifficultyTarget,
+    /// The header sits at a height whose block id is pinned in this binary
+    /// (`params::HARD_CHECKPOINTS`), and it is not that block.
+    CheckpointMismatch,
     /// §16.5 — Timestamp violates MTP or future-drift rules.
     BadTimestamp,
     /// §16.8 — Block contains more than `BLOCK_MAX_TXS` decoded transactions.

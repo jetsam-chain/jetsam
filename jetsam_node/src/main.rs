@@ -15089,12 +15089,17 @@ impl tracing_subscriber::fmt::time::FormatTime for UtcHms {
 /// block still proved under the old digest. Either way both sides go quiet and
 /// keep extending chains the other will never read.
 ///
+/// [`ConsensusError::CheckpointMismatch`] is the third: a peer offering a block
+/// that contradicts a pinned block id is on another chain by construction.
+///
 /// Every other precheck failure is ordinary traffic — a stale announcement, a
 /// competing parent, a peer mid-sync — and stays at `debug`. Raising all of them
 /// would bury this one, which is the outcome this exists to prevent.
 fn header_rejection_looks_like_a_fork(error: &jetsam_chain::consensus::ConsensusError) -> bool {
-    use jetsam_chain::consensus::ConsensusError::{BadDifficultyTarget, InvalidPoW};
-    matches!(error, BadDifficultyTarget | InvalidPoW)
+    use jetsam_chain::consensus::ConsensusError::{
+        BadDifficultyTarget, CheckpointMismatch, InvalidPoW,
+    };
+    matches!(error, BadDifficultyTarget | InvalidPoW | CheckpointMismatch)
 }
 
 #[cfg(test)]
@@ -15107,6 +15112,14 @@ mod fork_rejection_tests {
     fn the_two_signatures_of_a_crossing_are_recognised() {
         assert!(looks_like_a_fork(&ConsensusError::BadDifficultyTarget));
         assert!(looks_like_a_fork(&ConsensusError::InvalidPoW));
+    }
+
+    /// A peer serving a block that contradicts a pinned block id is on another
+    /// chain by definition — the pin exists for exactly the chain an attacker or
+    /// a stale miner would offer after a fork, so its refusal must be seen.
+    #[test]
+    fn a_pinned_block_conflict_is_a_fork_too() {
+        assert!(looks_like_a_fork(&ConsensusError::CheckpointMismatch));
     }
 
     /// Ordinary rejections must stay quiet, or the one that matters is buried.

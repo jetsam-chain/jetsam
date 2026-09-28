@@ -165,6 +165,11 @@ fn validate_header_inner(
     anchor_target: &[u8; 32],
     check_pow: bool,
 ) -> Result<(), ConsensusError> {
+    // 0. Hard checkpoint, before anything else: whatever else is true of this
+    //    header, a block at a pinned height that is not the pinned block is not
+    //    one this node will ever follow. See `params::HARD_CHECKPOINTS`.
+    check_hard_checkpoint(header, crate::consensus::params::HARD_CHECKPOINTS)?;
+
     // 1. Parent hash linkage.
     if header.prev_block_hash != expected_parent_hash {
         return Err(ConsensusError::BadParentHash);
@@ -241,6 +246,20 @@ fn validate_header_inner(
     }
 
     Ok(())
+}
+
+/// Refuse a header at a pinned height whose block id is not the pinned one.
+///
+/// Hashes only when `header.height` is pinned, so everywhere else the cost is
+/// one scan of a list holding one entry per crossed fork.
+pub(crate) fn check_hard_checkpoint(
+    header: &BlockHeader,
+    pins: &[(u64, [u8; 32])],
+) -> Result<(), ConsensusError> {
+    match crate::consensus::params::hard_checkpoint_in(pins, header.height) {
+        Some(pinned) if block_id(header) != pinned => Err(ConsensusError::CheckpointMismatch),
+        _ => Ok(()),
+    }
 }
 
 /// Determine the ASERT anchor for a given chain tip.
@@ -658,5 +677,55 @@ mod tests {
         assert!(is_final(0, DEPTH));
         assert!(!is_final(0, DEPTH - 1));
         assert!(is_final(100, 100 + DEPTH));
+    }
+
+    #[test]
+    fn a_block_at_a_pinned_height_that_is_not_the_pinned_block_is_refused() {
+        let genesis = make_header(0, 1_000_000, None);
+        let h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
+        assert_eq!(
+            check_hard_checkpoint(&h1, &[(1, [0xAA; 32])]),
+            Err(ConsensusError::CheckpointMismatch)
+        );
+    }
+
+    #[test]
+    fn the_pinned_block_itself_passes() {
+        let genesis = make_header(0, 1_000_000, None);
+        let h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
+        assert_eq!(check_hard_checkpoint(&h1, &[(1, block_id(&h1))]), Ok(()));
+    }
+
+    #[test]
+    fn heights_without_a_pin_are_untouched() {
+        let genesis = make_header(0, 1_000_000, None);
+        let h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
+        assert_eq!(check_hard_checkpoint(&h1, &[(2, [0xAA; 32])]), Ok(()));
+        assert_eq!(check_hard_checkpoint(&h1, &[]), Ok(()));
+    }
+
+    /// Through the production validator and the real pin list: any block 750
+    /// other than the one the test chain carries is refused, and refused before
+    /// its parent, its target or its work are even looked at — so the error a
+    /// peer gets back names the pin, not whichever later rule it also breaks.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn the_test_chain_refuses_every_other_block_750() {
+        // Not mined: height 750 is walked on this profile, and the pin has to
+        // refuse the header before proof of work is ever evaluated.
+        let parent = make_header(749, 1_000_000, None);
+        let other = make_header(750, 1_000_000 + BLOCK_TIME, Some(&parent));
+        assert_eq!(
+            validate_header_timeless(
+                &other,
+                &parent,
+                &[parent.timestamp],
+                &[],
+                0,
+                parent.timestamp,
+                &parent.difficulty_target,
+            ),
+            Err(ConsensusError::CheckpointMismatch)
+        );
     }
 }
