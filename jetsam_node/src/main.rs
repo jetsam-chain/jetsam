@@ -397,6 +397,11 @@ const MINING_QUORUM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::f
 /// property of the connection.  If authenticated tip traffic stops, mining
 /// must stop before the node can keep extending a stale parent indefinitely.
 const MINING_PEER_CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+/// How long a mining node may sit paused, with peers connected, before it says
+/// why. A node that is only catching up is authorized again well inside this.
+const MINING_PAUSE_EXPLAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+/// How often the explanation is repeated while the pause lasts.
+const MINING_PAUSE_EXPLAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 /// An immutable data plan is replaced only after its exact sources are truly
 /// exhausted and several fresh provider queries produced no progress.
 const EXACT_PLAN_NO_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -423,6 +428,11 @@ struct MiningPeerQuorum {
     proof_ready: tokio::sync::watch::Sender<bool>,
     nonce_ready: tokio::sync::watch::Sender<bool>,
     count: tokio::sync::watch::Sender<usize>,
+    /// Only a node that mines owes an explanation for not mining: every node
+    /// runs this quorum, and a plain node would otherwise warn forever.
+    explain_pauses: bool,
+    nonce_paused_since: std::cell::Cell<Option<Instant>>,
+    pause_explained_at: std::cell::Cell<Option<Instant>>,
 }
 
 impl MiningPeerQuorum {
@@ -450,9 +460,56 @@ impl MiningPeerQuorum {
             proof_ready,
             nonce_ready,
             count,
+            explain_pauses: false,
+            nonce_paused_since: std::cell::Cell::new(None),
+            pause_explained_at: std::cell::Cell::new(None),
         };
         quorum.publish_at(origin);
         quorum
+    }
+
+    /// Warn in plain words when mining stays paused (see `mining_pause_explanation`).
+    fn with_pause_explanations(mut self, mining: bool) -> Self {
+        self.explain_pauses = mining;
+        self
+    }
+
+    fn explain_pause_at(&self, now: Instant, nonce_ready: bool) {
+        if !self.explain_pauses || self.isolated {
+            return;
+        }
+        if nonce_ready {
+            if self.pause_explained_at.take().is_some() {
+                tracing::info!(
+                    peers = self.connected.len(),
+                    "mining resumed: a peer agrees with this node's chain again"
+                );
+            }
+            self.nonce_paused_since.set(None);
+            return;
+        }
+        let since = match self.nonce_paused_since.get() {
+            Some(since) => since,
+            None => {
+                self.nonce_paused_since.set(Some(now));
+                now
+            }
+        };
+        let due = self
+            .pause_explained_at
+            .get()
+            .is_none_or(|at| now.saturating_duration_since(at) >= MINING_PAUSE_EXPLAIN_EVERY);
+        if !due {
+            return;
+        }
+        if let Some(text) = mining_pause_explanation(
+            now.saturating_duration_since(since),
+            self.connected.len(),
+            self.readiness.committed_tip().height,
+        ) {
+            tracing::warn!("{text}");
+            self.pause_explained_at.set(Some(now));
+        }
     }
 
     fn now_ms(&self, now: Instant) -> u64 {
@@ -693,8 +750,139 @@ impl MiningPeerQuorum {
                 "mining network readiness changed"
             );
         }
+        self.explain_pause_at(now, snapshot.nonce_search_ready);
     }
 }
+
+/// What a mining node tells its operator when it has stopped searching for
+/// blocks because none of its peers agrees with its chain — `None` while there
+/// is nothing worth saying yet.
+///
+/// Rehearsed on 2026-09-28 on a private two-node chain forked at height 60: a
+/// miner left on the old release mined one block under the old rules, then
+/// BOTH nodes stopped mining, because a miner only searches while at least one
+/// authenticated peer agrees with it. The stale one, upgraded in place, kept its
+/// invalid block (no revalidation at startup) and said only "waiting for a
+/// synchronized authenticated chain view" — indefinitely. Moving its chain
+/// files aside, wallet kept, brought it back in 24 seconds. This text is that
+/// finding, in the words the operator needs.
+fn mining_pause_explanation(
+    paused_for: std::time::Duration,
+    connected_peers: usize,
+    tip_height: u64,
+) -> Option<String> {
+    if connected_peers == 0 || paused_for < MINING_PAUSE_EXPLAIN_AFTER {
+        return None;
+    }
+    let peers = if connected_peers == 1 {
+        "1 connected peer".to_string()
+    } else {
+        format!("{connected_peers} connected peers")
+    };
+    Some(format!(
+        "mining has been paused for {minutes} min: none of this node's {peers} agrees with \
+         its chain at height {tip_height}, so it is not searching for blocks. If the node is \
+         still catching up, this clears on its own. If it lasts, the usual cause is a hard \
+         fork: this node runs a release too old for the chain, or it stored a block made under \
+         the old rules before it was upgraded, and a node never re-checks the blocks it already \
+         stored. Check `jetsam --version` against the current release. If it is current and \
+         this persists: stop the node, move mdbx.dat, mdbx.lck and every snapshot-* folder out \
+         of the data folder into a new sub-folder (delete nothing, keep every wallet.* file \
+         where it is), then start it again; it resyncs in about a minute.",
+        minutes = paused_for.as_secs() / 60,
+    ))
+}
+
+#[cfg(test)]
+mod mining_pause_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn nothing_is_said_while_the_node_may_still_be_catching_up() {
+        assert_eq!(mining_pause_explanation(MINING_PAUSE_EXPLAIN_AFTER - Duration::from_secs(1), 3, 60), None);
+    }
+
+    #[test]
+    fn a_node_with_no_peer_at_all_is_a_different_problem() {
+        assert_eq!(mining_pause_explanation(Duration::from_secs(3600), 0, 60), None);
+    }
+
+    #[test]
+    fn the_explanation_names_the_cause_and_the_way_out() {
+        let text = mining_pause_explanation(MINING_PAUSE_EXPLAIN_AFTER, 2, 60)
+            .expect("five minutes paused with peers must be explained");
+        for needle in [
+            "mining has been paused for 5 min",
+            "none of this node's 2 connected peers agrees with its chain at height 60",
+            "hard fork",
+            "jetsam --version",
+            "mdbx.dat",
+            "keep every wallet.* file",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+        assert!(text.is_ascii(), "operators grep and paste this line: plain ASCII only");
+    }
+
+    #[test]
+    fn one_peer_reads_as_one_peer() {
+        let text = mining_pause_explanation(MINING_PAUSE_EXPLAIN_AFTER, 1, 60).unwrap();
+        assert!(text.contains("none of this node's 1 connected peer agrees"), "{text}");
+    }
+
+    fn quorum(mining: bool) -> MiningPeerQuorum {
+        let (proof_tx, _) = tokio::sync::watch::channel(false);
+        let (ready_tx, _) = tokio::sync::watch::channel(false);
+        let (count_tx, _) = tokio::sync::watch::channel(0usize);
+        MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx).with_pause_explanations(mining)
+    }
+
+    /// Once when the pause becomes long, again only after the repeat period,
+    /// and the slate is cleared the moment a peer authorizes mining again.
+    #[test]
+    fn a_miner_explains_a_long_pause_once_repeats_it_slowly_and_forgets_it_on_recovery() {
+        let mut q = quorum(true);
+        let peer = libp2p::PeerId::random();
+        q.set_canonical_tip(60, [0x60; 32], false);
+        q.set_sync_state(true, false);
+        q.connect(peer, jetsam_node::networking::FailureDomain(1));
+        let t0 = Instant::now();
+
+        q.publish_at(t0 + MINING_PAUSE_EXPLAIN_AFTER - Duration::from_secs(1));
+        assert_eq!(q.pause_explained_at.get(), None);
+
+        let first = t0 + MINING_PAUSE_EXPLAIN_AFTER;
+        q.publish_at(first);
+        assert_eq!(q.pause_explained_at.get(), Some(first));
+
+        q.publish_at(first + MINING_PAUSE_EXPLAIN_EVERY - Duration::from_secs(1));
+        assert_eq!(q.pause_explained_at.get(), Some(first), "not every tick");
+
+        let second = first + MINING_PAUSE_EXPLAIN_EVERY;
+        q.publish_at(second);
+        assert_eq!(q.pause_explained_at.get(), Some(second));
+
+        q.confirm_tip_at(peer, 60, [0x60; 32], second + Duration::from_secs(1));
+        assert_eq!(q.pause_explained_at.get(), None);
+        assert_eq!(q.nonce_paused_since.get(), None);
+    }
+
+    /// Every node runs this quorum; the seed of the test chain logged its
+    /// readiness 35,178 times. A node that does not mine must never warn.
+    #[test]
+    fn a_node_that_does_not_mine_never_warns() {
+        // Exactly the conditions under which a miner speaks: synced, one peer,
+        // no authorization — only the mode differs.
+        let mut q = quorum(false);
+        q.set_canonical_tip(60, [0x60; 32], false);
+        q.set_sync_state(true, false);
+        q.connect(libp2p::PeerId::random(), jetsam_node::networking::FailureDomain(1));
+        q.publish_at(Instant::now() + Duration::from_secs(24 * 3600));
+        assert_eq!(q.pause_explained_at.get(), None);
+    }
+}
+
 /// A state-manifest round with no usable candidate is re-requested after this
 /// deadline. A dropped stream must not wedge sync: with few peers there may
 /// never be another PeerConnected event to retrigger the probe. This fallback
@@ -2471,7 +2659,8 @@ async fn main() -> anyhow::Result<()> {
         mining_proof_ready_tx,
         mining_network_ready_tx,
         mining_confirmed_peer_count_tx,
-    );
+    )
+    .with_pause_explanations(matches!(cli.mode, NodeMode::Miner | NodeMode::Extminer));
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
     let p2p_history_step_runtimes = history_step_runtimes.clone();
