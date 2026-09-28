@@ -194,6 +194,13 @@ impl RpcClient {
         // what a file on disk says — so the pool can show which release each
         // machine is on. A node ignores the header.
         req = req.header("X-Jetsam-Version", env!("CARGO_PKG_VERSION"));
+        // What this binary can search under. A pool serving a walked template
+        // tells walkers from pre-fork miners by this header alone, and a miner
+        // that omits it is listed with the GPUs that will never find a block —
+        // measured on the test pool on 2026-09-28: this binary walked at
+        // 280 H/s on one thread and was still shown as `pow = None`. A node
+        // ignores the header.
+        req = req.header("X-Jetsam-PoW", "walk");
         let resp = req.send().with_context(|| format!("POST {}", self.url))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
