@@ -253,7 +253,7 @@ pub const V1_3_ACTIVATION_HEIGHT: Option<u64> = Some(20);
 /// crossed and been watched.** The two profiles are declared separately, exactly
 /// like [`V1_3_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
 #[cfg(not(feature = "testnet"))]
-pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(24846);
 
 /// **Disarmed on 2026-09-26, for the rehearsal from a clean start.** It had been
 /// armed at 4650 on the test chain on 2026-09-23, on a chain that was reset that
@@ -368,7 +368,7 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 /// settled, never before. Shipping both at once makes the ratio unknowable at the
 /// exact moment it has to be carved into a constant.
 #[cfg(not(feature = "testnet"))]
-pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = None;
+pub const V1_4_ANCHOR_TARGET: Option<[u8; 32]> = Some(two_pow_target(235));
 
 /// **Disarmed on 2026-09-26 together with [`V1_4_ACTIVATION_HEIGHT`]**, because
 /// `wire_limits::tests::the_pow_fork_cannot_be_armed_without_its_anchor_target`
