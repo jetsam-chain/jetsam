@@ -31,7 +31,7 @@ resolver = "2"
 # last build that did not know v1.4. Every build carrying the TowerWalk proof
 # of work — armed or dormant — is 1.4.x, so no two binaries that disagree about
 # the consensus rules can ever report the same version.
-version = "1.4.2"
+version = "1.4.3"
 edition = "2021"
 license = "Apache-2.0"
 
