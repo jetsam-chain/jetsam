@@ -57,9 +57,10 @@ jetsam-cli peers
 jetsam-cli mining
 ```
 
-The process prepares its embedded B25 and B255 proof matrices and selects the
-best available CPU backend. Every process starts block production with B25;
-larger B255 templates are used only when measured complete preparation timing
+The process prepares its embedded proof matrices for both classes and selects
+the best available CPU backend. Every process starts block production with the
+small class (`B25` in the code, 24 page positions since block 17,750); larger
+B255 templates are used only when measured complete preparation timing
 supports them.
 
 ## CPU planning
@@ -67,6 +68,12 @@ supports them.
 `--cpu-threads` is the total shared budget for proof and PoW phases. Do not set
 it higher than the logical CPUs available to the service's cgroup or virtual
 machine.
+
+Since block 24,846 the PoW phase is TowerWalk: each searching thread walks its
+own 512 KiB scratchpad, sized for one core's private L2 cache. One thread per
+physical core is usually the best setting for the search. Size the budget on
+the `walked digest` rate that `jetsam --bench` prints, not on the
+`sponge digest` rate printed above it.
 
 Leave capacity for the operating system and public P2P service on an
 infrastructure node. A dedicated miner can use every visible logical CPU.

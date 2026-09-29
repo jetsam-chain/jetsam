@@ -28,7 +28,8 @@ A mining node owns the block. It:
 Nonce search may run inside that process or in `jetsam-miner`. An external
 worker has a much narrower role:
 
-- receive one immutable Poseidon2b header schedule and target;
+- receive one immutable Poseidon2b header schedule, target and `pow_walk`
+  flag;
 - search independent values of its 128-bit nonce;
 - return a candidate nonce to the node.
 
@@ -43,13 +44,17 @@ Block production proceeds in this order:
 1. The node waits until it is synchronized and has the required authenticated
    peer quorum.
 2. It reads its canonical tip, current State and admissible mempool intents.
-3. It selects the B25 or B255 proof class and fixes every semantic field of the
-   candidate block except its nonce.
+3. It selects the small (`B25`) or large (`B255`) proof class and fixes every
+   semantic field of the candidate block except its nonce.
 4. It computes the exact slot writes and resulting UTXO root.
 5. It proves the new `HistoryStep`, including recursive continuity from the
    preceding terminal.
 6. The completed proof fixes one immutable mining template.
-7. The internal miner or an external worker searches the Poseidon2b nonce.
+7. The internal miner or an external worker searches the nonce. From block
+   24,846 each attempt is `TowerWalk(TowerHash(fields))`: the Poseidon2b
+   sponge produces a seed, and the walk over a 512 KiB scratchpad produces the
+   digest compared with the target (see
+   [Proof of work](../protocol/proof-of-work.md)).
 8. The node checks the nonce, seals the prepared terminal, commits the block
    atomically and announces it to peers.
 
@@ -107,6 +112,12 @@ jetsam --bench
 jetsam --bench 60 --cpu-threads 8
 ```
 
+It prints two lines. `sponge digest` is TowerHash alone, kept only to read
+blocks from before the fork. `walked digest` is the rate the miner actually
+searches at since block 24,846; size `--cpu-threads` on that one. Each walking
+thread needs 512 KiB of L2 cache to itself, so one thread per physical core is
+usually the best setting.
+
 Start Core with its built-in miner:
 
 ```sh
@@ -121,10 +132,11 @@ wallet. A separate canonical bech32m payout can be fixed with:
 jetsam --mode miner --miner-address j1...
 ```
 
-While it searches, the miner reports its measured rate every 15 seconds:
+While it searches, the miner reports its measured rate every 15 seconds, in
+this form (the figures depend on the machine):
 
 ```
-12:04:31  INFO miner: 2.79 MH/s (16 threads, 41068544 hashes total) height=257
+12:04:31  INFO ⛏  8.3 kH/s  ·  16 threads · 41068544 hashes total height=24910
 ```
 
 Watch readiness, chain progress and that same rate from another terminal:
@@ -159,7 +171,10 @@ jetsam-miner \
 ```
 
 The node prepares a complete proof before returning a template. The worker
-searches its nonce and submits only the result. Templates are single-use,
+searches its nonce and submits only the result. Every template carries
+`pow_walk: true` once TowerWalk governs its height; `jetsam-miner` reads that
+flag rather than the height, and sends the HTTP header `X-Jetsam-PoW: walk` so
+that a pool can tell it from a pre-fork miner. Templates are single-use,
 expire after 120 seconds and become stale immediately after a competing tip is
 accepted.
 
@@ -174,10 +189,10 @@ configuration and trust boundary are documented in
 [External miner](../operate/external-miner.md).
 
 Writing a miner or a pool from scratch, without any Jetsam mining software, is
-covered by [Stratum protocol and TowerHash specification](stratum.md). That
-document defines the proof of work down to the bit, with test vectors and a
-dependency-free reference implementation, and a Stratum-style pool protocol
-carrying it.
+covered by [Stratum protocol and proof-of-work specification](stratum.md). That
+document defines TowerHash and TowerWalk down to the bit, with test vectors and
+a dependency-free reference implementation, and a Stratum-style pool protocol
+carrying them.
 
 ## CPU and proof capacity
 
@@ -192,13 +207,13 @@ Wider kernels are selected at runtime when the host exposes them. The hardware
 check establishes that the production backend can run; it does not guarantee
 competitive mining performance.
 
-Every mining process begins with the B25 proof class. B255 is used only when
-measured complete preparation time supports the larger relation. Both classes
-prove the same consensus statement:
+Every mining process begins with the small proof class, named `B25` in the
+code. B255 is used only when measured complete preparation time supports the
+larger relation. Both classes prove the same consensus statement:
 
 | Class | Relation | Effective page positions |
 |---|---|---:|
-| B25 | `m=22` | up to 25 |
+| Small (`B25`) | `m=22` | up to 24 since block 17,750 (25 before) |
 | B255 | `m=24` | up to 255 |
 
 Proof construction and PoW are ordered all-core phases sharing one thread
@@ -206,10 +221,10 @@ budget. They are not two competing all-core jobs. On a public host, leaving
 some CPU capacity outside `--cpu-threads` keeps the operating
 system and peer service responsive.
 
-The network targets a 20-second mean block interval. This is not a deadline:
+The network targets a 90-second mean block interval. This is not a deadline:
 individual blocks may arrive sooner or much later. Proof latency still matters
 because a candidate becomes stale when another miner advances the tip. Measure
-the complete B25 preparation path on the intended machine rather than judging
+the complete small-class preparation path on the intended machine rather than judging
 it only by CPU model or advertised vCPU count.
 
 See [Hardware and capacity](../operate/hardware.md) and
@@ -218,9 +233,9 @@ floor and published reference timings.
 
 ## Difficulty, rewards and confirmations
 
-ASERT adjusts the Poseidon2b target against the complete interval between
-accepted blocks. Proof preparation, nonce search and propagation share that
-20-second mean target.
+ASERT adjusts the target against the complete interval between accepted
+blocks. Proof preparation, nonce search and propagation share that 90-second
+mean target.
 The chain with the greatest cumulative valid work wins; an equal-work tie uses
 the canonical block-hash tie-break.
 

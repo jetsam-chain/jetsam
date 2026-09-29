@@ -360,6 +360,7 @@ MiningInfo {
   active_slot_count: u64
   pow_hashrate_hps: number | null
   pow_hashes_total: u64
+  pow_walk?: bool
 }
 
 NodeStatus {
@@ -374,6 +375,8 @@ NodeStatus {
   worker_threads: usize
 }
 ```
+
+当下一个区块由 TowerWalk 工作量证明管辖时（公共网络自区块 24,846 起），`pow_walk` 为 `true`。值为 `false` 时该字段省略，因此为早期节点编写的客户端会把它读作 `false`。请读取该字段，不要根据高度推断。
 
 `isolated_mining` 是节点在特殊运营上下文中启动时的状态信息。公网部署不应
 把它用作远程控制凭据或对等节点属性。
@@ -668,6 +671,7 @@ BlockTemplateResponse {
   height: u64
   expires_in_seconds: u64
   n_txs: usize
+  pow_walk?: bool
   tx_input_counts?: usize[]
   tx_output_counts?: usize[]
   coinbase_value_micro_jtm: u64
@@ -686,6 +690,8 @@ BlockTemplateResponse {
 `pow_fields_hex` 包含 16 个连续的 16 字节小端字段。外部挖矿进程替换
 `nonce_field_index` 指向的字段——请从响应中读取该索引，不要硬编码。
 在本链上它的值为 **0**。
+
+`pow_walk: true` 表示有效 nonce 必须满足 `TowerWalk(TowerHash(patched_fields)) < difficulty_target`；缺失表示 `false`，此时只比较 TowerHash 摘要。节点依据模板自身的高度设置该字段，`waitBlockTemplate` 同理。矿工必须读取该字段，而不是根据高度推断：忽略它的矿工在遍历生效后提交的 nonce 会以 `-32025` 被拒绝。
 
 空行之后的七个字段让矿池无需比对 hex 即可回答「这是不是我已经派发过的任务，
 我还剩多少时间？」。它们都带有 `serde(default)`，因此针对旧节点编写的客户端
