@@ -273,6 +273,16 @@ pub(super) fn prove_and_verify_link_only(
     preparation: &HistoryStepParentRegionPreparation,
     z: &[F128],
 ) -> Result<(), RegionSidecarError> {
+    timed_link_only(preparation, z).map(|_| ())
+}
+
+/// [`prove_and_verify_link_only`] returning `(prove, verify, claim check)`
+/// wall times in milliseconds.
+pub(super) fn timed_link_only(
+    preparation: &HistoryStepParentRegionPreparation,
+    z: &[F128],
+) -> Result<[f64; 3], RegionSidecarError> {
+    let started = std::time::Instant::now();
     let plan = preparation.certified_c1_prover_plan()?;
     let mut prover = FsLaneChallenger::new_c1(LINK_ONLY_DOMAIN);
     let prefix = plan.prove_c1_walk_deferred_prefix(z, &mut prover)?;
@@ -284,6 +294,8 @@ pub(super) fn prove_and_verify_link_only(
         .map_err(|_| RegionSidecarError::InvalidProof)?;
     let (proof, prover_claims): (C1LinkRegionWalkDeferredProof, _) =
         prefix.finish(&terminals, &mut prover)?;
+    let prove_ms = started.elapsed().as_secs_f64() * 1e3;
+    let started = std::time::Instant::now();
 
     let total_vars = z.len().trailing_zeros() as usize;
     assert_eq!(1usize << total_vars, z.len(), "dyadic witness");
@@ -315,6 +327,8 @@ pub(super) fn prove_and_verify_link_only(
         verifier.sample_f256(),
         "Link-only prover/verifier transcript lockstep"
     );
+    let verify_ms = started.elapsed().as_secs_f64() * 1e3;
+    let started = std::time::Instant::now();
     for (index, claim) in claims.iter().enumerate() {
         assert_eq!(claim.k_skip, 0, "Link claims are plain multilinear");
         if mle_eval(z, &claim.x_rest) != claim.value {
@@ -322,7 +336,7 @@ pub(super) fn prove_and_verify_link_only(
             return Err(RegionSidecarError::InvalidProof);
         }
     }
-    Ok(())
+    Ok([prove_ms, verify_ms, started.elapsed().as_secs_f64() * 1e3])
 }
 
 fn mle_eval(values: &[F128], point: &[F256]) -> F256 {
@@ -748,6 +762,10 @@ mod client_slot {
         prepare_ms: f64,
         client_scratch_ms: f64,
         link_prove_ms: f64,
+        link_verify_ms: f64,
+        claim_check_ms: f64,
+        canonical_vk_ms: f64,
+        witness_vars: usize,
     }
 
     /// Production-scale carrier cost: B24 (m22) and B255 (m24) parent tiers,
@@ -793,6 +811,9 @@ mod client_slot {
             .iter()
             .map(ProofFixture::r_pcs)
             .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        geometry.canonical_vk(&test_spec()).expect("canonical VK");
+        cost.canonical_vk_ms = started.elapsed().as_secs_f64() * 1e3;
 
         // Native assembly alone (the Poseidon work of L-A/L-B).
         let started = std::time::Instant::now();
@@ -869,10 +890,71 @@ mod client_slot {
         cost.finalize = b.num_wires() - mark;
         cost.total = b.num_wires();
         let (_, z) = b.build();
-        let started = std::time::Instant::now();
-        prove_and_verify_link_only(&preparation, &z).expect("production Link walks");
-        cost.link_prove_ms = started.elapsed().as_secs_f64() * 1e3;
+        cost.witness_vars = z.len().trailing_zeros() as usize;
+        let [prove, verify, check] =
+            timed_link_only(&preparation, &z).expect("production Link walks");
+        cost.link_prove_ms = prove;
+        cost.link_verify_ms = verify;
+        cost.claim_check_ms = check;
         cost
+    }
+
+    /// Wires one parent arm spends verifying its parent's joint C1 sidecar
+    /// (Link walks under `link_vk` + the six Block walks), counted inside the
+    /// post-commit closure of the production C1 verifier replay.
+    fn recursive_sidecar_wires(
+        slot: usize,
+        link_vk: &LinkRegionSidecarVk,
+        block_vk: &crate::region_sidecar::BlockRegionSidecarVk,
+        spec: &jetsam_ivc_core::public_io::PublicIoSpec,
+    ) -> usize {
+        use crate::acceptance::history_step_bank::{
+            canonical_history_step_pcs_params, canonical_history_step_shape,
+            CanonicalHistoryStepClassId,
+        };
+        let class = CanonicalHistoryStepClassId::new(slot).expect("canonical slot");
+        let shape = canonical_history_step_shape(class);
+        let params = canonical_history_step_pcs_params(class);
+        let (field_proof, root) =
+            crate::acceptance::trace::self_verify::shape_only_field_r1cs_proof_c1(&shape, &params);
+        let sidecar = crate::region_sidecar::shape_only_joint_c1_region_sidecar_proof(
+            link_vk, block_vk, shape.m,
+        )
+        .expect("shape-only joint sidecar");
+        let mut b = FieldR1csBuilder::new_witness_only();
+        let digest = alloc_flat_digest(&mut b, &[0x42; 32]);
+        let post_commit = alloc_flat_digest(&mut b, &[0x43; 32]);
+        let root = alloc_flat_digest(&mut b, &root);
+        let io = (0..spec.io_len)
+            .map(|_| LinExpr::from_wire(b.alloc_f128(F128::ZERO)))
+            .collect::<Vec<_>>();
+        let proof =
+            C1FieldR1csProofTrace::alloc_shape_mode(&mut b, &field_proof, &shape, &params, false);
+        let mut channel = FsChannelUnionRecorder::new_c1(b"carrier-cost-sidecar");
+        let mut obligations = PcsWalkObligations::default();
+        let mut wires = 0usize;
+        crate::acceptance::trace::self_verify::verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+            &mut b,
+            &mut channel,
+            &shape,
+            &params,
+            &digest,
+            &root,
+            &proof,
+            spec,
+            &io,
+            &post_commit,
+            Some(&mut obligations),
+            |b, context| {
+                let start = b.num_wires();
+                crate::region_sidecar::verify_joint_c1_region_sidecar_trace_post_commit(
+                    b, context, link_vk, block_vk, &sidecar,
+                )
+                .expect("shape-only joint sidecar replays");
+                wires = b.num_wires() - start;
+            },
+        );
+        wires
     }
 
     /// M2 task 2.4 measurement: what walking the client proof costs at
@@ -948,9 +1030,50 @@ mod client_slot {
             );
         }
 
-        // 2. Wires per stage and native times, parent-only vs two-proof, for
-        //    both parent arms (B255 parent = arm 1).
-        for active in [1, 0] {
+        // 2. The recursive price: the NEXT block verifies this block's joint
+        //    sidecar inside each of its two parent arms (the ~255 k-row
+        //    "post-commit auxiliary" of the M1 ledger). Same measurement for
+        //    the released Link VK and for the two-proof one.
+        for slot in 0..2 {
+            let block_vk = &parts.direct_block_vks()[slot];
+            let before = recursive_sidecar_wires(slot, &parent_vk, block_vk, &spec);
+            let after = recursive_sidecar_wires(slot, &two_vk, block_vk, &spec);
+            // Attribution: L-A/L-B doubled alone, then the third L-C role alone.
+            let walks_only = LinkRegionSidecarVk::new(
+                two_vk.leaf_a().clone(),
+                two_vk.path_b().clone(),
+                parent_vk.rec_c().clone(),
+            )
+            .expect("hybrid VK");
+            let role_only = LinkRegionSidecarVk::new(
+                parent_vk.leaf_a().clone(),
+                parent_vk.path_b().clone(),
+                two_vk.rec_c().clone(),
+            )
+            .expect("hybrid VK");
+            let walks = recursive_sidecar_wires(slot, &walks_only, block_vk, &spec);
+            let role = recursive_sidecar_wires(slot, &role_only, block_vk, &spec);
+            eprintln!(
+                "[carrier-cost] recursive joint-sidecar verification, parent arm {slot}: \
+                 parent-only={before} two-proof={after} delta=+{} (L-A/L-B doubled alone +{}, \
+                 third L-C role alone +{})",
+                after - before,
+                walks - before,
+                role - before
+            );
+        }
+
+        // 3. Wires per stage and native times, parent-only vs two-proof, with
+        //    the B255 parent (m24) walked. Without the joint sidecar the two
+        //    tiers' replayed `[R]_prev` transcripts fall in different dyadic
+        //    classes, which one selected L-C key refuses, so both measurement
+        //    arms take the B255 form: the parent part is then identical in
+        //    both builds and every delta below is the client's alone.
+        let b255 =
+            || ProofFixture::shape_only(tiers[1].shape, tiers[1].params.clone(), tiers[1].digest);
+        let measured: [ProofFixture; 2] = [b255(), b255()];
+        for (active, _round) in [(1, 0), (1, 1)] {
+            let tiers = &measured;
             let parent_only = production_build(&tiers, None, active);
             let two_proof = production_build(&tiers, Some(&client), active);
             eprintln!("[carrier-cost] arm {active} parent-only {parent_only:?}");
@@ -958,7 +1081,7 @@ mod client_slot {
             eprintln!(
                 "[carrier-cost] arm {active} delta: columns +{} client arm +{} finalize +{} \
                  total +{} | assembly +{:.1} ms prepare +{:.1} ms client scratch +{:.1} ms \
-                 Link prove+verify +{:.1} ms",
+                 canonical VK +{:.1} ms Link prove +{:.1} ms Link verify +{:.1} ms",
                 two_proof.columns - parent_only.columns,
                 two_proof.client_arm,
                 two_proof.finalize - parent_only.finalize,
@@ -966,7 +1089,9 @@ mod client_slot {
                 two_proof.assembly_ms - parent_only.assembly_ms,
                 two_proof.prepare_ms - parent_only.prepare_ms,
                 two_proof.client_scratch_ms,
+                two_proof.canonical_vk_ms - parent_only.canonical_vk_ms,
                 two_proof.link_prove_ms - parent_only.link_prove_ms,
+                two_proof.link_verify_ms - parent_only.link_verify_ms,
             );
         }
     }
