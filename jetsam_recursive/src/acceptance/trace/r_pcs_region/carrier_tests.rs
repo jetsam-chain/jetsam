@@ -1,0 +1,984 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+// Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
+
+//! End-to-end tests of the HistoryStep Link carrier over real (small) C1
+//! proofs: the columns are prepared, the verifier arms run in region mode,
+//! the region is finalized, the whole trace must be satisfiable, and the
+//! three Link walks must prove and verify over the committed witness with
+//! every terminal claim holding on that witness.
+//!
+//! `parent_only_carrier_is_bit_identical` characterizes the carrier as it
+//! existed before the client slot: its wire count, matrix digest and Link VK
+//! digest are pinned. The `client-slot` tests describe the two-proof carrier.
+
+use super::*;
+use crate::acceptance::trace::self_verify::{
+    alloc_flat_digest, verify_field_c1_trace_deferred_region, C1FieldR1csProofTrace,
+};
+use crate::region_sidecar::{
+    verify_c1_link_region_walk_deferred_prefix, C1LinkRegionWalkDeferredProof,
+};
+use jetsam_ivc_core::challenger::{Challenger, FsLaneChallenger};
+use jetsam_ivc_core::deep_chain::c1::{
+    prove_ragged_deep_chain_walk, verify_ragged_deep_chain_walk,
+};
+use jetsam_ivc_core::field::F256;
+use jetsam_ivc_core::field_circuit::{ExtExpr, FsChannelOps, RecordedChannel};
+use jetsam_ivc_core::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+use jetsam_ivc_core::pcs::LOG_PACKING;
+use jetsam_ivc_core::proof::{C1FieldR1csProof, FieldShape};
+
+const PROOF_DOMAIN: &[u8] = b"carrier-test-proof";
+const CHILD_DOMAIN: &[u8] = b"carrier-test-child";
+const LINK_ONLY_DOMAIN: &[u8] = b"carrier-test-link-only";
+
+/// One honest C1 field proof over a synthetic satisfiable instance.
+pub(super) struct ProofFixture {
+    pub(super) shape: FieldShape,
+    pub(super) params: PcsParams,
+    pub(super) digest: [u8; 32],
+    pub(super) commitment: pcs::Commitment,
+    pub(super) proof: C1FieldR1csProof,
+}
+
+impl ProofFixture {
+    pub(super) fn new(m: usize, seed: u64) -> Self {
+        let (r1cs, witness): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(m, m, seed);
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut prover = FsLaneChallenger::new_c1(PROOF_DOMAIN);
+        let (proof, commitment, _, _) =
+            jetsam_ivc_prover::field_prover::prove_field_c1_capturing_fresh(
+                &r1cs,
+                &witness,
+                &params,
+                &mut prover,
+            );
+        Self {
+            shape: FieldShape::of(&r1cs),
+            params,
+            digest: r1cs.statement_digest(),
+            commitment,
+            proof,
+        }
+    }
+
+    /// A production-shape proof with honest uniform Merkle trees (the ghost
+    /// arm's proof): right dimensions, meaningless values.
+    #[cfg_attr(not(feature = "client-slot"), allow(dead_code))]
+    pub(super) fn shape_only(shape: FieldShape, params: PcsParams, digest: [u8; 32]) -> Self {
+        let (proof, root) =
+            crate::acceptance::trace::self_verify::shape_only_field_r1cs_proof_c1(&shape, &params);
+        Self {
+            shape,
+            commitment: pcs::Commitment {
+                root,
+                params: params.clone(),
+            },
+            params,
+            digest,
+            proof,
+        }
+    }
+
+    pub(super) fn r_pcs(&self) -> RPcsProof<'_> {
+        RPcsProof {
+            native: &self.proof.pcs_open,
+            params: &self.params,
+            commitment_root: flat_digest_lanes(&self.commitment.root),
+        }
+    }
+
+    /// Region-mode verifier replay on `b`, recording its transcript. Every
+    /// verifier rejection is multiplied by `gate` (when given).
+    pub(super) fn replay(
+        &self,
+        b: &mut FieldR1csBuilder,
+        gate: Option<&LinExpr>,
+    ) -> (PcsWalkObligations, RecordedChannel) {
+        let digest = alloc_flat_digest(b, &self.digest);
+        let root = alloc_flat_digest(b, &self.commitment.root);
+        let proof = C1FieldR1csProofTrace::alloc_shape_mode(
+            b,
+            &self.proof,
+            &self.shape,
+            &self.params,
+            false,
+        );
+        let mut channel = FsChannelUnionRecorder::new_c1(PROOF_DOMAIN);
+        let mut obligations = PcsWalkObligations::default();
+        let mut run = |b: &mut FieldR1csBuilder| {
+            verify_field_c1_trace_deferred_region(
+                b,
+                &mut channel,
+                &self.shape,
+                &self.params,
+                &digest,
+                &root,
+                &proof,
+                Some(&mut obligations),
+            );
+        };
+        match gate {
+            Some(gate) => with_pin_gate(gate, || run(b)),
+            None => run(b),
+        }
+        (obligations, channel.finish())
+    }
+
+    /// The same replay in a throw-away witness-only builder: the scratch
+    /// recording the carrier columns are allocated from.
+    pub(super) fn scratch(&self) -> LayoutRecordedChannel {
+        let mut b = FieldR1csBuilder::new_witness_only();
+        let (_, recording) = self.replay(&mut b, None);
+        capture(&recording, &b)
+    }
+}
+
+pub(super) fn capture(recording: &RecordedChannel, b: &FieldR1csBuilder) -> LayoutRecordedChannel {
+    LayoutRecordedChannel {
+        layout: compile_duplex(&recording.ops),
+        data_flat: recording.data_flat.clone(),
+        challenges: recording
+            .challenge_wires
+            .iter()
+            .map(|wire| Some(wire.eval(b.values())))
+            .collect(),
+        post_state: recording.post_state,
+        perms: recording.perms,
+    }
+}
+
+/// A small synthetic "Block child" transcript standing in for the joint
+/// sidecar child recording of a parent arm.
+pub(super) fn child_recording(b: &mut FieldR1csBuilder, seed: u64) -> RecordedChannel {
+    let value = F256::new(
+        F128::new(seed, seed.rotate_left(17)),
+        F128::new(seed ^ 0xA5A5, seed.rotate_left(41)),
+    );
+    let expression = ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(value.lo)),
+        LinExpr::from_wire(b.alloc_f128(value.hi)),
+    );
+    let mut recorder = FsChannelUnionRecorder::new_c1(CHILD_DOMAIN);
+    for _ in 0..3 {
+        recorder.observe_f256(b, &expression);
+        let _ = recorder.sample_f256(b);
+    }
+    recorder.finish()
+}
+
+pub(super) fn child_scratch(seed: u64) -> LayoutRecordedChannel {
+    let mut b = FieldR1csBuilder::new_witness_only();
+    let recording = child_recording(&mut b, seed);
+    capture(&recording, &b)
+}
+
+/// Two parent tiers (the canonical bank has two) at test scale.
+pub(super) const PARENT_TIER_MS: [usize; 2] = [8, 9];
+
+pub(super) struct ParentFixtures {
+    pub(super) tiers: [ProofFixture; 2],
+}
+
+impl ParentFixtures {
+    pub(super) fn new() -> Self {
+        Self {
+            tiers: [
+                ProofFixture::new(PARENT_TIER_MS[0], 0xCA11_0000),
+                ProofFixture::new(PARENT_TIER_MS[1], 0xCA11_0001),
+            ],
+        }
+    }
+
+    pub(super) fn params(&self) -> Vec<PcsParams> {
+        self.tiers.iter().map(|tier| tier.params.clone()).collect()
+    }
+
+    pub(super) fn geometry(&self) -> HistoryStepParentGeometry {
+        HistoryStepParentGeometry::from_parts(
+            &self.params(),
+            (0..2)
+                .map(|arm| child_scratch(arm as u64 + 1).layout)
+                .collect(),
+            self.tiers
+                .iter()
+                .map(|tier| tier.scratch().layout)
+                .collect(),
+        )
+        .expect("test-scale two-tier parent geometry")
+    }
+}
+
+/// One-hot arm selectors for `active` (booleanity and exclusivity pinned).
+pub(super) fn arm_selectors(b: &mut FieldR1csBuilder, active: usize) -> Vec<LinExpr> {
+    let selectors = (0..2)
+        .map(|arm| LinExpr::from_wire(b.alloc_bool(arm == active)))
+        .collect::<Vec<_>>();
+    let overlap = mul(b, &selectors[0], &selectors[1]);
+    pin_eq(b, &overlap, &LinExpr::zero());
+    pin_eq(
+        b,
+        &selectors[0].add(&selectors[1]),
+        &LinExpr::constant(F128::ONE),
+    );
+    selectors
+}
+
+/// The parent part of a carrier build: scratch recordings for both arms and
+/// the in-circuit replays of both arms under their selectors.
+pub(super) struct ParentArms {
+    pub(super) obligations: Vec<PcsWalkObligations>,
+    pub(super) children: Vec<RecordedChannel>,
+    pub(super) r_prev: Vec<RecordedChannel>,
+}
+
+pub(super) fn parent_scratches(
+    parents: &ParentFixtures,
+) -> (Vec<LayoutRecordedChannel>, Vec<LayoutRecordedChannel>) {
+    (
+        (0..2).map(|arm| child_scratch(arm as u64 + 1)).collect(),
+        parents.tiers.iter().map(ProofFixture::scratch).collect(),
+    )
+}
+
+pub(super) fn replay_parent_arms(
+    b: &mut FieldR1csBuilder,
+    parents: &ParentFixtures,
+    selectors: &[LinExpr],
+) -> ParentArms {
+    let mut arms = ParentArms {
+        obligations: Vec::new(),
+        children: Vec::new(),
+        r_prev: Vec::new(),
+    };
+    for (arm, tier) in parents.tiers.iter().enumerate() {
+        let (obligations, r_prev) = tier.replay(b, Some(&selectors[arm]));
+        arms.obligations.push(obligations);
+        arms.r_prev.push(r_prev);
+        arms.children.push(child_recording(b, arm as u64 + 1));
+    }
+    arms
+}
+
+/// Link-only sidecar: the three Link prefixes, one ragged walk over their
+/// three instances, the three suffixes — proven over `z`, verified, and every
+/// terminal claim evaluated directly on `z`.
+pub(super) fn prove_and_verify_link_only(
+    preparation: &HistoryStepParentRegionPreparation,
+    z: &[F128],
+) -> Result<(), RegionSidecarError> {
+    let plan = preparation.certified_c1_prover_plan()?;
+    let mut prover = FsLaneChallenger::new_c1(LINK_ONLY_DOMAIN);
+    let prefix = plan.prove_c1_walk_deferred_prefix(z, &mut prover)?;
+    let groups = prefix.groups();
+    let states = prefix.states();
+    let (walk, terminals) = prove_ragged_deep_chain_walk(&states, &groups, &mut prover);
+    let terminals: [_; 3] = terminals
+        .try_into()
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+    let (proof, prover_claims): (C1LinkRegionWalkDeferredProof, _) =
+        prefix.finish(&terminals, &mut prover)?;
+
+    let total_vars = z.len().trailing_zeros() as usize;
+    assert_eq!(1usize << total_vars, z.len(), "dyadic witness");
+    let mut verifier = FsLaneChallenger::new_c1(LINK_ONLY_DOMAIN);
+    let prefix = verify_c1_link_region_walk_deferred_prefix(
+        preparation.vk(),
+        total_vars,
+        &proof,
+        &mut verifier,
+    )?;
+    let groups = prefix.groups();
+    let w_logs = groups
+        .iter()
+        .map(|group| group.point.len())
+        .collect::<Vec<_>>();
+    let terminals = verify_ragged_deep_chain_walk(&w_logs, &groups, &walk, &mut verifier)
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+    let terminals: [_; 3] = terminals
+        .try_into()
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+    let claims = prefix.finish(&terminals, &mut verifier)?;
+    assert_eq!(
+        claims.len(),
+        prover_claims.len(),
+        "prover/verifier claim count"
+    );
+    assert_eq!(
+        prover.sample_f256(),
+        verifier.sample_f256(),
+        "Link-only prover/verifier transcript lockstep"
+    );
+    for (index, claim) in claims.iter().enumerate() {
+        assert_eq!(claim.k_skip, 0, "Link claims are plain multilinear");
+        if mle_eval(z, &claim.x_rest) != claim.value {
+            eprintln!("Link terminal claim {index} does not hold on the witness");
+            return Err(RegionSidecarError::InvalidProof);
+        }
+    }
+    Ok(())
+}
+
+fn mle_eval(values: &[F128], point: &[F256]) -> F256 {
+    assert_eq!(values.len(), 1usize << point.len());
+    let mut folded = values
+        .iter()
+        .copied()
+        .map(F256::from_base)
+        .collect::<Vec<_>>();
+    for &challenge in point {
+        folded = folded
+            .chunks_exact(2)
+            .map(|pair| pair[0] + challenge * (pair[0] + pair[1]))
+            .collect();
+    }
+    folded[0]
+}
+
+/// Build the parent-only carrier exactly as the relation does (columns,
+/// both arms, finalize) and return the built trace plus the Link region.
+fn build_parent_only(
+    parents: &ParentFixtures,
+    geometry: &HistoryStepParentGeometry,
+    active: usize,
+) -> (
+    FieldR1cs,
+    Vec<F128>,
+    usize,
+    HistoryStepParentRegionPreparation,
+) {
+    let (children, r_prev) = parent_scratches(parents);
+    let proofs = parents
+        .tiers
+        .iter()
+        .map(ProofFixture::r_pcs)
+        .collect::<Vec<_>>();
+    let mut b = FieldR1csBuilder::new();
+    let columns =
+        prepare_history_step_parent_columns(&mut b, &proofs, active, geometry, children, r_prev)
+            .expect("parent carrier columns");
+    let selectors = arm_selectors(&mut b, active);
+    let arms = replay_parent_arms(&mut b, parents, &selectors);
+    let preparation = finalize_history_step_parent_region(
+        &mut b,
+        columns,
+        &arms.obligations,
+        &selectors,
+        &arms.children,
+        &arms.r_prev,
+    )
+    .expect("parent carrier region");
+    let wires = b.num_wires();
+    let (r1cs, z) = b.build();
+    (r1cs, z, wires, preparation)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Characterization of the carrier as released (v1.3 relation): one walked
+/// proof. These values were captured on the unmodified tree (tag v1.4.3) and
+/// must never move while the `client-slot` feature is off.
+#[test]
+fn parent_only_carrier_is_bit_identical() {
+    let parents = ParentFixtures::new();
+    let geometry = parents.geometry();
+    let mut observed = Vec::new();
+    for active in 0..2 {
+        let (r1cs, z, wires, preparation) = build_parent_only(&parents, &geometry, active);
+        assert!(
+            r1cs.satisfies(&z),
+            "honest parent-only carrier (arm {active})"
+        );
+        prove_and_verify_link_only(&preparation, &z).expect("parent-only Link walks");
+        observed.push((
+            wires,
+            hex(&r1cs.structural_statement_digest()),
+            hex(&preparation.vk().transcript_digest()),
+        ));
+    }
+    // Parent selection changes witness values only.
+    assert_eq!(observed[0], observed[1], "arm selection moved the matrix");
+    let (wires, matrix, vk) = &observed[0];
+    eprintln!("[carrier] parent-only wires={wires} matrix={matrix} link_vk={vk}");
+    assert_eq!(
+        (wires.to_owned(), matrix.as_str(), vk.as_str()),
+        PARENT_ONLY_PINS,
+        "the parent-only carrier moved"
+    );
+}
+
+/// `(allocated wires, structural matrix digest, Link VK transcript digest)` of
+/// the parent-only test-scale carrier, captured on tag v1.4.3.
+const PARENT_ONLY_PINS: (usize, &str, &str) = (
+    178_819,
+    "8e952b1600cbe328c96ffea9dad99814d289026a0ea3efeb82b1fd7b7af5ae77",
+    "f98f7b42eb3aa7508d022958c0ed1c74c95eeb1545473134b1beb9009168416c",
+);
+
+/// The released v1.3 pack's runtime parts (recording layouts of both parent
+/// arms), read from `JETSAM_V13_RUNTIME` or the local release pack.
+pub(super) fn released_v13_parts() -> crate::acceptance::history_step::HistoryStepRuntimeParts {
+    let path = std::env::var("JETSAM_V13_RUNTIME")
+        .unwrap_or_else(|_| "/opt/jetsam-pack-v13/v1/history-step.runtime".to_owned());
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    // Header: 16-byte magic, u16 version, u64 body length; trailer: digest.
+    let body = &bytes[26..bytes.len() - 32];
+    crate::acceptance::history_step::HistoryStepRuntimeParts::decode_compact(&body[64..])
+        .expect("decode released v1.3 runtime parts")
+}
+
+pub(super) fn production_parent_params() -> Vec<PcsParams> {
+    (0..2)
+        .map(|slot| {
+            crate::acceptance::history_step_bank::canonical_history_step_pcs_params(
+                crate::acceptance::history_step_bank::CanonicalHistoryStepClassId::new(slot)
+                    .expect("canonical slot"),
+            )
+        })
+        .collect()
+}
+
+pub(super) fn production_parent_geometry(
+    parts: &crate::acceptance::history_step::HistoryStepRuntimeParts,
+) -> HistoryStepParentGeometry {
+    HistoryStepParentGeometry::new(
+        &production_parent_params(),
+        parts
+            .parent_transcripts()
+            .iter()
+            .map(|transcript| transcript.child().clone())
+            .collect(),
+        parts
+            .parent_transcripts()
+            .iter()
+            .map(|transcript| transcript.r_prev().clone())
+            .collect(),
+    )
+    .expect("production parent geometry")
+}
+
+/// Committed Link cells of one canonical VK: L-A (6 columns), L-B (9), L-C (6)
+/// and the one-cell selector.
+pub(super) fn committed_link_cells(vk: &LinkRegionSidecarVk) -> [usize; 4] {
+    [
+        6 << vk.leaf_a().w_log(),
+        N_COMMITTED_B << vk.path_b().w_log(),
+        6 << vk.rec_c().w_log(),
+        1,
+    ]
+}
+
+/// Production geometry of the released carrier (v1.3 relation, B24/B255
+/// parent arms, 133 queries). Pins the canonical Link VK digest the released
+/// matrices absorb, and prints the carrier dimensions.
+#[test]
+#[ignore = "diagnostic: reads the local v1.3 release pack"]
+fn production_carrier_geometry_diagnostic() {
+    let parts = released_v13_parts();
+    let geometry = production_parent_geometry(&parts);
+    let spec =
+        crate::acceptance::history_step_bank::history_step_bank_io_spec_for(parts.generation());
+    let vk = geometry.canonical_vk(&spec).expect("canonical Link VK");
+    assert_eq!(
+        vk.transcript_digest(),
+        parts.parent_recursion_vk().transcript_digest(),
+        "decoded parts and geometry disagree"
+    );
+    let dense = dense_path_geometry(&geometry.carrier).expect("dense path geometry");
+    let cells = committed_link_cells(&vk);
+    for (arm, transcript) in parts.parent_transcripts().iter().enumerate() {
+        eprintln!(
+            "[carrier-prod] arm {arm}: child slots={} r_prev slots={}",
+            transcript.child().slots.len(),
+            transcript.r_prev().slots.len()
+        );
+    }
+    eprintln!(
+        "[carrier-prod] parent-only: queries={} roles={} carrier_depths={:?} family_paths={:?} \
+         leaf_w_log={} path_w_log={} rec_w_log={} committed L-A={} L-B={} L-C={} sel={} total={} \
+         link_vk={}",
+        geometry.carrier.n_queries,
+        geometry.carrier.proof_roles,
+        dense.carrier_depths,
+        dense.family_path_counts,
+        vk.leaf_a().w_log(),
+        vk.path_b().w_log(),
+        vk.rec_c().w_log(),
+        cells[0],
+        cells[1],
+        cells[2],
+        cells[3],
+        cells.iter().sum::<usize>(),
+        hex(&vk.transcript_digest()),
+    );
+    assert_eq!(
+        hex(&vk.transcript_digest()),
+        RELEASED_V13_LINK_VK,
+        "the released carrier VK moved"
+    );
+}
+
+/// Canonical Link VK digest of the released v1.3 pack's carrier, captured on
+/// tag v1.4.3.
+const RELEASED_V13_LINK_VK: &str =
+    "66bc0cc46978c4c704116e40639942a09b1a73c31cb788eb16cdb8b883bf230b";
+
+/// The two-proof carrier: the selected parent AND a client proof ride the
+/// same three Link walks.
+#[cfg(feature = "client-slot")]
+mod client_slot {
+    use super::*;
+
+    /// Client form = the small parent class form (here: the m=8 tier).
+    const CLIENT_M: usize = PARENT_TIER_MS[0];
+
+    struct TwoProofBuild {
+        r1cs: FieldR1cs,
+        z: Vec<F128>,
+        wires: usize,
+        preparation: HistoryStepParentRegionPreparation,
+    }
+
+    /// Columns carry `carried`; the in-circuit client verifier replays
+    /// `verified` (whose transcript is the recorded client role).
+    fn build_two_proof(
+        parents: &ParentFixtures,
+        geometry: &HistoryStepParentGeometry,
+        active: usize,
+        carried: &ProofFixture,
+        verified: &ProofFixture,
+        client_present: bool,
+    ) -> TwoProofBuild {
+        let (children, r_prev) = parent_scratches(parents);
+        let proofs = parents
+            .tiers
+            .iter()
+            .map(ProofFixture::r_pcs)
+            .collect::<Vec<_>>();
+        let mut b = FieldR1csBuilder::new();
+        let columns = prepare_history_step_carrier_columns(
+            &mut b,
+            &proofs,
+            active,
+            geometry,
+            children,
+            r_prev,
+            ClientCarrierColumns {
+                proof: carried.r_pcs(),
+                recording: verified.scratch(),
+            },
+        )
+        .expect("two-proof carrier columns");
+        let selectors = arm_selectors(&mut b, active);
+        let arms = replay_parent_arms(&mut b, parents, &selectors);
+        let client_gate = LinExpr::from_wire(b.alloc_bool(client_present));
+        let (client_obligations, client_recorded) = verified.replay(&mut b, Some(&client_gate));
+        let preparation = finalize_history_step_carrier_region(
+            &mut b,
+            columns,
+            &arms.obligations,
+            &selectors,
+            &arms.children,
+            &arms.r_prev,
+            ClientCarrierDischarge {
+                obligations: &client_obligations,
+                recorded: &client_recorded,
+                gate: &client_gate,
+            },
+        )
+        .expect("two-proof carrier region");
+        let wires = b.num_wires();
+        let (r1cs, z) = b.build();
+        TwoProofBuild {
+            r1cs,
+            z,
+            wires,
+            preparation,
+        }
+    }
+
+    fn client_geometry(
+        parents: &ParentFixtures,
+        client: &ProofFixture,
+    ) -> HistoryStepParentGeometry {
+        parents
+            .geometry()
+            .with_client(&client.params, client.scratch().layout)
+            .expect("two-proof carrier geometry")
+    }
+
+    /// Both proofs are discharged: the trace is satisfiable for either parent
+    /// arm, the three Link walks prove and verify over the witness, parent
+    /// selection moves witness values only, and the client transcript is the
+    /// third L-C role, shared by both arms.
+    #[test]
+    fn two_proof_carrier_discharges_parent_and_client() {
+        let parents = ParentFixtures::new();
+        let client = ProofFixture::new(CLIENT_M, 0xC11E_0001);
+        let parent_only = parents.geometry();
+        let geometry = client_geometry(&parents, &client);
+        assert_eq!(geometry.carrier.proof_roles, 2, "two walked proofs");
+        let parent_vk = parent_only
+            .canonical_vk(&test_spec())
+            .expect("parent-only canonical VK");
+        let vk = geometry
+            .canonical_vk(&test_spec())
+            .expect("two-proof canonical VK");
+        assert_eq!(
+            vk.leaf_a().w_log(),
+            parent_vk.leaf_a().w_log() + 1,
+            "L-A tiles double"
+        );
+        assert_eq!(
+            vk.path_b().w_log(),
+            parent_vk.path_b().w_log() + 1,
+            "L-B paths double"
+        );
+        let client_layout = client.scratch().layout;
+        for arm in 0..2 {
+            let (layout, _) = vk.rec_c().selected_block(arm, 2).expect("third L-C role");
+            assert_eq!(
+                layout, &client_layout,
+                "client transcript role in arm {arm}"
+            );
+        }
+        assert_eq!(
+            vk.rec_c().selected_block(0, 2),
+            vk.rec_c().selected_block(1, 2),
+            "the client role does not depend on the parent arm"
+        );
+
+        let mut observed = Vec::new();
+        for active in 0..2 {
+            let built = build_two_proof(&parents, &geometry, active, &client, &client, true);
+            assert!(
+                built.r1cs.satisfies(&built.z),
+                "honest two-proof carrier (arm {active})"
+            );
+            prove_and_verify_link_only(&built.preparation, &built.z).expect("two-proof Link walks");
+            assert_eq!(
+                built.preparation.vk(),
+                &vk,
+                "prepared VK is the canonical VK"
+            );
+            observed.push((built.wires, hex(&built.r1cs.structural_statement_digest())));
+        }
+        assert_eq!(observed[0], observed[1], "arm selection moved the matrix");
+        eprintln!(
+            "[carrier] two-proof wires={} (parent-only pinned {}) link_vk={}",
+            observed[0].0,
+            PARENT_ONLY_PINS.0,
+            hex(&vk.transcript_digest())
+        );
+    }
+
+    /// The carrier is bound to the client proof the circuit verified: columns
+    /// built from any other client proof leave the trace unsatisfiable.
+    #[test]
+    fn carrier_rejects_a_client_proof_other_than_the_verified_one() {
+        let parents = ParentFixtures::new();
+        let verified = ProofFixture::new(CLIENT_M, 0xC11E_0002);
+        let substituted = ProofFixture::new(CLIENT_M, 0xC11E_0003);
+        let geometry = client_geometry(&parents, &verified);
+        let built = build_two_proof(&parents, &geometry, 0, &substituted, &verified, true);
+        assert!(
+            !built.r1cs.satisfies(&built.z),
+            "a substituted client proof satisfied the carrier"
+        );
+    }
+
+    /// `client_present = 0` releases every client obligation (a block without
+    /// a client still pays for the slot, but proves nothing about it), while
+    /// the parent stays fully bound.
+    #[test]
+    fn absent_client_releases_only_the_client_obligations() {
+        let parents = ParentFixtures::new();
+        let verified = ProofFixture::new(CLIENT_M, 0xC11E_0004);
+        let substituted = ProofFixture::new(CLIENT_M, 0xC11E_0005);
+        let geometry = client_geometry(&parents, &verified);
+        let built = build_two_proof(&parents, &geometry, 1, &substituted, &verified, false);
+        assert!(
+            built.r1cs.satisfies(&built.z),
+            "gated-off client still constrained"
+        );
+        prove_and_verify_link_only(&built.preparation, &built.z)
+            .expect("gated-off client Link walks");
+    }
+
+    /// A client form whose leaf signature or query count differs from the
+    /// parent classes cannot share the carrier.
+    #[test]
+    fn client_geometry_rejects_an_incompatible_form() {
+        let parents = ParentFixtures::new();
+        let client = ProofFixture::new(CLIENT_M, 0xC11E_0006);
+        let layout = client.scratch().layout;
+        let wider_leaves = PcsParams {
+            log_batch_size: client.params.log_batch_size + 1,
+            ..client.params.clone()
+        };
+        assert!(parents
+            .geometry()
+            .with_client(&wider_leaves, layout.clone())
+            .is_err());
+        let other_rate = PcsParams {
+            log_inv_rate: client.params.log_inv_rate + 1,
+            ..client.params.clone()
+        };
+        assert!(parents.geometry().with_client(&other_rate, layout).is_err());
+    }
+
+    /// Wires allocated by each stage of one carrier build, and its native
+    /// preparation / Link-only proving times.
+    #[derive(Debug, Default)]
+    struct StageCost {
+        columns: usize,
+        parent_arms: usize,
+        client_arm: usize,
+        finalize: usize,
+        total: usize,
+        assembly_ms: f64,
+        prepare_ms: f64,
+        client_scratch_ms: f64,
+        link_prove_ms: f64,
+    }
+
+    /// Production-scale carrier cost: B24 (m22) and B255 (m24) parent tiers,
+    /// client form = the B24 form. Shape-only proofs stand in for real ones
+    /// (identical dimensions); the parent `[R]_prev` recordings come from the
+    /// same region-mode replay (no joint sidecar), so the L-C width printed
+    /// for the real relation is taken from the released pack's layouts.
+    fn production_build(
+        tiers: &[ProofFixture; 2],
+        client: Option<&ProofFixture>,
+        active: usize,
+    ) -> StageCost {
+        let parents = ParentFixtures {
+            tiers: [
+                ProofFixture::shape_only(tiers[0].shape, tiers[0].params.clone(), tiers[0].digest),
+                ProofFixture::shape_only(tiers[1].shape, tiers[1].params.clone(), tiers[1].digest),
+            ],
+        };
+        let mut cost = StageCost::default();
+        let (children, r_prev) = parent_scratches(&parents);
+        let started = std::time::Instant::now();
+        let client_scratch = client.map(ProofFixture::scratch);
+        cost.client_scratch_ms = started.elapsed().as_secs_f64() * 1e3;
+        let mut geometry = HistoryStepParentGeometry::from_parts(
+            &parents.params(),
+            children
+                .iter()
+                .map(|recording| recording.layout.clone())
+                .collect(),
+            r_prev
+                .iter()
+                .map(|recording| recording.layout.clone())
+                .collect(),
+        )
+        .expect("measurement geometry");
+        if let (Some(client), Some(scratch)) = (client, &client_scratch) {
+            geometry = geometry
+                .with_client(&client.params, scratch.layout.clone())
+                .expect("measurement two-proof geometry");
+        }
+        let proofs = parents
+            .tiers
+            .iter()
+            .map(ProofFixture::r_pcs)
+            .collect::<Vec<_>>();
+
+        // Native assembly alone (the Poseidon work of L-A/L-B).
+        let started = std::time::Instant::now();
+        let walked = match client {
+            None => vec![parents.tiers[active].r_pcs()],
+            Some(client) => vec![parents.tiers[active].r_pcs(), client.r_pcs()],
+        };
+        let roles = match client {
+            None => vec![WalkedRole::Parent(active)],
+            Some(_) => vec![WalkedRole::Parent(active), WalkedRole::Client],
+        };
+        build_recording_free_link_assembly(&walked, &geometry.carrier, &roles)
+            .expect("production assembly");
+        cost.assembly_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        let mut b = FieldR1csBuilder::new();
+        let started = std::time::Instant::now();
+        let columns = match (client, client_scratch) {
+            (None, _) => prepare_history_step_parent_columns(
+                &mut b, &proofs, active, &geometry, children, r_prev,
+            ),
+            (Some(client), Some(recording)) => prepare_history_step_carrier_columns(
+                &mut b,
+                &proofs,
+                active,
+                &geometry,
+                children,
+                r_prev,
+                ClientCarrierColumns {
+                    proof: client.r_pcs(),
+                    recording,
+                },
+            ),
+            _ => unreachable!(),
+        }
+        .expect("production carrier columns");
+        cost.prepare_ms = started.elapsed().as_secs_f64() * 1e3;
+        cost.columns = b.num_wires();
+        let selectors = arm_selectors(&mut b, active);
+        let arms = replay_parent_arms(&mut b, &parents, &selectors);
+        cost.parent_arms = b.num_wires() - cost.columns;
+        let mark = b.num_wires();
+        let client_parts = client.map(|client| {
+            let gate = LinExpr::from_wire(b.alloc_bool(true));
+            let (obligations, recorded) = client.replay(&mut b, Some(&gate));
+            (gate, obligations, recorded)
+        });
+        cost.client_arm = b.num_wires() - mark;
+        let mark = b.num_wires();
+        let preparation = match &client_parts {
+            None => finalize_history_step_parent_region(
+                &mut b,
+                columns,
+                &arms.obligations,
+                &selectors,
+                &arms.children,
+                &arms.r_prev,
+            ),
+            Some((gate, obligations, recorded)) => finalize_history_step_carrier_region(
+                &mut b,
+                columns,
+                &arms.obligations,
+                &selectors,
+                &arms.children,
+                &arms.r_prev,
+                ClientCarrierDischarge {
+                    obligations,
+                    recorded,
+                    gate,
+                },
+            ),
+        }
+        .expect("production carrier region");
+        cost.finalize = b.num_wires() - mark;
+        cost.total = b.num_wires();
+        let (_, z) = b.build();
+        let started = std::time::Instant::now();
+        prove_and_verify_link_only(&preparation, &z).expect("production Link walks");
+        cost.link_prove_ms = started.elapsed().as_secs_f64() * 1e3;
+        cost
+    }
+
+    /// M2 task 2.4 measurement: what walking the client proof costs at
+    /// production scale. Run in release with `--features client-slot`.
+    #[test]
+    #[ignore = "diagnostic: production-scale carrier cost (release, reads the v1.3 pack)"]
+    fn production_two_proof_carrier_cost_diagnostic() {
+        let params = production_parent_params();
+        let shapes = (0..2).map(|slot| {
+            crate::acceptance::history_step_bank::canonical_history_step_shape(
+                crate::acceptance::history_step_bank::CanonicalHistoryStepClassId::new(slot)
+                    .expect("canonical slot"),
+            )
+        });
+        let tiers: Vec<ProofFixture> = shapes
+            .zip(params.iter())
+            .enumerate()
+            .map(|(slot, (shape, params))| {
+                ProofFixture::shape_only(shape, params.clone(), [0x50 + slot as u8; 32])
+            })
+            .collect();
+        let tiers: [ProofFixture; 2] = tiers.try_into().ok().expect("two tiers");
+        // Client form = the small class form (B24: m22, 133 queries).
+        let client = ProofFixture::shape_only(tiers[0].shape, tiers[0].params.clone(), [0xC1; 32]);
+
+        // 1. Geometry with the released layouts (real L-C width).
+        let parts = released_v13_parts();
+        let spec =
+            crate::acceptance::history_step_bank::history_step_bank_io_spec_for(parts.generation());
+        let parent_geometry = production_parent_geometry(&parts);
+        let client_layout = client.scratch().layout;
+        let two_geometry = production_parent_geometry(&parts)
+            .with_client(&client.params, client_layout.clone())
+            .expect("production two-proof geometry");
+        let parent_vk = parent_geometry.canonical_vk(&spec).expect("parent-only VK");
+        let two_vk = two_geometry.canonical_vk(&spec).expect("two-proof VK");
+        let parent_cells = committed_link_cells(&parent_vk);
+        let two_cells = committed_link_cells(&two_vk);
+        eprintln!(
+            "[carrier-cost] client form m={} queries={} client transcript slots={} (dyadic {})",
+            client.shape.m,
+            client.proof.pcs_open.queries.len(),
+            client_layout.slots.len(),
+            client_layout.slots.len().next_power_of_two()
+        );
+        for (name, vk, cells) in [
+            ("parent-only", &parent_vk, parent_cells),
+            ("two-proof  ", &two_vk, two_cells),
+        ] {
+            eprintln!(
+                "[carrier-cost] {name}: w_log L-A={} L-B={} L-C={} committed L-A={} L-B={} \
+                 L-C={} sel={} total={}",
+                vk.leaf_a().w_log(),
+                vk.path_b().w_log(),
+                vk.rec_c().w_log(),
+                cells[0],
+                cells[1],
+                cells[2],
+                cells[3],
+                cells.iter().sum::<usize>()
+            );
+        }
+        for (slot, block) in parts.direct_block_vks().iter().enumerate() {
+            eprintln!(
+                "[carrier-cost] joint walk, Block slot {slot} w_logs: wallet_a={} meta_a={} \
+                 wallet_b={} meta_b={} owner_c={} main_c={}",
+                block.wallet_a().w_log(),
+                block.meta_a().w_log(),
+                block.wallet_b().w_log(),
+                block.meta_b().w_log(),
+                block.owner_c().w_log(),
+                block.main_c().w_log(),
+            );
+        }
+
+        // 2. Wires per stage and native times, parent-only vs two-proof, for
+        //    both parent arms (B255 parent = arm 1).
+        for active in [1, 0] {
+            let parent_only = production_build(&tiers, None, active);
+            let two_proof = production_build(&tiers, Some(&client), active);
+            eprintln!("[carrier-cost] arm {active} parent-only {parent_only:?}");
+            eprintln!("[carrier-cost] arm {active} two-proof   {two_proof:?}");
+            eprintln!(
+                "[carrier-cost] arm {active} delta: columns +{} client arm +{} finalize +{} \
+                 total +{} | assembly +{:.1} ms prepare +{:.1} ms client scratch +{:.1} ms \
+                 Link prove+verify +{:.1} ms",
+                two_proof.columns - parent_only.columns,
+                two_proof.client_arm,
+                two_proof.finalize - parent_only.finalize,
+                two_proof.total - parent_only.total,
+                two_proof.assembly_ms - parent_only.assembly_ms,
+                two_proof.prepare_ms - parent_only.prepare_ms,
+                two_proof.client_scratch_ms,
+                two_proof.link_prove_ms - parent_only.link_prove_ms,
+            );
+        }
+    }
+
+    fn test_spec() -> jetsam_ivc_core::public_io::PublicIoSpec {
+        jetsam_ivc_core::public_io::PublicIoSpec {
+            io_slice: jetsam_ivc_core::public_io::WitnessSlice {
+                log2_len: 10,
+                index: 1,
+            },
+            io_len: 900,
+            claims: Vec::new(),
+        }
+    }
+}

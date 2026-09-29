@@ -3,6 +3,12 @@ name = "jetsam_recursive"
 version.workspace = true
 edition = "2021"
 
+[features]
+# v1.5 prototype (M2): the HistoryStep Link carrier walks a second proof, the
+# client proof, next to the selected parent. Off by default; without it the
+# relation and its matrices are bit-identical to the released v1.3 relation.
+client-slot = []
+
 [dependencies]
 jetsam_core = { path = "../jetsam_core" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }

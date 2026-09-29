@@ -135,11 +135,23 @@ pub(crate) struct HistoryStepPcsCarrierGeometry {
     groups: Vec<Vec<TreeInfo>>,
     n_queries: usize,
     proof_roles: usize,
+    /// The client proof's PCS parameters and tree ladder, when this carrier
+    /// walks a second proof (`client-slot`). It shares the universal leaf
+    /// signature and the query count of the parent tiers.
+    client_group: Option<(PcsParams, Vec<TreeInfo>)>,
 }
 
 impl HistoryStepPcsCarrierGeometry {
+    /// Every tree ladder the carrier topology must accommodate: the parent
+    /// tiers, then the client form when present.
+    fn walked_groups(&self) -> impl Iterator<Item = &Vec<TreeInfo>> {
+        self.groups
+            .iter()
+            .chain(self.client_group.iter().map(|(_, trees)| trees))
+    }
+
     fn subchannel_count(&self) -> usize {
-        self.groups.iter().map(Vec::len).max().unwrap_or(0)
+        self.walked_groups().map(Vec::len).max().unwrap_or(0)
     }
 
     /// Exact L-A leaf schedule at each tree position. A smaller tier may omit a
@@ -154,8 +166,7 @@ impl HistoryStepPcsCarrierGeometry {
         let mut lanes = Vec::with_capacity(positions);
         for position in 0..positions {
             let mut present = self
-                .groups
-                .iter()
+                .walked_groups()
                 .filter_map(|group| group.get(position))
                 .map(|tree| tree.lanes);
             let first = present
@@ -181,8 +192,7 @@ impl HistoryStepPcsCarrierGeometry {
         let mut depths = Vec::with_capacity(positions);
         for position in 0..positions {
             let max_actual = self
-                .groups
-                .iter()
+                .walked_groups()
                 .filter_map(|group| group.get(position))
                 .map(|tree| tree.depth)
                 .max()
@@ -210,6 +220,51 @@ pub(crate) struct HistoryStepParentGeometry {
     r_prev_layouts: Vec<DuplexLayout>,
     selected_recording_blocks: [Vec<(DuplexLayout, usize)>; 2],
     rec_w_log: usize,
+    /// The client verifier's transcript layout: a third L-C role, identical
+    /// in both parent arms (`client-slot`).
+    client_layout: Option<DuplexLayout>,
+}
+
+/// Pack each parent arm's recording roles — Block child, `[R]_prev`, then the
+/// client transcript when present — into one dyadic L-C domain. Both arms
+/// must land on identical offsets and width, so one fixed key serves both.
+fn pack_selected_recording_arms(
+    child_layouts: &[DuplexLayout],
+    r_prev_layouts: &[DuplexLayout],
+    client_layout: Option<&DuplexLayout>,
+) -> Result<([Vec<(DuplexLayout, usize)>; 2], usize), RegionSidecarError> {
+    if child_layouts.len() != 2 || r_prev_layouts.len() != 2 {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    let mut arm_blocks = Vec::with_capacity(2);
+    let mut common_w_log = None;
+    let mut common_offsets = None;
+    for arm in 0..2 {
+        let mut layouts = vec![&child_layouts[arm], &r_prev_layouts[arm]];
+        layouts.extend(client_layout);
+        let (offsets, w_log) = pack_recording_only_blocks(&layouts);
+        if common_w_log.is_some_and(|expected| expected != w_log)
+            || common_offsets
+                .as_ref()
+                .is_some_and(|expected: &Vec<usize>| expected != &offsets)
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        common_w_log = Some(w_log);
+        common_offsets = Some(offsets.clone());
+        arm_blocks.push(
+            layouts
+                .into_iter()
+                .cloned()
+                .zip(offsets)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let selected_recording_blocks: [Vec<(DuplexLayout, usize)>; 2] = arm_blocks
+        .try_into()
+        .expect("exactly two HistoryStep recording arms");
+    let rec_w_log = common_w_log.ok_or(RegionSidecarError::BadVk)?;
+    Ok((selected_recording_blocks, rec_w_log))
 }
 
 impl HistoryStepParentGeometry {
@@ -249,46 +304,57 @@ impl HistoryStepParentGeometry {
             groups,
             n_queries,
             proof_roles: 1,
+            client_group: None,
         };
         carrier.leaf_lanes()?;
         carrier.path_carrier_depths()?;
-        if child_layouts.len() != 2 {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        let mut arm_blocks = Vec::with_capacity(2);
-        let mut common_w_log = None;
-        let mut common_offsets = None;
-        for arm in 0..2 {
-            let layouts = [&child_layouts[arm], &r_prev_layouts[arm]];
-            let (offsets, w_log) = pack_recording_only_blocks(&layouts);
-            if common_w_log.is_some_and(|expected| expected != w_log)
-                || common_offsets
-                    .as_ref()
-                    .is_some_and(|expected: &Vec<usize>| expected != &offsets)
-            {
-                return Err(RegionSidecarError::UnsupportedVkShape);
-            }
-            common_w_log = Some(w_log);
-            common_offsets = Some(offsets.clone());
-            arm_blocks.push(
-                layouts
-                    .into_iter()
-                    .cloned()
-                    .zip(offsets)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        let selected_recording_blocks: [Vec<(DuplexLayout, usize)>; 2] = arm_blocks
-            .try_into()
-            .expect("exactly two HistoryStep recording arms");
-        let rec_w_log = common_w_log.ok_or(RegionSidecarError::BadVk)?;
+        let (selected_recording_blocks, rec_w_log) =
+            pack_selected_recording_arms(&child_layouts, &r_prev_layouts, None)?;
         Ok(Self {
             carrier,
             child_layouts,
             r_prev_layouts,
             selected_recording_blocks,
             rec_w_log,
+            client_layout: None,
         })
+    }
+
+    // Reached only through the `client-slot` API, which the relation's
+    // client arm (M2 task 2.3) will call; until then only tests reach it.
+    #[cfg_attr(any(not(feature = "client-slot"), not(test)), allow(dead_code))]
+    /// Add the client proof as a second walked role. The client form must
+    /// share the parent tiers' query count and per-position leaf signature;
+    /// its paths ride the same L-B families (a shorter tree is a causal
+    /// prefix of its carrier) and its transcript becomes the third L-C role.
+    fn add_client(
+        mut self,
+        client_params: &PcsParams,
+        client_layout: DuplexLayout,
+    ) -> Result<Self, RegionSidecarError> {
+        if self.carrier.client_group.is_some() || client_layout.slots.is_empty() {
+            return Err(RegionSidecarError::BadVk);
+        }
+        let config =
+            pcs::checked_fri_configuration(client_params.log_dim(), client_params.log_inv_rate)
+                .map_err(|_| RegionSidecarError::UnsupportedVkShape)?;
+        let trees = checked_tree_structure(client_params)?;
+        if config.query_count != self.carrier.n_queries || trees.len() < 2 {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        self.carrier.client_group = Some((client_params.clone(), trees));
+        self.carrier.proof_roles = 2;
+        self.carrier.leaf_lanes()?;
+        self.carrier.path_carrier_depths()?;
+        let (selected_recording_blocks, rec_w_log) = pack_selected_recording_arms(
+            &self.child_layouts,
+            &self.r_prev_layouts,
+            Some(&client_layout),
+        )?;
+        self.selected_recording_blocks = selected_recording_blocks;
+        self.rec_w_log = rec_w_log;
+        self.client_layout = Some(client_layout);
+        Ok(self)
     }
 
     pub(crate) fn new(
@@ -336,12 +402,29 @@ impl HistoryStepParentGeometry {
         self.vk_from_slices(leaf, path, rec, selector)
     }
 
+    #[cfg(test)]
     fn recording_union(
         &self,
         children: &[LayoutRecordedChannel],
         r_prev: &[LayoutRecordedChannel],
         active_slot: usize,
     ) -> Result<DuplexUnion, RegionSidecarError> {
+        self.recording_union_with_client(children, r_prev, active_slot, None)
+    }
+
+    fn recording_union_with_client(
+        &self,
+        children: &[LayoutRecordedChannel],
+        r_prev: &[LayoutRecordedChannel],
+        active_slot: usize,
+        client: Option<&LayoutRecordedChannel>,
+    ) -> Result<DuplexUnion, RegionSidecarError> {
+        match (client, &self.client_layout) {
+            (None, None) => {}
+            (Some(recording), Some(layout))
+                if &recording.layout == layout && recording.data_flat.len() == layout.n_data => {}
+            _ => return Err(RegionSidecarError::UnsupportedVkShape),
+        }
         if children.len() != self.tier_count()
             || r_prev.len() != self.tier_count()
             || active_slot >= self.tier_count()
@@ -373,6 +456,7 @@ impl HistoryStepParentGeometry {
             ),
         ]
         .into_iter()
+        .chain(client.map(|recording| (&recording.layout, recording.data_flat.as_slice())))
         .map(|(layout, data)| RecordingSpec {
             layout: layout.clone(),
             iv_flat: FsChannelUnionRecorder::capacity_iv_flat_c1(),
@@ -555,6 +639,8 @@ struct RecordingFreeLinkAssembly {
     leaf_descriptor: CombinedDuplexRegionDescriptor,
     /// Tree ladders for every selectable verifier arm.
     all_trees: Vec<Vec<TreeInfo>>,
+    /// The client's tree ladder when a second proof is walked (role 1).
+    client_trees: Option<Vec<TreeInfo>>,
     /// Universal leaf lane count indexed by tree position.
     leaf_lanes: Vec<usize>,
     /// Global-within-tile `(slot, A-lane)` data cells per tree-position
@@ -734,27 +820,44 @@ pub(crate) fn canonical_link_walk_slices(
     (leaf, path, rec, selector)
 }
 
+/// Which ladder a walked proof must match: the active parent tier (role 0)
+/// or the client form (role 1, `client-slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(not(feature = "client-slot"), not(test)), allow(dead_code))]
+enum WalkedRole {
+    Parent(usize),
+    Client,
+}
+
 fn build_recording_free_link_assembly(
     proofs: &[RPcsProof<'_>],
     geometry: &HistoryStepPcsCarrierGeometry,
-    active_groups: &[usize],
+    roles: &[WalkedRole],
 ) -> Result<RecordingFreeLinkAssembly, RegionSidecarError> {
     if proofs.is_empty()
-        || proofs.len() != active_groups.len()
+        || proofs.len() != roles.len()
         || proofs.len() != geometry.proof_roles
         || proofs.len() > 2
     {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    // The active group is the predecessor's output tier; universal carrier
-    // topology stays unchanged by that selection.
-    if active_groups
+    // Role 0 is the predecessor's output tier; universal carrier topology
+    // stays unchanged by that selection. Role 1, when walked, is the client.
+    let expected = roles
         .iter()
-        .any(|group| *group >= geometry.groups.len())
-        || (proofs.len() == 2 && (active_groups[0] != 0 || active_groups[1] == 0))
-    {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
+        .enumerate()
+        .map(|(role_index, role)| match (role_index, role) {
+            (0, WalkedRole::Parent(group)) if *group < geometry.groups.len() => {
+                Ok((&geometry.groups[*group], &geometry.group_params[*group]))
+            }
+            (1, WalkedRole::Client) => geometry
+                .client_group
+                .as_ref()
+                .map(|(params, trees)| (trees, params))
+                .ok_or(RegionSidecarError::UnsupportedVkShape),
+            _ => Err(RegionSidecarError::UnsupportedVkShape),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let trees = proofs
         .iter()
         .map(|proof| checked_tree_structure(proof.params))
@@ -767,10 +870,10 @@ fn build_recording_free_link_assembly(
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     for (proof_index, actual) in trees.iter().enumerate() {
-        let active_group = active_groups[proof_index];
-        if actual != &geometry.groups[active_group]
+        let (expected_trees, expected_params) = expected[proof_index];
+        if actual != expected_trees
             || pcs_params_statement_bytes(proofs[proof_index].params)
-                != pcs_params_statement_bytes(&geometry.group_params[active_group])
+                != pcs_params_statement_bytes(expected_params)
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -994,6 +1097,10 @@ fn build_recording_free_link_assembly(
         u_a,
         leaf_descriptor,
         all_trees: geometry.groups.clone(),
+        client_trees: geometry
+            .client_group
+            .as_ref()
+            .map(|(_, trees)| trees.clone()),
         leaf_lanes: universal_leaf_lanes,
         leaf_data_positions,
         s_log,
@@ -1022,6 +1129,8 @@ pub(crate) struct HistoryStepParentColumns {
     u_rec: DuplexUnion,
     child_scratches: Vec<LayoutRecordedChannel>,
     r_prev_scratches: Vec<LayoutRecordedChannel>,
+    /// The client verifier's scratch recording (third L-C role), if walked.
+    client_scratch: Option<LayoutRecordedChannel>,
     active_slot: usize,
     vk: LinkRegionSidecarVk,
 }
@@ -1084,15 +1193,64 @@ pub(crate) fn prepare_history_step_parent_columns(
     child_recordings: Vec<LayoutRecordedChannel>,
     r_prev_recordings: Vec<LayoutRecordedChannel>,
 ) -> Result<HistoryStepParentColumns, RegionSidecarError> {
+    prepare_carrier_columns(
+        b,
+        proofs,
+        active_slot,
+        geometry,
+        child_recordings,
+        r_prev_recordings,
+        None,
+    )
+}
+
+fn prepare_carrier_columns(
+    b: &mut FieldR1csBuilder,
+    proofs: &[RPcsProof<'_>],
+    active_slot: usize,
+    geometry: &HistoryStepParentGeometry,
+    child_recordings: Vec<LayoutRecordedChannel>,
+    r_prev_recordings: Vec<LayoutRecordedChannel>,
+    client: Option<(RPcsProof<'_>, LayoutRecordedChannel)>,
+) -> Result<HistoryStepParentColumns, RegionSidecarError> {
     if proofs.len() != geometry.tier_count() || active_slot >= geometry.tier_count() {
         return Err(RegionSidecarError::BadVk);
     }
-    let asm = build_recording_free_link_assembly(
-        std::slice::from_ref(&proofs[active_slot]),
-        &geometry.carrier,
-        &[active_slot],
+    let (asm, client_scratch) = match client {
+        None => (
+            build_recording_free_link_assembly(
+                std::slice::from_ref(&proofs[active_slot]),
+                &geometry.carrier,
+                &[WalkedRole::Parent(active_slot)],
+            )?,
+            None,
+        ),
+        Some((client_proof, client_scratch)) => {
+            let parent = &proofs[active_slot];
+            let walked = [
+                RPcsProof {
+                    native: parent.native,
+                    params: parent.params,
+                    commitment_root: parent.commitment_root,
+                },
+                client_proof,
+            ];
+            (
+                build_recording_free_link_assembly(
+                    &walked,
+                    &geometry.carrier,
+                    &[WalkedRole::Parent(active_slot), WalkedRole::Client],
+                )?,
+                Some(client_scratch),
+            )
+        }
+    };
+    let u_rec = geometry.recording_union_with_client(
+        &child_recordings,
+        &r_prev_recordings,
+        active_slot,
+        client_scratch.as_ref(),
     )?;
-    let u_rec = geometry.recording_union(&child_recordings, &r_prev_recordings, active_slot)?;
     let slices_a = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &asm.u_a.committed[column], asm.u_a.w_log)
     });
@@ -1158,6 +1316,7 @@ pub(crate) fn prepare_history_step_parent_columns(
         u_rec,
         child_scratches: child_recordings,
         r_prev_scratches: r_prev_recordings,
+        client_scratch,
         active_slot,
         vk,
     })
@@ -1348,6 +1507,182 @@ pub(crate) fn finalize_history_step_parent_region(
     recorded_children: &[FsRecordedChannel],
     recorded_r_prev: &[FsRecordedChannel],
 ) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
+    finalize_carrier_region(
+        b,
+        columns,
+        obligations,
+        arm_selectors,
+        recorded_children,
+        recorded_r_prev,
+        None,
+    )
+}
+
+/// L-A and L-B carry one walked proof per role block of `n_queries` tiles /
+/// paths. The digest cell of every leaf equals the entry of its path.
+fn pin_leaf_path_joins(
+    b: &mut FieldR1csBuilder,
+    asm: &RecordingFreeLinkAssembly,
+    slices_a: &[WitnessSlice; 6],
+    slices_b: &[WitnessSlice; N_COMMITTED_B],
+    block_base: usize,
+) {
+    let per_tile = 1usize << asm.u_a.block_log;
+    let subchannel_slots = 1usize << asm.s_log;
+    for query_index in 0..asm.n_queries {
+        let block = block_base + query_index;
+        let tile_offset = block * per_tile;
+        for tree_index in 0..asm.carrier_depths.len() {
+            let digest_slot =
+                tile_offset + tree_index * subchannel_slots + asm.leaf_lanes[tree_index] / 2 - 1;
+            let carrier_depth = asm.carrier_depths[tree_index];
+            let leg_slot = asm.leg_offsets[tree_index] + block * carrier_depth;
+            for lane in 0..2 {
+                pin_eq(
+                    b,
+                    &slot_cell(&slices_a[2 + lane], digest_slot),
+                    &slot_cell(&slices_b[4 + lane], leg_slot),
+                );
+            }
+        }
+    }
+}
+
+/// Pin one verifier's leaf and path obligations to the tiles and paths of
+/// the role block starting at `block_base`: leaf lanes to A-cells, direction
+/// bits to D, the FS-observed root to `CR(actual_depth)` (or to the final
+/// feed-forward node when the path fills its carrier).
+#[allow(clippy::too_many_arguments)]
+fn pin_walked_obligations(
+    b: &mut FieldR1csBuilder,
+    asm: &RecordingFreeLinkAssembly,
+    slices_a: &[WitnessSlice; 6],
+    slices_b: &[WitnessSlice; N_COMMITTED_B],
+    trees: &[TreeInfo],
+    obligations: &PcsWalkObligations,
+    block_base: usize,
+    what: &str,
+) {
+    let per_tile = 1usize << asm.u_a.block_log;
+    let n_trees = trees.len();
+    for query_index in 0..asm.n_queries {
+        let block = block_base + query_index;
+        let tile_offset = block * per_tile;
+        for tree_index in 0..n_trees {
+            let obligation_index = query_index * n_trees + tree_index;
+            let leaf = &obligations.leaves[obligation_index];
+            let positions = &asm.leaf_data_positions[tree_index];
+            assert_eq!(
+                leaf.lanes.len(),
+                positions.len(),
+                "HistoryStep parent leaf lanes"
+            );
+            for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
+                pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
+            }
+
+            let obligation = &obligations.paths[obligation_index];
+            assert_eq!(
+                obligation.leaf, obligation_index,
+                "HistoryStep parent leaf/path pairing in {what}"
+            );
+            let tree = trees[tree_index];
+            assert_eq!(obligation.dir_bits.len(), tree.depth);
+            let carrier_depth = asm.carrier_depths[tree_index];
+            let leg_slot = asm.leg_offsets[tree_index] + block * carrier_depth;
+            for (level, bit) in obligation.dir_bits.iter().enumerate() {
+                pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
+            }
+            for lane in 0..2 {
+                let root = if tree.depth < carrier_depth {
+                    slot_cell(&slices_b[4 + lane], leg_slot + tree.depth)
+                } else {
+                    let last = leg_slot + tree.depth - 1;
+                    let carried = slot_cell(&slices_b[4 + lane], last);
+                    let sibling = slot_cell(&slices_b[6 + lane], last);
+                    let direction = slot_cell(&slices_b[8], last);
+                    let selected_delta = mul(b, &direction, &carried.add(&sibling));
+                    slot_cell(&slices_b[lane], last)
+                        .add(&carried)
+                        .add(&selected_delta)
+                };
+                pin_eq(b, &root, &obligation.root[lane]);
+            }
+        }
+    }
+}
+
+fn assert_obligation_counts(obligations: &PcsWalkObligations, n_queries: usize, n_trees: usize) {
+    assert_eq!(
+        obligations.leaves.len(),
+        n_queries * n_trees,
+        "HistoryStep parent leaf obligation count"
+    );
+    assert_eq!(
+        obligations.paths.len(),
+        obligations.leaves.len(),
+        "HistoryStep parent path/leaf pairing"
+    );
+}
+
+/// Bind a recording role that is the same in both parent arms (the client
+/// transcript): every recorded cell's reserved row becomes `cell = source`,
+/// so the role costs no row beyond its committed cells.
+#[allow(clippy::too_many_arguments)]
+fn pin_common_recording_role(
+    b: &mut FieldR1csBuilder,
+    what: &str,
+    scratch: &LayoutRecordedChannel,
+    recording: &FsRecordedChannel,
+    rec_vk: &RecordingDuplexRegionVk,
+    role: usize,
+    u_rec: &DuplexUnion,
+    slices_rec: &[WitnessSlice; 6],
+    union_block: usize,
+    constraint_slots: &mut BTreeMap<(usize, usize), DeferredConstraintSlot>,
+) -> Result<(), RegionSidecarError> {
+    let block = rec_vk
+        .selected_block(0, role)
+        .ok_or(RegionSidecarError::UnsupportedVkShape)?;
+    if rec_vk.selected_block(1, role) != Some(block) || u_rec.rec_blocks[union_block] != *block {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    let bindings = recording_block_bindings(b, what, scratch, recording, block);
+    assert_eq!(
+        recording.challenge_wires.len(),
+        u_rec.rec_challenges[union_block].len(),
+        "{what} recording challenge count"
+    );
+    for (k, wire) in recording.challenge_wires.iter().enumerate() {
+        assert_eq!(
+            wire.eval(b.values()),
+            u_rec.rec_challenges[union_block][k],
+            "{what} recording challenge {k} lockstep"
+        );
+    }
+    let one = b.one();
+    for ((column, offset), source) in bindings {
+        if slices_rec.get(column).is_none() {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        let constraint_slot = constraint_slots
+            .remove(&(column, offset))
+            .ok_or(RegionSidecarError::UnsupportedVkShape)?;
+        b.seal_deferred_constraint(constraint_slot, &source, &one)
+            .map_err(|_| RegionSidecarError::InvalidProof)?;
+    }
+    Ok(())
+}
+
+fn finalize_carrier_region(
+    b: &mut FieldR1csBuilder,
+    columns: HistoryStepParentColumns,
+    obligations: &[PcsWalkObligations],
+    arm_selectors: &[LinExpr],
+    recorded_children: &[FsRecordedChannel],
+    recorded_r_prev: &[FsRecordedChannel],
+    client: Option<(&PcsWalkObligations, &FsRecordedChannel, &LinExpr)>,
+) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
     let HistoryStepParentColumns {
         asm,
         slices_a,
@@ -1358,6 +1693,7 @@ pub(crate) fn finalize_history_step_parent_region(
         u_rec,
         child_scratches,
         r_prev_scratches,
+        client_scratch,
         active_slot,
         vk,
     } = columns;
@@ -1371,29 +1707,24 @@ pub(crate) fn finalize_history_step_parent_region(
     if active_slot >= arm_selectors.len() || arm_selectors.len() != 2 {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
+    let client = match (client, client_scratch.as_ref(), asm.client_trees.as_ref()) {
+        (None, None, None) => None,
+        (Some((obligations, recording, gate)), Some(scratch), Some(trees)) => {
+            Some((obligations, recording, gate, scratch, trees))
+        }
+        _ => return Err(RegionSidecarError::UnsupportedVkShape),
+    };
     pin_eq(b, &slot_cell(&selector_slice, 0), &arm_selectors[1]);
-
-    let per_tile = 1usize << asm.u_a.block_log;
-    let subchannel_slots = 1usize << asm.s_log;
 
     // L-A and L-B carry one shared predecessor. Their digest/entry join is
     // unconditional; the authenticated class selector below chooses which
     // verifier arm supplies the leaves, directions and roots.
-    for query_index in 0..asm.n_queries {
-        let tile_offset = query_index * per_tile;
-        for tree_index in 0..asm.carrier_depths.len() {
-            let digest_slot =
-                tile_offset + tree_index * subchannel_slots + asm.leaf_lanes[tree_index] / 2 - 1;
-            let carrier_depth = asm.carrier_depths[tree_index];
-            let leg_slot = asm.leg_offsets[tree_index] + query_index * carrier_depth;
-            for lane in 0..2 {
-                pin_eq(
-                    b,
-                    &slot_cell(&slices_a[2 + lane], digest_slot),
-                    &slot_cell(&slices_b[4 + lane], leg_slot),
-                );
-            }
-        }
+    pin_leaf_path_joins(b, &asm, &slices_a, &slices_b, 0);
+    // The client rides the next role block, released by `client_present`.
+    if let Some((_, _, gate, _, _)) = client {
+        with_pin_gate(gate, || {
+            pin_leaf_path_joins(b, &asm, &slices_a, &slices_b, asm.n_queries)
+        });
     }
 
     for (arm, ((trees, obligations), selector)) in asm
@@ -1403,62 +1734,33 @@ pub(crate) fn finalize_history_step_parent_region(
         .zip(arm_selectors.iter())
         .enumerate()
     {
-        let n_trees = trees.len();
-        assert_eq!(
-            obligations.leaves.len(),
-            asm.n_queries * n_trees,
-            "HistoryStep parent leaf obligation count"
-        );
-        assert_eq!(
-            obligations.paths.len(),
-            obligations.leaves.len(),
-            "HistoryStep parent path/leaf pairing"
-        );
+        assert_obligation_counts(obligations, asm.n_queries, trees.len());
         with_pin_gate(selector, || {
-            for query_index in 0..asm.n_queries {
-                let tile_offset = query_index * per_tile;
-                for tree_index in 0..n_trees {
-                    let obligation_index = query_index * n_trees + tree_index;
-                    let leaf = &obligations.leaves[obligation_index];
-                    let positions = &asm.leaf_data_positions[tree_index];
-                    assert_eq!(
-                        leaf.lanes.len(),
-                        positions.len(),
-                        "HistoryStep parent leaf lanes"
-                    );
-                    for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
-                        pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
-                    }
-
-                    let obligation = &obligations.paths[obligation_index];
-                    assert_eq!(
-                        obligation.leaf, obligation_index,
-                        "HistoryStep parent leaf/path pairing in arm {arm}"
-                    );
-                    let tree = trees[tree_index];
-                    assert_eq!(obligation.dir_bits.len(), tree.depth);
-                    let carrier_depth = asm.carrier_depths[tree_index];
-                    let leg_slot = asm.leg_offsets[tree_index] + query_index * carrier_depth;
-                    for (level, bit) in obligation.dir_bits.iter().enumerate() {
-                        pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
-                    }
-                    for lane in 0..2 {
-                        let root = if tree.depth < carrier_depth {
-                            slot_cell(&slices_b[4 + lane], leg_slot + tree.depth)
-                        } else {
-                            let last = leg_slot + tree.depth - 1;
-                            let carried = slot_cell(&slices_b[4 + lane], last);
-                            let sibling = slot_cell(&slices_b[6 + lane], last);
-                            let direction = slot_cell(&slices_b[8], last);
-                            let selected_delta = mul(b, &direction, &carried.add(&sibling));
-                            slot_cell(&slices_b[lane], last)
-                                .add(&carried)
-                                .add(&selected_delta)
-                        };
-                        pin_eq(b, &root, &obligation.root[lane]);
-                    }
-                }
-            }
+            pin_walked_obligations(
+                b,
+                &asm,
+                &slices_a,
+                &slices_b,
+                trees,
+                obligations,
+                0,
+                &format!("arm {arm}"),
+            )
+        });
+    }
+    if let Some((client_obligations, _, gate, _, trees)) = client {
+        assert_obligation_counts(client_obligations, asm.n_queries, trees.len());
+        with_pin_gate(gate, || {
+            pin_walked_obligations(
+                b,
+                &asm,
+                &slices_a,
+                &slices_b,
+                trees,
+                client_obligations,
+                asm.n_queries,
+                "the client role",
+            )
         });
     }
     pin_selected_recording_role(
@@ -1489,6 +1791,20 @@ pub(crate) fn finalize_history_step_parent_region(
         1,
         &mut recording_constraint_slots,
     )?;
+    if let Some((_, recording, _, scratch, _)) = client {
+        pin_common_recording_role(
+            b,
+            "walk L-C HistoryStep client",
+            scratch,
+            recording,
+            vk.rec_c(),
+            2,
+            &u_rec,
+            &slices_rec,
+            2,
+            &mut recording_constraint_slots,
+        )?;
+    }
     if !recording_constraint_slots.is_empty() {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
@@ -1501,6 +1817,93 @@ pub(crate) fn finalize_history_step_parent_region(
     )?;
     Ok(HistoryStepParentRegionPreparation { vk, input })
 }
+
+/// The client proof a two-proof carrier walks next to the selected parent:
+/// its PCS opening (L-A tiles, L-B paths) and the scratch recording of its
+/// verifier transcript (third L-C role).
+#[cfg(feature = "client-slot")]
+#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
+pub(crate) struct ClientCarrierColumns<'a> {
+    pub(crate) proof: RPcsProof<'a>,
+    pub(crate) recording: LayoutRecordedChannel,
+}
+
+/// What the in-circuit client verifier left to discharge, and the gate
+/// (`client_present`) every client obligation is multiplied by.
+#[cfg(feature = "client-slot")]
+#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
+pub(crate) struct ClientCarrierDischarge<'a> {
+    pub(crate) obligations: &'a PcsWalkObligations,
+    pub(crate) recorded: &'a FsRecordedChannel,
+    pub(crate) gate: &'a LinExpr,
+}
+
+#[cfg(feature = "client-slot")]
+#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
+impl HistoryStepParentGeometry {
+    /// The two-proof carrier: this parent geometry plus the client form
+    /// (its PCS parameters and its verifier's transcript layout).
+    pub(crate) fn with_client(
+        self,
+        client_params: &PcsParams,
+        client_layout: DuplexLayout,
+    ) -> Result<Self, RegionSidecarError> {
+        self.add_client(client_params, client_layout)
+    }
+}
+
+/// Two-proof twin of [`prepare_history_step_parent_columns`]: L-A/L-B walk
+/// the selected parent (role 0) and the client (role 1); L-C carries the
+/// client transcript as its third role.
+#[cfg(feature = "client-slot")]
+#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
+pub(crate) fn prepare_history_step_carrier_columns(
+    b: &mut FieldR1csBuilder,
+    proofs: &[RPcsProof<'_>],
+    active_slot: usize,
+    geometry: &HistoryStepParentGeometry,
+    child_recordings: Vec<LayoutRecordedChannel>,
+    r_prev_recordings: Vec<LayoutRecordedChannel>,
+    client: ClientCarrierColumns<'_>,
+) -> Result<HistoryStepParentColumns, RegionSidecarError> {
+    prepare_carrier_columns(
+        b,
+        proofs,
+        active_slot,
+        geometry,
+        child_recordings,
+        r_prev_recordings,
+        Some((client.proof, client.recording)),
+    )
+}
+
+/// Two-proof twin of [`finalize_history_step_parent_region`]: every client
+/// obligation and join is multiplied by `client.gate`; the client transcript
+/// is bound cell for cell.
+#[cfg(feature = "client-slot")]
+#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
+pub(crate) fn finalize_history_step_carrier_region(
+    b: &mut FieldR1csBuilder,
+    columns: HistoryStepParentColumns,
+    obligations: &[PcsWalkObligations],
+    arm_selectors: &[LinExpr],
+    recorded_children: &[FsRecordedChannel],
+    recorded_r_prev: &[FsRecordedChannel],
+    client: ClientCarrierDischarge<'_>,
+) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
+    finalize_carrier_region(
+        b,
+        columns,
+        obligations,
+        arm_selectors,
+        recorded_children,
+        recorded_r_prev,
+        Some((client.obligations, client.recorded, client.gate)),
+    )
+}
+
+#[cfg(test)]
+mod carrier_tests;
 
 #[cfg(test)]
 mod tests {
