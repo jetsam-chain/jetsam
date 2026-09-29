@@ -97,6 +97,53 @@ fn tiny_spec(k_log: usize) -> (PublicIoSpec, jetsam_ivc_core::public_io::Witness
     )
 }
 
+/// v1.5 plan, task 1.5: prove time of the same free instance at a chosen m,
+/// under the HistoryStep PCS parameters (rate 1/4, batch 2^5, one block:
+/// `k_log = m`). The instance is trivial, so absolute times are optimistic;
+/// the plan uses the m=25 / m=24 ratio. One m per process, so that peak RSS
+/// can be read around it:
+///   JETSAM_BENCH_M=25 <test binary> prove_time_at_m --ignored --nocapture
+#[test]
+#[ignore = "benchmark: prove time at a chosen m (v1.5 plan, task 1.5)"]
+fn prove_time_at_m() {
+    let m: usize = std::env::var("JETSAM_BENCH_M")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(24);
+    let samples: usize = std::env::var("JETSAM_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    let k_log = m;
+    let (r1cs, mut z) = free_instance(m, k_log, 0x1525);
+    let (spec, io_slice) = tiny_spec(k_log);
+    let io: Vec<F128> = vec![F128 { lo: 0xA1, hi: 0 }, F128 { lo: 0xB2, hi: 0 }];
+    z[io_slice.start()] = io[0];
+    z[io_slice.start() + 1] = io[1];
+    let params = PcsParams {
+        m: m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 5,
+        profile: Default::default(),
+    };
+    for sample in 0..samples {
+        let started = std::time::Instant::now();
+        let mut ch_p = FsLaneChallenger::new(b"prove-time-at-m");
+        let (proof, commitment, _claims) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io, &mut ch_p);
+        let prove_s = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let mut ch_v = FsLaneChallenger::new(b"prove-time-at-m");
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io, &mut ch_v)
+            .expect("the benchmarked proof verifies");
+        eprintln!(
+            "[prove-time] m={m} sample={sample} prove_s={prove_s:.2} verify_ms={:.0} rayon_threads={}",
+            started.elapsed().as_secs_f64() * 1e3,
+            std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "all".into()),
+        );
+    }
+}
+
 #[test]
 fn deferred_matrix_pipeline_on_real_proofs() {
     let m = 11;
