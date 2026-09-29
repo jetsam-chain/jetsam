@@ -579,8 +579,17 @@ const _: () = assert!(
 /// genesis moves without the pins being cleared. The test chain gets reset; a
 /// pin left over from the previous one would stop the new chain dead at the
 /// pinned height, exactly like an unmineable anchor.
+/// The public network's v1.4 activation block, crossed on 2026-09-29 at 18:21 UTC.
+/// Read back from the four seeds and equal to the `prev_block_hash` of block 24847.
 #[cfg(not(feature = "testnet"))]
-pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[(
+    24846,
+    [
+        0x97, 0x97, 0xe7, 0xb0, 0x95, 0x96, 0xbe, 0x35, 0xde, 0x3e, 0x71, 0xfa, 0x13, 0x00,
+        0xef, 0xb6, 0x63, 0x1f, 0x95, 0xba, 0x5f, 0x76, 0xad, 0x4f, 0x28, 0x4f, 0xbf, 0x44,
+        0x0d, 0x7a, 0xa3, 0x3a,
+    ],
+)];
 
 /// The test chain's v1.4 activation block, crossed on 2026-09-27 at 18:28 UTC.
 /// Read back from two nodes that reached it by different paths — cpu13 by
@@ -660,6 +669,12 @@ mod hard_checkpoint_tests {
     #[cfg(feature = "testnet")]
     #[test]
     fn the_test_chain_pins_its_activation_block() {
+        assert_eq!(Some(HARD_CHECKPOINTS[0].0), V1_4_ACTIVATION_HEIGHT);
+    }
+
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn the_public_network_pins_its_activation_block() {
         assert_eq!(Some(HARD_CHECKPOINTS[0].0), V1_4_ACTIVATION_HEIGHT);
     }
 }
