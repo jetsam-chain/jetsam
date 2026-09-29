@@ -39,7 +39,8 @@ that authority to the complete logical transaction ID.
 
 The two production `HistoryStep` proof classes authenticated by the official
 matrix pack. They prove the same relation with capacities of 25 and 255
-effective page positions respectively.
+effective page positions respectively; since block 17,750 the small class,
+still named `B25` in the code, holds 24.
 
 ## Block–Tiwari FS-FRI security
 
@@ -303,7 +304,8 @@ the end-to-end from-genesis invalid-State game.
 ## Nonce
 
 The 128-bit header field varied during proof-of-work search. A winning nonce
-makes the Poseidon2b PoW digest numerically smaller than the exact target.
+makes the PoW digest — `TowerWalk(TowerHash(fields))` since block 24,846 —
+numerically smaller than the exact target.
 
 ## PagedSpend
 
@@ -439,6 +441,20 @@ omitted by a miner.
 ## Terminal
 
 The fixed-shape recursive proof output for the current `HistoryStep`.
+
+## TowerHash
+
+The Poseidon2b sponge over the 16-field header schedule, nonce included. Before
+block 24,846 its output was the proof-of-work digest; since then it is the
+32-byte seed that TowerWalk consumes.
+
+## TowerWalk
+
+The proof of work in force since block 24,846: a CPU proof of work that lives
+in each core's L2 cache. It fills a 512 KiB scratchpad from the TowerHash seed
+and walks it with 524,288 data-dependent reads, each written back, with
+periodic Poseidon2b folds. The GPU miners used before block 24,846 no longer
+work.
 
 ## Toy Problem metric
 

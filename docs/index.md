@@ -76,7 +76,8 @@ begins only after the proof is complete.**
 An independent miner follows the canonical chain, holds the current State,
 selects transactions and proves the exact next `HistoryStep`. Only after that
 proof is complete can an internal or external worker search the immutable
-Poseidon2b header nonce. A standalone hash engine cannot originate a block or
+header nonce — since block 24,846 with TowerWalk, a CPU proof of work that
+lives in each core's L2 cache. A standalone hash engine cannot originate a block or
 change the transition it is working on.
 
 Mining infrastructure therefore doubles as network infrastructure: an
@@ -183,7 +184,8 @@ and the [security model](protocol/security-model.md).
 | Parameter | Value |
 |---|---:|
 | Mean block target | 90 seconds |
-| Default miner class | B25, `m=22`, up to 25 effective page positions |
+| Proof of work | TowerWalk over a TowerHash seed (since block 24,846) |
+| Default miner class | small class (`B25` in code), `m=22`, up to 24 effective page positions since block 17,750 |
 | Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | 12.75 TPS |

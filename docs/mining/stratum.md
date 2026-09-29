@@ -1,10 +1,12 @@
 # Jetsam Stratum Mining Protocol — `JetsamStratum/1.0.0`
 
-**Status:** Draft 1 — 2026-09-06
-**Audience:** developers writing a GPU (or CPU) miner, or a pool, for the Jetsam (JTM) network, without access to any Jetsam mining software.
+**Status:** Draft 1 — 2026-09-06; §3.10 (TowerWalk, in force since block 24,846) added 2026-09-29
+**Audience:** developers writing a miner or a pool for the Jetsam (JTM) network, without access to any Jetsam mining software.
 **Normative words:** MUST, MUST NOT, SHOULD, MAY are used in the RFC 2119 sense.
 
-This document is self-contained. It defines (1) the proof-of-work function *TowerHash* down to the bit, with test vectors, and (2) a Stratum-style pool protocol carrying it. Nothing here requires reading Jetsam node source code.
+This document is self-contained. It defines (1) the proof of work down to the bit, with test vectors — *TowerHash*, and since block 24,846 *TowerWalk* applied to TowerHash's output — and (2) a Stratum-style pool protocol carrying it. Nothing here requires reading Jetsam node source code.
+
+> **Since block 24,846 (29 September 2026, 18:21:52 UTC) the block digest is `TowerWalk(TowerHash(fields))`** (§3.10). TowerWalk is a CPU proof of work that lives in each core's L2 cache; the GPU miners used before block 24,846 no longer work. A miner that implements only §3.1–3.9 finds nothing on current jobs.
 
 ---
 
@@ -14,12 +16,13 @@ This document is self-contained. It defines (1) the proof-of-work function *Towe
 |---|---|
 | What does a miner search? | A 128-bit nonce. Everything else in the block is fixed by the pool's node before the job is sent. |
 | What is hashed? | Sixteen 128-bit field elements (256 bytes). The nonce is **field 0**. Eight permutations of a Poseidon2b sponge over GF(2^128). |
+| Which digest? | For a block at height ≥ 24,846 (public network): `TowerWalk(TowerHash(fields))`, §3.10. Below that height: `TowerHash(fields)`. |
 | What is the success test? | `digest < target`, both read as **little-endian** 256-bit integers, strict inequality. |
 | Is there a midstate / precomputation? | No. The nonce sits in the *first* absorbed pair, so every attempt runs all eight permutations. This is deliberate. |
 | Is there an extranonce? | Yes: a 4-byte prefix assigned by the pool that occupies the top 4 bytes of the 16-byte nonce. The miner owns the remaining 96 bits. |
 | Can the miner change the timestamp, coinbase or any header field? | No. There is nothing to roll. Only the nonce. |
 | What does the miner submit? | `[worker, job_id, nonce_hex]` — the full 16-byte nonce, little-endian, 32 lowercase hex chars. |
-| How do I know my hash is right? | Appendix B vectors, then the published 12 000-vector `golden.txt`. A miner MUST pass them before mining; a wrong hash finds nothing and reports nothing. |
+| How do I know my hash is right? | Appendix B vectors, then the published 12 000-vector `golden.txt` (TowerHash) and the 256-vector `jetsam-towerwalk-golden-v1.txt` (the full post-fork digest, §3.10). A miner MUST pass them before mining; a wrong hash finds nothing and reports nothing. |
 
 ---
 
@@ -232,6 +235,8 @@ A miner MUST run a self-test over these vectors at start-up and refuse to mine o
 
 ### 3.8 Cost model (what the search loop pays)
 
+This section costs TowerHash alone. Since block 24,846 every attempt also runs TowerWalk (§3.10), which dominates the cost of an attempt.
+
 Per attempt: 8 permutations. Per permutation: one initial MDS, 8 full rounds (4 S-boxes + MDS each), 58 partial rounds (1 S-box + MDS each). One S-box costs 2 squarings + 2 multiplications. `MDS_FULL` has 10 non-identity entries, `MDS_PARTIAL` has 4. So per permutation roughly 600 general GF(2^128) multiplications plus about 130 squarings, and per attempt about 5 000 multiplications. There is no memory hardness and no data-dependent branching: the workload is pure carry-less arithmetic on 128-bit words. Only field 0 changes between attempts; fields 1…15, the IV and all constants are fixed per job.
 
 ### 3.9 Reference implementation (Python 3, no dependencies)
@@ -317,6 +322,81 @@ def le256_lt(d: bytes, t: bytes) -> bool:
 def with_nonce(pow_fields: bytes, nonce: int) -> bytes:
     return nonce.to_bytes(16, "little") + pow_fields[16:]
 ```
+
+### 3.10 TowerWalk: the digest from block 24,846
+
+From block **24,846** on the public network (block id `9797e7b09596be35de3e71fa1300efb6631f95ba5f76ad4f284fbf440d7aa33a`, 29 September 2026, 18:21:52 UTC) the 32 bytes that TowerHash returns are a **seed**, not the digest. The digest compared with the target is:
+
+```
+digest = towerwalk(towerhash(pow_fields))      height ≥ 24,846
+digest = towerhash(pow_fields)                 height < 24,846
+```
+
+Everything in §3.1–3.9 is unchanged: fields, nonce lane, sponge, target comparison. TowerWalk:
+
+1. reads the seed as four little-endian u64 words `s[0..3]`; the lane accumulators start as `a = s`, the hidden capacity words as `c[i] = s[i] ⊕ CAP_INIT[i]`;
+2. **fill** — writes 65 536 u64 cells (512 KiB) with a running `x = cheap_mix(x, i)` started from `s[0] ⊕ s[1] ⊕ s[2] ⊕ s[3]`; after every 4 096 cells it *folds* and XORs the four lane words into `x`;
+3. **walk** — 131 072 rounds; in each round lanes 0, 1, 2, 3 run **in that order**: the lane's state picks a cell `j = (a ⊕ (a >> 32)) & 0xFFFF`, reads it, mixes it into the lane, and writes `a + value` back to cell `j`; after every 8 192 rounds it folds;
+4. folds once more and outputs the four lane words, little-endian, as the 32-byte digest.
+
+A *fold* packs the state into four field elements `a[i] | (c[i] << 64)`, applies the Poseidon2b permutation of §3.2 to them **as flat-basis values, with no basis conversion**, and unpacks. There are 33 folds per attempt (16 in the fill, 16 in the walk, 1 final). `cheap_mix(x, ctr) = y ⊕ (y >> 29)` with `y = (x + ctr) · 0x9E3779B97F4A7C15`. All arithmetic wraps modulo 2^64.
+
+Implementation traps, each of which silently produces a wrong digest:
+
+- The four lanes are **sequential** inside a round: lane 1 reads what lane 0 has just written. Evaluating them as a batch is a different function.
+- The xorshift in `cheap_mix` is required; without it the low bits that form the address degenerate.
+- No saturation, no wider intermediate, no floating point.
+
+Reference implementation, on top of §3.9 (`permute_flat`, `towerhash`). It reproduces all 256 vectors below, at about 2 s per digest in CPython:
+
+```python
+M64 = (1 << 64) - 1
+CELLS, LANES, ROUNDS = 65536, 4, 131072
+PERM_PERIOD, FILL_PERM_PERIOD = 8192, 4096
+MULT_C, XORSHIFT = 0x9E3779B97F4A7C15, 29
+CAP_INIT = (0xA5A5A5A5A5A5A5A5, 0x5A5A5A5A5A5A5A5A, 0x3C3C3C3C3C3C3C3C, 0xC3C3C3C3C3C3C3C3)
+
+def cheap_mix(x, ctr):
+    y = ((x + ctr) * MULT_C) & M64
+    return y ^ (y >> XORSHIFT)
+
+def fold(a, c):                        # pack, permute (flat basis, as-is), unpack
+    s = permute_flat([a[i] | (c[i] << 64) for i in range(4)])
+    for i in range(4):
+        a[i], c[i] = s[i] & M64, s[i] >> 64
+
+def towerwalk(seed: bytes) -> bytes:    # 32 bytes in (the TowerHash digest), 32 bytes out
+    s = [int.from_bytes(seed[8*i:8*i+8], "little") for i in range(4)]
+    a = s[:]
+    c = [s[i] ^ CAP_INIT[i] for i in range(4)]
+    v = [0] * CELLS
+    x = s[0] ^ s[1] ^ s[2] ^ s[3]
+    for i in range(CELLS):             # fill: 512 KiB, re-anchored every 4096 cells
+        x = cheap_mix(x, i)
+        v[i] = x
+        if (i + 1) % FILL_PERM_PERIOD == 0:
+            fold(a, c)
+            x ^= a[0] ^ a[1] ^ a[2] ^ a[3]
+    for r in range(ROUNDS):            # walk: 4 lanes in order, each reads then writes back
+        for l in range(LANES):
+            j = (a[l] ^ (a[l] >> 32)) & (CELLS - 1)
+            val = v[j]
+            a[l] = cheap_mix(a[l] ^ val, r)
+            v[j] = (a[l] + val) & M64
+        if (r + 1) % PERM_PERIOD == 0:
+            fold(a, c)
+    fold(a, c)
+    return b"".join(a[i].to_bytes(8, "little") for i in range(4))
+
+def pow_digest_v14(pow_fields: bytes) -> bytes:  # from block 24,846 on the public network
+    return towerwalk(towerhash(pow_fields))
+```
+
+**Vectors:** `jetsam-towerwalk-golden-v1.txt`, published next to this document — 256 vectors, 194 819 bytes, SHA-256 `aaa8d4e5f568f5efd30697d5d41b8d93cad6a245986d7a88e4cbad109ed7b8f1`. Same line format as the TowerHash file (§3.7); the last group is `towerwalk(towerhash(fields))`. The first six vectors are structural corner cases, the rest splitmix64 inputs.
+
+**Cost and hardware.** One attempt is one TowerHash (8 permutations), 33 more permutations, 65 536 writes and 524 288 dependent read-modify-writes into a 512 KiB table. The reads depend on the previous one, so the attempt is bound by the latency of that table, which a CPU keeps in a core's private L2 cache. Give each search thread its own scratchpad, allocated once, not per attempt.
+
+**Which jobs are walked.** A node's template carries `pow_walk: true` exactly when its height requires the walk; a pool reads that field and must verify shares with the walked digest for such jobs. `JetsamStratum/1.0.0` has no field for it in `mining.notify`: a miner implementing this draft applies the walk to every job whose `height` (param 4) is 24,846 or more. The HTTP external miner (`jetsam-miner`) declares that it walks with the header `X-Jetsam-PoW: walk`.
 
 ---
 
@@ -561,6 +641,8 @@ The share at `id 7` is exactly Appendix B.6: with `extranonce1 = 07000000` and t
 ## 10. Writing a GPU miner — what you need to know
 
 This section lists what matters for a correct and efficient miner. It does not prescribe an implementation.
+
+It was written for the TowerHash-only proof of work. Since block 24,846 the digest is TowerWalk over TowerHash (§3.10), and the GPU miners used before block 24,846 no longer work. The points below still describe the TowerHash stage, which every attempt runs to produce its seed.
 
 1. **Per job, the constants are: fields 1…15, the IV, the 264 round constants, the two MDS matrices (all in the flat basis).** They fit in a few kilobytes. Per attempt, the only variable is field 0. Everything a thread needs is `(pow_fields[16:], share_target, block_target, nonce)`.
 

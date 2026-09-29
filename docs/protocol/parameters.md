@@ -58,13 +58,25 @@ stated otherwise.
 
 ## Proof classes
 
-| Class | Dimension | Effective page positions |
-|---|---:|---:|
-| B25 | 22 | 0–25 |
-| B255 | 24 | 26–255 |
+| Class | Dimension | Effective page positions before block 17,750 | From block 17,750 |
+|---|---:|---:|---:|
+| Small (`B25`) | 22 | 0–25 | 0–24 |
+| B255 | 24 | 26–255 | 25–255 |
 
 The primary reward is excluded from effective page-position count. A live
 development payout counts as one position.
+
+## Proof of work
+
+| Parameter | Value |
+|---|---:|
+| Header schedule | 16 `GF(2^128)` fields, nonce in field 0 |
+| Seed | TowerHash (Poseidon2b sponge, 8 permutations) |
+| TowerWalk activation (public network) | block 24,846 |
+| TowerWalk scratchpad | 65,536 × 64-bit cells (512 KiB) |
+| TowerWalk lanes × rounds | 4 × 131,072 (524,288 dependent reads) |
+| Poseidon2b folds per attempt | 33 |
+| Anchor target of the first walked block | `2^235` |
 
 ## Monetary
 

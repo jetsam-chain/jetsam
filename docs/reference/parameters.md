@@ -47,7 +47,7 @@ Poseidon2b width         4
 S-box                    x^7
 full rounds              8
 partial rounds           58
-B25                      m=22, up to 25 positions
+B25 (small class)        m=22, up to 24 positions (25 before block 17,750)
 B255                     m=24, up to 255 positions
 wallet queries           65
 History/BaseFold queries 133
@@ -60,6 +60,18 @@ Block–Tiwari conjectured 127 bits
 ideal-QROM boundary      64.707407428576 bits
 NIST Post-Quantum Cryptography Category 1
 Category 1 gate-depth floor 173.273866314232 bits
+```
+
+## Proof of work
+
+```text
+seed                     TowerHash, Poseidon2b sponge over 16 fields
+digest from block 24,846 TowerWalk(seed)
+digest before 24,846     seed
+scratchpad               65,536 x 64-bit cells = 512 KiB
+walk                     4 lanes x 131,072 rounds = 524,288 reads
+Poseidon2b folds         33 per attempt
+v1.4 anchor target       2^235
 ```
 
 ## Monetary
