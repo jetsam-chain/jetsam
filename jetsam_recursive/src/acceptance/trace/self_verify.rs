@@ -4374,6 +4374,32 @@ mod tests {
         }
     }
 
+    /// v1.5 plan, task 1.4: what an in-circuit registry membership would cost —
+    /// one `merkle_hash_pair_trace` per level plus the sibling it reads. The
+    /// left/right swap by path bit is not built here (a few products per level).
+    #[test]
+    #[ignore = "diagnostic: in-circuit registry membership cost (v1.5 plan, task 1.4)"]
+    fn registry_membership_row_diagnostic() {
+        let mut rng = Rng(0x5EED);
+        for depth in [4usize, 5, 8] {
+            let mut b = FieldR1csBuilder::new();
+            let mut node = alloc_flat_digest(&mut b, &rng.next_hash());
+            let start = b.num_wires();
+            for _ in 0..depth {
+                let sibling = alloc_flat_digest(&mut b, &rng.next_hash());
+                node = merkle_hash_pair_trace(&mut b, &node, &sibling);
+            }
+            let per_level = (b.num_wires() - start) / depth;
+            eprintln!(
+                "[registry-membership] depth={depth} ({} clients) rows={} per_level={per_level}",
+                1usize << depth,
+                b.num_wires() - start
+            );
+            let (r1cs, z) = b.build();
+            assert!(r1cs.satisfies(&z), "depth {depth}");
+        }
+    }
+
     #[test]
     fn hash_leaf_trace_matches_native_even_and_odd_lanes() {
         let mut rng = Rng(0xF00D);
