@@ -62,6 +62,8 @@ use crate::region_sidecar::{
     JointC1RegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
 };
 
+#[cfg(feature = "client-slot")]
+pub(crate) mod client_arm;
 mod freezer;
 mod gated_recorder;
 mod relation;
@@ -93,6 +95,16 @@ pub use relation::{
     HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
     HistoryStepSidecarOperation, HistoryStepTerminal, PreparedHistoryStepForPow,
     HISTORY_STEP_WIRE_VERSION,
+};
+#[cfg(feature = "client-slot")]
+pub use client_arm::{
+    client_io_commitment, HistoryStepClientRegistry, HistoryStepClientWitness,
+    HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+};
+#[cfg(feature = "client-slot")]
+pub use relation::{
+    derive_history_step_runtime_parts_with_client, prepare_history_step_for_pow_with_client,
+    HistoryStepClientParts,
 };
 pub use runtime_parts_codec::{
     HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES, HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,

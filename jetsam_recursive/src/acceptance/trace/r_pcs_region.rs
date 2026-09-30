@@ -1735,7 +1735,12 @@ fn finalize_carrier_region(
     arm_selectors: &[LinExpr],
     recorded_children: &[FsRecordedChannel],
     recorded_r_prev: &[FsRecordedChannel],
-    client: Option<(&PcsWalkObligations, &FsRecordedChannel, &LinExpr)>,
+    client: Option<(
+        &PcsWalkObligations,
+        &FsRecordedChannel,
+        &LinExpr,
+        Option<&LinExpr>,
+    )>,
 ) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
     let HistoryStepParentColumns {
         asm,
@@ -1761,19 +1766,24 @@ fn finalize_carrier_region(
     if active_slot >= arm_selectors.len() || arm_selectors.len() != 2 {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    let client = match (client, client_scratch.as_ref(), asm.client_trees.as_ref()) {
-        (None, None, None) => None,
-        (Some((obligations, recording, gate)), Some(scratch), Some(trees)) => {
-            Some((obligations, recording, gate, scratch, trees))
+    // A relation that walks a client finalizes outside its `parent_gate`
+    // (a base block may carry a client): the parent part is gated here, the
+    // client part only by `client_present`.
+    let (client, parent_gate) = match (client, client_scratch.as_ref(), asm.client_trees.as_ref()) {
+        (None, None, None) => (None, None),
+        (Some((obligations, recording, gate, parent_gate)), Some(scratch), Some(trees)) => {
+            (Some((obligations, recording, gate, scratch, trees)), parent_gate)
         }
         _ => return Err(RegionSidecarError::UnsupportedVkShape),
     };
-    pin_eq(b, &slot_cell(&selector_slice, 0), &arm_selectors[1]);
+    under_gate(parent_gate, || {
+        pin_eq(b, &slot_cell(&selector_slice, 0), &arm_selectors[1]);
 
-    // L-A and L-B carry one shared predecessor. Their digest/entry join is
-    // unconditional; the authenticated class selector below chooses which
-    // verifier arm supplies the leaves, directions and roots.
-    pin_leaf_path_joins(b, &asm, &slices_a, &slices_b, 0);
+        // L-A and L-B carry one shared predecessor. Their digest/entry join
+        // is unconditional; the authenticated class selector below chooses
+        // which verifier arm supplies the leaves, directions and roots.
+        pin_leaf_path_joins(b, &asm, &slices_a, &slices_b, 0);
+    });
     // The client rides the next role block, released by `client_present`.
     if let Some((_, _, gate, _, _)) = client {
         with_pin_gate(gate, || {
@@ -1781,27 +1791,29 @@ fn finalize_carrier_region(
         });
     }
 
-    for (arm, ((trees, obligations), selector)) in asm
-        .all_trees
-        .iter()
-        .zip(obligations.iter())
-        .zip(arm_selectors.iter())
-        .enumerate()
-    {
-        assert_obligation_counts(obligations, asm.n_queries, trees.len());
-        with_pin_gate(selector, || {
-            pin_walked_obligations(
-                b,
-                &asm,
-                &slices_a,
-                &slices_b,
-                trees,
-                obligations,
-                0,
-                &format!("arm {arm}"),
-            )
-        });
-    }
+    under_gate(parent_gate, || {
+        for (arm, ((trees, obligations), selector)) in asm
+            .all_trees
+            .iter()
+            .zip(obligations.iter())
+            .zip(arm_selectors.iter())
+            .enumerate()
+        {
+            assert_obligation_counts(obligations, asm.n_queries, trees.len());
+            with_pin_gate(selector, || {
+                pin_walked_obligations(
+                    b,
+                    &asm,
+                    &slices_a,
+                    &slices_b,
+                    trees,
+                    obligations,
+                    0,
+                    &format!("arm {arm}"),
+                )
+            });
+        }
+    });
     if let Some((client_obligations, _, gate, _, trees)) = client {
         assert_obligation_counts(client_obligations, asm.n_queries, trees.len());
         with_pin_gate(gate, || {
@@ -1890,6 +1902,10 @@ pub(crate) struct ClientCarrierDischarge<'a> {
     pub(crate) obligations: &'a PcsWalkObligations,
     pub(crate) recorded: &'a FsRecordedChannel,
     pub(crate) gate: &'a LinExpr,
+    /// The gate of the parent part (the relation's `parent_gate`), when the
+    /// caller does not finalize under it: the client part is never
+    /// multiplied by it.
+    pub(crate) parent_gate: Option<&'a LinExpr>,
 }
 
 #[cfg(feature = "client-slot")]
@@ -1903,6 +1919,14 @@ impl HistoryStepParentGeometry {
         client_layout: DuplexLayout,
     ) -> Result<Self, RegionSidecarError> {
         self.add_client(client_params, client_layout)
+    }
+}
+
+/// Run `f` under `gate` when there is one.
+fn under_gate<R>(gate: Option<&LinExpr>, f: impl FnOnce() -> R) -> R {
+    match gate {
+        Some(gate) => with_pin_gate(gate, f),
+        None => f(),
     }
 }
 
@@ -1952,7 +1976,12 @@ pub(crate) fn finalize_history_step_carrier_region(
         arm_selectors,
         recorded_children,
         recorded_r_prev,
-        Some((client.obligations, client.recorded, client.gate)),
+        Some((
+            client.obligations,
+            client.recorded,
+            client.gate,
+            client.parent_gate,
+        )),
     )
 }
 

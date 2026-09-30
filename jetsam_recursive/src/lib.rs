@@ -49,6 +49,18 @@ pub use acceptance::history_step_bank::{
     HISTORY_STEP_CLASS_COUNT, HISTORY_STEP_CURRENT_CLASS_MS, HISTORY_STEP_TIER_SLOT_COUNT,
     V1_3_RECURSION_ROOT_LANES,
 };
+/// v1.5 prototype client slot (`client-slot`, M2).
+#[cfg(feature = "client-slot")]
+pub use acceptance::history_step::{
+    client_io_commitment, derive_history_step_runtime_parts_with_client,
+    prepare_history_step_for_pow_with_client, HistoryStepClientParts, HistoryStepClientRegistry,
+    HistoryStepClientWitness, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+};
+#[cfg(feature = "client-slot")]
+pub use acceptance::history_step_bank::{
+    history_step_bank_io_layout_with_client, history_step_bank_io_spec_with_client,
+    HistoryStepClientForm, HistoryStepClientIoLanes,
+};
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
     ChainAccumulatorLocalBoundaryError, CHAIN_ACCUMULATOR_LANES,

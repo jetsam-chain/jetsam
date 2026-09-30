@@ -661,6 +661,7 @@ mod client_slot {
                 obligations: &client_obligations,
                 recorded: &client_recorded,
                 gate: &client_gate,
+                parent_gate: None,
             },
         )
         .expect("two-proof carrier region");
@@ -938,6 +939,7 @@ mod client_slot {
                     obligations,
                     recorded,
                     gate,
+                    parent_gate: None,
                 },
             ),
         }
@@ -1147,6 +1149,368 @@ mod client_slot {
                 two_proof.canonical_vk_ms - parent_only.canonical_vk_ms,
                 two_proof.link_prove_ms - parent_only.link_prove_ms,
                 two_proof.link_verify_ms - parent_only.link_verify_ms,
+            );
+        }
+    }
+
+    // ---- M2 task 2.3: the relation's client arm, at test scale -------------
+    //
+    // The arm the relation runs for its client slot (`client_arm_trace`),
+    // built next to the two-proof carrier over real small proofs: the client
+    // lanes of the public IO are wires here, exactly as the relation's IO
+    // cells are.
+
+    use crate::acceptance::history_step::client_arm::{
+        client_arm_trace, client_io_commitment, client_transcript_layout, prepare_client_arm,
+        ClientIoCells, HistoryStepClientRegistry, HistoryStepClientWitness, PreparedClientArm,
+        HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    };
+    use crate::acceptance::history_step_bank::{HistoryStepClientForm, HistoryStepClientIoLanes};
+
+    /// The test-scale client form: the m = 8 tier's shape and PCS form, an
+    /// eight-lane public IO, a four-entry registry.
+    fn test_client_form() -> HistoryStepClientForm {
+        let (r1cs, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(CLIENT_M, CLIENT_M, 1);
+        HistoryStepClientForm::new(
+            FieldShape::of(&r1cs),
+            PcsParams {
+                m: CLIENT_M + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile: Default::default(),
+            },
+            jetsam_ivc_core::public_io::PublicIoSpec {
+                io_slice: WitnessSlice {
+                    log2_len: 3,
+                    index: 1,
+                },
+                io_len: 8,
+                claims: Vec::new(),
+            },
+            2,
+        )
+    }
+
+    /// A real client of `form`: a synthetic satisfiable matrix, its public IO
+    /// read from the witness slice, proved with the form's post-commit class.
+    fn client_witness(
+        form: &HistoryStepClientForm,
+        seed: u64,
+        other_registered: usize,
+    ) -> HistoryStepClientWitness {
+        let (r1cs, witness): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(CLIENT_M, CLIENT_M, seed);
+        let spec = form.io_spec().clone();
+        let io = witness[spec.io_slice.start()..spec.io_slice.start() + spec.io_len].to_vec();
+        let mut prover = FsLaneChallenger::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
+        let (proof, (), commitment, _) =
+            jetsam_ivc_prover::field_prover::prove_field_c1_with_public_io_and_post_commit_context(
+                &r1cs,
+                &witness,
+                form.pcs_params(),
+                &spec,
+                &io,
+                &form.post_commit_digest(),
+                &mut prover,
+                |_| (),
+            );
+        let digest = r1cs.structural_statement_digest();
+        let mut entries = (0..other_registered)
+            .map(|index| [0xA0 + index as u8; 32])
+            .collect::<Vec<_>>();
+        entries.push(digest);
+        HistoryStepClientWitness {
+            field_proof: proof,
+            commitment,
+            io,
+            matrix: std::sync::Arc::new(r1cs),
+            registry: HistoryStepClientRegistry::new(form.registry_depth(), entries)
+                .expect("test registry"),
+        }
+    }
+
+    fn client_lanes(form: &HistoryStepClientForm) -> HistoryStepClientIoLanes {
+        HistoryStepClientIoLanes::at(0, form.shape().k_log)
+    }
+
+    fn client_io(form: &HistoryStepClientForm, prepared: &PreparedClientArm) -> Vec<F128> {
+        let lanes = client_lanes(form);
+        let mut io = vec![F128::ZERO; lanes.end()];
+        prepared.install_io(&lanes, &mut io);
+        io
+    }
+
+    /// Carrier + parent arms + the relation's client arm over `io` (the
+    /// client lanes of the public IO, as wires).
+    fn build_with_client_arm(
+        parents: &ParentFixtures,
+        geometry: &HistoryStepParentGeometry,
+        form: &HistoryStepClientForm,
+        prepared: &PreparedClientArm,
+        io: &[F128],
+    ) -> TwoProofBuild {
+        let (children, r_prev) = parent_scratches(parents);
+        let proofs = parents
+            .tiers
+            .iter()
+            .map(ProofFixture::r_pcs)
+            .collect::<Vec<_>>();
+        let mut b = FieldR1csBuilder::new();
+        let columns = prepare_history_step_carrier_columns(
+            &mut b,
+            &proofs,
+            0,
+            geometry,
+            children,
+            r_prev,
+            ClientCarrierColumns {
+                proof: prepared.carrier_proof(form),
+                recording: prepared.scratch().clone(),
+            },
+        )
+        .expect("client-arm carrier columns");
+        let selectors = arm_selectors(&mut b, 0);
+        let arms = replay_parent_arms(&mut b, parents, &selectors);
+        let cells = io
+            .iter()
+            .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
+            .collect::<Vec<_>>();
+        let cells = ClientIoCells::from_io(&client_lanes(form), &cells);
+        let arm = client_arm_trace(&mut b, form, &cells, prepared);
+        let preparation = finalize_history_step_carrier_region(
+            &mut b,
+            columns,
+            &arms.obligations,
+            &selectors,
+            &arms.children,
+            &arms.r_prev,
+            ClientCarrierDischarge {
+                obligations: &arm.obligations,
+                recorded: &arm.recorded,
+                gate: &arm.gate,
+                parent_gate: None,
+            },
+        )
+        .expect("client-arm carrier region");
+        let wires = b.num_wires();
+        let (r1cs, z) = b.build();
+        TwoProofBuild {
+            r1cs,
+            z,
+            wires,
+            preparation,
+        }
+    }
+
+    fn client_arm_geometry(parents: &ParentFixtures, form: &HistoryStepClientForm) -> HistoryStepParentGeometry {
+        parents
+            .geometry()
+            .with_client(form.pcs_params(), client_transcript_layout(form).expect("layout"))
+            .expect("client-arm geometry")
+    }
+
+    /// A registered client is proved: the trace is satisfiable, the Link
+    /// walks discharge its PCS hashing and transcript, and the public IO
+    /// carries `client_present = 1`, `D`, the registry root, the commitment
+    /// of its public inputs and an accumulator claim that the registered
+    /// matrix itself satisfies.
+    #[test]
+    fn client_arm_proves_a_registered_client() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let witness = client_witness(&form, 0xC11E_0101, 2);
+        let prepared = prepare_client_arm(&form, Some(&witness)).expect("registered client");
+        let io = client_io(&form, &prepared);
+        let lanes = client_lanes(&form);
+        let digest = witness.matrix.structural_statement_digest();
+        assert_eq!(io[lanes.present], F128::ONE);
+        assert_eq!(io[lanes.matrix_digest..lanes.matrix_digest + 2], flat_digest_lanes(&digest));
+        assert_eq!(
+            io[lanes.registry_root..lanes.registry_root + 2],
+            flat_digest_lanes(&witness.registry.root())
+        );
+        assert_eq!(
+            io[lanes.io_commitment..lanes.io_commitment + 2],
+            flat_digest_lanes(&client_io_commitment(&witness.io))
+        );
+        let claim = jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim {
+            point: io[lanes.matrix_lane.point..lanes.matrix_lane.value]
+                .chunks_exact(2)
+                .map(|pair| F256::new(pair[0], pair[1]))
+                .collect(),
+            value: F256::new(io[lanes.matrix_lane.value], io[lanes.matrix_lane.value + 1]),
+        };
+        assert_eq!(io[lanes.matrix_lane.live], F128::ONE);
+        assert_eq!(
+            jetsam_ivc_core::matrix_claim::c1::stacked_matrix_mle_eval_c1(&witness.matrix, &claim),
+            claim.value,
+            "the client accumulator claim is a claim on the registered matrix"
+        );
+
+        let geometry = client_arm_geometry(&parents, &form);
+        let built = build_with_client_arm(&parents, &geometry, &form, &prepared, &io);
+        assert!(built.r1cs.satisfies(&built.z), "registered client");
+        prove_and_verify_link_only(&built.preparation, &built.z).expect("client-arm Link walks");
+    }
+
+    /// A block without a client runs the same arm on a shape-only proof: the
+    /// matrix is the one a client-bearing block uses, the client lanes are
+    /// zero, and the trace is satisfiable.
+    #[test]
+    fn ghost_client_pays_the_same_matrix() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let witness = client_witness(&form, 0xC11E_0102, 1);
+        let present = prepare_client_arm(&form, Some(&witness)).expect("registered client");
+        let ghost = prepare_client_arm(&form, None).expect("ghost client");
+        assert_eq!(present.scratch().layout, ghost.scratch().layout);
+        assert_eq!(ghost.scratch().layout, client_transcript_layout(&form).unwrap());
+
+        let ghost_io = client_io(&form, &ghost);
+        assert!(ghost_io.iter().all(|lane| *lane == F128::ZERO));
+        let ghost_build = build_with_client_arm(&parents, &geometry, &form, &ghost, &ghost_io);
+        assert!(ghost_build.r1cs.satisfies(&ghost_build.z), "ghost client");
+        prove_and_verify_link_only(&ghost_build.preparation, &ghost_build.z)
+            .expect("ghost client Link walks");
+
+        let present_build = build_with_client_arm(
+            &parents,
+            &geometry,
+            &form,
+            &present,
+            &client_io(&form, &present),
+        );
+        assert_eq!(ghost_build.wires, present_build.wires);
+        assert_eq!(
+            ghost_build.r1cs.structural_statement_digest(),
+            present_build.r1cs.structural_statement_digest(),
+            "client presence moved the matrix"
+        );
+    }
+
+    /// `D` must be a member of the registry the IO names, and the IO must
+    /// commit to the client's public inputs: forging either lane leaves the
+    /// trace unsatisfiable. A matrix outside the registry is refused before
+    /// any circuit is built.
+    #[test]
+    fn client_arm_rejects_forged_registry_and_io_lanes() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let witness = client_witness(&form, 0xC11E_0103, 1);
+        let prepared = prepare_client_arm(&form, Some(&witness)).expect("registered client");
+        let lanes = client_lanes(&form);
+        let honest = client_io(&form, &prepared);
+
+        let mut forged_root = honest.clone();
+        forged_root[lanes.registry_root] += F128::ONE;
+        let built = build_with_client_arm(&parents, &geometry, &form, &prepared, &forged_root);
+        assert!(!built.r1cs.satisfies(&built.z), "forged registry root accepted");
+
+        let mut forged_io = honest.clone();
+        forged_io[lanes.io_commitment + 1] += F128::ONE;
+        let built = build_with_client_arm(&parents, &geometry, &form, &prepared, &forged_io);
+        assert!(!built.r1cs.satisfies(&built.z), "forged IO commitment accepted");
+
+        // The proof must verify under the `D` the IO names: a prover that
+        // claims another registered matrix, consistently in its lanes, its
+        // registry path and its recorded transcript, is refused.
+        let other = witness.registry.entries()[0];
+        assert_ne!(other, witness.matrix.structural_statement_digest());
+        let claiming = prepare_client_arm(&form, Some(&witness))
+            .expect("registered client")
+            .claiming_matrix(&form, other, &witness.registry);
+        let built = build_with_client_arm(
+            &parents,
+            &geometry,
+            &form,
+            &claiming,
+            &client_io(&form, &claiming),
+        );
+        assert!(!built.r1cs.satisfies(&built.z), "proof accepted under another matrix");
+
+        let mut unregistered = client_witness(&form, 0xC11E_0104, 1);
+        unregistered.registry =
+            HistoryStepClientRegistry::new(form.registry_depth(), vec![[0x55; 32]]).unwrap();
+        assert!(prepare_client_arm(&form, Some(&unregistered)).is_err());
+    }
+
+    /// `client_present` is bound to the arm: a block claiming a client while
+    /// carrying the ghost proof is unsatisfiable, and so is a non-boolean
+    /// selector.
+    #[test]
+    fn client_present_is_bound_to_the_arm() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let ghost = prepare_client_arm(&form, None).expect("ghost client");
+        let lanes = client_lanes(&form);
+
+        let mut claimed = client_io(&form, &ghost);
+        claimed[lanes.present] = F128::ONE;
+        claimed[lanes.matrix_lane.live] = F128::ONE;
+        let built = build_with_client_arm(&parents, &geometry, &form, &ghost, &claimed);
+        assert!(!built.r1cs.satisfies(&built.z), "ghost proof accepted as a client");
+
+        let mut non_boolean = client_io(&form, &ghost);
+        non_boolean[lanes.present] = F128::new(2, 0);
+        let built = build_with_client_arm(&parents, &geometry, &form, &ghost, &non_boolean);
+        assert!(!built.r1cs.satisfies(&built.z), "non-boolean client_present accepted");
+    }
+
+    /// M2 task 2.3, the Link-key fixed point: with the client slot the
+    /// canonical Link VK walks two proofs and records a third L-C role, which
+    /// widens the parent's joint-sidecar replay and therefore the recorded
+    /// layouts the key is built from. The derivation must still converge,
+    /// onto a key whose third role is the client transcript, and pin into a
+    /// client-bearing bank. Production scale: run in release.
+    #[test]
+    #[ignore = "production scale: derives client-bearing runtime parts (release, reads the v1.3 pack)"]
+    fn client_bearing_runtime_parts_reach_their_fixed_point() {
+        use crate::acceptance::history_step::{
+            derive_history_step_runtime_parts_with_client, pin_history_step_class_bank,
+        };
+        let released = released_v13_parts();
+        let started = std::time::Instant::now();
+        let parts = derive_history_step_runtime_parts_with_client(
+            released.generation(),
+            released.direct_block_vks().clone(),
+        )
+        .expect("client-bearing runtime parts converge");
+        let derive_ms = started.elapsed().as_secs_f64() * 1e3;
+        let form = HistoryStepClientForm::canonical();
+        let layout = client_transcript_layout(&form).expect("client layout");
+        let vk = parts.parent_recursion_vk();
+        for arm in 0..2 {
+            let (role, _) = vk.rec_c().selected_block(arm, 2).expect("third L-C role");
+            assert_eq!(role, &layout, "client transcript role, arm {arm}");
+        }
+        assert_eq!(vk.leaf_a().w_log(), 15, "L-A walks two proofs");
+        assert_eq!(vk.path_b().w_log(), 14, "L-B walks two proofs");
+        assert_ne!(
+            vk.transcript_digest(),
+            released.parent_recursion_vk().transcript_digest()
+        );
+        let bank = pin_history_step_class_bank([[0u8; 32]; 2], &parts).expect("client bank");
+        assert_eq!(bank.client_form(), Some(&form));
+        assert_eq!(bank.spec().io_slice.log2_len, 9);
+        let cells = committed_link_cells(vk);
+        eprintln!(
+            "[client-parts] derived in {derive_ms:.0} ms; client transcript slots={} (dyadic {}); \
+             Link w_log L-A={} L-B={} L-C={} committed={} ; link_vk={}",
+            layout.slots.len(),
+            layout.slots.len().next_power_of_two(),
+            vk.leaf_a().w_log(),
+            vk.path_b().w_log(),
+            vk.rec_c().w_log(),
+            cells.iter().sum::<usize>(),
+            hex(&vk.transcript_digest()),
+        );
+        for (arm, transcript) in parts.parent_transcripts().iter().enumerate() {
+            eprintln!(
+                "[client-parts] arm {arm}: child slots={} r_prev slots={}",
+                transcript.child().slots.len(),
+                transcript.r_prev().slots.len()
             );
         }
     }
