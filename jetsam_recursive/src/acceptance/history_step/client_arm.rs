@@ -36,7 +36,8 @@ use jetsam_ivc_core::field_circuit::{
 };
 use jetsam_ivc_core::field_r1cs::FieldR1cs;
 use jetsam_ivc_core::matrix_claim::c1::{
-    prove_matrix_claim_fold_c1, C1MatrixAccClaim, C1MatrixFoldProof,
+    fresh_claim_value_c1, prove_matrix_claim_fold_c1, stacked_matrix_mle_eval_c1,
+    C1MatrixAccClaim, C1MatrixFoldProof,
 };
 use jetsam_ivc_core::merkle::{self, Hash};
 use jetsam_ivc_core::pcs::Commitment;
@@ -46,7 +47,9 @@ use jetsam_ivc_core::verifier::verify_field_c1_deferred_matrix_with_post_commit_
 use super::gated_recorder::BaseSelectableParentRecorder;
 use super::relation::{capture_scratch_recording, history_step_query_lane_count};
 use super::HistoryStepError;
-use crate::acceptance::history_step_bank::{HistoryStepClientForm, HistoryStepClientIoLanes};
+use crate::acceptance::history_step_bank::{
+    HistoryStepBankError, HistoryStepClientClaim, HistoryStepClientForm, HistoryStepClientIoLanes,
+};
 use crate::acceptance::trace::matrix_fold::{
     verify_matrix_claim_fold_c1_trace, C1MatrixAccClaimTrace, C1MatrixFoldProofTrace,
 };
@@ -128,6 +131,93 @@ impl HistoryStepClientRegistry {
         (0..self.depth)
             .map(|level| levels[level][(index >> level) ^ 1])
             .collect()
+    }
+}
+
+/// The chain's client registry as a node holds it (M2 task 2.5): the
+/// registered digests, their root, and every registered matrix, resident and
+/// authenticated once, when the registry is installed.
+///
+/// In the prototype the registry is static: a node is configured with it
+/// ([`super::HistoryStepRuntime::with_chain_clients`]). In M3 it becomes
+/// chain state — written by registration transactions, bounded, read at the
+/// height of the block being judged, on that block's own branch.
+#[derive(Clone, Debug)]
+pub struct HistoryStepChainClients {
+    form: HistoryStepClientForm,
+    registry: HistoryStepClientRegistry,
+    root: Hash,
+    matrices: std::collections::BTreeMap<Hash, Arc<FieldR1cs>>,
+}
+
+impl HistoryStepChainClients {
+    /// Install `registry` with one matrix per entry, each of `form`'s shape:
+    /// every matrix is hashed here, once, and never trusted by digest later.
+    pub fn new(
+        form: &HistoryStepClientForm,
+        registry: HistoryStepClientRegistry,
+        matrices: Vec<Arc<FieldR1cs>>,
+    ) -> Result<Self, HistoryStepError> {
+        if registry.depth() != form.registry_depth()
+            || matrices
+                .iter()
+                .any(|matrix| FieldShape::of(matrix) != form.shape())
+        {
+            return Err(HistoryStepError::ClientForm);
+        }
+        let mut authenticated = std::collections::BTreeMap::new();
+        for matrix in matrices {
+            let digest = matrix.structural_statement_digest();
+            if registry.position(&digest).is_none()
+                || authenticated.insert(digest, matrix).is_some()
+            {
+                return Err(HistoryStepError::ClientRegistry);
+            }
+        }
+        if authenticated.len() != registry.entries().len() {
+            return Err(HistoryStepError::ClientRegistry);
+        }
+        let root = registry.root();
+        let matrices = authenticated;
+        Ok(Self {
+            form: form.clone(),
+            registry,
+            root,
+            matrices,
+        })
+    }
+
+    pub fn form(&self) -> &HistoryStepClientForm {
+        &self.form
+    }
+
+    pub fn registry(&self) -> &HistoryStepClientRegistry {
+        &self.registry
+    }
+
+    /// The root every client lane of this chain must carry.
+    pub fn root(&self) -> Hash {
+        self.root
+    }
+
+    /// The native checks of a present client's lanes: the registry root is
+    /// the chain's, `D` is registered, and the accumulator claim holds on the
+    /// registered matrix `D`.
+    pub fn check_claim(&self, claim: &HistoryStepClientClaim) -> Result<(), HistoryStepBankError> {
+        if claim.registry_root != self.root {
+            return Err(HistoryStepBankError::ClientRegistryRoot);
+        }
+        let matrix = self
+            .matrices
+            .get(&claim.matrix_digest)
+            .ok_or(HistoryStepBankError::ClientNotRegistered)?;
+        if claim.claim.point.len() != 2 * self.form.shape().k_log + 1 {
+            return Err(HistoryStepBankError::ClientLaneWidth);
+        }
+        if stacked_matrix_mle_eval_c1(matrix, &claim.claim) != claim.claim.value {
+            return Err(HistoryStepBankError::ClientAccumulatedClaimValue);
+        }
+        Ok(())
     }
 }
 
@@ -388,6 +478,13 @@ pub(crate) fn prepare_client_arm(
         |_, _| Ok(()),
     )
     .map_err(|_| HistoryStepError::ClientProof)?;
+    // The verifier above defers the lincheck's matrix evaluation. A proof of
+    // another matrix whose transcript absorbs `D` passes everything else, and
+    // folding its false claim trips the fold prover. Close the lincheck here,
+    // against the registered matrix, before anything is folded.
+    if fresh_claim_value_c1(matrix, &fresh) != fresh.value {
+        return Err(HistoryStepError::ClientProof);
+    }
     let verify_ms = started.elapsed().as_secs_f64() * 1e3;
     let started = std::time::Instant::now();
     let (fold_proof, outgoing) = prove_matrix_claim_fold_c1(
@@ -515,6 +612,27 @@ impl PreparedClientArm {
         self.scratch = scratch_replay(
             form,
             &digest,
+            &self.field_proof,
+            &self.commitment_root,
+            &self.io,
+            &self.fold_proof,
+        );
+        self
+    }
+
+    /// A prover that skips the reception check: this pre-pass with its
+    /// client proof replaced by `field_proof`, re-recorded consistently, its
+    /// lanes and fold kept.
+    #[cfg(test)]
+    pub(crate) fn with_field_proof(
+        mut self,
+        form: &HistoryStepClientForm,
+        field_proof: C1FieldR1csProof,
+    ) -> Self {
+        self.field_proof = field_proof;
+        self.scratch = scratch_replay(
+            form,
+            &self.digest,
             &self.field_proof,
             &self.commitment_root,
             &self.io,

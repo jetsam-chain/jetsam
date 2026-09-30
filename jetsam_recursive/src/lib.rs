@@ -53,13 +53,15 @@ pub use acceptance::history_step_bank::{
 #[cfg(feature = "client-slot")]
 pub use acceptance::history_step::{
     client_io_commitment, derive_history_step_runtime_parts_with_client,
-    prepare_history_step_for_pow_with_client, HistoryStepClientParts, HistoryStepClientRegistry,
-    HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
+    HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
+    HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 #[cfg(feature = "client-slot")]
 pub use acceptance::history_step_bank::{
     history_step_bank_io_layout_with_client, history_step_bank_io_spec_with_client,
-    HistoryStepClientForm, HistoryStepClientIoLanes,
+    parse_history_step_client_lanes, HistoryStepClientClaim, HistoryStepClientForm,
+    HistoryStepClientIoLanes,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,

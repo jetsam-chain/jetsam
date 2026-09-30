@@ -1748,6 +1748,358 @@ mod client_slot {
         }
     }
 
+    // ---- M2 task 2.5: the node's native checks of a client lane ----------
+    //
+    // A node never sees the client proof: it reads the client lanes of the
+    // block's public IO (which the HistoryStep proof binds) and checks them
+    // natively against the chain's registry. These tests run those checks on
+    // lanes written by real test-scale clients, then on every mutation.
+
+    use crate::acceptance::history_step::client_arm::{
+        HistoryStepChainClients, PreparedHistoryStepClient,
+    };
+    use crate::acceptance::history_step::HistoryStepError;
+    use crate::acceptance::history_step_bank::{
+        parse_history_step_client_lanes, HistoryStepBankError, HistoryStepClientClaim,
+    };
+
+    /// Two real clients, `A` and `B`, both registered in the chain's registry
+    /// (and in their provers' view of it), with the chain's registry itself.
+    fn registered_pair(
+        form: &HistoryStepClientForm,
+    ) -> (
+        HistoryStepClientWitness,
+        HistoryStepClientWitness,
+        HistoryStepChainClients,
+    ) {
+        let mut a = client_witness(form, 0xC11E_0201, 0);
+        let mut b = client_witness(form, 0xC11E_0202, 0);
+        let registry = HistoryStepClientRegistry::new(
+            form.registry_depth(),
+            vec![
+                a.matrix.structural_statement_digest(),
+                b.matrix.structural_statement_digest(),
+            ],
+        )
+        .expect("chain registry");
+        a.registry = registry.clone();
+        b.registry = registry.clone();
+        let chain = HistoryStepChainClients::new(
+            form,
+            registry,
+            vec![a.matrix.clone(), b.matrix.clone()],
+        )
+        .expect("chain clients");
+        (a, b, chain)
+    }
+
+    fn parsed(form: &HistoryStepClientForm, io: &[F128]) -> HistoryStepClientClaim {
+        parse_history_step_client_lanes(&client_lanes(form), io)
+            .expect("canonical client lanes")
+            .expect("present client")
+    }
+
+    /// The lanes of a registered client pass the node's checks: canonical,
+    /// the chain's registry root, `D` registered, and an accumulator claim
+    /// that holds on the registered matrix `D`. An absent client carries
+    /// nothing to check.
+    #[test]
+    fn node_accepts_the_lanes_of_a_registered_client() {
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        for witness in [&a, &b] {
+            let prepared = prepare_client_arm(&form, Some(witness)).expect("registered client");
+            let claim = parsed(&form, &client_io(&form, &prepared));
+            assert_eq!(claim.matrix_digest, witness.matrix.structural_statement_digest());
+            assert_eq!(claim.registry_root, chain.root());
+            assert_eq!(claim.io_commitment, client_io_commitment(&witness.io));
+            assert_eq!(chain.check_claim(&claim), Ok(()), "honest client lanes");
+        }
+        let ghost = prepare_client_arm(&form, None).expect("ghost client");
+        assert_eq!(
+            parse_history_step_client_lanes(&client_lanes(&form), &client_io(&form, &ghost)),
+            Ok(None),
+            "an absent client has no lane to check"
+        );
+    }
+
+    /// "D faux": the lanes name a matrix other than the one the claim was
+    /// folded against. Another registered matrix: the claim does not hold on
+    /// it. An unregistered digest: refused before any evaluation.
+    #[test]
+    fn node_refuses_a_wrong_matrix_digest() {
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        let lanes = client_lanes(&form);
+        let honest = client_io(
+            &form,
+            &prepare_client_arm(&form, Some(&a)).expect("registered client"),
+        );
+
+        let mut other = honest.clone();
+        other[lanes.matrix_digest..lanes.matrix_digest + 2]
+            .copy_from_slice(&flat_digest_lanes(&b.matrix.structural_statement_digest()));
+        assert_eq!(
+            chain.check_claim(&parsed(&form, &other)),
+            Err(HistoryStepBankError::ClientAccumulatedClaimValue)
+        );
+
+        let mut forged = honest.clone();
+        forged[lanes.matrix_digest] += F128::ONE;
+        assert_eq!(
+            chain.check_claim(&parsed(&form, &forged)),
+            Err(HistoryStepBankError::ClientNotRegistered)
+        );
+    }
+
+    /// "D hors registre": a client registered in its prover's registry but
+    /// not in the chain's. Its root is not the chain's; rewritten to the
+    /// chain's root, its `D` is still not an entry.
+    #[test]
+    fn node_refuses_a_matrix_outside_the_chain_registry() {
+        let form = test_client_form();
+        let (_, _, chain) = registered_pair(&form);
+        let outsider = client_witness(&form, 0xC11E_0203, 1);
+        let lanes = client_lanes(&form);
+        let io = client_io(
+            &form,
+            &prepare_client_arm(&form, Some(&outsider)).expect("registered elsewhere"),
+        );
+        assert_eq!(
+            chain.check_claim(&parsed(&form, &io)),
+            Err(HistoryStepBankError::ClientRegistryRoot)
+        );
+
+        let mut rerooted = io.clone();
+        rerooted[lanes.registry_root..lanes.registry_root + 2]
+            .copy_from_slice(&flat_digest_lanes(&chain.root()));
+        assert_eq!(
+            chain.check_claim(&parsed(&form, &rerooted)),
+            Err(HistoryStepBankError::ClientNotRegistered)
+        );
+    }
+
+    /// "Voie d'accumulateur fausse": a changed value, or a changed point
+    /// coordinate, is a claim the registered matrix does not satisfy.
+    #[test]
+    fn node_refuses_a_false_accumulator_lane() {
+        let form = test_client_form();
+        let (a, _, chain) = registered_pair(&form);
+        let lane = client_lanes(&form).matrix_lane;
+        let honest = client_io(
+            &form,
+            &prepare_client_arm(&form, Some(&a)).expect("registered client"),
+        );
+        for (name, index) in [
+            ("value lo", lane.value),
+            ("value hi", lane.value + 1),
+            ("first point coordinate", lane.point),
+            ("last point coordinate", lane.value - 1),
+        ] {
+            let mut forged = honest.clone();
+            forged[index] += F128::ONE;
+            assert_eq!(
+                chain.check_claim(&parsed(&form, &forged)),
+                Err(HistoryStepBankError::ClientAccumulatedClaimValue),
+                "{name}"
+            );
+        }
+    }
+
+    /// "client_present incohérent": the flag is 0 or 1; an absent client
+    /// carries only zeros; a present one a live lane and a non-null `D`.
+    #[test]
+    fn node_refuses_an_incoherent_client_present() {
+        let form = test_client_form();
+        let (a, _, _) = registered_pair(&form);
+        let lanes = client_lanes(&form);
+        let honest = client_io(
+            &form,
+            &prepare_client_arm(&form, Some(&a)).expect("registered client"),
+        );
+        let ghost = client_io(&form, &prepare_client_arm(&form, None).expect("ghost"));
+        let refused = |io: &[F128]| parse_history_step_client_lanes(&lanes, io).err();
+
+        let mut flag = ghost.clone();
+        flag[lanes.present] = F128::new(2, 0);
+        assert_eq!(refused(&flag), Some(HistoryStepBankError::ClientPresentFlag));
+
+        let mut hidden = honest.clone();
+        hidden[lanes.present] = F128::ZERO;
+        assert_eq!(
+            refused(&hidden),
+            Some(HistoryStepBankError::NonCanonicalAbsentClient),
+            "absent client with a present client's lanes"
+        );
+
+        let mut live_ghost = ghost.clone();
+        live_ghost[lanes.matrix_lane.live] = F128::ONE;
+        assert_eq!(
+            refused(&live_ghost),
+            Some(HistoryStepBankError::NonCanonicalAbsentClient),
+            "absent client with a live accumulator lane"
+        );
+
+        let mut dead = honest.clone();
+        dead[lanes.matrix_lane.live] = F128::ZERO;
+        assert_eq!(refused(&dead), Some(HistoryStepBankError::ClientLaneLiveness));
+
+        let mut claimed = ghost.clone();
+        claimed[lanes.present] = F128::ONE;
+        claimed[lanes.matrix_lane.live] = F128::ONE;
+        assert_eq!(
+            refused(&claimed),
+            Some(HistoryStepBankError::NullClientMatrixDigest),
+            "present flag over a ghost's lanes"
+        );
+
+        let mut null = honest.clone();
+        null[lanes.matrix_digest..lanes.matrix_digest + 2].fill(F128::ZERO);
+        assert_eq!(refused(&null), Some(HistoryStepBankError::NullClientMatrixDigest));
+    }
+
+    /// "π altérée": refused when it is received — the pre-pass verifies the
+    /// proof natively, its deferred lincheck included, against the registered
+    /// matrix — and, for a prover that skips that check, unsatisfiable in the
+    /// client arm.
+    #[test]
+    fn an_altered_client_proof_is_refused() {
+        let form = test_client_form();
+        let (a, _, _) = registered_pair(&form);
+        type Alteration = fn(&mut HistoryStepClientWitness);
+        let alterations: [(&str, Alteration); 6] = [
+            ("zerocheck final evaluation", |w| {
+                w.field_proof.zerocheck.final_a_eval += F256::ONE
+            }),
+            ("lincheck partial evaluation", |w| {
+                w.field_proof.lincheck.z_partial[0] += F256::ONE
+            }),
+            ("lincheck round", |w| w.field_proof.lincheck.rounds[0].0 += F256::ONE),
+            ("PCS query leaf", |w| {
+                w.field_proof.pcs_open.queries[0].initial_leaf[0] += F128::ONE
+            }),
+            ("PCS commitment root", |w| w.commitment.root[0] ^= 1),
+            ("public IO", |w| w.io[0] += F128::ONE),
+        ];
+        for (name, alter) in alterations {
+            let mut altered = a.clone();
+            alter(&mut altered);
+            assert!(
+                matches!(
+                    PreparedHistoryStepClient::prepare(&form, &altered),
+                    Err(HistoryStepError::ClientProof)
+                ),
+                "client proof altered in its {name} accepted on reception"
+            );
+        }
+
+        let parents = ParentFixtures::new();
+        let geometry = client_arm_geometry(&parents, &form);
+        let honest = prepare_client_arm(&form, Some(&a)).expect("registered client");
+        let io = client_io(&form, &honest);
+        let mut proof = a.field_proof.clone();
+        proof.lincheck.z_partial[0] += F256::ONE;
+        let skipped = honest.with_field_proof(&form, proof);
+        let built = build_with_client_arm(&parents, &geometry, &form, &skipped, &io);
+        assert!(
+            !built.r1cs.satisfies(&built.z),
+            "client arm satisfied by a proof altered in its deferred lincheck"
+        );
+
+        // The lie the deferred lincheck leaves open: a proof of another
+        // matrix, its transcript seeded with `D`. Every check but the matrix
+        // evaluation passes, so the reception pre-pass must close the
+        // lincheck against the registered matrix — refusing it with a typed
+        // error, before the fold prover ever sees a false claim.
+        let lying = proof_of_another_matrix_under(&form, &a, 0xC11E_0205);
+        assert!(
+            matches!(
+                PreparedHistoryStepClient::prepare(&form, &lying),
+                Err(HistoryStepError::ClientProof)
+            ),
+            "a proof of another matrix accepted under D on reception"
+        );
+    }
+
+    /// A cheating client: a real proof of a different matrix of the same
+    /// shape, whose transcript absorbs `registered`'s digest `D` (the prover
+    /// reads the seedable digest cache), presented as a client of `D`.
+    fn proof_of_another_matrix_under(
+        form: &HistoryStepClientForm,
+        registered: &HistoryStepClientWitness,
+        seed: u64,
+    ) -> HistoryStepClientWitness {
+        let (other, witness): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(CLIENT_M, CLIENT_M, seed);
+        let digest = registered.matrix.structural_statement_digest();
+        assert_ne!(other.structural_statement_digest(), digest);
+        other.seed_statement_digest(digest);
+        let spec = form.io_spec().clone();
+        let io = witness[spec.io_slice.start()..spec.io_slice.start() + spec.io_len].to_vec();
+        let mut prover = FsLaneChallenger::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
+        let (field_proof, (), commitment, _) =
+            jetsam_ivc_prover::field_prover::prove_field_c1_with_public_io_and_post_commit_context(
+                &other,
+                &witness,
+                form.pcs_params(),
+                &spec,
+                &io,
+                &form.post_commit_digest(),
+                &mut prover,
+                |_| (),
+            );
+        HistoryStepClientWitness {
+            field_proof,
+            commitment,
+            io,
+            matrix: registered.matrix.clone(),
+            registry: registered.registry.clone(),
+        }
+    }
+
+    /// The chain's registry holds exactly one matrix of the form per entry.
+    #[test]
+    fn chain_clients_hold_every_registered_matrix() {
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        let registry = chain.registry().clone();
+        assert!(matches!(
+            HistoryStepChainClients::new(&form, registry.clone(), vec![a.matrix.clone()]),
+            Err(HistoryStepError::ClientRegistry)
+        ), "an entry without its matrix");
+        let outsider = client_witness(&form, 0xC11E_0204, 0);
+        assert!(matches!(
+            HistoryStepChainClients::new(
+                &form,
+                registry.clone(),
+                vec![a.matrix.clone(), b.matrix.clone(), outsider.matrix.clone()]
+            ),
+            Err(HistoryStepError::ClientRegistry)
+        ), "a matrix outside the registry");
+        let deeper = HistoryStepClientRegistry::new(
+            form.registry_depth() + 1,
+            registry.entries().to_vec(),
+        )
+        .expect("deeper registry");
+        assert!(matches!(
+            HistoryStepChainClients::new(&form, deeper, vec![a.matrix.clone(), b.matrix.clone()]),
+            Err(HistoryStepError::ClientForm)
+        ), "a registry of another depth");
+        let (wider, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(CLIENT_M + 1, CLIENT_M + 1, 7);
+        let wider = std::sync::Arc::new(wider);
+        let mixed = HistoryStepClientRegistry::new(
+            form.registry_depth(),
+            vec![
+                a.matrix.structural_statement_digest(),
+                wider.structural_statement_digest(),
+            ],
+        )
+        .expect("mixed registry");
+        assert!(matches!(
+            HistoryStepChainClients::new(&form, mixed, vec![a.matrix.clone(), wider]),
+            Err(HistoryStepError::ClientForm)
+        ), "a matrix of another shape");
+    }
+
     fn test_spec() -> jetsam_ivc_core::public_io::PublicIoSpec {
         jetsam_ivc_core::public_io::PublicIoSpec {
             io_slice: jetsam_ivc_core::public_io::WitnessSlice {

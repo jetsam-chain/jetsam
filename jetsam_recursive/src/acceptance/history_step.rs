@@ -98,8 +98,8 @@ pub use relation::{
 };
 #[cfg(feature = "client-slot")]
 pub use client_arm::{
-    client_io_commitment, HistoryStepClientRegistry, HistoryStepClientWitness,
-    PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    client_io_commitment, HistoryStepChainClients, HistoryStepClientRegistry,
+    HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 #[cfg(feature = "client-slot")]
 pub use relation::{
