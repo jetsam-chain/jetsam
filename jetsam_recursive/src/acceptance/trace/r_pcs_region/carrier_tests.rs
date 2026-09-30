@@ -429,6 +429,61 @@ fn parent_only_carrier_is_bit_identical() {
     );
 }
 
+/// The canonical Link VK is a pure function of the geometry and of its witness
+/// slices. The memoized key must be exactly the key a fresh reconstruction
+/// yields — for the canonical slices, for every prepared block, and for any
+/// other slices (a memo keyed on other slices is never served).
+#[test]
+fn memoized_link_vk_is_the_rebuilt_vk() {
+    let parents = ParentFixtures::new();
+    let geometry = parents.geometry();
+    let spec = jetsam_ivc_core::public_io::PublicIoSpec {
+        io_slice: WitnessSlice {
+            log2_len: 10,
+            index: 1,
+        },
+        io_len: 900,
+        claims: Vec::new(),
+    };
+    let slices = geometry.canonical_slices(&spec).expect("canonical slices");
+    let rebuilt = geometry
+        .vk_from_slices(slices.0, slices.1, slices.2, slices.3)
+        .expect("fresh Link VK");
+    assert!(geometry.memoized_link_vk().is_none(), "nothing memoized yet");
+    let first = geometry.canonical_vk(&spec).expect("canonical Link VK");
+    assert_eq!(first, rebuilt, "memoized VK != rebuilt VK");
+    assert_eq!(first.transcript_digest(), rebuilt.transcript_digest());
+    assert!(
+        geometry.memoized_link_vk().is_some(),
+        "the canonical VK is memoized"
+    );
+    assert_eq!(geometry.canonical_vk(&spec).expect("memo hit"), rebuilt);
+
+    // Another slice table is rebuilt, never served from the memo.
+    let other_spec = jetsam_ivc_core::public_io::PublicIoSpec {
+        io_slice: WitnessSlice {
+            log2_len: 10,
+            index: 40,
+        },
+        ..spec.clone()
+    };
+    let other_slices = geometry.canonical_slices(&other_spec).expect("slices");
+    let other = geometry.canonical_vk(&other_spec).expect("other VK");
+    assert_eq!(
+        other,
+        geometry
+            .vk_from_slices(other_slices.0, other_slices.1, other_slices.2, other_slices.3)
+            .expect("fresh other VK")
+    );
+    assert_ne!(other.transcript_digest(), rebuilt.transcript_digest());
+
+    // Every prepared block carries the rebuilt key.
+    for active in 0..2 {
+        let (_, _, _, preparation) = build_parent_only(&parents, &geometry, active);
+        assert_eq!(preparation.vk(), &rebuilt, "prepared VK (arm {active})");
+    }
+}
+
 /// `(allocated wires, structural matrix digest, Link VK transcript digest)` of
 /// the parent-only test-scale carrier, captured on tag v1.4.3.
 const PARENT_ONLY_PINS: (usize, &str, &str) = (

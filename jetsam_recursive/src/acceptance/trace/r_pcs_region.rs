@@ -223,6 +223,26 @@ pub(crate) struct HistoryStepParentGeometry {
     /// The client verifier's transcript layout: a third L-C role, identical
     /// in both parent arms (`client-slot`).
     client_layout: Option<DuplexLayout>,
+    /// The canonical Link VK is a pure function of this geometry and of its
+    /// witness slices, and every block of one relation allocates the same
+    /// slices. It is built once and served from here (performance only: the
+    /// key is exactly what [`Self::vk_from_slices`] returns for those slices).
+    link_vk_memo: std::sync::OnceLock<LinkVkMemo>,
+}
+
+/// The witness slices of the three Link walks and of the arm selector.
+type LinkWalkSlices = (
+    [WitnessSlice; 6],
+    [WitnessSlice; N_COMMITTED_B],
+    [WitnessSlice; 6],
+    WitnessSlice,
+);
+
+/// One memoized canonical Link VK and the slices it was built for.
+#[derive(Clone, Debug)]
+struct LinkVkMemo {
+    slices: LinkWalkSlices,
+    vk: LinkRegionSidecarVk,
 }
 
 /// Pack each parent arm's recording roles — Block child, `[R]_prev`, then the
@@ -317,6 +337,7 @@ impl HistoryStepParentGeometry {
             selected_recording_blocks,
             rec_w_log,
             client_layout: None,
+            link_vk_memo: std::sync::OnceLock::new(),
         })
     }
 
@@ -354,6 +375,9 @@ impl HistoryStepParentGeometry {
         self.selected_recording_blocks = selected_recording_blocks;
         self.rec_w_log = rec_w_log;
         self.client_layout = Some(client_layout);
+        // The geometry changed: a key memoized for the parent-only carrier
+        // must never be served for this one.
+        self.link_vk_memo = std::sync::OnceLock::new();
         Ok(self)
     }
 
@@ -393,13 +417,55 @@ impl HistoryStepParentGeometry {
         &self,
         spec: &jetsam_ivc_core::public_io::PublicIoSpec,
     ) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+        let (leaf, path, rec, selector) = self.canonical_slices(spec)?;
+        self.memoized_vk_from_slices(leaf, path, rec, selector)
+    }
+
+    /// The Link walk slices a relation with public-IO `spec` allocates.
+    fn canonical_slices(
+        &self,
+        spec: &jetsam_ivc_core::public_io::PublicIoSpec,
+    ) -> Result<LinkWalkSlices, RegionSidecarError> {
         let leaf_w_log = crate::region_sidecar::combined_duplex_protocol_w_log(
             &combined_leaf_descriptor(&self.carrier)?,
         )?;
         let (_, path_w_log) = link_path_geometry(&self.carrier)?;
-        let (leaf, path, rec, selector) =
-            canonical_link_walk_slices(spec, leaf_w_log, path_w_log, self.rec_w_log);
-        self.vk_from_slices(leaf, path, rec, selector)
+        Ok(canonical_link_walk_slices(
+            spec,
+            leaf_w_log,
+            path_w_log,
+            self.rec_w_log,
+        ))
+    }
+
+    /// [`Self::vk_from_slices`], built at most once for the slices every
+    /// block of the relation allocates. Other slices are always rebuilt.
+    fn memoized_vk_from_slices(
+        &self,
+        leaf_slices: [WitnessSlice; 6],
+        path_slices: [WitnessSlice; N_COMMITTED_B],
+        rec_slices: [WitnessSlice; 6],
+        selector_slice: WitnessSlice,
+    ) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+        let slices = (leaf_slices, path_slices, rec_slices, selector_slice);
+        if let Some(memo) = self.link_vk_memo.get() {
+            if memo.slices == slices {
+                return Ok(memo.vk.clone());
+            }
+            return self.vk_from_slices(leaf_slices, path_slices, rec_slices, selector_slice);
+        }
+        let vk = self.vk_from_slices(leaf_slices, path_slices, rec_slices, selector_slice)?;
+        // A concurrent builder may have won the race with an identical key.
+        let _ = self.link_vk_memo.set(LinkVkMemo {
+            slices,
+            vk: vk.clone(),
+        });
+        Ok(vk)
+    }
+
+    #[cfg(test)]
+    fn memoized_link_vk(&self) -> Option<&LinkRegionSidecarVk> {
+        self.link_vk_memo.get().map(|memo| &memo.vk)
     }
 
     #[cfg(test)]
@@ -1277,33 +1343,21 @@ fn prepare_carrier_columns(
         0,
     );
 
-    let leaf_vk = CombinedDuplexRegionVk::from_union(
-        link_r_pcs_leaf_sidecar_purpose(),
-        asm.leaf_descriptor.clone(),
-        slices_a,
-        &asm.u_a,
-    )?;
-    let path_vk = MerkleRegionVk::new(
-        link_r_pcs_path_sidecar_purpose(),
-        asm.w_log_b,
-        slices_b,
-        asm.block_log_b,
-        asm.path_families.clone(),
-    )?;
-    let rec_vk = RecordingDuplexRegionVk::new_selected(
-        link_recordings_purpose(),
-        geometry.rec_w_log,
-        slices_rec,
-        selector_slice,
-        geometry.selected_recording_blocks.clone(),
-    )?;
-    if u_rec.w_log != geometry.rec_w_log
-        || u_rec.rec_blocks != geometry.selected_recording_blocks[active_slot]
+    // The canonical key of these slices, built once per geometry. This block's
+    // walks must be exactly the walks that key describes: the L-A union
+    // matches its certified protocol, the L-B carrier its families, the L-C
+    // union its selected blocks.
+    let vk = geometry.memoized_vk_from_slices(slices_a, slices_b, slices_rec, selector_slice)?;
+    vk.leaf_a().check_union(&asm.leaf_descriptor, &asm.u_a)?;
+    if asm.w_log_b != vk.path_b().w_log()
+        || asm.block_log_b != vk.path_b().block_log()
+        || asm.path_families.as_slice() != vk.path_b().families()
     {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk)?;
-    if vk != geometry.vk_from_slices(slices_a, slices_b, slices_rec, selector_slice)? {
+    if u_rec.w_log != geometry.rec_w_log
+        || u_rec.rec_blocks != geometry.selected_recording_blocks[active_slot]
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     Ok(HistoryStepParentColumns {

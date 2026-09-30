@@ -270,6 +270,38 @@ impl CombinedDuplexRegionVk {
         Ok(vk)
     }
 
+    /// The union checks of [`Self::from_union`] against this key's certified
+    /// protocol, without regenerating it: `union` must be the exact
+    /// recording-free output of `build_combined_duplex_union` for `descriptor`,
+    /// which must be this key's descriptor.
+    pub(crate) fn check_union(
+        &self,
+        descriptor: &CombinedDuplexRegionDescriptor,
+        union: &DuplexUnion,
+    ) -> Result<(), RegionSidecarError> {
+        let protocol = &self.protocol;
+        let expected_len = checked_pow2(protocol.w_log)?;
+        if descriptor != &self.descriptor
+            || !union.rec_refs.is_empty()
+            || !union.rec_blocks.is_empty()
+            || !union.rec_challenges.is_empty()
+            || union.w_log != protocol.w_log
+            || union.block_log != protocol.block_log
+            || union.refs != protocol.refs
+            || union.fixed.as_slice() != protocol.fixed.as_ref()
+            || !layouts_equal(&union.layout, &protocol.layout)
+            || union
+                .committed
+                .iter()
+                .chain(union.s0.iter())
+                .chain(union.s_out.iter())
+                .any(|column| column.len() != expected_len)
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        Ok(())
+    }
+
     pub fn purpose(&self) -> &[u8; 32] {
         &self.purpose
     }
