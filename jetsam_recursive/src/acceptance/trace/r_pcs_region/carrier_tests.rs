@@ -1658,6 +1658,39 @@ mod client_slot {
         assert!(!built.r1cs.satisfies(&built.z), "non-boolean client_present accepted");
     }
 
+    /// The client pre-pass (native verification, lincheck fold against the
+    /// registered matrix, recorded replay) depends only on the client proof:
+    /// done once when the proof is received and kept, it is exactly the
+    /// pre-pass a block would recompute, and the arm built from it is the
+    /// same trace.
+    #[test]
+    fn cached_client_prepass_is_the_recomputed_one() {
+        use crate::acceptance::history_step::client_arm::PreparedHistoryStepClient;
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let witness = client_witness(&form, 0xC11E_0105, 1);
+        let cached = PreparedHistoryStepClient::prepare(&form, &witness).expect("cached pre-pass");
+        let recomputed = prepare_client_arm(&form, Some(&witness)).expect("recomputed pre-pass");
+        assert!(
+            cached.arm().same_pre_pass(&recomputed),
+            "cached pre-pass differs from the recomputed one"
+        );
+        assert_eq!(cached.digest(), witness.matrix.structural_statement_digest());
+        assert!(cached.is_for(&form));
+
+        let geometry = client_arm_geometry(&parents, &form);
+        let io = client_io(&form, cached.arm());
+        assert_eq!(io, client_io(&form, &recomputed));
+        let from_cache = build_with_client_arm(&parents, &geometry, &form, cached.arm(), &io);
+        let from_scratch = build_with_client_arm(&parents, &geometry, &form, &recomputed, &io);
+        assert!(from_cache.r1cs.satisfies(&from_cache.z), "cached client");
+        assert_eq!(from_cache.z, from_scratch.z, "cached pre-pass moved the witness");
+        assert_eq!(
+            from_cache.r1cs.structural_statement_digest(),
+            from_scratch.r1cs.structural_statement_digest()
+        );
+    }
+
     /// M2 task 2.3, the Link-key fixed point: with the client slot the
     /// canonical Link VK walks two proofs and records a third L-C role, which
     /// widens the parent's joint-sidecar replay and therefore the recorded

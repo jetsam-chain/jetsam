@@ -298,7 +298,7 @@ type ClientSlot = ();
 
 /// The client a block carries, if any (`client-slot`); unit without it.
 #[cfg(feature = "client-slot")]
-type ClientInput<'a> = Option<&'a super::client_arm::HistoryStepClientWitness>;
+type ClientInput<'a> = Option<&'a super::client_arm::PreparedHistoryStepClient>;
 #[cfg(not(feature = "client-slot"))]
 type ClientInput<'a> = core::marker::PhantomData<&'a ()>;
 
@@ -2227,7 +2227,13 @@ fn prepare_client_slot<'r>(
     match (runtime.bank().client_form(), runtime.bank().layout().client) {
         (None, None) if client.is_none() => Ok(None),
         (Some(form), Some(lanes)) => {
-            let prepared = super::client_arm::prepare_client_arm(form, client)?;
+            // A present client comes pre-passed (on reception); only the
+            // ghost of the form is built here.
+            let prepared = match client {
+                Some(client) if client.is_for(form) => client.arm().clone(),
+                Some(_) => return Err(HistoryStepError::ClientForm),
+                None => super::client_arm::prepare_client_arm(form, None)?,
+            };
             prepared.install_io(&lanes, io);
             Ok(Some((form, lanes, prepared)))
         }
@@ -2999,13 +3005,15 @@ pub fn prepare_history_step_for_pow<const TIER: usize>(
 }
 
 /// [`prepare_history_step_for_pow`] for a client-bearing runtime
-/// (`client-slot`): the block carries `client`, or the ghost of the form.
+/// (`client-slot`): the block carries `client` — pre-passed once, when it
+/// was received ([`super::client_arm::PreparedHistoryStepClient::prepare`]) —
+/// or the ghost of the form.
 #[cfg(feature = "client-slot")]
 pub fn prepare_history_step_for_pow_with_client<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
     current: HistoryStepBlockInput<TIER>,
-    client: Option<&super::client_arm::HistoryStepClientWitness>,
+    client: Option<&super::client_arm::PreparedHistoryStepClient>,
 ) -> Result<PreparedHistoryStepForPow<TIER>, HistoryStepError> {
     prepare_history_step_for_pow_slot(runtime, parent, current, client)
 }

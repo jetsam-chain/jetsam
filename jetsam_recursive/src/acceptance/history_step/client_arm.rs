@@ -156,6 +156,7 @@ pub struct HistoryStepClientWitness {
 
 /// Native pre-pass of the client arm, present or ghost: everything the arm,
 /// the carrier columns and the public IO need.
+#[derive(Clone)]
 pub(crate) struct PreparedClientArm {
     present: bool,
     digest: Hash,
@@ -429,6 +430,45 @@ pub(crate) fn prepare_client_arm(
     })
 }
 
+/// A client proof prepared once, when it is received: native verification
+/// against `D` and the registry, the lincheck fold against the registered
+/// matrix, the recorded replay. None of it depends on the block that will
+/// carry the client, so it is kept and handed to every block attempt
+/// ([`super::relation::prepare_history_step_for_pow_with_client`]) instead
+/// of being redone on the critical path.
+#[derive(Clone)]
+pub struct PreparedHistoryStepClient {
+    form: HistoryStepClientForm,
+    arm: PreparedClientArm,
+}
+
+impl PreparedHistoryStepClient {
+    /// The pre-pass of `witness` under `form`.
+    pub fn prepare(
+        form: &HistoryStepClientForm,
+        witness: &HistoryStepClientWitness,
+    ) -> Result<Self, HistoryStepError> {
+        Ok(Self {
+            form: form.clone(),
+            arm: prepare_client_arm(form, Some(witness))?,
+        })
+    }
+
+    /// `D`, the registered matrix this client proof verifies under.
+    pub fn digest(&self) -> Hash {
+        self.arm.digest
+    }
+
+    /// Whether this pre-pass was made under `form`.
+    pub fn is_for(&self, form: &HistoryStepClientForm) -> bool {
+        &self.form == form
+    }
+
+    pub(crate) fn arm(&self) -> &PreparedClientArm {
+        &self.arm
+    }
+}
+
 /// The L-C layout of the client arm's transcript: value-independent, fixed
 /// by the form (the ghost's layout is every client's).
 pub(crate) fn client_transcript_layout(
@@ -438,6 +478,26 @@ pub(crate) fn client_transcript_layout(
 }
 
 impl PreparedClientArm {
+    /// Every value the pre-pass produced equals `other`'s.
+    #[cfg(test)]
+    pub(crate) fn same_pre_pass(&self, other: &Self) -> bool {
+        self.present == other.present
+            && self.digest == other.digest
+            && self.registry_root == other.registry_root
+            && self.registry_index == other.registry_index
+            && self.registry_path == other.registry_path
+            && self.io_commitment == other.io_commitment
+            && self.io == other.io
+            && self.commitment_root == other.commitment_root
+            && self.fold_proof == other.fold_proof
+            && self.outgoing == other.outgoing
+            && self.scratch.layout == other.scratch.layout
+            && self.scratch.data_flat == other.scratch.data_flat
+            && self.scratch.challenges == other.scratch.challenges
+            && self.scratch.post_state == other.scratch.post_state
+            && self.scratch.perms == other.scratch.perms
+    }
+
     /// A dishonest prover that claims another registered matrix `digest` for
     /// this proof, consistently everywhere it controls (IO lanes, registry
     /// path, recorded transcript).

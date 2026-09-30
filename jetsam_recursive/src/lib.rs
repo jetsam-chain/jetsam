@@ -54,7 +54,7 @@ pub use acceptance::history_step_bank::{
 pub use acceptance::history_step::{
     client_io_commitment, derive_history_step_runtime_parts_with_client,
     prepare_history_step_for_pow_with_client, HistoryStepClientParts, HistoryStepClientRegistry,
-    HistoryStepClientWitness, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 #[cfg(feature = "client-slot")]
 pub use acceptance::history_step_bank::{
