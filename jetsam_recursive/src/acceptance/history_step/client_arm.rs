@@ -364,11 +364,15 @@ pub(crate) fn prepare_client_arm(
     {
         return Err(HistoryStepError::ClientProof);
     }
+    let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
+    let started = std::time::Instant::now();
     let digest = matrix.structural_statement_digest();
+    let digest_ms = started.elapsed().as_secs_f64() * 1e3;
     let registry_index = witness
         .registry
         .position(&digest)
         .ok_or(HistoryStepError::ClientRegistry)?;
+    let started = std::time::Instant::now();
     let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
     let (_claim, fresh) = verify_field_c1_deferred_matrix_with_post_commit_context(
         &form.shape(),
@@ -383,6 +387,8 @@ pub(crate) fn prepare_client_arm(
         |_, _| Ok(()),
     )
     .map_err(|_| HistoryStepError::ClientProof)?;
+    let verify_ms = started.elapsed().as_secs_f64() * 1e3;
+    let started = std::time::Instant::now();
     let (fold_proof, outgoing) = prove_matrix_claim_fold_c1(
         matrix,
         &fresh,
@@ -390,6 +396,8 @@ pub(crate) fn prepare_client_arm(
         false,
         &mut challenger,
     );
+    let fold_ms = started.elapsed().as_secs_f64() * 1e3;
+    let started = std::time::Instant::now();
     let scratch = scratch_replay(
         form,
         &digest,
@@ -398,6 +406,13 @@ pub(crate) fn prepare_client_arm(
         &witness.io,
         &fold_proof,
     );
+    if timing {
+        eprintln!(
+            "[history-assembly client] matrix digest {digest_ms:.1} ms; native verify \
+             {verify_ms:.1} ms; lincheck fold {fold_ms:.1} ms; scratch replay {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
     Ok(PreparedClientArm {
         present: true,
         digest,

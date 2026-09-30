@@ -595,6 +595,121 @@ fn production_carrier_geometry_diagnostic() {
     );
 }
 
+/// Task A measurement, in one process and under one load: the production
+/// parent-column preparation (B255 parent walked, memoized key) against the
+/// work the memo removed from every block — the key built from the assembled
+/// walks (`from_union` + Merkle + selected recording) and the key rebuilt from
+/// the slices. Rounds alternate so foreign load hits both sides alike.
+#[test]
+#[ignore = "diagnostic: Link VK memo gain at production scale (release, reads the v1.3 pack)"]
+fn link_vk_memo_gain_diagnostic() {
+    let parts = released_v13_parts();
+    let geometry = production_parent_geometry(&parts);
+    let spec =
+        crate::acceptance::history_step_bank::history_step_bank_io_spec_for(parts.generation());
+    let params = production_parent_params();
+    let tiers: Vec<ProofFixture> = (0..2)
+        .map(|slot| {
+            let shape = crate::acceptance::history_step_bank::canonical_history_step_shape(
+                crate::acceptance::history_step_bank::CanonicalHistoryStepClassId::new(slot)
+                    .expect("canonical slot"),
+            );
+            ProofFixture::shape_only(shape, params[slot].clone(), [0x50 + slot as u8; 32])
+        })
+        .collect();
+    let proofs = tiers.iter().map(ProofFixture::r_pcs).collect::<Vec<_>>();
+    let recordings = |arm: usize| {
+        parts
+            .parent_transcripts()
+            .iter()
+            .map(|transcript| {
+                let layout = if arm == 0 {
+                    transcript.child()
+                } else {
+                    transcript.r_prev()
+                };
+                LayoutRecordedChannel {
+                    layout: layout.clone(),
+                    data_flat: vec![F128::ZERO; layout.n_data],
+                    challenges: vec![Some(F128::ZERO); layout.challenges.len()],
+                    post_state: [F128::ZERO; STATE_SIZE],
+                    perms: 0,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let prepare = || {
+        let mut b = FieldR1csBuilder::new_witness_only();
+        while b.num_wires() < spec.io_slice.start() + (1usize << spec.io_slice.log2_len) {
+            b.alloc_f128(F128::ZERO);
+        }
+        let started = std::time::Instant::now();
+        let columns =
+            prepare_history_step_parent_columns(&mut b, &proofs, 1, &geometry, recordings(0), recordings(1))
+                .expect("production parent columns");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        (ms, columns)
+    };
+    // Warm the memo, check it is the canonical key.
+    let (_, columns) = prepare();
+    assert_eq!(
+        columns.vk.transcript_digest(),
+        parts.parent_recursion_vk().transcript_digest()
+    );
+    let slices = geometry.canonical_slices(&spec).expect("slices");
+    let mut rows = Vec::new();
+    for round in 0..4 {
+        let (memo_ms, columns) = prepare();
+        // What every block paid before: the key from the assembled walks...
+        let started = std::time::Instant::now();
+        let leaf = CombinedDuplexRegionVk::from_union(
+            link_r_pcs_leaf_sidecar_purpose(),
+            columns.asm.leaf_descriptor.clone(),
+            columns.slices_a,
+            &columns.asm.u_a,
+        )
+        .expect("leaf VK");
+        let path = MerkleRegionVk::new(
+            link_r_pcs_path_sidecar_purpose(),
+            columns.asm.w_log_b,
+            columns.slices_b,
+            columns.asm.block_log_b,
+            columns.asm.path_families.clone(),
+        )
+        .expect("path VK");
+        let rec = RecordingDuplexRegionVk::new_selected(
+            link_recordings_purpose(),
+            geometry.rec_w_log,
+            columns.slices_rec,
+            columns.selector_slice,
+            geometry.selected_recording_blocks.clone(),
+        )
+        .expect("recording VK");
+        let assembled = LinkRegionSidecarVk::new(leaf, path, rec).expect("Link VK");
+        let assembled_ms = started.elapsed().as_secs_f64() * 1e3;
+        // ... and the key rebuilt from the slices.
+        let started = std::time::Instant::now();
+        let rebuilt = geometry
+            .vk_from_slices(slices.0, slices.1, slices.2, slices.3)
+            .expect("rebuilt VK");
+        let rebuilt_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(assembled, rebuilt);
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        eprintln!(
+            "[vk-memo] round {round}: prepare(memo)={memo_ms:.0} ms | removed per block: \
+             key from walks={assembled_ms:.0} ms + key from slices={rebuilt_ms:.0} ms | loadavg {}",
+            load.split_whitespace().next().unwrap_or("?")
+        );
+        rows.push((memo_ms, assembled_ms + rebuilt_ms));
+    }
+    let n = rows.len() as f64;
+    eprintln!(
+        "[vk-memo] mean: prepare(memo)={:.0} ms, removed={:.0} ms per block (before ≈ sum)",
+        rows.iter().map(|row| row.0).sum::<f64>() / n,
+        rows.iter().map(|row| row.1).sum::<f64>() / n
+    );
+}
+
 /// Canonical Link VK digest of the released v1.3 pack's carrier, captured on
 /// tag v1.4.3.
 const RELEASED_V13_LINK_VK: &str =

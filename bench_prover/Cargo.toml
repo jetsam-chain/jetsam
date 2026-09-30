@@ -14,6 +14,8 @@ license = "Apache-2.0"
 # `jetsam_chain` is where those constants are chosen, so forwarding to it is all
 # that is needed: every other crate reads them through it.
 testnet = ["jetsam_chain/testnet"]
+# v1.5 prototype: the client-bearing HistoryStep relation (measurement only).
+client-slot = ["jetsam_recursive/client-slot"]
 
 [dependencies]
 jetsam_core = { path = "../jetsam_core" }
@@ -72,4 +74,8 @@ harness = false
 
 [[bench]]
 name = "matrix_claim_c1"
+harness = false
+
+[[bench]]
+name = "history_step_g1"
 harness = false
