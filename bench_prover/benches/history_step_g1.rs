@@ -21,6 +21,10 @@
 //!   nonce sealing, proof.
 //! - `base-pack`: the same child proved as the base of a recursion rooted at
 //!   height 6 (both parent arms are shape-only), release pack.
+//!
+//! `G1_CLASS=b24|b255` (default `b255`) picks the child's class; with
+//! `base-client` the registered client is measured with its pre-pass inside
+//! the block and cached on reception (`PreparedHistoryStepClient`).
 //! - `base-client` (`--features client-slot`): the client-bearing relation.
 //!   Its runtime parts are derived from the pack's direct-Block keys (Link
 //!   fixed point with the client role); the bank pins stand-in matrices of
@@ -335,15 +339,63 @@ fn walk_backbone(
     }
 }
 
-fn b255_input(
+/// Which class the harness measures (`G1_CLASS`, default `b255`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum G1Class {
+    B24,
+    B255,
+}
+
+impl G1Class {
+    fn from_env() -> Result<Self, String> {
+        match std::env::var("G1_CLASS").as_deref() {
+            Err(_) | Ok("b255") => Ok(Self::B255),
+            Ok("b24") => Ok(Self::B24),
+            Ok(other) => Err(format!("unknown G1_CLASS {other}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::B24 => "B24",
+            Self::B255 => "B255",
+        }
+    }
+
+    fn id(self) -> CanonicalHistoryStepClassId {
+        CanonicalHistoryStepClassId::new(match self {
+            Self::B24 => 0,
+            Self::B255 => 1,
+        })
+        .expect("canonical class")
+    }
+}
+
+/// The class's honest child of the height-6 checkpoint, as a staged input.
+enum G1Input {
+    B24(HistoryStepBlockInput<24>),
+    B255(HistoryStepBlockInput<255>),
+}
+
+fn class_input(
+    class: G1Class,
     provider: &HonestHistoryStepFixtureProvider,
     start: &ChainAccumulator,
-) -> Result<(HistoryStepBlockInput<255>, u128, u128), String> {
-    let class = CanonicalHistoryStepClassId::new(1).expect("B255 class");
-    let fixture = provider.b255(class, start)?;
-    let input_ms = fixture.input_preparation().as_millis();
-    let (input, nonce) = finish_template(fixture)?;
-    Ok((input, nonce, input_ms))
+) -> Result<(G1Input, u128, u128), String> {
+    match class {
+        G1Class::B24 => {
+            let fixture = provider.b24(class.id(), start)?;
+            let input_ms = fixture.input_preparation().as_millis();
+            let (input, nonce) = finish_template(fixture)?;
+            Ok((G1Input::B24(input), nonce, input_ms))
+        }
+        G1Class::B255 => {
+            let fixture = provider.b255(class.id(), start)?;
+            let input_ms = fixture.input_preparation().as_millis();
+            let (input, nonce) = finish_template(fixture)?;
+            Ok((G1Input::B255(input), nonce, input_ms))
+        }
+    }
 }
 
 fn foreign_load(label: &str) {
@@ -361,27 +413,37 @@ fn foreign_load(label: &str) {
 
 // ---- modes -------------------------------------------------------------------
 
-/// Stage, seal and prove one B255 against `runtime` (recursive when `parent`).
-fn measure_b255_production(
+/// Stage, seal and prove one child against `runtime` (recursive when `parent`).
+fn measure_production(
     label: &str,
+    class: G1Class,
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
     provider: &HonestHistoryStepFixtureProvider,
     start: &ChainAccumulator,
 ) -> Result<(), String> {
-    let (input, nonce, input_ms) = b255_input(provider, start)?;
+    let (input, nonce, input_ms) = class_input(class, provider, start)?;
     foreign_load(label);
     reset_hwm();
-    let started = Instant::now();
-    let prepared = prepare_history_step_for_pow(runtime, parent, input)
-        .map_err(|error| format!("{label}: stage: {error}"))?;
-    let assembly_ms = started.elapsed().as_secs_f64() * 1e3;
-    memory_line(&format!("{label} after staged assembly"));
-    let started = Instant::now();
-    let built = prepared
-        .seal_nonce(runtime, nonce)
-        .map_err(|error| format!("{label}: seal: {error}"))?;
-    let seal_ms = started.elapsed().as_secs_f64() * 1e3;
+    macro_rules! production {
+        ($input:expr) => {{
+            let started = Instant::now();
+            let prepared = prepare_history_step_for_pow(runtime, parent, $input)
+                .map_err(|error| format!("{label}: stage: {error}"))?;
+            let assembly_ms = started.elapsed().as_secs_f64() * 1e3;
+            memory_line(&format!("{label} after staged assembly"));
+            let started = Instant::now();
+            let built = prepared
+                .seal_nonce(runtime, nonce)
+                .map_err(|error| format!("{label}: seal: {error}"))?;
+            let seal_ms = started.elapsed().as_secs_f64() * 1e3;
+            (assembly_ms, seal_ms, built)
+        }};
+    }
+    let (assembly_ms, seal_ms, built) = match input {
+        G1Input::B24(input) => production!(input),
+        G1Input::B255(input) => production!(input),
+    };
     let wires = built.useful_rows();
     let started = Instant::now();
     let terminal = prove_built_history_step_terminal(runtime, &built)
@@ -413,9 +475,11 @@ fn run_pack(samples: usize) -> Result<(), String> {
     for class in 0..2 {
         source.load_checked(CanonicalHistoryStepClassId::new(class).expect("class"))?;
     }
+    let class = G1Class::from_env()?;
     for sample in 0..samples {
-        measure_b255_production(
-            &format!("pack recursive B255 sample {}", sample + 1),
+        measure_production(
+            &format!("pack recursive {} sample {}", class.name(), sample + 1),
+            class,
             &runtime,
             Some(&parent),
             &provider,
@@ -440,10 +504,12 @@ fn run_base_pack(samples: usize) -> Result<(), String> {
         .parent_accumulator(0)
         .ok_or("no checkpoint")?
         .clone();
-    source.load_checked(CanonicalHistoryStepClassId::new(1).expect("class"))?;
+    let class = G1Class::from_env()?;
+    source.load_checked(class.id())?;
     for sample in 0..samples {
-        measure_b255_production(
-            &format!("pack base B255 sample {}", sample + 1),
+        measure_production(
+            &format!("pack base {} sample {}", class.name(), sample + 1),
+            class,
             &runtime,
             None,
             &provider,
@@ -461,7 +527,7 @@ mod client {
         derive_history_step_runtime_parts_with_client, pin_history_step_class_bank,
         prepare_history_step_for_pow_with_client, HistoryStepClientForm,
         HistoryStepClientRegistry, HistoryStepClientWitness, HistoryStepError,
-        HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+        PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
     };
 
     /// A stand-in matrix of `class`'s canonical shape: the witness-only
@@ -585,28 +651,71 @@ mod client {
             .parent_accumulator(0)
             .ok_or("no checkpoint")?
             .clone();
+        let class = G1Class::from_env()?;
         let client = registered_client(&form);
+        let limit_log = canonical_history_step_shape(class.id()).m;
         for sample in 0..samples {
-            for (name, carried) in [("ghost client", None), ("registered client", Some(&client))] {
-                let label = format!("client-slot base B255 {name} sample {}", sample + 1);
-                let (input, nonce, input_ms) = b255_input(&provider, &start)?;
+            for (name, carried, cached) in [
+                ("ghost client", None, false),
+                ("registered client, pre-pass in the block", Some(&client), false),
+                ("registered client, pre-pass cached", Some(&client), true),
+            ] {
+                let label = format!(
+                    "client-slot base {} {name} sample {}",
+                    class.name(),
+                    sample + 1
+                );
+                // The cached pre-pass is made on reception, outside the block.
+                let mut received = match (carried, cached) {
+                    (Some(witness), true) => {
+                        let started = Instant::now();
+                        let prepared = PreparedHistoryStepClient::prepare(&form, witness)
+                            .map_err(|error| format!("{label}: pre-pass: {error}"))?;
+                        println!(
+                            "[g1] {label}: pre-pass on reception {:.0} ms (off the block path)",
+                            started.elapsed().as_secs_f64() * 1e3
+                        );
+                        Some(prepared)
+                    }
+                    _ => None,
+                };
+                let (input, nonce, input_ms) = class_input(class, &provider, &start)?;
                 foreign_load(&label);
                 reset_hwm();
                 let started = Instant::now();
-                let prepared =
-                    prepare_history_step_for_pow_with_client(&runtime, None, input, carried)
+                if let (Some(witness), false) = (carried, cached) {
+                    received = Some(
+                        PreparedHistoryStepClient::prepare(&form, witness)
+                            .map_err(|error| format!("{label}: pre-pass: {error}"))?,
+                    );
+                }
+                macro_rules! staged {
+                    ($input:expr) => {{
+                        let prepared = prepare_history_step_for_pow_with_client(
+                            &runtime,
+                            None,
+                            $input,
+                            received.as_ref(),
+                        )
                         .map_err(|error| format!("{label}: stage: {error}"))?;
-                let assembly_ms = started.elapsed().as_secs_f64() * 1e3;
-                memory_line(&format!("{label} after staged assembly"));
-                let started = Instant::now();
-                let rows = match prepared.seal_nonce(&runtime, nonce) {
-                    Err(HistoryStepError::ShapeOverflow { used, limit, .. }) => {
-                        format!("rows={used} limit={limit} (over 2^24 by {})", used - limit)
-                    }
-                    Ok(built) => format!("rows={} (fits)", built.useful_rows()),
-                    Err(error) => return Err(format!("{label}: seal: {error}")),
+                        let assembly_ms = started.elapsed().as_secs_f64() * 1e3;
+                        memory_line(&format!("{label} after staged assembly"));
+                        let started = Instant::now();
+                        let rows = match prepared.seal_nonce(&runtime, nonce) {
+                            Err(HistoryStepError::ShapeOverflow { used, limit, .. }) => format!(
+                                "rows={used} limit={limit} (over 2^{limit_log} by {})",
+                                used - limit
+                            ),
+                            Ok(built) => format!("rows={} (fits 2^{limit_log})", built.useful_rows()),
+                            Err(error) => return Err(format!("{label}: seal: {error}")),
+                        };
+                        (assembly_ms, started.elapsed().as_secs_f64() * 1e3, rows)
+                    }};
+                }
+                let (assembly_ms, seal_ms, rows) = match input {
+                    G1Input::B24(input) => staged!(input),
+                    G1Input::B255(input) => staged!(input),
                 };
-                let seal_ms = started.elapsed().as_secs_f64() * 1e3;
                 println!(
                     "[g1] {label}: {rows} input_preparation_ms={input_ms} \
                      staged_assembly_ms={assembly_ms:.0} seal_ms={seal_ms:.0}"
