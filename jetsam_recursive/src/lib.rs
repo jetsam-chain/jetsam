@@ -52,7 +52,8 @@ pub use acceptance::history_step_bank::{
 /// v1.5 prototype client slot (`client-slot`, M2).
 #[cfg(feature = "client-slot")]
 pub use acceptance::history_step::{
-    client_io_commitment, derive_history_step_runtime_parts_with_client,
+    client_io_commitment, decode_history_step_client_proof, encode_history_step_client_proof,
+    history_step_client_proof_max_wire_bytes, derive_history_step_runtime_parts_with_client,
     prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
     HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
     HISTORY_STEP_CLIENT_PROOF_DOMAIN,

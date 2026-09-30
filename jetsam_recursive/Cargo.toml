@@ -23,3 +23,8 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tracing = { workspace = true }
+
+[dev-dependencies]
+# v1.5 prototype (M2 task 2.6): the example client, catalogue entry 1, which
+# an ignored production-scale test runs through the client arm.
+jetsam_client_agent = { path = "../jetsam_client_agent" }

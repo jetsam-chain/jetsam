@@ -561,6 +561,34 @@ impl PreparedHistoryStepClient {
         &self.form == form
     }
 
+    /// The client lanes a block carrying this client publishes: exactly
+    /// what every node checks natively ([`HistoryStepChainClients::check_claim`]).
+    pub fn published_claim(&self) -> HistoryStepClientClaim {
+        HistoryStepClientClaim {
+            matrix_digest: self.arm.digest,
+            registry_root: self.arm.registry_root,
+            io_commitment: self.arm.io_commitment,
+            claim: self.arm.outgoing.clone(),
+        }
+    }
+
+    /// Write those lanes into a client-bearing public IO.
+    pub fn install_lanes(
+        &self,
+        lanes: &HistoryStepClientIoLanes,
+        io: &mut [F128],
+    ) -> Result<(), HistoryStepError> {
+        if io.len() < lanes.end() {
+            return Err(HistoryStepBankError::IoLength {
+                expected: lanes.end(),
+                actual: io.len(),
+            }
+            .into());
+        }
+        self.arm.install_io(lanes, io);
+        Ok(())
+    }
+
     pub(crate) fn arm(&self) -> &PreparedClientArm {
         &self.arm
     }

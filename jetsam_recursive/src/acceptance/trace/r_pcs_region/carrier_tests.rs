@@ -44,13 +44,22 @@ pub(super) struct ProofFixture {
 
 impl ProofFixture {
     pub(super) fn new(m: usize, seed: u64) -> Self {
+        Self::with_params(
+            m,
+            seed,
+            PcsParams {
+                m: m + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile: Default::default(),
+            },
+        )
+    }
+
+    /// [`Self::new`] under explicit PCS parameters (the production
+    /// small-class form, for the production-scale client-arm test).
+    pub(super) fn with_params(m: usize, seed: u64, params: PcsParams) -> Self {
         let (r1cs, witness): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(m, m, seed);
-        let params = PcsParams {
-            m: m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 2,
-            profile: Default::default(),
-        };
         let mut prover = FsLaneChallenger::new_c1(PROOF_DOMAIN);
         let (proof, commitment, _, _) =
             jetsam_ivc_prover::field_prover::prove_field_c1_capturing_fresh(
@@ -2054,6 +2063,191 @@ mod client_slot {
             matrix: registered.matrix.clone(),
             registry: registered.registry.clone(),
         }
+    }
+
+    /// M2 task 2.6 — the client proof's wire format (what a client hands to
+    /// miners, M3 transport): it round-trips, never exceeds its fixed
+    /// unshared length, and a truncated, extended or foreign encoding is
+    /// refused. The decoded proof passes the reception pre-pass, and the
+    /// lanes a block then publishes pass the node's checks.
+    #[test]
+    fn a_client_proof_round_trips_through_its_wire_format() {
+        use crate::acceptance::history_step::{
+            decode_history_step_client_proof, encode_history_step_client_proof,
+            history_step_client_proof_max_wire_bytes,
+        };
+        let form = test_client_form();
+        let (a, _, chain) = registered_pair(&form);
+        let bytes =
+            encode_history_step_client_proof(&form, &a.field_proof, &a.commitment.root, &a.io)
+                .expect("encode");
+        assert!(bytes.len() <= history_step_client_proof_max_wire_bytes(&form).unwrap());
+        let (proof, root, io) = decode_history_step_client_proof(&form, &bytes).expect("decode");
+        assert_eq!(
+            encode_history_step_client_proof(&form, &proof, &root, &io).unwrap(),
+            bytes,
+            "decode then encode is the identity"
+        );
+        assert_eq!((root, io.clone()), (a.commitment.root, a.io.clone()));
+
+        let received = HistoryStepClientWitness {
+            field_proof: proof,
+            commitment: pcs::Commitment {
+                root,
+                params: form.pcs_params().clone(),
+            },
+            io,
+            matrix: a.matrix.clone(),
+            registry: a.registry.clone(),
+        };
+        let prepared =
+            PreparedHistoryStepClient::prepare(&form, &received).expect("decoded proof received");
+        let claim = prepared.published_claim();
+        assert_eq!(chain.check_claim(&claim), Ok(()));
+        let lanes = client_lanes(&form);
+        let mut block_io = vec![F128::ZERO; lanes.end()];
+        prepared
+            .install_lanes(&lanes, &mut block_io)
+            .expect("the lanes fit");
+        assert!(prepared.install_lanes(&lanes, &mut [F128::ZERO; 3]).is_err());
+        assert_eq!(parse_history_step_client_lanes(&lanes, &block_io), Ok(Some(claim)));
+
+        assert!(decode_history_step_client_proof(&form, &bytes[..bytes.len() - 1]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode_history_step_client_proof(&form, &longer).is_err());
+        let mut foreign = bytes.clone();
+        foreign[0] ^= 0xFF;
+        assert!(decode_history_step_client_proof(&form, &foreign).is_err());
+        assert!(decode_history_step_client_proof(&form, &[]).is_err());
+    }
+
+    /// M2 task 2.6 at production scale: the example client (catalogue entry
+    /// 1, `jetsam_client_agent`: an AI agent's trace respected its tool
+    /// policy and its budget) in the canonical client form (m = k_log = 22,
+    /// rate 1/4, batch 2^5) is accepted by the client arm — the relation's
+    /// arm, next to a two-proof Link carrier whose two parent tiers are real
+    /// proofs of the production small-class form, the whole trace
+    /// satisfiable and the three Link walks proved and verified — and its
+    /// lanes by the node's native checks against the chain's registry. A
+    /// violating trace of the same `D` has no valid proof. Release only.
+    #[test]
+    #[ignore = "production scale: proves the m = 22 example client and two m = 22 parents (release)"]
+    fn example_client_is_accepted_by_the_client_arm_and_the_node() {
+        use jetsam_client_agent::{agent_policy_instance, complies, AgentPolicy, ToolCall};
+        let started = std::time::Instant::now();
+        let lap = |label: &str| {
+            eprintln!("[example-client] {label}: {:.1} s", started.elapsed().as_secs_f64())
+        };
+        let form = HistoryStepClientForm::canonical();
+        let policy = AgentPolicy {
+            allowed_tools: [101, 102, 103, 205, 206, 300, 777],
+            budget_cap: 250_000,
+        };
+        let trace = |costs: &[(u32, u32)]| {
+            costs
+                .iter()
+                .enumerate()
+                .map(|(index, (tool, cost))| ToolCall {
+                    tool: *tool,
+                    cost: *cost,
+                    receipt_hash: [index as u8 + 1; 32],
+                })
+                .collect::<Vec<_>>()
+        };
+        let honest = trace(&[(101, 1_200), (205, 90_000), (777, 500), (103, 25_000)]);
+        assert!(complies(&policy, &honest));
+        let instance =
+            agent_policy_instance(&policy, &honest, form.shape(), form.io_spec().io_slice)
+                .expect("example client instance");
+        assert!(instance.r1cs.satisfies(&instance.witness));
+        let matrix = std::sync::Arc::new(instance.r1cs);
+        let digest = matrix.structural_statement_digest();
+        let prove = |matrix: &FieldR1cs, witness: &[F128], io: &[F128]| {
+            let mut prover = FsLaneChallenger::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
+            let (proof, (), commitment, _) =
+                jetsam_ivc_prover::field_prover::prove_field_c1_with_public_io_and_post_commit_context(
+                    matrix,
+                    witness,
+                    form.pcs_params(),
+                    form.io_spec(),
+                    io,
+                    &form.post_commit_digest(),
+                    &mut prover,
+                    |_| (),
+                );
+            (proof, commitment)
+        };
+        let (field_proof, commitment) = prove(&matrix, &instance.witness, &instance.io);
+        lap("example client proved");
+        let registry =
+            HistoryStepClientRegistry::new(form.registry_depth(), vec![digest]).expect("registry");
+        let witness = HistoryStepClientWitness {
+            field_proof,
+            commitment,
+            io: instance.io.clone(),
+            matrix: matrix.clone(),
+            registry: registry.clone(),
+        };
+        let prepared =
+            PreparedHistoryStepClient::prepare(&form, &witness).expect("received by a miner");
+        lap("reception pre-pass");
+
+        // The node: the block's client lanes against the chain's registry.
+        let chain = HistoryStepChainClients::new(&form, registry, vec![matrix.clone()])
+            .expect("chain registry");
+        let lanes = client_lanes(&form);
+        let mut io = vec![F128::ZERO; lanes.end()];
+        prepared.install_lanes(&lanes, &mut io).expect("lanes fit");
+        assert_eq!(chain.check_claim(&parsed(&form, &io)), Ok(()), "node check");
+        lap("node check");
+
+        // The client arm over a carrier with production-form parents.
+        let small = crate::acceptance::history_step_bank::CanonicalHistoryStepClassId::new(0)
+            .expect("small class");
+        let params =
+            crate::acceptance::history_step_bank::canonical_history_step_pcs_params(small);
+        let m = form.shape().m;
+        let parents = ParentFixtures {
+            tiers: [
+                ProofFixture::with_params(m, 0xCA11_2200, params.clone()),
+                ProofFixture::with_params(m, 0xCA11_2201, params),
+            ],
+        };
+        lap("parents proved");
+        let geometry = client_arm_geometry(&parents, &form);
+        let built = build_with_client_arm(&parents, &geometry, &form, prepared.arm(), &io);
+        lap(&format!("carrier + arms built, {} wires", built.wires));
+        assert!(built.r1cs.satisfies(&built.z), "example client in the client arm");
+        lap("satisfied");
+        prove_and_verify_link_only(&built.preparation, &built.z).expect("example client Link walks");
+        lap("Link walks proved and verified");
+
+        // A violating trace: same D, no satisfying witness, and a proof forced
+        // out of the prover anyway is refused on reception.
+        let violating = trace(&[(101, 1_200), (666, 90_000), (777, 500)]);
+        assert!(!complies(&policy, &violating));
+        let instance =
+            agent_policy_instance(&policy, &violating, form.shape(), form.io_spec().io_slice)
+                .expect("violating instance");
+        assert_eq!(instance.r1cs.structural_statement_digest(), digest, "one D");
+        assert!(!instance.r1cs.satisfies(&instance.witness));
+        if let Ok((field_proof, commitment)) = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| prove(&instance.r1cs, &instance.witness, &instance.io)),
+        ) {
+            let forced = HistoryStepClientWitness {
+                field_proof,
+                commitment,
+                io: instance.io.clone(),
+                matrix: matrix.clone(),
+                registry: witness.registry.clone(),
+            };
+            assert!(matches!(
+                PreparedHistoryStepClient::prepare(&form, &forced),
+                Err(HistoryStepError::ClientProof)
+            ));
+        }
+        lap("violating trace refused");
     }
 
     /// The chain's registry holds exactly one matrix of the form per entry.

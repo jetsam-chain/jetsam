@@ -109,6 +109,11 @@ pub use relation::{
 pub use runtime_parts_codec::{
     HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES, HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
 };
+#[cfg(feature = "client-slot")]
+pub use wire::{
+    decode_history_step_client_proof, encode_history_step_client_proof,
+    history_step_client_proof_max_wire_bytes,
+};
 pub use wire::{
     audit_history_step_terminal_encodings, decode_history_step_terminal,
     decode_verify_history_step_terminal, decode_verify_history_step_terminal_rooted,

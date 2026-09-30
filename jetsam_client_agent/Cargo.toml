@@ -1,0 +1,10 @@
+[package]
+name = "jetsam_client_agent"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Example client of the v1.5 prototype client slot: an AI agent's tool-call trace complies with its tool policy and budget (catalogue entry 1)."
+
+[dependencies]
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
