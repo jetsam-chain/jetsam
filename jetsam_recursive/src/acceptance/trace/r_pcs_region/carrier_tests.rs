@@ -484,6 +484,50 @@ fn memoized_link_vk_is_the_rebuilt_vk() {
     }
 }
 
+/// Lever 8: the region's prover input is built against a key that the
+/// checked constructors already certified, so it only checks endpoint
+/// lengths. It accepts exactly what the regenerating constructor accepts.
+#[test]
+fn certified_link_input_keeps_the_endpoint_checks() {
+    let parents = ParentFixtures::new();
+    let geometry = parents.geometry();
+    let spec = jetsam_ivc_core::public_io::PublicIoSpec {
+        io_slice: WitnessSlice {
+            log2_len: 10,
+            index: 1,
+        },
+        io_len: 900,
+        claims: Vec::new(),
+    };
+    let vk = geometry.canonical_vk(&spec).expect("canonical Link VK");
+    let endpoints = |w_log: usize| {
+        RegionWalkEndpoints::new(
+            std::array::from_fn(|_| vec![F128::ZERO; 1usize << w_log]),
+            std::array::from_fn(|_| vec![F128::ZERO; 1usize << w_log]),
+        )
+    };
+    let widths = [vk.leaf_a().w_log(), vk.path_b().w_log(), vk.rec_c().w_log()];
+    let honest = || widths.map(endpoints);
+    let [a, b, c] = honest();
+    assert!(LinkRegionProverInput::new(&vk, a, b, c).is_ok());
+    let [a, b, c] = honest();
+    assert!(LinkRegionProverInput::new_certified_c1(&vk, a, b, c).is_ok());
+    for wrong in 0..3 {
+        let build = || {
+            let mut sides = honest();
+            sides[wrong] = endpoints(widths[wrong] + 1);
+            sides
+        };
+        let [a, b, c] = build();
+        assert!(LinkRegionProverInput::new(&vk, a, b, c).is_err());
+        let [a, b, c] = build();
+        assert!(
+            LinkRegionProverInput::new_certified_c1(&vk, a, b, c).is_err(),
+            "certified input accepted a wrong-length endpoint (walk {wrong})"
+        );
+    }
+}
+
 /// `(allocated wires, structural matrix digest, Link VK transcript digest)` of
 /// the parent-only test-scale carrier, captured on tag v1.4.3.
 const PARENT_ONLY_PINS: (usize, &str, &str) = (
@@ -705,6 +749,47 @@ fn link_vk_memo_gain_diagnostic() {
     let n = rows.len() as f64;
     eprintln!(
         "[vk-memo] mean: prepare(memo)={:.0} ms, removed={:.0} ms per block (before ≈ sum)",
+        rows.iter().map(|row| row.0).sum::<f64>() / n,
+        rows.iter().map(|row| row.1).sum::<f64>() / n
+    );
+}
+
+/// Lever 8 measurement: the region's prover input against the released
+/// production key, built by the regenerating constructor and by the certified
+/// one, alternating in one process under one load.
+#[test]
+#[ignore = "diagnostic: certified Link input gain at production scale (release, reads the v1.3 pack)"]
+fn certified_link_input_gain_diagnostic() {
+    let parts = released_v13_parts();
+    let vk = parts.parent_recursion_vk().clone();
+    let endpoints = |w_log: usize| {
+        RegionWalkEndpoints::new(
+            std::array::from_fn(|_| vec![F128::ZERO; 1usize << w_log]),
+            std::array::from_fn(|_| vec![F128::ZERO; 1usize << w_log]),
+        )
+    };
+    let widths = [vk.leaf_a().w_log(), vk.path_b().w_log(), vk.rec_c().w_log()];
+    let mut rows = Vec::new();
+    for round in 0..4 {
+        let [a, b, c] = widths.map(endpoints);
+        let started = std::time::Instant::now();
+        LinkRegionProverInput::new(&vk, a, b, c).expect("checked input");
+        let checked_ms = started.elapsed().as_secs_f64() * 1e3;
+        let [a, b, c] = widths.map(endpoints);
+        let started = std::time::Instant::now();
+        LinkRegionProverInput::new_certified_c1(&vk, a, b, c).expect("certified input");
+        let certified_ms = started.elapsed().as_secs_f64() * 1e3;
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        eprintln!(
+            "[link-input] round {round}: regenerating={checked_ms:.1} ms certified={certified_ms:.3} ms \
+             | loadavg {}",
+            load.split_whitespace().next().unwrap_or("?")
+        );
+        rows.push((checked_ms, certified_ms));
+    }
+    let n = rows.len() as f64;
+    eprintln!(
+        "[link-input] mean: regenerating={:.1} ms certified={:.3} ms per block",
         rows.iter().map(|row| row.0).sum::<f64>() / n,
         rows.iter().map(|row| row.1).sum::<f64>() / n
     );

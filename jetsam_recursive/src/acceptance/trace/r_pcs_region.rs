@@ -1875,7 +1875,8 @@ fn finalize_carrier_region(
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
 
-    let input = LinkRegionProverInput::new(
+    // `vk` is the geometry's memoized key, built by the checked constructors.
+    let input = LinkRegionProverInput::new_certified_c1(
         &vk,
         RegionWalkEndpoints::new(asm.u_a.s0, asm.u_a.s_out),
         RegionWalkEndpoints::new(asm.s0b, asm.soutb),

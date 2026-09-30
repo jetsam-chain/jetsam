@@ -224,6 +224,26 @@ impl LinkRegionProverInput {
         Ok(input)
     }
 
+    /// [`Self::new`] for a key built by the checked constructors (the HistoryStep
+    /// carrier's memoized key): the structural regeneration is a constructor
+    /// obligation already met, so only the endpoint lengths are checked — the
+    /// check the certified prover plan repeats anyway.
+    pub(crate) fn new_certified_c1(
+        vk: &LinkRegionSidecarVk,
+        leaf_a: RegionWalkEndpoints,
+        path_b: RegionWalkEndpoints,
+        rec_c: RegionWalkEndpoints,
+    ) -> Result<Self, RegionSidecarError> {
+        vk.validate_roles()?;
+        let input = Self {
+            leaf_a,
+            path_b,
+            rec_c,
+        };
+        input.validate_certified_c1(vk)?;
+        Ok(input)
+    }
+
     fn validate(&self, vk: &LinkRegionSidecarVk) -> Result<(), RegionSidecarError> {
         CombinedDuplexRegionProverPlan::new(vk.leaf_a(), self.leaf_a.s0(), self.leaf_a.s_out())?;
         MerkleRegionProverPlan::new(vk.path_b(), self.path_b.s0(), self.path_b.s_out())?;
