@@ -869,14 +869,14 @@ mod tests {
     fn due_template_builds_the_mandatory_two_recipient_payout() {
         use crate::consensus::development_allocation::{
             development_share_each, miner_subsidy, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
-            TARGET_BLOCKS_PER_DAY,
+            DEVELOPMENT_PAYOUT_INTERVAL_90S,
         };
         use crate::consensus::emission::block_reward;
 
         let mut state = ChainState::with_log_slots(8);
         let mut parent = parent(&mut state);
-        parent.height = TARGET_BLOCKS_PER_DAY - 1;
-        let share = development_share_each(block_reward(TARGET_BLOCKS_PER_DAY)).unwrap();
+        parent.height = DEVELOPMENT_PAYOUT_INTERVAL_90S - 1;
+        let share = development_share_each(block_reward(DEVELOPMENT_PAYOUT_INTERVAL_90S)).unwrap();
 
         let template = build_block_template(
             &parent,
@@ -894,11 +894,17 @@ mod tests {
             .expect("daily payout is mandatory");
         assert_eq!(payout.body.outputs[0].owner, NETWORK_FUND_ADDRESS);
         assert_eq!(payout.body.outputs[1].owner, LAB_FUND_ADDRESS);
-        assert_eq!(payout.body.outputs[0].amount, share * TARGET_BLOCKS_PER_DAY);
-        assert_eq!(payout.body.outputs[1].amount, share * TARGET_BLOCKS_PER_DAY);
+        assert_eq!(
+            payout.body.outputs[0].amount,
+            share * DEVELOPMENT_PAYOUT_INTERVAL_90S
+        );
+        assert_eq!(
+            payout.body.outputs[1].amount,
+            share * DEVELOPMENT_PAYOUT_INTERVAL_90S
+        );
         assert_eq!(
             template.coinbase.body.outputs[0].amount,
-            miner_subsidy(TARGET_BLOCKS_PER_DAY)
+            miner_subsidy(DEVELOPMENT_PAYOUT_INTERVAL_90S)
         );
         assert_eq!(template.active_slot_count, 3);
         assert_eq!(template.alloc_counter, 3);
@@ -917,7 +923,7 @@ mod tests {
     #[test]
     fn scheduled_payout_and_state_expansion_use_the_child_reward_tier() {
         use crate::consensus::development_allocation::{
-            development_share_each, miner_subsidy, TARGET_BLOCKS_PER_DAY,
+            development_share_each, miner_subsidy, DEVELOPMENT_PAYOUT_INTERVAL_90S,
         };
         use crate::consensus::emission::block_reward;
 
@@ -927,7 +933,7 @@ mod tests {
         // newly expanded child depth.
         let mut state = ChainState::with_log_slots(24);
         let mut parent = parent(&mut state);
-        parent.height = TARGET_BLOCKS_PER_DAY - 1;
+        parent.height = DEVELOPMENT_PAYOUT_INTERVAL_90S - 1;
         let new_share = development_share_each(block_reward(25)).unwrap();
         let expansion_threshold = (1u64 << 24) * 3 / 4;
 
@@ -945,13 +951,13 @@ mod tests {
         assert_eq!(template.log_slots, 25);
         assert_eq!(
             template.coinbase.body.outputs[0].amount,
-            miner_subsidy(TARGET_BLOCKS_PER_DAY)
+            miner_subsidy(DEVELOPMENT_PAYOUT_INTERVAL_90S)
         );
         let payout = template
             .development_payout
             .as_ref()
             .expect("payout remains mandatory on an expansion block");
-        let expected_each = new_share * TARGET_BLOCKS_PER_DAY;
+        let expected_each = new_share * DEVELOPMENT_PAYOUT_INTERVAL_90S;
         assert_eq!(payout.body.outputs[0].amount, expected_each);
         assert_eq!(payout.body.outputs[1].amount, expected_each);
         assert_eq!(payout.body.epoch_anchor, block_id(&parent));
@@ -965,11 +971,12 @@ mod tests {
 
     #[test]
     fn payout_and_user_keep_distinct_anchors_at_epoch_boundary() {
-        use crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+        use crate::consensus::development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S;
         use crate::consensus::validate_block_epoch_anchors;
         use crate::fri_state::SlotValue;
 
-        assert!(TARGET_BLOCKS_PER_DAY.is_multiple_of(crate::consensus::params::TX_EPOCH_BLOCKS));
+        assert!(DEVELOPMENT_PAYOUT_INTERVAL_90S
+            .is_multiple_of(crate::consensus::params::TX_EPOCH_BLOCKS));
         let owner = Address([4u8; 32]);
         let mut state = ChainState::with_log_slots(8);
         state
@@ -983,7 +990,7 @@ mod tests {
         state.alloc_counter = 1;
         state.circulating_supply_micro_jtm = 1_000_000;
         let mut parent = parent(&mut state);
-        parent.height = TARGET_BLOCKS_PER_DAY - 1;
+        parent.height = DEVELOPMENT_PAYOUT_INTERVAL_90S - 1;
 
         // Boundary block 5,760 still consumes the previous 144-block user
         // anchor, while both system mints bind the immediate parent.

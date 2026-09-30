@@ -864,7 +864,7 @@ mod tests {
     fn direct_interpreters_assign_identical_development_payout_creation_ids() {
         let initial = state();
         let transactions = vec![coinbase(), development_payout(), user_tx()];
-        let height = crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+        let height = crate::consensus::development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S;
         let mut expected = initial.clone();
         for transaction in &transactions {
             apply_tx_at(&mut expected, &transaction.body, height).unwrap();
@@ -1070,7 +1070,7 @@ mod tests {
                 state_root: [0u8; 32],
                 tx_root: compute_tx_root(&transactions),
                 timestamp: 1,
-                height: crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY,
+                height: crate::consensus::development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S,
                 miner_address: Address([9u8; 32]),
                 nonce: 0,
                 difficulty_target: [0xff; 32],

@@ -70,8 +70,8 @@ pub use development_allocation::{
     development_allocation, development_allocation_active, development_payout_due,
     development_share_each, miner_subsidy, DevelopmentAllocation, DevelopmentAllocationError,
     DEVELOPMENT_ALLOCATION_END_HEIGHT, DEVELOPMENT_ALLOCATION_PAYOUTS,
+    DEVELOPMENT_PAYOUT_INTERVAL_180S, DEVELOPMENT_PAYOUT_INTERVAL_90S,
     DEVELOPMENT_SHARE_DENOMINATOR, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
-    TARGET_BLOCKS_PER_DAY,
 };
 pub use difficulty::{
     add_work, block_work, le256_lt, next_target, target_leading_zero_bits, work_gt,

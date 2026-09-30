@@ -557,19 +557,19 @@ mod tests {
     #[test]
     fn payout_position_stays_inside_the_selected_proof_class() {
         use jetsam_chain::consensus::development_allocation::{
-            DEVELOPMENT_ALLOCATION_END_HEIGHT, TARGET_BLOCKS_PER_DAY,
+            DEVELOPMENT_ALLOCATION_END_HEIGHT, DEVELOPMENT_PAYOUT_INTERVAL_90S,
         };
 
         assert_eq!(
-            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 2, 25),
+            user_page_limit_for_child(DEVELOPMENT_PAYOUT_INTERVAL_90S - 2, 25),
             Some(25)
         );
         assert_eq!(
-            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 1, 25),
+            user_page_limit_for_child(DEVELOPMENT_PAYOUT_INTERVAL_90S - 1, 25),
             Some(24)
         );
         assert_eq!(
-            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 1, 255),
+            user_page_limit_for_child(DEVELOPMENT_PAYOUT_INTERVAL_90S - 1, 255),
             Some(254)
         );
         assert_eq!(

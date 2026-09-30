@@ -200,7 +200,7 @@ fn main() {
     //
     // The launch-compatibility proof below cannot see this: it assembles a
     // witness for block 1, and `development_payout_due` is false on every
-    // height that is not a multiple of TARGET_BLOCKS_PER_DAY, so the rows that
+    // height that is not a payout height (a multiple of 960 before v1.5), so the rows that
     // name the fund addresses are satisfied by any constant at all. That is
     // exactly how a pack generated on the mainnet profile authenticated
     // cleanly and then stopped the test chain at block 1920 on 2026-09-17.

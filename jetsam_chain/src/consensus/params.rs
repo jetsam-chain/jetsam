@@ -20,9 +20,17 @@
 ///      previous block, which is what makes a minority miner lose blocks far
 ///      beyond its hashrate share.
 ///
-/// Must divide one day exactly — see the assertion in `development_allocation`.
-/// 86400 / 90 = 960.
+/// Must divide one day exactly — see the assertion below. 86400 / 90 = 960.
+///
+/// The development allocation does not read this constant: its two payout
+/// cadences are literals (`development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S`
+/// and `_180S`), so changing the interval cannot move a past payout.
 pub const BLOCK_TIME: u64 = 90;
+
+const _: () = assert!(
+    (24_u64 * 60 * 60).is_multiple_of(BLOCK_TIME),
+    "BLOCK_TIME must divide one day exactly"
+);
 
 /// Number of blocks per ASERT epoch.
 pub const EPOCH_LENGTH: u64 = 6;
@@ -281,6 +289,62 @@ pub const fn v1_4_active(height: u64) -> bool {
 /// Testable twin of [`v1_4_active`] with the activation height injected.
 #[inline]
 pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// First block height governed by the v1.5 consensus rules.
+///
+/// **`None` keeps every v1.5 rule dormant**, and that is what both profiles
+/// carry today. A binary with this constant at `None` validates, proves and
+/// pays byte for byte what v1.4.3 does.
+///
+/// # What it switches today
+///
+/// The development-allocation schedule, and only that
+/// (`development_allocation::development_allocation_with`). Decided with the
+/// operator on 2026-09-30: the allocation keeps lasting two years of *target
+/// time* when blocks go from 90 to 180 seconds. Payouts fall every 960 blocks up
+/// to and including this height, every 480 blocks after it, and the window ends
+/// on the 730th payout, at `J + (730 − J/960) × 480`. The rest of v1.5 — the
+/// 180-second interval, the m = 25 packs, the client slot — joins this clock in
+/// M3, and none of it may open a clock of its own.
+///
+/// # Constraints
+///
+/// A multiple of 960, no later than block 700 800: a height between two
+/// 90-second payouts would split a target-time day between two rules. Checked
+/// at compile time beside the schedule it feeds, in `development_allocation.rs`.
+///
+/// # Why this is its own clock
+///
+/// v1.4 is armed and past on both profiles. Hanging these rules off
+/// [`V1_4_ACTIVATION_HEIGHT`] would move payouts the chain has already made.
+/// Four clocks are four forks, and this is the fourth.
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// `wire_limits::tests::arming_v1_5_takes_two_deliberate_edits` fails the moment
+/// this value disagrees with the declaration beside it. The payout schedule is
+/// also in the proof relation, so the release that arms this height carries the
+/// v1.5 pack generated for **this** profile: a pack built under the wrong one
+/// fails on the first payout block after the height, not before.
+#[cfg(not(feature = "testnet"))]
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Dormant on the test chain as well. Declared per profile, like
+/// [`V1_4_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
+#[cfg(feature = "testnet")]
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Whether one candidate block height is governed by the v1.5 rules.
+#[inline]
+pub const fn v1_5_active(height: u64) -> bool {
+    v1_5_active_with(height, V1_5_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_5_active`] with the activation height injected.
+#[inline]
+pub(crate) const fn v1_5_active_with(height: u64, activation_height: Option<u64>) -> bool {
     matches!(activation_height, Some(activation) if height >= activation)
 }
 
@@ -1172,8 +1236,9 @@ const _: () = assert!(
 /// JETSAM CHANGE: 32, down from upstream's 144, so that the wall-clock epoch
 /// stays at 48 minutes at 90 s blocks (144 × 20 s = 32 × 90 s = 2880 s) and a
 /// day still divides into whole epochs: 960 / 32 = 30, exactly as upstream had
-/// 4320 / 144 = 30. Leaving it at 144 would make `TARGET_BLOCKS_PER_DAY` a
-/// non-multiple of the epoch and break the daily-payout anchor invariant.
+/// 4320 / 144 = 30. Leaving it at 144 would make the daily payout interval a
+/// non-multiple of the epoch and break the daily-payout anchor invariant, which
+/// `development_allocation` now asserts on both of its cadences.
 pub const TX_EPOCH_BLOCKS: u64 = 32;
 
 const _: () = assert!(
@@ -1536,6 +1601,18 @@ mod tests {
     fn transaction_epoch_is_not_asert_epoch() {
         assert_eq!(TX_EPOCH_BLOCKS, 32); // JETSAM: 48 min at 90s blocks
         assert_ne!(TX_EPOCH_BLOCKS, EPOCH_LENGTH);
+    }
+
+    /// The fourth clock counts from its own height, and a dormant clock
+    /// governs no height at all.
+    #[test]
+    fn the_v1_5_clock_counts_from_its_own_height() {
+        assert!(!v1_5_active_with(30_719, Some(30_720)));
+        assert!(v1_5_active_with(30_720, Some(30_720)));
+        assert!(v1_5_active_with(30_721, Some(30_720)));
+        for height in [0, 1, 30_720, 700_800, u64::MAX] {
+            assert!(!v1_5_active_with(height, None));
+        }
     }
 
     /// The pack generation is a function of the block's own height and the

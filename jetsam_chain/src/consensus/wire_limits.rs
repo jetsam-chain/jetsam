@@ -348,6 +348,47 @@ mod tests {
         }
     }
 
+    /// Dormant on the public network. It is decided with the operator against
+    /// the tip of the day, once the test chain has crossed on the v1.5 packs.
+    #[cfg(not(feature = "testnet"))]
+    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// Dormant on the test chain too. Split per profile for the same reason as
+    /// the v1.4 declaration: arming the test chain alone must be one visible
+    /// edit here, not a failure on the other profile.
+    #[cfg(feature = "testnet")]
+    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// The same two-edit rule, for the fourth clock.
+    ///
+    /// Crossing it moves the development payouts to a 480-block cadence and
+    /// closes the allocation window earlier, and the relation of the v1.5 packs
+    /// encodes both: an unannounced height is a fork on the first payout after it.
+    #[test]
+    fn arming_v1_5_takes_two_deliberate_edits() {
+        assert_eq!(
+            crate::consensus::params::V1_5_ACTIVATION_HEIGHT,
+            DECLARED_V1_5_ACTIVATION_HEIGHT,
+            "arming v1.5 is decided with the network operator: change this \
+             declaration and params::V1_5_ACTIVATION_HEIGHT in one commit, or neither"
+        );
+    }
+
+    /// Hanging v1.5 off an earlier clock would arm it retroactively and
+    /// re-judge payouts the chain has already made.
+    #[test]
+    fn the_v1_5_clock_is_not_one_of_the_earlier_clocks() {
+        use crate::consensus::params::{
+            V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT,
+            V1_5_ACTIVATION_HEIGHT,
+        };
+        if V1_5_ACTIVATION_HEIGHT.is_some() {
+            assert_ne!(V1_5_ACTIVATION_HEIGHT, V1_2_ACTIVATION_HEIGHT);
+            assert_ne!(V1_5_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT);
+            assert_ne!(V1_5_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT);
+        }
+    }
+
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
     #[test]
     fn arming_v1_3_takes_two_deliberate_edits() {

@@ -5,7 +5,8 @@
 //! Exact in-circuit stateless development-allocation schedule.
 
 use jetsam_chain::consensus::development_allocation::{
-    development_allocation, DEVELOPMENT_ALLOCATION_END_HEIGHT, TARGET_BLOCKS_PER_DAY,
+    development_allocation_with, DEVELOPMENT_ALLOCATION_END_HEIGHT_90S,
+    DEVELOPMENT_PAYOUT_INTERVAL_90S,
 };
 use jetsam_core::Block128;
 
@@ -16,17 +17,17 @@ use super::{
 };
 
 const HEIGHT_BITS: usize = 64;
-/// JETSAM CHANGE: 55, was 52. `TARGET_BLOCKS_PER_DAY` fell from 4320 to 960, so
+/// JETSAM CHANGE: 55, was 52. The payout interval fell from 4320 to 960, so
 /// the quotient of a u64 height by it needs three more bits. 55 + 9 = 64
 /// exactly fills `HEIGHT_BITS` under the largest shift used below.
 const PAYOUT_QUOTIENT_BITS: usize = 55;
-/// JETSAM CHANGE: 10, was 13 — enough for `TARGET_BLOCKS_PER_DAY` = 960.
+/// JETSAM CHANGE: 10, was 13 — enough for a payout interval of 960.
 const PAYOUT_REMAINDER_BITS: usize = 10;
 /// JETSAM CHANGE: 960 = 512 + 256 + 128 + 64, was 4320 = 4096 + 128 + 64 + 32.
 /// Still exactly four set bits, so the shift-and-add recomposition below keeps
 /// the same shape — only the shift amounts move.
-const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 9) + (1 << 8) + (1 << 7) + (1 << 6));
-const _: () = assert!(TARGET_BLOCKS_PER_DAY < (1 << PAYOUT_REMAINDER_BITS));
+const _: () = assert!(DEVELOPMENT_PAYOUT_INTERVAL_90S == (1 << 9) + (1 << 8) + (1 << 7) + (1 << 6));
+const _: () = assert!(DEVELOPMENT_PAYOUT_INTERVAL_90S < (1 << PAYOUT_REMAINDER_BITS));
 const _: () = assert!(PAYOUT_QUOTIENT_BITS + 9 <= HEIGHT_BITS);
 
 pub struct DevelopmentAllocationTrace {
@@ -184,17 +185,17 @@ fn selected_depth_constant(depth: &StateDepthTrace, values: &[u64]) -> LinExpr {
 }
 
 fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u64) -> LinExpr {
-    let quotient = native_height / TARGET_BLOCKS_PER_DAY;
-    let remainder = native_height % TARGET_BLOCKS_PER_DAY;
+    let quotient = native_height / DEVELOPMENT_PAYOUT_INTERVAL_90S;
+    let remainder = native_height % DEVELOPMENT_PAYOUT_INTERVAL_90S;
     let quotient = alloc_block(b, Block128::from(quotient as u128));
     let quotient_bits = range_check_bits(b, &quotient, PAYOUT_QUOTIENT_BITS);
     let remainder = alloc_block(b, Block128::from(remainder as u128));
     let remainder_bits = range_check_bits(b, &remainder, PAYOUT_REMAINDER_BITS);
-    let divisor = const_block(Block128::from(TARGET_BLOCKS_PER_DAY as u128));
+    let divisor = const_block(Block128::from(DEVELOPMENT_PAYOUT_INTERVAL_90S as u128));
     let divisor_bits = range_check_bits(b, &divisor, PAYOUT_REMAINDER_BITS);
     pin_lt_strict(b, &remainder_bits, &divisor_bits);
 
-    // JETSAM CHANGE: shifts follow the set bits of TARGET_BLOCKS_PER_DAY.
+    // JETSAM CHANGE: shifts follow the set bits of the payout interval.
     // 960 = (1<<9) + (1<<8) + (1<<7) + (1<<6); upstream's 4320 was
     // (1<<12) + (1<<7) + (1<<6) + (1<<5). Same four-term shape.
     let terms = [
@@ -240,7 +241,7 @@ pub fn bind_development_allocation(
     let below_end = less_than_bits(
         b,
         &height_bits,
-        &constant_bits(DEVELOPMENT_ALLOCATION_END_HEIGHT + 1, HEIGHT_BITS),
+        &constant_bits(DEVELOPMENT_ALLOCATION_END_HEIGHT_90S + 1, HEIGHT_BITS),
     );
     let height_is_zero = height_bits
         .iter()
@@ -262,7 +263,7 @@ pub fn bind_development_allocation(
         .iter()
         .map(|share| {
             share
-                .checked_mul(TARGET_BLOCKS_PER_DAY)
+                .checked_mul(DEVELOPMENT_PAYOUT_INTERVAL_90S)
                 .expect("development payout fits u64")
         })
         .collect::<Vec<_>>();
@@ -284,7 +285,10 @@ pub fn bind_development_allocation(
     let selected_payout = mul(b, &payout_due, payout_raw_amount);
     pin_eq(b, &selected_payout, &expected_payout);
 
-    let native = development_allocation(native_height).expect("honest development schedule");
+    // The launch and v1.3 relations carry the dormant schedule, whatever the
+    // profile arms: they never prove a block past the v1.5 height.
+    let native =
+        development_allocation_with(native_height, None).expect("honest development schedule");
     let native_payout = native.payout_each.unwrap_or(0);
     debug_assert_eq!(
         selected_payout.eval(b.values()),
@@ -328,7 +332,7 @@ mod tests {
         DevelopmentAllocationTrace,
         CaseWires,
     ) {
-        let native = development_allocation(height).unwrap();
+        let native = development_allocation_with(height, None).unwrap();
         let mut builder = FieldR1csBuilder::new();
         let height = alloc_block(&mut builder, Block128::from(height as u128));
         let depth_value = alloc_block(&mut builder, Block128::from(depth as u128));
@@ -351,13 +355,13 @@ mod tests {
     fn exact_edges_match_native_schedule() {
         for height in [
             1,
-            TARGET_BLOCKS_PER_DAY - 1,
-            TARGET_BLOCKS_PER_DAY,
-            TARGET_BLOCKS_PER_DAY + 1,
-            DEVELOPMENT_ALLOCATION_END_HEIGHT,
-            DEVELOPMENT_ALLOCATION_END_HEIGHT + 1,
+            DEVELOPMENT_PAYOUT_INTERVAL_90S - 1,
+            DEVELOPMENT_PAYOUT_INTERVAL_90S,
+            DEVELOPMENT_PAYOUT_INTERVAL_90S + 1,
+            DEVELOPMENT_ALLOCATION_END_HEIGHT_90S,
+            DEVELOPMENT_ALLOCATION_END_HEIGHT_90S + 1,
         ] {
-            let native = development_allocation(height).unwrap();
+            let native = development_allocation_with(height, None).unwrap();
             let (matrix, witness, trace, _) = case(height, 24);
             assert!(matrix.satisfies(&witness), "height {height}");
             assert_eq!(
@@ -375,7 +379,7 @@ mod tests {
 
     #[test]
     fn scheduled_payout_amount_is_load_bearing() {
-        let (due, witness, _, wires) = case(TARGET_BLOCKS_PER_DAY, 24);
+        let (due, witness, _, wires) = case(DEVELOPMENT_PAYOUT_INTERVAL_90S, 24);
         let mut bad = witness;
         bad[wires.payout.0 as usize] += F128::ONE;
         assert!(
@@ -386,9 +390,9 @@ mod tests {
 
     #[test]
     fn expansion_day_uses_the_current_lower_reward_tier() {
-        let (matrix, witness, trace, _) = case(TARGET_BLOCKS_PER_DAY, 25);
+        let (matrix, witness, trace, _) = case(DEVELOPMENT_PAYOUT_INTERVAL_90S, 25);
         assert!(matrix.satisfies(&witness));
-        let native = development_allocation(TARGET_BLOCKS_PER_DAY).unwrap();
+        let native = development_allocation_with(DEVELOPMENT_PAYOUT_INTERVAL_90S, None).unwrap();
         assert_eq!(
             trace.payout_each.eval(&witness),
             alloc_block_value(native.payout_each.unwrap())

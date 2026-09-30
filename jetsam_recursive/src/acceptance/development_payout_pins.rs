@@ -16,7 +16,7 @@
 //! ```
 //!
 //! `live` is `development_payout_due(child_height)`, false on every height
-//! that is not a multiple of `TARGET_BLOCKS_PER_DAY`. On those heights
+//! that is not a payout height — a multiple of 960 before v1.5. On those heights
 //! `A[r]·z = 0` and the row is satisfied whatever constant `B[r]` holds. On
 //! the 960th it is not, and every node stops at the same block. The test chain
 //! did exactly that at block 1920 on 2026-09-17.

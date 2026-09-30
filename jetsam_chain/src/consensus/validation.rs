@@ -708,19 +708,19 @@ mod tests {
     #[test]
     fn scheduled_development_payout_is_mandatory_and_exact() {
         use crate::consensus::development_allocation::{
-            development_allocation, development_share_each, TARGET_BLOCKS_PER_DAY,
+            development_allocation, development_share_each, DEVELOPMENT_PAYOUT_INTERVAL_90S,
         };
         use crate::consensus::emission::block_reward;
 
-        let parent = header(TARGET_BLOCKS_PER_DAY - 1);
-        let share = development_share_each(block_reward(TARGET_BLOCKS_PER_DAY)).unwrap();
-        let allocation = development_allocation(TARGET_BLOCKS_PER_DAY).unwrap();
+        let parent = header(DEVELOPMENT_PAYOUT_INTERVAL_90S - 1);
+        let share = development_share_each(block_reward(DEVELOPMENT_PAYOUT_INTERVAL_90S)).unwrap();
+        let allocation = development_allocation(DEVELOPMENT_PAYOUT_INTERVAL_90S).unwrap();
         let amount = allocation.payout_each.unwrap();
         let block = Block {
-            header: header(TARGET_BLOCKS_PER_DAY),
+            header: header(DEVELOPMENT_PAYOUT_INTERVAL_90S),
             transactions: vec![coinbase(&parent), development_payout(&parent, amount)],
         };
-        assert_eq!(amount, share * TARGET_BLOCKS_PER_DAY);
+        assert_eq!(amount, share * DEVELOPMENT_PAYOUT_INTERVAL_90S);
         assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
 
         let mut missing = block.clone();

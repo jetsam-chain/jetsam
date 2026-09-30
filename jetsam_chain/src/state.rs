@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn development_payout_uses_the_normal_allocator_namespace() {
-        use crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+        use crate::consensus::development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S;
         use crate::consensus::params::is_coinbase_creation_id;
 
         let mut state = ChainState::with_log_slots(8);
@@ -1318,7 +1318,7 @@ mod tests {
             validity_bitmap: output_bitmap_bit(0),
             is_coinbase: true,
         };
-        apply_tx_at(&mut state, &miner, TARGET_BLOCKS_PER_DAY).unwrap();
+        apply_tx_at(&mut state, &miner, DEVELOPMENT_PAYOUT_INTERVAL_90S).unwrap();
 
         let payout = TxBody {
             epoch_anchor: [9u8; 32],
@@ -1340,7 +1340,7 @@ mod tests {
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
             is_coinbase: true,
         };
-        apply_tx_at(&mut state, &payout, TARGET_BLOCKS_PER_DAY).unwrap();
+        apply_tx_at(&mut state, &payout, DEVELOPMENT_PAYOUT_INTERVAL_90S).unwrap();
 
         assert_eq!(state.state.slot(5).creation_id(), 2);
         assert_eq!(state.state.slot(6).creation_id(), 3);
