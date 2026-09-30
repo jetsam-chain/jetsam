@@ -355,6 +355,14 @@ impl G1Class {
         }
     }
 
+    /// `G1_CLASS=both` measures B24 then B255 in one process (one backbone).
+    fn list_from_env() -> Result<Vec<Self>, String> {
+        match std::env::var("G1_CLASS").as_deref() {
+            Ok("both") => Ok(vec![Self::B24, Self::B255]),
+            _ => Self::from_env().map(|class| vec![class]),
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::B24 => "B24",
@@ -475,16 +483,17 @@ fn run_pack(samples: usize) -> Result<(), String> {
     for class in 0..2 {
         source.load_checked(CanonicalHistoryStepClassId::new(class).expect("class"))?;
     }
-    let class = G1Class::from_env()?;
-    for sample in 0..samples {
-        measure_production(
-            &format!("pack recursive {} sample {}", class.name(), sample + 1),
-            class,
-            &runtime,
-            Some(&parent),
-            &provider,
-            &start,
-        )?;
+    for class in G1Class::list_from_env()? {
+        for sample in 0..samples {
+            measure_production(
+                &format!("pack recursive {} sample {}", class.name(), sample + 1),
+                class,
+                &runtime,
+                Some(&parent),
+                &provider,
+                &start,
+            )?;
+        }
     }
     Ok(())
 }
@@ -504,17 +513,18 @@ fn run_base_pack(samples: usize) -> Result<(), String> {
         .parent_accumulator(0)
         .ok_or("no checkpoint")?
         .clone();
-    let class = G1Class::from_env()?;
-    source.load_checked(class.id())?;
-    for sample in 0..samples {
-        measure_production(
-            &format!("pack base {} sample {}", class.name(), sample + 1),
-            class,
-            &runtime,
-            None,
-            &provider,
-            &start,
-        )?;
+    for class in G1Class::list_from_env()? {
+        source.load_checked(class.id())?;
+        for sample in 0..samples {
+            measure_production(
+                &format!("pack base {} sample {}", class.name(), sample + 1),
+                class,
+                &runtime,
+                None,
+                &provider,
+                &start,
+            )?;
+        }
     }
     Ok(())
 }
@@ -651,8 +661,8 @@ mod client {
             .parent_accumulator(0)
             .ok_or("no checkpoint")?
             .clone();
-        let class = G1Class::from_env()?;
         let client = registered_client(&form);
+        for class in G1Class::list_from_env()? {
         let limit_log = canonical_history_step_shape(class.id()).m;
         for sample in 0..samples {
             for (name, carried, cached) in [
@@ -721,6 +731,7 @@ mod client {
                      staged_assembly_ms={assembly_ms:.0} seal_ms={seal_ms:.0}"
                 );
             }
+        }
         }
         Ok(())
     }
