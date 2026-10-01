@@ -2871,6 +2871,176 @@ impl JetsamApiServer for RpcHandler {
         })
     }
 
+    async fn build_client_proof_bundle(
+        &self,
+        matrix_digest: String,
+        io_commitment: String,
+        payment_hex: String,
+        proof_hex: String,
+    ) -> RpcResult<String> {
+        let submission = jetsam_chain::consensus::client_objects::ClientSubmission {
+            matrix_digest: decode_32_byte_hex("matrix_digest", &matrix_digest)?,
+            io_commitment: decode_32_byte_hex("io_commitment", &io_commitment)?,
+        };
+        let payment_bytes =
+            decode_bounded_hex("submission payment", &payment_hex, MAX_TX_INTENT_BYTES_GLOBAL)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&payment_bytes)
+            .map_err(|error| rpc_err(format!("submission payment: {error:?}")))?;
+        let proof = decode_bounded_hex(
+            "client proof",
+            &proof_hex,
+            jetsam_chain::consensus::client_objects::CLIENT_PROOF_MAX_WIRE_BYTES,
+        )?;
+        let bundle =
+            jetsam_p2p::client_object_protocol::ClientProofBundle::new(submission, payment, proof)
+                .map_err(|error| rpc_err(format!("client proof bundle: {error}")))?;
+        Ok(hex::encode(bundle.encode()))
+    }
+
+    async fn wallet_build_client_payment(
+        &self,
+        object: crate::client_objects::ClientPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::client_objects::ClientPaymentResponse> {
+        use crate::client_objects::ClientPaymentObject;
+        use jetsam_chain::consensus::client_objects::{
+            ClientObject, ClientObjectRules, ClientSubmission, CLIENT_LICENSE_BURN_ADDRESS,
+            CLIENT_LICENSE_POOL_ADDRESS,
+        };
+        let rules = ClientObjectRules::current();
+        let (client_object, payments) = match &object {
+            ClientPaymentObject::Registration { matrix_path } => {
+                let objects = self.client_objects.clone().ok_or_else(|| {
+                    rpc_err("this node holds no v1.5 client objects (no v1.5 pack)")
+                })?;
+                let path = std::path::PathBuf::from(matrix_path);
+                let max = u64::from(rules.max_matrix_file_bytes);
+                let registration = tokio::task::spawn_blocking(move || {
+                    use std::io::Read as _;
+                    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                    let mut bytes = Vec::new();
+                    file.take(max + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| error.to_string())?;
+                    objects.registration_of_matrix_file(&bytes)
+                })
+                .await
+                .map_err(|error| rpc_err(error.to_string()))?
+                .map_err(|error| rpc_err(format!("matrix file {matrix_path}: {error}")))?;
+                let split = rules.destination.split(rules.license_micro);
+                let mut payments = Vec::new();
+                if split.burn > 0 {
+                    payments.push((CLIENT_LICENSE_BURN_ADDRESS.0, split.burn));
+                }
+                if split.miners > 0 {
+                    payments.push((CLIENT_LICENSE_POOL_ADDRESS.0, split.miners));
+                }
+                if let Some(treasury) = rules.destination.treasury_address() {
+                    payments.push((treasury.0, split.treasury));
+                }
+                (ClientObject::Registration(registration), payments)
+            }
+            ClientPaymentObject::Submission {
+                matrix_digest,
+                io_commitment,
+            } => (
+                ClientObject::Submission(ClientSubmission {
+                    matrix_digest: decode_32_byte_hex("matrix_digest", matrix_digest)?,
+                    io_commitment: decode_32_byte_hex("io_commitment", io_commitment)?,
+                }),
+                Vec::new(),
+            ),
+        };
+        let marker = client_object.marker();
+        let output_count = payments.len() + 2; // the marker and, at most, change
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints, required) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints =
+                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
+                    .map_err(rpc_err)?;
+            // One full input page bounds the required fee from above.
+            let required = jetsam_chain::consensus::fees::fee_breakdown(
+                jetsam_tx::TX_INPUTS as u64,
+                output_count as u64,
+                tip.active_slot_count,
+                tip.log_slots,
+            )
+            .required_total;
+            (epoch_anchor, tip.log_slots, slot_hints, required)
+        };
+        let submission_fee = match client_object {
+            ClientObject::Submission(_) => rules.submission_fee_micro,
+            ClientObject::Registration(_) => 0,
+        };
+        let fee = fee_micro_jtm.unwrap_or(required.saturating_add(submission_fee));
+        let wallet = Arc::clone(&self.wallet);
+        let build_payments = payments.clone();
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    build_payments,
+                    marker.0,
+                    fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let intent = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let txid = intent.logical_txid().0;
+        let output_slots: Vec<u32> = intent
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Held until mined: the wallet must not spend these inputs again.
+        self.wallet
+            .reserve_pending_submission(
+                txid,
+                &input_slots,
+                &output_slots,
+                payments.iter().map(|(_, amount)| amount).sum(),
+                marker.0,
+            )
+            .map_err(rpc_err)?;
+        let (matrix_file_root, matrix_file_len, io_commitment) = match client_object {
+            ClientObject::Registration(registration) => (
+                Some(hex::encode(registration.matrix_file_root)),
+                Some(registration.matrix_file_len),
+                None,
+            ),
+            ClientObject::Submission(submission) => {
+                (None, None, Some(hex::encode(submission.io_commitment)))
+            }
+        };
+        Ok(crate::client_objects::ClientPaymentResponse {
+            payment_hex: hex::encode(&intent_bytes),
+            txid: hex::encode(txid),
+            fee_micro_jtm: fee,
+            marker: hex::encode(marker.0),
+            matrix_digest: hex::encode(match client_object {
+                ClientObject::Registration(registration) => registration.matrix_digest,
+                ClientObject::Submission(submission) => submission.matrix_digest,
+            }),
+            matrix_file_root,
+            matrix_file_len,
+            io_commitment,
+        })
+    }
+
     async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse> {
         let (registry, tip_height) = {
             let chain = self.chain.read().await;

@@ -1053,6 +1053,39 @@ impl WalletOps for WalletHandle {
             fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micro_jtm),
         })
     }
+    fn build_client_payment(
+        &self,
+        payments: Vec<([u8; 32], u64)>,
+        marker: [u8; 32],
+        fee_micro_jtm: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        _log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
+        let (build_data, input_slots) = {
+            let guard = self.inner.lock().unwrap();
+            let w = guard
+                .as_ref()
+                .ok_or_else(|| "wallet not initialized".to_string())?;
+            let pending_outputs = w.pending_output_slots.clone();
+            let data = builder::extract_client_payment_build_data(
+                w,
+                &payments,
+                fee_micro_jtm,
+                epoch_anchor,
+                slot_hints,
+                &pending_outputs,
+            )
+            .map_err(|e| e.to_string())?;
+            let inputs: Vec<u32> = data.selected_utxos.iter().map(|u| u.slot_index).collect();
+            (data, inputs)
+        };
+        let (_txid, intent_bytes) =
+            builder::build_and_prove_client_payment(&payments, marker, fee_micro_jtm, build_data)
+                .map_err(|e| e.to_string())?;
+        Ok((intent_bytes, input_slots))
+    }
+
     fn build_send(
         &self,
         to_address: [u8; 32],

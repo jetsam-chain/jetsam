@@ -102,6 +102,40 @@ pub struct RegisterClientResponse {
     pub next_index: usize,
 }
 
+/// `jetsam_walletBuildClientPayment`: what to pay for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientPaymentObject {
+    /// The registration a local matrix file makes (its license is paid).
+    Registration { matrix_path: String },
+    /// A submission of one client proof (its fee is the transaction's).
+    Submission {
+        matrix_digest: String,
+        io_commitment: String,
+    },
+}
+
+/// `jetsam_walletBuildClientPayment`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientPaymentResponse {
+    /// The proved `PagedSpendIntent`, hex: pass it to `registerClient`, or
+    /// into a client proof bundle (`buildClientProofBundle`).
+    pub payment_hex: String,
+    pub txid: String,
+    pub fee_micro_jtm: u64,
+    /// The object's marker owner, hex.
+    pub marker: String,
+    /// The object: `D`, then the file root and length (registration) or the
+    /// IO commitment (submission), hex.
+    pub matrix_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_file_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_file_len: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_commitment: Option<String>,
+}
+
 /// The listing of `registry` at the tip `tip_height`.
 pub fn client_list(
     registry: &ClientRegistryState,
@@ -142,6 +176,24 @@ mod tests {
     use jetsam_chain::consensus::client_objects::{
         ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
     };
+
+    #[test]
+    fn a_client_payment_names_its_object_by_kind() {
+        let registration: ClientPaymentObject =
+            serde_json::from_str(r#"{"kind":"registration","matrix_path":"/tmp/m.bin"}"#).unwrap();
+        assert_eq!(
+            registration,
+            ClientPaymentObject::Registration {
+                matrix_path: "/tmp/m.bin".into()
+            }
+        );
+        let submission: ClientPaymentObject = serde_json::from_str(
+            r#"{"kind":"submission","matrix_digest":"aa","io_commitment":"bb"}"#,
+        )
+        .unwrap();
+        assert!(matches!(submission, ClientPaymentObject::Submission { .. }));
+        assert!(serde_json::from_str::<ClientPaymentObject>(r#"{"kind":"gift"}"#).is_err());
+    }
 
     #[test]
     fn the_listing_shows_every_entry_its_activation_and_whether_its_matrix_is_held() {

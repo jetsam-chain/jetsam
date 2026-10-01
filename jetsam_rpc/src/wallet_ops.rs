@@ -196,6 +196,23 @@ pub trait WalletOps: Send + Sync {
         log_slots: u32,
     ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
+    /// Build and prove a transaction paying a v1.5 client object (M3.8):
+    /// `payments` (a registration's license), the object's zero-value
+    /// `marker`, change back to the active address. Not submitted: the
+    /// payment travels with its object. CPU-heavy, like `build_send`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_client_payment(
+        &self,
+        _payments: Vec<([u8; 32], u64)>,
+        _marker: [u8; 32],
+        _fee_micro_jtm: u64,
+        _epoch_anchor: [u8; 32],
+        _slot_hints: Vec<u32>,
+        _log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
+        Err("this wallet does not build client-object payments".to_string())
+    }
+
     /// Plan one active-wallet consolidation from the smallest available UTXOs.
     ///
     /// The returned slot list is an immutable build boundary: block rewards or

@@ -135,35 +135,8 @@ pub fn extract_build_data(
     _log_slots: u32,
     pending_output_slots: &std::collections::HashSet<u32>,
 ) -> Result<TxBuildData, BuildError> {
-    let total_needed = amount_micro_jtm
-        .checked_add(fee_micro_jtm)
-        .ok_or(BuildError::AmountOverflow)?;
-
     // Coin selection — largest-first, returns (selected, change_amount).
-    let (selected_refs, change_amount) = match wallet.select_utxos(amount_micro_jtm, fee_micro_jtm)
-    {
-        Some(selection) => selection,
-        None => {
-            let spendable = wallet
-                .utxos
-                .values()
-                .filter(|utxo| utxo.key_index == wallet.active_index)
-                .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
-                .map(|utxo| utxo.value)
-                .try_fold(0u64, u64::checked_add)
-                .ok_or(BuildError::AmountOverflow)?;
-            if spendable >= total_needed {
-                return Err(BuildError::TooManyInputs {
-                    selected: MAX_PAGED_SPEND_INPUTS + 1,
-                    max: MAX_PAGED_SPEND_INPUTS,
-                });
-            }
-            return Err(BuildError::InsufficientFunds {
-                need: total_needed,
-                have: spendable,
-            });
-        }
-    };
+    let (selected_refs, change_amount) = select_inputs(wallet, amount_micro_jtm, fee_micro_jtm)?;
 
     // Filter out slots already claimed by in-flight (pending) txs to prevent
     // SlotConflict when wallet_send is retried or called concurrently.
@@ -193,6 +166,189 @@ pub fn extract_build_data(
         epoch_anchor,
         output_slot_hints: slot_hints,
     })
+}
+
+/// Largest-first coin selection for `amount + fee`, with the wallet's
+/// errors: too many inputs for one group, or not enough funds.
+fn select_inputs(
+    wallet: &WalletState,
+    amount_micro_jtm: u64,
+    fee_micro_jtm: u64,
+) -> Result<(Vec<&WalletUtxo>, u64), BuildError> {
+    let total_needed = amount_micro_jtm
+        .checked_add(fee_micro_jtm)
+        .ok_or(BuildError::AmountOverflow)?;
+    match wallet.select_utxos(amount_micro_jtm, fee_micro_jtm) {
+        Some(selection) => Ok(selection),
+        None => {
+            let spendable = wallet
+                .utxos
+                .values()
+                .filter(|utxo| utxo.key_index == wallet.active_index)
+                .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
+                .map(|utxo| utxo.value)
+                .try_fold(0u64, u64::checked_add)
+                .ok_or(BuildError::AmountOverflow)?;
+            if spendable >= total_needed {
+                return Err(BuildError::TooManyInputs {
+                    selected: MAX_PAGED_SPEND_INPUTS + 1,
+                    max: MAX_PAGED_SPEND_INPUTS,
+                });
+            }
+            Err(BuildError::InsufficientFunds {
+                need: total_needed,
+                have: spendable,
+            })
+        }
+    }
+}
+
+/// Build data for a transaction paying a v1.5 client object (M3.8): the
+/// `payments` its object owes (a registration's license, to each destination
+/// of D5; none for a submission, whose fee is the transaction fee), the
+/// object's zero-value marker, and the change. One output slot each.
+pub fn extract_client_payment_build_data(
+    wallet: &WalletState,
+    payments: &[([u8; 32], u64)],
+    fee_micro_jtm: u64,
+    epoch_anchor: [u8; 32],
+    slot_hints: Vec<u32>,
+    pending_output_slots: &std::collections::HashSet<u32>,
+) -> Result<TxBuildData, BuildError> {
+    let amount = payments
+        .iter()
+        .try_fold(0u64, |total, (_, amount)| total.checked_add(*amount))
+        .ok_or(BuildError::AmountOverflow)?;
+    let (selected_refs, change_amount) = select_inputs(wallet, amount, fee_micro_jtm)?;
+    let slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|s| !pending_output_slots.contains(s))
+        .collect();
+    let needed_slots = payments.len() + 1 + usize::from(change_amount > 0);
+    if slot_hints.len() < needed_slots {
+        return Err(BuildError::NotEnoughSlots {
+            need: needed_slots,
+            got: slot_hints.len(),
+        });
+    }
+    let selected_utxos: Vec<WalletUtxo> = selected_refs.into_iter().cloned().collect();
+    let owner_auth_witness = active_owner_witness(wallet, &selected_utxos)?;
+    Ok(TxBuildData {
+        selected_utxos,
+        owner_auth_witness,
+        change_address: wallet.active_address(),
+        epoch_anchor,
+        output_slot_hints: slot_hints,
+    })
+}
+
+/// Build and prove a transaction paying a v1.5 client object (M3.8): the
+/// `payments` first, then the zero-value `marker` that names the object,
+/// then the change. Outputs are packed two per page and inputs eight per
+/// page; the group is authorized once. Never submitted here: the payment
+/// travels with its object.
+pub fn build_and_prove_client_payment(
+    payments: &[([u8; 32], u64)],
+    marker: [u8; 32],
+    fee_micro_jtm: u64,
+    data: TxBuildData,
+) -> Result<([u8; 32], Vec<u8>), BuildError> {
+    let total_selected = data
+        .selected_utxos
+        .iter()
+        .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+        .ok_or(BuildError::AmountOverflow)?;
+    let paid = payments
+        .iter()
+        .try_fold(0u64, |total, (_, amount)| total.checked_add(*amount))
+        .ok_or(BuildError::AmountOverflow)?;
+    let need = paid
+        .checked_add(fee_micro_jtm)
+        .ok_or(BuildError::AmountOverflow)?;
+    let change_amount = total_selected
+        .checked_sub(need)
+        .ok_or(BuildError::InsufficientFunds {
+            need,
+            have: total_selected,
+        })?;
+    let mut outputs: Vec<(Address, u64)> = payments
+        .iter()
+        .map(|(owner, amount)| (Address(*owner), *amount))
+        .collect();
+    outputs.push((Address(marker), 0));
+    if change_amount > 0 {
+        outputs.push((data.change_address, change_amount));
+    }
+    if data.output_slot_hints.len() < outputs.len() {
+        return Err(BuildError::NotEnoughSlots {
+            need: outputs.len(),
+            got: data.output_slot_hints.len(),
+        });
+    }
+    let page_count = data
+        .selected_utxos
+        .len()
+        .div_ceil(TX_INPUTS)
+        .max(outputs.len().div_ceil(TX_OUTPUTS))
+        .max(1);
+    let mut pages = Vec::with_capacity(page_count);
+    for page_index in 0..page_count {
+        let mut page_inputs = [TxInput::dummy(); TX_INPUTS];
+        let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        let mut page_bitmap = 0u16;
+        for (slot, input) in page_inputs.iter_mut().enumerate() {
+            if let Some(utxo) = data.selected_utxos.get(page_index * TX_INPUTS + slot) {
+                *input = TxInput {
+                    slot_index: utxo.slot_index,
+                    amount: utxo.value,
+                    creation_id: utxo.creation_id,
+                };
+                page_bitmap |= 1u16 << slot;
+            }
+        }
+        for (slot, output) in page_outputs.iter_mut().enumerate() {
+            let index = page_index * TX_OUTPUTS + slot;
+            if let Some((owner, amount)) = outputs.get(index) {
+                *output = TxOutput {
+                    slot_index: data.output_slot_hints[index],
+                    amount: *amount,
+                    owner: *owner,
+                };
+                page_bitmap |= output_bitmap_bit(slot);
+            }
+        }
+        if page_index == 0 {
+            page_bitmap |= PAGED_SPEND_START_BIT;
+        }
+        if page_index + 1 == page_count {
+            page_bitmap |= PAGED_SPEND_END_BIT;
+        }
+        pages.push(
+            TxPage::new(TxBody {
+                epoch_anchor: data.epoch_anchor,
+                fee: if page_index == 0 { fee_micro_jtm } else { 0 },
+                input_owner: data.change_address,
+                inputs: page_inputs,
+                outputs: page_outputs,
+                validity_bitmap: page_bitmap,
+                is_coinbase: false,
+            })
+            .map_err(|error| BuildError::ProveFailed(error.to_string()))?,
+        );
+    }
+    let bundle = prove_tx(&pages, data.owner_auth_witness)
+        .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
+    let authorization_bytes = bundle
+        .to_bytes()
+        .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
+    let intent = PagedSpendIntent::new(pages, authorization_bytes)
+        .map_err(|error| BuildError::ProveFailed(error.to_string()))?;
+    Ok((
+        intent.logical_txid().0,
+        intent
+            .to_bytes()
+            .map_err(|error| BuildError::ProveFailed(error.to_string()))?,
+    ))
 }
 
 /// Extract the exact active-owner UTXOs approved by a consolidation plan.
@@ -600,6 +756,94 @@ mod tests {
             .expect("decode standard authorization bundle");
         jetsam_gkr::verify_paged_spend_authorization(&intent.pages, &bundle)
             .expect("verify standard authorization bundle");
+    }
+
+    /// M3.8: a transaction paying a v1.5 client object — the license to its
+    /// destination, the object's zero-value marker, the change — has more
+    /// outputs than one page holds; they spread over pages and the whole
+    /// group is authorized once. It passes the checks a node runs before
+    /// holding a registration.
+    #[test]
+    fn a_client_payment_carries_its_license_its_marker_and_its_change() {
+        use jetsam_chain::consensus::client_objects::{
+            check_registration_payment, ClientObject, ClientObjectRules, ClientRegistration,
+            CLIENT_LICENSE_BURN_ADDRESS,
+        };
+        let (_dir, wallet) = wallet_with_utxos(2, 2_000_000);
+        let registration = ClientRegistration {
+            matrix_digest: [0xD1; 32],
+            matrix_file_root: [0xF1; 32],
+            matrix_file_len: 4_096,
+        };
+        let marker = ClientObject::Registration(registration).marker();
+        let license = 1_500_000;
+        let fee = 1_000;
+        let payments = [(CLIENT_LICENSE_BURN_ADDRESS.0, license)];
+        let data = extract_client_payment_build_data(
+            &wallet,
+            &payments,
+            fee,
+            [7u8; 32],
+            (0..8).map(|slot| 100 + slot).collect(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        let (txid, intent_bytes) =
+            build_and_prove_client_payment(&payments, marker.0, fee, data).unwrap();
+        let intent = PagedSpendIntent::from_bytes(&intent_bytes).expect("decode intent");
+        assert_eq!(intent.logical_txid().0, txid);
+        let outputs: Vec<_> = intent
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| *output).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(outputs.len(), 3, "license, marker, change");
+        assert_eq!(outputs[0].owner, CLIENT_LICENSE_BURN_ADDRESS);
+        assert_eq!(outputs[0].amount, license);
+        assert_eq!((outputs[1].owner, outputs[1].amount), (marker, 0));
+        assert_eq!(outputs[2].owner, wallet.active_address());
+        let pages: Vec<_> = intent
+            .pages
+            .iter()
+            .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
+            .collect();
+        let rules = ClientObjectRules {
+            license_micro: license,
+            ..ClientObjectRules::CONSENSUS
+        };
+        assert_eq!(check_registration_payment(&pages, &registration, &rules), Ok(()));
+        let bundle = jetsam_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
+            .expect("decode authorization bundle");
+        jetsam_gkr::verify_paged_spend_authorization(&intent.pages, &bundle)
+            .expect("verify client payment authorization");
+
+        // A submission payment: no license, the marker and the change.
+        let submission_marker = ClientObject::Submission(
+            jetsam_chain::consensus::client_objects::ClientSubmission {
+                matrix_digest: [0xD1; 32],
+                io_commitment: [0x10; 32],
+            },
+        )
+        .marker();
+        let data = extract_client_payment_build_data(
+            &wallet,
+            &[],
+            fee,
+            [7u8; 32],
+            (0..8).map(|slot| 200 + slot).collect(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        let (_, intent_bytes) =
+            build_and_prove_client_payment(&[], submission_marker.0, fee, data).unwrap();
+        let intent = PagedSpendIntent::from_bytes(&intent_bytes).unwrap();
+        let outputs: Vec<_> = intent
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| *output).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!((outputs[0].owner, outputs[0].amount), (submission_marker, 0));
     }
 
     #[test]

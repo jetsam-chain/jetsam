@@ -253,6 +253,29 @@ pub trait JetsamApi {
     #[method(name = "listClients")]
     async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse>;
 
+    /// Assemble a client proof bundle (hex) from its parts: the submission
+    /// (`D`, IO commitment), its payment (hex intent) and the proof (hex,
+    /// `encode_history_step_client_proof`). No side effect.
+    #[method(name = "buildClientProofBundle")]
+    async fn build_client_proof_bundle(
+        &self,
+        matrix_digest: String,
+        io_commitment: String,
+        payment_hex: String,
+        proof_hex: String,
+    ) -> RpcResult<String>;
+
+    /// Build and prove, with the active wallet, the transaction paying a
+    /// client object: a registration's license and marker, or a
+    /// submission's fee and marker. Not submitted; its inputs are reserved
+    /// until it is mined (a wallet reload frees them otherwise).
+    #[method(name = "walletBuildClientPayment")]
+    async fn wallet_build_client_payment(
+        &self,
+        object: crate::client_objects::ClientPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::client_objects::ClientPaymentResponse>;
+
     // =========================================================================
     // Node control
     // =========================================================================
