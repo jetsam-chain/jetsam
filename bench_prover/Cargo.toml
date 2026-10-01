@@ -33,6 +33,9 @@ bincode = "1"
 hex = "0.4"
 zstd = { version = "0.13", features = ["zstdmt"] }
 tracing-subscriber = { workspace = true }
+# The example client of the v1.5 client slot (catalogue entry 1), proved by
+# the `client_agent_demo` bench and written out by `jetsam_client_demo`.
+jetsam_client_agent = { path = "../jetsam_client_agent" }
 
 [[bench]]
 name = "alice_sends_bob"
@@ -83,6 +86,3 @@ name = "client_agent_demo"
 harness = false
 
 [dev-dependencies]
-# The example client of the v1.5 client slot (catalogue entry 1), proved by
-# the `client_agent_demo` bench.
-jetsam_client_agent = { path = "../jetsam_client_agent" }
