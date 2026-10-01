@@ -2911,6 +2911,7 @@ dependencies = [
  "futures",
  "hex",
  "jetsam-ivc-core",
+ "jetsam-ivc-prover",
  "jetsam_block",
  "jetsam_chain",
  "jetsam_core",

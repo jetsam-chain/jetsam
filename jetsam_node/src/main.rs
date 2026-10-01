@@ -2491,6 +2491,40 @@ async fn main() -> anyhow::Result<()> {
     let tip_height = ctx.tip_height();
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
+    // v1.5 client objects (M3.8): the registered matrices this node holds
+    // (shared with the verifier), received client proofs and held
+    // registrations. Present exactly when the v1.5 relation is embedded.
+    let client_objects: Option<Arc<jetsam_node::client_objects::ClientObjects>> =
+        match history_step_runtimes.client_matrices.clone() {
+            Some(matrices) => {
+                let form = matrices.form().clone();
+                let objects =
+                    jetsam_node::client_objects::ClientObjects::open(&data_dir, &form, matrices)
+                        .context("open v1.5 client objects")?;
+                // Every registered matrix of the chain is wanted; client
+                // proofs kept before a restart are received again.
+                objects.want_matrices(
+                    ctx.client_registry()
+                        .entries()
+                        .iter()
+                        .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
+                );
+                let registry = ctx.client_registry().clone();
+                let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+                match jetsam_miner::install_inbound_verifier_cpu(|| {
+                    objects.reload_bundles(&registry, &rules)
+                }) {
+                    Ok(Ok(kept)) if kept > 0 => {
+                        tracing::info!(kept, "v1.5 client proofs kept across the restart")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, "kept client proofs not reloaded"),
+                    Err(error) => tracing::warn!(%error, "kept client proofs not reloaded"),
+                }
+                Some(Arc::new(objects))
+            }
+            None => None,
+        };
     let chain = Arc::new(RwLock::new(ctx));
     let initial_canonical_tip = {
         let ctx = chain.read().await;
@@ -2628,6 +2662,9 @@ async fn main() -> anyhow::Result<()> {
         p2p_background_capacity,
         cli.lan_discovery || cfg.network.lan_discovery,
         upnp_enabled,
+        client_objects.clone().map(|objects| {
+            objects as Arc<dyn jetsam_p2p::client_object_transport::ClientObjectSource>
+        }),
     )
     .context("start P2P network")?;
     let p2p_health_rx = p2p.health_receiver();
@@ -2711,6 +2748,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_history_step_runtimes = history_step_runtimes.clone();
     let p2p_external_mining_attempts = external_mining_attempts.clone();
     let p2p_canonical_tip_changes = canonical_tip_change_rx;
+    let p2p_client_objects = client_objects.clone();
     let mut p2p_event_task = tokio::spawn(async move {
         handle_p2p_events(
             p2p_events,
@@ -2726,6 +2764,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_history_step_runtimes,
             p2p_external_mining_attempts,
             p2p_canonical_tip_changes,
+            p2p_client_objects,
         )
         .await
     });
@@ -2859,6 +2898,9 @@ async fn main() -> anyhow::Result<()> {
         cli.mining_key,
         cli.allow_custom_coinbase,
         rpc_listen.ip().is_loopback(),
+        client_objects.clone().map(|objects| {
+            objects as jetsam_rpc::client_objects::SharedRpcClientObjects
+        }),
     )
     .await
     .context("start RPC server")?;
@@ -2902,6 +2944,11 @@ async fn main() -> anyhow::Result<()> {
             ),
         );
         miner.set_chain_operation_gate(Arc::clone(&wallet_operation_gate));
+        if let Some(objects) = &client_objects {
+            miner.set_client_source(
+                Arc::clone(objects) as jetsam_miner::client_slot::SharedMinerClientSource
+            );
+        }
 
         if cfg.mining.miner_address.is_empty() {
             let payout_wallet = shared_wallet.clone();
@@ -8373,6 +8420,114 @@ fn resolve_tx_gossip(
     }
 }
 
+/// Send the client-object requests the node's policy wants now (M3.8), to
+/// connected peers only (a request to an unconnected peer would dial).
+fn dispatch_client_object_requests(
+    objects: &jetsam_node::client_objects::ClientObjects,
+    p2p_cmd: &jetsam_p2p::NetworkCommandSender,
+    connected: &[libp2p::PeerId],
+) {
+    for fetch in objects.next_requests(connected, Instant::now()) {
+        let token = fetch.token;
+        if p2p_cmd
+            .try_send(jetsam_p2p::NetworkCommand::FetchClientObject {
+                token: fetch.token,
+                peer: fetch.peer,
+                request: fetch.request,
+            })
+            .is_err()
+        {
+            // The data lane is full: free the request, it is asked again.
+            objects.on_failed(token, false);
+        }
+    }
+}
+
+/// Keep the client objects in step with the chain (M3.8): every registered
+/// matrix of the chain, and of a snapshot candidate being installed, is
+/// wanted; every newly committed block — mined here or received — settles
+/// what it carried.
+async fn tend_client_objects(
+    objects: &jetsam_node::client_objects::ClientObjects,
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    manifest_registry: Option<&jetsam_chain::consensus::client_objects::ClientRegistryState>,
+    seen_height: &mut u64,
+) {
+    let (registry, tip_height, committed) = {
+        let ctx = chain.read().await;
+        let tip_height = ctx.tip_height();
+        let from = seen_height
+            .saturating_add(1)
+            .max(tip_height.saturating_sub(jetsam_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH));
+        let committed: Vec<Vec<u8>> = (from..=tip_height)
+            .filter_map(|height| ctx.store.get_recent_block(height).ok().flatten())
+            .collect();
+        (ctx.client_registry().clone(), tip_height, committed)
+    };
+    for bytes in committed {
+        if let Ok(block) = jetsam_chain::Block::from_bytes(&bytes) {
+            objects.on_block_committed(&block);
+        }
+    }
+    *seen_height = tip_height;
+    objects.want_matrices(
+        registry
+            .entries()
+            .iter()
+            .chain(manifest_registry.into_iter().flat_map(|registry| registry.entries()))
+            .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
+    );
+}
+
+/// Receive a fetched client proof bundle off the event loop (M3.8): its
+/// payment against the current state, then the pre-pass (seconds of CPU on
+/// the inbound-verification pool), then an announcement to peers.
+fn spawn_client_proof_reception(
+    objects: Arc<jetsam_node::client_objects::ClientObjects>,
+    chain: Arc<RwLock<MdbxChainContext>>,
+    mempool: AsyncMempool,
+    p2p_cmd: jetsam_p2p::NetworkCommandSender,
+    bundle: Vec<u8>,
+) {
+    tokio::spawn(async move {
+        let decoded = match jetsam_p2p::client_object_protocol::ClientProofBundle::decode(&bundle)
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::info!(%error, "fetched client proof bundle refused");
+                return;
+            }
+        };
+        if let Err(error) = mempool.check_client_payment(&decoded.payment).await {
+            tracing::info!(%error, "fetched client proof's payment refused");
+            return;
+        }
+        let registry = chain.read().await.client_registry().clone();
+        let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let received = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_inbound_verifier_cpu(|| {
+                objects.receive_bundle(&bundle, &registry, &rules)
+            })
+        })
+        .await;
+        match received {
+            Ok(Ok(Ok(announcement))) => {
+                tracing::info!(
+                    matrix_digest = %hex::encode(announcement.id.submission.matrix_digest),
+                    fee = announcement.fee,
+                    "client proof received and queued"
+                );
+                let _ = p2p_cmd
+                    .send(jetsam_p2p::NetworkCommand::AnnounceClientProof { announcement })
+                    .await;
+            }
+            Ok(Ok(Err(error))) => tracing::info!(%error, "fetched client proof refused"),
+            Ok(Err(error)) => tracing::warn!(%error, "client proof reception CPU admission failed"),
+            Err(error) => tracing::warn!(%error, "client proof reception panicked"),
+        }
+    });
+}
+
 async fn handle_p2p_events(
     mut rx: jetsam_p2p::NetworkEventReceiver,
     chain: Arc<RwLock<MdbxChainContext>>,
@@ -8387,6 +8542,7 @@ async fn handle_p2p_events(
     history_step_runtimes: EmbeddedHistoryStepRuntimes,
     external_mining_attempts: ExternalMiningAttemptInvalidator,
     mut canonical_tip_changes: tokio::sync::watch::Receiver<jetsam_p2p::object_protocol::ChainPoint>,
+    client_objects: Option<Arc<jetsam_node::client_objects::ClientObjects>>,
 ) -> anyhow::Result<()> {
     use jetsam_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
@@ -10025,6 +10181,13 @@ async fn handle_p2p_events(
 
     // Heartbeat for time-dependent checks (manifest timeout, etc.)
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(500));
+    // v1.5 client objects (M3.8): the last canonical height whose block the
+    // client objects have seen, and when they were last tended.
+    let mut client_objects_seen_height: u64 = {
+        let ctx = chain.read().await;
+        ctx.tip_height()
+    };
+    let mut client_objects_tended = Instant::now();
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await; // skip first
 
@@ -10703,6 +10866,68 @@ async fn handle_p2p_events(
                     // submitted or rejected by the local admission pipeline.
                     drop(inbound_memory_permit);
                 });
+            }
+            Ok(NetworkEvent::ClientProofAnnounced {
+                from,
+                relayed_by,
+                announcement,
+            }) => {
+                if let Some(objects) = &client_objects {
+                    objects.announced(from, announcement);
+                    if relayed_by != from {
+                        objects.announced(relayed_by, announcement);
+                    }
+                    let connected: Vec<libp2p::PeerId> =
+                        peer_failure_domains.keys().copied().collect();
+                    dispatch_client_object_requests(objects, &p2p_cmd, &connected);
+                }
+            }
+            Ok(NetworkEvent::ClientObjectFetched {
+                token, from, bytes, ..
+            }) => {
+                if let Some(objects) = &client_objects {
+                    match objects.on_fetched(token, &bytes) {
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::Bundle(bundle)) => {
+                            spawn_client_proof_reception(
+                                Arc::clone(objects),
+                                Arc::clone(&chain),
+                                mempool.clone(),
+                                p2p_cmd.clone(),
+                                bundle,
+                            );
+                        }
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::MatrixComplete(
+                            file,
+                        )) => {
+                            tracing::info!(
+                                matrix_digest = %hex::encode(file.matrix_digest),
+                                bytes = file.file_len,
+                                "registered client matrix fetched and authenticated"
+                            );
+                        }
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::Liar) => {
+                            tracing::warn!(peer = %from, "peer served bytes failing a client object's identity");
+                        }
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::Nothing) => {}
+                        Err(error) => {
+                            tracing::warn!(peer = %from, %error, "client object not stored");
+                        }
+                    }
+                    let connected: Vec<libp2p::PeerId> =
+                        peer_failure_domains.keys().copied().collect();
+                    dispatch_client_object_requests(objects, &p2p_cmd, &connected);
+                }
+            }
+            Ok(NetworkEvent::ClientObjectFetchFailed {
+                token, from, kind, ..
+            }) => {
+                if let Some(objects) = &client_objects {
+                    let liar = kind == jetsam_p2p::network::RequestFailureKind::InvalidResponse;
+                    objects.on_failed(token, liar);
+                    if liar {
+                        tracing::warn!(peer = %from, "peer served bytes failing a client object's identity");
+                    }
+                }
             }
             Ok(NetworkEvent::NewTx {
                 from,
@@ -12645,6 +12870,9 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 suffix_inventory_probe_peers.remove(&peer);
                 peer_failure_domains.remove(&peer);
+                if let Some(objects) = &client_objects {
+                    objects.forget_peer(&peer);
+                }
                 header_dag.remove_inventory_provider(peer);
                 if let Some(sync) = active_suffix_sync.as_mut() {
                     sync.disconnect(peer);
@@ -14192,6 +14420,27 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
+            if let Some(objects) = &client_objects {
+                if now.saturating_duration_since(client_objects_tended) >= Duration::from_secs(2) {
+                    client_objects_tended = now;
+                    let manifest_registry = pending_manifest.as_ref().and_then(|pending| {
+                        jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
+                            &pending.manifest.client_registry,
+                        )
+                        .ok()
+                    });
+                    tend_client_objects(
+                        objects,
+                        &chain,
+                        manifest_registry.as_ref(),
+                        &mut client_objects_seen_height,
+                    )
+                    .await;
+                    let connected: Vec<libp2p::PeerId> =
+                        peer_failure_domains.keys().copied().collect();
+                    dispatch_client_object_requests(objects, &p2p_cmd, &connected);
+                }
+            }
             dispatch_snapshot_generation_advance!();
             if let Some(pipeline) = snapshot_header_pipeline.as_mut() {
                 let mut plans = pipeline

@@ -76,6 +76,8 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 bench_prover = { path = "../bench_prover" }
+# Real test-scale client proofs for the client-object tests (M3.8).
+jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }
 tempfile = "3"
 static_assertions = "1.1"
 
