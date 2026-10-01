@@ -202,8 +202,9 @@ fn validate_header_inner(
     // and carrying the pre-fork target across the boundary would stall the chain
     // rather than slow it. See `params::V1_4_ANCHOR_TARGET`.
     //
-    // JETSAM CHANGE (v1.5): the same at the v1.5 height
-    // (`params::V1_5_ANCHOR_TARGET`), and ASERT itself bounded by height: the
+    // JETSAM CHANGE (v1.5): a derived target at the v1.5 height (half the
+    // 90-second ASERT target, `difficulty::v1_5_activation_target`), and
+    // ASERT itself bounded by height: the
     // ideal interval is 180 s from that height on, 90 s below it, so no header
     // the chain already holds is re-judged. `expected_target` is the one place
     // that logic lives; the miner's template calls the same function.

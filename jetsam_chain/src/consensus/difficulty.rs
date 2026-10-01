@@ -41,7 +41,6 @@
 use crate::consensus::params::{
     ASERT_POLYNOMIAL_FIX_HEIGHT, BLOCK_TIME, BLOCK_TIME_V1_5, GENESIS_TARGET, MAX_TARGET,
     MIN_TARGET, V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET, V1_5_ACTIVATION_HEIGHT,
-    V1_5_ANCHOR_TARGET,
 };
 
 /// BCH ASERT polynomial coefficients for `2^(f/65536)`, `f` in Q16.
@@ -53,8 +52,8 @@ const ASERT_C: u128 = 5_127;
 ///
 /// The target of a block depends on four heights: the polynomial fix, the v1.4
 /// proof-of-work (a constant target at its height, an anchor floored there),
-/// and v1.5 (a constant target at its height, an anchor floored there, and a
-/// 180-second interval from it on). Production reads [`Self::PRODUCTION`],
+/// and v1.5 (half the 90-second target at its height, an anchor floored there,
+/// and a 180-second interval from it on). Production reads [`Self::PRODUCTION`],
 /// built from the profile's constants; tests inject another schedule so an
 /// armed fork can be exercised — and real headers of another profile replayed
 /// — while the real clocks stay where they are.
@@ -72,10 +71,9 @@ pub struct DifficultySchedule {
     pub v1_4_activation: Option<u64>,
     /// The target the v1.4 activation block carries.
     pub v1_4_anchor_target: Option<[u8; 32]>,
-    /// The v1.5 height, if armed: 180-second blocks from it on.
+    /// The v1.5 height, if armed: 180-second blocks from it on, and a derived
+    /// target at it ([`v1_5_activation_target`]).
     pub v1_5_activation: Option<u64>,
-    /// The target the v1.5 activation block carries.
-    pub v1_5_anchor_target: Option<[u8; 32]>,
 }
 
 impl DifficultySchedule {
@@ -85,25 +83,23 @@ impl DifficultySchedule {
         v1_4_activation: V1_4_ACTIVATION_HEIGHT,
         v1_4_anchor_target: V1_4_ANCHOR_TARGET,
         v1_5_activation: V1_5_ACTIVATION_HEIGHT,
-        v1_5_anchor_target: V1_5_ANCHOR_TARGET,
     };
 
     /// The target a child at `height` carries verbatim, bypassing ASERT: the
-    /// v1.4 anchor at the v1.4 height, the v1.5 anchor at the v1.5 height,
-    /// nothing anywhere else. The two heights are distinct
+    /// v1.4 anchor at the v1.4 height, nothing anywhere else. The v1.5 height
+    /// has no declared target: its target is derived from ASERT
+    /// ([`v1_5_activation_target`]). The two heights are distinct
     /// (`wire_limits::tests::the_v1_5_clock_is_not_one_of_the_earlier_clocks`).
     pub const fn boundary_target(&self, height: u64) -> Option<[u8; 32]> {
-        if let Some(target) = crate::consensus::params::v1_5_boundary_target_with(
-            height,
-            self.v1_5_activation,
-            self.v1_5_anchor_target,
-        ) {
-            return Some(target);
-        }
         match (self.v1_4_activation, self.v1_4_anchor_target) {
             (Some(activation), Some(target)) if height == activation => Some(target),
             _ => None,
         }
+    }
+
+    /// Whether `height` is the armed v1.5 activation height.
+    pub const fn is_v1_5_activation(&self, height: u64) -> bool {
+        matches!(self.v1_5_activation, Some(activation) if activation == height)
     }
 
     /// ASERT anchor height for the child of the block at `current_height`
@@ -173,10 +169,38 @@ impl DifficultySchedule {
     }
 }
 
+/// The target of the first v1.5 block, derived from the 90-second rule.
+///
+/// Decision of 2026-10-01: the block at `V1_5_ACTIVATION_HEIGHT` carries the
+/// target ASERT gives it under the 90-second rule (every interval it counts
+/// ends below the height, and the halflife is 540 s on both sides), **halved**:
+/// twice the difficulty for twice the interval, at the same hashrate. Nothing
+/// is measured or carved before arming, and the activation block weighs more
+/// than its parent, so no reorg window opens at the boundary. Floored at
+/// [`MIN_TARGET`]; never easier than the ASERT input, which is itself never
+/// easier than the genesis floor.
+pub fn v1_5_activation_target(ninety_second_target: &[u8; 32]) -> [u8; 32] {
+    let mut halved = [0u8; 32];
+    for (index, byte) in halved.iter_mut().enumerate() {
+        let carry = if index + 1 < 32 {
+            ninety_second_target[index + 1] << 7
+        } else {
+            0
+        };
+        *byte = (ninety_second_target[index] >> 1) | carry;
+    }
+    if le256_lt(&halved, &MIN_TARGET) {
+        MIN_TARGET
+    } else {
+        halved
+    }
+}
+
 /// The target the child at `height` must carry, under this binary's clocks.
 ///
 /// The one function every site that builds or judges a header calls: the v1.4
-/// or v1.5 boundary target at exactly its height, the height-bounded ASERT
+/// boundary target at exactly its height, half the 90-second ASERT target at
+/// the v1.5 height ([`v1_5_activation_target`]), the height-bounded ASERT
 /// ([`next_target`]) everywhere else. `anchor_*` come from the block at
 /// [`DifficultySchedule::anchor_height`] of the parent (`asert_anchor_height`),
 /// and `parent_timestamp` is the parent's — never the child's own.
@@ -206,24 +230,29 @@ pub fn expected_target_in(
     height: u64,
     parent_timestamp: u64,
 ) -> [u8; 32] {
-    match schedule.boundary_target(height) {
-        Some(target) => target,
-        None => next_target_in(
-            schedule,
-            anchor_height,
-            anchor_timestamp,
-            anchor_target,
-            height,
-            parent_timestamp,
-        ),
+    if let Some(target) = schedule.boundary_target(height) {
+        return target;
+    }
+    let asert = next_target_in(
+        schedule,
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+        height,
+        parent_timestamp,
+    );
+    if schedule.is_v1_5_activation(height) {
+        v1_5_activation_target(&asert)
+    } else {
+        asert
     }
 }
 
 /// Compute the next difficulty target. Direct port of BCH `CalculateASERT`,
 /// bounded by height: the ideal elapsed time and the halflife are those of the
 /// rule in force for the child at `height` ([`DifficultySchedule`]). It does
-/// not apply the v1.4/v1.5 boundary targets — [`expected_target`] does, and is
-/// what a header builder or validator calls.
+/// not apply the v1.4 boundary target nor the v1.5 halving —
+/// [`expected_target`] does, and is what a header builder or validator calls.
 ///
 /// Inputs and output are 32-byte little-endian 256-bit targets.
 /// Result clamped to `[MIN_TARGET, GENESIS_TARGET]`:
@@ -271,7 +300,6 @@ fn next_target_with_fix_height(
             v1_4_activation: None,
             v1_4_anchor_target: None,
             v1_5_activation: None,
-            v1_5_anchor_target: None,
         },
         anchor_height,
         anchor_timestamp,
@@ -1535,34 +1563,35 @@ mod tests {
     fn schedule(
         polynomial_fix_height: u64,
         v1_4: Option<(u64, [u8; 32])>,
-        v1_5: Option<(u64, [u8; 32])>,
+        v1_5: Option<u64>,
     ) -> DifficultySchedule {
         DifficultySchedule {
             polynomial_fix_height,
             v1_4_activation: v1_4.map(|(h, _)| h),
             v1_4_anchor_target: v1_4.map(|(_, t)| t),
-            v1_5_activation: v1_5.map(|(h, _)| h),
-            v1_5_anchor_target: v1_5.map(|(_, t)| t),
+            v1_5_activation: v1_5,
         }
     }
 
     /// The public network's clocks as crossed: the polynomial fix at 2000, the
     /// v1.4 walk at 24 846 with its 2^235 anchor.
-    fn mainnet_schedule(v1_5: Option<(u64, [u8; 32])>) -> DifficultySchedule {
+    fn mainnet_schedule(v1_5: Option<u64>) -> DifficultySchedule {
         schedule(2000, Some((24_846, two_pow_target(235))), v1_5)
     }
 
     /// The test chain's clocks as crossed: the fix at 2000, v1.4 at 750 with
     /// the genesis target as its anchor.
-    fn testnet_schedule(v1_5: Option<(u64, [u8; 32])>) -> DifficultySchedule {
+    fn testnet_schedule(v1_5: Option<u64>) -> DifficultySchedule {
         schedule(2000, Some((750, GENESIS_TARGET)), v1_5)
     }
 
     /// The private rehearsal chain C: fix at 30, v1.4 at 60 on the genesis target.
-    fn private_c_schedule(v1_5: Option<(u64, [u8; 32])>) -> DifficultySchedule {
+    fn private_c_schedule(v1_5: Option<u64>) -> DifficultySchedule {
         schedule(30, Some((60, GENESIS_TARGET)), v1_5)
     }
 
+    /// A target for the activation block, where a test needs one as ASERT's
+    /// anchor input.
     const V1_5_TEST_ANCHOR: [u8; 32] = two_pow_target(230);
 
     /// The profile's production schedule is the one its chain actually crossed.
@@ -1576,7 +1605,6 @@ mod tests {
         // The v1.5 clock is compared on its own: dormant or armed, it must
         // never move what the earlier clocks say.
         production.v1_5_activation = None;
-        production.v1_5_anchor_target = None;
         assert_eq!(production, crossed);
     }
 
@@ -1630,9 +1658,9 @@ mod tests {
             .enumerate()
         {
             let s = match round % 3 {
-                0 => mainnet_schedule(Some((j, V1_5_TEST_ANCHOR))),
-                1 => testnet_schedule(Some((j, V1_5_TEST_ANCHOR))),
-                _ => schedule(2000, None, Some((j, V1_5_TEST_ANCHOR))),
+                0 => mainnet_schedule(Some(j)),
+                1 => testnet_schedule(Some(j)),
+                _ => schedule(2000, None, Some(j)),
             };
             let (ah, ats, at, h, ts) = random_input(&mut rng, j);
             assert!(h < j);
@@ -1650,34 +1678,53 @@ mod tests {
         }
     }
 
-    /// The first v1.5 block carries the declared anchor whatever ASERT would
-    /// say, and it is the only height that does.
+    /// Decision of 01/10: the first v1.5 block carries a DERIVED target, not
+    /// a declared one — the target the 90-second rule gives it, halved
+    /// (twice the difficulty for twice the interval), floored at
+    /// `MIN_TARGET`. Nothing to measure or carve before arming, and the
+    /// activation block weighs more than its parent. Every other height is
+    /// untouched.
     #[test]
-    fn the_v1_5_activation_block_carries_its_anchor_target() {
-        let j = 30_720u64;
-        let s = mainnet_schedule(Some((j, V1_5_TEST_ANCHOR)));
-        let mut rng = Rng(0x5EED_15A5_E271_0003);
-        for _ in 0..1_000 {
-            let (_, ats, at, _, ts) = random_input(&mut rng, 10);
-            assert_eq!(
-                expected_target_in(&s, s.anchor_height(j - 1), ats, &at, j, ts),
-                V1_5_TEST_ANCHOR
-            );
+    fn the_v1_5_activation_block_carries_half_the_90_second_target() {
+        fn halved(target: [u8; 32]) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for i in 0..32 {
+                out[i] = (target[i] >> 1) | if i + 1 < 32 { target[i + 1] << 7 } else { 0 };
+            }
+            if le256_lt(&out, &MIN_TARGET) {
+                MIN_TARGET
+            } else {
+                out
+            }
         }
-        assert_eq!(s.boundary_target(j), Some(V1_5_TEST_ANCHOR));
-        for h in [j - 1, j + 1, j + 6, 24_845, 24_847] {
-            assert_eq!(s.boundary_target(h), None, "height {h}");
+        let mut rng = Rng(0x5EED_15A5_E271_0004);
+        for j in [30_720u64, 960, 5_760, 1_000_003] {
+            let dormant = mainnet_schedule(None);
+            let armed = DifficultySchedule {
+                v1_5_activation: Some(j),
+                ..dormant
+            };
+            for _ in 0..2_000 {
+                let (_, ats, at, _, ts) = random_input(&mut rng, 10);
+                let anchor = armed.anchor_height(j - 1);
+                assert_eq!(anchor, dormant.anchor_height(j - 1));
+                let ninety = expected_target_in(&dormant, anchor, ats, &at, j, ts);
+                assert_eq!(
+                    expected_target_in(&armed, anchor, ats, &at, j, ts),
+                    halved(ninety),
+                    "J = {j}: anchor {anchor}@{ats} parent ts {ts}"
+                );
+            }
+            assert_eq!(armed.boundary_target(j), None, "no declared v1.5 target");
+            // Only the activation height is halved.
+            for h in [j - 1, j + 1, j + 6] {
+                assert!(!armed.is_v1_5_activation(h), "height {h}");
+            }
+            // The v1.4 boundary is untouched by the v1.5 one.
+            assert_eq!(armed.boundary_target(24_846), Some(two_pow_target(235)));
         }
-        // The v1.4 boundary is untouched by the v1.5 one.
-        assert_eq!(s.boundary_target(24_846), Some(two_pow_target(235)));
-        // Armed without its target (forbidden by the wire_limits guard), no
-        // height bypasses ASERT.
-        let half = schedule(2000, None, None);
-        let half = DifficultySchedule {
-            v1_5_activation: Some(j),
-            ..half
-        };
-        assert_eq!(half.boundary_target(j), None);
+        // The halving never goes below the hardest target.
+        assert_eq!(halved(MIN_TARGET), MIN_TARGET);
     }
 
     /// From J the anchor is never below J: the first v1.5 children are
@@ -1685,7 +1732,7 @@ mod tests {
     #[test]
     fn the_v1_5_activation_floors_the_asert_anchor() {
         for j in [30_720u64, 30_721, 30_725] {
-            let s = mainnet_schedule(Some((j, V1_5_TEST_ANCHOR)));
+            let s = mainnet_schedule(Some(j));
             for parent in (j - 30)..j {
                 assert_eq!(
                     s.anchor_height(parent),
@@ -1713,7 +1760,7 @@ mod tests {
         assert_eq!(BLOCK_TIME_V1_5, 180);
         assert_eq!(HALFLIFE_V1_5, 540);
         let j = 30_720u64;
-        let s = mainnet_schedule(Some((j, V1_5_TEST_ANCHOR)));
+        let s = mainnet_schedule(Some(j));
         let anchor_ts = 1_800_000_000u64;
         let anchor = V1_5_TEST_ANCHOR;
         let double = two_pow_target(231);
@@ -1763,7 +1810,7 @@ mod tests {
     #[test]
     fn the_ideal_elapsed_time_sums_each_interval_under_its_own_rule() {
         let j = 1_000u64;
-        let s = schedule(2000, None, Some((j, V1_5_TEST_ANCHOR)));
+        let s = schedule(2000, None, Some(j));
         // Intervals of blocks 991..=999: nine at 90 s.
         assert_eq!(s.ideal_elapsed(990, 1_000), 9 * 90);
         // Intervals of blocks 991..=1000: nine at 90 s, block 1000's at 180 s.
@@ -1874,7 +1921,7 @@ mod tests {
         let cases: [(
             &str,
             &[(u64, u64, [u8; 32])],
-            fn(Option<(u64, [u8; 32])>) -> DifficultySchedule,
+            fn(Option<u64>) -> DifficultySchedule,
             usize,
         ); 3] = [
             (
@@ -1895,7 +1942,7 @@ mod tests {
             let dormant = replay_headers(rows, &make(None));
             assert_eq!(dormant, expected, "{name}: children replayed");
             let j = j_above(rows);
-            let armed = replay_headers(rows, &make(Some((j, V1_5_TEST_ANCHOR))));
+            let armed = replay_headers(rows, &make(Some(j)));
             assert_eq!(armed, expected, "{name}: children replayed with J = {j}");
         }
     }
@@ -1911,7 +1958,7 @@ mod tests {
     fn full_header_dump_replays_through_the_bounded_rule() {
         let path = std::env::var("JETSAM_ASERT_REPLAY").expect("JETSAM_ASERT_REPLAY=<file>");
         let profile = std::env::var("JETSAM_ASERT_REPLAY_PROFILE").expect("profile");
-        let make: fn(Option<(u64, [u8; 32])>) -> DifficultySchedule = match profile.as_str() {
+        let make: fn(Option<u64>) -> DifficultySchedule = match profile.as_str() {
             "mainnet" => mainnet_schedule,
             "testnet" => testnet_schedule,
             other => panic!("unknown profile {other}"),
@@ -1920,12 +1967,12 @@ mod tests {
         let tip = rows.iter().map(|r| r.0).max().expect("rows");
         let dormant = replay_headers(&rows, &make(None));
         let j = j_above(&rows);
-        let armed = replay_headers(&rows, &make(Some((j, V1_5_TEST_ANCHOR))));
+        let armed = replay_headers(&rows, &make(Some(j)));
         // Not a silent watcher: armed INSIDE the history, the same replay must
         // see the 180-second rule disagree with the chain past that height.
         let inside = (tip / 2 / 960 + 1) * 960;
         let (_, diverged) =
-            replay_headers_counting(&rows, &make(Some((inside, V1_5_TEST_ANCHOR))), false);
+            replay_headers_counting(&rows, &make(Some(inside)), false);
         println!(
             "REPLAY {profile} {path}: {} headers, tip {tip}, children replayed dormant={dormant} \
              armed(J={j})={armed}, mismatches=0; armed inside (J={inside}): {diverged} of \

@@ -374,23 +374,6 @@ mod tests {
         );
     }
 
-    /// The v1.5 height changes the block interval, and its first block carries
-    /// a declared target (`params::V1_5_ANCHOR_TARGET`). A height without the
-    /// target hands the activation block a target computed for 90-second
-    /// blocks under a 180-second rule; a target without the height is a value
-    /// nothing reads. Armed together or not at all, like the v1.4 pair above.
-    /// The value itself is range-checked at compile time beside the constant.
-    #[test]
-    fn the_v1_5_fork_cannot_be_armed_without_its_anchor_target() {
-        use crate::consensus::params::{V1_5_ACTIVATION_HEIGHT, V1_5_ANCHOR_TARGET};
-        assert_eq!(
-            V1_5_ACTIVATION_HEIGHT.is_some(),
-            V1_5_ANCHOR_TARGET.is_some(),
-            "V1_5_ACTIVATION_HEIGHT and V1_5_ANCHOR_TARGET are armed together or not \
-             at all"
-        );
-    }
-
     /// Hanging v1.5 off an earlier clock would arm it retroactively and
     /// re-judge payouts the chain has already made.
     #[test]

@@ -89,7 +89,7 @@ pub const HALFLIFE_V1_5: u64 = 540;
 ///
 /// "The interval of block `h`" is the one that ends with it, from `h - 1` to
 /// `h`. The activation block's own interval is therefore a v1.5 one, which is
-/// what its anchor target ([`V1_5_ANCHOR_TARGET`]) is calibrated for.
+/// what its derived target (half the 90-second one) is calibrated for.
 #[inline]
 pub const fn block_time_at(height: u64) -> u64 {
     block_time_at_with(height, V1_5_ACTIVATION_HEIGHT)
@@ -121,70 +121,22 @@ pub const fn halflife_at_with(height: u64, v1_5_activation: Option<u64>) -> u64 
     }
 }
 
-/// The ASERT target the block at [`V1_5_ACTIVATION_HEIGHT`] carries, verbatim.
-///
-/// # Why a constant at the v1.5 height
+/// The target of the block at [`V1_5_ACTIVATION_HEIGHT`] is **derived, not
+/// declared** (decision of 2026-10-01): the ASERT target the 90-second rule
+/// gives it, halved (`difficulty::v1_5_activation_target`).
 ///
 /// The interval doubles at that height. ASERT anchors on the **parent's**
 /// timestamp and measures elapsed time against the ideal of the rule in force,
-/// so a target carried across the boundary would be calibrated for 90-second
-/// blocks: the first v1.5 blocks would come about twice too fast until ASERT
-/// had walked the difficulty up, roughly one halflife. Declaring the first
-/// target, on the model of [`V1_4_ANCHOR_TARGET`], removes that transient; from
-/// `activation + 1` on, ASERT resumes at 180 s against an anchor floored at the
-/// activation height (`header::asert_anchor_height`).
-///
-/// # The alternative not taken (to weigh before arming)
-///
-/// The proof-of-work does not change at v1.5, unlike v1.4: the equilibrium
-/// target at 180 s is simply half the one at 90 s at the same hashrate. The
-/// block at the activation height could therefore carry a *derived* target —
-/// the ASERT target the 90-second rule gives it, halved — with no measurement
-/// to take and no number to carve. It would also keep the activation block
-/// heavier than its parent rather than lighter, so no reorg window opens at the
-/// boundary (see the work discussion on [`V1_4_ANCHOR_TARGET`]). The M3 plan
-/// asked for a declared target, so that is what is here; the derived rule is a
-/// small change in `difficulty::DifficultySchedule::boundary_target` if the
-/// operator prefers it.
-///
-/// # Arming
-///
-/// `None` while the fork is dormant. Armed together with
-/// [`V1_5_ACTIVATION_HEIGHT`] or not at all
-/// (`wire_limits::tests::the_v1_5_fork_cannot_be_armed_without_its_anchor_target`),
-/// and refused at compile time outside [`anchor_target_is_mineable`]. The value
-/// is read from the network's measured target just before arming: about half
-/// the live 90-second target (twice the difficulty), eased as the operator
-/// sees fit — easier is a burst of fast blocks, harder is a stall.
-#[cfg(not(feature = "testnet"))]
-pub const V1_5_ANCHOR_TARGET: Option<[u8; 32]> = None;
-
-/// Dormant on the test chain as well, declared per profile like
-/// [`V1_4_ANCHOR_TARGET`]. ⚠️ The public network must never copy the test
-/// chain's value: each is read from its own network's measured target.
-#[cfg(feature = "testnet")]
-pub const V1_5_ANCHOR_TARGET: Option<[u8; 32]> = None;
-
-/// The target the block at `height` carries verbatim at the v1.5 boundary:
-/// [`V1_5_ANCHOR_TARGET`] at exactly [`V1_5_ACTIVATION_HEIGHT`], `None`
-/// everywhere else and everywhere while the fork is dormant.
-#[inline]
-pub const fn v1_5_boundary_target(height: u64) -> Option<[u8; 32]> {
-    v1_5_boundary_target_with(height, V1_5_ACTIVATION_HEIGHT, V1_5_ANCHOR_TARGET)
-}
-
-/// Testable twin of [`v1_5_boundary_target`] with the clock and target injected.
-#[inline]
-pub const fn v1_5_boundary_target_with(
-    height: u64,
-    activation: Option<u64>,
-    anchor_target: Option<[u8; 32]>,
-) -> Option<[u8; 32]> {
-    match (activation, anchor_target) {
-        (Some(activation), Some(target)) if height == activation => Some(target),
-        _ => None,
-    }
-}
+/// so a target carried across the boundary unchanged would be calibrated for
+/// 90-second blocks: the first v1.5 blocks would come about twice too fast
+/// until ASERT had walked the difficulty up, roughly one halflife. The
+/// proof-of-work does not change at v1.5 (unlike v1.4), so the equilibrium
+/// target at 180 s is simply half the one at 90 s at the same hashrate: the
+/// activation block carries exactly that, with no measurement to take and no
+/// number to carve before arming. It is also heavier than its parent, so no
+/// reorg window opens at the boundary. From `activation + 1` on, ASERT resumes
+/// at 180 s against an anchor floored at the activation height
+/// (`header::asert_anchor_height`).
 
 /// Dormant hardfork: first block height whose ASERT target is computed with
 /// the corrected `2^(frac/65536)` polynomial. **`u64::MAX` means "never".**
@@ -457,7 +409,7 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 /// * The block interval ([`block_time_at`], 90 → 180 s) and everything that
 ///   reads it: the ASERT ideal elapsed time (`difficulty::DifficultySchedule`),
 ///   the ASERT anchor, floored at this height, the target of this height itself
-///   ([`V1_5_ANCHOR_TARGET`]), and the miner's proof-time budget. The halflife
+///   (derived: half the 90-second ASERT target), and the miner's proof-time budget. The halflife
 ///   stays 540 s in seconds ([`HALFLIFE_V1_5`]).
 ///
 /// The rest of v1.5 — the m = 25 packs, the client slot — joins this clock in
@@ -1093,19 +1045,6 @@ const _: () = assert!(
     "V1_4_ANCHOR_TARGET must lie in [MIN_TARGET, GENESIS_TARGET]: below it the \
      activation block can never be mined and the chain stops there for good, \
      above it that block carries a weight the difficulty ladder never issues"
-);
-
-/// The same range check for the v1.5 anchor: a zero, reversed or copied-too-hard
-/// target stops the chain at the v1.5 height exactly as it would have at v1.4,
-/// and the same floor ([`V1_4_ANCHOR_FLOOR`], 2^226) separates a target a network
-/// could plausibly be mining under the walked digest from a slip.
-const _: () = assert!(
-    match V1_5_ANCHOR_TARGET {
-        Some(target) => anchor_target_is_mineable(target),
-        None => true,
-    },
-    "V1_5_ANCHOR_TARGET must lie in [V1_4_ANCHOR_FLOOR, GENESIS_TARGET]: outside it \
-     the v1.5 activation block is unmineable or weighs nothing the ladder issues"
 );
 
 /// The target a block at `height` carries verbatim, bypassing ASERT.
@@ -1863,36 +1802,6 @@ mod tests {
                 halflife_at(height),
                 halflife_at_with(height, V1_5_ACTIVATION_HEIGHT)
             );
-        }
-    }
-
-    /// Exactly one height carries the v1.5 anchor target, and only when the
-    /// height and the target are both declared.
-    #[test]
-    fn only_the_v1_5_activation_block_carries_the_v1_5_anchor() {
-        const J: u64 = 30_720;
-        let target = two_pow_target(230);
-        assert_eq!(
-            v1_5_boundary_target_with(J, Some(J), Some(target)),
-            Some(target)
-        );
-        for height in [0, J - 1, J + 1, J + 6, u64::MAX] {
-            assert_eq!(
-                v1_5_boundary_target_with(height, Some(J), Some(target)),
-                None
-            );
-        }
-        assert_eq!(v1_5_boundary_target_with(J, None, Some(target)), None);
-        assert_eq!(v1_5_boundary_target_with(J, Some(J), None), None);
-        match (V1_5_ACTIVATION_HEIGHT, V1_5_ANCHOR_TARGET) {
-            (Some(activation), Some(anchor)) => {
-                assert_eq!(v1_5_boundary_target(activation), Some(anchor))
-            }
-            _ => {
-                for height in [0, 1, 30_720, u64::MAX] {
-                    assert!(v1_5_boundary_target(height).is_none());
-                }
-            }
         }
     }
 
