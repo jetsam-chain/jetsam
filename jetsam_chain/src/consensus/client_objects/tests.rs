@@ -1385,3 +1385,45 @@ fn installed_rules_are_scoped_to_the_test_thread() {
     }
     assert_eq!(ClientObjectRules::current(), ClientObjectRules::CONSENSUS);
 }
+
+// ---------------------------------------------------------------------------
+// Mempool policy for plain transactions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_plain_transaction_neither_spends_a_locked_owner_nor_pays_an_object() {
+    let rules = burn_rules();
+    let pages = |owner: Address, outputs: &[(Address, u64)]| -> Vec<jetsam_tx::TxPage> {
+        logical(100, owner, outputs, 10)
+            .into_iter()
+            .map(|tx| jetsam_tx::TxPage { body: tx.body })
+            .collect()
+    };
+    let marker = ClientObject::Registration(registration(1)).marker();
+    let ordinary = pages(PAYER, &[(TREASURY, 5)]);
+    let burn = pages(PAYER, &[(CLIENT_LICENSE_BURN_ADDRESS, 5)]);
+    let from_burn = pages(CLIENT_LICENSE_BURN_ADDRESS, &[(PAYER, 5)]);
+    let paying = pages(PAYER, &[(CLIENT_LICENSE_BURN_ADDRESS, 5), (marker, 0)]);
+
+    for height in [ACTIVATION, HEIGHT] {
+        assert_eq!(check_plain_transaction(&ordinary, height, &rules), Ok(()));
+        assert_eq!(check_plain_transaction(&burn, height, &rules), Ok(()));
+        assert_eq!(
+            check_plain_transaction(&from_burn, height, &rules),
+            Err(ClientObjectError::SpendFromLockedAddress {
+                owner: CLIENT_LICENSE_BURN_ADDRESS
+            })
+        );
+        assert_eq!(
+            check_plain_transaction(&paying, height, &rules),
+            Err(ClientObjectError::PaymentWithoutObject)
+        );
+    }
+    // Below the v1.5 height: nothing is interpreted.
+    for pages in [&ordinary, &burn, &from_burn, &paying] {
+        assert_eq!(
+            check_plain_transaction(pages, ACTIVATION - 1, &rules),
+            Ok(())
+        );
+    }
+}

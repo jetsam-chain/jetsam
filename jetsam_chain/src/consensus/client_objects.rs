@@ -907,6 +907,9 @@ pub enum ClientObjectError {
     SubmissionNotCarried,
     /// The block's transactions are not a canonical page stream.
     PageStream,
+    /// A paying transaction offered alone: it is minable only together with
+    /// the object its marker names, and travels with it.
+    PaymentWithoutObject,
 }
 
 impl std::fmt::Display for ClientObjectError {
@@ -1095,6 +1098,34 @@ fn check_license_paid(
                 paid: paid as u64,
             });
         }
+    }
+    Ok(())
+}
+
+/// Mempool policy for one plain logical transaction (`pages`) offered for
+/// the block at `next_height`: a spend from a locked owner can never be mined,
+/// and a paying transaction (one with a marker) is mined only with its object.
+pub fn check_plain_transaction(
+    pages: &[jetsam_tx::TxPage],
+    next_height: u64,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    if !rules.active_at(next_height) {
+        return Ok(());
+    }
+    if let Some(owner) = pages
+        .iter()
+        .map(|page| page.body.input_owner)
+        .find(is_client_locked_address)
+    {
+        return Err(ClientObjectError::SpendFromLockedAddress { owner });
+    }
+    if pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs())
+        .any(|(_, output)| client_object_marker_kind(&output.owner).is_some())
+    {
+        return Err(ClientObjectError::PaymentWithoutObject);
     }
     Ok(())
 }
