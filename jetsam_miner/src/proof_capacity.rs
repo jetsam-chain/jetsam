@@ -267,8 +267,28 @@ impl AdaptiveProofCapacity {
     }
 
     /// The same, over one named relation's ladder.
+    ///
+    /// JETSAM CHANGE (v1.5): the budget is the interval of the block being
+    /// built, read at its own height — 90 s below the v1.5 height, 180 s from
+    /// it on. It is what admits the large class at m = 25: judged against 90 s
+    /// a v1.5 large-class preparation could never fit.
     pub fn page_limit_in(&self, generation: HistoryStepPackGeneration, height: u64) -> usize {
-        let target_ms = target_prepare_ms();
+        self.page_limit_at_interval(
+            generation,
+            height,
+            jetsam_chain::consensus::params::block_time_at(height),
+        )
+    }
+
+    /// [`Self::page_limit_in`] with the block interval, in seconds, given
+    /// rather than read from the clock (tests of an armed v1.5 interval).
+    pub fn page_limit_at_interval(
+        &self,
+        generation: HistoryStepPackGeneration,
+        height: u64,
+        block_time_secs: u64,
+    ) -> usize {
+        let target_ms = target_prepare_ms(block_time_secs);
         let b255_fits = match self.b255_prepare_ms_ewma {
             Some(measured_ms) => measured_ms <= target_ms,
             None => self
@@ -311,9 +331,11 @@ impl AdaptiveProofCapacity {
     }
 }
 
+/// The whole interval, in milliseconds, of a block whose interval is
+/// `block_time_secs`.
 #[inline]
-fn target_prepare_ms() -> f64 {
-    jetsam_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0
+fn target_prepare_ms(block_time_secs: u64) -> f64 {
+    block_time_secs as f64 * 1_000.0
 }
 
 /// Share of the block interval a preparation may consume before whatever is
@@ -326,8 +348,23 @@ const PREPARATION_INTERVAL_SHARE_BEFORE_ALARM: f64 = 2.0 / 3.0;
 /// keeps its class and merely becomes too slow to use it changes nothing an
 /// operator can see: it simply stops finding blocks, during exactly the busy
 /// stretch that made its templates large. This is the line that says so.
-pub fn preparation_starves_proof_of_work(elapsed: Duration) -> bool {
-    elapsed.as_secs_f64() * 1_000.0 > target_prepare_ms() * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM
+///
+/// JETSAM CHANGE (v1.5): against the interval of the block at `child_height`:
+/// 60 s of a 90-second block, 120 s of a 180-second one.
+pub fn preparation_starves_proof_of_work(elapsed: Duration, child_height: u64) -> bool {
+    preparation_starves_proof_of_work_at_interval(
+        elapsed,
+        jetsam_chain::consensus::params::block_time_at(child_height),
+    )
+}
+
+/// [`preparation_starves_proof_of_work`] with the interval given in seconds.
+pub fn preparation_starves_proof_of_work_at_interval(
+    elapsed: Duration,
+    block_time_secs: u64,
+) -> bool {
+    elapsed.as_secs_f64() * 1_000.0
+        > target_prepare_ms(block_time_secs) * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM
 }
 
 /// Assumed cost of a large-class preparation, as a multiple of a small one.
@@ -428,6 +465,80 @@ mod tests {
 
     /// Height used by tests that are about timing, not about the fork.
     const ANY_HEIGHT: u64 = 4004;
+
+    /// The interval the measurements below were taken under: the released
+    /// 90 s, which is the interval at [`ANY_HEIGHT`] on this build's clock.
+    const RELEASED_INTERVAL: u64 = jetsam_chain::consensus::params::BLOCK_TIME;
+
+    /// The budget is the interval of the block being built, at its own height:
+    /// the production entry points read the clock, and agree with the
+    /// interval-taking twins at every height.
+    #[test]
+    fn the_preparation_budget_is_the_interval_of_the_block_being_built() {
+        use jetsam_chain::consensus::params::block_time_at;
+        let mut capacity = capacity_capped_at(255);
+        capacity.observe_preparation(BlockProofClass::B255, millis(100_000));
+        for height in [0u64, 1, ANY_HEIGHT, 30_720, 1_000_000] {
+            let generation = HistoryStepPackGeneration::at_height(height);
+            assert_eq!(
+                capacity.page_limit(height),
+                capacity.page_limit_at_interval(generation, height, block_time_at(height))
+            );
+            for elapsed in [59_000u64, 61_000, 119_000, 121_000] {
+                assert_eq!(
+                    preparation_starves_proof_of_work(millis(elapsed), height),
+                    preparation_starves_proof_of_work_at_interval(
+                        millis(elapsed),
+                        block_time_at(height)
+                    )
+                );
+            }
+        }
+    }
+
+    /// At 180 s (v1.5) a large-class preparation of 100 s fits — it is what
+    /// lets an m = 25 node keep the large class — while against 90 s it did
+    /// not; and the alarm moves from 60 s to 120 s.
+    #[test]
+    fn at_the_v1_5_interval_the_large_class_fits_up_to_180_s_and_the_alarm_is_at_120_s() {
+        use jetsam_chain::consensus::params::{block_time_at_with, BLOCK_TIME_V1_5};
+        const J: u64 = 30_720;
+        assert_eq!(block_time_at_with(J, Some(J)), BLOCK_TIME_V1_5);
+        let mut capacity = capacity_capped_at(255);
+        capacity.observe_preparation(BlockProofClass::B255, millis(100_000));
+        assert_eq!(
+            capacity.page_limit_at_interval(any_height_generation(), ANY_HEIGHT, RELEASED_INTERVAL),
+            small_pages()
+        );
+        assert_eq!(
+            capacity.page_limit_at_interval(any_height_generation(), ANY_HEIGHT, BLOCK_TIME_V1_5),
+            255
+        );
+        // Past the whole 180 s interval: the large class is refused again.
+        let mut too_slow = capacity_capped_at(255);
+        too_slow.observe_preparation(BlockProofClass::B255, millis(180_001));
+        assert_eq!(
+            too_slow.page_limit_at_interval(any_height_generation(), ANY_HEIGHT, BLOCK_TIME_V1_5),
+            small_pages()
+        );
+        // The alarm: two thirds of the interval.
+        assert!(!preparation_starves_proof_of_work_at_interval(
+            millis(60_000),
+            RELEASED_INTERVAL
+        ));
+        assert!(preparation_starves_proof_of_work_at_interval(
+            millis(60_001),
+            RELEASED_INTERVAL
+        ));
+        assert!(!preparation_starves_proof_of_work_at_interval(
+            millis(120_000),
+            BLOCK_TIME_V1_5
+        ));
+        assert!(preparation_starves_proof_of_work_at_interval(
+            millis(120_001),
+            BLOCK_TIME_V1_5
+        ));
+    }
 
     const B25_TERMINAL_BYTES: usize = 971_732;
     const B255_TERMINAL_BYTES: usize = 1_081_108;
@@ -718,7 +829,7 @@ mod tests {
     #[test]
     fn the_machine_that_proved_a_real_b255_block_is_allowed_to_try_one() {
         assert!(
-            MEASURED_B255_PREPARE_MS < target_prepare_ms() as u64,
+            MEASURED_B255_PREPARE_MS < target_prepare_ms(RELEASED_INTERVAL) as u64,
             "this machine really did prove the large class inside the interval"
         );
 
@@ -733,31 +844,48 @@ mod tests {
     /// limit has not moved, because the limit only moves when the class does.
     #[test]
     fn a_preparation_that_eats_the_interval_is_reported_even_when_the_class_holds() {
-        let interval_ms = target_prepare_ms() as u64;
+        let interval_ms = target_prepare_ms(RELEASED_INTERVAL) as u64;
 
         // The measured large class on the reference machine: 65 % of the
         // interval. Tight, but it left a third of it to mine in and it did
         // produce blocks — routine, not worth a warning.
-        assert!(!preparation_starves_proof_of_work(millis(58_816)));
+        assert!(!preparation_starves_proof_of_work(
+            millis(58_816),
+            ANY_HEIGHT
+        ));
 
         // A node admitted at the top of the band whose real ratio is worse:
         // 30 s of small class at a true ratio of 2.9 is 87 s of large class,
         // and the nonce search gets what is left of ninety.
-        assert!(preparation_starves_proof_of_work(millis(87_000)));
+        assert!(preparation_starves_proof_of_work(
+            millis(87_000),
+            ANY_HEIGHT
+        ));
 
         // The boundary belongs to the healthy side.
-        let boundary = (target_prepare_ms() * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM) as u64;
-        assert!(!preparation_starves_proof_of_work(millis(boundary)));
-        assert!(preparation_starves_proof_of_work(millis(boundary + 1)));
-        assert!(preparation_starves_proof_of_work(millis(interval_ms)));
+        let boundary =
+            (target_prepare_ms(RELEASED_INTERVAL) * PREPARATION_INTERVAL_SHARE_BEFORE_ALARM) as u64;
+        assert!(!preparation_starves_proof_of_work(
+            millis(boundary),
+            ANY_HEIGHT
+        ));
+        assert!(preparation_starves_proof_of_work(
+            millis(boundary + 1),
+            ANY_HEIGHT
+        ));
+        assert!(preparation_starves_proof_of_work(
+            millis(interval_ms),
+            ANY_HEIGHT
+        ));
     }
 
     /// Recovering the pessimism must not turn into recklessness: a node whose
     /// large-class preparation would run past the interval still gets 25.
     #[test]
     fn a_node_too_slow_for_the_large_class_is_still_refused() {
-        let far_too_slow =
-            (target_prepare_ms() / measured_class_work_ratio()).ceil() as u64 + 10_000;
+        let far_too_slow = (target_prepare_ms(RELEASED_INTERVAL) / measured_class_work_ratio())
+            .ceil() as u64
+            + 10_000;
         let mut capacity = capacity_capped_at(255);
         capacity.observe_preparation(BlockProofClass::B25, millis(far_too_slow));
         assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
@@ -768,7 +896,8 @@ mod tests {
         let mut capacity = capacity_capped_at(255);
         assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 
-        let predicted_b255_boundary = (target_prepare_ms() / PREDICTED_B255_WORK_RATIO).round() as u64;
+        let predicted_b255_boundary =
+            (target_prepare_ms(RELEASED_INTERVAL) / PREDICTED_B255_WORK_RATIO).round() as u64;
         capacity.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary + 1));
         assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 
@@ -801,7 +930,7 @@ mod tests {
 
         capacity.observe_preparation(
             BlockProofClass::B255,
-            millis(target_prepare_ms() as u64 + 1),
+            millis(target_prepare_ms(RELEASED_INTERVAL) as u64 + 1),
         );
         assert_eq!(capacity.page_limit(ANY_HEIGHT), small_pages());
 

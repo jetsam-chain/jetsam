@@ -62,6 +62,9 @@ use crate::wallet_submit::{
 /// at the young-network difficulty. A 30 s TTL expired the node-owned template
 /// before such a miner could ever submit, wasting every solution it found. The
 /// TTL must exceed one block interval; the compile-time guard below pins that.
+///
+/// This is the lifetime of a template for a block below the v1.5 height; see
+/// [`external_mining_template_ttl`].
 const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(120);
 
 const _: () = assert!(
@@ -69,6 +72,41 @@ const _: () = assert!(
     "external template TTL must exceed one block interval, or a slow miner can never \
      complete a template within its validity window"
 );
+
+/// The lifetime of a template for a block at or above the v1.5 height: 240 s.
+///
+/// JETSAM CHANGE (v1.5): the interval doubles to 180 s, and at an unchanged
+/// hashrate ASERT doubles the difficulty with it, so the same modest external
+/// miner needs about twice as long to find a nonce. 120 s would sit below one
+/// interval and expire templates such a miner was about to solve — exactly the
+/// failure the 30 s → 120 s change above fixed. 240 s keeps the released ratio
+/// (4/3 of the interval). A template is only ever served while its parent is
+/// the tip, so a longer lifetime never hands out work on a stale parent.
+const EXTERNAL_MINING_TEMPLATE_TTL_V1_5: Duration = Duration::from_secs(240);
+
+const _: () = assert!(
+    EXTERNAL_MINING_TEMPLATE_TTL_V1_5.as_secs() > jetsam_chain::consensus::params::BLOCK_TIME_V1_5,
+    "the v1.5 external template TTL must exceed one v1.5 block interval"
+);
+
+/// The lifetime of an external template for the block at `child_height`:
+/// read at that block's own height, so every template below the v1.5 height
+/// keeps the released 120 s.
+const fn external_mining_template_ttl(child_height: u64) -> Duration {
+    external_mining_template_ttl_for_interval(jetsam_chain::consensus::params::block_time_at(
+        child_height,
+    ))
+}
+
+/// The lifetime for a block whose interval is `block_time_secs`: 120 s for the
+/// released 90-second block, 240 s for the 180-second one.
+const fn external_mining_template_ttl_for_interval(block_time_secs: u64) -> Duration {
+    if block_time_secs > jetsam_chain::consensus::params::BLOCK_TIME {
+        EXTERNAL_MINING_TEMPLATE_TTL_V1_5
+    } else {
+        EXTERNAL_MINING_TEMPLATE_TTL
+    }
+}
 
 // --- OVERLAP ---------------------------------------------------------------
 // The PoW work (pow_fields + target) is fully determined BEFORE the HistoryStep
@@ -177,7 +215,8 @@ fn take_pow_preview(tip_height: u64, tip_id: [u8; 32]) -> Option<BlockTemplateRe
         return None;
     }
     let age = preview.published_at.elapsed();
-    if age >= EXTERNAL_MINING_TEMPLATE_TTL {
+    let ttl = external_mining_template_ttl(preview.parent_height.saturating_add(1));
+    if age >= ttl {
         return None;
     }
     // The stored response was built when the preview was published, so its
@@ -185,7 +224,7 @@ fn take_pow_preview(tip_height: u64, tip_id: [u8; 32]) -> Option<BlockTemplateRe
     // template 40 s later would hand its miners work it believes has 120 s left
     // and watch it die at 80. Restate the lifetime as it actually is.
     let mut response = preview.response.clone();
-    response.ttl_remaining_ms = (EXTERNAL_MINING_TEMPLATE_TTL - age).as_millis() as u64;
+    response.ttl_remaining_ms = (ttl - age).as_millis() as u64;
     Some(response)
 }
 
@@ -1036,7 +1075,9 @@ impl ExternalMiningPreparationLease {
         now: Instant,
     ) -> Result<(), String> {
         let expires_at = now
-            .checked_add(EXTERNAL_MINING_TEMPLATE_TTL)
+            .checked_add(external_mining_template_ttl(
+                parent_height.saturating_add(1),
+            ))
             .ok_or_else(|| "external template expiry overflow".to_string())?;
         let retained_bytes = prepared.retained_bytes();
         self.attempts
@@ -1644,7 +1685,7 @@ impl RpcHandler {
             nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: hex::encode(diff_target),
             height,
-            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            expires_in_seconds: external_mining_template_ttl(height).as_secs(),
             n_txs,
             pow_walk: jetsam_chain::consensus::params::v1_4_active(height),
             tx_input_counts: tx_input_counts.clone(),
@@ -1658,7 +1699,7 @@ impl RpcHandler {
             state: "preview".to_string(),
             // Freshly published, so the whole window is genuinely left. Every
             // later re-serving recomputes this from the publication instant.
-            ttl_remaining_ms: EXTERNAL_MINING_TEMPLATE_TTL.as_millis() as u64,
+            ttl_remaining_ms: external_mining_template_ttl(height).as_millis() as u64,
             difficulty: difficulty_from_target(&diff_target),
         };
         publish_pow_preview(&early_template, preview_parent_height, preview_parent_id);
@@ -1764,7 +1805,7 @@ impl RpcHandler {
             nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: hex::encode(diff_target),
             height,
-            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            expires_in_seconds: external_mining_template_ttl(height).as_secs(),
             n_txs,
             pow_walk: jetsam_chain::consensus::params::v1_4_active(height),
             tx_input_counts,
@@ -1780,7 +1821,7 @@ impl RpcHandler {
             // Measured from publication, not assumed: proving took real time,
             // and a pool told it had the full window would hand out work that
             // dies under its miners.
-            ttl_remaining_ms: EXTERNAL_MINING_TEMPLATE_TTL
+            ttl_remaining_ms: external_mining_template_ttl(height)
                 .saturating_sub(preview_published_at.elapsed())
                 .as_millis() as u64,
             difficulty: difficulty_from_target(&diff_target),
@@ -4236,6 +4277,30 @@ mod access_control_tests {
             decimal_from_le_u256(&high),
             "452312848583266388373324160190187140051835877600158453279131187530910662656"
         );
+    }
+
+    /// Below the v1.5 height a template lives the released 120 s; from it on,
+    /// 240 s, more than one 180-second interval. Production reads the clock at
+    /// the template's own height.
+    #[test]
+    fn the_template_lifetime_follows_the_interval_of_its_block() {
+        use jetsam_chain::consensus::params::{block_time_at, block_time_at_with};
+        const J: u64 = 30_720;
+        assert_eq!(
+            external_mining_template_ttl_for_interval(block_time_at_with(J - 1, Some(J))),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            external_mining_template_ttl_for_interval(block_time_at_with(J, Some(J))),
+            Duration::from_secs(240)
+        );
+        for height in [0u64, 7, 24_846, J, 1_000_000] {
+            assert_eq!(
+                external_mining_template_ttl(height),
+                external_mining_template_ttl_for_interval(block_time_at(height))
+            );
+            assert!(external_mining_template_ttl(height).as_secs() > block_time_at(height));
+        }
     }
 
     #[test]

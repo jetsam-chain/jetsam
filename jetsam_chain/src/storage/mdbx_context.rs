@@ -2855,10 +2855,10 @@ mod tests {
         let timestamp = parent.timestamp.saturating_add(1);
         let anchor = context.anchor_info().unwrap();
         // JETSAM CHANGE: ASERT is anchored on the parent's timestamp, never on
-        // the block's own. This helper must feed `next_target` exactly what
-        // `validate_header_inner` will, or every block it builds is rejected
-        // with BadDifficultyTarget.
-        let target = crate::consensus::next_target(
+        // the block's own. This helper calls `expected_target`, the function
+        // `validate_header_inner` calls, so the blocks it builds carry exactly
+        // the target the validator demands.
+        let target = crate::consensus::expected_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
             &anchor.anchor_target,
@@ -2998,7 +2998,7 @@ mod tests {
             &[parent.active_slot_count],
             vec![],
             jetsam_poseidon2b::primitives::Address([0x44; 32]),
-            parent.timestamp + crate::consensus::params::BLOCK_TIME,
+            parent.timestamp + crate::consensus::params::block_time_at(parent.height + 1),
             [0; 32],
         )
         .unwrap();

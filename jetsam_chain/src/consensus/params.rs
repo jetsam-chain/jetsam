@@ -22,6 +22,16 @@
 ///
 /// Must divide one day exactly — see the assertion below. 86400 / 90 = 960.
 ///
+/// # The released interval, not "the" interval (v1.5)
+///
+/// This is the target interval of every block **below**
+/// [`V1_5_ACTIVATION_HEIGHT`] — the rule every block the chain already holds
+/// was judged by, and therefore a value that never changes. From that height
+/// on a block targets [`BLOCK_TIME_V1_5`]. A rule that a block at or above the
+/// activation can reach reads [`block_time_at`] with that block's height,
+/// never this constant: reading it there would judge a v1.5 block by the 90 s
+/// rule, and moving it would re-judge every header already in the chain.
+///
 /// The development allocation does not read this constant: its two payout
 /// cadences are literals (`development_allocation::DEVELOPMENT_PAYOUT_INTERVAL_90S`
 /// and `_180S`), so changing the interval cannot move a past payout.
@@ -32,11 +42,149 @@ const _: () = assert!(
     "BLOCK_TIME must divide one day exactly"
 );
 
-/// Number of blocks per ASERT epoch.
+/// Target interval of every block at or above [`V1_5_ACTIVATION_HEIGHT`].
+///
+/// Decided on 2026-09-29 together with the m = 25 large class ("voie A"):
+/// one hardfork, never the interval alone. Read through [`block_time_at`].
+pub const BLOCK_TIME_V1_5: u64 = 180;
+
+const _: () = assert!(
+    (24_u64 * 60 * 60).is_multiple_of(BLOCK_TIME_V1_5),
+    "BLOCK_TIME_V1_5 must divide one day exactly"
+);
+
+/// Number of blocks per ASERT epoch: the anchor rolls every six blocks on both
+/// sides of the v1.5 height. It only sets how often the anchor is refreshed;
+/// the response speed is [`halflife_at`], in seconds.
 pub const EPOCH_LENGTH: u64 = 6;
 
-/// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 540s at BLOCK_TIME=90
+/// ASERT halflife in seconds below [`V1_5_ACTIVATION_HEIGHT`]: 540 s, six
+/// 90-second blocks.
+///
+/// It used to be written `EPOCH_LENGTH × BLOCK_TIME`. That formula is the
+/// released value and is pinned below, but it no longer *defines* the
+/// halflife: applied to the 180-second interval it would silently give
+/// 1 080 s, a decision the operator did not take. Read through
+/// [`halflife_at`].
+pub const HALFLIFE: u64 = 540;
+
+const _: () = assert!(
+    HALFLIFE == EPOCH_LENGTH * BLOCK_TIME,
+    "the released halflife is six released intervals"
+);
+
+/// ASERT halflife in seconds at and above [`V1_5_ACTIVATION_HEIGHT`]: **540 s,
+/// unchanged in seconds** — three 180-second blocks instead of six 90-second
+/// ones.
+///
+/// Decided with the operator on 2026-10-01 (decision D1 of the M3 plan): the
+/// mining network is concentrated, so the departure of one large miner is the
+/// scenario to absorb fast. Simulated at 180 s (plan M3 §0.4): a drop to 10 %
+/// of the hashrate costs 65 min for the next ten blocks at 540 s against 87 min
+/// at 1 080 s, for a difficulty about 1.6 times noisier at steady state.
+pub const HALFLIFE_V1_5: u64 = 540;
+
+/// Target interval, in seconds, of the block at `height`: [`BLOCK_TIME`] below
+/// [`V1_5_ACTIVATION_HEIGHT`], [`BLOCK_TIME_V1_5`] from it on.
+///
+/// "The interval of block `h`" is the one that ends with it, from `h - 1` to
+/// `h`. The activation block's own interval is therefore a v1.5 one, which is
+/// what its anchor target ([`V1_5_ANCHOR_TARGET`]) is calibrated for.
+#[inline]
+pub const fn block_time_at(height: u64) -> u64 {
+    block_time_at_with(height, V1_5_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`block_time_at`] with the v1.5 activation height injected.
+#[inline]
+pub const fn block_time_at_with(height: u64, v1_5_activation: Option<u64>) -> u64 {
+    if v1_5_active_with(height, v1_5_activation) {
+        BLOCK_TIME_V1_5
+    } else {
+        BLOCK_TIME
+    }
+}
+
+/// ASERT halflife, in seconds, for the child block at `height`.
+#[inline]
+pub const fn halflife_at(height: u64) -> u64 {
+    halflife_at_with(height, V1_5_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`halflife_at`] with the v1.5 activation height injected.
+#[inline]
+pub const fn halflife_at_with(height: u64, v1_5_activation: Option<u64>) -> u64 {
+    if v1_5_active_with(height, v1_5_activation) {
+        HALFLIFE_V1_5
+    } else {
+        HALFLIFE
+    }
+}
+
+/// The ASERT target the block at [`V1_5_ACTIVATION_HEIGHT`] carries, verbatim.
+///
+/// # Why a constant at the v1.5 height
+///
+/// The interval doubles at that height. ASERT anchors on the **parent's**
+/// timestamp and measures elapsed time against the ideal of the rule in force,
+/// so a target carried across the boundary would be calibrated for 90-second
+/// blocks: the first v1.5 blocks would come about twice too fast until ASERT
+/// had walked the difficulty up, roughly one halflife. Declaring the first
+/// target, on the model of [`V1_4_ANCHOR_TARGET`], removes that transient; from
+/// `activation + 1` on, ASERT resumes at 180 s against an anchor floored at the
+/// activation height (`header::asert_anchor_height`).
+///
+/// # The alternative not taken (to weigh before arming)
+///
+/// The proof-of-work does not change at v1.5, unlike v1.4: the equilibrium
+/// target at 180 s is simply half the one at 90 s at the same hashrate. The
+/// block at the activation height could therefore carry a *derived* target —
+/// the ASERT target the 90-second rule gives it, halved — with no measurement
+/// to take and no number to carve. It would also keep the activation block
+/// heavier than its parent rather than lighter, so no reorg window opens at the
+/// boundary (see the work discussion on [`V1_4_ANCHOR_TARGET`]). The M3 plan
+/// asked for a declared target, so that is what is here; the derived rule is a
+/// small change in `difficulty::DifficultySchedule::boundary_target` if the
+/// operator prefers it.
+///
+/// # Arming
+///
+/// `None` while the fork is dormant. Armed together with
+/// [`V1_5_ACTIVATION_HEIGHT`] or not at all
+/// (`wire_limits::tests::the_v1_5_fork_cannot_be_armed_without_its_anchor_target`),
+/// and refused at compile time outside [`anchor_target_is_mineable`]. The value
+/// is read from the network's measured target just before arming: about half
+/// the live 90-second target (twice the difficulty), eased as the operator
+/// sees fit — easier is a burst of fast blocks, harder is a stall.
+#[cfg(not(feature = "testnet"))]
+pub const V1_5_ANCHOR_TARGET: Option<[u8; 32]> = None;
+
+/// Dormant on the test chain as well, declared per profile like
+/// [`V1_4_ANCHOR_TARGET`]. ⚠️ The public network must never copy the test
+/// chain's value: each is read from its own network's measured target.
+#[cfg(feature = "testnet")]
+pub const V1_5_ANCHOR_TARGET: Option<[u8; 32]> = None;
+
+/// The target the block at `height` carries verbatim at the v1.5 boundary:
+/// [`V1_5_ANCHOR_TARGET`] at exactly [`V1_5_ACTIVATION_HEIGHT`], `None`
+/// everywhere else and everywhere while the fork is dormant.
+#[inline]
+pub const fn v1_5_boundary_target(height: u64) -> Option<[u8; 32]> {
+    v1_5_boundary_target_with(height, V1_5_ACTIVATION_HEIGHT, V1_5_ANCHOR_TARGET)
+}
+
+/// Testable twin of [`v1_5_boundary_target`] with the clock and target injected.
+#[inline]
+pub const fn v1_5_boundary_target_with(
+    height: u64,
+    activation: Option<u64>,
+    anchor_target: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    match (activation, anchor_target) {
+        (Some(activation), Some(target)) if height == activation => Some(target),
+        _ => None,
+    }
+}
 
 /// Dormant hardfork: first block height whose ASERT target is computed with
 /// the corrected `2^(frac/65536)` polynomial. **`u64::MAX` means "never".**
@@ -300,13 +448,19 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 ///
 /// # What it switches today
 ///
-/// The development-allocation schedule, and only that
-/// (`development_allocation::development_allocation_with`). Decided with the
-/// operator on 2026-09-30: the allocation keeps lasting two years of *target
-/// time* when blocks go from 90 to 180 seconds. Payouts fall every 960 blocks up
-/// to and including this height, every 480 blocks after it, and the window ends
-/// on the 730th payout, at `J + (730 − J/960) × 480`. The rest of v1.5 — the
-/// 180-second interval, the m = 25 packs, the client slot — joins this clock in
+/// * The development-allocation schedule
+///   (`development_allocation::development_allocation_with`). Decided with the
+///   operator on 2026-09-30: the allocation keeps lasting two years of *target
+///   time* when blocks go from 90 to 180 seconds. Payouts fall every 960 blocks
+///   up to and including this height, every 480 blocks after it, and the window
+///   ends on the 730th payout, at `J + (730 − J/960) × 480`.
+/// * The block interval ([`block_time_at`], 90 → 180 s) and everything that
+///   reads it: the ASERT ideal elapsed time (`difficulty::DifficultySchedule`),
+///   the ASERT anchor, floored at this height, the target of this height itself
+///   ([`V1_5_ANCHOR_TARGET`]), and the miner's proof-time budget. The halflife
+///   stays 540 s in seconds ([`HALFLIFE_V1_5`]).
+///
+/// The rest of v1.5 — the m = 25 packs, the client slot — joins this clock in
 /// M3, and none of it may open a clock of its own.
 ///
 /// # Constraints
@@ -789,6 +943,9 @@ pub fn anchor_easing_factor(target: &[u8; 32], hashes_per_second: f64) -> Option
     if !(hashes_per_second > 0.0) {
         return None;
     }
+    // The released 90 s on purpose: this is the arithmetic of the v1.4 anchor,
+    // a 90-second-era decision. It is not consensus and nothing at a v1.5
+    // height reads it; a v1.5 anchor is weighed against `BLOCK_TIME_V1_5`.
     let equilibrium_seconds = BLOCK_TIME as f64;
     Some(equilibrium_seconds / expected_search_seconds(target, hashes_per_second))
 }
@@ -936,6 +1093,19 @@ const _: () = assert!(
     "V1_4_ANCHOR_TARGET must lie in [MIN_TARGET, GENESIS_TARGET]: below it the \
      activation block can never be mined and the chain stops there for good, \
      above it that block carries a weight the difficulty ladder never issues"
+);
+
+/// The same range check for the v1.5 anchor: a zero, reversed or copied-too-hard
+/// target stops the chain at the v1.5 height exactly as it would have at v1.4,
+/// and the same floor ([`V1_4_ANCHOR_FLOOR`], 2^226) separates a target a network
+/// could plausibly be mining under the walked digest from a slip.
+const _: () = assert!(
+    match V1_5_ANCHOR_TARGET {
+        Some(target) => anchor_target_is_mineable(target),
+        None => true,
+    },
+    "V1_5_ANCHOR_TARGET must lie in [V1_4_ANCHOR_FLOOR, GENESIS_TARGET]: outside it \
+     the v1.5 activation block is unmineable or weighs nothing the ladder issues"
 );
 
 /// The target a block at `height` carries verbatim, bypassing ASERT.
@@ -1244,6 +1414,14 @@ pub const TX_EPOCH_BLOCKS: u64 = 32;
 const _: () = assert!(
     (24_u64 * 60 * 60 / BLOCK_TIME).is_multiple_of(TX_EPOCH_BLOCKS),
     "one day must divide into whole transaction epochs"
+);
+
+/// And on the v1.5 interval: 480 / 32 = 15 epochs a day, each 96 minutes. The
+/// epoch is counted in blocks, so it doubles in wall-clock at the v1.5 height;
+/// what has to survive is the whole-epoch day the payout anchors rely on.
+const _: () = assert!(
+    (24_u64 * 60 * 60 / BLOCK_TIME_V1_5).is_multiple_of(TX_EPOCH_BLOCKS),
+    "one v1.5 day must divide into whole transaction epochs"
 );
 
 const _: () = assert!(
@@ -1612,6 +1790,67 @@ mod tests {
         assert!(v1_5_active_with(30_721, Some(30_720)));
         for height in [0, 1, 30_720, 700_800, u64::MAX] {
             assert!(!v1_5_active_with(height, None));
+        }
+    }
+
+    /// The interval is the one in force at the block's own height: 90 s below
+    /// the v1.5 height, 180 s from it on, 90 s everywhere while it is dormant.
+    /// The halflife stays 540 s in seconds on both sides (decision D1).
+    #[test]
+    fn the_block_interval_follows_the_v1_5_clock() {
+        const J: u64 = 30_720;
+        assert_eq!(block_time_at_with(0, Some(J)), 90);
+        assert_eq!(block_time_at_with(J - 1, Some(J)), 90);
+        assert_eq!(block_time_at_with(J, Some(J)), 180);
+        assert_eq!(block_time_at_with(J + 1, Some(J)), 180);
+        assert_eq!(block_time_at_with(u64::MAX, Some(J)), 180);
+        for height in [0, 1, J, 700_800, u64::MAX] {
+            assert_eq!(block_time_at_with(height, None), BLOCK_TIME);
+            assert_eq!(halflife_at_with(height, None), HALFLIFE);
+            assert_eq!(halflife_at_with(height, Some(J)), 540);
+        }
+        assert_eq!(HALFLIFE, 540);
+        assert_eq!(HALFLIFE_V1_5, 540);
+        // Production reads the profile's clock and nothing else.
+        for height in [0, 1, 24_846, 30_720, 700_800] {
+            assert_eq!(
+                block_time_at(height),
+                block_time_at_with(height, V1_5_ACTIVATION_HEIGHT)
+            );
+            assert_eq!(
+                halflife_at(height),
+                halflife_at_with(height, V1_5_ACTIVATION_HEIGHT)
+            );
+        }
+    }
+
+    /// Exactly one height carries the v1.5 anchor target, and only when the
+    /// height and the target are both declared.
+    #[test]
+    fn only_the_v1_5_activation_block_carries_the_v1_5_anchor() {
+        const J: u64 = 30_720;
+        let target = two_pow_target(230);
+        assert_eq!(
+            v1_5_boundary_target_with(J, Some(J), Some(target)),
+            Some(target)
+        );
+        for height in [0, J - 1, J + 1, J + 6, u64::MAX] {
+            assert_eq!(
+                v1_5_boundary_target_with(height, Some(J), Some(target)),
+                None
+            );
+        }
+        assert_eq!(v1_5_boundary_target_with(J, None, Some(target)), None);
+        assert_eq!(v1_5_boundary_target_with(J, Some(J), None), None);
+        match (V1_5_ACTIVATION_HEIGHT, V1_5_ANCHOR_TARGET) {
+            (Some(activation), Some(anchor)) => {
+                assert_eq!(v1_5_boundary_target(activation), Some(anchor))
+            }
+            _ => {
+                for height in [0, 1, 30_720, u64::MAX] {
+                    assert!(v1_5_boundary_target(height).is_none());
+                }
+            }
         }
     }
 
