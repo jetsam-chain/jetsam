@@ -1426,10 +1426,11 @@ mod tests {
     /// The profile is read from `jetsam_chain` (`IS_TEST_CHAIN`), never from
     /// this crate's own `testnet` feature, which is off when the test chain's
     /// suite selects the profile with `--features jetsam_chain/testnet`.
-    /// The test chain's nonce was mined for its genesis by
-    /// `print_new_fixture_nonce` under `--features testnet`.
+    /// The test chain's nonce was re-mined (`print_new_fixture_nonce`, under
+    /// `--features jetsam_chain/testnet`) after its genesis reset (`ab95428`,
+    /// 289_608 before it).
     const FIXTURE_CHAIN_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-        289_608
+        144_076
     } else {
         162_878
     };
@@ -1439,9 +1440,11 @@ mod tests {
     /// JETSAM: re-mined (`print_new_native_coinbase_child_nonce`) after TowerHash
     /// and the ASERT interval-count fix (382_055 upstream, then 422_266). One per
     /// network, for the reason given on [`FIXTURE_CHAIN_NONCE`].
-    /// The profile is read from `jetsam_chain`, as for [`FIXTURE_CHAIN_NONCE`].
+    /// The profile is read from `jetsam_chain`, as for [`FIXTURE_CHAIN_NONCE`];
+    /// the test chain's nonce was re-mined after its genesis reset (67_139
+    /// before it).
     const NATIVE_COINBASE_CHILD_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-        67_139
+        673_670
     } else {
         31_746
     };
