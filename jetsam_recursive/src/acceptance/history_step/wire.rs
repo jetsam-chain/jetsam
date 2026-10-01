@@ -1114,6 +1114,62 @@ pub fn decode_verify_history_step_terminal_rooted(
     )
 }
 
+/// Version byte of a client proof encoding (`client-slot`).
+#[cfg(feature = "client-slot")]
+const HISTORY_STEP_CLIENT_PROOF_WIRE_VERSION: u8 = 1;
+
+/// Upper bound of a client proof encoding: the fixed, unshared length
+/// (`client-slot`, M2 task 2.6).
+#[cfg(feature = "client-slot")]
+pub fn history_step_client_proof_max_wire_bytes(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+) -> Result<usize, HistoryStepError> {
+    let mut len = add(1, HASH_BYTES)?;
+    len = add(len, mul(form.io_spec().io_len, F128_BYTES)?)?;
+    add(len, field_proof_len(form.shape(), form.pcs_params())?)
+}
+
+/// A client proof of `form` on the wire (`client-slot`, M2 task 2.6): what a
+/// client hands to miners. Version byte, commitment root, the form's public
+/// IO, then the field proof with shared Merkle paths (the terminal's
+/// compressed encoding).
+#[cfg(feature = "client-slot")]
+pub fn encode_history_step_client_proof(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+    field_proof: &C1FieldR1csProof,
+    commitment_root: &[u8; HASH_BYTES],
+    io: &[F128],
+) -> Result<Vec<u8>, HistoryStepError> {
+    let mut out = Vec::with_capacity(history_step_client_proof_max_wire_bytes(form)?);
+    out.push(HISTORY_STEP_CLIENT_PROOF_WIRE_VERSION);
+    put_hash(&mut out, commitment_root);
+    encode_f128_vec(&mut out, io, form.io_spec().io_len)?;
+    encode_field_proof(&mut out, field_proof, form.shape(), form.pcs_params(), true)?;
+    Ok(out)
+}
+
+/// Decode [`encode_history_step_client_proof`]'s bytes: the proof, its
+/// commitment root and its public IO. Every byte is consumed or the
+/// encoding is refused; the length is bounded before anything is parsed.
+#[cfg(feature = "client-slot")]
+pub fn decode_history_step_client_proof(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+    bytes: &[u8],
+) -> Result<(C1FieldR1csProof, [u8; HASH_BYTES], Vec<F128>), HistoryStepError> {
+    if bytes.len() > history_step_client_proof_max_wire_bytes(form)? {
+        return Err(HistoryStepError::WireEncoding);
+    }
+    let mut reader = Reader::new(bytes);
+    if reader.u8()? != HISTORY_STEP_CLIENT_PROOF_WIRE_VERSION {
+        return Err(HistoryStepError::WireVersion);
+    }
+    let root = reader.hash()?;
+    let io = decode_f128_vec(&mut reader, form.io_spec().io_len)?;
+    let proof = decode_field_proof(&mut reader, form.shape(), form.pcs_params(), true)?;
+    reader.finish()?;
+    Ok((proof, root, io))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

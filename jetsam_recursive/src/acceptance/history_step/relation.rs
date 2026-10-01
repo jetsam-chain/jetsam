@@ -882,6 +882,10 @@ pub struct HistoryStepRuntime {
     parent_recursion_vk: LinkRegionSidecarVk,
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
     parent_geometry: HistoryStepParentGeometry,
+    /// The chain's client registry, when this node holds one (`client-slot`,
+    /// M2 task 2.5): static in the prototype, chain state in M3.
+    #[cfg(feature = "client-slot")]
+    clients: Option<std::sync::Arc<super::client_arm::HistoryStepChainClients>>,
 }
 
 impl HistoryStepRuntime {
@@ -931,7 +935,31 @@ impl HistoryStepRuntime {
             parent_recursion_vk,
             direct_block_vks,
             parent_geometry,
+            #[cfg(feature = "client-slot")]
+            clients: None,
         })
+    }
+
+    /// Give this node the chain's client registry (`client-slot`, M2 task
+    /// 2.5): every block that carries a client has its client lane checked
+    /// against it before acceptance. The registry must be of the bank's
+    /// client form.
+    #[cfg(feature = "client-slot")]
+    pub fn with_chain_clients(
+        mut self,
+        clients: std::sync::Arc<super::client_arm::HistoryStepChainClients>,
+    ) -> Result<Self, HistoryStepError> {
+        if self.bank.client_form() != Some(clients.form()) {
+            return Err(HistoryStepError::ClientForm);
+        }
+        self.clients = Some(clients);
+        Ok(self)
+    }
+
+    /// The chain's client registry this node checks client lanes against.
+    #[cfg(feature = "client-slot")]
+    pub fn chain_clients(&self) -> Option<&super::client_arm::HistoryStepChainClients> {
+        self.clients.as_deref()
     }
 
     pub fn bank(&self) -> &PinnedHistoryStepClassBank {
@@ -984,6 +1012,13 @@ impl HistoryStepRuntime {
         &self,
         pending: PendingHistoryStepBankDecision,
     ) -> Result<AcceptedHistoryStepBankTip, HistoryStepError> {
+        // A block that carries a client is decided only against the chain's
+        // registry (M2 task 2.5); the client lane is checked first, and its
+        // matrix is resident with the registry.
+        #[cfg(feature = "client-slot")]
+        let mut pending = pending;
+        #[cfg(feature = "client-slot")]
+        pending.check_client_lane(self.clients.as_deref())?;
         pending
             .finish_with_matrix_loader(|class| self.load_matrix(class))
             .map_err(Into::into)

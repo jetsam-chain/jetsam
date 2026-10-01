@@ -496,6 +496,7 @@ dependencies = [
  "jetsam-ivc-prover",
  "jetsam_block",
  "jetsam_chain",
+ "jetsam_client_agent",
  "jetsam_core",
  "jetsam_fri",
  "jetsam_fri_binius",
@@ -2774,6 +2775,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetsam_client_agent"
+version = "1.4.3"
+dependencies = [
+ "jetsam-ivc-core",
+]
+
+[[package]]
 name = "jetsam_core"
 version = "1.4.3"
 dependencies = [
@@ -2979,6 +2987,7 @@ dependencies = [
  "jetsam-ivc-core",
  "jetsam-ivc-prover",
  "jetsam_chain",
+ "jetsam_client_agent",
  "jetsam_core",
  "jetsam_fri",
  "jetsam_fri_binius",

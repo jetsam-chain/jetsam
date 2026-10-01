@@ -517,6 +517,81 @@ impl HistoryStepClientIoLanes {
     }
 }
 
+/// The client lanes of a public IO that carries a present client
+/// (`client-slot`, M2 task 2.5): what a node reads out of a block, and checks
+/// natively against the chain's registry, before it accepts the block.
+#[cfg(feature = "client-slot")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStepClientClaim {
+    /// `D`: the client matrix the circuit verified the client proof under.
+    pub matrix_digest: [u8; 32],
+    /// The registry root the circuit proved `D` a member of.
+    pub registry_root: [u8; 32],
+    /// `hash_leaf` of the client's public-IO lanes.
+    pub io_commitment: [u8; 32],
+    /// The client's folded lincheck: a claim on matrix `D`, which nodes
+    /// evaluate against the registered matrix.
+    pub claim: C1MatrixAccClaim,
+}
+
+/// Read the client lanes of `io` (`client-slot`, M2 task 2.5), refusing
+/// every non-canonical encoding: `client_present` is 0 or 1; an absent
+/// client carries zeros in every client lane; a present client carries a
+/// live accumulator lane and a non-null `D` (empty registry leaves are the
+/// null digest, so a null `D` would be a "member" of any registry that is
+/// not full).
+#[cfg(feature = "client-slot")]
+pub fn parse_history_step_client_lanes(
+    lanes: &HistoryStepClientIoLanes,
+    io: &[F128],
+) -> Result<Option<HistoryStepClientClaim>, HistoryStepBankError> {
+    if io.len() < lanes.end() {
+        return Err(HistoryStepBankError::IoLength {
+            expected: lanes.end(),
+            actual: io.len(),
+        });
+    }
+    match io[lanes.present] {
+        F128::ZERO => {
+            if io[lanes.present + 1..lanes.end()]
+                .iter()
+                .any(|lane| *lane != F128::ZERO)
+            {
+                return Err(HistoryStepBankError::NonCanonicalAbsentClient);
+            }
+            return Ok(None);
+        }
+        F128::ONE => {}
+        _ => return Err(HistoryStepBankError::ClientPresentFlag),
+    }
+    let lane = lanes.matrix_lane;
+    if io[lane.live] != F128::ONE {
+        return Err(HistoryStepBankError::ClientLaneLiveness);
+    }
+    let digest_at = |offset: usize| {
+        let mut digest = [0u8; 32];
+        digest[..16].copy_from_slice(&f128_to_u128(io[offset]).to_le_bytes());
+        digest[16..].copy_from_slice(&f128_to_u128(io[offset + 1]).to_le_bytes());
+        digest
+    };
+    let matrix_digest = digest_at(lanes.matrix_digest);
+    if matrix_digest == [0u8; 32] {
+        return Err(HistoryStepBankError::NullClientMatrixDigest);
+    }
+    Ok(Some(HistoryStepClientClaim {
+        matrix_digest,
+        registry_root: digest_at(lanes.registry_root),
+        io_commitment: digest_at(lanes.io_commitment),
+        claim: C1MatrixAccClaim {
+            point: io[lane.point..lane.value]
+                .chunks_exact(2)
+                .map(|coordinates| F256::new(coordinates[0], coordinates[1]))
+                .collect(),
+            value: F256::new(io[lane.value], io[lane.value + 1]),
+        },
+    }))
+}
+
 /// Shared public-IO layout of both launch classes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryStepBankIoLayout {
@@ -1096,6 +1171,9 @@ struct ParsedHistoryStepBankIo {
     block_accumulator: Vec<F128>,
     /// `None` under a generation that pins its root in the matrices.
     recursion_root: Option<Vec<F128>>,
+    /// The present client of a client-bearing IO (`client-slot`).
+    #[cfg(feature = "client-slot")]
+    client: Option<HistoryStepClientClaim>,
 }
 
 fn parse_history_step_bank_io(
@@ -1174,12 +1252,19 @@ fn parse_history_step_bank_io(
     let recursion_root = layout
         .recursion_root_range()
         .map(|range| io[range].to_vec());
+    #[cfg(feature = "client-slot")]
+    let client = match &layout.client {
+        Some(lanes) => parse_history_step_client_lanes(lanes, io)?,
+        None => None,
+    };
     Ok(ParsedHistoryStepBankIo {
         base,
         tip_class,
         lanes: parsed_lanes,
         block_accumulator,
         recursion_root,
+        #[cfg(feature = "client-slot")]
+        client,
     })
 }
 
@@ -1448,6 +1533,10 @@ pub struct PendingHistoryStepBankDecision {
     bank_digest: [u8; 32],
     base: bool,
     block_accumulator: Vec<F128>,
+    /// The tip's present client, until its lane is checked against the
+    /// chain's registry (`client-slot`, M2 task 2.5).
+    #[cfg(feature = "client-slot")]
+    client: Option<HistoryStepClientClaim>,
 }
 
 impl PendingHistoryStepBankDecision {
@@ -1487,7 +1576,35 @@ impl PendingHistoryStepBankDecision {
             bank_digest: replay.bank_digest,
             base: parsed.base,
             block_accumulator: parsed.block_accumulator,
+            #[cfg(feature = "client-slot")]
+            client: parsed.client,
         })
+    }
+
+    /// The tip's present client whose lane is still to be checked.
+    #[cfg(feature = "client-slot")]
+    pub fn pending_client(&self) -> Option<&HistoryStepClientClaim> {
+        self.client.as_ref()
+    }
+
+    /// Check the tip's client lane natively against the chain's registry
+    /// (`client-slot`, M2 task 2.5): registry root, membership of `D`, and
+    /// the accumulator claim evaluated on the registered matrix `D`. Nothing
+    /// to check without a present client; a present client and no registry
+    /// at this node is a refusal, never an acceptance.
+    #[cfg(feature = "client-slot")]
+    pub fn check_client_lane(
+        &mut self,
+        clients: Option<&crate::acceptance::history_step::HistoryStepChainClients>,
+    ) -> Result<(), HistoryStepBankError> {
+        let Some(claim) = &self.client else {
+            return Ok(());
+        };
+        clients
+            .ok_or(HistoryStepBankError::ClientRegistryUnavailable)?
+            .check_claim(claim)?;
+        self.client = None;
+        Ok(())
     }
 
     fn claims_for(
@@ -1658,6 +1775,10 @@ impl PendingHistoryStepBankDecision {
     /// Return an accepted terminal capability only after the tip fresh claim
     /// and every live bank lane were checked exactly once.
     pub fn finish(self) -> Result<AcceptedHistoryStepBankTip, HistoryStepBankError> {
+        #[cfg(feature = "client-slot")]
+        if self.client.is_some() {
+            return Err(HistoryStepBankError::ClientLaneUnchecked);
+        }
         if self.tip_fresh.is_some() {
             return Err(HistoryStepBankError::TipMatrixUnchecked(self.tip_class));
         }
@@ -1757,6 +1878,36 @@ pub enum HistoryStepBankError {
     /// A client-bearing bank named a form other than the imposed one.
     #[cfg(feature = "client-slot")]
     ClientForm,
+    /// `client_present` is neither 0 nor 1.
+    #[cfg(feature = "client-slot")]
+    ClientPresentFlag,
+    /// An absent client carries a nonzero client lane.
+    #[cfg(feature = "client-slot")]
+    NonCanonicalAbsentClient,
+    /// A present client's accumulator lane is not live.
+    #[cfg(feature = "client-slot")]
+    ClientLaneLiveness,
+    /// A present client names the null matrix digest.
+    #[cfg(feature = "client-slot")]
+    NullClientMatrixDigest,
+    /// A present client, and no client registry at this node.
+    #[cfg(feature = "client-slot")]
+    ClientRegistryUnavailable,
+    /// The registry root a client lane carries is not the chain's.
+    #[cfg(feature = "client-slot")]
+    ClientRegistryRoot,
+    /// The client matrix `D` is not an entry of the chain's registry.
+    #[cfg(feature = "client-slot")]
+    ClientNotRegistered,
+    /// The client accumulator claim has the wrong width for the form.
+    #[cfg(feature = "client-slot")]
+    ClientLaneWidth,
+    /// The client accumulator claim does not hold on the registered matrix.
+    #[cfg(feature = "client-slot")]
+    ClientAccumulatedClaimValue,
+    /// A present client whose lane was never checked.
+    #[cfg(feature = "client-slot")]
+    ClientLaneUnchecked,
 }
 
 impl core::fmt::Display for HistoryStepBankError {
@@ -1903,6 +2054,42 @@ impl core::fmt::Display for HistoryStepBankError {
             }
             #[cfg(feature = "client-slot")]
             Self::ClientForm => f.write_str("HistoryStep bank names a non-canonical client form"),
+            #[cfg(feature = "client-slot")]
+            Self::ClientPresentFlag => f.write_str("HistoryStep client_present is not boolean"),
+            #[cfg(feature = "client-slot")]
+            Self::NonCanonicalAbsentClient => {
+                f.write_str("HistoryStep absent client carries a nonzero client lane")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientLaneLiveness => {
+                f.write_str("HistoryStep present client has a dead accumulator lane")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::NullClientMatrixDigest => {
+                f.write_str("HistoryStep present client names the null matrix digest")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientRegistryUnavailable => {
+                f.write_str("HistoryStep block carries a client and this node has no client registry")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientRegistryRoot => {
+                f.write_str("HistoryStep client registry root is not the chain's")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientNotRegistered => {
+                f.write_str("HistoryStep client matrix is not in the chain's registry")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientLaneWidth => {
+                f.write_str("HistoryStep client accumulator claim has the wrong width")
+            }
+            #[cfg(feature = "client-slot")]
+            Self::ClientAccumulatedClaimValue => f.write_str(
+                "HistoryStep client accumulator claim does not hold on the registered matrix",
+            ),
+            #[cfg(feature = "client-slot")]
+            Self::ClientLaneUnchecked => f.write_str("HistoryStep client lane was not checked"),
         }
     }
 }
@@ -2075,6 +2262,246 @@ mod tests {
             let client = bank.layout().client.unwrap();
             assert_eq!(io.len(), bank.layout().len);
             assert!(io[client.present..].iter().all(|lane| *lane == F128::ZERO));
+        }
+
+        // ---- 2.5: the node's decision over a client-bearing tip ----------
+
+        use crate::acceptance::history_step::{HistoryStepChainClients, HistoryStepClientRegistry};
+        use jetsam_ivc_core::field_r1cs::SparseFieldMatrix;
+
+        fn client_bank() -> PinnedHistoryStepClassBank {
+            let generation = HistoryStepPackGeneration::V1_3;
+            let form = HistoryStepClientForm::canonical();
+            PinnedHistoryStepClassBank::validate_with_client(
+                generation,
+                test_pins_with_client(generation, &form),
+                form,
+            )
+            .unwrap()
+        }
+
+        /// A matrix of the canonical client shape (m = k_log = 22): one
+        /// multiplication row whose coefficient is `seed`, padded with empty
+        /// rows to 2^22. Distinct seeds, distinct structural digests.
+        fn canonical_shape_matrix(seed: u64) -> Arc<FieldR1cs> {
+            let shape = HistoryStepClientForm::canonical().shape();
+            let mut b = FieldR1csBuilder::new();
+            let x = LinExpr::from_wire(b.alloc_f128(F128::new(3, 1)));
+            let y = LinExpr::from_wire(b.alloc_f128(F128::new(5, 2)));
+            b.mul(&x.scale(F128::new(seed, 0)), &y);
+            let (small, _) = b.build();
+            let k = 1usize << shape.k_log;
+            let pad = |mut matrix: SparseFieldMatrix| {
+                let entries = matrix.col_indices.len();
+                matrix.row_offsets.resize(k + 1, entries);
+                matrix.num_rows = k;
+                matrix.num_cols = k;
+                matrix
+            };
+            let matrix = FieldR1cs {
+                m: shape.m,
+                k_log: shape.k_log,
+                k_skip: small.k_skip,
+                useful_rows: small.useful_rows,
+                a_0: pad(small.a_0),
+                b_0: pad(small.b_0),
+                const_pin: small.const_pin,
+                digest_cache: Default::default(),
+                csc_cache: Default::default(),
+            };
+            matrix.validate_shape();
+            assert_eq!(FieldShape::of(&matrix), shape);
+            Arc::new(matrix)
+        }
+
+        /// A true accumulator claim on `matrix` at a fixed pseudo-random point.
+        fn true_claim(matrix: &FieldR1cs) -> C1MatrixAccClaim {
+            let point = (0..2 * matrix.k_log + 1)
+                .map(|index| {
+                    let seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1);
+                    F256::new(F128::new(seed, !seed), F128::new(seed.rotate_left(29), seed ^ 7))
+                })
+                .collect();
+            let mut claim = C1MatrixAccClaim {
+                point,
+                value: F256::ZERO,
+            };
+            claim.value = stacked_matrix_mle_eval_c1(matrix, &claim);
+            claim
+        }
+
+        /// The chain's registry `[D1, D2]`, their matrices, and a base IO of
+        /// `bank` carrying a present client of `D1` whose claim holds.
+        struct ClientTip {
+            chain: HistoryStepChainClients,
+            other_chain: HistoryStepChainClients,
+            io: Vec<F128>,
+            claim: HistoryStepClientClaim,
+        }
+
+        fn client_tip(bank: &PinnedHistoryStepClassBank) -> ClientTip {
+            let form = HistoryStepClientForm::canonical();
+            let (first, second) = (canonical_shape_matrix(0x31), canonical_shape_matrix(0x32));
+            let digests = [
+                first.structural_statement_digest(),
+                second.structural_statement_digest(),
+            ];
+            let registry =
+                HistoryStepClientRegistry::new(form.registry_depth(), digests.to_vec()).unwrap();
+            let chain = HistoryStepChainClients::new(
+                &form,
+                registry.clone(),
+                vec![first.clone(), second.clone()],
+            )
+            .unwrap();
+            let other_chain = HistoryStepChainClients::new(
+                &form,
+                HistoryStepClientRegistry::new(form.registry_depth(), vec![digests[1]]).unwrap(),
+                vec![second],
+            )
+            .unwrap();
+            let claim = HistoryStepClientClaim {
+                matrix_digest: digests[0],
+                registry_root: registry.root(),
+                io_commitment: [0x5A; 32],
+                claim: true_claim(&first),
+            };
+            let class = CanonicalHistoryStepClassId::new(1).unwrap();
+            let mut io = history_step_bank_base_output_io_rooted(
+                bank,
+                class,
+                &crate::accumulator::genesis_accumulator(),
+                &RecursionRoot::genesis(),
+            )
+            .unwrap();
+            let lanes = bank.layout().client.unwrap();
+            io[lanes.present] = F128::ONE;
+            write_digest(&mut io, lanes.matrix_digest, &claim.matrix_digest);
+            write_digest(&mut io, lanes.registry_root, &claim.registry_root);
+            write_digest(&mut io, lanes.io_commitment, &claim.io_commitment);
+            install_claim(&mut io, &lanes, &claim.claim);
+            ClientTip {
+                chain,
+                other_chain,
+                io,
+                claim,
+            }
+        }
+
+        fn install_claim(io: &mut [F128], lanes: &HistoryStepClientIoLanes, claim: &C1MatrixAccClaim) {
+            let lane = lanes.matrix_lane;
+            for (pair, coordinate) in io[lane.point..lane.value].chunks_exact_mut(2).zip(&claim.point) {
+                pair[0] = coordinate.lo;
+                pair[1] = coordinate.hi;
+            }
+            io[lane.value] = claim.value.lo;
+            io[lane.value + 1] = claim.value.hi;
+            io[lane.live] = F128::ONE;
+        }
+
+        fn replay(bank: &PinnedHistoryStepClassBank) -> VerifiedHistoryStepTipReplay {
+            VerifiedHistoryStepTipReplay {
+                class_id: CanonicalHistoryStepClassId::new(1).unwrap(),
+                bank_digest: bank.digest(),
+                fresh: C1FreshLincheckClaim {
+                    alpha: F256::ZERO,
+                    z_skip: F256::ZERO,
+                    x_inner_rest: Vec::new(),
+                    r_inner_rest: Vec::new(),
+                    z_partial: Vec::new(),
+                    value: F256::ZERO,
+                },
+            }
+        }
+
+        /// A node decides a client-bearing tip only once its client lane was
+        /// checked against the chain's registry: without a registry, against
+        /// another chain's registry, or not at all, the tip is refused; after
+        /// the check, what remains is the class matrices' own obligations.
+        #[test]
+        fn a_client_bearing_tip_is_decided_with_its_client_lane() {
+            let bank = client_bank();
+            let tip = client_tip(&bank);
+            let begin = || PendingHistoryStepBankDecision::begin(&bank, &tip.io, replay(&bank)).unwrap();
+
+            let pending = begin();
+            assert_eq!(pending.pending_client(), Some(&tip.claim));
+            assert!(matches!(
+                pending.finish(),
+                Err(HistoryStepBankError::ClientLaneUnchecked)
+            ));
+
+            let mut pending = begin();
+            assert_eq!(
+                pending.check_client_lane(None),
+                Err(HistoryStepBankError::ClientRegistryUnavailable)
+            );
+            assert_eq!(
+                pending.check_client_lane(Some(&tip.other_chain)),
+                Err(HistoryStepBankError::ClientRegistryRoot)
+            );
+            assert_eq!(pending.pending_client(), Some(&tip.claim), "a refused lane stays pending");
+            assert_eq!(pending.check_client_lane(Some(&tip.chain)), Ok(()));
+            assert_eq!(pending.pending_client(), None);
+            assert!(matches!(
+                pending.finish(),
+                Err(HistoryStepBankError::TipMatrixUnchecked(_))
+            ), "the client lane no longer blocks; the tip's own matrix does");
+        }
+
+        /// A false accumulator lane is refused by the check (the lane stays
+        /// pending), a non-canonical one by every reader of the bank IO.
+        #[test]
+        fn a_client_bearing_tip_with_a_forged_client_lane_is_refused() {
+            let bank = client_bank();
+            let tip = client_tip(&bank);
+            let lanes = bank.layout().client.unwrap();
+
+            let mut false_value = tip.io.clone();
+            false_value[lanes.matrix_lane.value] += F128::ONE;
+            let mut pending =
+                PendingHistoryStepBankDecision::begin(&bank, &false_value, replay(&bank)).unwrap();
+            assert_eq!(
+                pending.check_client_lane(Some(&tip.chain)),
+                Err(HistoryStepBankError::ClientAccumulatedClaimValue)
+            );
+            assert!(pending.pending_client().is_some());
+
+            let mut flag = tip.io.clone();
+            flag[lanes.present] = F128::new(2, 0);
+            assert!(matches!(
+                PendingHistoryStepBankDecision::begin(&bank, &flag, replay(&bank)),
+                Err(HistoryStepBankError::ClientPresentFlag)
+            ));
+            assert_eq!(
+                history_step_bank_tip_class(&bank, &flag),
+                Err(HistoryStepBankError::ClientPresentFlag)
+            );
+            let mut dead = tip.io.clone();
+            dead[lanes.matrix_lane.live] = F128::ZERO;
+            assert_eq!(
+                history_step_bank_block_accumulator(&bank, &dead).err(),
+                Some(HistoryStepBankError::ClientLaneLiveness)
+            );
+        }
+
+        /// A tip of a bank without a client form has no client lane to check.
+        #[test]
+        fn a_plain_bank_tip_has_no_client_lane() {
+            let generation = HistoryStepPackGeneration::V1_3;
+            let bank =
+                PinnedHistoryStepClassBank::validate_for(generation, test_pins_for(generation))
+                    .unwrap();
+            let io = history_step_bank_base_output_io_rooted(
+                &bank,
+                CanonicalHistoryStepClassId::new(1).unwrap(),
+                &crate::accumulator::genesis_accumulator(),
+                &RecursionRoot::genesis(),
+            )
+            .unwrap();
+            let mut pending = PendingHistoryStepBankDecision::begin(&bank, &io, replay(&bank)).unwrap();
+            assert_eq!(pending.pending_client(), None);
+            assert_eq!(pending.check_client_lane(None), Ok(()));
         }
 
         fn test_pins_with_client(

@@ -22,6 +22,8 @@ members = [
     "jetsam_gui",
     # External tools
     "jetsam_extminer",
+    # v1.5 prototype: example client of the HistoryStep client slot
+    "jetsam_client_agent",
 ]
 resolver = "2"
 
