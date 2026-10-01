@@ -29,10 +29,15 @@ use jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
 /// [`identity::DEFAULT_RPC_PORT`]. The two are pinned to each other by
 /// `the_default_endpoint_matches_this_build` below: change one without the
 /// other and the test fails.
-#[cfg(not(feature = "testnet"))]
-const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9701";
-#[cfg(feature = "testnet")]
-const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9711";
+///
+/// The profile is read from `jetsam_chain` (`IS_TEST_CHAIN`), not from this
+/// crate's own `testnet` feature, which is off when the profile is selected
+/// with `--features jetsam_chain/testnet`.
+const DEFAULT_RPC_URL: &str = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+    "http://127.0.0.1:9711"
+} else {
+    "http://127.0.0.1:9701"
+};
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 

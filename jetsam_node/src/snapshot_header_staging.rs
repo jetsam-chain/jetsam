@@ -1422,24 +1422,29 @@ mod tests {
     /// so it is not the same proof-of-work preimage: a nonce mined for the
     /// public network is not a solution on the test chain. Every test that
     /// appends this fixture failed there with `InvalidPoW`.
-    #[cfg(not(feature = "testnet"))]
-    const FIXTURE_CHAIN_NONCE: u128 = 162_878;
-    /// Mined for the test chain's genesis by `print_new_fixture_nonce` under
-    /// `--features testnet`.
-    #[cfg(feature = "testnet")]
-    const FIXTURE_CHAIN_NONCE: u128 = 289_608;
+    ///
+    /// The profile is read from `jetsam_chain` (`IS_TEST_CHAIN`), never from
+    /// this crate's own `testnet` feature, which is off when the test chain's
+    /// suite selects the profile with `--features jetsam_chain/testnet`.
+    /// The test chain's nonce was mined for its genesis by
+    /// `print_new_fixture_nonce` under `--features testnet`.
+    const FIXTURE_CHAIN_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+        289_608
+    } else {
+        162_878
+    };
 
     /// Pre-mined nonce for [`native_coinbase_child`]'s coinbase-only template.
     ///
     /// JETSAM: re-mined (`print_new_native_coinbase_child_nonce`) after TowerHash
     /// and the ASERT interval-count fix (382_055 upstream, then 422_266). One per
     /// network, for the reason given on [`FIXTURE_CHAIN_NONCE`].
-    #[cfg(not(feature = "testnet"))]
-    const NATIVE_COINBASE_CHILD_NONCE: u128 = 31_746;
-    /// Mined for the test chain's genesis by
-    /// `print_new_native_coinbase_child_nonce` under `--features testnet`.
-    #[cfg(feature = "testnet")]
-    const NATIVE_COINBASE_CHILD_NONCE: u128 = 67_139;
+    /// The profile is read from `jetsam_chain`, as for [`FIXTURE_CHAIN_NONCE`].
+    const NATIVE_COINBASE_CHILD_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+        67_139
+    } else {
+        31_746
+    };
 
     fn fixture_chain() -> &'static [BlockHeader] {
         static HEADERS: OnceLock<Vec<BlockHeader>> = OnceLock::new();

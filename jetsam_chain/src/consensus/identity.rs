@@ -228,3 +228,12 @@ mod tests {
         ));
     }
 }
+
+/// Whether this build is the test chain's profile (`jetsam_chain/testnet`).
+///
+/// For crates above this one, which must not read their own `testnet` feature:
+/// a build that selects the profile with `--features jetsam_chain/testnet`
+/// (how the test chain's suites run) leaves it off, and a local
+/// `cfg(feature = "testnet")` silently takes the public network's arm.
+pub const IS_TEST_CHAIN: bool = cfg!(feature = "testnet");
+
