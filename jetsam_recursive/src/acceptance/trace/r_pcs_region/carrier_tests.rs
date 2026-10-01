@@ -2646,6 +2646,74 @@ mod client_slot {
         assert_eq!(chain.check_claim(&parsed(&form, &block_io(&form, &both))), Ok(()));
     }
 
+    /// M3.8: a node checks a tip's live lanes against the registered matrices
+    /// it holds, looked up by the leaves the tip publishes (whether those
+    /// leaves are the chain's registry is a native question on the block's
+    /// own branch). A memo keeps a node that validates every tip from
+    /// evaluating a lane it already verified: only lanes that moved cost an
+    /// evaluation.
+    #[test]
+    fn client_lanes_are_checked_against_held_matrices_with_a_memo() {
+        use crate::acceptance::history_step::client_arm::{
+            check_history_step_client_lanes, HistoryStepClientMatrixSet,
+        };
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let (only_a, both) = carried_history(&form, &a, &b, &leaves);
+        let only_a = parsed(&form, &block_io(&form, &only_a));
+        let both = parsed(&form, &block_io(&form, &both));
+
+        let held = HistoryStepClientMatrixSet::new(&form);
+        assert_eq!(
+            held.insert(a.matrix.clone()).ok(),
+            Some(a.matrix.structural_statement_digest())
+        );
+        assert!(held.holds(&a.matrix.structural_statement_digest()));
+        assert_eq!(check_history_step_client_lanes(&form, &only_a, &held), Ok(()));
+        assert_eq!(held.evaluated_lanes(), 1);
+        // B's lane is live and its matrix is not here: no verdict.
+        assert_eq!(
+            check_history_step_client_lanes(&form, &both, &held),
+            Err(HistoryStepBankError::ClientMatrixUnavailable)
+        );
+        held.insert(b.matrix.clone()).expect("B's matrix");
+        let before = held.evaluated_lanes();
+        assert_eq!(check_history_step_client_lanes(&form, &both, &held), Ok(()));
+        // A's lane did not move since it was verified; only B's is evaluated.
+        let a_moved = both.entries[0] != only_a.entries[0];
+        assert_eq!(held.evaluated_lanes(), before + 1 + usize::from(a_moved));
+        let after = held.evaluated_lanes();
+        assert_eq!(check_history_step_client_lanes(&form, &both, &held), Ok(()));
+        assert_eq!(held.evaluated_lanes(), after, "the same tip again costs nothing");
+
+        // A false lane is a verdict, even when another live lane's matrix
+        // is missing; a memoized lane never vouches for another value.
+        let mut lie = both.clone();
+        lie.entries[0].as_mut().expect("live lane 0").value += F256::ONE;
+        let lacking_b = HistoryStepClientMatrixSet::new(&form);
+        lacking_b.insert(a.matrix.clone()).expect("A's matrix");
+        assert_eq!(
+            check_history_step_client_lanes(&form, &lie, &lacking_b),
+            Err(HistoryStepBankError::ClientAccumulatedClaimValue)
+        );
+        assert_eq!(
+            check_history_step_client_lanes(&form, &lie, &held),
+            Err(HistoryStepBankError::ClientAccumulatedClaimValue)
+        );
+        // A live lane on an empty leaf names no registered matrix.
+        let mut orphan = only_a.clone();
+        orphan.registry[0] = [0u8; 32];
+        assert_eq!(
+            check_history_step_client_lanes(&form, &orphan, &held),
+            Err(HistoryStepBankError::ClientNotRegistered)
+        );
+        // Only matrices of the form's shape are held.
+        let (foreign, _): (FieldR1cs, Vec<F128>) =
+            synthetic_satisfiable(CLIENT_M + 1, CLIENT_M + 1, 1);
+        assert!(held.insert(std::sync::Arc::new(foreign)).is_err());
+    }
+
     /// The suffix-sync hole (M2 note §16.4-3), closed. A block that carried a
     /// false claim for entry 0 is followed by a block without a client: the
     /// relation carries the false lane faithfully (its trace is satisfiable

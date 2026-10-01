@@ -242,6 +242,194 @@ impl HistoryStepChainClients {
     }
 }
 
+/// The registered client matrices a node holds, looked up by their digest
+/// `D` (M3.8). Which digests are the chain's registry is not this trait's
+/// question: the node compares the leaves a tip publishes with the registry of
+/// the block's own branch, natively; this answers "do I hold the matrix of
+/// that leaf, and did I already verify this lane on it".
+pub trait HistoryStepClientMatrices: Send + Sync {
+    /// The matrix whose structural digest is `digest`, if held.
+    /// Implementations return only matrices authenticated against `digest`
+    /// and of the client form's shape.
+    fn client_matrix(&self, digest: &Hash) -> Option<Arc<FieldR1cs>>;
+
+    /// Whether this exact lane claim was already evaluated true on the matrix
+    /// `digest` (a memo; never a substitute for a matrix this node lacks).
+    fn lane_verified(&self, _digest: &Hash, _claim: &C1MatrixAccClaim) -> bool {
+        false
+    }
+
+    /// Record that this lane claim holds on the matrix `digest`.
+    fn record_lane_verified(&self, _digest: &Hash, _claim: &C1MatrixAccClaim) {}
+
+    /// Count one matrix evaluation (metrics and tests).
+    fn count_evaluation(&self) {}
+}
+
+/// Check every live entry lane of a tip's client claim (M3.8) against the
+/// matrices `matrices` holds, by the leaf of its entry:
+///
+/// - a live lane on an empty leaf names no registered matrix:
+///   `ClientNotRegistered`;
+/// - a lane of the wrong width: `ClientLaneWidth`;
+/// - a lane that does not hold on its matrix: `ClientAccumulatedClaimValue`,
+///   a verdict even if another live lane's matrix is missing;
+/// - a live lane whose matrix is not held: `ClientMatrixUnavailable`, **no
+///   verdict** (fetch the matrix, decide again), reported only once every
+///   lane this node can evaluate holds.
+///
+/// A lane already verified on its matrix (same digest, same claim) is not
+/// evaluated again: entry lanes move only when a block carries a client of
+/// that entry, so a node validating every tip evaluates about one lane per
+/// client-bearing block instead of every live lane at every tip.
+pub fn check_history_step_client_lanes(
+    form: &HistoryStepClientForm,
+    claim: &HistoryStepClientClaim,
+    matrices: &dyn HistoryStepClientMatrices,
+) -> Result<(), HistoryStepBankError> {
+    let width = 2 * form.shape().k_log + 1;
+    if claim.entries.len() != claim.registry.len() {
+        return Err(HistoryStepBankError::ClientLaneWidth);
+    }
+    let mut unavailable = false;
+    for (index, entry_claim) in claim.live_entries() {
+        let leaf = claim.registry[index];
+        if leaf == [0u8; 32] {
+            return Err(HistoryStepBankError::ClientNotRegistered);
+        }
+        if entry_claim.point.len() != width {
+            return Err(HistoryStepBankError::ClientLaneWidth);
+        }
+        if matrices.lane_verified(&leaf, entry_claim) {
+            continue;
+        }
+        let Some(matrix) = matrices.client_matrix(&leaf) else {
+            unavailable = true;
+            continue;
+        };
+        matrices.count_evaluation();
+        if stacked_matrix_mle_eval_c1(&matrix, entry_claim) != entry_claim.value {
+            return Err(HistoryStepBankError::ClientAccumulatedClaimValue);
+        }
+        matrices.record_lane_verified(&leaf, entry_claim);
+    }
+    if unavailable {
+        return Err(HistoryStepBankError::ClientMatrixUnavailable);
+    }
+    Ok(())
+}
+
+/// Upper bound of remembered verified lanes: 16 entries over a few tips.
+const VERIFIED_LANE_MEMO_CAPACITY: usize = 256;
+
+/// The registered client matrices a node holds, with a memo of verified
+/// lanes (M3.8): the production [`HistoryStepClientMatrices`]. Every matrix is
+/// authenticated once, on insertion (shape of the form, structural digest
+/// computed here, never taken from a caller).
+pub struct HistoryStepClientMatrixSet {
+    form: HistoryStepClientForm,
+    matrices: std::sync::RwLock<std::collections::BTreeMap<Hash, Arc<FieldR1cs>>>,
+    verified: std::sync::Mutex<std::collections::VecDeque<(Hash, Hash)>>,
+    evaluations: std::sync::atomic::AtomicUsize,
+}
+
+impl HistoryStepClientMatrixSet {
+    pub fn new(form: &HistoryStepClientForm) -> Self {
+        Self {
+            form: form.clone(),
+            matrices: Default::default(),
+            verified: Default::default(),
+            evaluations: Default::default(),
+        }
+    }
+
+    pub fn form(&self) -> &HistoryStepClientForm {
+        &self.form
+    }
+
+    /// Hold `matrix`: refused unless it has the form's shape. Returns its
+    /// structural digest `D`, computed here.
+    pub fn insert(&self, matrix: Arc<FieldR1cs>) -> Result<Hash, HistoryStepError> {
+        if FieldShape::of(&matrix) != self.form.shape() {
+            return Err(HistoryStepError::ClientForm);
+        }
+        let digest = matrix.structural_statement_digest();
+        self.matrices
+            .write()
+            .expect("client matrix set lock")
+            .insert(digest, matrix);
+        Ok(digest)
+    }
+
+    /// Whether the matrix `digest` is held.
+    pub fn holds(&self, digest: &Hash) -> bool {
+        self.matrices
+            .read()
+            .expect("client matrix set lock")
+            .contains_key(digest)
+    }
+
+    /// The digests held, in order.
+    pub fn digests(&self) -> Vec<Hash> {
+        self.matrices
+            .read()
+            .expect("client matrix set lock")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Matrix evaluations performed so far.
+    pub fn evaluated_lanes(&self) -> usize {
+        self.evaluations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn lane_key(digest: &Hash, claim: &C1MatrixAccClaim) -> (Hash, Hash) {
+        let mut bytes = Vec::with_capacity((claim.point.len() + 1) * 32);
+        for coordinate in claim.point.iter().chain(std::iter::once(&claim.value)) {
+            for lane in [coordinate.lo, coordinate.hi] {
+                bytes.extend_from_slice(&lane.lo.to_le_bytes());
+                bytes.extend_from_slice(&lane.hi.to_le_bytes());
+            }
+        }
+        (*digest, merkle::hash_leaf(&bytes))
+    }
+}
+
+impl HistoryStepClientMatrices for HistoryStepClientMatrixSet {
+    fn client_matrix(&self, digest: &Hash) -> Option<Arc<FieldR1cs>> {
+        self.matrices
+            .read()
+            .expect("client matrix set lock")
+            .get(digest)
+            .cloned()
+    }
+
+    fn lane_verified(&self, digest: &Hash, claim: &C1MatrixAccClaim) -> bool {
+        let key = Self::lane_key(digest, claim);
+        self.verified
+            .lock()
+            .expect("client lane memo lock")
+            .contains(&key)
+    }
+
+    fn record_lane_verified(&self, digest: &Hash, claim: &C1MatrixAccClaim) {
+        let key = Self::lane_key(digest, claim);
+        let mut verified = self.verified.lock().expect("client lane memo lock");
+        if !verified.contains(&key) {
+            if verified.len() >= VERIFIED_LANE_MEMO_CAPACITY {
+                verified.pop_front();
+            }
+            verified.push_back(key);
+        }
+    }
+
+    fn count_evaluation(&self) {
+        self.evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// `hash_leaf` over the flat bytes of the client public-IO lanes: the
 /// commitment the HistoryStep IO carries.
 pub fn client_io_commitment(io: &[F128]) -> Hash {

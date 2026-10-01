@@ -89,6 +89,7 @@ pub use relation::{
     prove_built_history_step_terminal,
     prove_built_history_step_terminal_cancellable, prove_history_step,
     verify_history_step_terminal, verify_history_step_terminal_rooted,
+    verify_history_step_terminal_rooted_with_client_matrices,
     AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep, HistoryStepError,
     HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
     HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
@@ -96,7 +97,8 @@ pub use relation::{
     HISTORY_STEP_WIRE_VERSION,
 };
 pub use client_arm::{
-    client_io_commitment, HistoryStepChainClients, HistoryStepClientCarry,
+    check_history_step_client_lanes, client_io_commitment, HistoryStepChainClients,
+    HistoryStepClientCarry, HistoryStepClientMatrices, HistoryStepClientMatrixSet,
     HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
     HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
@@ -112,6 +114,7 @@ pub use wire::{
 pub use wire::{
     audit_history_step_terminal_encodings, decode_history_step_terminal,
     decode_verify_history_step_terminal, decode_verify_history_step_terminal_rooted,
+    decode_verify_history_step_terminal_rooted_with_client_matrices,
     encode_history_step_terminal, history_step_terminal_max_wire_bytes, HistoryStepWireAudit,
     history_step_terminal_wire_bytes,
 };

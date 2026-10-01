@@ -1641,6 +1641,10 @@ pub struct PendingHistoryStepBankDecision {
     /// The tip's client lanes (v1.5: every tip has them), until they are
     /// checked against the chain's registry (M2 task 2.5, M3.4).
     client: Option<HistoryStepClientClaim>,
+    /// The same lanes once checked: the accepted tip reports them, so the
+    /// node can compare the published leaves and the carried client with
+    /// the chain (M3.8).
+    checked_client: Option<HistoryStepClientClaim>,
 }
 
 impl PendingHistoryStepBankDecision {
@@ -1681,6 +1685,7 @@ impl PendingHistoryStepBankDecision {
             base: parsed.base,
             block_accumulator: parsed.block_accumulator,
             client: parsed.client,
+            checked_client: None,
         })
     }
 
@@ -1706,8 +1711,36 @@ impl PendingHistoryStepBankDecision {
         clients
             .ok_or(HistoryStepBankError::ClientRegistryUnavailable)?
             .check_claim(claim)?;
-        self.client = None;
+        self.checked_client = self.client.take();
         Ok(())
+    }
+
+    /// Check the tip's live client lanes against the registered matrices
+    /// this node holds (M3.8), looked up by the leaves the tip publishes:
+    /// [`crate::acceptance::history_step::check_history_step_client_lanes`].
+    /// The leaves themselves are not compared here — whether they are the
+    /// chain's registry is a native question on the block's own branch, which
+    /// the node answers with the claim this decision then reports. A live
+    /// lane whose matrix is not held is `ClientMatrixUnavailable` (no
+    /// verdict) and the lanes stay pending.
+    pub fn check_client_lanes_with(
+        &mut self,
+        form: Option<&HistoryStepClientForm>,
+        matrices: Option<&dyn crate::acceptance::history_step::HistoryStepClientMatrices>,
+    ) -> Result<(), HistoryStepBankError> {
+        let Some(claim) = &self.client else {
+            return Ok(());
+        };
+        let form = form.ok_or(HistoryStepBankError::ClientRegistryUnavailable)?;
+        let matrices = matrices.ok_or(HistoryStepBankError::ClientRegistryUnavailable)?;
+        crate::acceptance::history_step::check_history_step_client_lanes(form, claim, matrices)?;
+        self.checked_client = self.client.take();
+        Ok(())
+    }
+
+    /// The tip's client lanes once checked.
+    pub fn checked_client(&self) -> Option<&HistoryStepClientClaim> {
+        self.checked_client.as_ref()
     }
 
     fn claims_for(
@@ -1859,8 +1892,20 @@ impl PendingHistoryStepBankDecision {
     /// a time. Each owned lease is dropped before the next class is loaded.
     pub fn finish_with_matrix_loader<E>(
         mut self,
-        mut load: impl FnMut(CanonicalHistoryStepClassId) -> Result<HistoryStepMatrixLease, E>,
+        load: impl FnMut(CanonicalHistoryStepClassId) -> Result<HistoryStepMatrixLease, E>,
     ) -> Result<AcceptedHistoryStepBankTip, HistoryStepBankError> {
+        self.discharge_class_matrices(load)?;
+        self.finish()
+    }
+
+    /// The class half of [`Self::finish_with_matrix_loader`], without
+    /// finishing: a node checks the class obligations first, then the client
+    /// lanes (M3.8), so that "no verdict" on a missing client matrix is only
+    /// ever said of a tip whose every other obligation holds.
+    pub fn discharge_class_matrices<E>(
+        &mut self,
+        mut load: impl FnMut(CanonicalHistoryStepClassId) -> Result<HistoryStepMatrixLease, E>,
+    ) -> Result<(), HistoryStepBankError> {
         for index in 0..HISTORY_STEP_CLASS_COUNT {
             let class = CanonicalHistoryStepClassId::from_index(index)
                 .expect("resident bank contains only canonical classes");
@@ -1872,7 +1917,7 @@ impl PendingHistoryStepBankDecision {
                 self.check_class_matrix_lease(class, &matrix)?;
             }
         }
-        self.finish()
+        Ok(())
     }
 
     /// Return an accepted terminal capability only after the tip fresh claim
@@ -1896,6 +1941,7 @@ impl PendingHistoryStepBankDecision {
             bank_digest: self.bank_digest,
             base: self.base,
             block_accumulator: self.block_accumulator,
+            client: self.checked_client,
         })
     }
 }
@@ -1907,6 +1953,7 @@ pub struct AcceptedHistoryStepBankTip {
     bank_digest: [u8; 32],
     base: bool,
     block_accumulator: Vec<F128>,
+    client: Option<HistoryStepClientClaim>,
 }
 
 impl AcceptedHistoryStepBankTip {
@@ -1926,6 +1973,18 @@ impl AcceptedHistoryStepBankTip {
     /// ten lanes at launch, twelve under v1.3.
     pub fn block_accumulator(&self) -> &[F128] {
         &self.block_accumulator
+    }
+
+    /// The tip's checked client lanes (v1.5): the carried client and the
+    /// registry leaves it publishes. `None` under a generation without the
+    /// client slot.
+    pub fn client(&self) -> Option<&HistoryStepClientClaim> {
+        self.client.as_ref()
+    }
+
+    /// Take the checked client lanes out of the decision.
+    pub fn take_client(&mut self) -> Option<HistoryStepClientClaim> {
+        self.client.take()
     }
 }
 
@@ -2561,6 +2620,52 @@ mod tests {
                 pending.finish(),
                 Err(HistoryStepBankError::TipMatrixUnchecked(_))
             ), "the client lane no longer blocks; the tip's own matrix does");
+        }
+
+        /// M3.8: the node decides the client lanes against the matrices it
+        /// holds (the leaves are compared with the chain's registry by the
+        /// node, on the block's branch), and the checked claim travels with
+        /// the decision so the node can run that comparison.
+        #[test]
+        fn a_client_bearing_tip_is_decided_against_held_matrices() {
+            use crate::acceptance::history_step::client_arm::HistoryStepClientMatrixSet;
+            let bank = client_bank();
+            let tip = client_tip(&bank);
+            let form = HistoryStepClientForm::canonical();
+            let held = HistoryStepClientMatrixSet::new(&form);
+            let mut pending =
+                PendingHistoryStepBankDecision::begin(&bank, &tip.io, replay(&bank)).unwrap();
+            assert_eq!(
+                pending.check_client_lanes_with(Some(&form), None),
+                Err(HistoryStepBankError::ClientRegistryUnavailable)
+            );
+            assert_eq!(
+                pending.check_client_lanes_with(Some(&form), Some(&held)),
+                Err(HistoryStepBankError::ClientMatrixUnavailable)
+            );
+            assert_eq!(pending.pending_client(), Some(&tip.claim), "no verdict keeps it pending");
+            assert_eq!(pending.checked_client(), None);
+            held.insert(canonical_shape_matrix(0x31)).expect("D1's matrix");
+            assert_eq!(pending.check_client_lanes_with(Some(&form), Some(&held)), Ok(()));
+            assert_eq!(pending.pending_client(), None);
+            assert_eq!(pending.checked_client(), Some(&tip.claim));
+            assert!(matches!(
+                pending.finish(),
+                Err(HistoryStepBankError::TipMatrixUnchecked(_))
+            ), "the client lane no longer blocks; the tip's own matrix does");
+
+            // A false lane is refused and stays pending.
+            let lanes = bank.layout().client.unwrap();
+            let mut false_value = tip.io.clone();
+            false_value[lanes.entry_lane(0).value] += F128::ONE;
+            let mut pending =
+                PendingHistoryStepBankDecision::begin(&bank, &false_value, replay(&bank)).unwrap();
+            assert_eq!(
+                pending.check_client_lanes_with(Some(&form), Some(&held)),
+                Err(HistoryStepBankError::ClientAccumulatedClaimValue)
+            );
+            assert!(pending.pending_client().is_some());
+            assert_eq!(pending.checked_client(), None);
         }
 
         /// A false accumulator lane is refused by the check (the lane stays

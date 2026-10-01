@@ -53,6 +53,11 @@ pub use acceptance::history_step_bank::{
 };
 /// The v1.5 client slot.
 pub use acceptance::history_step::{
+    check_history_step_client_lanes, decode_verify_history_step_terminal_rooted_with_client_matrices,
+    verify_history_step_terminal_rooted_with_client_matrices, HistoryStepClientMatrices,
+    HistoryStepClientMatrixSet,
+};
+pub use acceptance::history_step::{
     client_io_commitment, decode_history_step_client_proof, encode_history_step_client_proof,
     history_step_client_proof_max_wire_bytes, prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
     HistoryStepClientCarry, HistoryStepClientRegistry, HistoryStepClientWitness,

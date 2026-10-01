@@ -1124,6 +1124,30 @@ pub fn decode_verify_history_step_terminal_rooted(
     )
 }
 
+/// [`decode_verify_history_step_terminal_rooted`] with the client lanes
+/// decided against the registered matrices a node holds (M3.8). See
+/// [`super::relation::verify_history_step_terminal_rooted_with_client_matrices`].
+pub fn decode_verify_history_step_terminal_rooted_with_client_matrices(
+    runtime: &HistoryStepRuntime,
+    bytes: &[u8],
+    expected_header: &BlockHeader,
+    epoch_anchor_header: &BlockHeader,
+    previous_epoch_anchor_header: Option<&BlockHeader>,
+    expected_recursion_root: Option<&crate::acceptance::history_step_bank::RecursionRoot>,
+    matrices: Option<&dyn super::client_arm::HistoryStepClientMatrices>,
+) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
+    let terminal = decode_history_step_terminal(runtime, bytes)?;
+    super::relation::verify_history_step_terminal_rooted_with_client_matrices(
+        runtime,
+        &terminal,
+        expected_header,
+        epoch_anchor_header,
+        previous_epoch_anchor_header,
+        expected_recursion_root,
+        matrices,
+    )
+}
+
 /// Version byte of a client proof encoding (v1.5 client slot).
 const HISTORY_STEP_CLIENT_PROOF_WIRE_VERSION: u8 = 1;
 

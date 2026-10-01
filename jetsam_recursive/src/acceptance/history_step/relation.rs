@@ -1016,6 +1016,27 @@ impl HistoryStepRuntime {
             .finish_with_matrix_loader(|class| self.load_matrix(class))
             .map_err(Into::into)
     }
+
+    /// Decide a tip against the registered client matrices a node holds
+    /// (M3.8), supplied per call: the class obligations first, then every
+    /// live client lane against the matrix of its leaf
+    /// ([`super::check_history_step_client_lanes`]), then the decision, which
+    /// reports the checked client lanes. The node compares the published
+    /// leaves and the carried client with the chain on the block's own
+    /// branch — the registry is chain state, not a property of the runtime.
+    /// A live lane whose matrix is not held is
+    /// `Bank(ClientMatrixUnavailable)`: no verdict, said only of a tip whose
+    /// class obligations hold.
+    pub fn decide_with_client_matrices(
+        &self,
+        pending: PendingHistoryStepBankDecision,
+        matrices: Option<&dyn super::client_arm::HistoryStepClientMatrices>,
+    ) -> Result<AcceptedHistoryStepBankTip, HistoryStepError> {
+        let mut pending = pending;
+        pending.discharge_class_matrices(|class| self.load_matrix(class))?;
+        pending.check_client_lanes_with(self.bank.client_form(), matrices)?;
+        pending.finish().map_err(Into::into)
+    }
 }
 
 /// One runtime HistoryStep witness. It contains no relation rows and cannot be
@@ -1246,6 +1267,7 @@ pub struct AcceptedHistoryStepTerminal {
     semantic_id: [u8; 32],
     class_id: CanonicalHistoryStepClassId,
     accumulator: ChainAccumulator,
+    client: Option<crate::acceptance::history_step_bank::HistoryStepClientClaim>,
 }
 
 impl AcceptedHistoryStepTerminal {
@@ -1263,6 +1285,15 @@ impl AcceptedHistoryStepTerminal {
 
     pub const fn accumulator(&self) -> &ChainAccumulator {
         &self.accumulator
+    }
+
+    /// The terminal's checked client lanes (v1.5): the carried client and the
+    /// 16 registry leaves the block publishes. `None` under a generation
+    /// without the client slot.
+    pub fn client_claim(
+        &self,
+    ) -> Option<&crate::acceptance::history_step_bank::HistoryStepClientClaim> {
+        self.client.as_ref()
     }
 }
 
@@ -2073,6 +2104,55 @@ pub fn verify_history_step_terminal_rooted(
     previous_epoch_anchor_header: Option<&BlockHeader>,
     expected_recursion_root: Option<&RecursionRoot>,
 ) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
+    verify_history_step_terminal_rooted_by(
+        runtime,
+        terminal,
+        expected_header,
+        epoch_anchor_header,
+        previous_epoch_anchor_header,
+        expected_recursion_root,
+        |pending| runtime.decide(pending),
+    )
+}
+
+/// [`verify_history_step_terminal_rooted`] with the client lanes decided
+/// against the registered matrices a node holds (M3.8,
+/// [`HistoryStepRuntime::decide_with_client_matrices`]). The accepted
+/// terminal reports the checked client lanes
+/// ([`AcceptedHistoryStepTerminal::client_claim`]) for the node to compare
+/// with the chain.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_history_step_terminal_rooted_with_client_matrices(
+    runtime: &HistoryStepRuntime,
+    terminal: &HistoryStepTerminal,
+    expected_header: &BlockHeader,
+    epoch_anchor_header: &BlockHeader,
+    previous_epoch_anchor_header: Option<&BlockHeader>,
+    expected_recursion_root: Option<&RecursionRoot>,
+    matrices: Option<&dyn super::client_arm::HistoryStepClientMatrices>,
+) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
+    verify_history_step_terminal_rooted_by(
+        runtime,
+        terminal,
+        expected_header,
+        epoch_anchor_header,
+        previous_epoch_anchor_header,
+        expected_recursion_root,
+        |pending| runtime.decide_with_client_matrices(pending, matrices),
+    )
+}
+
+fn verify_history_step_terminal_rooted_by(
+    runtime: &HistoryStepRuntime,
+    terminal: &HistoryStepTerminal,
+    expected_header: &BlockHeader,
+    epoch_anchor_header: &BlockHeader,
+    previous_epoch_anchor_header: Option<&BlockHeader>,
+    expected_recursion_root: Option<&RecursionRoot>,
+    decide: impl FnOnce(
+        PendingHistoryStepBankDecision,
+    ) -> Result<AcceptedHistoryStepBankTip, HistoryStepError>,
+) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
     let accumulator = validate_terminal_metadata(
         runtime,
         terminal,
@@ -2084,7 +2164,7 @@ pub fn verify_history_step_terminal_rooted(
         expected_recursion_root,
     )?;
     let pending = verify_history_step_pending(runtime, terminal.class_id, &terminal.proof)?;
-    let accepted = runtime.decide(pending)?;
+    let mut accepted = decide(pending)?;
     if accepted.tip_class() != terminal.class_id
         || accepted.block_accumulator()
             != block_acc_lanes_for(runtime.bank().generation(), &accumulator).as_slice()
@@ -2101,6 +2181,7 @@ pub fn verify_history_step_terminal_rooted(
         semantic_id: terminal.semantic_id,
         class_id: terminal.class_id,
         accumulator,
+        client: accepted.take_client(),
     })
 }
 
