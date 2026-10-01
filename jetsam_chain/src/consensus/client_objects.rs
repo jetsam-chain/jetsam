@@ -1102,6 +1102,26 @@ fn check_license_paid(
     Ok(())
 }
 
+/// Upper bound of one client proof on the wire: the fixed, unshared length
+/// of the pinned client form (m = 22, decision D2), as computed by
+/// `history_step_client_proof_max_wire_bytes` (pinned against it by a
+/// `client-slot` test). The transport refuses a longer proof before reading it.
+pub const CLIENT_PROOF_MAX_WIRE_BYTES: usize = 509_009;
+
+/// Whether the logical transaction `pages` pays `submission`: exactly one
+/// marker output among its live outputs, of zero value, opening it.
+pub fn pays_submission(pages: &[jetsam_tx::TxPage], submission: &ClientSubmission) -> bool {
+    let marker = ClientObject::Submission(*submission).marker();
+    let mut markers = pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs())
+        .filter(|(_, output)| client_object_marker_kind(&output.owner).is_some());
+    matches!(
+        (markers.next(), markers.next()),
+        (Some((_, output)), None) if output.owner == marker && output.amount == 0
+    )
+}
+
 /// Mempool policy for one plain logical transaction (`pages`) offered for
 /// the block at `next_height`: a spend from a locked owner can never be mined,
 /// and a paying transaction (one with a marker) is mined only with its object.

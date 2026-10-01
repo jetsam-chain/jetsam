@@ -66,3 +66,17 @@ fn the_chain_registry_root_is_the_client_arm_registry_root() {
         }
     }
 }
+
+/// The transport bound of a client proof (M3 task 3.7) is the fixed wire
+/// bound of the pinned client form.
+#[test]
+fn the_transport_bound_is_the_client_form_bound() {
+    use jetsam_recursive::acceptance::history_step_bank::HistoryStepClientForm;
+    assert_eq!(
+        jetsam_recursive::history_step_client_proof_max_wire_bytes(
+            &HistoryStepClientForm::canonical()
+        )
+        .unwrap(),
+        jetsam_chain::consensus::client_objects::CLIENT_PROOF_MAX_WIRE_BYTES
+    );
+}

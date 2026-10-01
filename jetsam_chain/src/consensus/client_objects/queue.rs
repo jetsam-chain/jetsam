@@ -19,8 +19,7 @@ use jetsam_poseidon2b::primitives::Digest;
 use jetsam_tx::PagedSpendIntent;
 
 use super::{
-    client_object_marker_kind, ClientObject, ClientObjectRules, ClientRegistryState,
-    ClientSubmission,
+    pays_submission, ClientObject, ClientObjectRules, ClientRegistryState, ClientSubmission,
 };
 use crate::block::Block;
 use crate::block_header::BlockHeader;
@@ -113,16 +112,7 @@ impl<T> ClientSubmissionQueue<T> {
     ) -> Result<Option<ClientCandidate<T>>, ClientQueueError> {
         let spend = jetsam_tx::validate_paged_spend(&candidate.payment.pages)
             .map_err(|_| ClientQueueError::MalformedPayment)?;
-        let marker = ClientObject::Submission(candidate.submission).marker();
-        let markers: Vec<_> = candidate
-            .payment
-            .pages
-            .iter()
-            .flat_map(|page| page.body.live_outputs())
-            .filter(|(_, output)| client_object_marker_kind(&output.owner).is_some())
-            .map(|(_, output)| (output.owner, output.amount))
-            .collect();
-        if markers != [(marker, 0)] {
+        if !pays_submission(&candidate.payment.pages, &candidate.submission) {
             return Err(ClientQueueError::NotThePayment);
         }
         if spend.fee < rules.submission_fee_micro {

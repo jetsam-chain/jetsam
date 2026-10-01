@@ -1427,3 +1427,26 @@ fn a_plain_transaction_neither_spends_a_locked_owner_nor_pays_an_object() {
         );
     }
 }
+
+#[test]
+fn a_payment_names_exactly_one_submission() {
+    let sub = submission(0x10, 0x20);
+    let marker = ClientObject::Submission(sub).marker();
+    let pages = |outputs: &[(Address, u64)]| -> Vec<jetsam_tx::TxPage> {
+        logical(100, PAYER, outputs, 10)
+            .into_iter()
+            .map(|tx| jetsam_tx::TxPage { body: tx.body })
+            .collect()
+    };
+    assert!(pays_submission(&pages(&[(marker, 0)]), &sub));
+    assert!(pays_submission(&pages(&[(TREASURY, 3), (marker, 0)]), &sub));
+    assert!(!pays_submission(&pages(&[(TREASURY, 3)]), &sub));
+    assert!(!pays_submission(&pages(&[(marker, 1)]), &sub));
+    assert!(!pays_submission(&pages(&[(marker, 0), (marker, 0)]), &sub));
+    assert!(!pays_submission(
+        &pages(&[(marker, 0)]),
+        &submission(0x10, 0x21)
+    ));
+    let registration_marker = ClientObject::Registration(registration(0x10)).marker();
+    assert!(!pays_submission(&pages(&[(registration_marker, 0)]), &sub));
+}
