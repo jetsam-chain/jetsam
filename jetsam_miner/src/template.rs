@@ -641,6 +641,19 @@ impl TemplateBuilder {
         } else {
             crate::client_slot::TemplateClientSlot::default()
         };
+        if !client_slot.objects.is_empty() {
+            tracing::info!(
+                height = child_height,
+                objects = client_slot.objects.len(),
+                carries = %client_slot
+                    .carried
+                    .as_ref()
+                    .map(|client| hex::encode(&client.digest()[..8]))
+                    .unwrap_or_default(),
+                registers = client_slot.registry_leaves.is_some(),
+                "template carries v1.5 client objects"
+            );
+        }
 
         let selected_stream =
             jetsam_chain::consensus::validate_paged_spend_transaction_stream(&inner.txs)
