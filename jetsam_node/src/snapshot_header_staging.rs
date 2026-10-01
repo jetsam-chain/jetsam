@@ -1322,9 +1322,9 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jetsam_chain::consensus::expected_target;
     use jetsam_chain::consensus::genesis::genesis_header;
-    use jetsam_chain::consensus::next_target;
-    use jetsam_chain::consensus::params::BLOCK_TIME;
+    use jetsam_chain::consensus::params::block_time_at;
     use std::sync::OnceLock;
 
     #[test]
@@ -1452,7 +1452,7 @@ mod tests {
                     .iter()
                     .find(|header| header.height == anchor_height)
                     .expect("short fixture anchor");
-                let timestamp = parent.timestamp + BLOCK_TIME;
+                let timestamp = parent.timestamp + block_time_at(height);
                 let header = BlockHeader {
                     prev_block_hash: hash_block_header(&parent),
                     state_root: [height as u8; 32],
@@ -1461,8 +1461,9 @@ mod tests {
                     height,
                     miner_address: parent.miner_address,
                     nonce: FIXTURE_CHAIN_NONCE,
-                    // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
-                    difficulty_target: next_target(
+                    // JETSAM CHANGE: ASERT anchored on the parent's timestamp,
+                    // through the function the validator calls.
+                    difficulty_target: expected_target(
                         anchor_height,
                         anchor.timestamp,
                         &anchor.difficulty_target,
@@ -1498,10 +1499,11 @@ mod tests {
 
     fn native_coinbase_child(chain: &jetsam_chain::storage::MdbxChainContext) -> jetsam_chain::Block {
         let parent = *chain.tip_header();
-        let timestamp = parent.timestamp + BLOCK_TIME;
+        let timestamp = parent.timestamp + block_time_at(parent.height + 1);
         let anchor = chain.anchor_info().unwrap();
-        // JETSAM CHANGE: ASERT anchored on the parent's timestamp.
-        let difficulty_target = next_target(
+        // JETSAM CHANGE: ASERT anchored on the parent's timestamp, through the
+        // function the validator calls.
+        let difficulty_target = expected_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
             &anchor.anchor_target,
@@ -1555,7 +1557,7 @@ mod tests {
                 .unwrap();
         let mut bad_second = fixture_chain()[1];
         bad_second.height = 2;
-        bad_second.timestamp += BLOCK_TIME;
+        bad_second.timestamp += block_time_at(2);
         bad_second.prev_block_hash = [0xAA; 32];
         assert!(staging
             .append_batch(store, &[fixture_chain()[1], bad_second])

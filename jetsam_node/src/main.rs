@@ -7799,10 +7799,11 @@ mod tests {
         parent: &jetsam_chain::BlockHeader,
         state: &jetsam_chain::ChainState,
     ) -> jetsam_chain::block::Block {
-        let timestamp = parent.timestamp + jetsam_chain::consensus::params::BLOCK_TIME;
+        let timestamp =
+            parent.timestamp + jetsam_chain::consensus::params::block_time_at(parent.height + 1);
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
-        // block's own. Must mirror consensus::header::validate_header_inner.
-        let difficulty_target = jetsam_chain::consensus::difficulty::next_target(
+        // block's own, through the function consensus::header calls.
+        let difficulty_target = jetsam_chain::consensus::expected_target(
             0,
             parent.timestamp,
             &parent.difficulty_target,

@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use jetsam_chain::block::Block;
 use jetsam_chain::block_header::BlockHeader;
-use jetsam_chain::consensus::difficulty::next_target;
+use jetsam_chain::consensus::difficulty::expected_target;
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::pow::block_id;
 use jetsam_chain::consensus::template::BlockTemplate as ChainTemplate;
@@ -335,7 +335,8 @@ impl TemplateBuilder {
 
     /// Build a B25-default template from a pre-captured chain snapshot.
     ///
-    /// Computes the ASERT difficulty target correctly using `next_target()`.
+    /// Computes the difficulty target with `expected_target()`, the function
+    /// the validator calls.
     pub async fn build_from_snapshot(
         &self,
         snapshot: TemplateChainSnapshot,
@@ -388,24 +389,21 @@ impl TemplateBuilder {
         // MUST stay identical: a mismatch produces templates whose target the
         // network rejects.
         //
-        // JETSAM CHANGE (v1.4): the first block of the new proof-of-work carries a
-        // constant target, not an ASERT one. `validate_header_inner` demands it, so
-        // a template that computed ASERT here would be rejected at that one height
-        // and the chain would stall at `activation - 1` — the exact failure the
-        // constant exists to prevent. `None` on every profile today.
+        // JETSAM CHANGE (v1.4, v1.5): the first block of each new regime carries a
+        // constant target, and ASERT is bounded by height (180-second blocks from
+        // the v1.5 height). `expected_target` is the very function
+        // `validate_header_inner` calls, so the template and the validator can no
+        // longer disagree — a template that computed plain ASERT here was rejected
+        // at the activation height and stalled the chain at `activation - 1`.
         let anchor = &snapshot.anchor;
         let child_height = parent.height + 1;
-        let difficulty_target =
-            match jetsam_chain::consensus::params::v1_4_boundary_target(child_height) {
-                Some(target) => target,
-                None => next_target(
-                    anchor.anchor_height,
-                    anchor.anchor_timestamp,
-                    &anchor.anchor_target,
-                    child_height,
-                    parent.timestamp,
-                ),
-            };
+        let difficulty_target = expected_target(
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+            child_height,
+            parent.timestamp,
+        );
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;

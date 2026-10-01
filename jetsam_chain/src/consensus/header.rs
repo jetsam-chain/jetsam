@@ -11,7 +11,7 @@
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{
-    difficulty::next_target,
+    difficulty::{expected_target, DifficultySchedule},
     expected_child_log_slots,
     params::{CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH},
     pow::{block_id, validate_pow},
@@ -200,18 +200,20 @@ fn validate_header_inner(
     // times more expensive at that height, and ASERT anchors on the parent's
     // timestamp — so a block that does not arrive never makes the target easier,
     // and carrying the pre-fork target across the boundary would stall the chain
-    // rather than slow it. See `params::V1_4_ANCHOR_TARGET`. Below the activation
-    // height, and today on every profile, this returns `None` and nothing changes.
-    let expected_target = match crate::consensus::params::v1_4_boundary_target(header.height) {
-        Some(target) => target,
-        None => next_target(
-            anchor_height,
-            anchor_timestamp,
-            anchor_target,
-            header.height,
-            parent.timestamp,
-        ),
-    };
+    // rather than slow it. See `params::V1_4_ANCHOR_TARGET`.
+    //
+    // JETSAM CHANGE (v1.5): the same at the v1.5 height
+    // (`params::V1_5_ANCHOR_TARGET`), and ASERT itself bounded by height: the
+    // ideal interval is 180 s from that height on, 90 s below it, so no header
+    // the chain already holds is re-judged. `expected_target` is the one place
+    // that logic lives; the miner's template calls the same function.
+    let expected_target = expected_target(
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+        header.height,
+        parent.timestamp,
+    );
     if header.difficulty_target != expected_target {
         return Err(ConsensusError::BadDifficultyTarget);
     }
@@ -271,28 +273,50 @@ pub(crate) fn check_hard_checkpoint(
 /// anchor is additionally floored at the activation height. Without that floor a
 /// block just past the fork would be anchored on a target calibrated for a digest
 /// twenty times cheaper, and would inherit a difficulty that has no meaning under
-/// the new one. The floor is a no-op below the activation height, and `None` —
-/// which is what every profile ships — makes it a no-op everywhere.
+/// the new one. The floor is a no-op below the activation height, and `None`
+/// makes it a no-op everywhere.
+///
+/// JETSAM CHANGE (v1.5): floored at the v1.5 height as well, for the same
+/// reason with a different cause — the interval doubles there, and an anchor
+/// below it would measure 180-second blocks against a 90-second history. With
+/// both floors, no ASERT span ever straddles either boundary.
 pub fn asert_anchor_height(current_height: u64) -> u64 {
-    asert_anchor_height_with(
-        current_height,
-        crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
-    )
+    DifficultySchedule::PRODUCTION.anchor_height(current_height)
 }
 
-/// Testable twin of [`asert_anchor_height`] with the activation height injected.
+/// Testable twin of [`asert_anchor_height`] with only the v1.4 floor injected
+/// (the v1.5 clock dormant).
 ///
-/// The production constant is `None`, so the floor cannot be exercised through
-/// [`asert_anchor_height`] while the fork is dormant. This seam is how the armed
-/// behaviour is tested before it is armed, rather than the first time it runs on a
-/// live chain.
+/// The production constant was `None` for a long time, so the floor could not be
+/// exercised through [`asert_anchor_height`] while the fork was dormant. This seam
+/// is how the armed behaviour is tested before it is armed, rather than the first
+/// time it runs on a live chain.
 #[inline]
 pub(crate) fn asert_anchor_height_with(current_height: u64, activation: Option<u64>) -> u64 {
-    let epoch_anchor = (current_height / EPOCH_LENGTH) * EPOCH_LENGTH;
-    match activation {
-        Some(activation) if current_height >= activation => epoch_anchor.max(activation),
-        _ => epoch_anchor,
+    asert_anchor_height_with_clocks(current_height, activation, None)
+}
+
+/// [`asert_anchor_height`] with both floors injected: the latest epoch boundary
+/// at or below `current_height`, raised to each armed activation height that
+/// `current_height` has reached.
+#[inline]
+pub(crate) const fn asert_anchor_height_with_clocks(
+    current_height: u64,
+    v1_4_activation: Option<u64>,
+    v1_5_activation: Option<u64>,
+) -> u64 {
+    let mut anchor = (current_height / EPOCH_LENGTH) * EPOCH_LENGTH;
+    if let Some(activation) = v1_4_activation {
+        if current_height >= activation && activation > anchor {
+            anchor = activation;
+        }
     }
+    if let Some(activation) = v1_5_activation {
+        if current_height >= activation && activation > anchor {
+            anchor = activation;
+        }
+    }
+    anchor
 }
 
 /// Returns `true` if a block at `height` is considered final (cannot be reorged).
@@ -303,6 +327,7 @@ pub fn is_final(block_height: u64, tip_height: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::difficulty::next_target;
     use crate::consensus::params::BLOCK_TIME;
     use jetsam_poseidon2b::primitives::Address;
     // Any hash satisfies this target — nonce=0 always works, no search needed.
@@ -620,6 +645,47 @@ mod tests {
             assert_eq!(
                 asert_anchor_height_with(h, None),
                 (h / EPOCH_LENGTH) * EPOCH_LENGTH
+            );
+        }
+    }
+
+    /// The v1.5 floor, on top of the v1.4 one. A real J is a multiple of 960,
+    /// hence of 6, where the floor and the epoch boundary coincide; the tests
+    /// also take a J that is not, which is the case where the floor decides.
+    #[test]
+    fn the_v1_5_activation_floors_the_asert_anchor_on_top_of_the_v1_4_floor() {
+        let v1_4 = Some(1_000u64);
+        for j in [30_720u64, 30_721, 30_725] {
+            let v1_5 = Some(j);
+            for h in (j - 20)..j {
+                assert_eq!(
+                    asert_anchor_height_with_clocks(h, v1_4, v1_5),
+                    asert_anchor_height_with(h, v1_4),
+                    "below J the anchor rule is unchanged"
+                );
+            }
+            for h in j..(j + 40) {
+                let anchor = asert_anchor_height_with_clocks(h, v1_4, v1_5);
+                assert_eq!(anchor, ((h / EPOCH_LENGTH) * EPOCH_LENGTH).max(j), "h {h}");
+                assert!(anchor >= j && anchor <= h);
+            }
+            assert_eq!(asert_anchor_height_with_clocks(j, None, v1_5), j);
+        }
+        for h in [0u64, 5, 999, 1_000, 30_719, 30_720, 30_725, u64::MAX] {
+            assert_eq!(
+                asert_anchor_height_with_clocks(h, v1_4, None),
+                asert_anchor_height_with(h, v1_4)
+            );
+        }
+        // Production reads the profile's two clocks.
+        for h in [0u64, 100, 24_845, 24_846, 24_850, 30_720, 1_000_000] {
+            assert_eq!(
+                asert_anchor_height(h),
+                asert_anchor_height_with_clocks(
+                    h,
+                    crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
+                    crate::consensus::params::V1_5_ACTIVATION_HEIGHT,
+                )
             );
         }
     }

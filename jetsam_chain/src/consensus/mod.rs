@@ -74,7 +74,8 @@ pub use development_allocation::{
     DEVELOPMENT_SHARE_DENOMINATOR, NETWORK_FUND_ADDRESS, LAB_FUND_ADDRESS,
 };
 pub use difficulty::{
-    add_work, block_work, le256_lt, next_target, target_leading_zero_bits, work_gt,
+    add_work, block_work, expected_target, le256_lt, next_target, target_leading_zero_bits,
+    work_gt, DifficultySchedule,
 };
 pub use emission::{
     block_reward, format_eld, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum,

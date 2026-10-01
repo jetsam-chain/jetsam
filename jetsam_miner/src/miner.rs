@@ -83,16 +83,33 @@ pub struct MinerConfig {
     /// payout, or coinbase-only mempool input changes.
     /// This timer exists only for edge cases where both are silent.
     ///
-    /// Must be > BLOCK_TIME to avoid firing during active proving and
-    /// inserting unnecessary coinbase blocks. Default: 5 × BLOCK_TIME.
+    /// Must be > the block interval to avoid firing during active proving and
+    /// inserting unnecessary coinbase blocks. Default: 5 × the released 90 s
+    /// interval, 450 s.
     pub refresh_interval_secs: u64,
 }
+
+/// The default safety-net heartbeat: five released (90 s) intervals, 450 s.
+///
+/// JETSAM CHANGE (v1.5): deliberately NOT read at a height. It is a timer set
+/// once when the miner starts, not a rule a block is judged by, and a node
+/// started before the v1.5 height keeps running across it. 450 s is still
+/// 2.5 intervals of the 180-second v1.5 block — above one interval, which is
+/// all the contract asks — and keeping it leaves every pre-v1.5 behaviour of
+/// the miner unchanged. The assertion below holds it to that on both sides.
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = jetsam_chain::consensus::params::BLOCK_TIME * 5;
+
+const _: () = assert!(
+    DEFAULT_REFRESH_INTERVAL_SECS > jetsam_chain::consensus::params::BLOCK_TIME
+        && DEFAULT_REFRESH_INTERVAL_SECS > jetsam_chain::consensus::params::BLOCK_TIME_V1_5,
+    "the heartbeat must outlast one block interval on both sides of the v1.5 height"
+);
 
 impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            refresh_interval_secs: jetsam_chain::consensus::params::BLOCK_TIME * 5,
+            refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
         }
     }
 }
@@ -626,7 +643,10 @@ impl BlockMiner {
                     b255_prepare_ms_ewma,
                     "miner proof capacity changed"
                 );
-            } else if crate::proof_capacity::preparation_starves_proof_of_work(prepare_elapsed) {
+            } else if crate::proof_capacity::preparation_starves_proof_of_work(
+                prepare_elapsed,
+                observed_child_height,
+            ) {
                 // The limit only moves when the admissible class moves, so a
                 // node that keeps its class and merely becomes too slow to use
                 // it says nothing at all: it stops winning blocks during the
@@ -638,7 +658,8 @@ impl BlockMiner {
                     ?proof_class,
                     page_limit = next_page_limit,
                     prepare_ms = prepare_elapsed.as_millis(),
-                    block_time_secs = jetsam_chain::consensus::params::BLOCK_TIME,
+                    block_time_secs =
+                        jetsam_chain::consensus::params::block_time_at(observed_child_height),
                     b25_prepare_ms_ewma,
                     b255_prepare_ms_ewma,
                     "proving consumed most of the block interval — little of it was left to \
@@ -816,7 +837,8 @@ impl BlockMiner {
                             // Count leading zeros of the difficulty target (MSB-first, LE).
                             // Matches block_work() in difficulty.rs — higher = harder.
                             // Genesis = 27lz. ASERT raises this when blocks arrive faster
-                            // than BLOCK_TIME and lowers it when they're slower.
+                            // than the block interval (90 s, 180 s from v1.5) and lowers
+                            // it when they're slower.
                             let diff_lz = jetsam_chain::consensus::target_leading_zero_bits(
                                 &sealed_header.difficulty_target,
                             );

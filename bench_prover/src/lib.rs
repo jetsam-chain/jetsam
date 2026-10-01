@@ -809,28 +809,27 @@ impl HonestHistoryStepFixtureProvider {
         }
         let (candidates, authorities, next_user_spendables, next_output_slot_cursor) =
             child_user_transactions(checkpoint, user_count, self.seed, nonce_domain)?;
+        let child_height = checkpoint.parent_header.height + 1;
+        // On schedule: one interval of the child's own rule (90 s, 180 s from
+        // the v1.5 height).
         let timestamp = checkpoint
             .parent_header
             .timestamp
-            .checked_add(jetsam_chain::consensus::params::BLOCK_TIME)
+            .checked_add(jetsam_chain::consensus::params::block_time_at(child_height))
             .ok_or_else(|| "fixture timestamp overflow".to_owned())?;
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
-        // block's own. Must mirror consensus::header::validate_header_inner —
-        // including the v1.4 boundary block, which carries a constant target
-        // rather than an ASERT one. A fixture that forgot it would build
-        // unvalidatable blocks at exactly one height, and only once the fork is
-        // armed, which is the worst moment to discover it.
-        let child_height = checkpoint.parent_header.height + 1;
-        let target = match jetsam_chain::consensus::params::v1_4_boundary_target(child_height) {
-            Some(boundary) => boundary,
-            None => jetsam_chain::consensus::next_target(
-                checkpoint.asert_anchor.anchor_height,
-                checkpoint.asert_anchor.anchor_timestamp,
-                &checkpoint.asert_anchor.anchor_target,
-                child_height,
-                checkpoint.parent_header.timestamp,
-            ),
-        };
+        // block's own, through the very function consensus::header calls —
+        // boundary targets (v1.4, v1.5) and the height-bounded interval
+        // included. A fixture that diverged from it would build unvalidatable
+        // blocks at exactly one height, and only once a fork is armed, which is
+        // the worst moment to discover it.
+        let target = jetsam_chain::consensus::expected_target(
+            checkpoint.asert_anchor.anchor_height,
+            checkpoint.asert_anchor.anchor_timestamp,
+            &checkpoint.asert_anchor.anchor_target,
+            child_height,
+            checkpoint.parent_header.timestamp,
+        );
         let miner_seed = self
             .seed
             .wrapping_add(0x3000_0000)
