@@ -867,3 +867,83 @@ fn a_snapshot_carries_the_exact_registry_and_refuses_a_forged_one() {
         assert!(installed.is_empty());
     }
 }
+
+/// Decision of 01/10: a block may register several clients. Both are
+/// appended in the order of their paying transactions, and the block's
+/// terminal must publish both leaves.
+#[test]
+fn a_block_registers_several_clients() {
+    let _rules = test_rules::install(armed_rules());
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let first = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &first).unwrap();
+    let second = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &second).unwrap();
+    let a = ClientRegistration {
+        matrix_digest: [0xA1; 32],
+        matrix_file_root: [0xF1; 32],
+        matrix_file_len: 4_096,
+    };
+    let b = ClientRegistration {
+        matrix_digest: [0xB2; 32],
+        matrix_file_root: [0xF2; 32],
+        matrix_file_len: 8_192,
+    };
+    let (object_a, object_b) = (ClientObject::Registration(a), ClientObject::Registration(b));
+    let pays_a = spend_coinbase(
+        &context,
+        &first,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object_a.marker(), 0),
+        ],
+    );
+    let pays_b = spend_coinbase(
+        &context,
+        &second,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object_b.marker(), 0),
+        ],
+    );
+    // The template orders the paying transactions (by fee); the objects
+    // follow their markers in that order.
+    let probe = bundle_with(
+        &mut context,
+        MINER,
+        vec![pays_a.clone(), pays_b.clone()],
+        vec![object_a, object_b],
+    );
+    let probe = Block::from_bytes(probe.block_bytes()).unwrap();
+    let objects: Vec<ClientObject> = probe
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.body.live_outputs().map(|(_, output)| output.owner).collect::<Vec<_>>())
+        .filter_map(|owner| [object_a, object_b].into_iter().find(|object| object.marker() == owner))
+        .collect();
+    assert_eq!(objects.len(), 2);
+    let third = bundle_with(&mut context, MINER, vec![pays_a, pays_b], objects.clone());
+    // Only one of the two leaves published: refused.
+    let one_leaf = {
+        let mut view = honest_view(&context, &objects, None);
+        let leaves = view.registry_leaves.as_mut().unwrap();
+        leaves[1] = [0u8; 32];
+        view
+    };
+    refused_with(
+        apply_with_view(&mut context, &third, one_leaf),
+        ClientObjectError::RegistryLeavesMismatch,
+    );
+    apply(&mut context, &third).unwrap();
+    let registered: Vec<_> = context
+        .client_registry()
+        .entries()
+        .iter()
+        .map(|entry| (entry.index, entry.registered_at))
+        .collect();
+    assert_eq!(registered, vec![(0, 3), (1, 3)]);
+    let mut digests = context.client_registry().digests();
+    digests.sort();
+    assert_eq!(digests, vec![[0xA1; 32], [0xB2; 32]]);
+}

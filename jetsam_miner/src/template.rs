@@ -478,7 +478,14 @@ impl TemplateBuilder {
                             .first()
                             .is_some_and(|page| anchor_ok(&page.body.epoch_anchor))
                     })
-                    .take(jetsam_chain::consensus::client_objects::MAX_BLOCK_CLIENT_REGISTRATIONS)
+                    // Several per block (decision of 2026-10-01), within
+                    // what the registry still holds.
+                    .take(
+                        client_rules
+                            .registry_capacity
+                            .min(jetsam_chain::consensus::client_objects::MAX_BLOCK_CLIENT_REGISTRATIONS)
+                            .saturating_sub(snapshot.client_registry.len()),
+                    )
                 {
                     offered.objects.push(
                         jetsam_chain::consensus::client_objects::ClientObject::Registration(

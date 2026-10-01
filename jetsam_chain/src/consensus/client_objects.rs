@@ -142,10 +142,12 @@ pub const CLIENT_MATRIX_MAX_FILE_BYTES: u32 = 16 * 1024 * 1024;
 /// One client proof per block: the HistoryStep relation has one client arm.
 pub const MAX_BLOCK_CLIENT_SUBMISSIONS: usize = 1;
 
-/// One registration per block. The relation's published leaves (M3.4) would
-/// admit several appended leaves per block; one is kept by decision (01/10),
-/// as the simpler rule.
-pub const MAX_BLOCK_CLIENT_REGISTRATIONS: usize = 1;
+/// Registrations one block may carry: as many as the registry holds. The
+/// relation publishes the 16 leaves (M3.4), so a block may append several;
+/// decided on 2026-10-01 (the one-per-block rule of `a850324` is lifted). The
+/// registry capacity, the refusal of a digest already registered and the
+/// license of each registration still bound them.
+pub const MAX_BLOCK_CLIENT_REGISTRATIONS: usize = CLIENT_REGISTRY_CAPACITY;
 
 /// Wire cap of one block's object list.
 pub const MAX_BLOCK_CLIENT_OBJECTS: usize =
@@ -898,8 +900,6 @@ pub enum ClientObjectError {
         paid: u64,
     },
     TooManySubmissions,
-    /// More than [`MAX_BLOCK_CLIENT_REGISTRATIONS`] registrations in a block.
-    TooManyRegistrations,
     ClientNotRegistered {
         matrix_digest: Digest,
     },
@@ -1021,9 +1021,6 @@ pub fn validate_block_client_objects(
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         match object {
             ClientObject::Registration(registration) => {
-                if effect.registrations.len() >= MAX_BLOCK_CLIENT_REGISTRATIONS {
-                    return Err(ClientObjectError::TooManyRegistrations);
-                }
                 if registration.matrix_digest == [0u8; 32] {
                     return Err(ClientObjectError::NullMatrixDigest);
                 }
@@ -1323,7 +1320,8 @@ pub fn check_terminal_client_view(
 /// - each entry's marker opens exactly one slot minted after the v1.5 height,
 ///   of zero value, by the block the entry names: `alloc(r − 1) < creation_id
 ///   ≤ alloc(r)`, with `J ≤ r ≤ F` — this authenticates `D`, the file root and
-///   length, and `registered_at`;
+///   length, and `registered_at`; the entries' indices follow the order their
+///   markers were minted in (several per block are possible);
 /// - `active_from` and the license are what the rules give at `r`;
 /// - every registration marker minted after the v1.5 height opens an entry:
 ///   the registry omits none (they are counted while the slots stream past).
@@ -1393,10 +1391,7 @@ impl<'a> SnapshotRegistryCheck<'a> {
             if height < activation.max(1) || height > boundary_height {
                 return refuse("an entry registered outside the v1.5 range of the snapshot");
             }
-            if previous.is_some_and(|previous| {
-                height < previous
-                    || (MAX_BLOCK_CLIENT_REGISTRATIONS == 1 && height == previous)
-            }) {
+            if previous.is_some_and(|previous| height < previous) {
                 return refuse("entries out of registration order");
             }
             previous = Some(height);
@@ -1452,10 +1447,18 @@ impl<'a> SnapshotRegistryCheck<'a> {
         if self.unmatched != 0 {
             return refuse("a registration marker of the state opens no entry");
         }
+        let mut previous_creation: Option<u64> = None;
         for (entry, found) in self.registry.entries().iter().zip(&self.found) {
             let [(amount, creation_id)] = found.as_slice() else {
                 return refuse("an entry without exactly one marker slot in the state");
             };
+            // Entries are indexed in the order their markers were minted —
+            // across blocks and, since a block may register several, within
+            // one block (decision of 2026-10-01).
+            if previous_creation.is_some_and(|previous| previous >= *creation_id) {
+                return refuse("entries out of the order their markers were minted in");
+            }
+            previous_creation = Some(*creation_id);
             if *amount != 0 {
                 return refuse("a marker slot carrying value");
             }
