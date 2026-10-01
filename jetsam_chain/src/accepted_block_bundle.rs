@@ -419,6 +419,7 @@ mod tests {
                 alloc_counter: 0,
             },
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         }
     }
 

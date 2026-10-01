@@ -69,8 +69,11 @@ use crate::consensus::{
     pow::{block_id, validate_pow},
     slot_expansion::finalized_expansion_window,
     template::LocallyProvedBlockCommit,
-    validation::{validate_block_checks, AnchorInfo},
+    validation::{validate_block_checks_with_license_dividend, AnchorInfo},
     ConsensusError,
+};
+use crate::consensus::client_objects::{
+    validate_block_client_objects, ClientObjectRules, ClientObjectsEffect, ClientRegistryState,
 };
 use crate::segmented_state::SegmentedFriState;
 use crate::state::{ChainState, StreamingSparseRoot};
@@ -395,9 +398,61 @@ pub struct MdbxChainContext {
     /// `Some` suppresses per-block MDBX writes; the complete vector is installed
     /// together only after every replacement block succeeds.
     reorg_staging: Option<Vec<StagedAcceptedBlockCommit>>,
+
+    /// v1.5 client registry of the canonical branch at the tip.
+    client_registry: ClientRegistryState,
+}
+
+/// The registry bytes a commit writes: none under the dormant clock, so a
+/// dormant node's store is exactly what it was before v1.5.
+fn persisted_client_registry(registry: &ClientRegistryState) -> Option<&ClientRegistryState> {
+    ClientObjectRules::current()
+        .activation_height
+        .is_some()
+        .then_some(registry)
 }
 
 impl MdbxChainContext {
+    /// The v1.5 client registry of the canonical branch at the tip.
+    pub fn client_registry(&self) -> &ClientRegistryState {
+        &self.client_registry
+    }
+
+    /// Coinbase raise owed to the miner of `block` by license shares
+    /// (`Miners` variants of D5; zero under the provisional `Burn`).
+    fn license_dividend_for(&self, block: &Block) -> u64 {
+        self.client_registry
+            .license_dividend_at(block.header.height, &ClientObjectRules::current())
+    }
+
+    /// Native rules of `block`'s client objects against the registry of its
+    /// parent, the current tip.
+    fn validate_client_objects(
+        &self,
+        block: &Block,
+        parent: &BlockHeader,
+    ) -> Result<ClientObjectsEffect, MdbxContextError> {
+        validate_block_client_objects(
+            block,
+            &block.client_objects,
+            parent,
+            &self.client_registry,
+            &ClientObjectRules::current(),
+        )
+        .map_err(|error| MdbxContextError::Consensus(ConsensusError::ClientObject(error)))
+    }
+
+    /// The durable registry of the tip whose height is `tip_height`: an entry
+    /// above it can only belong to a branch that is no longer canonical.
+    fn load_client_registry(
+        store: &MdbxStore,
+        tip_height: u64,
+    ) -> Result<ClientRegistryState, MdbxContextError> {
+        let mut registry = store.get_client_registry()?.unwrap_or_default();
+        registry.truncate_above(tip_height);
+        Ok(registry)
+    }
+
     // -----------------------------------------------------------------------
     // Initialisation
     // -----------------------------------------------------------------------
@@ -666,6 +721,7 @@ impl MdbxChainContext {
                 finalized,
                 defer_finality_updates: false,
                 reorg_staging: None,
+                client_registry: ClientRegistryState::new(),
             };
             ctx.persist_genesis()?;
             Ok(ctx)
@@ -700,6 +756,7 @@ impl MdbxChainContext {
                         finalized,
                         defer_finality_updates: false,
                         reorg_staging: None,
+                        client_registry: ClientRegistryState::new(),
                     };
                     ctx.persist_genesis()?;
                     Ok(ctx)
@@ -736,6 +793,7 @@ impl MdbxChainContext {
             self.state.circulating_supply_micro_jtm,
             &meta,
             false,
+            None,
         )?;
         Ok(())
     }
@@ -827,6 +885,7 @@ impl MdbxChainContext {
 
         // 6. Use exact persisted cumulative chainwork.
         let tip_chain_work = meta.cumulative_chainwork;
+        let client_registry = Self::load_client_registry(&store, tip_height)?;
 
         Ok(Self {
             store,
@@ -838,6 +897,7 @@ impl MdbxChainContext {
             finalized,
             defer_finality_updates: false,
             reorg_staging: None,
+            client_registry,
         })
     }
 
@@ -928,9 +988,11 @@ impl MdbxChainContext {
                 "durable recent header window misses tip",
             ));
         }
+        let client_registry = Self::load_client_registry(&self.store, meta.tip_height)?;
 
         self.state = state;
         self.recent_headers = recent_headers;
+        self.client_registry = client_registry;
         self.tip_height = meta.tip_height;
         self.tip_hash = meta.tip_hash;
         self.tip_chain_work = meta.cumulative_chainwork;
@@ -1088,6 +1150,7 @@ impl MdbxChainContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_applied_next_block(
         &mut self,
         accepted_block: AcceptedBlockCommit<'_>,
@@ -1096,7 +1159,10 @@ impl MdbxChainContext {
         parent: &BlockHeader,
         parent_segment_summaries: &[ParentSegmentSummary],
         retain_persisted_segments: bool,
+        client_effect: &ClientObjectsEffect,
     ) -> Result<(), MdbxContextError> {
+        let mut next_client_registry = self.client_registry.clone();
+        next_client_registry.apply(client_effect);
         let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
             .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
         let block_hash = block_id(&block.header);
@@ -1158,6 +1224,7 @@ impl MdbxChainContext {
                     self.state.circulating_supply_micro_jtm,
                     &consensus_meta,
                     false,
+                    persisted_client_registry(&next_client_registry),
                 )
             })();
             if let Err(e) = commit_result {
@@ -1177,6 +1244,7 @@ impl MdbxChainContext {
         self.tip_hash = block_hash;
         self.tip_chain_work = new_tip_chain_work;
         self.finalized = new_finalized;
+        self.client_registry = next_client_registry;
         if !staged {
             self.state.state.clear_dirty();
             if !retain_persisted_segments {
@@ -1295,6 +1363,9 @@ impl MdbxChainContext {
         }
 
         let (block, accepted_bundle, post_state, undo) = proved.into_commit_parts();
+        // The local producer's objects pass the same native rules as a
+        // peer's: cheap, and the registry must not trust a template.
+        let client_effect = self.validate_client_objects(&block, &parent)?;
         if post_state.state.exact_dirty_segment_ids().next().is_some() {
             return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
                 "locally prepared post-state has an unsealed exact root".to_string(),
@@ -1342,6 +1413,7 @@ impl MdbxChainContext {
             &parent,
             &parent_segment_summaries,
             false,
+            &client_effect,
         )?;
         debug_assert_eq!(state_root, block.header.state_root);
         Ok((block, accepted_bundle))
@@ -1385,14 +1457,16 @@ impl MdbxChainContext {
         // All deterministic cheap checks, including bitmap-live resources
         // and the segment cap, precede proof decode, segment hydration, state
         // cloning, and undo allocation.
-        validate_block_checks(
+        validate_block_checks_with_license_dividend(
             block,
             &parent,
             &prev_timestamps,
             &finalized_active_counts,
             local_time,
             &anchor,
+            self.license_dividend_for(block),
         )?;
+        let client_effect = self.validate_client_objects(block, &parent)?;
 
         // The terminal is bound directly to this uncommitted candidate, never
         // to an older header fetched from storage. There is no canonical
@@ -1476,6 +1550,7 @@ impl MdbxChainContext {
             &parent,
             &parent_segment_summaries,
             false,
+            &client_effect,
         )?;
         Ok(state_root)
     }
@@ -1551,14 +1626,16 @@ impl MdbxChainContext {
             block_id(&parent),
             HistoryStepPackGeneration::at_height(block.header.height),
         )?;
-        validate_block_checks(
+        validate_block_checks_with_license_dividend(
             &block,
             &parent,
             &prev_timestamps,
             &finalized_active_counts,
             local_time,
             &anchor,
+            self.license_dividend_for(&block),
         )?;
+        let client_effect = self.validate_client_objects(&block, &parent)?;
         let checks_elapsed = checks_started.elapsed();
 
         let preload_started = Instant::now();
@@ -1635,6 +1712,7 @@ impl MdbxChainContext {
             &parent,
             &parent_segment_summaries,
             !is_final,
+            &client_effect,
         )?;
         let commit_elapsed = commit_started.elapsed();
 
@@ -2112,6 +2190,7 @@ impl MdbxChainContext {
         self.tip_height = ancestor_height;
         self.tip_hash = block_id(&ancestor_header);
         self.tip_chain_work = ancestor_chain_work;
+        self.client_registry.truncate_above(ancestor_height);
 
         // -----------------------------------------------------------------------
         // Validate the entire fork through the normal terminal-first applier,
@@ -2194,6 +2273,7 @@ impl MdbxChainContext {
                 &staged,
                 self.state.circulating_supply_micro_jtm,
                 &consensus_meta,
+                persisted_client_registry(&self.client_registry),
             )?;
             Ok(())
         })();
@@ -2724,6 +2804,9 @@ impl MdbxChainContext {
         self.tip_chain_work = cumulative_chainwork;
         self.finalized = finalized;
         self.defer_finality_updates = false;
+        // A snapshot does not carry the v1.5 client registry yet (M3.8): the
+        // install dropped the durable one, and the RAM copy follows it.
+        self.client_registry = ClientRegistryState::new();
         Ok(())
     }
 
@@ -2842,6 +2925,8 @@ impl MdbxChainContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod client_registry;
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
         test_next_bundle_for_miner(context, 0x44)
@@ -2965,6 +3050,7 @@ mod tests {
                     finalized,
                 },
                 false,
+                None,
             )
             .unwrap();
         MdbxChainContext {
@@ -2977,6 +3063,7 @@ mod tests {
             finalized,
             defer_finality_updates: false,
             reorg_staging: None,
+            client_registry: ClientRegistryState::new(),
         }
     }
 

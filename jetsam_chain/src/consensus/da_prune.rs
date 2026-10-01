@@ -212,6 +212,7 @@ mod tests {
                 alloc_counter: 1,
             },
             transactions: vec![tx],
+            client_objects: Vec::new(),
         }
     }
 

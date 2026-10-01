@@ -1465,6 +1465,7 @@ mod tests {
         let block = jetsam_chain::block::Block {
             header,
             transactions,
+            client_objects: Vec::new(),
         };
         let owned = std::collections::HashSet::from([owner.0]);
         let (recovered, history_changed) = recover_outgoing_receipts_from_block(
@@ -2209,6 +2210,7 @@ mod tests {
                 alloc_counter: 0,
             },
             transactions: vec![jetsam_tx::Transaction::new(body)],
+            client_objects: Vec::new(),
         };
 
         assert!(update_for_accepted_block(&handle.inner, &malformed).is_err());

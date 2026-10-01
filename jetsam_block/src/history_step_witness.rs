@@ -881,6 +881,7 @@ mod tests {
         let block = Block {
             header: template.to_pow_header(0),
             transactions: template.all_txs(),
+            client_objects: Vec::new(),
         };
         (block, state)
     }
@@ -972,6 +973,7 @@ mod tests {
         let block = Block {
             header: template.to_pow_header(0),
             transactions: template.all_txs(),
+            client_objects: Vec::new(),
         };
         (block, parent, state)
     }
@@ -1116,6 +1118,7 @@ mod tests {
         let block = Block {
             header: template.to_pow_header(0),
             transactions: template.all_txs(),
+            client_objects: Vec::new(),
         };
 
         let frontier = build_exact_state_frontier(&block, &state).expect("expansion frontier");

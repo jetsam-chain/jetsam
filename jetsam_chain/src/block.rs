@@ -43,6 +43,12 @@ pub struct Block {
     /// page stream. The legacy field name is retained to avoid copying the
     /// block body through every exact-state consumer.
     pub transactions: Vec<Transaction>,
+    /// v1.5 client objects (registrations, submissions), each one opened by
+    /// the zero-value marker of its paying transaction and committed through
+    /// it. Empty below the v1.5 height, and then absent from the wire: a block
+    /// without objects encodes exactly as before
+    /// (`consensus::client_objects`).
+    pub client_objects: Vec<crate::consensus::client_objects::ClientObject>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,9 +600,19 @@ fn take_u32(src: &mut &[u8]) -> Result<u32, WireError> {
 }
 
 impl Block {
-    /// Exact wire length derived only from the bounded fixed transaction count.
+    /// Exact wire length derived only from the bounded fixed transaction count
+    /// and the v1.5 object section, absent when empty.
     pub fn canonical_wire_len(&self) -> Result<usize, WireError> {
-        canonical_block_wire_len(self.transactions.len())
+        if self.client_objects.len() > crate::consensus::client_objects::MAX_BLOCK_CLIENT_OBJECTS {
+            return Err(WireError::LengthOverflow);
+        }
+        canonical_block_wire_len(self.transactions.len())?
+            .checked_add(
+                crate::consensus::client_objects::client_objects_section_wire_len(
+                    &self.client_objects,
+                ),
+            )
+            .ok_or(WireError::LengthOverflow)
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -627,6 +643,7 @@ impl Block {
                 .expect("validated block page stream has canonical page bodies");
             }
         }
+        crate::consensus::client_objects::encode_client_objects_section(&self.client_objects, buf);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -636,6 +653,19 @@ impl Block {
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
+        Self::decode_with_v1_5_activation(
+            src,
+            crate::consensus::client_objects::ClientObjectRules::current().activation_height,
+        )
+    }
+
+    /// [`Self::decode`] on an injected v1.5 clock. Below the v1.5 height an
+    /// object section is not part of a block: its bytes are trailing bytes,
+    /// exactly as before v1.5.
+    pub(crate) fn decode_with_v1_5_activation(
+        src: &mut &[u8],
+        v1_5_activation_height: Option<u64>,
+    ) -> Result<Self, WireError> {
         let marker = *take(src, 1)?.first().expect("one byte requested");
         if marker != BLOCK_WIRE_MARKER {
             return Err(WireError::BadMarker);
@@ -673,15 +703,37 @@ impl Block {
         if n > 0 {
             validate_block_page_stream(&transactions).map_err(|_| WireError::NonCanonicalBody)?;
         }
+        // The v1.5 object section, when present, ends the block. Any other
+        // trailing byte is left to the caller, exactly as before v1.5.
+        let v1_5 = matches!(v1_5_activation_height, Some(activation) if header.height >= activation);
+        let client_objects = if v1_5
+            && src.first() == Some(&crate::consensus::client_objects::CLIENT_OBJECTS_SECTION_MARKER)
+        {
+            crate::consensus::client_objects::decode_client_objects_section(src)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             header,
             transactions,
+            client_objects,
         })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
+        Self::from_bytes_with_v1_5_activation(
+            bytes,
+            crate::consensus::client_objects::ClientObjectRules::current().activation_height,
+        )
+    }
+
+    /// [`Self::from_bytes`] on an injected v1.5 clock.
+    pub(crate) fn from_bytes_with_v1_5_activation(
+        bytes: &[u8],
+        v1_5_activation_height: Option<u64>,
+    ) -> Result<Self, WireError> {
         let mut src = bytes;
-        let out = Self::decode(&mut src)?;
+        let out = Self::decode_with_v1_5_activation(&mut src, v1_5_activation_height)?;
         if !src.is_empty() {
             return Err(WireError::TrailingBytes);
         }
@@ -820,6 +872,7 @@ mod tests {
                 alloc_counter: dry.alloc_counter,
             },
             transactions: txs,
+            client_objects: Vec::new(),
         }
     }
 
@@ -884,6 +937,7 @@ mod tests {
                 alloc_counter: expected.alloc_counter,
             },
             transactions,
+            client_objects: Vec::new(),
         };
 
         let mut interpreted = initial.clone();
@@ -917,6 +971,70 @@ mod tests {
     }
 
     #[test]
+    fn v1_5_client_objects_follow_the_transactions_on_the_wire() {
+        use crate::consensus::client_objects::{
+            client_objects_section_wire_len, ClientObject, ClientRegistration, ClientSubmission,
+            CLIENT_OBJECTS_SECTION_MARKER,
+        };
+        let state = state();
+        let mut block = block_for(&state, vec![user_tx()]);
+        assert!(block.client_objects.is_empty());
+        let plain = block.to_bytes();
+        assert_eq!(block.canonical_wire_len(), Ok(plain.len()));
+
+        let objects = vec![
+            ClientObject::Registration(ClientRegistration {
+                matrix_digest: [1u8; 32],
+                matrix_file_root: [2u8; 32],
+                matrix_file_len: 3,
+            }),
+            ClientObject::Submission(ClientSubmission {
+                matrix_digest: [4u8; 32],
+                io_commitment: [5u8; 32],
+            }),
+        ];
+        block.client_objects = objects.clone();
+        let bytes = block.to_bytes();
+        // The transactions' bytes are unchanged; the section follows them.
+        assert_eq!(&bytes[..plain.len()], &plain[..]);
+        assert_eq!(bytes[plain.len()], CLIENT_OBJECTS_SECTION_MARKER);
+        assert_eq!(
+            bytes.len(),
+            plain.len() + client_objects_section_wire_len(&objects)
+        );
+        assert_eq!(block.canonical_wire_len(), Ok(bytes.len()));
+        let armed = Some(block.header.height);
+        let decode = |bytes: &[u8]| Block::from_bytes_with_v1_5_activation(bytes, armed);
+        assert_eq!(decode(&bytes), Ok(block.clone()));
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode(&trailing).is_err());
+        let mut not_a_section = plain.clone();
+        not_a_section.push(0);
+        assert_eq!(decode(&not_a_section), Err(WireError::TrailingBytes));
+        let mut empty_section = plain.clone();
+        empty_section.extend([CLIENT_OBJECTS_SECTION_MARKER, 0]);
+        assert!(decode(&empty_section).is_err());
+
+        // Below the v1.5 height, or with the clock dormant, the section is
+        // what it always was: trailing bytes.
+        for unarmed in [None, Some(block.header.height + 1)] {
+            assert_eq!(
+                Block::from_bytes_with_v1_5_activation(&bytes, unarmed),
+                Err(WireError::TrailingBytes)
+            );
+            assert_eq!(
+                Block::from_bytes_with_v1_5_activation(&plain, unarmed).map(|block| block.client_objects),
+                Ok(Vec::new())
+            );
+        }
+        if crate::consensus::params::V1_5_ACTIVATION_HEIGHT.is_none() {
+            assert_eq!(Block::from_bytes(&bytes), Err(WireError::TrailingBytes));
+        }
+    }
+
+    #[test]
     fn maximum_canonical_block_wire_is_exact() {
         let mut txs = vec![coinbase()];
         txs.extend((0..255).map(|index| {
@@ -942,6 +1060,7 @@ mod tests {
                 alloc_counter: 0,
             },
             transactions: txs,
+            client_objects: Vec::new(),
         };
         assert_eq!(block.canonical_wire_len(), Ok(82_905));
         assert_eq!(block.to_bytes().len(), 82_905);
@@ -1079,6 +1198,7 @@ mod tests {
                 alloc_counter: 0,
             },
             transactions,
+            client_objects: Vec::new(),
         };
         assert_eq!(Block::from_bytes(&block.to_bytes()), Ok(block));
     }
@@ -1141,6 +1261,7 @@ mod tests {
                 alloc_counter: 0,
             },
             transactions: vec![],
+            client_objects: Vec::new(),
         };
         assert!(apply_genesis_block(&mut state, &block).is_ok());
     }

@@ -304,6 +304,47 @@ impl ClientObjectRules {
     pub const fn active_at(&self, height: u64) -> bool {
         matches!(self.activation_height, Some(activation) if height >= activation)
     }
+
+    /// The rules in force: [`Self::CONSENSUS`]. In this crate's own unit
+    /// tests, a test may install other rules on its thread
+    /// ([`test_rules::install`]) so that the storage paths can be driven
+    /// through an armed clock and test-sized amounts.
+    pub fn current() -> Self {
+        #[cfg(test)]
+        if let Some(rules) = test_rules::installed() {
+            return rules;
+        }
+        Self::CONSENSUS
+    }
+}
+
+/// Per-thread rule injection for this crate's unit tests only.
+#[cfg(test)]
+pub(crate) mod test_rules {
+    use super::ClientObjectRules;
+    use std::cell::Cell;
+
+    thread_local! {
+        static INSTALLED: Cell<Option<ClientObjectRules>> = const { Cell::new(None) };
+    }
+
+    /// Restores the consensus rules when dropped.
+    pub(crate) struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            INSTALLED.with(|cell| cell.set(None));
+        }
+    }
+
+    pub(crate) fn install(rules: ClientObjectRules) -> Installed {
+        INSTALLED.with(|cell| cell.set(Some(rules)));
+        Installed(())
+    }
+
+    pub(super) fn installed() -> Option<ClientObjectRules> {
+        INSTALLED.with(Cell::get)
+    }
 }
 
 // ---------------------------------------------------------------------------

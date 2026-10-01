@@ -99,6 +99,7 @@ impl BlockTemplate {
         Block {
             header,
             transactions: self.inner.all_txs(),
+            client_objects: Vec::new(),
         }
     }
 

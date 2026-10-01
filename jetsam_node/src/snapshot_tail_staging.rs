@@ -469,6 +469,7 @@ mod tests {
         Block {
             header,
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         }
     }
 
@@ -502,6 +503,7 @@ mod tests {
         let genesis = Block {
             header: genesis_header(),
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         };
         let hash = jetsam_chain::hash_block_header(&genesis.header);
         let block = linked_block(&genesis, 1);
@@ -528,6 +530,7 @@ mod tests {
         let genesis = Block {
             header: genesis_header(),
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let first = linked_block(&genesis, 1);
@@ -553,6 +556,7 @@ mod tests {
         let genesis = Block {
             header: genesis_header(),
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let boundary_work = jetsam_chain::block_work(&genesis.header.difficulty_target);
@@ -594,6 +598,7 @@ mod tests {
         let genesis = Block {
             header: genesis_header(),
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let first = linked_block(&genesis, 1);

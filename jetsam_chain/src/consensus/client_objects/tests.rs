@@ -143,6 +143,7 @@ fn block_at(height: u64, groups: Vec<Vec<Transaction>>) -> Block {
     Block {
         header: header(height),
         transactions,
+        client_objects: Vec::new(),
     }
 }
 
@@ -1369,4 +1370,18 @@ fn a_paid_submission_must_be_the_carried_client() {
             matrix_digest: digest(0x55)
         })
     );
+}
+
+#[test]
+fn installed_rules_are_scoped_to_the_test_thread() {
+    assert_eq!(ClientObjectRules::current(), ClientObjectRules::CONSENSUS);
+    {
+        let _installed = test_rules::install(burn_rules());
+        assert_eq!(ClientObjectRules::current(), burn_rules());
+        let other = std::thread::spawn(ClientObjectRules::current)
+            .join()
+            .unwrap();
+        assert_eq!(other, ClientObjectRules::CONSENSUS);
+    }
+    assert_eq!(ClientObjectRules::current(), ClientObjectRules::CONSENSUS);
 }
