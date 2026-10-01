@@ -41,6 +41,7 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"JETSAM_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::availability_codec::AvailabilityCodec;
+use crate::client_object_codec::ClientObjectCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;
 use crate::header_sync_codec::HeaderSyncCodec;
 use crate::history_step_codec::HistoryStepTerminalCodec;
@@ -180,6 +181,13 @@ pub struct NodeBehaviour {
     /// This complements gossipsub (which only delivers NEW events) with a
     /// state-sync mechanism for existing mempool entries.
     pub mempool_sync: request_response::Behaviour<MempoolSyncCodec>,
+
+    /// v1.5 client objects (M3.7, wired in M3.8): client proof bundles and
+    /// registered matrix files (manifest, then 1 MiB chunks), one object per
+    /// request, checked against its identity by the codec before it is read.
+    /// Optional for the peer: a peer without it answers nothing, and the
+    /// requester tries another.
+    pub client_object_sync: request_response::Behaviour<ClientObjectCodec>,
 }
 
 impl NodeBehaviour {
@@ -423,6 +431,8 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
+        let client_object_sync = crate::client_object_codec::client_object_behaviour(protocol_id)?;
+
         // ----------------------------------------------------------------
         // Kademlia DHT
         // ----------------------------------------------------------------
@@ -596,6 +606,7 @@ impl NodeBehaviour {
             manifest_page_sync,
             state_segment_sync,
             mempool_sync,
+            client_object_sync,
         })
     }
 }

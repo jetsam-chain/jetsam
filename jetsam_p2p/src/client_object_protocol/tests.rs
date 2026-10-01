@@ -298,3 +298,31 @@ fn requests_respect_fee_order_and_per_peer_limits() {
     assert!(fetcher.is_wanted(&best.id));
     assert!(!fetcher.is_wanted(&shared.id));
 }
+
+/// M3.8: a provider that answered "not here", or that disconnected, is not
+/// asked again for that proof (the fetcher used to retry the first provider
+/// for ever); unlike a liar it is not reported, and the proof is given up
+/// only when no provider remains.
+#[test]
+fn an_unavailable_or_gone_provider_is_skipped_without_penalty() {
+    let mut fetcher: ClientProofFetcher<&str> = ClientProofFetcher::new(16, 4, 2);
+    let proof = announcement(0x20, 1, 5);
+    assert!(fetcher.announced("relay", proof));
+    assert!(fetcher.announced("holder", proof));
+    assert_eq!(fetcher.next_requests(), vec![("relay", proof.id)]);
+    assert!(!fetcher.unavailable(&"relay", &proof.id));
+    assert_eq!(fetcher.in_flight(&"relay"), 0);
+    assert_eq!(fetcher.next_requests(), vec![("holder", proof.id)]);
+
+    // A disconnected peer frees its requests and leaves every proof's
+    // providers; a proof it alone provided is given up.
+    let other = announcement(0x20, 2, 5);
+    assert!(fetcher.announced("holder", other));
+    assert_eq!(fetcher.next_requests(), vec![("holder", other.id)]);
+    assert_eq!(fetcher.in_flight(&"holder"), 2);
+    fetcher.forget_peer(&"holder");
+    assert_eq!(fetcher.in_flight(&"holder"), 0);
+    assert!(!fetcher.is_wanted(&other.id));
+    assert!(!fetcher.is_wanted(&proof.id), "its only other provider said no");
+    assert!(fetcher.next_requests().is_empty());
+}

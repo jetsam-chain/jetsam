@@ -294,6 +294,17 @@ impl MatrixFileId {
         }
     }
 
+    /// The file a registration names.
+    pub fn of_registration(
+        registration: &jetsam_chain::consensus::client_objects::ClientRegistration,
+    ) -> Self {
+        Self {
+            matrix_digest: registration.matrix_digest,
+            file_root: registration.matrix_file_root,
+            file_len: registration.matrix_file_len,
+        }
+    }
+
     pub fn chunk_count(&self) -> usize {
         matrix_file_chunk_count(self.file_len)
     }
@@ -524,6 +535,48 @@ impl<P: Ord + Clone> ClientProofFetcher<P> {
             }
         }
         served_wrong_bytes
+    }
+
+    /// `peer` answered that it does not hold `id` (it relayed the
+    /// announcement without fetching the bundle yet, or dropped it): it is
+    /// not asked again for this proof and not reported. The proof is given
+    /// up when no provider remains. Returns `false` (never a penalty).
+    pub fn unavailable(&mut self, peer: &P, id: &ClientProofId) -> bool {
+        if !self.release(peer, id) {
+            return false;
+        }
+        self.exclude(peer, id);
+        false
+    }
+
+    /// `peer` disconnected: its requests are freed, it leaves every proof's
+    /// providers, and a proof no provider remains for is given up.
+    pub fn forget_peer(&mut self, peer: &P) {
+        let ids: Vec<ClientProofId> = self
+            .wanted
+            .iter()
+            .filter(|(_, wanted)| wanted.providers.contains(peer))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.release(peer, &id);
+            self.exclude(peer, &id);
+        }
+        self.in_flight.remove(peer);
+    }
+
+    fn exclude(&mut self, peer: &P, id: &ClientProofId) {
+        let Some(wanted) = self.wanted.get_mut(id) else {
+            return;
+        };
+        wanted.excluded.insert(peer.clone());
+        if wanted
+            .providers
+            .iter()
+            .all(|provider| wanted.excluded.contains(provider))
+        {
+            self.wanted.remove(id);
+        }
     }
 
     pub fn is_wanted(&self, id: &ClientProofId) -> bool {

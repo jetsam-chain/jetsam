@@ -208,7 +208,9 @@ fn classify(command: &NetworkCommand) -> CommandClass {
         | RequestStateManifest { .. }
         | RequestStateSegment { .. }
         | RequestHistoryStepTerminal { .. }
-        | RequestMempoolSync { .. } => CommandClass::Data,
+        | RequestMempoolSync { .. }
+        | FetchClientObject { .. }
+        | AnnounceClientProof { .. } => CommandClass::Data,
     }
 }
 

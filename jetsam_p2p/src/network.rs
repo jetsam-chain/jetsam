@@ -3093,11 +3093,47 @@ pub enum NetworkCommand {
     /// Triggered on peer connect so late-joining nodes receive existing TXs.
     /// Emits `NetworkEvent::MempoolSyncResponse` when the response arrives.
     RequestMempoolSync { peer: PeerId },
+    /// Fetch one v1.5 client object (a client proof bundle, a registered
+    /// matrix manifest or chunk) from one **connected** peer (M3.8). Emits
+    /// `ClientObjectFetched` or `ClientObjectFetchFailed` with `token`.
+    FetchClientObject {
+        token: u64,
+        peer: PeerId,
+        request: crate::client_object_codec::ClientObjectRequest,
+    },
+    /// Publish a client-proof announcement on its gossip topic.
+    AnnounceClientProof {
+        announcement: crate::client_object_protocol::ClientProofAnnouncement,
+    },
 }
 
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
+    /// A v1.5 client-proof announcement (M3.8). `from` is the directly
+    /// connected publisher when there is one, else the relaying peer; both
+    /// are provider candidates the node may ask for the bundle.
+    ClientProofAnnounced {
+        from: PeerId,
+        relayed_by: PeerId,
+        announcement: crate::client_object_protocol::ClientProofAnnouncement,
+    },
+    /// One client object fetched with `FetchClientObject`: its bytes are
+    /// exactly the requested object (checked by the codec).
+    ClientObjectFetched {
+        token: u64,
+        from: PeerId,
+        request: crate::client_object_codec::ClientObjectRequest,
+        bytes: Arc<[u8]>,
+    },
+    /// A `FetchClientObject` that did not deliver: `InvalidResponse` means
+    /// the peer served other bytes, `Unavailable` that it does not hold it.
+    ClientObjectFetchFailed {
+        token: u64,
+        from: PeerId,
+        request: crate::client_object_codec::ClientObjectRequest,
+        kind: RequestFailureKind,
+    },
     /// Fixed-size network-v7 header announcement with exact body/terminal IDs.
     HeaderAnnouncement {
         from: PeerId,
@@ -3405,6 +3441,7 @@ impl P2PNetwork {
         background_capacity: BackgroundCapacity,
         lan_discovery: bool,
         upnp_enabled: bool,
+        client_objects: Option<Arc<dyn crate::client_object_transport::ClientObjectSource>>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<anyhow::Result<()>>)> {
         // Load before spawning so an absent, corrupt, symlinked, or publicly
         // readable private identity fails node startup instead of silently
@@ -3435,6 +3472,7 @@ impl P2PNetwork {
                 background_capacity,
                 lan_discovery,
                 upnp_enabled,
+                client_objects,
             )
             .await
         });
@@ -3626,6 +3664,7 @@ async fn run_swarm(
     background_capacity: BackgroundCapacity,
     lan_discovery: bool,
     upnp_enabled: bool,
+    client_objects: Option<Arc<dyn crate::client_object_transport::ClientObjectSource>>,
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
@@ -3708,6 +3747,17 @@ async fn run_swarm(
     let txs_topic = gossipsub::IdentTopic::new(topics.txs.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
+    // v1.5 client objects (M3.8): their own request-response behaviour and
+    // announcement topic, handled beside the main reactor.
+    let (mut client_transport, mut client_response_rx) =
+        crate::client_object_transport::ClientObjectTransport::new(
+            client_objects,
+            &topics.client_proofs,
+        );
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(client_transport.topic())?;
 
     // One failed bind must not take the node down. A host with IPv6 disabled
     // in the kernel, or a container without a v6 stack, answers EAFNOSUPPORT
@@ -3886,6 +3936,14 @@ async fn run_swarm(
             let Ok(cmd) = cmd_rx.try_recv() else {
                 break;
             };
+            let Some(cmd) = client_transport_command(
+                &mut client_transport,
+                &mut swarm,
+                &required_event_tx,
+                cmd,
+            ) else {
+                continue;
+            };
             handle_network_command(
                 &mut swarm,
                 cmd,
@@ -3911,6 +3969,14 @@ async fn run_swarm(
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
+                let Some(event) = client_transport.intercept(
+                    &mut swarm,
+                    &required_event_tx,
+                    &gossip_event_tx,
+                    event,
+                ) else {
+                    continue;
+                };
                 handle_swarm_event(
                     &mut swarm,
                     event,
@@ -3968,6 +4034,12 @@ async fn run_swarm(
                         .behaviour_mut()
                         .chain_sync
                         .send_response(prepared.channel, prepared.response);
+                }
+            }
+
+            prepared = client_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    client_transport.send_prepared(&mut swarm, prepared);
                 }
             }
 
@@ -4389,6 +4461,15 @@ async fn run_swarm(
 
             // Commands from the node (when no swarm event pending).
             cmd = cmd_rx.recv() => {
+                let cmd = match cmd {
+                    Some(cmd) => client_transport_command(
+                        &mut client_transport,
+                        &mut swarm,
+                        &required_event_tx,
+                        cmd,
+                    ),
+                    None => break, // cmd_tx dropped
+                };
                 match cmd {
                     Some(cmd) => handle_network_command(
                         &mut swarm,
@@ -4410,11 +4491,13 @@ async fn run_swarm(
                         &sync_paths,
                     )
                     .await,
-                    None => break, // cmd_tx dropped
+                    // Handled by the client-object transport.
+                    None => {}
                 }
             }
 
             _ = automatic_peer_timer.tick() => {
+                client_transport.sweep(&required_event_tx);
                 let now = Instant::now();
                 let mut wedged_sync_peers = std::collections::HashSet::new();
 
@@ -5580,6 +5663,31 @@ fn announce_availability_to_mesh(
 
 /// Process a single network command. Separated from the select! loop so that
 /// pending commands can be drained via `try_recv` before blocking.
+/// Route the client-object commands to their transport; every other command
+/// is returned for [`handle_network_command`].
+fn client_transport_command(
+    transport: &mut crate::client_object_transport::ClientObjectTransport,
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    events: &RequiredEventSender,
+    cmd: NetworkCommand,
+) -> Option<NetworkCommand> {
+    match cmd {
+        NetworkCommand::FetchClientObject {
+            token,
+            peer,
+            request,
+        } => {
+            transport.fetch(swarm, events, token, peer, request);
+            None
+        }
+        NetworkCommand::AnnounceClientProof { announcement } => {
+            transport.announce(swarm, announcement);
+            None
+        }
+        cmd => Some(cmd),
+    }
+}
+
 async fn handle_network_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     cmd: NetworkCommand,
@@ -6177,6 +6285,9 @@ async fn handle_network_command(
                 },
             );
             debug_assert!(inserted, "fresh snapshot header request ID must be unique");
+        }
+        NetworkCommand::FetchClientObject { .. } | NetworkCommand::AnnounceClientProof { .. } => {
+            // Routed to the client-object transport before this dispatcher.
         }
         NetworkCommand::RequestMempoolSync { peer } => {
             if !sync_paths.is_dispatchable(peer) {

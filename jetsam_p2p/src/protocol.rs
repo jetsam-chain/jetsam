@@ -794,6 +794,8 @@ pub struct NetworkTopics {
     pub blocks: String,
     pub txs: String,
     pub protocol_id: String,
+    /// v1.5 client-proof announcements (112 bytes each, M3.8).
+    pub client_proofs: String,
 }
 
 impl NetworkTopics {
@@ -804,6 +806,7 @@ impl NetworkTopics {
             blocks: format!("{}/gossip/headers/3", cfg.p2p_protocol_id),
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
+            client_proofs: format!("{}/gossip/client-proofs/1", cfg.p2p_protocol_id),
         }
     }
 }

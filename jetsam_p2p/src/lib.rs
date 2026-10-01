@@ -13,6 +13,7 @@ pub mod availability_codec;
 pub mod behaviour;
 pub mod client_object_codec;
 pub mod client_object_protocol;
+pub mod client_object_transport;
 mod command_dispatch;
 mod event_dispatch;
 pub mod header_protocol;

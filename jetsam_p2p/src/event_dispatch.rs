@@ -290,9 +290,11 @@ fn classify(event: &NetworkEvent) -> EventClass {
         | NetworkEvent::StateSegment { .. }
         | NetworkEvent::StateSegmentRequestFailed { .. }
         | NetworkEvent::StateSegmentRequestBusy { .. } => EventClass::Historical,
-        NetworkEvent::NewTx { .. } | NetworkEvent::MempoolSyncResponse { .. } => {
-            EventClass::Background
-        }
+        NetworkEvent::NewTx { .. }
+        | NetworkEvent::MempoolSyncResponse { .. }
+        | NetworkEvent::ClientProofAnnounced { .. }
+        | NetworkEvent::ClientObjectFetched { .. }
+        | NetworkEvent::ClientObjectFetchFailed { .. } => EventClass::Background,
     }
 }
 
