@@ -4,7 +4,7 @@
 
 //! Build a canonical `HistoryStep` release pack from honest chain data.
 //!
-//! Usage: `jetsam_matrix_gen <pack-root> [--generation v1|v1.3]`
+//! Usage: `jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5]`
 //!
 //! The fixture provider starts at the real genesis state, mines every header,
 //! verifies every wallet authorization and materializes every backbone state.
@@ -37,7 +37,7 @@ use jetsam_miner::history_step_artifacts::{
     HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
 };
 use jetsam_recursive::{
-    canonical_history_step_shape, freeze_history_step_bank_in, CanonicalHistoryStepClassId,
+    canonical_history_step_shape_in, freeze_history_step_bank_in, CanonicalHistoryStepClassId,
     HistoryStepFreezeMatrixStore, HistoryStepMatrixLease, HistoryStepMatrixSource,
     HistoryStepMatrixSourceError,
 };
@@ -61,9 +61,9 @@ fn class_label(class: CanonicalHistoryStepClassId) -> String {
     format!("H(B{})", class.current_tier_in(build_generation()))
 }
 
-/// Parse `[--generation v1|v1.3]`, defaulting to the launch relation.
+/// Parse `[--generation v1|v1.3|v1.5]`, defaulting to the launch relation.
 fn parse_arguments() -> (PathBuf, HistoryStepPackGeneration) {
-    const USAGE: &str = "usage: jetsam_matrix_gen <pack-root> [--generation v1|v1.3]";
+    const USAGE: &str = "usage: jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5]";
     let mut root: Option<PathBuf> = None;
     let mut generation: Option<HistoryStepPackGeneration> = None;
     let mut arguments = std::env::args().skip(1);
@@ -74,6 +74,7 @@ fn parse_arguments() -> (PathBuf, HistoryStepPackGeneration) {
                 let parsed = match value.as_str() {
                     "v1" => HistoryStepPackGeneration::V1,
                     "v1.3" => HistoryStepPackGeneration::V1_3,
+                    "v1.5" => HistoryStepPackGeneration::V1_5,
                     other => panic!("unknown pack generation {other:?}; {USAGE}"),
                 };
                 assert!(
@@ -152,7 +153,7 @@ impl CanonicalMatrixStore {
             .map_err(|error| format!("bound zstd window {}: {error}", path.display()))?;
         let matrix = FieldR1cs::read_artifact(
             &mut decoder,
-            canonical_history_step_shape(class),
+            canonical_history_step_shape_in(build_generation(), class),
             self.installed_digest(class)?,
             MAX_CANONICAL_MATRIX_BYTES,
         )
@@ -177,7 +178,7 @@ impl CanonicalMatrixStore {
         matrix: FieldR1cs,
     ) -> Result<(), String> {
         let actual_shape = FieldShape::of(&matrix);
-        let expected_shape = canonical_history_step_shape(class);
+        let expected_shape = canonical_history_step_shape_in(build_generation(), class);
         if actual_shape != expected_shape {
             return Err(format!(
                 "{} has shape {actual_shape:?}, expected {expected_shape:?}",
@@ -325,7 +326,7 @@ fn main() {
     let zstd_level = parse_zstd_level();
     let debug = std::env::var_os("JETSAM_HISTORY_STEP_GENERATOR_DEBUG").is_some();
     let [small_tier, large_tier] = generation.tiers();
-    let [small_m, large_m] = jetsam_recursive::HISTORY_STEP_CURRENT_CLASS_MS;
+    let [small_m, large_m] = jetsam_recursive::history_step_class_ms(generation);
     println!("JETSAM canonical HistoryStep freezer");
     println!("  pack:          {}", version.display());
     println!(
@@ -333,6 +334,7 @@ fn main() {
         match generation {
             HistoryStepPackGeneration::V1 => "v1 (launch)",
             HistoryStepPackGeneration::V1_3 => "v1.3",
+            HistoryStepPackGeneration::V1_5 => "v1.5",
         }
     );
     println!("  rayon threads: {}", rayon::current_num_threads());

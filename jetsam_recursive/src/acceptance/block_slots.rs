@@ -77,7 +77,7 @@ use super::trace::action_surface::{
     bind_coinbase_action_with_amount, bind_development_payout_action, bind_user_action_surface,
     ActionRowTrace, ActionSurfaceTrace,
 };
-use super::trace::development_allocation::bind_development_allocation;
+use super::trace::development_allocation::bind_development_schedule;
 use super::trace::exact_state::{
     bind_actions_to_exact_state_leaves, bind_exact_state_header_roots_dynamic,
     build_exact_state_structural_region_slot, select_upper_paired_roots, ExactStateSlotWires,
@@ -260,7 +260,8 @@ const _: () =
 /// power-of-two `TX_EPOCH_BLOCKS` slimmed the epoch recomposition of the
 /// accumulator transition), 3_778 under v1.3. The four added rows are the
 /// second anchor lane pair: one multiplexer and one pin per lane, driven by
-/// the same boundary bit as the first pair.
+/// the same boundary bit as the first pair. v1.5 carries the v1.3 boundary
+/// and the same tail.
 ///
 /// Both numbers are held here rather than one of them being derived, because
 /// the launch figure is a fact about matrices that already exist and can
@@ -270,7 +271,7 @@ const _: () =
 const fn direct_block_tail_rows(generation: HistoryStepPackGeneration) -> usize {
     match generation {
         HistoryStepPackGeneration::V1 => 3_774,
-        HistoryStepPackGeneration::V1_3 => 3_778,
+        HistoryStepPackGeneration::V1_3 | HistoryStepPackGeneration::V1_5 => 3_778,
     }
 }
 
@@ -1360,6 +1361,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
     proofs: PreparedSelectedZkAuthorizations,
     parent_header: &BlockHeader,
     parent_block_id: &[LinExpr; 2],
+    recursion_root_height: &LinExpr,
 ) -> SelectedZkBlockSlotsAssembly {
     let mut assembly = build_block_slots_selected_zk_prefix(
         b,
@@ -1372,6 +1374,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
         proofs,
         parent_header,
         parent_block_id,
+        recursion_root_height,
     );
     assembly
         .seal_direct_tail(b, sealed_header, end_accumulator)
@@ -1394,6 +1397,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     proofs: PreparedSelectedZkAuthorizations,
     parent_header: &BlockHeader,
     parent_block_id: &[LinExpr; 2],
+    recursion_root_height: &LinExpr,
 ) -> SelectedZkBlockSlotsAssembly {
     assert!(
         generation.tiers().contains(&tier)
@@ -1411,6 +1415,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
         proofs,
         parent_header,
         parent_block_id,
+        recursion_root_height,
     );
     let region = assembly
         .selected_region
@@ -1435,6 +1440,7 @@ fn build_selected_zk_block_slots_core(
     authorization_proofs: PreparedSelectedZkAuthorizations,
     parent_header: &BlockHeader,
     parent_block_id: &[LinExpr; 2],
+    recursion_root_height: &LinExpr,
 ) -> BlockSlotsCoreAssembly {
     assert_eq!(
         components.tx_body_inputs.len(),
@@ -1602,10 +1608,14 @@ fn build_selected_zk_block_slots_core(
         &header.fields[hf::LOG_SLOTS],
     );
 
-    let allocation = bind_development_allocation(
+    // The schedule of the block's own relation: launch and v1.3 keep the
+    // launch gadget row for row; v1.5 reads J off its recursion root.
+    let allocation = bind_development_schedule(
         b,
+        generation,
         &header.fields[hf::HEIGHT],
         &spine_inputs[1].leaves[jetsam_tx::body_hash::TX8X2_LEAF_OUTPUT0_DATA][1],
+        recursion_root_height,
     );
     let ghost_spine_native =
         jetsam_gkr::spine_statement::spine_inputs_from_body(&jetsam_gkr::ghost_tx::ghost_tx_body());

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! The HistoryStep client arm (v1.5 prototype, `client-slot`, M2 task 2.3).
+//! The HistoryStep client arm (v1.5 client slot, M2 task 2.3).
 //!
 //! A client-bearing HistoryStep verifies, next to its parent arms, one client
 //! proof of the imposed form ([`HistoryStepClientForm`]):

@@ -440,7 +440,7 @@ where
         (0, HistoryStepPackGeneration::V1) => {
             provider.b25(class, start).map(HistoryStepFreezeInput::B25)
         }
-        (0, HistoryStepPackGeneration::V1_3) => {
+        (0, HistoryStepPackGeneration::V1_3 | HistoryStepPackGeneration::V1_5) => {
             provider.b24(class, start).map(HistoryStepFreezeInput::B24)
         }
         (1, _) => provider

@@ -120,6 +120,8 @@ pub fn embedded_history_step_pack_for_height(
     match history_step_pack_generation(height) {
         HistoryStepPackGeneration::V1 => GENERATED_HISTORY_STEP_PACK.as_ref(),
         HistoryStepPackGeneration::V1_3 => GENERATED_HISTORY_STEP_PACK_V1_3.as_ref(),
+        // No v1.5 pack is staged yet (M3.9); the dormant clock never selects it.
+        HistoryStepPackGeneration::V1_5 => None,
     }
 }
 

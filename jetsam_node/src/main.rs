@@ -1124,6 +1124,9 @@ impl EmbeddedHistoryStepRuntimes {
         match embedded_history_step_pack::history_step_pack_generation(height) {
             embedded_history_step_pack::HistoryStepPackGeneration::V1 => self.pre_fork.as_ref(),
             embedded_history_step_pack::HistoryStepPackGeneration::V1_3 => self.post_fork.as_ref(),
+            // No v1.5 pack is embedded yet (M3.9): a height of that relation
+            // has no verifier, which the dormant v1.5 clock never asks for.
+            embedded_history_step_pack::HistoryStepPackGeneration::V1_5 => None,
         }
     }
 
@@ -8023,7 +8026,11 @@ mod tests {
                 | HistoryStepError::WireVersion
                 | HistoryStepError::WireLength { .. }
                 | HistoryStepError::WireEncoding
-                | HistoryStepError::ShapeOverflow { .. } => true,
+                | HistoryStepError::ShapeOverflow { .. }
+                // The v1.5 client slot (no longer behind a feature).
+                | HistoryStepError::ClientProof
+                | HistoryStepError::ClientRegistry
+                | HistoryStepError::ClientForm => true,
             }
         }
 

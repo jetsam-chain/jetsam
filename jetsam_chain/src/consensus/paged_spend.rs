@@ -154,10 +154,25 @@ impl BlockProofClass {
         }
     }
 
+    /// Outer dimension of this class under the launch (and v1.3) relation.
+    /// [`Self::outer_m_in_generation`] answers for the generation in hand.
     pub const fn outer_m(self) -> usize {
         match self {
             Self::B25 => 22,
             Self::B255 => 24,
+        }
+    }
+
+    /// Outer dimension of this class under one pack generation: m = 23 and
+    /// m = 25 under v1.5.
+    pub const fn outer_m_in_generation(
+        self,
+        generation: super::params::HistoryStepPackGeneration,
+    ) -> usize {
+        let ms = generation.class_ms();
+        match self {
+            Self::B25 => ms[0],
+            Self::B255 => ms[1],
         }
     }
 }
@@ -547,6 +562,24 @@ mod tests {
                 .unwrap()
             })
             .collect()
+    }
+
+    /// The outer dimension of a class is the generation's, not the launch
+    /// constant: v1.5 proves its two classes at m = 23 and m = 25.
+    #[test]
+    fn the_outer_dimension_follows_the_generation() {
+        use super::super::params::HistoryStepPackGeneration::{V1, V1_3, V1_5};
+        for generation in [V1, V1_3] {
+            assert_eq!(BlockProofClass::B25.outer_m_in_generation(generation), 22);
+            assert_eq!(BlockProofClass::B255.outer_m_in_generation(generation), 24);
+        }
+        assert_eq!(BlockProofClass::B25.outer_m_in_generation(V1_5), 23);
+        assert_eq!(BlockProofClass::B255.outer_m_in_generation(V1_5), 25);
+        assert_eq!(BlockProofClass::B25.outer_m(), BlockProofClass::B25.outer_m_in_generation(V1));
+        assert_eq!(
+            BlockProofClass::B255.outer_m(),
+            BlockProofClass::B255.outer_m_in_generation(V1)
+        );
     }
 
     #[test]

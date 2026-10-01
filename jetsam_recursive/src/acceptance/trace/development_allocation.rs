@@ -358,16 +358,16 @@ pub fn bind_development_allocation(
 /// every 480 blocks after it worth 480 blocks, and a window that closes on the
 /// 730th payout.
 ///
-/// **Not wired into any relation.** No pack generation carries this schedule
-/// yet; the launch and v1.3 relations keep [`bind_development_allocation`],
-/// whose rows this gadget does not touch. The v1.5 generation (M3) calls this
-/// one in its place, at the same site in `block_slots`.
+/// Wired into the v1.5 relation only, through [`bind_development_schedule`]:
+/// the launch and v1.3 relations keep [`bind_development_allocation`], whose
+/// rows this gadget does not touch.
 ///
 /// `activation` is the v1.5 activation height *as the relation knows it*, and
 /// the gadget trusts it: a prover free to choose it would choose the schedule.
 /// It must reach the relation authenticated — a build-time `const_block`, which
 /// makes the pack depend on the height, or a public-IO lane the node checks
-/// natively, as the v1.3 recursion root already is. It must also satisfy
+/// natively, as the v1.3 recursion root already is. The v1.5 relation takes
+/// the second: [`v1_5_activation_from_root_height`]. It must also satisfy
 /// `development_allocation::v1_5_activation_is_valid` (a multiple of 960, no
 /// later than 700 800), which the native side asserts at compile time and
 /// which the window-end arithmetic below relies on.
@@ -471,12 +471,16 @@ pub fn bind_development_allocation_v1_5(
     let selected_payout = mul(b, &payout_due, payout_raw_amount);
     pin_eq(b, &selected_payout, &expected_payout);
 
-    let native = development_allocation_with(native_height, Some(native_activation))
-        .expect("honest v1.5 development schedule");
-    debug_assert_eq!(
-        selected_payout.eval(b.values()),
-        alloc_block_value(native.payout_each.unwrap_or(0))
-    );
+    // Cross-check the honest payout against the native schedule — when `J` is
+    // one a chain can carry. The rows above never depend on `J`'s value, and a
+    // harness may root a relation at a height no chain would (no node accepts
+    // such a root): the matrix is the same, only the witness has no schedule.
+    if let Ok(native) = development_allocation_with(native_height, Some(native_activation)) {
+        debug_assert_eq!(
+            selected_payout.eval(b.values()),
+            alloc_block_value(native.payout_each.unwrap_or(0))
+        );
+    }
 
     DevelopmentAllocationTrace {
         active,
@@ -485,6 +489,61 @@ pub fn bind_development_allocation_v1_5(
         miner_subsidy,
         payout_each: expected_payout,
         emission_tiers: tiers,
+    }
+}
+
+/// The v1.5 activation height `J`, read from the height lane of the
+/// relation's recursion root.
+///
+/// A v1.5 relation starts at `J`: its first block is a base, and its
+/// recursion root is the boundary of block `J − 1`, a public-IO lane every
+/// node checks natively against its own branch (`expected_recursion_root`).
+/// So `J = root height + 1`, with one exception: a relation rooted at genesis
+/// is a chain on v1.5 from its first block, `J = 0`. Reading `J` there instead
+/// of freezing it as a constant keeps the pack independent of `J`: a release
+/// that moves the activation does not regenerate the packs, and a pack built
+/// for another `J` cannot stop the chain at its first payout after it.
+pub fn v1_5_activation_from_root_height(
+    b: &mut FieldR1csBuilder,
+    root_height: &LinExpr,
+) -> LinExpr {
+    let root_bits = range_check_bits(b, root_height, HEIGHT_BITS);
+    let root_is_genesis = root_bits
+        .iter()
+        .fold(LinExpr::constant(F128::ONE), |zero, bit| {
+            mul(b, &zero, &LinExpr::from_wire(*bit).add_const(F128::ONE))
+        });
+    let next = integer_add_no_overflow(
+        b,
+        root_height,
+        &const_block(Block128::from(1u128)),
+        HEIGHT_BITS,
+    );
+    // genesis ? 0 : root + 1
+    mul(b, &root_is_genesis.add_const(F128::ONE), &next)
+}
+
+/// The development schedule a block of `generation` is bound to.
+///
+/// Launch and v1.3: [`bind_development_allocation`], the 960-block cadence
+/// and the 700 800 end frozen as constants, row for row what those packs
+/// carry. v1.5: [`bind_development_allocation_v1_5`] on the `J` of the
+/// relation's own recursion root. `recursion_root_height` is that root's
+/// height lane; launch and v1.3 never read it.
+pub fn bind_development_schedule(
+    b: &mut FieldR1csBuilder,
+    generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+    child_height: &LinExpr,
+    payout_raw_amount: &LinExpr,
+    recursion_root_height: &LinExpr,
+) -> DevelopmentAllocationTrace {
+    use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3, V1_5};
+    match generation {
+        V1 | V1_3 => bind_development_allocation(b, child_height, payout_raw_amount),
+        V1_5 => {
+            let activation = v1_5_activation_from_root_height(b, recursion_root_height);
+            bind_development_allocation_v1_5(b, child_height, payout_raw_amount, &activation)
+        }
     }
 }
 
@@ -765,6 +824,144 @@ mod tests {
                     index + 1
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.2 — J read from the recursion root, and the schedule per generation
+    // -----------------------------------------------------------------------
+
+    /// The v1.5 relation starts at J: its recursion root is the boundary of
+    /// block J − 1, so J = root height + 1 — except a relation rooted at
+    /// genesis, whose activation is block 0 (a chain on v1.5 from genesis).
+    #[test]
+    fn the_v1_5_activation_is_the_block_after_the_recursion_root() {
+        for (root_height, activation) in [
+            (0u64, 0u64),
+            (959, 960),
+            (ACTIVATION - 1, ACTIVATION),
+            (700_799, 700_800),
+            (u64::from(u32::MAX), u64::from(u32::MAX) + 1),
+        ] {
+            let mut builder = FieldR1csBuilder::new();
+            let root = alloc_block(&mut builder, Block128::from(root_height as u128));
+            let derived = v1_5_activation_from_root_height(&mut builder, &root);
+            let (matrix, witness) = builder.build();
+            assert!(matrix.satisfies(&witness), "root {root_height}");
+            assert_eq!(
+                derived.eval(&witness),
+                alloc_block_value(activation),
+                "root {root_height}"
+            );
+        }
+    }
+
+    /// The derived J is load-bearing: a prover cannot pick another activation
+    /// for the same root.
+    #[test]
+    fn the_derived_activation_cannot_be_chosen_by_the_prover() {
+        let mut builder = FieldR1csBuilder::new();
+        let root = alloc_block(&mut builder, Block128::from((ACTIVATION - 1) as u128));
+        let derived = v1_5_activation_from_root_height(&mut builder, &root);
+        let pinned = builder.alloc_f128(alloc_block_value(ACTIVATION));
+        pin_eq(&mut builder, &derived, &LinExpr::from_wire(pinned));
+        let (matrix, witness) = builder.build();
+        assert!(matrix.satisfies(&witness));
+        for other in [0, ACTIVATION - 1, ACTIVATION + 960] {
+            let mut forged = witness.clone();
+            forged[pinned.0 as usize] = alloc_block_value(other);
+            assert!(
+                !matrix.satisfies(&forged),
+                "activation {other} accepted for root J - 1"
+            );
+        }
+    }
+
+    /// The v1.5 matrix does not depend on J: J is witness data read off the
+    /// recursion root, so one pack serves every activation height — and a
+    /// harness may root a relation at a height no chain would (here J = 7),
+    /// which builds the same rows without satisfying a schedule.
+    #[test]
+    fn the_v1_5_schedule_rows_do_not_depend_on_the_activation() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_5;
+        let digest = |root_height: u64| {
+            let mut builder = FieldR1csBuilder::new();
+            let child = alloc_block(&mut builder, Block128::from(7u128));
+            let root = alloc_block(&mut builder, Block128::from(root_height as u128));
+            let payout = alloc_block(&mut builder, Block128::from(0u128));
+            let _ = bind_development_schedule(&mut builder, V1_5, &child, &payout, &root);
+            let (matrix, _) = builder.build();
+            matrix.structural_statement_digest()
+        };
+        let genesis = digest(0);
+        for root_height in [6, 959, ACTIVATION - 1, 700_799] {
+            assert_eq!(digest(root_height), genesis, "root {root_height}");
+        }
+    }
+
+    /// The schedule a block is bound to follows its relation: launch and v1.3
+    /// keep the launch gadget row for row (J + 480 does not pay), v1.5 runs
+    /// the two-year gadget on the J of its root (J, J + 480 and the window end
+    /// pay as the native schedule says).
+    #[test]
+    fn each_generation_binds_its_own_development_schedule() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{self, V1, V1_3, V1_5};
+        let build = |generation: HistoryStepPackGeneration,
+                     height: u64,
+                     activation: u64,
+                     launch_gadget: bool| {
+            let native =
+                development_allocation_with(height, (generation == V1_5).then_some(activation))
+                    .unwrap();
+            let mut builder = FieldR1csBuilder::new();
+            let child = alloc_block(&mut builder, Block128::from(height as u128));
+            let root = alloc_block(
+                &mut builder,
+                Block128::from(activation.saturating_sub(1) as u128),
+            );
+            let payout = alloc_block(
+                &mut builder,
+                Block128::from(native.payout_each.unwrap_or(0) as u128),
+            );
+            let trace = if launch_gadget {
+                bind_development_allocation(&mut builder, &child, &payout)
+            } else {
+                bind_development_schedule(&mut builder, generation, &child, &payout, &root)
+            };
+            let (matrix, witness) = builder.build();
+            (matrix, witness, trace, native)
+        };
+        let end = development_allocation_end_height_with(Some(ACTIVATION));
+        for height in [
+            ACTIVATION,
+            ACTIVATION + 1,
+            ACTIVATION + 480,
+            end,
+            end + 480,
+        ] {
+            let (matrix, witness, trace, native) = build(V1_5, height, ACTIVATION, false);
+            assert!(matrix.satisfies(&witness), "v1.5 at {height}");
+            assert_eq!(
+                trace.payout_due.eval(&witness),
+                boolean(native.payout_due),
+                "{height}"
+            );
+            assert_eq!(
+                trace.payout_each.eval(&witness),
+                alloc_block_value(native.payout_each.unwrap_or(0)),
+                "{height}"
+            );
+        }
+        let (launch, _, _, _) = build(V1, ACTIVATION + 480, ACTIVATION, true);
+        for generation in [V1, V1_3] {
+            let (matrix, witness, trace, _) = build(generation, ACTIVATION + 480, ACTIVATION, false);
+            assert!(matrix.satisfies(&witness));
+            assert_eq!(trace.payout_due.eval(&witness), F128::ZERO, "{generation:?}");
+            assert_eq!(
+                matrix.structural_statement_digest(),
+                launch.structural_statement_digest(),
+                "{generation:?} must bind the launch gadget, row for row"
+            );
         }
     }
 }

@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! CARGO_TARGET_DIR=... RAYON_NUM_THREADS=32 nice -n 10 \
-//!   cargo bench -p bench_prover --features client-slot --bench client_agent_demo
+//!   cargo bench -p bench_prover --bench client_agent_demo
 //! ```
 //! `DEMO_SAMPLES` (default 2) repeats the prove / verify timings.
 
@@ -26,7 +26,7 @@ use jetsam_ivc_core::field::F128;
 use jetsam_ivc_core::matrix_claim::c1::fresh_claim_value_c1;
 use jetsam_ivc_core::verifier::verify_field_c1_deferred_matrix_with_post_commit_context;
 use jetsam_recursive::{
-    encode_history_step_client_proof, history_step_bank_io_layout_with_client,
+    encode_history_step_client_proof, history_step_bank_io_layout_for,
     history_step_client_proof_max_wire_bytes, parse_history_step_client_lanes,
     HistoryStepChainClients, HistoryStepClientForm, HistoryStepClientRegistry,
     HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
@@ -256,7 +256,7 @@ fn run() -> Result<(), String> {
     let prepared = prepared.ok_or("no sample")?;
 
     // 5. The node: the block's client lanes, parsed and checked.
-    let lanes = history_step_bank_io_layout_with_client(HistoryStepPackGeneration::V1_3)
+    let lanes = history_step_bank_io_layout_for(HistoryStepPackGeneration::V1_5)
         .client
         .ok_or("client lanes")?;
     let mut block_io = vec![F128::ZERO; lanes.end()];

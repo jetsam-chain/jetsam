@@ -778,9 +778,12 @@ fn ensure_bank_wrote_terminal_at(
         return Ok(());
     }
     let generation = bank.generation();
+    // The relation that ends at this bank's root: launch before v1.3, v1.3
+    // before v1.5.
     let other = match generation {
         HistoryStepPackGeneration::V1 => HistoryStepPackGeneration::V1_3,
         HistoryStepPackGeneration::V1_3 => HistoryStepPackGeneration::V1,
+        HistoryStepPackGeneration::V1_5 => HistoryStepPackGeneration::V1_3,
     };
     let io_len = |generation| {
         crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation).io_len
@@ -845,11 +848,18 @@ fn decode_terminal_in_format(
         // other relation's. A real pre-fork terminal offered to the post-fork
         // verifier is 256 bytes short of this one and would otherwise die
         // here, as a malformed frame from a peer that did nothing wrong.
+        // Only a relation with this runtime's class shapes can be sized
+        // with its entries: launch and v1.3 differ by their IO alone; v1.5
+        // proves at other dimensions and has no such twin.
         for other in [
             jetsam_chain::consensus::params::HistoryStepPackGeneration::V1,
             jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_3,
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_5,
         ] {
-            if other != generation && frame_fits(other)? {
+            if other != generation
+                && other.class_ms() == generation.class_ms()
+                && frame_fits(other)?
+            {
                 return Err(HistoryStepError::ForeignIoLayout {
                     expected: crate::acceptance::history_step_bank::history_step_bank_io_spec_for(
                         generation,
@@ -1114,13 +1124,11 @@ pub fn decode_verify_history_step_terminal_rooted(
     )
 }
 
-/// Version byte of a client proof encoding (`client-slot`).
-#[cfg(feature = "client-slot")]
+/// Version byte of a client proof encoding (v1.5 client slot).
 const HISTORY_STEP_CLIENT_PROOF_WIRE_VERSION: u8 = 1;
 
 /// Upper bound of a client proof encoding: the fixed, unshared length
-/// (`client-slot`, M2 task 2.6).
-#[cfg(feature = "client-slot")]
+/// (v1.5 client slot, M2 task 2.6).
 pub fn history_step_client_proof_max_wire_bytes(
     form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
 ) -> Result<usize, HistoryStepError> {
@@ -1129,11 +1137,10 @@ pub fn history_step_client_proof_max_wire_bytes(
     add(len, field_proof_len(form.shape(), form.pcs_params())?)
 }
 
-/// A client proof of `form` on the wire (`client-slot`, M2 task 2.6): what a
+/// A client proof of `form` on the wire (v1.5 client slot, M2 task 2.6): what a
 /// client hands to miners. Version byte, commitment root, the form's public
 /// IO, then the field proof with shared Merkle paths (the terminal's
 /// compressed encoding).
-#[cfg(feature = "client-slot")]
 pub fn encode_history_step_client_proof(
     form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
     field_proof: &C1FieldR1csProof,
@@ -1151,7 +1158,6 @@ pub fn encode_history_step_client_proof(
 /// Decode [`encode_history_step_client_proof`]'s bytes: the proof, its
 /// commitment root and its public IO. Every byte is consumed or the
 /// encoding is refused; the length is bounded before anything is parsed.
-#[cfg(feature = "client-slot")]
 pub fn decode_history_step_client_proof(
     form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
     bytes: &[u8],

@@ -41,7 +41,8 @@ pub use acceptance::history_step::{
 };
 pub use acceptance::history_step_bank::{
     canonical_history_step_class_id, canonical_history_step_class_id_in,
-    canonical_history_step_pcs_params, canonical_history_step_shape,
+    canonical_history_step_pcs_params, canonical_history_step_pcs_params_in,
+    canonical_history_step_shape, canonical_history_step_shape_in, history_step_class_ms,
     history_step_bank_io_layout, history_step_bank_io_layout_for,
     history_step_bank_io_spec, history_step_bank_io_spec_for, CanonicalHistoryStepClassId,
     HistoryStepBankEntryPins, HistoryStepBankError, HistoryStepBankIoLayout,
@@ -49,20 +50,16 @@ pub use acceptance::history_step_bank::{
     HISTORY_STEP_CLASS_COUNT, HISTORY_STEP_CURRENT_CLASS_MS, HISTORY_STEP_TIER_SLOT_COUNT,
     V1_3_RECURSION_ROOT_LANES,
 };
-/// v1.5 prototype client slot (`client-slot`, M2).
-#[cfg(feature = "client-slot")]
+/// The v1.5 client slot.
 pub use acceptance::history_step::{
     client_io_commitment, decode_history_step_client_proof, encode_history_step_client_proof,
-    history_step_client_proof_max_wire_bytes, derive_history_step_runtime_parts_with_client,
-    prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
+    history_step_client_proof_max_wire_bytes, prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
     HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
     HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
-#[cfg(feature = "client-slot")]
 pub use acceptance::history_step_bank::{
-    history_step_bank_io_layout_with_client, history_step_bank_io_spec_with_client,
     parse_history_step_client_lanes, HistoryStepClientClaim, HistoryStepClientForm,
-    HistoryStepClientIoLanes,
+    HistoryStepClientIoLanes, HISTORY_STEP_CLIENT_FORM_M,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,

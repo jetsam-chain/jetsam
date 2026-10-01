@@ -2264,6 +2264,12 @@ mod security_configuration_tests {
                 BASEFOLD_RATE_QUARTER_C1_QUERIES,
             ),
             ("recursive-m24", 19, 2, BASEFOLD_RATE_QUARTER_C1_QUERIES),
+            // v1.5 (M3.2): the two classes move to m = 23 and m = 25 on the
+            // same rate and batch, and keep the 133 queries of the launch
+            // classes — which is what lets an m = 22 client proof share
+            // their Link carrier.
+            ("recursive-m23", 18, 2, BASEFOLD_RATE_QUARTER_C1_QUERIES),
+            ("recursive-m25", 20, 2, BASEFOLD_RATE_QUARTER_C1_QUERIES),
             ("checkpoint-chunk", 4, 4, 96),
             ("receipt-projection", 5, 4, 94),
         ];
@@ -2271,6 +2277,10 @@ mod security_configuration_tests {
         for (name, log_msg_cols, log_inv_rate, expected_queries) in published {
             let config = checked_fri_configuration(log_msg_cols, log_inv_rate)
                 .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            eprintln!(
+                "{name}: {} queries, query term {:.1} bits, proximity term {:.1} bits",
+                config.query_count, config.query_term_bits, config.proximity_term_bits
+            );
             assert_eq!(config.query_count, expected_queries, "{name}");
             assert!(
                 config.query_term_bits + 1e-9 >= BASEFOLD_UDR_TARGET_BITS as f64,

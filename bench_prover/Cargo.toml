@@ -14,8 +14,6 @@ license = "Apache-2.0"
 # `jetsam_chain` is where those constants are chosen, so forwarding to it is all
 # that is needed: every other crate reads them through it.
 testnet = ["jetsam_chain/testnet"]
-# v1.5 prototype: the client-bearing HistoryStep relation (measurement only).
-client-slot = ["jetsam_recursive/client-slot", "dep:jetsam_client_agent"]
 
 [dependencies]
 jetsam_core = { path = "../jetsam_core" }
@@ -30,7 +28,6 @@ jetsam_recursive = { path = "../jetsam_recursive" }
 jetsam_miner = { path = "../jetsam_miner" }
 jetsam-ivc-core = { path = "../jetsam_ivc_core" }
 jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }
-jetsam_client_agent = { path = "../jetsam_client_agent", optional = true }
 rayon = "1.10"
 bincode = "1"
 hex = "0.4"
@@ -84,4 +81,8 @@ harness = false
 [[bench]]
 name = "client_agent_demo"
 harness = false
-required-features = ["client-slot"]
+
+[dev-dependencies]
+# The example client of the v1.5 client slot (catalogue entry 1), proved by
+# the `client_agent_demo` bench.
+jetsam_client_agent = { path = "../jetsam_client_agent" }

@@ -10,7 +10,7 @@
 //!
 //! `parent_only_carrier_is_bit_identical` characterizes the carrier as it
 //! existed before the client slot: its wire count, matrix digest and Link VK
-//! digest are pinned. The `client-slot` tests describe the two-proof carrier.
+//! digest are pinned. The `client_slot` tests describe the two-proof carrier (the v1.5 client slot).
 
 use super::*;
 use crate::acceptance::trace::self_verify::{
@@ -79,7 +79,6 @@ impl ProofFixture {
 
     /// A production-shape proof with honest uniform Merkle trees (the ghost
     /// arm's proof): right dimensions, meaningless values.
-    #[cfg_attr(not(feature = "client-slot"), allow(dead_code))]
     pub(super) fn shape_only(shape: FieldShape, params: PcsParams, digest: [u8; 32]) -> Self {
         let (proof, root) =
             crate::acceptance::trace::self_verify::shape_only_field_r1cs_proof_c1(&shape, &params);
@@ -408,7 +407,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Characterization of the carrier as released (v1.3 relation): one walked
 /// proof. These values were captured on the unmodified tree (tag v1.4.3) and
-/// must never move while the `client-slot` feature is off.
+/// must never move for the launch and v1.3 relations, which carry no client slot.
 #[test]
 fn parent_only_carrier_is_bit_identical() {
     let parents = ParentFixtures::new();
@@ -811,7 +810,50 @@ const RELEASED_V13_LINK_VK: &str =
 
 /// The two-proof carrier: the selected parent AND a client proof ride the
 /// same three Link walks.
-#[cfg(feature = "client-slot")]
+/// D2 (M3.2): the client form stays at m = 22 while v1.5 moves its parent
+/// classes to m = 23 and m = 25. The client still rides their Link carrier:
+/// same 133 queries, same leaf lanes at every tree position it has, and tree
+/// depths within the carrier's. Only the PCS parameters decide this, so
+/// placeholder transcript layouts are enough.
+#[test]
+fn the_m22_client_rides_the_v1_5_parent_carrier() {
+    use crate::acceptance::history_step_bank::{
+        canonical_history_step_pcs_params_in, CanonicalHistoryStepClassId, HistoryStepClientForm,
+    };
+    use jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_5;
+    use jetsam_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
+    let layout = || compile_duplex(&[TranscriptOp::Absorb(vec![Some(0); 2 * 1024])]);
+    let params: Vec<PcsParams> = (0..2)
+        .map(|slot| {
+            canonical_history_step_pcs_params_in(
+                V1_5,
+                CanonicalHistoryStepClassId::new(slot).expect("canonical slot"),
+            )
+        })
+        .collect();
+    let geometry = HistoryStepParentGeometry::new(
+        &params,
+        vec![layout(), layout()],
+        vec![layout(), layout()],
+    )
+    .expect("the v1.5 parent carrier exists");
+    assert_eq!(geometry.carrier.n_queries, 133);
+    let form = HistoryStepClientForm::canonical();
+    assert_eq!(form.shape().m, 22);
+    let geometry = geometry
+        .with_client(form.pcs_params(), layout())
+        .expect("an m = 22 client rides m = 23 / m = 25 parents");
+    assert_eq!(geometry.carrier.proof_roles, 2);
+    let dense = dense_path_geometry(&geometry.carrier).expect("dense path geometry");
+    eprintln!(
+        "[v1.5 carrier] queries={} roles={} carrier_depths={:?} family_paths={:?}",
+        geometry.carrier.n_queries,
+        geometry.carrier.proof_roles,
+        dense.carrier_depths,
+        dense.family_path_counts,
+    );
+}
+
 mod client_slot {
     use super::*;
 
@@ -1224,7 +1266,7 @@ mod client_slot {
     }
 
     /// M2 task 2.4 measurement: what walking the client proof costs at
-    /// production scale. Run in release with `--features client-slot`.
+    /// production scale. Run in release.
     #[test]
     #[ignore = "diagnostic: production-scale carrier cost (release, reads the v1.3 pack)"]
     fn production_two_proof_carrier_cost_diagnostic() {
@@ -1700,25 +1742,28 @@ mod client_slot {
         );
     }
 
-    /// M2 task 2.3, the Link-key fixed point: with the client slot the
-    /// canonical Link VK walks two proofs and records a third L-C role, which
-    /// widens the parent's joint-sidecar replay and therefore the recorded
-    /// layouts the key is built from. The derivation must still converge,
-    /// onto a key whose third role is the client transcript, and pin into a
-    /// client-bearing bank. Production scale: run in release.
+    /// M2 task 2.3, the Link-key fixed point, on the v1.5 relation (M3.2):
+    /// with the client slot the canonical Link VK walks two proofs and records
+    /// a third L-C role, which widens the parent's joint-sidecar replay and
+    /// therefore the recorded layouts the key is built from. The derivation
+    /// must still converge, onto a key whose third role is the client
+    /// transcript, and pin into a v1.5 bank. The direct-Block keys are the
+    /// released v1.3 ones (same tiers; the freezer replaces their slices).
+    /// Production scale: run in release.
     #[test]
-    #[ignore = "production scale: derives client-bearing runtime parts (release, reads the v1.3 pack)"]
+    #[ignore = "production scale: derives v1.5 runtime parts (release, reads the v1.3 pack)"]
     fn client_bearing_runtime_parts_reach_their_fixed_point() {
         use crate::acceptance::history_step::{
-            derive_history_step_runtime_parts_with_client, pin_history_step_class_bank,
+            derive_history_step_runtime_parts_in, pin_history_step_class_bank,
         };
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration;
         let released = released_v13_parts();
         let started = std::time::Instant::now();
-        let parts = derive_history_step_runtime_parts_with_client(
-            released.generation(),
+        let parts = derive_history_step_runtime_parts_in(
+            HistoryStepPackGeneration::V1_5,
             released.direct_block_vks().clone(),
         )
-        .expect("client-bearing runtime parts converge");
+        .expect("v1.5 runtime parts converge");
         let derive_ms = started.elapsed().as_secs_f64() * 1e3;
         let form = HistoryStepClientForm::canonical();
         let layout = client_transcript_layout(&form).expect("client layout");
@@ -1727,8 +1772,8 @@ mod client_slot {
             let (role, _) = vk.rec_c().selected_block(arm, 2).expect("third L-C role");
             assert_eq!(role, &layout, "client transcript role, arm {arm}");
         }
-        assert_eq!(vk.leaf_a().w_log(), 15, "L-A walks two proofs");
-        assert_eq!(vk.path_b().w_log(), 14, "L-B walks two proofs");
+        assert!(vk.leaf_a().w_log() >= 15, "L-A walks two proofs");
+        assert!(vk.path_b().w_log() >= 14, "L-B walks two proofs");
         assert_ne!(
             vk.transcript_digest(),
             released.parent_recursion_vk().transcript_digest()

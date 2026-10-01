@@ -13,8 +13,8 @@
 use super::gated_recorder::BaseSelectableParentRecorder;
 use super::*;
 use crate::acceptance::history_step_bank::{
-    block_acc_lanes_for, canonical_history_step_class_id_in, canonical_history_step_pcs_params,
-    canonical_history_step_shape, history_step_bank_base_output_io_rooted,
+    block_acc_lanes_for, canonical_history_step_class_id_in, canonical_history_step_pcs_params_in,
+    canonical_history_step_shape_in, history_step_bank_base_output_io_rooted,
     history_step_bank_recursion_root_lanes,
     history_step_bank_block_accumulator, history_step_bank_post_commit_digest,
     history_step_bank_tip_class, observe_history_step_bank_fold_route_trace,
@@ -25,7 +25,6 @@ use crate::acceptance::history_step_bank::{
     HISTORY_STEP_TIER_SLOT_COUNT,
 };
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
-#[cfg(feature = "client-slot")]
 use crate::acceptance::history_step_bank::HistoryStepClientForm;
 use jetsam_ivc_core::deep_chain::schedule::TranscriptOp;
 use jetsam_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
@@ -120,14 +119,11 @@ pub enum HistoryStepError {
         actual: usize,
     },
     /// The client proof is not a valid proof of the imposed form.
-    #[cfg(feature = "client-slot")]
     ClientProof,
     /// The client matrix is not in the registry, or the registry is malformed.
-    #[cfg(feature = "client-slot")]
     ClientRegistry,
     /// A client was supplied to a runtime without a client form, or the
     /// runtime's client parts disagree with its bank.
-    #[cfg(feature = "client-slot")]
     ClientForm,
 }
 
@@ -216,13 +212,10 @@ impl core::fmt::Display for HistoryStepError {
                 f,
                 "HistoryStep public IO is {actual} lanes, this pack generation uses {expected}",
             ),
-            #[cfg(feature = "client-slot")]
             Self::ClientProof => f.write_str("HistoryStep client proof is invalid for its form"),
-            #[cfg(feature = "client-slot")]
             Self::ClientRegistry => {
                 f.write_str("HistoryStep client matrix is not in a well-formed registry")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientForm => f.write_str("HistoryStep client slot does not match the runtime"),
         }
     }
@@ -260,18 +253,15 @@ impl HistoryStepError {
     }
 }
 
-/// The client slot of a runtime (`client-slot`, v1.5 prototype): the imposed
-/// client form and the L-C layout of the client arm's transcript. The layout
-/// is value-independent, so it is derived once, outside the Link-key fixed
-/// point.
-#[cfg(feature = "client-slot")]
+/// The client slot of a v1.5 runtime: the imposed client form and the L-C
+/// layout of the client arm's transcript. The layout is value-independent, so
+/// it is derived once, outside the Link-key fixed point.
 #[derive(Clone, Debug)]
 pub struct HistoryStepClientParts {
     form: HistoryStepClientForm,
     layout: DuplexLayout,
 }
 
-#[cfg(feature = "client-slot")]
 impl HistoryStepClientParts {
     /// The canonical form and its transcript layout.
     pub fn canonical() -> Result<Self, HistoryStepError> {
@@ -289,25 +279,30 @@ impl HistoryStepClientParts {
     }
 }
 
-/// A runtime's client slot: `None` for every existing relation. Without the
-/// feature it is the unit type, and nothing below depends on it.
-#[cfg(feature = "client-slot")]
+/// A runtime's client slot: present exactly when its generation carries one
+/// (v1.5), `None` for the launch and v1.3 relations.
 type ClientSlot = Option<HistoryStepClientParts>;
-#[cfg(not(feature = "client-slot"))]
-type ClientSlot = ();
 
-/// The client a block carries, if any (`client-slot`); unit without it.
-#[cfg(feature = "client-slot")]
+/// The client a block carries, if any.
 type ClientInput<'a> = Option<&'a super::client_arm::PreparedHistoryStepClient>;
-#[cfg(not(feature = "client-slot"))]
-type ClientInput<'a> = core::marker::PhantomData<&'a ()>;
 
 fn no_client<'a>() -> ClientInput<'a> {
-    Default::default()
+    None
+}
+
+/// The client slot `generation`'s relation carries: the canonical parts under
+/// v1.5, none under launch and v1.3.
+fn generation_client_slot(
+    generation: HistoryStepPackGeneration,
+) -> Result<ClientSlot, HistoryStepError> {
+    if generation.carries_client_slot() {
+        Ok(Some(HistoryStepClientParts::canonical()?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The parent geometry of a runtime, with the client role when it has one.
-#[cfg(feature = "client-slot")]
 fn slot_geometry(
     geometry: HistoryStepParentGeometry,
     client: &ClientSlot,
@@ -318,29 +313,23 @@ fn slot_geometry(
     }
 }
 
-#[cfg(not(feature = "client-slot"))]
-fn slot_geometry(
-    geometry: HistoryStepParentGeometry,
-    _client: &ClientSlot,
-) -> Result<HistoryStepParentGeometry, HistoryStepError> {
-    Ok(geometry)
-}
-
-/// The public-IO spec of a runtime: the client-bearing one when it has a
-/// client slot.
-#[cfg(feature = "client-slot")]
-fn slot_spec(generation: HistoryStepPackGeneration, client: &ClientSlot) -> PublicIoSpec {
-    match client {
-        Some(_) => {
-            crate::acceptance::history_step_bank::history_step_bank_io_spec_with_client(generation)
-        }
-        None => crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation),
-    }
-}
-
-#[cfg(not(feature = "client-slot"))]
-fn slot_spec(generation: HistoryStepPackGeneration, _client: &ClientSlot) -> PublicIoSpec {
+/// The public-IO spec of a runtime of `generation`: the client lanes are part
+/// of it exactly when the generation carries the client slot.
+fn slot_spec(generation: HistoryStepPackGeneration) -> PublicIoSpec {
     crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation)
+}
+
+/// PCS parameters of both parent arms of `generation`'s relation: a v1.5
+/// step verifies v1.5 parents only (its first block is a base).
+fn history_step_parent_params(
+    generation: HistoryStepPackGeneration,
+) -> [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] {
+    std::array::from_fn(|slot| {
+        canonical_history_step_pcs_params_in(
+            generation,
+            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
+        )
+    })
 }
 
 /// Fully materialized verifier authority. A persisted terminal is sufficient
@@ -392,7 +381,9 @@ impl HistoryStepRuntimeParts {
             parent_transcripts,
             parent_geometry,
             generation,
-            client: ClientSlot::default(),
+            // The compact codec carries no client part yet (M3.3), and the
+            // generation it discovers is never v1.5.
+            client: None,
         }
     }
 
@@ -431,25 +422,7 @@ impl HistoryStepRuntimeParts {
             parent_recursion_vk,
             direct_block_vks,
             parent_transcripts,
-            ClientSlot::default(),
-        )
-    }
-
-    /// [`Self::new_in`] for a client-bearing relation (`client-slot`).
-    #[cfg(feature = "client-slot")]
-    pub fn new_in_with_client(
-        generation: HistoryStepPackGeneration,
-        parent_recursion_vk: LinkRegionSidecarVk,
-        direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
-        parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
-        client: HistoryStepClientParts,
-    ) -> Result<Self, HistoryStepError> {
-        Self::new_in_slot(
-            generation,
-            parent_recursion_vk,
-            direct_block_vks,
-            parent_transcripts,
-            Some(client),
+            generation_client_slot(generation)?,
         )
     }
 
@@ -460,13 +433,18 @@ impl HistoryStepRuntimeParts {
         parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
         client: ClientSlot,
     ) -> Result<Self, HistoryStepError> {
-        let parent_params = (0..HISTORY_STEP_TIER_SLOT_COUNT)
-            .map(|slot| {
-                let class = CanonicalHistoryStepClassId::new(slot)
-                    .expect("runtime parent tier is canonical");
-                canonical_history_step_pcs_params(class)
-            })
-            .collect::<Vec<_>>();
+        // The client slot is the generation's, never a choice of the caller:
+        // a v1.5 runtime walks the canonical client form, the others none.
+        match &client {
+            Some(parts) if generation.carries_client_slot() => {
+                if parts.form != HistoryStepClientForm::canonical() {
+                    return Err(HistoryStepError::ClientForm);
+                }
+            }
+            None if !generation.carries_client_slot() => {}
+            _ => return Err(HistoryStepError::ClientForm),
+        }
+        let parent_params = history_step_parent_params(generation).to_vec();
         let geometry = HistoryStepParentGeometry::new(
             &parent_params,
             parent_transcripts
@@ -480,7 +458,7 @@ impl HistoryStepRuntimeParts {
         )?;
         let geometry = slot_geometry(geometry, &client)?;
         if geometry
-            .canonical_vk(&slot_spec(generation, &client))?
+            .canonical_vk(&slot_spec(generation))?
             .transcript_digest()
             != parent_recursion_vk.transcript_digest()
         {
@@ -522,8 +500,7 @@ impl HistoryStepRuntimeParts {
         &self.parent_transcripts
     }
 
-    /// The client slot of a client-bearing relation (`client-slot`).
-    #[cfg(feature = "client-slot")]
+    /// The client slot of a v1.5 relation; `None` under launch and v1.3.
     pub fn client(&self) -> Option<&HistoryStepClientParts> {
         self.client.as_ref()
     }
@@ -555,13 +532,13 @@ pub fn pin_history_step_class_bank(
     matrix_digests: [[u8; 32]; HISTORY_STEP_CLASS_COUNT],
     parts: &HistoryStepRuntimeParts,
 ) -> Result<PinnedHistoryStepClassBank, HistoryStepError> {
-    let spec = slot_spec(parts.generation, &parts.client);
+    let spec = slot_spec(parts.generation);
     let parent_recursion_vk_digest = parts.parent_recursion_vk.transcript_digest();
     let pins = std::array::from_fn(|index| {
         let class_id = CanonicalHistoryStepClassId::from_index(index)
             .expect("fixed HistoryStep bank index is canonical");
-        let shape = canonical_history_step_shape(class_id);
-        let pcs_params = canonical_history_step_pcs_params(class_id);
+        let shape = canonical_history_step_shape_in(parts.generation, class_id);
+        let pcs_params = canonical_history_step_pcs_params_in(parts.generation, class_id);
         let matrix_digest = matrix_digests[index];
         let direct_block_vk_digest =
             parts.direct_block_vks[class_id.current_slot()].transcript_digest();
@@ -582,15 +559,7 @@ pub fn pin_history_step_class_bank(
             ),
         }
     });
-    #[cfg(feature = "client-slot")]
-    if let Some(client) = &parts.client {
-        return PinnedHistoryStepClassBank::validate_with_client(
-            parts.generation,
-            pins,
-            client.form.clone(),
-        )
-        .map_err(Into::into);
-    }
+    // A v1.5 bank binds the client form itself (`validate_for`).
     PinnedHistoryStepClassBank::validate_for(parts.generation, pins).map_err(Into::into)
 }
 
@@ -647,6 +616,10 @@ pub fn derive_history_step_direct_block_vk_in<const TIER: usize>(
         authorization,
         &parent_header,
         &parent_seal.block_id,
+        // The shape alone is derived here: a v1.5 relation reads J off its
+        // recursion root, which this standalone build does not have; a
+        // genesis root (J = 0) is a valid schedule with the same rows.
+        &LinExpr::zero(),
     );
     Ok(assembly.region_vk().clone())
 }
@@ -678,34 +651,11 @@ pub fn derive_history_step_runtime_parts_in(
     generation: HistoryStepPackGeneration,
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
 ) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
-    derive_history_step_runtime_parts_slot(generation, direct_block_vks, ClientSlot::default())
-}
-
-/// [`derive_history_step_runtime_parts_in`] for a client-bearing relation
-/// (`client-slot`): the Link key walks the client proof and records its
-/// transcript, and the fixed point runs over that key.
-#[cfg(feature = "client-slot")]
-pub fn derive_history_step_runtime_parts_with_client(
-    generation: HistoryStepPackGeneration,
-    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
-) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
-    derive_history_step_runtime_parts_slot(
-        generation,
-        direct_block_vks,
-        Some(HistoryStepClientParts::canonical()?),
-    )
-}
-
-fn derive_history_step_runtime_parts_slot(
-    generation: HistoryStepPackGeneration,
-    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
-    client: ClientSlot,
-) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
-    let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
-        canonical_history_step_pcs_params(
-            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
-        )
-    });
+    // Under v1.5 the Link key also walks the client proof and records its
+    // transcript, and the fixed point runs over that key. The client
+    // transcript layout is value-independent and derived once, outside it.
+    let client = generation_client_slot(generation)?;
+    let parent_params = history_step_parent_params(generation);
     let mut child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|_| placeholder_history_step_recording_layout(1usize << 14));
     let mut r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
@@ -757,7 +707,7 @@ fn history_step_runtime_parts_pass(
         r_prev_layouts.to_vec(),
     )?;
     let geometry = slot_geometry(geometry, client)?;
-    let parent_recursion_vk = geometry.canonical_vk(&slot_spec(generation, client))?;
+    let parent_recursion_vk = geometry.canonical_vk(&slot_spec(generation))?;
     let transcripts = std::array::from_fn(|slot| {
         HistoryStepParentTranscriptLayout::new(
             child_layouts[slot].clone(),
@@ -835,26 +785,23 @@ pub(super) fn discover_history_step_pack_generation(
     direct_block_vks: &[BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
     transcripts: &[HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
 ) -> Result<HistoryStepPackGeneration, HistoryStepError> {
-    let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
-        canonical_history_step_pcs_params(
-            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
-        )
-    });
     let child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|slot| transcripts[slot].child.clone());
     let r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|slot| transcripts[slot].r_prev.clone());
+    // The compact codec carries no client part yet (M3.3): only the two
+    // client-free relations can be read back from it.
     for candidate in [
         HistoryStepPackGeneration::V1,
         HistoryStepPackGeneration::V1_3,
     ] {
         let pass = history_step_runtime_parts_pass(
             candidate,
-            &parent_params,
+            &history_step_parent_params(candidate),
             direct_block_vks,
             &child_layouts,
             &r_prev_layouts,
-            &ClientSlot::default(),
+            &None,
         )?;
         if pass.derived_children == child_layouts && pass.derived_r_prev == r_prev_layouts {
             return Ok(candidate);
@@ -882,9 +829,8 @@ pub struct HistoryStepRuntime {
     parent_recursion_vk: LinkRegionSidecarVk,
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
     parent_geometry: HistoryStepParentGeometry,
-    /// The chain's client registry, when this node holds one (`client-slot`,
+    /// The chain's client registry, when this node holds one (v1.5,
     /// M2 task 2.5): static in the prototype, chain state in M3.
-    #[cfg(feature = "client-slot")]
     clients: Option<std::sync::Arc<super::client_arm::HistoryStepChainClients>>,
 }
 
@@ -903,12 +849,9 @@ impl HistoryStepRuntime {
             client,
         } = parts;
         // A client-bearing bank and client-bearing parts come together.
-        #[cfg(feature = "client-slot")]
         if client.as_ref().map(HistoryStepClientParts::form) != bank.client_form() {
             return Err(HistoryStepError::ClientForm);
         }
-        #[cfg(not(feature = "client-slot"))]
-        let () = client;
         // The bank was pinned under a public-IO spec and these parts were
         // derived under one; if they disagree the two halves of the pack do
         // not belong together.
@@ -935,16 +878,14 @@ impl HistoryStepRuntime {
             parent_recursion_vk,
             direct_block_vks,
             parent_geometry,
-            #[cfg(feature = "client-slot")]
             clients: None,
         })
     }
 
-    /// Give this node the chain's client registry (`client-slot`, M2 task
+    /// Give this node the chain's client registry (v1.5, M2 task
     /// 2.5): every block that carries a client has its client lane checked
     /// against it before acceptance. The registry must be of the bank's
     /// client form.
-    #[cfg(feature = "client-slot")]
     pub fn with_chain_clients(
         mut self,
         clients: std::sync::Arc<super::client_arm::HistoryStepChainClients>,
@@ -957,7 +898,6 @@ impl HistoryStepRuntime {
     }
 
     /// The chain's client registry this node checks client lanes against.
-    #[cfg(feature = "client-slot")]
     pub fn chain_clients(&self) -> Option<&super::client_arm::HistoryStepChainClients> {
         self.clients.as_deref()
     }
@@ -1015,9 +955,7 @@ impl HistoryStepRuntime {
         // A block that carries a client is decided only against the chain's
         // registry (M2 task 2.5); the client lane is checked first, and its
         // matrix is resident with the registry.
-        #[cfg(feature = "client-slot")]
         let mut pending = pending;
-        #[cfg(feature = "client-slot")]
         pending.check_client_lane(self.clients.as_deref())?;
         pending
             .finish_with_matrix_loader(|class| self.load_matrix(class))
@@ -1337,14 +1275,17 @@ fn validate_built_against_bank(
     let entry = bank.entry(built.class_id);
     validate_runtime_witness_geometry(
         built.class_id,
-        canonical_history_step_shape(built.class_id),
+        canonical_history_step_shape_in(bank.generation(), built.class_id),
         matrix.field_shape(),
         matrix.useful_rows(),
         built.useful_rows,
         built.witness.len(),
     )?;
     if pcs_params_statement_bytes(&built.pcs_params)
-        != pcs_params_statement_bytes(&canonical_history_step_pcs_params(built.class_id))
+        != pcs_params_statement_bytes(&canonical_history_step_pcs_params_in(
+            bank.generation(),
+            built.class_id,
+        ))
     {
         return Err(HistoryStepError::PcsParams);
     }
@@ -2245,8 +2186,7 @@ pub struct PreparedHistoryStepForPow<const TIER: usize> {
 }
 
 /// The prepared client arm of a client-bearing runtime, its IO lanes
-/// installed into the block's output `io` (`client-slot`).
-#[cfg(feature = "client-slot")]
+/// installed into the block's output `io` (v1.5).
 fn prepare_client_slot<'r>(
     runtime: &'r HistoryStepRuntime,
     client: ClientInput<'_>,
@@ -2307,12 +2247,8 @@ fn prepare_history_step_assembly<const TIER: usize>(
     } = prepared;
     let envelope = envelopes[selected_parent_class.current_slot()].proof();
     let generation = bank.generation();
-    #[cfg(feature = "client-slot")]
     let mut io = io;
-    #[cfg(feature = "client-slot")]
     let client_slot = prepare_client_slot(runtime, client, &mut io)?;
-    #[cfg(not(feature = "client-slot"))]
-    let _ = client;
     let effective_pages = current.components.effective_page_count();
     if jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
         effective_pages,
@@ -2325,8 +2261,8 @@ fn prepare_history_step_assembly<const TIER: usize>(
     }
     let layout = bank.layout();
     let spec = bank.spec().clone();
-    let shape = canonical_history_step_shape(current_class);
-    let pcs_params = canonical_history_step_pcs_params(current_class);
+    let shape = canonical_history_step_shape_in(generation, current_class);
+    let pcs_params = canonical_history_step_pcs_params_in(generation, current_class);
     let current_matrix = match mode {
         HistoryStepAssemblyMode::Frozen => None,
         HistoryStepAssemblyMode::WitnessOnly => Some(runtime.load_matrix(current_class)?),
@@ -2370,18 +2306,8 @@ fn prepare_history_step_assembly<const TIER: usize>(
             }
         })
         .collect::<Vec<_>>();
-    #[cfg(not(feature = "client-slot"))]
-    let r_columns = prepare_history_step_parent_columns(
-        &mut builder,
-        &r_pcs,
-        selected_parent_class.current_slot(),
-        runtime.parent_geometry(),
-        prepared_parent.child_recordings,
-        prepared_parent.r_prev_recordings,
-    );
     // With a client slot the carrier walks the client proof (role 1) and
     // records its transcript (third L-C role), present or ghost.
-    #[cfg(feature = "client-slot")]
     let r_columns = match &client_slot {
         Some((form, _, client)) => {
             crate::acceptance::trace::r_pcs_region::prepare_history_step_carrier_columns(
@@ -2440,6 +2366,11 @@ fn prepare_history_step_assembly<const TIER: usize>(
         authorization,
         &parent_header,
         &parent_seal.block_id,
+        // v1.5 reads its activation height off the recursion root's height
+        // lane; launch and v1.3 do not read it (and launch has none).
+        &layout
+            .recursion_root_range()
+            .map_or_else(LinExpr::zero, |range| io_cells[range.start].clone()),
     );
     let block_slots = block_assembly.slots();
     // The parent header witness sits at the accumulator start height in both
@@ -2636,7 +2567,6 @@ fn prepare_history_step_assembly<const TIER: usize>(
     // The client arm: its checks are gated by `client_present` alone (a base
     // block may carry a client), so it runs outside `parent_gate`, and so
     // does the finalization of a carrier that walks it.
-    #[cfg(feature = "client-slot")]
     let client_trace = client_slot.as_ref().map(|(form, lanes, client)| {
         super::client_arm::client_arm_trace(
             &mut builder,
@@ -2645,9 +2575,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
             client,
         )
     });
-    #[cfg(feature = "client-slot")]
     lap("client arm", &mut stage_started);
-    #[cfg(feature = "client-slot")]
     let parent_region = match &client_trace {
         Some(client) => crate::acceptance::trace::r_pcs_region::finalize_history_step_carrier_region(
             &mut builder,
@@ -2674,17 +2602,6 @@ fn prepare_history_step_assembly<const TIER: usize>(
             )
         }),
     };
-    #[cfg(not(feature = "client-slot"))]
-    let parent_region = with_pin_gate(&parent_gate, || {
-        finalize_history_step_parent_region(
-            &mut builder,
-            r_columns,
-            &obligations,
-            &parent_selector.one_hot,
-            &recorded_children,
-            &recorded_r_prev,
-        )
-    });
     let parent_region = parent_region.map_err(|source| {
         HistoryStepError::sidecar(HistoryStepSidecarOperation::FinalizeParentRegion, source)
     })?;
@@ -3040,10 +2957,9 @@ pub fn prepare_history_step_for_pow<const TIER: usize>(
 }
 
 /// [`prepare_history_step_for_pow`] for a client-bearing runtime
-/// (`client-slot`): the block carries `client` — pre-passed once, when it
+/// (v1.5): the block carries `client` — pre-passed once, when it
 /// was received ([`super::client_arm::PreparedHistoryStepClient::prepare`]) —
 /// or the ghost of the form.
-#[cfg(feature = "client-slot")]
 pub fn prepare_history_step_for_pow_with_client<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
@@ -3190,7 +3106,7 @@ mod tests {
     #[test]
     fn runtime_witness_geometry_fails_closed_before_proving() {
         let class = CanonicalHistoryStepClassId::from_index(0).unwrap();
-        let shape = canonical_history_step_shape(class);
+        let shape = canonical_history_step_shape_in(HistoryStepPackGeneration::V1, class);
         let fields = 1usize << shape.m;
         assert!(validate_runtime_witness_geometry(class, shape, shape, 91, 91, fields).is_ok());
 

@@ -1132,40 +1132,82 @@ pub fn block_page_class_tier_at_activation(
 /// v1.2 is deliberately not a generation. It raised the terminal byte cap and
 /// changed a wire encoding, neither of which touches a matrix; the chain
 /// crossed it on the pack it already had.
+///
+/// v1.5 is the third generation: its classes are proved at m = 23 and m = 25
+/// instead of 22 and 24, and its relation carries the client slot. It keeps
+/// the v1.3 ladder, boundary and recursion root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HistoryStepPackGeneration {
     /// The relation the chain has run on since block one.
     V1,
     /// The relation that starts at [`V1_3_ACTIVATION_HEIGHT`].
     V1_3,
+    /// The relation that starts at [`V1_5_ACTIVATION_HEIGHT`].
+    V1_5,
 }
 
 impl HistoryStepPackGeneration {
     /// The generation that governs `height`, under the fixed schedule.
     #[inline]
     pub const fn at_height(height: u64) -> Self {
-        Self::at_activation(height, V1_3_ACTIVATION_HEIGHT)
+        Self::at_schedule(height, V1_3_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT)
     }
 
-    /// Testable twin with the schedule injected. Production always reads the
-    /// fixed clock; this exists so both relations can be exercised across a
-    /// boundary while the real clock stays dormant.
+    /// Testable twin with the v1.3 clock injected and v1.5 dormant. Production
+    /// always reads the fixed clocks; this exists so the launch and v1.3
+    /// relations can be exercised across their boundary while the real clock
+    /// stays dormant.
     #[inline]
     pub const fn at_activation(height: u64, activation_height: Option<u64>) -> Self {
-        if v1_3_active_with(height, activation_height) {
+        Self::at_schedule(height, activation_height, None)
+    }
+
+    /// Testable twin with both clocks injected. The later clock wins: a height
+    /// at or above the v1.5 activation is v1.5 whatever the v1.3 clock says.
+    #[inline]
+    pub const fn at_schedule(
+        height: u64,
+        v1_3_activation: Option<u64>,
+        v1_5_activation: Option<u64>,
+    ) -> Self {
+        if v1_5_active_with(height, v1_5_activation) {
+            Self::V1_5
+        } else if v1_3_active_with(height, v1_3_activation) {
             Self::V1_3
         } else {
             Self::V1
         }
     }
 
-    /// The class ladder this generation's matrices were built for.
+    /// The class ladder this generation's matrices were built for. v1.5 keeps
+    /// the v1.3 ladder: the classes grow in rows, not in pages.
     #[inline]
     pub const fn tiers(self) -> [usize; 2] {
         match self {
             Self::V1 => BLOCK_PAGE_CLASS_TIERS,
-            Self::V1_3 => [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]],
+            Self::V1_3 | Self::V1_5 => [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]],
         }
+    }
+
+    /// Outer dimension `m` (rows and columns are `2^m`) of each class,
+    /// indexed like [`Self::tiers`].
+    ///
+    /// v1.5 moves both classes up by one: the client arm and its share of the
+    /// Link carrier (~0.47 M rows, M2 note §14) take the small class past
+    /// 2^22 and the large one past 2^24.
+    #[inline]
+    pub const fn class_ms(self) -> [usize; 2] {
+        match self {
+            Self::V1 | Self::V1_3 => [22, 24],
+            Self::V1_5 => [23, 25],
+        }
+    }
+
+    /// Whether this generation's relation carries the client slot: the client
+    /// arm, its Link role and its public-IO lanes. Only v1.5 does.
+    #[inline]
+    pub const fn carries_client_slot(self) -> bool {
+        matches!(self, Self::V1_5)
     }
 
     /// Page positions held by this generation's small class.
@@ -1190,7 +1232,7 @@ impl HistoryStepPackGeneration {
     pub const fn chain_accumulator_lanes(self) -> usize {
         match self {
             Self::V1 => 10,
-            Self::V1_3 => 12,
+            Self::V1_3 | Self::V1_5 => 12,
         }
     }
 
@@ -1204,7 +1246,7 @@ impl HistoryStepPackGeneration {
     pub const fn recursion_root_lanes(self) -> usize {
         match self {
             Self::V1 => 0,
-            Self::V1_3 => self.chain_accumulator_lanes() + 2,
+            Self::V1_3 | Self::V1_5 => self.chain_accumulator_lanes() + 2,
         }
     }
 
@@ -1214,7 +1256,7 @@ impl HistoryStepPackGeneration {
     /// boundary had 90 seconds to be mined. K = 2 from v1.3.
     #[inline]
     pub const fn binds_two_epoch_anchors(self) -> bool {
-        matches!(self, Self::V1_3)
+        matches!(self, Self::V1_3 | Self::V1_5)
     }
 
     /// Whether the recursion root travels in the public IO.
@@ -1661,6 +1703,60 @@ mod tests {
         assert_eq!(v1_3.recursion_root_lanes(), 14);
         assert!(v1_3.binds_two_epoch_anchors());
         assert!(v1_3.carries_recursion_root());
+    }
+
+    /// v1.5 is the third relation. It is chosen by the fourth clock, at the
+    /// block's own height, over v1.3 and over launch; a dormant v1.5 clock
+    /// leaves the v1.3 schedule exactly as it was.
+    #[test]
+    fn the_v1_5_generation_is_chosen_by_the_blocks_own_height() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5};
+        let (v1_3, v1_5) = (Some(17_750), Some(30_720));
+        let at = |height| HistoryStepPackGeneration::at_schedule(height, v1_3, v1_5);
+        assert_eq!(at(0), V1);
+        assert_eq!(at(17_749), V1);
+        assert_eq!(at(17_750), V1_3);
+        assert_eq!(at(30_719), V1_3);
+        assert_eq!(at(30_720), V1_5);
+        assert_eq!(at(u64::MAX), V1_5);
+        for height in [0, 1, 17_749, 17_750, 30_720, u64::MAX] {
+            assert_eq!(
+                HistoryStepPackGeneration::at_schedule(height, v1_3, None),
+                HistoryStepPackGeneration::at_activation(height, v1_3),
+                "a dormant v1.5 clock must leave height {height} where it was"
+            );
+        }
+        // The production schedule, at whatever this profile carries.
+        for height in [0, 1, 17_750, 24_846, 30_720, u64::MAX] {
+            assert_eq!(
+                HistoryStepPackGeneration::at_height(height),
+                HistoryStepPackGeneration::at_schedule(
+                    height,
+                    V1_3_ACTIVATION_HEIGHT,
+                    V1_5_ACTIVATION_HEIGHT
+                )
+            );
+        }
+    }
+
+    /// What v1.5 changes in the relation, enumerated beside the other two:
+    /// the outer dimensions go to m = 23 / m = 25, the class ladder, the
+    /// boundary and the recursion root are those of v1.3, and only v1.5
+    /// carries the client slot.
+    #[test]
+    fn the_v1_5_generation_answers_its_own_constants() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5};
+        assert_eq!(V1.class_ms(), [22, 24]);
+        assert_eq!(V1_3.class_ms(), [22, 24]);
+        assert_eq!(V1_5.class_ms(), [23, 25]);
+        assert_eq!(V1_5.tiers(), V1_3.tiers());
+        assert_eq!(V1_5.chain_accumulator_lanes(), 12);
+        assert_eq!(V1_5.recursion_root_lanes(), 14);
+        assert!(V1_5.binds_two_epoch_anchors());
+        assert!(V1_5.carries_recursion_root());
+        assert!(V1_5.carries_client_slot());
+        assert!(!V1_3.carries_client_slot());
+        assert!(!V1.carries_client_slot());
     }
 
     /// A block is judged by the class ladder in force at its own height.

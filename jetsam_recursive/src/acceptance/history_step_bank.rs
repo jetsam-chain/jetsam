@@ -214,8 +214,12 @@ impl HistoryStepMatrixLease {
 }
 
 /// Frozen outer dimensions selected solely by the current physical-page
-/// class. Both matrices contain the same two-arm B25/B255 parent selector, so
-/// parent shape changes witness data rather than the current matrix identity.
+/// class, under the launch and v1.3 relations. Both matrices contain the same
+/// two-arm B25/B255 parent selector, so parent shape changes witness data
+/// rather than the current matrix identity.
+///
+/// v1.5 moves both classes up by one ([`history_step_class_ms`]); code that
+/// has a generation in hand asks it, never this constant.
 pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [22, 24];
 
 const _: () = assert!(
@@ -225,6 +229,26 @@ const _: () = assert!(
             == jetsam_chain::consensus::paged_spend::BlockProofClass::B255.outer_m(),
     "HistoryStep and consensus proof-class dimensions must match"
 );
+
+/// The outer dimension of each class of `generation`'s relation: m = 22 / 24
+/// at launch and under v1.3, m = 23 / 25 under v1.5.
+pub const fn history_step_class_ms(
+    generation: HistoryStepPackGeneration,
+) -> [usize; HISTORY_STEP_TIER_SLOT_COUNT] {
+    generation.class_ms()
+}
+
+const _: () = {
+    let launch = history_step_class_ms(HistoryStepPackGeneration::V1);
+    let v1_3 = history_step_class_ms(HistoryStepPackGeneration::V1_3);
+    assert!(
+        launch[0] == HISTORY_STEP_CURRENT_CLASS_MS[0]
+            && launch[1] == HISTORY_STEP_CURRENT_CLASS_MS[1]
+            && v1_3[0] == HISTORY_STEP_CURRENT_CLASS_MS[0]
+            && v1_3[1] == HISTORY_STEP_CURRENT_CLASS_MS[1],
+        "the launch and v1.3 relations keep the released class dimensions"
+    );
+};
 
 const HISTORY_STEP_BANK_POST_COMMIT_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/BANK-POST-COMMIT/V1";
 const HISTORY_STEP_BANK_DIGEST_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/CLASS-BANK/V1";
@@ -307,8 +331,23 @@ pub fn canonical_history_step_class_id_in(
     CanonicalHistoryStepClassId::new(current_slot)
 }
 
+/// The shape of one class under the launch and v1.3 relations (m = 22 / 24).
+/// [`canonical_history_step_shape_in`] answers for any generation.
 pub fn canonical_history_step_shape(class_id: CanonicalHistoryStepClassId) -> FieldShape {
-    let m = HISTORY_STEP_CURRENT_CLASS_MS[class_id.current_slot()];
+    canonical_history_step_shape_in(HistoryStepPackGeneration::V1, class_id)
+}
+
+/// The shape of one class of `generation`'s relation.
+pub fn canonical_history_step_shape_in(
+    generation: HistoryStepPackGeneration,
+    class_id: CanonicalHistoryStepClassId,
+) -> FieldShape {
+    square_history_step_shape(history_step_class_ms(generation)[class_id.current_slot()])
+}
+
+/// The canonical square shape at `m`: `k_log = m`, the zerocheck skip, the
+/// constant pinned in column zero.
+const fn square_history_step_shape(m: usize) -> FieldShape {
     FieldShape {
         m,
         k_log: m,
@@ -317,14 +356,29 @@ pub fn canonical_history_step_shape(class_id: CanonicalHistoryStepClassId) -> Fi
     }
 }
 
-pub fn canonical_history_step_pcs_params(class_id: CanonicalHistoryStepClassId) -> PcsParams {
-    let shape = canonical_history_step_shape(class_id);
+/// The PCS parameters of the HistoryStep proof system at shape `m`: rate 1/4,
+/// batch 2^5. Every class and the client form share them.
+fn history_step_pcs_params_at(m: usize) -> PcsParams {
     PcsParams {
-        m: shape.m + LOG_PACKING,
+        m: m + LOG_PACKING,
         log_inv_rate: HISTORY_STEP_PCS_LOG_INV_RATE,
         log_batch_size: HISTORY_STEP_PCS_LOG_BATCH_SIZE,
         profile: Default::default(),
     }
+}
+
+/// PCS parameters of one class under the launch and v1.3 relations.
+/// [`canonical_history_step_pcs_params_in`] answers for any generation.
+pub fn canonical_history_step_pcs_params(class_id: CanonicalHistoryStepClassId) -> PcsParams {
+    canonical_history_step_pcs_params_in(HistoryStepPackGeneration::V1, class_id)
+}
+
+/// PCS parameters of one class of `generation`'s relation.
+pub fn canonical_history_step_pcs_params_in(
+    generation: HistoryStepPackGeneration,
+    class_id: CanonicalHistoryStepClassId,
+) -> PcsParams {
+    history_step_pcs_params_at(canonical_history_step_shape_in(generation, class_id).m)
 }
 
 /// One variable-width matrix accumulator lane.
@@ -355,22 +409,26 @@ impl HistoryStepBankLaneLayout {
 }
 
 /// Public lanes of a client IO: its lane count in the imposed client form.
-#[cfg(feature = "client-slot")]
 pub const HISTORY_STEP_CLIENT_IO_LANES: usize = 8;
 
 /// Depth of the client registry tree: sixteen registered matrices, bound in
 /// circuit at ~362 rows per level (M1 task 1.4).
-#[cfg(feature = "client-slot")]
 pub const HISTORY_STEP_CLIENT_REGISTRY_DEPTH: usize = 4;
 
-#[cfg(feature = "client-slot")]
 const HISTORY_STEP_CLIENT_FORM_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/CLIENT-FORM/V1";
 
-/// The imposed client form (v1.5 prototype, `client-slot`): every client
-/// proof a block carries has this shape, these PCS parameters and this public
-/// IO. It is the small-class form, which lets the client ride the parent's
-/// Link carrier (same query count and leaf signature, M2 task 2.4).
-#[cfg(feature = "client-slot")]
+/// The outer dimension of the imposed client form: **pinned at m = 22**
+/// (operator decision D2, 2026-10-01). It is the launch small-class shape,
+/// and it does not follow the v1.5 small class to m = 23: a client proves in
+/// 3.7-5 s and sends ~409 kB at m = 22, and at that size it still has the 133
+/// queries and the leaf signature of the m = 23 / m = 25 parents whose Link
+/// carrier it rides.
+pub const HISTORY_STEP_CLIENT_FORM_M: usize = 22;
+
+/// The imposed client form of the v1.5 relation: every client proof a block
+/// carries has this shape, these PCS parameters and this public IO. Its query
+/// count and leaf signature are the parents', which lets the client ride the
+/// parent's Link carrier (M2 task 2.4, D2).
 #[derive(Clone, Debug)]
 pub struct HistoryStepClientForm {
     shape: FieldShape,
@@ -380,25 +438,23 @@ pub struct HistoryStepClientForm {
 }
 
 /// Two forms are one form when their canonical bytes are.
-#[cfg(feature = "client-slot")]
 impl PartialEq for HistoryStepClientForm {
     fn eq(&self, other: &Self) -> bool {
         self.statement_bytes() == other.statement_bytes()
     }
 }
 
-#[cfg(feature = "client-slot")]
 impl Eq for HistoryStepClientForm {}
 
-#[cfg(feature = "client-slot")]
 impl HistoryStepClientForm {
-    /// The v1.5 prototype form: the B24 class shape and PCS parameters, an
-    /// eight-lane public IO, a sixteen-entry registry.
+    /// The v1.5 form: the m = 22 square shape and the HistoryStep PCS
+    /// parameters at that size ([`HISTORY_STEP_CLIENT_FORM_M`]), an
+    /// eight-lane public IO, a sixteen-entry registry. Its bytes are those of
+    /// the M2 prototype form, which was the launch small-class form.
     pub fn canonical() -> Self {
-        let small = CanonicalHistoryStepClassId::new(0).expect("small class");
         Self {
-            shape: canonical_history_step_shape(small),
-            pcs_params: canonical_history_step_pcs_params(small),
+            shape: square_history_step_shape(HISTORY_STEP_CLIENT_FORM_M),
+            pcs_params: history_step_pcs_params_at(HISTORY_STEP_CLIENT_FORM_M),
             io_spec: PublicIoSpec {
                 io_slice: WitnessSlice {
                     log2_len: HISTORY_STEP_CLIENT_IO_LANES.trailing_zeros() as usize,
@@ -474,9 +530,8 @@ impl HistoryStepClientForm {
     }
 }
 
-/// The client lanes of a client-bearing public IO (`client-slot`), appended
+/// The client lanes of a v1.5 public IO, appended
 /// after the recursion root. A block without a client carries zeros.
-#[cfg(feature = "client-slot")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryStepClientIoLanes {
     /// `client_present`: one when the block carries a client proof.
@@ -492,7 +547,6 @@ pub struct HistoryStepClientIoLanes {
     pub matrix_lane: HistoryStepBankLaneLayout,
 }
 
-#[cfg(feature = "client-slot")]
 impl HistoryStepClientIoLanes {
     /// The client block starting at lane `offset`, its accumulator lane
     /// sized for a client matrix of side `2^k_log`.
@@ -518,9 +572,8 @@ impl HistoryStepClientIoLanes {
 }
 
 /// The client lanes of a public IO that carries a present client
-/// (`client-slot`, M2 task 2.5): what a node reads out of a block, and checks
+/// (v1.5, M2 task 2.5): what a node reads out of a block, and checks
 /// natively against the chain's registry, before it accepts the block.
-#[cfg(feature = "client-slot")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryStepClientClaim {
     /// `D`: the client matrix the circuit verified the client proof under.
@@ -534,13 +587,12 @@ pub struct HistoryStepClientClaim {
     pub claim: C1MatrixAccClaim,
 }
 
-/// Read the client lanes of `io` (`client-slot`, M2 task 2.5), refusing
+/// Read the client lanes of `io` (v1.5, M2 task 2.5), refusing
 /// every non-canonical encoding: `client_present` is 0 or 1; an absent
 /// client carries zeros in every client lane; a present client carries a
 /// live accumulator lane and a non-null `D` (empty registry leaves are the
 /// null digest, so a null `D` would be a "member" of any registry that is
 /// not full).
-#[cfg(feature = "client-slot")]
 pub fn parse_history_step_client_lanes(
     lanes: &HistoryStepClientIoLanes,
     io: &[F128],
@@ -623,8 +675,8 @@ pub struct HistoryStepBankIoLayout {
     /// The generation whose relation this layout describes. Every width
     /// above follows from it.
     pub generation: HistoryStepPackGeneration,
-    /// The client lanes, present only in a client-bearing layout.
-    #[cfg(feature = "client-slot")]
+    /// The client lanes, after the recursion root: present exactly when the
+    /// generation carries the client slot (v1.5).
     pub client: Option<HistoryStepClientIoLanes>,
 }
 
@@ -654,10 +706,14 @@ pub fn history_step_bank_io_layout() -> HistoryStepBankIoLayout {
 
 /// The public-IO layout of `generation`'s relation.
 ///
-/// Both generations agree lane for lane up to and including the first ten
-/// accumulator lanes; v1.3 then carries two more accumulator lanes and the
-/// recursion root. A launch IO is therefore a prefix of a v1.3 one, and the
-/// launch layout is byte for byte what it was before v1.3 existed.
+/// The launch and v1.3 layouts agree lane for lane up to and including the
+/// first ten accumulator lanes; v1.3 then carries two more accumulator lanes
+/// and the recursion root. A launch IO is therefore a prefix of a v1.3 one,
+/// and the launch layout is byte for byte what it was before v1.3 existed.
+///
+/// v1.5 keeps the v1.3 lanes up to the bank digest; its matrix lanes are
+/// wider (the class matrices are 2^23 and 2^25), and the client lanes follow
+/// the recursion root.
 pub fn history_step_bank_io_layout_for(
     generation: HistoryStepPackGeneration,
 ) -> HistoryStepBankIoLayout {
@@ -669,10 +725,20 @@ pub fn history_step_bank_io_layout_for(
     let mut offset = bank_digest + 2;
     let matrix_lanes = std::array::from_fn(|index| {
         let class_id = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
-        let (lane, next) =
-            HistoryStepBankLaneLayout::new(offset, canonical_history_step_shape(class_id).k_log);
+        let (lane, next) = HistoryStepBankLaneLayout::new(
+            offset,
+            canonical_history_step_shape_in(generation, class_id).k_log,
+        );
         offset = next;
         lane
+    });
+    let recursion_root = offset + generation.chain_accumulator_lanes();
+    let mut len = recursion_root + generation.recursion_root_lanes();
+    let client = generation.carries_client_slot().then(|| {
+        let client =
+            HistoryStepClientIoLanes::at(len, HistoryStepClientForm::canonical().shape().k_log);
+        len = client.end();
+        client
     });
     HistoryStepBankIoLayout {
         base,
@@ -682,37 +748,13 @@ pub fn history_step_bank_io_layout_for(
         bank_digest,
         matrix_lanes,
         block_accumulator: offset,
-        recursion_root: offset + generation.chain_accumulator_lanes(),
-        len: offset + generation.chain_accumulator_lanes() + generation.recursion_root_lanes(),
+        recursion_root,
+        len,
         generation,
-        #[cfg(feature = "client-slot")]
-        client: None,
+        client,
     }
 }
 
-/// `generation`'s layout with the client lanes appended after the recursion
-/// root (`client-slot`): every lane of the plain layout keeps its index.
-#[cfg(feature = "client-slot")]
-pub fn history_step_bank_io_layout_with_client(
-    generation: HistoryStepPackGeneration,
-) -> HistoryStepBankIoLayout {
-    let mut layout = history_step_bank_io_layout_for(generation);
-    let client = HistoryStepClientIoLanes::at(
-        layout.len,
-        HistoryStepClientForm::canonical().shape().k_log,
-    );
-    layout.len = client.end();
-    layout.client = Some(client);
-    layout
-}
-
-/// The public-IO spec of [`history_step_bank_io_layout_with_client`].
-#[cfg(feature = "client-slot")]
-pub fn history_step_bank_io_spec_with_client(generation: HistoryStepPackGeneration) -> PublicIoSpec {
-    io_spec_of(&history_step_bank_io_layout_with_client(generation))
-}
-
-#[cfg(feature = "client-slot")]
 fn io_spec_of(layout: &HistoryStepBankIoLayout) -> PublicIoSpec {
     PublicIoSpec {
         io_slice: WitnessSlice {
@@ -733,15 +775,7 @@ pub fn history_step_bank_io_spec() -> PublicIoSpec {
 /// The public-IO spec of `generation`'s relation — what its post-commit
 /// digests are taken over.
 pub fn history_step_bank_io_spec_for(generation: HistoryStepPackGeneration) -> PublicIoSpec {
-    let layout = history_step_bank_io_layout_for(generation);
-    PublicIoSpec {
-        io_slice: WitnessSlice {
-            log2_len: layout.len.next_power_of_two().trailing_zeros() as usize,
-            index: 1,
-        },
-        io_len: layout.len,
-        claims: Vec::new(),
-    }
+    io_spec_of(&history_step_bank_io_layout_for(generation))
 }
 
 /// External release pins needed to authenticate one bank entry.
@@ -808,8 +842,7 @@ pub struct PinnedHistoryStepClassBank {
     /// height for a v1.3 pack. Not part of the bank's digest — it is a fact
     /// about which chain the pack serves, not about the pack.
     recursion_root_height: u64,
-    /// The imposed client form of a client-bearing bank (`client-slot`).
-    #[cfg(feature = "client-slot")]
+    /// The imposed client form of a v1.5 bank.
     client_form: Option<HistoryStepClientForm>,
 }
 
@@ -829,41 +862,30 @@ impl PinnedHistoryStepClassBank {
     /// wrong one fails on its first entry rather than loading and
     /// misbehaving later. [`Self::validate`] is this under the launch
     /// generation, unchanged.
+    ///
+    /// A v1.5 bank carries the client slot: its public IO has the client
+    /// lanes, every post-commit digest is taken over that wider spec, and the
+    /// bank digest binds the imposed client form.
     pub fn validate_for(
         generation: HistoryStepPackGeneration,
         pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
     ) -> Result<Self, HistoryStepBankError> {
-        Self::validate_in(
-            history_step_bank_io_layout_for(generation),
-            history_step_bank_io_spec_for(generation),
-            pins,
-        )
-    }
-
-    /// A client-bearing bank of `generation` (`client-slot`): the public IO
-    /// carries the client lanes, every post-commit digest is taken over that
-    /// widened spec, and the bank digest binds the imposed client form.
-    #[cfg(feature = "client-slot")]
-    pub fn validate_with_client(
-        generation: HistoryStepPackGeneration,
-        pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
-        client_form: HistoryStepClientForm,
-    ) -> Result<Self, HistoryStepBankError> {
-        if client_form != HistoryStepClientForm::canonical() {
-            return Err(HistoryStepBankError::ClientForm);
-        }
-        let layout = history_step_bank_io_layout_with_client(generation);
+        let layout = history_step_bank_io_layout_for(generation);
         let spec = io_spec_of(&layout);
-        let mut bank = Self::validate_in(layout, spec, pins)?;
-        bank.digest = poseidon2b_hash_byte_slices(
-            HISTORY_STEP_BANK_DIGEST_DOMAIN,
-            &[&bank.digest, b"client-form", &client_form.statement_bytes()],
-        );
-        bank.client_form = Some(client_form);
+        let mut bank = Self::validate_in(generation, layout, spec, pins)?;
+        if generation.carries_client_slot() {
+            let client_form = HistoryStepClientForm::canonical();
+            bank.digest = poseidon2b_hash_byte_slices(
+                HISTORY_STEP_BANK_DIGEST_DOMAIN,
+                &[&bank.digest, b"client-form", &client_form.statement_bytes()],
+            );
+            bank.client_form = Some(client_form);
+        }
         Ok(bank)
     }
 
     fn validate_in(
+        generation: HistoryStepPackGeneration,
         layout: HistoryStepBankIoLayout,
         spec: PublicIoSpec,
         pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
@@ -877,10 +899,10 @@ impl PinnedHistoryStepClassBank {
                     actual: pin.class_id,
                 });
             }
-            if pin.shape != canonical_history_step_shape(pin.class_id) {
+            if pin.shape != canonical_history_step_shape_in(generation, pin.class_id) {
                 return Err(HistoryStepBankError::EntryShape(pin.class_id));
             }
-            let expected_pcs = canonical_history_step_pcs_params(pin.class_id);
+            let expected_pcs = canonical_history_step_pcs_params_in(generation, pin.class_id);
             if pcs_params_statement_bytes(&pin.pcs_params)
                 != pcs_params_statement_bytes(&expected_pcs)
             {
@@ -917,13 +939,11 @@ impl PinnedHistoryStepClassBank {
             spec,
             digest,
             recursion_root_height: 0,
-            #[cfg(feature = "client-slot")]
             client_form: None,
         })
     }
 
     /// The imposed client form of a client-bearing bank.
-    #[cfg(feature = "client-slot")]
     pub fn client_form(&self) -> Option<&HistoryStepClientForm> {
         self.client_form.as_ref()
     }
@@ -1171,8 +1191,7 @@ struct ParsedHistoryStepBankIo {
     block_accumulator: Vec<F128>,
     /// `None` under a generation that pins its root in the matrices.
     recursion_root: Option<Vec<F128>>,
-    /// The present client of a client-bearing IO (`client-slot`).
-    #[cfg(feature = "client-slot")]
+    /// The present client of a v1.5 IO.
     client: Option<HistoryStepClientClaim>,
 }
 
@@ -1252,7 +1271,6 @@ fn parse_history_step_bank_io(
     let recursion_root = layout
         .recursion_root_range()
         .map(|range| io[range].to_vec());
-    #[cfg(feature = "client-slot")]
     let client = match &layout.client {
         Some(lanes) => parse_history_step_client_lanes(lanes, io)?,
         None => None,
@@ -1263,7 +1281,6 @@ fn parse_history_step_bank_io(
         lanes: parsed_lanes,
         block_accumulator,
         recursion_root,
-        #[cfg(feature = "client-slot")]
         client,
     })
 }
@@ -1534,8 +1551,7 @@ pub struct PendingHistoryStepBankDecision {
     base: bool,
     block_accumulator: Vec<F128>,
     /// The tip's present client, until its lane is checked against the
-    /// chain's registry (`client-slot`, M2 task 2.5).
-    #[cfg(feature = "client-slot")]
+    /// chain's registry (v1.5, M2 task 2.5).
     client: Option<HistoryStepClientClaim>,
 }
 
@@ -1576,23 +1592,20 @@ impl PendingHistoryStepBankDecision {
             bank_digest: replay.bank_digest,
             base: parsed.base,
             block_accumulator: parsed.block_accumulator,
-            #[cfg(feature = "client-slot")]
             client: parsed.client,
         })
     }
 
     /// The tip's present client whose lane is still to be checked.
-    #[cfg(feature = "client-slot")]
     pub fn pending_client(&self) -> Option<&HistoryStepClientClaim> {
         self.client.as_ref()
     }
 
     /// Check the tip's client lane natively against the chain's registry
-    /// (`client-slot`, M2 task 2.5): registry root, membership of `D`, and
+    /// (v1.5, M2 task 2.5): registry root, membership of `D`, and
     /// the accumulator claim evaluated on the registered matrix `D`. Nothing
     /// to check without a present client; a present client and no registry
     /// at this node is a refusal, never an acceptance.
-    #[cfg(feature = "client-slot")]
     pub fn check_client_lane(
         &mut self,
         clients: Option<&crate::acceptance::history_step::HistoryStepChainClients>,
@@ -1775,7 +1788,6 @@ impl PendingHistoryStepBankDecision {
     /// Return an accepted terminal capability only after the tip fresh claim
     /// and every live bank lane were checked exactly once.
     pub fn finish(self) -> Result<AcceptedHistoryStepBankTip, HistoryStepBankError> {
-        #[cfg(feature = "client-slot")]
         if self.client.is_some() {
             return Err(HistoryStepBankError::ClientLaneUnchecked);
         }
@@ -1876,37 +1888,26 @@ pub enum HistoryStepBankError {
     TipMatrixUnchecked(CanonicalHistoryStepClassId),
     LiveLaneUnchecked(CanonicalHistoryStepClassId),
     /// A client-bearing bank named a form other than the imposed one.
-    #[cfg(feature = "client-slot")]
     ClientForm,
     /// `client_present` is neither 0 nor 1.
-    #[cfg(feature = "client-slot")]
     ClientPresentFlag,
     /// An absent client carries a nonzero client lane.
-    #[cfg(feature = "client-slot")]
     NonCanonicalAbsentClient,
     /// A present client's accumulator lane is not live.
-    #[cfg(feature = "client-slot")]
     ClientLaneLiveness,
     /// A present client names the null matrix digest.
-    #[cfg(feature = "client-slot")]
     NullClientMatrixDigest,
     /// A present client, and no client registry at this node.
-    #[cfg(feature = "client-slot")]
     ClientRegistryUnavailable,
     /// The registry root a client lane carries is not the chain's.
-    #[cfg(feature = "client-slot")]
     ClientRegistryRoot,
     /// The client matrix `D` is not an entry of the chain's registry.
-    #[cfg(feature = "client-slot")]
     ClientNotRegistered,
     /// The client accumulator claim has the wrong width for the form.
-    #[cfg(feature = "client-slot")]
     ClientLaneWidth,
     /// The client accumulator claim does not hold on the registered matrix.
-    #[cfg(feature = "client-slot")]
     ClientAccumulatedClaimValue,
     /// A present client whose lane was never checked.
-    #[cfg(feature = "client-slot")]
     ClientLaneUnchecked,
 }
 
@@ -2052,43 +2053,32 @@ impl core::fmt::Display for HistoryStepBankError {
             Self::LiveLaneUnchecked(class) => {
                 write!(f, "HistoryStep live lane {} was not checked", class.index())
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientForm => f.write_str("HistoryStep bank names a non-canonical client form"),
-            #[cfg(feature = "client-slot")]
             Self::ClientPresentFlag => f.write_str("HistoryStep client_present is not boolean"),
-            #[cfg(feature = "client-slot")]
             Self::NonCanonicalAbsentClient => {
                 f.write_str("HistoryStep absent client carries a nonzero client lane")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientLaneLiveness => {
                 f.write_str("HistoryStep present client has a dead accumulator lane")
             }
-            #[cfg(feature = "client-slot")]
             Self::NullClientMatrixDigest => {
                 f.write_str("HistoryStep present client names the null matrix digest")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientRegistryUnavailable => {
                 f.write_str("HistoryStep block carries a client and this node has no client registry")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientRegistryRoot => {
                 f.write_str("HistoryStep client registry root is not the chain's")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientNotRegistered => {
                 f.write_str("HistoryStep client matrix is not in the chain's registry")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientLaneWidth => {
                 f.write_str("HistoryStep client accumulator claim has the wrong width")
             }
-            #[cfg(feature = "client-slot")]
             Self::ClientAccumulatedClaimValue => f.write_str(
                 "HistoryStep client accumulator claim does not hold on the registered matrix",
             ),
-            #[cfg(feature = "client-slot")]
             Self::ClientLaneUnchecked => f.write_str("HistoryStep client lane was not checked"),
         }
     }
@@ -2112,8 +2102,8 @@ mod tests {
         let spec = history_step_bank_io_spec_for(generation);
         std::array::from_fn(|index| {
             let class_id = CanonicalHistoryStepClassId::from_index(index).unwrap();
-            let shape = canonical_history_step_shape(class_id);
-            let pcs_params = canonical_history_step_pcs_params(class_id);
+            let shape = canonical_history_step_shape_in(generation, class_id);
+            let pcs_params = canonical_history_step_pcs_params_in(generation, class_id);
             let matrix_digest = [index as u8 + 1; 32];
             let parent_recursion_vk_digest = [0x21; 32];
             let direct_block_vk_digest = [class_id.current_slot() as u8 + 0x41; 32];
@@ -2137,120 +2127,128 @@ mod tests {
         })
     }
 
-    /// v1.5 prototype (M2 tasks 2.1 and 2.2): the imposed client form and the
-    /// client lanes of the public IO.
-    #[cfg(feature = "client-slot")]
-    mod client_slot {
+    /// M3.2 — the v1.5 generation: m = 23 / m = 25 classes, the client form
+    /// pinned at m = 22, the client lanes part of the relation.
+    mod v1_5_generation {
         use super::*;
 
-        /// 2.1 — the client form is the small-class form retained in 2.4
-        /// (B24: m22, rate 1/4, batch 2^5, 133 queries), with a fixed public
-        /// IO and a bounded registry of sixteen matrices.
+        /// The two v1.5 classes are proved at m = 23 and m = 25, on the same
+        /// PCS parameters as before (rate 1/4, batch 2^5), and keep the 133
+        /// queries of the launch classes; launch and v1.3 keep m = 22 / 24.
         #[test]
-        fn the_client_form_is_the_small_class_form() {
+        fn the_v1_5_classes_are_m23_and_m25() {
+            use HistoryStepPackGeneration::{V1, V1_3, V1_5};
+            let small = CanonicalHistoryStepClassId::new(0).unwrap();
+            let large = CanonicalHistoryStepClassId::new(1).unwrap();
+            for generation in [V1, V1_3] {
+                assert_eq!(canonical_history_step_shape_in(generation, small).m, 22);
+                assert_eq!(canonical_history_step_shape_in(generation, large).m, 24);
+                assert_eq!(
+                    canonical_history_step_shape_in(generation, small),
+                    canonical_history_step_shape(small)
+                );
+                assert_eq!(
+                    canonical_history_step_shape_in(generation, large),
+                    canonical_history_step_shape(large)
+                );
+            }
+            for (class, m) in [(small, 23), (large, 25)] {
+                let shape = canonical_history_step_shape_in(V1_5, class);
+                assert_eq!((shape.m, shape.k_log), (m, m));
+                assert_eq!(shape.k_skip, jetsam_ivc_core::zerocheck::K_SKIP);
+                assert_eq!(shape.const_pin, Some(0));
+                let params = canonical_history_step_pcs_params_in(V1_5, class);
+                assert_eq!(params.m, m + LOG_PACKING);
+                assert_eq!(params.log_inv_rate, HISTORY_STEP_PCS_LOG_INV_RATE);
+                assert_eq!(params.log_batch_size, HISTORY_STEP_PCS_LOG_BATCH_SIZE);
+                assert_eq!(
+                    jetsam_ivc_core::pcs::default_fri_queries(params.log_dim(), params.log_inv_rate),
+                    HISTORY_STEP_FRI_QUERIES,
+                    "m = {m} keeps the 133 queries of the launch classes"
+                );
+            }
+        }
+
+        /// D2 (01/10): the client form is pinned at m = 22. It no longer
+        /// follows the small class, which v1.5 moves to m = 23; it keeps the
+        /// query count of the v1.5 parents, which is what lets it ride their
+        /// Link carrier.
+        #[test]
+        fn the_client_form_stays_at_m22_under_v1_5() {
+            use HistoryStepPackGeneration::{V1, V1_5};
             let form = HistoryStepClientForm::canonical();
             let small = CanonicalHistoryStepClassId::new(0).unwrap();
-            assert_eq!(form.shape(), canonical_history_step_shape(small));
+            assert_eq!(form.shape(), canonical_history_step_shape_in(V1, small));
+            assert_eq!((form.shape().m, form.shape().k_log), (22, 22));
+            assert_ne!(form.shape(), canonical_history_step_shape_in(V1_5, small));
             assert_eq!(
                 pcs_params_statement_bytes(form.pcs_params()),
-                pcs_params_statement_bytes(&canonical_history_step_pcs_params(small))
+                pcs_params_statement_bytes(&canonical_history_step_pcs_params_in(V1, small))
             );
-            assert_eq!(form.io_spec().io_len, HISTORY_STEP_CLIENT_IO_LANES);
-            assert!(form.io_spec().claims.is_empty());
-            form.io_spec().validate(form.shape().m);
-            assert_eq!(form.registry_depth(), 4);
-            assert_eq!(form.registry_capacity(), 16);
-            assert_ne!(form.post_commit_digest(), [0u8; 32]);
+            let params = form.pcs_params();
+            assert_eq!(
+                jetsam_ivc_core::pcs::default_fri_queries(params.log_dim(), params.log_inv_rate),
+                HISTORY_STEP_FRI_QUERIES
+            );
         }
 
-        /// 2.1 — a bank with the client form binds it: same entries, another
-        /// digest; the bank without it is the v1.3 bank, unchanged.
+        /// The v1.5 public IO: the v1.3 lanes up to the bank digest, wider
+        /// matrix lanes (k_log 23 and 25), the twelve-lane boundary, the root,
+        /// then the client block. Launch and v1.3 carry no client lanes.
         #[test]
-        fn a_bank_with_the_client_form_binds_it() {
-            let generation = HistoryStepPackGeneration::V1_3;
-            let plain = PinnedHistoryStepClassBank::validate_for(generation, test_pins_for(generation))
-                .unwrap();
-            assert!(plain.client_form().is_none());
-            assert!(plain.layout().client.is_none());
-
-            let form = HistoryStepClientForm::canonical();
-            let pins = test_pins_with_client(generation, &form);
-            let with_client =
-                PinnedHistoryStepClassBank::validate_with_client(generation, pins, form.clone())
-                    .unwrap();
-            assert_eq!(with_client.client_form(), Some(&form));
-            assert_eq!(
-                with_client.layout(),
-                &history_step_bank_io_layout_with_client(generation)
-            );
-            assert_eq!(
-                with_client.spec().transcript_lanes(),
-                history_step_bank_io_spec_with_client(generation).transcript_lanes()
-            );
-            assert_ne!(with_client.digest(), plain.digest());
-            // Post-commit digests are taken over the widened spec: v1.3 pins
-            // do not validate as a client-bearing bank.
-            assert!(PinnedHistoryStepClassBank::validate_with_client(
-                generation,
-                test_pins_for(generation),
-                form
-            )
-            .is_err());
-        }
-
-        /// 2.2 — the client lanes are appended after the recursion root:
-        /// every v1.3 lane keeps its index, the client block is contiguous,
-        /// and the spec widens to the next dyadic slice (232 -> 332 -> 512).
-        #[test]
-        fn client_lanes_extend_the_v1_3_layout() {
-            let generation = HistoryStepPackGeneration::V1_3;
-            let current = history_step_bank_io_layout_for(generation);
-            let layout = history_step_bank_io_layout_with_client(generation);
-            let client = layout.client.expect("client lanes");
-            assert_eq!(current.len, 232);
-            assert!(current.client.is_none());
-            assert_eq!(layout.base, current.base);
-            assert_eq!(layout.tip_class, current.tip_class);
-            assert_eq!(layout.matrix_whitelist, current.matrix_whitelist);
-            assert_eq!(layout.post_commit_whitelist, current.post_commit_whitelist);
-            assert_eq!(layout.bank_digest, current.bank_digest);
-            assert_eq!(layout.matrix_lanes, current.matrix_lanes);
-            assert_eq!(layout.block_accumulator, current.block_accumulator);
-            assert_eq!(layout.recursion_root, current.recursion_root);
-
+        fn the_v1_5_layout_appends_the_client_lanes_after_the_root() {
+            use HistoryStepPackGeneration::{V1, V1_3, V1_5};
+            assert!(history_step_bank_io_layout_for(V1).client.is_none());
+            assert!(history_step_bank_io_layout_for(V1_3).client.is_none());
+            let v1_3 = history_step_bank_io_layout_for(V1_3);
+            let layout = history_step_bank_io_layout_for(V1_5);
+            assert_eq!(layout.base, v1_3.base);
+            assert_eq!(layout.tip_class, v1_3.tip_class);
+            assert_eq!(layout.matrix_whitelist, v1_3.matrix_whitelist);
+            assert_eq!(layout.post_commit_whitelist, v1_3.post_commit_whitelist);
+            assert_eq!(layout.bank_digest, v1_3.bank_digest);
+            assert_eq!(layout.matrix_lanes[0].point_len(), 2 * 23 + 1);
+            assert_eq!(layout.matrix_lanes[1].point_len(), 2 * 25 + 1);
+            assert_eq!(layout.block_accumulator, 12 + (2 * 47 + 3) + (2 * 51 + 3));
+            assert_eq!(layout.recursion_root, layout.block_accumulator + 12);
+            let client = layout.client.expect("v1.5 carries the client lanes");
+            assert_eq!(client.present, layout.recursion_root + 14);
             let k_log = HistoryStepClientForm::canonical().shape().k_log;
-            assert_eq!(client.present, current.len);
-            assert_eq!(client.matrix_digest, client.present + 1);
-            assert_eq!(client.registry_root, client.matrix_digest + 2);
-            assert_eq!(client.io_commitment, client.registry_root + 2);
-            assert_eq!(client.matrix_lane.point, client.io_commitment + 2);
             assert_eq!(client.matrix_lane.point_len(), 2 * k_log + 1);
-            assert_eq!(client.matrix_lane.live + 1, layout.len);
-            assert_eq!(layout.len, 232 + 1 + 2 + 2 + 2 + 2 * (2 * k_log + 1) + 3);
-
-            let spec = history_step_bank_io_spec_with_client(generation);
+            assert_eq!(client.end(), layout.len);
+            assert_eq!(layout.len, 240 + 1 + 2 + 2 + 2 + 2 * (2 * 22 + 1) + 3);
+            let spec = history_step_bank_io_spec_for(V1_5);
             assert_eq!(spec.io_len, layout.len);
             assert_eq!(spec.io_slice.log2_len, 9);
-            assert_eq!(spec.io_slice.index, 1);
-            assert_eq!(
-                history_step_bank_io_spec_for(generation).io_slice.log2_len,
-                8,
-                "the v1.3 spec is unchanged"
-            );
+            assert_eq!(history_step_bank_io_spec_for(V1_3).io_slice.log2_len, 8);
         }
+
+        /// A v1.5 bank binds the client form by construction; v1.3 pins, made
+        /// for other shapes and another spec, do not validate as v1.5.
+        #[test]
+        fn a_v1_5_bank_binds_the_client_form() {
+            use HistoryStepPackGeneration::{V1_3, V1_5};
+            let v1_3 = PinnedHistoryStepClassBank::validate_for(V1_3, test_pins_for(V1_3)).unwrap();
+            assert!(v1_3.client_form().is_none());
+            let bank = PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_5)).unwrap();
+            assert_eq!(bank.client_form(), Some(&HistoryStepClientForm::canonical()));
+            assert_eq!(bank.layout(), &history_step_bank_io_layout_for(V1_5));
+            assert_ne!(bank.digest(), v1_3.digest());
+            assert!(PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_3)).is_err());
+            assert!(PinnedHistoryStepClassBank::validate_for(V1_3, test_pins_for(V1_5)).is_err());
+        }
+    }
+
+    /// The client lanes of a v1.5 tip (M2 task 2.5): what a node reads and
+    /// checks natively before it accepts the block.
+    mod client_lanes {
+        use super::*;
 
         /// A base IO of a client-bearing bank carries an absent client: every
         /// client lane is zero.
         #[test]
         fn a_base_io_carries_an_absent_client() {
-            let generation = HistoryStepPackGeneration::V1_3;
-            let form = HistoryStepClientForm::canonical();
-            let bank = PinnedHistoryStepClassBank::validate_with_client(
-                generation,
-                test_pins_with_client(generation, &form),
-                form,
-            )
-            .unwrap();
+            let bank = client_bank();
             let class = CanonicalHistoryStepClassId::new(1).unwrap();
             let io = history_step_bank_base_output_io_rooted(
                 &bank,
@@ -2270,14 +2268,9 @@ mod tests {
         use jetsam_ivc_core::field_r1cs::SparseFieldMatrix;
 
         fn client_bank() -> PinnedHistoryStepClassBank {
-            let generation = HistoryStepPackGeneration::V1_3;
-            let form = HistoryStepClientForm::canonical();
-            PinnedHistoryStepClassBank::validate_with_client(
-                generation,
-                test_pins_with_client(generation, &form),
-                form,
-            )
-            .unwrap()
+            let generation = HistoryStepPackGeneration::V1_5;
+            PinnedHistoryStepClassBank::validate_for(generation, test_pins_for(generation))
+                .unwrap()
         }
 
         /// A matrix of the canonical client shape (m = k_log = 22): one
@@ -2504,25 +2497,6 @@ mod tests {
             assert_eq!(pending.check_client_lane(None), Ok(()));
         }
 
-        fn test_pins_with_client(
-            generation: HistoryStepPackGeneration,
-            form: &HistoryStepClientForm,
-        ) -> [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT] {
-            let _ = form;
-            let spec = history_step_bank_io_spec_with_client(generation);
-            let mut pins = test_pins_for(generation);
-            for pin in &mut pins {
-                pin.post_commit_digest = history_step_bank_post_commit_digest(
-                    pin.class_id,
-                    &pin.matrix_digest,
-                    &spec,
-                    &pin.pcs_params,
-                    pin.parent_recursion_vk_digest,
-                    pin.direct_block_vk_digest,
-                );
-            }
-            pins
-        }
     }
 
     #[test]

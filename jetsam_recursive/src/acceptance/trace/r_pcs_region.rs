@@ -136,7 +136,7 @@ pub(crate) struct HistoryStepPcsCarrierGeometry {
     n_queries: usize,
     proof_roles: usize,
     /// The client proof's PCS parameters and tree ladder, when this carrier
-    /// walks a second proof (`client-slot`). It shares the universal leaf
+    /// walks a second proof (the v1.5 client slot). It shares the universal leaf
     /// signature and the query count of the parent tiers.
     client_group: Option<(PcsParams, Vec<TreeInfo>)>,
 }
@@ -221,7 +221,7 @@ pub(crate) struct HistoryStepParentGeometry {
     selected_recording_blocks: [Vec<(DuplexLayout, usize)>; 2],
     rec_w_log: usize,
     /// The client verifier's transcript layout: a third L-C role, identical
-    /// in both parent arms (`client-slot`).
+    /// in both parent arms (the v1.5 client slot).
     client_layout: Option<DuplexLayout>,
     /// The canonical Link VK is a pure function of this geometry and of its
     /// witness slices, and every block of one relation allocates the same
@@ -341,9 +341,6 @@ impl HistoryStepParentGeometry {
         })
     }
 
-    // Reached only through the `client-slot` API, which the relation's
-    // client arm (M2 task 2.3) will call; until then only tests reach it.
-    #[cfg_attr(any(not(feature = "client-slot"), not(test)), allow(dead_code))]
     /// Add the client proof as a second walked role. The client form must
     /// share the parent tiers' query count and per-position leaf signature;
     /// its paths ride the same L-B families (a shorter tree is a causal
@@ -887,9 +884,8 @@ pub(crate) fn canonical_link_walk_slices(
 }
 
 /// Which ladder a walked proof must match: the active parent tier (role 0)
-/// or the client form (role 1, `client-slot`).
+/// or the client form (role 1, the v1.5 client slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(any(not(feature = "client-slot"), not(test)), allow(dead_code))]
 enum WalkedRole {
     Parent(usize),
     Client,
@@ -1888,8 +1884,6 @@ fn finalize_carrier_region(
 /// The client proof a two-proof carrier walks next to the selected parent:
 /// its PCS opening (L-A tiles, L-B paths) and the scratch recording of its
 /// verifier transcript (third L-C role).
-#[cfg(feature = "client-slot")]
-#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
 pub(crate) struct ClientCarrierColumns<'a> {
     pub(crate) proof: RPcsProof<'a>,
     pub(crate) recording: LayoutRecordedChannel,
@@ -1897,8 +1891,6 @@ pub(crate) struct ClientCarrierColumns<'a> {
 
 /// What the in-circuit client verifier left to discharge, and the gate
 /// (`client_present`) every client obligation is multiplied by.
-#[cfg(feature = "client-slot")]
-#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
 pub(crate) struct ClientCarrierDischarge<'a> {
     pub(crate) obligations: &'a PcsWalkObligations,
     pub(crate) recorded: &'a FsRecordedChannel,
@@ -1909,8 +1901,6 @@ pub(crate) struct ClientCarrierDischarge<'a> {
     pub(crate) parent_gate: Option<&'a LinExpr>,
 }
 
-#[cfg(feature = "client-slot")]
-#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
 impl HistoryStepParentGeometry {
     /// The two-proof carrier: this parent geometry plus the client form
     /// (its PCS parameters and its verifier's transcript layout).
@@ -1934,8 +1924,6 @@ fn under_gate<R>(gate: Option<&LinExpr>, f: impl FnOnce() -> R) -> R {
 /// Two-proof twin of [`prepare_history_step_parent_columns`]: L-A/L-B walk
 /// the selected parent (role 0) and the client (role 1); L-C carries the
 /// client transcript as its third role.
-#[cfg(feature = "client-slot")]
-#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
 pub(crate) fn prepare_history_step_carrier_columns(
     b: &mut FieldR1csBuilder,
     proofs: &[RPcsProof<'_>],
@@ -1959,8 +1947,6 @@ pub(crate) fn prepare_history_step_carrier_columns(
 /// Two-proof twin of [`finalize_history_step_parent_region`]: every client
 /// obligation and join is multiplied by `client.gate`; the client transcript
 /// is bound cell for cell.
-#[cfg(feature = "client-slot")]
-#[cfg_attr(not(test), allow(dead_code))] // wired into the relation by M2 task 2.3
 pub(crate) fn finalize_history_step_carrier_region(
     b: &mut FieldR1csBuilder,
     columns: HistoryStepParentColumns,

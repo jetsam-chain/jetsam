@@ -9,7 +9,7 @@
 //! source "$PACK_ROOT/pins.env"   # the v1.3 release pack (grep -a: binary bytes)
 //! export JETSAM_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
 //! G1_MODE=pack        cargo bench -p bench_prover --bench history_step_g1
-//! G1_MODE=base-client cargo bench -p bench_prover --features client-slot --bench history_step_g1
+//! G1_MODE=base-client cargo bench -p bench_prover --bench history_step_g1
 //! ```
 //!
 //! Every mode builds the same honest fixture chain (v1.3 ladder): six small
@@ -25,14 +25,13 @@
 //! `G1_CLASS=b24|b255` (default `b255`) picks the child's class; with
 //! `base-client` the registered client is measured with its pre-pass inside
 //! the block and cached on reception (`PreparedHistoryStepClient`).
-//! - `base-client` (`--features client-slot`): the client-bearing relation.
+//! - `base-client`: the v1.5 relation (m = 23 / m = 25, client slot).
 //!   Its runtime parts are derived from the pack's direct-Block keys (Link
 //!   fixed point with the client role); the bank pins stand-in matrices of
-//!   the canonical shapes, because no client-bearing matrix exists at m = 24
-//!   (the relation outgrows 2^24 — the row count comes back as the
-//!   `ShapeOverflow` of the sealed witness). The base-case assembly runs once
-//!   with the ghost client and once with a registered client of the imposed
-//!   form. No proof can be produced at this m.
+//!   the v1.5 shapes, because no v1.5 matrix exists yet (the row count comes
+//!   back from the sealed witness, against 2^23 / 2^25). The base-case
+//!   assembly runs once with the ghost client and once with a registered
+//!   client of the imposed form. No proof is produced.
 //!
 //! Peak memory is read two ways: `getrusage(RUSAGE_SELF).ru_maxrss` (whole
 //! process, monotone) and `VmHWM` after `clear_refs` 5 resets it at the start
@@ -529,21 +528,21 @@ fn run_base_pack(samples: usize) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "client-slot")]
 mod client {
     use super::*;
     use jetsam_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
     use jetsam_recursive::{
-        derive_history_step_runtime_parts_with_client, pin_history_step_class_bank,
+        canonical_history_step_shape_in, derive_history_step_runtime_parts_in,
+        pin_history_step_class_bank,
         prepare_history_step_for_pow_with_client, HistoryStepClientForm,
         HistoryStepClientRegistry, HistoryStepClientWitness, HistoryStepError,
         PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
     };
 
-    /// A stand-in matrix of `class`'s canonical shape: the witness-only
-    /// assembly leases one, and no client-bearing matrix exists at this m.
+    /// A stand-in matrix of `class`'s v1.5 shape: the witness-only assembly
+    /// leases one, and no v1.5 matrix exists yet.
     fn stand_in(class: CanonicalHistoryStepClassId) -> FieldR1cs {
-        let shape = canonical_history_step_shape(class);
+        let shape = canonical_history_step_shape_in(HistoryStepPackGeneration::V1_5, class);
         let empty = || SparseFieldMatrix {
             num_rows: 0,
             num_cols: 0,
@@ -625,11 +624,11 @@ mod client {
         let (_, pack_parts, _) = load_pack()?;
         foreign_load("client parts derivation");
         let started = Instant::now();
-        let parts = derive_history_step_runtime_parts_with_client(
-            pack_parts.generation(),
+        let parts = derive_history_step_runtime_parts_in(
+            HistoryStepPackGeneration::V1_5,
             pack_parts.direct_block_vks().clone(),
         )
-        .map_err(|error| format!("client-bearing parts: {error}"))?;
+        .map_err(|error| format!("v1.5 parts: {error}"))?;
         println!(
             "[g1] client-bearing runtime parts derived in {:.1} s (Link fixed point)",
             started.elapsed().as_secs_f64()
@@ -654,7 +653,7 @@ mod client {
             .clone();
         let mut provider = HonestHistoryStepFixtureProvider::new_in(
             FIXTURE_SEED,
-            HistoryStepPackGeneration::V1_3,
+            HistoryStepPackGeneration::V1_5,
         )?;
         walk_backbone(&mut provider, None)?;
         let start = provider
@@ -663,7 +662,8 @@ mod client {
             .clone();
         let client = registered_client(&form);
         for class in G1Class::list_from_env()? {
-        let limit_log = canonical_history_step_shape(class.id()).m;
+        let limit_log =
+            canonical_history_step_shape_in(HistoryStepPackGeneration::V1_5, class.id()).m;
         for sample in 0..samples {
             for (name, carried, cached) in [
                 ("ghost client", None, false),
@@ -671,7 +671,7 @@ mod client {
                 ("registered client, pre-pass cached", Some(&client), true),
             ] {
                 let label = format!(
-                    "client-slot base {} {name} sample {}",
+                    "v1.5 base {} {name} sample {}",
                     class.name(),
                     sample + 1
                 );
@@ -754,7 +754,6 @@ fn run() -> Result<(), String> {
     let result = jetsam_miner::install_history_step_phase_cpu(move || match mode.as_str() {
         "pack" => run_pack(samples),
         "base-pack" => run_base_pack(samples),
-        #[cfg(feature = "client-slot")]
         "base-client" => client::run_base_client(samples),
         other => Err(format!("unknown G1_MODE {other}")),
     })
