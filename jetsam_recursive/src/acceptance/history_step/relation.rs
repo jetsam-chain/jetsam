@@ -392,8 +392,9 @@ impl HistoryStepRuntimeParts {
             parent_transcripts,
             parent_geometry,
             generation,
-            // The compact codec carries no client part yet (M3.3), and the
-            // generation it discovers is never v1.5.
+            // Only a version-1 compact frame comes through here, and it is a
+            // launch or v1.3 runtime: no client slot. A v1.5 frame is decoded
+            // by `decode_client_bearing_history_step_parts`.
             client: None,
         }
     }
@@ -800,8 +801,8 @@ pub(super) fn discover_history_step_pack_generation(
         std::array::from_fn(|slot| transcripts[slot].child.clone());
     let r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|slot| transcripts[slot].r_prev.clone());
-    // The compact codec carries no client part yet (M3.3): only the two
-    // client-free relations can be read back from it.
+    // A version-1 compact frame carries no client part: it is one of the two
+    // client-free relations. v1.5 frames take the client-bearing path below.
     for candidate in [
         HistoryStepPackGeneration::V1,
         HistoryStepPackGeneration::V1_3,
@@ -819,6 +820,47 @@ pub(super) fn discover_history_step_pack_generation(
         }
     }
     Err(HistoryStepError::RuntimeLayout)
+}
+
+/// Rebuild the runtime parts of a client-bearing (v1.5) compact frame.
+///
+/// Nothing in the frame is taken on trust: the form must be the canonical
+/// client form byte for byte, the client transcript layout must be the one
+/// that form derives, and the parent layouts must be the v1.5 fixed point
+/// under that client role — one round of the derivation, as
+/// [`discover_history_step_pack_generation`] does for the client-free
+/// relations. A frame that fails any of these is not a v1.5 pack.
+pub(super) fn decode_client_bearing_history_step_parts(
+    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    form_bytes: &[u8],
+    client_layout: DuplexLayout,
+) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
+    let generation = HistoryStepPackGeneration::V1_5;
+    debug_assert!(generation.carries_client_slot());
+    if form_bytes != HistoryStepClientForm::canonical().statement_bytes().as_slice() {
+        return Err(HistoryStepError::ClientForm);
+    }
+    let client = HistoryStepClientParts::canonical()?;
+    if client.layout != client_layout {
+        return Err(HistoryStepError::ClientForm);
+    }
+    let child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].child.clone());
+    let r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].r_prev.clone());
+    let pass = history_step_runtime_parts_pass(
+        generation,
+        &history_step_parent_params(generation),
+        &direct_block_vks,
+        &child_layouts,
+        &r_prev_layouts,
+        &Some(client),
+    )?;
+    if pass.derived_children != child_layouts || pass.derived_r_prev != r_prev_layouts {
+        return Err(HistoryStepError::RuntimeLayout);
+    }
+    Ok(pass.parts)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

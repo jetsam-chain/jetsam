@@ -2,7 +2,9 @@
 // Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! Emit release pins for one canonical `HistoryStep` v1 pack.
+//! Emit release pins for one canonical `HistoryStep` pack of any generation
+//! (launch, v1.3 or v1.5). The generation is read from the pack's own runtime
+//! metadata, and every class matrix is opened at that generation's shape.
 //!
 //! Usage: `jetsam_pack_pins <pack-root>`
 
@@ -21,9 +23,9 @@ use jetsam_miner::history_step_artifacts::{
 };
 use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 use jetsam_recursive::{
-    acceptance::history_step::assemble_history_step_base, canonical_history_step_shape,
+    acceptance::history_step::assemble_history_step_base, canonical_history_step_shape_in,
     CanonicalHistoryStepClassId, HistoryStepMatrixLease, HistoryStepMatrixSource,
-    HistoryStepMatrixSourceError, HistoryStepRuntime,
+    HistoryStepMatrixSourceError, HistoryStepPackGeneration, HistoryStepRuntime,
 };
 
 const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
@@ -70,6 +72,7 @@ fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> 
 
 fn open_launch_matrix(
     path: &Path,
+    generation: HistoryStepPackGeneration,
     class: CanonicalHistoryStepClassId,
     expected_digest: [u8; 32],
 ) -> Result<CompactFieldR1cs, String> {
@@ -92,7 +95,7 @@ fn open_launch_matrix(
     }
     CompactFieldR1cs::open(
         canonical.into_boxed_slice(),
-        canonical_history_step_shape(class),
+        canonical_history_step_shape_in(generation, class),
         expected_digest,
     )
     .and_then(CompactFieldR1cs::into_startup_packed)
@@ -208,10 +211,12 @@ fn main() {
         let class = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
         runtime_metadata.bank().entry(class).matrix_digest()
     });
-    verify_development_payout_profile(&version, &class_digests);
+    let generation = runtime_metadata.bank().generation();
+    println!("pack generation: {generation:?}");
+    verify_development_payout_profile(&version, generation, &class_digests);
 
     let launch_digest = runtime_metadata.bank().entry(launch_class).matrix_digest();
-    let launch_matrix = open_launch_matrix(&launch_path, launch_class, launch_digest)
+    let launch_matrix = open_launch_matrix(&launch_path, generation, launch_class, launch_digest)
         .unwrap_or_else(|error| panic!("{error}"));
     let (bank, runtime_parts) = runtime_metadata.into_parts();
     let runtime = HistoryStepRuntime::new(
@@ -265,6 +270,7 @@ fn main() {
 /// is not the one this pack shipped cannot reach the measurement.
 fn verify_development_payout_profile(
     version: &Path,
+    generation: HistoryStepPackGeneration,
     class_digests: &[[u8; 32]; HISTORY_STEP_PACK_LEAF_COUNT],
 ) {
     for index in 0..HISTORY_STEP_PACK_LEAF_COUNT {
@@ -282,7 +288,7 @@ fn verify_development_payout_profile(
             .take((MAX_CANONICAL_MATRIX_BYTES + 1) as u64)
             .read_to_end(&mut canonical)
             .unwrap_or_else(|error| panic!("decode {}: {error}", path.display()));
-        let shape = canonical_history_step_shape(class);
+        let shape = canonical_history_step_shape_in(generation, class);
         let relation =
             CompactFieldR1cs::open(canonical.into_boxed_slice(), shape, class_digests[index])
                 .unwrap_or_else(|error| panic!("authenticate {}: {error:?}", path.display()));

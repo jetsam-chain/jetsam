@@ -626,4 +626,150 @@ mod tests {
             Err(HistoryStepRuntimeMetadataError::Digest)
         ));
     }
+
+    /// M3.3 at production scale: v1.5 runtime parts derived from the direct-
+    /// Block keys of the released v1.3 pack (Link fixed point with the client
+    /// role), pinned with stand-in matrix digests, framed as runtime metadata
+    /// and read back. Checks the compact version, the refusals of a tampered
+    /// client section, the bank identity, and measures the v1.5 terminal
+    /// sizes against the consensus caps. Reads `/opt/jetsam-pack-v13`
+    /// (override: `JETSAM_V13_PACK`).
+    #[test]
+    #[ignore = "production scale: derives v1.5 runtime parts (release, reads the v1.3 pack)"]
+    fn v1_5_runtime_metadata_round_trips_at_production_scale() {
+        use jetsam_chain::consensus::wire_limits::{
+            history_step_terminal_bytes_limit, MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+            V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES,
+        };
+        use jetsam_recursive::{
+            derive_history_step_runtime_parts_in, history_step_terminal_wire_bytes,
+            HistoryStepClientForm, HistoryStepPackGeneration, HistoryStepRuntime,
+            HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION,
+            HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
+        };
+        use std::time::Instant;
+
+        struct NoMatrices;
+        impl HistoryStepMatrixSource for NoMatrices {
+            fn load(
+                &self,
+                _class: CanonicalHistoryStepClassId,
+            ) -> Result<HistoryStepMatrixLease, HistoryStepMatrixSourceError> {
+                Err(HistoryStepMatrixSourceError)
+            }
+        }
+
+        let root =
+            std::env::var("JETSAM_V13_PACK").unwrap_or_else(|_| "/opt/jetsam-pack-v13".to_owned());
+        let metadata = std::fs::read(format!("{root}/v1/{HISTORY_STEP_RUNTIME_METADATA_FILE}"))
+            .expect("read the v1.3 runtime metadata");
+        let pins = std::fs::read(format!("{root}/pins.env")).expect("read pins.env");
+        let pins = String::from_utf8_lossy(&pins);
+        let pin_hex = pins
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=")
+            })
+            .expect("release digest in pins.env");
+        let pin: [u8; 32] = hex::decode(pin_hex.trim()).unwrap().try_into().unwrap();
+        let v13 = decode_history_step_runtime_metadata_pinned(&metadata, pin)
+            .expect("the released v1.3 metadata decodes");
+        assert_eq!(v13.bank().generation(), HistoryStepPackGeneration::V1_3);
+        let v13_compact = v13.runtime_parts().encode_compact().unwrap();
+        assert_eq!(v13_compact[0], HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION);
+
+        // The v1.5 parts, at their fixed point.
+        let started = Instant::now();
+        let parts = derive_history_step_runtime_parts_in(
+            HistoryStepPackGeneration::V1_5,
+            v13.runtime_parts().direct_block_vks().clone(),
+        )
+        .expect("v1.5 runtime parts converge");
+        let derive_s = started.elapsed().as_secs_f64();
+        let bank = pin_history_step_class_bank([[0x15; 32], [0x25; 32]], &parts).unwrap();
+        assert_eq!(bank.generation(), HistoryStepPackGeneration::V1_5);
+        assert_eq!(bank.client_form(), Some(&HistoryStepClientForm::canonical()));
+        assert_ne!(bank.digest(), v13.bank().digest());
+
+        // Runtime metadata round trip.
+        let encoded = encode_history_step_runtime_metadata(&bank, &parts).unwrap();
+        let digest: [u8; 32] = encoded[encoded.len() - 32..].try_into().unwrap();
+        let started = Instant::now();
+        let decoded = decode_history_step_runtime_metadata_pinned(&encoded, digest)
+            .expect("v1.5 runtime metadata round-trips");
+        let decode_s = started.elapsed().as_secs_f64();
+        assert_eq!(decoded.bank().digest(), bank.digest());
+        assert_eq!(decoded.bank().generation(), HistoryStepPackGeneration::V1_5);
+        assert!(decoded.runtime_parts().client().is_some());
+        let compact = parts.encode_compact().unwrap();
+        assert_eq!(compact[0], HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION);
+        assert_eq!(decoded.runtime_parts().encode_compact().unwrap(), compact);
+        assert_eq!(
+            decoded.runtime_parts().parent_recursion_vk().transcript_digest(),
+            parts.parent_recursion_vk().transcript_digest()
+        );
+
+        // A v1.5 frame relabelled as version 1 is not read as anything.
+        let mut relabelled = compact.clone();
+        relabelled[0] = HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION;
+        assert!(HistoryStepRuntimeParts::decode_compact(&relabelled).is_err());
+        // A form that is not the canonical one is refused by name.
+        let form = HistoryStepClientForm::canonical().statement_bytes();
+        let form_at = compact
+            .windows(form.len())
+            .rposition(|window| window == form.as_slice())
+            .expect("the client section carries the form bytes");
+        let mut foreign_form = compact.clone();
+        foreign_form[form_at] ^= 1;
+        assert!(matches!(
+            HistoryStepRuntimeParts::decode_compact(&foreign_form),
+            Err(HistoryStepError::ClientForm)
+        ));
+        // A client layout that is not the one the form derives is refused:
+        // flip one constant lane (tag 2) of the client layout's slots.
+        let layout_at = form_at + form.len();
+        let slots = u32::from_le_bytes(compact[layout_at..layout_at + 4].try_into().unwrap());
+        let mut foreign_layout = compact.clone();
+        let constant_lane = (0..2 * slots as usize)
+            .map(|lane| layout_at + 12 + 17 * lane)
+            .find(|&at| compact[at] == 2)
+            .expect("the client transcript absorbs a constant somewhere");
+        foreign_layout[constant_lane + 1] ^= 1;
+        assert!(matches!(
+            HistoryStepRuntimeParts::decode_compact(&foreign_layout),
+            Err(HistoryStepError::ClientForm)
+        ));
+
+        // Terminal sizes, v1.3 against v1.5, against the consensus caps.
+        let runtime15 =
+            HistoryStepRuntime::new(bank.clone(), Box::new(NoMatrices), parts.clone()).unwrap();
+        let (bank13, parts13) = v13.into_parts();
+        let runtime13 = HistoryStepRuntime::new(bank13, Box::new(NoMatrices), parts13).unwrap();
+        eprintln!(
+            "[m3.3] v1.5 parts derived in {derive_s:.1} s, metadata decoded in {decode_s:.1} s; \
+             metadata {} bytes, compact parts {} bytes (v1.3: {}), bank {}",
+            encoded.len(),
+            compact.len(),
+            v13_compact.len(),
+            hex::encode(bank.digest())
+        );
+        for index in 0..HISTORY_STEP_CLASS_COUNT {
+            let class = CanonicalHistoryStepClassId::from_index(index).unwrap();
+            let v13_bytes = history_step_terminal_wire_bytes(&runtime13, class).unwrap();
+            let v15_bytes = history_step_terminal_wire_bytes(&runtime15, class).unwrap();
+            eprintln!(
+                "[m3.3] class c{index:02}: full terminal v1.3 {v13_bytes} B, v1.5 {v15_bytes} B \
+                 (+{}); transport cap {MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES} ({}), v1.2 cap \
+                 {V1_2_MAX_HISTORY_STEP_TERMINAL_BYTES}, cap at a far height {}",
+                v15_bytes as i64 - v13_bytes as i64,
+                if v15_bytes <= MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES {
+                    "fits"
+                } else {
+                    "EXCEEDS"
+                },
+                history_step_terminal_bytes_limit(u64::MAX),
+            );
+        }
+    }
 }

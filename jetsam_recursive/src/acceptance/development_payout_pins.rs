@@ -321,6 +321,68 @@ mod tests {
         r1cs
     }
 
+    /// The payout gate as the v1.5 relation wires it (M3.3): `live` is the
+    /// `payout_due` of the two-year schedule, whose J is read off the
+    /// recursion root, at a v1.5 payout height. The gate and the recipients
+    /// it freezes are the launch ones, so a v1.5 pack built under another
+    /// profile is refused exactly as a launch or v1.3 pack is.
+    fn v1_5_payout_relation() -> jetsam_ivc_core::field_r1cs::FieldR1cs {
+        use crate::acceptance::trace::development_allocation::bind_development_schedule;
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+        const ACTIVATION: u64 = 30_720;
+        let height = ACTIVATION + 480;
+        let schedule = jetsam_chain::consensus::development_allocation::development_allocation_with(
+            height,
+            Some(ACTIVATION),
+        )
+        .unwrap();
+        let amount = schedule.payout_each.expect("a v1.5 payout height");
+        let native = jetsam_gkr::spine_statement::spine_inputs_from_body(&payout_body(amount));
+        let ghost_native = jetsam_gkr::spine_statement::spine_inputs_from_body(
+            &jetsam_gkr::ghost_tx::ghost_tx_body(),
+        );
+        let mut b = FieldR1csBuilder::new();
+        let child = alloc_block(&mut b, Block128::from(height as u128));
+        let root = alloc_block(&mut b, Block128::from((ACTIVATION - 1) as u128));
+        let raw = SpineInputsTrace::alloc(&mut b, &native);
+        let ghost = constant_spine_inputs_trace(&ghost_native);
+        let allocation = bind_development_schedule(
+            &mut b,
+            HistoryStepPackGeneration::V1_5,
+            &child,
+            &raw.leaves[jetsam_tx::body_hash::TX8X2_LEAF_OUTPUT0_DATA][1],
+            &root,
+        );
+        let spine = select_spine_inputs_trace(&mut b, &allocation.payout_due, &raw, &ghost);
+        let payout = bind_development_payout_action(&mut b, &spine, &allocation.payout_due);
+        crate::acceptance::trace::pin_eq(&mut b, &payout.amount_each, &allocation.payout_each);
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "the honest v1.5 payout witness must satisfy");
+        r1cs
+    }
+
+    #[test]
+    fn the_v1_5_relation_freezes_this_build_recipients_too() {
+        let r1cs = v1_5_payout_relation();
+        let mut scan = DevelopmentPayoutPinScan::for_this_build();
+        for constant in &constant_column(&r1cs) {
+            scan.observe(*constant);
+        }
+        scan.finish().expect("the v1.5 wiring pays this build's own recipients");
+        let shape = jetsam_ivc_core::proof::FieldShape::of(&r1cs);
+        let digest = r1cs.structural_statement_digest();
+        let mut bytes = Vec::new();
+        r1cs.write_artifact(&mut bytes).expect("write artifact");
+        let compact = jetsam_ivc_core::field_r1cs::CompactFieldR1cs::open(
+            bytes.into_boxed_slice(),
+            shape,
+            digest,
+        )
+        .expect("canonical artifact opens");
+        verify_relation_development_payout_pins(&compact)
+            .expect("a v1.5 relation built here pays this build's recipients");
+    }
+
     fn constant_column(r1cs: &jetsam_ivc_core::field_r1cs::FieldR1cs) -> Vec<F128> {
         let column = r1cs
             .const_pin
