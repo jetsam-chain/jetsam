@@ -142,10 +142,9 @@ pub const CLIENT_MATRIX_MAX_FILE_BYTES: u32 = 16 * 1024 * 1024;
 /// One client proof per block: the HistoryStep relation has one client arm.
 pub const MAX_BLOCK_CLIENT_SUBMISSIONS: usize = 1;
 
-/// One registration per block: the registry root the relation carries moves
-/// by at most one leaf from a block to the next (M3.4: the root of the child
-/// is the parent's, or the parent's with one leaf appended at the next
-/// index).
+/// One registration per block. The relation's published leaves (M3.4) would
+/// admit several appended leaves per block; one is kept by decision (01/10),
+/// as the simpler rule.
 pub const MAX_BLOCK_CLIENT_REGISTRATIONS: usize = 1;
 
 /// Wire cap of one block's object list.
@@ -1116,8 +1115,9 @@ fn check_license_paid(
 
 /// Upper bound of one client proof on the wire: the fixed, unshared length
 /// of the pinned client form (m = 22, decision D2), as computed by
-/// `history_step_client_proof_max_wire_bytes` (pinned against it by a
-/// `client-slot` test). The transport refuses a longer proof before reading it.
+/// `history_step_client_proof_max_wire_bytes` (pinned against it by
+/// `jetsam_recursive/tests/client_registry_chain_state.rs`). The transport
+/// refuses a longer proof before reading it.
 pub const CLIENT_PROOF_MAX_WIRE_BYTES: usize = 509_009;
 
 /// Whether the logical transaction `pages` pays `submission`: exactly one

@@ -2,14 +2,12 @@
 // Copyright (C) 2026 the Jetsam developers.
 
 //! The chain's v1.5 client registry (`jetsam_chain::consensus::client_objects`)
-//! is the registry the HistoryStep client arm proves membership in: same
-//! leaves, same order, same zero padding, same node hash, same root. This is
-//! the interface the per-entry carried lanes (M3 task 3.4) build on: the
-//! node passes `ClientRegistryState::digests()` to
-//! `HistoryStepClientRegistry::new` and compares the IO root to
-//! `ClientRegistryState::root()`.
-
-#![cfg(feature = "client-slot")]
+//! is the registry the HistoryStep client arm publishes: same leaves, same
+//! order, same zero padding, same root. This is the interface the per-entry
+//! carried lanes (M3 task 3.4) build on: a v1.5 block's IO publishes the 16
+//! registry leaves, and the node compares them to
+//! `ClientRegistryState::digests()` padded with zero digests
+//! (`HistoryStepClientRegistry::leaves`).
 
 use jetsam_chain::consensus::client_objects::{
     client_registry_root, ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState,
@@ -44,26 +42,23 @@ fn chain_registry(count: usize) -> ClientRegistryState {
 }
 
 #[test]
-fn the_chain_registry_root_is_the_client_arm_registry_root() {
+fn the_chain_registry_is_the_client_arm_registry() {
     for count in 0..=CLIENT_REGISTRY_CAPACITY {
         let chain = chain_registry(count);
         let arm = HistoryStepClientRegistry::new(CLIENT_REGISTRY_DEPTH, chain.digests())
             .expect("every chain registry is a valid client-arm registry");
+        // The 16 leaves a v1.5 block publishes: the chain's digests in
+        // registration order, then zero digests.
+        let mut published = chain.digests();
+        published.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+        assert_eq!(arm.leaves(), published, "{count} entries");
+        assert_eq!(arm.leaves().len(), CLIENT_REGISTRY_CAPACITY);
+        for (index, entry) in chain.entries().iter().enumerate() {
+            assert_eq!(usize::from(entry.index), index);
+            assert_eq!(arm.position(&entry.matrix_digest), Some(index));
+        }
         assert_eq!(chain.root(), arm.root(), "{count} entries");
         assert_eq!(client_registry_root(&chain.digests()), arm.root());
-        for (index, entry) in chain.entries().iter().enumerate() {
-            assert_eq!(arm.position(&entry.matrix_digest), Some(index));
-            // The Merkle path the arm proves recomputes the chain root.
-            let mut node = entry.matrix_digest;
-            for (level, sibling) in arm.path(index).iter().enumerate() {
-                node = if (index >> level) & 1 == 0 {
-                    jetsam_ivc_core::merkle::hash_pair(&node, sibling)
-                } else {
-                    jetsam_ivc_core::merkle::hash_pair(sibling, &node)
-                };
-            }
-            assert_eq!(node, chain.root());
-        }
     }
 }
 
