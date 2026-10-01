@@ -43,6 +43,7 @@ pub mod validation;
 pub mod wire_limits;
 
 pub mod allocator;
+pub mod client_objects;
 pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;
