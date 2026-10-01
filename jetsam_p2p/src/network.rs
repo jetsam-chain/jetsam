@@ -3748,16 +3748,21 @@ async fn run_swarm(
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
     // v1.5 client objects (M3.8): their own request-response behaviour and
-    // announcement topic, handled beside the main reactor.
+    // announcement topic, handled beside the main reactor. A node without
+    // client objects (no v1.5 relation armed) answers every request with
+    // "not held" and does not join the announcement topic.
+    let joins_client_topic = client_objects.is_some();
     let (mut client_transport, mut client_response_rx) =
         crate::client_object_transport::ClientObjectTransport::new(
             client_objects,
             &topics.client_proofs,
         );
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(client_transport.topic())?;
+    if joins_client_topic {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(client_transport.topic())?;
+    }
 
     // One failed bind must not take the node down. A host with IPv6 disabled
     // in the kernel, or a container without a v6 stack, answers EAFNOSUPPORT

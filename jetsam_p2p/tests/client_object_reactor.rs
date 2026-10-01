@@ -24,6 +24,15 @@ struct Holder {
     bundle: Vec<u8>,
 }
 
+/// A node with client objects (a v1.5 relation armed) that holds none yet.
+struct HoldsNothing;
+
+impl ClientObjectSource for HoldsNothing {
+    fn client_object(&self, _request: &ClientObjectRequest) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 impl ClientObjectSource for Holder {
     fn client_object(&self, request: &ClientObjectRequest) -> Option<Vec<u8>> {
         match request {
@@ -111,7 +120,7 @@ async fn two_reactors_serve_fetch_and_announce_client_objects() {
         })),
     )
     .await;
-    let asker = start(asker_dir.path(), free_port(), None).await;
+    let asker = start(asker_dir.path(), free_port(), Some(Arc::new(HoldsNothing))).await;
     let mut asker_events = asker.subscribe();
 
     asker
