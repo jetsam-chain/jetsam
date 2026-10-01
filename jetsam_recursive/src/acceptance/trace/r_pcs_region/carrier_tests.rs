@@ -2362,10 +2362,13 @@ mod client_slot {
         let form = test_client_form();
         let (a, b, chain) = registered_pair(&form);
         let registry = chain.registry().clone();
-        assert!(matches!(
-            HistoryStepChainClients::new(&form, registry.clone(), vec![a.matrix.clone()]),
-            Err(HistoryStepError::ClientRegistry)
-        ), "an entry without its matrix");
+        // An entry may be registered before its matrix reaches this node
+        // (the matrix travels after the registration, M3.5): the registry is
+        // installed, and a lane that needs the missing matrix has no verdict.
+        assert!(
+            HistoryStepChainClients::new(&form, registry.clone(), vec![a.matrix.clone()]).is_ok(),
+            "an entry without its matrix yet"
+        );
         let outsider = client_witness(&form, 0xC11E_0204, 0);
         assert!(matches!(
             HistoryStepChainClients::new(
@@ -2613,6 +2616,34 @@ mod client_slot {
                 prepare_client_arm_on(&form, Some(&b), carry, &leaves).expect("recomputed");
             assert!(arm.same_pre_pass(&recomputed), "memoized fold differs");
         }
+    }
+
+    /// A live lane whose registered matrix this node does not hold yet has
+    /// no verdict (`ClientMatrixUnavailable`: fetch the matrix and decide
+    /// again) — it is not a refusal. An entry whose lane is still dead needs
+    /// no matrix at all.
+    #[test]
+    fn a_live_lane_whose_matrix_is_missing_has_no_verdict() {
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let without_b = HistoryStepChainClients::new(
+            &form,
+            chain.registry().clone(),
+            vec![a.matrix.clone()],
+        )
+        .expect("B registered, its matrix not here yet");
+        let (only_a, both) = carried_history(&form, &a, &b, &leaves);
+        assert_eq!(
+            without_b.check_claim(&parsed(&form, &block_io(&form, &only_a))),
+            Ok(()),
+            "B's lane is dead: nothing needs its matrix"
+        );
+        assert_eq!(
+            without_b.check_claim(&parsed(&form, &block_io(&form, &both))),
+            Err(HistoryStepBankError::ClientMatrixUnavailable)
+        );
+        assert_eq!(chain.check_claim(&parsed(&form, &block_io(&form, &both))), Ok(()));
     }
 
     /// The suffix-sync hole (M2 note §16.4-3), closed. A block that carried a

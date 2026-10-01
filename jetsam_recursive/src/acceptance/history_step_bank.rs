@@ -1999,6 +1999,10 @@ pub enum HistoryStepBankError {
     /// An entry accumulator claim does not hold on the matrix registered at
     /// its entry.
     ClientAccumulatedClaimValue,
+    /// A live entry lane whose registered matrix this node does not hold
+    /// yet: **no verdict** — fetch the matrix and decide again. Never a
+    /// refusal of the block (the matrix travels after its registration).
+    ClientMatrixUnavailable,
     /// Client lanes that were never checked.
     ClientLaneUnchecked,
 }
@@ -2172,6 +2176,9 @@ impl core::fmt::Display for HistoryStepBankError {
                 "HistoryStep client entry claim does not hold on the matrix registered at its entry",
             ),
             Self::ClientLaneUnchecked => f.write_str("HistoryStep client lanes were not checked"),
+            Self::ClientMatrixUnavailable => f.write_str(
+                "HistoryStep client entry lane needs a registered matrix this node does not hold yet",
+            ),
         }
     }
 }

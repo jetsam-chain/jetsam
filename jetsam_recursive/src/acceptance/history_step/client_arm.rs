@@ -138,9 +138,12 @@ impl HistoryStepClientRegistry {
     }
 }
 
-/// The chain's client registry as a node holds it (M2 task 2.5): the
-/// registered digests and every registered matrix, resident and
-/// authenticated once, when the registry is installed.
+/// The chain's client registry as a node holds it (M2 task 2.5, M3.4): the
+/// registered digests and the registered matrices this node holds, resident
+/// and authenticated once, when they are installed. An entry may be
+/// registered before its matrix arrives (the matrix travels after the
+/// registration): its lane is dead until a client of it is carried, which
+/// the registration's activation delay leaves time to fetch the matrix for.
 ///
 /// In the prototype the registry is static: a node is configured with it
 /// ([`super::HistoryStepRuntime::with_chain_clients`]). In M3 it becomes
@@ -155,8 +158,9 @@ pub struct HistoryStepChainClients {
 }
 
 impl HistoryStepChainClients {
-    /// Install `registry` with one matrix per entry, each of `form`'s shape:
-    /// every matrix is hashed here, once, and never trusted by digest later.
+    /// Install `registry` with the matrices of (some of) its entries, each of
+    /// `form`'s shape: every matrix is hashed here, once, and never trusted by
+    /// digest later; a matrix outside the registry is refused.
     pub fn new(
         form: &HistoryStepClientForm,
         registry: HistoryStepClientRegistry,
@@ -177,9 +181,6 @@ impl HistoryStepChainClients {
             {
                 return Err(HistoryStepError::ClientRegistry);
             }
-        }
-        if authenticated.len() != registry.entries().len() {
-            return Err(HistoryStepError::ClientRegistry);
         }
         let root = registry.root();
         let matrices = authenticated;
@@ -207,7 +208,8 @@ impl HistoryStepChainClients {
     /// The native checks of a tip's client lanes (M2 task 2.5, M3.4): the
     /// published leaves are the chain's registry, the carried client (if
     /// any) is registered, and every live entry lane holds on the matrix
-    /// registered at that entry.
+    /// registered at that entry. A live lane whose matrix is not here yet is
+    /// `ClientMatrixUnavailable`: no verdict, not a refusal.
     pub fn check_claim(&self, claim: &HistoryStepClientClaim) -> Result<(), HistoryStepBankError> {
         let leaves = self.registry.leaves();
         if claim.registry != leaves {
@@ -222,10 +224,13 @@ impl HistoryStepChainClients {
             return Err(HistoryStepBankError::ClientLaneWidth);
         }
         for (index, entry_claim) in claim.live_entries() {
+            if leaves[index] == [0u8; 32] {
+                return Err(HistoryStepBankError::ClientNotRegistered);
+            }
             let matrix = self
                 .matrices
                 .get(&leaves[index])
-                .ok_or(HistoryStepBankError::ClientNotRegistered)?;
+                .ok_or(HistoryStepBankError::ClientMatrixUnavailable)?;
             if entry_claim.point.len() != 2 * self.form.shape().k_log + 1 {
                 return Err(HistoryStepBankError::ClientLaneWidth);
             }

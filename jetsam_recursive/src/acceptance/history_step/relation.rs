@@ -1005,9 +1005,11 @@ impl HistoryStepRuntime {
         &self,
         pending: PendingHistoryStepBankDecision,
     ) -> Result<AcceptedHistoryStepBankTip, HistoryStepError> {
-        // A block that carries a client is decided only against the chain's
-        // registry (M2 task 2.5); the client lane is checked first, and its
-        // matrix is resident with the registry.
+        // A v1.5 tip is decided only against the chain's registry (M2 task
+        // 2.5, M3.4): its client lanes — the published leaves and every live
+        // entry lane, whether or not the block carries a client — are checked
+        // first, against matrices resident with the registry. A v1.5 node
+        // therefore always needs the registry.
         let mut pending = pending;
         pending.check_client_lane(self.clients.as_deref())?;
         pending
