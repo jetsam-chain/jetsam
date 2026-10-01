@@ -4974,6 +4974,7 @@ mod tests {
         let wrong = crate::storage::VerifiedSnapshotBoundary::new_verified(
             wrong_header,
             terminal(1, crate::block_header::semantic_header_id(&wrong_header), 0),
+            Default::default(),
         );
         assert!(store
             .cache_verified_snapshot_boundary_proof(&wrong)
@@ -4982,6 +4983,7 @@ mod tests {
         let verified = crate::storage::VerifiedSnapshotBoundary::new_verified(
             candidate.header,
             terminal_bytes.clone(),
+            Default::default(),
         );
         store
             .cache_verified_snapshot_boundary_proof(&verified)
@@ -5275,6 +5277,7 @@ mod tests {
         let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
             target.header,
             terminal_bytes.clone(),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5323,6 +5326,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5363,6 +5367,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5407,6 +5412,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5454,6 +5460,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5498,6 +5505,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5546,6 +5554,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 
@@ -5581,6 +5590,7 @@ mod tests {
                 crate::block_header::semantic_header_id(&target.header),
                 0,
             ),
+            Default::default(),
         );
         let recent = source.recent.clone();
 

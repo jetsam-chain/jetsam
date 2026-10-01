@@ -73,7 +73,8 @@ use crate::consensus::{
     ConsensusError,
 };
 use crate::consensus::client_objects::{
-    validate_block_client_objects, ClientObjectRules, ClientObjectsEffect, ClientRegistryState,
+    check_terminal_client_view, validate_block_client_objects, ClientObjectRules,
+    ClientObjectsEffect, ClientRegistryState, TerminalClientView,
 };
 use crate::segmented_state::SegmentedFriState;
 use crate::state::{ChainState, StreamingSparseRoot};
@@ -202,6 +203,9 @@ pub struct VerifiedHistoryStepTerminal {
     tip_header: BlockHeader,
     epoch_anchor_header: BlockHeader,
     terminal_bytes: Vec<u8>,
+    /// The tip's client lanes as the verifier read them (v1.5), checked
+    /// against the chain when the tip's body is applied.
+    client_view: TerminalClientView,
 }
 
 /// Perform the expensive recursive verification without holding the mutable
@@ -213,7 +217,7 @@ pub fn verify_history_step_terminal_candidate<A>(
     verify_history_step_terminal: A,
 ) -> Result<VerifiedHistoryStepTerminal, MdbxContextError>
 where
-    A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+    A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<TerminalClientView, String>,
 {
     if terminal_bytes.len()
         > crate::consensus::wire_limits::history_step_terminal_bytes_limit(tip_header.height)
@@ -247,7 +251,7 @@ where
             ),
         ));
     }
-    verify_history_step_terminal(&HistoryStepTerminalClaim {
+    let client_view = verify_history_step_terminal(&HistoryStepTerminalClaim {
         terminal_bytes: &terminal_bytes,
         header: tip_header,
         epoch_anchor_header,
@@ -258,6 +262,7 @@ where
         tip_header,
         epoch_anchor_header,
         terminal_bytes,
+        client_view,
     })
 }
 
@@ -273,6 +278,8 @@ pub struct VerifiedRecursiveSuffix {
     tip_header: BlockHeader,
     epoch_anchor_header: BlockHeader,
     terminal_bytes: Vec<u8>,
+    /// The tip's client lanes, checked against the chain at the final body.
+    client_view: TerminalClientView,
     next_height: u64,
     previous_hash: [u8; 32],
     complete: bool,
@@ -437,6 +444,25 @@ impl MdbxChainContext {
             &block.client_objects,
             parent,
             &self.client_registry,
+            &ClientObjectRules::current(),
+        )
+        .map_err(|error| MdbxContextError::Consensus(ConsensusError::ClientObject(error)))
+    }
+
+    /// The native checks of a block's terminal client lanes (M3.8) against
+    /// the registry of its parent — the current tip, on this branch — and the
+    /// effect of its own objects.
+    fn check_terminal_client_view(
+        &self,
+        view: &TerminalClientView,
+        effect: &ClientObjectsEffect,
+        height: u64,
+    ) -> Result<(), MdbxContextError> {
+        check_terminal_client_view(
+            view,
+            effect,
+            &self.client_registry,
+            height,
             &ClientObjectRules::current(),
         )
         .map_err(|error| MdbxContextError::Consensus(ConsensusError::ClientObject(error)))
@@ -1436,7 +1462,7 @@ impl MdbxChainContext {
     where
         F: FnOnce(&Block, &mut ChainState) -> Result<[u8; 32], E>,
         E: std::fmt::Display,
-        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<TerminalClientView, String>,
     {
         let block = Block::from_bytes(accepted_bundle.block_bytes()).map_err(|_| {
             MdbxContextError::Corrupt("accepted bundle contains a malformed canonical block")
@@ -1504,9 +1530,10 @@ impl MdbxChainContext {
             header: block.header,
             epoch_anchor_header,
         };
-        verify_history_step_terminal(&claim).map_err(|error| {
+        let client_view = verify_history_step_terminal(&claim).map_err(|error| {
             MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error))
         })?;
+        self.check_terminal_client_view(&client_view, &client_effect, height)?;
 
         let touched_segment_ids = self.segment_ids_for_block(block);
         let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
@@ -1636,6 +1663,16 @@ impl MdbxChainContext {
             self.license_dividend_for(&block),
         )?;
         let client_effect = self.validate_client_objects(&block, &parent)?;
+        if is_final {
+            // The suffix tip's IO is the one this node read: its client lanes
+            // are checked against the registry of the tip's parent, on this
+            // branch, and the tip's own objects (M3.8).
+            self.check_terminal_client_view(
+                &authority.client_view,
+                &client_effect,
+                block.header.height,
+            )?;
+        }
         let checks_elapsed = checks_started.elapsed();
 
         let preload_started = Instant::now();
@@ -2474,7 +2511,7 @@ impl MdbxChainContext {
         verify_history_step_terminal: A,
     ) -> Result<VerifiedSnapshotBoundary, MdbxContextError>
     where
-        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<TerminalClientView, String>,
     {
         if header.height == 0 {
             return Err(MdbxContextError::Corrupt(
@@ -2513,7 +2550,7 @@ impl MdbxChainContext {
                 ),
             ));
         }
-        verify_history_step_terminal(&HistoryStepTerminalClaim {
+        let client_view = verify_history_step_terminal(&HistoryStepTerminalClaim {
             terminal_bytes: &history_step_terminal_bytes,
             header,
             epoch_anchor_header,
@@ -2524,6 +2561,7 @@ impl MdbxChainContext {
         Ok(VerifiedSnapshotBoundary::new_verified(
             header,
             history_step_terminal_bytes,
+            client_view,
         ))
     }
 
@@ -2537,6 +2575,7 @@ impl MdbxChainContext {
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
+            client_view,
         } = verified;
         if tip_header.height <= boundary_height {
             return Err(MdbxContextError::Corrupt(
@@ -2567,6 +2606,7 @@ impl MdbxChainContext {
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
+            client_view,
             next_height: boundary_height.saturating_add(1),
             previous_hash: boundary_hash,
             complete: false,
@@ -2588,7 +2628,7 @@ impl MdbxChainContext {
         verify_history_step_terminal: A,
     ) -> Result<VerifiedRecursiveSuffix, MdbxContextError>
     where
-        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<TerminalClientView, String>,
     {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
@@ -2647,7 +2687,7 @@ impl MdbxChainContext {
         verify_history_step_terminal: A,
     ) -> Result<VerifiedReorgSuffix, MdbxContextError>
     where
-        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<TerminalClientView, String>,
     {
         let verified = verify_history_step_terminal_candidate(
             tip_header,
@@ -2981,8 +3021,30 @@ mod tests {
         crate::AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
     }
 
+    /// The client lanes an honest prover publishes for `block` on `context`'s
+    /// tip: none below the v1.5 height, the registry after the block's
+    /// registrations from it on.
+    fn honest_test_view(context: &MdbxChainContext, block: &crate::Block) -> TerminalClientView {
+        if !ClientObjectRules::current().active_at(block.header.height) {
+            return TerminalClientView::default();
+        }
+        let mut leaves = context.client_registry().digests();
+        leaves.extend(block.client_objects.iter().filter_map(|object| match object {
+            crate::consensus::client_objects::ClientObject::Registration(registration) => {
+                Some(registration.matrix_digest)
+            }
+            crate::consensus::client_objects::ClientObject::Submission(_) => None,
+        }));
+        leaves.resize(crate::consensus::client_objects::CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+        TerminalClientView {
+            carried: None,
+            registry_leaves: Some(leaves),
+        }
+    }
+
     fn accept_test_bundle(context: &mut MdbxChainContext, bundle: &crate::AcceptedBlockBundle) {
         let block = crate::Block::from_bytes(bundle.block_bytes()).unwrap();
+        let view = honest_test_view(context, &block);
         context
             .apply_next_block(
                 bundle,
@@ -2991,7 +3053,7 @@ mod tests {
                     crate::materialize_accepted_block_state(state, block)
                         .map_err(|error| format!("{error:?}"))
                 },
-                |_| Ok(()),
+                move |_| Ok(view),
             )
             .unwrap();
     }
@@ -3307,7 +3369,7 @@ mod tests {
                 second.history_step_terminal_bytes().to_vec(),
                 |_| {
                     verifier_calls += 1;
-                    Ok(())
+                    Ok(Default::default())
                 },
             )
             .unwrap();
@@ -3397,7 +3459,7 @@ mod tests {
                 second_block.header,
                 genesis,
                 second.history_step_terminal_bytes().to_vec(),
-                |_| Ok(()),
+                |_| Ok(Default::default()),
             )
             .unwrap();
 
@@ -3431,7 +3493,7 @@ mod tests {
                         crate::materialize_accepted_block_state(state, block)
                             .map_err(|error| format!("{error:?}"))
                     },
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )?;
                 Ok(())
             },
@@ -3469,7 +3531,7 @@ mod tests {
                 second.history_step_terminal_bytes().to_vec(),
                 |_| {
                     verify_calls.set(verify_calls.get() + 1);
-                    Ok(())
+                    Ok(Default::default())
                 },
             )
             .unwrap();
@@ -3537,7 +3599,7 @@ mod tests {
                 second_block.header,
                 genesis,
                 second.history_step_terminal_bytes().to_vec(),
-                |_| Ok(()),
+                |_| Ok(Default::default()),
             )
             .unwrap();
         let bodies = vec![first.block_bytes().to_vec(), second.block_bytes().to_vec()];
@@ -3590,7 +3652,7 @@ mod tests {
                 branch_a_block.header,
                 genesis,
                 branch_a.history_step_terminal_bytes().to_vec(),
-                |_| Ok(()),
+                |_| Ok(Default::default()),
             )
             .unwrap();
         for bundle in [&first, &branch_a] {
@@ -3617,7 +3679,7 @@ mod tests {
                         crate::materialize_accepted_block_state(state, block)
                             .map_err(|error| format!("{error:?}"))
                     },
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )?;
                 Ok(())
             };
@@ -3662,7 +3724,7 @@ mod tests {
                     final_block.header,
                     genesis,
                     final_bundle.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap();
             for bundle in &blocks[range] {
@@ -3699,7 +3761,7 @@ mod tests {
                         crate::materialize_accepted_block_state(state, block)
                             .map_err(|error| format!("{error:?}"))
                     },
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )?;
                 Ok(())
             },
@@ -3726,7 +3788,7 @@ mod tests {
                     second_block.header,
                     genesis,
                     second.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap();
             context
@@ -3782,7 +3844,7 @@ mod tests {
                     second_block.header,
                     genesis,
                     second.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap();
             context
@@ -3814,7 +3876,7 @@ mod tests {
                     second_block.header,
                     genesis,
                     second.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap();
             reopened
@@ -3854,7 +3916,7 @@ mod tests {
                     second_block.header,
                     genesis,
                     second.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap();
             context
@@ -3878,7 +3940,7 @@ mod tests {
                     third_block.header,
                     genesis,
                     third.history_step_terminal_bytes().to_vec(),
-                    |_| Ok(()),
+                    |_| Ok(Default::default()),
                 )
                 .unwrap_err();
             assert!(matches!(
@@ -3923,7 +3985,7 @@ mod tests {
                 second_block.header,
                 genesis,
                 second.history_step_terminal_bytes().to_vec(),
-                |_| Ok(()),
+                |_| Ok(Default::default()),
             )
             .unwrap();
         let mut tampered_first = crate::Block::from_bytes(first.block_bytes()).unwrap();

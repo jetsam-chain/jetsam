@@ -1115,6 +1115,10 @@ struct EmbeddedHistoryStepRuntimes {
     post_fork: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
     /// The v1.5 relation (m = 23 / 25, client slot), from the v1.5 height.
     v1_5: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    /// The registered client matrices this node holds, shared with the
+    /// matrix fetcher, with the memo of verified lanes (M3.8). Present
+    /// exactly when the v1.5 runtime is.
+    client_matrices: Option<Arc<jetsam_recursive::HistoryStepClientMatrixSet>>,
 }
 
 impl EmbeddedHistoryStepRuntimes {
@@ -1206,6 +1210,15 @@ fn embedded_history_step_runtimes(
             verify_embedded_development_payout_pins(label, pack)?;
         }
     }
+    let v1_5_runtime = match v1_5_activation {
+        Some(activation) => embedded_history_step_runtime_from_pack(
+            data_dir,
+            embedded_history_step_pack::embedded_history_step_pack_v1_5(),
+            activation.saturating_sub(1),
+            embedded_history_step_pack::HistoryStepPackGeneration::V1_5,
+        )?,
+        None => None,
+    };
     Ok(EmbeddedHistoryStepRuntimes {
         pre_fork: if reachable[0] {
             embedded_history_step_runtime_from_pack(
@@ -1230,15 +1243,11 @@ fn embedded_history_step_runtimes(
         },
         // The v1.5 relation reads J from its recursion root (root height + 1),
         // and a relation rooted at genesis is the v1.5 chain from J = 0.
-        v1_5: match v1_5_activation {
-            Some(activation) => embedded_history_step_runtime_from_pack(
-                data_dir,
-                embedded_history_step_pack::embedded_history_step_pack_v1_5(),
-                activation.saturating_sub(1),
-                embedded_history_step_pack::HistoryStepPackGeneration::V1_5,
-            )?,
-            None => None,
-        },
+        v1_5: v1_5_runtime.clone(),
+        client_matrices: v1_5_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.bank().client_form().cloned())
+            .map(|form| Arc::new(jetsam_recursive::HistoryStepClientMatrixSet::new(&form))),
     })
 }
 
@@ -1250,6 +1259,13 @@ fn embedded_history_step_runtimes(
 /// the sender. The classifier matches on text, so the marker has to travel in
 /// the text.
 const BRANCH_BOUNDARY_UNAVAILABLE: &str = "branch boundary unavailable:";
+
+/// Prefix of the v1.5 "no verdict yet": a live client lane whose registered
+/// matrix this node does not hold (M3.8). Like a missing branch boundary it is
+/// charged to nobody and stops nothing — the matrix is fetched and the
+/// candidate judged again. The classifier matches on text, so the marker
+/// travels in the text.
+const CLIENT_MATRIX_UNAVAILABLE: &str = "client matrix unavailable:";
 
 /// The boundary a terminal of `generation` rooted at `root_height` must carry,
 /// for the branch whose headers `header_at` serves.
@@ -4593,7 +4609,7 @@ fn verify_history_step_terminal_on_branch(
     claim: &jetsam_chain::storage::HistoryStepTerminalClaim<'_>,
     runtimes: &EmbeddedHistoryStepRuntimes,
     header_at: &mut dyn FnMut(u64) -> Option<jetsam_chain::BlockHeader>,
-) -> Result<(), String> {
+) -> Result<jetsam_chain::consensus::client_objects::TerminalClientView, String> {
     // The pack is chosen by the height of the block being verified, not by
     // the node's tip: a terminal proved before the fork is only ever
     // verifiable against the matrices that produced it.
@@ -4631,19 +4647,60 @@ fn verify_history_step_terminal_on_branch(
     } else {
         None
     };
-    jetsam_miner::install_inbound_verifier_cpu(|| {
-        jetsam_recursive::acceptance::history_step::decode_verify_history_step_terminal_rooted(
+    let client_matrices = runtimes
+        .client_matrices
+        .as_deref()
+        .map(|matrices| matrices as &dyn jetsam_recursive::HistoryStepClientMatrices);
+    let accepted = jetsam_miner::install_inbound_verifier_cpu(|| {
+        jetsam_recursive::decode_verify_history_step_terminal_rooted_with_client_matrices(
             runtime,
             claim.terminal_bytes,
             &claim.header,
             &claim.epoch_anchor_header,
             previous_epoch_anchor_header.as_ref(),
             recursion_root.as_ref(),
+            client_matrices,
         )
     })
     .map_err(|error| format!("HistoryStep verification CPU admission failed: {error}"))?
-    .map(|_| ())
-    .map_err(|error| format!("HistoryStep terminal rejected: {error}"))
+    .map_err(|error| history_step_verification_failure(claim.header.height, error))?;
+    Ok(terminal_client_view(accepted.client_claim()))
+}
+
+/// The text a verifier failure travels as (the classifiers match on it): a
+/// live client lane whose matrix this node does not hold is no verdict
+/// (`CLIENT_MATRIX_UNAVAILABLE`), everything else a rejection of the terminal.
+fn history_step_verification_failure(
+    height: u64,
+    error: jetsam_recursive::HistoryStepError,
+) -> String {
+    match error {
+        jetsam_recursive::HistoryStepError::Bank(
+            jetsam_recursive::HistoryStepBankError::ClientMatrixUnavailable,
+        ) => format!(
+            "{CLIENT_MATRIX_UNAVAILABLE} block {height} has a live client lane whose registered \
+             matrix this node does not hold yet"
+        ),
+        error => format!("HistoryStep terminal rejected: {error}"),
+    }
+}
+
+/// The client lanes a verified terminal publishes, as the chain checks them
+/// (M3.8). `None` under a generation without the client slot.
+fn terminal_client_view(
+    claim: Option<&jetsam_recursive::HistoryStepClientClaim>,
+) -> jetsam_chain::consensus::client_objects::TerminalClientView {
+    use jetsam_chain::consensus::client_objects::{CarriedClient, TerminalClientView};
+    match claim {
+        None => TerminalClientView::default(),
+        Some(claim) => TerminalClientView {
+            carried: claim.carried.as_ref().map(|carried| CarriedClient {
+                matrix_digest: carried.matrix_digest,
+                io_commitment: carried.io_commitment,
+            }),
+            registry_leaves: Some(claim.registry.clone()),
+        },
+    }
 }
 
 fn history_step_context_error_is_terminal_peer_fault(
@@ -4667,6 +4724,7 @@ fn history_step_context_error_is_terminal_peer_fault(
             // header at the root height was not there to read. Those carry
             // `BRANCH_BOUNDARY_UNAVAILABLE` and are answered below.
             !message.contains(BRANCH_BOUNDARY_UNAVAILABLE)
+                && !message.contains(CLIENT_MATRIX_UNAVAILABLE)
                 && (message.contains("terminal exceeds the wire cap")
                     || message.contains("terminal metadata is invalid")
                     || message.contains("terminal does not bind")
@@ -4691,6 +4749,7 @@ fn history_step_context_error_is_branch_boundary_gap(
         jetsam_chain::storage::MdbxContextError::Consensus(
             jetsam_chain::consensus::ConsensusError::BadHistoryStepTerminal(message),
         ) if message.contains(BRANCH_BOUNDARY_UNAVAILABLE)
+            || message.contains(CLIENT_MATRIX_UNAVAILABLE)
     )
 }
 
@@ -5629,7 +5688,7 @@ mod tests {
         competing_suffix_wins, embedded_seed_multiaddrs, expected_recursion_root,
         gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
         header_inventory_validation_anchor, history_step_context_error_is_branch_boundary_gap,
-        history_step_context_error_is_terminal_peer_fault,
+        history_step_context_error_is_terminal_peer_fault, history_step_verification_failure,
         initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
@@ -8088,6 +8147,39 @@ mod tests {
                 !history_step_context_error_is_branch_boundary_gap(&error),
                 "{reason} is the sender's, not a boundary this node could not read"
             );
+        }
+    }
+
+    /// M3.8: a live client lane whose registered matrix this node does not
+    /// hold yet is no verdict — charged to neither the peer nor the process,
+    /// like a boundary this node could not read — while a false client lane
+    /// is the sender's.
+    #[test]
+    fn a_client_matrix_this_node_lacks_is_no_verdict_and_a_false_lane_is_the_senders() {
+        use jetsam_recursive::{HistoryStepBankError, HistoryStepError};
+        let missing = bad_terminal(format!(
+            "verify exact suffix terminal: {}",
+            history_step_verification_failure(
+                4_004,
+                HistoryStepError::Bank(HistoryStepBankError::ClientMatrixUnavailable)
+            )
+        ));
+        assert!(history_step_context_error_is_branch_boundary_gap(&missing));
+        assert!(!history_step_context_error_is_terminal_peer_fault(&missing));
+        for lie in [
+            HistoryStepBankError::ClientAccumulatedClaimValue,
+            HistoryStepBankError::ClientNotRegistered,
+            HistoryStepBankError::ClientLaneWidth,
+        ] {
+            let refused = bad_terminal(history_step_verification_failure(
+                4_004,
+                HistoryStepError::Bank(lie.clone()),
+            ));
+            assert!(
+                history_step_context_error_is_terminal_peer_fault(&refused),
+                "{lie:?} is the sender's"
+            );
+            assert!(!history_step_context_error_is_branch_boundary_gap(&refused));
         }
     }
 

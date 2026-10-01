@@ -918,6 +918,13 @@ pub enum ClientObjectError {
     /// A paying transaction offered alone: it is minable only together with
     /// the object its marker names, and travels with it.
     PaymentWithoutObject,
+    /// A block at a v1.5 height whose verified terminal has no client lanes.
+    ClientLanesMissing,
+    /// A block below the v1.5 height whose verified terminal has client lanes.
+    UnexpectedClientLanes,
+    /// The registry leaves a terminal publishes are not the chain's registry
+    /// after the block (its parent's entries, then its own registrations).
+    RegistryLeavesMismatch,
 }
 
 impl std::fmt::Display for ClientObjectError {
@@ -1184,6 +1191,69 @@ pub fn check_carried_client(
         registry.check_carriable(&client.matrix_digest, height)?;
     }
     Ok(())
+}
+
+/// The client lanes a verified v1.5 terminal publishes (M3.8): what the
+/// node reads out of a block's public IO and checks natively against the
+/// chain, on the block's own branch. `Default` is "no client lanes", the
+/// answer of every generation without the client slot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalClientView {
+    /// The client the block carries (`client_present = 1`).
+    pub carried: Option<CarriedClient>,
+    /// The registry leaves the block publishes, in index order (zero for an
+    /// empty entry), [`CLIENT_REGISTRY_CAPACITY`] of them; `None` under a
+    /// generation without the client slot.
+    pub registry_leaves: Option<Vec<Digest>>,
+}
+
+/// The registry leaves a v1.5 block must publish: its parent's registered
+/// digests, then the digests its own registrations append, zero-padded to
+/// [`CLIENT_REGISTRY_CAPACITY`] (the IO carries the state **after** the
+/// block's registrations).
+pub fn registry_leaves_after(
+    parent: &ClientRegistryState,
+    effect: &ClientObjectsEffect,
+) -> Vec<Digest> {
+    let mut leaves = parent.digests();
+    leaves.extend(effect.registrations.iter().map(|entry| entry.matrix_digest));
+    leaves.resize(CLIENT_REGISTRY_CAPACITY.max(leaves.len()), [0u8; 32]);
+    leaves
+}
+
+/// The native checks of a block's terminal client lanes (M3.8), run where the
+/// node reads the IO, against the registry of the block's parent on its own
+/// branch and the effect of its own objects:
+///
+/// - below the v1.5 height a terminal has no client lanes;
+/// - from it on it has them, and its leaves are exactly
+///   [`registry_leaves_after`] — the relation proves the leaves append-only
+///   and every client verified against its leaf; that they are the chain's
+///   registrations is this native check;
+/// - a paid submission is the carried client, and a carried client is
+///   registered and carriable at this height ([`check_carried_client`]).
+pub fn check_terminal_client_view(
+    view: &TerminalClientView,
+    effect: &ClientObjectsEffect,
+    parent_registry: &ClientRegistryState,
+    height: u64,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    if !rules.active_at(height) {
+        return if view.registry_leaves.is_none() && view.carried.is_none() {
+            Ok(())
+        } else {
+            Err(ClientObjectError::UnexpectedClientLanes)
+        };
+    }
+    let leaves = view
+        .registry_leaves
+        .as_ref()
+        .ok_or(ClientObjectError::ClientLanesMissing)?;
+    if *leaves != registry_leaves_after(parent_registry, effect) {
+        return Err(ClientObjectError::RegistryLeavesMismatch);
+    }
+    check_carried_client(effect, view.carried, parent_registry, height)
 }
 
 pub mod queue;

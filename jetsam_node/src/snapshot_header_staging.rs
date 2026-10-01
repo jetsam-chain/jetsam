@@ -1776,7 +1776,7 @@ mod tests {
                     jetsam_chain::materialize_accepted_block_state(state, block)
                         .map_err(|error| format!("{error:?}"))
                 },
-                |_| Ok(()),
+                |_| Ok(Default::default()),
             )
             .unwrap();
         let store = &chain.store;

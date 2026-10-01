@@ -113,14 +113,27 @@ impl AuthenticatedSnapshotMetadata {
 pub struct VerifiedSnapshotBoundary {
     header: BlockHeader,
     history_step_terminal_bytes: Vec<u8>,
+    /// The boundary terminal's client lanes (v1.5): the registry leaves the
+    /// installed registry must equal.
+    client_view: crate::consensus::client_objects::TerminalClientView,
 }
 
 impl VerifiedSnapshotBoundary {
-    pub(crate) fn new_verified(header: BlockHeader, history_step_terminal_bytes: Vec<u8>) -> Self {
+    pub(crate) fn new_verified(
+        header: BlockHeader,
+        history_step_terminal_bytes: Vec<u8>,
+        client_view: crate::consensus::client_objects::TerminalClientView,
+    ) -> Self {
         Self {
             header,
             history_step_terminal_bytes,
+            client_view,
         }
+    }
+
+    /// The boundary terminal's client lanes, as its verifier read them.
+    pub fn client_view(&self) -> &crate::consensus::client_objects::TerminalClientView {
+        &self.client_view
     }
 
     pub fn header(&self) -> &BlockHeader {
