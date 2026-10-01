@@ -9322,6 +9322,24 @@ async fn handle_p2p_events(
                 )
             });
 
+            // v1.5 (M3.8): the boundary terminal's live client lanes are
+            // judged on the registered matrices, so the candidate's are
+            // wanted now — a boundary whose matrix is missing has no verdict
+            // and is judged again once it is here.
+            if let Some(objects) = &client_objects {
+                if let Ok(registry) =
+                    jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
+                        &manifest.client_registry,
+                    )
+                {
+                    objects.want_matrices(
+                        registry
+                            .entries()
+                            .iter()
+                            .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
+                    );
+                }
+            }
             // The manifest fixes one immutable State generation. Snapshot
             // admission ends at that exact boundary. Any later live tip is a
             // separate HeaderDAG-selected exact suffix, never a peer-owned
