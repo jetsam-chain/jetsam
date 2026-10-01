@@ -180,6 +180,12 @@ pub struct GetStateManifestHeader {
     pub bridge_cumulative_chainwork: [u8; 32],
     pub segment_count: u32,
     pub descriptor_pages: Vec<SnapshotManifestPageRef>,
+    /// Canonical bytes of the v1.5 client registry of the boundary
+    /// (`ClientRegistryState::encode`), empty when there is none (M3.8). The
+    /// manifest digest commits to it; the receiver authenticates it against
+    /// the installed state and headers.
+    #[serde(default)]
+    pub client_registry: Vec<u8>,
 }
 
 /// Manifest response: chain metadata + list of active segment IDs.
@@ -223,7 +229,16 @@ pub struct GetStateManifestResponse {
     /// Canonical sparse payload lengths aligned with `segment_ids`. The length
     /// commits the number of live entries before any payload allocation.
     pub segment_lengths: Vec<u32>,
+    /// Canonical bytes of the v1.5 client registry of the boundary, empty
+    /// when there is none (M3.8). See [`GetStateManifestHeader::client_registry`].
+    #[serde(default)]
+    pub client_registry: Vec<u8>,
 }
+
+/// Upper bound of the registry bytes a manifest carries: version, count, and
+/// the 16 fixed entries of a full registry.
+pub const MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES: usize = 2 + 16 * 109;
+const SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/CLIENT-REGISTRY/V1";
 
 pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 2;
 const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/V2";
@@ -254,6 +269,15 @@ impl GetStateManifestHeader {
             hasher.update(&page.byte_digest);
             hasher.update(&page.encoded_len.to_le_bytes());
             hasher.update(&page.descriptor_count.to_le_bytes());
+        }
+        // A manifest without a registry hashes exactly as before v1.5.
+        if !self.client_registry.is_empty() {
+            if self.client_registry.len() > MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES {
+                return None;
+            }
+            hasher.update(SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN);
+            hasher.update(&(self.client_registry.len() as u16).to_le_bytes());
+            hasher.update(&self.client_registry);
         }
         Some(*hasher.finalize().as_bytes())
     }
@@ -352,6 +376,7 @@ impl GetStateManifestHeader {
             segment_ids,
             segment_roots,
             segment_lengths,
+            client_registry: self.client_registry.clone(),
         };
         validate_manifest_descriptors(&response).then_some(response)
     }
@@ -496,6 +521,7 @@ impl GetStateManifestResponse {
             bridge_cumulative_chainwork: self.bridge_cumulative_chainwork,
             segment_count: u32::try_from(self.segment_ids.len()).ok()?,
             descriptor_pages: refs,
+            client_registry: self.client_registry.clone(),
         };
         header.seal_manifest_digest().then_some((header, pages))
     }

@@ -126,6 +126,9 @@ pub enum StoreError {
     HeaderAnchor(HeaderChainAnchorError),
     SnapshotStaging(SnapshotStagingError),
     SnapshotHeaders(String),
+    /// The v1.5 client registry a snapshot carries is not the one its state
+    /// and headers prove (M3.8): the sender's data, not this store's.
+    SnapshotClientRegistry(crate::consensus::client_objects::ClientObjectError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -136,6 +139,7 @@ impl std::fmt::Display for StoreError {
             Self::HeaderAnchor(e) => write!(f, "header anchor: {e}"),
             Self::SnapshotStaging(e) => write!(f, "snapshot staging: {e}"),
             Self::SnapshotHeaders(e) => write!(f, "snapshot headers: {e}"),
+            Self::SnapshotClientRegistry(e) => write!(f, "snapshot client registry: {e}"),
         }
     }
 }
@@ -146,7 +150,7 @@ impl std::error::Error for StoreError {
             Self::Mdbx(error) => Some(error),
             Self::HeaderAnchor(error) => Some(error),
             Self::SnapshotStaging(error) => Some(error),
-            Self::Decode(_) | Self::SnapshotHeaders(_) => None,
+            Self::Decode(_) | Self::SnapshotHeaders(_) | Self::SnapshotClientRegistry(_) => None,
         }
     }
 }
@@ -227,6 +231,20 @@ impl MdbxHistoricalReadSnapshot<'_> {
         let table = self.txn.open_table(Some(T_STATE_META))?;
         let raw: Option<Vec<u8>> = self.txn.get(&table, KEY_META)?;
         Ok(raw.and_then(|raw| decode_state_meta(&raw)))
+    }
+
+    /// The v1.5 client registry committed with the tip, in this pinned view
+    /// (never written under the dormant clock).
+    pub(super) fn get_client_registry(
+        &self,
+    ) -> Result<Option<crate::consensus::client_objects::ClientRegistryState>, StoreError> {
+        let table = self.txn.open_table(Some(T_STATE_META))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, KEY_CLIENT_REGISTRY)?;
+        raw.map(|bytes| {
+            crate::consensus::client_objects::ClientRegistryState::decode(&bytes)
+                .map_err(|_| StoreError::Decode("client registry is malformed"))
+        })
+        .transpose()
     }
 
     pub(super) fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
@@ -2361,6 +2379,7 @@ impl MdbxStore {
     /// The returned `ChainState` contains only compact exact summaries and
     /// evicted-segment metadata.  It is returned only after MDBX commit, so the
     /// context can switch hot state without a fallible post-commit disk reload.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_finalized_snapshot_staging<S: SnapshotHeaderInstallSource>(
         &self,
         staging: &FinalizedSnapshotStaging,
@@ -2369,6 +2388,7 @@ impl MdbxStore {
         boundary: &crate::storage::VerifiedSnapshotBoundary,
         header_source: &mut S,
         allow_nonfinal_rebase: bool,
+        client_registry: &crate::consensus::client_objects::ClientRegistryState,
     ) -> Result<ChainState, StoreError> {
         let metadata = staging.metadata();
         let tip_header = *metadata.header();
@@ -2738,6 +2758,36 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
         archive_history_step_proof_object(&txn, boundary.history_step_terminal_bytes())?;
+        // The v1.5 client registry travels with the snapshot and is part of
+        // what this transaction authenticates (M3.8): every entry against
+        // its marker slot in the state streamed below and the headers just
+        // written, and every post-activation registration marker against an
+        // entry.
+        let client_rules = crate::consensus::client_objects::ClientObjectRules::current();
+        let read_alloc_counter = |height: u64| -> Option<u64> {
+            let raw: Option<Vec<u8>> = txn.get(&header_tbl, &u64_key(height)).ok().flatten();
+            raw.and_then(|raw| decode_header(&raw))
+                .map(|header| header.alloc_counter)
+        };
+        let activation_alloc_floor = match client_rules.activation_height {
+            Some(activation) if client_rules.active_at(tip_header.height) => {
+                if activation == 0 {
+                    Some(0)
+                } else {
+                    Some(read_alloc_counter(activation - 1).ok_or(StoreError::Decode(
+                        "snapshot install lacks the header below the v1.5 height",
+                    ))?)
+                }
+            }
+            _ => None,
+        };
+        let mut registry_check = crate::consensus::client_objects::SnapshotRegistryCheck::new(
+            client_registry,
+            tip_header.height,
+            activation_alloc_floor,
+            &client_rules,
+        )
+        .map_err(StoreError::SnapshotClientRegistry)?;
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
@@ -2804,6 +2854,11 @@ impl MdbxStore {
                     .push_leaf(u32::from(local), slot_leaf_hash(slot))
                     .map_err(|_| StoreError::Decode("staged segment exact leaf is out of range"))?;
                 let owner = owner_key_from_fields(slot.owner_hi, slot.owner_lo);
+                registry_check.observe_slot(
+                    &jetsam_poseidon2b::primitives::Address(owner),
+                    slot.amount(),
+                    slot.creation_id(),
+                );
                 txn.put(
                     &owner_tbl,
                     owner_index_key(&owner, global),
@@ -2851,6 +2906,9 @@ impl MdbxStore {
                 "staged snapshot active count does not match target header",
             ));
         }
+        registry_check
+            .finish(read_alloc_counter)
+            .map_err(StoreError::SnapshotClientRegistry)?;
         let exact_root = exact
             .finish()
             .map_err(|_| StoreError::Decode("staged snapshot exact-root build failed"))?;
@@ -2899,11 +2957,22 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
-        // A snapshot does not carry the v1.5 client registry (yet): a stale
-        // one from the replaced state must not survive it.
-        let stale_registry: Option<Vec<u8>> = txn.get(&state_meta_tbl, KEY_CLIENT_REGISTRY)?;
-        if stale_registry.is_some() {
-            txn.del(&state_meta_tbl, KEY_CLIENT_REGISTRY, None)?;
+        // The authenticated registry replaces the one of the replaced state.
+        // Under the dormant clock nothing is written (a dormant node's store
+        // is exactly what it was before v1.5) and a stale key is dropped.
+        if client_rules.activation_height.is_some() {
+            txn.put(
+                &state_meta_tbl,
+                KEY_CLIENT_REGISTRY,
+                client_registry.encode(),
+                WriteFlags::empty(),
+            )?;
+        } else {
+            let stale_registry: Option<Vec<u8>> =
+                txn.get(&state_meta_tbl, KEY_CLIENT_REGISTRY)?;
+            if stale_registry.is_some() {
+                txn.del(&state_meta_tbl, KEY_CLIENT_REGISTRY, None)?;
+            }
         }
         prune_history_step_proof_objects(&txn, tip_header.height)?;
         txn.commit()?;
@@ -5289,6 +5358,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 false,
+                &Default::default(),
             )
             .unwrap();
 
@@ -5338,6 +5408,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 false,
+                &Default::default(),
             )
             .unwrap();
 
@@ -5379,6 +5450,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 false,
+                &Default::default(),
             )
             .is_err());
 
@@ -5424,6 +5496,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 true,
+                &Default::default(),
             )
             .unwrap();
 
@@ -5472,6 +5545,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 true,
+                &Default::default(),
             )
             .is_err());
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, stronger_hash)));
@@ -5517,6 +5591,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 true,
+                &Default::default(),
             )
             .unwrap();
 
@@ -5566,6 +5641,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 true,
+                &Default::default(),
             )
             .is_err());
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, divergent_hash)));
@@ -5602,6 +5678,7 @@ mod tests {
                 &boundary,
                 &mut source,
                 false,
+                &Default::default(),
             )
             .is_err());
 

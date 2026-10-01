@@ -4496,6 +4496,11 @@ enum SnapshotInstallError {
         local_hash: [u8; 32],
     },
     BeforeCommit(String),
+    /// The candidate's data, not this node: the v1.5 client registry the
+    /// manifest carries is not the one the boundary terminal publishes or
+    /// the installed state proves (M3.8). Nothing was written; the plan is
+    /// retired like any rejected candidate, and the process keeps running.
+    Rejected(String),
     AfterCommit {
         applied: AppliedVerifiedSnapshot,
         error: String,
@@ -4515,6 +4520,22 @@ fn superseded_snapshot_install(
     })
 }
 
+/// How a refused snapshot install travels: a client registry the install
+/// refuses (M3.8) is the candidate's data and retires its plan; anything else
+/// before the commit keeps the loud answer.
+fn snapshot_install_failure(
+    error: jetsam_chain::storage::MdbxContextError,
+) -> SnapshotInstallError {
+    match error {
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::ClientObject(error),
+        ) => SnapshotInstallError::Rejected(format!("snapshot client registry refused: {error}")),
+        error => SnapshotInstallError::BeforeCommit(format!(
+            "apply authenticated state snapshot: {error:?}"
+        )),
+    }
+}
+
 impl std::fmt::Display for SnapshotInstallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4526,7 +4547,7 @@ impl std::fmt::Display for SnapshotInstallError {
                 formatter,
                 "snapshot boundary {snapshot_height} was superseded by canonical height {local_height}"
             ),
-            Self::BeforeCommit(error) | Self::AfterCommit { error, .. } => {
+            Self::BeforeCommit(error) | Self::Rejected(error) | Self::AfterCommit { error, .. } => {
                 formatter.write_str(error)
             }
         }
@@ -5689,6 +5710,7 @@ mod tests {
         gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
         header_inventory_validation_anchor, history_step_context_error_is_branch_boundary_gap,
         history_step_context_error_is_terminal_peer_fault, history_step_verification_failure,
+        snapshot_install_failure,
         initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
@@ -8148,6 +8170,27 @@ mod tests {
                 "{reason} is the sender's, not a boundary this node could not read"
             );
         }
+    }
+
+    /// M3.8: a snapshot whose client registry the install refuses is the
+    /// candidate's fault, retired like any rejected candidate — never a
+    /// reason to stop the node; any other install failure keeps the loud
+    /// answer.
+    #[test]
+    fn a_refused_snapshot_registry_retires_the_candidate_and_nothing_else() {
+        use jetsam_chain::consensus::client_objects::ClientObjectError;
+        let refused = snapshot_install_failure(jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::ClientObject(
+                ClientObjectError::SnapshotRegistry {
+                    reason: "a registration marker of the state opens no entry",
+                },
+            ),
+        ));
+        assert!(matches!(refused, super::SnapshotInstallError::Rejected(_)));
+        let broken = snapshot_install_failure(jetsam_chain::storage::MdbxContextError::Corrupt(
+            "staged snapshot tip hash does not match authenticated header",
+        ));
+        assert!(matches!(broken, super::SnapshotInstallError::BeforeCommit(_)));
     }
 
     /// M3.8: a live client lane whose registered matrix this node does not
@@ -13711,6 +13754,17 @@ async fn handle_p2p_events(
                     );
                     retire_snapshot_plan!();
                 }
+                Err(SnapshotInstallError::Rejected(error)) => {
+                    snapshot_rebase_hint = None;
+                    tracing::warn!(
+                        observer_peer = %completed.key.observer_peer,
+                        tip = completed.key.height,
+                        err = %error,
+                        "snapshot candidate rejected at install; retiring only its immutable plan"
+                    );
+                    retire_snapshot_plan!();
+                    request_bounded_manifest_failover!(completed.key.observer_peer, false);
+                }
                 Err(SnapshotInstallError::BeforeCommit(error)) => {
                     tracing::error!(
                         observer_peer = %completed.key.observer_peer,
@@ -15260,6 +15314,25 @@ async fn apply_verified_snapshot_boundary(
     }
     let snapshot_height = manifest.tip_height;
     let segment_count = staging.descriptors().len();
+    // The v1.5 client registry the candidate carries for its boundary
+    // (M3.8). The manifest admission already refused a non-canonical one;
+    // what it is worth is decided by the install, against the boundary
+    // terminal and the installed state.
+    let client_registry = if manifest.client_registry.is_empty() {
+        jetsam_chain::consensus::client_objects::ClientRegistryState::new()
+    } else {
+        match jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
+            &manifest.client_registry,
+        ) {
+            Ok(registry) => registry,
+            Err(_) => {
+                drop_verified_history_step(history_step);
+                return Err(SnapshotInstallError::Rejected(
+                    "snapshot manifest client registry is not canonical".into(),
+                ));
+            }
+        }
+    };
     let VerifiedHistoryStepSnapshot {
         boundary,
         mut headers,
@@ -15296,12 +15369,11 @@ async fn apply_verified_snapshot_boundary(
             &boundary,
             &mut headers,
             allow_nonfinal_rebase,
+            &client_registry,
         ) {
             drop(ctx);
             let _ = headers.discard();
-            return Err(SnapshotInstallError::BeforeCommit(format!(
-                "apply authenticated state snapshot: {error:?}"
-            )));
+            return Err(snapshot_install_failure(error));
         }
         let state_install_elapsed = state_install_started.elapsed();
         let view = ChainView::from_mdbx(&ctx);

@@ -73,8 +73,8 @@ use crate::consensus::{
     ConsensusError,
 };
 use crate::consensus::client_objects::{
-    check_terminal_client_view, validate_block_client_objects, ClientObjectRules,
-    ClientObjectsEffect, ClientRegistryState, TerminalClientView,
+    check_snapshot_registry_leaves, check_terminal_client_view, validate_block_client_objects,
+    ClientObjectRules, ClientObjectsEffect, ClientRegistryState, TerminalClientView,
 };
 use crate::segmented_state::SegmentedFriState;
 use crate::state::{ChainState, StreamingSparseRoot};
@@ -2739,12 +2739,19 @@ impl MdbxChainContext {
     }
 
     /// Install a fully verified snapshot boundary in one durable state epoch.
+    /// `client_registry` is the v1.5 client registry the snapshot carries
+    /// for its boundary (M3.8): it is installed only if the boundary terminal
+    /// publishes exactly its leaves and the installed state and headers prove
+    /// every entry and omit none (`SnapshotRegistryCheck`); otherwise the
+    /// install is refused as `ClientObject`, the sender's data, with nothing
+    /// written.
     pub fn apply_staged_state_snapshot<S: SnapshotHeaderInstallSource>(
         &mut self,
         staging: &FinalizedSnapshotStaging,
         boundary: &VerifiedSnapshotBoundary,
         header_source: &mut S,
         allow_nonfinal_rebase: bool,
+        client_registry: &ClientRegistryState,
     ) -> Result<(), MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
@@ -2827,14 +2834,30 @@ impl MdbxChainContext {
         // transaction has committed. Every operation below is an infallible
         // in-memory swap, so no post-commit error can leave hot and durable
         // state at different boundaries.
-        let snapshot_state = self.store.install_finalized_snapshot_staging(
-            staging,
-            &consensus_meta,
-            &decoded_recent,
-            boundary,
-            header_source,
-            allow_nonfinal_rebase,
-        )?;
+        check_snapshot_registry_leaves(
+            boundary.client_view(),
+            client_registry,
+            tip_height,
+            &ClientObjectRules::current(),
+        )
+        .map_err(|error| MdbxContextError::Consensus(ConsensusError::ClientObject(error)))?;
+        let snapshot_state = self
+            .store
+            .install_finalized_snapshot_staging(
+                staging,
+                &consensus_meta,
+                &decoded_recent,
+                boundary,
+                header_source,
+                allow_nonfinal_rebase,
+                client_registry,
+            )
+            .map_err(|error| match error {
+                crate::storage::mdbx_store::StoreError::SnapshotClientRegistry(error) => {
+                    MdbxContextError::Consensus(ConsensusError::ClientObject(error))
+                }
+                error => error.into(),
+            })?;
         debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
 
         self.state = snapshot_state;
@@ -2844,9 +2867,8 @@ impl MdbxChainContext {
         self.tip_chain_work = cumulative_chainwork;
         self.finalized = finalized;
         self.defer_finality_updates = false;
-        // A snapshot does not carry the v1.5 client registry yet (M3.8): the
-        // install dropped the durable one, and the RAM copy follows it.
-        self.client_registry = ClientRegistryState::new();
+        // The registry the install authenticated and committed (M3.8).
+        self.client_registry = client_registry.clone();
         Ok(())
     }
 

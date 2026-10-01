@@ -22,13 +22,19 @@ use jetsam_chain::{
 
 use crate::protocol::{
     GetStateManifestHeader, GetStateManifestRequest, SnapshotManifestPageRef,
-    MAX_SNAPSHOT_MANIFEST_PAGES, SNAPSHOT_MANIFEST_FORMAT_VERSION,
+    MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES, MAX_SNAPSHOT_MANIFEST_PAGES,
+    SNAPSHOT_MANIFEST_FORMAT_VERSION,
 };
 
 // JETSAM: the leading byte E replaces the upstream magic's initial, so no
 // stream or file magic is byte-identical to Parano1d's.
 const REQUEST_MAGIC: [u8; 4] = *b"JMQ7";
 const RESPONSE_MAGIC: [u8; 4] = *b"JMH7";
+/// The same header followed by the v1.5 client registry of the boundary
+/// (M3.8): `u16` length, then its canonical bytes. Only a manifest that
+/// carries a registry uses it, so every pre-v1.5 frame is byte-identical to
+/// the released one.
+const RESPONSE_MAGIC_WITH_CLIENT_REGISTRY: [u8; 4] = *b"JMH8";
 const REQUEST_BYTES: usize = 4 + 8 + 32;
 const RESPONSE_HEADER_BYTES: usize =
     4 + 8 + 32 + 32 + 4 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4 + 2;
@@ -73,9 +79,13 @@ impl request_response::Codec for StateManifestCodec {
     {
         let mut encoded = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut encoded).await?;
-        if encoded[..4] != RESPONSE_MAGIC {
+        let carries_client_registry = if encoded[..4] == RESPONSE_MAGIC {
+            false
+        } else if encoded[..4] == RESPONSE_MAGIC_WITH_CLIENT_REGISTRY {
+            true
+        } else {
             return Err(invalid_data("invalid state-manifest header magic/version"));
-        }
+        };
         let page_count = u16::from_le_bytes(encoded[241..243].try_into().unwrap()) as usize;
         if page_count > MAX_SNAPSHOT_MANIFEST_PAGES {
             return Err(invalid_data("manifest descriptor page count exceeds cap"));
@@ -99,6 +109,17 @@ impl request_response::Codec for StateManifestCodec {
                 descriptor_count: u16::from_le_bytes(page[38..40].try_into().unwrap()),
             });
         }
+        let mut client_registry = Vec::new();
+        if carries_client_registry {
+            let mut length = [0u8; 2];
+            io.read_exact(&mut length).await?;
+            let length = usize::from(u16::from_le_bytes(length));
+            if length == 0 || length > MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES {
+                return Err(invalid_data("manifest client registry length is out of bounds"));
+            }
+            client_registry.resize(length, 0);
+            io.read_exact(&mut client_registry).await?;
+        }
         ensure_eof(io).await?;
         let response = GetStateManifestHeader {
             tip_height: u64::from_le_bytes(encoded[4..12].try_into().unwrap()),
@@ -116,6 +137,7 @@ impl request_response::Codec for StateManifestCodec {
             bridge_cumulative_chainwork: encoded[205..237].try_into().unwrap(),
             segment_count: u32::from_le_bytes(encoded[237..241].try_into().unwrap()),
             descriptor_pages,
+            client_registry,
         };
         validate_header(&response)?;
         Ok(response)
@@ -148,7 +170,11 @@ impl request_response::Codec for StateManifestCodec {
     {
         validate_header(&response)?;
         let mut encoded = [0u8; RESPONSE_HEADER_BYTES];
-        encoded[..4].copy_from_slice(&RESPONSE_MAGIC);
+        encoded[..4].copy_from_slice(if response.client_registry.is_empty() {
+            &RESPONSE_MAGIC
+        } else {
+            &RESPONSE_MAGIC_WITH_CLIENT_REGISTRY
+        });
         encoded[4..12].copy_from_slice(&response.tip_height.to_le_bytes());
         encoded[12..44].copy_from_slice(&response.tip_hash);
         encoded[44..76].copy_from_slice(&response.cumulative_chainwork);
@@ -174,6 +200,11 @@ impl request_response::Codec for StateManifestCodec {
             io.write_all(&page.byte_digest).await?;
             io.write_all(&page.encoded_len.to_le_bytes()).await?;
             io.write_all(&page.descriptor_count.to_le_bytes()).await?;
+        }
+        if !response.client_registry.is_empty() {
+            io.write_all(&(response.client_registry.len() as u16).to_le_bytes())
+                .await?;
+            io.write_all(&response.client_registry).await?;
         }
         io.flush().await
     }
@@ -235,6 +266,24 @@ fn validate_header(header: &GetStateManifestHeader) -> io::Result<()> {
     if !header.has_canonical_page_shape() || !header.has_valid_manifest_digest() {
         return Err(invalid_data("manifest page shape or digest is invalid"));
     }
+    if !header.client_registry.is_empty() {
+        // Canonical, and nothing registered above the boundary. Whether it is
+        // the boundary's registry is decided against the installed state.
+        let registry = jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
+            &header.client_registry,
+        )
+        .map_err(|_| invalid_data("manifest client registry is not canonical"))?;
+        if registry.is_empty()
+            || registry
+                .entries()
+                .iter()
+                .any(|entry| entry.registered_at > header.tip_height)
+        {
+            return Err(invalid_data(
+                "manifest client registry is not the boundary's",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -263,6 +312,11 @@ mod tests {
     }
 
     fn populated() -> (GetStateManifestHeader, Vec<std::sync::Arc<[u8]>>) {
+        let manifest = populated_manifest();
+        manifest.to_header_and_pages().unwrap()
+    }
+
+    fn populated_manifest() -> GetStateManifestResponse {
         let mut manifest = GetStateManifestResponse {
             tip_height: 77,
             tip_hash: [0x11; 32],
@@ -284,9 +338,10 @@ mod tests {
             segment_ids: vec![0, 1],
             segment_roots: vec![[0x33; 32], [0x44; 32]],
             segment_lengths: vec![209, 259],
+            client_registry: Vec::new(),
         };
         assert!(manifest.seal_manifest_digest());
-        manifest.to_header_and_pages().unwrap()
+        manifest
     }
 
     #[tokio::test]
@@ -323,6 +378,92 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// M3.8: a v1.5 snapshot manifest carries the client registry of its
+    /// boundary. With no registry the frame is the released one, byte for
+    /// byte; with one it is a second frame (`JMH8`) whose digest commits to
+    /// the registry, so every source of one plan serves the same registry.
+    #[tokio::test]
+    async fn a_manifest_carries_the_client_registry_of_its_boundary() {
+        use jetsam_chain::consensus::client_objects::{
+            ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState,
+        };
+        let (plain, _) = populated();
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&ClientObjectsEffect {
+            registrations: vec![ClientRegistryEntry {
+                index: 0,
+                matrix_digest: [0xD1; 32],
+                matrix_file_root: [0xF1; 32],
+                matrix_file_len: 4_096,
+                registered_at: 70,
+                active_from: 550,
+                license: Default::default(),
+            }],
+            ..ClientObjectsEffect::default()
+        });
+        let mut carrying = populated_manifest();
+        carrying.client_registry = registry.encode();
+        assert!(carrying.seal_manifest_digest());
+        let (header, _) = carrying.to_header_and_pages().unwrap();
+        assert_eq!(header.client_registry, registry.encode());
+        assert_ne!(header.manifest_digest, plain.manifest_digest, "the digest commits to it");
+
+        // The registry-free frame is unchanged.
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, plain.clone())
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], b"JMH7");
+        assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES + PAGE_REF_BYTES);
+
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, header.clone())
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], b"JMH8");
+        let bytes = wire.into_inner();
+        assert_eq!(
+            bytes.len(),
+            RESPONSE_HEADER_BYTES + PAGE_REF_BYTES + 2 + registry.encode().len()
+        );
+        assert_eq!(
+            StateManifestCodec
+                .read_response(&protocol(), &mut Cursor::new(bytes.clone()))
+                .await
+                .unwrap(),
+            header
+        );
+        // Altered registry bytes break the digest; a registry above the
+        // boundary or a non-canonical one is refused.
+        let mut altered = bytes.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert!(StateManifestCodec
+            .read_response(&protocol(), &mut Cursor::new(altered))
+            .await
+            .is_err());
+        let mut late = populated_manifest();
+        let mut late_registry = ClientRegistryState::new();
+        late_registry.apply(&ClientObjectsEffect {
+            registrations: vec![ClientRegistryEntry {
+                registered_at: 78,
+                active_from: 558,
+                ..registry.entries()[0]
+            }],
+            ..ClientObjectsEffect::default()
+        });
+        late.client_registry = late_registry.encode();
+        assert!(late.seal_manifest_digest());
+        let (late_header, _) = late.to_header_and_pages().unwrap();
+        let mut wire = Cursor::new(Vec::new());
+        assert!(StateManifestCodec
+            .write_response(&protocol(), &mut wire, late_header)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

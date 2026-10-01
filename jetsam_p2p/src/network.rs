@@ -394,6 +394,13 @@ impl SnapshotExportEntry {
                 .iter()
                 .map(|segment| segment.encoded_len)
                 .collect(),
+            // The v1.5 client registry of the boundary (M3.8); empty below
+            // v1.5, where the manifest is the released one.
+            client_registry: if generation.client_registry().is_empty() {
+                Vec::new()
+            } else {
+                generation.client_registry().encode()
+            },
         };
         let (network_manifest, manifest_header, manifest_pages) =
             VerifiedStateManifest::prepare_local(network_manifest)?;

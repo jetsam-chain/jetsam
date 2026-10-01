@@ -1481,3 +1481,133 @@ fn a_payment_names_exactly_one_submission() {
     let registration_marker = ClientObject::Registration(registration(0x10)).marker();
     assert!(!pays_submission(&pages(&[(registration_marker, 0)]), &sub));
 }
+
+// ---------------------------------------------------------------------------
+// M3.8: the registry a snapshot carries, authenticated by the snapshot state
+// ---------------------------------------------------------------------------
+
+/// A chain whose header at height `h` has `alloc_counter = 10 * h`: the
+/// outputs minted by block `h` carry creation ids `10 (h - 1) + 1 ..= 10 h`.
+fn alloc_at(height: u64) -> Option<u64> {
+    Some(10 * height)
+}
+
+/// The registry entry block `registered_at` produced for `byte`, under the
+/// burn rules (license, activation delay).
+fn snapshot_entry(index: u8, byte: u8, registered_at: u64) -> ClientRegistryEntry {
+    let rules = burn_rules();
+    ClientRegistryEntry {
+        active_from: registered_at + rules.activation_delay,
+        ..entry(
+            index,
+            byte,
+            registered_at,
+            rules.destination.split(rules.license_micro),
+        )
+    }
+}
+
+fn snapshot_registry(entries: &[ClientRegistryEntry]) -> ClientRegistryState {
+    let mut registry = ClientRegistryState::new();
+    registry.apply(&ClientObjectsEffect {
+        registrations: entries.to_vec(),
+        ..ClientObjectsEffect::default()
+    });
+    registry
+}
+
+/// The marker slot block `registered_at` minted for `entry`: a zero-value
+/// output owned by the registration marker, creation id inside the block's
+/// alloc range.
+fn marker_slot(entry: &ClientRegistryEntry) -> (Address, u64, u64) {
+    let owner = ClientObject::Registration(ClientRegistration {
+        matrix_digest: entry.matrix_digest,
+        matrix_file_root: entry.matrix_file_root,
+        matrix_file_len: entry.matrix_file_len,
+    })
+    .marker();
+    (owner, 0, 10 * (entry.registered_at - 1) + 3)
+}
+
+fn check_snapshot(
+    registry: &ClientRegistryState,
+    boundary: u64,
+    slots: &[(Address, u64, u64)],
+) -> Result<(), ClientObjectError> {
+    let rules = burn_rules();
+    let floor = rules
+        .active_at(boundary)
+        .then(|| alloc_at(ACTIVATION - 1).unwrap());
+    let mut check = SnapshotRegistryCheck::new(registry, boundary, floor, &rules)?;
+    for (owner, amount, creation_id) in slots {
+        check.observe_slot(owner, *amount, *creation_id);
+    }
+    check.finish(alloc_at)
+}
+
+#[test]
+fn a_snapshot_registry_is_the_one_its_state_proves() {
+    let first = snapshot_entry(0, 0x21, 150);
+    let second = snapshot_entry(1, 0x22, 190);
+    let registry = snapshot_registry(&[first, second]);
+    let slots = [marker_slot(&first), marker_slot(&second)];
+    // Honest: every entry has its marker slot, minted by its own block.
+    assert_eq!(check_snapshot(&registry, HEIGHT, &slots), Ok(()));
+    // Unrelated slots, pre-activation look-alikes and coinbase-tagged ids
+    // are not registrations.
+    let mut noisy = slots.to_vec();
+    noisy.push((PAYER, 5, 10 * 160 + 1));
+    noisy.push((marker_slot(&first).0, 0, 10 * (ACTIVATION - 2) + 1));
+    let mut tagged = marker_slot(&snapshot_entry(2, 0x23, 120));
+    tagged.2 = crate::consensus::params::coinbase_creation_id(120);
+    noisy.push(tagged);
+    assert_eq!(check_snapshot(&registry, HEIGHT, &noisy), Ok(()));
+    // An empty registry below the v1.5 height, with nothing to check.
+    assert_eq!(
+        check_snapshot(&ClientRegistryState::new(), ACTIVATION - 1, &[]),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_forged_snapshot_registry_is_refused() {
+    let first = snapshot_entry(0, 0x21, 150);
+    let second = snapshot_entry(1, 0x22, 190);
+    let slots = [marker_slot(&first), marker_slot(&second)];
+    let refused = |entries: &[ClientRegistryEntry], slots: &[(Address, u64, u64)]| {
+        check_snapshot(&snapshot_registry(entries), HEIGHT, slots)
+            .expect_err("a forged registry must be refused")
+    };
+    // Another file root than the one registered: no marker opens it.
+    let mut wrong_root = first;
+    wrong_root.matrix_file_root = [0x99; 32];
+    refused(&[wrong_root, second], &slots);
+    // A registration height the marker was not minted at.
+    let mut moved = first;
+    moved.registered_at = 151;
+    moved.active_from = 151 + burn_rules().activation_delay;
+    refused(&[moved, second], &slots);
+    // An activation the rules do not give.
+    let mut early = first;
+    early.active_from -= 1;
+    refused(&[early, second], &slots);
+    // A license the rules do not give.
+    let mut cheap = first;
+    cheap.license.burn -= 1;
+    refused(&[cheap, second], &slots);
+    // A registration the state does not hold.
+    refused(&[first, second], &slots[..1]);
+    // A registration the snapshot omits (its marker is in the state).
+    refused(&[first], &slots);
+    // A marker carrying value.
+    let mut valued = slots;
+    valued[0].1 = 1;
+    refused(&[first, second], &valued);
+    // An entry registered above the boundary, or below the v1.5 height.
+    let late = snapshot_entry(1, 0x22, HEIGHT + 1);
+    refused(&[first, late], &[slots[0], marker_slot(&late)]);
+    let before = snapshot_entry(0, 0x21, ACTIVATION - 1);
+    refused(&[before], &[marker_slot(&before)]);
+    // A non-empty registry at a boundary below the v1.5 height.
+    assert!(check_snapshot(&snapshot_registry(&[first]), ACTIVATION - 1, &slots[..1]).is_err());
+}

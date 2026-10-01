@@ -30,6 +30,7 @@ use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 use serde::{Deserialize, Serialize};
 
 use crate::block_header::{block_id, BlockHeader};
+use crate::consensus::client_objects::ClientRegistryState;
 use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
@@ -56,6 +57,14 @@ const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";
 const SEGMENTS_DIRECTORY_NAME: &str = "segments";
 const BRIDGE_DIRECTORY_NAME: &str = "bridge";
 const BOUNDARY_TERMINAL_FILE_NAME: &str = "boundary.history-step";
+/// The v1.5 client registry of the target (M3.8), present only when it is
+/// non-empty: a generation of a chain below the v1.5 height, or of a dormant
+/// clock, is byte for byte what it was before v1.5. Not covered by the
+/// manifest digest; the receiver authenticates it against the installed
+/// state and headers (`SnapshotRegistryCheck`).
+const CLIENT_REGISTRY_FILE_NAME: &str = "client-registry.bin";
+/// Canonical bytes of a full registry: version, count, 16 fixed entries.
+const MAX_CLIENT_REGISTRY_FILE_BYTES: u64 = 2 + 16 * 109;
 const BRIDGE_TERMINAL_FILE_NAME: &str = "bridge.history-step";
 
 /// A manifest contains only bounded segment metadata, never segment payloads.
@@ -151,6 +160,8 @@ impl SnapshotGenerationManifest {
 pub struct SnapshotGeneration {
     directory: PathBuf,
     manifest: SnapshotGenerationManifest,
+    /// The v1.5 client registry of the target (empty below v1.5).
+    client_registry: ClientRegistryState,
 }
 
 impl SnapshotGeneration {
@@ -160,6 +171,12 @@ impl SnapshotGeneration {
 
     pub fn manifest(&self) -> &SnapshotGenerationManifest {
         &self.manifest
+    }
+
+    /// The v1.5 client registry of the target, as committed by the source
+    /// chain (M3.8). Empty below the v1.5 height and under a dormant clock.
+    pub fn client_registry(&self) -> &ClientRegistryState {
+        &self.client_registry
     }
 
     /// Stable canonical boundary key used by P2P export registries.
@@ -527,6 +544,12 @@ fn export_snapshot_generation_inner(
             "tip state metadata does not match tip header",
         ));
     }
+
+    // The registry committed with the tip, rolled back to the target: an
+    // entry registered above the target is not part of its state.
+    let source_client_registry = snapshot.get_client_registry()?;
+    let mut client_registry = source_client_registry.clone().unwrap_or_default();
+    client_registry.truncate_above(target_height);
 
     let target_header = canonical_header(&snapshot, target_height)?;
     let target_hash = block_id(&target_header);
@@ -907,8 +930,15 @@ fn export_snapshot_generation_inner(
         || snapshot.get_state_meta()? != Some(state_meta)
         || canonical_header(&snapshot, target_height)? != target_header
         || snapshot.get_chain_work(target_height)? != Some(cumulative_chainwork)
+        || snapshot.get_client_registry()? != source_client_registry
     {
         return Err(SnapshotGenerationError::SourceChanged);
+    }
+    if !client_registry.is_empty() {
+        write_synced_file(
+            &temporary.path().join(CLIENT_REGISTRY_FILE_NAME),
+            &client_registry.encode(),
+        )?;
     }
 
     let manifest_bytes = encode_manifest(&manifest)?;
@@ -934,7 +964,7 @@ fn export_snapshot_generation_inner(
         }
         Err(_error) if final_directory.exists() => {
             let existing = open_snapshot_generation(&final_directory)?;
-            if existing.manifest != manifest {
+            if existing.manifest != manifest || existing.client_registry != client_registry {
                 return Err(SnapshotGenerationError::PublishedGenerationConflict(
                     final_directory,
                 ));
@@ -971,10 +1001,51 @@ pub fn open_snapshot_generation(
     }
     let manifest = decode_manifest(&encoded)?;
     validate_manifest(&manifest)?;
+    let client_registry = read_generation_client_registry(&directory, manifest.target_height)?;
     Ok(SnapshotGeneration {
         directory,
         manifest,
+        client_registry,
     })
+}
+
+/// The registry file of a generation, if present: bounded, canonical, and
+/// with no entry registered above the target.
+fn read_generation_client_registry(
+    directory: &Path,
+    target_height: u64,
+) -> Result<ClientRegistryState, SnapshotGenerationError> {
+    let path = directory.join(CLIENT_REGISTRY_FILE_NAME);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ClientRegistryState::new())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut encoded = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_CLIENT_REGISTRY_FILE_BYTES + 1)
+        .read_to_end(&mut encoded)?;
+    if encoded.len() as u64 > MAX_CLIENT_REGISTRY_FILE_BYTES {
+        return Err(SnapshotGenerationError::Corrupt(
+            "snapshot client registry exceeds its bound",
+        ));
+    }
+    let registry = ClientRegistryState::decode(&encoded).map_err(|_| {
+        SnapshotGenerationError::Corrupt("snapshot client registry is malformed")
+    })?;
+    if registry.is_empty()
+        || registry
+            .entries()
+            .iter()
+            .any(|entry| entry.registered_at > target_height)
+    {
+        return Err(SnapshotGenerationError::Corrupt(
+            "snapshot client registry is not the target's",
+        ));
+    }
+    Ok(registry)
 }
 
 fn incremental_base_is_eligible(
@@ -1701,6 +1772,7 @@ mod tests {
         let source = segment_path(previous_root.path(), 7);
         fs::write(&source, b"immutable-segment").unwrap();
         let previous = SnapshotGeneration {
+            client_registry: ClientRegistryState::new(),
             directory: previous_root.path().to_path_buf(),
             manifest: SnapshotGenerationManifest {
                 version: SNAPSHOT_GENERATION_VERSION,

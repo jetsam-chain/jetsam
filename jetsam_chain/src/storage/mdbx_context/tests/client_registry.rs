@@ -684,3 +684,186 @@ fn a_suffix_tip_publishes_the_chains_registry_after_its_block() {
         "the tip body is not committed"
     );
 }
+
+// ---- M3.8: the registry is part of a snapshot's authenticated state ----
+
+/// Headers of `producer` from genesis to `target`, as a staged snapshot
+/// header source.
+struct ProducerHeaders {
+    base: crate::storage::VerifiedHeaderBatchRecord,
+    records: Vec<crate::storage::VerifiedHeaderBatchRecord>,
+    recent: Vec<BlockHeader>,
+    next: usize,
+}
+
+impl ProducerHeaders {
+    fn of(producer: &MdbxChainContext, target: u64) -> Self {
+        let record = |height: u64| {
+            let header = producer.get_header_from_store(height).unwrap().unwrap();
+            crate::storage::VerifiedHeaderBatchRecord {
+                header,
+                hash: block_id(&header),
+                cumulative_chainwork: producer.store.get_chain_work(height).unwrap().unwrap(),
+            }
+        };
+        Self {
+            base: record(0),
+            records: (1..=target).map(record).collect(),
+            recent: (0..=target)
+                .map(|height| producer.get_header_from_store(height).unwrap().unwrap())
+                .collect(),
+            next: 0,
+        }
+    }
+}
+
+impl crate::storage::SnapshotHeaderInstallSource for ProducerHeaders {
+    fn base_record(&self) -> crate::storage::VerifiedHeaderBatchRecord {
+        self.base
+    }
+    fn target_record(&self) -> crate::storage::VerifiedHeaderBatchRecord {
+        *self.records.last().unwrap()
+    }
+    fn recent_headers(&self) -> &[BlockHeader] {
+        &self.recent
+    }
+    fn next_record(&mut self) -> Result<Option<crate::storage::VerifiedHeaderBatchRecord>, String> {
+        let record = self.records.get(self.next).copied();
+        self.next += usize::from(record.is_some());
+        Ok(record)
+    }
+}
+
+/// Stage `generation`'s segments into a finalized staging under `root`.
+fn stage(
+    generation: &crate::storage::SnapshotGeneration,
+    target: BlockHeader,
+    root: &Path,
+) -> crate::storage::FinalizedSnapshotStaging {
+    let manifest = generation.manifest();
+    let header = crate::storage::AuthenticatedSnapshotMetadata::from_authenticated_header(
+        target,
+        manifest.target_hash,
+        manifest.effective_log_segment_size,
+    )
+    .unwrap();
+    let mut session =
+        crate::storage::SnapshotStagingSession::new(root, header, manifest.segments.clone())
+            .unwrap();
+    for descriptor in &manifest.segments {
+        let encoded = generation
+            .read_encoded_segment(descriptor.segment_id)
+            .unwrap();
+        session
+            .accept_segment(
+                descriptor.segment_id,
+                manifest.effective_log_segment_size,
+                &encoded,
+            )
+            .unwrap();
+    }
+    session.finalize().unwrap()
+}
+
+#[test]
+fn a_snapshot_carries_the_exact_registry_and_refuses_a_forged_one() {
+    let _rules = test_rules::install(armed_rules());
+    let producer_dir = tempfile::tempdir().unwrap();
+    let mut producer = easy_block_context(producer_dir.path());
+    let first = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &first).unwrap();
+    let (registration, object) = registration();
+    let paying = spend_coinbase(
+        &producer,
+        &first,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object.marker(), 0),
+        ],
+    );
+    let second = bundle_with(&mut producer, MINER, vec![paying], vec![object]);
+    apply(&mut producer, &second).unwrap();
+    let third = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &third).unwrap();
+    let registry = producer.client_registry().clone();
+    assert_eq!(registry.digests(), vec![registration.matrix_digest]);
+
+    // The generation carries the registry of its target, read back from disk.
+    let exports = tempfile::tempdir().unwrap();
+    let generation =
+        crate::storage::export_snapshot_boundary_generation(&producer.store, exports.path(), 3, None)
+            .unwrap();
+    assert_eq!(generation.client_registry(), &registry);
+    let reopened = crate::storage::open_snapshot_generation(generation.directory()).unwrap();
+    assert_eq!(reopened.client_registry(), &registry);
+    // A target below the registration carries an empty one.
+    let exports_below = tempfile::tempdir().unwrap();
+    let below = crate::storage::export_snapshot_boundary_generation(
+        &producer.store,
+        exports_below.path(),
+        1,
+        None,
+    )
+    .unwrap();
+    assert!(below.client_registry().is_empty());
+
+    let target = producer.get_header_from_store(3).unwrap().unwrap();
+    let leaves = {
+        let mut leaves = registry.digests();
+        leaves.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+        leaves
+    };
+    let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+        target,
+        third.history_step_terminal_bytes().to_vec(),
+        TerminalClientView {
+            carried: None,
+            registry_leaves: Some(leaves),
+        },
+    );
+    let install = |claimed: &ClientRegistryState| {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let mut consumer = easy_block_context(directory.path());
+        let staging = stage(&generation, target, staging_root.path());
+        let mut headers = ProducerHeaders::of(&producer, 3);
+        let result = consumer.apply_staged_state_snapshot(
+            &staging,
+            &boundary,
+            &mut headers,
+            false,
+            claimed,
+        );
+        let durable = consumer.store.get_client_registry().unwrap();
+        (result, consumer.tip_height(), consumer.client_registry().clone(), durable, directory)
+    };
+
+    // The exact registry: installed in RAM and durably, and kept on reopen.
+    let (result, height, installed, durable, directory) = install(&registry);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!((height, &installed, durable.as_ref()), (3, &registry, Some(&registry)));
+    let reopened =
+        MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap()).unwrap();
+    assert_eq!(reopened.client_registry(), &registry);
+
+    // Forgeries: refused by name, nothing installed.
+    let mut forged_entries = registry.entries().to_vec();
+    forged_entries[0].matrix_file_root = [0x99; 32];
+    let mut forged = ClientRegistryState::new();
+    forged.apply(&ClientObjectsEffect {
+        registrations: forged_entries,
+        ..ClientObjectsEffect::default()
+    });
+    for claimed in [ClientRegistryState::new(), forged] {
+        let (result, height, installed, _, _) = install(&claimed);
+        assert!(
+            matches!(
+                result,
+                Err(MdbxContextError::Consensus(ConsensusError::ClientObject(_)))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(height, 0);
+        assert!(installed.is_empty());
+    }
+}

@@ -925,6 +925,11 @@ pub enum ClientObjectError {
     /// The registry leaves a terminal publishes are not the chain's registry
     /// after the block (its parent's entries, then its own registrations).
     RegistryLeavesMismatch,
+    /// The registry a state snapshot carries is not the one its state and
+    /// headers prove ([`SnapshotRegistryCheck`]).
+    SnapshotRegistry {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for ClientObjectError {
@@ -1254,6 +1259,196 @@ pub fn check_terminal_client_view(
         return Err(ClientObjectError::RegistryLeavesMismatch);
     }
     check_carried_client(effect, view.carried, parent_registry, height)
+}
+
+/// Authenticate the client registry a state snapshot carries (M3.8) against
+/// the snapshot's own state and the header chain, for a node installed from a
+/// snapshot to start from the exact registry, verified.
+///
+/// The registry is not in the state root, but every registration left a
+/// permanent trace in the state: its paying transaction's **marker output**,
+/// a zero-value slot owned by `tag ‖ hash(D, file root, file length)`, which
+/// no one can spend (refused from v1.5 on), and whose `creation_id` is the
+/// allocation cursor of the block that minted it. So:
+///
+/// - each entry's marker opens exactly one slot minted after the v1.5 height,
+///   of zero value, by the block the entry names: `alloc(r − 1) < creation_id
+///   ≤ alloc(r)`, with `J ≤ r ≤ F` — this authenticates `D`, the file root and
+///   length, and `registered_at`;
+/// - `active_from` and the license are what the rules give at `r`;
+/// - every registration marker minted after the v1.5 height opens an entry:
+///   the registry omits none (they are counted while the slots stream past).
+///
+/// Below the v1.5 height the registry is empty. What a snapshot node cannot
+/// re-check, as for every native-only rule, is that each license was paid:
+/// it inherits that from the chain it trusts for the state.
+pub struct SnapshotRegistryCheck<'a> {
+    registry: &'a ClientRegistryState,
+    /// `alloc_counter` of the header before the v1.5 height; `None` when the
+    /// boundary is below it (nothing to observe).
+    floor: Option<u64>,
+    /// Marker owner bytes of each entry → its index.
+    expected: std::collections::BTreeMap<[u8; 32], usize>,
+    found: Vec<Vec<(u64, u64)>>,
+    unmatched: u64,
+}
+
+impl<'a> SnapshotRegistryCheck<'a> {
+    /// Start the check of `registry`, claimed for the boundary at
+    /// `boundary_height`. `activation_alloc_floor` is the `alloc_counter` of
+    /// the header just below the v1.5 height (zero for a chain that is v1.5
+    /// from genesis), required when the boundary is at or above it.
+    pub fn new(
+        registry: &'a ClientRegistryState,
+        boundary_height: u64,
+        activation_alloc_floor: Option<u64>,
+        rules: &ClientObjectRules,
+    ) -> Result<Self, ClientObjectError> {
+        let refuse = |reason| Err(ClientObjectError::SnapshotRegistry { reason });
+        let Some(activation) = rules
+            .activation_height
+            .filter(|_| rules.active_at(boundary_height))
+        else {
+            return if registry.is_empty() {
+                Ok(Self {
+                    registry,
+                    floor: None,
+                    expected: Default::default(),
+                    found: Vec::new(),
+                    unmatched: 0,
+                })
+            } else {
+                refuse("a registry below the v1.5 height")
+            };
+        };
+        let Some(floor) = activation_alloc_floor else {
+            return refuse("no allocation floor at the v1.5 height");
+        };
+        let capacity = rules.registry_capacity.min(CLIENT_REGISTRY_CAPACITY);
+        if registry.len() > capacity {
+            return refuse("more entries than the registry holds");
+        }
+        let split = rules.destination.split(rules.license_micro);
+        let mut expected = std::collections::BTreeMap::new();
+        let mut previous: Option<u64> = None;
+        for (position, entry) in registry.entries().iter().enumerate() {
+            let height = entry.registered_at;
+            if usize::from(entry.index) != position
+                || entry.matrix_digest == [0u8; 32]
+                || entry.matrix_file_root == [0u8; 32]
+                || entry.matrix_file_len == 0
+                || entry.matrix_file_len > rules.max_matrix_file_bytes
+            {
+                return refuse("an entry the registration rules forbid");
+            }
+            if height < activation.max(1) || height > boundary_height {
+                return refuse("an entry registered outside the v1.5 range of the snapshot");
+            }
+            if previous.is_some_and(|previous| {
+                height < previous
+                    || (MAX_BLOCK_CLIENT_REGISTRATIONS == 1 && height == previous)
+            }) {
+                return refuse("entries out of registration order");
+            }
+            previous = Some(height);
+            if entry.active_from != height.saturating_add(rules.activation_delay)
+                || entry.license != split
+            {
+                return refuse("an activation or a license the rules do not give");
+            }
+            let marker = ClientObject::Registration(ClientRegistration {
+                matrix_digest: entry.matrix_digest,
+                matrix_file_root: entry.matrix_file_root,
+                matrix_file_len: entry.matrix_file_len,
+            })
+            .marker();
+            expected.insert(marker.0, position);
+        }
+        Ok(Self {
+            registry,
+            floor: Some(floor),
+            expected,
+            found: vec![Vec::new(); registry.len()],
+            unmatched: 0,
+        })
+    }
+
+    /// Observe one live slot of the snapshot state.
+    pub fn observe_slot(&mut self, owner: &Address, amount: u64, creation_id: u64) {
+        let Some(floor) = self.floor else {
+            return;
+        };
+        if client_object_marker_kind(owner) != Some(ClientObjectKind::Registration)
+            || crate::consensus::params::is_coinbase_creation_id(creation_id)
+            || creation_id <= floor
+        {
+            return;
+        }
+        match self.expected.get(&owner.0) {
+            Some(&index) => self.found[index].push((amount, creation_id)),
+            None => self.unmatched = self.unmatched.saturating_add(1),
+        }
+    }
+
+    /// Finish once every slot was observed. `alloc_counter_at` reads the
+    /// canonical header at a height (the headers the snapshot installs).
+    pub fn finish(
+        self,
+        mut alloc_counter_at: impl FnMut(u64) -> Option<u64>,
+    ) -> Result<(), ClientObjectError> {
+        let refuse = |reason| Err(ClientObjectError::SnapshotRegistry { reason });
+        if self.floor.is_none() {
+            return Ok(());
+        }
+        if self.unmatched != 0 {
+            return refuse("a registration marker of the state opens no entry");
+        }
+        for (entry, found) in self.registry.entries().iter().zip(&self.found) {
+            let [(amount, creation_id)] = found.as_slice() else {
+                return refuse("an entry without exactly one marker slot in the state");
+            };
+            if *amount != 0 {
+                return refuse("a marker slot carrying value");
+            }
+            let height = entry.registered_at;
+            let (Some(before), Some(after)) = (
+                alloc_counter_at(height.saturating_sub(1)),
+                alloc_counter_at(height),
+            ) else {
+                return refuse("a registration height without its headers");
+            };
+            if !(before < *creation_id && *creation_id <= after) {
+                return refuse("a marker slot not minted by the block the entry names");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The leaves the boundary terminal of a snapshot publishes against the
+/// registry it carries (M3.8): below the v1.5 height no client lanes and an
+/// empty registry; from it on, exactly the registry's digests, padded.
+pub fn check_snapshot_registry_leaves(
+    view: &TerminalClientView,
+    registry: &ClientRegistryState,
+    boundary_height: u64,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    if !rules.active_at(boundary_height) {
+        return if view.registry_leaves.is_none() && registry.is_empty() {
+            Ok(())
+        } else {
+            Err(ClientObjectError::UnexpectedClientLanes)
+        };
+    }
+    let leaves = view
+        .registry_leaves
+        .as_ref()
+        .ok_or(ClientObjectError::ClientLanesMissing)?;
+    if *leaves != registry_leaves_after(registry, &ClientObjectsEffect::default()) {
+        return Err(ClientObjectError::RegistryLeavesMismatch);
+    }
+    Ok(())
 }
 
 pub mod queue;
