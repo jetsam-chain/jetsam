@@ -150,6 +150,7 @@ impl PreparedBlockAttempt {
             parent_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             prepared_state_commit,
+            client_slot,
             ..
         } = template;
 
@@ -214,7 +215,10 @@ impl PreparedBlockAttempt {
             return Ok(None);
         }
 
-        let block = inner.into_block(0);
+        let mut block = inner.into_block(0);
+        // The v1.5 client objects travel in the body after the transactions;
+        // the relation does not read them (their markers are in the pages).
+        block.client_objects = client_slot.objects.clone();
         let payload_weight = block
             .to_bytes()
             .len()
@@ -266,6 +270,8 @@ impl PreparedBlockAttempt {
                 ghost,
                 runtime,
                 parent_terminal.as_ref(),
+                client_slot.carried.as_deref(),
+                client_slot.registry_leaves.as_deref(),
             )
             .map(PreparedWitness::B24),
             25 => jetsam_block::prepare_history_step_witness::<25>(
@@ -275,6 +281,8 @@ impl PreparedBlockAttempt {
                 ghost,
                 runtime,
                 parent_terminal.as_ref(),
+                client_slot.carried.as_deref(),
+                client_slot.registry_leaves.as_deref(),
             )
             .map(PreparedWitness::B25),
             255 => jetsam_block::prepare_history_step_witness::<255>(
@@ -284,6 +292,8 @@ impl PreparedBlockAttempt {
                 ghost,
                 runtime,
                 parent_terminal.as_ref(),
+                client_slot.carried.as_deref(),
+                client_slot.registry_leaves.as_deref(),
             )
             .map(PreparedWitness::B255),
             other => {

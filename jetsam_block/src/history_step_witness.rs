@@ -25,7 +25,7 @@ use jetsam_gkr::zk_authorization::ZkAuthorizationProof;
 use jetsam_gkr::{spine_inputs_from_body, MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH};
 use jetsam_poseidon2b::native::compress;
 use jetsam_recursive::acceptance::history_step::{
-    prepare_history_step_authorizations_in, prepare_history_step_for_pow,
+    prepare_history_step_authorizations_in,
     HistoryStepAuthorizationError, HistoryStepBlockInput, HistoryStepError, HistoryStepInputError,
     HistoryStepRuntime, HistoryStepTerminal, PreparedHistoryStepAuthorizations,
     PreparedHistoryStepForPow, PreparedHistoryStepGhostAuthorization,
@@ -282,6 +282,13 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
 /// template, including live authorization verification and the exact-state
 /// sibling frontier. This path is identical for coinbase-only and tx-bearing
 /// blocks.
+///
+/// `client` and `registry_leaves` are the v1.5 client slot (M3.8): the client
+/// proof the block carries, pre-passed when it was received (`None`: the
+/// ghost), and the registry leaves it publishes when it registers a client
+/// (`None`: the parent's). Both `None` under the launch and v1.3 relations,
+/// where this is exactly the released preparation.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_history_step_witness<const TIER: usize>(
     template: Block,
     context: HistoryStepPreparationContext<'_>,
@@ -289,6 +296,8 @@ pub fn prepare_history_step_witness<const TIER: usize>(
     ghost_authorization: &PreparedHistoryStepGhostAuthorization,
     runtime: &HistoryStepRuntime,
     parent_terminal: Option<&HistoryStepTerminal>,
+    client: Option<&jetsam_recursive::acceptance::history_step::PreparedHistoryStepClient>,
+    registry_leaves: Option<&[[u8; 32]]>,
 ) -> Result<PreparedHistoryStepWitness<TIER>, HistoryStepWitnessError> {
     let native = prepare_native_history_step::<TIER>(
         template,
@@ -322,7 +331,14 @@ pub fn prepare_history_step_witness<const TIER: usize>(
         &template.header,
         &parent_header,
     )?;
-    let prepared_history_step = prepare_history_step_for_pow(runtime, parent_terminal, current)?;
+    let prepared_history_step =
+        jetsam_recursive::acceptance::history_step::prepare_history_step_for_pow_with_client(
+            runtime,
+            parent_terminal,
+            current,
+            client,
+            registry_leaves,
+        )?;
     Ok(PreparedHistoryStepWitness {
         generation,
         template,

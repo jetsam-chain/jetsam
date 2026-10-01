@@ -83,6 +83,10 @@ pub struct BlockTemplate {
     /// One-shot post-state/undo capability minted by the same canonical
     /// builder that fixed `inner.state_root`.
     pub(crate) prepared_state_commit: jetsam_chain::consensus::template::PreparedBlockStateCommit,
+    /// The v1.5 client slot (M3.8): the block's client objects, the client
+    /// proof it carries and the registry leaves it publishes. Empty below
+    /// the v1.5 height.
+    pub client_slot: crate::client_slot::TemplateClientSlot,
 }
 
 impl BlockTemplate {
@@ -99,7 +103,7 @@ impl BlockTemplate {
         Block {
             header,
             transactions: self.inner.all_txs(),
-            client_objects: Vec::new(),
+            client_objects: self.client_slot.objects.clone(),
         }
     }
 
@@ -131,6 +135,8 @@ pub struct TemplateChainSnapshot {
     pub parent_previous_tx_epoch_anchor_header: Option<BlockHeader>,
     pub child_previous_tx_epoch_anchor_header: Option<BlockHeader>,
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
+    /// The v1.5 client registry of the parent, on its branch.
+    pub client_registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
     store: MdbxStore,
 }
 
@@ -239,6 +245,7 @@ impl TemplateChainSnapshot {
             parent_previous_tx_epoch_anchor_header,
             child_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
+            client_registry: ctx.client_registry().clone(),
             store: ctx.store.clone(),
         })
     }
@@ -327,11 +334,26 @@ impl TemplateChainSnapshot {
 /// Builds `BlockTemplate` from a chain snapshot and top-fee mempool txs.
 pub struct TemplateBuilder {
     pub mempool: AsyncMempool,
+    /// What the node holds for v1.5 client slots (M3.8): received client
+    /// proofs and held registrations, with their payments.
+    pub client_source: Option<crate::client_slot::SharedMinerClientSource>,
 }
 
 impl TemplateBuilder {
     pub fn new(mempool: AsyncMempool) -> Self {
-        Self { mempool }
+        Self {
+            mempool,
+            client_source: None,
+        }
+    }
+
+    /// Offer the node's client objects to the templates this builder makes.
+    pub fn with_client_source(
+        mut self,
+        client_source: Option<crate::client_slot::SharedMinerClientSource>,
+    ) -> Self {
+        self.client_source = client_source;
+        self
     }
 
     /// Build a B25-default template from a pre-captured chain snapshot.
@@ -421,6 +443,65 @@ impl TemplateBuilder {
                 .map(block_id)
                 .unwrap_or(user_epoch_anchor),
         };
+        // v1.5 client slot (M3.8): the paying transactions of the client
+        // objects this node holds are offered to the same fee selection. They
+        // take their page budget first; mempool groups touching their slots
+        // are left out (a conflicting apply would abort the whole template).
+        let client_rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let mut offered = crate::client_slot::OfferedClientObjects::default();
+        let mut held_payments: Vec<jetsam_tx::PagedSpendIntent> = Vec::new();
+        if client_rules.active_at(child_height) {
+            if let Some(source) = &self.client_source {
+                let anchor_ok =
+                    |anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation);
+                if let Some(candidate) = source.best_candidate(
+                    &parent,
+                    &snapshot.client_registry,
+                    &client_rules,
+                    &anchor_ok,
+                ) {
+                    offered.objects.push(
+                        jetsam_chain::consensus::client_objects::ClientObject::Submission(
+                            candidate.submission,
+                        ),
+                    );
+                    offered.candidate =
+                        Some((candidate.submission, std::sync::Arc::clone(&candidate.payload)));
+                    held_payments.push(candidate.payment);
+                }
+                for (registration, payment) in source
+                    .held_registrations(&snapshot.client_registry)
+                    .into_iter()
+                    .filter(|(_, payment)| {
+                        payment
+                            .pages
+                            .first()
+                            .is_some_and(|page| anchor_ok(&page.body.epoch_anchor))
+                    })
+                    .take(jetsam_chain::consensus::client_objects::MAX_BLOCK_CLIENT_REGISTRATIONS)
+                {
+                    offered.objects.push(
+                        jetsam_chain::consensus::client_objects::ClientObject::Registration(
+                            registration,
+                        ),
+                    );
+                    held_payments.push(payment);
+                }
+            }
+        }
+        let held_pages: usize = held_payments.iter().map(|payment| payment.pages.len()).sum();
+        let held_slots: HashSet<u32> = held_payments
+            .iter()
+            .flat_map(|payment| payment.pages.iter())
+            .flat_map(|page| {
+                page.body
+                    .live_inputs()
+                    .map(|(_, input)| input.slot_index)
+                    .chain(page.body.live_outputs().map(|(_, output)| output.slot_index))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let max_user_pages = max_user_pages.saturating_sub(held_pages);
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
         // while cloning only the authorization bundles selected for this block.
@@ -433,6 +514,21 @@ impl TemplateBuilder {
                 .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
                 .await
         };
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| {
+                held_slots.is_empty()
+                    || !entry.pages.iter().any(|page| {
+                        page.body
+                            .live_inputs()
+                            .any(|(_, input)| held_slots.contains(&input.slot_index))
+                            || page
+                                .body
+                                .live_outputs()
+                                .any(|(_, output)| held_slots.contains(&output.slot_index))
+                    })
+            })
+            .collect();
         // Keep each authorization paired with its indivisible logical group;
         // flatten only the public pages passed into the chain template.
         let (authorization_bytes, groups): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
@@ -457,11 +553,23 @@ impl TemplateBuilder {
                 .zip(groups.iter().map(|(logical_txid, _)| *logical_txid))
                 .map(|(proof, logical_txid)| (logical_txid, proof))
                 .collect();
-        let txs: Vec<_> = groups
+        let mut txs: Vec<_> = groups
             .into_iter()
             .flat_map(|(_, pages)| pages)
             .map(|page| jetsam_tx::Transaction::new(page.body))
             .collect();
+        let mempool_txs = txs.clone();
+        for payment in &held_payments {
+            if let Ok(spend) = jetsam_tx::validate_paged_spend(&payment.pages) {
+                proof_by_hash.insert(spend.logical_txid, Some(payment.authorization_bytes.clone()));
+                txs.extend(
+                    payment
+                        .pages
+                        .iter()
+                        .map(|page| jetsam_tx::Transaction::new(page.body.clone())),
+                );
+            }
+        }
 
         // Fault in only segments referenced by the admitted transaction set.
         // The canonical snapshot itself remains metadata-only, so template
@@ -475,30 +583,56 @@ impl TemplateBuilder {
             tracing::warn!(err = %error, "template coinbase-reuse hydration failed");
             return None;
         }
+        let offers_clients = !held_payments.is_empty();
         let template_cpu_result = install_history_step_phase_cpu(|| {
-            match jetsam_chain::consensus::template::build_node_owned_block_template(
-                &parent,
-                &state,
-                finalized_active_counts,
-                txs,
-                miner_address,
-                timestamp,
-                difficulty_target,
-            ) {
-                Ok(inner) => Some(inner),
+            let build = |txs| {
+                jetsam_chain::consensus::template::build_node_owned_block_template(
+                    &parent,
+                    &state,
+                    finalized_active_counts,
+                    txs,
+                    miner_address,
+                    timestamp,
+                    difficulty_target,
+                )
+            };
+            match build(txs) {
+                Ok(inner) => Some((inner, true)),
+                // A held client payment no longer applies (spent, or its
+                // slot taken): the block goes out without the client objects
+                // rather than not at all.
+                Err(error) if offers_clients => {
+                    tracing::info!(err = ?error, "template without its held client payments");
+                    match build(mempool_txs) {
+                        Ok(inner) => Some((inner, false)),
+                        Err(error) => {
+                            tracing::warn!(err = ?error, "template build failed");
+                            None
+                        }
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(err = ?error, "template build failed");
                     None
                 }
             }
         });
-        let (inner, prepared_state_commit) = match template_cpu_result {
+        let ((inner, prepared_state_commit), with_clients) = match template_cpu_result {
             Ok(Some(built)) => built,
             Ok(None) => return None,
             Err(error) => {
                 tracing::error!(%error, "template CPU phase failed");
                 return None;
             }
+        };
+        let client_slot = if with_clients {
+            crate::client_slot::client_slot_of_selection(
+                &inner.txs,
+                &offered,
+                &snapshot.client_registry,
+            )
+        } else {
+            crate::client_slot::TemplateClientSlot::default()
         };
 
         let selected_stream =
@@ -528,6 +662,7 @@ impl TemplateBuilder {
             parent_previous_tx_epoch_anchor_header: snapshot.parent_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes: snapshot.parent_history_step_terminal_bytes,
             prepared_state_commit,
+            client_slot,
         })
     }
 }

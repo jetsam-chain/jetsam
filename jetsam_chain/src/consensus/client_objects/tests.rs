@@ -1611,3 +1611,50 @@ fn a_forged_snapshot_registry_is_refused() {
     // A non-empty registry at a boundary below the v1.5 height.
     assert!(check_snapshot(&snapshot_registry(&[first]), ACTIVATION - 1, &slots[..1]).is_err());
 }
+
+/// M3.8: what a node checks of a registration handed to it before holding
+/// it for its miner — the same rules the block will be judged by: exactly
+/// one marker, of zero value, opening this registration, and the license
+/// paid to every destination of D5.
+#[test]
+fn a_registration_payment_is_checked_before_it_is_held() {
+    let object = registration(0x41);
+    let marker = ClientObject::Registration(object).marker();
+    assert_eq!(
+        check_registration_payment(&paid_registration(10, object), &object, &burn_rules()),
+        Ok(())
+    );
+    let unpaid = logical(10, PAYER, &[(marker, 0)], required_fee(1, 1));
+    assert!(matches!(
+        check_registration_payment(&unpaid, &object, &burn_rules()),
+        Err(ClientObjectError::LicenseMissing { .. })
+    ));
+    let other = registration(0x42);
+    assert_eq!(
+        check_registration_payment(&paid_registration(10, other), &object, &burn_rules()),
+        Err(ClientObjectError::ObjectsDoNotMatchMarkers)
+    );
+    let valued = logical(
+        10,
+        PAYER,
+        &[(CLIENT_LICENSE_BURN_ADDRESS, LICENSE), (marker, 1)],
+        required_fee(1, 2),
+    );
+    assert!(matches!(
+        check_registration_payment(&valued, &object, &burn_rules()),
+        Err(ClientObjectError::MarkerCarriesValue { .. })
+    ));
+    let mut bad = object;
+    bad.matrix_file_len = 0;
+    let bad_marker = ClientObject::Registration(bad).marker();
+    let pays_bad = logical(
+        10,
+        PAYER,
+        &[(CLIENT_LICENSE_BURN_ADDRESS, LICENSE), (bad_marker, 0)],
+        required_fee(1, 2),
+    );
+    assert!(matches!(
+        check_registration_payment(&pays_bad, &bad, &burn_rules()),
+        Err(ClientObjectError::MatrixFileLength { .. })
+    ));
+}

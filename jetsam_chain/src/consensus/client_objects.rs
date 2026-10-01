@@ -1125,6 +1125,55 @@ fn check_license_paid(
     Ok(())
 }
 
+/// The checks of a registration's paying transaction `pages` a node runs
+/// before holding it for its miner (M3.8), against the rules the block will
+/// be judged by: the registration itself is admissible (non-null `D` and file
+/// root, a file length in bounds), the transaction carries exactly one marker,
+/// of zero value, opening this registration, and pays the license to every
+/// destination of D5. What depends on the chain (registry full, `D` already
+/// registered, the transaction's inputs) is checked by the block.
+pub fn check_registration_payment(
+    pages: &[jetsam_tx::Transaction],
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    if registration.matrix_digest == [0u8; 32] {
+        return Err(ClientObjectError::NullMatrixDigest);
+    }
+    if registration.matrix_file_root == [0u8; 32] {
+        return Err(ClientObjectError::NullMatrixFileRoot);
+    }
+    if registration.matrix_file_len == 0
+        || registration.matrix_file_len > rules.max_matrix_file_bytes
+    {
+        return Err(ClientObjectError::MatrixFileLength {
+            len: registration.matrix_file_len,
+            max: rules.max_matrix_file_bytes,
+        });
+    }
+    let marker = ClientObject::Registration(*registration).marker();
+    let mut markers = pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs())
+        .filter(|(_, output)| client_object_marker_kind(&output.owner).is_some());
+    match (markers.next(), markers.next()) {
+        (Some((_, output)), None) if output.owner == marker => {
+            if output.amount != 0 {
+                return Err(ClientObjectError::MarkerCarriesValue { group: 0 });
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(ClientObjectError::MultipleMarkersInTransaction { group: 0 })
+        }
+        _ => return Err(ClientObjectError::ObjectsDoNotMatchMarkers),
+    }
+    check_license_paid(
+        pages,
+        rules.destination.split(rules.license_micro),
+        rules.destination,
+    )
+}
+
 /// Upper bound of one client proof on the wire: the fixed, unshared length
 /// of the pinned client form (m = 22, decision D2), as computed by
 /// `history_step_client_proof_max_wire_bytes` (pinned against it by

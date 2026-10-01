@@ -241,6 +241,9 @@ pub struct BlockMiner {
     /// corresponding mempool/wallet reload. Library-only miners may leave it
     /// unset when no external state-replacement path exists.
     chain_operation_gate: Option<ChainOperationGate>,
+    /// The node's v1.5 client objects (M3.8): offered to every template,
+    /// told of every block this miner commits.
+    client_source: Option<crate::client_slot::SharedMinerClientSource>,
 }
 
 impl BlockMiner {
@@ -290,6 +293,7 @@ impl BlockMiner {
             on_block_applied: None,
             payout_resolver: None,
             chain_operation_gate: None,
+            client_source: None,
         };
         (miner, rx)
     }
@@ -311,6 +315,12 @@ impl BlockMiner {
     /// are captured/updated, never while HistoryStep proving or PoW runs.
     pub fn set_chain_operation_gate(&mut self, gate: ChainOperationGate) {
         self.chain_operation_gate = Some(gate);
+    }
+
+    /// Offer the node's v1.5 client objects (held client proofs and
+    /// registrations, with their payments) to every template.
+    pub fn set_client_source(&mut self, source: crate::client_slot::SharedMinerClientSource) {
+        self.client_source = Some(source);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -375,7 +385,8 @@ impl BlockMiner {
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.
     /// Never returns under normal operation.
     pub async fn run(mut self) {
-        let builder = TemplateBuilder::new(self.mempool.clone());
+        let builder =
+            TemplateBuilder::new(self.mempool.clone()).with_client_source(self.client_source.clone());
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
@@ -1080,6 +1091,9 @@ impl BlockMiner {
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
+        if let Some(source) = &self.client_source {
+            source.on_block_committed(block);
+        }
         drop(chain_operation);
 
         Ok(committed)
