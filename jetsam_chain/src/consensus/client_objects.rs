@@ -1154,5 +1154,7 @@ pub fn check_carried_client(
     Ok(())
 }
 
+pub mod queue;
+
 #[cfg(test)]
 mod tests;
