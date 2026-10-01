@@ -43,6 +43,7 @@ pub mod validation;
 pub mod wire_limits;
 
 pub mod allocator;
+pub mod client_objects;
 pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;
@@ -122,7 +123,8 @@ pub use timestamps::{
     validate_timestamp,
 };
 pub use validation::{
-    validate_block_checks, validate_block_checks_timeless, validate_block_consensus,
+    validate_block_checks, validate_block_checks_timeless,
+    validate_block_checks_with_license_dividend, validate_block_consensus,
     validate_block_resource_preflight, validate_mandatory_coinbase, AnchorInfo,
     BlockResourcePreflight,
 };
@@ -192,6 +194,15 @@ pub enum ConsensusError {
     BadStateRoot,
     /// Generic shape / length mismatch.
     ShapeMismatch(String),
+    /// v1.5: the block's client objects (registrations, submissions) break a
+    /// rule of `client_objects`.
+    ClientObject(client_objects::ClientObjectError),
+}
+
+impl From<client_objects::ClientObjectError> for ConsensusError {
+    fn from(error: client_objects::ClientObjectError) -> Self {
+        Self::ClientObject(error)
+    }
 }
 
 impl std::fmt::Display for ConsensusError {

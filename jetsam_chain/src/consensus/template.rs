@@ -109,6 +109,7 @@ impl BlockTemplate {
                 alloc_counter,
             },
             transactions,
+            client_objects: Vec::new(),
         }
     }
 
@@ -1148,6 +1149,7 @@ mod tests {
         let winning = crate::block::Block {
             header: first.to_pow_header(0),
             transactions: first.all_txs(),
+            client_objects: Vec::new(),
         };
         crate::block::apply_block(&mut state, &winning).unwrap();
         assert_eq!(state.state.log_slots(), 9);
@@ -1161,6 +1163,7 @@ mod tests {
         let losing = crate::block::Block {
             header: second.to_pow_header(0),
             transactions: second.all_txs(),
+            client_objects: Vec::new(),
         };
         let winning_root = state.cached_state_root();
         assert!(crate::block::apply_block(&mut state, &losing).is_err());
@@ -1184,6 +1187,7 @@ mod tests {
         let next_block = crate::block::Block {
             header: next.to_pow_header(0),
             transactions: next.all_txs(),
+            client_objects: Vec::new(),
         };
         crate::block::apply_block(&mut state, &next_block).unwrap();
         assert_eq!(state.state.log_slots(), 9);

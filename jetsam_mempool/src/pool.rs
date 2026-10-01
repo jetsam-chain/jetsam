@@ -879,6 +879,17 @@ fn run_admission_checks(
 
     validate_paged_spend(pages)
         .map_err(|error| SubmitError::MalformedIntent(format!("PagedSpend: {error}")))?;
+    // v1.5: a spend from the license addresses or a marker owner can never be
+    // mined, and a transaction paying a client object is mined only with its
+    // object (it does not travel as a plain transaction). Inert before v1.5.
+    jetsam_chain::consensus::client_objects::check_plain_transaction(
+        pages,
+        st.view.tip_height.saturating_add(1),
+        &jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS,
+    )
+    .map_err(|error| {
+        SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::ClientObject(error))
+    })?;
     if spend.epoch_anchor == [0u8; 32] {
         return Err(SubmitError::Consensus(
             jetsam_chain::consensus::ConsensusError::BadEpochAnchor,

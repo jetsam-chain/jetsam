@@ -1785,6 +1785,7 @@ mod tests {
                 state.circulating_supply_micro_jtm,
                 &genesis_meta,
                 true,
+                None,
             )
             .unwrap();
         let first = export_snapshot_generation(&store, exports.path(), 0, None).unwrap();
@@ -1814,6 +1815,7 @@ mod tests {
         let block = crate::Block {
             header: child,
             transactions: vec![coinbase],
+            client_objects: Vec::new(),
         };
         let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
             1,
@@ -1856,6 +1858,7 @@ mod tests {
                 state.circulating_supply_micro_jtm,
                 &child_meta,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1908,6 +1911,7 @@ mod tests {
         let grandchild_block = crate::Block {
             header: grandchild,
             transactions: block.transactions.clone(),
+            client_objects: Vec::new(),
         };
         let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
             2,
@@ -1954,6 +1958,7 @@ mod tests {
                 changed_state.circulating_supply_micro_jtm,
                 &grandchild_meta,
                 false,
+                None,
             )
             .unwrap();
         let bridged = export_snapshot_generation(&store, exports.path(), 1, Some(&second)).unwrap();

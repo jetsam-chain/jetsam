@@ -7825,6 +7825,7 @@ mod tests {
         jetsam_chain::block::Block {
             header,
             transactions,
+            client_objects: Vec::new(),
         }
     }
 

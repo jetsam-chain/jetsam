@@ -110,6 +110,10 @@ const KEY_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK: &[u8] = &[2u8];
 const KEY_VERIFIED_SUFFIX_AUTHORITY: &[u8] = &[3u8];
+/// v1.5 client registry of the canonical tip, in `T_STATE_META`. Written
+/// only under an armed v1.5 clock, atomically with the block or reorg that
+/// produced it.
+const KEY_CLIENT_REGISTRY: &[u8] = b"client_registry";
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -1874,6 +1878,21 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_state_meta(&b)))
     }
 
+    /// The v1.5 client registry committed with the tip, if one was ever
+    /// written (never under the dormant clock).
+    pub fn get_client_registry(
+        &self,
+    ) -> Result<Option<crate::consensus::client_objects::ClientRegistryState>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_STATE_META))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_CLIENT_REGISTRY)?;
+        raw.map(|bytes| {
+            crate::consensus::client_objects::ClientRegistryState::decode(&bytes)
+                .map_err(|_| StoreError::Decode("client registry is malformed"))
+        })
+        .transpose()
+    }
+
     pub fn get_circulating_supply(&self) -> Result<Option<u128>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_STATE_META))?;
@@ -2880,6 +2899,12 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
+        // A snapshot does not carry the v1.5 client registry (yet): a stale
+        // one from the replaced state must not survive it.
+        let stale_registry: Option<Vec<u8>> = txn.get(&state_meta_tbl, KEY_CLIENT_REGISTRY)?;
+        if stale_registry.is_some() {
+            txn.del(&state_meta_tbl, KEY_CLIENT_REGISTRY, None)?;
+        }
         prune_history_step_proof_objects(&txn, tip_header.height)?;
         txn.commit()?;
         Ok(hot_state)
@@ -3067,6 +3092,7 @@ impl MdbxStore {
         circulating_supply_micro_jtm: u128,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
+        client_registry: Option<&crate::consensus::client_objects::ClientRegistryState>,
     ) -> Result<(), StoreError> {
         if dirty_segments.len() != dirty_segment_summaries.len()
             || dirty_segments.iter().zip(dirty_segment_summaries).any(
@@ -3372,6 +3398,14 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
+        if let Some(registry) = client_registry {
+            txn.put(
+                &meta_tbl,
+                KEY_CLIENT_REGISTRY,
+                registry.encode(),
+                WriteFlags::empty(),
+            )?;
+        }
 
         // --- 7. BlockUndoLog ---
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
@@ -3581,6 +3615,7 @@ impl MdbxStore {
         replacement: &[StagedAcceptedBlockCommit],
         circulating_supply_micro_jtm: u128,
         consensus_meta: &ConsensusMeta,
+        client_registry: Option<&crate::consensus::client_objects::ClientRegistryState>,
     ) -> Result<(), StoreError> {
         if final_dirty_segments.len() != final_dirty_segment_summaries.len()
             || final_dirty_segments
@@ -4050,6 +4085,14 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
+        if let Some(registry) = client_registry {
+            txn.put(
+                &meta_tbl,
+                KEY_CLIENT_REGISTRY,
+                registry.encode(),
+                WriteFlags::empty(),
+            )?;
+        }
         // Rebuild the owner accelerator from the exact post-reorg segment
         // table. Clear is an MDBX operation (no all-key Vec), and records are
         // written as each single decoded segment is visited (no owner map).
@@ -4288,6 +4331,7 @@ mod tests {
         crate::Block {
             header,
             transactions: vec![transaction],
+            client_objects: Vec::new(),
         }
     }
 
@@ -4358,6 +4402,7 @@ mod tests {
                 0,
                 &meta,
                 false,
+                None,
             )
             .unwrap();
         (genesis, meta)
@@ -4393,6 +4438,7 @@ mod tests {
                 state.circulating_supply_micro_jtm,
                 &meta,
                 true,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4757,6 +4803,7 @@ mod tests {
                 0,
                 &meta,
                 false,
+                None,
             )
             .unwrap();
         meta
@@ -4804,6 +4851,7 @@ mod tests {
                 0,
                 &meta,
                 false,
+                None,
             )
             .unwrap();
 
@@ -5029,6 +5077,7 @@ mod tests {
                 0,
                 &meta,
                 false,
+                None,
             )
             .is_err());
         assert_eq!(

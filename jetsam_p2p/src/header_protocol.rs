@@ -470,6 +470,7 @@ mod tests {
         let block = Block {
             header,
             transactions: Vec::new(),
+            client_objects: Vec::new(),
         };
         // The terminal's wire version is a property of its own height, and the
         // activation height that decides it differs between networks: writing

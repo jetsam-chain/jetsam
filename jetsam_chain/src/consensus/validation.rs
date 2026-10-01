@@ -138,6 +138,24 @@ pub fn validate_block_resource_preflight(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+    if !block.client_objects.is_empty() {
+        let rules = crate::consensus::client_objects::ClientObjectRules::current();
+        if !rules.active_at(block.header.height) {
+            return Err(ConsensusError::ClientObject(
+                crate::consensus::client_objects::ClientObjectError::ObjectsBeforeActivation,
+            ));
+        }
+        let wire_len = block.canonical_wire_len().map_err(|_| {
+            ConsensusError::ShapeMismatch("block wire length overflows".into())
+        })?;
+        if wire_len > crate::consensus::wire_limits::MAX_BLOCK_BYTES {
+            return resource_limit(
+                "block_bytes",
+                wire_len,
+                crate::consensus::wire_limits::MAX_BLOCK_BYTES,
+            );
+        }
+    }
     if !(1..=32).contains(&block.header.log_slots) {
         return Err(ConsensusError::ShapeMismatch(
             "block log_slots is outside the u32 slot domain".into(),
@@ -333,6 +351,33 @@ pub fn validate_block_checks(
         anchor,
         Some(local_time),
         true,
+        0,
+    )
+}
+
+/// [`validate_block_checks`] with the coinbase ceiling raised by the v1.5
+/// license dividend owed to this block's miner
+/// (`ClientRegistryState::license_dividend_at`): zero below the v1.5 height
+/// and under the `Burn` and `Treasury` destinations, so the checks are then
+/// exactly [`validate_block_checks`].
+pub fn validate_block_checks_with_license_dividend(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    finalized_active_counts: &[u64],
+    local_time: u64,
+    anchor: &AnchorInfo,
+    license_dividend: u64,
+) -> Result<(), ConsensusError> {
+    validate_block_checks_inner(
+        block,
+        parent,
+        prev_timestamps,
+        finalized_active_counts,
+        anchor,
+        Some(local_time),
+        true,
+        license_dividend,
     )
 }
 
@@ -359,6 +404,7 @@ pub fn validate_block_checks_template(
         anchor,
         Some(local_time),
         false,
+        0,
     )
 }
 
@@ -377,6 +423,7 @@ pub fn validate_block_checks_timeless(
         anchor,
         None,
         true,
+        0,
     )
 }
 
@@ -388,6 +435,7 @@ fn validate_block_checks_inner(
     anchor: &AnchorInfo,
     local_time: Option<u64>,
     check_pow: bool,
+    license_dividend: u64,
 ) -> Result<(), ConsensusError> {
     // Bound the raw semantic surface before any O(n) consensus scan.  This is
     // also the first line of defence for direct in-memory callers that did not
@@ -429,6 +477,16 @@ fn validate_block_checks_inner(
     validate_block_slot_conflicts(&block.transactions)?;
     validate_tx_consensus(&block.transactions[0])?;
     let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
+    validate_coinbase_ceiling(block, claimable_fee_sum, license_dividend)
+}
+
+/// The coinbase may claim the miner subsidy, the claimable fees, and the v1.5
+/// license dividend owed to this block (zero outside the `Miners` variants).
+pub(crate) fn validate_coinbase_ceiling(
+    block: &Block,
+    claimable_fee_sum: u128,
+    license_dividend: u64,
+) -> Result<(), ConsensusError> {
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
             let cb_value = cb
@@ -441,7 +499,7 @@ fn validate_block_checks_inner(
             let max_allowed = max_coinbase_value_from_claimable_fee_sum(
                 block.header.height,
                 claimable_fee_sum,
-            );
+            ) + u128::from(license_dividend);
             if u128::from(cb_value) > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }
@@ -650,6 +708,7 @@ mod tests {
         let block = Block {
             header: header(1),
             transactions,
+            client_objects: Vec::new(),
         };
         let counts = validate_block_resource_preflight(&block).unwrap();
         assert_eq!(counts.user_page_count, 255);
@@ -668,6 +727,7 @@ mod tests {
         let block = Block {
             header: header(1),
             transactions,
+            client_objects: Vec::new(),
         };
         assert_eq!(
             validate_block_resource_preflight(&block),
@@ -679,6 +739,7 @@ mod tests {
         let block = Block {
             header: header(1),
             transactions,
+            client_objects: Vec::new(),
         };
         assert!(matches!(
             validate_block_resource_preflight(&block),
@@ -695,6 +756,7 @@ mod tests {
         let mut block = Block {
             header: header(1),
             transactions: vec![coinbase(&parent)],
+            client_objects: Vec::new(),
         };
         assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
 
@@ -719,6 +781,7 @@ mod tests {
         let block = Block {
             header: header(DEVELOPMENT_PAYOUT_INTERVAL_90S),
             transactions: vec![coinbase(&parent), development_payout(&parent, amount)],
+            client_objects: Vec::new(),
         };
         assert_eq!(amount, share * DEVELOPMENT_PAYOUT_INTERVAL_90S);
         assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
@@ -746,11 +809,85 @@ mod tests {
     }
 
     #[test]
+    fn the_license_dividend_raises_the_coinbase_ceiling_exactly() {
+        let parent = header(0);
+        let mut block = Block {
+            header: header(1),
+            transactions: vec![coinbase(&parent)],
+            client_objects: Vec::new(),
+        };
+        let ceiling = max_coinbase_value_from_claimable_fee_sum(1, 5) as u64;
+        block.transactions[0].body.outputs[0].amount = ceiling + 7;
+        assert_eq!(validate_coinbase_ceiling(&block, 5, 7), Ok(()));
+        assert_eq!(
+            validate_coinbase_ceiling(&block, 5, 6),
+            Err(ConsensusError::InflatedCoinbase)
+        );
+        assert_eq!(
+            validate_coinbase_ceiling(&block, 5, 0),
+            Err(ConsensusError::InflatedCoinbase)
+        );
+        block.transactions[0].body.outputs[0].amount = ceiling;
+        assert_eq!(validate_coinbase_ceiling(&block, 5, 0), Ok(()));
+    }
+
+    #[test]
+    fn client_objects_exist_only_at_v1_5_heights_and_within_the_block_cap() {
+        use crate::consensus::client_objects::{
+            test_rules, ClientObject, ClientObjectError, ClientObjectRules, ClientSubmission,
+        };
+        let parent = header(0);
+        let mut block = Block {
+            header: header(1),
+            transactions: vec![coinbase(&parent)],
+            client_objects: vec![ClientObject::Submission(ClientSubmission {
+                matrix_digest: [1u8; 32],
+                io_commitment: [2u8; 32],
+            })],
+        };
+        if ClientObjectRules::CONSENSUS.activation_height.is_none() {
+            assert_eq!(
+                validate_block_resource_preflight(&block),
+                Err(ConsensusError::ClientObject(
+                    ClientObjectError::ObjectsBeforeActivation
+                ))
+            );
+        }
+        let _armed = test_rules::install(ClientObjectRules {
+            activation_height: Some(2),
+            ..ClientObjectRules::CONSENSUS
+        });
+        assert_eq!(
+            validate_block_resource_preflight(&block),
+            Err(ConsensusError::ClientObject(
+                ClientObjectError::ObjectsBeforeActivation
+            ))
+        );
+        block.header.height = 2;
+        assert!(validate_block_resource_preflight(&block).is_ok());
+
+        // A full block leaves no room for a section.
+        block
+            .transactions
+            .extend((0..255).map(|index| user(index, 1, 1)));
+        assert!(matches!(
+            validate_block_resource_preflight(&block),
+            Err(ConsensusError::BlockResourceLimitExceeded {
+                limit: "block_bytes",
+                ..
+            })
+        ));
+        block.client_objects.clear();
+        assert!(validate_block_resource_preflight(&block).is_ok());
+    }
+
+    #[test]
     fn unscheduled_development_payout_is_rejected() {
         let parent = header(0);
         let block = Block {
             header: header(1),
             transactions: vec![coinbase(&parent), development_payout(&parent, 1)],
+            client_objects: Vec::new(),
         };
         assert_eq!(
             validate_mandatory_coinbase(&block, &parent),

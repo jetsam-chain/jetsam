@@ -517,6 +517,7 @@ mod tests {
                 alloc_counter,
             },
             transactions,
+            client_objects: Vec::new(),
         }
     }
 
