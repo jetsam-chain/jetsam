@@ -28,7 +28,8 @@ use jetsam_ivc_core::verifier::verify_field_c1_deferred_matrix_with_post_commit_
 use jetsam_recursive::{
     encode_history_step_client_proof, history_step_bank_io_layout_for,
     history_step_client_proof_max_wire_bytes, parse_history_step_client_lanes,
-    HistoryStepChainClients, HistoryStepClientForm, HistoryStepClientRegistry,
+    HistoryStepChainClients, HistoryStepClientCarry, HistoryStepClientForm,
+    HistoryStepClientRegistry,
     HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
@@ -261,13 +262,17 @@ fn run() -> Result<(), String> {
         .ok_or("client lanes")?;
     let mut block_io = vec![F128::ZERO; lanes.end()];
     prepared
-        .install_lanes(&lanes, &mut block_io)
+        .install_lanes(
+            &lanes,
+            &HistoryStepClientCarry::empty(&form),
+            &chain.registry().leaves(),
+            &mut block_io,
+        )
         .map_err(|error| error.to_string())?;
     for sample in 0..samples {
         let started = Instant::now();
         let claim = parse_history_step_client_lanes(&lanes, &block_io)
-            .map_err(|error| error.to_string())?
-            .ok_or("absent client")?;
+            .map_err(|error| error.to_string())?;
         chain
             .check_claim(&claim)
             .map_err(|error| format!("node check: {error}"))?;

@@ -283,11 +283,22 @@ impl HistoryStepClientParts {
 /// (v1.5), `None` for the launch and v1.3 relations.
 type ClientSlot = Option<HistoryStepClientParts>;
 
-/// The client a block carries, if any.
-type ClientInput<'a> = Option<&'a super::client_arm::PreparedHistoryStepClient>;
+/// The client a v1.5 block carries, if any, and the registry leaves it
+/// publishes (`None`: the parent's, i.e. no registration in this block).
+#[derive(Clone, Copy, Default)]
+struct ClientInput<'a> {
+    client: Option<&'a super::client_arm::PreparedHistoryStepClient>,
+    registry: Option<&'a [jetsam_ivc_core::merkle::Hash]>,
+}
+
+impl ClientInput<'_> {
+    fn is_none(&self) -> bool {
+        self.client.is_none() && self.registry.is_none()
+    }
+}
 
 fn no_client<'a>() -> ClientInput<'a> {
-    None
+    ClientInput::default()
 }
 
 /// The client slot `generation`'s relation carries: the canonical parts under
@@ -2185,11 +2196,13 @@ pub struct PreparedHistoryStepForPow<const TIER: usize> {
     parent_header: BlockHeader,
 }
 
-/// The prepared client arm of a client-bearing runtime, its IO lanes
-/// installed into the block's output `io` (v1.5).
+/// The prepared client arm of a v1.5 runtime, its IO lanes installed into
+/// the block's output `io`. `parent_io` is the parent proof's public IO, or
+/// `None` at a base, whose carried lanes start empty.
 fn prepare_client_slot<'r>(
     runtime: &'r HistoryStepRuntime,
     client: ClientInput<'_>,
+    parent_io: Option<&[F128]>,
     io: &mut [F128],
 ) -> Result<
     Option<(
@@ -2202,12 +2215,26 @@ fn prepare_client_slot<'r>(
     match (runtime.bank().client_form(), runtime.bank().layout().client) {
         (None, None) if client.is_none() => Ok(None),
         (Some(form), Some(lanes)) => {
-            // A present client comes pre-passed (on reception); only the
-            // ghost of the form is built here.
-            let prepared = match client {
-                Some(client) if client.is_for(form) => client.arm().clone(),
+            // The carry this block starts from: the parent's client lanes,
+            // or nothing at a base.
+            let parent = match parent_io {
+                Some(parent_io) => super::client_arm::HistoryStepClientCarry::from_claim(
+                    &crate::acceptance::history_step_bank::parse_history_step_client_lanes(
+                        &lanes, parent_io,
+                    )?,
+                ),
+                None => super::client_arm::HistoryStepClientCarry::empty(form),
+            };
+            let registry = match client.registry {
+                Some(registry) => registry.to_vec(),
+                None => parent.registry.clone(),
+            };
+            // A present client comes pre-passed (on reception); its fold into
+            // the parent's lane of its entry, and the ghost, are built here.
+            let prepared = match client.client {
+                Some(client) if client.is_for(form) => client.arm_on(&parent, &registry)?,
                 Some(_) => return Err(HistoryStepError::ClientForm),
-                None => super::client_arm::prepare_client_arm(form, None)?,
+                None => super::client_arm::prepare_client_arm_on(form, None, &parent, &registry)?,
             };
             prepared.install_io(&lanes, io);
             Ok(Some((form, lanes, prepared)))
@@ -2248,7 +2275,12 @@ fn prepare_history_step_assembly<const TIER: usize>(
     let envelope = envelopes[selected_parent_class.current_slot()].proof();
     let generation = bank.generation();
     let mut io = io;
-    let client_slot = prepare_client_slot(runtime, client, &mut io)?;
+    let client_slot = prepare_client_slot(
+        runtime,
+        client,
+        (!base).then_some(envelope.io.as_slice()),
+        &mut io,
+    )?;
     let effective_pages = current.components.effective_page_count();
     if jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
         effective_pages,
@@ -2572,6 +2604,8 @@ fn prepare_history_step_assembly<const TIER: usize>(
             &mut builder,
             form,
             &super::client_arm::ClientIoCells::from_io(lanes, &io_cells),
+            &super::client_arm::ClientIoCells::from_io(lanes, &prev_io),
+            &parent_gate,
             client,
         )
     });
@@ -2956,17 +2990,20 @@ pub fn prepare_history_step_for_pow<const TIER: usize>(
     prepare_history_step_for_pow_slot(runtime, parent, current, no_client())
 }
 
-/// [`prepare_history_step_for_pow`] for a client-bearing runtime
-/// (v1.5): the block carries `client` — pre-passed once, when it
-/// was received ([`super::client_arm::PreparedHistoryStepClient::prepare`]) —
-/// or the ghost of the form.
+/// [`prepare_history_step_for_pow`] for a v1.5 runtime: the block carries
+/// `client` — pre-passed once, when it was received
+/// ([`super::client_arm::PreparedHistoryStepClient::prepare`]) — or the
+/// ghost of the form, and publishes `registry` as its registry leaves (the
+/// chain's registry as this block's state ends with it, zero-padded to the
+/// form's capacity; `None` keeps the parent's).
 pub fn prepare_history_step_for_pow_with_client<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
     current: HistoryStepBlockInput<TIER>,
     client: Option<&super::client_arm::PreparedHistoryStepClient>,
+    registry: Option<&[jetsam_ivc_core::merkle::Hash]>,
 ) -> Result<PreparedHistoryStepForPow<TIER>, HistoryStepError> {
-    prepare_history_step_for_pow_slot(runtime, parent, current, client)
+    prepare_history_step_for_pow_slot(runtime, parent, current, ClientInput { client, registry })
 }
 
 fn prepare_history_step_for_pow_slot<const TIER: usize>(

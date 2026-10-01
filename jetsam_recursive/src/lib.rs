@@ -54,12 +54,13 @@ pub use acceptance::history_step_bank::{
 pub use acceptance::history_step::{
     client_io_commitment, decode_history_step_client_proof, encode_history_step_client_proof,
     history_step_client_proof_max_wire_bytes, prepare_history_step_for_pow_with_client, HistoryStepChainClients, HistoryStepClientParts,
-    HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
+    HistoryStepClientCarry, HistoryStepClientRegistry, HistoryStepClientWitness,
+    PreparedHistoryStepClient,
     HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 pub use acceptance::history_step_bank::{
-    parse_history_step_client_lanes, HistoryStepClientClaim, HistoryStepClientForm,
-    HistoryStepClientIoLanes, HISTORY_STEP_CLIENT_FORM_M,
+    parse_history_step_client_lanes, HistoryStepCarriedClient, HistoryStepClientClaim,
+    HistoryStepClientForm, HistoryStepClientIoLanes, HISTORY_STEP_CLIENT_FORM_M,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,

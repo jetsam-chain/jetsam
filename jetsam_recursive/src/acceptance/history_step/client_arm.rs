@@ -2,28 +2,33 @@
 // Copyright (C) 2026 the Jetsam developers.
 // Portions derived from an Apache-2.0 licensed upstream; see NOTICE.
 
-//! The HistoryStep client arm (v1.5 client slot, M2 task 2.3).
+//! The HistoryStep client arm (v1.5 client slot, M2 task 2.3, M3.4).
 //!
-//! A client-bearing HistoryStep verifies, next to its parent arms, one client
-//! proof of the imposed form ([`HistoryStepClientForm`]):
+//! A v1.5 HistoryStep verifies, next to its parent arms, one client proof of
+//! the imposed form ([`HistoryStepClientForm`]):
 //!
 //! - the C1 verifier runs in region mode with the client matrix digest `D`
 //!   read from the public IO (a witness lane, not a constant), the client's
 //!   own public IO as witness lanes and the form's post-commit class as a
 //!   constant; its PCS hashing is left as obligations for the Link carrier
 //!   and its transcript is recorded for L-C (third role);
-//! - its deferred lincheck is folded once, on the same recorded transcript,
-//!   into an accumulator claim published in the client matrix lane — nodes
-//!   evaluate it against the registered matrix `D` (M2 task 2.5);
-//! - `D` is proved a member of the registry whose root the IO carries
-//!   (Merkle path in circuit, ~362 rows per level);
+//! - `D` is the registry leaf of the client's entry `i` (a one-hot selector
+//!   over the leaves the IO publishes, no hashing);
+//! - its deferred lincheck is folded, on the same recorded transcript, into
+//!   **entry lane `i`**, with the parent's lane `i` as the incoming claim;
 //! - the IO commits to the client's public inputs (`hash_leaf` of its lanes).
 //!
-//! Every one of those checks is multiplied by `client_present`, an IO lane.
-//! A block without a client runs the same arm on a shape-only proof of the
-//! form (the "ghost"): the form is paid by every block, the matrix does not
-//! depend on the presence of a client, and an absent client's lanes are
-//! pinned to zero.
+//! Every one of those checks is multiplied by `client_present`, an IO lane. A
+//! block without a client runs the same arm on a shape-only proof of the form
+//! (the "ghost"): the form is paid by every block, and the matrix does not
+//! depend on the presence of a client.
+//!
+//! Whatever the block carries (M3.4, decision D3 = (a)), it publishes the
+//! chain's registry leaves and one accumulator lane per entry: every leaf the
+//! parent had set is kept (append-only), every lane but the client's is the
+//! parent's, and the client's lane is the parent's folded with the new
+//! claim. Nodes evaluate every live lane against the matrix of its entry, so a
+//! node that checks only a tip checks every client the chain has carried.
 
 use std::sync::Arc;
 
@@ -37,7 +42,7 @@ use jetsam_ivc_core::field_circuit::{
 use jetsam_ivc_core::field_r1cs::FieldR1cs;
 use jetsam_ivc_core::matrix_claim::c1::{
     fresh_claim_value_c1, prove_matrix_claim_fold_c1, stacked_matrix_mle_eval_c1,
-    C1MatrixAccClaim, C1MatrixFoldProof,
+    C1FreshLincheckClaim, C1MatrixAccClaim, C1MatrixFoldProof,
 };
 use jetsam_ivc_core::merkle::{self, Hash};
 use jetsam_ivc_core::pcs::Commitment;
@@ -48,7 +53,8 @@ use super::gated_recorder::BaseSelectableParentRecorder;
 use super::relation::{capture_scratch_recording, history_step_query_lane_count};
 use super::HistoryStepError;
 use crate::acceptance::history_step_bank::{
-    HistoryStepBankError, HistoryStepClientClaim, HistoryStepClientForm, HistoryStepClientIoLanes,
+    HistoryStepBankError, HistoryStepCarriedClient, HistoryStepClientClaim, HistoryStepClientForm,
+    HistoryStepClientIoLanes,
 };
 use crate::acceptance::trace::matrix_fold::{
     verify_matrix_claim_fold_c1_trace, C1MatrixAccClaimTrace, C1MatrixFoldProofTrace,
@@ -56,7 +62,7 @@ use crate::acceptance::trace::matrix_fold::{
 use crate::acceptance::trace::r_pcs_region::RPcsProof;
 use crate::acceptance::trace::self_verify::{
     alloc_flat_digest, const_flat_digest, flat_digest_lanes, merkle_hash_leaf_lanes_trace,
-    merkle_hash_pair_trace, patch_shape_only_query_positions_c1, pin_flat_digest_eq,
+    patch_shape_only_query_positions_c1, pin_flat_digest_eq,
     shape_only_field_r1cs_proof_c1,
     verify_field_c1_trace_deferred_region_with_post_commit_context_expr, C1FieldR1csProofTrace,
     FlatDigestExpr, PcsWalkObligations,
@@ -67,9 +73,9 @@ use crate::acceptance::trace::{mul, pin_eq, with_pin_gate};
 pub const HISTORY_STEP_CLIENT_PROOF_DOMAIN: &[u8] = b"history-step-client-v1";
 
 /// The bounded registry of client matrices (native side). Leaves are the
-/// matrix digests `D`, padded with zero digests to `2^depth`; nodes are
-/// `merkle::hash_pair`. Its root travels in the public IO; which root is the
-/// chain's is a native question (M2 task 2.5).
+/// matrix digests `D`, in index order, padded with zero digests to `2^depth`.
+/// A v1.5 block publishes the leaves themselves; which leaves are the chain's
+/// is a native question (M2 task 2.5, M3.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryStepClientRegistry {
     depth: usize,
@@ -105,10 +111,16 @@ impl HistoryStepClientRegistry {
         self.entries.iter().position(|entry| entry == digest)
     }
 
+    /// The leaves a v1.5 block publishes: the entries, then zero digests up
+    /// to the capacity.
+    pub fn leaves(&self) -> Vec<Hash> {
+        let mut leaves = self.entries.clone();
+        leaves.resize(1usize << self.depth, [0u8; 32]);
+        leaves
+    }
+
     fn levels(&self) -> Vec<Vec<Hash>> {
-        let mut level = self.entries.clone();
-        level.resize(1usize << self.depth, [0u8; 32]);
-        let mut levels = vec![level];
+        let mut levels = vec![self.leaves()];
         for _ in 0..self.depth {
             let next = levels
                 .last()
@@ -124,23 +136,15 @@ impl HistoryStepClientRegistry {
     pub fn root(&self) -> Hash {
         self.levels()[self.depth][0]
     }
-
-    /// Bottom-up siblings of leaf `index`.
-    pub fn path(&self, index: usize) -> Vec<Hash> {
-        let levels = self.levels();
-        (0..self.depth)
-            .map(|level| levels[level][(index >> level) ^ 1])
-            .collect()
-    }
 }
 
 /// The chain's client registry as a node holds it (M2 task 2.5): the
-/// registered digests, their root, and every registered matrix, resident and
+/// registered digests and every registered matrix, resident and
 /// authenticated once, when the registry is installed.
 ///
 /// In the prototype the registry is static: a node is configured with it
 /// ([`super::HistoryStepRuntime::with_chain_clients`]). In M3 it becomes
-/// chain state — written by registration transactions, bounded, read at the
+/// chain state — written by registration objects, append-only, read at the
 /// height of the block being judged, on that block's own branch.
 #[derive(Clone, Debug)]
 pub struct HistoryStepChainClients {
@@ -195,27 +199,39 @@ impl HistoryStepChainClients {
         &self.registry
     }
 
-    /// The root every client lane of this chain must carry.
+    /// The root of the chain's registry.
     pub fn root(&self) -> Hash {
         self.root
     }
 
-    /// The native checks of a present client's lanes: the registry root is
-    /// the chain's, `D` is registered, and the accumulator claim holds on the
-    /// registered matrix `D`.
+    /// The native checks of a tip's client lanes (M2 task 2.5, M3.4): the
+    /// published leaves are the chain's registry, the carried client (if
+    /// any) is registered, and every live entry lane holds on the matrix
+    /// registered at that entry.
     pub fn check_claim(&self, claim: &HistoryStepClientClaim) -> Result<(), HistoryStepBankError> {
-        if claim.registry_root != self.root {
+        let leaves = self.registry.leaves();
+        if claim.registry != leaves {
             return Err(HistoryStepBankError::ClientRegistryRoot);
         }
-        let matrix = self
-            .matrices
-            .get(&claim.matrix_digest)
-            .ok_or(HistoryStepBankError::ClientNotRegistered)?;
-        if claim.claim.point.len() != 2 * self.form.shape().k_log + 1 {
+        if let Some(carried) = &claim.carried {
+            if self.registry.position(&carried.matrix_digest).is_none() {
+                return Err(HistoryStepBankError::ClientNotRegistered);
+            }
+        }
+        if claim.entries.len() != leaves.len() {
             return Err(HistoryStepBankError::ClientLaneWidth);
         }
-        if stacked_matrix_mle_eval_c1(matrix, &claim.claim) != claim.claim.value {
-            return Err(HistoryStepBankError::ClientAccumulatedClaimValue);
+        for (index, entry_claim) in claim.live_entries() {
+            let matrix = self
+                .matrices
+                .get(&leaves[index])
+                .ok_or(HistoryStepBankError::ClientNotRegistered)?;
+            if entry_claim.point.len() != 2 * self.form.shape().k_log + 1 {
+                return Err(HistoryStepBankError::ClientLaneWidth);
+            }
+            if stacked_matrix_mle_eval_c1(matrix, entry_claim) != entry_claim.value {
+                return Err(HistoryStepBankError::ClientAccumulatedClaimValue);
+            }
         }
         Ok(())
     }
@@ -241,23 +257,96 @@ pub struct HistoryStepClientWitness {
     /// The registered client matrix: its digest is `D`, and the prover
     /// folds the deferred lincheck against it.
     pub matrix: Arc<FieldR1cs>,
+    /// The registry as the client's prover sees it: `D` must be one of its
+    /// entries when the proof is received. The block that carries the
+    /// client places it by the chain's leaves.
     pub registry: HistoryStepClientRegistry,
 }
 
-/// Native pre-pass of the client arm, present or ghost: everything the arm,
-/// the carrier columns and the public IO need.
+/// The carried part of a v1.5 block's client lanes (M3.4), as the next block
+/// folds into it: the registry leaves and the entry lanes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStepClientCarry {
+    /// Registry leaves in index order, zero for an empty entry.
+    pub registry: Vec<Hash>,
+    /// Each entry's accumulated claim, when its lane is live.
+    pub entries: Vec<Option<C1MatrixAccClaim>>,
+}
+
+impl HistoryStepClientCarry {
+    /// The carry a relation starts from: no leaf set, every lane dead.
+    pub fn empty(form: &HistoryStepClientForm) -> Self {
+        Self {
+            registry: vec![[0u8; 32]; form.registry_capacity()],
+            entries: vec![None; form.registry_capacity()],
+        }
+    }
+
+    /// The carry a block's IO publishes.
+    pub fn from_claim(claim: &HistoryStepClientClaim) -> Self {
+        Self {
+            registry: claim.registry.clone(),
+            entries: claim.entries.clone(),
+        }
+    }
+
+    fn incoming(&self, index: usize, k_log: usize) -> (C1MatrixAccClaim, bool) {
+        match &self.entries[index] {
+            Some(claim) => (claim.clone(), true),
+            None => (C1MatrixAccClaim::zero(k_log), false),
+        }
+    }
+}
+
+/// A client proof verified on reception: what does not depend on the block
+/// that will carry it.
 #[derive(Clone)]
-pub(crate) struct PreparedClientArm {
-    present: bool,
+struct ReceivedClient {
     digest: Hash,
-    registry_root: Hash,
-    registry_index: usize,
-    registry_path: Vec<Hash>,
     io_commitment: Hash,
     io: Vec<F128>,
     field_proof: C1FieldR1csProof,
     commitment_root: Hash,
+    matrix: Arc<FieldR1cs>,
+    fresh: C1FreshLincheckClaim,
+    /// The client transcript after its verifier: the fold continues it.
+    challenger: FsLaneChallenger,
+    /// The last fold into an entry lane. It depends on the block only
+    /// through the parent's lane of the client's entry, which changes only
+    /// when a block carries a client of that entry: every block attempt on
+    /// an unchanged lane reuses it, and the fold — seconds of matrix work —
+    /// stays off the block path, as the reception pre-pass was in M2.
+    fold_memo: Arc<std::sync::Mutex<Option<FoldMemo>>>,
+}
+
+/// One fold of a received client into the lane of its entry.
+#[derive(Clone)]
+struct FoldMemo {
+    registry_index: usize,
+    incoming: Option<C1MatrixAccClaim>,
     fold_proof: C1MatrixFoldProof,
+    outgoing: C1MatrixAccClaim,
+    scratch: LayoutRecordedChannel,
+}
+
+/// Native preparation of the client arm for one block, present or ghost:
+/// everything the arm, the carrier columns and the public IO need.
+#[derive(Clone)]
+pub(crate) struct PreparedClientArm {
+    present: bool,
+    digest: Hash,
+    /// The client's registry entry (zero for the ghost).
+    registry_index: usize,
+    io_commitment: Hash,
+    io: Vec<F128>,
+    field_proof: C1FieldR1csProof,
+    commitment_root: Hash,
+    /// The parent's lanes the block starts from (empty at a base).
+    parent: HistoryStepClientCarry,
+    /// The leaves this block publishes.
+    registry: Vec<Hash>,
+    fold_proof: C1MatrixFoldProof,
+    /// The parent's lane `registry_index` folded with the client's claim.
     outgoing: C1MatrixAccClaim,
     scratch: LayoutRecordedChannel,
 }
@@ -272,9 +361,10 @@ fn zero_fold_proof(k_log: usize) -> C1MatrixFoldProof {
     }
 }
 
-/// The client verifier (region mode) followed by the one-shot fold of its
-/// deferred lincheck, on `channel`. The scratch replay and the relation's
-/// arm both run exactly this, so their transcripts are one.
+/// The client verifier (region mode) followed by the fold of its deferred
+/// lincheck into the selected entry lane (`incoming`, live when
+/// `incoming_live`), on `channel`. The scratch replay and the relation's arm
+/// both run exactly this, so their transcripts are one.
 #[allow(clippy::too_many_arguments)]
 fn client_verifier_and_fold<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
@@ -284,6 +374,8 @@ fn client_verifier_and_fold<C: FsChannelOps>(
     field_proof: &C1FieldR1csProof,
     commitment_root: &Hash,
     io_values: &[F128],
+    incoming: &C1MatrixAccClaimTrace,
+    incoming_live: &LinExpr,
     fold_proof: &C1MatrixFoldProof,
 ) -> (PcsWalkObligations, Vec<LinExpr>, C1MatrixAccClaimTrace) {
     let shape = form.shape();
@@ -311,21 +403,30 @@ fn client_verifier_and_fold<C: FsChannelOps>(
         |_, _| {},
     );
     let fold = C1MatrixFoldProofTrace::alloc(b, fold_proof, shape.k_log);
-    let incoming = C1MatrixAccClaimTrace {
-        point: vec![ExtExpr::zero(); 2 * shape.k_log + 1],
-        value: ExtExpr::zero(),
-    };
     let accumulated = verify_matrix_claim_fold_c1_trace(
         b,
         channel,
         shape.k_log,
         shape.k_skip,
         &fresh,
-        &incoming,
-        &LinExpr::zero(),
+        incoming,
+        incoming_live,
         &fold,
     );
     (obligations, io, accumulated)
+}
+
+/// The incoming claim as wires, the way the relation's arm sees it (it
+/// selects it from the parent's IO cells): a replay must absorb wires, not
+/// constants, to record the arm's layout.
+fn alloc_incoming(
+    b: &mut FieldR1csBuilder,
+    incoming: &C1MatrixAccClaim,
+    live: bool,
+) -> (C1MatrixAccClaimTrace, LinExpr) {
+    let claim = C1MatrixAccClaimTrace::alloc(b, incoming);
+    let live = LinExpr::from_wire(b.alloc_f128(if live { F128::ONE } else { F128::ZERO }));
+    (claim, live)
 }
 
 /// Witness-only replay of the client arm: its recorded transcript (the L-C
@@ -338,10 +439,13 @@ fn scratch_replay(
     field_proof: &C1FieldR1csProof,
     commitment_root: &Hash,
     io: &[F128],
+    incoming: &C1MatrixAccClaim,
+    incoming_live: bool,
     fold_proof: &C1MatrixFoldProof,
 ) -> LayoutRecordedChannel {
     let mut b = FieldR1csBuilder::new_witness_only();
     let digest = alloc_flat_digest(&mut b, digest);
+    let (incoming, incoming_live) = alloc_incoming(&mut b, incoming, incoming_live);
     let mut channel = FsChannelUnionRecorder::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
     client_verifier_and_fold(
         &mut b,
@@ -351,6 +455,8 @@ fn scratch_replay(
         field_proof,
         commitment_root,
         io,
+        &incoming,
+        &incoming_live,
         fold_proof,
     );
     capture_scratch_recording(&channel.finish(), &b)
@@ -407,45 +513,13 @@ fn verifier_query_lanes(
         .collect())
 }
 
-/// Native pre-pass: verify a present client (natively, against `D` and its
-/// registry), fold its lincheck against the registered matrix, and record
-/// the arm's transcript; or build the ghost of the form.
-pub(crate) fn prepare_client_arm(
+/// Native verification of a client proof on reception: against `D` (the
+/// digest of its matrix) and the prover's registry, its lincheck closed on
+/// the matrix. Nothing here depends on the block that will carry it.
+fn receive_client(
     form: &HistoryStepClientForm,
-    witness: Option<&HistoryStepClientWitness>,
-) -> Result<PreparedClientArm, HistoryStepError> {
-    let k_log = form.shape().k_log;
-    let Some(witness) = witness else {
-        let (mut field_proof, commitment_root) =
-            shape_only_field_r1cs_proof_c1(&form.shape(), form.pcs_params());
-        let io = vec![F128::ZERO; form.io_spec().io_len];
-        let query_lanes = verifier_query_lanes(form, &field_proof, &commitment_root, &io)?;
-        patch_shape_only_query_positions_c1(&mut field_proof, form.pcs_params(), &query_lanes);
-        let fold_proof = zero_fold_proof(k_log);
-        let scratch = scratch_replay(
-            form,
-            &[0u8; 32],
-            &field_proof,
-            &commitment_root,
-            &io,
-            &fold_proof,
-        );
-        return Ok(PreparedClientArm {
-            present: false,
-            digest: [0u8; 32],
-            registry_root: [0u8; 32],
-            registry_index: 0,
-            registry_path: vec![[0u8; 32]; form.registry_depth()],
-            io_commitment: [0u8; 32],
-            io,
-            field_proof,
-            commitment_root,
-            fold_proof,
-            outgoing: C1MatrixAccClaim::zero(k_log),
-            scratch,
-        });
-    };
-
+    witness: &HistoryStepClientWitness,
+) -> Result<ReceivedClient, HistoryStepError> {
     let matrix = witness.matrix.as_ref();
     if FieldShape::of(matrix) != form.shape()
         || pcs_params_statement_bytes(&witness.commitment.params)
@@ -459,7 +533,7 @@ pub(crate) fn prepare_client_arm(
     let started = std::time::Instant::now();
     let digest = matrix.structural_statement_digest();
     let digest_ms = started.elapsed().as_secs_f64() * 1e3;
-    let registry_index = witness
+    witness
         .registry
         .position(&digest)
         .ok_or(HistoryStepError::ClientRegistry)?;
@@ -485,58 +559,199 @@ pub(crate) fn prepare_client_arm(
     if fresh_claim_value_c1(matrix, &fresh) != fresh.value {
         return Err(HistoryStepError::ClientProof);
     }
-    let verify_ms = started.elapsed().as_secs_f64() * 1e3;
-    let started = std::time::Instant::now();
-    let (fold_proof, outgoing) = prove_matrix_claim_fold_c1(
-        matrix,
-        &fresh,
-        &C1MatrixAccClaim::zero(k_log),
-        false,
-        &mut challenger,
-    );
-    let fold_ms = started.elapsed().as_secs_f64() * 1e3;
-    let started = std::time::Instant::now();
-    let scratch = scratch_replay(
-        form,
-        &digest,
-        &witness.field_proof,
-        &witness.commitment.root,
-        &witness.io,
-        &fold_proof,
-    );
     if timing {
         eprintln!(
-            "[history-assembly client] matrix digest {digest_ms:.1} ms; native verify \
-             {verify_ms:.1} ms; lincheck fold {fold_ms:.1} ms; scratch replay {:.1} ms",
+            "[history-assembly client] matrix digest {digest_ms:.1} ms; native verify {:.1} ms",
             started.elapsed().as_secs_f64() * 1e3
         );
     }
-    Ok(PreparedClientArm {
-        present: true,
+    Ok(ReceivedClient {
         digest,
-        registry_root: witness.registry.root(),
-        registry_index,
-        registry_path: witness.registry.path(registry_index),
         io_commitment: client_io_commitment(&witness.io),
         io: witness.io.clone(),
         field_proof: witness.field_proof.clone(),
         commitment_root: witness.commitment.root,
+        matrix: Arc::clone(&witness.matrix),
+        fresh,
+        challenger,
+        fold_memo: Arc::new(std::sync::Mutex::new(None)),
+    })
+}
+
+/// The client arm of one block: the ghost of the form, or a received client
+/// placed at its entry in `registry` (the leaves this block publishes) and
+/// folded into the parent's lane of that entry (`parent`).
+fn prepare_client_arm_from(
+    form: &HistoryStepClientForm,
+    received: Option<&ReceivedClient>,
+    parent: &HistoryStepClientCarry,
+    registry: &[Hash],
+) -> Result<PreparedClientArm, HistoryStepError> {
+    let k_log = form.shape().k_log;
+    let capacity = form.registry_capacity();
+    if parent.registry.len() != capacity
+        || parent.entries.len() != capacity
+        || registry.len() != capacity
+    {
+        return Err(HistoryStepError::ClientRegistry);
+    }
+    let Some(received) = received else {
+        let (mut field_proof, commitment_root) =
+            shape_only_field_r1cs_proof_c1(&form.shape(), form.pcs_params());
+        let io = vec![F128::ZERO; form.io_spec().io_len];
+        let query_lanes = verifier_query_lanes(form, &field_proof, &commitment_root, &io)?;
+        patch_shape_only_query_positions_c1(&mut field_proof, form.pcs_params(), &query_lanes);
+        let fold_proof = zero_fold_proof(k_log);
+        let (incoming, live) = parent.incoming(0, k_log);
+        let scratch = scratch_replay(
+            form,
+            &[0u8; 32],
+            &field_proof,
+            &commitment_root,
+            &io,
+            &incoming,
+            live,
+            &fold_proof,
+        );
+        return Ok(PreparedClientArm {
+            present: false,
+            digest: [0u8; 32],
+            registry_index: 0,
+            io_commitment: [0u8; 32],
+            io,
+            field_proof,
+            commitment_root,
+            parent: parent.clone(),
+            registry: registry.to_vec(),
+            fold_proof,
+            outgoing: C1MatrixAccClaim::zero(k_log),
+            scratch,
+        });
+    };
+
+    let registry_index = registry
+        .iter()
+        .position(|leaf| *leaf == received.digest)
+        .ok_or(HistoryStepError::ClientRegistry)?;
+    let memo = {
+        let memo = received
+            .fold_memo
+            .lock()
+            .map_err(|_| HistoryStepError::ClientProof)?;
+        memo.as_ref()
+            .filter(|memo| {
+                memo.registry_index == registry_index
+                    && memo.incoming == parent.entries[registry_index]
+            })
+            .cloned()
+    };
+    let FoldMemo {
+        fold_proof,
+        outgoing,
+        scratch,
+        ..
+    } = match memo {
+        Some(memo) => memo,
+        None => {
+            let (incoming, live) = parent.incoming(registry_index, k_log);
+            let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
+            let started = std::time::Instant::now();
+            let mut challenger = received.challenger.clone();
+            let (fold_proof, outgoing) = prove_matrix_claim_fold_c1(
+                received.matrix.as_ref(),
+                &received.fresh,
+                &incoming,
+                live,
+                &mut challenger,
+            );
+            let fold_ms = started.elapsed().as_secs_f64() * 1e3;
+            let started = std::time::Instant::now();
+            let scratch = scratch_replay(
+                form,
+                &received.digest,
+                &received.field_proof,
+                &received.commitment_root,
+                &received.io,
+                &incoming,
+                live,
+                &fold_proof,
+            );
+            if timing {
+                eprintln!(
+                    "[history-assembly client] lincheck fold into entry {registry_index} \
+                     {fold_ms:.1} ms; scratch replay {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let memo = FoldMemo {
+                registry_index,
+                incoming: parent.entries[registry_index].clone(),
+                fold_proof,
+                outgoing,
+                scratch,
+            };
+            *received
+                .fold_memo
+                .lock()
+                .map_err(|_| HistoryStepError::ClientProof)? = Some(memo.clone());
+            memo
+        }
+    };
+    Ok(PreparedClientArm {
+        present: true,
+        digest: received.digest,
+        registry_index,
+        io_commitment: received.io_commitment,
+        io: received.io.clone(),
+        field_proof: received.field_proof.clone(),
+        commitment_root: received.commitment_root,
+        parent: parent.clone(),
+        registry: registry.to_vec(),
         fold_proof,
         outgoing,
         scratch,
     })
 }
 
+/// The client arm of one block, from a witness (the pre-pass and the block
+/// part in one call): the ghost when `witness` is `None`. `parent` is the
+/// carry the block starts from, `registry` the leaves it publishes.
+pub(crate) fn prepare_client_arm_on(
+    form: &HistoryStepClientForm,
+    witness: Option<&HistoryStepClientWitness>,
+    parent: &HistoryStepClientCarry,
+    registry: &[Hash],
+) -> Result<PreparedClientArm, HistoryStepError> {
+    let received = witness
+        .map(|witness| receive_client(form, witness))
+        .transpose()?;
+    prepare_client_arm_from(form, received.as_ref(), parent, registry)
+}
+
+/// [`prepare_client_arm_on`] for a block that starts from an empty carry and
+/// publishes the client prover's registry (or none, for the ghost).
+pub(crate) fn prepare_client_arm(
+    form: &HistoryStepClientForm,
+    witness: Option<&HistoryStepClientWitness>,
+) -> Result<PreparedClientArm, HistoryStepError> {
+    let registry = match witness {
+        Some(witness) => witness.registry.leaves(),
+        None => vec![[0u8; 32]; form.registry_capacity()],
+    };
+    prepare_client_arm_on(form, witness, &HistoryStepClientCarry::empty(form), &registry)
+}
+
 /// A client proof prepared once, when it is received: native verification
-/// against `D` and the registry, the lincheck fold against the registered
-/// matrix, the recorded replay. None of it depends on the block that will
-/// carry the client, so it is kept and handed to every block attempt
-/// ([`super::relation::prepare_history_step_for_pow_with_client`]) instead
-/// of being redone on the critical path.
+/// against `D` and the prover's registry, the lincheck closed against the
+/// registered matrix. None of it depends on the block that will carry the
+/// client, so it is kept and handed to every block attempt
+/// ([`super::relation::prepare_history_step_for_pow_with_client`]); what
+/// does — the fold into the entry lane, which starts from the parent's lane —
+/// is redone for each block.
 #[derive(Clone)]
 pub struct PreparedHistoryStepClient {
     form: HistoryStepClientForm,
-    arm: PreparedClientArm,
+    received: ReceivedClient,
 }
 
 impl PreparedHistoryStepClient {
@@ -547,13 +762,13 @@ impl PreparedHistoryStepClient {
     ) -> Result<Self, HistoryStepError> {
         Ok(Self {
             form: form.clone(),
-            arm: prepare_client_arm(form, Some(witness))?,
+            received: receive_client(form, witness)?,
         })
     }
 
     /// `D`, the registered matrix this client proof verifies under.
     pub fn digest(&self) -> Hash {
-        self.arm.digest
+        self.received.digest
     }
 
     /// Whether this pre-pass was made under `form`.
@@ -561,21 +776,34 @@ impl PreparedHistoryStepClient {
         &self.form == form
     }
 
-    /// The client lanes a block carrying this client publishes: exactly
-    /// what every node checks natively ([`HistoryStepChainClients::check_claim`]).
-    pub fn published_claim(&self) -> HistoryStepClientClaim {
-        HistoryStepClientClaim {
-            matrix_digest: self.arm.digest,
-            registry_root: self.arm.registry_root,
-            io_commitment: self.arm.io_commitment,
-            claim: self.arm.outgoing.clone(),
-        }
+    /// The arm of a block carrying this client: placed at its entry in
+    /// `registry`, folded into `parent`'s lane of that entry (the fold is
+    /// reused while that lane is unchanged).
+    pub(crate) fn arm_on(
+        &self,
+        parent: &HistoryStepClientCarry,
+        registry: &[Hash],
+    ) -> Result<PreparedClientArm, HistoryStepError> {
+        prepare_client_arm_from(&self.form, Some(&self.received), parent, registry)
     }
 
-    /// Write those lanes into a client-bearing public IO.
+    /// The client lanes a block carrying this client on top of `parent`
+    /// publishes, with `registry` as its leaves: exactly what every node
+    /// checks natively ([`HistoryStepChainClients::check_claim`]).
+    pub fn published_claim(
+        &self,
+        parent: &HistoryStepClientCarry,
+        registry: &[Hash],
+    ) -> Result<HistoryStepClientClaim, HistoryStepError> {
+        Ok(self.arm_on(parent, registry)?.published_claim())
+    }
+
+    /// Write those lanes into a v1.5 public IO.
     pub fn install_lanes(
         &self,
         lanes: &HistoryStepClientIoLanes,
+        parent: &HistoryStepClientCarry,
+        registry: &[Hash],
         io: &mut [F128],
     ) -> Result<(), HistoryStepError> {
         if io.len() < lanes.end() {
@@ -585,12 +813,8 @@ impl PreparedHistoryStepClient {
             }
             .into());
         }
-        self.arm.install_io(lanes, io);
+        self.arm_on(parent, registry)?.install_io(lanes, io);
         Ok(())
-    }
-
-    pub(crate) fn arm(&self) -> &PreparedClientArm {
-        &self.arm
     }
 }
 
@@ -603,17 +827,17 @@ pub(crate) fn client_transcript_layout(
 }
 
 impl PreparedClientArm {
-    /// Every value the pre-pass produced equals `other`'s.
+    /// Every value the preparation produced equals `other`'s.
     #[cfg(test)]
     pub(crate) fn same_pre_pass(&self, other: &Self) -> bool {
         self.present == other.present
             && self.digest == other.digest
-            && self.registry_root == other.registry_root
             && self.registry_index == other.registry_index
-            && self.registry_path == other.registry_path
             && self.io_commitment == other.io_commitment
             && self.io == other.io
             && self.commitment_root == other.commitment_root
+            && self.parent == other.parent
+            && self.registry == other.registry
             && self.fold_proof == other.fold_proof
             && self.outgoing == other.outgoing
             && self.scratch.layout == other.scratch.layout
@@ -624,31 +848,20 @@ impl PreparedClientArm {
     }
 
     /// A dishonest prover that claims another registered matrix `digest` for
-    /// this proof, consistently everywhere it controls (IO lanes, registry
-    /// path, recorded transcript).
+    /// this proof, consistently everywhere it controls (IO lanes, entry index,
+    /// recorded transcript).
     #[cfg(test)]
-    pub(crate) fn claiming_matrix(
-        mut self,
-        form: &HistoryStepClientForm,
-        digest: Hash,
-        registry: &HistoryStepClientRegistry,
-    ) -> Self {
+    pub(crate) fn claiming_matrix(mut self, form: &HistoryStepClientForm, digest: Hash) -> Self {
         self.digest = digest;
-        self.registry_index = registry.position(&digest).expect("registered digest");
-        self.registry_path = registry.path(self.registry_index);
-        self.registry_root = registry.root();
-        self.scratch = scratch_replay(
-            form,
-            &digest,
-            &self.field_proof,
-            &self.commitment_root,
-            &self.io,
-            &self.fold_proof,
-        );
-        self
+        self.registry_index = self
+            .registry
+            .iter()
+            .position(|leaf| *leaf == digest)
+            .expect("registered digest");
+        self.rescratch(form)
     }
 
-    /// A prover that skips the reception check: this pre-pass with its
+    /// A prover that skips the reception check: this preparation with its
     /// client proof replaced by `field_proof`, re-recorded consistently, its
     /// lanes and fold kept.
     #[cfg(test)]
@@ -658,12 +871,53 @@ impl PreparedClientArm {
         field_proof: C1FieldR1csProof,
     ) -> Self {
         self.field_proof = field_proof;
+        self.rescratch(form)
+    }
+
+    /// A prover that folds into entry `index` while the IO names its real
+    /// entry: the fold starts from the parent's lane `index`.
+    #[cfg(test)]
+    pub(crate) fn folding_into(mut self, form: &HistoryStepClientForm, index: usize) -> Self {
+        self.registry_index = index;
+        self.rescratch(form)
+    }
+
+    /// A prover whose lanes and fold are this arm's, its transcript recorded
+    /// against `parent`'s lane of its entry — what the relation actually
+    /// absorbs when the arm runs over `parent`'s IO. (An arm recorded on one
+    /// parent and built over another does not even assemble: its recording
+    /// drifts from the circuit.)
+    #[cfg(test)]
+    pub(crate) fn recorded_against(
+        mut self,
+        form: &HistoryStepClientForm,
+        parent: &HistoryStepClientCarry,
+    ) -> Self {
+        let (incoming, live) = parent.incoming(self.registry_index, form.shape().k_log);
         self.scratch = scratch_replay(
             form,
             &self.digest,
             &self.field_proof,
             &self.commitment_root,
             &self.io,
+            &incoming,
+            live,
+            &self.fold_proof,
+        );
+        self
+    }
+
+    #[cfg(test)]
+    fn rescratch(mut self, form: &HistoryStepClientForm) -> Self {
+        let (incoming, live) = self.parent.incoming(self.registry_index, form.shape().k_log);
+        self.scratch = scratch_replay(
+            form,
+            &self.digest,
+            &self.field_proof,
+            &self.commitment_root,
+            &self.io,
+            &incoming,
+            live,
             &self.fold_proof,
         );
         self
@@ -682,31 +936,88 @@ impl PreparedClientArm {
         }
     }
 
+    /// The carry this block publishes: the parent's, the client's lane
+    /// folded, this block's leaves.
+    pub(crate) fn carry(&self) -> HistoryStepClientCarry {
+        let mut entries = self.parent.entries.clone();
+        if self.present {
+            entries[self.registry_index] = Some(self.outgoing.clone());
+        }
+        HistoryStepClientCarry {
+            registry: self.registry.clone(),
+            entries,
+        }
+    }
+
+    /// The client lanes this block publishes.
+    pub(crate) fn published_claim(&self) -> HistoryStepClientClaim {
+        let carry = self.carry();
+        HistoryStepClientClaim {
+            carried: self.present.then(|| HistoryStepCarriedClient {
+                matrix_digest: self.digest,
+                io_commitment: self.io_commitment,
+            }),
+            registry: carry.registry,
+            entries: carry.entries,
+        }
+    }
+
     /// Write this block's client lanes into its public IO. Every lane is
-    /// written: nothing of a parent's client survives into the child.
+    /// written: the carried ones from the parent and this block.
     pub(crate) fn install_io(&self, lanes: &HistoryStepClientIoLanes, io: &mut [F128]) {
         io[lanes.present..lanes.end()].fill(F128::ZERO);
-        if !self.present {
-            return;
+        if self.present {
+            io[lanes.present] = F128::ONE;
+            io[lanes.matrix_digest..lanes.matrix_digest + 2]
+                .copy_from_slice(&flat_digest_lanes(&self.digest));
+            io[lanes.io_commitment..lanes.io_commitment + 2]
+                .copy_from_slice(&flat_digest_lanes(&self.io_commitment));
         }
-        io[lanes.present] = F128::ONE;
-        io[lanes.matrix_digest..lanes.matrix_digest + 2]
-            .copy_from_slice(&flat_digest_lanes(&self.digest));
-        io[lanes.registry_root..lanes.registry_root + 2]
-            .copy_from_slice(&flat_digest_lanes(&self.registry_root));
-        io[lanes.io_commitment..lanes.io_commitment + 2]
-            .copy_from_slice(&flat_digest_lanes(&self.io_commitment));
-        let lane = lanes.matrix_lane;
+        install_carry(lanes, &self.carry(), io);
+    }
+}
+
+/// Write a carry (leaves and entry lanes) into the lanes of a v1.5 IO.
+pub(crate) fn install_carry(
+    lanes: &HistoryStepClientIoLanes,
+    carry: &HistoryStepClientCarry,
+    io: &mut [F128],
+) {
+    for (index, leaf) in carry.registry.iter().enumerate() {
+        let at = lanes.registry_leaf(index);
+        io[at..at + 2].copy_from_slice(&flat_digest_lanes(leaf));
+    }
+    for (index, entry) in carry.entries.iter().enumerate() {
+        let lane = lanes.entry_lane(index);
+        io[lane.point..=lane.live].fill(F128::ZERO);
+        let Some(claim) = entry else {
+            continue;
+        };
         for (pair, coordinate) in io[lane.point..lane.value]
             .chunks_exact_mut(2)
-            .zip(&self.outgoing.point)
+            .zip(&claim.point)
         {
             pair[0] = coordinate.lo;
             pair[1] = coordinate.hi;
         }
-        io[lane.value] = self.outgoing.value.lo;
-        io[lane.value + 1] = self.outgoing.value.hi;
+        io[lane.value] = claim.value.lo;
+        io[lane.value + 1] = claim.value.hi;
         io[lane.live] = F128::ONE;
+    }
+}
+
+/// One entry accumulator lane, as IO cells.
+#[derive(Clone)]
+pub(crate) struct EntryLaneCells {
+    point: Vec<LinExpr>,
+    value: [LinExpr; 2],
+    live: LinExpr,
+}
+
+impl EntryLaneCells {
+    /// Point lanes, then the two value lanes, then `live`.
+    fn cells(&self) -> impl Iterator<Item = &LinExpr> {
+        self.point.iter().chain(&self.value).chain([&self.live])
     }
 }
 
@@ -714,25 +1025,31 @@ impl PreparedClientArm {
 pub(crate) struct ClientIoCells {
     present: LinExpr,
     matrix_digest: FlatDigestExpr,
-    registry_root: FlatDigestExpr,
     io_commitment: FlatDigestExpr,
-    lane_point: Vec<LinExpr>,
-    lane_value: [LinExpr; 2],
-    lane_live: LinExpr,
+    registry: Vec<FlatDigestExpr>,
+    entries: Vec<EntryLaneCells>,
 }
 
 impl ClientIoCells {
     pub(crate) fn from_io(lanes: &HistoryStepClientIoLanes, io: &[LinExpr]) -> Self {
         let pair = |start: usize| [io[start].clone(), io[start + 1].clone()];
-        let lane = lanes.matrix_lane;
         Self {
             present: io[lanes.present].clone(),
             matrix_digest: pair(lanes.matrix_digest),
-            registry_root: pair(lanes.registry_root),
             io_commitment: pair(lanes.io_commitment),
-            lane_point: io[lane.point..lane.value].to_vec(),
-            lane_value: pair(lane.value),
-            lane_live: io[lane.live].clone(),
+            registry: (0..lanes.registry_capacity)
+                .map(|index| pair(lanes.registry_leaf(index)))
+                .collect(),
+            entries: (0..lanes.registry_capacity)
+                .map(|index| {
+                    let lane = lanes.entry_lane(index);
+                    EntryLaneCells {
+                        point: io[lane.point..lane.value].to_vec(),
+                        value: pair(lane.value),
+                        live: io[lane.live].clone(),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -745,48 +1062,146 @@ pub(crate) struct ClientArmTrace {
     pub(crate) gate: LinExpr,
 }
 
-/// In-circuit registry membership: the root reached from leaf `D` along the
-/// witnessed path (direction bits are the leaf index, low bit first).
-fn registry_root_trace(
-    b: &mut FieldR1csBuilder,
-    leaf: &FlatDigestExpr,
-    index: usize,
-    path: &[Hash],
-) -> FlatDigestExpr {
-    let mut node = leaf.clone();
-    for (level, sibling) in path.iter().enumerate() {
-        let bit = LinExpr::from_wire(b.alloc_bool((index >> level) & 1 == 1));
-        let sibling = alloc_flat_digest(b, sibling);
-        let delta: [LinExpr; 2] =
-            std::array::from_fn(|lane| mul(b, &bit, &node[lane].add(&sibling[lane])));
-        let left = [node[0].add(&delta[0]), node[1].add(&delta[1])];
-        let right = [sibling[0].add(&delta[0]), sibling[1].add(&delta[1])];
-        node = merkle_hash_pair_trace(b, &left, &right);
-    }
-    node
-}
-
-/// The relation's client arm over its IO cells. See the module comment.
+/// The relation's client arm over its IO cells and its parent's (`parent`,
+/// the parent proof's public IO; `parent_gate` is one in a recursive step,
+/// zero at a base, whose lanes start empty). See the module comment.
 pub(crate) fn client_arm_trace(
     b: &mut FieldR1csBuilder,
     form: &HistoryStepClientForm,
     cells: &ClientIoCells,
+    parent: &ClientIoCells,
+    parent_gate: &LinExpr,
     prepared: &PreparedClientArm,
 ) -> ClientArmTrace {
+    let capacity = form.registry_capacity();
+    assert_eq!(cells.registry.len(), capacity);
+    assert_eq!(parent.registry.len(), capacity);
     let present = cells.present.clone();
-    // `client_present` is boolean, and an absent client carries zero lanes.
+    // `client_present` is boolean, and an absent client names nothing.
     let square = mul(b, &present, &present);
     pin_eq(b, &square, &present);
     let absent = present.add_const(F128::ONE);
-    for lane in cells
-        .matrix_digest
-        .iter()
-        .chain(&cells.registry_root)
-        .chain(&cells.io_commitment)
-    {
+    for lane in cells.matrix_digest.iter().chain(&cells.io_commitment) {
         let masked = mul(b, &absent, lane);
         pin_eq(b, &masked, &LinExpr::zero());
     }
+
+    // The registry is append-only: every leaf the parent had set is kept.
+    // For a set parent leaf (some lane nonzero) each lane of the child's is
+    // the parent's; an empty parent leaf may become anything. A base step
+    // has no parent: its leaves are free, and the node checks them.
+    for (child, parent_leaf) in cells.registry.iter().zip(&parent.registry) {
+        for parent_lane in parent_leaf {
+            let gated = mul(b, parent_gate, parent_lane);
+            for (child_lane, kept) in child.iter().zip(parent_leaf) {
+                let moved = mul(b, &gated, &child_lane.add(kept));
+                pin_eq(b, &moved, &LinExpr::zero());
+            }
+        }
+    }
+
+    // The client's entry: a one-hot selector over the leaves. A present
+    // client's `D` is the leaf it selects, and is not the empty leaf.
+    let selector = (0..capacity)
+        .map(|index| {
+            let bit = LinExpr::from_wire(b.alloc_bool(index == prepared.registry_index));
+            let square = mul(b, &bit, &bit);
+            pin_eq(b, &square, &bit);
+            bit
+        })
+        .collect::<Vec<_>>();
+    let selected_sum = selector
+        .iter()
+        .fold(LinExpr::zero(), |sum, bit| sum.add(bit));
+    pin_eq(b, &selected_sum, &LinExpr::constant(F128::ONE));
+    let select = |b: &mut FieldR1csBuilder, values: &[&LinExpr]| -> LinExpr {
+        values
+            .iter()
+            .zip(&selector)
+            .fold(LinExpr::zero(), |sum, (value, bit)| sum.add(&mul(b, bit, value)))
+    };
+    for lane in 0..2 {
+        let leaf = select(
+            b,
+            &cells.registry.iter().map(|leaf| &leaf[lane]).collect::<Vec<_>>(),
+        );
+        let mismatch = mul(b, &present, &leaf.add(&cells.matrix_digest[lane]));
+        pin_eq(b, &mismatch, &LinExpr::zero());
+    }
+    // `D != 0` for a present client: D_0 · u + D_1 · v = 1 for witnessed u, v.
+    {
+        let digest = prepared.digest;
+        let lanes = flat_digest_lanes(&digest);
+        let (u, v) = if lanes[0] != F128::ZERO {
+            (lanes[0].inv(), F128::ZERO)
+        } else if lanes[1] != F128::ZERO {
+            (F128::ZERO, lanes[1].inv())
+        } else {
+            (F128::ZERO, F128::ZERO)
+        };
+        let u = LinExpr::from_wire(b.alloc_f128(u));
+        let v = LinExpr::from_wire(b.alloc_f128(v));
+        let first = mul(b, &cells.matrix_digest[0], &u);
+        let second = mul(b, &cells.matrix_digest[1], &v);
+        let unit = mul(b, &present, &first.add(&second).add_const(F128::ONE));
+        pin_eq(b, &unit, &LinExpr::zero());
+    }
+
+    // The parent's entry lanes, empty at a base.
+    let parent_entries = parent
+        .entries
+        .iter()
+        .map(|entry| EntryLaneCells {
+            point: entry
+                .point
+                .iter()
+                .map(|cell| mul(b, parent_gate, cell))
+                .collect(),
+            value: std::array::from_fn(|lane| mul(b, parent_gate, &entry.value[lane])),
+            live: mul(b, parent_gate, &entry.live),
+        })
+        .collect::<Vec<_>>();
+    // The incoming claim: the parent's lane of the client's entry.
+    let k_log = form.shape().k_log;
+    let incoming_point = (0..2 * k_log + 1)
+        .map(|coordinate| {
+            let lo = select(
+                b,
+                &parent_entries
+                    .iter()
+                    .map(|entry| &entry.point[2 * coordinate])
+                    .collect::<Vec<_>>(),
+            );
+            let hi = select(
+                b,
+                &parent_entries
+                    .iter()
+                    .map(|entry| &entry.point[2 * coordinate + 1])
+                    .collect::<Vec<_>>(),
+            );
+            ExtExpr::new(lo, hi)
+        })
+        .collect::<Vec<_>>();
+    let incoming_value: [LinExpr; 2] = std::array::from_fn(|lane| {
+        select(
+            b,
+            &parent_entries
+                .iter()
+                .map(|entry| &entry.value[lane])
+                .collect::<Vec<_>>(),
+        )
+    });
+    let incoming_live = select(
+        b,
+        &parent_entries
+            .iter()
+            .map(|entry| &entry.live)
+            .collect::<Vec<_>>(),
+    );
+    let incoming = C1MatrixAccClaimTrace {
+        point: incoming_point,
+        value: ExtExpr::new(incoming_value[0].clone(), incoming_value[1].clone()),
+    };
 
     let mut channel = BaseSelectableParentRecorder::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
     let (obligations, accumulated) = with_pin_gate(&present, || {
@@ -798,38 +1213,32 @@ pub(crate) fn client_arm_trace(
             &prepared.field_proof,
             &prepared.commitment_root,
             &prepared.io,
+            &incoming,
+            &incoming_live,
             &prepared.fold_proof,
         );
-        let root = registry_root_trace(
-            b,
-            &cells.matrix_digest,
-            prepared.registry_index,
-            &prepared.registry_path,
-        );
-        pin_flat_digest_eq(b, &root, &cells.registry_root);
         let commitment = merkle_hash_leaf_lanes_trace(b, &io);
         pin_flat_digest_eq(b, &commitment, &cells.io_commitment);
         (obligations, accumulated)
     });
 
-    // The accumulator lane publishes the folded claim of a present client,
-    // zeros otherwise; it is live exactly when a client is.
-    let accumulated_lanes = accumulated
+    // The entry lanes: the parent's, except the client's, which carries the
+    // fold — `child = parent + present · bit · (folded - parent)`; live
+    // likewise towards one.
+    let folded = accumulated
         .point
         .iter()
         .flat_map(|coordinate| [coordinate.lo.clone(), coordinate.hi.clone()])
+        .chain([accumulated.value.lo.clone(), accumulated.value.hi.clone()])
+        .chain([LinExpr::constant(F128::ONE)])
         .collect::<Vec<_>>();
-    assert_eq!(accumulated_lanes.len(), cells.lane_point.len());
-    for (cell, lane) in cells
-        .lane_point
-        .iter()
-        .chain(&cells.lane_value)
-        .zip(accumulated_lanes.iter().chain([&accumulated.value.lo, &accumulated.value.hi]))
-    {
-        let published = mul(b, &present, lane);
-        pin_eq(b, cell, &published);
+    for ((child, kept), bit) in cells.entries.iter().zip(&parent_entries).zip(&selector) {
+        let carried = mul(b, &present, bit);
+        for ((cell, previous), next) in child.cells().zip(kept.cells()).zip(&folded) {
+            let delta = mul(b, &carried, &next.add(previous));
+            pin_eq(b, cell, &previous.add(&delta));
+        }
     }
-    pin_eq(b, &cells.lane_live, &present);
 
     ClientArmTrace {
         obligations,

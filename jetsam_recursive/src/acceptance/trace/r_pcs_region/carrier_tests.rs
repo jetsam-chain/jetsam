@@ -1413,8 +1413,8 @@ mod client_slot {
 
     use crate::acceptance::history_step::client_arm::{
         client_arm_trace, client_io_commitment, client_transcript_layout, prepare_client_arm,
-        ClientIoCells, HistoryStepClientRegistry, HistoryStepClientWitness, PreparedClientArm,
-        HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+        prepare_client_arm_on, ClientIoCells, HistoryStepClientCarry, HistoryStepClientRegistry,
+        HistoryStepClientWitness, PreparedClientArm, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
     };
     use crate::acceptance::history_step_bank::{HistoryStepClientForm, HistoryStepClientIoLanes};
 
@@ -1480,7 +1480,7 @@ mod client_slot {
     }
 
     fn client_lanes(form: &HistoryStepClientForm) -> HistoryStepClientIoLanes {
-        HistoryStepClientIoLanes::at(0, form.shape().k_log)
+        HistoryStepClientIoLanes::at(0, form.shape().k_log, form.registry_depth())
     }
 
     fn client_io(form: &HistoryStepClientForm, prepared: &PreparedClientArm) -> Vec<F128> {
@@ -1491,13 +1491,29 @@ mod client_slot {
     }
 
     /// Carrier + parent arms + the relation's client arm over `io` (the
-    /// client lanes of the public IO, as wires).
+    /// client lanes of the public IO, as wires), at a base: no parent lanes.
     fn build_with_client_arm(
         parents: &ParentFixtures,
         geometry: &HistoryStepParentGeometry,
         form: &HistoryStepClientForm,
         prepared: &PreparedClientArm,
         io: &[F128],
+    ) -> TwoProofBuild {
+        let parent_io = vec![F128::ZERO; io.len()];
+        build_with_client_arm_over(parents, geometry, form, prepared, io, &parent_io, false)
+    }
+
+    /// The same, over a parent's client lanes `parent_io` (as the parent
+    /// proof's public-IO wires): a recursive step when `recursive`, a base
+    /// (whose lanes start empty, whatever `parent_io` holds) otherwise.
+    fn build_with_client_arm_over(
+        parents: &ParentFixtures,
+        geometry: &HistoryStepParentGeometry,
+        form: &HistoryStepClientForm,
+        prepared: &PreparedClientArm,
+        io: &[F128],
+        parent_io: &[F128],
+        recursive: bool,
     ) -> TwoProofBuild {
         let (children, r_prev) = parent_scratches(parents);
         let proofs = parents
@@ -1526,7 +1542,14 @@ mod client_slot {
             .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
             .collect::<Vec<_>>();
         let cells = ClientIoCells::from_io(&client_lanes(form), &cells);
-        let arm = client_arm_trace(&mut b, form, &cells, prepared);
+        let parent_cells = parent_io
+            .iter()
+            .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
+            .collect::<Vec<_>>();
+        let parent_cells = ClientIoCells::from_io(&client_lanes(form), &parent_cells);
+        let parent_gate =
+            LinExpr::from_wire(b.alloc_f128(if recursive { F128::ONE } else { F128::ZERO }));
+        let arm = client_arm_trace(&mut b, form, &cells, &parent_cells, &parent_gate, prepared);
         let preparation = finalize_history_step_carrier_region(
             &mut b,
             columns,
@@ -1575,22 +1598,28 @@ mod client_slot {
         let digest = witness.matrix.structural_statement_digest();
         assert_eq!(io[lanes.present], F128::ONE);
         assert_eq!(io[lanes.matrix_digest..lanes.matrix_digest + 2], flat_digest_lanes(&digest));
-        assert_eq!(
-            io[lanes.registry_root..lanes.registry_root + 2],
-            flat_digest_lanes(&witness.registry.root())
-        );
+        for (index, leaf) in witness.registry.leaves().iter().enumerate() {
+            let at = lanes.registry_leaf(index);
+            assert_eq!(io[at..at + 2], flat_digest_lanes(leaf), "registry leaf {index}");
+        }
         assert_eq!(
             io[lanes.io_commitment..lanes.io_commitment + 2],
             flat_digest_lanes(&client_io_commitment(&witness.io))
         );
+        let entry = witness.registry.position(&digest).expect("registered");
+        let lane = lanes.entry_lane(entry);
         let claim = jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim {
-            point: io[lanes.matrix_lane.point..lanes.matrix_lane.value]
+            point: io[lane.point..lane.value]
                 .chunks_exact(2)
                 .map(|pair| F256::new(pair[0], pair[1]))
                 .collect(),
-            value: F256::new(io[lanes.matrix_lane.value], io[lanes.matrix_lane.value + 1]),
+            value: F256::new(io[lane.value], io[lane.value + 1]),
         };
-        assert_eq!(io[lanes.matrix_lane.live], F128::ONE);
+        assert_eq!(io[lane.live], F128::ONE);
+        for other in (0..lanes.registry_capacity).filter(|other| *other != entry) {
+            let lane = lanes.entry_lane(other);
+            assert!(io[lane.point..=lane.live].iter().all(|cell| *cell == F128::ZERO));
+        }
         assert_eq!(
             jetsam_ivc_core::matrix_claim::c1::stacked_matrix_mle_eval_c1(&witness.matrix, &claim),
             claim.value,
@@ -1639,7 +1668,7 @@ mod client_slot {
         );
     }
 
-    /// `D` must be a member of the registry the IO names, and the IO must
+    /// `D` must be the registry leaf of the client's entry, and the IO must
     /// commit to the client's public inputs: forging either lane leaves the
     /// trace unsatisfiable. A matrix outside the registry is refused before
     /// any circuit is built.
@@ -1652,11 +1681,15 @@ mod client_slot {
         let prepared = prepare_client_arm(&form, Some(&witness)).expect("registered client");
         let lanes = client_lanes(&form);
         let honest = client_io(&form, &prepared);
+        let entry = witness
+            .registry
+            .position(&witness.matrix.structural_statement_digest())
+            .expect("registered");
 
-        let mut forged_root = honest.clone();
-        forged_root[lanes.registry_root] += F128::ONE;
-        let built = build_with_client_arm(&parents, &geometry, &form, &prepared, &forged_root);
-        assert!(!built.r1cs.satisfies(&built.z), "forged registry root accepted");
+        let mut forged_leaf = honest.clone();
+        forged_leaf[lanes.registry_leaf(entry)] += F128::ONE;
+        let built = build_with_client_arm(&parents, &geometry, &form, &prepared, &forged_leaf);
+        assert!(!built.r1cs.satisfies(&built.z), "D accepted against another leaf");
 
         let mut forged_io = honest.clone();
         forged_io[lanes.io_commitment + 1] += F128::ONE;
@@ -1670,7 +1703,7 @@ mod client_slot {
         assert_ne!(other, witness.matrix.structural_statement_digest());
         let claiming = prepare_client_arm(&form, Some(&witness))
             .expect("registered client")
-            .claiming_matrix(&form, other, &witness.registry);
+            .claiming_matrix(&form, other);
         let built = build_with_client_arm(
             &parents,
             &geometry,
@@ -1699,7 +1732,7 @@ mod client_slot {
 
         let mut claimed = client_io(&form, &ghost);
         claimed[lanes.present] = F128::ONE;
-        claimed[lanes.matrix_lane.live] = F128::ONE;
+        claimed[lanes.entry_lane(0).live] = F128::ONE;
         let built = build_with_client_arm(&parents, &geometry, &form, &ghost, &claimed);
         assert!(!built.r1cs.satisfies(&built.z), "ghost proof accepted as a client");
 
@@ -1722,17 +1755,20 @@ mod client_slot {
         let witness = client_witness(&form, 0xC11E_0105, 1);
         let cached = PreparedHistoryStepClient::prepare(&form, &witness).expect("cached pre-pass");
         let recomputed = prepare_client_arm(&form, Some(&witness)).expect("recomputed pre-pass");
+        let from_reception = cached
+            .arm_on(&HistoryStepClientCarry::empty(&form), &witness.registry.leaves())
+            .expect("block part of the cached pre-pass");
         assert!(
-            cached.arm().same_pre_pass(&recomputed),
+            from_reception.same_pre_pass(&recomputed),
             "cached pre-pass differs from the recomputed one"
         );
         assert_eq!(cached.digest(), witness.matrix.structural_statement_digest());
         assert!(cached.is_for(&form));
 
         let geometry = client_arm_geometry(&parents, &form);
-        let io = client_io(&form, cached.arm());
+        let io = client_io(&form, &from_reception);
         assert_eq!(io, client_io(&form, &recomputed));
-        let from_cache = build_with_client_arm(&parents, &geometry, &form, cached.arm(), &io);
+        let from_cache = build_with_client_arm(&parents, &geometry, &form, &from_reception, &io);
         let from_scratch = build_with_client_arm(&parents, &geometry, &form, &recomputed, &io);
         assert!(from_cache.r1cs.satisfies(&from_cache.z), "cached client");
         assert_eq!(from_cache.z, from_scratch.z, "cached pre-pass moved the witness");
@@ -1816,6 +1852,7 @@ mod client_slot {
     use crate::acceptance::history_step_bank::{
         parse_history_step_client_lanes, HistoryStepBankError, HistoryStepClientClaim,
     };
+    use jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim;
 
     /// Two real clients, `A` and `B`, both registered in the chain's registry
     /// (and in their provers' view of it), with the chain's registry itself.
@@ -1848,9 +1885,17 @@ mod client_slot {
     }
 
     fn parsed(form: &HistoryStepClientForm, io: &[F128]) -> HistoryStepClientClaim {
-        parse_history_step_client_lanes(&client_lanes(form), io)
-            .expect("canonical client lanes")
-            .expect("present client")
+        parse_history_step_client_lanes(&client_lanes(form), io).expect("canonical client lanes")
+    }
+
+    /// Move the lane of entry `from` to entry `to` (the rest unchanged).
+    fn move_lane(form: &HistoryStepClientForm, io: &mut [F128], from: usize, to: usize) {
+        let lanes = client_lanes(form);
+        let (source, target) = (lanes.entry_lane(from), lanes.entry_lane(to));
+        let width = source.live + 1 - source.point;
+        let moved = io[source.point..source.point + width].to_vec();
+        io[source.point..source.point + width].fill(F128::ZERO);
+        io[target.point..target.point + width].copy_from_slice(&moved);
     }
 
     /// The lanes of a registered client pass the node's checks: canonical,
@@ -1864,17 +1909,16 @@ mod client_slot {
         for witness in [&a, &b] {
             let prepared = prepare_client_arm(&form, Some(witness)).expect("registered client");
             let claim = parsed(&form, &client_io(&form, &prepared));
-            assert_eq!(claim.matrix_digest, witness.matrix.structural_statement_digest());
-            assert_eq!(claim.registry_root, chain.root());
-            assert_eq!(claim.io_commitment, client_io_commitment(&witness.io));
+            let carried = claim.carried.clone().expect("present client");
+            assert_eq!(carried.matrix_digest, witness.matrix.structural_statement_digest());
+            assert_eq!(claim.registry, chain.registry().leaves());
+            assert_eq!(carried.io_commitment, client_io_commitment(&witness.io));
+            assert_eq!(claim.live_entries().count(), 1);
             assert_eq!(chain.check_claim(&claim), Ok(()), "honest client lanes");
         }
         let ghost = prepare_client_arm(&form, None).expect("ghost client");
-        assert_eq!(
-            parse_history_step_client_lanes(&client_lanes(&form), &client_io(&form, &ghost)),
-            Ok(None),
-            "an absent client has no lane to check"
-        );
+        let ghost = parsed(&form, &client_io(&form, &ghost));
+        assert!(ghost.carried.is_none() && ghost.live_entries().count() == 0);
     }
 
     /// "D faux": the lanes name a matrix other than the one the claim was
@@ -1890,9 +1934,12 @@ mod client_slot {
             &prepare_client_arm(&form, Some(&a)).expect("registered client"),
         );
 
+        // The claim folded against A, published as B's (in B's lane, under
+        // B's name): it does not hold on B's matrix.
         let mut other = honest.clone();
         other[lanes.matrix_digest..lanes.matrix_digest + 2]
             .copy_from_slice(&flat_digest_lanes(&b.matrix.structural_statement_digest()));
+        move_lane(&form, &mut other, 0, 1);
         assert_eq!(
             chain.check_claim(&parsed(&form, &other)),
             Err(HistoryStepBankError::ClientAccumulatedClaimValue)
@@ -1901,7 +1948,7 @@ mod client_slot {
         let mut forged = honest.clone();
         forged[lanes.matrix_digest] += F128::ONE;
         assert_eq!(
-            chain.check_claim(&parsed(&form, &forged)),
+            parse_history_step_client_lanes(&lanes, &forged),
             Err(HistoryStepBankError::ClientNotRegistered)
         );
     }
@@ -1925,10 +1972,12 @@ mod client_slot {
         );
 
         let mut rerooted = io.clone();
-        rerooted[lanes.registry_root..lanes.registry_root + 2]
-            .copy_from_slice(&flat_digest_lanes(&chain.root()));
+        for (index, leaf) in chain.registry().leaves().iter().enumerate() {
+            let at = lanes.registry_leaf(index);
+            rerooted[at..at + 2].copy_from_slice(&flat_digest_lanes(leaf));
+        }
         assert_eq!(
-            chain.check_claim(&parsed(&form, &rerooted)),
+            parse_history_step_client_lanes(&lanes, &rerooted),
             Err(HistoryStepBankError::ClientNotRegistered)
         );
     }
@@ -1939,7 +1988,7 @@ mod client_slot {
     fn node_refuses_a_false_accumulator_lane() {
         let form = test_client_form();
         let (a, _, chain) = registered_pair(&form);
-        let lane = client_lanes(&form).matrix_lane;
+        let lane = client_lanes(&form).entry_lane(0);
         let honest = client_io(
             &form,
             &prepare_client_arm(&form, Some(&a)).expect("registered client"),
@@ -1987,20 +2036,23 @@ mod client_slot {
         );
 
         let mut live_ghost = ghost.clone();
-        live_ghost[lanes.matrix_lane.live] = F128::ONE;
+        live_ghost[lanes.entry_lane(0).live] = F128::ONE;
         assert_eq!(
             refused(&live_ghost),
-            Some(HistoryStepBankError::NonCanonicalAbsentClient),
-            "absent client with a live accumulator lane"
+            Some(HistoryStepBankError::ClientNotRegistered),
+            "a live lane for an empty registry entry"
         );
 
         let mut dead = honest.clone();
-        dead[lanes.matrix_lane.live] = F128::ZERO;
+        dead[lanes.entry_lane(0).live] = F128::ZERO;
         assert_eq!(refused(&dead), Some(HistoryStepBankError::ClientLaneLiveness));
+
+        let mut two = honest.clone();
+        two[lanes.entry_lane(1).live] = F128::new(2, 0);
+        assert_eq!(refused(&two), Some(HistoryStepBankError::ClientLaneLiveness));
 
         let mut claimed = ghost.clone();
         claimed[lanes.present] = F128::ONE;
-        claimed[lanes.matrix_lane.live] = F128::ONE;
         assert_eq!(
             refused(&claimed),
             Some(HistoryStepBankError::NullClientMatrixDigest),
@@ -2147,15 +2199,19 @@ mod client_slot {
         };
         let prepared =
             PreparedHistoryStepClient::prepare(&form, &received).expect("decoded proof received");
-        let claim = prepared.published_claim();
+        let empty = HistoryStepClientCarry::empty(&form);
+        let leaves = chain.registry().leaves();
+        let claim = prepared.published_claim(&empty, &leaves).expect("published lanes");
         assert_eq!(chain.check_claim(&claim), Ok(()));
         let lanes = client_lanes(&form);
         let mut block_io = vec![F128::ZERO; lanes.end()];
         prepared
-            .install_lanes(&lanes, &mut block_io)
+            .install_lanes(&lanes, &empty, &leaves, &mut block_io)
             .expect("the lanes fit");
-        assert!(prepared.install_lanes(&lanes, &mut [F128::ZERO; 3]).is_err());
-        assert_eq!(parse_history_step_client_lanes(&lanes, &block_io), Ok(Some(claim)));
+        assert!(prepared
+            .install_lanes(&lanes, &empty, &leaves, &mut [F128::ZERO; 3])
+            .is_err());
+        assert_eq!(parse_history_step_client_lanes(&lanes, &block_io), Ok(claim));
 
         assert!(decode_history_step_client_proof(&form, &bytes[..bytes.len() - 1]).is_err());
         let mut longer = bytes.clone();
@@ -2243,7 +2299,11 @@ mod client_slot {
             .expect("chain registry");
         let lanes = client_lanes(&form);
         let mut io = vec![F128::ZERO; lanes.end()];
-        prepared.install_lanes(&lanes, &mut io).expect("lanes fit");
+        let empty = HistoryStepClientCarry::empty(&form);
+        let leaves = chain.registry().leaves();
+        prepared
+            .install_lanes(&lanes, &empty, &leaves, &mut io)
+            .expect("lanes fit");
         assert_eq!(chain.check_claim(&parsed(&form, &io)), Ok(()), "node check");
         lap("node check");
 
@@ -2261,7 +2321,8 @@ mod client_slot {
         };
         lap("parents proved");
         let geometry = client_arm_geometry(&parents, &form);
-        let built = build_with_client_arm(&parents, &geometry, &form, prepared.arm(), &io);
+        let arm = prepared.arm_on(&empty, &leaves).expect("block arm");
+        let built = build_with_client_arm(&parents, &geometry, &form, &arm, &io);
         lap(&format!("carrier + arms built, {} wires", built.wires));
         assert!(built.r1cs.satisfies(&built.z), "example client in the client arm");
         lap("satisfied");
@@ -2337,6 +2398,255 @@ mod client_slot {
             HistoryStepChainClients::new(&form, mixed, vec![a.matrix.clone(), wider]),
             Err(HistoryStepError::ClientForm)
         ), "a matrix of another shape");
+    }
+
+    // ---- M3.4: the carried lanes, one per registry entry ------------------
+    //
+    // A v1.5 block publishes the registry leaves and one accumulator lane per
+    // entry, whether or not it carries a client. The relation folds a
+    // client's lincheck into its own entry's lane, starting from the
+    // parent's, keeps every other lane and every set leaf of the parent, and
+    // a node that checks only the tip checks every client ever carried.
+
+    /// The IO of a block that publishes `arm`'s lanes.
+    fn block_io(form: &HistoryStepClientForm, arm: &PreparedClientArm) -> Vec<F128> {
+        client_io(form, arm)
+    }
+
+    /// A chain of client-bearing blocks: A at entry 0, then B at entry 1,
+    /// both registered. Returns the carry after each, and their arms.
+    fn carried_history(
+        form: &HistoryStepClientForm,
+        a: &HistoryStepClientWitness,
+        b: &HistoryStepClientWitness,
+        leaves: &[jetsam_ivc_core::merkle::Hash],
+    ) -> (PreparedClientArm, PreparedClientArm) {
+        let first = prepare_client_arm_on(form, Some(a), &HistoryStepClientCarry::empty(form), leaves)
+            .expect("A at entry 0");
+        let second =
+            prepare_client_arm_on(form, Some(b), &first.carry(), leaves).expect("B at entry 1");
+        (first, second)
+    }
+
+    /// The client of entry 1 folds into lane 1, from the parent's lane 1
+    /// (live: B was carried before), and lane 0 (A's) is the parent's. The
+    /// trace is satisfiable, every live lane holds on its entry's matrix, and
+    /// any other publication is unsatisfiable: lane 0 altered, lane 1 left as
+    /// the parent's, or lane 1 restarted from nothing (the parent's claim
+    /// dropped — the lie a suffix sync could not see).
+    #[test]
+    fn a_client_folds_into_its_entry_lane_and_every_other_lane_is_carried() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let (_, parent) = carried_history(&form, &a, &b, &leaves);
+        let parent_io = block_io(&form, &parent);
+        let parent_claim = parsed(&form, &parent_io);
+        assert_eq!(parent_claim.live_entries().count(), 2);
+        assert_eq!(chain.check_claim(&parent_claim), Ok(()));
+
+        let child = prepare_client_arm_on(&form, Some(&b), &parent.carry(), &leaves)
+            .expect("B again, on top of the parent");
+        let io = block_io(&form, &child);
+        let claim = parsed(&form, &io);
+        assert_eq!(claim.entries[0], parent_claim.entries[0], "lane 0 is carried");
+        assert_ne!(claim.entries[1], parent_claim.entries[1], "lane 1 is folded");
+        assert_eq!(chain.check_claim(&claim), Ok(()), "every live lane holds");
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &child, &io, &parent_io, true);
+        assert!(built.r1cs.satisfies(&built.z), "honest carried lanes");
+        prove_and_verify_link_only(&built.preparation, &built.z).expect("Link walks");
+
+        let lanes = client_lanes(&form);
+        let mut altered = io.clone();
+        altered[lanes.entry_lane(0).value] += F128::ONE;
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &child, &altered, &parent_io, true);
+        assert!(!built.r1cs.satisfies(&built.z), "lane 0 altered in passing");
+
+        let mut unfolded = io.clone();
+        let lane = lanes.entry_lane(1);
+        unfolded[lane.point..=lane.live].copy_from_slice(&parent_io[lane.point..=lane.live]);
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &child, &unfolded, &parent_io, true);
+        assert!(!built.r1cs.satisfies(&built.z), "client carried without folding its lane");
+
+        // A prover that restarts lane 1 from nothing: its fold and its lanes
+        // are honest for an empty parent, and the parent's claims vanish.
+        let restarted =
+            prepare_client_arm_on(&form, Some(&b), &HistoryStepClientCarry::empty(&form), &leaves)
+                .expect("B on an empty carry");
+        let restarted_io = block_io(&form, &restarted);
+        let restarted = restarted.recorded_against(&form, &parent.carry());
+        let built = build_with_client_arm_over(
+            &parents,
+            &geometry,
+            &form,
+            &restarted,
+            &restarted_io,
+            &parent_io,
+            true,
+        );
+        assert!(!built.r1cs.satisfies(&built.z), "the parent's lanes dropped");
+    }
+
+    /// The fold goes to the entry whose leaf is `D`: a prover folding B's
+    /// claim into A's lane, `D` still B, is unsatisfiable.
+    #[test]
+    fn a_client_cannot_fold_into_another_entry_lane() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let (_, parent) = carried_history(&form, &a, &b, &leaves);
+        let parent_io = block_io(&form, &parent);
+        let honest = prepare_client_arm_on(&form, Some(&b), &parent.carry(), &leaves)
+            .expect("B on top of the parent");
+        let elsewhere = honest.clone().folding_into(&form, 0);
+        let mut io = block_io(&form, &honest);
+        move_lane(&form, &mut io, 1, 0);
+        let lanes = client_lanes(&form);
+        let lane = lanes.entry_lane(1);
+        io[lane.point..=lane.live].copy_from_slice(&parent_io[lane.point..=lane.live]);
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &elsewhere, &io, &parent_io, true);
+        assert!(!built.r1cs.satisfies(&built.z), "B folded into A's lane");
+    }
+
+    /// The registry is append-only across blocks: an empty leaf may be set
+    /// (a registration), a set leaf may neither change nor disappear. A ghost
+    /// block publishes the leaves; the parent had only A.
+    #[test]
+    fn the_registry_leaves_are_append_only() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let (a, b, chain) = registered_pair(&form);
+        let only_a = HistoryStepClientRegistry::new(
+            form.registry_depth(),
+            vec![a.matrix.structural_statement_digest()],
+        )
+        .unwrap()
+        .leaves();
+        let mut a_only = a.clone();
+        a_only.registry =
+            HistoryStepClientRegistry::new(form.registry_depth(), vec![only_a[0]]).unwrap();
+        let parent = prepare_client_arm_on(
+            &form,
+            Some(&a_only),
+            &HistoryStepClientCarry::empty(&form),
+            &only_a,
+        )
+        .expect("A registered alone");
+        let parent_io = block_io(&form, &parent);
+        let b_digest = b.matrix.structural_statement_digest();
+        let build = |leaves: &[jetsam_ivc_core::merkle::Hash]| {
+            let ghost = prepare_client_arm_on(&form, None, &parent.carry(), leaves).expect("ghost");
+            let io = block_io(&form, &ghost);
+            build_with_client_arm_over(&parents, &geometry, &form, &ghost, &io, &parent_io, true)
+        };
+        let appended = chain.registry().leaves();
+        assert!(build(&appended).r1cs.satisfies(&build(&appended).z), "B appended");
+        let kept = build(&only_a);
+        assert!(kept.r1cs.satisfies(&kept.z), "nothing registered");
+        let mut overwritten = only_a.clone();
+        overwritten[0] = b_digest;
+        let built = build(&overwritten);
+        assert!(!built.r1cs.satisfies(&built.z), "A's leaf overwritten");
+        let removed = vec![[0u8; 32]; form.registry_capacity()];
+        let built = build(&removed);
+        assert!(!built.r1cs.satisfies(&built.z), "A's leaf removed");
+    }
+
+    /// A base step has no parent: whatever the shape-only parent's IO holds,
+    /// its lanes start empty and the client's lane is the fresh fold alone.
+    #[test]
+    fn a_base_starts_from_empty_lanes() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let (_, earlier) = carried_history(&form, &a, &b, &leaves);
+        let unrelated_io = block_io(&form, &earlier);
+        let base =
+            prepare_client_arm_on(&form, Some(&b), &HistoryStepClientCarry::empty(&form), &leaves)
+                .expect("B at a base");
+        let io = block_io(&form, &base);
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &base, &io, &unrelated_io, false);
+        assert!(built.r1cs.satisfies(&built.z), "a base ignores its ghost parent's lanes");
+        let inherited = prepare_client_arm_on(&form, Some(&b), &earlier.carry(), &leaves)
+            .expect("B on the unrelated lanes");
+        let inherited_io = block_io(&form, &inherited);
+        let inherited = inherited.recorded_against(&form, &HistoryStepClientCarry::empty(&form));
+        let built = build_with_client_arm_over(
+            &parents,
+            &geometry,
+            &form,
+            &inherited,
+            &inherited_io,
+            &unrelated_io,
+            false,
+        );
+        assert!(!built.r1cs.satisfies(&built.z), "a base inheriting lanes");
+    }
+
+    /// A received client is folded per block (the fold starts from the
+    /// parent's lane of its entry) and the fold is reused while that lane is
+    /// unchanged: whatever the order of the blocks it is offered to, the arm
+    /// is exactly the one recomputed from the witness.
+    #[test]
+    fn a_received_client_reuses_its_fold_only_while_its_lane_is_unchanged() {
+        let form = test_client_form();
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let received = PreparedHistoryStepClient::prepare(&form, &b).expect("received");
+        let (_, parent) = carried_history(&form, &a, &b, &leaves);
+        let empty = HistoryStepClientCarry::empty(&form);
+        for carry in [&empty, &empty, &parent.carry(), &parent.carry(), &empty] {
+            let arm = received.arm_on(carry, &leaves).expect("arm");
+            let recomputed =
+                prepare_client_arm_on(&form, Some(&b), carry, &leaves).expect("recomputed");
+            assert!(arm.same_pre_pass(&recomputed), "memoized fold differs");
+        }
+    }
+
+    /// The suffix-sync hole (M2 note §16.4-3), closed. A block that carried a
+    /// false claim for entry 0 is followed by a block without a client: the
+    /// relation carries the false lane faithfully (its trace is satisfiable
+    /// over the forged parent), and a node that checks only that later tip
+    /// refuses it, because it evaluates every live lane.
+    #[test]
+    fn a_false_claim_of_an_intermediate_block_is_refused_at_the_tip() {
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let geometry = client_arm_geometry(&parents, &form);
+        let (a, b, chain) = registered_pair(&form);
+        let leaves = chain.registry().leaves();
+        let (_, honest) = carried_history(&form, &a, &b, &leaves);
+        let mut forged = honest.carry();
+        let lie: &mut C1MatrixAccClaim = forged.entries[0].as_mut().expect("live lane 0");
+        lie.value += F256::ONE;
+        let lanes = client_lanes(&form);
+        let mut forged_io = vec![F128::ZERO; lanes.end()];
+        crate::acceptance::history_step::client_arm::install_carry(&lanes, &forged, &mut forged_io);
+
+        let ghost = prepare_client_arm_on(&form, None, &forged, &leaves).expect("ghost tip");
+        let tip_io = block_io(&form, &ghost);
+        let built =
+            build_with_client_arm_over(&parents, &geometry, &form, &ghost, &tip_io, &forged_io, true);
+        assert!(built.r1cs.satisfies(&built.z), "the false lane is carried as it is");
+        assert_eq!(
+            chain.check_claim(&parsed(&form, &tip_io)),
+            Err(HistoryStepBankError::ClientAccumulatedClaimValue),
+            "the tip check sees the intermediate block's claim"
+        );
+        let honest_tip = prepare_client_arm_on(&form, None, &honest.carry(), &leaves).expect("ghost");
+        assert_eq!(chain.check_claim(&parsed(&form, &block_io(&form, &honest_tip))), Ok(()));
     }
 
     fn test_spec() -> jetsam_ivc_core::public_io::PublicIoSpec {

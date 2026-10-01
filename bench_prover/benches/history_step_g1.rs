@@ -706,6 +706,7 @@ mod client {
                             None,
                             $input,
                             received.as_ref(),
+                            Some(&client.registry.leaves()),
                         )
                         .map_err(|error| format!("{label}: stage: {error}"))?;
                         let assembly_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -717,6 +718,14 @@ mod client {
                                 used - limit
                             ),
                             Ok(built) => format!("rows={} (fits 2^{limit_log})", built.useful_rows()),
+                            // The stand-in matrix pins no rows: a witness that
+                            // fits 2^m is refused against it, with its count.
+                            Err(HistoryStepError::RuntimeUsefulRows { actual, .. }) => {
+                                format!(
+                                    "rows={actual} (fits 2^{limit_log}, margin {})",
+                                    (1usize << limit_log) - actual
+                                )
+                            }
                             Err(error) => return Err(format!("{label}: seal: {error}")),
                         };
                         (assembly_ms, started.elapsed().as_secs_f64() * 1e3, rows)

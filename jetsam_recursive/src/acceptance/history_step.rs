@@ -96,8 +96,9 @@ pub use relation::{
     HISTORY_STEP_WIRE_VERSION,
 };
 pub use client_arm::{
-    client_io_commitment, HistoryStepChainClients, HistoryStepClientRegistry,
-    HistoryStepClientWitness, PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    client_io_commitment, HistoryStepChainClients, HistoryStepClientCarry,
+    HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
+    HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
 pub use relation::{prepare_history_step_for_pow_with_client, HistoryStepClientParts};
 pub use runtime_parts_codec::{
