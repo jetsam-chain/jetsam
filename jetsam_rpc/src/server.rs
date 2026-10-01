@@ -729,11 +729,14 @@ fn fee_breakdown_info(
     }
 }
 
-fn mempool_tx_info(entry: jetsam_mempool::MempoolEntryMetadata) -> MempoolTxInfo {
+fn mempool_tx_info(
+    entry: jetsam_mempool::MempoolEntryMetadata,
+    next_block_height: u64,
+) -> MempoolTxInfo {
     use jetsam_chain::consensus::paged_spend::BlockProofClass;
 
     let page_count = usize::from(entry.page_count);
-    let proof_class = BlockProofClass::for_page_count(page_count)
+    let proof_class = BlockProofClass::for_page_count_at_height(page_count, next_block_height)
         .expect("admitted PagedSpend always fits a consensus proof class");
     let requires_b255_miner = matches!(proof_class, BlockProofClass::B255);
     MempoolTxInfo {
@@ -2738,8 +2741,9 @@ impl JetsamApiServer for RpcHandler {
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = jetsam_poseidon2b::primitives::TxBodyHash(hash_bytes);
+        let next_block_height = self.chain.read().await.tip_height().saturating_add(1);
         let found = self.mempool.get_entry_metadata(&hash).await;
-        Ok(found.map(mempool_tx_info))
+        Ok(found.map(|entry| mempool_tx_info(entry, next_block_height)))
     }
 
     // -----------------------------------------------------------------------
@@ -3481,13 +3485,14 @@ impl JetsamApiServer for RpcHandler {
     // -----------------------------------------------------------------------
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
+        let next_block_height = self.chain.read().await.tip_height().saturating_add(1);
         let snapshot = self.mempool.metadata_snapshot().await;
 
         let txs: Vec<MempoolTxInfo> = snapshot
             .entries
             .iter()
             .copied()
-            .map(mempool_tx_info)
+            .map(|entry| mempool_tx_info(entry, next_block_height))
             .collect();
 
         Ok(MempoolInfo {
@@ -3776,8 +3781,11 @@ mod tests {
         assert!(validate_tx_counts(1, jetsam_tx::MAX_PAGED_SPEND_OUTPUTS + 1).is_err());
     }
 
+    /// The small class holds 25 pages at launch and 24 from v1.3, so the
+    /// boundary shown for a pending transaction is the one of the block that
+    /// would carry it, not the launch ladder.
     #[test]
-    fn mempool_status_exposes_the_exact_b25_b255_boundary() {
+    fn mempool_status_exposes_the_b25_b255_boundary_of_the_next_block() {
         let metadata = |page_count| jetsam_mempool::MempoolEntryMetadata {
             tx_hash: jetsam_poseidon2b::primitives::TxBodyHash([page_count as u8; 32]),
             fee_micro_jtm: 7,
@@ -3788,16 +3796,29 @@ mod tests {
             admitted_height: 11,
             has_authorization: true,
         };
+        let v1_3 = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT
+            .expect("v1.3 is armed on every profile");
+        let launch = v1_3 - 1;
 
-        let b25 = mempool_tx_info(metadata(25));
-        assert_eq!(b25.page_count, 25);
-        assert_eq!(b25.minimum_proof_class, "B25");
-        assert!(!b25.requires_b255_miner);
-
-        let b255 = mempool_tx_info(metadata(26));
-        assert_eq!(b255.page_count, 26);
-        assert_eq!(b255.minimum_proof_class, "B255");
-        assert!(b255.requires_b255_miner);
+        for (page_count, next_block_height, expect_b255) in [
+            (24, v1_3, false),
+            (25, v1_3, true),
+            (255, v1_3, true),
+            (25, launch, false),
+            (26, launch, true),
+        ] {
+            let info = mempool_tx_info(metadata(page_count), next_block_height);
+            assert_eq!(info.page_count, usize::from(page_count));
+            assert_eq!(
+                info.requires_b255_miner, expect_b255,
+                "{page_count} pages for block {next_block_height}"
+            );
+            assert_eq!(
+                info.minimum_proof_class,
+                if expect_b255 { "B255" } else { "B25" },
+                "{page_count} pages for block {next_block_height}"
+            );
+        }
     }
 
     #[test]
