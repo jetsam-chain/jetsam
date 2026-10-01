@@ -142,8 +142,15 @@ pub const CLIENT_MATRIX_MAX_FILE_BYTES: u32 = 16 * 1024 * 1024;
 /// One client proof per block: the HistoryStep relation has one client arm.
 pub const MAX_BLOCK_CLIENT_SUBMISSIONS: usize = 1;
 
+/// One registration per block: the registry root the relation carries moves
+/// by at most one leaf from a block to the next (M3.4: the root of the child
+/// is the parent's, or the parent's with one leaf appended at the next
+/// index).
+pub const MAX_BLOCK_CLIENT_REGISTRATIONS: usize = 1;
+
 /// Wire cap of one block's object list.
-pub const MAX_BLOCK_CLIENT_OBJECTS: usize = CLIENT_REGISTRY_CAPACITY + MAX_BLOCK_CLIENT_SUBMISSIONS;
+pub const MAX_BLOCK_CLIENT_OBJECTS: usize =
+    MAX_BLOCK_CLIENT_REGISTRATIONS + MAX_BLOCK_CLIENT_SUBMISSIONS;
 
 /// The license burn address.
 ///
@@ -892,6 +899,8 @@ pub enum ClientObjectError {
         paid: u64,
     },
     TooManySubmissions,
+    /// More than [`MAX_BLOCK_CLIENT_REGISTRATIONS`] registrations in a block.
+    TooManyRegistrations,
     ClientNotRegistered {
         matrix_digest: Digest,
     },
@@ -1001,6 +1010,9 @@ pub fn validate_block_client_objects(
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         match object {
             ClientObject::Registration(registration) => {
+                if effect.registrations.len() >= MAX_BLOCK_CLIENT_REGISTRATIONS {
+                    return Err(ClientObjectError::TooManyRegistrations);
+                }
                 if registration.matrix_digest == [0u8; 32] {
                     return Err(ClientObjectError::NullMatrixDigest);
                 }

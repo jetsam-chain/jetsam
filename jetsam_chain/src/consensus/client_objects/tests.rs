@@ -667,25 +667,40 @@ fn a_paid_registration_is_appended() {
 }
 
 #[test]
-fn several_registrations_in_one_block_take_consecutive_indices() {
+fn a_block_registers_at_most_one_client() {
+    // One append per block: the registry root the relation carries moves by
+    // at most one leaf from a block to the next (M3.4).
     let (a, b) = (registration(1), registration(2));
     let block = block(vec![paid_registration(100, a), paid_registration(200, b)]);
-    let registry = registry_with(3, 150);
+    assert_eq!(
+        validate(
+            &block,
+            &[ClientObject::Registration(a), ClientObject::Registration(b)],
+            &registry_with(3, 150),
+            &burn_rules(),
+        ),
+        Err(ClientObjectError::TooManyRegistrations)
+    );
+    assert_eq!(MAX_BLOCK_CLIENT_REGISTRATIONS, 1);
+    // The next block takes the next index.
+    let mut registry = registry_with(3, 150);
+    registry.apply(
+        &validate(
+            &block_at(HEIGHT, vec![paid_registration(100, a)]),
+            &[ClientObject::Registration(a)],
+            &registry,
+            &burn_rules(),
+        )
+        .unwrap(),
+    );
     let effect = validate(
-        &block,
-        &[ClientObject::Registration(a), ClientObject::Registration(b)],
+        &block_at(HEIGHT + 1, vec![paid_registration(100, b)]),
+        &[ClientObject::Registration(b)],
         &registry,
         &burn_rules(),
     )
     .unwrap();
-    assert_eq!(
-        effect
-            .registrations
-            .iter()
-            .map(|entry| entry.index)
-            .collect::<Vec<_>>(),
-        vec![3, 4]
-    );
+    assert_eq!(effect.registrations[0].index, 4);
 }
 
 #[test]
@@ -775,17 +790,19 @@ fn a_full_registry_refuses_registrations() {
         ),
         Err(ClientObjectError::RegistryFull { capacity: 16 })
     );
-    // Fifteen registered, two in one block: the second does not fit.
-    let (a, b) = (registration(0xE0), registration(0xE1));
-    assert_eq!(
-        validate(
-            &block(vec![paid_registration(100, a), paid_registration(200, b)]),
-            &[ClientObject::Registration(a), ClientObject::Registration(b)],
-            &registry_with(15, 150),
-            &burn_rules(),
-        ),
-        Err(ClientObjectError::RegistryFull { capacity: 16 })
-    );
+    // Fifteen registered: the sixteenth fits, then nothing.
+    let last = registration(0xE0);
+    let mut registry = registry_with(15, 150);
+    let effect = validate(
+        &block(vec![paid_registration(100, last)]),
+        &[ClientObject::Registration(last)],
+        &registry,
+        &burn_rules(),
+    )
+    .unwrap();
+    assert_eq!(effect.registrations[0].index, 15);
+    registry.apply(&effect);
+    assert_eq!(registry.len(), CLIENT_REGISTRY_CAPACITY);
 }
 
 #[test]
@@ -806,23 +823,27 @@ fn a_digest_is_registered_once() {
             matrix_digest: digest(0x11)
         })
     );
-    // Twice in the same block, two different payments and file roots.
+    // Registered again in a later block, under another file and payment.
     let first = registration(0x33);
     let second = ClientRegistration {
         matrix_file_len: 1,
         ..first
     };
+    let mut registry = ClientRegistryState::new();
+    registry.apply(
+        &validate(
+            &block_at(HEIGHT, vec![paid_registration(100, first)]),
+            &[ClientObject::Registration(first)],
+            &registry,
+            &burn_rules(),
+        )
+        .unwrap(),
+    );
     assert_eq!(
         validate(
-            &block(vec![
-                paid_registration(100, first),
-                paid_registration(200, second)
-            ]),
-            &[
-                ClientObject::Registration(first),
-                ClientObject::Registration(second)
-            ],
-            &ClientRegistryState::new(),
+            &block_at(HEIGHT + 1, vec![paid_registration(200, second)]),
+            &[ClientObject::Registration(second)],
+            &registry,
             &burn_rules(),
         ),
         Err(ClientObjectError::DuplicateRegistration {
@@ -882,11 +903,20 @@ fn malformed_registrations_are_refused() {
 
 #[test]
 fn the_object_list_is_exactly_the_markers_openings() {
-    let (a, b) = (registration(1), registration(2));
-    let two = block(vec![paid_registration(100, a), paid_registration(200, b)]);
-    let registry = ClientRegistryState::new();
-    let ok = [ClientObject::Registration(a), ClientObject::Registration(b)];
-    assert!(validate(&two, &ok, &registry, &burn_rules()).is_ok());
+    // One registration and one submission (of an active client), in the
+    // order of their paying transactions.
+    let registry = registry_with(1, 100);
+    let a = registration(1);
+    let sub = submission(0x10, 0x99);
+    let block = block_at(
+        600,
+        vec![
+            paid_registration(100, a),
+            paid_submission(200, sub, MICRO_PER_JTM),
+        ],
+    );
+    let ok = [ClientObject::Registration(a), ClientObject::Submission(sub)];
+    assert!(validate(&block, &ok, &registry, &burn_rules()).is_ok());
 
     let altered = ClientRegistration {
         matrix_file_len: a.matrix_file_len + 1,
@@ -894,15 +924,16 @@ fn the_object_list_is_exactly_the_markers_openings() {
     };
     let mismatches: Vec<Vec<ClientObject>> = vec![
         vec![],                                                          // objects dropped
-        vec![ClientObject::Registration(a)],                             // one dropped
+        vec![ok[0]],                                                     // one dropped
         vec![ok[1], ok[0]],                                              // reordered
         vec![ClientObject::Registration(altered), ok[1]],                // altered
         vec![ok[0], ok[1], ClientObject::Registration(registration(3))], // added
         vec![ClientObject::Submission(submission(1, 2)), ok[1]],         // wrong kind
+        vec![ok[0], ClientObject::Submission(submission(0x10, 0x98))],   // other proof
     ];
     for objects in mismatches {
         assert_eq!(
-            validate(&two, &objects, &registry, &burn_rules()),
+            validate(&block, &objects, &registry, &burn_rules()),
             Err(ClientObjectError::ObjectsDoNotMatchMarkers),
             "{objects:?}"
         );
