@@ -224,6 +224,36 @@ pub trait JetsamApi {
     async fn submit_block(&self, template_id: String, nonce_hex: String) -> RpcResult<String>;
 
     // =========================================================================
+    // v1.5 client objects (M3.8)
+    // =========================================================================
+
+    /// Hand a client proof bundle (hex of `ClientProofBundle::encode`:
+    /// submission, the transaction paying its fee, the proof) to this node:
+    /// its payment is checked against the current state, the proof
+    /// pre-passed and queued for the miners, then announced to peers.
+    #[method(name = "submitClientProof")]
+    async fn submit_client_proof(
+        &self,
+        bundle_hex: String,
+    ) -> RpcResult<crate::client_objects::SubmitClientProofResponse>;
+
+    /// Register a client: `payment_hex` is the `PagedSpendIntent` paying the
+    /// license, whose one marker opens the registration `matrix_path` makes
+    /// (a canonical matrix file of the client form, on this node's disk).
+    /// The registration is held for this node's miners and the matrix served
+    /// to peers during the activation delay.
+    #[method(name = "registerClient")]
+    async fn register_client(
+        &self,
+        payment_hex: String,
+        matrix_path: String,
+    ) -> RpcResult<crate::client_objects::RegisterClientResponse>;
+
+    /// The chain's client registry at the tip, and what this node holds.
+    #[method(name = "listClients")]
+    async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse>;
+
+    // =========================================================================
     // Node control
     // =========================================================================
 

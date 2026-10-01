@@ -1227,6 +1227,9 @@ pub struct RpcHandler {
     /// Node-side proof capacity for external PoW templates. External workers
     /// do not choose the B25/B255 class.
     external_mining_capacity: Arc<Mutex<AdaptiveProofCapacity>>,
+    /// The node's v1.5 client objects (M3.8): offered to external-mining
+    /// templates, reached by the client-object methods.
+    pub client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
 }
 
 #[derive(Clone)]
@@ -1542,7 +1545,11 @@ impl RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
-        let builder = TemplateBuilder::new(self.mempool.clone());
+        let builder = TemplateBuilder::new(self.mempool.clone()).with_client_source(
+            self.client_objects
+                .clone()
+                .map(|objects| objects as jetsam_miner::client_slot::SharedMinerClientSource),
+        );
         // Snapshot/reorg installation holds the same gate while it replaces
         // chain, mempool and wallet views. Capture the exact parent+payout
         // boundary under that gate, then release it before witness preparation.
@@ -1920,6 +1927,9 @@ impl RpcHandler {
         self.mempool
             .on_new_block(&confirmed, height, new_view)
             .await;
+        if let Some(objects) = &self.client_objects {
+            objects.on_block_committed(block);
+        }
         drop(wallet_operation);
 
         tracing::info!(
@@ -2736,6 +2746,148 @@ impl JetsamApiServer for RpcHandler {
 
     async fn get_mempool_size(&self) -> RpcResult<usize> {
         Ok(self.mempool.len().await)
+    }
+
+    async fn submit_client_proof(
+        &self,
+        bundle_hex: String,
+    ) -> RpcResult<crate::client_objects::SubmitClientProofResponse> {
+        use jetsam_chain::consensus::client_objects::ClientObjectRules;
+        let objects = self
+            .client_objects
+            .clone()
+            .ok_or_else(|| rpc_err("this node holds no v1.5 client objects (no v1.5 pack)"))?;
+        let bytes = decode_bounded_hex(
+            "client proof bundle",
+            &bundle_hex,
+            jetsam_p2p::client_object_protocol::MAX_CLIENT_PROOF_BUNDLE_BYTES,
+        )?;
+        let bundle = jetsam_p2p::client_object_protocol::ClientProofBundle::decode(&bytes)
+            .map_err(|error| rpc_err(format!("client proof bundle: {error}")))?;
+        let rules = ClientObjectRules::current();
+        let (registry, tip_height) = {
+            let chain = self.chain.read().await;
+            (chain.client_registry().clone(), chain.tip_height())
+        };
+        if !rules.active_at(tip_height.saturating_add(1)) {
+            return Err(rpc_err("client objects are carried from the v1.5 height only"));
+        }
+        self.mempool
+            .check_client_payment(&bundle.payment)
+            .await
+            .map_err(|error| rpc_err(format!("submission payment: {error}")))?;
+        let announcement = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_inbound_verifier_cpu(|| {
+                objects.receive_client_proof(&bytes, &registry, &rules)
+            })
+            .map_err(|error| error.to_string())?
+        })
+        .await
+        .map_err(|error| rpc_err(format!("client proof reception: {error}")))?
+        .map_err(rpc_err)?;
+        let _ = self
+            .p2p_cmd
+            .send(jetsam_p2p::NetworkCommand::AnnounceClientProof { announcement })
+            .await;
+        Ok(crate::client_objects::SubmitClientProofResponse {
+            matrix_digest: hex::encode(announcement.id.submission.matrix_digest),
+            io_commitment: hex::encode(announcement.id.submission.io_commitment),
+            bundle_digest: hex::encode(announcement.id.bundle_digest),
+            bundle_len: announcement.id.encoded_len,
+            fee_micro_jtm: announcement.fee,
+        })
+    }
+
+    async fn register_client(
+        &self,
+        payment_hex: String,
+        matrix_path: String,
+    ) -> RpcResult<crate::client_objects::RegisterClientResponse> {
+        use jetsam_chain::consensus::client_objects::{ClientObjectRules, CLIENT_REGISTRY_CAPACITY};
+        let objects = self
+            .client_objects
+            .clone()
+            .ok_or_else(|| rpc_err("this node holds no v1.5 client objects (no v1.5 pack)"))?;
+        let payment_bytes =
+            decode_bounded_hex("license payment", &payment_hex, MAX_TX_INTENT_BYTES_GLOBAL)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&payment_bytes)
+            .map_err(|error| rpc_err(format!("license payment: {error:?}")))?;
+        let rules = ClientObjectRules::current();
+        let matrix_file = {
+            let path = std::path::PathBuf::from(&matrix_path);
+            let max = u64::from(rules.max_matrix_file_bytes);
+            tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                use std::io::Read as _;
+                let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                let mut bytes = Vec::new();
+                file.take(max + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 > max {
+                    return Err(format!("matrix file exceeds {max} bytes"));
+                }
+                Ok(bytes)
+            })
+            .await
+            .map_err(|error| rpc_err(error.to_string()))?
+            .map_err(|error| rpc_err(format!("matrix file {matrix_path}: {error}")))?
+        };
+        let (registry, tip_height) = {
+            let chain = self.chain.read().await;
+            (chain.client_registry().clone(), chain.tip_height())
+        };
+        if !rules.active_at(tip_height.saturating_add(1)) {
+            return Err(rpc_err("client objects are carried from the v1.5 height only"));
+        }
+        let registration = {
+            let objects = std::sync::Arc::clone(&objects);
+            let matrix_file = matrix_file.clone();
+            tokio::task::spawn_blocking(move || objects.registration_of_matrix_file(&matrix_file))
+                .await
+                .map_err(|error| rpc_err(error.to_string()))?
+                .map_err(rpc_err)?
+        };
+        if registry.entry(&registration.matrix_digest).is_some() {
+            return Err(rpc_err("this client is already registered"));
+        }
+        if registry.len() >= rules.registry_capacity.min(CLIENT_REGISTRY_CAPACITY) {
+            return Err(rpc_err("the client registry is full"));
+        }
+        self.mempool
+            .check_client_payment(&payment)
+            .await
+            .map_err(|error| rpc_err(format!("license payment: {error}")))?;
+        let registration = tokio::task::spawn_blocking(move || {
+            objects.hold_client_registration(payment, &matrix_file, &rules)
+        })
+        .await
+        .map_err(|error| rpc_err(error.to_string()))?
+        .map_err(rpc_err)?;
+        Ok(crate::client_objects::RegisterClientResponse {
+            matrix_digest: hex::encode(registration.matrix_digest),
+            matrix_file_root: hex::encode(registration.matrix_file_root),
+            matrix_file_len: registration.matrix_file_len,
+            next_index: registry.len(),
+        })
+    }
+
+    async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse> {
+        let (registry, tip_height) = {
+            let chain = self.chain.read().await;
+            (chain.client_registry().clone(), chain.tip_height())
+        };
+        let objects = self.client_objects.clone();
+        Ok(crate::client_objects::client_list(
+            &registry,
+            tip_height,
+            &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
+            |digest| {
+                objects
+                    .as_ref()
+                    .is_some_and(|objects| objects.holds_client_matrix(digest))
+            },
+            objects.as_ref().map(|objects| objects.queued_client_proofs()),
+        ))
     }
 
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
@@ -3986,6 +4138,7 @@ pub async fn start_rpc_server(
     mining_key: Option<String>,
     allow_custom_coinbase: bool,
     rpc_is_loopback: bool,
+    client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -4075,6 +4228,7 @@ pub async fn start_rpc_server(
             external_mining_generation,
             external_mining_terminal_bytes,
         ))),
+        client_objects,
     };
 
     // Always add the RPC access-control middleware layer. Browser-originated
