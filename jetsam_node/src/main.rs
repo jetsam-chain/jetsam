@@ -1113,6 +1113,8 @@ fn embedded_history_step_cache_ready(data_dir: &Path, class: HistoryStepCacheCla
 struct EmbeddedHistoryStepRuntimes {
     pre_fork: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
     post_fork: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    /// The v1.5 relation (m = 23 / 25, client slot), from the v1.5 height.
+    v1_5: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
 }
 
 impl EmbeddedHistoryStepRuntimes {
@@ -1124,15 +1126,13 @@ impl EmbeddedHistoryStepRuntimes {
         match embedded_history_step_pack::history_step_pack_generation(height) {
             embedded_history_step_pack::HistoryStepPackGeneration::V1 => self.pre_fork.as_ref(),
             embedded_history_step_pack::HistoryStepPackGeneration::V1_3 => self.post_fork.as_ref(),
-            // No v1.5 pack is embedded yet (M3.9): a height of that relation
-            // has no verifier, which the dormant v1.5 clock never asks for.
-            embedded_history_step_pack::HistoryStepPackGeneration::V1_5 => None,
+            embedded_history_step_pack::HistoryStepPackGeneration::V1_5 => self.v1_5.as_ref(),
         }
     }
 
     /// Whether this build can verify anything at all.
     fn is_empty(&self) -> bool {
-        self.pre_fork.is_none() && self.post_fork.is_none()
+        self.pre_fork.is_none() && self.post_fork.is_none() && self.v1_5.is_none()
     }
 
     /// The prover for the block at `height`, as the miner and the external
@@ -1162,25 +1162,32 @@ fn embedded_history_step_runtimes(
     // verifies nothing from the activation height on, and stops every node
     // running it at the same block. That refusal belongs here, on one
     // operator's terminal.
-    match embedded_history_step_pack::embedded_pack_coverage(
-        jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT,
+    let v1_3_activation = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
+    let v1_5_activation = jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT;
+    let carried = [
         embedded_history_step_pack::embedded_history_step_pack().is_some(),
         embedded_history_step_pack::embedded_history_step_pack_v1_3().is_some(),
+        embedded_history_step_pack::embedded_history_step_pack_v1_5().is_some(),
+    ];
+    let reachable = embedded_history_step_pack::reachable_history_step_generations(
+        v1_3_activation,
+        v1_5_activation,
+    );
+    for unused in embedded_history_step_pack::embedded_pack_coverage_for_schedule(
+        v1_3_activation,
+        v1_5_activation,
+        carried,
     )? {
-        embedded_history_step_pack::EmbeddedPackCoverage::Complete => {}
-        embedded_history_step_pack::EmbeddedPackCoverage::PackFree => {}
-        embedded_history_step_pack::EmbeddedPackCoverage::UnusedPostForkPack => {
-            tracing::warn!(
-                "this binary embeds a v1.3 HistoryStep pack while V1_3_ACTIVATION_HEIGHT is \
-                 unset: the fork schedule will never select it. Arming the fork is a source \
-                 edit, not a build input."
-            );
-        }
+        tracing::warn!(
+            generation = ?unused,
+            "this binary embeds a HistoryStep pack no height of its fork schedule selects: \
+             arming a fork is a source edit, not a build input"
+        );
     }
-    // And does every pack it carries pay this build's own network? Both of
-    // them, not just the one the current clock selects: the launch pack
-    // carries the same constraint, and a v1.3 pack staged ahead of the arming
-    // is checked while the mistake is still cheap to fix.
+    // And does every pack it carries pay this build's own network? Every one
+    // of them, not just the one the current clock selects: the launch pack
+    // carries the same constraint, and a pack staged ahead of the arming is
+    // checked while the mistake is still cheap to fix.
     for (label, pack) in [
         (
             "launch",
@@ -1190,28 +1197,47 @@ fn embedded_history_step_runtimes(
             "v1.3",
             embedded_history_step_pack::embedded_history_step_pack_v1_3(),
         ),
+        (
+            "v1.5",
+            embedded_history_step_pack::embedded_history_step_pack_v1_5(),
+        ),
     ] {
         if let Some(pack) = pack {
             verify_embedded_development_payout_pins(label, pack)?;
         }
     }
     Ok(EmbeddedHistoryStepRuntimes {
-        pre_fork: embedded_history_step_runtime_from_pack(
-            data_dir,
-            embedded_history_step_pack::embedded_history_step_pack(),
-            0,
-            embedded_history_step_pack::HistoryStepPackGeneration::V1,
-        )?,
-        post_fork: match jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT {
-            None => None,
-            Some(activation) => embedded_history_step_runtime_from_pack(
+        pre_fork: if reachable[0] {
+            embedded_history_step_runtime_from_pack(
                 data_dir,
-                embedded_history_step_pack::embedded_history_step_pack_for_height(activation),
+                embedded_history_step_pack::embedded_history_step_pack(),
+                0,
+                embedded_history_step_pack::HistoryStepPackGeneration::V1,
+            )?
+        } else {
+            None
+        },
+        post_fork: match v1_3_activation {
+            Some(activation) if reachable[1] => embedded_history_step_runtime_from_pack(
+                data_dir,
+                embedded_history_step_pack::embedded_history_step_pack_v1_3(),
                 activation
                     .checked_sub(1)
                     .ok_or("the v1.3 activation height cannot be genesis")?,
                 embedded_history_step_pack::HistoryStepPackGeneration::V1_3,
             )?,
+            _ => None,
+        },
+        // The v1.5 relation reads J from its recursion root (root height + 1),
+        // and a relation rooted at genesis is the v1.5 chain from J = 0.
+        v1_5: match v1_5_activation {
+            Some(activation) => embedded_history_step_runtime_from_pack(
+                data_dir,
+                embedded_history_step_pack::embedded_history_step_pack_v1_5(),
+                activation.saturating_sub(1),
+                embedded_history_step_pack::HistoryStepPackGeneration::V1_5,
+            )?,
+            None => None,
         },
     })
 }
@@ -1361,7 +1387,7 @@ fn embedded_history_step_runtime_from_pack(
     // and reused on later starts.
     let cache_directory = history_step_cache_directory(data_dir, pack.runtime_metadata_digest());
     let matrix_source = pack
-        .matrix_source(Some(cache_directory))
+        .matrix_source(actual_generation, Some(cache_directory))
         .map_err(|error| format!("embedded HistoryStep matrices rejected: {error}"))?;
     let (bank, runtime_parts) = metadata.into_parts();
     let runtime = jetsam_recursive::acceptance::history_step::HistoryStepRuntime::new(

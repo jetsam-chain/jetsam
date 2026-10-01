@@ -25,12 +25,12 @@ use jetsam_recursive::acceptance::history_step::{
     HistoryStepMatrixLease, HistoryStepMatrixSource, HistoryStepMatrixSourceError,
 };
 use jetsam_recursive::acceptance::history_step_bank::{
-    canonical_history_step_shape, CanonicalHistoryStepClassId, PinnedHistoryStepClassBank,
+    canonical_history_step_shape_in, CanonicalHistoryStepClassId, PinnedHistoryStepClassBank,
     HISTORY_STEP_CLASS_COUNT,
 };
 use jetsam_recursive::{
-    pin_history_step_class_bank, HistoryStepError, HistoryStepRuntimeParts,
-    HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
+    pin_history_step_class_bank, HistoryStepError, HistoryStepPackGeneration,
+    HistoryStepRuntimeParts, HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
 };
 use thiserror::Error;
 
@@ -388,12 +388,18 @@ pub struct EmbeddedHistoryStepMatrixSource {
 }
 
 impl EmbeddedHistoryStepMatrixSource {
+    /// `generation` is the generation of the pack these leaves come from
+    /// (read from its pinned runtime metadata): each leaf must have that
+    /// generation's class shape — m = 22 / 24 for the launch and v1.3 packs,
+    /// m = 23 / 25 for v1.5.
+    ///
     /// # Safety
     ///
     /// Every leaf must be the exact immutable canonical/seal tuple accepted by
     /// the pack preflight and staged by the release build. Runtime or
     /// filesystem bytes must not enter this constructor.
     pub unsafe fn from_release_build(
+        generation: HistoryStepPackGeneration,
         leaves: [EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT],
     ) -> Result<Self, EmbeddedHistoryStepMatrixError> {
         for (index, leaf) in leaves.iter().enumerate() {
@@ -405,7 +411,7 @@ impl EmbeddedHistoryStepMatrixSource {
             if leaf.compressed_canonical.is_empty() || leaf.build_seal.canonical_bytes() == 0 {
                 return Err(EmbeddedHistoryStepMatrixError::EmptyLeaf { index });
             }
-            if leaf.build_seal.shape() != canonical_history_step_shape(expected) {
+            if leaf.build_seal.shape() != canonical_history_step_shape_in(generation, expected) {
                 return Err(EmbeddedHistoryStepMatrixError::Shape { class: index });
             }
         }
@@ -599,6 +605,54 @@ mod tests {
                 format!("history-step-c{index:02}.packed-r1cs.zst")
             );
             assert!(runtime.insert(runtime_name));
+        }
+    }
+
+    /// M3.8: an embedded pack is checked against the shapes of its OWN
+    /// generation. A v1.5 pack (m = 23 / 25) is accepted as v1.5, and a pack
+    /// staged under another generation is refused by shape, class 0 first.
+    #[test]
+    fn release_leaves_are_checked_against_their_own_generations_shapes() {
+        use jetsam_recursive::acceptance::history_step_bank::canonical_history_step_shape_in;
+        use jetsam_recursive::HistoryStepPackGeneration;
+
+        fn leaves(
+            generation: HistoryStepPackGeneration,
+        ) -> [EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT] {
+            std::array::from_fn(|index| {
+                let class = CanonicalHistoryStepClassId::from_index(index).unwrap();
+                // SAFETY: test-only stand-ins; no matrix is ever opened here.
+                unsafe {
+                    EmbeddedHistoryStepMatrixLeaf::from_release_build(
+                        class,
+                        b"stand-in",
+                        BuildAuthenticatedFieldR1csSeal::from_release_build(
+                            canonical_history_step_shape_in(generation, class),
+                            [0x5A; 32],
+                            1,
+                        ),
+                    )
+                }
+            })
+        }
+
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5};
+        for generation in [V1, V1_3, V1_5] {
+            // SAFETY: see `leaves`.
+            let source = unsafe {
+                EmbeddedHistoryStepMatrixSource::from_release_build(generation, leaves(generation))
+            };
+            assert!(source.is_ok(), "{generation:?} pack refused");
+        }
+        for (staged_as, pack) in [(V1, V1_5), (V1_3, V1_5), (V1_5, V1), (V1_5, V1_3)] {
+            // SAFETY: see `leaves`.
+            let refused = unsafe {
+                EmbeddedHistoryStepMatrixSource::from_release_build(staged_as, leaves(pack))
+            };
+            assert!(
+                matches!(refused, Err(EmbeddedHistoryStepMatrixError::Shape { class: 0 })),
+                "a {pack:?} pack staged as {staged_as:?} must be refused by shape"
+            );
         }
     }
 
