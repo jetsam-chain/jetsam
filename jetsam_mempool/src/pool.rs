@@ -415,6 +415,47 @@ impl AsyncMempool {
         Ok(hash)
     }
 
+    /// Check a transaction that pays a v1.5 client object (M3.8). It travels
+    /// with its object — inside a client proof bundle, or a registration
+    /// handed to this node — and is never admitted to the pool, so it is
+    /// checked here like an admission against the current state (fee, epoch
+    /// anchor, live inputs, empty outputs, no spend from a locked address)
+    /// but without the pool's own rules (its marker, conflicts with pool
+    /// entries), then its authorization proof is verified, outside the lock.
+    pub async fn check_client_payment(&self, intent: &PagedSpendIntent) -> Result<(), SubmitError> {
+        let spend = validate_paged_spend(&intent.pages)
+            .map_err(|e| SubmitError::MalformedIntent(format!("PagedSpend: {e}")))?;
+        if intent.authorization_bytes.is_empty() {
+            return Err(SubmitError::MissingProof);
+        }
+        if intent.authorization_bytes.len() > MAX_AUTHORIZATION_BYTES {
+            return Err(SubmitError::ProofTooLarge {
+                actual: intent.authorization_bytes.len(),
+                max: MAX_AUTHORIZATION_BYTES,
+            });
+        }
+        {
+            let st = self.state.lock().await;
+            run_admission_checks_with(&intent.pages, &spend, &st, false)?;
+        }
+        let proof_bytes = intent.authorization_bytes.clone();
+        let pages = intent.pages.clone();
+        let executor = Arc::clone(&self.auth_verify_executor);
+        let _permit = self
+            .auth_verify_semaphore
+            .acquire()
+            .await
+            .map_err(|_| SubmitError::Internal("proof-verification semaphore closed".into()))?;
+        tokio::task::spawn_blocking(move || {
+            executor(Box::new(move || {
+                verify_intent_authorization(&pages, &proof_bytes)
+            }))
+        })
+        .await
+        .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
+        .map_err(SubmitError::InvalidProof)
+    }
+
     // -----------------------------------------------------------------------
     // Block assembly
     // -----------------------------------------------------------------------
@@ -861,6 +902,19 @@ fn run_admission_checks(
     spend: &PagedSpendFacts,
     st: &MempoolState,
 ) -> Result<u64, SubmitError> {
+    run_admission_checks_with(pages, spend, st, true)
+}
+
+/// [`run_admission_checks`]; `pool_rules` off for a transaction paying a
+/// v1.5 client object, which travels with its object and is never admitted
+/// to the pool (M3.8): no marker policy and no conflict with pool entries
+/// (the template builder leaves those out).
+fn run_admission_checks_with(
+    pages: &[TxPage],
+    spend: &PagedSpendFacts,
+    st: &MempoolState,
+    pool_rules: bool,
+) -> Result<u64, SubmitError> {
     // Dynamic fee floor layered over the deterministic consensus minimum.
     let consensus_required = fee_breakdown(
         u64::from(spend.live_inputs),
@@ -882,14 +936,28 @@ fn run_admission_checks(
     // v1.5: a spend from the license addresses or a marker owner can never be
     // mined, and a transaction paying a client object is mined only with its
     // object (it does not travel as a plain transaction). Inert before v1.5.
-    jetsam_chain::consensus::client_objects::check_plain_transaction(
-        pages,
-        st.view.tip_height.saturating_add(1),
-        &jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS,
-    )
-    .map_err(|error| {
-        SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::ClientObject(error))
-    })?;
+    if pool_rules {
+        jetsam_chain::consensus::client_objects::check_plain_transaction(
+            pages,
+            st.view.tip_height.saturating_add(1),
+            &jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS,
+        )
+        .map_err(|error| {
+            SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::ClientObject(error))
+        })?;
+    } else if let Some(owner) = pages
+        .iter()
+        .map(|page| page.body.input_owner)
+        .find(jetsam_chain::consensus::client_objects::is_client_locked_address)
+    {
+        return Err(SubmitError::Consensus(
+            jetsam_chain::consensus::ConsensusError::ClientObject(
+                jetsam_chain::consensus::client_objects::ClientObjectError::SpendFromLockedAddress {
+                    owner,
+                },
+            ),
+        ));
+    }
     if spend.epoch_anchor == [0u8; 32] {
         return Err(SubmitError::Consensus(
             jetsam_chain::consensus::ConsensusError::BadEpochAnchor,
@@ -910,7 +978,13 @@ fn run_admission_checks(
     }
 
     // No slot conflict with currently admitted txs (O(inputs + outputs)).
-    check_slot_conflicts_with_pool(pages, &st.admitted_input_slots, &st.admitted_output_slots)?;
+    if pool_rules {
+        check_slot_conflicts_with_pool(
+            pages,
+            &st.admitted_input_slots,
+            &st.admitted_output_slots,
+        )?;
+    }
 
     // Input slots must be live in state.
     check_input_slots(pages, spend, &st.view)?;
@@ -1366,6 +1440,93 @@ mod tests {
         let facts = validate_paged_spend(&candidate).unwrap();
         run_admission_checks(&candidate, &facts, &probe_state)
             .expect("accepted tip reward is spendable in its child block");
+    }
+
+    /// M3.8: a transaction paying a v1.5 client object travels with its
+    /// object and is never admitted to the pool; the node checks it with
+    /// every admission rule but the pool's own (marker policy, conflicts with
+    /// pool entries) — and its authorization, which a forged one fails.
+    #[tokio::test]
+    async fn a_client_payment_is_checked_like_an_admission_but_never_admitted() {
+        use crate::SubmitError;
+        use jetsam_chain::consensus::params::coinbase_creation_id;
+
+        let owner = Address([0xA5; 32]);
+        let mint_height = 3;
+        let mut state = ChainState::with_log_slots(6);
+        state
+            .state
+            .set_slot(
+                7,
+                SlotValue::with_owner_fields(
+                    1_000_000,
+                    coinbase_creation_id(mint_height),
+                    owner.as_fields(),
+                ),
+            )
+            .unwrap();
+        let genesis = genesis_header();
+        let mut tip = genesis.clone();
+        tip.height = mint_height;
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis);
+        headers.insert(mint_height, tip);
+        let view = ChainView::new(mint_height, headers, 1, state.state);
+        let anchor = view.user_epoch_anchor_id;
+        let required = jetsam_chain::consensus::fee_breakdown(
+            1,
+            1,
+            view.active_slot_count,
+            view.log_slots(),
+        )
+        .required_total;
+        let pool = AsyncMempool::new(view, MempoolConfig::default());
+        let payment = |slot: u32, epoch_anchor: [u8; 32]| {
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: slot,
+                amount: 1_000_000,
+                creation_id: coinbase_creation_id(mint_height),
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 8,
+                amount: 1_000_000 - required,
+                owner: Address([0xB6; 32]),
+            };
+            jetsam_tx::PagedSpendIntent::new(
+                vec![TxPage::new(TxBody {
+                    epoch_anchor,
+                    fee: required,
+                    input_owner: owner,
+                    inputs,
+                    outputs,
+                    validity_bitmap: 1
+                        | output_bitmap_bit(0)
+                        | PAGED_SPEND_START_BIT
+                        | PAGED_SPEND_END_BIT,
+                    is_coinbase: false,
+                })
+                .unwrap()],
+                vec![0xA5; 64],
+            )
+            .unwrap()
+        };
+        // Every state rule is checked...
+        assert!(matches!(
+            pool.check_client_payment(&payment(7, [9; 32])).await,
+            Err(SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::BadEpochAnchor
+            ))
+        ));
+        assert!(pool.check_client_payment(&payment(9, anchor)).await.is_err());
+        // ... then the authorization, which this stand-in fails.
+        assert!(matches!(
+            pool.check_client_payment(&payment(7, anchor)).await,
+            Err(SubmitError::InvalidProof(_))
+        ));
+        // Nothing was admitted.
+        assert_eq!(pool.state.lock().await.pool.len(), 0);
     }
 
     /// Admission asks the view for the anchors the *next block's* generation
