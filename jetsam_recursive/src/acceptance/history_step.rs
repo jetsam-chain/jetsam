@@ -101,7 +101,8 @@ pub use client_arm::{
 };
 pub use relation::{prepare_history_step_for_pow_with_client, HistoryStepClientParts};
 pub use runtime_parts_codec::{
-    HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES, HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
+    HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION, HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
+    HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
 };
 pub use wire::{
     decode_history_step_client_proof, encode_history_step_client_proof,

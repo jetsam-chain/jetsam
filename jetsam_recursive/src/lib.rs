@@ -36,8 +36,9 @@ pub use acceptance::history_step::{
     HistoryStepMatrixSourceError, HistoryStepParentTranscriptLayout, HistoryStepRuntime,
     HistoryStepRuntimeParts, HistoryStepSidecarOperation, HistoryStepTerminal,
     PreparedHistoryStepAuthorizations, PreparedHistoryStepForPow,
-    PreparedHistoryStepGhostAuthorization, HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
-    HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION, HISTORY_STEP_WIRE_VERSION,
+    PreparedHistoryStepGhostAuthorization, HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION,
+    HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES, HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
+    HISTORY_STEP_WIRE_VERSION,
 };
 pub use acceptance::history_step_bank::{
     canonical_history_step_class_id, canonical_history_step_class_id_in,
