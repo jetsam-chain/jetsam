@@ -534,3 +534,53 @@ fn a_relayed_registration_is_held_for_this_nodes_miner() {
     assert_eq!(held[0].1, notice.payment);
     assert!(!objects.holds_matrix(&client.digest()));
 }
+
+/// M3.10: registrations held for this node's miner survive a restart (they
+/// are kept on disk with their payment, as relayed), and a block that makes
+/// one removes it for good.
+#[test]
+fn held_registrations_are_kept_across_a_restart_until_a_block_makes_them() {
+    use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+    use jetsam_miner::client_slot::MinerClientSource;
+    use jetsam_p2p::client_object_protocol::ClientRegistrationNotice;
+    let form = test_form();
+    let client = TestClient::new(&form, 0xC9);
+    let directory = tempfile::tempdir().unwrap();
+    let rules = rules();
+    let notice = {
+        let objects = open(directory.path(), &form);
+        let registration = objects.registration_of_matrix_file(&client.file).unwrap();
+        let marker = ClientObject::Registration(registration).marker();
+        let license = rules.destination.split(rules.license_micro).burn;
+        let notice = ClientRegistrationNotice::new(
+            registration,
+            payment_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)], 1_000),
+            &rules,
+        )
+        .unwrap();
+        assert!(objects
+            .hold_relayed_registration(&notice, &ClientRegistryState::new(), &rules)
+            .unwrap());
+        notice
+    };
+    let empty = ClientRegistryState::new();
+    let objects = open(directory.path(), &form);
+    let held = MinerClientSource::held_registrations(&objects, &empty);
+    assert_eq!(held.len(), 1, "kept across the restart");
+    assert_eq!((held[0].0, &held[0].1), (notice.registration, &notice.payment));
+
+    let mut block = jetsam_chain::Block {
+        header: jetsam_chain::consensus::genesis_header(),
+        transactions: Vec::new(),
+        client_objects: vec![ClientObject::Registration(notice.registration)],
+    };
+    block.header.height = 30;
+    objects.on_block_committed(&block);
+    assert!(MinerClientSource::held_registrations(&objects, &empty).is_empty());
+    drop(objects);
+    let objects = open(directory.path(), &form);
+    assert!(
+        MinerClientSource::held_registrations(&objects, &empty).is_empty(),
+        "a registration a block made is not held again"
+    );
+}

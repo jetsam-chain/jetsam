@@ -145,7 +145,14 @@ pub struct ClientObjects {
     matrices: Arc<HistoryStepClientMatrixSet>,
     matrix_dir: PathBuf,
     proof_dir: PathBuf,
+    /// Held registrations, one file each (the relayed notice bytes), so a
+    /// restart keeps what this node's miner was asked to include (M3.10).
+    registration_dir: PathBuf,
     state: Mutex<State>,
+}
+
+fn registration_file_name(matrix_digest: &Hash32) -> String {
+    format!("{}.registration", hex32(matrix_digest))
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -198,13 +205,16 @@ impl ClientObjects {
         let root = data_dir.join("client-objects");
         let matrix_dir = root.join("matrices");
         let proof_dir = root.join("proofs");
+        let registration_dir = root.join("registrations");
         std::fs::create_dir_all(&matrix_dir)?;
         std::fs::create_dir_all(&proof_dir)?;
+        std::fs::create_dir_all(&registration_dir)?;
         let objects = Self {
             form: form.clone(),
             matrices,
             matrix_dir,
             proof_dir,
+            registration_dir,
             state: Mutex::new(State {
                 held_files: BTreeMap::new(),
                 manifests: BTreeMap::new(),
@@ -242,6 +252,40 @@ impl ClientObjects {
                 }
                 Err(error) => {
                     tracing::warn!(file = %name, %error, "held client matrix file refused; it will be fetched again");
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        // Held registrations kept before a restart: each re-checked as a
+        // relayed notice is (its payment opens and pays it).
+        let rules = ClientObjectRules::current();
+        for entry in std::fs::read_dir(&objects.registration_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("registration") {
+                continue;
+            }
+            let bytes = read_bounded(
+                &entry.path(),
+                jetsam_p2p::client_object_protocol::MAX_CLIENT_REGISTRATION_NOTICE_BYTES as u64,
+            )?;
+            match jetsam_p2p::client_object_protocol::ClientRegistrationNotice::decode(&bytes, &rules)
+            {
+                Ok(notice) => {
+                    objects
+                        .state
+                        .lock()
+                        .expect("client objects lock")
+                        .registrations
+                        .insert(
+                            notice.registration.matrix_digest,
+                            HeldRegistration {
+                                registration: notice.registration,
+                                payment: notice.payment,
+                            },
+                        );
+                }
+                Err(error) => {
+                    tracing::warn!(file = %entry.path().display(), %error, "kept client registration dropped");
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -795,9 +839,22 @@ impl ClientObjects {
                 "too many registrations held".into(),
             ));
         }
-        state
-            .registrations
-            .insert(held.registration.matrix_digest, held);
+        // Kept on disk as its notice bytes (the relay's encoding). A payment
+        // too large to relay is held in memory only.
+        let digest = held.registration.matrix_digest;
+        let notice = jetsam_p2p::client_object_protocol::ClientRegistrationNotice {
+            registration: held.registration,
+            payment: held.payment.clone(),
+        };
+        if notice.encode().len()
+            <= jetsam_p2p::client_object_protocol::MAX_CLIENT_REGISTRATION_NOTICE_BYTES
+        {
+            write_atomically(
+                &self.registration_dir.join(registration_file_name(&digest)),
+                &notice.encode(),
+            )?;
+        }
+        state.registrations.insert(digest, held);
         Ok(())
     }
 
@@ -823,6 +880,10 @@ impl ClientObjects {
             match object {
                 ClientObject::Registration(registration) => {
                     state.registrations.remove(&registration.matrix_digest);
+                    let _ = std::fs::remove_file(
+                        self.registration_dir
+                            .join(registration_file_name(&registration.matrix_digest)),
+                    );
                 }
                 ClientObject::Submission(submission) => {
                     let ids: Vec<ClientProofId> = state
