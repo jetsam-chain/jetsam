@@ -453,6 +453,25 @@ pub fn install_reorg_snapshot_and_artifacts(
 
 /// Fail closed if an exact owner snapshot cannot be installed after a chain
 /// replacement. A later verified reload restores the cache.
+/// Release the client-object payments that can no longer be mined at
+/// `tip_height` (M3.10). Called as the chain advances.
+pub fn release_expired_client_payments(wallet: &SharedWallet, tip_height: u64) -> usize {
+    let mut guard = match wallet.lock() {
+        Ok(guard) => guard,
+        Err(_) => return 0,
+    };
+    let Some(state) = guard.as_mut() else {
+        return 0;
+    };
+    match state.release_expired_client_payments(tip_height) {
+        Ok(released) => released,
+        Err(error) => {
+            tracing::warn!(%error, "expired client payments not released");
+            0
+        }
+    }
+}
+
 pub fn invalidate_active_cache(wallet: &SharedWallet) {
     let Ok(mut guard) = wallet.lock() else {
         return;
@@ -1275,6 +1294,13 @@ impl WalletOps for WalletHandle {
         wallet.track_pending_send_slots(txid, input_slots, output_slots);
         wallet.record_pending_send(txid, amount_micro_jtm, peer_address)?;
         Ok(())
+    }
+
+    fn track_client_payment(&self, txid: [u8; 32], built_at: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(wallet) = guard.as_mut() {
+            wallet.track_client_payment(txid, built_at);
+        }
     }
 
     fn rollback_pending_submission(

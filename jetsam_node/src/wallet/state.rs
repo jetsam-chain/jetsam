@@ -147,6 +147,11 @@ pub struct WalletState {
     /// still pending has no reservation to release — the same position as
     /// before this map existed.
     pub(super) pending_send_slots: HashMap<[u8; 32], (Vec<u32>, Vec<u32>)>,
+    /// v1.5 client-object payments built for a client (M3.10): txid → the
+    /// tip height they were built at. They never enter the mempool (they
+    /// travel with their object), so nothing else releases them if they are
+    /// never mined.
+    pub(super) pending_client_payments: HashMap<[u8; 32], u64>,
     /// The ACTIVE address key index. One owner per transaction (consensus
     /// rule): sends spend ONLY this address's UTXOs and change returns to it.
     /// Inactive addresses are not scanned or cached.
@@ -185,6 +190,7 @@ impl WalletState {
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
             pending_send_slots: HashMap::new(),
+            pending_client_payments: HashMap::new(),
             active_index: 0,
         };
         if one_address_only {
@@ -439,6 +445,37 @@ impl WalletState {
         // the meantime keeps its place in the record.
         self.remove_pending_send(tx_hash)?;
         Ok(true)
+    }
+
+    /// Track a client-object payment built at tip `built_at` (its inputs and
+    /// outputs are reserved like a send's, by `track_pending_send_slots`).
+    pub fn track_client_payment(&mut self, tx_hash: [u8; 32], built_at: u64) {
+        self.pending_client_payments.insert(tx_hash, built_at);
+    }
+
+    /// Release every client-object payment that can no longer be mined at
+    /// `tip_height` and was not: its epoch anchor (the current one when it was
+    /// built) is accepted for two epochs at most, so after
+    /// [`CLIENT_PAYMENT_LIFETIME_BLOCKS`] no block can include it. A payment
+    /// that was mined is only forgotten. Returns how many were released.
+    pub fn release_expired_client_payments(&mut self, tip_height: u64) -> Result<usize, String> {
+        let expired: Vec<[u8; 32]> = self
+            .pending_client_payments
+            .iter()
+            .filter(|(_, built_at)| {
+                tip_height >= built_at.saturating_add(CLIENT_PAYMENT_LIFETIME_BLOCKS)
+            })
+            .map(|(txid, _)| *txid)
+            .collect();
+        let mut released = 0;
+        for txid in expired {
+            self.pending_client_payments.remove(&txid);
+            // A mined payment's slots were already forgotten at confirmation.
+            if self.release_dropped_send(&txid)? {
+                released += 1;
+            }
+        }
+        Ok(released)
     }
 
     /// Update the height of a pending (height=0) tx once it is confirmed.
@@ -1080,6 +1117,12 @@ fn persist_atomically(
 /// Thread-safe shared wallet. `None` if wallet is not yet initialized.
 pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 
+/// Blocks after which a client-object payment can no longer be mined: two
+/// transaction epochs (the current anchor, then the previous one), plus the
+/// block being built.
+pub const CLIENT_PAYMENT_LIFETIME_BLOCKS: u64 =
+    2 * jetsam_chain::consensus::params::TX_EPOCH_BLOCKS + 2;
+
 #[cfg(test)]
 mod tests {
 
@@ -1375,6 +1418,50 @@ mod tests {
         let reloaded = WalletState::create_or_load(wallet.keystore_path.clone()).unwrap();
         assert_eq!(reloaded.active_index, 0);
         assert_eq!(reloaded.next_index, 2);
+    }
+
+    /// M3.10: a client payment built and never used (the client never
+    /// registered or submitted) is released once no block can include it any
+    /// more — not at the next restart; one that was mined is only forgotten.
+    #[test]
+    fn an_unused_client_payment_is_released_when_it_can_no_longer_be_mined() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let peer = [0x42; 32];
+        let (unused, mined) = ([0xA1; 32], [0xB2; 32]);
+        for (txid, inputs, outputs) in [(unused, [5u32], [7u32]), (mined, [6], [8])] {
+            wallet.add_pending_inputs(&inputs);
+            wallet.add_pending_outputs(&outputs);
+            wallet.track_pending_send_slots(txid, &inputs, &outputs);
+            wallet.record_pending_send(txid, 1_000, peer).unwrap();
+            wallet.track_client_payment(txid, 100);
+        }
+        assert!(wallet.confirm_pending_tx(&mined, 120, [0x33; 32]));
+        wallet.remove_pending_inputs(&[6]);
+        wallet.remove_pending_outputs(&[8]);
+
+        // Still minable: nothing released.
+        let last_minable = 100 + CLIENT_PAYMENT_LIFETIME_BLOCKS - 1;
+        assert_eq!(wallet.release_expired_client_payments(last_minable), Ok(0));
+        assert!(wallet.pending_input_slots.contains(&5));
+        assert!(wallet.pending_output_slots.contains(&7));
+        // Expired: the unused one is released, its pending record removed.
+        assert_eq!(
+            wallet.release_expired_client_payments(100 + CLIENT_PAYMENT_LIFETIME_BLOCKS),
+            Ok(1)
+        );
+        assert!(wallet.pending_input_slots.is_empty());
+        assert!(wallet.pending_output_slots.is_empty());
+        assert!(!wallet
+            .history
+            .iter()
+            .any(|entry| entry.tx_hash == unused));
+        assert!(wallet
+            .history
+            .iter()
+            .any(|entry| entry.tx_hash == mined && entry.height == 120));
+        assert!(wallet.pending_client_payments.is_empty());
+        assert_eq!(wallet.release_expired_client_payments(1_000), Ok(0));
     }
 
     #[test]

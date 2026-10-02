@@ -3025,7 +3025,8 @@ impl JetsamApiServer for RpcHandler {
             .flat_map(|page| page.body.live_outputs())
             .map(|(_, output)| output.slot_index)
             .collect();
-        // Held until mined: the wallet must not spend these inputs again.
+        // Held until mined, or until no block can include it any more: the
+        // wallet must not spend these inputs again meanwhile.
         self.wallet
             .reserve_pending_submission(
                 txid,
@@ -3035,6 +3036,8 @@ impl JetsamApiServer for RpcHandler {
                 marker.0,
             )
             .map_err(rpc_err)?;
+        let built_at = self.chain.read().await.tip_height();
+        self.wallet.track_client_payment(txid, built_at);
         let (matrix_file_root, matrix_file_len, io_commitment) = match client_object {
             ClientObject::Registration(registration) => (
                 Some(hex::encode(registration.matrix_file_root)),

@@ -14673,6 +14673,12 @@ async fn handle_p2p_events(
                         &mut client_objects_seen_height,
                     )
                     .await;
+                    // Client-object payments nobody used, now unminable (M3.10).
+                    let released =
+                        wallet::release_expired_client_payments(&wallet, client_objects_seen_height);
+                    if released > 0 {
+                        tracing::info!(released, "unused client-object payments released");
+                    }
                     let connected: Vec<libp2p::PeerId> =
                         peer_failure_domains.keys().copied().collect();
                     dispatch_client_object_requests(objects, &p2p_cmd, &connected);

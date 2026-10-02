@@ -257,6 +257,11 @@ pub trait WalletOps: Send + Sync {
         peer_address: [u8; 32],
     ) -> Result<(), String>;
 
+    /// Remember that the reservation of `txid` is a client-object payment
+    /// built at tip `built_at` (M3.10): it never enters the mempool, so the
+    /// wallet releases it itself once no block can include it.
+    fn track_client_payment(&self, _txid: [u8; 32], _built_at: u64) {}
+
     /// Roll back the exact reservation installed above. Safe to call from Drop.
     fn rollback_pending_submission(
         &self,
