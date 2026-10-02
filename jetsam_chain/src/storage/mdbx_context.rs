@@ -1388,10 +1388,12 @@ impl MdbxChainContext {
             ));
         }
 
-        let (block, accepted_bundle, post_state, undo) = proved.into_commit_parts();
-        // The local producer's objects pass the same native rules as a
-        // peer's: cheap, and the registry must not trust a template.
+        let (block, accepted_bundle, post_state, undo, client_view) = proved.into_commit_parts();
+        // The local producer's objects and the client lanes its terminal
+        // publishes pass the same native checks as a peer's block: cheap, and
+        // neither the registry nor the chain may trust a template.
         let client_effect = self.validate_client_objects(&block, &parent)?;
+        self.check_terminal_client_view(&client_view, &client_effect, block.header.height)?;
         if post_state.state.exact_dirty_segment_ids().next().is_some() {
             return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
                 "locally prepared post-state has an unsealed exact root".to_string(),
@@ -3188,7 +3190,11 @@ mod tests {
         // asserts that no canonical state is mutated.
         unsafe {
             prepared
-                .seal_after_trusted_history_step_proof_unchecked(block, terminal)
+                .seal_after_trusted_history_step_proof_unchecked(
+                    block,
+                    terminal,
+                    TerminalClientView::default(),
+                )
                 .unwrap()
         }
     }

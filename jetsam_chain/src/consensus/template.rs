@@ -29,6 +29,7 @@ use jetsam_tx::{PagedSpendFacts, Transaction};
 use crate::accepted_block_bundle::AcceptedBlockBundle;
 use crate::block::Block;
 use crate::block_header::BlockHeader;
+use crate::consensus::client_objects::TerminalClientView;
 use crate::consensus::da_prune::{build_undo_log, BlockUndoLog};
 use crate::consensus::pow::block_id;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
@@ -188,6 +189,10 @@ pub struct LocallyProvedBlockCommit {
     bundle: AcceptedBlockBundle,
     post_state: ChainState,
     undo_log: BlockUndoLog,
+    /// The client lanes the terminal publishes (v1.5), read back from the
+    /// terminal bytes the bundle carries: checked against the chain like a
+    /// received block's.
+    client_view: TerminalClientView,
 }
 
 impl PreparedBlockStateCommit {
@@ -206,6 +211,7 @@ impl PreparedBlockStateCommit {
         self,
         block: Block,
         history_step_terminal_bytes: Vec<u8>,
+        client_view: TerminalClientView,
     ) -> Result<LocallyProvedBlockCommit, String> {
         let mut nonce_free_header = block.header;
         nonce_free_header.nonce = 0;
@@ -237,6 +243,7 @@ impl PreparedBlockStateCommit {
             bundle,
             post_state: self.post_state,
             undo_log: self.undo_log,
+            client_view,
         })
     }
 }
@@ -256,8 +263,20 @@ impl LocallyProvedBlockCommit {
 
     pub(crate) fn into_commit_parts(
         self,
-    ) -> (Block, AcceptedBlockBundle, ChainState, BlockUndoLog) {
-        (self.block, self.bundle, self.post_state, self.undo_log)
+    ) -> (
+        Block,
+        AcceptedBlockBundle,
+        ChainState,
+        BlockUndoLog,
+        TerminalClientView,
+    ) {
+        (
+            self.block,
+            self.bundle,
+            self.post_state,
+            self.undo_log,
+            self.client_view,
+        )
     }
 }
 
@@ -1310,7 +1329,7 @@ mod tests {
             // the unsafe bridge's immutable template binding and is never
             // committed.
             unsafe {
-                prepared.seal_after_trusted_history_step_proof_unchecked(changed_header, terminal)
+                prepared.seal_after_trusted_history_step_proof_unchecked(changed_header, terminal, TerminalClientView::default())
             }
             .err(),
             Some("sealed block header differs from its prepared template".to_string())
@@ -1325,7 +1344,7 @@ mod tests {
         assert_eq!(
             // SAFETY: as above, no capability produced here reaches commit.
             unsafe {
-                prepared.seal_after_trusted_history_step_proof_unchecked(changed_body, terminal)
+                prepared.seal_after_trusted_history_step_proof_unchecked(changed_body, terminal, TerminalClientView::default())
             }
             .err(),
             Some("sealed block body differs from its prepared template".to_string())

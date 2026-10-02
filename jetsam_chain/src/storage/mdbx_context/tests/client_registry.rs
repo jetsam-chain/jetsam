@@ -947,3 +947,144 @@ fn a_block_registers_several_clients() {
     digests.sort();
     assert_eq!(digests, vec![[0xA1; 32], [0xB2; 32]]);
 }
+
+// ---- M3.10 (§8 trou c): a locally produced block passes the same view checks ----
+
+/// The node-owned next block on `context`'s tip with these user pages and
+/// objects, sealed as the local producer seals it, its terminal publishing
+/// `view`.
+fn locally_proved_with(
+    context: &mut MdbxChainContext,
+    transactions: Vec<Transaction>,
+    client_objects: Vec<ClientObject>,
+    view: TerminalClientView,
+) -> crate::consensus::template::LocallyProvedBlockCommit {
+    let parent = *context.tip_header();
+    let probe = Block {
+        header: parent,
+        transactions: transactions.clone(),
+        client_objects: Vec::new(),
+    };
+    let segments = context.segment_ids_for_block(&probe);
+    context.preload_segment_ids(&segments).unwrap();
+    let anchor = context.anchor_info().unwrap();
+    let target = crate::consensus::next_target(
+        anchor.anchor_height,
+        anchor.anchor_timestamp,
+        &anchor.anchor_target,
+        parent.height + 1,
+        parent.timestamp,
+    );
+    let finalized_active_counts = context.finalized_active_counts().unwrap();
+    let (template, prepared) = crate::consensus::template::build_node_owned_block_template(
+        &parent,
+        &context.state,
+        &finalized_active_counts,
+        transactions,
+        Address([MINER; 32]),
+        parent.timestamp + 1,
+        target,
+    )
+    .unwrap();
+    let mut nonce = 0u128;
+    let mut block = loop {
+        let candidate = template.clone().into_block(nonce);
+        if crate::consensus::validate_pow(&candidate.header).is_ok() {
+            break candidate;
+        }
+        nonce += 1;
+    };
+    block.client_objects = client_objects;
+    let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+        block.header.height,
+        crate::block_header::semantic_header_id(&block.header),
+        0,
+    )
+    .unwrap()
+    .encode_prefix()
+    .to_vec();
+    terminal.push(0xA5);
+    // SAFETY: a structural terminal; what is under test is the native check
+    // of the client lanes the sealed capability says its terminal publishes.
+    unsafe {
+        prepared
+            .seal_after_trusted_history_step_proof_unchecked(block, terminal, view)
+            .unwrap()
+    }
+}
+
+/// A block this node mines is held to the client-lane checks of a block it
+/// receives: a paid submission its terminal does not carry, leaves that are
+/// not the chain's, or no client lanes at a v1.5 height are refused before
+/// anything is installed; the honest view commits.
+#[test]
+fn a_local_block_passes_the_client_view_checks_of_a_received_one() {
+    let _rules = test_rules::install(armed_rules());
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let first = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &first).unwrap();
+    let (registration, object) = registration();
+    let paying = spend_coinbase(
+        &context,
+        &first,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object.marker(), 0),
+        ],
+    );
+    let second = bundle_with(&mut context, MINER, vec![paying], vec![object]);
+    apply(&mut context, &second).unwrap();
+    let funding = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &funding).unwrap();
+    assert_eq!(context.tip_height(), 3);
+
+    // Height 4 (D1 carriable), produced here: a submission paid for D1.
+    let submission = ClientSubmission {
+        matrix_digest: registration.matrix_digest,
+        io_commitment: [0x10; 32],
+    };
+    let submission_object = ClientObject::Submission(submission);
+    let fee_page = spend_coinbase(&context, &funding, &[(submission_object.marker(), 0)]);
+    let carried = Some(CarriedClient {
+        matrix_digest: submission.matrix_digest,
+        io_commitment: submission.io_commitment,
+    });
+    let tip = context.tip_hash();
+    let root = context.state.cached_state_root();
+    let mut commit = |context: &mut MdbxChainContext, view: TerminalClientView| {
+        let proved = locally_proved_with(
+            context,
+            vec![fee_page.clone()],
+            vec![submission_object],
+            view,
+        );
+        context.commit_locally_proved_next_block(proved).map(|_| ())
+    };
+    let refused = |result: Result<(), MdbxContextError>, expected: ClientObjectError| match result {
+        Err(MdbxContextError::Consensus(ConsensusError::ClientObject(error))) => {
+            assert_eq!(error, expected)
+        }
+        other => panic!("expected {expected:?}, got {other:?}"),
+    };
+
+    // The paid submission is not the carried client.
+    let view = honest_view(&context, &[], None);
+    refused(commit(&mut context, view), ClientObjectError::SubmissionNotCarried);
+    // Leaves with a digest the chain never registered.
+    let mut forged = honest_view(&context, &[], carried);
+    forged.registry_leaves.as_mut().unwrap()[3] = [0xEE; 32];
+    refused(commit(&mut context, forged), ClientObjectError::RegistryLeavesMismatch);
+    // No client lanes at a v1.5 height.
+    refused(
+        commit(&mut context, TerminalClientView::default()),
+        ClientObjectError::ClientLanesMissing,
+    );
+    assert_eq!((context.tip_height(), context.tip_hash()), (3, tip));
+    assert_eq!(context.state.cached_state_root(), root);
+
+    // The honest view: committed.
+    let view = honest_view(&context, &[], carried);
+    commit(&mut context, view).unwrap();
+    assert_eq!(context.tip_height(), 4);
+}

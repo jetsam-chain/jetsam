@@ -49,6 +49,9 @@ pub struct PreparedBlockAttempt {
     payload_weight: usize,
     retained_bytes: usize,
     state_commit: PreparedStateCommit,
+    /// The client lanes `terminal_bytes` publishes, read back from them: the
+    /// local commit checks them against the chain like a received block's.
+    client_view: jetsam_chain::consensus::client_objects::TerminalClientView,
 }
 
 /// A private-capability carrier created only after the HistoryStep prover has
@@ -363,6 +366,9 @@ impl PreparedBlockAttempt {
         let retained_bytes = payload_weight
             .checked_add(terminal_bytes.len())
             .ok_or_else(|| "prepared HistoryStep retained-byte weight overflow".to_string())?;
+        // What peers will read: the lanes of the encoded terminal, not of the
+        // witness that built it.
+        let client_view = terminal_client_view_of(runtime, &terminal_bytes)?;
 
         Ok(Some(Self {
             generation,
@@ -376,6 +382,7 @@ impl PreparedBlockAttempt {
             payload_weight,
             retained_bytes,
             state_commit: prepared_state_commit,
+            client_view,
         }))
     }
 
@@ -450,11 +457,40 @@ impl PreparedBlockAttempt {
         // preparation. The local commit intentionally does not verify its own
         // freshly-authored proof a second time.
         let local_commit = unsafe {
-            self.state_commit
-                .seal_after_trusted_history_step_proof_unchecked(block, self.terminal_bytes)
+            self.state_commit.seal_after_trusted_history_step_proof_unchecked(
+                block,
+                self.terminal_bytes,
+                self.client_view,
+            )
         }?;
         Ok(ProvedBlock { local_commit })
     }
+}
+
+/// The client lanes an encoded terminal publishes, as the chain checks them:
+/// none under a generation without the client slot. The terminal is decoded,
+/// not verified (this node has just proved it); the lanes are parsed with the
+/// canonicality rules a receiving node applies.
+pub fn terminal_client_view_of(
+    runtime: &HistoryStepRuntime,
+    terminal_bytes: &[u8],
+) -> Result<jetsam_chain::consensus::client_objects::TerminalClientView, String> {
+    use jetsam_chain::consensus::client_objects::{CarriedClient, TerminalClientView};
+    let Some(lanes) = runtime.bank().layout().client else {
+        return Ok(TerminalClientView::default());
+    };
+    let terminal =
+        jetsam_recursive::acceptance::history_step::decode_history_step_terminal(runtime, terminal_bytes)
+            .map_err(|error| format!("prepared HistoryStep terminal does not decode: {error}"))?;
+    let claim = jetsam_recursive::parse_history_step_client_lanes(&lanes, terminal.proof().io())
+        .map_err(|error| format!("prepared HistoryStep terminal client lanes: {error}"))?;
+    Ok(TerminalClientView {
+        carried: claim.carried.map(|carried| CarriedClient {
+            matrix_digest: carried.matrix_digest,
+            io_commitment: carried.io_commitment,
+        }),
+        registry_leaves: Some(claim.registry),
+    })
 }
 
 impl ProvedBlock {
