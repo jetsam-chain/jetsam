@@ -173,12 +173,63 @@ pub fn client_list(
     }
 }
 
+/// The fee `jetsam_walletBuildClientPayment` asks for a client-object
+/// payment of `output_count` live outputs at a tip of `active_slot_count` /
+/// `log_slots`, before the wallet has selected its inputs: enough for any
+/// number of inputs of one page (1 to `TX_INPUTS`). The required fee is
+/// convex in the input count — each input pays `FEE_PER_INPUT`, and each one
+/// up to the output count spares one slot of state growth — so its maximum
+/// over the page is at one end. (A wallet that needs more than a page of
+/// inputs pays more: pass the fee explicitly.)
+pub fn client_payment_required_fee(output_count: u64, active_slot_count: u64, log_slots: u32) -> u64 {
+    [1, jetsam_tx::TX_INPUTS as u64]
+        .into_iter()
+        .map(|inputs| {
+            jetsam_chain::consensus::fees::fee_breakdown(
+                inputs,
+                output_count,
+                active_slot_count,
+                log_slots,
+            )
+            .required_total
+        })
+        .max()
+        .expect("two input counts")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use jetsam_chain::consensus::client_objects::{
         ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
     };
+
+    /// M3.10 (found on the private chain): a registration payment built from
+    /// one input was refused by the mempool (`BelowMinFee: required=12200
+    /// actual=7900`): the fee assumed a full input page was the most
+    /// expensive case, but each input below the output count adds one slot of
+    /// state growth. The fee asked must cover every input count of a page.
+    #[test]
+    fn a_client_payment_fee_covers_every_input_count_of_one_page() {
+        use jetsam_chain::consensus::fees::fee_breakdown;
+        for (active_slot_count, log_slots) in [(0, 20), (1_000, 20), (900_000, 20), (5_000_000, 24)] {
+            // A submission (marker, change), a registration (license,
+            // marker, change), a split license.
+            for output_count in [2u64, 3, 4] {
+                let asked = client_payment_required_fee(output_count, active_slot_count, log_slots);
+                for inputs in 1..=jetsam_tx::TX_INPUTS as u64 {
+                    let required =
+                        fee_breakdown(inputs, output_count, active_slot_count, log_slots)
+                            .required_total;
+                    assert!(
+                        asked >= required,
+                        "{output_count} outputs, {inputs} inputs, {active_slot_count} active: \
+                         asked {asked} < required {required}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_client_payment_names_its_object_by_kind() {

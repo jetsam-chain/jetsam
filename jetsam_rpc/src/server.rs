@@ -2984,14 +2984,12 @@ impl JetsamApiServer for RpcHandler {
             let slot_hints =
                 collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
                     .map_err(rpc_err)?;
-            // One full input page bounds the required fee from above.
-            let required = jetsam_chain::consensus::fees::fee_breakdown(
-                jetsam_tx::TX_INPUTS as u64,
+            // Enough for any input count of one page (state growth included).
+            let required = crate::client_objects::client_payment_required_fee(
                 output_count as u64,
                 tip.active_slot_count,
                 tip.log_slots,
-            )
-            .required_total;
+            );
             (epoch_anchor, tip.log_slots, slot_hints, required)
         };
         let submission_fee = match client_object {
