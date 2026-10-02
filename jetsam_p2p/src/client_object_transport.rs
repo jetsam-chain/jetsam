@@ -136,10 +136,12 @@ impl ClientObjectTransport {
             Self::fail(events, token, peer, request, RequestFailureKind::LocalCapacity);
             return;
         }
-        let request_id = swarm
-            .behaviour_mut()
-            .client_object_sync
-            .send_request(&peer, request);
+        // A node without client objects has no behaviour to ask with.
+        let Some(behaviour) = swarm.behaviour_mut().client_object_sync.as_mut() else {
+            Self::fail(events, token, peer, request, RequestFailureKind::LocalCapacity);
+            return;
+        };
+        let request_id = behaviour.send_request(&peer, request);
         self.pending.insert(
             request_id,
             PendingClientObject {
@@ -362,10 +364,9 @@ impl ClientObjectTransport {
         swarm: &mut Swarm<NodeBehaviour>,
         prepared: PreparedClientObjectResponse,
     ) {
-        let _ = swarm
-            .behaviour_mut()
-            .client_object_sync
-            .send_response(prepared.channel, prepared.response);
+        if let Some(behaviour) = swarm.behaviour_mut().client_object_sync.as_mut() {
+            let _ = behaviour.send_response(prepared.channel, prepared.response);
+        }
     }
 
     /// Fail requests the behaviour lost track of.

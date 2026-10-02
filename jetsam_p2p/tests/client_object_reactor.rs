@@ -223,3 +223,68 @@ async fn two_reactors_serve_fetch_and_announce_client_objects() {
     assert_eq!(from, holder_peer);
     assert_eq!(heard.id, id);
 }
+
+/// The protocols `node` (listening on `port`) advertises to a plain
+/// identify-only probe that dials it.
+async fn advertised_protocols(port: u16) -> Vec<String> {
+    use futures::StreamExt;
+    use libp2p::{identify, noise, swarm::SwarmEvent, tcp, yamux, SwarmBuilder};
+    let mut probe = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+        .unwrap()
+        .with_behaviour(|key| {
+            identify::Behaviour::new(identify::Config::new("/jetsam/1.0.0".into(), key.public()))
+        })
+        .unwrap()
+        .build();
+    let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+    probe.dial(address.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match probe.select_next_some().await {
+                // The node's listener may not be up yet: dial again.
+                SwarmEvent::OutgoingConnectionError { .. } => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    probe.dial(address.clone()).unwrap();
+                }
+                SwarmEvent::Behaviour(identify::Event::Received { info, .. }) => {
+                    return info
+                    .protocols
+                    .iter()
+                    .map(|protocol| protocol.to_string())
+                    .collect::<Vec<_>>();
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the node identifies itself to the probe")
+}
+
+/// M3.10 (§8 trou d): a node without v1.5 client objects (the dormant
+/// release: no v1.5 pack, no clock) does not expose `/client/objects/1` — what
+/// it advertises is what it advertised before v1.5 — while a node with them
+/// does (the positive control that the probe would see it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dormant_node_does_not_advertise_the_client_object_protocol() {
+    let dormant_dir = tempfile::tempdir().unwrap();
+    let armed_dir = tempfile::tempdir().unwrap();
+    let (dormant_port, armed_port) = (free_port(), free_port());
+    let _dormant = start(dormant_dir.path(), dormant_port, None).await;
+    let _armed = start(armed_dir.path(), armed_port, Some(Arc::new(HoldsNothing))).await;
+    let client_protocol = |protocols: &[String]| {
+        protocols
+            .iter()
+            .any(|protocol| protocol.ends_with("/client/objects/1"))
+    };
+    let armed = advertised_protocols(armed_port).await;
+    assert!(client_protocol(&armed), "positive control: {armed:?}");
+    let dormant = advertised_protocols(dormant_port).await;
+    assert!(
+        dormant.iter().any(|protocol| protocol.ends_with("/sync/objects/2")),
+        "the probe reads the dormant node's protocols: {dormant:?}"
+    );
+    assert!(!client_protocol(&dormant), "dormant node advertises: {dormant:?}");
+}

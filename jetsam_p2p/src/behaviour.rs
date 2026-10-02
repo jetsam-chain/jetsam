@@ -187,7 +187,11 @@ pub struct NodeBehaviour {
     /// request, checked against its identity by the codec before it is read.
     /// Optional for the peer: a peer without it answers nothing, and the
     /// requester tries another.
-    pub client_object_sync: request_response::Behaviour<ClientObjectCodec>,
+    ///
+    /// Present only on a node with v1.5 client objects (a v1.5 pack): a
+    /// dormant node neither serves nor advertises the protocol, so what it
+    /// announces through identify is exactly what it announced before v1.5.
+    pub client_object_sync: Toggle<request_response::Behaviour<ClientObjectCodec>>,
 }
 
 impl NodeBehaviour {
@@ -209,6 +213,7 @@ impl NodeBehaviour {
         serve_relay: bool,
         lan_discovery: bool,
         upnp_enabled: bool,
+        client_objects: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -431,7 +436,13 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
-        let client_object_sync = crate::client_object_codec::client_object_behaviour(protocol_id)?;
+        let client_object_sync = Toggle::from(if client_objects {
+            Some(crate::client_object_codec::client_object_behaviour(
+                protocol_id,
+            )?)
+        } else {
+            None
+        });
 
         // ----------------------------------------------------------------
         // Kademlia DHT

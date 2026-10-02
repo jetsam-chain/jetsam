@@ -3679,6 +3679,7 @@ async fn run_swarm(
     let protocol_id = topics.protocol_id.clone();
     let network_profile = NetworkProfile::for_proof_bank(history_proof_bank_id);
     let public_relay_enabled = !public_addresses.is_empty();
+    let serves_client_objects = client_objects.is_some();
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
@@ -3700,6 +3701,7 @@ async fn run_swarm(
                 public_relay_enabled,
                 lan_discovery,
                 upnp_enabled,
+                serves_client_objects,
             )
         })?
         .with_swarm_config(|cfg| {
