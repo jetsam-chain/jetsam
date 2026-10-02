@@ -1088,3 +1088,116 @@ fn a_local_block_passes_the_client_view_checks_of_a_received_one() {
     commit(&mut context, view).unwrap();
     assert_eq!(context.tip_height(), 4);
 }
+
+// ---- M3.10 (§8 gap a): what a recursive suffix re-judges, and what it cannot ----
+
+/// Characterisation of gap (a) of the M3.8 notes, kept as a test so that the
+/// documentation cannot drift from the code. The client lanes of a block
+/// (carried client, registry leaves) are public IO of **its own** terminal; a
+/// node that syncs a recursive suffix reads only the tip's terminal, so for
+/// the intermediate blocks it re-runs the native rules of their objects
+/// (license, registry, submission fee and carriability of a paid `D`) but has
+/// no input that says which client their IO carried. Two chains with the same
+/// bodies and the same tip — one whose block 4 carried its paid submission,
+/// one whose block 4 did not — are therefore the same suffix: a block-by-block
+/// node refuses the second, a suffix node accepts both. What the suffix node
+/// does check about the intermediate blocks' clients is their **claims**:
+/// every claim is folded into its entry's lane and evaluated at the tip
+/// (`jetsam_recursive` … `a_false_claim_of_an_intermediate_block_is_refused_at_the_tip`).
+/// Closing the rest needs the relation to commit to each block's carried
+/// client (decision pending, see the notes); this test then flips.
+#[test]
+fn a_suffix_does_not_rejudge_the_client_lanes_of_its_intermediate_blocks() {
+    let _rules = test_rules::install(armed_rules());
+    let producer_dir = tempfile::tempdir().unwrap();
+    let mut producer = easy_block_context(producer_dir.path());
+    let first = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &first).unwrap();
+    let (registration, object) = registration();
+    let paying = spend_coinbase(
+        &producer,
+        &first,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object.marker(), 0),
+        ],
+    );
+    let second = bundle_with(&mut producer, MINER, vec![paying], vec![object]);
+    apply(&mut producer, &second).unwrap();
+    let third = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &third).unwrap();
+    let submission = ClientSubmission {
+        matrix_digest: registration.matrix_digest,
+        io_commitment: [0x10; 32],
+    };
+    let submission_object = ClientObject::Submission(submission);
+    let fee_page = spend_coinbase(&producer, &third, &[(submission_object.marker(), 0)]);
+    let fourth = bundle_with(&mut producer, MINER, vec![fee_page], vec![submission_object]);
+    let carried = Some(CarriedClient {
+        matrix_digest: submission.matrix_digest,
+        io_commitment: submission.io_commitment,
+    });
+    let view = honest_view(&producer, &[], carried);
+    apply_with_view(&mut producer, &fourth, view).unwrap();
+    let fifth = test_next_bundle_for_miner(&producer, MINER);
+    let tip_view = honest_view(&producer, &[], None);
+    apply_with_view(&mut producer, &fifth, tip_view.clone()).unwrap();
+    let bodies = [&first, &second, &third, &fourth, &fifth];
+
+    // A block-by-block node, given block 4's IO without the paid client
+    // (or block 3's IO carrying D1 before it is carriable), refuses it.
+    for (lying_height, lie, expected) in [
+        (4u64, None, ClientObjectError::SubmissionNotCarried),
+        (
+            3,
+            carried,
+            ClientObjectError::ClientNotYetActive {
+                matrix_digest: registration.matrix_digest,
+                active_from: 4,
+            },
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut judge = easy_block_context(directory.path());
+        for bundle in bodies {
+            let height = Block::from_bytes(bundle.block_bytes()).unwrap().header.height;
+            if height == lying_height {
+                let view = honest_view(&judge, &[], lie);
+                refused_with(apply_with_view(&mut judge, bundle, view), expected);
+                break;
+            }
+            apply(&mut judge, bundle).unwrap();
+        }
+        assert_eq!(judge.tip_height(), lying_height - 1);
+    }
+
+    // A suffix node reads the tip's terminal only: the same bodies and tip
+    // are accepted, whichever IO the intermediate blocks had.
+    let directory = tempfile::tempdir().unwrap();
+    let mut suffix = easy_block_context(directory.path());
+    let genesis = suffix.get_header_from_store(0).unwrap().unwrap();
+    let tip = Block::from_bytes(fifth.block_bytes()).unwrap();
+    let mut authority = suffix
+        .verify_recursive_suffix(
+            tip.header,
+            genesis,
+            fifth.history_step_terminal_bytes().to_vec(),
+            move |_| Ok(tip_view),
+        )
+        .unwrap();
+    for bundle in bodies {
+        suffix
+            .apply_verified_recursive_suffix_block(
+                &mut authority,
+                bundle.block_bytes(),
+                Block::from_bytes(bundle.block_bytes()).unwrap().header.timestamp,
+                |block, state| {
+                    crate::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(suffix.tip_height(), 5);
+    assert_eq!(suffix.client_registry().digests(), vec![registration.matrix_digest]);
+}
