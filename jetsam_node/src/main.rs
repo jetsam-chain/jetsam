@@ -10427,6 +10427,14 @@ async fn handle_p2p_events(
                 announcement,
                 source_has_objects,
             }) => {
+                // A peer that served an invalid block or terminal (M3.10) no
+                // longer brings headers: one it alone can supply would hold
+                // the best-tip selection while nobody can fetch it.
+                if rejected_suffix_object_peers.contains(&from)
+                    || rejected_terminal_peers.contains(&from)
+                {
+                    continue;
+                }
                 let announced_header = announcement.header;
                 let exact_inventory = (source_has_objects && manifest_peers.contains(&from))
                     .then(|| {
@@ -11572,6 +11580,13 @@ async fn handle_p2p_events(
                 let header_count = records.len();
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+                // See the announcement path: a rejected source brings no
+                // headers (M3.10).
+                if rejected_suffix_object_peers.contains(&from)
+                    || rejected_terminal_peers.contains(&from)
+                {
+                    continue;
+                }
                 if !rejected_suffix_object_peers.contains(&from) {
                     let domain = peer_failure_domains
                         .get(&from)
@@ -13754,6 +13769,23 @@ async fn handle_p2p_events(
                             &mut highest_announced,
                             block,
                             committed_height,
+                        );
+                    } else if terminal_rejected
+                        && !header_dag.has_inventory(&completed.target.hash)
+                    {
+                        // Its only providers served a terminal that does not
+                        // verify (M3.10): nothing can be fetched for this tip,
+                        // so it must not hold the selection. Forgotten, not
+                        // condemned: an honest provider may still bring it.
+                        let best_changed = header_dag.forget(&completed.target.hash);
+                        let committed_height = chain.read().await.tip_height();
+                        highest_announced = committed_height.max(header_dag.best_tip().height);
+                        tracing::warn!(
+                            height = completed.target.height,
+                            hash = %hex::encode(&completed.target.hash[..8]),
+                            best_changed,
+                            best_height = header_dag.best_tip().height,
+                            "tip whose terminal every provider failed forgotten"
                         );
                     }
                     tracing::warn!(

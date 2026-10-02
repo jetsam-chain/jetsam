@@ -121,27 +121,64 @@ impl HeaderDag {
             // A finalized block was committed; nothing refuses it later.
             return false;
         }
-        let mut condemned = HashSet::from([*hash]);
+        let condemned = self.remove_with_descendants(hash);
+        self.invalid.extend(condemned);
+        self.reselect_best()
+    }
+
+    /// Whether `hash` was condemned.
+    pub fn is_invalid(&self, hash: &Hash32) -> bool {
+        self.invalid.contains(hash)
+    }
+
+    /// Whether any provider still advertises the objects of `hash`.
+    pub fn has_inventory(&self, hash: &Hash32) -> bool {
+        self.inventories
+            .get(hash)
+            .is_some_and(|providers| !providers.is_empty())
+    }
+
+    /// Forget the header `hash` and its descendants without condemning them
+    /// (M3.10): their objects were refused from every provider that offered
+    /// them, so nothing can be fetched for them, and a tip nobody can supply
+    /// must not hold the best-tip selection. Unlike [`Self::invalidate`] they
+    /// may come back, announced again by a provider. Returns whether the best
+    /// tip changed.
+    pub fn forget(&mut self, hash: &Hash32) -> bool {
+        if *hash == self.finalized.hash {
+            return false;
+        }
+        self.remove_with_descendants(hash);
+        self.reselect_best()
+    }
+
+    /// Remove `hash` and every descendant the DAG holds; returns them.
+    fn remove_with_descendants(&mut self, hash: &Hash32) -> HashSet<Hash32> {
+        let mut removed = HashSet::from([*hash]);
         loop {
             let descendants: Vec<Hash32> = self
                 .nodes
                 .values()
                 .filter(|node| {
-                    !condemned.contains(&node.hash)
-                        && condemned.contains(&node.header.prev_block_hash)
+                    !removed.contains(&node.hash) && removed.contains(&node.header.prev_block_hash)
                 })
                 .map(|node| node.hash)
                 .collect();
             if descendants.is_empty() {
                 break;
             }
-            condemned.extend(descendants);
+            removed.extend(descendants);
         }
-        for hash in &condemned {
+        for hash in &removed {
             self.nodes.remove(hash);
             self.inventories.remove(hash);
         }
-        self.invalid.extend(condemned);
+        removed
+    }
+
+    /// Choose the best tip again, by work, among what the DAG holds (the
+    /// finalized point at worst). Returns whether it changed.
+    fn reselect_best(&mut self) -> bool {
         let previous = self.best;
         let (mut best, mut best_work) = (self.finalized, self.finalized_work);
         for node in self.nodes.values() {
@@ -156,11 +193,6 @@ impl HeaderDag {
         self.best = best;
         self.best_work = best_work;
         self.best != previous
-    }
-
-    /// Whether `hash` was condemned.
-    pub fn is_invalid(&self, hash: &Hash32) -> bool {
-        self.invalid.contains(hash)
     }
 
     pub const fn finalized(&self) -> ChainPoint {
@@ -681,6 +713,37 @@ mod tests {
         assert!(dag.invalidate(&honest_1.hash));
         assert_eq!(dag.best_tip(), finalized);
         assert!(dag.is_empty());
+    }
+
+    /// M3.10: a selected tip whose objects every provider failed to supply
+    /// is forgotten (with its descendants): the best tip falls back to what
+    /// can be fetched, and the header may be admitted again later.
+    #[test]
+    fn an_unprovidable_tip_is_forgotten_but_not_condemned() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let honest = child(genesis, [1; 32], 1);
+        dag.insert(honest).unwrap();
+        let withheld = child(honest.header, honest.cumulative_work, 2);
+        let above = child(withheld.header, withheld.cumulative_work, 3);
+        dag.insert(withheld).unwrap();
+        dag.insert(above).unwrap();
+        let liar = PeerId::random();
+        dag.advertise_inventory(liar, &[inventory(withheld, 1, true)]).unwrap();
+        assert!(dag.has_inventory(&withheld.hash));
+        assert!(!dag.has_inventory(&above.hash));
+        dag.remove_inventory_provider(liar);
+        assert!(!dag.has_inventory(&withheld.hash));
+
+        assert!(dag.forget(&withheld.hash));
+        assert_eq!(dag.best_tip(), honest.point());
+        assert!(dag.get(&withheld.hash).is_none() && dag.get(&above.hash).is_none());
+        assert!(!dag.is_invalid(&withheld.hash), "forgotten, not condemned");
+        assert!(matches!(
+            dag.insert(withheld).unwrap(),
+            HeaderDagUpdate::NewBest { best, .. } if best == withheld.point()
+        ));
     }
 
     #[test]
