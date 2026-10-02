@@ -288,3 +288,111 @@ async fn a_dormant_node_does_not_advertise_the_client_object_protocol() {
     );
     assert!(!client_protocol(&dormant), "dormant node advertises: {dormant:?}");
 }
+
+/// M3.10 (§8 gap b): a registration one node holds reaches another node over
+/// the client topic, whole (registration and paying transaction), so that any
+/// miner can include it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_registration_is_relayed_to_every_node() {
+    use jetsam_chain::consensus::client_objects::{
+        ClientObject, ClientObjectRules, ClientRegistration, CLIENT_LICENSE_BURN_ADDRESS,
+    };
+    use jetsam_p2p::client_object_protocol::ClientRegistrationNotice;
+    use jetsam_poseidon2b::primitives::Address;
+    use jetsam_tx::{
+        output_bitmap_bit, PagedSpendIntent, TxBody, TxInput, TxOutput, TxPage,
+        PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+    };
+    let rules = ClientObjectRules::current();
+    let registration = ClientRegistration {
+        matrix_digest: [0x31; 32],
+        matrix_file_root: [0x32; 32],
+        matrix_file_len: 4_096,
+    };
+    let marker = ClientObject::Registration(registration).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    let notice_paying_fee = |fee: u64| {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 300,
+            amount: license + fee,
+            creation_id: 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 301,
+            amount: license,
+            owner: CLIENT_LICENSE_BURN_ADDRESS,
+        };
+        outputs[1] = TxOutput {
+            slot_index: 302,
+            amount: 0,
+            owner: marker,
+        };
+        let payment = PagedSpendIntent::new(
+            vec![TxPage {
+                body: TxBody {
+                    epoch_anchor: [7u8; 32],
+                    fee,
+                    input_owner: Address([0x51; 32]),
+                    inputs,
+                    outputs,
+                    validity_bitmap: 1
+                        | output_bitmap_bit(0)
+                        | output_bitmap_bit(1)
+                        | PAGED_SPEND_START_BIT
+                        | PAGED_SPEND_END_BIT,
+                    is_coinbase: false,
+                },
+            }],
+            vec![0xA5; 64],
+        )
+        .unwrap();
+        ClientRegistrationNotice::new(registration, payment, &rules).unwrap()
+    };
+    let holder_dir = tempfile::tempdir().unwrap();
+    let asker_dir = tempfile::tempdir().unwrap();
+    let holder_port = free_port();
+    let holder = start(holder_dir.path(), holder_port, Some(Arc::new(HoldsNothing))).await;
+    let asker = start(asker_dir.path(), free_port(), Some(Arc::new(HoldsNothing))).await;
+    let mut asker_events = asker.subscribe();
+    asker
+        .dial(format!("/ip4/127.0.0.1/tcp/{holder_port}").parse().unwrap())
+        .await;
+    let holder_peer: PeerId = next_matching(&mut asker_events, Duration::from_secs(30), |event| {
+        match event {
+            NetworkEvent::PeerConnected { peer, .. } => Some(peer),
+            _ => None,
+        }
+    })
+    .await
+    .expect("the two nodes connect");
+
+    // Repeated (with distinct bytes: gossip deduplicates by content) until
+    // the mesh has formed.
+    let mut received = None;
+    for attempt in 0..30u64 {
+        let notice = Arc::new(notice_paying_fee(2_000_000 + attempt));
+        holder
+            .cmd_tx
+            .send(NetworkCommand::AnnounceClientRegistration {
+                notice: Arc::clone(&notice),
+            })
+            .await
+            .unwrap();
+        received = next_matching(&mut asker_events, Duration::from_secs(2), |event| match event {
+            NetworkEvent::ClientRegistrationRelayed { relayed_by, notice } => {
+                Some((relayed_by, notice))
+            }
+            _ => None,
+        })
+        .await;
+        if received.is_some() {
+            break;
+        }
+    }
+    let (relayed_by, heard) = received.expect("the registration is relayed");
+    assert_eq!(relayed_by, holder_peer);
+    assert_eq!(heard.registration, registration);
+    assert_eq!(heard.payment.pages[0].body.outputs[1].owner, marker);
+}

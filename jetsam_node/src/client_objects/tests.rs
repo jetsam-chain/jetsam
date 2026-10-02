@@ -484,3 +484,53 @@ fn a_registration_is_held_with_its_matrix_until_a_block_makes_it() {
     // Once registered on chain it is no longer offered.
     assert!(MinerClientSource::held_registrations(&objects, &registry_of(&[&client])).is_empty());
 }
+
+/// M3.10 (§8 gap b): a registration relayed by a peer is held for this
+/// node's miner exactly like one handed to it, unless the chain already has
+/// its `D` or a full registry; relayed again, it is not held twice.
+#[test]
+fn a_relayed_registration_is_held_for_this_nodes_miner() {
+    use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+    use jetsam_miner::client_slot::MinerClientSource;
+    use jetsam_p2p::client_object_protocol::ClientRegistrationNotice;
+    let form = test_form();
+    let client = TestClient::new(&form, 0xC7);
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let rules = rules();
+    let registration = objects.registration_of_matrix_file(&client.file).unwrap();
+    let marker = ClientObject::Registration(registration).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    let notice = ClientRegistrationNotice::new(
+        registration,
+        payment_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)], 1_000),
+        &rules,
+    )
+    .unwrap();
+    let empty = ClientRegistryState::new();
+
+    // Already on chain: refused, nothing held.
+    assert!(objects
+        .hold_relayed_registration(&notice, &registry_of(&[&client]), &rules)
+        .is_err());
+    assert!(MinerClientSource::held_registrations(&objects, &empty).is_empty());
+    // A full registry: refused.
+    let full_rules = ClientObjectRules {
+        registry_capacity: 1,
+        ..rules
+    };
+    let other = TestClient::new(&form, 0xC8);
+    assert!(objects
+        .hold_relayed_registration(&notice, &registry_of(&[&other]), &full_rules)
+        .is_err());
+    assert!(MinerClientSource::held_registrations(&objects, &empty).is_empty());
+
+    // Otherwise held, once, with its payment; the matrix is not required.
+    assert!(objects.hold_relayed_registration(&notice, &empty, &rules).unwrap());
+    assert!(!objects.hold_relayed_registration(&notice, &empty, &rules).unwrap());
+    let held = MinerClientSource::held_registrations(&objects, &empty);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].0, registration);
+    assert_eq!(held[0].1, notice.payment);
+    assert!(!objects.holds_matrix(&client.digest()));
+}

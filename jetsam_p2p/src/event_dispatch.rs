@@ -293,6 +293,7 @@ fn classify(event: &NetworkEvent) -> EventClass {
         NetworkEvent::NewTx { .. }
         | NetworkEvent::MempoolSyncResponse { .. }
         | NetworkEvent::ClientProofAnnounced { .. }
+        | NetworkEvent::ClientRegistrationRelayed { .. }
         | NetworkEvent::ClientObjectFetched { .. }
         | NetworkEvent::ClientObjectFetchFailed { .. } => EventClass::Background,
     }

@@ -2857,17 +2857,38 @@ impl JetsamApiServer for RpcHandler {
             .check_client_payment(&payment)
             .await
             .map_err(|error| rpc_err(format!("license payment: {error}")))?;
+        let relayed_payment = payment.clone();
         let registration = tokio::task::spawn_blocking(move || {
             objects.hold_client_registration(payment, &matrix_file, &rules)
         })
         .await
         .map_err(|error| rpc_err(error.to_string()))?
         .map_err(rpc_err)?;
+        // Relayed whole to the peers, for any miner to include it (M3.10,
+        // §8 gap b); held here whatever the relay does.
+        let relayed = match jetsam_p2p::client_object_protocol::ClientRegistrationNotice::new(
+            registration,
+            relayed_payment,
+            &rules,
+        ) {
+            Ok(notice) => self
+                .p2p_cmd
+                .send(jetsam_p2p::NetworkCommand::AnnounceClientRegistration {
+                    notice: std::sync::Arc::new(notice),
+                })
+                .await
+                .is_ok(),
+            Err(error) => {
+                tracing::warn!(%error, "client registration held but not relayed");
+                false
+            }
+        };
         Ok(crate::client_objects::RegisterClientResponse {
             matrix_digest: hex::encode(registration.matrix_digest),
             matrix_file_root: hex::encode(registration.matrix_file_root),
             matrix_file_len: registration.matrix_file_len,
             next_index: registry.len(),
+            relayed,
         })
     }
 

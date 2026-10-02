@@ -8528,6 +8528,47 @@ fn spawn_client_proof_reception(
     });
 }
 
+/// Hold a client registration relayed by a peer (M3.10, §8 gap b) for this
+/// node's miner, off the event loop: client objects active at the next
+/// height, its payment admissible against the current state (the mempool's
+/// admission rules, without admitting it: a paying transaction travels only
+/// with its object), its `D` not registered and the registry not full. The
+/// transport already checked that the payment opens and pays it, and gossip
+/// forwards it to the other peers.
+fn spawn_client_registration_reception(
+    objects: Arc<jetsam_node::client_objects::ClientObjects>,
+    chain: Arc<RwLock<MdbxChainContext>>,
+    mempool: AsyncMempool,
+    relayed_by: libp2p::PeerId,
+    notice: Arc<jetsam_p2p::client_object_protocol::ClientRegistrationNotice>,
+) {
+    tokio::spawn(async move {
+        let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let digest = hex::encode(notice.registration.matrix_digest);
+        let (registry, tip_height) = {
+            let ctx = chain.read().await;
+            (ctx.client_registry().clone(), ctx.tip_height())
+        };
+        if !rules.active_at(tip_height.saturating_add(1)) {
+            tracing::debug!(peer = %relayed_by, matrix_digest = %digest, "client registration relayed before the v1.5 height: ignored");
+            return;
+        }
+        if let Err(error) = mempool.check_client_payment(&notice.payment).await {
+            tracing::info!(peer = %relayed_by, matrix_digest = %digest, %error, "relayed client registration's payment refused");
+            return;
+        }
+        match objects.hold_relayed_registration(&notice, &registry, &rules) {
+            Ok(true) => tracing::info!(
+                peer = %relayed_by,
+                matrix_digest = %digest,
+                "client registration relayed and held for the miner"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::info!(peer = %relayed_by, matrix_digest = %digest, %error, "relayed client registration refused"),
+        }
+    });
+}
+
 async fn handle_p2p_events(
     mut rx: jetsam_p2p::NetworkEventReceiver,
     chain: Arc<RwLock<MdbxChainContext>>,
@@ -10898,6 +10939,17 @@ async fn handle_p2p_events(
                     let connected: Vec<libp2p::PeerId> =
                         peer_failure_domains.keys().copied().collect();
                     dispatch_client_object_requests(objects, &p2p_cmd, &connected);
+                }
+            }
+            Ok(NetworkEvent::ClientRegistrationRelayed { relayed_by, notice }) => {
+                if let Some(objects) = &client_objects {
+                    spawn_client_registration_reception(
+                        Arc::clone(objects),
+                        Arc::clone(&chain),
+                        mempool.clone(),
+                        relayed_by,
+                        notice,
+                    );
                 }
             }
             Ok(NetworkEvent::ClientObjectFetched {

@@ -326,3 +326,158 @@ fn an_unavailable_or_gone_provider_is_skipped_without_penalty() {
     assert!(!fetcher.is_wanted(&proof.id), "its only other provider said no");
     assert!(fetcher.next_requests().is_empty());
 }
+
+// ---- M3.10 (§8 gap b): registrations relayed whole on the client topic ----
+
+use jetsam_chain::consensus::client_objects::{
+    ClientObjectError, ClientObjectRules, ClientRegistration, CLIENT_LICENSE_BURN_ADDRESS,
+};
+
+fn registration(d: u8) -> ClientRegistration {
+    ClientRegistration {
+        matrix_digest: [d; 32],
+        matrix_file_root: [d ^ 0xFF; 32],
+        matrix_file_len: 4_096,
+    }
+}
+
+fn notice_rules() -> ClientObjectRules {
+    ClientObjectRules {
+        activation_height: Some(1),
+        ..ClientObjectRules::CONSENSUS
+    }
+}
+
+/// One page paying `outputs` (owner, amount), `fee` μJTM.
+pub(super) fn page_paying(outputs: &[(Address, u64)], fee: u64) -> PagedSpendIntent {
+    let mut inputs = [TxInput::dummy(); TX_INPUTS];
+    inputs[0] = TxInput {
+        slot_index: 300,
+        amount: outputs.iter().map(|(_, amount)| amount).sum::<u64>() + fee,
+        creation_id: 1,
+    };
+    let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+    let mut bitmap = 1 | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT;
+    for (index, (owner, amount)) in outputs.iter().enumerate() {
+        page_outputs[index] = TxOutput {
+            slot_index: 301 + index as u32,
+            amount: *amount,
+            owner: *owner,
+        };
+        bitmap |= output_bitmap_bit(index);
+    }
+    PagedSpendIntent::new(
+        vec![TxPage {
+            body: TxBody {
+                epoch_anchor: [7u8; 32],
+                fee,
+                input_owner: Address([0x51; 32]),
+                inputs,
+                outputs: page_outputs,
+                validity_bitmap: bitmap,
+                is_coinbase: false,
+            },
+        }],
+        vec![0xA5; 64],
+    )
+    .unwrap()
+}
+
+/// A notice for `registration(d)` whose payment pays the license.
+pub(super) fn paid_notice(d: u8, fee: u64) -> ClientRegistrationNotice {
+    let rules = notice_rules();
+    let registration = registration(d);
+    let marker = ClientObject::Registration(registration).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    ClientRegistrationNotice::new(
+        registration,
+        page_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)], fee),
+        &rules,
+    )
+    .unwrap()
+}
+
+#[test]
+fn registration_notices_round_trip_and_are_told_from_announcements() {
+    let rules = notice_rules();
+    let notice = paid_notice(0x31, 2_000);
+    let bytes = notice.encode();
+    assert!(bytes.len() <= MAX_CLIENT_REGISTRATION_NOTICE_BYTES);
+    assert!(ClientRegistrationNotice::is_notice(&bytes));
+    assert_eq!(ClientRegistrationNotice::decode(&bytes, &rules), Ok(notice));
+    let announcement = ClientProofAnnouncement {
+        id: bundle(0x10, 0x20, 1_000).id(),
+        fee: 5,
+    };
+    assert!(!ClientRegistrationNotice::is_notice(&announcement.encode()));
+}
+
+#[test]
+fn a_registration_notice_carries_a_paid_registration_and_nothing_else() {
+    let rules = notice_rules();
+    let registration = registration(0x31);
+    let marker = ClientObject::Registration(registration).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    // No license.
+    assert_eq!(
+        ClientRegistrationNotice::new(registration, page_paying(&[(marker, 0)], 2_000), &rules),
+        Err(ClientTransportError::RegistrationRefused(
+            ClientObjectError::LicenseMissing {
+                destination: CLIENT_LICENSE_BURN_ADDRESS,
+                required: license,
+            }
+        ))
+    );
+    // A license paid for another registration.
+    let other = ClientObject::Registration(super::tests::registration(0x32)).marker();
+    assert_eq!(
+        ClientRegistrationNotice::new(
+            registration,
+            page_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (other, 0)], 2_000),
+            &rules
+        ),
+        Err(ClientTransportError::RegistrationRefused(
+            ClientObjectError::ObjectsDoNotMatchMarkers
+        ))
+    );
+    // The same refusals on the wire: a relay cannot swap the payment.
+    let honest = paid_notice(0x31, 2_000).encode();
+    let foreign = paid_notice(0x32, 2_000).encode();
+    let mut swapped = honest[..CLIENT_REGISTRATION_NOTICE_FIXED_BYTES].to_vec();
+    swapped.extend_from_slice(&foreign[CLIENT_REGISTRATION_NOTICE_FIXED_BYTES..]);
+    assert_eq!(
+        ClientRegistrationNotice::decode(&swapped, &rules),
+        Err(ClientTransportError::RegistrationRefused(
+            ClientObjectError::ObjectsDoNotMatchMarkers
+        ))
+    );
+    // Malformed: cut, trailing, magic, a payment declared past the bound.
+    for cut in [0, 3, 4, 40, CLIENT_REGISTRATION_NOTICE_FIXED_BYTES, honest.len() - 1] {
+        assert!(
+            ClientRegistrationNotice::decode(&honest[..cut], &rules).is_err(),
+            "cut {cut}"
+        );
+    }
+    let mut trailing = honest.clone();
+    trailing.push(0);
+    assert_eq!(
+        ClientRegistrationNotice::decode(&trailing, &rules),
+        Err(ClientTransportError::TrailingBytes)
+    );
+    let mut magic = honest.clone();
+    magic[0] ^= 1;
+    assert_eq!(
+        ClientRegistrationNotice::decode(&magic, &rules),
+        Err(ClientTransportError::BadMagic)
+    );
+    let max_payment = MAX_CLIENT_REGISTRATION_NOTICE_BYTES - CLIENT_REGISTRATION_NOTICE_FIXED_BYTES - 4;
+    let mut too_large = honest[..CLIENT_REGISTRATION_NOTICE_FIXED_BYTES].to_vec();
+    too_large.extend_from_slice(&((max_payment + 1) as u32).to_le_bytes());
+    assert_eq!(
+        ClientRegistrationNotice::decode(&too_large, &rules),
+        Err(ClientTransportError::PaymentTooLarge {
+            actual: max_payment + 1,
+            max: max_payment,
+        })
+    );
+}

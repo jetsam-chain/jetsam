@@ -210,7 +210,8 @@ fn classify(command: &NetworkCommand) -> CommandClass {
         | RequestHistoryStepTerminal { .. }
         | RequestMempoolSync { .. }
         | FetchClientObject { .. }
-        | AnnounceClientProof { .. } => CommandClass::Data,
+        | AnnounceClientProof { .. }
+        | AnnounceClientRegistration { .. } => CommandClass::Data,
     }
 }
 

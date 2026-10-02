@@ -22,7 +22,8 @@
 //!   bundle bytes are kept on disk under `client-objects/proofs/`, so a node
 //!   that restarts keeps its queue, and served to peers.
 //! - **Registrations** submitted to this node (RPC) are held with their
-//!   paying transaction until a block of this node's miner carries them.
+//!   paying transaction until a block carries them, and relayed whole to
+//!   peers, which hold them for their own miners (M3.10, §8 gap b).
 //!
 //! This node serves what it holds ([`ClientObjectSource`]).
 
@@ -738,6 +739,48 @@ impl ClientObjects {
             payment,
         })?;
         Ok(registration)
+    }
+
+    /// Hold a registration relayed by a peer (§8 gap b), its payment already
+    /// checked to open and pay it (by the transport) and against this node's
+    /// state (by the caller, through the mempool): refused if `D` is already
+    /// registered with `registry` or the registry is full. Returns whether it
+    /// is newly held (a registration already held keeps its first payment).
+    pub fn hold_relayed_registration(
+        &self,
+        notice: &jetsam_p2p::client_object_protocol::ClientRegistrationNotice,
+        registry: &ClientRegistryState,
+        rules: &ClientObjectRules,
+    ) -> Result<bool, ClientObjectsError> {
+        let digest = notice.registration.matrix_digest;
+        if registry.entry(&digest).is_some() {
+            return Err(ClientObjectsError::Registration(
+                "this client is already registered".into(),
+            ));
+        }
+        if registry.len()
+            >= rules
+                .registry_capacity
+                .min(jetsam_chain::consensus::client_objects::CLIENT_REGISTRY_CAPACITY)
+        {
+            return Err(ClientObjectsError::Registration(
+                "the client registry is full".into(),
+            ));
+        }
+        if self
+            .state
+            .lock()
+            .expect("client objects lock")
+            .registrations
+            .contains_key(&digest)
+        {
+            return Ok(false);
+        }
+        self.hold_registration(HeldRegistration {
+            registration: notice.registration,
+            payment: notice.payment.clone(),
+        })?;
+        Ok(true)
     }
 
     /// Hold a registration for this node's miner.

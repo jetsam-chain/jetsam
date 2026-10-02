@@ -81,6 +81,14 @@ pub enum ClientTransportError {
     NotThePayment,
     /// The bytes are not those of the requested id.
     WrongBytes,
+    /// A registration notice whose payment does not open and pay exactly its
+    /// registration (the consensus check of the paying transaction alone).
+    RegistrationRefused(jetsam_chain::consensus::client_objects::ClientObjectError),
+    /// A registration notice larger than a gossip message.
+    NoticeTooLarge {
+        actual: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for ClientTransportError {
@@ -272,6 +280,147 @@ impl ClientProofAnnouncement {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Registrations relayed to every miner
+// ---------------------------------------------------------------------------
+
+const REGISTRATION_NOTICE_MAGIC: [u8; 4] = *b"JCR1";
+
+/// Fixed bytes of a registration notice: magic, `D`, file root, file length.
+pub const CLIENT_REGISTRATION_NOTICE_FIXED_BYTES: usize = 4 + 32 + 32 + 4;
+
+/// Largest registration notice. It travels whole on the client topic, so it
+/// is bounded by the gossip cap (one payment intent): the payment it carries
+/// is at most this minus the fixed bytes.
+pub const MAX_CLIENT_REGISTRATION_NOTICE_BYTES: usize = MAX_PAGED_SPEND_INTENT_BYTES;
+
+/// A client registration a node holds for its miner, relayed whole on the
+/// client topic (§8 of the M3.8 notes, gap b): any miner that receives it can
+/// include it. The registration and the ordinary transaction that pays its
+/// license and carries its marker; the payment's authorization and inputs are
+/// checked by each node against its own state before it holds the notice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRegistrationNotice {
+    pub registration: jetsam_chain::consensus::client_objects::ClientRegistration,
+    pub payment: PagedSpendIntent,
+}
+
+impl ClientRegistrationNotice {
+    /// A notice for `registration` paid by `payment`, refused unless the
+    /// payment opens exactly this registration and pays its license under
+    /// `rules`, and unless it fits a gossip message.
+    pub fn new(
+        registration: jetsam_chain::consensus::client_objects::ClientRegistration,
+        payment: PagedSpendIntent,
+        rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+    ) -> Result<Self, ClientTransportError> {
+        let payment_len = payment
+            .to_bytes()
+            .map_err(|_| ClientTransportError::MalformedPayment)?
+            .len();
+        let max = MAX_CLIENT_REGISTRATION_NOTICE_BYTES - CLIENT_REGISTRATION_NOTICE_FIXED_BYTES - 4;
+        if payment_len > max {
+            return Err(ClientTransportError::NoticeTooLarge {
+                actual: CLIENT_REGISTRATION_NOTICE_FIXED_BYTES + 4 + payment_len,
+                max: MAX_CLIENT_REGISTRATION_NOTICE_BYTES,
+            });
+        }
+        check_registration_paid(&registration, &payment, rules)?;
+        Ok(Self {
+            registration,
+            payment,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let payment = self
+            .payment
+            .to_bytes()
+            .expect("a notice's payment is a canonical intent");
+        let mut bytes =
+            Vec::with_capacity(CLIENT_REGISTRATION_NOTICE_FIXED_BYTES + 4 + payment.len());
+        bytes.extend_from_slice(&REGISTRATION_NOTICE_MAGIC);
+        bytes.extend_from_slice(&self.registration.matrix_digest);
+        bytes.extend_from_slice(&self.registration.matrix_file_root);
+        bytes.extend_from_slice(&self.registration.matrix_file_len.to_le_bytes());
+        bytes.extend_from_slice(&(payment.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payment);
+        bytes
+    }
+
+    /// Decode a notice, its payment bounded before it is read, then checked
+    /// to open and pay exactly its registration under `rules`.
+    pub fn decode(
+        bytes: &[u8],
+        rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+    ) -> Result<Self, ClientTransportError> {
+        if bytes.len() > MAX_CLIENT_REGISTRATION_NOTICE_BYTES {
+            return Err(ClientTransportError::NoticeTooLarge {
+                actual: bytes.len(),
+                max: MAX_CLIENT_REGISTRATION_NOTICE_BYTES,
+            });
+        }
+        let mut src = bytes;
+        if take(&mut src, 4)? != REGISTRATION_NOTICE_MAGIC {
+            return Err(ClientTransportError::BadMagic);
+        }
+        let registration = jetsam_chain::consensus::client_objects::ClientRegistration {
+            matrix_digest: take_hash(&mut src)?,
+            matrix_file_root: take_hash(&mut src)?,
+            matrix_file_len: take_u32(&mut src)?,
+        };
+        let payment_len = take_u32(&mut src)? as usize;
+        let max = MAX_CLIENT_REGISTRATION_NOTICE_BYTES - CLIENT_REGISTRATION_NOTICE_FIXED_BYTES - 4;
+        if payment_len > max {
+            return Err(ClientTransportError::PaymentTooLarge {
+                actual: payment_len,
+                max,
+            });
+        }
+        let payment = PagedSpendIntent::from_bytes(take(&mut src, payment_len)?)
+            .map_err(|_| ClientTransportError::MalformedPayment)?;
+        if !src.is_empty() {
+            return Err(ClientTransportError::TrailingBytes);
+        }
+        check_registration_paid(&registration, &payment, rules)?;
+        Ok(Self {
+            registration,
+            payment,
+        })
+    }
+
+    /// Whether gossip bytes are a registration notice (by their magic).
+    pub fn is_notice(bytes: &[u8]) -> bool {
+        bytes.starts_with(&REGISTRATION_NOTICE_MAGIC)
+    }
+}
+
+/// The consensus check of a registration's paying transaction alone
+/// (`check_registration_payment`): admissible registration, exactly one
+/// zero-value marker opening it, the license paid to every destination.
+fn check_registration_paid(
+    registration: &jetsam_chain::consensus::client_objects::ClientRegistration,
+    payment: &PagedSpendIntent,
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Result<(), ClientTransportError> {
+    let pages: Vec<jetsam_tx::Transaction> = payment
+        .pages
+        .iter()
+        .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
+        .collect();
+    jetsam_chain::consensus::client_objects::check_registration_payment(
+        &pages,
+        registration,
+        rules,
+    )
+    .map_err(ClientTransportError::RegistrationRefused)
+}
+
+const _: () = assert!(
+    MAX_CLIENT_REGISTRATION_NOTICE_BYTES
+        <= jetsam_chain::consensus::wire_limits::MAX_TX_INTENT_BYTES_GLOBAL
+);
 
 // ---------------------------------------------------------------------------
 // Registered matrix files

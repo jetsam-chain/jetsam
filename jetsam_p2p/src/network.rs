@@ -3105,6 +3105,11 @@ pub enum NetworkCommand {
     AnnounceClientProof {
         announcement: crate::client_object_protocol::ClientProofAnnouncement,
     },
+    /// Relay a client registration this node holds (with its payment) on the
+    /// client topic, for every miner to include it.
+    AnnounceClientRegistration {
+        notice: Arc<crate::client_object_protocol::ClientRegistrationNotice>,
+    },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -3117,6 +3122,13 @@ pub enum NetworkEvent {
         from: PeerId,
         relayed_by: PeerId,
         announcement: crate::client_object_protocol::ClientProofAnnouncement,
+    },
+    /// A v1.5 client registration relayed on the client topic, its payment
+    /// already checked to open and pay it; the node checks the payment
+    /// against its state before holding it for its miner.
+    ClientRegistrationRelayed {
+        relayed_by: PeerId,
+        notice: Arc<crate::client_object_protocol::ClientRegistrationNotice>,
     },
     /// One client object fetched with `FetchClientObject`: its bytes are
     /// exactly the requested object (checked by the codec).
@@ -5691,6 +5703,10 @@ fn client_transport_command(
             transport.announce(swarm, announcement);
             None
         }
+        NetworkCommand::AnnounceClientRegistration { notice } => {
+            transport.announce_registration(swarm, &notice);
+            None
+        }
         cmd => Some(cmd),
     }
 }
@@ -6293,7 +6309,9 @@ async fn handle_network_command(
             );
             debug_assert!(inserted, "fresh snapshot header request ID must be unique");
         }
-        NetworkCommand::FetchClientObject { .. } | NetworkCommand::AnnounceClientProof { .. } => {
+        NetworkCommand::FetchClientObject { .. }
+        | NetworkCommand::AnnounceClientProof { .. }
+        | NetworkCommand::AnnounceClientRegistration { .. } => {
             // Routed to the client-object transport before this dispatcher.
         }
         NetworkCommand::RequestMempoolSync { peer } => {

@@ -20,6 +20,11 @@
 //! - **Announcing.** `NetworkCommand::AnnounceClientProof` publishes the
 //!   112-byte announcement; a received one is decoded, rate-limited and handed
 //!   to the node as `ClientProofAnnounced` with the peer that relayed it.
+//! - **Registrations.** `NetworkCommand::AnnounceClientRegistration` publishes
+//!   a held registration whole (registration and paying transaction) on the
+//!   same topic; a received one is forwarded only if its payment opens and
+//!   pays exactly its registration, and handed to the node as
+//!   `ClientRegistrationRelayed`, for any miner to include it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +35,9 @@ use tokio::sync::{mpsc, Semaphore};
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::client_object_codec::{ClientObjectRequest, ClientObjectResponse};
-use crate::client_object_protocol::{ClientProofAnnouncement, CLIENT_PROOF_ANNOUNCEMENT_BYTES};
+use crate::client_object_protocol::{
+    ClientProofAnnouncement, ClientRegistrationNotice, CLIENT_PROOF_ANNOUNCEMENT_BYTES,
+};
 use crate::event_dispatch::RequiredEventSender;
 use crate::network::{NetworkEvent, RequestFailureKind};
 use crate::object_protocol::DataResponseStatus;
@@ -173,6 +180,26 @@ impl ClientObjectTransport {
         }
     }
 
+    /// `NetworkCommand::AnnounceClientRegistration`.
+    pub(crate) fn announce_registration(
+        &mut self,
+        swarm: &mut Swarm<NodeBehaviour>,
+        notice: &crate::client_object_protocol::ClientRegistrationNotice,
+    ) {
+        match swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.topic.clone(), notice.encode())
+        {
+            Ok(_) => {}
+            // Already relayed (the gossip id is the bytes).
+            Err(gossipsub::PublishError::Duplicate) => {}
+            Err(error) => {
+                tracing::debug!(%error, "client registration notice not published");
+            }
+        }
+    }
+
     /// A received gossip message, if it is on the client-proof topic:
     /// decoded, rate-limited, validated for propagation and handed to the
     /// node. Returns the message untouched otherwise.
@@ -204,6 +231,25 @@ impl ClientObjectTransport {
         rate.0 = rate.0.saturating_add(1);
         if rate.0 > ANNOUNCEMENT_RATE_MAX {
             report(swarm, gossipsub::MessageAcceptance::Ignore);
+            return None;
+        }
+        // A registration relayed whole: forwarded only if its payment opens
+        // and pays exactly its registration; the node checks the payment
+        // against its state before holding it.
+        if ClientRegistrationNotice::is_notice(&message.data) {
+            match ClientRegistrationNotice::decode(
+                &message.data,
+                &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
+            ) {
+                Ok(notice) => {
+                    report(swarm, gossipsub::MessageAcceptance::Accept);
+                    let _ = gossip_events.send(NetworkEvent::ClientRegistrationRelayed {
+                        relayed_by: propagation_source,
+                        notice: Arc::new(notice),
+                    });
+                }
+                Err(_) => report(swarm, gossipsub::MessageAcceptance::Reject),
+            }
             return None;
         }
         if message.data.len() != CLIENT_PROOF_ANNOUNCEMENT_BYTES {

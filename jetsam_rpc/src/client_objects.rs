@@ -100,6 +100,9 @@ pub struct RegisterClientResponse {
     pub matrix_file_len: u32,
     /// The index the entry takes if the next registration mined is this one.
     pub next_index: usize,
+    /// Whether the registration was handed to the P2P layer to be relayed to
+    /// the peers (any miner may then include it).
+    pub relayed: bool,
 }
 
 /// `jetsam_walletBuildClientPayment`: what to pay for.
