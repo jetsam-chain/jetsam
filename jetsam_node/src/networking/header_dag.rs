@@ -49,6 +49,9 @@ pub enum HeaderDagUpdate {
         previous: ChainPoint,
         best: ChainPoint,
     },
+    /// The header, or its parent, was condemned by [`HeaderDag::invalidate`]:
+    /// it is not retained and can never be selected.
+    Invalid,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -85,6 +88,9 @@ pub struct HeaderDag {
     best: ChainPoint,
     best_work: Hash32,
     nodes: HashMap<Hash32, ValidatedHeader>,
+    /// Headers whose block was proved invalid (a body refused by a native
+    /// rule under a verified terminal), with every descendant seen since.
+    invalid: HashSet<Hash32>,
     /// Availability hints are deliberately subordinate to the validated DAG.
     /// They can select a byte source, never a branch or a cumulative-work view.
     inventories: HashMap<Hash32, HashMap<PeerId, HeaderInventoryRecord>>,
@@ -100,9 +106,61 @@ impl HeaderDag {
             best: finalized,
             best_work: finalized_work,
             nodes: HashMap::new(),
+            invalid: HashSet::new(),
             inventories: HashMap::new(),
             max_nodes,
         }
+    }
+
+    /// Condemn the header `hash` — its block was proved invalid — and every
+    /// descendant the DAG holds: they leave the DAG, are never re-admitted,
+    /// and the best tip is chosen again by work among what remains (the
+    /// finalized point at worst). Returns whether the best tip changed.
+    pub fn invalidate(&mut self, hash: &Hash32) -> bool {
+        if *hash == self.finalized.hash {
+            // A finalized block was committed; nothing refuses it later.
+            return false;
+        }
+        let mut condemned = HashSet::from([*hash]);
+        loop {
+            let descendants: Vec<Hash32> = self
+                .nodes
+                .values()
+                .filter(|node| {
+                    !condemned.contains(&node.hash)
+                        && condemned.contains(&node.header.prev_block_hash)
+                })
+                .map(|node| node.hash)
+                .collect();
+            if descendants.is_empty() {
+                break;
+            }
+            condemned.extend(descendants);
+        }
+        for hash in &condemned {
+            self.nodes.remove(hash);
+            self.inventories.remove(hash);
+        }
+        self.invalid.extend(condemned);
+        let previous = self.best;
+        let (mut best, mut best_work) = (self.finalized, self.finalized_work);
+        for node in self.nodes.values() {
+            if matches!(
+                choose_chain_by_work(&node.cumulative_work, &node.hash, &best_work, &best.hash),
+                ChainChoice::A
+            ) {
+                best = node.point();
+                best_work = node.cumulative_work;
+            }
+        }
+        self.best = best;
+        self.best_work = best_work;
+        self.best != previous
+    }
+
+    /// Whether `hash` was condemned.
+    pub fn is_invalid(&self, hash: &Hash32) -> bool {
+        self.invalid.contains(hash)
     }
 
     pub const fn finalized(&self) -> ChainPoint {
@@ -256,6 +314,13 @@ impl HeaderDag {
     ) -> Result<HeaderDagUpdate, HeaderDagError> {
         if candidate.header.height <= self.finalized.height {
             return Err(HeaderDagError::BelowFinalized);
+        }
+        if self.invalid.contains(&candidate.hash) {
+            return Ok(HeaderDagUpdate::Invalid);
+        }
+        if self.invalid.contains(&candidate.header.prev_block_hash) {
+            self.invalid.insert(candidate.hash);
+            return Ok(HeaderDagUpdate::Invalid);
         }
         if let Some(existing) = self.nodes.get(&candidate.hash) {
             return if existing == &candidate {
@@ -566,6 +631,56 @@ mod tests {
                 encoded_len: 2,
             }),
         }
+    }
+
+    /// M3.10: a block whose terminal verified but whose body a native rule
+    /// refused leaves the DAG with its descendants, is never re-admitted
+    /// (nor is any child of it), and the best tip falls back to the best
+    /// remaining branch — so the honest chain is selected again without a
+    /// restart, and its next block is not a tie against the condemned one.
+    #[test]
+    fn a_condemned_header_and_its_descendants_leave_the_dag_for_good() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let honest_1 = child(genesis, [1; 32], 1);
+        dag.insert(honest_1).unwrap();
+        // The bad block 2 and a child on top of it: the best branch.
+        let bad_2 = child(honest_1.header, honest_1.cumulative_work, 2);
+        let bad_3 = child(bad_2.header, bad_2.cumulative_work, 3);
+        dag.insert(bad_2).unwrap();
+        dag.insert(bad_3).unwrap();
+        assert_eq!(dag.best_tip(), bad_3.point());
+
+        assert!(dag.invalidate(&bad_2.hash));
+        assert_eq!(dag.best_tip(), honest_1.point());
+        assert_eq!(dag.best_work(), honest_1.cumulative_work);
+        assert!(dag.get(&bad_2.hash).is_none() && dag.get(&bad_3.hash).is_none());
+        assert!(dag.is_invalid(&bad_2.hash) && dag.is_invalid(&bad_3.hash));
+        // Announced again, or extended: never re-admitted, never selected.
+        assert_eq!(dag.insert(bad_2), Ok(HeaderDagUpdate::Invalid));
+        assert_eq!(dag.insert(bad_3), Ok(HeaderDagUpdate::Invalid));
+        let bad_4 = child(bad_3.header, bad_3.cumulative_work, 4);
+        assert_eq!(dag.insert(bad_4), Ok(HeaderDagUpdate::Invalid));
+        assert!(dag.is_invalid(&bad_4.hash));
+        assert_eq!(dag.best_tip(), honest_1.point());
+        // The honest block 2 is selected as soon as it arrives.
+        let honest_2 = child(honest_1.header, honest_1.cumulative_work, 5);
+        assert!(matches!(
+            dag.insert(honest_2).unwrap(),
+            HeaderDagUpdate::NewBest { best, .. } if best == honest_2.point()
+        ));
+        // Condemning a branch that is not selected keeps the tip.
+        let side = child(honest_1.header, honest_1.cumulative_work, 6);
+        dag.insert(side).unwrap();
+        let tip = dag.best_tip();
+        let other = if tip == side.point() { honest_2.hash } else { side.hash };
+        assert!(!dag.invalidate(&other));
+        assert_eq!(dag.best_tip(), tip);
+        // Condemning the root of everything falls back to the finalized point.
+        assert!(dag.invalidate(&honest_1.hash));
+        assert_eq!(dag.best_tip(), finalized);
+        assert!(dag.is_empty());
     }
 
     #[test]

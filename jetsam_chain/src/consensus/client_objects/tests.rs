@@ -1650,3 +1650,74 @@ fn a_registration_payment_is_checked_before_it_is_held() {
         Err(ClientObjectError::MatrixFileLength { .. })
     ));
 }
+
+// ---- M3.10: liveness — which refusals condemn a block, which leaves a terminal may publish ----
+
+/// A refusal that judges what the header commits to condemns the block; one
+/// that may be a relay's tampering with the uncommitted object section does
+/// not (the honest body may still come from another peer).
+#[test]
+fn only_refusals_of_committed_content_condemn_the_block() {
+    let condemning = [
+        ClientObjectError::RegistryLeavesMismatch,
+        ClientObjectError::SubmissionNotCarried,
+        ClientObjectError::ClientLanesMissing,
+        ClientObjectError::UnexpectedClientLanes,
+        ClientObjectError::ClientNotRegistered { matrix_digest: digest(1) },
+        ClientObjectError::ClientNotYetActive { matrix_digest: digest(1), active_from: 9 },
+        ClientObjectError::LicenseMissing { destination: CLIENT_LICENSE_BURN_ADDRESS, required: 1 },
+        ClientObjectError::LicenseUnderpaid {
+            destination: CLIENT_LICENSE_BURN_ADDRESS,
+            required: 2,
+            paid: 1,
+        },
+        ClientObjectError::DuplicateRegistration { matrix_digest: digest(1) },
+        ClientObjectError::RegistryFull { capacity: 16 },
+        ClientObjectError::TooManySubmissions,
+        ClientObjectError::SubmissionFeeTooLow { required: 2, paid: 1 },
+        ClientObjectError::SpendFromLockedAddress { owner: CLIENT_LICENSE_BURN_ADDRESS },
+        ClientObjectError::MarkerCarriesValue { group: 0 },
+        ClientObjectError::MultipleMarkersInTransaction { group: 0 },
+        ClientObjectError::MarkerInSystemRecord,
+        ClientObjectError::NullMatrixDigest,
+    ];
+    for error in condemning {
+        assert!(error.condemns_block(), "{error:?} judges committed content");
+    }
+    for error in [
+        ClientObjectError::ObjectsDoNotMatchMarkers,
+        ClientObjectError::ObjectsBeforeActivation,
+    ] {
+        assert!(!error.condemns_block(), "{error:?} may be a relay's tampering");
+    }
+}
+
+/// The leaves a terminal can publish at the end of a suffix: the branch's
+/// registry at the base (a later registry truncated to it), then the
+/// suffix's registrations in order, zero padded to 16.
+#[test]
+fn the_leaves_through_a_suffix_are_the_base_registry_then_its_registrations() {
+    // Known at height 260: two entries at 150, one at 250 (above the base).
+    let mut known = registry_with(2, 150);
+    known.apply(&ClientObjectsEffect {
+        registrations: vec![entry(2, 0x30, 250, LicenseSplit::default())],
+        ..ClientObjectsEffect::default()
+    });
+    let mut first = block_at(201, Vec::new());
+    first.client_objects = vec![ClientObject::Registration(registration(0x41))];
+    let second = block_at(202, Vec::new());
+    let mut third = block_at(203, Vec::new());
+    third.client_objects = vec![
+        ClientObject::Submission(submission(0x10, 0x01)),
+        ClientObject::Registration(registration(0x42)),
+        ClientObject::Registration(registration(0x43)),
+    ];
+    let leaves = registry_leaves_through(&known, 200, &[first, second, third]);
+    let mut expected = vec![digest(0x10), digest(0x11), digest(0x41), digest(0x42), digest(0x43)];
+    expected.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+    assert_eq!(leaves, expected);
+    // No suffix: the base registry alone.
+    let mut alone = vec![digest(0x10), digest(0x11), digest(0x30)];
+    alone.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+    assert_eq!(registry_leaves_through(&known, 260, &[]), alone);
+}

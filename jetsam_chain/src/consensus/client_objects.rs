@@ -932,6 +932,25 @@ pub enum ClientObjectError {
     },
 }
 
+impl ClientObjectError {
+    /// Whether this refusal proves the **block** invalid — its header can be
+    /// condemned for good — rather than the bytes a peer served for it.
+    ///
+    /// Every rule here is checked after the transactions matched the header
+    /// (`tx_root`), so it judges what the header commits to; the exceptions
+    /// are the object section itself, which the header commits to only
+    /// through the markers: objects that do not open the markers
+    /// (`ObjectsDoNotMatchMarkers`) or objects attached below the v1.5 height
+    /// (`ObjectsBeforeActivation`) may be a relay's tampering with an honest
+    /// block, so they condemn the source, not the header.
+    pub fn condemns_block(&self) -> bool {
+        !matches!(
+            self,
+            Self::ObjectsDoNotMatchMarkers | Self::ObjectsBeforeActivation
+        )
+    }
+}
+
 impl std::fmt::Display for ClientObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -1256,6 +1275,33 @@ pub struct TerminalClientView {
     /// empty entry), [`CLIENT_REGISTRY_CAPACITY`] of them; `None` under a
     /// generation without the client slot.
     pub registry_leaves: Option<Vec<Digest>>,
+}
+
+/// The registry leaves a v1.5 terminal at the end of `blocks` can publish
+/// at most, on the branch whose registry at `base_height` is `base` (a
+/// registry known at a later height, truncated): `base`'s entries up to
+/// `base_height`, then the registration objects of `blocks` in order, zero
+/// padded. The objects are not judged here (the native rules do it block by
+/// block); this is what a node compares the leaves of a terminal against
+/// **before** it concludes that a live lane whose matrix it lacks has no
+/// verdict: a live lane on a leaf outside this list belongs to a matrix no
+/// honest node will ever serve.
+pub fn registry_leaves_through(
+    base: &ClientRegistryState,
+    base_height: u64,
+    blocks: &[Block],
+) -> Vec<Digest> {
+    let mut base = base.clone();
+    base.truncate_above(base_height);
+    let mut leaves = base.digests();
+    leaves.extend(blocks.iter().flat_map(|block| {
+        block.client_objects.iter().filter_map(|object| match object {
+            ClientObject::Registration(registration) => Some(registration.matrix_digest),
+            ClientObject::Submission(_) => None,
+        })
+    }));
+    leaves.resize(CLIENT_REGISTRY_CAPACITY.max(leaves.len()), [0u8; 32]);
+    leaves
 }
 
 /// The registry leaves a v1.5 block must publish: its parent's registered

@@ -87,6 +87,16 @@ enum ExactSuffixApplyError {
         sources: Vec<libp2p::PeerId>,
         error: String,
     },
+    /// A block proved invalid (M3.10): its terminal verified (or verified up
+    /// to a lane whose matrix no honest node can hold) and a native rule
+    /// refused what its header commits to. The header is condemned in the
+    /// HeaderDAG with its descendants, so the honest chain is selected again
+    /// without a restart; the source is rejected like a body fault.
+    Invalid {
+        source: libp2p::PeerId,
+        error: String,
+        block: jetsam_node::networking::ChainPoint,
+    },
     Other(String),
 }
 
@@ -105,11 +115,36 @@ impl ExactSuffixApplyError {
         }
     }
 
+    fn invalid(
+        source: libp2p::PeerId,
+        error: impl Into<String>,
+        header: &jetsam_chain::BlockHeader,
+    ) -> Self {
+        Self::Invalid {
+            source,
+            error: error.into(),
+            block: jetsam_node::networking::ChainPoint::new(
+                header.height,
+                jetsam_chain::block_id(header),
+            ),
+        }
+    }
+
     fn peer_sources(&self) -> &[libp2p::PeerId] {
         match self {
-            Self::Terminal { source, .. } => std::slice::from_ref(source),
+            Self::Terminal { source, .. } | Self::Invalid { source, .. } => {
+                std::slice::from_ref(source)
+            }
             Self::Body { sources, .. } => sources,
             Self::Other(_) => &[],
+        }
+    }
+
+    /// The block this failure proved invalid, if it did.
+    fn condemned_block(&self) -> Option<jetsam_node::networking::ChainPoint> {
+        match self {
+            Self::Invalid { block, .. } => Some(*block),
+            _ => None,
         }
     }
 
@@ -121,9 +156,10 @@ impl ExactSuffixApplyError {
 impl std::fmt::Display for ExactSuffixApplyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Terminal { error, .. } | Self::Body { error, .. } | Self::Other(error) => {
-                formatter.write_str(error)
-            }
+            Self::Terminal { error, .. }
+            | Self::Body { error, .. }
+            | Self::Invalid { error, .. }
+            | Self::Other(error) => formatter.write_str(error),
         }
     }
 }
@@ -4841,6 +4877,73 @@ fn exact_suffix_context_error_is_body_peer_fault(
     }
 }
 
+/// Whether a failure to apply a body under a verified terminal proves the
+/// block itself invalid (M3.10): a native v1.5 client-object rule refusing
+/// what the header commits to. Anything else under a verified terminal may be
+/// a relay's corrupted bytes for an honest header, and condemns only the
+/// source.
+fn exact_suffix_context_error_condemns_block(
+    error: &jetsam_chain::storage::MdbxContextError,
+) -> bool {
+    matches!(
+        error,
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::ClientObject(error)
+        ) if error.condemns_block()
+    )
+}
+
+/// A block proved invalid (M3.10) leaves the HeaderDAG with its descendants
+/// and is never re-admitted; the best tip is chosen again among what remains,
+/// and the announced height the node chases falls back to what it can still
+/// reach, so a miner is not held behind a header nobody can apply.
+fn condemn_invalid_block(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    highest_announced: &mut u64,
+    block: jetsam_node::networking::ChainPoint,
+    committed_height: u64,
+) {
+    let best_changed = header_dag.invalidate(&block.hash);
+    *highest_announced = committed_height.max(header_dag.best_tip().height);
+    tracing::warn!(
+        height = block.height,
+        hash = %hex::encode(&block.hash[..8]),
+        best_changed,
+        best_height = header_dag.best_tip().height,
+        "block proved invalid by a native rule: header condemned with its descendants"
+    );
+}
+
+/// Marker of a terminal whose only undecided client lane sits on a leaf that
+/// is not the branch's registry: a verdict, not a wait (M3.10).
+const CLIENT_LANES_CONDEMN_BLOCK: &str = "client lanes condemn the block:";
+
+/// Before a terminal is left without a verdict because a live client lane's
+/// matrix is not held (M3.10): its registry leaves are read (decoded, every
+/// other part of the proof having verified) and compared with what the branch
+/// can have registered by then ([`registry_leaves_through`]). Leaves outside
+/// it name a matrix no honest node will ever serve: the block is refused for
+/// good instead of being judged again forever.
+fn refuse_unregistered_client_lanes(
+    claim: &jetsam_chain::storage::HistoryStepTerminalClaim<'_>,
+    runtimes: &EmbeddedHistoryStepRuntimes,
+    expected_leaves: &[[u8; 32]],
+) -> Option<String> {
+    let runtime = runtimes.for_height(claim.header.height)?;
+    let view =
+        jetsam_miner::block_production::terminal_client_view_of(runtime, claim.terminal_bytes)
+            .ok()?;
+    let leaves = view.registry_leaves?;
+    (leaves.as_slice() != expected_leaves).then(|| {
+        format!(
+            "{CLIENT_LANES_CONDEMN_BLOCK} block {} publishes registry leaves that are not the \
+             branch's (RegistryLeavesMismatch); a live lane on an unregistered leaf has no \
+             matrix to wait for",
+            claim.header.height
+        )
+    })
+}
+
 fn quarantine_exact_suffix_sources(
     header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
     rejected: &mut std::collections::HashSet<libp2p::PeerId>,
@@ -4992,17 +5095,43 @@ async fn apply_exact_suffix_offthread(
                     .map(|block| block.header)
             }
         };
+        // What the branch can have registered by the tip (M3.10): the leaves a
+        // terminal is compared against before a missing matrix means "wait".
+        let expected_leaves = {
+            let registry = apply_chain.blocking_read().client_registry().clone();
+            jetsam_chain::consensus::client_objects::registry_leaves_through(
+                &registry,
+                plan.base().height,
+                &blocks,
+            )
+        };
         let verified_terminal = jetsam_chain::storage::verify_history_step_terminal_candidate(
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
             |claim| {
-                verify_history_step_terminal_on_branch(claim, &history_step_runtimes, &mut header_at)
+                match verify_history_step_terminal_on_branch(
+                    claim,
+                    &history_step_runtimes,
+                    &mut header_at,
+                ) {
+                    Err(message) if message.contains(CLIENT_MATRIX_UNAVAILABLE) => {
+                        Err(refuse_unregistered_client_lanes(
+                            claim,
+                            &history_step_runtimes,
+                            &expected_leaves,
+                        )
+                        .unwrap_or(message))
+                    }
+                    verdict => verdict,
+                }
             },
         )
         .map_err(|error| {
             let message = format!("verify exact suffix terminal: {error}");
-            if history_step_context_error_is_terminal_peer_fault(&error) {
+            if message.contains(CLIENT_LANES_CONDEMN_BLOCK) {
+                ExactSuffixApplyError::invalid(terminal_source, message, &tip_header)
+            } else if history_step_context_error_is_terminal_peer_fault(&error) {
                 ExactSuffixApplyError::terminal(terminal_source, message)
             } else {
                 ExactSuffixApplyError::Other(message)
@@ -5075,9 +5204,11 @@ async fn apply_exact_suffix_offthread(
                             "apply exact suffix block {}: {error}",
                             block.header.height
                         );
-                        trailing_error = Some(if exact_suffix_context_error_is_body_peer_fault(
+                        trailing_error = Some(if exact_suffix_context_error_condemns_block(
                             &error,
                         ) {
+                            ExactSuffixApplyError::invalid(*source, message, &block.header)
+                        } else if exact_suffix_context_error_is_body_peer_fault(&error) {
                             ExactSuffixApplyError::body(*source, message)
                         } else {
                             ExactSuffixApplyError::Other(message)
@@ -5130,6 +5261,16 @@ async fn apply_exact_suffix_offthread(
                         let message =
                             format!("apply atomic exact reorg suffix: {}", failure.error);
                         match failure.body_index {
+                            Some(index)
+                                if exact_suffix_context_error_condemns_block(&failure.error) =>
+                            {
+                                match (body_sources.get(index).copied(), blocks.get(index)) {
+                                    (Some(source), Some(block)) => {
+                                        ExactSuffixApplyError::invalid(source, message, &block.header)
+                                    }
+                                    _ => ExactSuffixApplyError::Other(message),
+                                }
+                            }
                             Some(index)
                                 if exact_suffix_context_error_is_body_peer_fault(
                                     &failure.error,
@@ -10502,6 +10643,13 @@ async fn handle_p2p_events(
                     // data plan has actually been admitted. This prevents a
                     // header-only source from pinning miners in sync forever.
                     mining_peer_quorum.observe_compatible(from);
+                    // A header already proved invalid (M3.10) is no target:
+                    // re-announcing it must not hold this node behind it.
+                    if header_dag.is_invalid(&jetsam_chain::block_id(&announced_header))
+                        || header_dag.is_invalid(&announced_header.prev_block_hash)
+                    {
+                        continue;
+                    }
                     record_authenticated_height!(height, from);
 
                     let cumulative_work = jetsam_chain::add_work(
@@ -11591,7 +11739,9 @@ async fn handle_p2p_events(
                                 "validated object inventory was not attached to HeaderDAG"
                             );
                         }
-                        record_authenticated_height!(target.height, from);
+                        if !header_dag.is_invalid(&target.hash) {
+                            record_authenticated_height!(target.height, from);
+                        }
 
                         // HeaderDAG, not the peer and not the object inventory,
                         // decides whether this exact target is authoritative.
@@ -13490,6 +13640,14 @@ async fn handle_p2p_events(
                             &mut rejected_suffix_object_peers,
                             &rejected_sources,
                         );
+                        if let Some(block) = error.condemned_block() {
+                            condemn_invalid_block(
+                                &mut header_dag,
+                                &mut highest_announced,
+                                block,
+                                applied.height,
+                            );
+                        }
                         tracing::warn!(
                             ?completed.plan_id,
                             height = applied.height,
@@ -13589,6 +13747,15 @@ async fn handle_p2p_events(
                         &mut rejected_suffix_object_peers,
                         &rejected_sources,
                     );
+                    if let Some(block) = error.condemned_block() {
+                        let committed_height = chain.read().await.tip_height();
+                        condemn_invalid_block(
+                            &mut header_dag,
+                            &mut highest_announced,
+                            block,
+                            committed_height,
+                        );
+                    }
                     tracing::warn!(
                         ?completed.plan_id,
                         target_height = completed.target.height,
@@ -16176,4 +16343,56 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod condemned_block_tests {
+    use super::*;
+    use jetsam_chain::consensus::client_objects::ClientObjectError;
+    use jetsam_chain::consensus::ConsensusError;
+    use jetsam_chain::storage::MdbxContextError;
+
+    /// M3.10: a native client-object rule refusing committed content under a
+    /// verified terminal condemns the block (its header leaves the HeaderDAG);
+    /// tampering with the uncommitted object section, or any other failure,
+    /// condemns only the source.
+    #[test]
+    fn only_a_native_refusal_of_committed_content_condemns_the_block() {
+        let refused = |error| MdbxContextError::Consensus(ConsensusError::ClientObject(error));
+        for error in [
+            ClientObjectError::RegistryLeavesMismatch,
+            ClientObjectError::SubmissionNotCarried,
+            ClientObjectError::ClientNotYetActive {
+                matrix_digest: [1; 32],
+                active_from: 9,
+            },
+        ] {
+            assert!(exact_suffix_context_error_condemns_block(&refused(error)));
+        }
+        assert!(!exact_suffix_context_error_condemns_block(&refused(
+            ClientObjectError::ObjectsDoNotMatchMarkers
+        )));
+        assert!(!exact_suffix_context_error_condemns_block(
+            &MdbxContextError::Consensus(ConsensusError::BadStateRoot)
+        ));
+        assert!(!exact_suffix_context_error_condemns_block(&MdbxContextError::Corrupt(
+            "recursive suffix block body is malformed"
+        )));
+
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = 25;
+        let peer = libp2p::PeerId::random();
+        let invalid = ExactSuffixApplyError::invalid(peer, "refused", &header);
+        assert_eq!(
+            invalid.condemned_block(),
+            Some(jetsam_node::networking::ChainPoint::new(
+                25,
+                jetsam_chain::block_id(&header)
+            ))
+        );
+        assert_eq!(invalid.peer_sources(), &[peer]);
+        assert!(!invalid.is_terminal_fault());
+        assert_eq!(ExactSuffixApplyError::body(peer, "x").condemned_block(), None);
+        assert_eq!(ExactSuffixApplyError::terminal(peer, "x").condemned_block(), None);
+    }
 }
