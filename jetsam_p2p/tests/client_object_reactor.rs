@@ -240,11 +240,13 @@ async fn advertised_protocols(port: u16) -> Vec<String> {
         .build();
     let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
     probe.dial(address.clone()).unwrap();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             match probe.select_next_some().await {
-                // The node's listener may not be up yet: dial again.
-                SwarmEvent::OutgoingConnectionError { .. } => {
+                // The node's listener may not be up yet, or the node may close
+                // the connection (the probe lacks the sync protocols) before
+                // its own identify reached the probe under load: dial again.
+                SwarmEvent::OutgoingConnectionError { .. } | SwarmEvent::ConnectionClosed { .. } => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     probe.dial(address.clone()).unwrap();
                 }
