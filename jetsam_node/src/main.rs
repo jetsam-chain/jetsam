@@ -11758,6 +11758,24 @@ async fn handle_p2p_events(
                             record_authenticated_height!(target.height, from);
                         }
 
+                        // A selected tip nobody supplies (M3.10: an invalid
+                        // header relayed by gossip from an attacker this node
+                        // never reaches) yields a tie of work to this supplied
+                        // target. Only while no data plan is in flight: a
+                        // plan's objects come from offers, not DAG inventory.
+                        if header_dag.best_tip() != target
+                            && active_suffix_sync.is_none()
+                            && !data_plan_blocked
+                            && header_dag.forget_unsupplied_tie(&target.hash)
+                        {
+                            tracing::warn!(
+                                peer = %from,
+                                height = target.height,
+                                best_height = header_dag.best_tip().height,
+                                "selected tip nobody supplies forgotten for a supplied tie"
+                            );
+                        }
+
                         // HeaderDAG, not the peer and not the object inventory,
                         // decides whether this exact target is authoritative.
                         if header_dag.best_tip() != target {

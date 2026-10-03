@@ -152,6 +152,27 @@ impl HeaderDag {
         self.reselect_best()
     }
 
+    /// M3.10: a selected tip no provider advertises (an invalid header
+    /// relayed by gossip, its objects held only by a peer this node never
+    /// reaches) must not keep a tie of work against `supplied`, a header a
+    /// provider does advertise: it is forgotten, not condemned, so the
+    /// selection falls to what can be fetched instead of waiting for the next
+    /// block. Returns whether the best tip changed.
+    pub fn forget_unsupplied_tie(&mut self, supplied: &Hash32) -> bool {
+        let best = self.best.hash;
+        if best == *supplied
+            || self.has_inventory(&best)
+            || !self.has_inventory(supplied)
+            || !self
+                .nodes
+                .get(supplied)
+                .is_some_and(|node| node.cumulative_work == self.best_work)
+        {
+            return false;
+        }
+        self.forget(&best)
+    }
+
     /// Remove `hash` and every descendant the DAG holds; returns them.
     fn remove_with_descendants(&mut self, hash: &Hash32) -> HashSet<Hash32> {
         let mut removed = HashSet::from([*hash]);
@@ -744,6 +765,57 @@ mod tests {
             dag.insert(withheld).unwrap(),
             HeaderDagUpdate::NewBest { best, .. } if best == withheld.point()
         ));
+    }
+
+    /// M3.10 replay (mutation 5): a node not connected to the attacker gets
+    /// the invalid header by gossip, without objects. It wins the hash
+    /// tie-break against the honest block at the same height, which peers do
+    /// supply: the unsupplied tip is forgotten as soon as the supplied one is
+    /// advertised, so the node does not wait for the next block.
+    #[test]
+    fn an_unsupplied_tip_loses_a_tie_to_a_supplied_header() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let honest_1 = child(genesis, [1; 32], 1);
+        dag.insert(honest_1).unwrap();
+        let left = child(honest_1.header, honest_1.cumulative_work, 2);
+        let right = child(honest_1.header, honest_1.cumulative_work, 3);
+        dag.insert(left).unwrap();
+        dag.insert(right).unwrap();
+        let (unsupplied, supplied) = if dag.best_tip() == left.point() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        assert_eq!(dag.best_tip(), unsupplied.point());
+        assert_eq!(unsupplied.cumulative_work, supplied.cumulative_work);
+
+        // Nothing to yield to while the competitor is not supplied either.
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert_eq!(dag.best_tip(), unsupplied.point());
+
+        dag.advertise_inventory(PeerId::random(), &[inventory(supplied, 1, true)])
+            .unwrap();
+        assert!(dag.forget_unsupplied_tie(&supplied.hash));
+        assert_eq!(dag.best_tip(), supplied.point());
+        assert!(dag.get(&unsupplied.hash).is_none());
+        assert!(!dag.is_invalid(&unsupplied.hash), "forgotten, not condemned");
+
+        // Once supplied, it wins its tie by hash again and keeps it.
+        dag.insert(unsupplied).unwrap();
+        assert_eq!(dag.best_tip(), unsupplied.point());
+        dag.advertise_inventory(PeerId::random(), &[inventory(unsupplied, 2, true)])
+            .unwrap();
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert_eq!(dag.best_tip(), unsupplied.point());
+
+        // More work is no tie: an unsupplied stronger tip is waited for.
+        let above = child(supplied.header, supplied.cumulative_work, 4);
+        dag.insert(above).unwrap();
+        assert_eq!(dag.best_tip(), above.point());
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert_eq!(dag.best_tip(), above.point());
     }
 
     #[test]
