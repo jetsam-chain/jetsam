@@ -33,7 +33,10 @@ resolver = "2"
 # last build that did not know v1.4. Every build carrying the TowerWalk proof
 # of work — armed or dormant — is 1.4.x, so no two binaries that disagree about
 # the consensus rules can ever report the same version.
-version = "1.4.3"
+# 1.5.0 is the first build that knows the v1.5 fork (client slot, 180 s blocks,
+# 480-block development payouts). It ships dormant: the public profile carries
+# no activation height, so before an armed height it behaves as 1.4.3 does.
+version = "1.5.0"
 edition = "2021"
 license = "Apache-2.0"
 

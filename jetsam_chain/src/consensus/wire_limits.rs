@@ -353,11 +353,11 @@ mod tests {
     #[cfg(not(feature = "testnet"))]
     const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
 
-    /// Dormant on the test chain too. Split per profile for the same reason as
-    /// the v1.4 declaration: arming the test chain alone must be one visible
-    /// edit here, not a failure on the other profile.
+    /// Armed on the test chain at the provisional 9600 (see `params`). Split per
+    /// profile for the same reason as the v1.4 declaration: arming the test chain
+    /// alone must be one visible edit here, not a failure on the other profile.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(9600);
 
     /// The same two-edit rule, for the fourth clock.
     ///

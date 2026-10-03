@@ -394,9 +394,10 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 
 /// First block height governed by the v1.5 consensus rules.
 ///
-/// **`None` keeps every v1.5 rule dormant**, and that is what both profiles
-/// carry today. A binary with this constant at `None` validates, proves and
-/// pays byte for byte what v1.4.3 does.
+/// **`None` keeps every v1.5 rule dormant**, and that is what the public
+/// profile carries. The test profile carries a provisional height (below); a
+/// binary validates, proves and pays byte for byte what v1.4.3 does until it,
+/// and for ever when this constant is `None`.
 ///
 /// # What it switches today
 ///
@@ -437,10 +438,15 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 #[cfg(not(feature = "testnet"))]
 pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// Dormant on the test chain as well. Declared per profile, like
-/// [`V1_4_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
+/// Armed on the test chain at **9600 = 10 x 960**, a PROVISIONAL height chosen
+/// on 2026-10-03 against a tip of about 5 900 (90 s per block): it leaves some
+/// 3 700 blocks, about four days, for the release build, the v1.5 pack, the
+/// seeds and a 24-48 hour notice. It is moved (`arm.sh --clock v1.5 --postpone`,
+/// later only) or confirmed with the operator the day the test chain is told.
+/// Declared per profile, like [`V1_4_ACTIVATION_HEIGHT`], so that arming one
+/// can never arm the other: the public profile above stays `None`.
 #[cfg(feature = "testnet")]
-pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(9600);
 
 /// Whether one candidate block height is governed by the v1.5 rules.
 #[inline]
