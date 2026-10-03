@@ -507,7 +507,9 @@ mod tests {
     fn daily_payout_uses_the_payout_blocks_reward_tier() {
         for height in payout_heights_across_the_window() {
             let share = development_share_each(block_reward(height)).unwrap();
-            let allocation = development_allocation(height).unwrap();
+            // The 90-second rule, whatever the profile arms: a test chain with
+            // a v1.5 height pays on the 480 cadence above it.
+            let allocation = development_allocation_with(height, None).unwrap();
             assert_eq!(
                 allocation.payout_each,
                 Some(share * DEVELOPMENT_PAYOUT_INTERVAL_90S),
@@ -569,7 +571,8 @@ mod tests {
     #[test]
     fn fund_share_of_max_supply_is_as_documented() {
         let mut funded: u128 = 0;
-        for height in 1..=DEVELOPMENT_ALLOCATION_END_HEIGHT {
+        // The 90-second window: the figure documented for the dormant rule.
+        for height in 1..=DEVELOPMENT_ALLOCATION_END_HEIGHT_90S {
             let share = development_share_each(block_reward(height)).unwrap();
             funded += u128::from(2 * share);
         }

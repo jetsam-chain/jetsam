@@ -1642,8 +1642,13 @@ mod tests {
                 released_anchor_height(parent, s.v1_4_activation)
             );
         }
-        // The production entry points are the dormant schedule today.
-        assert_eq!(DifficultySchedule::PRODUCTION.v1_5_activation, None);
+        // The production schedule reads the profile's declared v1.5 height
+        // (None on the public profile, which the arming guard in
+        // `wire_limits` pins; the test profile carries its own).
+        assert_eq!(
+            DifficultySchedule::PRODUCTION.v1_5_activation,
+            crate::consensus::params::V1_5_ACTIVATION_HEIGHT
+        );
     }
 
     /// Armed at J: every child BELOW J keeps the released rule bit for bit —
