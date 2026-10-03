@@ -176,6 +176,35 @@ impl HeaderDag {
         self.forget(&best)
     }
 
+    /// M3.10: a body whose objects do not open its markers condemns only the
+    /// source (a relay may have stripped them), so the header stays. Once the
+    /// source is rejected and no provider advertises the block, the headers on
+    /// the path to `target` that nobody supplies are forgotten, not condemned,
+    /// so the selection falls back to what can be fetched instead of holding
+    /// the node behind a block it cannot get. `applied` (the committed tip) is
+    /// never forgotten. Returns whether the best tip changed.
+    pub fn forget_unsupplied_branch(&mut self, target: &Hash32, applied: &Hash32) -> bool {
+        // The path to `target`, read before anything is forgotten.
+        let mut path = HashSet::new();
+        let mut cursor = *target;
+        while let Some(node) = self.nodes.get(&cursor) {
+            path.insert(cursor);
+            cursor = node.header.prev_block_hash;
+        }
+        let mut changed = false;
+        loop {
+            let best = self.best;
+            if best.hash == *applied
+                || best == self.finalized
+                || self.has_inventory(&best.hash)
+                || !path.contains(&best.hash)
+            {
+                return changed;
+            }
+            changed |= self.forget(&best.hash);
+        }
+    }
+
     /// Remove `hash` and every descendant the DAG holds; returns them.
     fn remove_with_descendants(&mut self, hash: &Hash32) -> HashSet<Hash32> {
         let mut removed = HashSet::from([*hash]);
@@ -849,6 +878,41 @@ mod tests {
         assert!(!dag.forget_unsupplied_tie(&sibling.hash, &applied.hash));
         assert_eq!(dag.best_tip(), applied.point());
         assert!(dag.selected_path_from(applied.point()).is_ok());
+    }
+
+    /// M3.10 (marker without object): a header whose body keeps failing with
+    /// `ObjectsDoNotMatchMarkers` is not condemnable, so it stays in the DAG
+    /// once its only provider is rejected. It must not hold the selection:
+    /// the unsupplied block and its unsupplied parent on the failed path are
+    /// forgotten, the committed tip and a supplied header are not.
+    #[test]
+    fn an_unsupplied_branch_after_a_body_fault_is_forgotten_not_condemned() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let applied = child(genesis, [1; 32], 1);
+        let stripped_1 = child(applied.header, applied.cumulative_work, 2);
+        let stripped_2 = child(stripped_1.header, stripped_1.cumulative_work, 3);
+        for header in [applied, stripped_1, stripped_2] {
+            dag.insert(header).unwrap();
+        }
+        let attacker = PeerId::random();
+        dag.advertise_inventory(attacker, &[inventory(stripped_1, 1, true), inventory(stripped_2, 2, true)])
+            .unwrap();
+        assert_eq!(dag.best_tip(), stripped_2.point());
+        dag.remove_inventory_provider(attacker);
+
+        assert!(dag.forget_unsupplied_branch(&stripped_2.hash, &applied.hash));
+        assert_eq!(dag.best_tip(), applied.point());
+        assert!(dag.get(&stripped_1.hash).is_none() && dag.get(&stripped_2.hash).is_none());
+        assert!(!dag.is_invalid(&stripped_1.hash) && !dag.is_invalid(&stripped_2.hash));
+
+        // A provider still advertising the target keeps it: nothing forgotten.
+        dag.insert(stripped_1).unwrap();
+        dag.insert(stripped_2).unwrap();
+        dag.advertise_inventory(PeerId::random(), &[inventory(stripped_2, 2, true)]).unwrap();
+        assert!(!dag.forget_unsupplied_branch(&stripped_2.hash, &applied.hash));
+        assert_eq!(dag.best_tip(), stripped_2.point());
     }
 
     #[test]

@@ -151,6 +151,12 @@ impl ExactSuffixApplyError {
     fn is_terminal_fault(&self) -> bool {
         matches!(self, Self::Terminal { .. })
     }
+
+    /// A body refused without proving its block invalid (the object section
+    /// is not committed by the header): only the source is condemned.
+    fn is_body_fault(&self) -> bool {
+        matches!(self, Self::Body { .. })
+    }
 }
 
 impl std::fmt::Display for ExactSuffixApplyError {
@@ -13680,6 +13686,13 @@ async fn handle_p2p_events(
                                 block,
                                 applied.height,
                             );
+                        } else if error.is_body_fault()
+                            && header_dag
+                                .forget_unsupplied_branch(&completed.target.hash, &applied.block_hash)
+                        {
+                            // Marker without object (M3.10): not condemnable,
+                            // and nobody supplies it any more.
+                            highest_announced = applied.height.max(header_dag.best_tip().height);
                         }
                         tracing::warn!(
                             ?completed.plan_id,
@@ -13788,6 +13801,16 @@ async fn handle_p2p_events(
                             block,
                             committed_height,
                         );
+                    } else if error.is_body_fault() {
+                        let (committed_height, committed_hash) = {
+                            let ctx = chain.read().await;
+                            (ctx.tip_height(), ctx.tip_hash())
+                        };
+                        if header_dag
+                            .forget_unsupplied_branch(&completed.target.hash, &committed_hash)
+                        {
+                            highest_announced = committed_height.max(header_dag.best_tip().height);
+                        }
                     } else if terminal_rejected
                         && !header_dag.has_inventory(&completed.target.hash)
                     {
