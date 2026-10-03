@@ -157,10 +157,13 @@ impl HeaderDag {
     /// reaches) must not keep a tie of work against `supplied`, a header a
     /// provider does advertise: it is forgotten, not condemned, so the
     /// selection falls to what can be fetched instead of waiting for the next
-    /// block. Returns whether the best tip changed.
-    pub fn forget_unsupplied_tie(&mut self, supplied: &Hash32) -> bool {
+    /// block. `applied` is the committed tip: its objects are held locally
+    /// although no provider advertises them, so it is never forgotten.
+    /// Returns whether the best tip changed.
+    pub fn forget_unsupplied_tie(&mut self, supplied: &Hash32, applied: &Hash32) -> bool {
         let best = self.best.hash;
         if best == *supplied
+            || best == *applied
             || self.has_inventory(&best)
             || !self.has_inventory(supplied)
             || !self
@@ -792,12 +795,12 @@ mod tests {
         assert_eq!(unsupplied.cumulative_work, supplied.cumulative_work);
 
         // Nothing to yield to while the competitor is not supplied either.
-        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash, &honest_1.hash));
         assert_eq!(dag.best_tip(), unsupplied.point());
 
         dag.advertise_inventory(PeerId::random(), &[inventory(supplied, 1, true)])
             .unwrap();
-        assert!(dag.forget_unsupplied_tie(&supplied.hash));
+        assert!(dag.forget_unsupplied_tie(&supplied.hash, &honest_1.hash));
         assert_eq!(dag.best_tip(), supplied.point());
         assert!(dag.get(&unsupplied.hash).is_none());
         assert!(!dag.is_invalid(&unsupplied.hash), "forgotten, not condemned");
@@ -807,15 +810,45 @@ mod tests {
         assert_eq!(dag.best_tip(), unsupplied.point());
         dag.advertise_inventory(PeerId::random(), &[inventory(unsupplied, 2, true)])
             .unwrap();
-        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash, &honest_1.hash));
         assert_eq!(dag.best_tip(), unsupplied.point());
 
         // More work is no tie: an unsupplied stronger tip is waited for.
         let above = child(supplied.header, supplied.cumulative_work, 4);
         dag.insert(above).unwrap();
         assert_eq!(dag.best_tip(), above.point());
-        assert!(!dag.forget_unsupplied_tie(&supplied.hash));
+        assert!(!dag.forget_unsupplied_tie(&supplied.hash, &honest_1.hash));
         assert_eq!(dag.best_tip(), above.point());
+    }
+
+    /// The applied canonical tip has no provider in the DAG (it was inserted
+    /// from the store, not advertised), yet its objects are ours: a peer
+    /// relaying a same-work sibling with inventory must not make it forgotten,
+    /// or the committed tip leaves the DAG and the selected ancestry from it
+    /// can no longer be frozen.
+    #[test]
+    fn the_applied_tip_is_never_forgotten_for_a_supplied_tie() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let honest_1 = child(genesis, [1; 32], 1);
+        dag.insert(honest_1).unwrap();
+        let left = child(honest_1.header, honest_1.cumulative_work, 2);
+        let right = child(honest_1.header, honest_1.cumulative_work, 3);
+        dag.insert(left).unwrap();
+        dag.insert(right).unwrap();
+        let (applied, sibling) = if dag.best_tip() == left.point() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        assert_eq!(dag.best_tip(), applied.point());
+        dag.advertise_inventory(PeerId::random(), &[inventory(sibling, 1, true)])
+            .unwrap();
+
+        assert!(!dag.forget_unsupplied_tie(&sibling.hash, &applied.hash));
+        assert_eq!(dag.best_tip(), applied.point());
+        assert!(dag.selected_path_from(applied.point()).is_ok());
     }
 
     #[test]

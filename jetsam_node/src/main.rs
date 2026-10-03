@@ -11766,7 +11766,7 @@ async fn handle_p2p_events(
                         if header_dag.best_tip() != target
                             && active_suffix_sync.is_none()
                             && !data_plan_blocked
-                            && header_dag.forget_unsupplied_tie(&target.hash)
+                            && header_dag.forget_unsupplied_tie(&target.hash, &old_tip.hash)
                         {
                             tracing::warn!(
                                 peer = %from,
