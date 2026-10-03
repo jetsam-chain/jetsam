@@ -940,7 +940,7 @@ fn run_admission_checks_with(
         jetsam_chain::consensus::client_objects::check_plain_transaction(
             pages,
             st.view.tip_height.saturating_add(1),
-            &jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS,
+            &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
         )
         .map_err(|error| {
             SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::ClientObject(error))
