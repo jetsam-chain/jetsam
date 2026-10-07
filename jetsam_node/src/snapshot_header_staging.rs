@@ -1430,7 +1430,7 @@ mod tests {
     /// `--features jetsam_chain/testnet`) after its genesis reset (`ab95428`,
     /// 289_608 before it).
     const FIXTURE_CHAIN_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-        144_076
+        611_542
     } else {
         162_878
     };
@@ -1441,10 +1441,10 @@ mod tests {
     /// and the ASERT interval-count fix (382_055 upstream, then 422_266). One per
     /// network, for the reason given on [`FIXTURE_CHAIN_NONCE`].
     /// The profile is read from `jetsam_chain`, as for [`FIXTURE_CHAIN_NONCE`];
-    /// the test chain's nonce was re-mined after its genesis reset (67_139
-    /// before it).
+    /// the test chain's nonce was re-mined after its genesis resets (67_139,
+    /// then 673_670 before it).
     const NATIVE_COINBASE_CHILD_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-        673_670
+        210_692
     } else {
         31_746
     };

@@ -572,8 +572,16 @@ mod advertised_bank_identity_tests {
                 activation.saturating_add(1),
             ]);
         }
+        // An armed v1.5 takes every height from J on: the v1.3 pack covers
+        // [v1.3 height, J) only.
+        let v1_5 = jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT;
+        if let Some(j) = v1_5 {
+            heights.extend([j.saturating_sub(1), j, j.saturating_add(1)]);
+        }
         for height in heights {
-            let expected = if matches!(armed, Some(activation) if height >= activation) {
+            let expected = if matches!(v1_5, Some(j) if height >= j) {
+                embedded_history_step_pack_v1_5()
+            } else if matches!(armed, Some(activation) if height >= activation) {
                 embedded_history_step_pack_v1_3()
             } else {
                 embedded_history_step_pack()
