@@ -1053,6 +1053,7 @@ mod tests {
     /// convincing everyone to fetch it, so the value is pinned here — a
     /// routine change that shifts it fails this test instead of silently
     /// splitting the network from the copies already in the wild.
+    #[cfg(not(feature = "testnet"))]
     #[test]
     fn asert_polynomial_fix_is_armed_at_the_agreed_height() {
         assert_eq!(
@@ -1060,6 +1061,14 @@ mod tests {
             "the activation height published with v1.1.0 was 2000; changing it \
              forks this build away from every node already running that release"
         );
+    }
+
+    /// The reset test chain is corrected from its first block (see the
+    /// constant): the order of its clocks is the public network's.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn the_test_chain_is_corrected_from_its_first_block() {
+        assert_eq!(ASERT_POLYNOMIAL_FIX_HEIGHT, 0);
     }
 
     /// The deployed polynomial, bit for bit: the three rows measured on the
@@ -1234,6 +1243,9 @@ mod tests {
 
     /// The production entry point (`next_target`, activation constant not
     /// armed) reproduces every legacy vector exactly — zero-bit tolerance.
+    // Replays the public network's own blocks: meaningful on its profile only
+    // (the reset test chain is corrected from block 0).
+    #[cfg(not(feature = "testnet"))]
     #[test]
     fn production_next_target_replays_legacy_vectors_exactly() {
         let mut differing = 0;
@@ -1360,6 +1372,9 @@ mod tests {
     /// this cfg(test) build) is re-applied by hand. Every child target must
     /// come back identical. With the fix forced on (`H = 0`) the same replay
     /// must diverge, proving the check discriminates the two polynomials.
+    // Replays the public network's own blocks: meaningful on its profile only
+    // (the reset test chain is corrected from block 0).
+    #[cfg(not(feature = "testnet"))]
     #[test]
     fn production_next_target_replays_mainnet_headers_exactly() {
         use crate::consensus::header::asert_anchor_height;
@@ -1579,9 +1594,15 @@ mod tests {
         schedule(2000, Some((24_846, two_pow_target(235))), v1_5)
     }
 
-    /// The test chain's clocks as crossed: the fix at 2000, v1.4 at 750 with
-    /// the genesis target as its anchor.
+    /// The reset test chain's clocks (2026-10-07): the fix from block 0, v1.4
+    /// at 6 with the genesis target as its anchor.
     fn testnet_schedule(v1_5: Option<u64>) -> DifficultySchedule {
+        schedule(0, Some((6, GENESIS_TARGET)), v1_5)
+    }
+
+    /// The test chain retired on 2026-10-04 (genesis b3d4220c): the fix at 2000,
+    /// v1.4 at 750 on the genesis target. Its real headers stay in testdata.
+    fn retired_testnet_schedule(v1_5: Option<u64>) -> DifficultySchedule {
         schedule(2000, Some((750, GENESIS_TARGET)), v1_5)
     }
 
@@ -1620,6 +1641,7 @@ mod tests {
             schedule(u64::MAX, None, None),
             mainnet_schedule(None),
             testnet_schedule(None),
+            retired_testnet_schedule(None),
             private_c_schedule(None),
         ];
         for round in 0..60_000 {
@@ -1935,7 +1957,7 @@ mod tests {
                 mainnet_schedule,
                 MAINNET_HEADERS.len() - 2,
             ),
-            ("testnet 744-1349", &testnet, testnet_schedule, 1349 - 744),
+            ("testnet 744-1349", &testnet, retired_testnet_schedule, 1349 - 744),
             (
                 "private chain C 24-70",
                 &private_c,

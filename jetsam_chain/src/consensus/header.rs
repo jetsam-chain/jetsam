@@ -771,18 +771,16 @@ mod tests {
         assert_eq!(check_hard_checkpoint(&h1, &[]), Ok(()));
     }
 
-    /// Through the production validator and the real pin list: any block 750
-    /// other than the one the test chain carries is refused, and refused before
-    /// its parent, its target or its work are even looked at — so the error a
-    /// peer gets back names the pin, not whichever later rule it also breaks.
+    /// Through the production validator and the real pin list: the reset test
+    /// chain carries no pin yet, so no block is refused for a checkpoint. Once
+    /// the new chain has crossed its own blocks, pin one and restore the refusal
+    /// this test used to assert.
     #[cfg(feature = "testnet")]
     #[test]
-    fn the_test_chain_refuses_every_other_block_750() {
-        // Not mined: height 750 is walked on this profile, and the pin has to
-        // refuse the header before proof of work is ever evaluated.
+    fn the_reset_test_chain_refuses_no_block_by_checkpoint() {
         let parent = make_header(749, 1_000_000, None);
         let other = make_header(750, 1_000_000 + BLOCK_TIME, Some(&parent));
-        assert_eq!(
+        assert_ne!(
             validate_header_timeless(
                 &other,
                 &parent,

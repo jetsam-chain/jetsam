@@ -47,7 +47,7 @@ pub const GENESIS_TIMESTAMP: u64 = 1_787_328_000;
 /// previous hash, the empty-state root, height 0) or shared with the public
 /// network, which must not move.
 #[cfg(feature = "testnet")]
-pub const GENESIS_TIMESTAMP: u64 = 1_790_380_800;
+pub const GENESIS_TIMESTAMP: u64 = 1_791_385_200;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -110,7 +110,7 @@ const GENESIS_NONCE: u128 = 131_160;
 /// header, so moving the timestamp invalidates it: `genesis_nonce_satisfies_pow`
 /// is what refuses a build whose genesis cannot be proved.
 #[cfg(feature = "testnet")]
-const GENESIS_NONCE: u128 = 501_920;
+const GENESIS_NONCE: u128 = 91_696;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -254,10 +254,24 @@ mod tests {
             id, RETIRED_TESTNET_GENESIS_ID,
             "the reset test chain must not share a genesis with the one it replaced"
         );
-        const TESTNET_GENESIS_ID: [u8; 32] = [
+        /// Retired: 2026-10-07 J=1920 rehearsal born in v1.5, stopped at height 77.
+        const RETIRED_BC341146: [u8; 32] = [
+            0xbc, 0x34, 0x11, 0x46, 0xcb, 0x97, 0x4c, 0xad, 0x51, 0xd5, 0x39, 0x8f, 0x00, 0x97,
+            0xc9, 0x40, 0x07, 0xbf, 0xf7, 0x3d, 0xae, 0x59, 0x2c, 0xb8, 0x0e, 0xfd, 0x4f, 0x01,
+            0xcf, 0x11, 0xcf, 0x87,
+        ];
+        assert_ne!(crate::block_header::block_id(&genesis_header()), RETIRED_BC341146);
+        /// Retired: 2026-10-04 J=5980 rehearsal, stopped at height 7664.
+        const RETIRED_B3D4220C: [u8; 32] = [
             0xb3, 0xd4, 0x22, 0x0c, 0xe6, 0xdb, 0xb2, 0xa8, 0xda, 0x03, 0xd7, 0xcc, 0xc9, 0x69,
             0x5b, 0x24, 0xb1, 0xc8, 0xe6, 0xc7, 0xd8, 0x49, 0x30, 0x88, 0x36, 0x93, 0xce, 0x63,
             0xcc, 0xb4, 0x55, 0xf8,
+        ];
+        assert_ne!(crate::block_header::block_id(&genesis_header()), RETIRED_B3D4220C);
+        const TESTNET_GENESIS_ID: [u8; 32] = [
+            0xd9, 0xd1, 0x56, 0xee, 0x35, 0xe7, 0x25, 0xcf, 0x6b, 0x13, 0x32, 0x16, 0x80, 0x9c,
+            0x1b, 0x0f, 0x16, 0x5d, 0x11, 0x20, 0xc9, 0xcf, 0x42, 0xcc, 0x2b, 0xfe, 0xb0, 0xef,
+            0x90, 0x31, 0xee, 0x85,
         ];
         assert_eq!(id, TESTNET_GENESIS_ID);
     }
@@ -267,9 +281,9 @@ mod tests {
     fn genesis_timestamp_is_reasonable() {
         #[cfg(not(feature = "testnet"))]
         assert_eq!(GENESIS_TIMESTAMP, 1_787_328_000);
-        // 2026-09-26 00:00:00 UTC — the reset test chain. The retired value was
-        // 1_788_912_000.
+        // 2026-10-07 15:00:00 UTC — the reset test chain (proof of work walked
+        // from block 6). Retired values: 1_788_912_000, 1_790_380_800.
         #[cfg(feature = "testnet")]
-        assert_eq!(GENESIS_TIMESTAMP, 1_790_380_800);
+        assert_eq!(GENESIS_TIMESTAMP, 1_791_385_200);
     }
 }

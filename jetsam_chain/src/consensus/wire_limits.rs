@@ -291,7 +291,7 @@ mod tests {
     /// visible, and a shared declaration would make that edit fail on the public
     /// profile and look like a bug in the guard rather than what it is.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(750);
+    const DECLARED_V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(6);
 
     /// The same two-edit rule, for the third clock.
     ///
@@ -357,7 +357,7 @@ mod tests {
     /// profile for the same reason as the v1.4 declaration: arming the test chain
     /// alone must be one visible edit here, not a failure on the other profile.
     #[cfg(feature = "testnet")]
-    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(9600);
+    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(960);
 
     /// The same two-edit rule, for the fourth clock.
     ///

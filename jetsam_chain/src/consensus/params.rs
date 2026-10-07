@@ -196,7 +196,15 @@ pub const fn halflife_at_with(height: u64, v1_5_activation: Option<u64>) -> u64 
 /// corrected curve. Below 2000 the two versions agree byte for byte, which
 /// `difficulty::tests::production_next_target_replays_mainnet_headers_exactly`
 /// proves against real mainnet headers.
+#[cfg(not(feature = "testnet"))]
 pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 2000;
+
+/// The test chain reset on 2026-10-07 carries the corrected polynomial from its
+/// first block. The public network crossed 2000 long before v1.4 and will meet
+/// v1.5 with the corrected curve only; a test chain that crossed the fix after
+/// v1.5 would rehearse an order of clocks the public network never sees.
+#[cfg(feature = "testnet")]
+pub const ASERT_POLYNOMIAL_FIX_HEIGHT: u64 = 0;
 
 /// First block height governed by the complete v1.2 consensus rules.
 ///
@@ -378,7 +386,7 @@ pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(24846);
 /// in `wire_limits`, and [`V1_4_ANCHOR_TARGET`] in one commit. Three edits,
 /// three guards.
 #[cfg(feature = "testnet")]
-pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(750);
+pub const V1_4_ACTIVATION_HEIGHT: Option<u64> = Some(6);
 
 /// Whether one candidate block height is governed by the v1.4 proof-of-work.
 #[inline]
@@ -446,7 +454,7 @@ pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
 /// Declared per profile, like [`V1_4_ACTIVATION_HEIGHT`], so that arming one
 /// can never arm the other: the public profile above stays `None`.
 #[cfg(feature = "testnet")]
-pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(9600);
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(960);
 
 /// Whether one candidate block height is governed by the v1.5 rules.
 #[inline]
@@ -767,19 +775,10 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[(
     ],
 )];
 
-/// The test chain's v1.4 activation block, crossed on 2026-09-27 at 18:28 UTC.
-/// Read back from two nodes that reached it by different paths — cpu13 by
-/// sequential validation, the seed by a snapshot jump from 749 to 772 — and
-/// equal to the `prev_block_hash` of block 751.
+/// The test chain was reset on 2026-10-07 (walked from block 6): no pin until
+/// the new chain has crossed its own blocks.
 #[cfg(feature = "testnet")]
-pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[(
-    750,
-    [
-        0xac, 0xad, 0xac, 0xcb, 0x06, 0xf9, 0xa2, 0x29, 0x19, 0x49, 0x03, 0x0c, 0x3b, 0x43,
-        0x8e, 0xaf, 0xb7, 0x62, 0xa4, 0x7e, 0x53, 0xab, 0xd4, 0x88, 0x99, 0x59, 0x03, 0xf4,
-        0x1d, 0x60, 0x38, 0xe0,
-    ],
-)];
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
 
 /// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
 #[cfg(not(feature = "testnet"))]
@@ -792,9 +791,9 @@ pub const HARD_CHECKPOINTS_GENESIS: [u8; 32] = [
 /// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
 #[cfg(feature = "testnet")]
 pub const HARD_CHECKPOINTS_GENESIS: [u8; 32] = [
-    0xb3, 0xd4, 0x22, 0x0c, 0xe6, 0xdb, 0xb2, 0xa8, 0xda, 0x03, 0xd7, 0xcc, 0xc9, 0x69, 0x5b,
-    0x24, 0xb1, 0xc8, 0xe6, 0xc7, 0xd8, 0x49, 0x30, 0x88, 0x36, 0x93, 0xce, 0x63, 0xcc, 0xb4,
-    0x55, 0xf8,
+    0xd9, 0xd1, 0x56, 0xee, 0x35, 0xe7, 0x25, 0xcf, 0x6b, 0x13, 0x32, 0x16, 0x80, 0x9c, 0x1b,
+    0x0f, 0x16, 0x5d, 0x11, 0x20, 0xc9, 0xcf, 0x42, 0xcc, 0x2b, 0xfe, 0xb0, 0xef, 0x90, 0x31,
+    0xee, 0x85,
 ];
 
 /// The block id pinned at `height` on this profile, if any.
@@ -842,10 +841,12 @@ mod hard_checkpoint_tests {
     /// The block worth pinning is the activation block — the one whose absence
     /// the work comparison cannot see. A pin typed one block off would still
     /// build, still pass every other test, and protect nothing.
+    /// The test chain was reset on 2026-10-07: no pin until it has crossed its
+    /// own activation block, which is then the one to pin.
     #[cfg(feature = "testnet")]
     #[test]
-    fn the_test_chain_pins_its_activation_block() {
-        assert_eq!(Some(HARD_CHECKPOINTS[0].0), V1_4_ACTIVATION_HEIGHT);
+    fn the_reset_test_chain_carries_no_pin_yet() {
+        assert!(HARD_CHECKPOINTS.is_empty());
     }
 
     #[cfg(not(feature = "testnet"))]
