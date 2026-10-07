@@ -620,6 +620,9 @@ impl WalletOps for WalletHandle {
                     timestamp: h.timestamp,
                     own_address: h.own_address.clone(),
                     own_key_index: h.own_key_index,
+                    block_hash: h.block_hash,
+                    canonical: None,
+                    confirmations: None,
                 })
                 .collect(),
         }
@@ -2203,6 +2206,18 @@ mod tests {
         assert!(entry.is_coinbase);
         assert_eq!(entry.block_hash, Some(displaced_block_hash));
         drop(guard);
+
+        // `walletHistory` needs the exact mined block to report the orphan.
+        let listed = jetsam_rpc::wallet_ops::WalletOps::history(&handle);
+        let listed = listed
+            .iter()
+            .find(|entry| entry.tx_hash == hex::encode(coinbase_txid))
+            .expect("displaced coinbase listed by walletHistory");
+        assert_eq!(listed.block_hash, Some(displaced_block_hash));
+        assert_eq!(
+            listed.canonical, None,
+            "the wallet alone cannot see the chain"
+        );
 
         let reloaded = state::WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         assert!(reloaded.history.iter().any(|entry| {

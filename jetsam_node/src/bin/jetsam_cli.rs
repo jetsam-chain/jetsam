@@ -1875,26 +1875,12 @@ async fn cmd_history(
     }
     separator(88);
 
-    // Compute totals
-    let mut sent: u64 = 0;
-    let mut received: u64 = 0;
+    let totals = tally_history(&filtered);
 
     for e in &filtered {
         let height = e["height"].as_u64().unwrap_or(0);
-        let dir = e["direction"].as_str().unwrap_or("?");
         let micro = e["amount_micro_jtm"].as_u64().unwrap_or(0);
-
-        let (sign, arrow, colour) = if dir == "received" || dir == "recv" {
-            ("+", "\u{2190} recv", GRN)
-        } else {
-            ("-", "\u{2192} sent", RED)
-        };
-
-        if dir == "sent" {
-            sent += micro;
-        } else {
-            received += micro;
-        }
+        let (sign, arrow, colour) = history_row_style(e);
 
         let own = e["own_address"].as_str().unwrap_or("");
         let own_idx = e["own_key_index"].as_u64();
@@ -1934,20 +1920,78 @@ async fn cmd_history(
             "",
             "",
             GRN,
-            format!("+ {} JTM received", jetsam_str(received)),
+            format!("+ {} JTM received", jetsam_str(totals.received)),
             RED,
-            format!("  - {} JTM sent", jetsam_str(sent)),
+            format!("  - {} JTM sent", jetsam_str(totals.sent)),
             RST
         );
     } else {
         println!(
             "  total: +{} received  -{} sent",
-            jetsam_str(received),
-            jetsam_str(sent)
+            jetsam_str(totals.received),
+            jetsam_str(totals.sent)
         );
+    }
+    if let Some(line) = orphaned_total_line(&totals) {
+        println!("  {}", c!(DIM, line));
     }
 
     Ok(())
+}
+
+/// Totals shown under `jetsam-cli history`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HistoryTotals {
+    received: u64,
+    sent: u64,
+    orphaned_blocks: u64,
+    orphaned_micro: u64,
+}
+
+/// A locally mined block that lost a reorganization: its reward does not
+/// exist. Only an explicit `canonical: false` from the node counts; older
+/// nodes do not send the field.
+fn is_orphaned_coinbase(entry: &Value) -> bool {
+    entry["is_coinbase"].as_bool() == Some(true) && entry["canonical"].as_bool() == Some(false)
+}
+
+/// Sign, direction label and colour of one history row.
+fn history_row_style(entry: &Value) -> (&'static str, &'static str, &'static str) {
+    let dir = entry["direction"].as_str().unwrap_or("?");
+    if is_orphaned_coinbase(entry) {
+        (" ", "orphaned", DIM)
+    } else if dir == "received" || dir == "recv" {
+        ("+", "\u{2190} recv", GRN)
+    } else {
+        ("-", "\u{2192} sent", RED)
+    }
+}
+
+fn tally_history(entries: &[&Value]) -> HistoryTotals {
+    let mut totals = HistoryTotals::default();
+    for entry in entries {
+        let micro = entry["amount_micro_jtm"].as_u64().unwrap_or(0);
+        if is_orphaned_coinbase(entry) {
+            totals.orphaned_blocks += 1;
+            totals.orphaned_micro += micro;
+        } else if entry["direction"].as_str() == Some("sent") {
+            totals.sent += micro;
+        } else {
+            totals.received += micro;
+        }
+    }
+    totals
+}
+
+fn orphaned_total_line(totals: &HistoryTotals) -> Option<String> {
+    (totals.orphaned_blocks > 0).then(|| {
+        format!(
+            "orphaned coinbases: {} block{}, {} JTM (not spendable)",
+            totals.orphaned_blocks,
+            if totals.orphaned_blocks == 1 { "" } else { "s" },
+            jetsam_str(totals.orphaned_micro)
+        )
+    })
 }
 
 async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
@@ -2401,5 +2445,84 @@ mod endpoint_tests {
             jetsam_chain::consensus::identity::DEFAULT_RPC_PORT
         );
         assert_eq!(DEFAULT_RPC_URL, expected);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{history_row_style, orphaned_total_line, tally_history, HistoryTotals, GRN};
+    use serde_json::{json, Value};
+
+    fn coinbase(height: u64, micro: u64, canonical: Option<bool>) -> Value {
+        let mut entry = json!({
+            "tx_hash": format!("{height:064x}"),
+            "height": height,
+            "direction": "received",
+            "is_coinbase": true,
+            "amount_micro_jtm": micro,
+        });
+        if let Some(canonical) = canonical {
+            entry["canonical"] = json!(canonical);
+            entry["confirmations"] = json!(if canonical { 1 } else { 0 });
+        }
+        entry
+    }
+
+    /// The reported case: three locally mined blocks around 29344 all lost a
+    /// reorganization, the balance is zero, and the history summed them as
+    /// "+180.03 JTM received".
+    #[test]
+    fn orphaned_coinbases_are_not_received_money() {
+        let entries = [
+            coinbase(29_342, 60_010_000, Some(false)),
+            coinbase(29_343, 60_010_000, Some(false)),
+            coinbase(29_344, 60_010_000, Some(false)),
+        ];
+        let refs = entries.iter().collect::<Vec<_>>();
+        let totals = tally_history(&refs);
+        assert_eq!(totals.received, 0, "orphaned rewards counted as received");
+        assert_eq!(totals.orphaned_blocks, 3);
+        assert_eq!(totals.orphaned_micro, 180_030_000);
+        assert_eq!(
+            orphaned_total_line(&totals).as_deref(),
+            Some("orphaned coinbases: 3 blocks, 180.030000 JTM (not spendable)")
+        );
+    }
+
+    #[test]
+    fn an_orphaned_coinbase_row_is_labelled_and_not_green() {
+        let (sign, label, colour) = history_row_style(&coinbase(29_344, 60_010_000, Some(false)));
+        assert_eq!(label, "orphaned");
+        assert_ne!(sign, "+");
+        assert_ne!(colour, GRN);
+    }
+
+    /// A coinbase still on the canonical chain (one confirmation) is the
+    /// wallet's money; only the explicit `canonical: false` marks an orphan.
+    /// An entry from an older node carries no status and keeps the old display.
+    #[test]
+    fn a_canonical_or_unknown_coinbase_stays_received() {
+        let canonical = coinbase(29_345, 60_010_000, Some(true));
+        let legacy = coinbase(29_346, 60_010_000, None);
+        let orphan = coinbase(29_344, 60_010_000, Some(false));
+        for entry in [&canonical, &legacy] {
+            assert_eq!(history_row_style(entry), ("+", "\u{2190} recv", GRN));
+        }
+        let totals = tally_history(&[&canonical, &legacy, &orphan]);
+        assert_eq!(
+            totals,
+            HistoryTotals {
+                received: 120_020_000,
+                sent: 0,
+                orphaned_blocks: 1,
+                orphaned_micro: 60_010_000,
+            }
+        );
+    }
+
+    #[test]
+    fn no_orphan_line_without_orphans() {
+        let entry = coinbase(10, 50_000_000, Some(true));
+        assert_eq!(orphaned_total_line(&tally_history(&[&entry])), None);
     }
 }

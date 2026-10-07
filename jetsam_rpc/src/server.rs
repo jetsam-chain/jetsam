@@ -337,6 +337,33 @@ fn mined_record_is_canonical(
     )
 }
 
+/// Mark each locally mined coinbase in `history` canonical or orphaned with
+/// the identity check `walletMinedBlocks` uses. Payments are left unmarked.
+fn annotate_coinbase_status<E>(
+    history: &mut [WalletHistoryEntry],
+    tip: u64,
+    mut canonical_header_at: impl FnMut(u64) -> Result<Option<jetsam_chain::BlockHeader>, E>,
+) -> Result<(), E> {
+    for entry in history
+        .iter_mut()
+        .filter(|entry| entry.is_coinbase && entry.height != 0)
+    {
+        let Some(payout) = entry.own_address.as_deref() else {
+            continue;
+        };
+        let canonical = canonical_header_at(entry.height)?.is_some_and(|header| {
+            mined_record_is_canonical(entry.block_hash, entry.timestamp, payout, &header)
+        });
+        entry.canonical = Some(canonical);
+        entry.confirmations = Some(if canonical {
+            tip.saturating_sub(entry.height).saturating_add(1)
+        } else {
+            0
+        });
+    }
+    Ok(())
+}
+
 fn discover_contiguous_funded_prefix<E>(
     expected_next_index: u32,
     candidates: &[(u32, [u8; 32])],
@@ -3419,7 +3446,13 @@ impl JetsamApiServer for RpcHandler {
     }
 
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>> {
-        Ok(self.wallet.history())
+        let mut history = self.wallet.history();
+        let chain = self.chain.read().await;
+        annotate_coinbase_status(&mut history, chain.tip_height(), |height| {
+            chain.get_header_from_store(height)
+        })
+        .map_err(|error| rpc_err(error.to_string()))?;
+        Ok(history)
     }
 
     async fn wallet_receipts(&self, page: u32, page_size: u32) -> RpcResult<WalletReceiptsPage> {
@@ -3934,6 +3967,69 @@ mod tests {
             &jetsam_poseidon2b::primitives::Address([1; 32]).to_bech32(),
             &header,
         ));
+    }
+
+    #[test]
+    fn wallet_history_marks_orphaned_and_canonical_coinbases() {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = 5;
+        let payout = header.miner_address.to_bech32();
+        let exact_hash = block_id(&header);
+        let mut displaced_hash = exact_hash;
+        displaced_hash[0] ^= 1;
+        let entry = |height, is_coinbase, block_hash| WalletHistoryEntry {
+            tx_hash: format!("{height:064x}"),
+            height,
+            direction: "received".into(),
+            is_coinbase,
+            amount_micro_jtm: 60_010_000,
+            amount_eld: 60.01,
+            peer_address: None,
+            timestamp: header.timestamp,
+            own_address: Some(payout.clone()),
+            own_key_index: Some(0),
+            block_hash,
+            canonical: None,
+            confirmations: None,
+        };
+        let mut history = vec![
+            entry(5, true, Some(exact_hash)),
+            entry(5, true, Some(displaced_hash)),
+            // The canonical chain no longer reaches this height.
+            entry(6, true, Some(exact_hash)),
+            entry(5, false, None),
+        ];
+        annotate_coinbase_status(&mut history, 7, |height| {
+            Ok::<_, ()>((height == 5).then(|| header.clone()))
+        })
+        .unwrap();
+
+        let status = history
+            .iter()
+            .map(|entry| (entry.canonical, entry.confirmations))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status,
+            [
+                (Some(true), Some(3)),
+                (Some(false), Some(0)),
+                (Some(false), Some(0)),
+                (None, None),
+            ]
+        );
+
+        // Wire format: the status is optional and the internal block identity
+        // is not serialized; an older node's entry still deserializes.
+        let json = serde_json::to_value(&history[1]).unwrap();
+        assert_eq!(json["canonical"], serde_json::json!(false));
+        assert!(json.get("block_hash").is_none());
+        let payment = serde_json::to_value(&history[3]).unwrap();
+        assert!(payment.get("canonical").is_none());
+        assert!(payment.get("confirmations").is_none());
+        let mut legacy = payment;
+        legacy.as_object_mut().unwrap().remove("is_coinbase");
+        let legacy: WalletHistoryEntry = serde_json::from_value(legacy).unwrap();
+        assert_eq!((legacy.canonical, legacy.confirmations), (None, None));
     }
 
     #[test]

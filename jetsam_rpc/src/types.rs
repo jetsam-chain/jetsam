@@ -239,6 +239,19 @@ pub struct WalletHistoryEntry {
     pub own_address: Option<String>,
     /// Key index of the own address.
     pub own_key_index: Option<u32>,
+    /// Exact block that confirmed this entry, when the wallet recorded it.
+    /// Server-side input for `canonical`; not part of the JSON response.
+    #[serde(skip)]
+    pub block_hash: Option<[u8; 32]>,
+    /// Locally mined coinbases only: false once the block lost a
+    /// reorganization (the reward does not exist). Absent for payments and
+    /// from older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<bool>,
+    /// Locally mined coinbases only: tip-inclusive confirmations, 0 when
+    /// orphaned. Absent for payments and from older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
 }
 
 /// One durable receipt for a payment whose recipient differs from its source.
