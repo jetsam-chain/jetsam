@@ -75,3 +75,36 @@ fn the_transport_bound_is_the_client_form_bound() {
         jetsam_chain::consensus::client_objects::CLIENT_PROOF_MAX_WIRE_BYTES
     );
 }
+
+/// The client catalogue (closed, decision of 2026-10-04) of the test network
+/// lists the example client, catalogue entry 1 (`jetsam_client_agent`), by the
+/// digest of its matrix in the canonical client form: the `D` of the
+/// `matrix.bin` `jetsam_client_demo` writes, the one the registration
+/// rehearsals use. The matrix does not depend on the trace nor on the policy
+/// (data-independent circuit), so the empty trace gives it. The public
+/// network lists no tool.
+#[test]
+fn the_test_network_catalogue_lists_the_example_client() {
+    use jetsam_chain::consensus::client_objects::CLIENT_CATALOGUE;
+    use jetsam_client_agent::{agent_policy_instance, AgentPolicy};
+    use jetsam_recursive::acceptance::history_step_bank::HistoryStepClientForm;
+    let form = HistoryStepClientForm::canonical();
+    let policy = AgentPolicy {
+        allowed_tools: [101, 102, 103, 205, 206, 300, 777],
+        budget_cap: 250_000,
+    };
+    let example = agent_policy_instance(&policy, &[], form.shape(), form.io_spec().io_slice)
+        .expect("the example client in the canonical client form")
+        .r1cs
+        .structural_statement_digest();
+    let hex: String = example.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, "87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f",
+        "the example client's D the testnet rehearsals registered"
+    );
+    if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+        assert_eq!(CLIENT_CATALOGUE, &[example]);
+    } else {
+        assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
+    }
+}

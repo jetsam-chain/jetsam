@@ -344,6 +344,7 @@ fn registration(d: u8) -> ClientRegistration {
 fn notice_rules() -> ClientObjectRules {
     ClientObjectRules {
         activation_height: Some(1),
+        catalogue: &[[0x31; 32], [0x32; 32]],
         ..ClientObjectRules::CONSENSUS
     }
 }
@@ -410,6 +411,40 @@ fn registration_notices_round_trip_and_are_told_from_announcements() {
         fee: 5,
     };
     assert!(!ClientRegistrationNotice::is_notice(&announcement.encode()));
+}
+
+/// The closed catalogue (decision of 2026-10-04): a notice for a tool
+/// outside it, license paid, is refused where it is built and where it is
+/// read off the wire — never relayed.
+#[test]
+fn a_registration_notice_outside_the_catalogue_is_refused() {
+    let rules = notice_rules();
+    let foreign = registration(0x77);
+    assert!(!rules.catalogue.contains(&foreign.matrix_digest));
+    let marker = ClientObject::Registration(foreign).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    let payment = page_paying(
+        &[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)],
+        2_000,
+    );
+    let refused = Err(ClientTransportError::RegistrationRefused(
+        ClientObjectError::NotInCatalogue {
+            matrix_digest: foreign.matrix_digest,
+        },
+    ));
+    assert_eq!(
+        ClientRegistrationNotice::new(foreign, payment.clone(), &rules),
+        refused
+    );
+    // Sent by a node whose catalogue lists it: refused on reception.
+    let wider = ClientObjectRules {
+        catalogue: &[[0x77; 32]],
+        ..rules
+    };
+    let bytes = ClientRegistrationNotice::new(foreign, payment, &wider)
+        .unwrap()
+        .encode();
+    assert_eq!(ClientRegistrationNotice::decode(&bytes, &rules), refused);
 }
 
 #[test]

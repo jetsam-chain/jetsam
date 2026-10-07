@@ -2540,9 +2540,11 @@ async fn main() -> anyhow::Result<()> {
         match history_step_runtimes.client_matrices.clone() {
             Some(matrices) => {
                 let form = matrices.form().clone();
-                let objects =
-                    jetsam_node::client_objects::ClientObjects::open(&data_dir, &form, matrices)
-                        .context("open v1.5 client objects")?;
+                let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+                let objects = jetsam_node::client_objects::ClientObjects::open(
+                    &data_dir, &form, matrices, &rules,
+                )
+                .context("open v1.5 client objects")?;
                 // Every registered matrix of the chain is wanted; client
                 // proofs kept before a restart are received again.
                 objects.want_matrices(
@@ -2552,7 +2554,6 @@ async fn main() -> anyhow::Result<()> {
                         .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
                 );
                 let registry = ctx.client_registry().clone();
-                let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
                 match jetsam_miner::install_inbound_verifier_cpu(|| {
                     objects.reload_bundles(&registry, &rules)
                 }) {

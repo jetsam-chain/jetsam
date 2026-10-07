@@ -293,21 +293,25 @@ async fn a_dormant_node_does_not_advertise_the_client_object_protocol() {
 
 /// M3.10 (§8 gap b): a registration one node holds reaches another node over
 /// the client topic, whole (registration and paying transaction), so that any
-/// miner can include it.
+/// miner can include it. Only a tool of the closed catalogue (decision of
+/// 2026-10-04) can be registered, hence relayed: the public network lists
+/// none, and there the notice is refused before it is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_registration_is_relayed_to_every_node() {
     use jetsam_chain::consensus::client_objects::{
-        ClientObject, ClientObjectRules, ClientRegistration, CLIENT_LICENSE_BURN_ADDRESS,
+        ClientObject, ClientObjectError, ClientObjectRules, ClientRegistration,
+        CLIENT_LICENSE_BURN_ADDRESS,
     };
-    use jetsam_p2p::client_object_protocol::ClientRegistrationNotice;
+    use jetsam_p2p::client_object_protocol::{ClientRegistrationNotice, ClientTransportError};
     use jetsam_poseidon2b::primitives::Address;
     use jetsam_tx::{
         output_bitmap_bit, PagedSpendIntent, TxBody, TxInput, TxOutput, TxPage,
         PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
     let rules = ClientObjectRules::current();
+    let listed = rules.catalogue.first().copied();
     let registration = ClientRegistration {
-        matrix_digest: [0x31; 32],
+        matrix_digest: listed.unwrap_or([0x31; 32]),
         matrix_file_root: [0x32; 32],
         matrix_file_len: 4_096,
     };
@@ -350,8 +354,19 @@ async fn a_held_registration_is_relayed_to_every_node() {
             vec![0xA5; 64],
         )
         .unwrap();
-        ClientRegistrationNotice::new(registration, payment, &rules).unwrap()
+        ClientRegistrationNotice::new(registration, payment, &rules)
     };
+    if listed.is_none() {
+        assert_eq!(
+            notice_paying_fee(2_000_000),
+            Err(ClientTransportError::RegistrationRefused(
+                ClientObjectError::NotInCatalogue {
+                    matrix_digest: registration.matrix_digest
+                }
+            ))
+        );
+        return;
+    }
     let holder_dir = tempfile::tempdir().unwrap();
     let asker_dir = tempfile::tempdir().unwrap();
     let holder_port = free_port();
@@ -374,7 +389,7 @@ async fn a_held_registration_is_relayed_to_every_node() {
     // the mesh has formed.
     let mut received = None;
     for attempt in 0..30u64 {
-        let notice = Arc::new(notice_paying_fee(2_000_000 + attempt));
+        let notice = Arc::new(notice_paying_fee(2_000_000 + attempt).unwrap());
         holder
             .cmd_tx
             .send(NetworkCommand::AnnounceClientRegistration {

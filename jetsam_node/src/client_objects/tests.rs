@@ -136,8 +136,24 @@ fn rules() -> ClientObjectRules {
         activation_height: Some(1),
         submission_fee_micro: 1_000,
         activation_delay: 2,
+        catalogue: test_catalogue(),
         ..ClientObjectRules::CONSENSUS
     }
+}
+
+/// The client catalogue of these tests: the `D` of every test client
+/// (seeds `0xC0..=0xCF`).
+fn test_catalogue() -> &'static [Hash32] {
+    static CATALOGUE: std::sync::OnceLock<Vec<Hash32>> = std::sync::OnceLock::new();
+    CATALOGUE.get_or_init(|| {
+        (0xC0..=0xCF)
+            .map(|seed| {
+                let (matrix, _): (FieldR1cs, Vec<F128>) =
+                    synthetic_satisfiable(CLIENT_M, CLIENT_M, seed);
+                matrix.structural_statement_digest()
+            })
+            .collect()
+    })
 }
 
 /// A one-page payment of `submission` (its marker), `fee` μJTM.
@@ -180,6 +196,7 @@ fn open(directory: &Path, form: &HistoryStepClientForm) -> ClientObjects {
         directory,
         form,
         Arc::new(HistoryStepClientMatrixSet::new(form)),
+        &rules(),
     )
     .unwrap()
 }
@@ -483,6 +500,38 @@ fn a_registration_is_held_with_its_matrix_until_a_block_makes_it() {
     assert_eq!(held[0].0, registration);
     // Once registered on chain it is no longer offered.
     assert!(MinerClientSource::held_registrations(&objects, &registry_of(&[&client])).is_empty());
+}
+
+/// The closed catalogue (decision of 2026-10-04): a registration handed to
+/// this node (`registerClient`) for a tool outside the catalogue, license
+/// paid, is refused at the door — nothing held, its matrix not served.
+#[test]
+fn a_registration_outside_the_catalogue_is_not_held() {
+    use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+    use jetsam_miner::client_slot::MinerClientSource;
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCA);
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let rules = ClientObjectRules {
+        catalogue: &[],
+        ..rules()
+    };
+    let registration = objects.registration_of_matrix_file(&client.file).unwrap();
+    let marker = ClientObject::Registration(registration).marker();
+    let license = rules.destination.split(rules.license_micro).burn;
+    let paid = payment_paying(
+        &[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)],
+        1_000,
+    );
+    let error = objects
+        .hold_client_registration(paid, &client.file, &rules)
+        .unwrap_err();
+    assert!(error.to_string().contains("NotInCatalogue"), "{error}");
+    assert!(!objects.holds_matrix(&client.digest()));
+    assert!(
+        MinerClientSource::held_registrations(&objects, &ClientRegistryState::new()).is_empty()
+    );
 }
 
 /// M3.10 (§8 gap b): a registration relayed by a peer is held for this

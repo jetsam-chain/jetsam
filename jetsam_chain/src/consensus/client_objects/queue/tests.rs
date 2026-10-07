@@ -28,6 +28,7 @@ fn rules() -> ClientObjectRules {
         dividend_blocks: 480,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
+        catalogue: &crate::consensus::client_objects::test_rules::UNIFORM_CATALOGUE,
     }
 }
 

@@ -33,6 +33,7 @@ fn armed_rules() -> ClientObjectRules {
         dividend_blocks: 4,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
+        catalogue: &test_rules::UNIFORM_CATALOGUE,
     }
 }
 
@@ -1200,4 +1201,261 @@ fn a_suffix_does_not_rejudge_the_client_lanes_of_its_intermediate_blocks() {
     }
     assert_eq!(suffix.tip_height(), 5);
     assert_eq!(suffix.client_registry().digests(), vec![registration.matrix_digest]);
+}
+
+// ---- The closed catalogue (decision of 2026-10-04, confirmed 2026-10-07) ----
+
+/// A paid registration of `matrix_digest` on `context`'s tip, spending the
+/// coinbase of `funding`.
+fn registration_of(matrix_digest: [u8; 32]) -> (ClientRegistration, ClientObject) {
+    let registration = ClientRegistration {
+        matrix_digest,
+        matrix_file_root: [0xF1; 32],
+        matrix_file_len: 4_096,
+    };
+    (registration, ClientObject::Registration(registration))
+}
+
+fn paying(
+    context: &MdbxChainContext,
+    funding: &crate::AcceptedBlockBundle,
+    object: &ClientObject,
+) -> Transaction {
+    spend_coinbase(
+        context,
+        funding,
+        &[
+            (CLIENT_LICENSE_BURN_ADDRESS, MICRO_PER_JTM),
+            (object.marker(), 0),
+        ],
+    )
+}
+
+/// A block registering a tool outside the catalogue is refused by name and
+/// writes nothing; a tool of the catalogue registers exactly as before.
+#[test]
+fn a_block_registering_outside_the_catalogue_is_refused_and_writes_nothing() {
+    let _rules = test_rules::install(ClientObjectRules {
+        catalogue: &[[0xA1; 32]],
+        ..armed_rules()
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let first = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &first).unwrap();
+    let durable_before = context.store.get_client_registry().unwrap();
+
+    let (foreign, foreign_object) = registration_of([0xD1; 32]);
+    let pays = paying(&context, &first, &foreign_object);
+    let refused = bundle_with(&mut context, MINER, vec![pays], vec![foreign_object]);
+    refused_with(
+        apply(&mut context, &refused),
+        ClientObjectError::NotInCatalogue {
+            matrix_digest: foreign.matrix_digest,
+        },
+    );
+    assert_eq!(context.tip_height(), 1);
+    assert!(context.client_registry().is_empty());
+    assert_eq!(context.store.get_client_registry().unwrap(), durable_before);
+
+    let (allowed, allowed_object) = registration_of([0xA1; 32]);
+    let pays = paying(&context, &first, &allowed_object);
+    let accepted = bundle_with(&mut context, MINER, vec![pays], vec![allowed_object]);
+    apply(&mut context, &accepted).unwrap();
+    assert_eq!(context.tip_height(), 2);
+    assert_eq!(
+        context.client_registry().digests(),
+        vec![allowed.matrix_digest]
+    );
+    let entry = context.client_registry().entries()[0];
+    assert_eq!(
+        (entry.index, entry.registered_at, entry.active_from),
+        (0, 2, 4)
+    );
+    assert_eq!(
+        context.store.get_client_registry().unwrap().as_ref(),
+        Some(context.client_registry())
+    );
+}
+
+/// An empty catalogue (the public network at launch): no registration
+/// reaches the chain, which goes on without one.
+#[test]
+fn an_empty_catalogue_keeps_every_registration_off_the_chain() {
+    let _rules = test_rules::install(ClientObjectRules {
+        catalogue: &[],
+        ..armed_rules()
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let first = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &first).unwrap();
+    for digest in [[0xA1; 32], [0xD1; 32]] {
+        let (registration, object) = registration_of(digest);
+        let pays = paying(&context, &first, &object);
+        let refused = bundle_with(&mut context, MINER, vec![pays], vec![object]);
+        refused_with(
+            apply(&mut context, &refused),
+            ClientObjectError::NotInCatalogue {
+                matrix_digest: registration.matrix_digest,
+            },
+        );
+        assert_eq!(context.tip_height(), 1);
+    }
+    let next = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &next).unwrap();
+    assert_eq!(context.tip_height(), 2);
+    assert!(context.client_registry().is_empty());
+}
+
+/// A reorg whose replacement registers outside the catalogue is undone and
+/// leaves the registry of the durable branch; one registering another tool
+/// of the catalogue moves the registry to its branch, durably.
+#[test]
+fn a_reorg_keeps_the_registry_coherent_under_the_catalogue() {
+    let _rules = test_rules::install(ClientObjectRules {
+        catalogue: &[[0xA1; 32], [0xB2; 32]],
+        ..armed_rules()
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let first = test_next_bundle_for_miner(&context, MINER);
+    apply(&mut context, &first).unwrap();
+    let (a, object_a) = registration_of([0xA1; 32]);
+    let (b, object_b) = registration_of([0xB2; 32]);
+    let (_, object_x) = registration_of([0xD1; 32]);
+    // Three second blocks on the same parent, built before any is applied.
+    let pays_a = paying(&context, &first, &object_a);
+    let with_a = bundle_with(&mut context, MINER, vec![pays_a], vec![object_a]);
+    let pays_b = paying(&context, &first, &object_b);
+    let with_b = bundle_with(&mut context, 0x62, vec![pays_b], vec![object_b]);
+    let pays_x = paying(&context, &first, &object_x);
+    let with_x = bundle_with(&mut context, 0x63, vec![pays_x], vec![object_x]);
+    apply(&mut context, &with_a).unwrap();
+    assert_eq!(context.client_registry().digests(), vec![a.matrix_digest]);
+
+    let reorg_apply = |context: &mut MdbxChainContext,
+                       bundle: &crate::AcceptedBlockBundle,
+                       _: u64| { apply(context, bundle).map(|_| ()) };
+    let error = context
+        .apply_reorg_mdbx_with_applier(1, std::slice::from_ref(&with_x), 0, reorg_apply)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MdbxContextError::Consensus(ConsensusError::ClientObject(
+                ClientObjectError::NotInCatalogue { .. }
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(context.tip_hash(), with_a.block_hash());
+    assert_eq!(context.client_registry().digests(), vec![a.matrix_digest]);
+    assert_eq!(
+        context.store.get_client_registry().unwrap().as_ref(),
+        Some(context.client_registry())
+    );
+
+    context
+        .apply_reorg_mdbx_with_applier(1, std::slice::from_ref(&with_b), 0, reorg_apply)
+        .unwrap();
+    assert_eq!(context.tip_hash(), with_b.block_hash());
+    assert_eq!(context.client_registry().digests(), vec![b.matrix_digest]);
+    assert_eq!(context.client_registry().entries()[0].registered_at, 2);
+    assert_eq!(
+        context.store.get_client_registry().unwrap().as_ref(),
+        Some(context.client_registry())
+    );
+    let mut truncated = context.client_registry().clone();
+    truncated.truncate_above(1);
+    assert!(truncated.is_empty());
+    drop(context);
+    let reopened =
+        MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap()).unwrap();
+    assert_eq!(reopened.client_registry().digests(), vec![b.matrix_digest]);
+}
+
+/// A snapshot whose registry holds a tool outside this node's catalogue is
+/// refused (nothing installed), though its state proves every entry: the
+/// same snapshot installs under a catalogue that lists the tool.
+#[test]
+fn a_snapshot_registry_outside_the_catalogue_is_refused() {
+    let producer_rules = test_rules::install(ClientObjectRules {
+        catalogue: &[[0xD1; 32]],
+        ..armed_rules()
+    });
+    let producer_dir = tempfile::tempdir().unwrap();
+    let mut producer = easy_block_context(producer_dir.path());
+    let first = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &first).unwrap();
+    let (registration, object) = registration_of([0xD1; 32]);
+    let pays = paying(&producer, &first, &object);
+    let second = bundle_with(&mut producer, MINER, vec![pays], vec![object]);
+    apply(&mut producer, &second).unwrap();
+    let third = test_next_bundle_for_miner(&producer, MINER);
+    apply(&mut producer, &third).unwrap();
+    let registry = producer.client_registry().clone();
+    assert_eq!(registry.digests(), vec![registration.matrix_digest]);
+    let exports = tempfile::tempdir().unwrap();
+    let generation = crate::storage::export_snapshot_boundary_generation(
+        &producer.store,
+        exports.path(),
+        3,
+        None,
+    )
+    .unwrap();
+    let target = producer.get_header_from_store(3).unwrap().unwrap();
+    let mut leaves = registry.digests();
+    leaves.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+    let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+        target,
+        third.history_step_terminal_bytes().to_vec(),
+        TerminalClientView {
+            carried: None,
+            registry_leaves: Some(leaves),
+        },
+    );
+    let install = || {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let mut consumer = easy_block_context(directory.path());
+        let staging = stage(&generation, target, staging_root.path());
+        let mut headers = ProducerHeaders::of(&producer, 3);
+        let result = consumer.apply_staged_state_snapshot(
+            &staging,
+            &boundary,
+            &mut headers,
+            false,
+            &registry,
+        );
+        let durable = consumer.store.get_client_registry().unwrap();
+        (
+            result,
+            consumer.tip_height(),
+            consumer.client_registry().clone(),
+            durable,
+        )
+    };
+
+    // Positive control: under the producer's catalogue it installs.
+    let (result, height, installed, _) = install();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!((height, &installed), (3, &registry));
+
+    // Under a catalogue without the tool: refused by name, nothing written.
+    drop(producer_rules);
+    let _consumer_rules = test_rules::install(ClientObjectRules {
+        catalogue: &[[0xA1; 32]],
+        ..armed_rules()
+    });
+    let (result, height, installed, durable) = install();
+    match result {
+        Err(MdbxContextError::Consensus(ConsensusError::ClientObject(
+            ClientObjectError::SnapshotRegistry { reason },
+        ))) => assert_eq!(reason, "an entry outside the client catalogue"),
+        other => panic!("expected the catalogue refusal, got {other:?}"),
+    }
+    assert_eq!(height, 0);
+    assert!(installed.is_empty());
+    assert!(durable.unwrap_or_default().is_empty());
 }

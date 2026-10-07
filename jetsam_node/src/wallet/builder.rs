@@ -809,6 +809,7 @@ mod tests {
             .collect();
         let rules = ClientObjectRules {
             license_micro: license,
+            catalogue: &[[0xD1; 32]],
             ..ClientObjectRules::CONSENSUS
         };
         assert_eq!(check_registration_payment(&pages, &registration, &rules), Ok(()));

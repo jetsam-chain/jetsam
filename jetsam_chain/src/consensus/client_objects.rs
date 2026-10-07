@@ -11,7 +11,8 @@
 //! list of native **client objects**:
 //!
 //! - a [`ClientRegistration`] appends one client matrix digest `D` to the
-//!   chain's append-only registry (16 entries per bank), against a license;
+//!   chain's append-only registry (16 entries per bank), against a license,
+//!   if `D` is in the closed [`CLIENT_CATALOGUE`];
 //! - a [`ClientSubmission`] pays the miner who carries one client proof
 //!   (`D`, `io_commitment`) in the block's HistoryStep client lanes.
 //!
@@ -103,6 +104,46 @@ pub const CLIENT_REGISTRY_DEPTH: usize = 4;
 
 /// Entries per bank (decision D3: append-only, 16).
 pub const CLIENT_REGISTRY_CAPACITY: usize = 1 << CLIENT_REGISTRY_DEPTH;
+
+/// The client catalogue: the matrix digests `D` the project allows to
+/// register (decision of 2026-10-04, confirmed 2026-10-07: **closed**). A
+/// registration whose `D` is not listed is refused by consensus
+/// ([`ClientObjectError::NotInCatalogue`]): the block carrying it is invalid,
+/// and a node refuses it before that ([`check_registration_payment`]: RPC,
+/// relay, restart). A snapshot whose registry holds an unlisted `D` is
+/// refused ([`SnapshotRegistryCheck`]).
+///
+/// One consensus constant per profile; changing it takes a new release, and
+/// is a fork (a node of an older release refuses a block registering a digest
+/// it does not list). **Append-only**: a release may add a digest, never
+/// remove one a chain may have registered — every block and every snapshot of
+/// the chain is judged against this list.
+///
+/// Only registrations are concerned: license, capacity, activation delay,
+/// fees, the refusal of a `D` already registered, cadence and the HistoryStep
+/// relation are unchanged (the relation proves the leaves its terminal
+/// publishes; the node checks they are the chain's registry).
+///
+/// **Public network: empty.** No tool is ready at launch: no registration is
+/// possible until a release lists one.
+#[cfg(not(feature = "testnet"))]
+pub const CLIENT_CATALOGUE: &[Digest] = &[];
+
+/// **Test network**: the client of the registration rehearsals, so that a
+/// real registration stays repeatable on the test chain.
+///
+/// 1. `87c1a7b0…977d7f` — catalogue entry 1, the example client
+///    `jetsam_client_agent` (an AI agent's tool-call trace complies with its
+///    tool policy and budget): the structural digest of its matrix in the
+///    canonical client form, i.e. the `matrix.bin` that `bench_prover`'s
+///    `jetsam_client_demo` writes, registered in the M3.10 private-chain
+///    rehearsals (2026-10-02). Recomputed from this repository by
+///    `jetsam_recursive`'s `the_test_network_catalogue_lists_the_example_client`.
+#[cfg(feature = "testnet")]
+pub const CLIENT_CATALOGUE: &[Digest] = &[[
+    0x87, 0xc1, 0xa7, 0xb0, 0xf5, 0x65, 0x27, 0x19, 0x8e, 0x46, 0xb1, 0x89, 0x97, 0xe8, 0xd2, 0xf5,
+    0x29, 0x3a, 0x2b, 0xc4, 0x1b, 0xc9, 0x10, 0x53, 0xa8, 0xa3, 0x61, 0xc3, 0x83, 0x97, 0x7d, 0x7f,
+]];
 
 /// License price of one registration, in μJTM.
 ///
@@ -293,6 +334,8 @@ pub struct ClientObjectRules {
     pub dividend_blocks: u64,
     pub registry_capacity: usize,
     pub max_matrix_file_bytes: u32,
+    /// The matrix digests allowed to register ([`CLIENT_CATALOGUE`]).
+    pub catalogue: &'static [Digest],
 }
 
 impl ClientObjectRules {
@@ -306,6 +349,7 @@ impl ClientObjectRules {
         dividend_blocks: CLIENT_LICENSE_DIVIDEND_BLOCKS,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
+        catalogue: CLIENT_CATALOGUE,
     };
 
     /// Whether `height` is governed by the v1.5 client-object rules.
@@ -329,8 +373,21 @@ impl ClientObjectRules {
 /// Per-thread rule injection for this crate's unit tests only.
 #[cfg(test)]
 pub(crate) mod test_rules {
-    use super::ClientObjectRules;
+    use super::{ClientObjectRules, Digest};
     use std::cell::Cell;
+
+    /// Every uniform non-null digest `[b; 32]`: the catalogue of the tests
+    /// written for the open registry, which register such digests freely.
+    /// The catalogue's own tests narrow it.
+    pub(crate) static UNIFORM_CATALOGUE: [Digest; 255] = {
+        let mut digests = [[0u8; 32]; 255];
+        let mut index = 0;
+        while index < 255 {
+            digests[index] = [index as u8 + 1; 32];
+            index += 1;
+        }
+        digests
+    };
 
     thread_local! {
         static INSTALLED: Cell<Option<ClientObjectRules>> = const { Cell::new(None) };
@@ -885,6 +942,10 @@ pub enum ClientObjectError {
     DuplicateRegistration {
         matrix_digest: Digest,
     },
+    /// A registration of a matrix digest the client catalogue does not list.
+    NotInCatalogue {
+        matrix_digest: Digest,
+    },
     RegistryFull {
         capacity: usize,
     },
@@ -1054,6 +1115,11 @@ pub fn validate_block_client_objects(
                         max: rules.max_matrix_file_bytes,
                     });
                 }
+                if !rules.catalogue.contains(&registration.matrix_digest) {
+                    return Err(ClientObjectError::NotInCatalogue {
+                        matrix_digest: registration.matrix_digest,
+                    });
+                }
                 if !registered.insert(registration.matrix_digest) {
                     return Err(ClientObjectError::DuplicateRegistration {
                         matrix_digest: registration.matrix_digest,
@@ -1144,10 +1210,11 @@ fn check_license_paid(
 /// The checks of a registration's paying transaction `pages` a node runs
 /// before holding it for its miner (M3.8), against the rules the block will
 /// be judged by: the registration itself is admissible (non-null `D` and file
-/// root, a file length in bounds), the transaction carries exactly one marker,
-/// of zero value, opening this registration, and pays the license to every
-/// destination of D5. What depends on the chain (registry full, `D` already
-/// registered, the transaction's inputs) is checked by the block.
+/// root, a file length in bounds, `D` in the catalogue), the transaction
+/// carries exactly one marker, of zero value, opening this registration, and
+/// pays the license to every destination of D5. What depends on the chain
+/// (registry full, `D` already registered, the transaction's inputs) is
+/// checked by the block.
 pub fn check_registration_payment(
     pages: &[jetsam_tx::Transaction],
     registration: &ClientRegistration,
@@ -1165,6 +1232,11 @@ pub fn check_registration_payment(
         return Err(ClientObjectError::MatrixFileLength {
             len: registration.matrix_file_len,
             max: rules.max_matrix_file_bytes,
+        });
+    }
+    if !rules.catalogue.contains(&registration.matrix_digest) {
+        return Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: registration.matrix_digest,
         });
     }
     let marker = ClientObject::Registration(*registration).marker();
@@ -1433,6 +1505,9 @@ impl<'a> SnapshotRegistryCheck<'a> {
                 || entry.matrix_file_len > rules.max_matrix_file_bytes
             {
                 return refuse("an entry the registration rules forbid");
+            }
+            if !rules.catalogue.contains(&entry.matrix_digest) {
+                return refuse("an entry outside the client catalogue");
             }
             if height < activation.max(1) || height > boundary_height {
                 return refuse("an entry registered outside the v1.5 range of the snapshot");

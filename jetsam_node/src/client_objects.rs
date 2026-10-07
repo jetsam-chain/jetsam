@@ -196,11 +196,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 impl ClientObjects {
     /// Open the client objects under `data_dir`, loading every matrix file
     /// held (each authenticated again: decoded as a matrix of `form` whose
-    /// structural digest is the one its name registers) into `matrices`.
+    /// structural digest is the one its name registers) into `matrices`, and
+    /// every registration held, re-checked under `rules`.
     pub fn open(
         data_dir: &Path,
         form: &HistoryStepClientForm,
         matrices: Arc<HistoryStepClientMatrixSet>,
+        rules: &ClientObjectRules,
     ) -> Result<Self, ClientObjectsError> {
         let root = data_dir.join("client-objects");
         let matrix_dir = root.join("matrices");
@@ -257,8 +259,8 @@ impl ClientObjects {
             }
         }
         // Held registrations kept before a restart: each re-checked as a
-        // relayed notice is (its payment opens and pays it).
-        let rules = ClientObjectRules::current();
+        // relayed notice is (its payment opens and pays it, its `D` is in
+        // the catalogue).
         for entry in std::fs::read_dir(&objects.registration_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|ext| ext.to_str()) != Some("registration") {
@@ -268,7 +270,7 @@ impl ClientObjects {
                 &entry.path(),
                 jetsam_p2p::client_object_protocol::MAX_CLIENT_REGISTRATION_NOTICE_BYTES as u64,
             )?;
-            match jetsam_p2p::client_object_protocol::ClientRegistrationNotice::decode(&bytes, &rules)
+            match jetsam_p2p::client_object_protocol::ClientRegistrationNotice::decode(&bytes, rules)
             {
                 Ok(notice) => {
                     objects

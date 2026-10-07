@@ -26,6 +26,7 @@ fn rules(destination: LicenseDestination) -> ClientObjectRules {
         dividend_blocks: 480,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
+        catalogue: &test_rules::UNIFORM_CATALOGUE,
     }
 }
 
@@ -1505,7 +1506,15 @@ fn check_snapshot(
     boundary: u64,
     slots: &[(Address, u64, u64)],
 ) -> Result<(), ClientObjectError> {
-    let rules = burn_rules();
+    check_snapshot_under(registry, boundary, slots, burn_rules())
+}
+
+fn check_snapshot_under(
+    registry: &ClientRegistryState,
+    boundary: u64,
+    slots: &[(Address, u64, u64)],
+    rules: ClientObjectRules,
+) -> Result<(), ClientObjectError> {
     let floor = rules
         .active_at(boundary)
         .then(|| alloc_at(ACTIVATION - 1).unwrap());
@@ -1720,4 +1729,283 @@ fn the_leaves_through_a_suffix_are_the_base_registry_then_its_registrations() {
     let mut alone = vec![digest(0x10), digest(0x11), digest(0x30)];
     alone.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
     assert_eq!(registry_leaves_through(&known, 260, &[]), alone);
+}
+
+// ---- The closed catalogue (decision of 2026-10-04, confirmed 2026-10-07) ----
+
+/// The burn rules, `catalogue` the tools allowed to register.
+fn catalogue_rules(catalogue: &'static [Digest]) -> ClientObjectRules {
+    ClientObjectRules {
+        catalogue,
+        ..burn_rules()
+    }
+}
+
+fn from_hex(hex: &str) -> Digest {
+    assert_eq!(hex.len(), 64);
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).unwrap();
+    }
+    digest
+}
+
+/// Mainnet lists no tool (none is ready at launch); the test network lists
+/// the example client the registration rehearsals use (`D` of the matrix
+/// `jetsam_client_demo` writes). Never the null digest, never twice.
+#[test]
+fn the_catalogue_is_a_consensus_constant_of_each_profile() {
+    assert_eq!(ClientObjectRules::CONSENSUS.catalogue, CLIENT_CATALOGUE);
+    if crate::consensus::identity::IS_TEST_CHAIN {
+        assert_eq!(
+            CLIENT_CATALOGUE,
+            &[from_hex(
+                "87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f"
+            )]
+        );
+    } else {
+        assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
+    }
+    assert!(!CLIENT_CATALOGUE.contains(&[0u8; 32]));
+    let distinct: BTreeSet<&Digest> = CLIENT_CATALOGUE.iter().collect();
+    assert_eq!(distinct.len(), CLIENT_CATALOGUE.len());
+}
+
+/// A registration whose `D` is not in the catalogue makes its block invalid,
+/// whatever else it gets right (license paid, `D` new, room left) — and with
+/// it the registrations of the catalogue the same block carries.
+#[test]
+fn a_registration_outside_the_catalogue_is_refused() {
+    let (allowed, foreign) = (registration(1), registration(2));
+    let rules = catalogue_rules(&[[1u8; 32]]);
+    let empty = ClientRegistryState::new();
+    let effect = validate(
+        &block(vec![paid_registration(100, allowed)]),
+        &[ClientObject::Registration(allowed)],
+        &empty,
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(effect.registrations.len(), 1);
+    assert_eq!(effect.registrations[0].matrix_digest, allowed.matrix_digest);
+
+    let refused = ClientObjectError::NotInCatalogue {
+        matrix_digest: foreign.matrix_digest,
+    };
+    assert_eq!(
+        validate(
+            &block(vec![paid_registration(100, foreign)]),
+            &[ClientObject::Registration(foreign)],
+            &empty,
+            &rules,
+        ),
+        Err(refused.clone())
+    );
+    assert_eq!(
+        validate(
+            &block(vec![
+                paid_registration(100, allowed),
+                paid_registration(200, foreign)
+            ]),
+            &[
+                ClientObject::Registration(allowed),
+                ClientObject::Registration(foreign)
+            ],
+            &empty,
+            &rules,
+        ),
+        Err(refused.clone())
+    );
+    // It judges what the header commits to: the block is condemned.
+    assert!(refused.condemns_block());
+}
+
+/// The catalogue of this binary's profile, under an armed clock: each tool
+/// it lists registers exactly as before, any other is refused — on the
+/// public network, whose list is empty, every registration.
+#[test]
+fn the_profiles_catalogue_admits_exactly_its_tools() {
+    let armed = ClientObjectRules {
+        activation_height: Some(ACTIVATION),
+        ..ClientObjectRules::CONSENSUS
+    };
+    let empty = ClientRegistryState::new();
+    for matrix_digest in CLIENT_CATALOGUE {
+        let object = ClientRegistration {
+            matrix_digest: *matrix_digest,
+            matrix_file_root: digest(0x99),
+            matrix_file_len: 9_911_119,
+        };
+        let pays = paid_registration(100, object);
+        assert_eq!(check_registration_payment(&pays, &object, &armed), Ok(()));
+        let effect = validate(
+            &block(vec![pays]),
+            &[ClientObject::Registration(object)],
+            &empty,
+            &armed,
+        )
+        .unwrap();
+        assert_eq!(effect.registrations[0].matrix_digest, *matrix_digest);
+        assert_eq!(effect.registrations[0].active_from, HEIGHT + 480);
+    }
+    let outsider = registration(1);
+    assert!(!CLIENT_CATALOGUE.contains(&outsider.matrix_digest));
+    let refused = ClientObjectError::NotInCatalogue {
+        matrix_digest: outsider.matrix_digest,
+    };
+    assert_eq!(
+        check_registration_payment(&paid_registration(100, outsider), &outsider, &armed),
+        Err(refused.clone())
+    );
+    assert_eq!(
+        validate(
+            &block(vec![paid_registration(100, outsider)]),
+            &[ClientObject::Registration(outsider)],
+            &empty,
+            &armed,
+        ),
+        Err(refused)
+    );
+}
+
+/// An empty catalogue (the public network at launch) admits no
+/// registration at all, by block or before one.
+#[test]
+fn an_empty_catalogue_admits_no_registration() {
+    let closed = catalogue_rules(&[]);
+    for byte in [0x01, 0x41, 0xD1, 0xFF] {
+        let object = registration(byte);
+        let refused = ClientObjectError::NotInCatalogue {
+            matrix_digest: object.matrix_digest,
+        };
+        assert_eq!(
+            check_registration_payment(&paid_registration(10, object), &object, &closed),
+            Err(refused.clone())
+        );
+        assert_eq!(
+            validate(
+                &block(vec![paid_registration(100, object)]),
+                &[ClientObject::Registration(object)],
+                &ClientRegistryState::new(),
+                &closed,
+            ),
+            Err(refused)
+        );
+    }
+}
+
+/// What a node checks before holding (RPC, relay, restart) is judged by the
+/// same catalogue as the block.
+#[test]
+fn the_catalogue_judges_a_registration_before_it_is_held() {
+    let rules = catalogue_rules(&[[0x41; 32]]);
+    let (allowed, foreign) = (registration(0x41), registration(0x42));
+    assert_eq!(
+        check_registration_payment(&paid_registration(10, allowed), &allowed, &rules),
+        Ok(())
+    );
+    assert_eq!(
+        check_registration_payment(&paid_registration(10, foreign), &foreign, &rules),
+        Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: foreign.matrix_digest
+        })
+    );
+}
+
+/// A snapshot whose registry holds a digest outside the catalogue is not a
+/// registry this chain can have made: refused, even with every marker slot
+/// in place.
+#[test]
+fn a_snapshot_registry_outside_the_catalogue_is_refused() {
+    let first = snapshot_entry(0, 0x21, 150);
+    let second = snapshot_entry(1, 0x22, 190);
+    let registry = snapshot_registry(&[first, second]);
+    let slots = [marker_slot(&first), marker_slot(&second)];
+    assert_eq!(
+        check_snapshot_under(
+            &registry,
+            HEIGHT,
+            &slots,
+            catalogue_rules(&[[0x21; 32], [0x22; 32]])
+        ),
+        Ok(())
+    );
+    let refused = Err(ClientObjectError::SnapshotRegistry {
+        reason: "an entry outside the client catalogue",
+    });
+    assert_eq!(
+        check_snapshot_under(&registry, HEIGHT, &slots, catalogue_rules(&[[0x21; 32]])),
+        refused
+    );
+    assert_eq!(
+        check_snapshot_under(&registry, HEIGHT, &slots, catalogue_rules(&[])),
+        refused
+    );
+    // The empty registry needs no catalogue.
+    assert_eq!(
+        check_snapshot_under(
+            &ClientRegistryState::new(),
+            HEIGHT,
+            &[],
+            catalogue_rules(&[])
+        ),
+        Ok(())
+    );
+}
+
+/// Below the v1.5 height (and under the dormant clock) the catalogue changes
+/// nothing: no object is interpreted, a block carrying one is refused as
+/// before (`ObjectsBeforeActivation`), a snapshot carries the empty registry.
+#[test]
+fn the_catalogue_changes_nothing_below_the_v1_5_height() {
+    let closed = catalogue_rules(&[]);
+    let empty = ClientRegistryState::new();
+    let object = registration(1);
+    let marked = logical(
+        100,
+        CLIENT_LICENSE_BURN_ADDRESS,
+        &[(ClientObject::Registration(object).marker(), 5)],
+        10,
+    );
+    let below = block_at(ACTIVATION - 1, vec![marked]);
+    for rules in [burn_rules(), closed] {
+        assert_eq!(
+            validate(&below, &[], &empty, &rules),
+            Ok(ClientObjectsEffect::default())
+        );
+        assert_eq!(
+            validate(
+                &below,
+                &[ClientObject::Registration(object)],
+                &empty,
+                &rules
+            ),
+            Err(ClientObjectError::ObjectsBeforeActivation)
+        );
+        let dormant = ClientObjectRules {
+            activation_height: None,
+            ..rules
+        };
+        let high = block_at(1_000_000, vec![paid_registration(100, object)]);
+        assert_eq!(
+            validate(&high, &[], &empty, &dormant),
+            Ok(ClientObjectsEffect::default())
+        );
+        assert_eq!(
+            validate(
+                &high,
+                &[ClientObject::Registration(object)],
+                &empty,
+                &dormant
+            ),
+            Err(ClientObjectError::ObjectsBeforeActivation)
+        );
+        assert_eq!(
+            check_snapshot_under(&empty, ACTIVATION - 1, &[], rules),
+            Ok(())
+        );
+    }
+    if !crate::consensus::identity::IS_TEST_CHAIN {
+        assert_eq!(ClientObjectRules::CONSENSUS.activation_height, None);
+    }
 }
