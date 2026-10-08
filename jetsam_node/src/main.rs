@@ -5929,10 +5929,10 @@ mod tests {
     #[test]
     fn a_foreign_marker_deletes_nothing_at_all() {
         let directory = tempfile::tempdir().unwrap();
-        // Wallets in SUBdirectories: the shape /root/wallet/jetsam actually
-        // uses, and the one a top-level `wallet.*` scan could never see.
-        std::fs::create_dir(directory.path().join("pool-cpu8")).unwrap();
-        std::fs::write(directory.path().join("pool-cpu8/wallet.key"), b"pool wallet").unwrap();
+        // Wallets in SUBdirectories: the shape a directory of wallet backups
+        // takes, and the one a top-level `wallet.*` scan could never see.
+        std::fs::create_dir(directory.path().join("pool-node")).unwrap();
+        std::fs::write(directory.path().join("pool-node/wallet.key"), b"pool wallet").unwrap();
         std::fs::create_dir_all(directory.path().join("mining-perso/data")).unwrap();
         std::fs::write(
             directory.path().join("mining-perso/data/wallet.key"),

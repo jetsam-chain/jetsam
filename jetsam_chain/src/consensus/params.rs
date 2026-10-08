@@ -518,9 +518,9 @@ const _: () = assert!(
 /// # Where it comes from
 ///
 /// [MEASURED 2026-09-26] the operator's CPU fleet produces **213 kH/s** of
-/// walked digest in its current state (Veld running on most machines), rounded
-/// down to **200 kH/s** as the nominal. epyc1 alone gives 93.4 kH/s across 256
-/// threads — 46.7 kH/s per socket, not the 34.6 estimated earlier.
+/// walked digest in its current state (shared with other workloads), rounded
+/// down to **200 kH/s** as the nominal. One dual-socket EPYC 7742 server alone
+/// gives 93.4 kH/s across 256 threads — 46.7 kH/s per socket, not the 34.6 estimated earlier.
 ///
 /// Equilibrium at that rate is `2^256 / (200_000 * 90)` = 2^231.9. The design
 /// asks for eight times easier, which lands on **2^235** once rounded to a
@@ -583,7 +583,7 @@ const _: () = assert!(
 pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
 
 /// The test chain's v1.4 activation block, crossed on 2026-09-27 at 18:28 UTC.
-/// Read back from two nodes that reached it by different paths — cpu13 by
+/// Read back from two nodes that reached it by different paths — one by
 /// sequential validation, the seed by a snapshot jump from 749 to 772 — and
 /// equal to the `prev_block_hash` of block 751.
 #[cfg(feature = "testnet")]
