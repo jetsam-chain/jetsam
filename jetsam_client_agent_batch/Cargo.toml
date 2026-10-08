@@ -1,0 +1,15 @@
+[package]
+name = "jetsam_client_agent_batch"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Off-chain prototype of a computed batch (agent-batch-v1): one client circuit proves N statements of catalogue entry 1 and publishes the Merkle root of their IO commitments."
+
+[dependencies]
+jetsam-ivc-core = { path = "../jetsam_ivc_core" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+jetsam_client_agent = { path = "../jetsam_client_agent" }
+
+[dev-dependencies]
+jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }

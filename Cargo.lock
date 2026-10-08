@@ -2782,6 +2782,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetsam_client_agent_batch"
+version = "1.5.0"
+dependencies = [
+ "jetsam-ivc-core",
+ "jetsam-ivc-prover",
+ "jetsam_client_agent",
+ "jetsam_poseidon2b",
+]
+
+[[package]]
 name = "jetsam_core"
 version = "1.5.0"
 dependencies = [

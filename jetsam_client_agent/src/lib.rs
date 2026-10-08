@@ -184,7 +184,6 @@ pub fn agent_policy_instance(
         return Err(AgentPolicyError::UnsupportedForm);
     }
     let io = public_io(policy, calls)?;
-    let records = padded_records(calls)?;
 
     // Wire 0 is the constant one; the public IO sits in the form's slice.
     let mut b = FieldR1csBuilder::new();
@@ -195,6 +194,41 @@ pub fn agent_policy_instance(
         .iter()
         .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
         .collect::<Vec<_>>();
+    enforce_agent_policy(&mut b, policy, calls, &public)?;
+
+    let circuit_rows = b.num_wires();
+    let capacity = 1usize << shape.m;
+    if circuit_rows > capacity {
+        return Err(AgentPolicyError::FormTooSmall {
+            rows: circuit_rows,
+            capacity,
+        });
+    }
+    let (small, witness) = b.build();
+    let (r1cs, witness) = pad_to_form(small, witness, shape.k_log);
+    Ok(AgentPolicyInstance {
+        r1cs,
+        witness,
+        io: io.to_vec(),
+        circuit_rows,
+    })
+}
+
+/// The statement's constraints, appended to `b` over the eight lanes
+/// `public` (laid out as [`lanes`]): the whole circuit of catalogue entry 1
+/// after its public-IO wires. [`agent_policy_instance`] is this gadget over
+/// the form's IO slice; a batch circuit runs it once per statement, over
+/// wires of its own. The rows it appends never depend on the values.
+pub fn enforce_agent_policy(
+    b: &mut FieldR1csBuilder,
+    policy: &AgentPolicy,
+    calls: &[ToolCall],
+    public: &[LinExpr],
+) -> Result<(), AgentPolicyError> {
+    if public.len() != PUBLIC_IO_LANES {
+        return Err(AgentPolicyError::UnsupportedForm);
+    }
+    let records = padded_records(calls)?;
 
     // The policy: allowed tools, the cap (a 32-bit integer), and `P`.
     let tools = policy
@@ -206,10 +240,10 @@ pub fn agent_policy_instance(
     let cap_bits = bit_exprs(b.decompose_bits_le(&cap, AMOUNT_BITS));
     let mut committed_policy = tools.clone();
     committed_policy.push(cap.clone());
-    let policy_digest = hash_leaf_trace(&mut b, &committed_policy);
-    pin_eq(&mut b, &policy_digest[0], &public[lanes::POLICY_COMMITMENT]);
-    pin_eq(&mut b, &policy_digest[1], &public[lanes::POLICY_COMMITMENT + 1]);
-    pin_eq(&mut b, &cap, &public[lanes::BUDGET_CAP]);
+    let policy_digest = hash_leaf_trace(b, &committed_policy);
+    pin_eq(b, &policy_digest[0], &public[lanes::POLICY_COMMITMENT]);
+    pin_eq(b, &policy_digest[1], &public[lanes::POLICY_COMMITMENT + 1]);
+    pin_eq(b, &cap, &public[lanes::BUDGET_CAP]);
 
     // The records, one slot per possible call.
     let mut actives: Vec<LinExpr> = Vec::with_capacity(MAX_CALLS);
@@ -242,13 +276,13 @@ pub fn agent_policy_instance(
         let violation = LinExpr::from_wire(b.mul(&active, &product));
         b.pin_f128(&violation, F128::ZERO);
         // The running total.
-        total_bits = add_bits(&mut b, &total_bits, &cost_bits);
+        total_bits = add_bits(b, &total_bits, &cost_bits);
         actives.push(active);
         committed_records.extend(cells);
     }
 
     // Total spent, and total ≤ cap: the borrow of cap − total is zero.
-    pin_eq(&mut b, &pack_bits(&total_bits), &public[lanes::TOTAL_SPENT]);
+    pin_eq(b, &pack_bits(&total_bits), &public[lanes::TOTAL_SPENT]);
     let mut borrow = LinExpr::zero();
     for (bit, total) in total_bits.iter().enumerate() {
         let cap_bit = cap_bits.get(bit).cloned().unwrap_or_else(LinExpr::zero);
@@ -267,30 +301,14 @@ pub fn agent_policy_instance(
         let next = actives.get(slot + 1).cloned().unwrap_or_else(LinExpr::zero);
         count = count.add(&active.add(&next).scale(lane(slot as u128 + 1)));
     }
-    pin_eq(&mut b, &count, &public[lanes::CALLS]);
+    pin_eq(b, &count, &public[lanes::CALLS]);
     b.pin_f128(&public[lanes::CATALOG_TAG], lane(u128::from(CATALOG_TAG)));
 
     // `T`, over the padded records.
-    let trace_digest = hash_leaf_trace(&mut b, &committed_records);
-    pin_eq(&mut b, &trace_digest[0], &public[lanes::TRACE_COMMITMENT]);
-    pin_eq(&mut b, &trace_digest[1], &public[lanes::TRACE_COMMITMENT + 1]);
-
-    let circuit_rows = b.num_wires();
-    let capacity = 1usize << shape.m;
-    if circuit_rows > capacity {
-        return Err(AgentPolicyError::FormTooSmall {
-            rows: circuit_rows,
-            capacity,
-        });
-    }
-    let (small, witness) = b.build();
-    let (r1cs, witness) = pad_to_form(small, witness, shape.k_log);
-    Ok(AgentPolicyInstance {
-        r1cs,
-        witness,
-        io: io.to_vec(),
-        circuit_rows,
-    })
+    let trace_digest = hash_leaf_trace(b, &committed_records);
+    pin_eq(b, &trace_digest[0], &public[lanes::TRACE_COMMITMENT]);
+    pin_eq(b, &trace_digest[1], &public[lanes::TRACE_COMMITMENT + 1]);
+    Ok(())
 }
 
 fn lane(value: u128) -> F128 {
@@ -379,7 +397,7 @@ fn add_bits(b: &mut FieldR1csBuilder, x: &[LinExpr], y: &[LinExpr]) -> Vec<LinEx
 /// In-circuit `merkle::hash_leaf` of an even number of lanes (the
 /// fixed-length, no-pad mode), with no constant folding: the rows never
 /// depend on the values.
-fn hash_leaf_trace(b: &mut FieldR1csBuilder, lanes: &[LinExpr]) -> [LinExpr; 2] {
+pub fn hash_leaf_trace(b: &mut FieldR1csBuilder, lanes: &[LinExpr]) -> [LinExpr; 2] {
     assert!(!lanes.is_empty() && lanes.len() % 2 == 0, "even lane count");
     let [iv_hi, iv_lo] = merkle::leaf_fixed_iv_flat(lanes.len() * 16);
     let mut state = [
@@ -398,7 +416,7 @@ fn hash_leaf_trace(b: &mut FieldR1csBuilder, lanes: &[LinExpr]) -> [LinExpr; 2] 
 
 /// Lay a built circuit out in the form's `2^k_log` rows: empty rows, zero
 /// witness, `useful_rows` unchanged.
-fn pad_to_form(small: FieldR1cs, mut witness: Vec<F128>, k_log: usize) -> (FieldR1cs, Vec<F128>) {
+pub fn pad_to_form(small: FieldR1cs, mut witness: Vec<F128>, k_log: usize) -> (FieldR1cs, Vec<F128>) {
     let k = 1usize << k_log;
     let pad = |mut matrix: SparseFieldMatrix| {
         let entries = matrix.col_indices.len();

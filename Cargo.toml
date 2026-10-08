@@ -24,6 +24,8 @@ members = [
     "jetsam_extminer",
     # v1.5 prototype: example client of the HistoryStep client slot
     "jetsam_client_agent",
+    # Off-chain prototype: a computed batch of catalogue entry 1 (not listed)
+    "jetsam_client_agent_batch",
 ]
 resolver = "2"
 
