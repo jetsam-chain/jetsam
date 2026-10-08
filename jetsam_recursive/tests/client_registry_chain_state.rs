@@ -103,7 +103,48 @@ fn the_test_network_catalogue_lists_the_example_client() {
         "the example client's D the testnet rehearsals registered"
     );
     if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-        assert_eq!(CLIENT_CATALOGUE, &[example]);
+        // Append-only: entry 1 keeps index 0.
+        assert_eq!(CLIENT_CATALOGUE.first(), Some(&example));
+    } else {
+        assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
+    }
+}
+
+/// The test network's catalogue lists, after entry 1, a computed batch of
+/// 128 statements of entry 1 (`jetsam_client_agent_batch`, capacity 128): the
+/// `D` of the 212 931 651-byte `matrix.bin` `jetsam_client_batch_demo` writes.
+/// A TEST entry of the off-chain prototype (proof-aggregation design, step
+/// 1): its capacity, leaf and IO layout are not frozen for the public
+/// network, which lists no tool. The matrix depends on the capacity only, so
+/// the empty batch gives it.
+#[test]
+#[ignore = "production scale (a 4.1 M-row matrix): run with --release -- --ignored"]
+fn the_test_network_catalogue_lists_the_batch_of_128_statements() {
+    use jetsam_chain::consensus::client_objects::{CLIENT_CATALOGUE, CLIENT_MATRIX_MAX_FILE_BYTES};
+    use jetsam_recursive::acceptance::history_step_bank::HistoryStepClientForm;
+    let form = HistoryStepClientForm::canonical();
+    let batch = jetsam_client_agent_batch::agent_batch_instance(
+        128,
+        &[],
+        0,
+        form.shape(),
+        form.io_spec().io_slice,
+    )
+    .expect("the batch of 128 in the canonical client form")
+    .r1cs;
+    let digest = batch.structural_statement_digest();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, "32796d826b530e03b8844214e3403a680d8ed7b0b92c2adc47176a74c5b21464",
+        "the D of the batch of 128 the prototype measured"
+    );
+    let mut file = Vec::new();
+    batch.write_artifact(&mut file).unwrap();
+    assert_eq!(file.len(), 212_931_651);
+    assert!(file.len() <= CLIENT_MATRIX_MAX_FILE_BYTES as usize);
+    if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+        assert_eq!(CLIENT_CATALOGUE.get(1), Some(&digest));
+        assert_eq!(CLIENT_CATALOGUE.len(), 2);
     } else {
         assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
     }

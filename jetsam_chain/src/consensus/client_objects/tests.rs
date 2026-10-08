@@ -1808,16 +1808,20 @@ fn from_hex(hex: &str) -> Digest {
 
 /// Mainnet lists no tool (none is ready at launch); the test network lists
 /// the example client the registration rehearsals use (`D` of the matrix
-/// `jetsam_client_demo` writes). Never the null digest, never twice.
+/// `jetsam_client_demo` writes), then a computed batch of 128 of its
+/// statements (`D` of the matrix `jetsam_client_batch_demo` writes), a test
+/// entry of the off-chain prototype. Append-only: entry 1 keeps index 0.
+/// Never the null digest, never twice.
 #[test]
 fn the_catalogue_is_a_consensus_constant_of_each_profile() {
     assert_eq!(ClientObjectRules::CONSENSUS.catalogue, CLIENT_CATALOGUE);
     if crate::consensus::identity::IS_TEST_CHAIN {
         assert_eq!(
             CLIENT_CATALOGUE,
-            &[from_hex(
-                "87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f"
-            )]
+            &[
+                from_hex("87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f"),
+                from_hex("32796d826b530e03b8844214e3403a680d8ed7b0b92c2adc47176a74c5b21464"),
+            ]
         );
     } else {
         assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
@@ -1886,11 +1890,16 @@ fn the_profiles_catalogue_admits_exactly_its_tools() {
         ..ClientObjectRules::CONSENSUS
     };
     let empty = ClientRegistryState::new();
-    for matrix_digest in CLIENT_CATALOGUE {
+    // Entry 1's matrix file, and the batch of 128's (203.07 MiB).
+    let lengths = [9_911_119, 212_931_651];
+    for (matrix_digest, matrix_file_len) in CLIENT_CATALOGUE
+        .iter()
+        .flat_map(|d| lengths.map(|len| (d, len)))
+    {
         let object = ClientRegistration {
             matrix_digest: *matrix_digest,
             matrix_file_root: digest(0x99),
-            matrix_file_len: 9_911_119,
+            matrix_file_len,
         };
         let pays = paid_registration(100, object);
         assert_eq!(check_registration_payment(&pays, &object, &armed), Ok(()));

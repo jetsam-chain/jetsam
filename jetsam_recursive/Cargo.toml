@@ -22,3 +22,6 @@ tracing = { workspace = true }
 # The example client of the v1.5 client slot (M2 task 2.6, catalogue entry
 # 1), which an ignored production-scale test runs through the client arm.
 jetsam_client_agent = { path = "../jetsam_client_agent" }
+# The computed batch of entry 1 the test network's catalogue lists (its D is
+# recomputed by an ignored production-scale test).
+jetsam_client_agent_batch = { path = "../jetsam_client_agent_batch" }

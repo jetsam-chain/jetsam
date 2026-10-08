@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 the Jetsam developers.
 
-//! `agent-batch-v1`: a computed batch of catalogue entry 1. **Off-chain
-//! prototype** (step 1 of the proof-aggregation design): nothing here is
-//! registered, listed in a catalogue or read by the consensus.
+//! `agent-batch-v1`: a computed batch of catalogue entry 1. **Prototype**
+//! (step 1 of the proof-aggregation design). The consensus reads nothing
+//! here; the test network's catalogue lists the `D` of capacity 128 as a
+//! TEST entry (its capacity, leaf and IO layout are not frozen for the
+//! public network, whose catalogue lists no tool).
 //!
 //! One client circuit of the imposed form proves `N` statements of catalogue
 //! entry 1 ("an AI agent's trace respected its tool policy and its budget")

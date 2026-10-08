@@ -36,6 +36,9 @@ tracing-subscriber = { workspace = true }
 # The example client of the v1.5 client slot (catalogue entry 1), proved by
 # the `client_agent_demo` bench and written out by `jetsam_client_demo`.
 jetsam_client_agent = { path = "../jetsam_client_agent" }
+# The computed batch of entry 1 (agent-batch-v1 prototype), written out by
+# `jetsam_client_batch_demo`.
+jetsam_client_agent_batch = { path = "../jetsam_client_agent_batch" }
 
 [[bench]]
 name = "alice_sends_bob"
