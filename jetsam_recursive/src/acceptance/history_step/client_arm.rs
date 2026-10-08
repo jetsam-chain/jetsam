@@ -322,6 +322,21 @@ pub fn check_history_step_client_lanes(
 /// Upper bound of remembered verified lanes: 16 entries over a few tips.
 const VERIFIED_LANE_MEMO_CAPACITY: usize = 256;
 
+/// A client matrix of a set's form whose structural digest `D` the set
+/// computed ([`HistoryStepClientMatrixSet::authenticate`]); only that method
+/// makes one, so `D` is never taken from a caller.
+pub struct AuthenticatedClientMatrix {
+    digest: Hash,
+    matrix: Arc<FieldR1cs>,
+}
+
+impl AuthenticatedClientMatrix {
+    /// `D`, computed from the matrix.
+    pub fn digest(&self) -> Hash {
+        self.digest
+    }
+}
+
 /// The registered client matrices a node holds, with a memo of verified
 /// lanes (M3.8): the production [`HistoryStepClientMatrices`]. Every matrix is
 /// authenticated once, on insertion (shape of the form, structural digest
@@ -350,10 +365,35 @@ impl HistoryStepClientMatrixSet {
     /// Hold `matrix`: refused unless it has the form's shape. Returns its
     /// structural digest `D`, computed here.
     pub fn insert(&self, matrix: Arc<FieldR1cs>) -> Result<Hash, HistoryStepError> {
+        self.insert_authenticated(self.authenticate(matrix)?)
+    }
+
+    /// Authenticate `matrix` without holding it: refused unless it has the
+    /// form's shape; its structural digest `D` is computed here. This is the
+    /// one pass over the matrix (minutes of CPU at 256 MiB on two cores): a
+    /// node compares `D` with the registered one before holding the matrix.
+    pub fn authenticate(
+        &self,
+        matrix: Arc<FieldR1cs>,
+    ) -> Result<AuthenticatedClientMatrix, HistoryStepError> {
         if FieldShape::of(&matrix) != self.form.shape() {
             return Err(HistoryStepError::ClientForm);
         }
         let digest = matrix.structural_statement_digest();
+        Ok(AuthenticatedClientMatrix { digest, matrix })
+    }
+
+    /// Hold a matrix [`Self::authenticate`] authenticated, under the `D` it
+    /// computed: no second pass. Refused if it was authenticated under a
+    /// form of another shape.
+    pub fn insert_authenticated(
+        &self,
+        authenticated: AuthenticatedClientMatrix,
+    ) -> Result<Hash, HistoryStepError> {
+        let AuthenticatedClientMatrix { digest, matrix } = authenticated;
+        if FieldShape::of(&matrix) != self.form.shape() {
+            return Err(HistoryStepError::ClientForm);
+        }
         self.matrices
             .write()
             .expect("client matrix set lock")

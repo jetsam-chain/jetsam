@@ -2714,6 +2714,42 @@ mod client_slot {
         assert!(held.insert(std::sync::Arc::new(foreign)).is_err());
     }
 
+    /// A registered matrix is authenticated once (a 203 MiB batch takes
+    /// 150 CPU-seconds to digest): `authenticate` checks the form's shape and
+    /// computes `D` from the matrix, holding nothing; the authenticated matrix
+    /// is then held under that `D` without a second pass, by a set of the same
+    /// form only.
+    #[test]
+    fn a_client_matrix_is_authenticated_once_then_held_under_its_computed_digest() {
+        use crate::acceptance::history_step::client_arm::HistoryStepClientMatrixSet;
+        let form = test_client_form();
+        let (matrix, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(CLIENT_M, CLIENT_M, 0x5A);
+        let matrix = std::sync::Arc::new(matrix);
+        let digest = matrix.structural_statement_digest();
+        let held = HistoryStepClientMatrixSet::new(&form);
+        let authenticated = held.authenticate(matrix.clone()).expect("the form's shape");
+        assert_eq!(authenticated.digest(), digest);
+        assert!(!held.holds(&digest), "authenticating holds nothing");
+        assert_eq!(held.insert_authenticated(authenticated).ok(), Some(digest));
+        assert!(held.holds(&digest));
+
+        // Another shape is refused, and a matrix authenticated under another
+        // form is not held by this set.
+        let (foreign, _): (FieldR1cs, Vec<F128>) =
+            synthetic_satisfiable(CLIENT_M + 1, CLIENT_M + 1, 1);
+        let foreign = std::sync::Arc::new(foreign);
+        assert!(held.authenticate(foreign.clone()).is_err());
+        let other = HistoryStepClientMatrixSet::new(&HistoryStepClientForm::new(
+            FieldShape::of(&foreign),
+            form.pcs_params().clone(),
+            form.io_spec().clone(),
+            form.registry_depth(),
+        ));
+        let authenticated_elsewhere = other.authenticate(foreign.clone()).expect("its shape");
+        assert!(held.insert_authenticated(authenticated_elsewhere).is_err());
+        assert!(!held.holds(&foreign.structural_statement_digest()));
+    }
+
     /// The suffix-sync hole (M2 note §16.4-3), closed. A block that carried a
     /// false claim for entry 0 is followed by a block without a client: the
     /// relation carries the false lane faithfully (its trace is satisfiable

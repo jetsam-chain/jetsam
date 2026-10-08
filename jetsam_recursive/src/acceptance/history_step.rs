@@ -97,7 +97,8 @@ pub use relation::{
     HISTORY_STEP_WIRE_VERSION,
 };
 pub use client_arm::{
-    check_history_step_client_lanes, client_io_commitment, HistoryStepChainClients,
+    check_history_step_client_lanes, client_io_commitment, AuthenticatedClientMatrix,
+    HistoryStepChainClients,
     HistoryStepClientCarry, HistoryStepClientMatrices, HistoryStepClientMatrixSet,
     HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
     HISTORY_STEP_CLIENT_PROOF_DOMAIN,
