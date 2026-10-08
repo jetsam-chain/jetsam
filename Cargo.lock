@@ -2924,6 +2924,7 @@ dependencies = [
  "jetsam-ivc-prover",
  "jetsam_block",
  "jetsam_chain",
+ "jetsam_client_agent_batch",
  "jetsam_core",
  "jetsam_gkr",
  "jetsam_mempool",

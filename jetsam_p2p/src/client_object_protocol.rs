@@ -6,7 +6,7 @@
 //!
 //! A client proof (~409 kB measured, 509 009 B bound) does not fit the
 //! gossip cap (303 495 B, one PagedSpend intent), and a registered matrix
-//! file (up to 16 MiB) fits no single response. So:
+//! file (up to 256 MiB) fits no single response. So:
 //!
 //! - a node that holds a client proof **announces** it in a few dozen bytes
 //!   ([`ClientProofAnnouncement`]: the submission, the bundle's byte digest

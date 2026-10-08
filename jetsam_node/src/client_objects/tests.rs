@@ -633,3 +633,83 @@ fn held_registrations_are_kept_across_a_restart_until_a_block_makes_them() {
         "a registration a block made is not held again"
     );
 }
+
+/// The matrix file of the computed batch of capacity 128 (catalogue entry 1,
+/// 128 times) in the canonical client form, with its registration.
+fn batch_128() -> &'static (HistoryStepClientForm, MatrixFileId, Vec<u8>) {
+    static BATCH: std::sync::OnceLock<(HistoryStepClientForm, MatrixFileId, Vec<u8>)> =
+        std::sync::OnceLock::new();
+    BATCH.get_or_init(|| {
+        let form = HistoryStepClientForm::canonical();
+        let matrix = jetsam_client_agent_batch::agent_batch_instance(
+            128,
+            &[],
+            0,
+            form.shape(),
+            form.io_spec().io_slice,
+        )
+        .unwrap()
+        .r1cs;
+        let mut file = Vec::new();
+        matrix.write_artifact(&mut file).unwrap();
+        let id = MatrixFileId {
+            matrix_digest: matrix.structural_statement_digest(),
+            file_root: matrix_file_root(&file),
+            file_len: file.len() as u32,
+        };
+        (form, id, file)
+    })
+}
+
+/// Decision of 2026-10-08 (v1.5.0): a registered matrix file may weigh up to
+/// 256 MiB. The 203 MiB file of a computed batch is taken by `registerClient`
+/// (its registration), held, served, fetched by another node in 204 chunks of
+/// 1 MiB, and held again, authenticated from disk, after a restart.
+#[test]
+#[ignore = "production scale (a 203 MiB matrix in the m = 22 client form): run with --release -- --ignored"]
+fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart() {
+    let (form, id, file) = batch_128();
+    assert_eq!(id.file_len, 212_931_651);
+    let holder_dir = tempfile::tempdir().unwrap();
+    let holder = open(holder_dir.path(), form);
+    let registration = holder.registration_of_matrix_file(file).unwrap();
+    assert_eq!(MatrixFileId::of_registration(&registration), *id);
+    holder.insert_matrix_file(*id, file).unwrap();
+    assert!(holder.holds_matrix(&id.matrix_digest));
+
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), form);
+    objects.want_matrices([*id]);
+    let peers = [PeerId::random(), PeerId::random()];
+    let now = Instant::now();
+    let (mut manifests, mut chunks, mut complete) = (0, 0, false);
+    while !complete {
+        let fetches = objects.next_requests(&peers, now);
+        assert!(!fetches.is_empty(), "the fetch stalled");
+        for fetch in fetches {
+            match fetch.request {
+                ClientObjectRequest::MatrixManifest(_) => manifests += 1,
+                ClientObjectRequest::MatrixChunk { .. } => chunks += 1,
+                ClientObjectRequest::Proof(_) => unreachable!(),
+            }
+            let bytes = holder.client_object(&fetch.request).unwrap();
+            assert_eq!(fetch.request.expected_len(), Some(bytes.len()));
+            match objects.on_fetched(fetch.token, &bytes).unwrap() {
+                ClientObjectFetched::MatrixComplete(done) => {
+                    assert_eq!(done, *id);
+                    complete = true;
+                }
+                ClientObjectFetched::Nothing => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!((manifests, chunks), (1, 204));
+    assert!(objects.holds_matrix(&id.matrix_digest));
+    assert!(objects.fetching_matrices().is_empty());
+
+    drop(objects);
+    let reopened = open(directory.path(), form);
+    assert!(reopened.holds_matrix(&id.matrix_digest));
+    assert_eq!(reopened.held_matrix_files(), vec![*id]);
+}

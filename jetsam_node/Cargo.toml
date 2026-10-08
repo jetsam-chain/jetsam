@@ -78,6 +78,9 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 bench_prover = { path = "../bench_prover" }
 # Real test-scale client proofs for the client-object tests (M3.8).
 jetsam-ivc-prover = { path = "../jetsam_ivc_prover" }
+# The production-scale matrix file of the client-object tests: a computed
+# batch of catalogue entry 1 (203 MiB).
+jetsam_client_agent_batch = { path = "../jetsam_client_agent_batch" }
 tempfile = "3"
 static_assertions = "1.1"
 

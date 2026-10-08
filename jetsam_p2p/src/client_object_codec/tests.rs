@@ -307,3 +307,81 @@ async fn matrix_manifests_and_chunks_are_checked_on_reception() {
     .is_err());
     let _ = ClientProofId::of_bytes;
 }
+
+/// Decision of 2026-10-08 (v1.5.0): a registered matrix file may weigh up to
+/// 256 MiB. A computed batch's file (capacity 128: 212 931 651 bytes, 204
+/// chunks) travels like any other: its manifest and its chunks, the last one
+/// short, are admitted, served and checked on reception. A file one byte
+/// over 256 MiB admits no request: a node neither asks for it nor answers.
+#[tokio::test]
+async fn a_batch_matrix_file_travels_in_chunks_and_one_over_the_cap_admits_none() {
+    use crate::client_object_protocol::MAX_CLIENT_MATRIX_MANIFEST_BYTES;
+    use jetsam_chain::consensus::client_objects::{
+        matrix_file_chunk_digest, matrix_file_root_from_chunk_digests,
+    };
+    const MIB: usize = 1024 * 1024;
+    let file_len = 212_931_651usize;
+    let count = file_len.div_ceil(CLIENT_MATRIX_CHUNK_BYTES);
+    assert_eq!(count, 204);
+    // The first and the last chunk are real bytes; the manifest lists their
+    // digests and stand-ins for the others (the transport checks a manifest
+    // against the registered root, and a chunk against its manifest digest).
+    let first: Vec<u8> = (0..CLIENT_MATRIX_CHUNK_BYTES)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let last: Vec<u8> = (0..file_len - (count - 1) * CLIENT_MATRIX_CHUNK_BYTES)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    let mut digests: Vec<Hash32> = (0..count).map(|index| [index as u8; 32]).collect();
+    digests[0] = matrix_file_chunk_digest(0, &first);
+    digests[count - 1] = matrix_file_chunk_digest((count - 1) as u32, &last);
+    let file = MatrixFileId {
+        matrix_digest: [0xB1; 32],
+        file_root: matrix_file_root_from_chunk_digests(file_len as u64, &digests),
+        file_len: file_len as u32,
+    };
+    let manifest = digests.concat();
+    let request = ClientObjectRequest::MatrixManifest(file);
+    assert_eq!(request.expected_len(), Some(32 * count));
+    assert_eq!(request_round_trip(request).await.unwrap(), request);
+    let wire = encode_response(ClientObjectResponse::ready(request, manifest.clone()))
+        .await
+        .unwrap();
+    assert_eq!(decode_response(wire).await.unwrap().bytes, Some(manifest));
+    for (index, chunk) in [(0, &first), (count - 1, &last)] {
+        let request = ClientObjectRequest::MatrixChunk {
+            file,
+            index: index as u32,
+            digest: digests[index],
+        };
+        assert_eq!(request.expected_len(), Some(chunk.len()));
+        assert_eq!(request_round_trip(request).await.unwrap(), request);
+        let wire = encode_response(ClientObjectResponse::ready(request, chunk.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_response(wire).await.unwrap().bytes.as_deref(),
+            Some(chunk.as_slice())
+        );
+    }
+    for (len, admitted) in [(256 * MIB, true), (256 * MIB + 1, false)] {
+        let file = MatrixFileId {
+            file_len: len as u32,
+            ..file
+        };
+        let manifest = ClientObjectRequest::MatrixManifest(file);
+        let chunk = ClientObjectRequest::MatrixChunk {
+            file,
+            index: 0,
+            digest: [0; 32],
+        };
+        assert_eq!(manifest.expected_len().is_some(), admitted, "{len} bytes");
+        assert_eq!(chunk.expected_len().is_some(), admitted, "{len} bytes");
+        assert_eq!(
+            request_round_trip(manifest).await.is_ok(),
+            admitted,
+            "{len} bytes"
+        );
+    }
+    assert_eq!(MAX_CLIENT_MATRIX_MANIFEST_BYTES, 32 * 256);
+}

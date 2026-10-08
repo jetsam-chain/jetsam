@@ -881,6 +881,62 @@ fn malformed_registrations_are_refused() {
     }
 }
 
+/// Decision of 2026-10-08, for the v1.5.0 release: a registered matrix file
+/// may weigh up to 256 MiB, so that a computed batch of catalogue entry 1
+/// registers (capacity 128: a 212 931 651-byte `matrix.bin`). The three gates
+/// a registration meets — the block, the node's check before it holds the
+/// registration, the registry a snapshot carries — admit such a file, and
+/// all three refuse one byte over 256 MiB.
+#[test]
+fn a_registered_matrix_file_may_weigh_up_to_256_mib() {
+    const MIB: u32 = 1024 * 1024;
+    const BATCH_128_FILE_BYTES: u32 = 212_931_651;
+    for (len, admitted) in [
+        (BATCH_128_FILE_BYTES, true),
+        (200 * MIB, true),
+        (256 * MIB, true),
+        (256 * MIB + 1, false),
+    ] {
+        let object = ClientRegistration {
+            matrix_file_len: len,
+            ..registration(0x61)
+        };
+        let expected = if admitted {
+            Ok(())
+        } else {
+            Err(ClientObjectError::MatrixFileLength {
+                len,
+                max: 256 * MIB,
+            })
+        };
+        assert_eq!(
+            validate(
+                &block(vec![paid_registration(100, object)]),
+                &[ClientObject::Registration(object)],
+                &ClientRegistryState::new(),
+                &burn_rules()
+            )
+            .map(|_| ()),
+            expected,
+            "block, {len} bytes"
+        );
+        assert_eq!(
+            check_registration_payment(&paid_registration(10, object), &object, &burn_rules()),
+            expected,
+            "node, {len} bytes"
+        );
+        let entry = ClientRegistryEntry {
+            matrix_file_len: len,
+            ..snapshot_entry(0, 0x61, 150)
+        };
+        assert_eq!(
+            check_snapshot(&snapshot_registry(&[entry]), HEIGHT, &[marker_slot(&entry)]).is_ok(),
+            admitted,
+            "snapshot, {len} bytes"
+        );
+    }
+}
+
 #[test]
 fn the_object_list_is_exactly_the_markers_openings() {
     let (a, b) = (registration(1), registration(2));

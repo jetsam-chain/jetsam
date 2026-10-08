@@ -175,10 +175,13 @@ pub const CLIENT_ACTIVATION_DELAY_BLOCKS: u64 = 480;
 pub const CLIENT_LICENSE_DIVIDEND_BLOCKS: u64 = 480;
 
 /// Upper bound of a registered matrix file (the bytes a node fetches).
-/// A dense m22 matrix compresses to ~3.8 MB (B24's).
+/// A dense m22 matrix compresses to ~3.8 MB (B24's); catalogue entry 1's
+/// file is 9.45 MiB; a computed batch of 128 statements of entry 1 fills the
+/// m22 client form and its file is 203.07 MiB (212 931 651 bytes).
 ///
-/// **PROVISIONAL**: 16 MiB.
-pub const CLIENT_MATRIX_MAX_FILE_BYTES: u32 = 16 * 1024 * 1024;
+/// **256 MiB** (decision of 2026-10-08, before the public network: raising it
+/// later is a fork). A file this size travels in 256 chunks of 1 MiB.
+pub const CLIENT_MATRIX_MAX_FILE_BYTES: u32 = 256 * 1024 * 1024;
 
 /// One client proof per block: the HistoryStep relation has one client arm.
 pub const MAX_BLOCK_CLIENT_SUBMISSIONS: usize = 1;
