@@ -2938,6 +2938,7 @@ dependencies = [
  "libc",
  "libp2p",
  "rand 0.8.6",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

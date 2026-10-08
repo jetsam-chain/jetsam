@@ -11,10 +11,20 @@
 //!   [`HistoryStepClientMatrixSet`] the verifier reads. A missing one is
 //!   fetched from peers: the manifest (chunk digests, checked against the
 //!   registered file root), then 1 MiB chunks (each checked against its
-//!   digest), from any mix of peers; complete, the file must decode as a
-//!   matrix of the client form whose structural digest is the registered
-//!   `D`. A peer that serves bytes failing their identity is never asked
-//!   again for that file.
+//!   digest by the transport, as it arrives), from any mix of peers;
+//!   complete, the file must decode as a matrix of the client form whose
+//!   structural digest is the registered `D`. A peer that serves bytes
+//!   failing their identity is never asked again for that file.
+//! - **Authenticated once, off the event loop.** The structural digest of a
+//!   256 MiB matrix is minutes of CPU on two cores, and every node receives a
+//!   registration at the same time: a completed file is handed back
+//!   ([`ClientObjectFetched::MatrixAssembled`]) and authenticated on a
+//!   blocking worker ([`ClientObjects::authenticate_assembled`]), its chunks
+//!   hashed once (by the transport) and its matrix digested once. After a
+//!   restart the files held on disk are listed without being read and
+//!   authenticated again the same way ([`ClientObjects::authenticate_held_files`]).
+//!   Until then a matrix is neither held for the verifier nor served (a tip
+//!   that needs it has no verdict yet), nor fetched again.
 //! - **Client proofs.** Announced on gossip, fetched as bundles (submission,
 //!   paying transaction, proof), decoded under their bounds, pre-passed once
 //!   (`PreparedHistoryStepClient`: native verification, lincheck on `D`,
@@ -34,9 +44,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jetsam_chain::consensus::client_objects::{
-    matrix_file_root, queue::ClientCandidate, queue::ClientSubmissionQueue, ClientObject,
-    ClientObjectRules, ClientRegistration, ClientRegistryState, ClientSubmission,
-    CLIENT_MATRIX_CHUNK_BYTES, CLIENT_MATRIX_MAX_FILE_BYTES,
+    matrix_file_chunk_digest, matrix_file_root_from_chunk_digests, queue::ClientCandidate,
+    queue::ClientSubmissionQueue, ClientObject, ClientObjectRules, ClientRegistration,
+    ClientRegistryState, ClientSubmission, CLIENT_MATRIX_CHUNK_BYTES,
+    CLIENT_MATRIX_MAX_FILE_BYTES,
 };
 use jetsam_ivc_core::field_r1cs::FieldR1cs;
 use jetsam_p2p::client_object_codec::ClientObjectRequest;
@@ -48,7 +59,9 @@ use jetsam_p2p::client_object_transport::ClientObjectSource;
 use jetsam_recursive::acceptance::history_step::{
     HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
 };
-use jetsam_recursive::{HistoryStepClientForm, HistoryStepClientMatrixSet};
+use jetsam_recursive::{
+    AuthenticatedClientMatrix, HistoryStepClientForm, HistoryStepClientMatrixSet,
+};
 use jetsam_tx::PagedSpendIntent;
 use libp2p::PeerId;
 
@@ -108,12 +121,36 @@ pub enum ClientObjectFetched {
     /// A client proof bundle, exactly the announced bytes: to receive
     /// ([`ClientObjects::receive_bundle`], CPU-heavy).
     Bundle(Vec<u8>),
-    /// A registered matrix is now held.
-    MatrixComplete(MatrixFileId),
+    /// Every chunk of a registered matrix file arrived: to authenticate off
+    /// the event loop ([`ClientObjects::authenticate_assembled`], CPU-heavy).
+    MatrixAssembled(AssembledMatrixFile),
     /// Progress (a manifest or chunk stored), or a late or unwanted answer.
     Nothing,
     /// The peer served bytes failing their identity: penalise it.
     Liar,
+}
+
+/// A registered matrix file whose every chunk arrived, each the one its
+/// manifest lists, the manifest the registered root's; not authenticated yet
+/// (made only by [`ClientObjects::on_fetched`]).
+pub struct AssembledMatrixFile {
+    id: MatrixFileId,
+    digests: Vec<Hash32>,
+    chunks: Vec<Vec<u8>>,
+}
+
+impl AssembledMatrixFile {
+    pub fn id(&self) -> MatrixFileId {
+        self.id
+    }
+}
+
+impl std::fmt::Debug for AssembledMatrixFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssembledMatrixFile")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -131,6 +168,11 @@ struct State {
     held_files: BTreeMap<MatrixFileId, PathBuf>,
     manifests: BTreeMap<MatrixFileId, Vec<u8>>,
     fetches: BTreeMap<MatrixFileId, MatrixFetch>,
+    /// Files on disk found by `open`, not authenticated again yet.
+    unauthenticated_files: BTreeMap<MatrixFileId, PathBuf>,
+    /// Files being authenticated off the event loop (assembled, or read
+    /// back after a restart).
+    authenticating: BTreeSet<MatrixFileId>,
     next_token: u64,
     tokens: BTreeMap<u64, (PeerId, ClientObjectRequest, Instant)>,
     proofs: ClientProofFetcher<PeerId>,
@@ -183,6 +225,16 @@ fn parse_matrix_file_name(name: &str) -> Option<MatrixFileId> {
     })
 }
 
+/// The digests of a matrix file's chunks, in order (its manifest; the root is
+/// their hash): one pass over the file, its chunks hashed in parallel.
+fn matrix_chunk_digests(file: &[u8]) -> Vec<Hash32> {
+    use rayon::prelude::*;
+    file.par_chunks(CLIENT_MATRIX_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| matrix_file_chunk_digest(index as u32, chunk))
+        .collect()
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let staged = path.with_extension(format!("tmp-{}", std::process::id()));
     {
@@ -194,10 +246,11 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl ClientObjects {
-    /// Open the client objects under `data_dir`, loading every matrix file
-    /// held (each authenticated again: decoded as a matrix of `form` whose
-    /// structural digest is the one its name registers) into `matrices`, and
-    /// every registration held, re-checked under `rules`.
+    /// Open the client objects under `data_dir`: every registration held,
+    /// re-checked under `rules`, and the list of the matrix files held, not
+    /// read here: each is authenticated again (decoded as a matrix of `form`
+    /// whose structural digest is the one its name registers) into `matrices`
+    /// by [`Self::authenticate_held_files`], off the event loop.
     pub fn open(
         data_dir: &Path,
         form: &HistoryStepClientForm,
@@ -221,6 +274,8 @@ impl ClientObjects {
                 held_files: BTreeMap::new(),
                 manifests: BTreeMap::new(),
                 fetches: BTreeMap::new(),
+                unauthenticated_files: BTreeMap::new(),
+                authenticating: BTreeSet::new(),
                 next_token: 1,
                 tokens: BTreeMap::new(),
                 proofs: ClientProofFetcher::new(
@@ -239,24 +294,12 @@ impl ClientObjects {
             let Some(id) = parse_matrix_file_name(&name) else {
                 continue;
             };
-            let bytes = read_bounded(&entry.path(), u64::from(CLIENT_MATRIX_MAX_FILE_BYTES))?;
-            match objects.authenticate_matrix_file(&id, &bytes) {
-                Ok(matrix) => {
-                    objects
-                        .matrices
-                        .insert(matrix)
-                        .map_err(|_| ClientObjectsError::MatrixFile("form shape"))?;
-                    let mut state = objects.state.lock().expect("client objects lock");
-                    state
-                        .manifests
-                        .insert(id, MatrixFileId::manifest_of(&bytes));
-                    state.held_files.insert(id, entry.path());
-                }
-                Err(error) => {
-                    tracing::warn!(file = %name, %error, "held client matrix file refused; it will be fetched again");
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
+            objects
+                .state
+                .lock()
+                .expect("client objects lock")
+                .unauthenticated_files
+                .insert(id, entry.path());
         }
         // Held registrations kept before a restart: each re-checked as a
         // relayed notice is (its payment opens and pays it, its `D` is in
@@ -303,27 +346,69 @@ impl ClientObjects {
         &self.matrices
     }
 
+    /// `bytes` decoded as a matrix of the client form, its `D` computed (the
+    /// one structural pass).
+    fn open_client_matrix(&self, bytes: &[u8]) -> Option<AuthenticatedClientMatrix> {
+        let matrix = FieldR1cs::read_artifact_unbound(
+            &mut &bytes[..],
+            self.form.shape(),
+            CLIENT_MATRIX_MAX_FILE_BYTES as usize,
+        )
+        .ok()?;
+        self.matrices.authenticate(Arc::new(matrix)).ok()
+    }
+
+    /// `bytes` decoded as the matrix of the registered `D` of `id`.
+    fn open_registered_matrix(
+        &self,
+        id: &MatrixFileId,
+        bytes: &[u8],
+    ) -> Result<AuthenticatedClientMatrix, ClientObjectsError> {
+        self.open_client_matrix(bytes)
+            .filter(|matrix| matrix.digest() == id.matrix_digest)
+            .ok_or(ClientObjectsError::MatrixFile(
+                "not a matrix of the client form with this D",
+            ))
+    }
+
     /// The file `bytes` as the registered file `id`: its length and root,
-    /// then a matrix of the client form whose structural digest is `D`.
+    /// then a matrix of the client form whose structural digest is `D`. One
+    /// pass of each hash; returns the matrix and the chunk digests.
     fn authenticate_matrix_file(
         &self,
         id: &MatrixFileId,
         bytes: &[u8],
-    ) -> Result<Arc<FieldR1cs>, ClientObjectsError> {
+    ) -> Result<(AuthenticatedClientMatrix, Vec<Hash32>), ClientObjectsError> {
         if bytes.len() != id.file_len as usize || bytes.is_empty() {
             return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
         }
-        if matrix_file_root(bytes) != id.file_root {
+        let digests = matrix_chunk_digests(bytes);
+        if matrix_file_root_from_chunk_digests(u64::from(id.file_len), &digests) != id.file_root {
             return Err(ClientObjectsError::MatrixFile("root is not the registered one"));
         }
-        let matrix = FieldR1cs::read_artifact(
-            &mut &bytes[..],
-            self.form.shape(),
-            id.matrix_digest,
-            CLIENT_MATRIX_MAX_FILE_BYTES as usize,
-        )
-        .map_err(|_| ClientObjectsError::MatrixFile("not a matrix of the client form with this D"))?;
-        Ok(Arc::new(matrix))
+        Ok((self.open_registered_matrix(id, bytes)?, digests))
+    }
+
+    /// Hold the authenticated matrix file `id` kept at `path`: inserted for
+    /// the verifier, its manifest (`digests`) and chunks served to peers.
+    fn hold_authenticated(
+        &self,
+        id: MatrixFileId,
+        matrix: AuthenticatedClientMatrix,
+        digests: Vec<Hash32>,
+        path: PathBuf,
+    ) -> Result<(), ClientObjectsError> {
+        self.matrices
+            .insert_authenticated(matrix)
+            .map_err(|_| ClientObjectsError::MatrixFile("form shape"))?;
+        let mut state = self.state.lock().expect("client objects lock");
+        state.manifests.insert(id, digests.concat());
+        state.held_files.insert(id, path);
+        state.fetches.remove(&id);
+        state.authenticating.remove(&id);
+        // Held anew (`registerClient`) before the restart's pass reached it.
+        state.unauthenticated_files.remove(&id);
+        Ok(())
     }
 
     /// Hold the registered matrix file `id` (`bytes`, authenticated here):
@@ -333,17 +418,96 @@ impl ClientObjects {
         id: MatrixFileId,
         bytes: &[u8],
     ) -> Result<(), ClientObjectsError> {
-        let matrix = self.authenticate_matrix_file(&id, bytes)?;
+        let (matrix, digests) = self.authenticate_matrix_file(&id, bytes)?;
         let path = self.matrix_dir.join(matrix_file_name(&id));
         write_atomically(&path, bytes)?;
-        self.matrices
-            .insert(matrix)
-            .map_err(|_| ClientObjectsError::MatrixFile("form shape"))?;
-        let mut state = self.state.lock().expect("client objects lock");
-        state.manifests.insert(id, MatrixFileId::manifest_of(bytes));
-        state.held_files.insert(id, path);
-        state.fetches.remove(&id);
-        Ok(())
+        self.hold_authenticated(id, matrix, digests, path)
+    }
+
+    /// Authenticate a matrix file whose chunks were fetched (CPU-heavy: call
+    /// it off the event loop) and hold it. Every chunk is the one the
+    /// registered root lists (checked as it arrived), so only the structural
+    /// identity is left: refused if the file is not a matrix of the
+    /// registered `D` (no peer can do better: the fetch is dropped).
+    pub fn authenticate_assembled(
+        &self,
+        assembled: AssembledMatrixFile,
+    ) -> Result<MatrixFileId, ClientObjectsError> {
+        let id = assembled.id;
+        match self.hold_assembled(assembled) {
+            Ok(()) => Ok(id),
+            Err(error) => {
+                self.forget_assembled(&id);
+                Err(error)
+            }
+        }
+    }
+
+    fn hold_assembled(&self, assembled: AssembledMatrixFile) -> Result<(), ClientObjectsError> {
+        let AssembledMatrixFile {
+            id,
+            digests,
+            chunks,
+        } = assembled;
+        // Each chunk is freed as it is copied.
+        let mut file = Vec::with_capacity(id.file_len as usize);
+        for chunk in chunks {
+            file.extend_from_slice(&chunk);
+        }
+        if file.len() != id.file_len as usize {
+            return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
+        }
+        let matrix = self.open_registered_matrix(&id, &file)?;
+        let path = self.matrix_dir.join(matrix_file_name(&id));
+        write_atomically(&path, &file)?;
+        self.hold_authenticated(id, matrix, digests, path)
+    }
+
+    /// An assembled file that will not be authenticated (its worker was
+    /// refused or lost): no longer awaited, it is fetched again when wanted.
+    pub fn forget_assembled(&self, id: &MatrixFileId) {
+        self.state
+            .lock()
+            .expect("client objects lock")
+            .authenticating
+            .remove(id);
+    }
+
+    /// Authenticate again every matrix file `open` found on disk (CPU-heavy:
+    /// call it off the event loop), one file at a time, and hold each. A file
+    /// that no longer reads as its registered identity is dropped, to be
+    /// fetched again. Returns the files held.
+    pub fn authenticate_held_files(&self) -> usize {
+        let mut held = 0usize;
+        loop {
+            let (id, path) = {
+                let mut state = self.state.lock().expect("client objects lock");
+                let Some((id, path)) = state.unauthenticated_files.pop_first() else {
+                    break;
+                };
+                state.authenticating.insert(id);
+                (id, path)
+            };
+            let outcome = read_bounded(&path, u64::from(CLIENT_MATRIX_MAX_FILE_BYTES))
+                .map_err(ClientObjectsError::from)
+                .and_then(|bytes| self.authenticate_matrix_file(&id, &bytes))
+                .and_then(|(matrix, digests)| {
+                    self.hold_authenticated(id, matrix, digests, path.clone())
+                });
+            match outcome {
+                Ok(()) => held += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        file = %path.display(),
+                        %error,
+                        "held client matrix file refused; it will be fetched again"
+                    );
+                    let _ = std::fs::remove_file(&path);
+                    self.forget_assembled(&id);
+                }
+            }
+        }
+        held
     }
 
     /// Whether the matrix of `D` is held.
@@ -352,11 +516,16 @@ impl ClientObjects {
     }
 
     /// Fetch every registered matrix in `wanted` this node does not hold
-    /// (the chain's registry, or a snapshot candidate's).
+    /// (the chain's registry, or a snapshot candidate's), nor has on disk or
+    /// in hand awaiting authentication.
     pub fn want_matrices(&self, wanted: impl IntoIterator<Item = MatrixFileId>) {
         let mut state = self.state.lock().expect("client objects lock");
         for id in wanted {
-            if !state.held_files.contains_key(&id) && !self.matrices.holds(&id.matrix_digest) {
+            if !state.held_files.contains_key(&id)
+                && !state.unauthenticated_files.contains_key(&id)
+                && !state.authenticating.contains(&id)
+                && !self.matrices.holds(&id.matrix_digest)
+            {
                 state.fetches.entry(id).or_default();
             }
         }
@@ -501,7 +670,9 @@ impl ClientObjects {
     }
 
     /// A request of this node was answered with `bytes`, exactly the
-    /// requested object (checked by the transport codec).
+    /// requested object (checked by the transport codec, off the event loop:
+    /// a chunk is not hashed again here). Called on the event loop: nothing
+    /// here is CPU-heavy.
     pub fn on_fetched(
         &self,
         token: u64,
@@ -547,59 +718,36 @@ impl ClientObjects {
                 index,
                 digest,
             } => {
-                let complete = {
-                    let mut state = self.state.lock().expect("client objects lock");
-                    let Some(fetch) = state.fetches.get_mut(&file) else {
-                        return Ok(ClientObjectFetched::Nothing);
-                    };
-                    fetch.in_flight.remove(&index);
-                    let expected = fetch
-                        .manifest
-                        .as_ref()
-                        .and_then(|digests| digests.get(index as usize))
-                        .copied();
-                    if expected != Some(digest)
-                        || !jetsam_p2p::client_object_protocol::matrix_chunk_matches(
-                            index, bytes, &digest,
-                        )
-                    {
-                        fetch.excluded.insert(peer);
-                        return Ok(ClientObjectFetched::Liar);
-                    }
-                    fetch.chunks[index as usize] = Some(bytes.to_vec());
-                    if fetch.chunks.iter().all(Option::is_some) {
-                        let file_bytes: Vec<u8> = fetch
-                            .chunks
-                            .iter()
-                            .flat_map(|chunk| chunk.as_deref().unwrap_or_default().iter().copied())
-                            .collect();
-                        Some(file_bytes)
-                    } else {
-                        None
-                    }
-                };
-                let Some(file_bytes) = complete else {
+                let mut state = self.state.lock().expect("client objects lock");
+                let Some(fetch) = state.fetches.get_mut(&file) else {
                     return Ok(ClientObjectFetched::Nothing);
                 };
-                match self.insert_matrix_file(file, &file_bytes) {
-                    Ok(()) => Ok(ClientObjectFetched::MatrixComplete(file)),
-                    Err(error) => {
-                        // Every chunk matched the registered manifest, so the
-                        // registered file itself is not a matrix of `D`: no
-                        // peer can do better. Stop fetching it.
-                        tracing::warn!(
-                            digest = %hex32(&file.matrix_digest),
-                            %error,
-                            "the registered client matrix file does not open as its D"
-                        );
-                        self.state
-                            .lock()
-                            .expect("client objects lock")
-                            .fetches
-                            .remove(&file);
-                        Ok(ClientObjectFetched::Nothing)
-                    }
+                fetch.in_flight.remove(&index);
+                let expected = fetch
+                    .manifest
+                    .as_ref()
+                    .and_then(|digests| digests.get(index as usize))
+                    .copied();
+                // The transport hashed the bytes against the request's digest
+                // (the one pass over a chunk, off the event loop): what is
+                // left is that the request is the manifest's.
+                if expected != Some(digest) || file.chunk_len(index) != Some(bytes.len()) {
+                    fetch.excluded.insert(peer);
+                    return Ok(ClientObjectFetched::Liar);
                 }
+                fetch.chunks[index as usize] = Some(bytes.to_vec());
+                if !fetch.chunks.iter().all(Option::is_some) {
+                    return Ok(ClientObjectFetched::Nothing);
+                }
+                // Complete: authenticated off the event loop; meanwhile not
+                // fetched again.
+                let fetch = state.fetches.remove(&file).expect("found above");
+                state.authenticating.insert(file);
+                Ok(ClientObjectFetched::MatrixAssembled(AssembledMatrixFile {
+                    id: file,
+                    digests: fetch.manifest.expect("chunks follow the manifest"),
+                    chunks: fetch.chunks.into_iter().flatten().collect(),
+                }))
             }
         }
     }
@@ -739,20 +887,29 @@ impl ClientObjects {
         &self,
         bytes: &[u8],
     ) -> Result<ClientRegistration, ClientObjectsError> {
+        Ok(self.open_matrix_file(bytes)?.0)
+    }
+
+    /// The registration a matrix file makes, with the matrix it opens as and
+    /// its chunk digests: one pass of each hash.
+    fn open_matrix_file(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(ClientRegistration, AuthenticatedClientMatrix, Vec<Hash32>), ClientObjectsError>
+    {
         if bytes.is_empty() || bytes.len() > CLIENT_MATRIX_MAX_FILE_BYTES as usize {
             return Err(ClientObjectsError::MatrixFile("length out of bounds"));
         }
-        let matrix = FieldR1cs::read_artifact_unbound(
-            &mut &bytes[..],
-            self.form.shape(),
-            CLIENT_MATRIX_MAX_FILE_BYTES as usize,
-        )
-        .map_err(|_| ClientObjectsError::MatrixFile("not a matrix of the client form"))?;
-        Ok(ClientRegistration {
-            matrix_digest: matrix.structural_statement_digest(),
-            matrix_file_root: matrix_file_root(bytes),
+        let matrix = self
+            .open_client_matrix(bytes)
+            .ok_or(ClientObjectsError::MatrixFile("not a matrix of the client form"))?;
+        let digests = matrix_chunk_digests(bytes);
+        let registration = ClientRegistration {
+            matrix_digest: matrix.digest(),
+            matrix_file_root: matrix_file_root_from_chunk_digests(bytes.len() as u64, &digests),
             matrix_file_len: bytes.len() as u32,
-        })
+        };
+        Ok((registration, matrix, digests))
     }
 
     /// Hold the registration `matrix_file` makes, paid by `payment`, for this
@@ -767,7 +924,7 @@ impl ClientObjects {
         matrix_file: &[u8],
         rules: &ClientObjectRules,
     ) -> Result<ClientRegistration, ClientObjectsError> {
-        let registration = self.registration_of_matrix_file(matrix_file)?;
+        let (registration, matrix, digests) = self.open_matrix_file(matrix_file)?;
         let pages: Vec<jetsam_tx::Transaction> = payment
             .pages
             .iter()
@@ -779,7 +936,10 @@ impl ClientObjects {
             rules,
         )
         .map_err(|error| ClientObjectsError::Registration(error.to_string()))?;
-        self.insert_matrix_file(MatrixFileId::of_registration(&registration), matrix_file)?;
+        let id = MatrixFileId::of_registration(&registration);
+        let path = self.matrix_dir.join(matrix_file_name(&id));
+        write_atomically(&path, matrix_file)?;
+        self.hold_authenticated(id, matrix, digests, path)?;
         self.hold_registration(HeldRegistration {
             registration,
             payment,

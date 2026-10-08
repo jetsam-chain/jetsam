@@ -2541,30 +2541,28 @@ async fn main() -> anyhow::Result<()> {
             Some(matrices) => {
                 let form = matrices.form().clone();
                 let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
-                let objects = jetsam_node::client_objects::ClientObjects::open(
-                    &data_dir, &form, matrices, &rules,
-                )
-                .context("open v1.5 client objects")?;
-                // Every registered matrix of the chain is wanted; client
-                // proofs kept before a restart are received again.
+                let objects = Arc::new(
+                    jetsam_node::client_objects::ClientObjects::open(
+                        &data_dir, &form, matrices, &rules,
+                    )
+                    .context("open v1.5 client objects")?,
+                );
+                // Every registered matrix of the chain is wanted (one held on
+                // disk awaits its authentication instead); the held ones and
+                // the client proofs kept before a restart are reloaded off
+                // the startup path.
                 objects.want_matrices(
                     ctx.client_registry()
                         .entries()
                         .iter()
                         .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
                 );
-                let registry = ctx.client_registry().clone();
-                match jetsam_miner::install_inbound_verifier_cpu(|| {
-                    objects.reload_bundles(&registry, &rules)
-                }) {
-                    Ok(Ok(kept)) if kept > 0 => {
-                        tracing::info!(kept, "v1.5 client proofs kept across the restart")
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "kept client proofs not reloaded"),
-                    Err(error) => tracing::warn!(%error, "kept client proofs not reloaded"),
-                }
-                Some(Arc::new(objects))
+                spawn_held_client_objects_reload(
+                    Arc::clone(&objects),
+                    ctx.client_registry().clone(),
+                    rules,
+                );
+                Some(objects)
             }
             None => None,
         };
@@ -8627,6 +8625,86 @@ async fn tend_client_objects(
     );
 }
 
+/// Authenticate a fetched matrix file off the event loop (M3.8): its decode
+/// and structural digest are seconds of CPU on 32 threads and minutes on two
+/// cores at 256 MiB, and every node receives a registration at once (on the
+/// event loop the whole network would stop together). Until it is held, a
+/// tip that needs it has no verdict.
+fn spawn_matrix_authentication(
+    objects: Arc<jetsam_node::client_objects::ClientObjects>,
+    assembled: jetsam_node::client_objects::AssembledMatrixFile,
+) {
+    let id = assembled.id();
+    tokio::spawn(async move {
+        let worker = Arc::clone(&objects);
+        let outcome = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_inbound_verifier_cpu(|| worker.authenticate_assembled(assembled))
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Ok(file))) => tracing::info!(
+                matrix_digest = %hex::encode(file.matrix_digest),
+                bytes = file.file_len,
+                "registered client matrix fetched and authenticated"
+            ),
+            // Every chunk matched the registered manifest, so the registered
+            // file itself is not a matrix of `D`: no peer can do better.
+            Ok(Ok(Err(error))) => tracing::warn!(
+                digest = %hex::encode(id.matrix_digest),
+                %error,
+                "the registered client matrix file does not open as its D"
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "client matrix authentication CPU admission failed");
+                objects.forget_assembled(&id);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "client matrix authentication panicked");
+                objects.forget_assembled(&id);
+            }
+        }
+    });
+}
+
+/// After a restart (M3.8), off the startup path and the event loop: the
+/// matrix files held on disk authenticated again (minutes of CPU per 256 MiB
+/// matrix on two cores), then the client proofs kept before the restart
+/// received again under `registry` (each needs its matrix held).
+fn spawn_held_client_objects_reload(
+    objects: Arc<jetsam_node::client_objects::ClientObjects>,
+    registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
+    rules: jetsam_chain::consensus::client_objects::ClientObjectRules,
+) {
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        match jetsam_miner::install_inbound_verifier_cpu(|| {
+            let held = objects.authenticate_held_files();
+            (held, objects.reload_bundles(&registry, &rules))
+        }) {
+            Ok((held, kept)) => {
+                if held > 0 {
+                    tracing::info!(
+                        held,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "v1.5 client matrices held on disk authenticated again"
+                    );
+                }
+                match kept {
+                    Ok(kept) if kept > 0 => {
+                        tracing::info!(kept, "v1.5 client proofs kept across the restart")
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "kept client proofs not reloaded"),
+                }
+            }
+            Err(error) => tracing::error!(
+                %error,
+                "held client matrices and kept client proofs not reloaded: restart the node"
+            ),
+        }
+    });
+}
+
 /// Receive a fetched client proof bundle off the event loop (M3.8): its
 /// payment against the current state, then the pre-pass (seconds of CPU on
 /// the inbound-verification pool), then an announcement to peers.
@@ -11129,14 +11207,10 @@ async fn handle_p2p_events(
                                 bundle,
                             );
                         }
-                        Ok(jetsam_node::client_objects::ClientObjectFetched::MatrixComplete(
-                            file,
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::MatrixAssembled(
+                            assembled,
                         )) => {
-                            tracing::info!(
-                                matrix_digest = %hex::encode(file.matrix_digest),
-                                bytes = file.file_len,
-                                "registered client matrix fetched and authenticated"
-                            );
+                            spawn_matrix_authentication(Arc::clone(objects), assembled);
                         }
                         Ok(jetsam_node::client_objects::ClientObjectFetched::Liar) => {
                             tracing::warn!(peer = %from, "peer served bytes failing a client object's identity");

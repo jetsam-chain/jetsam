@@ -6,7 +6,7 @@
 
 use super::*;
 use jetsam_chain::consensus::client_objects::{
-    ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
+    matrix_file_root, ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
 };
 use jetsam_ivc_core::challenger::FsLaneChallenger;
 use jetsam_ivc_core::field::F128;
@@ -191,7 +191,17 @@ fn payment_of(submission: &ClientSubmission, fee: u64) -> PagedSpendIntent {
     .unwrap()
 }
 
+/// The client objects under `directory`, as a restart leaves them: opened,
+/// then every matrix file held on disk authenticated again.
 fn open(directory: &Path, form: &HistoryStepClientForm) -> ClientObjects {
+    let objects = open_unauthenticated(directory, form);
+    objects.authenticate_held_files();
+    objects
+}
+
+/// The client objects under `directory` just opened: the matrix files held on
+/// disk are not authenticated yet.
+fn open_unauthenticated(directory: &Path, form: &HistoryStepClientForm) -> ClientObjects {
     ClientObjects::open(
         directory,
         form,
@@ -199,6 +209,22 @@ fn open(directory: &Path, form: &HistoryStepClientForm) -> ClientObjects {
         &rules(),
     )
     .unwrap()
+}
+
+/// What the transport hands this node for `fetch` answered with `bytes`: the
+/// codec refuses bytes that are not exactly the requested object and the
+/// request fails as the peer's lie (`on_failed`); exact bytes reach
+/// `on_fetched`.
+fn deliver(
+    objects: &ClientObjects,
+    fetch: &ClientObjectFetch,
+    bytes: &[u8],
+) -> ClientObjectFetched {
+    if !fetch.request.matches(bytes) {
+        assert!(objects.on_failed(fetch.token, true));
+        return ClientObjectFetched::Liar;
+    }
+    objects.on_fetched(fetch.token, bytes).unwrap()
 }
 
 #[test]
@@ -280,7 +306,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
         for _ in 0..16 {
             for fetch in objects.next_requests(&order, now) {
                 let bytes = answer(&holder, liar, &fetch);
-                match objects.on_fetched(fetch.token, &bytes).unwrap() {
+                match deliver(&objects, &fetch, &bytes) {
                     ClientObjectFetched::Liar => {
                         assert_eq!(fetch.peer, liar);
                         lies.push(match fetch.request {
@@ -289,8 +315,11 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
                             ClientObjectRequest::Proof(_) => "proof",
                         });
                     }
-                    ClientObjectFetched::MatrixComplete(id) => {
-                        assert_eq!(id, client.file_id());
+                    ClientObjectFetched::MatrixAssembled(assembled) => {
+                        assert_eq!(
+                            objects.authenticate_assembled(assembled).unwrap(),
+                            client.file_id()
+                        );
                         complete = true;
                     }
                     ClientObjectFetched::Nothing => {}
@@ -309,6 +338,177 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
         objects.want_matrices([client.file_id()]);
         assert!(objects.next_requests(&order, now).is_empty());
     }
+
+    // The node reads the chunk digests of a manifest itself: a false one
+    // handed to it is the peer's lie, and that peer is not asked again.
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    objects.want_matrices([client.file_id()]);
+    let now = Instant::now();
+    let [fetch] = objects.next_requests(&[liar], now).try_into().unwrap();
+    assert!(matches!(fetch.request, ClientObjectRequest::MatrixManifest(_)));
+    let bytes = answer(&holder, liar, &fetch);
+    assert!(matches!(
+        objects.on_fetched(fetch.token, &bytes).unwrap(),
+        ClientObjectFetched::Liar
+    ));
+    assert!(objects.next_requests(&[liar], now).is_empty());
+}
+
+/// Serve `request` of the file `file` (whatever the identity it names).
+fn answer_from_file(file: &[u8], request: &ClientObjectRequest) -> Vec<u8> {
+    match request {
+        ClientObjectRequest::MatrixManifest(_) => MatrixFileId::manifest_of(file),
+        ClientObjectRequest::MatrixChunk { index, .. } => file
+            .chunks(CLIENT_MATRIX_CHUNK_BYTES)
+            .nth(*index as usize)
+            .unwrap()
+            .to_vec(),
+        ClientObjectRequest::Proof(_) => unreachable!(),
+    }
+}
+
+/// Fetch `id` from `peers` serving `file` until it is assembled.
+fn fetch_until_assembled(
+    objects: &ClientObjects,
+    id: MatrixFileId,
+    file: &[u8],
+    peers: &[PeerId],
+) -> AssembledMatrixFile {
+    objects.want_matrices([id]);
+    let now = Instant::now();
+    for _ in 0..16 {
+        for fetch in objects.next_requests(peers, now) {
+            match deliver(objects, &fetch, &answer_from_file(file, &fetch.request)) {
+                ClientObjectFetched::MatrixAssembled(assembled) => return assembled,
+                ClientObjectFetched::Nothing => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    panic!("the matrix file was not assembled");
+}
+
+/// The last chunk of a fetched matrix completes the file on the event loop
+/// without authenticating it (the structural digest of a 203 MiB batch is
+/// 150 CPU-seconds): the assembled file is authenticated off the loop.
+/// Meanwhile it is neither held nor served nor fetched again; authenticated,
+/// it is held, served and kept across a restart.
+#[test]
+fn a_fetched_matrix_is_authenticated_off_the_event_loop() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCB);
+    let id = client.file_id();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let peers = [PeerId::random()];
+    let assembled = fetch_until_assembled(&objects, id, &client.file, &peers);
+    assert_eq!(assembled.id(), id);
+    assert!(!objects.holds_matrix(&client.digest()));
+    assert!(objects.held_matrix_files().is_empty());
+    assert_eq!(
+        objects.client_object(&ClientObjectRequest::MatrixManifest(id)),
+        None
+    );
+    objects.want_matrices([id]);
+    assert!(
+        objects.next_requests(&peers, Instant::now()).is_empty(),
+        "not fetched again while it is authenticated"
+    );
+
+    assert_eq!(objects.authenticate_assembled(assembled).unwrap(), id);
+    assert!(objects.holds_matrix(&client.digest()));
+    assert!(objects.fetching_matrices().is_empty());
+    assert_eq!(
+        objects.client_object(&ClientObjectRequest::MatrixManifest(id)),
+        Some(MatrixFileId::manifest_of(&client.file))
+    );
+    drop(objects);
+    let reopened = open(directory.path(), &form);
+    assert!(reopened.holds_matrix(&client.digest()));
+    assert_eq!(reopened.held_matrix_files(), vec![id]);
+}
+
+/// An assembled file whose every chunk is the registered one but which is
+/// not a matrix of the registered `D` is refused off the loop exactly as
+/// before (nothing held, the fetch dropped); an assembled file whose
+/// authentication never ran (CPU admission refused, worker lost) is fetched
+/// again.
+#[test]
+fn an_assembled_file_is_held_only_as_its_registered_d() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCC);
+    let other = TestClient::new(&form, 0xCD);
+    // Registered with another client's `D`: its root and length are the file's.
+    let mut false_d = client.file_id();
+    false_d.matrix_digest = other.digest();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let peers = [PeerId::random()];
+    let assembled = fetch_until_assembled(&objects, false_d, &client.file, &peers);
+    let error = objects.authenticate_assembled(assembled).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "matrix file: not a matrix of the client form with this D"
+    );
+    assert!(!objects.holds_matrix(&client.digest()));
+    assert!(!objects.holds_matrix(&other.digest()));
+    assert!(objects.fetching_matrices().is_empty());
+    assert!(objects.held_matrix_files().is_empty());
+
+    let assembled = fetch_until_assembled(&objects, client.file_id(), &client.file, &peers);
+    let lost = assembled.id();
+    drop(assembled);
+    objects.forget_assembled(&lost);
+    objects.want_matrices([client.file_id()]);
+    assert_eq!(objects.fetching_matrices(), vec![client.file_id()]);
+}
+
+/// A restart lists the matrix files held on disk without reading them; they
+/// are authenticated again off the event loop (a 203 MiB batch: 47 s on 32
+/// threads, 194 s on two cores before v1.5.0's single pass), and meanwhile
+/// held for nobody, served to nobody and not fetched. A file that no longer
+/// authenticates is dropped and fetched.
+#[test]
+fn held_matrix_files_are_authenticated_again_off_the_event_loop_after_a_restart() {
+    let form = test_form();
+    let (kept, damaged) = (TestClient::new(&form, 0xCE), TestClient::new(&form, 0xCF));
+    let directory = tempfile::tempdir().unwrap();
+    {
+        let objects = open(directory.path(), &form);
+        objects.insert_matrix_file(kept.file_id(), &kept.file).unwrap();
+        objects.insert_matrix_file(damaged.file_id(), &damaged.file).unwrap();
+    }
+    let damaged_path = directory
+        .path()
+        .join("client-objects")
+        .join("matrices")
+        .join(matrix_file_name(&damaged.file_id()));
+    let mut bytes = std::fs::read(&damaged_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&damaged_path, bytes).unwrap();
+
+    let objects = open_unauthenticated(directory.path(), &form);
+    assert!(!objects.holds_matrix(&kept.digest()));
+    assert!(objects.held_matrix_files().is_empty());
+    assert_eq!(
+        objects.client_object(&ClientObjectRequest::MatrixManifest(kept.file_id())),
+        None
+    );
+    objects.want_matrices([kept.file_id(), damaged.file_id()]);
+    assert!(
+        objects.fetching_matrices().is_empty(),
+        "a file held on disk is not fetched while it waits"
+    );
+
+    assert_eq!(objects.authenticate_held_files(), 1);
+    assert!(objects.holds_matrix(&kept.digest()));
+    assert_eq!(objects.held_matrix_files(), vec![kept.file_id()]);
+    assert!(!objects.holds_matrix(&damaged.digest()));
+    assert!(!damaged_path.exists(), "a file that no longer authenticates is dropped");
+    objects.want_matrices([kept.file_id(), damaged.file_id()]);
+    assert_eq!(objects.fetching_matrices(), vec![damaged.file_id()]);
 }
 
 #[test]
@@ -665,6 +865,11 @@ fn batch_128() -> &'static (HistoryStepClientForm, MatrixFileId, Vec<u8>) {
 /// 256 MiB. The 203 MiB file of a computed batch is taken by `registerClient`
 /// (its registration), held, served, fetched by another node in 204 chunks of
 /// 1 MiB, and held again, authenticated from disk, after a restart.
+///
+/// Every node receives a registration at once: no call made on the event loop
+/// may authenticate the file (before v1.5.0's fix the last chunk held the loop
+/// 47 s on 32 threads, 191 s on two cores, network-wide). The authentication
+/// runs off the loop, once, as does a restart's.
 #[test]
 #[ignore = "production scale (a 203 MiB matrix in the m = 22 client form): run with --release -- --ignored"]
 fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart() {
@@ -672,9 +877,13 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
     assert_eq!(id.file_len, 212_931_651);
     let holder_dir = tempfile::tempdir().unwrap();
     let holder = open(holder_dir.path(), form);
+    let started = Instant::now();
     let registration = holder.registration_of_matrix_file(file).unwrap();
+    eprintln!("registration_of_matrix_file: {:?}", started.elapsed());
     assert_eq!(MatrixFileId::of_registration(&registration), *id);
+    let started = Instant::now();
     holder.insert_matrix_file(*id, file).unwrap();
+    eprintln!("insert_matrix_file: {:?}", started.elapsed());
     assert!(holder.holds_matrix(&id.matrix_digest));
 
     let directory = tempfile::tempdir().unwrap();
@@ -682,8 +891,10 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
     objects.want_matrices([*id]);
     let peers = [PeerId::random(), PeerId::random()];
     let now = Instant::now();
-    let (mut manifests, mut chunks, mut complete) = (0, 0, false);
-    while !complete {
+    let (mut manifests, mut chunks, mut assembled) = (0, 0, None);
+    // The longest call made on the event loop for one fetched object.
+    let mut longest_on_loop = Duration::ZERO;
+    while assembled.is_none() {
         let fetches = objects.next_requests(&peers, now);
         assert!(!fetches.is_empty(), "the fetch stalled");
         for fetch in fetches {
@@ -693,23 +904,41 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
                 ClientObjectRequest::Proof(_) => unreachable!(),
             }
             let bytes = holder.client_object(&fetch.request).unwrap();
-            assert_eq!(fetch.request.expected_len(), Some(bytes.len()));
-            match objects.on_fetched(fetch.token, &bytes).unwrap() {
-                ClientObjectFetched::MatrixComplete(done) => {
-                    assert_eq!(done, *id);
-                    complete = true;
+            // The codec's check, off the executor in the node.
+            assert!(fetch.request.matches(&bytes));
+            let started = Instant::now();
+            let fetched = objects.on_fetched(fetch.token, &bytes).unwrap();
+            longest_on_loop = longest_on_loop.max(started.elapsed());
+            match fetched {
+                ClientObjectFetched::MatrixAssembled(file) => {
+                    assert_eq!(file.id(), *id);
+                    assembled = Some(file);
                 }
                 ClientObjectFetched::Nothing => {}
                 other => panic!("{other:?}"),
             }
         }
     }
+    eprintln!("longest call on the event loop: {longest_on_loop:?}");
+    assert!(
+        longest_on_loop < Duration::from_millis(250),
+        "the event loop was held {longest_on_loop:?} by one fetched object"
+    );
     assert_eq!((manifests, chunks), (1, 204));
+    assert!(!objects.holds_matrix(&id.matrix_digest));
+    let started = Instant::now();
+    assert_eq!(objects.authenticate_assembled(assembled.unwrap()).unwrap(), *id);
+    eprintln!("authenticate_assembled (off the loop): {:?}", started.elapsed());
     assert!(objects.holds_matrix(&id.matrix_digest));
     assert!(objects.fetching_matrices().is_empty());
 
     drop(objects);
-    let reopened = open(directory.path(), form);
+    let started = Instant::now();
+    let reopened = open_unauthenticated(directory.path(), form);
+    eprintln!("open after a restart: {:?}", started.elapsed());
+    let started = Instant::now();
+    assert_eq!(reopened.authenticate_held_files(), 1);
+    eprintln!("authenticate_held_files (off the loop): {:?}", started.elapsed());
     assert!(reopened.holds_matrix(&id.matrix_digest));
     assert_eq!(reopened.held_matrix_files(), vec![*id]);
 }
