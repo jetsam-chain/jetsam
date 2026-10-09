@@ -2799,10 +2799,16 @@ impl JetsamApiServer for RpcHandler {
         if !rules.active_at(tip_height.saturating_add(1)) {
             return Err(rpc_err("client objects are carried from the v1.5 height only"));
         }
-        self.mempool
-            .check_client_payment(&bundle.payment)
-            .await
-            .map_err(|error| rpc_err(format!("submission payment: {error}")))?;
+        if let Err(error) = self.mempool.check_client_payment(&bundle.payment).await {
+            tracing::info!(
+                matrix_digest = %hex::encode(bundle.submission.matrix_digest),
+                %error,
+                "client proof refused: its payment"
+            );
+            return Err(rpc_err(format!("submission payment: {error}")));
+        }
+        // Admitted or refused from here on, it is logged by the node's
+        // client objects (INFO, `D`).
         let next_height = tip_height.saturating_add(1);
         let announcement = tokio::task::spawn_blocking(move || {
             jetsam_miner::install_inbound_verifier_cpu(|| {
@@ -2873,18 +2879,37 @@ impl JetsamApiServer for RpcHandler {
             tokio::task::spawn_blocking(move || objects.registration_of_matrix_file(&matrix_file))
                 .await
                 .map_err(|error| rpc_err(error.to_string()))?
-                .map_err(rpc_err)?
+                .map_err(|error| {
+                    tracing::info!(
+                        file = %matrix_path,
+                        %error,
+                        "client registration refused: the file is not a client matrix"
+                    );
+                    rpc_err(error)
+                })?
+        };
+        let digest = hex::encode(registration.matrix_digest);
+        tracing::info!(
+            matrix_digest = %digest,
+            bytes = registration.matrix_file_len,
+            "client registration submitted"
+        );
+        let refused = |reason: String| {
+            tracing::info!(matrix_digest = %digest, %reason, "client registration refused");
+            rpc_err(reason)
         };
         if registry.entry(&registration.matrix_digest).is_some() {
-            return Err(rpc_err("this client is already registered"));
+            return Err(refused("this client is already registered".into()));
         }
         if registry.len() >= rules.registry_capacity.min(CLIENT_REGISTRY_CAPACITY) {
-            return Err(rpc_err("the client registry is full"));
+            return Err(refused("the client registry is full".into()));
         }
         self.mempool
             .check_client_payment(&payment)
             .await
-            .map_err(|error| rpc_err(format!("license payment: {error}")))?;
+            .map_err(|error| refused(format!("license payment: {error}")))?;
+        // Held or refused from here on, it is logged by the node's client
+        // objects (INFO, `D`).
         let relayed_payment = payment.clone();
         let registration = tokio::task::spawn_blocking(move || {
             objects.hold_client_registration(payment, &matrix_file, &rules)

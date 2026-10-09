@@ -166,18 +166,15 @@ impl ClientObjectTransport {
         swarm: &mut Swarm<NodeBehaviour>,
         announcement: ClientProofAnnouncement,
     ) {
-        match swarm
+        let outcome = swarm
             .behaviour_mut()
             .gossipsub
-            .publish(self.topic.clone(), announcement.encode().to_vec())
-        {
-            Ok(_) => {}
-            // Already seen (the gossip id is the bytes): nothing to repeat.
-            Err(gossipsub::PublishError::Duplicate) => {}
-            Err(error) => {
-                tracing::debug!(%error, "client proof announcement not published");
-            }
-        }
+            .publish(self.topic.clone(), announcement.encode().to_vec());
+        log_publish_outcome(
+            "client proof announcement",
+            &announcement.id.submission.matrix_digest,
+            outcome,
+        );
     }
 
     /// `NetworkCommand::AnnounceClientRegistration`.
@@ -186,18 +183,15 @@ impl ClientObjectTransport {
         swarm: &mut Swarm<NodeBehaviour>,
         notice: &crate::client_object_protocol::ClientRegistrationNotice,
     ) {
-        match swarm
+        let outcome = swarm
             .behaviour_mut()
             .gossipsub
-            .publish(self.topic.clone(), notice.encode())
-        {
-            Ok(_) => {}
-            // Already relayed (the gossip id is the bytes).
-            Err(gossipsub::PublishError::Duplicate) => {}
-            Err(error) => {
-                tracing::debug!(%error, "client registration notice not published");
-            }
-        }
+            .publish(self.topic.clone(), notice.encode());
+        log_publish_outcome(
+            "client registration",
+            &notice.registration.matrix_digest,
+            outcome,
+        );
     }
 
     /// A received gossip message, if it is on the client-proof topic:
@@ -475,5 +469,97 @@ impl ClientObjectTransport {
                 }),
             event => Some(event),
         }
+    }
+}
+
+/// The outcome of publishing a client object (`what`, of client `D`) on the
+/// client topic: a failure is an object that did not leave this node (WARN,
+/// once per object, never per block); a duplicate was relayed already.
+fn log_publish_outcome(
+    what: &str,
+    matrix_digest: &[u8; 32],
+    outcome: Result<gossipsub::MessageId, gossipsub::PublishError>,
+) {
+    match outcome {
+        Ok(_) => {}
+        // Already seen (the gossip id is the bytes): nothing to repeat.
+        Err(gossipsub::PublishError::Duplicate) => {}
+        Err(error) => {
+            let matrix_digest: String = matrix_digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            tracing::warn!(%matrix_digest, %error, "{what} not relayed to peers");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records each event's level and fields (the `tracing` crate alone).
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .expect("recorder")
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn recorded(run: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        let recorder = Recorder::default();
+        tracing::subscriber::with_default(recorder.clone(), run);
+        let events = recorder.0.lock().expect("recorder").clone();
+        events
+    }
+
+    /// Found on the test network (2026-10-08): a client object this node
+    /// failed to publish on the client topic (no peer to send it to, queues
+    /// full, ...) was logged at DEBUG only: a registration or a client proof
+    /// silently never left the node. It is a WARN naming the object's `D` in
+    /// hex; a duplicate (already relayed) is not a failure.
+    #[test]
+    fn a_client_object_that_fails_to_leave_the_node_is_a_warning() {
+        let digest = [0xab; 32];
+        for what in ["client proof announcement", "client registration"] {
+            let events = recorded(|| {
+                log_publish_outcome(what, &digest, Err(gossipsub::PublishError::InsufficientPeers))
+            });
+            assert_eq!(events.len(), 1, "{events:?}");
+            let (level, fields) = &events[0];
+            assert_eq!(*level, tracing::Level::WARN, "{fields}");
+            assert!(fields.contains(&"ab".repeat(32)), "{fields}");
+            assert!(fields.contains("InsufficientPeers"), "{fields}");
+            assert!(fields.contains(what), "{fields}");
+        }
+        let events = recorded(|| {
+            log_publish_outcome(
+                "client registration",
+                &digest,
+                Err(gossipsub::PublishError::Duplicate),
+            )
+        });
+        assert!(events.is_empty(), "{events:?}");
     }
 }

@@ -1127,3 +1127,159 @@ fn receiving_a_client_proof_does_not_digest_its_held_matrix_again() {
         "reception {reception:?} is not well under one digest pass {digest_pass:?}"
     );
 }
+
+thread_local! {
+    /// What this thread's events print while [`logged`] captures them.
+    static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Writes into this thread's capture, if any.
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED.with(|captured| {
+            if let Some(bytes) = captured.borrow_mut().as_mut() {
+                bytes.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `run`, and the lines it logged at INFO and above (the node's default),
+/// as an operator reads them. One global subscriber writes each thread's
+/// events into that thread's capture: a scoped subscriber per test lets a
+/// callsite first reached by a parallel test without one be cached as
+/// uninteresting, and its line is then lost.
+fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadCapture)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in these tests");
+    });
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    let out = run();
+    let bytes = CAPTURED
+        .with(|captured| captured.borrow_mut().take())
+        .expect("captured");
+    let lines = String::from_utf8(bytes)
+        .expect("log output is utf-8")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (out, lines)
+}
+
+/// The one line among `lines` that says `what`, at `level`, naming `D`.
+fn the_line<'a>(lines: &'a [String], level: &str, what: &str, digest: &Hash32) -> &'a str {
+    let found: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(what) && line.contains(&hex32(digest)))
+        .collect();
+    assert_eq!(found.len(), 1, "one `{what}` line naming D: {lines:#?}");
+    assert!(found[0].contains(level), "{}", found[0]);
+    found[0]
+}
+
+/// Found on the test network (2026-10-08): the node a registration was
+/// handed to logged nothing at INFO. It says, `D` in hex, whether it held it
+/// (served, for the miner) or refused it, and why.
+#[test]
+fn a_registration_handed_to_this_node_is_logged_with_its_digest() {
+    use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+    let form = test_form();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let rules = rules();
+    let paid = |client: &TestClient| {
+        let registration = objects.registration_of_matrix_file(&client.file).unwrap();
+        let marker = ClientObject::Registration(registration).marker();
+        let license = rules.destination.split(rules.license_micro).burn;
+        payment_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)], 1_000)
+    };
+
+    let client = TestClient::new(&form, 0xCC);
+    let payment = paid(&client);
+    let (held, lines) = logged(|| objects.hold_client_registration(payment, &client.file, &rules));
+    held.unwrap();
+    the_line(&lines, "INFO", "client registration accepted", &client.digest());
+
+    let foreign = TestClient::new(&form, 0x0F);
+    let payment = paid(&foreign);
+    let (refused, lines) = logged(|| objects.hold_client_registration(payment, &foreign.file, &rules));
+    assert!(refused.is_err());
+    let line = the_line(&lines, "INFO", "client registration refused", &foreign.digest());
+    assert!(line.contains("NotInCatalogue"), "{line}");
+}
+
+/// A client proof handed to this node (RPC, relay): admitted or refused, at
+/// INFO, `D` in hex, and why it was refused.
+#[test]
+fn a_client_proof_admission_is_logged_with_its_digest() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCD);
+    let registry = registry_active_from(&client, 500);
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    objects
+        .insert_matrix_file(client.file_id(), &client.file)
+        .unwrap();
+    let submission = client.submission();
+    let bytes = ClientProofBundle::new(
+        submission,
+        payment_of(&submission, 2_000_000),
+        client.proof.clone(),
+    )
+    .unwrap()
+    .encode();
+
+    let (refused, lines) = logged(|| objects.receive_bundle(&bytes, &registry, &rules(), 11));
+    assert!(refused.is_err());
+    let line = the_line(&lines, "INFO", "client proof refused", &client.digest());
+    assert!(line.contains("active from height 500"), "{line}");
+
+    let (admitted, lines) = logged(|| objects.receive_bundle(&bytes, &registry, &rules(), 500));
+    admitted.unwrap();
+    the_line(&lines, "INFO", "client proof admitted", &client.digest());
+}
+
+/// A registered matrix this node lacks: its fetch starts (once, however
+/// often the chain's registry is read: no line per block) and its last
+/// chunk's arrival are logged at INFO with `D`.
+#[test]
+fn a_matrix_fetch_is_logged_once_and_its_arrival_too() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCE);
+    let id = client.file_id();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let ((), lines) = logged(|| {
+        for _ in 0..3 {
+            objects.want_matrices([id]);
+        }
+    });
+    the_line(&lines, "INFO", "fetching registered client matrix", &client.digest());
+
+    let peer = PeerId::random();
+    let (assembled, lines) = logged(|| loop {
+        let fetches = objects.next_requests(&[peer], Instant::now());
+        assert!(!fetches.is_empty(), "the fetch stalled");
+        for fetch in fetches {
+            let bytes = answer_from_file(&client.file, &fetch.request);
+            if let ClientObjectFetched::MatrixAssembled(file) = deliver(&objects, &fetch, &bytes) {
+                return file;
+            }
+        }
+    });
+    assert_eq!(assembled.id(), id);
+    the_line(&lines, "INFO", "registered client matrix received", &client.digest());
+}

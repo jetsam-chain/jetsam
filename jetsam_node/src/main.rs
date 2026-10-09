@@ -8727,7 +8727,11 @@ fn spawn_client_proof_reception(
             }
         };
         if let Err(error) = mempool.check_client_payment(&decoded.payment).await {
-            tracing::info!(%error, "fetched client proof's payment refused");
+            tracing::info!(
+                matrix_digest = %hex::encode(decoded.submission.matrix_digest),
+                %error,
+                "fetched client proof refused: its payment"
+            );
             return;
         }
         let (registry, next_height) = {
@@ -8741,18 +8745,14 @@ fn spawn_client_proof_reception(
             })
         })
         .await;
+        // Admission and refusal are logged by `receive_bundle` (INFO, `D`).
         match received {
             Ok(Ok(Ok(announcement))) => {
-                tracing::info!(
-                    matrix_digest = %hex::encode(announcement.id.submission.matrix_digest),
-                    fee = announcement.fee,
-                    "client proof received and queued"
-                );
                 let _ = p2p_cmd
                     .send(jetsam_p2p::NetworkCommand::AnnounceClientProof { announcement })
                     .await;
             }
-            Ok(Ok(Err(error))) => tracing::info!(%error, "fetched client proof refused"),
+            Ok(Ok(Err(_))) => {}
             Ok(Err(error)) => tracing::warn!(%error, "client proof reception CPU admission failed"),
             Err(error) => tracing::warn!(%error, "client proof reception panicked"),
         }

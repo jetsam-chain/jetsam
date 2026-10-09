@@ -537,7 +537,14 @@ impl ClientObjects {
                 && !state.authenticating.contains(&id)
                 && !self.matrices.holds(&id.matrix_digest)
             {
-                state.fetches.entry(id).or_default();
+                if let std::collections::btree_map::Entry::Vacant(fetch) = state.fetches.entry(id) {
+                    fetch.insert(MatrixFetch::default());
+                    tracing::info!(
+                        matrix_digest = %hex32(&id.matrix_digest),
+                        bytes = id.file_len,
+                        "fetching registered client matrix from peers"
+                    );
+                }
             }
         }
     }
@@ -754,6 +761,12 @@ impl ClientObjects {
                 // fetched again.
                 let fetch = state.fetches.remove(&file).expect("found above");
                 state.authenticating.insert(file);
+                tracing::info!(
+                    matrix_digest = %hex32(&file.matrix_digest),
+                    bytes = file.file_len,
+                    chunks = fetch.chunks.len(),
+                    "registered client matrix received from peers; authenticating it"
+                );
                 Ok(ClientObjectFetched::MatrixAssembled(AssembledMatrixFile {
                     id: file,
                     digests: fetch.manifest.expect("chunks follow the manifest"),
@@ -768,8 +781,37 @@ impl ClientObjects {
     /// `registry`, active at `next_height` (the next block's height: no block
     /// may carry it before) and its matrix held, pre-pass the proof once
     /// (CPU-heavy: run off the reactor), check it is the submission's client,
-    /// and queue it. Returns the announcement for peers.
+    /// and queue it. Returns the announcement for peers. Admission and
+    /// refusal are logged at INFO, `D` in hex.
     pub fn receive_bundle(
+        &self,
+        bytes: &[u8],
+        registry: &ClientRegistryState,
+        rules: &ClientObjectRules,
+        next_height: u64,
+    ) -> Result<ClientProofAnnouncement, ClientObjectsError> {
+        let outcome = self.admit_bundle(bytes, registry, rules, next_height);
+        match &outcome {
+            Ok(announcement) => tracing::info!(
+                matrix_digest = %hex32(&announcement.id.submission.matrix_digest),
+                io_commitment = %hex32(&announcement.id.submission.io_commitment),
+                fee = announcement.fee,
+                queued = self.queued(),
+                "client proof admitted and queued for the miners"
+            ),
+            Err(error) => tracing::info!(
+                matrix_digest = %ClientProofBundle::decode(bytes)
+                    .map(|bundle| hex32(&bundle.submission.matrix_digest))
+                    .unwrap_or_else(|_| "undecodable".into()),
+                %error,
+                "client proof refused"
+            ),
+        }
+        outcome
+    }
+
+    /// [`Self::receive_bundle`], unlogged.
+    fn admit_bundle(
         &self,
         bytes: &[u8],
         registry: &ClientRegistryState,
@@ -873,7 +915,7 @@ impl ClientObjects {
                 &entry.path(),
                 jetsam_p2p::client_object_protocol::MAX_CLIENT_PROOF_BUNDLE_BYTES as u64,
             )?;
-            match self.receive_bundle(&bytes, registry, rules, next_height) {
+            match self.admit_bundle(&bytes, registry, rules, next_height) {
                 Ok(_) => received += 1,
                 Err(error) => {
                     tracing::info!(file = %entry.path().display(), %error, "kept client proof dropped on reload");
@@ -942,14 +984,53 @@ impl ClientObjects {
     /// its license (`check_registration_payment`); the matrix is then held
     /// and served, so the network can fetch it during the activation delay.
     /// The caller checks what depends on the chain (state of the payment,
-    /// registry not full, `D` not registered yet).
+    /// registry not full, `D` not registered yet). Logged at INFO, `D` in
+    /// hex: held, or refused and why.
     pub fn hold_client_registration(
         &self,
         payment: PagedSpendIntent,
         matrix_file: &[u8],
         rules: &ClientObjectRules,
     ) -> Result<ClientRegistration, ClientObjectsError> {
-        let (registration, matrix, digests) = self.open_matrix_file(matrix_file)?;
+        let (registration, matrix, digests) = match self.open_matrix_file(matrix_file) {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::info!(
+                    bytes = matrix_file.len(),
+                    %error,
+                    "client registration refused: the file is not a client matrix"
+                );
+                return Err(error);
+            }
+        };
+        let digest = hex32(&registration.matrix_digest);
+        match self.hold_opened_registration(payment, matrix_file, rules, registration, matrix, digests)
+        {
+            Ok(registration) => {
+                tracing::info!(
+                    matrix_digest = %digest,
+                    matrix_file_root = %hex32(&registration.matrix_file_root),
+                    bytes = registration.matrix_file_len,
+                    "client registration accepted: held for the miners, its matrix served to peers"
+                );
+                Ok(registration)
+            }
+            Err(error) => {
+                tracing::info!(matrix_digest = %digest, %error, "client registration refused");
+                Err(error)
+            }
+        }
+    }
+
+    fn hold_opened_registration(
+        &self,
+        payment: PagedSpendIntent,
+        matrix_file: &[u8],
+        rules: &ClientObjectRules,
+        registration: ClientRegistration,
+        matrix: AuthenticatedClientMatrix,
+        digests: Vec<Hash32>,
+    ) -> Result<ClientRegistration, ClientObjectsError> {
         let pages: Vec<jetsam_tx::Transaction> = payment
             .pages
             .iter()
