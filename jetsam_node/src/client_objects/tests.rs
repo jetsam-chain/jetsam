@@ -605,7 +605,7 @@ fn a_matrix_the_node_waits_for_is_authenticated_at_the_nodes_priority() {
 #[test]
 fn matrices_are_hurried_only_while_a_verification_waits_for_one() {
     let form = test_form();
-    let client = TestClient::new(&form, 0xD1);
+    let client = TestClient::new(&form, 0xC1);
     let directory = tempfile::tempdir().unwrap();
     {
         let objects = open(directory.path(), &form);
@@ -1449,4 +1449,163 @@ fn a_matrix_fetch_is_logged_once_and_its_arrival_too() {
     });
     assert_eq!(assembled.id(), id);
     the_line(&lines, "INFO", "registered client matrix received", &client.digest());
+}
+
+// ---- Review B3: no matrix outside the catalogue and the canonical registry ----
+
+/// Review B3 (v1.5.0): a forged snapshot manifest listed a matrix whose `D`
+/// is in no catalogue (`want_matrices` was called on its registry before any
+/// authentication): it was fetched, authenticated, kept on disk and in RAM,
+/// and authenticated again at every start. None of that happens now.
+#[test]
+fn b3_a_matrix_outside_the_catalogue_is_never_fetched_kept_nor_reloaded() {
+    let form = test_form();
+    let rogue = TestClient::new(&form, 0x77);
+    assert!(!test_catalogue().contains(&rogue.digest()));
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    // A forged manifest's registry lists it: never fetched.
+    objects.want_matrices([rogue.file_id()]);
+    assert!(objects.fetching_matrices().is_empty(), "fetched outside the catalogue");
+    assert!(objects
+        .next_requests(&[PeerId::random()], Instant::now())
+        .is_empty());
+    assert!(!objects.awaits_matrices());
+    // Handed in whole: never kept.
+    assert!(objects.insert_matrix_file(rogue.file_id(), &rogue.file).is_err());
+    assert!(!objects.holds_matrix(&rogue.digest()));
+    assert!(objects.held_matrix_files().is_empty());
+    // Left on disk by an earlier release: set aside at the start (never
+    // deleted), never authenticated again.
+    drop(objects);
+    let name = matrix_file_name(&rogue.file_id());
+    std::fs::write(
+        directory.path().join("client-objects/matrices").join(&name),
+        &rogue.file,
+    )
+    .unwrap();
+    let reopened = open_unauthenticated(directory.path(), &form);
+    assert!(!reopened.awaits_matrices(), "nothing to authenticate");
+    assert_eq!(reopened.authenticate_held_files(), 0);
+    assert!(!reopened.holds_matrix(&rogue.digest()));
+    let aside = directory
+        .path()
+        .join("client-objects")
+        .join(SET_ASIDE_DIR)
+        .join(&name);
+    assert_eq!(std::fs::read(&aside).unwrap(), rogue.file, "moved aside, not deleted");
+    assert!(!directory
+        .path()
+        .join("client-objects/matrices")
+        .join(&name)
+        .exists());
+}
+
+/// Review B3: a registry's worth of fetches at most, none of a length beyond
+/// the cap or of a null root, and a fetch nobody wants any more is dropped.
+#[test]
+fn b3_matrix_fetches_are_bounded_and_expire() {
+    let form = test_form();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    // 64 identities of catalogue digests (a forged registry may name any
+    // root): as many fetches as a registry holds.
+    let many: Vec<MatrixFileId> = test_catalogue()
+        .iter()
+        .flat_map(|digest| {
+            (1u8..=4).map(move |root| MatrixFileId {
+                matrix_digest: *digest,
+                file_root: [root; 32],
+                file_len: 4_096,
+            })
+        })
+        .collect();
+    assert_eq!(many.len(), 64);
+    objects.want_matrices(many.iter().copied());
+    assert_eq!(
+        objects.fetching_matrices().len(),
+        jetsam_chain::consensus::client_objects::CLIENT_REGISTRY_CAPACITY
+    );
+    // Beyond the cap of a registration, or a null root: never fetched.
+    let objects = open(tempfile::tempdir().unwrap().path(), &form);
+    let digest = test_catalogue()[0];
+    objects.want_matrices([
+        MatrixFileId {
+            matrix_digest: digest,
+            file_root: [0x11; 32],
+            file_len: u32::MAX,
+        },
+        MatrixFileId {
+            matrix_digest: digest,
+            file_root: [0u8; 32],
+            file_len: 4_096,
+        },
+    ]);
+    assert!(objects.fetching_matrices().is_empty());
+    // Wanted only while listed: a retired candidate's fetch is dropped.
+    let wanted = MatrixFileId {
+        matrix_digest: digest,
+        file_root: [0x12; 32],
+        file_len: 4_096,
+    };
+    let retired = MatrixFileId {
+        matrix_digest: test_catalogue()[1],
+        file_root: [0x13; 32],
+        file_len: 4_096,
+    };
+    objects.want_only_matrices(&[wanted, retired]);
+    assert_eq!(objects.fetching_matrices().len(), 2);
+    assert!(objects.awaits_matrices());
+    objects.want_only_matrices(&[wanted]);
+    assert_eq!(objects.fetching_matrices(), vec![wanted]);
+    objects.want_only_matrices(&[]);
+    assert!(objects.fetching_matrices().is_empty());
+    assert!(!objects.awaits_matrices());
+}
+
+/// Review B3: at a start, a catalogue matrix held on disk that no entry of
+/// the canonical chain's registry names (fetched for a snapshot candidate
+/// never installed, say) is set aside before any authentication; the
+/// canonical chain's, and the file of a registration this node holds for
+/// its miner, are authenticated again.
+#[test]
+fn b3_at_a_start_only_the_canonical_registrys_matrices_are_authenticated_again() {
+    use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+    let form = test_form();
+    let (canonical, stray) = (TestClient::new(&form, 0xC0), TestClient::new(&form, 0xC9));
+    let registering = TestClient::new(&form, 0xCA);
+    let directory = tempfile::tempdir().unwrap();
+    {
+        let objects = open(directory.path(), &form);
+        objects
+            .insert_matrix_file(canonical.file_id(), &canonical.file)
+            .unwrap();
+        objects.insert_matrix_file(stray.file_id(), &stray.file).unwrap();
+        // `registerClient`: held for this node's miner, its matrix served
+        // to the network during the activation delay.
+        let rules = rules();
+        let registration = objects
+            .registration_of_matrix_file(&registering.file)
+            .unwrap();
+        let marker = ClientObject::Registration(registration).marker();
+        let license = rules.destination.split(rules.license_micro).burn;
+        let payment = payment_paying(&[(CLIENT_LICENSE_BURN_ADDRESS, license), (marker, 0)], 1_000);
+        objects
+            .hold_client_registration(payment, &registering.file, &rules)
+            .unwrap();
+    }
+    let objects = open_unauthenticated(directory.path(), &form);
+    assert!(objects.awaits_matrices());
+    assert_eq!(objects.set_aside_unregistered_files(&registry_of(&[&canonical])), 1);
+    assert_eq!(objects.authenticate_held_files(), 2);
+    assert!(objects.holds_matrix(&canonical.digest()));
+    assert!(objects.holds_matrix(&registering.digest()), "a held registration's matrix is kept");
+    assert!(!objects.holds_matrix(&stray.digest()));
+    assert!(!objects.awaits_matrices());
+    assert!(directory
+        .path()
+        .join("client-objects")
+        .join(SET_ASIDE_DIR)
+        .join(matrix_file_name(&stray.file_id()))
+        .exists());
 }

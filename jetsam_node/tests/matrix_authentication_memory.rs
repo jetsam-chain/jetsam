@@ -82,6 +82,15 @@ static ALLOCATOR: Counting = Counting;
 /// MiB, far above what a decode or a digest allocates on the side.
 const MATRIX_LOG: usize = 16;
 
+/// The public rules with this matrix in the client catalogue: only a listed
+/// `D` is fetched or kept (review B3).
+fn rules_listing(id: &MatrixFileId) -> ClientObjectRules {
+    ClientObjectRules {
+        catalogue: Box::leak(vec![id.matrix_digest].into_boxed_slice()),
+        ..ClientObjectRules::CONSENSUS
+    }
+}
+
 /// A client form of `MATRIX_LOG` rows, a client matrix of it, its file and
 /// its registered identity.
 fn client_matrix() -> (HistoryStepClientForm, MatrixFileId, Vec<u8>) {
@@ -182,7 +191,7 @@ fn a_matrix_file_is_never_held_beside_its_decoded_matrix() {
             directory.path(),
             &form,
             Arc::new(HistoryStepClientMatrixSet::new(&form)),
-            &ClientObjectRules::CONSENSUS,
+            &rules_listing(&id),
         )
         .unwrap(),
     );
@@ -220,7 +229,7 @@ fn a_matrix_file_is_never_held_beside_its_decoded_matrix() {
         directory.path(),
         &form,
         Arc::new(HistoryStepClientMatrixSet::new(&form)),
-        &ClientObjectRules::CONSENSUS,
+        &rules_listing(&id),
     )
     .unwrap();
     let reopened = LIVE.load(Ordering::SeqCst);

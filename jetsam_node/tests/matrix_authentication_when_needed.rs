@@ -36,6 +36,15 @@ use rayon::prelude::*;
 /// lasts seconds on two workers in a debug build.
 const MATRIX_LOG: usize = 15;
 
+/// The public rules with this matrix in the client catalogue: only a listed
+/// `D` is fetched or kept (review B3).
+fn rules_listing(id: &MatrixFileId) -> ClientObjectRules {
+    ClientObjectRules {
+        catalogue: Box::leak(vec![id.matrix_digest].into_boxed_slice()),
+        ..ClientObjectRules::CONSENSUS
+    }
+}
+
 fn client_matrix() -> (HistoryStepClientForm, MatrixFileId, Vec<u8>) {
     let (matrix, _): (FieldR1cs, _) =
         synthetic_satisfiable_bounded_dictionary(MATRIX_LOG, MATRIX_LOG, 0x5EED, 64);
@@ -91,7 +100,7 @@ fn restarted_with(
         directory,
         form,
         Arc::new(HistoryStepClientMatrixSet::new(form)),
-        &ClientObjectRules::CONSENSUS,
+        &rules_listing(id),
     )
     .unwrap();
     assert!(objects.awaits_matrices());

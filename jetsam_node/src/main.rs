@@ -9085,13 +9085,34 @@ async fn tend_client_objects(
         }
     }
     *seen_height = tip_height;
-    objects.want_matrices(
-        registry
-            .entries()
-            .iter()
-            .chain(manifest_registry.into_iter().flat_map(|registry| registry.entries()))
-            .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
-    );
+    // Exactly these, the chain's first (review B3): a fetch nobody wants any
+    // more (a candidate retired, an entry reorganised away) is dropped.
+    let wanted: Vec<_> = registry
+        .entries()
+        .iter()
+        .chain(manifest_registry.into_iter().flat_map(|registry| registry.entries()))
+        .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry)
+        .collect();
+    objects.want_only_matrices(&wanted);
+}
+
+/// The client registry a snapshot manifest announces, if this node may fetch
+/// its matrices before the snapshot is authenticated (review B3): decoded,
+/// for a boundary at or above the v1.5 height (below it a registry is
+/// refused at install). Each entry is then fetched only if the rules allow
+/// this node to keep it (`ClientObjects::want_matrices`).
+fn snapshot_manifest_client_registry(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+) -> Option<jetsam_chain::consensus::client_objects::ClientRegistryState> {
+    jetsam_chain::consensus::client_objects::ClientObjectRules::current()
+        .active_at(manifest.tip_height)
+        .then(|| {
+            jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
+                &manifest.client_registry,
+            )
+            .ok()
+        })
+        .flatten()
 }
 
 /// Authenticate a fetched matrix file off the event loop (M3.8): its decode
@@ -9144,6 +9165,16 @@ fn spawn_held_client_objects_reload(
     next_height: u64,
 ) {
     tokio::task::spawn_blocking(move || {
+        // Nothing the canonical chain does not register (nor a registration
+        // this node holds) is authenticated again: set aside (review B3).
+        let set_aside = objects.set_aside_unregistered_files(&registry);
+        if set_aside > 0 {
+            tracing::warn!(
+                set_aside,
+                "client matrix files on disk that no canonical registry entry names were set \
+                 aside, not authenticated again"
+            );
+        }
         let started = Instant::now();
         let held = objects.authenticate_held_files();
         if held > 0 {
@@ -10111,11 +10142,7 @@ async fn handle_p2p_events(
             // wanted now — a boundary whose matrix is missing has no verdict
             // and is judged again once it is here.
             if let Some(objects) = &client_objects {
-                if let Ok(registry) =
-                    jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
-                        &manifest.client_registry,
-                    )
-                {
+                if let Some(registry) = snapshot_manifest_client_registry(&manifest) {
                     objects.want_matrices(
                         registry
                             .entries()
@@ -15404,12 +15431,9 @@ async fn handle_p2p_events(
             if let Some(objects) = &client_objects {
                 if now.saturating_duration_since(client_objects_tended) >= Duration::from_secs(2) {
                     client_objects_tended = now;
-                    let manifest_registry = pending_manifest.as_ref().and_then(|pending| {
-                        jetsam_chain::consensus::client_objects::ClientRegistryState::decode(
-                            &pending.manifest.client_registry,
-                        )
-                        .ok()
-                    });
+                    let manifest_registry = pending_manifest
+                        .as_ref()
+                        .and_then(|pending| snapshot_manifest_client_registry(&pending.manifest));
                     tend_client_objects(
                         objects,
                         &chain,

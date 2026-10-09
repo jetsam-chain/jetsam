@@ -82,6 +82,13 @@ const MATRIX_CHUNKS_IN_FLIGHT: usize = 4;
 const CLIENT_OBJECT_REQUEST_DEADLINE: Duration = Duration::from_secs(90);
 /// Held registrations (one per block is mined; a registry holds 16).
 const MAX_HELD_REGISTRATIONS: usize = 16;
+/// Matrix files fetched at once: a registry holds 16 (review B3: a forged
+/// snapshot manifest wanted as many as it listed, without bound).
+const MAX_MATRIX_FETCHES: usize =
+    jetsam_chain::consensus::client_objects::CLIENT_REGISTRY_CAPACITY;
+/// Where a matrix file found on disk that no rule allows this node to keep
+/// is moved at startup, never deleted (`client-objects/matrices-set-aside`).
+const SET_ASIDE_DIR: &str = "matrices-set-aside";
 
 /// What went wrong with a client object handed to this node.
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +217,9 @@ pub struct ClientObjects {
     /// A verification waits for a matrix still to be fetched or
     /// authenticated ([`Self::note_matrices_needed`]); cleared once none is.
     needed: AtomicBool,
+    /// The rules a matrix file must satisfy to be fetched or kept: its `D`
+    /// in the catalogue, its length within the cap (review B3).
+    rules: ClientObjectRules,
 }
 
 fn registration_file_name(matrix_digest: &Hash32) -> String {
@@ -439,6 +449,7 @@ impl ClientObjects {
                 registrations: BTreeMap::new(),
             }),
             needed: AtomicBool::new(false),
+            rules: *rules,
         };
         for entry in std::fs::read_dir(&objects.matrix_dir)? {
             let entry = entry?;
@@ -446,6 +457,13 @@ impl ClientObjects {
             let Some(id) = parse_matrix_file_name(&name) else {
                 continue;
             };
+            // A file no rule lets this node keep (its `D` outside the
+            // catalogue, a length beyond the cap) is never authenticated
+            // again: moved aside, not deleted (review B3).
+            if !objects.matrix_file_admissible(&id) {
+                objects.set_aside(&id, &entry.path(), "its D is outside the client catalogue");
+                continue;
+            }
             objects
                 .state
                 .lock()
@@ -492,6 +510,81 @@ impl ClientObjects {
 
     pub fn form(&self) -> &HistoryStepClientForm {
         &self.form
+    }
+
+    /// Whether the rules let this node fetch or keep the matrix file `id`:
+    /// a non-null `D` listed in the client catalogue and a non-null root, a
+    /// length within the cap of a registration (review B3: a forged snapshot
+    /// manifest had any `D`, of any length, fetched, kept and authenticated
+    /// again at every start).
+    fn matrix_file_admissible(&self, id: &MatrixFileId) -> bool {
+        id.matrix_digest != [0u8; 32]
+            && id.file_root != [0u8; 32]
+            && id.file_len != 0
+            && id.file_len <= self.rules.max_matrix_file_bytes.min(CLIENT_MATRIX_MAX_FILE_BYTES)
+            && self.rules.catalogue.contains(&id.matrix_digest)
+    }
+
+    /// Move the matrix file `id` at `path` aside (never delete it): it is
+    /// neither authenticated nor held nor served. Logged at WARN with why.
+    fn set_aside(&self, id: &MatrixFileId, path: &Path, why: &str) {
+        let aside = self
+            .matrix_dir
+            .parent()
+            .map_or_else(|| self.matrix_dir.join(SET_ASIDE_DIR), |root| root.join(SET_ASIDE_DIR));
+        let moved = std::fs::create_dir_all(&aside).and_then(|()| {
+            let target = aside.join(path.file_name().unwrap_or_default());
+            std::fs::rename(path, &target).map(|()| target)
+        });
+        match moved {
+            Ok(target) => tracing::warn!(
+                matrix_digest = %hex32(&id.matrix_digest),
+                bytes = id.file_len,
+                file = %target.display(),
+                why,
+                "client matrix file set aside: this node does not keep it"
+            ),
+            Err(error) => tracing::error!(
+                matrix_digest = %hex32(&id.matrix_digest),
+                file = %path.display(),
+                %error,
+                why,
+                "client matrix file could not be set aside: it is ignored, not deleted"
+            ),
+        }
+    }
+
+    /// At startup, before any matrix file found on disk is authenticated
+    /// again: every file that is neither an entry of the canonical chain's
+    /// `registry` nor the file of a registration this node holds for its
+    /// miner is set aside, not deleted (review B3). Returns how many.
+    pub fn set_aside_unregistered_files(&self, registry: &ClientRegistryState) -> usize {
+        let unregistered: Vec<(MatrixFileId, PathBuf)> = {
+            let mut state = self.state.lock().expect("client objects lock");
+            let held: BTreeSet<MatrixFileId> = state
+                .registrations
+                .values()
+                .map(|held| MatrixFileId::of_registration(&held.registration))
+                .collect();
+            let canonical: BTreeSet<MatrixFileId> =
+                registry.entries().iter().map(MatrixFileId::of_entry).collect();
+            let unregistered: Vec<MatrixFileId> = state
+                .unauthenticated_files
+                .keys()
+                .filter(|id| !canonical.contains(id) && !held.contains(id))
+                .copied()
+                .collect();
+            let unregistered = unregistered
+                .into_iter()
+                .filter_map(|id| state.unauthenticated_files.remove(&id).map(|path| (id, path)))
+                .collect();
+            self.settle_needed(&state);
+            unregistered
+        };
+        for (id, path) in &unregistered {
+            self.set_aside(id, path, "no entry of the canonical chain's registry names it");
+        }
+        unregistered.len()
     }
 
     pub fn matrices(&self) -> &Arc<HistoryStepClientMatrixSet> {
@@ -657,6 +750,13 @@ impl ClientObjects {
         digests: Vec<Hash32>,
         path: PathBuf,
     ) -> Result<(), ClientObjectsError> {
+        // Every path that keeps a matrix ends here: none keeps one the rules
+        // do not allow (review B3).
+        if !self.matrix_file_admissible(&id) {
+            return Err(ClientObjectsError::MatrixFile(
+                "its D is outside the client catalogue, or its length beyond the cap",
+            ));
+        }
         self.matrices
             .insert_authenticated(matrix)
             .map_err(|_| ClientObjectsError::MatrixFile("form shape"))?;
@@ -789,16 +889,37 @@ impl ClientObjects {
 
     /// Fetch every registered matrix in `wanted` this node does not hold
     /// (the chain's registry, or a snapshot candidate's), nor has on disk or
-    /// in hand awaiting authentication.
+    /// in hand awaiting authentication — only those the rules allow it to
+    /// keep (`D` in the catalogue, length within the cap), and never more
+    /// than a registry holds at once (review B3). Callers list the chain's
+    /// registry first: what does not fit waits for a later call.
     pub fn want_matrices(&self, wanted: impl IntoIterator<Item = MatrixFileId>) {
         let mut state = self.state.lock().expect("client objects lock");
         for id in wanted {
+            if !self.matrix_file_admissible(&id) {
+                tracing::debug!(
+                    matrix_digest = %hex32(&id.matrix_digest),
+                    bytes = id.file_len,
+                    "client matrix not fetched: its D is outside the client catalogue, or its \
+                     length beyond the cap"
+                );
+                continue;
+            }
             if !state.held_files.contains_key(&id)
                 && !state.unauthenticated_files.contains_key(&id)
                 && !state.authenticating.contains(&id)
                 && !self.matrices.holds(&id.matrix_digest)
             {
+                let fetching = state.fetches.len();
                 if let std::collections::btree_map::Entry::Vacant(fetch) = state.fetches.entry(id) {
+                    if fetching >= MAX_MATRIX_FETCHES {
+                        tracing::debug!(
+                            matrix_digest = %hex32(&id.matrix_digest),
+                            fetching,
+                            "client matrix not fetched yet: as many fetches as a registry holds"
+                        );
+                        continue;
+                    }
                     fetch.insert(MatrixFetch::default());
                     tracing::info!(
                         matrix_digest = %hex32(&id.matrix_digest),
@@ -808,6 +929,25 @@ impl ClientObjects {
                 }
             }
         }
+    }
+
+    /// [`Self::want_matrices`] for exactly `wanted`: a fetch no longer
+    /// wanted (a snapshot candidate retired, an entry a reorg removed) is
+    /// dropped, its chunks freed, so nothing is fetched for ever.
+    pub fn want_only_matrices(&self, wanted: &[MatrixFileId]) {
+        {
+            let mut state = self.state.lock().expect("client objects lock");
+            let before = state.fetches.len();
+            state.fetches.retain(|id, _| wanted.contains(id));
+            if state.fetches.len() != before {
+                tracing::info!(
+                    dropped = before - state.fetches.len(),
+                    "client matrix fetches no longer wanted dropped"
+                );
+            }
+            self.settle_needed(&state);
+        }
+        self.want_matrices(wanted.iter().copied());
     }
 
     /// Matrix files being fetched.
