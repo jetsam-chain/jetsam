@@ -326,13 +326,27 @@ fn matrix_chunk_digests(file: &[u8]) -> Vec<Hash32> {
     })
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let staged = path.with_extension(format!("tmp-{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+/// Where a file is written before it takes the name `path`.
+fn staged_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("tmp-{}", std::process::id()))
+}
+
+/// Write `parts` to `staged`, in order, synced to disk; each part is freed
+/// once written.
+fn write_staged<P: AsRef<[u8]>>(
+    staged: &Path,
+    parts: impl IntoIterator<Item = P>,
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(staged)?;
+    for part in parts {
+        file.write_all(part.as_ref())?;
     }
+    file.sync_all()
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let staged = staged_path(path);
+    write_staged(&staged, [bytes])?;
     std::fs::rename(&staged, path)
 }
 
@@ -437,12 +451,16 @@ impl ClientObjects {
         &self.matrices
     }
 
-    /// `bytes` decoded as a matrix of the client form, its `D` computed (the
-    /// one structural pass), on the authentication workers.
-    fn open_client_matrix(&self, bytes: &[u8]) -> Option<AuthenticatedClientMatrix> {
+    /// The matrix file read from `artifact` decoded as a matrix of the client
+    /// form, its `D` computed (the one structural pass), on the
+    /// authentication workers.
+    fn open_client_matrix(
+        &self,
+        artifact: &mut (impl Read + Send),
+    ) -> Option<AuthenticatedClientMatrix> {
         on_authentication_workers(|| {
             let matrix = FieldR1cs::read_artifact_unbound(
-                &mut &bytes[..],
+                artifact,
                 self.form.shape(),
                 CLIENT_MATRIX_MAX_FILE_BYTES as usize,
             )
@@ -451,13 +469,14 @@ impl ClientObjects {
         })
     }
 
-    /// `bytes` decoded as the matrix of the registered `D` of `id`.
+    /// The matrix file read from `artifact` decoded as the matrix of the
+    /// registered `D` of `id`.
     fn open_registered_matrix(
         &self,
         id: &MatrixFileId,
-        bytes: &[u8],
+        artifact: &mut (impl Read + Send),
     ) -> Result<AuthenticatedClientMatrix, ClientObjectsError> {
-        self.open_client_matrix(bytes)
+        self.open_client_matrix(artifact)
             .filter(|matrix| matrix.digest() == id.matrix_digest)
             .ok_or(ClientObjectsError::MatrixFile(
                 "not a matrix of the client form with this D",
@@ -479,7 +498,48 @@ impl ClientObjects {
         if matrix_file_root_from_chunk_digests(u64::from(id.file_len), &digests) != id.file_root {
             return Err(ClientObjectsError::MatrixFile("root is not the registered one"));
         }
-        Ok((self.open_registered_matrix(id, bytes)?, digests))
+        Ok((self.open_registered_matrix(id, &mut &bytes[..])?, digests))
+    }
+
+    /// The file at `path` as the registered file `id`, read from disk: its
+    /// length, its root (its chunks read and hashed a few at a time, in
+    /// parallel), then a matrix of the client form whose structural digest
+    /// is `D`, decoded from the file. Its bytes are never in memory whole,
+    /// nor beside its decoded matrix (three times their size) for the whole
+    /// structural digest. Returns the matrix and the chunk digests.
+    fn authenticate_held_file(
+        &self,
+        id: &MatrixFileId,
+        path: &Path,
+    ) -> Result<(AuthenticatedClientMatrix, Vec<Hash32>), ClientObjectsError> {
+        let mut file = std::fs::File::open(path)?;
+        if file.metadata()?.len() != u64::from(id.file_len) || id.file_len == 0 {
+            return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
+        }
+        let digests = on_authentication_workers(|| -> std::io::Result<Vec<Hash32>> {
+            use rayon::prelude::*;
+            let mut digests = Vec::with_capacity(id.chunk_count());
+            let mut chunks = Vec::new();
+            while digests.len() < id.chunk_count() {
+                let first = digests.len();
+                chunks.clear();
+                for index in first..id.chunk_count().min(first + rayon::current_num_threads()) {
+                    let mut chunk = vec![0u8; id.chunk_len(index as u32).expect("a chunk of id")];
+                    file.read_exact(&mut chunk)?;
+                    chunks.push(chunk);
+                }
+                digests.par_extend(chunks.par_iter().enumerate().map(|(offset, chunk)| {
+                    matrix_file_chunk_digest((first + offset) as u32, chunk)
+                }));
+            }
+            Ok(digests)
+        })?;
+        if matrix_file_root_from_chunk_digests(u64::from(id.file_len), &digests) != id.file_root {
+            return Err(ClientObjectsError::MatrixFile("root is not the registered one"));
+        }
+        std::io::Seek::rewind(&mut file)?;
+        let matrix = self.open_registered_matrix(id, &mut std::io::BufReader::new(file))?;
+        Ok((matrix, digests))
     }
 
     /// Hold the authenticated matrix file `id` kept at `path`: inserted for
@@ -542,18 +602,33 @@ impl ClientObjects {
             digests,
             chunks,
         } = assembled;
-        // Each chunk is freed as it is copied.
-        let mut file = Vec::with_capacity(id.file_len as usize);
-        for chunk in chunks {
-            file.extend_from_slice(&chunk);
-        }
-        if file.len() != id.file_len as usize {
+        if chunks.iter().map(Vec::len).sum::<usize>() != id.file_len as usize {
             return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
         }
-        let matrix = self.open_registered_matrix(&id, &file)?;
+        // On disk before it is decoded, each chunk freed once written, then
+        // decoded from there: the file is never copied whole in memory nor
+        // held beside its decoded matrix, three times its size (0.62 GiB for
+        // the 203 MiB file of a batch of 128) for the whole structural
+        // digest. It takes its name once authenticated.
         let path = self.matrix_dir.join(matrix_file_name(&id));
-        write_atomically(&path, &file)?;
-        self.hold_authenticated(id, matrix, digests, path)
+        let staged = staged_path(&path);
+        let authenticated = write_staged(&staged, chunks)
+            .map_err(ClientObjectsError::from)
+            .and_then(|()| {
+                let mut artifact = std::io::BufReader::new(std::fs::File::open(&staged)?);
+                self.open_registered_matrix(&id, &mut artifact)
+            })
+            .and_then(|matrix| {
+                std::fs::rename(&staged, &path)?;
+                Ok(matrix)
+            });
+        match authenticated {
+            Ok(matrix) => self.hold_authenticated(id, matrix, digests, path),
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged);
+                Err(error)
+            }
+        }
     }
 
     /// An assembled file that will not be authenticated (its worker was
@@ -581,9 +656,8 @@ impl ClientObjects {
                 state.authenticating.insert(id);
                 (id, path)
             };
-            let outcome = read_bounded(&path, u64::from(CLIENT_MATRIX_MAX_FILE_BYTES))
-                .map_err(ClientObjectsError::from)
-                .and_then(|bytes| self.authenticate_matrix_file(&id, &bytes))
+            let outcome = self
+                .authenticate_held_file(&id, &path)
                 .and_then(|(matrix, digests)| {
                     self.hold_authenticated(id, matrix, digests, path.clone())
                 });
@@ -1050,7 +1124,7 @@ impl ClientObjects {
             return Err(ClientObjectsError::MatrixFile("length out of bounds"));
         }
         let matrix = self
-            .open_client_matrix(bytes)
+            .open_client_matrix(&mut &bytes[..])
             .ok_or(ClientObjectsError::MatrixFile("not a matrix of the client form"))?;
         let digests = matrix_chunk_digests(bytes);
         let registration = ClientRegistration {
