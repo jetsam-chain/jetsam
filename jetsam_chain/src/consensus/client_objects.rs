@@ -215,7 +215,7 @@ pub const CLIENT_SHORT_ACTIVATION_FROM: Option<u64> = None;
 /// **PROVISIONAL — change it here** (the tip of test network 3 plus a margin,
 /// right before the build).
 #[cfg(feature = "testnet")]
-pub const TESTNET_SHORT_ACTIVATION_HEIGHT: u64 = 1_400;
+pub const TESTNET_SHORT_ACTIVATION_HEIGHT: u64 = 1_347;
 
 /// Activation delay of a registration from [`CLIENT_SHORT_ACTIVATION_FROM`]
 /// on (test network only): 20 blocks (one hour at 180 s).
