@@ -44,6 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -206,6 +207,9 @@ pub struct ClientObjects {
     /// restart keeps what this node's miner was asked to include (M3.10).
     registration_dir: PathBuf,
     state: Mutex<State>,
+    /// A verification waits for a matrix still to be fetched or
+    /// authenticated ([`Self::note_matrices_needed`]); cleared once none is.
+    needed: AtomicBool,
 }
 
 fn registration_file_name(matrix_digest: &Hash32) -> String {
@@ -240,10 +244,22 @@ fn parse_matrix_file_name(name: &str) -> Option<MatrixFileId> {
     })
 }
 
+/// Which workers authenticate a matrix (see [`on_authentication_workers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthenticationPriority {
+    /// Nothing waits for it: the lowest CPU priority, never in the way of a
+    /// block's verification.
+    Background,
+    /// A verification answered "client matrix unavailable" while it was
+    /// pending: the node makes no progress until it is held, so it runs at
+    /// the node's own priority.
+    Needed,
+}
+
 /// Run `operation` (a matrix's decode, structural digest or chunk hashes:
 /// minutes of CPU at 256 MiB on two cores, on every node at once when a
-/// registration is mined) on the workers that authenticate matrices, and
-/// its parallel parts with it.
+/// registration is mined) on the workers that authenticate matrices at
+/// `priority`, and its parallel parts with it.
 ///
 /// Never on the shared pool where blocks are verified and produced: Rayon
 /// runs a job handed to a pool from outside only when its workers find
@@ -251,32 +267,62 @@ fn parse_matrix_file_name(name: &str) -> Option<MatrixFileId> {
 /// authentication ended with it (testnet 3, 2026-10-09: block 1222 verified
 /// in 102.6 s instead of 9-11 s on the two-vCPU seed, during the 95 s
 /// authentication of a 203 MiB matrix). As many workers as the shared pool,
-/// so an idle node authenticates as fast as before, each at the lowest CPU
+/// so an idle node authenticates as fast as before.
+///
+/// [`AuthenticationPriority::Background`] workers run at the lowest CPU
 /// priority Linux has (SCHED_IDLE, below nice 19, which they take as well):
 /// a CPU runs them when nothing else wants it, so a core that verifies or
-/// produces a block leaves them only what it does not use. On other systems
-/// they keep the default priority. If they cannot be started, the caller's
+/// produces a block leaves them only what it does not use. That is right
+/// for a matrix nothing waits for, and wrong for one the node's progress
+/// depends on: a two-vCPU node restarted behind the network judged its
+/// snapshot candidate again and again, refused each time for want of the
+/// matrix, and those judgements left the authentication about 15 % of the
+/// CPUs (testnet 3, 2026-10-09: 630 s instead of 125 s). A thread cannot
+/// leave SCHED_IDLE without privilege, so [`AuthenticationPriority::Needed`]
+/// work runs on workers of its own that keep the node's priority (both sets
+/// are started together by the first caller, never by one of these workers,
+/// whose priority a thread it starts would inherit). On other systems both
+/// keep the default priority. If workers cannot be started, the caller's
 /// thread does the work.
-fn on_authentication_workers<R: Send>(operation: impl FnOnce() -> R + Send) -> R {
-    static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    let workers = WORKERS.get_or_init(|| {
+fn on_authentication_workers<R: Send>(
+    priority: AuthenticationPriority,
+    operation: impl FnOnce() -> R + Send,
+) -> R {
+    static WORKERS: OnceLock<[Option<rayon::ThreadPool>; 2]> = OnceLock::new();
+    let [background, needed] = WORKERS.get_or_init(|| {
         let threads = jetsam_miner::configured_process_cpu_budget()
             .map(|plan| plan.shared_pool_threads)
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|index| format!("jetsam-matrix-auth-{index}"))
-            .start_handler(|_| lowest_cpu_priority())
-            .build()
-            .map_err(|error| {
-                tracing::warn!(
-                    %error,
-                    "client matrix authentication workers not started: matrices are \
-                     authenticated on the caller's thread"
-                )
-            })
-            .ok()
+        let start = |name: &'static str, lowest: bool| {
+            let builder = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(move |index| format!("{name}-{index}"));
+            let builder = if lowest {
+                builder.start_handler(|_| lowest_cpu_priority())
+            } else {
+                builder
+            };
+            builder
+                .build()
+                .map_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        workers = name,
+                        "client matrix authentication workers not started: matrices are \
+                         authenticated on the caller's thread"
+                    )
+                })
+                .ok()
+        };
+        [
+            start("jetsam-matrix-auth", true),
+            start("jetsam-matrix-need", false),
+        ]
     });
+    let workers = match priority {
+        AuthenticationPriority::Background => background,
+        AuthenticationPriority::Needed => needed,
+    };
     match workers {
         Some(workers) => workers.install(operation),
         None => operation(),
@@ -316,9 +362,9 @@ fn lowest_cpu_priority() {}
 /// The digests of a matrix file's chunks, in order (its manifest; the root is
 /// their hash): one pass over the file, its chunks hashed in parallel on the
 /// authentication workers.
-fn matrix_chunk_digests(file: &[u8]) -> Vec<Hash32> {
+fn matrix_chunk_digests(priority: AuthenticationPriority, file: &[u8]) -> Vec<Hash32> {
     use rayon::prelude::*;
-    on_authentication_workers(|| {
+    on_authentication_workers(priority, || {
         file.par_chunks(CLIENT_MATRIX_CHUNK_BYTES)
             .enumerate()
             .map(|(index, chunk)| matrix_file_chunk_digest(index as u32, chunk))
@@ -392,6 +438,7 @@ impl ClientObjects {
                 queue: ClientSubmissionQueue::new(CLIENT_QUEUE_CAPACITY),
                 registrations: BTreeMap::new(),
             }),
+            needed: AtomicBool::new(false),
         };
         for entry in std::fs::read_dir(&objects.matrix_dir)? {
             let entry = entry?;
@@ -451,6 +498,58 @@ impl ClientObjects {
         &self.matrices
     }
 
+    /// The workers the next stage of an authentication runs on: asked again
+    /// at each stage, so a matrix a verification starts waiting for moves to
+    /// the node's priority at its next stage.
+    fn authentication_priority(&self) -> AuthenticationPriority {
+        if self.needed.load(Ordering::Acquire) {
+            AuthenticationPriority::Needed
+        } else {
+            AuthenticationPriority::Background
+        }
+    }
+
+    /// A verification answered "client matrix unavailable" (M3.8: no
+    /// verdict): the node waits for a matrix it has yet to fetch or
+    /// authenticate, so every matrix still to be authenticated is from now on
+    /// authenticated at the node's own CPU priority, not in the background,
+    /// until none is left. Returns whether one is (nothing to hurry
+    /// otherwise). Logged at INFO when it starts.
+    pub fn note_matrices_needed(&self) -> bool {
+        let state = self.state.lock().expect("client objects lock");
+        let pending = Self::pending_matrices(&state);
+        if pending == 0 {
+            return false;
+        }
+        if !self.needed.swap(true, Ordering::AcqRel) {
+            tracing::info!(
+                pending,
+                "a verification waits for client matrices not held yet: they are authenticated \
+                 at the node's CPU priority until they are"
+            );
+        }
+        true
+    }
+
+    /// Whether a matrix is still to be fetched or authenticated (a snapshot
+    /// candidate refused for want of one waits for this to end).
+    pub fn awaits_matrices(&self) -> bool {
+        Self::pending_matrices(&self.state.lock().expect("client objects lock")) > 0
+    }
+
+    /// Matrix files wanted and not held yet: being fetched, found on disk
+    /// and not authenticated again yet, or being authenticated.
+    fn pending_matrices(state: &State) -> usize {
+        state.fetches.len() + state.unauthenticated_files.len() + state.authenticating.len()
+    }
+
+    /// Back to the background once no matrix is pending.
+    fn settle_needed(&self, state: &State) {
+        if Self::pending_matrices(state) == 0 {
+            self.needed.store(false, Ordering::Release);
+        }
+    }
+
     /// The matrix file read from `artifact` decoded as a matrix of the client
     /// form, its `D` computed (the one structural pass), on the
     /// authentication workers.
@@ -458,13 +557,15 @@ impl ClientObjects {
         &self,
         artifact: &mut (impl Read + Send),
     ) -> Option<AuthenticatedClientMatrix> {
-        on_authentication_workers(|| {
-            let matrix = FieldR1cs::read_artifact_unbound(
+        let matrix = on_authentication_workers(self.authentication_priority(), || {
+            FieldR1cs::read_artifact_unbound(
                 artifact,
                 self.form.shape(),
                 CLIENT_MATRIX_MAX_FILE_BYTES as usize,
             )
-            .ok()?;
+            .ok()
+        })?;
+        on_authentication_workers(self.authentication_priority(), || {
             self.matrices.authenticate(Arc::new(matrix)).ok()
         })
     }
@@ -494,7 +595,7 @@ impl ClientObjects {
         if bytes.len() != id.file_len as usize || bytes.is_empty() {
             return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
         }
-        let digests = matrix_chunk_digests(bytes);
+        let digests = matrix_chunk_digests(self.authentication_priority(), bytes);
         if matrix_file_root_from_chunk_digests(u64::from(id.file_len), &digests) != id.file_root {
             return Err(ClientObjectsError::MatrixFile("root is not the registered one"));
         }
@@ -516,24 +617,29 @@ impl ClientObjects {
         if file.metadata()?.len() != u64::from(id.file_len) || id.file_len == 0 {
             return Err(ClientObjectsError::MatrixFile("length is not the registered one"));
         }
-        let digests = on_authentication_workers(|| -> std::io::Result<Vec<Hash32>> {
-            use rayon::prelude::*;
-            let mut digests = Vec::with_capacity(id.chunk_count());
-            let mut chunks = Vec::new();
-            while digests.len() < id.chunk_count() {
-                let first = digests.len();
-                chunks.clear();
-                for index in first..id.chunk_count().min(first + rayon::current_num_threads()) {
-                    let mut chunk = vec![0u8; id.chunk_len(index as u32).expect("a chunk of id")];
-                    file.read_exact(&mut chunk)?;
-                    chunks.push(chunk);
-                }
-                digests.par_extend(chunks.par_iter().enumerate().map(|(offset, chunk)| {
-                    matrix_file_chunk_digest((first + offset) as u32, chunk)
-                }));
-            }
-            Ok(digests)
-        })?;
+        // A few chunks at a time, each batch on the workers of the moment.
+        let mut digests = Vec::with_capacity(id.chunk_count());
+        let mut chunks = Vec::new();
+        while digests.len() < id.chunk_count() {
+            on_authentication_workers(
+                self.authentication_priority(),
+                || -> std::io::Result<()> {
+                    use rayon::prelude::*;
+                    let first = digests.len();
+                    chunks.clear();
+                    for index in first..id.chunk_count().min(first + rayon::current_num_threads()) {
+                        let mut chunk =
+                            vec![0u8; id.chunk_len(index as u32).expect("a chunk of id")];
+                        file.read_exact(&mut chunk)?;
+                        chunks.push(chunk);
+                    }
+                    digests.par_extend(chunks.par_iter().enumerate().map(|(offset, chunk)| {
+                        matrix_file_chunk_digest((first + offset) as u32, chunk)
+                    }));
+                    Ok(())
+                },
+            )?;
+        }
         if matrix_file_root_from_chunk_digests(u64::from(id.file_len), &digests) != id.file_root {
             return Err(ClientObjectsError::MatrixFile("root is not the registered one"));
         }
@@ -561,6 +667,7 @@ impl ClientObjects {
         state.authenticating.remove(&id);
         // Held anew (`registerClient`) before the restart's pass reached it.
         state.unauthenticated_files.remove(&id);
+        self.settle_needed(&state);
         Ok(())
     }
 
@@ -634,11 +741,9 @@ impl ClientObjects {
     /// An assembled file that will not be authenticated (its worker was
     /// refused or lost): no longer awaited, it is fetched again when wanted.
     pub fn forget_assembled(&self, id: &MatrixFileId) {
-        self.state
-            .lock()
-            .expect("client objects lock")
-            .authenticating
-            .remove(id);
+        let mut state = self.state.lock().expect("client objects lock");
+        state.authenticating.remove(id);
+        self.settle_needed(&state);
     }
 
     /// Authenticate again every matrix file `open` found on disk (CPU-heavy:
@@ -1126,7 +1231,7 @@ impl ClientObjects {
         let matrix = self
             .open_client_matrix(&mut &bytes[..])
             .ok_or(ClientObjectsError::MatrixFile("not a matrix of the client form"))?;
-        let digests = matrix_chunk_digests(bytes);
+        let digests = matrix_chunk_digests(self.authentication_priority(), bytes);
         let registration = ClientRegistration {
             matrix_digest: matrix.digest(),
             matrix_file_root: matrix_file_root_from_chunk_digests(bytes.len() as u64, &digests),

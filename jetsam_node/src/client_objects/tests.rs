@@ -516,25 +516,26 @@ fn held_matrix_files_are_authenticated_again_off_the_event_loop_after_a_restart(
 /// node's shared pool, where blocks are verified). On Linux they run at the
 /// lowest CPU priority (nice 19, SCHED_IDLE) and the caller's own priority
 /// is untouched.
+/// The calling thread's nice value and scheduling policy, where they are the
+/// thread's own.
+fn nice() -> Option<(i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getpriority and sched_getscheduler read no memory of ours.
+        Some(unsafe {
+            (
+                libc::getpriority(libc::PRIO_PROCESS as _, 0),
+                libc::sched_getscheduler(0),
+            )
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 #[test]
 fn matrices_are_authenticated_on_their_own_lowest_priority_workers() {
     use rayon::prelude::*;
-    /// The calling thread's nice value and scheduling policy, where they are
-    /// the thread's own.
-    fn nice() -> Option<(i32, i32)> {
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: getpriority and sched_getscheduler read no memory of ours.
-            Some(unsafe {
-                (
-                    libc::getpriority(libc::PRIO_PROCESS as _, 0),
-                    libc::sched_getscheduler(0),
-                )
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        None
-    }
     fn on_authentication_worker() -> bool {
         std::thread::current()
             .name()
@@ -543,7 +544,7 @@ fn matrices_are_authenticated_on_their_own_lowest_priority_workers() {
     let callers = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
     let caller_nice = callers.install(nice);
     let (worker, parallel_parts, worker_nice) = callers.install(|| {
-        on_authentication_workers(|| {
+        on_authentication_workers(AuthenticationPriority::Background, || {
             (
                 on_authentication_worker(),
                 (0..256).into_par_iter().all(|_| on_authentication_worker()),
@@ -561,6 +562,73 @@ fn matrices_are_authenticated_on_their_own_lowest_priority_workers() {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (worker_nice, caller_nice);
+}
+
+/// A matrix the node's progress waits for is authenticated on workers of its
+/// own at the priority of the node, never at the lowest: a thread cannot
+/// leave SCHED_IDLE without privilege, and on two CPUs kept busy judging
+/// the candidate that waits for it, SCHED_IDLE workers get next to nothing
+/// (testnet 3, 2026-10-09: 630 s instead of 125 s).
+#[test]
+fn a_matrix_the_node_waits_for_is_authenticated_at_the_nodes_priority() {
+    use rayon::prelude::*;
+    fn on_needed_worker() -> bool {
+        std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("jetsam-matrix-need-"))
+    }
+    let callers = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let caller_nice = callers.install(nice);
+    let (worker, parallel_parts, worker_nice) = callers.install(|| {
+        on_authentication_workers(AuthenticationPriority::Needed, || {
+            (
+                on_needed_worker(),
+                (0..256).into_par_iter().all(|_| on_needed_worker()),
+                nice(),
+            )
+        })
+    });
+    assert!(worker, "authenticated on the caller's thread");
+    assert!(parallel_parts, "parallel parts ran off the needed authentication workers");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(worker_nice, caller_nice);
+        assert_ne!(worker_nice.map(|(_, policy)| policy), Some(libc::SCHED_IDLE));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (worker_nice, caller_nice);
+}
+
+/// The background is the rule: a matrix is hurried only from the moment a
+/// verification waits for one ("client matrix unavailable") until none is
+/// left to fetch or authenticate, and not at all when none is.
+#[test]
+fn matrices_are_hurried_only_while_a_verification_waits_for_one() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xD1);
+    let directory = tempfile::tempdir().unwrap();
+    {
+        let objects = open(directory.path(), &form);
+        objects.insert_matrix_file(client.file_id(), &client.file).unwrap();
+        assert!(!objects.awaits_matrices());
+        assert!(!objects.note_matrices_needed(), "nothing to hurry");
+        assert_eq!(objects.authentication_priority(), AuthenticationPriority::Background);
+    }
+    let objects = open_unauthenticated(directory.path(), &form);
+    assert!(objects.awaits_matrices(), "a file on disk is not held yet");
+    assert_eq!(objects.authentication_priority(), AuthenticationPriority::Background);
+    assert!(objects.note_matrices_needed());
+    assert_eq!(objects.authentication_priority(), AuthenticationPriority::Needed);
+    assert_eq!(objects.authenticate_held_files(), 1);
+    assert!(objects.holds_matrix(&client.digest()));
+    assert!(!objects.awaits_matrices());
+    assert_eq!(
+        objects.authentication_priority(),
+        AuthenticationPriority::Background,
+        "back to the background once nothing is pending"
+    );
+    assert!(!objects.note_matrices_needed());
+    assert_eq!(objects.authentication_priority(), AuthenticationPriority::Background);
 }
 
 #[test]

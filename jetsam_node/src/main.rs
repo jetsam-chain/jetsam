@@ -3591,6 +3591,67 @@ fn advertised_terminal_peer(
         .min_by_key(|peer| (*peer != preferred, peer.to_bytes()))
 }
 
+/// How long a snapshot candidate or an exact suffix refused only for want of
+/// a registered client matrix (no verdict) waits for the client objects
+/// before it is judged again even though a matrix is still being fetched or
+/// authenticated: a bound, in case a matrix never comes.
+const CLIENT_MATRIX_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
+/// A snapshot candidate, or an exact suffix, refused only because this node
+/// does not hold a registered client matrix yet (M3.8: no verdict) is not
+/// judged again while that matrix is still being fetched or authenticated:
+/// each judgement is seconds of CPU on every core, refused again for the
+/// same reason, and the judgements starved the authentication they were
+/// waiting for (testnet 3, 2026-10-09: a candidate judged every 10 s on two
+/// vCPUs, 51 times; 630 s of authentication instead of 125 s; a node
+/// restarted a few blocks behind did the same with its exact suffix). The
+/// node judges again (a fresh snapshot, toward the network's boundary of the
+/// moment; the suffix it has fetched) once no matrix is pending, or after
+/// [`CLIENT_MATRIX_WAIT_LIMIT`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientMatrixWait {
+    since: Option<Instant>,
+}
+
+/// Why a [`ClientMatrixWait`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientMatrixWaitEnd {
+    /// No matrix is pending any more.
+    Held,
+    /// One still is, after the limit.
+    TimedOut,
+}
+
+impl ClientMatrixWait {
+    /// A candidate or a suffix was refused for want of a matrix that is
+    /// pending.
+    fn begin(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    /// Whether judging again waits now (`awaits_matrices`: a matrix is still
+    /// being fetched or authenticated).
+    fn holds(self, now: Instant, awaits_matrices: bool) -> bool {
+        self.since.is_some_and(|since| {
+            awaits_matrices && now.saturating_duration_since(since) < CLIENT_MATRIX_WAIT_LIMIT
+        })
+    }
+
+    /// The wait ends (once) when it no longer holds.
+    fn end(&mut self, now: Instant, awaits_matrices: bool) -> Option<ClientMatrixWaitEnd> {
+        let since = self.since?;
+        if !awaits_matrices {
+            self.since = None;
+            Some(ClientMatrixWaitEnd::Held)
+        } else if now.saturating_duration_since(since) >= CLIENT_MATRIX_WAIT_LIMIT {
+            self.since = None;
+            Some(ClientMatrixWaitEnd::TimedOut)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapshotHeaderNextAction {
     Fetch { start_height: u64, count: u16 },
@@ -4795,6 +4856,19 @@ fn history_step_verification_failure(
     }
 }
 
+/// Whether a verification answered "client matrix unavailable" (no verdict)
+/// for want of a matrix this node is still fetching or authenticating: if
+/// so, those matrices are from now on authenticated at its own CPU priority
+/// (`ClientObjects::note_matrices_needed`), and the caller waits for them
+/// (`ClientMatrixWait`) rather than judge again.
+fn client_matrices_awaited(
+    objects: Option<&jetsam_node::client_objects::ClientObjects>,
+    error: &impl std::fmt::Display,
+) -> bool {
+    error.to_string().contains(CLIENT_MATRIX_UNAVAILABLE)
+        && objects.is_some_and(|objects| objects.note_matrices_needed())
+}
+
 /// The client lanes a verified terminal publishes, as the chain checks them
 /// (M3.8). `None` under a generation without the client slot.
 fn terminal_client_view(
@@ -5928,6 +6002,8 @@ mod tests {
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
+        Duration, Instant,
+        ClientMatrixWait, ClientMatrixWaitEnd, CLIENT_MATRIX_WAIT_LIMIT,
         CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
@@ -6599,6 +6675,42 @@ mod tests {
             );
         }
         assert_eq!(failures.get(&key), Some(&5));
+    }
+
+    /// A candidate refused for want of a matrix still being fetched or
+    /// authenticated is not planned again until none is pending, within a
+    /// bound; once ended, the wait holds nothing.
+    #[test]
+    fn a_candidate_refused_for_a_pending_matrix_waits_for_it_within_a_bound() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut wait = ClientMatrixWait::default();
+        assert!(!wait.holds(start, true));
+        assert_eq!(wait.end(start, true), None);
+
+        wait.begin(start);
+        assert!(wait.holds(start + 10 * second, true));
+        assert!(
+            !wait.holds(start + 10 * second, false),
+            "nothing pending: nothing to wait for"
+        );
+        assert_eq!(wait.end(start + 10 * second, true), None);
+        assert_eq!(
+            wait.end(start + 11 * second, false),
+            Some(ClientMatrixWaitEnd::Held)
+        );
+        assert!(!wait.holds(start + 12 * second, true));
+        assert_eq!(wait.end(start + 12 * second, false), None, "ended once");
+
+        // Refused again while waiting: the bound counts from the first refusal.
+        wait.begin(start);
+        wait.begin(start + 60 * second);
+        assert!(wait.holds(start + CLIENT_MATRIX_WAIT_LIMIT - second, true));
+        assert!(!wait.holds(start + CLIENT_MATRIX_WAIT_LIMIT, true));
+        assert_eq!(
+            wait.end(start + CLIENT_MATRIX_WAIT_LIMIT, true),
+            Some(ClientMatrixWaitEnd::TimedOut)
+        );
     }
 
     #[test]
@@ -8998,6 +9110,8 @@ async fn handle_p2p_events(
         .unwrap_or_else(Instant::now);
     let mut snapshot_plan_last_progress: Option<Instant> = None;
     let mut snapshot_provider_discovery_rounds = 0u8;
+    let mut snapshot_client_matrix_wait = ClientMatrixWait::default();
+    let mut suffix_client_matrix_wait = ClientMatrixWait::default();
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
     let (snapshot_header_staging_tx, mut snapshot_header_staging_rx) =
@@ -9183,14 +9297,27 @@ async fn handle_p2p_events(
     macro_rules! try_request_manifest {
         ($peer:expr, $requester_height:expr, $digest:expr) => {{
             let peer = $peer;
+            let digest: [u8; 32] = $digest;
             if manifest_requested_peers.contains(&peer) {
+                false
+            } else if digest == [0; 32]
+                && snapshot_client_matrix_wait.holds(
+                    Instant::now(),
+                    client_objects
+                        .as_ref()
+                        .is_some_and(|objects| objects.awaits_matrices()),
+                )
+            {
+                // No new snapshot plan while the last candidate waits for
+                // this node's client matrices (`ClientMatrixWait`).
+                tracing::debug!(peer = %peer, "snapshot manifest held back while client matrices are pending");
                 false
             } else if p2p_cmd
                 .try_send(jetsam_p2p::NetworkCommand::RequestStateManifest {
                     generation: snapshot_sync_generation,
                     peer,
                     requester_height: $requester_height,
-                    requested_manifest_digest: $digest,
+                    requested_manifest_digest: digest,
                 })
                 .is_ok()
             {
@@ -10276,8 +10403,16 @@ async fn handle_p2p_events(
 
     macro_rules! try_start_exact_suffix_apply {
         () => {{
+            // Not while the last suffix waits for this node's client
+            // matrices (`ClientMatrixWait`): the heartbeat starts it then.
             let ready = exact_suffix_apply_inflight.is_none()
                 && !header_dag_faulted
+                && !suffix_client_matrix_wait.holds(
+                    Instant::now(),
+                    client_objects
+                        .as_ref()
+                        .is_some_and(|objects| objects.awaits_matrices()),
+                )
                 && active_suffix_sync
                     .as_ref()
                     .is_some_and(|sync| {
@@ -12408,7 +12543,30 @@ async fn handle_p2p_events(
                     );
                 }
 
+                let plan_waits_for_client_matrices = snapshot_client_matrix_wait.holds(
+                    Instant::now(),
+                    client_objects
+                        .as_ref()
+                        .is_some_and(|objects| objects.awaits_matrices()),
+                );
                 if manifest.tip_height > 0
+                    && pending_manifest.is_none()
+                    && pending_snapshot_header_sync.is_none()
+                    && snapshot_header_staging_inflight.is_none()
+                    && history_step_verification_inflight.is_none()
+                    && snapshot_staging_inflight.is_none()
+                    && snapshot_install_inflight.is_none()
+                    && plan_waits_for_client_matrices
+                {
+                    // Answered after the last candidate was refused for want
+                    // of a client matrix: planned once it is held.
+                    deferred_sync_peer = Some(from);
+                    tracing::debug!(
+                        from = %from,
+                        tip = manifest.tip_height,
+                        "snapshot manifest set aside while client matrices are pending"
+                    );
+                } else if manifest.tip_height > 0
                     && pending_manifest.is_none()
                     && pending_snapshot_header_sync.is_none()
                     && snapshot_header_staging_inflight.is_none()
@@ -13747,6 +13905,17 @@ async fn handle_p2p_events(
                         "header-first exact suffix application completed"
                     );
                     if let Some(error) = applied.trailing_error.take() {
+                        if client_matrices_awaited(client_objects.as_deref(), &error) {
+                            suffix_client_matrix_wait.begin(Instant::now());
+                            tracing::info!(
+                                height = applied.height,
+                                target_height = completed.target.height,
+                                wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
+                                "exact suffix needs registered client matrices this node is still \
+                                 fetching or authenticating (no verdict): judged again once they \
+                                 are held"
+                            );
+                        }
                         let rejected_sources = error.peer_sources().to_vec();
                         let newly_rejected = quarantine_exact_suffix_sources(
                             &mut header_dag,
@@ -13854,6 +14023,16 @@ async fn handle_p2p_events(
                     );
                 }
                 Err(error) => {
+                    if client_matrices_awaited(client_objects.as_deref(), &error) {
+                        suffix_client_matrix_wait.begin(Instant::now());
+                        tracing::info!(
+                            target_height = completed.target.height,
+                            wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
+                            "exact suffix needs registered client matrices this node is still \
+                             fetching or authenticating (no verdict): judged again once they are \
+                             held"
+                        );
+                    }
                     let terminal_rejected = error.is_terminal_fault();
                     let rejected_sources = error.peer_sources().to_vec();
                     if terminal_rejected {
@@ -14547,6 +14726,21 @@ async fn handle_p2p_events(
                         .as_ref()
                         .map(|pending| pending.preferred_peer)
                         .unwrap_or(completed.key.terminal_from);
+                    // No verdict for want of a matrix this node is still
+                    // fetching or authenticating: hurry it, and plan no new
+                    // snapshot until it is held (`ClientMatrixWait`).
+                    if client_matrices_awaited(client_objects.as_deref(), &error) {
+                        snapshot_client_matrix_wait.begin(Instant::now());
+                        tracing::info!(
+                            boundary = completed.key.snapshot.boundary.height,
+                            wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
+                            "snapshot candidate needs registered client matrices this node is \
+                             still fetching or authenticating (no verdict): a fresh snapshot is \
+                             planned once they are held"
+                        );
+                        retire_snapshot_plan!();
+                        continue;
+                    }
                     tracing::warn!(
                         boundary = completed.key.snapshot.boundary.height,
                         terminal_from = %completed.key.terminal_from,
@@ -15027,6 +15221,58 @@ async fn handle_p2p_events(
                 retire_snapshot_plan!();
                 if let Some(failed_peer) = failed_peer {
                     request_bounded_manifest_failover!(failed_peer, false);
+                }
+            }
+
+            // The last exact suffix, or snapshot candidate, waited for client
+            // matrices: once none is pending (or after the bound), judge the
+            // suffix again, or plan a fresh snapshot toward the boundary peers
+            // offer now.
+            let client_matrices_pending = client_objects
+                .as_ref()
+                .is_some_and(|objects| objects.awaits_matrices());
+            if let Some(end) = suffix_client_matrix_wait.end(now, client_matrices_pending) {
+                match end {
+                    ClientMatrixWaitEnd::Held => tracing::info!(
+                        our_height,
+                        "client matrices held: judging the exact suffix again"
+                    ),
+                    ClientMatrixWaitEnd::TimedOut => tracing::warn!(
+                        our_height,
+                        wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
+                        "client matrices still pending after the wait limit: judging the exact \
+                         suffix again anyway"
+                    ),
+                }
+                try_start_exact_suffix_apply!();
+            }
+            if let Some(end) = snapshot_client_matrix_wait.end(now, client_matrices_pending) {
+                match end {
+                    ClientMatrixWaitEnd::Held => tracing::info!(
+                        our_height,
+                        "client matrices held: planning a fresh snapshot"
+                    ),
+                    ClientMatrixWaitEnd::TimedOut => tracing::warn!(
+                        our_height,
+                        wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
+                        "client matrices still pending after the wait limit: planning a fresh \
+                         snapshot anyway"
+                    ),
+                }
+                if !snapshot_plan_active!() {
+                    let peer = manifest_peers
+                        .iter()
+                        .copied()
+                        .filter(|peer| {
+                            !rejected_terminal_peers.contains(peer)
+                                && !finalized_divergent_peers.contains(peer)
+                        })
+                        .min_by_key(|peer| peer.to_bytes());
+                    if let Some(peer) = peer {
+                        if try_request_manifest!(peer, our_height, [0; 32]) {
+                            manifest_force_snapshot_peers.insert(peer);
+                        }
+                    }
                 }
             }
 
