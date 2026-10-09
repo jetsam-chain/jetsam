@@ -1525,31 +1525,100 @@ pub struct TerminalClientView {
     pub registry_leaves: Option<Vec<Digest>>,
 }
 
-/// The registry leaves a v1.5 terminal at the end of `blocks` can publish
-/// at most, on the branch whose registry at `base_height` is `base` (a
-/// registry known at a later height, truncated): `base`'s entries up to
-/// `base_height`, then the registration objects of `blocks` in order, zero
-/// padded. The objects are not judged here (the native rules do it block by
-/// block); this is what a node compares the leaves of a terminal against
-/// **before** it concludes that a live lane whose matrix it lacks has no
-/// verdict: a live lane on a leaf outside this list belongs to a matrix no
-/// honest node will ever serve.
-pub fn registry_leaves_through(
+/// The client state a suffix's bodies leave at its tip, every block judged
+/// ([`judge_suffix_client_objects`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JudgedSuffixClientObjects {
+    /// The registry of the tip's parent, on the suffix's branch.
+    pub tip_parent_registry: ClientRegistryState,
+    /// What the tip's own objects do (its registrations, its submission).
+    pub tip_effect: ClientObjectsEffect,
+}
+
+impl JudgedSuffixClientObjects {
+    /// The registry leaves the tip's terminal must publish
+    /// ([`registry_leaves_after`]).
+    pub fn tip_leaves(&self) -> Vec<Digest> {
+        registry_leaves_after(&self.tip_parent_registry, &self.tip_effect)
+    }
+
+    /// Every native check of the tip's terminal client lanes
+    /// ([`check_terminal_client_view`]), on the suffix's branch.
+    pub fn check_tip_view(
+        &self,
+        view: &TerminalClientView,
+        tip_height: u64,
+        rules: &ClientObjectRules,
+    ) -> Result<(), ClientObjectError> {
+        check_terminal_client_view(
+            view,
+            &self.tip_effect,
+            &self.tip_parent_registry,
+            tip_height,
+            rules,
+        )
+    }
+}
+
+/// Why [`judge_suffix_client_objects`] refused a suffix, and which body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SuffixClientObjectsRefusal {
+    /// Body `index` is not the one its header commits to (`tx_root`): the
+    /// bytes of whoever served it, not the block.
+    BodyNotCommitted { index: usize },
+    /// Block `index` breaks a native client-object rule
+    /// ([`ClientObjectError::condemns_block`] tells the block's fault from
+    /// a relay's tampering with the object section).
+    Refused {
+        index: usize,
+        error: ClientObjectError,
+    },
+}
+
+/// The native client-object rules of block validation
+/// ([`validate_block_client_objects`]) applied to a suffix's bodies, block
+/// by block, on the branch whose registry at `base_header`'s height is
+/// `base` (a registry known at a later height, truncated): a registration
+/// enters the registry only once its block's rules accepted it (closed
+/// catalogue, license, uniqueness, capacity). From the v1.5 height on, each
+/// body is first checked to be the one its header commits to, so a refusal
+/// judges the block, not a relay's bytes.
+///
+/// This is what a node knows of a suffix **before** it concludes that a live
+/// lane whose matrix it lacks has no verdict (review B2: leaves counted from
+/// unjudged bodies let an attacker's own `D`, outside the catalogue, hold
+/// every node without a verdict). Below the v1.5 height a block carries no
+/// object and nothing is refused.
+pub fn judge_suffix_client_objects(
     base: &ClientRegistryState,
-    base_height: u64,
+    base_header: &BlockHeader,
     blocks: &[Block],
-) -> Vec<Digest> {
-    let mut base = base.clone();
-    base.truncate_above(base_height);
-    let mut leaves = base.digests();
-    leaves.extend(blocks.iter().flat_map(|block| {
-        block.client_objects.iter().filter_map(|object| match object {
-            ClientObject::Registration(registration) => Some(registration.matrix_digest),
-            ClientObject::Submission(_) => None,
-        })
-    }));
-    leaves.resize(CLIENT_REGISTRY_CAPACITY.max(leaves.len()), [0u8; 32]);
-    leaves
+    rules: &ClientObjectRules,
+) -> Result<JudgedSuffixClientObjects, SuffixClientObjectsRefusal> {
+    let mut registry = base.clone();
+    registry.truncate_above(base_header.height);
+    let mut tip_parent_registry = registry.clone();
+    let mut tip_effect = ClientObjectsEffect::default();
+    let mut parent = base_header;
+    for (index, block) in blocks.iter().enumerate() {
+        if rules.active_at(block.header.height)
+            && crate::block::try_compute_tx_root(&block.transactions)
+                .map_or(true, |root| root != block.header.tx_root)
+        {
+            return Err(SuffixClientObjectsRefusal::BodyNotCommitted { index });
+        }
+        let effect =
+            validate_block_client_objects(block, &block.client_objects, parent, &registry, rules)
+                .map_err(|error| SuffixClientObjectsRefusal::Refused { index, error })?;
+        tip_parent_registry = registry.clone();
+        registry.apply(&effect);
+        tip_effect = effect;
+        parent = &block.header;
+    }
+    Ok(JudgedSuffixClientObjects {
+        tip_parent_registry,
+        tip_effect,
+    })
 }
 
 /// The registry leaves a v1.5 block must publish: its parent's registered

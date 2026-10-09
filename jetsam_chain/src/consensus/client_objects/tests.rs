@@ -1765,34 +1765,62 @@ fn only_refusals_of_committed_content_condemn_the_block() {
     }
 }
 
-/// The leaves a terminal can publish at the end of a suffix: the branch's
-/// registry at the base (a later registry truncated to it), then the
-/// suffix's registrations in order, zero padded to 16.
+/// `block` as its header commits to it (`tx_root` of its transactions).
+fn committed(mut block: Block) -> Block {
+    block.header.tx_root = crate::block::compute_tx_root(&block.transactions);
+    block
+}
+
+/// The client state a suffix leaves at its tip: the branch's registry at
+/// the base (a later registry truncated to it), then the registrations its
+/// blocks' rules accept, in order; the leaves of the tip zero padded to 16.
 #[test]
-fn the_leaves_through_a_suffix_are_the_base_registry_then_its_registrations() {
+fn the_judged_leaves_through_a_suffix_are_the_base_registry_then_its_accepted_registrations() {
+    let rules = burn_rules();
     // Known at height 260: two entries at 150, one at 250 (above the base).
     let mut known = registry_with(2, 150);
     known.apply(&ClientObjectsEffect {
         registrations: vec![entry(2, 0x30, 250, LicenseSplit::default())],
         ..ClientObjectsEffect::default()
     });
-    let mut first = block_at(201, Vec::new());
+    let mut first = block_at(201, vec![paid_registration(100, registration(0x41))]);
     first.client_objects = vec![ClientObject::Registration(registration(0x41))];
     let second = block_at(202, Vec::new());
-    let mut third = block_at(203, Vec::new());
+    let mut third = block_at(
+        203,
+        vec![
+            paid_registration(200, registration(0x42)),
+            paid_registration(300, registration(0x43)),
+        ],
+    );
     third.client_objects = vec![
-        ClientObject::Submission(submission(0x10, 0x01)),
         ClientObject::Registration(registration(0x42)),
         ClientObject::Registration(registration(0x43)),
     ];
-    let leaves = registry_leaves_through(&known, 200, &[first, second, third]);
+    let judged = judge_suffix_client_objects(
+        &known,
+        &header(200),
+        &[committed(first), committed(second), committed(third)],
+        &rules,
+    )
+    .unwrap();
     let mut expected = vec![digest(0x10), digest(0x11), digest(0x41), digest(0x42), digest(0x43)];
     expected.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
-    assert_eq!(leaves, expected);
+    assert_eq!(judged.tip_leaves(), expected);
+    assert_eq!(
+        judged.tip_parent_registry.digests(),
+        vec![digest(0x10), digest(0x11), digest(0x41)]
+    );
+    assert_eq!(judged.tip_effect.registrations.len(), 2);
     // No suffix: the base registry alone.
     let mut alone = vec![digest(0x10), digest(0x11), digest(0x30)];
     alone.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
-    assert_eq!(registry_leaves_through(&known, 260, &[]), alone);
+    assert_eq!(
+        judge_suffix_client_objects(&known, &header(260), &[], &rules)
+            .unwrap()
+            .tip_leaves(),
+        alone
+    );
 }
 
 // ---- The closed catalogue (decision of 2026-10-04, confirmed 2026-10-07) ----
@@ -2422,4 +2450,194 @@ fn the_test_network_shortens_the_activation_from_its_declared_height() {
         480
     );
     assert_eq!(rules.activation_delay_at(TESTNET_SHORT_ACTIVATION_HEIGHT), 20);
+}
+
+// ---- Review B2: leaves expected of a suffix are judged leaves ----
+
+/// The public profile's rules, armed: an empty catalogue.
+fn empty_catalogue_rules() -> ClientObjectRules {
+    catalogue_rules(&[])
+}
+
+/// The attacker's block of review B2: it registers its own `D` (outside
+/// the catalogue) with a zero-value marker and a fee, and its terminal
+/// publishes that `D` as leaf 0 with a live lane on it.
+fn b2_attacker_block() -> (Block, ClientRegistration) {
+    let object = registration(0x21);
+    let mut attacker = block(vec![logical(
+        400,
+        PAYER,
+        &[(ClientObject::Registration(object).marker(), 0)],
+        required_fee(1, 1),
+    )]);
+    attacker.client_objects = vec![ClientObject::Registration(object)];
+    (committed(attacker), object)
+}
+
+/// Review B2 (v1.5.0): an attacker's block registers its own `D` outside
+/// the (empty, public) catalogue and carries a live lane on it. That
+/// registration is judged before anything is concluded of the terminal: the
+/// block is refused by a rule that condemns it (a verdict), and its `D` is
+/// never a leaf a terminal is compared against.
+#[test]
+fn b2_an_unjudged_registration_is_never_an_expected_leaf() {
+    let (attacker, object) = b2_attacker_block();
+    let refusal = judge_suffix_client_objects(
+        &ClientRegistryState::new(),
+        &header(HEIGHT - 1),
+        std::slice::from_ref(&attacker),
+        &empty_catalogue_rules(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal,
+        SuffixClientObjectsRefusal::Refused {
+            index: 0,
+            error: ClientObjectError::NotInCatalogue {
+                matrix_digest: object.matrix_digest
+            },
+        }
+    );
+    let SuffixClientObjectsRefusal::Refused { error, .. } = refusal else {
+        unreachable!()
+    };
+    assert!(error.condemns_block(), "a verdict on the block, never a wait");
+    // The same block behind an honest one: the honest one passes, the
+    // attacker's is named.
+    let honest = committed(block_at(HEIGHT - 1, Vec::new()));
+    assert!(matches!(
+        judge_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &header(HEIGHT - 2),
+            &[honest, attacker],
+            &empty_catalogue_rules(),
+        ),
+        Err(SuffixClientObjectsRefusal::Refused { index: 1, .. })
+    ));
+}
+
+/// The tip's terminal view is judged against the judged registry: leaves
+/// naming a `D` no accepted registration put there, or a carried client
+/// registered within the activation delay, condemn the tip natively (the
+/// activation delay is a native rule the relation does not enforce).
+#[test]
+fn b2_the_tip_view_is_judged_on_the_judged_registry() {
+    let rules = burn_rules();
+    let judged = judge_suffix_client_objects(
+        &ClientRegistryState::new(),
+        &header(HEIGHT - 1),
+        &[committed(block(Vec::new()))],
+        &rules,
+    )
+    .unwrap();
+    let mut leaves = vec![[0u8; 32]; CLIENT_REGISTRY_CAPACITY];
+    assert_eq!(
+        judged.check_tip_view(
+            &TerminalClientView {
+                carried: None,
+                registry_leaves: Some(leaves.clone()),
+            },
+            HEIGHT,
+            &rules
+        ),
+        Ok(())
+    );
+    leaves[0] = digest(0x21);
+    assert_eq!(
+        judged.check_tip_view(
+            &TerminalClientView {
+                carried: None,
+                registry_leaves: Some(leaves.clone()),
+            },
+            HEIGHT,
+            &rules
+        ),
+        Err(ClientObjectError::RegistryLeavesMismatch)
+    );
+    // A valid registration in the tip itself, and a live lane carried on it
+    // in the same block: refused by the activation delay.
+    let object = registration(0x21);
+    let mut registering = block(vec![paid_registration(100, object)]);
+    registering.client_objects = vec![ClientObject::Registration(object)];
+    let judged = judge_suffix_client_objects(
+        &ClientRegistryState::new(),
+        &header(HEIGHT - 1),
+        &[committed(registering)],
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(judged.tip_leaves()[0], object.matrix_digest);
+    let verdict = judged.check_tip_view(
+        &TerminalClientView {
+            carried: Some(CarriedClient {
+                matrix_digest: object.matrix_digest,
+                io_commitment: digest(0x99),
+            }),
+            registry_leaves: Some(judged.tip_leaves()),
+        },
+        HEIGHT,
+        &rules,
+    );
+    assert!(
+        matches!(verdict, Err(ref error) if error.condemns_block()),
+        "{verdict:?}"
+    );
+}
+
+/// What a relay can do to an honest block's bytes is the relay's fault, not
+/// the block's: an object added to (or dropped from) the uncommitted object
+/// section, or transactions that are not the ones the header commits to.
+#[test]
+fn b2_a_relays_tampering_is_told_from_the_blocks_fault() {
+    let rules = burn_rules();
+    let mut added = block(Vec::new());
+    added.client_objects = vec![ClientObject::Registration(registration(0x21))];
+    let refusal = judge_suffix_client_objects(
+        &ClientRegistryState::new(),
+        &header(HEIGHT - 1),
+        &[committed(added)],
+        &rules,
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal,
+        SuffixClientObjectsRefusal::Refused {
+            index: 0,
+            error: ClientObjectError::ObjectsDoNotMatchMarkers,
+        }
+    );
+    let mut swapped = committed(block(vec![logical(
+        400,
+        PAYER,
+        &[(ClientObject::Registration(registration(0x21)).marker(), 7)],
+        required_fee(1, 1),
+    )]));
+    swapped.header.tx_root = [0x44; 32];
+    assert_eq!(
+        judge_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &header(HEIGHT - 1),
+            &[swapped],
+            &rules,
+        ),
+        Err(SuffixClientObjectsRefusal::BodyNotCommitted { index: 0 })
+    );
+}
+
+/// Below the v1.5 height nothing is judged nor refused (v1.4.3): no object,
+/// no commitment check, the registry as it was.
+#[test]
+fn b2_below_the_v1_5_height_a_suffix_is_not_judged() {
+    let rules = burn_rules();
+    let below = block_at(ACTIVATION - 1, Vec::new());
+    assert_ne!(below.header.tx_root, crate::block::compute_tx_root(&below.transactions));
+    let judged = judge_suffix_client_objects(
+        &registry_with(1, 150),
+        &header(ACTIVATION - 2),
+        &[below],
+        &rules,
+    )
+    .unwrap();
+    assert!(judged.tip_parent_registry.is_empty(), "truncated to the base height");
+    assert_eq!(judged.tip_effect, ClientObjectsEffect::default());
 }

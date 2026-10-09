@@ -5126,28 +5126,88 @@ fn condemn_invalid_block(
 const CLIENT_LANES_CONDEMN_BLOCK: &str = "client lanes condemn the block:";
 
 /// Before a terminal is left without a verdict because a live client lane's
-/// matrix is not held (M3.10): its registry leaves are read (decoded, every
-/// other part of the proof having verified) and compared with what the branch
-/// can have registered by then ([`registry_leaves_through`]). Leaves outside
-/// it name a matrix no honest node will ever serve: the block is refused for
-/// good instead of being judged again forever.
+/// matrix is not held (M3.10): its client lanes are read (decoded, every
+/// other part of the proof having verified) and given every native check of
+/// a tip's lanes against the branch's **judged** client state
+/// ([`judge_suffix_client_objects`]): leaves that are not the registrations
+/// the block rules accepted, a carried client not registered or not active
+/// yet. Any refusal is a verdict on the block (review B2: leaves counted from
+/// unjudged bodies held every node without a verdict, and its miners
+/// paused); only a lane on an accepted, carriable registration whose matrix
+/// this node lacks is left to wait for it.
 fn refuse_unregistered_client_lanes(
     claim: &jetsam_chain::storage::HistoryStepTerminalClaim<'_>,
     runtimes: &EmbeddedHistoryStepRuntimes,
-    expected_leaves: &[[u8; 32]],
+    judged: &jetsam_chain::consensus::client_objects::JudgedSuffixClientObjects,
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
 ) -> Option<String> {
     let runtime = runtimes.for_height(claim.header.height)?;
     let view =
         jetsam_miner::block_production::terminal_client_view_of(runtime, claim.terminal_bytes)
             .ok()?;
-    let leaves = view.registry_leaves?;
-    (leaves.as_slice() != expected_leaves).then(|| {
-        format!(
-            "{CLIENT_LANES_CONDEMN_BLOCK} block {} publishes registry leaves that are not the \
-             branch's (RegistryLeavesMismatch); a live lane on an unregistered leaf has no \
-             matrix to wait for",
-            claim.header.height
-        )
+    client_lanes_condemn_tip(&view, judged, claim.header.height, rules)
+}
+
+/// The verdict of [`refuse_unregistered_client_lanes`] on a decoded view.
+fn client_lanes_condemn_tip(
+    view: &jetsam_chain::consensus::client_objects::TerminalClientView,
+    judged: &jetsam_chain::consensus::client_objects::JudgedSuffixClientObjects,
+    tip_height: u64,
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Option<String> {
+    judged
+        .check_tip_view(view, tip_height, rules)
+        .err()
+        .map(|error| {
+            format!(
+                "{CLIENT_LANES_CONDEMN_BLOCK} block {tip_height} publishes client lanes the \
+                 branch's judged registry refuses ({error}); a live lane there has no matrix \
+                 to wait for"
+            )
+        })
+}
+
+/// The native client-object rules applied to every body of an exact suffix
+/// before its terminal is judged (review B2), on the branch's registry at
+/// the plan base: a refusal is a verdict on the block that carries it (its
+/// header is condemned) or on the bytes a relay served (the source only).
+fn judge_exact_suffix_client_objects(
+    base_registry: &jetsam_chain::consensus::client_objects::ClientRegistryState,
+    base_header: &jetsam_chain::BlockHeader,
+    blocks: &[jetsam_chain::Block],
+    sources: &[libp2p::PeerId],
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Result<jetsam_chain::consensus::client_objects::JudgedSuffixClientObjects, ExactSuffixApplyError>
+{
+    use jetsam_chain::consensus::client_objects::{
+        judge_suffix_client_objects, SuffixClientObjectsRefusal,
+    };
+    judge_suffix_client_objects(base_registry, base_header, blocks, rules).map_err(|refusal| {
+        let (index, fault) = match &refusal {
+            SuffixClientObjectsRefusal::BodyNotCommitted { index } => (*index, None),
+            SuffixClientObjectsRefusal::Refused { index, error } => (*index, Some(error)),
+        };
+        let (Some(block), Some(source)) = (blocks.get(index), sources.get(index).copied()) else {
+            return ExactSuffixApplyError::Other(format!(
+                "exact suffix client objects refused outside the suffix: {refusal:?}"
+            ));
+        };
+        let height = block.header.height;
+        match fault {
+            None => ExactSuffixApplyError::body(
+                source,
+                format!("exact suffix body {height} is not the one its header commits to"),
+            ),
+            Some(error) if error.condemns_block() => ExactSuffixApplyError::invalid(
+                source,
+                format!("exact suffix block {height} refused by a client-object rule: {error}"),
+                &block.header,
+            ),
+            Some(error) => ExactSuffixApplyError::body(
+                source,
+                format!("exact suffix body {height} client objects refused: {error}"),
+            ),
+        }
     })
 }
 
@@ -5302,15 +5362,37 @@ async fn apply_exact_suffix_offthread(
                     .map(|block| block.header)
             }
         };
-        // What the branch can have registered by the tip (M3.10): the leaves a
-        // terminal is compared against before a missing matrix means "wait".
-        let expected_leaves = {
+        // What the branch has registered by the tip (M3.10), every body judged
+        // by the native client-object rules first (review B2): a block they
+        // refuse has its verdict here, before any terminal, and only the
+        // registrations they accept are leaves a terminal is compared against
+        // before a missing matrix means "wait".
+        // Below the v1.5 height a suffix carries no object (v1.4.3 unchanged).
+        let client_rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let judged_client_objects = if !client_rules.active_at(tip_header.height) {
+            jetsam_chain::consensus::client_objects::JudgedSuffixClientObjects {
+                tip_parent_registry: Default::default(),
+                tip_effect: Default::default(),
+            }
+        } else {
             let registry = apply_chain.blocking_read().client_registry().clone();
-            jetsam_chain::consensus::client_objects::registry_leaves_through(
+            let base_header = apply_store
+                .get_header(plan.base().height)
+                .map_err(|error| {
+                    ExactSuffixApplyError::Other(format!("load exact suffix base header: {error}"))
+                })?
+                .ok_or_else(|| {
+                    ExactSuffixApplyError::Other(
+                        "exact suffix base header is missing from canonical storage".into(),
+                    )
+                })?;
+            judge_exact_suffix_client_objects(
                 &registry,
-                plan.base().height,
+                &base_header,
                 &blocks,
-            )
+                &body_sources,
+                &client_rules,
+            )?
         };
         let verified_terminal = jetsam_chain::storage::verify_history_step_terminal_candidate(
             tip_header,
@@ -5326,7 +5408,8 @@ async fn apply_exact_suffix_offthread(
                         Err(refuse_unregistered_client_lanes(
                             claim,
                             &history_step_runtimes,
-                            &expected_leaves,
+                            &judged_client_objects,
+                            &client_rules,
                         )
                         .unwrap_or(message))
                     }
@@ -17151,5 +17234,232 @@ mod condemned_block_tests {
         assert!(!invalid.is_terminal_fault());
         assert_eq!(ExactSuffixApplyError::body(peer, "x").condemned_block(), None);
         assert_eq!(ExactSuffixApplyError::terminal(peer, "x").condemned_block(), None);
+    }
+
+    use jetsam_chain::consensus::client_objects::{
+        ClientObject, ClientObjectRules, ClientRegistration, ClientRegistryState,
+        TerminalClientView, CLIENT_REGISTRY_CAPACITY,
+    };
+    use jetsam_poseidon2b::primitives::Address;
+    use jetsam_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+        PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+    };
+
+    const B2_J: u64 = 100;
+
+    /// The public profile's rules (empty catalogue), armed at `B2_J`.
+    fn b2_rules() -> ClientObjectRules {
+        ClientObjectRules {
+            activation_height: Some(B2_J),
+            catalogue: &[],
+            ..ClientObjectRules::CONSENSUS
+        }
+    }
+
+    fn b2_parent() -> jetsam_chain::BlockHeader {
+        let mut parent = jetsam_chain::consensus::genesis_header();
+        parent.height = B2_J + 99;
+        parent
+    }
+
+    /// A block on `parent` paying, from one input, `outputs`, carrying
+    /// `objects`, as its header commits to it.
+    fn b2_block(
+        parent: &jetsam_chain::BlockHeader,
+        outputs: &[(Address, u64)],
+        objects: Vec<ClientObject>,
+    ) -> jetsam_chain::Block {
+        let mut coinbase_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        coinbase_outputs[0] = TxOutput {
+            slot_index: 15_000_000,
+            amount: 1,
+            owner: Address([9u8; 32]),
+        };
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: jetsam_chain::block_id(parent),
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: coinbase_outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let fee = jetsam_chain::consensus::fee_breakdown(
+            1,
+            outputs.len() as u64,
+            parent.active_slot_count,
+            parent.log_slots,
+        )
+        .required_total;
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 400,
+            amount: outputs.iter().map(|(_, amount)| amount).sum::<u64>() + fee,
+            creation_id: 1,
+        };
+        let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        let mut bitmap = 1 | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT;
+        for (slot, (owner, amount)) in outputs.iter().enumerate() {
+            page_outputs[slot] = TxOutput {
+                slot_index: 401 + slot as u32,
+                amount: *amount,
+                owner: *owner,
+            };
+            bitmap |= output_bitmap_bit(slot);
+        }
+        let payment = Transaction::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee,
+            input_owner: Address([0x51; 32]),
+            inputs,
+            outputs: page_outputs,
+            validity_bitmap: bitmap,
+            is_coinbase: false,
+        });
+        let transactions = vec![coinbase, payment];
+        let mut header = *parent;
+        header.height = parent.height + 1;
+        header.prev_block_hash = jetsam_chain::block_id(parent);
+        header.tx_root = jetsam_chain::compute_tx_root(&transactions);
+        jetsam_chain::Block {
+            header,
+            transactions,
+            client_objects: objects,
+        }
+    }
+
+    /// The attacker's `D` of review B2, outside the (empty) catalogue.
+    fn b2_rogue() -> ClientRegistration {
+        ClientRegistration {
+            matrix_digest: [0x21; 32],
+            matrix_file_root: [0xA1; 32],
+            matrix_file_len: 4_096,
+        }
+    }
+
+    /// Review B2 (v1.5.0): after J an attacker mines a block that registers
+    /// its own `D` outside the empty public catalogue and publishes a live
+    /// lane on it. Before the fix its registration was counted unjudged, the
+    /// leaves matched, the missing matrix was "no verdict", the header stayed
+    /// the best tip and every honest miner paused. Now the bodies are judged
+    /// first: the block is condemned, the HeaderDAG falls back to the honest
+    /// tip, and nothing is left for mining to wait on.
+    #[test]
+    fn b2_an_attackers_registration_condemns_its_block_and_mining_resumes() {
+        use jetsam_node::networking::header_dag::{HeaderDag, ValidatedHeader};
+        use jetsam_node::networking::ChainPoint;
+        let rules = b2_rules();
+        let parent = b2_parent();
+        let rogue = b2_rogue();
+        let attacker = b2_block(
+            &parent,
+            &[(ClientObject::Registration(rogue).marker(), 0)],
+            vec![ClientObject::Registration(rogue)],
+        );
+        let source = libp2p::PeerId::random();
+        let error = judge_exact_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &parent,
+            std::slice::from_ref(&attacker),
+            &[source],
+            &rules,
+        )
+        .expect_err("an off-catalogue registration is refused by its block's rules");
+        let attacker_point =
+            ChainPoint::new(attacker.header.height, jetsam_chain::block_id(&attacker.header));
+        assert_eq!(error.condemned_block(), Some(attacker_point), "{error}");
+        assert_eq!(error.peer_sources(), &[source]);
+        assert!(error.to_string().contains("NotInCatalogue"), "{error}");
+
+        // The attacker's header is the best tip until the verdict ...
+        let committed = ChainPoint::new(parent.height, jetsam_chain::block_id(&parent));
+        let mut dag = HeaderDag::new(committed, [0u8; 32], 16);
+        dag.insert(ValidatedHeader::new_after_consensus_checks(
+            attacker.header,
+            jetsam_chain::add_work(&[0u8; 32], &jetsam_chain::block_work(&attacker.header.difficulty_target)),
+        ))
+        .unwrap();
+        assert_eq!(dag.best_tip(), attacker_point);
+        // ... which condemns it: the committed honest tip is the best again,
+        // so no suffix plan is left in flight and mining resumes.
+        let mut highest_announced = attacker_point.height;
+        condemn_invalid_block(
+            &mut dag,
+            &mut highest_announced,
+            error.condemned_block().unwrap(),
+            parent.height,
+        );
+        assert_eq!(dag.best_tip(), committed);
+        assert_eq!(highest_announced, parent.height);
+        assert!(dag.is_invalid(&attacker_point.hash));
+    }
+
+    /// Review B2, second line: a terminal whose live lane names a `D` no
+    /// accepted registration put in the branch's registry, or that carries a
+    /// client not carriable yet, is a verdict before any "no verdict".
+    #[test]
+    fn b2_lanes_the_judged_registry_refuses_condemn_the_tip() {
+        let rules = b2_rules();
+        let parent = b2_parent();
+        let honest = b2_block(&parent, &[(Address([0x66; 32]), 5)], Vec::new());
+        let judged = judge_exact_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &parent,
+            std::slice::from_ref(&honest),
+            &[libp2p::PeerId::random()],
+            &rules,
+        )
+        .unwrap();
+        let mut leaves = vec![[0u8; 32]; CLIENT_REGISTRY_CAPACITY];
+        let zero = TerminalClientView {
+            carried: None,
+            registry_leaves: Some(leaves.clone()),
+        };
+        assert_eq!(client_lanes_condemn_tip(&zero, &judged, honest.header.height, &rules), None);
+        leaves[0] = b2_rogue().matrix_digest;
+        let rogue_leaf = TerminalClientView {
+            carried: None,
+            registry_leaves: Some(leaves),
+        };
+        let verdict = client_lanes_condemn_tip(&rogue_leaf, &judged, honest.header.height, &rules)
+            .expect("a leaf no accepted registration made");
+        assert!(verdict.contains(CLIENT_LANES_CONDEMN_BLOCK), "{verdict}");
+    }
+
+    /// What a relay does to an honest block's bytes condemns the relay, never
+    /// the header: an object added to the uncommitted object section, or
+    /// transactions the header does not commit to.
+    #[test]
+    fn b2_a_relays_tampering_condemns_the_source_not_the_header() {
+        let rules = b2_rules();
+        let parent = b2_parent();
+        let mut added = b2_block(&parent, &[(Address([0x66; 32]), 5)], Vec::new());
+        added.client_objects = vec![ClientObject::Registration(b2_rogue())];
+        let source = libp2p::PeerId::random();
+        let error = judge_exact_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &parent,
+            std::slice::from_ref(&added),
+            &[source],
+            &rules,
+        )
+        .unwrap_err();
+        assert!(error.is_body_fault() && error.condemned_block().is_none(), "{error}");
+        let mut swapped = b2_block(
+            &parent,
+            &[(ClientObject::Registration(b2_rogue()).marker(), 7)],
+            Vec::new(),
+        );
+        swapped.header.tx_root = [0x44; 32];
+        let error = judge_exact_suffix_client_objects(
+            &ClientRegistryState::new(),
+            &parent,
+            std::slice::from_ref(&swapped),
+            &[source],
+            &rules,
+        )
+        .unwrap_err();
+        assert!(error.is_body_fault() && error.condemned_block().is_none(), "{error}");
     }
 }
