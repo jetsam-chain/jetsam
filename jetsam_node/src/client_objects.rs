@@ -89,6 +89,17 @@ pub enum ClientObjectsError {
     Bundle(String),
     #[error("client {0} is not registered, or its matrix is not held yet")]
     UnknownClient(String),
+    #[error(
+        "client {matrix_digest} is registered but not active yet: the chain is at height \
+         {tip_height}, the client is active from height {active_from} (no block may carry \
+         its proof before); submit it again once the chain reaches height {}",
+        active_from.saturating_sub(1)
+    )]
+    NotYetActive {
+        matrix_digest: String,
+        tip_height: u64,
+        active_from: u64,
+    },
     #[error("client proof does not verify: {0}")]
     Proof(String),
     #[error("registration: {0}")]
@@ -754,19 +765,30 @@ impl ClientObjects {
 
     /// Receive a client proof bundle (fetched, or handed to this node):
     /// decode it under its bounds, check its client is registered with
-    /// `registry` and its matrix held, pre-pass the proof once (CPU-heavy:
-    /// run off the reactor), check it is the submission's client, and queue
-    /// it. Returns the announcement for peers.
+    /// `registry`, active at `next_height` (the next block's height: no block
+    /// may carry it before) and its matrix held, pre-pass the proof once
+    /// (CPU-heavy: run off the reactor), check it is the submission's client,
+    /// and queue it. Returns the announcement for peers.
     pub fn receive_bundle(
         &self,
         bytes: &[u8],
         registry: &ClientRegistryState,
         rules: &ClientObjectRules,
+        next_height: u64,
     ) -> Result<ClientProofAnnouncement, ClientObjectsError> {
         let bundle =
             ClientProofBundle::decode(bytes).map_err(|error| ClientObjectsError::Bundle(error.to_string()))?;
         let id = ClientProofId::of_bytes(bundle.submission, bytes)
             .ok_or_else(|| ClientObjectsError::Bundle("too long".into()))?;
+        if let Some(entry) = registry.entry(&bundle.submission.matrix_digest) {
+            if entry.active_from > next_height {
+                return Err(ClientObjectsError::NotYetActive {
+                    matrix_digest: hex32(&entry.matrix_digest),
+                    tip_height: next_height.saturating_sub(1),
+                    active_from: entry.active_from,
+                });
+            }
+        }
         let fee = jetsam_tx::validate_paged_spend(&bundle.payment.pages)
             .map_err(|_| ClientObjectsError::Bundle("payment is not a logical transaction".into()))?
             .fee;
@@ -832,11 +854,13 @@ impl ClientObjects {
     }
 
     /// Re-read the bundles kept on disk (after a restart) and receive each
-    /// again under `registry`. Bundles that no longer verify are dropped.
+    /// again under `registry`, the next block at `next_height`. Bundles that
+    /// are no longer admissible are dropped.
     pub fn reload_bundles(
         &self,
         registry: &ClientRegistryState,
         rules: &ClientObjectRules,
+        next_height: u64,
     ) -> Result<usize, ClientObjectsError> {
         let mut received = 0usize;
         for entry in std::fs::read_dir(&self.proof_dir)? {
@@ -848,7 +872,7 @@ impl ClientObjects {
                 &entry.path(),
                 jetsam_p2p::client_object_protocol::MAX_CLIENT_PROOF_BUNDLE_BYTES as u64,
             )?;
-            match self.receive_bundle(&bytes, registry, rules) {
+            match self.receive_bundle(&bytes, registry, rules, next_height) {
                 Ok(_) => received += 1,
                 Err(error) => {
                     tracing::info!(file = %entry.path().display(), %error, "kept client proof dropped on reload");
@@ -1153,8 +1177,9 @@ impl jetsam_rpc::client_objects::RpcClientObjects for ClientObjects {
         bundle: &[u8],
         registry: &ClientRegistryState,
         rules: &ClientObjectRules,
+        next_height: u64,
     ) -> Result<ClientProofAnnouncement, String> {
-        self.receive_bundle(bundle, registry, rules)
+        self.receive_bundle(bundle, registry, rules, next_height)
             .map_err(|error| error.to_string())
     }
 

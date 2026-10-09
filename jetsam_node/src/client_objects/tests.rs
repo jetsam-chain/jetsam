@@ -529,7 +529,7 @@ fn a_client_proof_is_received_queued_kept_and_reloaded() {
 
     // Its matrix is not held yet: refused (and fetched by the caller).
     assert!(matches!(
-        objects.receive_bundle(&bytes, &registry, &rules()),
+        objects.receive_bundle(&bytes, &registry, &rules(), 13),
         Err(ClientObjectsError::UnknownClient(_))
     ));
     objects
@@ -537,7 +537,7 @@ fn a_client_proof_is_received_queued_kept_and_reloaded() {
         .unwrap();
     // A client the chain did not register: refused.
     assert!(matches!(
-        objects.receive_bundle(&bytes, &ClientRegistryState::new(), &rules()),
+        objects.receive_bundle(&bytes, &ClientRegistryState::new(), &rules(), 13),
         Err(ClientObjectsError::UnknownClient(_))
     ));
     // A submission naming another IO than the proof's: refused.
@@ -550,11 +550,13 @@ fn a_client_proof_is_received_queued_kept_and_reloaded() {
     )
     .unwrap();
     assert!(matches!(
-        objects.receive_bundle(&forged.encode(), &registry, &rules()),
+        objects.receive_bundle(&forged.encode(), &registry, &rules(), 13),
         Err(ClientObjectsError::Proof(_))
     ));
 
-    let announcement = objects.receive_bundle(&bytes, &registry, &rules()).unwrap();
+    let announcement = objects
+        .receive_bundle(&bytes, &registry, &rules(), 13)
+        .unwrap();
     assert_eq!(announcement.id, bundle.id());
     assert_eq!(announcement.fee, 2_000_000);
     assert_eq!(objects.queued(), 1);
@@ -574,7 +576,7 @@ fn a_client_proof_is_received_queued_kept_and_reloaded() {
     drop(objects);
     let reopened = open(directory.path(), &form);
     assert_eq!(reopened.queued(), 0);
-    assert_eq!(reopened.reload_bundles(&registry, &rules()).unwrap(), 1);
+    assert_eq!(reopened.reload_bundles(&registry, &rules(), 13).unwrap(), 1);
     assert_eq!(reopened.queued(), 1);
 }
 
@@ -941,4 +943,98 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
     eprintln!("authenticate_held_files (off the loop): {:?}", started.elapsed());
     assert!(reopened.holds_matrix(&id.matrix_digest));
     assert_eq!(reopened.held_matrix_files(), vec![*id]);
+}
+
+/// The registry of `client` registered at 10, active from `active_from`.
+fn registry_active_from(client: &TestClient, active_from: u64) -> ClientRegistryState {
+    let mut registry = ClientRegistryState::new();
+    registry.apply(&ClientObjectsEffect {
+        registrations: vec![ClientRegistryEntry {
+            index: 0,
+            matrix_digest: client.digest(),
+            matrix_file_root: client.file_id().file_root,
+            matrix_file_len: client.file_id().file_len,
+            registered_at: 10,
+            active_from,
+            license: LicenseSplit::default(),
+        }],
+        ..ClientObjectsEffect::default()
+    });
+    registry
+}
+
+/// Found reading `submitClientProof` (2026-10-08), established by test: a
+/// client proof whose client is registered but not active yet (before
+/// `active_from`) was admitted (`Ok`, fee returned), queued, kept, announced
+/// and served to peers, while no block may carry it before `active_from` (the
+/// queue skips it, consensus refuses a block carrying it): the caller was told
+/// "accepted" for a proof that waits up to the whole activation delay (a day).
+/// It is refused at admission (RPC, relay, reload), naming `D`, the chain's
+/// height and `active_from`, nothing queued nor kept; from the block that may
+/// carry it, it is admitted.
+#[test]
+fn a_client_proof_is_refused_until_its_client_is_active() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCB);
+    let registry = registry_active_from(&client, 500);
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    objects
+        .insert_matrix_file(client.file_id(), &client.file)
+        .unwrap();
+    let submission = client.submission();
+    let bundle = ClientProofBundle::new(
+        submission,
+        payment_of(&submission, 2_000_000),
+        client.proof.clone(),
+    )
+    .unwrap();
+    let bytes = bundle.encode();
+    let kept = || std::fs::read_dir(directory.path().join("client-objects/proofs")).unwrap().count();
+
+    // The chain is at 10: the next block is 11, the client is carriable from 500.
+    let refused = objects
+        .receive_bundle(&bytes, &registry, &rules(), 11)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            ClientObjectsError::NotYetActive {
+                tip_height: 10,
+                active_from: 500,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    let message = refused.to_string();
+    for fragment in [
+        hex32(&client.digest()),
+        "chain is at height 10".to_string(),
+        "active from height 500".to_string(),
+    ] {
+        assert!(message.contains(&fragment), "{message}");
+    }
+    assert_eq!(objects.queued(), 0);
+    assert_eq!(kept(), 0);
+    assert!(objects
+        .client_object(&ClientObjectRequest::Proof(bundle.id()))
+        .is_none());
+    // The chain is at 498: still one block too early.
+    assert!(matches!(
+        objects.receive_bundle(&bytes, &registry, &rules(), 499),
+        Err(ClientObjectsError::NotYetActive { .. })
+    ));
+
+    // The chain is at 499: the next block may carry it.
+    objects
+        .receive_bundle(&bytes, &registry, &rules(), 500)
+        .unwrap();
+    assert_eq!(objects.queued(), 1);
+    assert_eq!(kept(), 1);
+    // A restart before it is active again drops it.
+    drop(objects);
+    let reopened = open(directory.path(), &form);
+    assert_eq!(reopened.reload_bundles(&registry, &rules(), 11).unwrap(), 0);
+    assert_eq!(reopened.queued(), 0);
 }

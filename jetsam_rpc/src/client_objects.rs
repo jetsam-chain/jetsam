@@ -20,12 +20,14 @@ use serde::{Deserialize, Serialize};
 /// What the node holds of v1.5 client objects, as the RPC reaches it.
 pub trait RpcClientObjects: jetsam_miner::client_slot::MinerClientSource {
     /// Receive one client proof bundle (decode, pre-pass, queue): CPU-heavy,
-    /// called on a blocking worker.
+    /// called on a blocking worker. Refused unless its client is active at
+    /// `next_height`, the height of the next block.
     fn receive_client_proof(
         &self,
         bundle: &[u8],
         registry: &ClientRegistryState,
         rules: &ClientObjectRules,
+        next_height: u64,
     ) -> Result<ClientProofAnnouncement, String>;
 
     /// Hold the registration `matrix_file` makes, paid by `payment`.
@@ -318,6 +320,7 @@ mod tests {
             _bundle: &[u8],
             _registry: &ClientRegistryState,
             _rules: &ClientObjectRules,
+            _next_height: u64,
         ) -> Result<ClientProofAnnouncement, String> {
             unreachable!("not a registration")
         }

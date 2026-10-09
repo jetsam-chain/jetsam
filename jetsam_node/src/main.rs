@@ -2561,6 +2561,7 @@ async fn main() -> anyhow::Result<()> {
                     Arc::clone(&objects),
                     ctx.client_registry().clone(),
                     rules,
+                    tip_height.saturating_add(1),
                 );
                 Some(objects)
             }
@@ -8674,12 +8675,13 @@ fn spawn_held_client_objects_reload(
     objects: Arc<jetsam_node::client_objects::ClientObjects>,
     registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
     rules: jetsam_chain::consensus::client_objects::ClientObjectRules,
+    next_height: u64,
 ) {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         match jetsam_miner::install_inbound_verifier_cpu(|| {
             let held = objects.authenticate_held_files();
-            (held, objects.reload_bundles(&registry, &rules))
+            (held, objects.reload_bundles(&registry, &rules, next_height))
         }) {
             Ok((held, kept)) => {
                 if held > 0 {
@@ -8728,11 +8730,14 @@ fn spawn_client_proof_reception(
             tracing::info!(%error, "fetched client proof's payment refused");
             return;
         }
-        let registry = chain.read().await.client_registry().clone();
+        let (registry, next_height) = {
+            let ctx = chain.read().await;
+            (ctx.client_registry().clone(), ctx.tip_height().saturating_add(1))
+        };
         let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
         let received = tokio::task::spawn_blocking(move || {
             jetsam_miner::install_inbound_verifier_cpu(|| {
-                objects.receive_bundle(&bundle, &registry, &rules)
+                objects.receive_bundle(&bundle, &registry, &rules, next_height)
             })
         })
         .await;

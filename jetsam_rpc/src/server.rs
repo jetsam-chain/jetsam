@@ -2803,9 +2803,10 @@ impl JetsamApiServer for RpcHandler {
             .check_client_payment(&bundle.payment)
             .await
             .map_err(|error| rpc_err(format!("submission payment: {error}")))?;
+        let next_height = tip_height.saturating_add(1);
         let announcement = tokio::task::spawn_blocking(move || {
             jetsam_miner::install_inbound_verifier_cpu(|| {
-                objects.receive_client_proof(&bytes, &registry, &rules)
+                objects.receive_client_proof(&bytes, &registry, &rules, next_height)
             })
             .map_err(|error| error.to_string())?
         })
