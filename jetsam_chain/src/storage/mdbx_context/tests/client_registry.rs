@@ -30,6 +30,8 @@ fn armed_rules() -> ClientObjectRules {
         destination: LicenseDestination::Burn,
         submission_fee_micro: 1_000,
         activation_delay: 2,
+        short_activation_from: None,
+        short_activation_delay: 20,
         dividend_blocks: 4,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,

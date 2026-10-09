@@ -171,7 +171,7 @@ impl<T> ClientSubmissionQueue<T> {
             .values()
             .filter(|queued| {
                 registry
-                    .check_carriable(&queued.candidate.submission.matrix_digest, height)
+                    .check_carriable(&queued.candidate.submission.matrix_digest, height, rules)
                     .is_ok()
             })
             .filter(|queued| anchor_ok(&queued.anchor))

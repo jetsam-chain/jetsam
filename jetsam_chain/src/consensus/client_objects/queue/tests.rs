@@ -25,6 +25,8 @@ fn rules() -> ClientObjectRules {
         destination: LicenseDestination::Burn,
         submission_fee_micro: MICRO_PER_JTM,
         activation_delay: 480,
+        short_activation_from: None,
+        short_activation_delay: 20,
         dividend_blocks: 480,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
@@ -344,4 +346,38 @@ fn expired_payments_are_forgotten() {
     assert_eq!(queue.retain_minable(current), 1);
     assert_eq!(queue.len(), 1);
     assert!(queue.remove(&submission(0x10, 1)).is_some());
+}
+
+/// Test network (2026-10-09): what the miner carries follows the short
+/// activation. 0x12, registered at 220, is stored active from 700; with a
+/// short activation from 650 the block at 650 may carry it, not the one at
+/// 649.
+#[test]
+fn the_miner_carries_a_client_from_its_short_activation() {
+    let short = ClientObjectRules {
+        short_activation_from: Some(650),
+        short_activation_delay: 20,
+        ..rules()
+    };
+    let registry = registry();
+    let mut queue = ClientSubmissionQueue::new(16);
+    queue
+        .insert(
+            candidate(400, submission(0x12, 1), required(1) + MICRO_PER_JTM),
+            &short,
+        )
+        .unwrap();
+    assert!(queue
+        .best(&parent(648), &registry, &short, current)
+        .is_none());
+    assert_eq!(
+        queue
+            .best(&parent(649), &registry, &short, current)
+            .map(|best| best.payload),
+        Some(400)
+    );
+    // Without the short activation it waits for 700.
+    assert!(queue
+        .best(&parent(649), &registry, &rules(), current)
+        .is_none());
 }

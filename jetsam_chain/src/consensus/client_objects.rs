@@ -66,7 +66,9 @@
 //! authenticated against `matrix_file_root`; once complete, its structural
 //! digest must equal `D`. An entry becomes **carriable**
 //! [`CLIENT_ACTIVATION_DELAY_BLOCKS`] blocks after the block that registers it
-//! ([`ClientRegistryEntry::active_from`]): a block carrying it earlier is
+//! ([`ClientRegistryEntry::active_from`]; on the test network, from
+//! [`CLIENT_SHORT_ACTIVATION_FROM`] on, the shorter delay of
+//! [`ClientObjectRules::effective_active_from`]): a block carrying it earlier is
 //! invalid. That delay is the time every node has to fetch the matrix before
 //! any block can need it. A node that must judge a block carrying a carriable
 //! entry whose matrix it does not hold has no verdict yet: it must keep the
@@ -184,6 +186,40 @@ pub const CLIENT_LICENSE_DESTINATION: LicenseDestination = LicenseDestination::B
 ///
 /// **PROVISIONAL**: 480 blocks (one day at 180 s).
 pub const CLIENT_ACTIVATION_DELAY_BLOCKS: u64 = 480;
+
+/// **Test network only**: the height `H` from which the activation delay is
+/// [`CLIENT_SHORT_ACTIVATION_DELAY_BLOCKS`] instead of
+/// [`CLIENT_ACTIVATION_DELAY_BLOCKS`] (decision of 2026-10-09: the test
+/// network runs only our nodes, which fetch a matrix in minutes).
+///
+/// - a registration at `r >= H` stores `active_from = r + 20`;
+/// - a registration at `r < H` keeps its stored `active_from = r + 480` (no
+///   state is rewritten), but is active from
+///   `min(active_from, max(r + 20, H))` ([`ClientObjectRules::client_active_at`]):
+///   below `H` nothing changes, so the blocks already on the chain are
+///   judged as before.
+///
+/// **PROVISIONAL value**: set [`TESTNET_SHORT_ACTIVATION_HEIGHT`] to the
+/// height chosen for the switch right before building the testnet release;
+/// every node of the test network must run the same value.
+#[cfg(feature = "testnet")]
+pub const CLIENT_SHORT_ACTIVATION_FROM: Option<u64> = Some(TESTNET_SHORT_ACTIVATION_HEIGHT);
+
+/// **Public network: none.** Every registration waits
+/// [`CLIENT_ACTIVATION_DELAY_BLOCKS`] blocks, at every height.
+#[cfg(not(feature = "testnet"))]
+pub const CLIENT_SHORT_ACTIVATION_FROM: Option<u64> = None;
+
+/// `H` of [`CLIENT_SHORT_ACTIVATION_FROM`] on the test network.
+///
+/// **PROVISIONAL — change it here** (the tip of test network 3 plus a margin,
+/// right before the build).
+#[cfg(feature = "testnet")]
+pub const TESTNET_SHORT_ACTIVATION_HEIGHT: u64 = 1_400;
+
+/// Activation delay of a registration from [`CLIENT_SHORT_ACTIVATION_FROM`]
+/// on (test network only): 20 blocks (one hour at 180 s).
+pub const CLIENT_SHORT_ACTIVATION_DELAY_BLOCKS: u64 = 20;
 
 /// Blocks over which a license share owed to miners is re-issued (variants
 /// `Miners` and `BurnAndMiners` only).
@@ -351,6 +387,10 @@ pub struct ClientObjectRules {
     pub destination: LicenseDestination,
     pub submission_fee_micro: u64,
     pub activation_delay: u64,
+    /// Height from which [`Self::short_activation_delay`] replaces
+    /// [`Self::activation_delay`] ([`CLIENT_SHORT_ACTIVATION_FROM`]).
+    pub short_activation_from: Option<u64>,
+    pub short_activation_delay: u64,
     pub dividend_blocks: u64,
     pub registry_capacity: usize,
     pub max_matrix_file_bytes: u32,
@@ -366,6 +406,8 @@ impl ClientObjectRules {
         destination: CLIENT_LICENSE_DESTINATION,
         submission_fee_micro: CLIENT_SUBMISSION_FEE_MICRO,
         activation_delay: CLIENT_ACTIVATION_DELAY_BLOCKS,
+        short_activation_from: CLIENT_SHORT_ACTIVATION_FROM,
+        short_activation_delay: CLIENT_SHORT_ACTIVATION_DELAY_BLOCKS,
         dividend_blocks: CLIENT_LICENSE_DIVIDEND_BLOCKS,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
@@ -375,6 +417,39 @@ impl ClientObjectRules {
     /// Whether `height` is governed by the v1.5 client-object rules.
     pub const fn active_at(&self, height: u64) -> bool {
         matches!(self.activation_height, Some(activation) if height >= activation)
+    }
+
+    /// The activation delay of a registration at `registered_at`: the
+    /// `active_from` it stores is `registered_at` plus this.
+    pub fn activation_delay_at(&self, registered_at: u64) -> u64 {
+        match self.short_activation_from {
+            Some(from) if registered_at >= from => self.short_activation_delay,
+            _ => self.activation_delay,
+        }
+    }
+
+    /// The first height at which a block may carry `entry`: its stored
+    /// `active_from`, or earlier under a short activation
+    /// ([`CLIENT_SHORT_ACTIVATION_FROM`]): `min(active_from, max(r + short
+    /// delay, H))`, which is `active_from` itself for a registration at
+    /// `r >= H` and never below `H` otherwise.
+    pub fn effective_active_from(&self, entry: &ClientRegistryEntry) -> u64 {
+        match self.short_activation_from {
+            None => entry.active_from,
+            Some(from) => entry.active_from.min(
+                entry
+                    .registered_at
+                    .saturating_add(self.short_activation_delay)
+                    .max(from),
+            ),
+        }
+    }
+
+    /// Whether a block at `height` may carry `entry`: THE activation
+    /// predicate, used by block validation, admission, relay, the miner's
+    /// choice and the RPC listing alike.
+    pub fn client_active_at(&self, entry: &ClientRegistryEntry, height: u64) -> bool {
+        height >= self.effective_active_from(entry)
     }
 
     /// The rules in force: [`Self::CONSENSUS`]. In this crate's own unit
@@ -771,31 +846,37 @@ impl ClientRegistryState {
             .find(|entry| entry.matrix_digest == *matrix_digest)
     }
 
-    /// The entry a block at `height` may carry: registered, and active.
+    /// The entry a block at `height` may carry: registered, and active
+    /// ([`ClientObjectRules::client_active_at`]).
     pub fn check_carriable(
         &self,
         matrix_digest: &Digest,
         height: u64,
+        rules: &ClientObjectRules,
     ) -> Result<&ClientRegistryEntry, ClientObjectError> {
         let entry = self
             .entry(matrix_digest)
             .ok_or(ClientObjectError::ClientNotRegistered {
                 matrix_digest: *matrix_digest,
             })?;
-        if entry.active_from > height {
+        if !rules.client_active_at(entry, height) {
             return Err(ClientObjectError::ClientNotYetActive {
                 matrix_digest: *matrix_digest,
-                active_from: entry.active_from,
+                active_from: rules.effective_active_from(entry),
             });
         }
         Ok(entry)
     }
 
     /// Entries whose matrix a node must hold to judge a block at `height`.
-    pub fn carriable_at(&self, height: u64) -> impl Iterator<Item = &ClientRegistryEntry> {
+    pub fn carriable_at<'a>(
+        &'a self,
+        height: u64,
+        rules: &'a ClientObjectRules,
+    ) -> impl Iterator<Item = &'a ClientRegistryEntry> {
         self.entries
             .iter()
-            .filter(move |entry| entry.active_from <= height)
+            .filter(move |entry| rules.client_active_at(entry, height))
     }
 
     /// Append one block's registrations (the effect of a validated block).
@@ -1212,7 +1293,7 @@ pub fn validate_block_client_objects(
                     matrix_file_root: registration.matrix_file_root,
                     matrix_file_len: registration.matrix_file_len,
                     registered_at: height,
-                    active_from: height.saturating_add(rules.activation_delay),
+                    active_from: height.saturating_add(rules.activation_delay_at(height)),
                     license: split,
                 });
             }
@@ -1220,7 +1301,7 @@ pub fn validate_block_client_objects(
                 if effect.submission.is_some() {
                     return Err(ClientObjectError::TooManySubmissions);
                 }
-                registry.check_carriable(&submission.matrix_digest, height)?;
+                registry.check_carriable(&submission.matrix_digest, height, rules)?;
                 let required = fee_breakdown(
                     u64::from(group.spend.live_inputs),
                     u64::from(group.spend.live_outputs),
@@ -1406,6 +1487,7 @@ pub fn check_carried_client(
     carried: Option<CarriedClient>,
     registry: &ClientRegistryState,
     height: u64,
+    rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
     if let Some(submission) = effect.submission {
         match carried {
@@ -1416,7 +1498,7 @@ pub fn check_carried_client(
         }
     }
     if let Some(client) = carried {
-        registry.check_carriable(&client.matrix_digest, height)?;
+        registry.check_carriable(&client.matrix_digest, height, rules)?;
     }
     Ok(())
 }
@@ -1508,7 +1590,7 @@ pub fn check_terminal_client_view(
     if *leaves != registry_leaves_after(parent_registry, effect) {
         return Err(ClientObjectError::RegistryLeavesMismatch);
     }
-    check_carried_client(effect, view.carried, parent_registry, height)
+    check_carried_client(effect, view.carried, parent_registry, height, rules)
 }
 
 /// Authenticate the client registry a state snapshot carries (M3.8) against
@@ -1526,7 +1608,8 @@ pub fn check_terminal_client_view(
 ///   ≤ alloc(r)`, with `J ≤ r ≤ F` — this authenticates `D`, the file root and
 ///   length, and `registered_at`; the entries' indices follow the order their
 ///   markers were minted in (several per block are possible);
-/// - `active_from` and the license are what the rules give at `r`;
+/// - `active_from` and the license are what the rules give at `r`
+///   ([`ClientObjectRules::activation_delay_at`]);
 /// - every registration marker minted after the v1.5 height opens an entry:
 ///   the registry omits none (they are counted while the slots stream past).
 ///
@@ -1602,7 +1685,7 @@ impl<'a> SnapshotRegistryCheck<'a> {
                 return refuse("entries out of registration order");
             }
             previous = Some(height);
-            if entry.active_from != height.saturating_add(rules.activation_delay)
+            if entry.active_from != height.saturating_add(rules.activation_delay_at(height))
                 || entry.license != split
             {
                 return refuse("an activation or a license the rules do not give");

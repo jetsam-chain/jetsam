@@ -60,7 +60,14 @@ pub struct ClientEntryInfo {
     pub matrix_file_root: String,
     pub matrix_file_len: u32,
     pub registered_at: u64,
+    /// The first height a block may carry a client of this entry
+    /// ([`ClientObjectRules::effective_active_from`]): on the test network,
+    /// from its short activation on, earlier than the stored one.
     pub active_from: u64,
+    /// The `active_from` the registry stores (registration height plus the
+    /// delay in force then).
+    #[serde(default)]
+    pub stored_active_from: u64,
     /// Whether the next block may carry a client of this entry.
     pub carriable: bool,
     /// Whether this node holds its matrix (it needs it to judge any tip
@@ -237,8 +244,9 @@ pub fn client_list(
                 matrix_file_root: hex::encode(entry.matrix_file_root),
                 matrix_file_len: entry.matrix_file_len,
                 registered_at: entry.registered_at,
-                active_from: entry.active_from,
-                carriable: rules.active_at(next_height) && entry.active_from <= next_height,
+                active_from: rules.effective_active_from(entry),
+                stored_active_from: entry.active_from,
+                carriable: rules.active_at(next_height) && rules.client_active_at(entry, next_height),
                 matrix_held: holds(&entry.matrix_digest),
                 license_burned_micro_jtm: entry.license.burn,
                 license_miners_micro_jtm: entry.license.miners,
@@ -586,5 +594,46 @@ mod tests {
             None,
         );
         assert!(dormant.entries.iter().all(|entry| !entry.carriable));
+    }
+
+    /// Test network (2026-10-09): the listing shows the height a client is
+    /// EFFECTIVELY active from (`active_from`), and the activation the
+    /// registry stores (`stored_active_from`); `carriable` follows the
+    /// effective one. Registered at 971 (stored 1451) and 1219 (stored
+    /// 1699) under a short activation from 1312: both from 1312.
+    #[test]
+    fn the_listing_shows_the_effective_activation() {
+        let rules = ClientObjectRules {
+            activation_height: Some(100),
+            short_activation_from: Some(1_312),
+            short_activation_delay: 20,
+            ..ClientObjectRules::CONSENSUS
+        };
+        let entry = |index: u8, registered_at: u64| ClientRegistryEntry {
+            index,
+            matrix_digest: [0xD1 + index; 32],
+            matrix_file_root: [0xF1; 32],
+            matrix_file_len: 4_096,
+            registered_at,
+            active_from: registered_at + 480,
+            license: LicenseSplit::default(),
+        };
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&ClientObjectsEffect {
+            registrations: vec![entry(0, 971), entry(1, 1219)],
+            ..ClientObjectsEffect::default()
+        });
+        let before = client_list(&registry, 1_310, &rules, |_| true, None);
+        let at = client_list(&registry, 1_311, &rules, |_| true, None);
+        for (listing, carriable) in [(&before, false), (&at, true)] {
+            assert_eq!(
+                listing
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.active_from, entry.stored_active_from, entry.carriable))
+                    .collect::<Vec<_>>(),
+                vec![(1_312, 1_451, carriable), (1_312, 1_699, carriable)]
+            );
+        }
     }
 }

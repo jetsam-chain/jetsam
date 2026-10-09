@@ -1091,6 +1091,53 @@ fn a_client_proof_is_refused_until_its_client_is_active() {
     assert_eq!(reopened.queued(), 0);
 }
 
+/// Test network (2026-10-09): admission follows the short activation. The
+/// client registered at 10 is stored active from 500; with a short
+/// activation from 300 its proof is refused until the next block is 300,
+/// naming 300, and admitted from it.
+#[test]
+fn a_client_proof_is_admitted_from_its_short_activation() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xCB);
+    let registry = registry_active_from(&client, 500);
+    let rules = ClientObjectRules {
+        short_activation_from: Some(300),
+        short_activation_delay: 20,
+        ..rules()
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    objects
+        .insert_matrix_file(client.file_id(), &client.file)
+        .unwrap();
+    let submission = client.submission();
+    let bytes = ClientProofBundle::new(
+        submission,
+        payment_of(&submission, 2_000_000),
+        client.proof.clone(),
+    )
+    .unwrap()
+    .encode();
+    let refused = objects
+        .receive_bundle(&bytes, &registry, &rules, 299)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            ClientObjectsError::NotYetActive {
+                tip_height: 298,
+                active_from: 300,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    objects
+        .receive_bundle(&bytes, &registry, &rules, 300)
+        .unwrap();
+    assert_eq!(objects.queued(), 1);
+}
+
 /// v1.5.0 (2026-10-08): receiving one client proof of a held 203 MiB matrix
 /// cost 5.5 s on 32 threads and 84 s on two cores, 93 % of it digesting the
 /// matrix again (`D`), although the node authenticated it, once, when it was

@@ -23,6 +23,8 @@ fn rules(destination: LicenseDestination) -> ClientObjectRules {
         destination,
         submission_fee_micro: MICRO_PER_JTM,
         activation_delay: 480,
+        short_activation_from: None,
+        short_activation_delay: 20,
         dividend_blocks: 480,
         registry_capacity: CLIENT_REGISTRY_CAPACITY,
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
@@ -547,24 +549,24 @@ fn an_entry_is_carriable_only_once_active() {
     let registry = registry_with(1, 150);
     let d = digest(0x10);
     assert_eq!(
-        registry.check_carriable(&d, 629),
+        registry.check_carriable(&d, 629, &burn_rules()),
         Err(ClientObjectError::ClientNotYetActive {
             matrix_digest: d,
             active_from: 630
         })
     );
     assert_eq!(
-        registry.check_carriable(&d, 630).map(|entry| entry.index),
+        registry.check_carriable(&d, 630, &burn_rules()).map(|entry| entry.index),
         Ok(0)
     );
     assert_eq!(
-        registry.check_carriable(&digest(0x77), 630),
+        registry.check_carriable(&digest(0x77), 630, &burn_rules()),
         Err(ClientObjectError::ClientNotRegistered {
             matrix_digest: digest(0x77)
         })
     );
-    assert_eq!(registry.carriable_at(629).count(), 0);
-    assert_eq!(registry.carriable_at(630).count(), 1);
+    assert_eq!(registry.carriable_at(629, &burn_rules()).count(), 0);
+    assert_eq!(registry.carriable_at(630, &burn_rules()).count(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,11 +1382,11 @@ fn a_paid_submission_must_be_the_carried_client() {
         io_commitment: digest(0x99),
     };
     assert_eq!(
-        check_carried_client(&effect, Some(carried), &registry, 600),
+        check_carried_client(&effect, Some(carried), &registry, 600, &burn_rules()),
         Ok(())
     );
     assert_eq!(
-        check_carried_client(&effect, None, &registry, 600),
+        check_carried_client(&effect, None, &registry, 600, &burn_rules()),
         Err(ClientObjectError::SubmissionNotCarried)
     );
     for other in [
@@ -1398,20 +1400,20 @@ fn a_paid_submission_must_be_the_carried_client() {
         },
     ] {
         assert_eq!(
-            check_carried_client(&effect, Some(other), &registry, 600),
+            check_carried_client(&effect, Some(other), &registry, 600, &burn_rules()),
             Err(ClientObjectError::SubmissionNotCarried)
         );
     }
 
     // Carried without payment: the miner's gift, if the client is carriable.
     let none = ClientObjectsEffect::default();
-    assert_eq!(check_carried_client(&none, None, &registry, 600), Ok(()));
+    assert_eq!(check_carried_client(&none, None, &registry, 600, &burn_rules()), Ok(()));
     assert_eq!(
-        check_carried_client(&none, Some(carried), &registry, 600),
+        check_carried_client(&none, Some(carried), &registry, 600, &burn_rules()),
         Ok(())
     );
     assert_eq!(
-        check_carried_client(&none, Some(carried), &registry, 579),
+        check_carried_client(&none, Some(carried), &registry, 579, &burn_rules()),
         Err(ClientObjectError::ClientNotYetActive {
             matrix_digest: digest(0x10),
             active_from: 580
@@ -1422,7 +1424,7 @@ fn a_paid_submission_must_be_the_carried_client() {
         ..carried
     };
     assert_eq!(
-        check_carried_client(&none, Some(stranger), &registry, 600),
+        check_carried_client(&none, Some(stranger), &registry, 600, &burn_rules()),
         Err(ClientObjectError::ClientNotRegistered {
             matrix_digest: digest(0x55)
         })
@@ -2122,4 +2124,283 @@ fn a_refusal_names_digests_in_hex() {
     let locked = ClientObjectError::SpendFromLockedAddress { owner }.to_string();
     assert!(locked.contains(&owner.to_bech32()), "{locked}");
     assert!(!locked.contains("171"), "{locked}");
+}
+
+// ---------------------------------------------------------------------------
+// Test network: the short activation (2026-10-09)
+// ---------------------------------------------------------------------------
+
+/// `H` of these tests: the first height of the short activation.
+const SHORT_FROM: u64 = 1_312;
+
+/// The burn rules with a short activation from [`SHORT_FROM`].
+fn short_rules() -> ClientObjectRules {
+    ClientObjectRules {
+        short_activation_from: Some(SHORT_FROM),
+        short_activation_delay: 20,
+        ..burn_rules()
+    }
+}
+
+/// The two registrations of test network 3, under the 480-block delay:
+/// registered at 971 (active from 1451) and at 1219 (active from 1699).
+fn testnet_3_registry() -> ClientRegistryState {
+    snapshot_registry(&[snapshot_entry(0, 0x21, 971), snapshot_entry(1, 0x22, 1219)])
+}
+
+#[test]
+fn clients_registered_before_the_short_activation_become_active_at_it() {
+    let rules = short_rules();
+    let registry = testnet_3_registry();
+    for (byte, stored) in [(0x21, 1451), (0x22, 1699)] {
+        let entry = *registry.entry(&digest(byte)).unwrap();
+        // The state is not rewritten: the stored activation stays.
+        assert_eq!(entry.active_from, stored);
+        assert_eq!(rules.effective_active_from(&entry), SHORT_FROM);
+        assert!(!rules.client_active_at(&entry, SHORT_FROM - 1));
+        assert!(rules.client_active_at(&entry, SHORT_FROM));
+        assert_eq!(
+            registry.check_carriable(&digest(byte), SHORT_FROM - 1, &rules),
+            Err(ClientObjectError::ClientNotYetActive {
+                matrix_digest: digest(byte),
+                active_from: SHORT_FROM,
+            })
+        );
+        assert_eq!(
+            registry
+                .check_carriable(&digest(byte), SHORT_FROM, &rules)
+                .map(|entry| entry.index),
+            Ok(entry.index)
+        );
+    }
+    assert_eq!(registry.carriable_at(SHORT_FROM - 1, &rules).count(), 0);
+    assert_eq!(registry.carriable_at(SHORT_FROM, &rules).count(), 2);
+    // Registered less than 20 blocks before H: active 20 blocks after it.
+    let late = snapshot_entry(0, 0x23, SHORT_FROM - 5);
+    assert_eq!(rules.effective_active_from(&late), SHORT_FROM + 15);
+    // Already active before H: unchanged.
+    let old = snapshot_entry(0, 0x24, 500);
+    assert_eq!(rules.effective_active_from(&old), 980);
+}
+
+/// Below `H` the short rule decides exactly what the 480-block rule does:
+/// the blocks already on the chain are judged as before.
+#[test]
+fn below_the_short_activation_nothing_changes() {
+    let short = short_rules();
+    let long = burn_rules();
+    for registered_at in (ACTIVATION..SHORT_FROM).step_by(7) {
+        let entry = snapshot_entry(0, 0x21, registered_at);
+        for height in (ACTIVATION..SHORT_FROM).step_by(3) {
+            assert_eq!(
+                short.client_active_at(&entry, height),
+                long.client_active_at(&entry, height),
+                "registered at {registered_at}, height {height}"
+            );
+        }
+        assert_eq!(short.activation_delay_at(registered_at), 480);
+    }
+}
+
+#[test]
+fn a_registration_from_the_short_activation_on_is_active_twenty_blocks_later() {
+    let rules = short_rules();
+    let object = registration(1);
+    for registered_at in [SHORT_FROM, SHORT_FROM + 7] {
+        assert_eq!(rules.activation_delay_at(registered_at), 20);
+        let effect = validate(
+            &block_at(registered_at, vec![paid_registration(100, object)]),
+            &[ClientObject::Registration(object)],
+            &ClientRegistryState::new(),
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(effect.registrations[0].active_from, registered_at + 20);
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&effect);
+        assert_eq!(
+            registry.check_carriable(&object.matrix_digest, registered_at + 19, &rules),
+            Err(ClientObjectError::ClientNotYetActive {
+                matrix_digest: object.matrix_digest,
+                active_from: registered_at + 20,
+            })
+        );
+        assert!(registry
+            .check_carriable(&object.matrix_digest, registered_at + 20, &rules)
+            .is_ok());
+    }
+    // One block before H: the stored activation is still the 480-block one.
+    let effect = validate(
+        &block_at(SHORT_FROM - 1, vec![paid_registration(100, object)]),
+        &[ClientObject::Registration(object)],
+        &ClientRegistryState::new(),
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(effect.registrations[0].active_from, SHORT_FROM - 1 + 480);
+}
+
+/// A block carrying the proof of a client not active yet under the short
+/// rule is refused, paid or carried for free; from `H` it is accepted.
+#[test]
+fn a_block_carrying_a_client_not_yet_active_under_the_short_rule_is_refused() {
+    let rules = short_rules();
+    let registry = testnet_3_registry();
+    let object = submission(0x21, 1);
+    let not_yet = ClientObjectError::ClientNotYetActive {
+        matrix_digest: digest(0x21),
+        active_from: SHORT_FROM,
+    };
+    assert_eq!(
+        validate(
+            &block_at(SHORT_FROM - 1, vec![paid_submission(100, object, MICRO_PER_JTM)]),
+            &[ClientObject::Submission(object)],
+            &registry,
+            &rules
+        ),
+        Err(not_yet.clone())
+    );
+    let effect = validate(
+        &block_at(SHORT_FROM, vec![paid_submission(100, object, MICRO_PER_JTM)]),
+        &[ClientObject::Submission(object)],
+        &registry,
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(effect.submission, Some(object));
+
+    let carried = CarriedClient {
+        matrix_digest: digest(0x22),
+        io_commitment: digest(1),
+    };
+    let none = ClientObjectsEffect::default();
+    let view = TerminalClientView {
+        carried: Some(carried),
+        registry_leaves: Some(registry_leaves_after(&registry, &none)),
+    };
+    assert_eq!(
+        check_terminal_client_view(&view, &none, &registry, SHORT_FROM - 1, &rules),
+        Err(ClientObjectError::ClientNotYetActive {
+            matrix_digest: digest(0x22),
+            active_from: SHORT_FROM,
+        })
+    );
+    assert_eq!(
+        check_terminal_client_view(&view, &none, &registry, SHORT_FROM, &rules),
+        Ok(())
+    );
+    // The same block under the 480-block rule is still refused at H.
+    assert!(check_terminal_client_view(&view, &none, &registry, SHORT_FROM, &burn_rules()).is_err());
+}
+
+/// A snapshot's registry is checked against the delay of each entry's own
+/// registration height: 480 below `H`, 20 from it on.
+#[test]
+fn a_mixed_snapshot_registry_is_checked_against_the_delay_of_its_height() {
+    let rules = short_rules();
+    let first = snapshot_entry(0, 0x21, 971);
+    let second = snapshot_entry(1, 0x22, 1219);
+    let third = ClientRegistryEntry {
+        active_from: SHORT_FROM + 5 + 20,
+        ..snapshot_entry(2, 0x23, SHORT_FROM + 5)
+    };
+    let slots = [marker_slot(&first), marker_slot(&second), marker_slot(&third)];
+    let boundary = SHORT_FROM + 10;
+    assert_eq!(
+        check_snapshot_under(
+            &snapshot_registry(&[first, second, third]),
+            boundary,
+            &slots,
+            rules
+        ),
+        Ok(())
+    );
+    let refused = |entries: &[ClientRegistryEntry]| {
+        check_snapshot_under(&snapshot_registry(entries), boundary, &slots, rules)
+            .expect_err("a forged activation must be refused")
+    };
+    // Above H with the 480-block delay, below H with the 20-block one, or
+    // one block off either way.
+    refused(&[first, second, ClientRegistryEntry { active_from: SHORT_FROM + 5 + 480, ..third }]);
+    refused(&[ClientRegistryEntry { active_from: 971 + 20, ..first }, second, third]);
+    refused(&[first, ClientRegistryEntry { active_from: 1699 - 1, ..second }, third]);
+    refused(&[first, second, ClientRegistryEntry { active_from: SHORT_FROM + 5 + 21, ..third }]);
+    // The same mixed registry without the short activation is refused.
+    assert!(check_snapshot_under(
+        &snapshot_registry(&[first, second, third]),
+        boundary,
+        &slots,
+        burn_rules()
+    )
+    .is_err());
+}
+
+/// The public network has no short activation: 480 blocks for every
+/// registration and the stored activation decides, at every height.
+#[cfg(not(feature = "testnet"))]
+#[test]
+fn the_public_network_keeps_the_480_block_activation() {
+    assert_eq!(CLIENT_SHORT_ACTIVATION_FROM, None);
+    let rules = ClientObjectRules::CONSENSUS;
+    assert_eq!(rules.short_activation_from, None);
+    assert_eq!(rules.activation_delay, 480);
+    for registered_at in [1, 971, 1219, SHORT_FROM, 1_000_000, u64::MAX / 2] {
+        assert_eq!(rules.activation_delay_at(registered_at), 480);
+        let entry = snapshot_entry(0, 0x21, registered_at);
+        assert_eq!(rules.effective_active_from(&entry), entry.active_from);
+        for height in [
+            registered_at,
+            registered_at + 20,
+            entry.active_from - 1,
+            entry.active_from,
+            SHORT_FROM,
+        ] {
+            assert_eq!(
+                rules.client_active_at(&entry, height),
+                entry.active_from <= height
+            );
+        }
+    }
+    // Registered at and above the testnet's H: still 480 blocks.
+    let armed = ClientObjectRules {
+        activation_height: Some(ACTIVATION),
+        catalogue: &test_rules::UNIFORM_CATALOGUE,
+        ..ClientObjectRules::CONSENSUS
+    };
+    let object = registration(1);
+    let effect = validate(
+        &block_at(SHORT_FROM + 7, vec![paid_registration(100, object)]),
+        &[ClientObject::Registration(object)],
+        &ClientRegistryState::new(),
+        &armed,
+    )
+    .unwrap();
+    assert_eq!(effect.registrations[0].active_from, SHORT_FROM + 7 + 480);
+    let registry = testnet_3_registry();
+    assert_eq!(
+        registry.check_carriable(&digest(0x21), 1450, &armed),
+        Err(ClientObjectError::ClientNotYetActive {
+            matrix_digest: digest(0x21),
+            active_from: 1451,
+        })
+    );
+}
+
+/// The test network shortens the activation from its declared height on.
+#[cfg(feature = "testnet")]
+#[test]
+fn the_test_network_shortens_the_activation_from_its_declared_height() {
+    assert_eq!(
+        CLIENT_SHORT_ACTIVATION_FROM,
+        Some(TESTNET_SHORT_ACTIVATION_HEIGHT)
+    );
+    let rules = ClientObjectRules::CONSENSUS;
+    assert_eq!(rules.short_activation_from, CLIENT_SHORT_ACTIVATION_FROM);
+    assert_eq!(rules.short_activation_delay, 20);
+    assert_eq!(rules.activation_delay, 480);
+    assert_eq!(
+        rules.activation_delay_at(TESTNET_SHORT_ACTIVATION_HEIGHT - 1),
+        480
+    );
+    assert_eq!(rules.activation_delay_at(TESTNET_SHORT_ACTIVATION_HEIGHT), 20);
 }

@@ -979,11 +979,11 @@ impl ClientObjects {
         let id = ClientProofId::of_bytes(bundle.submission, bytes)
             .ok_or_else(|| ClientObjectsError::Bundle("too long".into()))?;
         if let Some(entry) = registry.entry(&bundle.submission.matrix_digest) {
-            if entry.active_from > next_height {
+            if !rules.client_active_at(entry, next_height) {
                 return Err(ClientObjectsError::NotYetActive {
                     matrix_digest: hex32(&entry.matrix_digest),
                     tip_height: next_height.saturating_sub(1),
-                    active_from: entry.active_from,
+                    active_from: rules.effective_active_from(entry),
                 });
             }
         }
