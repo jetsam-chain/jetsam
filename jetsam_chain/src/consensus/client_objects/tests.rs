@@ -2106,8 +2106,15 @@ fn the_catalogue_changes_nothing_below_the_v1_5_height() {
             Ok(())
         );
     }
+    // The public network, armed or not: its clock is the declared one and its
+    // catalogue is empty, so no registration is possible at any height until
+    // a release lists a digest.
     if !crate::consensus::identity::IS_TEST_CHAIN {
-        assert_eq!(ClientObjectRules::CONSENSUS.activation_height, None);
+        assert_eq!(
+            ClientObjectRules::CONSENSUS.activation_height,
+            V1_5_ACTIVATION_HEIGHT
+        );
+        assert!(ClientObjectRules::CONSENSUS.catalogue.is_empty());
     }
 }
 

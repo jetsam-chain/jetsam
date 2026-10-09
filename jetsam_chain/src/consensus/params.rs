@@ -444,7 +444,7 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 /// v1.5 pack generated for **this** profile: a pack built under the wrong one
 /// fails on the first payout block after the height, not before.
 #[cfg(not(feature = "testnet"))]
-pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(38400);
 
 /// Armed on the test chain at **9600 = 10 x 960**, a PROVISIONAL height chosen
 /// on 2026-10-03 against a tip of about 5 900 (90 s per block): it leaves some
@@ -452,7 +452,7 @@ pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
 /// seeds and a 24-48 hour notice. It is moved (`arm.sh --clock v1.5 --postpone`,
 /// later only) or confirmed with the operator the day the test chain is told.
 /// Declared per profile, like [`V1_4_ACTIVATION_HEIGHT`], so that arming one
-/// can never arm the other: the public profile above stays `None`.
+/// can never arm the other.
 #[cfg(feature = "testnet")]
 pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(960);
 

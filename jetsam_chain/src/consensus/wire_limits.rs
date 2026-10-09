@@ -348,10 +348,11 @@ mod tests {
         }
     }
 
-    /// Dormant on the public network. It is decided with the operator against
-    /// the tip of the day, once the test chain has crossed on the v1.5 packs.
+    /// The public network's v1.5 height, decided with the operator against the
+    /// tip of the day (`arm.sh --clock v1.5 --profile mainnet`), once the test
+    /// chain had crossed on the v1.5 packs.
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(38400);
 
     /// Armed on the test chain at the provisional 9600 (see `params`). Split per
     /// profile for the same reason as the v1.4 declaration: arming the test chain
