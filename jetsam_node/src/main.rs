@@ -6304,6 +6304,7 @@ mod tests {
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
         snapshot_generation_probe_peers, superseded_snapshot_plan_source, Duration, Instant,
         ClientMatrixWait, ClientMatrixWaitEnd, CLIENT_MATRIX_WAIT_LIMIT,
+        client_matrices_wanted, AwaitedSnapshotMatrices,
         CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
@@ -7260,6 +7261,112 @@ mod tests {
             wait.end(start + CLIENT_MATRIX_WAIT_LIMIT, true),
             Some(ClientMatrixWaitEnd::TimedOut)
         );
+    }
+
+    /// Review 2, R1 (v1.5.0): a snapshot candidate refused for want of a
+    /// client matrix is retired, and with it the registry its manifest
+    /// announced; the next heartbeat asks the client objects for exactly the
+    /// matrices the node wants. A fresh node's chain registers nothing: the
+    /// fetch the candidate waited for was dropped, the wait ended as if the
+    /// matrix were held, a fresh snapshot was planned and refused the same
+    /// way, for ever (testnet 3, 2026-10-09: 18 rounds in 7 minutes, no
+    /// matrix received). The candidate's registry stays wanted while the
+    /// chain is below its boundary; only what the catalogue allows is
+    /// fetched (review B3).
+    #[test]
+    fn r1_a_snapshot_candidate_waiting_for_a_matrix_keeps_it_wanted_once_retired() {
+        use jetsam_chain::consensus::client_objects::{
+            ClientObjectRules, ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState,
+            LicenseSplit,
+        };
+        use jetsam_ivc_core::field::F128;
+        use jetsam_ivc_core::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+        use jetsam_ivc_core::pcs::{PcsParams, LOG_PACKING};
+        use jetsam_ivc_core::proof::FieldShape;
+        use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use jetsam_node::client_objects::ClientObjects;
+        use jetsam_p2p::client_object_protocol::MatrixFileId;
+        use jetsam_recursive::{HistoryStepClientForm, HistoryStepClientMatrixSet};
+
+        let (shape, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(8, 8, 1);
+        let form = HistoryStepClientForm::new(
+            FieldShape::of(&shape),
+            PcsParams {
+                m: 8 + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile: Default::default(),
+            },
+            PublicIoSpec {
+                io_slice: WitnessSlice {
+                    log2_len: 3,
+                    index: 1,
+                },
+                io_len: 8,
+                claims: Vec::new(),
+            },
+            2,
+        );
+        let entry = |index: u8, digest: u8| ClientRegistryEntry {
+            index,
+            matrix_digest: [digest; 32],
+            matrix_file_root: [digest ^ 0xFF; 32],
+            matrix_file_len: 4_096,
+            registered_at: 1_219,
+            active_from: 1_239,
+            license: LicenseSplit::default(),
+        };
+        let (listed, unlisted) = (entry(0, 0xD1), entry(1, 0xD2));
+        let rules = ClientObjectRules {
+            catalogue: Box::leak(vec![listed.matrix_digest].into_boxed_slice()),
+            ..ClientObjectRules::CONSENSUS
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let objects = ClientObjects::open(
+            directory.path(),
+            &form,
+            std::sync::Arc::new(HistoryStepClientMatrixSet::new(&form)),
+            &rules,
+        )
+        .unwrap();
+        let mut candidate = ClientRegistryState::new();
+        candidate.apply(&ClientObjectsEffect {
+            registrations: vec![listed, unlisted],
+            ..ClientObjectsEffect::default()
+        });
+        let chain = ClientRegistryState::new();
+        let boundary = 1_578;
+
+        // The candidate's manifest: its registry is wanted, the catalogue's
+        // `D` only.
+        objects.want_matrices(client_matrices_wanted(&chain, 0, Some(&candidate), None));
+        assert_eq!(objects.fetching_matrices(), vec![MatrixFileId::of_entry(&listed)]);
+        // Its verification answers "client matrix unavailable": the node
+        // waits for the matrix, and retires the candidate.
+        assert!(objects.note_matrices_needed());
+        let start = Instant::now();
+        let mut wait = ClientMatrixWait::default();
+        wait.begin(start);
+        let awaited = AwaitedSnapshotMatrices {
+            boundary,
+            registry: candidate,
+        };
+        // The next heartbeat: no candidate any more, the chain still empty.
+        objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+        assert_eq!(
+            objects.fetching_matrices(),
+            vec![MatrixFileId::of_entry(&listed)],
+            "the fetch the retired candidate waits for is dropped"
+        );
+        assert!(objects.awaits_matrices());
+        assert_eq!(
+            wait.end(start + Duration::from_secs(2), objects.awaits_matrices()),
+            None,
+            "the wait ends as if the matrix were held"
+        );
+        // Once the chain is at the boundary, its own registry decides.
+        objects.want_only_matrices(&client_matrices_wanted(&chain, boundary, None, Some(&awaited)));
+        assert!(objects.fetching_matrices().is_empty());
     }
 
     #[test]
@@ -9246,13 +9353,14 @@ fn dispatch_client_object_requests(
 }
 
 /// Keep the client objects in step with the chain (M3.8): every registered
-/// matrix of the chain, and of a snapshot candidate being installed, is
-/// wanted; every newly committed block — mined here or received — settles
-/// what it carried.
+/// matrix of the chain, of a snapshot candidate being installed, and of the
+/// last candidate refused for want of one (`awaited`), is wanted; every newly
+/// committed block — mined here or received — settles what it carried.
 async fn tend_client_objects(
     objects: &jetsam_node::client_objects::ClientObjects,
     chain: &Arc<RwLock<MdbxChainContext>>,
     manifest_registry: Option<&jetsam_chain::consensus::client_objects::ClientRegistryState>,
+    awaited: Option<&AwaitedSnapshotMatrices>,
     seen_height: &mut u64,
 ) {
     let (registry, tip_height, committed) = {
@@ -9274,13 +9382,50 @@ async fn tend_client_objects(
     *seen_height = tip_height;
     // Exactly these, the chain's first (review B3): a fetch nobody wants any
     // more (a candidate retired, an entry reorganised away) is dropped.
-    let wanted: Vec<_> = registry
+    objects.want_only_matrices(&client_matrices_wanted(
+        &registry,
+        tip_height,
+        manifest_registry,
+        awaited,
+    ));
+}
+
+/// The client registry a snapshot candidate refused for want of client
+/// matrices announced (`ClientMatrixWait`), and its boundary (review 2, R1).
+/// The candidate is retired while the node waits, and the fresh candidate
+/// planned after the wait needs the same matrices: they stay wanted.
+#[derive(Clone, Debug)]
+struct AwaitedSnapshotMatrices {
+    boundary: u64,
+    registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
+}
+
+/// The matrix files this node wants, the chain's registry first (review
+/// B3): every entry of its chain's `registry`, of the snapshot `candidate`
+/// being installed, and of the last candidate refused for want of a matrix
+/// (`awaited`) while the chain is below that candidate's boundary — beyond
+/// it, the chain's own registry decides (review 2, R1: without it a fresh
+/// node, whose chain registers nothing, dropped the fetch its retired
+/// candidate waited for, ended the wait as if the matrix were held, and
+/// planned a fresh snapshot refused the same way, for ever). Each is then
+/// fetched only if the catalogue allows it, a registry's worth at most
+/// (`ClientObjects::want_matrices`).
+fn client_matrices_wanted(
+    registry: &jetsam_chain::consensus::client_objects::ClientRegistryState,
+    tip_height: u64,
+    candidate: Option<&jetsam_chain::consensus::client_objects::ClientRegistryState>,
+    awaited: Option<&AwaitedSnapshotMatrices>,
+) -> Vec<jetsam_p2p::client_object_protocol::MatrixFileId> {
+    let awaited = awaited
+        .filter(|awaited| tip_height < awaited.boundary)
+        .map(|awaited| &awaited.registry);
+    registry
         .entries()
         .iter()
-        .chain(manifest_registry.into_iter().flat_map(|registry| registry.entries()))
+        .chain(candidate.into_iter().flat_map(|registry| registry.entries()))
+        .chain(awaited.into_iter().flat_map(|registry| registry.entries()))
         .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry)
-        .collect();
-    objects.want_only_matrices(&wanted);
+        .collect()
 }
 
 /// The client registry a snapshot manifest announces, if this node may fetch
@@ -9685,6 +9830,9 @@ async fn handle_p2p_events(
     let mut snapshot_plan_last_progress: Option<Instant> = None;
     let mut snapshot_provider_discovery_rounds = 0u8;
     let mut snapshot_client_matrix_wait = ClientMatrixWait::default();
+    // The registry of the last snapshot candidate refused for want of client
+    // matrices: wanted after its plan is retired (review 2, R1).
+    let mut awaited_snapshot_matrices: Option<AwaitedSnapshotMatrices> = None;
     let mut suffix_client_matrix_wait = ClientMatrixWait::default();
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
@@ -15401,6 +15549,16 @@ async fn handle_p2p_events(
                     // snapshot until it is held (`ClientMatrixWait`).
                     if client_matrices_awaited(client_objects.as_deref(), &error) {
                         snapshot_client_matrix_wait.begin(Instant::now());
+                        // Its matrices stay wanted once its plan is retired:
+                        // the fresh candidate needs them (review 2, R1).
+                        awaited_snapshot_matrices = pending_manifest.as_ref().and_then(|pending| {
+                            snapshot_manifest_client_registry(&pending.manifest).map(|registry| {
+                                AwaitedSnapshotMatrices {
+                                    boundary: pending.manifest.tip_height,
+                                    registry,
+                                }
+                            })
+                        });
                         tracing::info!(
                             boundary = completed.key.snapshot.boundary.height,
                             wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
@@ -15678,6 +15836,7 @@ async fn handle_p2p_events(
                         objects,
                         &chain,
                         manifest_registry.as_ref(),
+                        awaited_snapshot_matrices.as_ref(),
                         &mut client_objects_seen_height,
                     )
                     .await;

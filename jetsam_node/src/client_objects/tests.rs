@@ -1609,3 +1609,70 @@ fn b3_at_a_start_only_the_canonical_registrys_matrices_are_authenticated_again()
         .join(matrix_file_name(&stray.file_id()))
         .exists());
 }
+
+/// Review 2, R1 (v1.5.0): a fetch is dropped (its snapshot candidate
+/// retired) while chunk requests to an honest provider are in flight, then
+/// the same file is wanted again. The provider's answers to the dropped
+/// fetch's requests, arriving now, were judged against the new fetch (no
+/// manifest yet) and the honest provider excluded as a liar: with no other
+/// provider, the file was never fetched again. A dropped fetch takes its
+/// requests with it: a late answer is nothing, and the provider is asked
+/// again until the file is assembled.
+#[test]
+fn r1_a_late_answer_to_a_dropped_fetch_never_excludes_the_honest_provider() {
+    let form = test_form();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    // A file of several chunks under a catalogue `D` (assembled, not
+    // authenticated here: only the fetch is at stake).
+    let file: Vec<u8> = (0..2 * CLIENT_MATRIX_CHUNK_BYTES + 17)
+        .map(|index| (index * 31 % 251) as u8)
+        .collect();
+    let id = MatrixFileId {
+        matrix_digest: test_catalogue()[3],
+        file_root: matrix_file_root(&file),
+        file_len: file.len() as u32,
+    };
+    let honest = PeerId::random();
+    let now = Instant::now();
+    objects.want_matrices([id]);
+    let [manifest] = objects
+        .next_requests(&[honest], now)
+        .try_into()
+        .expect("one manifest request");
+    assert!(matches!(
+        deliver(&objects, &manifest, &answer_from_file(&file, &manifest.request)),
+        ClientObjectFetched::Nothing
+    ));
+    let late = objects.next_requests(&[honest], now);
+    assert!(late.len() > 1, "chunk requests in flight to the honest provider");
+    // The candidate is retired (the fetch dropped), then a new candidate
+    // wants the same file.
+    objects.want_only_matrices(&[]);
+    objects.want_matrices([id]);
+    // The honest provider's answers to the dropped fetch arrive now.
+    for fetch in &late {
+        let verdict = deliver(&objects, fetch, &answer_from_file(&file, &fetch.request));
+        assert!(
+            matches!(verdict, ClientObjectFetched::Nothing),
+            "a late honest answer judged {verdict:?}"
+        );
+    }
+    // The honest provider is still asked, to the end of the file.
+    let mut assembled = None;
+    for _ in 0..16 {
+        let requests = objects.next_requests(&[honest], now);
+        assert!(!requests.is_empty() || assembled.is_some(), "the honest provider is no longer asked");
+        for fetch in requests {
+            match deliver(&objects, &fetch, &answer_from_file(&file, &fetch.request)) {
+                ClientObjectFetched::MatrixAssembled(file) => assembled = Some(file),
+                ClientObjectFetched::Nothing => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        if assembled.is_some() {
+            break;
+        }
+    }
+    assert_eq!(assembled.expect("assembled from the honest provider").id(), id);
+}

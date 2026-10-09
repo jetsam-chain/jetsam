@@ -933,12 +933,22 @@ impl ClientObjects {
 
     /// [`Self::want_matrices`] for exactly `wanted`: a fetch no longer
     /// wanted (a snapshot candidate retired, an entry a reorg removed) is
-    /// dropped, its chunks freed, so nothing is fetched for ever.
+    /// dropped, its chunks freed, so nothing is fetched for ever. Its
+    /// requests in flight go with it: an answer arriving later is nothing,
+    /// never judged against a new fetch of the same file (review 2, R1: an
+    /// honest provider's late chunk, judged against a fetch with no manifest
+    /// yet, excluded it as a liar).
     pub fn want_only_matrices(&self, wanted: &[MatrixFileId]) {
         {
             let mut state = self.state.lock().expect("client objects lock");
             let before = state.fetches.len();
-            state.fetches.retain(|id, _| wanted.contains(id));
+            let State { fetches, tokens, .. } = &mut *state;
+            fetches.retain(|id, _| wanted.contains(id));
+            tokens.retain(|_, (_, request, _)| match request {
+                ClientObjectRequest::MatrixManifest(file)
+                | ClientObjectRequest::MatrixChunk { file, .. } => fetches.contains_key(file),
+                ClientObjectRequest::Proof(_) => true,
+            });
             if state.fetches.len() != before {
                 tracing::info!(
                     dropped = before - state.fetches.len(),
