@@ -139,6 +139,56 @@ pub struct ClientPaymentResponse {
     pub io_commitment: Option<String>,
 }
 
+/// What `jetsam_walletBuildClientPayment` pays for the registration the
+/// matrix file at `matrix_path` makes: the registration (its `D` computed by
+/// `objects`) and the license outputs it owes under `rules`. Refused unless
+/// the registration is admissible (`check_registration_admissible`: `D` in
+/// the catalogue, among others).
+pub async fn plan_registration_payment(
+    objects: Option<SharedRpcClientObjects>,
+    matrix_path: &str,
+    rules: &ClientObjectRules,
+) -> Result<(ClientRegistration, Vec<([u8; 32], u64)>), String> {
+    use jetsam_chain::consensus::client_objects::{
+        CLIENT_LICENSE_BURN_ADDRESS, CLIENT_LICENSE_POOL_ADDRESS,
+    };
+    let objects =
+        objects.ok_or_else(|| "this node holds no v1.5 client objects (no v1.5 pack)".to_string())?;
+    let path = std::path::PathBuf::from(matrix_path);
+    let max = u64::from(rules.max_matrix_file_bytes);
+    let registration = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(max + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        objects.registration_of_matrix_file(&bytes)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("matrix file {matrix_path}: {error}"))?;
+    // Before anything is built, proved or reserved: a registration no block
+    // can carry (outside the catalogue, say) would hold its license inputs
+    // until its payment expires.
+    jetsam_chain::consensus::client_objects::check_registration_admissible(&registration, rules)
+        .map_err(|error| {
+            format!("registration refused, no payment built: {error} (matrix file {matrix_path})")
+        })?;
+    let split = rules.destination.split(rules.license_micro);
+    let mut payments = Vec::new();
+    if split.burn > 0 {
+        payments.push((CLIENT_LICENSE_BURN_ADDRESS.0, split.burn));
+    }
+    if split.miners > 0 {
+        payments.push((CLIENT_LICENSE_POOL_ADDRESS.0, split.miners));
+    }
+    if let Some(treasury) = rules.destination.treasury_address() {
+        payments.push((treasury.0, split.treasury));
+    }
+    Ok((registration, payments))
+}
+
 /// The listing of `registry` at the tip `tip_height`.
 pub fn client_list(
     registry: &ClientRegistryState,
@@ -229,6 +279,133 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A node whose matrix files all make `registration` (the structural
+    /// digest is not what is tested here).
+    struct MakesRegistration(ClientRegistration);
+
+    impl jetsam_miner::client_slot::MinerClientSource for MakesRegistration {
+        fn best_candidate(
+            &self,
+            _parent: &jetsam_chain::BlockHeader,
+            _registry: &ClientRegistryState,
+            _rules: &ClientObjectRules,
+            _anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+        ) -> Option<
+            jetsam_chain::consensus::client_objects::queue::ClientCandidate<
+                std::sync::Arc<
+                    jetsam_recursive::acceptance::history_step::PreparedHistoryStepClient,
+                >,
+            >,
+        > {
+            None
+        }
+
+        fn held_registrations(
+            &self,
+            _registry: &ClientRegistryState,
+        ) -> Vec<(ClientRegistration, PagedSpendIntent)> {
+            Vec::new()
+        }
+
+        fn on_block_committed(&self, _block: &jetsam_chain::Block) {}
+    }
+
+    impl RpcClientObjects for MakesRegistration {
+        fn receive_client_proof(
+            &self,
+            _bundle: &[u8],
+            _registry: &ClientRegistryState,
+            _rules: &ClientObjectRules,
+        ) -> Result<ClientProofAnnouncement, String> {
+            unreachable!("not a registration")
+        }
+
+        fn hold_client_registration(
+            &self,
+            _payment: PagedSpendIntent,
+            _matrix_file: &[u8],
+            _rules: &ClientObjectRules,
+        ) -> Result<ClientRegistration, String> {
+            unreachable!("walletBuildClientPayment holds nothing")
+        }
+
+        fn registration_of_matrix_file(
+            &self,
+            _matrix_file: &[u8],
+        ) -> Result<ClientRegistration, String> {
+            Ok(self.0)
+        }
+
+        fn holds_client_matrix(&self, _matrix_digest: &[u8; 32]) -> bool {
+            false
+        }
+
+        fn queued_client_proofs(&self) -> usize {
+            0
+        }
+    }
+
+    /// Found on the test network (2026-10-08): `walletBuildClientPayment`
+    /// built and proved the license payment of a registration whose `D` the
+    /// closed catalogue does not list, and reserved its inputs (1 035 JTMT
+    /// held until the payment expired) — for a registration no block can
+    /// carry. It is refused while it is planned, before anything is built,
+    /// proved or reserved, by the catalogue's own refusal (`D` in hex).
+    #[tokio::test]
+    async fn a_registration_outside_the_catalogue_is_refused_before_its_payment_is_built() {
+        use jetsam_chain::consensus::client_objects::CLIENT_LICENSE_BURN_ADDRESS;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("matrix.bin");
+        std::fs::write(&path, b"a matrix file").unwrap();
+        let path = path.to_str().unwrap();
+        let rules = ClientObjectRules {
+            catalogue: &[[0x41; 32]],
+            ..ClientObjectRules::CONSENSUS
+        };
+        let registration = |digest: u8| ClientRegistration {
+            matrix_digest: [digest; 32],
+            matrix_file_root: [0x99; 32],
+            matrix_file_len: 13,
+        };
+        let objects = |digest: u8| -> Option<SharedRpcClientObjects> {
+            Some(std::sync::Arc::new(MakesRegistration(registration(digest))))
+        };
+
+        let refused = plan_registration_payment(objects(0xAB), path, &rules)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("NotInCatalogue"), "{refused}");
+        assert!(refused.contains(&"ab".repeat(32)), "{refused}");
+
+        let (planned, payments) = plan_registration_payment(objects(0x41), path, &rules)
+            .await
+            .unwrap();
+        assert_eq!(planned, registration(0x41));
+        assert_eq!(
+            payments,
+            vec![(CLIENT_LICENSE_BURN_ADDRESS.0, rules.license_micro)]
+        );
+
+        // This build's own catalogue: each tool it lists is planned, any
+        // other refused (the public network's list is empty).
+        let current = ClientObjectRules::current();
+        for digest in current.catalogue {
+            let objects: SharedRpcClientObjects = std::sync::Arc::new(MakesRegistration(
+                ClientRegistration {
+                    matrix_digest: *digest,
+                    ..registration(0)
+                },
+            ));
+            assert!(plan_registration_payment(Some(objects), path, &current)
+                .await
+                .is_ok());
+        }
+        assert!(plan_registration_payment(objects(0xAB), path, &current)
+            .await
+            .unwrap_err()
+            .contains("NotInCatalogue"));
     }
 
     #[test]

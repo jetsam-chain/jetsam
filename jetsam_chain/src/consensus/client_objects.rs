@@ -1294,25 +1294,7 @@ pub fn check_registration_payment(
     registration: &ClientRegistration,
     rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
-    if registration.matrix_digest == [0u8; 32] {
-        return Err(ClientObjectError::NullMatrixDigest);
-    }
-    if registration.matrix_file_root == [0u8; 32] {
-        return Err(ClientObjectError::NullMatrixFileRoot);
-    }
-    if registration.matrix_file_len == 0
-        || registration.matrix_file_len > rules.max_matrix_file_bytes
-    {
-        return Err(ClientObjectError::MatrixFileLength {
-            len: registration.matrix_file_len,
-            max: rules.max_matrix_file_bytes,
-        });
-    }
-    if !rules.catalogue.contains(&registration.matrix_digest) {
-        return Err(ClientObjectError::NotInCatalogue {
-            matrix_digest: registration.matrix_digest,
-        });
-    }
+    check_registration_admissible(registration, rules)?;
     let marker = ClientObject::Registration(*registration).marker();
     let mut markers = pages
         .iter()
@@ -1334,6 +1316,36 @@ pub fn check_registration_payment(
         rules.destination.split(rules.license_micro),
         rules.destination,
     )
+}
+
+/// The checks of a registration alone, before anything pays it: a non-null
+/// `D` and file root, a file length in bounds, `D` in the catalogue. A wallet
+/// runs them before building a license payment (a payment for a registration
+/// no block can carry would hold its inputs until it expires).
+pub fn check_registration_admissible(
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    if registration.matrix_digest == [0u8; 32] {
+        return Err(ClientObjectError::NullMatrixDigest);
+    }
+    if registration.matrix_file_root == [0u8; 32] {
+        return Err(ClientObjectError::NullMatrixFileRoot);
+    }
+    if registration.matrix_file_len == 0
+        || registration.matrix_file_len > rules.max_matrix_file_bytes
+    {
+        return Err(ClientObjectError::MatrixFileLength {
+            len: registration.matrix_file_len,
+            max: rules.max_matrix_file_bytes,
+        });
+    }
+    if !rules.catalogue.contains(&registration.matrix_digest) {
+        return Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: registration.matrix_digest,
+        });
+    }
+    Ok(())
 }
 
 /// Upper bound of one client proof on the wire: the fixed, unshared length

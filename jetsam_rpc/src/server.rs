@@ -2952,40 +2952,18 @@ impl JetsamApiServer for RpcHandler {
     ) -> RpcResult<crate::client_objects::ClientPaymentResponse> {
         use crate::client_objects::ClientPaymentObject;
         use jetsam_chain::consensus::client_objects::{
-            ClientObject, ClientObjectRules, ClientSubmission, CLIENT_LICENSE_BURN_ADDRESS,
-            CLIENT_LICENSE_POOL_ADDRESS,
+            ClientObject, ClientObjectRules, ClientSubmission,
         };
         let rules = ClientObjectRules::current();
         let (client_object, payments) = match &object {
             ClientPaymentObject::Registration { matrix_path } => {
-                let objects = self.client_objects.clone().ok_or_else(|| {
-                    rpc_err("this node holds no v1.5 client objects (no v1.5 pack)")
-                })?;
-                let path = std::path::PathBuf::from(matrix_path);
-                let max = u64::from(rules.max_matrix_file_bytes);
-                let registration = tokio::task::spawn_blocking(move || {
-                    use std::io::Read as _;
-                    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-                    let mut bytes = Vec::new();
-                    file.take(max + 1)
-                        .read_to_end(&mut bytes)
-                        .map_err(|error| error.to_string())?;
-                    objects.registration_of_matrix_file(&bytes)
-                })
+                let (registration, payments) = crate::client_objects::plan_registration_payment(
+                    self.client_objects.clone(),
+                    matrix_path,
+                    &rules,
+                )
                 .await
-                .map_err(|error| rpc_err(error.to_string()))?
-                .map_err(|error| rpc_err(format!("matrix file {matrix_path}: {error}")))?;
-                let split = rules.destination.split(rules.license_micro);
-                let mut payments = Vec::new();
-                if split.burn > 0 {
-                    payments.push((CLIENT_LICENSE_BURN_ADDRESS.0, split.burn));
-                }
-                if split.miners > 0 {
-                    payments.push((CLIENT_LICENSE_POOL_ADDRESS.0, split.miners));
-                }
-                if let Some(treasury) = rules.destination.treasury_address() {
-                    payments.push((treasury.0, split.treasury));
-                }
+                .map_err(rpc_err)?;
                 (ClientObject::Registration(registration), payments)
             }
             ClientPaymentObject::Submission {
