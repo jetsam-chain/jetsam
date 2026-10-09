@@ -11,7 +11,8 @@
 //! to peers during the activation delay.
 
 use jetsam_chain::consensus::client_objects::{
-    ClientObjectRules, ClientRegistration, ClientRegistryState,
+    ClientObjectError, ClientObjectRules, ClientRegistration, ClientRegistryState,
+    CLIENT_REGISTRY_CAPACITY,
 };
 use jetsam_p2p::client_object_protocol::ClientProofAnnouncement;
 use jetsam_tx::PagedSpendIntent;
@@ -145,10 +146,12 @@ pub struct ClientPaymentResponse {
 /// matrix file at `matrix_path` makes: the registration (its `D` computed by
 /// `objects`) and the license outputs it owes under `rules`. Refused unless
 /// the registration is admissible (`check_registration_admissible`: `D` in
-/// the catalogue, among others).
+/// the catalogue, among others) and `registry`, the registry at the tip,
+/// neither holds its `D` already nor is full.
 pub async fn plan_registration_payment(
     objects: Option<SharedRpcClientObjects>,
     matrix_path: &str,
+    registry: &ClientRegistryState,
     rules: &ClientObjectRules,
 ) -> Result<(ClientRegistration, Vec<([u8; 32], u64)>), String> {
     use jetsam_chain::consensus::client_objects::{
@@ -177,6 +180,27 @@ pub async fn plan_registration_payment(
         .map_err(|error| {
             format!("registration refused, no payment built: {error} (matrix file {matrix_path})")
         })?;
+    // Nor one the registry at the tip already holds: the block would refuse
+    // it (`validate_block_client_objects`).
+    if registry.entry(&registration.matrix_digest).is_some() {
+        let error = ClientObjectError::DuplicateRegistration {
+            matrix_digest: registration.matrix_digest,
+        };
+        return Err(format!(
+            "registration refused, no payment built: {error}, already in the registry \
+             (matrix file {matrix_path})"
+        ));
+    }
+    let capacity = rules.registry_capacity.min(CLIENT_REGISTRY_CAPACITY);
+    if registry.len() >= capacity {
+        let error = ClientObjectError::RegistryFull { capacity };
+        return Err(format!(
+            "registration refused, no payment built: {error}, the registry holds {} clients, \
+             no place left for D {} (matrix file {matrix_path})",
+            registry.len(),
+            hex::encode(registration.matrix_digest)
+        ));
+    }
     let split = rules.destination.split(rules.license_micro);
     let mut payments = Vec::new();
     if split.burn > 0 {
@@ -375,14 +399,15 @@ mod tests {
         let objects = |digest: u8| -> Option<SharedRpcClientObjects> {
             Some(std::sync::Arc::new(MakesRegistration(registration(digest))))
         };
+        let empty = ClientRegistryState::new();
 
-        let refused = plan_registration_payment(objects(0xAB), path, &rules)
+        let refused = plan_registration_payment(objects(0xAB), path, &empty, &rules)
             .await
             .unwrap_err();
         assert!(refused.contains("NotInCatalogue"), "{refused}");
         assert!(refused.contains(&"ab".repeat(32)), "{refused}");
 
-        let (planned, payments) = plan_registration_payment(objects(0x41), path, &rules)
+        let (planned, payments) = plan_registration_payment(objects(0x41), path, &empty, &rules)
             .await
             .unwrap();
         assert_eq!(planned, registration(0x41));
@@ -401,14 +426,91 @@ mod tests {
                     ..registration(0)
                 },
             ));
-            assert!(plan_registration_payment(Some(objects), path, &current)
+            assert!(plan_registration_payment(Some(objects), path, &empty, &current)
                 .await
                 .is_ok());
         }
-        assert!(plan_registration_payment(objects(0xAB), path, &current)
+        assert!(plan_registration_payment(objects(0xAB), path, &empty, &current)
             .await
             .unwrap_err()
             .contains("NotInCatalogue"));
+    }
+
+    /// A registration the chain's registry already holds (`D` registered at
+    /// the tip) or a full registry (`CLIENT_REGISTRY_CAPACITY` entries): no
+    /// block can carry it (`DuplicateRegistration`, `RegistryFull`), so its
+    /// payment is refused while it is planned, before anything is built,
+    /// proved or reserved, `D` in hex.
+    #[tokio::test]
+    async fn a_registration_already_registered_or_into_a_full_registry_is_refused_before_its_payment_is_built(
+    ) {
+        use jetsam_chain::consensus::client_objects::CLIENT_REGISTRY_CAPACITY;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("matrix.bin");
+        std::fs::write(&path, b"a matrix file").unwrap();
+        let path = path.to_str().unwrap();
+        // D = 1..=16 fill the registry; D = 0x41 is listed but not registered.
+        let mut catalogue: Vec<[u8; 32]> = (1..=CLIENT_REGISTRY_CAPACITY as u8)
+            .map(|digest| [digest; 32])
+            .collect();
+        catalogue.push([0x41; 32]);
+        let catalogue: &'static [[u8; 32]] = Box::leak(catalogue.into_boxed_slice());
+        let rules = ClientObjectRules {
+            catalogue,
+            ..ClientObjectRules::CONSENSUS
+        };
+        let objects = |digest: u8| -> Option<SharedRpcClientObjects> {
+            Some(std::sync::Arc::new(MakesRegistration(ClientRegistration {
+                matrix_digest: [digest; 32],
+                matrix_file_root: [0x99; 32],
+                matrix_file_len: 13,
+            })))
+        };
+        let registry_of = |count: usize| {
+            let mut registry = ClientRegistryState::new();
+            registry.apply(&ClientObjectsEffect {
+                registrations: (0..count)
+                    .map(|index| ClientRegistryEntry {
+                        index: index as u8,
+                        matrix_digest: [index as u8 + 1; 32],
+                        matrix_file_root: [0xF1; 32],
+                        matrix_file_len: 13,
+                        registered_at: 100,
+                        active_from: 580,
+                        license: LicenseSplit::default(),
+                    })
+                    .collect(),
+                ..ClientObjectsEffect::default()
+            });
+            registry
+        };
+
+        // Already registered at the tip.
+        let refused = plan_registration_payment(objects(0x02), path, &registry_of(3), &rules)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("DuplicateRegistration"), "{refused}");
+        assert!(refused.contains(&"02".repeat(32)), "{refused}");
+        assert!(refused.contains("no payment built"), "{refused}");
+
+        // One place left: planned. None left: refused.
+        let almost = registry_of(CLIENT_REGISTRY_CAPACITY - 1);
+        assert!(
+            plan_registration_payment(objects(0x41), path, &almost, &rules)
+                .await
+                .is_ok()
+        );
+        let full = registry_of(CLIENT_REGISTRY_CAPACITY);
+        let refused = plan_registration_payment(objects(0x41), path, &full, &rules)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("RegistryFull"), "{refused}");
+        assert!(
+            refused.contains(&CLIENT_REGISTRY_CAPACITY.to_string()),
+            "{refused}"
+        );
+        assert!(refused.contains(&"41".repeat(32)), "{refused}");
+        assert!(refused.contains("no payment built"), "{refused}");
     }
 
     #[test]

@@ -2983,9 +2983,13 @@ impl JetsamApiServer for RpcHandler {
         let rules = ClientObjectRules::current();
         let (client_object, payments) = match &object {
             ClientPaymentObject::Registration { matrix_path } => {
+                // The registry at the tip: a D already registered, or a full
+                // registry, is refused before anything is built.
+                let registry = self.chain.read().await.client_registry().clone();
                 let (registration, payments) = crate::client_objects::plan_registration_payment(
                     self.client_objects.clone(),
                     matrix_path,
+                    &registry,
                     &rules,
                 )
                 .await
