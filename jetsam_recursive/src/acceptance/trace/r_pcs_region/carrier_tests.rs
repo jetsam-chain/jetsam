@@ -2750,6 +2750,58 @@ mod client_slot {
         assert!(!held.holds(&foreign.structural_statement_digest()));
     }
 
+    /// A received client proof is pre-passed with the `D` computed when its
+    /// held matrix was authenticated (v1.5.0: digesting a held 203 MiB matrix
+    /// again was 93 % of a reception, 5.5 s on 32 threads, 84 s on two
+    /// cores): the pre-pass is the one that digests the matrix, and the
+    /// digest is lent only to a witness over that very matrix — an equal copy
+    /// or another client's matrix is refused, so a digest never vouches for a
+    /// matrix it was not computed from.
+    #[test]
+    fn a_held_matrix_lends_its_authenticated_digest_to_its_own_witness_only() {
+        use crate::acceptance::history_step::client_arm::HistoryStepClientMatrixSet;
+        let form = test_client_form();
+        let (a, b, _chain) = registered_pair(&form);
+        let digest = a.matrix.structural_statement_digest();
+        let held = HistoryStepClientMatrixSet::new(&form);
+        assert!(held.authenticated(&digest).is_none(), "not held yet");
+        assert_eq!(held.insert(a.matrix.clone()).ok(), Some(digest));
+        let authenticated = held.authenticated(&digest).expect("held");
+        assert_eq!(authenticated.digest(), digest);
+
+        let witness = HistoryStepClientWitness {
+            matrix: authenticated.matrix().clone(),
+            ..a.clone()
+        };
+        let reused = PreparedHistoryStepClient::prepare_authenticated(&form, &witness, &authenticated)
+            .expect("received on its held matrix");
+        let digested = PreparedHistoryStepClient::prepare(&form, &witness).expect("received");
+        assert_eq!(reused.digest(), digested.digest());
+        let empty = HistoryStepClientCarry::empty(&form);
+        let leaves = a.registry.leaves();
+        assert_eq!(
+            reused.published_claim(&empty, &leaves).expect("lanes"),
+            digested.published_claim(&empty, &leaves).expect("lanes")
+        );
+
+        // An equal matrix that is not the authenticated one, or another
+        // client's: the authenticated digest is not lent.
+        let copy = client_witness(&form, 0xC11E_0201, 0);
+        assert_eq!(copy.matrix.structural_statement_digest(), digest);
+        let copied = HistoryStepClientWitness {
+            registry: a.registry.clone(),
+            ..copy
+        };
+        assert!(matches!(
+            PreparedHistoryStepClient::prepare_authenticated(&form, &copied, &authenticated),
+            Err(HistoryStepError::ClientProof)
+        ));
+        assert!(matches!(
+            PreparedHistoryStepClient::prepare_authenticated(&form, &b, &authenticated),
+            Err(HistoryStepError::ClientProof)
+        ));
+    }
+
     /// The suffix-sync hole (M2 note §16.4-3), closed. A block that carried a
     /// false claim for entry 0 is followed by a block without a client: the
     /// relation carries the false lane faithfully (its trace is satisfiable

@@ -335,6 +335,11 @@ impl AuthenticatedClientMatrix {
     pub fn digest(&self) -> Hash {
         self.digest
     }
+
+    /// The matrix `D` was computed from (immutable: the digest stays its).
+    pub fn matrix(&self) -> &Arc<FieldR1cs> {
+        &self.matrix
+    }
 }
 
 /// The registered client matrices a node holds, with a memo of verified
@@ -399,6 +404,20 @@ impl HistoryStepClientMatrixSet {
             .expect("client matrix set lock")
             .insert(digest, matrix);
         Ok(digest)
+    }
+
+    /// The held matrix `digest`, with the `D` this set computed when it
+    /// authenticated it (every matrix is held under that `D` only), for a
+    /// reception that must not digest it again.
+    pub fn authenticated(&self, digest: &Hash) -> Option<AuthenticatedClientMatrix> {
+        self.matrices
+            .read()
+            .expect("client matrix set lock")
+            .get(digest)
+            .map(|matrix| AuthenticatedClientMatrix {
+                digest: *digest,
+                matrix: Arc::clone(matrix),
+            })
     }
 
     /// Whether the matrix `digest` is held.
@@ -753,8 +772,20 @@ fn receive_client(
     form: &HistoryStepClientForm,
     witness: &HistoryStepClientWitness,
 ) -> Result<ReceivedClient, HistoryStepError> {
-    let matrix = witness.matrix.as_ref();
-    if FieldShape::of(matrix) != form.shape()
+    check_client_witness_form(form, witness)?;
+    let started = std::time::Instant::now();
+    let digest = witness.matrix.structural_statement_digest();
+    let digest_ms = started.elapsed().as_secs_f64() * 1e3;
+    receive_client_with_digest(form, witness, digest, digest_ms)
+}
+
+/// The witness is of `form`: its matrix's shape, its PCS parameters, its IO
+/// length and its registry's depth.
+fn check_client_witness_form(
+    form: &HistoryStepClientForm,
+    witness: &HistoryStepClientWitness,
+) -> Result<(), HistoryStepError> {
+    if FieldShape::of(witness.matrix.as_ref()) != form.shape()
         || pcs_params_statement_bytes(&witness.commitment.params)
             != pcs_params_statement_bytes(form.pcs_params())
         || witness.io.len() != form.io_spec().io_len
@@ -762,10 +793,20 @@ fn receive_client(
     {
         return Err(HistoryStepError::ClientProof);
     }
+    Ok(())
+}
+
+/// [`receive_client`] with `D` already computed from `witness.matrix` (in
+/// `digest_ms`): by it, or when the matrix was authenticated.
+fn receive_client_with_digest(
+    form: &HistoryStepClientForm,
+    witness: &HistoryStepClientWitness,
+    digest: Hash,
+    digest_ms: f64,
+) -> Result<ReceivedClient, HistoryStepError> {
+    check_client_witness_form(form, witness)?;
+    let matrix = witness.matrix.as_ref();
     let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
-    let started = std::time::Instant::now();
-    let digest = matrix.structural_statement_digest();
-    let digest_ms = started.elapsed().as_secs_f64() * 1e3;
     witness
         .registry
         .position(&digest)
@@ -996,6 +1037,26 @@ impl PreparedHistoryStepClient {
         Ok(Self {
             form: form.clone(),
             received: receive_client(form, witness)?,
+        })
+    }
+
+    /// The pre-pass of `witness` whose matrix is `matrix`, held and
+    /// authenticated: its `D` is the one computed when it was authenticated,
+    /// not computed again (one structural pass, 93 % of a reception at
+    /// 203 MiB). Refused unless `witness.matrix` is that very matrix (the
+    /// same allocation, immutable): an equal copy or another matrix borrows
+    /// nothing.
+    pub fn prepare_authenticated(
+        form: &HistoryStepClientForm,
+        witness: &HistoryStepClientWitness,
+        matrix: &AuthenticatedClientMatrix,
+    ) -> Result<Self, HistoryStepError> {
+        if !Arc::ptr_eq(&witness.matrix, &matrix.matrix) {
+            return Err(HistoryStepError::ClientProof);
+        }
+        Ok(Self {
+            form: form.clone(),
+            received: receive_client_with_digest(form, witness, matrix.digest, 0.0)?,
         })
     }
 

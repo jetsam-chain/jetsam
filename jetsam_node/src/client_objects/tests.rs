@@ -1038,3 +1038,92 @@ fn a_client_proof_is_refused_until_its_client_is_active() {
     assert_eq!(reopened.reload_bundles(&registry, &rules(), 11).unwrap(), 0);
     assert_eq!(reopened.queued(), 0);
 }
+
+/// v1.5.0 (2026-10-08): receiving one client proof of a held 203 MiB matrix
+/// cost 5.5 s on 32 threads and 84 s on two cores, 93 % of it digesting the
+/// matrix again (`D`), although the node authenticated it, once, when it was
+/// held. Reception reuses the digest computed then: it must cost well under
+/// one structural pass over the matrix.
+///
+/// Production scale, on the files `bench_prover`'s `jetsam_client_batch_demo`
+/// writes for the batch of 128 (`matrix.bin`, `client-0.json`, `proof-0.bin`):
+/// `JETSAM_CLIENT_BATCH_DIR=<dir> cargo test --release -p jetsam_node --lib
+/// -- --ignored receiving_a_client_proof`.
+#[test]
+#[ignore = "production scale (a 203 MiB matrix and its proof on disk): set JETSAM_CLIENT_BATCH_DIR, run with --release -- --ignored"]
+fn receiving_a_client_proof_does_not_digest_its_held_matrix_again() {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("JETSAM_CLIENT_BATCH_DIR")
+            .expect("JETSAM_CLIENT_BATCH_DIR: the batch demo's output directory"),
+    );
+    let client: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("client-0.json")).unwrap()).unwrap();
+    let field = |name: &str| -> Hash32 {
+        hex::decode(client[name].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let file = std::fs::read(dir.join("matrix.bin")).unwrap();
+    let proof = std::fs::read(dir.join(client["proof_hex_file"].as_str().unwrap())).unwrap();
+    let id = MatrixFileId {
+        matrix_digest: field("matrix_digest"),
+        file_root: field("matrix_file_root"),
+        file_len: file.len() as u32,
+    };
+    let form = HistoryStepClientForm::canonical();
+
+    // One structural pass, the yardstick.
+    let matrix = FieldR1cs::read_artifact_unbound(
+        &mut &file[..],
+        form.shape(),
+        CLIENT_MATRIX_MAX_FILE_BYTES as usize,
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert_eq!(matrix.structural_statement_digest(), id.matrix_digest);
+    let digest_pass = started.elapsed();
+    drop(matrix);
+
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let started = Instant::now();
+    objects.insert_matrix_file(id, &file).unwrap();
+    eprintln!("insert_matrix_file (authentication): {:?}", started.elapsed());
+    drop(file);
+    let mut registry = ClientRegistryState::new();
+    registry.apply(&ClientObjectsEffect {
+        registrations: vec![ClientRegistryEntry {
+            index: 0,
+            matrix_digest: id.matrix_digest,
+            matrix_file_root: id.file_root,
+            matrix_file_len: id.file_len,
+            registered_at: 10,
+            active_from: 12,
+            license: LicenseSplit::default(),
+        }],
+        ..ClientObjectsEffect::default()
+    });
+    let submission = ClientSubmission {
+        matrix_digest: id.matrix_digest,
+        io_commitment: field("io_commitment"),
+    };
+    let bytes = ClientProofBundle::new(submission, payment_of(&submission, 2_000_000), proof)
+        .unwrap()
+        .encode();
+    let started = Instant::now();
+    objects
+        .receive_bundle(&bytes, &registry, &rules(), 13)
+        .unwrap();
+    let reception = started.elapsed();
+    eprintln!(
+        "one structural digest pass: {digest_pass:?}; receive_bundle: {reception:?} \
+         (rayon threads: {})",
+        rayon::current_num_threads()
+    );
+    assert_eq!(objects.queued(), 1);
+    assert!(
+        reception < digest_pass / 2,
+        "reception {reception:?} is not well under one digest pass {digest_pass:?}"
+    );
+}

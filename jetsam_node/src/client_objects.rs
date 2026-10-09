@@ -825,11 +825,12 @@ impl ClientObjects {
         if registry.entry(&digest).is_none() {
             return Err(ClientObjectsError::UnknownClient(hex32(&digest)));
         }
-        let matrix = jetsam_recursive::HistoryStepClientMatrices::client_matrix(
-            self.matrices.as_ref(),
-            &digest,
-        )
-        .ok_or_else(|| ClientObjectsError::UnknownClient(hex32(&digest)))?;
+        // Held, so authenticated once already: the pre-pass reuses that `D`
+        // instead of digesting the matrix again.
+        let authenticated = self
+            .matrices
+            .authenticated(&digest)
+            .ok_or_else(|| ClientObjectsError::UnknownClient(hex32(&digest)))?;
         let (field_proof, root, io) =
             jetsam_recursive::decode_history_step_client_proof(&self.form, proof_bytes)
                 .map_err(|error| ClientObjectsError::Proof(error.to_string()))?;
@@ -845,11 +846,11 @@ impl ClientObjects {
                 params: self.form.pcs_params().clone(),
             },
             io,
-            matrix,
+            matrix: Arc::clone(authenticated.matrix()),
             registry: HistoryStepClientRegistry::new(self.form.registry_depth(), registry.digests())
                 .map_err(|error| ClientObjectsError::Proof(error.to_string()))?,
         };
-        PreparedHistoryStepClient::prepare(&self.form, &witness)
+        PreparedHistoryStepClient::prepare_authenticated(&self.form, &witness, &authenticated)
             .map_err(|error| ClientObjectsError::Proof(error.to_string()))
     }
 
