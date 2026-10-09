@@ -18,7 +18,9 @@ For a child block to extend a parent, all of the following must hold:
    more than 120 seconds ahead of local wall clock;
 4. `difficulty_target` is the exact ASERT target derived from canonical
    history and is not easier than the protocol floor;
-5. the Poseidon2b PoW digest is strictly less than the little-endian target;
+5. the PoW digest is strictly less than the little-endian target — the
+   TowerHash digest below height 24,846, `TowerWalk(TowerHash(fields))` from
+   that height (see [Proof of work](proof-of-work.md));
 6. the physical block encoding and all transaction groups are canonical;
 7. the mandatory primary reward and any scheduled development payout are
    exact;
@@ -95,6 +97,19 @@ by consensus.
 
 Likewise, mining requires one authenticated peer in the official node. That
 is an operational isolation guard, not a block-validity vote.
+
+## Activation heights
+
+Rule changes are hard forks activated at fixed heights compiled into the node.
+A block is always judged under the rules of its own height. On the public
+network:
+
+| Version | Height | Change |
+|---|---:|---|
+| v1.1 | 2,000 | Corrected ASERT difficulty polynomial |
+| v1.2 | 8,450 | 255-page proof class; HistoryStep terminal limit of 1,200,000 bytes |
+| v1.3 | 17,750 | Transaction anchor spans two epochs; the small proof class holds 24 pages |
+| v1.4 | 24,846 | Proof of work becomes TowerWalk; the first walked block carries a fixed `2^235` anchor target |
 
 ## Genesis and network identity
 

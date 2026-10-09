@@ -1,13 +1,13 @@
 # FROST-GKR
 
-**FROST-GKR 是 Jetsam Lab 的研究成果：一种面向 `GF(2^128)` 上批量
-Poseidon2b 执行的全局承诺执行轨迹协议。**
+**FROST-GKR 是一种面向 `GF(2^128)` 上批量 Poseidon2b 执行的全局承诺执行轨迹
+协议，由本链所派生自的上游项目开发（见 [NOTICE](../../../../NOTICE)），在此原样继承。**
 
 FROST 是 **Frobenius Reduction over Shifted Tables** 的缩写。该协议将整批
 含四个状态元素的 Poseidon2b 执行归约为三个已承诺[多线性多项式](../reference/glossary.md#multilinear-extension)的打开。
 
 [阅读论文](https://jetsamchain.com/research/) ·
-[阅读 Jetsam Lab 研究文章](https://jetsamchain.com/research/) ·
+[阅读研究文章](https://jetsamchain.com/research/) ·
 [查看参考实现](https://github.com/ignotusnemo/frost-gkr)
 
 ## 重复计算问题
@@ -133,4 +133,5 @@ Fiat-Shamir 挑战值、终端断言和递归区域认证提升到 `GF(2^256)`�
 基于 `GF(2^128)` 的基准结果。
 
 因此，FROST-GKR 既是一项可复用的研究成果，也是 Jetsam 证明架构的具体
-组成部分。FROST-GKR 是 **Jetsam Lab** 的研究成果。
+组成部分。FROST-GKR 由本链所派生自的上游项目开发（见
+[NOTICE](../../../../NOTICE)），在此原样继承。

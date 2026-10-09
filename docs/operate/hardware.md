@@ -68,7 +68,11 @@ The following are operational starting points, not consensus minima:
 | B255 miner | Benchmark the exact host | 16 GiB or more | NVMe preferred |
 
 CPU generation, clock, memory bandwidth and the selected carry-less
-multiplication backend matter more than a provider's vCPU label. Mining
+multiplication backend matter more than a provider's vCPU label. For the
+proof-of-work search, what matters since block 24,846 is private L2 cache: each
+TowerWalk thread needs a 512 KiB scratchpad, so count physical cores and their
+L2 size, not vCPUs, and measure with `jetsam --bench` (the `walked digest`
+line). Mining
 capacity must be measured on the final host with the production C1 profile and
 authenticated matrix pack. The required procedure is in
 [Performance measurement](../reference/performance.md).

@@ -10,7 +10,9 @@ Mining has two ordered phases:
 
 1. select transactions, construct the State transition and prove the complete
    nonce-independent block;
-2. search the 128-bit nonce of the fixed Poseidon2b header.
+2. search the 128-bit nonce of the fixed header. Since block 24,846 each
+   attempt is `TowerWalk(TowerHash(fields))`, a Poseidon2b sponge followed by
+   a walk over a 512 KiB scratchpad held in the core's L2 cache.
 
 This order prevents proof of work from being spent on a block whose transition
 has not yet been established.
@@ -36,10 +38,12 @@ The proof stack ships two authenticated matrix classes:
 
 | Class | Hypercube dimension | Effective page capacity |
 |---|---:|---:|
-| B25 | `m=22` | Up to 25 |
+| Small (`B25`) | `m=22` | Up to 24 since block 17,750 (25 before) |
 | B255 | `m=24` | Up to 255 |
 
-Every miner begins with B25. The node may use B255 when complete proof
+The small class keeps its launch name `B25` in the code; under the v1.3 rules
+in force since block 17,750 it holds 24 page positions. Every miner begins
+with the small class. The node may use B255 when complete proof
 preparation timing shows that the larger relation is appropriate for the
 90-second block target. The decision uses measured end-to-end preparation, not
 only one internal proving phase.
@@ -91,7 +95,13 @@ opaque, single-use template containing:
 - template identifier;
 - exact 16-field Poseidon2b PoW schedule;
 - target;
+- `pow_walk`, `true` when the template's height requires the TowerWalk digest;
 - expiry and display metadata.
+
+The worker applies the walk because the template says so, never because of
+the height it reads: the activation height is a consensus constant of the
+node. `jetsam-miner` also declares `X-Jetsam-PoW: walk` on its requests so a
+pool can tell it from a pre-fork miner.
 
 It returns one little-endian 128-bit nonce. The node verifies the nonce against
 the still-live template, seals the already-proved block and invalidates the

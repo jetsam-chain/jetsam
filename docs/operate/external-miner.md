@@ -31,6 +31,10 @@ Limit worker threads when needed:
 jetsam-miner --key 'LONG-RANDOM-TOKEN' --threads 8
 ```
 
+Each walking thread keeps a 512 KiB scratchpad in the core's L2 cache, so one
+thread per physical core is usually the best setting. Measure first with
+`jetsam --bench` and read its `walked digest` line.
+
 ## Remote worker
 
 Do not expose an unencrypted bearer token and general RPC interface directly
@@ -77,8 +81,16 @@ The worker still cannot modify the proved template.
 ## Template lifecycle
 
 `getBlockTemplate` returns an opaque single-use ID, 16-field PoW schedule,
-nonce index and target. The worker searches random, independent nonce ranges
-and calls `submitBlock` with exactly 16 little-endian nonce bytes.
+nonce index, target and, from block 24,846, `pow_walk: true`. With that flag
+the worker must search `TowerWalk(TowerHash(fields))` instead of the TowerHash
+digest alone; `jetsam-miner` reads the flag, never the height. The worker
+searches random, independent nonce ranges and calls `submitBlock` with exactly
+16 little-endian nonce bytes.
+
+Each request from `jetsam-miner` carries two HTTP headers: `X-Jetsam-Version`
+(its release) and `X-Jetsam-PoW: walk` (it can search the walked digest). A
+node ignores both. A pool uses the second to tell walking miners from pre-fork
+miners, which cannot find a block on TowerWalk work.
 
 A template expires after 120 seconds. It is also invalidated by a canonical tip
 change, successful submission or node-side cancellation. A stale result is
@@ -98,5 +110,7 @@ If requests fail:
 - a custom coinbase error means the node did not enable it;
 - repeated stale templates usually mean the node is receiving new tips or
   proof preparation exceeds the template lifecycle;
+- `-32025` (digest not below the target) on every submission means the worker
+  ignored `pow_walk` — a miner built before v1.4 searches the wrong digest;
 - no template means the node is not synchronized, lacks the peer quorum or is
   not in `extminer` mode.

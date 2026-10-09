@@ -376,6 +376,7 @@ MiningInfo {
   active_slot_count: u64
   pow_hashrate_hps: number | null
   pow_hashes_total: u64
+  pow_walk?: bool
 }
 
 NodeStatus {
@@ -390,6 +391,11 @@ NodeStatus {
   worker_threads: usize
 }
 ```
+
+`pow_walk` is `true` when the next block is governed by the TowerWalk proof of
+work (from block 24,846 on the public network). It is omitted when `false`, so
+a client written for an earlier node reads it as `false`. Read the field; do
+not derive it from the height.
 
 `isolated_mining` is status information from a node started in a special
 operator context. Public deployments should not use it as a remote control or
@@ -686,6 +692,7 @@ BlockTemplateResponse {
   height: u64
   expires_in_seconds: u64
   n_txs: usize
+  pow_walk?: bool
   tx_input_counts?: usize[]
   tx_output_counts?: usize[]
   coinbase_value_micro_jtm: u64
@@ -704,6 +711,13 @@ BlockTemplateResponse {
 `pow_fields_hex` contains 16 consecutive 16-byte little-endian fields. The
 worker replaces the field at `nonce_field_index` — read that index from the
 response rather than hardcoding it. On this chain it is **0**.
+
+`pow_walk: true` means a valid nonce must satisfy
+`TowerWalk(TowerHash(patched_fields)) < difficulty_target`; absent means
+`false`, and the TowerHash digest alone is compared. The node sets it from the
+template's own height, and the same holds for `waitBlockTemplate`. A miner
+must read this field rather than derive it from the height: a miner that
+ignores it has its nonces refused with `-32025` once the walk is in force.
 
 The seven fields below the blank line let a pool answer "is this the same work
 I already handed out, and how long have I got?" without diffing hex. They carry

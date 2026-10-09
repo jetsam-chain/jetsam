@@ -1,14 +1,15 @@
 # FROST-GKR
 
-**FROST-GKR is research by Jetsam Lab: a global committed-trace protocol for
-batched Poseidon2b over `GF(2^128)`.**
+**FROST-GKR is a global committed-trace protocol for batched Poseidon2b over
+`GF(2^128)`, developed by the upstream project this chain derives from (see
+[NOTICE](../../NOTICE)) and inherited here unchanged.**
 
 The name expands to **Frobenius Reduction over Shifted Tables**. The protocol
 turns an entire batch of width-four Poseidon2b executions into openings of
 three committed multilinear polynomials.
 
 [Read the paper](https://jetsamchain.com/research/) ·
-[Open the Jetsam Lab research article](https://jetsamchain.com/research/) ·
+[Open the research article](https://jetsamchain.com/research/) ·
 [Inspect the reference implementation](https://github.com/ignotusnemo/frost-gkr)
 
 ## The repeated-computation problem
@@ -155,4 +156,5 @@ the reduction; it does not change the three-column trace, the degree-nine
 relation or the `GF(2^128)` benchmark reported in the paper.
 
 FROST-GKR is therefore a reusable research result as well as a concrete part
-of Jetsam's proof architecture. It is research by **Jetsam Lab**.
+of Jetsam's proof architecture. It was developed by the upstream project this
+chain derives from (see [NOTICE](../../NOTICE)) and is inherited here unchanged.
