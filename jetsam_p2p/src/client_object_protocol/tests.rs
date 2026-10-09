@@ -516,3 +516,16 @@ fn a_registration_notice_carries_a_paid_registration_and_nothing_else() {
         })
     );
 }
+
+/// A refused notice names the client's `D` in hex (the log line of a node
+/// that drops a kept or relayed registration goes through this message).
+#[test]
+fn a_refused_notice_names_its_digest_in_hex() {
+    let message = ClientTransportError::RegistrationRefused(ClientObjectError::NotInCatalogue {
+        matrix_digest: [0xab; 32],
+    })
+    .to_string();
+    assert!(message.contains(&"ab".repeat(32)), "{message}");
+    assert!(message.contains("NotInCatalogue"), "{message}");
+    assert!(!message.contains("171"), "{message}");
+}

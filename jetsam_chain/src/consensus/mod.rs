@@ -217,6 +217,7 @@ impl std::fmt::Display for ConsensusError {
             Self::BelowMinFee { required, actual } => {
                 write!(f, "BelowMinFee: required={required} actual={actual}")
             }
+            Self::ClientObject(error) => write!(f, "ClientObject({error})"),
             other => write!(f, "{other:?}"),
         }
     }

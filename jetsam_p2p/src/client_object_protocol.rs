@@ -93,7 +93,11 @@ pub enum ClientTransportError {
 
 impl std::fmt::Display for ClientTransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            // The refusal's own message: its digest in hex.
+            Self::RegistrationRefused(error) => write!(f, "RegistrationRefused({error})"),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 

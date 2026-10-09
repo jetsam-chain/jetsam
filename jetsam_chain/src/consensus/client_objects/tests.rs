@@ -2074,3 +2074,52 @@ fn the_catalogue_changes_nothing_below_the_v1_5_height() {
         assert_eq!(ClientObjectRules::CONSENSUS.activation_height, None);
     }
 }
+
+/// A refusal names a client's `D` (and any digest) in hex, as every listing,
+/// file name and RPC answer does: on the test network the closed catalogue's
+/// refusal printed `NotInCatalogue { matrix_digest: [171, 171, …] }`, a
+/// digest nobody could match against `listClients` or the catalogue. An
+/// address is named by its bech32m form. Through the consensus error too: a
+/// refused block's log line goes through it.
+#[test]
+fn a_refusal_names_digests_in_hex() {
+    let digest = [0xab; 32];
+    let hex = "ab".repeat(32);
+    for error in [
+        ClientObjectError::NotInCatalogue {
+            matrix_digest: digest,
+        },
+        ClientObjectError::DuplicateRegistration {
+            matrix_digest: digest,
+        },
+        ClientObjectError::ClientNotRegistered {
+            matrix_digest: digest,
+        },
+        ClientObjectError::ClientNotYetActive {
+            matrix_digest: digest,
+            active_from: 680,
+        },
+    ] {
+        for message in [
+            error.to_string(),
+            crate::consensus::ConsensusError::ClientObject(error.clone()).to_string(),
+        ] {
+            assert!(message.contains(&hex), "{message}");
+            assert!(!message.contains("171"), "{message}");
+            assert!(
+                message.contains(format!("{error:?}").split([' ', '(']).next().unwrap()),
+                "the refusal keeps its name: {message}"
+            );
+        }
+    }
+    let active = ClientObjectError::ClientNotYetActive {
+        matrix_digest: digest,
+        active_from: 680,
+    }
+    .to_string();
+    assert!(active.contains("680"), "{active}");
+    let owner = Address([0xab; 32]);
+    let locked = ClientObjectError::SpendFromLockedAddress { owner }.to_string();
+    assert!(locked.contains(&owner.to_bech32()), "{locked}");
+    assert!(!locked.contains("171"), "{locked}");
+}

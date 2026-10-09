@@ -1032,9 +1032,63 @@ impl ClientObjectError {
     }
 }
 
+/// A digest as every listing, file name and RPC answer shows it: hex.
+struct DigestHex<'a>(&'a Digest);
+
+impl std::fmt::Display for DigestHex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// The refusal's name and fields, its digests in hex and its addresses in
+/// bech32m (the derived `Debug` prints them as decimal byte arrays).
 impl std::fmt::Display for ClientObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::SpendFromLockedAddress { owner } => {
+                write!(f, "SpendFromLockedAddress {{ owner: {owner} }}")
+            }
+            Self::DuplicateRegistration { matrix_digest } => write!(
+                f,
+                "DuplicateRegistration {{ matrix_digest: {} }}",
+                DigestHex(matrix_digest)
+            ),
+            Self::NotInCatalogue { matrix_digest } => write!(
+                f,
+                "NotInCatalogue {{ matrix_digest: {} }}",
+                DigestHex(matrix_digest)
+            ),
+            Self::ClientNotRegistered { matrix_digest } => write!(
+                f,
+                "ClientNotRegistered {{ matrix_digest: {} }}",
+                DigestHex(matrix_digest)
+            ),
+            Self::ClientNotYetActive {
+                matrix_digest,
+                active_from,
+            } => write!(
+                f,
+                "ClientNotYetActive {{ matrix_digest: {}, active_from: {active_from} }}",
+                DigestHex(matrix_digest)
+            ),
+            Self::LicenseMissing {
+                destination,
+                required,
+            } => write!(
+                f,
+                "LicenseMissing {{ destination: {destination}, required: {required} }}"
+            ),
+            Self::LicenseUnderpaid {
+                destination,
+                required,
+                paid,
+            } => write!(
+                f,
+                "LicenseUnderpaid {{ destination: {destination}, required: {required}, paid: {paid} }}"
+            ),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 
