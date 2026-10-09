@@ -2164,6 +2164,40 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
             );
         }
     }
+    println!(
+        "{}",
+        v1_5_arming_line(jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT)
+    );
+}
+
+/// The v1.5 clock as `--bench` reports it: a release reads the height back
+/// from the binary it ships.
+fn v1_5_arming_line(activation: Option<u64>) -> String {
+    match activation {
+        Some(height) => {
+            format!("From block {height} the chain runs the v1.5 rules: 180-second blocks.")
+        }
+        None => "This build does not arm the v1.5 rules.".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod bench_v1_5_line_tests {
+    use super::v1_5_arming_line;
+
+    /// A release is checked against the v1.5 height the binary itself
+    /// reports, not the tree it is believed to come from.
+    #[test]
+    fn the_bench_names_the_v1_5_height_or_says_it_is_not_armed() {
+        assert_eq!(
+            v1_5_arming_line(Some(37_440)),
+            "From block 37440 the chain runs the v1.5 rules: 180-second blocks."
+        );
+        assert_eq!(
+            v1_5_arming_line(None),
+            "This build does not arm the v1.5 rules."
+        );
+    }
 }
 
 #[tokio::main]
