@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use jetsam_chain::consensus::identity::TICKER;
 use jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
 
 /// Where the daemon of *this* build listens by default.
@@ -139,28 +140,35 @@ fn fmt_hash(h: &str) -> &str {
 // CLI structure
 // ---------------------------------------------------------------------------
 
-#[derive(Parser)]
-#[command(
-    name = "jetsam-cli",
-    about = "Jetsam thin client — control a running jetsam daemon",
-    version = env!("CARGO_PKG_VERSION"),
-    long_about = "\
+/// The top-level long help, in this chain's ticker.
+fn cli_long_about() -> String {
+    format!(
+        "\
 Jetsam thin client. Connects to a running jetsam daemon via JSON-RPC.
 
 QUICK START:
   jetsam-cli status              Node info (height, hash, slots)
   jetsam-cli balance             Wallet balance
-  jetsam-cli send <addr> 10.5   Send 10.5 JTM to address
+  jetsam-cli send <addr> 10.5   Send 10.5 {TICKER} to address
   jetsam-cli history             Transaction history
   jetsam-cli mempool             Pending transactions
   jetsam-cli help                All commands
 
 AMOUNT FORMAT:
-  Amounts are in JTM (e.g. 10.5, 0.000001).
-  1 JTM = 1,000,000 μJTM — the CLI converts automatically.
+  Amounts are in {TICKER} (e.g. 10.5, 0.000001).
+  1 {TICKER} = 1,000,000 \u{03bc}{TICKER} \u{2014} the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: jetsam --mode miner --data-dir ~/.jetsam/data",
+  The daemon must be running: jetsam --mode miner --data-dir ~/.jetsam/data"
+    )
+}
+
+#[derive(Parser)]
+#[command(
+    name = "jetsam-cli",
+    about = "Jetsam thin client — control a running jetsam daemon",
+    version = env!("CARGO_PKG_VERSION"),
+    long_about = cli_long_about(),
 )]
 struct Cli {
     /// JSON-RPC endpoint of the running jetsam daemon.
@@ -301,33 +309,46 @@ enum Command {
         use_index: Option<u32>,
     },
 
-    /// Confirmed wallet balance (JTM and μJTM).
-    #[command(alias = "bal")]
+    #[command(
+        alias = "bal",
+        about = format!("Confirmed wallet balance ({TICKER} and \u{03bc}{TICKER}).")
+    )]
     Balance,
 
     /// List all confirmed UTXOs with slot index, value, and height.
     #[command(alias = "ls")]
     Utxos,
 
-    /// Send JTM to a recipient address.
-    ///
-    /// Amount is in JTM (e.g. 10.5 → 10,500,000 μJTM).
-    /// Fee is auto-computed if not specified (recommended).
-    ///
-    /// Examples:
-    ///   jetsam-cli send f784...b61e 10.5
-    ///   jetsam-cli send f784...b61e 10.5 --fee 0.01
+    #[command(
+        about = format!("Send {TICKER} to a recipient address."),
+        long_about = format!(
+            "Send {TICKER} to a recipient address.\n\n\
+             Amount is in {TICKER} (e.g. 10.5 \u{2192} 10,500,000 \u{03bc}{TICKER}).\n\
+             Fee is auto-computed if not specified (recommended).\n\n\
+             Examples:\n  \
+             jetsam-cli send f784...b61e 10.5\n  \
+             jetsam-cli send f784...b61e 10.5 --fee 0.01"
+        )
+    )]
     Send {
         /// Recipient address (canonical bech32m j1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount in JTM  (1 JTM = 1 000 000 μJTM).
-        /// Examples: "50" = 50 JTM, "0.5" = 500 000 μJTM, "0.000001" = 1 μJTM (minimum).
-        /// Tip: for programmatic use the RPC walletSend accepts raw μJTM directly.
-        #[arg(value_name = "AMOUNT")]
+        #[arg(
+            value_name = "AMOUNT",
+            help = format!(
+                "Amount in {TICKER}  (1 {TICKER} = 1 000 000 \u{03bc}{TICKER}). \
+                 Examples: \"50\" = 50 {TICKER}, \"0.5\" = 500 000 \u{03bc}{TICKER}, \
+                 \"0.000001\" = 1 \u{03bc}{TICKER} (minimum). \
+                 Tip: for programmatic use the RPC walletSend accepts raw \u{03bc}{TICKER} directly."
+            )
+        )]
         amount: String,
-        /// Transaction fee in JTM. Omit for automatic fee calculation.
-        #[arg(long, value_name = "FEE_MICRO_JTM")]
+        #[arg(
+            long,
+            value_name = "FEE",
+            help = format!("Transaction fee in {TICKER}. Omit for automatic fee calculation.")
+        )]
         fee: Option<String>,
         /// Show the ordinary-transaction plan without submitting.
         #[arg(long)]
@@ -752,8 +773,8 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
         kv("Status", &c!(GRN, "live UTXO"));
         kv2(
             "Value",
-            &format!("{} JTM", jetsam_str(value)),
-            &format!("({value} μJTM)"),
+            &format!("{} {TICKER}", jetsam_str(value)),
+            &format!("({value} μ{TICKER})"),
         );
         kv("Creation ID", &creation_id.to_string());
         kv("Owner", ctx.h(owner));
@@ -845,7 +866,7 @@ async fn cmd_utxos_of(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
     }
     let total: u64 = slots.iter().map(|s| s["value"].as_u64().unwrap_or(0)).sum();
     separator(74);
-    println!("  {:<12}  {:>20}  {:>14}", "slot", "creation id", "JTM");
+    println!("  {:<12}  {:>20}  {:>14}", "slot", "creation id", TICKER);
     separator(74);
     for s in &slots {
         let slot = s["slot_index"].as_u64().unwrap_or(0);
@@ -1002,8 +1023,8 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     );
     kv2(
         "Block reward",
-        &format!("{} JTM/block", jetsam_str(reward_micro)),
-        &format!("({reward_micro} \u{03bc}JTM)"),
+        &format!("{} {TICKER}/block", jetsam_str(reward_micro)),
+        &format!("({reward_micro} \u{03bc}{TICKER})"),
     );
     kv("Active UTXOs", &active.to_string());
     if !payout.is_empty() {
@@ -1060,28 +1081,28 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyho
     ));
     kv2(
         "Min relay fee",
-        &format!("{} JTM", jetsam_str(fee_micro)),
-        &format!("({fee_micro} μJTM)"),
+        &format!("{} {TICKER}", jetsam_str(fee_micro)),
+        &format!("({fee_micro} μ{TICKER})"),
     );
     kv(
         "Base",
-        &format!("{} μJTM", b["base"].as_u64().unwrap_or(0)),
+        &format!("{} μ{TICKER}", b["base"].as_u64().unwrap_or(0)),
     );
     kv(
         "Inputs",
-        &format!("{} μJTM", b["input"].as_u64().unwrap_or(0)),
+        &format!("{} μ{TICKER}", b["input"].as_u64().unwrap_or(0)),
     );
     kv(
         "Outputs",
-        &format!("{} μJTM", b["output"].as_u64().unwrap_or(0)),
+        &format!("{} μ{TICKER}", b["output"].as_u64().unwrap_or(0)),
     );
     kv(
         "State growth burned",
-        &format!("{} μJTM", b["state_growth"].as_u64().unwrap_or(0)),
+        &format!("{} μ{TICKER}", b["state_growth"].as_u64().unwrap_or(0)),
     );
     kv(
         "Miner claimable",
-        &format!("{} μJTM", b["miner_claimable"].as_u64().unwrap_or(0)),
+        &format!("{} μ{TICKER}", b["miner_claimable"].as_u64().unwrap_or(0)),
     );
     println!();
     println!(
@@ -1129,8 +1150,8 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     let fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
     kv2(
         "Fee",
-        &format!("{} JTM", jetsam_str(fee)),
-        &format!("({fee} \u{03bc}JTM)"),
+        &format!("{} {TICKER}", jetsam_str(fee)),
+        &format!("({fee} \u{03bc}{TICKER})"),
     );
     kv(
         "Inputs",
@@ -1206,8 +1227,8 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv2("Pending", &size.to_string(), "transactions");
     kv2(
         "Fee floor",
-        &format!("{} JTM", jetsam_str(fee_floor)),
-        &format!("({fee_floor} μJTM minimum)"),
+        &format!("{} {TICKER}", jetsam_str(fee_floor)),
+        &format!("({fee_floor} μ{TICKER} minimum)"),
     );
 
     if txs.is_empty() {
@@ -1221,12 +1242,12 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}{}",
-            BOLD, "tx hash", "fee (μJTM)", "pages", "in", "out", "class", "proof", RST
+            BOLD, "tx hash", format!("fee (\u{03bc}{TICKER})"), "pages", "in", "out", "class", "proof", RST
         );
     } else {
         println!(
             "  {:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}",
-            "tx hash", "fee (μJTM)", "pages", "in", "out", "class", "proof"
+            "tx hash", format!("fee (\u{03bc}{TICKER})"), "pages", "in", "out", "class", "proof"
         );
     }
     separator(100);
@@ -1300,7 +1321,7 @@ async fn cmd_address(
         } else {
             println!("  {}", addr);
         }
-        println!("  Balance: {bal:.6} JTM");
+        println!("  Balance: {bal:.6} {TICKER}");
         println!();
         println!(
             "  {} Sends now spend from this address only; change returns here.",
@@ -1395,7 +1416,7 @@ async fn cmd_address(
         }
         println!();
         println!(
-            "  {} Sends spend from this address; share it to receive JTM here.",
+            "  {} Sends spend from this address; share it to receive {TICKER} here.",
             c!(DIM, "↑")
         );
         println!(
@@ -1440,7 +1461,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     section("Wallet balance (active address)");
     if is_tty() {
         println!(
-            "  {}Balance:{} {}{} JTM{} {}({} \u{03bc}JTM){}  {}({} UTXOs){}",
+            "  {}Balance:{} {}{} {TICKER}{} {}({} \u{03bc}{TICKER}){}  {}({} UTXOs){}",
             CYN,
             RST,
             BOLD,
@@ -1455,7 +1476,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         );
     } else {
         println!(
-            "  Balance:           {} JTM  ({micro} \u{03bc}JTM)  ({utxos} UTXOs)",
+            "  Balance:           {} {TICKER}  ({micro} \u{03bc}{TICKER})  ({utxos} UTXOs)",
             jetsam_str(micro)
         );
     }
@@ -1463,7 +1484,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if pending_out > 0 {
         if is_tty() {
             println!(
-                "  {}Pending:{}  -{} JTM outbound  {}({} \u{03bc}JTM locked){}",
+                "  {}Pending:{}  -{} {TICKER} outbound  {}({} \u{03bc}{TICKER} locked){}",
                 YLW,
                 RST,
                 jetsam_str(pending_out),
@@ -1472,7 +1493,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
                 RST
             );
             println!(
-                "  {}Spendable:{} {}{} JTM{}",
+                "  {}Spendable:{} {}{} {TICKER}{}",
                 CYN,
                 RST,
                 BOLD,
@@ -1481,10 +1502,10 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             );
         } else {
             println!(
-                "  Pending:           -{} JTM outbound ({pending_out} \u{03bc}JTM locked)",
+                "  Pending:           -{} {TICKER} outbound ({pending_out} \u{03bc}{TICKER} locked)",
                 jetsam_str(pending_out)
             );
-            println!("  Spendable:         {} JTM", jetsam_str(spendable));
+            println!("  Spendable:         {} {TICKER}", jetsam_str(spendable));
         }
     }
 
@@ -1541,12 +1562,12 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}{}",
-            BOLD, "slot", "creation id", "JTM", "key", "at block", "address", RST
+            BOLD, "slot", "creation id", TICKER, "key", "at block", "address", RST
         );
     } else {
         println!(
             "  {:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}",
-            "slot", "creation id", "JTM", "key", "at block", "address"
+            "slot", "creation id", TICKER, "key", "at block", "address"
         );
     }
     separator(96);
@@ -1605,11 +1626,11 @@ async fn cmd_send(
 
     // Warn if the amount looks suspiciously large (> 1 000 000 JTM = 1e12 μJTM).
     // This catches the common mistake of passing μJTM to a JTM-denomination CLI.
-    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M JTM in μJTM
+    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M coins in micro-units
     if amount_micro > MAX_WARN_MICRO {
         eprintln!(
-            "⚠  Large amount: {} JTM ({} μJTM). \
-             Note: this CLI takes JTM, not μJTM. Press Ctrl-C to cancel.",
+            "⚠  Large amount: {} {TICKER} ({} μ{TICKER}). \
+             Note: this CLI takes {TICKER}, not μ{TICKER}. Press Ctrl-C to cancel.",
             jetsam_str(amount_micro),
             amount_micro
         );
@@ -1624,18 +1645,18 @@ async fn cmd_send(
     // figure typed as if it were micro-JTM, or a stray zero, hands the whole
     // amount to a miner with no way back. Refuse anything absurd rather than
     // let a typo cost a hundred times the transfer.
-    const FEE_SANITY_LIMIT_MICRO: u64 = 1_000_000; // 1 JTM
+    const FEE_SANITY_LIMIT_MICRO: u64 = 1_000_000; // 1 coin
     if fee_micro > FEE_SANITY_LIMIT_MICRO || (amount_micro > 0 && fee_micro > amount_micro) {
         bail!(
-            "Refusing a fee of {} JTM.\n\
-             \tA fee is normally a few thousandths of one JTM, and this one is \n\
+            "Refusing a fee of {} {TICKER}.\n\
+             \tA fee is normally a few thousandths of one {TICKER}, and this one is \n\
              \t{}. Fees are paid to a miner and cannot be recovered.\n\
              \tOmit --fee to let the node price it, or pass a smaller figure.",
             jetsam_str(fee_micro),
             if fee_micro > FEE_SANITY_LIMIT_MICRO {
-                "above the one-JTM sanity limit".to_string()
+                format!("above the one-{TICKER} sanity limit")
             } else {
-                format!("larger than the {} JTM you are sending", jetsam_str(amount_micro))
+                format!("larger than the {} {TICKER} you are sending", jetsam_str(amount_micro))
             }
         );
     }
@@ -1678,15 +1699,15 @@ async fn cmd_send(
         kv("To", to_clean);
         kv2(
             "Amount",
-            &format!("{} JTM", jetsam_str(amount_micro)),
-            &format!("({amount_micro} μJTM)"),
+            &format!("{} {TICKER}", jetsam_str(amount_micro)),
+            &format!("({amount_micro} μ{TICKER})"),
         );
         let planned_fee = result["fee_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Fee",
-            &format!("{} JTM", jetsam_str(planned_fee)),
+            &format!("{} {TICKER}", jetsam_str(planned_fee)),
             &format!(
-                "({planned_fee} μJTM){}",
+                "({planned_fee} μ{TICKER}){}",
                 if fee.is_none() { " auto" } else { "" }
             ),
         );
@@ -1701,8 +1722,8 @@ async fn cmd_send(
         let change = result["change_micro_jtm"].as_u64().unwrap_or(0);
         kv2(
             "Change",
-            &format!("{} JTM", jetsam_str(change)),
-            &format!("({change} μJTM)"),
+            &format!("{} {TICKER}", jetsam_str(change)),
+            &format!("({change} μ{TICKER})"),
         );
         println!();
         println!(
@@ -1713,9 +1734,9 @@ async fn cmd_send(
     }
 
     // --- Confirm interactively for large amounts ---
-    if amount_micro >= 1_000_000_000 /* 1000 JTM */ && is_tty() {
+    if amount_micro >= 1_000_000_000 /* 1000 coins */ && is_tty() {
         print!(
-            "  {} Send {}{} JTM{} to {}{}{}? [y/N] ",
+            "  {} Send {}{} {TICKER}{} to {}{}{}? [y/N] ",
             c!(YLW, "⚠"),
             BOLD,
             jetsam_str(amount_micro),
@@ -1753,13 +1774,13 @@ async fn cmd_send(
             kv("To", to_clean);
             kv2(
                 "Amount",
-                &format!("{} JTM", jetsam_str(amount_micro)),
-                &format!("({amount_micro} μJTM)"),
+                &format!("{} {TICKER}", jetsam_str(amount_micro)),
+                &format!("({amount_micro} μ{TICKER})"),
             );
             kv2(
                 "Fee",
-                &format!("{} JTM", jetsam_str(actual_fee)),
-                &format!("({actual_fee} μJTM){auto_tag}"),
+                &format!("{} {TICKER}", jetsam_str(actual_fee)),
+                &format!("({actual_fee} μ{TICKER}){auto_tag}"),
             );
             println!();
             println!(
@@ -1782,7 +1803,7 @@ async fn cmd_send(
                 // Try to extract amounts
                 format!(
                     "Insufficient funds.\n\
-                     \t  Requested: {} JTM  ({amount_micro} μJTM)\n\
+                     \t  Requested: {} {TICKER}  ({amount_micro} μ{TICKER})\n\
                      \t  Run 'jetsam-cli balance' to check your current balance.",
                     jetsam_str(amount_micro)
                 )
@@ -1865,12 +1886,12 @@ async fn cmd_history(
     if is_tty() {
         println!(
             "  {}  {:<8}  {:<8}  {:>14}  {:<16}  {}{}",
-            BOLD, "block", "dir", "JTM", "own[idx]", "counterparty", RST
+            BOLD, "block", "dir", TICKER, "own[idx]", "counterparty", RST
         );
     } else {
         println!(
             "  {:<8}  {:<8}  {:>14}  {:<16}  {}",
-            "block", "dir", "JTM", "own[idx]", "counterparty"
+            "block", "dir", TICKER, "own[idx]", "counterparty"
         );
     }
     separator(88);
@@ -1920,9 +1941,9 @@ async fn cmd_history(
             "",
             "",
             GRN,
-            format!("+ {} JTM received", jetsam_str(totals.received)),
+            format!("+ {} {TICKER} received", jetsam_str(totals.received)),
             RED,
-            format!("  - {} JTM sent", jetsam_str(totals.sent)),
+            format!("  - {} {TICKER} sent", jetsam_str(totals.sent)),
             RST
         );
     } else {
@@ -1986,7 +2007,7 @@ fn tally_history(entries: &[&Value]) -> HistoryTotals {
 fn orphaned_total_line(totals: &HistoryTotals) -> Option<String> {
     (totals.orphaned_blocks > 0).then(|| {
         format!(
-            "orphaned coinbases: {} block{}, {} JTM (not spendable)",
+            "orphaned coinbases: {} block{}, {} {TICKER} (not spendable)",
             totals.orphaned_blocks,
             if totals.orphaned_blocks == 1 { "" } else { "s" },
             jetsam_str(totals.orphaned_micro)
@@ -2017,7 +2038,7 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     section("Active address reloaded");
     println!(
-        "  Index {}  \u{2022}  Snapshot height {}  \u{2022}  Found {} UTXO(s)  \u{2022}  Balance: {} JTM",
+        "  Index {}  \u{2022}  Snapshot height {}  \u{2022}  Found {} UTXO(s)  \u{2022}  Balance: {} {TICKER}",
         active_index,
         snapshot_height,
         found,
@@ -2159,7 +2180,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             &format!("#{height}"),
             &format!("unix {confirmed_unix}"),
         );
-        kv("Fee", &format!("{} ({} μJTM)", jetsam_str(fee), fee));
+        kv("Fee", &format!("{} ({} μ{TICKER})", jetsam_str(fee), fee));
         kv("Inputs", &inputs.to_string());
         kv("Outputs", &outputs.len().to_string());
         for (index, output) in outputs.iter().enumerate() {
@@ -2168,7 +2189,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             let slot = output["slot_index"].as_u64().unwrap_or(0);
             kv2(
                 &format!("  Output {}", index + 1),
-                &format!("{} ({} μJTM)", jetsam_str(amount), amount),
+                &format!("{} ({} μ{TICKER})", jetsam_str(amount), amount),
                 &format!("to {owner}, slot {slot}"),
             );
         }
@@ -2225,8 +2246,8 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     kv("Expires in", &format!("{expires_in_seconds} s"));
     kv("Nonce field", &nonce_field_index.to_string());
     kv("Difficulty", difficulty_target);
-    kv("Claimable fees", &format!("{claimable_fees} μJTM"));
-    kv("Coinbase value", &format!("{coinbase_value} μJTM"));
+    kv("Claimable fees", &format!("{claimable_fees} μ{TICKER}"));
+    kv("Coinbase value", &format!("{coinbase_value} μ{TICKER}"));
     if !pow_fields.is_empty() {
         kv2(
             "PoW fields",
@@ -2484,8 +2505,11 @@ mod history_tests {
         assert_eq!(totals.orphaned_blocks, 3);
         assert_eq!(totals.orphaned_micro, 180_030_000);
         assert_eq!(
-            orphaned_total_line(&totals).as_deref(),
-            Some("orphaned coinbases: 3 blocks, 180.030000 JTM (not spendable)")
+            orphaned_total_line(&totals),
+            Some(format!(
+                "orphaned coinbases: 3 blocks, 180.030000 {} (not spendable)",
+                jetsam_chain::consensus::identity::TICKER
+            ))
         );
     }
 
@@ -2524,5 +2548,62 @@ mod history_tests {
     fn no_orphan_line_without_orphans() {
         let entry = coinbase(10, 50_000_000, Some(true));
         assert_eq!(orphaned_total_line(&tally_history(&[&entry])), None);
+    }
+}
+
+#[cfg(test)]
+mod ticker_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+    use jetsam_chain::consensus::identity::{SUBUNIT_NAME, TICKER};
+
+    /// The words of `text` that name a ticker other than this chain's (its
+    /// coin or its subunit): the test chain's CLI printed `JTM`, the public
+    /// network's ticker, beside test coins worth nothing.
+    fn foreign_tickers(text: &str) -> Vec<String> {
+        let coin = ["J", "TM"].concat();
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| word.contains(&coin))
+            .filter(|word| *word != TICKER && *word != SUBUNIT_NAME)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn every_help(command: &mut clap::Command, out: &mut String) {
+        out.push_str(&command.render_long_help().to_string());
+        for sub in command.get_subcommands_mut() {
+            every_help(sub, out);
+        }
+    }
+
+    /// Every help page names this chain's ticker (`JTMT` on the test chain).
+    #[test]
+    fn the_help_names_this_chains_ticker() {
+        let mut command = Cli::command();
+        command.build();
+        let mut help = String::new();
+        every_help(&mut command, &mut help);
+        assert!(help.contains(TICKER), "the help names a ticker");
+        assert_eq!(foreign_tickers(&help), Vec::<String>::new());
+    }
+
+    /// Nothing this CLI prints spells a ticker out: every amount, label and
+    /// message takes it from `identity::TICKER` (the source above the tests,
+    /// comments aside; the help is checked above).
+    #[test]
+    fn printed_text_takes_the_ticker_from_the_profile() {
+        let source = include_str!("jetsam_cli.rs");
+        let code = source
+            .split(&["#[cfg", "(test)]"].concat())
+            .next()
+            .unwrap();
+        let spelled: Vec<String> = code
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains(&["J", "TM"].concat()))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect();
+        assert_eq!(spelled, Vec::<String>::new());
     }
 }

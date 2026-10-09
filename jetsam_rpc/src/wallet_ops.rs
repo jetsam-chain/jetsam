@@ -21,7 +21,10 @@ use crate::types::{
 /// prevents the RPC layer from scraping human-readable wallet errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WalletSendPlanError {
-    #[error("InsufficientFunds: need {needed_micro_jtm} μJTM, have {available_micro_jtm} μJTM spendable")]
+    #[error(
+        "InsufficientFunds: need {needed_micro_jtm} \u{03bc}{ticker}, have {available_micro_jtm} \u{03bc}{ticker} spendable",
+        ticker = jetsam_chain::consensus::identity::TICKER
+    )]
     InsufficientFunds {
         needed_micro_jtm: u64,
         available_micro_jtm: u64,

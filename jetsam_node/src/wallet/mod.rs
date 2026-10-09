@@ -78,6 +78,7 @@ mod secret_surface_source_tests {
 
 use std::sync::Arc;
 
+use jetsam_chain::consensus::identity::TICKER;
 use jetsam_chain::storage::VerifiedOwnerSnapshot;
 use jetsam_rpc::types::{
     microjetsam_to_eld, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
@@ -922,7 +923,7 @@ impl WalletOps for WalletHandle {
         if let Some(fee) = explicit_fee_micro_jtm {
             if fee < one_input_one_output_minimum {
                 return Err(WalletSendPlanError::Other(format!(
-                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} μJTM, got {fee} μJTM"
+                    "fee too low for transaction with 1 input and 1 output: required {one_input_one_output_minimum} \u{03bc}{TICKER}, got {fee} \u{03bc}{TICKER}"
                 )));
             }
         }
@@ -970,7 +971,7 @@ impl WalletOps for WalletHandle {
                 let minimum = breakdown.required_total.max(relay_floor);
                 if fee < minimum {
                     return Err(WalletSendPlanError::Other(format!(
-                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μJTM, got {fee} μJTM"
+                        "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} \u{03bc}{TICKER}, got {fee} \u{03bc}{TICKER}"
                     )));
                 }
                 planned = Some((input_count, fee, output_count, change, breakdown));
@@ -1058,7 +1059,7 @@ impl WalletOps for WalletHandle {
         let minimum = breakdown.required_total.max(relay_floor);
         if fee_micro_jtm < minimum {
             return Err(WalletSendPlanError::Other(format!(
-                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μJTM, got {fee_micro_jtm} μJTM"
+                "fee too low for selected transaction with {input_count} input(s) and {output_count} output(s): required {minimum} \u{03bc}{TICKER}, got {fee_micro_jtm} \u{03bc}{TICKER}"
             )));
         }
         let total_spend_micro_jtm =
@@ -1654,9 +1655,41 @@ mod tests {
         let error = handle.plan_send(10_000, Some(1), 0, 24, 0).unwrap_err();
         assert_eq!(
             error,
-            WalletSendPlanError::Other(
-                "fee too low for transaction with 1 input and 1 output: required 5800 μJTM, got 1 μJTM"
-                    .to_string()
+            WalletSendPlanError::Other(format!(
+                "fee too low for transaction with 1 input and 1 output: required 5800 \u{03bc}{}, got 1 \u{03bc}{}",
+                jetsam_chain::consensus::identity::TICKER,
+                jetsam_chain::consensus::identity::TICKER,
+            ))
+        );
+    }
+
+    /// The wallet's messages reach people through the RPC (and the CLI): they
+    /// name this chain's ticker, `JTMT` on the test chain, never the public
+    /// network's beside coins worth nothing.
+    #[test]
+    fn wallet_messages_name_this_chains_ticker() {
+        let ticker = jetsam_chain::consensus::identity::TICKER;
+        assert_eq!(
+            WalletSendPlanError::InsufficientFunds {
+                needed_micro_jtm: 5,
+                available_micro_jtm: 3,
+            }
+            .to_string(),
+            format!("InsufficientFunds: need 5 \u{03bc}{ticker}, have 3 \u{03bc}{ticker} spendable")
+        );
+        assert_eq!(
+            super::builder::BuildError::InsufficientFunds { need: 5, have: 3 }.to_string(),
+            format!("insufficient funds: need 5 \u{03bc}{ticker}, have 3 \u{03bc}{ticker}")
+        );
+        assert_eq!(
+            super::builder::BuildError::ConsolidationValueMismatch {
+                selected_total: 5,
+                expected_total: 3,
+            }
+            .to_string(),
+            format!(
+                "consolidation value mismatch: selected inputs total 5 \u{03bc}{ticker}, \
+                 expected output+fee 3 \u{03bc}{ticker}"
             )
         );
     }

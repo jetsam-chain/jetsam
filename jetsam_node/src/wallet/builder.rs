@@ -55,7 +55,10 @@ pub struct TxBuildData {
 /// Errors that can occur during transaction construction.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    #[error("insufficient funds: need {need} μJTM, have {have} μJTM")]
+    #[error(
+        "insufficient funds: need {need} \u{03bc}{ticker}, have {have} \u{03bc}{ticker}",
+        ticker = jetsam_chain::consensus::identity::TICKER
+    )]
     InsufficientFunds { need: u64, have: u64 },
 
     #[error("payment needs more than {max} active UTXOs (selected at least {selected})")]
@@ -77,7 +80,8 @@ pub enum BuildError {
     ConsolidationInputUnavailable { slot_index: u32 },
 
     #[error(
-        "consolidation value mismatch: selected inputs total {selected_total} μJTM, expected output+fee {expected_total} μJTM"
+        "consolidation value mismatch: selected inputs total {selected_total} \u{03bc}{ticker}, expected output+fee {expected_total} \u{03bc}{ticker}",
+        ticker = jetsam_chain::consensus::identity::TICKER
     )]
     ConsolidationValueMismatch {
         selected_total: u64,
