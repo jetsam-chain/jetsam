@@ -463,8 +463,25 @@ mod tests {
         BlockProofClass::B25.page_capacity_in_generation(any_height_generation())
     }
 
-    /// Height used by tests that are about timing, not about the fork.
-    const ANY_HEIGHT: u64 = 4004;
+    /// Height used by tests that are about timing, not about the fork: below
+    /// this profile's v1.5 height, where the interval is the released 90 s.
+    /// The test chain arms v1.5 at 960 since 16d0b00: 4004 was past it, at
+    /// 180 s, and four of these tests failed there for that reason alone.
+    const ANY_HEIGHT: u64 = match jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT {
+        Some(activation) if activation <= 4004 => activation.saturating_sub(60),
+        _ => 4004,
+    };
+
+    /// The premise of the timing tests: [`ANY_HEIGHT`] is at the released
+    /// interval on this build's clock.
+    #[test]
+    fn any_height_is_at_the_released_interval() {
+        assert_eq!(
+            jetsam_chain::consensus::params::block_time_at(ANY_HEIGHT),
+            RELEASED_INTERVAL,
+            "ANY_HEIGHT = {ANY_HEIGHT}"
+        );
+    }
 
     /// The interval the measurements below were taken under: the released
     /// 90 s, which is the interval at [`ANY_HEIGHT`] on this build's clock.
