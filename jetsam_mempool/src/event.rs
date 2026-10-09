@@ -51,6 +51,10 @@ pub enum EvictReason {
     /// One of the transaction's chosen output slots was filled by a confirmed block.
     /// The wallet should rebuild/re-prove with fresh slot hints.
     OutputSlotOccupied,
+    /// From the v1.5 height on no block may carry it as a plain transaction:
+    /// it pays a client-object marker without its object, or spends from a
+    /// locked address (`check_plain_transaction` at the next block's height).
+    ClientObjectRule,
 }
 
 impl EvictReason {
@@ -79,6 +83,10 @@ impl EvictReason {
                 "a confirmed block took a state slot it had claimed; \
                  the wallet must rebuild it with fresh slot hints"
             }
+            Self::ClientObjectRule => {
+                "from the v1.5 height no block may carry it alone: it pays a client \
+                 object without that object, or spends from a locked address"
+            }
         }
     }
 }
@@ -94,6 +102,7 @@ mod tests {
             EvictReason::CapacityPressure,
             EvictReason::InputConsumed,
             EvictReason::OutputSlotOccupied,
+            EvictReason::ClientObjectRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {

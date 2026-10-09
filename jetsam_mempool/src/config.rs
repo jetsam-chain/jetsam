@@ -4,6 +4,7 @@
 
 //! Mempool configuration.
 
+use jetsam_chain::consensus::client_objects::ClientObjectRules;
 use jetsam_chain::consensus::wire_limits::{MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS};
 
 /// Configuration for the async mempool.
@@ -23,6 +24,11 @@ pub struct MempoolConfig {
     /// 0 = no concurrency limit; authorization verification is still required.
     /// Recommended: number of physical cores.
     pub auth_verify_workers: usize,
+
+    /// The v1.5 client-object rules the pool judges plain transactions by
+    /// (`check_plain_transaction`): the consensus rules of this binary. A
+    /// test arms a clock of its own with [`Self::with_client_object_rules`].
+    pub client_object_rules: ClientObjectRules,
 }
 
 impl Default for MempoolConfig {
@@ -32,6 +38,7 @@ impl Default for MempoolConfig {
             max_total_intent_bytes: MAX_MEMPOOL_BYTES,
             fee_floor_window: 50,
             auth_verify_workers: 4,
+            client_object_rules: ClientObjectRules::current(),
         }
     }
 }
@@ -49,6 +56,11 @@ impl MempoolConfig {
 
     pub fn with_auth_verify_workers(mut self, n: usize) -> Self {
         self.auth_verify_workers = n;
+        self
+    }
+
+    pub fn with_client_object_rules(mut self, rules: ClientObjectRules) -> Self {
+        self.client_object_rules = rules;
         self
     }
 }

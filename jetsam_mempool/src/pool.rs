@@ -85,6 +85,9 @@ pub(crate) struct MempoolState {
     pub admitted_input_slots: HashSet<u32>,
     /// Output slot indices currently held by admitted txs. O(1) conflict check.
     pub admitted_output_slots: HashSet<u32>,
+    /// The v1.5 client-object rules plain transactions are judged by
+    /// ([`MempoolConfig::client_object_rules`]).
+    pub client_rules: jetsam_chain::consensus::client_objects::ClientObjectRules,
 }
 
 /// Compact immutable RPC/diagnostic projection of one mempool entry.
@@ -196,6 +199,7 @@ impl AsyncMempool {
             floor,
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
+            client_rules: config.client_object_rules,
         };
         let max_permits = if config.auth_verify_workers == 0 {
             // 0 = unlimited concurrency; verification is still required
@@ -659,6 +663,12 @@ impl AsyncMempool {
             );
         }
 
+        // v1.5: what the next block may not carry under the client-object
+        // rule of its height, re-judged at every view change (crossing J,
+        // reorg): admission judged it for an earlier next block.
+        let next_height = st.view.tip_height.saturating_add(1);
+        evict_client_object_violations(&mut st, next_height, &self.events);
+
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
         if st.pool.is_empty() {
@@ -815,7 +825,38 @@ impl AsyncMempool {
     /// Update the chain view without applying a new block.
     /// Used on startup (initial state) or after a reorg.
     pub async fn update_chain_view(&self, view: ChainView) {
-        self.state.lock().await.view = view;
+        let mut st = self.state.lock().await;
+        st.view = view;
+        let next_height = st.view.tip_height.saturating_add(1);
+        if evict_client_object_violations(&mut st, next_height, &self.events) > 0 {
+            rebuild_slot_sets(&mut st);
+            if st.pool.is_empty() {
+                st.floor.reset();
+            }
+        }
+    }
+
+    /// The client-object rule of the block at `next_height`
+    /// (`check_plain_transaction`) applied to every entry, the refused ones
+    /// evicted ([`EvictReason::ClientObjectRule`]): a template builder calls
+    /// it for the child of its own parent, which the pool's view may not
+    /// have reached yet. Nothing below the v1.5 height. Returns the number
+    /// evicted.
+    pub async fn evict_unminable_at(&self, next_height: u64) -> usize {
+        let mut st = self.state.lock().await;
+        let evicted = evict_client_object_violations(&mut st, next_height, &self.events);
+        if evicted > 0 {
+            rebuild_slot_sets(&mut st);
+            if st.pool.is_empty() {
+                st.floor.reset();
+            }
+        }
+        evicted
+    }
+
+    /// The v1.5 client-object rules this pool judges plain transactions by.
+    pub fn client_object_rules(&self) -> jetsam_chain::consensus::client_objects::ClientObjectRules {
+        self.config.client_object_rules
     }
 
     /// Serialized owner-auth proof bytes for the given admitted tx body
@@ -940,7 +981,7 @@ fn run_admission_checks_with(
         jetsam_chain::consensus::client_objects::check_plain_transaction(
             pages,
             st.view.tip_height.saturating_add(1),
-            &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
+            &st.client_rules,
         )
         .map_err(|error| {
             SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::ClientObject(error))
@@ -998,6 +1039,48 @@ fn run_admission_checks_with(
 // ---------------------------------------------------------------------------
 // Helper: rebuild admitted slot sets from current pool (O(pool), after eviction)
 // ---------------------------------------------------------------------------
+
+/// Evict every entry the block at `next_height` may not carry as a plain
+/// transaction under the v1.5 client-object rule of that height
+/// (`check_plain_transaction`, the rule admission applies and block
+/// validation refuses): a marker payment without its object, a spend from a
+/// locked address. Inert below the v1.5 height, where nothing is scanned.
+/// Returns the number evicted; the caller rebuilds the slot sets.
+fn evict_client_object_violations(
+    st: &mut MempoolState,
+    next_height: u64,
+    events: &broadcast::Sender<MempoolEvent>,
+) -> usize {
+    if !st.client_rules.active_at(next_height) {
+        return 0;
+    }
+    let refused: Vec<TxBodyHash> = st
+        .pool
+        .iter()
+        .filter(|(_, entry)| {
+            jetsam_chain::consensus::client_objects::check_plain_transaction(
+                &entry.pages,
+                next_height,
+                &st.client_rules,
+            )
+            .is_err()
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in &refused {
+        st.pool.remove(hash);
+        tracing::info!(
+            ?hash,
+            next_height,
+            "tx evicted: no block from the v1.5 height may carry it as a plain transaction"
+        );
+        let _ = events.send(MempoolEvent::TxEvicted {
+            hash: *hash,
+            reason: EvictReason::ClientObjectRule,
+        });
+    }
+    refused.len()
+}
 
 fn rebuild_slot_sets(st: &mut MempoolState) {
     st.admitted_input_slots.clear();
@@ -1395,6 +1478,7 @@ mod tests {
             floor: crate::floor::FeeFloor::new(4),
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
+            client_rules: MempoolConfig::default().client_object_rules,
         };
 
         let spend = |fee: u64| {
@@ -1573,6 +1657,7 @@ mod tests {
             floor: crate::floor::FeeFloor::new(4),
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
+            client_rules: MempoolConfig::default().client_object_rules,
         };
         let required = jetsam_chain::consensus::fee_breakdown(
             1,
@@ -1687,5 +1772,210 @@ mod tests {
         pages[0].body.inputs[0].creation_id = 42;
         facts = validate_paged_spend(&pages).unwrap();
         assert!(check_input_slots(&pages, &facts, &view).is_ok());
+    }
+
+    /// The v1.5 height of the crossing tests: the public profile's empty
+    /// catalogue, armed at a height of their own (the release arms it at J).
+    const CROSSING_J: u64 = 1_200;
+
+    fn armed_rules() -> jetsam_chain::consensus::client_objects::ClientObjectRules {
+        jetsam_chain::consensus::client_objects::ClientObjectRules {
+            activation_height: Some(CROSSING_J),
+            catalogue: &[],
+            ..jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS
+        }
+    }
+
+    /// The view of a chain whose tip is `tip`, every header around J known
+    /// (both epoch anchors of any generation).
+    fn view_of(state: &ChainState, tip: u64) -> ChainView {
+        let genesis = genesis_header();
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis.clone());
+        for height in (CROSSING_J - 200)..=tip {
+            let mut header = genesis.clone();
+            header.height = height;
+            header.nonce = u128::from(height);
+            headers.insert(height, header);
+        }
+        ChainView::new(tip, headers, 1, state.state.clone())
+    }
+
+    /// A pool on an armed clock, its view at `tip`, and one ordinary
+    /// transaction paying an owner that carries the registration marker tag
+    /// (what `walletBuildClientPayment` builds), admissible for the block at
+    /// `tip + 1` while that block is below J.
+    struct MarkerCrossing {
+        state: ChainState,
+        intent: jetsam_tx::PagedSpendIntent,
+    }
+
+    impl MarkerCrossing {
+        fn new(tip: u64) -> Self {
+            use jetsam_chain::consensus::params::coinbase_creation_id;
+            let owner = Address([0xA5; 32]);
+            let mut state = ChainState::with_log_slots(6);
+            state
+                .state
+                .set_slot(
+                    7,
+                    SlotValue::with_owner_fields(
+                        1_000_000,
+                        coinbase_creation_id(3),
+                        owner.as_fields(),
+                    ),
+                )
+                .unwrap();
+            let view = view_of(&state, tip);
+            let required = jetsam_chain::consensus::fee_breakdown(
+                1,
+                1,
+                view.active_slot_count,
+                view.log_slots(),
+            )
+            .required_total
+                * 4;
+            let mut marker = [0x5Au8; 32];
+            marker[..8].copy_from_slice(
+                &jetsam_chain::consensus::client_objects::CLIENT_REGISTRATION_MARKER_TAG,
+            );
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: 7,
+                amount: 1_000_000,
+                creation_id: coinbase_creation_id(3),
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 8,
+                amount: 1_000_000 - required,
+                owner: Address(marker),
+            };
+            let pages = vec![TxPage::new(TxBody {
+                epoch_anchor: view.user_epoch_anchor_id,
+                fee: required,
+                input_owner: owner,
+                inputs,
+                outputs,
+                validity_bitmap: 1
+                    | output_bitmap_bit(0)
+                    | PAGED_SPEND_START_BIT
+                    | PAGED_SPEND_END_BIT,
+                is_coinbase: false,
+            })
+            .unwrap()];
+            Self {
+                state,
+                intent: jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap(),
+            }
+        }
+
+        fn view_at(&self, tip: u64) -> ChainView {
+            view_of(&self.state, tip)
+        }
+
+        fn pool_at(&self, tip: u64) -> AsyncMempool {
+            AsyncMempool::new(
+                self.view_at(tip),
+                MempoolConfig::default().with_client_object_rules(armed_rules()),
+            )
+            // This test is about the pool's v1.5 rule, not the proof.
+            .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())))
+        }
+
+        async fn submit(&self, pool: &AsyncMempool) -> jetsam_poseidon2b::primitives::TxBodyHash {
+            let bytes = self.intent.to_bytes().unwrap();
+            pool.submit(self.intent.clone(), bytes)
+                .await
+                .expect("admitted while the next block is below J")
+        }
+    }
+
+    /// B1 (review of v1.5.0): a transaction paying a marker owner is
+    /// admitted while the next block is below J (the rule is inert there, as
+    /// in v1.4.3). Once the tip reaches J - 1 it is a transaction no block at
+    /// J can carry: the pool evicts it, and the template of J never sees it,
+    /// so no miner proves and seals a block the chain refuses.
+    #[tokio::test]
+    async fn crossing_j_evicts_a_marker_payment_admitted_below_j() {
+        use jetsam_chain::consensus::client_objects::{check_plain_transaction, ClientObjectError};
+        let crossing = MarkerCrossing::new(CROSSING_J - 2);
+        let pool = crossing.pool_at(CROSSING_J - 2);
+        let mut events = pool.subscribe();
+        let hash = crossing.submit(&pool).await;
+        assert_eq!(pool.len().await, 1);
+
+        // The tip reaches J - 1 (a block that did not include it).
+        pool.on_new_block(&[], CROSSING_J - 1, crossing.view_at(CROSSING_J - 1))
+            .await;
+        assert_eq!(pool.len().await, 0, "a block at J can never carry it");
+        let (anchors, generation) = pool.state.lock().await.view.accepted_user_epoch_anchors();
+        assert!(pool
+            .select_for_block_at_anchors(BLOCK_MAX_USER_PAGES, anchors, generation)
+            .await
+            .is_empty());
+        let mut evicted = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let crate::event::MempoolEvent::TxEvicted { hash, reason } = event {
+                evicted.push((hash, reason));
+            }
+        }
+        assert_eq!(
+            evicted,
+            vec![(hash, crate::event::EvictReason::ClientObjectRule)],
+            "the sender's wallet is told, and releases its coins"
+        );
+        // What the block at J would have been refused for.
+        assert_eq!(
+            check_plain_transaction(&crossing.intent.pages, CROSSING_J, &armed_rules()),
+            Err(ClientObjectError::PaymentWithoutObject)
+        );
+        // And the pool refuses it again from now on.
+        let bytes = crossing.intent.to_bytes().unwrap();
+        assert!(pool.submit(crossing.intent.clone(), bytes).await.is_err());
+    }
+
+    /// Below J nothing changes (v1.4.3): the same transaction stays in the
+    /// pool while the next block is below J, and is offered to it.
+    #[tokio::test]
+    async fn below_j_a_marker_payment_stays_a_plain_transaction() {
+        let crossing = MarkerCrossing::new(CROSSING_J - 3);
+        let pool = crossing.pool_at(CROSSING_J - 3);
+        crossing.submit(&pool).await;
+        pool.on_new_block(&[], CROSSING_J - 2, crossing.view_at(CROSSING_J - 2))
+            .await;
+        assert_eq!(pool.len().await, 1);
+        assert_eq!(pool.evict_unminable_at(CROSSING_J - 1).await, 0);
+        let (anchors, generation) = pool.state.lock().await.view.accepted_user_epoch_anchors();
+        assert_eq!(
+            pool.select_for_block_at_anchors(BLOCK_MAX_USER_PAGES, anchors, generation)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    /// A view installed without a block (`update_chain_view`, a reorg or a
+    /// snapshot) is judged the same way.
+    #[tokio::test]
+    async fn a_view_replaced_across_j_evicts_what_its_next_block_refuses() {
+        let crossing = MarkerCrossing::new(CROSSING_J - 2);
+        let pool = crossing.pool_at(CROSSING_J - 2);
+        crossing.submit(&pool).await;
+        pool.update_chain_view(crossing.view_at(CROSSING_J + 3)).await;
+        assert_eq!(pool.len().await, 0);
+    }
+
+    /// A template for J built while the pool's view still lags at J - 2 (its
+    /// parent J - 1 committed, the pool not told yet): the builder asks the
+    /// pool to drop what the child cannot carry before it selects.
+    #[tokio::test]
+    async fn a_lagging_view_is_judged_for_the_templates_own_child() {
+        let crossing = MarkerCrossing::new(CROSSING_J - 2);
+        let pool = crossing.pool_at(CROSSING_J - 2);
+        crossing.submit(&pool).await;
+        assert_eq!(pool.evict_unminable_at(CROSSING_J).await, 1);
+        assert_eq!(pool.len().await, 0);
+        assert_eq!(pool.client_object_rules(), armed_rules());
     }
 }

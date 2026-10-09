@@ -447,7 +447,13 @@ impl TemplateBuilder {
         // objects this node holds are offered to the same fee selection. They
         // take their page budget first; mempool groups touching their slots
         // are left out (a conflicting apply would abort the whole template).
-        let client_rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let client_rules = self.mempool.client_object_rules();
+        // A pool whose view has not reached this parent yet still holds what
+        // it admitted for an earlier next block: the child's own rule is
+        // applied to it before anything is selected (review B1).
+        if client_rules.active_at(child_height) {
+            self.mempool.evict_unminable_at(child_height).await;
+        }
         let mut offered = crate::client_slot::OfferedClientObjects::default();
         let mut held_payments: Vec<jetsam_tx::PagedSpendIntent> = Vec::new();
         if client_rules.active_at(child_height) {
@@ -521,7 +527,7 @@ impl TemplateBuilder {
                 .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
                 .await
         };
-        let entries: Vec<_> = entries
+        let entries: Vec<_> = minable_plain_entries(entries, child_height, &client_rules)
             .into_iter()
             .filter(|entry| {
                 held_slots.is_empty()
@@ -591,6 +597,8 @@ impl TemplateBuilder {
             return None;
         }
         let offers_clients = !held_payments.is_empty();
+        let client_registry = &snapshot.client_registry;
+        let offered = &offered;
         let template_cpu_result = install_history_step_phase_cpu(|| {
             let build = |txs| {
                 jetsam_chain::consensus::template::build_node_owned_block_template(
@@ -603,43 +611,81 @@ impl TemplateBuilder {
                     difficulty_target,
                 )
             };
+            // The client slot of a selection, and the client-object rules of
+            // block validation applied to the block it makes — exactly what
+            // the commit will judge the sealed block by, before any proof or
+            // proof of work is spent on it (review B1).
+            let judged = |inner: &jetsam_chain::consensus::template::BlockTemplate,
+                          with_clients: bool| {
+                let slot = if with_clients {
+                    crate::client_slot::client_slot_of_selection(&inner.txs, offered, client_registry)
+                } else {
+                    crate::client_slot::TemplateClientSlot::default()
+                };
+                if client_rules.active_at(child_height) {
+                    check_template_client_objects(
+                        inner,
+                        &slot.objects,
+                        &parent,
+                        client_registry,
+                        &client_rules,
+                    )?;
+                }
+                Ok::<_, jetsam_chain::consensus::client_objects::ClientObjectError>(slot)
+            };
             match build(txs) {
-                Ok(inner) => Some((inner, true)),
+                Ok(built) => match judged(&built.0, true) {
+                    Ok(slot) => return Some((built, slot)),
+                    // The held client objects make a block the rules refuse:
+                    // the block goes out without them rather than not at all.
+                    Err(error) if offers_clients => tracing::warn!(
+                        %error,
+                        "template refused by the client-object rules with its held client \
+                         payments: built again without them"
+                    ),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "template refused by the client-object rules of its height"
+                        );
+                        return None;
+                    }
+                },
                 // A held client payment no longer applies (spent, or its
                 // slot taken): the block goes out without the client objects
                 // rather than not at all.
                 Err(error) if offers_clients => {
                     tracing::info!(err = ?error, "template without its held client payments");
-                    match build(mempool_txs) {
-                        Ok(inner) => Some((inner, false)),
-                        Err(error) => {
-                            tracing::warn!(err = ?error, "template build failed");
-                            None
-                        }
-                    }
                 }
+                Err(error) => {
+                    tracing::warn!(err = ?error, "template build failed");
+                    return None;
+                }
+            }
+            match build(mempool_txs) {
+                Ok(built) => match judged(&built.0, false) {
+                    Ok(slot) => Some((built, slot)),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "template refused by the client-object rules of its height"
+                        );
+                        None
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(err = ?error, "template build failed");
                     None
                 }
             }
         });
-        let ((inner, prepared_state_commit), with_clients) = match template_cpu_result {
+        let ((inner, prepared_state_commit), client_slot) = match template_cpu_result {
             Ok(Some(built)) => built,
             Ok(None) => return None,
             Err(error) => {
                 tracing::error!(%error, "template CPU phase failed");
                 return None;
             }
-        };
-        let client_slot = if with_clients {
-            crate::client_slot::client_slot_of_selection(
-                &inner.txs,
-                &offered,
-                &snapshot.client_registry,
-            )
-        } else {
-            crate::client_slot::TemplateClientSlot::default()
         };
         if !client_slot.objects.is_empty() {
             tracing::info!(
@@ -685,6 +731,54 @@ impl TemplateBuilder {
             client_slot,
         })
     }
+}
+
+/// The mempool entries a block at `child_height` may carry: plain
+/// transactions under the v1.5 client-object rule of that height
+/// (`check_plain_transaction`, the rule the block is judged by). Inert below
+/// the v1.5 height (review B1: a marker payment admitted for J - 1 reached
+/// the template of J, and every miner proved, sealed and lost the block).
+pub(crate) fn minable_plain_entries(
+    entries: Vec<jetsam_mempool::SelectedMempoolEntry>,
+    child_height: u64,
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Vec<jetsam_mempool::SelectedMempoolEntry> {
+    if !rules.active_at(child_height) {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| {
+            jetsam_chain::consensus::client_objects::check_plain_transaction(
+                &entry.pages,
+                child_height,
+                rules,
+            )
+            .is_ok()
+        })
+        .collect()
+}
+
+/// The client-object rules of block validation
+/// (`validate_block_client_objects`) applied to the block `inner` makes with
+/// `objects`, against the parent's registry: the very check the commit runs
+/// on the sealed block (the nonce is not one of its inputs).
+pub(crate) fn check_template_client_objects(
+    inner: &ChainTemplate,
+    objects: &[jetsam_chain::consensus::client_objects::ClientObject],
+    parent: &BlockHeader,
+    registry: &jetsam_chain::consensus::client_objects::ClientRegistryState,
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Result<(), jetsam_chain::consensus::client_objects::ClientObjectError> {
+    let block = Block {
+        header: inner.to_pow_header(0),
+        transactions: inner.all_txs(),
+        client_objects: objects.to_vec(),
+    };
+    jetsam_chain::consensus::client_objects::validate_block_client_objects(
+        &block, objects, parent, registry, rules,
+    )
+    .map(|_| ())
 }
 
 fn user_page_limit_for_child(parent_height: u64, max_effective_pages: usize) -> Option<usize> {
@@ -823,6 +917,152 @@ mod tests {
         assert_eq!(v1_3.child_transactions, 3 * e);
         assert_eq!(v1_3.child_previous_transactions, Some(2 * e));
         assert_eq!(template_epoch_anchor_heights_in(V1_3, u64::MAX), None);
+    }
+
+    /// The v1.5 height of the B1 tests, armed with the public profile's empty
+    /// catalogue.
+    const B1_J: u64 = 1_200;
+
+    fn b1_rules() -> jetsam_chain::consensus::client_objects::ClientObjectRules {
+        jetsam_chain::consensus::client_objects::ClientObjectRules {
+            activation_height: Some(B1_J),
+            catalogue: &[],
+            ..jetsam_chain::consensus::client_objects::ClientObjectRules::CONSENSUS
+        }
+    }
+
+    /// One page spending slot 7 (owner 0xA5) to `owner`, `fee` μJTM.
+    fn b1_page(owner: Address, amount: u64, fee: u64) -> jetsam_tx::TxPage {
+        use jetsam_tx::{
+            output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+        };
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: amount + fee,
+            creation_id: jetsam_chain::consensus::params::coinbase_creation_id(3),
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 8,
+            amount,
+            owner,
+        };
+        jetsam_tx::TxPage::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee,
+            input_owner: Address([0xA5; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        })
+        .unwrap()
+    }
+
+    fn marker_owner() -> Address {
+        let mut marker = [0x5Au8; 32];
+        marker[..8]
+            .copy_from_slice(&jetsam_chain::consensus::client_objects::CLIENT_REGISTRATION_MARKER_TAG);
+        Address(marker)
+    }
+
+    fn selected(page: jetsam_tx::TxPage) -> jetsam_mempool::SelectedMempoolEntry {
+        let pages = vec![page];
+        jetsam_mempool::SelectedMempoolEntry {
+            logical_txid: jetsam_tx::validate_paged_spend(&pages).unwrap().logical_txid,
+            pages,
+            cached_authorization: None,
+        }
+    }
+
+    /// B1: a marker payment the pool still holds (its view lagging) is never
+    /// offered to the block at J, while below J it stays the plain
+    /// transaction it was in v1.4.3.
+    #[test]
+    fn the_template_of_j_never_offers_a_marker_payment_without_its_object() {
+        let rules = b1_rules();
+        let plain = selected(b1_page(Address([0xB6; 32]), 900, 100));
+        let marker = selected(b1_page(marker_owner(), 900, 100));
+        let plain_id = plain.logical_txid;
+        let kept = minable_plain_entries(vec![marker, plain], B1_J, &rules);
+        assert_eq!(
+            kept.iter().map(|entry| entry.logical_txid).collect::<Vec<_>>(),
+            vec![plain_id]
+        );
+        let marker = selected(b1_page(marker_owner(), 900, 100));
+        assert_eq!(minable_plain_entries(vec![marker], B1_J - 1, &rules).len(), 1);
+    }
+
+    /// B1: the template is judged by the client-object rules of block
+    /// validation before anything is proved: a block at J carrying a marker
+    /// without its object is refused there (as the commit refuses it after
+    /// the proof and the proof of work), the same block below J passes.
+    #[test]
+    fn a_template_is_judged_by_the_rules_its_block_will_be_judged_by() {
+        use jetsam_chain::consensus::client_objects::{ClientObjectError, ClientRegistryState};
+        use jetsam_chain::fri_state::SlotValue;
+        let owner = Address([0xA5; 32]);
+        let build = |parent_height: u64, owner_of_output: Address| {
+            let mut state = ChainState::with_log_slots(6);
+            state
+                .state
+                .set_slot(
+                    7,
+                    SlotValue::with_owner_fields(
+                        1_000_000,
+                        jetsam_chain::consensus::params::coinbase_creation_id(3),
+                        owner.as_fields(),
+                    ),
+                )
+                .unwrap();
+            state.active_slot_count = 1;
+            state.circulating_supply_micro_jtm = 1_000_000;
+            let mut parent = jetsam_chain::consensus::genesis_header();
+            parent.height = parent_height;
+            parent.state_root = state.cached_state_root();
+            parent.active_slot_count = 1;
+            parent.log_slots = state.state.log_slots() as u32;
+            let fee = jetsam_chain::consensus::fee_breakdown(
+                1,
+                1,
+                parent.active_slot_count,
+                parent.log_slots,
+            )
+            .required_total
+                * 4;
+            let page = b1_page(owner_of_output, 1_000_000 - fee, fee);
+            let (inner, _) = jetsam_chain::consensus::template::build_node_owned_block_template(
+                &parent,
+                &state,
+                &[],
+                vec![jetsam_tx::Transaction::new(page.body)],
+                Address([0x61; 32]),
+                parent.timestamp + 1,
+                parent.difficulty_target,
+            )
+            .expect("the template builds: the rule is a client-object one");
+            (inner, parent)
+        };
+        let registry = ClientRegistryState::new();
+        let rules = b1_rules();
+
+        let (at_j, parent) = build(B1_J - 1, marker_owner());
+        assert!(matches!(
+            check_template_client_objects(&at_j, &[], &parent, &registry, &rules),
+            Err(ClientObjectError::ObjectsDoNotMatchMarkers | ClientObjectError::MarkerCarriesValue { .. })
+        ));
+        let (plain_at_j, parent) = build(B1_J - 1, Address([0xB6; 32]));
+        assert_eq!(
+            check_template_client_objects(&plain_at_j, &[], &parent, &registry, &rules),
+            Ok(())
+        );
+        let (below_j, parent) = build(B1_J - 2, marker_owner());
+        assert_eq!(
+            check_template_client_objects(&below_j, &[], &parent, &registry, &rules),
+            Ok(())
+        );
     }
 
     #[test]
