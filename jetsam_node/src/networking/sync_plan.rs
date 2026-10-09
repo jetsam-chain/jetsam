@@ -52,6 +52,26 @@ pub enum SyncPlanError {
     SnapshotSegmentMismatch,
     #[error("snapshot segment identifiers are not strictly increasing")]
     SnapshotSegmentsNotCanonical,
+    #[error(
+        "the suffix starts below the root of its tip's relation and has no terminal for that \
+         root block"
+    )]
+    MissingRelationRootTerminal,
+    #[error("the suffix starts below the roots of two relations")]
+    SpansTwoRelationRoots,
+}
+
+/// The index, in `headers`, of the block whose own terminal a suffix from
+/// `base` must bring (review I1): the root of the tip's HistoryStep relation
+/// (`history_step_relation_root_height`), when the suffix starts below it.
+/// The tip's terminal proves only the blocks above that root.
+pub fn suffix_relation_root(base: ChainPoint, headers: &[ValidatedHeader]) -> Option<usize> {
+    let target = headers.last()?.header.height;
+    let root =
+        jetsam_chain::consensus::params::history_step_relation_root_height(target);
+    (base.height < root)
+        .then(|| (root - base.height - 1) as usize)
+        .filter(|index| *index < headers.len())
 }
 
 /// A frozen graph of consensus objects required to reach one exact target.
@@ -69,6 +89,9 @@ pub struct SyncPlan {
     snapshot: Option<SnapshotId>,
     headers: Vec<ValidatedHeader>,
     required_objects: Vec<ObjectClaimId>,
+    /// The terminal of the block rooting the tip's relation, when the suffix
+    /// starts below it ([`suffix_relation_root`], review I1).
+    relation_root_terminal: Option<TerminalClaimId>,
 }
 
 impl SyncPlan {
@@ -77,7 +100,25 @@ impl SyncPlan {
         headers: Vec<ValidatedHeader>,
         proof_class: u8,
     ) -> Result<Self, SyncPlanError> {
-        Self::suffix(SyncPlanKind::LiveSuffix, None, base, headers, proof_class)
+        Self::live_suffix_with_root(base, headers, proof_class, None)
+    }
+
+    /// [`Self::live_suffix`] with the terminal of the root block of the
+    /// tip's relation, required when the suffix starts below it.
+    pub fn live_suffix_with_root(
+        base: ChainPoint,
+        headers: Vec<ValidatedHeader>,
+        proof_class: u8,
+        relation_root_terminal: Option<TerminalClaimId>,
+    ) -> Result<Self, SyncPlanError> {
+        Self::suffix(
+            SyncPlanKind::LiveSuffix,
+            None,
+            base,
+            headers,
+            proof_class,
+            relation_root_terminal,
+        )
     }
 
     pub fn reorg(
@@ -85,6 +126,19 @@ impl SyncPlan {
         ancestor: ChainPoint,
         headers: Vec<ValidatedHeader>,
         proof_class: u8,
+    ) -> Result<Self, SyncPlanError> {
+        Self::reorg_with_root(old_tip, ancestor, headers, proof_class, None)
+    }
+
+    /// [`Self::reorg`] with the terminal of the root block of the tip's
+    /// relation on the replacement branch, required when the replacement
+    /// starts below it.
+    pub fn reorg_with_root(
+        old_tip: ChainPoint,
+        ancestor: ChainPoint,
+        headers: Vec<ValidatedHeader>,
+        proof_class: u8,
+        relation_root_terminal: Option<TerminalClaimId>,
     ) -> Result<Self, SyncPlanError> {
         if ancestor.height > old_tip.height {
             return Err(SyncPlanError::InvalidReorgBase);
@@ -95,6 +149,7 @@ impl SyncPlan {
             ancestor,
             headers,
             proof_class,
+            relation_root_terminal,
         )
     }
 
@@ -144,6 +199,7 @@ impl SyncPlan {
             snapshot: Some(snapshot),
             headers: Vec::new(),
             required_objects,
+            relation_root_terminal: None,
         })
     }
 
@@ -153,6 +209,7 @@ impl SyncPlan {
         base: ChainPoint,
         headers: Vec<ValidatedHeader>,
         proof_class: u8,
+        relation_root_terminal: Option<TerminalClaimId>,
     ) -> Result<Self, SyncPlanError> {
         let first = headers.first().ok_or(SyncPlanError::EmptySuffix)?;
         if first.hash != block_id(&first.header) {
@@ -193,6 +250,29 @@ impl SyncPlan {
                 })
             })
             .collect::<Vec<_>>();
+        // Review I1: below the root of the tip's relation, the root block's
+        // own terminal proves the blocks up to it; it comes before the tip's,
+        // which stays the last required object.
+        let relation_root_terminal = match suffix_relation_root(base, &headers) {
+            None => None,
+            Some(index) => {
+                let root = &headers[index];
+                let claim = relation_root_terminal
+                    .filter(|claim| {
+                        claim.height == root.header.height
+                            && claim.semantic_header_id == semantic_header_id(&root.header)
+                    })
+                    .ok_or(SyncPlanError::MissingRelationRootTerminal)?;
+                if jetsam_chain::consensus::params::history_step_relation_root_height(
+                    root.header.height,
+                ) > base.height
+                {
+                    return Err(SyncPlanError::SpansTwoRelationRoots);
+                }
+                required_objects.push(ObjectClaimId::Terminal(claim));
+                Some(claim)
+            }
+        };
         required_objects.push(ObjectClaimId::Terminal(terminal));
 
         let id = derive_plan_id(
@@ -215,7 +295,14 @@ impl SyncPlan {
             snapshot: None,
             headers,
             required_objects,
+            relation_root_terminal,
         })
+    }
+
+    /// The terminal of the root block of the tip's relation this plan
+    /// requires, when it starts below that root (review I1).
+    pub const fn relation_root_terminal(&self) -> Option<TerminalClaimId> {
+        self.relation_root_terminal
     }
 
     pub const fn id(&self) -> PlanId {

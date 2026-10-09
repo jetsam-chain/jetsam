@@ -21,7 +21,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::{
     header_dag::ValidatedHeader,
     object_fetcher::{FetchError, FetchState, ObjectFetcher},
-    sync_plan::{SyncPlan, SyncPlanError, SyncPlanKind},
+    sync_plan::{suffix_relation_root, SyncPlan, SyncPlanError, SyncPlanKind},
     types::{ChainPoint, FailureDomain, ObjectClaimId, PlanId},
 };
 
@@ -111,16 +111,39 @@ impl SuffixOffer {
             return Err(SuffixSyncError::ObjectClaimMismatch);
         }
         objects.push(ObjectId::Terminal(terminal));
+        // Review I1: a suffix starting below the root of its tip's relation
+        // brings that root block's own terminal as well.
+        let relation_root_terminal = match suffix_relation_root(base, &headers) {
+            None => None,
+            Some(index) => {
+                let root = &headers[index];
+                let root_terminal = records[index]
+                    .terminal
+                    .ok_or(SuffixSyncError::MissingRelationRootTerminal)?;
+                if root_terminal.claim.height != root.header.height
+                    || root_terminal.claim.semantic_header_id
+                        != jetsam_chain::block_header::semantic_header_id(&root.header)
+                {
+                    return Err(SuffixSyncError::ObjectClaimMismatch);
+                }
+                objects.push(ObjectId::Terminal(root_terminal));
+                Some(root_terminal.claim)
+            }
+        };
 
         let plan = match kind {
-            SyncPlanKind::LiveSuffix => {
-                SyncPlan::live_suffix(base, headers, terminal.claim.proof_class)?
-            }
-            SyncPlanKind::Reorg => SyncPlan::reorg(
+            SyncPlanKind::LiveSuffix => SyncPlan::live_suffix_with_root(
+                base,
+                headers,
+                terminal.claim.proof_class,
+                relation_root_terminal,
+            )?,
+            SyncPlanKind::Reorg => SyncPlan::reorg_with_root(
                 old_tip.ok_or(SuffixSyncError::MissingOldTip)?,
                 base,
                 headers,
                 terminal.claim.proof_class,
+                relation_root_terminal,
             )?,
             SyncPlanKind::Snapshot => return Err(SuffixSyncError::WrongPlanKind),
         };
@@ -176,6 +199,9 @@ pub struct FetchedSuffix {
     pub body_sources: Vec<PeerId>,
     pub terminal_bytes: Vec<u8>,
     pub terminal_source: PeerId,
+    /// The terminal of the root block of the tip's relation, and who served
+    /// it, when the plan starts below that root (review I1).
+    pub relation_root_terminal: Option<(Vec<u8>, PeerId)>,
     tip_announcement: HeaderAnnouncement,
     _permits: Vec<Arc<OwnedSemaphorePermit>>,
 }
@@ -205,6 +231,7 @@ impl FetchedSuffix {
         sources
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (
@@ -213,6 +240,7 @@ impl FetchedSuffix {
         Vec<PeerId>,
         Vec<u8>,
         PeerId,
+        Option<(Vec<u8>, PeerId)>,
         Vec<Arc<OwnedSemaphorePermit>>,
     ) {
         (
@@ -221,6 +249,7 @@ impl FetchedSuffix {
             self.body_sources,
             self.terminal_bytes,
             self.terminal_source,
+            self.relation_root_terminal,
             self._permits,
         )
     }
@@ -236,6 +265,11 @@ pub enum SuffixSyncError {
     InventoryHeaderMismatch,
     #[error("the selected suffix tip has no exact terminal identity")]
     MissingTipTerminal,
+    #[error(
+        "the selected suffix starts below the root of its tip's relation and that root block \
+         has no exact terminal identity"
+    )]
+    MissingRelationRootTerminal,
     #[error("the selected suffix has no exact body source for every header")]
     MissingBodySource,
     #[error("an exact object claim differs from the immutable plan")]
@@ -352,6 +386,28 @@ impl SuffixSync {
                     peer,
                     failure_domain,
                     ObjectId::BlockBody(body),
+                )? {
+                    advertised = advertised.saturating_add(1);
+                }
+            }
+        }
+        // Review I1: the root block's terminal of a plan that requires it.
+        if let Some(root_claim) = self.plan.relation_root_terminal() {
+            let base_height = self.plan.base().height;
+            let root_terminal = root_claim
+                .height
+                .checked_sub(base_height.saturating_add(1))
+                .and_then(|index| records.get(index as usize))
+                .and_then(|record| record.terminal);
+            if let Some(terminal) = root_terminal {
+                if terminal.claim != root_claim {
+                    return Err(SuffixSyncError::ObjectClaimMismatch);
+                }
+                if self.fetcher.advertise_new(
+                    ObjectClaimId::Terminal(root_claim),
+                    peer,
+                    failure_domain,
+                    ObjectId::Terminal(terminal),
                 )? {
                     advertised = advertised.saturating_add(1);
                 }
@@ -775,8 +831,10 @@ impl SuffixSync {
         let mut body_sources = Vec::with_capacity(self.plan.headers().len());
         let mut terminal_bytes = None;
         let mut terminal_source = None;
+        let mut relation_root_terminal = None;
         let mut tip_body_object = None;
         let mut terminal_object = None;
+        let target_height = self.plan.target().height;
         let mut permits = Vec::new();
         for claim in self.plan.required_objects() {
             let received = self
@@ -794,6 +852,9 @@ impl SuffixSync {
                     tip_body_object = Some(body);
                     body_bytes.push(received.bytes);
                     body_sources.push(received.source);
+                }
+                ObjectId::Terminal(terminal) if terminal.claim.height != target_height => {
+                    relation_root_terminal = Some((received.bytes, received.source));
                 }
                 ObjectId::Terminal(terminal) => {
                     terminal_object = Some(terminal);
@@ -826,6 +887,7 @@ impl SuffixSync {
             body_sources,
             terminal_bytes: terminal_bytes.ok_or(SuffixSyncError::MissingTipTerminal)?,
             terminal_source: terminal_source.ok_or(SuffixSyncError::MissingTipTerminal)?,
+            relation_root_terminal,
             tip_announcement,
             _permits: permits,
         })
@@ -1482,6 +1544,146 @@ mod tests {
             .find(|candidate| candidate.objects.len() == 2)
             .expect("every claim from the consumed request is schedulable again");
         assert_eq!(replacement.objects, request.objects);
+    }
+
+    /// Review I1: headers from two below the root of the v1.3 relation (the
+    /// block before its activation) to its activation, with bodies, the
+    /// tip's terminal, and the root block's terminal when `with_root`.
+    fn crossing(with_root: bool) -> (ChainPoint, Vec<ValidatedHeader>, Vec<HeaderInventoryRecord>) {
+        let activation = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT
+            .expect("both profiles arm v1.3");
+        let mut base_header = genesis_header();
+        base_header.height = activation - 3;
+        let base = ChainPoint::new(base_header.height, block_id(&base_header));
+        let mut parent = base_header;
+        let mut headers = Vec::new();
+        let mut records = Vec::new();
+        for marker in [1u8, 2, 3] {
+            let validated = child(parent, marker);
+            parent = validated.header;
+            let bytes = vec![marker; 9];
+            records.push(HeaderInventoryRecord {
+                header: validated.header,
+                body: Some(
+                    BlockBodyObjectId::from_bytes(
+                        BlockBodyClaimId {
+                            height: validated.header.height,
+                            block_hash: validated.hash,
+                        },
+                        &bytes,
+                    )
+                    .unwrap(),
+                ),
+                terminal: None,
+            });
+            headers.push(validated);
+        }
+        let terminal_of = |header: &BlockHeader, byte: u8| {
+            TerminalObjectId::from_bytes(
+                TerminalClaimId {
+                    height: header.height,
+                    semantic_header_id: semantic_header_id(header),
+                    proof_class: 0,
+                },
+                &[byte; 17],
+            )
+            .unwrap()
+        };
+        records[2].terminal = Some(terminal_of(&headers[2].header, 0xE2));
+        if with_root {
+            records[1].terminal = Some(terminal_of(&headers[1].header, 0xE1));
+        }
+        assert_eq!(headers[2].header.height, activation);
+        assert_eq!(super::suffix_relation_root(base, &headers), Some(1));
+        (base, headers, records)
+    }
+
+    /// Review I1: a suffix that starts below the root of its tip's relation
+    /// is planned only with the root block's own terminal (the tip's proves
+    /// only the blocks above the root), fetched like the tip's and handed to
+    /// the committer apart from it; from the root on, the tip's alone.
+    #[test]
+    fn a_suffix_below_its_tip_relations_root_carries_the_roots_terminal() {
+        let (base, headers, without_root) = crossing(false);
+        assert_eq!(
+            SuffixOffer::live(base, headers.clone(), &without_root).unwrap_err(),
+            SuffixSyncError::MissingRelationRootTerminal
+        );
+        assert_eq!(
+            SyncPlan::live_suffix(base, headers.clone(), 0).unwrap_err(),
+            SyncPlanError::MissingRelationRootTerminal
+        );
+        // From the root itself, the tip's terminal alone (unchanged).
+        assert!(SuffixOffer::live(headers[1].point(), headers[2..].to_vec(), &without_root[2..])
+            .is_ok());
+
+        let (base, headers, records) = crossing(true);
+        let offer = SuffixOffer::live(base, headers.clone(), &records).unwrap();
+        let root_claim = records[1].terminal.unwrap().claim;
+        let tip_claim = records[2].terminal.unwrap().claim;
+        assert_eq!(offer.plan().relation_root_terminal(), Some(root_claim));
+        let required = offer.plan().required_objects();
+        assert_eq!(
+            &required[required.len() - 2..],
+            &[ObjectClaimId::Terminal(root_claim), ObjectClaimId::Terminal(tip_claim)]
+        );
+
+        // The root's terminal from one provider, everything else from another.
+        let (root_peer, other_peer) = (PeerId::random(), PeerId::random());
+        let mut tip_only = records.clone();
+        tip_only[1].terminal = None;
+        let mut sync = SuffixSync::from_offer(
+            other_peer,
+            FailureDomain(1),
+            SuffixOffer::live(base, headers.clone(), &records).unwrap(),
+        )
+        .unwrap();
+        let mut root_only = headers
+            .iter()
+            .map(|header| HeaderInventoryRecord::header_only(header.header))
+            .collect::<Vec<_>>();
+        root_only[1].terminal = records[1].terminal;
+        assert_eq!(
+            sync.add_inventory(root_peer, FailureDomain(2), &headers, &root_only)
+                .unwrap(),
+            1
+        );
+        let bytes_of = |object: &ObjectId| match object {
+            ObjectId::BlockBody(body) => vec![
+                headers
+                    .iter()
+                    .position(|header| header.hash == body.claim.block_hash)
+                    .unwrap() as u8
+                    + 1;
+                9
+            ],
+            ObjectId::Terminal(terminal) if terminal.claim == root_claim => vec![0xE1; 17],
+            ObjectId::Terminal(_) => vec![0xE2; 17],
+            _ => unreachable!(),
+        };
+        let mut rounds = 0;
+        while !sync.is_complete() {
+            rounds += 1;
+            assert!(rounds < 8, "the plan never completes");
+            for request in sync.schedule(rounds) {
+                let payloads = request
+                    .objects
+                    .iter()
+                    .map(|object| ObjectPayload {
+                        object: *object,
+                        bytes: Some(bytes_of(object)),
+                    })
+                    .collect();
+                sync.accept_response(request.token, request.peer, payloads, None)
+                    .unwrap();
+            }
+        }
+        let fetched = sync.into_fetched().unwrap();
+        assert_eq!(fetched.terminal_bytes, vec![0xE2; 17]);
+        let (root_bytes, _) = fetched.relation_root_terminal.clone().unwrap();
+        assert_eq!(root_bytes, vec![0xE1; 17]);
+        assert_eq!(fetched.body_bytes.len(), 3);
+        let _ = tip_only;
     }
 
     trait ObjectIdTestExt {

@@ -1382,6 +1382,41 @@ impl HistoryStepPackGeneration {
     }
 }
 
+/// The height of the header that roots the HistoryStep relation proving a
+/// block at `height`: genesis for the launch relation, the block before the
+/// activation height for a relation that starts there (the root the node
+/// derives from the branch's own headers). A terminal at `height` proves the
+/// blocks above that root and **nothing at or below it** (review I1): a
+/// suffix whose base lies below the root needs the root's own terminal for
+/// the blocks up to it.
+#[inline]
+pub const fn history_step_relation_root_height(height: u64) -> u64 {
+    history_step_relation_root_height_with(height, V1_3_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`history_step_relation_root_height`] with both clocks
+/// injected.
+#[inline]
+pub const fn history_step_relation_root_height_with(
+    height: u64,
+    v1_3_activation: Option<u64>,
+    v1_5_activation: Option<u64>,
+) -> u64 {
+    let activation = match HistoryStepPackGeneration::at_schedule(
+        height,
+        v1_3_activation,
+        v1_5_activation,
+    ) {
+        HistoryStepPackGeneration::V1 => None,
+        HistoryStepPackGeneration::V1_3 => v1_3_activation,
+        HistoryStepPackGeneration::V1_5 => v1_5_activation,
+    };
+    match activation {
+        Some(activation) => activation.saturating_sub(1),
+        None => 0,
+    }
+}
+
 const _: () = assert!(
     V1_3_TIER_SMALL < BLOCK_PAGE_CLASS_TIERS[0],
     "the v1.3 small class gives up a page position, it never adds one"

@@ -280,9 +280,56 @@ pub struct VerifiedRecursiveSuffix {
     terminal_bytes: Vec<u8>,
     /// The tip's client lanes, checked against the chain at the final body.
     client_view: TerminalClientView,
+    /// The block that roots the tip's relation and its epoch anchor, when the
+    /// suffix starts below that root: proved by its own verified terminal
+    /// (review I1), each checked against the suffix's body at its height.
+    relation_root: Option<(BlockHeader, BlockHeader)>,
     next_height: u64,
     previous_hash: [u8; 32],
     complete: bool,
+}
+
+/// The height of the header rooting the relation that proves a block at
+/// `height` ([`crate::consensus::params::history_step_relation_root_height`]);
+/// this crate's tests install a schedule of their own on the test thread.
+fn relation_root_height(height: u64) -> u64 {
+    #[cfg(test)]
+    if let Some((v1_3, v1_5)) = test_relation_schedule::installed() {
+        return crate::consensus::params::history_step_relation_root_height_with(
+            height, v1_3, v1_5,
+        );
+    }
+    crate::consensus::params::history_step_relation_root_height(height)
+}
+
+/// Per-thread relation schedule for this crate's unit tests only.
+#[cfg(test)]
+pub(crate) mod test_relation_schedule {
+    use std::cell::Cell;
+
+    type Schedule = (Option<u64>, Option<u64>);
+
+    thread_local! {
+        static INSTALLED: Cell<Option<Schedule>> = const { Cell::new(None) };
+    }
+
+    /// Restores the consensus schedule when dropped.
+    pub(crate) struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            INSTALLED.with(|cell| cell.set(None));
+        }
+    }
+
+    pub(crate) fn install(v1_3: Option<u64>, v1_5: Option<u64>) -> Installed {
+        INSTALLED.with(|cell| cell.set(Some((v1_3, v1_5))));
+        Installed(())
+    }
+
+    pub(super) fn installed() -> Option<Schedule> {
+        INSTALLED.with(Cell::get)
+    }
 }
 
 impl VerifiedRecursiveSuffix {
@@ -1642,6 +1689,19 @@ impl MdbxChainContext {
                 ),
             ));
         }
+        if let Some((root, root_epoch_anchor)) = &authority.relation_root {
+            if (block.header.height == root.height && block.header != *root)
+                || (block.header.height == root_epoch_anchor.height
+                    && block.header != *root_epoch_anchor)
+            {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadHistoryStepTerminal(
+                        "recursive suffix body differs from its verified relation root"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
 
         let parent = *self.tip_header();
         let checks_started = Instant::now();
@@ -2567,11 +2627,43 @@ impl MdbxChainContext {
         ))
     }
 
+    /// The epoch anchor a terminal at `terminal_height` binds is canonical
+    /// when at or below the suffix boundary, and otherwise lies inside the
+    /// suffix (checked against its body there).
+    fn check_suffix_epoch_anchor(
+        &self,
+        boundary_height: u64,
+        terminal_height: u64,
+        epoch_anchor_header: &BlockHeader,
+    ) -> Result<(), MdbxContextError> {
+        let expected_epoch_height = tx_epoch_anchor_height_for_child(terminal_height);
+        if expected_epoch_height <= boundary_height {
+            let canonical_epoch_anchor = self.get_header_from_store(expected_epoch_height)?.ok_or(
+                MdbxContextError::Corrupt("recursive suffix canonical epoch anchor is missing"),
+            )?;
+            if canonical_epoch_anchor != *epoch_anchor_header {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadHistoryStepTerminal(
+                        "recursive suffix epoch anchor is not canonical".to_string(),
+                    ),
+                ));
+            }
+        } else if expected_epoch_height >= terminal_height {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix epoch anchor lies outside its body sequence".to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn authorize_recursive_terminal_from_boundary(
         &self,
         boundary_height: u64,
         boundary_hash: [u8; 32],
         verified: VerifiedHistoryStepTerminal,
+        relation_root: Option<VerifiedHistoryStepTerminal>,
     ) -> Result<VerifiedRecursiveSuffix, MdbxContextError> {
         let VerifiedHistoryStepTerminal {
             tip_header,
@@ -2584,31 +2676,50 @@ impl MdbxChainContext {
                 "recursive suffix tip does not advance its exact boundary",
             ));
         }
-        let expected_epoch_height = tx_epoch_anchor_height_for_child(tip_header.height);
-        if expected_epoch_height <= boundary_height {
-            let canonical_epoch_anchor = self.get_header_from_store(expected_epoch_height)?.ok_or(
-                MdbxContextError::Corrupt("recursive suffix canonical epoch anchor is missing"),
-            )?;
-            if canonical_epoch_anchor != epoch_anchor_header {
+        self.check_suffix_epoch_anchor(boundary_height, tip_header.height, &epoch_anchor_header)?;
+        // Review I1: the tip's terminal proves the blocks above the root of
+        // its relation and nothing at or below it. A suffix that starts
+        // below that root needs the root's own verified terminal for the
+        // blocks up to it, itself rooted at or below the boundary.
+        let root_height = relation_root_height(tip_header.height);
+        let relation_root = if boundary_height < root_height {
+            let Some(root) = relation_root else {
                 return Err(MdbxContextError::Consensus(
-                    ConsensusError::BadHistoryStepTerminal(
-                        "recursive suffix epoch anchor is not canonical".to_string(),
-                    ),
+                    ConsensusError::BadHistoryStepTerminal(format!(
+                        "recursive suffix from {boundary_height} to {} starts below the root \
+                         {root_height} of its tip's relation: the blocks up to the root need \
+                         the root's own terminal",
+                        tip_header.height
+                    )),
+                ));
+            };
+            if root.tip_header.height != root_height
+                || relation_root_height(root_height) > boundary_height
+            {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadHistoryStepTerminal(format!(
+                        "recursive suffix from {boundary_height} to {} is not proved by a \
+                         relation-root terminal at {} (root {root_height})",
+                        tip_header.height, root.tip_header.height
+                    )),
                 ));
             }
-        } else if expected_epoch_height >= tip_header.height {
-            return Err(MdbxContextError::Consensus(
-                ConsensusError::BadHistoryStepTerminal(
-                    "recursive suffix epoch anchor lies outside its body sequence".to_string(),
-                ),
-            ));
-        }
+            self.check_suffix_epoch_anchor(
+                boundary_height,
+                root_height,
+                &root.epoch_anchor_header,
+            )?;
+            Some((root.tip_header, root.epoch_anchor_header))
+        } else {
+            None
+        };
         Ok(VerifiedRecursiveSuffix {
             boundary_height,
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
             client_view,
+            relation_root,
             next_height: boundary_height.saturating_add(1),
             previous_hash: boundary_hash,
             complete: false,
@@ -2657,6 +2768,17 @@ impl MdbxChainContext {
         &mut self,
         verified: VerifiedHistoryStepTerminal,
     ) -> Result<VerifiedRecursiveSuffix, MdbxContextError> {
+        self.begin_preverified_recursive_suffix_with_root(verified, None)
+    }
+
+    /// [`Self::begin_preverified_recursive_suffix`] for a suffix that may
+    /// start below the root of its tip's relation: `relation_root` is the
+    /// verified terminal of that root block (review I1), required then.
+    pub fn begin_preverified_recursive_suffix_with_root(
+        &mut self,
+        verified: VerifiedHistoryStepTerminal,
+        relation_root: Option<VerifiedHistoryStepTerminal>,
+    ) -> Result<VerifiedRecursiveSuffix, MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
                 "recursive suffix cannot begin during reorg staging",
@@ -2668,6 +2790,7 @@ impl MdbxChainContext {
             boundary_height,
             boundary_hash,
             verified,
+            relation_root,
         )?;
         self.store.begin_verified_recursive_suffix(
             boundary_height,
@@ -2707,6 +2830,19 @@ impl MdbxChainContext {
         ancestor_height: u64,
         verified: VerifiedHistoryStepTerminal,
     ) -> Result<VerifiedReorgSuffix, MdbxContextError> {
+        self.authorize_preverified_reorg_suffix_with_root(ancestor_height, verified, None)
+    }
+
+    /// [`Self::authorize_preverified_reorg_suffix`] for a replacement that
+    /// may start below the root of its tip's relation: `relation_root` is the
+    /// verified terminal of that root block on the replacement branch
+    /// (review I1), required then.
+    pub fn authorize_preverified_reorg_suffix_with_root(
+        &self,
+        ancestor_height: u64,
+        verified: VerifiedHistoryStepTerminal,
+        relation_root: Option<VerifiedHistoryStepTerminal>,
+    ) -> Result<VerifiedReorgSuffix, MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
                 "recursive reorg cannot begin during reorg staging",
@@ -2731,6 +2867,7 @@ impl MdbxChainContext {
             ancestor_height,
             ancestor_hash,
             verified,
+            relation_root,
         )?;
         Ok(VerifiedReorgSuffix {
             suffix,
@@ -2991,6 +3128,7 @@ mod tests {
     use super::*;
 
     mod client_registry;
+    mod relation_root;
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
         test_next_bundle_for_miner(context, 0x44)

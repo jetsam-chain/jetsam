@@ -5272,6 +5272,7 @@ async fn apply_exact_suffix_offthread(
             body_sources,
             terminal_bytes,
             terminal_source,
+            relation_root_terminal,
             inbound_permits,
         ) = fetched.into_parts();
         let _inbound_permits = inbound_permits;
@@ -5432,6 +5433,62 @@ async fn apply_exact_suffix_offthread(
             elapsed_ms = terminal_started.elapsed().as_millis(),
             "exact suffix terminal verified outside the chain writer"
         );
+        // Review I1: a suffix starting below the root of its tip's relation
+        // brings the root block's own terminal, verified on the same branch:
+        // it proves the blocks up to the root, which the tip's does not.
+        let verified_relation_root = match (plan.relation_root_terminal(), relation_root_terminal) {
+            (None, _) => None,
+            (Some(claim), Some((root_bytes, root_source))) => {
+                let root_header = blocks
+                    .iter()
+                    .find(|block| block.header.height == claim.height)
+                    .map(|block| block.header)
+                    .ok_or_else(|| {
+                        ExactSuffixApplyError::Other(
+                            "exact suffix relation root is missing from its bodies".into(),
+                        )
+                    })?;
+                let root_anchor_height =
+                    jetsam_chain::consensus::tx_epoch_anchor_height_for_child(claim.height);
+                let root_anchor_header = header_at(root_anchor_height).ok_or_else(|| {
+                    ExactSuffixApplyError::Other(format!(
+                        "exact suffix relation root epoch anchor {root_anchor_height} is missing"
+                    ))
+                })?;
+                let verified = jetsam_chain::storage::verify_history_step_terminal_candidate(
+                    root_header,
+                    root_anchor_header,
+                    root_bytes,
+                    |claim| {
+                        verify_history_step_terminal_on_branch(
+                            claim,
+                            &history_step_runtimes,
+                            &mut header_at,
+                        )
+                    },
+                )
+                .map_err(|error| {
+                    let message = format!("verify exact suffix relation-root terminal: {error}");
+                    if history_step_context_error_is_terminal_peer_fault(&error) {
+                        ExactSuffixApplyError::terminal(root_source, message)
+                    } else {
+                        ExactSuffixApplyError::Other(message)
+                    }
+                })?;
+                tracing::info!(
+                    root_height = claim.height,
+                    tip_height = tip_header.height,
+                    "exact suffix relation-root terminal verified: it proves the blocks up to the \
+                     root of the tip's relation"
+                );
+                Some(verified)
+            }
+            (Some(_), None) => {
+                return Err(ExactSuffixApplyError::Other(
+                    "exact suffix plan requires a relation-root terminal it did not fetch".into(),
+                ))
+            }
+        };
 
         let writer_wait_started = Instant::now();
         let mut ctx = apply_chain.blocking_write();
@@ -5452,7 +5509,10 @@ async fn apply_exact_suffix_offthread(
                     ));
                 }
                 let mut authority = ctx
-                    .begin_preverified_recursive_suffix(verified_terminal)
+                    .begin_preverified_recursive_suffix_with_root(
+                        verified_terminal,
+                        verified_relation_root,
+                    )
                     .map_err(|error| {
                         let message = format!("authorize exact live suffix terminal: {error}");
                         if history_step_context_error_is_terminal_peer_fault(&error) {
@@ -5528,7 +5588,11 @@ async fn apply_exact_suffix_offthread(
             }
             SyncPlanKind::Reorg => {
                 let authority = ctx
-                    .authorize_preverified_reorg_suffix(plan.base().height, verified_terminal)
+                    .authorize_preverified_reorg_suffix_with_root(
+                        plan.base().height,
+                        verified_terminal,
+                        verified_relation_root,
+                    )
                     .map_err(|error| {
                         let message = format!("authorize exact reorg terminal: {error}");
                         if history_step_context_error_is_terminal_peer_fault(&error) {
@@ -6015,6 +6079,16 @@ fn source_independent_suffix_offer(
         .last_mut()
         .expect("non-empty suffix checked above")
         .terminal = Some(terminal);
+    // Review I1: below the root of the tip's relation, the root block's own
+    // terminal proves the blocks up to it, and is part of the plan.
+    if let Some(index) =
+        jetsam_node::networking::sync_plan::suffix_relation_root(base, &headers)
+    {
+        let (_, root_terminal) = dag
+            .terminal_provider(headers[index].point(), Some(preferred_peer))
+            .ok_or(SuffixSyncError::MissingRelationRootTerminal)?;
+        bootstrap[index].terminal = Some(root_terminal);
+    }
     let offer = if base == old_tip {
         SuffixOffer::live(base, headers.clone(), &bootstrap)?
     } else {
@@ -6040,6 +6114,21 @@ fn source_independent_suffix_offer(
         return Err(SuffixSyncError::MissingBodySource);
     }
     Ok((terminal_peer, offer, inventories))
+}
+
+/// Whether a header range ending at `target` brought what the selected tip's
+/// plan lacked (review I1): `target` is the root block of the selected tip's
+/// relation, whose own terminal a provider now advertises.
+fn range_completes_relation_root(
+    dag: &jetsam_node::networking::header_dag::HeaderDag,
+    target: jetsam_node::networking::ChainPoint,
+) -> bool {
+    let best = dag.best_tip();
+    best != target
+        && best.height > target.height
+        && target.height
+            == jetsam_chain::consensus::params::history_step_relation_root_height(best.height)
+        && dag.terminal_provider(target, None).is_some()
 }
 
 fn dispatch_exact_suffix_requests(
@@ -6197,7 +6286,8 @@ mod tests {
         refuse_foreign_chain_data,
         prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
         record_snapshot_terminal_transport_failure,         resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
-        rotating_manifest_peers, seed_to_multiaddr, selected_tip_probe_range,
+        range_completes_relation_root, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range,
         snapshot_candidate_wins_header_dag, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
@@ -6324,6 +6414,103 @@ mod tests {
             encoded_len: 1,
         });
         jetsam_node::networking::suffix_sync::SuffixOffer::live(base, headers, &records).unwrap()
+    }
+
+    /// Review I1: a node two blocks below the root of the v1.3 relation (the
+    /// block before its activation) selects a tip at the activation. Its
+    /// plan needs the root block's own terminal: without an advertised one
+    /// no plan is formed (the node asks for a range ending at the root), and
+    /// a range that brings it lets the selected tip's plan go on, with it.
+    #[test]
+    fn a_selected_suffix_below_its_relation_root_waits_for_the_roots_terminal() {
+        use jetsam_chain::block_header::{block_id, semantic_header_id};
+        use jetsam_node::networking::{
+            header_dag::{HeaderDag, ValidatedHeader},
+            suffix_sync::SuffixSyncError,
+            ChainPoint,
+        };
+        use jetsam_p2p::{
+            header_protocol::HeaderInventoryRecord,
+            object_protocol::{
+                BlockBodyClaimId, BlockBodyObjectId, TerminalClaimId, TerminalObjectId,
+            },
+        };
+
+        let activation = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT
+            .expect("both profiles arm v1.3");
+        let mut base_header = jetsam_chain::consensus::genesis_header();
+        base_header.height = activation - 3;
+        let base = ChainPoint::new(base_header.height, block_id(&base_header));
+        let mut dag = HeaderDag::new(base, [0u8; 32], 16);
+        let (mut parent, mut work) = (base_header, [0u8; 32]);
+        let mut headers = Vec::new();
+        for marker in 1..=3u8 {
+            let mut header = parent;
+            header.height += 1;
+            header.prev_block_hash = block_id(&parent);
+            header.timestamp += 1;
+            header.nonce = marker.into();
+            work = jetsam_chain::add_work(&work, &jetsam_chain::block_work(&header.difficulty_target));
+            let validated = ValidatedHeader::new_after_consensus_checks(header, work);
+            dag.insert(validated).unwrap();
+            headers.push(validated);
+            parent = header;
+        }
+        let (root, tip) = (headers[1], headers[2]);
+        assert_eq!(tip.header.height, activation);
+        assert_eq!(dag.best_tip(), tip.point());
+        let terminal_of = |header: &jetsam_chain::BlockHeader| TerminalObjectId {
+            claim: TerminalClaimId {
+                height: header.height,
+                semantic_header_id: semantic_header_id(header),
+                proof_class: 0,
+            },
+            byte_digest: [header.height as u8; 32],
+            encoded_len: 1,
+        };
+        let provider = libp2p::PeerId::random();
+        let records = headers
+            .iter()
+            .map(|header| HeaderInventoryRecord {
+                header: header.header,
+                body: Some(BlockBodyObjectId {
+                    claim: BlockBodyClaimId {
+                        height: header.header.height,
+                        block_hash: header.hash,
+                    },
+                    byte_digest: [7; 32],
+                    encoded_len: 1,
+                }),
+                terminal: (header.hash == tip.hash).then(|| terminal_of(&tip.header)),
+            })
+            .collect::<Vec<_>>();
+        dag.advertise_inventory(provider, &records).unwrap();
+        assert_eq!(
+            source_independent_suffix_offer(&dag, provider, base, base, headers.clone())
+                .unwrap_err(),
+            SuffixSyncError::MissingRelationRootTerminal
+        );
+        assert!(!range_completes_relation_root(&dag, root.point()));
+
+        // A header range ending at the root: its last record names the root
+        // block's terminal (beside its retained body).
+        let range_end = HeaderInventoryRecord {
+            terminal: Some(terminal_of(&root.header)),
+            ..records[1]
+        };
+        assert_eq!(
+            advertise_inventory_for_known_headers(&mut dag, provider, &[range_end]).unwrap(),
+            1
+        );
+        assert!(range_completes_relation_root(&dag, root.point()));
+        assert!(!range_completes_relation_root(&dag, tip.point()));
+        let (_, offer, _) =
+            source_independent_suffix_offer(&dag, provider, base, base, headers.clone()).unwrap();
+        assert_eq!(
+            offer.plan().relation_root_terminal(),
+            Some(terminal_of(&root.header).claim)
+        );
+        assert_eq!(offer.plan().target(), tip.point());
     }
 
     #[test]
@@ -12409,7 +12596,13 @@ async fn handle_p2p_events(
 
                         // HeaderDAG, not the peer and not the object inventory,
                         // decides whether this exact target is authoritative.
-                        if header_dag.best_tip() != target {
+                        // A range ending at the root of the selected tip's
+                        // relation (asked for its terminal, review I1)
+                        // completes the selected tip's plan: it goes on with
+                        // that tip.
+                        let completes_relation_root = active_suffix_sync.is_none()
+                            && range_completes_relation_root(&header_dag, target);
+                        if header_dag.best_tip() != target && !completes_relation_root {
                             mining_peer_quorum.observe_compatible(from);
                             tracing::debug!(
                                 peer = %from,
@@ -12722,6 +12915,53 @@ async fn handle_p2p_events(
                                     base_height = base.height,
                                     target_height = target.height,
                                     "validated stronger branch is waiting for an exact tip terminal"
+                                );
+                            }
+                            Err(
+                                jetsam_node::networking::suffix_sync::SuffixSyncError::MissingRelationRootTerminal,
+                            ) => {
+                                // Review I1: the suffix starts below the root
+                                // of its tip's relation, whose own terminal
+                                // nobody advertised yet. A header range ending
+                                // at the root carries it in its inventory
+                                // (the last record of a range names its
+                                // terminal); once known, the plan is formed.
+                                let root_height =
+                                    jetsam_chain::consensus::params::history_step_relation_root_height(
+                                        target.height,
+                                    );
+                                let count = root_height
+                                    .saturating_sub(base.height)
+                                    .saturating_add(1)
+                                    .min(512) as u16;
+                                let excluded = std::collections::HashSet::from([from]);
+                                let mut candidates = vec![from];
+                                candidates.extend(rotating_manifest_peers(
+                                    &manifest_peers,
+                                    &excluded,
+                                    None,
+                                    false,
+                                    &mut exact_inventory_probe_cursor,
+                                    2,
+                                ));
+                                for peer in candidates {
+                                    try_dispatch_header_fetch(
+                                        &p2p_cmd,
+                                        &mut fetch_in_progress,
+                                        &mut recent_header_fetches,
+                                        peer,
+                                        base.height,
+                                        count,
+                                        Instant::now(),
+                                    );
+                                }
+                                tracing::info!(
+                                    peer = %from,
+                                    base_height = base.height,
+                                    root_height,
+                                    target_height = target.height,
+                                    "exact suffix starts below the root of its tip's relation: \
+                                     asking for the root block's terminal"
                                 );
                             }
                             Err(error) => tracing::warn!(
