@@ -79,8 +79,7 @@ pub use difficulty::{
     work_gt, DifficultySchedule,
 };
 pub use emission::{
-    block_reward, format_eld, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum,
-    total_fees,
+    block_reward, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum, total_fees,
 };
 pub use epoch_anchor::{
     checked_tx_epoch_height_decomposition, next_tx_epoch_anchor_id,

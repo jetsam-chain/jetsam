@@ -42,7 +42,6 @@
 use crate::consensus::fees::claimable_fee_for_tx_body;
 use crate::consensus::params::{
     BASE_REWARD_MICRO, EMISSION_END_HEIGHT, HALVING_COUNT, HALVING_INTERVAL, H1_HEIGHT, H2_HEIGHT,
-    MICRO_PER_JTM,
 };
 use jetsam_tx::types::TxBody;
 
@@ -148,13 +147,6 @@ pub fn max_coinbase_value_from_claimable_fee_sum(
     u128::from(crate::consensus::development_allocation::miner_subsidy(
         child_height,
     )) + claimable_fee_sum
-}
-
-/// Format a μJTM amount as a human-readable string (not consensus-critical).
-pub fn format_eld(micro_jtm: u64) -> String {
-    let whole = micro_jtm / MICRO_PER_JTM;
-    let frac = micro_jtm % MICRO_PER_JTM;
-    format!("{}.{:06} JTM", whole, frac)
 }
 
 #[cfg(test)]
