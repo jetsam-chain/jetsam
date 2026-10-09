@@ -8630,7 +8630,9 @@ async fn tend_client_objects(
 /// and structural digest are seconds of CPU on 32 threads and minutes on two
 /// cores at 256 MiB, and every node receives a registration at once (on the
 /// event loop the whole network would stop together). Until it is held, a
-/// tip that needs it has no verdict.
+/// tip that needs it has no verdict. The client objects do that work on
+/// their own lowest-priority workers, never on the shared pool where blocks
+/// are verified and produced: this blocking thread only waits for them.
 fn spawn_matrix_authentication(
     objects: Arc<jetsam_node::client_objects::ClientObjects>,
     assembled: jetsam_node::client_objects::AssembledMatrixFile,
@@ -8638,27 +8640,21 @@ fn spawn_matrix_authentication(
     let id = assembled.id();
     tokio::spawn(async move {
         let worker = Arc::clone(&objects);
-        let outcome = tokio::task::spawn_blocking(move || {
-            jetsam_miner::install_inbound_verifier_cpu(|| worker.authenticate_assembled(assembled))
-        })
-        .await;
+        let outcome =
+            tokio::task::spawn_blocking(move || worker.authenticate_assembled(assembled)).await;
         match outcome {
-            Ok(Ok(Ok(file))) => tracing::info!(
+            Ok(Ok(file)) => tracing::info!(
                 matrix_digest = %hex::encode(file.matrix_digest),
                 bytes = file.file_len,
                 "registered client matrix fetched and authenticated"
             ),
             // Every chunk matched the registered manifest, so the registered
             // file itself is not a matrix of `D`: no peer can do better.
-            Ok(Ok(Err(error))) => tracing::warn!(
+            Ok(Err(error)) => tracing::warn!(
                 digest = %hex::encode(id.matrix_digest),
                 %error,
                 "the registered client matrix file does not open as its D"
             ),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "client matrix authentication CPU admission failed");
-                objects.forget_assembled(&id);
-            }
             Err(error) => {
                 tracing::warn!(%error, "client matrix authentication panicked");
                 objects.forget_assembled(&id);
@@ -8669,8 +8665,10 @@ fn spawn_matrix_authentication(
 
 /// After a restart (M3.8), off the startup path and the event loop: the
 /// matrix files held on disk authenticated again (minutes of CPU per 256 MiB
-/// matrix on two cores), then the client proofs kept before the restart
-/// received again under `registry` (each needs its matrix held).
+/// matrix on two cores, on the client objects' own lowest-priority workers,
+/// never on the shared pool where blocks are verified), then the client
+/// proofs kept before the restart received again under `registry` (each
+/// needs its matrix held), on the inbound-verification pool.
 fn spawn_held_client_objects_reload(
     objects: Arc<jetsam_node::client_objects::ClientObjects>,
     registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
@@ -8679,29 +8677,25 @@ fn spawn_held_client_objects_reload(
 ) {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
+        let held = objects.authenticate_held_files();
+        if held > 0 {
+            tracing::info!(
+                held,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "v1.5 client matrices held on disk authenticated again"
+            );
+        }
         match jetsam_miner::install_inbound_verifier_cpu(|| {
-            let held = objects.authenticate_held_files();
-            (held, objects.reload_bundles(&registry, &rules, next_height))
+            objects.reload_bundles(&registry, &rules, next_height)
         }) {
-            Ok((held, kept)) => {
-                if held > 0 {
-                    tracing::info!(
-                        held,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "v1.5 client matrices held on disk authenticated again"
-                    );
-                }
-                match kept {
-                    Ok(kept) if kept > 0 => {
-                        tracing::info!(kept, "v1.5 client proofs kept across the restart")
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(%error, "kept client proofs not reloaded"),
-                }
+            Ok(Ok(kept)) if kept > 0 => {
+                tracing::info!(kept, "v1.5 client proofs kept across the restart")
             }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "kept client proofs not reloaded"),
             Err(error) => tracing::error!(
                 %error,
-                "held client matrices and kept client proofs not reloaded: restart the node"
+                "kept client proofs not reloaded: restart the node"
             ),
         }
     });

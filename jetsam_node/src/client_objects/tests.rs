@@ -511,6 +511,58 @@ fn held_matrix_files_are_authenticated_again_off_the_event_loop_after_a_restart(
     assert_eq!(objects.fetching_matrices(), vec![damaged.file_id()]);
 }
 
+/// A matrix is decoded and digested on the authentication workers, its
+/// parallel parts with it, whoever asks: never on the caller's pool (the
+/// node's shared pool, where blocks are verified). On Linux they run at the
+/// lowest CPU priority (nice 19, SCHED_IDLE) and the caller's own priority
+/// is untouched.
+#[test]
+fn matrices_are_authenticated_on_their_own_lowest_priority_workers() {
+    use rayon::prelude::*;
+    /// The calling thread's nice value and scheduling policy, where they are
+    /// the thread's own.
+    fn nice() -> Option<(i32, i32)> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: getpriority and sched_getscheduler read no memory of ours.
+            Some(unsafe {
+                (
+                    libc::getpriority(libc::PRIO_PROCESS as _, 0),
+                    libc::sched_getscheduler(0),
+                )
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+    fn on_authentication_worker() -> bool {
+        std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("jetsam-matrix-auth-"))
+    }
+    let callers = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let caller_nice = callers.install(nice);
+    let (worker, parallel_parts, worker_nice) = callers.install(|| {
+        on_authentication_workers(|| {
+            (
+                on_authentication_worker(),
+                (0..256).into_par_iter().all(|_| on_authentication_worker()),
+                nice(),
+            )
+        })
+    });
+    assert!(worker, "authenticated on the caller's thread");
+    assert!(parallel_parts, "parallel parts ran off the authentication workers");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(worker_nice, Some((19, libc::SCHED_IDLE)));
+        assert_eq!(callers.install(nice), caller_nice);
+        assert_ne!(caller_nice.map(|(_, policy)| policy), Some(libc::SCHED_IDLE));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (worker_nice, caller_nice);
+}
+
 #[test]
 fn a_client_proof_is_received_queued_kept_and_reloaded() {
     let form = test_form();

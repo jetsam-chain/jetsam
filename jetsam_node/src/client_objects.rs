@@ -25,6 +25,10 @@
 //!   authenticated again the same way ([`ClientObjects::authenticate_held_files`]).
 //!   Until then a matrix is neither held for the verifier nor served (a tip
 //!   that needs it has no verdict yet), nor fetched again.
+//! - **Never in the way of blocks.** A matrix is decoded and digested on its
+//!   own workers, at the lowest CPU priority, whoever asks: never on the
+//!   shared pool where blocks are verified and produced
+//!   (`on_authentication_workers`).
 //! - **Client proofs.** Announced on gossip, fetched as bundles (submission,
 //!   paying transaction, proof), decoded under their bounds, pre-passed once
 //!   (`PreparedHistoryStepClient`: native verification, lincheck on `D`,
@@ -40,7 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use jetsam_chain::consensus::client_objects::{
@@ -236,14 +240,90 @@ fn parse_matrix_file_name(name: &str) -> Option<MatrixFileId> {
     })
 }
 
+/// Run `operation` (a matrix's decode, structural digest or chunk hashes:
+/// minutes of CPU at 256 MiB on two cores, on every node at once when a
+/// registration is mined) on the workers that authenticate matrices, and
+/// its parallel parts with it.
+///
+/// Never on the shared pool where blocks are verified and produced: Rayon
+/// runs a job handed to a pool from outside only when its workers find
+/// nothing else to do, so a block's verification queued behind an
+/// authentication ended with it (testnet 3, 2026-10-09: block 1222 verified
+/// in 102.6 s instead of 9-11 s on the two-vCPU seed, during the 95 s
+/// authentication of a 203 MiB matrix). As many workers as the shared pool,
+/// so an idle node authenticates as fast as before, each at the lowest CPU
+/// priority Linux has (SCHED_IDLE, below nice 19, which they take as well):
+/// a CPU runs them when nothing else wants it, so a core that verifies or
+/// produces a block leaves them only what it does not use. On other systems
+/// they keep the default priority. If they cannot be started, the caller's
+/// thread does the work.
+fn on_authentication_workers<R: Send>(operation: impl FnOnce() -> R + Send) -> R {
+    static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    let workers = WORKERS.get_or_init(|| {
+        let threads = jetsam_miner::configured_process_cpu_budget()
+            .map(|plan| plan.shared_pool_threads)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("jetsam-matrix-auth-{index}"))
+            .start_handler(|_| lowest_cpu_priority())
+            .build()
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "client matrix authentication workers not started: matrices are \
+                     authenticated on the caller's thread"
+                )
+            })
+            .ok()
+    });
+    match workers {
+        Some(workers) => workers.install(operation),
+        None => operation(),
+    }
+}
+
+/// The calling thread, and it alone, to the lowest CPU priority: nice 19,
+/// then SCHED_IDLE. Nice 19 alone left these workers more than its weight
+/// (measured: a quarter to a third of two CPUs while Rayon workers at
+/// nice 10 verified on them); SCHED_IDLE leaves them what the CPUs do not
+/// use (under 8 % there).
+#[cfg(target_os = "linux")]
+fn lowest_cpu_priority() {
+    // `who = 0` and `pid = 0` are the calling thread: Linux keeps the nice
+    // value and the policy per thread. Lowering one's own priority needs no
+    // privilege.
+    // SAFETY: setpriority reads no memory of ours.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, 19) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "a client matrix authentication worker keeps the default CPU priority"
+        );
+    }
+    let idle = libc::sched_param { sched_priority: 0 };
+    // SAFETY: `idle` outlives the call, which only reads it.
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &idle) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "a client matrix authentication worker keeps the default CPU policy"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lowest_cpu_priority() {}
+
 /// The digests of a matrix file's chunks, in order (its manifest; the root is
-/// their hash): one pass over the file, its chunks hashed in parallel.
+/// their hash): one pass over the file, its chunks hashed in parallel on the
+/// authentication workers.
 fn matrix_chunk_digests(file: &[u8]) -> Vec<Hash32> {
     use rayon::prelude::*;
-    file.par_chunks(CLIENT_MATRIX_CHUNK_BYTES)
-        .enumerate()
-        .map(|(index, chunk)| matrix_file_chunk_digest(index as u32, chunk))
-        .collect()
+    on_authentication_workers(|| {
+        file.par_chunks(CLIENT_MATRIX_CHUNK_BYTES)
+            .enumerate()
+            .map(|(index, chunk)| matrix_file_chunk_digest(index as u32, chunk))
+            .collect()
+    })
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -358,15 +438,17 @@ impl ClientObjects {
     }
 
     /// `bytes` decoded as a matrix of the client form, its `D` computed (the
-    /// one structural pass).
+    /// one structural pass), on the authentication workers.
     fn open_client_matrix(&self, bytes: &[u8]) -> Option<AuthenticatedClientMatrix> {
-        let matrix = FieldR1cs::read_artifact_unbound(
-            &mut &bytes[..],
-            self.form.shape(),
-            CLIENT_MATRIX_MAX_FILE_BYTES as usize,
-        )
-        .ok()?;
-        self.matrices.authenticate(Arc::new(matrix)).ok()
+        on_authentication_workers(|| {
+            let matrix = FieldR1cs::read_artifact_unbound(
+                &mut &bytes[..],
+                self.form.shape(),
+                CLIENT_MATRIX_MAX_FILE_BYTES as usize,
+            )
+            .ok()?;
+            self.matrices.authenticate(Arc::new(matrix)).ok()
+        })
     }
 
     /// `bytes` decoded as the matrix of the registered `D` of `id`.
