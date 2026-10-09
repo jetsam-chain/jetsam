@@ -3271,15 +3271,45 @@ struct PendingSnapshotHeaderSync {
     target_height: u64,
 }
 
+/// The snapshot boundaries a provider serves the terminal of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManifestTerminalCapability {
+    /// The newest boundary it advertised, by a manifest or a header
+    /// inventory.
     boundary_height: u64,
     boundary_hash: [u8; 32],
+    /// The boundary of the last manifest it served this node. A provider
+    /// keeps serving the generation it leased to a peer, while its header
+    /// inventories already advertise its newer boundary: overwriting the
+    /// manifest's boundary with theirs left a plan for the leased generation
+    /// with nobody to ask for its terminal (testnet 3, 2026-10-09).
+    served_manifest: Option<(u64, [u8; 32])>,
 }
 
 impl ManifestTerminalCapability {
+    /// What a manifest advertises: its boundary, the one of the generation
+    /// served to this node.
+    fn from_manifest(height: u64, block_hash: [u8; 32]) -> Self {
+        Self {
+            boundary_height: height,
+            boundary_hash: block_hash,
+            served_manifest: Some((height, block_hash)),
+        }
+    }
+
+    /// What a header inventory advertises (`height`, `block_hash`): its
+    /// newest boundary, beside the boundary of the manifest it served.
+    fn from_headers(previous: Option<&Self>, height: u64, block_hash: [u8; 32]) -> Self {
+        Self {
+            boundary_height: height,
+            boundary_hash: block_hash,
+            served_manifest: previous.and_then(|previous| previous.served_manifest),
+        }
+    }
+
     fn advertises(self, height: u64, block_hash: [u8; 32]) -> bool {
-        self.boundary_height == height && self.boundary_hash == block_hash
+        (self.boundary_height == height && self.boundary_hash == block_hash)
+            || self.served_manifest == Some((height, block_hash))
     }
 }
 
@@ -3590,6 +3620,69 @@ fn advertised_terminal_peer(
         })
         .min_by_key(|peer| (*peer != preferred, peer.to_bytes()))
 }
+
+/// A plan waiting for the terminal of a boundary no usable connected
+/// provider offers any more (each served a newer manifest since, or its
+/// offer was dropped after a failed request or a disconnection) has nobody
+/// left to ask for it. When one offers a newer boundary, the plan is
+/// superseded: this returns that provider and its boundary (the highest
+/// offered), to plan again toward it. `None` while any usable provider still
+/// offers the plan's boundary.
+///
+/// Testnet 3, 2026-10-09: a two-vCPU node with one peer kept a plan for
+/// boundary 1404 after the seed had moved on to 1410, made no request and
+/// wrote no line for 13 minutes.
+fn superseded_snapshot_plan_source(
+    peers: &std::collections::HashSet<libp2p::PeerId>,
+    capabilities: &std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
+    rejected: &std::collections::HashSet<libp2p::PeerId>,
+    height: u64,
+    block_hash: [u8; 32],
+) -> Option<(libp2p::PeerId, u64)> {
+    let usable = || {
+        peers
+            .iter()
+            .copied()
+            .filter(|peer| !rejected.contains(peer))
+            .filter_map(|peer| {
+                capabilities
+                    .get(&peer)
+                    .map(|capability| (peer, *capability))
+            })
+    };
+    if usable().any(|(_, capability)| capability.advertises(height, block_hash)) {
+        return None;
+    }
+    usable()
+        .filter(|(_, capability)| capability.boundary_height > height)
+        .max_by_key(|(peer, capability)| {
+            (
+                capability.boundary_height,
+                std::cmp::Reverse(peer.to_bytes()),
+            )
+        })
+        .map(|(peer, capability)| (peer, capability.boundary_height))
+}
+
+/// The providers asked again for a stalled snapshot plan's exact manifest:
+/// the others first, and the plan's own provider when nobody else is left
+/// (being asked again is not a failure). Leaving it out left a node with one
+/// peer nobody to ask, so its stalled plan never counted a discovery round
+/// and was never retired.
+fn snapshot_generation_probe_peers(
+    peers: &std::collections::HashSet<libp2p::PeerId>,
+    rejected_exact: &std::collections::HashSet<libp2p::PeerId>,
+    preferred: libp2p::PeerId,
+    cursor: &mut usize,
+    limit: usize,
+) -> Vec<libp2p::PeerId> {
+    rotating_manifest_peers(peers, rejected_exact, Some(preferred), true, cursor, limit)
+}
+
+/// How long a snapshot plan whose boundary nobody offers any more is kept,
+/// from its last progress, before it is planned again toward the newer
+/// boundary a provider offers (`superseded_snapshot_plan_source`).
+const SNAPSHOT_PLAN_SUPERSEDED_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a snapshot candidate or an exact suffix refused only for want of
 /// a registered client matrix (no verdict) waits for the client objects
@@ -6002,7 +6095,7 @@ mod tests {
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
-        Duration, Instant,
+        snapshot_generation_probe_peers, superseded_snapshot_plan_source, Duration, Instant,
         ClientMatrixWait, ClientMatrixWaitEnd, CLIENT_MATRIX_WAIT_LIMIT,
         CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
@@ -6677,6 +6770,158 @@ mod tests {
         assert_eq!(failures.get(&key), Some(&5));
     }
 
+    /// A boundary a provider serves: the one of the manifest it served.
+    fn offering(height: u64, block_hash: [u8; 32]) -> ManifestTerminalCapability {
+        ManifestTerminalCapability::from_manifest(height, block_hash)
+    }
+
+    /// Testnet 3, 2026-10-09: the seed served this node the manifest of
+    /// boundary 1404 (the generation it leased to it) while its header
+    /// inventories, answered in the same seconds, already advertised its
+    /// newer boundary 1410. The node took the headers' word for what the seed
+    /// serves, so the plan for 1404 had nobody to ask for its terminal, and
+    /// asked nothing, ever. The provider serves both.
+    #[test]
+    fn a_provider_still_offers_the_generation_it_served_after_its_headers_move_on() {
+        let seed = libp2p::PeerId::random();
+        let (height, block_hash) = (1_404u64, [4u8; 32]);
+        let served = ManifestTerminalCapability::from_manifest(height, block_hash);
+        assert!(served.advertises(height, block_hash));
+        let moved_on = ManifestTerminalCapability::from_headers(Some(&served), 1_410, [10; 32]);
+        assert!(moved_on.advertises(1_410, [10; 32]));
+        assert!(
+            moved_on.advertises(height, block_hash),
+            "the generation the seed served is still its to serve"
+        );
+        let peers = std::collections::HashSet::from([seed]);
+        let capabilities = std::collections::HashMap::from([(seed, moved_on)]);
+        assert_eq!(
+            advertised_terminal_peer(
+                &peers,
+                &capabilities,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                &std::collections::HashMap::new(),
+                seed,
+                height,
+                block_hash,
+                std::time::Instant::now(),
+            ),
+            Some(seed),
+            "the plan for 1404 asks the seed for its terminal"
+        );
+        // A newer manifest is what the seed serves now; a header inventory
+        // alone never said what it served.
+        let newer = ManifestTerminalCapability::from_manifest(1_410, [10; 32]);
+        assert!(!newer.advertises(height, block_hash));
+        let headers_only = ManifestTerminalCapability::from_headers(None, 1_410, [10; 32]);
+        assert!(!headers_only.advertises(height, block_hash));
+        // The same height on another block is not the served boundary.
+        assert!(!moved_on.advertises(height, [5; 32]));
+    }
+
+    /// A node whose only peer is the seed waits for the terminal of boundary
+    /// 1404 while the seed now serves 1410 (its manifest says so). Nobody
+    /// offers 1404 any more, so nothing would ever be asked for it: the plan
+    /// is superseded by 1410.
+    #[test]
+    fn a_plan_whose_boundary_nobody_offers_any_more_is_superseded_by_the_newer_one() {
+        let seed = libp2p::PeerId::random();
+        let (height, block_hash) = (1_404u64, [4u8; 32]);
+        let mut peers = std::collections::HashSet::from([seed]);
+        let mut rejected = std::collections::HashSet::new();
+        let mut capabilities = std::collections::HashMap::from([(seed, offering(1_404, [4; 32]))]);
+        let superseded =
+            |peers: &std::collections::HashSet<libp2p::PeerId>,
+             capabilities: &std::collections::HashMap<
+                libp2p::PeerId,
+                ManifestTerminalCapability,
+            >,
+             rejected: &std::collections::HashSet<libp2p::PeerId>| {
+                superseded_snapshot_plan_source(peers, capabilities, rejected, height, block_hash)
+            };
+        assert_eq!(superseded(&peers, &capabilities, &rejected), None);
+
+        // Header inventories alone do not take 1404 away from the seed.
+        capabilities.insert(
+            seed,
+            ManifestTerminalCapability::from_headers(capabilities.get(&seed), 1_410, [10; 32]),
+        );
+        assert_eq!(superseded(&peers, &capabilities, &rejected), None);
+
+        capabilities.insert(seed, offering(1_410, [10; 32]));
+        assert_eq!(
+            advertised_terminal_peer(
+                &peers,
+                &capabilities,
+                &rejected,
+                &std::collections::HashSet::new(),
+                &std::collections::HashMap::new(),
+                seed,
+                height,
+                block_hash,
+                std::time::Instant::now(),
+            ),
+            None,
+            "nobody to ask for the terminal of 1404"
+        );
+        assert_eq!(
+            superseded(&peers, &capabilities, &rejected),
+            Some((seed, 1_410))
+        );
+
+        // Another peer still offering 1404 keeps the plan, unless its
+        // terminals were refused.
+        let other = libp2p::PeerId::random();
+        peers.insert(other);
+        capabilities.insert(other, offering(1_404, [4; 32]));
+        assert_eq!(superseded(&peers, &capabilities, &rejected), None);
+        rejected.insert(other);
+        assert_eq!(
+            superseded(&peers, &capabilities, &rejected),
+            Some((seed, 1_410))
+        );
+
+        // Nothing newer offered (an older boundary, or nothing at all): not
+        // superseded; the stalled plan's own recovery answers that.
+        let lone = std::collections::HashSet::from([seed]);
+        let older = std::collections::HashMap::from([(seed, offering(1_398, [9; 32]))]);
+        let none = std::collections::HashSet::new();
+        assert_eq!(superseded(&lone, &older, &none), None);
+        assert_eq!(
+            superseded(&lone, &std::collections::HashMap::new(), &none),
+            None
+        );
+        // Same height, another block: not newer.
+        let fork = std::collections::HashMap::from([(seed, offering(1_404, [5; 32]))]);
+        assert_eq!(superseded(&lone, &fork, &none), None);
+    }
+
+    /// A stalled plan asks its providers again for its exact manifest. Its
+    /// own provider is not a failed one: with one peer, that peer is asked
+    /// (excluding it left nobody, no round was ever counted and the plan was
+    /// never retired); with others, they are asked first.
+    #[test]
+    fn a_stalled_plan_with_one_peer_asks_that_peer_again() {
+        let seed = libp2p::PeerId::random();
+        let mut peers = std::collections::HashSet::from([seed]);
+        let none = std::collections::HashSet::new();
+        let mut cursor = 0usize;
+        assert_eq!(
+            snapshot_generation_probe_peers(&peers, &none, seed, &mut cursor, 3),
+            vec![seed]
+        );
+        let other = libp2p::PeerId::random();
+        peers.insert(other);
+        assert_eq!(
+            snapshot_generation_probe_peers(&peers, &none, seed, &mut cursor, 3),
+            vec![other]
+        );
+        // A provider already refused for this exact manifest is not asked.
+        let lone = std::collections::HashSet::from([seed]);
+        assert!(snapshot_generation_probe_peers(&lone, &lone, seed, &mut cursor, 3).is_empty());
+    }
+
     /// A candidate refused for want of a matrix still being fetched or
     /// authenticated is not planned again until none is pending, within a
     /// bound; once ended, the wait holds nothing.
@@ -6723,17 +6968,11 @@ mod tests {
         let capabilities = std::collections::HashMap::from([
             (
                 preferred,
-                ManifestTerminalCapability {
-                    boundary_height: height,
-                    boundary_hash: block_hash,
-                },
+                ManifestTerminalCapability::from_manifest(height, block_hash),
             ),
             (
                 alternate,
-                ManifestTerminalCapability {
-                    boundary_height: height,
-                    boundary_hash: block_hash,
-                },
+                ManifestTerminalCapability::from_manifest(height, block_hash),
             ),
         ]);
         let rejected = std::collections::HashSet::new();
@@ -9627,6 +9866,41 @@ async fn handle_p2p_events(
         }};
     }
 
+    /// A stalled plan's providers asked again for its exact manifest, its
+    /// own provider included when nobody else is left: it has not failed
+    /// (`snapshot_generation_probe_peers`).
+    macro_rules! probe_snapshot_generation_providers {
+        ($preferred_peer:expr) => {{
+            let preferred_peer = $preferred_peer;
+            let requester_height = {
+                let ctx = chain.read().await;
+                ctx.tip_height()
+            };
+            let requested_manifest_digest = pending_manifest
+                .as_ref()
+                .map(|pending| pending.manifest.manifest_digest)
+                .unwrap_or([0; 32]);
+            let rejected_exact = rejected_snapshot_manifest_providers
+                .get(&requested_manifest_digest)
+                .cloned()
+                .unwrap_or_default();
+            let candidates = snapshot_generation_probe_peers(
+                &manifest_peers,
+                &rejected_exact,
+                preferred_peer,
+                &mut manifest_retry_cursor,
+                3,
+            );
+            let mut dispatched = 0usize;
+            for peer in candidates {
+                if try_request_manifest!(peer, requester_height, requested_manifest_digest) {
+                    dispatched = dispatched.saturating_add(1);
+                }
+            }
+            dispatched
+        }};
+    }
+
     macro_rules! rotate_snapshot_segment_source {
         ($failed_peer:expr, $segment_id:expr, $reason:expr) => {{
             let failed_peer = $failed_peer;
@@ -11557,13 +11831,12 @@ async fn handle_p2p_events(
                         && boundary.height % jetsam_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
-                        from,
-                        ManifestTerminalCapability {
-                            boundary_height: boundary.height,
-                            boundary_hash: boundary.hash,
-                        },
+                    let capability = ManifestTerminalCapability::from_headers(
+                        manifest_terminal_capabilities.get(&from),
+                        boundary.height,
+                        boundary.hash,
                     );
+                    manifest_terminal_capabilities.insert(from, capability);
                 }
                 let Some(pipeline) = snapshot_header_pipeline.as_mut() else {
                     tracing::debug!(
@@ -11784,13 +12057,12 @@ async fn handle_p2p_events(
                         && boundary.height % jetsam_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
-                        from,
-                        ManifestTerminalCapability {
-                            boundary_height: boundary.height,
-                            boundary_hash: boundary.hash,
-                        },
+                    let capability = ManifestTerminalCapability::from_headers(
+                        manifest_terminal_capabilities.get(&from),
+                        boundary.height,
+                        boundary.hash,
                     );
+                    manifest_terminal_capabilities.insert(from, capability);
                 }
                 let header_count = records.len();
                 // Headers batch arrived — clear the in-progress guard.
@@ -12458,10 +12730,10 @@ async fn handle_p2p_events(
                 if manifest.tip_height > 0 {
                     manifest_terminal_capabilities.insert(
                         from,
-                        ManifestTerminalCapability {
-                            boundary_height: manifest.tip_height,
-                            boundary_hash: manifest.tip_hash,
-                        },
+                        ManifestTerminalCapability::from_manifest(
+                            manifest.tip_height,
+                            manifest.tip_hash,
+                        ),
                     );
                     if pending_manifest
                         .as_ref()
@@ -12591,11 +12863,25 @@ async fn handle_p2p_events(
                     // integer here. Ordinary fork choice probes this peer after
                     // the active, fully authenticated snapshot is installed.
                     deferred_sync_peer = Some(from);
-                    tracing::debug!(
-                        from = %from,
-                        tip = manifest.tip_height,
-                        "late manifest deferred to authenticated post-install fork choice"
-                    );
+                    let plan_boundary = pending_manifest
+                        .as_ref()
+                        .map(|pending| pending.manifest.tip_height);
+                    if plan_boundary.is_some_and(|boundary| manifest.tip_height > boundary) {
+                        // The plan is replaced (heartbeat) once nobody offers
+                        // its own boundary any more.
+                        tracing::info!(
+                            from = %from,
+                            offered_boundary = manifest.tip_height,
+                            plan_boundary = plan_boundary.unwrap_or_default(),
+                            "a newer snapshot boundary is offered while a snapshot plan is active"
+                        );
+                    } else {
+                        tracing::debug!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            "late manifest deferred to authenticated post-install fork choice"
+                        );
+                    }
                 }
                 if manifest_tip_height == 0
                     && manifest_requested_peers.is_empty()
@@ -15192,13 +15478,51 @@ async fn handle_p2p_events(
                     .as_ref()
                     .map(|pending| pending.preferred_peer)
                 {
-                    let dispatched = request_snapshot_generation_providers!(original);
+                    let dispatched = probe_snapshot_generation_providers!(original);
                     if dispatched > 0 {
                         snapshot_provider_discovery_rounds =
                             snapshot_provider_discovery_rounds.saturating_add(1);
                     }
                 }
                 last_snapshot_provider_probe = now;
+            }
+
+            // A plan waiting for the terminal of a boundary no usable
+            // provider offers any more, while one offers a newer boundary,
+            // can never be served: its providers moved on. Planned again
+            // toward the newer boundary, after a short grace for a provider
+            // to offer the plan's boundary again.
+            let superseded_plan = if snapshot_pre_state_extinct
+                && snapshot_terminal_extinct
+                && snapshot_plan_last_progress.is_some_and(|last| {
+                    now.saturating_duration_since(last) >= SNAPSHOT_PLAN_SUPERSEDED_GRACE
+                }) {
+                snapshot_terminal_target.and_then(|(height, block_hash)| {
+                    superseded_snapshot_plan_source(
+                        &manifest_peers,
+                        &manifest_terminal_capabilities,
+                        &rejected_terminal_peers,
+                        height,
+                        block_hash,
+                    )
+                    .map(|(peer, newer)| (height, peer, newer))
+                })
+            } else {
+                None
+            };
+            if let Some((stale_boundary, peer, newer_boundary)) = superseded_plan {
+                tracing::info!(
+                    stale_boundary,
+                    newer_boundary,
+                    peer = %peer,
+                    our_height,
+                    "snapshot plan superseded: no peer offers its boundary any more; planning \
+                     again toward the newer boundary"
+                );
+                retire_snapshot_plan!();
+                if try_request_manifest!(peer, our_height, [0; 32]) {
+                    manifest_force_snapshot_peers.insert(peer);
+                }
             }
 
             let snapshot_extinction_confirmed = !snapshot_local_work
