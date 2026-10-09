@@ -278,6 +278,12 @@ fn provisional_parameters_are_the_declared_ones() {
     assert_eq!(CLIENT_LICENSE_MICRO, 1_000_000_000);
     assert_eq!(CLIENT_SUBMISSION_FEE_MICRO, 1_000_000);
     assert_eq!(CLIENT_LICENSE_DESTINATION, LicenseDestination::Burn);
+    // One activation delay per profile (decision of 2026-10-09): six hours
+    // on the public network; one day on the test network, whose
+    // registrations at 971 and 1219 stored `r + 480`.
+    #[cfg(not(feature = "testnet"))]
+    assert_eq!(CLIENT_ACTIVATION_DELAY_BLOCKS, 120);
+    #[cfg(feature = "testnet")]
     assert_eq!(CLIENT_ACTIVATION_DELAY_BLOCKS, 480);
     assert_eq!(CLIENT_LICENSE_DIVIDEND_BLOCKS, 480);
     assert_eq!(CLIENT_REGISTRY_CAPACITY, 16);
@@ -2335,17 +2341,17 @@ fn a_mixed_snapshot_registry_is_checked_against_the_delay_of_its_height() {
     .is_err());
 }
 
-/// The public network has no short activation: 480 blocks for every
+/// The public network has no short activation: 120 blocks for every
 /// registration and the stored activation decides, at every height.
 #[cfg(not(feature = "testnet"))]
 #[test]
-fn the_public_network_keeps_the_480_block_activation() {
+fn the_public_network_activates_a_client_120_blocks_after_its_registration() {
     assert_eq!(CLIENT_SHORT_ACTIVATION_FROM, None);
     let rules = ClientObjectRules::CONSENSUS;
     assert_eq!(rules.short_activation_from, None);
-    assert_eq!(rules.activation_delay, 480);
+    assert_eq!(rules.activation_delay, 120);
     for registered_at in [1, 971, 1219, SHORT_FROM, 1_000_000, u64::MAX / 2] {
-        assert_eq!(rules.activation_delay_at(registered_at), 480);
+        assert_eq!(rules.activation_delay_at(registered_at), 120);
         let entry = snapshot_entry(0, 0x21, registered_at);
         assert_eq!(rules.effective_active_from(&entry), entry.active_from);
         for height in [
@@ -2361,7 +2367,8 @@ fn the_public_network_keeps_the_480_block_activation() {
             );
         }
     }
-    // Registered at and above the testnet's H: still 480 blocks.
+    // Registered at and above the testnet's H: still 120 blocks, and the
+    // client is carriable from that height on, not one block earlier.
     let armed = ClientObjectRules {
         activation_height: Some(ACTIVATION),
         catalogue: &test_rules::UNIFORM_CATALOGUE,
@@ -2375,7 +2382,19 @@ fn the_public_network_keeps_the_480_block_activation() {
         &armed,
     )
     .unwrap();
-    assert_eq!(effect.registrations[0].active_from, SHORT_FROM + 7 + 480);
+    assert_eq!(effect.registrations[0].active_from, SHORT_FROM + 7 + 120);
+    let mut registered = ClientRegistryState::new();
+    registered.apply(&effect);
+    assert_eq!(
+        registered.check_carriable(&object.matrix_digest, SHORT_FROM + 7 + 119, &armed),
+        Err(ClientObjectError::ClientNotYetActive {
+            matrix_digest: object.matrix_digest,
+            active_from: SHORT_FROM + 7 + 120,
+        })
+    );
+    assert!(registered
+        .check_carriable(&object.matrix_digest, SHORT_FROM + 7 + 120, &armed)
+        .is_ok());
     let registry = testnet_3_registry();
     assert_eq!(
         registry.check_carriable(&digest(0x21), 1450, &armed),

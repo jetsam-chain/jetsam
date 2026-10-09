@@ -184,7 +184,15 @@ pub const CLIENT_LICENSE_DESTINATION: LicenseDestination = LicenseDestination::B
 /// Blocks between a registration and the first block that may carry the
 /// registered client: the window every node has to fetch the matrix.
 ///
-/// **PROVISIONAL**: 480 blocks (one day at 180 s).
+/// **Public network: 120 blocks** (six hours at 180 s; decision of
+/// 2026-10-09).
+#[cfg(not(feature = "testnet"))]
+pub const CLIENT_ACTIVATION_DELAY_BLOCKS: u64 = 120;
+
+/// **Test network: 480 blocks** (one day at 180 s), unchanged: test network
+/// 3 registered its clients at 971 and 1219 under it, and its snapshots are
+/// checked against `r + 480` below [`TESTNET_SHORT_ACTIVATION_HEIGHT`].
+#[cfg(feature = "testnet")]
 pub const CLIENT_ACTIVATION_DELAY_BLOCKS: u64 = 480;
 
 /// **Test network only**: the height `H` from which the activation delay is
