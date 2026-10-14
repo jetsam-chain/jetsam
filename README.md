@@ -32,13 +32,6 @@
 > current height is visible at
 > [explorer.jetsamchain.com](https://explorer.jetsamchain.com). Every figure in
 > this document is a protocol constant or a measurement, each labelled as such.
->
-> **Consensus rules v1.4 are in force since block 24,846** (29 September 2026,
-> 18:21:52 UTC). Proof of work is now **TowerWalk**, a CPU proof of work that
-> lives in each core's L2 cache; the GPU miners used before block 24,846 no
-> longer work. The current release is
-> [v1.4.2](https://github.com/jetsam-chain/jetsam/releases/tag/v1.4.2); see
-> [Consensus rules in force](#consensus-rules-in-force).
 
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
@@ -77,15 +70,16 @@ verify the network without replaying the chain's lifetime.
 ## What that looks like
 
 **Two nodes join the same chain at the same moment.** One replays three million
-blocks. The other authenticates the head, verifies one recursive proof of all
-history, checks an 8-block suffix — and is at the tip.
+blocks. The other authenticates the head, verifies one recursive proof of the
+chain's history — anchored by checkpoints built into every node — checks an
+8-block suffix, and is at the tip.
 
 <p align="center">
   <img src="docs/assets/readme/sync.png" alt="A replay-from-genesis node and a Jetsam node joining the same chain" width="88%">
 </p>
 
 **The subsidy reaches exactly zero.** Seven halvings by height, ending at height
-3,467,664 — about 9.9 years in. The schedule sums to the cap to the micro-unit;
+3,467,664 — about 19.7 years in. The schedule sums to the cap to the micro-unit;
 the final era is trimmed by 136 blocks so the total lands *on* 21,000,000, not
 near it.
 
@@ -96,7 +90,7 @@ near it.
 **Blocks you find are blocks you keep.** On the codebase Jetsam descends from, a
 miner producing ~35% of blocks kept roughly 3% of them — difficulty read from a
 block's own timestamp, and an interval below prover latency. Jetsam anchors
-difficulty on the parent and mines 90 s blocks.
+difficulty on the parent and mines 180 s blocks (90 s until block 38,399).
 
 <p align="center">
   <img src="docs/assets/readme/mining.png" alt="The same 35% miner under timestamp-anchored rules and under Jetsam rules" width="78%">
@@ -129,8 +123,10 @@ Jetsam has a hard maximum supply of **21,000,000 JTM** and **zero premine**:
 the genesis block carries no coinbase, so every coin in existence is mined
 under the public schedule. Emission halves by block height — seven times in
 total, the first at height 28,800, the second at 172,800, then every 659,000
-blocks — and stops entirely at height **3,467,664**, roughly 9.9 years after
-launch at the 90-second block target:
+blocks — and stops entirely at height **3,467,664**, roughly 19.7 years after
+launch: 90-second blocks until height 38,399, 180-second blocks since height
+38,400 (v1.5). Halvings are fixed by height, so the reward per block is unchanged;
+with 480 blocks a day instead of 960, daily issuance halved at block 38,400:
 
 ```
 height           0 →      28 800   50      JTM/block
@@ -325,55 +321,40 @@ This common arithmetic is what lets wallet authorization, exact state and
 recursive chain verification compose as one protocol instead of independent
 proof systems glued together afterward.
 
-### Proof-Native PoW: TowerWalk
+### Proof-Native PoW: TowerWalk (since block 24,846) and TowerHash
 
 **Hashpower alone cannot produce blocks. Mining is stateful and proof-gated.**
 A producer must follow the canonical state and complete the nonce-independent
 `HistoryStep` before its internal or external worker can search the fixed
 header.
 
-Since block 24,846, Jetsam's PoW is **TowerWalk**, a CPU proof of work that
-lives in each core's L2 cache; the GPU miners used before block 24,846 no
-longer work. One attempt has two stages:
+Since block 24,846 (v1.4), Jetsam's PoW is **TowerWalk**: a cache-resident walk
+built on the same Poseidon2b permutation, so the efficient place to mine is a
+CPU core and its cache. Blocks 1 to 24,845 used **TowerHash**, described below.
 
-1. **TowerHash** turns the 16-field header schedule, nonce included, into a
-   32-byte seed. It is a sponge over the Poseidon2b permutation in a binary
-   tower field, following the design of Grassi et al.
-   ([IACR ePrint 2025/1893](https://eprint.iacr.org/2025/1893)). Jetsam did not
-   design the permutation and does not claim to; what it instantiates is its
-   own: fresh round constants derived from a documented nothing-up-my-sleeve
-   seed, its own domain-separation tags, and the nonce moved to the first
-   sponge lane so every attempt runs all eight permutations with no midstate
-   shortcut.
-2. **TowerWalk** fills a 512 KiB scratchpad (65,536 cells of 64 bits) from that
-   seed, then walks it with 524,288 data-dependent reads — four lanes, 131,072
-   rounds — each read followed by a write-back to the same cell. A Poseidon2b
-   fold re-mixes the lane state every 4,096 cells of the fill and every 8,192
-   rounds of the walk, 33 folds per attempt. The 32-byte output is compared
-   with the target.
-
-A block at height 24,846 or above is valid only if
-`TowerWalk(TowerHash(fields)) < target`; below that height the digest is the
-TowerHash output alone, so every earlier block keeps its original proof of
-work. Jetsam work is invalid on any other network, and vice versa.
+**TowerHash** is a sponge over the Poseidon2b permutation in a
+binary tower field, following the design of Grassi et al.
+([IACR ePrint 2025/1893](https://eprint.iacr.org/2025/1893)). Jetsam did not
+design the permutation and does not claim to; what it instantiates is its own:
+fresh round constants derived from a documented nothing-up-my-sleeve seed, its
+own domain-separation tags, and the nonce moved to the first sponge lane so
+every attempt runs all eight permutations with no midstate shortcut. Jetsam
+work is invalid on any other network, and vice versa.
 
 PoW has one job: choose the order of valid transitions. Hash power cannot make
 an invalid `HistoryStep` acceptable.
 
-The miner proves the nonce-independent block first, then searches the fixed
-header with a 128-bit nonce. ASERT targets the complete interval between
-accepted blocks — proof preparation, nonce search and propagation — at a
-90-second mean, anchored on the parent's timestamp so a block cannot grind
-weight out of its own. At the fork, the first TowerWalk block carried a fixed
-anchor target of 2^235, from which ASERT converges again. Cumulative work
-selects the chain. An external miner receives an immutable, single-use
-template and returns only a nonce; it cannot alter the transactions or state
-root.
+The miner proves the nonce-independent block first, then searches a fixed
+TowerHash header with a 128-bit nonce. ASERT targets the complete interval
+between accepted blocks — proof preparation, nonce search and propagation —
+at a 180-second mean since block 38,400 (90 seconds before), anchored on the parent's timestamp so a block cannot
+grind weight out of its own. Cumulative work selects the chain. An external
+miner receives an immutable, single-use template and returns only a nonce; it
+cannot alter the transactions or state root.
 
-The walk is specified bit for bit, with a dependency-free reference
-implementation and 256 frozen test vectors
-([`jetsam-towerwalk-golden-v1.txt`](docs/mining/jetsam-towerwalk-golden-v1.txt)),
-in the [mining specification](docs/mining/stratum.md#310-towerwalk-the-digest-from-block-24846).
+A CUDA GPU miner was validated bit-exact against the CPU reference for the
+TowerHash era (12,000/12,000 test vectors, 1.40 MH/s on an RTX 5060). It does
+not mine TowerWalk; since block 24,846 mining is done on CPUs.
 
 ## Network Profile
 
@@ -381,12 +362,11 @@ in the [mining specification](docs/mining/stratum.md#310-towerwalk-the-digest-fr
 |---|---:|
 | Maximum supply | 21,000,000 JTM |
 | Premine | none — the genesis block has no coinbase |
-| Mean block target | 90 seconds |
-| Proof of work | TowerWalk over a TowerHash seed, 512 KiB scratchpad (since block 24,846) |
-| Consensus finality depth | 8 blocks (~12 minutes) |
-| Halvings | 7, ending at height 3,467,664 (~9.9 years) |
-| Default miner class | small class (`B25` in code), `m=22`, up to 24 effective page positions since block 17,750 (25 before) |
-| Large miner class | B255, `m=24`, up to 255 effective page positions |
+| Mean block target | 180 seconds since block 38,400 (90 seconds before) |
+| Consensus finality depth | 8 blocks (~24 minutes) |
+| Halvings | 7, ending at height 3,467,664 (~19.7 years) |
+| Default miner class | B25, `m=23` since v1.5 (`m=22` before), up to 25 effective page positions |
+| Large miner class | B255, `m=25` since v1.5 (`m=24` before), up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | ~2.8 TPS |
 | Maximum inputs in one transaction | 1,020 |
@@ -400,29 +380,6 @@ capacity selector measures complete preparation on each host and uses B255 only
 when that host sustains the larger class within the block cadence. Every node
 verifies both classes.
 
-### Consensus rules in force
-
-Every rule change is a hard fork activated at a fixed height; blocks below it
-keep the rules they were mined under. Mainnet history:
-
-| Version | Activation height | What changed |
-|---|---:|---|
-| v1.0 | 0 (genesis) | Launch rules |
-| v1.1 | 2,000 | Corrected ASERT difficulty curve |
-| v1.2 | 8,450 | 255-page proof class; HistoryStep terminal limit raised to 1,200,000 bytes |
-| v1.3 | 17,750 (22 September 2026, 10:24 UTC) | Transaction anchor spans two epochs; the small proof class holds 24 pages |
-| **v1.4** | **24,846 (29 September 2026, 18:21:52 UTC)** | **Proof of work becomes TowerWalk** |
-
-Block 24,846 has the id
-`9797e7b09596be35de3e71fa1300efb6631f95ba5f76ad4f284fbf440d7aa33a`. A node
-must run v1.4.2 or later to follow the chain past block 24,845. A follow-up
-release will pin the hash of block 24,846 into the node, so that a node
-installed or resynchronized after the fork cannot be led onto a chain the
-network has refused.
-
-The test chain, reset on 26 September 2026, runs v1.2 from block 0, v1.3 from
-block 20 and v1.4 from block 750 (27 September 2026).
-
 ## Development Allocation
 
 Jetsam has no premine. For blocks 1 through 700,800 — two 365-day target-time
@@ -433,9 +390,11 @@ years — 10% of each block subsidy is allocated by consensus:
 - 5% to the Lab Fund.
 
 Transaction fees remain entirely miner-claimable after the existing
-state-growth burn. Beginning with block 700,801, the development allocation
-ends and 100% of every new block reward goes to miners. Summed over the
-schedule, the allocation is **1,163,996 JTM — 5.54% of the maximum supply**.
+state-growth burn. The allocation lasts two years of target time: it is paid
+every 960 blocks up to and including block 38,400, then every 480 blocks.
+Beginning with block 369,601, it ends and 100% of every new block reward goes
+to miners. Summed over the schedule, the allocation is **747,000 JTM — 3.56% of
+the maximum supply**.
 
 The Network Fund finances operation, maintenance, security and adoption of the
 network. The Lab Fund supports the developers, researchers and contributors
@@ -467,27 +426,12 @@ the wallet and the checksums, verify them, and make them runnable:
 curl -sL -O https://github.com/jetsam-chain/jetsam/releases/latest/download/jetsam-node-linux-x86_64 \
         -O https://github.com/jetsam-chain/jetsam/releases/latest/download/jetsam-cli-linux-x86_64 \
         -O https://github.com/jetsam-chain/jetsam/releases/latest/download/SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS
+sha256sum -c SHA256SUMS
 chmod +x jetsam-node-linux-x86_64 jetsam-cli-linux-x86_64
 ```
 
 `sha256sum -c` must print `OK` for both binaries. Rename them to `jetsam` and
 `jetsam-cli` if you prefer the short commands used below.
-
-The [v1.4.2 release](https://github.com/jetsam-chain/jetsam/releases/tag/v1.4.2)
-(28 September 2026) publishes, for Linux x86-64 and Windows x86-64:
-
-| Asset | What it is |
-|---|---|
-| `jetsam-node-linux-x86_64`, `jetsam-node-windows-x86_64.exe` | The node, with its built-in CPU miner |
-| `jetsam-cli-linux-x86_64`, `jetsam-cli-windows-x86_64.exe` | The command-line wallet and node client |
-| `jetsam-miner-linux-x86_64`, `jetsam-miner-windows-x86_64.exe` | The external CPU miner (`jetsam-miner`) |
-| `Jetsam-Desktop-1.4.2-linux-x64.tar.gz`, `Jetsam-Desktop-1.4.2-windows-x64.zip` | Jetsam Desktop: wallet, node and miner in one window; it mines on the CPU, and the GPU option is removed |
-| `SHA256SUMS` | Checksums of every asset above |
-
-`SHA256SUMS` lists every asset, so a plain `sha256sum -c` also reports the ones
-you did not download as `FAILED open or read`; add `--ignore-missing` to check
-only the files you fetched.
 
 ### Run
 
@@ -508,12 +452,6 @@ jetsam --bench
 jetsam --bench 60 --cpu-threads 8
 ```
 
-`--bench` prints two rates: the `sponge digest` (TowerHash alone, kept to read
-blocks from before the fork) and the `walked digest`, which is what the chain
-requires since block 24,846. Size `--cpu-threads` on the walked figure. Each
-walking thread needs 512 KiB of L2 cache to itself, so one thread per physical
-core is usually the best setting.
-
 An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
@@ -527,13 +465,6 @@ External nonce search keeps transaction selection and proving inside the node:
 jetsam --extminer --mining-key <token>
 jetsam-miner --key <token>
 ```
-
-The node tells miners which digest to search: `getMiningInfo` and every block
-template carry `pow_walk: true` once TowerWalk governs the next block. Read the
-flag; never derive it from the height. `jetsam-miner` does this, and declares
-itself to a pool with the HTTP header `X-Jetsam-PoW: walk`; a pool serving
-TowerWalk work can tell it apart from a pre-fork miner that will never find a
-block.
 
 Default ports are `9700` for P2P and `127.0.0.1:9701` for JSON-RPC. First start
 creates `~/.jetsam/jetsam.toml`, the MDBX state and the built-in wallet
@@ -595,18 +526,12 @@ cd jetsam
 
 mkdir -p ../jetsam-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../jetsam-artifacts/history-step-pack-v1 \
-  --profile mainnet
-./scripts/generate_history_step_pack.sh \
-  ../jetsam-artifacts/history-step-pack-v1-3 \
-  --profile mainnet --generation v1.3
+  ../jetsam-artifacts/history-step-pack-v1
 ```
 
-`--profile` is required. The second pack is the relation in force since block
-17,750; a release binary that carries the v1.3 activation height refuses to
-start without it. Generation is expensive but only needs to be performed once.
+Generation is expensive but only needs to be performed once.
 
-Build for the current machine. The script authenticates the packs, embeds them
+Build for the current machine. The script authenticates the pack, embeds it
 into the node and produces two independent deliverables:
 
 - a Core archive containing `jetsam`, `jetsam-cli` and `jetsam-miner`;
@@ -615,34 +540,22 @@ into the node and produces two independent deliverables:
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../jetsam-artifacts/history-step-pack-v1 \
-  --pack-v1-3 ../jetsam-artifacts/history-step-pack-v1-3
+  --pack ../jetsam-artifacts/history-step-pack-v1
 
 cat target/release-builds/LAST_RELEASE
 ```
 
-On Linux this has to run inside `docker/release-linux.Dockerfile` (Ubuntu
-22.04). Building on a newer host makes libmdbx import
-`__isoc23_strtol@GLIBC_2.38`, and the binary then refuses to start on Ubuntu
-22.04, Debian 12 or Rocky 9; no compiler flag prevents it. The script refuses
-to run on such a host, and checks every produced binary with `objdump` before
-packaging. See
-[docs/developers/build.md](docs/developers/build.md#build-native-deliverables).
-
-When a GitHub release also carries an authenticated pack archive such as
-`history-step-pack-v1.tar.gz`, extracting it and passing the contained
-directory to the same build command skips generation:
+For a faster build, the corresponding GitHub release also carries the
+authenticated `history-step-pack-v1.tar.gz`. Extract it and pass the contained
+directory to the same build command:
 
 ```sh
 mkdir -p ../release-pack
 tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 
 ./scripts/build_release.sh \
-  --pack ../release-pack/history-step-pack-v1 \
-  --pack-v1-3 ../jetsam-artifacts/history-step-pack-v1-3
+  --pack ../release-pack/history-step-pack-v1
 ```
-
-The v1.4.2 release publishes no pack archive; generate both packs as above.
 
 To reproduce the production soundness calculation, see
 [`jetsam_soundness`](jetsam_soundness/README.md) and run:
