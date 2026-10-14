@@ -771,6 +771,63 @@ mod tests {
         assert_eq!(check_hard_checkpoint(&h1, &[]), Ok(()));
     }
 
+    /// Through the production validator and the real pin list (2026-10-13
+    /// stall, v1.5.1): a header at 38 399 or 38 400 that is not the pinned
+    /// block is refused by `CheckpointMismatch`, before parent, target or
+    /// proof-of-work are even read — the branch of the 1.4.3 nodes that did
+    /// not upgrade forks at 38 400', so this is what refuses it on every path,
+    /// the timeless one used by snapshot header staging included. The real
+    /// headers pass the pin step (and fail only later, on the dummy parent).
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn a_header_at_38399_or_38400_other_than_the_pinned_block_is_refused() {
+        use crate::consensus::params::hard_checkpoint_tests::{
+            SEED_HEADER_38399, SEED_HEADER_38400,
+        };
+        use crate::consensus::params::HARD_CHECKPOINTS;
+        fn header(hex: &str) -> BlockHeader {
+            let bytes = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            BlockHeader::from_bytes(&bytes).unwrap()
+        }
+        for real in [header(SEED_HEADER_38399), header(SEED_HEADER_38400)] {
+            assert_eq!(check_hard_checkpoint(&real, HARD_CHECKPOINTS), Ok(()));
+            let parent = make_header(real.height - 1, real.timestamp - BLOCK_TIME, None);
+            assert_ne!(
+                validate_header_timeless(
+                    &real,
+                    &parent,
+                    &[parent.timestamp],
+                    &[],
+                    0,
+                    parent.timestamp,
+                    &parent.difficulty_target,
+                ),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+            // The other branch's block at the same height: any other id.
+            let mut other = real;
+            other.nonce ^= 1;
+            assert_eq!(
+                check_hard_checkpoint(&other, HARD_CHECKPOINTS),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+            assert_eq!(
+                validate_header_timeless(
+                    &other,
+                    &parent,
+                    &[parent.timestamp],
+                    &[],
+                    0,
+                    parent.timestamp,
+                    &parent.difficulty_target,
+                ),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+        }
+    }
+
     /// Through the production validator and the real pin list: the reset test
     /// chain carries no pin yet, so no block is refused for a checkpoint. Once
     /// the new chain has crossed its own blocks, pin one and restore the refusal

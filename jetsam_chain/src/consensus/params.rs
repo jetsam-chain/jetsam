@@ -763,17 +763,49 @@ const _: () = assert!(
 /// genesis moves without the pins being cleared. The test chain gets reset; a
 /// pin left over from the previous one would stop the new chain dead at the
 /// pinned height, exactly like an unmineable anchor.
+///
+/// # Why the v1.5 block and the one before it
+///
+/// The public network crossed v1.5 on 2026-10-13 (block 38 400, 20:48:25 UTC).
+/// The 1.4.3 nodes that did not upgrade go on mining their own 38 400' and
+/// beyond at the old 90-second target. Their branch is durably HIGHER than
+/// this one (180 s) and may carry more work; height or work alone therefore
+/// never rule it out. Pinning 38 399 (the last block both rule sets share,
+/// review 2 R2) and 38 400 (J) refuses that branch by its id at 38 400, on
+/// every acceptance path, whatever its height or its work.
+///
 /// The public network's v1.4 activation block, crossed on 2026-09-29 at 18:21 UTC.
 /// Read back from the four seeds and equal to the `prev_block_hash` of block 24847.
+/// Blocks 38 399 and 38 400 read back from the four seeds (`jetsam_getBlockHash`
+/// and `jetsam_getHeaderByHeight`, 2026-10-14 03:16 UTC, identical on all four);
+/// each is the `prev_block_hash` of the next one.
 #[cfg(not(feature = "testnet"))]
-pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[(
-    24846,
-    [
-        0x97, 0x97, 0xe7, 0xb0, 0x95, 0x96, 0xbe, 0x35, 0xde, 0x3e, 0x71, 0xfa, 0x13, 0x00,
-        0xef, 0xb6, 0x63, 0x1f, 0x95, 0xba, 0x5f, 0x76, 0xad, 0x4f, 0x28, 0x4f, 0xbf, 0x44,
-        0x0d, 0x7a, 0xa3, 0x3a,
-    ],
-)];
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
+    (
+        24846,
+        [
+            0x97, 0x97, 0xe7, 0xb0, 0x95, 0x96, 0xbe, 0x35, 0xde, 0x3e, 0x71, 0xfa, 0x13, 0x00,
+            0xef, 0xb6, 0x63, 0x1f, 0x95, 0xba, 0x5f, 0x76, 0xad, 0x4f, 0x28, 0x4f, 0xbf, 0x44,
+            0x0d, 0x7a, 0xa3, 0x3a,
+        ],
+    ),
+    (
+        38399,
+        [
+            0x91, 0xea, 0x8a, 0xb3, 0x24, 0xb7, 0xbc, 0xae, 0x81, 0x55, 0x4a, 0x5f, 0x04, 0x68,
+            0xa2, 0x62, 0xde, 0x54, 0x25, 0xd8, 0xcc, 0xda, 0x54, 0x9c, 0x9e, 0xe9, 0x04, 0x5d,
+            0x1f, 0x88, 0xdf, 0x9c,
+        ],
+    ),
+    (
+        38400,
+        [
+            0xec, 0x7c, 0x3d, 0xaa, 0x6b, 0xbf, 0x5f, 0xd0, 0x5f, 0x29, 0xff, 0x56, 0x78, 0x2d,
+            0x2c, 0x56, 0xd2, 0xb7, 0xf1, 0xbe, 0x88, 0x7a, 0xe3, 0x42, 0xc1, 0x68, 0x01, 0x8f,
+            0x9e, 0xf4, 0x05, 0xc5,
+        ],
+    ),
+];
 
 /// The test chain was reset on 2026-10-07 (walked from block 6): no pin until
 /// the new chain has crossed its own blocks.
@@ -811,7 +843,7 @@ pub(crate) fn hard_checkpoint_in(pins: &[(u64, [u8; 32])], height: u64) -> Optio
 }
 
 #[cfg(test)]
-mod hard_checkpoint_tests {
+pub(crate) mod hard_checkpoint_tests {
     use super::*;
     use crate::block_header::block_id;
     use crate::consensus::genesis::genesis_header;
@@ -854,6 +886,81 @@ mod hard_checkpoint_tests {
     fn the_public_network_pins_its_activation_block() {
         assert_eq!(Some(HARD_CHECKPOINTS[0].0), V1_4_ACTIVATION_HEIGHT);
     }
+
+    /// Parse 64 hex digits; the test inputs below are copied from the seeds.
+    #[cfg(not(feature = "testnet"))]
+    fn id(hex: &str) -> [u8; 32] {
+        let bytes = hex.as_bytes();
+        assert_eq!(bytes.len(), 64, "a block id is 64 hex digits");
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("not a lowercase hex digit: {}", c as char),
+        };
+        std::array::from_fn(|i| (nibble(bytes[2 * i]) << 4) | nibble(bytes[2 * i + 1]))
+    }
+
+    /// The public network crossed its v1.5 height on 2026-10-13 (block 38 400,
+    /// 20:48:25 UTC). The 1.4.3 nodes that did not upgrade go on mining their
+    /// own 38 400' and beyond at the old 90-second target, refused here by
+    /// `BadDifficultyTarget`; their branch is durably higher than ours. Both
+    /// the block before J (review 2, R2) and J itself are pinned, so that
+    /// branch is refused by its id at 38 400, by every acceptance path,
+    /// whatever its height or its work.
+    ///
+    /// Read back from the four seeds (`jetsam_getBlockHash`, 2026-10-13 22:32
+    /// UTC, and again 2026-10-14 03:16 UTC at their tip 38 516): 38 399 and
+    /// 38 400 equal on all four, and the `prev_block_hash` of 38 400 and
+    /// 38 401 equal to the ids of 38 399 and 38 400.
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn the_public_network_pins_the_block_before_its_v1_5_height_and_its_v1_5_block() {
+        let j = V1_5_ACTIVATION_HEIGHT.expect("v1.5 is armed on the public network");
+        assert_eq!(j, 38_400, "the pins below follow J: read them again if J moved");
+        assert_eq!(
+            hard_checkpoint(j - 1),
+            Some(id("91ea8ab324b7bcae81554a5f0468a262de5425d8ccda549c9ee9045d1f88df9c"))
+        );
+        assert_eq!(
+            hard_checkpoint(j),
+            Some(id("ec7c3daa6bbf5fd05f29ff56782d2c56d2b7f1be887ae342c168018f9ef405c5"))
+        );
+        assert!(
+            HARD_CHECKPOINTS.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "pins in height order"
+        );
+    }
+
+    /// The pins are the ids of the headers the four seeds serve, not two
+    /// strings copied by hand: the raw headers 38 399, 38 400 and 38 401
+    /// (`jetsam_getHeaderByHeight`, identical bytes on the four seeds) hash to
+    /// the pinned ids and link to each other.
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn the_v1_5_pins_are_the_ids_of_the_headers_the_seeds_serve() {
+        use crate::block_header::{block_id, BlockHeader};
+        fn header(hex: &str) -> BlockHeader {
+            let bytes = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            BlockHeader::from_bytes(&bytes).expect("a 212-byte wire header")
+        }
+        let h38399 = header(SEED_HEADER_38399);
+        let h38400 = header(SEED_HEADER_38400);
+        let h38401 = header(SEED_HEADER_38401);
+        assert_eq!((h38399.height, h38400.height, h38401.height), (38_399, 38_400, 38_401));
+        assert_eq!(hard_checkpoint(38_399), Some(block_id(&h38399)));
+        assert_eq!(hard_checkpoint(38_400), Some(block_id(&h38400)));
+        assert_eq!(h38400.prev_block_hash, block_id(&h38399));
+        assert_eq!(h38401.prev_block_hash, block_id(&h38400));
+    }
+
+    #[cfg(not(feature = "testnet"))]
+    pub(crate) const SEED_HEADER_38399: &str = "63a6e5e9a4ca276b8a6f5ebd2e3002eeb09275fa5a55e43d173625b8d721e2591619022398c6219db713cbb33685047552cf6e8e1fdbf5e9431a6f0a0fd67a9026e4db813bafdec46e6f102c98e02faa61164323f6ae06edf4c82be8a82577c61297ce6a00000000ff95000000000000823e9c2302894c5be2180cc9eaa1efc2f66bcb116c1a828e7fd470b236becfeb3d02c084bbcd0000839e4c40cec3f4cb9f5d108083a02ac55d1b4a9952e17946b96335e1ebdbd723813a774b1c000000180000008b71000000000000d7d6000000000000";
+    #[cfg(not(feature = "testnet"))]
+    pub(crate) const SEED_HEADER_38400: &str = "91ea8ab324b7bcae81554a5f0468a262de5425d8ccda549c9ee9045d1f88df9ce69d836abc7457f717c25a8dfbf858dbd2d60d908dbe470db960bc1a66892ddaef31defddf738cb17dcc657039ef36afc172d4e0ffb85dc97cab2963aaf901211999ce6a000000000096000000000000b5d62e858b47b510663140ad4fe2b842403322d8b8ddf3369cca5c5542e5bb47a90080840e2a0000280f00000000e3ddec5d8ae87c17790aa6d084d960084aa31ce4383faec0ec8d5202d2170e000000180000008e71000000000000dad6000000000000";
+    #[cfg(not(feature = "testnet"))]
+    pub(crate) const SEED_HEADER_38401: &str = "ec7c3daa6bbf5fd05f29ff56782d2c56d2b7f1be887ae342c168018f9ef405c5f7bb6fa8d732563dc28a3cbc85dd00f4eb6828cee8a831bf43c69bac50b9140c95814db645a2ae67ccd0b07a3beadc165d27084a185c9107d7095f5958b004662a9bce6a000000000196000000000000b5d62e858b47b510663140ad4fe2b842403322d8b8ddf3369cca5c5542e5bb47e5510c0000000000490e00000000d4f2ec5d8ae87c17790aa6d084d960084aa31ce4383faec0ec8d5202d2170e000000180000008f71000000000000dbd6000000000000";
 }
 
 // ---------------------------------------------------------------------------
