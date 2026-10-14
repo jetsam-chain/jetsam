@@ -4401,6 +4401,7 @@ fn snapshot_header_cache_can_be_recreated(error: &SnapshotHeaderStagingError) ->
         error,
         SnapshotHeaderStagingError::Format(_)
             | SnapshotHeaderStagingError::InvalidCandidate { .. }
+            | SnapshotHeaderStagingError::ForkRule { .. }
             | SnapshotHeaderStagingError::ParentMismatch { .. }
             | SnapshotHeaderStagingError::CanonicalBaseMoved { .. }
     ) || matches!(
@@ -4652,6 +4653,7 @@ fn snapshot_header_completion_rejects_candidate(error: &SnapshotHeaderStagingErr
     matches!(
         error,
         SnapshotHeaderStagingError::InvalidCandidate { .. }
+            | SnapshotHeaderStagingError::ForkRule { .. }
             | SnapshotHeaderStagingError::ParentMismatch { .. }
     )
 }
@@ -10580,6 +10582,7 @@ async fn handle_p2p_events(
                         }
                         Err(
                             error @ (SnapshotHeaderStagingError::InvalidCandidate { .. }
+                            | SnapshotHeaderStagingError::ForkRule { .. }
                             | SnapshotHeaderStagingError::ParentMismatch { .. }),
                         ) => SnapshotHeaderStagingResult::CandidateRejected {
                             sync,
@@ -17233,10 +17236,9 @@ impl tracing_subscriber::fmt::time::FormatTime for UtcHms {
 /// competing parent, a peer mid-sync — and stays at `debug`. Raising all of them
 /// would bury this one, which is the outcome this exists to prevent.
 fn header_rejection_looks_like_a_fork(error: &jetsam_chain::consensus::ConsensusError) -> bool {
-    use jetsam_chain::consensus::ConsensusError::{
-        BadDifficultyTarget, CheckpointMismatch, InvalidPoW,
-    };
-    matches!(error, BadDifficultyTarget | InvalidPoW | CheckpointMismatch)
+    // One predicate with snapshot header staging (v1.5.1), which types the
+    // same refusals as `SnapshotHeaderStagingError::ForkRule`.
+    jetsam_node::snapshot_header_staging::consensus_rule_only_a_fork_explains(error)
 }
 
 #[cfg(test)]

@@ -51,6 +51,14 @@ pub enum SnapshotHeaderStagingError {
     Format(&'static str),
     #[error("snapshot header candidate rejected at h={height}: {reason}")]
     InvalidCandidate { height: u64, reason: String },
+    /// Refused by a rule only a fork explains: the header's target, its
+    /// proof-of-work, or a pinned block id (v1.5.1). The peer that served it
+    /// is on a branch this node's consensus refuses.
+    #[error("snapshot header candidate rejected at h={height}: {error}")]
+    ForkRule {
+        height: u64,
+        error: jetsam_chain::consensus::ConsensusError,
+    },
     #[error("snapshot header candidate rejected at h={height}: BadParentHash")]
     ParentMismatch { height: u64 },
     #[error("snapshot header canonical base moved at h={height}: {reason}")]
@@ -1004,11 +1012,37 @@ fn validate_next_header(
                 height: header.height,
             }
         }
+        error if consensus_rule_only_a_fork_explains(&error) => {
+            SnapshotHeaderStagingError::ForkRule {
+                height: header.height,
+                error,
+            }
+        }
         error => SnapshotHeaderStagingError::InvalidCandidate {
             height: header.height,
             reason: error.to_string(),
         },
     })
+}
+
+/// Whether a header refused for `error` puts the peer that served it on the
+/// other side of a fork: its target ([`ConsensusError::BadDifficultyTarget`],
+/// what a node on the other rule set produces at an activation height), its
+/// proof-of-work ([`ConsensusError::InvalidPoW`], a block proved under the
+/// other digest), or a pinned block id ([`ConsensusError::CheckpointMismatch`]).
+/// Every other refusal is ordinary traffic (a stale or competing header, a
+/// peer mid-sync).
+///
+/// [`ConsensusError::BadDifficultyTarget`]: jetsam_chain::consensus::ConsensusError::BadDifficultyTarget
+/// [`ConsensusError::InvalidPoW`]: jetsam_chain::consensus::ConsensusError::InvalidPoW
+/// [`ConsensusError::CheckpointMismatch`]: jetsam_chain::consensus::ConsensusError::CheckpointMismatch
+pub fn consensus_rule_only_a_fork_explains(
+    error: &jetsam_chain::consensus::ConsensusError,
+) -> bool {
+    use jetsam_chain::consensus::ConsensusError::{
+        BadDifficultyTarget, CheckpointMismatch, InvalidPoW,
+    };
+    matches!(error, BadDifficultyTarget | InvalidPoW | CheckpointMismatch)
 }
 
 /// Validate one bounded in-memory extension before its block bodies can steer
@@ -1572,6 +1606,57 @@ mod tests {
             .is_err());
         assert_eq!(staging.staged_len(), 0);
         assert!(store.get_header(1).unwrap().is_none());
+    }
+
+    /// v1.5.1: a header refused by a rule only a fork explains (its target,
+    /// its proof-of-work, a pinned id) is typed as such, so the node can name
+    /// the peer that served it as divergent. On 2026-10-13 the 1.4.3 peers'
+    /// 38 400' came back as an anonymous `InvalidCandidate` string and the
+    /// peer was simply asked again. Any other refusal keeps its old type.
+    #[test]
+    fn a_header_refused_by_a_fork_rule_is_typed_as_such() {
+        let db = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let chain = jetsam_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging =
+            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), store, base)
+                .unwrap();
+
+        // The other branch's block: the old rules' target at this height.
+        let mut other_rules = fixture_chain()[1];
+        other_rules.difficulty_target[0] ^= 0x01;
+        let refused = staging.append_batch(store, &[other_rules]).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SnapshotHeaderStagingError::ForkRule {
+                    height: 1,
+                    error: jetsam_chain::consensus::ConsensusError::BadDifficultyTarget,
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(staging.staged_len(), 0);
+        let refused =
+            validate_bounded_header_extension(store, 0, &[other_rules], other_rules.timestamp)
+                .unwrap_err();
+        assert!(
+            matches!(refused, SnapshotHeaderStagingError::ForkRule { height: 1, .. }),
+            "{refused:?}"
+        );
+        // The message reads as before.
+        assert!(refused.to_string().starts_with("snapshot header candidate rejected at h=1"));
+
+        // An ordinary refusal (a timestamp below the median) is not a fork.
+        let mut too_early = fixture_chain()[1];
+        too_early.timestamp = fixture_chain()[0].timestamp.saturating_sub(1);
+        let refused = staging.append_batch(store, &[too_early]).unwrap_err();
+        assert!(
+            matches!(refused, SnapshotHeaderStagingError::InvalidCandidate { height: 1, .. }),
+            "{refused:?}"
+        );
     }
 
     #[test]
