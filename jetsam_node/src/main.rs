@@ -9968,7 +9968,14 @@ async fn handle_p2p_events(
     // cannot be a snapshot source. v1.5.1: the verdict outlives the
     // connection (`peer_chain_evidence`); on 2026-10-13 a disconnect wiped
     // it and the next manifest of the 1.4.3 branch became the candidate.
-    let mut peer_chain_evidence = peer_chain_evidence::PeerChainEvidence::default();
+    let mut peer_chain_evidence =
+        peer_chain_evidence::PeerChainEvidence::<HeldSnapshotManifest>::default();
+    // A manifest set aside for a pin proof comes back here with the proof and
+    // goes through the manifest path again: the P2P layer delivers a
+    // provider's manifest once per snapshot generation, so asking the peer
+    // again would bring nothing back.
+    let mut resumed_manifest_events: std::collections::VecDeque<NetworkEvent> =
+        std::collections::VecDeque::new();
     // Last time an unauthenticated snapshot plan (one that has verified
     // nothing yet) staged headers or received its terminal.
     let mut snapshot_plan_real_progress: Option<Instant> = None;
@@ -11480,7 +11487,13 @@ async fn handle_p2p_events(
                 );
             }
         }
-        rx_result = rx.recv() => { let rx_item = rx_result;
+        rx_result = async {
+            // v1.5.1: a manifest proven by its sender's pin goes first.
+            match resumed_manifest_events.pop_front() {
+                Some(event) => Ok(event),
+                None => rx.recv().await,
+            }
+        } => { let rx_item = rx_result;
         match rx_item {
             Ok(NetworkEvent::HeaderAnnouncement {
                 from,
@@ -12693,21 +12706,24 @@ async fn handle_p2p_events(
                         retire_snapshot_plan_refused_through!(from, height);
                     }
                     peer_chain_evidence::PinEvidence::Matches { height } => {
-                        if let Some(force) =
+                        if let Some((force, (generation, requester_height, manifest))) =
                             peer_chain_evidence.take_satisfied_wait(&from, probe_now)
                         {
-                            let our_height = {
-                                let ctx = chain.read().await;
-                                ctx.tip_height()
-                            };
                             tracing::info!(
                                 peer = %from,
                                 pin_height = height,
-                                "peer showed the pinned block: asking again for its snapshot manifest"
+                                snapshot_height = manifest.tip_height,
+                                "peer showed the pinned block: its snapshot manifest is judged again"
                             );
-                            if try_request_manifest!(from, our_height, [0; 32]) && force {
+                            if force {
                                 manifest_force_snapshot_peers.insert(from);
                             }
+                            resumed_manifest_events.push_back(NetworkEvent::StateManifest {
+                                generation,
+                                from,
+                                requester_height,
+                                manifest,
+                            });
                         }
                     }
                     peer_chain_evidence::PinEvidence::Silent => {}
@@ -13377,6 +13393,11 @@ async fn handle_p2p_events(
                 suffix_inventory_probe_peers.remove(&from);
                 fetch_in_progress.remove(&from);
                 recent_header_fetches.remove(&(from, start_height, count));
+                // v1.5.1: a failed pin probe is sent again at the next tick;
+                // no later answer on this lane may be read as its answer.
+                if count == 1 && peer_chain_evidence.probe_in_flight(&from) == Some(start_height) {
+                    peer_chain_evidence.probe_ended(&from);
+                }
                 tracing::debug!(
                     peer = %from,
                     start_height,
@@ -13595,7 +13616,12 @@ async fn handle_p2p_events(
                     ) {
                         ManifestCandidacy::Admit => {}
                         ManifestCandidacy::AwaitPinProof { pin_height } => {
-                            peer_chain_evidence.want_pin_probe(from, pin_height, force_snapshot);
+                            peer_chain_evidence.want_pin_probe(
+                                from,
+                                pin_height,
+                                force_snapshot,
+                                (generation, requester_height, manifest.clone()),
+                            );
                             for (peer, height) in peer_chain_evidence.pin_probes_due(
                                 &std::collections::HashSet::from([from]),
                                 &fetch_in_progress,
@@ -17634,6 +17660,11 @@ fn header_rejection_looks_like_a_fork(error: &jetsam_chain::consensus::Consensus
     jetsam_node::snapshot_header_staging::consensus_rule_only_a_fork_explains(error)
 }
 
+/// v1.5.1 — a snapshot manifest set aside until its sender shows a pinned
+/// block: its snapshot generation, the requester height it was asked at, and
+/// the manifest.
+type HeldSnapshotManifest = (u64, u64, jetsam_p2p::protocol::VerifiedStateManifest);
+
 /// v1.5.1 — what a snapshot manifest above the local tip is, once judged
 /// (`judge_snapshot_manifest`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17671,7 +17702,7 @@ enum ManifestCandidacy {
 fn judge_snapshot_manifest(
     manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
     pins: &[(u64, [u8; 32])],
-    evidence: &peer_chain_evidence::PeerChainEvidence,
+    evidence: &peer_chain_evidence::PeerChainEvidence<HeldSnapshotManifest>,
     sender: &libp2p::PeerId,
     now: Instant,
     local_tip: jetsam_node::networking::ChainPoint,

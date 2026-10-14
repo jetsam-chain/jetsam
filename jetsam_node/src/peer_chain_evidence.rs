@@ -57,22 +57,45 @@ pub(crate) enum PinEvidence {
     Silent,
 }
 
+/// A manifest set aside until its sender shows a pinned block.
+#[derive(Debug)]
+struct PinWait<H> {
+    /// The pinned height the proof must reach.
+    height: u64,
+    /// Whether the manifest was asked for as a forced snapshot.
+    force: bool,
+    /// The manifest itself (the node's own type): the P2P layer delivers a
+    /// provider's manifest once per snapshot generation, so it is held here
+    /// and handed back with the proof rather than asked for again.
+    held: H,
+}
+
 /// What this node has proven about each peer's chain.
-#[derive(Debug, Default)]
-pub(crate) struct PeerChainEvidence {
+#[derive(Debug)]
+pub(crate) struct PeerChainEvidence<H = ()> {
     /// Lowest height at which a header the peer served was refused by a rule
     /// only a fork explains.
     divergent: HashMap<PeerId, Verdict>,
     /// Highest pinned height at which the peer served the pinned block.
     pinned: HashMap<PeerId, Verdict>,
-    /// Pinned height a manifest from this peer waits on, and whether that
-    /// manifest was asked for as a forced snapshot.
-    probe_wanted: HashMap<PeerId, (u64, bool)>,
+    /// The manifest from this peer waiting on a pin proof.
+    probe_wanted: HashMap<PeerId, PinWait<H>>,
     /// Pin probes sent and not answered yet.
     probe_inflight: HashMap<PeerId, (u64, Instant)>,
 }
 
-impl PeerChainEvidence {
+impl<H> Default for PeerChainEvidence<H> {
+    fn default() -> Self {
+        Self {
+            divergent: HashMap::new(),
+            pinned: HashMap::new(),
+            probe_wanted: HashMap::new(),
+            probe_inflight: HashMap::new(),
+        }
+    }
+}
+
+impl<H> PeerChainEvidence<H> {
     /// The peer served a header refused at `height` by a rule only a fork
     /// explains (its target, its proof-of-work, a pinned id), or its headers
     /// have no common ancestor in the accepted non-final window.
@@ -185,13 +208,26 @@ impl PeerChainEvidence {
             .map(|proof| proof.height)
     }
 
-    /// A manifest from `peer` waits until it has shown the pinned block at
-    /// `pin_height`. `force` records that it was asked for as a forced
-    /// snapshot, so the request made again after the proof is the same one.
-    pub(crate) fn want_pin_probe(&mut self, peer: PeerId, pin_height: u64, force: bool) {
-        let wanted = self.probe_wanted.entry(peer).or_insert((pin_height, force));
-        wanted.0 = wanted.0.max(pin_height);
-        wanted.1 |= force;
+    /// The manifest `held` from `peer` waits until the peer has shown the
+    /// pinned block at `pin_height`. `force` records that it was asked for as
+    /// a forced snapshot. A newer manifest from the same peer replaces the
+    /// one held.
+    pub(crate) fn want_pin_probe(&mut self, peer: PeerId, pin_height: u64, force: bool, held: H) {
+        match self.probe_wanted.entry(peer) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let wait = entry.get_mut();
+                wait.height = wait.height.max(pin_height);
+                wait.force |= force;
+                wait.held = held;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PinWait {
+                    height: pin_height,
+                    force,
+                    held,
+                });
+            }
+        }
     }
 
     /// The pin probes to send now: wanted, to a connected peer whose header
@@ -213,7 +249,7 @@ impl PeerChainEvidence {
                     .get(*peer)
                     .is_none_or(|(_, sent)| now.saturating_duration_since(*sent) >= PIN_PROBE_TIMEOUT)
             })
-            .map(|(peer, (height, _))| (*peer, *height))
+            .map(|(peer, wait)| (*peer, wait.height))
             .collect::<Vec<_>>();
         due.sort_by_key(|(peer, _)| peer.to_bytes());
         for (peer, height) in &due {
@@ -232,16 +268,17 @@ impl PeerChainEvidence {
         self.probe_inflight.remove(peer);
     }
 
-    /// The manifest that waited on a pin proof `peer` has now given: whether
-    /// it was a forced snapshot request. `None` when nothing waited, or when
-    /// the proof does not reach the height it waited on.
-    pub(crate) fn take_satisfied_wait(&mut self, peer: &PeerId, now: Instant) -> Option<bool> {
-        let (height, force) = *self.probe_wanted.get(peer)?;
+    /// The manifest that waited on a pin proof `peer` has now given, and
+    /// whether it was a forced snapshot request. `None` when nothing waited,
+    /// or when the proof does not reach the height it waited on.
+    pub(crate) fn take_satisfied_wait(&mut self, peer: &PeerId, now: Instant) -> Option<(bool, H)> {
+        let height = self.probe_wanted.get(peer)?.height;
         if self.pin_verified_through(peer, now)? < height {
             return None;
         }
-        self.probe_wanted.remove(peer);
-        Some(force)
+        self.probe_wanted
+            .remove(peer)
+            .map(|wait| (wait.force, wait.held))
     }
 
     /// The peer answered the probe without the pinned height: the manifest
@@ -312,7 +349,7 @@ mod tests {
     /// candidate.
     #[test]
     fn a_refused_peer_stays_divergent_across_reconnections() {
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         let peer = PeerId::random();
         let now = Instant::now();
         evidence.mark_divergent(peer, 38_400, now);
@@ -331,7 +368,7 @@ mod tests {
     /// do (the peer moved to this chain).
     #[test]
     fn only_validated_headers_through_the_divergence_clear_it() {
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         let peer = PeerId::random();
         let now = Instant::now();
         evidence.mark_divergent(peer, 38_400, now);
@@ -350,7 +387,7 @@ mod tests {
         let below = header_at(38_399, 3);
         let pins = pins_for(&[&below, &canonical]);
         let now = Instant::now();
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
 
         let honest = PeerId::random();
         assert_eq!(
@@ -382,7 +419,7 @@ mod tests {
         let pinned = header_at(38_400, 1);
         let pins = pins_for(&[&pinned]);
         let now = Instant::now();
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         let peer = PeerId::random();
         evidence.observe_headers(peer, [&pinned], &pins, now);
         assert_eq!(evidence.pin_verified_through(&peer, now), Some(38_400));
@@ -393,10 +430,10 @@ mod tests {
     #[test]
     fn a_wanted_pin_probe_is_sent_once_per_timeout_to_a_free_connected_peer() {
         let now = Instant::now();
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         let peer = PeerId::random();
         let connected = HashSet::from([peer]);
-        evidence.want_pin_probe(peer, 38_400, true);
+        evidence.want_pin_probe(peer, 38_400, true, ());
         assert!(evidence
             .pin_probes_due(&connected, &HashSet::from([peer]), now)
             .is_empty());
@@ -430,15 +467,51 @@ mod tests {
         let high = header_at(38_400, 2);
         let pins = pins_for(&[&low, &high]);
         let now = Instant::now();
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         let peer = PeerId::random();
-        evidence.want_pin_probe(peer, 38_400, true);
+        evidence.want_pin_probe(peer, 38_400, true, ());
         assert_eq!(evidence.take_satisfied_wait(&peer, now), None);
         evidence.observe_headers(peer, [&low], &pins, now);
         assert_eq!(evidence.take_satisfied_wait(&peer, now), None, "24 846 is not 38 400");
         evidence.observe_headers(peer, [&high], &pins, now);
-        assert_eq!(evidence.take_satisfied_wait(&peer, now), Some(true));
+        assert_eq!(evidence.take_satisfied_wait(&peer, now), Some((true, ())));
         assert_eq!(evidence.take_satisfied_wait(&peer, now), None, "taken once");
+    }
+
+    /// A provider's manifest reaches the node once per snapshot generation:
+    /// the P2P layer delivers it to each provider once, so asking the same
+    /// peer again after its pin proof brings nothing back (mainnet,
+    /// 2026-10-14 04:25 UTC: the first two seeds asked again never answered
+    /// again). The manifest set aside is held with the wait and handed back
+    /// with the proof — the newest one when the peer sent several.
+    #[test]
+    fn the_manifest_set_aside_comes_back_with_the_proof() {
+        let pinned = header_at(38_400, 1);
+        let pins = pins_for(&[&pinned]);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<&'static str>::default();
+        let peer = PeerId::random();
+        evidence.want_pin_probe(peer, 38_400, false, "first manifest");
+        evidence.want_pin_probe(peer, 38_400, true, "newer manifest");
+        evidence.observe_headers(peer, [&pinned], &pins, now);
+        assert_eq!(
+            evidence.take_satisfied_wait(&peer, now),
+            Some((true, "newer manifest"))
+        );
+        assert_eq!(evidence.take_satisfied_wait(&peer, now), None, "taken once");
+
+        // A disconnect, a contradiction or an answer without the pinned
+        // height drops what was held.
+        let gone = PeerId::random();
+        evidence.want_pin_probe(gone, 38_400, false, "dropped at disconnect");
+        evidence.on_disconnect(&gone);
+        evidence.observe_headers(gone, [&pinned], &pins, now);
+        assert_eq!(evidence.take_satisfied_wait(&gone, now), None);
+        let silent = PeerId::random();
+        evidence.want_pin_probe(silent, 38_400, false, "dropped on an empty answer");
+        evidence.cancel_pin_wait(&silent);
+        evidence.observe_headers(silent, [&pinned], &pins, now);
+        assert_eq!(evidence.take_satisfied_wait(&silent, now), None);
     }
 
     #[test]
@@ -454,7 +527,7 @@ mod tests {
     #[test]
     fn the_evidence_is_bounded() {
         let now = Instant::now();
-        let mut evidence = PeerChainEvidence::default();
+        let mut evidence = PeerChainEvidence::<()>::default();
         for i in 0..PEER_CHAIN_EVIDENCE_CAPACITY + 10 {
             evidence.mark_divergent(PeerId::random(), i as u64, now + Duration::from_millis(i as u64));
         }
