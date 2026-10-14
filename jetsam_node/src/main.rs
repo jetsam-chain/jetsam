@@ -16403,7 +16403,18 @@ async fn handle_p2p_events(
                     .map(|pending| pending.preferred_peer)
                 {
                     let dispatched = probe_snapshot_generation_providers!(original);
-                    if dispatched > 0 {
+                    // v1.5.1: every connected peer already answered that it
+                    // does not serve this exact generation — a completed
+                    // round too, or the plan would never be confirmed extinct.
+                    let askable = pending_manifest.as_ref().map_or(0, |pending| {
+                        let refused = rejected_snapshot_manifest_providers
+                            .get(&pending.manifest.manifest_digest);
+                        manifest_peers
+                            .iter()
+                            .filter(|peer| refused.is_none_or(|refused| !refused.contains(*peer)))
+                            .count()
+                    });
+                    if snapshot_discovery_round_completed(dispatched, askable) {
                         snapshot_provider_discovery_rounds =
                             snapshot_provider_discovery_rounds.saturating_add(1);
                     }
@@ -17780,6 +17791,14 @@ fn snapshot_plan_yields_to_tip_extension(
         && !plan_holds_verified_authority
 }
 
+/// v1.5.1 — whether one discovery round for the active snapshot plan's
+/// exact generation is complete: a request went out, or no connected peer is
+/// left to ask (every one answered that it does not serve that generation).
+/// Requests held back locally (a full lane, one already in flight) are not.
+fn snapshot_discovery_round_completed(dispatched: usize, askable_peers: usize) -> bool {
+    dispatched > 0 || askable_peers == 0
+}
+
 /// v1.5.1 — how long a snapshot plan that has verified nothing may go
 /// without staging a header or receiving its terminal. Provider churn does
 /// not count as progress: on 2026-10-13 it kept such a plan alive 30 min 46 s.
@@ -18031,6 +18050,23 @@ mod divergent_branch_capture_tests {
         assert!(!snapshot_plan_yields_to_tip_extension(true, true, true, false, false), "deep gap");
         assert!(!snapshot_plan_yields_to_tip_extension(true, true, false, true, false), "commit running");
         assert!(!snapshot_plan_yields_to_tip_extension(true, true, false, false, true), "verified plan");
+    }
+
+    /// Mainnet, 2026-10-14 04:28-04:44 UTC (a fresh 1.5.1 candidate node):
+    /// the plan's one state segment failed at its only provider, every other
+    /// connected peer answered that it no longer serves that generation, and
+    /// the plan then sat with no request out — a discovery round only counted
+    /// when a request went out, and nobody was left to ask, so its extinction
+    /// was never confirmed. A round with nobody left to ask is a completed
+    /// round; requests merely held back locally are not.
+    #[test]
+    fn a_discovery_round_with_nobody_left_to_ask_counts() {
+        assert!(snapshot_discovery_round_completed(1, 5));
+        assert!(snapshot_discovery_round_completed(0, 0), "nobody left to ask");
+        assert!(
+            !snapshot_discovery_round_completed(0, 3),
+            "requests held back locally are no round"
+        );
     }
 
     /// A snapshot plan that has verified nothing and staged no header for a
