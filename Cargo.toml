@@ -39,7 +39,10 @@ resolver = "2"
 # 1.5.0 is the first build that knows the v1.5 fork (client slot, 180 s blocks,
 # 480-block development payouts). It ships dormant: the public profile carries
 # no activation height, so before an armed height it behaves as 1.4.3 does.
-version = "1.5.0"
+# 1.5.1 keeps the v1.5 rules (armed at 38400) and pins blocks 38399 and 38400;
+# its fix is to synchronization: a branch the node refuses can no longer
+# capture its snapshot sync.
+version = "1.5.1"
 edition = "2021"
 license = "Apache-2.0"
 
