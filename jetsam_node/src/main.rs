@@ -1476,6 +1476,7 @@ fn prepare_history_step_ghost_authorization() -> Result<
 }
 
 mod config;
+mod peer_chain_evidence;
 mod embedded_history_step_pack;
 mod log_highlight;
 mod sync_phase_telemetry;
@@ -5741,6 +5742,12 @@ enum HeaderInventoryPlan {
         target: jetsam_node::networking::ChainPoint,
     },
     FinalizedDivergence,
+    /// v1.5.1: a header of the batch was refused at `height` by a rule only a
+    /// fork explains (its target, its proof-of-work, a pinned id).
+    ConsensusFork {
+        height: u64,
+        error: jetsam_chain::consensus::ConsensusError,
+    },
 }
 
 const HEADER_DAG_MAX_NODES: usize = 1024;
@@ -6005,17 +6012,23 @@ async fn plan_header_inventory(
     };
     validation_headers.extend_from_slice(&competing_headers);
     let validation_base_height = header_dag.finalized().height;
-    let target_work = tokio::task::spawn_blocking(move || {
+    let target_work = match tokio::task::spawn_blocking(move || {
         validate_bounded_header_extension(
             &validation_store,
             validation_base_height,
             &validation_headers,
             unix_now(),
         )
-        .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| format!("header validation worker failed: {error}"))??;
+    .map_err(|error| format!("header validation worker failed: {error}"))?
+    {
+        Ok(work) => work,
+        Err(SnapshotHeaderStagingError::ForkRule { height, error }) => {
+            return Ok(HeaderInventoryPlan::ConsensusFork { height, error });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     let mut cumulative_work = header_dag
         .cumulative_work(ancestor)
@@ -9950,11 +9963,15 @@ async fn handle_p2p_events(
     let mut rejected_suffix_object_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // A peer whose authenticated header view has no common ancestor in our
-    // complete non-final window cannot be used for an automatic rebase. Keep
-    // it out of snapshot selection for this connection lifetime instead of
-    // cycling through manifests guaranteed to fail at the first parent link.
-    let mut finalized_divergent_peers: std::collections::HashSet<libp2p::PeerId> =
-        std::collections::HashSet::new();
+    // complete non-final window, or that served a header refused by a rule
+    // only a fork explains (its target, its proof-of-work, a pinned id),
+    // cannot be a snapshot source. v1.5.1: the verdict outlives the
+    // connection (`peer_chain_evidence`); on 2026-10-13 a disconnect wiped
+    // it and the next manifest of the 1.4.3 branch became the candidate.
+    let mut peer_chain_evidence = peer_chain_evidence::PeerChainEvidence::default();
+    // Last time an unauthenticated snapshot plan (one that has verified
+    // nothing yet) staged headers or received its terminal.
+    let mut snapshot_plan_real_progress: Option<Instant> = None;
     let mut mempool_sync_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Bounded retries rotate through the connected set instead of repeatedly
@@ -10216,6 +10233,7 @@ async fn handle_p2p_events(
             }
             active_snapshot_sync = None;
             snapshot_plan_last_progress = None;
+            snapshot_plan_real_progress = None;
             snapshot_provider_discovery_rounds = 0;
             rejected_snapshot_manifest_providers.clear();
             snapshot_terminal_transport_failures.clear();
@@ -10265,8 +10283,9 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
+            let divergent_peers = peer_chain_evidence.divergent_peers(Instant::now());
             let excluded_peers = rejected_terminal_peers
-                .union(&finalized_divergent_peers)
+                .union(&divergent_peers)
                 .copied()
                 .collect::<std::collections::HashSet<_>>();
             let candidates = rotating_manifest_peers(
@@ -10297,6 +10316,69 @@ async fn handle_p2p_events(
                 || snapshot_staging.is_some()
                 || snapshot_staging_inflight.is_some()
                 || snapshot_install_inflight.is_some()
+        }};
+    }
+
+    // v1.5.1: whether the active snapshot plan has verified anything — its
+    // complete header chain, its terminal, or its State. Until then it is a
+    // peer's claim staged against this node's rules, and it may yield.
+    macro_rules! snapshot_plan_holds_verified_authority {
+        () => {{
+            retained_snapshot_headers.is_some()
+                // The complete header chain, staged and validated, waits for
+                // its terminal or is being verified with it.
+                || pending_snapshot_header_sync.as_ref().is_some_and(|sync| {
+                    sync.next_height == sync.target_height.saturating_add(1)
+                })
+                || history_step_verification_inflight.is_some()
+                || pending_manifest
+                    .as_ref()
+                    .is_some_and(|pending| pending.history_step.is_some())
+                || active_snapshot_sync.is_some()
+                || snapshot_staging.is_some()
+                || snapshot_staging_inflight.is_some()
+                || finalized_snapshot_waiting.is_some()
+                || snapshot_install_inflight.is_some()
+        }};
+    }
+
+    // v1.5.1: whether `peer` offered the active, unauthenticated plan's
+    // manifest and a refusal at `height` falls inside it — the plan's
+    // boundary then descends from a block this node's rules refuse.
+    macro_rules! snapshot_plan_refused_through {
+        ($peer:expr, $height:expr) => {{
+            let peer = $peer;
+            let height: u64 = $height;
+            !snapshot_plan_holds_verified_authority!()
+                && pending_manifest.as_ref().is_some_and(|pending| {
+                    (pending.preferred_peer == peer || pending.providers.contains(&peer))
+                        && height <= pending.manifest.tip_height
+                })
+        }};
+    }
+
+    // v1.5.1: retire the active plan as soon as the peer that offered it is
+    // shown to follow a refused branch below its boundary. On 2026-10-13 such
+    // a plan lived 30 min 46 s on a seed, retired only when a terminal of the
+    // other branch finally arrived and failed verification.
+    macro_rules! retire_snapshot_plan_refused_through {
+        ($peer:expr, $height:expr) => {{
+            let peer = $peer;
+            let height: u64 = $height;
+            if snapshot_plan_refused_through!(peer, height) {
+                let boundary = pending_manifest
+                    .as_ref()
+                    .map_or(0, |pending| pending.manifest.tip_height);
+                tracing::warn!(
+                    peer = %peer,
+                    refused_height = height,
+                    boundary,
+                    "the snapshot plan's provider follows a branch this node refuses — \
+                     retiring the plan"
+                );
+                retire_snapshot_plan!();
+                request_bounded_manifest_failover!(peer, false);
+            }
         }};
     }
 
@@ -10501,6 +10583,7 @@ async fn handle_p2p_events(
                 history_step: None,
             });
             snapshot_plan_last_progress = Some(Instant::now());
+            snapshot_plan_real_progress = Some(Instant::now());
             snapshot_provider_discovery_rounds = 0;
 
             snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
@@ -10617,6 +10700,7 @@ async fn handle_p2p_events(
         ($sync:expr, $payload:expr) => {{
             let sync = $sync;
             let payload = $payload;
+            snapshot_plan_real_progress = Some(Instant::now());
             let terminal_from = payload.from;
             let terminal_request_token = payload.token;
             let runtimes = history_step_runtimes.clone();
@@ -10805,6 +10889,7 @@ async fn handle_p2p_events(
         ($authority:expr, $payload:expr) => {{
             let authority = $authority;
             let payload = $payload;
+            snapshot_plan_real_progress = Some(Instant::now());
             let snapshot = authority.snapshot;
             let terminal_from = payload.from;
             let terminal_request_token = payload.token;
@@ -11418,7 +11503,7 @@ async fn handle_p2p_events(
                         )
                     });
                 let height = announced_header.height;
-                let announcement_data_blocked = snapshot_plan_active!()
+                let mut announcement_data_blocked = snapshot_plan_active!()
                     || exact_suffix_apply_inflight.is_some()
                     || pending_manifest.is_some()
                     || snapshot_install_inflight.is_some();
@@ -11591,6 +11676,9 @@ async fn handle_p2p_events(
                                 }
                             }
                         } else if header_rejection_looks_like_a_fork(&e) {
+                            // v1.5.1: and remembered, across reconnections.
+                            peer_chain_evidence.mark_divergent(from, height, Instant::now());
+                            retire_snapshot_plan_refused_through!(from, height);
                             // Loud on purpose. This is what a consensus change
                             // looks like from the inside, and it used to be
                             // invisible: both sides reject each other, neither
@@ -11663,6 +11751,34 @@ async fn handle_p2p_events(
                             "validated direct child retained; HeaderDAG selected another tip"
                         );
                         continue;
+                    }
+                    // v1.5.1 (d): a validated child of the committed tip,
+                    // selected by HeaderDAG, is never held behind a snapshot
+                    // plan that has verified nothing (2026-10-13: 30 min).
+                    let canonical_mutation_inflight = exact_suffix_apply_inflight.is_some()
+                        || snapshot_install_inflight.is_some();
+                    if announcement_data_blocked
+                        && snapshot_plan_yields_to_tip_extension(
+                            *initial_sync_ready.borrow(),
+                            true,
+                            false,
+                            canonical_mutation_inflight,
+                            snapshot_plan_holds_verified_authority!(),
+                        )
+                    {
+                        if let Some(boundary) =
+                            pending_manifest.as_ref().map(|pending| pending.manifest.tip_height)
+                        {
+                            tracing::info!(
+                                peer = %from,
+                                height,
+                                boundary,
+                                "a validated child of the committed tip supersedes a snapshot \
+                                 plan that has verified nothing — retiring the plan"
+                            );
+                            retire_snapshot_plan!();
+                        }
+                        announcement_data_blocked = canonical_mutation_inflight;
                     }
                     if announcement_data_blocked {
                         deferred_sync_peer = Some(from);
@@ -12262,7 +12378,9 @@ async fn handle_p2p_events(
                     // Manifest and tip discovery are independent, tiny
                     // requests. Only our bounded outbound neighbour set starts
                     // them; an inbound wallet cannot make a seed reciprocate.
-                    if snapshot_install_inflight.is_none() {
+                    if snapshot_install_inflight.is_none()
+                        && !peer_chain_evidence.is_divergent(&peer, Instant::now())
+                    {
                         try_request_manifest!(peer, our_height, [0; 32]);
                     }
 
@@ -12549,6 +12667,64 @@ async fn handle_p2p_events(
                 let header_count = records.len();
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+                // v1.5.1: what this batch shows at the pinned heights. Only a
+                // block id is compared — the pin is the authority — so even a
+                // single unanchored header is evidence about the peer's chain.
+                let probe_now = Instant::now();
+                let probed_height = peer_chain_evidence.probe_in_flight(&from);
+                let pin_evidence = peer_chain_evidence.observe_headers(
+                    from,
+                    records.iter().map(|record| &record.header),
+                    jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+                    probe_now,
+                );
+                match pin_evidence {
+                    peer_chain_evidence::PinEvidence::Contradicts { height } => {
+                        mining_peer_quorum.reject_incompatible(from);
+                        manifest_requested_peers.remove(&from);
+                        manifest_force_snapshot_peers.remove(&from);
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            "this peer serves another block at a pinned height: it follows a \
+                             branch this node refuses (kept for {} min)",
+                            peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                        );
+                        retire_snapshot_plan_refused_through!(from, height);
+                    }
+                    peer_chain_evidence::PinEvidence::Matches { height } => {
+                        if let Some(force) =
+                            peer_chain_evidence.take_satisfied_wait(&from, probe_now)
+                        {
+                            let our_height = {
+                                let ctx = chain.read().await;
+                                ctx.tip_height()
+                            };
+                            tracing::info!(
+                                peer = %from,
+                                pin_height = height,
+                                "peer showed the pinned block: asking again for its snapshot manifest"
+                            );
+                            if try_request_manifest!(from, our_height, [0; 32]) && force {
+                                manifest_force_snapshot_peers.insert(from);
+                            }
+                        }
+                    }
+                    peer_chain_evidence::PinEvidence::Silent => {}
+                }
+                // The answer to a pin probe (one header at the probed height,
+                // or none) is evidence only: it is not a tip view.
+                if let Some(probed) = probed_height {
+                    if records.len() <= 1
+                        && records.iter().all(|record| record.header.height == probed)
+                    {
+                        peer_chain_evidence.probe_ended(&from);
+                        if records.is_empty() {
+                            peer_chain_evidence.cancel_pin_wait(&from);
+                        }
+                        continue;
+                    }
+                }
                 // See the announcement path: a rejected source brings no
                 // headers (M3.10).
                 if rejected_suffix_object_peers.contains(&from)
@@ -12640,7 +12816,7 @@ async fn handle_p2p_events(
                 .await;
                 match plan {
                     Ok(HeaderInventoryPlan::Confirmed { tip }) => {
-                        finalized_divergent_peers.remove(&from);
+                        peer_chain_evidence.confirm_compatible_through(from, tip.height);
                         if active_suffix_sync.is_none() && tip.height >= highest_announced {
                             clear_manifest_round_state!();
                             mark_initial_sync_ready(&initial_sync_ready);
@@ -12685,7 +12861,7 @@ async fn handle_p2p_events(
                         old_tip,
                         target,
                     }) => {
-                        finalized_divergent_peers.remove(&from);
+                        peer_chain_evidence.confirm_compatible_through(from, target.height);
                         if let Err(error) = record_validated_headers(&mut header_dag, &headers) {
                             header_dag_faulted = true;
                             tracing::warn!(
@@ -12835,6 +13011,37 @@ async fn handle_p2p_events(
                             data_plan_blocked = snapshot_plan_active!()
                                 || snapshot_install_inflight.is_some()
                                 || exact_suffix_apply_inflight.is_some();
+                        }
+                        // v1.5.1 (d): a validated extension of the committed
+                        // tip, within direct reach, is never held behind a
+                        // snapshot plan that has verified nothing. On
+                        // 2026-10-13 a seed held 38 411-38 418 for 30 min
+                        // behind a plan toward the 1.4.3 branch.
+                        let canonical_mutation_inflight = exact_suffix_apply_inflight.is_some()
+                            || snapshot_install_inflight.is_some();
+                        if data_plan_blocked
+                            && snapshot_plan_yields_to_tip_extension(
+                                *initial_sync_ready.borrow(),
+                                selected_rebase_base.is_none(),
+                                needs_snapshot,
+                                canonical_mutation_inflight,
+                                snapshot_plan_holds_verified_authority!(),
+                            )
+                        {
+                            if let Some(boundary) = pending_manifest
+                                .as_ref()
+                                .map(|pending| pending.manifest.tip_height)
+                            {
+                                tracing::info!(
+                                    peer = %from,
+                                    target_height = target.height,
+                                    boundary,
+                                    "a validated extension of the committed tip supersedes a \
+                                     snapshot plan that has verified nothing — retiring the plan"
+                                );
+                                retire_snapshot_plan!();
+                            }
+                            data_plan_blocked = canonical_mutation_inflight;
                         }
                         if data_plan_blocked {
                             tracing::debug!(
@@ -13124,14 +13331,33 @@ async fn handle_p2p_events(
                         }
                     }
                     Ok(HeaderInventoryPlan::FinalizedDivergence) => {
+                        let finalized_height = header_dag.finalized().height;
                         mining_peer_quorum.reject_incompatible(from);
-                        finalized_divergent_peers.insert(from);
+                        peer_chain_evidence.mark_divergent(from, finalized_height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
                         tracing::warn!(
                             peer = %from,
                             "peer has no common ancestor inside the accepted non-final window"
                         );
+                        retire_snapshot_plan_refused_through!(from, finalized_height);
+                    }
+                    Ok(HeaderInventoryPlan::ConsensusFork { height, error }) => {
+                        // v1.5.1: a header refused by a rule only a fork
+                        // explains marks its sender, like a missing common
+                        // ancestor does (c3a011c only logged it).
+                        mining_peer_quorum.reject_incompatible(from);
+                        peer_chain_evidence.mark_divergent(from, height, Instant::now());
+                        manifest_requested_peers.remove(&from);
+                        manifest_force_snapshot_peers.remove(&from);
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            err = %error,
+                            "header inventory failed native validation: refused by a CONSENSUS \
+                             rule — this peer follows a branch this node refuses"
+                        );
+                        retire_snapshot_plan_refused_through!(from, height);
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -13176,7 +13402,7 @@ async fn handle_p2p_events(
                     continue;
                 }
                 manifest_requested_peers.remove(&from);
-                if finalized_divergent_peers.contains(&from) {
+                if peer_chain_evidence.is_divergent(&from, Instant::now()) {
                     tracing::warn!(
                         from = %from,
                         tip = manifest.tip_height,
@@ -13305,9 +13531,16 @@ async fn handle_p2p_events(
                         dispatch_snapshot_segments_from_available_source!();
                         continue;
                     }
-                    let our_height = {
+                    let (our_height, our_tip, our_work) = {
                         let ctx = chain.read().await;
-                        ctx.tip_height()
+                        (
+                            ctx.tip_height(),
+                            jetsam_node::networking::ChainPoint::new(
+                                ctx.tip_height(),
+                                ctx.tip_hash(),
+                            ),
+                            *ctx.tip_chain_work(),
+                        )
                     };
                     if manifest.tip_height <= our_height {
                         tracing::debug!(
@@ -13337,6 +13570,77 @@ async fn handle_p2p_events(
                             );
                         }
                         continue;
+                    }
+
+                    // v1.5.1 (c): a boundary above the local tip is a claim,
+                    // not authority. It must carry more work than the local
+                    // tip, descend from the pinned blocks (its sender shows
+                    // them), and — once this node has tip authority — be
+                    // supported by its own validated headers.
+                    let judged_at = Instant::now();
+                    let validated_view = (*initial_sync_ready.borrow()
+                        && rebase_anchor.is_none()
+                        && snapshot_rebase_hint.is_none()
+                        && !header_dag_faulted)
+                        .then_some(&header_dag);
+                    match judge_snapshot_manifest(
+                        &manifest,
+                        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+                        &peer_chain_evidence,
+                        &from,
+                        judged_at,
+                        our_tip,
+                        &our_work,
+                        validated_view,
+                    ) {
+                        ManifestCandidacy::Admit => {}
+                        ManifestCandidacy::AwaitPinProof { pin_height } => {
+                            peer_chain_evidence.want_pin_probe(from, pin_height, force_snapshot);
+                            for (peer, height) in peer_chain_evidence.pin_probes_due(
+                                &std::collections::HashSet::from([from]),
+                                &fetch_in_progress,
+                                judged_at,
+                            ) {
+                                if !try_dispatch_header_fetch(
+                                    &p2p_cmd,
+                                    &mut fetch_in_progress,
+                                    &mut recent_header_fetches,
+                                    peer,
+                                    height,
+                                    1,
+                                    judged_at,
+                                ) {
+                                    peer_chain_evidence.probe_ended(&peer);
+                                }
+                            }
+                            tracing::info!(
+                                from = %from,
+                                our_height,
+                                snapshot_height = manifest.tip_height,
+                                pin_height,
+                                "snapshot manifest set aside until its sender shows the pinned block"
+                            );
+                            continue;
+                        }
+                        ManifestCandidacy::ContradictsPin { height } => {
+                            peer_chain_evidence.mark_divergent(from, height, judged_at);
+                            tracing::warn!(
+                                from = %from,
+                                snapshot_height = manifest.tip_height,
+                                "snapshot manifest names another block at a pinned height — refused"
+                            );
+                            continue;
+                        }
+                        ManifestCandidacy::Refuse(reason) => {
+                            tracing::info!(
+                                from = %from,
+                                our_height,
+                                snapshot_height = manifest.tip_height,
+                                reason,
+                                "snapshot manifest is not a snapshot candidate"
+                            );
+                            continue;
+                        }
                     }
 
                     let snapshot_gap = manifest.tip_height.saturating_sub(our_height);
@@ -14324,7 +14628,9 @@ async fn handle_p2p_events(
                 recent_header_fetches.retain(|(p, _, _), _| *p != peer);
                 manifest_requested_peers.remove(&peer);
                 mempool_sync_requested_peers.remove(&peer);
-                finalized_divergent_peers.remove(&peer);
+                // v1.5.1: a disconnect forgets only the pin probe in flight;
+                // what the peer proved about its chain stays (2026-10-13).
+                peer_chain_evidence.on_disconnect(&peer);
                 peer_tx_rate.remove(&peer);
             }
             Err(jetsam_p2p::NetworkEventRecvError::Lagged(n)) => {
@@ -14444,6 +14750,36 @@ async fn handle_p2p_events(
                             "snapshot header prepare was misclassified as peer input: {error}"
                         ));
                     };
+                    // v1.5.1: a range refused by a rule only a fork explains
+                    // marks its source; if that source offered this plan, the
+                    // plan's boundary descends from the refused block and the
+                    // plan is retired now, not when a terminal of the other
+                    // branch finally fails (2026-10-13: 30 min 46 s).
+                    if let SnapshotHeaderStagingError::ForkRule { height, .. } = &error {
+                        let height = *height;
+                        peer_chain_evidence.mark_divergent(range_from, height, Instant::now());
+                        tracing::warn!(
+                            peer = %range_from,
+                            height,
+                            err = %error,
+                            "snapshot header range refused by a CONSENSUS rule — its source \
+                             follows a branch this node refuses"
+                        );
+                        if snapshot_plan_refused_through!(range_from, height) {
+                            let boundary = sync.target_height;
+                            cleanup_snapshot_header_staging_offthread(sync.staging);
+                            tracing::warn!(
+                                peer = %range_from,
+                                refused_height = height,
+                                boundary,
+                                "the snapshot plan's provider follows a branch this node refuses — \
+                                 retiring the plan"
+                            );
+                            retire_snapshot_plan!();
+                            request_bounded_manifest_failover!(range_from, false);
+                            continue;
+                        }
+                    }
                     let parent_mismatch_at_base = matches!(
                         &error,
                         SnapshotHeaderStagingError::ParentMismatch { height }
@@ -14545,6 +14881,7 @@ async fn handle_p2p_events(
                 }
             };
             snapshot_plan_last_progress = Some(Instant::now());
+            snapshot_plan_real_progress = Some(Instant::now());
             snapshot_provider_discovery_rounds = 0;
             if sync.snapshot != snapshot {
                 cleanup_snapshot_header_staging_offthread(sync.staging);
@@ -15920,6 +16257,24 @@ async fn handle_p2p_events(
             );
             mining_peer_quorum.expire_stale(now);
 
+            // v1.5.1: pin probes for manifests set aside until their sender
+            // shows the pinned block (one header each, on a free lane).
+            for (peer, height) in
+                peer_chain_evidence.pin_probes_due(&manifest_peers, &fetch_in_progress, now)
+            {
+                if !try_dispatch_header_fetch(
+                    &p2p_cmd,
+                    &mut fetch_in_progress,
+                    &mut recent_header_fetches,
+                    peer,
+                    height,
+                    1,
+                    now,
+                ) {
+                    peer_chain_evidence.probe_ended(&peer);
+                }
+            }
+
             // Data-lane backpressure is local scheduling, not a peer failure.
             // Exact jobs returned to Wanted are retried here without ever
             // blocking the header/control event loop.
@@ -16040,11 +16395,17 @@ async fn handle_p2p_events(
                 && snapshot_plan_last_progress.is_some_and(|last| {
                     now.saturating_duration_since(last) >= SNAPSHOT_PLAN_SUPERSEDED_GRACE
                 }) {
+                // v1.5.1: never toward a peer whose chain this node refuses
+                // (its boundary is the highest: the 1.4.3 branch's was).
+                let unusable_sources = rejected_terminal_peers
+                    .union(&peer_chain_evidence.divergent_peers(now))
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
                 snapshot_terminal_target.and_then(|(height, block_hash)| {
                     superseded_snapshot_plan_source(
                         &manifest_peers,
                         &manifest_terminal_capabilities,
-                        &rejected_terminal_peers,
+                        &unusable_sources,
                         height,
                         block_hash,
                     )
@@ -16084,6 +16445,37 @@ async fn handle_p2p_events(
                     generation = snapshot_sync_generation,
                     rounds = snapshot_provider_discovery_rounds,
                     "exact snapshot transport exhausted; selecting a fresh HeaderDAG-bound generation"
+                );
+                retire_snapshot_plan!();
+                if let Some(failed_peer) = failed_peer {
+                    request_bounded_manifest_failover!(failed_peer, false);
+                }
+            }
+
+            // v1.5.1 (d): a plan that has verified nothing and staged no
+            // header for a few minutes is a claim nobody can serve; it is
+            // retired (2026-10-13: such a plan lived 30 min 46 s, refreshed
+            // by responses that were then refused).
+            if pending_manifest.is_some()
+                && !snapshot_plan_holds_verified_authority!()
+                && unauthenticated_snapshot_plan_stalled(
+                    snapshot_plan_real_progress,
+                    now,
+                    // Validation running now, not an object parked waiting
+                    // for headers that may never come.
+                    snapshot_header_staging_inflight.is_some()
+                        || history_step_verification_inflight.is_some(),
+                )
+            {
+                let failed_peer = pending_manifest.as_ref().map(|pending| pending.preferred_peer);
+                let boundary = pending_manifest
+                    .as_ref()
+                    .map_or(0, |pending| pending.manifest.tip_height);
+                tracing::warn!(
+                    boundary,
+                    our_height,
+                    stall_s = UNAUTHENTICATED_SNAPSHOT_PLAN_STALL.as_secs(),
+                    "a snapshot plan that has verified nothing made no progress — retiring it"
                 );
                 retire_snapshot_plan!();
                 if let Some(failed_peer) = failed_peer {
@@ -16132,7 +16524,7 @@ async fn handle_p2p_events(
                         .copied()
                         .filter(|peer| {
                             !rejected_terminal_peers.contains(peer)
-                                && !finalized_divergent_peers.contains(peer)
+                                && !peer_chain_evidence.is_divergent(peer, now)
                         })
                         .min_by_key(|peer| peer.to_bytes());
                     if let Some(peer) = peer {
@@ -16762,8 +17154,9 @@ async fn handle_p2p_events(
                         "state manifest round produced no usable candidate — re-requesting"
                     );
                     clear_manifest_round_state!();
+                    let divergent_peers = peer_chain_evidence.divergent_peers(now);
                     let excluded_peers = rejected_terminal_peers
-                        .union(&finalized_divergent_peers)
+                        .union(&divergent_peers)
                         .copied()
                         .collect::<std::collections::HashSet<_>>();
                     let retry_peers = rotating_manifest_peers(
@@ -17239,6 +17632,391 @@ fn header_rejection_looks_like_a_fork(error: &jetsam_chain::consensus::Consensus
     // One predicate with snapshot header staging (v1.5.1), which types the
     // same refusals as `SnapshotHeaderStagingError::ForkRule`.
     jetsam_node::snapshot_header_staging::consensus_rule_only_a_fork_explains(error)
+}
+
+/// v1.5.1 — what a snapshot manifest above the local tip is, once judged
+/// (`judge_snapshot_manifest`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestCandidacy {
+    /// It may become the snapshot candidate (its headers are still staged
+    /// and validated one by one against this node's rules).
+    Admit,
+    /// Set aside until its sender has shown the pinned block at
+    /// `pin_height` (a one-header probe).
+    AwaitPinProof { pin_height: u64 },
+    /// Its boundary is another block than the one pinned at `height`.
+    ContradictsPin { height: u64 },
+    /// Never a candidate, for the reason given.
+    Refuse(&'static str),
+}
+
+/// v1.5.1 (forensic §5.1) — judge a snapshot manifest whose boundary is above
+/// the local tip. Before v1.5.1 its height alone made it the candidate, and
+/// the 1.4.3 branch, durably higher, captured v1.5.0 nodes.
+///
+/// In order:
+/// * a sender whose chain this node has refused (`PeerChainEvidence`, kept
+///   across reconnections) offers no candidate;
+/// * a boundary at a pinned height must be the pinned block;
+/// * the boundary must claim more work than the local tip (height is not
+///   authority; the claim itself is checked exactly when the candidate's
+///   headers are staged);
+/// * with tip authority (`validated_view`: initial sync done, no rebase in
+///   progress, HeaderDAG sound), the boundary must be on the HeaderDAG's
+///   selected chain with exactly that work — or beyond the validated view
+///   while that view is itself a snapshot gap above the local tip;
+/// * otherwise its sender must have shown the highest pinned block below the
+///   boundary, so the boundary cannot descend from a refused branch.
+#[allow(clippy::too_many_arguments)]
+fn judge_snapshot_manifest(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    pins: &[(u64, [u8; 32])],
+    evidence: &peer_chain_evidence::PeerChainEvidence,
+    sender: &libp2p::PeerId,
+    now: Instant,
+    local_tip: jetsam_node::networking::ChainPoint,
+    local_work: &[u8; 32],
+    validated_view: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+) -> ManifestCandidacy {
+    if evidence.is_divergent(sender, now) {
+        return ManifestCandidacy::Refuse("its sender follows a branch this node refuses");
+    }
+    if let Some((height, pinned)) = pins
+        .iter()
+        .copied()
+        .find(|(height, _)| *height == manifest.tip_height)
+    {
+        if pinned != manifest.tip_hash {
+            return ManifestCandidacy::ContradictsPin { height };
+        }
+    }
+    if !jetsam_chain::work_gt(&manifest.cumulative_chainwork, local_work) {
+        return ManifestCandidacy::Refuse("it carries no more work than the local tip");
+    }
+    if let Some(dag) = validated_view {
+        let best = dag.best_tip();
+        if manifest.tip_height <= best.height {
+            let on_selected_chain = dag
+                .point_at_height(best, manifest.tip_height)
+                .is_ok_and(|point| point.hash == manifest.tip_hash)
+                && dag
+                    .cumulative_work(jetsam_node::networking::ChainPoint::new(
+                        manifest.tip_height,
+                        manifest.tip_hash,
+                    ))
+                    .is_ok_and(|work| work == manifest.cumulative_chainwork);
+            // Validated headers descend from the finalized chain, which
+            // holds every pin below it: no proof needed from the sender.
+            return if on_selected_chain {
+                ManifestCandidacy::Admit
+            } else {
+                ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
+            };
+        }
+        if !gap_requires_snapshot_sync(local_tip.height, best.height) {
+            return ManifestCandidacy::Refuse("its boundary is beyond the validated header view");
+        }
+    }
+    if let Some((pin_height, _)) = peer_chain_evidence::pin_below(pins, manifest.tip_height) {
+        if evidence
+            .pin_verified_through(sender, now)
+            .is_none_or(|height| height < pin_height)
+        {
+            return ManifestCandidacy::AwaitPinProof { pin_height };
+        }
+    }
+    ManifestCandidacy::Admit
+}
+
+/// v1.5.1 (forensic §5.3) — whether a validated header extending the
+/// committed tip goes ahead of the active snapshot plan, which is retired.
+/// It does when this node has tip authority, the extension starts at the
+/// committed tip (no reorganization), it is within direct reach (no
+/// snapshot gap), no canonical mutation is running, and the plan has
+/// verified nothing yet. Before v1.5.1 every such header waited for the plan
+/// (30 min 46 s on a seed, 2026-10-13).
+fn snapshot_plan_yields_to_tip_extension(
+    tip_authority: bool,
+    extends_committed_tip: bool,
+    needs_snapshot: bool,
+    canonical_mutation_inflight: bool,
+    plan_holds_verified_authority: bool,
+) -> bool {
+    tip_authority
+        && extends_committed_tip
+        && !needs_snapshot
+        && !canonical_mutation_inflight
+        && !plan_holds_verified_authority
+}
+
+/// v1.5.1 — how long a snapshot plan that has verified nothing may go
+/// without staging a header or receiving its terminal. Provider churn does
+/// not count as progress: on 2026-10-13 it kept such a plan alive 30 min 46 s.
+const UNAUTHENTICATED_SNAPSHOT_PLAN_STALL: Duration = Duration::from_secs(180);
+
+/// Whether an unauthenticated snapshot plan whose last real progress was at
+/// `last_real_progress` has stalled at `now`. Local work in flight (header
+/// validation, terminal verification) is never a stall.
+fn unauthenticated_snapshot_plan_stalled(
+    last_real_progress: Option<Instant>,
+    now: Instant,
+    local_work_in_flight: bool,
+) -> bool {
+    !local_work_in_flight
+        && last_real_progress.is_some_and(|last| {
+            now.saturating_duration_since(last) >= UNAUTHENTICATED_SNAPSHOT_PLAN_STALL
+        })
+}
+
+/// v1.5.1 — the stall of 2026-10-13 (forensic §4-5). A snapshot manifest
+/// from the 1.4.3 branch, which forks at 38 400' and is durably higher than
+/// ours, became the snapshot candidate on height alone; the plan could never
+/// complete and held the import of every canonical block behind it.
+#[cfg(test)]
+mod divergent_branch_capture_tests {
+    use super::*;
+    use jetsam_chain::block_header::block_id;
+    use jetsam_node::networking::{
+        header_dag::{HeaderDag, ValidatedHeader},
+        ChainPoint,
+    };
+    use peer_chain_evidence::PeerChainEvidence;
+
+    /// A validated chain from genesis: `len` children, each one block of the
+    /// genesis target's work, in a HeaderDAG finalized at genesis.
+    fn validated_chain(len: u64) -> (HeaderDag, Vec<ValidatedHeader>) {
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let base = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(base, [0u8; 32], 1024);
+        let mut headers = Vec::new();
+        let (mut parent, mut work) = (genesis, [0u8; 32]);
+        for height in 1..=len {
+            let mut header = parent;
+            header.height = height;
+            header.prev_block_hash = block_id(&parent);
+            header.timestamp += 1;
+            header.nonce = u128::from(height);
+            work = jetsam_chain::add_work(
+                &work,
+                &jetsam_chain::block_work(&header.difficulty_target),
+            );
+            let validated = ValidatedHeader::new_after_consensus_checks(header, work);
+            dag.insert(validated).unwrap();
+            headers.push(validated);
+            parent = header;
+        }
+        (dag, headers)
+    }
+
+    fn manifest(height: u64, hash: [u8; 32], work: [u8; 32]) -> jetsam_p2p::protocol::GetStateManifestResponse {
+        jetsam_p2p::protocol::GetStateManifestResponse {
+            tip_height: height,
+            tip_hash: hash,
+            cumulative_chainwork: work,
+            ..Default::default()
+        }
+    }
+
+    /// `work` plus `blocks` blocks of the genesis target.
+    fn more_work(work: [u8; 32], blocks: u64) -> [u8; 32] {
+        let step = jetsam_chain::block_work(&jetsam_chain::consensus::genesis_header().difficulty_target);
+        (0..blocks).fold(work, |acc, _| jetsam_chain::add_work(&acc, &step))
+    }
+
+    /// The pins of a chain: its blocks at `heights`.
+    fn pins_of(headers: &[ValidatedHeader], heights: &[u64]) -> Vec<(u64, [u8; 32])> {
+        heights
+            .iter()
+            .map(|height| (*height, headers[*height as usize - 1].hash))
+            .collect()
+    }
+
+    /// The peer of 2026-10-13: its header at the fork height was refused for
+    /// its target, it disconnects, reconnects, and offers a manifest higher
+    /// than our tip. Before v1.5.1 the disconnect wiped the verdict and the
+    /// manifest became the candidate on height alone. It never is now, on any
+    /// reconnection, while the verdict holds.
+    #[test]
+    fn a_refused_peer_that_reconnects_with_a_higher_manifest_is_never_a_candidate() {
+        let (_, headers) = validated_chain(30);
+        let tip = headers[19].point(); // we are at 20
+        let local_work = headers[19].cumulative_work;
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let forked = libp2p::PeerId::random();
+        evidence.mark_divergent(forked, 16, now); // its 16' was refused
+        let higher = manifest(28, [0xB2; 32], more_work(local_work, 50));
+        for reconnection in 0..20u64 {
+            evidence.on_disconnect(&forked);
+            let later = now + Duration::from_secs(60 * reconnection);
+            assert_eq!(
+                judge_snapshot_manifest(&higher, &[], &evidence, &forked, later, tip, &local_work, None),
+                ManifestCandidacy::Refuse("its sender follows a branch this node refuses"),
+                "reconnection {reconnection}"
+            );
+        }
+    }
+
+    /// The same peer, never seen before by this node (no verdict yet): with
+    /// the fork height pinned, its manifest above the pin waits until it shows
+    /// the pinned block; what it shows is its own 16', which marks it, and the
+    /// manifest is refused. An honest peer showing the pinned block is
+    /// admitted on a cold node.
+    #[test]
+    fn a_manifest_above_a_pin_waits_for_its_sender_to_show_the_pinned_block() {
+        let (_, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[15, 16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let forked = libp2p::PeerId::random();
+        let honest = libp2p::PeerId::random();
+        let theirs = manifest(24, [0xB2; 32], more_work([0; 32], 40));
+        let ours = manifest(24, headers[23].hash, headers[23].cumulative_work);
+
+        for (peer, offered) in [(forked, &theirs), (honest, &ours)] {
+            assert_eq!(
+                judge_snapshot_manifest(offered, &pins, &evidence, &peer, now, cold_tip, &[0; 32], None),
+                ManifestCandidacy::AwaitPinProof { pin_height: 16 }
+            );
+        }
+        let mut their_16 = headers[15].header;
+        their_16.nonce ^= 0xFFFF; // 16' — another block at the pinned height
+        evidence.observe_headers(forked, [&their_16], &pins, now);
+        evidence.observe_headers(honest, [&headers[15].header], &pins, now);
+        assert_eq!(
+            judge_snapshot_manifest(&theirs, &pins, &evidence, &forked, now, cold_tip, &[0; 32], None),
+            ManifestCandidacy::Refuse("its sender follows a branch this node refuses")
+        );
+        assert_eq!(
+            judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None),
+            ManifestCandidacy::Admit
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_boundary_contradicts_a_pin_is_refused() {
+        let (_, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[24]);
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let other_24 = manifest(24, [0xB2; 32], more_work([0; 32], 40));
+        assert_eq!(
+            judge_snapshot_manifest(&other_24, &pins, &evidence, &libp2p::PeerId::random(), now, cold_tip, &[0; 32], None),
+            ManifestCandidacy::ContradictsPin { height: 24 }
+        );
+    }
+
+    /// Height is not authority: a higher boundary that claims no more work
+    /// than our validated tip is refused (the claim itself is then checked
+    /// header by header when a candidate is staged).
+    #[test]
+    fn a_manifest_carrying_less_work_than_the_local_tip_is_refused() {
+        let (_, headers) = validated_chain(30);
+        let tip = headers[19].point();
+        let local_work = headers[19].cumulative_work;
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let peer = libp2p::PeerId::random();
+        let taller_but_lighter = manifest(28, [0x01; 32], more_work([0; 32], 10));
+        assert_eq!(
+            judge_snapshot_manifest(&taller_but_lighter, &[], &evidence, &peer, now, tip, &local_work, None),
+            ManifestCandidacy::Refuse("it carries no more work than the local tip")
+        );
+        let heavier = manifest(28, [0x01; 32], more_work(local_work, 8));
+        assert_eq!(
+            judge_snapshot_manifest(&heavier, &[], &evidence, &peer, now, tip, &local_work, None),
+            ManifestCandidacy::Admit
+        );
+    }
+
+    /// A node with tip authority (initial sync done) takes a snapshot only
+    /// toward what its own validated headers support: a boundary on the
+    /// selected chain, with its exact work; or one beyond the validated view
+    /// when that view itself is a snapshot gap away. mseed2's case — a
+    /// boundary 8 above a tip its validated headers say is the frontier — is
+    /// refused, whatever the height.
+    #[test]
+    fn a_synced_node_takes_no_boundary_its_validated_headers_do_not_support() {
+        let (dag, headers) = validated_chain(60);
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let peer = libp2p::PeerId::random();
+
+        // Tip authority at 20, the DAG validated through 60 (a snapshot gap).
+        let tip = headers[19].point();
+        let local_work = headers[19].cumulative_work;
+        let on_chain = manifest(36, headers[35].hash, headers[35].cumulative_work);
+        assert_eq!(
+            judge_snapshot_manifest(&on_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            ManifestCandidacy::Admit
+        );
+        let off_chain = manifest(36, [0xB2; 32], more_work(headers[35].cumulative_work, 5));
+        assert_eq!(
+            judge_snapshot_manifest(&off_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
+        );
+        let wrong_work = manifest(36, headers[35].hash, more_work(headers[35].cumulative_work, 5));
+        assert_eq!(
+            judge_snapshot_manifest(&wrong_work, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
+        );
+        let beyond_far_view = manifest(70, [0xC3; 32], more_work(headers[59].cumulative_work, 20));
+        assert_eq!(
+            judge_snapshot_manifest(&beyond_far_view, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            ManifestCandidacy::Admit
+        );
+
+        // Tip authority at 60 = the DAG's best tip: the frontier. A boundary
+        // 8 above it (mseed2, 38 410 / 38 418) is beyond anything validated.
+        let tip = headers[59].point();
+        let local_work = headers[59].cumulative_work;
+        let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
+        assert_eq!(
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            ManifestCandidacy::Refuse("its boundary is beyond the validated header view")
+        );
+        // Without tip authority (cold bootstrap) the same claim may be staged:
+        // staging validates every header against the node's rules.
+        assert_eq!(
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None),
+            ManifestCandidacy::Admit
+        );
+    }
+
+    /// A validated direct extension of the committed tip is never held behind
+    /// a snapshot plan that has not verified anything yet: the plan yields.
+    /// It does not yield during a cold bootstrap (the snapshot IS the sync),
+    /// to a plan holding verified authority, while a canonical mutation runs,
+    /// to a gap that needs a snapshot, or to a non-final reorganization.
+    #[test]
+    fn a_direct_child_of_the_tip_is_never_held_behind_an_unauthenticated_snapshot_plan() {
+        assert!(snapshot_plan_yields_to_tip_extension(true, true, false, false, false));
+        assert!(!snapshot_plan_yields_to_tip_extension(false, true, false, false, false), "cold");
+        assert!(!snapshot_plan_yields_to_tip_extension(true, false, false, false, false), "reorg");
+        assert!(!snapshot_plan_yields_to_tip_extension(true, true, true, false, false), "deep gap");
+        assert!(!snapshot_plan_yields_to_tip_extension(true, true, false, true, false), "commit running");
+        assert!(!snapshot_plan_yields_to_tip_extension(true, true, false, false, true), "verified plan");
+    }
+
+    /// A snapshot plan that has verified nothing and staged no header for a
+    /// few minutes is retired (it lived 30 min 46 s on mseed2). Time spent in
+    /// local validation does not count against it.
+    #[test]
+    fn an_unauthenticated_snapshot_plan_without_progress_dies_within_minutes() {
+        let t0 = Instant::now();
+        assert!(UNAUTHENTICATED_SNAPSHOT_PLAN_STALL <= Duration::from_secs(300));
+        assert!(UNAUTHENTICATED_SNAPSHOT_PLAN_STALL >= Duration::from_secs(60));
+        let just_before = t0 + UNAUTHENTICATED_SNAPSHOT_PLAN_STALL - Duration::from_secs(1);
+        let at = t0 + UNAUTHENTICATED_SNAPSHOT_PLAN_STALL;
+        assert!(!unauthenticated_snapshot_plan_stalled(Some(t0), just_before, false));
+        assert!(unauthenticated_snapshot_plan_stalled(Some(t0), at, false));
+        assert!(!unauthenticated_snapshot_plan_stalled(Some(t0), at, true), "local work in flight");
+        assert!(!unauthenticated_snapshot_plan_stalled(None, at, false), "no plan");
+    }
 }
 
 #[cfg(test)]
