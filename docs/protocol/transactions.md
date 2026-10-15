@@ -9,7 +9,7 @@ Each page has the fixed 323-byte body encoding:
 
 | Field | Meaning |
 |---|---|
-| `epoch_anchor` | Current 144-block replay-protection anchor |
+| `epoch_anchor` | Current 32-block replay-protection anchor |
 | `fee` | Logical fee on the first page; zero on continuations |
 | `input_owner` | Owner shared by every live input |
 | `inputs[8]` | Possible `{slot_index, amount, creation_id}` records |
@@ -93,11 +93,11 @@ Every page uses the current transaction-epoch anchor. For child height `C`,
 the anchor is the block ID at:
 
 ```text
-floor((C - 1) / 144) × 144
+floor((C - 1) / 32) × 32
 ```
 
-for `C > 0`. Height 144 still consumes the height-zero anchor; height 145
-begins using height 144. The mempool removes intents whose anchor is no longer
+for `C > 0`. Height 32 still consumes the height-zero anchor; height 33
+begins using height 32. The mempool removes intents whose anchor is no longer
 current.
 
 ## Authorization and State are separate

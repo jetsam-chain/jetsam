@@ -128,7 +128,7 @@ places:
 | `slot` | `INDEX` | Current slot contents |
 | `utxos-of` | `j1…` | Current UTXOs owned by an address |
 | `state` | — | Capacity, occupancy and encoded State size |
-| `epoch` | — | Current 144-block user transaction anchor |
+| `epoch` | — | Current 32-block user transaction anchor |
 
 Examples:
 
@@ -140,7 +140,7 @@ jetsam-cli slot 9700063
 jetsam-cli utxos-of j1...
 ```
 
-`block` returns data only inside the 18-block body-retention window. `header`
+`block` returns data only inside the 8-block body-retention window. `header`
 and `block-header` remain available for every canonical height.
 
 ### Network and mining

@@ -139,7 +139,7 @@ statement.
 ## Finality assumption
 
 Consensus refuses a reorganization that changes the prefix deeper than the
-18-block finality boundary. Operators and applications may choose to wait for
+8-block finality boundary. Operators and applications may choose to wait for
 additional confirmations inside the recent suffix, but no peer can present a
 deeper branch as eligible under the same rules.
 

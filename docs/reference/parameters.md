@@ -3,13 +3,13 @@
 ## Core
 
 ```text
-block target             90 seconds
+block target            180 seconds since block 38,400 (90 before)
 ASERT epoch               6 blocks
-ASERT half-life         120 seconds
+ASERT half-life         540 seconds
 median-time-past         11 headers
 future drift            120 seconds
-transaction epoch       144 blocks
-hard finality            18 blocks
+transaction epoch        32 blocks
+hard finality             8 blocks
 ```
 
 ## State
@@ -47,8 +47,8 @@ Poseidon2b width         4
 S-box                    x^7
 full rounds              8
 partial rounds           58
-B25 (small class)        m=22, up to 24 positions (25 before block 17,750)
-B255                     m=24, up to 255 positions
+B25 (small class)        m=23 since block 38,400 (m=22 before), up to 24 positions (25 before block 17,750)
+B255                     m=25 since block 38,400 (m=24 before), up to 255 positions
 wallet queries           65
 History/BaseFold queries 133
 B25 codeword             2^19 at rate 1/4
@@ -79,7 +79,11 @@ v1.4 anchor target       2^235
 ```text
 1 JTM                   1,000,000 μJTM
 initial subsidy          50 JTM
-subsidy floor            1 JTM
+halvings                 by height, 7 (28,800 · 172,800 · 831,800 · 1,490,800 · 2,149,800 · 2,808,800)
+emission end             height 3,467,664 (reward 0 from there; no floor)
+maximum supply           21,000,000 JTM
+development allocation   10% of each subsidy, blocks 1–369,600; 747,000 JTM in all
+development payout       every 960 blocks up to 38,400, then every 480
 base fee                 5,000 μJTM
 input fee                100 μJTM
 output fee               700 μJTM

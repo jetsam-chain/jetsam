@@ -21,7 +21,7 @@ Parano1d (NOID) coins, and the two networks reject each other's peers.
 | Halving trigger | state expansion (`log_slots += 1` at 75% occupancy) | **block height** |
 | Maximum supply | **none** — 1 NOID/block floor forever | **21 000 000 JTM, hard-capped** |
 | Reward floor | 1 NOID/block, perpetual | **none** — emission reaches zero |
-| Block interval | 20 s | **90 s** |
+| Block interval | 20 s | **90 s at launch, 180 s since block 38,400 (v1.5)** |
 | Base reward | 50 NOID | 50 JTM |
 | Development allocation | 3 years | **2 years** |
 
@@ -34,7 +34,7 @@ height-based schedule under a hard cap.
 The deterministic state-growth burn is **retained unchanged**: state growth
 remains priced even though the halving no longer tracks it.
 
-Emission schedule (90 s blocks, 28 800 blocks/month):
+Emission schedule (heights; 90 s blocks until 38,399, 180 s since 38,400):
 
 ```
 height           0 →      28 800   50      JTM/block
@@ -44,7 +44,7 @@ height     831 800 →   1 490 800   6.25    JTM/block
 height   1 490 800 →   2 149 800   3.125   JTM/block
 height   2 149 800 →   2 808 800   1.5625  JTM/block
 height   2 808 800 →   3 467 664   0.78125 JTM/block
-height   3 467 664 →         ...   0       (emission ends, ≈9.89 years)
+height   3 467 664 →         ...   0       (emission ends, ≈19.7 years after genesis)
 ```
 
 The final tier ends at `EMISSION_END_HEIGHT` = 3 467 664, not at the naive
@@ -64,12 +64,13 @@ addresses them:
   timestamp. Upstream derives the ASERT target from `header.timestamp`, so
   dating a block at `parent + 1` yields a heavier block at no computational
   cost — free weight. Jetsam removes this grinding vector.
-- **Block interval raised to 90 s**, above the recursive prover's 7–35 s
+- **Block interval raised to 90 s** (180 s since block 38,400, so that the
+  block can also carry a client proof), above the recursive prover's 7–35 s
   window. Upstream's 20 s interval leaves miners idle for a large fraction of
   every block (measured duty cycle: 79%) and hands a structural head start to
   whoever found the previous block.
-- **Finality depth reduced** from 18 to 8 blocks, keeping wall-clock finality
-  at ~12 minutes despite the longer interval.
+- **Finality depth reduced** from 18 to 8 blocks: ~12 minutes at 90 s,
+  ~24 minutes at 180 s.
 
 ## 3. Proof of work — TowerHash
 

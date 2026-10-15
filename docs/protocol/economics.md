@@ -1,7 +1,7 @@
 # Network economics
 
-Jetsam ties issuance to Live State capacity and prices persistent State
-growth separately from ordinary transaction work.
+Jetsam fixes issuance by block height under a hard cap of 21,000,000 JTM and
+prices persistent State growth separately from ordinary transaction work.
 
 ## Unit
 
@@ -14,41 +14,47 @@ All consensus amounts are integers in μJTM.
 
 ## Block reward
 
-The starting subsidy is 50 JTM. It halves whenever the State domain expands
-and never falls below 1 JTM:
+The starting subsidy is 50 JTM. It halves at seven fixed heights and reaches
+exactly zero; there is no floor (`jetsam_chain/src/consensus/emission.rs`):
 
-| `log_slots` | Capacity | Block reward |
-|---:|---:|---:|
-| 24 | 16,777,216 slots | 50.000000 JTM |
-| 25 | 33,554,432 slots | 25.000000 JTM |
-| 26 | 67,108,864 slots | 12.500000 JTM |
-| 27 | 134,217,728 slots | 6.250000 JTM |
-| 28 | 268,435,456 slots | 3.125000 JTM |
-| 29 | 536,870,912 slots | 1.562500 JTM |
-| 30–32 | Up to 4,294,967,296 slots | 1.000000 JTM |
+| Height range | Block reward |
+|---:|---:|
+| 1 – 28,799 | 50.000000 JTM |
+| 28,800 – 172,799 | 25.000000 JTM |
+| 172,800 – 831,799 | 12.500000 JTM |
+| 831,800 – 1,490,799 | 6.250000 JTM |
+| 1,490,800 – 2,149,799 | 3.125000 JTM |
+| 2,149,800 – 2,808,799 | 1.562500 JTM |
+| 2,808,800 – 3,467,663 | 0.781250 JTM |
+| 3,467,664 and above | 0 |
 
-Expansion requires sustained 75% occupancy in a hard-finalized window. The
-network therefore moves to a lower inflation tier only after materially using
-the current State capacity.
+The last era is trimmed by 136 blocks so that the sum over every
+coinbase-carrying height is exactly 21,000,000 JTM. Genesis carries no
+coinbase. Halvings are counted in blocks: since block 38,400 a day holds 480
+blocks instead of 960, so each halving arrives later in calendar time and the
+daily issuance halved at that height. State expansion (`log_slots`) no longer
+touches the subsidy; it still prices the State-growth burn.
 
 ## Launch development allocation
 
-For the first three target-time years, each block subsidy is divided:
+For the first two target-time years — blocks 1 through 369,600 — each block
+subsidy is divided:
 
 - 90% to the miner;
-- 5% to the O(1) Network Fund;
-- 5% to Jetsam Lab.
+- 5% to the Network Fund;
+- 5% to the Lab Fund.
 
-There is no premine. After height 6,307,200, the complete block subsidy goes to
-the miner.
+There is no premine. From height 369,601, the complete block subsidy goes to
+the miner. Summed over the schedule, the allocation is 747,000 JTM — 3.56% of
+the maximum supply (`jetsam_chain/src/consensus/development_allocation.rs`).
 
 To avoid creating two extra live UTXOs in every block, the two development
-shares are paid in one mandatory two-output system record every 5,760 target
-blocks. The amount uses the reward tier active at that payout boundary. If the
-State expands during the interval, the resulting difference remains unissued.
+shares are paid in one mandatory two-output system record once per target-time
+day: every 960 blocks up to and including block 38,400, then every 480 blocks.
+The amount uses the reward tier active at that payout height.
 
 The payout schedule, recipients and amounts are derived statelessly from height
-and `log_slots` and are proved inside `HistoryStep`. A miner cannot omit,
+and are proved inside `HistoryStep`. A miner cannot omit,
 redirect or defer a due payout.
 
 ## Fees

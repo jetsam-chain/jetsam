@@ -213,15 +213,15 @@ larger relation. Both classes prove the same consensus statement:
 
 | Class | Relation | Effective page positions |
 |---|---|---:|
-| Small (`B25`) | `m=22` | up to 24 since block 17,750 (25 before) |
-| B255 | `m=24` | up to 255 |
+| Small (`B25`) | `m=23` since block 38,400 (`m=22` before) | up to 24 since block 17,750 (25 before) |
+| B255 | `m=25` since block 38,400 (`m=24` before) | up to 255 |
 
 Proof construction and PoW are ordered all-core phases sharing one thread
 budget. They are not two competing all-core jobs. On a public host, leaving
 some CPU capacity outside `--cpu-threads` keeps the operating
 system and peer service responsive.
 
-The network targets a 90-second mean block interval. This is not a deadline:
+The network targets a 180-second mean block interval since block 38,400 (90 seconds before). This is not a deadline:
 individual blocks may arrive sooner or much later. Proof latency still matters
 because a candidate becomes stale when another miner advances the tip. Measure
 the complete small-class preparation path on the intended machine rather than judging
@@ -234,7 +234,7 @@ floor and published reference timings.
 ## Difficulty, rewards and confirmations
 
 ASERT adjusts the target against the complete interval between accepted
-blocks. Proof preparation, nonce search and propagation share that 90-second
+blocks. Proof preparation, nonce search and propagation share that 180-second
 mean target.
 The chain with the greatest cumulative valid work wins; an equal-work tie uses
 the canonical block-hash tie-break.

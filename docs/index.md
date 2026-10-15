@@ -93,7 +93,7 @@ terminal inside the same relation. Proof size and verification work do not
 increase with block height.
 
 An active node keeps the exact Live State, compact headers for cumulative work
-and the latest 18 canonical block bodies for competing miners and reorgs. A
+and the latest 8 canonical block bodies for competing miners and reorgs. A
 joining node authenticates a finalized State with its matching terminal, then
 verifies one recursive terminal at the recent suffix tip before applying the
 linked bodies.
@@ -183,15 +183,15 @@ and the [security model](protocol/security-model.md).
 
 | Parameter | Value |
 |---|---:|
-| Mean block target | 90 seconds |
+| Mean block target | 180 seconds since block 38,400 (90 seconds before) |
 | Proof of work | TowerWalk over a TowerHash seed (since block 24,846) |
-| Default miner class | small class (`B25` in code), `m=22`, up to 24 effective page positions since block 17,750 |
-| Large miner class | B255, `m=24`, up to 255 effective page positions |
+| Default miner class | small class (`B25` in code), `m=23` since block 38,400 (`m=22` before), up to 24 effective page positions since block 17,750 |
+| Large miner class | B255, `m=25` since block 38,400 (`m=24` before), up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | 12.75 TPS |
 | Maximum inputs in one transaction | 1,020 |
 | Maximum outputs in one transaction | 256 |
-| Recent block and reorg suffix | 18 blocks |
+| Recent block and reorg suffix | 8 blocks |
 | State domain | `2^24` to `2^32` slots |
 
 ## Start

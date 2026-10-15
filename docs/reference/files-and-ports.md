@@ -52,7 +52,7 @@ transport. A bearer token authenticates requests but does not encrypt them.
 | Reorganizable suffix | 18 |
 | Maximum reorganization | 17 |
 | Undo records | 36 |
-| Transaction epoch | 144 |
+| Transaction epoch | 32 |
 
 Receipts preserve payment-specific inclusion evidence outside body retention.
 

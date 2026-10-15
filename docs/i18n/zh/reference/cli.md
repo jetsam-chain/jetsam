@@ -122,7 +122,7 @@ CLI 钱包命令输入的金额以 JTM 为单位，最多六位小数：
 | `slot` | `INDEX` | 当前槽位内容 |
 | `utxos-of` | `j1…` | 某地址当前拥有的 UTXO |
 | `state` | — | 容量、占用和 State 编码大小 |
-| `epoch` | — | 当前 144 区块用户[交易周期（epoch）锚点](glossary.md#transaction-epoch-anchor) |
+| `epoch` | — | 当前 32 区块用户[交易周期（epoch）锚点](glossary.md#transaction-epoch-anchor) |
 
 示例：
 

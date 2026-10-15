@@ -6,7 +6,7 @@
   <img alt="status" src="https://img.shields.io/badge/status-mainnet%20live-3fe3c5?style=flat-square&labelColor=040e17">
   <img alt="hard cap" src="https://img.shields.io/badge/hard%20cap-21%2C000%2C000%20JTM-3fe3c5?style=flat-square&labelColor=040e17">
   <img alt="premine" src="https://img.shields.io/badge/premine-zero-3fe3c5?style=flat-square&labelColor=040e17">
-  <img alt="block time" src="https://img.shields.io/badge/block-90%20s-8fa9b5?style=flat-square&labelColor=040e17">
+  <img alt="block time" src="https://img.shields.io/badge/block-180%20s-8fa9b5?style=flat-square&labelColor=040e17">
   <img alt="node size" src="https://img.shields.io/badge/node%20size-O(1)-8fa9b5?style=flat-square&labelColor=040e17">
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-8fa9b5?style=flat-square&labelColor=040e17">
 </p>
@@ -310,9 +310,10 @@ prover time by 10.69×, median protocol-verifier time by 14.80× and raw
 algebraic proof bytes by 51.67×. Batched sumchecks, zerocheck, lincheck and
 FRI-Binius close the GF(2) R1CS relation without a trusted setup. One joint
 `GF(2^256)` transcript binds the three Link and six Block recursive regions
-into the outer PCS batch. The two authenticated production matrices, B25 at
-`m=22` and B255 at `m=24`, are embedded in the official binary and can be
-regenerated from source. The
+into the outer PCS batch. The authenticated production matrices of every relation generation — B25 and
+B255 at `m=22` and `m=24` for the launch and v1.3 relations, at `m=23` and
+`m=25` for v1.5 — are embedded in the official binary and can be regenerated
+from source. The
 [FROST-GKR research note](docs/research/frost-gkr.md)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
@@ -365,7 +366,7 @@ not mine TowerWalk; since block 24,846 mining is done on CPUs.
 | Mean block target | 180 seconds since block 38,400 (90 seconds before) |
 | Consensus finality depth | 8 blocks (~24 minutes) |
 | Halvings | 7, ending at height 3,467,664 (~19.7 years) |
-| Default miner class | B25, `m=23` since v1.5 (`m=22` before), up to 25 effective page positions |
+| Default miner class | B25, `m=23` since v1.5 (`m=22` before), up to 24 effective page positions (25 before block 17,750) |
 | Large miner class | B255, `m=25` since v1.5 (`m=24` before), up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | ~2.8 TPS |
@@ -382,7 +383,7 @@ verifies both classes.
 
 ## Development Allocation
 
-Jetsam has no premine. For blocks 1 through 700,800 — two 365-day target-time
+Jetsam has no premine. For blocks 1 through 369,600 — two 365-day target-time
 years — 10% of each block subsidy is allocated by consensus:
 
 - 90% to the miner;

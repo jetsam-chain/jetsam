@@ -55,7 +55,7 @@ database recovery on the next start.
 
 The lower table records primary rewards received by generated wallet addresses.
 It shows confirmation depth and whether complete block data remains inside the
-18-block retention window. Permanent header data remains available afterward.
+8-block retention window. Permanent header data remains available afterward.
 
 For server deployment, see
 [Internal mining](../operate/internal-mining.md).
