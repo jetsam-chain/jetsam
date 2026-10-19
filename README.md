@@ -580,3 +580,8 @@ issues according to the [security policy](.github/SECURITY.md).
 Questions, ideas and mining discussion happen in
 [Discussions](https://github.com/jetsam-chain/jetsam/discussions) and on
 [Discord](https://discord.gg/yjNgkyEw2W).
+
+Partnerships — exchanges, mining pools and integrations:
+**jetsamchain.partners@protonmail.com**. It is the only partnership address:
+anyone writing on Jetsam's behalf from another address is not the team. The
+team never asks for a seed phrase or a key.
