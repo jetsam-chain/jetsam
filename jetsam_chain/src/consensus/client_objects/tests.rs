@@ -2823,9 +2823,9 @@ fn carried_batch(root: u8, count: u64, used: &[usize]) -> CarriedBatch {
     }
 }
 
-/// The batch rules of this binary are dormant at [`HEIGHT`]: no v1.6 height
-/// on the public profile, a v1.6 height above it on the test profile once
-/// armed; the entry points without `_with` apply exactly them.
+/// The batch rules of this binary are dormant at [`HEIGHT`]: the v1.6 height
+/// of each profile, once armed, lies above it; the entry points without
+/// `_with` apply exactly them.
 #[test]
 fn the_consensus_batch_rules_are_dormant() {
     assert_eq!(
@@ -2837,8 +2837,6 @@ fn the_consensus_batch_rules_are_dormant() {
             catalogue: CLIENT_CATALOGUE_Z,
         }
     );
-    #[cfg(not(feature = "testnet"))]
-    assert_eq!(ClientBatchRules::CONSENSUS.activation_height, None);
     assert!(
         ClientBatchRules::CONSENSUS
             .activation_height

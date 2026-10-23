@@ -390,23 +390,28 @@ mod tests {
         }
     }
 
-    /// The public network's v1.6 height: not armed. The v1.6 relation and its
-    /// public pack do not exist, and the public network has not crossed v1.5.
+    /// The public network's v1.6 height, decided with the operator against the
+    /// tip of the day (`arm.sh --clock v1.6 --profile mainnet`).
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_V1_6_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(46080);
 
     /// The test chain's v1.6 height, decided with the operator against the
     /// tip of the day.
     #[cfg(feature = "testnet")]
     const DECLARED_V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(4800);
 
-    /// Arming the test chain's v1.6 never arms the public network's: the
-    /// public profile keeps both its v1.6 height and its declaration unset.
+    /// The public network's v1.6 height is its own declared one, a multiple
+    /// of 960 strictly above the public network's v1.5 height.
     #[cfg(not(feature = "testnet"))]
     #[test]
-    fn the_public_network_leaves_v1_6_unset() {
-        assert_eq!(crate::consensus::params::V1_6_ACTIVATION_HEIGHT, None);
-        assert_eq!(DECLARED_V1_6_ACTIVATION_HEIGHT, None);
+    fn the_public_network_arms_v1_6_at_its_declared_height() {
+        use crate::consensus::params::{V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT};
+        assert_eq!(V1_6_ACTIVATION_HEIGHT, DECLARED_V1_6_ACTIVATION_HEIGHT);
+        let v1_5 = V1_5_ACTIVATION_HEIGHT.expect("the public network's v1.5 is armed");
+        if let Some(v1_6) = V1_6_ACTIVATION_HEIGHT {
+            assert_eq!(v1_6 % 960, 0);
+            assert!(v1_6 > v1_5);
+        }
     }
 
     /// The same two-edit rule, for the fifth clock.

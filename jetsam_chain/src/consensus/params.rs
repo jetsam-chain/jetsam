@@ -495,11 +495,12 @@ pub(crate) const fn v1_5_active_with(height: u64, activation_height: Option<u64>
 /// First block height governed by the v1.6 relation: the client slot carries
 /// a recursive batch of client proofs instead of one bare client proof.
 ///
-/// **`None` on both profiles.** The v1.6 relation is written (its batch
-/// class still an input, frozen later) but no v1.6 pack exists and no v1.6
-/// tip is decided natively yet. A node refuses to start when this clock is
-/// armed and its build carries no v1.6 pack, rather than stopping with every
-/// other node at the same block (`jetsam_node::embedded_history_step_pack`).
+/// **Armed on both profiles**: the public network's height below
+/// (`arm.sh --clock v1.6 --profile mainnet`), the test chain's after it. A
+/// release carries the v1.6 pack generated for its profile. A node refuses to
+/// start when this clock is armed and its build carries no v1.6 pack, rather
+/// than stopping with every other node at the same block
+/// (`jetsam_node::embedded_history_step_pack`).
 ///
 /// # What it will switch
 ///
@@ -525,7 +526,7 @@ pub(crate) const fn v1_5_active_with(height: u64, activation_height: Option<u64>
 /// `wire_limits::tests::arming_v1_6_takes_two_deliberate_edits` fails the moment
 /// this value disagrees with the declaration beside it.
 #[cfg(not(feature = "testnet"))]
-pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(46080);
 
 /// The test chain's v1.6 height: 4 800 = 5 × 960, decided
 /// with the operator against the tip of the day. First armed at 6 720, then
@@ -540,8 +541,8 @@ pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = None;
 pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(4800);
 
 /// **Private builds only** (`rehearsal-v1-6`): v1.6 armed at
-/// [`REHEARSAL_V1_6_ACTIVATION`]. The public network's constant above stays
-/// `None`.
+/// [`REHEARSAL_V1_6_ACTIVATION`]. The public network's constant above is not
+/// affected by it.
 #[cfg(feature = "rehearsal-v1-6")]
 pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_6_ACTIVATION);
 
@@ -2726,7 +2727,8 @@ mod v1_6_crossing_pin_tests {
     /// A private build: its private chain is not the test network.
     #[cfg(feature = "rehearsal-v1-6")]
     const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
-    /// The public network: v1.6 is not armed there.
+    /// The public network: not crossed yet; its pins come with the release
+    /// that follows its crossing.
     #[cfg(not(feature = "testnet"))]
     const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
 
