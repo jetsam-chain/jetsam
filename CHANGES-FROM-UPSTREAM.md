@@ -5,7 +5,7 @@ v1.0.0, used under the Apache License 2.0. This file satisfies section 4(b) of
 that license: *"You must cause any modified files to carry prominent notices
 stating that You changed the files."*
 
-Upstream baseline: commit `ffbb5ef` in this repository is the unmodified
+Upstream baseline: commit `6a836a5` in this repository is the unmodified
 upstream tree. Every change below is visible as a diff against it.
 
 **Jetsam is an independent network.** It is not endorsed by, affiliated with, or

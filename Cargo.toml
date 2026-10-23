@@ -42,7 +42,12 @@ resolver = "2"
 # 1.5.1 keeps the v1.5 rules (armed at 38400) and pins blocks 38399 and 38400;
 # its fix is to synchronization: a branch the node refuses can no longer
 # capture its snapshot sync.
-version = "1.5.1"
+# 1.6.0-dev is the v1.6 development line (test network only, never released
+# as such): the v1.5.1 rules and synchronization, plus the v1.6 relation,
+# dormant on both profiles. A pre-release so that no build of this line can
+# report the version of a release, nor of the 1.6.0 that will carry an armed
+# v1.6 height; the release that ships it sets 1.6.0.
+version = "1.6.0-dev"
 edition = "2021"
 license = "Apache-2.0"
 
