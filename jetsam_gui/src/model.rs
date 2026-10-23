@@ -291,6 +291,56 @@ pub struct MinedBlocksSnapshot {
     pub total: usize,
     pub total_pages: u32,
     pub blocks: Vec<MinedBlockSnapshot>,
+    /// Over every block of the wallet, not only this page.
+    pub totals: MinedTotals,
+}
+
+/// Rewards of this wallet's blocks, from `walletHistory`. A coinbase whose
+/// block is canonical is earned; one whose block lost its height in a
+/// reorganization (`canonical: false`) is orphaned and paid nothing. A reward
+/// the node gave no status for (an older node) is in neither total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MinedTotals {
+    pub mined_blocks: u64,
+    pub earned_micro_jtm: u64,
+    pub orphaned_blocks: u64,
+    pub orphaned_micro_jtm: u64,
+}
+
+impl MinedTotals {
+    /// `(canonical, reward)` of each coinbase in the wallet's history.
+    pub fn from_coinbases(coinbases: impl IntoIterator<Item = (Option<bool>, u64)>) -> Self {
+        let mut totals = Self::default();
+        for (canonical, reward) in coinbases {
+            match canonical {
+                Some(true) => {
+                    totals.mined_blocks += 1;
+                    totals.earned_micro_jtm = totals.earned_micro_jtm.saturating_add(reward);
+                }
+                Some(false) => {
+                    totals.orphaned_blocks += 1;
+                    totals.orphaned_micro_jtm = totals.orphaned_micro_jtm.saturating_add(reward);
+                }
+                None => {}
+            }
+        }
+        totals
+    }
+
+    /// The line beside the MINED BLOCKS title.
+    pub fn summary(&self) -> String {
+        let mut line = format!(
+            "EARNED {} \u{2460}",
+            format_micro_jtm(self.earned_micro_jtm)
+        );
+        if self.mined_blocks > 0 {
+            line.push_str(&format!(" · {} MINED (CANONICAL)", self.mined_blocks));
+        }
+        if self.orphaned_blocks > 0 {
+            line.push_str(&format!(" · {} ORPHANED · NO REWARD", self.orphaned_blocks));
+        }
+        line
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +424,7 @@ impl MinedBlocksSnapshot {
             total: 0,
             total_pages: 0,
             blocks: Vec::new(),
+            totals: MinedTotals::default(),
         }
     }
 }
@@ -391,6 +442,14 @@ pub struct MinedBlockSnapshot {
 }
 
 impl MinedBlockSnapshot {
+    pub fn status_label(&self) -> &'static str {
+        if self.canonical {
+            "MINED (CANONICAL)"
+        } else {
+            "ORPHANED · NO REWARD"
+        }
+    }
+
     pub fn reward(&self) -> String {
         format_micro_jtm(self.reward_micro_jtm)
     }
@@ -840,28 +899,32 @@ fn preview_mined_blocks(page: u32) -> MinedBlocksSnapshot {
     let page = page.clamp(1, total_pages);
     let offset = (page - 1) * MINED_BLOCK_PAGE_SIZE;
     let count = MINED_BLOCK_PAGE_SIZE.min(TOTAL as u32 - offset);
-    let blocks = (0..count)
-        .map(|row| {
-            let index = offset + row;
-            let height = 18_420 - u64::from(index);
-            let confirmations = u64::from(index) + 1;
-            MinedBlockSnapshot {
-                height,
-                block_hash: format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height)),
-                timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
-                reward_micro_jtm: 50_000_000,
-                payout_key_index: 0,
-                canonical: true,
-                confirmations,
-                full_block_available: confirmations <= 18,
-            }
-        })
-        .collect();
+    // Two of the preview's blocks lost their height, to show both statuses.
+    let block = |index: u32| {
+        let height = 18_420 - u64::from(index);
+        let canonical = !matches!(index, 2 | 3);
+        let confirmations = if canonical { u64::from(index) + 1 } else { 0 };
+        MinedBlockSnapshot {
+            height,
+            block_hash: format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height)),
+            timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
+            reward_micro_jtm: 50_000_000,
+            payout_key_index: 0,
+            canonical,
+            confirmations,
+            full_block_available: canonical && confirmations <= 18,
+        }
+    };
+    let totals = MinedTotals::from_coinbases((0..TOTAL as u32).map(|index| {
+        let block = block(index);
+        (Some(block.canonical), block.reward_micro_jtm)
+    }));
     MinedBlocksSnapshot {
         page,
         total: TOTAL,
         total_pages,
-        blocks,
+        blocks: (0..count).map(|row| block(offset + row)).collect(),
+        totals,
     }
 }
 
@@ -1246,5 +1309,69 @@ mod tests {
             .addresses
             .iter()
             .all(|address| address.address.chars().count() == width));
+    }
+    /// The Mining view's totals come from `walletHistory`: only the rewards of
+    /// canonical blocks are earned; an orphan is counted apart, and a reward
+    /// the node gave no status for is in neither.
+    #[test]
+    fn mined_totals_earn_only_canonical_blocks() {
+        use super::MinedTotals;
+        let totals = MinedTotals::from_coinbases([
+            (Some(false), 60_010_000),
+            (Some(false), 60_010_000),
+            (Some(false), 60_010_000),
+            (Some(true), 60_010_000),
+            (None, 60_010_000),
+        ]);
+        assert_eq!(
+            totals,
+            MinedTotals {
+                mined_blocks: 1,
+                earned_micro_jtm: 60_010_000,
+                orphaned_blocks: 3,
+                orphaned_micro_jtm: 180_030_000,
+            }
+        );
+        assert_eq!(
+            totals.summary(),
+            "EARNED 60.010000 \u{2460} · 1 MINED (CANONICAL) · 3 ORPHANED · NO REWARD"
+        );
+        assert_eq!(MinedTotals::default().summary(), "EARNED 0.000000 \u{2460}");
+    }
+
+    /// A reorganization flips the same block between the two statuses; the
+    /// totals and the row label follow the node's `canonical` on every read.
+    #[test]
+    fn a_reorganization_moves_a_block_between_mined_and_orphaned() {
+        use super::{MinedBlockSnapshot, MinedTotals};
+        let block = |canonical| MinedBlockSnapshot {
+            height: 29_344,
+            block_hash: "ab".repeat(32),
+            timestamp: 0,
+            reward_micro_jtm: 60_010_000,
+            payout_key_index: 0,
+            canonical,
+            confirmations: if canonical { 3 } else { 0 },
+            full_block_available: canonical,
+        };
+        for canonical in [true, false, true] {
+            let totals = MinedTotals::from_coinbases([(Some(canonical), 60_010_000)]);
+            assert_eq!(
+                (totals.earned_micro_jtm, totals.orphaned_micro_jtm),
+                if canonical {
+                    (60_010_000, 0)
+                } else {
+                    (0, 60_010_000)
+                }
+            );
+            assert_eq!(
+                block(canonical).status_label(),
+                if canonical {
+                    "MINED (CANONICAL)"
+                } else {
+                    "ORPHANED · NO REWARD"
+                }
+            );
+        }
     }
 }

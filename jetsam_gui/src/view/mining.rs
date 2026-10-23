@@ -345,10 +345,10 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
         text(format!("[{}]", history.total))
             .size(13)
             .color(theme::MUTED),
+        text(history.totals.summary()).size(13).color(theme::ACCENT),
         iced::widget::Space::new().width(Length::Fill),
-        legend("FULL BLOCK", theme::ACCENT),
-        legend("HEADER", theme::DIM),
-        legend("ORPHANED", theme::WARNING),
+        legend("MINED (CANONICAL)", theme::ACCENT),
+        legend("ORPHANED · NO REWARD", theme::WARNING),
     ]
     .spacing(9)
     .align_y(Alignment::Center);
@@ -356,6 +356,7 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
     let header = container(
         row![
             table_cell("HEIGHT".into(), 2, theme::INK),
+            table_cell("STATUS".into(), 4, theme::INK),
             table_cell("FOUND".into(), 3, theme::INK),
             table_cell("REWARD".into(), 4, theme::INK),
             table_cell("PAYOUT".into(), 3, theme::INK),
@@ -446,8 +447,13 @@ fn mined_block_row<'a>(
     block: &'a MinedBlockSnapshot,
     alternate: bool,
 ) -> Element<'a, Message> {
+    let status_color = if block.canonical {
+        theme::ACCENT
+    } else {
+        theme::WARNING
+    };
     let available = if !block.canonical {
-        ("ORPHANED · NO REWARD".into(), theme::WARNING)
+        ("—".into(), theme::DIM)
     } else if block.full_block_available {
         (
             format!("FULL · {} conf", block.confirmations),
@@ -483,6 +489,7 @@ fn mined_block_row<'a>(
     container(
         row![
             table_cell(block.height.to_string(), 2, identity_color),
+            table_cell(block.status_label().into(), 4, status_color),
             table_cell(format_age(block.timestamp), 3, theme::MUTED),
             table_cell(reward, 4, theme::TEXT),
             table_cell(

@@ -85,6 +85,7 @@ owner string.
 |---|---|---|
 | `getMiningInfo` | `[]` | `MiningInfo` |
 | `getPeerCount` | `[]` | Connected-peer count |
+| `getPeerVersions` | `[]` | `PeerVersionsInfo`: the version each identified peer announced |
 | `getNodeStatus` | `[]` | `NodeStatus` |
 | `estimateFee` | `[n_outputs: u32]` | Accepted minimum in μJTM, assuming one input |
 | `estimateFeeDetailed` | `[n_inputs: u32, n_outputs: u32]` | `FeeEstimate` |
@@ -396,6 +397,31 @@ NodeStatus {
 work (from block 24,846 on the public network). It is omitted when `false`, so
 a client written for an earlier node reads it as `false`. Read the field; do
 not derive it from the height.
+
+```text
+PeerVersionsInfo {
+  local_agent_version: string      // e.g. "jetsam/1.6.0 (v1.6=dormant)"
+  now_unix: u64                    // this node's clock, reference for the times below
+  peers: [{
+    peer_id: string | null         // null unless loopback or bearer-authenticated
+    agent_version: string          // ≤ 64 printable ASCII characters, "unknown" if empty
+    connected: bool
+    profile_verified: bool         // network profile verified: the peer is on this chain
+    first_seen_unix: u64
+    last_seen_unix: u64
+  }]                               // at most 1,024 peers, connected ones kept first
+}
+```
+
+`getPeerVersions` measures how much of the network runs a release before a
+hardfork (`jetsam-cli adoption`). Each node announces
+`jetsam/<release> (v1.6=<height>|dormant)` through libp2p Identify, outside the
+network profile: the wire version does not change. A release older than the
+announcement shows `rust-libp2p/<version>`. The value is whatever the peer
+sends: it is bounded and stripped of control characters when received, and the
+node takes no decision from it (admission, synchronization, peer choice and
+consensus never read it). Peer identities are given only to a loopback caller,
+or on an endpoint that requires the bearer.
 
 `isolated_mining` is status information from a node started in a special
 operator context. Public deployments should not use it as a remote control or

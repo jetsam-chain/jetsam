@@ -33,7 +33,7 @@ use crate::model::{
     BlockTransactionInputSnapshot, BlockTransactionOutputSnapshot, BlockTransactionSnapshot,
     ExplorerAddressSnapshot, ExplorerBlockSnapshot, ExplorerSearchResultSnapshot,
     ExplorerSlotSnapshot, ExplorerSnapshot, Language, LogLevel, MatrixClass, MinedBlockSnapshot,
-    MinedBlocksSnapshot, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot,
+    MinedBlocksSnapshot, MinedTotals, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot,
     ReceiptDetailSnapshot, ReceiptInputSnapshot, ReceiptOutputSnapshot, ReceiptSnapshot,
     ReceiptSummarySnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
     RecentTransactionSnapshot, RecentTransactionsSnapshot, RetainedBlockSnapshot, SegmentSnapshot,
@@ -794,6 +794,7 @@ impl Backend {
             balance,
             mut wallet_utxos,
             mined_blocks,
+            history,
         ) = tokio::try_join!(
             self.rpc::<ChainInfo>("getChainInfo", json!([])),
             self.rpc::<StateInfo>("getStateInfo", json!([])),
@@ -810,6 +811,7 @@ impl Backend {
                 "walletMinedBlocks",
                 json!([mining_page.max(1), MINED_BLOCK_PAGE_SIZE]),
             ),
+            self.rpc::<Vec<RpcHistoryEntry>>("walletHistory", json!([])),
         )?;
         sort_wallet_utxos_newest_first(&mut wallet_utxos);
         let circulating_supply_micro_jtm = chain
@@ -1010,6 +1012,12 @@ impl Backend {
                 page: mined_blocks.page,
                 total: mined_blocks.total,
                 total_pages: mined_blocks.total_pages,
+                totals: MinedTotals::from_coinbases(
+                    history
+                        .iter()
+                        .filter(|entry| entry.is_coinbase)
+                        .map(|entry| (entry.canonical, entry.amount_micro_jtm)),
+                ),
                 blocks: mined_blocks
                     .blocks
                     .into_iter()
@@ -2254,6 +2262,17 @@ struct WalletUtxoInfo {
     confirmed_height: u64,
     #[serde(default)]
     reserved: bool,
+}
+
+/// The fields of a `walletHistory` entry the Mining view totals. `canonical`
+/// is present on coinbases only, and absent from nodes older than v1.5.0.
+#[derive(Debug, Clone, Deserialize)]
+struct RpcHistoryEntry {
+    #[serde(default)]
+    is_coinbase: bool,
+    amount_micro_jtm: u64,
+    #[serde(default)]
+    canonical: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
