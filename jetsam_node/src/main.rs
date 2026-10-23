@@ -11227,6 +11227,9 @@ async fn handle_p2p_events(
         peer_chain_evidence::PeerChainEvidence::<HeldSnapshotManifest>::default();
     // The verdicts outlive a restart (data directory).
     let peer_verdicts_path = snapshot_staging_root.with_file_name("peer-verdicts");
+    // The verdicts last handed to the P2P layer, which keeps
+    // those peers out of its neighbour slots and seed replacement.
+    let mut refused_branch_peers_sent = std::collections::HashSet::new();
     match peer_chain_evidence.load_verdicts(
         &peer_verdicts_path,
         Instant::now(),
@@ -17615,6 +17618,16 @@ async fn handle_p2p_events(
                 ) {
                     tracing::warn!(%error, "divergence verdicts could not be saved");
                 }
+            }
+            let refused_branch_peers = peer_chain_evidence.divergent_peers(now);
+            if refused_branch_peers != refused_branch_peers_sent
+                && p2p_cmd
+                    .try_send(jetsam_p2p::NetworkCommand::RefusedBranchPeers {
+                        peers: refused_branch_peers.iter().copied().collect(),
+                    })
+                    .is_ok()
+            {
+                refused_branch_peers_sent = refused_branch_peers;
             }
             if let Some(summary) = branch_warnings.summary_due(now) {
                 for (peer, motif, repeats) in summary {
