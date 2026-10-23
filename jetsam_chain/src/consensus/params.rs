@@ -922,9 +922,35 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
     ),
 ];
 
-/// The test chain was reset on 2026-10-07 (walked from block 6): no pin until
-/// the new chain has crossed its own blocks.
-#[cfg(feature = "testnet")]
+/// The test chain was reset on 2026-10-07 (walked from block 6). It crossed
+/// v1.6 at 4 800 on 2026-10-21: 4 799 and 4 800 read
+/// back on 2026-10-22 (`jetsam_getBlockHash` and `jetsam_getHeaderByHeight`)
+/// from the seed, the public RPC and four test nodes, identical everywhere;
+/// each is the `prev_block_hash` of the next one. The nodes left on the v1.5
+/// release hold another 4 800, refused here by its id.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
+    (
+        4799,
+        [
+            0xa7, 0x2a, 0x4b, 0x45, 0x41, 0xf4, 0x8c, 0x10, 0x2e, 0xde, 0x08, 0xe0, 0x13, 0x40,
+            0x94, 0x75, 0x3b, 0xbb, 0x08, 0x09, 0x94, 0xd4, 0x7a, 0xf4, 0x69, 0x04, 0x97, 0x6f,
+            0x5e, 0x19, 0xc6, 0xbe,
+        ],
+    ),
+    (
+        4800,
+        [
+            0x4d, 0xb8, 0x93, 0x58, 0x83, 0xfa, 0x2a, 0xd0, 0x67, 0x69, 0x4d, 0x45, 0x71, 0xc5,
+            0x14, 0xaf, 0x55, 0xe2, 0xcb, 0x38, 0x28, 0x9f, 0xdc, 0x40, 0xbb, 0x33, 0x89, 0x29,
+            0x32, 0x22, 0xa0, 0x7b,
+        ],
+    ),
+];
+
+/// **Private builds only** (`rehearsal-v1-6`): a private build starts a
+/// new private chain, so it carries no pin.
+#[cfg(feature = "rehearsal-v1-6")]
 pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
 
 /// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
@@ -985,14 +1011,21 @@ pub(crate) mod hard_checkpoint_tests {
         assert_eq!(hard_checkpoint_in(&[], 750), None);
     }
 
-    /// The block worth pinning is the activation block — the one whose absence
-    /// the work comparison cannot see. A pin typed one block off would still
-    /// build, still pass every other test, and protect nothing.
-    /// The test chain was reset on 2026-10-07: no pin until it has crossed its
-    /// own activation block, which is then the one to pin.
-    #[cfg(feature = "testnet")]
+    /// The test chain was reset on 2026-10-07 and crossed v1.6 at 4 800 on
+    /// 2026-10-21: it pins `V1_6 − 1` and `V1_6`, nothing else.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
     #[test]
-    fn the_reset_test_chain_carries_no_pin_yet() {
+    fn the_test_chain_pins_the_block_before_its_v1_6_height_and_its_v1_6_block() {
+        let k = V1_6_ACTIVATION_HEIGHT.expect("v1.6 is armed on the test chain");
+        let heights: Vec<u64> = HARD_CHECKPOINTS.iter().map(|(height, _)| *height).collect();
+        assert_eq!(heights, [k - 1, k]);
+    }
+
+    /// A private build (`rehearsal-v1-6`) starts a new private chain:
+    /// it carries no pin.
+    #[cfg(feature = "rehearsal-v1-6")]
+    #[test]
+    fn a_private_build_carries_no_pin() {
         assert!(HARD_CHECKPOINTS.is_empty());
     }
 
@@ -2681,9 +2714,17 @@ mod v1_6_crossing_pin_tests {
     use crate::consensus::difficulty::{expected_target_in, DifficultySchedule};
 
     /// The raw headers `V1_6 − 1`, `V1_6`, `V1_6 + 1` (`jetsam_getHeaderByHeight`)
-    /// the test network's seeds serve after its v1.6 crossing. `None` until
-    /// then: the release that follows sets them AND pins `V1_6 − 1` and `V1_6`.
-    #[cfg(feature = "testnet")]
+    /// the test network serves after its v1.6 crossing (block 4 800,
+    /// 2026-10-21): read back on 2026-10-22 from the seed, the public RPC and
+    /// four test nodes, the same bytes everywhere.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = Some([
+        "89bfaee6c689c0ae4ae81f4008920f545e98e2904f67ffa1c4807faf6441036db3f0e6ff3fea3f35f9427b5bf66d407a6d7a19e7ce159ce36cd46fa9d814323c6e4afea807e2f302de9aa4b91dd630fd02ce437e4bc4e4ab2c37eaf90f770a78ec01d86a00000000bf12000000000000373ff7d3ed3a2f9b3cb699b2adaf48f503cb649aa568225bf4153be78307a980a09d0f0259dcf2f1000000000000000020c5e530e52024431ad3e75a6fc42f06dad48e8ccf9971bdee76f222c40f0000180000006b12000000000000e212000000000000",
+        "a72a4b4541f48c102ede08e0134094753bbb080994d47af46904976f5e19c6be8a4daa5c3e30687bd4399b5b959fb8ec5403bc3b9f1d56aa0c70f2508bc87fe8e48b6df440370df31ec1e5a9efe184178d9c9afa65922624dbf59d7cb4b79c6f8103d86a00000000c01200000000000077f42d6aa829ff5ff48b885ffdb47b7f00f77882898de7be9edf5698e583d74e14d9778612562a9000000000000000007d16b7aae1ab927d5cf35681947b7d6b9368f5649c45c42932659fc7490f0000180000005a12000000000000e812000000000000",
+        "4db8935883fa2ad067694d4571c514af55e2cb38289fdc40bb3389293222a07b827e89110ea2192799d6a40b7abd1ee367b4b25515c033b1e5dc1471a909f0b62f0d0fea6f5ca1bcd2a8846dff7b7cf27db5e622c810fa3efa00bd923ca74e3f4b04d86a00000000c11200000000000077f42d6aa829ff5ff48b885ffdb47b7f00f77882898de7be9edf5698e583d74e7f09e72ccccf612e0000000000000000ea0476fc4815f5e267aaf1a942ca42c94457ff981cffa9a6d636d93d6f100000180000004712000000000000ec12000000000000",
+    ]);
+    /// A private build: its private chain is not the test network.
+    #[cfg(feature = "rehearsal-v1-6")]
     const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
     /// The public network: v1.6 is not armed there.
     #[cfg(not(feature = "testnet"))]
@@ -2761,6 +2802,28 @@ mod v1_6_crossing_pin_tests {
             ),
             (None, raw) => assert!(raw.is_none(), "crossing headers without a v1.6 height"),
         }
+    }
+
+    /// The test chain's nodes left on the v1.5 release mined their own 4 800'
+    /// on the same 4 799 (raw header served by two of them, 2026-10-22): the
+    /// real pin list refuses it, and passes ours.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+    #[test]
+    fn the_test_chain_pins_refuse_the_old_branch_block_at_the_v1_6_height() {
+        use crate::consensus::header::check_hard_checkpoint;
+        use crate::consensus::ConsensusError::CheckpointMismatch;
+        let raw = V1_6_CROSSING_HEADERS.expect("the test chain has crossed v1.6");
+        let (before, ours) = (header(raw[0]), header(raw[1]));
+        let theirs = header("a72a4b4541f48c102ede08e0134094753bbb080994d47af46904976f5e19c6be402eb4d9e007c44fe5692dc6c693a79b38b9af2e94e630e4a1d2f0306697d991c5ddc59bfe686d08b082ecb1f865e3976f96e67df1f9d7d050b54e12ed46e53ae002d86a00000000c01200000000000087555e7c01546eb4a7fa203e1ae3e913bbc2afbbcbd3f4f18ca1c1917d29a4aaad693a9812562a9000000000000000007d16b7aae1ab927d5cf35681947b7d6b9368f5649c45c42932659fc7490f0000180000006e12000000000000e512000000000000");
+        assert_eq!(theirs.height, ours.height);
+        assert_eq!(theirs.prev_block_hash, block_id(&before), "the same parent");
+        assert_ne!(block_id(&theirs), block_id(&ours));
+        assert_eq!(
+            check_hard_checkpoint(&theirs, HARD_CHECKPOINTS),
+            Err(CheckpointMismatch)
+        );
+        assert_eq!(check_hard_checkpoint(&ours, HARD_CHECKPOINTS), Ok(()));
+        assert_eq!(check_hard_checkpoint(&before, HARD_CHECKPOINTS), Ok(()));
     }
 
     /// The same check over a private test chain's real crossing
