@@ -413,10 +413,14 @@ fn check_registration_paid(
         .iter()
         .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
         .collect();
-    jetsam_chain::consensus::client_objects::check_registration_payment(
+    // The height of the block that will carry it is unknown here: a form-Z
+    // entry is relayed on a build whose v1.6 clock is armed, and the
+    // node and the block judge it at their height.
+    jetsam_chain::consensus::client_objects::check_registration_payment_relayable(
         &pages,
         registration,
         rules,
+        &jetsam_chain::consensus::client_objects::ClientBatchRules::current(),
     )
     .map_err(ClientTransportError::RegistrationRefused)
 }
@@ -740,6 +744,9 @@ impl<P: Ord + Clone> ClientProofFetcher<P> {
         self.in_flight.get(peer).copied().unwrap_or(0)
     }
 }
+
+mod batch;
+pub use batch::*;
 
 #[cfg(test)]
 mod tests;

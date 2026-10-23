@@ -30,6 +30,7 @@ pub mod object_protocol;
 mod outbound_budget;
 mod peer_diversity;
 pub mod peer_store;
+pub mod peer_versions;
 pub mod protocol;
 mod resource_profile;
 pub mod state_manifest_codec;

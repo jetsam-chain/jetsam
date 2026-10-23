@@ -6,7 +6,7 @@
 
 use super::*;
 use jetsam_chain::consensus::client_objects::{
-    matrix_file_root, ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
+    matrix_file_root, CatalogueEntry, ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
 };
 use jetsam_ivc_core::challenger::FsLaneChallenger;
 use jetsam_ivc_core::field::F128;
@@ -141,16 +141,22 @@ fn rules() -> ClientObjectRules {
     }
 }
 
-/// The client catalogue of these tests: the `D` of every test client
-/// (seeds `0xC0..=0xCF`).
-fn test_catalogue() -> &'static [Hash32] {
-    static CATALOGUE: std::sync::OnceLock<Vec<Hash32>> = std::sync::OnceLock::new();
+/// The client catalogue of these tests: every test client (seeds
+/// `0xC0..=0xCF`), its `D` pinned to its matrix file (`TestClient::file`).
+fn test_catalogue() -> &'static [CatalogueEntry] {
+    static CATALOGUE: std::sync::OnceLock<Vec<CatalogueEntry>> = std::sync::OnceLock::new();
     CATALOGUE.get_or_init(|| {
         (0xC0..=0xCF)
             .map(|seed| {
                 let (matrix, _): (FieldR1cs, Vec<F128>) =
                     synthetic_satisfiable(CLIENT_M, CLIENT_M, seed);
-                matrix.structural_statement_digest()
+                let mut file = Vec::new();
+                matrix.write_artifact(&mut file).unwrap();
+                CatalogueEntry {
+                    matrix_digest: matrix.structural_statement_digest(),
+                    matrix_file_root: matrix_file_root(&file),
+                    matrix_file_len: file.len() as u32,
+                }
             })
             .collect()
     })
@@ -298,7 +304,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
     for (order, lie_on) in [([liar, honest], "manifest"), ([honest, liar], "chunk")] {
         let directory = tempfile::tempdir().unwrap();
         let objects = open(directory.path(), &form);
-        objects.want_matrices([client.file_id()]);
+        objects.want_matrices([client.digest()]);
         assert_eq!(objects.fetching_matrices(), vec![client.file_id()]);
         let now = Instant::now();
         let mut lies = Vec::new();
@@ -313,6 +319,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
                             ClientObjectRequest::MatrixManifest(_) => "manifest",
                             ClientObjectRequest::MatrixChunk { .. } => "chunk",
                             ClientObjectRequest::Proof(_) => "proof",
+                            ClientObjectRequest::Batch(_) => "batch",
                         });
                     }
                     ClientObjectFetched::MatrixAssembled(assembled) => {
@@ -323,7 +330,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
                         complete = true;
                     }
                     ClientObjectFetched::Nothing => {}
-                    ClientObjectFetched::Bundle(_) => unreachable!(),
+                    ClientObjectFetched::Bundle(_) | ClientObjectFetched::Batch(..) => unreachable!(),
                 }
             }
             if complete {
@@ -335,7 +342,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
         assert!(objects.holds_matrix(&client.digest()));
         assert!(objects.fetching_matrices().is_empty());
         // No request goes out for a held file.
-        objects.want_matrices([client.file_id()]);
+        objects.want_matrices([client.digest()]);
         assert!(objects.next_requests(&order, now).is_empty());
     }
 
@@ -343,7 +350,7 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
     // handed to it is the peer's lie, and that peer is not asked again.
     let directory = tempfile::tempdir().unwrap();
     let objects = open(directory.path(), &form);
-    objects.want_matrices([client.file_id()]);
+    objects.want_matrices([client.digest()]);
     let now = Instant::now();
     let [fetch] = objects.next_requests(&[liar], now).try_into().unwrap();
     assert!(matches!(fetch.request, ClientObjectRequest::MatrixManifest(_)));
@@ -364,7 +371,7 @@ fn answer_from_file(file: &[u8], request: &ClientObjectRequest) -> Vec<u8> {
             .nth(*index as usize)
             .unwrap()
             .to_vec(),
-        ClientObjectRequest::Proof(_) => unreachable!(),
+        ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
     }
 }
 
@@ -375,7 +382,7 @@ fn fetch_until_assembled(
     file: &[u8],
     peers: &[PeerId],
 ) -> AssembledMatrixFile {
-    objects.want_matrices([id]);
+    objects.want_matrices([id.matrix_digest]);
     let now = Instant::now();
     for _ in 0..16 {
         for fetch in objects.next_requests(peers, now) {
@@ -410,7 +417,7 @@ fn a_fetched_matrix_is_authenticated_off_the_event_loop() {
         objects.client_object(&ClientObjectRequest::MatrixManifest(id)),
         None
     );
-    objects.want_matrices([id]);
+    objects.want_matrices([id.matrix_digest]);
     assert!(
         objects.next_requests(&peers, Instant::now()).is_empty(),
         "not fetched again while it is authenticated"
@@ -439,11 +446,26 @@ fn an_assembled_file_is_held_only_as_its_registered_d() {
     let form = test_form();
     let client = TestClient::new(&form, 0xCC);
     let other = TestClient::new(&form, 0xCD);
-    // Registered with another client's `D`: its root and length are the file's.
+    // Pinned under another client's `D`: its root and length are the file's
+    // (a catalogue error the structural digest still catches).
     let mut false_d = client.file_id();
     false_d.matrix_digest = other.digest();
     let directory = tempfile::tempdir().unwrap();
-    let objects = open(directory.path(), &form);
+    let pin = |id: MatrixFileId| CatalogueEntry {
+        matrix_digest: id.matrix_digest,
+        matrix_file_root: id.file_root,
+        matrix_file_len: id.file_len,
+    };
+    let objects = ClientObjects::open(
+        directory.path(),
+        &form,
+        Arc::new(HistoryStepClientMatrixSet::new(&form)),
+        &ClientObjectRules {
+            catalogue: Box::leak(vec![pin(false_d), pin(client.file_id())].into_boxed_slice()),
+            ..rules()
+        },
+    )
+    .unwrap();
     let peers = [PeerId::random()];
     let assembled = fetch_until_assembled(&objects, false_d, &client.file, &peers);
     let error = objects.authenticate_assembled(assembled).unwrap_err();
@@ -460,7 +482,7 @@ fn an_assembled_file_is_held_only_as_its_registered_d() {
     let lost = assembled.id();
     drop(assembled);
     objects.forget_assembled(&lost);
-    objects.want_matrices([client.file_id()]);
+    objects.want_matrices([client.digest()]);
     assert_eq!(objects.fetching_matrices(), vec![client.file_id()]);
 }
 
@@ -496,7 +518,7 @@ fn held_matrix_files_are_authenticated_again_off_the_event_loop_after_a_restart(
         objects.client_object(&ClientObjectRequest::MatrixManifest(kept.file_id())),
         None
     );
-    objects.want_matrices([kept.file_id(), damaged.file_id()]);
+    objects.want_matrices([kept.digest(), damaged.digest()]);
     assert!(
         objects.fetching_matrices().is_empty(),
         "a file held on disk is not fetched while it waits"
@@ -507,7 +529,7 @@ fn held_matrix_files_are_authenticated_again_off_the_event_loop_after_a_restart(
     assert_eq!(objects.held_matrix_files(), vec![kept.file_id()]);
     assert!(!objects.holds_matrix(&damaged.digest()));
     assert!(!damaged_path.exists(), "a file that no longer authenticates is dropped");
-    objects.want_matrices([kept.file_id(), damaged.file_id()]);
+    objects.want_matrices([kept.digest(), damaged.digest()]);
     assert_eq!(objects.fetching_matrices(), vec![damaged.file_id()]);
 }
 
@@ -1010,7 +1032,7 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
 
     let directory = tempfile::tempdir().unwrap();
     let objects = open(directory.path(), form);
-    objects.want_matrices([*id]);
+    objects.want_matrices([id.matrix_digest]);
     let peers = [PeerId::random(), PeerId::random()];
     let now = Instant::now();
     let (mut manifests, mut chunks, mut assembled) = (0, 0, None);
@@ -1023,7 +1045,7 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
             match fetch.request {
                 ClientObjectRequest::MatrixManifest(_) => manifests += 1,
                 ClientObjectRequest::MatrixChunk { .. } => chunks += 1,
-                ClientObjectRequest::Proof(_) => unreachable!(),
+                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
             }
             let bytes = holder.client_object(&fetch.request).unwrap();
             // The codec's check, off the executor in the node.
@@ -1431,7 +1453,7 @@ fn a_matrix_fetch_is_logged_once_and_its_arrival_too() {
     let objects = open(directory.path(), &form);
     let ((), lines) = logged(|| {
         for _ in 0..3 {
-            objects.want_matrices([id]);
+            objects.want_matrices([id.matrix_digest]);
         }
     });
     the_line(&lines, "INFO", "fetching registered client matrix", &client.digest());
@@ -1461,11 +1483,11 @@ fn a_matrix_fetch_is_logged_once_and_its_arrival_too() {
 fn b3_a_matrix_outside_the_catalogue_is_never_fetched_kept_nor_reloaded() {
     let form = test_form();
     let rogue = TestClient::new(&form, 0x77);
-    assert!(!test_catalogue().contains(&rogue.digest()));
+    assert!(!rules().lists(&rogue.digest()));
     let directory = tempfile::tempdir().unwrap();
     let objects = open(directory.path(), &form);
     // A forged manifest's registry lists it: never fetched.
-    objects.want_matrices([rogue.file_id()]);
+    objects.want_matrices([rogue.digest()]);
     assert!(objects.fetching_matrices().is_empty(), "fetched outside the catalogue");
     assert!(objects
         .next_requests(&[PeerId::random()], Instant::now())
@@ -1501,63 +1523,41 @@ fn b3_a_matrix_outside_the_catalogue_is_never_fetched_kept_nor_reloaded() {
         .exists());
 }
 
-/// Review B3: a registry's worth of fetches at most, none of a length beyond
-/// the cap or of a null root, and a fetch nobody wants any more is dropped.
+/// A registry's worth of fetches at most, and a fetch nobody
+/// wants any more is dropped. A `D` names its catalogue file, so a
+/// file beyond the cap or of a null root can no longer even be asked for.
 #[test]
 fn b3_matrix_fetches_are_bounded_and_expire() {
     let form = test_form();
     let directory = tempfile::tempdir().unwrap();
     let objects = open(directory.path(), &form);
-    // 64 identities of catalogue digests (a forged registry may name any
-    // root): as many fetches as a registry holds.
-    let many: Vec<MatrixFileId> = test_catalogue()
+    // Every catalogue `D`, several times over (a forged registry may name
+    // any): as many fetches as a registry holds, each its catalogue file.
+    let many: Vec<Hash32> = test_catalogue()
         .iter()
-        .flat_map(|digest| {
-            (1u8..=4).map(move |root| MatrixFileId {
-                matrix_digest: *digest,
-                file_root: [root; 32],
-                file_len: 4_096,
-            })
-        })
+        .flat_map(|entry| [entry.matrix_digest; 4])
+        .chain((1u8..=16).map(|byte| [byte; 32]))
         .collect();
-    assert_eq!(many.len(), 64);
     objects.want_matrices(many.iter().copied());
+    let fetching = objects.fetching_matrices();
     assert_eq!(
-        objects.fetching_matrices().len(),
+        fetching.len(),
         jetsam_chain::consensus::client_objects::CLIENT_REGISTRY_CAPACITY
     );
-    // Beyond the cap of a registration, or a null root: never fetched.
-    let objects = open(tempfile::tempdir().unwrap().path(), &form);
-    let digest = test_catalogue()[0];
-    objects.want_matrices([
-        MatrixFileId {
-            matrix_digest: digest,
-            file_root: [0x11; 32],
-            file_len: u32::MAX,
-        },
-        MatrixFileId {
-            matrix_digest: digest,
-            file_root: [0u8; 32],
-            file_len: 4_096,
-        },
-    ]);
-    assert!(objects.fetching_matrices().is_empty());
+    assert!(fetching
+        .iter()
+        .all(|id| objects.pinned_file(&id.matrix_digest) == Some(*id)));
     // Wanted only while listed: a retired candidate's fetch is dropped.
-    let wanted = MatrixFileId {
-        matrix_digest: digest,
-        file_root: [0x12; 32],
-        file_len: 4_096,
-    };
-    let retired = MatrixFileId {
-        matrix_digest: test_catalogue()[1],
-        file_root: [0x13; 32],
-        file_len: 4_096,
-    };
-    objects.want_only_matrices(&[wanted, retired]);
+    let objects = open(tempfile::tempdir().unwrap().path(), &form);
+    let (wanted, retired) = (test_catalogue()[0], test_catalogue()[1]);
+    objects.want_only_matrices(&[wanted.matrix_digest, retired.matrix_digest]);
     assert_eq!(objects.fetching_matrices().len(), 2);
     assert!(objects.awaits_matrices());
-    objects.want_only_matrices(&[wanted]);
-    assert_eq!(objects.fetching_matrices(), vec![wanted]);
+    objects.want_only_matrices(&[wanted.matrix_digest]);
+    assert_eq!(
+        objects.fetching_matrices(),
+        vec![objects.pinned_file(&wanted.matrix_digest).unwrap()]
+    );
     objects.want_only_matrices(&[]);
     assert!(objects.fetching_matrices().is_empty());
     assert!(!objects.awaits_matrices());
@@ -1622,20 +1622,20 @@ fn b3_at_a_start_only_the_canonical_registrys_matrices_are_authenticated_again()
 fn r1_a_late_answer_to_a_dropped_fetch_never_excludes_the_honest_provider() {
     let form = test_form();
     let directory = tempfile::tempdir().unwrap();
-    let objects = open(directory.path(), &form);
-    // A file of several chunks under a catalogue `D` (assembled, not
-    // authenticated here: only the fetch is at stake).
+    // A file of several chunks, the one a catalogue pins for its `D`
+    // (assembled, not authenticated here: only the fetch is at stake).
     let file: Vec<u8> = (0..2 * CLIENT_MATRIX_CHUNK_BYTES + 17)
         .map(|index| (index * 31 % 251) as u8)
         .collect();
     let id = MatrixFileId {
-        matrix_digest: test_catalogue()[3],
+        matrix_digest: test_catalogue()[3].matrix_digest,
         file_root: matrix_file_root(&file),
         file_len: file.len() as u32,
     };
+    let objects = open_pinned(directory.path(), &form, id);
     let honest = PeerId::random();
     let now = Instant::now();
-    objects.want_matrices([id]);
+    objects.want_matrices([id.matrix_digest]);
     let [manifest] = objects
         .next_requests(&[honest], now)
         .try_into()
@@ -1649,7 +1649,7 @@ fn r1_a_late_answer_to_a_dropped_fetch_never_excludes_the_honest_provider() {
     // The candidate is retired (the fetch dropped), then a new candidate
     // wants the same file.
     objects.want_only_matrices(&[]);
-    objects.want_matrices([id]);
+    objects.want_matrices([id.matrix_digest]);
     // The honest provider's answers to the dropped fetch arrive now.
     for fetch in &late {
         let verdict = deliver(&objects, fetch, &answer_from_file(&file, &fetch.request));
@@ -1675,4 +1675,171 @@ fn r1_a_late_answer_to_a_dropped_fetch_never_excludes_the_honest_provider() {
         }
     }
     assert_eq!(assembled.expect("assembled from the honest provider").id(), id);
+}
+
+/// The files a forged registry named (16 catalogue `D`,
+/// roots nobody serves) held every fetch slot, and a file listed before them
+/// was starved. The order of `wanted` is the priority; and since a
+/// `D` names its catalogue file, so a forged registry of catalogue `D` only
+/// ever has the honest files fetched — the one of a `D` already being
+/// fetched keeps its fetch.
+#[test]
+fn fetch_a_file_listed_first_takes_its_fetch_slot_from_a_forged_one_listed_later() {
+    let form = test_form();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let honest = TestClient::new(&form, 0xC1);
+    objects.want_only_matrices(&[honest.digest()]);
+    assert_eq!(objects.fetching_matrices(), vec![honest.file_id()]);
+    let forged: Vec<Hash32> = test_catalogue()
+        .iter()
+        .map(|entry| entry.matrix_digest)
+        .filter(|digest| *digest != honest.digest())
+        .collect();
+    assert_eq!(forged.len(), MAX_MATRIX_FETCHES - 1);
+    // A forged candidate listed first, the honest `D` among its 16.
+    let wanted: Vec<Hash32> = forged
+        .iter()
+        .copied()
+        .chain([honest.digest(), honest.digest()])
+        .collect();
+    objects.want_only_matrices(&wanted);
+    let fetching = objects.fetching_matrices();
+    assert!(fetching.contains(&honest.file_id()));
+    assert_eq!(fetching.len(), MAX_MATRIX_FETCHES, "still bounded");
+    assert!(fetching
+        .iter()
+        .all(|id| objects.pinned_file(&id.matrix_digest) == Some(*id)));
+    // Listed first, the honest file keeps its slot when the rest overflows.
+    let overflow: Vec<Hash32> = std::iter::once(honest.digest())
+        .chain(forged.iter().copied())
+        .chain((1u8..=4).map(|byte| [byte; 32]))
+        .collect();
+    objects.want_only_matrices(&overflow);
+    assert!(objects.fetching_matrices().contains(&honest.file_id()));
+}
+
+/// A fetch of a decoy file whose `D` this node already holds
+/// counted as a matrix awaited. A `D` has one file now (its pin): once its
+/// matrix is held, nothing of it is fetched or awaited.
+#[test]
+fn fetch_a_fetch_of_a_matrix_already_held_through_another_file_is_not_awaited() {
+    let form = test_form();
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open(directory.path(), &form);
+    let client = TestClient::new(&form, 0xC2);
+    objects.want_only_matrices(&[client.digest()]);
+    assert_eq!(objects.fetching_matrices(), vec![client.file_id()]);
+    objects.insert_matrix_file(client.file_id(), &client.file).unwrap();
+    assert!(objects.holds_matrix(&client.digest()));
+    assert!(!objects.awaits_matrices());
+    assert!(!objects.note_matrices_needed());
+    objects.want_only_matrices(&[client.digest()]);
+    assert!(objects.fetching_matrices().is_empty());
+}
+
+// ---- The catalogue pins the file of every `D` ----
+
+/// A node whose catalogue pins exactly `id`.
+fn open_pinned(directory: &Path, form: &HistoryStepClientForm, id: MatrixFileId) -> ClientObjects {
+    let rules = ClientObjectRules {
+        catalogue: Box::leak(
+            vec![CatalogueEntry {
+                matrix_digest: id.matrix_digest,
+                matrix_file_root: id.file_root,
+                matrix_file_len: id.file_len,
+            }]
+            .into_boxed_slice(),
+        ),
+        ..rules()
+    };
+    ClientObjects::open(
+        directory,
+        form,
+        Arc::new(HistoryStepClientMatrixSet::new(form)),
+        &rules,
+    )
+    .unwrap()
+}
+
+/// A listed `D` is fetched as the file its catalogue entry pins,
+/// and no other file of it is ever kept or reloaded — handed in whole, or
+/// found on disk (moved aside, never deleted) — even one that decodes as the
+/// very matrix of `D`. A peer whose manifest is not the pinned file's is a
+/// liar, as for any file.
+#[test]
+fn pin_a_file_other_than_the_pin_is_never_fetched_kept_nor_reloaded() {
+    let form = test_form();
+    let client = TestClient::new(&form, 0xC4);
+    let pinned = client.file_id();
+    assert_eq!(rules().pinned_file(&client.digest()).map(|entry| entry.matrix_file_root), Some(pinned.file_root));
+    // Another file of the same `D`: the catalogue pins the client's own,
+    // this node is told another one (as if it were a decoy that happened to
+    // decode).
+    let other_file: Vec<u8> = client.file.iter().map(|byte| byte ^ 0x5A).collect();
+    let other = MatrixFileId {
+        matrix_digest: client.digest(),
+        file_root: matrix_file_root(&other_file),
+        file_len: other_file.len() as u32,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let objects = open_pinned(directory.path(), &form, other);
+    // Wanted by `D`: its pinned file is fetched, nothing else.
+    objects.want_matrices([client.digest()]);
+    assert_eq!(objects.fetching_matrices(), vec![other]);
+    // The client's own file, handed in whole: not the pin, refused.
+    assert!(objects.insert_matrix_file(pinned, &client.file).is_err());
+    assert!(!objects.holds_matrix(&client.digest()));
+    // A manifest that is not the pinned file's: the peer is a liar.
+    let peer = PeerId::random();
+    let [manifest] = objects
+        .next_requests(&[peer], Instant::now())
+        .try_into()
+        .expect("one manifest request");
+    assert_eq!(manifest.request, ClientObjectRequest::MatrixManifest(other));
+    assert!(matches!(
+        objects
+            .on_fetched(manifest.token, &MatrixFileId::manifest_of(&client.file))
+            .unwrap(),
+        ClientObjectFetched::Liar
+    ));
+    // Left on disk by an earlier release: set aside at the start.
+    drop(objects);
+    let name = matrix_file_name(&pinned);
+    std::fs::write(
+        directory.path().join("client-objects/matrices").join(&name),
+        &client.file,
+    )
+    .unwrap();
+    let reopened = ClientObjects::open(
+        directory.path(),
+        &form,
+        Arc::new(HistoryStepClientMatrixSet::new(&form)),
+        &ClientObjectRules {
+            catalogue: Box::leak(
+                vec![CatalogueEntry {
+                    matrix_digest: other.matrix_digest,
+                    matrix_file_root: other.file_root,
+                    matrix_file_len: other.file_len,
+                }]
+                .into_boxed_slice(),
+            ),
+            ..rules()
+        },
+    )
+    .unwrap();
+    assert!(!reopened.awaits_matrices(), "nothing to authenticate");
+    assert_eq!(reopened.authenticate_held_files(), 0);
+    assert!(!reopened.holds_matrix(&client.digest()));
+    assert_eq!(
+        std::fs::read(directory.path().join("client-objects").join(SET_ASIDE_DIR).join(&name))
+            .unwrap(),
+        client.file,
+        "moved aside, not deleted"
+    );
+    // Under the catalogue that pins it, the same file is held.
+    let held_dir = tempfile::tempdir().unwrap();
+    let objects = open(held_dir.path(), &form);
+    objects.insert_matrix_file(pinned, &client.file).unwrap();
+    assert!(objects.holds_matrix(&client.digest()));
 }

@@ -294,6 +294,7 @@ fn classify(event: &NetworkEvent) -> EventClass {
         | NetworkEvent::MempoolSyncResponse { .. }
         | NetworkEvent::ClientProofAnnounced { .. }
         | NetworkEvent::ClientRegistrationRelayed { .. }
+        | NetworkEvent::ClientBatchAnnounced { .. }
         | NetworkEvent::ClientObjectFetched { .. }
         | NetworkEvent::ClientObjectFetchFailed { .. } => EventClass::Background,
     }

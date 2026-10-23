@@ -256,6 +256,35 @@ enum Command {
     /// Number of connected peers.
     Peers,
 
+    /// Adoption of a release: the versions this node's peers announce.
+    ///
+    /// Counts the peers whose network profile was verified (on this chain),
+    /// connected now and seen within --window seconds, by announced version,
+    /// and the share running --target (by default, what the asked node
+    /// itself announces). Answers of several nodes (--node, --answer) are
+    /// merged by peer identity, given to a loopback or bearer RPC only. A
+    /// version is what a peer claims; a release older than the announcement
+    /// shows `rust-libp2p/<version>`. Hashrate is not measured here.
+    Adoption {
+        /// Release (`1.6.0`) or exact announcement
+        /// (`jetsam/1.6.0 (v1.6=4800)`) to count.
+        #[arg(long, value_name = "RELEASE")]
+        target: Option<String>,
+        /// A departed peer still counts if seen within this many seconds.
+        #[arg(long, value_name = "SECONDS", default_value_t = 3_600)]
+        window: u64,
+        /// Another node's RPC endpoint to ask as well (repeatable).
+        #[arg(long = "node", value_name = "URL")]
+        nodes: Vec<String>,
+        /// A saved `getPeerVersions` answer (bare or JSON-RPC envelope) to
+        /// merge (repeatable).
+        #[arg(long = "answer", value_name = "FILE")]
+        answers: Vec<std::path::PathBuf>,
+        /// Do not ask the --rpc node; use --node and --answer only.
+        #[arg(long)]
+        offline: bool,
+    },
+
     /// Estimate minimum relay fee for live inputs/outputs.
     #[command(name = "estimate-fee")]
     EstimateFee {
@@ -471,6 +500,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::State => cmd_state(&ctx).await,
         Command::Mining => cmd_mining(&ctx).await,
         Command::Peers => cmd_peers(&ctx).await,
+        Command::Adoption {
+            target,
+            window,
+            nodes,
+            answers,
+            offline,
+        } => cmd_adoption(&ctx, target.as_deref(), *window, nodes, answers, *offline).await,
         Command::EstimateFee { n_outputs, inputs } => {
             cmd_estimate_fee(&ctx, *inputs, *n_outputs).await
         }
@@ -1060,6 +1096,281 @@ async fn cmd_peers(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let n = result.as_u64().unwrap_or(0);
     section("Connected peers");
     kv("Count", &n.to_string());
+    Ok(())
+}
+
+/// One peer in the merged adoption view.
+#[derive(Debug, Clone)]
+struct AdoptionPeer {
+    /// `None` when the answering endpoint withheld identities: such a peer
+    /// is counted, but cannot be recognised in another node's answer.
+    peer_id: Option<String>,
+    /// The freshest announcement among the answers that saw it.
+    agent: String,
+    /// Connected to at least one asked node.
+    connected: bool,
+    /// Its network profile was verified by at least one asked node.
+    verified: bool,
+    /// Seconds since the freshest sighting, on the clock of the node that
+    /// made it.
+    age_secs: u64,
+}
+
+/// Merge `getPeerVersions` answers by peer identity. A malformed answer is
+/// an error, never a count.
+fn merge_adoption_answers(answers: &[Value]) -> anyhow::Result<Vec<AdoptionPeer>> {
+    let mut merged: Vec<AdoptionPeer> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (index, answer) in answers.iter().enumerate() {
+        let answer = answer.get("result").unwrap_or(answer);
+        let now = answer["now_unix"]
+            .as_u64()
+            .with_context(|| format!("answer {}: no now_unix", index + 1))?;
+        let peers = answer["peers"]
+            .as_array()
+            .with_context(|| format!("answer {}: peers is not a list", index + 1))?;
+        for peer in peers {
+            let field = |name: &str| {
+                anyhow::anyhow!("answer {}: a peer has no valid {name}", index + 1)
+            };
+            let peer_id = match &peer["peer_id"] {
+                Value::Null => None,
+                Value::String(id) => Some(id.clone()),
+                _ => return Err(field("peer_id")),
+            };
+            let agent = jetsam_p2p::peer_versions::sanitize_agent_version(
+                peer["agent_version"]
+                    .as_str()
+                    .ok_or_else(|| field("agent_version"))?,
+            );
+            let connected = peer["connected"]
+                .as_bool()
+                .ok_or_else(|| field("connected"))?;
+            let verified = peer["profile_verified"]
+                .as_bool()
+                .ok_or_else(|| field("profile_verified"))?;
+            let last_seen = peer["last_seen_unix"]
+                .as_u64()
+                .ok_or_else(|| field("last_seen_unix"))?;
+            let sighting = AdoptionPeer {
+                peer_id: peer_id.clone(),
+                agent,
+                connected,
+                verified,
+                age_secs: now.saturating_sub(last_seen),
+            };
+            let Some(id) = peer_id else {
+                merged.push(sighting);
+                continue;
+            };
+            match by_id.get(&id) {
+                Some(&slot) => {
+                    let known = &mut merged[slot];
+                    known.connected |= sighting.connected;
+                    known.verified |= sighting.verified;
+                    if sighting.age_secs < known.age_secs {
+                        known.age_secs = sighting.age_secs;
+                        known.agent = sighting.agent;
+                    }
+                }
+                None => {
+                    by_id.insert(id, merged.len());
+                    merged.push(sighting);
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Whether an announcement is `target`: a release (`1.6.0`, matching
+/// `jetsam/1.6.0 …` exactly, not `1.6.0-dev`) or an exact announcement,
+/// whole or up to a space.
+fn agent_matches(agent: &str, target: &str) -> bool {
+    if target.contains('/') {
+        return agent == target
+            || agent
+                .strip_prefix(target)
+                .is_some_and(|rest| rest.starts_with(' '));
+    }
+    agent
+        .strip_prefix("jetsam/")
+        .and_then(|rest| rest.split(' ').next())
+        .is_some_and(|release| release == target)
+}
+
+#[derive(Debug, Default)]
+struct AdoptionRow {
+    agent: String,
+    connected: usize,
+    recent: usize,
+}
+
+#[derive(Debug, Default)]
+struct AdoptionReport {
+    /// Verified peers connected now, and those of them on the target.
+    connected: usize,
+    target_connected: usize,
+    /// Verified peers connected now or seen within the window.
+    recent: usize,
+    target_recent: usize,
+    /// Peers whose profile no asked node verified: not counted above.
+    unverified: usize,
+    /// Peers without an identity: one seen by two nodes counts twice.
+    unmerged: usize,
+    rows: Vec<AdoptionRow>,
+}
+
+fn adoption_report(
+    peers: &[AdoptionPeer],
+    target: Option<&str>,
+    window_secs: u64,
+) -> AdoptionReport {
+    let mut report = AdoptionReport::default();
+    let mut rows: std::collections::BTreeMap<&str, AdoptionRow> = Default::default();
+    for peer in peers {
+        if peer.peer_id.is_none() {
+            report.unmerged += 1;
+        }
+        if !peer.verified {
+            report.unverified += 1;
+            continue;
+        }
+        let recent = peer.connected || peer.age_secs <= window_secs;
+        if !recent {
+            continue;
+        }
+        let on_target = target.is_some_and(|target| agent_matches(&peer.agent, target));
+        let row = rows.entry(&peer.agent).or_insert_with(|| AdoptionRow {
+            agent: peer.agent.clone(),
+            ..AdoptionRow::default()
+        });
+        row.recent += 1;
+        report.recent += 1;
+        report.target_recent += usize::from(on_target);
+        if peer.connected {
+            row.connected += 1;
+            report.connected += 1;
+            report.target_connected += usize::from(on_target);
+        }
+    }
+    report.rows = rows.into_values().collect();
+    report.rows.sort_by(|a, b| {
+        (b.recent, b.connected, &a.agent).cmp(&(a.recent, a.connected, &b.agent))
+    });
+    report
+}
+
+fn share(part: usize, whole: usize) -> String {
+    if whole == 0 {
+        format!("{part} / 0")
+    } else {
+        format!("{part} / {whole}  ({:.1} %)", 100.0 * part as f64 / whole as f64)
+    }
+}
+
+async fn cmd_adoption(
+    ctx: &Ctx<'_>,
+    target: Option<&str>,
+    window: u64,
+    nodes: &[String],
+    answer_files: &[std::path::PathBuf],
+    offline: bool,
+) -> anyhow::Result<()> {
+    let mut endpoints: Vec<&str> = Vec::new();
+    if !offline {
+        endpoints.push(ctx.rpc);
+    }
+    endpoints.extend(nodes.iter().map(String::as_str));
+    let mut answers = Vec::new();
+    for endpoint in &endpoints {
+        let node = Ctx {
+            client: ctx.client,
+            rpc: endpoint,
+            json: ctx.json,
+        };
+        let answer = rpc(&node, "getPeerVersions", &[])
+            .await
+            .with_context(|| format!("getPeerVersions on {endpoint}"))?;
+        answers.push(answer);
+    }
+    for path in answer_files {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let answer: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", path.display()))?;
+        answers.push(answer);
+    }
+    anyhow::ensure!(
+        !answers.is_empty(),
+        "nothing to count: --offline needs --node or --answer"
+    );
+    let peers = merge_adoption_answers(&answers)?;
+    // By default, the share of peers running what the first node announces.
+    let target = match target {
+        Some(target) => Some(target.to_string()),
+        None => answers
+            .first()
+            .map(|answer| answer.get("result").unwrap_or(answer))
+            .and_then(|answer| answer["local_agent_version"].as_str())
+            .map(jetsam_p2p::peer_versions::sanitize_agent_version),
+    };
+    let report = adoption_report(&peers, target.as_deref(), window);
+
+    if ctx.json {
+        let rows: Vec<Value> = report
+            .rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "agent_version": row.agent,
+                    "connected": row.connected,
+                    "recent": row.recent,
+                })
+            })
+            .collect();
+        return print_json(&serde_json::json!({
+            "answers": answers.len(),
+            "target": target,
+            "window_secs": window,
+            "connected": report.connected,
+            "target_connected": report.target_connected,
+            "recent": report.recent,
+            "target_recent": report.target_recent,
+            "unverified": report.unverified,
+            "unmerged": report.unmerged,
+            "versions": rows,
+        }));
+    }
+
+    section("Adoption (announced versions)");
+    kv("Answers merged", &answers.len().to_string());
+    kv("Target", target.as_deref().unwrap_or("none"));
+    kv("Connected now", &share(report.target_connected, report.connected));
+    kv(
+        &format!("Seen in {window} s"),
+        &share(report.target_recent, report.recent),
+    );
+    kv(
+        "Unverified",
+        &format!("{} (profile never verified: not counted)", report.unverified),
+    );
+    println!();
+    println!("  {:<64} {:>9} {:>9}", "Version", "connected", "recent");
+    separator(84);
+    for row in &report.rows {
+        println!("  {:<64} {:>9} {:>9}", row.agent, row.connected, row.recent);
+    }
+    println!();
+    if report.unmerged > 0 && answers.len() > 1 {
+        warn_msg(&format!(
+            "{} peers came without an identity (public endpoint): one seen by two nodes is counted twice. Ask each node on loopback, or save its answer there and pass it with --answer.",
+            report.unmerged
+        ));
+    }
+    println!(
+        "  A version is what a peer claims, nothing more; a release older than the announcement shows rust-libp2p/<version>. Hashrate is not measured here."
+    );
     Ok(())
 }
 
@@ -1882,19 +2193,19 @@ async fn cmd_history(
         return Ok(());
     }
 
-    separator(88);
+    separator(100);
     if is_tty() {
         println!(
-            "  {}  {:<8}  {:<8}  {:>14}  {:<16}  {}{}",
+            "  {}  {:<8}  {:<20}  {:>14}  {:<16}  {}{}",
             BOLD, "block", "dir", TICKER, "own[idx]", "counterparty", RST
         );
     } else {
         println!(
-            "  {:<8}  {:<8}  {:>14}  {:<16}  {}",
+            "  {:<8}  {:<20}  {:>14}  {:<16}  {}",
             "block", "dir", TICKER, "own[idx]", "counterparty"
         );
     }
-    separator(88);
+    separator(100);
 
     let totals = tally_history(&filtered);
 
@@ -1916,7 +2227,7 @@ async fn cmd_history(
 
         if is_tty() {
             println!(
-                "  {:>8}  {:<8}  {}{}{}  {:<16}  {}",
+                "  {:>8}  {:<20}  {}{}{}  {:<16}  {}",
                 height,
                 arrow,
                 colour,
@@ -1927,13 +2238,13 @@ async fn cmd_history(
             );
         } else {
             println!(
-                "  {:>8}  {:<8}  {}  {:<16}  {}",
+                "  {:>8}  {:<20}  {}  {:<16}  {}",
                 height, arrow, amount_str, own_display, peer
             );
         }
     }
 
-    separator(88);
+    separator(100);
     if is_tty() {
         println!(
             "  {}  {:<8}  {:<8}  {}{}  {}{}{}",
@@ -1953,18 +2264,24 @@ async fn cmd_history(
             jetsam_str(totals.sent)
         );
     }
+    if let Some(line) = mined_total_line(&totals) {
+        println!("  {}", c!(GRN, line));
+    }
     if let Some(line) = orphaned_total_line(&totals) {
-        println!("  {}", c!(DIM, line));
+        println!("  {}", c!(YLW, line));
     }
 
     Ok(())
 }
 
-/// Totals shown under `jetsam-cli history`.
+/// Totals shown under `jetsam-cli history`. Rewards of canonical blocks are
+/// `mined`, apart from payments `received`; orphans are in no other total.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct HistoryTotals {
     received: u64,
     sent: u64,
+    mined_blocks: u64,
+    mined_micro: u64,
     orphaned_blocks: u64,
     orphaned_micro: u64,
 }
@@ -1976,11 +2293,18 @@ fn is_orphaned_coinbase(entry: &Value) -> bool {
     entry["is_coinbase"].as_bool() == Some(true) && entry["canonical"].as_bool() == Some(false)
 }
 
+/// A coinbase whose exact block the node reports on the canonical chain.
+fn is_mined_coinbase(entry: &Value) -> bool {
+    entry["is_coinbase"].as_bool() == Some(true) && entry["canonical"].as_bool() == Some(true)
+}
+
 /// Sign, direction label and colour of one history row.
 fn history_row_style(entry: &Value) -> (&'static str, &'static str, &'static str) {
     let dir = entry["direction"].as_str().unwrap_or("?");
     if is_orphaned_coinbase(entry) {
-        (" ", "orphaned", DIM)
+        (" ", "orphaned \u{b7} no reward", YLW)
+    } else if is_mined_coinbase(entry) {
+        ("+", "mined", GRN)
     } else if dir == "received" || dir == "recv" {
         ("+", "\u{2190} recv", GRN)
     } else {
@@ -1995,6 +2319,9 @@ fn tally_history(entries: &[&Value]) -> HistoryTotals {
         if is_orphaned_coinbase(entry) {
             totals.orphaned_blocks += 1;
             totals.orphaned_micro += micro;
+        } else if is_mined_coinbase(entry) {
+            totals.mined_blocks += 1;
+            totals.mined_micro += micro;
         } else if entry["direction"].as_str() == Some("sent") {
             totals.sent += micro;
         } else {
@@ -2004,10 +2331,22 @@ fn tally_history(entries: &[&Value]) -> HistoryTotals {
     totals
 }
 
+fn mined_total_line(totals: &HistoryTotals) -> Option<String> {
+    (totals.mined_blocks > 0).then(|| {
+        format!(
+            "mined: {} block{}, {} {TICKER} earned (canonical blocks only)",
+            totals.mined_blocks,
+            if totals.mined_blocks == 1 { "" } else { "s" },
+            jetsam_str(totals.mined_micro)
+        )
+    })
+}
+
 fn orphaned_total_line(totals: &HistoryTotals) -> Option<String> {
     (totals.orphaned_blocks > 0).then(|| {
         format!(
-            "orphaned coinbases: {} block{}, {} {TICKER} (not spendable)",
+            "orphaned \u{b7} no reward: {} block{}, {} {TICKER} \
+             (lost a reorganization, never in the balance)",
             totals.orphaned_blocks,
             if totals.orphaned_blocks == 1 { "" } else { "s" },
             jetsam_str(totals.orphaned_micro)
@@ -2384,6 +2723,122 @@ fn looks_like_address(candidate: &str) -> bool {
 }
 
 #[cfg(test)]
+mod adoption_tests {
+    use super::{adoption_report, agent_matches, merge_adoption_answers};
+    use serde_json::{json, Value};
+
+    fn answer(now_unix: u64, peers: Value) -> Value {
+        json!({
+            "local_agent_version": "jetsam/1.6.0 (v1.6=5760)",
+            "now_unix": now_unix,
+            "peers": peers,
+        })
+    }
+
+    fn peer(id: Value, agent: &str, connected: bool, verified: bool, last_seen: u64) -> Value {
+        json!({
+            "peer_id": id,
+            "agent_version": agent,
+            "connected": connected,
+            "profile_verified": verified,
+            "first_seen_unix": 1,
+            "last_seen_unix": last_seen,
+        })
+    }
+
+    #[test]
+    fn two_seeds_count_a_shared_peer_once() {
+        let first = answer(
+            1_000,
+            json!([
+                peer(json!("P1"), "jetsam/1.6.0 (v1.6=5760)", true, true, 990),
+                peer(json!("P2"), "rust-libp2p/0.46.0", false, true, 400),
+                peer(json!("P5"), "rust-libp2p/0.46.0", false, true, 10),
+            ]),
+        );
+        // Another node, another clock.
+        let second = answer(
+            50_000,
+            json!([
+                peer(json!("P1"), "jetsam/1.6.0 (v1.6=5760)", false, true, 49_000),
+                peer(json!("P3"), "jetsam/1.6.0-dev (v1.6=4800)", true, true, 49_990),
+                // Never completed the profile handshake: not on this chain.
+                peer(json!("P4"), "jetsam/1.6.0 (v1.6=5760)", true, false, 49_990),
+            ]),
+        );
+        let peers = merge_adoption_answers(&[first, second]).unwrap();
+        assert_eq!(peers.len(), 5);
+        let shared = peers
+            .iter()
+            .find(|peer| peer.peer_id.as_deref() == Some("P1"))
+            .unwrap();
+        assert!(shared.connected && shared.verified);
+        assert_eq!(shared.age_secs, 10);
+
+        let report = adoption_report(&peers, Some("1.6.0"), 900);
+        // Connected and verified: P1, P3. Seen within 15 minutes: P1, P3, P2
+        // (P5 left 990 s ago).
+        assert_eq!((report.target_connected, report.connected), (1, 2));
+        assert_eq!((report.target_recent, report.recent), (1, 3));
+        assert_eq!(report.unverified, 1);
+        assert_eq!(report.unmerged, 0);
+        let rows: Vec<(&str, usize, usize)> = report
+            .rows
+            .iter()
+            .map(|row| (row.agent.as_str(), row.connected, row.recent))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("jetsam/1.6.0 (v1.6=5760)", 1, 1),
+                ("jetsam/1.6.0-dev (v1.6=4800)", 1, 1),
+                ("rust-libp2p/0.46.0", 0, 1),
+            ]
+        );
+        // No target: the same counts, no share.
+        let untargeted = adoption_report(&peers, None, 900);
+        assert_eq!((untargeted.target_connected, untargeted.target_recent), (0, 0));
+        assert_eq!((untargeted.connected, untargeted.recent), (2, 3));
+    }
+
+    #[test]
+    fn a_target_is_a_release_or_an_exact_agent_prefix() {
+        assert!(agent_matches("jetsam/1.6.0 (v1.6=5760)", "1.6.0"));
+        assert!(!agent_matches("jetsam/1.6.0-dev (v1.6=4800)", "1.6.0"));
+        assert!(!agent_matches("rust-libp2p/0.46.0", "0.46.0"));
+        assert!(agent_matches(
+            "jetsam/1.6.0 (v1.6=5760)",
+            "jetsam/1.6.0 (v1.6=5760)"
+        ));
+        assert!(!agent_matches(
+            "jetsam/1.6.0 (v1.6=6720)",
+            "jetsam/1.6.0 (v1.6=5760)"
+        ));
+    }
+
+    #[test]
+    fn answers_without_identities_are_counted_but_not_merged() {
+        let hidden = |now| {
+            answer(
+                now,
+                json!([peer(Value::Null, "jetsam/1.6.0 (v1.6=5760)", true, true, now)]),
+            )
+        };
+        let peers = merge_adoption_answers(&[hidden(10), hidden(20)]).unwrap();
+        assert_eq!(peers.len(), 2);
+        let report = adoption_report(&peers, Some("1.6.0"), 60);
+        assert_eq!((report.target_connected, report.connected), (2, 2));
+        assert_eq!(report.unmerged, 2);
+    }
+
+    #[test]
+    fn a_malformed_answer_is_an_error_not_a_count() {
+        assert!(merge_adoption_answers(&[json!({"peers": "nope"})]).is_err());
+        assert!(merge_adoption_answers(&[answer(1, json!([{"peer_id": "P1"}]))]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod address_tests {
     use super::looks_like_address;
 
@@ -2471,7 +2926,10 @@ mod endpoint_tests {
 
 #[cfg(test)]
 mod history_tests {
-    use super::{history_row_style, orphaned_total_line, tally_history, HistoryTotals, GRN};
+    use super::{
+        history_row_style, mined_total_line, orphaned_total_line, tally_history, HistoryTotals, GRN,
+    };
+    use jetsam_chain::consensus::identity::TICKER;
     use serde_json::{json, Value};
 
     fn coinbase(height: u64, micro: u64, canonical: Option<bool>) -> Value {
@@ -2489,6 +2947,16 @@ mod history_tests {
         entry
     }
 
+    fn payment(micro: u64) -> Value {
+        json!({
+            "tx_hash": format!("{micro:064x}"),
+            "height": 12,
+            "direction": "received",
+            "is_coinbase": false,
+            "amount_micro_jtm": micro,
+        })
+    }
+
     /// The reported case: three locally mined blocks around 29344 all lost a
     /// reorganization, the balance is zero, and the history summed them as
     /// "+180.03 JTM received".
@@ -2502,52 +2970,104 @@ mod history_tests {
         let refs = entries.iter().collect::<Vec<_>>();
         let totals = tally_history(&refs);
         assert_eq!(totals.received, 0, "orphaned rewards counted as received");
+        assert_eq!((totals.mined_blocks, totals.mined_micro), (0, 0));
         assert_eq!(totals.orphaned_blocks, 3);
         assert_eq!(totals.orphaned_micro, 180_030_000);
         assert_eq!(
             orphaned_total_line(&totals),
             Some(format!(
-                "orphaned coinbases: 3 blocks, 180.030000 {} (not spendable)",
-                jetsam_chain::consensus::identity::TICKER
+                "orphaned \u{b7} no reward: 3 blocks, 180.030000 {TICKER} \
+                 (lost a reorganization, never in the balance)"
             ))
         );
+        assert_eq!(mined_total_line(&totals), None);
     }
 
     #[test]
     fn an_orphaned_coinbase_row_is_labelled_and_not_green() {
         let (sign, label, colour) = history_row_style(&coinbase(29_344, 60_010_000, Some(false)));
-        assert_eq!(label, "orphaned");
+        assert_eq!(label, "orphaned \u{b7} no reward");
         assert_ne!(sign, "+");
         assert_ne!(colour, GRN);
     }
 
-    /// A coinbase still on the canonical chain (one confirmation) is the
-    /// wallet's money; only the explicit `canonical: false` marks an orphan.
-    /// An entry from an older node carries no status and keeps the old display.
+    /// A coinbase whose block is canonical is a mined reward: labelled
+    /// "mined", in its own total, apart from payments received.
     #[test]
-    fn a_canonical_or_unknown_coinbase_stays_received() {
-        let canonical = coinbase(29_345, 60_010_000, Some(true));
-        let legacy = coinbase(29_346, 60_010_000, None);
-        let orphan = coinbase(29_344, 60_010_000, Some(false));
-        for entry in [&canonical, &legacy] {
-            assert_eq!(history_row_style(entry), ("+", "\u{2190} recv", GRN));
-        }
-        let totals = tally_history(&[&canonical, &legacy, &orphan]);
+    fn a_canonical_coinbase_is_mined_apart_from_payments() {
+        let mined = coinbase(29_345, 60_010_000, Some(true));
+        let paid = payment(2_000_000);
+        assert_eq!(history_row_style(&mined), ("+", "mined", GRN));
+        assert_eq!(history_row_style(&paid), ("+", "\u{2190} recv", GRN));
+        let totals = tally_history(&[&mined, &paid]);
         assert_eq!(
             totals,
             HistoryTotals {
-                received: 120_020_000,
+                received: 2_000_000,
                 sent: 0,
-                orphaned_blocks: 1,
-                orphaned_micro: 60_010_000,
+                mined_blocks: 1,
+                mined_micro: 60_010_000,
+                orphaned_blocks: 0,
+                orphaned_micro: 0,
             }
         );
+        assert_eq!(
+            mined_total_line(&totals),
+            Some(format!(
+                "mined: 1 block, 60.010000 {TICKER} earned (canonical blocks only)"
+            ))
+        );
+        assert_eq!(orphaned_total_line(&totals), None);
     }
 
     #[test]
     fn no_orphan_line_without_orphans() {
         let entry = coinbase(10, 50_000_000, Some(true));
         assert_eq!(orphaned_total_line(&tally_history(&[&entry])), None);
+    }
+
+    /// An entry from an older node carries no status: the history cannot tell
+    /// mined from orphaned and keeps the old display.
+    #[test]
+    fn a_coinbase_without_status_keeps_the_old_display() {
+        let legacy = coinbase(29_346, 60_010_000, None);
+        assert_eq!(history_row_style(&legacy), ("+", "\u{2190} recv", GRN));
+        let totals = tally_history(&[&legacy]);
+        assert_eq!(totals.received, 60_010_000);
+        assert_eq!((totals.mined_blocks, totals.orphaned_blocks), (0, 0));
+    }
+
+    /// The node recomputes `canonical` on every call: the same block moves
+    /// from mined to orphaned when another block wins its height, and back
+    /// when the chain returns to it. The totals follow.
+    #[test]
+    fn a_reorganization_moves_a_coinbase_between_mined_and_orphaned() {
+        let mined = (1, 60_010_000, 0, 0);
+        let orphaned = (0, 0, 1, 60_010_000);
+        for (canonical, expected) in [(true, mined), (false, orphaned), (true, mined)] {
+            let entry = coinbase(29_344, 60_010_000, Some(canonical));
+            let totals = tally_history(&[&entry]);
+            assert_eq!(
+                (
+                    totals.mined_blocks,
+                    totals.mined_micro,
+                    totals.orphaned_blocks,
+                    totals.orphaned_micro
+                ),
+                expected,
+                "canonical={canonical}"
+            );
+            assert_eq!(totals.received, 0);
+            let label = history_row_style(&entry).1;
+            assert_eq!(
+                label,
+                if canonical {
+                    "mined"
+                } else {
+                    "orphaned \u{b7} no reward"
+                }
+            );
+        }
     }
 }
 

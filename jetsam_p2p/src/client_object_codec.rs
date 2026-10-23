@@ -35,6 +35,8 @@ const RESPONSE_MAGIC: [u8; 4] = *b"JCS1";
 const KIND_PROOF: u8 = 1;
 const KIND_MANIFEST: u8 = 2;
 const KIND_CHUNK: u8 = 3;
+/// A v1.6 batch bundle.
+const KIND_BATCH: u8 = 4;
 const NONE_LEN: u32 = u32::MAX;
 
 /// Protocol path under the network's protocol id.
@@ -51,6 +53,8 @@ pub enum ClientObjectRequest {
         index: u32,
         digest: Hash32,
     },
+    /// A v1.6 batch bundle, by its id.
+    Batch(crate::client_object_protocol::ClientBatchId),
 }
 
 impl ClientObjectRequest {
@@ -72,6 +76,12 @@ impl ClientObjectRequest {
                     None
                 }
             }
+            Self::Batch(id) => {
+                let len = usize::try_from(id.encoded_len).ok()?;
+                (crate::client_object_protocol::CLIENT_BATCH_BUNDLE_FIXED_BYTES < len
+                    && len <= crate::client_object_protocol::MAX_CLIENT_BATCH_BUNDLE_BYTES)
+                    .then_some(len)
+            }
         }
     }
 
@@ -84,6 +94,7 @@ impl ClientObjectRequest {
             Self::Proof(id) => id.matches_bytes(bytes),
             Self::MatrixManifest(file) => file.verify_manifest(bytes).is_some(),
             Self::MatrixChunk { index, digest, .. } => matrix_chunk_matches(*index, bytes, digest),
+            Self::Batch(id) => id.matches_bytes(bytes),
         }
     }
 
@@ -110,6 +121,14 @@ impl ClientObjectRequest {
                 out.extend_from_slice(&index.to_le_bytes());
                 out.extend_from_slice(digest);
             }
+            Self::Batch(id) => {
+                out.push(KIND_BATCH);
+                out.extend_from_slice(&id.submission.batch_class);
+                out.extend_from_slice(&id.submission.statements_root);
+                out.extend_from_slice(&id.submission.count.to_le_bytes());
+                out.extend_from_slice(&id.bundle_digest);
+                out.extend_from_slice(&id.encoded_len.to_le_bytes());
+            }
         }
     }
 
@@ -121,6 +140,7 @@ impl ClientObjectRequest {
             KIND_PROOF => 100,
             KIND_MANIFEST => 68,
             KIND_CHUNK => 104,
+            KIND_BATCH => 104,
             _ => return Err(invalid_data("unknown client object kind")),
         };
         let mut body = [0u8; 104];
@@ -143,6 +163,15 @@ impl ClientObjectRequest {
                 encoded_len: u32_at(96),
             }),
             KIND_MANIFEST => Self::MatrixManifest(file()),
+            KIND_BATCH => Self::Batch(crate::client_object_protocol::ClientBatchId {
+                submission: jetsam_chain::consensus::client_objects::ClientBatchSubmission {
+                    batch_class: hash(0),
+                    statements_root: hash(32),
+                    count: u32_at(64),
+                },
+                bundle_digest: hash(68),
+                encoded_len: u32_at(100),
+            }),
             _ => Self::MatrixChunk {
                 file: file(),
                 index: u32_at(68),

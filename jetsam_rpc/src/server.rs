@@ -119,6 +119,38 @@ struct PowPreview {
     published_at: Instant,
 }
 
+/// The `getPeerVersions` answer. `operator` (loopback, or bearer required)
+/// adds peer identities, so the answers of several nodes can be merged
+/// without counting a peer twice.
+fn peer_versions_view(
+    mut observed: Vec<jetsam_p2p::peer_versions::ObservedPeerVersion>,
+    operator: bool,
+    now_unix: u64,
+) -> crate::types::PeerVersionsInfo {
+    observed.sort_by(|a, b| {
+        (&a.agent_version, b.last_seen_unix, &a.peer_id).cmp(&(
+            &b.agent_version,
+            a.last_seen_unix,
+            &b.peer_id,
+        ))
+    });
+    crate::types::PeerVersionsInfo {
+        local_agent_version: jetsam_p2p::peer_versions::local_agent_version(),
+        now_unix,
+        peers: observed
+            .into_iter()
+            .map(|peer| crate::types::PeerVersionInfo {
+                peer_id: operator.then_some(peer.peer_id),
+                agent_version: peer.agent_version,
+                connected: peer.connected,
+                profile_verified: peer.profile_verified,
+                first_seen_unix: peer.first_seen_unix,
+                last_seen_unix: peer.last_seen_unix,
+            })
+            .collect(),
+    }
+}
+
 /// Compare a presented bearer against the expected one without leaking where
 /// they first differ.
 ///
@@ -1631,8 +1663,11 @@ impl RpcHandler {
         // carry a `+1` stamp. This restores the same rule for the RPC template
         // path, so both producers behave identically.
         //
-        // Validity, unchanged (jetsam_chain/consensus/timestamps.rs):
+        // Validity (jetsam_chain/consensus/timestamps.rs, header.rs):
         //   timestamp > median of the last 11   AND   timestamp <= now + 120 s
+        //   AND, from V1_6, timestamp >= parent - 600 s. The template builder
+        //   raises this clock to that bound (`template_timestamp`, the
+        //   validator's `lowest_admitted_timestamp`).
         let block_ts = {
             let mtp = median_time_past(&snapshot.prev_timestamps);
             now.max(mtp.saturating_add(1))
@@ -2323,8 +2358,11 @@ impl JetsamApiServer for RpcHandler {
                 "retained block header does not match canonical header",
             ));
         }
-        let stream = jetsam_chain::validate_block_page_stream(&block.transactions)
-            .map_err(|error| rpc_err(format!("decode retained transaction stream: {error}")))?;
+        let generation =
+            jetsam_chain::consensus::params::HistoryStepPackGeneration::at_height(header.height);
+        let stream =
+            jetsam_chain::validate_block_page_stream_in(&block.transactions, generation)
+                .map_err(|error| rpc_err(format!("decode retained transaction stream: {error}")))?;
         let logical_txids = jetsam_chain::try_compute_logical_txids(&block.transactions)
             .map_err(|error| rpc_err(format!("derive retained transaction ids: {error}")))?;
         let coinbase = block
@@ -2495,11 +2533,7 @@ impl JetsamApiServer for RpcHandler {
             .map(|group| u128::from(group.spend.fee))
             .sum::<u128>()
             .to_string();
-        let proof_class = match stream.proof_class {
-            jetsam_chain::consensus::BlockProofClass::B25 => "B25 / m22",
-            jetsam_chain::consensus::BlockProofClass::B255 => "B255 / m24",
-        }
-        .to_string();
+        let proof_class = proof_class_label(stream.proof_class, generation);
         let retained = RetainedBlockInfo {
             proof_class,
             logical_transactions: logical_txids.len() as u16,
@@ -2661,6 +2695,22 @@ impl JetsamApiServer for RpcHandler {
         }
     }
 
+    async fn get_peer_versions(&self) -> RpcResult<crate::types::PeerVersionsInfo> {
+        match jetsam_p2p::P2PNetwork::peer_versions_via(&self.p2p_cmd).await {
+            // Who our neighbours are is told to the operator only, as the
+            // payout address is in `getMiningInfo`.
+            Some(observed) => Ok(peer_versions_view(
+                observed,
+                self.rpc_is_loopback || self.mining_key.is_some(),
+                jetsam_p2p::peer_versions::unix_now_secs(),
+            )),
+            None => Err(mining_err(
+                crate::types::ERR_MINING_NOT_READY,
+                "the P2P task did not answer; the node is starting or stopping",
+            )),
+        }
+    }
+
     async fn get_node_status(&self) -> RpcResult<NodeStatus> {
         let p2p = self.p2p_health.borrow().clone();
         let heartbeat_age = p2p.updated_at.elapsed();
@@ -2799,6 +2849,13 @@ impl JetsamApiServer for RpcHandler {
         if !rules.active_at(tip_height.saturating_add(1)) {
             return Err(rpc_err("client objects are carried from the v1.5 height only"));
         }
+        if jetsam_chain::consensus::client_objects::ClientBatchRules::current()
+            .active_at(tip_height.saturating_add(1))
+        {
+            return Err(rpc_err(
+                "a v1.5 client proof is not carried from the v1.6 height on (submit a batch)",
+            ));
+        }
         if let Err(error) = self.mempool.check_client_payment(&bundle.payment).await {
             tracing::info!(
                 matrix_digest = %hex::encode(bundle.submission.matrix_digest),
@@ -2830,6 +2887,135 @@ impl JetsamApiServer for RpcHandler {
             bundle_len: announcement.id.encoded_len,
             fee_micro_jtm: announcement.fee,
         })
+    }
+
+    async fn submit_client_batch(
+        &self,
+        bundle_hex: String,
+    ) -> RpcResult<crate::client_objects::SubmitClientBatchResponse> {
+        use jetsam_chain::consensus::client_objects::ClientBatchRules;
+        let objects = self
+            .client_objects
+            .clone()
+            .ok_or_else(|| rpc_err("this node holds no client objects"))?;
+        let bytes = decode_bounded_hex(
+            "client batch bundle",
+            &bundle_hex,
+            jetsam_p2p::client_object_protocol::MAX_CLIENT_BATCH_BUNDLE_BYTES,
+        )?;
+        let bundle = jetsam_p2p::client_object_protocol::ClientBatchBundle::decode(&bytes)
+            .map_err(|error| rpc_err(format!("client batch bundle: {error}")))?;
+        let (registry, tip_height, terminal) = {
+            let chain = self.chain.read().await;
+            let tip = *chain.tip_header();
+            let terminal = if tip.height == 0 {
+                None
+            } else {
+                chain
+                    .store
+                    .get_history_step_terminal_at(tip.height, jetsam_chain::block_header::block_id(&tip))
+                    .map_err(|error| rpc_err(format!("tip terminal: {error}")))?
+            };
+            (chain.client_registry().clone(), tip.height, terminal)
+        };
+        if !ClientBatchRules::current().active_at(tip_height.saturating_add(1)) {
+            return Err(rpc_err("client batches are carried from the v1.6 height only"));
+        }
+        if let Err(error) = self.mempool.check_client_payment(&bundle.payment).await {
+            tracing::info!(
+                statements_root = %hex::encode(bundle.submission.statements_root),
+                %error,
+                "client batch refused: its payment"
+            );
+            return Err(rpc_err(format!("batch payment: {error}")));
+        }
+        let announcement = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_inbound_verifier_cpu(|| {
+                objects.receive_client_batch(&bytes, tip_height, terminal.as_deref(), &registry, None)
+            })
+            .map_err(|error| error.to_string())?
+        })
+        .await
+        .map_err(|error| rpc_err(format!("client batch reception: {error}")))?
+        .map_err(rpc_err)?;
+        let _ = self
+            .p2p_cmd
+            .send(jetsam_p2p::NetworkCommand::AnnounceClientBatch { announcement })
+            .await;
+        Ok(crate::client_objects::SubmitClientBatchResponse {
+            batch_class: hex::encode(announcement.id.submission.batch_class),
+            statements_root: hex::encode(announcement.id.submission.statements_root),
+            count: announcement.id.submission.count,
+            bundle_digest: hex::encode(announcement.id.bundle_digest),
+            bundle_len: announcement.id.encoded_len,
+            fee_micro_jtm: announcement.fee,
+        })
+    }
+
+    async fn get_client_batch_parent(
+        &self,
+    ) -> RpcResult<crate::client_objects::ClientBatchParentResponse> {
+        use jetsam_chain::consensus::client_objects::{CLIENT_BATCH_CLASS, CLIENT_REGISTRY_CAPACITY};
+        let objects = self
+            .client_objects
+            .clone()
+            .ok_or_else(|| rpc_err("this node holds no client objects"))?;
+        let (registry, tip, terminal) = {
+            let chain = self.chain.read().await;
+            let tip = *chain.tip_header();
+            let terminal = if tip.height == 0 {
+                None
+            } else {
+                chain
+                    .store
+                    .get_history_step_terminal_at(tip.height, jetsam_chain::block_header::block_id(&tip))
+                    .map_err(|error| rpc_err(format!("tip terminal: {error}")))?
+            };
+            (chain.client_registry().clone(), tip, terminal)
+        };
+        let lanes = tokio::task::spawn_blocking(move || {
+            objects.client_batch_parent_lanes(tip.height, terminal.as_deref())
+        })
+        .await
+        .map_err(|error| rpc_err(format!("batch parent lanes: {error}")))?
+        .map_err(rpc_err)?;
+        let mut leaves = registry.digests();
+        leaves.resize(CLIENT_REGISTRY_CAPACITY.max(leaves.len()), [0u8; 32]);
+        Ok(crate::client_objects::ClientBatchParentResponse {
+            tip_height: tip.height,
+            tip_hash: hex::encode(jetsam_chain::block_header::block_id(&tip)),
+            batch_class: CLIENT_BATCH_CLASS.map(hex::encode).unwrap_or_default(),
+            leaves: leaves.iter().map(hex::encode).collect(),
+            lanes_hex: hex::encode(lanes.encode()),
+        })
+    }
+
+    async fn build_client_batch_bundle(
+        &self,
+        batch_class: String,
+        statements_root: String,
+        count: u32,
+        payment_hex: String,
+        proof_hex: String,
+    ) -> RpcResult<String> {
+        let submission = jetsam_chain::consensus::client_objects::ClientBatchSubmission {
+            batch_class: decode_32_byte_hex("batch_class", &batch_class)?,
+            statements_root: decode_32_byte_hex("statements_root", &statements_root)?,
+            count,
+        };
+        let payment_bytes =
+            decode_bounded_hex("batch payment", &payment_hex, MAX_TX_INTENT_BYTES_GLOBAL)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&payment_bytes)
+            .map_err(|error| rpc_err(format!("batch payment: {error:?}")))?;
+        let proof = decode_bounded_hex(
+            "batch proof",
+            &proof_hex,
+            jetsam_chain::consensus::client_objects::CLIENT_BATCH_PROOF_MAX_WIRE_BYTES,
+        )?;
+        let bundle =
+            jetsam_p2p::client_object_protocol::ClientBatchBundle::new(submission, payment, proof)
+                .map_err(|error| rpc_err(format!("client batch bundle: {error}")))?;
+        Ok(hex::encode(bundle.encode()))
     }
 
     async fn register_client(
@@ -2985,12 +3171,16 @@ impl JetsamApiServer for RpcHandler {
             ClientPaymentObject::Registration { matrix_path } => {
                 // The registry at the tip: a D already registered, or a full
                 // registry, is refused before anything is built.
-                let registry = self.chain.read().await.client_registry().clone();
-                let (registration, payments) = crate::client_objects::plan_registration_payment(
+                let (registry, next_height) = {
+                    let chain = self.chain.read().await;
+                    (chain.client_registry().clone(), chain.tip_height().saturating_add(1))
+                };
+                let (registration, payments) = crate::client_objects::plan_registration_payment_at(
                     self.client_objects.clone(),
                     matrix_path,
                     &registry,
                     &rules,
+                    next_height,
                 )
                 .await
                 .map_err(rpc_err)?;
@@ -3006,6 +3196,39 @@ impl JetsamApiServer for RpcHandler {
                 }),
                 Vec::new(),
             ),
+            ClientPaymentObject::Batch {
+                batch_class,
+                statements_root,
+                count,
+            } => {
+                // As a registration or a submission: refused before anything
+                // is built or reserved when no block could carry it.
+                let batch_rules = jetsam_chain::consensus::client_objects::ClientBatchRules::current();
+                let next_height = self.chain.read().await.tip_height().saturating_add(1);
+                let batch_class = decode_32_byte_hex("batch_class", batch_class)?;
+                if !batch_rules.active_at(next_height) {
+                    return Err(rpc_err("client batches are carried from the v1.6 height only"));
+                }
+                if batch_rules.batch_class != Some(batch_class) {
+                    return Err(rpc_err("the batch class is not the chain's (CLIENT_BATCH_CLASS)"));
+                }
+                if *count == 0 || *count > batch_rules.max_clients {
+                    return Err(rpc_err(format!(
+                        "a batch covers 1 to {} clients",
+                        batch_rules.max_clients
+                    )));
+                }
+                (
+                    ClientObject::BatchSubmission(
+                        jetsam_chain::consensus::client_objects::ClientBatchSubmission {
+                            batch_class,
+                            statements_root: decode_32_byte_hex("statements_root", statements_root)?,
+                            count: *count,
+                        },
+                    ),
+                    Vec::new(),
+                )
+            }
         };
         let marker = client_object.marker();
         let output_count = payments.len() + 2; // the marker and, at most, change
@@ -3028,7 +3251,9 @@ impl JetsamApiServer for RpcHandler {
             (epoch_anchor, tip.log_slots, slot_hints, required)
         };
         let submission_fee = match client_object {
-            ClientObject::Submission(_) => rules.submission_fee_micro,
+            ClientObject::Submission(_) | ClientObject::BatchSubmission(_) => {
+                rules.submission_fee_micro
+            }
             ClientObject::Registration(_) => 0,
         };
         let fee = fee_micro_jtm.unwrap_or(required.saturating_add(submission_fee));
@@ -3082,6 +3307,8 @@ impl JetsamApiServer for RpcHandler {
             ClientObject::Submission(submission) => {
                 (None, None, Some(hex::encode(submission.io_commitment)))
             }
+            // A batch payment names its class, root and count.
+            ClientObject::BatchSubmission(_) => (None, None, None),
         };
         Ok(crate::client_objects::ClientPaymentResponse {
             payment_hex: hex::encode(&intent_bytes),
@@ -3091,6 +3318,7 @@ impl JetsamApiServer for RpcHandler {
             matrix_digest: hex::encode(match client_object {
                 ClientObject::Registration(registration) => registration.matrix_digest,
                 ClientObject::Submission(submission) => submission.matrix_digest,
+                ClientObject::BatchSubmission(batch) => batch.batch_class,
             }),
             matrix_file_root,
             matrix_file_len,
@@ -3929,9 +4157,75 @@ fn parse_address_param(s: &str) -> RpcResult<jetsam_poseidon2b::primitives::Addr
         .map_err(|e| rpc_err(format!("invalid address: {e}")))
 }
 
+/// The proof class of a retained block as `getBlockDetails` names it: the
+/// class's page capacity and outer dimension under the block's generation.
+fn proof_class_label(
+    class: jetsam_chain::consensus::BlockProofClass,
+    generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
+) -> String {
+    format!(
+        "B{} / m{}",
+        class.page_capacity_in_generation(generation),
+        class.outer_m_in_generation(generation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retained block's proof class reads the generation in force at its
+    /// height: the class's page capacity and its outer dimension, so the
+    /// small class is B24 from v1.3 and both classes move to m = 23 / 25 at
+    /// v1.5 and stay there under v1.6.
+    #[test]
+    fn the_proof_class_label_follows_the_generation_of_the_block() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+        use jetsam_chain::consensus::BlockProofClass::{B25, B255};
+        for (generation, small, large) in [
+            (V1, "B25 / m22", "B255 / m24"),
+            (V1_3, "B24 / m22", "B255 / m24"),
+            (V1_5, "B24 / m23", "B255 / m25"),
+            (V1_6, "B24 / m23", "B255 / m25"),
+        ] {
+            assert_eq!(proof_class_label(B25, generation), small, "{generation:?}");
+            assert_eq!(proof_class_label(B255, generation), large, "{generation:?}");
+        }
+    }
+
+    #[test]
+    fn peer_versions_name_peers_only_to_the_operator() {
+        let peer = "12D3KooWJwcz3pB3Y1eGxXUSvbHLuRqhtKvHzhgFSXMJt3GNyY5t".to_string();
+        let observed = vec![jetsam_p2p::peer_versions::ObservedPeerVersion {
+            peer_id: peer.clone(),
+            agent_version: "jetsam/1.6.0 (v1.6=5760)".to_string(),
+            connected: true,
+            profile_verified: true,
+            first_seen_unix: 100,
+            last_seen_unix: 400,
+        }];
+
+        // A public endpoint: versions and counts, never who our neighbours are.
+        let public = peer_versions_view(observed.clone(), false, 500);
+        assert_eq!(
+            public.local_agent_version,
+            jetsam_p2p::peer_versions::local_agent_version()
+        );
+        assert_eq!(public.now_unix, 500);
+        assert_eq!(public.peers.len(), 1);
+        assert_eq!(public.peers[0].peer_id, None);
+        assert_eq!(public.peers[0].agent_version, "jetsam/1.6.0 (v1.6=5760)");
+        assert!(public.peers[0].connected && public.peers[0].profile_verified);
+        assert_eq!(
+            (public.peers[0].first_seen_unix, public.peers[0].last_seen_unix),
+            (100, 400)
+        );
+
+        // Loopback or bearer-authenticated: identities, so several nodes'
+        // answers can be merged without counting a peer twice.
+        let operator = peer_versions_view(observed, true, 500);
+        assert_eq!(operator.peers[0].peer_id, Some(peer));
+    }
 
     #[test]
     fn mined_block_identity_marks_exact_and_legacy_reorganizations() {
@@ -4038,6 +4332,50 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("is_coinbase");
         let legacy: WalletHistoryEntry = serde_json::from_value(legacy).unwrap();
         assert_eq!((legacy.canonical, legacy.confirmations), (None, None));
+    }
+
+    /// The same recorded coinbase, read by `walletHistory` while the chain
+    /// switches branch at its height: mined, then orphaned when another block
+    /// wins the height, then mined again when the chain returns to ours. The
+    /// status is recomputed from the canonical header on every call, never
+    /// remembered.
+    #[test]
+    fn wallet_history_follows_a_coinbase_across_reorganizations() {
+        let mut ours = jetsam_chain::consensus::genesis_header();
+        ours.height = 5;
+        let payout = ours.miner_address.to_bech32();
+        let mut theirs = ours.clone();
+        theirs.timestamp += 1;
+        assert_ne!(block_id(&ours), block_id(&theirs));
+        let recorded = |block_hash| WalletHistoryEntry {
+            tx_hash: format!("{:064x}", 5),
+            height: 5,
+            direction: "received".into(),
+            is_coinbase: true,
+            amount_micro_jtm: 60_010_000,
+            amount_eld: 60.01,
+            peer_address: None,
+            timestamp: ours.timestamp,
+            own_address: Some(payout.clone()),
+            own_key_index: Some(0),
+            block_hash,
+            canonical: None,
+            confirmations: None,
+        };
+        // Exact identity (new records) and legacy timestamp/payout identity.
+        for block_hash in [Some(block_id(&ours)), None] {
+            let read = |canonical_at_5: &jetsam_chain::BlockHeader, tip| {
+                let mut history = vec![recorded(block_hash)];
+                annotate_coinbase_status(&mut history, tip, |height| {
+                    Ok::<_, ()>((height == 5).then(|| canonical_at_5.clone()))
+                })
+                .unwrap();
+                (history[0].canonical, history[0].confirmations)
+            };
+            assert_eq!(read(&ours, 5), (Some(true), Some(1)), "{block_hash:?}");
+            assert_eq!(read(&theirs, 6), (Some(false), Some(0)), "{block_hash:?}");
+            assert_eq!(read(&ours, 8), (Some(true), Some(4)), "{block_hash:?}");
+        }
     }
 
     #[test]
@@ -4344,8 +4682,10 @@ mod tests {
         assert!(decode_external_nonce_hex(&encoded[..30]).is_err());
     }
 
-    /// The rule the served template must follow, kept here so a regression in
+    /// The clock the served template starts from, kept here so a regression in
     /// `getBlockTemplate` fails a test instead of quietly throttling the chain.
+    /// From V1_6 the template builder raises it to the parent bound
+    /// (`jetsam_miner::template::template_timestamp`, tested there).
     fn template_block_timestamp(now: u64, prev_timestamps: &[u64]) -> u64 {
         now.max(median_time_past(prev_timestamps).saturating_add(1))
     }

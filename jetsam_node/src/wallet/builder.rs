@@ -813,7 +813,7 @@ mod tests {
             .collect();
         let rules = ClientObjectRules {
             license_micro: license,
-            catalogue: &[[0xD1; 32]],
+            catalogue: &[jetsam_chain::consensus::client_objects::CatalogueEntry { matrix_digest: [0xD1; 32], matrix_file_root: [0xF0; 32], matrix_file_len: 4_096 }],
             ..ClientObjectRules::CONSENSUS
         };
         assert_eq!(check_registration_payment(&pages, &registration, &rules), Ok(()));

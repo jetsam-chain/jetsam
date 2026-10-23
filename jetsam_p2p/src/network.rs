@@ -3022,6 +3022,11 @@ pub enum NetworkCommand {
     PeerCount {
         reply: tokio::sync::oneshot::Sender<usize>,
     },
+    /// The software version each identified peer announced (informative:
+    /// measures adoption, decides nothing).
+    PeerVersions {
+        reply: tokio::sync::oneshot::Sender<Vec<crate::peer_versions::ObservedPeerVersion>>,
+    },
     /// Fetch one exact content-addressed object set from one candidate source.
     /// The token is node-local and is returned unchanged in the result.
     FetchObjects {
@@ -3110,6 +3115,10 @@ pub enum NetworkCommand {
     AnnounceClientRegistration {
         notice: Arc<crate::client_object_protocol::ClientRegistrationNotice>,
     },
+    /// Publish a v1.6 batch announcement on the client topic.
+    AnnounceClientBatch {
+        announcement: crate::client_object_protocol::ClientBatchAnnouncement,
+    },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -3122,6 +3131,13 @@ pub enum NetworkEvent {
         from: PeerId,
         relayed_by: PeerId,
         announcement: crate::client_object_protocol::ClientProofAnnouncement,
+    },
+    /// A v1.6 batch announcement, with its provider candidates as
+    /// for a client proof.
+    ClientBatchAnnounced {
+        from: PeerId,
+        relayed_by: PeerId,
+        announcement: crate::client_object_protocol::ClientBatchAnnouncement,
     },
     /// A v1.5 client registration relayed on the client topic, its payment
     /// already checked to open and pay it; the node checks the payment
@@ -3632,6 +3648,22 @@ impl P2PNetwork {
     pub async fn peer_count(&self) -> Option<usize> {
         Self::peer_count_via(&self.cmd_tx).await
     }
+
+    /// The version every identified peer announced, connected or recently
+    /// gone, or `None` when the P2P task could not be asked.
+    pub async fn peer_versions_via(
+        cmd: &NetworkCommandSender,
+    ) -> Option<Vec<crate::peer_versions::ObservedPeerVersion>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if cmd
+            .send(NetworkCommand::PeerVersions { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3811,6 +3843,7 @@ async fn run_swarm(
     // enter the same bounded automatic manager as DNS bootstrap sources, so a
     // restart cannot create a second untracked dial burst.
     let mut successful_peer_cache = crate::peer_store::load(&data_dir);
+    let mut observed_peer_versions = crate::peer_versions::ObservedPeerVersions::default();
     let local_peer_id = *swarm.local_peer_id();
     let mut automatic_peers = AutomaticPeerState::new(local_peer_id);
     for peer in successful_peer_cache.entries() {
@@ -3981,6 +4014,7 @@ async fn run_swarm(
                 &mut pending_history_step_requests,
                 &mut automatic_peers,
                 &sync_paths,
+                &observed_peer_versions,
             )
             .await;
         }
@@ -4043,6 +4077,7 @@ async fn run_swarm(
                     &mut relay_reservations,
                     &mut relay_circuit_backoff,
                     &mut successful_peer_cache,
+                    &mut observed_peer_versions,
                 )
                 .await;
             }
@@ -4508,6 +4543,7 @@ async fn run_swarm(
                         &mut pending_history_step_requests,
                         &mut automatic_peers,
                         &sync_paths,
+                        &observed_peer_versions,
                     )
                     .await,
                     // Handled by the client-object transport.
@@ -5707,6 +5743,10 @@ fn client_transport_command(
             transport.announce_registration(swarm, &notice);
             None
         }
+        NetworkCommand::AnnounceClientBatch { announcement } => {
+            transport.announce_batch(swarm, announcement);
+            None
+        }
         cmd => Some(cmd),
     }
 }
@@ -5750,6 +5790,7 @@ async fn handle_network_command(
     >,
     automatic_peers: &mut AutomaticPeerState,
     sync_paths: &PeerSyncPaths,
+    observed_peer_versions: &crate::peer_versions::ObservedPeerVersions,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
@@ -5854,6 +5895,11 @@ async fn handle_network_command(
         NetworkCommand::PeerCount { reply } => {
             let count = sync_paths.dispatchable_peer_count();
             let _ = reply.send(count);
+        }
+        NetworkCommand::PeerVersions { reply } => {
+            let _ = reply.send(
+                observed_peer_versions.snapshot(|peer| sync_paths.profile_verified.contains(peer)),
+            );
         }
         NetworkCommand::FetchObjects {
             token,
@@ -6311,7 +6357,8 @@ async fn handle_network_command(
         }
         NetworkCommand::FetchClientObject { .. }
         | NetworkCommand::AnnounceClientProof { .. }
-        | NetworkCommand::AnnounceClientRegistration { .. } => {
+        | NetworkCommand::AnnounceClientRegistration { .. }
+        | NetworkCommand::AnnounceClientBatch { .. } => {
             // Routed to the client-object transport before this dispatcher.
         }
         NetworkCommand::RequestMempoolSync { peer } => {
@@ -6411,6 +6458,7 @@ async fn handle_swarm_event(
     relay_reservations: &mut RelayReservations,
     relay_circuit_backoff: &mut RelayCircuitBackoff,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
+    observed_peer_versions: &mut crate::peer_versions::ObservedPeerVersions,
 ) {
     let implicit_bootstraps = stop_implicit_kad_bootstraps(swarm);
     if implicit_bootstraps > 0 {
@@ -6773,6 +6821,11 @@ async fn handle_swarm_event(
                     successful_peer_cache.record_success(peer_id, addr);
                 }
             }
+            // Informative only: recorded for the operator's adoption count,
+            // after every admission decision above, and read by nothing else.
+            let seen_unix = crate::peer_versions::unix_now_secs();
+            observed_peer_versions.observe(peer_id, &info.agent_version, seen_unix);
+            successful_peer_cache.note_agent_version(peer_id, &info.agent_version);
 
             // 2. Arm one bounded random lookup now that at least one routable
             //    peer is present. It starts later on an identity-jittered
@@ -9135,6 +9188,11 @@ async fn handle_swarm_event(
             if num_established == 0 {
                 automatic_peers.clear_local_selection(peer_id);
                 relay_reservations.retire_peer(swarm, peer_id);
+                observed_peer_versions.disconnected(
+                    peer_id,
+                    crate::peer_versions::unix_now_secs(),
+                    sync_paths.profile_verified.contains(&peer_id),
+                );
                 sync_paths.clear_profile_verified(peer_id);
                 pending_network_profile_requests.take_where(|pending| pending.peer == peer_id);
                 block_event_rate.remove(&peer_id);

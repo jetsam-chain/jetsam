@@ -22,7 +22,8 @@
 //! shown. A disconnect forgets only the probe in flight.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 use jetsam_chain::block_header::BlockHeader;
 use libp2p::PeerId;
@@ -32,8 +33,8 @@ use libp2p::PeerId;
 /// refused again at its first pinned header or refused header.
 pub(crate) const PEER_CHAIN_EVIDENCE_TTL: Duration = Duration::from_secs(3_600);
 
-/// Bound on the verdicts kept. Past it, the verdicts closest to expiry go
-/// first.
+/// Bound on the verdicts kept. Past it, the expired ones and then those
+/// closest to expiry go, down to three quarters of it.
 pub(crate) const PEER_CHAIN_EVIDENCE_CAPACITY: usize = 4_096;
 
 /// A pin probe that has not been answered after this long may be sent again.
@@ -82,6 +83,11 @@ pub(crate) struct PeerChainEvidence<H = ()> {
     probe_wanted: HashMap<PeerId, PinWait<H>>,
     /// Pin probes sent and not answered yet.
     probe_inflight: HashMap<PeerId, (u64, Instant)>,
+    /// Boundary of a snapshot plan the peer offered that then made no
+    /// progress: a claim nobody served.
+    unserved: HashMap<PeerId, Verdict>,
+    /// A divergence verdict was taken or ended since [`Self::take_changed`].
+    changed: bool,
 }
 
 impl<H> Default for PeerChainEvidence<H> {
@@ -89,6 +95,8 @@ impl<H> Default for PeerChainEvidence<H> {
         Self {
             divergent: HashMap::new(),
             pinned: HashMap::new(),
+            unserved: HashMap::new(),
+            changed: false,
             probe_wanted: HashMap::new(),
             probe_inflight: HashMap::new(),
         }
@@ -107,6 +115,7 @@ impl<H> PeerChainEvidence<H> {
             .or_insert(Verdict { height, expires });
         verdict.height = verdict.height.min(height);
         verdict.expires = expires;
+        self.changed = true;
         // A peer seen on a refused branch vouches for no pinned block any more.
         self.pinned.remove(&peer);
         self.probe_wanted.remove(&peer);
@@ -117,6 +126,84 @@ impl<H> PeerChainEvidence<H> {
         self.divergence_height(peer, now).is_some()
     }
 
+    /// Whether a divergence verdict was taken or ended since the last call.
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// Write the divergence verdicts that hold at `now` to `path`, each with
+    /// its wall-clock expiry.
+    pub(crate) fn save_verdicts(
+        &self,
+        path: &Path,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> std::io::Result<()> {
+        let mut lines = String::new();
+        for (peer, verdict) in &self.divergent {
+            let left = verdict.expires.saturating_duration_since(now);
+            if left.is_zero() {
+                continue;
+            }
+            let expires = (wall_now + left)
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            lines.push_str(&format!("{peer} {} {expires}\n", verdict.height));
+        }
+        let written = path.with_extension("new");
+        std::fs::write(&written, lines)?;
+        std::fs::rename(&written, path)
+    }
+
+    /// Read back the verdicts [`Self::save_verdicts`] wrote, those that still
+    /// hold at `wall_now`. A missing file holds none. Returns how many came
+    /// back.
+    pub(crate) fn load_verdicts(
+        &mut self,
+        path: &Path,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> std::io::Result<usize> {
+        let lines = match std::fs::read_to_string(path) {
+            Ok(lines) => lines,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let wall_now = wall_now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut loaded = 0;
+        for line in lines.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(Ok(peer)), Some(Ok(height)), Some(Ok(expires))) = (
+                fields.next().map(str::parse::<PeerId>),
+                fields.next().map(str::parse::<u64>),
+                fields.next().map(str::parse::<u64>),
+            ) else {
+                continue;
+            };
+            // Never longer than a fresh verdict, whatever the wall clock did.
+            let left = expires
+                .saturating_sub(wall_now)
+                .min(PEER_CHAIN_EVIDENCE_TTL.as_secs());
+            if left == 0 {
+                continue;
+            }
+            self.divergent.insert(
+                peer,
+                Verdict {
+                    height,
+                    expires: now + Duration::from_secs(left),
+                },
+            );
+            loaded += 1;
+        }
+        self.bound(now);
+        Ok(loaded)
+    }
+
     /// The lowest height at which the peer's chain was refused, while the
     /// verdict holds.
     pub(crate) fn divergence_height(&self, peer: &PeerId, now: Instant) -> Option<u64> {
@@ -124,6 +211,23 @@ impl<H> PeerChainEvidence<H> {
             .get(peer)
             .filter(|verdict| verdict.expires > now)
             .map(|verdict| verdict.height)
+    }
+
+    /// The peer offered the snapshot boundary at `boundary` of a plan that
+    /// then verified nothing and made no progress.
+    pub(crate) fn mark_unserved_claim(&mut self, peer: PeerId, boundary: u64, now: Instant) {
+        let expires = now + PEER_CHAIN_EVIDENCE_TTL;
+        self.unserved.insert(peer, Verdict { height: boundary, expires });
+        self.bound(now);
+    }
+
+    /// The boundary of the unserved snapshot plan the peer offered, while
+    /// that record holds.
+    pub(crate) fn unserved_claim(&self, peer: &PeerId, now: Instant) -> Option<u64> {
+        self.unserved
+            .get(peer)
+            .filter(|record| record.expires > now)
+            .map(|record| record.height)
     }
 
     /// Every peer whose divergence verdict holds.
@@ -146,6 +250,7 @@ impl<H> PeerChainEvidence<H> {
             .is_some_and(|verdict| verdict.height <= height)
         {
             self.divergent.remove(&peer);
+            self.changed = true;
             true
         } else {
             false
@@ -155,7 +260,10 @@ impl<H> PeerChainEvidence<H> {
     /// Read the pinned heights a batch of headers from `peer` covers. Only the
     /// block id is compared: a pin is the authority, nothing else about the
     /// header needs to be valid for the comparison to mean something. A
-    /// contradiction marks the peer divergent at that height.
+    /// contradiction marks the peer divergent at that height. A match never
+    /// ends a verdict: the pinned header is public and anyone can replay it;
+    /// only headers validated by this node's own rules
+    /// do ([`Self::confirm_compatible_through`]).
     pub(crate) fn observe_headers<'a>(
         &mut self,
         peer: PeerId,
@@ -183,7 +291,7 @@ impl<H> PeerChainEvidence<H> {
         let Some(height) = matched else {
             return PinEvidence::Silent;
         };
-        if !self.is_divergent(&peer, now) || self.confirm_compatible_through(peer, height) {
+        if !self.is_divergent(&peer, now) {
             let expires = now + PEER_CHAIN_EVIDENCE_TTL;
             let proof = self
                 .pinned
@@ -282,9 +390,10 @@ impl<H> PeerChainEvidence<H> {
     }
 
     /// The peer answered the probe without the pinned height: the manifest
-    /// that waited on it is dropped (a later one starts a new wait).
-    pub(crate) fn cancel_pin_wait(&mut self, peer: &PeerId) {
-        self.probe_wanted.remove(peer);
+    /// that waited on it is dropped (a later one starts a new wait). Returns
+    /// whether one was.
+    pub(crate) fn cancel_pin_wait(&mut self, peer: &PeerId) -> bool {
+        self.probe_wanted.remove(peer).is_some()
     }
 
     /// Transport loss: only the probe state goes. What the peer proved about
@@ -294,17 +403,22 @@ impl<H> PeerChainEvidence<H> {
         self.probe_wanted.remove(peer);
     }
 
+    /// Past [`PEER_CHAIN_EVIDENCE_CAPACITY`], the expired records go, then
+    /// those closest to expiry, down to three quarters of it: the sort runs
+    /// once per quarter of new identities, not once per identity.
+    /// Below it, nothing is done; reads ignore expired records.
     fn bound(&mut self, now: Instant) {
-        self.divergent.retain(|_, verdict| verdict.expires > now);
-        self.pinned.retain(|_, proof| proof.expires > now);
-        for map in [&mut self.divergent, &mut self.pinned] {
+        for map in [&mut self.divergent, &mut self.pinned, &mut self.unserved] {
+            if map.len() > PEER_CHAIN_EVIDENCE_CAPACITY {
+                map.retain(|_, record| record.expires > now);
+            }
             if map.len() > PEER_CHAIN_EVIDENCE_CAPACITY {
                 let mut by_expiry = map
                     .iter()
                     .map(|(peer, verdict)| (verdict.expires, *peer))
                     .collect::<Vec<_>>();
                 by_expiry.sort();
-                let excess = map.len() - PEER_CHAIN_EVIDENCE_CAPACITY;
+                let excess = map.len() - PEER_CHAIN_EVIDENCE_CAPACITY * 3 / 4;
                 for (_, peer) in by_expiry.into_iter().take(excess) {
                     map.remove(&peer);
                 }
@@ -427,6 +541,83 @@ mod tests {
         assert_eq!(evidence.pin_verified_through(&peer, now), None);
     }
 
+    /// A peer refused at the pinned height replays
+    /// the pinned header. A pinned header is public — anyone copies it from
+    /// an honest node — so showing it says nothing about the branch the peer
+    /// follows: the verdict stands and the replay proves no pin. Before this,
+    /// it erased the one-hour verdict and the peer's manifest was admitted
+    /// again on a cold node. Headers validated by this node's own rules
+    /// through the refused height still end it.
+    #[test]
+    fn a_replayed_pinned_header_neither_clears_a_verdict_nor_proves_a_pin() {
+        let pinned = header_at(38_400, 1);
+        let pins = pins_for(&[&pinned]);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let peer = PeerId::random();
+        evidence.mark_divergent(peer, 38_400, now);
+        evidence.want_pin_probe(peer, 38_400, false, ());
+        evidence.observe_headers(peer, [&pinned], &pins, now);
+        assert_eq!(evidence.divergence_height(&peer, now), Some(38_400), "the verdict stands");
+        assert_eq!(evidence.pin_verified_through(&peer, now), None, "no pin proof");
+        assert_eq!(evidence.take_satisfied_wait(&peer, now), None);
+        assert!(evidence.confirm_compatible_through(peer, 38_400));
+        assert!(!evidence.is_divergent(&peer, now));
+    }
+
+    /// A peer offered a boundary above the real tip, the real
+    /// headers were staged up to that tip, then nothing more came and the
+    /// plan was retired after its stall delay. The provider is remembered for
+    /// the TTL, across reconnections; it is not a fork verdict.
+    #[test]
+    fn the_provider_of_an_unserved_plan_is_remembered_for_the_ttl() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let peer = PeerId::random();
+        evidence.mark_unserved_claim(peer, 40_000, now);
+        evidence.on_disconnect(&peer);
+        assert_eq!(evidence.unserved_claim(&peer, now + Duration::from_secs(60)), Some(40_000));
+        assert!(!evidence.is_divergent(&peer, now), "not a fork verdict");
+        assert_eq!(evidence.unserved_claim(&PeerId::random(), now), None);
+        assert_eq!(evidence.unserved_claim(&peer, now + PEER_CHAIN_EVIDENCE_TTL), None);
+    }
+
+    /// The verdicts lived in memory only. A
+    /// restarted node took the old branch's manifest for a candidate before
+    /// refusing it again. They now come back from the data directory with
+    /// what is left of their TTL; an expired one does not.
+    #[test]
+    fn the_verdicts_outlive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer-verdicts");
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut before = PeerChainEvidence::<()>::default();
+        let (forked, compatible) = (PeerId::random(), PeerId::random());
+        before.mark_divergent(forked, 38_400, now);
+        before.mark_divergent(compatible, 38_400, now);
+        assert!(before.confirm_compatible_through(compatible, 38_400));
+        assert!(before.take_changed());
+        assert!(!before.take_changed(), "reported once");
+        before.save_verdicts(&path, now, wall).unwrap();
+
+        // Restarted ten minutes later.
+        let restarted = Instant::now();
+        let ten_minutes = Duration::from_secs(600);
+        let mut after = PeerChainEvidence::<()>::default();
+        assert_eq!(after.load_verdicts(&path, restarted, wall + ten_minutes).unwrap(), 1);
+        assert_eq!(after.divergence_height(&forked, restarted), Some(38_400));
+        assert!(!after.is_divergent(&compatible, restarted));
+        let left = PEER_CHAIN_EVIDENCE_TTL - ten_minutes;
+        assert!(after.is_divergent(&forked, restarted + left - Duration::from_secs(2)));
+        assert!(!after.is_divergent(&forked, restarted + left + Duration::from_secs(1)));
+
+        let mut late = PeerChainEvidence::<()>::default();
+        let two_hours = Duration::from_secs(7_200);
+        assert_eq!(late.load_verdicts(&path, restarted, wall + two_hours).unwrap(), 0);
+        let mut fresh = PeerChainEvidence::<()>::default();
+        assert_eq!(fresh.load_verdicts(&directory.path().join("absent"), now, wall).unwrap(), 0);
+    }
+
     #[test]
     fn a_wanted_pin_probe_is_sent_once_per_timeout_to_a_free_connected_peer() {
         let now = Instant::now();
@@ -509,7 +700,9 @@ mod tests {
         assert_eq!(evidence.take_satisfied_wait(&gone, now), None);
         let silent = PeerId::random();
         evidence.want_pin_probe(silent, 38_400, false, "dropped on an empty answer");
-        evidence.cancel_pin_wait(&silent);
+        // The node says so when a manifest was dropped.
+        assert!(evidence.cancel_pin_wait(&silent), "a manifest was dropped");
+        assert!(!evidence.cancel_pin_wait(&silent), "nothing left to drop");
         evidence.observe_headers(silent, [&pinned], &pins, now);
         assert_eq!(evidence.take_satisfied_wait(&silent, now), None);
     }
@@ -531,6 +724,32 @@ mod tests {
         for i in 0..PEER_CHAIN_EVIDENCE_CAPACITY + 10 {
             evidence.mark_divergent(PeerId::random(), i as u64, now + Duration::from_millis(i as u64));
         }
-        assert_eq!(evidence.divergent.len(), PEER_CHAIN_EVIDENCE_CAPACITY);
+        assert!(evidence.divergent.len() <= PEER_CHAIN_EVIDENCE_CAPACITY);
+    }
+
+    /// Past the bound, every new identity sorted all the
+    /// verdicts to evict one (1.3 ms per mark in the event loop). The bound
+    /// now evicts down to three quarters at once, so the next quarter of new
+    /// identities sorts nothing; the verdicts closest to expiry still go
+    /// first.
+    #[test]
+    fn past_its_bound_the_evidence_is_pruned_a_quarter_at_a_time() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let mut peers = Vec::new();
+        for i in 0..=PEER_CHAIN_EVIDENCE_CAPACITY {
+            let peer = PeerId::random();
+            peers.push(peer);
+            evidence.mark_divergent(peer, i as u64, now + Duration::from_millis(i as u64));
+        }
+        let kept = PEER_CHAIN_EVIDENCE_CAPACITY * 3 / 4;
+        assert_eq!(evidence.divergent.len(), kept);
+        assert!(!evidence.divergent.contains_key(&peers[0]), "closest to expiry first");
+        assert!(evidence.divergent.contains_key(peers.last().unwrap()));
+        for i in 0..PEER_CHAIN_EVIDENCE_CAPACITY - kept {
+            let later = now + Duration::from_secs(1) + Duration::from_millis(i as u64);
+            evidence.mark_divergent(PeerId::random(), 1, later);
+        }
+        assert_eq!(evidence.divergent.len(), PEER_CHAIN_EVIDENCE_CAPACITY, "nothing evicted");
     }
 }

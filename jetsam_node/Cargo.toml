@@ -9,6 +9,9 @@ license.workspace = true
 # directory). Orthogonal to the fork: a testnet build can carry the v1.2 fork
 # dormant or armed, exactly like a mainnet build.
 testnet = ["jetsam_chain/testnet"]
+# PRIVATE BUILDS ONLY: see the feature of the
+# same name in jetsam_chain. Never a release build.
+rehearsal-v1-6 = ["testnet", "jetsam_chain/rehearsal-v1-6"]
 
 # --- Daemon ---
 [[bin]]

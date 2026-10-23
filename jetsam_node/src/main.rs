@@ -730,7 +730,11 @@ impl MiningPeerQuorum {
                 .nonce_search_ready
     }
 
-    fn probe_candidates(&self, limit: usize) -> Vec<libp2p::PeerId> {
+    fn probe_candidates(
+        &self,
+        limit: usize,
+        excluded: &std::collections::HashSet<libp2p::PeerId>,
+    ) -> Vec<libp2p::PeerId> {
         let mut confirmed = self
             .frontier_confirmed
             .iter()
@@ -757,6 +761,7 @@ impl MiningPeerQuorum {
             .into_iter()
             .map(|(peer, _)| peer)
             .chain(confirmed.into_iter().map(|(peer, _)| peer))
+            .filter(|peer| !excluded.contains(peer))
             .take(limit)
             .collect()
     }
@@ -1161,6 +1166,12 @@ struct EmbeddedHistoryStepRuntimes {
     /// matrix fetcher, with the memo of verified lanes (M3.8). Present
     /// exactly when the v1.5 runtime is.
     client_matrices: Option<Arc<jetsam_recursive::HistoryStepClientMatrixSet>>,
+    /// The v1.6 relation (m = 23 / 25, batch slot over `D_batch`), from the
+    /// v1.6 height.
+    v1_6: Option<Arc<jetsam_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    /// The registered form-Z matrices (v1.6 batch entries), under the hiding
+    /// form's own rule. Present exactly when the v1.6 runtime is.
+    client_matrices_z: Option<Arc<jetsam_recursive::HistoryStepClientMatrixSet>>,
 }
 
 impl EmbeddedHistoryStepRuntimes {
@@ -1173,12 +1184,18 @@ impl EmbeddedHistoryStepRuntimes {
             embedded_history_step_pack::HistoryStepPackGeneration::V1 => self.pre_fork.as_ref(),
             embedded_history_step_pack::HistoryStepPackGeneration::V1_3 => self.post_fork.as_ref(),
             embedded_history_step_pack::HistoryStepPackGeneration::V1_5 => self.v1_5.as_ref(),
+            // An armed v1.6 clock without the v1.6 pack is refused at startup
+            // (`v1_6_relation_coverage`).
+            embedded_history_step_pack::HistoryStepPackGeneration::V1_6 => self.v1_6.as_ref(),
         }
     }
 
     /// Whether this build can verify anything at all.
     fn is_empty(&self) -> bool {
-        self.pre_fork.is_none() && self.post_fork.is_none() && self.v1_5.is_none()
+        self.pre_fork.is_none()
+            && self.post_fork.is_none()
+            && self.v1_5.is_none()
+            && self.v1_6.is_none()
     }
 
     /// The prover for the block at `height`, as the miner and the external
@@ -1210,6 +1227,9 @@ fn embedded_history_step_runtimes(
     // operator's terminal.
     let v1_3_activation = jetsam_chain::consensus::params::V1_3_ACTIVATION_HEIGHT;
     let v1_5_activation = jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT;
+    embedded_history_step_pack::v1_6_relation_coverage(
+        jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT,
+    )?;
     let carried = [
         embedded_history_step_pack::embedded_history_step_pack().is_some(),
         embedded_history_step_pack::embedded_history_step_pack_v1_3().is_some(),
@@ -1247,6 +1267,10 @@ fn embedded_history_step_runtimes(
             "v1.5",
             embedded_history_step_pack::embedded_history_step_pack_v1_5(),
         ),
+        (
+            "v1.6",
+            embedded_history_step_pack::embedded_history_step_pack_v1_6(),
+        ),
     ] {
         if let Some(pack) = pack {
             verify_embedded_development_payout_pins(label, pack)?;
@@ -1259,6 +1283,27 @@ fn embedded_history_step_runtimes(
             activation.saturating_sub(1),
             embedded_history_step_pack::HistoryStepPackGeneration::V1_5,
         )?,
+        None => None,
+    };
+    // The v1.6 relation is rooted at the block before the v1.6 height. Its
+    // metadata names the chain's batch class, frozen here once (tens of
+    // seconds) and checked against CLIENT_BATCH_CLASS.
+    let v1_6_runtime = match jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT {
+        Some(activation) => {
+            let started = std::time::Instant::now();
+            let runtime = embedded_history_step_runtime_from_pack(
+                data_dir,
+                embedded_history_step_pack::embedded_history_step_pack_v1_6(),
+                activation.saturating_sub(1),
+                embedded_history_step_pack::HistoryStepPackGeneration::V1_6,
+            )?;
+            tracing::info!(
+                v1_6_height = activation,
+                seconds = started.elapsed().as_secs_f64(),
+                "v1.6 HistoryStep relation ready (batch class frozen and checked)"
+            );
+            runtime
+        }
         None => None,
     };
     Ok(EmbeddedHistoryStepRuntimes {
@@ -1290,6 +1335,12 @@ fn embedded_history_step_runtimes(
             .as_ref()
             .and_then(|runtime| runtime.bank().client_form().cloned())
             .map(|form| Arc::new(jetsam_recursive::HistoryStepClientMatrixSet::new(&form))),
+        client_matrices_z: v1_6_runtime.as_ref().map(|_| {
+            Arc::new(jetsam_recursive::HistoryStepClientMatrixSet::new(
+                &jetsam_recursive::HistoryStepClientForm::canonical_z(),
+            ))
+        }),
+        v1_6: v1_6_runtime,
     })
 }
 
@@ -1477,6 +1528,7 @@ fn prepare_history_step_ghost_authorization() -> Result<
 
 mod config;
 mod peer_chain_evidence;
+mod repeated_warnings;
 mod embedded_history_step_pack;
 mod log_highlight;
 mod sync_phase_telemetry;
@@ -2104,6 +2156,169 @@ fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open the stored chain and hold it against the pinned blocks
+/// (`HARD_CHECKPOINTS`). Every new header is checked against them, but a chain
+/// stored by an older release never was: a node that followed the 1.4.3
+/// branch past 38 400 resumed it, could not take a single canonical block, and
+/// blamed its peers for it. A stored chain holding another
+/// block at a pinned height is moved aside — chain database, snapshot
+/// folders and peer verdicts into `refused-chain-<height>-<unix time>`,
+/// nothing deleted, the wallet files left in place and copied along — and the
+/// node starts again from genesis.
+fn open_chain_on_pinned_branch(
+    data_dir: &Path,
+    pins: &[(u64, [u8; 32])],
+) -> anyhow::Result<MdbxChainContext> {
+    let ctx = MdbxChainContext::open_or_create(data_dir).context("open MDBX")?;
+    let mut refused = None;
+    for &(height, pinned) in pins {
+        if height > ctx.tip_height() {
+            continue;
+        }
+        let stored = ctx
+            .get_header_from_store(height)
+            .context("read a stored header at a pinned height")?
+            .map(|header| jetsam_chain::block_header::block_id(&header));
+        if let Some(stored) = stored.filter(|stored| *stored != pinned) {
+            refused = Some((height, stored, pinned));
+            break;
+        }
+    }
+    let Some((height, stored, pinned)) = refused else {
+        return Ok(ctx);
+    };
+    let tip_height = ctx.tip_height();
+    drop(ctx);
+
+    let unix_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let aside = data_dir.join(format!("refused-chain-{tip_height}-{unix_time}"));
+    std::fs::create_dir(&aside).with_context(|| format!("create {}", aside.display()))?;
+    for entry in
+        std::fs::read_dir(data_dir).with_context(|| format!("read {}", data_dir.display()))?
+    {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("wallet") && path.is_file() {
+            std::fs::copy(&path, aside.join(name))
+                .with_context(|| format!("copy {} aside", path.display()))?;
+        } else if name == "mdbx.dat"
+            || name == "mdbx.lck"
+            || name.starts_with("snapshot-")
+            // Verdicts taken from that chain's point of view.
+            || name == "peer-verdicts"
+        {
+            std::fs::rename(&path, aside.join(name))
+                .with_context(|| format!("move {} aside", path.display()))?;
+        }
+    }
+    tracing::error!(
+        pinned_height = height,
+        stored_block = %hex::encode(stored),
+        pinned_block = %hex::encode(pinned),
+        stored_tip = tip_height,
+        moved_to = %aside.display(),
+        "the stored chain is on a branch this release refuses: it holds another block at a \
+         pinned height (data from an older release that followed the other side of a fork). \
+         It was moved aside, nothing deleted; the wallet stays in place, with a copy in that \
+         folder. Syncing again from genesis."
+    );
+    MdbxChainContext::open_or_create(data_dir).context("open MDBX")
+}
+
+#[cfg(test)]
+mod stored_chain_pin_tests {
+    use super::open_chain_on_pinned_branch;
+    use jetsam_chain::block_header::block_id;
+    use jetsam_chain::consensus::genesis::genesis_header;
+    use std::path::{Path, PathBuf};
+
+    /// A data directory holding a stored chain (genesis), a wallet and the
+    /// snapshot folders a running node leaves behind.
+    fn data_dir_with_chain_and_wallet() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        drop(jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap());
+        for (name, bytes) in [("wallet.key", &b"key"[..]), ("wallet.receipts", b"receipts")] {
+            std::fs::write(directory.path().join(name), bytes).unwrap();
+        }
+        for folder in ["snapshot-exports", "snapshot-header-staging"] {
+            std::fs::create_dir(directory.path().join(folder)).unwrap();
+            std::fs::write(directory.path().join(folder).join("of-the-stored-chain"), b"x").unwrap();
+        }
+        directory
+    }
+
+    fn set_aside_folders(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("refused-chain-"))
+            })
+            .collect()
+    }
+
+    /// A node whose data followed the 1.4.3 branch
+    /// past 38 400 was upgraded in place. It resumed that branch without
+    /// re-checking it, said it was ready to mine as soon as a 1.4.3 peer
+    /// shared its tip, and stayed there; the remedy that worked by hand was to
+    /// move the chain files aside, wallet kept. Here a pin at a stored height
+    /// names another block: the stored chain is set aside (moved, nothing
+    /// deleted) with every wallet file copied along, the wallet stays where
+    /// it is, and the node starts again from genesis.
+    #[test]
+    fn a_stored_chain_holding_another_block_at_a_pinned_height_is_set_aside() {
+        let directory = data_dir_with_chain_and_wallet();
+        let chain = open_chain_on_pinned_branch(directory.path(), &[(0, [0xAA; 32])]).unwrap();
+        assert_eq!(chain.tip_height(), 0, "the node starts again from genesis");
+        drop(chain);
+
+        let aside = set_aside_folders(directory.path());
+        assert_eq!(aside.len(), 1, "one folder holds what was set aside");
+        let aside = &aside[0];
+        assert!(aside.join("mdbx.dat").is_file(), "the stored chain was moved, not deleted");
+        for folder in ["snapshot-exports", "snapshot-header-staging"] {
+            assert!(aside.join(folder).join("of-the-stored-chain").is_file(), "{folder} moved");
+            assert!(!directory.path().join(folder).exists(), "{folder} left behind");
+        }
+        for (name, bytes) in [("wallet.key", &b"key"[..]), ("wallet.receipts", b"receipts")] {
+            assert_eq!(std::fs::read(directory.path().join(name)).unwrap(), bytes, "{name} kept");
+            assert_eq!(std::fs::read(aside.join(name)).unwrap(), bytes, "{name} copied along");
+        }
+    }
+
+    /// The divergence verdicts the node took while it followed the refused
+    /// branch accuse the honest peers: they go aside with that chain.
+    #[test]
+    fn the_verdicts_taken_on_a_refused_chain_go_aside_with_it() {
+        let directory = data_dir_with_chain_and_wallet();
+        std::fs::write(directory.path().join("peer-verdicts"), b"verdicts").unwrap();
+        drop(open_chain_on_pinned_branch(directory.path(), &[(0, [0xAA; 32])]).unwrap());
+        let aside = set_aside_folders(directory.path());
+        assert!(aside[0].join("peer-verdicts").is_file());
+        assert!(!directory.path().join("peer-verdicts").exists());
+    }
+
+    /// A stored chain that holds the pinned block, or that has not reached a
+    /// pinned height, is left exactly where it is.
+    #[test]
+    fn a_stored_chain_on_its_pins_is_left_alone() {
+        let genesis = block_id(&genesis_header());
+        for pins in [vec![(0, genesis)], vec![(5, [0xAA; 32])], vec![]] {
+            let directory = data_dir_with_chain_and_wallet();
+            drop(open_chain_on_pinned_branch(directory.path(), &pins).unwrap());
+            assert!(set_aside_folders(directory.path()).is_empty(), "pins {pins:?}");
+            assert!(directory.path().join("mdbx.dat").is_file());
+            assert!(directory.path().join("snapshot-exports/of-the-stored-chain").is_file());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2169,6 +2384,18 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
         "{}",
         v1_5_arming_line(jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT)
     );
+    println!(
+        "{}",
+        v1_6_arming_line(jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT)
+    );
+}
+
+/// The v1.6 clock as `--bench` reports it, read back the same way.
+fn v1_6_arming_line(activation: Option<u64>) -> String {
+    match activation {
+        Some(height) => format!("From block {height} the chain runs the v1.6 rules."),
+        None => "This build does not arm the v1.6 rules.".to_owned(),
+    }
 }
 
 /// The v1.5 clock as `--bench` reports it: a release reads the height back
@@ -2197,6 +2424,24 @@ mod bench_v1_5_line_tests {
         assert_eq!(
             v1_5_arming_line(None),
             "This build does not arm the v1.5 rules."
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_v1_6_line_tests {
+    use super::v1_6_arming_line;
+
+    /// The same read-back for the v1.6 clock.
+    #[test]
+    fn the_bench_names_the_v1_6_height_or_says_it_is_not_armed() {
+        assert_eq!(
+            v1_6_arming_line(Some(6_720)),
+            "From block 6720 the chain runs the v1.6 rules."
+        );
+        assert_eq!(
+            v1_6_arming_line(None),
+            "This build does not arm the v1.6 rules."
         );
     }
 }
@@ -2564,7 +2809,10 @@ async fn main() -> anyhow::Result<()> {
     if cli.purge_state {
         purge_chain_state(&data_dir)?;
     }
-    let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
+    let ctx = open_chain_on_pinned_branch(
+        &data_dir,
+        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+    )?;
     let tip_height = ctx.tip_height();
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
@@ -2576,9 +2824,23 @@ async fn main() -> anyhow::Result<()> {
             Some(matrices) => {
                 let form = matrices.form().clone();
                 let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+                // v1.6: the form-Z matrix set and the batches,
+                // when the v1.6 relation is embedded.
+                let v1_6 = match (&history_step_runtimes.v1_6, &history_step_runtimes.client_matrices_z) {
+                    (Some(runtime), Some(matrices_z)) => Some((
+                        Arc::clone(matrices_z),
+                        Arc::new(jetsam_node::client_batches::ClientBatches::new(
+                            Arc::clone(runtime),
+                            Arc::clone(matrices_z),
+                            rules,
+                            jetsam_chain::consensus::client_objects::ClientBatchRules::current(),
+                        )),
+                    )),
+                    _ => None,
+                };
                 let objects = Arc::new(
-                    jetsam_node::client_objects::ClientObjects::open(
-                        &data_dir, &form, matrices, &rules,
+                    jetsam_node::client_objects::ClientObjects::open_with_v1_6(
+                        &data_dir, &form, matrices, &rules, v1_6,
                     )
                     .context("open v1.5 client objects")?,
                 );
@@ -2586,12 +2848,7 @@ async fn main() -> anyhow::Result<()> {
                 // disk awaits its authentication instead); the held ones and
                 // the client proofs kept before a restart are reloaded off
                 // the startup path.
-                objects.want_matrices(
-                    ctx.client_registry()
-                        .entries()
-                        .iter()
-                        .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
-                );
+                objects.want_matrices(ctx.client_registry().digests());
                 spawn_held_client_objects_reload(
                     Arc::clone(&objects),
                     ctx.client_registry().clone(),
@@ -4639,6 +4896,11 @@ enum SnapshotBoundaryVerificationOutcome {
     CandidateRejected {
         error: String,
         authority: Option<RetainedSnapshotHeaderAuthority>,
+        /// The `D` of the live client lanes whose matrix this node did not
+        /// hold, as the verifier asked for them (`MissingClientMatrices`):
+        /// set for a "client matrix unavailable" refusal, empty otherwise
+        /// (a typed list, not text).
+        missing_client_matrices: Vec<[u8; 32]>,
     },
     BaseMoved {
         error: String,
@@ -4692,6 +4954,7 @@ fn verify_terminal_against_validated_snapshot_headers(
 
     let terminal_len = terminal_bytes.len() as u64;
     let terminal_started = Instant::now();
+    let mut missing_client_matrices = Vec::new();
     let terminal_result = {
         let ctx = chain.blocking_read();
         // The branch being judged is the candidate's, not this node's: the
@@ -4706,7 +4969,14 @@ fn verify_terminal_against_validated_snapshot_headers(
             boundary.tip_header,
             boundary.epoch_anchor_header,
             terminal_bytes,
-            |claim| verify_history_step_terminal_on_branch(claim, runtimes, &mut header_at),
+            |claim| {
+                verify_history_step_terminal_recording_missing(
+                    claim,
+                    runtimes,
+                    &mut header_at,
+                    &mut missing_client_matrices,
+                )
+            },
         )
     };
     let measurement = SyncPhaseMeasurement::new(
@@ -4741,6 +5011,10 @@ fn verify_terminal_against_validated_snapshot_headers(
                 // plan and take the next one. Anything else here would hand a
                 // peer a way to end the process by omission.
                 SnapshotBoundaryVerificationOutcome::CandidateRejected {
+                    missing_client_matrices: missing_client_matrices_of_refusal(
+                        &error,
+                        missing_client_matrices,
+                    ),
                     error: message,
                     authority: Some(authority),
                 }
@@ -4911,6 +5185,18 @@ fn verify_history_step_terminal_on_branch(
     runtimes: &EmbeddedHistoryStepRuntimes,
     header_at: &mut dyn FnMut(u64) -> Option<jetsam_chain::BlockHeader>,
 ) -> Result<jetsam_chain::consensus::client_objects::TerminalClientView, String> {
+    verify_history_step_terminal_recording_missing(claim, runtimes, header_at, &mut Vec::new())
+}
+
+/// [`verify_history_step_terminal_on_branch`], noting in `missing` the `D`
+/// of every client matrix the verifier asked for and this node does not
+/// hold (`MissingClientMatrices`).
+fn verify_history_step_terminal_recording_missing(
+    claim: &jetsam_chain::storage::HistoryStepTerminalClaim<'_>,
+    runtimes: &EmbeddedHistoryStepRuntimes,
+    header_at: &mut dyn FnMut(u64) -> Option<jetsam_chain::BlockHeader>,
+    missing: &mut Vec<[u8; 32]>,
+) -> Result<jetsam_chain::consensus::client_objects::TerminalClientView, String> {
     // The pack is chosen by the height of the block being verified, not by
     // the node's tip: a terminal proved before the fork is only ever
     // verifiable against the matrices that produced it.
@@ -4948,10 +5234,16 @@ fn verify_history_step_terminal_on_branch(
     } else {
         None
     };
-    let client_matrices = runtimes
-        .client_matrices
-        .as_deref()
-        .map(|matrices| matrices as &dyn jetsam_recursive::HistoryStepClientMatrices);
+    // A v1.6 tip's live lanes are form-Z entries only (a batch uses form-Z
+    // entries only, and the v1.6 lanes start dead at the v1.6 height).
+    let matrix_set = if generation.carries_batch_slot() {
+        runtimes.client_matrices_z.as_deref()
+    } else {
+        runtimes.client_matrices.as_deref()
+    };
+    let client_matrices = matrix_set.map(|matrices| {
+        MissingClientMatrices::new(matrices as &dyn jetsam_recursive::HistoryStepClientMatrices)
+    });
     let accepted = jetsam_miner::install_inbound_verifier_cpu(|| {
         jetsam_recursive::decode_verify_history_step_terminal_rooted_with_client_matrices(
             runtime,
@@ -4960,12 +5252,21 @@ fn verify_history_step_terminal_on_branch(
             &claim.epoch_anchor_header,
             previous_epoch_anchor_header.as_ref(),
             recursion_root.as_ref(),
-            client_matrices,
+            client_matrices
+                .as_ref()
+                .map(|matrices| matrices as &dyn jetsam_recursive::HistoryStepClientMatrices),
         )
     })
-    .map_err(|error| format!("HistoryStep verification CPU admission failed: {error}"))?
-    .map_err(|error| history_step_verification_failure(claim.header.height, error))?;
-    Ok(terminal_client_view(accepted.client_claim()))
+    .map_err(|error| format!("HistoryStep verification CPU admission failed: {error}"))?;
+    if let Some(recorder) = &client_matrices {
+        *missing = recorder.missing();
+    }
+    let accepted =
+        accepted.map_err(|error| history_step_verification_failure(claim.header.height, error))?;
+    Ok(match accepted.batch_claim() {
+        Some(batch) => terminal_batch_view(batch),
+        None => terminal_client_view(accepted.client_claim()),
+    })
 }
 
 /// The text a verifier failure travels as (the classifiers match on it): a
@@ -4983,6 +5284,82 @@ fn history_step_verification_failure(
              matrix this node does not hold yet"
         ),
         error => format!("HistoryStep terminal rejected: {error}"),
+    }
+}
+
+/// The matrices a verification looked for and this node does not hold:
+/// the `D` of the live client lanes of a terminal whose
+/// class obligations hold (`ClientMatrixUnavailable` is said of no other) —
+/// the one authenticated statement of which matrices a snapshot candidate
+/// needs before its manifest's registry is checked at the install.
+struct MissingClientMatrices<'a> {
+    inner: &'a dyn jetsam_recursive::HistoryStepClientMatrices,
+    missing: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+impl<'a> MissingClientMatrices<'a> {
+    fn new(inner: &'a dyn jetsam_recursive::HistoryStepClientMatrices) -> Self {
+        Self {
+            inner,
+            missing: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn missing(&self) -> Vec<[u8; 32]> {
+        self.missing.lock().expect("missing client matrices lock").clone()
+    }
+}
+
+impl jetsam_recursive::HistoryStepClientMatrices for MissingClientMatrices<'_> {
+    fn client_matrix(
+        &self,
+        digest: &[u8; 32],
+    ) -> Option<Arc<jetsam_ivc_core::field_r1cs::FieldR1cs>> {
+        let matrix = self.inner.client_matrix(digest);
+        if matrix.is_none() {
+            let mut missing = self.missing.lock().expect("missing client matrices lock");
+            if !missing.contains(digest) {
+                missing.push(*digest);
+            }
+        }
+        matrix
+    }
+
+    fn lane_verified(
+        &self,
+        digest: &[u8; 32],
+        claim: &jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim,
+    ) -> bool {
+        self.inner.lane_verified(digest, claim)
+    }
+
+    fn record_lane_verified(
+        &self,
+        digest: &[u8; 32],
+        claim: &jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim,
+    ) {
+        self.inner.record_lane_verified(digest, claim)
+    }
+
+    fn count_evaluation(&self) {
+        self.inner.count_evaluation()
+    }
+}
+
+/// The matrices a refused snapshot candidate waits for: what the verifier
+/// recorded missing (`recorded`), for a "client matrix unavailable" refusal
+/// only — the one statement of which matrices a verified terminal needs
+/// (a typed list, never read back from the error's text,
+/// which no peer's bytes can then reach).
+fn missing_client_matrices_of_refusal(
+    error: &jetsam_chain::storage::MdbxContextError,
+    recorded: Vec<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    match error {
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            jetsam_chain::consensus::ConsensusError::BadHistoryStepTerminal(message),
+        ) if message.contains(CLIENT_MATRIX_UNAVAILABLE) => recorded,
+        _ => Vec::new(),
     }
 }
 
@@ -5013,8 +5390,18 @@ fn terminal_client_view(
                 io_commitment: carried.io_commitment,
             }),
             registry_leaves: Some(claim.registry.clone()),
+            batch: None,
         },
     }
+}
+
+/// The batch lanes a verified v1.6 terminal publishes, as the chain checks
+/// them: no carried client, the registry leaves, the carried
+/// batch.
+fn terminal_batch_view(
+    claim: &jetsam_recursive::HistoryStepBatchClaim,
+) -> jetsam_chain::consensus::client_objects::TerminalClientView {
+    jetsam_miner::terminal_batch_view_of_claim(claim)
 }
 
 fn history_step_context_error_is_terminal_peer_fault(
@@ -6319,7 +6706,8 @@ mod tests {
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
         snapshot_generation_probe_peers, superseded_snapshot_plan_source, Duration, Instant,
         ClientMatrixWait, ClientMatrixWaitEnd, CLIENT_MATRIX_WAIT_LIMIT,
-        client_matrices_wanted, AwaitedSnapshotMatrices,
+        client_matrices_wanted, AwaitedSnapshotMatrices, client_matrix_wait_manifest_peer,
+        missing_client_matrices_of_refusal, MissingClientMatrices,
         CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
@@ -7333,7 +7721,14 @@ mod tests {
         };
         let (listed, unlisted) = (entry(0, 0xD1), entry(1, 0xD2));
         let rules = ClientObjectRules {
-            catalogue: Box::leak(vec![listed.matrix_digest].into_boxed_slice()),
+            catalogue: Box::leak(
+                vec![jetsam_chain::consensus::client_objects::CatalogueEntry {
+                    matrix_digest: listed.matrix_digest,
+                    matrix_file_root: listed.matrix_file_root,
+                    matrix_file_len: listed.matrix_file_len,
+                }]
+                .into_boxed_slice(),
+            ),
             ..ClientObjectRules::CONSENSUS
         };
         let directory = tempfile::tempdir().unwrap();
@@ -7362,10 +7757,7 @@ mod tests {
         let start = Instant::now();
         let mut wait = ClientMatrixWait::default();
         wait.begin(start);
-        let awaited = AwaitedSnapshotMatrices {
-            boundary,
-            registry: candidate,
-        };
+        let awaited = AwaitedSnapshotMatrices::of(boundary, &candidate);
         // The next heartbeat: no candidate any more, the chain still empty.
         objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
         assert_eq!(
@@ -7382,6 +7774,684 @@ mod tests {
         // Once the chain is at the boundary, its own registry decides.
         objects.want_only_matrices(&client_matrices_wanted(&chain, boundary, None, Some(&awaited)));
         assert!(objects.fetching_matrices().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The matrices a refused snapshot candidate leaves
+    // awaited come from a manifest nobody has authenticated yet.
+    // -----------------------------------------------------------------------
+
+    fn fetch_objects(
+        catalogue: Vec<[u8; 32]>,
+    ) -> (tempfile::TempDir, jetsam_node::client_objects::ClientObjects) {
+        use jetsam_chain::consensus::client_objects::ClientObjectRules;
+        use jetsam_ivc_core::field::F128;
+        use jetsam_ivc_core::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+        use jetsam_ivc_core::pcs::{PcsParams, LOG_PACKING};
+        use jetsam_ivc_core::proof::FieldShape;
+        use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use jetsam_recursive::{HistoryStepClientForm, HistoryStepClientMatrixSet};
+        let (shape, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(8, 8, 1);
+        let form = HistoryStepClientForm::new(
+            FieldShape::of(&shape),
+            PcsParams {
+                m: 8 + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile: Default::default(),
+            },
+            PublicIoSpec {
+                io_slice: WitnessSlice {
+                    log2_len: 3,
+                    index: 1,
+                },
+                io_len: 8,
+                claims: Vec::new(),
+            },
+            2,
+        );
+        let rules = ClientObjectRules {
+            catalogue: Box::leak(
+                catalogue
+                    .iter()
+                    .map(|digest| jetsam_chain::consensus::client_objects::CatalogueEntry {
+                        matrix_digest: *digest,
+                        matrix_file_root: [0x2E; 32],
+                        matrix_file_len: 4_096,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            ..ClientObjectRules::CONSENSUS
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let objects = jetsam_node::client_objects::ClientObjects::open(
+            directory.path(),
+            &form,
+            std::sync::Arc::new(HistoryStepClientMatrixSet::new(&form)),
+            &rules,
+        )
+        .unwrap();
+        (directory, objects)
+    }
+
+    /// A registry naming `(D, file root byte)` pairs.
+    fn fetch_registry(
+        entries: &[([u8; 32], u8)],
+    ) -> jetsam_chain::consensus::client_objects::ClientRegistryState {
+        use jetsam_chain::consensus::client_objects::{
+            ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState, LicenseSplit,
+        };
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&ClientObjectsEffect {
+            registrations: entries
+                .iter()
+                .enumerate()
+                .map(|(index, (digest, root))| ClientRegistryEntry {
+                    index: index as u8,
+                    matrix_digest: *digest,
+                    matrix_file_root: [*root; 32],
+                    matrix_file_len: 4_096,
+                    registered_at: 1_219,
+                    active_from: 1_239,
+                    license: LicenseSplit::default(),
+                })
+                .collect(),
+            ..ClientObjectsEffect::default()
+        });
+        registry
+    }
+
+    fn fetch_file(
+        digest: [u8; 32],
+        root: u8,
+    ) -> jetsam_p2p::client_object_protocol::MatrixFileId {
+        jetsam_p2p::client_object_protocol::MatrixFileId {
+            matrix_digest: digest,
+            file_root: [root; 32],
+            file_len: 4_096,
+        }
+    }
+
+    /// The reported attack: the honest candidate's matrix X is being fetched
+    /// and awaited; the next round's manifest (an attacker's, for the same
+    /// honest boundary and terminal, which needs X) carries NO registry, or
+    /// one that omits X. Its refusal for want of X overwrote the awaited
+    /// registry with nothing: the next tend dropped X's fetch and the wait
+    /// ended as if X were held. What is awaited is now the `D` the verified
+    /// terminal asked for, whatever the manifest names: nothing is dropped.
+    #[test]
+    fn fetch_a_registryless_manifest_refused_for_a_matrix_keeps_the_honest_fetch() {
+        let x = [0xD1u8; 32];
+        let (_dir, objects) = fetch_objects(vec![x]);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let honest = fetch_registry(&[(x, 0x2E)]);
+        let boundary = 1_578;
+        let mut awaited = AwaitedSnapshotMatrices::default();
+        // Round 1, honest: fetched for the candidate, refused for want of X.
+        objects.want_only_matrices(&client_matrices_wanted(&chain, 0, Some(&honest), None));
+        assert!(objects.note_matrices_needed());
+        awaited.await_refused_candidate(0, boundary, Some(&honest), &[x]);
+        objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+        assert_eq!(objects.fetching_matrices(), vec![fetch_file(x, 0x2E)]);
+        // Round 2: the attacker's manifest, no registry (or one that omits X).
+        let start = Instant::now();
+        let mut wait = ClientMatrixWait::default();
+        wait.begin(start);
+        for attacker in [None, Some(fetch_registry(&[([0xD7; 32], 0x77)]))] {
+            awaited.await_refused_candidate(0, boundary, attacker.as_ref(), &[x]);
+            objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+            assert_eq!(
+                objects.fetching_matrices(),
+                vec![fetch_file(x, 0x2E)],
+                "the honest fetch of X is dropped by the attacker's manifest"
+            );
+            assert_eq!(
+                wait.end(start + Duration::from_secs(2), objects.awaits_matrices()),
+                None,
+                "the wait ends as if X were held"
+            );
+        }
+    }
+
+    /// A decoy: the attacker's manifest names X with a root nobody serves.
+    /// It never was the honest file's equal: the file fetched for X is the
+    /// catalogue's, and the decoy is never awaited nor fetched, however
+    /// many rounds name one.
+    #[test]
+    fn fetch_a_decoy_file_does_not_evict_the_honest_one() {
+        let x = [0xD1u8; 32];
+        let (_dir, objects) = fetch_objects(vec![x]);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let boundary = 1_578;
+        let mut awaited = AwaitedSnapshotMatrices::default();
+        awaited.await_refused_candidate(0, boundary, Some(&fetch_registry(&[(x, 0x2E)])), &[x]);
+        for root in [0xDEu8, 0xD0, 0xD3, 0xD4] {
+            awaited.await_refused_candidate(0, boundary, Some(&fetch_registry(&[(x, root)])), &[x]);
+            objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+            assert_eq!(objects.fetching_matrices(), vec![fetch_file(x, 0x2E)]);
+        }
+        assert_eq!(awaited.wanted_at(0), vec![x], "one entry per D");
+    }
+
+    /// A forged registry of 16 catalogue `D` (roots nobody serves) refused
+    /// for want of X awaited all 16 and held every fetch slot, X's included.
+    /// Only the matrices the verified terminal asked for are awaited.
+    #[test]
+    fn fetch_a_forged_registry_awaits_only_the_matrices_the_terminal_needs() {
+        let forged: Vec<[u8; 32]> = (1u8..=15).map(|i| [i; 32]).collect();
+        let x = [0xD1u8; 32];
+        let mut catalogue = forged.clone();
+        catalogue.push(x);
+        let (_dir, objects) = fetch_objects(catalogue);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let mut entries: Vec<([u8; 32], u8)> =
+            forged.iter().map(|digest| (*digest, 0xEE)).collect();
+        entries.push((x, 0x2E));
+        let forged_registry = fetch_registry(&entries);
+        assert_eq!(forged_registry.entries().len(), 16);
+        let mut awaited = AwaitedSnapshotMatrices::default();
+        awaited.await_refused_candidate(0, 1_578, Some(&forged_registry), &[x]);
+        assert_eq!(awaited.wanted_at(0), vec![x]);
+        objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+        assert_eq!(objects.fetching_matrices(), vec![fetch_file(x, 0x2E)]);
+    }
+
+    /// A refusal never shrinks what is awaited: a second candidate refused
+    /// for want of another matrix adds it; each is forgotten once the chain
+    /// reaches its own boundary.
+    #[test]
+    fn fetch_awaited_files_add_up_and_expire_at_their_own_boundary() {
+        let (x, y) = ([0xD1u8; 32], [0xD2u8; 32]);
+        let mut awaited = AwaitedSnapshotMatrices::default();
+        awaited.await_refused_candidate(0, 1_578, Some(&fetch_registry(&[(x, 0x2E)])), &[x]);
+        awaited.await_refused_candidate(
+            0,
+            1_600,
+            Some(&fetch_registry(&[(x, 0x2E), (y, 0x3E)])),
+            &[y],
+        );
+        assert_eq!(awaited.wanted_at(0), vec![x, y]);
+        assert_eq!(awaited.wanted_at(1_578), vec![y]);
+        assert!(awaited.wanted_at(1_600).is_empty());
+        // The same matrix named again under a later boundary lives to it.
+        awaited.await_refused_candidate(0, 1_700, Some(&fetch_registry(&[(x, 0x2E)])), &[x]);
+        assert_eq!(awaited.wanted_at(1_650), vec![x]);
+        // A refusal that names no matrix (the verifier names at least one):
+        // the candidate's registry counts, by `D`.
+        let mut unnamed = AwaitedSnapshotMatrices::default();
+        unnamed.await_refused_candidate(0, 1_578, Some(&fetch_registry(&[(y, 0x99)])), &[]);
+        assert_eq!(unnamed.wanted_at(0), vec![y]);
+    }
+
+    /// The provider asked after a wait: the lowest peer id was asked every
+    /// time, so a provider whose id sorts low (a refused candidate's own)
+    /// was asked again after each wait. It rotates, away from the provider
+    /// of the refused candidate while another is left.
+    #[test]
+    fn fetch_the_wait_end_rotates_away_from_the_refused_provider() {
+        let mut peers: Vec<libp2p::PeerId> = (0..4).map(|_| libp2p::PeerId::random()).collect();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        let lowest = peers[0];
+        let all: std::collections::HashSet<libp2p::PeerId> = peers.iter().copied().collect();
+        let none = std::collections::HashSet::new();
+        let mut cursor = 0;
+        let mut asked = Vec::new();
+        for _ in 0..6 {
+            let peer = client_matrix_wait_manifest_peer(&all, &none, Some(lowest), &mut cursor)
+                .expect("a provider");
+            assert_ne!(peer, lowest, "the refused provider is asked again");
+            asked.push(peer);
+        }
+        let distinct: std::collections::HashSet<_> = asked.iter().collect();
+        assert_eq!(distinct.len(), 3, "the other providers take turns: {asked:?}");
+        // Alone, the refused provider is still asked.
+        let alone = std::collections::HashSet::from([lowest]);
+        assert_eq!(
+            client_matrix_wait_manifest_peer(&alone, &none, Some(lowest), &mut cursor),
+            Some(lowest)
+        );
+    }
+
+    /// The merge of v1.5.1 into v1.6 (the one conflict of `main.rs`): after
+    /// a client matrix wait, the provider is chosen by the rotation of v1.6
+    /// among the peers v1.5.1 does not refuse. A peer whose branch this node
+    /// refused (`peer_chain_evidence`, remembered across a disconnection) is
+    /// never asked — not in turn, and not as the refused provider left alone.
+    #[test]
+    fn the_wait_end_never_asks_a_peer_whose_branch_this_node_refused() {
+        let mut peers: Vec<libp2p::PeerId> = (0..4).map(|_| libp2p::PeerId::random()).collect();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        let (refused_provider, divergent) = (peers[0], peers[2]);
+        let all: std::collections::HashSet<libp2p::PeerId> = peers.iter().copied().collect();
+        let now = std::time::Instant::now();
+        let mut evidence = crate::peer_chain_evidence::PeerChainEvidence::<()>::default();
+        evidence.mark_divergent(divergent, 38_400, now);
+        evidence.on_disconnect(&divergent);
+        // The construction of the event loop, as the merge resolved it.
+        let rejected_terminal_peers = std::collections::HashSet::new();
+        let divergent_peers = evidence.divergent_peers(now);
+        let excluded_peers = rejected_terminal_peers
+            .union(&divergent_peers)
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut cursor = 0;
+        let mut asked = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let peer = client_matrix_wait_manifest_peer(
+                &all,
+                &excluded_peers,
+                Some(refused_provider),
+                &mut cursor,
+            )
+            .expect("a provider");
+            assert_ne!(peer, divergent, "a refused branch is asked for a manifest");
+            assert_ne!(peer, refused_provider, "the refused provider is asked again");
+            asked.insert(peer);
+        }
+        assert_eq!(asked.len(), 2, "the two other providers take turns: {asked:?}");
+        // Alone, a divergent refused provider is not asked either.
+        let alone = std::collections::HashSet::from([divergent]);
+        assert_eq!(
+            client_matrix_wait_manifest_peer(&alone, &excluded_peers, Some(divergent), &mut cursor),
+            None
+        );
+    }
+
+    /// The `D` a "client matrix unavailable" verification found missing are
+    /// recorded as the verifier asks for them and travel in a typed field of
+    /// the refusal (not in the error's text, nothing is
+    /// read back from it). Nothing in the
+    /// text is read: a marker in it names nothing.
+    #[test]
+    fn fetch_a_client_matrix_unavailable_names_the_missing_matrices() {
+        use jetsam_recursive::{HistoryStepBankError, HistoryStepClientMatrices, HistoryStepError};
+        let (x, y) = ([0xD1u8; 32], [0x0Fu8; 32]);
+        let set = jetsam_recursive::HistoryStepClientMatrixSet::new(&{
+            use jetsam_ivc_core::field::F128;
+            use jetsam_ivc_core::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+            use jetsam_ivc_core::pcs::{PcsParams, LOG_PACKING};
+            use jetsam_ivc_core::proof::FieldShape;
+            use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+            let (shape, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(8, 8, 1);
+            jetsam_recursive::HistoryStepClientForm::new(
+                FieldShape::of(&shape),
+                PcsParams {
+                    m: 8 + LOG_PACKING,
+                    log_inv_rate: 2,
+                    log_batch_size: 2,
+                    profile: Default::default(),
+                },
+                PublicIoSpec {
+                    io_slice: WitnessSlice {
+                        log2_len: 3,
+                        index: 1,
+                    },
+                    io_len: 8,
+                    claims: Vec::new(),
+                },
+                2,
+            )
+        });
+        let recorder = MissingClientMatrices::new(&set);
+        assert!(recorder.client_matrix(&x).is_none());
+        assert!(recorder.client_matrix(&y).is_none());
+        assert!(recorder.client_matrix(&x).is_none());
+        assert_eq!(recorder.missing(), vec![x, y]);
+        let unavailable = history_step_verification_failure(
+            1_578,
+            HistoryStepError::Bank(HistoryStepBankError::ClientMatrixUnavailable),
+        );
+        // A marker of the former text encoding, ahead of everything: ignored.
+        let injected = bad_terminal(format!(
+            "missing matrices D: {} {unavailable}",
+            hex::encode([0xEEu8; 32])
+        ));
+        assert_eq!(
+            missing_client_matrices_of_refusal(&injected, recorder.missing()),
+            vec![x, y]
+        );
+        // Still no verdict, still charged to nobody.
+        let missing = bad_terminal(unavailable);
+        assert!(history_step_context_error_is_branch_boundary_gap(&missing));
+        assert!(!history_step_context_error_is_terminal_peer_fault(&missing));
+        assert_eq!(missing_client_matrices_of_refusal(&missing, vec![x]), vec![x]);
+        // Any other refusal waits for no matrix.
+        let other = bad_terminal(format!(
+            "{} branch header 7 is not available",
+            crate::BRANCH_BOUNDARY_UNAVAILABLE
+        ));
+        assert!(missing_client_matrices_of_refusal(&other, vec![x]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The catalogue pins the file of every `D`, so
+    // what an unauthenticated manifest names cannot steer what is fetched.
+    // -----------------------------------------------------------------------
+
+    /// A file of a few chunks (not a matrix: only its fetch is at stake) and
+    /// its catalogue entry under `digest`.
+    fn pin_file(
+        digest: [u8; 32],
+        seed: u8,
+    ) -> (Vec<u8>, jetsam_chain::consensus::client_objects::CatalogueEntry) {
+        use jetsam_chain::consensus::client_objects::{
+            matrix_file_root, CatalogueEntry, CLIENT_MATRIX_CHUNK_BYTES,
+        };
+        let file: Vec<u8> = (0..3 * CLIENT_MATRIX_CHUNK_BYTES + 5)
+            .map(|index| (index as u8).wrapping_mul(31) ^ seed)
+            .collect();
+        let entry = CatalogueEntry {
+            matrix_digest: digest,
+            matrix_file_root: matrix_file_root(&file),
+            matrix_file_len: file.len() as u32,
+        };
+        (file, entry)
+    }
+
+    /// An entry pinned to a file nobody serves in these tests.
+    fn pin_unserved(digest: [u8; 32]) -> jetsam_chain::consensus::client_objects::CatalogueEntry {
+        jetsam_chain::consensus::client_objects::CatalogueEntry {
+            matrix_digest: digest,
+            matrix_file_root: [0x5A; 32],
+            matrix_file_len: 4_096,
+        }
+    }
+
+    fn pin_id(
+        entry: &jetsam_chain::consensus::client_objects::CatalogueEntry,
+    ) -> jetsam_p2p::client_object_protocol::MatrixFileId {
+        jetsam_p2p::client_object_protocol::MatrixFileId {
+            matrix_digest: entry.matrix_digest,
+            file_root: entry.matrix_file_root,
+            file_len: entry.matrix_file_len,
+        }
+    }
+
+    /// The client objects of a node whose catalogue is exactly `catalogue`.
+    fn pin_objects(
+        catalogue: Vec<jetsam_chain::consensus::client_objects::CatalogueEntry>,
+    ) -> (tempfile::TempDir, jetsam_node::client_objects::ClientObjects) {
+        use jetsam_chain::consensus::client_objects::ClientObjectRules;
+        use jetsam_ivc_core::field::F128;
+        use jetsam_ivc_core::field_r1cs::{synthetic_satisfiable, FieldR1cs};
+        use jetsam_ivc_core::pcs::{PcsParams, LOG_PACKING};
+        use jetsam_ivc_core::proof::FieldShape;
+        use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use jetsam_recursive::{HistoryStepClientForm, HistoryStepClientMatrixSet};
+        let (shape, _): (FieldR1cs, Vec<F128>) = synthetic_satisfiable(8, 8, 1);
+        let form = HistoryStepClientForm::new(
+            FieldShape::of(&shape),
+            PcsParams {
+                m: 8 + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile: Default::default(),
+            },
+            PublicIoSpec {
+                io_slice: WitnessSlice {
+                    log2_len: 3,
+                    index: 1,
+                },
+                io_len: 8,
+                claims: Vec::new(),
+            },
+            2,
+        );
+        let rules = ClientObjectRules {
+            catalogue: Box::leak(catalogue.into_boxed_slice()),
+            ..ClientObjectRules::CONSENSUS
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let objects = jetsam_node::client_objects::ClientObjects::open(
+            directory.path(),
+            &form,
+            std::sync::Arc::new(HistoryStepClientMatrixSet::new(&form)),
+            &rules,
+        )
+        .unwrap();
+        (directory, objects)
+    }
+
+    /// A snapshot manifest's registry naming `(D, file root, file length)`.
+    fn pin_registry(
+        files: &[([u8; 32], [u8; 32], u32)],
+    ) -> jetsam_chain::consensus::client_objects::ClientRegistryState {
+        use jetsam_chain::consensus::client_objects::{
+            ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState, LicenseSplit,
+        };
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&ClientObjectsEffect {
+            registrations: files
+                .iter()
+                .enumerate()
+                .map(|(index, (digest, root, len))| ClientRegistryEntry {
+                    index: index as u8,
+                    matrix_digest: *digest,
+                    matrix_file_root: *root,
+                    matrix_file_len: *len,
+                    registered_at: 1_219,
+                    active_from: 1_239,
+                    license: LicenseSplit::default(),
+                })
+                .collect(),
+            ..ClientObjectsEffect::default()
+        });
+        registry
+    }
+
+    /// The fetch of `file` (`id`) moves on: its manifest is asked of
+    /// `provider` and received. Returns the chunk requests that follow.
+    fn pin_receive_manifest(
+        objects: &jetsam_node::client_objects::ClientObjects,
+        id: jetsam_p2p::client_object_protocol::MatrixFileId,
+        file: &[u8],
+        provider: libp2p::PeerId,
+    ) {
+        let requests = objects.next_requests(&[provider], Instant::now());
+        let manifest = requests
+            .iter()
+            .find(|fetch| {
+                fetch.request
+                    == jetsam_p2p::client_object_codec::ClientObjectRequest::MatrixManifest(id)
+            })
+            .expect("the honest file's manifest is asked");
+        let bytes = jetsam_p2p::client_object_protocol::MatrixFileId::manifest_of(file);
+        assert!(matches!(
+            objects.on_fetched(manifest.token, &bytes).unwrap(),
+            jetsam_node::client_objects::ClientObjectFetched::Nothing
+        ));
+    }
+
+    /// Whether the fetch of `id` kept its progress: its next requests are
+    /// chunks, not its manifest again (a fetch dropped and wanted anew starts
+    /// over from its manifest, its chunks freed).
+    fn pin_fetch_kept_its_progress(
+        objects: &jetsam_node::client_objects::ClientObjects,
+        id: jetsam_p2p::client_object_protocol::MatrixFileId,
+    ) -> bool {
+        let requests = objects.next_requests(&[libp2p::PeerId::random()], Instant::now());
+        !requests.iter().any(|fetch| {
+            fetch.request == jetsam_p2p::client_object_codec::ClientObjectRequest::MatrixManifest(id)
+        })
+    }
+
+    /// An honest file named again by an honest round kept its
+    /// place as the oldest of its `D`, so two decoy rounds anywhere in the
+    /// wait history evicted it (two files per `D`) and its fetch restarted
+    /// from zero at the next honest round. With the pin, a manifest's file
+    /// for `D` is irrelevant: the pinned file is the one fetched, through any
+    /// number of decoy rounds, and its fetch is never dropped nor restarted.
+    #[test]
+    fn pin_decoy_rounds_never_evict_nor_restart_the_honest_fetch() {
+        let x = [0xD1u8; 32];
+        let (file, pin) = pin_file(x, 0x2E);
+        let honest = pin_id(&pin);
+        let (_dir, objects) = pin_objects(vec![pin]);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let boundary = 1_578;
+        let mut awaited = AwaitedSnapshotMatrices::default();
+        let named = |root: [u8; 32]| pin_registry(&[(x, root, pin.matrix_file_len)]);
+        // Round H: refused for want of X; X's honest file is awaited.
+        awaited.await_refused_candidate(0, boundary, Some(&named(pin.matrix_file_root)), &[x]);
+        objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+        assert_eq!(objects.fetching_matrices(), vec![honest]);
+        pin_receive_manifest(&objects, honest, &file, libp2p::PeerId::random());
+        // Decoy rounds, with honest rounds between and after.
+        let rounds: [[u8; 32]; 9] = [
+            [0xA1; 32],
+            pin.matrix_file_root,
+            [0xA2; 32],
+            pin.matrix_file_root,
+            [0xA3; 32],
+            [0xA4; 32],
+            [0xA5; 32],
+            pin.matrix_file_root,
+            [0xA6; 32],
+        ];
+        for (round, root) in rounds.into_iter().enumerate() {
+            awaited.await_refused_candidate(0, boundary, Some(&named(root)), &[x]);
+            objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+            assert_eq!(
+                objects.fetching_matrices(),
+                vec![honest],
+                "round {round}: the honest fetch is evicted, or a decoy fetched"
+            );
+            assert!(
+                pin_fetch_kept_its_progress(&objects, honest),
+                "round {round}: the honest fetch restarted from its manifest"
+            );
+        }
+    }
+
+    /// The first manifest received after a wait launches the
+    /// plan, and a provider that answers faster than the rotation's peer wins
+    /// every round — before, the honest file was evicted after two of them,
+    /// or never awaited at all if the attacker also won the first race. With
+    /// the pin, winning the race buys nothing: the pinned file is fetched
+    /// from the first round on, and kept.
+    #[test]
+    fn pin_a_faster_false_manifest_never_wins() {
+        let x = [0xD1u8; 32];
+        let (file, pin) = pin_file(x, 0x2E);
+        let honest = pin_id(&pin);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let boundary = 1_578;
+        let decoy = |round: u8| pin_registry(&[(x, [0xA0 | round; 32], pin.matrix_file_len)]);
+        for honest_first in [false, true] {
+            let (_dir, objects) = pin_objects(vec![pin]);
+            let mut awaited = AwaitedSnapshotMatrices::default();
+            if honest_first {
+                let candidate = pin_registry(&[(x, pin.matrix_file_root, pin.matrix_file_len)]);
+                objects.want_only_matrices(&client_matrices_wanted(
+                    &chain,
+                    0,
+                    Some(&candidate),
+                    Some(&awaited),
+                ));
+                awaited.await_refused_candidate(0, boundary, Some(&candidate), &[x]);
+                objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+                pin_receive_manifest(&objects, honest, &file, libp2p::PeerId::random());
+            }
+            // Every following race is the attacker's: its manifest is the
+            // pending candidate (wanted while it is planned), then refused for
+            // want of X.
+            for round in 1u8..=8 {
+                let candidate = decoy(round);
+                objects.want_only_matrices(&client_matrices_wanted(
+                    &chain,
+                    0,
+                    Some(&candidate),
+                    Some(&awaited),
+                ));
+                assert_eq!(
+                    objects.fetching_matrices(),
+                    vec![honest],
+                    "honest_first={honest_first} round {round}, planned: the faster false \
+                     manifest steers the fetch"
+                );
+                awaited.await_refused_candidate(0, boundary, Some(&candidate), &[x]);
+                objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+                assert_eq!(
+                    objects.fetching_matrices(),
+                    vec![honest],
+                    "honest_first={honest_first} round {round}, refused: the faster false \
+                     manifest steers the fetch"
+                );
+                if round == 1 && !honest_first {
+                    pin_receive_manifest(&objects, honest, &file, libp2p::PeerId::random());
+                }
+                assert!(
+                    pin_fetch_kept_its_progress(&objects, honest),
+                    "honest_first={honest_first} round {round}: the honest fetch restarted"
+                );
+            }
+        }
+    }
+
+    /// A pending candidate's files are listed before the
+    /// awaited ones, and the fetch slots go in that order: a forged candidate
+    /// of 16 catalogue `D` (one of them a decoy of X) took every slot and the
+    /// fetch of X, awaited and in flight, was abandoned for the whole plan.
+    /// With the pin, the candidate's X is the pinned file (the same fetch),
+    /// and the files of a verified terminal's missing matrices come before an
+    /// unauthenticated candidate's: the honest fetch is never abandoned, even
+    /// when the 16 forged `D` are all others.
+    #[test]
+    fn pin_a_forged_candidate_never_abandons_the_awaited_fetch() {
+        let x = [0xD1u8; 32];
+        let (file, pin) = pin_file(x, 0x2E);
+        let honest = pin_id(&pin);
+        let chain = jetsam_chain::consensus::client_objects::ClientRegistryState::new();
+        let others: Vec<[u8; 32]> = (1u8..=16).map(|byte| [byte; 32]).collect();
+        let mut catalogue: Vec<_> = others.iter().map(|digest| pin_unserved(*digest)).collect();
+        catalogue.push(pin);
+        for with_x in [true, false] {
+            let (_dir, objects) = pin_objects(catalogue.clone());
+            let mut awaited = AwaitedSnapshotMatrices::default();
+            awaited.await_refused_candidate(
+                0,
+                1_578,
+                Some(&pin_registry(&[(x, pin.matrix_file_root, pin.matrix_file_len)])),
+                &[x],
+            );
+            objects.want_only_matrices(&client_matrices_wanted(&chain, 0, None, Some(&awaited)));
+            assert_eq!(objects.fetching_matrices(), vec![honest]);
+            pin_receive_manifest(&objects, honest, &file, libp2p::PeerId::random());
+            // The forged candidate: 16 catalogue `D`, roots nobody serves —
+            // X's decoy among them, or 16 others.
+            let mut forged: Vec<([u8; 32], [u8; 32], u32)> = others
+                .iter()
+                .take(if with_x { 15 } else { 16 })
+                .map(|digest| (*digest, [0xEE; 32], 4_096))
+                .collect();
+            if with_x {
+                forged.push((x, [0xDE; 32], 4_096));
+            }
+            let forged = pin_registry(&forged);
+            assert_eq!(forged.entries().len(), 16);
+            objects.want_only_matrices(&client_matrices_wanted(
+                &chain,
+                0,
+                Some(&forged),
+                Some(&awaited),
+            ));
+            let fetching = objects.fetching_matrices();
+            assert!(
+                fetching.contains(&honest),
+                "with_x={with_x}: the awaited fetch in flight is abandoned for a forged \
+                 candidate ({} fetches)",
+                fetching.len()
+            );
+            assert!(
+                fetching.iter().all(|id| id.file_root != [0xEE; 32] && id.file_root != [0xDE; 32]),
+                "with_x={with_x}: a file no catalogue pin names is fetched"
+            );
+            assert!(
+                pin_fetch_kept_its_progress(&objects, honest),
+                "with_x={with_x}: the honest fetch restarted"
+            );
+        }
     }
 
     #[test]
@@ -7508,7 +8578,7 @@ mod tests {
         quorum.set_canonical_tip(height, hash, false);
         quorum.set_sync_state(true, false);
         quorum.connect(first, jetsam_node::networking::FailureDomain(1));
-        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 1);
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new()).len(), 1);
         assert_eq!(*count_rx.borrow(), 0);
         assert!(!*ready_rx.borrow());
 
@@ -7556,7 +8626,7 @@ mod tests {
         quorum.expire_stale(confirmed_at + MINING_PEER_CONFIRMATION_TTL);
         assert_eq!(*count_rx.borrow(), 0);
         assert!(!*ready_rx.borrow());
-        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 1);
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new()).len(), 1);
     }
 
     #[test]
@@ -7575,13 +8645,34 @@ mod tests {
         let hash = [0x31; 32];
         quorum.set_canonical_tip(height, hash, false);
         quorum.set_sync_state(true, false);
-        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 1);
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new()).len(), 1);
 
         quorum.confirm_tip(peers[0], height, hash);
         quorum.confirm_tip(peers[1], height, hash);
-        let candidates = quorum.probe_candidates(MINING_PEER_QUORUM);
+        let candidates = quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new());
         assert_eq!(candidates.len(), 1);
         assert!(!candidates.contains(&peers[0]));
+    }
+
+    /// Backlog v1.5.2 item 16: a peer refused as incompatible loses its tip
+    /// confirmation and was probed first among the unconfirmed ones, again
+    /// and again — every answer refused, readiness flapping 0↔1 (254 lines in
+    /// 3 h on mseed2). A peer proven on a refused branch is not probed.
+    #[test]
+    fn mining_quorum_never_probes_a_peer_on_a_refused_branch() {
+        let (proof_tx, _proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, _ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let (forked, honest) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        quorum.connect(forked, jetsam_node::networking::FailureDomain(1));
+        quorum.connect(honest, jetsam_node::networking::FailureDomain(2));
+        quorum.set_canonical_tip(31, [0x31; 32], false);
+        quorum.set_sync_state(true, false);
+        quorum.confirm_tip(honest, 31, [0x31; 32]);
+        quorum.reject_incompatible(forked);
+        let refused = std::collections::HashSet::from([forked]);
+        assert_eq!(quorum.probe_candidates(usize::MAX, &refused), vec![honest]);
     }
 
     #[test]
@@ -7595,13 +8686,13 @@ mod tests {
             quorum.connect(*peer, jetsam_node::networking::FailureDomain(index as u64));
         }
 
-        let first = quorum.probe_candidates(MINING_PEER_QUORUM);
+        let first = quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new());
         assert_eq!(first.len(), MINING_PEER_QUORUM);
         let attempted_at = std::time::Instant::now();
         for peer in &first {
             quorum.mark_probe_sent(*peer, attempted_at);
         }
-        let second = quorum.probe_candidates(MINING_PEER_QUORUM);
+        let second = quorum.probe_candidates(MINING_PEER_QUORUM, &std::collections::HashSet::new());
         assert_eq!(second.len(), MINING_PEER_QUORUM);
         assert!(first.iter().all(|peer| !second.contains(peer)));
 
@@ -8882,9 +9973,12 @@ mod tests {
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp, never the
         // block's own, through the function consensus::header calls.
         let difficulty_target = jetsam_chain::consensus::expected_target(
-            0,
-            parent.timestamp,
-            &parent.difficulty_target,
+            &jetsam_chain::consensus::AnchorInfo {
+                anchor_height: 0,
+                anchor_timestamp: parent.timestamp,
+                anchor_parent_timestamp: parent.timestamp,
+                anchor_target: parent.difficulty_target,
+            },
             parent.height + 1,
             parent.timestamp,
         );
@@ -9405,41 +10499,112 @@ async fn tend_client_objects(
     ));
 }
 
-/// The client registry a snapshot candidate refused for want of client
-/// matrices announced (`ClientMatrixWait`), and its boundary (review 2, R1).
-/// The candidate is retired while the node waits, and the fresh candidate
-/// planned after the wait needs the same matrices: they stay wanted.
-#[derive(Clone, Debug)]
+/// The matrices snapshot candidates refused for want of client matrices
+/// asked for (`ClientMatrixWait`), each with its candidate's boundary.
+/// A candidate is retired while the node waits, and the
+/// fresh candidate planned after the wait needs the same matrices: they stay
+/// wanted while the chain is below the boundary.
+///
+/// The set holds no
+/// *files* named by unauthenticated manifests, so no provider's file
+/// can replace or evict the pinned one. It holds the `D` alone — the
+/// ones the verified terminal found missing (`missing_client_matrices`) —
+/// and the file fetched for a `D` is the one the client catalogue pins
+/// (`ClientObjects::want_matrices`): no manifest can change it. A refusal
+/// only adds to the set, one entry per `D`; the caller keeps only `D` the
+/// catalogue lists, so the set is bounded by the catalogue.
+#[derive(Clone, Debug, Default)]
 struct AwaitedSnapshotMatrices {
-    boundary: u64,
-    registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
+    /// `D` → the boundary below which it stays wanted.
+    matrices: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
-/// The matrix files this node wants, the chain's registry first (review
-/// B3): every entry of its chain's `registry`, of the snapshot `candidate`
-/// being installed, and of the last candidate refused for want of a matrix
-/// (`awaited`) while the chain is below that candidate's boundary — beyond
-/// it, the chain's own registry decides (review 2, R1: without it a fresh
-/// node, whose chain registers nothing, dropped the fetch its retired
-/// candidate waited for, ended the wait as if the matrix were held, and
-/// planned a fresh snapshot refused the same way, for ever). Each is then
-/// fetched only if the catalogue allows it, a registry's worth at most
-/// (`ClientObjects::want_matrices`).
+impl AwaitedSnapshotMatrices {
+    /// Every entry of `registry`, awaited below `boundary`.
+    #[cfg(test)]
+    fn of(
+        boundary: u64,
+        registry: &jetsam_chain::consensus::client_objects::ClientRegistryState,
+    ) -> Self {
+        let mut awaited = Self::default();
+        awaited.await_refused_candidate(0, boundary, Some(registry), &[]);
+        awaited
+    }
+
+    /// The matrices still awaited with the chain at `tip_height`.
+    fn wanted_at(&self, tip_height: u64) -> Vec<[u8; 32]> {
+        self.matrices
+            .iter()
+            .filter(|(_, boundary)| tip_height < **boundary)
+            .map(|(digest, _)| *digest)
+            .collect()
+    }
+
+    /// A candidate of `boundary` was refused for want of the matrices
+    /// `needed` (the `D` its verified terminal asked for and this node does
+    /// not hold). Only if that list is empty — a refusal that names none,
+    /// which the verifier does not produce — every `D` of the candidate's
+    /// `registry` counts instead: whatever it names, the file fetched is the
+    /// catalogue's. A `D` named again lives to the later boundary; matrices
+    /// at or below `tip_height` are forgotten.
+    fn await_refused_candidate(
+        &mut self,
+        tip_height: u64,
+        boundary: u64,
+        registry: Option<&jetsam_chain::consensus::client_objects::ClientRegistryState>,
+        needed: &[[u8; 32]],
+    ) {
+        self.matrices.retain(|_, live| tip_height < *live);
+        let fallback = if needed.is_empty() {
+            registry.map(|registry| registry.digests()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for digest in needed.iter().chain(&fallback) {
+            let live = self.matrices.entry(*digest).or_insert(boundary);
+            *live = (*live).max(boundary);
+        }
+    }
+}
+
+/// The peer asked for a fresh manifest once a wait for client matrices
+/// ends: the next in rotation other than `refused_provider` (the provider
+/// of the last candidate refused for want of one), that one only when no
+/// other is left (asked in rotation, not by
+/// lowest peer id, so no provider is asked again after each wait).
+fn client_matrix_wait_manifest_peer(
+    peers: &std::collections::HashSet<libp2p::PeerId>,
+    excluded_peers: &std::collections::HashSet<libp2p::PeerId>,
+    refused_provider: Option<libp2p::PeerId>,
+    cursor: &mut usize,
+) -> Option<libp2p::PeerId> {
+    rotating_manifest_peers(peers, excluded_peers, refused_provider, true, cursor, 1)
+        .into_iter()
+        .next()
+}
+
+/// The matrices this node wants, by `D`, in priority order:
+/// every entry of its chain's `registry`; then the matrices
+/// candidates refused for want of one left awaited (`awaited`) while the
+/// chain is below their boundary — authenticated by a verified terminal —
+/// beyond it, the chain's own registry decides (so that a
+/// fresh node, whose chain registers nothing, keeps the fetch its retired
+/// candidate waited for and does not end the wait as if the matrix were
+/// held); then the
+/// entries of the snapshot `candidate` being installed, which no one has
+/// authenticated yet. Each is then fetched as the file the catalogue pins
+/// for it, a registry's worth at most (`ClientObjects::want_matrices`).
 fn client_matrices_wanted(
     registry: &jetsam_chain::consensus::client_objects::ClientRegistryState,
     tip_height: u64,
     candidate: Option<&jetsam_chain::consensus::client_objects::ClientRegistryState>,
     awaited: Option<&AwaitedSnapshotMatrices>,
-) -> Vec<jetsam_p2p::client_object_protocol::MatrixFileId> {
-    let awaited = awaited
-        .filter(|awaited| tip_height < awaited.boundary)
-        .map(|awaited| &awaited.registry);
+) -> Vec<[u8; 32]> {
     registry
-        .entries()
-        .iter()
-        .chain(candidate.into_iter().flat_map(|registry| registry.entries()))
-        .chain(awaited.into_iter().flat_map(|registry| registry.entries()))
-        .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry)
+        .digests()
+        .into_iter()
+        .chain(awaited.into_iter().flat_map(|awaited| awaited.wanted_at(tip_height)))
+        .chain(candidate.into_iter().flat_map(|registry| registry.digests()))
         .collect()
 }
 
@@ -9595,6 +10760,83 @@ fn spawn_client_proof_reception(
             Ok(Ok(Err(_))) => {}
             Ok(Err(error)) => tracing::warn!(%error, "client proof reception CPU admission failed"),
             Err(error) => tracing::warn!(%error, "client proof reception panicked"),
+        }
+    });
+}
+
+/// Receive a v1.6 batch bundle fetched from a peer, off the event
+/// loop: its payment admissible against the current state, then decided
+/// against this node's tip and held for the miner, then announced. A refused
+/// one is logged (INFO) and dropped.
+fn spawn_client_batch_reception(
+    objects: Arc<jetsam_node::client_objects::ClientObjects>,
+    chain: Arc<RwLock<MdbxChainContext>>,
+    mempool: AsyncMempool,
+    p2p_cmd: jetsam_p2p::NetworkCommandSender,
+    id: jetsam_p2p::client_object_protocol::ClientBatchId,
+    bundle: Vec<u8>,
+) {
+    use jetsam_rpc::client_objects::RpcClientObjects as _;
+    tokio::spawn(async move {
+        let decoded =
+            match jetsam_p2p::client_object_protocol::ClientBatchBundle::decode_for(&id, &bundle) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::info!(%error, "fetched client batch bundle refused");
+                    return;
+                }
+            };
+        // The cheap checks before the payment's proof is verified.
+        let tip_height = chain.read().await.tip_height();
+        if let Some(batches) = objects.batches() {
+            if let Err(error) = batches.precheck(&decoded.submission, tip_height) {
+                tracing::info!(%error, "fetched client batch refused");
+                return;
+            }
+        }
+        if let Err(error) = mempool.check_client_payment(&decoded.payment).await {
+            tracing::info!(
+                statements_root = %hex::encode(decoded.submission.statements_root),
+                %error,
+                "fetched client batch refused: its payment"
+            );
+            return;
+        }
+        let tip = {
+            let ctx = chain.read().await;
+            let tip = *ctx.tip_header();
+            let terminal = if tip.height == 0 {
+                Ok(None)
+            } else {
+                ctx.store.get_history_step_terminal_at(
+                    tip.height,
+                    jetsam_chain::block_header::block_id(&tip),
+                )
+            };
+            terminal.map(|terminal| (tip.height, terminal, ctx.client_registry().clone()))
+        };
+        let (tip_height, terminal, registry) = match tip {
+            Ok(tip) => tip,
+            Err(error) => {
+                tracing::warn!(%error, "client batch reception: tip terminal unreadable");
+                return;
+            }
+        };
+        let received = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_inbound_verifier_cpu(|| {
+                objects.receive_client_batch(&bundle, tip_height, terminal.as_deref(), &registry, Some(&id))
+            })
+        })
+        .await;
+        match received {
+            Ok(Ok(Ok(announcement))) => {
+                let _ = p2p_cmd
+                    .send(jetsam_p2p::NetworkCommand::AnnounceClientBatch { announcement })
+                    .await;
+            }
+            Ok(Ok(Err(error))) => tracing::info!(%error, "fetched client batch refused"),
+            Ok(Err(error)) => tracing::warn!(%error, "client batch reception CPU admission failed"),
+            Err(error) => tracing::warn!(%error, "client batch reception panicked"),
         }
     });
 }
@@ -9837,6 +11079,16 @@ async fn handle_p2p_events(
     let mut active_snapshot_sync: Option<jetsam_node::networking::snapshot_sync::SnapshotSync> = None;
     let mut candidate_manifest_providers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // The admitted manifests a node without a validated
+    // header view collects for COLD_SNAPSHOT_ELECTION_WINDOW (generation,
+    // sender, manifest, rebase anchor), and when that window opened.
+    let mut cold_snapshot_ballot: Vec<(
+        u64,
+        libp2p::PeerId,
+        jetsam_p2p::protocol::VerifiedStateManifest,
+        Option<SnapshotRebaseAnchor>,
+    )> = Vec::new();
+    let mut cold_snapshot_ballot_opened: Option<Instant> = None;
     let mut rejected_snapshot_manifest_providers =
         std::collections::HashMap::<[u8; 32], std::collections::HashSet<libp2p::PeerId>>::new();
     let mut last_snapshot_provider_probe = Instant::now()
@@ -9847,7 +11099,10 @@ async fn handle_p2p_events(
     let mut snapshot_client_matrix_wait = ClientMatrixWait::default();
     // The registry of the last snapshot candidate refused for want of client
     // matrices: wanted after its plan is retired (review 2, R1).
-    let mut awaited_snapshot_matrices: Option<AwaitedSnapshotMatrices> = None;
+    let mut awaited_snapshot_matrices = AwaitedSnapshotMatrices::default();
+    // The provider of the last candidate refused for want of a client
+    // matrix: the wait's end asks another one first.
+    let mut awaited_snapshot_provider: Option<libp2p::PeerId> = None;
     let mut suffix_client_matrix_wait = ClientMatrixWait::default();
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
@@ -9970,6 +11225,30 @@ async fn handle_p2p_events(
     // it and the next manifest of the 1.4.3 branch became the candidate.
     let mut peer_chain_evidence =
         peer_chain_evidence::PeerChainEvidence::<HeldSnapshotManifest>::default();
+    // The verdicts outlive a restart (data directory).
+    let peer_verdicts_path = snapshot_staging_root.with_file_name("peer-verdicts");
+    match peer_chain_evidence.load_verdicts(
+        &peer_verdicts_path,
+        Instant::now(),
+        std::time::SystemTime::now(),
+    ) {
+        Ok(0) => {}
+        Ok(restored) => tracing::info!(restored, "divergence verdicts restored from the last run"),
+        Err(error) => tracing::warn!(%error, "divergence verdicts of the last run unreadable"),
+    }
+    let mut branch_warnings = repeated_warnings::RepeatedWarnings::new(
+        repeated_warnings::REPEATED_WARNINGS_CAPACITY,
+        Instant::now(),
+    );
+    macro_rules! warn_branch_once {
+        ($peer:expr, $motif:literal, $($arg:tt)+) => {
+            if branch_warnings.first($peer, $motif, Instant::now()) {
+                tracing::warn!($($arg)+)
+            } else {
+                tracing::debug!($($arg)+)
+            }
+        };
+    }
     // A manifest set aside for a pin proof comes back here with the proof and
     // goes through the manifest path again: the P2P layer delivers a
     // provider's manifest once per snapshot generation, so asking the peer
@@ -10376,7 +11655,9 @@ async fn handle_p2p_events(
                 let boundary = pending_manifest
                     .as_ref()
                     .map_or(0, |pending| pending.manifest.tip_height);
-                tracing::warn!(
+                warn_branch_once!(
+                    peer,
+                    "snapshot plan provider on a refused branch",
                     peer = %peer,
                     refused_height = height,
                     boundary,
@@ -10569,12 +11850,9 @@ async fn handle_p2p_events(
             // and is judged again once it is here.
             if let Some(objects) = &client_objects {
                 if let Some(registry) = snapshot_manifest_client_registry(&manifest) {
-                    objects.want_matrices(
-                        registry
-                            .entries()
-                            .iter()
-                            .map(jetsam_p2p::client_object_protocol::MatrixFileId::of_entry),
-                    );
+                    // By `D`: the file fetched is the catalogue's, whatever
+                    // this unauthenticated manifest names.
+                    objects.want_matrices(registry.digests());
                 }
             }
             // The manifest fixes one immutable State generation. Snapshot
@@ -10784,6 +12062,7 @@ async fn handle_p2p_events(
                                         anchor.height
                                     ),
                                     authority: None,
+                                    missing_client_matrices: Vec::new(),
                                 };
                             }
                             Err(error) => {
@@ -10820,6 +12099,7 @@ async fn handle_p2p_events(
                                 SnapshotBoundaryVerificationOutcome::CandidateRejected {
                                     error,
                                     authority: None,
+                                    missing_client_matrices: Vec::new(),
                                 }
                             } else {
                                 SnapshotBoundaryVerificationOutcome::Fatal {
@@ -10841,6 +12121,7 @@ async fn handle_p2p_events(
                         return SnapshotBoundaryVerificationOutcome::CandidateRejected {
                             error,
                             authority: Some(authority),
+                            missing_client_matrices: Vec::new(),
                         };
                     }
                     if let Err(error) =
@@ -10849,6 +12130,7 @@ async fn handle_p2p_events(
                         return SnapshotBoundaryVerificationOutcome::CandidateRejected {
                             error,
                             authority: Some(authority),
+                            missing_client_matrices: Vec::new(),
                         };
                     }
                     header_validation_elapsed = header_started.elapsed();
@@ -11632,9 +12914,7 @@ async fn handle_p2p_events(
                                         &prev_timestamps,
                                         &finalized_active_counts,
                                         local_time,
-                                        anchor.anchor_height,
-                                        anchor.anchor_timestamp,
-                                        &anchor.anchor_target,
+                                        &anchor,
                                     ),
                                     jetsam_node::networking::ChainPoint::new(
                                         ctx.tip_height(),
@@ -11690,7 +12970,7 @@ async fn handle_p2p_events(
                             }
                         } else if header_rejection_looks_like_a_fork(&e) {
                             // v1.5.1: and remembered, across reconnections.
-                            peer_chain_evidence.mark_divergent(from, height, Instant::now());
+                            refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, height, Instant::now());
                             retire_snapshot_plan_refused_through!(from, height);
                             // Loud on purpose. This is what a consensus change
                             // looks like from the inside, and it used to be
@@ -11699,7 +12979,9 @@ async fn handle_p2p_events(
                             // operator finds out from a stalled explorer hours
                             // later. Naming the peer is the point — it is the
                             // list of who has not upgraded.
-                            tracing::warn!(
+                            warn_branch_once!(
+                                from,
+                                "block refused by a consensus rule",
                                 peer = %from,
                                 height,
                                 err = %e,
@@ -12201,6 +13483,31 @@ async fn handle_p2p_events(
                     dispatch_client_object_requests(objects, &p2p_cmd, &connected);
                 }
             }
+            Ok(NetworkEvent::ClientBatchAnnounced {
+                from,
+                relayed_by: _,
+                announcement,
+            }) => {
+                let tip_height = chain.read().await.tip_height();
+                if let Some(fetch) = client_objects
+                    .as_ref()
+                    .and_then(|objects| objects.batch_request(from, &announcement, tip_height))
+                {
+                    let token = fetch.token;
+                    if p2p_cmd
+                        .try_send(jetsam_p2p::NetworkCommand::FetchClientObject {
+                            token: fetch.token,
+                            peer: fetch.peer,
+                            request: fetch.request,
+                        })
+                        .is_err()
+                    {
+                        if let Some(objects) = &client_objects {
+                            objects.on_failed(token, false);
+                        }
+                    }
+                }
+            }
             Ok(NetworkEvent::ClientRegistrationRelayed { relayed_by, notice }) => {
                 if let Some(objects) = &client_objects {
                     spawn_client_registration_reception(
@@ -12230,6 +13537,16 @@ async fn handle_p2p_events(
                             assembled,
                         )) => {
                             spawn_matrix_authentication(Arc::clone(objects), assembled);
+                        }
+                        Ok(jetsam_node::client_objects::ClientObjectFetched::Batch(id, bundle)) => {
+                            spawn_client_batch_reception(
+                                Arc::clone(objects),
+                                Arc::clone(&chain),
+                                mempool.clone(),
+                                p2p_cmd.clone(),
+                                id,
+                                bundle,
+                            );
                         }
                         Ok(jetsam_node::client_objects::ClientObjectFetched::Liar) => {
                             tracing::warn!(peer = %from, "peer served bytes failing a client object's identity");
@@ -12693,10 +14010,16 @@ async fn handle_p2p_events(
                 );
                 match pin_evidence {
                     peer_chain_evidence::PinEvidence::Contradicts { height } => {
+                        // Marked divergent by `observe_headers`; like every
+                        // other refusal of its branch, it supplies no header
+                        // any more (`refuse_peer_branch`).
+                        header_dag.remove_inventory_provider(from);
                         mining_peer_quorum.reject_incompatible(from);
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
-                        tracing::warn!(
+                        warn_branch_once!(
+                            from,
+                            "another block at a pinned height",
                             peer = %from,
                             height,
                             "this peer serves another block at a pinned height: it follows a \
@@ -12709,21 +14032,39 @@ async fn handle_p2p_events(
                         if let Some((force, (generation, requester_height, manifest))) =
                             peer_chain_evidence.take_satisfied_wait(&from, probe_now)
                         {
-                            tracing::info!(
-                                peer = %from,
-                                pin_height = height,
-                                snapshot_height = manifest.tip_height,
-                                "peer showed the pinned block: its snapshot manifest is judged again"
-                            );
                             if force {
                                 manifest_force_snapshot_peers.insert(from);
                             }
-                            resumed_manifest_events.push_back(NetworkEvent::StateManifest {
-                                generation,
-                                from,
-                                requester_height,
-                                manifest,
-                            });
+                            if generation != snapshot_sync_generation {
+                                // A plan was retired while the
+                                // manifest waited; replayed, it was dropped as
+                                // a stale response without a word. The peer
+                                // has shown the pin: ask it for a fresh one.
+                                let our_height = chain.read().await.tip_height();
+                                let requested = try_request_manifest!(from, our_height, [0; 32]);
+                                tracing::info!(
+                                    peer = %from,
+                                    pin_height = height,
+                                    snapshot_height = manifest.tip_height,
+                                    requested,
+                                    "peer showed the pinned block, but the snapshot plan its \
+                                     manifest answered was retired meanwhile: asking it for a \
+                                     fresh manifest"
+                                );
+                            } else {
+                                tracing::info!(
+                                    peer = %from,
+                                    pin_height = height,
+                                    snapshot_height = manifest.tip_height,
+                                    "peer showed the pinned block: its snapshot manifest is judged again"
+                                );
+                                resumed_manifest_events.push_back(NetworkEvent::StateManifest {
+                                    generation,
+                                    from,
+                                    requester_height,
+                                    manifest,
+                                });
+                            }
                         }
                     }
                     peer_chain_evidence::PinEvidence::Silent => {}
@@ -12735,8 +14076,14 @@ async fn handle_p2p_events(
                         && records.iter().all(|record| record.header.height == probed)
                     {
                         peer_chain_evidence.probe_ended(&from);
-                        if records.is_empty() {
-                            peer_chain_evidence.cancel_pin_wait(&from);
+                        if records.is_empty() && peer_chain_evidence.cancel_pin_wait(&from) {
+                            // It was dropped without a word.
+                            tracing::info!(
+                                peer = %from,
+                                pin_height = probed,
+                                "peer answered the pin probe without the pinned block: its \
+                                 snapshot manifest set aside is dropped"
+                            );
                         }
                         continue;
                     }
@@ -12783,8 +14130,12 @@ async fn handle_p2p_events(
                         }
                     }
                 }
+                // A peer proven on a refused branch supplies no
+                // header (`refuse_peer_branch`); a later batch must not make
+                // it a provider again.
                 if manifest_peers.contains(&from)
                     && !rejected_suffix_object_peers.contains(&from)
+                    && !peer_chain_evidence.is_divergent(&from, probe_now)
                 {
                     match advertise_inventory_for_known_headers(
                         &mut header_dag,
@@ -12903,6 +14254,15 @@ async fn handle_p2p_events(
                                 peer = %from,
                                 target_height = target.height,
                                 "ignoring exact-object inventory from a rejected data provider"
+                            );
+                        } else if peer_chain_evidence.is_divergent(&from, probe_now) {
+                            // A batch of an old-branch peer that
+                            // stops at K' (valid here, K+1' refused) ends no
+                            // verdict and makes it no provider of K' again.
+                            tracing::debug!(
+                                peer = %from,
+                                target_height = target.height,
+                                "ignoring exact-object inventory from a peer on a refused branch"
                             );
                         } else if let Err(error) = header_dag.advertise_inventory(from, &records) {
                             // Availability is never header authority. A bad or
@@ -13349,10 +14709,12 @@ async fn handle_p2p_events(
                     Ok(HeaderInventoryPlan::FinalizedDivergence) => {
                         let finalized_height = header_dag.finalized().height;
                         mining_peer_quorum.reject_incompatible(from);
-                        peer_chain_evidence.mark_divergent(from, finalized_height, Instant::now());
+                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, finalized_height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
-                        tracing::warn!(
+                        warn_branch_once!(
+                            from,
+                            "no common ancestor",
                             peer = %from,
                             "peer has no common ancestor inside the accepted non-final window"
                         );
@@ -13363,10 +14725,12 @@ async fn handle_p2p_events(
                         // explains marks its sender, like a missing common
                         // ancestor does (c3a011c only logged it).
                         mining_peer_quorum.reject_incompatible(from);
-                        peer_chain_evidence.mark_divergent(from, height, Instant::now());
+                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
-                        tracing::warn!(
+                        warn_branch_once!(
+                            from,
+                            "header inventory refused by a consensus rule",
                             peer = %from,
                             height,
                             err = %error,
@@ -13424,7 +14788,9 @@ async fn handle_p2p_events(
                 }
                 manifest_requested_peers.remove(&from);
                 if peer_chain_evidence.is_divergent(&from, Instant::now()) {
-                    tracing::warn!(
+                    warn_branch_once!(
+                        from,
+                        "manifest from a refused branch",
                         from = %from,
                         tip = manifest.tip_height,
                         "ignoring manifest from a branch outside the accepted non-final window"
@@ -13509,6 +14875,7 @@ async fn handle_p2p_events(
                 } else {
                     None
                 };
+                let mut admitted_without_validated_view = false;
                 if manifest.tip_height > 0 {
                     manifest_terminal_capabilities.insert(
                         from,
@@ -13614,7 +14981,9 @@ async fn handle_p2p_events(
                         &our_work,
                         validated_view,
                     ) {
-                        ManifestCandidacy::Admit => {}
+                        ManifestCandidacy::Admit => {
+                            admitted_without_validated_view = validated_view.is_none();
+                        }
                         ManifestCandidacy::AwaitPinProof { pin_height } => {
                             peer_chain_evidence.want_pin_probe(
                                 from,
@@ -13649,8 +15018,10 @@ async fn handle_p2p_events(
                             continue;
                         }
                         ManifestCandidacy::ContradictsPin { height } => {
-                            peer_chain_evidence.mark_divergent(from, height, judged_at);
-                            tracing::warn!(
+                            refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, height, judged_at);
+                            warn_branch_once!(
+                                from,
+                                "manifest names another block at a pinned height",
                                 from = %from,
                                 snapshot_height = manifest.tip_height,
                                 "snapshot manifest names another block at a pinned height — refused"
@@ -13703,6 +15074,26 @@ async fn handle_p2p_events(
                         tip = manifest.tip_height,
                         "snapshot manifest set aside while client matrices are pending"
                     );
+                } else if manifest.tip_height > 0
+                    && pending_manifest.is_none()
+                    && pending_snapshot_header_sync.is_none()
+                    && snapshot_header_staging_inflight.is_none()
+                    && history_step_verification_inflight.is_none()
+                    && snapshot_staging_inflight.is_none()
+                    && snapshot_install_inflight.is_none()
+                    && admitted_without_validated_view
+                {
+                    // Planned when the election closes (heartbeat).
+                    tracing::info!(
+                        from = %from,
+                        tip = manifest.tip_height,
+                        window_s = COLD_SNAPSHOT_ELECTION_WINDOW.as_secs(),
+                        "snapshot manifest entered the election of a node without validated headers"
+                    );
+                    cold_snapshot_ballot_opened.get_or_insert_with(Instant::now);
+                    cold_snapshot_ballot.retain(|(_, peer, _, _)| *peer != from);
+                    cold_snapshot_ballot.push((generation, from, manifest, rebase_anchor));
+                    manifest_round_started_at = None;
                 } else if manifest.tip_height > 0
                     && pending_manifest.is_none()
                     && pending_snapshot_header_sync.is_none()
@@ -14783,8 +16174,10 @@ async fn handle_p2p_events(
                     // branch finally fails (2026-10-13: 30 min 46 s).
                     if let SnapshotHeaderStagingError::ForkRule { height, .. } = &error {
                         let height = *height;
-                        peer_chain_evidence.mark_divergent(range_from, height, Instant::now());
-                        tracing::warn!(
+                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, range_from, height, Instant::now());
+                        warn_branch_once!(
+                            range_from,
+                            "header range refused by a consensus rule",
                             peer = %range_from,
                             height,
                             err = %error,
@@ -14794,7 +16187,9 @@ async fn handle_p2p_events(
                         if snapshot_plan_refused_through!(range_from, height) {
                             let boundary = sync.target_height;
                             cleanup_snapshot_header_staging_offthread(sync.staging);
-                            tracing::warn!(
+                            warn_branch_once!(
+                                range_from,
+                                "snapshot plan provider on a refused branch",
                                 peer = %range_from,
                                 refused_height = height,
                                 boundary,
@@ -15902,7 +17297,11 @@ async fn handle_p2p_events(
                     ensure_snapshot_boundary_terminal_request!();
                     continue;
                 }
-                SnapshotBoundaryVerificationOutcome::CandidateRejected { error, authority } => {
+                SnapshotBoundaryVerificationOutcome::CandidateRejected {
+                    error,
+                    authority,
+                    missing_client_matrices,
+                } => {
                     if let Some(authority) = authority {
                         cleanup_validated_snapshot_headers_offthread(authority.headers);
                     }
@@ -15914,19 +17313,35 @@ async fn handle_p2p_events(
                     // fetching or authenticating: hurry it, and plan no new
                     // snapshot until it is held (`ClientMatrixWait`).
                     if client_matrices_awaited(client_objects.as_deref(), &error) {
-                        snapshot_client_matrix_wait.begin(Instant::now());
-                        // Its matrices stay wanted once its plan is retired:
-                        // the fresh candidate needs them (review 2, R1).
-                        awaited_snapshot_matrices = pending_manifest.as_ref().and_then(|pending| {
-                            snapshot_manifest_client_registry(&pending.manifest).map(|registry| {
-                                AwaitedSnapshotMatrices {
-                                    boundary: pending.manifest.tip_height,
-                                    registry,
-                                }
+                        // The matrices its verified terminal asked for stay
+                        // wanted once its plan is retired: the fresh
+                        // candidate needs them. By `D` alone,
+                        // those the catalogue lists: the file fetched for
+                        // each is the catalogue's, whatever the manifest
+                        // named.
+                        let needed: Vec<[u8; 32]> = missing_client_matrices
+                            .into_iter()
+                            .filter(|digest| {
+                                client_objects
+                                    .as_deref()
+                                    .is_some_and(|objects| objects.pinned_file(digest).is_some())
                             })
-                        });
+                            .collect();
+                        let tip_height = chain.read().await.tip_height();
+                        if let Some(pending) = pending_manifest.as_ref() {
+                            awaited_snapshot_matrices.await_refused_candidate(
+                                tip_height,
+                                pending.manifest.tip_height,
+                                snapshot_manifest_client_registry(&pending.manifest).as_ref(),
+                                &needed,
+                            );
+                        }
+                        awaited_snapshot_provider = Some(failed_peer);
+                        snapshot_client_matrix_wait.begin(Instant::now());
                         tracing::info!(
                             boundary = completed.key.snapshot.boundary.height,
+                            provider = %failed_peer,
+                            missing = ?needed.iter().map(hex::encode).collect::<Vec<_>>(),
                             wait_limit_s = CLIENT_MATRIX_WAIT_LIMIT.as_secs(),
                             "snapshot candidate needs registered client matrices this node is \
                              still fetching or authenticating (no verdict): a fresh snapshot is \
@@ -16192,6 +17607,25 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
+            if peer_chain_evidence.take_changed() {
+                if let Err(error) = peer_chain_evidence.save_verdicts(
+                    &peer_verdicts_path,
+                    now,
+                    std::time::SystemTime::now(),
+                ) {
+                    tracing::warn!(%error, "divergence verdicts could not be saved");
+                }
+            }
+            if let Some(summary) = branch_warnings.summary_due(now) {
+                for (peer, motif, repeats) in summary {
+                    tracing::info!(
+                        peer = %peer,
+                        motif,
+                        repeats,
+                        "refused-branch warning repeated in the last 10 min (repeats logged at debug)"
+                    );
+                }
+            }
             if let Some(objects) = &client_objects {
                 if now.saturating_duration_since(client_objects_tended) >= Duration::from_secs(2) {
                     client_objects_tended = now;
@@ -16202,7 +17636,7 @@ async fn handle_p2p_events(
                         objects,
                         &chain,
                         manifest_registry.as_ref(),
-                        awaited_snapshot_matrices.as_ref(),
+                        Some(&awaited_snapshot_matrices),
                         &mut client_objects_seen_height,
                     )
                     .await;
@@ -16215,6 +17649,39 @@ async fn handle_p2p_events(
                     let connected: Vec<libp2p::PeerId> =
                         peer_failure_domains.keys().copied().collect();
                     dispatch_client_object_requests(objects, &p2p_cmd, &connected);
+                    // A held batch the next block can carry is announced
+                    // again, for the peers that connected after its
+                    // announcement (one over lanes the chain moved past is not).
+                    if let Some(batches) = objects.batches().filter(|batches| !batches.is_empty()) {
+                        let view = {
+                            let ctx = chain.read().await;
+                            let tip = *ctx.tip_header();
+                            let terminal = if tip.height == 0 {
+                                Ok(None)
+                            } else {
+                                ctx.store.get_history_step_terminal_at(
+                                    tip.height,
+                                    jetsam_chain::block_header::block_id(&tip),
+                                )
+                            };
+                            terminal.ok().map(|terminal| {
+                                (
+                                    tip.height,
+                                    terminal,
+                                    jetsam_node::client_batches::registry_leaves(ctx.client_registry()),
+                                )
+                            })
+                        };
+                        if let Some((tip_height, terminal, leaves)) = view {
+                            if let Ok(lanes) = batches.parent_lanes(tip_height, terminal.as_deref()) {
+                                for announcement in batches.announcements_due(now, &lanes, &leaves) {
+                                    let _ = p2p_cmd.try_send(
+                                        jetsam_p2p::NetworkCommand::AnnounceClientBatch { announcement },
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             dispatch_snapshot_generation_advance!();
@@ -16508,11 +17975,33 @@ async fn handle_p2p_events(
                 let boundary = pending_manifest
                     .as_ref()
                     .map_or(0, |pending| pending.manifest.tip_height);
+                // Every peer that offered this exact boundary
+                // and is still connected claimed it and served nothing; none
+                // is a snapshot candidate again while the record holds,
+                // across reconnections. A provider that went away (a seed
+                // restarting) refused nothing.
+                let claimants = pending_manifest
+                    .as_ref()
+                    .map(|pending| {
+                        pending
+                            .providers
+                            .iter()
+                            .copied()
+                            .filter(|peer| manifest_peers.contains(peer))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for peer in &claimants {
+                    peer_chain_evidence.mark_unserved_claim(*peer, boundary, now);
+                }
                 tracing::warn!(
                     boundary,
                     our_height,
                     stall_s = UNAUTHENTICATED_SNAPSHOT_PLAN_STALL.as_secs(),
-                    "a snapshot plan that has verified nothing made no progress — retiring it"
+                    claimants = claimants.len(),
+                    "a snapshot plan that has verified nothing made no progress — retiring it; \
+                     the peers that offered it are not snapshot sources for {} min",
+                    peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
                 );
                 retire_snapshot_plan!();
                 if let Some(failed_peer) = failed_peer {
@@ -16556,14 +18045,17 @@ async fn handle_p2p_events(
                     ),
                 }
                 if !snapshot_plan_active!() {
-                    let peer = manifest_peers
-                        .iter()
+                    let divergent_peers = peer_chain_evidence.divergent_peers(now);
+                    let excluded_peers = rejected_terminal_peers
+                        .union(&divergent_peers)
                         .copied()
-                        .filter(|peer| {
-                            !rejected_terminal_peers.contains(peer)
-                                && !peer_chain_evidence.is_divergent(peer, now)
-                        })
-                        .min_by_key(|peer| peer.to_bytes());
+                        .collect::<std::collections::HashSet<_>>();
+                    let peer = client_matrix_wait_manifest_peer(
+                        &manifest_peers,
+                        &excluded_peers,
+                        awaited_snapshot_provider,
+                        &mut manifest_retry_cursor,
+                    );
                     if let Some(peer) = peer {
                         if try_request_manifest!(peer, our_height, [0; 32]) {
                             manifest_force_snapshot_peers.insert(peer);
@@ -16804,7 +18296,7 @@ async fn handle_p2p_events(
                     header_dag.best_tip().height,
                     CONNECTED_TIP_PROBE_HEADERS,
                 );
-                let excluded = std::collections::HashSet::new();
+                let excluded = peer_chain_evidence.divergent_peers(now);
                 let candidates = rotating_manifest_peers(
                     &manifest_peers,
                     &excluded,
@@ -16933,7 +18425,10 @@ async fn handle_p2p_events(
                 let mut lane_capacity = MINING_PEER_QUORUM
                     .saturating_sub(fetch_in_progress.len().min(MINING_PEER_QUORUM));
                 let mut dispatched = false;
-                for peer in mining_peer_quorum.probe_candidates(usize::MAX) {
+                // Backlog item 16: a peer proven on a refused branch answers
+                // every tip probe with headers this node refuses.
+                let refused_branch_peers = peer_chain_evidence.divergent_peers(now);
+                for peer in mining_peer_quorum.probe_candidates(usize::MAX, &refused_branch_peers) {
                     if lane_capacity == 0 {
                         break;
                     }
@@ -16970,7 +18465,7 @@ async fn handle_p2p_events(
                     false,
                     canonical_sync_idle,
                 ) {
-                    let excluded = std::collections::HashSet::new();
+                    let excluded = peer_chain_evidence.divergent_peers(now);
                     let candidates = rotating_manifest_peers(
                         &manifest_peers,
                         &excluded,
@@ -17209,6 +18704,72 @@ async fn handle_p2p_events(
                     }
                     if !manifest_peers.is_empty() {
                         manifest_round_started_at = Some(now);
+                    }
+                }
+            }
+
+            // A node without a validated header view plans
+            // the boundary most peers offered during its election window,
+            // not the first one admitted.
+            if cold_snapshot_ballot_opened.is_some_and(|opened| {
+                now.saturating_duration_since(opened) >= COLD_SNAPSHOT_ELECTION_WINDOW
+            }) {
+                cold_snapshot_ballot_opened = None;
+                let mut ballot = std::mem::take(&mut cold_snapshot_ballot);
+                ballot.retain(|(generation, peer, _, _)| {
+                    *generation == snapshot_sync_generation
+                        && !peer_chain_evidence.is_divergent(peer, now)
+                        && peer_chain_evidence.unserved_claim(peer, now).is_none()
+                });
+                let offers = ballot
+                    .iter()
+                    .map(|(_, _, manifest, _)| (manifest.tip_height, manifest.tip_hash))
+                    .collect::<Vec<_>>();
+                if let Some(elected) = elect_cold_snapshot_boundary(&offers) {
+                    let (_, from, manifest, rebase_anchor) = ballot.swap_remove(elected);
+                    let plannable = pending_manifest.is_none()
+                        && pending_snapshot_header_sync.is_none()
+                        && snapshot_header_staging_inflight.is_none()
+                        && history_step_verification_inflight.is_none()
+                        && snapshot_staging_inflight.is_none()
+                        && snapshot_install_inflight.is_none()
+                        && !snapshot_client_matrix_wait.holds(
+                            now,
+                            client_objects
+                                .as_ref()
+                                .is_some_and(|objects| objects.awaits_matrices()),
+                        );
+                    if plannable {
+                        let votes = offers
+                            .iter()
+                            .filter(|offer| **offer == offers[elected])
+                            .count();
+                        tracing::info!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            votes,
+                            offers = offers.len(),
+                            "snapshot election closed: validating the boundary most peers offered"
+                        );
+                        candidate_manifest_providers.clear();
+                        candidate_manifest_providers.insert(from);
+                        manifest_round_started_at = None;
+                        begin_snapshot_header_staging!(from, manifest, rebase_anchor);
+                        if let Some(pending) = pending_manifest.as_mut() {
+                            for (_, peer, other, _) in &ballot {
+                                if other.as_ref() == pending.manifest.as_ref() {
+                                    pending.providers.insert(*peer);
+                                    candidate_manifest_providers.insert(*peer);
+                                }
+                            }
+                        }
+                    } else {
+                        deferred_sync_peer = Some(from);
+                        tracing::debug!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            "snapshot election closed while another snapshot is under way — deferred"
+                        );
                     }
                 }
             }
@@ -17707,7 +19268,11 @@ enum ManifestCandidacy {
 ///   progress, HeaderDAG sound), the boundary must be on the HeaderDAG's
 ///   selected chain with exactly that work — or beyond the validated view
 ///   while that view is itself a snapshot gap above the local tip;
-/// * otherwise its sender must have shown the highest pinned block below the
+/// * otherwise a sender whose last snapshot plan went unserved (it verified
+///   nothing and stalled) offers no candidate while that record holds: a
+///   boundary claimed above the real tip costs the node the staging of the
+///   real headers and the stall delay, once per sender, not once per cycle;
+/// * and its sender must have shown the highest pinned block below the
 ///   boundary, so the boundary cannot descend from a refused branch.
 #[allow(clippy::too_many_arguments)]
 fn judge_snapshot_manifest(
@@ -17759,6 +19324,9 @@ fn judge_snapshot_manifest(
             return ManifestCandidacy::Refuse("its boundary is beyond the validated header view");
         }
     }
+    if evidence.unserved_claim(sender, now).is_some() {
+        return ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved");
+    }
     if let Some((pin_height, _)) = peer_chain_evidence::pin_below(pins, manifest.tip_height) {
         if evidence
             .pin_verified_through(sender, now)
@@ -17799,6 +19367,22 @@ fn snapshot_discovery_round_completed(dispatched: usize, askable_peers: usize) -
     dispatched > 0 || askable_peers == 0
 }
 
+/// How long a node without a validated header view
+/// collects snapshot manifests before planning one. Before, the first
+/// admitted manifest became the plan at once.
+const COLD_SNAPSHOT_ELECTION_WINDOW: Duration = Duration::from_secs(3);
+
+/// Which of the snapshot boundaries `(height, hash)` offered during a cold
+/// node's election window becomes the plan: the one the most peers offered;
+/// on a tie the lowest (a boundary claimed above the real tip loses to a real
+/// one); then the first offered.
+fn elect_cold_snapshot_boundary(offers: &[(u64, [u8; 32])]) -> Option<usize> {
+    (0..offers.len()).min_by_key(|&index| {
+        let votes = offers.iter().filter(|offer| **offer == offers[index]).count();
+        (std::cmp::Reverse(votes), offers[index].0, index)
+    })
+}
+
 /// v1.5.1 — how long a snapshot plan that has verified nothing may go
 /// without staging a header or receiving its terminal. Provider churn does
 /// not count as progress: on 2026-10-13 it kept such a plan alive 30 min 46 s.
@@ -17818,11 +19402,30 @@ fn unauthenticated_snapshot_plan_stalled(
         })
 }
 
+/// A peer proven on a branch this node refuses (a header or block refused
+/// by a rule only a fork explains, no common ancestor inside the non-final
+/// window, another block at a pinned height): the verdict is kept across
+/// reconnections ([`peer_chain_evidence::PeerChainEvidence`]) and the peer
+/// supplies no header any more. Otherwise a block of its branch that ties
+/// ours on work — at the v1.6 height both branches carry the v1.5 rule's
+/// target — holds the HeaderDAG's selection on a block this node refuses
+/// (private test chain, 2026-10-17).
+fn refuse_peer_branch<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    peer: libp2p::PeerId,
+    height: u64,
+    now: Instant,
+) {
+    evidence.mark_divergent(peer, height, now);
+    header_dag.remove_inventory_provider(peer);
+}
+
+#[cfg(test)]
 /// v1.5.1 — the stall of 2026-10-13 (forensic §4-5). A snapshot manifest
 /// from the 1.4.3 branch, which forks at 38 400' and is durably higher than
 /// ours, became the snapshot candidate on height alone; the plan could never
 /// complete and held the import of every canonical block behind it.
-#[cfg(test)]
 mod divergent_branch_capture_tests {
     use super::*;
     use jetsam_chain::block_header::block_id;
@@ -17879,6 +19482,53 @@ mod divergent_branch_capture_tests {
             .iter()
             .map(|height| (*height, headers[*height as usize - 1].hash))
             .collect()
+    }
+
+    /// Private test chain (2026-10-17 15:18 UTC): at the v1.6 height both
+    /// branches carry the same target (the v1.5 rule's), so a block K and the
+    /// not-upgraded branch's K' tie on work, and the tie goes to the lower
+    /// hash. K' won it; its terminal was refused (the v1.6 relation), its
+    /// source quarantined, but a second old-branch peer stayed a provider of
+    /// K', and its header batches, refused at K+1 for their target, never
+    /// removed it: the node held K' as its selected tip and never applied K
+    /// (25 min, until restarted), while the only v1.6 miner paused for want of
+    /// a peer agreeing with its K. A peer proven on a branch this node refuses
+    /// supplies no header any more: the unsupplied tie is forgotten and the
+    /// node's own branch is selected.
+    #[test]
+    fn a_peer_proven_on_a_refused_branch_supplies_no_header_and_frees_a_tie() {
+        use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+        let (mut dag, headers) = validated_chain(3);
+        let parent = headers[2];
+        let child = |nonce: u128| {
+            let mut header = parent.header;
+            header.height = 4;
+            header.prev_block_hash = parent.hash;
+            header.timestamp += 1;
+            header.nonce = nonce;
+            ValidatedHeader::new_after_consensus_checks(header, more_work(parent.cumulative_work, 1))
+        };
+        let (one, two) = (child(1), child(2));
+        let (theirs, ours) = if one.hash < two.hash { (one, two) } else { (two, one) };
+        dag.insert(ours).unwrap();
+        dag.insert(theirs).unwrap();
+        assert_eq!(dag.best_tip(), theirs.point(), "the tie goes to the lower hash");
+        let (old_peer, new_peer) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        dag.advertise_inventory(old_peer, &[HeaderInventoryRecord::header_only(theirs.header)])
+            .unwrap();
+        dag.advertise_inventory(new_peer, &[HeaderInventoryRecord::header_only(ours.header)])
+            .unwrap();
+        // Without the verdict the supplied tie holds.
+        assert!(!dag.forget_unsupplied_tie(&ours.hash, &parent.hash));
+
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        refuse_peer_branch(&mut dag, &mut evidence, old_peer, 5, now);
+        assert!(evidence.is_divergent(&old_peer, now));
+        assert!(!dag.has_inventory(&theirs.hash), "it supplies nothing any more");
+        assert!(dag.has_inventory(&ours.hash));
+        assert!(dag.forget_unsupplied_tie(&ours.hash, &parent.hash));
+        assert_eq!(dag.best_tip(), ours.point());
     }
 
     /// The peer of 2026-10-13: its header at the fork height was refused for
@@ -17943,6 +19593,49 @@ mod divergent_branch_capture_tests {
             judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None),
             ManifestCandidacy::Admit
         );
+    }
+
+    /// On a cold node a peer showed the (public) pinned block,
+    /// offered a boundary above the real tip claiming any work, and the plan
+    /// stalled once the real headers ran out. Its next manifest — another
+    /// boundary, another claim — is not a candidate while the record holds.
+    #[test]
+    fn a_sender_whose_last_plan_went_unserved_offers_no_candidate() {
+        let (_, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let staller = libp2p::PeerId::random();
+        evidence.observe_headers(staller, [&headers[15].header], &pins, now);
+        let next = manifest(28, [0xC3; 32], [0xFF; 32]);
+        assert_eq!(
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            ManifestCandidacy::Admit,
+            "the pin proof alone admits it"
+        );
+        evidence.mark_unserved_claim(staller, 10_000, now);
+        assert_eq!(
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved")
+        );
+    }
+
+    /// On a cold node the first admitted manifest was the
+    /// plan. A peer that answers first with a boundary above the real tip
+    /// won every cycle; the peers offering the real boundary now outvote it,
+    /// and a tie goes to the lower boundary.
+    #[test]
+    fn a_cold_node_plans_the_boundary_most_peers_offer() {
+        let (fake, real, newer) = ((50_000, [0xF0; 32]), (39_000, [0x39; 32]), (39_024, [0x3A; 32]));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, real, real]), Some(1));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real, newer]), Some(1));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, real]), Some(1), "tie: the lower");
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real]), Some(2), "tie: the lower");
+        assert_eq!(elect_cold_snapshot_boundary(&[real, (39_000, [0x40; 32])]), Some(0), "then the first");
+        assert_eq!(elect_cold_snapshot_boundary(&[real]), Some(0));
+        assert_eq!(elect_cold_snapshot_boundary(&[]), None);
     }
 
     #[test]
@@ -18685,12 +20378,14 @@ mod condemned_block_tests {
         let zero = TerminalClientView {
             carried: None,
             registry_leaves: Some(leaves.clone()),
+            batch: None,
         };
         assert_eq!(client_lanes_condemn_tip(&zero, &judged, honest.header.height, &rules), None);
         leaves[0] = b2_rogue().matrix_digest;
         let rogue_leaf = TerminalClientView {
             carried: None,
             registry_leaves: Some(leaves),
+            batch: None,
         };
         let verdict = client_lanes_condemn_tip(&rogue_leaf, &judged, honest.header.height, &rules)
             .expect("a leaf no accepted registration made");
