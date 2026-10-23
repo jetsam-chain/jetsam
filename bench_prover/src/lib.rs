@@ -8,6 +8,8 @@
 
 use std::time::{Duration, Instant};
 
+pub mod zk_batch_client;
+
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_core::Block128;
 use jetsam_gkr::zk_authorization::ZkAuthorizationProof;
@@ -824,9 +826,7 @@ impl HonestHistoryStepFixtureProvider {
         // blocks at exactly one height, and only once a fork is armed, which is
         // the worst moment to discover it.
         let target = jetsam_chain::consensus::expected_target(
-            checkpoint.asert_anchor.anchor_height,
-            checkpoint.asert_anchor.anchor_timestamp,
-            &checkpoint.asert_anchor.anchor_target,
+            &checkpoint.asert_anchor,
             child_height,
             checkpoint.parent_header.timestamp,
         );
@@ -1126,6 +1126,7 @@ fn genesis_fixture_checkpoint() -> HistoryStepFixtureCheckpoint {
         asert_anchor: jetsam_chain::consensus::AnchorInfo {
             anchor_height: genesis.height,
             anchor_timestamp: genesis.timestamp,
+            anchor_parent_timestamp: genesis.timestamp,
             anchor_target: genesis.difficulty_target,
         },
         spendables: Vec::new(),

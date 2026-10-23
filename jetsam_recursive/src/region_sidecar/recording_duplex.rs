@@ -73,6 +73,84 @@ struct SelectedRecordingLayouts {
     /// Two alternatives with the same role count and dyadic role geometry.
     /// A selector of zero chooses arm 0; one chooses arm 1.
     arms: [Vec<(DuplexLayout, usize)>; 2],
+    packing: RecordingPacking,
+}
+
+/// How each selected role of a recording key occupies the L-C domain.
+///
+/// A role's fixed patterns are cut in `2^SELECTED_RECORDING_CHUNK_LOG_REDUCTION`
+/// chunks of its dyadic block. Past the longest arm's schedule every pattern
+/// of the block is zero (pure carry), so a chunk lying wholly past it carries
+/// nothing the walk needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RecordingPacking {
+    /// Every role occupies its whole dyadic block, self-aligned (the key of
+    /// every released relation).
+    #[default]
+    Dyadic,
+    /// Every role occupies only the chunks its longest arm reaches, aligned
+    /// to its chunk size: the domain is rounded once, not per role.
+    Chunked,
+}
+
+/// Where one selected role sits: its dyadic block (the period of its
+/// patterns), its chunk, and the slots it spans in the domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedRoleExtent {
+    pub(crate) block_log: usize,
+    pub(crate) chunk_log: usize,
+    pub(crate) span: usize,
+}
+
+impl SelectedRoleExtent {
+    /// The alignment its offset must keep.
+    pub(crate) fn alignment(&self, packing: RecordingPacking) -> usize {
+        match packing {
+            RecordingPacking::Dyadic => 1usize << self.block_log,
+            RecordingPacking::Chunked => 1usize << self.chunk_log,
+        }
+    }
+}
+
+/// The extent of one role recorded by `layouts` (one per arm, the same
+/// dyadic block for every arm).
+pub(crate) fn selected_role_extent(
+    layouts: &[&DuplexLayout],
+    packing: RecordingPacking,
+) -> Result<SelectedRoleExtent, RegionSidecarError> {
+    let first = layouts.first().ok_or(RegionSidecarError::BadVk)?;
+    let size = first
+        .slots
+        .len()
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or(RegionSidecarError::BadVk)?;
+    if layouts
+        .iter()
+        .any(|layout| layout.slots.len().max(1).next_power_of_two() != size)
+    {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    let block_log = size.trailing_zeros() as usize;
+    let chunk_log = block_log
+        .checked_sub(SELECTED_RECORDING_CHUNK_LOG_REDUCTION)
+        .ok_or(RegionSidecarError::UnsupportedVkShape)?;
+    let span = match packing {
+        RecordingPacking::Dyadic => size,
+        RecordingPacking::Chunked => {
+            let longest = layouts
+                .iter()
+                .map(|layout| layout.slots.len().max(1))
+                .max()
+                .unwrap_or(1);
+            longest.div_ceil(1usize << chunk_log) << chunk_log
+        }
+    };
+    Ok(SelectedRoleExtent {
+        block_log,
+        chunk_log,
+        span,
+    })
 }
 
 /// Canonical verification key for one recordings-only duplex vertical.
@@ -106,10 +184,12 @@ impl RecordingDuplexRegionVk {
         slices: [WitnessSlice; DUPLEX_REGION_COMMITTED_COLUMNS],
         selector_slice: WitnessSlice,
         arms: [Vec<(DuplexLayout, usize)>; 2],
+        packing: RecordingPacking,
     ) -> Result<Self, RegionSidecarError> {
         let selected = SelectedRecordingLayouts {
             selector_slice,
             arms,
+            packing,
         };
         let (fixed, refs, rec_refs) = canonical_selected_recording_fixed(w_log, &selected)?;
         let layout_digest = recording_layout_digest(w_log, &[], Some(&selected));
@@ -142,6 +222,15 @@ impl RecordingDuplexRegionVk {
 
     pub(crate) fn selected_block(&self, arm: usize, role: usize) -> Option<&(DuplexLayout, usize)> {
         self.selected.as_ref()?.arms.get(arm)?.get(role)
+    }
+
+    /// The extent of a selected role (both arms' layouts of that role).
+    // Used by the tests (and the v1.6 relation); not by the batch step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn selected_extent(&self, role: usize) -> Option<SelectedRoleExtent> {
+        let selected = self.selected.as_ref()?;
+        let layouts = [&selected.arms[0].get(role)?.0, &selected.arms[1].get(role)?.0];
+        selected_role_extent(&layouts, selected.packing).ok()
     }
 
     fn selector_slice(&self) -> Option<WitnessSlice> {
@@ -296,10 +385,14 @@ fn canonical_recording_fixed(
     Ok((fixed, refs, rec_refs))
 }
 
-fn selected_recording_chunk_patterns(
+/// The gated chunk patterns of one role of `layout` at `offset`: one set of
+/// [`DUPLEX_PATTERNS_PER_SET`] patterns per chunk of its extent.
+pub(crate) fn selected_recording_chunk_patterns(
     w_log: usize,
     layout: &DuplexLayout,
     offset: usize,
+    extent: SelectedRoleExtent,
+    packing: RecordingPacking,
 ) -> Result<Vec<Vec<FixedPattern>>, RegionSidecarError> {
     let domain = 1usize
         .checked_shl(w_log as u32)
@@ -311,15 +404,25 @@ fn selected_recording_chunk_patterns(
         .checked_next_power_of_two()
         .ok_or(RegionSidecarError::BadVk)?;
     let s_log = size.trailing_zeros() as usize;
-    let end = offset.checked_add(size).ok_or(RegionSidecarError::BadVk)?;
-    if offset % size != 0 || end > domain || s_log < SELECTED_RECORDING_CHUNK_LOG_REDUCTION {
+    let end = offset
+        .checked_add(extent.span)
+        .ok_or(RegionSidecarError::BadVk)?;
+    if s_log != extent.block_log
+        || s_log < SELECTED_RECORDING_CHUNK_LOG_REDUCTION
+        || extent.chunk_log != s_log - SELECTED_RECORDING_CHUNK_LOG_REDUCTION
+        || extent.span % (1usize << extent.chunk_log) != 0
+        || extent.span > size
+        || extent.span < layout.slots.len()
+        || offset % extent.alignment(packing) != 0
+        || end > domain
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     let iv = FsChannelUnionRecorder::capacity_iv_flat_c1();
     let full = duplex_fixed_patterns(layout, iv, s_log);
-    let chunk_log = s_log - SELECTED_RECORDING_CHUNK_LOG_REDUCTION;
+    let chunk_log = extent.chunk_log;
     let chunk_size = 1usize << chunk_log;
-    let chunk_count = 1usize << SELECTED_RECORDING_CHUNK_LOG_REDUCTION;
+    let chunk_count = extent.span / chunk_size;
     Ok((0..chunk_count)
         .map(|chunk| {
             let chunk_offset = offset + chunk * chunk_size;
@@ -365,9 +468,11 @@ fn canonical_selected_recording_fixed(
     if role_count == 0 || selected.arms[1].len() != role_count {
         return Err(RegionSidecarError::BadVk);
     }
-    let chunk_count = 1usize << SELECTED_RECORDING_CHUNK_LOG_REDUCTION;
-    let mut fixed = Vec::with_capacity(role_count * chunk_count * 2 * DUPLEX_PATTERNS_PER_SET);
-    let mut set_refs = Vec::with_capacity(role_count * chunk_count * 2);
+    let packing = selected.packing;
+    let max_chunks = 1usize << SELECTED_RECORDING_CHUNK_LOG_REDUCTION;
+    let mut fixed = Vec::with_capacity(role_count * max_chunks * 2 * DUPLEX_PATTERNS_PER_SET);
+    let mut set_refs = Vec::with_capacity(role_count * max_chunks * 2);
+    let mut extents = Vec::with_capacity(role_count);
     for role in 0..role_count {
         let (base_layout, base_offset) = &selected.arms[0][role];
         let (alternative_layout, alternative_offset) = &selected.arms[1][role];
@@ -376,9 +481,18 @@ fn canonical_selected_recording_fixed(
         if base_offset != alternative_offset || base_size != alternative_size {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        let base_chunks = selected_recording_chunk_patterns(w_log, base_layout, *base_offset)?;
-        let alternative_chunks =
-            selected_recording_chunk_patterns(w_log, alternative_layout, *alternative_offset)?;
+        let extent = selected_role_extent(&[base_layout, alternative_layout], packing)?;
+        extents.push(extent);
+        let chunk_count = extent.span >> extent.chunk_log;
+        let base_chunks =
+            selected_recording_chunk_patterns(w_log, base_layout, *base_offset, extent, packing)?;
+        let alternative_chunks = selected_recording_chunk_patterns(
+            w_log,
+            alternative_layout,
+            *alternative_offset,
+            extent,
+            packing,
+        )?;
         if base_chunks.len() != chunk_count || alternative_chunks.len() != chunk_count {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -406,9 +520,8 @@ fn canonical_selected_recording_fixed(
     // Each arm must itself be a valid non-overlapping recording packing.
     for arm in &selected.arms {
         let mut ranges = Vec::with_capacity(role_count);
-        for (layout, offset) in arm {
-            let size = layout.slots.len().max(1).next_power_of_two();
-            ranges.push((*offset, offset + size));
+        for ((_, offset), extent) in arm.iter().zip(&extents) {
+            ranges.push((*offset, offset + extent.span));
         }
         for (index, left) in ranges.iter().enumerate() {
             for right in &ranges[index + 1..] {
@@ -441,6 +554,11 @@ fn recording_layout_digest(
                 push_usize(&mut bytes, *offset);
                 bytes.extend_from_slice(&duplex_layout_digest(layout));
             }
+        }
+        // The dyadic encoding is the released one, byte for byte; a chunked
+        // key appends its packing tag (its spans follow from the layouts).
+        if selected.packing == RecordingPacking::Chunked {
+            bytes.push(2);
         }
     } else {
         bytes.push(0);
@@ -988,6 +1106,7 @@ mod tests {
                 vec![(arm0_role0, 0), (arm0_role1, 8)],
                 vec![(arm1_role0, 0), (arm1_role1, 8)],
             ],
+            packing: RecordingPacking::Dyadic,
         }
     }
 
@@ -1041,5 +1160,118 @@ mod tests {
             }
             assert_eq!(actual, expected, "selector {arm} fixed bank");
         }
+    }
+
+    fn slots_layout(slots: usize, constant: Option<u128>) -> DuplexLayout {
+        let mut lanes = vec![None; 2 * slots];
+        lanes[1] = constant;
+        let layout = compile_duplex(&[TranscriptOp::Absorb(lanes)]);
+        assert_eq!(layout.slots.len(), slots);
+        layout
+    }
+
+    /// Two roles, two arms: role 0 of 5 / 6 slots (block 8, chunk 2), role 1
+    /// of 3 / 4 slots (block 4, chunk 1).
+    fn chunked_fixture(offsets: [usize; 2]) -> SelectedRecordingLayouts {
+        SelectedRecordingLayouts {
+            selector_slice: WitnessSlice {
+                log2_len: 0,
+                index: 31,
+            },
+            arms: [
+                vec![
+                    (slots_layout(5, None), offsets[0]),
+                    (slots_layout(3, None), offsets[1]),
+                ],
+                vec![
+                    (slots_layout(6, Some(7)), offsets[0]),
+                    (slots_layout(4, Some(11)), offsets[1]),
+                ],
+            ],
+            packing: RecordingPacking::Chunked,
+        }
+    }
+
+    /// A chunked key keeps, per role, only the chunks its longest arm
+    /// reaches: its bank is each arm's complete dyadic bank cut to the role's
+    /// span (the patterns are zero past the schedule), with the second role
+    /// starting inside the first role's dyadic block.
+    #[test]
+    fn chunked_chunks_recompose_each_arm_on_its_span() {
+        let w_log = 4;
+        let domain = 1usize << w_log;
+        // Role 0 spans 6 slots (3 chunks of 2) at 0; role 1 spans 4 (4 of 1)
+        // at 6 — inside role 0's dyadic block [0, 8).
+        let selected = chunked_fixture([0, 6]);
+        let spans = [6usize, 4];
+        for (role, span) in spans.iter().enumerate() {
+            let layouts = [&selected.arms[0][role].0, &selected.arms[1][role].0];
+            assert_eq!(
+                selected_role_extent(&layouts, RecordingPacking::Chunked).map(|e| e.span),
+                Ok(*span),
+                "role {role}"
+            );
+        }
+        let (fixed, _, rec_refs) =
+            canonical_selected_recording_fixed(w_log, &selected).expect("chunked fixed bank");
+        let sets = 1 + rec_refs.len();
+        assert_eq!(sets, (3 + 4) * 2, "one base and one delta set per kept chunk");
+
+        for (arm, selector) in [F128::ZERO, F128::ONE].into_iter().enumerate() {
+            let mut actual = vec![vec![F128::ZERO; domain]; DUPLEX_PATTERNS_PER_SET];
+            for pair in 0..sets / 2 {
+                for pattern in 0..DUPLEX_PATTERNS_PER_SET {
+                    let base =
+                        fixed[(2 * pair) * DUPLEX_PATTERNS_PER_SET + pattern].materialize(domain);
+                    let delta = fixed[(2 * pair + 1) * DUPLEX_PATTERNS_PER_SET + pattern]
+                        .materialize(domain);
+                    for row in 0..domain {
+                        actual[pattern][row] += base[row] + selector * delta[row];
+                    }
+                }
+            }
+            let mut expected = vec![vec![F128::ZERO; domain]; DUPLEX_PATTERNS_PER_SET];
+            for ((layout, offset), span) in selected.arms[arm].iter().zip(spans) {
+                let size = layout.slots.len().max(1).next_power_of_two();
+                let s_log = size.trailing_zeros() as usize;
+                for (pattern, full) in duplex_fixed_patterns(
+                    layout,
+                    FsChannelUnionRecorder::capacity_iv_flat_c1(),
+                    s_log,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    assert!(
+                        full.table[span..].iter().all(|value| *value == F128::ZERO),
+                        "patterns past the span are zero"
+                    );
+                    for slot in 0..span {
+                        expected[pattern][offset + slot] += full.table[slot];
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "selector {arm} chunked fixed bank");
+        }
+
+        // The same arms at dyadic offsets are a different key.
+        let dyadic_offsets = chunked_fixture([0, 8]);
+        let mut dyadic = dyadic_offsets.clone();
+        dyadic.packing = RecordingPacking::Dyadic;
+        assert!(canonical_selected_recording_fixed(w_log, &dyadic_offsets).is_ok());
+        assert!(canonical_selected_recording_fixed(w_log, &dyadic).is_ok());
+        assert_ne!(
+            recording_layout_digest(w_log, &[], Some(&dyadic_offsets)),
+            recording_layout_digest(w_log, &[], Some(&dyadic)),
+            "the packing is part of the layout digest"
+        );
+        // A dyadic key never accepts a role inside another role's block, and
+        // a chunked key never accepts a misaligned or overlapping span.
+        let mut inside = selected.clone();
+        inside.packing = RecordingPacking::Dyadic;
+        assert!(canonical_selected_recording_fixed(w_log, &inside).is_err());
+        assert!(canonical_selected_recording_fixed(w_log, &chunked_fixture([0, 5])).is_err());
+        assert!(canonical_selected_recording_fixed(w_log, &chunked_fixture([1, 8])).is_err());
+        assert!(canonical_selected_recording_fixed(3, &selected).is_err(), "out of the domain");
     }
 }

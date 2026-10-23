@@ -779,11 +779,12 @@ fn ensure_bank_wrote_terminal_at(
     }
     let generation = bank.generation();
     // The relation that ends at this bank's root: launch before v1.3, v1.3
-    // before v1.5.
+    // before v1.5, v1.5 before v1.6.
     let other = match generation {
         HistoryStepPackGeneration::V1 => HistoryStepPackGeneration::V1_3,
         HistoryStepPackGeneration::V1_3 => HistoryStepPackGeneration::V1,
         HistoryStepPackGeneration::V1_5 => HistoryStepPackGeneration::V1_3,
+        HistoryStepPackGeneration::V1_6 => HistoryStepPackGeneration::V1_5,
     };
     let io_len = |generation| {
         crate::acceptance::history_step_bank::history_step_bank_io_spec_for(generation).io_len
@@ -1200,9 +1201,254 @@ pub fn decode_history_step_client_proof(
     Ok((proof, root, io))
 }
 
+/// Version byte of a form-Z client proof encoding (v1.6). Distinct
+/// from the v1.5 byte: neither codec reads the other's encodings.
+pub const HISTORY_STEP_CLIENT_ZK_PROOF_WIRE_VERSION: u8 = 2;
+
+/// Upper bound of a form-Z client proof encoding: the v1.5 bound plus the
+/// zerocheck's `kappa` and the lincheck mask's final value (two F256), by
+/// generation of the form (509 073 bytes for the canonical m = 22 form).
+pub fn history_step_client_zk_proof_max_wire_bytes(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+) -> Result<usize, HistoryStepError> {
+    add(history_step_client_proof_max_wire_bytes(form)?, 2 * F256_BYTES)
+}
+
+/// A form-Z client proof on the wire: version byte 2, commitment root,
+/// public IO, the masked field proof with shared Merkle paths, then
+/// `kappa` and the lincheck mask value.
+pub fn encode_history_step_client_zk_proof(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+    proof: &jetsam_ivc_core::proof::C1ZkFieldR1csProof,
+    commitment_root: &[u8; HASH_BYTES],
+    io: &[F128],
+) -> Result<Vec<u8>, HistoryStepError> {
+    let mut out = Vec::with_capacity(history_step_client_zk_proof_max_wire_bytes(form)?);
+    out.push(HISTORY_STEP_CLIENT_ZK_PROOF_WIRE_VERSION);
+    put_hash(&mut out, commitment_root);
+    encode_f128_vec(&mut out, io, form.io_spec().io_len)?;
+    encode_field_proof(&mut out, &proof.base, form.shape(), form.pcs_params(), true)?;
+    put_f256(&mut out, proof.zerocheck_kappa);
+    put_f256(&mut out, proof.lincheck_mask_value);
+    Ok(out)
+}
+
+/// Decode [`encode_history_step_client_zk_proof`]'s bytes, every byte
+/// consumed, the length bounded first.
+pub fn decode_history_step_client_zk_proof(
+    form: &crate::acceptance::history_step_bank::HistoryStepClientForm,
+    bytes: &[u8],
+) -> Result<
+    (
+        jetsam_ivc_core::proof::C1ZkFieldR1csProof,
+        [u8; HASH_BYTES],
+        Vec<F128>,
+    ),
+    HistoryStepError,
+> {
+    if bytes.len() > history_step_client_zk_proof_max_wire_bytes(form)? {
+        return Err(HistoryStepError::WireEncoding);
+    }
+    let mut reader = Reader::new(bytes);
+    if reader.u8()? != HISTORY_STEP_CLIENT_ZK_PROOF_WIRE_VERSION {
+        return Err(HistoryStepError::WireVersion);
+    }
+    let root = reader.hash()?;
+    let io = decode_f128_vec(&mut reader, form.io_spec().io_len)?;
+    let base = decode_field_proof(&mut reader, form.shape(), form.pcs_params(), true)?;
+    let zerocheck_kappa = reader.f256()?;
+    let lincheck_mask_value = reader.f256()?;
+    reader.finish()?;
+    Ok((
+        jetsam_ivc_core::proof::C1ZkFieldR1csProof {
+            base,
+            zerocheck_kappa,
+            lincheck_mask_value,
+        },
+        root,
+        io,
+    ))
+}
+
+/// Upper bound of [`encode_rooted_field_proof`]'s bytes: a commitment root,
+/// `io_len` IO lanes and a field proof of `shape` under `params` with shared
+/// Merkle paths — the body of a v1.5 client proof encoding, here for the
+/// v1.6 batch proof (`client_batch::wire`).
+pub(crate) fn rooted_field_proof_max_wire_bytes(
+    io_len: usize,
+    shape: FieldShape,
+    params: &PcsParams,
+) -> Result<usize, HistoryStepError> {
+    let len = add(HASH_BYTES, mul(io_len, F128_BYTES)?)?;
+    add(len, field_proof_len(shape, params)?)
+}
+
+/// A commitment root, `io_len` IO lanes, then the field proof with shared
+/// Merkle paths (the encoding of [`encode_history_step_client_proof`] after
+/// its version byte).
+pub(crate) fn encode_rooted_field_proof(
+    out: &mut Vec<u8>,
+    commitment_root: &[u8; HASH_BYTES],
+    io: &[F128],
+    io_len: usize,
+    field_proof: &C1FieldR1csProof,
+    shape: FieldShape,
+    params: &PcsParams,
+) -> Result<(), HistoryStepError> {
+    put_hash(out, commitment_root);
+    encode_f128_vec(out, io, io_len)?;
+    encode_field_proof(out, field_proof, shape, params, true)
+}
+
+/// Decode [`encode_rooted_field_proof`]'s bytes, every byte consumed.
+pub(crate) fn decode_rooted_field_proof(
+    bytes: &[u8],
+    io_len: usize,
+    shape: FieldShape,
+    params: &PcsParams,
+) -> Result<(C1FieldR1csProof, [u8; HASH_BYTES], Vec<F128>), HistoryStepError> {
+    if bytes.len() > rooted_field_proof_max_wire_bytes(io_len, shape, params)? {
+        return Err(HistoryStepError::WireEncoding);
+    }
+    let mut reader = Reader::new(bytes);
+    let root = reader.hash()?;
+    let io = decode_f128_vec(&mut reader, io_len)?;
+    let proof = decode_field_proof(&mut reader, shape, params, true)?;
+    reader.finish()?;
+    Ok((proof, root, io))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A form-Z client proof at m = 12 (test layout) and the form it rides.
+    fn small_zk_proof() -> (
+        crate::acceptance::history_step_bank::HistoryStepClientForm,
+        jetsam_ivc_core::proof::C1ZkFieldR1csProof,
+        [u8; HASH_BYTES],
+        Vec<F128>,
+    ) {
+        use jetsam_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
+        use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use jetsam_ivc_core::zk_form::{draw_zk_form_randomness, ZkFormLayout, ZkFormRelation};
+        let m = 12usize;
+        let logical_m = 11usize;
+        let n = 1usize << logical_m;
+        let mut z = vec![F128::ZERO; n];
+        let mut a_rows: Vec<Vec<(u32, F128)>> = vec![Vec::new(); n];
+        let mut b_rows: Vec<Vec<(u32, F128)>> = vec![Vec::new(); n];
+        z[0] = F128::ONE;
+        a_rows[0].push((0, F128::ONE));
+        b_rows[0].push((0, F128::ONE));
+        for io in 8..16 {
+            z[io] = F128::new(io as u64 * 7 + 1, 3);
+            a_rows[io].push((io as u32, F128::ONE));
+            b_rows[io].push((0, F128::ONE));
+        }
+        for c in 16..400 {
+            let (x, w) = (c * 7 % c.max(1), (c * 13 + 5) % c);
+            a_rows[c].push((x as u32, F128::new(c as u64, 1)));
+            b_rows[c].push((w as u32, F128::ONE));
+            z[c] = F128::new(c as u64, 1) * z[x] * z[w];
+        }
+        let logical = FieldR1cs {
+            m: logical_m,
+            k_log: logical_m,
+            k_skip: 6,
+            useful_rows: 400,
+            a_0: SparseFieldMatrix::from_rows(n, a_rows),
+            b_0: SparseFieldMatrix::from_rows(n, b_rows),
+            const_pin: Some(0),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let layout = ZkFormLayout::reduced(m);
+        let relation = ZkFormRelation::from_logical(layout, &logical).unwrap();
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice { log2_len: 3, index: 1 },
+            io_len: 8,
+            claims: Vec::new(),
+        };
+        let params = PcsParams {
+            m: m + jetsam_ivc_core::pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let form = crate::acceptance::history_step_bank::HistoryStepClientForm::new(
+            FieldShape::of(relation.physical()),
+            params.clone(),
+            spec.clone(),
+            4,
+        );
+        let io = z[8..16].to_vec();
+        let mut counter = 0u8;
+        let randomness = draw_zk_form_randomness(layout, &mut |bytes: &mut [u8]| {
+            for byte in bytes.iter_mut() {
+                counter = counter.wrapping_mul(29).wrapping_add(11);
+                *byte = counter;
+            }
+        });
+        let mut challenger = jetsam_ivc_core::challenger::FsLaneChallenger::new_c1(b"e8-wire");
+        let (proof, (), commitment, _) =
+            jetsam_ivc_prover::zk_client::prove_field_c1_zk_with_public_io_and_post_commit_context(
+                &relation,
+                &z,
+                randomness,
+                &params,
+                &spec,
+                &io,
+                &[0x77; 32],
+                &mut challenger,
+                |_| (),
+            )
+            .unwrap();
+        (form, proof, commitment.root, io)
+    }
+
+    #[test]
+    fn the_form_z_client_proof_bound_is_the_v1_5_bound_plus_kappa_and_the_mask_value() {
+        let canonical = crate::acceptance::history_step_bank::HistoryStepClientForm::canonical();
+        assert_eq!(history_step_client_proof_max_wire_bytes(&canonical).unwrap(), 509_009);
+        assert_eq!(
+            history_step_client_zk_proof_max_wire_bytes(&canonical).unwrap(),
+            509_073
+        );
+    }
+
+    #[test]
+    fn a_form_z_client_proof_round_trips_and_every_byte_counts() {
+        let (form, proof, root, io) = small_zk_proof();
+        let bytes = encode_history_step_client_zk_proof(&form, &proof, &root, &io).unwrap();
+        assert!(bytes.len() <= history_step_client_zk_proof_max_wire_bytes(&form).unwrap());
+        assert_eq!(bytes[0], HISTORY_STEP_CLIENT_ZK_PROOF_WIRE_VERSION);
+        let (decoded, decoded_root, decoded_io) =
+            decode_history_step_client_zk_proof(&form, &bytes).unwrap();
+        assert_eq!(decoded_root, root);
+        assert_eq!(decoded_io, io);
+        assert_eq!(decoded.zerocheck_kappa, proof.zerocheck_kappa);
+        assert_eq!(decoded.lincheck_mask_value, proof.lincheck_mask_value);
+        assert_eq!(
+            encode_history_step_client_zk_proof(&form, &decoded, &decoded_root, &decoded_io).unwrap(),
+            bytes
+        );
+        // The v1.5 codec refuses a form-Z encoding, and the converse.
+        assert!(decode_history_step_client_proof(&form, &bytes).is_err());
+        let v15 = encode_history_step_client_proof(&form, &proof.base, &root, &io).unwrap();
+        assert_eq!(v15.len() + 2 * F256_BYTES, bytes.len());
+        assert!(decode_history_step_client_zk_proof(&form, &v15).is_err());
+        let mut relabelled = bytes.clone();
+        relabelled[0] = 1;
+        assert!(decode_history_step_client_zk_proof(&form, &relabelled).is_err());
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(decode_history_step_client_zk_proof(&form, &truncated).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode_history_step_client_zk_proof(&form, &longer).is_err());
+    }
+
     use crate::acceptance::history_step_bank::{
         canonical_history_step_pcs_params, canonical_history_step_shape,
         history_step_bank_post_commit_digest, HistoryStepBankEntryPins,
@@ -1284,6 +1530,79 @@ mod tests {
         // rooted at genesis, so every block of the chain is above its root.
         assert!(ensure_bank_wrote_terminal_at(&launch, ACTIVATION - 1).is_ok());
         assert!(ensure_bank_wrote_terminal_at(&launch, 1).is_ok());
+    }
+
+    /// A v1.6 pack is rooted at the block before the v1.6 height, so the
+    /// terminal at that root was written by the v1.5 relation: the v1.6 bank
+    /// names it as a foreign frame (its IO is v1.5's, 1 765 lanes, not the
+    /// 1 873 of v1.6) instead of decoding it, and reads its own base at the
+    /// v1.6 height and every block above it. A v1.5 pack rooted below keeps
+    /// reading the v1.5 history it wrote.
+    #[test]
+    fn a_v1_6_pack_refuses_the_v1_5_terminal_at_its_root() {
+        use crate::acceptance::history_step_bank::{
+            canonical_history_step_pcs_params_in, canonical_history_step_shape_in,
+            history_step_bank_io_spec_for, HistoryStepBatchClassPins, HISTORY_STEP_BATCH_FORM_M,
+        };
+        use HistoryStepPackGeneration::{V1_5, V1_6};
+        const V1_5_HEIGHT: u64 = 960;
+        const V1_6_HEIGHT: u64 = 9_600;
+        let pins_of = |generation: HistoryStepPackGeneration| {
+            let spec = history_step_bank_io_spec_for(generation);
+            std::array::from_fn(|index| {
+                let class_id = CanonicalHistoryStepClassId::from_index(index).unwrap();
+                let shape = canonical_history_step_shape_in(generation, class_id);
+                let pcs_params = canonical_history_step_pcs_params_in(generation, class_id);
+                let matrix_digest = [index as u8 + 1; 32];
+                let parent_recursion_vk_digest = [0x21; 32];
+                let direct_block_vk_digest = [class_id.current_slot() as u8 + 0x41; 32];
+                let post_commit_digest = history_step_bank_post_commit_digest(
+                    class_id,
+                    &matrix_digest,
+                    &spec,
+                    &pcs_params,
+                    parent_recursion_vk_digest,
+                    direct_block_vk_digest,
+                );
+                HistoryStepBankEntryPins {
+                    class_id,
+                    shape,
+                    pcs_params,
+                    matrix_digest,
+                    parent_recursion_vk_digest,
+                    direct_block_vk_digest,
+                    post_commit_digest,
+                }
+            })
+        };
+        let batch = HistoryStepBatchClassPins {
+            matrix_digest: [0xB1; 32],
+            post_commit_digest: [0xB2; 32],
+            link_vk_digest: [0xB3; 32],
+            m: HISTORY_STEP_BATCH_FORM_M,
+        };
+        let v1_6 = PinnedHistoryStepClassBank::validate_for_v1_6(pins_of(V1_6), batch)
+            .unwrap()
+            .rooted_at_height(V1_6_HEIGHT - 1);
+        let v1_5 = PinnedHistoryStepClassBank::validate_for(V1_5, pins_of(V1_5))
+            .unwrap()
+            .rooted_at_height(V1_5_HEIGHT - 1);
+        for below in [V1_6_HEIGHT - 1, V1_5_HEIGHT, 1] {
+            assert!(
+                matches!(
+                    ensure_bank_wrote_terminal_at(&v1_6, below),
+                    Err(HistoryStepError::ForeignIoLayout {
+                        expected: 1873,
+                        actual: 1765,
+                    })
+                ),
+                "a v1.6 pack must name the v1.5 terminal at {below}: {:?}",
+                ensure_bank_wrote_terminal_at(&v1_6, below)
+            );
+        }
+        assert!(ensure_bank_wrote_terminal_at(&v1_6, V1_6_HEIGHT).is_ok());
+        assert!(ensure_bank_wrote_terminal_at(&v1_6, V1_6_HEIGHT + 1).is_ok());
+        assert!(ensure_bank_wrote_terminal_at(&v1_5, V1_6_HEIGHT - 1).is_ok());
     }
 
     /// The block that opens a relation recurses over nothing, so no reader

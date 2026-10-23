@@ -4,7 +4,7 @@
 
 //! Build a canonical `HistoryStep` release pack from honest chain data.
 //!
-//! Usage: `jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5]`
+//! Usage: `jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5|v1.6]`
 //!
 //! The fixture provider starts at the real genesis state, mines every header,
 //! verifies every wallet authorization and materializes every backbone state.
@@ -61,9 +61,9 @@ fn class_label(class: CanonicalHistoryStepClassId) -> String {
     format!("H(B{})", class.current_tier_in(build_generation()))
 }
 
-/// Parse `[--generation v1|v1.3|v1.5]`, defaulting to the launch relation.
+/// Parse `[--generation v1|v1.3|v1.5|v1.6]`, defaulting to the launch relation.
 fn parse_arguments() -> (PathBuf, HistoryStepPackGeneration) {
-    const USAGE: &str = "usage: jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5]";
+    const USAGE: &str = "usage: jetsam_matrix_gen <pack-root> [--generation v1|v1.3|v1.5|v1.6]";
     let mut root: Option<PathBuf> = None;
     let mut generation: Option<HistoryStepPackGeneration> = None;
     let mut arguments = std::env::args().skip(1);
@@ -75,6 +75,9 @@ fn parse_arguments() -> (PathBuf, HistoryStepPackGeneration) {
                     "v1" => HistoryStepPackGeneration::V1,
                     "v1.3" => HistoryStepPackGeneration::V1_3,
                     "v1.5" => HistoryStepPackGeneration::V1_5,
+                    // The v1.6 relation over the chain's batch class
+                    // (CLIENT_BATCH_CLASS, a consensus constant).
+                    "v1.6" => HistoryStepPackGeneration::V1_6,
                     other => panic!("unknown pack generation {other:?}; {USAGE}"),
                 };
                 assert!(
@@ -335,6 +338,7 @@ fn main() {
             HistoryStepPackGeneration::V1 => "v1 (launch)",
             HistoryStepPackGeneration::V1_3 => "v1.3",
             HistoryStepPackGeneration::V1_5 => "v1.5",
+            HistoryStepPackGeneration::V1_6 => "v1.6 (batch slot over D_batch)",
         }
     );
     println!("  rayon threads: {}", rayon::current_num_threads());

@@ -523,6 +523,44 @@ pub fn v1_5_activation_from_root_height(
     mul(b, &root_is_genesis.add_const(F128::ONE), &next)
 }
 
+/// The v1.5 activation height `J` a v1.6 relation pays under: the v1.5
+/// height of the profile, frozen into the v1.6 matrices as a constant.
+///
+/// v1.6 does not move the development schedule (`V1_6_ACTIVATION_HEIGHT`:
+/// "it does not move ... the development schedule, which stays on the v1.5
+/// clock"), and a v1.6 relation cannot read `J` off its recursion root as a
+/// v1.5 one does: that root is the block before the v1.6 height. A constant
+/// makes the v1.6 pack depend on the profile — one per profile, as the v1.5
+/// packs already are (their payout recipients are frozen constants) — and a
+/// pack built under the other profile pays the wrong schedule from its first
+/// payout block, so it is refused there, never silently.
+///
+/// v1.6 is only ever armed above an armed v1.5 (`v1_6_schedule_is_valid`),
+/// and both profiles arm v1.5: this is checked at compile time.
+pub const V1_6_PAYOUT_ACTIVATION: u64 =
+    match jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT {
+        Some(activation) => activation,
+        None => panic!("a v1.6 relation pays the v1.5 schedule: V1_5_ACTIVATION_HEIGHT must be armed"),
+    };
+
+const _: () = assert!(
+    jetsam_chain::consensus::development_allocation::v1_5_activation_is_valid(V1_6_PAYOUT_ACTIVATION),
+    "the v1.5 height a v1.6 relation pays under is a valid v1.5 activation"
+);
+
+/// Bind the development schedule of a v1.6 block: the v1.5 schedule
+/// ([`bind_development_allocation_v1_5`]) on `v1_5_activation`, a constant of
+/// the relation (the profile's [`V1_6_PAYOUT_ACTIVATION`] in production).
+pub fn bind_development_allocation_v1_6(
+    b: &mut FieldR1csBuilder,
+    child_height: &LinExpr,
+    payout_raw_amount: &LinExpr,
+    v1_5_activation: u64,
+) -> DevelopmentAllocationTrace {
+    let activation = const_block(Block128::from(v1_5_activation as u128));
+    bind_development_allocation_v1_5(b, child_height, payout_raw_amount, &activation)
+}
+
 /// The development schedule a block of `generation` is bound to.
 ///
 /// Launch and v1.3: [`bind_development_allocation`], the 960-block cadence
@@ -530,6 +568,12 @@ pub fn v1_5_activation_from_root_height(
 /// carry. v1.5: [`bind_development_allocation_v1_5`] on the `J` of the
 /// relation's own recursion root. `recursion_root_height` is that root's
 /// height lane; launch and v1.3 never read it.
+///
+/// v1.6: [`bind_development_allocation_v1_6`], the v1.5 schedule on the
+/// v1.5 height of the profile ([`V1_6_PAYOUT_ACTIVATION`]), never on its own
+/// recursion root, which sits at the v1.6 height (`J` read there would be
+/// `V1_6`, and the relation would pay on another schedule). It does not read
+/// `recursion_root_height`.
 pub fn bind_development_schedule(
     b: &mut FieldR1csBuilder,
     generation: jetsam_chain::consensus::params::HistoryStepPackGeneration,
@@ -537,12 +581,15 @@ pub fn bind_development_schedule(
     payout_raw_amount: &LinExpr,
     recursion_root_height: &LinExpr,
 ) -> DevelopmentAllocationTrace {
-    use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3, V1_5};
+    use jetsam_chain::consensus::params::HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
     match generation {
         V1 | V1_3 => bind_development_allocation(b, child_height, payout_raw_amount),
         V1_5 => {
             let activation = v1_5_activation_from_root_height(b, recursion_root_height);
             bind_development_allocation_v1_5(b, child_height, payout_raw_amount, &activation)
+        }
+        V1_6 => {
+            bind_development_allocation_v1_6(b, child_height, payout_raw_amount, V1_6_PAYOUT_ACTIVATION)
         }
     }
 }
@@ -963,5 +1010,112 @@ mod tests {
                 "{generation:?} must bind the launch gadget, row for row"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.6 — the v1.5 schedule, J bound to the profile, not to the root
+    // -----------------------------------------------------------------------
+
+    /// One v1.6 schedule gadget at `height`, its relation rooted at
+    /// `v1_6 − 1` (the v1.6 recursion root), the payout lane carrying
+    /// `payout`: (satisfied, payout_due, payout_each, miner_subsidy).
+    fn v1_6_case(height: u64, v1_6: u64, payout: u64) -> (bool, F128, F128, F128) {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_6;
+        let mut builder = FieldR1csBuilder::new();
+        let child = alloc_block(&mut builder, Block128::from(height as u128));
+        let root = alloc_block(&mut builder, Block128::from((v1_6 - 1) as u128));
+        let payout = alloc_block(&mut builder, Block128::from(payout as u128));
+        let trace = bind_development_schedule(&mut builder, V1_6, &child, &payout, &root);
+        let (matrix, witness) = builder.build();
+        (
+            matrix.satisfies(&witness),
+            trace.payout_due.eval(&witness),
+            trace.payout_each.eval(&witness),
+            trace.miner_subsidy.eval(&witness),
+        )
+    }
+
+    /// The trap: a v1.6 relation is rooted at `V1_6 − 1`, and
+    /// the v1.5 gadget reads `J` off its root — copied as is, it would read
+    /// `J = V1_6` and pay on the wrong schedule. A v1.6 block pays THE v1.5
+    /// schedule of its profile (`J` = the profile's v1.5 height): every height
+    /// below, at and above J (cadence 960 up to J, 480 after it), at and after
+    /// the v1.6 height, and around the window end, pays exactly what the
+    /// native schedule says and the honest amount satisfies the gadget; the
+    /// schedule rooted at V1_6 differs from it at two heights at least
+    /// (between J and V1_6, where J's cadence is 480 and V1_6's 960; past J's
+    /// window end, which V1_6's would push 0.5 × (V1_6 − J) later). The
+    /// gadget's outputs (payout due, amount, miner subsidy) are compared, not
+    /// a forged amount: off a payout height the payout lane is a user body,
+    /// and an amount forged into the witness would break its own row first.
+    #[test]
+    fn a_v1_6_block_pays_the_v1_5_schedule_of_its_profile() {
+        use jetsam_chain::consensus::params::V1_5_ACTIVATION_HEIGHT;
+        let j = V1_5_ACTIVATION_HEIGHT.expect("v1.5 is armed on both profiles");
+        // Two hypothetical v1.6 heights of this profile, multiples of 960 above J.
+        for v1_6 in [j + 960, j + 9_600] {
+            let end = development_allocation_end_height_with(Some(j));
+            let wrong_end = development_allocation_end_height_with(Some(v1_6));
+            assert!(wrong_end > end, "a later root moves the window end");
+            let mut heights = vec![1, j, j + 1, j + 480, j + 960, v1_6 - 480, v1_6, v1_6 + 1];
+            heights.extend([v1_6 + 480, v1_6 + 960, end - 480, end, end + 1, end + 480]);
+            heights.extend([wrong_end - 480, wrong_end, wrong_end + 480]);
+            if j >= 960 {
+                heights.extend([j - 960, j - 480]);
+            }
+            let mut differing = 0;
+            for height in heights {
+                let native = development_allocation_with(height, Some(j)).unwrap();
+                let (satisfied, due, each, miner) =
+                    v1_6_case(height, v1_6, native.payout_each.unwrap_or(0));
+                assert!(satisfied, "v1.6 at {height} (V1_6 = {v1_6}): the honest payout is refused");
+                assert_eq!(due, boolean(native.payout_due), "payout due at {height} (V1_6 = {v1_6})");
+                assert_eq!(
+                    each,
+                    alloc_block_value(native.payout_each.unwrap_or(0)),
+                    "payout at {height} (V1_6 = {v1_6})"
+                );
+                assert_eq!(
+                    miner,
+                    alloc_block_value(native.miner_subsidy),
+                    "miner subsidy at {height} (V1_6 = {v1_6})"
+                );
+                // The schedule of the v1.6 root (J = V1_6): wherever it
+                // differs, the gadget (equal to J's, above) is not it.
+                let rooted = development_allocation_with(height, Some(v1_6)).unwrap();
+                if (rooted.payout_due, rooted.payout_each, rooted.miner_subsidy)
+                    != (native.payout_due, native.payout_each, native.miner_subsidy)
+                {
+                    differing += 1;
+                }
+            }
+            assert!(
+                differing >= 2,
+                "V1_6 = {v1_6}: the heights checked must separate J's schedule from the root's ({differing})"
+            );
+        }
+    }
+
+    /// The v1.6 schedule is a constant of the profile, not witness data: the
+    /// matrix does not depend on the root it is given (one v1.6 pack per
+    /// profile, like the v1.5 packs), and it is not the v1.5 matrix, which
+    /// reads J off the root.
+    #[test]
+    fn the_v1_6_schedule_rows_ignore_the_root_and_differ_from_v1_5() {
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::{self, V1_5, V1_6};
+        let digest = |generation: HistoryStepPackGeneration, root_height: u64| {
+            let mut builder = FieldR1csBuilder::new();
+            let child = alloc_block(&mut builder, Block128::from(7u128));
+            let root = alloc_block(&mut builder, Block128::from(root_height as u128));
+            let payout = alloc_block(&mut builder, Block128::from(0u128));
+            let _ = bind_development_schedule(&mut builder, generation, &child, &payout, &root);
+            let (matrix, _) = builder.build();
+            matrix.structural_statement_digest()
+        };
+        let v1_6 = digest(V1_6, 0);
+        for root_height in [6, 959, ACTIVATION - 1, 700_799] {
+            assert_eq!(digest(V1_6, root_height), v1_6, "root {root_height}");
+        }
+        assert_ne!(v1_6, digest(V1_5, 0), "the v1.6 schedule is not the v1.5 matrix");
     }
 }

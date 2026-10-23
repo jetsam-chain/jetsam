@@ -288,6 +288,11 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
 /// ghost), and the registry leaves it publishes when it registers a client
 /// (`None`: the parent's). Both `None` under the launch and v1.3 relations,
 /// where this is exactly the released preparation.
+///
+/// `batch` is the v1.6 batch slot: the batch the block carries,
+/// decided and prepared when it was received (`None`: the ghost). Under a
+/// v1.6 runtime the block carries no client (`client` must be `None`); under
+/// an earlier one, no batch.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_history_step_witness<const TIER: usize>(
     template: Block,
@@ -298,7 +303,14 @@ pub fn prepare_history_step_witness<const TIER: usize>(
     parent_terminal: Option<&HistoryStepTerminal>,
     client: Option<&jetsam_recursive::acceptance::history_step::PreparedHistoryStepClient>,
     registry_leaves: Option<&[[u8; 32]]>,
+    batch: Option<&jetsam_recursive::PreparedBatch>,
 ) -> Result<PreparedHistoryStepWitness<TIER>, HistoryStepWitnessError> {
+    let carries_batch_slot = runtime.bank().generation().carries_batch_slot();
+    if (carries_batch_slot && client.is_some()) || (!carries_batch_slot && batch.is_some()) {
+        return Err(HistoryStepWitnessError::Recursive(
+            jetsam_recursive::acceptance::history_step::HistoryStepError::ClientForm,
+        ));
+    }
     let native = prepare_native_history_step::<TIER>(
         template,
         context,
@@ -331,14 +343,23 @@ pub fn prepare_history_step_witness<const TIER: usize>(
         &template.header,
         &parent_header,
     )?;
-    let prepared_history_step =
+    let prepared_history_step = if carries_batch_slot {
+        jetsam_recursive::acceptance::history_step::prepare_history_step_for_pow_with_batch(
+            runtime,
+            parent_terminal,
+            current,
+            batch,
+            registry_leaves,
+        )?
+    } else {
         jetsam_recursive::acceptance::history_step::prepare_history_step_for_pow_with_client(
             runtime,
             parent_terminal,
             current,
             client,
             registry_leaves,
-        )?;
+        )?
+    };
     Ok(PreparedHistoryStepWitness {
         generation,
         template,
@@ -1023,6 +1044,7 @@ mod tests {
             let asert_anchor = AnchorInfo {
                 anchor_height: 0,
                 anchor_timestamp: 0,
+                anchor_parent_timestamp: 0,
                 anchor_target: GENESIS_TARGET,
             };
             for (generation, accepts) in [(V1, launch_accepts), (V1_3, true)] {

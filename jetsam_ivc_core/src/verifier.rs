@@ -1496,3 +1496,237 @@ mod tests {
         assert!(!production.contains("FieldCscCircuit::from_matrices"));
     }
 }
+
+// ---- form Z (v1.6) ----------------------------------------------------------
+
+/// Deferred-matrix verifier of a form-Z client proof (the production client
+/// path, `verify_field_c1_deferred_matrix_with_post_commit_context`'s twin).
+/// The masked zerocheck and lincheck are replayed, the masks' final values
+/// become sparse claims in the batched opening, and the tautology rows are
+/// removed in closed form: the returned fresh claim concerns the physical
+/// catalogue matrix only.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_c1_zk_deferred_matrix_with_post_commit_context<Ch, Aux, PostCommit>(
+    layout: &crate::zk_form::ZkFormLayout,
+    shape: &crate::proof::FieldShape,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+    proof: &crate::proof::C1ZkFieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    auxiliary: &Aux,
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> Result<
+    (
+        crate::proof::C1R1csClaim,
+        crate::matrix_claim::c1::C1FreshLincheckClaim,
+    ),
+    VerifyError,
+>
+where
+    Ch: Challenger,
+    Aux: Sync,
+    PostCommit:
+        FnOnce(&Aux, &mut FieldPostCommitVerifierContext<'_, Ch>) -> Result<(), VerifyError> + Send,
+{
+    install_verifier(move || {
+        verify_field_c1_zk_inner(
+            layout,
+            shape,
+            statement_digest,
+            commitment,
+            proof,
+            spec,
+            io,
+            challenger,
+            |commitment, challenger| {
+                bind_post_commit_class(challenger, post_commit_class_digest);
+                let mut context =
+                    FieldPostCommitVerifierContext::new(commitment, shape.m, challenger);
+                post_commit(auxiliary, &mut context)?;
+                Ok(context.finish_c1())
+            },
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_field_c1_zk_inner<Ch: Challenger>(
+    layout: &crate::zk_form::ZkFormLayout,
+    shape: &crate::proof::FieldShape,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+    proof: &crate::proof::C1ZkFieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[F128],
+    challenger: &mut Ch,
+    post_commit: impl FnOnce(
+        &Commitment,
+        &mut Ch,
+    ) -> Result<
+        (Vec<pcs::QuirkyDirectClaim>, Vec<pcs::C1QuirkyDirectClaim>),
+        VerifyError,
+    >,
+) -> Result<
+    (
+        crate::proof::C1R1csClaim,
+        crate::matrix_claim::c1::C1FreshLincheckClaim,
+    ),
+    VerifyError,
+> {
+    if shape.m != layout.m
+        || shape.k_log != layout.m
+        || shape.k_skip != crate::zk_form::ZK_FORM_K_SKIP
+        || commitment.params.m != shape.m + pcs::LOG_PACKING
+        || commitment.params.log_batch_size != 5
+        || layout.validate().is_err()
+    {
+        return Err(VerifyError::ParamsMismatch);
+    }
+    crate::proof::bind_statement_zk_form_c1(challenger, layout, statement_digest, commitment);
+    let io_claims = crate::public_io::bind_public_io_c1(challenger, spec, io, shape.m);
+    let (auxiliary_claims, auxiliary_c1_claims) = post_commit(commitment, challenger)?;
+
+    let zerocheck = zerocheck::field_c1::verify_zk(
+        shape.m,
+        &proof.base.zerocheck,
+        proof.zerocheck_kappa,
+        challenger,
+    )
+    .map_err(VerifyError::Zerocheck)?;
+    let zerocheck_claim = &zerocheck.claim;
+    let rounds = layout.rounds();
+    let lincheck_point = lincheck::c1::C1QuirkyPoint {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.mlv_challenges[..rounds].to_vec(),
+        x_outer: Vec::new(),
+    };
+    let u = layout.lincheck_mask_point();
+    let (lincheck, mut fresh) = lincheck::c1::verify_deferred_zk(
+        shape.m,
+        shape.k_skip,
+        shape.const_pin,
+        &lincheck_point,
+        zerocheck_claim.a_eval,
+        zerocheck_claim.b_eval,
+        &proof.base.lincheck,
+        proof.lincheck_mask_value,
+        &u,
+        challenger,
+    )
+    .map_err(VerifyError::Lincheck)?;
+    fresh.value += layout.tautology_fresh_value(
+        fresh.alpha,
+        fresh.z_skip,
+        &fresh.x_inner_rest,
+        &fresh.r_inner_rest,
+        &fresh.z_partial,
+    );
+
+    let ab = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: lincheck.claim.r_inner_skip,
+            x_inner_rest: lincheck.claim.r_inner_rest.clone(),
+            x_outer: Vec::new(),
+        },
+        value: lincheck.claim.w,
+    };
+    let c = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: zerocheck_claim.z,
+            x_inner_rest: zerocheck_claim.r_rest[..rounds].to_vec(),
+            x_outer: Vec::new(),
+        },
+        value: zerocheck_claim.c_eval,
+    };
+    let mut claims = vec![
+        pcs::C1QuirkyDirectClaim {
+            z_skip: ab.point.z_skip,
+            k_skip: shape.k_skip,
+            x_rest: ab.point.x_inner_rest.clone(),
+            value: ab.value,
+        },
+        pcs::C1QuirkyDirectClaim {
+            z_skip: c.point.z_skip,
+            k_skip: shape.k_skip,
+            x_rest: c.point.x_inner_rest.clone(),
+            value: c.value,
+        },
+    ];
+    claims.extend(io_claims);
+    claims.extend(
+        auxiliary_claims
+            .into_iter()
+            .map(|claim| pcs::C1QuirkyDirectClaim {
+                z_skip: F256::from_base(claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim.x_rest.into_iter().map(F256::from_base).collect(),
+                value: F256::from_base(claim.value),
+            }),
+    );
+    claims.extend(auxiliary_c1_claims);
+    let refs = claims
+        .iter()
+        .map(|claim| pcs::C1QuirkyDirectClaimRef {
+            z_skip: claim.z_skip,
+            k_skip: claim.k_skip,
+            x_rest: &claim.x_rest,
+            value: claim.value,
+        })
+        .collect::<Vec<_>>();
+    let sparse = [
+        layout.zerocheck_mask_claim(
+            zerocheck_claim.z,
+            &zerocheck_claim.mlv_challenges,
+            zerocheck.mask_value,
+        ),
+        layout.lincheck_mask_claim(&lincheck.claim.r_inner_rest, lincheck.mask_value),
+    ];
+    pcs::verify_opening_batch_quirky_direct_c1_with_sparse(
+        commitment,
+        &refs,
+        &sparse,
+        &proof.base.pcs_open,
+        challenger,
+    )
+    .map_err(VerifyError::PcsAb)?;
+    Ok((crate::proof::C1R1csClaim { ab, c }, fresh))
+}
+
+/// Native receipt of a form-Z client proof against its relation: the
+/// deferred verifier, then the stripped fresh claim discharged on the
+/// physical catalogue matrix.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_c1_zk<Ch: Challenger>(
+    relation: &crate::zk_form::ZkFormRelation,
+    commitment: &Commitment,
+    proof: &crate::proof::C1ZkFieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    challenger: &mut Ch,
+) -> Result<crate::proof::C1R1csClaim, VerifyError> {
+    let physical = relation.physical();
+    let shape = crate::proof::FieldShape::of(physical);
+    let (claim, fresh) = verify_field_c1_zk_deferred_matrix_with_post_commit_context(
+        relation.layout(),
+        &shape,
+        &physical.statement_digest(),
+        commitment,
+        proof,
+        spec,
+        io,
+        post_commit_class_digest,
+        &(),
+        challenger,
+        |_, _| Ok(()),
+    )?;
+    if crate::matrix_claim::c1::fresh_claim_value_c1(physical, &fresh) != fresh.value {
+        return Err(VerifyError::Lincheck(lincheck::VerifyError::ConsistencyFailed {
+            which: "zk-form-matrix",
+        }));
+    }
+    Ok(claim)
+}

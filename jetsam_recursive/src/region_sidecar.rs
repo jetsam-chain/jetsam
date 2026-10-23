@@ -57,6 +57,8 @@ pub use bounded_decode::*;
 pub(crate) use joint_c1::*;
 mod link;
 pub use link::*;
+mod link_only_c1;
+pub(crate) use link_only_c1::*;
 mod merkle_trace;
 pub use merkle_trace::*;
 mod combined_duplex;

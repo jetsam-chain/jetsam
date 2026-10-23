@@ -17,6 +17,13 @@
 //!   layout of the client arm's transcript. Both are checked on decoding
 //!   against the canonical form and the layout it derives, and the parent
 //!   layouts against the v1.5 fixed point.
+//! - **3**, the v1.6 relation: version 1's body followed by the
+//!   batch section — the batch class pins (`D_batch`, its post-commit class,
+//!   its Link key digest, `m`), then the L-C layout of the chain arm's
+//!   transcript. Both are checked on decoding against the chain's batch
+//!   class (frozen by this build, checked against `CLIENT_BATCH_CLASS`) and
+//!   the layout it derives, and the parent layouts against the v1.6 fixed
+//!   point.
 
 use jetsam_ivc_core::deep_chain::schedule::{DuplexLayout, DuplexSlot, LaneSource};
 use jetsam_ivc_core::pcs::PcsParams;
@@ -27,7 +34,7 @@ use super::{
     HistoryStepRuntimeParts,
 };
 use crate::acceptance::history_step_bank::{
-    CanonicalHistoryStepClassId, HISTORY_STEP_TIER_SLOT_COUNT,
+    CanonicalHistoryStepClassId, HistoryStepBatchClassPins, HISTORY_STEP_TIER_SLOT_COUNT,
 };
 use crate::region_sidecar::{
     BlockRegionSidecarVk, SelectedZkBlockRegionVkSlices, DUPLEX_REGION_COMMITTED_COLUMNS,
@@ -39,11 +46,17 @@ pub const HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION: u8 = 1;
 /// The client-bearing (v1.5) compact format: version 1's body, then the
 /// client section.
 pub const HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION: u8 = 2;
+/// The batch-bearing (v1.6) compact format: version 1's body, then the batch
+/// section.
+pub const HISTORY_STEP_RUNTIME_PARTS_COMPACT_BATCH_VERSION: u8 = 3;
 pub const HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES: usize = 40 * 1024 * 1024;
 
 /// Bound on the client form's canonical bytes. The form is five words, the
 /// PCS statement and the public-IO transcript lanes: a few hundred bytes.
 const MAX_CLIENT_FORM_BYTES: usize = 4096;
+
+/// The batch class pins: three digests and `m` (one byte).
+const BATCH_PINS_BYTES: usize = 3 * 32 + 1;
 
 const MAX_LAYOUT_SLOTS: usize = 1 << 17;
 const MAX_LAYOUT_CHALLENGES: usize = 1 << 18;
@@ -187,6 +200,25 @@ fn put_client_section(
     put_layout(out, layout)
 }
 
+fn batch_section_len(layout: &DuplexLayout) -> Result<usize, HistoryStepError> {
+    checked_add(BATCH_PINS_BYTES, layout_len(layout)?)
+}
+
+/// The batch section of a v1.6 runtime: the batch class pins, then the
+/// chain arm's transcript layout.
+fn put_batch_section(
+    out: &mut Vec<u8>,
+    pins: &HistoryStepBatchClassPins,
+    layout: &DuplexLayout,
+) -> Result<(), HistoryStepError> {
+    let m = u8::try_from(pins.m).map_err(|_| encoding())?;
+    out.extend_from_slice(&pins.matrix_digest);
+    out.extend_from_slice(&pins.post_commit_digest);
+    out.extend_from_slice(&pins.link_vk_digest);
+    out.push(m);
+    put_layout(out, layout)
+}
+
 #[derive(Clone, Copy)]
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -286,19 +318,52 @@ fn read_client_section(
     Ok((form_bytes, read_layout(reader)?))
 }
 
-/// Whether a compact frame of this version carries the client section, or
-/// `WireVersion` for a version this binary does not know.
-fn version_carries_client(version: u8) -> Result<bool, HistoryStepError> {
+fn preflight_batch_section(reader: &mut Reader<'_>) -> Result<(), HistoryStepError> {
+    reader.take(BATCH_PINS_BYTES)?;
+    preflight_layout(reader)
+}
+
+fn read_batch_section(
+    reader: &mut Reader<'_>,
+) -> Result<(HistoryStepBatchClassPins, DuplexLayout), HistoryStepError> {
+    let mut digest = || -> Result<[u8; 32], HistoryStepError> {
+        reader.take(32)?.try_into().map_err(|_| encoding())
+    };
+    let matrix_digest = digest()?;
+    let post_commit_digest = digest()?;
+    let link_vk_digest = digest()?;
+    let m = usize::from(reader.u8()?);
+    let pins = HistoryStepBatchClassPins {
+        matrix_digest,
+        post_commit_digest,
+        link_vk_digest,
+        m,
+    };
+    Ok((pins, read_layout(reader)?))
+}
+
+/// The section a compact frame of one version carries after version 1's body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactSection {
+    None,
+    Client,
+    Batch,
+}
+
+/// The section a compact frame of this version carries, or `WireVersion`
+/// for a version this binary does not know.
+fn version_section(version: u8) -> Result<CompactSection, HistoryStepError> {
     match version {
-        HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION => Ok(false),
-        HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION => Ok(true),
+        HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION => Ok(CompactSection::None),
+        HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION => Ok(CompactSection::Client),
+        HISTORY_STEP_RUNTIME_PARTS_COMPACT_BATCH_VERSION => Ok(CompactSection::Batch),
         _ => Err(HistoryStepError::WireVersion),
     }
 }
 
 fn preflight(encoded: &[u8]) -> Result<(), HistoryStepError> {
     let mut reader = Reader::new(encoded)?;
-    let with_client = version_carries_client(reader.u8()?)?;
+    let section = version_section(reader.u8()?)?;
     reader.take(
         HISTORY_STEP_TIER_SLOT_COUNT
             .checked_mul(BLOCK_SLICE_COUNT)
@@ -308,8 +373,10 @@ fn preflight(encoded: &[u8]) -> Result<(), HistoryStepError> {
     for _ in 0..HISTORY_STEP_TIER_SLOT_COUNT * 2 {
         preflight_layout(&mut reader)?;
     }
-    if with_client {
-        preflight_client_section(&mut reader)?;
+    match section {
+        CompactSection::None => {}
+        CompactSection::Client => preflight_client_section(&mut reader)?,
+        CompactSection::Batch => preflight_batch_section(&mut reader)?,
     }
     reader.finish()
 }
@@ -397,6 +464,9 @@ impl HistoryStepRuntimeParts {
                 client_section_len(&client.form().statement_bytes(), client.layout())?,
             )?;
         }
+        if let Some(batch) = self.batch() {
+            len = checked_add(len, batch_section_len(batch.layout())?)?;
+        }
         if len > HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES {
             return Err(encoding());
         }
@@ -406,11 +476,13 @@ impl HistoryStepRuntimeParts {
     pub fn encode_compact(&self) -> Result<Vec<u8>, HistoryStepError> {
         let mut encoded = Vec::with_capacity(self.compact_encoded_len()?);
         // A runtime carries a client slot exactly when its generation does
-        // (v1.5); the launch and v1.3 encodings stay version 1, byte for byte.
-        encoded.push(if self.client().is_some() {
-            HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION
-        } else {
-            HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION
+        // (v1.5), a batch slot exactly when it is v1.6, never both; the
+        // launch and v1.3 encodings stay version 1, byte for byte.
+        encoded.push(match (self.client(), self.batch()) {
+            (None, None) => HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
+            (Some(_), None) => HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION,
+            (None, Some(_)) => HISTORY_STEP_RUNTIME_PARTS_COMPACT_BATCH_VERSION,
+            (Some(_), Some(_)) => return Err(encoding()),
         });
         for vk in self.direct_block_vks() {
             put_block_slices(&mut encoded, vk.selected_registry_slices()?)?;
@@ -421,6 +493,9 @@ impl HistoryStepRuntimeParts {
         }
         if let Some(client) = self.client() {
             put_client_section(&mut encoded, &client.form().statement_bytes(), client.layout())?;
+        }
+        if let Some(batch) = self.batch() {
+            put_batch_section(&mut encoded, batch.pins(), batch.layout())?;
         }
         if encoded.len() != self.compact_encoded_len()? {
             return Err(encoding());
@@ -433,7 +508,7 @@ impl HistoryStepRuntimeParts {
         // bound before the second pass reserves a vector.
         preflight(encoded)?;
         let mut reader = Reader::new(encoded)?;
-        let with_client = version_carries_client(reader.u8()?)?;
+        let section = version_section(reader.u8()?)?;
         let mut direct_block_vks = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
         for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
             let tier = jetsam_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[slot];
@@ -451,8 +526,13 @@ impl HistoryStepRuntimeParts {
                 read_layout(&mut reader)?,
             ));
         }
-        let client_section = if with_client {
+        let client_section = if section == CompactSection::Client {
             Some(read_client_section(&mut reader)?)
+        } else {
+            None
+        };
+        let batch_section = if section == CompactSection::Batch {
+            Some(read_batch_section(&mut reader)?)
         } else {
             None
         };
@@ -468,6 +548,18 @@ impl HistoryStepRuntimeParts {
                 parent_transcripts,
                 &form_bytes,
                 client_layout,
+            );
+        }
+        if let Some((pins, batch_layout)) = batch_section {
+            // v1.6: the only batch-bearing relation. Its class pins and the
+            // chain arm's layout are checked against the chain's batch class
+            // (frozen here once per process), its parent layouts against the
+            // v1.6 fixed point.
+            return super::relation::decode_batch_bearing_history_step_parts(
+                direct_block_vks,
+                parent_transcripts,
+                pins,
+                batch_layout,
             );
         }
         let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] =
@@ -592,9 +684,76 @@ mod tests {
         assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION, true)).is_err());
         assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION, false)).is_err());
         assert!(matches!(
-            preflight(&body(3, false)),
+            preflight(&body(4, false)),
             Err(HistoryStepError::WireVersion)
         ));
+    }
+
+    fn test_batch_pins() -> crate::acceptance::history_step_bank::HistoryStepBatchClassPins {
+        crate::acceptance::history_step_bank::HistoryStepBatchClassPins {
+            matrix_digest: [0xD1; 32],
+            post_commit_digest: [0xD2; 32],
+            link_vk_digest: [0xD3; 32],
+            m: 22,
+        }
+    }
+
+    /// The batch section of a v1.6 runtime: the batch class pins
+    /// (`D_batch`, its post-commit class, its Link key digest, `m`), then
+    /// the L-C layout of the chain arm's transcript. It round-trips, and its
+    /// preflight refuses a truncated section.
+    #[test]
+    fn batch_section_round_trips_and_is_bounded() {
+        let layout = compile_duplex(&[
+            TranscriptOp::Absorb(vec![None, Some(5), None]),
+            TranscriptOp::Squeeze(2),
+        ]);
+        let mut bytes = Vec::new();
+        put_batch_section(&mut bytes, &test_batch_pins(), &layout).unwrap();
+        assert_eq!(bytes.len(), batch_section_len(&layout).unwrap());
+        let mut reader = Reader::new(&bytes).unwrap();
+        preflight_batch_section(&mut reader).unwrap();
+        reader.finish().unwrap();
+        let mut reader = Reader::new(&bytes).unwrap();
+        let (pins, read_back) = read_batch_section(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(pins, test_batch_pins());
+        assert_eq!(read_back, layout);
+        let truncated = &bytes[..BATCH_PINS_BYTES - 1];
+        let mut reader = Reader::new(truncated).unwrap();
+        assert!(preflight_batch_section(&mut reader).is_err());
+        let mut wide = test_batch_pins();
+        wide.m = 256;
+        assert!(put_batch_section(&mut Vec::new(), &wide, &layout).is_err());
+    }
+
+    /// The version names the v1.6 section too: version 3 is version 1's body
+    /// then the batch section; a batch section under version 1 or 2, or a
+    /// version 3 frame without it, are refused by the preflight.
+    #[test]
+    fn the_version_says_whether_a_batch_section_follows() {
+        let layout = compile_duplex(&[
+            TranscriptOp::Absorb(vec![Some(0)]),
+            TranscriptOp::Squeeze(1),
+        ]);
+        let body = |version: u8, with_batch: bool| {
+            let mut bytes = vec![version];
+            bytes.extend(
+                std::iter::repeat(0u8)
+                    .take(HISTORY_STEP_TIER_SLOT_COUNT * BLOCK_SLICE_COUNT * SLICE_BYTES),
+            );
+            for _ in 0..HISTORY_STEP_TIER_SLOT_COUNT * 2 {
+                put_layout(&mut bytes, &layout).unwrap();
+            }
+            if with_batch {
+                put_batch_section(&mut bytes, &test_batch_pins(), &layout).unwrap();
+            }
+            bytes
+        };
+        assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_BATCH_VERSION, true)).is_ok());
+        assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_BATCH_VERSION, false)).is_err());
+        assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION, true)).is_err());
+        assert!(preflight(&body(HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION, true)).is_err());
     }
 
     #[test]

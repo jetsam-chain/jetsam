@@ -405,6 +405,108 @@ pub fn verify_matrix_claim_fold_c1_trace(
     }
 }
 
+/// Trace twin of `matrix_claim::c1::verify_matrix_claim_merge_c1`: two
+/// accumulated claims on one matrix, each gated by its liveness wire (0 or
+/// 1), merged into one accumulated claim (ClientBatchStep prototype). The
+/// matrix never appears: both terminals evaluate eq weights of the input
+/// points against prover-supplied wires. The sumcheck is gated by both
+/// liveness wires at once (`both = left·right`): with at most one live side
+/// it checks the zero proof (rounds through the terminals, row images and
+/// final evaluation pinned to zero) and the outgoing claim is the live
+/// side's, carried (`left·L + right·R`); with two, the merged `M~(ρ‖σ)`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_matrix_claim_merge_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    k_log: usize,
+    left: &C1MatrixAccClaimTrace,
+    left_gate: &LinExpr,
+    right: &C1MatrixAccClaimTrace,
+    right_gate: &LinExpr,
+    proof: &C1MatrixFoldProofTrace,
+) -> C1MatrixAccClaimTrace {
+    assert_eq!(left.point.len(), 2 * k_log + 1);
+    assert_eq!(right.point.len(), 2 * k_log + 1);
+    assert_eq!(proof.phase1_rounds.len(), k_log + 1);
+    assert_eq!(proof.phase2_rounds.len(), k_log);
+
+    channel.observe_label(b, b"client-batch-matrix-claim-merge-c1");
+    channel.observe_f256_slice(b, &left.point);
+    channel.observe_f256(b, &left.value);
+    channel.observe_f256(b, &ExtExpr::from_base(left_gate.clone()));
+    channel.observe_f256_slice(b, &right.point);
+    channel.observe_f256(b, &right.value);
+    channel.observe_f256(b, &ExtExpr::from_base(right_gate.clone()));
+    let gamma = channel.sample_f256(b);
+    let both = mul(b, left_gate, right_gate);
+    let right_scale = super::mul_ext_base(b, &gamma, &both);
+    let (left_row, left_column) = left.point.split_at(k_log + 1);
+    let (right_row, right_column) = right.point.split_at(k_log + 1);
+
+    let left_target = super::mul_ext_base(b, &left.value, &both);
+    let mut claim = left_target.add(&mul_ext(b, &right_scale, &right.value));
+    let mut rho = Vec::with_capacity(k_log + 1);
+    for wire in &proof.phase1_rounds {
+        let (next, challenge) = compressed_deg2_round_c1(b, channel, &claim, wire);
+        claim = next;
+        rho.push(challenge);
+    }
+    let left_weight = eq_points_c1_trace(b, left_row, &rho);
+    let left_weight = super::mul_ext_base(b, &left_weight, &both);
+    let right_weight = eq_points_c1_trace(b, right_row, &rho);
+    let right_weight = mul_ext(b, &right_scale, &right_weight);
+    let first = mul_ext(b, &left_weight, &proof.g_v);
+    let second = mul_ext(b, &right_weight, &proof.g_e);
+    pin_eq_ext(b, &first.add(&second), &claim);
+
+    channel.observe_f256(b, &proof.g_v);
+    channel.observe_f256(b, &proof.g_e);
+    let delta = channel.sample_f256(b);
+    let right_delta = super::mul_ext_base(b, &delta, &both);
+
+    let left_target = super::mul_ext_base(b, &proof.g_v, &both);
+    let mut claim = left_target.add(&mul_ext(b, &right_delta, &proof.g_e));
+    let mut sigma = Vec::with_capacity(k_log);
+    for wire in &proof.phase2_rounds {
+        let (next, challenge) = compressed_deg2_round_c1(b, channel, &claim, wire);
+        claim = next;
+        sigma.push(challenge);
+    }
+    let left_weight = eq_points_c1_trace(b, left_column, &sigma);
+    let left_weight = super::mul_ext_base(b, &left_weight, &both);
+    let right_weight = eq_points_c1_trace(b, right_column, &sigma);
+    let right_weight = mul_ext(b, &right_delta, &right_weight);
+    let expected = mul_ext(
+        b,
+        &left_weight.add(&right_weight),
+        &proof.final_matrix_eval,
+    );
+    pin_eq_ext(b, &expected, &claim);
+    channel.observe_f256(b, &proof.final_matrix_eval);
+
+    // At most one live side: the zero proof only.
+    let not_both = both.add_const(F128::ONE);
+    for wire in [&proof.g_v, &proof.g_e, &proof.final_matrix_eval] {
+        let masked = super::mul_ext_base(b, wire, &not_both);
+        pin_eq_ext(b, &masked, &ExtExpr::zero());
+    }
+
+    // Outgoing: `left·L + right·R` carried, plus `both·(M + L + R)` (two
+    // live sides: `M`).
+    let out = |b: &mut FieldR1csBuilder, merged: &ExtExpr, l: &ExtExpr, r: &ExtExpr| {
+        let carried = super::mul_ext_base(b, l, left_gate)
+            .add(&super::mul_ext_base(b, r, right_gate));
+        let merged = super::mul_ext_base(b, &merged.add(l).add(r), &both);
+        carried.add(&merged)
+    };
+    let mut point = Vec::with_capacity(2 * k_log + 1);
+    for (index, merged) in rho.iter().chain(&sigma).enumerate() {
+        point.push(out(b, merged, &left.point[index], &right.point[index]));
+    }
+    let value = out(b, &proof.final_matrix_eval, &left.value, &right.value);
+    C1MatrixAccClaimTrace { point, value }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +740,260 @@ mod tests {
             survivors.is_empty(),
             "C1 fold twin survivors: {survivors:?}"
         );
+    }
+
+    fn true_acc_claim(rng: &mut Rng, relation: &FieldR1cs) -> C1MatrixAccClaim {
+        let mut claim = C1MatrixAccClaim {
+            point: (0..2 * relation.k_log + 1).map(|_| rng.f256()).collect(),
+            value: F256::ZERO,
+        };
+        claim.value = stacked_matrix_mle_eval_c1(relation, &claim);
+        claim
+    }
+
+    /// Merge twin (ClientBatchStep): lockstep with the native merge for every
+    /// liveness pattern, a satisfiable trace, every proof wire mutation
+    /// rejected, and the outgoing claim true on the matrix.
+    #[test]
+    fn c1_matrix_merge_twin_lockstep_and_mutations() {
+        use jetsam_ivc_core::matrix_claim::c1::prove_matrix_claim_merge_c1;
+        let k_log = 7;
+        let mut rng = Rng(0xC1_3E46);
+        let relation = random_instance(&mut rng, k_log);
+        let left = true_acc_claim(&mut rng, &relation);
+        let right = true_acc_claim(&mut rng, &relation);
+        for (left_live, right_live) in [(true, true), (true, false), (false, true)] {
+            let mut native = FsLaneChallenger::new_c1(b"merge-twin-c1-test");
+            let (proof, native_claim) = prove_matrix_claim_merge_c1(
+                &relation, &left, left_live, &right, right_live, &mut native,
+            );
+            assert_eq!(
+                stacked_matrix_mle_eval_c1(&relation, &native_claim),
+                native_claim.value
+            );
+
+            let mut builder = FieldR1csBuilder::new();
+            let mut trace = FsChannelTrace::new_c1(&mut builder, b"merge-twin-c1-test");
+            let left_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &left);
+            let right_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &right);
+            let gate = |builder: &mut FieldR1csBuilder, live: bool| {
+                LinExpr::from_wire(builder.alloc_f128(if live { F128::ONE } else { F128::ZERO }))
+            };
+            let left_gate = gate(&mut builder, left_live);
+            let right_gate = gate(&mut builder, right_live);
+            let mutation_start = builder.num_wires();
+            let proof_trace = C1MatrixFoldProofTrace::alloc(&mut builder, &proof, k_log);
+            let mutation_end = builder.num_wires();
+            let before = builder.num_wires();
+            let merged = verify_matrix_claim_merge_c1_trace(
+                &mut builder,
+                &mut trace,
+                k_log,
+                &left_trace,
+                &left_gate,
+                &right_trace,
+                &right_gate,
+                &proof_trace,
+            );
+            eprintln!(
+                "[matrix-merge] twin rows @k_log={k_log} live=({left_live},{right_live}): {}",
+                builder.num_wires() - before
+            );
+            assert_eq!(
+                merged
+                    .point
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                native_claim.point
+            );
+            assert_eq!(merged.value.eval(builder.values()), native_claim.value);
+            assert_eq!(
+                trace.sample_f256(&mut builder).eval(builder.values()),
+                native.sample_f256(),
+                "merge twin transcript diverged"
+            );
+            let (trace_relation, witness) = builder.build();
+            assert!(trace_relation.satisfies(&witness), "honest merge twin");
+            // Gated-off sides release their g wire; every other proof wire
+            // is bound.
+            let survivors = trace_relation
+                .flip_battery(&witness)
+                .survivors(mutation_start..mutation_end);
+            let tolerated = usize::from(!left_live) + usize::from(!right_live);
+            assert!(
+                survivors.len() <= 2 * tolerated,
+                "merge twin survivors ({left_live},{right_live}): {survivors:?}"
+            );
+        }
+    }
+
+    /// One live side, in the trace: the outgoing claim is the live side's
+    /// claim (no sumcheck), in lockstep with the native merge; the zero proof
+    /// is the only one — every proof wire is bound (no flip survives) — and a
+    /// one-sided proof with a row image or a final evaluation set, absorbed
+    /// consistently, is unsatisfiable. Two dead sides give the zero claim.
+    #[test]
+    fn c1_matrix_merge_twin_carries_a_one_sided_claim() {
+        use jetsam_ivc_core::matrix_claim::c1::prove_matrix_claim_merge_c1;
+        let k_log = 7;
+        let mut rng = Rng(0xC1_3E49);
+        let relation = random_instance(&mut rng, k_log);
+        let live = true_acc_claim(&mut rng, &relation);
+        let mut garbage = true_acc_claim(&mut rng, &relation);
+        garbage.value += F256::ONE;
+        let zero_claim = C1MatrixAccClaim::zero(k_log);
+        type Alter = fn(&mut C1MatrixFoldProof);
+        let alterations: [(&str, Alter); 3] = [
+            ("left row image", |p| p.g_v += F256::ONE),
+            ("right row image", |p| p.g_e += F256::ONE),
+            ("final evaluation", |p| p.final_matrix_eval += F256::ONE),
+        ];
+        for (left, left_live, right, right_live, carried) in [
+            (&live, true, &garbage, false, &live),
+            (&garbage, false, &live, true, &live),
+            (&garbage, false, &garbage, false, &zero_claim),
+        ] {
+            let build = |proof: &C1MatrixFoldProof| {
+                let mut builder = FieldR1csBuilder::new();
+                let mut trace = FsChannelTrace::new_c1(&mut builder, b"merge-twin-c1-carry");
+                let left_trace = C1MatrixAccClaimTrace::alloc(&mut builder, left);
+                let right_trace = C1MatrixAccClaimTrace::alloc(&mut builder, right);
+                let gate = |builder: &mut FieldR1csBuilder, live: bool| {
+                    LinExpr::from_wire(builder.alloc_f128(if live { F128::ONE } else { F128::ZERO }))
+                };
+                let left_gate = gate(&mut builder, left_live);
+                let right_gate = gate(&mut builder, right_live);
+                let start = builder.num_wires();
+                let proof_trace = C1MatrixFoldProofTrace::alloc(&mut builder, proof, k_log);
+                let end = builder.num_wires();
+                let merged = verify_matrix_claim_merge_c1_trace(
+                    &mut builder,
+                    &mut trace,
+                    k_log,
+                    &left_trace,
+                    &left_gate,
+                    &right_trace,
+                    &right_gate,
+                    &proof_trace,
+                );
+                let point = merged
+                    .point
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>();
+                let value = merged.value.eval(builder.values());
+                let next = trace.sample_f256(&mut builder).eval(builder.values());
+                (builder, start..end, C1MatrixAccClaim { point, value }, next)
+            };
+            let mut native = FsLaneChallenger::new_c1(b"merge-twin-c1-carry");
+            let (proof, native_claim) = prove_matrix_claim_merge_c1(
+                &relation, left, left_live, right, right_live, &mut native,
+            );
+            assert_eq!(&native_claim, carried, "native: the live claim is carried");
+            let (builder, wires, claim, next) = build(&proof);
+            assert_eq!(&claim, carried, "trace: the live claim is carried");
+            assert_eq!(next, native.sample_f256(), "carry twin transcript diverged");
+            let (trace_relation, witness) = builder.build();
+            assert!(trace_relation.satisfies(&witness), "honest one-sided merge twin");
+            let survivors = trace_relation.flip_battery(&witness).survivors(wires);
+            assert!(
+                survivors.is_empty(),
+                "one-sided merge twin ({left_live},{right_live}) survivors: {survivors:?}"
+            );
+            for (name, alter) in alterations {
+                let mut altered = proof.clone();
+                alter(&mut altered);
+                let (builder, _, _, _) = build(&altered);
+                let (trace_relation, witness) = builder.build();
+                assert!(
+                    !trace_relation.satisfies(&witness),
+                    "a one-sided merge ({left_live},{right_live}) with a {name} satisfied the trace"
+                );
+            }
+        }
+    }
+
+    /// Each terminal check binds the merged claim to the inputs: a proof
+    /// whose final evaluation (phase 2) or row images (phase 1) are altered
+    /// — the trace absorbing the altered values consistently — is
+    /// unsatisfiable. Without the phase-2 check a prover could replace the
+    /// merged claim by a true evaluation and make a false input vanish.
+    #[test]
+    fn c1_matrix_merge_twin_binds_its_terminals() {
+        use jetsam_ivc_core::matrix_claim::c1::prove_matrix_claim_merge_c1;
+        let k_log = 7;
+        let mut rng = Rng(0xC1_3E48);
+        let relation = random_instance(&mut rng, k_log);
+        let left = true_acc_claim(&mut rng, &relation);
+        let right = true_acc_claim(&mut rng, &relation);
+        let mut native = FsLaneChallenger::new_c1(b"merge-twin-c1-terminals");
+        let (proof, _) =
+            prove_matrix_claim_merge_c1(&relation, &left, true, &right, true, &mut native);
+        type Alter = fn(&mut C1MatrixFoldProof);
+        let alterations: [(&str, Alter); 3] = [
+            ("final evaluation", |p| p.final_matrix_eval += F256::ONE),
+            ("left row image", |p| p.g_v += F256::ONE),
+            ("right row image", |p| p.g_e += F256::ONE),
+        ];
+        for (name, alter) in alterations {
+            let mut altered = proof.clone();
+            alter(&mut altered);
+            let mut builder = FieldR1csBuilder::new();
+            let mut trace = FsChannelTrace::new_c1(&mut builder, b"merge-twin-c1-terminals");
+            let left_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &left);
+            let right_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &right);
+            let one = LinExpr::constant(F128::ONE);
+            let proof_trace = C1MatrixFoldProofTrace::alloc(&mut builder, &altered, k_log);
+            verify_matrix_claim_merge_c1_trace(
+                &mut builder,
+                &mut trace,
+                k_log,
+                &left_trace,
+                &one,
+                &right_trace,
+                &one,
+                &proof_trace,
+            );
+            let (trace_relation, witness) = builder.build();
+            assert!(
+                !trace_relation.satisfies(&witness),
+                "a merge with an altered {name} satisfied the trace"
+            );
+        }
+    }
+
+    /// A merge whose left input is false cannot be satisfied in the trace
+    /// with the honest prover's wires.
+    #[test]
+    fn c1_matrix_merge_twin_refuses_a_false_input() {
+        use jetsam_ivc_core::matrix_claim::c1::prove_matrix_claim_merge_c1;
+        let k_log = 7;
+        let mut rng = Rng(0xC1_3E47);
+        let relation = random_instance(&mut rng, k_log);
+        let mut left = true_acc_claim(&mut rng, &relation);
+        left.value += F256::ONE;
+        let right = true_acc_claim(&mut rng, &relation);
+        let mut native = FsLaneChallenger::new_c1(b"merge-twin-c1-false");
+        let (proof, _) =
+            prove_matrix_claim_merge_c1(&relation, &left, true, &right, true, &mut native);
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, b"merge-twin-c1-false");
+        let left_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &left);
+        let right_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &right);
+        let one = LinExpr::constant(F128::ONE);
+        let proof_trace = C1MatrixFoldProofTrace::alloc(&mut builder, &proof, k_log);
+        verify_matrix_claim_merge_c1_trace(
+            &mut builder,
+            &mut trace,
+            k_log,
+            &left_trace,
+            &one,
+            &right_trace,
+            &one,
+            &proof_trace,
+        );
+        let (trace_relation, witness) = builder.build();
+        assert!(!trace_relation.satisfies(&witness), "false merge input satisfied");
     }
 }

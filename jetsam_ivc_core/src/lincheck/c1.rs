@@ -561,6 +561,220 @@ pub fn verify_deferred<Ch: Challenger>(
     ))
 }
 
+// ---- form Z (v1.6): the masked lincheck ------------------------------------
+//
+// The lincheck is a plain sum over the columns: in characteristic 2 a
+// separable mask sum_t g_t(x_t) sums to zero over any two free variables, so
+// each term is weighted by eq(u_k, x_k) on the OTHER bits, u a fixed public
+// point (see `zk_form::ZkLincheckMask`). The prover chose g_{0,1} so that the
+// mask sums to zero (no kappa on the wire). After the rounds it sends
+// M(r_inner), a linear claim on the mask cells; the deferred matrix claim is
+// the running value minus lambda' M(r_inner).
+
+/// The masked lincheck's outputs beside the usual claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1ZkLincheckOutput {
+    pub claim: C1LincheckClaim,
+    pub lambda: F256,
+    /// `M(r_inner_rest)`, sent by the prover.
+    pub mask_value: F256,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_zk<Ch: Challenger>(
+    witness: &[F128],
+    m: usize,
+    k_skip: usize,
+    circuit: &dyn LincheckCircuit,
+    point: &C1QuirkyPoint,
+    mask: &crate::zk_form::ZkLincheckMask,
+    u: &[F256],
+    challenger: &mut Ch,
+) -> (C1LincheckProof, C1ZkLincheckOutput) {
+    let k_log = m;
+    let width = 1usize << k_log;
+    assert_eq!(witness.len(), width);
+    let inner_rest_len = k_log - k_skip;
+    assert_eq!(circuit.n_cols(), width);
+    assert_eq!(point.x_inner_rest.len(), inner_rest_len);
+    assert!(point.x_outer.is_empty());
+    assert_eq!(mask.rounds.len(), inner_rest_len);
+    assert_eq!(u.len(), inner_rest_len);
+
+    challenger.observe_label(b"history-lincheck-c1");
+    let alpha = challenger.sample_f256();
+    let mut combination =
+        circuit.fold_alpha_batched_quirky_c1(alpha, point.z_skip, &point.x_inner_rest, k_skip);
+    if let Some(column) = circuit.const_pin_col() {
+        let sampled = challenger.sample_f256();
+        combination[column] += sampled;
+    }
+    challenger.observe_label(b"history-lincheck-c1-zk");
+    let lambda = challenger.sample_f256();
+
+    let mut folded_witness: Vec<F256> = witness.par_iter().map(|&v| F256::from_base(v)).collect();
+    // Round of bit t: E_t g_t(X) + eq(u_t, X) (D_t + E_t B_t), with E_t the
+    // product of eq(u_k, r_k) over the bound bits, D_t the bound terms and
+    // B_t = sum_{j < t} (g_j(0) + g_j(1)).
+    let mut prefix = vec![F256::ZERO; inner_rest_len + 1];
+    for t in 0..inner_rest_len {
+        let g = &mask.rounds[t];
+        prefix[t + 1] = prefix[t] + g[1] + g[2];
+    }
+    let mut e = F256::ONE;
+    let mut d = F256::ZERO;
+    let mut rounds = Vec::with_capacity(inner_rest_len);
+    let mut sampled = Vec::with_capacity(inner_rest_len);
+    let (mut at_one, mut at_infinity) = round_eval(&combination, &folded_witness);
+    for round in 0..inner_rest_len {
+        let t = inner_rest_len - 1 - round;
+        let g = &mask.rounds[t];
+        let mask_one = e * (g[0] + g[1] + g[2]) + u[t] * (d + e * prefix[t]);
+        let mask_infinity = e * g[2];
+        let message = (at_one + lambda * mask_one, at_infinity + lambda * mask_infinity);
+        challenger.observe_f256(message.0);
+        challenger.observe_f256(message.1);
+        let challenge = challenger.sample_f256();
+        rounds.push(message);
+        sampled.push(challenge);
+        let eq_t = F256::ONE + u[t] + challenge;
+        d = d * eq_t + (g[0] + g[1] * challenge + g[2] * challenge * challenge) * e;
+        e *= eq_t;
+        if round + 1 < inner_rest_len {
+            (at_one, at_infinity) =
+                bind_both_and_eval_next(&mut combination, &mut folded_witness, challenge);
+        } else {
+            bind_top(&mut combination, challenge);
+            bind_top(&mut folded_witness, challenge);
+        }
+    }
+
+    let z_partial = folded_witness;
+    challenger.observe_f256_slice(&z_partial);
+    sampled.reverse();
+    let mask_value = d;
+    debug_assert_eq!(mask_value, mask.evaluate(&sampled, u));
+    challenger.observe_f256(mask_value);
+    let r_inner_skip = challenger.sample_f256();
+    let weights = lagrange_weights(k_skip, r_inner_skip, 0);
+    let w = inner_product(&weights, &z_partial);
+    (
+        C1LincheckProof { rounds, z_partial },
+        C1ZkLincheckOutput {
+            claim: C1LincheckClaim {
+                r_inner_skip,
+                r_inner_rest: sampled,
+                w,
+            },
+            lambda,
+            mask_value,
+        },
+    )
+}
+
+/// Deferred-matrix verifier of the masked lincheck: the returned fresh claim
+/// is stripped of the const-pin and of the mask (not of the tautologies).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_deferred_zk<Ch: Challenger>(
+    m: usize,
+    k_skip: usize,
+    const_pin: Option<usize>,
+    point: &C1QuirkyPoint,
+    a_value: F256,
+    b_value: F256,
+    proof: &C1LincheckProof,
+    mask_value: F256,
+    u: &[F256],
+    challenger: &mut Ch,
+) -> Result<
+    (
+        C1ZkLincheckOutput,
+        crate::matrix_claim::c1::C1FreshLincheckClaim,
+    ),
+    VerifyError,
+> {
+    let k_log = m;
+    let inner_rest_len = k_log - k_skip;
+    let skip_size = 1usize << k_skip;
+    if point.x_inner_rest.len() != inner_rest_len || !point.x_outer.is_empty() {
+        return Err(VerifyError::BadInnerRestLength {
+            which: "x_ab",
+            expected: inner_rest_len,
+            got: point.x_inner_rest.len(),
+        });
+    }
+    if proof.rounds.len() != inner_rest_len || u.len() != inner_rest_len {
+        return Err(VerifyError::BadVectorLength {
+            which: "rounds",
+            expected: inner_rest_len,
+            got: proof.rounds.len(),
+        });
+    }
+    if proof.z_partial.len() != skip_size {
+        return Err(VerifyError::BadVectorLength {
+            which: "z_partial",
+            expected: skip_size,
+            got: proof.z_partial.len(),
+        });
+    }
+
+    challenger.observe_label(b"history-lincheck-c1");
+    let alpha = challenger.sample_f256();
+    let mut running = alpha * a_value + b_value;
+    let beta = if const_pin.is_some() {
+        let beta = challenger.sample_f256();
+        running += beta;
+        Some(beta)
+    } else {
+        None
+    };
+    challenger.observe_label(b"history-lincheck-c1-zk");
+    let lambda = challenger.sample_f256();
+    // The mask sums to zero: no lambda kappa' term.
+    let mut sampled = Vec::with_capacity(inner_rest_len);
+    for &(at_one, at_infinity) in &proof.rounds {
+        challenger.observe_f256(at_one);
+        challenger.observe_f256(at_infinity);
+        let challenge = challenger.sample_f256();
+        let at_zero = running + at_one;
+        let linear = at_zero + at_one + at_infinity;
+        running = at_infinity * challenge * challenge + linear * challenge + at_zero;
+        sampled.push(challenge);
+    }
+    challenger.observe_f256_slice(&proof.z_partial);
+    sampled.reverse();
+    challenger.observe_f256(mask_value);
+
+    let mut fresh_value = running + lambda * mask_value;
+    if let (Some(beta), Some(column)) = (beta, const_pin) {
+        let weights = build_eq_table(&sampled);
+        fresh_value += beta * proof.z_partial[column & (skip_size - 1)] * weights[column >> k_skip];
+    }
+    let fresh = crate::matrix_claim::c1::C1FreshLincheckClaim {
+        alpha,
+        z_skip: point.z_skip,
+        x_inner_rest: point.x_inner_rest.clone(),
+        r_inner_rest: sampled.clone(),
+        z_partial: proof.z_partial.clone(),
+        value: fresh_value,
+    };
+    let r_inner_skip = challenger.sample_f256();
+    let weights = lagrange_weights(k_skip, r_inner_skip, 0);
+    let w = inner_product(&weights, &proof.z_partial);
+    Ok((
+        C1ZkLincheckOutput {
+            claim: C1LincheckClaim {
+                r_inner_skip,
+                r_inner_rest: sampled,
+                w,
+            },
+            lambda,
+            mask_value,
+        },
+        fresh,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

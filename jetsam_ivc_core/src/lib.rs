@@ -39,6 +39,7 @@ pub mod scratch;
 pub mod tuple_permutation;
 pub mod verifier;
 pub mod zerocheck;
+pub mod zk_form;
 
 /// Run a deliberately dishonest prover fixture in both debug and release
 /// test profiles.

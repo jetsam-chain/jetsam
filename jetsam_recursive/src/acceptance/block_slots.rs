@@ -261,7 +261,8 @@ const _: () =
 /// accumulator transition), 3_778 under v1.3. The four added rows are the
 /// second anchor lane pair: one multiplexer and one pin per lane, driven by
 /// the same boundary bit as the first pair. v1.5 carries the v1.3 boundary
-/// and the same tail.
+/// and the same tail, and so will v1.6 (its batch arm sits in the client
+/// slot, not in the block tail).
 ///
 /// Both numbers are held here rather than one of them being derived, because
 /// the launch figure is a fact about matrices that already exist and can
@@ -271,7 +272,9 @@ const _: () =
 const fn direct_block_tail_rows(generation: HistoryStepPackGeneration) -> usize {
     match generation {
         HistoryStepPackGeneration::V1 => 3_774,
-        HistoryStepPackGeneration::V1_3 | HistoryStepPackGeneration::V1_5 => 3_778,
+        HistoryStepPackGeneration::V1_3
+        | HistoryStepPackGeneration::V1_5
+        | HistoryStepPackGeneration::V1_6 => 3_778,
     }
 }
 

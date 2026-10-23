@@ -26,6 +26,14 @@ use crate::acceptance::history_step_bank::{
 };
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use crate::acceptance::history_step_bank::HistoryStepClientForm;
+use crate::acceptance::client_batch::chain_arm::{
+    batch_slot_trace, chain_batch_transcript_layout, prepare_batch_slot_lanes,
+    prepare_chain_batch_ghost, BatchIoCells, PreparedChainBatch,
+};
+use crate::acceptance::client_batch::step::{ClassIdentity, ClientBatchError, ClientBatchParts};
+use crate::acceptance::history_step_bank::{
+    HistoryStepBatchClassPins, HistoryStepBatchIoLanes, HISTORY_STEP_BATCH_FORM_M,
+};
 use jetsam_ivc_core::deep_chain::schedule::TranscriptOp;
 use jetsam_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
 pub const HISTORY_STEP_WIRE_VERSION: u8 = 4;
@@ -283,17 +291,106 @@ impl HistoryStepClientParts {
 /// (v1.5), `None` for the launch and v1.3 relations.
 type ClientSlot = Option<HistoryStepClientParts>;
 
+/// The client slot of a v1.6 runtime: the batch class its chain arm verifies
+/// the carried batch under (the class parts, `D_batch`, its post-commit
+/// class, its Link key) and the L-C layout of the chain arm's transcript
+/// (independent of the batch carried: the ghost's), derived once, outside the Link-key
+/// fixed point. The class is an input until it is frozen as a consensus
+/// constant.
+#[derive(Clone)]
+pub struct HistoryStepBatchParts {
+    parts: ClientBatchParts,
+    pins: HistoryStepBatchClassPins,
+    layout: DuplexLayout,
+}
+
+impl core::fmt::Debug for HistoryStepBatchParts {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("HistoryStepBatchParts")
+            .field("pins", &self.pins)
+            .field("transcript_slots", &self.layout.slots.len())
+            .finish()
+    }
+}
+
+impl HistoryStepBatchParts {
+    /// The slot of a batch class (its matrix is not needed: the relation
+    /// never evaluates it). Its class is an input (the tests', the
+    /// rows gate's) until it is a constant of the build.
+    pub(crate) fn new(identity: ClassIdentity<'_>) -> Result<Self, HistoryStepError> {
+        let layout = chain_batch_transcript_layout(identity).map_err(batch_error)?;
+        Ok(Self {
+            parts: identity.parts.clone(),
+            pins: HistoryStepBatchClassPins {
+                matrix_digest: identity.digest,
+                post_commit_digest: identity.post_commit,
+                link_vk_digest: identity.parts.link_vk.transcript_digest(),
+                m: identity.parts.shape.m,
+            },
+            layout,
+        })
+    }
+
+    /// The slot of the chain's batch class: the class over the hiding client
+    /// form at the production batch shape, frozen once per process and
+    /// checked against the consensus constant `CLIENT_BATCH_CLASS`.
+    /// Refused when this build derives another class.
+    pub fn canonical() -> Result<Self, HistoryStepError> {
+        let class = crate::acceptance::client_batch::aggregate::AggregationClass::chain()
+            .map_err(|_| HistoryStepError::ClientForm)?;
+        Self::new(class.class.identity())
+    }
+
+    pub fn pins(&self) -> &HistoryStepBatchClassPins {
+        &self.pins
+    }
+
+    pub fn layout(&self) -> &DuplexLayout {
+        &self.layout
+    }
+
+    pub(crate) fn parts(&self) -> &ClientBatchParts {
+        &self.parts
+    }
+
+    pub(crate) fn identity(&self) -> ClassIdentity<'_> {
+        ClassIdentity {
+            parts: &self.parts,
+            digest: self.pins.matrix_digest,
+            post_commit: self.pins.post_commit_digest,
+            matrix: None,
+        }
+    }
+}
+
+/// A runtime's batch slot: present exactly under v1.6.
+type BatchSlot = Option<HistoryStepBatchParts>;
+
+/// A batch-module error, as the relation reports it.
+fn batch_error(error: ClientBatchError) -> HistoryStepError {
+    match error {
+        ClientBatchError::HistoryStep(error) => error,
+        ClientBatchError::Sidecar(error) => HistoryStepError::Region(error),
+        ClientBatchError::Verify(error) => HistoryStepError::Verify(error),
+        ClientBatchError::Shape(_) => HistoryStepError::RuntimeLayout,
+        ClientBatchError::Child(_) | ClientBatchError::Decision(_) => HistoryStepError::ClientProof,
+    }
+}
+
 /// The client a v1.5 block carries, if any, and the registry leaves it
 /// publishes (`None`: the parent's, i.e. no registration in this block).
 #[derive(Clone, Copy, Default)]
 struct ClientInput<'a> {
     client: Option<&'a super::client_arm::PreparedHistoryStepClient>,
     registry: Option<&'a [jetsam_ivc_core::merkle::Hash]>,
+    /// The batch a v1.6 block carries (`None`: the ghost).
+    batch: Option<&'a PreparedChainBatch>,
 }
 
 impl ClientInput<'_> {
     fn is_none(&self) -> bool {
-        self.client.is_none() && self.registry.is_none()
+        self.client.is_none() && self.registry.is_none() && self.batch.is_none()
     }
 }
 
@@ -302,10 +399,16 @@ fn no_client<'a>() -> ClientInput<'a> {
 }
 
 /// The client slot `generation`'s relation carries: the canonical parts under
-/// v1.5, none under launch and v1.3.
+/// v1.5, none under launch and v1.3. Refused under v1.6: its slot is a batch
+/// slot, built from a batch class, which this build does not hold as a
+/// constant until the class is frozen — a v1.6 runtime comes from
+/// [`derive_history_step_runtime_parts_v1_6`], never from the generation alone.
 fn generation_client_slot(
     generation: HistoryStepPackGeneration,
 ) -> Result<ClientSlot, HistoryStepError> {
+    if generation.carries_batch_slot() {
+        return Err(HistoryStepError::ClientForm);
+    }
     if generation.carries_client_slot() {
         Ok(Some(HistoryStepClientParts::canonical()?))
     } else {
@@ -313,14 +416,55 @@ fn generation_client_slot(
     }
 }
 
-/// The parent geometry of a runtime, with the client role when it has one.
+/// The slots are the generation's, never a choice of the caller: a v1.5
+/// runtime walks the canonical client form, a v1.6 runtime a batch class of
+/// the hiding client form (`canonical_z`, one form per class) at the
+/// production batch shape, launch and v1.3 neither.
+fn check_generation_slot(
+    generation: HistoryStepPackGeneration,
+    client: &ClientSlot,
+    batch: &BatchSlot,
+) -> Result<(), HistoryStepError> {
+    if generation.carries_batch_slot() {
+        return match (client, batch) {
+            (None, Some(batch))
+                if batch.pins.m == HISTORY_STEP_BATCH_FORM_M
+                    && batch.parts.client == HistoryStepClientForm::canonical_z() =>
+            {
+                Ok(())
+            }
+            _ => Err(HistoryStepError::ClientForm),
+        };
+    }
+    if batch.is_some() {
+        return Err(HistoryStepError::ClientForm);
+    }
+    match client {
+        Some(parts) if generation.carries_client_slot() => {
+            if parts.form != HistoryStepClientForm::canonical() {
+                return Err(HistoryStepError::ClientForm);
+            }
+        }
+        None if !generation.carries_client_slot() => {}
+        _ => return Err(HistoryStepError::ClientForm),
+    }
+    Ok(())
+}
+
+/// The parent geometry of a runtime, with the client role when it has one —
+/// under v1.6 the batch proof and the chain arm's transcript, the L-C roles
+/// packed by chunk (the batch transcript would double a dyadic L-C).
 fn slot_geometry(
     geometry: HistoryStepParentGeometry,
     client: &ClientSlot,
+    batch: &BatchSlot,
 ) -> Result<HistoryStepParentGeometry, HistoryStepError> {
-    match client {
-        Some(client) => Ok(geometry.with_client(client.form.pcs_params(), client.layout.clone())?),
-        None => Ok(geometry),
+    match (client, batch) {
+        (Some(client), _) => Ok(geometry.with_client(client.form.pcs_params(), client.layout.clone())?),
+        (None, Some(batch)) => Ok(geometry
+            .with_client(&batch.parts.pcs_params, batch.layout.clone())?
+            .with_chunked_recordings()?),
+        (None, None) => Ok(geometry),
     }
 }
 
@@ -376,6 +520,7 @@ pub struct HistoryStepRuntimeParts {
     parent_geometry: HistoryStepParentGeometry,
     generation: HistoryStepPackGeneration,
     client: ClientSlot,
+    batch: BatchSlot,
 }
 
 impl HistoryStepRuntimeParts {
@@ -396,6 +541,7 @@ impl HistoryStepRuntimeParts {
             // launch or v1.3 runtime: no client slot. A v1.5 frame is decoded
             // by `decode_client_bearing_history_step_parts`.
             client: None,
+            batch: None,
         }
     }
 
@@ -435,6 +581,7 @@ impl HistoryStepRuntimeParts {
             direct_block_vks,
             parent_transcripts,
             generation_client_slot(generation)?,
+            None,
         )
     }
 
@@ -444,18 +591,9 @@ impl HistoryStepRuntimeParts {
         direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
         parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
         client: ClientSlot,
+        batch: BatchSlot,
     ) -> Result<Self, HistoryStepError> {
-        // The client slot is the generation's, never a choice of the caller:
-        // a v1.5 runtime walks the canonical client form, the others none.
-        match &client {
-            Some(parts) if generation.carries_client_slot() => {
-                if parts.form != HistoryStepClientForm::canonical() {
-                    return Err(HistoryStepError::ClientForm);
-                }
-            }
-            None if !generation.carries_client_slot() => {}
-            _ => return Err(HistoryStepError::ClientForm),
-        }
+        check_generation_slot(generation, &client, &batch)?;
         let parent_params = history_step_parent_params(generation).to_vec();
         let geometry = HistoryStepParentGeometry::new(
             &parent_params,
@@ -468,7 +606,7 @@ impl HistoryStepRuntimeParts {
                 .map(|transcript| transcript.r_prev.clone())
                 .collect(),
         )?;
-        let geometry = slot_geometry(geometry, &client)?;
+        let geometry = slot_geometry(geometry, &client, &batch)?;
         if geometry
             .canonical_vk(&slot_spec(generation))?
             .transcript_digest()
@@ -490,6 +628,7 @@ impl HistoryStepRuntimeParts {
             parent_geometry: geometry,
             generation,
             client,
+            batch,
         })
     }
 
@@ -517,6 +656,11 @@ impl HistoryStepRuntimeParts {
         self.client.as_ref()
     }
 
+    /// The batch slot of a v1.6 relation; `None` under every other one.
+    pub fn batch(&self) -> Option<&HistoryStepBatchParts> {
+        self.batch.as_ref()
+    }
+
     pub(super) fn with_direct_block_vk(
         &self,
         slot: usize,
@@ -533,6 +677,7 @@ impl HistoryStepRuntimeParts {
             direct_block_vks,
             self.parent_transcripts.clone(),
             self.client.clone(),
+            self.batch.clone(),
         )
     }
 }
@@ -571,8 +716,12 @@ pub fn pin_history_step_class_bank(
             ),
         }
     });
-    // A v1.5 bank binds the client form itself (`validate_for`).
-    PinnedHistoryStepClassBank::validate_for(parts.generation, pins).map_err(Into::into)
+    // A v1.5 bank binds the client form itself (`validate_for`), a v1.6 bank
+    // the batch class of its parts.
+    match &parts.batch {
+        Some(batch) => PinnedHistoryStepClassBank::validate_for_v1_6(pins, batch.pins).map_err(Into::into),
+        None => PinnedHistoryStepClassBank::validate_for(parts.generation, pins).map_err(Into::into),
+    }
 }
 
 struct RejectingHistoryStepMatrixSource;
@@ -667,6 +816,31 @@ pub fn derive_history_step_runtime_parts_in(
     // transcript, and the fixed point runs over that key. The client
     // transcript layout is value-independent and derived once, outside it.
     let client = generation_client_slot(generation)?;
+    derive_history_step_runtime_parts_slot(generation, direct_block_vks, client, None)
+}
+
+/// [`derive_history_step_runtime_parts_in`] under v1.6: the Link key walks
+/// the batch proof and records the chain arm's transcript (L-C by chunk),
+/// and the fixed point runs over that key. The batch class is an input
+/// until it is a constant of the build.
+pub(crate) fn derive_history_step_runtime_parts_v1_6(
+    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    batch: HistoryStepBatchParts,
+) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
+    derive_history_step_runtime_parts_slot(
+        HistoryStepPackGeneration::V1_6,
+        direct_block_vks,
+        None,
+        Some(batch),
+    )
+}
+
+fn derive_history_step_runtime_parts_slot(
+    generation: HistoryStepPackGeneration,
+    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    client: ClientSlot,
+    batch: BatchSlot,
+) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
     let parent_params = history_step_parent_params(generation);
     let mut child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|_| placeholder_history_step_recording_layout(1usize << 14));
@@ -681,6 +855,7 @@ pub fn derive_history_step_runtime_parts_in(
             &child_layouts,
             &r_prev_layouts,
             &client,
+            &batch,
         )?;
         if pass.derived_children == child_layouts && pass.derived_r_prev == r_prev_layouts {
             return Ok(pass.parts);
@@ -712,13 +887,14 @@ fn history_step_runtime_parts_pass(
     child_layouts: &[DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
     r_prev_layouts: &[DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT],
     client: &ClientSlot,
+    batch: &BatchSlot,
 ) -> Result<HistoryStepRuntimePartsPass, HistoryStepError> {
     let geometry = HistoryStepParentGeometry::new(
         parent_params,
         child_layouts.to_vec(),
         r_prev_layouts.to_vec(),
     )?;
-    let geometry = slot_geometry(geometry, client)?;
+    let geometry = slot_geometry(geometry, client, batch)?;
     let parent_recursion_vk = geometry.canonical_vk(&slot_spec(generation))?;
     let transcripts = std::array::from_fn(|slot| {
         HistoryStepParentTranscriptLayout::new(
@@ -732,6 +908,7 @@ fn history_step_runtime_parts_pass(
         direct_block_vks.clone(),
         transcripts,
         client.clone(),
+        batch.clone(),
     )?;
     let bank = pin_history_step_class_bank([[0u8; 32]; HISTORY_STEP_CLASS_COUNT], &parts)?;
     let runtime = HistoryStepRuntime::new(
@@ -814,6 +991,7 @@ pub(super) fn discover_history_step_pack_generation(
             &child_layouts,
             &r_prev_layouts,
             &None,
+            &None,
         )?;
         if pass.derived_children == child_layouts && pass.derived_r_prev == r_prev_layouts {
             return Ok(candidate);
@@ -856,6 +1034,45 @@ pub(super) fn decode_client_bearing_history_step_parts(
         &child_layouts,
         &r_prev_layouts,
         &Some(client),
+        &None,
+    )?;
+    if pass.derived_children != child_layouts || pass.derived_r_prev != r_prev_layouts {
+        return Err(HistoryStepError::RuntimeLayout);
+    }
+    Ok(pass.parts)
+}
+
+/// [`decode_client_bearing_history_step_parts`] for the v1.6 relation: the
+/// batch class pins and the chain arm's layout a pack carries must be the
+/// chain's batch class's ([`HistoryStepBatchParts::canonical`]), and its
+/// parent layouts the v1.6 fixed point over them.
+pub(super) fn decode_batch_bearing_history_step_parts(
+    direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    pins: HistoryStepBatchClassPins,
+    batch_layout: DuplexLayout,
+) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
+    let generation = HistoryStepPackGeneration::V1_6;
+    debug_assert!(generation.carries_batch_slot());
+    let batch = HistoryStepBatchParts::canonical()?;
+    if batch.pins != pins {
+        return Err(HistoryStepError::ClientForm);
+    }
+    if batch.layout != batch_layout {
+        return Err(HistoryStepError::ClientForm);
+    }
+    let child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].child.clone());
+    let r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|slot| transcripts[slot].r_prev.clone());
+    let pass = history_step_runtime_parts_pass(
+        generation,
+        &history_step_parent_params(generation),
+        &direct_block_vks,
+        &child_layouts,
+        &r_prev_layouts,
+        &None,
+        &Some(batch),
     )?;
     if pass.derived_children != child_layouts || pass.derived_r_prev != r_prev_layouts {
         return Err(HistoryStepError::RuntimeLayout);
@@ -885,6 +1102,8 @@ pub struct HistoryStepRuntime {
     /// The chain's client registry, when this node holds one (v1.5,
     /// M2 task 2.5): static in the prototype, chain state in M3.
     clients: Option<std::sync::Arc<super::client_arm::HistoryStepChainClients>>,
+    /// The batch slot of a v1.6 runtime: the class its chain arm verifies.
+    batch: BatchSlot,
 }
 
 impl HistoryStepRuntime {
@@ -900,9 +1119,14 @@ impl HistoryStepRuntime {
             parent_geometry,
             generation,
             client,
+            batch,
         } = parts;
         // A client-bearing bank and client-bearing parts come together.
         if client.as_ref().map(HistoryStepClientParts::form) != bank.client_form() {
+            return Err(HistoryStepError::ClientForm);
+        }
+        // So do a v1.6 bank and parts of the batch class it binds.
+        if batch.as_ref().map(HistoryStepBatchParts::pins) != bank.batch_class() {
             return Err(HistoryStepError::ClientForm);
         }
         // The bank was pinned under a public-IO spec and these parts were
@@ -932,7 +1156,13 @@ impl HistoryStepRuntime {
             direct_block_vks,
             parent_geometry,
             clients: None,
+            batch,
         })
+    }
+
+    /// The batch slot of a v1.6 runtime.
+    pub fn batch(&self) -> Option<&HistoryStepBatchParts> {
+        self.batch.as_ref()
     }
 
     /// Give this node the chain's client registry (v1.5, M2 task
@@ -1035,6 +1265,14 @@ impl HistoryStepRuntime {
         let mut pending = pending;
         pending.discharge_class_matrices(|class| self.load_matrix(class))?;
         pending.check_client_lanes_with(self.bank.client_form(), matrices)?;
+        // A v1.6 tip's batch lanes: every live entry lane on the
+        // form-Z matrix registered at its entry, the `D_batch` lane on the
+        // chain's batch class matrix (the one the bank pins).
+        if pending.pending_batch().is_some() {
+            let class = crate::acceptance::client_batch::aggregate::AggregationClass::chain()
+                .map_err(|_| HistoryStepError::Bank(HistoryStepBankError::BatchMatrix))?;
+            pending.check_batch_lanes_with(Some(class.form()), Some(class.batch_matrix()), matrices)?;
+        }
         pending.finish().map_err(Into::into)
     }
 }
@@ -1268,6 +1506,7 @@ pub struct AcceptedHistoryStepTerminal {
     class_id: CanonicalHistoryStepClassId,
     accumulator: ChainAccumulator,
     client: Option<crate::acceptance::history_step_bank::HistoryStepClientClaim>,
+    batch: Option<crate::acceptance::history_step_bank::HistoryStepBatchClaim>,
 }
 
 impl AcceptedHistoryStepTerminal {
@@ -1294,6 +1533,15 @@ impl AcceptedHistoryStepTerminal {
         &self,
     ) -> Option<&crate::acceptance::history_step_bank::HistoryStepClientClaim> {
         self.client.as_ref()
+    }
+
+    /// The terminal's decided batch lanes (v1.6): the carried batch, the
+    /// registry leaves and the entry and `D_batch` lanes the block
+    /// publishes. `None` under a generation without the batch slot.
+    pub fn batch_claim(
+        &self,
+    ) -> Option<&crate::acceptance::history_step_bank::HistoryStepBatchClaim> {
+        self.batch.as_ref()
     }
 }
 
@@ -2182,6 +2430,7 @@ fn verify_history_step_terminal_rooted_by(
         class_id: terminal.class_id,
         accumulator,
         client: accepted.take_client(),
+        batch: accepted.take_batch(),
     })
 }
 
@@ -2368,6 +2617,53 @@ fn prepare_client_slot<'r>(
     }
 }
 
+/// The prepared batch slot of a v1.6 runtime, its lanes installed into the
+/// block's output `io`: the carried batch (or the ghost), a junction on the
+/// parent's lanes (`parent_io`, `None` at a base), publishing `registry` as
+/// its registry leaves (`None` keeps the parent's).
+fn prepare_batch_slot<'b>(
+    runtime: &HistoryStepRuntime,
+    batch: Option<&'b PreparedChainBatch>,
+    registry: Option<&[jetsam_ivc_core::merkle::Hash]>,
+    parent_io: Option<&[F128]>,
+    io: &mut [F128],
+) -> Result<(HistoryStepBatchIoLanes, std::borrow::Cow<'b, PreparedChainBatch>), HistoryStepError> {
+    let lanes = runtime.bank().layout().batch.ok_or(HistoryStepError::ClientForm)?;
+    let slot = runtime.batch().ok_or(HistoryStepError::ClientForm)?;
+    let prepared = match batch {
+        Some(batch) => {
+            // A batch prepared under another class is not this relation's.
+            let public = batch.public.as_ref().ok_or(HistoryStepError::ClientForm)?;
+            if public.batch_digest != slot.pins.matrix_digest
+                || public.post_commit != slot.pins.post_commit_digest
+            {
+                return Err(HistoryStepError::ClientForm);
+            }
+            std::borrow::Cow::Borrowed(batch)
+        }
+        None => std::borrow::Cow::Owned(
+            prepare_chain_batch_ghost(slot.identity()).map_err(batch_error)?,
+        ),
+    };
+    let registry = match registry {
+        Some(registry) => registry.to_vec(),
+        None => (0..lanes.registry_capacity)
+            .map(|index| match parent_io {
+                Some(parent_io) => {
+                    let at = lanes.registry_leaf(index);
+                    let mut leaf = [0u8; 32];
+                    leaf[..16].copy_from_slice(&jetsam_ivc_core::field_circuit::f128_to_u128(parent_io[at]).to_le_bytes());
+                    leaf[16..].copy_from_slice(&jetsam_ivc_core::field_circuit::f128_to_u128(parent_io[at + 1]).to_le_bytes());
+                    leaf
+                }
+                None => [0u8; 32],
+            })
+            .collect(),
+    };
+    prepare_batch_slot_lanes(&lanes, &prepared, parent_io, &registry, io).map_err(batch_error)?;
+    Ok((lanes, prepared))
+}
+
 fn prepare_history_step_assembly<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     prepared: PreparedHistoryStepParent<'_>,
@@ -2400,12 +2696,32 @@ fn prepare_history_step_assembly<const TIER: usize>(
     let envelope = envelopes[selected_parent_class.current_slot()].proof();
     let generation = bank.generation();
     let mut io = io;
-    let client_slot = prepare_client_slot(
-        runtime,
-        client,
-        (!base).then_some(envelope.io.as_slice()),
-        &mut io,
-    )?;
+    // v1.6 carries the batch slot where v1.5 carries the client slot; a
+    // runtime never takes the other's input.
+    let (client_slot, batch_slot) = if generation.carries_batch_slot() {
+        if client.client.is_some() {
+            return Err(HistoryStepError::ClientForm);
+        }
+        let batch = prepare_batch_slot(
+            runtime,
+            client.batch,
+            client.registry,
+            (!base).then_some(envelope.io.as_slice()),
+            &mut io,
+        )?;
+        (None, Some(batch))
+    } else {
+        if client.batch.is_some() {
+            return Err(HistoryStepError::ClientForm);
+        }
+        let client_slot = prepare_client_slot(
+            runtime,
+            client,
+            (!base).then_some(envelope.io.as_slice()),
+            &mut io,
+        )?;
+        (client_slot, None)
+    };
     let effective_pages = current.components.effective_page_count();
     if jetsam_chain::consensus::paged_spend::BlockProofClass::for_page_count_in_generation(
         effective_pages,
@@ -2464,9 +2780,10 @@ fn prepare_history_step_assembly<const TIER: usize>(
         })
         .collect::<Vec<_>>();
     // With a client slot the carrier walks the client proof (role 1) and
-    // records its transcript (third L-C role), present or ghost.
-    let r_columns = match &client_slot {
-        Some((form, _, client)) => {
+    // records its transcript (third L-C role), present or ghost; under v1.6,
+    // the batch proof and the chain arm's transcript.
+    let r_columns = match (&client_slot, &batch_slot) {
+        (Some((form, _, client)), _) => {
             crate::acceptance::trace::r_pcs_region::prepare_history_step_carrier_columns(
                 &mut builder,
                 &r_pcs,
@@ -2480,7 +2797,22 @@ fn prepare_history_step_assembly<const TIER: usize>(
                 },
             )
         }
-        None => prepare_history_step_parent_columns(
+        (None, Some((_, batch))) => {
+            let slot = runtime.batch().ok_or(HistoryStepError::ClientForm)?;
+            crate::acceptance::trace::r_pcs_region::prepare_history_step_carrier_columns(
+                &mut builder,
+                &r_pcs,
+                selected_parent_class.current_slot(),
+                runtime.parent_geometry(),
+                prepared_parent.child_recordings,
+                prepared_parent.r_prev_recordings,
+                crate::acceptance::trace::r_pcs_region::ClientCarrierColumns {
+                    proof: batch.carrier_proof(slot.parts()),
+                    recording: batch.scratch.clone(),
+                },
+            )
+        }
+        (None, None) => prepare_history_step_parent_columns(
             &mut builder,
             &r_pcs,
             selected_parent_class.current_slot(),
@@ -2735,8 +3067,28 @@ fn prepare_history_step_assembly<const TIER: usize>(
         )
     });
     lap("client arm", &mut stage_started);
-    let parent_region = match &client_trace {
-        Some(client) => crate::acceptance::trace::r_pcs_region::finalize_history_step_carrier_region(
+    // The batch slot (v1.6): gated by `batch_present` alone, like the client
+    // arm, so outside `parent_gate` too.
+    let batch_trace = match &batch_slot {
+        Some((lanes, batch)) => {
+            let slot = runtime.batch().ok_or(HistoryStepError::ClientForm)?;
+            Some(
+                batch_slot_trace(
+                    &mut builder,
+                    slot.identity(),
+                    &BatchIoCells::from_io(lanes, &io_cells),
+                    &BatchIoCells::from_io(lanes, &prev_io),
+                    &parent_gate,
+                    batch,
+                )
+                .map_err(batch_error)?,
+            )
+        }
+        None => None,
+    };
+    lap("batch slot", &mut stage_started);
+    let parent_region = match (&client_trace, &batch_trace) {
+        (Some(client), _) => crate::acceptance::trace::r_pcs_region::finalize_history_step_carrier_region(
             &mut builder,
             r_columns,
             &obligations,
@@ -2750,7 +3102,21 @@ fn prepare_history_step_assembly<const TIER: usize>(
                 parent_gate: Some(&parent_gate),
             },
         ),
-        None => with_pin_gate(&parent_gate, || {
+        (None, Some(batch)) => crate::acceptance::trace::r_pcs_region::finalize_history_step_carrier_region(
+            &mut builder,
+            r_columns,
+            &obligations,
+            &parent_selector.one_hot,
+            &recorded_children,
+            &recorded_r_prev,
+            crate::acceptance::trace::r_pcs_region::ClientCarrierDischarge {
+                obligations: &batch.obligations,
+                recorded: &batch.recorded,
+                gate: &batch.gate,
+                parent_gate: Some(&parent_gate),
+            },
+        ),
+        (None, None) => with_pin_gate(&parent_gate, || {
             finalize_history_step_parent_region(
                 &mut builder,
                 r_columns,
@@ -3128,7 +3494,44 @@ pub fn prepare_history_step_for_pow_with_client<const TIER: usize>(
     client: Option<&super::client_arm::PreparedHistoryStepClient>,
     registry: Option<&[jetsam_ivc_core::merkle::Hash]>,
 ) -> Result<PreparedHistoryStepForPow<TIER>, HistoryStepError> {
-    prepare_history_step_for_pow_slot(runtime, parent, current, ClientInput { client, registry })
+    prepare_history_step_for_pow_slot(
+        runtime,
+        parent,
+        current,
+        ClientInput {
+            client,
+            registry,
+            batch: None,
+        },
+    )
+}
+
+/// [`prepare_history_step_for_pow`] for a v1.6 runtime: the block carries
+/// `batch` — decided and prepared once, on reception
+/// ([`crate::acceptance::client_batch::aggregate::decide`]), a junction on
+/// this block's parent — or the ghost, and publishes `registry` as its
+/// registry leaves (`None` keeps the parent's). Refused under a runtime
+/// without the batch slot.
+pub fn prepare_history_step_for_pow_with_batch<const TIER: usize>(
+    runtime: &HistoryStepRuntime,
+    parent: Option<&HistoryStepTerminal>,
+    current: HistoryStepBlockInput<TIER>,
+    batch: Option<&crate::acceptance::client_batch::aggregate::PreparedBatch>,
+    registry: Option<&[jetsam_ivc_core::merkle::Hash]>,
+) -> Result<PreparedHistoryStepForPow<TIER>, HistoryStepError> {
+    if !runtime.bank().generation().carries_batch_slot() {
+        return Err(HistoryStepError::ClientForm);
+    }
+    prepare_history_step_for_pow_slot(
+        runtime,
+        parent,
+        current,
+        ClientInput {
+            client: None,
+            registry,
+            batch: batch.map(|batch| batch.0.as_ref()),
+        },
+    )
 }
 
 fn prepare_history_step_for_pow_slot<const TIER: usize>(
@@ -3222,6 +3625,85 @@ pub fn prove_history_step<const TIER: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The v1.6 slot is a batch slot. The generation alone builds no
+    /// v1.6 runtime (its batch class is an input): no client slot,
+    /// and an explicit client slot is refused under v1.6, as a batch slot
+    /// under every other generation. Launch, v1.3 and v1.5 answer as before.
+    #[test]
+    fn the_v1_6_slot_is_a_batch_slot() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+        assert!(matches!(
+            generation_client_slot(V1_6),
+            Err(HistoryStepError::ClientForm)
+        ));
+        assert!(matches!(generation_client_slot(V1), Ok(None)));
+        assert!(matches!(generation_client_slot(V1_3), Ok(None)));
+        assert!(matches!(generation_client_slot(V1_5), Ok(Some(_))));
+        assert!(matches!(
+            check_generation_slot(V1_6, &None, &None),
+            Err(HistoryStepError::ClientForm)
+        ));
+        let canonical = generation_client_slot(V1_5).unwrap();
+        assert!(matches!(
+            check_generation_slot(V1_6, &canonical, &None),
+            Err(HistoryStepError::ClientForm)
+        ));
+        assert!(check_generation_slot(V1_5, &canonical, &None).is_ok());
+        assert!(check_generation_slot(V1_3, &None, &None).is_ok());
+        assert!(matches!(
+            check_generation_slot(V1_3, &canonical, &None),
+            Err(HistoryStepError::ClientForm)
+        ));
+    }
+
+    /// A v1.6 runtime takes a batch class of the canonical client form
+    /// at the production batch shape (m = 22), and only under v1.6. The test
+    /// batch class (client m = 8, m = 21) is refused; the same slot named as
+    /// the production one is accepted under v1.6 and refused elsewhere.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only: freezes the test batch class (real batch-step relation)")]
+    fn the_v1_6_slot_takes_the_production_batch_class_only() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+        let fixture = crate::acceptance::client_batch::tests::fixture();
+        let test_scale = HistoryStepBatchParts::new(fixture.class.identity()).unwrap();
+        assert_eq!(test_scale.pins().m, 21);
+        assert_eq!(
+            test_scale.layout().slots.len(),
+            fixture.class.parts.arm_b_layout.slots.len()
+        );
+        assert!(matches!(
+            check_generation_slot(V1_6, &None, &Some(test_scale.clone())),
+            Err(HistoryStepError::ClientForm)
+        ));
+        let mut named = test_scale.clone();
+        named.pins.m = HISTORY_STEP_BATCH_FORM_M;
+        assert!(
+            check_generation_slot(V1_6, &None, &Some(named.clone())).is_err(),
+            "a batch class of another client form"
+        );
+        // One form per class: the v1.6 batch class is over the hiding client
+        // form; the v1.5 form at the production shape is another form.
+        named.parts.client = HistoryStepClientForm::canonical();
+        assert!(
+            check_generation_slot(V1_6, &None, &Some(named.clone())).is_err(),
+            "a batch class of the v1.5 client form"
+        );
+        named.parts.client = HistoryStepClientForm::canonical_z();
+        assert!(check_generation_slot(V1_6, &None, &Some(named.clone())).is_ok());
+        let mut other_shape = named.clone();
+        other_shape.pins.m = 21;
+        assert!(
+            check_generation_slot(V1_6, &None, &Some(other_shape)).is_err(),
+            "a batch class of the canonical form at another shape"
+        );
+        let canonical = generation_client_slot(V1_5).unwrap();
+        assert!(check_generation_slot(V1_6, &canonical, &Some(named.clone())).is_err());
+        for generation in [V1, V1_3] {
+            assert!(check_generation_slot(generation, &None, &Some(named.clone())).is_err());
+        }
+        assert!(check_generation_slot(V1_5, &canonical, &Some(named)).is_err());
+    }
 
     fn selector_matrix(parent_slot: usize) -> (FieldR1cs, Vec<F128>) {
         let native = CanonicalHistoryStepClassId::new(parent_slot).unwrap();
