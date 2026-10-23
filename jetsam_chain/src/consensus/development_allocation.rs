@@ -15,8 +15,8 @@
 //! smaller than 5%; the difference is never issued. Fees remain entirely
 //! miner-claimable after the existing state-growth burn.
 //!
-//! While v1.5 is dormant, the funds' share over the whole window is
-//! 1 163 996 JTM, which is 5.54% of the 21 000 000 maximum supply. There is no
+//! With v1.5 at 38 400 (public profile), the funds' share over the whole window
+//! is 747 000 JTM, about 3.56% of the 21 000 000 maximum supply. There is no
 //! premine.
 //!
 //! # Two cadences, one window (v1.5)
@@ -102,9 +102,21 @@ const _: () = assert!(
 /// 960-block cadence, no later than its last one. Anything else would split a
 /// target-time day between the two rules, or open the new cadence after the
 /// window has closed.
+#[cfg(not(feature = "rehearsal-v1-6"))]
 pub const fn v1_5_activation_is_valid(activation: u64) -> bool {
     activation.is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_90S)
         && activation / DEVELOPMENT_PAYOUT_INTERVAL_90S <= DEVELOPMENT_ALLOCATION_PAYOUTS
+}
+
+/// **Private builds only** (`rehearsal-v1-6`): the private v1.5
+/// height ([`crate::consensus::params::REHEARSAL_V1_5_ACTIVATION`]) is not a
+/// payout height of the 960-block cadence; no payout falls inside a
+/// private run (the first one after it is at 516).
+#[cfg(feature = "rehearsal-v1-6")]
+pub const fn v1_5_activation_is_valid(activation: u64) -> bool {
+    activation == crate::consensus::params::REHEARSAL_V1_5_ACTIVATION
+        || (activation.is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_90S)
+            && activation / DEVELOPMENT_PAYOUT_INTERVAL_90S <= DEVELOPMENT_ALLOCATION_PAYOUTS)
 }
 
 const _: () = assert!(

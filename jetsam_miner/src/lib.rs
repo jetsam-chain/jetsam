@@ -35,7 +35,9 @@ pub mod pow;
 pub mod proof_capacity;
 pub mod template;
 
-pub use block_production::{CommittedBlock, PreparedBlockAttempt, ProvedBlock};
+pub use block_production::{
+    terminal_batch_view_of_claim, CommittedBlock, PreparedBlockAttempt, ProvedBlock,
+};
 pub use cpu_budget::{
     configure_process_cpu_budget, configure_process_cpu_budget_with_threads,
     configured_process_cpu_budget, install_history_step_phase_cpu, install_inbound_verifier_cpu,

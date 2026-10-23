@@ -385,8 +385,6 @@ impl TemplateBuilder {
         now_unix: u64,
         max_effective_pages: usize,
     ) -> Option<BlockTemplate> {
-        use jetsam_chain::consensus::median_time_past;
-
         let parent = snapshot.parent;
         if !mining_launch_is_open(&parent, now_unix) {
             return None;
@@ -395,13 +393,17 @@ impl TemplateBuilder {
         let prev_timestamps = &snapshot.prev_timestamps;
 
         // Compute the minimum valid timestamp for the new block:
-        //   timestamp MUST be strictly greater than MTP (median of last 11 blocks).
-        //   See validate_timestamp in jetsam_chain::consensus::timestamps.
+        //   timestamp MUST be strictly greater than MTP (median of last 11 blocks),
+        //   and from v1.6 no more than 600 s below the parent's
+        //   (`header::lowest_admitted_timestamp`, the validator's own bound).
         // This prevents BadTimestamp when blocks are found faster than 1 second
         // (genesis target is trivial; multiple blocks per second are possible).
-        let mtp = median_time_past(prev_timestamps);
-        let min_valid_ts = mtp + 1;
-        let timestamp = now_unix.max(min_valid_ts);
+        let timestamp = template_timestamp(
+            now_unix,
+            &parent,
+            prev_timestamps,
+            jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT,
+        );
 
         // Compute the correct ASERT target for the new block.
         // MUST match what validate_header computes; wrong target = block rejected.
@@ -420,13 +422,7 @@ impl TemplateBuilder {
         // at the activation height and stalled the chain at `activation - 1`.
         let anchor = &snapshot.anchor;
         let child_height = parent.height + 1;
-        let difficulty_target = expected_target(
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
-            child_height,
-            parent.timestamp,
-        );
+        let difficulty_target = expected_target(anchor, child_height, parent.timestamp);
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;
@@ -456,16 +452,36 @@ impl TemplateBuilder {
         }
         let mut offered = crate::client_slot::OfferedClientObjects::default();
         let mut held_payments: Vec<jetsam_tx::PagedSpendIntent> = Vec::new();
+        // v1.6: the slot carries a batch, never a v1.5 client.
+        let batch_rules = jetsam_chain::consensus::client_objects::ClientBatchRules::current();
+        let carries_batch_slot = batch_rules.active_at(child_height);
+        let mut offered_batch: Option<crate::client_slot::MinerBatch> = None;
         if client_rules.active_at(child_height) {
             if let Some(source) = &self.client_source {
                 let anchor_ok =
                     |anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation);
+                if carries_batch_slot {
+                    if let Some(batch) = source.best_batch(
+                        &parent,
+                        snapshot.parent_history_step_terminal_bytes.as_deref(),
+                        &snapshot.client_registry,
+                        &anchor_ok,
+                    ) {
+                        offered.objects.push(
+                            jetsam_chain::consensus::client_objects::ClientObject::BatchSubmission(
+                                batch.submission,
+                            ),
+                        );
+                        held_payments.push(batch.payment.clone());
+                        offered_batch = Some(batch);
+                    }
+                }
                 if let Some(candidate) = source.best_candidate(
                     &parent,
                     &snapshot.client_registry,
                     &client_rules,
                     &anchor_ok,
-                ) {
+                ).filter(|_| !carries_batch_slot) {
                     offered.objects.push(
                         jetsam_chain::consensus::client_objects::ClientObject::Submission(
                             candidate.submission,
@@ -475,24 +491,15 @@ impl TemplateBuilder {
                         Some((candidate.submission, std::sync::Arc::clone(&candidate.payload)));
                     held_payments.push(candidate.payment);
                 }
-                for (registration, payment) in source
-                    .held_registrations(&snapshot.client_registry)
-                    .into_iter()
-                    .filter(|(_, payment)| {
-                        payment
-                            .pages
-                            .first()
-                            .is_some_and(|page| anchor_ok(&page.body.epoch_anchor))
-                    })
-                    // Several per block (decision of 2026-10-01), within
-                    // what the registry still holds.
-                    .take(
-                        client_rules
-                            .registry_capacity
-                            .min(jetsam_chain::consensus::client_objects::MAX_BLOCK_CLIENT_REGISTRATIONS)
-                            .saturating_sub(snapshot.client_registry.len()),
-                    )
-                {
+                for (registration, payment) in offered_registrations(
+                    source.held_registrations(&snapshot.client_registry),
+                    snapshot.client_registry.len(),
+                    &client_rules,
+                    &batch_rules,
+                    child_height,
+                    offered_batch.is_some(),
+                    &anchor_ok,
+                ) {
                     offered.objects.push(
                         jetsam_chain::consensus::client_objects::ClientObject::Registration(
                             registration,
@@ -618,10 +625,27 @@ impl TemplateBuilder {
             let judged = |inner: &jetsam_chain::consensus::template::BlockTemplate,
                           with_clients: bool| {
                 let slot = if with_clients {
-                    crate::client_slot::client_slot_of_selection(&inner.txs, offered, client_registry)
+                    let mut slot = crate::client_slot::client_slot_of_selection_at(
+                        &inner.txs,
+                        offered,
+                        client_registry,
+                        child_height,
+                        &batch_rules,
+                    );
+                    slot.batch = offered_batch
+                        .as_ref()
+                        .filter(|batch| slot.batch_submission == Some(batch.submission))
+                        .map(|batch| batch.prepared.clone());
+                    slot
                 } else {
                     crate::client_slot::TemplateClientSlot::default()
                 };
+                let slot = crate::client_slot::with_registry_at_v1_6_base(
+                    slot,
+                    client_registry,
+                    child_height,
+                    &batch_rules,
+                );
                 if client_rules.active_at(child_height) {
                     check_template_client_objects(
                         inner,
@@ -637,12 +661,18 @@ impl TemplateBuilder {
                 Ok(built) => match judged(&built.0, true) {
                     Ok(slot) => return Some((built, slot)),
                     // The held client objects make a block the rules refuse:
-                    // the block goes out without them rather than not at all.
-                    Err(error) if offers_clients => tracing::warn!(
-                        %error,
-                        "template refused by the client-object rules with its held client \
-                         payments: built again without them"
-                    ),
+                    // the block goes out without them rather than not at all,
+                    // and an offered batch is not offered again.
+                    Err(error) if offers_clients => {
+                        if let (Some(batch), Some(source)) = (&offered_batch, &self.client_source) {
+                            source.forget_batch(&batch.submission);
+                        }
+                        tracing::warn!(
+                            %error,
+                            "template refused by the client-object rules with its held client \
+                             payments: built again without them"
+                        )
+                    }
                     Err(error) => {
                         tracing::error!(
                             %error,
@@ -697,7 +727,8 @@ impl TemplateBuilder {
                     .map(|client| hex::encode(&client.digest()[..8]))
                     .unwrap_or_default(),
                 registers = client_slot.registry_leaves.is_some(),
-                "template carries v1.5 client objects"
+                batch = client_slot.batch.is_some(),
+                "template carries client objects"
             );
         }
 
@@ -763,6 +794,55 @@ pub(crate) fn minable_plain_entries(
 /// (`validate_block_client_objects`) applied to the block `inner` makes with
 /// `objects`, against the parent's registry: the very check the commit runs
 /// on the sealed block (the nonce is not one of its inputs).
+/// The held registrations a template at `child_height` offers, in order.
+///
+/// Only those whose payment binds an epoch anchor the block accepts; none in
+/// a block that carries a batch (a batch is built over the registry the
+/// parent publishes); several per block (decision of 2026-10-01), within what
+/// the registry still holds.
+pub(crate) fn offered_registrations(
+    held: Vec<(
+        jetsam_chain::consensus::client_objects::ClientRegistration,
+        jetsam_tx::PagedSpendIntent,
+    )>,
+    registry_len: usize,
+    client_rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+    batch_rules: &jetsam_chain::consensus::client_objects::ClientBatchRules,
+    child_height: u64,
+    carries_batch: bool,
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+) -> Vec<(
+    jetsam_chain::consensus::client_objects::ClientRegistration,
+    jetsam_tx::PagedSpendIntent,
+)> {
+    held.into_iter()
+        .filter(|(_, payment)| {
+            payment
+                .pages
+                .first()
+                .is_some_and(|page| anchor_ok(&page.body.epoch_anchor))
+        })
+        .filter(|_| !carries_batch)
+        // Only a registration the block's own height admits: one the block
+        // would refuse would take every client
+        // object out of the template.
+        .filter(|(registration, _)| {
+            jetsam_chain::consensus::client_objects::registrable_at(
+                &registration.matrix_digest,
+                client_rules,
+                batch_rules,
+                child_height,
+            )
+        })
+        .take(
+            client_rules
+                .registry_capacity
+                .min(jetsam_chain::consensus::client_objects::MAX_BLOCK_CLIENT_REGISTRATIONS)
+                .saturating_sub(registry_len),
+        )
+        .collect()
+}
+
 pub(crate) fn check_template_client_objects(
     inner: &ChainTemplate,
     objects: &[jetsam_chain::consensus::client_objects::ClientObject],
@@ -796,6 +876,24 @@ fn user_page_limit_for_child(parent_height: u64, max_effective_pages: usize) -> 
 
 pub(crate) fn mining_launch_is_open(parent: &BlockHeader, now_unix: u64) -> bool {
     parent.height != 0 || now_unix >= parent.timestamp
+}
+
+/// The timestamp of a template for the child of `parent`: the clock, raised
+/// to the lowest timestamp that child admits
+/// (`header::lowest_admitted_timestamp_with`, the validator's bound) — with
+/// the v1.6 height injected for the tests.
+pub(crate) fn template_timestamp(
+    now_unix: u64,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    v1_6_activation: Option<u64>,
+) -> u64 {
+    now_unix.max(jetsam_chain::consensus::header::lowest_admitted_timestamp_with(
+        parent.height + 1,
+        parent.timestamp,
+        prev_timestamps,
+        v1_6_activation,
+    ))
 }
 
 #[cfg(test)]
@@ -1078,4 +1176,94 @@ mod tests {
         later_parent.height = 1;
         assert!(mining_launch_is_open(&later_parent, 0));
     }
+
+    /// A template offers only the
+    /// registrations its own block admits. From the v1.6 height a v1.5
+    /// catalogue entry is refused by the block (`registrable_at`): offered,
+    /// it would take every client object out of the template. Below that
+    /// height the v1.5 entry is offered and the form-Z one is not.
+    #[test]
+    fn a_template_offers_only_the_registrations_its_block_admits() {
+        use jetsam_chain::consensus::client_objects::{
+            CatalogueEntry, ClientBatchRules, ClientObjectRules, ClientRegistration,
+        };
+        const K: u64 = 1_920;
+        static V15: [CatalogueEntry; 1] = [CatalogueEntry {
+            matrix_digest: [0x15; 32],
+            matrix_file_root: [0x51; 32],
+            matrix_file_len: 1_000,
+        }];
+        static Z: [CatalogueEntry; 1] = [CatalogueEntry {
+            matrix_digest: [0x16; 32],
+            matrix_file_root: [0x61; 32],
+            matrix_file_len: 1_000,
+        }];
+        let client_rules = ClientObjectRules {
+            activation_height: Some(K - 960),
+            catalogue: &V15,
+            ..ClientObjectRules::CONSENSUS
+        };
+        let batch_rules = ClientBatchRules {
+            activation_height: Some(K),
+            catalogue: &Z,
+            ..ClientBatchRules::CONSENSUS
+        };
+        let registration = |entry: &CatalogueEntry| ClientRegistration {
+            matrix_digest: entry.matrix_digest,
+            matrix_file_root: entry.matrix_file_root,
+            matrix_file_len: entry.matrix_file_len,
+        };
+        let held = || {
+            [&V15[0], &Z[0]]
+                .into_iter()
+                .map(|entry| {
+                    let page = b1_page(marker_owner(), 900, 100);
+                    let payment = jetsam_tx::PagedSpendIntent::new(vec![page], vec![0xA5; 64]).unwrap();
+                    (registration(entry), payment)
+                })
+                .collect::<Vec<_>>()
+        };
+        let offered = |height: u64| {
+            offered_registrations(held(), 0, &client_rules, &batch_rules, height, false, &|_| true)
+                .into_iter()
+                .map(|(registration, _)| registration.matrix_digest)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offered(K - 1), vec![V15[0].matrix_digest], "below v1.6: the v1.5 catalogue");
+        assert_eq!(offered(K), vec![Z[0].matrix_digest], "at v1.6: the form-Z catalogue only");
+        assert_eq!(offered(K + 1), vec![Z[0].matrix_digest]);
+        // A block carrying a batch registers nothing; an anchor the block
+        // refuses keeps its payment out.
+        assert!(offered_registrations(held(), 0, &client_rules, &batch_rules, K, true, &|_| true).is_empty());
+        assert!(offered_registrations(held(), 0, &client_rules, &batch_rules, K, false, &|_| false).is_empty());
+    }
+
+    /// From the v1.6 height a block may not be dated more
+    /// than 600 s below its parent. A template built by a node whose clock is
+    /// behind a parent dated at its future limit takes the lowest timestamp
+    /// the block admits, not its clock; below the height, its clock or the
+    /// median, as released.
+    #[test]
+    fn a_template_timestamp_meets_the_parent_floor_from_v1_6() {
+        const K: u64 = 48_000;
+        let parent_ts = 1_900_000_000u64;
+        let prev: Vec<u64> = (0..11).map(|i| parent_ts - (10 - i) * 180).collect();
+        // The parent of a child at `child_height`.
+        let parent_of = |child_height: u64| {
+            let mut parent = jetsam_chain::consensus::genesis_header();
+            parent.height = child_height - 1;
+            parent.timestamp = parent_ts;
+            parent
+        };
+        // Clock 720 s behind the parent: the floor, from the v1.6 height on.
+        assert_eq!(template_timestamp(parent_ts - 720, &parent_of(K), &prev, Some(K)), parent_ts - 600);
+        assert_eq!(template_timestamp(parent_ts - 720, &parent_of(K + 1), &prev, Some(K)), parent_ts - 600);
+        // Below the height, or dormant: the clock above the median.
+        assert_eq!(template_timestamp(parent_ts - 720, &parent_of(K - 1), &prev, Some(K)), parent_ts - 720);
+        assert_eq!(template_timestamp(parent_ts - 720, &parent_of(K), &prev, None), parent_ts - 720);
+        assert_eq!(template_timestamp(parent_ts - 2_000, &parent_of(K - 1), &prev, Some(K)), parent_ts - 899);
+        // A clock past the floor is kept.
+        assert_eq!(template_timestamp(parent_ts + 5, &parent_of(K), &prev, Some(K)), parent_ts + 5);
+    }
+
 }

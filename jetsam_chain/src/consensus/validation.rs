@@ -45,16 +45,9 @@ use crate::consensus::{
 };
 use crate::state::ChainState;
 
-/// Parameters needed for header chain validation.
-#[derive(Debug, Clone)]
-pub struct AnchorInfo {
-    /// Height of the ASERT anchor block.
-    pub anchor_height: u64,
-    /// Timestamp of the ASERT anchor block.
-    pub anchor_timestamp: u64,
-    /// Difficulty target at the ASERT anchor block.
-    pub anchor_target: [u8; 32],
-}
+/// Parameters needed for header chain validation (defined beside the rule
+/// that reads them).
+pub use crate::consensus::difficulty::AnchorInfo;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockResourcePreflight {
@@ -448,9 +441,7 @@ fn validate_block_checks_inner(
             prev_timestamps,
             finalized_active_counts,
             local_time,
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
+            anchor,
         )?,
         (Some(local_time), false) => validate_header_template(
             &block.header,
@@ -458,18 +449,14 @@ fn validate_block_checks_inner(
             prev_timestamps,
             finalized_active_counts,
             local_time,
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
+            anchor,
         )?,
         (None, _) => validate_header_timeless(
             &block.header,
             parent,
             prev_timestamps,
             finalized_active_counts,
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
+            anchor,
         )?,
     }
     validate_mandatory_coinbase(block, parent)?;
@@ -532,9 +519,7 @@ pub fn validate_block_consensus(
         prev_timestamps,
         finalized_active_counts,
         local_time,
-        anchor.anchor_height,
-        anchor.anchor_timestamp,
-        &anchor.anchor_target,
+        anchor,
     )?;
 
     // --- Bounded canonical resource preflight ---

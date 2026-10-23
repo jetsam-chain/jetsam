@@ -36,11 +36,17 @@
 //! `params::V1_5_ACTIVATION_HEIGHT`, 180 s from it on, a 540 s halflife on both
 //! sides. Below that height the computation is the released one, bit for bit.
 //!
+//! JETSAM (v1.6): every child above `params::V1_6_ACTIVATION_HEIGHT` follows
+//! the v1.6 rule (`DifficultySchedule::v1_6_rule_at`, `expected_target_in`).
+//! Up to that height, the activation block included, the v1.5 computation,
+//! bit for bit.
+//!
 //! All arithmetic uses u64/u128 integers. NO FLOATS.
 
 use crate::consensus::params::{
     ASERT_POLYNOMIAL_FIX_HEIGHT, BLOCK_TIME, BLOCK_TIME_V1_5, GENESIS_TARGET, MAX_TARGET,
-    MIN_TARGET, V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET, V1_5_ACTIVATION_HEIGHT,
+    HALFLIFE_V1_6, MIN_TARGET, V1_4_ACTIVATION_HEIGHT, V1_4_ANCHOR_TARGET,
+    V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT,
 };
 
 /// BCH ASERT polynomial coefficients for `2^(f/65536)`, `f` in Q16.
@@ -48,12 +54,33 @@ const ASERT_A: u128 = 195_766_423_245_049;
 const ASERT_B: u128 = 971_821_376;
 const ASERT_C: u128 = 5_127;
 
+/// The ASERT anchor of a child, as every caller reads it from the chain.
+///
+/// One value, filled in one place per source (`MdbxChainContext::anchor_info`
+/// for a node's chain, the validated window for staged headers), so that every
+/// call site reads the same fields.
+#[derive(Debug, Clone)]
+pub struct AnchorInfo {
+    /// Height of the ASERT anchor block
+    /// ([`DifficultySchedule::anchor_height`] of the parent).
+    pub anchor_height: u64,
+    /// Timestamp of the ASERT anchor block.
+    pub anchor_timestamp: u64,
+    /// Timestamp of the block just below the anchor (the anchor's own at
+    /// genesis, which has no parent).
+    pub anchor_parent_timestamp: u64,
+    /// Difficulty target at the ASERT anchor block.
+    pub anchor_target: [u8; 32],
+}
+
 /// Every clock the difficulty rule reads, in one value.
 ///
-/// The target of a block depends on four heights: the polynomial fix, the v1.4
+/// The target of a block depends on five heights: the polynomial fix, the v1.4
 /// proof-of-work (a constant target at its height, an anchor floored there),
-/// and v1.5 (half the 90-second target at its height, an anchor floored there,
-/// and a 180-second interval from it on). Production reads [`Self::PRODUCTION`],
+/// v1.5 (half the 90-second target at its height, an anchor floored there,
+/// and a 180-second interval from it on), and v1.6 (the v1.6 rule above it,
+/// an anchor floored there). Production reads
+/// [`Self::PRODUCTION`],
 /// built from the profile's constants; tests inject another schedule so an
 /// armed fork can be exercised — and real headers of another profile replayed
 /// — while the real clocks stay where they are.
@@ -74,6 +101,8 @@ pub struct DifficultySchedule {
     /// The v1.5 height, if armed: 180-second blocks from it on, and a derived
     /// target at it ([`v1_5_activation_target`]).
     pub v1_5_activation: Option<u64>,
+    /// The v1.6 height, if armed.
+    pub v1_6_activation: Option<u64>,
 }
 
 impl DifficultySchedule {
@@ -83,6 +112,7 @@ impl DifficultySchedule {
         v1_4_activation: V1_4_ACTIVATION_HEIGHT,
         v1_4_anchor_target: V1_4_ANCHOR_TARGET,
         v1_5_activation: V1_5_ACTIVATION_HEIGHT,
+        v1_6_activation: V1_6_ACTIVATION_HEIGHT,
     };
 
     /// The target a child at `height` carries verbatim, bypassing ASERT: the
@@ -104,13 +134,22 @@ impl DifficultySchedule {
 
     /// ASERT anchor height for the child of the block at `current_height`
     /// (the parent): the latest epoch boundary, floored at every armed
-    /// proof-of-work or interval change the parent has reached.
+    /// proof-of-work, interval or difficulty-rule change the parent has
+    /// reached.
     pub const fn anchor_height(&self, current_height: u64) -> u64 {
         crate::consensus::header::asert_anchor_height_with_clocks(
             current_height,
             self.v1_4_activation,
             self.v1_5_activation,
+            self.v1_6_activation,
         )
+    }
+
+    /// Whether the child at `height` is under the v1.6 rule: strictly above
+    /// the v1.6 height, so that its anchor (floored there) is at or above it.
+    /// The block AT the height keeps the v1.5 rule's target.
+    pub const fn v1_6_rule_at(&self, height: u64) -> bool {
+        matches!(self.v1_6_activation, Some(activation) if height > activation)
     }
 
     /// Target interval of the block at `height` under this schedule.
@@ -118,9 +157,15 @@ impl DifficultySchedule {
         crate::consensus::params::block_time_at_with(height, self.v1_5_activation)
     }
 
-    /// ASERT halflife for the child at `height` under this schedule.
+    /// ASERT halflife for the child at `height` under this schedule:
+    /// [`HALFLIFE_V1_6`] under the v1.6 rule ([`Self::v1_6_rule_at`]), the
+    /// v1.5 clock's halflife otherwise.
     pub const fn halflife_at(&self, height: u64) -> u64 {
-        crate::consensus::params::halflife_at_with(height, self.v1_5_activation)
+        if self.v1_6_rule_at(height) {
+            HALFLIFE_V1_6
+        } else {
+            crate::consensus::params::halflife_at_with(height, self.v1_5_activation)
+        }
     }
 
     /// Ideal elapsed time from the anchor to the parent of the child at
@@ -204,18 +249,13 @@ pub fn v1_5_activation_target(ninety_second_target: &[u8; 32]) -> [u8; 32] {
 /// ([`next_target`]) everywhere else. `anchor_*` come from the block at
 /// [`DifficultySchedule::anchor_height`] of the parent (`asert_anchor_height`),
 /// and `parent_timestamp` is the parent's — never the child's own.
-pub fn expected_target(
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
-    height: u64,
-    parent_timestamp: u64,
-) -> [u8; 32] {
+pub fn expected_target(anchor: &AnchorInfo, height: u64, parent_timestamp: u64) -> [u8; 32] {
     expected_target_in(
         &DifficultySchedule::PRODUCTION,
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
+        anchor.anchor_height,
+        anchor.anchor_timestamp,
+        anchor.anchor_parent_timestamp,
+        &anchor.anchor_target,
         height,
         parent_timestamp,
     )
@@ -226,6 +266,7 @@ pub fn expected_target_in(
     schedule: &DifficultySchedule,
     anchor_height: u64,
     anchor_timestamp: u64,
+    anchor_parent_timestamp: u64,
     anchor_target: &[u8; 32],
     height: u64,
     parent_timestamp: u64,
@@ -233,14 +274,29 @@ pub fn expected_target_in(
     if let Some(target) = schedule.boundary_target(height) {
         return target;
     }
-    let asert = next_target_in(
-        schedule,
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
-        height,
-        parent_timestamp,
-    );
+    // Above the v1.6 height ASERT runs from `A - 1`, with the anchor's target
+    // and the timestamp of the block below the anchor. Up to and at the v1.6
+    // height it runs from `A`, with the anchor's own timestamp, as
+    // released.
+    let asert = if schedule.v1_6_rule_at(height) {
+        next_target_in(
+            schedule,
+            anchor_height.saturating_sub(1),
+            anchor_parent_timestamp,
+            anchor_target,
+            height,
+            parent_timestamp,
+        )
+    } else {
+        next_target_in(
+            schedule,
+            anchor_height,
+            anchor_timestamp,
+            anchor_target,
+            height,
+            parent_timestamp,
+        )
+    };
     if schedule.is_v1_5_activation(height) {
         v1_5_activation_target(&asert)
     } else {
@@ -300,6 +356,7 @@ fn next_target_with_fix_height(
             v1_4_activation: None,
             v1_4_anchor_target: None,
             v1_5_activation: None,
+            v1_6_activation: None,
         },
         anchor_height,
         anchor_timestamp,
@@ -320,17 +377,24 @@ pub fn next_target_in(
 ) -> [u8; 32] {
     let polynomial_fix_height = schedule.polynomial_fix_height;
     let ideal = schedule.ideal_elapsed(anchor_height, height);
-    // Saturate: if timestamp < anchor, treat as 0 elapsed (can't go negative).
-    // Cap at i64::MAX to avoid overflow when casting for the exponent calculation.
-    let actual: i64 = timestamp
-        .saturating_sub(anchor_timestamp)
-        .min(i64::MAX as u64) as i64;
+    // Up to the v1.6 height: saturate — if timestamp < anchor, treat as 0
+    // elapsed — and cap at i64::MAX, as released. Above it the difference is
+    // kept as it is, negative or not.
+    // Two u64 fit an i128 difference, and `± 2^64 · 65536` an
+    // i128 product.
+    let actual: i128 = if schedule.v1_6_rule_at(height) {
+        timestamp as i128 - anchor_timestamp as i128
+    } else {
+        timestamp
+            .saturating_sub(anchor_timestamp)
+            .min(i64::MAX as u64) as i128
+    };
     let halflife = schedule.halflife_at(height) as i128;
 
     // exponent in Q16 fixed-point
     // Clamp before casting to i64 — very large diffs (e.g. u64::MAX timestamp)
     // could overflow i64 when multiplied by 65536.
-    let raw_exp = (actual as i128 - ideal as i128) * 65536 / halflife;
+    let raw_exp = (actual - ideal as i128) * 65536 / halflife;
     let exponent: i64 = raw_exp.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
     // Decompose: arithmetic right shift gives floor for negative numbers (Rust guarantees this).
@@ -1585,6 +1649,7 @@ mod tests {
             v1_4_activation: v1_4.map(|(h, _)| h),
             v1_4_anchor_target: v1_4.map(|(_, t)| t),
             v1_5_activation: v1_5,
+            v1_6_activation: None,
         }
     }
 
@@ -1623,9 +1688,14 @@ mod tests {
         #[cfg(feature = "testnet")]
         let crossed = testnet_schedule(None);
         let mut production = DifficultySchedule::PRODUCTION;
-        // The v1.5 clock is compared on its own: dormant or armed, it must
-        // never move what the earlier clocks say.
+        // The v1.5 and v1.6 clocks are compared on their own: dormant or
+        // armed, they must never move what the earlier clocks say.
         production.v1_5_activation = None;
+        assert_eq!(
+            production.v1_6_activation,
+            crate::consensus::params::V1_6_ACTIVATION_HEIGHT
+        );
+        production.v1_6_activation = None;
         assert_eq!(production, crossed);
     }
 
@@ -1653,8 +1723,10 @@ mod tests {
                 released_next_target(ah, ats, &at, h, ts, s.polynomial_fix_height),
                 "next_target diverged: {s:?} anchor {ah}@{ats} child {h}@{ts}"
             );
+            // The anchor's parent timestamp (read by the v1.6 rule only) is
+            // anything at all here.
             assert_eq!(
-                expected_target_in(s, ah, ats, &at, h, ts),
+                expected_target_in(s, ah, ats, rng.next(), &at, h, ts),
                 released_expected_target(s, ah, ats, &at, h, ts),
                 "expected_target diverged: {s:?} anchor {ah}@{ats} child {h}@{ts}"
             );
@@ -1692,7 +1764,7 @@ mod tests {
             let (ah, ats, at, h, ts) = random_input(&mut rng, j);
             assert!(h < j);
             assert_eq!(
-                expected_target_in(&s, ah, ats, &at, h, ts),
+                expected_target_in(&s, ah, ats, rng.next(), &at, h, ts),
                 released_expected_target(&s, ah, ats, &at, h, ts),
                 "child {h} < J = {j} re-judged: anchor {ah}@{ats} parent ts {ts}"
             );
@@ -1735,9 +1807,9 @@ mod tests {
                 let (_, ats, at, _, ts) = random_input(&mut rng, 10);
                 let anchor = armed.anchor_height(j - 1);
                 assert_eq!(anchor, dormant.anchor_height(j - 1));
-                let ninety = expected_target_in(&dormant, anchor, ats, &at, j, ts);
+                let ninety = expected_target_in(&dormant, anchor, ats, ats, &at, j, ts);
                 assert_eq!(
-                    expected_target_in(&armed, anchor, ats, &at, j, ts),
+                    expected_target_in(&armed, anchor, ats, ats, &at, j, ts),
                     halved(ninety),
                     "J = {j}: anchor {anchor}@{ats} parent ts {ts}"
                 );
@@ -1799,7 +1871,7 @@ mod tests {
             assert_eq!(s.block_time_at(child), 180);
             assert_eq!(s.halflife_at(child), 540);
             assert_eq!(
-                expected_target_in(&s, anchor_height, anchor_ts, &anchor, child, on_schedule),
+                expected_target_in(&s, anchor_height, anchor_ts, 0, &anchor, child, on_schedule),
                 anchor,
                 "child {child} on a 180 s schedule keeps the anchor target"
             );
@@ -1808,6 +1880,7 @@ mod tests {
                     &s,
                     anchor_height,
                     anchor_ts,
+                    0,
                     &anchor,
                     child,
                     on_schedule + 540
@@ -1821,7 +1894,7 @@ mod tests {
         let child = j + 7;
         let parent_ts = anchor_ts + 6 * 90;
         assert_eq!(
-            expected_target_in(&s, j, anchor_ts, &anchor, child, parent_ts),
+            expected_target_in(&s, j, anchor_ts, 0, &anchor, child, parent_ts),
             half
         );
         assert_eq!(
@@ -1903,10 +1976,17 @@ mod tests {
             let Some((anchor_ts, anchor_target)) = by_height.get(&anchor_height) else {
                 continue;
             };
+            // Absent only at a window's lower edge; 0 there turns any use of
+            // it into a loud mismatch.
+            let anchor_parent_ts = anchor_height
+                .checked_sub(1)
+                .and_then(|h| by_height.get(&h))
+                .map_or(0, |(ts, _)| *ts);
             let got = floor(expected_target_in(
                 schedule,
                 anchor_height,
                 *anchor_ts,
+                anchor_parent_ts,
                 anchor_target,
                 child,
                 *parent_ts,
@@ -1927,6 +2007,39 @@ mod tests {
     fn j_above(rows: &[(u64, u64, [u8; 32])]) -> u64 {
         let tip = rows.iter().map(|r| r.0).max().unwrap_or(0);
         (tip / 960 + 2) * 960
+    }
+
+    /// A private test chain (v1.5 at 36, v1.6 at K = 64), read from its
+    /// nodes (`jetsam_getBlockHeader`): the v1.6
+    /// branch from a v1.6 node, the branch a v1.5.1 node kept mining from a v1.5.1 node, the
+    /// same blocks below K. The v1.6 branch crosses K under the v1.6 rule (every target
+    /// reproduced, K included, which keeps the v1.5 rule's target); the v1.5.1 branch is the
+    /// v1.5 rule all the way; and the two rules part at K + 1, not at K.
+    #[test]
+    fn a_private_chain_crosses_v1_6_under_the_v1_6_rule_and_the_rules_part_at_k_plus_1() {
+        const K: u64 = 64;
+        let new = parse_header_rows(include_str!("testdata/headers-private-v1-6-30-76.txt"));
+        let old = parse_header_rows(include_str!("testdata/headers-private-v1-5-branch-30-90.txt"));
+        let v1_5_rule = testnet_schedule(Some(36));
+        let v1_6_rule = DifficultySchedule { v1_6_activation: Some(K), ..testnet_schedule(Some(36)) };
+        let below_k = |rows: &[(u64, u64, [u8; 32])]| rows.iter().filter(|r| r.0 < K).copied().collect::<Vec<_>>();
+        assert_eq!(below_k(&new), below_k(&old), "one chain below K");
+        let children = |rows: &[(u64, u64, [u8; 32])]| rows.len() - 1;
+        assert_eq!(replay_headers(&new, &v1_6_rule), children(&new), "the v1.6 branch, v1.6 rule");
+        assert_eq!(replay_headers(&old, &v1_5_rule), children(&old), "the v1.5.1 branch, v1.5 rule");
+        let first_mismatch = |rows: &[(u64, u64, [u8; 32])], schedule: &DifficultySchedule| {
+            let by_height: Vec<_> = rows.to_vec();
+            (K - 2..=rows.iter().map(|r| r.0).max().unwrap())
+                .find(|h| {
+                    let window: Vec<_> = by_height.iter().filter(|r| r.0 <= *h).copied().collect();
+                    replay_headers_counting(&window, schedule, false).1 > 0
+                })
+        };
+        assert_eq!(first_mismatch(&new, &v1_5_rule), Some(K + 1), "v1.6 branch under the v1.5 rule");
+        assert_eq!(first_mismatch(&old, &v1_6_rule), Some(K + 1), "v1.5.1 branch under the v1.6 rule");
+        // No jump at K: K carries the v1.5 rule's target on both branches.
+        let target_at = |rows: &[(u64, u64, [u8; 32])], h: u64| rows.iter().find(|r| r.0 == h).unwrap().2;
+        assert_eq!(target_at(&new, K), target_at(&old, K));
     }
 
     /// Real headers, three chains, through the one entry point every header
@@ -2013,5 +2126,382 @@ mod tests {
             diverged > (tip - inside) as usize / 2,
             "the replay does not discriminate"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.6: the difficulty rule above the v1.6 height
+    // (`expected_target_in`, `halflife_at`)
+    // -----------------------------------------------------------------------
+
+    use crate::consensus::params::{EPOCH_LENGTH, HALFLIFE_V1_6};
+
+    /// The public network as crossed (v1.5 at 38 400), the v1.6 clock at `k`.
+    fn mainnet_v1_6(k: Option<u64>) -> DifficultySchedule {
+        DifficultySchedule {
+            v1_6_activation: k,
+            ..mainnet_schedule(Some(38_400))
+        }
+    }
+
+    /// A target as a float, for the tests only (consensus has none).
+    fn target_f64(t: &[u8; 32]) -> f64 {
+        t.iter().rev().fold(0.0, |acc, byte| acc * 256.0 + f64::from(*byte))
+    }
+
+    /// A simulated chain under `schedule`, children `start..start+blocks`.
+    /// A constant hashrate for which `two_pow_target(228)` is the 180-second
+    /// target; solve times drawn from an exponential law (seeded).
+    /// `low_permille` and `every_block` choose which blocks take the
+    /// smallest timestamp the median rule admits.
+    /// Returns the cadence: blocks per 180 s of real time,
+    /// minus one.
+    fn simulated_cadence(
+        schedule: &DifficultySchedule,
+        start: u64,
+        blocks: u64,
+        low_permille: u64,
+        every_block: bool,
+        seed: u64,
+    ) -> f64 {
+        let t0 = two_pow_target(228);
+        let mut rng = Rng(seed);
+        // Twelve blocks on schedule at T0 before `start`.
+        let base = start - 12;
+        let mut ts: Vec<u64> = (0..12).map(|i| 1_800_000_000 + i * 180).collect();
+        let mut targets: Vec<[u8; 32]> = vec![t0; 12];
+        let at = |height: u64| (height - base) as usize;
+        let first_real = ts[11] as f64;
+        let mut real = first_real;
+        for child in start..start + blocks {
+            let parent = child - 1;
+            let anchor = schedule.anchor_height(parent);
+            let target = expected_target_in(
+                schedule,
+                anchor,
+                ts[at(anchor)],
+                ts[at(anchor - 1)],
+                &targets[at(anchor)],
+                child,
+                ts[at(parent)],
+            );
+            let u = ((rng.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            real += -u.ln() * 180.0 * target_f64(&t0) / target_f64(&target);
+            let mtp = crate::consensus::median_time_past(&ts);
+            let lowest =
+                (every_block || child % EPOCH_LENGTH == 0) && rng.below(1_000) < low_permille;
+            let stamp = if lowest {
+                mtp + 1
+            } else {
+                (real.round() as u64).max(mtp + 1)
+            };
+            ts.push(stamp);
+            targets.push(target);
+        }
+        blocks as f64 * 180.0 / (real - first_real) - 1.0
+    }
+
+    /// Under the v1.6 rule a simulated chain keeps its cadence within 2 % of
+    /// the schedule (`every_block` off); and the child of an anchor A whose
+    /// timestamp is 1 435 s above that of A - 1 carries 2^((1435 - 180) / 2160)
+    /// times the anchor target. The v1.6 height is an injected value
+    /// (39 360).
+    #[test]
+    fn the_v1_6_rule_keeps_a_simulated_chain_on_schedule() {
+        let k = 39_360;
+        let start = k + 600;
+        let armed = mainnet_v1_6(Some(k));
+        for low in [0u64, 300, 500] {
+            for seed in 0..3 {
+                let e = simulated_cadence(&armed, start, 12_000, low, false, 0xA5E7_0000 + seed);
+                assert!(e.abs() < 0.02, "{low}‰ seed {seed}: cadence {:+.2} %", e * 100.0);
+            }
+        }
+
+        // The child of an anchor A, 1 435 s above the block below it.
+        let t0 = two_pow_target(228);
+        let a = k + 42;
+        let ts_parent = 1_800_000_000u64;
+        let ts_a = ts_parent + 1_435;
+        let got = expected_target_in(&armed, a, ts_a, ts_parent, &t0, a + 1, ts_a);
+        let ratio = target_f64(&got) / target_f64(&t0);
+        let exact = 2f64.powf(1_255.0 / 2_160.0);
+        assert!((ratio / exact - 1.0).abs() < 2e-4, "{ratio} vs {exact}");
+    }
+
+    /// Every public-network target in `testdata/headers-mainnet-38390-
+    /// 39839.txt` (public RPC, read-only, `difficulty_target` little-endian)
+    /// comes back byte for byte from the one entry point, the v1.6 clock
+    /// dormant or armed above the last header. Armed inside the range, the
+    /// replay must disagree with the chain past that height: it
+    /// discriminates.
+    #[test]
+    fn public_network_targets_replay_byte_for_byte_below_v1_6() {
+        let rows = parse_header_rows(include_str!("testdata/headers-mainnet-38390-39839.txt"));
+        assert_eq!((rows[0].0, rows[rows.len() - 1].0, rows.len()), (38_390, 39_839, 1_450));
+        let checked = |schedule: &DifficultySchedule| replay_headers_counting(&rows, schedule, false);
+        // Children 38 395..=39 839 have their parent, their anchor and the
+        // anchor's parent in the file.
+        let children = 39_839 - 38_395 + 1;
+        assert_eq!(checked(&mainnet_v1_6(None)), (children, 0));
+        let above = j_above(&rows);
+        assert_eq!(checked(&mainnet_v1_6(Some(above))), (children, 0));
+        assert_eq!(replay_headers(&rows, &mainnet_v1_6(Some(above))), children);
+        let inside = 39_360;
+        let (_, diverged) = checked(&mainnet_v1_6(Some(inside)));
+        assert!(
+            diverged > (39_839 - inside) as usize / 2,
+            "armed at {inside}, only {diverged} later targets differ: the replay does not discriminate"
+        );
+    }
+
+    /// The halflife is 2 160 s for every child above the v1.6 height, and
+    /// stays 540 s up to it (the block AT the height carries the v1.5 rule's
+    /// target, see the transition test): one halflife late doubles the
+    /// target, 540 s late is a quarter of a doubling.
+    #[test]
+    fn the_halflife_is_2160_seconds_above_the_v1_6_height_only() {
+        assert_eq!(HALFLIFE_V1_6, 2_160);
+        let k = 39_360;
+        let armed = mainnet_v1_6(Some(k));
+        let dormant = mainnet_v1_6(None);
+        for child in [38_401, k - 1, k] {
+            assert_eq!(armed.halflife_at(child), 540, "child {child}");
+        }
+        for child in [k + 1, k + 6, k + 7, 1_000_000] {
+            assert_eq!(armed.halflife_at(child), 2_160, "child {child}");
+            assert_eq!(dormant.halflife_at(child), 540, "child {child}, dormant");
+        }
+        let anchor = V1_5_TEST_ANCHOR;
+        let anchor_parent_ts = 1_800_000_000u64;
+        for child in (k + 1)..=(k + 12) {
+            let a = armed.anchor_height(child - 1);
+            let on_schedule = anchor_parent_ts + (child - a) * 180;
+            let target = |late: u64| {
+                expected_target_in(&armed, a, 0, anchor_parent_ts, &anchor, child, on_schedule + late)
+            };
+            assert_eq!(target(0), anchor, "child {child} on schedule keeps the anchor target");
+            assert_eq!(target(2_160), two_pow_target(231), "child {child}: 2 160 s late doubles it");
+            let quarter = target_f64(&target(540)) / target_f64(&anchor);
+            assert!((quarter / 2f64.powf(0.25) - 1.0).abs() < 2e-4, "child {child}: {quarter}");
+        }
+    }
+
+    /// The transition: no header the chain holds is re-judged (every child
+    /// up to the height — the activation block included — gets the v1.5
+    /// target, bit for bit, whatever the anchor's parent timestamp), the
+    /// anchor is floored at the height, and the first v1.6 children start
+    /// from the activation block's target: on schedule nothing moves, and
+    /// the first step is the activation interval alone, under 2 160 s.
+    #[test]
+    fn the_v1_6_transition_rejudges_nothing_and_neither_jumps_nor_freezes() {
+        let mut rng = Rng(0x5EED_16A5_E271_0001);
+        for (round, k) in [960u64, 39_360, 64, 1_000_002].into_iter().cycle().take(40_000).enumerate() {
+            let base = match round % 3 {
+                0 => mainnet_schedule(Some(38_400)),
+                1 => testnet_schedule(Some(36)),
+                _ => schedule(0, None, None),
+            };
+            let dormant = DifficultySchedule { v1_6_activation: None, ..base };
+            let armed = DifficultySchedule { v1_6_activation: Some(k), ..base };
+            let (ah, ats, at, h, ts) = random_input(&mut rng, k + 1);
+            assert!(h <= k);
+            let apts = rng.next();
+            assert_eq!(
+                expected_target_in(&armed, ah, ats, apts, &at, h, ts),
+                expected_target_in(&dormant, ah, ats, rng.next(), &at, h, ts),
+                "child {h} <= K = {k} re-judged: anchor {ah}@{ats} parent ts {ts}"
+            );
+            let parent = rng.below(k);
+            assert_eq!(armed.anchor_height(parent), dormant.anchor_height(parent));
+        }
+        // The anchor floor (64: the private chain's height, off the 6-block grid).
+        for k in [960u64, 64, 39_360] {
+            let armed = DifficultySchedule { v1_6_activation: Some(k), ..testnet_schedule(Some(36)) };
+            assert_eq!(armed.anchor_height(k), k);
+            for parent in k..k + 30 {
+                assert_eq!(armed.anchor_height(parent), (parent / 6 * 6).max(k), "parent {parent}");
+            }
+        }
+        // No jump, no freeze: a chain on a random walk of intervals crosses K.
+        let k = 39_360u64;
+        let armed = mainnet_v1_6(Some(k));
+        let dormant = mainnet_v1_6(None);
+        let start = k - 30;
+        let mut ts: Vec<u64> = (0..12).map(|i| 1_800_000_000 + i * 180).collect();
+        let mut targets = vec![V1_5_TEST_ANCHOR; 12];
+        let base = start - 12;
+        let at = |height: u64| (height - base) as usize;
+        for child in start..k + 40 {
+            let parent = child - 1;
+            let target = |s: &DifficultySchedule| {
+                let a = s.anchor_height(parent);
+                expected_target_in(s, a, ts[at(a)], ts[at(a - 1)], &targets[at(a)], child, ts[at(parent)])
+            };
+            let got = target(&armed);
+            if child <= k {
+                assert_eq!(got, target(&dormant), "child {child}: the v1.5 target");
+            }
+            if child == k + 1 {
+                // Anchored on K, measured from K - 1.
+                let step = (ts[at(k)] as f64 - ts[at(k - 1)] as f64 - 180.0) / 2_160.0;
+                let ratio = target_f64(&got) / target_f64(&targets[at(k)]);
+                assert!((ratio / 2f64.powf(step) - 1.0).abs() < 2e-4, "first v1.6 step {ratio}");
+            }
+            ts.push(ts[at(parent)] + 1 + rng.below(720));
+            targets.push(got);
+        }
+        // On schedule across K, the target never moves.
+        let mut ts: Vec<u64> = (0..80).map(|i| 1_800_000_000 + i * 180).collect();
+        let base = k - 40;
+        let at = |height: u64| (height - base) as usize;
+        let mut targets = vec![V1_5_TEST_ANCHOR; 80];
+        for child in (k - 28)..(k + 38) {
+            let a = armed.anchor_height(child - 1);
+            let got = expected_target_in(&armed, a, ts[at(a)], ts[at(a - 1)], &targets[at(a)], child, ts[at(child - 1)]);
+            assert_eq!(got, V1_5_TEST_ANCHOR, "child {child} on schedule");
+            targets[at(child)] = got;
+            ts[at(child)] = ts[at(child - 1)] + 180;
+        }
+    }
+
+    /// Above the v1.6 height the elapsed time may be negative: a parent
+    /// whose timestamp is below that of the anchor's parent (the median rule
+    /// admits it) gives a negative span. Up to the height, the released
+    /// computation, bit for bit.
+    #[test]
+    fn the_v1_6_elapsed_time_is_signed() {
+        let k = 39_360;
+        let armed = mainnet_v1_6(Some(k));
+        let t0 = two_pow_target(228);
+        let a = k + 42;
+        let anchor_parent_ts = 1_800_000_000u64;
+        // Child A + 6: anchored on A, its parent A + 5 at 300 s below A - 1.
+        let parent_ts = anchor_parent_ts - 300;
+        let got = expected_target_in(&armed, a, anchor_parent_ts + 180, anchor_parent_ts, &t0, a + 6, parent_ts);
+        let ratio = target_f64(&got) / target_f64(&t0);
+        let exact = 2f64.powf((-300.0 - 6.0 * 180.0) / 2_160.0);
+        assert!((ratio / exact - 1.0).abs() < 2e-4, "v1.6: {ratio} vs {exact}");
+        // At and below the height: elapsed clamped at zero, as released.
+        let dormant = mainnet_v1_6(None);
+        for child in [k - 5, k] {
+            let a = dormant.anchor_height(child - 1);
+            assert_eq!(
+                expected_target_in(&armed, a, anchor_parent_ts, 0, &t0, child, parent_ts),
+                expected_target_in(&dormant, a, anchor_parent_ts, 0, &t0, child, parent_ts),
+                "child {child}"
+            );
+        }
+    }
+
+    /// Under the v1.6 rule a simulated chain keeps its cadence within 2 % of
+    /// the schedule with `every_block` on, at 100 and 300 per mille. The
+    /// v1.6 height is an injected value (39 360).
+    #[test]
+    fn the_v1_6_rule_keeps_a_simulated_chain_on_schedule_on_every_block() {
+        let k = 39_360;
+        let start = k + 600;
+        let armed = mainnet_v1_6(Some(k));
+        for low in [100u64, 300] {
+            for seed in 0..3 {
+                let e = simulated_cadence(&armed, start, 12_000, low, true, 0xB1A5_0000 + seed);
+                assert!(e.abs() < 0.02, "{low}‰ seed {seed}: cadence {:+.2} %", e * 100.0);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.6: the parent timestamp bound (`V1_6_PARENT_TIMESTAMP_LAG`)
+    // -----------------------------------------------------------------------
+
+    /// What one simulated chain returns
+    /// (`simulated_timestamps`).
+    struct TimestampRun {
+        /// Blocks per 180 s of real time, minus one.
+        cadence: f64,
+        /// A block took more than 30 days of real time.
+        dead: bool,
+    }
+
+    /// A simulated chain under `schedule`, with `floor_from` passed to
+    /// `header::lowest_admitted_timestamp_with`, children
+    /// `start..start+blocks`. A constant hashrate for which
+    /// `two_pow_target(228)` is the 180-second target; solve times drawn
+    /// from an exponential law (seeded). Timestamps are the real time raised
+    /// to the lowest admitted (the template); `share_permille` and
+    /// `earliest` choose which blocks take the lowest admitted itself.
+    /// The lowest admitted is
+    /// `header::lowest_admitted_timestamp_with`.
+    fn simulated_timestamps(
+        schedule: &DifficultySchedule,
+        floor_from: Option<u64>,
+        start: u64,
+        blocks: u64,
+        share_permille: u64,
+        earliest: bool,
+        seed: u64,
+    ) -> TimestampRun {
+        use crate::consensus::header::lowest_admitted_timestamp_with;
+        let t0 = two_pow_target(228);
+        let share = share_permille as f64 / 1_000.0;
+        let mut rng = Rng(seed);
+        let base = start - 12;
+        let mut ts: Vec<u64> = (0..12).map(|i| 1_800_000_000 + i * 180).collect();
+        let mut targets: Vec<[u8; 32]> = vec![t0; 12];
+        let at = |height: u64| (height - base) as usize;
+        let first_real = ts[11] as f64;
+        let mut real = first_real;
+        for child in start..start + blocks {
+            let parent = child - 1;
+            let anchor = schedule.anchor_height(parent);
+            let target = expected_target_in(
+                schedule,
+                anchor,
+                ts[at(anchor)],
+                ts[at(anchor - 1)],
+                &targets[at(anchor)],
+                child,
+                ts[at(parent)],
+            );
+            let u = ((rng.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            let dt = -u.ln() * 180.0 * target_f64(&t0) / target_f64(&target);
+            if dt > 30.0 * 86_400.0 {
+                return TimestampRun { cadence: -1.0, dead: true };
+            }
+            real += dt;
+            let own = (rng.below(1_000_000) as f64) < share * 1_000_000.0;
+            let lowest = lowest_admitted_timestamp_with(child, ts[at(parent)], &ts[ts.len() - 11..], floor_from);
+            let stamp = if own && earliest { lowest } else { (real.round() as u64).max(lowest) };
+            ts.push(stamp);
+            targets.push(target);
+        }
+        TimestampRun {
+            cadence: blocks as f64 * 180.0 / (real - first_real) - 1.0,
+            dead: false,
+        }
+    }
+
+    /// Under the v1.6 rule and its parent bound, a simulated chain keeps its
+    /// cadence within 2 % of the schedule at 450 and 500 per mille, on every
+    /// seed.
+    #[test]
+    fn the_parent_bound_keeps_a_simulated_chain_on_schedule() {
+        let k = 39_360;
+        let start = k + 600;
+        let armed = mainnet_v1_6(Some(k));
+        for low in [450u64, 500] {
+            for seed in 0..10 {
+                let run = simulated_timestamps(&armed, Some(k), start, 12_000, low, true, 3_516_858_368 + seed);
+                assert!(!run.dead && run.cadence.abs() < 0.02, "{low}‰ seed {seed}: cadence {:+.2} %", run.cadence * 100.0);
+            }
+        }
+    }
+
+    /// The public-network headers of `headers-mainnet-38390-39839.txt`: none
+    /// sits more than 600 s below its parent.
+    #[test]
+    fn no_mainnet_header_falls_below_the_parent_floor() {
+        let rows = parse_header_rows(include_str!("testdata/headers-mainnet-38390-39839.txt"));
+        let lag = crate::consensus::params::V1_6_PARENT_TIMESTAMP_LAG;
+        assert!(rows.windows(2).all(|w| w[1].1 + lag >= w[0].1));
     }
 }

@@ -4,8 +4,8 @@
 
 //! Cache-resident proof-of-work — the post-v1.4 mining digest.
 //!
-//! DORMANT. Nothing below [`crate::consensus::params::V1_4_ACTIVATION_HEIGHT`]
-//! calls this, and that constant ships as `None`. Every block already on either
+//! Nothing below [`crate::consensus::params::V1_4_ACTIVATION_HEIGHT`]
+//! calls this (24 846 on the public profile). Every block already on either
 //! chain keeps its digest.
 //!
 //! # Where the function lives, and why not here

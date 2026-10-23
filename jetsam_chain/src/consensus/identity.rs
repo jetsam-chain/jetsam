@@ -69,11 +69,22 @@ macro_rules! protocol_namespace {
 
 /// The test chain's namespace. Two nodes on different namespaces never get as
 /// far as offering each other a block: they part at the handshake.
-#[cfg(feature = "testnet")]
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
 #[macro_export]
 macro_rules! protocol_namespace {
     () => {
         "/jetsam/testnet"
+    };
+}
+
+/// **Private builds only** (`rehearsal-v1-6`): a namespace of their
+/// own, so a private node, whose clocks are not the test chain's, parts
+/// from every test node at the handshake.
+#[cfg(feature = "rehearsal-v1-6")]
+#[macro_export]
+macro_rules! protocol_namespace {
+    () => {
+        "/jetsam/rehearsal-v1-6"
     };
 }
 
@@ -101,8 +112,11 @@ pub const DEFAULT_RPC_PORT: u16 = 9711;
 pub const DATA_DIR_NAME: &str = "jetsam";
 /// A separate directory: a test node can never open, and never overwrite, the
 /// state of a mainnet node running on the same machine.
-#[cfg(feature = "testnet")]
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
 pub const DATA_DIR_NAME: &str = "jetsam-testnet";
+/// **Private builds only**: never the test node's state.
+#[cfg(feature = "rehearsal-v1-6")]
+pub const DATA_DIR_NAME: &str = "jetsam-rehearsal-v1-6";
 
 #[cfg(test)]
 mod tests {

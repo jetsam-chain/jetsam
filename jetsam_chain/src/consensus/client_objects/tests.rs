@@ -1826,9 +1826,9 @@ fn the_judged_leaves_through_a_suffix_are_the_base_registry_then_its_accepted_re
 // ---- The closed catalogue (decision of 2026-10-04, confirmed 2026-10-07) ----
 
 /// The burn rules, `catalogue` the tools allowed to register.
-fn catalogue_rules(catalogue: &'static [Digest]) -> ClientObjectRules {
+fn catalogue_rules(catalogue: &[Digest]) -> ClientObjectRules {
     ClientObjectRules {
-        catalogue,
+        catalogue: test_rules::listing(catalogue),
         ..burn_rules()
     }
 }
@@ -1846,8 +1846,10 @@ fn from_hex(hex: &str) -> Digest {
 /// the example client the registration rehearsals use (`D` of the matrix
 /// `jetsam_client_demo` writes), then a computed batch of 128 of its
 /// statements (`D` of the matrix `jetsam_client_batch_demo` writes), a test
-/// entry of the off-chain prototype. Append-only: entry 1 keeps index 0.
-/// Never the null digest, never twice.
+/// entry of the off-chain prototype, each pinned to its matrix file (root and
+/// length measured on the files test network 3 registered and holds,
+/// 2026-10-11). Append-only: entry 1 keeps index 0. Never the null digest,
+/// never twice, never without its pin.
 #[test]
 fn the_catalogue_is_a_consensus_constant_of_each_profile() {
     assert_eq!(ClientObjectRules::CONSENSUS.catalogue, CLIENT_CATALOGUE);
@@ -1855,16 +1857,125 @@ fn the_catalogue_is_a_consensus_constant_of_each_profile() {
         assert_eq!(
             CLIENT_CATALOGUE,
             &[
-                from_hex("87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f"),
-                from_hex("32796d826b530e03b8844214e3403a680d8ed7b0b92c2adc47176a74c5b21464"),
+                CatalogueEntry {
+                    matrix_digest: from_hex(
+                        "87c1a7b0f56527198e46b18997e8d2f5293a2bc41bc91053a8a361c383977d7f"
+                    ),
+                    matrix_file_root: from_hex(
+                        "9ed90bff4be01db73d5097cb699437c4529d71bf10c593c41adb23cc2961259b"
+                    ),
+                    matrix_file_len: 9_911_119,
+                },
+                CatalogueEntry {
+                    matrix_digest: from_hex(
+                        "32796d826b530e03b8844214e3403a680d8ed7b0b92c2adc47176a74c5b21464"
+                    ),
+                    matrix_file_root: from_hex(
+                        "1285c72af671ab5387c4e5565dd8c6a957e51b65b4e03bef7ab319ac7598327f"
+                    ),
+                    matrix_file_len: 212_931_651,
+                },
             ]
         );
     } else {
         assert!(CLIENT_CATALOGUE.is_empty(), "{CLIENT_CATALOGUE:?}");
     }
-    assert!(!CLIENT_CATALOGUE.contains(&[0u8; 32]));
-    let distinct: BTreeSet<&Digest> = CLIENT_CATALOGUE.iter().collect();
+    assert!(catalogue_is_pinned(CLIENT_CATALOGUE));
+    let distinct: BTreeSet<&Digest> = CLIENT_CATALOGUE
+        .iter()
+        .map(|entry| &entry.matrix_digest)
+        .collect();
     assert_eq!(distinct.len(), CLIENT_CATALOGUE.len());
+    for entry in CLIENT_CATALOGUE {
+        assert!(ClientObjectRules::CONSENSUS.lists(&entry.matrix_digest));
+        assert_eq!(
+            ClientObjectRules::CONSENSUS.pinned_file(&entry.matrix_digest),
+            Some(entry)
+        );
+    }
+}
+
+/// An entry without its pin does not compile —
+/// the guard `catalogue_is_pinned` refuses a null `D` or root, a null length
+/// or one beyond the cap, and a `D` listed twice (this crate asserts it of
+/// each profile's catalogue at compile time).
+#[test]
+fn a_catalogue_entry_without_its_pin_is_refused() {
+    let pinned = CatalogueEntry {
+        matrix_digest: [0xD1; 32],
+        matrix_file_root: [0x2E; 32],
+        matrix_file_len: 4_096,
+    };
+    assert!(catalogue_is_pinned(&[]));
+    assert!(catalogue_is_pinned(&[pinned]));
+    for unpinned in [
+        CatalogueEntry {
+            matrix_file_root: [0u8; 32],
+            ..pinned
+        },
+        CatalogueEntry {
+            matrix_file_len: 0,
+            ..pinned
+        },
+        CatalogueEntry {
+            matrix_file_len: CLIENT_MATRIX_MAX_FILE_BYTES + 1,
+            ..pinned
+        },
+        CatalogueEntry {
+            matrix_digest: [0u8; 32],
+            ..pinned
+        },
+    ] {
+        assert!(!catalogue_is_pinned(&[unpinned]), "{unpinned:?}");
+        assert!(!catalogue_is_pinned(&[pinned, unpinned]), "{unpinned:?}");
+    }
+    assert!(catalogue_is_pinned(&[CatalogueEntry {
+        matrix_file_len: CLIENT_MATRIX_MAX_FILE_BYTES,
+        ..pinned
+    }]));
+    // The same `D` twice, even with the same file.
+    assert!(!catalogue_is_pinned(&[pinned, pinned]));
+    assert!(!catalogue_is_pinned(&[
+        pinned,
+        CatalogueEntry {
+            matrix_file_root: [0x2F; 32],
+            ..pinned
+        }
+    ]));
+}
+
+/// The pin is node policy, not a consensus rule: a registration of a listed
+/// `D` naming another file root or length is judged exactly as before (the
+/// block carrying it is valid). Making the chain refuse it is a release of
+/// its own (CatalogueEntry).
+#[test]
+fn the_pin_is_no_consensus_rule() {
+    let rules = ClientObjectRules {
+        catalogue: &[CatalogueEntry {
+            matrix_digest: [0x41; 32],
+            matrix_file_root: [0x2E; 32],
+            matrix_file_len: 4_096,
+        }],
+        ..burn_rules()
+    };
+    for (root, len) in [([0x2E; 32], 4_096), ([0x99; 32], 4_096), ([0x2E; 32], 13)] {
+        let object = ClientRegistration {
+            matrix_digest: [0x41; 32],
+            matrix_file_root: root,
+            matrix_file_len: len,
+        };
+        let pays = paid_registration(100, object);
+        assert_eq!(check_registration_payment(&pays, &object, &rules), Ok(()));
+        let effect = validate(
+            &block(vec![pays]),
+            &[ClientObject::Registration(object)],
+            &ClientRegistryState::new(),
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(effect.registrations[0].matrix_file_root, root);
+        assert_eq!(effect.registrations[0].matrix_file_len, len);
+    }
 }
 
 /// A registration whose `D` is not in the catalogue makes its block invalid,
@@ -1930,7 +2041,7 @@ fn the_profiles_catalogue_admits_exactly_its_tools() {
     let lengths = [9_911_119, 212_931_651];
     for (matrix_digest, matrix_file_len) in CLIENT_CATALOGUE
         .iter()
-        .flat_map(|d| lengths.map(|len| (d, len)))
+        .flat_map(|entry| lengths.map(|len| (&entry.matrix_digest, len)))
     {
         let object = ClientRegistration {
             matrix_digest: *matrix_digest,
@@ -1950,7 +2061,7 @@ fn the_profiles_catalogue_admits_exactly_its_tools() {
         assert_eq!(effect.registrations[0].active_from, HEIGHT + 480);
     }
     let outsider = registration(1);
-    assert!(!CLIENT_CATALOGUE.contains(&outsider.matrix_digest));
+    assert!(!ClientObjectRules::CONSENSUS.lists(&outsider.matrix_digest));
     let refused = ClientObjectError::NotInCatalogue {
         matrix_digest: outsider.matrix_digest,
     };
@@ -2318,6 +2429,7 @@ fn a_block_carrying_a_client_not_yet_active_under_the_short_rule_is_refused() {
     let view = TerminalClientView {
         carried: Some(carried),
         registry_leaves: Some(registry_leaves_after(&registry, &none)),
+        batch: None,
     };
     assert_eq!(
         check_terminal_client_view(&view, &none, &registry, SHORT_FROM - 1, &rules),
@@ -2452,10 +2564,10 @@ fn the_test_network_shortens_the_activation_from_its_declared_height() {
     assert_eq!(rules.short_activation_from, CLIENT_SHORT_ACTIVATION_FROM);
     assert_eq!(rules.short_activation_delay, 20);
     assert_eq!(rules.activation_delay, 480);
-    assert_eq!(
-        rules.activation_delay_at(TESTNET_SHORT_ACTIVATION_HEIGHT - 1),
-        480
-    );
+    // The private build declares 0: no height before it.
+    if let Some(before) = TESTNET_SHORT_ACTIVATION_HEIGHT.checked_sub(1) {
+        assert_eq!(rules.activation_delay_at(before), 480);
+    }
     assert_eq!(rules.activation_delay_at(TESTNET_SHORT_ACTIVATION_HEIGHT), 20);
 }
 
@@ -2543,6 +2655,7 @@ fn b2_the_tip_view_is_judged_on_the_judged_registry() {
             &TerminalClientView {
                 carried: None,
                 registry_leaves: Some(leaves.clone()),
+                batch: None,
             },
             HEIGHT,
             &rules
@@ -2555,6 +2668,7 @@ fn b2_the_tip_view_is_judged_on_the_judged_registry() {
             &TerminalClientView {
                 carried: None,
                 registry_leaves: Some(leaves.clone()),
+                batch: None,
             },
             HEIGHT,
             &rules
@@ -2581,6 +2695,7 @@ fn b2_the_tip_view_is_judged_on_the_judged_registry() {
                 io_commitment: digest(0x99),
             }),
             registry_leaves: Some(judged.tip_leaves()),
+            batch: None,
         },
         HEIGHT,
         &rules,
@@ -2647,4 +2762,633 @@ fn b2_below_the_v1_5_height_a_suffix_is_not_judged() {
     .unwrap();
     assert!(judged.tip_parent_registry.is_empty(), "truncated to the base height");
     assert_eq!(judged.tip_effect, ClientObjectsEffect::default());
+}
+
+// ---------------------------------------------------------------------------
+// v1.6: the batch slot
+// ---------------------------------------------------------------------------
+
+/// The v1.6 height of these tests (above the v1.5 height, 100), and a
+/// height above it where the test registries (registered at 10, active from
+/// 490) are carriable.
+const V1_6: u64 = 960;
+const H16: u64 = 1_000;
+const BATCH_CLASS: Digest = [0xBA; 32];
+
+fn batch_rules() -> ClientBatchRules {
+    ClientBatchRules {
+        activation_height: Some(V1_6),
+        batch_class: Some(BATCH_CLASS),
+        max_clients: CLIENT_BATCH_MAX_CLIENTS,
+        // Every uniform digest is of form Z here, as every one is in the
+        // v1.5 catalogue of these tests; the form-Z tests narrow it.
+        catalogue: &test_rules::UNIFORM_CATALOGUE,
+    }
+}
+
+fn batch(root: u8, count: u32) -> ClientBatchSubmission {
+    ClientBatchSubmission {
+        batch_class: BATCH_CLASS,
+        statements_root: digest(root),
+        count,
+    }
+}
+
+fn paid_batch(slot_base: u32, object: ClientBatchSubmission, extra_fee: u64) -> Vec<Transaction> {
+    let marker = ClientObject::BatchSubmission(object).marker();
+    logical(slot_base, PAYER, &[(marker, 0)], required_fee(1, 1) + extra_fee)
+}
+
+fn validate_v16(
+    block: &Block,
+    objects: &[ClientObject],
+    registry: &ClientRegistryState,
+    batch: &ClientBatchRules,
+) -> Result<ClientObjectsEffect, ClientObjectError> {
+    validate_block_client_objects_with(
+        block,
+        objects,
+        &header(block.header.height - 1),
+        registry,
+        &burn_rules(),
+        batch,
+    )
+}
+
+fn carried_batch(root: u8, count: u64, used: &[usize]) -> CarriedBatch {
+    CarriedBatch {
+        statements_root: digest(root),
+        count,
+        mask: (0..CLIENT_REGISTRY_CAPACITY).map(|index| used.contains(&index)).collect(),
+    }
+}
+
+/// The batch rules of this binary are dormant at [`HEIGHT`]: no v1.6 height
+/// on the public profile, a v1.6 height above it on the test profile once
+/// armed; the entry points without `_with` apply exactly them.
+#[test]
+fn the_consensus_batch_rules_are_dormant() {
+    assert_eq!(
+        ClientBatchRules::CONSENSUS,
+        ClientBatchRules {
+            activation_height: crate::consensus::params::V1_6_ACTIVATION_HEIGHT,
+            batch_class: CLIENT_BATCH_CLASS,
+            max_clients: 1 << 16,
+            catalogue: CLIENT_CATALOGUE_Z,
+        }
+    );
+    #[cfg(not(feature = "testnet"))]
+    assert_eq!(ClientBatchRules::CONSENSUS.activation_height, None);
+    assert!(
+        ClientBatchRules::CONSENSUS
+            .activation_height
+            .is_none_or(|activation| HEIGHT < activation),
+        "the block below is built under the v1.6 height"
+    );
+    assert_eq!(ClientBatchRules::current(), ClientBatchRules::CONSENSUS);
+    let object = batch(0x21, 3);
+    let block = block_at(HEIGHT, vec![paid_batch(100, object, MICRO_PER_JTM)]);
+    let objects = [ClientObject::BatchSubmission(object)];
+    let registry = registry_with(2, 100);
+    assert_eq!(
+        validate(&block, &objects, &registry, &burn_rules()),
+        validate_v16(&block, &objects, &registry, &ClientBatchRules::CONSENSUS),
+    );
+    assert_eq!(
+        validate(&block, &objects, &registry, &burn_rules()),
+        Err(ClientObjectError::ObjectsDoNotMatchMarkers),
+        "dormant: the batch marker is an ordinary output"
+    );
+}
+
+/// A batch submission travels in the object section like the v1.5 objects:
+/// a fixed, canonical encoding under its own tag, and a marker that commits
+/// to every field under its own 8-byte tag.
+#[test]
+fn a_batch_submission_round_trips_and_its_marker_commits_to_every_field() {
+    let object = ClientObject::BatchSubmission(batch(0x21, 7));
+    let mut bytes = Vec::new();
+    object.encode(&mut bytes);
+    assert_eq!(bytes.len(), object.wire_len());
+    assert_eq!(bytes.len(), 1 + 32 + 32 + 4);
+    assert_eq!(bytes[0], 3);
+    assert_eq!(ClientObject::decode(&mut bytes.as_slice()), Ok(object));
+    assert_eq!(
+        ClientObject::decode(&mut &bytes[..bytes.len() - 1]),
+        Err(WireError::Truncated)
+    );
+    let marker = object.marker();
+    assert_eq!(marker.0[..8], *b"JTMCBAT1");
+    assert_eq!(marker.0[..8], CLIENT_BATCH_SUBMISSION_MARKER_TAG);
+    for other in [
+        ClientBatchSubmission { batch_class: [0xBB; 32], ..batch(0x21, 7) },
+        batch(0x22, 7),
+        batch(0x21, 8),
+    ] {
+        assert_ne!(ClientObject::BatchSubmission(other).marker(), marker);
+    }
+    // Not the marker of the v1.5 submission with the same bytes.
+    let v15 = ClientObject::Submission(ClientSubmission {
+        matrix_digest: BATCH_CLASS,
+        io_commitment: digest(0x21),
+    });
+    assert_ne!(v15.marker().0[8..], marker.0[8..]);
+}
+
+/// Below the v1.6 height nothing of the batch slot exists: the batch tag is
+/// no marker (an output carrying it is ordinary, may be spent), and a batch
+/// object is refused — the v1.5 rules, unchanged.
+#[test]
+fn below_v1_6_the_batch_tag_is_an_ordinary_output() {
+    let rules = batch_rules();
+    let object = batch(0x21, 3);
+    let marker = ClientObject::BatchSubmission(object).marker();
+    for height in [ACTIVATION, V1_6 - 1] {
+        assert_eq!(client_object_marker_kind_at(&marker, height, &rules), None);
+        assert!(!is_client_locked_address_at(&marker, height, &rules));
+        // A plain output to that owner: an ordinary block.
+        let plain = block_at(height, vec![logical(100, PAYER, &[(marker, 0)], required_fee(1, 1))]);
+        assert_eq!(
+            validate_v16(&plain, &[], &registry_with(1, 10), &rules).map(|effect| effect.batch_submission),
+            Ok(None)
+        );
+        // The object attached: it opens no marker.
+        assert_eq!(
+            validate_v16(&plain, &[ClientObject::BatchSubmission(object)], &registry_with(1, 10), &rules),
+            Err(ClientObjectError::ObjectsDoNotMatchMarkers)
+        );
+        // Spending from that owner is an ordinary spend.
+        let from_marker = block_at(height, vec![logical(100, marker, &[(PAYER, 1)], required_fee(1, 1))]);
+        assert_eq!(validate_v16(&from_marker, &[], &registry_with(1, 10), &rules), Ok(ClientObjectsEffect::default()));
+    }
+    for height in [V1_6, H16] {
+        assert_eq!(
+            client_object_marker_kind_at(&marker, height, &rules),
+            Some(ClientObjectKind::BatchSubmission)
+        );
+        assert!(is_client_locked_address_at(&marker, height, &rules));
+        let from_marker = block_at(height, vec![logical(100, marker, &[(PAYER, 1)], required_fee(1, 1))]);
+        assert_eq!(
+            validate_v16(&from_marker, &[], &registry_with(1, 10), &rules),
+            Err(ClientObjectError::SpendFromLockedAddress { owner: marker })
+        );
+    }
+}
+
+/// At a v1.6 height a block pays one batch of the chain's class, at the
+/// submission fee; the effect names it.
+#[test]
+fn a_v1_6_block_pays_one_batch_of_the_chains_class() {
+    let rules = batch_rules();
+    let registry = registry_with(2, 10);
+    let object = batch(0x21, 3);
+    let block = block_at(H16, vec![paid_batch(100, object, MICRO_PER_JTM)]);
+    let effect = validate_v16(&block, &[ClientObject::BatchSubmission(object)], &registry, &rules).unwrap();
+    assert_eq!(effect.batch_submission, Some(object));
+    assert_eq!(effect.submission, None);
+    // One batch per block.
+    let second = batch(0x22, 1);
+    let two = block_at(
+        H16,
+        vec![paid_batch(100, object, MICRO_PER_JTM), paid_batch(200, second, MICRO_PER_JTM)],
+    );
+    assert_eq!(
+        validate_v16(
+            &two,
+            &[ClientObject::BatchSubmission(object), ClientObject::BatchSubmission(second)],
+            &registry,
+            &rules
+        ),
+        Err(ClientObjectError::TooManySubmissions)
+    );
+    // The fee of a submission, not less.
+    let cheap = block_at(H16, vec![paid_batch(100, object, MICRO_PER_JTM - 1)]);
+    assert_eq!(
+        validate_v16(&cheap, &[ClientObject::BatchSubmission(object)], &registry, &rules),
+        Err(ClientObjectError::SubmissionFeeTooLow {
+            required: required_fee(1, 1) + MICRO_PER_JTM,
+            paid: required_fee(1, 1) + MICRO_PER_JTM - 1,
+        })
+    );
+}
+
+/// A v1.6 block's client slot carries a batch: a v1.5 client submission is
+/// refused there, alone or beside a batch.
+#[test]
+fn a_v1_6_block_refuses_a_v1_5_client_submission() {
+    let rules = batch_rules();
+    let registry = registry_with(2, 10);
+    let object = submission(0x11, 0x99);
+    let block = block_at(H16, vec![paid_submission(100, object, MICRO_PER_JTM)]);
+    assert_eq!(
+        validate_v16(&block, &[ClientObject::Submission(object)], &registry, &rules),
+        Err(ClientObjectError::ClientSubmissionInBatchSlot)
+    );
+    // Below the v1.6 height the same block is the v1.5 one, accepted.
+    let v15 = block_at(V1_6 - 1, vec![paid_submission(100, object, MICRO_PER_JTM)]);
+    assert_eq!(
+        validate_v16(&v15, &[ClientObject::Submission(object)], &registry_with(2, 10), &rules)
+            .map(|effect| effect.submission),
+        Ok(Some(object))
+    );
+}
+
+/// The class a batch names is the chain's; while the class is not a
+/// consensus constant no batch is valid; its count is 1 to the bound.
+#[test]
+fn a_batch_of_another_class_or_count_is_refused() {
+    let registry = registry_with(2, 10);
+    let check = |object: ClientBatchSubmission, rules: &ClientBatchRules| {
+        let block = block_at(H16, vec![paid_batch(100, object, MICRO_PER_JTM)]);
+        validate_v16(&block, &[ClientObject::BatchSubmission(object)], &registry, rules)
+    };
+    let foreign = ClientBatchSubmission { batch_class: [0xBB; 32], ..batch(0x21, 3) };
+    assert_eq!(
+        check(foreign, &batch_rules()),
+        Err(ClientObjectError::ForeignBatchClass { batch_class: [0xBB; 32] })
+    );
+    let unset = ClientBatchRules { batch_class: None, ..batch_rules() };
+    assert_eq!(check(batch(0x21, 3), &unset), Err(ClientObjectError::BatchClassUnset));
+    assert_eq!(
+        check(batch(0x21, 0), &batch_rules()),
+        Err(ClientObjectError::BatchCount { count: 0, max: CLIENT_BATCH_MAX_CLIENTS })
+    );
+    assert_eq!(
+        check(batch(0x21, CLIENT_BATCH_MAX_CLIENTS + 1), &batch_rules()),
+        Err(ClientObjectError::BatchCount {
+            count: u64::from(CLIENT_BATCH_MAX_CLIENTS) + 1,
+            max: CLIENT_BATCH_MAX_CLIENTS
+        })
+    );
+    assert!(check(batch(0x21, CLIENT_BATCH_MAX_CLIENTS), &batch_rules()).is_ok());
+    assert!(check(batch(0x21, 1), &batch_rules()).is_ok());
+}
+
+/// The batch a v1.6 terminal carries: a paid batch must be it (root and
+/// count), a carried one needs no payment, covers 1 to the bound clients and
+/// uses only entries carriable at the block's height.
+#[test]
+fn a_paid_batch_must_be_the_carried_one() {
+    let rules = burn_rules();
+    let batch_rules = batch_rules();
+    let registry = registry_with(2, 100); // active from 580
+    let leaves = registry_leaves_after(&registry, &ClientObjectsEffect::default());
+    let object = batch(0x21, 3);
+    let paid = ClientObjectsEffect { batch_submission: Some(object), ..ClientObjectsEffect::default() };
+    let carried = carried_batch(0x21, 3, &[0, 1]);
+    let check = |effect: &ClientObjectsEffect, carried: Option<&CarriedBatch>, height: u64| {
+        check_carried_batch(effect, carried, &leaves, &registry, height, &rules, &batch_rules)
+    };
+    assert_eq!(check(&paid, Some(&carried), 600), Ok(()));
+    assert_eq!(check(&paid, None, 600), Err(ClientObjectError::BatchSubmissionNotCarried));
+    for other in [carried_batch(0x22, 3, &[0, 1]), carried_batch(0x21, 4, &[0, 1])] {
+        assert_eq!(check(&paid, Some(&other), 600), Err(ClientObjectError::BatchSubmissionNotCarried));
+    }
+    // Carried for free.
+    let none = ClientObjectsEffect::default();
+    assert_eq!(check(&none, None, 600), Ok(()));
+    assert_eq!(check(&none, Some(&carried), 600), Ok(()));
+    // Its count.
+    assert_eq!(
+        check(&none, Some(&carried_batch(0x21, 0, &[0])), 600),
+        Err(ClientObjectError::BatchCount { count: 0, max: CLIENT_BATCH_MAX_CLIENTS })
+    );
+    assert_eq!(
+        check(&none, Some(&carried_batch(0x21, u64::from(CLIENT_BATCH_MAX_CLIENTS) + 1, &[0])), 600),
+        Err(ClientObjectError::BatchCount {
+            count: u64::from(CLIENT_BATCH_MAX_CLIENTS) + 1,
+            max: CLIENT_BATCH_MAX_CLIENTS
+        })
+    );
+    // Its entries: carriable at the block's height, by the one predicate.
+    assert_eq!(
+        check(&none, Some(&carried), 579),
+        Err(ClientObjectError::ClientNotYetActive { matrix_digest: digest(0x10), active_from: 580 })
+    );
+    assert_eq!(
+        check(&none, Some(&carried_batch(0x21, 1, &[2])), 600),
+        Err(ClientObjectError::ClientNotRegistered { matrix_digest: [0u8; 32] }),
+        "a batch using an empty entry"
+    );
+}
+
+/// The mask check alone: used entries carriable, unused ones asked nothing,
+/// the entry found at the mask's index.
+#[test]
+fn a_batch_uses_only_carriable_entries() {
+    let rules = burn_rules();
+    let mut registry = registry_with(1, 100); // entry 0 = 0x10, active from 580
+    registry.apply(&ClientObjectsEffect {
+        registrations: vec![entry(1, 0x11, 500, LicenseSplit { burn: LICENSE, ..LicenseSplit::default() })],
+        ..ClientObjectsEffect::default()
+    }); // entry 1 = 0x11, active from 980
+    let leaves = registry_leaves_after(&registry, &ClientObjectsEffect::default());
+    let mask = |used: &[usize]| -> Vec<bool> {
+        (0..CLIENT_REGISTRY_CAPACITY).map(|index| used.contains(&index)).collect()
+    };
+    assert_eq!(check_batch_mask_carriable(&mask(&[0]), &leaves, &registry, 600, &rules), Ok(()));
+    assert_eq!(
+        check_batch_mask_carriable(&mask(&[0, 1]), &leaves, &registry, 600, &rules),
+        Err(ClientObjectError::ClientNotYetActive { matrix_digest: digest(0x11), active_from: 980 })
+    );
+    assert_eq!(check_batch_mask_carriable(&mask(&[0, 1]), &leaves, &registry, 980, &rules), Ok(()));
+    assert_eq!(check_batch_mask_carriable(&mask(&[]), &leaves, &registry, 1, &rules), Ok(()));
+    // The leaves swapped: each entry is registered, but not at the mask's index.
+    let mut swapped = leaves.clone();
+    swapped.swap(0, 1);
+    assert_eq!(
+        check_batch_mask_carriable(&mask(&[0]), &swapped, &registry, 1_000, &rules),
+        Err(ClientObjectError::ClientNotRegistered { matrix_digest: digest(0x11) })
+    );
+}
+
+/// A v1.6 terminal publishes the chain's registry leaves like a v1.5 one,
+/// carries no client lanes, and its batch is checked; a v1.5 terminal
+/// carries no batch.
+#[test]
+fn a_v1_6_terminal_carries_a_batch_and_no_client() {
+    let rules = burn_rules();
+    let batch_rules = batch_rules();
+    let registry = registry_with(2, 10);
+    let effect = ClientObjectsEffect::default();
+    let leaves = registry_leaves_after(&registry, &effect);
+    let view = |carried: Option<CarriedClient>, batch: Option<CarriedBatch>, leaves: Vec<Digest>| {
+        TerminalClientView { carried, registry_leaves: Some(leaves), batch }
+    };
+    let check = |view: &TerminalClientView, height: u64| {
+        check_terminal_client_view_with(view, &effect, &registry, height, &rules, &batch_rules)
+    };
+    let a_batch = carried_batch(0x21, 2, &[0]);
+    let a_client = CarriedClient { matrix_digest: digest(0x10), io_commitment: digest(0x99) };
+    assert_eq!(check(&view(None, Some(a_batch.clone()), leaves.clone()), H16), Ok(()));
+    assert_eq!(check(&view(None, None, leaves.clone()), H16), Ok(()));
+    assert_eq!(
+        check(&view(Some(a_client), None, leaves.clone()), H16),
+        Err(ClientObjectError::UnexpectedClientLanes)
+    );
+    let mut wrong = leaves.clone();
+    wrong[5] = digest(0x55);
+    assert_eq!(
+        check(&view(None, Some(a_batch.clone()), wrong), H16),
+        Err(ClientObjectError::RegistryLeavesMismatch)
+    );
+    assert_eq!(
+        check(&view(None, Some(carried_batch(0x21, 2, &[0, 7])), leaves.clone()), H16),
+        Err(ClientObjectError::ClientNotRegistered { matrix_digest: [0u8; 32] })
+    );
+    // Below v1.6: the v1.5 view, no batch.
+    assert_eq!(check(&view(Some(a_client), None, leaves.clone()), V1_6 - 1), Ok(()));
+    assert_eq!(
+        check(&view(None, Some(a_batch.clone()), leaves.clone()), V1_6 - 1),
+        Err(ClientObjectError::UnexpectedBatchLanes)
+    );
+    // Below v1.5: nothing at all.
+    assert_eq!(
+        check(&TerminalClientView { batch: Some(a_batch), ..TerminalClientView::default() }, ACTIVATION - 1),
+        Err(ClientObjectError::UnexpectedClientLanes)
+    );
+    assert_eq!(check(&TerminalClientView::default(), ACTIVATION - 1), Ok(()));
+}
+
+/// Mempool policy at a v1.6 height: a plain transaction paying a batch
+/// (its marker) is mined only with its object, and a batch marker owner
+/// cannot spend; below v1.6 both are ordinary.
+#[test]
+fn a_plain_transaction_pays_no_batch_and_spends_no_batch_marker() {
+    let rules = burn_rules();
+    let batch_rules = batch_rules();
+    let marker = ClientObject::BatchSubmission(batch(0x21, 3)).marker();
+    let pages = |owner: Address, outputs: &[(Address, u64)]| -> Vec<jetsam_tx::TxPage> {
+        logical(100, owner, outputs, 10)
+            .into_iter()
+            .map(|tx| jetsam_tx::TxPage { body: tx.body })
+            .collect()
+    };
+    let paying = pages(PAYER, &[(marker, 0)]);
+    let from_marker = pages(marker, &[(PAYER, 1)]);
+    assert_eq!(
+        check_plain_transaction_with(&paying, V1_6, &rules, &batch_rules),
+        Err(ClientObjectError::PaymentWithoutObject)
+    );
+    assert_eq!(
+        check_plain_transaction_with(&from_marker, V1_6, &rules, &batch_rules),
+        Err(ClientObjectError::SpendFromLockedAddress { owner: marker })
+    );
+    for pages in [&paying, &from_marker] {
+        assert_eq!(check_plain_transaction_with(pages, V1_6 - 1, &rules, &batch_rules), Ok(()));
+        assert_eq!(check_plain_transaction(pages, H16, &rules), Ok(()), "dormant binary");
+    }
+}
+
+/// A payment names exactly one batch submission: one marker, of zero value,
+/// opening it.
+#[test]
+fn a_payment_names_exactly_one_batch() {
+    let object = batch(0x21, 3);
+    let marker = ClientObject::BatchSubmission(object).marker();
+    let pages = |outputs: &[(Address, u64)]| -> Vec<jetsam_tx::TxPage> {
+        logical(100, PAYER, outputs, 10)
+            .into_iter()
+            .map(|tx| jetsam_tx::TxPage { body: tx.body })
+            .collect()
+    };
+    assert!(pays_batch_submission(&pages(&[(marker, 0)]), &object));
+    assert!(pays_batch_submission(&pages(&[(TREASURY, 3), (marker, 0)]), &object));
+    assert!(!pays_batch_submission(&pages(&[(TREASURY, 3)]), &object));
+    assert!(!pays_batch_submission(&pages(&[(marker, 1)]), &object));
+    assert!(!pays_batch_submission(&pages(&[(marker, 0), (marker, 0)]), &object));
+    assert!(!pays_batch_submission(&pages(&[(marker, 0)]), &batch(0x21, 4)));
+    let v15 = ClientObject::Submission(submission(0x10, 0x20)).marker();
+    assert!(!pays_batch_submission(&pages(&[(marker, 0), (v15, 0)]), &object));
+}
+
+// ---------------------------------------------------------------------------
+// v1.6: the form-Z catalogue
+// ---------------------------------------------------------------------------
+
+/// The form-Z catalogue of each profile is pinned and shares no `D` with the
+/// v1.5 catalogue (a matrix is of one form); the public network lists none.
+#[test]
+fn the_form_z_catalogue_is_pinned_and_apart_from_the_v1_5_one() {
+    assert!(catalogue_is_pinned(CLIENT_CATALOGUE_Z));
+    for entry in CLIENT_CATALOGUE_Z {
+        assert!(!ClientObjectRules::CONSENSUS.lists(&entry.matrix_digest), "{entry:?}");
+        assert!(ClientBatchRules::CONSENSUS.lists(&entry.matrix_digest));
+    }
+    for entry in CLIENT_CATALOGUE {
+        assert!(!ClientBatchRules::CONSENSUS.lists(&entry.matrix_digest), "{entry:?}");
+    }
+    if crate::consensus::identity::IS_TEST_CHAIN {
+        assert_eq!(CLIENT_CATALOGUE_Z.len(), 2);
+    } else {
+        assert!(CLIENT_CATALOGUE_Z.is_empty());
+    }
+    assert_eq!(ClientBatchRules::CONSENSUS.catalogue, CLIENT_CATALOGUE_Z);
+}
+
+/// On the chain: every entry a carried batch uses is a form-Z
+/// catalogue entry (an entry of the v1.5 form, registered before v1.6, is
+/// refused even when carriable); an entry the batch does not use is asked
+/// nothing.
+#[test]
+fn a_batch_uses_only_form_z_catalogue_entries() {
+    let rules = burn_rules();
+    let batch_rules = ClientBatchRules {
+        catalogue: test_rules::listing(&[digest(0x10)]),
+        ..batch_rules()
+    };
+    let registry = registry_with(2, 100); // 0x10 and 0x11, active from 580
+    let leaves = registry_leaves_after(&registry, &ClientObjectsEffect::default());
+    let none = ClientObjectsEffect::default();
+    let check = |used: &[usize]| {
+        check_carried_batch(&none, Some(&carried_batch(0x21, 1, used)), &leaves, &registry, H16, &rules, &batch_rules)
+    };
+    assert_eq!(check(&[0]), Ok(()));
+    assert_eq!(
+        check(&[1]),
+        Err(ClientObjectError::BatchEntryNotFormZ { matrix_digest: digest(0x11) })
+    );
+    assert_eq!(
+        check(&[0, 1]),
+        Err(ClientObjectError::BatchEntryNotFormZ { matrix_digest: digest(0x11) })
+    );
+    assert_eq!(
+        check_batch_mask_form_z(&carried_batch(0x21, 1, &[0]).mask, &leaves, &batch_rules),
+        Ok(())
+    );
+}
+
+/// A form-Z catalogue entry registers from the v1.6 height on, not before;
+/// a v1.5 catalogue entry still registers at a v1.6 height.
+#[test]
+fn a_form_z_entry_registers_from_the_v1_6_height_only() {
+    let rules = ClientObjectRules {
+        catalogue: test_rules::listing(&[digest(0x10)]),
+        ..burn_rules()
+    };
+    let batch_rules = ClientBatchRules {
+        catalogue: test_rules::listing(&[digest(0x20)]),
+        ..batch_rules()
+    };
+    let registry = ClientRegistryState::new();
+    let check = |byte: u8, height: u64| {
+        let object = registration(byte);
+        let block = block_at(height, vec![paid_registration(100, object)]);
+        validate_block_client_objects_with(
+            &block,
+            &[ClientObject::Registration(object)],
+            &header(height - 1),
+            &registry,
+            &rules,
+            &batch_rules,
+        )
+        .map(|effect| effect.registrations.len())
+    };
+    assert_eq!(
+        check(0x20, V1_6 - 1),
+        Err(ClientObjectError::NotInCatalogue { matrix_digest: digest(0x20) })
+    );
+    assert_eq!(check(0x20, V1_6), Ok(1));
+    assert_eq!(check(0x10, V1_6 - 1), Ok(1));
+    // From V1_6 on, an entry of the obsolete v1.5 catalogue is refused:
+    // no V1_6 slot can use it, and a registry leaf is a scarce resource.
+    assert_eq!(
+        check(0x10, V1_6),
+        Err(ClientObjectError::NotInCatalogue { matrix_digest: digest(0x10) })
+    );
+    assert_eq!(
+        check(0x30, V1_6),
+        Err(ClientObjectError::NotInCatalogue { matrix_digest: digest(0x30) })
+    );
+}
+
+// ---- the form-Z catalogue beyond block validation ----------
+
+/// The form-Z catalogue of these tests: 0x21 is a v1.5 entry, 0x22 a
+/// form-Z one.
+fn d12_rules() -> (ClientObjectRules, ClientBatchRules) {
+    (
+        catalogue_rules(&[[0x21; 32]]),
+        ClientBatchRules {
+            catalogue: test_rules::listing(&[[0x22; 32]]),
+            ..batch_rules()
+        },
+    )
+}
+
+/// A snapshot whose registry holds a form-Z entry registered at or above
+/// the v1.6 height is a registry the chain can have made: the entry
+/// is judged by the catalogue its registration height reads, as the block
+/// that registered it was. A form-Z entry below the v1.6 height, and a v1.5
+/// entry at or above it, are not.
+#[test]
+fn a_snapshot_registry_judges_each_entry_by_the_catalogue_of_its_height() {
+    let (rules, batch) = d12_rules();
+    let check = |entries: &[ClientRegistryEntry], boundary: u64| {
+        let registry = snapshot_registry(entries);
+        let slots = entries.iter().map(marker_slot).collect::<Vec<_>>();
+        let floor = rules.active_at(boundary).then(|| alloc_at(ACTIVATION - 1).unwrap());
+        let mut check = SnapshotRegistryCheck::new_with_batch(&registry, boundary, floor, &rules, &batch)?;
+        for (owner, amount, creation_id) in &slots {
+            check.observe_slot(owner, *amount, *creation_id);
+        }
+        check.finish(alloc_at)
+    };
+    let v15 = snapshot_entry(0, 0x21, 150);
+    let z = snapshot_entry(1, 0x22, V1_6);
+    assert_eq!(check(&[v15, z], V1_6 + 10), Ok(()));
+    let refused = Err(ClientObjectError::SnapshotRegistry {
+        reason: "an entry outside the client catalogue",
+    });
+    let z_early = snapshot_entry(1, 0x22, V1_6 - 1);
+    assert_eq!(check(&[v15, z_early], V1_6 + 10), refused);
+    let v15_late = snapshot_entry(0, 0x21, V1_6);
+    assert_eq!(check(&[v15_late], V1_6 + 10), refused);
+    // The height-less constructor keeps the v1.5 catalogue's judgment.
+    let registry = snapshot_registry(&[v15]);
+    let floor = Some(alloc_at(ACTIVATION - 1).unwrap());
+    assert!(SnapshotRegistryCheck::new(&registry, V1_6 + 10, floor, &rules).is_ok());
+}
+
+/// A wallet's pre-check of a registration at the height of the block that
+/// will carry it: a form-Z entry from the v1.6 height on, a v1.5
+/// entry below it only — the block's own rule.
+#[test]
+fn a_registration_is_admissible_by_the_catalogue_of_its_height() {
+    let (rules, batch) = d12_rules();
+    let registration = |byte: u8| ClientRegistration {
+        matrix_digest: [byte; 32],
+        matrix_file_root: [0xF0; 32],
+        matrix_file_len: 1_000,
+    };
+    let at = |byte: u8, height: u64| check_registration_admissible_at(&registration(byte), &rules, &batch, height);
+    let refused = |byte: u8| Err(ClientObjectError::NotInCatalogue { matrix_digest: [byte; 32] });
+    assert_eq!(at(0x22, V1_6), Ok(()));
+    assert_eq!(at(0x22, V1_6 - 1), refused(0x22));
+    assert_eq!(at(0x21, V1_6 - 1), Ok(()));
+    assert_eq!(at(0x21, V1_6), refused(0x21));
+    assert_eq!(at(0x30, V1_6), refused(0x30));
+}
+
+/// A registration a node holds or relays without knowing the height of the
+/// block that will carry it: its `D` listed by the v1.5 catalogue, or
+/// by the form-Z one only on a build whose v1.6 clock is armed (the block
+/// then judges it at its height).
+#[test]
+fn a_relayed_registration_names_an_entry_of_a_catalogue_this_build_can_register() {
+    let (rules, batch) = d12_rules();
+    let dormant = ClientBatchRules {
+        activation_height: None,
+        ..batch
+    };
+    let registration = |byte: u8| ClientRegistration {
+        matrix_digest: [byte; 32],
+        matrix_file_root: [0xF0; 32],
+        matrix_file_len: 1_000,
+    };
+    let refused = |byte: u8| Err(ClientObjectError::NotInCatalogue { matrix_digest: [byte; 32] });
+    assert_eq!(check_registration_relayable(&registration(0x21), &rules, &batch), Ok(()));
+    assert_eq!(check_registration_relayable(&registration(0x22), &rules, &batch), Ok(()));
+    assert_eq!(check_registration_relayable(&registration(0x22), &rules, &dormant), refused(0x22));
+    assert_eq!(check_registration_relayable(&registration(0x30), &rules, &batch), refused(0x30));
 }

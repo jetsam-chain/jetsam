@@ -11,11 +11,14 @@
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{
-    difficulty::{expected_target, DifficultySchedule},
+    difficulty::{expected_target, AnchorInfo, DifficultySchedule},
     expected_child_log_slots,
-    params::{CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH},
+    params::{
+        v1_6_active_with, CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH, V1_6_ACTIVATION_HEIGHT,
+        V1_6_PARENT_TIMESTAMP_LAG,
+    },
     pow::{block_id, validate_pow},
-    timestamps::{validate_future_drift, validate_median_time_past},
+    timestamps::{median_time_past, validate_future_drift, validate_median_time_past},
     ConsensusError,
 };
 
@@ -25,7 +28,7 @@ use crate::consensus::{
 /// 1. `prev_block_hash` == semantic Poseidon2b block id of the parent
 /// 2. `height` == parent.height + 1
 /// 3. `difficulty_target` == ASERT-computed target
-/// 4. Timestamp rules (MTP + future drift)
+/// 4. Timestamp rules (MTP, from v1.6 the parent floor, future drift)
 /// 5. Poseidon2b PoW satisfies difficulty_target
 /// 6. `log_slots` equals the exact hard-finalized expansion result
 ///
@@ -36,16 +39,14 @@ use crate::consensus::{
 /// `finalized_active_counts`: the complete hard-finalized expansion window,
 /// oldest-first, or empty while the chain is too short to provide it.
 /// `local_time`: current wall-clock seconds (for future drift check).
-/// `anchor_*`: epoch anchor values for ASERT.
+/// `anchor`: the ASERT anchor of the child ([`AnchorInfo`]).
 pub fn validate_header(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
     local_time: u64,
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
+    anchor: &AnchorInfo,
 ) -> Result<(), ConsensusError> {
     validate_header_inner(
         header,
@@ -54,10 +55,9 @@ pub fn validate_header(
         prev_timestamps,
         finalized_active_counts,
         Some(local_time),
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
+        anchor,
         true,
+        V1_6_ACTIVATION_HEIGHT,
     )
 }
 
@@ -74,9 +74,7 @@ pub fn validate_header_template(
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
     local_time: u64,
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
+    anchor: &AnchorInfo,
 ) -> Result<(), ConsensusError> {
     validate_header_inner(
         header,
@@ -85,10 +83,9 @@ pub fn validate_header_template(
         prev_timestamps,
         finalized_active_counts,
         Some(local_time),
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
+        anchor,
         false,
+        V1_6_ACTIVATION_HEIGHT,
     )
 }
 
@@ -101,9 +98,7 @@ pub fn validate_header_timeless(
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
+    anchor: &AnchorInfo,
 ) -> Result<(), ConsensusError> {
     validate_header_inner(
         header,
@@ -112,10 +107,9 @@ pub fn validate_header_timeless(
         prev_timestamps,
         finalized_active_counts,
         None,
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
+        anchor,
         true,
+        V1_6_ACTIVATION_HEIGHT,
     )
 }
 
@@ -134,9 +128,7 @@ pub fn validate_header_timeless_prehashed_parent(
     parent_id: [u8; 32],
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
+    anchor: &AnchorInfo,
 ) -> Result<(), ConsensusError> {
     validate_header_inner(
         header,
@@ -145,10 +137,9 @@ pub fn validate_header_timeless_prehashed_parent(
         prev_timestamps,
         finalized_active_counts,
         None,
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
+        anchor,
         true,
+        V1_6_ACTIVATION_HEIGHT,
     )
 }
 
@@ -160,10 +151,9 @@ fn validate_header_inner(
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
     local_time: Option<u64>,
-    anchor_height: u64,
-    anchor_timestamp: u64,
-    anchor_target: &[u8; 32],
+    anchor: &AnchorInfo,
     check_pow: bool,
+    v1_6_activation: Option<u64>,
 ) -> Result<(), ConsensusError> {
     // 0. Hard checkpoint, before anything else: whatever else is true of this
     //    header, a block at a pinned height that is not the pinned block is not
@@ -208,13 +198,12 @@ fn validate_header_inner(
     // ideal interval is 180 s from that height on, 90 s below it, so no header
     // the chain already holds is re-judged. `expected_target` is the one place
     // that logic lives; the miner's template calls the same function.
-    let expected_target = expected_target(
-        anchor_height,
-        anchor_timestamp,
-        anchor_target,
-        header.height,
-        parent.timestamp,
-    );
+    //
+    // JETSAM CHANGE (v1.6): above the v1.6 height `expected_target` applies
+    // the v1.6 rule. The anchor's fields
+    // all come in `anchor`,
+    // read in one place per source.
+    let expected_target = expected_target(anchor, header.height, parent.timestamp);
     if header.difficulty_target != expected_target {
         return Err(ConsensusError::BadDifficultyTarget);
     }
@@ -222,6 +211,14 @@ fn validate_header_inner(
     // 4. Timestamp rules.
     validate_median_time_past(header.timestamp, prev_timestamps)
         .map_err(|_| ConsensusError::BadTimestamp)?;
+    // JETSAM CHANGE (v1.6): from the v1.6 height a block may not
+    // be dated more than `V1_6_PARENT_TIMESTAMP_LAG` below its parent, in
+    // addition to the median rule. The bound reads the parent only, never a
+    // clock, so every node judges it alike. The template takes the same bound
+    // through `lowest_admitted_timestamp`.
+    if header.timestamp < parent_timestamp_floor(header.height, parent.timestamp, v1_6_activation) {
+        return Err(ConsensusError::BadTimestamp);
+    }
     if let Some(local_time) = local_time {
         // The normal future-drift allowance must not let the first mainnet
         // child enter local consensus before the fixed genesis time. This is
@@ -249,6 +246,51 @@ fn validate_header_inner(
     }
 
     Ok(())
+}
+
+/// The lowest timestamp a child at `height` may carry: one past the median
+/// of `prev_timestamps` (its last eleven ancestors, oldest first) and, from
+/// the v1.6 height on, no more than [`V1_6_PARENT_TIMESTAMP_LAG`] below its
+/// parent's. What the validator admits, and what a template built on a clock
+/// behind it must take instead.
+pub fn lowest_admitted_timestamp(
+    height: u64,
+    parent_timestamp: u64,
+    prev_timestamps: &[u64],
+) -> u64 {
+    lowest_admitted_timestamp_with(
+        height,
+        parent_timestamp,
+        prev_timestamps,
+        V1_6_ACTIVATION_HEIGHT,
+    )
+}
+
+/// [`lowest_admitted_timestamp`] with the v1.6 height injected.
+pub fn lowest_admitted_timestamp_with(
+    height: u64,
+    parent_timestamp: u64,
+    prev_timestamps: &[u64],
+    v1_6_activation: Option<u64>,
+) -> u64 {
+    median_time_past(prev_timestamps)
+        .saturating_add(1)
+        .max(parent_timestamp_floor(height, parent_timestamp, v1_6_activation))
+}
+
+/// The lowest timestamp the parent allows its child at `height`: the
+/// parent's less [`V1_6_PARENT_TIMESTAMP_LAG`] from the v1.6 height on, no
+/// bound (zero) below it.
+const fn parent_timestamp_floor(
+    height: u64,
+    parent_timestamp: u64,
+    v1_6_activation: Option<u64>,
+) -> u64 {
+    if v1_6_active_with(height, v1_6_activation) {
+        parent_timestamp.saturating_sub(V1_6_PARENT_TIMESTAMP_LAG)
+    } else {
+        0
+    }
 }
 
 /// Refuse a header at a pinned height whose block id is not the pinned one.
@@ -294,7 +336,7 @@ pub fn asert_anchor_height(current_height: u64) -> u64 {
 /// time it runs on a live chain.
 #[inline]
 pub(crate) fn asert_anchor_height_with(current_height: u64, activation: Option<u64>) -> u64 {
-    asert_anchor_height_with_clocks(current_height, activation, None)
+    asert_anchor_height_with_clocks(current_height, activation, None, None)
 }
 
 /// [`asert_anchor_height`] with both floors injected: the latest epoch boundary
@@ -305,6 +347,7 @@ pub(crate) const fn asert_anchor_height_with_clocks(
     current_height: u64,
     v1_4_activation: Option<u64>,
     v1_5_activation: Option<u64>,
+    v1_6_activation: Option<u64>,
 ) -> u64 {
     let mut anchor = (current_height / EPOCH_LENGTH) * EPOCH_LENGTH;
     if let Some(activation) = v1_4_activation {
@@ -313,6 +356,11 @@ pub(crate) const fn asert_anchor_height_with_clocks(
         }
     }
     if let Some(activation) = v1_5_activation {
+        if current_height >= activation && activation > anchor {
+            anchor = activation;
+        }
+    }
+    if let Some(activation) = v1_6_activation {
         if current_height >= activation && activation > anchor {
             anchor = activation;
         }
@@ -360,6 +408,17 @@ mod tests {
         }
     }
 
+    /// The anchor these tests use: the parent itself at height 0 (its own
+    /// timestamp also standing for its parent's).
+    fn anchor_at(block: BlockHeader) -> AnchorInfo {
+        AnchorInfo {
+            anchor_height: 0,
+            anchor_timestamp: block.timestamp,
+            anchor_parent_timestamp: block.timestamp,
+            anchor_target: block.difficulty_target,
+        }
+    }
+
     fn mine(header: &mut BlockHeader) {
         // JETSAM CHANGE: upstream hardcoded nonce = 0, relying on the child
         // carrying [0xFF;32]. With the parent-anchored target the child's target
@@ -381,9 +440,7 @@ mod tests {
             &prev_ts,
             &[],
             h1.timestamp + 1,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         assert!(result.is_ok(), "valid header should accept: {:?}", result);
     }
@@ -402,9 +459,7 @@ mod tests {
                 &prev_ts,
                 &[],
                 1,
-                0,
-                genesis.timestamp,
-                &genesis.difficulty_target,
+                &anchor_at(genesis),
             ),
             Err(ConsensusError::BadTimestamp)
         );
@@ -413,9 +468,7 @@ mod tests {
             &genesis,
             &prev_ts,
             &[],
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         )
         .is_ok());
     }
@@ -434,9 +487,7 @@ mod tests {
                 &previous,
                 &[],
                 genesis.timestamp - 1,
-                0,
-                genesis.timestamp,
-                &genesis.difficulty_target,
+                &anchor_at(genesis),
             ),
             Err(ConsensusError::BadTimestamp)
         );
@@ -446,9 +497,7 @@ mod tests {
             &previous,
             &[],
             genesis.timestamp,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         )
         .is_ok());
         assert!(validate_header_timeless(
@@ -456,9 +505,7 @@ mod tests {
             &genesis,
             &previous,
             &[],
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         )
         .is_ok());
     }
@@ -494,9 +541,7 @@ mod tests {
                     &genesis,
                     &previous,
                     &[],
-                    0,
-                    genesis.timestamp,
-                    &genesis.difficulty_target,
+                    &anchor_at(genesis),
                 )
                 .is_ok(),
                 "{label} child must accept the parent-anchored target"
@@ -528,9 +573,7 @@ mod tests {
             &[genesis.timestamp],
             &[],
             h1.timestamp + 1,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         assert_eq!(result, Err(ConsensusError::BadParentHash));
     }
@@ -546,9 +589,7 @@ mod tests {
             &genesis,
             &[genesis.timestamp],
             &[],
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         let prehashed = validate_header_timeless_prehashed_parent(
             &h1,
@@ -556,9 +597,7 @@ mod tests {
             parent_id,
             &[genesis.timestamp],
             &[],
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         assert_eq!(prehashed, standard);
 
@@ -569,9 +608,7 @@ mod tests {
                 [0xAB; 32],
                 &[genesis.timestamp],
                 &[],
-                0,
-                genesis.timestamp,
-                &genesis.difficulty_target,
+                &anchor_at(genesis),
             ),
             Err(ConsensusError::BadParentHash)
         );
@@ -589,9 +626,7 @@ mod tests {
             &[genesis.timestamp],
             &[],
             h1.timestamp + 1,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         assert_eq!(result, Err(ConsensusError::BadHeight));
     }
@@ -608,9 +643,7 @@ mod tests {
             &[genesis.timestamp],
             &[],
             h1.timestamp + 1,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
+            &anchor_at(genesis),
         );
         assert_eq!(result, Err(ConsensusError::BadLogSlotsExpansion));
     }
@@ -660,21 +693,21 @@ mod tests {
             let v1_5 = Some(j);
             for h in (j - 20)..j {
                 assert_eq!(
-                    asert_anchor_height_with_clocks(h, v1_4, v1_5),
+                    asert_anchor_height_with_clocks(h, v1_4, v1_5, None),
                     asert_anchor_height_with(h, v1_4),
                     "below J the anchor rule is unchanged"
                 );
             }
             for h in j..(j + 40) {
-                let anchor = asert_anchor_height_with_clocks(h, v1_4, v1_5);
+                let anchor = asert_anchor_height_with_clocks(h, v1_4, v1_5, None);
                 assert_eq!(anchor, ((h / EPOCH_LENGTH) * EPOCH_LENGTH).max(j), "h {h}");
                 assert!(anchor >= j && anchor <= h);
             }
-            assert_eq!(asert_anchor_height_with_clocks(j, None, v1_5), j);
+            assert_eq!(asert_anchor_height_with_clocks(j, None, v1_5, None), j);
         }
         for h in [0u64, 5, 999, 1_000, 30_719, 30_720, 30_725, u64::MAX] {
             assert_eq!(
-                asert_anchor_height_with_clocks(h, v1_4, None),
+                asert_anchor_height_with_clocks(h, v1_4, None, None),
                 asert_anchor_height_with(h, v1_4)
             );
         }
@@ -686,6 +719,7 @@ mod tests {
                     h,
                     crate::consensus::params::V1_4_ACTIVATION_HEIGHT,
                     crate::consensus::params::V1_5_ACTIVATION_HEIGHT,
+                    crate::consensus::params::V1_6_ACTIVATION_HEIGHT,
                 )
             );
         }
@@ -800,9 +834,7 @@ mod tests {
                     &parent,
                     &[parent.timestamp],
                     &[],
-                    0,
-                    parent.timestamp,
-                    &parent.difficulty_target,
+                    &anchor_at(parent),
                 ),
                 Err(ConsensusError::CheckpointMismatch)
             );
@@ -819,9 +851,7 @@ mod tests {
                     &parent,
                     &[parent.timestamp],
                     &[],
-                    0,
-                    parent.timestamp,
-                    &parent.difficulty_target,
+                    &anchor_at(parent),
                 ),
                 Err(ConsensusError::CheckpointMismatch)
             );
@@ -843,11 +873,248 @@ mod tests {
                 &parent,
                 &[parent.timestamp],
                 &[],
-                0,
-                parent.timestamp,
-                &parent.difficulty_target,
+                &anchor_at(parent),
             ),
             Err(ConsensusError::CheckpointMismatch)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.6: a timestamp may not fall more than a fixed lag below its parent's
+    // -----------------------------------------------------------------------
+
+    use crate::consensus::params::{V1_6_ACTIVATION_HEIGHT, V1_6_PARENT_TIMESTAMP_LAG};
+
+    /// An injected v1.6 height (a multiple of 960); the profile's stays dormant.
+    const K: u64 = 48_000;
+
+    /// Eleven ancestor timestamps 180 s apart, the newest being the parent's:
+    /// their median is `parent_ts - 900`, so a child dated between that and
+    /// `parent_ts - 600` passes the median rule and meets only the new bound.
+    fn spaced_ancestors(parent_ts: u64) -> Vec<u64> {
+        (0..11).map(|i| parent_ts - (10 - i) * 180).collect()
+    }
+
+    /// A parent at `height - 1` dated `parent_ts`, and its nonce-free child at
+    /// `height` dated `child_ts`, carrying the target the production rule
+    /// computes for it — so the timestamp is the one thing under test.
+    fn v1_6_case(height: u64, parent_ts: u64, child_ts: u64) -> (BlockHeader, BlockHeader, AnchorInfo) {
+        let parent = make_header(height - 1, parent_ts, None);
+        let anchor = AnchorInfo {
+            anchor_height: ((height - 1) / EPOCH_LENGTH) * EPOCH_LENGTH,
+            anchor_timestamp: parent_ts.saturating_sub(900),
+            anchor_parent_timestamp: parent_ts.saturating_sub(1_080),
+            anchor_target: TEST_TARGET,
+        };
+        let mut child = make_header(height, child_ts, Some(&parent));
+        child.difficulty_target = expected_target(&anchor, height, parent.timestamp);
+        (parent, child, anchor)
+    }
+
+    /// The timeless validator with the v1.6 height injected.
+    fn timeless_at(
+        child: &BlockHeader,
+        parent: &BlockHeader,
+        anchor: &AnchorInfo,
+        v1_6: Option<u64>,
+    ) -> Result<(), ConsensusError> {
+        validate_header_inner(
+            child,
+            parent,
+            block_id(parent),
+            &spaced_ancestors(parent.timestamp),
+            &[],
+            None,
+            anchor,
+            false,
+            v1_6,
+        )
+    }
+
+    /// The bound and its height: from the v1.6 block on (that block's
+    /// timestamp is the parent timestamp of the first v1.6 difficulty step),
+    /// a child dated more than 600 s below its parent is refused; one second
+    /// less far is admitted; below the height, and with v1.6 dormant, the
+    /// median rule alone, as released.
+    #[test]
+    fn the_parent_timestamp_floor_holds_from_v1_6_only() {
+        assert_eq!(V1_6_PARENT_TIMESTAMP_LAG, 600, "the v1.6 parent lag");
+        let parent_ts = 1_900_000_000u64;
+        for height in [K, K + 1, K + 6, K + 7, K + 960] {
+            let (parent, at_floor, anchor) = v1_6_case(height, parent_ts, parent_ts - 600);
+            assert_eq!(timeless_at(&at_floor, &parent, &anchor, Some(K)), Ok(()), "h {height}");
+            let (parent, below, anchor) = v1_6_case(height, parent_ts, parent_ts - 601);
+            assert_eq!(
+                timeless_at(&below, &parent, &anchor, Some(K)),
+                Err(ConsensusError::BadTimestamp),
+                "h {height}"
+            );
+            // Dormant: the median rule alone.
+            assert_eq!(timeless_at(&below, &parent, &anchor, None), Ok(()), "h {height}");
+            let (parent, at_mtp, anchor) = v1_6_case(height, parent_ts, parent_ts - 899);
+            assert_eq!(timeless_at(&at_mtp, &parent, &anchor, None), Ok(()), "h {height}");
+        }
+        for height in [K - 1, K - 6, K - 960, 2] {
+            let (parent, at_mtp, anchor) = v1_6_case(height, parent_ts, parent_ts - 899);
+            assert_eq!(timeless_at(&at_mtp, &parent, &anchor, Some(K)), Ok(()), "h {height}");
+            let (parent, at_median, anchor) = v1_6_case(height, parent_ts, parent_ts - 900);
+            assert_eq!(
+                timeless_at(&at_median, &parent, &anchor, Some(K)),
+                Err(ConsensusError::BadTimestamp),
+                "h {height}: the median rule still holds"
+            );
+        }
+
+        // The lowest admitted timestamp, the one function the template uses.
+        let prev = spaced_ancestors(parent_ts);
+        assert_eq!(lowest_admitted_timestamp_with(K - 1, parent_ts, &prev, Some(K)), parent_ts - 899);
+        assert_eq!(lowest_admitted_timestamp_with(K, parent_ts, &prev, Some(K)), parent_ts - 600);
+        assert_eq!(lowest_admitted_timestamp_with(K + 1, parent_ts, &prev, Some(K)), parent_ts - 600);
+        assert_eq!(lowest_admitted_timestamp_with(K, parent_ts, &prev, None), parent_ts - 899);
+        // A parent dated low, its median above `parent - 600`: the median wins.
+        let flat = vec![parent_ts; 11];
+        assert_eq!(lowest_admitted_timestamp_with(K, parent_ts, &flat, Some(K)), parent_ts + 1);
+        // No underflow near zero.
+        assert_eq!(lowest_admitted_timestamp_with(K, 100, &[], Some(K)), 1);
+        let (parent, child, anchor) = v1_6_case(K, 700, 100);
+        assert_eq!(
+            validate_header_inner(&child, &parent, block_id(&parent), &[1], &[], None, &anchor, false, Some(K)),
+            Ok(())
+        );
+    }
+
+    /// A private test chain's real headers 52..70
+    /// (its v1.6 branch, read from its nodes; this build's schedule is the
+    /// private one, v1.5 at 36 and v1.6 at K = 64). Each header from K - 1
+    /// to K + 2 passes the validator as mined, proof of work included; the
+    /// same child dated one second below `parent - 600` is refused at K and
+    /// at K + 1 (not at K - 1, under the median rule alone), and dated at the
+    /// lowest it admits it passes the timestamp rules.
+    #[cfg(feature = "rehearsal-v1-6")]
+    #[test]
+    fn on_a_private_chain_a_child_below_its_parent_floor_is_refused_at_k_and_k_plus_1() {
+        use crate::consensus::difficulty::DifficultySchedule;
+        let headers: std::collections::BTreeMap<u64, BlockHeader> =
+            include_str!("testdata/raw-headers-private-v1-6-52-70.txt")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let (height, hex) = line.split_once(' ').expect("height hex");
+                    let bytes: Vec<u8> = (0..hex.len() / 2)
+                        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                        .collect();
+                    let header = BlockHeader::from_bytes(&bytes).expect("a wire header");
+                    assert_eq!(header.height, height.parse::<u64>().unwrap());
+                    (header.height, header)
+                })
+                .collect();
+        let schedule = DifficultySchedule::PRODUCTION;
+        assert_eq!((schedule.v1_5_activation, schedule.v1_6_activation), (Some(36), Some(64)));
+        const K: u64 = 64;
+        for height in [K - 1, K, K + 1, K + 2] {
+            let child = headers[&height];
+            let parent = headers[&(height - 1)];
+            assert_eq!(child.prev_block_hash, block_id(&parent), "h {height}: a chain");
+            let prev: Vec<u64> = (height - 11..height).map(|h| headers[&h].timestamp).collect();
+            let anchor_height = schedule.anchor_height(height - 1);
+            let anchor = AnchorInfo {
+                anchor_height,
+                anchor_timestamp: headers[&anchor_height].timestamp,
+                anchor_parent_timestamp: headers[&(anchor_height - 1)].timestamp,
+                anchor_target: headers[&anchor_height].difficulty_target,
+            };
+            let judge = |header: &BlockHeader, check_pow: bool| {
+                validate_header_inner(header, &parent, block_id(&parent), &prev, &[], None, &anchor, check_pow, V1_6_ACTIVATION_HEIGHT)
+            };
+            assert_eq!(judge(&child, true), Ok(()), "h {height}: as mined");
+            let lowest = lowest_admitted_timestamp(height, parent.timestamp, &prev);
+            let mut early = child;
+            early.timestamp = lowest;
+            assert_eq!(judge(&early, false), Ok(()), "h {height}: dated at the lowest it admits");
+            early.timestamp = lowest - 1;
+            assert_eq!(judge(&early, false), Err(ConsensusError::BadTimestamp), "h {height}: one second lower");
+            let floor = parent.timestamp - V1_6_PARENT_TIMESTAMP_LAG;
+            if height >= K {
+                assert!(lowest >= floor, "h {height}: the parent floor binds");
+                let mut below = child;
+                below.timestamp = floor - 1;
+                assert_eq!(judge(&below, false), Err(ConsensusError::BadTimestamp), "h {height}: below parent - 600");
+            } else {
+                assert!(lowest < floor, "h {height}: below K the median rule alone");
+            }
+        }
+    }
+
+    /// No header the chain holds is judged again: through every production
+    /// entry point, a child dated far below its parent but above the median is
+    /// admitted at every height the profile's v1.6 clock does not govern —
+    /// all of them while it is dormant.
+    #[test]
+    fn no_existing_header_is_rejudged_by_the_parent_floor() {
+        let parent_ts = 1_900_000_000u64;
+        // Away from the v1.3/v1.4/v1.5 boundaries and pins of both profiles.
+        for height in [2u64, 1_001, 30_001, 38_401, 39_945, K - 1, K, K + 1, 1 << 40] {
+            if crate::consensus::params::v1_6_active(height) {
+                continue;
+            }
+            let (parent, mut child, anchor) = v1_6_case(height, parent_ts, parent_ts - 899);
+            mine(&mut child);
+            let prev = spaced_ancestors(parent_ts);
+            assert_eq!(
+                validate_header_timeless(&child, &parent, &prev, &[], &anchor),
+                Ok(()),
+                "h {height}"
+            );
+            assert_eq!(
+                validate_header_template(&child, &parent, &prev, &[], parent_ts, &anchor),
+                Ok(()),
+                "h {height}"
+            );
+            assert_eq!(
+                validate_header_timeless_prehashed_parent(&child, &parent, block_id(&parent), &prev, &[], &anchor),
+                Ok(()),
+                "h {height}"
+            );
+            assert_eq!(lowest_admitted_timestamp(height, parent_ts, &prev), parent_ts - 899);
+        }
+        if V1_6_ACTIVATION_HEIGHT.is_none() {
+            assert_eq!(lowest_admitted_timestamp(u64::MAX, parent_ts, &[]), 1);
+        }
+    }
+
+    /// The template and the validator agree: the timestamp a template takes
+    /// (`max(now, lowest admitted)`) is one the validator admits, with the
+    /// local future-drift check, at and around the v1.6 height; one second
+    /// below the lowest admitted is refused; and the child's target does not
+    /// depend on which of the two it carries (it is the parent's affair).
+    #[test]
+    fn the_template_timestamp_is_one_the_validator_admits() {
+        let parent_ts = 1_900_000_000u64;
+        // `now` behind the parent by up to 720 s (a parent at its +120 s future
+        // limit on a node 600 s slower), and ahead of it.
+        for height in [K - 1, K, K + 1, K + 5, K + 6] {
+            for behind in [0u64, 120, 599, 600, 601, 720] {
+                // Ancestors whose median sits at the parent bind the median
+                // rule above the parent: only a clock at the parent's admits that.
+                let flat = if behind == 0 { vec![vec![parent_ts; 11]] } else { vec![] };
+                for prev in [vec![spaced_ancestors(parent_ts)], flat].concat() {
+                    let now = parent_ts - behind;
+                    let lowest = lowest_admitted_timestamp_with(height, parent_ts, &prev, Some(K));
+                    let stamp = now.max(lowest);
+                    let (parent, child, anchor) = v1_6_case(height, parent_ts, stamp);
+                    let full = validate_header_inner(
+                        &child, &parent, block_id(&parent), &prev, &[], Some(now), &anchor, false, Some(K),
+                    );
+                    assert_eq!(full, Ok(()), "h {height} behind {behind}");
+                    let (parent, lower, anchor) = v1_6_case(height, parent_ts, lowest - 1);
+                    assert_eq!(lower.difficulty_target, child.difficulty_target);
+                    assert_eq!(
+                        validate_header_inner(&lower, &parent, block_id(&parent), &prev, &[], None, &anchor, false, Some(K)),
+                        Err(ConsensusError::BadTimestamp),
+                        "h {height} behind {behind}"
+                    );
+                }
+            }
+        }
     }
 }
