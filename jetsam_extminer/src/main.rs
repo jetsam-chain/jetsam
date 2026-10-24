@@ -94,9 +94,10 @@ struct Cli {
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
 
-    /// Benchmark this machine's TowerHash rate for N seconds and exit, without
-    /// touching the network. Reports hashes/second at the chosen --threads, so
-    /// you can size how many threads each CPU needs to pull its weight.
+    /// Benchmark this machine's walked search rate for N seconds and exit,
+    /// without touching the network. Reports hashes/second at the chosen
+    /// --threads, so you can size how many threads each CPU needs to pull its
+    /// weight.
     #[arg(long, value_name = "SECONDS")]
     bench: Option<u64>,
 }
@@ -641,6 +642,39 @@ fn mine(cli: &Cli) -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Hashes per second, on the current pool, of the work `search_nonce` does for
+/// each nonce of a walked template: the sponge digest, then the walk.
+fn bench_rate(duration: Duration) -> f64 {
+    let threads = rayon::current_num_threads();
+    // A fixed dummy header; the hash rate does not depend on its contents.
+    let fields = [Block128::from(0x9e37_79b9_7f4a_7c15u128); POW_HEADER_FIELD_COUNT];
+    let started = Instant::now();
+    let deadline = started + duration;
+    let total: u64 = (0..threads)
+        .into_par_iter()
+        .map(|tid| {
+            let mut hasher = FixedFieldNonceBatch::new(TAG_POWHDR, &fields, POW_NONCE_FIELD_INDEX);
+            let mut digests = [[0u8; 32]; WALK_BATCH];
+            let mut scratch = jetsam_poseidon2b::towerwalk::Scratch::new();
+            let mut nonce = (tid as u128) << 96;
+            let mut done: u64 = 0;
+            while Instant::now() < deadline {
+                hasher.hash_into(nonce, &mut digests);
+                for seed in &digests {
+                    std::hint::black_box(jetsam_poseidon2b::towerwalk::towerwalk_digest_with(
+                        &mut scratch,
+                        seed,
+                    ));
+                }
+                nonce = nonce.wrapping_add(WALK_BATCH as u128);
+                done += WALK_BATCH as u64;
+            }
+            done
+        })
+        .sum();
+    total as f64 / started.elapsed().as_secs_f64()
+}
+
 fn run_bench(cli: &Cli) {
     if cli.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -650,35 +684,18 @@ fn run_bench(cli: &Cli) {
     }
     let threads = rayon::current_num_threads();
     let secs = cli.bench.unwrap_or(10).max(1);
-    // A fixed dummy header; the hash rate does not depend on its contents.
-    let fields = [Block128::from(0x9e37_79b9_7f4a_7c15u128); POW_HEADER_FIELD_COUNT];
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    eprintln!("benchmarking TowerHash on {threads} thread(s) for {secs}s...");
-    let counts: Vec<u128> = (0..threads)
-        .into_par_iter()
-        .map(|tid| {
-            let mut hasher =
-                FixedFieldNonceBatch::new(TAG_POWHDR, &fields, POW_NONCE_FIELD_INDEX);
-            let mut digests = [[0u8; 32]; DIGEST_BATCH];
-            let mut nonce = (tid as u128) << 96;
-            let mut done: u128 = 0;
-            while Instant::now() < deadline {
-                hasher.hash_into(nonce, &mut digests);
-                nonce = nonce.wrapping_add(DIGEST_BATCH as u128);
-                done += DIGEST_BATCH as u128;
-            }
-            done
-        })
-        .collect();
-    let total: u128 = counts.iter().sum();
-    let hps = (total as f64) / (secs as f64);
-    let unit = if hps >= 1.0e6 {
-        format!("{:.2} MH/s", hps / 1.0e6)
-    } else {
-        format!("{:.1} kH/s", hps / 1.0e3)
-    };
-    println!("TowerHash rate: {unit}  ({threads} threads, {:.1} kH/s per thread)",
-             hps / 1.0e3 / threads as f64);
+    eprintln!("benchmarking the walked search on {threads} thread(s) for {secs}s...");
+    let hps = bench_rate(Duration::from_secs(secs));
+    println!(
+        "walked search: {:.2} kH/s  ({threads} threads, {:.3} kH/s per thread)",
+        hps / 1.0e3,
+        hps / 1.0e3 / threads as f64
+    );
+    println!(
+        "Each nonce is a sponge digest and its walk, as every current network asks. \
+         This is an upper bound, measured with nothing else running: a node building \
+         and proving blocks on the same cores lowers the rate reached while mining."
+    );
 }
 
 fn main() {
@@ -713,7 +730,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        search_nonce, search_until_new_work, template_search_deadline, Block128,
+        bench_rate, search_nonce, search_until_new_work, template_search_deadline, Block128,
         BlockTemplateResponse, RpcClient, CHUNK_SIZE, NONCE_REGION_SHIFT, POW_HEADER_FIELD_COUNT,
     };
 
@@ -805,6 +822,42 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(fresh.expect("the new tip's template").0.height, 8);
+    }
+
+    /// Walked digests per second on the current pool's first thread.
+    fn walk_rate() -> f64 {
+        let mut scratch = jetsam_poseidon2b::towerwalk::Scratch::new();
+        let mut seed = [7u8; 32];
+        let started = Instant::now();
+        let mut walked = 0u32;
+        while walked < 3 || started.elapsed() < Duration::from_millis(500) {
+            seed = jetsam_poseidon2b::towerwalk::towerwalk_digest_with(&mut scratch, &seed);
+            walked += 1;
+        }
+        f64::from(walked) / started.elapsed().as_secs_f64()
+    }
+
+    /// `--bench` timed the sponge digest alone and printed it as the miner's
+    /// rate, while every current network has the miner walk each digest: the
+    /// figure was some 80 times what a walking miner searches.
+    #[test]
+    fn the_bench_times_the_walked_search_the_miner_runs() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool");
+        let before = pool.install(walk_rate);
+        let bench = pool.install(|| bench_rate(Duration::from_millis(1_500)));
+        let after = pool.install(walk_rate);
+
+        assert!(
+            bench <= 3.0 * before.max(after),
+            "bench {bench:.0} H/s against a walk of {before:.0}-{after:.0} H/s"
+        );
+        assert!(
+            bench >= before.min(after) / 3.0,
+            "bench {bench:.0} H/s against a walk of {before:.0}-{after:.0} H/s"
+        );
     }
 
     /// With its own coinbase a worker holds the node's only template: work the

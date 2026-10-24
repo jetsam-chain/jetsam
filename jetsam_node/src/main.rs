@@ -2363,14 +2363,7 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
                 f64::INFINITY
             };
             println!();
-            println!(
-                "From block {height} the chain uses the WALKED digest: that is the rate \
-                 `jetsam --mode miner` searches at, and it is {ratio:.0}x below the sponge."
-            );
-            println!(
-                "Size your --cpu-threads on the walked figure. The sponge one is kept \
-                 only to read pre-fork blocks."
-            );
+            println!("{}", walked_digest_lines(height, ratio));
         }
         None => {
             println!("This is the rate `jetsam --mode miner` searches at on this machine.");
@@ -2388,6 +2381,37 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
         "{}",
         v1_6_arming_line(jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT)
     );
+}
+
+/// What `--bench` says of the walked figure. Release checks read its first
+/// line, `From block <height> `, as the proof-of-work arming of the binary.
+fn walked_digest_lines(height: u64, ratio: f64) -> String {
+    format!(
+        "From block {height} the chain uses the WALKED digest, {ratio:.0}x below the \
+         sponge: `jetsam --mode miner` searches with it.\n\
+         The walked figure is an upper bound, measured with nothing else running: \
+         between two searches a mining node also builds and proves blocks on the \
+         same cores, so its ⛏ log line, the rate it reaches, reads lower.\n\
+         Size your --cpu-threads on the walked figure. The sponge one is kept \
+         only to read pre-fork blocks."
+    )
+}
+
+#[cfg(test)]
+mod bench_walked_line_tests {
+    use super::walked_digest_lines;
+
+    /// The bench walks with nothing else running. Between two searches a
+    /// mining node also builds and proves blocks on the same cores, and in
+    /// service it was measured below its bench figure (2026-09-27).
+    #[test]
+    fn the_bench_calls_the_walked_figure_a_ceiling_and_keeps_the_arming_line() {
+        let text = walked_digest_lines(24_846, 81.0);
+        assert!(text.starts_with("From block 24846 the chain uses the WALKED digest"));
+        assert_eq!(text.lines().filter(|line| line.contains("From block")).count(), 1);
+        assert!(!text.contains("that is the rate"), "{text}");
+        assert!(text.contains("upper bound"), "{text}");
+    }
 }
 
 /// The v1.6 clock as `--bench` reports it, read back the same way.
