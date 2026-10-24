@@ -85,8 +85,8 @@ column. A segment whose last live UTXO is spent is removed.
 ## Expansion rule
 
 For a candidate child of parent height `H`, use the 18 hard-finalized headers
-ending at height `H - 18`. The first complete window is available for parent
-height 35 and covers heights 0 through 17.
+ending at height `H - 8`. The first complete window is available for parent
+height 25 and covers heights 0 through 17.
 
 Count headers satisfying:
 

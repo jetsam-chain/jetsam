@@ -113,10 +113,10 @@ Changes near finality, epochs or State expansion require explicit boundary
 vectors, not only a long-running happy path. Cover:
 
 - heights 143, 144 and 145 for transaction anchors;
-- 17- and 18-block fork depths;
+- 8- and 9-block fork depths;
 - 18- and 19-block synchronization gaps;
 - finalized expansion windows with 9/9 and 10/8 occupancy;
-- restart with the complete 36-header expansion lookback;
+- restart with the complete 25-header expansion lookback;
 - payout boundaries and the final allocation height;
 - State expansion from one `log_slots` tier to the next.
 

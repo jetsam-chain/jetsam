@@ -48,10 +48,10 @@ transport. A bearer token authenticates requests but does not encrypt them.
 | Data | Window |
 |---|---:|
 | Headers | Permanent |
-| Canonical block bodies | 18 |
-| Reorganizable suffix | 18 |
-| Maximum reorganization | 17 |
-| Undo records | 36 |
+| Canonical block bodies | 8 |
+| Reorganizable suffix | 8 |
+| Maximum reorganization | 8 |
+| Undo records | 16 |
 | Transaction epoch | 32 |
 
 Receipts preserve payment-specific inclusion evidence outside body retention.

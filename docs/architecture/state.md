@@ -68,7 +68,7 @@ transactions again.
 ## Expansion
 
 Expansion is based on an 18-header hard-finalized occupancy window. For a child
-of parent height `H`, the window ends at `H - 18`. It is therefore unaffected
+of parent height `H`, the window ends at `H - 8`. It is therefore unaffected
 by the reorganizable suffix.
 
 When at least 10 of the 18 finalized headers report occupancy at or above 75%,
