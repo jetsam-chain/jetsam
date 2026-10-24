@@ -78,7 +78,7 @@ pub(crate) fn observe_pinned_digest<C: FsChannelOps>(
 /// constant schedule. Constant coordinates are still fixed by matrix rows;
 /// only their transcript representation becomes a data lane. Non-constant
 /// coordinates already have a witness source and are reused unchanged.
-fn pin_transcript_constant_coordinates(
+pub(crate) fn pin_transcript_constant_coordinates(
     b: &mut FieldR1csBuilder,
     coordinates: &[LinExpr],
 ) -> Vec<LinExpr> {
@@ -451,14 +451,14 @@ fn inverse_trace(b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
     inv
 }
 
-fn alloc_f256(b: &mut FieldR1csBuilder, value: F256) -> ExtExpr {
+pub(crate) fn alloc_f256(b: &mut FieldR1csBuilder, value: F256) -> ExtExpr {
     ExtExpr::new(
         LinExpr::from_wire(b.alloc_f128(value.lo)),
         LinExpr::from_wire(b.alloc_f128(value.hi)),
     )
 }
 
-fn inverse_ext_trace(b: &mut FieldR1csBuilder, value: &ExtExpr) -> ExtExpr {
+pub(crate) fn inverse_ext_trace(b: &mut FieldR1csBuilder, value: &ExtExpr) -> ExtExpr {
     let inverse = alloc_f256(b, value.eval(b.values()).inv());
     let product = mul_ext(b, value, &inverse);
     pin_eq_ext(b, &product, &ExtExpr::one());
@@ -506,7 +506,7 @@ pub(super) fn lagrange_weights_window_ext_trace(
         .collect()
 }
 
-fn dot_ext_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) -> ExtExpr {
+pub(crate) fn dot_ext_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) -> ExtExpr {
     assert_eq!(left.len(), right.len());
     left.iter()
         .zip(right)
@@ -515,7 +515,7 @@ fn dot_ext_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) 
         })
 }
 
-fn interpolate_lambda_ext_trace(
+pub(crate) fn interpolate_lambda_ext_trace(
     b: &mut FieldR1csBuilder,
     values: &[ExtExpr],
     k_skip: usize,
@@ -527,7 +527,7 @@ fn interpolate_lambda_ext_trace(
     dot_ext_trace(b, &weights, values)
 }
 
-fn interpolate_combined_ext_trace(
+pub(crate) fn interpolate_combined_ext_trace(
     b: &mut FieldR1csBuilder,
     values: &[ExtExpr],
     k_skip: usize,
@@ -2026,7 +2026,7 @@ fn fri_fold_coset_bits_trace(
     buf.pop().unwrap()
 }
 
-fn flatten_ext_lanes(values: &[ExtExpr]) -> Vec<LinExpr> {
+pub(crate) fn flatten_ext_lanes(values: &[ExtExpr]) -> Vec<LinExpr> {
     let mut lanes = Vec::with_capacity(2 * values.len());
     for value in values {
         lanes.push(value.lo.clone());
@@ -2767,13 +2767,13 @@ pub struct FieldPostCommitTraceContext<'a, C> {
     c1_claims: Vec<C1QuirkyDirectClaimTrace>,
 }
 
-struct FieldPostCommitTraceClaims {
-    base: Vec<QuirkyDirectClaimTrace>,
-    c1: Vec<C1QuirkyDirectClaimTrace>,
+pub(crate) struct FieldPostCommitTraceClaims {
+    pub(crate) base: Vec<QuirkyDirectClaimTrace>,
+    pub(crate) c1: Vec<C1QuirkyDirectClaimTrace>,
 }
 
 impl<'a, C> FieldPostCommitTraceContext<'a, C> {
-    fn new(commitment_root: &'a FlatDigestExpr, total_vars: usize, channel: &'a mut C) -> Self {
+    pub(crate) fn new(commitment_root: &'a FlatDigestExpr, total_vars: usize, channel: &'a mut C) -> Self {
         Self {
             commitment_root,
             total_vars,
@@ -2783,7 +2783,7 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
         }
     }
 
-    fn finish(self) -> FieldPostCommitTraceClaims {
+    pub(crate) fn finish(self) -> FieldPostCommitTraceClaims {
         FieldPostCommitTraceClaims {
             base: self.claims,
             c1: self.c1_claims,

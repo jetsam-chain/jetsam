@@ -261,6 +261,7 @@ fn registrations_are_durable_chain_state_that_follows_the_branch() {
                 Ok(TerminalClientView {
                     carried: None,
                     registry_leaves: Some(vec![[0u8; 32]; CLIENT_REGISTRY_CAPACITY]),
+                    batch: None,
                 })
             },
         )
@@ -361,12 +362,13 @@ fn honest_view(
     let mut after = context.client_registry().digests();
     after.extend(objects.iter().filter_map(|object| match object {
         ClientObject::Registration(registration) => Some(registration.matrix_digest),
-        ClientObject::Submission(_) => None,
+        ClientObject::Submission(_) | ClientObject::BatchSubmission(_) => None,
     }));
     after.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
     TerminalClientView {
         carried,
         registry_leaves: Some(after),
+        batch: None,
     }
 }
 
@@ -679,6 +681,7 @@ fn a_suffix_tip_publishes_the_chains_registry_after_its_block() {
     let (result, height, digests) = run(TerminalClientView {
         carried: None,
         registry_leaves: Some(vec![[0u8; 32]; CLIENT_REGISTRY_CAPACITY]),
+        batch: None,
     });
     refused_with(result, ClientObjectError::RegistryLeavesMismatch);
     assert_eq!(
@@ -822,6 +825,7 @@ fn a_snapshot_carries_the_exact_registry_and_refuses_a_forged_one() {
         TerminalClientView {
             carried: None,
             registry_leaves: Some(leaves),
+            batch: None,
         },
     );
     let install = |claimed: &ClientRegistryState| {
@@ -1238,7 +1242,7 @@ fn paying(
 #[test]
 fn a_block_registering_outside_the_catalogue_is_refused_and_writes_nothing() {
     let _rules = test_rules::install(ClientObjectRules {
-        catalogue: &[[0xA1; 32]],
+        catalogue: test_rules::listing(&[[0xA1; 32]]),
         ..armed_rules()
     });
     let directory = tempfile::tempdir().unwrap();
@@ -1316,7 +1320,7 @@ fn an_empty_catalogue_keeps_every_registration_off_the_chain() {
 #[test]
 fn a_reorg_keeps_the_registry_coherent_under_the_catalogue() {
     let _rules = test_rules::install(ClientObjectRules {
-        catalogue: &[[0xA1; 32], [0xB2; 32]],
+        catalogue: test_rules::listing(&[[0xA1; 32], [0xB2; 32]]),
         ..armed_rules()
     });
     let directory = tempfile::tempdir().unwrap();
@@ -1383,7 +1387,7 @@ fn a_reorg_keeps_the_registry_coherent_under_the_catalogue() {
 #[test]
 fn a_snapshot_registry_outside_the_catalogue_is_refused() {
     let producer_rules = test_rules::install(ClientObjectRules {
-        catalogue: &[[0xD1; 32]],
+        catalogue: test_rules::listing(&[[0xD1; 32]]),
         ..armed_rules()
     });
     let producer_dir = tempfile::tempdir().unwrap();
@@ -1415,6 +1419,7 @@ fn a_snapshot_registry_outside_the_catalogue_is_refused() {
         TerminalClientView {
             carried: None,
             registry_leaves: Some(leaves),
+            batch: None,
         },
     );
     let install = || {
@@ -1447,7 +1452,7 @@ fn a_snapshot_registry_outside_the_catalogue_is_refused() {
     // Under a catalogue without the tool: refused by name, nothing written.
     drop(producer_rules);
     let _consumer_rules = test_rules::install(ClientObjectRules {
-        catalogue: &[[0xA1; 32]],
+        catalogue: test_rules::listing(&[[0xA1; 32]]),
         ..armed_rules()
     });
     let (result, height, installed, durable) = install();

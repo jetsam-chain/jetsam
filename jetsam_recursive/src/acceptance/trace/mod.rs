@@ -55,6 +55,7 @@ pub mod region_source_binding;
 pub mod region_source_binding_c1;
 pub mod segment_compaction;
 pub mod self_verify;
+pub mod self_verify_zk;
 pub mod tx_body_spine;
 pub mod tx_epoch;
 pub mod zk_affine_fold;
@@ -157,6 +158,12 @@ thread_local! {
     /// by multiplying those rejection equations by one authenticated boolean.
     /// The scope is thread-local because matrix builders run in parallel.
     static PIN_GATES: RefCell<Vec<LinExpr>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Depth of this thread's pin-gate stack (diagnostics).
+#[cfg(test)]
+pub(crate) fn pin_gate_depth() -> usize {
+    PIN_GATES.with(|gates| gates.borrow().len())
 }
 
 struct PinGateGuard;

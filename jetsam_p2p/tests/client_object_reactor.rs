@@ -309,7 +309,7 @@ async fn a_held_registration_is_relayed_to_every_node() {
         PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
     let rules = ClientObjectRules::current();
-    let listed = rules.catalogue.first().copied();
+    let listed = rules.catalogue.first().map(|entry| entry.matrix_digest);
     let registration = ClientRegistration {
         matrix_digest: listed.unwrap_or([0x31; 32]),
         matrix_file_root: [0x32; 32],

@@ -385,3 +385,35 @@ async fn a_batch_matrix_file_travels_in_chunks_and_one_over_the_cap_admits_none(
     }
     assert_eq!(MAX_CLIENT_MATRIX_MANIFEST_BYTES, 32 * 256);
 }
+
+/// A v1.6 batch bundle travels on the client-object protocol: its
+/// request round-trips, admits exactly its announced length (within the
+/// batch bound), and the bytes served for it must be exactly its bytes.
+#[tokio::test]
+async fn a_batch_bundle_request_round_trips_and_admits_only_its_bytes() {
+    use crate::client_object_protocol::{ClientBatchId, MAX_CLIENT_BATCH_BUNDLE_BYTES};
+    use jetsam_chain::consensus::client_objects::ClientBatchSubmission;
+    let submission = ClientBatchSubmission {
+        batch_class: [0xD1; 32],
+        statements_root: [0x42; 32],
+        count: 3,
+    };
+    let bytes: Vec<u8> = (0..4_000u32).map(|index| (index % 251) as u8).collect();
+    let id = ClientBatchId::of_bytes(submission, &bytes).unwrap();
+    let request = ClientObjectRequest::Batch(id);
+    assert_eq!(request.expected_len(), Some(bytes.len()));
+    assert_eq!(request_round_trip(request).await.unwrap(), request);
+    assert!(request.matches(&bytes));
+    let mut altered = bytes.clone();
+    altered[17] ^= 1;
+    assert!(!request.matches(&altered));
+    let response = ClientObjectResponse::ready(request, bytes.clone());
+    let decoded = decode_response(encode_response(response).await.unwrap()).await.unwrap();
+    assert_eq!(decoded.bytes.as_deref(), Some(&bytes[..]));
+    // A request admitting no batch: empty, or past the batch bound.
+    for encoded_len in [0u32, MAX_CLIENT_BATCH_BUNDLE_BYTES as u32 + 1] {
+        let request = ClientObjectRequest::Batch(ClientBatchId { encoded_len, ..id });
+        assert_eq!(request.expected_len(), None);
+        assert!(request_round_trip(request).await.is_err());
+    }
+}

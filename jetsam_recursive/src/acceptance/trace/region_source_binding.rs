@@ -6464,6 +6464,123 @@ pub(crate) fn pack_recording_only_blocks(layouts: &[&DuplexLayout]) -> (Vec<usiz
     (offsets, w_log)
 }
 
+/// Chunked twin of [`build_recording_only_duplex_union`]: each recording at
+/// its given offset, spanning only `extent.span` slots — the chunks of its
+/// dyadic block its schedule reaches (every pattern of the block is zero past
+/// the schedule, so the dropped chunks are pure carry either way). Slots
+/// between and after the recordings are pure carry ghosts; every recording
+/// start re-seeds its capacity IV through its own START/const patterns, as in
+/// the dyadic union. Fixed patterns: one gated set per chunk (`refs` = the
+/// first chunk of the first recording, `rec_refs` = every other chunk).
+pub(crate) fn build_recording_only_duplex_union_chunked(
+    recordings: &[RecordingSpec<'_>],
+    placement: &[(usize, crate::region_sidecar::SelectedRoleExtent)],
+    w_log: usize,
+) -> DuplexUnion {
+    assert!(!recordings.is_empty(), "at least one recording block");
+    assert_eq!(recordings.len(), placement.len(), "one placement per recording");
+    let p = 1usize << w_log;
+    let mut order: Vec<usize> = (0..recordings.len()).collect();
+    order.sort_by_key(|&rec| placement[rec].0);
+    let mut end = 0usize;
+    for &rec in &order {
+        let (offset, extent) = placement[rec];
+        let chunk = 1usize << extent.chunk_log;
+        assert!(offset >= end, "recording spans overlap");
+        assert!(
+            offset % chunk == 0
+                && extent.span % chunk == 0
+                && extent.span >= recordings[rec].layout.slots.len()
+                && extent.span <= 1usize << extent.block_log
+                && extent.chunk_log < w_log,
+            "recording span is not a run of its own chunks"
+        );
+        end = offset + extent.span;
+    }
+    assert!(end <= p, "recording spans leave the domain");
+
+    let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut rec_challenges: Vec<Vec<F128>> = vec![Vec::new(); recordings.len()];
+    let mut carry = [F128::ZERO; STATE_SIZE];
+    let mut filled = 0usize;
+    let fill_carry = |committed: &mut [Vec<F128>; 6],
+                      s0: &mut [Vec<F128>; STATE_SIZE],
+                      s_out: &mut [Vec<F128>; STATE_SIZE],
+                      carry: &mut [F128; STATE_SIZE],
+                      from: usize,
+                      to: usize| {
+        for slot in from..to {
+            let (g0, gout) = jetsam_ivc_core::deep_chain::source_tree::run_perm(*carry);
+            for lane in 0..STATE_SIZE {
+                s0[lane][slot] = g0[lane];
+                s_out[lane][slot] = gout[lane];
+                committed[2 + lane][slot] = gout[lane];
+            }
+            *carry = gout;
+        }
+    };
+    for &rec_index in &order {
+        let (offset, extent) = placement[rec_index];
+        fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, filled, offset);
+        let rec = &recordings[rec_index];
+        let span = extent.span;
+        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, extent.block_log);
+        for lane in 0..2 {
+            committed[lane][offset..offset + span].copy_from_slice(&cols.a[lane][..span]);
+        }
+        for lane in 0..STATE_SIZE {
+            committed[2 + lane][offset..offset + span].copy_from_slice(&cols.c[lane][..span]);
+            s0[lane][offset..offset + span].copy_from_slice(&cols.s0[lane][..span]);
+            s_out[lane][offset..offset + span].copy_from_slice(&cols.s_out[lane][..span]);
+        }
+        rec_challenges[rec_index] = cols.challenges;
+        carry = std::array::from_fn(|lane| committed[2 + lane][offset + span - 1]);
+        filled = offset + span;
+    }
+    fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, filled, p);
+
+    let mut fixed: Vec<FixedPattern> = Vec::new();
+    let mut set_refs = Vec::new();
+    for (rec_index, rec) in recordings.iter().enumerate() {
+        let (offset, extent) = placement[rec_index];
+        let chunk = 1usize << extent.chunk_log;
+        let full = duplex_fixed_patterns(&rec.layout, rec.iv_flat, extent.block_log);
+        for start in (0..extent.span).step_by(chunk) {
+            let base = fixed.len();
+            for pattern in &full {
+                fixed.push(
+                    FixedPattern::new(extent.chunk_log, pattern.table[start..start + chunk].to_vec())
+                        .gated(extent.chunk_log, rec_hi_bits(offset + start, extent.chunk_log, w_log)),
+                );
+            }
+            set_refs.push(duplex_family_refs(0, base));
+        }
+    }
+    let refs = set_refs[0];
+    let rec_refs = set_refs[1..].to_vec();
+    let primary_challenges = rec_challenges[0].clone();
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs,
+        layout: recordings[0].layout.clone(),
+        w_log,
+        block_log: placement[0].1.block_log,
+        challenges: vec![primary_challenges],
+        rec_blocks: recordings
+            .iter()
+            .zip(placement)
+            .map(|(rec, (offset, _))| (rec.layout.clone(), *offset))
+            .collect(),
+        rec_refs,
+        rec_challenges,
+    }
+}
+
 /// Recordings-ONLY duplex union: no region-1 channel tiles, just each
 /// recorded transcript as its own gated dyadic block, packed from offset
 /// zero in descending size order (every offset stays self-aligned).  Slots

@@ -23,7 +23,7 @@ use jetsam_poseidon2b::native::permutation::STATE_SIZE;
 
 use super::super::trace::pin_eq;
 
-pub(super) struct BaseSelectableParentRecorder {
+pub(crate) struct BaseSelectableParentRecorder {
     state: [F128; STATE_SIZE],
     buffered: Option<F128>,
     pending: Option<F128>,
@@ -37,7 +37,7 @@ pub(super) struct BaseSelectableParentRecorder {
 }
 
 impl BaseSelectableParentRecorder {
-    pub(super) fn new_c1(domain: &[u8]) -> Self {
+    pub(crate) fn new_c1(domain: &[u8]) -> Self {
         Self::with_profile(domain, fs_c1_lane_iv_flat(), true)
     }
 
@@ -157,7 +157,7 @@ impl BaseSelectableParentRecorder {
         pin_eq(builder, &reconstructed, expression);
     }
 
-    pub(super) fn finish(mut self) -> RecordedChannel {
+    pub(crate) fn finish(mut self) -> RecordedChannel {
         self.close_absorb();
         RecordedChannel {
             ops: self.ops,

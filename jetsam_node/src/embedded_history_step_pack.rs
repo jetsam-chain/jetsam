@@ -125,6 +125,9 @@ pub fn embedded_history_step_pack_for_height(
         HistoryStepPackGeneration::V1 => GENERATED_HISTORY_STEP_PACK.as_ref(),
         HistoryStepPackGeneration::V1_3 => GENERATED_HISTORY_STEP_PACK_V1_3.as_ref(),
         HistoryStepPackGeneration::V1_5 => GENERATED_HISTORY_STEP_PACK_V1_5.as_ref(),
+        // A build whose v1.6 clock is armed without the v1.6 pack is refused
+        // at startup (`v1_6_relation_coverage`).
+        HistoryStepPackGeneration::V1_6 => GENERATED_HISTORY_STEP_PACK_V1_6.as_ref(),
     }
 }
 
@@ -172,6 +175,12 @@ pub fn embedded_history_step_pack_v1_3() -> Option<&'static EmbeddedHistoryStepP
 /// [`embedded_history_step_pack_v1_3`]).
 pub fn embedded_history_step_pack_v1_5() -> Option<&'static EmbeddedHistoryStepPack> {
     GENERATED_HISTORY_STEP_PACK_V1_5.as_ref()
+}
+
+/// The v1.6 pack (batch slot over `D_batch`), whether or not the
+/// v1.6 clock is armed (a build fact, like [`embedded_history_step_pack_v1_5`]).
+pub fn embedded_history_step_pack_v1_6() -> Option<&'static EmbeddedHistoryStepPack> {
+    GENERATED_HISTORY_STEP_PACK_V1_6.as_ref()
 }
 
 /// Which generations some block height from 1 on selects, as
@@ -256,6 +265,9 @@ pub fn embedded_pack_coverage_for_schedule(
                      leave V1_5_ACTIVATION_HEIGHT unset.",
                     v1_5_activation.unwrap_or_default()
                 ),
+                HistoryStepPackGeneration::V1_6 => {
+                    unreachable!("the coverage rule enumerates launch, v1.3 and v1.5 only")
+                }
             });
         }
     }
@@ -263,6 +275,32 @@ pub fn embedded_pack_coverage_for_schedule(
         .filter(|&index| carried[index] && !reachable[index])
         .map(|index| generations[index])
         .collect())
+}
+
+/// Refuse a binary whose v1.6 clock is armed without the v1.6 pack: from
+/// that height on it could verify no block, and every node running it would
+/// stop together at the same block. The same refusal as
+/// [`embedded_pack_coverage_for_schedule`], for the fourth generation.
+pub fn v1_6_relation_coverage(v1_6_activation: Option<u64>) -> Result<(), String> {
+    v1_6_relation_coverage_with(v1_6_activation, embedded_history_step_pack_v1_6().is_some())
+}
+
+/// Testable twin of [`v1_6_relation_coverage`] with the build fact injected.
+pub fn v1_6_relation_coverage_with(
+    v1_6_activation: Option<u64>,
+    carries_v1_6_pack: bool,
+) -> Result<(), String> {
+    match v1_6_activation {
+        None => Ok(()),
+        Some(_) if carries_v1_6_pack => Ok(()),
+        Some(height) => Err(format!(
+            "this binary arms the v1.6 fork at height {height} but embeds no v1.6 HistoryStep \
+             pack: from that height on it could verify no block at all, and every node running \
+             it would stop together at the same block. Rebuild with \
+             JETSAM_HISTORY_STEP_PACK_DIR_V1_6 (and its release digest), or leave \
+             V1_6_ACTIVATION_HEIGHT unset."
+        )),
+    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/history_step_pack.rs"));
@@ -549,6 +587,37 @@ mod advertised_bank_identity_tests {
         .expect("this build's embedded packs cover its own activation clock");
     }
 
+    /// A build that embeds the v1.6 pack covers an armed v1.6 clock;
+    /// the v1.6 pack is the one a v1.6 height selects.
+    #[test]
+    fn an_armed_v1_6_clock_is_covered_by_the_v1_6_pack() {
+        assert_eq!(v1_6_relation_coverage_with(Some(960), true), Ok(()));
+        assert_eq!(v1_6_relation_coverage_with(None, true), Ok(()));
+        assert_eq!(v1_6_relation_coverage_with(None, false), Ok(()));
+        assert_eq!(
+            embedded_history_step_pack_v1_6().is_some(),
+            GENERATED_HISTORY_STEP_PACK_V1_6.is_some()
+        );
+    }
+
+    /// A build without the v1.6 pack: an armed v1.6 clock is refused at
+    /// startup, with the height, and a dormant one is not. This build's own
+    /// clock passes (dormant on both profiles).
+    #[test]
+    fn an_armed_v1_6_clock_is_refused_while_no_build_carries_its_relation() {
+        for height in [960, 11_520, 42_240] {
+            let refusal = v1_6_relation_coverage_with(Some(height), false)
+                .expect_err("an armed v1.6 clock without its relation must be refused");
+            assert!(
+                refusal.contains(&height.to_string()) && refusal.contains("v1.6"),
+                "the refusal names the height and the fork: {refusal}"
+            );
+        }
+        v1_6_relation_coverage(None).expect("a dormant v1.6 clock is covered");
+        v1_6_relation_coverage(jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT)
+            .expect("this build's v1.6 clock is covered");
+    }
+
     /// The two packs are selected by the block's own height, on the one
     /// activation clock: the pre-fork pack below the activation height, the
     /// v1.3 pack at and above it. While that clock is `None` every height
@@ -578,8 +647,16 @@ mod advertised_bank_identity_tests {
         if let Some(j) = v1_5 {
             heights.extend([j.saturating_sub(1), j, j.saturating_add(1)]);
         }
+        // And an armed v1.6 every height from its own on: the v1.5 pack then
+        // covers [J, v1.6 height) only.
+        let v1_6 = jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT;
+        if let Some(k) = v1_6 {
+            heights.extend([k.saturating_sub(1), k, k.saturating_add(1)]);
+        }
         for height in heights {
-            let expected = if matches!(v1_5, Some(j) if height >= j) {
+            let expected = if matches!(v1_6, Some(k) if height >= k) {
+                embedded_history_step_pack_v1_6()
+            } else if matches!(v1_5, Some(j) if height >= j) {
                 embedded_history_step_pack_v1_5()
             } else if matches!(armed, Some(activation) if height >= activation) {
                 embedded_history_step_pack_v1_3()

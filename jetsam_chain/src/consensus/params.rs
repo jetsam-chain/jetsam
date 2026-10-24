@@ -84,6 +84,11 @@ const _: () = assert!(
 /// at 1 080 s, for a difficulty about 1.6 times noisier at steady state.
 pub const HALFLIFE_V1_5: u64 = 540;
 
+/// ASERT halflife in seconds for every child above [`V1_6_ACTIVATION_HEIGHT`]:
+/// **2 160 s**, twelve 180-second blocks. Read through
+/// `difficulty::DifficultySchedule::halflife_at`.
+pub const HALFLIFE_V1_6: u64 = 2_160;
+
 /// Target interval, in seconds, of the block at `height`: [`BLOCK_TIME`] below
 /// [`V1_5_ACTIVATION_HEIGHT`], [`BLOCK_TIME_V1_5`] from it on.
 ///
@@ -402,8 +407,8 @@ pub(crate) const fn v1_4_active_with(height: u64, activation_height: Option<u64>
 
 /// First block height governed by the v1.5 consensus rules.
 ///
-/// **`None` keeps every v1.5 rule dormant**, and that is what the public
-/// profile carries. The test profile carries a provisional height (below); a
+/// **`None` keeps every v1.5 rule dormant**; the public profile carries 38 400.
+/// The test profile carries a provisional height (below); a
 /// binary validates, proves and pays byte for byte what v1.4.3 does until it,
 /// and for ever when this constant is `None`.
 ///
@@ -453,8 +458,27 @@ pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(38400);
 /// later only) or confirmed with the operator the day the test chain is told.
 /// Declared per profile, like [`V1_4_ACTIVATION_HEIGHT`], so that arming one
 /// can never arm the other.
-#[cfg(feature = "testnet")]
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
 pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(960);
+
+/// **Private builds only** (cargo feature `rehearsal-v1-6`): the
+/// test profile with v1.5 at 36, so that a private chain
+/// on a loopback-only network crosses v1.5 and then v1.6 in a few hours.
+/// Never a release build, never a public network. The development schedule
+/// accepts it under the same feature only.
+#[cfg(feature = "rehearsal-v1-6")]
+pub const V1_5_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_5_ACTIVATION);
+
+/// The v1.5 height of a private build (`rehearsal-v1-6`).
+pub const REHEARSAL_V1_5_ACTIVATION: u64 = 36;
+
+/// The v1.6 height of a private build (`rehearsal-v1-6`): above
+/// the private v1.5 height, on a 32-block transaction epoch boundary (v1.6
+/// moves neither the ASERT clock nor the payout cadence; the first payout
+/// after the private v1.5 height is at 516, past the private run). The v1.6
+/// pack does not depend on it (the relation is rooted at a height given at
+/// startup).
+pub const REHEARSAL_V1_6_ACTIVATION: u64 = 64;
 
 /// Whether one candidate block height is governed by the v1.5 rules.
 #[inline]
@@ -467,6 +491,98 @@ pub const fn v1_5_active(height: u64) -> bool {
 pub(crate) const fn v1_5_active_with(height: u64, activation_height: Option<u64>) -> bool {
     matches!(activation_height, Some(activation) if height >= activation)
 }
+
+/// First block height governed by the v1.6 relation: the client slot carries
+/// a recursive batch of client proofs instead of one bare client proof.
+///
+/// **Armed on both profiles**: the public network's height below
+/// (`arm.sh --clock v1.6 --profile mainnet`), the test chain's after it. A
+/// release carries the v1.6 pack generated for its profile. A node refuses to
+/// start when this clock is armed and its build carries no v1.6 pack, rather
+/// than stopping with every other node at the same block
+/// (`jetsam_node::embedded_history_step_pack`).
+///
+/// # What it will switch
+///
+/// The HistoryStep relation: the client arm becomes the batch arm. And the
+/// difficulty rule for every child above it
+/// (`difficulty::DifficultySchedule::v1_6_rule_at`,
+/// [`HALFLIFE_V1_6`]); the block at the height
+/// keeps the v1.5 rule's target, the anchor is floored there
+/// (`difficulty::DifficultySchedule`). It does not move the block interval
+/// or the development schedule, which stay on the v1.5 clock.
+///
+/// # Constraints
+///
+/// Armed only after v1.5 ([`V1_5_ACTIVATION_HEIGHT`] armed, and strictly
+/// below it), on a multiple of 960: that is a multiple of the 480-block
+/// payout cadence after v1.5 (the v1.5 height is itself a multiple of 960),
+/// of the 32-block transaction epoch and of the 6-block ASERT epoch, so the
+/// new relation never starts inside any of them. Checked at compile time by
+/// [`v1_6_schedule_is_valid`].
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// `wire_limits::tests::arming_v1_6_takes_two_deliberate_edits` fails the moment
+/// this value disagrees with the declaration beside it.
+#[cfg(not(feature = "testnet"))]
+pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(46080);
+
+/// The test chain's v1.6 height: 4 800 = 5 × 960, decided
+/// with the operator against the tip of the day. First armed at 6 720, then
+/// moved earlier on a test chain whose every node the operator runs
+/// (`arm.sh --clock v1.6 --advance`, at least 300 blocks above the tip and
+/// every node redeployed before it). Otherwise moved later only
+/// (`arm.sh --clock v1.6 --postpone`); the public network is never moved
+/// earlier. A release of this profile carries the v1.6 test pack.
+/// Declared per profile, like [`V1_5_ACTIVATION_HEIGHT`], so that arming one
+/// can never arm the other.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(4800);
+
+/// **Private builds only** (`rehearsal-v1-6`): v1.6 armed at
+/// [`REHEARSAL_V1_6_ACTIVATION`]. The public network's constant above is not
+/// affected by it.
+#[cfg(feature = "rehearsal-v1-6")]
+pub const V1_6_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_6_ACTIVATION);
+
+/// Whether one candidate block height is governed by the v1.6 relation.
+#[inline]
+pub const fn v1_6_active(height: u64) -> bool {
+    v1_6_active_with(height, V1_6_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_6_active`] with the activation height injected.
+#[inline]
+pub(crate) const fn v1_6_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// Whether a v1.6 height may sit beside a v1.5 height: dormant, or armed
+/// strictly after an armed v1.5, on a multiple of 960.
+pub const fn v1_6_schedule_is_valid(
+    v1_5_activation: Option<u64>,
+    v1_6_activation: Option<u64>,
+) -> bool {
+    match (v1_5_activation, v1_6_activation) {
+        (_, None) => true,
+        (Some(v1_5), Some(v1_6)) => v1_6 > v1_5 && v1_6.is_multiple_of(960),
+        (None, Some(_)) => false,
+    }
+}
+
+#[cfg(not(feature = "rehearsal-v1-6"))]
+const _: () = assert!(
+    v1_6_schedule_is_valid(V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT),
+    "V1_6_ACTIVATION_HEIGHT must be None, or a multiple of 960 strictly above an armed V1_5_ACTIVATION_HEIGHT"
+);
+
+#[cfg(feature = "rehearsal-v1-6")]
+const _: () = assert!(
+    REHEARSAL_V1_6_ACTIVATION > REHEARSAL_V1_5_ACTIVATION
+        && REHEARSAL_V1_6_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS),
+    "the rehearsal v1.6 height sits above the rehearsal v1.5 height, on an epoch boundary"
+);
 
 /// The ASERT anchor target the first post-v1.4 block carries, verbatim.
 ///
@@ -807,9 +923,35 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
     ),
 ];
 
-/// The test chain was reset on 2026-10-07 (walked from block 6): no pin until
-/// the new chain has crossed its own blocks.
-#[cfg(feature = "testnet")]
+/// The test chain was reset on 2026-10-07 (walked from block 6). It crossed
+/// v1.6 at 4 800 on 2026-10-21: 4 799 and 4 800 read
+/// back on 2026-10-22 (`jetsam_getBlockHash` and `jetsam_getHeaderByHeight`)
+/// from the seed, the public RPC and four test nodes, identical everywhere;
+/// each is the `prev_block_hash` of the next one. The nodes left on the v1.5
+/// release hold another 4 800, refused here by its id.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
+    (
+        4799,
+        [
+            0xa7, 0x2a, 0x4b, 0x45, 0x41, 0xf4, 0x8c, 0x10, 0x2e, 0xde, 0x08, 0xe0, 0x13, 0x40,
+            0x94, 0x75, 0x3b, 0xbb, 0x08, 0x09, 0x94, 0xd4, 0x7a, 0xf4, 0x69, 0x04, 0x97, 0x6f,
+            0x5e, 0x19, 0xc6, 0xbe,
+        ],
+    ),
+    (
+        4800,
+        [
+            0x4d, 0xb8, 0x93, 0x58, 0x83, 0xfa, 0x2a, 0xd0, 0x67, 0x69, 0x4d, 0x45, 0x71, 0xc5,
+            0x14, 0xaf, 0x55, 0xe2, 0xcb, 0x38, 0x28, 0x9f, 0xdc, 0x40, 0xbb, 0x33, 0x89, 0x29,
+            0x32, 0x22, 0xa0, 0x7b,
+        ],
+    ),
+];
+
+/// **Private builds only** (`rehearsal-v1-6`): a private build starts a
+/// new private chain, so it carries no pin.
+#[cfg(feature = "rehearsal-v1-6")]
 pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[];
 
 /// The genesis block id the pins in [`HARD_CHECKPOINTS`] were taken on.
@@ -870,14 +1012,21 @@ pub(crate) mod hard_checkpoint_tests {
         assert_eq!(hard_checkpoint_in(&[], 750), None);
     }
 
-    /// The block worth pinning is the activation block — the one whose absence
-    /// the work comparison cannot see. A pin typed one block off would still
-    /// build, still pass every other test, and protect nothing.
-    /// The test chain was reset on 2026-10-07: no pin until it has crossed its
-    /// own activation block, which is then the one to pin.
-    #[cfg(feature = "testnet")]
+    /// The test chain was reset on 2026-10-07 and crossed v1.6 at 4 800 on
+    /// 2026-10-21: it pins `V1_6 − 1` and `V1_6`, nothing else.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
     #[test]
-    fn the_reset_test_chain_carries_no_pin_yet() {
+    fn the_test_chain_pins_the_block_before_its_v1_6_height_and_its_v1_6_block() {
+        let k = V1_6_ACTIVATION_HEIGHT.expect("v1.6 is armed on the test chain");
+        let heights: Vec<u64> = HARD_CHECKPOINTS.iter().map(|(height, _)| *height).collect();
+        assert_eq!(heights, [k - 1, k]);
+    }
+
+    /// A private build (`rehearsal-v1-6`) starts a new private chain:
+    /// it carries no pin.
+    #[cfg(feature = "rehearsal-v1-6")]
+    #[test]
+    fn a_private_build_carries_no_pin() {
         assert!(HARD_CHECKPOINTS.is_empty());
     }
 
@@ -1198,6 +1347,16 @@ pub const MAX_FUTURE_DRIFT: u64 = 120;
 /// Number of previous blocks used for median-time-past.
 pub const MEDIAN_TIME_BLOCKS: usize = 11;
 
+/// From [`V1_6_ACTIVATION_HEIGHT`] on, the most seconds a block's timestamp
+/// may fall below its parent's: **600 s**. Below the height, the median rule
+/// alone.
+///
+/// The bound is wider than the gap the future-drift limit allows between
+/// two honest clocks (a child built on a 120 s slow clock under a parent at
+/// the future limit of a 120 s fast one). Read through
+/// `header::lowest_admitted_timestamp`.
+pub const V1_6_PARENT_TIMESTAMP_LAG: u64 = 600;
+
 // ---------------------------------------------------------------------------
 // Block limits
 // ---------------------------------------------------------------------------
@@ -1359,6 +1518,10 @@ pub fn block_page_class_tier_at_activation(
 /// v1.5 is the third generation: its classes are proved at m = 23 and m = 25
 /// instead of 22 and 24, and its relation carries the client slot. It keeps
 /// the v1.3 ladder, boundary and recursion root.
+///
+/// v1.6 is the fourth: its client slot carries a recursive batch of client
+/// proofs (the batch arm) instead of one client proof. Its relation is
+/// written; its batch class, its pack and its native rules are not yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HistoryStepPackGeneration {
     /// The relation the chain has run on since block one.
@@ -1367,13 +1530,37 @@ pub enum HistoryStepPackGeneration {
     V1_3,
     /// The relation that starts at [`V1_5_ACTIVATION_HEIGHT`].
     V1_5,
+    /// The relation that starts at [`V1_6_ACTIVATION_HEIGHT`].
+    V1_6,
 }
 
 impl HistoryStepPackGeneration {
     /// The generation that governs `height`, under the fixed schedule.
     #[inline]
     pub const fn at_height(height: u64) -> Self {
-        Self::at_schedule(height, V1_3_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT)
+        Self::at_full_schedule(
+            height,
+            V1_3_ACTIVATION_HEIGHT,
+            V1_5_ACTIVATION_HEIGHT,
+            V1_6_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// Testable twin with all three clocks injected. The latest clock wins: a
+    /// height at or above the v1.6 activation is v1.6 whatever the earlier
+    /// clocks say; below it (or with v1.6 dormant) this is [`Self::at_schedule`].
+    #[inline]
+    pub const fn at_full_schedule(
+        height: u64,
+        v1_3_activation: Option<u64>,
+        v1_5_activation: Option<u64>,
+        v1_6_activation: Option<u64>,
+    ) -> Self {
+        if v1_6_active_with(height, v1_6_activation) {
+            Self::V1_6
+        } else {
+            Self::at_schedule(height, v1_3_activation, v1_5_activation)
+        }
     }
 
     /// Testable twin with the v1.3 clock injected and v1.5 dormant. Production
@@ -1385,8 +1572,9 @@ impl HistoryStepPackGeneration {
         Self::at_schedule(height, activation_height, None)
     }
 
-    /// Testable twin with both clocks injected. The later clock wins: a height
-    /// at or above the v1.5 activation is v1.5 whatever the v1.3 clock says.
+    /// Testable twin with the v1.3 and v1.5 clocks injected and v1.6 dormant.
+    /// The later clock wins: a height at or above the v1.5 activation is v1.5
+    /// whatever the v1.3 clock says.
     #[inline]
     pub const fn at_schedule(
         height: u64,
@@ -1408,7 +1596,7 @@ impl HistoryStepPackGeneration {
     pub const fn tiers(self) -> [usize; 2] {
         match self {
             Self::V1 => BLOCK_PAGE_CLASS_TIERS,
-            Self::V1_3 | Self::V1_5 => [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]],
+            Self::V1_3 | Self::V1_5 | Self::V1_6 => [V1_3_TIER_SMALL, BLOCK_PAGE_CLASS_TIERS[1]],
         }
     }
 
@@ -1418,11 +1606,16 @@ impl HistoryStepPackGeneration {
     /// v1.5 moves both classes up by one: the client arm and its share of the
     /// Link carrier (~0.47 M rows, M2 note §14) take the small class past
     /// 2^22 and the large one past 2^24.
+    ///
+    /// v1.6 keeps them: its relation (the batch slot in place of the client
+    /// slot) has 5 416 876 rows in the small class (2^23) and 17 604 564 in
+    /// the large one (2^25), 233 505 more than v1.5 in each (rows gate,
+    /// measured on honest witnesses, both profiles).
     #[inline]
     pub const fn class_ms(self) -> [usize; 2] {
         match self {
             Self::V1 | Self::V1_3 => [22, 24],
-            Self::V1_5 => [23, 25],
+            Self::V1_5 | Self::V1_6 => [23, 25],
         }
     }
 
@@ -1431,6 +1624,14 @@ impl HistoryStepPackGeneration {
     #[inline]
     pub const fn carries_client_slot(self) -> bool {
         matches!(self, Self::V1_5)
+    }
+
+    /// Whether this generation's client slot carries a recursive batch of
+    /// client proofs (the batch arm) instead of one client proof. Only v1.6
+    /// does, and never together with [`Self::carries_client_slot`].
+    #[inline]
+    pub const fn carries_batch_slot(self) -> bool {
+        matches!(self, Self::V1_6)
     }
 
     /// Page positions held by this generation's small class.
@@ -1455,7 +1656,7 @@ impl HistoryStepPackGeneration {
     pub const fn chain_accumulator_lanes(self) -> usize {
         match self {
             Self::V1 => 10,
-            Self::V1_3 | Self::V1_5 => 12,
+            Self::V1_3 | Self::V1_5 | Self::V1_6 => 12,
         }
     }
 
@@ -1469,7 +1670,7 @@ impl HistoryStepPackGeneration {
     pub const fn recursion_root_lanes(self) -> usize {
         match self {
             Self::V1 => 0,
-            Self::V1_3 | Self::V1_5 => self.chain_accumulator_lanes() + 2,
+            Self::V1_3 | Self::V1_5 | Self::V1_6 => self.chain_accumulator_lanes() + 2,
         }
     }
 
@@ -1479,7 +1680,7 @@ impl HistoryStepPackGeneration {
     /// boundary had 90 seconds to be mined. K = 2 from v1.3.
     #[inline]
     pub const fn binds_two_epoch_anchors(self) -> bool {
-        matches!(self, Self::V1_3 | Self::V1_5)
+        matches!(self, Self::V1_3 | Self::V1_5 | Self::V1_6)
     }
 
     /// Whether the recursion root travels in the public IO.
@@ -1498,11 +1699,33 @@ impl HistoryStepPackGeneration {
 /// the blocks up to it.
 #[inline]
 pub const fn history_step_relation_root_height(height: u64) -> u64 {
-    history_step_relation_root_height_with(height, V1_3_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT)
+    history_step_relation_root_height_with_v1_6(
+        height,
+        V1_3_ACTIVATION_HEIGHT,
+        V1_5_ACTIVATION_HEIGHT,
+        V1_6_ACTIVATION_HEIGHT,
+    )
 }
 
-/// Testable twin of [`history_step_relation_root_height`] with both clocks
-/// injected.
+/// Testable twin of [`history_step_relation_root_height`] with all three
+/// clocks injected: a v1.6 relation is rooted at the block before the v1.6
+/// height; below it (or with v1.6 dormant) this is
+/// [`history_step_relation_root_height_with`].
+#[inline]
+pub const fn history_step_relation_root_height_with_v1_6(
+    height: u64,
+    v1_3_activation: Option<u64>,
+    v1_5_activation: Option<u64>,
+    v1_6_activation: Option<u64>,
+) -> u64 {
+    match v1_6_activation {
+        Some(activation) if height >= activation => activation.saturating_sub(1),
+        _ => history_step_relation_root_height_with(height, v1_3_activation, v1_5_activation),
+    }
+}
+
+/// Testable twin of [`history_step_relation_root_height`] with the v1.3 and
+/// v1.5 clocks injected and v1.6 dormant.
 #[inline]
 pub const fn history_step_relation_root_height_with(
     height: u64,
@@ -1517,6 +1740,8 @@ pub const fn history_step_relation_root_height_with(
         HistoryStepPackGeneration::V1 => None,
         HistoryStepPackGeneration::V1_3 => v1_3_activation,
         HistoryStepPackGeneration::V1_5 => v1_5_activation,
+        // `at_schedule` never answers v1.6: its own clock is dormant here.
+        HistoryStepPackGeneration::V1_6 => None,
     };
     match activation {
         Some(activation) => activation.saturating_sub(1),
@@ -2023,8 +2248,13 @@ mod tests {
                 "a dormant v1.5 clock must leave height {height} where it was"
             );
         }
-        // The production schedule, at whatever this profile carries.
+        // The production schedule, at whatever this profile carries, below an
+        // armed v1.6 (above it, `the_v1_6_generation_is_chosen_by_the_blocks_own_height`
+        // checks the production schedule against the full four-clock one).
         for height in [0, 1, 17_750, 24_846, 30_720, u64::MAX] {
+            if V1_6_ACTIVATION_HEIGHT.is_some_and(|v1_6| height >= v1_6) {
+                continue;
+            }
             assert_eq!(
                 HistoryStepPackGeneration::at_height(height),
                 HistoryStepPackGeneration::at_schedule(
@@ -2054,6 +2284,187 @@ mod tests {
         assert!(V1_5.carries_client_slot());
         assert!(!V1_3.carries_client_slot());
         assert!(!V1.carries_client_slot());
+    }
+
+    /// The v1.6 clock counts from its own height, and a dormant clock governs
+    /// no height at all.
+    #[test]
+    fn the_v1_6_clock_counts_from_its_own_height() {
+        assert!(!v1_6_active_with(42_239, Some(42_240)));
+        assert!(v1_6_active_with(42_240, Some(42_240)));
+        assert!(v1_6_active_with(42_241, Some(42_240)));
+        assert!(v1_6_active_with(u64::MAX, Some(42_240)));
+        for height in [0, 1, 38_400, 42_240, 700_800, u64::MAX] {
+            assert!(!v1_6_active_with(height, None));
+        }
+        // Production reads the profile's clock and nothing else.
+        for height in [0, 1, 960, 38_400, 42_240, u64::MAX] {
+            assert_eq!(
+                v1_6_active(height),
+                v1_6_active_with(height, V1_6_ACTIVATION_HEIGHT)
+            );
+        }
+    }
+
+    /// v1.6 comes after an armed v1.5, strictly, on a multiple of 960 (the
+    /// payout cadence after v1.5, the transaction epoch and the ASERT epoch
+    /// all divide it); dormant is always allowed.
+    #[test]
+    fn the_v1_6_height_is_a_multiple_of_960_after_an_armed_v1_5() {
+        for v1_5 in [None, Some(960), Some(38_400)] {
+            assert!(v1_6_schedule_is_valid(v1_5, None));
+        }
+        assert!(v1_6_schedule_is_valid(Some(960), Some(1_920)));
+        assert!(v1_6_schedule_is_valid(Some(960), Some(11_520)));
+        assert!(v1_6_schedule_is_valid(Some(38_400), Some(39_360)));
+        // Not after v1.5: before it, at it, or with v1.5 dormant.
+        assert!(!v1_6_schedule_is_valid(Some(38_400), Some(37_440)));
+        assert!(!v1_6_schedule_is_valid(Some(38_400), Some(38_400)));
+        assert!(!v1_6_schedule_is_valid(None, Some(960)));
+        // Off the 960 cadence, including a multiple of 480 only.
+        assert!(!v1_6_schedule_is_valid(Some(960), Some(1_440)));
+        assert!(!v1_6_schedule_is_valid(Some(960), Some(1_921)));
+        assert!(!v1_6_schedule_is_valid(Some(960), Some(0)));
+        // The schedule this build carries.
+        assert!(v1_6_schedule_is_valid(
+            V1_5_ACTIVATION_HEIGHT,
+            V1_6_ACTIVATION_HEIGHT
+        ));
+    }
+
+    /// v1.6 is the fourth relation. It is chosen by its own clock, at the
+    /// block's own height, over every earlier one; a dormant v1.6 clock leaves
+    /// the three-generation schedule exactly as it was, at every height.
+    #[test]
+    fn the_v1_6_generation_is_chosen_by_the_blocks_own_height() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+        let (v1_3, v1_5, v1_6) = (Some(17_750), Some(38_400), Some(42_240));
+        let at = |height| HistoryStepPackGeneration::at_full_schedule(height, v1_3, v1_5, v1_6);
+        assert_eq!(at(0), V1);
+        assert_eq!(at(17_749), V1);
+        assert_eq!(at(17_750), V1_3);
+        assert_eq!(at(38_399), V1_3);
+        assert_eq!(at(38_400), V1_5);
+        assert_eq!(at(42_239), V1_5);
+        assert_eq!(at(42_240), V1_6);
+        assert_eq!(at(u64::MAX), V1_6);
+        for height in [0, 1, 17_749, 17_750, 38_399, 38_400, 42_240, u64::MAX] {
+            assert_eq!(
+                HistoryStepPackGeneration::at_full_schedule(height, v1_3, v1_5, None),
+                HistoryStepPackGeneration::at_schedule(height, v1_3, v1_5),
+                "a dormant v1.6 clock must leave height {height} where it was"
+            );
+        }
+        // The production schedule, at whatever this profile carries, is the
+        // full one; with v1.6 dormant it is also the three-generation one.
+        for height in [0, 1, 6, 20, 960, 17_750, 24_846, 38_400, u64::MAX] {
+            assert_eq!(
+                HistoryStepPackGeneration::at_height(height),
+                HistoryStepPackGeneration::at_full_schedule(
+                    height,
+                    V1_3_ACTIVATION_HEIGHT,
+                    V1_5_ACTIVATION_HEIGHT,
+                    V1_6_ACTIVATION_HEIGHT
+                )
+            );
+            if V1_6_ACTIVATION_HEIGHT.is_none() {
+                assert_eq!(
+                    HistoryStepPackGeneration::at_height(height),
+                    HistoryStepPackGeneration::at_schedule(
+                        height,
+                        V1_3_ACTIVATION_HEIGHT,
+                        V1_5_ACTIVATION_HEIGHT
+                    )
+                );
+            }
+        }
+    }
+
+    /// Neutrality of a dormant v1.6, height by height: on this profile's
+    /// clocks, with v1.6 dormant, every height from genesis to 1 000 000 (and
+    /// the top of the range) picks the generation and the relation root the
+    /// three-clock schedule picked before v1.6 existed. Answers what this
+    /// build does, so it holds while the clock sleeps and is skipped once a
+    /// profile arms it.
+    #[test]
+    fn a_dormant_v1_6_clock_changes_no_height() {
+        if V1_6_ACTIVATION_HEIGHT.is_some() {
+            return;
+        }
+        for height in (0..=1_000_000u64).chain([u64::MAX - 1, u64::MAX]) {
+            assert_eq!(
+                HistoryStepPackGeneration::at_height(height),
+                HistoryStepPackGeneration::at_schedule(
+                    height,
+                    V1_3_ACTIVATION_HEIGHT,
+                    V1_5_ACTIVATION_HEIGHT
+                ),
+                "height {height}"
+            );
+            assert_eq!(
+                history_step_relation_root_height(height),
+                history_step_relation_root_height_with(
+                    height,
+                    V1_3_ACTIVATION_HEIGHT,
+                    V1_5_ACTIVATION_HEIGHT
+                ),
+                "height {height}"
+            );
+            assert!(!v1_6_active(height), "height {height}");
+        }
+    }
+
+    /// What v1.6 changes in the relation, enumerated beside the others: the
+    /// client slot carries a batch, never a bare client proof; classes,
+    /// ladder, boundary and recursion root are those of v1.5.
+    #[test]
+    fn the_v1_6_generation_answers_its_own_constants() {
+        use HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+        assert_eq!(V1_6.class_ms(), V1_5.class_ms());
+        assert_eq!(V1_6.class_ms(), [23, 25]);
+        assert_eq!(V1_6.tiers(), V1_5.tiers());
+        assert_eq!(V1_6.chain_accumulator_lanes(), 12);
+        assert_eq!(V1_6.recursion_root_lanes(), 14);
+        assert!(V1_6.binds_two_epoch_anchors());
+        assert!(V1_6.carries_recursion_root());
+        assert!(V1_6.carries_batch_slot());
+        assert!(!V1_6.carries_client_slot());
+        for earlier in [V1, V1_3, V1_5] {
+            assert!(
+                !earlier.carries_batch_slot(),
+                "{earlier:?} carries no batch slot"
+            );
+        }
+    }
+
+    /// A v1.6 relation is rooted at the block before the v1.6 height, like
+    /// every relation that starts above genesis; a dormant v1.6 clock leaves
+    /// every root where the three-generation schedule puts it.
+    #[test]
+    fn the_v1_6_relation_is_rooted_before_its_own_height() {
+        let (v1_3, v1_5, v1_6) = (Some(17_750), Some(38_400), Some(42_240));
+        let root = |height| history_step_relation_root_height_with_v1_6(height, v1_3, v1_5, v1_6);
+        assert_eq!(root(1), 0);
+        assert_eq!(root(17_750), 17_749);
+        assert_eq!(root(38_400), 38_399);
+        assert_eq!(root(42_239), 38_399);
+        assert_eq!(root(42_240), 42_239);
+        assert_eq!(root(u64::MAX), 42_239);
+        for height in [0, 1, 17_750, 38_399, 38_400, 42_240, u64::MAX] {
+            assert_eq!(
+                history_step_relation_root_height_with_v1_6(height, v1_3, v1_5, None),
+                history_step_relation_root_height_with(height, v1_3, v1_5),
+            );
+            assert_eq!(
+                history_step_relation_root_height(height),
+                history_step_relation_root_height_with_v1_6(
+                    height,
+                    V1_3_ACTIVATION_HEIGHT,
+                    V1_5_ACTIVATION_HEIGHT,
+                    V1_6_ACTIVATION_HEIGHT
+                )
+            );
+        }
     }
 
     /// A block is judged by the class ladder in force at its own height.
@@ -2286,5 +2697,188 @@ mod tests {
                 assert_eq!(le256_lt_const(a, b), oracle, "guard order: {a:?} < {b:?}");
             }
         }
+    }
+}
+
+/// The pins of the release that follows a v1.6 crossing (lesson of
+/// 2026-10-13): `V1_6 − 1` and `V1_6` in [`HARD_CHECKPOINTS`],
+/// read back from the seeds as raw headers and checked here, not copied by
+/// hand. The v1.6 rule makes the two branches part one block ABOVE the
+/// height (the block at `V1_6` keeps the v1.5 rule's target, so a
+/// not-upgraded `V1_6'` ties ours on work): the pin at `V1_6` is what refuses
+/// the old branch from its first block, and `V1_6 + 1` is read to prove the
+/// pinned id (its parent) and that it carries the v1.6 rule's target.
+#[cfg(test)]
+mod v1_6_crossing_pin_tests {
+    use super::*;
+    use crate::block_header::{block_id, BlockHeader};
+    use crate::consensus::difficulty::{expected_target_in, DifficultySchedule};
+
+    /// The raw headers `V1_6 − 1`, `V1_6`, `V1_6 + 1` (`jetsam_getHeaderByHeight`)
+    /// the test network serves after its v1.6 crossing (block 4 800,
+    /// 2026-10-21): read back on 2026-10-22 from the seed, the public RPC and
+    /// four test nodes, the same bytes everywhere.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = Some([
+        "89bfaee6c689c0ae4ae81f4008920f545e98e2904f67ffa1c4807faf6441036db3f0e6ff3fea3f35f9427b5bf66d407a6d7a19e7ce159ce36cd46fa9d814323c6e4afea807e2f302de9aa4b91dd630fd02ce437e4bc4e4ab2c37eaf90f770a78ec01d86a00000000bf12000000000000373ff7d3ed3a2f9b3cb699b2adaf48f503cb649aa568225bf4153be78307a980a09d0f0259dcf2f1000000000000000020c5e530e52024431ad3e75a6fc42f06dad48e8ccf9971bdee76f222c40f0000180000006b12000000000000e212000000000000",
+        "a72a4b4541f48c102ede08e0134094753bbb080994d47af46904976f5e19c6be8a4daa5c3e30687bd4399b5b959fb8ec5403bc3b9f1d56aa0c70f2508bc87fe8e48b6df440370df31ec1e5a9efe184178d9c9afa65922624dbf59d7cb4b79c6f8103d86a00000000c01200000000000077f42d6aa829ff5ff48b885ffdb47b7f00f77882898de7be9edf5698e583d74e14d9778612562a9000000000000000007d16b7aae1ab927d5cf35681947b7d6b9368f5649c45c42932659fc7490f0000180000005a12000000000000e812000000000000",
+        "4db8935883fa2ad067694d4571c514af55e2cb38289fdc40bb3389293222a07b827e89110ea2192799d6a40b7abd1ee367b4b25515c033b1e5dc1471a909f0b62f0d0fea6f5ca1bcd2a8846dff7b7cf27db5e622c810fa3efa00bd923ca74e3f4b04d86a00000000c11200000000000077f42d6aa829ff5ff48b885ffdb47b7f00f77882898de7be9edf5698e583d74e7f09e72ccccf612e0000000000000000ea0476fc4815f5e267aaf1a942ca42c94457ff981cffa9a6d636d93d6f100000180000004712000000000000ec12000000000000",
+    ]);
+    /// A private build: its private chain is not the test network.
+    #[cfg(feature = "rehearsal-v1-6")]
+    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
+    /// The public network: not crossed yet; its pins come with the release
+    /// that follows its crossing.
+    #[cfg(not(feature = "testnet"))]
+    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
+
+    fn header(hex: &str) -> BlockHeader {
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        BlockHeader::from_bytes(&bytes).expect("a wire header")
+    }
+
+    /// The release's check: `crossing` is `[V1_6 − 1, V1_6, V1_6 + 1]` as
+    /// served; `v1_5_anchor` is the block the v1.5 rule would anchor
+    /// `V1_6 + 1` on and its parent's timestamp (the block `V1_6` itself on a
+    /// production height, a multiple of 960).
+    fn check_v1_6_crossing_pins(
+        pins: &[(u64, [u8; 32])],
+        schedule: &DifficultySchedule,
+        crossing: &[BlockHeader; 3],
+        v1_5_anchor: (&BlockHeader, u64),
+    ) -> Result<(), String> {
+        let k = schedule.v1_6_activation.ok_or("v1.6 is not armed")?;
+        let [before, at, after] = crossing;
+        if (before.height, at.height, after.height) != (k - 1, k, k + 1) {
+            return Err(format!("not the crossing: {} {} {}", before.height, at.height, after.height));
+        }
+        if at.prev_block_hash != block_id(before) || after.prev_block_hash != block_id(at) {
+            return Err("the three headers are not one chain".into());
+        }
+        for header in [before, at] {
+            if hard_checkpoint_in(pins, header.height) != Some(block_id(header)) {
+                return Err(format!("the pin at {} is not the served header's id", header.height));
+            }
+        }
+        // V1_6 + 1 under the v1.6 rule: its anchor is V1_6 (floored there),
+        // paired with the timestamp of V1_6 − 1.
+        if schedule.anchor_height(k) != k {
+            return Err("the v1.6 anchor is not floored at the v1.6 height".into());
+        }
+        let v1_6_target = expected_target_in(schedule, k, at.timestamp, before.timestamp, &at.difficulty_target, k + 1, at.timestamp);
+        if after.difficulty_target != v1_6_target {
+            return Err(format!("{} does not carry the v1.6 rule's target", k + 1));
+        }
+        let v1_5 = DifficultySchedule { v1_6_activation: None, ..*schedule };
+        let (anchor, anchor_parent_timestamp) = v1_5_anchor;
+        if anchor.height != v1_5.anchor_height(k) {
+            return Err("not the v1.5 rule's anchor".into());
+        }
+        let v1_5_target = expected_target_in(&v1_5, anchor.height, anchor.timestamp, anchor_parent_timestamp, &anchor.difficulty_target, k + 1, at.timestamp);
+        if v1_5_target == v1_6_target {
+            return Err(format!("the two rules agree at {}: the crossing proves nothing", k + 1));
+        }
+        Ok(())
+    }
+
+    /// The release that follows a crossing: its pins are the ids of the
+    /// headers the seeds serve. Before the crossing no v1.6 pin exists.
+    #[test]
+    fn the_v1_6_pins_are_the_ids_of_the_crossing_headers_the_seeds_serve() {
+        match (V1_6_ACTIVATION_HEIGHT, V1_6_CROSSING_HEADERS) {
+            (Some(k), Some(raw)) => {
+                let crossing = raw.map(header);
+                check_v1_6_crossing_pins(
+                    HARD_CHECKPOINTS,
+                    &DifficultySchedule::PRODUCTION,
+                    &crossing,
+                    (&crossing[1], crossing[0].timestamp),
+                )
+                .unwrap_or_else(|error| panic!("v1.6 crossing at {k}: {error}"));
+            }
+            (Some(k), None) => assert!(
+                hard_checkpoint(k).is_none() && hard_checkpoint(k - 1).is_none(),
+                "a pin at the v1.6 height without the crossing headers it was read from"
+            ),
+            (None, raw) => assert!(raw.is_none(), "crossing headers without a v1.6 height"),
+        }
+    }
+
+    /// The test chain's nodes left on the v1.5 release mined their own 4 800'
+    /// on the same 4 799 (raw header served by two of them, 2026-10-22): the
+    /// real pin list refuses it, and passes ours.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
+    #[test]
+    fn the_test_chain_pins_refuse_the_old_branch_block_at_the_v1_6_height() {
+        use crate::consensus::header::check_hard_checkpoint;
+        use crate::consensus::ConsensusError::CheckpointMismatch;
+        let raw = V1_6_CROSSING_HEADERS.expect("the test chain has crossed v1.6");
+        let (before, ours) = (header(raw[0]), header(raw[1]));
+        let theirs = header("a72a4b4541f48c102ede08e0134094753bbb080994d47af46904976f5e19c6be402eb4d9e007c44fe5692dc6c693a79b38b9af2e94e630e4a1d2f0306697d991c5ddc59bfe686d08b082ecb1f865e3976f96e67df1f9d7d050b54e12ed46e53ae002d86a00000000c01200000000000087555e7c01546eb4a7fa203e1ae3e913bbc2afbbcbd3f4f18ca1c1917d29a4aaad693a9812562a9000000000000000007d16b7aae1ab927d5cf35681947b7d6b9368f5649c45c42932659fc7490f0000180000006e12000000000000e512000000000000");
+        assert_eq!(theirs.height, ours.height);
+        assert_eq!(theirs.prev_block_hash, block_id(&before), "the same parent");
+        assert_ne!(block_id(&theirs), block_id(&ours));
+        assert_eq!(
+            check_hard_checkpoint(&theirs, HARD_CHECKPOINTS),
+            Err(CheckpointMismatch)
+        );
+        assert_eq!(check_hard_checkpoint(&ours, HARD_CHECKPOINTS), Ok(()));
+        assert_eq!(check_hard_checkpoint(&before, HARD_CHECKPOINTS), Ok(()));
+    }
+
+    /// The same check over a private test chain's real crossing
+    /// (v1.5 at 36, v1.6 at 64; its v1.6 branch and the branch a
+    /// v1.5.1 node kept mining, read from their nodes). Its pins pass; the old
+    /// branch is refused at the pinned height; a pin on the old block refuses
+    /// ours; the old block above the height carries the v1.5 rule's target.
+    #[test]
+    fn the_v1_6_crossing_check_on_a_private_chain() {
+        let rows = |text: &str| -> std::collections::BTreeMap<u64, BlockHeader> {
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let (height, hex) = line.split_once(' ').expect("height hex");
+                    let header = header(hex);
+                    assert_eq!(header.height, height.parse::<u64>().unwrap());
+                    (header.height, header)
+                })
+                .collect()
+        };
+        let new = rows(include_str!("testdata/raw-headers-private-v1-6-52-70.txt"));
+        let old = rows(include_str!("testdata/raw-headers-private-v1-5-branch-59-66.txt"));
+        let schedule = DifficultySchedule {
+            polynomial_fix_height: 0,
+            v1_4_activation: Some(6),
+            v1_4_anchor_target: Some(GENESIS_TARGET),
+            v1_5_activation: Some(36),
+            v1_6_activation: Some(64),
+        };
+        let v1_5_anchor = (&new[&60], new[&59].timestamp);
+        assert_eq!(old[&63], new[&63], "one chain below the height");
+        let pins = [(63, block_id(&new[&63])), (64, block_id(&new[&64]))];
+        let ours = [new[&63], new[&64], new[&65]];
+        let theirs = [old[&63], old[&64], old[&65]];
+        assert_eq!(check_v1_6_crossing_pins(&pins, &schedule, &ours, v1_5_anchor), Ok(()));
+        assert_eq!(
+            check_v1_6_crossing_pins(&pins, &schedule, &theirs, v1_5_anchor),
+            Err("the pin at 64 is not the served header's id".into())
+        );
+        assert_eq!(
+            crate::consensus::header::check_hard_checkpoint(&old[&64], &pins),
+            Err(crate::consensus::ConsensusError::CheckpointMismatch),
+            "the validator refuses the old branch at its first block"
+        );
+        assert_eq!(crate::consensus::header::check_hard_checkpoint(&new[&64], &pins), Ok(()));
+        let their_pins = [(63, block_id(&old[&63])), (64, block_id(&old[&64]))];
+        assert_eq!(
+            check_v1_6_crossing_pins(&their_pins, &schedule, &theirs, v1_5_anchor),
+            Err("65 does not carry the v1.6 rule's target".into())
+        );
+        assert_eq!(
+            old[&64].difficulty_target, new[&64].difficulty_target,
+            "the block at the height keeps the v1.5 rule's target on both branches"
+        );
     }
 }

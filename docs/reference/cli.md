@@ -148,12 +148,37 @@ and `block-header` remain available for every canonical height.
 | Command | Options | Result |
 |---|---|---|
 | `peers` | — | Connected peer count |
+| `adoption` | `--target RELEASE`, `--window SECONDS`, `--node URL`, `--answer FILE`, `--offline` | Versions announced by the peers, and the share running a release |
 | `mining` | — | Difficulty, next reward and mining state |
 | `block-template` | `--miner-addr j1…` | Node-owned external mining template |
 | `submit-block` | `TEMPLATE_ID NONCE_HEX` | Submit one 16-byte little-endian nonce |
 
 The external-mining commands are low-level. `jetsam-miner` handles template
 refresh and nonce encoding automatically.
+
+`adoption` reads `getPeerVersions` and counts, by announced version, the peers
+whose network profile was verified: connected now, and connected or seen
+within `--window` seconds (default 3,600). The share is computed for
+`--target`, a release (`1.6.0`, not matching `1.6.0-dev`) or an exact
+announcement (`"jetsam/1.6.0 (v1.6=4800)"`); by default, what the asked node
+itself announces. Peers whose profile was never verified are listed apart and
+not counted. Use it on the seeds before arming a hardfork:
+
+```sh
+# On each seed (loopback: the answer carries peer identities)
+curl -s -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"jetsam_getPeerVersions","params":[]}' \
+  http://127.0.0.1:9701 > seed1.json
+
+# Anywhere: merge the answers; a peer seen by several seeds counts once
+jetsam-cli adoption --offline --answer seed1.json --answer seed2.json --target 1.6.0
+```
+
+`--node URL` asks another endpoint directly. A public endpoint withholds peer
+identities, so its peers cannot be matched with another node's: the command
+warns that such a peer may be counted twice. A version is a claim, not a proof,
+and old releases announce `rust-libp2p/<version>`. The hashrate share is not
+measured by this command.
 
 ### Fees and mempool
 

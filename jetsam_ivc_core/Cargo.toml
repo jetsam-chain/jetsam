@@ -20,6 +20,7 @@ jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 toml = "0.8"
+zeroize = "1.8"
 
 [dev-dependencies]
 # Used by `LigeritoSecurityConfig` serde round-trip tests.

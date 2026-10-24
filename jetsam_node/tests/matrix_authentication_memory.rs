@@ -86,7 +86,14 @@ const MATRIX_LOG: usize = 16;
 /// `D` is fetched or kept (review B3).
 fn rules_listing(id: &MatrixFileId) -> ClientObjectRules {
     ClientObjectRules {
-        catalogue: Box::leak(vec![id.matrix_digest].into_boxed_slice()),
+        catalogue: Box::leak(
+            vec![jetsam_chain::consensus::client_objects::CatalogueEntry {
+                matrix_digest: id.matrix_digest,
+                matrix_file_root: id.file_root,
+                matrix_file_len: id.file_len,
+            }]
+            .into_boxed_slice(),
+        ),
         ..ClientObjectRules::CONSENSUS
     }
 }
@@ -126,7 +133,7 @@ fn client_matrix() -> (HistoryStepClientForm, MatrixFileId, Vec<u8>) {
 
 /// `id` fetched from a peer serving `file`, every chunk received.
 fn fetched(objects: &ClientObjects, id: MatrixFileId, file: &[u8]) -> AssembledMatrixFile {
-    objects.want_matrices([id]);
+    objects.want_matrices([id.matrix_digest]);
     let peers = [PeerId::random()];
     loop {
         let fetches = objects.next_requests(&peers, Instant::now());
@@ -139,7 +146,7 @@ fn fetched(objects: &ClientObjects, id: MatrixFileId, file: &[u8]) -> AssembledM
                     .nth(index as usize)
                     .unwrap()
                     .to_vec(),
-                ClientObjectRequest::Proof(_) => unreachable!(),
+                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
             };
             match objects.on_fetched(fetch.token, &bytes).unwrap() {
                 ClientObjectFetched::MatrixAssembled(assembled) => return assembled,

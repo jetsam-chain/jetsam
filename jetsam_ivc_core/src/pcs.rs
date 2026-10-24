@@ -537,6 +537,170 @@ pub fn open_batch_quirky_direct_c1<Ch: Challenger>(
     )
 }
 
+/// Form Z (v1.6): the C1 quirky-direct batch plus sparse linear
+/// claims on a few committed cells (the Libra masks' final values). The
+/// sparse values are absorbed after the point claims and before the batching
+/// scalars; each sparse claim adds `gamma * sum_j w_j e_{cell_j}` to the wide
+/// tensor. The v1.5 entry points above are untouched.
+pub fn open_batch_quirky_direct_c1_with_sparse<Ch: Challenger>(
+    packed_witness: &[F128],
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    claims: &[C1QuirkyDirectClaim],
+    sparse: &[crate::zk_form::ZkSparseClaim],
+    challenger: &mut Ch,
+) -> C1BaseFoldProof {
+    use rayon::prelude::*;
+
+    assert!(!claims.is_empty(), "need at least one C1 claim");
+    let length = packed_witness.len();
+    let log_length = length.trailing_zeros() as usize;
+    for claim in claims {
+        assert_eq!(claim.x_rest.len() + claim.k_skip, log_length);
+    }
+    challenger.observe_label(b"history-pcs-open-field-c1");
+    for claim in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-c1");
+        challenger.observe_f256(claim.z_skip);
+        challenger.observe_f256(F256::from_base(F128::new(claim.k_skip as u64, 0)));
+        challenger.observe_f256_slice(&claim.x_rest);
+        challenger.observe_f256(claim.value);
+    }
+    observe_sparse_claims(challenger, sparse);
+    let gammas = (0..claims.len() + sparse.len())
+        .map(|_| challenger.sample_f256())
+        .collect::<Vec<_>>();
+    let mut target = claims
+        .iter()
+        .zip(&gammas)
+        .fold(F256::ZERO, |sum, (claim, &gamma)| sum + gamma * claim.value);
+    for (claim, &gamma) in sparse.iter().zip(&gammas[claims.len()..]) {
+        target += gamma * claim.value;
+    }
+
+    let mut combined = vec![F256::ZERO; length];
+    for (claim, &gamma) in claims.iter().zip(&gammas) {
+        let skip = crate::zerocheck::field_c1::lagrange_weights(claim.k_skip, claim.z_skip, 0);
+        let rest = crate::zerocheck::field_c1::build_eq_table(&claim.x_rest);
+        let skip_mask = (1usize << claim.k_skip) - 1;
+        combined.par_iter_mut().enumerate().for_each(|(index, slot)| {
+            *slot += gamma * skip[index & skip_mask] * rest[index >> claim.k_skip];
+        });
+    }
+    for (claim, &gamma) in sparse.iter().zip(&gammas[claims.len()..]) {
+        for (&cell, &weight) in claim.cells.iter().zip(&claim.weights) {
+            combined[cell] += gamma * weight;
+        }
+    }
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    basefold::prove_c1_with_precomputed_round0_prime(
+        packed_witness,
+        combined,
+        target,
+        &prover_data.codeword,
+        &prover_data.merkle_tree,
+        &ntt,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
+        None,
+        challenger,
+    )
+}
+
+fn observe_sparse_claims<Ch: Challenger>(challenger: &mut Ch, sparse: &[crate::zk_form::ZkSparseClaim]) {
+    challenger.observe_label(b"history-pcs-sparse-c1");
+    for claim in sparse {
+        challenger.observe_f256(F256::from_base(F128::new(claim.cells.len() as u64, 0)));
+        challenger.observe_f256(claim.value);
+    }
+}
+
+/// Verifier twin of [`open_batch_quirky_direct_c1_with_sparse`].
+pub fn verify_opening_batch_quirky_direct_c1_with_sparse<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[C1QuirkyDirectClaimRef<'_>],
+    sparse: &[crate::zk_form::ZkSparseClaim],
+    proof: &C1BaseFoldProof,
+    challenger: &mut Ch,
+) -> Result<(), VerifyError> {
+    assert!(!claims.is_empty(), "need at least one C1 claim");
+    let log_length = commitment.params.m - LOG_PACKING;
+    for claim in claims {
+        assert_eq!(claim.x_rest.len() + claim.k_skip, log_length);
+    }
+    for claim in sparse {
+        if claim.cells.len() != claim.weights.len()
+            || claim.cells.iter().any(|&cell| cell >> log_length != 0)
+        {
+            return Err(VerifyError::FinalBMismatch);
+        }
+    }
+    challenger.observe_label(b"history-pcs-open-field-c1");
+    for claim in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-c1");
+        challenger.observe_f256(claim.z_skip);
+        challenger.observe_f256(F256::from_base(F128::new(claim.k_skip as u64, 0)));
+        challenger.observe_f256_slice(claim.x_rest);
+        challenger.observe_f256(claim.value);
+    }
+    observe_sparse_claims(challenger, sparse);
+    let gammas = (0..claims.len() + sparse.len())
+        .map(|_| challenger.sample_f256())
+        .collect::<Vec<_>>();
+    let mut target = claims
+        .iter()
+        .zip(&gammas)
+        .fold(F256::ZERO, |sum, (claim, &gamma)| sum + gamma * claim.value);
+    for (claim, &gamma) in sparse.iter().zip(&gammas[claims.len()..]) {
+        target += gamma * claim.value;
+    }
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    let challenges = basefold::verify_c1(
+        target,
+        proof,
+        &commitment.root,
+        &ntt,
+        log_length,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        challenger,
+    )
+    .map_err(VerifyError::BaseFold)?;
+    let eq_eval = |left: &[F256], right: &[F256]| {
+        left.iter()
+            .zip(right)
+            .fold(F256::ONE, |product, (&left, &right)| {
+                product * (F256::ONE + left + right)
+            })
+    };
+    let mut expected_final_b = F256::ZERO;
+    for (claim, &gamma) in claims.iter().zip(&gammas) {
+        let skip = crate::zerocheck::field_c1::lagrange_weights(claim.k_skip, claim.z_skip, 0);
+        let eq_skip = crate::zerocheck::field_c1::build_eq_table(&challenges[..claim.k_skip]);
+        let skip_factor = skip
+            .iter()
+            .zip(&eq_skip)
+            .fold(F256::ZERO, |sum, (&weight, &eq)| sum + weight * eq);
+        expected_final_b +=
+            gamma * skip_factor * eq_eval(claim.x_rest, &challenges[claim.k_skip..]);
+    }
+    for (claim, &gamma) in sparse.iter().zip(&gammas[claims.len()..]) {
+        let mut sum = F256::ZERO;
+        for (&cell, &weight) in claim.cells.iter().zip(&claim.weights) {
+            let eq = challenges.iter().enumerate().fold(F256::ONE, |p, (bit, &c)| {
+                if (cell >> bit) & 1 == 1 { p * c } else { p * (F256::ONE + c) }
+            });
+            sum += weight * eq;
+        }
+        expected_final_b += gamma * sum;
+    }
+    if expected_final_b != proof.final_b {
+        return Err(VerifyError::FinalBMismatch);
+    }
+    Ok(())
+}
+
 /// Verify the C1 quirky-direct batch and its wide transparent tensor value.
 pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
     commitment: &Commitment,

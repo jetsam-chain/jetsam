@@ -195,7 +195,9 @@ fn classify(command: &NetworkCommand) -> CommandClass {
     match command {
         Dial { .. }
         | BootstrapComplete
+        | RefusedBranchPeers { .. }
         | PeerCount { .. }
+        | PeerVersions { .. }
         | AdvanceSnapshotGeneration { .. }
         | CancelHistoryStepTerminalRace { .. } => CommandClass::Control,
         AnnounceBlock { .. } | AnnounceAvailability { .. } | FetchHeaders { .. } => {
@@ -211,7 +213,8 @@ fn classify(command: &NetworkCommand) -> CommandClass {
         | RequestMempoolSync { .. }
         | FetchClientObject { .. }
         | AnnounceClientProof { .. }
-        | AnnounceClientRegistration { .. } => CommandClass::Data,
+        | AnnounceClientRegistration { .. }
+        | AnnounceClientBatch { .. } => CommandClass::Data,
     }
 }
 

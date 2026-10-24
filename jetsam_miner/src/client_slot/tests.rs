@@ -186,3 +186,139 @@ fn the_slot_is_the_openings_of_the_kept_markers_in_order() {
     assert_eq!(slot.objects, vec![carried]);
     assert!(slot.carried.is_none());
 }
+
+/// At a v1.6 height a kept batch marker opens the offered batch
+/// submission: it is the block's object and its batch submission. Below the
+/// v1.6 height the batch tag is no marker and opens nothing, and the
+/// height-less slot never reads it.
+#[test]
+fn a_kept_batch_marker_is_the_block_s_batch_submission_from_the_v1_6_height() {
+    use jetsam_chain::consensus::client_objects::{ClientBatchRules, ClientBatchSubmission};
+    const V1_6: u64 = 960;
+    let rules = ClientBatchRules {
+        activation_height: Some(V1_6),
+        ..ClientBatchRules::current()
+    };
+    let submission = ClientBatchSubmission {
+        batch_class: [0xD1; 32],
+        statements_root: [0x42; 32],
+        count: 2,
+    };
+    let batch = ClientObject::BatchSubmission(submission);
+    let offered = OfferedClientObjects {
+        objects: vec![batch],
+        candidate: None,
+    };
+    let registry = ClientRegistryState::new();
+    let pays_batch = page(50, &[(batch.marker(), 0), (Address([8; 32]), 7)]);
+    let plain = page(10, &[(Address([9; 32]), 5)]);
+
+    let slot = client_slot_of_selection_at(&[plain.clone(), pays_batch.clone()], &offered, &registry, V1_6, &rules);
+    assert_eq!(slot.objects, vec![batch]);
+    assert_eq!(slot.batch_submission, Some(submission));
+    assert!(slot.carried.is_none());
+    assert_eq!(slot.registry_leaves, None);
+
+    for slot in [
+        client_slot_of_selection_at(&[pays_batch.clone()], &offered, &registry, V1_6 - 1, &rules),
+        client_slot_of_selection(&[pays_batch.clone()], &offered, &registry),
+        client_slot_of_selection_at(&[plain], &offered, &registry, V1_6, &rules),
+    ] {
+        assert!(slot.objects.is_empty());
+        assert_eq!(slot.batch_submission, None);
+    }
+}
+
+/// Private test chain (2026-10-17): the v1.6 relation's first block, at
+/// the v1.6 height, has no parent proof, and a slot that registers nothing
+/// left its registry leaves to the parent's — none at a base, so the block
+/// published an empty registry. The chain checks a terminal's leaves against
+/// the registry (`check_terminal_client_view`): with a v1.5 entry registered
+/// before the height, every v1.6 block the miner proved at that height was
+/// refused by its own node (`RegistryLeavesMismatch`, twice on the private run
+/// chain) and no v1.6 block could follow. At the base the block publishes
+/// the registry it inherits (a base's leaves are the node's business in the
+/// circuit); above it the circuit keeps the parent's.
+#[test]
+fn the_first_v1_6_block_publishes_the_registry_it_inherits() {
+    use jetsam_chain::consensus::client_objects::{
+        check_terminal_client_view_with, ClientBatchRules, ClientObjectError, ClientObjectRules,
+        TerminalClientView,
+    };
+    const V1_6: u64 = 960;
+    let rules = ClientBatchRules {
+        activation_height: Some(V1_6),
+        ..ClientBatchRules::current()
+    };
+    let objects = ClientObjectRules {
+        activation_height: Some(0),
+        ..ClientObjectRules::current()
+    };
+    let registry = registry_with([0x87; 32]);
+    let offered = OfferedClientObjects::default();
+    let plain = page(10, &[(Address([9; 32]), 5)]);
+    let slot_at = |height: u64, registry: &ClientRegistryState| {
+        with_registry_at_v1_6_base(
+            client_slot_of_selection_at(&[plain.clone()], &offered, registry, height, &rules),
+            registry,
+            height,
+            &rules,
+        )
+    };
+    let mut inherited = vec![[0x87; 32]];
+    inherited.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+    assert_eq!(slot_at(V1_6, &registry).registry_leaves, Some(inherited.clone()));
+    assert_eq!(
+        with_registry_at_v1_6_base(TemplateClientSlot::default(), &registry, V1_6, &rules).registry_leaves,
+        Some(inherited.clone()),
+        "a template built without its client objects too"
+    );
+    assert_eq!(slot_at(V1_6 + 1, &registry).registry_leaves, None, "above the base: the parent's");
+    assert_eq!(slot_at(V1_6 - 1, &registry).registry_leaves, None, "below v1.6: unchanged");
+    assert_eq!(
+        slot_at(V1_6, &ClientRegistryState::new()).registry_leaves,
+        None,
+        "an empty registry: the zero leaves a base publishes anyway"
+    );
+    // A base that registers keeps its own leaves: the inherited ones and the
+    // new entry.
+    let registration = ClientObject::Registration(registration_of(0x3e));
+    let offered_registration = OfferedClientObjects {
+        objects: vec![registration],
+        candidate: None,
+    };
+    let pays_registration = page(20, &[(registration.marker(), 0)]);
+    let registers = with_registry_at_v1_6_base(
+        client_slot_of_selection_at(&[pays_registration], &offered_registration, &registry, V1_6, &rules),
+        &registry,
+        V1_6,
+        &rules,
+    );
+    let mut grown = vec![[0x87; 32], [0x3e; 32]];
+    grown.resize(CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
+    assert_eq!(registers.objects, vec![registration]);
+    assert_eq!(registers.registry_leaves, Some(grown));
+    // What the validator expects of the terminal at the base.
+    let view = |leaves: Vec<[u8; 32]>| TerminalClientView {
+        carried: None,
+        registry_leaves: Some(leaves),
+        batch: None,
+    };
+    let effect = ClientObjectsEffect::default();
+    assert_eq!(
+        check_terminal_client_view_with(&view(inherited), &effect, &registry, V1_6, &objects, &rules),
+        Ok(())
+    );
+    assert_eq!(
+        check_terminal_client_view_with(
+            &view(vec![[0u8; 32]; CLIENT_REGISTRY_CAPACITY]),
+            &effect,
+            &registry,
+            V1_6,
+            &objects,
+            &rules
+        ),
+        Err(ClientObjectError::RegistryLeavesMismatch),
+        "the empty leaves the base published before"
+    );
+}

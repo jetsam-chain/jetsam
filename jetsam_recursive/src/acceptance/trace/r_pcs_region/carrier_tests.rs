@@ -735,6 +735,7 @@ fn link_vk_memo_gain_diagnostic() {
             columns.slices_rec,
             columns.selector_slice,
             geometry.selected_recording_blocks.clone(),
+            geometry.recording_packing,
         )
         .expect("recording VK");
         let assembled = LinkRegionSidecarVk::new(leaf, path, rec).expect("Link VK");
@@ -1014,6 +1015,115 @@ mod client_slot {
             !built.r1cs.satisfies(&built.z),
             "a substituted client proof satisfied the carrier"
         );
+    }
+
+    /// The two-proof carrier with its L-C roles packed by chunk: every role
+    /// spans only the chunks its longest arm reaches and a role may start
+    /// inside the previous role's dyadic block. Over real proofs the trace is
+    /// satisfiable for either arm, the three Link walks prove and verify with
+    /// every terminal claim holding on the witness, arm selection moves
+    /// witness values only, and the key is a new one.
+    #[test]
+    fn chunked_two_proof_carrier_discharges_parent_and_client() {
+        let parents = ParentFixtures::new();
+        let client = ProofFixture::new(CLIENT_M, 0xC11E_0011);
+        let dyadic = client_geometry(&parents, &client);
+        let geometry = client_geometry(&parents, &client)
+            .with_chunked_recordings()
+            .expect("chunked two-proof carrier geometry");
+        let spans = geometry.recording_role_spans();
+        let dyadic_spans = dyadic.recording_role_spans();
+        eprintln!(
+            "[carrier] L-C roles (offset, span): dyadic {dyadic_spans:?} 2^{}, chunked {spans:?} 2^{}",
+            dyadic.rec_w_log(),
+            geometry.rec_w_log()
+        );
+        assert!(geometry.rec_w_log() <= dyadic.rec_w_log());
+        assert!(
+            spans.iter().zip(&dyadic_spans).any(|(chunked, dyadic)| chunked.1 < dyadic.1),
+            "the fixture drops no chunk: the test would not test chunking"
+        );
+        assert!(
+            spans.iter().zip(&dyadic_spans).any(|((offset, _), (start, size))| {
+                *offset > *start && *offset < start + size
+            }) || spans.iter().any(|(offset, _)| {
+                dyadic_spans
+                    .iter()
+                    .any(|(start, size)| *offset > *start && *offset < start + size)
+            }),
+            "no role starts inside another role's dyadic block"
+        );
+        let dyadic_vk = dyadic.canonical_vk(&test_spec()).expect("dyadic key");
+        let vk = geometry.canonical_vk(&test_spec()).expect("chunked key");
+        assert_ne!(vk.transcript_digest(), dyadic_vk.transcript_digest());
+
+        let mut observed = Vec::new();
+        for active in 0..2 {
+            let built = build_two_proof(&parents, &geometry, active, &client, &client, true);
+            assert!(
+                built.r1cs.satisfies(&built.z),
+                "honest chunked two-proof carrier (arm {active})"
+            );
+            prove_and_verify_link_only(&built.preparation, &built.z)
+                .expect("chunked two-proof Link walks");
+            assert_eq!(built.preparation.vk(), &vk, "prepared VK is the canonical VK");
+            observed.push((built.wires, hex(&built.r1cs.structural_statement_digest())));
+        }
+        assert_eq!(observed[0], observed[1], "arm selection moved the matrix");
+    }
+
+    /// Chunked packing keeps every L-C slot bound: a carry slot inside a
+    /// role's span but past its schedule, a gap slot past every span, or a
+    /// recorded data cell, altered in the committed witness, breaks the Link
+    /// walks; a substituted client proof leaves the trace unsatisfiable.
+    #[test]
+    fn chunked_carrier_binds_every_recording_slot() {
+        let parents = ParentFixtures::new();
+        let verified = ProofFixture::new(CLIENT_M, 0xC11E_0012);
+        let substituted = ProofFixture::new(CLIENT_M, 0xC11E_0013);
+        let geometry = client_geometry(&parents, &verified)
+            .with_chunked_recordings()
+            .expect("chunked geometry");
+        let built = build_two_proof(&parents, &geometry, 1, &substituted, &verified, true);
+        assert!(
+            !built.r1cs.satisfies(&built.z),
+            "a substituted client proof satisfied the chunked carrier"
+        );
+
+        let built = build_two_proof(&parents, &geometry, 1, &verified, &verified, true);
+        assert!(built.r1cs.satisfies(&built.z), "control: honest");
+        prove_and_verify_link_only(&built.preparation, &built.z).expect("control: honest walks");
+        let rec = built.preparation.vk().rec_c();
+        let spans = geometry.recording_role_spans();
+        // The role whose schedule stops shortest of its span (arm 1).
+        let (role, (offset, span)) = spans
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(role, (_, span))| {
+                span - rec.selected_block(1, *role).expect("role").0.slots.len()
+            })
+            .expect("roles");
+        let schedule = rec.selected_block(1, role).expect("role").0.slots.len();
+        assert!(schedule < span, "a carry slot inside the span");
+        let end = spans.iter().map(|(offset, span)| offset + span).max().unwrap();
+        assert!(end < 1usize << rec.w_log(), "a gap slot past every span");
+        let data_slot = duplex_data_positions(&rec.selected_block(1, role).unwrap().0)[0];
+        for (name, column, slot) in [
+            ("carry slot inside a span", 2, offset + schedule),
+            ("gap slot past every span", 3, end),
+            ("recorded data cell", data_slot.1, offset + data_slot.0),
+        ] {
+            let mut z = built.z.clone();
+            z[rec.slices()[column].start() + slot] += F128::ONE;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                built.r1cs.satisfies(&z) && prove_and_verify_link_only(&built.preparation, &z).is_ok()
+            }));
+            assert!(
+                !matches!(outcome, Ok(true)),
+                "an altered {name} passed the chunked carrier"
+            );
+        }
     }
 
     /// `client_present = 0` releases every client obligation (a block without
@@ -1665,6 +1775,151 @@ mod client_slot {
             ghost_build.r1cs.structural_statement_digest(),
             present_build.r1cs.structural_statement_digest(),
             "client presence moved the matrix"
+        );
+    }
+
+    /// The v1.6 client slot end to end at test scale (parents m = 8 / 9,
+    /// the test batch class): the carrier walks the batch proof (slot role)
+    /// and records the chain arm's transcript with its L-C roles packed by
+    /// chunk; the relation's batch slot runs over the block's batch lanes and
+    /// its parent's; the carrier region discharges the batch's obligations.
+    /// A junction batch and the ghost of a block without one are both
+    /// satisfiable, both Link walks prove and verify, and they pay the same
+    /// matrix. Real batch proofs: release-only.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only: real batch-step proofs (hours in a debug build)")]
+    fn a_v1_6_batch_slot_rides_the_link_carrier() {
+        use crate::acceptance::client_batch::chain_arm::{
+            batch_slot_trace, chain_batch_transcript_layout, prepare_batch_slot_lanes,
+            prepare_chain_batch, prepare_chain_batch_ghost, BatchIoCells, PreparedChainBatch,
+        };
+        use crate::acceptance::client_batch::step::ClientBatchFirst;
+        use crate::acceptance::client_batch::tests::{fixture, tree};
+        use crate::acceptance::history_step_bank::HistoryStepBatchIoLanes;
+
+        let batch = fixture();
+        let parts = &batch.class.parts;
+        let lanes = HistoryStepBatchIoLanes::at(
+            0,
+            batch.form.shape().k_log,
+            batch.form.registry_depth(),
+            parts.layout.k_log_batch,
+        );
+        // The parent's lanes: the tree's chain step; the block's batch: a
+        // junction on them.
+        let chain_lanes = batch.decide(&tree().chain).unwrap().public;
+        let mut input = batch.input(ClientBatchFirst::Batch(&tree().leaf_a), None);
+        input.incoming_entries = chain_lanes.out_entries.clone();
+        input.incoming_self = chain_lanes.out_self.clone();
+        let (junction, _) = batch.step(&input);
+        // The parent block's batch lanes: the registry, the chain step's
+        // outgoing entry lanes and its D_batch lane.
+        let mut parent_io = vec![F128::ZERO; lanes.end()];
+        let install = |io: &mut [F128], at: crate::acceptance::history_step_bank::HistoryStepBankLaneLayout,
+                       claim: Option<&jetsam_ivc_core::matrix_claim::c1::C1MatrixAccClaim>| {
+            if let Some(claim) = claim {
+                for (pair, coordinate) in io[at.point..at.value].chunks_exact_mut(2).zip(&claim.point) {
+                    pair[0] = coordinate.lo;
+                    pair[1] = coordinate.hi;
+                }
+                io[at.value] = claim.value.lo;
+                io[at.value + 1] = claim.value.hi;
+                io[at.live] = F128::ONE;
+            }
+        };
+        for (index, leaf) in batch.leaves().iter().enumerate() {
+            let at = lanes.registry_leaf(index);
+            parent_io[at..at + 2].copy_from_slice(&flat_digest_lanes(leaf));
+        }
+        for (index, claim) in chain_lanes.out_entries.iter().enumerate() {
+            install(&mut parent_io, lanes.entry_lane(index), claim.as_ref());
+        }
+        install(&mut parent_io, lanes.batch_self_lane(), chain_lanes.out_self.as_ref());
+        let parents = ParentFixtures::new();
+        let layout = chain_batch_transcript_layout(batch.class.identity()).unwrap();
+        let geometry = parents
+            .geometry()
+            .with_client(&parts.pcs_params, layout)
+            .expect("batch-slot geometry")
+            .with_chunked_recordings()
+            .expect("chunked L-C");
+        let build = |prepared: &PreparedChainBatch| -> TwoProofBuild {
+            let mut io = vec![F128::ZERO; lanes.end()];
+            prepare_batch_slot_lanes(&lanes, prepared, Some(&parent_io), &batch.leaves(), &mut io)
+                .expect("block lanes");
+            let (children, r_prev) = parent_scratches(&parents);
+            let proofs = parents.tiers.iter().map(ProofFixture::r_pcs).collect::<Vec<_>>();
+            let mut b = FieldR1csBuilder::new();
+            let columns = prepare_history_step_carrier_columns(
+                &mut b,
+                &proofs,
+                0,
+                &geometry,
+                children,
+                r_prev,
+                ClientCarrierColumns {
+                    proof: prepared.carrier_proof(parts),
+                    recording: prepared.scratch.clone(),
+                },
+            )
+            .expect("batch-slot carrier columns");
+            let selectors = arm_selectors(&mut b, 0);
+            let arms = replay_parent_arms(&mut b, &parents, &selectors);
+            let cells = io.iter().map(|v| LinExpr::from_wire(b.alloc_f128(*v))).collect::<Vec<_>>();
+            let parent_cells = parent_io
+                .iter()
+                .map(|v| LinExpr::from_wire(b.alloc_f128(*v)))
+                .collect::<Vec<_>>();
+            let parent_gate = LinExpr::from_wire(b.alloc_bool(true));
+            let slot = batch_slot_trace(
+                &mut b,
+                batch.class.identity(),
+                &BatchIoCells::from_io(&lanes, &cells),
+                &BatchIoCells::from_io(&lanes, &parent_cells),
+                &parent_gate,
+                prepared,
+            )
+            .expect("batch slot");
+            let preparation = finalize_history_step_carrier_region(
+                &mut b,
+                columns,
+                &arms.obligations,
+                &selectors,
+                &arms.children,
+                &arms.r_prev,
+                ClientCarrierDischarge {
+                    obligations: &slot.obligations,
+                    recorded: &slot.recorded,
+                    gate: &slot.gate,
+                    parent_gate: Some(&parent_gate),
+                },
+            )
+            .expect("batch-slot carrier region");
+            let wires = b.num_wires();
+            let (r1cs, z) = b.build();
+            TwoProofBuild {
+                r1cs,
+                z,
+                wires,
+                preparation,
+            }
+        };
+        let present = prepare_chain_batch(&batch.class, &junction).expect("junction");
+        let present_build = build(&present);
+        eprintln!("[batch-slot carrier] v1.6 slot + carrier at test scale: {} rows", present_build.wires);
+        assert!(present_build.r1cs.satisfies(&present_build.z), "junction block");
+        prove_and_verify_link_only(&present_build.preparation, &present_build.z)
+            .expect("junction block Link walks");
+        let ghost = prepare_chain_batch_ghost(batch.class.identity()).unwrap();
+        let ghost_build = build(&ghost);
+        assert!(ghost_build.r1cs.satisfies(&ghost_build.z), "block without a batch");
+        prove_and_verify_link_only(&ghost_build.preparation, &ghost_build.z)
+            .expect("ghost block Link walks");
+        assert_eq!(ghost_build.wires, present_build.wires);
+        assert_eq!(
+            ghost_build.r1cs.structural_statement_digest(),
+            present_build.r1cs.structural_statement_digest(),
+            "batch presence moved the matrix"
         );
     }
 
@@ -2834,6 +3089,382 @@ mod client_slot {
         );
         let honest_tip = prepare_client_arm_on(&form, None, &honest.carry(), &leaves).expect("ghost");
         assert_eq!(chain.check_claim(&parsed(&form, &block_io(&form, &honest_tip))), Ok(()));
+    }
+
+    // ---- v1.6: the carrier shared with a batch step -------------------------
+    //
+    // A batch step (v1.6) reuses this carrier with arms that record no Block
+    // child, and the HistoryStep client arm with its transcript padded to the
+    // L-C role it shares with a longer batch transcript. HistoryStep itself
+    // keeps its child role and an unpadded arm: its pins do not move.
+
+    /// The two-proof carrier without the child role, over real proofs:
+    /// `[R]_prev` then the client, both selected arms.
+    fn build_without_child(
+        parents: &ParentFixtures,
+        geometry: &HistoryStepParentGeometry,
+        active: usize,
+        carried: &ProofFixture,
+        verified: &ProofFixture,
+    ) -> TwoProofBuild {
+        let (_, r_prev) = parent_scratches(parents);
+        let proofs = parents
+            .tiers
+            .iter()
+            .map(ProofFixture::r_pcs)
+            .collect::<Vec<_>>();
+        let mut b = FieldR1csBuilder::new();
+        let columns = prepare_history_step_carrier_columns(
+            &mut b,
+            &proofs,
+            active,
+            geometry,
+            Vec::new(),
+            r_prev,
+            ClientCarrierColumns {
+                proof: carried.r_pcs(),
+                recording: verified.scratch(),
+            },
+        )
+        .expect("child-less carrier columns");
+        let selectors = arm_selectors(&mut b, active);
+        let mut obligations = Vec::new();
+        let mut recorded_r_prev = Vec::new();
+        for (arm, tier) in parents.tiers.iter().enumerate() {
+            let (tier_obligations, recorded) = tier.replay(&mut b, Some(&selectors[arm]));
+            obligations.push(tier_obligations);
+            recorded_r_prev.push(recorded);
+        }
+        let client_gate = LinExpr::from_wire(b.alloc_bool(true));
+        let (client_obligations, client_recorded) = verified.replay(&mut b, Some(&client_gate));
+        let preparation = finalize_history_step_carrier_region(
+            &mut b,
+            columns,
+            &obligations,
+            &selectors,
+            &[],
+            &recorded_r_prev,
+            ClientCarrierDischarge {
+                obligations: &client_obligations,
+                recorded: &client_recorded,
+                gate: &client_gate,
+                parent_gate: None,
+            },
+        )
+        .expect("child-less carrier region");
+        let wires = b.num_wires();
+        let (r1cs, z) = b.build();
+        TwoProofBuild {
+            r1cs,
+            z,
+            wires,
+            preparation,
+        }
+    }
+
+    /// A carrier whose selected arms record no Block child: `[R]_prev` is L-C
+    /// role 0 and the client role 1, in both arms. Over real proofs the trace
+    /// is satisfiable for either arm and the three Link walks prove and
+    /// verify; a substituted client proof is unsatisfiable; Block-child
+    /// recordings are refused by such a carrier, and it is built for exactly
+    /// two tiers.
+    #[test]
+    fn a_carrier_without_a_child_role_discharges_parent_and_client() {
+        let parents = ParentFixtures::new();
+        let client = ProofFixture::new(CLIENT_M, 0xC11E_0E21);
+        let r_prev_layouts = || {
+            parents
+                .tiers
+                .iter()
+                .map(|tier| tier.scratch().layout)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            HistoryStepParentGeometry::new_without_child(&parents.params()[..1], r_prev_layouts()[..1].to_vec())
+                .is_err(),
+            "one tier"
+        );
+        let geometry = HistoryStepParentGeometry::new_without_child(&parents.params(), r_prev_layouts())
+            .expect("child-less parent geometry")
+            .with_client(&client.params, client.scratch().layout)
+            .expect("child-less two-proof geometry");
+        assert_eq!(geometry.tier_count(), 2);
+        let vk = geometry.canonical_vk(&test_spec()).expect("child-less key");
+        let with_child = client_geometry(&parents, &client)
+            .canonical_vk(&test_spec())
+            .expect("HistoryStep key");
+        assert_ne!(vk.transcript_digest(), with_child.transcript_digest());
+        for (arm, layout) in r_prev_layouts().iter().enumerate() {
+            assert_eq!(vk.rec_c().selected_block(arm, 0).map(|role| &role.0), Some(layout));
+            assert_eq!(
+                vk.rec_c().selected_block(arm, 1).map(|role| role.0.clone()),
+                Some(client.scratch().layout)
+            );
+            assert!(vk.rec_c().selected_block(arm, 2).is_none(), "two roles only");
+        }
+
+        let mut observed = Vec::new();
+        for active in 0..2 {
+            let built = build_without_child(&parents, &geometry, active, &client, &client);
+            assert!(built.r1cs.satisfies(&built.z), "honest child-less carrier (arm {active})");
+            prove_and_verify_link_only(&built.preparation, &built.z)
+                .expect("child-less Link walks");
+            assert_eq!(built.preparation.vk(), &vk, "prepared VK is the canonical VK");
+            observed.push((built.wires, hex(&built.r1cs.structural_statement_digest())));
+        }
+        assert_eq!(observed[0], observed[1], "arm selection moved the matrix");
+
+        let substituted = ProofFixture::new(CLIENT_M, 0xC11E_0E22);
+        let built = build_without_child(&parents, &geometry, 1, &substituted, &client);
+        assert!(!built.r1cs.satisfies(&built.z), "a substituted client proof was accepted");
+
+        let (children, r_prev) = parent_scratches(&parents);
+        let proofs = parents.tiers.iter().map(ProofFixture::r_pcs).collect::<Vec<_>>();
+        let mut b = FieldR1csBuilder::new();
+        assert!(prepare_history_step_carrier_columns(
+            &mut b,
+            &proofs,
+            0,
+            &geometry,
+            children,
+            r_prev,
+            ClientCarrierColumns {
+                proof: client.r_pcs(),
+                recording: client.scratch(),
+            },
+        )
+        .is_err());
+    }
+
+    /// The client arm may absorb constant padding after its fold (a batch
+    /// step pads it into the L-C role it shares with a longer transcript).
+    /// Zero padding is the HistoryStep arm, value for value; a padded arm
+    /// records a longer transcript, moves no IO lane, is the same from a
+    /// cached pre-pass, and rides a carrier keyed on its padded layout.
+    #[test]
+    fn client_arm_padding_is_none_in_history_step_and_lengthens_the_transcript() {
+        use crate::acceptance::history_step::client_arm::{
+            client_transcript_layout_padded, prepare_client_arm_on_padded,
+            PreparedHistoryStepClient,
+        };
+        let parents = ParentFixtures::new();
+        let form = test_client_form();
+        let witness = client_witness(&form, 0xC11E_0E23, 1);
+        let empty = HistoryStepClientCarry::empty(&form);
+        let leaves = witness.registry.leaves();
+        let unpadded = prepare_client_arm(&form, Some(&witness)).expect("registered client");
+        let zero = prepare_client_arm_on_padded(&form, Some(&witness), &empty, &leaves, 0)
+            .expect("zero padding");
+        assert!(zero.same_pre_pass(&unpadded), "zero padding moved the arm");
+        assert_eq!(
+            client_transcript_layout_padded(&form, 0).expect("layout"),
+            client_transcript_layout(&form).expect("layout")
+        );
+
+        let pad = 4096;
+        let padded = prepare_client_arm_on_padded(&form, Some(&witness), &empty, &leaves, pad)
+            .expect("padded client");
+        let padded_layout = client_transcript_layout_padded(&form, pad).expect("padded layout");
+        assert_eq!(padded.scratch().layout, padded_layout, "ghost and present pad alike");
+        assert!(
+            padded_layout.slots.len() > unpadded.scratch().layout.slots.len(),
+            "padding records nothing"
+        );
+        assert_eq!(client_io(&form, &padded), client_io(&form, &unpadded), "padding moved a lane");
+        let cached = PreparedHistoryStepClient::prepare(&form, &witness).expect("cached pre-pass");
+        assert!(cached
+            .arm_on_padded(&empty, &leaves, pad)
+            .expect("cached padded arm")
+            .same_pre_pass(&padded));
+
+        let geometry = parents
+            .geometry()
+            .with_client(form.pcs_params(), padded_layout)
+            .expect("carrier keyed on the padded layout");
+        let io = client_io(&form, &padded);
+        let built = build_with_client_arm(&parents, &geometry, &form, &padded, &io);
+        assert!(built.r1cs.satisfies(&built.z), "padded client arm");
+        prove_and_verify_link_only(&built.preparation, &built.z).expect("padded client Link walks");
+    }
+
+    /// The client arm exports its one-hot entry selector: the client's
+    /// registry entry for a present client, entry 0 for the ghost.
+    #[test]
+    fn the_client_arm_exports_its_entry_selector() {
+        let form = test_client_form();
+        let selector_of = |prepared: &PreparedClientArm| {
+            let io = client_io(&form, prepared);
+            let mut b = FieldR1csBuilder::new();
+            let cells = io
+                .iter()
+                .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
+                .collect::<Vec<_>>();
+            let cells = ClientIoCells::from_io(&client_lanes(&form), &cells);
+            let parent = vec![F128::ZERO; io.len()]
+                .iter()
+                .map(|value| LinExpr::from_wire(b.alloc_f128(*value)))
+                .collect::<Vec<_>>();
+            let parent = ClientIoCells::from_io(&client_lanes(&form), &parent);
+            let parent_gate = LinExpr::from_wire(b.alloc_f128(F128::ZERO));
+            let arm = client_arm_trace(&mut b, &form, &cells, &parent, &parent_gate, prepared);
+            arm.selector
+                .iter()
+                .map(|cell| cell.eval(b.values()))
+                .collect::<Vec<_>>()
+        };
+        let one_hot = |entry: usize| {
+            (0..form.registry_capacity())
+                .map(|index| if index == entry { F128::ONE } else { F128::ZERO })
+                .collect::<Vec<_>>()
+        };
+        let witness = client_witness(&form, 0xC11E_0E24, 2);
+        let entry = witness
+            .registry
+            .position(&witness.matrix.structural_statement_digest())
+            .expect("registered");
+        assert_eq!(entry, 2);
+        let present = prepare_client_arm(&form, Some(&witness)).expect("registered client");
+        assert_eq!(selector_of(&present), one_hot(entry));
+        let ghost = prepare_client_arm(&form, None).expect("ghost client");
+        assert_eq!(selector_of(&ghost), one_hot(0));
+    }
+
+    /// The v1.6 carrier gate, at production scale. The released v1.5 key, rebuilt
+    /// from the released v1.3 layouts and the client transcript with the
+    /// DYADIC packing, is the key the v1.5 derivation produces (and, when
+    /// `JETSAM_V15_RUNTIME` names a released v1.5 pack, the key of that
+    /// pack): the chunked packing moves no released key. The same carrier
+    /// re-packed by chunk is a new key that costs nothing: same committed
+    /// Link cells (884 737) and the same parent-arm replay of the joint
+    /// sidecar (401 762 rows), measured on the prototype.
+    #[test]
+    #[ignore = "production scale: v1.5 key rebuilt and re-packed by chunk (release, reads the v1.3 pack)"]
+    fn the_released_v1_5_key_is_rebuilt_and_its_chunked_repacking_costs_nothing() {
+        use crate::acceptance::history_step::derive_history_step_runtime_parts_in;
+        use crate::acceptance::history_step_bank::{
+            canonical_history_step_pcs_params_in, canonical_history_step_shape_in,
+            history_step_bank_io_spec_for, CanonicalHistoryStepClassId,
+        };
+        use crate::acceptance::trace::self_verify::{
+            shape_only_field_r1cs_proof_c1,
+            verify_field_c1_trace_deferred_region_with_post_commit_context_expr,
+        };
+        use jetsam_chain::consensus::params::HistoryStepPackGeneration::V1_5;
+
+        let released = released_v13_parts();
+        let started = std::time::Instant::now();
+        let v15 = derive_history_step_runtime_parts_in(V1_5, released.direct_block_vks().clone())
+            .expect("v1.5 runtime parts");
+        eprintln!("[e2-gate] v1.5 runtime parts derived in {:.1} s", started.elapsed().as_secs_f64());
+        if let Ok(path) = std::env::var("JETSAM_V15_RUNTIME") {
+            let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+            let body = &bytes[26..bytes.len() - 32];
+            let pack = crate::acceptance::history_step::HistoryStepRuntimeParts::decode_compact(&body[64..])
+                .expect("decode released v1.5 runtime parts");
+            assert_eq!(pack.generation(), V1_5);
+            assert_eq!(
+                pack.parent_recursion_vk().transcript_digest(),
+                v15.parent_recursion_vk().transcript_digest(),
+                "the derived v1.5 key is the released pack's"
+            );
+            eprintln!("[e2-gate] derived v1.5 key = key of the released pack {path}");
+        }
+
+        let form = HistoryStepClientForm::canonical();
+        let client_layout = client_transcript_layout(&form).expect("client layout");
+        let params = (0..2)
+            .map(|slot| {
+                canonical_history_step_pcs_params_in(V1_5, CanonicalHistoryStepClassId::new(slot).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let child = v15.parent_transcripts().iter().map(|t| t.child().clone()).collect::<Vec<_>>();
+        let r_prev = v15.parent_transcripts().iter().map(|t| t.r_prev().clone()).collect::<Vec<_>>();
+        let spec = history_step_bank_io_spec_for(V1_5);
+        let dyadic = HistoryStepParentGeometry::new(&params, child, r_prev)
+            .expect("v1.5 parent geometry")
+            .with_client(form.pcs_params(), client_layout)
+            .expect("v1.5 client role");
+        let chunked = dyadic.clone().with_chunked_recordings().expect("chunked v1.5 carrier");
+        let dyadic_vk = dyadic.canonical_vk(&spec).expect("dyadic key");
+        let chunked_vk = chunked.canonical_vk(&spec).expect("chunked key");
+        assert_eq!(
+            dyadic_vk.transcript_digest(),
+            v15.parent_recursion_vk().transcript_digest(),
+            "the rebuilt v1.5 key is the derived one"
+        );
+        assert_ne!(chunked_vk.transcript_digest(), dyadic_vk.transcript_digest(), "a new key");
+        let dyadic_spans = dyadic.recording_role_spans();
+        let chunked_spans = chunked.recording_role_spans();
+        eprintln!(
+            "[e2-gate] L-C roles (offset, span) child/[R]_prev/client: dyadic {dyadic_spans:?} 2^{}, chunked {chunked_spans:?} 2^{}",
+            dyadic.rec_w_log(),
+            chunked.rec_w_log()
+        );
+        assert!(
+            chunked_spans.iter().zip(&dyadic_spans).all(|(c, d)| c.1 <= d.1)
+                && chunked_spans.iter().zip(&dyadic_spans).any(|(c, d)| c.1 < d.1),
+            "the chunked key drops no chunk"
+        );
+        let cells = |vk: &LinkRegionSidecarVk| committed_link_cells(vk).iter().sum::<usize>();
+        eprintln!(
+            "[e2-gate] committed Link cells: dyadic {} (L-A 2^{} L-B 2^{} L-C 2^{}), chunked {} (L-C 2^{})",
+            cells(&dyadic_vk),
+            dyadic_vk.leaf_a().w_log(),
+            dyadic_vk.path_b().w_log(),
+            dyadic_vk.rec_c().w_log(),
+            cells(&chunked_vk),
+            chunked_vk.rec_c().w_log()
+        );
+        assert_eq!(cells(&dyadic_vk), 884_737);
+        assert_eq!(cells(&chunked_vk), 884_737);
+
+        // A parent arm's replay of the joint sidecar under each key.
+        let block_vk = &released.direct_block_vks()[0];
+        let class = CanonicalHistoryStepClassId::new(0).unwrap();
+        let shape = canonical_history_step_shape_in(V1_5, class);
+        let pcs_params = canonical_history_step_pcs_params_in(V1_5, class);
+        let replay = |vk: &LinkRegionSidecarVk| {
+            let (proof, root) = shape_only_field_r1cs_proof_c1(&shape, &pcs_params);
+            let sidecar =
+                crate::region_sidecar::shape_only_joint_c1_region_sidecar_proof(vk, block_vk, shape.m)
+                    .expect("shape-only joint sidecar");
+            let mut b = FieldR1csBuilder::new_witness_only();
+            let digest = alloc_flat_digest(&mut b, &[3u8; 32]);
+            let post_commit = alloc_flat_digest(&mut b, &[4u8; 32]);
+            let root = alloc_flat_digest(&mut b, &root);
+            let io = (0..spec.io_len)
+                .map(|_| LinExpr::from_wire(b.alloc_f128(F128::ZERO)))
+                .collect::<Vec<_>>();
+            let trace = C1FieldR1csProofTrace::alloc_shape_mode(&mut b, &proof, &shape, &pcs_params, false);
+            let mut channel = FsChannelUnionRecorder::new_c1(b"e2-gate-replay");
+            let mut rows = 0;
+            verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+                &mut b,
+                &mut channel,
+                &shape,
+                &pcs_params,
+                &digest,
+                &root,
+                &trace,
+                &spec,
+                &io,
+                &post_commit,
+                Some(&mut PcsWalkObligations::default()),
+                |b, context| {
+                    let before = b.num_wires();
+                    crate::region_sidecar::verify_joint_c1_region_sidecar_trace_post_commit(
+                        b, context, vk, block_vk, &sidecar,
+                    )
+                    .expect("joint sidecar replay");
+                    rows = b.num_wires() - before;
+                },
+            );
+            rows
+        };
+        let (dyadic_rows, chunked_rows) = (replay(&dyadic_vk), replay(&chunked_vk));
+        eprintln!("[e2-gate] parent-arm joint sidecar replay: dyadic {dyadic_rows} rows, chunked {chunked_rows} rows");
+        assert_eq!(dyadic_rows, 401_762);
+        assert_eq!(chunked_rows, 401_762);
     }
 
     fn test_spec() -> jetsam_ivc_core::public_io::PublicIoSpec {

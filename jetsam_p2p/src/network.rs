@@ -1270,6 +1270,7 @@ struct AutomaticPeerState {
     discovery_learned: bool,
     discovery_failures: u8,
     next_discovery_at: Instant,
+    refused_branch: std::collections::HashSet<PeerId>,
 }
 
 impl AutomaticPeerState {
@@ -1292,7 +1293,38 @@ impl AutomaticPeerState {
             discovery_learned: false,
             discovery_failures: 0,
             next_discovery_at: initial_discovery_at,
+            refused_branch: std::collections::HashSet::new(),
         }
+    }
+
+    /// The node's current verdicts: peers proven on a branch it refuses
+    /// (seen on a v1.6 private test chain). Such a peer is useless as a neighbour,
+    /// so it neither counts toward the topology nor replaces a seed, and
+    /// this node's own selected connections to it are released. Connections
+    /// it opened itself are left alone.
+    fn set_refused_branch_peers(&mut self, peers: impl IntoIterator<Item = PeerId>) {
+        let refused = peers.into_iter().collect::<std::collections::HashSet<_>>();
+        let changed = refused
+            .symmetric_difference(&self.refused_branch)
+            .copied()
+            .collect::<Vec<_>>();
+        self.refused_branch = refused;
+        for peer in changed {
+            self.refresh_selected_identified(peer);
+        }
+    }
+
+    /// Ordinary neighbour connections this node selected to a peer on a
+    /// refused branch: each one holds a slot a useful neighbour needs.
+    fn refused_neighbour_connections(&self) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
+        self.managed_connections
+            .iter()
+            .filter(|(_, connection)| {
+                matches!(connection.kind, ManagedOutboundKind::Peer)
+                    && self.refused_branch.contains(&connection.peer)
+            })
+            .map(|(connection_id, connection)| (*connection_id, connection.peer))
+            .collect()
     }
 
     fn register_bootstrap(&mut self, addr: Multiaddr) {
@@ -1407,7 +1439,11 @@ impl AutomaticPeerState {
             .identified_connections
             .values()
             .copied()
-            .filter(|peer| !bootstrap.contains(peer) && !selected.contains(peer))
+            .filter(|peer| {
+                !bootstrap.contains(peer)
+                    && !selected.contains(peer)
+                    && !self.refused_branch.contains(peer)
+            })
             .collect::<std::collections::HashSet<_>>()
             .len()
             .min(MAX_UNSELECTED_TOPOLOGY_CREDIT);
@@ -1449,6 +1485,7 @@ impl AutomaticPeerState {
 
     fn refresh_selected_identified(&mut self, peer: PeerId) {
         let usable = self.locally_selected_peers.contains(&peer)
+            && !self.refused_branch.contains(&peer)
             && self
                 .identified_connections
                 .values()
@@ -1568,6 +1605,7 @@ impl AutomaticPeerState {
             .is_some_and(|connected| *connected == peer)
             && !self.managed_connections.contains_key(&connection_id)
             && !self.is_bootstrap_peer(peer)
+            && !self.refused_branch.contains(&peer)
             && self.topology_peer_count() <= AUTOMATIC_OUTBOUND_TARGET;
         if adopt_discovered_transport {
             self.track_managed_connection(connection_id, peer, ManagedOutboundKind::Peer);
@@ -3018,9 +3056,18 @@ pub enum NetworkCommand {
     /// Initial chain synchronization is complete; bootstrap connections may be
     /// released once enough ordinary outbound peers are available.
     BootstrapComplete,
+    /// The complete current list of peers the node has proven on a branch it
+    /// refuses. Local topology only, never sent on the wire: none of them
+    /// holds a neighbour slot or replaces a seed while listed.
+    RefusedBranchPeers { peers: Vec<PeerId> },
     /// Get current peer count.
     PeerCount {
         reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    /// The software version each identified peer announced (informative:
+    /// measures adoption, decides nothing).
+    PeerVersions {
+        reply: tokio::sync::oneshot::Sender<Vec<crate::peer_versions::ObservedPeerVersion>>,
     },
     /// Fetch one exact content-addressed object set from one candidate source.
     /// The token is node-local and is returned unchanged in the result.
@@ -3110,6 +3157,10 @@ pub enum NetworkCommand {
     AnnounceClientRegistration {
         notice: Arc<crate::client_object_protocol::ClientRegistrationNotice>,
     },
+    /// Publish a v1.6 batch announcement on the client topic.
+    AnnounceClientBatch {
+        announcement: crate::client_object_protocol::ClientBatchAnnouncement,
+    },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -3122,6 +3173,13 @@ pub enum NetworkEvent {
         from: PeerId,
         relayed_by: PeerId,
         announcement: crate::client_object_protocol::ClientProofAnnouncement,
+    },
+    /// A v1.6 batch announcement, with its provider candidates as
+    /// for a client proof.
+    ClientBatchAnnounced {
+        from: PeerId,
+        relayed_by: PeerId,
+        announcement: crate::client_object_protocol::ClientBatchAnnouncement,
     },
     /// A v1.5 client registration relayed on the client topic, its payment
     /// already checked to open and pay it; the node checks the payment
@@ -3632,6 +3690,22 @@ impl P2PNetwork {
     pub async fn peer_count(&self) -> Option<usize> {
         Self::peer_count_via(&self.cmd_tx).await
     }
+
+    /// The version every identified peer announced, connected or recently
+    /// gone, or `None` when the P2P task could not be asked.
+    pub async fn peer_versions_via(
+        cmd: &NetworkCommandSender,
+    ) -> Option<Vec<crate::peer_versions::ObservedPeerVersion>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if cmd
+            .send(NetworkCommand::PeerVersions { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3811,6 +3885,7 @@ async fn run_swarm(
     // enter the same bounded automatic manager as DNS bootstrap sources, so a
     // restart cannot create a second untracked dial burst.
     let mut successful_peer_cache = crate::peer_store::load(&data_dir);
+    let mut observed_peer_versions = crate::peer_versions::ObservedPeerVersions::default();
     let local_peer_id = *swarm.local_peer_id();
     let mut automatic_peers = AutomaticPeerState::new(local_peer_id);
     for peer in successful_peer_cache.entries() {
@@ -3981,6 +4056,7 @@ async fn run_swarm(
                 &mut pending_history_step_requests,
                 &mut automatic_peers,
                 &sync_paths,
+                &observed_peer_versions,
             )
             .await;
         }
@@ -4043,6 +4119,7 @@ async fn run_swarm(
                     &mut relay_reservations,
                     &mut relay_circuit_backoff,
                     &mut successful_peer_cache,
+                    &mut observed_peer_versions,
                 )
                 .await;
             }
@@ -4508,6 +4585,7 @@ async fn run_swarm(
                         &mut pending_history_step_requests,
                         &mut automatic_peers,
                         &sync_paths,
+                        &observed_peer_versions,
                     )
                     .await,
                     // Handled by the client-object transport.
@@ -5357,6 +5435,16 @@ fn maintain_automatic_outbound(
         // starting replacement dials on the next two-second maintenance tick.
         return;
     }
+    // Already out of every count below; closing frees the transport slot.
+    // An active relay carrier stays, as in every other release.
+    for (connection_id, peer) in automatic.refused_neighbour_connections() {
+        if relay_reservations.protects_peer(peer) {
+            continue;
+        }
+        if swarm.close_connection(connection_id) {
+            tracing::debug!(peer = %peer, "released a neighbour on a refused branch");
+        }
+    }
     let stable_non_bootstrap = automatic.stable_non_bootstrap_peer_count(now);
     let desired_bootstrap = desired_bootstrap_connections(
         automatic.bootstrap_complete,
@@ -5527,6 +5615,7 @@ fn maintain_automatic_outbound(
                 && !candidate.addrs.is_empty()
                 && !bootstrap_peers.contains(peer)
                 && !pending_peers.contains(peer)
+                && !automatic.refused_branch.contains(peer)
                 && !swarm.is_connected(peer)
         })
         .map(|(peer, candidate)| {
@@ -5707,6 +5796,10 @@ fn client_transport_command(
             transport.announce_registration(swarm, &notice);
             None
         }
+        NetworkCommand::AnnounceClientBatch { announcement } => {
+            transport.announce_batch(swarm, announcement);
+            None
+        }
         cmd => Some(cmd),
     }
 }
@@ -5750,6 +5843,7 @@ async fn handle_network_command(
     >,
     automatic_peers: &mut AutomaticPeerState,
     sync_paths: &PeerSyncPaths,
+    observed_peer_versions: &crate::peer_versions::ObservedPeerVersions,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
@@ -5851,9 +5945,17 @@ async fn handle_network_command(
             automatic_peers.bootstrap_complete = true;
             tracing::debug!("initial synchronization complete — bootstrap peers are releasable");
         }
+        NetworkCommand::RefusedBranchPeers { peers } => {
+            automatic_peers.set_refused_branch_peers(peers);
+        }
         NetworkCommand::PeerCount { reply } => {
             let count = sync_paths.dispatchable_peer_count();
             let _ = reply.send(count);
+        }
+        NetworkCommand::PeerVersions { reply } => {
+            let _ = reply.send(
+                observed_peer_versions.snapshot(|peer| sync_paths.profile_verified.contains(peer)),
+            );
         }
         NetworkCommand::FetchObjects {
             token,
@@ -6311,7 +6413,8 @@ async fn handle_network_command(
         }
         NetworkCommand::FetchClientObject { .. }
         | NetworkCommand::AnnounceClientProof { .. }
-        | NetworkCommand::AnnounceClientRegistration { .. } => {
+        | NetworkCommand::AnnounceClientRegistration { .. }
+        | NetworkCommand::AnnounceClientBatch { .. } => {
             // Routed to the client-object transport before this dispatcher.
         }
         NetworkCommand::RequestMempoolSync { peer } => {
@@ -6411,6 +6514,7 @@ async fn handle_swarm_event(
     relay_reservations: &mut RelayReservations,
     relay_circuit_backoff: &mut RelayCircuitBackoff,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
+    observed_peer_versions: &mut crate::peer_versions::ObservedPeerVersions,
 ) {
     let implicit_bootstraps = stop_implicit_kad_bootstraps(swarm);
     if implicit_bootstraps > 0 {
@@ -6773,6 +6877,11 @@ async fn handle_swarm_event(
                     successful_peer_cache.record_success(peer_id, addr);
                 }
             }
+            // Informative only: recorded for the operator's adoption count,
+            // after every admission decision above, and read by nothing else.
+            let seen_unix = crate::peer_versions::unix_now_secs();
+            observed_peer_versions.observe(peer_id, &info.agent_version, seen_unix);
+            successful_peer_cache.note_agent_version(peer_id, &info.agent_version);
 
             // 2. Arm one bounded random lookup now that at least one routable
             //    peer is present. It starts later on an identity-jittered
@@ -6840,6 +6949,7 @@ async fn handle_swarm_event(
                 if peer_id == *swarm.local_peer_id()
                     || swarm.is_connected(&peer_id)
                     || automatic_peers.is_locally_selected(peer_id)
+                    || automatic_peers.refused_branch.contains(&peer_id)
                 {
                     continue;
                 }
@@ -9135,6 +9245,11 @@ async fn handle_swarm_event(
             if num_established == 0 {
                 automatic_peers.clear_local_selection(peer_id);
                 relay_reservations.retire_peer(swarm, peer_id);
+                observed_peer_versions.disconnected(
+                    peer_id,
+                    crate::peer_versions::unix_now_secs(),
+                    sync_paths.profile_verified.contains(&peer_id),
+                );
                 sync_paths.clear_profile_verified(peer_id);
                 pending_network_profile_requests.take_where(|pending| pending.peer == peer_id);
                 block_event_rate.remove(&peer_id);
@@ -10399,6 +10514,118 @@ mod tests {
         assert_eq!(desired_bootstrap_connections(true, 0, 3), 2);
         assert_eq!(desired_bootstrap_connections(true, 0, 1), 1);
         assert_eq!(desired_bootstrap_connections(true, 0, 0), 0);
+    }
+
+    /// Seen on a v1.6 private test chain (2026-10-22): a v1.6 miner
+    /// started with v1.6 seeds only while two nodes of the old branch were
+    /// online. Kademlia adopted the two old nodes as ordinary neighbours; 30 s
+    /// later they counted as the stable replacements of both seeds, the seeds
+    /// were released, and the miner was left with peers whose blocks it
+    /// refuses: mining paused four times. A peer the node has proven on a
+    /// branch it refuses replaces no seed, holds no neighbour slot, has its
+    /// selected connections released and is not adopted again while the
+    /// verdict holds.
+    #[test]
+    fn a_peer_on_a_refused_branch_replaces_no_seed_and_holds_no_neighbour_slot() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        for index in 0..INITIAL_BOOTSTRAP_FANOUT {
+            let addr: Multiaddr = format!("/ip4/203.0.113.{}/tcp/9500", index + 1)
+                .parse()
+                .unwrap();
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(400 + index);
+            let seed = PeerId::random();
+            state.register_bootstrap(addr.clone());
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr));
+            state.note_connection_established(connection_id, seed, true);
+            state.note_identified(connection_id, seed);
+        }
+        let old = [PeerId::random(), PeerId::random()];
+        let old_connections = [
+            libp2p::swarm::ConnectionId::new_unchecked(410),
+            libp2p::swarm::ConnectionId::new_unchecked(411),
+        ];
+        for (peer, connection_id) in old.iter().zip(old_connections) {
+            // Kademlia's own transports, adopted as ordinary neighbours.
+            state.note_connection_established(connection_id, *peer, true);
+            state.note_identified(connection_id, *peer);
+        }
+        let stable = Instant::now() + AUTOMATIC_PEER_HEALTHY_AFTER;
+        let configured = state.bootstrap.len();
+        assert_eq!(
+            desired_bootstrap_connections(
+                true,
+                state.stable_non_bootstrap_peer_count(stable),
+                configured
+            ),
+            0,
+            "without a verdict two stable neighbours replace both seeds"
+        );
+
+        state.set_refused_branch_peers(old);
+
+        assert_eq!(state.stable_non_bootstrap_peer_count(stable), 0);
+        assert_eq!(
+            desired_bootstrap_connections(
+                true,
+                state.stable_non_bootstrap_peer_count(stable),
+                configured
+            ),
+            INITIAL_BOOTSTRAP_FANOUT,
+            "a peer on a refused branch replaces no seed"
+        );
+        assert_eq!(
+            state.connected_bootstrap_peer_ids().len(),
+            INITIAL_BOOTSTRAP_FANOUT
+        );
+        assert_eq!(state.topology_peer_count(), 0, "nor holds a neighbour slot");
+        let released = state
+            .refused_neighbour_connections()
+            .into_iter()
+            .map(|(connection_id, _)| connection_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(released, old_connections.into_iter().collect());
+
+        // Another transport Kademlia opens to it is not adopted again.
+        let again = libp2p::swarm::ConnectionId::new_unchecked(412);
+        state.note_connection_established(again, old[0], true);
+        state.note_identified(again, old[0]);
+        assert!(!state.managed_connections.contains_key(&again));
+
+        // The verdict ended: a still-connected selected peer is a neighbour again.
+        state.set_refused_branch_peers([]);
+        assert_eq!(state.topology_peer_count(), old.len());
+        assert!(state.refused_neighbour_connections().is_empty());
+    }
+
+    /// The seed side of the same case: a configured seed proven on a refused branch
+    /// fills no bootstrap place, so another seed is dialled. Its connection is
+    /// kept: a seed is the operator's explicit choice.
+    #[test]
+    fn a_seed_on_a_refused_branch_fills_no_bootstrap_place() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        let mut seeds = Vec::new();
+        for index in 0..INITIAL_BOOTSTRAP_FANOUT {
+            let addr: Multiaddr = format!("/ip4/203.0.113.{}/tcp/9500", index + 1)
+                .parse()
+                .unwrap();
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(420 + index);
+            let seed = PeerId::random();
+            state.register_bootstrap(addr.clone());
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr));
+            state.note_connection_established(connection_id, seed, true);
+            state.note_identified(connection_id, seed);
+            seeds.push(seed);
+        }
+
+        state.set_refused_branch_peers([seeds[0]]);
+
+        assert_eq!(state.connected_bootstrap_peer_ids(), vec![seeds[1]]);
+        assert!(state.refused_neighbour_connections().is_empty());
     }
 
     #[test]

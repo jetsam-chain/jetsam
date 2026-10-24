@@ -3093,9 +3093,23 @@ impl MdbxChainContext {
                 .ok_or(MdbxContextError::Corrupt(
                     "canonical ASERT anchor header is missing",
                 ))?;
+        // The block just below the anchor (the anchor itself at genesis). It
+        // is at most seven below the tip, inside the window `prev_timestamps`
+        // already requires.
+        let anchor_parent_timestamp = match anchor_height.checked_sub(1) {
+            None => anchor_header.timestamp,
+            Some(height) => {
+                self.get_header_from_store(height)?
+                    .ok_or(MdbxContextError::Corrupt(
+                        "canonical ASERT anchor parent header is missing",
+                    ))?
+                    .timestamp
+            }
+        };
         Ok(AnchorInfo {
             anchor_height,
             anchor_timestamp: anchor_header.timestamp,
+            anchor_parent_timestamp,
             anchor_target: anchor_header.difficulty_target,
         })
     }
@@ -3146,9 +3160,7 @@ mod tests {
         // `validate_header_inner` calls, so the blocks it builds carry exactly
         // the target the validator demands.
         let target = crate::consensus::expected_target(
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
+            &anchor,
             parent.height.saturating_add(1),
             parent.timestamp,
         );
@@ -3195,12 +3207,14 @@ mod tests {
             crate::consensus::client_objects::ClientObject::Registration(registration) => {
                 Some(registration.matrix_digest)
             }
-            crate::consensus::client_objects::ClientObject::Submission(_) => None,
+            crate::consensus::client_objects::ClientObject::Submission(_)
+            | crate::consensus::client_objects::ClientObject::BatchSubmission(_) => None,
         }));
         leaves.resize(crate::consensus::client_objects::CLIENT_REGISTRY_CAPACITY, [0u8; 32]);
         TerminalClientView {
             carried: None,
             registry_leaves: Some(leaves),
+            batch: None,
         }
     }
 
@@ -3456,7 +3470,23 @@ mod tests {
         let anchor = context.anchor_info().unwrap();
         assert_eq!(anchor.anchor_height, 0);
         assert_eq!(anchor.anchor_timestamp, genesis.timestamp);
+        assert_eq!(anchor.anchor_parent_timestamp, genesis.timestamp, "genesis has no parent");
         assert_eq!(anchor.anchor_target, genesis.difficulty_target);
+
+        // v1.6: the anchor's parent timestamp comes from the
+        // canonical row just below the anchor, never from the anchor itself.
+        context.recent_headers = (1..=11)
+            .map(|height| {
+                let mut header = occupancy_header(height, 0);
+                header.timestamp = 5_000 + height * 7;
+                (height, header)
+            })
+            .collect();
+        context.tip_height = 11;
+        let anchor = context.anchor_info().unwrap();
+        assert_eq!(anchor.anchor_height, 6);
+        assert_eq!(anchor.anchor_timestamp, 5_000 + 6 * 7);
+        assert_eq!(anchor.anchor_parent_timestamp, 5_000 + 5 * 7);
     }
 
     #[test]
@@ -3480,6 +3510,15 @@ mod tests {
             context.anchor_info(),
             Err(MdbxContextError::Corrupt(
                 "canonical ASERT anchor header is missing"
+            ))
+        ));
+
+        context.recent_headers.insert(6, occupancy_header(6, 0));
+        context.recent_headers.remove(&5);
+        assert!(matches!(
+            context.anchor_info(),
+            Err(MdbxContextError::Corrupt(
+                "canonical ASERT anchor parent header is missing"
             ))
         ));
     }

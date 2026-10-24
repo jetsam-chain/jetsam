@@ -505,7 +505,11 @@ impl NodeBehaviour {
         // Identify
         // ----------------------------------------------------------------
         //
-        // Tells connected peers our listen addresses and supported protocols.
+        // Tells connected peers our listen addresses and supported protocols,
+        // and our release (`peer_versions::local_agent_version`), read back
+        // only to measure adoption before a hardfork. The protocol version
+        // string stays "/jetsam/1.0.0": the release is not a compatibility
+        // claim, and no peer is judged by it.
         // CRITICAL: the event handler in network.rs MUST call
         //   `kad.add_address(peer_id, addr)` for every listen address
         //   received via `identify::Event::Received`.
@@ -513,6 +517,7 @@ impl NodeBehaviour {
         // the DHT only stores addresses it has been explicitly told about.
         let identify = identify::Behaviour::new(
             identify::Config::new("/jetsam/1.0.0".into(), key.public())
+                .with_agent_version(crate::peer_versions::local_agent_version())
                 .with_push_listen_addr_updates(true)
                 // Re-identify periodically so address changes propagate.
                 .with_interval(Duration::from_secs(300)),

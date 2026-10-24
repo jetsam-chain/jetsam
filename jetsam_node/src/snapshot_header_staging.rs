@@ -988,23 +988,14 @@ fn validate_next_header(
     }
     let (finalized_active_counts, expansion_len) =
         finalized_active_counts_for_parent(parent.height, window)?;
-    let anchor_height = asert_anchor_height(parent.height);
-    let anchor = window
-        .iter()
-        .find(|ancestor| ancestor.height == anchor_height)
-        .ok_or(SnapshotHeaderStagingError::InvalidCandidate {
-            height: header.height,
-            reason: format!("ASERT anchor h={anchor_height} is outside the validated window"),
-        })?;
+    let anchor = window_anchor(window, parent.height, header.height)?;
     validate_header_timeless_prehashed_parent(
         header,
         parent,
         parent_id,
         &prev_timestamps[..timestamp_len],
         &finalized_active_counts[..expansion_len],
-        anchor_height,
-        anchor.timestamp,
-        &anchor.difficulty_target,
+        &anchor,
     )
     .map_err(|error| match error {
         jetsam_chain::consensus::ConsensusError::BadParentHash => {
@@ -1022,6 +1013,35 @@ fn validate_next_header(
             height: header.height,
             reason: error.to_string(),
         },
+    })
+}
+
+/// The ASERT anchor of the child at `child_height` of the parent at
+/// `parent_height`, read from the validated `window`: the anchor and the block
+/// just below it (the anchor itself at genesis), at most seven below the
+/// parent. Either missing refuses the child.
+fn window_anchor(
+    window: &VecDeque<BlockHeader>,
+    parent_height: u64,
+    child_height: u64,
+) -> Result<jetsam_chain::consensus::AnchorInfo> {
+    let anchor_height = asert_anchor_height(parent_height);
+    let in_window = |height: u64| {
+        window
+            .iter()
+            .find(|ancestor| ancestor.height == height)
+            .ok_or(SnapshotHeaderStagingError::InvalidCandidate {
+                height: child_height,
+                reason: format!("ASERT anchor h={height} is outside the validated window"),
+            })
+    };
+    let anchor = in_window(anchor_height)?;
+    let anchor_parent = in_window(anchor_height.saturating_sub(1))?;
+    Ok(jetsam_chain::consensus::AnchorInfo {
+        anchor_height,
+        anchor_timestamp: anchor.timestamp,
+        anchor_parent_timestamp: anchor_parent.timestamp,
+        anchor_target: anchor.difficulty_target,
     })
 }
 
@@ -1424,6 +1444,34 @@ mod tests {
 
     /// JETSAM CHANGE: bounds derived from `EXPANSION_HEADER_LOOKBACK` instead of
     /// the literals 34 and 66.
+    /// v1.6: staged headers are judged on the anchor AND the block
+    /// just below it, both read from the validated window (the anchor itself
+    /// at genesis); a window without either refuses the header.
+    #[test]
+    fn a_staged_header_is_judged_on_the_anchor_and_its_parent_from_the_window() {
+        let header = |height: u64| {
+            let mut header = genesis_header();
+            header.height = height;
+            header.timestamp = 5_000 + height * 7;
+            header.difficulty_target = [height as u8; 32];
+            header
+        };
+        let window: VecDeque<BlockHeader> = (0..=11).map(header).collect();
+        let anchor = window_anchor(&window, 11, 12).expect("anchor and parent in the window");
+        assert_eq!(anchor.anchor_height, 6);
+        assert_eq!(anchor.anchor_timestamp, 5_000 + 6 * 7);
+        assert_eq!(anchor.anchor_parent_timestamp, 5_000 + 5 * 7);
+        assert_eq!(anchor.anchor_target, [6u8; 32]);
+        let genesis: VecDeque<BlockHeader> = [header(0)].into_iter().collect();
+        let anchor = window_anchor(&genesis, 0, 1).expect("genesis");
+        assert_eq!((anchor.anchor_height, anchor.anchor_parent_timestamp), (0, 5_000));
+        let without_parent: VecDeque<BlockHeader> = (0..=11).filter(|h| *h != 5).map(header).collect();
+        assert!(matches!(
+            window_anchor(&without_parent, 11, 12),
+            Err(SnapshotHeaderStagingError::InvalidCandidate { height: 12, .. })
+        ));
+    }
+
     #[test]
     fn snapshot_validation_requires_the_complete_finalized_window() {
         use jetsam_chain::consensus::params::EXPANSION_HEADER_LOOKBACK as LOOKBACK;
@@ -1506,9 +1554,12 @@ mod tests {
                     // JETSAM CHANGE: ASERT anchored on the parent's timestamp,
                     // through the function the validator calls.
                     difficulty_target: expected_target(
-                        anchor_height,
-                        anchor.timestamp,
-                        &anchor.difficulty_target,
+                        &jetsam_chain::consensus::AnchorInfo {
+                            anchor_height,
+                            anchor_timestamp: anchor.timestamp,
+                            anchor_parent_timestamp: anchor.timestamp,
+                            anchor_target: anchor.difficulty_target,
+                        },
                         height,
                         parent.timestamp,
                     ),
@@ -1545,13 +1596,7 @@ mod tests {
         let anchor = chain.anchor_info().unwrap();
         // JETSAM CHANGE: ASERT anchored on the parent's timestamp, through the
         // function the validator calls.
-        let difficulty_target = expected_target(
-            anchor.anchor_height,
-            anchor.anchor_timestamp,
-            &anchor.anchor_target,
-            parent.height + 1,
-            parent.timestamp,
-        );
+        let difficulty_target = expected_target(&anchor, parent.height + 1, parent.timestamp);
         jetsam_chain::consensus::build_block_template(
             &parent,
             &chain.state,

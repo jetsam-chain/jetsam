@@ -58,9 +58,10 @@ use jetsam_poseidon2b::native::permutation::STATE_SIZE;
 use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use crate::region_sidecar::{
-    CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk, CombinedDuplexSubChannelDescriptor,
-    LinkRegionProverInput, LinkRegionProverPlan, LinkRegionSidecarVk, MerkleRegionFamily,
-    MerkleRegionVk, RecordingDuplexRegionVk, RegionSidecarError, RegionWalkEndpoints,
+    selected_role_extent, CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk,
+    CombinedDuplexSubChannelDescriptor, LinkRegionProverInput, LinkRegionProverPlan,
+    LinkRegionSidecarVk, MerkleRegionFamily, MerkleRegionVk, RecordingDuplexRegionVk,
+    RecordingPacking, RegionSidecarError, RegionWalkEndpoints, SelectedRoleExtent,
     MAX_COMBINED_DUPLEX_DATA_LANES,
 };
 
@@ -69,7 +70,8 @@ use jetsam_ivc_core::field_circuit::RecordedChannel as FsRecordedChannel;
 
 use super::region_source_binding::{
     alloc_boolean_column_slice_values_only, alloc_column_slice_values_only,
-    build_combined_duplex_union, build_recording_only_duplex_union, duplex_data_positions,
+    build_combined_duplex_union, build_recording_only_duplex_union,
+    build_recording_only_duplex_union_chunked, duplex_data_positions,
     pack_recording_only_blocks, slot_cell, DuplexUnion, RecordingSpec, SubChannel,
 };
 use super::self_verify::{
@@ -216,10 +218,16 @@ impl HistoryStepPcsCarrierGeometry {
 #[derive(Clone, Debug)]
 pub(crate) struct HistoryStepParentGeometry {
     carrier: HistoryStepPcsCarrierGeometry,
+    /// Empty when the selected arms have no child transcript role (the
+    /// ClientBatchStep prototype: a Link-only sidecar has no Block child).
     child_layouts: Vec<DuplexLayout>,
     r_prev_layouts: Vec<DuplexLayout>,
     selected_recording_blocks: [Vec<(DuplexLayout, usize)>; 2],
+    /// Per L-C role: its dyadic block, chunk and span (shared by both arms).
+    selected_recording_extents: Vec<SelectedRoleExtent>,
     rec_w_log: usize,
+    /// How the L-C roles are laid out (dyadic for every released relation).
+    recording_packing: RecordingPacking,
     /// The client verifier's transcript layout: a third L-C role, identical
     /// in both parent arms (the v1.5 client slot).
     client_layout: Option<DuplexLayout>,
@@ -245,23 +253,102 @@ struct LinkVkMemo {
     vk: LinkRegionSidecarVk,
 }
 
+/// The packed L-C roles of both arms: blocks `(layout, offset)` per arm, the
+/// role extents, the domain log.
+type PackedRecordingArms = (
+    [Vec<(DuplexLayout, usize)>; 2],
+    Vec<SelectedRoleExtent>,
+    usize,
+);
+
 /// Pack each parent arm's recording roles — Block child, `[R]_prev`, then the
-/// client transcript when present — into one dyadic L-C domain. Both arms
-/// must land on identical offsets and width, so one fixed key serves both.
+/// client transcript when present — into one L-C domain. Both arms must land
+/// on identical offsets and width, so one fixed key serves both.
 fn pack_selected_recording_arms(
     child_layouts: &[DuplexLayout],
     r_prev_layouts: &[DuplexLayout],
     client_layout: Option<&DuplexLayout>,
-) -> Result<([Vec<(DuplexLayout, usize)>; 2], usize), RegionSidecarError> {
-    if child_layouts.len() != 2 || r_prev_layouts.len() != 2 {
+    packing: RecordingPacking,
+) -> Result<PackedRecordingArms, RegionSidecarError> {
+    // An empty child list means the arms have no child role.
+    if (child_layouts.len() != 2 && !child_layouts.is_empty()) || r_prev_layouts.len() != 2 {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
+    let roles = (0..2)
+        .map(|arm| {
+            let mut layouts = child_layouts
+                .get(arm)
+                .into_iter()
+                .chain([&r_prev_layouts[arm]])
+                .collect::<Vec<_>>();
+            layouts.extend(client_layout);
+            layouts
+        })
+        .collect::<Vec<_>>();
+    match packing {
+        RecordingPacking::Dyadic => {
+            // Informational only: the dyadic packing and its checks are the
+            // released ones, unchanged.
+            let extents = roles[0]
+                .iter()
+                .map(|layout| {
+                    let block_log =
+                        layout.slots.len().max(1).next_power_of_two().trailing_zeros() as usize;
+                    SelectedRoleExtent {
+                        block_log,
+                        chunk_log: block_log.saturating_sub(2),
+                        span: 1usize << block_log,
+                    }
+                })
+                .collect();
+            let (arm_blocks, w_log) = pack_dyadic_recording_arms(roles)?;
+            Ok((arm_blocks, extents, w_log))
+        }
+        RecordingPacking::Chunked => {
+            let extents = (0..roles[0].len())
+                .map(|role| selected_role_extent(&[roles[0][role], roles[1][role]], packing))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (offsets, w_log) = pack_chunked_recording_roles(&extents);
+            let arm_blocks = roles.into_iter().map(|layouts| {
+                layouts
+                    .into_iter()
+                    .cloned()
+                    .zip(offsets.iter().copied())
+                    .collect::<Vec<_>>()
+            });
+            let arm_blocks: [Vec<(DuplexLayout, usize)>; 2] = arm_blocks
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("exactly two HistoryStep recording arms");
+            Ok((arm_blocks, extents, w_log))
+        }
+    }
+}
+
+/// Chunked L-C packing: roles in descending chunk size (stable), each at the
+/// running end of the previous ones (a multiple of its own chunk), the
+/// domain rounded once. Offsets in caller order.
+fn pack_chunked_recording_roles(extents: &[SelectedRoleExtent]) -> (Vec<usize>, usize) {
+    let mut order: Vec<usize> = (0..extents.len()).collect();
+    order.sort_by_key(|&role| std::cmp::Reverse(extents[role].chunk_log));
+    let mut offsets = vec![0usize; extents.len()];
+    let mut cursor = 0usize;
+    for &role in &order {
+        debug_assert_eq!(cursor % (1usize << extents[role].chunk_log), 0, "chunk alignment");
+        offsets[role] = cursor;
+        cursor += extents[role].span;
+    }
+    let w_log = cursor.max(1).next_power_of_two().trailing_zeros() as usize;
+    (offsets, w_log)
+}
+
+fn pack_dyadic_recording_arms(
+    roles: Vec<Vec<&DuplexLayout>>,
+) -> Result<([Vec<(DuplexLayout, usize)>; 2], usize), RegionSidecarError> {
     let mut arm_blocks = Vec::with_capacity(2);
     let mut common_w_log = None;
     let mut common_offsets = None;
-    for arm in 0..2 {
-        let mut layouts = vec![&child_layouts[arm], &r_prev_layouts[arm]];
-        layouts.extend(client_layout);
+    for layouts in roles {
         let (offsets, w_log) = pack_recording_only_blocks(&layouts);
         if common_w_log.is_some_and(|expected| expected != w_log)
             || common_offsets
@@ -294,7 +381,7 @@ impl HistoryStepParentGeometry {
         r_prev_layouts: Vec<DuplexLayout>,
     ) -> Result<Self, RegionSidecarError> {
         if parent_params.is_empty()
-            || child_layouts.len() != parent_params.len()
+            || (child_layouts.len() != parent_params.len() && !child_layouts.is_empty())
             || r_prev_layouts.len() != parent_params.len()
             || child_layouts.iter().any(|layout| layout.slots.is_empty())
             || r_prev_layouts.iter().any(|layout| layout.slots.is_empty())
@@ -328,17 +415,75 @@ impl HistoryStepParentGeometry {
         };
         carrier.leaf_lanes()?;
         carrier.path_carrier_depths()?;
-        let (selected_recording_blocks, rec_w_log) =
-            pack_selected_recording_arms(&child_layouts, &r_prev_layouts, None)?;
+        let (selected_recording_blocks, selected_recording_extents, rec_w_log) =
+            pack_selected_recording_arms(
+                &child_layouts,
+                &r_prev_layouts,
+                None,
+                RecordingPacking::Dyadic,
+            )?;
         Ok(Self {
             carrier,
             child_layouts,
             r_prev_layouts,
             selected_recording_blocks,
+            selected_recording_extents,
             rec_w_log,
+            recording_packing: RecordingPacking::Dyadic,
             client_layout: None,
             link_vk_memo: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Re-pack the L-C roles of this geometry (and of its client role, when
+    /// present) with `packing`.
+    fn repack_recordings(mut self, packing: RecordingPacking) -> Result<Self, RegionSidecarError> {
+        let (selected_recording_blocks, selected_recording_extents, rec_w_log) =
+            pack_selected_recording_arms(
+                &self.child_layouts,
+                &self.r_prev_layouts,
+                self.client_layout.as_ref(),
+                packing,
+            )?;
+        self.selected_recording_blocks = selected_recording_blocks;
+        self.selected_recording_extents = selected_recording_extents;
+        self.rec_w_log = rec_w_log;
+        self.recording_packing = packing;
+        // The geometry changed: a key memoized for another packing must
+        // never be served for this one.
+        self.link_vk_memo = std::sync::OnceLock::new();
+        Ok(self)
+    }
+
+    /// The same carrier with its L-C roles packed by chunk instead of by
+    /// dyadic block ([`RecordingPacking::Chunked`]): a NEW key, for a new
+    /// relation only (every released relation keeps the dyadic one).
+    pub(crate) fn with_chunked_recordings(self) -> Result<Self, RegionSidecarError> {
+        self.repack_recordings(RecordingPacking::Chunked)
+    }
+
+    // Used by the tests (and the v1.6 relation); not by the batch step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn recording_packing(&self) -> RecordingPacking {
+        self.recording_packing
+    }
+
+    /// The L-C domain log of this geometry's key.
+    // Used by the tests (and the v1.6 relation); not by the batch step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rec_w_log(&self) -> usize {
+        self.rec_w_log
+    }
+
+    /// Per L-C role: `(offset, span)` in the domain (both arms).
+    // Used by the tests (and the v1.6 relation); not by the batch step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn recording_role_spans(&self) -> Vec<(usize, usize)> {
+        self.selected_recording_blocks[0]
+            .iter()
+            .zip(&self.selected_recording_extents)
+            .map(|((_, offset), extent)| (*offset, extent.span))
+            .collect()
     }
 
     /// Add the client proof as a second walked role. The client form must
@@ -364,18 +509,10 @@ impl HistoryStepParentGeometry {
         self.carrier.proof_roles = 2;
         self.carrier.leaf_lanes()?;
         self.carrier.path_carrier_depths()?;
-        let (selected_recording_blocks, rec_w_log) = pack_selected_recording_arms(
-            &self.child_layouts,
-            &self.r_prev_layouts,
-            Some(&client_layout),
-        )?;
-        self.selected_recording_blocks = selected_recording_blocks;
-        self.rec_w_log = rec_w_log;
         self.client_layout = Some(client_layout);
-        // The geometry changed: a key memoized for the parent-only carrier
-        // must never be served for this one.
-        self.link_vk_memo = std::sync::OnceLock::new();
-        Ok(self)
+        // Re-packed with the client role; the memo is reset there.
+        let packing = self.recording_packing;
+        self.repack_recordings(packing)
     }
 
     pub(crate) fn new(
@@ -394,7 +531,24 @@ impl HistoryStepParentGeometry {
     }
 
     pub(crate) fn tier_count(&self) -> usize {
-        self.child_layouts.len()
+        self.r_prev_layouts.len()
+    }
+
+    /// Two tiers whose selected arms record one main transcript each and no
+    /// child transcript (ClientBatchStep prototype).
+    pub(crate) fn new_without_child(
+        parent_params: &[PcsParams],
+        r_prev_layouts: Vec<DuplexLayout>,
+    ) -> Result<Self, RegionSidecarError> {
+        if parent_params.len() != 2 || r_prev_layouts.len() != 2 {
+            return Err(RegionSidecarError::BadVk);
+        }
+        Self::from_parts(parent_params, Vec::new(), r_prev_layouts)
+    }
+
+    /// Whether the selected arms carry a child transcript role.
+    fn has_child_role(&self) -> bool {
+        !self.child_layouts.is_empty()
     }
 
     pub(crate) fn child_layout(&self, slot: usize) -> Option<&DuplexLayout> {
@@ -488,7 +642,12 @@ impl HistoryStepParentGeometry {
                 if &recording.layout == layout && recording.data_flat.len() == layout.n_data => {}
             _ => return Err(RegionSidecarError::UnsupportedVkShape),
         }
-        if children.len() != self.tier_count()
+        let expected_children = if self.has_child_role() {
+            self.tier_count()
+        } else {
+            0
+        };
+        if children.len() != expected_children
             || r_prev.len() != self.tier_count()
             || active_slot >= self.tier_count()
         {
@@ -508,25 +667,36 @@ impl HistoryStepParentGeometry {
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        let specs = [
-            (
-                &children[active_slot].layout,
-                children[active_slot].data_flat.as_slice(),
-            ),
-            (
+        let specs = children
+            .get(active_slot)
+            .map(|child| (&child.layout, child.data_flat.as_slice()))
+            .into_iter()
+            .chain([(
                 &r_prev[active_slot].layout,
                 r_prev[active_slot].data_flat.as_slice(),
-            ),
-        ]
-        .into_iter()
-        .chain(client.map(|recording| (&recording.layout, recording.data_flat.as_slice())))
+            )])
+            .chain(client.map(|recording| (&recording.layout, recording.data_flat.as_slice())))
         .map(|(layout, data)| RecordingSpec {
             layout: layout.clone(),
             iv_flat: FsChannelUnionRecorder::capacity_iv_flat_c1(),
             data,
         })
         .collect::<Vec<_>>();
-        Ok(build_recording_only_duplex_union(&specs))
+        match self.recording_packing {
+            RecordingPacking::Dyadic => Ok(build_recording_only_duplex_union(&specs)),
+            RecordingPacking::Chunked => {
+                let placement = self.selected_recording_blocks[active_slot]
+                    .iter()
+                    .zip(&self.selected_recording_extents)
+                    .map(|((_, offset), extent)| (*offset, *extent))
+                    .collect::<Vec<_>>();
+                Ok(build_recording_only_duplex_union_chunked(
+                    &specs,
+                    &placement,
+                    self.rec_w_log,
+                ))
+            }
+        }
     }
 
     fn vk_from_slices(
@@ -571,6 +741,7 @@ impl HistoryStepParentGeometry {
             rec_slices,
             selector_slice,
             self.selected_recording_blocks.clone(),
+            self.recording_packing,
         )?;
         LinkRegionSidecarVk::new(leaf, path, rec)
     }
@@ -1825,20 +1996,26 @@ fn finalize_carrier_region(
             )
         });
     }
-    pin_selected_recording_role(
-        b,
-        "walk L-C HistoryStep parent Block child",
-        &child_scratches,
-        recorded_children,
-        vk.rec_c(),
-        arm_selectors,
-        active_slot,
-        0,
-        &u_rec,
-        &slices_rec,
-        0,
-        &mut recording_constraint_slots,
-    )?;
+    // Without a child role (ClientBatchStep prototype) the main transcript
+    // is role 0 and the common role follows it.
+    let mut role = 0;
+    if !child_scratches.is_empty() {
+        pin_selected_recording_role(
+            b,
+            "walk L-C HistoryStep parent Block child",
+            &child_scratches,
+            recorded_children,
+            vk.rec_c(),
+            arm_selectors,
+            active_slot,
+            role,
+            &u_rec,
+            &slices_rec,
+            role,
+            &mut recording_constraint_slots,
+        )?;
+        role += 1;
+    }
     pin_selected_recording_role(
         b,
         "walk L-C HistoryStep [R]_prev",
@@ -1847,12 +2024,13 @@ fn finalize_carrier_region(
         vk.rec_c(),
         arm_selectors,
         active_slot,
-        1,
+        role,
         &u_rec,
         &slices_rec,
-        1,
+        role,
         &mut recording_constraint_slots,
     )?;
+    role += 1;
     if let Some((_, recording, _, scratch, _)) = client {
         pin_common_recording_role(
             b,
@@ -1860,10 +2038,10 @@ fn finalize_carrier_region(
             scratch,
             recording,
             vk.rec_c(),
-            2,
+            role,
             &u_rec,
             &slices_rec,
-            2,
+            role,
             &mut recording_constraint_slots,
         )?;
     }
@@ -2053,6 +2231,157 @@ mod tests {
         assert_eq!(vk.leaf_a().w_log(), 14);
         assert_eq!(vk.path_b().w_log(), 13);
         assert_eq!(vk.path_b().block_log(), 13);
+    }
+
+    /// A layout of exactly `slots` absorb slots.
+    fn slots_layout(slots: usize) -> DuplexLayout {
+        let layout = compile_duplex(&[TranscriptOp::Absorb(vec![Some(0); 2 * slots])]);
+        assert_eq!(layout.slots.len(), slots);
+        layout
+    }
+
+    /// Chunked L-C packing: each role spans only the chunks (a quarter of
+    /// its dyadic block) its longest arm reaches, roles are placed by
+    /// descending chunk, and the domain is rounded once — where the dyadic
+    /// packing rounds every role. The dyadic key is untouched.
+    #[test]
+    fn chunked_packing_keeps_each_role_to_the_chunks_it_reaches() {
+        let params = [23usize, 24].map(|m| PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        });
+        let client_params = PcsParams {
+            m: 22 + LOG_PACKING,
+            ..params[0].clone()
+        };
+        // Child 23 / 20 slots (block 32), [R]_prev 11 / 10 (block 16),
+        // client 19 (block 32): dyadic 32 + 16 + 32 = 80 → 2^7; chunked
+        // 24 + 12 + 24 = 60 → 2^6.
+        let dyadic = HistoryStepParentGeometry::new(
+            &params,
+            vec![slots_layout(23), slots_layout(20)],
+            vec![slots_layout(11), slots_layout(10)],
+        )
+        .expect("geometry")
+        .with_client(&client_params, slots_layout(19))
+        .expect("client role");
+        assert_eq!(dyadic.recording_packing(), RecordingPacking::Dyadic);
+        assert_eq!(dyadic.rec_w_log(), 7, "control: the dyadic packing");
+        assert_eq!(dyadic.recording_role_spans(), vec![(0, 32), (64, 16), (32, 32)]);
+
+        let chunked = dyadic.clone().with_chunked_recordings().expect("chunked geometry");
+        assert_eq!(chunked.recording_packing(), RecordingPacking::Chunked);
+        assert_eq!(chunked.rec_w_log(), 6, "one rounding, not three");
+        assert_eq!(
+            chunked.recording_role_spans(),
+            vec![(0, 24), (48, 12), (24, 24)],
+            "child, [R]_prev, client: chunk-aligned spans by descending chunk"
+        );
+        // The order of the builder calls does not matter.
+        let chunked_first = HistoryStepParentGeometry::new(
+            &params,
+            vec![slots_layout(23), slots_layout(20)],
+            vec![slots_layout(11), slots_layout(10)],
+        )
+        .expect("geometry")
+        .with_chunked_recordings()
+        .expect("chunked")
+        .with_client(&client_params, slots_layout(19))
+        .expect("client role");
+        assert_eq!(chunked_first.recording_role_spans(), chunked.recording_role_spans());
+
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 10,
+                index: 1,
+            },
+            io_len: 900,
+            claims: Vec::new(),
+        };
+        let dyadic_vk = dyadic.canonical_vk(&spec).expect("dyadic key");
+        let chunked_vk = chunked.canonical_vk(&spec).expect("chunked key");
+        assert_eq!(dyadic_vk.rec_c().w_log(), 7);
+        assert_eq!(chunked_vk.rec_c().w_log(), 6);
+        assert_ne!(
+            dyadic_vk.transcript_digest(),
+            chunked_vk.transcript_digest(),
+            "a chunked key is a new key"
+        );
+        assert_eq!(chunked_first.canonical_vk(&spec).unwrap(), chunked_vk);
+        for (role, (_, span)) in chunked.recording_role_spans().into_iter().enumerate() {
+            assert_eq!(chunked_vk.rec_c().selected_extent(role).map(|e| e.span), Some(span));
+        }
+
+        // Arms whose role sits in different dyadic blocks cannot share a key.
+        assert!(HistoryStepParentGeometry::new(
+            &params,
+            vec![slots_layout(23), slots_layout(12)],
+            vec![slots_layout(11), slots_layout(10)],
+        )
+        .and_then(HistoryStepParentGeometry::with_chunked_recordings)
+        .is_err());
+        assert!(selected_role_extent(
+            &[&slots_layout(23), &slots_layout(12)],
+            RecordingPacking::Chunked
+        )
+        .is_err());
+    }
+
+    /// With the dyadic offsets, the chunked union IS the dyadic union, cell
+    /// for cell: the chunks it drops are pure carry, and the slots between
+    /// two spans are filled by the same carry chain.
+    #[test]
+    fn a_chunked_union_at_dyadic_offsets_is_the_dyadic_union() {
+        // 5, 11 and 3 absorb slots then a squeeze: blocks 8, 16, 4; spans 6,
+        // 12, 3 (the gaps up to the next dyadic offset are carry).
+        let layouts = [5usize, 11, 3].map(|slots| {
+            compile_duplex(&[
+                TranscriptOp::Absorb(vec![None; 2 * slots - 1]),
+                TranscriptOp::Squeeze(1),
+            ])
+        });
+        let data = layouts
+            .iter()
+            .enumerate()
+            .map(|(seed, layout)| {
+                (0..layout.n_data)
+                    .map(|lane| F128::new(lane as u64 + 1, seed as u64 + 7))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let specs = layouts
+            .iter()
+            .zip(&data)
+            .map(|(layout, data)| RecordingSpec {
+                layout: layout.clone(),
+                iv_flat: FsChannelUnionRecorder::capacity_iv_flat_c1(),
+                data: data.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let dyadic = build_recording_only_duplex_union(&specs);
+        let placement = specs
+            .iter()
+            .zip(&dyadic.rec_blocks)
+            .map(|(spec, (_, offset))| {
+                let extent = selected_role_extent(&[&spec.layout], RecordingPacking::Chunked)
+                    .expect("extent");
+                (*offset, extent)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            placement
+                .iter()
+                .any(|(_, extent)| extent.span < 1usize << extent.block_log),
+            "the fixture drops no chunk"
+        );
+        let chunked = build_recording_only_duplex_union_chunked(&specs, &placement, dyadic.w_log);
+        assert_eq!(chunked.committed, dyadic.committed);
+        assert_eq!(chunked.s0, dyadic.s0);
+        assert_eq!(chunked.s_out, dyadic.s_out);
+        assert_eq!(chunked.rec_challenges, dyadic.rec_challenges);
+        assert_eq!(chunked.rec_blocks, dyadic.rec_blocks);
     }
 
     #[test]

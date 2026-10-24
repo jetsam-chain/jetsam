@@ -30,6 +30,11 @@ struct PeerEntry {
     /// eviction priority to a peer confirmed by the current implementation.
     #[serde(default)]
     last_success_unix: u64,
+    /// The software version the peer last announced. Missing in files
+    /// written before the announcement; a release that predates it ignores
+    /// the field when it reads a newer file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +42,7 @@ pub(crate) struct CachedPeer {
     pub(crate) peer_id: PeerId,
     pub(crate) addrs: Vec<Multiaddr>,
     last_success_unix: u64,
+    pub(crate) agent_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +64,7 @@ impl SuccessfulPeerCache {
             peer_id,
             addrs: Vec::new(),
             last_success_unix: now,
+            agent_version: None,
         });
         entry.last_success_unix = now;
         if !entry.addrs.contains(&addr) {
@@ -71,6 +78,14 @@ impl SuccessfulPeerCache {
 
     pub(crate) fn remove(&mut self, peer_id: &PeerId) {
         self.entries.remove(peer_id);
+    }
+
+    /// Keep the version a cached peer announced. Informative only: never
+    /// read to choose, rank or dial a peer.
+    pub(crate) fn note_agent_version(&mut self, peer_id: PeerId, agent_version: &str) {
+        if let Some(entry) = self.entries.get_mut(&peer_id) {
+            entry.agent_version = Some(crate::peer_versions::sanitize_agent_version(agent_version));
+        }
     }
 
     fn prune(&mut self) {
@@ -122,6 +137,10 @@ pub(crate) fn load(data_dir: &Path) -> SuccessfulPeerCache {
                 peer_id,
                 addrs,
                 last_success_unix: entry.last_success_unix,
+                agent_version: entry
+                    .agent_version
+                    .as_deref()
+                    .map(crate::peer_versions::sanitize_agent_version),
             },
         );
     }
@@ -145,6 +164,7 @@ pub(crate) fn save(data_dir: &Path, cache: &SuccessfulPeerCache) {
             peer_id: entry.peer_id.to_string(),
             addrs: entry.addrs.iter().map(ToString::to_string).collect(),
             last_success_unix: entry.last_success_unix,
+            agent_version: entry.agent_version.clone(),
         })
         .collect();
 
@@ -225,5 +245,67 @@ mod tests {
         let persisted: Vec<PeerEntry> =
             serde_json::from_slice(&std::fs::read(peer_store_path(dir.path())).unwrap()).unwrap();
         assert_eq!(persisted[0].last_success_unix, 0);
+        assert_eq!(loaded.agent_version, None);
+        assert_eq!(persisted[0].agent_version, None);
+    }
+
+    #[test]
+    fn announced_version_is_stored_and_an_older_release_still_reads_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = PeerId::random();
+        let mut cache = SuccessfulPeerCache::default();
+        // Only a peer already reached outbound is cached, version or not.
+        cache.note_agent_version(peer, "jetsam/1.6.0 (v1.6=5760)");
+        assert_eq!(cache.entries().count(), 0);
+        cache.record_success(peer, public_addr("8.8.8.8"));
+        cache.note_agent_version(peer, "jetsam/1.6.0 (v1.6=5760)");
+        save(dir.path(), &cache);
+
+        let bytes = std::fs::read(peer_store_path(dir.path())).unwrap();
+        // The entry as a release that predates the announcement reads it.
+        #[derive(Deserialize)]
+        struct ReleasedPeerEntry {
+            peer_id: String,
+            addrs: Vec<String>,
+            #[serde(default)]
+            last_success_unix: u64,
+        }
+        let released: Vec<ReleasedPeerEntry> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(released[0].peer_id, peer.to_string());
+        assert_eq!(released[0].addrs, vec!["/ip4/8.8.8.8/tcp/9500".to_string()]);
+        assert!(released[0].last_success_unix > 0);
+
+        let reloaded = load(dir.path());
+        assert_eq!(
+            reloaded.entries().next().unwrap().agent_version.as_deref(),
+            Some("jetsam/1.6.0 (v1.6=5760)")
+        );
+    }
+
+    #[test]
+    fn a_stored_version_is_bounded_again_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = PeerId::random();
+        let edited = serde_json::json!([{
+            "peer_id": peer.to_string(),
+            "addrs": ["/ip4/8.8.8.8/tcp/9500"],
+            "last_success_unix": 7,
+            "agent_version": format!("jetsam/1.6.0\u{7}\n{}", "z".repeat(10_000))
+        }]);
+        std::fs::write(
+            peer_store_path(dir.path()),
+            serde_json::to_vec(&edited).unwrap(),
+        )
+        .unwrap();
+        let cache = load(dir.path());
+        let version = cache
+            .entries()
+            .next()
+            .unwrap()
+            .agent_version
+            .clone()
+            .unwrap();
+        assert_eq!(version.len(), crate::peer_versions::MAX_AGENT_VERSION_CHARS);
+        assert!(version.starts_with("jetsam/1.6.0??z"));
     }
 }

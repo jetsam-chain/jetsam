@@ -182,6 +182,120 @@ async fn next_mining_mempool_refresh(
     }
 }
 
+/// What a prepared, proof-valid attempt is still good for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedAttemptGate {
+    /// Same parent, no template input change, canonical sync authority held
+    /// and exact frontier authorization present: search its nonce.
+    Search,
+    /// The attempt no longer describes the next block on the canonical tip.
+    Stale,
+    /// Shutdown, or a readiness channel closed.
+    Stop,
+}
+
+/// Hold a prepared attempt until its nonce may be searched, before the first
+/// search and again whenever frontier authorization interrupts one.
+///
+/// The HistoryStep proof binds the template — its parent, body and payout —
+/// and nothing about peer frontier reports, which can lapse and return on the
+/// same tip. The attempt is therefore kept across such a pause
+/// and dropped only when its parent is no longer the tip, a template input
+/// changed, or canonical sync authority was lost.
+async fn gate_prepared_attempt_for_nonce_search<F, Fut>(
+    height: u64,
+    nonce_network_ready: &mut watch::Receiver<bool>,
+    proof_network_ready: &mut watch::Receiver<bool>,
+    template_changes: &mut broadcast::Receiver<()>,
+    stopped: &AtomicBool,
+    mut parent_is_still_tip: F,
+) -> PreparedAttemptGate
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if !*proof_network_ready.borrow() {
+        tracing::debug!(
+            height,
+            "prepared template lost canonical sync authority before PoW"
+        );
+        return PreparedAttemptGate::Stale;
+    }
+    // Preparation may be expensive. Refuse to spend PoW on a parent
+    // that was replaced while it ran; the final commit repeats this
+    // exact-parent check under the canonical write lock.
+    if !parent_is_still_tip().await {
+        tracing::debug!(height, "prepared template parent changed before PoW");
+        return PreparedAttemptGate::Stale;
+    }
+    match template_changes.try_recv() {
+        Ok(()) => {
+            tracing::debug!(height, "prepared template input changed before PoW");
+            return PreparedAttemptGate::Stale;
+        }
+        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+            tracing::debug!(
+                height,
+                skipped,
+                "template-change receiver lagged before PoW"
+            );
+            return PreparedAttemptGate::Stale;
+        }
+        Err(broadcast::error::TryRecvError::Empty) => {}
+        Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
+    }
+
+    // Frontier authorization may lag an ordinary child commit by one
+    // compact header round-trip. Preserve the expensive prepared
+    // transition while waiting; only a real parent/sync change makes
+    // it stale.
+    if !*nonce_network_ready.borrow() {
+        tracing::info!(
+            height,
+            "miner: proof ready; waiting for exact frontier authorization"
+        );
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                return PreparedAttemptGate::Stop;
+            }
+            tokio::select! {
+                readiness = nonce_network_ready.changed() => {
+                    match readiness {
+                        Ok(()) if *nonce_network_ready.borrow() => break,
+                        Ok(()) => {}
+                        Err(_) => return PreparedAttemptGate::Stop,
+                    }
+                }
+                readiness = proof_network_ready.changed() => {
+                    match readiness {
+                        Ok(()) if !*proof_network_ready.borrow() => {
+                            tracing::info!(height, "miner: canonical sync changed while awaiting frontier authorization");
+                            return PreparedAttemptGate::Stale;
+                        }
+                        Ok(()) => {}
+                        Err(_) => return PreparedAttemptGate::Stop,
+                    }
+                }
+                template_change = template_changes.recv() => {
+                    match template_change {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            tracing::debug!(height, "prepared template parent changed while awaiting frontier authorization");
+                            return PreparedAttemptGate::Stale;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+        }
+        if !parent_is_still_tip().await || !*proof_network_ready.borrow() {
+            tracing::debug!(height, "prepared template became stale before nonce search");
+            return PreparedAttemptGate::Stale;
+        }
+    }
+    PreparedAttemptGate::Search
+}
+
 // ---------------------------------------------------------------------------
 // BlockMiner
 // ---------------------------------------------------------------------------
@@ -697,335 +811,297 @@ impl BlockMiner {
                 continue;
             }
 
-            // Preparation may be expensive. Refuse to spend PoW on a parent
-            // that was replaced while it ran; the final commit repeats this
-            // exact-parent check under the canonical write lock.
-            let parent_is_still_tip = {
-                let context = self.chain.read().await;
-                context.tip_height() == expected_parent_height
-                    && block_id(context.tip_header()) == expected_parent_hash
-            };
-            if !parent_is_still_tip {
-                tracing::debug!(height, "prepared template parent changed before PoW");
-                continue;
-            }
-            match self.template_changes.try_recv() {
-                Ok(()) => {
-                    tracing::debug!(height, "prepared template input changed before PoW");
-                    continue;
+            // A pause in frontier authorization during PoW returns here with
+            // the same prepared attempt: the gate decides whether it resumes.
+            let mut nonce_search_resumed = false;
+            'nonce_search: loop {
+                let chain = &self.chain;
+                let gate = gate_prepared_attempt_for_nonce_search(
+                    height,
+                    &mut self.nonce_network_ready,
+                    &mut self.proof_network_ready,
+                    &mut self.template_changes,
+                    &self.stopped,
+                    || async move {
+                        let context = chain.read().await;
+                        context.tip_height() == expected_parent_height
+                            && block_id(context.tip_header()) == expected_parent_hash
+                    },
+                )
+                .await;
+                match gate {
+                    PreparedAttemptGate::Search => {}
+                    PreparedAttemptGate::Stale => continue 'mining,
+                    PreparedAttemptGate::Stop => break 'mining,
                 }
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    tracing::debug!(
+
+                // Logged once per completed proof: scripts count this line.
+                if nonce_search_resumed {
+                    tracing::info!(
                         height,
-                        skipped,
-                        "template-change receiver lagged before PoW"
+                        "miner: frontier authorization restored; resuming nonce search with the prepared proof"
                     );
-                    continue;
+                } else {
+                    tracing::info!(
+                        height,
+                        txs = n_txs,
+                        user_pages,
+                        ?proof_class,
+                        prepare_ms = prepare_elapsed.as_millis(),
+                        "mining complete block"
+                    );
                 }
-                Err(broadcast::error::TryRecvError::Empty) => {}
-                Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
-            }
 
-            // Frontier authorization may lag an ordinary child commit by one
-            // compact header round-trip. Preserve the expensive prepared
-            // transition while waiting; only a real parent/sync change makes
-            // it stale.
-            if !*self.nonce_network_ready.borrow() {
-                tracing::info!(
-                    height,
-                    "miner: proof ready; waiting for exact frontier authorization"
-                );
-                loop {
-                    if self.stopped.load(Ordering::Acquire) {
-                        break 'mining;
-                    }
-                    tokio::select! {
-                        readiness = self.nonce_network_ready.changed() => {
-                            match readiness {
-                                Ok(()) if *self.nonce_network_ready.borrow() => break,
-                                Ok(()) => {}
-                                Err(_) => break 'mining,
-                            }
-                        }
-                        readiness = self.proof_network_ready.changed() => {
-                            match readiness {
-                                Ok(()) if !*self.proof_network_ready.borrow() => {
-                                    tracing::info!(height, "miner: canonical sync changed while awaiting frontier authorization");
-                                    continue 'mining;
+                // `watch::Receiver::changed` is edge-triggered. Readiness may
+                // have become true while this miner was waiting to start or
+                // while the proof was being built; consume that already-observed
+                // version before entering the PoW select. Otherwise the stale
+                // true edge wakes the select immediately and throws away a valid
+                // proof even though network authorization never changed.
+                let _ = *self.proof_network_ready.borrow_and_update();
+                let _ = *self.nonce_network_ready.borrow_and_update();
+
+                // Phase 2: all workers search the already-proven semantic header.
+                // A winning nonce only seals the nonce-free HistoryStep terminal.
+                let pow_header = attempt.pow_header(0);
+                let cancel_pow = Arc::clone(&cancel);
+                cancel.store(false, Ordering::Relaxed);
+                // Close the race where shutdown set cancel between the check
+                // above and the reset. A later shutdown cannot be lost because it
+                // sets cancel after this point and the PoW worker observes it.
+                if self.stopped.load(Ordering::Acquire) {
+                    cancel.store(true, Ordering::SeqCst);
+                    tracing::info!(
+                        height,
+                        "miner: shutdown requested before PoW; discarding prepared block"
+                    );
+                    break 'mining;
+                }
+                // A resumed search keeps counting from the template's first
+                // PoW start: the safety net still bounds the template's age.
+                if !nonce_search_resumed {
+                    heartbeat.reset();
+                }
+                let pow_start = Instant::now();
+                let mut pow_handle = tokio::task::spawn_blocking(move || {
+                    install_pow_phase_cpu(|| {
+                        crate::pow::search_pow_parallel(&pow_header, &cancel_pow)
+                    })
+                });
+
+                tokio::select! {
+                    pow_res = &mut pow_handle => {
+                        match pow_res {
+                            Ok(Ok(Some(sol))) => {
+                                if self.stopped.load(Ordering::Acquire) {
+                                    tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
+                                    break 'mining;
                                 }
-                                Ok(()) => {}
-                                Err(_) => break 'mining,
-                            }
-                        }
-                        template_change = self.template_changes.recv() => {
-                            match template_change {
-                                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                                    tracing::debug!(height, "prepared template parent changed while awaiting frontier authorization");
-                                    continue 'mining;
+                                // A found nonce is finished work. The readiness
+                                // watches are a local heuristic about peers, not a
+                                // consensus rule, and they flip several times a
+                                // second while suffix plans come and go. Discarding
+                                // here threw away blocks this node had actually won.
+                                //
+                                // The authoritative check is atomic and happens
+                                // anyway: commit_locally_proved_next_block rejects a
+                                // moved parent under the chain write lock
+                                // (BadParentHash / BadHeight). The external mining
+                                // path dropped this same guard for the same reason.
+                                let nonce_found_at = Instant::now();
+                                let sealed_header = attempt.pow_header(sol.nonce);
+                                let hash = block_id(&sealed_header);
+                                let elapsed = pow_start.elapsed();
+                                let elapsed_s = elapsed.as_secs_f64();
+
+                                // Count leading zeros of the difficulty target (MSB-first, LE).
+                                // Matches block_work() in difficulty.rs — higher = harder.
+                                // Genesis = 27lz. ASERT raises this when blocks arrive faster
+                                // than the block interval (90 s, 180 s from v1.5) and lowers
+                                // it when they're slower.
+                                let diff_lz = jetsam_chain::consensus::target_leading_zero_bits(
+                                    &sealed_header.difficulty_target,
+                                );
+
+                                tracing::debug!(
+                                    height,
+                                    hash = %hex::encode(hash),
+                                    n_txs,
+                                    prepare_ms = prepare_elapsed.as_millis(),
+                                    ?proof_class,
+                                    b25_prepare_ms_ewma,
+                                    b255_prepare_ms_ewma,
+                                    pow_time = %format!("{elapsed_s:.2}s"),
+                                    diff = %format!("lz{diff_lz}"),
+                                    "PoW nonce found; sealing prepared HistoryStep"
+                                );
+
+                                let seal_runtime = Arc::clone(&block_runtime);
+                                let seal_handle = tokio::task::spawn_blocking(move || {
+                                    let started = Instant::now();
+                                    let result = install_history_step_phase_cpu(|| {
+                                        attempt.prove(&seal_runtime, sol.nonce)
+                                    })
+                                    .map_err(|error| format!("HistoryStep seal CPU phase: {error}"))
+                                    .and_then(|result| result);
+                                    (result, started.elapsed())
+                                });
+                                let (proved, seal_elapsed) = match seal_handle.await {
+                                    Ok((Ok(proved), elapsed)) => (proved, elapsed),
+                                    Ok((Err(error), elapsed)) => {
+                                        tracing::error!(
+                                            height,
+                                            seal_ms = elapsed.as_millis(),
+                                            %error,
+                                            "prepared HistoryStep sealing failed"
+                                        );
+                                        let _ = self.events.send(MinerEvent::ProveFailed { height, error });
+                                        continue 'mining;
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(height, ?error, "HistoryStep sealing task panicked");
+                                        continue 'mining;
+                                    }
+                                };
+
+                                if self.stopped.load(Ordering::Acquire) {
+                                    tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
+                                    break 'mining;
                                 }
-                                Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                                // Fully proved at this point: same reasoning as
+                                // above. The parent re-check at commit decides.
+
+                                // IMPORTANT: apply and store the block FIRST, THEN fire the event.
+                                // The announcement triggers peers to request the block immediately;
+                                // if we fire the event before storing, a fast peer gets None.
+                                let proved = match self.apply_found_block(proved, addr).await {
+                                    Ok(proved) => proved,
+                                    Err(error) => {
+                                        tracing::warn!(height, "miner: block superseded: {error}");
+                                        continue 'mining;
+                                    }
+                                };
+                                // The one line worth scrolling back for. The
+                                // structured fields are unchanged — every script
+                                // that reads them keeps working — but the message
+                                // now stands out from the sync chatter around it,
+                                // and says what the operator wants to know first:
+                                // which block, and what it paid.
+                                tracing::info!(
+                                    height,
+                                    hash = %hex::encode(hash),
+                                    txs = n_txs,
+                                    pow_ms = elapsed.as_millis(),
+                                    history_step_ms = prepare_elapsed.as_millis(),
+                                    seal_ms = seal_elapsed.as_millis(),
+                                    nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
+                                    "{} BLOCK WON #{height} — {} {}  ·  block accepted  ·  \
+                                     pow {:.1}s · proof {:.1}s",
+                                    crate::colour::WON,
+                                    jetsam_chain::consensus::emission::block_reward(height)
+                                        / jetsam_chain::consensus::params::MICRO_PER_JTM,
+                                    jetsam_chain::consensus::identity::TICKER,
+                                    elapsed.as_secs_f64(),
+                                    prepare_elapsed.as_secs_f64(),
+                                );
+
+                                // Now safe to announce: the complete bundle is durable.
+                                let _ = self.events.send(MinerEvent::BlockFound {
+                                    height,
+                                    hash,
+                                    n_txs,
+                                    pow_nonce: sol.nonce,
+                                    bundle: proved.into_parts().1,
+                                });
+                            }
+                            Ok(Ok(None)) => {
+                                // PoW cancelled.
+                                let _ = self.events.send(MinerEvent::MiningCancelled {
+                                    reason: "cancelled".into(),
+                                });
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(height, %error, "PoW CPU admission failed");
+                            }
+                            Err(error) => {
+                                tracing::error!(height, ?error, "PoW task panicked");
                             }
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+
+                    _ = heartbeat.tick(), if user_pages == 0 => {
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = pow_handle.await;
+                        tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
+                    }
+
+                    refresh = next_mining_mempool_refresh(&mut mempool_events), if user_pages == 0 => {
+                        // No blocking PoW task may escape this select branch. A
+                        // new transaction must be included immediately. Lag is
+                        // conservative because the missed range may contain an
+                        // admission; previous-height confirmations are filtered
+                        // inside `next_mining_mempool_refresh`.
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = pow_handle.await;
+                        match refresh {
+                            MiningMempoolRefresh::TransactionAdmitted => {
+                                tracing::debug!("coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
+                            }
+                            MiningMempoolRefresh::ReceiverLagged(skipped) => {
+                                tracing::debug!(skipped, "coinbase-only template: mempool receiver lagged, rebuilding after PoW drain");
+                            }
+                        }
+                    }
+
+                    template_change = self.template_changes.recv() => {
+                        // A new chain tip or wallet payout invalidates this exact template.
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = pow_handle.await;
+                        match template_change {
+                            Ok(()) => tracing::debug!("template input changed: cancelling PoW to rebuild"),
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::debug!(skipped, "template-change receiver lagged: cancelling PoW to rebuild");
+                            }
+                            // The miner owns a sender, so closure is unreachable
+                            // until the miner itself is dropped.
+                            Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                        }
+                    }
+
+                    readiness = self.nonce_network_ready.changed() => {
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = pow_handle.await;
+                        match readiness {
+                            Ok(()) if !*self.nonce_network_ready.borrow() => {
+                                tracing::info!("miner: frontier authorization lost; pausing nonce search");
+                            }
+                            Ok(()) => {
+                                tracing::debug!("miner: frontier authorization changed; re-checking the prepared proof");
+                            }
+                            Err(_) => break 'mining,
+                        }
+                        // Authorization is not part of the proof: keep the
+                        // attempt and let the gate resume or discard it.
+                        nonce_search_resumed = true;
+                        continue 'nonce_search;
+                    }
+
+                    readiness = self.proof_network_ready.changed() => {
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = pow_handle.await;
+                        match readiness {
+                            Ok(()) if !*self.proof_network_ready.borrow() => {
+                                tracing::info!("miner: canonical sync authority changed; discarding template");
+                            }
+                            Ok(()) => {
+                                tracing::debug!("miner: proof readiness changed; rebuilding");
+                            }
+                            Err(_) => break 'mining,
+                        }
                     }
                 }
-                let parent_is_still_tip = {
-                    let context = self.chain.read().await;
-                    context.tip_height() == expected_parent_height
-                        && block_id(context.tip_header()) == expected_parent_hash
-                };
-                if !parent_is_still_tip || !*self.proof_network_ready.borrow() {
-                    tracing::debug!(height, "prepared template became stale before nonce search");
-                    continue;
-                }
-            }
-
-            tracing::info!(
-                height,
-                txs = n_txs,
-                user_pages,
-                ?proof_class,
-                prepare_ms = prepare_elapsed.as_millis(),
-                "mining complete block"
-            );
-
-            // `watch::Receiver::changed` is edge-triggered. Readiness may
-            // have become true while this miner was waiting to start or
-            // while the proof was being built; consume that already-observed
-            // version before entering the PoW select. Otherwise the stale
-            // true edge wakes the select immediately and throws away a valid
-            // proof even though network authorization never changed.
-            let _ = *self.proof_network_ready.borrow_and_update();
-            let _ = *self.nonce_network_ready.borrow_and_update();
-
-            // Phase 2: all workers search the already-proven semantic header.
-            // A winning nonce only seals the nonce-free HistoryStep terminal.
-            let pow_header = attempt.pow_header(0);
-            let cancel_pow = Arc::clone(&cancel);
-            cancel.store(false, Ordering::Relaxed);
-            // Close the race where shutdown set cancel between the check
-            // above and the reset. A later shutdown cannot be lost because it
-            // sets cancel after this point and the PoW worker observes it.
-            if self.stopped.load(Ordering::Acquire) {
-                cancel.store(true, Ordering::SeqCst);
-                tracing::info!(
-                    height,
-                    "miner: shutdown requested before PoW; discarding prepared block"
-                );
+                // Every other outcome rebuilds from a fresh template.
                 break;
-            }
-            heartbeat.reset();
-            let pow_start = Instant::now();
-            let mut pow_handle = tokio::task::spawn_blocking(move || {
-                install_pow_phase_cpu(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
-            });
-
-            tokio::select! {
-                pow_res = &mut pow_handle => {
-                    match pow_res {
-                        Ok(Ok(Some(sol))) => {
-                            if self.stopped.load(Ordering::Acquire) {
-                                tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
-                                break 'mining;
-                            }
-                            // A found nonce is finished work. The readiness
-                            // watches are a local heuristic about peers, not a
-                            // consensus rule, and they flip several times a
-                            // second while suffix plans come and go. Discarding
-                            // here threw away blocks this node had actually won.
-                            //
-                            // The authoritative check is atomic and happens
-                            // anyway: commit_locally_proved_next_block rejects a
-                            // moved parent under the chain write lock
-                            // (BadParentHash / BadHeight). The external mining
-                            // path dropped this same guard for the same reason.
-                            let nonce_found_at = Instant::now();
-                            let sealed_header = attempt.pow_header(sol.nonce);
-                            let hash = block_id(&sealed_header);
-                            let elapsed = pow_start.elapsed();
-                            let elapsed_s = elapsed.as_secs_f64();
-
-                            // Count leading zeros of the difficulty target (MSB-first, LE).
-                            // Matches block_work() in difficulty.rs — higher = harder.
-                            // Genesis = 27lz. ASERT raises this when blocks arrive faster
-                            // than the block interval (90 s, 180 s from v1.5) and lowers
-                            // it when they're slower.
-                            let diff_lz = jetsam_chain::consensus::target_leading_zero_bits(
-                                &sealed_header.difficulty_target,
-                            );
-
-                            tracing::debug!(
-                                height,
-                                hash = %hex::encode(hash),
-                                n_txs,
-                                prepare_ms = prepare_elapsed.as_millis(),
-                                ?proof_class,
-                                b25_prepare_ms_ewma,
-                                b255_prepare_ms_ewma,
-                                pow_time = %format!("{elapsed_s:.2}s"),
-                                diff = %format!("lz{diff_lz}"),
-                                "PoW nonce found; sealing prepared HistoryStep"
-                            );
-
-                            let seal_runtime = Arc::clone(&block_runtime);
-                            let seal_handle = tokio::task::spawn_blocking(move || {
-                                let started = Instant::now();
-                                let result = install_history_step_phase_cpu(|| {
-                                    attempt.prove(&seal_runtime, sol.nonce)
-                                })
-                                .map_err(|error| format!("HistoryStep seal CPU phase: {error}"))
-                                .and_then(|result| result);
-                                (result, started.elapsed())
-                            });
-                            let (proved, seal_elapsed) = match seal_handle.await {
-                                Ok((Ok(proved), elapsed)) => (proved, elapsed),
-                                Ok((Err(error), elapsed)) => {
-                                    tracing::error!(
-                                        height,
-                                        seal_ms = elapsed.as_millis(),
-                                        %error,
-                                        "prepared HistoryStep sealing failed"
-                                    );
-                                    let _ = self.events.send(MinerEvent::ProveFailed { height, error });
-                                    continue;
-                                }
-                                Err(error) => {
-                                    tracing::error!(height, ?error, "HistoryStep sealing task panicked");
-                                    continue;
-                                }
-                            };
-
-                            if self.stopped.load(Ordering::Acquire) {
-                                tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
-                                break 'mining;
-                            }
-                            // Fully proved at this point: same reasoning as
-                            // above. The parent re-check at commit decides.
-
-                            // IMPORTANT: apply and store the block FIRST, THEN fire the event.
-                            // The announcement triggers peers to request the block immediately;
-                            // if we fire the event before storing, a fast peer gets None.
-                            let proved = match self.apply_found_block(proved, addr).await {
-                                Ok(proved) => proved,
-                                Err(error) => {
-                                    tracing::warn!(height, "miner: block superseded: {error}");
-                                    continue;
-                                }
-                            };
-                            // The one line worth scrolling back for. The
-                            // structured fields are unchanged — every script
-                            // that reads them keeps working — but the message
-                            // now stands out from the sync chatter around it,
-                            // and says what the operator wants to know first:
-                            // which block, and what it paid.
-                            tracing::info!(
-                                height,
-                                hash = %hex::encode(hash),
-                                txs = n_txs,
-                                pow_ms = elapsed.as_millis(),
-                                history_step_ms = prepare_elapsed.as_millis(),
-                                seal_ms = seal_elapsed.as_millis(),
-                                nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
-                                "{} BLOCK WON #{height} — {} {}  ·  block accepted  ·  \
-                                 pow {:.1}s · proof {:.1}s",
-                                crate::colour::WON,
-                                jetsam_chain::consensus::emission::block_reward(height)
-                                    / jetsam_chain::consensus::params::MICRO_PER_JTM,
-                                jetsam_chain::consensus::identity::TICKER,
-                                elapsed.as_secs_f64(),
-                                prepare_elapsed.as_secs_f64(),
-                            );
-
-                            // Now safe to announce: the complete bundle is durable.
-                            let _ = self.events.send(MinerEvent::BlockFound {
-                                height,
-                                hash,
-                                n_txs,
-                                pow_nonce: sol.nonce,
-                                bundle: proved.into_parts().1,
-                            });
-                        }
-                        Ok(Ok(None)) => {
-                            // PoW cancelled.
-                            let _ = self.events.send(MinerEvent::MiningCancelled {
-                                reason: "cancelled".into(),
-                            });
-                        }
-                        Ok(Err(error)) => {
-                            tracing::error!(height, %error, "PoW CPU admission failed");
-                        }
-                        Err(error) => {
-                            tracing::error!(height, ?error, "PoW task panicked");
-                        }
-                    }
-                }
-
-                _ = heartbeat.tick(), if user_pages == 0 => {
-                    cancel.store(true, Ordering::Relaxed);
-                    let _ = pow_handle.await;
-                    tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
-                }
-
-                refresh = next_mining_mempool_refresh(&mut mempool_events), if user_pages == 0 => {
-                    // No blocking PoW task may escape this select branch. A
-                    // new transaction must be included immediately. Lag is
-                    // conservative because the missed range may contain an
-                    // admission; previous-height confirmations are filtered
-                    // inside `next_mining_mempool_refresh`.
-                    cancel.store(true, Ordering::Relaxed);
-                    let _ = pow_handle.await;
-                    match refresh {
-                        MiningMempoolRefresh::TransactionAdmitted => {
-                            tracing::debug!("coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
-                        }
-                        MiningMempoolRefresh::ReceiverLagged(skipped) => {
-                            tracing::debug!(skipped, "coinbase-only template: mempool receiver lagged, rebuilding after PoW drain");
-                        }
-                    }
-                }
-
-                template_change = self.template_changes.recv() => {
-                    // A new chain tip or wallet payout invalidates this exact template.
-                    cancel.store(true, Ordering::Relaxed);
-                    let _ = pow_handle.await;
-                    match template_change {
-                        Ok(()) => tracing::debug!("template input changed: cancelling PoW to rebuild"),
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::debug!(skipped, "template-change receiver lagged: cancelling PoW to rebuild");
-                        }
-                        // The miner owns a sender, so closure is unreachable
-                        // until the miner itself is dropped.
-                        Err(broadcast::error::RecvError::Closed) => unreachable!(),
-                    }
-                }
-
-                readiness = self.nonce_network_ready.changed() => {
-                    cancel.store(true, Ordering::Relaxed);
-                    let _ = pow_handle.await;
-                    match readiness {
-                        Ok(()) if !*self.nonce_network_ready.borrow() => {
-                            tracing::info!("miner: frontier authorization lost; pausing nonce search");
-                        }
-                        Ok(()) => {
-                            tracing::debug!("miner: frontier authorization changed; rebuilding");
-                        }
-                        Err(_) => break 'mining,
-                    }
-                }
-
-                readiness = self.proof_network_ready.changed() => {
-                    cancel.store(true, Ordering::Relaxed);
-                    let _ = pow_handle.await;
-                    match readiness {
-                        Ok(()) if !*self.proof_network_ready.borrow() => {
-                            tracing::info!("miner: canonical sync authority changed; discarding template");
-                        }
-                        Ok(()) => {
-                            tracing::debug!("miner: proof readiness changed; rebuilding");
-                        }
-                        Err(_) => break 'mining,
-                    }
-                }
             }
         }
     }
@@ -1162,5 +1238,183 @@ mod tests {
             .unwrap(),
             MiningMempoolRefresh::TransactionAdmitted,
         );
+    }
+
+    /// The receivers exactly as the nonce search leaves them when frontier
+    /// authorization drops: both readiness versions consumed before PoW, then
+    /// the authorization edge observed by the PoW select.
+    struct PausedSearch {
+        nonce_tx: watch::Sender<bool>,
+        proof_tx: watch::Sender<bool>,
+        template_tx: broadcast::Sender<()>,
+        nonce_rx: watch::Receiver<bool>,
+        proof_rx: watch::Receiver<bool>,
+        template_rx: broadcast::Receiver<()>,
+        stopped: AtomicBool,
+        parent_is_tip: Arc<AtomicBool>,
+    }
+
+    async fn search_paused_by_lost_authorization() -> PausedSearch {
+        let (nonce_tx, mut nonce_rx) = watch::channel(true);
+        let (proof_tx, mut proof_rx) = watch::channel(true);
+        let (template_tx, template_rx) = broadcast::channel(4);
+        let _ = *nonce_rx.borrow_and_update();
+        let _ = *proof_rx.borrow_and_update();
+        nonce_tx.send_replace(false);
+        nonce_rx.changed().await.unwrap();
+        assert!(!*nonce_rx.borrow());
+        PausedSearch {
+            nonce_tx,
+            proof_tx,
+            template_tx,
+            nonce_rx,
+            proof_rx,
+            template_rx,
+            stopped: AtomicBool::new(false),
+            parent_is_tip: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    async fn gate(search: &mut PausedSearch) -> PreparedAttemptGate {
+        let parent_is_tip = Arc::clone(&search.parent_is_tip);
+        gate_prepared_attempt_for_nonce_search(
+            7,
+            &mut search.nonce_rx,
+            &mut search.proof_rx,
+            &mut search.template_rx,
+            &search.stopped,
+            move || std::future::ready(parent_is_tip.load(Ordering::SeqCst)),
+        )
+        .await
+    }
+
+    async fn still_paused(
+        gate: &mut (impl std::future::Future<Output = PreparedAttemptGate> + Unpin),
+    ) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), gate)
+                .await
+                .is_err(),
+            "no nonce may be searched while frontier authorization is absent",
+        );
+    }
+
+    async fn decided(
+        gate: impl std::future::Future<Output = PreparedAttemptGate>,
+    ) -> PreparedAttemptGate {
+        tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("the gate decides once its inputs settle")
+    }
+
+    #[tokio::test]
+    async fn prepared_proof_survives_a_frontier_authorization_pause_on_the_same_tip() {
+        // Authorization drops during PoW and returns on the unchanged tip:
+        // the HistoryStep proof is kept and the nonce search resumes.
+        let mut search = search_paused_by_lost_authorization().await;
+        let nonce_tx = search.nonce_tx.clone();
+        let mut pending = Box::pin(gate(&mut search));
+        still_paused(&mut pending).await;
+        nonce_tx.send_replace(true);
+        assert_eq!(decided(pending).await, PreparedAttemptGate::Search);
+
+        // The same when the authorization already came back before the
+        // miner looked again (false then true between two polls).
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx.send_replace(true);
+        search.nonce_rx.changed().await.unwrap();
+        assert_eq!(
+            decided(gate(&mut search)).await,
+            PreparedAttemptGate::Search
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_proof_is_discarded_when_the_tip_moves_during_the_pause() {
+        // A new canonical tip (or payout switch) signalled during the pause.
+        let mut search = search_paused_by_lost_authorization().await;
+        let template_tx = search.template_tx.clone();
+        let mut pending = Box::pin(gate(&mut search));
+        still_paused(&mut pending).await;
+        template_tx.send(()).unwrap();
+        assert_eq!(decided(pending).await, PreparedAttemptGate::Stale);
+
+        // The parent stopped being the tip; seen when authorization returns.
+        let mut search = search_paused_by_lost_authorization().await;
+        let (nonce_tx, parent_is_tip) =
+            (search.nonce_tx.clone(), Arc::clone(&search.parent_is_tip));
+        let mut pending = Box::pin(gate(&mut search));
+        still_paused(&mut pending).await;
+        parent_is_tip.store(false, Ordering::SeqCst);
+        nonce_tx.send_replace(true);
+        assert_eq!(decided(pending).await, PreparedAttemptGate::Stale);
+
+        // Authorization already back, but a tip change is queued.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx.send_replace(true);
+        search.template_tx.send(()).unwrap();
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stale);
+
+        // Authorization already back, but the parent was replaced.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx.send_replace(true);
+        search.parent_is_tip.store(false, Ordering::SeqCst);
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stale);
+    }
+
+    #[tokio::test]
+    async fn prepared_proof_is_discarded_when_sync_authority_is_lost_during_the_pause() {
+        let mut search = search_paused_by_lost_authorization().await;
+        let proof_tx = search.proof_tx.clone();
+        let mut pending = Box::pin(gate(&mut search));
+        still_paused(&mut pending).await;
+        proof_tx.send_replace(false);
+        assert_eq!(decided(pending).await, PreparedAttemptGate::Stale);
+
+        // Authorization reads true, but canonical sync authority is gone.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx.send_replace(true);
+        search.proof_tx.send_replace(false);
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stale);
+    }
+
+    #[tokio::test]
+    async fn shutdown_or_a_closed_authorization_channel_ends_the_pause() {
+        let mut search = search_paused_by_lost_authorization().await;
+        search.stopped.store(true, Ordering::Release);
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stop);
+
+        // Replacing the only sender closes the authorization channel.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx = watch::channel(false).0;
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stop);
+
+        // The same for the canonical-sync channel while authorization is awaited.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.proof_tx = watch::channel(true).0;
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stop);
+    }
+
+    #[tokio::test]
+    async fn prepared_proof_is_discarded_when_tip_changes_overflow_the_receiver_during_the_pause() {
+        // A burst of tip changes (a reorg and back) that ends on the same
+        // parent: the lagged receiver may have dropped an input change, so the
+        // attempt is not resumed even though its parent reads as the tip.
+        let mut search = search_paused_by_lost_authorization().await;
+        search.nonce_tx.send_replace(true);
+        for _ in 0..5 {
+            search.template_tx.send(()).unwrap();
+        }
+        assert_eq!(decided(gate(&mut search)).await, PreparedAttemptGate::Stale);
+
+        // The same burst while authorization is still awaited.
+        let mut search = search_paused_by_lost_authorization().await;
+        let template_tx = search.template_tx.clone();
+        let mut pending = Box::pin(gate(&mut search));
+        still_paused(&mut pending).await;
+        for _ in 0..5 {
+            template_tx.send(()).unwrap();
+        }
+        assert_eq!(decided(pending).await, PreparedAttemptGate::Stale);
     }
 }

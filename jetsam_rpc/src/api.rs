@@ -115,6 +115,13 @@ pub trait JetsamApi {
     #[method(name = "getPeerCount")]
     async fn get_peer_count(&self) -> RpcResult<usize>;
 
+    /// The software version each identified peer announced, to measure
+    /// adoption of a release (`jetsam-cli adoption`). Informative only.
+    /// Peer identities are given to a loopback or bearer-authenticated caller
+    /// only.
+    #[method(name = "getPeerVersions")]
+    async fn get_peer_versions(&self) -> RpcResult<crate::types::PeerVersionsInfo>;
+
     /// Daemon sync, mining, CPU backend and worker-pool status.
     #[method(name = "getNodeStatus")]
     async fn get_node_status(&self) -> RpcResult<NodeStatus>;
@@ -261,6 +268,37 @@ pub trait JetsamApi {
         &self,
         matrix_digest: String,
         io_commitment: String,
+        payment_hex: String,
+        proof_hex: String,
+    ) -> RpcResult<String>;
+
+    /// Hand a v1.6 batch bundle (hex of `ClientBatchBundle::encode`: batch
+    /// submission, the transaction paying its fee, the batch proof) to this
+    /// node: its payment is checked against the current state, the
+    /// batch decided against the tip's lanes and held for the miners, then
+    /// announced to peers.
+    #[method(name = "submitClientBatch")]
+    async fn submit_client_batch(
+        &self,
+        bundle_hex: String,
+    ) -> RpcResult<crate::client_objects::SubmitClientBatchResponse>;
+
+    /// What a batch for the next block is built over: the tip,
+    /// the chain's batch class, the registry leaves and the lanes the tip
+    /// publishes.
+    #[method(name = "getClientBatchParent")]
+    async fn get_client_batch_parent(
+        &self,
+    ) -> RpcResult<crate::client_objects::ClientBatchParentResponse>;
+
+    /// Assemble a batch bundle (hex) from its parts: the batch submission,
+    /// its payment (hex intent) and the batch proof (hex). No side effect.
+    #[method(name = "buildClientBatchBundle")]
+    async fn build_client_batch_bundle(
+        &self,
+        batch_class: String,
+        statements_root: String,
+        count: u32,
         payment_hex: String,
         proof_hex: String,
     ) -> RpcResult<String>;

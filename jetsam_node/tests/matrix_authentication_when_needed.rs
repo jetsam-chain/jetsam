@@ -40,7 +40,14 @@ const MATRIX_LOG: usize = 15;
 /// `D` is fetched or kept (review B3).
 fn rules_listing(id: &MatrixFileId) -> ClientObjectRules {
     ClientObjectRules {
-        catalogue: Box::leak(vec![id.matrix_digest].into_boxed_slice()),
+        catalogue: Box::leak(
+            vec![jetsam_chain::consensus::client_objects::CatalogueEntry {
+                matrix_digest: id.matrix_digest,
+                matrix_file_root: id.file_root,
+                matrix_file_len: id.file_len,
+            }]
+            .into_boxed_slice(),
+        ),
         ..ClientObjectRules::CONSENSUS
     }
 }

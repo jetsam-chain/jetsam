@@ -47,6 +47,30 @@ pub trait RpcClientObjects: jetsam_miner::client_slot::MinerClientSource {
 
     /// Client proofs queued for this node's miners.
     fn queued_client_proofs(&self) -> usize;
+
+    /// Receive one v1.6 batch bundle against the tip at `tip_height` (its
+    /// `terminal`, its branch's `registry`): decoded, decided, held for the
+    /// miners. CPU-heavy, called on a blocking worker.
+    fn receive_client_batch(
+        &self,
+        _bundle: &[u8],
+        _tip_height: u64,
+        _terminal: Option<&[u8]>,
+        _registry: &ClientRegistryState,
+        _expected: Option<&jetsam_p2p::client_object_protocol::ClientBatchId>,
+    ) -> Result<jetsam_p2p::client_object_protocol::ClientBatchAnnouncement, String> {
+        Err("this node holds no v1.6 relation: no batch is received".into())
+    }
+
+    /// The lanes a batch for the block after the tip at `tip_height` is built
+    /// on.
+    fn client_batch_parent_lanes(
+        &self,
+        _tip_height: u64,
+        _terminal: Option<&[u8]>,
+    ) -> Result<jetsam_recursive::ParentLanes, String> {
+        Err("this node holds no v1.6 relation".into())
+    }
 }
 
 pub type SharedRpcClientObjects = std::sync::Arc<dyn RpcClientObjects>;
@@ -102,6 +126,32 @@ pub struct SubmitClientProofResponse {
     pub fee_micro_jtm: u64,
 }
 
+/// `jetsam_submitClientBatch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitClientBatchResponse {
+    pub batch_class: String,
+    pub statements_root: String,
+    pub count: u32,
+    pub bundle_digest: String,
+    pub bundle_len: u32,
+    pub fee_micro_jtm: u64,
+}
+
+/// `jetsam_getClientBatchParent`: what a batch for the next block
+/// is built over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBatchParentResponse {
+    /// The tip; the batch is for the block at `tip_height + 1`.
+    pub tip_height: u64,
+    pub tip_hash: String,
+    /// `CLIENT_BATCH_CLASS`, hex.
+    pub batch_class: String,
+    /// The registry leaves the tip publishes (zero-padded), hex.
+    pub leaves: Vec<String>,
+    /// `ParentLanes::encode`, hex.
+    pub lanes_hex: String,
+}
+
 /// `jetsam_registerClient`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterClientResponse {
@@ -125,6 +175,13 @@ pub enum ClientPaymentObject {
     Submission {
         matrix_digest: String,
         io_commitment: String,
+    },
+    /// A v1.6 batch submission: its class, statements root and
+    /// count (its fee is the transaction's).
+    Batch {
+        batch_class: String,
+        statements_root: String,
+        count: u32,
     },
 }
 
@@ -161,6 +218,19 @@ pub async fn plan_registration_payment(
     registry: &ClientRegistryState,
     rules: &ClientObjectRules,
 ) -> Result<(ClientRegistration, Vec<([u8; 32], u64)>), String> {
+    plan_registration_payment_at(objects, matrix_path, registry, rules, 0).await
+}
+
+/// [`plan_registration_payment`] for the block at `next_height`: the
+/// registration must be admissible at that height (from the v1.6 height on,
+/// a form-Z entry only).
+pub async fn plan_registration_payment_at(
+    objects: Option<SharedRpcClientObjects>,
+    matrix_path: &str,
+    registry: &ClientRegistryState,
+    rules: &ClientObjectRules,
+    next_height: u64,
+) -> Result<(ClientRegistration, Vec<([u8; 32], u64)>), String> {
     use jetsam_chain::consensus::client_objects::{
         CLIENT_LICENSE_BURN_ADDRESS, CLIENT_LICENSE_POOL_ADDRESS,
     };
@@ -183,7 +253,14 @@ pub async fn plan_registration_payment(
     // Before anything is built, proved or reserved: a registration no block
     // can carry (outside the catalogue, say) would hold its license inputs
     // until its payment expires.
-    jetsam_chain::consensus::client_objects::check_registration_admissible(&registration, rules)
+    // At the height of the block that will carry it: from the v1.6
+    // height on, a form-Z entry only.
+    jetsam_chain::consensus::client_objects::check_registration_admissible_at(
+        &registration,
+        rules,
+        &jetsam_chain::consensus::client_objects::ClientBatchRules::current(),
+        next_height,
+    )
         .map_err(|error| {
             format!("registration refused, no payment built: {error} (matrix file {matrix_path})")
         })?;
@@ -396,7 +473,7 @@ mod tests {
         std::fs::write(&path, b"a matrix file").unwrap();
         let path = path.to_str().unwrap();
         let rules = ClientObjectRules {
-            catalogue: &[[0x41; 32]],
+            catalogue: &[jetsam_chain::consensus::client_objects::CatalogueEntry { matrix_digest: [0x41; 32], matrix_file_root: [0xF0; 32], matrix_file_len: 4_096 }],
             ..ClientObjectRules::CONSENSUS
         };
         let registration = |digest: u8| ClientRegistration {
@@ -427,10 +504,10 @@ mod tests {
         // This build's own catalogue: each tool it lists is planned, any
         // other refused (the public network's list is empty).
         let current = ClientObjectRules::current();
-        for digest in current.catalogue {
+        for entry in current.catalogue {
             let objects: SharedRpcClientObjects = std::sync::Arc::new(MakesRegistration(
                 ClientRegistration {
-                    matrix_digest: *digest,
+                    matrix_digest: entry.matrix_digest,
                     ..registration(0)
                 },
             ));
@@ -462,7 +539,13 @@ mod tests {
             .map(|digest| [digest; 32])
             .collect();
         catalogue.push([0x41; 32]);
-        let catalogue: &'static [[u8; 32]] = Box::leak(catalogue.into_boxed_slice());
+        let catalogue: &'static [jetsam_chain::consensus::client_objects::CatalogueEntry] = Box::leak(
+            catalogue
+                .iter()
+                .map(|digest| jetsam_chain::consensus::client_objects::CatalogueEntry { matrix_digest: *digest, matrix_file_root: [0xF0; 32], matrix_file_len: 4_096 })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         let rules = ClientObjectRules {
             catalogue,
             ..ClientObjectRules::CONSENSUS

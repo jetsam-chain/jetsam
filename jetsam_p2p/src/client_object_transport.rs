@@ -60,6 +60,39 @@ const CLIENT_OBJECT_PENDING_DEADLINE: Duration = Duration::from_secs(75);
 const ANNOUNCEMENT_RATE_MAX: u32 = 32;
 const ANNOUNCEMENT_RATE_WINDOW: Duration = Duration::from_secs(10);
 
+/// What one message on the client topic is (v1.6 adds the batch
+/// announcement): told apart by its framing.
+#[derive(Debug)]
+pub(crate) enum ClientGossip {
+    Registration(ClientRegistrationNotice),
+    Proof(ClientProofAnnouncement),
+    Batch(crate::client_object_protocol::ClientBatchAnnouncement),
+}
+
+/// Decode one message of the client topic: a registration notice (its
+/// payment checked to open and pay it), a client-proof announcement or a
+/// batch announcement; anything else is refused.
+pub(crate) fn decode_client_gossip(
+    data: &[u8],
+    rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+) -> Result<ClientGossip, ()> {
+    use crate::client_object_protocol::{ClientBatchAnnouncement, CLIENT_BATCH_ANNOUNCEMENT_BYTES};
+    if ClientRegistrationNotice::is_notice(data) {
+        return ClientRegistrationNotice::decode(data, rules)
+            .map(ClientGossip::Registration)
+            .map_err(|_| ());
+    }
+    match data.len() {
+        CLIENT_PROOF_ANNOUNCEMENT_BYTES => ClientProofAnnouncement::decode(data)
+            .map(ClientGossip::Proof)
+            .map_err(|_| ()),
+        CLIENT_BATCH_ANNOUNCEMENT_BYTES => ClientBatchAnnouncement::decode(data)
+            .map(ClientGossip::Batch)
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
 struct PendingClientObject {
     token: u64,
     peer: PeerId,
@@ -177,6 +210,23 @@ impl ClientObjectTransport {
         );
     }
 
+    /// `NetworkCommand::AnnounceClientBatch`.
+    pub(crate) fn announce_batch(
+        &mut self,
+        swarm: &mut Swarm<NodeBehaviour>,
+        announcement: crate::client_object_protocol::ClientBatchAnnouncement,
+    ) {
+        let outcome = swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.topic.clone(), announcement.encode().to_vec());
+        log_publish_outcome(
+            "client batch announcement",
+            &announcement.id.submission.statements_root,
+            outcome,
+        );
+    }
+
     /// `NetworkCommand::AnnounceClientRegistration`.
     pub(crate) fn announce_registration(
         &mut self,
@@ -230,42 +280,51 @@ impl ClientObjectTransport {
         // A registration relayed whole: forwarded only if its payment opens
         // and pays exactly its registration; the node checks the payment
         // against its state before holding it.
-        if ClientRegistrationNotice::is_notice(&message.data) {
-            match ClientRegistrationNotice::decode(
-                &message.data,
-                &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
-            ) {
-                Ok(notice) => {
-                    report(swarm, gossipsub::MessageAcceptance::Accept);
-                    let _ = gossip_events.send(NetworkEvent::ClientRegistrationRelayed {
-                        relayed_by: propagation_source,
-                        notice: Arc::new(notice),
-                    });
-                }
-                Err(_) => report(swarm, gossipsub::MessageAcceptance::Reject),
-            }
-            return None;
-        }
-        if message.data.len() != CLIENT_PROOF_ANNOUNCEMENT_BYTES {
-            report(swarm, gossipsub::MessageAcceptance::Reject);
-            return None;
-        }
-        match ClientProofAnnouncement::decode(&message.data) {
-            Ok(announcement) => {
+        let decoded = decode_client_gossip(
+            &message.data,
+            &jetsam_chain::consensus::client_objects::ClientObjectRules::current(),
+        );
+        // The relaying peer is a provider candidate; the original publisher,
+        // when directly connected, is a better one.
+        let from = message
+            .source
+            .filter(|source| swarm.is_connected(source))
+            .unwrap_or(propagation_source);
+        match decoded {
+            Ok(ClientGossip::Registration(notice)) => {
                 report(swarm, gossipsub::MessageAcceptance::Accept);
-                // The relaying peer is a provider candidate; the original
-                // publisher, when directly connected, is a better one.
-                let from = message
-                    .source
-                    .filter(|source| swarm.is_connected(source))
-                    .unwrap_or(propagation_source);
+                let _ = gossip_events.send(NetworkEvent::ClientRegistrationRelayed {
+                    relayed_by: propagation_source,
+                    notice: Arc::new(notice),
+                });
+            }
+            Ok(ClientGossip::Proof(announcement)) => {
+                report(swarm, gossipsub::MessageAcceptance::Accept);
                 let _ = gossip_events.send(NetworkEvent::ClientProofAnnounced {
                     from,
                     relayed_by: propagation_source,
                     announcement,
                 });
             }
-            Err(_) => report(swarm, gossipsub::MessageAcceptance::Reject),
+            // A node whose v1.6 clock is dormant neither forwards nor fetches a
+            // batch: ignored, as before v1.6 existed
+            // nobody forwarded one.
+            Ok(ClientGossip::Batch(_))
+                if jetsam_chain::consensus::client_objects::ClientBatchRules::current()
+                    .activation_height
+                    .is_none() =>
+            {
+                report(swarm, gossipsub::MessageAcceptance::Ignore);
+            }
+            Ok(ClientGossip::Batch(announcement)) => {
+                report(swarm, gossipsub::MessageAcceptance::Accept);
+                let _ = gossip_events.send(NetworkEvent::ClientBatchAnnounced {
+                    from,
+                    relayed_by: propagation_source,
+                    announcement,
+                });
+            }
+            Err(()) => report(swarm, gossipsub::MessageAcceptance::Reject),
         }
         None
     }
@@ -561,5 +620,52 @@ mod tests {
             )
         });
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// What arrives on the client topic is told apart by its framing:
+    /// a registration notice, a 112-byte client-proof announcement, a
+    /// 116-byte batch announcement (v1.6); anything else is refused.
+    #[test]
+    fn a_batch_announcement_is_told_apart_on_the_client_topic() {
+        use crate::client_object_protocol::{
+            ClientBatchAnnouncement, ClientBatchId, ClientProofAnnouncement, ClientProofId,
+        };
+        use jetsam_chain::consensus::client_objects::{ClientBatchSubmission, ClientSubmission};
+        let rules = jetsam_chain::consensus::client_objects::ClientObjectRules::current();
+        let batch = ClientBatchAnnouncement {
+            id: ClientBatchId {
+                submission: ClientBatchSubmission {
+                    batch_class: [0xD1; 32],
+                    statements_root: [0x42; 32],
+                    count: 2,
+                },
+                bundle_digest: [0x77; 32],
+                encoded_len: 790_000,
+            },
+            fee: 1_000_000,
+        };
+        let proof = ClientProofAnnouncement {
+            id: ClientProofId {
+                submission: ClientSubmission {
+                    matrix_digest: [0x10; 32],
+                    io_commitment: [0x11; 32],
+                },
+                bundle_digest: [0x12; 32],
+                encoded_len: 400_000,
+            },
+            fee: 7,
+        };
+        assert!(matches!(
+            decode_client_gossip(&batch.encode(), &rules),
+            Ok(ClientGossip::Batch(decoded)) if decoded == batch
+        ));
+        assert!(matches!(
+            decode_client_gossip(&proof.encode(), &rules),
+            Ok(ClientGossip::Proof(decoded)) if decoded == proof
+        ));
+        let mut bad = batch.encode().to_vec();
+        bad[0] ^= 1;
+        assert!(decode_client_gossip(&bad, &rules).is_err());
+        assert!(decode_client_gossip(&[0u8; 50], &rules).is_err());
     }
 }

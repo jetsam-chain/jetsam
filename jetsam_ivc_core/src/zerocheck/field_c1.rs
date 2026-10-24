@@ -380,6 +380,298 @@ pub fn verify<C: Challenger>(
     })
 }
 
+// ---- form Z (v1.6): the Libra-masked zerocheck -----------------------------
+//
+// The mask g(s, x) = Z_S(s) h(s) + sum_i g_i(x_i) (deg h <= 62, deg g_i = 2)
+// sits in committed cells. After r_rest the prover sends
+// kappa = sum_x eq(r, x) g(s, x) = sum_i [(1 + r_i) g_i(0) + r_i g_i(1)]
+// (Z_S vanishes on S), then lambda is drawn. The sent polynomial becomes
+// R'(X) = R(X) + lambda (Z_S(X) h(X) + kappa); on S it equals lambda kappa,
+// so R' - lambda kappa still vanishes on S and interpolates from Lambda. The
+// multilinear rounds carry lambda (g_i(X) + off_i). At the end the verifier
+// recovers g_final = G(z, rho) = (running - final_a final_b) / lambda, a
+// linear claim on the mask cells checked by the PCS opening.
+
+/// The verifier side of the masked zerocheck: the claims, the mask point
+/// and the value the mask claim must have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1ZkZerocheckClaim {
+    pub claim: C1ZerocheckClaim,
+    pub lambda: F256,
+    /// `G(z, rho) = Z_S(z) h(z) + sum_i g_i(rho_i)`.
+    pub mask_value: F256,
+}
+
+fn libra_round_value(g: &[F256; 3], x: F256) -> F256 {
+    g[0] + g[1] * x + g[2] * x * x
+}
+
+pub fn prove_zk<C: Challenger>(
+    a: &[F128],
+    b: &[F128],
+    c: &[F128],
+    m: usize,
+    mask: &crate::zk_form::ZkZerocheckMask,
+    challenger: &mut C,
+) -> (C1ZerocheckProof, F256, C1ZkZerocheckClaim) {
+    let k_skip = K_SKIP;
+    let skip_size = 1usize << k_skip;
+    assert!(m >= k_skip + 1, "prove requires m >= K_SKIP + 1");
+    let length = 1usize << m;
+    assert_eq!(a.len(), length);
+    assert_eq!(b.len(), length);
+    assert_eq!(c.len(), length);
+    let mlv_rounds = m - k_skip;
+    assert_eq!(mask.rounds.len(), mlv_rounds);
+    assert_eq!(mask.skip.len(), crate::zk_form::ZK_SKIP_MASK_COEFFICIENTS);
+    let rest_size = 1usize << mlv_rounds;
+
+    challenger.observe_label(b"history-field-zerocheck-c1");
+    let r_rest = challenger.sample_f256_vec(mlv_rounds);
+    let eq = build_eq_table(&r_rest);
+
+    let kappa = mask
+        .rounds
+        .iter()
+        .zip(&r_rest)
+        .fold(F256::ZERO, |sum, (g, &r)| {
+            let at_zero = g[0];
+            let at_one = g[0] + g[1] + g[2];
+            sum + (F256::ONE + r) * at_zero + r * at_one
+        });
+    challenger.observe_label(b"history-field-zerocheck-c1-zk");
+    challenger.observe_f256(kappa);
+    let lambda = challenger.sample_f256();
+
+    let extender = SkipExtender::new(k_skip);
+    let chunk = 1usize.max(rest_size / (8 * rayon::current_num_threads().max(1)));
+    let (mut round1_ab, mut round1_c) = (0..rest_size.div_ceil(chunk))
+        .into_par_iter()
+        .map(|chunk_index| {
+            let start = chunk_index * chunk;
+            let end = ((chunk_index + 1) * chunk).min(rest_size);
+            let mut ab_accumulator = vec![F256::ZERO; skip_size];
+            let mut c_accumulator = vec![F256::ZERO; skip_size];
+            let mut a_local = vec![F128::ZERO; skip_size];
+            let mut b_local = vec![F128::ZERO; skip_size];
+            for rest_index in start..end {
+                let base = rest_index * skip_size;
+                let weight = eq[rest_index];
+                a_local.copy_from_slice(&a[base..base + skip_size]);
+                b_local.copy_from_slice(&b[base..base + skip_size]);
+                extender.extend_s_to_lambda(&mut a_local);
+                extender.extend_s_to_lambda(&mut b_local);
+                for skip_index in 0..skip_size {
+                    ab_accumulator[skip_index] +=
+                        weight.scale_base(a_local[skip_index] * b_local[skip_index]);
+                    c_accumulator[skip_index] += weight.scale_base(c[base + skip_index]);
+                }
+            }
+            (ab_accumulator, c_accumulator)
+        })
+        .reduce(
+            || (vec![F256::ZERO; skip_size], vec![F256::ZERO; skip_size]),
+            |(mut ab_left, mut c_left), (ab_right, c_right)| {
+                for index in 0..skip_size {
+                    ab_left[index] += ab_right[index];
+                    c_left[index] += c_right[index];
+                }
+                (ab_left, c_left)
+            },
+        );
+    extend_s_to_lambda(&extender, &mut round1_c);
+    let h_at = |x: F256| {
+        mask.skip
+            .iter()
+            .rev()
+            .fold(F256::ZERO, |acc, &coefficient| acc * x + coefficient)
+    };
+    for (index, value) in round1_ab.iter_mut().enumerate() {
+        let node = F256::from_base(PHI_8_TABLE[skip_size + index]);
+        *value += lambda * (crate::zk_form::skip_vanishing(node) * h_at(node) + kappa);
+    }
+
+    challenger.observe_f256_slice(&round1_ab);
+    challenger.observe_f256_slice(&round1_c);
+    let z = challenger.sample_f256();
+    let final_c_eval = interpolate_on_lambda(&round1_c, k_skip, z);
+    let zs_h = crate::zk_form::skip_vanishing(z) * h_at(z);
+
+    let skip_weights = lagrange_weights(k_skip, z, 0);
+    let fold_at_z = |values: &[F128]| -> Vec<F256> {
+        (0..rest_size)
+            .into_par_iter()
+            .map(|rest_index| {
+                let base = rest_index * skip_size;
+                (0..skip_size).fold(F256::ZERO, |sum, skip_index| {
+                    sum + skip_weights[skip_index].scale_base(values[base + skip_index])
+                })
+            })
+            .collect()
+    };
+    let mut a_mlv = fold_at_z(a);
+    let mut b_mlv = fold_at_z(b);
+
+    // tail[i] = sum_{j > i} [(1 + r_j) g_j(0) + r_j g_j(1)].
+    let mut tail = vec![F256::ZERO; mlv_rounds + 1];
+    for i in (0..mlv_rounds).rev() {
+        let g = &mask.rounds[i];
+        let r = r_rest[i];
+        tail[i] = tail[i + 1] + (F256::ONE + r) * g[0] + r * (g[0] + g[1] + g[2]);
+    }
+    let mut bound = F256::ZERO;
+    let mut multilinear_rounds = Vec::with_capacity(mlv_rounds);
+    let mut mlv_challenges = Vec::with_capacity(mlv_rounds);
+    for round in 0..mlv_rounds {
+        if round > 0 {
+            fold_pair(&mut a_mlv, &mut b_mlv, mlv_challenges[round - 1]);
+        }
+        let log_length = a_mlv.len().trailing_zeros() as usize;
+        let mut next_eq = vec![F256::ONE; log_length];
+        next_eq[1..].copy_from_slice(&r_rest[round + 1..]);
+        let (one, infinity) = round_pair(&a_mlv, &b_mlv, &next_eq);
+        let g = &mask.rounds[round];
+        let offset = zs_h + bound + tail[round + 1];
+        let message = (
+            one + lambda * (libra_round_value(g, F256::ONE) + offset),
+            infinity + lambda * g[2],
+        );
+        multilinear_rounds.push(message);
+        challenger.observe_f256(message.0);
+        challenger.observe_f256(message.1);
+        let challenge = challenger.sample_f256();
+        mlv_challenges.push(challenge);
+        bound += libra_round_value(g, challenge);
+    }
+    fold_pair(
+        &mut a_mlv,
+        &mut b_mlv,
+        *mlv_challenges.last().expect("at least one challenge"),
+    );
+    let final_a_eval = a_mlv[0];
+    let final_b_eval = b_mlv[0];
+    challenger.observe_f256(final_a_eval);
+    challenger.observe_f256(final_b_eval);
+
+    let proof = C1ZerocheckProof {
+        round1_ab,
+        round1_c,
+        multilinear_rounds,
+        final_a_eval,
+        final_b_eval,
+        final_c_eval,
+    };
+    let claim = C1ZerocheckClaim {
+        z,
+        mlv_challenges,
+        r_rest,
+        a_eval: final_a_eval,
+        b_eval: final_b_eval,
+        c_eval: final_c_eval,
+    };
+    (
+        proof,
+        kappa,
+        C1ZkZerocheckClaim {
+            claim,
+            lambda,
+            mask_value: zs_h + bound,
+        },
+    )
+}
+
+pub fn verify_zk<C: Challenger>(
+    m: usize,
+    proof: &C1ZerocheckProof,
+    kappa: F256,
+    challenger: &mut C,
+) -> Result<C1ZkZerocheckClaim, VerifyError> {
+    let k_skip = K_SKIP;
+    if m < k_skip + 1 {
+        return Err(VerifyError::LogNTooSmall { log_n: m, k_skip });
+    }
+    let mlv_rounds = m - k_skip;
+    let skip_size = 1usize << k_skip;
+    if proof.round1_ab.len() != skip_size {
+        return Err(VerifyError::BadRound1Length {
+            expected: skip_size,
+            got: proof.round1_ab.len(),
+        });
+    }
+    if proof.round1_c.len() != skip_size {
+        return Err(VerifyError::BadRound1Length {
+            expected: skip_size,
+            got: proof.round1_c.len(),
+        });
+    }
+    if proof.multilinear_rounds.len() != mlv_rounds {
+        return Err(VerifyError::BadMultilinearRoundsLength {
+            expected: mlv_rounds,
+            got: proof.multilinear_rounds.len(),
+        });
+    }
+
+    challenger.observe_label(b"history-field-zerocheck-c1");
+    let r_rest = challenger.sample_f256_vec(mlv_rounds);
+    challenger.observe_label(b"history-field-zerocheck-c1-zk");
+    challenger.observe_f256(kappa);
+    let lambda = challenger.sample_f256();
+    challenger.observe_f256_slice(&proof.round1_ab);
+    challenger.observe_f256_slice(&proof.round1_c);
+    let z = challenger.sample_f256();
+
+    if interpolate_on_lambda(&proof.round1_c, k_skip, z) != proof.final_c_eval {
+        return Err(VerifyError::CEvalMismatch);
+    }
+    // R' - lambda kappa vanishes on S.
+    let shift = lambda * kappa;
+    let combined_at_lambda = proof
+        .round1_ab
+        .iter()
+        .zip(&proof.round1_c)
+        .map(|(&ab, &c)| ab + c + shift)
+        .collect::<Vec<_>>();
+    let mut running = interpolate_combined(&combined_at_lambda, k_skip, z)
+        + shift
+        + interpolate_on_lambda(&proof.round1_c, k_skip, z);
+
+    let mut mlv_challenges = Vec::with_capacity(mlv_rounds);
+    for (round, &(message_one, message_infinity)) in proof.multilinear_rounds.iter().enumerate() {
+        let eq_challenge = r_rest[round];
+        let one_plus_eq = F256::ONE + eq_challenge;
+        let value_zero = (running + eq_challenge * message_one) * one_plus_eq.inv();
+
+        challenger.observe_f256(message_one);
+        challenger.observe_f256(message_infinity);
+        let challenge = challenger.sample_f256();
+        mlv_challenges.push(challenge);
+
+        let one_plus_challenge = F256::ONE + challenge;
+        running = value_zero * one_plus_challenge
+            + message_one * challenge
+            + message_infinity * challenge * one_plus_challenge;
+    }
+
+    challenger.observe_f256(proof.final_a_eval);
+    challenger.observe_f256(proof.final_b_eval);
+    if lambda.is_zero() {
+        return Err(VerifyError::SumcheckFinalFailed);
+    }
+    let mask_value = (running + proof.final_a_eval * proof.final_b_eval) * lambda.inv();
+    Ok(C1ZkZerocheckClaim {
+        claim: C1ZerocheckClaim {
+            z,
+            mlv_challenges,
+            r_rest,
+            a_eval: proof.final_a_eval,
+            b_eval: proof.final_b_eval,
+            c_eval: proof.final_c_eval,
+        },
+        lambda,
+        mask_value,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

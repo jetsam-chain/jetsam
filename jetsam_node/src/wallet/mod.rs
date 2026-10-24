@@ -2260,6 +2260,123 @@ mod tests {
         }));
     }
 
+    /// The balance follows the canonical chain: the reward of a locally mined
+    /// block is in it while the block is canonical, leaves it when another
+    /// block wins the height, and comes back when the chain returns to ours.
+    /// The history keeps exactly one record of the block throughout, bound to
+    /// its exact hash, which is what `walletHistory` marks mined or orphaned.
+    #[test]
+    fn an_orphaned_coinbase_leaves_the_balance_and_returns_with_its_block() {
+        use jetsam_chain::block::Block;
+        use jetsam_chain::block_header::BlockHeader;
+        use jetsam_chain::storage::VerifiedOwnerUtxo;
+        use jetsam_poseidon2b::primitives::{Address, TxBodyHash};
+        use jetsam_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput};
+        use jetsam_tx::{TX_INPUTS, TX_OUTPUTS};
+
+        const HEIGHT: u64 = 9;
+        const REWARD: u64 = 45_000_000;
+        const SLOT: u32 = 7;
+        let (_dir, handle) = handle_with_utxos(&[]);
+        let owner = handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .active_address();
+
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: SLOT,
+            amount: REWARD,
+            owner,
+        };
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: [0x31; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let transactions = vec![coinbase];
+        let ours = Block {
+            header: BlockHeader {
+                prev_block_hash: [0x30; 32],
+                state_root: [0; 32],
+                tx_root: jetsam_chain::try_compute_tx_root(&transactions).unwrap(),
+                timestamp: 123,
+                height: HEIGHT,
+                miner_address: owner,
+                nonce: 0,
+                difficulty_target: [0xFF; 32],
+                log_slots: 24,
+                active_slot_count: 1,
+                alloc_counter: 8,
+            },
+            transactions,
+            client_objects: Vec::new(),
+        };
+        let our_hash = jetsam_chain::block_id(&ours.header);
+        let our_coinbase = jetsam_chain::try_compute_logical_txids(&ours.transactions).unwrap()[0];
+        let their_coinbase = TxBodyHash([0x99; 32]);
+        let reward = VerifiedOwnerUtxo {
+            slot_index: SLOT,
+            amount: REWARD,
+            creation_id: jetsam_chain::consensus::params::coinbase_creation_id(HEIGHT),
+        };
+        let no_slots = std::collections::HashSet::new();
+        let reorganize =
+            |utxos: Vec<VerifiedOwnerUtxo>, reclaimed: &[TxBodyHash], blocks: &[&Block]| {
+                install_reorg_snapshot_and_artifacts(
+                    &handle.inner,
+                    0,
+                    1,
+                    owner.0,
+                    VerifiedOwnerSnapshot {
+                        owner: owner.0,
+                        height: HEIGHT,
+                        tip_hash: [0x11; 32],
+                        state_root: [0x22; 32],
+                        log_slots: 24,
+                        active_slot_count: utxos.len() as u64,
+                        alloc_counter: 8,
+                        utxos,
+                    },
+                    &no_slots,
+                    &no_slots,
+                    reclaimed,
+                    blocks,
+                )
+                .unwrap();
+            };
+        let coinbase_records = || {
+            jetsam_rpc::wallet_ops::WalletOps::history(&handle)
+                .into_iter()
+                .filter(|entry| entry.is_coinbase)
+                .map(|entry| (entry.height, entry.block_hash, entry.amount_micro_jtm))
+                .collect::<Vec<_>>()
+        };
+        let mined = [(HEIGHT, Some(our_hash), REWARD)];
+
+        // Our block is canonical: its reward is in the balance.
+        reorganize(vec![reward], &[], &[&ours]);
+        assert_eq!(handle.get_balance().balance_micro_jtm, REWARD);
+        assert_eq!(coinbase_records(), mined);
+
+        // Another block wins height 9: the reward no longer exists.
+        reorganize(vec![], &[our_coinbase], &[]);
+        assert_eq!(handle.get_balance().balance_micro_jtm, 0);
+        assert_eq!(coinbase_records(), mined, "the orphan stays on record");
+
+        // The chain returns to our block: the reward is back, recorded once.
+        reorganize(vec![reward], &[their_coinbase], &[&ours]);
+        assert_eq!(handle.get_balance().balance_micro_jtm, REWARD);
+        assert_eq!(coinbase_records(), mined);
+    }
+
     #[test]
     fn rejected_incremental_update_does_not_advance_snapshot_or_cache() {
         let (_dir, handle) = handle_with_utxos(&[111]);

@@ -64,7 +64,7 @@ use crate::region_sidecar::{
 
 pub(crate) mod client_arm;
 mod freezer;
-mod gated_recorder;
+pub(crate) mod gated_recorder;
 mod relation;
 mod runtime_parts_codec;
 mod wire;
@@ -80,6 +80,8 @@ pub use freezer::{
     HistoryStepFreezeError, HistoryStepFreezeInput, HistoryStepFreezeInputProvider,
     HistoryStepFreezeMatrixStore, HistoryStepFreezeStage,
 };
+#[doc(hidden)]
+pub use freezer::{measure_history_step_v1_6_rows, HistoryStepV16RowsGate};
 pub use relation::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
     assemble_history_step_base, assemble_history_step_recursive,
@@ -100,17 +102,25 @@ pub use client_arm::{
     check_history_step_client_lanes, client_io_commitment, AuthenticatedClientMatrix,
     HistoryStepChainClients,
     HistoryStepClientCarry, HistoryStepClientMatrices, HistoryStepClientMatrixSet,
-    HistoryStepClientRegistry, HistoryStepClientWitness, PreparedHistoryStepClient,
-    HISTORY_STEP_CLIENT_PROOF_DOMAIN,
+    HistoryStepClientRegistry, HistoryStepClientWitness, HistoryStepClientZkWitness,
+    PreparedHistoryStepClient, HISTORY_STEP_CLIENT_PROOF_DOMAIN,
 };
-pub use relation::{prepare_history_step_for_pow_with_client, HistoryStepClientParts};
+pub use relation::{
+    prepare_history_step_for_pow_with_batch, prepare_history_step_for_pow_with_client,
+    HistoryStepClientParts,
+};
 pub use runtime_parts_codec::{
     HISTORY_STEP_RUNTIME_PARTS_COMPACT_CLIENT_VERSION, HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
     HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,
 };
 pub use wire::{
-    decode_history_step_client_proof, encode_history_step_client_proof,
-    history_step_client_proof_max_wire_bytes,
+    decode_history_step_client_proof, decode_history_step_client_zk_proof,
+    encode_history_step_client_proof, encode_history_step_client_zk_proof,
+    history_step_client_proof_max_wire_bytes, history_step_client_zk_proof_max_wire_bytes,
+    HISTORY_STEP_CLIENT_ZK_PROOF_WIRE_VERSION,
+};
+pub(crate) use wire::{
+    decode_rooted_field_proof, encode_rooted_field_proof, rooted_field_proof_max_wire_bytes,
 };
 pub use wire::{
     audit_history_step_terminal_encodings, decode_history_step_terminal,

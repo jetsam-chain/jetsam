@@ -672,6 +672,42 @@ pub struct MiningInfo {
     pub pow_walk: bool,
 }
 
+/// The software version announced by every peer this node has identified,
+/// connected or recently gone (`getPeerVersions`). Read to measure how much
+/// of the network runs a release before a hardfork; informative only, the
+/// node decides nothing from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerVersionsInfo {
+    /// What this node itself announces, e.g. `jetsam/1.6.0 (v1.6=4800)`.
+    pub local_agent_version: String,
+    /// This node's clock when it answered, Unix seconds: the reference for
+    /// the sighting times below, so answers of several nodes can be merged.
+    pub now_unix: u64,
+    /// One entry per remembered peer (at most 1 024).
+    pub peers: Vec<PeerVersionInfo>,
+}
+
+/// One peer's announced version, as `getPeerVersions` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerVersionInfo {
+    /// The peer's identity. Given only to a loopback caller, or to a caller
+    /// that holds the RPC bearer; `null` on a public endpoint.
+    pub peer_id: Option<String>,
+    /// What the peer announced, at most 64 printable ASCII characters
+    /// (`unknown` when empty). A node built before the announcement shows
+    /// `rust-libp2p/<version>`. Whatever the peer chose to send: a claim,
+    /// not a proof.
+    pub agent_version: String,
+    /// Connected now.
+    pub connected: bool,
+    /// Its network profile was verified (now, or before it left): the peer
+    /// is on this chain.
+    pub profile_verified: bool,
+    /// First and latest sighting (announcement or departure), Unix seconds.
+    pub first_seen_unix: u64,
+    pub last_seen_unix: u64,
+}
+
 /// Runtime status of the daemon which serves this RPC endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {

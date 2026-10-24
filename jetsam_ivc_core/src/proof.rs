@@ -51,6 +51,33 @@ pub struct C1FieldR1csProof {
     pub pcs_open: pcs::C1BaseFoldProof,
 }
 
+/// A form-Z client proof (v1.6): the C1 proof whose zerocheck and
+/// lincheck messages are Libra-masked, plus the zerocheck's `kappa` and the
+/// lincheck mask's final value `G'(r_inner)` (64 bytes on the wire).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct C1ZkFieldR1csProof {
+    pub base: C1FieldR1csProof,
+    pub zerocheck_kappa: crate::field::F256,
+    pub lincheck_mask_value: crate::field::F256,
+}
+
+/// Form-Z statement binding: the layout, then the usual C1 binding of the
+/// physical relation's digest and the commitment.
+pub fn bind_statement_zk_form_c1<Ch: Challenger>(
+    challenger: &mut Ch,
+    layout: &crate::zk_form::ZkFormLayout,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+) {
+    challenger.observe_label(b"history-zk-client-form-v1");
+    let mut bytes = Vec::with_capacity(24);
+    for value in [layout.m, layout.coin_coefficients, layout.reserved_coefficients] {
+        bytes.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+    challenger.observe_bytes(&bytes);
+    bind_statement_field_parts_c1(challenger, statement_digest, commitment);
+}
+
 /// Canonical statement byte encoding of the PCS parameters — shared by the
 /// native statement bindings below and their in-trace twins, so the two can
 /// never drift on serialization details.

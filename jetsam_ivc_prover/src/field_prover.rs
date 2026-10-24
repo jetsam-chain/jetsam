@@ -76,7 +76,7 @@ pub struct FieldPostCommitProverContext<'a, Ch> {
 }
 
 impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
-    fn new(
+    pub(crate) fn new(
         witness: &'a [F128],
         commitment: &'a Commitment,
         total_vars: usize,
@@ -100,7 +100,7 @@ impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
         self.claims
     }
 
-    fn finish_c1(self) -> (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>) {
+    pub(crate) fn finish_c1(self) -> (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>) {
         (self.claims, self.c1_claims)
     }
 

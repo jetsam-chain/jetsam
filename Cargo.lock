@@ -488,7 +488,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "bench_prover"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
  "hex",
@@ -507,6 +507,7 @@ dependencies = [
  "jetsam_recursive",
  "jetsam_tx",
  "rayon",
+ "serde_json",
  "tracing-subscriber",
  "zstd",
 ]
@@ -2708,7 +2709,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jetsam-extminer"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2723,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam-ivc-core"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
  "jetsam_core",
@@ -2732,13 +2733,15 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
 name = "jetsam-ivc-prover"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
+ "getrandom 0.2.17",
  "jetsam-ivc-core",
  "jetsam_core",
  "jetsam_poseidon2b",
@@ -2748,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_block"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam_chain",
  "jetsam_core",
@@ -2760,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_chain"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
  "jetsam_core",
@@ -2777,14 +2780,14 @@ dependencies = [
 
 [[package]]
 name = "jetsam_client_agent"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam-ivc-core",
 ]
 
 [[package]]
 name = "jetsam_client_agent_batch"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam-ivc-core",
  "jetsam-ivc-prover",
@@ -2794,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_core"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "rand 0.8.6",
  "rayon",
@@ -2804,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_fri"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam_core",
  "jetsam_poseidon2b",
@@ -2815,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_fri_binius"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam_core",
  "jetsam_fri",
@@ -2829,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_gkr"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
  "hex",
@@ -2848,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_gui"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "blake3",
  "hex",
@@ -2869,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_mempool"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam_chain",
  "jetsam_core",
@@ -2884,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_miner"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2910,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_node"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2956,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_p2p"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2981,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_poseidon2b"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bech32",
  "hex",
@@ -2995,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_recursive"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "bincode",
  "jetsam-ivc-core",
@@ -3016,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_rpc"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -3041,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_soundness"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam-ivc-core",
  "jetsam_fri_binius",
@@ -3055,7 +3058,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_tx"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "jetsam_core",
  "jetsam_poseidon2b",

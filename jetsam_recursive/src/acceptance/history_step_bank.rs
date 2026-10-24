@@ -35,6 +35,7 @@ use jetsam_ivc_core::matrix_claim::c1::{
 use jetsam_ivc_core::pcs::{PcsParams, BASEFOLD_RATE_QUARTER_C1_QUERIES, LOG_PACKING};
 use jetsam_ivc_core::proof::{pcs_params_statement_bytes, FieldShape};
 use jetsam_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+use jetsam_ivc_core::zk_form::{ZkFormLayout, ZK_FORM_K_SKIP};
 use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use super::trace::flat_of;
@@ -416,6 +417,8 @@ pub const HISTORY_STEP_CLIENT_IO_LANES: usize = 8;
 pub const HISTORY_STEP_CLIENT_REGISTRY_DEPTH: usize = 4;
 
 const HISTORY_STEP_CLIENT_FORM_DOMAIN: &[u8] = b"JTM/HISTORY-STEP/CLIENT-FORM/V1";
+/// Appended to a hiding form's statement bytes, before its layout.
+const HISTORY_STEP_CLIENT_FORM_Z_TAG: &[u8] = b"JTM/CLIENT-FORM-Z/V1";
 
 /// The outer dimension of the imposed client form: **pinned at m = 22**
 /// (operator decision D2, 2026-10-01). It is the launch small-class shape,
@@ -435,6 +438,10 @@ pub struct HistoryStepClientForm {
     pcs_params: PcsParams,
     io_spec: PublicIoSpec,
     registry_depth: usize,
+    /// The hiding client form (v1.6): client proofs of this form are
+    /// form-Z proofs of this layout (`jetsam_ivc_core::zk_form`), their
+    /// matrices form-Z matrices. `None` for the v1.5 form.
+    zk: Option<ZkFormLayout>,
 }
 
 /// Two forms are one form when their canonical bytes are.
@@ -464,7 +471,45 @@ impl HistoryStepClientForm {
                 claims: Vec::new(),
             },
             registry_depth: HISTORY_STEP_CLIENT_REGISTRY_DEPTH,
+            zk: None,
         }
+    }
+
+    /// The v1.6 client form (one form per class: the only form a v1.6 batch class
+    /// carries): the canonical form, hiding, at layout
+    /// [`ZkFormLayout::CLIENT`].
+    pub fn canonical_z() -> Self {
+        Self::canonical()
+            .with_zk(ZkFormLayout::CLIENT)
+            .expect("the canonical form takes the client layout")
+    }
+
+    /// This form, hiding at `layout`: the layout's `m` is the shape's, the
+    /// shape square with `K_SKIP = 6` and the constant pinned at column 0,
+    /// the PCS batch 32 lanes, the IO the eight lanes `[8, 16)`.
+    pub fn with_zk(mut self, layout: ZkFormLayout) -> Result<Self, HistoryStepBankError> {
+        let io = self.io_spec.io_slice;
+        if layout.validate().is_err()
+            || self.shape.m != layout.m
+            || self.shape.k_log != layout.m
+            || self.shape.k_skip != ZK_FORM_K_SKIP
+            || self.shape.const_pin != Some(0)
+            || self.pcs_params.m != layout.m + LOG_PACKING
+            || self.pcs_params.log_batch_size != 5
+            || io.start() != 8
+            || io.len() != 8
+            || self.io_spec.io_len != 8
+            || !self.io_spec.claims.is_empty()
+        {
+            return Err(HistoryStepBankError::ClientForm);
+        }
+        self.zk = Some(layout);
+        Ok(self)
+    }
+
+    /// The hiding layout of this form (`None`: the v1.5 form).
+    pub const fn zk_layout(&self) -> Option<&ZkFormLayout> {
+        self.zk.as_ref()
     }
 
     /// A form at another scale (tests build the client arm at m = 8).
@@ -479,6 +524,7 @@ impl HistoryStepClientForm {
             pcs_params,
             io_spec,
             registry_depth,
+            zk: None,
         }
     }
 
@@ -519,6 +565,14 @@ impl HistoryStepClientForm {
         for lane in self.io_spec.transcript_lanes() {
             bytes.extend_from_slice(&lane.lo.to_le_bytes());
             bytes.extend_from_slice(&lane.hi.to_le_bytes());
+        }
+        // The v1.5 form's bytes end here (unchanged); a hiding form appends
+        // its tag and layout, so its post-commit class differs.
+        if let Some(layout) = &self.zk {
+            bytes.extend_from_slice(HISTORY_STEP_CLIENT_FORM_Z_TAG);
+            for value in [layout.m, layout.coin_coefficients, layout.reserved_coefficients] {
+                bytes.extend_from_slice(&(value as u64).to_le_bytes());
+            }
         }
         bytes
     }
@@ -607,6 +661,108 @@ impl HistoryStepClientIoLanes {
     /// One past the last client lane.
     pub const fn end(&self) -> usize {
         self.entry_lanes + self.registry_capacity * self.entry_lane_width()
+    }
+}
+
+/// The outer dimension of the batch class a v1.6 block verifies (the
+/// production batch step of the aggregation, m = 22: rows gate, 1 838 599
+/// rows). Its lincheck claims accumulate in the block's `D_batch` lane, whose
+/// width follows from it.
+pub const HISTORY_STEP_BATCH_FORM_M: usize = 22;
+
+/// The batch class a v1.6 bank binds: `D_batch`, its post-commit class and
+/// the transcript digest of its Link key, at the batch shape `m`. Consensus
+/// constants once the class is frozen; until then the v1.6 relation and
+/// bank take them as an input, and no pack is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryStepBatchClassPins {
+    pub matrix_digest: [u8; 32],
+    pub post_commit_digest: [u8; 32],
+    pub link_vk_digest: [u8; 32],
+    pub m: usize,
+}
+
+/// The batch lanes of a v1.6 public IO, appended after the recursion root:
+/// the batch this block carries, if any — `batch_present`, the
+/// root of the `(D, io_commitment)` tree it covers, its count `g^n` and the
+/// mask of the registry entries it uses, all zero when absent — then the
+/// **carried** part, which every v1.6 block publishes: the registry leaves
+/// (append-only, as under v1.5), one accumulator lane per registry entry (as
+/// under v1.5: a block that carries a batch publishes the batch's outgoing
+/// lanes, whose incoming lanes were the parent's; a block without one carries
+/// the parent's), and the `D_batch` lane (the lincheck claims of every batch
+/// the chain has carried, the same way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryStepBatchIoLanes {
+    /// `batch_present`: one when the block carries a batch proof.
+    pub present: usize,
+    /// Two flat lanes: the root of the ordered `(D, io_commitment)` tree.
+    pub root: usize,
+    /// One lane: `g^n`, `n` the number of client proofs the batch covers.
+    pub count: usize,
+    /// First of `registry_capacity` lanes: the entries the batch uses.
+    pub mask: usize,
+    /// First of `2 * registry_capacity` flat lanes: the registry leaves.
+    pub registry_leaves: usize,
+    pub registry_capacity: usize,
+    /// First of the `registry_capacity` entry accumulator lanes.
+    pub entry_lanes: usize,
+    /// Side `2^k_log` of a client matrix.
+    pub k_log: usize,
+    /// First lane of the `D_batch` accumulator lane.
+    pub batch_lane: usize,
+    /// Side `2^k_log_batch` of the batch matrix.
+    pub k_log_batch: usize,
+}
+
+impl HistoryStepBatchIoLanes {
+    /// The batch block starting at lane `offset`.
+    pub fn at(offset: usize, k_log: usize, registry_depth: usize, k_log_batch: usize) -> Self {
+        let registry_capacity = 1usize << registry_depth;
+        let present = offset;
+        let root = present + 1;
+        let count = root + 2;
+        let mask = count + 1;
+        let registry_leaves = mask + registry_capacity;
+        let entry_lanes = registry_leaves + 2 * registry_capacity;
+        let batch_lane = entry_lanes + registry_capacity * (2 * (2 * k_log + 1) + 3);
+        Self {
+            present,
+            root,
+            count,
+            mask,
+            registry_leaves,
+            registry_capacity,
+            entry_lanes,
+            k_log,
+            batch_lane,
+            k_log_batch,
+        }
+    }
+
+    /// The two flat lanes of registry leaf `index`.
+    pub const fn registry_leaf(&self, index: usize) -> usize {
+        self.registry_leaves + 2 * index
+    }
+
+    /// The accumulator lane of registry entry `index`.
+    pub fn entry_lane(&self, index: usize) -> HistoryStepBankLaneLayout {
+        assert!(index < self.registry_capacity, "registry entry out of range");
+        HistoryStepBankLaneLayout::new(
+            self.entry_lanes + index * (2 * (2 * self.k_log + 1) + 3),
+            self.k_log,
+        )
+        .0
+    }
+
+    /// The `D_batch` accumulator lane.
+    pub fn batch_self_lane(&self) -> HistoryStepBankLaneLayout {
+        HistoryStepBankLaneLayout::new(self.batch_lane, self.k_log_batch).0
+    }
+
+    /// One past the last batch lane.
+    pub fn end(&self) -> usize {
+        HistoryStepBankLaneLayout::new(self.batch_lane, self.k_log_batch).1
     }
 }
 
@@ -732,6 +888,190 @@ pub fn parse_history_step_client_lanes(
     })
 }
 
+/// Largest number of client proofs a v1.6 batch lane may count
+/// ([`jetsam_chain::consensus::client_objects::CLIENT_BATCH_MAX_CLIENTS`]).
+pub const HISTORY_STEP_BATCH_MAX_CLIENTS: usize =
+    jetsam_chain::consensus::client_objects::CLIENT_BATCH_MAX_CLIENTS as usize;
+
+/// The batch a v1.6 block carries, as its lanes name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStepCarriedBatch {
+    /// Root of the ordered `(D, io_commitment)` tree of the clients covered.
+    pub statements_root: [u8; 32],
+    /// `n`, from the count lane `g^n` (1 to [`HISTORY_STEP_BATCH_MAX_CLIENTS`]).
+    pub count: u64,
+    /// The registry entries the batch uses, in index order.
+    pub mask: Vec<bool>,
+}
+
+/// The batch lanes of a v1.6 public IO: what a node reads out of a
+/// block, decides on the matrices (every live entry lane on the matrix
+/// registered at its entry, the `D_batch` lane on the batch class's matrix)
+/// and checks natively against the chain (the registry leaves, the paid
+/// batch, the entries the batch uses carriable at the block's height:
+/// `jetsam_chain::consensus::client_objects::check_terminal_client_view`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStepBatchClaim {
+    /// The batch this block carries, if any.
+    pub carried: Option<HistoryStepCarriedBatch>,
+    /// The registry leaves the block publishes, in index order.
+    pub registry: Vec<[u8; 32]>,
+    /// Each entry's accumulated lincheck claim when its lane is live: every
+    /// client the chain has carried for that entry, through every batch.
+    pub entries: Vec<Option<C1MatrixAccClaim>>,
+    /// The `D_batch` lane when live: the lincheck claims of every batch the
+    /// chain has carried, on the batch class's matrix.
+    pub batch_lane: Option<C1MatrixAccClaim>,
+}
+
+impl HistoryStepBatchClaim {
+    /// The same lanes read as client lanes (no carried client): the entry
+    /// lanes are decided exactly as under v1.5.
+    fn entry_claim(&self) -> HistoryStepClientClaim {
+        HistoryStepClientClaim {
+            carried: None,
+            registry: self.registry.clone(),
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+/// One accumulator lane at `lane`: dead (all zeros), or live with its claim.
+fn parse_accumulator_lane(
+    io: &[F128],
+    lane: HistoryStepBankLaneLayout,
+) -> Result<Option<C1MatrixAccClaim>, ()> {
+    match io[lane.live] {
+        F128::ZERO => {
+            if io[lane.point..lane.live].iter().any(|value| *value != F128::ZERO) {
+                return Err(());
+            }
+            Ok(None)
+        }
+        F128::ONE => Ok(Some(C1MatrixAccClaim {
+            point: io[lane.point..lane.value]
+                .chunks_exact(2)
+                .map(|coordinates| F256::new(coordinates[0], coordinates[1]))
+                .collect(),
+            value: F256::new(io[lane.value], io[lane.value + 1]),
+        })),
+        _ => Err(()),
+    }
+}
+
+/// Read the batch lanes of `io` (v1.6), refusing every
+/// non-canonical encoding:
+///
+/// - `batch_present` is 0 or 1; an absent batch carries a zero root, count
+///   and mask; a present one counts `g^n` with `1 <= n <=`
+///   [`HISTORY_STEP_BATCH_MAX_CLIENTS`] and a boolean mask whose used entries
+///   are non-empty leaves;
+/// - an entry lane and the `D_batch` lane are live (1) or dead (0); a dead
+///   lane is all zeros; a live entry lane belongs to a non-empty leaf.
+pub fn parse_history_step_batch_lanes(
+    lanes: &HistoryStepBatchIoLanes,
+    io: &[F128],
+) -> Result<HistoryStepBatchClaim, HistoryStepBankError> {
+    if io.len() < lanes.end() {
+        return Err(HistoryStepBankError::IoLength {
+            expected: lanes.end(),
+            actual: io.len(),
+        });
+    }
+    let registry = (0..lanes.registry_capacity)
+        .map(|index| digest_of_lanes(io, lanes.registry_leaf(index)))
+        .collect::<Vec<_>>();
+    let carried = match io[lanes.present] {
+        F128::ZERO => {
+            if io[lanes.root..lanes.registry_leaves]
+                .iter()
+                .any(|lane| *lane != F128::ZERO)
+            {
+                return Err(HistoryStepBankError::NonCanonicalAbsentBatch);
+            }
+            None
+        }
+        F128::ONE => {
+            let count = crate::acceptance::client_batch::io::decode_count(
+                io[lanes.count],
+                HISTORY_STEP_BATCH_MAX_CLIENTS,
+            )
+            .filter(|count| *count >= 1)
+            .ok_or(HistoryStepBankError::BatchCount)?;
+            let mut mask = Vec::with_capacity(lanes.registry_capacity);
+            for index in 0..lanes.registry_capacity {
+                let used = match io[lanes.mask + index] {
+                    F128::ZERO => false,
+                    F128::ONE => true,
+                    _ => return Err(HistoryStepBankError::BatchMaskFlag),
+                };
+                if used && registry[index] == [0u8; 32] {
+                    return Err(HistoryStepBankError::ClientNotRegistered);
+                }
+                mask.push(used);
+            }
+            Some(HistoryStepCarriedBatch {
+                statements_root: digest_of_lanes(io, lanes.root),
+                count: count as u64,
+                mask,
+            })
+        }
+        _ => return Err(HistoryStepBankError::BatchPresentFlag),
+    };
+    let mut entries = Vec::with_capacity(lanes.registry_capacity);
+    for (index, leaf) in registry.iter().enumerate() {
+        let claim = parse_accumulator_lane(io, lanes.entry_lane(index))
+            .map_err(|()| HistoryStepBankError::ClientLaneLiveness)?;
+        if claim.is_some() && *leaf == [0u8; 32] {
+            return Err(HistoryStepBankError::ClientNotRegistered);
+        }
+        entries.push(claim);
+    }
+    let batch_lane = parse_accumulator_lane(io, lanes.batch_self_lane())
+        .map_err(|()| HistoryStepBankError::BatchLaneLiveness)?;
+    Ok(HistoryStepBatchClaim {
+        carried,
+        registry,
+        entries,
+        batch_lane,
+    })
+}
+
+/// The matrix of a batch class, its structural digest computed once from it
+/// ([`Self::authenticate`]): the matrix a v1.6 tip's `D_batch` lane is
+/// evaluated on, which must be the one the bank pins.
+#[derive(Clone)]
+pub struct HistoryStepBatchMatrix {
+    digest: [u8; 32],
+    matrix: Arc<FieldR1cs>,
+}
+
+impl HistoryStepBatchMatrix {
+    /// Digest `matrix` (its structural statement digest).
+    pub fn authenticate(matrix: Arc<FieldR1cs>) -> Self {
+        Self {
+            digest: matrix.structural_statement_digest(),
+            matrix,
+        }
+    }
+
+    /// A batch class's matrix under the digest its freeze computed from it
+    /// (`D_batch`): no second structural pass.
+    pub(crate) fn of_frozen_class(digest: [u8; 32], matrix: Arc<FieldR1cs>) -> Self {
+        Self { digest, matrix }
+    }
+
+    /// The structural digest computed from the matrix.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// The matrix.
+    pub fn matrix(&self) -> &Arc<FieldR1cs> {
+        &self.matrix
+    }
+}
+
 /// Shared public-IO layout of both launch classes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryStepBankIoLayout {
@@ -766,6 +1106,9 @@ pub struct HistoryStepBankIoLayout {
     /// The client lanes, after the recursion root: present exactly when the
     /// generation carries the client slot (v1.5).
     pub client: Option<HistoryStepClientIoLanes>,
+    /// The batch lanes, after the recursion root: present exactly when the
+    /// generation carries the batch slot (v1.6), never with `client`.
+    pub batch: Option<HistoryStepBatchIoLanes>,
 }
 
 impl HistoryStepBankIoLayout {
@@ -802,6 +1145,9 @@ pub fn history_step_bank_io_layout() -> HistoryStepBankIoLayout {
 /// v1.5 keeps the v1.3 lanes up to the bank digest; its matrix lanes are
 /// wider (the class matrices are 2^23 and 2^25), and the client lanes follow
 /// the recursion root.
+///
+/// v1.6 keeps the v1.5 lanes up to the recursion root (same classes); the
+/// batch lanes follow it instead of the client lanes.
 pub fn history_step_bank_io_layout_for(
     generation: HistoryStepPackGeneration,
 ) -> HistoryStepBankIoLayout {
@@ -828,6 +1174,17 @@ pub fn history_step_bank_io_layout_for(
         len = client.end();
         client
     });
+    let batch = generation.carries_batch_slot().then(|| {
+        let form = HistoryStepClientForm::canonical();
+        let batch = HistoryStepBatchIoLanes::at(
+            len,
+            form.shape().k_log,
+            form.registry_depth(),
+            HISTORY_STEP_BATCH_FORM_M,
+        );
+        len = batch.end();
+        batch
+    });
     HistoryStepBankIoLayout {
         base,
         tip_class,
@@ -840,6 +1197,7 @@ pub fn history_step_bank_io_layout_for(
         len,
         generation,
         client,
+        batch,
     }
 }
 
@@ -932,6 +1290,8 @@ pub struct PinnedHistoryStepClassBank {
     recursion_root_height: u64,
     /// The imposed client form of a v1.5 bank.
     client_form: Option<HistoryStepClientForm>,
+    /// The batch class a v1.6 bank binds.
+    batch_class: Option<HistoryStepBatchClassPins>,
 }
 
 impl PinnedHistoryStepClassBank {
@@ -958,6 +1318,12 @@ impl PinnedHistoryStepClassBank {
         generation: HistoryStepPackGeneration,
         pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
     ) -> Result<Self, HistoryStepBankError> {
+        // A v1.6 bank binds its batch class, which this bank does not hold
+        // by itself: it is validated by `validate_for_v1_6`,
+        // never here, so a v1.6 bank never loads without its class.
+        if generation.carries_batch_slot() {
+            return Err(HistoryStepBankError::ClientForm);
+        }
         let layout = history_step_bank_io_layout_for(generation);
         let spec = io_spec_of(&layout);
         let mut bank = Self::validate_in(generation, layout, spec, pins)?;
@@ -970,6 +1336,41 @@ impl PinnedHistoryStepClassBank {
             bank.client_form = Some(client_form);
         }
         Ok(bank)
+    }
+
+    /// Validate a v1.6 bank: the v1.6 layout (the batch lanes after the
+    /// recursion root), and the bank digest binds the batch class the
+    /// relation verifies batches under (`D_batch`, its post-commit class, its
+    /// Link key, its shape), as a v1.5 bank binds its client form.
+    pub fn validate_for_v1_6(
+        pins: [HistoryStepBankEntryPins; HISTORY_STEP_CLASS_COUNT],
+        batch: HistoryStepBatchClassPins,
+    ) -> Result<Self, HistoryStepBankError> {
+        let generation = HistoryStepPackGeneration::V1_6;
+        if batch.m != HISTORY_STEP_BATCH_FORM_M {
+            return Err(HistoryStepBankError::ClientForm);
+        }
+        let layout = history_step_bank_io_layout_for(generation);
+        let spec = io_spec_of(&layout);
+        let mut bank = Self::validate_in(generation, layout, spec, pins)?;
+        bank.digest = poseidon2b_hash_byte_slices(
+            HISTORY_STEP_BANK_DIGEST_DOMAIN,
+            &[
+                &bank.digest,
+                b"batch-class",
+                &batch.matrix_digest,
+                &batch.post_commit_digest,
+                &batch.link_vk_digest,
+                &(batch.m as u64).to_le_bytes(),
+            ],
+        );
+        bank.batch_class = Some(batch);
+        Ok(bank)
+    }
+
+    /// The batch class a v1.6 bank binds.
+    pub fn batch_class(&self) -> Option<&HistoryStepBatchClassPins> {
+        self.batch_class.as_ref()
     }
 
     fn validate_in(
@@ -1028,6 +1429,7 @@ impl PinnedHistoryStepClassBank {
             digest,
             recursion_root_height: 0,
             client_form: None,
+            batch_class: None,
         })
     }
 
@@ -1281,6 +1683,8 @@ struct ParsedHistoryStepBankIo {
     recursion_root: Option<Vec<F128>>,
     /// The present client of a v1.5 IO.
     client: Option<HistoryStepClientClaim>,
+    /// The batch lanes of a v1.6 IO.
+    batch: Option<HistoryStepBatchClaim>,
 }
 
 fn parse_history_step_bank_io(
@@ -1363,6 +1767,10 @@ fn parse_history_step_bank_io(
         Some(lanes) => Some(parse_history_step_client_lanes(lanes, io)?),
         None => None,
     };
+    let batch = match &layout.batch {
+        Some(lanes) => Some(parse_history_step_batch_lanes(lanes, io)?),
+        None => None,
+    };
     Ok(ParsedHistoryStepBankIo {
         base,
         tip_class,
@@ -1370,6 +1778,7 @@ fn parse_history_step_bank_io(
         block_accumulator,
         recursion_root,
         client,
+        batch,
     })
 }
 
@@ -1645,6 +2054,13 @@ pub struct PendingHistoryStepBankDecision {
     /// node can compare the published leaves and the carried client with
     /// the chain (M3.8).
     checked_client: Option<HistoryStepClientClaim>,
+    /// The tip's batch lanes (v1.6: every tip has them), until they are
+    /// decided on the matrices.
+    batch: Option<HistoryStepBatchClaim>,
+    /// The same lanes once decided.
+    checked_batch: Option<HistoryStepBatchClaim>,
+    /// The batch class the bank pins (v1.6).
+    batch_class: Option<HistoryStepBatchClassPins>,
 }
 
 impl PendingHistoryStepBankDecision {
@@ -1686,6 +2102,9 @@ impl PendingHistoryStepBankDecision {
             block_accumulator: parsed.block_accumulator,
             client: parsed.client,
             checked_client: None,
+            batch: parsed.batch,
+            checked_batch: None,
+            batch_class: bank.batch_class().copied(),
         })
     }
 
@@ -1741,6 +2160,61 @@ impl PendingHistoryStepBankDecision {
     /// The tip's client lanes once checked.
     pub fn checked_client(&self) -> Option<&HistoryStepClientClaim> {
         self.checked_client.as_ref()
+    }
+
+    /// The tip's batch lanes (v1.6), while they are still to be decided.
+    pub fn pending_batch(&self) -> Option<&HistoryStepBatchClaim> {
+        self.batch.as_ref()
+    }
+
+    /// The tip's batch lanes once decided.
+    pub fn checked_batch(&self) -> Option<&HistoryStepBatchClaim> {
+        self.checked_batch.as_ref()
+    }
+
+    /// Decide the batch lanes of a v1.6 tip on the matrices: every
+    /// live entry lane on the matrix registered at its entry, looked up by
+    /// the leaf the tip publishes, exactly as a v1.5 client lane
+    /// ([`crate::acceptance::history_step::check_history_step_client_lanes`],
+    /// "no verdict" included); the `D_batch` lane, when live, on the batch
+    /// class's matrix — the one whose digest and shape the bank pins. The
+    /// leaves, the paid batch and the entries the batch uses are native
+    /// questions on the block's branch, answered by the node with the claim
+    /// this decision reports. Nothing to decide under a generation without
+    /// the batch slot; a refused or undecided claim stays pending.
+    pub fn check_batch_lanes_with(
+        &mut self,
+        form: Option<&HistoryStepClientForm>,
+        batch_matrix: Option<&HistoryStepBatchMatrix>,
+        matrices: Option<&dyn crate::acceptance::history_step::HistoryStepClientMatrices>,
+    ) -> Result<(), HistoryStepBankError> {
+        let Some(claim) = &self.batch else {
+            return Ok(());
+        };
+        let form = form.ok_or(HistoryStepBankError::ClientRegistryUnavailable)?;
+        let matrices = matrices.ok_or(HistoryStepBankError::ClientRegistryUnavailable)?;
+        let pins = self.batch_class.ok_or(HistoryStepBankError::BatchMatrix)?;
+        if let Some(lane) = &claim.batch_lane {
+            let batch_matrix = batch_matrix.ok_or(HistoryStepBankError::BatchMatrix)?;
+            if batch_matrix.digest() != pins.matrix_digest
+                || FieldShape::of(batch_matrix.matrix()).m != pins.m
+            {
+                return Err(HistoryStepBankError::BatchMatrix);
+            }
+            if lane.point.len() != 2 * batch_matrix.matrix().k_log + 1 {
+                return Err(HistoryStepBankError::BatchLaneWidth);
+            }
+            if stacked_matrix_mle_eval_c1(batch_matrix.matrix(), lane) != lane.value {
+                return Err(HistoryStepBankError::BatchAccumulatedClaimValue);
+            }
+        }
+        crate::acceptance::history_step::check_history_step_client_lanes(
+            form,
+            &claim.entry_claim(),
+            matrices,
+        )?;
+        self.checked_batch = self.batch.take();
+        Ok(())
     }
 
     fn claims_for(
@@ -1926,6 +2400,9 @@ impl PendingHistoryStepBankDecision {
         if self.client.is_some() {
             return Err(HistoryStepBankError::ClientLaneUnchecked);
         }
+        if self.batch.is_some() {
+            return Err(HistoryStepBankError::BatchLaneUnchecked);
+        }
         if self.tip_fresh.is_some() {
             return Err(HistoryStepBankError::TipMatrixUnchecked(self.tip_class));
         }
@@ -1942,6 +2419,7 @@ impl PendingHistoryStepBankDecision {
             base: self.base,
             block_accumulator: self.block_accumulator,
             client: self.checked_client,
+            batch: self.checked_batch,
         })
     }
 }
@@ -1954,6 +2432,7 @@ pub struct AcceptedHistoryStepBankTip {
     base: bool,
     block_accumulator: Vec<F128>,
     client: Option<HistoryStepClientClaim>,
+    batch: Option<HistoryStepBatchClaim>,
 }
 
 impl AcceptedHistoryStepBankTip {
@@ -1985,6 +2464,17 @@ impl AcceptedHistoryStepBankTip {
     /// Take the checked client lanes out of the decision.
     pub fn take_client(&mut self) -> Option<HistoryStepClientClaim> {
         self.client.take()
+    }
+
+    /// The tip's decided batch lanes (v1.6). `None` under a generation
+    /// without the batch slot.
+    pub fn batch(&self) -> Option<&HistoryStepBatchClaim> {
+        self.batch.as_ref()
+    }
+
+    /// Take the decided batch lanes out of the decision.
+    pub fn take_batch(&mut self) -> Option<HistoryStepBatchClaim> {
+        self.batch.take()
     }
 }
 
@@ -2064,6 +2554,25 @@ pub enum HistoryStepBankError {
     ClientMatrixUnavailable,
     /// Client lanes that were never checked.
     ClientLaneUnchecked,
+    /// `batch_present` is neither 0 nor 1.
+    BatchPresentFlag,
+    /// An absent batch carries a nonzero root, count or mask.
+    NonCanonicalAbsentBatch,
+    /// A present batch's count lane is not `g^n`, `1 <= n <=` the bound.
+    BatchCount,
+    /// A mask lane is neither 0 nor 1.
+    BatchMaskFlag,
+    /// The `D_batch` lane is neither live nor dead, or dead and not zero.
+    BatchLaneLiveness,
+    /// No batch class pinned, no batch matrix, or a matrix of another digest
+    /// or shape than the pinned class's.
+    BatchMatrix,
+    /// The `D_batch` claim has the wrong width for the batch matrix.
+    BatchLaneWidth,
+    /// The `D_batch` claim does not hold on the batch class's matrix.
+    BatchAccumulatedClaimValue,
+    /// Batch lanes that were never decided.
+    BatchLaneUnchecked,
 }
 
 impl core::fmt::Display for HistoryStepBankError {
@@ -2235,6 +2744,23 @@ impl core::fmt::Display for HistoryStepBankError {
                 "HistoryStep client entry claim does not hold on the matrix registered at its entry",
             ),
             Self::ClientLaneUnchecked => f.write_str("HistoryStep client lanes were not checked"),
+            Self::BatchPresentFlag => f.write_str("HistoryStep batch_present is not boolean"),
+            Self::NonCanonicalAbsentBatch => {
+                f.write_str("HistoryStep absent batch carries a nonzero root, count or mask")
+            }
+            Self::BatchCount => f.write_str("HistoryStep batch count is not g^n for an admissible n"),
+            Self::BatchMaskFlag => f.write_str("HistoryStep batch mask lane is not boolean"),
+            Self::BatchLaneLiveness => {
+                f.write_str("HistoryStep D_batch lane is neither live nor dead")
+            }
+            Self::BatchMatrix => {
+                f.write_str("HistoryStep batch matrix is missing or is not the pinned batch class's")
+            }
+            Self::BatchLaneWidth => f.write_str("HistoryStep D_batch claim has the wrong width"),
+            Self::BatchAccumulatedClaimValue => {
+                f.write_str("HistoryStep D_batch claim does not hold on the batch class's matrix")
+            }
+            Self::BatchLaneUnchecked => f.write_str("HistoryStep batch lanes were not decided"),
             Self::ClientMatrixUnavailable => f.write_str(
                 "HistoryStep client entry lane needs a registered matrix this node does not hold yet",
             ),
@@ -2403,6 +2929,142 @@ mod tests {
             assert_ne!(bank.digest(), v1_3.digest());
             assert!(PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_3)).is_err());
             assert!(PinnedHistoryStepClassBank::validate_for(V1_3, test_pins_for(V1_5)).is_err());
+        }
+
+        fn test_batch_class(seed: u8) -> HistoryStepBatchClassPins {
+            HistoryStepBatchClassPins {
+                matrix_digest: [seed; 32],
+                post_commit_digest: [seed ^ 0x55; 32],
+                link_vk_digest: [seed ^ 0xAA; 32],
+                m: HISTORY_STEP_BATCH_FORM_M,
+            }
+        }
+
+        /// v1.6 keeps the v1.5 lanes up to the recursion root (same
+        /// classes, same root) and appends the batch lanes where v1.5 has its
+        /// client lanes: batch present, statements root, count, mask, the
+        /// sixteen registry leaves and entry lanes (as under v1.5) and the
+        /// `D_batch` lane (m = 22) — 108 lanes more than v1.5, same IO slice.
+        #[test]
+        fn the_v1_6_layout_appends_the_batch_lanes_after_the_root() {
+            use HistoryStepPackGeneration::{V1, V1_3, V1_5, V1_6};
+            for generation in [V1, V1_3, V1_5] {
+                assert!(history_step_bank_io_layout_for(generation).batch.is_none());
+            }
+            let v1_5 = history_step_bank_io_layout_for(V1_5);
+            let layout = history_step_bank_io_layout_for(V1_6);
+            assert!(layout.client.is_none(), "v1.6 carries no bare client");
+            assert_eq!(
+                (layout.base, layout.tip_class, layout.matrix_whitelist),
+                (v1_5.base, v1_5.tip_class, v1_5.matrix_whitelist)
+            );
+            assert_eq!(
+                (layout.post_commit_whitelist, layout.bank_digest),
+                (v1_5.post_commit_whitelist, v1_5.bank_digest)
+            );
+            assert_eq!(layout.matrix_lanes, v1_5.matrix_lanes);
+            assert_eq!(layout.block_accumulator, v1_5.block_accumulator);
+            assert_eq!(layout.recursion_root, v1_5.recursion_root);
+            let batch = layout.batch.expect("v1.6 carries the batch lanes");
+            let client = v1_5.client.unwrap();
+            assert_eq!(batch.present, client.present, "where v1.5 has its client lanes");
+            assert_eq!((batch.root, batch.count, batch.mask), (batch.present + 1, batch.present + 3, batch.present + 4));
+            assert_eq!(batch.registry_capacity, 16);
+            assert_eq!(batch.registry_leaves, batch.mask + 16);
+            assert_eq!(batch.entry_lanes, batch.registry_leaves + 2 * 16);
+            let k_log = HistoryStepClientForm::canonical().shape().k_log;
+            for entry in 0..16 {
+                assert_eq!(batch.entry_lane(entry).point_len(), 2 * k_log + 1);
+            }
+            assert_eq!(batch.batch_lane, batch.entry_lane(15).live + 1);
+            assert_eq!(batch.batch_self_lane().point_len(), 2 * HISTORY_STEP_BATCH_FORM_M + 1);
+            assert_eq!(batch.batch_self_lane().live + 1, batch.end());
+            assert_eq!(batch.end(), layout.len);
+            // + mask (16) + count (1) + D_batch lane (93) − D and io_commitment (4)
+            // + root (2) = +108 lanes.
+            assert_eq!(layout.len, v1_5.len + 108);
+            assert_eq!(layout.len, 1873);
+            let spec = history_step_bank_io_spec_for(V1_6);
+            assert_eq!(spec.io_len, layout.len);
+            assert_eq!(spec.io_slice.log2_len, 11, "same IO slice as v1.5");
+        }
+
+        /// A v1.6 bank binds its batch class (`D_batch`, post-commit
+        /// class, Link key, shape) in its digest, as a v1.5 bank binds its
+        /// client form. Without a class (`validate_for`) it is refused — the
+        /// class is required. Pins of another
+        /// generation do not validate as v1.6, nor v1.6 pins as v1.5.
+        #[test]
+        fn a_v1_6_bank_binds_its_batch_class() {
+            use HistoryStepPackGeneration::{V1_3, V1_5, V1_6};
+            for pins in [test_pins_for(V1_3), test_pins_for(V1_5), test_pins_for(V1_6)] {
+                assert!(matches!(
+                    PinnedHistoryStepClassBank::validate_for(V1_6, pins),
+                    Err(HistoryStepBankError::ClientForm)
+                ));
+            }
+            let bank =
+                PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_6), test_batch_class(7)).unwrap();
+            assert_eq!(bank.generation(), V1_6);
+            assert_eq!(bank.layout(), &history_step_bank_io_layout_for(V1_6));
+            assert_eq!(bank.batch_class(), Some(&test_batch_class(7)));
+            assert!(bank.client_form().is_none());
+            let other =
+                PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_6), test_batch_class(8)).unwrap();
+            assert_ne!(bank.digest(), other.digest(), "the bank digest binds the batch class");
+            for field in 0..3 {
+                let mut changed = test_batch_class(7);
+                match field {
+                    0 => changed.matrix_digest[0] ^= 1,
+                    1 => changed.post_commit_digest[0] ^= 1,
+                    _ => changed.link_vk_digest[0] ^= 1,
+                }
+                let changed = PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_6), changed).unwrap();
+                assert_ne!(bank.digest(), changed.digest(), "batch class field {field}");
+            }
+            let mut wrong_m = test_batch_class(7);
+            wrong_m.m = 21;
+            assert!(PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_6), wrong_m).is_err());
+            assert!(PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_5), test_batch_class(7)).is_err());
+            assert!(PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_6)).is_err());
+            assert!(PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_5)).is_ok());
+            assert!(PinnedHistoryStepClassBank::validate_for(V1_3, test_pins_for(V1_3)).is_ok());
+            let v1_5 = PinnedHistoryStepClassBank::validate_for(V1_5, test_pins_for(V1_5)).unwrap();
+            assert!(v1_5.batch_class().is_none());
+        }
+
+        /// A v1.6 tip whose bank pins are
+        /// all in place begins its decision, and is not accepted until its
+        /// batch lanes are decided (`batch_lanes`).
+        #[test]
+        fn a_v1_6_tip_is_decided_by_its_native_rules() {
+            use HistoryStepPackGeneration::V1_6;
+            let bank =
+                PinnedHistoryStepClassBank::validate_for_v1_6(test_pins_for(V1_6), test_batch_class(7)).unwrap();
+            let class = CanonicalHistoryStepClassId::from_index(0).unwrap();
+            let io = history_step_bank_base_output_io_rooted(
+                &bank,
+                class,
+                &crate::accumulator::genesis_accumulator(),
+                &RecursionRoot::genesis(),
+            )
+            .unwrap();
+            let shape = bank.entry(class).shape();
+            let replay = VerifiedHistoryStepTipReplay {
+                class_id: class,
+                bank_digest: bank.digest(),
+                fresh: C1FreshLincheckClaim {
+                    alpha: F256::ZERO,
+                    z_skip: F256::ZERO,
+                    x_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+                    r_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+                    z_partial: vec![F256::ZERO; 1usize << shape.k_skip],
+                    value: F256::ZERO,
+                },
+            };
+            let pending = PendingHistoryStepBankDecision::begin(&bank, &io, replay).unwrap();
+            assert!(pending.pending_batch().is_some());
+            assert!(matches!(pending.finish(), Err(HistoryStepBankError::BatchLaneUnchecked)));
         }
     }
 
@@ -2743,6 +3405,314 @@ mod tests {
             assert_eq!(pending.check_client_lane(None), Ok(()));
         }
 
+    
+        /// The batch lanes of a v1.6 tip: what a node reads out of
+        /// a block, decides on the matrices, and reports for the chain's
+        /// native checks.
+        mod batch_lanes {
+            use super::*;
+            use crate::acceptance::client_batch::io::count_value;
+            use crate::acceptance::history_step::client_arm::HistoryStepClientMatrixSet;
+
+            const D_BATCH_SEED: u64 = 0x5B;
+
+            /// Digested once: a 2^22 matrix is slow to build and digest in a
+            /// debug build.
+            fn batch_matrix() -> HistoryStepBatchMatrix {
+                static MATRIX: std::sync::OnceLock<HistoryStepBatchMatrix> = std::sync::OnceLock::new();
+                MATRIX
+                    .get_or_init(|| HistoryStepBatchMatrix::authenticate(canonical_shape_matrix(D_BATCH_SEED)))
+                    .clone()
+            }
+
+            /// A v1.6 bank pinning the batch class of [`batch_matrix`].
+            fn v16_bank() -> PinnedHistoryStepClassBank {
+                let generation = HistoryStepPackGeneration::V1_6;
+                PinnedHistoryStepClassBank::validate_for_v1_6(
+                    test_pins_for(generation),
+                    HistoryStepBatchClassPins {
+                        matrix_digest: batch_matrix().digest(),
+                        post_commit_digest: [0x51; 32],
+                        link_vk_digest: [0x52; 32],
+                        m: HISTORY_STEP_BATCH_FORM_M,
+                    },
+                )
+                .unwrap()
+            }
+
+            fn install_lane(io: &mut [F128], lane: HistoryStepBankLaneLayout, claim: &C1MatrixAccClaim) {
+                for (pair, coordinate) in io[lane.point..lane.value].chunks_exact_mut(2).zip(&claim.point) {
+                    pair[0] = coordinate.lo;
+                    pair[1] = coordinate.hi;
+                }
+                io[lane.value] = claim.value.lo;
+                io[lane.value + 1] = claim.value.hi;
+                io[lane.live] = F128::ONE;
+            }
+
+            /// A v1.6 tip carrying a batch of three clients over the
+            /// registry `[D1, D2]` that uses entry 0: entry 0's lane and the
+            /// `D_batch` lane live and true, entry 1's dead.
+            struct BatchTip {
+                io: Vec<F128>,
+                claim: HistoryStepBatchClaim,
+                held: HistoryStepClientMatrixSet,
+            }
+
+            fn batch_tip(bank: &PinnedHistoryStepClassBank) -> BatchTip {
+                let form = HistoryStepClientForm::canonical();
+                let (first, second) = (canonical_shape_matrix(0x31), canonical_shape_matrix(0x32));
+                let mut registry = vec![
+                    first.structural_statement_digest(),
+                    second.structural_statement_digest(),
+                ];
+                registry.resize(form.registry_capacity(), [0u8; 32]);
+                let mut entries = vec![None; form.registry_capacity()];
+                entries[0] = Some(true_claim(&first));
+                let mut mask = vec![false; form.registry_capacity()];
+                mask[0] = true;
+                let claim = HistoryStepBatchClaim {
+                    carried: Some(HistoryStepCarriedBatch {
+                        statements_root: [0x7A; 32],
+                        count: 3,
+                        mask,
+                    }),
+                    registry,
+                    entries,
+                    batch_lane: Some(true_claim(batch_matrix().matrix())),
+                };
+                let class = CanonicalHistoryStepClassId::new(1).unwrap();
+                let mut io = history_step_bank_base_output_io_rooted(
+                    bank,
+                    class,
+                    &crate::accumulator::genesis_accumulator(),
+                    &RecursionRoot::genesis(),
+                )
+                .unwrap();
+                let lanes = bank.layout().batch.unwrap();
+                let carried = claim.carried.as_ref().unwrap();
+                io[lanes.present] = F128::ONE;
+                write_digest(&mut io, lanes.root, &carried.statements_root);
+                io[lanes.count] = count_value(3);
+                io[lanes.mask] = F128::ONE;
+                for (index, leaf) in claim.registry.iter().enumerate() {
+                    write_digest(&mut io, lanes.registry_leaf(index), leaf);
+                }
+                install_lane(&mut io, lanes.entry_lane(0), claim.entries[0].as_ref().unwrap());
+                install_lane(&mut io, lanes.batch_self_lane(), claim.batch_lane.as_ref().unwrap());
+                let held = HistoryStepClientMatrixSet::new(&form);
+                held.insert(first).expect("D1's matrix");
+                BatchTip { io, claim, held }
+            }
+
+            fn begin(bank: &PinnedHistoryStepClassBank, io: &[F128]) -> Result<PendingHistoryStepBankDecision, HistoryStepBankError> {
+                PendingHistoryStepBankDecision::begin(bank, io, replay(bank))
+            }
+
+            /// A base v1.6 IO carries no batch and dead lanes: parsed, it is
+            /// an absent batch over an empty registry.
+            #[test]
+            fn a_v1_6_base_io_carries_no_batch() {
+                let bank = v16_bank();
+                let io = history_step_bank_base_output_io_rooted(
+                    &bank,
+                    CanonicalHistoryStepClassId::new(1).unwrap(),
+                    &crate::accumulator::genesis_accumulator(),
+                    &RecursionRoot::genesis(),
+                )
+                .unwrap();
+                let claim = parse_history_step_batch_lanes(&bank.layout().batch.unwrap(), &io).unwrap();
+                assert_eq!(claim.carried, None);
+                assert!(claim.entries.iter().all(Option::is_none));
+                assert_eq!(claim.batch_lane, None);
+                assert!(claim.registry.iter().all(|leaf| *leaf == [0u8; 32]));
+            }
+
+            /// The lanes read back are the ones written: the carried batch
+            /// (root, count `n` from `g^n`, mask), the leaves, the live lanes.
+            #[test]
+            fn the_batch_lanes_read_back_what_a_tip_publishes() {
+                let bank = v16_bank();
+                let tip = batch_tip(&bank);
+                let lanes = bank.layout().batch.unwrap();
+                assert_eq!(parse_history_step_batch_lanes(&lanes, &tip.io), Ok(tip.claim.clone()));
+                let pending = begin(&bank, &tip.io).unwrap();
+                assert_eq!(pending.pending_batch(), Some(&tip.claim));
+                assert_eq!(pending.pending_client(), None, "a v1.6 tip has no client lanes");
+            }
+
+            /// Every non-canonical encoding is refused by every reader.
+            #[test]
+            fn a_non_canonical_batch_encoding_is_refused() {
+                let bank = v16_bank();
+                let tip = batch_tip(&bank);
+                let lanes = bank.layout().batch.unwrap();
+                let refused = |edit: &dyn Fn(&mut Vec<F128>), error: HistoryStepBankError| {
+                    let mut io = tip.io.clone();
+                    edit(&mut io);
+                    assert_eq!(parse_history_step_batch_lanes(&lanes, &io), Err(error.clone()));
+                    assert!(matches!(begin(&bank, &io), Err(e) if e == error));
+                };
+                refused(&|io| io[lanes.present] = F128::new(2, 0), HistoryStepBankError::BatchPresentFlag);
+                // Absent: root, count and mask all zero.
+                refused(
+                    &|io| {
+                        io[lanes.present] = F128::ZERO;
+                    },
+                    HistoryStepBankError::NonCanonicalAbsentBatch,
+                );
+                refused(
+                    &|io| {
+                        io[lanes.present] = F128::ZERO;
+                        io[lanes.root..lanes.registry_leaves].fill(F128::ZERO);
+                        io[lanes.mask + 3] = F128::ONE;
+                    },
+                    HistoryStepBankError::NonCanonicalAbsentBatch,
+                );
+                // Present: a count g^n with 1 <= n <= the bound.
+                refused(&|io| io[lanes.count] = F128::ONE, HistoryStepBankError::BatchCount); // n = 0
+                refused(&|io| io[lanes.count] = F128::new(3, 0), HistoryStepBankError::BatchCount);
+                refused(&|io| io[lanes.count] = F128::ZERO, HistoryStepBankError::BatchCount);
+                refused(
+                    &|io| io[lanes.count] = count_value(HISTORY_STEP_BATCH_MAX_CLIENTS + 1),
+                    HistoryStepBankError::BatchCount,
+                );
+                refused(&|io| io[lanes.mask + 1] = F128::new(2, 0), HistoryStepBankError::BatchMaskFlag);
+                refused(&|io| io[lanes.mask + 5] = F128::ONE, HistoryStepBankError::ClientNotRegistered);
+                // Lanes: live or dead, dead all zero, live on a registered leaf.
+                refused(
+                    &|io| io[lanes.entry_lane(1).live] = F128::new(2, 0),
+                    HistoryStepBankError::ClientLaneLiveness,
+                );
+                refused(
+                    &|io| io[lanes.entry_lane(1).point] = F128::ONE,
+                    HistoryStepBankError::ClientLaneLiveness,
+                );
+                refused(
+                    &|io| io[lanes.entry_lane(4).live] = F128::ONE,
+                    HistoryStepBankError::ClientNotRegistered,
+                );
+                refused(
+                    &|io| io[lanes.batch_self_lane().live] = F128::new(2, 0),
+                    HistoryStepBankError::BatchLaneLiveness,
+                );
+                refused(
+                    &|io| {
+                        let lane = lanes.batch_self_lane();
+                        io[lane.live] = F128::ZERO;
+                    },
+                    HistoryStepBankError::BatchLaneLiveness,
+                );
+                // The bound itself is admissible.
+                let mut io = tip.io.clone();
+                io[lanes.count] = count_value(HISTORY_STEP_BATCH_MAX_CLIENTS);
+                assert_eq!(
+                    parse_history_step_batch_lanes(&lanes, &io).unwrap().carried.unwrap().count,
+                    HISTORY_STEP_BATCH_MAX_CLIENTS as u64
+                );
+            }
+
+            /// A v1.6 tip is decided only once its batch lanes were decided on
+            /// the matrices: the entry lanes on the registered matrices held,
+            /// the `D_batch` lane on the pinned batch class's matrix. The
+            /// decided claim travels with the accepted tip.
+            #[test]
+            fn a_v1_6_tip_is_decided_with_its_batch_lanes() {
+                let bank = v16_bank();
+                let tip = batch_tip(&bank);
+                let form = HistoryStepClientForm::canonical();
+                let batch = batch_matrix();
+
+                let pending = begin(&bank, &tip.io).unwrap();
+                assert!(matches!(pending.finish(), Err(HistoryStepBankError::BatchLaneUnchecked)));
+
+                let mut pending = begin(&bank, &tip.io).unwrap();
+                assert_eq!(
+                    pending.check_batch_lanes_with(Some(&form), Some(&batch), None),
+                    Err(HistoryStepBankError::ClientRegistryUnavailable)
+                );
+                assert_eq!(
+                    pending.check_batch_lanes_with(Some(&form), None, Some(&tip.held)),
+                    Err(HistoryStepBankError::BatchMatrix),
+                    "a live D_batch lane and no batch matrix"
+                );
+                let other = HistoryStepBatchMatrix::authenticate(canonical_shape_matrix(0x77));
+                assert_eq!(
+                    pending.check_batch_lanes_with(Some(&form), Some(&other), Some(&tip.held)),
+                    Err(HistoryStepBankError::BatchMatrix),
+                    "a batch matrix of another digest"
+                );
+                let empty = HistoryStepClientMatrixSet::new(&form);
+                assert_eq!(
+                    pending.check_batch_lanes_with(Some(&form), Some(&batch), Some(&empty)),
+                    Err(HistoryStepBankError::ClientMatrixUnavailable),
+                    "no verdict without the registered matrix"
+                );
+                assert_eq!(pending.pending_batch(), Some(&tip.claim), "refusals keep it pending");
+                assert_eq!(pending.checked_batch(), None);
+                assert_eq!(pending.check_batch_lanes_with(Some(&form), Some(&batch), Some(&tip.held)), Ok(()));
+                assert_eq!(pending.pending_batch(), None);
+                assert_eq!(pending.checked_batch(), Some(&tip.claim));
+                assert!(
+                    matches!(pending.finish(), Err(HistoryStepBankError::TipMatrixUnchecked(_))),
+                    "the batch lanes no longer block; the tip's own matrix does"
+                );
+            }
+
+            /// A forged accumulated claim — on an entry lane or on the
+            /// `D_batch` lane — is refused by the decision and stays pending.
+            #[test]
+            fn a_v1_6_tip_with_a_forged_lane_is_refused() {
+                let bank = v16_bank();
+                let tip = batch_tip(&bank);
+                let form = HistoryStepClientForm::canonical();
+                let batch = batch_matrix();
+                let lanes = bank.layout().batch.unwrap();
+                for (at, error) in [
+                    (lanes.entry_lane(0).value, HistoryStepBankError::ClientAccumulatedClaimValue),
+                    (lanes.batch_self_lane().value, HistoryStepBankError::BatchAccumulatedClaimValue),
+                    (lanes.batch_self_lane().point, HistoryStepBankError::BatchAccumulatedClaimValue),
+                ] {
+                    let mut io = tip.io.clone();
+                    io[at] += F128::ONE;
+                    let mut pending = begin(&bank, &io).unwrap();
+                    assert_eq!(
+                        pending.check_batch_lanes_with(Some(&form), Some(&batch), Some(&tip.held)),
+                        Err(error)
+                    );
+                    assert!(pending.pending_batch().is_some());
+                    assert_eq!(pending.checked_batch(), None);
+                }
+            }
+
+            /// A dead `D_batch` lane needs no batch matrix; the entry lanes
+            /// are still decided.
+            #[test]
+            fn a_dead_batch_lane_needs_no_batch_matrix() {
+                let bank = v16_bank();
+                let tip = batch_tip(&bank);
+                let form = HistoryStepClientForm::canonical();
+                let lanes = bank.layout().batch.unwrap();
+                let mut io = tip.io.clone();
+                let lane = lanes.batch_self_lane();
+                io[lane.point..=lane.live].fill(F128::ZERO);
+                let mut pending = begin(&bank, &io).unwrap();
+                assert_eq!(pending.check_batch_lanes_with(Some(&form), None, Some(&tip.held)), Ok(()));
+                assert_eq!(pending.checked_batch().unwrap().batch_lane, None);
+            }
+
+            /// A v1.5 tip has no batch lanes: nothing to decide, nothing
+            /// reported.
+            #[test]
+            fn a_v1_5_tip_has_no_batch_lanes() {
+                let bank = client_bank();
+                let tip = client_tip(&bank);
+                let mut pending = PendingHistoryStepBankDecision::begin(&bank, &tip.io, replay(&bank)).unwrap();
+                assert_eq!(pending.pending_batch(), None);
+                assert_eq!(pending.check_batch_lanes_with(None, None, None), Ok(()));
+                assert_eq!(pending.checked_batch(), None);
+            }
+        }
     }
 
     #[test]

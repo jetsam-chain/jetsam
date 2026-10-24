@@ -357,10 +357,22 @@ where
     provider
         .reset_backbone()
         .map_err(HistoryStepFreezeError::Provider)?;
-    derive_history_step_runtime_parts_in(
-        generation,
-        vks.map(|vk| vk.expect("all tier VKs derived")),
-    )
+    let vks = vks.map(|vk| vk.expect("all tier VKs derived"));
+    // A v1.6 relation's slot is the chain's batch class, checked
+    // against CLIENT_BATCH_CLASS when it is frozen; never a class of the
+    // caller's choosing.
+    if generation.carries_batch_slot() {
+        return super::relation::HistoryStepBatchParts::canonical()
+            .and_then(|batch| super::relation::derive_history_step_runtime_parts_v1_6(vks, batch))
+            .map_err(|source| {
+                HistoryStepFreezeError::relation(
+                    HistoryStepFreezeStage::ProvisionalRuntimeParts,
+                    None,
+                    source,
+                )
+            });
+    }
+    derive_history_step_runtime_parts_in(generation, vks)
     .map_err(|source| {
         HistoryStepFreezeError::relation(
             HistoryStepFreezeStage::ProvisionalRuntimeParts,
@@ -440,9 +452,12 @@ where
         (0, HistoryStepPackGeneration::V1) => {
             provider.b25(class, start).map(HistoryStepFreezeInput::B25)
         }
-        (0, HistoryStepPackGeneration::V1_3 | HistoryStepPackGeneration::V1_5) => {
-            provider.b24(class, start).map(HistoryStepFreezeInput::B24)
-        }
+        (
+            0,
+            HistoryStepPackGeneration::V1_3
+            | HistoryStepPackGeneration::V1_5
+            | HistoryStepPackGeneration::V1_6,
+        ) => provider.b24(class, start).map(HistoryStepFreezeInput::B24),
         (1, _) => provider
             .b255(class, start)
             .map(HistoryStepFreezeInput::B255),
@@ -724,5 +739,157 @@ where
     Ok(FrozenHistoryStepBank {
         bank: final_bank,
         parts,
+    })
+}
+
+/// Rows gate (release tooling): the useful rows of each class of the
+/// v1.6 relation, measured on honest production witnesses, beside the v1.5
+/// relation built from the same witnesses (the control: it must give the
+/// rows of the v1.5 packs in service).
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct HistoryStepV16RowsGate {
+    /// Useful rows of the B24 and B255 classes, v1.5 then v1.6.
+    pub v1_5_rows: [usize; HISTORY_STEP_CLASS_COUNT],
+    pub v1_6_rows: [usize; HISTORY_STEP_CLASS_COUNT],
+    /// Class sizes `2^m` of the v1.6 relation.
+    pub v1_6_limits: [usize; HISTORY_STEP_CLASS_COUNT],
+    /// Link key of each relation: (L-A, L-B, L-C) `w_log`.
+    pub v1_5_link_w_logs: (usize, usize, usize),
+    pub v1_6_link_w_logs: (usize, usize, usize),
+    /// Seconds: batch parts, v1.5 parts, v1.6 parts, each class assembly.
+    pub timings: Vec<(String, f64)>,
+}
+
+/// Measure [`HistoryStepV16RowsGate`]: walk the provider's backbone to its
+/// two parent checkpoints, fork one honest child per class from the first
+/// one, derive each relation's runtime parts from block keys derived on those
+/// children (v1.6: with the production batch class shape, m = 22, its
+/// `D_batch` and post-commit class placeholders — the rows do not depend on
+/// them), and assemble each class frozen, as a base rooted at the child's
+/// parent (the base and recursive cases share one matrix). No proof.
+#[doc(hidden)]
+pub fn measure_history_step_v1_6_rows<P: HistoryStepFreezeInputProvider>(
+    provider: &mut P,
+) -> Result<HistoryStepV16RowsGate, String>
+where
+    P::Error: core::fmt::Debug,
+{
+    use crate::acceptance::client_batch::step::{derive_client_batch_parts_at, ClassIdentity};
+    use crate::acceptance::history_step_bank::{
+        HistoryStepClientForm, HISTORY_STEP_BATCH_FORM_M,
+    };
+
+    struct Rejecting;
+    impl HistoryStepMatrixSource for Rejecting {
+        fn load(
+            &self,
+            _class: CanonicalHistoryStepClassId,
+        ) -> Result<HistoryStepMatrixLease, HistoryStepMatrixSourceError> {
+            Err(HistoryStepMatrixSourceError)
+        }
+    }
+
+    let mut timings = Vec::new();
+    let mut lap = |label: &str, started: Instant| {
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!("[v1.6 rows gate] {label}: {seconds:.1} s");
+        timings.push((label.to_owned(), seconds));
+    };
+    // The backbone: its first parent checkpoint is the boundary every child
+    // below is forked from.
+    let started = Instant::now();
+    provider.reset_backbone().map_err(|error| format!("{error:?}"))?;
+    let mut expected = crate::accumulator::genesis_accumulator();
+    let mut last_of_slot: [Option<ChainAccumulator>; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|_| None);
+    while let Some(input) = provider
+        .next_backbone(&expected)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        if input.start_accumulator() != &expected {
+            return Err("backbone start".into());
+        }
+        expected = input.end_accumulator().clone();
+        last_of_slot[input.current_slot()] = Some(expected.clone());
+    }
+    let parent = last_of_slot[0].clone().ok_or("no B24 checkpoint")?;
+    lap("backbone", started);
+    let class = |slot: usize| CanonicalHistoryStepClassId::new(slot).expect("canonical slot");
+
+    let mut rows = [[0usize; HISTORY_STEP_CLASS_COUNT]; 2];
+    let mut w_logs = [(0, 0, 0); 2];
+    let mut limits = [0usize; HISTORY_STEP_CLASS_COUNT];
+    for (index, generation) in [HistoryStepPackGeneration::V1_5, HistoryStepPackGeneration::V1_6]
+        .into_iter()
+        .enumerate()
+    {
+        let name = if index == 0 { "v1.5" } else { "v1.6" };
+        let started = Instant::now();
+        let b24 = provider.b24(class(0), &parent).map_err(|error| format!("{error:?}"))?;
+        let b255 = provider.b255(class(1), &parent).map_err(|error| format!("{error:?}"))?;
+        let vks = [
+            derive_history_step_direct_block_vk_in(generation, b24).map_err(|e| format!("{e:?}"))?,
+            derive_history_step_direct_block_vk_in(generation, b255).map_err(|e| format!("{e:?}"))?,
+        ];
+        lap(&format!("{name} direct-Block keys"), started);
+        let started = Instant::now();
+        let parts = if index == 0 {
+            derive_history_step_runtime_parts_in(generation, vks).map_err(|e| format!("{e:?}"))?
+        } else {
+            let batch = derive_client_batch_parts_at(
+                &HistoryStepClientForm::canonical_z(),
+                HISTORY_STEP_BATCH_FORM_M,
+            )
+            .map_err(|e| format!("batch parts: {e:?}"))?;
+            lap("v1.6 batch parts (m = 22)", started);
+            let slot = super::relation::HistoryStepBatchParts::new(ClassIdentity {
+                parts: &batch,
+                digest: [0xD1; 32],
+                post_commit: [0xD2; 32],
+                matrix: None,
+            })
+            .map_err(|e| format!("{e:?}"))?;
+            super::relation::derive_history_step_runtime_parts_v1_6(vks, slot)
+                .map_err(|e| format!("{e:?}"))?
+        };
+        lap(&format!("{name} runtime parts"), started);
+        let vk = parts.parent_recursion_vk();
+        w_logs[index] = (vk.leaf_a().w_log(), vk.path_b().w_log(), vk.rec_c().w_log());
+        for slot in 0..HISTORY_STEP_CLASS_COUNT {
+            let started = Instant::now();
+            let input = if slot == 0 {
+                HistoryStepFreezeInput::B24(
+                    provider.b24(class(0), &parent).map_err(|error| format!("{error:?}"))?,
+                )
+            } else {
+                HistoryStepFreezeInput::B255(
+                    provider.b255(class(1), &parent).map_err(|error| format!("{error:?}"))?,
+                )
+            };
+            let bank = pin_history_step_class_bank([[0u8; 32]; HISTORY_STEP_CLASS_COUNT], &parts)
+                .map_err(|e| format!("{e:?}"))?
+                .rooted_at_height(input.start_accumulator().height);
+            let runtime = HistoryStepRuntime::new(bank, Box::new(Rejecting), parts.clone())
+                .map_err(|e| format!("{e:?}"))?;
+            let frozen = assemble_input(&runtime, None, input).map_err(|e| format!("{e:?}"))?;
+            rows[index][slot] = frozen.useful_rows();
+            limits[slot] = 1usize
+                << crate::acceptance::history_step_bank::canonical_history_step_shape_in(
+                    generation,
+                    class(slot),
+                )
+                .m;
+            drop(frozen);
+            lap(&format!("{name} class {slot} frozen ({} rows)", rows[index][slot]), started);
+        }
+    }
+    Ok(HistoryStepV16RowsGate {
+        v1_5_rows: rows[0],
+        v1_6_rows: rows[1],
+        v1_6_limits: limits,
+        v1_5_link_w_logs: w_logs[0],
+        v1_6_link_w_logs: w_logs[1],
+        timings,
     })
 }

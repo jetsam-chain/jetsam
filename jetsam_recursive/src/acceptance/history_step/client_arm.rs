@@ -46,8 +46,14 @@ use jetsam_ivc_core::matrix_claim::c1::{
 };
 use jetsam_ivc_core::merkle::{self, Hash};
 use jetsam_ivc_core::pcs::Commitment;
-use jetsam_ivc_core::proof::{pcs_params_statement_bytes, C1FieldR1csProof, FieldShape};
-use jetsam_ivc_core::verifier::verify_field_c1_deferred_matrix_with_post_commit_context;
+use jetsam_ivc_core::proof::{
+    pcs_params_statement_bytes, C1FieldR1csProof, C1ZkFieldR1csProof, FieldShape,
+};
+use jetsam_ivc_core::verifier::{
+    verify_field_c1_deferred_matrix_with_post_commit_context,
+    verify_field_c1_zk_deferred_matrix_with_post_commit_context,
+};
+use jetsam_ivc_core::zk_form::check_zk_form_registration;
 
 use super::gated_recorder::BaseSelectableParentRecorder;
 use super::relation::{capture_scratch_recording, history_step_query_lane_count};
@@ -66,6 +72,10 @@ use crate::acceptance::trace::self_verify::{
     shape_only_field_r1cs_proof_c1,
     verify_field_c1_trace_deferred_region_with_post_commit_context_expr, C1FieldR1csProofTrace,
     FlatDigestExpr, PcsWalkObligations,
+};
+use crate::acceptance::trace::self_verify_zk::{
+    verify_field_c1_zk_trace_deferred_region_with_post_commit_context_expr,
+    C1ZkFieldR1csProofTrace,
 };
 use crate::acceptance::trace::{mul, pin_eq, with_pin_gate};
 
@@ -384,6 +394,12 @@ impl HistoryStepClientMatrixSet {
         if FieldShape::of(&matrix) != self.form.shape() {
             return Err(HistoryStepError::ClientForm);
         }
+        // A hiding form's matrix obeys the registration rule (nothing on a
+        // free row or column): the stripped claims a lane carries are about
+        // the matrix only under it.
+        if let Some(layout) = self.form.zk_layout() {
+            check_zk_form_registration(layout, &matrix).map_err(|_| HistoryStepError::ClientForm)?;
+        }
         let digest = matrix.structural_statement_digest();
         Ok(AuthenticatedClientMatrix { digest, matrix })
     }
@@ -515,6 +531,41 @@ pub struct HistoryStepClientWitness {
     pub registry: HistoryStepClientRegistry,
 }
 
+/// What an aggregator supplies to carry one client proof of a hiding form
+/// (v1.6, [`HistoryStepClientForm::canonical_z`]): a form-Z proof,
+/// and the registered form-Z matrix (the physical, renamed catalogue matrix:
+/// its digest is `D`, the stripped lincheck folds against it).
+#[derive(Clone)]
+pub struct HistoryStepClientZkWitness {
+    pub proof: C1ZkFieldR1csProof,
+    pub commitment: Commitment,
+    pub io: Vec<F128>,
+    pub matrix: Arc<FieldR1cs>,
+    pub registry: HistoryStepClientRegistry,
+}
+
+/// The two values a form-Z proof adds to the v1.5 body: `κ` and `M(r)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClientZkValues {
+    pub(crate) kappa: F256,
+    pub(crate) mask_value: F256,
+}
+
+impl ClientZkValues {
+    /// The ghost's values.
+    const ZERO: Self = Self {
+        kappa: F256::ZERO,
+        mask_value: F256::ZERO,
+    };
+
+    fn of(proof: &C1ZkFieldR1csProof) -> Self {
+        Self {
+            kappa: proof.zerocheck_kappa,
+            mask_value: proof.lincheck_mask_value,
+        }
+    }
+}
+
 /// The carried part of a v1.5 block's client lanes (M3.4), as the next block
 /// folds into it: the registry leaves and the entry lanes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,6 +609,8 @@ struct ReceivedClient {
     io_commitment: Hash,
     io: Vec<F128>,
     field_proof: C1FieldR1csProof,
+    /// `κ` and `M(r)` of a form-Z proof (`None` for a v1.5 one).
+    zk: Option<ClientZkValues>,
     commitment_root: Hash,
     matrix: Arc<FieldR1cs>,
     fresh: C1FreshLincheckClaim,
@@ -575,6 +628,7 @@ struct ReceivedClient {
 #[derive(Clone)]
 struct FoldMemo {
     registry_index: usize,
+    pad_bytes: usize,
     incoming: Option<C1MatrixAccClaim>,
     fold_proof: C1MatrixFoldProof,
     outgoing: C1MatrixAccClaim,
@@ -592,6 +646,8 @@ pub(crate) struct PreparedClientArm {
     io_commitment: Hash,
     io: Vec<F128>,
     field_proof: C1FieldR1csProof,
+    /// `κ` and `M(r)` of a form-Z proof (zero for the ghost of a hiding form).
+    zk: Option<ClientZkValues>,
     commitment_root: Hash,
     /// The parent's lanes the block starts from (empty at a base).
     parent: HistoryStepClientCarry,
@@ -601,6 +657,8 @@ pub(crate) struct PreparedClientArm {
     /// The parent's lane `registry_index` folded with the client's claim.
     outgoing: C1MatrixAccClaim,
     scratch: LayoutRecordedChannel,
+    /// Constant padding bytes absorbed after the fold (0 in HistoryStep).
+    pad_bytes: usize,
 }
 
 fn zero_fold_proof(k_log: usize) -> C1MatrixFoldProof {
@@ -624,11 +682,13 @@ fn client_verifier_and_fold<C: FsChannelOps>(
     form: &HistoryStepClientForm,
     digest: &FlatDigestExpr,
     field_proof: &C1FieldR1csProof,
+    zk: Option<ClientZkValues>,
     commitment_root: &Hash,
     io_values: &[F128],
     incoming: &C1MatrixAccClaimTrace,
     incoming_live: &LinExpr,
     fold_proof: &C1MatrixFoldProof,
+    pad_bytes: usize,
 ) -> (PcsWalkObligations, Vec<LinExpr>, C1MatrixAccClaimTrace) {
     let shape = form.shape();
     let root = alloc_flat_digest(b, commitment_root);
@@ -640,20 +700,54 @@ fn client_verifier_and_fold<C: FsChannelOps>(
         C1FieldR1csProofTrace::alloc_shape_mode(b, field_proof, &shape, form.pcs_params(), false);
     let post_commit = const_flat_digest(&form.post_commit_digest());
     let mut obligations = PcsWalkObligations::default();
-    let (_claim, fresh) = verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
-        b,
-        channel,
-        &shape,
-        form.pcs_params(),
-        digest,
-        &root,
-        &proof,
-        form.io_spec(),
-        &io,
-        &post_commit,
-        Some(&mut obligations),
-        |_, _| {},
-    );
+    let (_claim, fresh) = match form.zk_layout() {
+        None => verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+            b,
+            channel,
+            &shape,
+            form.pcs_params(),
+            digest,
+            &root,
+            &proof,
+            form.io_spec(),
+            &io,
+            &post_commit,
+            Some(&mut obligations),
+            |_, _| {},
+        ),
+        // A hiding form: the form-Z verifier (layout bound, masked zerocheck
+        // and lincheck, sparse claims), its fresh claim stripped of the
+        // tautologies — a claim on the registered (physical) matrix.
+        Some(layout) => {
+            let values = zk.expect("a form-Z client arm carries kappa and M(r)");
+            let proof = C1ZkFieldR1csProofTrace {
+                base: proof,
+                kappa: ExtExpr::new(
+                    LinExpr::from_wire(b.alloc_f128(values.kappa.lo)),
+                    LinExpr::from_wire(b.alloc_f128(values.kappa.hi)),
+                ),
+                mask_value: ExtExpr::new(
+                    LinExpr::from_wire(b.alloc_f128(values.mask_value.lo)),
+                    LinExpr::from_wire(b.alloc_f128(values.mask_value.hi)),
+                ),
+            };
+            verify_field_c1_zk_trace_deferred_region_with_post_commit_context_expr(
+                b,
+                channel,
+                layout,
+                &shape,
+                form.pcs_params(),
+                digest,
+                &root,
+                &proof,
+                form.io_spec(),
+                &io,
+                &post_commit,
+                Some(&mut obligations),
+                |_, _| {},
+            )
+        }
+    };
     let fold = C1MatrixFoldProofTrace::alloc(b, fold_proof, shape.k_log);
     let accumulated = verify_matrix_claim_fold_c1_trace(
         b,
@@ -665,6 +759,12 @@ fn client_verifier_and_fold<C: FsChannelOps>(
         incoming_live,
         &fold,
     );
+    // Constant padding (ClientBatchStep prototype): a client arm that shares
+    // a selected L-C role with a longer transcript is padded into the same
+    // dyadic block. Zero for the HistoryStep relation (no op at all).
+    if pad_bytes > 0 {
+        channel.observe_bytes_const(b, &vec![0u8; pad_bytes]);
+    }
     (obligations, io, accumulated)
 }
 
@@ -689,11 +789,13 @@ fn scratch_replay(
     form: &HistoryStepClientForm,
     digest: &Hash,
     field_proof: &C1FieldR1csProof,
+    zk: Option<ClientZkValues>,
     commitment_root: &Hash,
     io: &[F128],
     incoming: &C1MatrixAccClaim,
     incoming_live: bool,
     fold_proof: &C1MatrixFoldProof,
+    pad_bytes: usize,
 ) -> LayoutRecordedChannel {
     let mut b = FieldR1csBuilder::new_witness_only();
     let digest = alloc_flat_digest(&mut b, digest);
@@ -705,11 +807,13 @@ fn scratch_replay(
         form,
         &digest,
         field_proof,
+        zk,
         commitment_root,
         io,
         &incoming,
         &incoming_live,
         fold_proof,
+        pad_bytes,
     );
     capture_scratch_recording(&channel.finish(), &b)
 }
@@ -719,6 +823,7 @@ fn scratch_replay(
 fn verifier_query_lanes(
     form: &HistoryStepClientForm,
     field_proof: &C1FieldR1csProof,
+    zk: Option<ClientZkValues>,
     commitment_root: &Hash,
     io: &[F128],
 ) -> Result<Vec<F128>, HistoryStepError> {
@@ -738,20 +843,47 @@ fn verifier_query_lanes(
         false,
     );
     let mut channel = FsChannelUnionRecorder::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
-    verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
-        &mut b,
-        &mut channel,
-        &shape,
-        form.pcs_params(),
-        &digest,
-        &root,
-        &proof,
-        form.io_spec(),
-        &io,
-        &const_flat_digest(&form.post_commit_digest()),
-        Some(&mut PcsWalkObligations::default()),
-        |_, _| {},
-    );
+    match form.zk_layout() {
+        None => {
+            verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+                &mut b,
+                &mut channel,
+                &shape,
+                form.pcs_params(),
+                &digest,
+                &root,
+                &proof,
+                form.io_spec(),
+                &io,
+                &const_flat_digest(&form.post_commit_digest()),
+                Some(&mut PcsWalkObligations::default()),
+                |_, _| {},
+            );
+        }
+        Some(layout) => {
+            let values = zk.ok_or(HistoryStepError::ClientProof)?;
+            let proof = C1ZkFieldR1csProofTrace {
+                base: proof,
+                kappa: ExtExpr::constant(values.kappa),
+                mask_value: ExtExpr::constant(values.mask_value),
+            };
+            verify_field_c1_zk_trace_deferred_region_with_post_commit_context_expr(
+                &mut b,
+                &mut channel,
+                layout,
+                &shape,
+                form.pcs_params(),
+                &digest,
+                &root,
+                &proof,
+                form.io_spec(),
+                &io,
+                &const_flat_digest(&form.post_commit_digest()),
+                Some(&mut PcsWalkObligations::default()),
+                |_, _| {},
+            );
+        }
+    }
     let recording = channel.finish();
     let lanes = history_step_query_lane_count(form.pcs_params());
     let start = recording
@@ -805,6 +937,10 @@ fn receive_client_with_digest(
     digest_ms: f64,
 ) -> Result<ReceivedClient, HistoryStepError> {
     check_client_witness_form(form, witness)?;
+    // A v1.5 proof is never a proof of a hiding form (one form per class).
+    if form.zk_layout().is_some() {
+        return Err(HistoryStepError::ClientProof);
+    }
     let matrix = witness.matrix.as_ref();
     let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
     witness
@@ -844,6 +980,78 @@ fn receive_client_with_digest(
         io_commitment: client_io_commitment(&witness.io),
         io: witness.io.clone(),
         field_proof: witness.field_proof.clone(),
+        zk: None,
+        commitment_root: witness.commitment.root,
+        matrix: Arc::clone(&witness.matrix),
+        fresh,
+        challenger,
+        fold_memo: Arc::new(std::sync::Mutex::new(None)),
+    })
+}
+
+/// Native reception of a form-Z client proof (v1.6), the twin of
+/// [`receive_client_with_digest`]: the form must be hiding; the matrix is of
+/// the form's shape and obeys the registration rule (nothing on a free row or
+/// column, `check_zk_form_registration`); `D` is in the prover's registry;
+/// the form-Z verifier accepts, and its stripped lincheck closes on the
+/// registered matrix. Nothing here depends on the block that will carry it.
+fn receive_client_z(
+    form: &HistoryStepClientForm,
+    witness: &HistoryStepClientZkWitness,
+) -> Result<ReceivedClient, HistoryStepError> {
+    receive_client_z_with(form, witness, None)
+}
+
+/// [`receive_client_z`], the matrix's `D` given when it was computed once
+/// already (an authenticated matrix): every other check is run.
+fn receive_client_z_with(
+    form: &HistoryStepClientForm,
+    witness: &HistoryStepClientZkWitness,
+    known_digest: Option<Hash>,
+) -> Result<ReceivedClient, HistoryStepError> {
+    let layout = form.zk_layout().ok_or(HistoryStepError::ClientProof)?;
+    let matrix = witness.matrix.as_ref();
+    let shape = form.shape();
+    if FieldShape::of(matrix) != shape
+        || pcs_params_statement_bytes(&witness.commitment.params)
+            != pcs_params_statement_bytes(form.pcs_params())
+        || witness.io.len() != form.io_spec().io_len
+        || witness.registry.depth() != form.registry_depth()
+    {
+        return Err(HistoryStepError::ClientProof);
+    }
+    check_zk_form_registration(layout, matrix).map_err(|_| HistoryStepError::ClientProof)?;
+    let digest = known_digest.unwrap_or_else(|| matrix.structural_statement_digest());
+    witness
+        .registry
+        .position(&digest)
+        .ok_or(HistoryStepError::ClientRegistry)?;
+    let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_CLIENT_PROOF_DOMAIN);
+    let (_claim, fresh) = verify_field_c1_zk_deferred_matrix_with_post_commit_context(
+        layout,
+        &shape,
+        &digest,
+        &witness.commitment,
+        &witness.proof,
+        form.io_spec(),
+        &witness.io,
+        &form.post_commit_digest(),
+        &(),
+        &mut challenger,
+        |_, _| Ok(()),
+    )
+    .map_err(|_| HistoryStepError::ClientProof)?;
+    // As for v1.5: close the (stripped) lincheck against the registered
+    // matrix before anything is folded.
+    if fresh_claim_value_c1(matrix, &fresh) != fresh.value {
+        return Err(HistoryStepError::ClientProof);
+    }
+    Ok(ReceivedClient {
+        digest,
+        io_commitment: client_io_commitment(&witness.io),
+        io: witness.io.clone(),
+        field_proof: witness.proof.base.clone(),
+        zk: Some(ClientZkValues::of(&witness.proof)),
         commitment_root: witness.commitment.root,
         matrix: Arc::clone(&witness.matrix),
         fresh,
@@ -860,6 +1068,7 @@ fn prepare_client_arm_from(
     received: Option<&ReceivedClient>,
     parent: &HistoryStepClientCarry,
     registry: &[Hash],
+    pad_bytes: usize,
 ) -> Result<PreparedClientArm, HistoryStepError> {
     let k_log = form.shape().k_log;
     let capacity = form.registry_capacity();
@@ -873,7 +1082,8 @@ fn prepare_client_arm_from(
         let (mut field_proof, commitment_root) =
             shape_only_field_r1cs_proof_c1(&form.shape(), form.pcs_params());
         let io = vec![F128::ZERO; form.io_spec().io_len];
-        let query_lanes = verifier_query_lanes(form, &field_proof, &commitment_root, &io)?;
+        let zk = form.zk_layout().map(|_| ClientZkValues::ZERO);
+        let query_lanes = verifier_query_lanes(form, &field_proof, zk, &commitment_root, &io)?;
         patch_shape_only_query_positions_c1(&mut field_proof, form.pcs_params(), &query_lanes);
         let fold_proof = zero_fold_proof(k_log);
         let (incoming, live) = parent.incoming(0, k_log);
@@ -881,11 +1091,13 @@ fn prepare_client_arm_from(
             form,
             &[0u8; 32],
             &field_proof,
+            zk,
             &commitment_root,
             &io,
             &incoming,
             live,
             &fold_proof,
+            pad_bytes,
         );
         return Ok(PreparedClientArm {
             present: false,
@@ -894,12 +1106,14 @@ fn prepare_client_arm_from(
             io_commitment: [0u8; 32],
             io,
             field_proof,
+            zk,
             commitment_root,
             parent: parent.clone(),
             registry: registry.to_vec(),
             fold_proof,
             outgoing: C1MatrixAccClaim::zero(k_log),
             scratch,
+            pad_bytes,
         });
     };
 
@@ -915,6 +1129,7 @@ fn prepare_client_arm_from(
         memo.as_ref()
             .filter(|memo| {
                 memo.registry_index == registry_index
+                    && memo.pad_bytes == pad_bytes
                     && memo.incoming == parent.entries[registry_index]
             })
             .cloned()
@@ -944,11 +1159,13 @@ fn prepare_client_arm_from(
                 form,
                 &received.digest,
                 &received.field_proof,
+                received.zk,
                 &received.commitment_root,
                 &received.io,
                 &incoming,
                 live,
                 &fold_proof,
+                pad_bytes,
             );
             if timing {
                 eprintln!(
@@ -959,6 +1176,7 @@ fn prepare_client_arm_from(
             }
             let memo = FoldMemo {
                 registry_index,
+                pad_bytes,
                 incoming: parent.entries[registry_index].clone(),
                 fold_proof,
                 outgoing,
@@ -978,12 +1196,14 @@ fn prepare_client_arm_from(
         io_commitment: received.io_commitment,
         io: received.io.clone(),
         field_proof: received.field_proof.clone(),
+        zk: received.zk,
         commitment_root: received.commitment_root,
         parent: parent.clone(),
         registry: registry.to_vec(),
         fold_proof,
         outgoing,
         scratch,
+        pad_bytes,
     })
 }
 
@@ -999,7 +1219,23 @@ pub(crate) fn prepare_client_arm_on(
     let received = witness
         .map(|witness| receive_client(form, witness))
         .transpose()?;
-    prepare_client_arm_from(form, received.as_ref(), parent, registry)
+    prepare_client_arm_from(form, received.as_ref(), parent, registry, 0)
+}
+
+/// [`prepare_client_arm_on`] with `pad_bytes` of constant padding absorbed at
+/// the end of the arm's transcript (ClientBatchStep prototype: the client
+/// tier shares a selected L-C role with the longer batch-arm transcript).
+pub(crate) fn prepare_client_arm_on_padded(
+    form: &HistoryStepClientForm,
+    witness: Option<&HistoryStepClientWitness>,
+    parent: &HistoryStepClientCarry,
+    registry: &[Hash],
+    pad_bytes: usize,
+) -> Result<PreparedClientArm, HistoryStepError> {
+    let received = witness
+        .map(|witness| receive_client(form, witness))
+        .transpose()?;
+    prepare_client_arm_from(form, received.as_ref(), parent, registry, pad_bytes)
 }
 
 /// [`prepare_client_arm_on`] for a block that starts from an empty carry and
@@ -1037,6 +1273,38 @@ impl PreparedHistoryStepClient {
         Ok(Self {
             form: form.clone(),
             received: receive_client(form, witness)?,
+        })
+    }
+
+    /// The pre-pass of a form-Z `witness` under the hiding `form` (v1.6,
+    /// form Z): refused under a v1.5 form, as a v1.5 witness is refused
+    /// under a hiding one (one form per class).
+    pub fn prepare_z(
+        form: &HistoryStepClientForm,
+        witness: &HistoryStepClientZkWitness,
+    ) -> Result<Self, HistoryStepError> {
+        Ok(Self {
+            form: form.clone(),
+            received: receive_client_z(form, witness)?,
+        })
+    }
+
+    /// [`Self::prepare_z`] on a matrix held and authenticated: its `D`
+    /// is the one computed when it was authenticated, not computed again;
+    /// refused unless `witness.matrix` is that very matrix (the same
+    /// allocation). The hiding form's registration rule is checked again
+    /// (linear, unlike `D`).
+    pub fn prepare_z_authenticated(
+        form: &HistoryStepClientForm,
+        witness: &HistoryStepClientZkWitness,
+        matrix: &AuthenticatedClientMatrix,
+    ) -> Result<Self, HistoryStepError> {
+        if !Arc::ptr_eq(&witness.matrix, &matrix.matrix) {
+            return Err(HistoryStepError::ClientProof);
+        }
+        Ok(Self {
+            form: form.clone(),
+            received: receive_client_z_with(form, witness, Some(matrix.digest))?,
         })
     }
 
@@ -1078,7 +1346,17 @@ impl PreparedHistoryStepClient {
         parent: &HistoryStepClientCarry,
         registry: &[Hash],
     ) -> Result<PreparedClientArm, HistoryStepError> {
-        prepare_client_arm_from(&self.form, Some(&self.received), parent, registry)
+        prepare_client_arm_from(&self.form, Some(&self.received), parent, registry, 0)
+    }
+
+    /// [`Self::arm_on`] with constant transcript padding (ClientBatchStep).
+    pub(crate) fn arm_on_padded(
+        &self,
+        parent: &HistoryStepClientCarry,
+        registry: &[Hash],
+        pad_bytes: usize,
+    ) -> Result<PreparedClientArm, HistoryStepError> {
+        prepare_client_arm_from(&self.form, Some(&self.received), parent, registry, pad_bytes)
     }
 
     /// The client lanes a block carrying this client on top of `parent`
@@ -1120,6 +1398,22 @@ pub(crate) fn client_transcript_layout(
     Ok(prepare_client_arm(form, None)?.scratch.layout)
 }
 
+/// [`client_transcript_layout`] with `pad_bytes` of constant padding.
+pub(crate) fn client_transcript_layout_padded(
+    form: &HistoryStepClientForm,
+    pad_bytes: usize,
+) -> Result<DuplexLayout, HistoryStepError> {
+    Ok(prepare_client_arm_on_padded(
+        form,
+        None,
+        &HistoryStepClientCarry::empty(form),
+        &vec![[0u8; 32]; form.registry_capacity()],
+        pad_bytes,
+    )?
+    .scratch
+    .layout)
+}
+
 impl PreparedClientArm {
     /// Every value the preparation produced equals `other`'s.
     #[cfg(test)]
@@ -1129,6 +1423,7 @@ impl PreparedClientArm {
             && self.registry_index == other.registry_index
             && self.io_commitment == other.io_commitment
             && self.io == other.io
+            && self.zk == other.zk
             && self.commitment_root == other.commitment_root
             && self.parent == other.parent
             && self.registry == other.registry
@@ -1168,6 +1463,38 @@ impl PreparedClientArm {
         self.rescratch(form)
     }
 
+    /// A prover that skips the reception check: this preparation with its
+    /// form-Z values `κ`, `M(r)` replaced, re-recorded consistently.
+    #[cfg(test)]
+    pub(crate) fn with_zk_values(
+        mut self,
+        form: &HistoryStepClientForm,
+        kappa: F256,
+        mask_value: F256,
+    ) -> Self {
+        self.zk = Some(ClientZkValues { kappa, mask_value });
+        self.rescratch(form)
+    }
+
+    /// A prover that skips every native refusal and forces a v1.5 (non-hiding)
+    /// body into a form-Z arm: `field_proof` under its own commitment
+    /// `commitment_root`, recorded with `κ = M(r) = 0`.
+    #[cfg(test)]
+    pub(crate) fn with_v1_5_body(
+        mut self,
+        form: &HistoryStepClientForm,
+        field_proof: C1FieldR1csProof,
+        commitment_root: Hash,
+    ) -> Self {
+        self.field_proof = field_proof;
+        self.commitment_root = commitment_root;
+        self.zk = Some(ClientZkValues {
+            kappa: F256::ZERO,
+            mask_value: F256::ZERO,
+        });
+        self.rescratch(form)
+    }
+
     /// A prover that folds into entry `index` while the IO names its real
     /// entry: the fold starts from the parent's lane `index`.
     #[cfg(test)]
@@ -1192,11 +1519,13 @@ impl PreparedClientArm {
             form,
             &self.digest,
             &self.field_proof,
+            self.zk,
             &self.commitment_root,
             &self.io,
             &incoming,
             live,
             &self.fold_proof,
+            self.pad_bytes,
         );
         self
     }
@@ -1208,11 +1537,13 @@ impl PreparedClientArm {
             form,
             &self.digest,
             &self.field_proof,
+            self.zk,
             &self.commitment_root,
             &self.io,
             &incoming,
             live,
             &self.fold_proof,
+            self.pad_bytes,
         );
         self
     }
@@ -1354,6 +1685,9 @@ pub(crate) struct ClientArmTrace {
     pub(crate) recorded: RecordedChannel,
     /// `client_present`: the gate of every client obligation.
     pub(crate) gate: LinExpr,
+    /// The one-hot entry selector (entry 0 for the ghost; not gated by
+    /// `client_present`).
+    pub(crate) selector: Vec<LinExpr>,
 }
 
 /// The relation's client arm over its IO cells and its parent's (`parent`,
@@ -1505,11 +1839,13 @@ pub(crate) fn client_arm_trace(
             form,
             &cells.matrix_digest,
             &prepared.field_proof,
+            prepared.zk,
             &prepared.commitment_root,
             &prepared.io,
             &incoming,
             &incoming_live,
             &prepared.fold_proof,
+            prepared.pad_bytes,
         );
         let commitment = merkle_hash_leaf_lanes_trace(b, &io);
         pin_flat_digest_eq(b, &commitment, &cells.io_commitment);
@@ -1538,5 +1874,6 @@ pub(crate) fn client_arm_trace(
         obligations,
         recorded: channel.finish(),
         gate: present,
+        selector,
     }
 }

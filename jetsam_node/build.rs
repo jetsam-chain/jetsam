@@ -37,11 +37,19 @@ const METADATA_DIGEST_V1_3_ENV: &str =
 const PACK_DIRECTORY_V1_5_ENV: &str = "JETSAM_HISTORY_STEP_PACK_DIR_V1_5";
 const METADATA_DIGEST_V1_5_ENV: &str =
     "JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST_V1_5";
+/// The v1.6 pack (m = 23 / 25, batch slot over `D_batch`), which governs
+/// blocks at and above the v1.6 activation height. Optional like
+/// the others: the startup coverage rule refuses a binary whose armed v1.6
+/// clock has no v1.6 pack.
+const PACK_DIRECTORY_V1_6_ENV: &str = "JETSAM_HISTORY_STEP_PACK_DIR_V1_6";
+const METADATA_DIGEST_V1_6_ENV: &str =
+    "JETSAM_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST_V1_6";
 
 const GENERATED_FILE: &str = "history_step_pack.rs";
 const STAGED_DIRECTORY: &str = "embedded-history-step";
 const STAGED_DIRECTORY_V1_3: &str = "embedded-history-step-v1-3";
 const STAGED_DIRECTORY_V1_5: &str = "embedded-history-step-v1-5";
+const STAGED_DIRECTORY_V1_6: &str = "embedded-history-step-v1-6";
 const MAX_COMPRESSED_LEAF_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CANONICAL_LEAF_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
@@ -65,6 +73,8 @@ fn main() {
         METADATA_DIGEST_V1_3_ENV,
         PACK_DIRECTORY_V1_5_ENV,
         METADATA_DIGEST_V1_5_ENV,
+        PACK_DIRECTORY_V1_6_ENV,
+        METADATA_DIGEST_V1_6_ENV,
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -110,6 +120,14 @@ fn main() {
         &out_directory,
     );
 
+    let v1_6 = stage_generation(
+        PACK_DIRECTORY_V1_6_ENV,
+        METADATA_DIGEST_V1_6_ENV,
+        STAGED_DIRECTORY_V1_6,
+        "GENERATED_HISTORY_STEP_PACK_V1_6",
+        &out_directory,
+    );
+
     let mut generated = String::new();
     generated.push_str(
         &pre_fork.unwrap_or_else(|| empty_generation("GENERATED_HISTORY_STEP_PACK")),
@@ -119,6 +137,9 @@ fn main() {
     );
     generated.push_str(
         &v1_5.unwrap_or_else(|| empty_generation("GENERATED_HISTORY_STEP_PACK_V1_5")),
+    );
+    generated.push_str(
+        &v1_6.unwrap_or_else(|| empty_generation("GENERATED_HISTORY_STEP_PACK_V1_6")),
     );
     write_if_changed(&generated_path, generated.as_bytes());
 }

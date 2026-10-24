@@ -275,6 +275,7 @@ impl PreparedBlockAttempt {
                 parent_terminal.as_ref(),
                 client_slot.carried.as_deref(),
                 client_slot.registry_leaves.as_deref(),
+                client_slot.batch.as_ref(),
             )
             .map(PreparedWitness::B24),
             25 => jetsam_block::prepare_history_step_witness::<25>(
@@ -286,6 +287,7 @@ impl PreparedBlockAttempt {
                 parent_terminal.as_ref(),
                 client_slot.carried.as_deref(),
                 client_slot.registry_leaves.as_deref(),
+                client_slot.batch.as_ref(),
             )
             .map(PreparedWitness::B25),
             255 => jetsam_block::prepare_history_step_witness::<255>(
@@ -297,6 +299,7 @@ impl PreparedBlockAttempt {
                 parent_terminal.as_ref(),
                 client_slot.carried.as_deref(),
                 client_slot.registry_leaves.as_deref(),
+                client_slot.batch.as_ref(),
             )
             .map(PreparedWitness::B255),
             other => {
@@ -476,6 +479,17 @@ pub fn terminal_client_view_of(
     terminal_bytes: &[u8],
 ) -> Result<jetsam_chain::consensus::client_objects::TerminalClientView, String> {
     use jetsam_chain::consensus::client_objects::{CarriedClient, TerminalClientView};
+    // v1.6: the batch lanes, read as a receiving node reads them.
+    if let Some(lanes) = runtime.bank().layout().batch {
+        let terminal = jetsam_recursive::acceptance::history_step::decode_history_step_terminal(
+            runtime,
+            terminal_bytes,
+        )
+        .map_err(|error| format!("prepared HistoryStep terminal does not decode: {error}"))?;
+        let claim = jetsam_recursive::parse_history_step_batch_lanes(&lanes, terminal.proof().io())
+            .map_err(|error| format!("prepared HistoryStep terminal batch lanes: {error:?}"))?;
+        return Ok(terminal_batch_view_of_claim(&claim));
+    }
     let Some(lanes) = runtime.bank().layout().client else {
         return Ok(TerminalClientView::default());
     };
@@ -490,7 +504,25 @@ pub fn terminal_client_view_of(
             io_commitment: carried.io_commitment,
         }),
         registry_leaves: Some(claim.registry),
+        batch: None,
     })
+}
+
+/// The batch lanes of a v1.6 terminal, as the chain checks them:
+/// no carried client, the registry leaves it publishes, the batch it carries.
+pub fn terminal_batch_view_of_claim(
+    claim: &jetsam_recursive::HistoryStepBatchClaim,
+) -> jetsam_chain::consensus::client_objects::TerminalClientView {
+    use jetsam_chain::consensus::client_objects::{CarriedBatch, TerminalClientView};
+    TerminalClientView {
+        carried: None,
+        registry_leaves: Some(claim.registry.clone()),
+        batch: claim.carried.as_ref().map(|carried| CarriedBatch {
+            statements_root: carried.statements_root,
+            count: carried.count,
+            mask: carried.mask.clone(),
+        }),
+    }
 }
 
 impl ProvedBlock {

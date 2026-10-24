@@ -95,7 +95,7 @@ use jetsam_tx::wire::WireError;
 use crate::block::{validate_block_page_stream, Block};
 use crate::block_header::BlockHeader;
 use crate::consensus::fees::fee_breakdown;
-use crate::consensus::params::{MICRO_PER_JTM, V1_5_ACTIVATION_HEIGHT};
+use crate::consensus::params::{MICRO_PER_JTM, V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT};
 
 // ---------------------------------------------------------------------------
 // Consensus parameters
@@ -108,16 +108,17 @@ pub const CLIENT_REGISTRY_DEPTH: usize = 4;
 pub const CLIENT_REGISTRY_CAPACITY: usize = 1 << CLIENT_REGISTRY_DEPTH;
 
 /// The client catalogue: the matrix digests `D` the project allows to
-/// register (decision of 2026-10-04, confirmed 2026-10-07: **closed**). A
-/// registration whose `D` is not listed is refused by consensus
-/// ([`ClientObjectError::NotInCatalogue`]): the block carrying it is invalid,
-/// and a node refuses it before that ([`check_registration_payment`]: RPC,
-/// relay, restart). A snapshot whose registry holds an unlisted `D` is
-/// refused ([`SnapshotRegistryCheck`]).
+/// register (decision of 2026-10-04, confirmed 2026-10-07: **closed**), each
+/// with the exact matrix file of its `D` (its file root and length, the
+/// **pin**). A registration whose `D` is not listed
+/// is refused by consensus ([`ClientObjectError::NotInCatalogue`]): the block
+/// carrying it is invalid, and a node refuses it before that
+/// ([`check_registration_payment`]: RPC, relay, restart). A snapshot whose
+/// registry holds an unlisted `D` is refused ([`SnapshotRegistryCheck`]).
 ///
 /// One consensus constant per profile; changing it takes a new release, and
 /// is a fork (a node of an older release refuses a block registering a digest
-/// it does not list). **Append-only**: a release may add a digest, never
+/// it does not list). **Append-only**: a release may add an entry, never
 /// remove one a chain may have registered — every block and every snapshot of
 /// the chain is judged against this list.
 ///
@@ -126,10 +127,24 @@ pub const CLIENT_REGISTRY_CAPACITY: usize = 1 << CLIENT_REGISTRY_DEPTH;
 /// relation are unchanged (the relation proves the leaves its terminal
 /// publishes; the node checks they are the chain's registry).
 ///
+/// **The pin is node policy, not a consensus rule** ([`CatalogueEntry`]):
+/// consensus reads `D` alone, and a registration naming another file root or
+/// length for a listed `D` is judged exactly as before. Every node fetches,
+/// keeps and serves, for a listed `D`, the pinned file and no other, whatever
+/// a registry, a snapshot manifest or a peer names. Making the registry agree
+/// with the pin on chain (refusing such a registration) would be a consensus
+/// rule: a release of its own, at an activation height.
+///
+/// Every entry is pinned: an entry with a null root or length, a length
+/// beyond [`CLIENT_MATRIX_MAX_FILE_BYTES`] or a `D` listed twice does not
+/// compile ([`catalogue_is_pinned`]). A release that lists an entry also adds
+/// the test that recomputes its pin from the client's source (as
+/// `jetsam_recursive`'s catalogue tests do).
+///
 /// **Public network: empty.** No tool is ready at launch: no registration is
 /// possible until a release lists one.
 #[cfg(not(feature = "testnet"))]
-pub const CLIENT_CATALOGUE: &[Digest] = &[];
+pub const CLIENT_CATALOGUE: &[CatalogueEntry] = &[];
 
 /// **Test network**: the client of the registration rehearsals, so that a
 /// real registration stays repeatable on the test chain.
@@ -139,7 +154,8 @@ pub const CLIENT_CATALOGUE: &[Digest] = &[];
 ///    tool policy and budget): the structural digest of its matrix in the
 ///    canonical client form, i.e. the `matrix.bin` that `bench_prover`'s
 ///    `jetsam_client_demo` writes, registered in the M3.10 private-chain
-///    rehearsals (2026-10-02). Recomputed from this repository by
+///    private runs (2026-10-02). Its file: 9 911 119 bytes, root
+///    `9ed90bff…61259b`. Recomputed from this repository by
 ///    `jetsam_recursive`'s `the_test_network_catalogue_lists_the_example_client`.
 /// 2. `32796d82…b21464` — a **TEST entry**: the computed batch of 128
 ///    statements of entry 1 (`jetsam_client_agent_batch`, capacity 128,
@@ -147,22 +163,216 @@ pub const CLIENT_CATALOGUE: &[Digest] = &[];
 ///    digest of the 212 931 651-byte `matrix.bin` that `bench_prover`'s
 ///    `jetsam_client_batch_demo` writes, listed to rehearse a matrix file of
 ///    this size on the test network. Its capacity, leaf and IO layout are not
-///    frozen for the public network. Recomputed by `jetsam_recursive`'s
-///    ignored `the_test_network_catalogue_lists_the_batch_of_128_statements`
+///    frozen for the public network. Its file root: `1285c72a…98327f`.
+///    Recomputed by `jetsam_recursive`'s ignored
+///    `the_test_network_catalogue_lists_the_batch_of_128_statements`
+///    (production scale: `--release -- --ignored`).
+///
+/// Both pins were also measured on the files test network 3 holds (the ones
+/// its registrations at 971 and 1219 name, 2026-10-11): same root, same
+/// length, and each file is the one canonical artifact of its matrix (decoded
+/// and written again, the same bytes).
+#[cfg(feature = "testnet")]
+pub const CLIENT_CATALOGUE: &[CatalogueEntry] = &[
+    CatalogueEntry {
+        matrix_digest: [
+            0x87, 0xc1, 0xa7, 0xb0, 0xf5, 0x65, 0x27, 0x19, 0x8e, 0x46, 0xb1, 0x89, 0x97, 0xe8,
+            0xd2, 0xf5, 0x29, 0x3a, 0x2b, 0xc4, 0x1b, 0xc9, 0x10, 0x53, 0xa8, 0xa3, 0x61, 0xc3,
+            0x83, 0x97, 0x7d, 0x7f,
+        ],
+        matrix_file_root: [
+            0x9e, 0xd9, 0x0b, 0xff, 0x4b, 0xe0, 0x1d, 0xb7, 0x3d, 0x50, 0x97, 0xcb, 0x69, 0x94,
+            0x37, 0xc4, 0x52, 0x9d, 0x71, 0xbf, 0x10, 0xc5, 0x93, 0xc4, 0x1a, 0xdb, 0x23, 0xcc,
+            0x29, 0x61, 0x25, 0x9b,
+        ],
+        matrix_file_len: 9_911_119,
+    },
+    CatalogueEntry {
+        matrix_digest: [
+            0x32, 0x79, 0x6d, 0x82, 0x6b, 0x53, 0x0e, 0x03, 0xb8, 0x84, 0x42, 0x14, 0xe3, 0x40,
+            0x3a, 0x68, 0x0d, 0x8e, 0xd7, 0xb0, 0xb9, 0x2c, 0x2a, 0xdc, 0x47, 0x17, 0x6a, 0x74,
+            0xc5, 0xb2, 0x14, 0x64,
+        ],
+        matrix_file_root: [
+            0x12, 0x85, 0xc7, 0x2a, 0xf6, 0x71, 0xab, 0x53, 0x87, 0xc4, 0xe5, 0x56, 0x5d, 0xd8,
+            0xc6, 0xa9, 0x57, 0xe5, 0x1b, 0x65, 0xb4, 0xe0, 0x3b, 0xef, 0x7a, 0xb3, 0x19, 0xac,
+            0x75, 0x98, 0x32, 0x7f,
+        ],
+        matrix_file_len: 212_931_651,
+    },
+];
+
+/// The **form-Z** client catalogue (v1.6): the
+/// matrices of the hiding client form a v1.6 batch may use. A form-Z matrix
+/// is a catalogue relation renamed into the hiding form (its physical
+/// matrix, nothing on a free row or column: the registration rule), and its
+/// `D` is the structural digest of that physical matrix. One form per matrix:
+/// no `D` is in both catalogues.
+///
+/// Read only at a v1.6 height ([`ClientBatchRules::catalogue`]): a form-Z
+/// entry registers from the v1.6 height on, and every entry a carried batch
+/// uses must be one ([`check_batch_mask_form_z`]). From that height on it is
+/// the **only** catalogue a registration may name: a v1.5 entry is refused
+/// (no V1_6 slot can use it). Below it nothing changes.
+/// Append-only, pinned like [`CLIENT_CATALOGUE`].
+///
+/// **Public network: empty.**
+#[cfg(not(feature = "testnet"))]
+pub const CLIENT_CATALOGUE_Z: &[CatalogueEntry] = &[];
+
+/// **Test network**:
+///
+/// 1. `3e75f295…3d93a0` — catalogue entry 1 (`jetsam_client_agent`, the
+///    example client) in form Z: the canonical-form matrix renamed at layout
+///    `ZkFormLayout::CLIENT`. Its file: 9 921 644 bytes, root `8139fe88…3307c8`.
+///    Recomputed by `jetsam_recursive`'s
+///    `the_test_network_form_z_catalogue_lists_the_example_client`.
+/// 2. `1070676e…1772e8` — a **TEST entry**: the computed batch of 97
+///    statements of entry 1 (`jetsam_client_agent_batch`, capacity 97) in form
+///    Z, replacing for v1.6 the batch of 128, which does not fit the hiding
+///    form (4 117 805 rows against a useful capacity of 3 139 584; 97 is the
+///    largest capacity that fits: 3 122 242 rows). Its file: 163 615 237
+///    bytes, root `e0fba419…805c1e`. Recomputed by the ignored
+///    `the_test_network_form_z_catalogue_lists_the_batch_of_97_statements`
 ///    (production scale: `--release -- --ignored`).
 #[cfg(feature = "testnet")]
-pub const CLIENT_CATALOGUE: &[Digest] = &[
-    [
-        0x87, 0xc1, 0xa7, 0xb0, 0xf5, 0x65, 0x27, 0x19, 0x8e, 0x46, 0xb1, 0x89, 0x97, 0xe8, 0xd2,
-        0xf5, 0x29, 0x3a, 0x2b, 0xc4, 0x1b, 0xc9, 0x10, 0x53, 0xa8, 0xa3, 0x61, 0xc3, 0x83, 0x97,
-        0x7d, 0x7f,
-    ],
-    [
-        0x32, 0x79, 0x6d, 0x82, 0x6b, 0x53, 0x0e, 0x03, 0xb8, 0x84, 0x42, 0x14, 0xe3, 0x40, 0x3a,
-        0x68, 0x0d, 0x8e, 0xd7, 0xb0, 0xb9, 0x2c, 0x2a, 0xdc, 0x47, 0x17, 0x6a, 0x74, 0xc5, 0xb2,
-        0x14, 0x64,
-    ],
+pub const CLIENT_CATALOGUE_Z: &[CatalogueEntry] = &[
+    CatalogueEntry {
+        matrix_digest: [
+            0x3e, 0x75, 0xf2, 0x95, 0x7b, 0x3e, 0xb3, 0x9c, 0x17, 0x17, 0xd8, 0x28, 0xc4, 0x27,
+            0x0b, 0x4e, 0x61, 0x69, 0x5a, 0xda, 0x8b, 0xca, 0x05, 0x97, 0x9a, 0xb1, 0x1e, 0x73,
+            0xba, 0x3d, 0x93, 0xa0,
+        ],
+        matrix_file_root: [
+            0x81, 0x39, 0xfe, 0x88, 0x7e, 0xc4, 0x31, 0xee, 0x7c, 0x90, 0x62, 0x0a, 0xfc, 0x3c,
+            0x16, 0x63, 0xb3, 0xff, 0x1e, 0xe4, 0xfb, 0x0d, 0x93, 0xf9, 0x77, 0x11, 0x03, 0x06,
+            0x1c, 0x33, 0x07, 0xc8,
+        ],
+        matrix_file_len: 9_921_644,
+    },
+    CatalogueEntry {
+        matrix_digest: [
+            0x10, 0x70, 0x67, 0x6e, 0x3c, 0x87, 0xd2, 0xd8, 0xc0, 0x6c, 0xb7, 0x1f, 0x1c, 0xaa,
+            0x27, 0xff, 0x4c, 0x22, 0xd9, 0x0f, 0x11, 0xa7, 0x4f, 0x1e, 0x4e, 0x60, 0x2c, 0xdb,
+            0xe9, 0x17, 0x72, 0xe8,
+        ],
+        matrix_file_root: [
+            0xe0, 0xfb, 0xa4, 0x19, 0x44, 0xe0, 0xef, 0xfd, 0xd5, 0xdf, 0xb4, 0x47, 0x0a, 0x25,
+            0x4f, 0x76, 0x71, 0x63, 0x3f, 0xa7, 0x52, 0xca, 0x99, 0x57, 0x1c, 0x07, 0x27, 0x77,
+            0x06, 0x80, 0x5c, 0x1e,
+        ],
+        matrix_file_len: 163_615_237,
+    },
 ];
+
+/// Whether no `D` is listed in both `left` and `right`.
+pub const fn catalogues_are_disjoint(left: &[CatalogueEntry], right: &[CatalogueEntry]) -> bool {
+    let mut i = 0;
+    while i < left.len() {
+        let mut j = 0;
+        while j < right.len() {
+            let mut same = true;
+            let mut k = 0;
+            while k < 32 {
+                if left[i].matrix_digest[k] != right[j].matrix_digest[k] {
+                    same = false;
+                }
+                k += 1;
+            }
+            if same {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    catalogue_is_pinned(CLIENT_CATALOGUE_Z) && catalogues_are_disjoint(CLIENT_CATALOGUE, CLIENT_CATALOGUE_Z),
+    "every form-Z catalogue entry is pinned, and no D is of both forms"
+);
+
+/// One entry of the client catalogue: a matrix digest `D` and the exact file
+/// of its matrix, the **pin**.
+///
+/// The file of a `D` is unique. The matrix artifact codec admits one byte
+/// string per matrix (`FieldR1cs::write_artifact`; its reader refuses any
+/// other: a non-canonical dictionary or count, a wrong total length,
+/// trailing bytes, another version), and `D` is the structural digest of the
+/// whole matrix (its shape and both sparse matrices). So the file, its length
+/// and its root ([`matrix_file_root`], 1 MiB chunks) are functions of `D`.
+///
+/// What a pin closes: a node that synchronises from
+/// a snapshot needs the matrices of the live client lanes before the
+/// snapshot's registry can be checked, and it used to learn which file to
+/// fetch from unauthenticated snapshot manifests, so a lying provider could
+/// name decoy files and keep the honest one from being fetched. The node now
+/// knows the file of every listed `D` in advance: what a manifest names is
+/// irrelevant to what it fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CatalogueEntry {
+    /// `D`, the structural digest of the client's matrix.
+    pub matrix_digest: Digest,
+    /// Root of its matrix file ([`matrix_file_root`]).
+    pub matrix_file_root: Digest,
+    /// Exact byte length of its matrix file.
+    pub matrix_file_len: u32,
+}
+
+/// Whether every entry of `catalogue` is pinned: a non-null `D`, a non-null
+/// file root, a file length in `1..=CLIENT_MATRIX_MAX_FILE_BYTES`, and no
+/// `D` listed twice. Checked when this crate compiles, for the catalogue of
+/// each profile.
+pub const fn catalogue_is_pinned(catalogue: &[CatalogueEntry]) -> bool {
+    const fn is_null(digest: &Digest) -> bool {
+        let mut index = 0;
+        while index < digest.len() {
+            if digest[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+    const fn same(left: &Digest, right: &Digest) -> bool {
+        let mut index = 0;
+        while index < left.len() {
+            if left[index] != right[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+    let mut index = 0;
+    while index < catalogue.len() {
+        let entry = &catalogue[index];
+        if is_null(&entry.matrix_digest)
+            || is_null(&entry.matrix_file_root)
+            || entry.matrix_file_len == 0
+            || entry.matrix_file_len > CLIENT_MATRIX_MAX_FILE_BYTES
+        {
+            return false;
+        }
+        let mut earlier = 0;
+        while earlier < index {
+            if same(&catalogue[earlier].matrix_digest, &entry.matrix_digest) {
+                return false;
+            }
+            earlier += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    catalogue_is_pinned(CLIENT_CATALOGUE),
+    "every client catalogue entry pins its matrix file: a non-null D and root, a length within \
+     CLIENT_MATRIX_MAX_FILE_BYTES, each D once"
+);
 
 /// License price of one registration, in μJTM.
 ///
@@ -222,8 +432,14 @@ pub const CLIENT_SHORT_ACTIVATION_FROM: Option<u64> = None;
 ///
 /// **PROVISIONAL — change it here** (the tip of test network 3 plus a margin,
 /// right before the build).
-#[cfg(feature = "testnet")]
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-6")))]
 pub const TESTNET_SHORT_ACTIVATION_HEIGHT: u64 = 1_347;
+
+/// **Private builds only** (`rehearsal-v1-6`): the short delay
+/// from genesis, so a client registered after the private v1.6 height is
+/// carriable 20 blocks later.
+#[cfg(feature = "rehearsal-v1-6")]
+pub const TESTNET_SHORT_ACTIVATION_HEIGHT: u64 = 0;
 
 /// Activation delay of a registration from [`CLIENT_SHORT_ACTIVATION_FROM`]
 /// on (test network only): 20 blocks (one hour at 180 s).
@@ -290,8 +506,34 @@ pub const CLIENT_REGISTRATION_MARKER_TAG: [u8; 8] = *b"JTMCREG1";
 /// 8-byte tag of a submission marker owner.
 pub const CLIENT_SUBMISSION_MARKER_TAG: [u8; 8] = *b"JTMCSUB1";
 
+/// 8-byte tag of a batch submission marker owner (v1.6). Read as a marker
+/// only at a v1.6 height ([`client_object_marker_kind_at`]): below it an
+/// output whose owner happens to carry it is an ordinary output, exactly as
+/// before v1.6 existed.
+pub const CLIENT_BATCH_SUBMISSION_MARKER_TAG: [u8; 8] = *b"JTMCBAT1";
+
 const REGISTRATION_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.5/CLIENT-OBJECT/REGISTRATION";
 const SUBMISSION_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.5/CLIENT-OBJECT/SUBMISSION";
+const BATCH_SUBMISSION_COMMITMENT_DOMAIN: &[u8] =
+    b"JTM/CONSENSUS/V1.6/CLIENT-OBJECT/BATCH-SUBMISSION";
+
+/// Largest number of client proofs one batch may cover (`n` of its count
+/// lane `g^n`): the bound the native decision of a batch searches its count
+/// up to (`jetsam_recursive`'s `decide_client_batch`).
+pub const CLIENT_BATCH_MAX_CLIENTS: u32 = 1 << 16;
+
+/// The class of the batch proof a v1.6 block's batch slot verifies:
+/// `D_batch`, the structural digest of the batch-step matrix over the hiding
+/// client form (`HistoryStepClientForm::canonical_z`, m = 22, 1 843 584
+/// rows), **frozen** (`f6599908…49c89b6`, its post-commit class
+/// `2539ef57…82ead0`): recomputed from the repository by
+/// `jetsam_recursive`'s `the_chain_batch_class_is_the_form_z_class`. Dormant
+/// while [`V1_6_ACTIVATION_HEIGHT`] is unset.
+pub const CLIENT_BATCH_CLASS: Option<Digest> = Some([
+    0xf6, 0x59, 0x99, 0x08, 0x67, 0x6d, 0x7c, 0xed, 0xad, 0xb8, 0x6f, 0x51, 0xc7, 0x46,
+    0x2f, 0xc4, 0xaa, 0xeb, 0x3c, 0xfa, 0x56, 0xff, 0xf2, 0xa3, 0x6f, 0x1b, 0x1b, 0x18,
+    0xe4, 0x9c, 0x89, 0xb6,
+]);
 
 /// Node tag of the registry tree: the same `merkle::hash_pair` the
 /// HistoryStep client arm proves membership with (`jetsam_ivc_core`), so the
@@ -402,8 +644,9 @@ pub struct ClientObjectRules {
     pub dividend_blocks: u64,
     pub registry_capacity: usize,
     pub max_matrix_file_bytes: u32,
-    /// The matrix digests allowed to register ([`CLIENT_CATALOGUE`]).
-    pub catalogue: &'static [Digest],
+    /// The matrix digests allowed to register, each with its pinned file
+    /// ([`CLIENT_CATALOGUE`]).
+    pub catalogue: &'static [CatalogueEntry],
 }
 
 impl ClientObjectRules {
@@ -421,6 +664,20 @@ impl ClientObjectRules {
         max_matrix_file_bytes: CLIENT_MATRIX_MAX_FILE_BYTES,
         catalogue: CLIENT_CATALOGUE,
     };
+
+    /// Whether the catalogue lists `matrix_digest` (the consensus rule: `D`
+    /// alone).
+    pub fn lists(&self, matrix_digest: &Digest) -> bool {
+        self.pinned_file(matrix_digest).is_some()
+    }
+
+    /// The catalogue entry of `matrix_digest`: the file a node fetches,
+    /// keeps and serves for it (node policy, [`CatalogueEntry`]).
+    pub fn pinned_file(&self, matrix_digest: &Digest) -> Option<&'static CatalogueEntry> {
+        self.catalogue
+            .iter()
+            .find(|entry| entry.matrix_digest == *matrix_digest)
+    }
 
     /// Whether `height` is governed by the v1.5 client-object rules.
     pub const fn active_at(&self, height: u64) -> bool {
@@ -476,21 +733,46 @@ impl ClientObjectRules {
 /// Per-thread rule injection for this crate's unit tests only.
 #[cfg(test)]
 pub(crate) mod test_rules {
-    use super::{ClientObjectRules, Digest};
+    use super::{CatalogueEntry, ClientObjectRules};
     use std::cell::Cell;
 
     /// Every uniform non-null digest `[b; 32]`: the catalogue of the tests
     /// written for the open registry, which register such digests freely.
-    /// The catalogue's own tests narrow it.
-    pub(crate) static UNIFORM_CATALOGUE: [Digest; 255] = {
-        let mut digests = [[0u8; 32]; 255];
+    /// The catalogue's own tests narrow it. Its pins (root `[0xF0; 32]`,
+    /// 4 096 bytes) are no consensus rule: these tests register any file.
+    pub(crate) static UNIFORM_CATALOGUE: [CatalogueEntry; 255] = {
+        let mut entries = [CatalogueEntry {
+            matrix_digest: [0u8; 32],
+            matrix_file_root: [0u8; 32],
+            matrix_file_len: 0,
+        }; 255];
         let mut index = 0;
         while index < 255 {
-            digests[index] = [index as u8 + 1; 32];
+            entries[index] = CatalogueEntry {
+                matrix_digest: [index as u8 + 1; 32],
+                matrix_file_root: [0xF0; 32],
+                matrix_file_len: 4_096,
+            };
             index += 1;
         }
-        digests
+        entries
     };
+
+    /// A catalogue listing `digests`, each pinned to a file these tests do
+    /// not fetch (a pin is no consensus rule).
+    pub(crate) fn listing(digests: &[super::Digest]) -> &'static [CatalogueEntry] {
+        Box::leak(
+            digests
+                .iter()
+                .map(|digest| CatalogueEntry {
+                    matrix_digest: *digest,
+                    matrix_file_root: [0xF0; 32],
+                    matrix_file_len: 4_096,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
 
     thread_local! {
         static INSTALLED: Cell<Option<ClientObjectRules>> = const { Cell::new(None) };
@@ -512,6 +794,70 @@ pub(crate) mod test_rules {
 
     pub(super) fn installed() -> Option<ClientObjectRules> {
         INSTALLED.with(Cell::get)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.6: the batch slot
+// ---------------------------------------------------------------------------
+
+/// The rules of the v1.6 batch slot, beside [`ClientObjectRules`]:
+/// from the v1.6 height on, the client slot of a block carries **one batch
+/// proof** of [`Self::batch_class`] instead of one client proof. So:
+///
+/// - a block pays at most one [`ClientBatchSubmission`] (the batch slot holds
+///   one batch), and no v1.5 [`ClientSubmission`] any more: a v1.6 block has
+///   no client lanes to carry one;
+/// - the payment names `(class, statements root, count)`, which the block's
+///   batch lanes publish; the batch must be the carried one;
+/// - every registry entry the carried batch uses is carriable at the block's
+///   height ([`check_batch_mask_carriable`], the one activation predicate).
+///
+/// **Replays.** A batch is not de-duplicated: the same `(D, io_commitment)`
+/// may appear twice under its root and is counted twice (the circuit counts
+/// what it folds, the payment is per batch, not per client). The same batch
+/// proof cannot be carried twice: its incoming lanes are those of the
+/// parent of the block that carries it, and carrying it moves them.
+///
+/// Below the v1.6 height none of this exists: a batch marker is an ordinary
+/// output, a batch object is refused, and the v1.5 rules are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientBatchRules {
+    /// The v1.6 height ([`V1_6_ACTIVATION_HEIGHT`]).
+    pub activation_height: Option<u64>,
+    /// [`CLIENT_BATCH_CLASS`].
+    pub batch_class: Option<Digest>,
+    /// [`CLIENT_BATCH_MAX_CLIENTS`].
+    pub max_clients: u32,
+    /// [`CLIENT_CATALOGUE_Z`]: the form-Z matrices a batch may use, and the
+    /// digests that register from the v1.6 height on.
+    pub catalogue: &'static [CatalogueEntry],
+}
+
+impl ClientBatchRules {
+    /// The consensus rules of this binary.
+    pub const CONSENSUS: Self = Self {
+        activation_height: V1_6_ACTIVATION_HEIGHT,
+        batch_class: CLIENT_BATCH_CLASS,
+        max_clients: CLIENT_BATCH_MAX_CLIENTS,
+        catalogue: CLIENT_CATALOGUE_Z,
+    };
+
+    /// Whether `height` carries a batch slot.
+    pub const fn active_at(&self, height: u64) -> bool {
+        matches!(self.activation_height, Some(activation) if height >= activation)
+    }
+
+    /// The rules in force: [`Self::CONSENSUS`].
+    pub const fn current() -> Self {
+        Self::CONSENSUS
+    }
+
+    /// Whether the form-Z catalogue lists `matrix_digest`.
+    pub fn lists(&self, matrix_digest: &Digest) -> bool {
+        self.catalogue
+            .iter()
+            .any(|entry| entry.matrix_digest == *matrix_digest)
     }
 }
 
@@ -538,22 +884,40 @@ pub struct ClientSubmission {
     pub io_commitment: Digest,
 }
 
+/// Batch submission (v1.6): pay the miner who carries this batch proof in
+/// the block's batch slot ([`ClientBatchRules`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientBatchSubmission {
+    /// The class of the batch proof (`D_batch`, then `D_wrap`):
+    /// [`CLIENT_BATCH_CLASS`].
+    pub batch_class: Digest,
+    /// Root of the ordered `(D, io_commitment)` tree of the clients covered.
+    pub statements_root: Digest,
+    /// How many client proofs it covers (`n` of its count lane `g^n`).
+    pub count: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ClientObject {
     Registration(ClientRegistration),
     Submission(ClientSubmission),
+    /// v1.6 only: refused below the v1.6 height.
+    BatchSubmission(ClientBatchSubmission),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientObjectKind {
     Registration,
     Submission,
+    BatchSubmission,
 }
 
 const OBJECT_TAG_REGISTRATION: u8 = 1;
 const OBJECT_TAG_SUBMISSION: u8 = 2;
+const OBJECT_TAG_BATCH_SUBMISSION: u8 = 3;
 const REGISTRATION_PAYLOAD_BYTES: usize = 32 + 32 + 4;
 const SUBMISSION_PAYLOAD_BYTES: usize = 32 + 32;
+const BATCH_SUBMISSION_PAYLOAD_BYTES: usize = 32 + 32 + 4;
 
 /// First byte of a block's object section (after the last transaction).
 pub const CLIENT_OBJECTS_SECTION_MARKER: u8 = 0xC1;
@@ -563,6 +927,7 @@ impl ClientObject {
         match self {
             Self::Registration(_) => ClientObjectKind::Registration,
             Self::Submission(_) => ClientObjectKind::Submission,
+            Self::BatchSubmission(_) => ClientObjectKind::BatchSubmission,
         }
     }
 
@@ -576,6 +941,10 @@ impl ClientObject {
             Self::Submission(object) => {
                 buf.push(OBJECT_TAG_SUBMISSION);
                 buf.extend_from_slice(&submission_payload(object));
+            }
+            Self::BatchSubmission(object) => {
+                buf.push(OBJECT_TAG_BATCH_SUBMISSION);
+                buf.extend_from_slice(&batch_submission_payload(object));
             }
         }
     }
@@ -600,6 +969,14 @@ impl ClientObject {
                     io_commitment: digest_at(payload, 32),
                 }))
             }
+            OBJECT_TAG_BATCH_SUBMISSION => {
+                let payload = take(src, BATCH_SUBMISSION_PAYLOAD_BYTES)?;
+                Ok(Self::BatchSubmission(ClientBatchSubmission {
+                    batch_class: digest_at(payload, 0),
+                    statements_root: digest_at(payload, 32),
+                    count: u32::from_le_bytes(payload[64..68].try_into().expect("four bytes")),
+                }))
+            }
             _ => Err(WireError::BadMarker),
         }
     }
@@ -609,6 +986,7 @@ impl ClientObject {
         1 + match self {
             Self::Registration(_) => REGISTRATION_PAYLOAD_BYTES,
             Self::Submission(_) => SUBMISSION_PAYLOAD_BYTES,
+            Self::BatchSubmission(_) => BATCH_SUBMISSION_PAYLOAD_BYTES,
         }
     }
 
@@ -625,6 +1003,11 @@ impl ClientObject {
                 CLIENT_SUBMISSION_MARKER_TAG,
                 SUBMISSION_COMMITMENT_DOMAIN,
                 submission_payload(object).to_vec(),
+            ),
+            Self::BatchSubmission(object) => (
+                CLIENT_BATCH_SUBMISSION_MARKER_TAG,
+                BATCH_SUBMISSION_COMMITMENT_DOMAIN,
+                batch_submission_payload(object).to_vec(),
             ),
         };
         let commitment = poseidon2b_hash_bytes(domain, &payload);
@@ -647,6 +1030,14 @@ fn submission_payload(object: &ClientSubmission) -> [u8; SUBMISSION_PAYLOAD_BYTE
     let mut payload = [0u8; SUBMISSION_PAYLOAD_BYTES];
     payload[..32].copy_from_slice(&object.matrix_digest);
     payload[32..].copy_from_slice(&object.io_commitment);
+    payload
+}
+
+fn batch_submission_payload(object: &ClientBatchSubmission) -> [u8; BATCH_SUBMISSION_PAYLOAD_BYTES] {
+    let mut payload = [0u8; BATCH_SUBMISSION_PAYLOAD_BYTES];
+    payload[..32].copy_from_slice(&object.batch_class);
+    payload[32..64].copy_from_slice(&object.statements_root);
+    payload[64..].copy_from_slice(&object.count.to_le_bytes());
     payload
 }
 
@@ -686,6 +1077,33 @@ pub fn is_client_locked_address(owner: &Address) -> bool {
     *owner == CLIENT_LICENSE_BURN_ADDRESS
         || *owner == CLIENT_LICENSE_POOL_ADDRESS
         || client_object_marker_kind(owner).is_some()
+}
+
+/// [`client_object_marker_kind`] at `height`: from the v1.6 height on, a
+/// batch submission marker is a marker too. Below it the batch tag means
+/// nothing ([`CLIENT_BATCH_SUBMISSION_MARKER_TAG`]).
+pub fn client_object_marker_kind_at(
+    owner: &Address,
+    height: u64,
+    batch: &ClientBatchRules,
+) -> Option<ClientObjectKind> {
+    match client_object_marker_kind(owner) {
+        Some(kind) => Some(kind),
+        None if batch.active_at(height)
+            && owner.0[..8] == CLIENT_BATCH_SUBMISSION_MARKER_TAG =>
+        {
+            Some(ClientObjectKind::BatchSubmission)
+        }
+        None => None,
+    }
+}
+
+/// [`is_client_locked_address`] at `height`: from the v1.6 height on, a batch
+/// submission marker owner is locked too.
+pub fn is_client_locked_address_at(owner: &Address, height: u64, batch: &ClientBatchRules) -> bool {
+    *owner == CLIENT_LICENSE_BURN_ADDRESS
+        || *owner == CLIENT_LICENSE_POOL_ADDRESS
+        || client_object_marker_kind_at(owner, height, batch).is_some()
 }
 
 /// Root of a matrix file: the byte-hash of its 1 MiB chunk digests, in order.
@@ -1010,6 +1428,8 @@ pub struct ClientObjectsEffect {
     pub registrations: Vec<ClientRegistryEntry>,
     /// The submission the block pays, if any.
     pub submission: Option<ClientSubmission>,
+    /// The batch submission the block pays, if any (v1.6).
+    pub batch_submission: Option<ClientBatchSubmission>,
     /// Coinbase raise owed to this block's miner (`Miners` variants).
     pub license_dividend: u64,
 }
@@ -1019,6 +1439,19 @@ pub struct ClientObjectsEffect {
 pub struct CarriedClient {
     pub matrix_digest: Digest,
     pub io_commitment: Digest,
+}
+
+/// The batch a v1.6 block's HistoryStep IO carries (`batch_present = 1`):
+/// what its batch lanes publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarriedBatch {
+    /// Root of the ordered `(D, io_commitment)` tree of the clients covered.
+    pub statements_root: Digest,
+    /// `n` of the count lane `g^n`.
+    pub count: u64,
+    /// The registry entries the batch uses, in index order
+    /// ([`CLIENT_REGISTRY_CAPACITY`] of them).
+    pub mask: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1092,6 +1525,33 @@ pub enum ClientObjectError {
     ClientLanesMissing,
     /// A block below the v1.5 height whose verified terminal has client lanes.
     UnexpectedClientLanes,
+    /// A v1.5 client submission in a block at a v1.6 height: its client slot
+    /// carries a batch.
+    ClientSubmissionInBatchSlot,
+    /// A batch submission below the v1.6 height.
+    BatchSubmissionBeforeV1_6,
+    /// A batch submission while the batch class is not a consensus constant
+    /// yet ([`CLIENT_BATCH_CLASS`] unset).
+    BatchClassUnset,
+    /// A batch submission naming another class than the chain's.
+    ForeignBatchClass {
+        batch_class: Digest,
+    },
+    /// A batch covering no client, or more than the bound.
+    BatchCount {
+        count: u64,
+        max: u32,
+    },
+    /// A batch submission is paid but the block's IO does not carry that
+    /// batch.
+    BatchSubmissionNotCarried,
+    /// A carried batch uses a registry entry that is not a form-Z catalogue
+    /// entry ([`check_batch_mask_form_z`], v1.6).
+    BatchEntryNotFormZ {
+        matrix_digest: Digest,
+    },
+    /// Batch lanes in a block below the v1.6 height.
+    UnexpectedBatchLanes,
     /// The registry leaves a terminal publishes are not the chain's registry
     /// after the block (its parent's entries, then its own registrations).
     RegistryLeavesMismatch,
@@ -1148,6 +1608,11 @@ impl std::fmt::Display for ClientObjectError {
                 "NotInCatalogue {{ matrix_digest: {} }}",
                 DigestHex(matrix_digest)
             ),
+            Self::BatchEntryNotFormZ { matrix_digest } => write!(
+                f,
+                "BatchEntryNotFormZ {{ matrix_digest: {} }}",
+                DigestHex(matrix_digest)
+            ),
             Self::ClientNotRegistered { matrix_digest } => write!(
                 f,
                 "ClientNotRegistered {{ matrix_digest: {} }}",
@@ -1184,13 +1649,33 @@ impl std::fmt::Display for ClientObjectError {
 impl std::error::Error for ClientObjectError {}
 
 /// Native validation of one block's client objects against the registry of
-/// its parent, on its own branch. Pure; returns the effect to apply.
+/// its parent, on its own branch. Pure; returns the effect to apply. The
+/// v1.6 batch slot under the rules of this binary ([`ClientBatchRules`]).
 pub fn validate_block_client_objects(
     block: &Block,
     objects: &[ClientObject],
     parent: &BlockHeader,
     registry: &ClientRegistryState,
     rules: &ClientObjectRules,
+) -> Result<ClientObjectsEffect, ClientObjectError> {
+    validate_block_client_objects_with(
+        block,
+        objects,
+        parent,
+        registry,
+        rules,
+        &ClientBatchRules::current(),
+    )
+}
+
+/// [`validate_block_client_objects`] with the batch slot's rules injected.
+pub fn validate_block_client_objects_with(
+    block: &Block,
+    objects: &[ClientObject],
+    parent: &BlockHeader,
+    registry: &ClientRegistryState,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
 ) -> Result<ClientObjectsEffect, ClientObjectError> {
     let height = block.header.height;
     if !rules.active_at(height) {
@@ -1207,7 +1692,7 @@ pub fn validate_block_client_objects(
         record
             .body
             .live_outputs()
-            .any(|(_, output)| client_object_marker_kind(&output.owner).is_some())
+            .any(|(_, output)| client_object_marker_kind_at(&output.owner, height, batch).is_some())
     }) {
         return Err(ClientObjectError::MarkerInSystemRecord);
     }
@@ -1215,7 +1700,7 @@ pub fn validate_block_client_objects(
     // Spends from locked owners; then each group's marker, if any.
     let mut marked = Vec::new();
     for (group_index, group) in stream.groups.iter().enumerate() {
-        if is_client_locked_address(&group.spend.input_owner) {
+        if is_client_locked_address_at(&group.spend.input_owner, height, batch) {
             return Err(ClientObjectError::SpendFromLockedAddress {
                 owner: group.spend.input_owner,
             });
@@ -1223,7 +1708,7 @@ pub fn validate_block_client_objects(
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         let mut marker = None;
         for (_, output) in pages.iter().flat_map(|page| page.body.live_outputs()) {
-            if let Some(kind) = client_object_marker_kind(&output.owner) {
+            if let Some(kind) = client_object_marker_kind_at(&output.owner, height, batch) {
                 if output.amount != 0 {
                     return Err(ClientObjectError::MarkerCarriesValue { group: group_index });
                 }
@@ -1278,7 +1763,10 @@ pub fn validate_block_client_objects(
                         max: rules.max_matrix_file_bytes,
                     });
                 }
-                if !rules.catalogue.contains(&registration.matrix_digest) {
+                // The v1.5 catalogue below the v1.6 height; from it on, the
+                // form-Z one only: a v1.5 entry has no use at V1_6 and would
+                // spend a registry leaf.
+                if !registrable_at(&registration.matrix_digest, rules, batch, height) {
                     return Err(ClientObjectError::NotInCatalogue {
                         matrix_digest: registration.matrix_digest,
                     });
@@ -1306,6 +1794,9 @@ pub fn validate_block_client_objects(
                 });
             }
             ClientObject::Submission(submission) => {
+                if batch.active_at(height) {
+                    return Err(ClientObjectError::ClientSubmissionInBatchSlot);
+                }
                 if effect.submission.is_some() {
                     return Err(ClientObjectError::TooManySubmissions);
                 }
@@ -1325,6 +1816,39 @@ pub fn validate_block_client_objects(
                     });
                 }
                 effect.submission = Some(*submission);
+            }
+            ClientObject::BatchSubmission(submission) => {
+                if !batch.active_at(height) {
+                    return Err(ClientObjectError::BatchSubmissionBeforeV1_6);
+                }
+                if effect.batch_submission.is_some() {
+                    return Err(ClientObjectError::TooManySubmissions);
+                }
+                match batch.batch_class {
+                    None => return Err(ClientObjectError::BatchClassUnset),
+                    Some(class) if class != submission.batch_class => {
+                        return Err(ClientObjectError::ForeignBatchClass {
+                            batch_class: submission.batch_class,
+                        })
+                    }
+                    Some(_) => {}
+                }
+                check_batch_count(u64::from(submission.count), batch)?;
+                let required = fee_breakdown(
+                    u64::from(group.spend.live_inputs),
+                    u64::from(group.spend.live_outputs),
+                    parent.active_slot_count,
+                    parent.log_slots,
+                )
+                .required_total
+                .saturating_add(rules.submission_fee_micro);
+                if group.spend.fee < required {
+                    return Err(ClientObjectError::SubmissionFeeTooLow {
+                        required,
+                        paid: group.spend.fee,
+                    });
+                }
+                effect.batch_submission = Some(*submission);
             }
         }
     }
@@ -1384,6 +1908,49 @@ pub fn check_registration_payment(
     rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
     check_registration_admissible(registration, rules)?;
+    check_registration_paid(pages, registration, rules)
+}
+
+/// [`check_registration_payment`] for a registration a node holds or relays
+/// without knowing the height of the block that will carry it: the
+/// registration [`check_registration_relayable`], then its payment.
+pub fn check_registration_payment_relayable(
+    pages: &[jetsam_tx::Transaction],
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
+    check_registration_relayable(registration, rules, batch)?;
+    check_registration_paid(pages, registration, rules)
+}
+
+/// A registration a node holds or relays without the height of the block
+/// that will carry it: its shape, and its `D` listed by the v1.5
+/// catalogue or — on a build whose v1.6 clock is armed — by the form-Z one.
+/// The block judges it at its height ([`registrable_at`]).
+pub fn check_registration_relayable(
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
+    check_registration_shape(registration, rules)?;
+    if !rules.lists(&registration.matrix_digest)
+        && !(batch.activation_height.is_some() && batch.lists(&registration.matrix_digest))
+    {
+        return Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: registration.matrix_digest,
+        });
+    }
+    Ok(())
+}
+
+/// The transaction `pages` opens exactly `registration` (one zero-value
+/// marker) and pays its license.
+fn check_registration_paid(
+    pages: &[jetsam_tx::Transaction],
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
     let marker = ClientObject::Registration(*registration).marker();
     let mut markers = pages
         .iter()
@@ -1407,11 +1974,59 @@ pub fn check_registration_payment(
     )
 }
 
+/// Whether a block at `height` may register `digest`: listed by the v1.5
+/// catalogue below the v1.6 height, by the form-Z one from it on. The one
+/// rule block validation, the snapshot check
+/// and a wallet's pre-check read.
+pub fn registrable_at(
+    digest: &Digest,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+    height: u64,
+) -> bool {
+    if batch.active_at(height) {
+        batch.lists(digest)
+    } else {
+        rules.lists(digest)
+    }
+}
+
+/// [`check_registration_admissible`] for a block at `height`: `D` must
+/// be [`registrable_at`] that height.
+pub fn check_registration_admissible_at(
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+    height: u64,
+) -> Result<(), ClientObjectError> {
+    check_registration_shape(registration, rules)?;
+    if !registrable_at(&registration.matrix_digest, rules, batch, height) {
+        return Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: registration.matrix_digest,
+        });
+    }
+    Ok(())
+}
+
 /// The checks of a registration alone, before anything pays it: a non-null
 /// `D` and file root, a file length in bounds, `D` in the catalogue. A wallet
 /// runs them before building a license payment (a payment for a registration
 /// no block can carry would hold its inputs until it expires).
 pub fn check_registration_admissible(
+    registration: &ClientRegistration,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    check_registration_shape(registration, rules)?;
+    if !rules.lists(&registration.matrix_digest) {
+        return Err(ClientObjectError::NotInCatalogue {
+            matrix_digest: registration.matrix_digest,
+        });
+    }
+    Ok(())
+}
+
+/// A non-null `D` and file root, a file length in bounds.
+fn check_registration_shape(
     registration: &ClientRegistration,
     rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
@@ -1427,11 +2042,6 @@ pub fn check_registration_admissible(
         return Err(ClientObjectError::MatrixFileLength {
             len: registration.matrix_file_len,
             max: rules.max_matrix_file_bytes,
-        });
-    }
-    if !rules.catalogue.contains(&registration.matrix_digest) {
-        return Err(ClientObjectError::NotInCatalogue {
-            matrix_digest: registration.matrix_digest,
         });
     }
     Ok(())
@@ -1458,6 +2068,33 @@ pub fn pays_submission(pages: &[jetsam_tx::TxPage], submission: &ClientSubmissio
     )
 }
 
+/// Upper bound of one v1.6 batch proof on the wire: the fixed
+/// bound of the batch class's encoding (version, Link-only sidecar,
+/// commitment root, IO, field proof with shared paths), as computed by
+/// `jetsam_recursive`'s `client_batch_proof_max_wire_bytes` at the production
+/// class (m = 22) and pinned against it by its gate. The transport refuses
+/// a longer batch before reading it. **v1.6 only**: the v1.5 client bound
+/// [`CLIENT_PROOF_MAX_WIRE_BYTES`] is unchanged.
+pub const CLIENT_BATCH_PROOF_MAX_WIRE_BYTES: usize = 889_492;
+
+/// Whether the logical transaction `pages` pays the batch `submission`
+/// (v1.6): exactly one marker output among its live outputs (of any kind),
+/// of zero value, opening it.
+pub fn pays_batch_submission(pages: &[jetsam_tx::TxPage], submission: &ClientBatchSubmission) -> bool {
+    let marker = ClientObject::BatchSubmission(*submission).marker();
+    let mut markers = pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs())
+        .filter(|(_, output)| {
+            client_object_marker_kind(&output.owner).is_some()
+                || output.owner.0[..8] == CLIENT_BATCH_SUBMISSION_MARKER_TAG
+        });
+    matches!(
+        (markers.next(), markers.next()),
+        (Some((_, output)), None) if output.owner == marker && output.amount == 0
+    )
+}
+
 /// Mempool policy for one plain logical transaction (`pages`) offered for
 /// the block at `next_height`: a spend from a locked owner can never be mined,
 /// and a paying transaction (one with a marker) is mined only with its object.
@@ -1466,20 +2103,31 @@ pub fn check_plain_transaction(
     next_height: u64,
     rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
+    check_plain_transaction_with(pages, next_height, rules, &ClientBatchRules::current())
+}
+
+/// [`check_plain_transaction`] with the batch slot's rules injected: from the
+/// v1.6 height on, a batch marker is a marker too.
+pub fn check_plain_transaction_with(
+    pages: &[jetsam_tx::TxPage],
+    next_height: u64,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
     if !rules.active_at(next_height) {
         return Ok(());
     }
     if let Some(owner) = pages
         .iter()
         .map(|page| page.body.input_owner)
-        .find(is_client_locked_address)
+        .find(|owner| is_client_locked_address_at(owner, next_height, batch))
     {
         return Err(ClientObjectError::SpendFromLockedAddress { owner });
     }
     if pages
         .iter()
         .flat_map(|page| page.body.live_outputs())
-        .any(|(_, output)| client_object_marker_kind(&output.owner).is_some())
+        .any(|(_, output)| client_object_marker_kind_at(&output.owner, next_height, batch).is_some())
     {
         return Err(ClientObjectError::PaymentWithoutObject);
     }
@@ -1523,6 +2171,8 @@ pub struct TerminalClientView {
     /// empty entry), [`CLIENT_REGISTRY_CAPACITY`] of them; `None` under a
     /// generation without the client slot.
     pub registry_leaves: Option<Vec<Digest>>,
+    /// The batch the block carries (`batch_present = 1`, v1.6).
+    pub batch: Option<CarriedBatch>,
 }
 
 /// The client state a suffix's bodies leave at its tip, every block judged
@@ -1653,8 +2303,29 @@ pub fn check_terminal_client_view(
     height: u64,
     rules: &ClientObjectRules,
 ) -> Result<(), ClientObjectError> {
+    check_terminal_client_view_with(
+        view,
+        effect,
+        parent_registry,
+        height,
+        rules,
+        &ClientBatchRules::current(),
+    )
+}
+
+/// [`check_terminal_client_view`] with the batch slot's rules injected. From
+/// the v1.6 height on, a terminal carries batch lanes instead of client lanes
+/// ([`check_carried_batch`]); below it, it carries none.
+pub fn check_terminal_client_view_with(
+    view: &TerminalClientView,
+    effect: &ClientObjectsEffect,
+    parent_registry: &ClientRegistryState,
+    height: u64,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
     if !rules.active_at(height) {
-        return if view.registry_leaves.is_none() && view.carried.is_none() {
+        return if view.registry_leaves.is_none() && view.carried.is_none() && view.batch.is_none() {
             Ok(())
         } else {
             Err(ClientObjectError::UnexpectedClientLanes)
@@ -1667,7 +2338,115 @@ pub fn check_terminal_client_view(
     if *leaves != registry_leaves_after(parent_registry, effect) {
         return Err(ClientObjectError::RegistryLeavesMismatch);
     }
+    if batch.active_at(height) {
+        if view.carried.is_some() {
+            return Err(ClientObjectError::UnexpectedClientLanes);
+        }
+        return check_carried_batch(
+            effect,
+            view.batch.as_ref(),
+            leaves,
+            parent_registry,
+            height,
+            rules,
+            batch,
+        );
+    }
+    if view.batch.is_some() {
+        return Err(ClientObjectError::UnexpectedBatchLanes);
+    }
     check_carried_client(effect, view.carried, parent_registry, height, rules)
+}
+
+/// The cross-check between a v1.6 block's paid batch submission and the
+/// batch its IO carries, once the IO is parsed: a paid batch must be the
+/// carried one (class by the relation, root and count by the lanes), and a
+/// carried batch covers between one and the bound clients, every registry
+/// entry it uses carriable at this height ([`check_batch_mask_carriable`]).
+/// A carried batch without a submission is allowed: the miner carries it for
+/// free.
+pub fn check_carried_batch(
+    effect: &ClientObjectsEffect,
+    carried: Option<&CarriedBatch>,
+    leaves: &[Digest],
+    registry: &ClientRegistryState,
+    height: u64,
+    rules: &ClientObjectRules,
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
+    if let Some(submission) = effect.batch_submission {
+        match carried {
+            Some(carried)
+                if carried.statements_root == submission.statements_root
+                    && carried.count == u64::from(submission.count) => {}
+            _ => return Err(ClientObjectError::BatchSubmissionNotCarried),
+        }
+    }
+    if let Some(carried) = carried {
+        check_batch_count(carried.count, batch)?;
+        check_batch_mask_carriable(&carried.mask, leaves, registry, height, rules)?;
+        check_batch_mask_form_z(&carried.mask, leaves, batch)?;
+    }
+    Ok(())
+}
+
+/// Every registry entry a batch uses (`mask`, over the block's registry
+/// `leaves`) is a form-Z catalogue entry ([`ClientBatchRules::catalogue`],
+/// v1.6): a v1.6 batch class verifies form-Z client proofs, whose
+/// lincheck it folds stripped of the form's tautologies, which is a claim
+/// about the registered matrix only if that matrix is a form-Z matrix. An
+/// entry of the v1.5 form (registered before v1.6) is refused, carriable or
+/// not; an entry the batch does not use is asked nothing.
+pub fn check_batch_mask_form_z(
+    mask: &[bool],
+    leaves: &[Digest],
+    batch: &ClientBatchRules,
+) -> Result<(), ClientObjectError> {
+    for (used, leaf) in mask.iter().zip(leaves) {
+        if *used && !batch.lists(leaf) {
+            return Err(ClientObjectError::BatchEntryNotFormZ { matrix_digest: *leaf });
+        }
+    }
+    Ok(())
+}
+
+/// A batch covers between one and [`ClientBatchRules::max_clients`] clients.
+fn check_batch_count(count: u64, batch: &ClientBatchRules) -> Result<(), ClientObjectError> {
+    if count == 0 || count > u64::from(batch.max_clients) {
+        return Err(ClientObjectError::BatchCount {
+            count,
+            max: batch.max_clients,
+        });
+    }
+    Ok(())
+}
+
+/// Every registry entry a batch uses (`mask`, over the block's registry
+/// `leaves`) is carriable at `height`: THE activation predicate of the v1.5
+/// client slot, [`ClientRegistryState::check_carriable`] (registered, and
+/// active by [`ClientObjectRules::client_active_at`]), the entry found at the
+/// mask's index. An entry the batch does not use is asked nothing. One
+/// implementation: the native preparation of a batch in `jetsam_recursive`
+/// calls this one.
+pub fn check_batch_mask_carriable(
+    mask: &[bool],
+    leaves: &[Digest],
+    registry: &ClientRegistryState,
+    height: u64,
+    rules: &ClientObjectRules,
+) -> Result<(), ClientObjectError> {
+    for (index, (used, leaf)) in mask.iter().zip(leaves).enumerate() {
+        if !*used {
+            continue;
+        }
+        let entry = registry.check_carriable(leaf, height, rules)?;
+        if usize::from(entry.index) != index {
+            return Err(ClientObjectError::ClientNotRegistered {
+                matrix_digest: *leaf,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Authenticate the client registry a state snapshot carries (M3.8) against
@@ -1715,6 +2494,25 @@ impl<'a> SnapshotRegistryCheck<'a> {
         activation_alloc_floor: Option<u64>,
         rules: &ClientObjectRules,
     ) -> Result<Self, ClientObjectError> {
+        Self::new_with_batch(
+            registry,
+            boundary_height,
+            activation_alloc_floor,
+            rules,
+            &ClientBatchRules::current(),
+        )
+    }
+
+    /// [`Self::new`] with the v1.6 rules injected: each entry is judged by
+    /// the catalogue its registration height reads ([`registrable_at`]),
+    /// as the block that registered it was.
+    pub fn new_with_batch(
+        registry: &'a ClientRegistryState,
+        boundary_height: u64,
+        activation_alloc_floor: Option<u64>,
+        rules: &ClientObjectRules,
+        batch: &ClientBatchRules,
+    ) -> Result<Self, ClientObjectError> {
         let refuse = |reason| Err(ClientObjectError::SnapshotRegistry { reason });
         let Some(activation) = rules
             .activation_height
@@ -1752,7 +2550,7 @@ impl<'a> SnapshotRegistryCheck<'a> {
             {
                 return refuse("an entry the registration rules forbid");
             }
-            if !rules.catalogue.contains(&entry.matrix_digest) {
+            if !registrable_at(&entry.matrix_digest, rules, batch, height) {
                 return refuse("an entry outside the client catalogue");
             }
             if height < activation.max(1) || height > boundary_height {

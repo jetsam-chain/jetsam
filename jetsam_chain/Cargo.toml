@@ -8,6 +8,12 @@ license = "Apache-2.0"
 # Test-chain identity: distinct genesis, address HRP, protocol namespace,
 # ports and data directory. Never enable for a mainnet release.
 testnet = ["jetsam_poseidon2b/testnet"]
+# PRIVATE BUILDS ONLY: the test profile with
+# v1.5 armed at 36 and v1.6 at 64, the short client activation delay from
+# genesis, so a private chain on a loopback-only network crosses both in a
+# few hours. Never in a release build, never on a public network: no
+# released binary, script or pack is built with it.
+rehearsal-v1-6 = ["testnet"]
 
 [dependencies]
 tracing = { workspace = true }

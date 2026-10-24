@@ -22,6 +22,11 @@
 //! - `base-pack`: the same child proved as the base of a recursion rooted at
 //!   height 6 (both parent arms are shape-only), release pack.
 //!
+//! `G1_GENERATION=v1.3|v1.6` (default `v1.3`) names the relation of the pack
+//! in `pack` and `base-pack` (with `v1.6`: a v1.6 pack, the block
+//! with the ghost batch; the chain arm of a carried batch is prepared once,
+//! at its reception, and measured apart).
+//!
 //! `G1_CLASS=b24|b255` (default `b255`) picks the child's class; with
 //! `base-client` the registered client is measured with its pre-pass inside
 //! the block and cached on reception (`PreparedHistoryStepClient`).
@@ -57,7 +62,7 @@ use jetsam_miner::history_step_artifacts::{
 };
 use jetsam_poseidon2b::native::poseidon2b_hash_byte_slices;
 use jetsam_recursive::{
-    canonical_history_step_shape, prepare_history_step_for_pow,
+    prepare_history_step_for_pow,
     prove_built_history_step_terminal, prove_history_step, CanonicalHistoryStepClassId,
     ChainAccumulator, HistoryStepBlockInput, HistoryStepMatrixLease, HistoryStepMatrixSource,
     HistoryStepMatrixSourceError, HistoryStepPackGeneration, HistoryStepRuntime,
@@ -137,6 +142,8 @@ fn memory_line(label: &str) {
 
 struct PinnedDiskMatrixSource {
     directory: PathBuf,
+    /// The pack's relation: its classes' shapes (v1.6: m = 23 / 25).
+    generation: HistoryStepPackGeneration,
     matrix_digests: [[u8; 32]; HISTORY_STEP_CLASS_COUNT],
     leaf_digests: [[u8; 32]; HISTORY_STEP_CLASS_COUNT],
     cache: Mutex<VecDeque<(CanonicalHistoryStepClassId, Arc<CompactFieldR1cs>)>>,
@@ -178,7 +185,7 @@ impl PinnedDiskMatrixSource {
             .map_err(|error| format!("decode {}: {error}", path.display()))?;
         let matrix = CompactFieldR1cs::open(
             canonical.into_boxed_slice(),
-            canonical_history_step_shape(class),
+            jetsam_recursive::canonical_history_step_shape_in(self.generation, class),
             self.matrix_digests[class.index()],
         )
         .and_then(CompactFieldR1cs::into_startup_packed)
@@ -266,6 +273,7 @@ fn load_pack() -> Result<
     }
     let source = Arc::new(PinnedDiskMatrixSource {
         directory,
+        generation: metadata.bank().generation(),
         matrix_digests,
         leaf_digests,
         cache: Mutex::new(VecDeque::with_capacity(MATRIX_CACHE_CAPACITY)),
@@ -467,6 +475,15 @@ fn measure_production(
     Ok(())
 }
 
+/// The fixtures' relation (`G1_GENERATION`): the pack's must be the same.
+fn pack_generation_from_env() -> Result<HistoryStepPackGeneration, String> {
+    match std::env::var("G1_GENERATION").as_deref() {
+        Err(_) | Ok("v1.3") => Ok(HistoryStepPackGeneration::V1_3),
+        Ok("v1.6") => Ok(HistoryStepPackGeneration::V1_6),
+        Ok(other) => Err(format!("unknown G1_GENERATION {other}")),
+    }
+}
+
 fn run_pack(samples: usize) -> Result<(), String> {
     let (bank, parts, source) = load_pack()?;
     let runtime = HistoryStepRuntime::new(
@@ -475,8 +492,11 @@ fn run_pack(samples: usize) -> Result<(), String> {
         parts,
     )
     .map_err(|error| format!("pack runtime: {error}"))?;
-    let mut provider =
-        HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, HistoryStepPackGeneration::V1_3)?;
+    let generation = pack_generation_from_env()?;
+    if runtime.bank().generation() != generation {
+        return Err(format!("the pack is {:?}, G1_GENERATION {generation:?}", runtime.bank().generation()));
+    }
+    let mut provider = HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, generation)?;
     let parent = walk_backbone(&mut provider, Some(&runtime))?.ok_or("no parent terminal")?;
     let start = parent.accumulator().clone();
     for class in 0..2 {
@@ -505,8 +525,11 @@ fn run_base_pack(samples: usize) -> Result<(), String> {
         parts,
     )
     .map_err(|error| format!("rooted pack runtime: {error}"))?;
-    let mut provider =
-        HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, HistoryStepPackGeneration::V1_3)?;
+    let generation = pack_generation_from_env()?;
+    if runtime.bank().generation() != generation {
+        return Err(format!("the pack is {:?}, G1_GENERATION {generation:?}", runtime.bank().generation()));
+    }
+    let mut provider = HonestHistoryStepFixtureProvider::new_in(FIXTURE_SEED, generation)?;
     walk_backbone(&mut provider, None)?;
     let start = provider
         .parent_accumulator(0)

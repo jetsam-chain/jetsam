@@ -10,11 +10,18 @@
 //!   `FieldR1cs` artifact per entry, and in RAM in the shared
 //!   [`HistoryStepClientMatrixSet`] the verifier reads. A missing one is
 //!   fetched from peers: the manifest (chunk digests, checked against the
-//!   registered file root), then 1 MiB chunks (each checked against its
-//!   digest by the transport, as it arrives), from any mix of peers;
-//!   complete, the file must decode as a matrix of the client form whose
-//!   structural digest is the registered `D`. A peer that serves bytes
-//!   failing their identity is never asked again for that file.
+//!   file root), then 1 MiB chunks (each checked against its digest by the
+//!   transport, as it arrives), from any mix of peers; complete, the file
+//!   must decode as a matrix of the client form whose structural digest is
+//!   `D`. A peer that serves bytes failing their identity is never asked
+//!   again for that file.
+//! - **The file of a `D` is the catalogue's.** Callers want matrices by `D`
+//!   (the chain's registry, a snapshot candidate's, the ones a verified
+//!   terminal found missing); the file fetched, kept and served for a `D` is
+//!   the one its catalogue entry pins (`CatalogueEntry`), never one a
+//!   registry, a manifest or a peer names (a manifest provider cannot
+//!   substitute another file for it, nor keep the pinned one from being
+//!   fetched).
 //! - **Authenticated once, off the event loop.** The structural digest of a
 //!   256 MiB matrix is minutes of CPU on two cores, and every node receives a
 //!   registration at the same time: a completed file is handed back
@@ -50,7 +57,8 @@ use std::time::{Duration, Instant};
 
 use jetsam_chain::consensus::client_objects::{
     matrix_file_chunk_digest, matrix_file_root_from_chunk_digests, queue::ClientCandidate,
-    queue::ClientSubmissionQueue, ClientObject, ClientObjectRules, ClientRegistration,
+    queue::ClientSubmissionQueue, ClientBatchRules, ClientObject, ClientObjectRules,
+    ClientRegistration,
     ClientRegistryState, ClientSubmission, CLIENT_MATRIX_CHUNK_BYTES,
     CLIENT_MATRIX_MAX_FILE_BYTES,
 };
@@ -147,6 +155,9 @@ pub enum ClientObjectFetched {
     /// Every chunk of a registered matrix file arrived: to authenticate off
     /// the event loop ([`ClientObjects::authenticate_assembled`], CPU-heavy).
     MatrixAssembled(AssembledMatrixFile),
+    /// A v1.6 batch bundle, exactly the bytes of its id: to receive
+    /// ([`crate::client_batches::ClientBatches::receive`], CPU-heavy).
+    Batch(jetsam_p2p::client_object_protocol::ClientBatchId, Vec<u8>),
     /// Progress (a manifest or chunk stored), or a late or unwanted answer.
     Nothing,
     /// The peer served bytes failing their identity: penalise it.
@@ -220,6 +231,14 @@ pub struct ClientObjects {
     /// The rules a matrix file must satisfy to be fetched or kept: its `D`
     /// in the catalogue, its length within the cap (review B3).
     rules: ClientObjectRules,
+    /// The v1.6 rules: from the v1.6 height a form-Z entry registers, and
+    /// its pinned file is fetched, kept and served.
+    batch_rules: ClientBatchRules,
+    /// The form-Z matrix set (v1.6): a form-Z entry's matrix is authenticated
+    /// under the hiding form's rule and held there.
+    matrices_z: Option<Arc<HistoryStepClientMatrixSet>>,
+    /// The v1.6 batches held for the miner.
+    batches: Option<Arc<crate::client_batches::ClientBatches>>,
 }
 
 fn registration_file_name(matrix_digest: &Hash32) -> String {
@@ -418,6 +437,22 @@ impl ClientObjects {
         matrices: Arc<HistoryStepClientMatrixSet>,
         rules: &ClientObjectRules,
     ) -> Result<Self, ClientObjectsError> {
+        Self::open_with_v1_6(data_dir, form, matrices, rules, None)
+    }
+
+    /// [`Self::open`] with the node's v1.6 side: the form-Z matrix
+    /// set and the batches. Set before the matrix files on disk are listed,
+    /// so a form-Z entry's file is kept, not set aside.
+    pub fn open_with_v1_6(
+        data_dir: &Path,
+        form: &HistoryStepClientForm,
+        matrices: Arc<HistoryStepClientMatrixSet>,
+        rules: &ClientObjectRules,
+        v1_6: Option<(
+            Arc<HistoryStepClientMatrixSet>,
+            Arc<crate::client_batches::ClientBatches>,
+        )>,
+    ) -> Result<Self, ClientObjectsError> {
         let root = data_dir.join("client-objects");
         let matrix_dir = root.join("matrices");
         let proof_dir = root.join("proofs");
@@ -450,6 +485,9 @@ impl ClientObjects {
             }),
             needed: AtomicBool::new(false),
             rules: *rules,
+            batch_rules: ClientBatchRules::current(),
+            matrices_z: v1_6.as_ref().map(|(set, _)| Arc::clone(set)),
+            batches: v1_6.map(|(_, batches)| batches),
         };
         for entry in std::fs::read_dir(&objects.matrix_dir)? {
             let entry = entry?;
@@ -458,10 +496,15 @@ impl ClientObjects {
                 continue;
             };
             // A file no rule lets this node keep (its `D` outside the
-            // catalogue, a length beyond the cap) is never authenticated
-            // again: moved aside, not deleted (review B3).
+            // catalogue, or another file than the one the catalogue pins for
+            // it) is never authenticated again: moved aside, not deleted
+            // (kept for inspection).
             if !objects.matrix_file_admissible(&id) {
-                objects.set_aside(&id, &entry.path(), "its D is outside the client catalogue");
+                objects.set_aside(
+                    &id,
+                    &entry.path(),
+                    "it is not the file the client catalogue pins for a D it lists",
+                );
                 continue;
             }
             objects
@@ -512,17 +555,66 @@ impl ClientObjects {
         &self.form
     }
 
+    /// The v1.6 batches this node holds, if it has a v1.6 relation.
+    pub fn batches(&self) -> Option<&Arc<crate::client_batches::ClientBatches>> {
+        self.batches.as_ref()
+    }
+
+    /// The form-Z matrix set, if this node has a v1.6 relation.
+    pub fn matrices_z(&self) -> Option<&Arc<HistoryStepClientMatrixSet>> {
+        self.matrices_z.as_ref()
+    }
+
+    /// Whether `D` is a form-Z entry this node handles (a build whose v1.6
+    /// clock is armed, with its form-Z matrix set): its matrix is
+    /// authenticated under the hiding form's rule and held in that set.
+    fn is_form_z(&self, matrix_digest: &Hash32) -> bool {
+        self.matrices_z.is_some()
+            && self.batch_rules.activation_height.is_some()
+            && self.batch_rules.lists(matrix_digest)
+    }
+
+    /// The matrix set the matrix of `D` is held in.
+    fn set_of(&self, matrix_digest: &Hash32) -> &Arc<HistoryStepClientMatrixSet> {
+        match &self.matrices_z {
+            Some(set) if self.is_form_z(matrix_digest) => set,
+            _ => &self.matrices,
+        }
+    }
+
+    /// The file this node fetches, keeps and serves for the matrix of `D`:
+    /// the one its catalogue entry pins — the v1.5 catalogue's, or on a build
+    /// with a v1.6 relation the form-Z one's; none for a `D` neither
+    /// lists.
+    pub fn pinned_file(&self, matrix_digest: &Hash32) -> Option<MatrixFileId> {
+        let z_entry = || {
+            self.is_form_z(matrix_digest)
+                .then(|| {
+                    self.batch_rules
+                        .catalogue
+                        .iter()
+                        .find(|entry| entry.matrix_digest == *matrix_digest)
+                })
+                .flatten()
+        };
+        self.rules
+            .pinned_file(matrix_digest)
+            .or_else(z_entry)
+            .map(|entry| MatrixFileId {
+                matrix_digest: entry.matrix_digest,
+                file_root: entry.matrix_file_root,
+                file_len: entry.matrix_file_len,
+            })
+    }
+
     /// Whether the rules let this node fetch or keep the matrix file `id`:
-    /// a non-null `D` listed in the client catalogue and a non-null root, a
-    /// length within the cap of a registration (review B3: a forged snapshot
-    /// manifest had any `D`, of any length, fetched, kept and authenticated
-    /// again at every start).
+    /// exactly the file the catalogue pins for its `D` (nothing a snapshot
+    /// manifest names otherwise is fetched, kept or authenticated again at
+    /// start, and no other file of a
+    /// listed `D` takes its place). A pin is non-null and within the
+    /// cap by construction (`catalogue_is_pinned`).
     fn matrix_file_admissible(&self, id: &MatrixFileId) -> bool {
-        id.matrix_digest != [0u8; 32]
-            && id.file_root != [0u8; 32]
-            && id.file_len != 0
-            && id.file_len <= self.rules.max_matrix_file_bytes.min(CLIENT_MATRIX_MAX_FILE_BYTES)
-            && self.rules.catalogue.contains(&id.matrix_digest)
+        self.pinned_file(&id.matrix_digest) == Some(*id)
     }
 
     /// Move the matrix file `id` at `path` aside (never delete it): it is
@@ -561,17 +653,20 @@ impl ClientObjects {
     pub fn set_aside_unregistered_files(&self, registry: &ClientRegistryState) -> usize {
         let unregistered: Vec<(MatrixFileId, PathBuf)> = {
             let mut state = self.state.lock().expect("client objects lock");
-            let held: BTreeSet<MatrixFileId> = state
+            // Files on disk are the pinned files of their `D` (`open`): a
+            // `D` names its file.
+            let held: BTreeSet<Hash32> = state
                 .registrations
                 .values()
-                .map(|held| MatrixFileId::of_registration(&held.registration))
+                .map(|held| held.registration.matrix_digest)
                 .collect();
-            let canonical: BTreeSet<MatrixFileId> =
-                registry.entries().iter().map(MatrixFileId::of_entry).collect();
+            let canonical: BTreeSet<Hash32> = registry.digests().into_iter().collect();
             let unregistered: Vec<MatrixFileId> = state
                 .unauthenticated_files
                 .keys()
-                .filter(|id| !canonical.contains(id) && !held.contains(id))
+                .filter(|id| {
+                    !canonical.contains(&id.matrix_digest) && !held.contains(&id.matrix_digest)
+                })
                 .copied()
                 .collect();
             let unregistered = unregistered
@@ -610,7 +705,7 @@ impl ClientObjects {
     /// otherwise). Logged at INFO when it starts.
     pub fn note_matrices_needed(&self) -> bool {
         let state = self.state.lock().expect("client objects lock");
-        let pending = Self::pending_matrices(&state);
+        let pending = self.pending_matrices(&state);
         if pending == 0 {
             return false;
         }
@@ -627,18 +722,20 @@ impl ClientObjects {
     /// Whether a matrix is still to be fetched or authenticated (a snapshot
     /// candidate refused for want of one waits for this to end).
     pub fn awaits_matrices(&self) -> bool {
-        Self::pending_matrices(&self.state.lock().expect("client objects lock")) > 0
+        self.pending_matrices(&self.state.lock().expect("client objects lock")) > 0
     }
 
     /// Matrix files wanted and not held yet: being fetched, found on disk
-    /// and not authenticated again yet, or being authenticated.
-    fn pending_matrices(state: &State) -> usize {
+    /// and not authenticated again yet, or being authenticated. One file per
+    /// `D` (its pin): a matrix held is never fetched (so no
+    /// fetch of a held `D` exists to be counted).
+    fn pending_matrices(&self, state: &State) -> usize {
         state.fetches.len() + state.unauthenticated_files.len() + state.authenticating.len()
     }
 
     /// Back to the background once no matrix is pending.
     fn settle_needed(&self, state: &State) {
-        if Self::pending_matrices(state) == 0 {
+        if self.pending_matrices(state) == 0 {
             self.needed.store(false, Ordering::Release);
         }
     }
@@ -650,6 +747,16 @@ impl ClientObjects {
         &self,
         artifact: &mut (impl Read + Send),
     ) -> Option<AuthenticatedClientMatrix> {
+        self.open_client_matrix_in(artifact, &self.matrices)
+    }
+
+    /// [`Self::open_client_matrix`], authenticated by `set` (the form-Z set
+    /// applies the hiding form's registration rule).
+    fn open_client_matrix_in(
+        &self,
+        artifact: &mut (impl Read + Send),
+        set: &HistoryStepClientMatrixSet,
+    ) -> Option<AuthenticatedClientMatrix> {
         let matrix = on_authentication_workers(self.authentication_priority(), || {
             FieldR1cs::read_artifact_unbound(
                 artifact,
@@ -659,7 +766,7 @@ impl ClientObjects {
             .ok()
         })?;
         on_authentication_workers(self.authentication_priority(), || {
-            self.matrices.authenticate(Arc::new(matrix)).ok()
+            set.authenticate(Arc::new(matrix)).ok()
         })
     }
 
@@ -670,7 +777,7 @@ impl ClientObjects {
         id: &MatrixFileId,
         artifact: &mut (impl Read + Send),
     ) -> Result<AuthenticatedClientMatrix, ClientObjectsError> {
-        self.open_client_matrix(artifact)
+        self.open_client_matrix_in(artifact, self.set_of(&id.matrix_digest))
             .filter(|matrix| matrix.digest() == id.matrix_digest)
             .ok_or(ClientObjectsError::MatrixFile(
                 "not a matrix of the client form with this D",
@@ -751,13 +858,14 @@ impl ClientObjects {
         path: PathBuf,
     ) -> Result<(), ClientObjectsError> {
         // Every path that keeps a matrix ends here: none keeps one the rules
-        // do not allow (review B3).
+        // do not allow, nor any file of a `D` but its pin
+        // (the catalogue's).
         if !self.matrix_file_admissible(&id) {
             return Err(ClientObjectsError::MatrixFile(
-                "its D is outside the client catalogue, or its length beyond the cap",
+                "not the file the client catalogue pins for a D it lists",
             ));
         }
-        self.matrices
+        self.set_of(&id.matrix_digest)
             .insert_authenticated(matrix)
             .map_err(|_| ClientObjectsError::MatrixFile("form shape"))?;
         let mut state = self.state.lock().expect("client objects lock");
@@ -884,32 +992,27 @@ impl ClientObjects {
 
     /// Whether the matrix of `D` is held.
     pub fn holds_matrix(&self, matrix_digest: &Hash32) -> bool {
-        self.matrices.holds(matrix_digest)
+        self.set_of(matrix_digest).holds(matrix_digest)
     }
 
-    /// Fetch every registered matrix in `wanted` this node does not hold
-    /// (the chain's registry, or a snapshot candidate's), nor has on disk or
-    /// in hand awaiting authentication — only those the rules allow it to
-    /// keep (`D` in the catalogue, length within the cap), and never more
-    /// than a registry holds at once (review B3). Callers list the chain's
-    /// registry first: what does not fit waits for a later call.
-    pub fn want_matrices(&self, wanted: impl IntoIterator<Item = MatrixFileId>) {
+    /// Fetch the matrix of every `D` in `wanted` this node does not hold
+    /// (the chain's registry, a snapshot candidate's, the ones a verified
+    /// terminal found missing), nor has on disk or in hand awaiting
+    /// authentication — the file the catalogue pins for it, and only for a
+    /// `D` the catalogue lists — never more than a
+    /// registry holds at once. Callers list the chain's registry
+    /// first: what does not fit waits for a later call.
+    pub fn want_matrices(&self, wanted: impl IntoIterator<Item = Hash32>) {
         let mut state = self.state.lock().expect("client objects lock");
-        for id in wanted {
-            if !self.matrix_file_admissible(&id) {
+        for digest in wanted {
+            let Some(id) = self.pinned_file(&digest) else {
                 tracing::debug!(
-                    matrix_digest = %hex32(&id.matrix_digest),
-                    bytes = id.file_len,
-                    "client matrix not fetched: its D is outside the client catalogue, or its \
-                     length beyond the cap"
+                    matrix_digest = %hex32(&digest),
+                    "client matrix not fetched: its D is outside the client catalogue"
                 );
                 continue;
-            }
-            if !state.held_files.contains_key(&id)
-                && !state.unauthenticated_files.contains_key(&id)
-                && !state.authenticating.contains(&id)
-                && !self.matrices.holds(&id.matrix_digest)
-            {
+            };
+            if self.fetchable(&state, &id) {
                 let fetching = state.fetches.len();
                 if let std::collections::btree_map::Entry::Vacant(fetch) = state.fetches.entry(id) {
                     if fetching >= MAX_MATRIX_FETCHES {
@@ -923,12 +1026,22 @@ impl ClientObjects {
                     fetch.insert(MatrixFetch::default());
                     tracing::info!(
                         matrix_digest = %hex32(&id.matrix_digest),
+                        matrix_file_root = %hex32(&id.file_root),
                         bytes = id.file_len,
-                        "fetching registered client matrix from peers"
+                        "fetching registered client matrix from peers (its catalogue file)"
                     );
                 }
             }
         }
+    }
+
+    /// Whether the file `id` is one this node does not hold, nor has on disk
+    /// or in hand awaiting authentication.
+    fn fetchable(&self, state: &State, id: &MatrixFileId) -> bool {
+        !state.held_files.contains_key(id)
+            && !state.unauthenticated_files.contains_key(id)
+            && !state.authenticating.contains(id)
+            && !self.set_of(&id.matrix_digest).holds(&id.matrix_digest)
     }
 
     /// [`Self::want_matrices`] for exactly `wanted`: a fetch no longer
@@ -938,16 +1051,33 @@ impl ClientObjects {
     /// never judged against a new fetch of the same file (review 2, R1: an
     /// honest provider's late chunk, judged against a fetch with no manifest
     /// yet, excluded it as a liar).
-    pub fn want_only_matrices(&self, wanted: &[MatrixFileId]) {
+    ///
+    /// The order of `wanted` is the priority: only the
+    /// matrices listed first that this node may fetch keep a fetch, as many
+    /// as fit. Whoever names a `D`, its fetch is the pinned file's: a `D`
+    /// named again keeps its fetch and its progress.
+    pub fn want_only_matrices(&self, wanted: &[Hash32]) {
         {
             let mut state = self.state.lock().expect("client objects lock");
             let before = state.fetches.len();
+            let mut first: Vec<MatrixFileId> = Vec::with_capacity(MAX_MATRIX_FETCHES);
+            for digest in wanted {
+                if first.len() == MAX_MATRIX_FETCHES {
+                    break;
+                }
+                let Some(id) = self.pinned_file(digest) else {
+                    continue;
+                };
+                if !first.contains(&id) && self.fetchable(&state, &id) {
+                    first.push(id);
+                }
+            }
             let State { fetches, tokens, .. } = &mut *state;
-            fetches.retain(|id, _| wanted.contains(id));
+            fetches.retain(|id, _| first.contains(id));
             tokens.retain(|_, (_, request, _)| match request {
                 ClientObjectRequest::MatrixManifest(file)
                 | ClientObjectRequest::MatrixChunk { file, .. } => fetches.contains_key(file),
-                ClientObjectRequest::Proof(_) => true,
+                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => true,
             });
             if state.fetches.len() != before {
                 tracing::info!(
@@ -978,6 +1108,53 @@ impl ClientObjects {
             return;
         }
         state.proofs.announced(peer, announcement);
+    }
+
+    /// `peer` announced a v1.6 batch: the request to fetch it
+    /// from `peer`, unless this node has no batches, holds its submission
+    /// already, or is fetching it. One request per announcement: a batch a
+    /// peer failed to serve is asked again on its next announcement.
+    pub fn batch_request(
+        &self,
+        peer: PeerId,
+        announcement: &jetsam_p2p::client_object_protocol::ClientBatchAnnouncement,
+        tip_height: u64,
+    ) -> Option<ClientObjectFetch> {
+        let batches = self.batches.as_ref()?;
+        let id = &announcement.id;
+        // Cheap filters first: a batch held or
+        // refused here, of another class, or of a count out of bounds is
+        // not fetched.
+        if batches.holds(id)
+            || batches.was_refused(id)
+            || batches.waits_for_next_tip(id, tip_height)
+            || jetsam_chain::consensus::client_objects::CLIENT_BATCH_CLASS != Some(id.submission.batch_class)
+            || id.submission.count == 0
+            || id.submission.count > self.batch_rules.max_clients
+        {
+            return None;
+        }
+        let request = ClientObjectRequest::Batch(announcement.id);
+        let mut state = self.state.lock().expect("client objects lock");
+        // One fetch per batch, at most two batch fetches per peer in flight.
+        if state.tokens.values().any(|(_, pending, _)| *pending == request)
+            || state
+                .tokens
+                .values()
+                .filter(|(holder, pending, _)| *holder == peer && matches!(pending, ClientObjectRequest::Batch(_)))
+                .count()
+                >= 2
+        {
+            return None;
+        }
+        let token = state.next_token;
+        state.next_token = state.next_token.wrapping_add(1);
+        state.tokens.insert(token, (peer, request, Instant::now()));
+        Some(ClientObjectFetch {
+            token,
+            peer,
+            request,
+        })
     }
 
     /// `peer` disconnected.
@@ -1124,6 +1301,12 @@ impl ClientObjects {
                 state.proofs.completed(&peer, &id);
                 Ok(ClientObjectFetched::Bundle(bytes.to_vec()))
             }
+            ClientObjectRequest::Batch(id) => {
+                if !id.matches_bytes(bytes) {
+                    return Ok(ClientObjectFetched::Liar);
+                }
+                Ok(ClientObjectFetched::Batch(id, bytes.to_vec()))
+            }
             ClientObjectRequest::MatrixManifest(id) => {
                 let mut state = self.state.lock().expect("client objects lock");
                 let Some(fetch) = state.fetches.get_mut(&id) else {
@@ -1201,6 +1384,13 @@ impl ClientObjects {
         rules: &ClientObjectRules,
         next_height: u64,
     ) -> Result<ClientProofAnnouncement, ClientObjectsError> {
+        // From the v1.6 height on no block carries a v1.5 client proof (a
+        // batch takes the slot): none is received, held or announced.
+        if self.batch_rules.active_at(next_height) {
+            return Err(ClientObjectsError::Bundle(
+                "a v1.5 client proof is not carried from the v1.6 height on (submit a batch)".into(),
+            ));
+        }
         let outcome = self.admit_bundle(bytes, registry, rules, next_height);
         match &outcome {
             Ok(announcement) => tracing::info!(
@@ -1378,9 +1568,19 @@ impl ClientObjects {
         if bytes.is_empty() || bytes.len() > CLIENT_MATRIX_MAX_FILE_BYTES as usize {
             return Err(ClientObjectsError::MatrixFile("length out of bounds"));
         }
-        let matrix = self
+        let mut matrix = self
             .open_client_matrix(&mut &bytes[..])
             .ok_or(ClientObjectsError::MatrixFile("not a matrix of the client form"))?;
+        // A form-Z entry's matrix obeys the hiding form's registration rule:
+        // authenticated again by the form-Z set, which applies it.
+        if self.is_form_z(&matrix.digest()) {
+            matrix = self
+                .set_of(&matrix.digest())
+                .authenticate(Arc::clone(matrix.matrix()))
+                .map_err(|_| {
+                    ClientObjectsError::MatrixFile("a form-Z entry's matrix breaks its registration rule")
+                })?;
+        }
         let digests = matrix_chunk_digests(self.authentication_priority(), bytes);
         let registration = ClientRegistration {
             matrix_digest: matrix.digest(),
@@ -1447,10 +1647,11 @@ impl ClientObjects {
             .iter()
             .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
             .collect();
-        jetsam_chain::consensus::client_objects::check_registration_payment(
+        jetsam_chain::consensus::client_objects::check_registration_payment_relayable(
             &pages,
             &registration,
             rules,
+            &self.batch_rules,
         )
         .map_err(|error| ClientObjectsError::Registration(error.to_string()))?;
         let id = MatrixFileId::of_registration(&registration);
@@ -1579,6 +1780,8 @@ impl ClientObjects {
                         );
                     }
                 }
+                // A carried batch leaves the batch queue (`ClientBatches`).
+                ClientObject::BatchSubmission(_) => {}
             }
         }
     }
@@ -1597,6 +1800,7 @@ impl ClientObjects {
 
 fn release(state: &mut State, peer: &PeerId, request: &ClientObjectRequest, liar: bool) -> bool {
     match request {
+        ClientObjectRequest::Batch(_) => liar,
         ClientObjectRequest::Proof(id) => {
             if liar {
                 state.proofs.failed(peer, id, true)
@@ -1661,10 +1865,62 @@ impl jetsam_miner::client_slot::MinerClientSource for ClientObjects {
 
     fn on_block_committed(&self, block: &jetsam_chain::Block) {
         ClientObjects::on_block_committed(self, block);
+        if let Some(batches) = &self.batches {
+            batches.on_block_committed(block);
+        }
+    }
+
+    fn best_batch(
+        &self,
+        parent: &jetsam_chain::BlockHeader,
+        parent_terminal: Option<&[u8]>,
+        registry: &ClientRegistryState,
+        anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Option<jetsam_miner::client_slot::MinerBatch> {
+        self.batches.as_ref()?.best(parent, parent_terminal, registry, anchor_ok)
+    }
+
+    fn forget_batch(&self, submission: &jetsam_chain::consensus::client_objects::ClientBatchSubmission) {
+        if let Some(batches) = &self.batches {
+            batches.forget(submission);
+        }
     }
 }
 
 impl jetsam_rpc::client_objects::RpcClientObjects for ClientObjects {
+    fn receive_client_batch(
+        &self,
+        bundle: &[u8],
+        tip_height: u64,
+        terminal: Option<&[u8]>,
+        registry: &ClientRegistryState,
+        expected: Option<&jetsam_p2p::client_object_protocol::ClientBatchId>,
+    ) -> Result<jetsam_p2p::client_object_protocol::ClientBatchAnnouncement, String> {
+        self.batches
+            .as_ref()
+            .ok_or("this node holds no v1.6 relation: no batch is received")?
+            .receive(
+                bundle,
+                &crate::client_batches::BatchTip {
+                    height: tip_height,
+                    terminal,
+                    registry,
+                },
+                expected,
+            )
+    }
+
+    fn client_batch_parent_lanes(
+        &self,
+        tip_height: u64,
+        terminal: Option<&[u8]>,
+    ) -> Result<jetsam_recursive::ParentLanes, String> {
+        self.batches
+            .as_ref()
+            .ok_or("this node holds no v1.6 relation")?
+            .parent_lanes(tip_height, terminal)
+    }
+
     fn receive_client_proof(
         &self,
         bundle: &[u8],
@@ -1733,6 +1989,7 @@ impl ClientObjectSource for ClientObjects {
                 handle.read_exact(&mut chunk).ok()?;
                 Some(chunk)
             }
+            ClientObjectRequest::Batch(id) => self.batches.as_ref()?.bytes(id),
         }
     }
 }
