@@ -277,13 +277,14 @@ fn publish_rate(hashed: &AtomicU64, started: Instant) {
 /// `cursor` is where this worker's search resumes, and it only ever moves
 /// forward. A template that expires mid-search is fetched again and searched
 /// again; restarting from a fresh point re-hashed the range the previous pass
-/// had already covered.
+/// had already covered. Raising `new_work` ends the search like the deadline.
 fn search_nonce(
     pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
     target: &[u8; 32],
     deadline: Instant,
     cursor: &mut u128,
     pow_walk: bool,
+    new_work: &AtomicBool,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
@@ -302,7 +303,7 @@ fn search_nonce(
     let found = AtomicBool::new(false);
 
     loop {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || new_work.load(Ordering::Relaxed) {
             *cursor = chunk_start;
             publish_rate(&hashed, started);
             return None;
@@ -328,7 +329,10 @@ fn search_nonce(
             let batch = if pow_walk { WALK_BATCH } else { DIGEST_BATCH };
             let mut nonce = ts;
             while nonce < te {
-                if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                if found.load(Ordering::Relaxed)
+                    || new_work.load(Ordering::Relaxed)
+                    || Instant::now() >= deadline
+                {
                     return None;
                 }
                 let n = ((te - nonce).min(batch as u128)) as usize;
@@ -358,6 +362,48 @@ fn search_nonce(
             return solution;
         }
     }
+}
+
+/// How often a search asks the node whether its work changed.
+const WORK_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `fresh` is other work than `current`: a new tip, whose parent is part of
+/// the PoW input, or work the node renewed on the same tip.
+fn is_new_work(current: &BlockTemplateResponse, fresh: &BlockTemplateResponse) -> bool {
+    fresh.pow_fields_hex != current.pow_fields_hex
+        || fresh.difficulty_target_hex != current.difficulty_target_hex
+}
+
+/// Run `search`, asking the node every `check_every` for a template; the
+/// search is stopped as soon as one carries new work, which is returned.
+fn search_until_new_work(
+    rpc: &RpcClient,
+    coinbase: &str,
+    current: &BlockTemplateResponse,
+    check_every: Duration,
+    search: impl FnOnce(&AtomicBool) -> Option<u128> + Send,
+) -> (Option<u128>, Option<(BlockTemplateResponse, Instant)>) {
+    let new_work = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| search(&new_work));
+        let mut fresh = None;
+        let mut next_check = Instant::now() + check_every;
+        while !worker.is_finished() {
+            if Instant::now() < next_check {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            if let Ok(template) = rpc.get_template(coinbase) {
+                if is_new_work(current, &template) {
+                    fresh = Some((template, Instant::now()));
+                    new_work.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            next_check = Instant::now() + check_every;
+        }
+        (worker.join().expect("PoW search thread"), fresh)
+    })
 }
 
 fn decode_pow_fields_hex(hex_str: &str) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
@@ -451,15 +497,19 @@ fn mine(cli: &Cli) -> Result<()> {
         ((clock_entropy ^ (pid << 12)) & 0xFFFF_FFFF) << 64
     };
 
+    let mut next: Option<(BlockTemplateResponse, Instant)> = None;
     loop {
-        // Fetch template.
-        let (tmpl, template_received_at) = match rpc.get_template(&cli.coinbase) {
-            Ok(t) => (t, Instant::now()),
-            Err(e) => {
-                eprintln!("template fetch failed: {e}  — retrying in 2s");
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
+        // Fetch template, unless the search already brought back the new tip's.
+        let (tmpl, template_received_at) = match next.take() {
+            Some(fresh) => fresh,
+            None => match rpc.get_template(&cli.coinbase) {
+                Ok(t) => (t, Instant::now()),
+                Err(e) => {
+                    eprintln!("template fetch failed: {e}  — retrying in 2s");
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            },
         };
 
         // One template, several machines: each is given a region of the nonce
@@ -523,10 +573,34 @@ fn mine(cli: &Cli) -> Result<()> {
         let t0 = Instant::now();
         let deadline = template_search_deadline(template_received_at, tmpl.expires_in_seconds);
 
-        let nonce = match search_nonce(&pow_fields, &target, deadline, &mut cursor, tmpl.pow_walk) {
+        let (found, fresh) = search_until_new_work(
+            &rpc,
+            &cli.coinbase,
+            &tmpl,
+            WORK_CHECK_INTERVAL,
+            |new_work| {
+                search_nonce(
+                    &pow_fields,
+                    &target,
+                    deadline,
+                    &mut cursor,
+                    tmpl.pow_walk,
+                    new_work,
+                )
+            },
+        );
+        // The node may hold a single template per worker: the one the check
+        // fetched is the next one mined, never fetched twice.
+        next = fresh;
+        let nonce = match found {
             Some(n) => n,
             None => {
-                eprintln!("└─ EXPIRED  refreshing node-owned template");
+                match &next {
+                    Some((new, _)) => {
+                        eprintln!("└─ NEW WORK  h={}  switching template", new.height)
+                    }
+                    None => eprintln!("└─ EXPIRED  refreshing node-owned template"),
+                }
                 continue;
             }
         };
@@ -634,12 +708,149 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, Read, Write};
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
     use super::{
-        search_nonce, template_search_deadline, Block128, BlockTemplateResponse, CHUNK_SIZE,
-        NONCE_REGION_SHIFT, POW_HEADER_FIELD_COUNT,
+        search_nonce, search_until_new_work, template_search_deadline, Block128,
+        BlockTemplateResponse, RpcClient, CHUNK_SIZE, NONCE_REGION_SHIFT, POW_HEADER_FIELD_COUNT,
     };
+
+    /// A search never told of new work.
+    static NEVER: AtomicBool = AtomicBool::new(false);
+
+    const TEMPLATE_AT_7: &str = r#"{"template_id":"a7","pow_fields_hex":"07","nonce_field_index":0,
+        "difficulty_target_hex":"00","height":7,"expires_in_seconds":240,"n_txs":1,
+        "template_seq":1,"parent_id":"66","ttl_remaining_ms":240000}"#;
+    /// The same work served again, later.
+    const TEMPLATE_AT_7_AGAIN: &str = r#"{"template_id":"a7","pow_fields_hex":"07",
+        "nonce_field_index":0,"difficulty_target_hex":"00","height":7,"expires_in_seconds":240,
+        "n_txs":1,"template_seq":1,"parent_id":"66","ttl_remaining_ms":180000}"#;
+    /// New work on the same parent, once the previous work expired at the node.
+    /// A node's template ids repeat, so the id says nothing.
+    const TEMPLATE_AT_7_RENEWED: &str = r#"{"template_id":"a7","pow_fields_hex":"17",
+        "nonce_field_index":0,"difficulty_target_hex":"00","height":7,"expires_in_seconds":240,
+        "n_txs":1,"template_seq":2,"parent_id":"66","ttl_remaining_ms":240000}"#;
+    const TEMPLATE_AT_8: &str = r#"{"template_id":"a8","pow_fields_hex":"08","nonce_field_index":0,
+        "difficulty_target_hex":"00","height":8,"expires_in_seconds":240,"n_txs":1,
+        "template_seq":3,"parent_id":"77","ttl_remaining_ms":240000}"#;
+
+    /// One search thread: the stop is checked once per batch, and a debug
+    /// build on a loaded machine makes a batch on every core slow.
+    fn one_thread() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool")
+    }
+
+    /// A JSON-RPC node that answers `first` to the first request and `then`
+    /// to every later one.
+    fn fake_node(first: &'static str, then: &'static str) -> RpcClient {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let result = if served == 0 { first } else { then };
+                let reply = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        RpcClient::new(&url, None)
+    }
+
+    /// The miner kept searching a template whose parent had been replaced,
+    /// until the template expired: up to 240 s of work no block could use.
+    #[test]
+    fn a_search_switches_to_the_new_tip_instead_of_running_to_expiry() {
+        let rpc = fake_node(TEMPLATE_AT_7, TEMPLATE_AT_8);
+        let current = rpc.get_template("").unwrap();
+        assert_eq!(current.height, 7);
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let mut cursor = 0u128;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let started = Instant::now();
+
+        let (found, fresh) =
+            search_until_new_work(&rpc, "", &current, Duration::from_millis(100), |moved| {
+                one_thread().install(|| {
+                    search_nonce(&fields, &[0u8; 32], deadline, &mut cursor, false, moved)
+                })
+            });
+
+        assert_eq!(found, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the search ran {:?} on a replaced parent",
+            started.elapsed()
+        );
+        assert_eq!(fresh.expect("the new tip's template").0.height, 8);
+    }
+
+    /// With its own coinbase a worker holds the node's only template: work the
+    /// node renews on the same tip, fetched by the check, has to be the next
+    /// one mined, or the node refuses every other request until it expires.
+    #[test]
+    fn new_work_on_the_same_tip_is_taken_too() {
+        let rpc = fake_node(TEMPLATE_AT_7, TEMPLATE_AT_7_RENEWED);
+        let current = rpc.get_template("").unwrap();
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let mut cursor = 0u128;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let started = Instant::now();
+
+        let (found, fresh) =
+            search_until_new_work(&rpc, "", &current, Duration::from_millis(100), |moved| {
+                one_thread().install(|| {
+                    search_nonce(&fields, &[0u8; 32], deadline, &mut cursor, false, moved)
+                })
+            });
+
+        assert_eq!(found, None);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(fresh.expect("the renewed work").0.pow_fields_hex, "17");
+    }
+
+    /// The same work served again does not interrupt the search.
+    #[test]
+    fn the_same_work_served_again_does_not_interrupt_the_search() {
+        let rpc = fake_node(TEMPLATE_AT_7, TEMPLATE_AT_7_AGAIN);
+        let current = rpc.get_template("").unwrap();
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        let mut cursor = 0u128;
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+
+        let (found, fresh) =
+            search_until_new_work(&rpc, "", &current, Duration::from_millis(100), |moved| {
+                one_thread().install(|| {
+                    search_nonce(&fields, &[0u8; 32], deadline, &mut cursor, false, moved)
+                })
+            });
+
+        assert_eq!(found, None);
+        assert!(fresh.is_none());
+        assert!(Instant::now() >= deadline);
+    }
 
     #[test]
     fn nonce_submission_is_canonical_little_endian_hex() {
@@ -669,7 +880,14 @@ mod tests {
         let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
         let mut cursor = 4_242u128;
         assert_eq!(
-            search_nonce(&fields, &[0xff; 32], Instant::now(), &mut cursor, false),
+            search_nonce(
+                &fields,
+                &[0xff; 32],
+                Instant::now(),
+                &mut cursor,
+                false,
+                &NEVER
+            ),
             None
         );
         assert_eq!(
@@ -700,12 +918,12 @@ mod tests {
         let mut cursor = 700u128;
 
         let first = pool
-            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false))
+            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false, &NEVER))
             .expect("easy target");
         assert_eq!(first, 700);
 
         let second = pool
-            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false))
+            .install(|| search_nonce(&fields, &[0xff; 32], far, &mut cursor, false, &NEVER))
             .expect("easy target");
         assert_eq!(
             second,
@@ -727,7 +945,10 @@ mod tests {
         // production it is long warm by the time a template arrives.
         rayon::current_num_threads();
         let soon = Instant::now() + Duration::from_millis(300);
-        assert_eq!(search_nonce(&fields, &[0u8; 32], soon, &mut cursor, false), None);
+        assert_eq!(
+            search_nonce(&fields, &[0u8; 32], soon, &mut cursor, false, &NEVER),
+            None
+        );
         assert!(
             cursor > start,
             "the cursor went back to {cursor} after a pass that started at {start}"
@@ -756,7 +977,8 @@ mod tests {
             .expect("two-thread pool");
         let mut cursor = KNOWN_SOLUTION - 1;
         let deadline = Instant::now() + Duration::from_secs(3);
-        let found = pool.install(|| search_nonce(&fields, &target, deadline, &mut cursor, false));
+        let found =
+            pool.install(|| search_nonce(&fields, &target, deadline, &mut cursor, false, &NEVER));
         let returned_at = Instant::now();
 
         assert_eq!(found, Some(KNOWN_SOLUTION));
@@ -850,7 +1072,7 @@ mod tests {
         let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
         let mut cursor = 0u128;
         let far = Instant::now() + Duration::from_secs(60);
-        let nonce = search_nonce(&fields, &[0xff; 32], far, &mut cursor, true)
+        let nonce = search_nonce(&fields, &[0xff; 32], far, &mut cursor, true, &NEVER)
             .expect("any digest beats an all-ones target");
         // And the walk really is applied, not skipped: the digest it produces
         // for that nonce differs from the seed it was computed from.
