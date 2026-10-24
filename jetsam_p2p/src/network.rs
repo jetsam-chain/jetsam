@@ -1314,16 +1314,39 @@ impl AutomaticPeerState {
         }
     }
 
-    /// Ordinary neighbour connections this node selected to a peer on a
-    /// refused branch: each one holds a slot a useful neighbour needs.
+    /// Seed and neighbour connections this node selected to a peer on a
+    /// refused branch: each one holds a slot a useful peer needs.
     fn refused_neighbour_connections(&self) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
         self.managed_connections
             .iter()
-            .filter(|(_, connection)| {
-                matches!(connection.kind, ManagedOutboundKind::Peer)
-                    && self.refused_branch.contains(&connection.peer)
-            })
+            .filter(|(_, connection)| self.refused_branch.contains(&connection.peer))
             .map(|(connection_id, connection)| (*connection_id, connection.peer))
+            .collect()
+    }
+
+    fn due_bootstrap_dials(
+        &self,
+        now: Instant,
+        is_connected: impl Fn(&PeerId) -> bool,
+    ) -> Vec<(Multiaddr, Option<PeerId>)> {
+        let pending_addrs = self
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                PendingAutomaticDial::Bootstrap(addr) => Some(addr.clone()),
+                PendingAutomaticDial::Peer { .. } | PendingAutomaticDial::Lan { .. } => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        self.bootstrap
+            .iter()
+            .filter(|(addr, candidate)| {
+                candidate.next_attempt <= now
+                    && !pending_addrs.contains(*addr)
+                    && candidate.peer.is_none_or(|peer| {
+                        !is_connected(&peer) && !self.refused_branch.contains(&peer)
+                    })
+            })
+            .map(|(addr, candidate)| (addr.clone(), candidate.peer))
             .collect()
     }
 
@@ -1484,6 +1507,10 @@ impl AutomaticPeerState {
     }
 
     fn refresh_selected_identified(&mut self, peer: PeerId) {
+        if self.refused_branch.contains(&peer) && self.is_bootstrap_peer(peer) {
+            // Counted again only through a new dial, never on a connection kept through the verdict.
+            self.locally_selected_peers.remove(&peer);
+        }
         let usable = self.locally_selected_peers.contains(&peer)
             && !self.refused_branch.contains(&peer)
             && self
@@ -5442,7 +5469,11 @@ fn maintain_automatic_outbound(
             continue;
         }
         if swarm.close_connection(connection_id) {
-            tracing::debug!(peer = %peer, "released a neighbour on a refused branch");
+            if automatic.is_bootstrap_peer(peer) {
+                tracing::debug!(peer = %peer, "released a seed on a refused branch");
+            } else {
+                tracing::debug!(peer = %peer, "released a neighbour on a refused branch");
+            }
         }
     }
     let stable_non_bootstrap = automatic.stable_non_bootstrap_peer_count(now);
@@ -5532,24 +5563,7 @@ fn maintain_automatic_outbound(
                 .saturating_add(1)
                 .saturating_sub(occupied),
         );
-        let pending_addrs = automatic
-            .pending
-            .values()
-            .filter_map(|pending| match pending {
-                PendingAutomaticDial::Bootstrap(addr) => Some(addr.clone()),
-                PendingAutomaticDial::Peer { .. } | PendingAutomaticDial::Lan { .. } => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let mut due = automatic
-            .bootstrap
-            .iter()
-            .filter(|(addr, candidate)| {
-                candidate.next_attempt <= now
-                    && !pending_addrs.contains(*addr)
-                    && candidate.peer.is_none_or(|peer| !swarm.is_connected(&peer))
-            })
-            .map(|(addr, candidate)| (addr.clone(), candidate.peer))
-            .collect::<Vec<_>>();
+        let mut due = automatic.due_bootstrap_dials(now, |peer| swarm.is_connected(peer));
         due.shuffle(&mut rand::thread_rng());
         let mut occupied_groups = connected_bootstrap
             .iter()
@@ -10601,8 +10615,8 @@ mod tests {
     }
 
     /// The seed side of the same case: a configured seed proven on a refused branch
-    /// fills no bootstrap place, so another seed is dialled. Its connection is
-    /// kept: a seed is the operator's explicit choice.
+    /// fills no bootstrap place, so another seed is dialled, and this node's
+    /// connection to it is released like a neighbour's.
     #[test]
     fn a_seed_on_a_refused_branch_fills_no_bootstrap_place() {
         let mut state = AutomaticPeerState::new(PeerId::random());
@@ -10625,7 +10639,121 @@ mod tests {
         state.set_refused_branch_peers([seeds[0]]);
 
         assert_eq!(state.connected_bootstrap_peer_ids(), vec![seeds[1]]);
-        assert!(state.refused_neighbour_connections().is_empty());
+        assert_eq!(
+            state.refused_neighbour_connections(),
+            vec![(libp2p::swarm::ConnectionId::new_unchecked(420), seeds[0])]
+        );
+    }
+
+    /// Three configured seeds; this node holds bootstrap connections to the
+    /// first two, and the first one also holds an inbound connection to it.
+    fn three_seeds_two_connected() -> (
+        AutomaticPeerState,
+        Vec<(Multiaddr, PeerId)>,
+        libp2p::swarm::ConnectionId,
+    ) {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        let seeds = (0..3)
+            .map(|index| {
+                let addr: Multiaddr = format!("/ip4/203.0.113.{}/tcp/9500", index + 1)
+                    .parse()
+                    .unwrap();
+                state.register_bootstrap(addr.clone());
+                (addr, PeerId::random())
+            })
+            .collect::<Vec<_>>();
+        for (index, (addr, seed)) in seeds.iter().take(2).enumerate() {
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(430 + index);
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
+            state.note_connection_established(connection_id, *seed, true);
+            state.note_identified(connection_id, *seed);
+        }
+        let inbound = libp2p::swarm::ConnectionId::new_unchecked(439);
+        state.note_connection_established(inbound, seeds[0].1, false);
+        state.note_identified(inbound, seeds[0].1);
+        (
+            state,
+            seeds,
+            libp2p::swarm::ConnectionId::new_unchecked(430),
+        )
+    }
+
+    /// Seen on a v1.6 private test chain (2026-10-23): the bootstrap connection
+    /// to a seed proven on a refused branch was never closed.
+    #[test]
+    fn a_seed_on_a_refused_branch_has_its_bootstrap_connection_released() {
+        let (mut state, seeds, refused_connection) = three_seeds_two_connected();
+
+        state.set_refused_branch_peers([seeds[0].1]);
+
+        assert_eq!(
+            state.refused_neighbour_connections(),
+            vec![(refused_connection, seeds[0].1)]
+        );
+    }
+
+    /// Released, the seed is not dialled again while the verdict holds; once it
+    /// ends, the seed is dialled again like any other.
+    #[test]
+    fn a_seed_on_a_refused_branch_is_not_dialled_while_the_verdict_holds() {
+        let (mut state, seeds, refused_connection) = three_seeds_two_connected();
+        state.set_refused_branch_peers([seeds[0].1]);
+        state.note_connection_closed(refused_connection);
+        let later = Instant::now() + Duration::from_secs(24 * 3_600);
+        let due = |state: &AutomaticPeerState| {
+            state
+                .due_bootstrap_dials(later, |_| false)
+                .into_iter()
+                .map(|(addr, _)| addr)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!due(&state).contains(&seeds[0].0));
+        assert!(due(&state).contains(&seeds[2].0));
+
+        state.set_refused_branch_peers([]);
+        assert!(due(&state).contains(&seeds[0].0));
+    }
+
+    /// Seen on a v1.6 private test chain (2026-10-23), twice out of twice: the
+    /// second the verdict on a seed ended, the seed counted again as a connected
+    /// seed before being judged again, the node held one seed too many, and one
+    /// seed connection was released at random: once a seed on the accepted
+    /// branch. A seed counts again only through a new dial.
+    #[test]
+    fn a_seed_whose_verdict_ends_is_not_counted_again_on_a_connection_it_kept() {
+        let (mut state, seeds, refused_connection) = three_seeds_two_connected();
+        state.set_refused_branch_peers([seeds[0].1]);
+        state.note_connection_closed(refused_connection);
+        // The replacement seed this node dialled meanwhile.
+        let replacement = libp2p::swarm::ConnectionId::new_unchecked(440);
+        state.pending.insert(
+            replacement,
+            PendingAutomaticDial::Bootstrap(seeds[2].0.clone()),
+        );
+        state.note_connection_established(replacement, seeds[2].1, true);
+        state.note_identified(replacement, seeds[2].1);
+        let mut connected = state.connected_bootstrap_peer_ids();
+        connected.sort_unstable_by_key(|peer| peer.to_bytes());
+        let mut expected = vec![seeds[1].1, seeds[2].1];
+        expected.sort_unstable_by_key(|peer| peer.to_bytes());
+        assert_eq!(connected, expected);
+
+        state.set_refused_branch_peers([]);
+
+        let mut connected = state.connected_bootstrap_peer_ids();
+        connected.sort_unstable_by_key(|peer| peer.to_bytes());
+        assert_eq!(
+            connected, expected,
+            "the seed is counted again before any new dial"
+        );
+        assert!(
+            connected.len() <= desired_bootstrap_connections(false, 0, state.bootstrap.len()),
+            "a seed too many sends one seed connection, picked at random, to be released"
+        );
     }
 
     #[test]
