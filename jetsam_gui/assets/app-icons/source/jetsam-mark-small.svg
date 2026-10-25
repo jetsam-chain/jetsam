@@ -1,9 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Jetsam mark, small-size cut">
   <rect width="96" height="96" rx="21" fill="#04101b"/>
-  <path d="M8 72H88" stroke="#3fe3c5" stroke-width="6" fill="none"/>
-  <path d="M63 13 63 48 33 48Z" fill="#3fe3c5"/>
-  <path d="M62 57 59.5 72" stroke="#3fe3c5" stroke-width="5.5" fill="none"/>
-  <path d="M28 48.5 Q60.5 44 88 48.5 Q80 57.5 57 59.5 Q37 57.5 28 48.5Z" fill="#e9f3f2"/>
-  <rect x="15" y="60.7" width="11.3" height="11.3" fill="#e9f3f2" opacity=".85"/>
-  <rect x="4" y="64.2" width="7.8" height="7.8" fill="#e9f3f2" opacity=".45"/>
+  <g transform="translate(-96.73 14.68) scale(0.13693)">
+<path fill="#3fe3c5" transform="translate(-34 0)" d="M1036 100C965.56 188.73 905.55 291.32 871 399H1036Z"/>
+<path fill="#3fe3c5" d="M1062 6V399H1276.5C1290.09 242.11 1217.61 75.85 1062 6Z"/>
+<path d="M855 470H1259" stroke="#3fe3c5" stroke-width="36" fill="none" stroke-linecap="round"/>
+  </g>
 </svg>
