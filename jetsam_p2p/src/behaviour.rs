@@ -74,6 +74,9 @@ pub struct NodeBehaviour {
     /// use the unreserved pool.
     pub connection_limits: connection_limits::Behaviour,
 
+    /// Denies every outbound dial to a seed proven on a refused branch.
+    pub refused_seed_dials: RefusedSeedDials,
+
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
@@ -603,6 +606,7 @@ impl NodeBehaviour {
 
         Ok(Self {
             connection_limits,
+            refused_seed_dials: RefusedSeedDials::default(),
             gossipsub,
             network_profile_sync,
             object_sync,
@@ -624,5 +628,77 @@ impl NodeBehaviour {
             mempool_sync,
             client_object_sync,
         })
+    }
+}
+
+/// Seeds proven on a refused branch: no behaviour dials them; their own connections are left alone.
+#[derive(Default)]
+pub struct RefusedSeedDials {
+    peers: HashSet<libp2p::PeerId>,
+}
+
+impl RefusedSeedDials {
+    pub fn set(&mut self, peers: HashSet<libp2p::PeerId>) {
+        self.peers = peers;
+    }
+}
+
+impl NetworkBehaviour for RefusedSeedDials {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: libp2p::PeerId,
+        _: &libp2p::Multiaddr,
+        _: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        peer: Option<libp2p::PeerId>,
+        _: &[libp2p::Multiaddr],
+        _: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        match peer {
+            Some(peer) if self.peers.contains(&peer) => Err(libp2p::swarm::ConnectionDenied::new(
+                std::io::Error::other("seed on a refused branch"),
+            )),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: libp2p::PeerId,
+        _: &libp2p::Multiaddr,
+        _: libp2p::core::Endpoint,
+        _: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, _: libp2p::swarm::FromSwarm) {}
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: libp2p::PeerId,
+        _: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        std::task::Poll::Pending
     }
 }

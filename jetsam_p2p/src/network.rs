@@ -5462,6 +5462,14 @@ fn maintain_automatic_outbound(
         // starting replacement dials on the next two-second maintenance tick.
         return;
     }
+    // Kademlia would dial a released seed again, from its own table or another peer's answer.
+    swarm.behaviour_mut().refused_seed_dials.set(
+        automatic
+            .bootstrap_peer_ids()
+            .intersection(&automatic.refused_branch)
+            .copied()
+            .collect(),
+    );
     // Already out of every count below; closing frees the transport slot.
     // An active relay carrier stays, as in every other release.
     for (connection_id, peer) in automatic.refused_neighbour_connections() {
