@@ -584,6 +584,92 @@ const _: () = assert!(
     "the rehearsal v1.6 height sits above the rehearsal v1.5 height, on an epoch boundary"
 );
 
+/// First block height governed by the v1.7 rules: every block carries the
+/// destination section (0xC2), even empty, after its client-object section;
+/// below it a block carries none.
+///
+/// **`None` keeps every v1.7 rule dormant** on both public profiles: a binary
+/// validates, relays and announces byte for byte what v1.6.0 does until it,
+/// and for ever while this constant is `None`.
+///
+/// # What it switches
+///
+/// The block wire (the 0xC2 section, outside [`crate::consensus::wire_limits::MAX_BLOCK_BYTES`],
+/// under its own budget `wire_limits::MAX_DESTINATION_SECTION_BYTES`) and the
+/// rules that read it. It moves neither the header, the proof relation, the
+/// difficulty rule, the block interval nor the development schedule.
+///
+/// # Constraints
+///
+/// Armed only after v1.6 ([`V1_6_ACTIVATION_HEIGHT`] armed, and strictly
+/// below it), on a multiple of 960. Checked at compile time by
+/// [`v1_7_schedule_is_valid`].
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// `wire_limits::tests::arming_v1_7_takes_two_deliberate_edits` fails the moment
+/// this value disagrees with the declaration beside it.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// The test chain's v1.7 height: none until it is decided with the operator
+/// against the tip of the day. Declared per profile, like
+/// [`V1_6_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// **Private builds only** (`rehearsal-v1-7`): v1.7 armed at
+/// [`REHEARSAL_V1_7_ACTIVATION`], above the private v1.6 height. The public
+/// network's constant above is not affected by it.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_7_ACTIVATION);
+
+/// The v1.7 height of a private build (`rehearsal-v1-7`): above the private
+/// v1.6 height, on a 32-block transaction epoch boundary.
+pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
+
+/// Whether one candidate block height is governed by the v1.7 rules.
+#[inline]
+pub const fn v1_7_active(height: u64) -> bool {
+    v1_7_active_with(height, V1_7_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_7_active`] with the activation height injected.
+///
+/// Public so that the transport caps of another crate can be tested across
+/// the boundary while the real schedule stays dormant; it grants nothing: what
+/// a node accepts is decided by [`V1_7_ACTIVATION_HEIGHT`].
+#[inline]
+pub const fn v1_7_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// Whether a v1.7 height may sit beside a v1.6 height: dormant, or armed
+/// strictly after an armed v1.6, on a multiple of 960.
+pub const fn v1_7_schedule_is_valid(
+    v1_6_activation: Option<u64>,
+    v1_7_activation: Option<u64>,
+) -> bool {
+    match (v1_6_activation, v1_7_activation) {
+        (_, None) => true,
+        (Some(v1_6), Some(v1_7)) => v1_7 > v1_6 && v1_7.is_multiple_of(960),
+        (None, Some(_)) => false,
+    }
+}
+
+#[cfg(not(feature = "rehearsal-v1-7"))]
+const _: () = assert!(
+    v1_7_schedule_is_valid(V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT),
+    "V1_7_ACTIVATION_HEIGHT must be None, or a multiple of 960 strictly above an armed V1_6_ACTIVATION_HEIGHT"
+);
+
+#[cfg(feature = "rehearsal-v1-7")]
+const _: () = assert!(
+    REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION
+        && REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS),
+    "the rehearsal v1.7 height sits above the rehearsal v1.6 height, on an epoch boundary"
+);
+
 /// The ASERT anchor target the first post-v1.4 block carries, verbatim.
 ///
 /// # Why a constant is needed at all
@@ -2330,6 +2416,67 @@ mod tests {
             V1_5_ACTIVATION_HEIGHT,
             V1_6_ACTIVATION_HEIGHT
         ));
+    }
+
+    /// The v1.7 clock counts from its own height, and a dormant clock governs
+    /// no height at all.
+    #[test]
+    fn the_v1_7_clock_counts_from_its_own_height() {
+        assert!(!v1_7_active_with(69_119, Some(69_120)));
+        assert!(v1_7_active_with(69_120, Some(69_120)));
+        assert!(v1_7_active_with(69_121, Some(69_120)));
+        assert!(v1_7_active_with(u64::MAX, Some(69_120)));
+        for height in [0, 1, 46_080, 69_120, 700_800, u64::MAX] {
+            assert!(!v1_7_active_with(height, None));
+        }
+        // Production reads the profile's clock and nothing else.
+        for height in [0, 1, 960, 46_080, 69_120, u64::MAX] {
+            assert_eq!(
+                v1_7_active(height),
+                v1_7_active_with(height, V1_7_ACTIVATION_HEIGHT)
+            );
+        }
+    }
+
+    /// v1.7 comes after an armed v1.6, strictly, on a multiple of 960;
+    /// dormant is always allowed.
+    #[test]
+    fn v1_7_schedule_is_valid_multiple_of_960() {
+        for v1_6 in [None, Some(4_800), Some(46_080)] {
+            assert!(v1_7_schedule_is_valid(v1_6, None));
+        }
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(69_120)));
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(84_480)));
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(47_040)));
+        // Not after v1.6: before it, at it, or with v1.6 dormant.
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(45_120)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(46_080)));
+        assert!(!v1_7_schedule_is_valid(None, Some(69_120)));
+        // Off the 960 cadence, including a multiple of 480 only.
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_600)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_121)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(0)));
+        // The schedule this build carries (a private build has its own rule,
+        // checked at compile time beside its height).
+        #[cfg(not(feature = "rehearsal-v1-7"))]
+        assert!(v1_7_schedule_is_valid(
+            V1_6_ACTIVATION_HEIGHT,
+            V1_7_ACTIVATION_HEIGHT
+        ));
+    }
+
+    /// The public network and the test chain carry no v1.7 height until it
+    /// is armed with the operator; only a private build arms it.
+    #[test]
+    fn v1_7_is_dormant_outside_a_private_build() {
+        #[cfg(not(feature = "rehearsal-v1-7"))]
+        assert_eq!(V1_7_ACTIVATION_HEIGHT, None);
+        #[cfg(feature = "rehearsal-v1-7")]
+        {
+            assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(REHEARSAL_V1_7_ACTIVATION));
+            assert!(REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION);
+            assert!(REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS));
+        }
     }
 
     /// v1.6 is the fourth relation. It is chosen by its own clock, at the

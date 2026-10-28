@@ -444,6 +444,51 @@ mod tests {
         }
     }
 
+    /// The public network's v1.7 height: none until it is decided with the
+    /// operator against the tip of the day (`arm.sh --clock v1.7`).
+    #[cfg(not(feature = "testnet"))]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// The test chain's v1.7 height: none until it is decided with the
+    /// operator.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+
+    /// A private build's v1.7 height (`rehearsal-v1-7`, never a release).
+    #[cfg(feature = "rehearsal-v1-7")]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> =
+        Some(crate::consensus::params::REHEARSAL_V1_7_ACTIVATION);
+
+    /// The same two-edit rule, for the sixth clock.
+    ///
+    /// Crossing it makes the destination section (0xC2) mandatory in every
+    /// block: an unannounced height is a fork on the first block after it.
+    #[test]
+    fn arming_v1_7_takes_two_deliberate_edits() {
+        assert_eq!(
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+            DECLARED_V1_7_ACTIVATION_HEIGHT,
+            "arming v1.7 is decided with the network operator: change this \
+             declaration and params::V1_7_ACTIVATION_HEIGHT in one commit, or neither"
+        );
+    }
+
+    /// Hanging v1.7 off an earlier clock would arm it retroactively.
+    #[test]
+    fn the_v1_7_clock_is_not_one_of_the_earlier_clocks() {
+        use crate::consensus::params::{
+            V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT,
+            V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT,
+        };
+        if V1_7_ACTIVATION_HEIGHT.is_some() {
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_2_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT);
+        }
+    }
+
     /// The same two-edit rule as the v1.2 guard above, for the second clock.
     #[test]
     fn arming_v1_3_takes_two_deliberate_edits() {

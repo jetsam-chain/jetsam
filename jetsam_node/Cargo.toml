@@ -12,6 +12,7 @@ testnet = ["jetsam_chain/testnet"]
 # PRIVATE BUILDS ONLY: see the feature of the
 # same name in jetsam_chain. Never a release build.
 rehearsal-v1-6 = ["testnet", "jetsam_chain/rehearsal-v1-6"]
+rehearsal-v1-7 = ["rehearsal-v1-6", "jetsam_chain/rehearsal-v1-7"]
 
 # --- Daemon ---
 [[bin]]
