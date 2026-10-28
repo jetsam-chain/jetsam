@@ -79,3 +79,10 @@ codegen-units = 1
 # See third_party/libmdbx-0.6.6-mingw/PATCH.md. No effect on other targets.
 [patch.crates-io]
 libmdbx = { path = "third_party/libmdbx-0.6.6-mingw" }
+# GHSA-gc42-3jg7-rxr2 (CVE-2026-33040) / GHSA-xqmp-fxgv-xvq5 (CVE-2026-34219):
+# an unbounded remote-supplied PRUNE backoff duration overflows Instant
+# arithmetic, first at insertion and again on a later heartbeat, panicking
+# the node on a single malicious gossipsub message. Fixed upstream in
+# libp2p-gossipsub 0.49.3/0.49.4; this vendors 0.48.0 (our resolved version)
+# with the same clamp applied locally. See third_party/libp2p-gossipsub-0.48.0/PATCH.md.
+libp2p-gossipsub = { path = "third_party/libp2p-gossipsub-0.48.0" }
