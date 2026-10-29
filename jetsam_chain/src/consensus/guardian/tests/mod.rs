@@ -26,6 +26,7 @@ use crate::consensus::pow::block_id;
 mod attestation;
 mod constants;
 mod equivocation;
+mod reward;
 mod stake;
 
 /// A fixture of `guardian/testdata/`.
@@ -78,6 +79,9 @@ pub(crate) fn rules() -> GuardianRules {
         unbonding: 960,
         stake_vault: STAKE_VAULT,
         reward_pool: REWARD_POOL,
+        network_fund: crate::consensus::development_allocation::NETWORK_FUND_ADDRESS,
+        lab_fund: crate::consensus::development_allocation::LAB_FUND_ADDRESS,
+        guardian_reward_owner: GUARDIAN_REWARD_OWNER,
     }
 }
 

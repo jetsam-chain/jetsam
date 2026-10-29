@@ -35,6 +35,7 @@ use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MICRO_PER_JTM, V1_7_ACT
 pub mod attestation;
 pub mod block;
 pub mod equivocation;
+pub mod reward;
 pub mod stake;
 pub mod state;
 pub mod statement;
@@ -51,6 +52,10 @@ pub use block::{
 pub use equivocation::{
     anchor_leaf_hash, apply_equivocation, check_equivocation, compute_anchor_root,
     EquivocationWitness, GuardianEquivocation, EQUIVOCATION_E1_BYTES, LEAF_WITNESS_BYTES,
+};
+pub use reward::{
+    apply_period_boundary, apply_reward_claim, apply_reward_fund, delegation_height_reached,
+    RewardAccount, RewardClaim, RewardFund, CLAIM_BODY_BYTES, FUND_BODY_BYTES,
 };
 pub use stake::{
     apply_payout, apply_stake_lock, apply_stake_unlock, delegation_active, GuardianPayout,
@@ -417,6 +422,10 @@ pub struct GuardianRules {
     pub unbonding: u64,
     pub stake_vault: Address,
     pub reward_pool: Address,
+    /// The two development funds (the only funders of the reward pool).
+    pub network_fund: Address,
+    pub lab_fund: Address,
+    pub guardian_reward_owner: Address,
 }
 
 impl GuardianRules {
@@ -432,6 +441,9 @@ impl GuardianRules {
             unbonding: UNBONDING_DELAY_BLOCKS,
             stake_vault: STAKE_VAULT,
             reward_pool: REWARD_POOL,
+            network_fund: NETWORK_FUND_ADDRESS,
+            lab_fund: crate::consensus::development_allocation::LAB_FUND_ADDRESS,
+            guardian_reward_owner: GUARDIAN_REWARD_OWNER,
         }
     }
 

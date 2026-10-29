@@ -15,6 +15,9 @@ use jetsam_poseidon2b::primitives::Address;
 
 use super::attestation::{check_attestation, GuardianAttestation};
 use super::equivocation::{apply_equivocation, check_equivocation, GuardianEquivocation};
+use super::reward::{
+    apply_period_boundary, apply_reward_claim, apply_reward_fund, RewardClaim, RewardFund,
+};
 use super::stake::{
     apply_payout, apply_stake_lock, apply_stake_unlock, check_pool_gate, GuardianPayout, StakeLock,
     StakeUnlock,
@@ -178,12 +181,17 @@ pub enum GuardianError {
     PayoutOutputsMismatch,
     /// Y-6.
     PayoutFeeTooHigh,
+    /// F-2: not paid by one of the two development funds, as itself.
+    FundingNotFromDevFund,
+    /// F-3: not exactly one output to the reward pool, of the funded amount.
+    FundAmountMismatch,
+    /// F-4: before the latch, a block funds the pool without both funds.
+    FundingBeforeLatch,
+    /// C-2: more than the balance (or the vested guardian balance).
+    ClaimExceedsEntitlement,
     /// This node cannot read its own branch at `height` (a local fault, not
     /// a property of the block).
     BranchUnavailable { height: u64 },
-    /// An object kind whose rules are not built yet in this line (T3.3-T3.5):
-    /// refused.
-    GuardianObjectNotYetValid { kind: GuardianObjectKind },
 }
 
 impl GuardianError {
@@ -408,6 +416,11 @@ pub fn apply_block_guardian(
         check_pool_gate(group, kind, rules)?;
     }
     let mut next = state.clone();
+    if ctx.height.is_multiple_of(rules.period) {
+        apply_period_boundary(&mut next, ctx.height, rules);
+    }
+    let latched_before = next.activated_at.is_some();
+    let (mut network_funded, mut lab_funded, mut funded) = (false, false, false);
     for (group_index, object) in &ctx.objects {
         let group = &ctx.groups[*group_index];
         match object.kind {
@@ -434,8 +447,25 @@ pub fn apply_block_guardian(
                 let payout = GuardianPayout::decode(&object.body)?;
                 apply_payout(&mut next, ctx.height, group, &payout, rules)?;
             }
-            kind => return Err(GuardianError::GuardianObjectNotYetValid { kind }),
+            GuardianObjectKind::RewardFund => {
+                let fund = RewardFund::decode(&object.body)?;
+                apply_reward_fund(&mut next, ctx.height, group, &fund, rules)?;
+                funded = true;
+                network_funded |= fund.funder == rules.network_fund;
+                lab_funded |= fund.funder == rules.lab_fund;
+            }
+            GuardianObjectKind::RewardClaim => {
+                let claim = RewardClaim::decode(&object.body)?;
+                apply_reward_claim(&mut next, ctx.height, group, &claim, rules)?;
+            }
         }
+    }
+    // F-4, then the latch (effective from the next block).
+    if !latched_before && funded {
+        if !(network_funded && lab_funded) {
+            return Err(GuardianError::FundingBeforeLatch);
+        }
+        next.activated_at = Some(ctx.height);
     }
     Ok(next)
 }
