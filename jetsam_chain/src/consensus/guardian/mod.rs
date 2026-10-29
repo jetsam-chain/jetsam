@@ -35,6 +35,7 @@ use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MICRO_PER_JTM, V1_7_ACT
 pub mod attestation;
 pub mod block;
 pub mod equivocation;
+pub mod persist;
 pub mod reward;
 pub mod stake;
 pub mod state;
@@ -52,6 +53,10 @@ pub use block::{
 pub use equivocation::{
     anchor_leaf_hash, apply_equivocation, check_equivocation, compute_anchor_root,
     EquivocationWitness, GuardianEquivocation, EQUIVOCATION_E1_BYTES, LEAF_WITNESS_BYTES,
+};
+pub use persist::{
+    decode_guardian_journal, encode_guardian_journal, GuardianJournalEntry, GuardianUndo,
+    GUARDIAN_JOURNAL_MAGIC, GUARDIAN_STATE_VERSION, MAX_GUARDIAN_JOURNAL_FILE_BYTES,
 };
 pub use reward::{
     apply_period_boundary, apply_reward_claim, apply_reward_fund, delegation_height_reached,

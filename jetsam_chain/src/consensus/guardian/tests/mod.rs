@@ -26,6 +26,7 @@ use crate::consensus::pow::block_id;
 mod attestation;
 mod constants;
 mod equivocation;
+mod persistence;
 mod reward;
 mod stake;
 
