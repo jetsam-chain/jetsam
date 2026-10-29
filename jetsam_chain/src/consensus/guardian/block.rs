@@ -15,6 +15,10 @@ use jetsam_poseidon2b::primitives::Address;
 
 use super::attestation::{check_attestation, GuardianAttestation};
 use super::equivocation::{apply_equivocation, check_equivocation, GuardianEquivocation};
+use super::stake::{
+    apply_payout, apply_stake_lock, apply_stake_unlock, check_pool_gate, GuardianPayout, StakeLock,
+    StakeUnlock,
+};
 use super::{
     guardian_marker_kind, GuardianObjectKind, GuardianRules, GuardianState,
     MAX_ATTESTATIONS_PER_BLOCK, MAX_DELEGATION_OBJECTS_PER_BLOCK, MAX_EQUIVOCATIONS_PER_BLOCK,
@@ -145,6 +149,35 @@ pub enum GuardianError {
     NotAnEquivocation,
     /// Q-8: an anchor-leaf witness does not open its statement's anchor root.
     InvalidWitness,
+    /// S-1, Y-1 (and later F-1, C-1): delegation is not active.
+    DelegationDormant,
+    /// S-2 (and C-2): the group is not the object owner's own.
+    GuardianObjectOwnerMismatch,
+    /// S-3: not exactly one output to the stake vault, of the locked amount.
+    StakeAmountMismatch,
+    /// An amount below its minimum (S-3, S-5, F-3, C-3).
+    BelowMinimum,
+    /// S-4.
+    StakeRegistryFull,
+    /// S-5.
+    UnlockExceedsStake,
+    /// P-1: an output to a pool outside that pool's object (`None`: a
+    /// system record).
+    OutputToGuardianPoolOutsideObject { group: Option<usize> },
+    /// P-2.
+    SpendFromGuardianPoolWithoutPayout { group: usize },
+    /// P-3 / Y-7.
+    PayoutSpendsPreV1_7Slot,
+    /// Y-2: no such unpaid entry.
+    UnknownPayoutEntry,
+    /// Y-3.
+    PayoutNotDue,
+    /// Y-4.
+    PayoutFromWrongPool,
+    /// Y-5.
+    PayoutOutputsMismatch,
+    /// Y-6.
+    PayoutFeeTooHigh,
     /// This node cannot read its own branch at `height` (a local fault, not
     /// a property of the block).
     BranchUnavailable { height: u64 },
@@ -195,6 +228,8 @@ pub struct GuardianGroupFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockGuardianContext {
     pub height: u64,
+    /// Live outputs of the system records (coinbase, development payouts).
+    pub system_outputs: Vec<(Address, u64)>,
     pub groups: Vec<GuardianGroupFacts>,
     pub objects: Vec<(usize, GuardianObject)>,
 }
@@ -300,6 +335,10 @@ pub fn guardian_context(
     }
     Ok(Some(BlockGuardianContext {
         height,
+        system_outputs: system
+            .iter()
+            .flat_map(|record| record.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+            .collect(),
         groups,
         objects: marked
             .iter()
@@ -352,8 +391,25 @@ pub fn apply_block_guardian(
             return Err(GuardianError::TooManyGuardianObjects { kind });
         }
     }
+    // P-1 for system records, then P-1 and P-2 for every group.
+    if ctx
+        .system_outputs
+        .iter()
+        .any(|(owner, _)| *owner == rules.stake_vault || *owner == rules.reward_pool)
+    {
+        return Err(GuardianError::OutputToGuardianPoolOutsideObject { group: None });
+    }
+    for (index, group) in ctx.groups.iter().enumerate() {
+        let kind = ctx
+            .objects
+            .iter()
+            .find(|(g, _)| *g == index)
+            .map(|(_, object)| object.kind);
+        check_pool_gate(group, kind, rules)?;
+    }
     let mut next = state.clone();
-    for (_, object) in &ctx.objects {
+    for (group_index, object) in &ctx.objects {
+        let group = &ctx.groups[*group_index];
         match object.kind {
             GuardianObjectKind::Attestation => {
                 let attestation = GuardianAttestation::decode(&object.body)?;
@@ -365,6 +421,18 @@ pub fn apply_block_guardian(
                 let equivocation = GuardianEquivocation::decode(&object.body)?;
                 check_equivocation(&next, &equivocation, rules)?;
                 apply_equivocation(&mut next, ctx.height);
+            }
+            GuardianObjectKind::StakeLock => {
+                let lock = StakeLock::decode(&object.body)?;
+                apply_stake_lock(&mut next, ctx.height, group, &lock, rules)?;
+            }
+            GuardianObjectKind::StakeUnlock => {
+                let unlock = StakeUnlock::decode(&object.body)?;
+                apply_stake_unlock(&mut next, ctx.height, group, &unlock, rules)?;
+            }
+            GuardianObjectKind::Payout => {
+                let payout = GuardianPayout::decode(&object.body)?;
+                apply_payout(&mut next, ctx.height, group, &payout, rules)?;
             }
             kind => return Err(GuardianError::GuardianObjectNotYetValid { kind }),
         }

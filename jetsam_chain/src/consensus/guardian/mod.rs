@@ -35,6 +35,7 @@ use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MICRO_PER_JTM, V1_7_ACT
 pub mod attestation;
 pub mod block;
 pub mod equivocation;
+pub mod stake;
 pub mod state;
 pub mod statement;
 
@@ -50,6 +51,10 @@ pub use block::{
 pub use equivocation::{
     anchor_leaf_hash, apply_equivocation, check_equivocation, compute_anchor_root,
     EquivocationWitness, GuardianEquivocation, EQUIVOCATION_E1_BYTES, LEAF_WITNESS_BYTES,
+};
+pub use stake::{
+    apply_payout, apply_stake_lock, apply_stake_unlock, delegation_active, GuardianPayout,
+    StakeLock, StakeUnlock, PAYOUT_BODY_BYTES, STAKE_BODY_BYTES,
 };
 pub use state::{GuardianState, PayoutEntry, PayoutEntryKind, StakePosition};
 pub use statement::{cum_work_word, headers_digest, u256_word, GuardianStatement};
