@@ -29,6 +29,7 @@ mod equivocation;
 mod persistence;
 mod properties;
 mod reward;
+mod snapshot;
 mod stake;
 
 /// A fixture of `guardian/testdata/`.

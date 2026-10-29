@@ -37,6 +37,7 @@ pub mod block;
 pub mod equivocation;
 pub mod persist;
 pub mod reward;
+pub mod snapshot;
 pub mod stake;
 pub mod state;
 pub mod statement;
@@ -62,6 +63,7 @@ pub use reward::{
     apply_period_boundary, apply_reward_claim, apply_reward_fund, delegation_height_reached,
     RewardAccount, RewardClaim, RewardFund, CLAIM_BODY_BYTES, FUND_BODY_BYTES,
 };
+pub use snapshot::{check_snapshot_guardian, SnapshotGuardianInput, SnapshotMarkerSlot};
 pub use stake::{
     apply_payout, apply_stake_lock, apply_stake_unlock, delegation_active, GuardianPayout,
     StakeLock, StakeUnlock, PAYOUT_BODY_BYTES, STAKE_BODY_BYTES,

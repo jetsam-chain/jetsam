@@ -189,6 +189,9 @@ pub enum GuardianError {
     FundingBeforeLatch,
     /// C-2: more than the balance (or the vested guardian balance).
     ClaimExceedsEntitlement,
+    /// A snapshot's guardian journal does not match the UTXO markers or the
+    /// pools' balances (the installation is refused).
+    SnapshotMismatch { reason: &'static str },
     /// This node cannot read its own branch at `height` (a local fault, not
     /// a property of the block).
     BranchUnavailable { height: u64 },
