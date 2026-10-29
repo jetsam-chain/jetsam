@@ -24,6 +24,16 @@
 //! (light-client updates of the L1, the bridge account proof, a vault release)
 //! is judged by the rules that read it, not by the wire.
 
+pub mod bls;
+pub mod forks;
+pub mod l1_read;
+pub mod light_client;
+pub mod mpt;
+pub mod ssz;
+
+#[cfg(test)]
+pub(crate) mod tests;
+
 use crate::block::Block;
 use crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
 use jetsam_tx::wire::WireError;

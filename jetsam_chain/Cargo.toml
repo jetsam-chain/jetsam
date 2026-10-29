@@ -30,7 +30,14 @@ rayon = "1.10"
 libmdbx = "0.6"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
+# v1.7 destination module: the L1's sync-committee signatures (BLS12-381),
+# SSZ roots (SHA-256) and state proofs (keccak-256), as in the bench of the
+# return path.
+blst = "=0.3.16"
+sha2 = "=0.10.9"
+tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3"
 rayon     = "1.10"
