@@ -31,6 +31,7 @@
 //! - [`network`]        — Network-kind parameters and per-network constants.
 //! - [`wire_limits`]    — Shared wire/memory/decode DoS caps.
 //! - [`destination`]    — v1.7 destination section (0xC2) and its objects.
+//! - [`vault`]          — v1.7 native gate of the bridge vault (V1-V7).
 
 pub mod checks;
 pub mod conflict;
@@ -46,6 +47,7 @@ pub mod wire_limits;
 pub mod allocator;
 pub mod client_objects;
 pub mod destination;
+pub mod vault;
 pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;

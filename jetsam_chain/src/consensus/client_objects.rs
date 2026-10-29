@@ -1099,11 +1099,17 @@ pub fn client_object_marker_kind_at(
 }
 
 /// [`is_client_locked_address`] at `height`: from the v1.6 height on, a batch
-/// submission marker owner is locked too.
+/// submission marker owner is locked too; from the v1.7 height on, the
+/// bridge's markers (`vault::is_destination_locked_address_at`, rule V5).
 pub fn is_client_locked_address_at(owner: &Address, height: u64, batch: &ClientBatchRules) -> bool {
     *owner == CLIENT_LICENSE_BURN_ADDRESS
         || *owner == CLIENT_LICENSE_POOL_ADDRESS
         || client_object_marker_kind_at(owner, height, batch).is_some()
+        || crate::consensus::vault::is_destination_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        )
 }
 
 /// Root of a matrix file: the byte-hash of its 1 MiB chunk digests, in order.
