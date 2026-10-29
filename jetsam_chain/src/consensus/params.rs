@@ -895,6 +895,13 @@ const _: () = assert!(
 /// Blocks 38 399 and 38 400 read back from the four seeds (`jetsam_getBlockHash`
 /// and `jetsam_getHeaderByHeight`, 2026-10-14 03:16 UTC, identical on all four);
 /// each is the `prev_block_hash` of the next one.
+///
+/// Blocks 46 079 and 46 080: the public network crossed v1.6 on 2026-10-29
+/// (block 46 080). Same reasoning as the v1.5 crossing above — a node left on
+/// v1.5.1 goes on mining its own 46 080' at the old rules, and that branch is
+/// refused here by its id at 46 080. Read back from the four mainnet seeds
+/// (`jetsam_getBlockHash` and `jetsam_getHeaderByHeight`, 2026-10-30, identical
+/// on all four); each is the `prev_block_hash` of the next one.
 #[cfg(not(feature = "testnet"))]
 pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
     (
@@ -919,6 +926,22 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
             0xec, 0x7c, 0x3d, 0xaa, 0x6b, 0xbf, 0x5f, 0xd0, 0x5f, 0x29, 0xff, 0x56, 0x78, 0x2d,
             0x2c, 0x56, 0xd2, 0xb7, 0xf1, 0xbe, 0x88, 0x7a, 0xe3, 0x42, 0xc1, 0x68, 0x01, 0x8f,
             0x9e, 0xf4, 0x05, 0xc5,
+        ],
+    ),
+    (
+        46079,
+        [
+            0xcf, 0x00, 0xa7, 0xd0, 0x07, 0x82, 0x1c, 0xd3, 0x84, 0x88, 0xec, 0x02, 0x5a, 0x78,
+            0xa4, 0x56, 0xbf, 0xaf, 0x7f, 0x69, 0x58, 0x59, 0x56, 0x06, 0x79, 0x8e, 0x0d, 0xe8,
+            0xa8, 0x52, 0xa6, 0x93,
+        ],
+    ),
+    (
+        46080,
+        [
+            0xa2, 0xa9, 0x1f, 0x26, 0xd8, 0xa1, 0x4a, 0x73, 0x46, 0xf1, 0x3d, 0xf1, 0x11, 0x85,
+            0x1d, 0x5c, 0x70, 0x3d, 0x32, 0x68, 0xa5, 0x2f, 0x42, 0xce, 0x91, 0x37, 0xde, 0xe8,
+            0x18, 0xdb, 0x58, 0x5f,
         ],
     ),
 ];
@@ -2727,10 +2750,16 @@ mod v1_6_crossing_pin_tests {
     /// A private build: its private chain is not the test network.
     #[cfg(feature = "rehearsal-v1-6")]
     const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
-    /// The public network: not crossed yet; its pins come with the release
-    /// that follows its crossing.
+    /// The raw headers 46 079, 46 080, 46 081 (`jetsam_getHeaderByHeight`) the
+    /// public network serves after its v1.6 crossing (block 46 080, 2026-10-29):
+    /// read back on 2026-10-30 from the four mainnet seeds, the same bytes
+    /// on every one.
     #[cfg(not(feature = "testnet"))]
-    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = None;
+    const V1_6_CROSSING_HEADERS: Option<[&str; 3]> = Some([
+        "3f3578cad1c7d8fb40f247ca4554de26322b06043310edf560a3a5fbde88633b0577d4b4374fbae064aeff79888a07fc02c27362706f10643f78d7b51de79d6e72cd2a5cd9127f0e41c8adbc59cd7d351435255fbed884e1e3f66c28318a8b4ba8c0e36a00000000ffb30000000000008f2bdf39af91926de8204283e0a01a661ef9292bb30792adb54295c6faa0607dc13602000000c00055586517aa06000007d9df5f3824cefb090b780852676292bf3bb3a537faa05e1abbdaed0f00000018000000b8e7000000000000a1d0010000000000",
+        "cf00a7d007821cd38488ec025a78a456bfaf7f6958595606798e0de8a852a6934bcb98ca2bc921f4818762f135f9e29127e30601162271d438bbe708754c641c14414e912da7410ec1e25821cca329cf2791314ea4e6df62b83232a92156dd5830c1e36a0000000000b40000000000002f3c1654dd1288326987fa6cc82f8108b84ae31beb23e3907457cff6bc9de442174b010000007006f121269bf1f15403cbe1eb41a33bafc0c07dfeb3c3436a457006f79603ed262a8205beb90d00000018000000bbe7000000000000a4d0010000000000",
+        "a2a91f26d8a14a7346f13df111851d5c703d3268a52f42ce9137dee818db585f46d2a82afc599d1303c63526bd61cb50288e9598bcf75e1802f7871a7ed68d6f4391ba49da6e7e7205303691bd34dba30e42ca3367deb84a7c7e25ea95c798fdb0c1e36a0000000001b400000000000005e12595e43723f0f90d3907f57276acd0c005bbafb1072ea0deb686e06224b3178a7038070000008005940da3091013c701c4dda1c8fdca2673be3b89e3b13b8dda1e86bb1968749669a1880d00000018000000bce7000000000000a5d0010000000000",
+    ]);
 
     fn header(hex: &str) -> BlockHeader {
         let bytes: Vec<u8> = (0..hex.len() / 2)
