@@ -966,6 +966,7 @@ fn held_registrations_are_kept_across_a_restart_until_a_block_makes_them() {
         header: jetsam_chain::consensus::genesis_header(),
         transactions: Vec::new(),
         client_objects: vec![ClientObject::Registration(notice.registration)],
+        destination: None,
     };
     block.header.height = 30;
     objects.on_block_committed(&block);

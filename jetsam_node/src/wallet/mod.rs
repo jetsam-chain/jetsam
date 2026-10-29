@@ -1529,6 +1529,7 @@ mod tests {
             header,
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         let owned = std::collections::HashSet::from([owner.0]);
         let (recovered, history_changed) = recover_outgoing_receipts_from_block(
@@ -2318,6 +2319,7 @@ mod tests {
             },
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         let our_hash = jetsam_chain::block_id(&ours.header);
         let our_coinbase = jetsam_chain::try_compute_logical_txids(&ours.transactions).unwrap()[0];
@@ -2435,6 +2437,7 @@ mod tests {
             },
             transactions: vec![jetsam_tx::Transaction::new(body)],
             client_objects: Vec::new(),
+            destination: None,
         };
 
         assert!(update_for_accepted_block(&handle.inner, &malformed).is_err());

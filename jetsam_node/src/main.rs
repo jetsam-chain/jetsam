@@ -9998,6 +9998,7 @@ mod tests {
             header,
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 
@@ -20302,6 +20303,7 @@ mod condemned_block_tests {
             header,
             transactions,
             client_objects: objects,
+            destination: None,
         }
     }
 

@@ -494,11 +494,11 @@ const BLOCK_BODY_OBJECT_RETENTION_DEPTH: u64 = HISTORY_STEP_PROOF_OBJECT_RETENTI
 const BLOCK_BODY_OBJECT_MAX_PIN_DEPTH: u64 = 512;
 const BLOCK_BODY_OBJECT_PRUNE_LIMIT: usize = 8;
 const BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT: usize =
-    crate::consensus::wire_limits::MAX_BLOCK_BYTES * 2;
+    crate::consensus::wire_limits::MAX_BLOCK_TRANSPORT_BYTES * 2;
 /// Bound numeric maintenance work even after a large snapshot jump.
 const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
 /// One retained block plus terminal is bounded by the canonical wire caps.
-const RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT: usize = crate::consensus::wire_limits::MAX_BLOCK_BYTES
+const RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT: usize = crate::consensus::wire_limits::MAX_BLOCK_TRANSPORT_BYTES
     + crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 /// A normal retired height deletes a block and terminal; advancing the exact
 /// boundary additionally removes one block body.
@@ -617,7 +617,7 @@ fn archive_block_body_object(
     expected_hash: [u8; 32],
     block_bytes: &[u8],
 ) -> Result<(), StoreError> {
-    if block_bytes.is_empty() || block_bytes.len() > crate::consensus::wire_limits::MAX_BLOCK_BYTES
+    if block_bytes.is_empty() || block_bytes.len() > crate::consensus::wire_limits::MAX_BLOCK_TRANSPORT_BYTES
     {
         return Err(StoreError::Decode(
             "archived block body length is outside hard bounds",
@@ -4401,6 +4401,7 @@ mod tests {
             header,
             transactions: vec![transaction],
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 

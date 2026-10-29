@@ -518,6 +518,7 @@ mod tests {
             },
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 

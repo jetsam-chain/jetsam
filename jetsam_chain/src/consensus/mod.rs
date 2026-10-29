@@ -30,6 +30,7 @@
 //! - [`genesis`]        — Genesis block / state root derivation.
 //! - [`network`]        — Network-kind parameters and per-network constants.
 //! - [`wire_limits`]    — Shared wire/memory/decode DoS caps.
+//! - [`destination`]    — v1.7 destination section (0xC2) and its objects.
 
 pub mod checks;
 pub mod conflict;
@@ -44,6 +45,7 @@ pub mod wire_limits;
 
 pub mod allocator;
 pub mod client_objects;
+pub mod destination;
 pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;
@@ -196,6 +198,15 @@ pub enum ConsensusError {
     /// v1.5: the block's client objects (registrations, submissions) break a
     /// rule of `client_objects`.
     ClientObject(client_objects::ClientObjectError),
+    /// v1.7: the block's destination section (0xC2) breaks a rule of
+    /// `destination`.
+    Destination(destination::DestinationError),
+}
+
+impl From<destination::DestinationError> for ConsensusError {
+    fn from(error: destination::DestinationError) -> Self {
+        Self::Destination(error)
+    }
 }
 
 impl From<client_objects::ClientObjectError> for ConsensusError {
@@ -217,6 +228,7 @@ impl std::fmt::Display for ConsensusError {
                 write!(f, "BelowMinFee: required={required} actual={actual}")
             }
             Self::ClientObject(error) => write!(f, "ClientObject({error})"),
+            Self::Destination(error) => write!(f, "Destination({error})"),
             other => write!(f, "{other:?}"),
         }
     }

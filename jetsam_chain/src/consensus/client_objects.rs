@@ -1168,6 +1168,18 @@ pub fn encode_client_objects_section(objects: &[ClientObject], buf: &mut Vec<u8>
 /// an empty list; a present section is canonical (marker, count in
 /// `1..=MAX_BLOCK_CLIENT_OBJECTS`, objects, nothing after).
 pub fn decode_client_objects_section(src: &mut &[u8]) -> Result<Vec<ClientObject>, WireError> {
+    let objects = decode_client_objects_section_prefix(src)?;
+    if !src.is_empty() {
+        return Err(WireError::TrailingBytes);
+    }
+    Ok(objects)
+}
+
+/// [`decode_client_objects_section`] without its final check: from the v1.7
+/// height on, the destination section follows this one.
+pub fn decode_client_objects_section_prefix(
+    src: &mut &[u8],
+) -> Result<Vec<ClientObject>, WireError> {
     if src.is_empty() {
         return Ok(Vec::new());
     }
@@ -1181,9 +1193,6 @@ pub fn decode_client_objects_section(src: &mut &[u8]) -> Result<Vec<ClientObject
     let mut objects = Vec::with_capacity(count);
     for _ in 0..count {
         objects.push(ClientObject::decode(src)?);
-    }
-    if !src.is_empty() {
-        return Err(WireError::TrailingBytes);
     }
     Ok(objects)
 }

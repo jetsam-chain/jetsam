@@ -114,6 +114,7 @@ fn empty_block(height: u64) -> jetsam_chain::Block {
         header: header(height),
         transactions: Vec::new(),
         client_objects: Vec::new(),
+        destination: None,
     }
 }
 

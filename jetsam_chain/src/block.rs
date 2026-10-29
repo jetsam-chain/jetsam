@@ -49,6 +49,11 @@ pub struct Block {
     /// without objects encodes exactly as before
     /// (`consensus::client_objects`).
     pub client_objects: Vec<crate::consensus::client_objects::ClientObject>,
+    /// v1.7 destination section (0xC2): `None` below the v1.7 height, where a
+    /// block carries none and encodes exactly as before; `Some`, possibly
+    /// empty, from it on, where it ends the block on the wire
+    /// (`consensus::destination`).
+    pub destination: Option<crate::consensus::destination::DestinationSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,9 +605,22 @@ fn take_u32(src: &mut &[u8]) -> Result<u32, WireError> {
 }
 
 impl Block {
-    /// Exact wire length derived only from the bounded fixed transaction count
-    /// and the v1.5 object section, absent when empty.
+    /// Exact wire length derived only from the bounded fixed transaction count,
+    /// the v1.5 object section, absent when empty, and the v1.7 destination
+    /// section, when present.
     pub fn canonical_wire_len(&self) -> Result<usize, WireError> {
+        let destination = self
+            .destination
+            .as_ref()
+            .map_or(0, crate::consensus::destination::destination_section_wire_len);
+        self.canonical_wire_len_before_destination()?
+            .checked_add(destination)
+            .ok_or(WireError::LengthOverflow)
+    }
+
+    /// [`Self::canonical_wire_len`] without the v1.7 destination section:
+    /// what [`crate::consensus::wire_limits::MAX_BLOCK_BYTES`] bounds.
+    pub fn canonical_wire_len_before_destination(&self) -> Result<usize, WireError> {
         if self.client_objects.len() > crate::consensus::client_objects::MAX_BLOCK_CLIENT_OBJECTS {
             return Err(WireError::LengthOverflow);
         }
@@ -644,6 +662,9 @@ impl Block {
             }
         }
         crate::consensus::client_objects::encode_client_objects_section(&self.client_objects, buf);
+        if let Some(section) = &self.destination {
+            crate::consensus::destination::encode_destination_section(section, buf);
+        }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -665,6 +686,22 @@ impl Block {
     pub(crate) fn decode_with_v1_5_activation(
         src: &mut &[u8],
         v1_5_activation_height: Option<u64>,
+    ) -> Result<Self, WireError> {
+        Self::decode_with_activations(
+            src,
+            v1_5_activation_height,
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// [`Self::decode`] on injected v1.5 and v1.7 clocks. From the v1.7
+    /// height on, the destination section ends the block when present (its
+    /// absence is the block's fault, judged by `consensus::destination`);
+    /// below it, its bytes are trailing bytes, exactly as before v1.7.
+    pub(crate) fn decode_with_activations(
+        src: &mut &[u8],
+        v1_5_activation_height: Option<u64>,
+        v1_7_activation_height: Option<u64>,
     ) -> Result<Self, WireError> {
         let marker = *take(src, 1)?.first().expect("one byte requested");
         if marker != BLOCK_WIRE_MARKER {
@@ -706,17 +743,31 @@ impl Block {
         // The v1.5 object section, when present, ends the block. Any other
         // trailing byte is left to the caller, exactly as before v1.5.
         let v1_5 = matches!(v1_5_activation_height, Some(activation) if header.height >= activation);
+        let v1_7 =
+            crate::consensus::params::v1_7_active_with(header.height, v1_7_activation_height);
         let client_objects = if v1_5
             && src.first() == Some(&crate::consensus::client_objects::CLIENT_OBJECTS_SECTION_MARKER)
         {
-            crate::consensus::client_objects::decode_client_objects_section(src)?
+            if v1_7 {
+                crate::consensus::client_objects::decode_client_objects_section_prefix(src)?
+            } else {
+                crate::consensus::client_objects::decode_client_objects_section(src)?
+            }
         } else {
             Vec::new()
+        };
+        let destination = if v1_7
+            && src.first() == Some(&crate::consensus::destination::DESTINATION_SECTION_MARKER)
+        {
+            Some(crate::consensus::destination::decode_destination_section(src)?)
+        } else {
+            None
         };
         Ok(Self {
             header,
             transactions,
             client_objects,
+            destination,
         })
     }
 
@@ -732,8 +783,22 @@ impl Block {
         bytes: &[u8],
         v1_5_activation_height: Option<u64>,
     ) -> Result<Self, WireError> {
+        Self::from_bytes_with_activations(
+            bytes,
+            v1_5_activation_height,
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// [`Self::from_bytes`] on injected v1.5 and v1.7 clocks.
+    pub(crate) fn from_bytes_with_activations(
+        bytes: &[u8],
+        v1_5_activation_height: Option<u64>,
+        v1_7_activation_height: Option<u64>,
+    ) -> Result<Self, WireError> {
         let mut src = bytes;
-        let out = Self::decode_with_v1_5_activation(&mut src, v1_5_activation_height)?;
+        let out =
+            Self::decode_with_activations(&mut src, v1_5_activation_height, v1_7_activation_height)?;
         if !src.is_empty() {
             return Err(WireError::TrailingBytes);
         }
@@ -873,6 +938,7 @@ mod tests {
             },
             transactions: txs,
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 
@@ -938,6 +1004,7 @@ mod tests {
             },
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
 
         let mut interpreted = initial.clone();
@@ -1034,6 +1101,125 @@ mod tests {
         }
     }
 
+    /// From the v1.7 height on, every block ends with the destination section
+    /// (0xC2), after the client-object section when there is one; an empty
+    /// section is two bytes, never absent. Below the height, or with the clock
+    /// dormant, those bytes are what they always were: trailing bytes.
+    #[test]
+    fn v1_7_destination_section_ends_the_block_on_the_wire() {
+        use crate::consensus::client_objects::{
+            ClientObject, ClientSubmission, CLIENT_OBJECTS_SECTION_MARKER,
+        };
+        use crate::consensus::destination::{
+            destination_section_wire_len, DestinationObject, DestinationObjectKind,
+            DestinationSection, DESTINATION_SECTION_MARKER,
+        };
+        let state = state();
+        let mut block = block_for(&state, vec![user_tx()]);
+        let height = block.header.height;
+        let plain = block.to_bytes();
+        let decode = |bytes: &[u8], v1_7: Option<u64>| {
+            Block::from_bytes_with_activations(bytes, Some(height), v1_7)
+        };
+
+        // Empty but present: marker and a zero count.
+        block.destination = Some(DestinationSection::default());
+        let bytes = block.to_bytes();
+        assert_eq!(&bytes[..plain.len()], &plain[..]);
+        assert_eq!(&bytes[plain.len()..], &[DESTINATION_SECTION_MARKER, 0]);
+        assert_eq!(block.canonical_wire_len(), Ok(bytes.len()));
+        assert_eq!(decode(&bytes, Some(height)), Ok(block.clone()));
+        // A block at the height without the section decodes without it (the
+        // rule refusing it is the block's, `validation`).
+        assert_eq!(
+            decode(&plain, Some(height)).map(|block| block.destination),
+            Ok(None)
+        );
+
+        // Objects: tag, little-endian length, payload; after the 0xC1 section.
+        block.client_objects = vec![ClientObject::Submission(ClientSubmission {
+            matrix_digest: [4u8; 32],
+            io_commitment: [5u8; 32],
+        })];
+        let objects = vec![
+            DestinationObject {
+                kind: DestinationObjectKind::FinalityUpdate,
+                payload: vec![7u8; 3],
+            },
+            DestinationObject {
+                kind: DestinationObjectKind::VaultRelease,
+                payload: vec![8u8; 2],
+            },
+        ];
+        block.destination = Some(DestinationSection {
+            objects: objects.clone(),
+        });
+        let bytes = block.to_bytes();
+        let section = destination_section_wire_len(block.destination.as_ref().unwrap());
+        assert_eq!(section, 2 + (1 + 4 + 3) + (1 + 4 + 2));
+        let tail = &bytes[bytes.len() - section..];
+        assert_eq!(tail[0], DESTINATION_SECTION_MARKER);
+        assert_eq!(tail[1], 2);
+        assert_eq!(&tail[3..7], &3u32.to_le_bytes());
+        assert_eq!(bytes[plain.len()], CLIENT_OBJECTS_SECTION_MARKER);
+        assert_eq!(block.canonical_wire_len(), Ok(bytes.len()));
+        assert_eq!(decode(&bytes, Some(height)), Ok(block.clone()));
+
+        // Non-canonical sections are refused.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode(&trailing, Some(height)).is_err());
+        let mut unknown_tag = bytes.clone();
+        let tag_at = bytes.len() - section + 2;
+        unknown_tag[tag_at] = 0xEE;
+        assert!(decode(&unknown_tag, Some(height)).is_err());
+        let mut short = bytes.clone();
+        short.pop();
+        assert!(decode(&short, Some(height)).is_err());
+        let mut empty_payload = plain.clone();
+        empty_payload.extend([DESTINATION_SECTION_MARKER, 1, 2, 0, 0, 0, 0]);
+        assert!(decode(&empty_payload, Some(height)).is_err());
+
+        // Below the height, or dormant: the section is trailing bytes.
+        for unarmed in [None, Some(height + 1)] {
+            assert_eq!(decode(&bytes, unarmed), Err(WireError::TrailingBytes));
+        }
+        if crate::consensus::params::V1_7_ACTIVATION_HEIGHT.is_none() {
+            let mut v1_6_view = plain.clone();
+            v1_6_view.extend([DESTINATION_SECTION_MARKER, 0]);
+            assert_eq!(Block::from_bytes(&v1_6_view), Err(WireError::TrailingBytes));
+        }
+    }
+
+    /// A section over its budget is refused on the wire, before any object is
+    /// allocated.
+    #[test]
+    fn destination_section_over_budget_is_refused_on_the_wire() {
+        use crate::consensus::destination::{
+            DestinationObject, DestinationObjectKind, DestinationSection,
+        };
+        use crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
+        let state = state();
+        let mut block = block_for(&state, vec![user_tx()]);
+        let height = block.header.height;
+        // 2 bytes of section header + 5 of object header + payload.
+        let at_budget = MAX_DESTINATION_SECTION_BYTES - 2 - 5;
+        for (payload, ok) in [(at_budget, true), (at_budget + 1, false)] {
+            block.destination = Some(DestinationSection {
+                objects: vec![DestinationObject {
+                    kind: DestinationObjectKind::CommitteeUpdate,
+                    payload: vec![1u8; payload],
+                }],
+            });
+            let decoded = Block::from_bytes_with_activations(
+                &block.to_bytes(),
+                Some(height),
+                Some(height),
+            );
+            assert_eq!(decoded.is_ok(), ok, "payload of {payload} bytes");
+        }
+    }
+
     #[test]
     fn maximum_canonical_block_wire_is_exact() {
         let mut txs = vec![coinbase()];
@@ -1061,6 +1247,7 @@ mod tests {
             },
             transactions: txs,
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(block.canonical_wire_len(), Ok(82_905));
         assert_eq!(block.to_bytes().len(), 82_905);
@@ -1199,6 +1386,7 @@ mod tests {
             },
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(Block::from_bytes(&block.to_bytes()), Ok(block));
     }
@@ -1262,6 +1450,7 @@ mod tests {
             },
             transactions: vec![],
             client_objects: Vec::new(),
+            destination: None,
         };
         assert!(apply_genesis_block(&mut state, &block).is_ok());
     }

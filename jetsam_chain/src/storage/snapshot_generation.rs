@@ -35,7 +35,7 @@ use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
 use crate::consensus::wire_limits::{
-    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_SEGMENT_BYTES,
+    history_step_terminal_bytes_limit, MAX_BLOCK_TRANSPORT_BYTES, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS,
 };
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
@@ -247,7 +247,7 @@ impl SnapshotGeneration {
             &bridge_path(&self.directory, height),
             descriptor.encoded_len,
             descriptor.encoded_digest,
-            MAX_BLOCK_BYTES,
+            MAX_BLOCK_TRANSPORT_BYTES,
             "snapshot bridge block",
         )?;
         let block = crate::Block::from_bytes(&encoded)
@@ -819,7 +819,7 @@ fn export_snapshot_generation_inner(
         let encoded = snapshot
             .get_recent_block(height)?
             .ok_or(SnapshotGenerationError::MissingBridgeBlock(height))?;
-        if encoded.is_empty() || encoded.len() > MAX_BLOCK_BYTES {
+        if encoded.is_empty() || encoded.len() > MAX_BLOCK_TRANSPORT_BYTES {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
         let block = crate::Block::from_bytes(&encoded)
@@ -1433,7 +1433,7 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
     for descriptor in &manifest.bridge {
         if descriptor.height != expected_height
             || descriptor.encoded_len == 0
-            || descriptor.encoded_len as usize > MAX_BLOCK_BYTES
+            || descriptor.encoded_len as usize > MAX_BLOCK_TRANSPORT_BYTES
         {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(
                 descriptor.height,
@@ -1888,6 +1888,7 @@ mod tests {
             header: child,
             transactions: vec![coinbase],
             client_objects: Vec::new(),
+            destination: None,
         };
         let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
             1,
@@ -1984,6 +1985,7 @@ mod tests {
             header: grandchild,
             transactions: block.transactions.clone(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
             2,

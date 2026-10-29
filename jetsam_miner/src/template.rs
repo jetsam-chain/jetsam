@@ -100,10 +100,13 @@ impl BlockTemplate {
     /// Assemble the final sealed block after PoW fixes its nonce.
     pub fn seal(&self, nonce: u128) -> Block {
         let header = self.inner.clone().into_header(nonce);
+        let destination = jetsam_chain::consensus::params::v1_7_active(header.height)
+            .then(jetsam_chain::consensus::destination::DestinationSection::default);
         Block {
             header,
             transactions: self.inner.all_txs(),
             client_objects: self.client_slot.objects.clone(),
+            destination,
         }
     }
 
@@ -854,6 +857,8 @@ pub(crate) fn check_template_client_objects(
         header: inner.to_pow_header(0),
         transactions: inner.all_txs(),
         client_objects: objects.to_vec(),
+        // The client-object rules do not read the destination section.
+        destination: None,
     };
     jetsam_chain::consensus::client_objects::validate_block_client_objects(
         &block, objects, parent, registry, rules,

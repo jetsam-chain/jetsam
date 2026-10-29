@@ -52,6 +52,7 @@ fn bundle_with(
         header: parent,
         transactions: transactions.clone(),
         client_objects: Vec::new(),
+        destination: None,
     };
     let segments = context.segment_ids_for_block(&probe);
     context.preload_segment_ids(&segments).unwrap();
@@ -971,6 +972,7 @@ fn locally_proved_with(
         header: parent,
         transactions: transactions.clone(),
         client_objects: Vec::new(),
+        destination: None,
     };
     let segments = context.segment_ids_for_block(&probe);
     context.preload_segment_ids(&segments).unwrap();

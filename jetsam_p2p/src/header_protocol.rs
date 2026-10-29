@@ -7,7 +7,8 @@
 use jetsam_chain::{
     block::BLOCK_WIRE_HEADER_OFFSET,
     block_header::{block_id, semantic_header_id},
-    consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES},
+    consensus::params::V1_7_ACTIVATION_HEIGHT,
+    consensus::wire_limits::{block_bytes_limit_at_activation, history_step_terminal_bytes_limit},
     history_step::{HistoryStepTerminalMetadata, HISTORY_STEP_CLASS_COUNT},
     AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
 };
@@ -208,12 +209,22 @@ impl HeaderInventoryRecord {
     }
 
     pub fn validate(&self) -> Result<(), HeaderAnnounceError> {
+        self.validate_with_v1_7(V1_7_ACTIVATION_HEIGHT)
+    }
+
+    /// [`Self::validate`] on an injected v1.7 clock: a body may exceed
+    /// `MAX_BLOCK_BYTES` by the destination section from that height on.
+    pub(crate) fn validate_with_v1_7(
+        &self,
+        v1_7_activation: Option<u64>,
+    ) -> Result<(), HeaderAnnounceError> {
         let expected_hash = block_id(&self.header);
         if self.body.is_some_and(|body| {
             body.claim.height != self.header.height
                 || body.claim.block_hash != expected_hash
                 || body.encoded_len == 0
-                || body.encoded_len as usize > MAX_BLOCK_BYTES
+                || body.encoded_len as usize
+                    > block_bytes_limit_at_activation(self.header.height, v1_7_activation)
         }) {
             return Err(HeaderAnnounceError::BodyClaimMismatch);
         }
@@ -391,6 +402,14 @@ impl HeaderAnnouncement {
     }
 
     pub fn validate(&self) -> Result<(), HeaderAnnounceError> {
+        self.validate_with_v1_7(V1_7_ACTIVATION_HEIGHT)
+    }
+
+    /// [`Self::validate`] on an injected v1.7 clock.
+    pub(crate) fn validate_with_v1_7(
+        &self,
+        v1_7_activation: Option<u64>,
+    ) -> Result<(), HeaderAnnounceError> {
         let expected_hash = block_id(&self.header);
         if self.body.claim.height != self.header.height
             || self.body.claim.block_hash != expected_hash
@@ -407,7 +426,10 @@ impl HeaderAnnouncement {
                 self.terminal.claim.proof_class,
             ));
         }
-        if self.body.encoded_len == 0 || self.body.encoded_len as usize > MAX_BLOCK_BYTES {
+        if self.body.encoded_len == 0
+            || self.body.encoded_len as usize
+                > block_bytes_limit_at_activation(self.header.height, v1_7_activation)
+        {
             return Err(HeaderAnnounceError::BodyLength(self.body.encoded_len));
         }
         if self.terminal.encoded_len == 0
@@ -461,6 +483,7 @@ pub enum HeaderAnnounceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jetsam_chain::consensus::wire_limits::MAX_BLOCK_BYTES;
     use jetsam_chain::Block;
 
     fn bundle() -> AcceptedBlockBundle {
@@ -471,6 +494,7 @@ mod tests {
             header,
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         // The terminal's wire version is a property of its own height, and the
         // activation height that decides it differs between networks: writing
@@ -641,6 +665,82 @@ mod tests {
         assert_eq!(
             announcement.encode(),
             Err(HeaderAnnounceError::BodyClaimMismatch)
+        );
+    }
+    /// From the v1.7 height on, a block body may carry the destination
+    /// section beyond `MAX_BLOCK_BYTES`: the announcement, the inventory and
+    /// the object request of such a body are accepted at its height, and only
+    /// there; below it, or with the clock dormant, the v1.6 cap holds.
+    #[test]
+    fn p2p_accepts_v1_7_block_size() {
+        use jetsam_chain::consensus::wire_limits::{
+            MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES,
+        };
+        const J: u64 = 69_120;
+        let announcement_at = |height: u64, body_len: usize| {
+            let mut header = jetsam_chain::consensus::genesis_header();
+            header.height = height;
+            HeaderAnnouncement {
+                header,
+                body: BlockBodyObjectId {
+                    claim: BlockBodyClaimId {
+                        height,
+                        block_hash: block_id(&header),
+                    },
+                    byte_digest: [1; 32],
+                    encoded_len: body_len as u32,
+                },
+                terminal: TerminalObjectId {
+                    claim: TerminalClaimId {
+                        height,
+                        semantic_header_id: semantic_header_id(&header),
+                        proof_class: 0,
+                    },
+                    byte_digest: [2; 32],
+                    encoded_len: 1_000,
+                },
+                providers: ProviderFlags::new(true, true, false),
+            }
+        };
+        for (height, v1_7, len, ok) in [
+            (J, Some(J), MAX_V1_7_BLOCK_BYTES, true),
+            (J + 1, Some(J), MAX_V1_7_BLOCK_BYTES, true),
+            (J, Some(J), MAX_V1_7_BLOCK_BYTES + 1, false),
+            (J - 1, Some(J), MAX_BLOCK_BYTES + 1, false),
+            (J - 1, Some(J), MAX_BLOCK_BYTES, true),
+            (J, None, MAX_BLOCK_BYTES + 1, false),
+        ] {
+            let announcement = announcement_at(height, len);
+            assert_eq!(
+                announcement.validate_with_v1_7(v1_7).is_ok(),
+                ok,
+                "announcement at {height} of {len} bytes under {v1_7:?}"
+            );
+            let record = HeaderInventoryRecord::from_announcement(announcement);
+            assert_eq!(record.validate_with_v1_7(v1_7).is_ok(), ok, "inventory");
+            assert_eq!(
+                crate::object_codec::validate_object_id_with_v1_7(
+                    crate::object_protocol::ObjectId::BlockBody(announcement.body),
+                    v1_7
+                )
+                .is_ok(),
+                ok,
+                "object request"
+            );
+        }
+        // The production rule follows this build's clock; the transport bound
+        // is the v1.6 one while it is dormant.
+        let at = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.unwrap_or(J);
+        let largest = announcement_at(at, MAX_V1_7_BLOCK_BYTES);
+        let armed = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_some();
+        assert_eq!(largest.validate().is_ok(), armed);
+        assert_eq!(
+            MAX_BLOCK_TRANSPORT_BYTES,
+            if armed {
+                MAX_V1_7_BLOCK_BYTES
+            } else {
+                MAX_BLOCK_BYTES
+            }
         );
     }
 }

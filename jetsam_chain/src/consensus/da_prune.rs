@@ -213,6 +213,7 @@ mod tests {
             },
             transactions: vec![tx],
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 

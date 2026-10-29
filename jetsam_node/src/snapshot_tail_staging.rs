@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use jetsam_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES};
+use jetsam_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_TRANSPORT_BYTES};
 use jetsam_chain::{
     Block, BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
@@ -157,7 +157,7 @@ impl SnapshotTailStaging {
     }
 
     pub fn append(mut self, block_bytes: Vec<u8>) -> Result<Self, String> {
-        if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_BYTES {
+        if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_TRANSPORT_BYTES {
             return Err("tail block body length is outside bounds".to_string());
         }
         let block = Block::from_bytes(&block_bytes)
@@ -389,7 +389,7 @@ impl SnapshotTailReader {
             .read_exact(&mut encoded_len)
             .map_err(|error| format!("read tail record length: {error}"))?;
         let encoded_len = u32::from_le_bytes(encoded_len) as usize;
-        if encoded_len == 0 || encoded_len > MAX_BLOCK_BYTES {
+        if encoded_len == 0 || encoded_len > MAX_BLOCK_TRANSPORT_BYTES {
             return Err("finalized tail record length is outside bounds".to_string());
         }
         if encoded_len as u64 > self.remaining_payload_bytes {
@@ -470,6 +470,7 @@ mod tests {
             header,
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 
@@ -504,6 +505,7 @@ mod tests {
             header: genesis_header(),
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let hash = jetsam_chain::hash_block_header(&genesis.header);
         let block = linked_block(&genesis, 1);
@@ -531,6 +533,7 @@ mod tests {
             header: genesis_header(),
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let first = linked_block(&genesis, 1);
@@ -557,6 +560,7 @@ mod tests {
             header: genesis_header(),
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let boundary_work = jetsam_chain::block_work(&genesis.header.difficulty_target);
@@ -599,6 +603,7 @@ mod tests {
             header: genesis_header(),
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let boundary_hash = jetsam_chain::hash_block_header(&genesis.header);
         let first = linked_block(&genesis, 1);

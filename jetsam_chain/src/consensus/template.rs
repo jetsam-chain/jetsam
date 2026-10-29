@@ -111,6 +111,10 @@ impl BlockTemplate {
             },
             transactions,
             client_objects: Vec::new(),
+            // From the v1.7 height on, a block carries the destination
+            // section, even empty.
+            destination: crate::consensus::params::v1_7_active(height)
+                .then(crate::consensus::destination::DestinationSection::default),
         }
     }
 
@@ -1169,6 +1173,7 @@ mod tests {
             header: first.to_pow_header(0),
             transactions: first.all_txs(),
             client_objects: Vec::new(),
+            destination: None,
         };
         crate::block::apply_block(&mut state, &winning).unwrap();
         assert_eq!(state.state.log_slots(), 9);
@@ -1183,6 +1188,7 @@ mod tests {
             header: second.to_pow_header(0),
             transactions: second.all_txs(),
             client_objects: Vec::new(),
+            destination: None,
         };
         let winning_root = state.cached_state_root();
         assert!(crate::block::apply_block(&mut state, &losing).is_err());
@@ -1207,6 +1213,7 @@ mod tests {
             header: next.to_pow_header(0),
             transactions: next.all_txs(),
             client_objects: Vec::new(),
+            destination: None,
         };
         crate::block::apply_block(&mut state, &next_block).unwrap();
         assert_eq!(state.state.log_slots(), 9);

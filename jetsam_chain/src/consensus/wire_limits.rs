@@ -28,6 +28,46 @@ pub const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BLOCK_BYTES: usize =
     1 + crate::wire::BLOCK_HEADER_WIRE_SIZE + 4 + 256 * jetsam_tx::TX_BODY_WIRE_SIZE;
 
+/// v1.7: budget of a block's destination section (0xC2), marker and count
+/// included, **outside** [`MAX_BLOCK_BYTES`]. The largest section measured
+/// (one committee update, one finality update, the bridge account proof and
+/// four releases) is 44 645 bytes of objects.
+pub const MAX_DESTINATION_SECTION_BYTES: usize = 48 * 1024;
+
+/// Largest v1.7 block: everything [`MAX_BLOCK_BYTES`] bounds, then a
+/// destination section at its budget.
+pub const MAX_V1_7_BLOCK_BYTES: usize = MAX_BLOCK_BYTES + MAX_DESTINATION_SECTION_BYTES;
+
+/// Allocation, storage and transport bound of one block body understood by
+/// this binary, before any decode: [`MAX_V1_7_BLOCK_BYTES`] once the v1.7
+/// clock is armed, [`MAX_BLOCK_BYTES`] while it is dormant (byte for byte the
+/// v1.6 bound). Consensus still judges each block by the cap of its own
+/// height ([`block_bytes_limit`]): bound first, judge second.
+pub const MAX_BLOCK_TRANSPORT_BYTES: usize =
+    match crate::consensus::params::V1_7_ACTIVATION_HEIGHT {
+        Some(_) => MAX_V1_7_BLOCK_BYTES,
+        None => MAX_BLOCK_BYTES,
+    };
+
+/// Active cap for the body of a block at `height`.
+#[inline]
+pub const fn block_bytes_limit(height: u64) -> usize {
+    block_bytes_limit_at_activation(height, crate::consensus::params::V1_7_ACTIVATION_HEIGHT)
+}
+
+/// Twin of [`block_bytes_limit`] with the v1.7 schedule injected: a pure
+/// arithmetic answer, public so that the transport guards of other crates can
+/// be tested across the boundary while the real schedule stays dormant. It
+/// grants no admission capability.
+#[inline]
+pub const fn block_bytes_limit_at_activation(height: u64, v1_7_activation: Option<u64>) -> usize {
+    if crate::consensus::params::v1_7_active_with(height, v1_7_activation) {
+        MAX_V1_7_BLOCK_BYTES
+    } else {
+        MAX_BLOCK_BYTES
+    }
+}
+
 /// Maximum block resource weight accepted before expensive proof verification.
 ///
 /// This is an admission/DoS guard, not the consensus semantic throughput
