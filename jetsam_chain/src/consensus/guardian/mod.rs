@@ -34,6 +34,7 @@ use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MICRO_PER_JTM, V1_7_ACT
 
 pub mod attestation;
 pub mod block;
+pub mod equivocation;
 pub mod state;
 pub mod statement;
 
@@ -45,6 +46,10 @@ pub use block::{
     apply_block_guardian, guardian_body_len_allowed, guardian_context,
     is_guardian_locked_address_at, validate_block_guardian, BlockGuardianContext, GuardianBranch,
     GuardianError, GuardianGroupFacts, GuardianObject,
+};
+pub use equivocation::{
+    anchor_leaf_hash, apply_equivocation, check_equivocation, compute_anchor_root,
+    EquivocationWitness, GuardianEquivocation, EQUIVOCATION_E1_BYTES, LEAF_WITNESS_BYTES,
 };
 pub use state::{GuardianState, PayoutEntry, PayoutEntryKind, StakePosition};
 pub use statement::{cum_work_word, headers_digest, u256_word, GuardianStatement};

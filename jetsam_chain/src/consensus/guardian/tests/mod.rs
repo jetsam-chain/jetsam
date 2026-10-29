@@ -25,6 +25,7 @@ use crate::consensus::pow::block_id;
 
 mod attestation;
 mod constants;
+mod equivocation;
 
 /// A fixture of `guardian/testdata/`.
 pub(crate) fn fixture(name: &str) -> Value {

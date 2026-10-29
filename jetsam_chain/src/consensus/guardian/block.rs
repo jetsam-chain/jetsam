@@ -14,6 +14,7 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
 
 use super::attestation::{check_attestation, GuardianAttestation};
+use super::equivocation::{apply_equivocation, check_equivocation, GuardianEquivocation};
 use super::{
     guardian_marker_kind, GuardianObjectKind, GuardianRules, GuardianState,
     MAX_ATTESTATIONS_PER_BLOCK, MAX_DELEGATION_OBJECTS_PER_BLOCK, MAX_EQUIVOCATIONS_PER_BLOCK,
@@ -136,6 +137,14 @@ pub enum GuardianError {
     AttestationNotIncreasing,
     /// A-10 / Q-5.
     InvalidGuardianSignature,
+    /// Q-4: `s1 < s2` does not hold (identical statements included).
+    EquivocationNotCanonical,
+    /// Q-6: rule byte, witnesses or length.
+    NonCanonicalEquivocation,
+    /// Q-7 / Q-8: the two statements do not contradict each other.
+    NotAnEquivocation,
+    /// Q-8: an anchor-leaf witness does not open its statement's anchor root.
+    InvalidWitness,
     /// This node cannot read its own branch at `height` (a local fault, not
     /// a property of the block).
     BranchUnavailable { height: u64 },
@@ -351,6 +360,11 @@ pub fn apply_block_guardian(
                 let attested = check_attestation(&next, ctx.height, &attestation, branch, rules)?;
                 next.last_attested_height = Some(attested);
                 next.attested_period = Some(ctx.height / rules.period);
+            }
+            GuardianObjectKind::Equivocation => {
+                let equivocation = GuardianEquivocation::decode(&object.body)?;
+                check_equivocation(&next, &equivocation, rules)?;
+                apply_equivocation(&mut next, ctx.height);
             }
             kind => return Err(GuardianError::GuardianObjectNotYetValid { kind }),
         }
