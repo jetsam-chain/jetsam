@@ -32,8 +32,22 @@ use crate::consensus::destination::mpt::keccak256;
 use crate::consensus::development_allocation::NETWORK_FUND_ADDRESS;
 use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MICRO_PER_JTM, V1_7_ACTIVATION_HEIGHT};
 
+pub mod attestation;
+pub mod block;
+pub mod state;
+pub mod statement;
+
 #[cfg(test)]
 mod tests;
+
+pub use attestation::{check_attestation, GuardianAttestation, ATTESTATION_BODY_BYTES};
+pub use block::{
+    apply_block_guardian, guardian_body_len_allowed, guardian_context,
+    is_guardian_locked_address_at, validate_block_guardian, BlockGuardianContext, GuardianBranch,
+    GuardianError, GuardianGroupFacts, GuardianObject,
+};
+pub use state::{GuardianState, PayoutEntry, PayoutEntryKind, StakePosition};
+pub use statement::{cum_work_word, headers_digest, u256_word, GuardianStatement};
 
 // ---------------------------------------------------------------------------
 // The signed statement

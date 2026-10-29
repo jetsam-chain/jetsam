@@ -21,8 +21,9 @@
 //! ```
 //!
 //! An object is carried as its canonical payload bytes; what each kind means
-//! (light-client updates of the L1, the bridge account proof, a vault release)
-//! is judged by the rules that read it, not by the wire.
+//! (light-client updates of the L1, the bridge account proof, a vault release,
+//! the guardian objects 0x20..=0x26) is judged by the rules that read it, not
+//! by the wire, which checks only a guardian object's exact size.
 
 pub mod bls;
 pub mod forks;
@@ -35,6 +36,7 @@ pub mod ssz;
 pub(crate) mod tests;
 
 use crate::block::Block;
+use crate::consensus::guardian::{guardian_body_len_allowed, GuardianObjectKind};
 use crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
 use jetsam_tx::wire::WireError;
 
@@ -67,6 +69,9 @@ pub enum DestinationObjectKind {
     BridgeAccountProof,
     /// One release from the vault, with its storage proof.
     VaultRelease,
+    /// A guardian object (codes 0x20..=0x26), judged by
+    /// [`crate::consensus::guardian`].
+    Guardian(GuardianObjectKind),
 }
 
 impl DestinationObjectKind {
@@ -76,6 +81,7 @@ impl DestinationObjectKind {
             Self::FinalityUpdate => TAG_FINALITY_UPDATE,
             Self::BridgeAccountProof => TAG_BRIDGE_ACCOUNT_PROOF,
             Self::VaultRelease => TAG_VAULT_RELEASE,
+            Self::Guardian(kind) => kind.section_code(),
         }
     }
 
@@ -85,7 +91,10 @@ impl DestinationObjectKind {
             TAG_FINALITY_UPDATE => Some(Self::FinalityUpdate),
             TAG_BRIDGE_ACCOUNT_PROOF => Some(Self::BridgeAccountProof),
             TAG_VAULT_RELEASE => Some(Self::VaultRelease),
-            _ => None,
+            code => match GuardianObjectKind::from_section_code(code) {
+                Some(kind) => Some(Self::Guardian(kind)),
+                None => None,
+            },
         }
     }
 }
@@ -157,6 +166,11 @@ pub fn decode_destination_section(src: &mut &[u8]) -> Result<DestinationSection,
         let len = u32::from_le_bytes(take(src, 4)?.try_into().expect("four bytes")) as usize;
         if len == 0 {
             return Err(WireError::NonCanonicalBody);
+        }
+        if let DestinationObjectKind::Guardian(kind) = kind {
+            if !guardian_body_len_allowed(kind, len) {
+                return Err(WireError::LengthOverflow);
+            }
         }
         used = used
             .checked_add(OBJECT_HEADER_BYTES)
