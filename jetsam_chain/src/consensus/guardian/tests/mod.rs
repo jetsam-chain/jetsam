@@ -27,6 +27,7 @@ mod attestation;
 mod constants;
 mod equivocation;
 mod persistence;
+mod properties;
 mod reward;
 mod stake;
 
