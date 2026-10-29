@@ -47,6 +47,7 @@ pub mod wire_limits;
 pub mod allocator;
 pub mod client_objects;
 pub mod destination;
+pub mod guardian;
 pub mod vault;
 pub mod development_allocation;
 pub mod difficulty;
