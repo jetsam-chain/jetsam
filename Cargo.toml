@@ -45,9 +45,10 @@ resolver = "2"
 # 1.6.0 is the first release that knows the v1.6 fork (batch relation and
 # consensus rule updates); below the v1.6 height of its profile it applies the
 # 1.5.1 consensus rules.
-# 1.6.1-testnet keeps the 1.6.0 consensus rules and activation heights;
-# the bare 1.6.1 name is left to the release that will carry the pins.
-version = "1.6.1-testnet"
+# 1.6.1 keeps the 1.6.0 consensus rules and activation heights, and pins
+# blocks 46079 and 46080 (the public network's v1.6 crossing): a node
+# installed or re-synced from now on can only follow the real chain.
+version = "1.6.1"
 edition = "2021"
 license = "Apache-2.0"
 
