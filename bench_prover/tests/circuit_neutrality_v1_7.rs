@@ -438,8 +438,12 @@ impl RootedChain {
             target,
         )
         .expect("template");
+        // From J on the template already carries an (empty) destination
+        // section; a caller's section replaces it.
         let mut block = template.into_block(0);
-        block.destination = destination;
+        if destination.is_some() {
+            block.destination = destination;
+        }
         // One wallet authorization per user group, in block order.
         let mut authorizations: Vec<ZkAuthorizationProof> = Vec::new();
         let mut group_pages: Vec<TxPage> = Vec::new();
