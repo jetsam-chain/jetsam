@@ -27,6 +27,7 @@ pub mod network;
 pub mod network_profile;
 pub mod object_codec;
 pub mod object_protocol;
+pub mod onion;
 mod outbound_budget;
 mod peer_diversity;
 pub mod peer_store;
