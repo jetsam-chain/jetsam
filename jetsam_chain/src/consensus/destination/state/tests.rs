@@ -775,7 +775,10 @@ fn window_sums_the_releases_of_the_479_blocks_before() {
     let next = state.tip + 1;
     let expected: u64 = (next - 479..next).filter(|h| h % 10 == 0).sum();
     assert_eq!(state.released_in_window(next, 480), expected);
-    assert!(state.window.iter().all(|r| r.height >= next - 479));
+    assert!(state
+        .window
+        .iter()
+        .all(|r| r.height >= next - 479 - DESTINATION_UNDO_BLOCKS));
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1021,8 @@ impl Chain {
 
     /// What a snapshot of this chain's tip carries.
     fn snapshot_file(&self) -> DestinationSnapshotFile {
-        let first = (self.height + 2).saturating_sub(self.rules.vault.window_blocks);
+        let first = (self.height + 2)
+            .saturating_sub(self.rules.vault.window_blocks + DESTINATION_UNDO_BLOCKS);
         DestinationSnapshotFile {
             committee_updates: self.updates[self.updates.len().saturating_sub(2)..].to_vec(),
             window_releases: self
@@ -1262,5 +1266,100 @@ fn destination_record_round_trips_state_and_committee_keys() {
     assert_eq!(
         decode_destination_record(&lone).map(|_| ()),
         Err(DestinationStateError::Malformed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Found by the mutants (T2.3)
+// ---------------------------------------------------------------------------
+
+/// After a reorg the window of the next block reaches as far back as on a
+/// node that never saw the other branch: the state keeps the releases of
+/// the window **and** of the undo depth (otherwise V6 would undercount by
+/// the reorg's depth and nodes would split on a block near the cap).
+#[test]
+fn window_after_a_reorg_counts_the_releases_before_the_fork() {
+    let w = VAULT_RELEASE_WINDOW_BLOCKS;
+    let mut state = DestinationState::at_v1_7(J, 0);
+    let mut history = Vec::new();
+    for h in J..J + w + 40 {
+        state
+            .apply(&effect_at(h, &[(h, 1 + h % 7)], 0, None), w)
+            .unwrap();
+        history.push((h, 1 + h % 7));
+    }
+    for depth in 1..=8 {
+        let back = state
+            .clone()
+            .truncate_above(state.tip - depth)
+            .unwrap()
+            .unwrap();
+        let next = back.tip + 1;
+        let expected: u64 = history
+            .iter()
+            .filter(|(h, _)| *h + w > next && *h < next)
+            .map(|(_, a)| a)
+            .sum();
+        assert_eq!(back.released_in_window(next, w), expected, "depth {depth}");
+    }
+    // And the window never counts a block more than W − 1 back.
+    let next = state.tip + 1;
+    let expected: u64 = history
+        .iter()
+        .filter(|(h, _)| *h + w > next && *h < next)
+        .map(|(_, a)| a)
+        .sum();
+    assert_eq!(state.released_in_window(next, w), expected);
+}
+
+/// The anchor update must be of the period just before P0, not only bring
+/// the anchor's committee.
+#[test]
+fn anchor_update_of_another_period_is_refused() {
+    let anchor = committee(1);
+    let rules = anchored_rules(&anchor);
+    let parent = state_at(J, Vec::new());
+    for period in [P0 - 2, P0, P0 + 5] {
+        let payload = committee_update(&committee(0xEE), period, &anchor).encode_payload();
+        let b = block_with(
+            J + 1,
+            vec![update_group(300, &payload)],
+            vec![object(DestinationObjectKind::CommitteeUpdate, payload)],
+        );
+        assert_eq!(
+            validate_block_destination(&b, &parent, &rules, &CommitteeKeyCache::default()),
+            Err(DestinationBlockError::AnchorMismatch),
+            "{period}"
+        );
+    }
+}
+
+/// A snapshot whose first committee marker opens an update that does not
+/// bring the anchor's committee is refused (defence in depth: a valid
+/// chain cannot hold one).
+#[test]
+fn snapshot_with_a_foreign_anchor_update_is_refused() {
+    let c0 = committee(1);
+    let mut chain = Chain::new(&c0);
+    chain.committee_update(None, P0 - 1, &c0);
+    chain.empty(2);
+    // Replace the anchor update's marker slot by that of a foreign update
+    // of the same period, and carry that update in the file.
+    let foreign = anchor_update(&committee(4)).encode_payload();
+    let genuine = committee_update_marker(&chain.updates[0]);
+    for slot in &mut chain.live {
+        if slot.0 == genuine {
+            slot.0 = committee_update_marker(&foreign);
+        }
+    }
+    let file = DestinationSnapshotFile {
+        committee_updates: vec![foreign],
+        window_releases: Vec::new(),
+    };
+    assert_eq!(
+        chain.install(&file).map(|_| ()),
+        Err(SnapshotDestinationError::Mismatch {
+            reason: "the anchor update is not the anchor's"
+        })
     );
 }

@@ -321,8 +321,10 @@ impl DestinationState {
                     amount: *amount,
                 }),
         );
-        // Keep what the next block's window reads.
-        let keep_from = (effect.height + 2).saturating_sub(window_blocks);
+        // Keep what the next block's window reads, and what it reads after
+        // a reorg as deep as the undo (a truncation never brings back what
+        // was pruned).
+        let keep_from = (effect.height + 2).saturating_sub(window_blocks + DESTINATION_UNDO_BLOCKS);
         self.window.retain(|r| r.height >= keep_from);
         self.tip = effect.height;
         Ok(())
@@ -917,7 +919,8 @@ pub struct DestinationSnapshotFile {
     /// state's two latest (oldest first; fewer if there are fewer).
     pub committee_updates: Vec<Vec<u8>>,
     /// `(n, owner, amount)` of every release marker created by the last
-    /// `window_blocks − 1` blocks, in creation order (V6 of the next block).
+    /// `window_blocks − 1 + DESTINATION_UNDO_BLOCKS` blocks, in creation order
+    /// (V6 of the next block, as a full node keeps it).
     pub window_releases: Vec<(u64, Address, u64)>,
 }
 
@@ -1063,7 +1066,9 @@ impl<'a> SnapshotDestinationCheck<'a> {
 
         // V6: the releases of the blocks the next block's window reads.
         let window_blocks = self.rules.vault.window_blocks;
-        let first = (self.tip + 2).saturating_sub(window_blocks).max(start);
+        let first = (self.tip + 2)
+            .saturating_sub(window_blocks + DESTINATION_UNDO_BLOCKS)
+            .max(start);
         let header =
             |h: u64| alloc_counter(h).ok_or(SnapshotDestinationError::HeaderMissing { height: h });
         let low = header(first - 1)?;
@@ -1176,7 +1181,7 @@ pub fn snapshot_floor(
 // ---------------------------------------------------------------------------
 
 /// The roots a state names: its committees and those its undo can restore.
-fn named_roots(state: &DestinationState) -> Vec<Root> {
+pub fn named_roots(state: &DestinationState) -> Vec<Root> {
     let mut roots: Vec<Root> = state.committees.iter().map(|c| c.root).collect();
     for undo in &state.undo {
         for committee in undo.committees_before.iter().flatten() {

@@ -114,6 +114,42 @@ const KEY_VERIFIED_SUFFIX_AUTHORITY: &[u8] = &[3u8];
 /// only under an armed v1.5 clock, atomically with the block or reorg that
 /// produced it.
 const KEY_CLIENT_REGISTRY: &[u8] = b"client_registry";
+/// v1.7 destination record of the canonical tip (state and the keys of its
+/// committees), in `T_STATE_META`. Written only under an armed v1.7 clock,
+/// atomically with the block or reorg that produced it.
+const KEY_DESTINATION_RECORD: &[u8] = b"destination_record";
+
+/// What a commit does to the v1.7 destination record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DestinationWrite<'a> {
+    /// The dormant clock: the key is never touched (the store stays what it
+    /// was before v1.7).
+    Untouched,
+    /// The record after the block (or reorg).
+    Put(&'a [u8]),
+    /// The branch is below J again: no record.
+    Delete,
+}
+
+fn write_destination_record(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    table: &Table<'_>,
+    destination: DestinationWrite<'_>,
+) -> Result<(), StoreError> {
+    match destination {
+        DestinationWrite::Untouched => {}
+        DestinationWrite::Put(bytes) => {
+            txn.put(table, KEY_DESTINATION_RECORD, bytes, WriteFlags::empty())?;
+        }
+        DestinationWrite::Delete => {
+            let stale: Option<Vec<u8>> = txn.get(table, KEY_DESTINATION_RECORD)?;
+            if stale.is_some() {
+                txn.del(table, KEY_DESTINATION_RECORD, None)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -1911,6 +1947,14 @@ impl MdbxStore {
         .transpose()
     }
 
+    /// The v1.7 destination record committed with the tip, if one was ever
+    /// written (never under the dormant clock).
+    pub fn get_destination_record(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_STATE_META))?;
+        Ok(txn.get(&tbl, KEY_DESTINATION_RECORD)?)
+    }
+
     pub fn get_circulating_supply(&self) -> Result<Option<u128>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_STATE_META))?;
@@ -2968,12 +3012,14 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
         } else {
-            let stale_registry: Option<Vec<u8>> =
-                txn.get(&state_meta_tbl, KEY_CLIENT_REGISTRY)?;
+            let stale_registry: Option<Vec<u8>> = txn.get(&state_meta_tbl, KEY_CLIENT_REGISTRY)?;
             if stale_registry.is_some() {
                 txn.del(&state_meta_tbl, KEY_CLIENT_REGISTRY, None)?;
             }
         }
+        // A snapshot installed here is below J (the context refuses one at or
+        // above it until its destination state is wired): no record.
+        write_destination_record(&txn, &state_meta_tbl, DestinationWrite::Delete)?;
         prune_history_step_proof_objects(&txn, tip_header.height)?;
         txn.commit()?;
         Ok(hot_state)
@@ -3162,6 +3208,7 @@ impl MdbxStore {
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
         client_registry: Option<&crate::consensus::client_objects::ClientRegistryState>,
+        destination: DestinationWrite<'_>,
     ) -> Result<(), StoreError> {
         if dirty_segments.len() != dirty_segment_summaries.len()
             || dirty_segments.iter().zip(dirty_segment_summaries).any(
@@ -3475,6 +3522,7 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
         }
+        write_destination_record(&txn, &meta_tbl, destination)?;
 
         // --- 7. BlockUndoLog ---
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
@@ -3685,6 +3733,7 @@ impl MdbxStore {
         circulating_supply_micro_jtm: u128,
         consensus_meta: &ConsensusMeta,
         client_registry: Option<&crate::consensus::client_objects::ClientRegistryState>,
+        destination: DestinationWrite<'_>,
     ) -> Result<(), StoreError> {
         if final_dirty_segments.len() != final_dirty_segment_summaries.len()
             || final_dirty_segments
@@ -4162,6 +4211,7 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
         }
+        write_destination_record(&txn, &meta_tbl, destination)?;
         // Rebuild the owner accelerator from the exact post-reorg segment
         // table. Clear is an MDBX operation (no all-key Vec), and records are
         // written as each single decoded segment is visited (no owner map).
@@ -4473,6 +4523,7 @@ mod tests {
                 &meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
         (genesis, meta)
@@ -4509,6 +4560,7 @@ mod tests {
                 &meta,
                 true,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
         assert_eq!(
@@ -4874,6 +4926,7 @@ mod tests {
                 &meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
         meta
@@ -4922,6 +4975,7 @@ mod tests {
                 &meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
 
@@ -5150,6 +5204,7 @@ mod tests {
                 &meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .is_err());
         assert_eq!(
