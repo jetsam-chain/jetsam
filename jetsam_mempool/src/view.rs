@@ -25,7 +25,9 @@ use std::{
 };
 
 use jetsam_chain::block_header::BlockHeader;
+use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+use jetsam_chain::consensus::vault::ReleasedSet;
 use jetsam_chain::consensus::{
     pow::block_id, previous_tx_epoch_anchor_height_for_child, tx_epoch_anchor_height_for_child,
     AcceptedEpochAnchors,
@@ -35,6 +37,36 @@ use jetsam_chain::segmented_state::SegmentedFriState;
 use jetsam_chain::storage::MdbxStore;
 
 const SEGMENT_READ_CACHE_CAPACITY: usize = 4;
+
+/// The v1.7 vault as the block after the view's tip is judged against it
+/// (T2.5): the destination state's `bridge_locked` (V8), the withdrawal
+/// indices the branch has paid (D52), and the floor `alloc_counter(J − 1)`
+/// (V1-b).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultView {
+    pub bridge_locked: u64,
+    pub released: ReleasedSet,
+    pub floor: u64,
+}
+
+/// The [`VaultView`] of the block at `height` after a tip whose destination
+/// state is `parent` and whose header has `parent_alloc_counter`: at J a
+/// fresh vault on that floor (never a default), above J the parent's, `None`
+/// below J or under a dormant clock.
+pub fn vault_view_for_child(
+    parent: Option<&DestinationState>,
+    parent_alloc_counter: u64,
+    height: u64,
+    rules: &DestinationRules,
+) -> Option<VaultView> {
+    DestinationState::for_child(parent, parent_alloc_counter, height, rules).map(|state| {
+        VaultView {
+            bridge_locked: state.bridge_locked,
+            released: state.released,
+            floor: state.floor,
+        }
+    })
+}
 
 #[derive(Debug)]
 pub enum ChainViewReadError {
@@ -90,6 +122,10 @@ pub struct ChainView {
     /// Canonical tip hash paired with `tip_height` for atomic durable reads.
     pub tip_hash: [u8; 32],
 
+    /// The v1.7 vault for the next block (`None` below J): V8 and the paid
+    /// withdrawal indices at admission.
+    pub vault: Option<VaultView>,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -132,6 +168,7 @@ impl ChainView {
             user_epoch_anchor_id,
             previous_user_epoch_anchor_id,
             tip_hash,
+            vault: None,
             state,
             store: None,
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::default())),
@@ -215,6 +252,23 @@ impl ChainView {
         );
         view.tip_hash = ctx.tip_hash;
         view.store = Some(ctx.store.clone());
+        let tip_alloc_counter = ctx
+            .recent_headers
+            .get(&ctx.tip_height)
+            .map(|header| header.alloc_counter)
+            .or_else(|| {
+                ctx.get_header_from_store(ctx.tip_height)
+                    .ok()
+                    .flatten()
+                    .map(|header| header.alloc_counter)
+            })
+            .unwrap_or(0);
+        view.vault = vault_view_for_child(
+            ctx.destination_state(),
+            tip_alloc_counter,
+            ctx.tip_height.saturating_add(1),
+            &DestinationRules::current(),
+        );
         let anchor_height = tx_epoch_anchor_height_for_child(ctx.tip_height + 1);
         view.user_epoch_anchor_id = ctx
             .get_header_from_store(anchor_height)
@@ -265,6 +319,33 @@ fn child_generation(tip_height: u64) -> HistoryStepPackGeneration {
 mod tests {
     use super::*;
 
+    /// T2.5: the vault view of the block after the tip starts at J from the
+    /// tip header's `alloc_counter` (never a default floor), follows the
+    /// branch's destination state above J, and is absent below J.
+    #[test]
+    fn vault_view_at_j_starts_from_the_tip_alloc_counter() {
+        let rules = DestinationRules {
+            activation_height: Some(960),
+            ..DestinationRules::CONSENSUS
+        };
+        assert_eq!(vault_view_for_child(None, 77, 959, &rules), None);
+        let at_j = vault_view_for_child(None, 77, 960, &rules).expect("J");
+        assert_eq!(at_j.floor, 77);
+        assert_eq!(at_j.bridge_locked, 0);
+        let mut parent = DestinationState::at_v1_7(960, 77);
+        parent.tip = 961;
+        parent.bridge_locked = 5_000;
+        parent.released.insert(3);
+        let above = vault_view_for_child(Some(&parent), 999, 962, &rules).expect("above J");
+        assert_eq!(above.floor, 77, "the floor stays J − 1's");
+        assert_eq!(above.bridge_locked, 5_000);
+        assert!(above.released.contains(3));
+        assert_eq!(
+            vault_view_for_child(Some(&parent), 999, 962, &DestinationRules::CONSENSUS).is_some(),
+            jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_some()
+        );
+    }
+
     /// JETSAM CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
     /// which pinned the transaction epoch length in the test name and body.
     #[test]
@@ -305,7 +386,11 @@ mod tests {
         ] {
             let view = view(tip_height);
             let post_fork = matches!(armed, Some(activation) if tip_height + 1 >= activation);
-            let expected_previous = if post_fork { post_fork_previous } else { current };
+            let expected_previous = if post_fork {
+                post_fork_previous
+            } else {
+                current
+            };
             assert_eq!(view.user_epoch_anchor_id, current, "tip {tip_height}");
             assert_eq!(
                 view.previous_user_epoch_anchor_id, expected_previous,

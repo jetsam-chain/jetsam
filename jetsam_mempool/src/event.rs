@@ -55,6 +55,12 @@ pub enum EvictReason {
     /// it pays a client-object marker without its object, or spends from a
     /// locked address (`check_plain_transaction` at the next block's height).
     ClientObjectRule,
+    /// From the v1.7 height on no block may carry it as a plain transaction:
+    /// it spends from the bridge vault (a release travels with its object),
+    /// pays a release or committee-update marker without its object, or is a
+    /// deposit of the wrong shape or before the bridge opening
+    /// (`check_plain_vault_transaction` at the next block's height).
+    VaultRule,
 }
 
 impl EvictReason {
@@ -76,9 +82,7 @@ impl EvictReason {
                 "the pool was full and this fee was among the lowest; \
                  another node may still mine it, or it can be re-sent with a higher fee"
             }
-            Self::InputConsumed => {
-                "the coins it spends were already spent by a confirmed block"
-            }
+            Self::InputConsumed => "the coins it spends were already spent by a confirmed block",
             Self::OutputSlotOccupied => {
                 "a confirmed block took a state slot it had claimed; \
                  the wallet must rebuild it with fresh slot hints"
@@ -86,6 +90,11 @@ impl EvictReason {
             Self::ClientObjectRule => {
                 "from the v1.5 height no block may carry it alone: it pays a client \
                  object without that object, or spends from a locked address"
+            }
+            Self::VaultRule => {
+                "from the v1.7 height no block may carry it alone: it spends from the \
+                 bridge vault, pays a bridge marker without its object, or is a deposit \
+                 of the wrong shape or before the bridge opens"
             }
         }
     }
@@ -103,6 +112,7 @@ mod tests {
             EvictReason::InputConsumed,
             EvictReason::OutputSlotOccupied,
             EvictReason::ClientObjectRule,
+            EvictReason::VaultRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {
