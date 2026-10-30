@@ -468,3 +468,56 @@ pub fn decode_guardian_journal(bytes: &[u8]) -> Result<Vec<GuardianJournalEntry>
     r.finish()?;
     Ok(entries)
 }
+
+/// First bytes of the record the chain context keeps for its tip (T3.6).
+pub const GUARDIAN_RECORD_MAGIC: [u8; 8] = *b"JTMGRC01";
+/// Blocks whose undo the record keeps: twice the deepest reorg, as the
+/// destination state's.
+pub const GUARDIAN_UNDO_BLOCKS: u64 = crate::consensus::destination::state::DESTINATION_UNDO_BLOCKS;
+
+/// The durable record of a tip: `magic ‖ len:u32 ‖ state ‖ count:u8 ‖ count ×
+/// { height:u64 ‖ len:u32 ‖ undo }`, undos by increasing height (the last
+/// [`GUARDIAN_UNDO_BLOCKS`] blocks at most).
+pub fn encode_guardian_record(state: &GuardianState, undos: &[(u64, GuardianUndo)]) -> Vec<u8> {
+    let mut out = GUARDIAN_RECORD_MAGIC.to_vec();
+    let state = state.encode();
+    out.extend_from_slice(&u32::try_from(state.len()).expect("state fits u32").to_le_bytes());
+    out.extend_from_slice(&state);
+    out.push(u8::try_from(undos.len()).unwrap_or(u8::MAX));
+    for (height, undo) in undos {
+        let undo = undo.encode();
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(undo.len()).expect("undo fits u32").to_le_bytes());
+        out.extend_from_slice(&undo);
+    }
+    out
+}
+
+/// Decode [`encode_guardian_record`]: a canonical state, at most
+/// [`GUARDIAN_UNDO_BLOCKS`] canonical undos at strictly increasing heights,
+/// nothing after.
+pub fn decode_guardian_record(
+    bytes: &[u8],
+) -> Result<(GuardianState, Vec<(u64, GuardianUndo)>), GuardianError> {
+    let mut r = Reader(bytes);
+    if r.take(8)? != GUARDIAN_RECORD_MAGIC {
+        return Err(BAD);
+    }
+    let len = r.u32()? as usize;
+    let state = GuardianState::decode(r.take(len)?)?;
+    let count = u64::from(r.u8()?);
+    if count > GUARDIAN_UNDO_BLOCKS {
+        return Err(BAD);
+    }
+    let mut undos: Vec<(u64, GuardianUndo)> = Vec::new();
+    for _ in 0..count {
+        let height = r.u64()?;
+        if undos.last().is_some_and(|(last, _)| *last >= height) {
+            return Err(BAD);
+        }
+        let len = r.u32()? as usize;
+        undos.push((height, GuardianUndo::decode(r.take(len)?)?));
+    }
+    r.finish()?;
+    Ok((state, undos))
+}

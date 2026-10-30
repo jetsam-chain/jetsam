@@ -407,3 +407,38 @@ fn guardian_state_at_j_starts_from_alloc_counter_of_j_minus_1() {
         Some(later.clone())
     );
 }
+
+/// T3.6 storage: the record the chain context writes with each block — the
+/// state after it and the undo of its last blocks — reads back exactly, and
+/// refuses damage (magic, lengths, heights out of order, too many undos,
+/// trailing bytes, an undo that does not decode).
+#[test]
+fn guardian_record_round_trips_and_refuses_damage() {
+    let state = rich_state();
+    let before = GuardianState::at_v1_7(5);
+    let undos: Vec<(u64, GuardianUndo)> = (10..14)
+        .map(|h| (h, GuardianUndo::between(&before, &state)))
+        .collect();
+    let bytes = encode_guardian_record(&state, &undos);
+    assert_eq!(decode_guardian_record(&bytes).unwrap(), (state.clone(), undos.clone()));
+    assert_eq!(
+        decode_guardian_record(&encode_guardian_record(&before, &[])).unwrap(),
+        (before.clone(), Vec::new())
+    );
+    for cut in [0, 4, 8, 12, bytes.len() / 2, bytes.len() - 1] {
+        assert!(decode_guardian_record(&bytes[..cut]).is_err(), "cut {cut}");
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(decode_guardian_record(&longer).is_err());
+    let mut magic = bytes.clone();
+    magic[0] ^= 1;
+    assert!(decode_guardian_record(&magic).is_err());
+    let mut swapped = undos.clone();
+    swapped.swap(0, 1);
+    assert!(decode_guardian_record(&encode_guardian_record(&state, &swapped)).is_err());
+    let too_many: Vec<(u64, GuardianUndo)> = (0..=GUARDIAN_UNDO_BLOCKS)
+        .map(|h| (h, GuardianUndo::between(&before, &state)))
+        .collect();
+    assert!(decode_guardian_record(&encode_guardian_record(&state, &too_many)).is_err());
+}

@@ -1859,6 +1859,7 @@ mod tests {
                 true,
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
         let first = export_snapshot_generation(&store, exports.path(), 0, None).unwrap();
@@ -1933,6 +1934,7 @@ mod tests {
                 &child_meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
@@ -2035,6 +2037,7 @@ mod tests {
                 &grandchild_meta,
                 false,
                 None,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();

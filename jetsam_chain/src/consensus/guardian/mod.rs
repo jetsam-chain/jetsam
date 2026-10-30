@@ -56,8 +56,10 @@ pub use equivocation::{
     EquivocationWitness, GuardianEquivocation, EQUIVOCATION_E1_BYTES, LEAF_WITNESS_BYTES,
 };
 pub use persist::{
-    decode_guardian_journal, encode_guardian_journal, GuardianJournalEntry, GuardianUndo,
-    GUARDIAN_JOURNAL_MAGIC, GUARDIAN_STATE_VERSION, MAX_GUARDIAN_JOURNAL_FILE_BYTES,
+    decode_guardian_journal, decode_guardian_record, encode_guardian_journal,
+    encode_guardian_record, GuardianJournalEntry, GuardianUndo, GUARDIAN_JOURNAL_MAGIC,
+    GUARDIAN_RECORD_MAGIC, GUARDIAN_STATE_VERSION, GUARDIAN_UNDO_BLOCKS,
+    MAX_GUARDIAN_JOURNAL_FILE_BYTES,
 };
 pub use reward::{
     apply_period_boundary, apply_reward_claim, apply_reward_fund, delegation_height_reached,
@@ -415,6 +417,35 @@ pub fn verify_guardian_signature(
 // Rules
 // ---------------------------------------------------------------------------
 
+/// Per-thread rule injection for this crate's unit tests only.
+#[cfg(test)]
+pub(crate) mod test_rules {
+    use super::GuardianRules;
+    use std::cell::Cell;
+
+    thread_local! {
+        static INSTALLED: Cell<Option<GuardianRules>> = const { Cell::new(None) };
+    }
+
+    /// Restores the consensus rules when dropped.
+    pub(crate) struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            INSTALLED.with(|cell| cell.set(None));
+        }
+    }
+
+    pub(crate) fn install(rules: GuardianRules) -> Installed {
+        INSTALLED.with(|cell| cell.set(Some(rules)));
+        Installed(())
+    }
+
+    pub(super) fn installed() -> Option<GuardianRules> {
+        INSTALLED.with(Cell::get)
+    }
+}
+
 /// The parameters of the guardian rules; [`GuardianRules::current`] is this
 /// build's. Tests inject their own (a test key, a dormant or armed clock).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,7 +467,19 @@ pub struct GuardianRules {
 }
 
 impl GuardianRules {
+    /// This build's rules. In this crate's own unit tests, a test may
+    /// install other rules on its thread ([`test_rules::install`]), as for
+    /// the destination rules.
     pub fn current() -> Self {
+        #[cfg(test)]
+        if let Some(rules) = test_rules::installed() {
+            return rules;
+        }
+        Self::consensus()
+    }
+
+    /// The consensus rules of this build.
+    pub fn consensus() -> Self {
         Self {
             activation_height: V1_7_ACTIVATION_HEIGHT,
             delegation_height: DELEGATION_ACTIVATION_HEIGHT,

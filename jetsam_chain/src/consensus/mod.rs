@@ -207,6 +207,8 @@ pub enum ConsensusError {
     /// v1.7: the block breaks a destination rule against its branch's
     /// destination state (light client, vault gate, V7).
     DestinationBlock(destination::state::DestinationBlockError),
+    /// v1.7 (T3.6): the guardian rules of a block.
+    Guardian(guardian::GuardianError),
 }
 
 impl From<destination::DestinationError> for ConsensusError {
@@ -236,6 +238,7 @@ impl std::fmt::Display for ConsensusError {
             Self::ClientObject(error) => write!(f, "ClientObject({error})"),
             Self::Destination(error) => write!(f, "Destination({error})"),
             Self::DestinationBlock(error) => write!(f, "DestinationBlock({error})"),
+            Self::Guardian(error) => write!(f, "Guardian({error:?})"),
             other => write!(f, "{other:?}"),
         }
     }

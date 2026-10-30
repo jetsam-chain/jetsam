@@ -427,3 +427,205 @@ fn a_reorg_above_j_truncates_the_destination_state() {
     assert_eq!(state.floor, at_j.unwrap().floor);
     assert_eq!(producer.destination_state(), Some(&state));
 }
+
+// ---------------------------------------------------------------------------
+// T3.6 storage: the guardian state as durable chain state
+// ---------------------------------------------------------------------------
+
+/// The guardian rules armed at the test clock's J.
+fn armed_guardians() -> crate::consensus::guardian::GuardianRules {
+    crate::consensus::guardian::GuardianRules {
+        activation_height: Some(J_T),
+        ..crate::consensus::guardian::GuardianRules::consensus()
+    }
+}
+
+/// At J the guardian state starts from the floor `alloc_counter(J − 1)`
+/// (never a default: INV-S), is written with each block with its undo, read
+/// back on reopen, and follows a heavier branch: truncated below J, then
+/// started again from the new branch's floor.
+#[test]
+fn guardian_state_is_durable_and_follows_the_branch() {
+    use crate::consensus::guardian::{decode_guardian_record, test_rules as guardian_rules};
+    let _rules = test_rules::install(armed(J_T));
+    let _guardians = guardian_rules::install(armed_guardians());
+    let directory = tempfile::tempdir().unwrap();
+    let (mut context, _first) = to_j(directory.path());
+    let floor = context
+        .get_header_from_store(J_T - 1)
+        .unwrap()
+        .unwrap()
+        .alloc_counter;
+    assert_eq!(
+        context.guardian_state(),
+        Some(&crate::consensus::guardian::GuardianState::at_v1_7(floor))
+    );
+    let third = test_next_bundle_for_miner(&context, MINER);
+    accept_test_bundle(&mut context, &third);
+    let record = context.store.get_guardian_record().unwrap().expect("written");
+    let (state, undo) = decode_guardian_record(&record).unwrap();
+    assert_eq!(Some(&state), context.guardian_state());
+    assert_eq!(
+        undo.iter().map(|(height, _)| *height).collect::<Vec<_>>(),
+        vec![J_T, J_T + 1]
+    );
+    drop(context);
+    let mut context =
+        MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap()).unwrap();
+    assert_eq!(context.guardian_state(), Some(&state));
+
+    // A heavier branch from genesis: below J nothing, then a new start.
+    let producer_dir = tempfile::tempdir().unwrap();
+    let mut producer = easy_block_context(producer_dir.path());
+    let mut branch = Vec::new();
+    for _ in 0..4 {
+        let bundle = test_next_bundle_for_miner(&producer, 0x62);
+        accept_test_bundle(&mut producer, &bundle);
+        branch.push(bundle);
+    }
+    let tip_block = Block::from_bytes(branch[3].block_bytes()).unwrap();
+    let genesis = context.get_header_from_store(0).unwrap().unwrap();
+    let authority = context
+        .verify_reorg_suffix(
+            0,
+            tip_block.header,
+            genesis,
+            branch[3].history_step_terminal_bytes().to_vec(),
+            |_| Ok(TerminalClientView::default()),
+        )
+        .unwrap();
+    let bodies: Vec<Vec<u8>> = branch.iter().map(|b| b.block_bytes().to_vec()).collect();
+    context
+        .apply_verified_reorg_suffix_with_applier(
+            authority,
+            &bodies,
+            tip_block.header.timestamp,
+            |block, state| {
+                crate::materialize_accepted_block_state(state, block)
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .unwrap();
+    let new_floor = context
+        .get_header_from_store(J_T - 1)
+        .unwrap()
+        .unwrap()
+        .alloc_counter;
+    assert_eq!(
+        context.guardian_state(),
+        Some(&crate::consensus::guardian::GuardianState::at_v1_7(new_floor))
+    );
+    let (_, undo) = decode_guardian_record(&context.store.get_guardian_record().unwrap().unwrap())
+        .unwrap();
+    assert_eq!(
+        undo.iter().map(|(height, _)| *height).collect::<Vec<_>>(),
+        vec![2, 3, 4],
+        "only the new branch's blocks"
+    );
+    drop(context);
+    let context =
+        MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap()).unwrap();
+    assert_eq!(
+        context.guardian_state(),
+        Some(&crate::consensus::guardian::GuardianState::at_v1_7(new_floor))
+    );
+}
+
+/// The guardian rules judge every block from J on: a block paying the stake
+/// vault without its object (the pools' native gate) is refused by the
+/// context, and writes nothing.
+#[test]
+fn a_block_paying_the_stake_vault_without_its_object_is_refused() {
+    use crate::consensus::guardian::{test_rules as guardian_rules, GuardianError, STAKE_VAULT};
+    let _rules = test_rules::install(armed(J_T));
+    let _guardians = guardian_rules::install(armed_guardians());
+    let directory = tempfile::tempdir().unwrap();
+    let (mut context, first) = to_j(directory.path());
+    let before = context.guardian_state().cloned();
+    let record_before = context.store.get_guardian_record().unwrap();
+    let page = spend_coinbase(&context, &first, &[(STAKE_VAULT, 10 * MICRO_PER_JTM)]);
+    let third = bundle_with(&mut context, vec![page]);
+    let error = apply(&mut context, &third).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MdbxContextError::Consensus(ConsensusError::Guardian(
+                GuardianError::OutputToGuardianPoolOutsideObject { .. }
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(context.tip_height(), J_T);
+    assert_eq!(context.guardian_state().cloned(), before);
+    assert_eq!(context.store.get_guardian_record().unwrap(), record_before);
+}
+
+/// A block refused after the guardian rules passed (a state root that does
+/// not match) leaves the guardian state and its record as they were.
+#[test]
+fn rollback_uncommitted_block_restores_guardian_state() {
+    use crate::consensus::guardian::test_rules as guardian_rules;
+    let _rules = test_rules::install(armed(J_T));
+    let _guardians = guardian_rules::install(armed_guardians());
+    let directory = tempfile::tempdir().unwrap();
+    let (mut context, _first) = to_j(directory.path());
+    let before = context.guardian_state().cloned();
+    let record_before = context.store.get_guardian_record().unwrap();
+    let third = test_next_bundle_for_miner(&context, MINER);
+    let block = Block::from_bytes(third.block_bytes()).unwrap();
+    let error = context
+        .apply_next_block(
+            &third,
+            block.header.timestamp,
+            |block, state| {
+                crate::materialize_accepted_block_state(state, block)
+                    .map_err(|error| format!("{error:?}"))?;
+                Ok::<_, String>([0xEE; 32])
+            },
+            |_| Ok(TerminalClientView::default()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MdbxContextError::Consensus(ConsensusError::BadStateRoot)
+    ));
+    assert_eq!(context.guardian_state().cloned(), before);
+    assert_eq!(context.store.get_guardian_record().unwrap(), record_before);
+    apply(&mut context, &third).unwrap();
+    assert_eq!(context.tip_height(), J_T + 1);
+}
+
+/// Under the dormant clock nothing is judged and no record is written.
+#[test]
+fn the_dormant_rules_write_no_guardian_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    for _ in 0..3 {
+        let bundle = test_next_bundle_for_miner(&context, MINER);
+        accept_test_bundle(&mut context, &bundle);
+    }
+    assert!(context.guardian_state().is_none());
+    assert!(context.store.get_guardian_record().unwrap().is_none());
+}
+
+/// The record keeps the undo of the last 16 blocks, no more.
+#[test]
+fn guardian_undo_keeps_the_last_16_blocks() {
+    use crate::consensus::guardian::{
+        decode_guardian_record, test_rules as guardian_rules, GUARDIAN_UNDO_BLOCKS,
+    };
+    let _rules = test_rules::install(armed(J_T));
+    let _guardians = guardian_rules::install(armed_guardians());
+    let directory = tempfile::tempdir().unwrap();
+    let (mut context, _first) = to_j(directory.path());
+    for _ in 0..GUARDIAN_UNDO_BLOCKS + 2 {
+        let bundle = test_next_bundle_for_miner(&context, MINER);
+        accept_test_bundle(&mut context, &bundle);
+    }
+    let tip = context.tip_height();
+    let (_, undo) = decode_guardian_record(&context.store.get_guardian_record().unwrap().unwrap())
+        .unwrap();
+    assert_eq!(undo.len() as u64, GUARDIAN_UNDO_BLOCKS);
+    assert_eq!(undo.last().unwrap().0, tip);
+    assert_eq!(undo.first().unwrap().0, tip + 1 - GUARDIAN_UNDO_BLOCKS);
+}

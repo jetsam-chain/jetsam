@@ -60,6 +60,10 @@ use crate::consensus::destination::state::{
     decode_destination_record, encode_destination_record, named_roots, validate_block_destination,
     CommitteeKeyCache, DestinationEffect, DestinationRules, DestinationState,
 };
+use crate::consensus::guardian::{
+    decode_guardian_record, encode_guardian_record, validate_block_guardian, GuardianBranch,
+    GuardianRules, GuardianState, GuardianUndo, GUARDIAN_UNDO_BLOCKS,
+};
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block, BlockUndoLog},
     difficulty::{add_work, block_work},
@@ -469,6 +473,87 @@ pub struct MdbxChainContext {
     /// The keys of the L1 committees the destination state names, by root
     /// (D57: never state; read from the updates that brought them).
     committee_keys: CommitteeKeyCache,
+
+    /// v1.7 guardian state of the canonical branch at the tip (`None` below
+    /// J, and under the dormant clock), and the undo of its last
+    /// [`GUARDIAN_UNDO_BLOCKS`] blocks, by increasing height (T3.6).
+    guardian: Option<GuardianState>,
+    guardian_undo: Vec<(u64, GuardianUndo)>,
+}
+
+/// The guardian record a commit writes: nothing under the dormant clock, the
+/// record of the state and its undo, or its deletion below J (T3.6).
+fn guardian_record_bytes(
+    state: Option<&GuardianState>,
+    undo: &[(u64, GuardianUndo)],
+) -> Option<Option<Vec<u8>>> {
+    GuardianRules::current()
+        .activation_height
+        .map(|_| state.map(|state| encode_guardian_record(state, undo)))
+}
+
+/// The guardian state after the block at `height` from one at a higher tip,
+/// by its undo (T3.6): `None` below J; an error when the undo does not reach
+/// back that far.
+fn truncate_guardian(
+    state: Option<GuardianState>,
+    mut undo: Vec<(u64, GuardianUndo)>,
+    height: u64,
+    v1_7_activation: Option<u64>,
+) -> Result<(Option<GuardianState>, Vec<(u64, GuardianUndo)>), ()> {
+    let Some(mut state) = state else {
+        return Ok((None, Vec::new()));
+    };
+    if v1_7_activation.is_none_or(|j| height < j) {
+        return Ok((None, Vec::new()));
+    }
+    let mut reached = undo.last().map(|(tip, _)| *tip);
+    while let Some((block, block_undo)) = undo.pop_if(|(block, _)| *block > height) {
+        state = block_undo.revert(&state);
+        reached = Some(block - 1);
+    }
+    if reached.is_some_and(|reached| reached != height) && undo.is_empty() {
+        return Err(());
+    }
+    Ok((Some(state), undo))
+}
+
+/// The branch an attestation is judged on (T3.6): the context's headers up
+/// to its tip, the replacement branch's while a reorg is staged.
+struct ContextGuardianBranch<'a> {
+    context: &'a MdbxChainContext,
+}
+
+impl GuardianBranch for ContextGuardianBranch<'_> {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.context.tip_height {
+            return None;
+        }
+        self.context
+            .recent_headers
+            .get(&height)
+            .copied()
+            .or_else(|| self.context.store.get_header(height).ok().flatten())
+            .map(|header| block_id(&header))
+    }
+
+    fn chain_work(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.context.tip_height {
+            return None;
+        }
+        if height == self.context.tip_height {
+            return Some(self.context.tip_chain_work);
+        }
+        if let Some(staged) = self
+            .context
+            .reorg_staging
+            .as_ref()
+            .and_then(|staged| staged.iter().find(|commit| commit.header.height == height))
+        {
+            return Some(staged.cumulative_chainwork);
+        }
+        self.context.store.get_chain_work(height).ok().flatten()
+    }
 }
 
 /// The destination record a commit writes: nothing under the dormant clock
@@ -607,6 +692,57 @@ impl MdbxChainContext {
             MdbxContextError::Corrupt("destination record cannot be brought back to the tip")
         })?;
         Ok((state, keys))
+    }
+
+    /// The durable guardian state and undo of the tip whose height is
+    /// `tip_height` (nothing under the dormant clock), T3.6.
+    fn load_guardian(
+        store: &MdbxStore,
+        tip_height: u64,
+    ) -> Result<(Option<GuardianState>, Vec<(u64, GuardianUndo)>), MdbxContextError> {
+        let activation = GuardianRules::current().activation_height;
+        if activation.is_none() {
+            return Ok((None, Vec::new()));
+        }
+        let Some(bytes) = store.get_guardian_record()? else {
+            return Ok((None, Vec::new()));
+        };
+        let (state, undo) = decode_guardian_record(&bytes)
+            .map_err(|_| MdbxContextError::Corrupt("guardian record is malformed"))?;
+        truncate_guardian(Some(state), undo, tip_height, activation).map_err(|_| {
+            MdbxContextError::Corrupt("guardian record cannot be brought back to the tip")
+        })
+    }
+
+    /// The v1.7 guardian state of the tip (`None` below J or under the
+    /// dormant clock).
+    pub fn guardian_state(&self) -> Option<&GuardianState> {
+        self.guardian.as_ref()
+    }
+
+    /// The guardian rules of `block` against the guardian state of its
+    /// parent, the current tip (at J: a fresh state on the parent's
+    /// `alloc_counter`, never a default): the state after the block, `None`
+    /// below J (T3.6).
+    fn validate_guardian(
+        &self,
+        block: &Block,
+        parent: &BlockHeader,
+    ) -> Result<Option<GuardianState>, MdbxContextError> {
+        let rules = GuardianRules::current();
+        let height = block.header.height;
+        let Some(parent_state) = GuardianState::for_child(
+            self.guardian.as_ref(),
+            parent.alloc_counter,
+            height,
+            rules.activation_height,
+        ) else {
+            return Ok(None);
+        };
+        let branch = ContextGuardianBranch { context: self };
+        validate_block_guardian(block, &parent_state, &branch, &rules)
+            .map(Some)
+            .map_err(|error| MdbxContextError::Consensus(ConsensusError::Guardian(error)))
     }
 
     /// The durable registry of the tip whose height is `tip_height`: an entry
@@ -891,6 +1027,8 @@ impl MdbxChainContext {
                 client_registry: ClientRegistryState::new(),
                 destination: None,
                 committee_keys: CommitteeKeyCache::default(),
+                guardian: None,
+                guardian_undo: Vec::new(),
             };
             ctx.persist_genesis()?;
             Ok(ctx)
@@ -928,6 +1066,8 @@ impl MdbxChainContext {
                         client_registry: ClientRegistryState::new(),
                         destination: None,
                         committee_keys: CommitteeKeyCache::default(),
+                        guardian: None,
+                        guardian_undo: Vec::new(),
                     };
                     ctx.persist_genesis()?;
                     Ok(ctx)
@@ -965,6 +1105,7 @@ impl MdbxChainContext {
             &meta,
             false,
             None,
+            crate::storage::mdbx_store::DestinationWrite::Untouched,
             crate::storage::mdbx_store::DestinationWrite::Untouched,
         )?;
         Ok(())
@@ -1059,6 +1200,7 @@ impl MdbxChainContext {
         let tip_chain_work = meta.cumulative_chainwork;
         let client_registry = Self::load_client_registry(&store, tip_height)?;
         let (destination, committee_keys) = Self::load_destination(&store, tip_height)?;
+        let (guardian, guardian_undo) = Self::load_guardian(&store, tip_height)?;
 
         Ok(Self {
             store,
@@ -1073,6 +1215,8 @@ impl MdbxChainContext {
             client_registry,
             destination,
             committee_keys,
+            guardian,
+            guardian_undo,
         })
     }
 
@@ -1165,12 +1309,15 @@ impl MdbxChainContext {
         }
         let client_registry = Self::load_client_registry(&self.store, meta.tip_height)?;
         let (destination, committee_keys) = Self::load_destination(&self.store, meta.tip_height)?;
+        let (guardian, guardian_undo) = Self::load_guardian(&self.store, meta.tip_height)?;
 
         self.state = state;
         self.recent_headers = recent_headers;
         self.client_registry = client_registry;
         self.destination = destination;
         self.committee_keys = committee_keys;
+        self.guardian = guardian;
+        self.guardian_undo = guardian_undo;
         self.tip_height = meta.tip_height;
         self.tip_hash = meta.tip_hash;
         self.tip_chain_work = meta.cumulative_chainwork;
@@ -1339,6 +1486,7 @@ impl MdbxChainContext {
         retain_persisted_segments: bool,
         client_effect: &ClientObjectsEffect,
         destination_effect: Option<&DestinationEffect>,
+        guardian_next: Option<GuardianState>,
     ) -> Result<(), MdbxContextError> {
         let mut next_client_registry = self.client_registry.clone();
         next_client_registry.apply(client_effect);
@@ -1382,6 +1530,25 @@ impl MdbxChainContext {
             next_destination.as_ref(),
             next_keys.as_ref().unwrap_or(&self.committee_keys),
         );
+        // T3.6: the guardian state after the block, and its undo.
+        let guardian_parent = GuardianState::for_child(
+            self.guardian.as_ref(),
+            parent.alloc_counter,
+            block.header.height,
+            GuardianRules::current().activation_height,
+        );
+        let mut next_guardian_undo = if guardian_next.is_some() {
+            self.guardian_undo.clone()
+        } else {
+            Vec::new()
+        };
+        if let (Some(before), Some(after)) = (&guardian_parent, &guardian_next) {
+            next_guardian_undo.push((block.header.height, GuardianUndo::between(before, after)));
+            while next_guardian_undo.len() as u64 > GUARDIAN_UNDO_BLOCKS {
+                next_guardian_undo.remove(0);
+            }
+        }
+        let guardian_record = guardian_record_bytes(guardian_next.as_ref(), &next_guardian_undo);
         let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
             .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
         let block_hash = block_id(&block.header);
@@ -1445,6 +1612,7 @@ impl MdbxChainContext {
                     false,
                     persisted_client_registry(&next_client_registry),
                     destination_write(&destination_record),
+                    destination_write(&guardian_record),
                 )
             })();
             if let Err(e) = commit_result {
@@ -1469,6 +1637,8 @@ impl MdbxChainContext {
         if let Some(keys) = next_keys {
             self.committee_keys = keys;
         }
+        self.guardian = guardian_next;
+        self.guardian_undo = next_guardian_undo;
         if !staged {
             self.state.state.clear_dirty();
             if !retain_persisted_segments {
@@ -1592,6 +1762,7 @@ impl MdbxChainContext {
         // neither the registry nor the chain may trust a template.
         let client_effect = self.validate_client_objects(&block, &parent)?;
         let destination_effect = self.validate_destination(&block, &parent)?;
+        let guardian_next = self.validate_guardian(&block, &parent)?;
         self.check_terminal_client_view(&client_view, &client_effect, block.header.height)?;
         if post_state.state.exact_dirty_segment_ids().next().is_some() {
             return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
@@ -1642,6 +1813,7 @@ impl MdbxChainContext {
             false,
             &client_effect,
             destination_effect.as_ref(),
+            guardian_next,
         )?;
         debug_assert_eq!(state_root, block.header.state_root);
         Ok((block, accepted_bundle))
@@ -1696,6 +1868,7 @@ impl MdbxChainContext {
         )?;
         let client_effect = self.validate_client_objects(block, &parent)?;
         let destination_effect = self.validate_destination(block, &parent)?;
+        let guardian_next = self.validate_guardian(block, &parent)?;
 
         // The terminal is bound directly to this uncommitted candidate, never
         // to an older header fetched from storage. There is no canonical
@@ -1782,6 +1955,7 @@ impl MdbxChainContext {
             false,
             &client_effect,
             destination_effect.as_ref(),
+            guardian_next,
         )?;
         Ok(state_root)
     }
@@ -1881,6 +2055,7 @@ impl MdbxChainContext {
         )?;
         let client_effect = self.validate_client_objects(&block, &parent)?;
         let destination_effect = self.validate_destination(&block, &parent)?;
+        let guardian_next = self.validate_guardian(&block, &parent)?;
         if is_final {
             // The suffix tip's IO is the one this node read: its client lanes
             // are checked against the registry of the tip's parent, on this
@@ -1969,6 +2144,7 @@ impl MdbxChainContext {
             !is_final,
             &client_effect,
             destination_effect.as_ref(),
+            guardian_next,
         )?;
         let commit_elapsed = commit_started.elapsed();
 
@@ -2460,6 +2636,22 @@ impl MdbxChainContext {
                 )));
             }
         }
+        match truncate_guardian(
+            self.guardian.take(),
+            std::mem::take(&mut self.guardian_undo),
+            ancestor_height,
+            GuardianRules::current().activation_height,
+        ) {
+            Ok((state, undo)) => {
+                self.guardian = state;
+                self.guardian_undo = undo;
+            }
+            Err(()) => {
+                return Err(self.abort_staged_reorg(MdbxContextError::Corrupt(
+                    "guardian undo cannot reach the reorg ancestor",
+                )));
+            }
+        }
 
         // -----------------------------------------------------------------------
         // Validate the entire fork through the normal terminal-first applier,
@@ -2513,6 +2705,7 @@ impl MdbxChainContext {
         let commit_started = Instant::now();
         let destination_record =
             destination_record_bytes(self.destination.as_ref(), &self.committee_keys);
+        let guardian_record = guardian_record_bytes(self.guardian.as_ref(), &self.guardian_undo);
         let commit_result = (|| -> Result<(), MdbxContextError> {
             let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
             let eff_log = self.state.state.effective_log_segment_size() as u8;
@@ -2546,6 +2739,7 @@ impl MdbxChainContext {
                 &consensus_meta,
                 persisted_client_registry(&self.client_registry),
                 destination_write(&destination_record),
+                destination_write(&guardian_record),
             )?;
             Ok(())
         })();
@@ -3193,6 +3387,8 @@ impl MdbxChainContext {
         // Below J: no destination state (the install dropped any stale record).
         self.destination = None;
         self.committee_keys = CommitteeKeyCache::default();
+        self.guardian = None;
+        self.guardian_undo = Vec::new();
         Ok(())
     }
 
@@ -3476,6 +3672,7 @@ mod tests {
                 false,
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                crate::storage::mdbx_store::DestinationWrite::Untouched,
             )
             .unwrap();
         MdbxChainContext {
@@ -3491,6 +3688,8 @@ mod tests {
             client_registry: ClientRegistryState::new(),
             destination: None,
             committee_keys: CommitteeKeyCache::default(),
+            guardian: None,
+            guardian_undo: Vec::new(),
         }
     }
 
