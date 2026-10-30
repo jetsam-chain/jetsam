@@ -25,7 +25,9 @@ use std::{
 };
 
 use jetsam_chain::block_header::BlockHeader;
-use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
+use jetsam_chain::consensus::destination::state::{
+    CommitteeRef, DestinationRules, DestinationState,
+};
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::vault::ReleasedSet;
 use jetsam_chain::consensus::{
@@ -40,13 +42,15 @@ const SEGMENT_READ_CACHE_CAPACITY: usize = 4;
 
 /// The v1.7 vault as the block after the view's tip is judged against it
 /// (T2.5): the destination state's `bridge_locked` (V8), the withdrawal
-/// indices the branch has paid (D52), and the floor `alloc_counter(J − 1)`
-/// (V1-b).
+/// indices the branch has paid (D52), the floor `alloc_counter(J − 1)`
+/// (V1-b), and the L1 committees the branch knows (which committee update is
+/// still due).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VaultView {
     pub bridge_locked: u64,
     pub released: ReleasedSet,
     pub floor: u64,
+    pub committees: Vec<CommitteeRef>,
 }
 
 /// The [`VaultView`] of the block at `height` after a tip whose destination
@@ -64,6 +68,7 @@ pub fn vault_view_for_child(
             bridge_locked: state.bridge_locked,
             released: state.released,
             floor: state.floor,
+            committees: state.committees,
         }
     })
 }

@@ -260,6 +260,29 @@ pub trait JetsamApi {
     #[method(name = "listClients")]
     async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse>;
 
+    /// v1.7: hand a destination intent (hex of `DestinationIntent::encode`:
+    /// a committee update with the transaction paying it, or a release with
+    /// its finality update, account proof and release group) to this node's
+    /// mempool, for its miners. Refused below J.
+    #[method(name = "submitDestinationObject")]
+    async fn submit_destination_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::destination::SubmitDestinationObjectResponse>;
+
+    /// v1.7: the bridge vault at the tip — `bridge_locked`, ceiling, room
+    /// (V8), floor, opening `F`, paid indices and V6 window, deposits per
+    /// height over the last 1 024 heights, releases held.
+    #[method(name = "getVaultState")]
+    async fn get_vault_state(&self) -> RpcResult<crate::destination::VaultStateResponse>;
+
+    /// v1.7: the L1 sync committees the branch knows, whether this node holds
+    /// their keys, the build's anchor and bridge.
+    #[method(name = "getDestinationCommittee")]
+    async fn get_destination_committee(
+        &self,
+    ) -> RpcResult<crate::destination::DestinationCommitteeResponse>;
+
     /// Assemble a client proof bundle (hex) from its parts: the submission
     /// (`D`, IO commitment), its payment (hex intent) and the proof (hex,
     /// `encode_history_step_client_proof`). No side effect.

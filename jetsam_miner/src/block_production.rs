@@ -154,6 +154,7 @@ impl PreparedBlockAttempt {
             parent_history_step_terminal_bytes,
             prepared_state_commit,
             client_slot,
+            destination,
             ..
         } = template;
 
@@ -222,6 +223,11 @@ impl PreparedBlockAttempt {
         // The v1.5 client objects travel in the body after the transactions;
         // the relation does not read them (their markers are in the pages).
         block.client_objects = client_slot.objects.clone();
+        // v1.7: the destination objects the template's selection carries,
+        // judged with it (T2.5); the relation does not read them either.
+        if block.destination.is_some() {
+            block.destination = Some(destination.unwrap_or_default());
+        }
         let payload_weight = block
             .to_bytes()
             .len()

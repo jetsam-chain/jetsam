@@ -2285,3 +2285,171 @@ fn mempool_refuses_deposit_over_vault_ceiling() {
     let plain = pages(logical(300, PAYER, &[(ALICE, 5)], FEE));
     assert_eq!(check_vault_deposit_room(&plain, ceil, &rules()), Ok(()));
 }
+
+/// T2.5: the mempool's check of a release intent's group
+/// ([`check_release_group`]) accepts exactly the groups the block gate
+/// accepts for that release, alone in a block (nothing paid, empty window,
+/// room in the vault): honest groups with and without change, at 1 and 930
+/// inputs, and one variant per rule the gate applies to a release group.
+#[test]
+fn release_group_check_matches_the_block_gate() {
+    use crate::consensus::fees::fee_breakdown;
+    use crate::consensus::params::coinbase_creation_id;
+    let r = release(3, ALICE, 40 * MICRO_PER_JTM);
+    let floor = 1_000u64;
+    let gate = |group: &[Transaction]| {
+        let ctx = VaultContext {
+            released: &NONE_PAID,
+            released_in_window: 0,
+            bridge_locked: LOCKED,
+            bridge_vault_floor: floor,
+        };
+        validate_block_vault(
+            &block(vec![group.to_vec()], std::slice::from_ref(&r)),
+            &ctx,
+            &rules(),
+            &mut proven,
+        )
+        .is_ok()
+    };
+    let one = |paid: u64, fee: u64, change: u64, outputs_extra: &[(Address, u64)], id: u64| {
+        let mut outputs = vec![(r.owner, paid), (r.marker(), 0)];
+        if change > 0 {
+            outputs.push((VAULT_ADDRESS, change));
+        }
+        outputs.extend_from_slice(outputs_extra);
+        let total = outputs.iter().map(|(_, a)| a).sum::<u64>() + fee;
+        group_with_inputs(100, VAULT_ADDRESS, &[(total, id)], &outputs, fee)
+    };
+    let minimum_930 = fee_breakdown(930, 3, 1_000, 24).required_total;
+    let wide = |paid: u64| {
+        let change = 2 * MICRO_PER_JTM;
+        let total = paid + minimum_930 + change;
+        let each = total / 930;
+        let mut inputs = vec![(each, floor + 5); 929];
+        inputs.push((total - each * 929, floor + 5));
+        group_with_inputs(
+            100,
+            VAULT_ADDRESS,
+            &inputs,
+            &[(r.owner, paid), (r.marker(), 0), (VAULT_ADDRESS, change)],
+            minimum_930,
+        )
+    };
+    let other_marker = release(4, ALICE, r.amount).marker();
+    let cases: Vec<(&str, Vec<Transaction>, bool)> = vec![
+        (
+            "honest, change",
+            one(r.amount - RF, FEE, 3_000, &[], floor + 1),
+            true,
+        ),
+        (
+            "honest, no change",
+            one(r.amount - RF, RF, 0, &[], floor + 1),
+            true,
+        ),
+        ("honest, 930 inputs", wide(r.amount - minimum_930), true),
+        ("930 inputs, bare cap", wide(r.amount - RF), false),
+        (
+            "paid one more",
+            one(r.amount - RF + 1, FEE, 3_000, &[], floor + 1),
+            false,
+        ),
+        (
+            "paid one less",
+            one(r.amount - RF - 1, FEE, 3_000, &[], floor + 1),
+            false,
+        ),
+        (
+            "fee above R",
+            one(r.amount - RF, RF + 1, 3_000, &[], floor + 1),
+            false,
+        ),
+        (
+            "extra output",
+            one(r.amount - RF, FEE, 3_000, &[(BOB, 1)], floor + 1),
+            false,
+        ),
+        (
+            "input at the floor",
+            one(r.amount - RF, FEE, 3_000, &[], floor),
+            false,
+        ),
+        (
+            "coinbase input",
+            one(
+                r.amount - RF,
+                FEE,
+                3_000,
+                &[],
+                coinbase_creation_id(floor + 9),
+            ),
+            false,
+        ),
+        (
+            "change to another owner",
+            group_with_inputs(
+                100,
+                VAULT_ADDRESS,
+                &[(r.amount - RF + FEE + 3_000, floor + 1)],
+                &[(r.owner, r.amount - RF), (r.marker(), 0), (BOB, 3_000)],
+                FEE,
+            ),
+            false,
+        ),
+        (
+            "marker of another n",
+            group_with_inputs(
+                100,
+                VAULT_ADDRESS,
+                &[(r.amount - RF + FEE, floor + 1)],
+                &[(r.owner, r.amount - RF), (other_marker, 0)],
+                FEE,
+            ),
+            false,
+        ),
+        (
+            "paid to another owner",
+            group_with_inputs(
+                100,
+                VAULT_ADDRESS,
+                &[(r.amount - RF + FEE, floor + 1)],
+                &[(BOB, r.amount - RF), (r.marker(), 0)],
+                FEE,
+            ),
+            false,
+        ),
+        (
+            "not spent from the vault",
+            group_with_inputs(
+                100,
+                PAYER,
+                &[(r.amount - RF + FEE, floor + 1)],
+                &[(r.owner, r.amount - RF), (r.marker(), 0)],
+                FEE,
+            ),
+            false,
+        ),
+    ];
+    for (name, group, expected) in &cases {
+        assert_eq!(gate(group), *expected, "{name}: the block gate");
+        assert_eq!(
+            check_release_group(&pages(group.clone()), &r, &rules(), floor).is_ok(),
+            *expected,
+            "{name}: the mempool's check"
+        );
+    }
+    // A burn of an unpayable shape is refused whatever its group.
+    let poisoned = release(5, VAULT_ADDRESS, 3 * MICRO_PER_JTM);
+    let group = group_with_inputs(
+        100,
+        VAULT_ADDRESS,
+        &[(3 * MICRO_PER_JTM - RF + FEE, floor + 1)],
+        &[
+            (VAULT_ADDRESS, 3 * MICRO_PER_JTM - RF),
+            (poisoned.marker(), 0),
+        ],
+        FEE,
+    );
+    assert!(check_release_group(&pages(group), &poisoned, &rules(), floor).is_err());
+}

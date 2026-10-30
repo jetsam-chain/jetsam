@@ -87,6 +87,10 @@ pub struct BlockTemplate {
     /// proof it carries and the registry leaves it publishes. Empty below
     /// the v1.5 height.
     pub client_slot: crate::client_slot::TemplateClientSlot,
+    /// The v1.7 destination section (T2.5): the destination objects whose
+    /// transactions the block carries, judged by the destination rules of
+    /// its height. `None` below J.
+    pub destination: Option<jetsam_chain::consensus::destination::DestinationSection>,
 }
 
 impl BlockTemplate {
@@ -101,7 +105,7 @@ impl BlockTemplate {
     pub fn seal(&self, nonce: u128) -> Block {
         let header = self.inner.clone().into_header(nonce);
         let destination = jetsam_chain::consensus::params::v1_7_active(header.height)
-            .then(jetsam_chain::consensus::destination::DestinationSection::default);
+            .then(|| self.destination.clone().unwrap_or_default());
         Block {
             header,
             transactions: self.inner.all_txs(),
@@ -140,6 +144,11 @@ pub struct TemplateChainSnapshot {
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
     /// The v1.5 client registry of the parent, on its branch.
     pub client_registry: jetsam_chain::consensus::client_objects::ClientRegistryState,
+    /// v1.7: the destination state the child is judged against (at J a
+    /// fresh one on the parent's `alloc_counter`), `None` below J; and the
+    /// keys of the L1 committees it names (D57).
+    pub destination: Option<jetsam_chain::consensus::destination::state::DestinationState>,
+    pub committee_keys: jetsam_chain::consensus::destination::state::CommitteeKeyCache,
     store: MdbxStore,
 }
 
@@ -249,6 +258,13 @@ impl TemplateChainSnapshot {
             child_previous_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             client_registry: ctx.client_registry().clone(),
+            destination: jetsam_chain::consensus::destination::state::DestinationState::for_child(
+                ctx.destination_state(),
+                parent.alloc_counter,
+                parent.height.saturating_add(1),
+                &jetsam_chain::consensus::destination::state::DestinationRules::current(),
+            ),
+            committee_keys: ctx.committee_keys().clone(),
             store: ctx.store.clone(),
         })
     }
@@ -512,9 +528,37 @@ impl TemplateBuilder {
                 }
             }
         }
-        let held_pages: usize = held_payments.iter().map(|payment| payment.pages.len()).sum();
+        // v1.7 destination slot (T2.5): what the branch can use of the
+        // destination intents the pool holds, their transactions offered
+        // beside the client payments.
+        let destination_rules =
+            jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let offer = match &snapshot.destination {
+            Some(state) if destination_rules.active_at(child_height) => {
+                let (updates, releases) = self.mempool.destination_candidates().await;
+                let anchor_ok =
+                    |anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation);
+                crate::destination_slot::plan_destination_offer(
+                    state,
+                    &destination_rules,
+                    child_height,
+                    updates,
+                    releases,
+                    &anchor_ok,
+                    0,
+                )
+            }
+            _ => crate::destination_slot::DestinationOffer::default(),
+        };
+        let offers_destination = !offer.is_empty();
+        let held_pages: usize = held_payments
+            .iter()
+            .chain(offer.payments())
+            .map(|payment| payment.pages.len())
+            .sum();
         let held_slots: HashSet<u32> = held_payments
             .iter()
+            .chain(offer.payments())
             .flat_map(|payment| payment.pages.iter())
             .flat_map(|page| {
                 page.body
@@ -552,6 +596,20 @@ impl TemplateBuilder {
                     })
             })
             .collect();
+        // V8 in the order the chain template places the groups (A1 bis
+        // n-6): a deposit that would take the vault over its ceiling stays
+        // in the pool. Judged without the offer's releases, so that the block
+        // built again without its destination objects keeps V8 too.
+        let entries = match &snapshot.destination {
+            Some(state) => crate::destination_slot::deposits_within_ceiling(
+                entries,
+                |entry| entry.pages.as_slice(),
+                &crate::destination_slot::DestinationOffer::default(),
+                state.bridge_locked,
+                &destination_rules.vault,
+            ),
+            None => entries,
+        };
         // Keep each authorization paired with its indivisible logical group;
         // flatten only the public pages passed into the chain template.
         let (authorization_bytes, groups): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
@@ -582,6 +640,15 @@ impl TemplateBuilder {
             .map(|page| jetsam_tx::Transaction::new(page.body))
             .collect();
         let mempool_txs = txs.clone();
+        for payment in offer.payments() {
+            if let Ok(spend) = jetsam_tx::validate_paged_spend(&payment.pages) {
+                proof_by_hash.insert(
+                    spend.logical_txid,
+                    Some(payment.authorization_bytes.clone()),
+                );
+            }
+        }
+        let destination_txs = offer.payment_order();
         for payment in &held_payments {
             if let Ok(spend) = jetsam_tx::validate_paged_spend(&payment.pages) {
                 proof_by_hash.insert(spend.logical_txid, Some(payment.authorization_bytes.clone()));
@@ -593,12 +660,13 @@ impl TemplateBuilder {
                 );
             }
         }
-
         // Fault in only segments referenced by the admitted transaction set.
         // The canonical snapshot itself remains metadata-only, so template
         // construction never clones unrelated UTXO columns.
         let mut state = snapshot.state.clone();
-        if let Err(error) = snapshot.hydrate_transaction_segments(&mut state, &txs) {
+        let hydrate: Vec<jetsam_tx::Transaction> =
+            txs.iter().chain(destination_txs.iter()).cloned().collect();
+        if let Err(error) = snapshot.hydrate_transaction_segments(&mut state, &hydrate) {
             tracing::warn!(err = %error, "template touched-segment hydration failed");
             return None;
         }
@@ -609,6 +677,12 @@ impl TemplateBuilder {
         let offers_clients = !held_payments.is_empty();
         let client_registry = &snapshot.client_registry;
         let offered = &offered;
+        let offer_ref = &offer;
+        let destination_state = snapshot.destination.as_ref();
+        let committee_keys = &snapshot.committee_keys;
+        // What a destination refusal blames, forgotten by the pool once the
+        // CPU phase is over.
+        let mut blamed: Option<crate::destination_slot::Culprits> = None;
         let template_cpu_result = install_history_step_phase_cpu(|| {
             let build = |txs| {
                 jetsam_chain::consensus::template::build_node_owned_block_template(
@@ -660,59 +734,143 @@ impl TemplateBuilder {
                 }
                 Ok::<_, jetsam_chain::consensus::client_objects::ClientObjectError>(slot)
             };
-            match build(txs) {
-                Ok(built) => match judged(&built.0, true) {
-                    Ok(slot) => return Some((built, slot)),
-                    // The held client objects make a block the rules refuse:
-                    // the block goes out without them rather than not at all,
-                    // and an offered batch is not offered again.
-                    Err(error) if offers_clients => {
-                        if let (Some(batch), Some(source)) = (&offered_batch, &self.client_source) {
-                            source.forget_batch(&batch.submission);
-                        }
-                        tracing::warn!(
-                            %error,
-                            "template refused by the client-object rules with its held client \
-                             payments: built again without them"
-                        )
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            "template refused by the client-object rules of its height"
-                        );
-                        return None;
-                    }
-                },
-                // A held client payment no longer applies (spent, or its
-                // slot taken): the block goes out without the client objects
-                // rather than not at all.
-                Err(error) if offers_clients => {
-                    tracing::info!(err = ?error, "template without its held client payments");
+            // v1.7 (T2.5): the destination section of a selection — the
+            // offer's objects whose transactions it kept, or none — and the
+            // destination rules applied to the block it makes, against the
+            // parent's destination state: what the commit will judge.
+            let judged_destination = |inner: &jetsam_chain::consensus::template::BlockTemplate,
+                                      with_destination: bool| {
+                if !destination_rules.active_at(child_height) {
+                    return Ok(None);
                 }
-                Err(error) => {
-                    tracing::warn!(err = ?error, "template build failed");
+                let section = if with_destination {
+                    offer_ref.section_for(&inner.txs)
+                } else {
+                    jetsam_chain::consensus::destination::DestinationSection::default()
+                };
+                let Some(parent_state) = destination_state else {
+                    return Err(
+                        jetsam_chain::consensus::destination::state::DestinationBlockError::StateNotParent {
+                            tip: parent.height,
+                            height: child_height,
+                        },
+                    );
+                };
+                let block = Block {
+                    header: inner.clone().into_header(0),
+                    transactions: inner.all_txs(),
+                    client_objects: Vec::new(),
+                    destination: Some(section.clone()),
+                };
+                jetsam_chain::consensus::destination::state::validate_block_destination(
+                    &block,
+                    parent_state,
+                    &destination_rules,
+                    committee_keys,
+                )
+                .map(|_| Some(section))
+            };
+            enum Refusal {
+                Build(String),
+                Client(jetsam_chain::consensus::client_objects::ClientObjectError),
+                Destination(jetsam_chain::consensus::destination::state::DestinationBlockError),
+            }
+            let attempt =
+                |txs: Vec<jetsam_tx::Transaction>, with_clients: bool, with_destination: bool| {
+                    let built = build(txs).map_err(|error| Refusal::Build(format!("{error:?}")))?;
+                    let slot = judged(&built.0, with_clients).map_err(Refusal::Client)?;
+                    let section = judged_destination(&built.0, with_destination)
+                        .map_err(Refusal::Destination)?;
+                    Ok::<_, Refusal>((built, slot, section))
+                };
+            let report = |refusal: &Refusal, what: &str| match refusal {
+                Refusal::Build(error) => tracing::warn!(%error, "template build failed {what}"),
+                Refusal::Client(error) => {
+                    tracing::warn!(%error, "template refused by the client-object rules {what}")
+                }
+                Refusal::Destination(error) => {
+                    tracing::warn!(%error, "template refused by the destination rules {what}")
+                }
+            };
+            // 1. Everything held: client payments and the destination offer.
+            let mut everything = txs.clone();
+            everything.extend(destination_txs.iter().cloned());
+            match attempt(everything, true, offers_destination) {
+                Ok(built) => return Some(built),
+                // The destination objects make a block the rules refuse, or
+                // one of their transactions no longer applies: the block goes
+                // out without them, and what the refusal blames is forgotten.
+                Err(refusal) if offers_destination => {
+                    if let Refusal::Destination(error) = &refusal {
+                        blamed = Some(crate::destination_slot::culprits_of(error, offer_ref));
+                    }
+                    if let (Refusal::Client(_), Some(batch), Some(source)) =
+                        (&refusal, &offered_batch, &self.client_source)
+                    {
+                        source.forget_batch(&batch.submission);
+                    }
+                    report(
+                        &refusal,
+                        "with its destination objects: built again without them",
+                    );
+                    // 2. Without the destination offer.
+                    match attempt(txs.clone(), true, false) {
+                        Ok(built) => return Some(built),
+                        Err(refusal) if offers_clients => report(
+                            &refusal,
+                            "with its held client payments: built again without them",
+                        ),
+                        Err(refusal) => {
+                            report(&refusal, "at its height");
+                            return None;
+                        }
+                    }
+                }
+                // The held client objects make a block the rules refuse:
+                // the block goes out without them rather than not at all,
+                // and an offered batch is not offered again.
+                Err(refusal) if offers_clients => {
+                    if let (Refusal::Client(_), Some(batch), Some(source)) =
+                        (&refusal, &offered_batch, &self.client_source)
+                    {
+                        source.forget_batch(&batch.submission);
+                    }
+                    report(
+                        &refusal,
+                        "with its held client payments: built again without them",
+                    );
+                }
+                Err(refusal) => {
+                    report(&refusal, "at its height");
                     return None;
                 }
             }
-            match build(mempool_txs) {
-                Ok(built) => match judged(&built.0, false) {
-                    Ok(slot) => Some((built, slot)),
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            "template refused by the client-object rules of its height"
-                        );
-                        None
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(err = ?error, "template build failed");
+            // 3. The mempool's selection alone.
+            match attempt(mempool_txs, false, false) {
+                Ok(built) => Some(built),
+                Err(refusal) => {
+                    report(&refusal, "at its height");
                     None
                 }
             }
         });
-        let ((inner, prepared_state_commit), client_slot) = match template_cpu_result {
+        if let Some(culprits) = blamed {
+            self.mempool
+                .forget_destination(
+                    &culprits.releases,
+                    culprits
+                        .committee_update
+                        .then(|| {
+                            offer
+                                .committee_update
+                                .as_ref()
+                                .and_then(|u| u.next_period())
+                        })
+                        .flatten(),
+                )
+                .await;
+        }
+        let ((inner, prepared_state_commit), client_slot, destination) = match template_cpu_result {
             Ok(Some(built)) => built,
             Ok(None) => return None,
             Err(error) => {
@@ -720,10 +878,24 @@ impl TemplateBuilder {
                 return None;
             }
         };
+        if destination
+            .as_ref()
+            .is_some_and(|section| !section.objects.is_empty())
+        {
+            tracing::info!(
+                height = child_height,
+                objects = destination
+                    .as_ref()
+                    .map_or(0, |section| section.objects.len()),
+                "template carries destination objects"
+            );
+        }
         if !client_slot.objects.is_empty() {
             tracing::info!(
                 height = child_height,
                 objects = client_slot.objects.len(),
+
+
                 carries = %client_slot
                     .carried
                     .as_ref()
@@ -763,6 +935,7 @@ impl TemplateBuilder {
             parent_history_step_terminal_bytes: snapshot.parent_history_step_terminal_bytes,
             prepared_state_commit,
             client_slot,
+            destination,
         })
     }
 }
@@ -900,11 +1073,9 @@ pub(crate) fn template_timestamp(
         v1_6_activation,
     ))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn payout_position_stays_inside_the_selected_proof_class() {
         use jetsam_chain::consensus::development_allocation::{
@@ -1086,6 +1257,7 @@ mod tests {
     #[test]
     fn the_template_of_j_never_offers_a_marker_payment_without_its_object() {
         let rules = b1_rules();
+
         let plain = selected(b1_page(Address([0xB6; 32]), 900, 100));
         let marker = selected(b1_page(marker_owner(), 900, 100));
         let plain_id = plain.logical_txid;

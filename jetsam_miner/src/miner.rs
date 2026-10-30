@@ -152,6 +152,9 @@ pub enum MinerEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MiningMempoolRefresh {
     TransactionAdmitted,
+    /// v1.7: a destination object (a release, a committee update) was
+    /// admitted; the template is rebuilt even when it carries transactions.
+    DestinationObjectAdmitted,
     ReceiverLagged(u64),
 }
 
@@ -159,16 +162,32 @@ enum MiningMempoolRefresh {
 /// template. Confirmations and evictions emitted while applying our own block
 /// belong to the previous height and must not cancel fresh PoW on the next
 /// height.
+#[cfg(test)]
 async fn next_mining_mempool_refresh(
     receiver: &mut broadcast::Receiver<MempoolEvent>,
 ) -> MiningMempoolRefresh {
+    next_mining_mempool_refresh_with(receiver, true).await
+}
+
+/// [`next_mining_mempool_refresh`] for a template that is coinbase-only or
+/// not: a plain admission refreshes only a coinbase-only template; the
+/// admission of a destination object refreshes any (SPEC retour §1.3: a
+/// release waits for one block less at the p90).
+async fn next_mining_mempool_refresh_with(
+    receiver: &mut broadcast::Receiver<MempoolEvent>,
+    coinbase_only: bool,
+) -> MiningMempoolRefresh {
     loop {
         match receiver.recv().await {
-            Ok(MempoolEvent::TxAdmitted { .. }) => {
+            Ok(MempoolEvent::TxAdmitted { .. }) if coinbase_only => {
                 return MiningMempoolRefresh::TransactionAdmitted;
             }
+            Ok(MempoolEvent::DestinationObjectAdmitted { .. }) => {
+                return MiningMempoolRefresh::DestinationObjectAdmitted;
+            }
             Ok(
-                MempoolEvent::TxConfirmed { .. }
+                MempoolEvent::TxAdmitted { .. }
+                | MempoolEvent::TxConfirmed { .. }
                 | MempoolEvent::TxEvicted { .. }
                 | MempoolEvent::TxAuthorizationVerified { .. },
             ) => {}
@@ -1035,7 +1054,7 @@ impl BlockMiner {
                         tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
                     }
 
-                    refresh = next_mining_mempool_refresh(&mut mempool_events), if user_pages == 0 => {
+                    refresh = next_mining_mempool_refresh_with(&mut mempool_events, user_pages == 0) => {
                         // No blocking PoW task may escape this select branch. A
                         // new transaction must be included immediately. Lag is
                         // conservative because the missed range may contain an
@@ -1046,6 +1065,9 @@ impl BlockMiner {
                         match refresh {
                             MiningMempoolRefresh::TransactionAdmitted => {
                                 tracing::debug!("coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
+                            }
+                            MiningMempoolRefresh::DestinationObjectAdmitted => {
+                                tracing::info!("destination object admitted: cancelling PoW to rebuild the template with it");
                             }
                             MiningMempoolRefresh::ReceiverLagged(skipped) => {
                                 tracing::debug!(skipped, "coinbase-only template: mempool receiver lagged, rebuilding after PoW drain");
@@ -1237,6 +1259,50 @@ mod tests {
             .await
             .unwrap(),
             MiningMempoolRefresh::TransactionAdmitted,
+        );
+    }
+
+    /// T2.5 (SPEC retour §1.3, §6.2): the admission of a destination object
+    /// wakes the miner even while its template already carries transactions
+    /// (a plain admission does not, then), and it is not mistaken for one.
+    #[tokio::test]
+    async fn miner_rebuilds_template_on_release_admission_with_user_pages() {
+        let (sender, mut receiver) = broadcast::channel(8);
+        sender
+            .send(MempoolEvent::TxAdmitted {
+                hash: jetsam_poseidon2b::primitives::TxBodyHash([0x22; 32]),
+                fee: 1,
+                intent_bytes: Arc::from(Vec::<u8>::new().into_boxed_slice()),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                next_mining_mempool_refresh_with(&mut receiver, false),
+            )
+            .await
+            .is_err(),
+            "with user pages, a plain admission does not cancel the PoW",
+        );
+        sender
+            .send(MempoolEvent::DestinationObjectAdmitted { release: Some(7) })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_mining_mempool_refresh_with(&mut receiver, false),
+            )
+            .await
+            .unwrap(),
+            MiningMempoolRefresh::DestinationObjectAdmitted,
+        );
+        // Coinbase-only: both wake it, each for what it is.
+        sender
+            .send(MempoolEvent::DestinationObjectAdmitted { release: None })
+            .unwrap();
+        assert_eq!(
+            next_mining_mempool_refresh_with(&mut receiver, true).await,
+            MiningMempoolRefresh::DestinationObjectAdmitted,
         );
     }
 

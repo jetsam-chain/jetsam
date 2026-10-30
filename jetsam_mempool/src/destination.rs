@@ -1,0 +1,397 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! v1.7 (T2.5): the destination objects this node holds for its miners.
+//!
+//! A destination object never travels alone, and never as a plain
+//! transaction: it travels as an **intent** with the transaction that the
+//! block carries for it.
+//!
+//! * A **committee update** (`CommitteeUpdate`, one per L1 period) with the
+//!   transaction that pays for it and carries its `JTMLCU01` marker.
+//! * A **release** (`VaultRelease` and its storage proof) with the finality
+//!   update and the bridge account proof it was proven under, and its release
+//!   group: the spend from the vault (published secret) that pays the burn's
+//!   owner `amount − R` (D59), its `JTMVRL01` marker and the change.
+//!
+//! The pool checks at admission what does not need the L1 light client
+//! (shapes, the release group against the vault gate, slots, the payment's
+//! authorization). The BLS signatures and the storage proofs need the
+//! committee keys of the chain: the template checks the whole destination
+//! section with `validate_block_destination` before it mines, and builds
+//! again without the objects it refuses.
+
+use std::collections::BTreeMap;
+
+use jetsam_chain::consensus::destination::forks::period_of_slot;
+use jetsam_chain::consensus::destination::ssz::{LightClientFinalityUpdate, LightClientUpdate};
+use jetsam_chain::consensus::destination::state::committee_update_marker;
+use jetsam_chain::consensus::destination::{DestinationObject, DestinationObjectKind};
+use jetsam_chain::consensus::vault::{decode_proof_nodes, destination_marker_kind, VaultRelease};
+use jetsam_chain::consensus::wire_limits::{
+    MAX_DESTINATION_SECTION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
+};
+use jetsam_tx::PagedSpendIntent;
+
+/// First bytes of an encoded destination intent.
+pub const DESTINATION_INTENT_MAGIC: [u8; 8] = *b"JTMDIN01";
+/// Largest encoded intent: its objects within one destination section, its
+/// transaction within the global intent bound.
+pub const MAX_DESTINATION_INTENT_BYTES: usize = DESTINATION_INTENT_MAGIC.len()
+    + 1
+    + 4 * 4
+    + MAX_DESTINATION_SECTION_BYTES
+    + MAX_TX_INTENT_BYTES_GLOBAL;
+/// Committee updates held at once (one per period; a block carries one).
+pub const MAX_HELD_COMMITTEE_UPDATES: usize = 4;
+/// Releases held at once (one per withdrawal index `n`).
+pub const MAX_HELD_RELEASES: usize = 64;
+
+const KIND_COMMITTEE_UPDATE: u8 = 1;
+const KIND_RELEASE: u8 = 2;
+
+/// A committee update with the transaction that pays for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitteeUpdateIntent {
+    /// The `LightClientUpdate` payload (SSZ).
+    pub payload: Vec<u8>,
+    /// Carries the update's `JTMLCU01` marker.
+    pub payment: PagedSpendIntent,
+}
+
+impl CommitteeUpdateIntent {
+    /// The period whose committee this update brings (attested period + 1).
+    pub fn next_period(&self) -> Option<u64> {
+        LightClientUpdate::decode_payload(&self.payload)
+            .ok()
+            .and_then(|update| period_of_slot(update.attested_header.beacon.slot).checked_add(1))
+    }
+
+    pub fn object(&self) -> DestinationObject {
+        DestinationObject {
+            kind: DestinationObjectKind::CommitteeUpdate,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+/// A release with what proves it and the group that pays it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseIntent {
+    pub release: VaultRelease,
+    /// The `LightClientFinalityUpdate` payload it is proven under.
+    pub finality: Vec<u8>,
+    /// The bridge account proof under that update's finalized root.
+    pub account_proof: Vec<u8>,
+    /// The release group: a spend from the vault.
+    pub payment: PagedSpendIntent,
+}
+
+/// One destination object with its transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DestinationIntent {
+    CommitteeUpdate(CommitteeUpdateIntent),
+    Release(ReleaseIntent),
+}
+
+/// Why bytes are not a destination intent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DestinationIntentError {
+    TooLarge {
+        actual: usize,
+        max: usize,
+    },
+    BadMagic,
+    UnknownKind(u8),
+    Truncated,
+    TrailingBytes,
+    /// An object payload over the section budget, or empty.
+    ObjectSize,
+    /// A payload that does not decode as its object.
+    MalformedObject(DestinationObjectKind),
+    /// The transaction does not decode, or is not this intent's.
+    Payment(String),
+}
+
+impl std::fmt::Display for DestinationIntentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn take<'a>(src: &mut &'a [u8]) -> Result<&'a [u8], DestinationIntentError> {
+    if src.len() < 4 {
+        return Err(DestinationIntentError::Truncated);
+    }
+    let len = u32::from_le_bytes(src[..4].try_into().expect("four bytes")) as usize;
+    let rest = &src[4..];
+    if rest.len() < len {
+        return Err(DestinationIntentError::Truncated);
+    }
+    let (head, tail) = rest.split_at(len);
+    *src = tail;
+    Ok(head)
+}
+
+fn object_bytes<'a>(src: &mut &'a [u8]) -> Result<&'a [u8], DestinationIntentError> {
+    let bytes = take(src)?;
+    if bytes.is_empty() || bytes.len() > MAX_DESTINATION_SECTION_BYTES {
+        return Err(DestinationIntentError::ObjectSize);
+    }
+    Ok(bytes)
+}
+
+fn payment_of(bytes: &[u8]) -> Result<PagedSpendIntent, DestinationIntentError> {
+    if bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
+        return Err(DestinationIntentError::TooLarge {
+            actual: bytes.len(),
+            max: MAX_TX_INTENT_BYTES_GLOBAL,
+        });
+    }
+    let mut src = bytes;
+    let intent = PagedSpendIntent::decode(&mut src)
+        .map_err(|e| DestinationIntentError::Payment(format!("{e:?}")))?;
+    if !src.is_empty() {
+        return Err(DestinationIntentError::TrailingBytes);
+    }
+    Ok(intent)
+}
+
+impl DestinationIntent {
+    /// `magic ‖ kind ‖ (len:u32 LE ‖ bytes)*`: a committee update carries its
+    /// payload and its payment; a release its object payload, finality
+    /// update, account proof and release group.
+    pub fn encode(&self) -> Result<Vec<u8>, DestinationIntentError> {
+        let mut out = DESTINATION_INTENT_MAGIC.to_vec();
+        let payment = |intent: &PagedSpendIntent| {
+            intent
+                .to_bytes()
+                .map_err(|e| DestinationIntentError::Payment(format!("{e:?}")))
+        };
+        match self {
+            Self::CommitteeUpdate(update) => {
+                out.push(KIND_COMMITTEE_UPDATE);
+                put(&mut out, &update.payload);
+                put(&mut out, &payment(&update.payment)?);
+            }
+            Self::Release(release) => {
+                out.push(KIND_RELEASE);
+                put(&mut out, &release.release.encode_payload());
+                put(&mut out, &release.finality);
+                put(&mut out, &release.account_proof);
+                put(&mut out, &payment(&release.payment)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The canonical decoding, bounded before anything is allocated beyond
+    /// the input; each object payload is decoded as its object.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DestinationIntentError> {
+        if bytes.len() > MAX_DESTINATION_INTENT_BYTES {
+            return Err(DestinationIntentError::TooLarge {
+                actual: bytes.len(),
+                max: MAX_DESTINATION_INTENT_BYTES,
+            });
+        }
+        let Some(rest) = bytes.strip_prefix(&DESTINATION_INTENT_MAGIC) else {
+            return Err(DestinationIntentError::BadMagic);
+        };
+        let (&kind, mut src) = rest
+            .split_first()
+            .ok_or(DestinationIntentError::Truncated)?;
+        let intent = match kind {
+            KIND_COMMITTEE_UPDATE => {
+                let payload = object_bytes(&mut src)?;
+                LightClientUpdate::decode_payload(payload).map_err(|_| {
+                    DestinationIntentError::MalformedObject(DestinationObjectKind::CommitteeUpdate)
+                })?;
+                let payment = payment_of(take(&mut src)?)?;
+                Self::CommitteeUpdate(CommitteeUpdateIntent {
+                    payload: payload.to_vec(),
+                    payment,
+                })
+            }
+            KIND_RELEASE => {
+                let release =
+                    VaultRelease::decode_payload(object_bytes(&mut src)?).map_err(|_| {
+                        DestinationIntentError::MalformedObject(DestinationObjectKind::VaultRelease)
+                    })?;
+                let finality = object_bytes(&mut src)?;
+                LightClientFinalityUpdate::decode_payload(finality).map_err(|_| {
+                    DestinationIntentError::MalformedObject(DestinationObjectKind::FinalityUpdate)
+                })?;
+                let account_proof = object_bytes(&mut src)?;
+                let mut proof = account_proof;
+                decode_proof_nodes(&mut proof)
+                    .ok()
+                    .filter(|_| proof.is_empty())
+                    .ok_or(DestinationIntentError::MalformedObject(
+                        DestinationObjectKind::BridgeAccountProof,
+                    ))?;
+                let payment = payment_of(take(&mut src)?)?;
+                Self::Release(ReleaseIntent {
+                    release,
+                    finality: finality.to_vec(),
+                    account_proof: account_proof.to_vec(),
+                    payment,
+                })
+            }
+            other => return Err(DestinationIntentError::UnknownKind(other)),
+        };
+        if !src.is_empty() {
+            return Err(DestinationIntentError::TrailingBytes);
+        }
+        intent.check_payment_markers()?;
+        Ok(intent)
+    }
+
+    /// The transaction is this object's: a committee update's payment carries
+    /// exactly one v1.7 marker, its own `JTMLCU01`; a release's group carries
+    /// its own `JTMVRL01` (the rest of its shape is the pool's admission).
+    fn check_payment_markers(&self) -> Result<(), DestinationIntentError> {
+        let markers = |intent: &PagedSpendIntent| -> Vec<jetsam_poseidon2b::primitives::Address> {
+            intent
+                .pages
+                .iter()
+                .flat_map(|page| page.body.live_outputs().map(|(_, o)| o.owner))
+                .filter(|owner| destination_marker_kind(owner).is_some())
+                .collect()
+        };
+        let ok = match self {
+            Self::CommitteeUpdate(update) => {
+                markers(&update.payment) == [committee_update_marker(&update.payload)]
+            }
+            Self::Release(release) => markers(&release.payment) == [release.release.marker()],
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(DestinationIntentError::Payment(
+                "the transaction does not carry exactly this object's marker".into(),
+            ))
+        }
+    }
+
+    pub fn payment(&self) -> &PagedSpendIntent {
+        match self {
+            Self::CommitteeUpdate(update) => &update.payment,
+            Self::Release(release) => &release.payment,
+        }
+    }
+}
+
+/// What [`crate::AsyncMempool::submit_destination`] admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DestinationAdmitted {
+    /// A committee update bringing the committee of `period`.
+    CommitteeUpdate { period: u64 },
+    /// The release of withdrawal index `n`.
+    Release { n: u64 },
+}
+
+/// What the pool holds: committee updates by the period they bring, releases
+/// by withdrawal index.
+#[derive(Clone, Debug, Default)]
+pub struct DestinationPool {
+    committee_updates: BTreeMap<u64, CommitteeUpdateIntent>,
+    releases: BTreeMap<u64, ReleaseIntent>,
+}
+
+/// Why the pool does not hold an intent it was offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldError {
+    /// No room left for this kind.
+    Full,
+    /// A committee update whose period does not decode.
+    NoPeriod,
+}
+
+impl DestinationPool {
+    /// Hold `intent`, replacing the one of the same period or index (the
+    /// newer proof wins: a relayer refreshes a release under a later finality
+    /// update).
+    pub fn hold(&mut self, intent: DestinationIntent) -> Result<(), HoldError> {
+        match intent {
+            DestinationIntent::CommitteeUpdate(update) => {
+                let period = update.next_period().ok_or(HoldError::NoPeriod)?;
+                if !self.committee_updates.contains_key(&period)
+                    && self.committee_updates.len() >= MAX_HELD_COMMITTEE_UPDATES
+                {
+                    return Err(HoldError::Full);
+                }
+                self.committee_updates.insert(period, update);
+            }
+            DestinationIntent::Release(release) => {
+                let n = release.release.n;
+                if !self.releases.contains_key(&n) && self.releases.len() >= MAX_HELD_RELEASES {
+                    return Err(HoldError::Full);
+                }
+                self.releases.insert(n, release);
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases by increasing `n` (the template's policy, porte R §3.3).
+    pub fn releases(&self) -> impl Iterator<Item = &ReleaseIntent> {
+        self.releases.values()
+    }
+
+    /// Committee updates by increasing period.
+    pub fn committee_updates(&self) -> impl Iterator<Item = &CommitteeUpdateIntent> {
+        self.committee_updates.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.committee_updates.len() + self.releases.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Forget what a branch no longer needs: releases whose index `paid`
+    /// holds or that `stale` says can no longer be built (inputs spent),
+    /// committee updates for a period at or below `known_period`. Returns
+    /// the number forgotten.
+    pub fn prune(
+        &mut self,
+        paid: impl Fn(u64) -> bool,
+        stale: impl Fn(&ReleaseIntent) -> bool,
+        known_period: Option<u64>,
+    ) -> usize {
+        let before = self.len();
+        self.releases
+            .retain(|n, release| !paid(*n) && !stale(release));
+        if let Some(known) = known_period {
+            self.committee_updates.retain(|period, _| *period > known);
+        }
+        before - self.len()
+    }
+
+    /// Forget the releases of `releases` and the committee update bringing
+    /// `committee_period` (a template's block was refused for them).
+    pub fn forget(&mut self, releases: &[u64], committee_period: Option<u64>) -> usize {
+        let before = self.len();
+        self.releases.retain(|n, _| !releases.contains(n));
+        if let Some(period) = committee_period {
+            self.committee_updates.remove(&period);
+        }
+        before - self.len()
+    }
+
+    /// Forget everything (below J, or a view the pool cannot judge by).
+    pub fn clear(&mut self) {
+        self.committee_updates.clear();
+        self.releases.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

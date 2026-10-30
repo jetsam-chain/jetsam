@@ -37,6 +37,12 @@ pub enum MempoolEvent {
     /// Wallet authorization cached for a transaction (background proving cache).
     /// The block assembler can now use the cached proof.
     TxAuthorizationVerified { hash: TxBodyHash },
+
+    /// v1.7: a destination object was admitted with its transaction (the
+    /// release of `release`, or a committee update when `None`). A miner
+    /// builds its template again, even one that already carries
+    /// transactions (SPEC retour §1.3: 2 to 3 min at the p90).
+    DestinationObjectAdmitted { release: Option<u64> },
 }
 
 /// Why a transaction was evicted.

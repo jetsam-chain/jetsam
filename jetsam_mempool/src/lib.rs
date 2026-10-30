@@ -47,6 +47,7 @@
 //! ```
 
 pub mod config;
+pub mod destination;
 pub mod error;
 pub mod event;
 pub mod floor;

@@ -3345,6 +3345,73 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn submit_destination_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::destination::SubmitDestinationObjectResponse> {
+        let bytes = hex::decode(intent_hex.trim())
+            .map_err(|error| rpc_err(format!("intent_hex: {error}")))?;
+        if bytes.len() > jetsam_mempool::destination::MAX_DESTINATION_INTENT_BYTES {
+            return Err(rpc_err("destination intent too large"));
+        }
+        self.mempool
+            .submit_destination(&bytes)
+            .await
+            .map(Into::into)
+            .map_err(|error| rpc_err(format!("destination intent refused: {error}")))
+    }
+
+    async fn get_vault_state(&self) -> RpcResult<crate::destination::VaultStateResponse> {
+        use crate::destination::{deposit_count_of_outputs, vault_state, DEPOSIT_COUNT_HEIGHTS};
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let held_releases = self.mempool.destination_candidates().await.1.len();
+        let chain = self.chain.read().await;
+        let tip = chain.tip_height();
+        let state = chain.destination_state();
+        let mut deposits = Vec::new();
+        let mut unread = 0u64;
+        if let Some(state) = state {
+            let from = state
+                .start
+                .max(tip.saturating_sub(DEPOSIT_COUNT_HEIGHTS - 1));
+            for height in from..=tip {
+                let block = chain
+                    .store
+                    .get_recent_block(height)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| jetsam_chain::block::Block::from_bytes(&bytes).ok());
+                let Some(block) = block else {
+                    unread += 1;
+                    continue;
+                };
+                let count = deposit_count_of_outputs(block.transactions.iter().flat_map(|tx| {
+                    tx.body
+                        .live_outputs()
+                        .map(|(_, output)| (output.owner, output.amount))
+                        .collect::<Vec<_>>()
+                }));
+                deposits.push((height, count));
+            }
+        }
+        let mut reply = vault_state(state, tip, &rules, &deposits, held_releases);
+        reply.deposit_heights_unread = unread;
+        Ok(reply)
+    }
+
+    async fn get_destination_committee(
+        &self,
+    ) -> RpcResult<crate::destination::DestinationCommitteeResponse> {
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let chain = self.chain.read().await;
+        let keys = chain.committee_keys();
+        Ok(crate::destination::destination_committee(
+            chain.destination_state(),
+            &rules,
+            |root| keys.get(root).is_some(),
+        ))
+    }
+
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = jetsam_poseidon2b::primitives::TxBodyHash(hash_bytes);

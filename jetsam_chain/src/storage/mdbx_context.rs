@@ -555,6 +555,12 @@ impl MdbxChainContext {
         self.destination.as_ref()
     }
 
+    /// The keys of the L1 committees the tip's destination state names (D57),
+    /// for a template's check of its destination section and for RPC.
+    pub fn committee_keys(&self) -> &CommitteeKeyCache {
+        &self.committee_keys
+    }
+
     /// The destination rules of `block` against the destination state of its
     /// parent, the current tip (at J: a fresh state from the parent's
     /// `alloc_counter`, never a default). `None` below J.

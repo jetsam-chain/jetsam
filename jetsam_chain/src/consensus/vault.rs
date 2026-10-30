@@ -934,6 +934,77 @@ pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> boo
         && amount <= rules.window_cap
 }
 
+/// The release group a mempool admits with its release object (T2.5): what
+/// [`validate_block_vault`] asks of one release group, judged alone — the
+/// burn has a payable shape ([`release_shape_ok`]); the group spends only
+/// from the vault, slots created after `floor` and not by a coinbase (V1-b);
+/// its live outputs are `(owner, amount − R)`, the release's marker (value
+/// 0), at most one change to the vault (V2); `amount ≥ R` (V3) and its fee is
+/// at most `R` ([`VaultRules::release_fee_for`], D59). What depends on the
+/// block (paid set, window, V8, V7) is the template's and the block's.
+pub fn check_release_group(
+    pages: &[jetsam_tx::TxPage],
+    release: &VaultRelease,
+    rules: &VaultRules,
+    floor: u64,
+) -> Result<(), VaultError> {
+    if !release_shape_ok(&release.owner, release.amount, rules) {
+        return Err(VaultError::ReleaseShape { group: 0 });
+    }
+    let facts = jetsam_tx::validate_paged_spend(pages).map_err(|_| VaultError::PageStream)?;
+    if facts.input_owner != rules.vault {
+        return Err(VaultError::ReleaseShape { group: 0 });
+    }
+    let outputs: Vec<(Address, u64)> = pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+        .collect();
+    let shape_ok = match outputs.as_slice() {
+        [(payee, _), (marker, 0)] | [(payee, _), (marker, 0), (_, _)] => {
+            *marker == release.marker()
+                && *payee == release.owner
+                && outputs
+                    .get(2)
+                    .is_none_or(|(change, _)| *change == rules.vault)
+        }
+        _ => false,
+    };
+    if !shape_ok {
+        return Err(VaultError::ReleaseShape { group: 0 });
+    }
+    for page in pages {
+        for (_, input) in page.body.live_inputs() {
+            if input.creation_id <= floor || is_coinbase_creation_id(input.creation_id) {
+                return Err(VaultError::ReleaseSpendsPreV1_7Slot { group: 0 });
+            }
+        }
+    }
+    let release_fee =
+        rules.release_fee_for(u64::from(facts.live_inputs), u64::from(facts.live_outputs));
+    if release.amount < release_fee {
+        return Err(VaultError::ReleaseBelowFee {
+            amount: release.amount,
+            fee: release_fee,
+        });
+    }
+    let expected = release.amount - release_fee;
+    if outputs[0].1 != expected {
+        return Err(VaultError::ReleasePaysWrongAmount {
+            group: 0,
+            paid: outputs[0].1,
+            expected,
+        });
+    }
+    if facts.fee > release_fee {
+        return Err(VaultError::ReleaseFeeTooHigh {
+            group: 0,
+            fee: facts.fee,
+            max: release_fee,
+        });
+    }
+    Ok(())
+}
+
 /// V8 at admission, against the tip's `bridge_locked`: a deposit that would
 /// take the vault over the ceiling is refused (it stays with its owner; the
 /// template applies V8 again in block order, T1.1 §18.2).

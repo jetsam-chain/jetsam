@@ -91,6 +91,9 @@ pub(crate) struct MempoolState {
     /// The v1.7 vault rules plain transactions are judged by
     /// ([`MempoolConfig::vault_rules`]).
     pub vault_rules: jetsam_chain::consensus::vault::VaultRules,
+    /// v1.7: destination objects held with their transactions, never in the
+    /// fee pool ([`crate::destination`]).
+    pub destination: crate::destination::DestinationPool,
 }
 
 /// Compact immutable RPC/diagnostic projection of one mempool entry.
@@ -204,6 +207,7 @@ impl AsyncMempool {
             admitted_output_slots: HashSet::new(),
             client_rules: config.client_object_rules,
             vault_rules: config.vault_rules,
+            destination: Default::default(),
         };
         let max_permits = if config.auth_verify_workers == 0 {
             // 0 = unlimited concurrency; verification is still required
@@ -444,7 +448,7 @@ impl AsyncMempool {
         }
         {
             let st = self.state.lock().await;
-            run_admission_checks_with(&intent.pages, &spend, &st, false)?;
+            run_admission_checks_with(&intent.pages, &spend, &st, Admission::ObjectPayment)?;
         }
         let proof_bytes = intent.authorization_bytes.clone();
         let pages = intent.pages.clone();
@@ -462,6 +466,125 @@ impl AsyncMempool {
         .await
         .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
         .map_err(SubmitError::InvalidProof)
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.7 destination objects (T2.5)
+    // -----------------------------------------------------------------------
+
+    /// Admit one encoded destination intent ([`crate::destination`]): a
+    /// committee update with its payment, or a release with its finality
+    /// update, account proof and release group. Checked here: the bytes, the
+    /// v1.7 clock of the next block, the transaction against the current
+    /// state (fee, epoch anchor, live inputs, empty outputs), a committee
+    /// payment's marker, a release's index unpaid on the branch and its group
+    /// against the vault gate (`check_release_group`), then the transaction's
+    /// authorization, outside the lock. Not checked here: the L1 signatures
+    /// and proofs (the template's `validate_block_destination`). Held, never
+    /// put in the fee pool; the miners are woken.
+    pub async fn submit_destination(
+        &self,
+        bytes: &[u8],
+    ) -> Result<crate::destination::DestinationAdmitted, SubmitError> {
+        use crate::destination::{DestinationAdmitted, DestinationIntent, HoldError};
+        let intent = DestinationIntent::decode(bytes).map_err(|error| {
+            SubmitError::MalformedIntent(format!("destination intent: {error}"))
+        })?;
+        let payment = intent.payment();
+        let spend = validate_paged_spend(&payment.pages)
+            .map_err(|e| SubmitError::MalformedIntent(format!("PagedSpend: {e}")))?;
+        if payment.authorization_bytes.is_empty() {
+            return Err(SubmitError::MissingProof);
+        }
+        if payment.authorization_bytes.len() > MAX_AUTHORIZATION_BYTES {
+            return Err(SubmitError::ProofTooLarge {
+                actual: payment.authorization_bytes.len(),
+                max: MAX_AUTHORIZATION_BYTES,
+            });
+        }
+        {
+            let st = self.state.lock().await;
+            check_destination_admission(&intent, &spend, &st)?;
+        }
+        let proof_bytes = payment.authorization_bytes.clone();
+        let pages = payment.pages.clone();
+        let executor = Arc::clone(&self.auth_verify_executor);
+        {
+            let _permit =
+                self.auth_verify_semaphore.acquire().await.map_err(|_| {
+                    SubmitError::Internal("proof-verification semaphore closed".into())
+                })?;
+            tokio::task::spawn_blocking(move || {
+                executor(Box::new(move || {
+                    verify_intent_authorization(&pages, &proof_bytes)
+                }))
+            })
+            .await
+            .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
+            .map_err(SubmitError::InvalidProof)?;
+        }
+        let mut st = self.state.lock().await;
+        check_destination_admission(&intent, &spend, &st)?;
+        let admitted = match &intent {
+            DestinationIntent::CommitteeUpdate(update) => DestinationAdmitted::CommitteeUpdate {
+                period: update.next_period().unwrap_or_default(),
+            },
+            DestinationIntent::Release(release) => DestinationAdmitted::Release {
+                n: release.release.n,
+            },
+        };
+        st.destination.hold(intent).map_err(|error| match error {
+            HoldError::Full => SubmitError::Full {
+                capacity: crate::destination::MAX_HELD_RELEASES,
+            },
+            HoldError::NoPeriod => {
+                SubmitError::MalformedIntent("committee update without a period".into())
+            }
+        })?;
+        let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
+            release: match admitted {
+                DestinationAdmitted::Release { n } => Some(n),
+                DestinationAdmitted::CommitteeUpdate { .. } => None,
+            },
+        });
+        tracing::info!(?admitted, "destination object admitted");
+        Ok(admitted)
+    }
+
+    /// Forget the destination intents a template's block was refused for
+    /// (its releases `releases`, the committee update bringing
+    /// `committee_period`): they are not offered again unless submitted
+    /// again.
+    pub async fn forget_destination(&self, releases: &[u64], committee_period: Option<u64>) {
+        let forgotten = self
+            .state
+            .lock()
+            .await
+            .destination
+            .forget(releases, committee_period);
+        if forgotten > 0 {
+            tracing::warn!(
+                ?releases,
+                ?committee_period,
+                forgotten,
+                "destination intents forgotten: a template's block was refused for them"
+            );
+        }
+    }
+
+    /// The destination intents held for the template: committee updates by
+    /// increasing period, releases by increasing `n`.
+    pub async fn destination_candidates(
+        &self,
+    ) -> (
+        Vec<crate::destination::CommitteeUpdateIntent>,
+        Vec<crate::destination::ReleaseIntent>,
+    ) {
+        let st = self.state.lock().await;
+        (
+            st.destination.committee_updates().cloned().collect(),
+            st.destination.releases().cloned().collect(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -674,6 +797,7 @@ impl AsyncMempool {
         evict_client_object_violations(&mut st, next_height, &self.events);
         // v1.7: likewise for the vault rule (crossing J, reorg).
         evict_vault_violations(&mut st, next_height, &self.events);
+        prune_destination(&mut st, next_height);
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
@@ -836,6 +960,7 @@ impl AsyncMempool {
         let next_height = st.view.tip_height.saturating_add(1);
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events);
+        prune_destination(&mut st, next_height);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
             if st.pool.is_empty() {
@@ -960,19 +1085,34 @@ fn run_admission_checks(
     spend: &PagedSpendFacts,
     st: &MempoolState,
 ) -> Result<u64, SubmitError> {
-    run_admission_checks_with(pages, spend, st, true)
+    run_admission_checks_with(pages, spend, st, Admission::Plain)
 }
 
-/// [`run_admission_checks`]; `pool_rules` off for a transaction paying a
-/// v1.5 client object, which travels with its object and is never admitted
-/// to the pool (M3.8): no marker policy and no conflict with pool entries
-/// (the template builder leaves those out).
+/// What a transaction is admitted as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// A plain transaction of the fee pool: every pool rule.
+    Plain,
+    /// A transaction paying a client or destination object, which travels
+    /// with its object and never enters the pool: no marker policy, no
+    /// conflict with pool entries (the template builder leaves those out).
+    ObjectPayment,
+    /// A release group (T2.5): as an object payment, but its fee is capped
+    /// by the vault gate at `R` (D59), so only the consensus minimum is
+    /// asked, never the dynamic floor; its shape is
+    /// `vault::check_release_group`'s.
+    VaultRelease,
+}
+
+/// [`run_admission_checks`] for a transaction admitted as `admission`
+/// ([`Admission`]).
 fn run_admission_checks_with(
     pages: &[TxPage],
     spend: &PagedSpendFacts,
     st: &MempoolState,
-    pool_rules: bool,
+    admission: Admission,
 ) -> Result<u64, SubmitError> {
+    let pool_rules = admission == Admission::Plain;
     // Dynamic fee floor layered over the deterministic consensus minimum.
     let consensus_required = fee_breakdown(
         u64::from(spend.live_inputs),
@@ -981,7 +1121,11 @@ fn run_admission_checks_with(
         st.view.log_slots(),
     )
     .required_total;
-    let required = st.floor.current().max(consensus_required);
+    let required = if admission == Admission::VaultRelease {
+        consensus_required
+    } else {
+        st.floor.current().max(consensus_required)
+    };
     let actual = spend.fee;
     if actual < required {
         return Err(SubmitError::Consensus(
@@ -1169,6 +1313,98 @@ fn evict_vault_violations(
         });
     }
     refused.len()
+}
+
+/// The admission rules of a destination intent against `st` (module docs of
+/// [`crate::destination`]).
+fn check_destination_admission(
+    intent: &crate::destination::DestinationIntent,
+    spend: &PagedSpendFacts,
+    st: &MempoolState,
+) -> Result<(), SubmitError> {
+    use crate::destination::DestinationIntent;
+    use jetsam_chain::consensus::destination::DestinationError;
+    use jetsam_chain::consensus::vault::{check_release_group, VaultError};
+    let next_height = st.view.tip_height.saturating_add(1);
+    let before_j = || {
+        SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::Destination(
+            DestinationError::SectionBeforeActivation,
+        ))
+    };
+    if !st.vault_rules.active_at(next_height) {
+        return Err(before_j());
+    }
+    match intent {
+        DestinationIntent::CommitteeUpdate(update) => {
+            if spend.input_owner == st.vault_rules.vault {
+                return Err(vault_submit_error(VaultError::SpendFromLockedAddress {
+                    group: 0,
+                }));
+            }
+            run_admission_checks_with(&update.payment.pages, spend, st, Admission::ObjectPayment)?;
+        }
+        DestinationIntent::Release(release) => {
+            let vault = st.view.vault.as_ref().ok_or_else(before_j)?;
+            if vault.released.contains(release.release.n) {
+                return Err(vault_submit_error(VaultError::ReleaseAlreadyPaid {
+                    n: release.release.n,
+                }));
+            }
+            check_release_group(
+                &release.payment.pages,
+                &release.release,
+                &st.vault_rules,
+                vault.floor,
+            )
+            .map_err(vault_submit_error)?;
+            run_admission_checks_with(&release.payment.pages, spend, st, Admission::VaultRelease)?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget the destination intents the next block can no longer use: all of
+/// them below J; above, releases whose index the branch paid or whose vault
+/// slots are no longer live as their group spends them, and committee updates
+/// for a period the branch already knows.
+fn prune_destination(st: &mut MempoolState, next_height: u64) {
+    use jetsam_chain::fri_state::SlotValue;
+    if !st.vault_rules.active_at(next_height) {
+        st.destination.clear();
+        return;
+    }
+    let Some(vault) = st.view.vault.clone() else {
+        return;
+    };
+    let view = &st.view;
+    let forgotten = st.destination.prune(
+        |n| vault.released.contains(n),
+        |release| {
+            let Some(owner) = release
+                .payment
+                .pages
+                .first()
+                .map(|page| page.body.input_owner)
+            else {
+                return true;
+            };
+            release.payment.pages.iter().any(|page| {
+                page.body.live_inputs().any(|(_, input)| {
+                    let expected = SlotValue::with_owner_fields(
+                        input.amount,
+                        input.creation_id,
+                        owner.as_fields(),
+                    );
+                    view.try_slot(input.slot_index)
+                        .map_or(true, |slot| slot != expected)
+                })
+            })
+        },
+        vault.committees.last().map(|committee| committee.period),
+    );
+    if forgotten > 0 {
+        tracing::debug!(forgotten, "destination intents the branch no longer needs");
+    }
 }
 
 fn rebuild_slot_sets(st: &mut MempoolState) {
@@ -1569,6 +1805,7 @@ mod tests {
             admitted_output_slots: HashSet::new(),
             client_rules: MempoolConfig::default().client_object_rules,
             vault_rules: MempoolConfig::default().vault_rules,
+            destination: Default::default(),
         };
 
         let spend = |fee: u64| {
@@ -1748,6 +1985,7 @@ mod tests {
             admitted_output_slots: HashSet::new(),
             client_rules: MempoolConfig::default().client_object_rules,
             vault_rules: MempoolConfig::default().vault_rules,
+            destination: Default::default(),
         };
         let required = jetsam_chain::consensus::fee_breakdown(
             1,
@@ -2144,6 +2382,7 @@ mod tests {
                     bridge_locked,
                     released: Default::default(),
                     floor: 0,
+                    committees: Vec::new(),
                 });
             }
             view
@@ -2285,6 +2524,292 @@ mod tests {
                 opening: CROSSING_J + 8
             })
         );
+    }
+
+    /// The floor of the release tests: `alloc_counter(J − 1)`.
+    const RELEASE_FLOOR: u64 = 10;
+
+    /// A vault slot created after the floor (not by a coinbase) and the
+    /// release intent whose group spends it whole: `(owner, amount − R)` and
+    /// the marker, fee `R`, bound to the epoch anchor of the child of `tip`.
+    struct ReleaseCase {
+        state: ChainState,
+        intent: crate::destination::DestinationIntent,
+        n: u64,
+    }
+
+    impl ReleaseCase {
+        fn new(tip: u64, n: u64, amount: u64, paid_delta: i64) -> Self {
+            use jetsam_chain::consensus::vault::{
+                encode_proof_nodes, VaultRelease, RELEASE_FEE_MICRO, VAULT_ADDRESS,
+            };
+            let rf = RELEASE_FEE_MICRO;
+            let release = VaultRelease {
+                n,
+                owner: Address([0xa1; 32]),
+                amount,
+                storage_proof: vec![vec![0xee; 40]],
+            };
+            let paid = (amount - rf).saturating_add_signed(paid_delta);
+            let mut state = ChainState::with_log_slots(6);
+            state
+                .state
+                .set_slot(
+                    7,
+                    SlotValue::with_owner_fields(paid + rf, 50, VAULT_ADDRESS.as_fields()),
+                )
+                .unwrap();
+            let view = view_of(&state, tip);
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: 7,
+                amount: paid + rf,
+                creation_id: 50,
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 8,
+                amount: paid,
+                owner: release.owner,
+            };
+            outputs[1] = TxOutput {
+                slot_index: 9,
+                amount: 0,
+                owner: release.marker(),
+            };
+            let pages = vec![TxPage::new(TxBody {
+                epoch_anchor: view.user_epoch_anchor_id,
+                fee: rf,
+                input_owner: VAULT_ADDRESS,
+                inputs,
+                outputs,
+                validity_bitmap: 1
+                    | output_bitmap_bit(0)
+                    | output_bitmap_bit(1)
+                    | PAGED_SPEND_START_BIT
+                    | PAGED_SPEND_END_BIT,
+                is_coinbase: false,
+            })
+            .unwrap()];
+            let mut proof = Vec::new();
+            encode_proof_nodes(&[vec![0xdd; 64]], &mut proof);
+            Self {
+                state,
+                intent: crate::destination::DestinationIntent::Release(
+                    crate::destination::ReleaseIntent {
+                        release,
+                        finality: crate::destination::tests::finality_payload(),
+                        account_proof: proof,
+                        payment: jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap(),
+                    },
+                ),
+                n,
+            }
+        }
+
+        fn view_at(&self, tip: u64, paid: &[u64]) -> ChainView {
+            let mut view = view_of(&self.state, tip);
+            if tip + 1 >= CROSSING_J {
+                let mut released = jetsam_chain::consensus::vault::ReleasedSet::new();
+                for n in paid {
+                    released.insert(*n);
+                }
+                view.vault = Some(crate::view::VaultView {
+                    bridge_locked: 1_000_000_000,
+                    released,
+                    floor: RELEASE_FLOOR,
+                    committees: Vec::new(),
+                });
+            }
+            view
+        }
+
+        fn pool_at(&self, tip: u64, paid: &[u64]) -> AsyncMempool {
+            AsyncMempool::new(
+                self.view_at(tip, paid),
+                MempoolConfig::default()
+                    .with_client_object_rules(armed_rules())
+                    .with_vault_rules(armed_vault_rules()),
+            )
+            .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())))
+        }
+
+        async fn submit(
+            &self,
+            pool: &AsyncMempool,
+        ) -> Result<crate::destination::DestinationAdmitted, super::SubmitError> {
+            pool.submit_destination(&self.intent.encode().unwrap())
+                .await
+        }
+    }
+
+    /// T2.5: a release intent (object, finality update, account proof, and
+    /// the release group spending the vault) is held for the template; the
+    /// same group alone is a plain vault spend and is refused; an index the
+    /// branch has paid, a group that pays the wrong amount, and anything
+    /// below J are refused.
+    #[tokio::test]
+    async fn mempool_admits_release_intent_with_valid_objects() {
+        use crate::event::MempoolEvent;
+        use jetsam_chain::consensus::vault::VaultError;
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        // A release's fee is capped at R by the vault gate (D59): the pool's
+        // dynamic floor, raised far above it here, never refuses one.
+        {
+            let mut locked = pool.state.lock().await;
+            for _ in 0..64 {
+                locked.floor.record(10_000_000);
+            }
+            assert!(locked.floor.current() > jetsam_chain::consensus::vault::RELEASE_FEE_MICRO);
+        }
+        let mut events = pool.subscribe();
+        let admitted = case.submit(&pool).await.expect("a valid release intent");
+        assert_eq!(
+            admitted,
+            crate::destination::DestinationAdmitted::Release { n: 4 }
+        );
+        let (updates, releases) = pool.destination_candidates().await;
+        assert!(updates.is_empty());
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].release.n, case.n);
+        assert_eq!(pool.len().await, 0, "never in the plain pool");
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let MempoolEvent::DestinationObjectAdmitted { release } = event {
+                seen.push(release);
+            }
+        }
+        assert_eq!(seen, vec![Some(4)], "the miner is woken");
+        // The group alone, as a plain transaction (on a pool at its usual
+        // floor: the raised one would refuse its fee first).
+        let payment = case.intent.payment().clone();
+        let bytes = payment.to_bytes().unwrap();
+        assert_eq!(
+            vault_error(case.pool_at(tip, &[]).submit(payment, bytes).await),
+            Some(VaultError::SpendFromLockedAddress { group: 0 })
+        );
+        // Already paid by the branch.
+        let paid = case.pool_at(tip, &[4]);
+        assert!(matches!(
+            case.submit(&paid).await,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(
+                    jetsam_chain::consensus::destination::state::DestinationBlockError::Vault(
+                        VaultError::ReleaseAlreadyPaid { n: 4 }
+                    )
+                )
+            ))
+        ));
+        // A group paying one µJTM more than `amount − R`.
+        let greedy = ReleaseCase::new(tip, 4, 5_000_000, 1);
+        assert!(matches!(
+            greedy.submit(&greedy.pool_at(tip, &[])).await,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(
+                    jetsam_chain::consensus::destination::state::DestinationBlockError::Vault(
+                        VaultError::ReleasePaysWrongAmount { .. }
+                    )
+                )
+            ))
+        ));
+        // Below J.
+        let early = ReleaseCase::new(CROSSING_J - 5, 4, 5_000_000, 0);
+        assert!(matches!(
+            early.submit(&early.pool_at(CROSSING_J - 5, &[])).await,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::Destination(
+                    jetsam_chain::consensus::destination::DestinationError::SectionBeforeActivation
+                )
+            ))
+        ));
+    }
+
+    /// Held releases are forgotten once their index is paid on the branch or
+    /// their vault slots are spent, at a new block or a replaced view.
+    #[tokio::test]
+    async fn destination_intents_are_pruned_when_paid_or_spent() {
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        pool.on_new_block(&[], tip + 1, case.view_at(tip + 1, &[]))
+            .await;
+        assert_eq!(
+            pool.destination_candidates().await.1.len(),
+            1,
+            "still payable"
+        );
+        pool.on_new_block(&[], tip + 2, case.view_at(tip + 2, &[4]))
+            .await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "paid");
+
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        let mut spent = ChainState::with_log_slots(6);
+        spent.state.set_slot(7, SlotValue::EMPTY).unwrap();
+        let mut view = view_of(&spent, tip + 1);
+        view.vault = case.view_at(tip + 1, &[]).vault;
+        pool.update_chain_view(view).await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "spent");
+    }
+
+    /// A committee update with the transaction that pays for it (its
+    /// `JTMLCU01` marker) is held; the same transaction alone is refused (a
+    /// marker without its object); the update is forgotten once the branch
+    /// knows its period.
+    #[tokio::test]
+    async fn mempool_holds_committee_update_with_its_payment() {
+        use jetsam_chain::consensus::destination::state::{committee_update_marker, CommitteeRef};
+        use jetsam_chain::consensus::vault::VaultError;
+        let tip = CROSSING_J + 20;
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let case = VaultCase::new(
+            tip,
+            Address([0xA5; 32]),
+            &[(Address([0x42; 32]), 10), (marker, 0)],
+        );
+        let pool = case.pool_at(tip, 0);
+        let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+            crate::destination::CommitteeUpdateIntent {
+                payload,
+                payment: case.intent.clone(),
+            },
+        );
+        let crate::destination::DestinationIntent::CommitteeUpdate(update) = &intent else {
+            unreachable!()
+        };
+        let period = update.next_period().unwrap();
+        assert_eq!(
+            pool.submit_destination(&intent.encode().unwrap())
+                .await
+                .expect("a committee update with its payment"),
+            crate::destination::DestinationAdmitted::CommitteeUpdate { period }
+        );
+        assert_eq!(pool.destination_candidates().await.0.len(), 1);
+        assert_eq!(
+            vault_error(case.submit(&pool).await),
+            Some(VaultError::ReleaseMarkerOutsideRelease { group: 0 })
+        );
+        // Below J, refused.
+        let early = case.pool_at(CROSSING_J - 5, 0);
+        assert!(matches!(
+            early.submit_destination(&intent.encode().unwrap()).await,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::Destination(
+                    jetsam_chain::consensus::destination::DestinationError::SectionBeforeActivation
+                )
+            ))
+        ));
+        let mut view = case.view_at(tip + 1, 0);
+        view.vault.as_mut().unwrap().committees = vec![CommitteeRef {
+            period,
+            root: [0u8; 32],
+        }];
+        pool.update_chain_view(view).await;
+        assert!(pool.destination_candidates().await.0.is_empty());
     }
 
     /// A template for J built while the pool's view still lags at J - 2 (its

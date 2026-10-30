@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! v1.7 (T2.5): the destination slot of a block template.
+//!
+//! The mempool holds destination intents with their transactions
+//! (`jetsam_mempool::destination`). A template offers what the branch can
+//! use ([`plan_destination_offer`]): the committee update it needs next, and
+//! releases by increasing `n` among the payable ones (porte R §3.3: never
+//! jumping one that waits only for the V6 window), sharing one finality
+//! update, within the section's object cap (32 objects in all, T2.2) and byte
+//! budget. Their transactions go to the fee selection with the mempool's;
+//! mempool deposits that would take the vault over its ceiling in the order
+//! the chain template places the groups are left out
+//! ([`deposits_within_ceiling`], A1 bis n-6). Once built, the block's section
+//! is the offer's objects whose transactions the block kept, releases in the
+//! order of their markers ([`DestinationOffer::section_for`]); the template
+//! judges the block by `validate_block_destination` and, refused, builds it
+//! again without the destination objects, forgetting those the refusal blames
+//! ([`culprits_of`]).
+
+use jetsam_chain::consensus::destination::state::{
+    committee_update_marker, DestinationBlockError, DestinationRules, DestinationState,
+};
+use jetsam_chain::consensus::destination::{
+    destination_section_wire_len, DestinationObject, DestinationObjectKind, DestinationSection,
+    MAX_BLOCK_DESTINATION_OBJECTS,
+};
+use jetsam_chain::consensus::vault::{
+    destination_marker_kind, DestinationMarkerKind, VaultError, VaultRules,
+};
+use jetsam_chain::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
+use jetsam_mempool::destination::{CommitteeUpdateIntent, ReleaseIntent};
+use jetsam_poseidon2b::primitives::Address;
+use jetsam_tx::{PagedSpendIntent, Transaction, TxPage};
+
+/// What a template offers to carry in its destination section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DestinationOffer {
+    pub committee_update: Option<CommitteeUpdateIntent>,
+    /// By increasing `n`, all proven under the first one's finality update.
+    pub releases: Vec<ReleaseIntent>,
+}
+
+impl DestinationOffer {
+    pub fn is_empty(&self) -> bool {
+        self.committee_update.is_none() && self.releases.is_empty()
+    }
+
+    /// The section objects the offer makes when all of it is carried.
+    pub fn object_count(&self) -> usize {
+        usize::from(self.committee_update.is_some())
+            + if self.releases.is_empty() {
+                0
+            } else {
+                2 + self.releases.len()
+            }
+    }
+
+    /// The transactions the offer brings, committee update first.
+    pub fn payments(&self) -> impl Iterator<Item = &PagedSpendIntent> {
+        self.committee_update
+            .iter()
+            .map(|update| &update.payment)
+            .chain(self.releases.iter().map(|release| &release.payment))
+    }
+
+    /// Their pages as transactions, in [`Self::payments`] order.
+    pub fn payment_order(&self) -> Vec<Transaction> {
+        self.payments()
+            .flat_map(|payment| payment.pages.iter())
+            .map(|page| Transaction::new(page.body.clone()))
+            .collect()
+    }
+
+    /// The section of a block whose transactions are `txs`: the committee
+    /// update if its marker is there; the finality update and account proof
+    /// once, then the release objects in the order of their markers, if any
+    /// release group is there.
+    pub fn section_for(&self, txs: &[Transaction]) -> DestinationSection {
+        let markers: Vec<Address> = txs
+            .iter()
+            .flat_map(|tx| {
+                tx.body
+                    .live_outputs()
+                    .map(|(_, output)| output.owner)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|owner| destination_marker_kind(owner).is_some())
+            .collect();
+        let mut objects = Vec::new();
+        if let Some(update) = &self.committee_update {
+            if markers.contains(&committee_update_marker(&update.payload)) {
+                objects.push(update.object());
+            }
+        }
+        let carried: Vec<&ReleaseIntent> = markers
+            .iter()
+            .filter(|marker| {
+                destination_marker_kind(marker) == Some(DestinationMarkerKind::Release)
+            })
+            .filter_map(|marker| {
+                self.releases
+                    .iter()
+                    .find(|release| release.release.marker() == *marker)
+            })
+            .collect();
+        if let Some(first) = carried.first() {
+            objects.push(DestinationObject {
+                kind: DestinationObjectKind::FinalityUpdate,
+                payload: first.finality.clone(),
+            });
+            objects.push(DestinationObject {
+                kind: DestinationObjectKind::BridgeAccountProof,
+                payload: first.account_proof.clone(),
+            });
+            objects.extend(carried.iter().map(|release| release.release.object()));
+        }
+        DestinationSection { objects }
+    }
+
+    /// The offer without what `culprits` blames.
+    pub fn without(&self, culprits: &Culprits) -> Self {
+        Self {
+            committee_update: self
+                .committee_update
+                .clone()
+                .filter(|_| !culprits.committee_update),
+            releases: self
+                .releases
+                .iter()
+                .filter(|release| !culprits.releases.contains(&release.release.n))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn fits(&self, budget: usize) -> bool {
+        self.object_count() <= budget
+            && destination_section_wire_len(&self.section_for(&self.payment_order()))
+                <= MAX_DESTINATION_SECTION_BYTES
+    }
+}
+
+fn anchor_of(payment: &PagedSpendIntent) -> Option<[u8; 32]> {
+    payment.pages.first().map(|page| page.body.epoch_anchor)
+}
+
+/// What the block at `height` after a branch in `state` offers, from the
+/// intents the mempool holds, with `other_objects` already in its section
+/// (module docs). `anchor_ok` says whether a transaction's epoch anchor is
+/// minable at `height`.
+pub fn plan_destination_offer(
+    state: &DestinationState,
+    rules: &DestinationRules,
+    height: u64,
+    committee_updates: Vec<CommitteeUpdateIntent>,
+    mut releases: Vec<ReleaseIntent>,
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+    other_objects: usize,
+) -> DestinationOffer {
+    let budget = MAX_BLOCK_DESTINATION_OBJECTS.saturating_sub(other_objects);
+    let mut offer = DestinationOffer::default();
+    if let Some(anchor) = rules.anchor {
+        let due = state
+            .committees
+            .last()
+            .map_or(Some(anchor.period), |known| known.period.checked_add(1));
+        offer.committee_update = committee_updates.into_iter().find(|update| {
+            due.is_some()
+                && update.next_period() == due
+                && anchor_of(&update.payment).is_some_and(|a| anchor_ok(&a))
+        });
+        if !offer.fits(budget) {
+            offer.committee_update = None;
+        }
+    }
+    if rules.bridge.is_none() {
+        return offer;
+    }
+    releases.sort_by_key(|release| release.release.n);
+    let mut window = state.released_in_window(height, rules.vault.window_blocks);
+    for release in releases {
+        if offer.releases.len() >= rules.vault.max_releases_per_block {
+            break;
+        }
+        if state.released.contains(release.release.n)
+            || !anchor_of(&release.payment).is_some_and(|a| anchor_ok(&a))
+        {
+            continue;
+        }
+        if let Some(first) = offer.releases.first() {
+            if release.finality != first.finality || release.account_proof != first.account_proof {
+                continue;
+            }
+        }
+        // Never jump a payable release that waits only for the window.
+        let Some(after) = window
+            .checked_add(release.release.amount)
+            .filter(|after| *after <= rules.vault.window_cap)
+        else {
+            break;
+        };
+        let mut candidate = offer.clone();
+        candidate.releases.push(release);
+        if !candidate.fits(budget) {
+            break;
+        }
+        window = after;
+        offer = candidate;
+    }
+    offer
+}
+
+/// The entries of `entries` (the mempool's selection, `pages_of` their pages)
+/// that keep V8 when the chain template places them with `offer`'s
+/// transactions by decreasing fee then logical txid, the vault holding
+/// `bridge_locked` before the block: a deposit that would take it over the
+/// ceiling is left out (it stays in the pool), a release gives back what it
+/// takes. Order of `entries` kept.
+pub fn deposits_within_ceiling<E>(
+    entries: Vec<E>,
+    pages_of: impl Fn(&E) -> &[TxPage],
+    offer: &DestinationOffer,
+    bridge_locked: u64,
+    rules: &VaultRules,
+) -> Vec<E> {
+    enum Effect {
+        Release(u64),
+        Deposit(usize, u64),
+        Other,
+    }
+    let vault_outputs = |pages: &[TxPage]| -> (bool, u64) {
+        let mut deposit = false;
+        let mut to_vault = 0u64;
+        for page in pages {
+            for (_, output) in page.body.live_outputs() {
+                if destination_marker_kind(&output.owner) == Some(DestinationMarkerKind::Deposit) {
+                    deposit = true;
+                }
+                if output.owner == rules.vault {
+                    to_vault = to_vault.saturating_add(output.amount);
+                }
+            }
+        }
+        (deposit, to_vault)
+    };
+    let mut placed: Vec<(u64, [u8; 32], Effect)> = Vec::new();
+    for release in &offer.releases {
+        if let Ok(facts) = jetsam_tx::validate_paged_spend(&release.payment.pages) {
+            let (_, change) = vault_outputs(&release.payment.pages);
+            let taken = u64::try_from(facts.input_sum).unwrap_or(u64::MAX);
+            placed.push((
+                facts.fee,
+                facts.logical_txid.0,
+                Effect::Release(taken.saturating_sub(change)),
+            ));
+        }
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let pages = pages_of(entry);
+        let Ok(facts) = jetsam_tx::validate_paged_spend(pages) else {
+            continue;
+        };
+        let (deposit, amount) = vault_outputs(pages);
+        let effect = if deposit {
+            Effect::Deposit(index, amount)
+        } else {
+            Effect::Other
+        };
+        placed.push((facts.fee, facts.logical_txid.0, effect));
+    }
+    placed.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut locked = bridge_locked;
+    let mut dropped = std::collections::HashSet::new();
+    for (_, _, effect) in placed {
+        match effect {
+            Effect::Release(outflow) => locked = locked.saturating_sub(outflow),
+            Effect::Deposit(index, amount) => match locked.checked_add(amount) {
+                Some(after) if after <= rules.outstanding_ceil => locked = after,
+                _ => {
+                    dropped.insert(index);
+                }
+            },
+            Effect::Other => {}
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped.contains(index))
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
+/// What a refused block blames among the destination objects it carried.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Culprits {
+    /// Withdrawal indices to forget.
+    pub releases: Vec<u64>,
+    /// Whether to forget the committee update.
+    pub committee_update: bool,
+}
+
+/// The objects `error` (from `validate_block_destination` on a block carrying
+/// `offer`) blames: one release for its own proof or an index already paid;
+/// every release for their shared finality update or account proof; the
+/// committee update for the anchor, its payload or the light client when it
+/// was carried (else the releases' finality update). Nothing for a local
+/// fault (keys this node lacks, a state not the parent's) or for what the
+/// template itself decided (counts, window): the block is then built without
+/// destination objects and they stay held.
+pub fn culprits_of(error: &DestinationBlockError, offer: &DestinationOffer) -> Culprits {
+    let all_releases = || {
+        offer
+            .releases
+            .iter()
+            .map(|release| release.release.n)
+            .collect()
+    };
+    let one = |n: u64| Culprits {
+        releases: offer
+            .releases
+            .iter()
+            .map(|release| release.release.n)
+            .filter(|offered| *offered == n)
+            .collect(),
+        committee_update: false,
+    };
+    let update = || Culprits {
+        releases: Vec::new(),
+        committee_update: offer.committee_update.is_some(),
+    };
+    match error {
+        DestinationBlockError::Vault(VaultError::NotProvenOnL1 { n, .. })
+        | DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n }) => one(*n),
+        DestinationBlockError::LightClient(_) if offer.committee_update.is_some() => update(),
+        DestinationBlockError::LightClient(_)
+        | DestinationBlockError::BridgeAccount(_)
+        | DestinationBlockError::MalformedObject {
+            kind:
+                DestinationObjectKind::FinalityUpdate
+                | DestinationObjectKind::BridgeAccountProof
+                | DestinationObjectKind::VaultRelease,
+        } => Culprits {
+            releases: all_releases(),
+            committee_update: false,
+        },
+        DestinationBlockError::AnchorMismatch
+        | DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::CommitteeUpdate,
+        } => update(),
+        _ => Culprits::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests;
