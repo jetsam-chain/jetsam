@@ -402,6 +402,14 @@ fn the_pool_keeps_the_highest_attestation_and_one_equivocation() {
         pool.hold(a110.clone(), facts(&a110)),
         Err(HoldRefusal::Covered { held: J + 120 })
     );
+    // Another attestation of the height held is covered too.
+    let mut same_height = attestation_of(J + 120);
+    same_height.body[500] ^= 1;
+    let a120b = chain.intent(J + 200, PAYER, same_height, &[]);
+    assert_eq!(
+        pool.hold(a120b.clone(), facts(&a120b)),
+        Err(HoldRefusal::Covered { held: J + 120 })
+    );
     let e1 = chain.intent(J + 200, PAYER, equivocation(0, 1).object(), &[]);
     let e2 = chain.intent(J + 200, PAYER, equivocation(0, 2).object(), &[]);
     pool.hold(e1.clone(), facts(&e1)).unwrap();
@@ -447,6 +455,41 @@ fn the_pool_keeps_the_highest_attestation_and_one_equivocation() {
         1,
         "the attestation 100 was already replaced"
     );
+}
+
+/// Two intents whose transactions share a slot are never both held (no
+/// block carries both); a higher attestation may reuse the coin of the one
+/// it replaces.
+#[test]
+fn intents_sharing_a_slot_are_not_both_held() {
+    let mut chain = Chain::new();
+    let mut pool = GuardianPool::default();
+    let facts = |intent: &GuardianIntent| group_facts(&intent.payment.pages, PAYER, 0);
+    let lock = |amount: u64| {
+        StakeLock {
+            owner: PAYER,
+            amount,
+        }
+        .object()
+    };
+    let first = chain.intent(JD + 50, PAYER, lock(10 * JTM), &[]);
+    pool.hold(first.clone(), facts(&first)).unwrap();
+    let twin = GuardianIntent {
+        object: lock(11 * JTM),
+        payment: first.payment.clone(),
+    };
+    assert_eq!(
+        pool.hold(twin.clone(), facts(&twin)),
+        Err(HoldRefusal::SlotConflict)
+    );
+    let low = chain.intent(JD + 50, PAYER, attestation_of(J + 100), &[]);
+    pool.hold(low.clone(), facts(&low)).unwrap();
+    let high = GuardianIntent {
+        object: attestation_of(J + 110),
+        payment: low.payment.clone(),
+    };
+    pool.hold(high.clone(), facts(&high))
+        .expect("replaces the attestation whose coin it reuses");
 }
 
 #[test]

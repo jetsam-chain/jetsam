@@ -505,6 +505,11 @@ pub enum HoldRefusal {
     EquivocationHeld,
     /// [`MAX_HELD_DELEGATION_OBJECTS`] delegation objects already held.
     Full,
+    /// Its transaction spends or creates a slot a held intent's transaction
+    /// does (two payouts drawing on the same pool slots, a coin spent twice):
+    /// no block could carry both, and the template would be refused for them
+    /// at every height without a culprit to forget.
+    SlotConflict,
 }
 
 impl std::fmt::Display for HoldRefusal {
@@ -547,6 +552,34 @@ impl GuardianPool {
     pub fn conflict(&self, intent: &GuardianIntent) -> Result<(), HoldRefusal> {
         if self.held().any(|held| held.intent.object == intent.object) {
             return Err(HoldRefusal::AlreadyHeld);
+        }
+        let slots = |pages: &[TxPage]| -> Vec<u32> {
+            pages
+                .iter()
+                .flat_map(|page| {
+                    page.body
+                        .live_inputs()
+                        .map(|(_, input)| input.slot_index)
+                        .chain(
+                            page.body
+                                .live_outputs()
+                                .map(|(_, output)| output.slot_index),
+                        )
+                        .collect::<Vec<u32>>()
+                })
+                .collect()
+        };
+        let own = slots(&intent.payment.pages);
+        let replaced = |held: &HeldGuardian| {
+            intent.object.kind == GuardianObjectKind::Attestation
+                && held.intent.object.kind == GuardianObjectKind::Attestation
+        };
+        if self.held().filter(|held| !replaced(held)).any(|held| {
+            slots(&held.intent.payment.pages)
+                .iter()
+                .any(|slot| own.contains(slot))
+        }) {
+            return Err(HoldRefusal::SlotConflict);
         }
         match intent.object.kind {
             GuardianObjectKind::Attestation => {
