@@ -414,6 +414,13 @@ enum Command {
         receipt: String,
     },
 
+    // ---- Delegation (v1.7) ----------------------------------------------------
+    /// Delegated stake beside the guardians (v1.7): lock, unlock, claim, info,
+    /// payout. Dormant until the delegation height J_D and the first funding
+    /// of the reward pool by both development funds in one block.
+    #[command(subcommand)]
+    Stake(StakeCommand),
+
     // ---- Node control ---------------------------------------------------------
     /// Gracefully stop the Jetsam daemon.
     Stop,
@@ -436,6 +443,62 @@ enum Command {
         /// Exactly 16 little-endian nonce bytes as 32 lowercase hex characters.
         #[arg(value_name = "NONCE_HEX")]
         nonce_hex: String,
+    },
+}
+
+/// `jetsam-cli stake …` (v1.7, T3.8). No graphical interface (D13).
+#[derive(Subcommand)]
+enum StakeCommand {
+    /// Lock an amount of the active address into the stake vault; it earns
+    /// from the next reward period on.
+    Lock {
+        /// Amount, e.g. 10.5 (at least the minimum lock).
+        #[arg(value_name = "AMOUNT")]
+        amount: String,
+        /// Explicit fee of the paying transaction.
+        #[arg(long, value_name = "AMOUNT")]
+        fee: Option<String>,
+    },
+
+    /// Ask for staked coins back. Each entry is payable by anyone after the
+    /// unbonding delay; an amount larger than one payout can pay is split
+    /// into several entries. The fee is paid from another small coin of the
+    /// active address: keep one.
+    Unlock {
+        /// Amount, e.g. 10.5.
+        #[arg(value_name = "AMOUNT")]
+        amount: String,
+        /// Explicit fee of each paying transaction.
+        #[arg(long, value_name = "AMOUNT")]
+        fee: Option<String>,
+    },
+
+    /// Claim reward of the active address, payable from the next block. The
+    /// fee is paid from another small coin of the active address: keep one.
+    Claim {
+        /// Amount, e.g. 2.
+        #[arg(value_name = "AMOUNT")]
+        amount: String,
+        /// Claim the guardians' vested share (its reward owner only).
+        #[arg(long)]
+        guardian: bool,
+        /// Explicit fee of the paying transaction.
+        #[arg(long, value_name = "AMOUNT")]
+        fee: Option<String>,
+    },
+
+    /// Stake, entries and reward of an address (default: the active one).
+    Info {
+        /// Owner address (bech32m).
+        #[arg(value_name = "ADDRESS")]
+        address: Option<String>,
+    },
+
+    /// Pay a due entry out of its pool; anyone may, no key is needed.
+    Payout {
+        /// Entry id (see `stake info`).
+        #[arg(value_name = "ENTRY_ID")]
+        entry_id: u64,
     },
 }
 
@@ -532,6 +595,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Scan => cmd_scan(&ctx).await,
         Command::Receipt { txhash } => cmd_receipt(&ctx, txhash).await,
         Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
+        Command::Stake(command) => cmd_stake(&ctx, command).await,
         Command::Stop => cmd_stop(&ctx).await,
         Command::BlockTemplate { miner_addr } => cmd_block_template(&ctx, miner_addr).await,
         Command::SubmitBlock {
@@ -2541,6 +2605,258 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
 // Node control
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Delegation (v1.7, T3.8)
+// ---------------------------------------------------------------------------
+
+/// Unlock entries one call makes at most: the delegation objects one block
+/// carries (and one pool holds).
+const MAX_UNLOCK_PARTS: u64 = 32;
+
+/// The entries an unlock of `amount` is split into (A1 m4): each payable by
+/// one payout (at most `max_payable_entry`, from `getStakeInfo`) and at
+/// least `min_unlock`, as even as possible.
+fn split_unlock(amount: u64, max_payable_entry: u64, min_unlock: u64) -> anyhow::Result<Vec<u64>> {
+    if amount < min_unlock {
+        bail!(
+            "an unlock is at least {} {TICKER}",
+            jetsam_str(min_unlock)
+        );
+    }
+    if max_payable_entry < min_unlock {
+        bail!(
+            "the stake vault cannot pay an entry of {} {TICKER} yet: try again later",
+            jetsam_str(min_unlock)
+        );
+    }
+    let parts = amount.div_ceil(max_payable_entry);
+    if parts > MAX_UNLOCK_PARTS {
+        bail!(
+            "this unlock makes {parts} entries of at most {} {TICKER}: unlock at most {} {TICKER} per call",
+            jetsam_str(max_payable_entry),
+            jetsam_str(max_payable_entry.saturating_mul(MAX_UNLOCK_PARTS))
+        );
+    }
+    let (base, extra) = (amount / parts, amount % parts);
+    let split: Vec<u64> = (0..parts).map(|i| base + u64::from(i < extra)).collect();
+    if split.iter().any(|part| *part < min_unlock) {
+        bail!(
+            "an unlock is split into entries of at least {} {TICKER}",
+            jetsam_str(min_unlock)
+        );
+    }
+    Ok(split)
+}
+
+/// Why stake objects are refused now (a `getStakeInfo` or `getRewardInfo`
+/// reply), if they are.
+fn inactive_reason(info: &Value) -> Option<String> {
+    if info["delegation_active"].as_bool() == Some(true) {
+        return None;
+    }
+    Some(
+        info["inactive_reason"]
+            .as_str()
+            .unwrap_or(jetsam_rpc::guardian::DELEGATION_INACTIVE_MESSAGE)
+            .to_string(),
+    )
+}
+
+/// The object `walletBuildGuardianPayment` pays for a stake command and an
+/// amount (µ units); `None` for the commands that pay nothing.
+fn stake_request(command: &StakeCommand, amount: u64) -> Option<Value> {
+    match command {
+        StakeCommand::Lock { .. } => {
+            Some(serde_json::json!({ "kind": "stake_lock", "amount": amount }))
+        }
+        StakeCommand::Unlock { .. } => {
+            Some(serde_json::json!({ "kind": "stake_unlock", "amount": amount }))
+        }
+        StakeCommand::Claim { guardian, .. } => Some(serde_json::json!({
+            "kind": "reward_claim",
+            "account": if *guardian { "guardian" } else { "delegator" },
+            "amount": amount,
+        })),
+        StakeCommand::Info { .. } | StakeCommand::Payout { .. } => None,
+    }
+}
+
+async fn active_owner(ctx: &Ctx<'_>) -> anyhow::Result<String> {
+    let wallet = rpc(ctx, "walletActiveAddress", &[])
+        .await
+        .context("walletActiveAddress")?;
+    wallet["address"]
+        .as_str()
+        .map(str::to_string)
+        .context("the daemon has no active wallet address")
+}
+
+/// Build the paying transaction of `object` with the daemon's wallet, then
+/// hand the intent to its mempool.
+async fn stake_submit(ctx: &Ctx<'_>, object: Value, fee: Option<&str>) -> anyhow::Result<Value> {
+    let fee = fee.map(parse_jetsam_amount).transpose()?;
+    let built = rpc(
+        ctx,
+        "walletBuildGuardianPayment",
+        &[object, fee.map_or(Value::Null, Value::from)],
+    )
+    .await
+    .context("walletBuildGuardianPayment")?;
+    let intent = built["intent_hex"]
+        .as_str()
+        .context("walletBuildGuardianPayment returned no intent")?;
+    let admitted = rpc(ctx, "submitGuardianObject", &[intent.into()])
+        .await
+        .context("submitGuardianObject")?;
+    Ok(serde_json::json!({ "built": built, "admitted": admitted }))
+}
+
+async fn cmd_stake(ctx: &Ctx<'_>, command: &StakeCommand) -> anyhow::Result<()> {
+    let (amount, fee) = match command {
+        StakeCommand::Info { address } => return cmd_stake_info(ctx, address.as_deref()).await,
+        StakeCommand::Payout { entry_id } => return cmd_stake_payout(ctx, *entry_id).await,
+        StakeCommand::Lock { amount, fee }
+        | StakeCommand::Unlock { amount, fee }
+        | StakeCommand::Claim { amount, fee, .. } => (parse_jetsam_amount(amount)?, fee),
+    };
+    let owner = active_owner(ctx).await?;
+    let info = rpc(ctx, "getStakeInfo", &[owner.clone().into()])
+        .await
+        .context("getStakeInfo")?;
+    if let Some(reason) = inactive_reason(&info) {
+        bail!("{reason}");
+    }
+    let parts = match command {
+        StakeCommand::Unlock { .. } => split_unlock(
+            amount,
+            info["max_payable_entry"].as_u64().unwrap_or(0),
+            info["min_unlock"].as_u64().unwrap_or(0),
+        )?,
+        _ => vec![amount],
+    };
+    if !matches!(command, StakeCommand::Lock { .. }) && !ctx.json {
+        warn_msg("the fee is paid from another coin of the active address: keep a small one");
+    }
+    if parts.len() > 1 && !ctx.json {
+        warn_msg(&format!(
+            "split into {} entries, each payable by one payout",
+            parts.len()
+        ));
+    }
+    let mut results = Vec::new();
+    for part in parts {
+        let object = stake_request(command, part).expect("a paying command");
+        let result = stake_submit(ctx, object, fee.as_deref()).await?;
+        if !ctx.json {
+            ok_msg(&format!(
+                "{} {} {TICKER}: tx {} (fee {} {TICKER}), held for the next blocks",
+                result["admitted"]["kind"].as_str().unwrap_or("object"),
+                jetsam_str(part),
+                result["built"]["txid"].as_str().unwrap_or("?"),
+                jetsam_str(result["built"]["fee_micro_jtm"].as_u64().unwrap_or(0)),
+            ));
+        }
+        results.push(result);
+    }
+    if ctx.json {
+        return print_json(&Value::from(results));
+    }
+    Ok(())
+}
+
+async fn cmd_stake_info(ctx: &Ctx<'_>, address: Option<&str>) -> anyhow::Result<()> {
+    let owner = match address {
+        Some(address) => address.to_string(),
+        None => active_owner(ctx).await?,
+    };
+    let stake = rpc(ctx, "getStakeInfo", &[owner.clone().into()])
+        .await
+        .context("getStakeInfo")?;
+    let reward = rpc(ctx, "getRewardInfo", &[owner.clone().into()])
+        .await
+        .context("getRewardInfo")?;
+    if ctx.json {
+        return print_json(&serde_json::json!({ "stake": stake, "reward": reward }));
+    }
+    let amount = |value: &Value| format!("{} {TICKER}", jetsam_str(value.as_u64().unwrap_or(0)));
+    section(&format!("Delegated stake of {owner}"));
+    match inactive_reason(&stake) {
+        Some(reason) => warn_msg(&reason),
+        None => ok_msg("delegation active"),
+    }
+    kv("Active", &amount(&stake["active"]));
+    kv("Activating", &amount(&stake["activating"]));
+    kv("Reward balance", &amount(&reward["balance"]));
+    if let Some(guardian) = reward["guardian_balance"].as_u64() {
+        kv("Guardians' share", &amount(&Value::from(guardian)));
+    }
+    kv("Max payable entry", &amount(&stake["max_payable_entry"]));
+    kv(
+        "Next boundary",
+        &reward["next_boundary"].as_u64().unwrap_or(0).to_string(),
+    );
+    let entries: Vec<&Value> = stake["entries"]
+        .as_array()
+        .into_iter()
+        .chain(reward["entries"].as_array())
+        .flatten()
+        .collect();
+    if !entries.is_empty() {
+        section("Open entries");
+        for entry in entries {
+            println!(
+                "  #{:<6} {:<17} {:>20}  due {}{}",
+                entry["id"].as_u64().unwrap_or(0),
+                entry["kind"].as_str().unwrap_or("?"),
+                amount(&entry["amount"]),
+                entry["due"].as_u64().unwrap_or(0),
+                if entry["payable_now"].as_bool() == Some(true) {
+                    "  (payable: jetsam-cli stake payout <id>)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_stake_payout(ctx: &Ctx<'_>, entry_id: u64) -> anyhow::Result<()> {
+    let plan = rpc(ctx, "planGuardianPayout", &[entry_id.into()])
+        .await
+        .context("planGuardianPayout")?;
+    if ctx.json {
+        return print_json(&plan);
+    }
+    section(&format!("Payout of entry #{entry_id}"));
+    kv("From pool", plan["pool"].as_str().unwrap_or("?"));
+    kv(
+        "Inputs",
+        &plan["inputs"].as_array().map_or(0, Vec::len).to_string(),
+    );
+    for output in plan["outputs"].as_array().into_iter().flatten() {
+        kv(
+            "Output",
+            &format!(
+                "{} {TICKER} to {}",
+                jetsam_str(output[1].as_u64().unwrap_or(0)),
+                output[0].as_str().unwrap_or("?")
+            ),
+        );
+    }
+    kv(
+        "Fee",
+        &format!(
+            "{} {TICKER} (taken out of the amount)",
+            jetsam_str(plan["fee_micro_jtm"].as_u64().unwrap_or(0))
+        ),
+    );
+    bail!(
+        "this daemon's wallet does not build the payout transaction yet (it spends the pool \
+         with its published secret): the plan above is what it will carry"
+    )
+}
+
 async fn cmd_stop(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     match rpc(ctx, "stop", &[]).await {
         Ok(r) => {
@@ -3125,5 +3441,103 @@ mod ticker_tests {
             .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
             .collect();
         assert_eq!(spelled, Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod stake_tests {
+    use super::{inactive_reason, split_unlock, stake_request, Cli, Command, StakeCommand};
+    use clap::Parser;
+    use jetsam_rpc::guardian::{GuardianPaymentObject, DELEGATION_INACTIVE_MESSAGE};
+
+    const ONE: u64 = 1_000_000;
+
+    /// A1 m4: an unlock larger than one payout can pay is split into
+    /// entries each payable by one payout and each at least the minimum, as
+    /// even as possible; one that fits stays whole.
+    #[test]
+    fn an_unlock_is_split_into_payable_entries() {
+        assert_eq!(split_unlock(25 * ONE, 100 * ONE, ONE).unwrap(), vec![25 * ONE]);
+        assert_eq!(
+            split_unlock(25 * ONE, 10 * ONE, ONE).unwrap(),
+            vec![8_333_334, 8_333_333, 8_333_333]
+        );
+        let parts = split_unlock(1_000 * ONE + 7, 300 * ONE, ONE).unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts.iter().sum::<u64>(), 1_000 * ONE + 7);
+        assert!(parts.iter().all(|part| *part <= 300 * ONE && *part >= ONE));
+        assert_eq!(split_unlock(20 * ONE, 20 * ONE, ONE).unwrap(), vec![20 * ONE]);
+        assert!(split_unlock(ONE - 1, 100 * ONE, ONE).is_err(), "below the minimum");
+        assert!(
+            split_unlock(3 * ONE, 2 * ONE, 2 * ONE).is_err(),
+            "two entries of 1.5 each, under a minimum of 2"
+        );
+        assert!(split_unlock(5 * ONE, ONE - 1, ONE).is_err(), "nothing payable yet");
+        assert!(
+            split_unlock(33 * ONE, ONE, ONE).is_err(),
+            "more entries than a block carries: in several calls"
+        );
+        assert_eq!(split_unlock(32 * ONE, ONE, ONE).unwrap().len(), 32);
+    }
+
+    /// Before activation every stake command says why, in the words of T1.1
+    /// §10 (height J_D, or the pot not yet funded by both funds in one block).
+    #[test]
+    fn an_inactive_delegation_says_why() {
+        let inactive = serde_json::json!({
+            "delegation_active": false,
+            "inactive_reason": DELEGATION_INACTIVE_MESSAGE,
+        });
+        let reason = inactive_reason(&inactive).expect("inactive");
+        assert!(reason.contains("J_D") && reason.contains("both development funds"));
+        let silent = serde_json::json!({ "delegation_active": false });
+        assert_eq!(inactive_reason(&silent).as_deref(), Some(DELEGATION_INACTIVE_MESSAGE));
+        assert_eq!(inactive_reason(&serde_json::json!({ "delegation_active": true })), None);
+    }
+
+    /// The subcommands, and the object each one asks the daemon to pay for,
+    /// in the shape `walletBuildGuardianPayment` reads.
+    #[test]
+    fn each_stake_command_asks_for_its_object() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").cmd {
+            Command::Stake(command) => command,
+            _ => panic!("not a stake command"),
+        };
+        let object = |command: &StakeCommand, amount: u64| -> GuardianPaymentObject {
+            serde_json::from_value(stake_request(command, amount).expect("a request"))
+                .expect("the RPC's shape")
+        };
+        let lock = parse(&["jetsam-cli", "stake", "lock", "12.5"]);
+        assert_eq!(
+            object(&lock, 12_500_000),
+            GuardianPaymentObject::StakeLock { amount: 12_500_000 }
+        );
+        let unlock = parse(&["jetsam-cli", "stake", "unlock", "3", "--fee", "0.06"]);
+        assert!(matches!(&unlock, StakeCommand::Unlock { fee: Some(fee), .. } if fee == "0.06"));
+        assert_eq!(
+            object(&unlock, 3 * ONE),
+            GuardianPaymentObject::StakeUnlock { amount: 3 * ONE }
+        );
+        assert_eq!(
+            object(&parse(&["jetsam-cli", "stake", "claim", "2"]), 2 * ONE),
+            GuardianPaymentObject::RewardClaim {
+                account: "delegator".into(),
+                amount: 2 * ONE
+            }
+        );
+        assert_eq!(
+            object(&parse(&["jetsam-cli", "stake", "claim", "2", "--guardian"]), 2 * ONE),
+            GuardianPaymentObject::RewardClaim {
+                account: "guardian".into(),
+                amount: 2 * ONE
+            }
+        );
+        let payout = parse(&["jetsam-cli", "stake", "payout", "7"]);
+        assert!(matches!(payout, StakeCommand::Payout { entry_id: 7 }));
+        assert!(stake_request(&payout, 0).is_none(), "a payout needs no key");
+        assert!(matches!(
+            parse(&["jetsam-cli", "stake", "info"]),
+            StakeCommand::Info { address: None }
+        ));
     }
 }
