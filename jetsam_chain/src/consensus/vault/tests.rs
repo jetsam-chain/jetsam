@@ -119,7 +119,11 @@ pub(crate) fn logical(
         .collect()
 }
 
-pub(crate) fn block_at(height: u64, groups: Vec<Vec<Transaction>>, releases: &[VaultRelease]) -> Block {
+pub(crate) fn block_at(
+    height: u64,
+    groups: Vec<Vec<Transaction>>,
+    releases: &[VaultRelease],
+) -> Block {
     let parent = header(height - 1);
     let mut transactions = vec![coinbase(&parent, Address([9u8; 32]))];
     for group in groups {
@@ -149,7 +153,12 @@ pub(crate) fn release(n: u64, owner: Address, amount: u64) -> VaultRelease {
 }
 
 /// The exact release group of `r`: payee, marker, change to the vault.
-pub(crate) fn release_group(slot_base: u32, r: &VaultRelease, change: u64, fee: u64) -> Vec<Transaction> {
+pub(crate) fn release_group(
+    slot_base: u32,
+    r: &VaultRelease,
+    change: u64,
+    fee: u64,
+) -> Vec<Transaction> {
     let mut outputs = vec![(r.owner, r.amount - RF), (r.marker(), 0)];
     if change > 0 {
         outputs.push((VAULT_ADDRESS, change));
@@ -1904,4 +1913,162 @@ fn release_above_window_cap_is_refused_even_alone() {
             cap: VAULT_RELEASE_WINDOW_CAP_MICRO
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// T2.5 (pure part): what the mempool refuses before a block would
+// ---------------------------------------------------------------------------
+
+/// The 13 marker tags of the v1.7 node (destination, guardians, clients).
+fn every_marker_tag() -> Vec<[u8; 8]> {
+    use crate::consensus::client_objects::{
+        CLIENT_BATCH_SUBMISSION_MARKER_TAG, CLIENT_REGISTRATION_MARKER_TAG,
+        CLIENT_SUBMISSION_MARKER_TAG,
+    };
+    use crate::consensus::guardian::{
+        GUARDIAN_ATTESTATION_MARKER_TAG, GUARDIAN_EQUIVOCATION_MARKER_TAG,
+        GUARDIAN_PAYOUT_MARKER_TAG, REWARD_CLAIM_MARKER_TAG, REWARD_FUND_MARKER_TAG,
+        STAKE_LOCK_MARKER_TAG, STAKE_UNLOCK_MARKER_TAG,
+    };
+    vec![
+        BRIDGE_DEPOSIT_MARKER_TAG,
+        VAULT_RELEASE_MARKER_TAG,
+        LIGHT_CLIENT_UPDATE_MARKER_TAG,
+        GUARDIAN_ATTESTATION_MARKER_TAG,
+        GUARDIAN_EQUIVOCATION_MARKER_TAG,
+        STAKE_LOCK_MARKER_TAG,
+        STAKE_UNLOCK_MARKER_TAG,
+        REWARD_FUND_MARKER_TAG,
+        REWARD_CLAIM_MARKER_TAG,
+        GUARDIAN_PAYOUT_MARKER_TAG,
+        CLIENT_REGISTRATION_MARKER_TAG,
+        CLIENT_SUBMISSION_MARKER_TAG,
+        CLIENT_BATCH_SUBMISSION_MARKER_TAG,
+    ]
+}
+
+fn tagged(tag: [u8; 8]) -> Address {
+    let mut owner = [0x55u8; 32];
+    owner[..8].copy_from_slice(&tag);
+    Address(owner)
+}
+
+/// Causes 1-6 of the porte R: a release to the vault, a marker (13 tags) or
+/// a pool, or above the window cap, can never be paid; the mempool refuses
+/// it at admission. A `JTM` prefix that is no tag is an ordinary owner here
+/// (the contract's filter, D53, is wider).
+#[test]
+fn mempool_refuses_unpayable_release_shape() {
+    use crate::consensus::guardian::{REWARD_POOL, STAKE_VAULT};
+    let rules = rules();
+    for tag in every_marker_tag() {
+        assert!(
+            !release_shape_ok(&tagged(tag), MICRO_PER_JTM, &rules),
+            "{tag:?}"
+        );
+    }
+    for owner in [VAULT_ADDRESS, STAKE_VAULT, REWARD_POOL] {
+        assert!(!release_shape_ok(&owner, MICRO_PER_JTM, &rules));
+    }
+    assert!(release_shape_ok(&ALICE, RF, &rules));
+    assert!(!release_shape_ok(&ALICE, RF - 1, &rules));
+    assert!(release_shape_ok(
+        &ALICE,
+        VAULT_RELEASE_WINDOW_CAP_MICRO,
+        &rules
+    ));
+    assert!(!release_shape_ok(
+        &ALICE,
+        VAULT_RELEASE_WINDOW_CAP_MICRO + 1,
+        &rules
+    ));
+    assert!(release_shape_ok(
+        &tagged(*b"JTMX0000"),
+        MICRO_PER_JTM,
+        &rules
+    ));
+}
+
+/// The predicate is the blocks' own: every owner it refuses is refused by
+/// the vault gate or the guardian gate in a block, and an owner it accepts
+/// passes both.
+#[test]
+fn release_shape_ok_matches_the_block_gates() {
+    use crate::consensus::guardian::{
+        apply_block_guardian, guardian_context, GuardianBranch, GuardianRules, GuardianState,
+        REWARD_POOL, STAKE_VAULT,
+    };
+    struct NoBranch;
+    impl GuardianBranch for NoBranch {
+        fn block_id(&self, _: u64) -> Option<[u8; 32]> {
+            None
+        }
+        fn chain_work(&self, _: u64) -> Option<[u8; 32]> {
+            None
+        }
+    }
+    let guardian_rules = GuardianRules {
+        activation_height: Some(J),
+        ..GuardianRules::current()
+    };
+    let refused_by_a_block = |owner: Address, amount: u64| {
+        let r = release(1, owner, amount);
+        let b = block(vec![release_group(100, &r, 0, FEE)], &[r]);
+        if check(&b, ctx()).is_err() {
+            return true;
+        }
+        match guardian_context(&b, &guardian_rules) {
+            Err(_) => true,
+            Ok(None) => false,
+            Ok(Some(gctx)) => apply_block_guardian(
+                &GuardianState::at_v1_7(0),
+                &gctx,
+                &NoBranch,
+                &guardian_rules,
+            )
+            .is_err(),
+        }
+    };
+    let mut owners: Vec<Address> = every_marker_tag().into_iter().map(tagged).collect();
+    owners.extend([
+        VAULT_ADDRESS,
+        STAKE_VAULT,
+        REWARD_POOL,
+        ALICE,
+        BOB,
+        tagged(*b"JTMX0000"),
+    ]);
+    for owner in owners {
+        for amount in [RF, MICRO_PER_JTM, VAULT_RELEASE_WINDOW_CAP_MICRO + 1] {
+            assert_eq!(
+                release_shape_ok(&owner, amount, &rules()),
+                !refused_by_a_block(owner, amount),
+                "{owner:?} {amount}"
+            );
+        }
+    }
+}
+
+/// V8 at admission: a deposit that would take the vault over the ceiling
+/// is refused before it reaches a template (it stays with its owner).
+#[test]
+fn mempool_refuses_deposit_over_vault_ceiling() {
+    let d = pages(deposit(200, [7; 20], 5 * MICRO_PER_JTM));
+    let ceil = VAULT_OUTSTANDING_CEIL_MICRO;
+    assert_eq!(
+        check_vault_deposit_room(&d, ceil - 5 * MICRO_PER_JTM, &rules()),
+        Ok(())
+    );
+    assert_eq!(
+        check_vault_deposit_room(&d, ceil - 5 * MICRO_PER_JTM + 1, &rules()),
+        Err(VaultError::VaultCeilingReached {
+            group: 0,
+            locked: ceil - 5 * MICRO_PER_JTM + 1,
+            amount: 5 * MICRO_PER_JTM,
+            ceil
+        })
+    );
+    // Not a deposit: nothing to check.
+    let plain = pages(logical(300, PAYER, &[(ALICE, 5)], FEE));
+    assert_eq!(check_vault_deposit_room(&plain, ceil, &rules()), Ok(()));
 }

@@ -880,3 +880,65 @@ pub fn check_plain_vault_transaction(
         _ => Err(VaultError::DepositShape { group: 0 }),
     }
 }
+
+/// Whether a burn `(owner, amount)` has a shape a block can ever pay (the
+/// porte R's causes 1-6): not the vault, not one of the 13 marker tags
+/// (destination, guardians, clients), not one of the guardians' two pools,
+/// and `RELEASE_FEE ≤ amount ≤` the window cap. The mempool refuses a release
+/// of any other shape at admission (T2.5); the CLI warns with it.
+pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
+    use crate::consensus::client_objects::{
+        CLIENT_BATCH_SUBMISSION_MARKER_TAG, CLIENT_REGISTRATION_MARKER_TAG,
+        CLIENT_SUBMISSION_MARKER_TAG,
+    };
+    use crate::consensus::guardian::{guardian_marker_kind, REWARD_POOL, STAKE_VAULT};
+    let tag: [u8; 8] = owner.0[..8].try_into().expect("eight bytes");
+    let marker = destination_marker_kind(owner).is_some()
+        || guardian_marker_kind(owner).is_some()
+        || matches!(
+            tag,
+            CLIENT_REGISTRATION_MARKER_TAG
+                | CLIENT_SUBMISSION_MARKER_TAG
+                | CLIENT_BATCH_SUBMISSION_MARKER_TAG
+        );
+    !marker
+        && *owner != rules.vault
+        && *owner != STAKE_VAULT
+        && *owner != REWARD_POOL
+        && amount >= rules.release_fee
+        && amount <= rules.window_cap
+}
+
+/// V8 at admission, against the tip's `bridge_locked`: a deposit that would
+/// take the vault over the ceiling is refused (it stays with its owner; the
+/// template applies V8 again in block order, T1.1 §18.2).
+pub fn check_vault_deposit_room(
+    pages: &[jetsam_tx::TxPage],
+    bridge_locked: u64,
+    rules: &VaultRules,
+) -> Result<(), VaultError> {
+    let outputs: Vec<(Address, u64)> = pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+        .collect();
+    let is_deposit = outputs
+        .iter()
+        .any(|(owner, _)| destination_marker_kind(owner) == Some(DestinationMarkerKind::Deposit));
+    if !is_deposit {
+        return Ok(());
+    }
+    let amount: u64 = outputs
+        .iter()
+        .filter(|(owner, _)| *owner == rules.vault)
+        .map(|(_, amount)| *amount)
+        .sum();
+    if bridge_locked.saturating_add(amount) > rules.outstanding_ceil {
+        return Err(VaultError::VaultCeilingReached {
+            group: 0,
+            locked: bridge_locked,
+            amount,
+            ceil: rules.outstanding_ceil,
+        });
+    }
+    Ok(())
+}
