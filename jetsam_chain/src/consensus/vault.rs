@@ -61,7 +61,7 @@ use crate::consensus::params::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// The vault's published spend secret. Its address is [`VAULT_ADDRESS`].
 pub const VAULT_SECRET: [u8; 32] = *b"JTM/CONSENSUS/V1.7/VAULT-SECRET/";

@@ -31,6 +31,7 @@ pub mod l1_read;
 pub mod light_client;
 pub mod mpt;
 pub mod ssz;
+pub mod state;
 
 #[cfg(test)]
 pub(crate) mod tests;

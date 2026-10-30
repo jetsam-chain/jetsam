@@ -383,3 +383,27 @@ fn guardian_journal_file_round_trips_and_refuses_damage() {
         Err(GuardianError::NonCanonicalBody)
     );
 }
+
+/// At J the guardian state starts from `alloc_counter(J − 1)`, never from a
+/// default (a default would make the pools' pre-J slots payable: INV-S);
+/// below J there is none; above J the parent's carries on.
+#[test]
+fn guardian_state_at_j_starts_from_alloc_counter_of_j_minus_1() {
+    let j = 69_120;
+    assert_eq!(GuardianState::for_child(None, 5, j - 1, Some(j)), None);
+    assert_eq!(GuardianState::for_child(None, 5, j, None), None);
+    let at_j = GuardianState::for_child(None, 4_242, j, Some(j)).expect("J");
+    assert_eq!(at_j, GuardianState::at_v1_7(4_242));
+    assert_eq!((at_j.vault_floor, at_j.next_entry_id), (4_242, 1));
+    let stale = GuardianState::default();
+    assert_eq!(
+        GuardianState::for_child(Some(&stale), 9, j, Some(j)),
+        Some(GuardianState::at_v1_7(9))
+    );
+    let mut later = at_j.clone();
+    later.revoked_at = Some(j + 3);
+    assert_eq!(
+        GuardianState::for_child(Some(&later), 1, j + 4, Some(j)),
+        Some(later.clone())
+    );
+}

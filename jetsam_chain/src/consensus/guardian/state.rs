@@ -76,4 +76,22 @@ impl GuardianState {
             ..Self::default()
         }
     }
+
+    /// The state the block at `height` is judged against: the parent's, at
+    /// J a fresh one ([`Self::at_v1_7`] from the parent header's
+    /// `alloc_counter`, never a default), `None` below J.
+    pub fn for_child(
+        parent: Option<&Self>,
+        parent_alloc_counter: u64,
+        height: u64,
+        v1_7_activation: Option<u64>,
+    ) -> Option<Self> {
+        if !crate::consensus::params::v1_7_active_with(height, v1_7_activation) {
+            return None;
+        }
+        if v1_7_activation == Some(height) {
+            return Some(Self::at_v1_7(parent_alloc_counter));
+        }
+        parent.cloned()
+    }
 }

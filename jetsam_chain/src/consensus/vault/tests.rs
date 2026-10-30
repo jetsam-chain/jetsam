@@ -15,17 +15,17 @@ use jetsam_tx::{
     PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
 };
 
-const J: u64 = 69_120;
+pub(crate) const J: u64 = 69_120;
 /// The bridge opening of the test clock (V4-d): `F = J + 1 440`.
-const F: u64 = J + 1_440;
-const HEIGHT: u64 = F + 10;
-const PAYER: Address = Address([0x51; 32]);
-const ALICE: Address = Address([0xa1; 32]);
-const BOB: Address = Address([0xb0; 32]);
-const RF: u64 = RELEASE_FEE_MICRO;
-const FEE: u64 = 47_200;
+pub(crate) const F: u64 = J + 1_440;
+pub(crate) const HEIGHT: u64 = F + 10;
+pub(crate) const PAYER: Address = Address([0x51; 32]);
+pub(crate) const ALICE: Address = Address([0xa1; 32]);
+pub(crate) const BOB: Address = Address([0xb0; 32]);
+pub(crate) const RF: u64 = RELEASE_FEE_MICRO;
+pub(crate) const FEE: u64 = 47_200;
 
-fn rules() -> VaultRules {
+pub(crate) fn rules() -> VaultRules {
     VaultRules {
         activation_height: Some(J),
         deposits_from_height: Some(F),
@@ -33,7 +33,7 @@ fn rules() -> VaultRules {
     }
 }
 
-fn header(height: u64) -> BlockHeader {
+pub(crate) fn header(height: u64) -> BlockHeader {
     BlockHeader {
         prev_block_hash: [0u8; 32],
         state_root: [0u8; 32],
@@ -49,7 +49,7 @@ fn header(height: u64) -> BlockHeader {
     }
 }
 
-fn coinbase(parent: &BlockHeader, owner: Address) -> Transaction {
+pub(crate) fn coinbase(parent: &BlockHeader, owner: Address) -> Transaction {
     let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     outputs[0] = TxOutput {
         slot_index: 15_000_000,
@@ -69,7 +69,7 @@ fn coinbase(parent: &BlockHeader, owner: Address) -> Transaction {
 
 /// One logical transaction: one input from `owner`, the outputs two per
 /// page, `fee` on the first page; the input covers outputs and fee exactly.
-fn logical(
+pub(crate) fn logical(
     slot_base: u32,
     owner: Address,
     outputs: &[(Address, u64)],
@@ -119,7 +119,7 @@ fn logical(
         .collect()
 }
 
-fn block_at(height: u64, groups: Vec<Vec<Transaction>>, releases: &[VaultRelease]) -> Block {
+pub(crate) fn block_at(height: u64, groups: Vec<Vec<Transaction>>, releases: &[VaultRelease]) -> Block {
     let parent = header(height - 1);
     let mut transactions = vec![coinbase(&parent, Address([9u8; 32]))];
     for group in groups {
@@ -139,7 +139,7 @@ fn block(groups: Vec<Vec<Transaction>>, releases: &[VaultRelease]) -> Block {
     block_at(HEIGHT, groups, releases)
 }
 
-fn release(n: u64, owner: Address, amount: u64) -> VaultRelease {
+pub(crate) fn release(n: u64, owner: Address, amount: u64) -> VaultRelease {
     VaultRelease {
         n,
         owner,
@@ -149,7 +149,7 @@ fn release(n: u64, owner: Address, amount: u64) -> VaultRelease {
 }
 
 /// The exact release group of `r`: payee, marker, change to the vault.
-fn release_group(slot_base: u32, r: &VaultRelease, change: u64, fee: u64) -> Vec<Transaction> {
+pub(crate) fn release_group(slot_base: u32, r: &VaultRelease, change: u64, fee: u64) -> Vec<Transaction> {
     let mut outputs = vec![(r.owner, r.amount - RF), (r.marker(), 0)];
     if change > 0 {
         outputs.push((VAULT_ADDRESS, change));
@@ -157,7 +157,7 @@ fn release_group(slot_base: u32, r: &VaultRelease, change: u64, fee: u64) -> Vec
     logical(slot_base, VAULT_ADDRESS, &outputs, fee)
 }
 
-fn deposit(slot_base: u32, recipient: [u8; 20], amount: u64) -> Vec<Transaction> {
+pub(crate) fn deposit(slot_base: u32, recipient: [u8; 20], amount: u64) -> Vec<Transaction> {
     logical(
         slot_base,
         PAYER,
@@ -1628,7 +1628,7 @@ fn prop_vault_balance_covers_supply_plus_pending() {
 /// One logical transaction spending `inputs` `(amount, creation_id)` from
 /// `owner`, eight per page, the outputs two per page, `fee` on the first
 /// page. The caller makes the amounts balance.
-fn group_with_inputs(
+pub(crate) fn group_with_inputs(
     slot_base: u32,
     owner: Address,
     inputs: &[(u64, u64)],
