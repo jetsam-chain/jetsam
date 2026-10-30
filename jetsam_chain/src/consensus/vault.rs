@@ -9,18 +9,25 @@
 //! * **V1** — a group spending from the vault is valid only as a release: the
 //!   block carries a `VaultRelease` object that opens the group's `JTMVRL01`
 //!   marker (one object, one group); otherwise `SpendFromLockedAddress`.
+//! * **V1-b** — every input of a release has a non-coinbase `creation_id`
+//!   above `bridge_vault_floor` (`alloc_counter` of the header J − 1): what was
+//!   sent to the published vault address before J stays frozen.
 //! * **V2** — a release's live outputs are exactly `(owner_n, amount_n −
 //!   RELEASE_FEE)`, then its marker (value 0), then at most one change output
-//!   to the vault; its fee is at most `RELEASE_FEE` (conservation is the
-//!   paged-spend rule's).
+//!   to the vault; its fee is at most `RELEASE_FEE + FEE_PER_INPUT × (inputs −
+//!   1)` (**F1**, D55: the vault pays the consensus input fee of its own
+//!   fragmentation, so that a release needing more than 929 slots stays
+//!   buildable; the owner still receives `amount_n − RELEASE_FEE`).
+//!   Conservation is the paged-spend rule's.
 //! * **V3** — `amount_n ≥ RELEASE_FEE`.
 //! * **V4** — an output to the vault is valid only in a deposit group or as a
 //!   release's change. A deposit group carries exactly one vault output and
 //!   exactly one marker `JTMBRDG1 ‖ recipient (20 B) ‖ 4 reserved bytes`, of
 //!   value 0, whose reserved bytes are zero and whose recipient is not zero,
-//!   for an amount in `[MIN_DEPOSIT, MAX_DEPOSIT]`: the deposit rule the L1's
-//!   proof program applies (G6), so that no deposit the vault accepts can be
-//!   left unmintable (SPEC-v3 §6.4, D28).
+//!   for an amount in `[MIN_DEPOSIT, MAX_DEPOSIT]`, in a block above the
+//!   bridge opening `F` (V4-d): the deposit rule the L1's proof program applies
+//!   (G6), so that no deposit the vault accepts can be left unmintable
+//!   (SPEC-v3 §6.4, D28, D44). A system record never pays the vault (V4-0).
 //! * **V5** — the markers `JTMBRDG1`, `JTMVRL01`, `JTMLCU01` carry no value,
 //!   cannot be spent (`client_objects::is_client_locked_address_at`) and never
 //!   appear in a system record.
@@ -30,13 +37,18 @@
 //! * **V7** — each release is proven on the L1: `withdrawals[n]` of the pinned
 //!   bridge contract holds `keccak(owner ‖ amount)` under a finalized root
 //!   (`destination::l1_read::verify_withdrawal`).
+//! * **V8** — `bridge_locked + amount ≤ VAULT_OUTSTANDING_CEIL` for each
+//!   deposit, in group order, where `bridge_locked` is the sum of the vault's
+//!   live slots created after the floor, not by a coinbase ([`bridge_locked_of`]).
 //!
-//! Releases are numbered: the `i`-th release of a block, in group order, has
-//! `n == release_index + 1 + i`, where `release_index` counts the chain's
-//! `JTMVRL01` markers below the block.
+//! **No order** (porte R, D52): a release `n` is valid when no release marker
+//! of the branch carries `n`, nor an earlier release of the same block. The
+//! marker carries `n` in clear, so the set of paid indices is read back from
+//! the UTXO state ([`ReleasedSet::from_marker_slots`]); a burn no block can
+//! ever include blocks nothing but itself.
 //!
-//! Pure functions: the branch's `release_index`, its window sum and the V7
-//! proof come from the caller (the chain state, `DestinationState`).
+//! Pure functions: the branch's paid set, window sum, `bridge_locked`, floor
+//! and the V7 proof come from the caller (the chain state, `DestinationState`).
 
 use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
@@ -44,7 +56,9 @@ use jetsam_poseidon2b::primitives::Address;
 use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::destination::l1_read::L1ReadError;
 use crate::consensus::destination::{DestinationObject, DestinationObjectKind};
-use crate::consensus::params::{v1_7_active_with, MICRO_PER_JTM, V1_7_ACTIVATION_HEIGHT};
+use crate::consensus::params::{
+    is_coinbase_creation_id, v1_7_active_with, FEE_PER_INPUT, MICRO_PER_JTM, V1_7_ACTIVATION_HEIGHT,
+};
 
 #[cfg(test)]
 mod tests;
@@ -72,10 +86,36 @@ pub const VAULT_RELEASE_WINDOW_BLOCKS: u64 = 480;
 /// Most the vault releases over any window (D19): a corrupted L1 committee
 /// costs at most this per window.
 pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
+/// V8: most the vault holds for the bridge (D45, = the contract's
+/// `OUTSTANDING_CEIL`).
+pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 10_000 * MICRO_PER_JTM;
+
+/// Blocks between J and the bridge opening `F` (D44): the public profiles
+/// open ≈ 3 days after J, once the branch that did not update is dead.
+#[cfg(not(feature = "rehearsal-v1-7"))]
+pub const BRIDGE_OPENING_DELAY: u64 = 1_440;
+/// The rehearsal opens 32 blocks after its J (`F_R = J_R + 32`).
+#[cfg(feature = "rehearsal-v1-7")]
+pub const BRIDGE_OPENING_DELAY: u64 = 32;
+
+/// `F` (`BRIDGE_DEPOSITS_FROM_HEIGHT`) of a v1.7 clock: none while J is
+/// none; a deposit is valid only in a block above it (V4-d).
+pub const fn bridge_deposits_from_height(v1_7_activation: Option<u64>) -> Option<u64> {
+    match v1_7_activation {
+        Some(j) => Some(j + BRIDGE_OPENING_DELAY),
+        None => None,
+    }
+}
+
+const _: () = assert!(BRIDGE_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");
+const _: () = assert!(
+    MIN_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO && MAX_DEPOSIT_MICRO <= VAULT_OUTSTANDING_CEIL_MICRO
+);
 
 /// Marker of a deposit: `tag ‖ L1 recipient (20 B) ‖ 4 reserved zero bytes`.
 pub const BRIDGE_DEPOSIT_MARKER_TAG: [u8; 8] = *b"JTMBRDG1";
-/// Marker of a release: `tag ‖ 24 bytes of its object's commitment`.
+/// Marker of a release: `tag ‖ n (8 B, little-endian) ‖ 16 bytes of its
+/// object's commitment` (D52: `n` is read back in clear).
 pub const VAULT_RELEASE_MARKER_TAG: [u8; 8] = *b"JTMVRL01";
 /// Marker of an L1 committee update: `tag ‖ 24 bytes of its commitment`.
 pub const LIGHT_CLIENT_UPDATE_MARKER_TAG: [u8; 8] = *b"JTMLCU01";
@@ -99,6 +139,117 @@ pub fn destination_marker_kind(owner: &Address) -> Option<DestinationMarkerKind>
         LIGHT_CLIENT_UPDATE_MARKER_TAG => Some(DestinationMarkerKind::LightClientUpdate),
         _ => None,
     }
+}
+
+/// The withdrawal index a release marker carries in clear; `None` for any
+/// other owner.
+pub fn release_marker_n(owner: &Address) -> Option<u64> {
+    (destination_marker_kind(owner) == Some(DestinationMarkerKind::Release))
+        .then(|| u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")))
+}
+
+/// The withdrawal indices a branch has paid (D52): bit `n` is set when a
+/// release marker carrying `n` is in the branch's UTXO state. Each index costs
+/// a burn on the L1 and is proven there (V7) before it is inserted, so the
+/// bitmap stays as small as the burns are many; reading an index far above
+/// the highest paid one allocates nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ReleasedSet {
+    /// Little-endian bitmap; no trailing zero word.
+    words: Vec<u64>,
+}
+
+impl ReleasedSet {
+    pub const fn new() -> Self {
+        Self { words: Vec::new() }
+    }
+
+    pub fn contains(&self, n: u64) -> bool {
+        usize::try_from(n / 64)
+            .ok()
+            .and_then(|word| self.words.get(word))
+            .is_some_and(|word| word & (1 << (n % 64)) != 0)
+    }
+
+    /// Mark `n` paid; `false` if it already was.
+    pub fn insert(&mut self, n: u64) -> bool {
+        let word = usize::try_from(n / 64).expect("a proven withdrawal index fits memory");
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        let bit = 1 << (n % 64);
+        let fresh = self.words[word] & bit == 0;
+        self.words[word] |= bit;
+        fresh
+    }
+
+    /// Mark `n` unpaid (a reorg removed its marker); `false` if it was not
+    /// paid.
+    pub fn remove(&mut self, n: u64) -> bool {
+        if !self.contains(n) {
+            return false;
+        }
+        let word = (n / 64) as usize;
+        self.words[word] &= !(1 << (n % 64));
+        while self.words.last() == Some(&0) {
+            self.words.pop();
+        }
+        true
+    }
+
+    pub fn len(&self) -> u64 {
+        self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// The paid indices, increasing.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.words.iter().enumerate().flat_map(|(i, word)| {
+            (0..64u64)
+                .filter(move |bit| word & (1 << bit) != 0)
+                .map(move |bit| i as u64 * 64 + bit)
+        })
+    }
+
+    /// The set a branch's UTXO state shows: the release markers among its
+    /// live slots `(owner, creation_id)` created **after** `floor` and not by
+    /// a coinbase. Older ones were ordinary owners anyone could pay before J
+    /// (V5 locks them, it does not make them releases).
+    pub fn from_marker_slots<'a>(
+        slots: impl IntoIterator<Item = (&'a Address, u64)>,
+        floor: u64,
+    ) -> Self {
+        let mut set = Self::new();
+        for (owner, creation_id) in slots {
+            if creation_id <= floor || is_coinbase_creation_id(creation_id) {
+                continue;
+            }
+            if let Some(n) = release_marker_n(owner) {
+                set.insert(n);
+            }
+        }
+        set
+    }
+}
+
+/// V8's `bridge_locked` from the live slots `(owner, amount, creation_id)`
+/// of a UTXO state: the vault's slots created after `floor`, not by a
+/// coinbase. JTM sent to the published vault address before J are neither
+/// payable (V1-b) nor counted.
+pub fn bridge_locked_of<'a>(
+    slots: impl IntoIterator<Item = (&'a Address, u64, u64)>,
+    vault: &Address,
+    floor: u64,
+) -> u64 {
+    slots
+        .into_iter()
+        .filter(|(owner, _, creation_id)| {
+            *owner == vault && *creation_id > floor && !is_coinbase_creation_id(*creation_id)
+        })
+        .fold(0u64, |sum, (_, amount, _)| sum.saturating_add(amount))
 }
 
 /// V5: from the v1.7 height (`v1_7_activation`) on, no input may be owned by
@@ -126,31 +277,55 @@ pub const fn is_destination_locked_address_at(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VaultRules {
     pub activation_height: Option<u64>,
+    /// `F`: deposits only in blocks above it (V4-d); none while J is none.
+    pub deposits_from_height: Option<u64>,
     pub vault: Address,
     pub release_fee: u64,
+    /// F1: what each input beyond the first adds to a release's fee cap.
+    pub fee_per_input: u64,
     pub min_deposit: u64,
     pub max_deposit: u64,
     pub max_releases_per_block: usize,
     pub window_blocks: u64,
     pub window_cap: u64,
+    /// V8.
+    pub outstanding_ceil: u64,
 }
 
 impl VaultRules {
     pub const fn current() -> Self {
         Self {
             activation_height: V1_7_ACTIVATION_HEIGHT,
+            deposits_from_height: bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
             vault: VAULT_ADDRESS,
             release_fee: RELEASE_FEE_MICRO,
+            fee_per_input: FEE_PER_INPUT,
             min_deposit: MIN_DEPOSIT_MICRO,
             max_deposit: MAX_DEPOSIT_MICRO,
             max_releases_per_block: MAX_RELEASES_PER_BLOCK,
             window_blocks: VAULT_RELEASE_WINDOW_BLOCKS,
             window_cap: VAULT_RELEASE_WINDOW_CAP_MICRO,
+            outstanding_ceil: VAULT_OUTSTANDING_CEIL_MICRO,
         }
     }
 
     pub const fn active_at(&self, height: u64) -> bool {
         v1_7_active_with(height, self.activation_height)
+    }
+
+    /// V4-d: whether a block at `height` may carry a deposit.
+    pub const fn deposits_open_at(&self, height: u64) -> bool {
+        match self.deposits_from_height {
+            Some(opening) => height > opening,
+            None => false,
+        }
+    }
+
+    /// V2 under F1: the most a release spending `inputs` slots may pay in
+    /// fees.
+    pub const fn release_fee_cap(&self, inputs: u64) -> u64 {
+        self.release_fee
+            .saturating_add(self.fee_per_input.saturating_mul(inputs.saturating_sub(1)))
     }
 }
 
@@ -265,14 +440,18 @@ impl VaultRelease {
         }
     }
 
-    /// The marker owner of the group that pays it: the tag, then 24 bytes of
-    /// the tagged byte-hash of its fields. The proof is witness data: it is
-    /// not committed to (any valid proof of the same withdrawal will do).
+    /// The marker owner of the group that pays it: the tag, `n` in clear
+    /// (8 bytes, little-endian), then 16 bytes of the tagged byte-hash of its
+    /// fields `(n, owner, amount)`. For a given `n`, another `(owner, amount)`
+    /// with the same marker is a 128-bit second preimage. The proof is
+    /// witness data: it is not committed to (any valid proof of the same
+    /// withdrawal will do).
     pub fn marker(&self) -> Address {
         let commitment = poseidon2b_hash_bytes(RELEASE_COMMITMENT_DOMAIN, &self.fields());
         let mut owner = [0u8; 32];
         owner[..8].copy_from_slice(&VAULT_RELEASE_MARKER_TAG);
-        owner[8..].copy_from_slice(&commitment[..24]);
+        owner[8..16].copy_from_slice(&self.n.to_le_bytes());
+        owner[16..].copy_from_slice(&commitment[..16]);
         Address(owner)
     }
 }
@@ -286,12 +465,16 @@ pub fn deposit_marker(recipient: &[u8; 20]) -> Address {
 }
 
 /// The branch state a block is judged against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VaultContext {
-    /// `JTMVRL01` markers of the branch below the block.
-    pub release_index: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaultContext<'a> {
+    /// The withdrawal indices the branch has paid below the block.
+    pub released: &'a ReleasedSet,
     /// Released over the `window_blocks − 1` blocks before this one.
     pub released_in_window: u64,
+    /// V8's `bridge_locked` of the parent state ([`bridge_locked_of`]).
+    pub bridge_locked: u64,
+    /// `alloc_counter` of the header J − 1 (V1-b, V8).
+    pub bridge_vault_floor: u64,
 }
 
 /// A deposit a block makes.
@@ -310,8 +493,8 @@ pub struct VaultEffect {
     pub releases: Vec<(u64, Address, u64)>,
     /// Sum of the releases' amounts.
     pub released: u64,
-    /// `release_index` after the block.
-    pub release_index_after: u64,
+    /// V8's `bridge_locked` after the block.
+    pub bridge_locked_after: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,8 +514,14 @@ pub enum VaultError {
     /// The release objects are not exactly the openings of the release
     /// markers, in group order (also: an undecodable release object).
     ReleasesDoNotMatchMarkers,
-    /// `n` is not `release_index + 1 + i`.
-    ReleaseOutOfOrder { expected: u64, found: u64 },
+    /// D52: `n` was paid by the branch, or by an earlier release of the
+    /// block.
+    ReleaseAlreadyPaid { n: u64 },
+    /// V1-b: a release input created at or below the floor, or by a coinbase.
+    ReleaseSpendsPreV1_7Slot { group: usize },
+    /// A release takes more from the vault's post-floor slots than they
+    /// hold: the caller's `bridge_locked` is not this block's parent's.
+    VaultBalanceUnderflow { group: usize },
     /// V3.
     ReleaseBelowFee { amount: u64, fee: u64 },
     /// V2: the first output does not pay the burn's owner.
@@ -348,6 +537,22 @@ pub enum VaultError {
     /// V4: an output to the vault outside a deposit group or a release's
     /// change.
     VaultOutputOutsideDeposit { group: usize },
+    /// V4-0: a coinbase or development payout pays the vault.
+    VaultOutputInSystemRecord,
+    /// V4-d: a deposit at a height at or below the bridge opening `F`
+    /// (`opening` is `F`, `u64::MAX` while there is none).
+    DepositBeforeBridgeOpening {
+        group: usize,
+        height: u64,
+        opening: u64,
+    },
+    /// V8.
+    VaultCeilingReached {
+        group: usize,
+        locked: u64,
+        amount: u64,
+        ceil: u64,
+    },
     /// V4: a deposit group of the wrong shape (markers, vault outputs,
     /// reserved bytes, recipient).
     DepositShape { group: usize },
@@ -366,27 +571,30 @@ pub enum VaultError {
 /// caller's). Below the v1.7 height nothing is read and nothing is refused.
 pub fn validate_block_vault(
     block: &Block,
-    ctx: &VaultContext,
+    ctx: &VaultContext<'_>,
     rules: &VaultRules,
     prove: &mut dyn FnMut(&VaultRelease) -> Result<(), L1ReadError>,
 ) -> Result<VaultEffect, VaultError> {
     let height = block.header.height;
     if !rules.active_at(height) {
         return Ok(VaultEffect {
-            release_index_after: ctx.release_index,
+            bridge_locked_after: ctx.bridge_locked,
             ..VaultEffect::default()
         });
     }
     let stream =
         validate_block_page_stream(&block.transactions).map_err(|_| VaultError::PageStream)?;
     let (system, user) = block.transactions.split_at(stream.user_start_index);
-    if system.iter().any(|record| {
-        record
-            .body
-            .live_outputs()
-            .any(|(_, output)| destination_marker_kind(&output.owner).is_some())
-    }) {
-        return Err(VaultError::MarkerInSystemRecord);
+    for record in system {
+        for (_, output) in record.body.live_outputs() {
+            if destination_marker_kind(&output.owner).is_some() {
+                return Err(VaultError::MarkerInSystemRecord);
+            }
+            // V4-0.
+            if output.owner == rules.vault {
+                return Err(VaultError::VaultOutputInSystemRecord);
+            }
+        }
     }
 
     struct ReleaseGroup {
@@ -395,9 +603,12 @@ pub fn validate_block_vault(
         payee: Address,
         paid: u64,
         fee: u64,
+        inputs: u64,
     }
     let mut releases = Vec::new();
     let mut deposits = Vec::new();
+    // V8's balance, in group order.
+    let mut locked = ctx.bridge_locked;
     for (index, group) in stream.groups.iter().enumerate() {
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         let outputs: Vec<(Address, u64)> = pages
@@ -439,12 +650,29 @@ pub fn validate_block_vault(
             if !shape_ok || kinds.len() != 1 {
                 return Err(VaultError::ReleaseShape { group: index });
             }
+            // V1-b, and V8's balance: the inputs leave, the change returns.
+            let mut taken = 0u64;
+            for page in pages {
+                for (_, input) in page.body.live_inputs() {
+                    if input.creation_id <= ctx.bridge_vault_floor
+                        || is_coinbase_creation_id(input.creation_id)
+                    {
+                        return Err(VaultError::ReleaseSpendsPreV1_7Slot { group: index });
+                    }
+                    taken = taken.saturating_add(input.amount);
+                }
+            }
+            locked = locked
+                .checked_sub(taken)
+                .ok_or(VaultError::VaultBalanceUnderflow { group: index })?
+                .saturating_add(outputs.get(2).map_or(0, |(_, change)| *change));
             releases.push(ReleaseGroup {
                 group: index,
                 marker: outputs[1].0,
                 payee: outputs[0].0,
                 paid: outputs[0].1,
                 fee: group.spend.fee,
+                inputs: u64::from(group.spend.live_inputs),
             });
             continue;
         }
@@ -470,6 +698,24 @@ pub fn validate_block_vault(
                         amount: *amount,
                     });
                 }
+                // V4-d.
+                if !rules.deposits_open_at(height) {
+                    return Err(VaultError::DepositBeforeBridgeOpening {
+                        group: index,
+                        height,
+                        opening: rules.deposits_from_height.unwrap_or(u64::MAX),
+                    });
+                }
+                // V8.
+                if locked.saturating_add(*amount) > rules.outstanding_ceil {
+                    return Err(VaultError::VaultCeilingReached {
+                        group: index,
+                        locked,
+                        amount: *amount,
+                        ceil: rules.outstanding_ceil,
+                    });
+                }
+                locked += *amount;
                 deposits.push(VaultDeposit {
                     group: index,
                     recipient,
@@ -513,16 +759,13 @@ pub fn validate_block_vault(
 
     let mut effect = VaultEffect {
         deposits,
-        release_index_after: ctx.release_index,
+        bridge_locked_after: locked,
         ..VaultEffect::default()
     };
     for (i, (release, group)) in decoded.iter().zip(&releases).enumerate() {
-        let expected = ctx.release_index + 1 + i as u64;
-        if release.n != expected {
-            return Err(VaultError::ReleaseOutOfOrder {
-                expected,
-                found: release.n,
-            });
+        // D52: never paid, on the branch or earlier in the block.
+        if ctx.released.contains(release.n) || decoded[..i].iter().any(|r| r.n == release.n) {
+            return Err(VaultError::ReleaseAlreadyPaid { n: release.n });
         }
         // V3.
         if release.amount < rules.release_fee {
@@ -543,11 +786,13 @@ pub fn validate_block_vault(
                 expected: expected_paid,
             });
         }
-        if group.fee > rules.release_fee {
+        // V2 under F1.
+        let max = rules.release_fee_cap(group.inputs);
+        if group.fee > max {
             return Err(VaultError::ReleaseFeeTooHigh {
                 group: group.group,
                 fee: group.fee,
-                max: rules.release_fee,
+                max,
             });
         }
         effect.released = effect.released.saturating_add(release.amount);
@@ -570,7 +815,6 @@ pub fn validate_block_vault(
             error,
         })?;
     }
-    effect.release_index_after = ctx.release_index + decoded.len() as u64;
     Ok(effect)
 }
 
@@ -578,7 +822,8 @@ pub fn validate_block_vault(
 /// block at `next_height`: from the v1.7 height on, it cannot spend from the
 /// vault (a release travels with its object, never alone), cannot carry a
 /// release or committee-update marker without its object, and a deposit must
-/// already have the deposit shape.
+/// already have the deposit shape, above the bridge opening (V4-d). V8 needs
+/// the vault's balance: the mempool checks it with the state (T2.5).
 pub fn check_plain_vault_transaction(
     pages: &[jetsam_tx::TxPage],
     next_height: u64,
@@ -621,6 +866,12 @@ pub fn check_plain_vault_transaction(
                 Err(VaultError::DepositAmount {
                     group: 0,
                     amount: *amount,
+                })
+            } else if !rules.deposits_open_at(next_height) {
+                Err(VaultError::DepositBeforeBridgeOpening {
+                    group: 0,
+                    height: next_height,
+                    opening: rules.deposits_from_height.unwrap_or(u64::MAX),
                 })
             } else {
                 Ok(())
