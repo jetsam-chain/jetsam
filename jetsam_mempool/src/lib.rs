@@ -51,6 +51,7 @@ pub mod destination;
 pub mod error;
 pub mod event;
 pub mod floor;
+pub mod guardian;
 pub mod pool;
 pub mod view;
 

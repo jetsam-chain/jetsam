@@ -101,6 +101,18 @@ pub fn is_guardian_locked_address_at(
     v1_7_active_with(height, v1_7_activation) && guardian_marker_kind(owner).is_some()
 }
 
+/// P-1 and P-2 for one group carrying a guardian object of `kind` (or
+/// none), exactly as [`apply_block_guardian`] judges each group of a block:
+/// for the pool and the template, which judge a group before any block
+/// carries it (T3.7). No rule of its own.
+pub fn check_group_pool_gate(
+    group: &GuardianGroupFacts,
+    kind: Option<GuardianObjectKind>,
+    rules: &GuardianRules,
+) -> Result<(), GuardianError> {
+    check_pool_gate(group, kind, rules)
+}
+
 /// Why a block breaks a guardian rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GuardianError {

@@ -67,6 +67,10 @@ pub enum EvictReason {
     /// deposit of the wrong shape or before the bridge opening
     /// (`check_plain_vault_transaction` at the next block's height).
     VaultRule,
+    /// From the v1.7 height on no block may carry it as a plain transaction:
+    /// it spends from or pays the stake vault or the reward pool, spends from
+    /// a guardian marker, or pays a guardian marker without its object.
+    GuardianRule,
 }
 
 impl EvictReason {
@@ -102,6 +106,10 @@ impl EvictReason {
                  bridge vault, pays a bridge marker without its object, or is a deposit \
                  of the wrong shape or before the bridge opens"
             }
+            Self::GuardianRule => {
+                "from the v1.7 height no block may carry it alone: it touches the stake \
+                 vault or the reward pool, or pays a guardian marker without its object"
+            }
         }
     }
 }
@@ -119,6 +127,7 @@ mod tests {
             EvictReason::OutputSlotOccupied,
             EvictReason::ClientObjectRule,
             EvictReason::VaultRule,
+            EvictReason::GuardianRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {

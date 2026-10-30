@@ -50,6 +50,18 @@ pub enum SubmitError {
     /// Internal error (lock poisoned, channel closed, etc).
     #[error("internal: {0}")]
     Internal(String),
+
+    /// v1.7 (A1 m13): one source handed in more attestations and
+    /// equivocations in the last second than the pool verifies; refused
+    /// without any verification.
+    #[error("guardian objects rate-limited for {origin}")]
+    GuardianRateLimited { origin: String },
+
+    /// v1.7: the pool does not hold this guardian object beside what it
+    /// holds (the same object, an attestation of a height already covered,
+    /// a second equivocation, or a block's worth of delegation objects).
+    #[error("guardian object not held: {0}")]
+    GuardianNotHeld(String),
 }
 
 impl SubmitError {
@@ -62,6 +74,8 @@ impl SubmitError {
                 | SubmitError::Full { .. }
                 | SubmitError::BytesFull { .. }
                 | SubmitError::Consensus(ConsensusError::SlotConflict)
+                | SubmitError::GuardianRateLimited { .. }
+                | SubmitError::GuardianNotHeld(_)
         )
     }
 }

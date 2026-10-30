@@ -28,6 +28,7 @@ use jetsam_chain::block_header::BlockHeader;
 use jetsam_chain::consensus::destination::state::{
     CommitteeRef, DestinationRules, DestinationState,
 };
+use jetsam_chain::consensus::guardian::{GuardianBranch, GuardianRules, GuardianState};
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
 use jetsam_chain::consensus::vault::ReleasedSet;
 use jetsam_chain::consensus::{
@@ -131,6 +132,10 @@ pub struct ChainView {
     /// withdrawal indices at admission.
     pub vault: Option<VaultView>,
 
+    /// The v1.7 guardian state the next block is judged against (`None`
+    /// below J; at J a fresh one on the tip's `alloc_counter`), T3.7.
+    pub guardian: Option<Arc<GuardianState>>,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -174,6 +179,7 @@ impl ChainView {
             previous_user_epoch_anchor_id,
             tip_hash,
             vault: None,
+            guardian: None,
             state,
             store: None,
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::default())),
@@ -274,6 +280,13 @@ impl ChainView {
             ctx.tip_height.saturating_add(1),
             &DestinationRules::current(),
         );
+        view.guardian = GuardianState::for_child(
+            ctx.guardian_state(),
+            tip_alloc_counter,
+            ctx.tip_height.saturating_add(1),
+            GuardianRules::current().activation_height,
+        )
+        .map(Arc::new);
         let anchor_height = tx_epoch_anchor_height_for_child(ctx.tip_height + 1);
         view.user_epoch_anchor_id = ctx
             .get_header_from_store(anchor_height)
@@ -310,6 +323,35 @@ impl ChainView {
             },
             child_generation(self.tip_height),
         )
+    }
+}
+
+/// The branch of the view's tip, for the rules of an attestation (T3.7):
+/// block ids from the retained headers or the store, chain work from the
+/// store, never above the tip.
+impl GuardianBranch for ChainView {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.tip_height {
+            return None;
+        }
+        self.recent_headers
+            .get(&height)
+            .copied()
+            .or_else(|| {
+                self.store
+                    .as_ref()
+                    .and_then(|store| store.get_header(height).ok().flatten())
+            })
+            .map(|header| block_id(&header))
+    }
+
+    fn chain_work(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.tip_height {
+            return None;
+        }
+        self.store
+            .as_ref()
+            .and_then(|store| store.get_chain_work(height).ok().flatten())
     }
 }
 

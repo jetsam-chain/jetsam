@@ -94,6 +94,11 @@ pub(crate) struct MempoolState {
     /// v1.7: destination objects held with their transactions, never in the
     /// fee pool ([`crate::destination`]).
     pub destination: crate::destination::DestinationPool,
+    /// v1.7: guardian objects held with their transactions, never in the fee
+    /// pool ([`crate::guardian`]).
+    pub guardian: crate::guardian::GuardianPool,
+    /// The v1.7 guardian rules ([`MempoolConfig::guardian_rules`]).
+    pub guardian_rules: jetsam_chain::consensus::guardian::GuardianRules,
 }
 
 /// Compact immutable RPC/diagnostic projection of one mempool entry.
@@ -174,6 +179,9 @@ pub struct AsyncMempool {
     /// Set to 0 in config → semaphore with MAX permits (no limit).
     auth_verify_semaphore: Arc<Semaphore>,
     auth_verify_executor: AuthorizationVerificationExecutor,
+    /// v1.7: guardian BLS verifications run so far (A1 m13: each one comes
+    /// after every cheap refusal and within the rate limit).
+    guardian_signature_checks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Largest number of events one `on_new_block` can emit before any subscriber
@@ -208,6 +216,8 @@ impl AsyncMempool {
             client_rules: config.client_object_rules,
             vault_rules: config.vault_rules,
             destination: Default::default(),
+            guardian: Default::default(),
+            guardian_rules: config.guardian_rules,
         };
         let max_permits = if config.auth_verify_workers == 0 {
             // 0 = unlimited concurrency; verification is still required
@@ -222,6 +232,7 @@ impl AsyncMempool {
             config: Arc::new(config),
             auth_verify_semaphore,
             auth_verify_executor: Arc::new(|task| task()),
+            guardian_signature_checks: Arc::default(),
         }
     }
 
@@ -588,6 +599,136 @@ impl AsyncMempool {
     }
 
     // -----------------------------------------------------------------------
+    // v1.7 guardian objects (T3.7)
+    // -----------------------------------------------------------------------
+
+    /// Admit one encoded guardian intent ([`crate::guardian`]) handed in by
+    /// `source` (a peer, an RPC client). In this order: the bytes; for an
+    /// attestation or an equivocation, the rate limit of `source` (beyond
+    /// it, refused unverified); under the lock, the v1.7 clock of the next
+    /// block, the conflicts with what is held, every guardian rule but the
+    /// signatures on the tip's guardian state after the held objects, and the
+    /// transaction against the current state; outside the lock, the BLS
+    /// signatures, then the transaction's authorization; under the lock
+    /// again, the same cheap checks before it is held. Never in the fee pool,
+    /// and no miner is woken: no guardian object is urgent (T1.1 §10).
+    pub async fn submit_guardian(
+        &self,
+        bytes: &[u8],
+        source: &str,
+    ) -> Result<crate::guardian::GuardianAdmitted, SubmitError> {
+        use crate::guardian::{group_facts, verify_guardian_signatures, GuardianIntent};
+        use jetsam_chain::consensus::guardian::GuardianObjectKind;
+        let intent = GuardianIntent::decode(bytes)
+            .map_err(|error| SubmitError::MalformedIntent(format!("guardian intent: {error}")))?;
+        let signed = matches!(
+            intent.object.kind,
+            GuardianObjectKind::Attestation | GuardianObjectKind::Equivocation
+        );
+        if signed
+            && !self
+                .state
+                .lock()
+                .await
+                .guardian
+                .limiter
+                .admit(source, std::time::Instant::now())
+        {
+            return Err(SubmitError::GuardianRateLimited {
+                origin: source.to_string(),
+            });
+        }
+        let spend = validate_paged_spend(&intent.payment.pages)
+            .map_err(|e| SubmitError::MalformedIntent(format!("PagedSpend: {e}")))?;
+        if intent.payment.authorization_bytes.is_empty() {
+            return Err(SubmitError::MissingProof);
+        }
+        if intent.payment.authorization_bytes.len() > MAX_AUTHORIZATION_BYTES {
+            return Err(SubmitError::ProofTooLarge {
+                actual: intent.payment.authorization_bytes.len(),
+                max: MAX_AUTHORIZATION_BYTES,
+            });
+        }
+        {
+            let st = self.state.lock().await;
+            check_guardian_admission(&intent, &spend, &st)?;
+        }
+        if signed {
+            let object = intent.object.clone();
+            let rules = self.config.guardian_rules;
+            self.guardian_signature_checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::spawn_blocking(move || verify_guardian_signatures(&object, &rules))
+                .await
+                .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
+                .map_err(guardian_submit_error)?;
+        }
+        let proof_bytes = intent.payment.authorization_bytes.clone();
+        let pages = intent.payment.pages.clone();
+        let executor = Arc::clone(&self.auth_verify_executor);
+        {
+            let _permit =
+                self.auth_verify_semaphore.acquire().await.map_err(|_| {
+                    SubmitError::Internal("proof-verification semaphore closed".into())
+                })?;
+            tokio::task::spawn_blocking(move || {
+                executor(Box::new(move || {
+                    verify_intent_authorization(&pages, &proof_bytes)
+                }))
+            })
+            .await
+            .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
+            .map_err(SubmitError::InvalidProof)?;
+        }
+        let mut st = self.state.lock().await;
+        let pending_pair = check_guardian_admission(&intent, &spend, &st)?;
+        let kind = intent.object.kind;
+        let marker = intent.object.marker();
+        let group = group_facts(&intent.payment.pages, spend.input_owner, spend.fee);
+        let seq = st
+            .guardian
+            .hold(intent, group)
+            .map_err(|refusal| SubmitError::GuardianNotHeld(refusal.to_string()))?;
+        tracing::info!(?kind, seq, pending_pair, "guardian object admitted");
+        Ok(crate::guardian::GuardianAdmitted {
+            kind,
+            marker,
+            seq,
+            pending_pair,
+        })
+    }
+
+    /// The guardian intents held for the template, in its order: the
+    /// equivocation, the attestation, the delegation objects by arrival.
+    pub async fn guardian_candidates(&self) -> Vec<crate::guardian::HeldGuardian> {
+        self.state.lock().await.guardian.held().cloned().collect()
+    }
+
+    /// Forget the guardian intents numbered `seqs` (a template's block was
+    /// refused for them): not offered again unless submitted again.
+    pub async fn forget_guardian(&self, seqs: &[u64]) {
+        let forgotten = self.state.lock().await.guardian.forget(seqs);
+        if forgotten > 0 {
+            tracing::warn!(
+                ?seqs,
+                forgotten,
+                "guardian intents forgotten: a template's block was refused for them"
+            );
+        }
+    }
+
+    /// The v1.7 guardian rules this pool judges by.
+    pub fn guardian_rules(&self) -> jetsam_chain::consensus::guardian::GuardianRules {
+        self.config.guardian_rules
+    }
+
+    /// Guardian BLS verifications this pool has run.
+    pub fn guardian_signature_checks(&self) -> u64 {
+        self.guardian_signature_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // -----------------------------------------------------------------------
     // Block assembly
     // -----------------------------------------------------------------------
 
@@ -797,7 +938,9 @@ impl AsyncMempool {
         evict_client_object_violations(&mut st, next_height, &self.events);
         // v1.7: likewise for the vault rule (crossing J, reorg).
         evict_vault_violations(&mut st, next_height, &self.events);
+        evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
+        prune_guardian(&mut st, next_height);
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
@@ -959,8 +1102,10 @@ impl AsyncMempool {
         st.view = view;
         let next_height = st.view.tip_height.saturating_add(1);
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
-            + evict_vault_violations(&mut st, next_height, &self.events);
+            + evict_vault_violations(&mut st, next_height, &self.events)
+            + evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
+        prune_guardian(&mut st, next_height);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
             if st.pool.is_empty() {
@@ -979,7 +1124,8 @@ impl AsyncMempool {
     pub async fn evict_unminable_at(&self, next_height: u64) -> usize {
         let mut st = self.state.lock().await;
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
-            + evict_vault_violations(&mut st, next_height, &self.events);
+            + evict_vault_violations(&mut st, next_height, &self.events)
+            + evict_guardian_violations(&mut st, next_height, &self.events);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
             if st.pool.is_empty() {
@@ -1102,6 +1248,13 @@ enum Admission {
     /// asked, never the dynamic floor; its shape is
     /// `vault::check_release_group`'s.
     VaultRelease,
+    /// A transaction paying a guardian object (T3.7): as an object payment,
+    /// and the guardian rules are the object's (it may pay a pool).
+    GuardianPayment,
+    /// A guardian payout group (T3.7): as a guardian payment, its fee taken
+    /// out of the entry and capped by `PAYOUT_FEE_MAX` (Y-6), so only the
+    /// consensus minimum is asked, as for a release.
+    GuardianPayout,
 }
 
 /// [`run_admission_checks`] for a transaction admitted as `admission`
@@ -1121,7 +1274,7 @@ fn run_admission_checks_with(
         st.view.log_slots(),
     )
     .required_total;
-    let required = if admission == Admission::VaultRelease {
+    let required = if matches!(admission, Admission::VaultRelease | Admission::GuardianPayout) {
         consensus_required
     } else {
         st.floor.current().max(consensus_required)
@@ -1164,6 +1317,16 @@ fn run_admission_checks_with(
                 },
             ),
         ));
+    }
+    // v1.7: a transaction that does not travel with its guardian object
+    // never touches the two pools and carries no guardian marker.
+    if !matches!(admission, Admission::GuardianPayment | Admission::GuardianPayout) {
+        crate::guardian::check_plain_guardian_transaction(
+            pages,
+            st.view.tip_height.saturating_add(1),
+            &st.guardian_rules,
+        )
+        .map_err(guardian_submit_error)?;
     }
     if spend.epoch_anchor == [0u8; 32] {
         return Err(SubmitError::Consensus(
@@ -1405,6 +1568,173 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
+}
+
+fn guardian_submit_error(error: jetsam_chain::consensus::guardian::GuardianError) -> SubmitError {
+    SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::Guardian(error))
+}
+
+/// Evict every entry the block at `next_height` may not carry as a plain
+/// transaction under the v1.7 guardian policy
+/// ([`crate::guardian::check_plain_guardian_transaction`]): crossing J, a
+/// reorg. Inert below J. Returns the number evicted; the caller rebuilds the
+/// slot sets.
+fn evict_guardian_violations(
+    st: &mut MempoolState,
+    next_height: u64,
+    events: &broadcast::Sender<MempoolEvent>,
+) -> usize {
+    use jetsam_chain::consensus::params::v1_7_active_with;
+    if !v1_7_active_with(next_height, st.guardian_rules.activation_height) {
+        return 0;
+    }
+    let refused: Vec<TxBodyHash> = st
+        .pool
+        .iter()
+        .filter(|(_, entry)| {
+            crate::guardian::check_plain_guardian_transaction(
+                &entry.pages,
+                next_height,
+                &st.guardian_rules,
+            )
+            .is_err()
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in &refused {
+        st.pool.remove(hash);
+        tracing::info!(
+            ?hash,
+            next_height,
+            "tx evicted: no block from the v1.7 height may carry it without its guardian object"
+        );
+        let _ = events.send(MempoolEvent::TxEvicted {
+            hash: *hash,
+            reason: EvictReason::GuardianRule,
+        });
+    }
+    refused.len()
+}
+
+/// The admission rules of a guardian intent against `st`, cheapest first
+/// and without the BLS signatures (module docs of [`crate::guardian`]).
+/// Returns whether it is a reward funding before the latch still waiting
+/// for its pair (F-4).
+fn check_guardian_admission(
+    intent: &crate::guardian::GuardianIntent,
+    spend: &PagedSpendFacts,
+    st: &MempoolState,
+) -> Result<bool, SubmitError> {
+    use crate::guardian::{apply_guardian_intent, group_facts, project, Signatures};
+    use jetsam_chain::consensus::guardian::{GuardianError, GuardianObjectKind, RewardFund};
+    use jetsam_chain::consensus::params::v1_7_active_with;
+    let rules = &st.guardian_rules;
+    let next_height = st.view.tip_height.saturating_add(1);
+    let state = st
+        .view
+        .guardian
+        .as_deref()
+        .filter(|_| v1_7_active_with(next_height, rules.activation_height))
+        .ok_or_else(|| guardian_submit_error(GuardianError::GuardianObjectsBeforeV1_7))?;
+    st.guardian
+        .conflict(intent)
+        .map_err(|refusal| SubmitError::GuardianNotHeld(refusal.to_string()))?;
+    let group = group_facts(&intent.payment.pages, spend.input_owner, spend.fee);
+    let (mut projected, _) = project(state, next_height, st.guardian.held(), &st.view, rules);
+    apply_guardian_intent(
+        &mut projected,
+        next_height,
+        &group,
+        &intent.object,
+        &st.view,
+        rules,
+        Signatures::Defer,
+    )
+    .map_err(guardian_submit_error)?;
+    let admission = if intent.object.kind == GuardianObjectKind::Payout {
+        Admission::GuardianPayout
+    } else {
+        Admission::GuardianPayment
+    };
+    run_admission_checks_with(&intent.payment.pages, spend, st, admission)?;
+    let funder = |object: &jetsam_chain::consensus::guardian::GuardianObject| {
+        (object.kind == GuardianObjectKind::RewardFund)
+            .then(|| RewardFund::decode(&object.body).ok().map(|fund| fund.funder))
+            .flatten()
+    };
+    Ok(match funder(&intent.object) {
+        Some(funder) if state.activated_at.is_none() => {
+            let other = if funder == rules.network_fund {
+                rules.lab_fund
+            } else {
+                rules.network_fund
+            };
+            !st.guardian
+                .held()
+                .any(|held| funder_is(&held.intent.object, other))
+        }
+        _ => false,
+    })
+}
+
+/// Whether `object` is a reward funding by `funder`.
+fn funder_is(object: &jetsam_chain::consensus::guardian::GuardianObject, funder: Address) -> bool {
+    object.kind == jetsam_chain::consensus::guardian::GuardianObjectKind::RewardFund
+        && jetsam_chain::consensus::guardian::RewardFund::decode(&object.body)
+            .is_ok_and(|fund| fund.funder == funder)
+}
+
+/// Judge the held guardian intents again for the block at `next_height`
+/// (a new tip: a period boundary, `J_D` and the latch included) and forget
+/// the ones the branch now refuses, and those whose inputs are no longer live
+/// as their transaction spends them; everything below J or without a
+/// guardian state.
+fn prune_guardian(st: &mut MempoolState, next_height: u64) {
+    use jetsam_chain::consensus::params::v1_7_active_with;
+    let rules = st.guardian_rules;
+    let Some(state) = st
+        .view
+        .guardian
+        .clone()
+        .filter(|_| v1_7_active_with(next_height, rules.activation_height))
+    else {
+        st.guardian.clear();
+        return;
+    };
+    let (_, refused) = crate::guardian::project(
+        &state,
+        next_height,
+        st.guardian.held(),
+        &st.view,
+        &rules,
+    );
+    let mut forget: Vec<u64> = refused.iter().map(|(seq, _)| *seq).collect();
+    forget.extend(
+        st.guardian
+            .held()
+            .filter(|held| inputs_no_longer_live(&held.intent.payment.pages, &st.view))
+            .map(|held| held.seq),
+    );
+    let forgotten = st.guardian.forget(&forget);
+    if forgotten > 0 {
+        tracing::debug!(forgotten, ?refused, "guardian intents the branch no longer takes");
+    }
+}
+
+/// Whether an input of `pages` is no longer the live slot it spends (value,
+/// creation id and owner).
+fn inputs_no_longer_live(pages: &[TxPage], view: &ChainView) -> bool {
+    let Some(owner) = pages.first().map(|page| page.body.input_owner) else {
+        return true;
+    };
+    pages.iter().any(|page| {
+        page.body.live_inputs().any(|(_, input)| {
+            let expected =
+                SlotValue::with_owner_fields(input.amount, input.creation_id, owner.as_fields());
+            view.try_slot(input.slot_index)
+                .map_or(true, |slot| slot != expected)
+        })
+    })
 }
 
 fn rebuild_slot_sets(st: &mut MempoolState) {
@@ -1806,6 +2136,8 @@ mod tests {
             client_rules: MempoolConfig::default().client_object_rules,
             vault_rules: MempoolConfig::default().vault_rules,
             destination: Default::default(),
+            guardian: Default::default(),
+            guardian_rules: MempoolConfig::default().guardian_rules,
         };
 
         let spend = |fee: u64| {
@@ -1986,6 +2318,8 @@ mod tests {
             client_rules: MempoolConfig::default().client_object_rules,
             vault_rules: MempoolConfig::default().vault_rules,
             destination: Default::default(),
+            guardian: Default::default(),
+            guardian_rules: MempoolConfig::default().guardian_rules,
         };
         let required = jetsam_chain::consensus::fee_breakdown(
             1,
