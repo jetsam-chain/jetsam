@@ -7,6 +7,7 @@
 pub mod api;
 pub mod client_objects;
 pub mod destination;
+pub mod guardian;
 pub mod server;
 pub mod types;
 pub mod wallet_ops;

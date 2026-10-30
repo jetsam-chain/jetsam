@@ -3412,6 +3412,194 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn submit_guardian_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::guardian::SubmitGuardianObjectResponse> {
+        let bytes = hex::decode(intent_hex.trim())
+            .map_err(|error| rpc_err(format!("intent_hex: {error}")))?;
+        if bytes.len() > jetsam_mempool::guardian::MAX_GUARDIAN_INTENT_BYTES {
+            return Err(rpc_err("guardian intent too large"));
+        }
+        self.mempool
+            .submit_guardian(&bytes, "rpc")
+            .await
+            .map(Into::into)
+            .map_err(|error| rpc_err(format!("guardian intent refused: {error}")))
+    }
+
+    async fn get_guardian_state(&self) -> RpcResult<crate::guardian::GuardianStateResponse> {
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let held = self.mempool.guardian_candidates().await.len();
+        let chain = self.chain.read().await;
+        let tip = chain.tip_height();
+        let state = guardian_state_for_child(&chain, &rules);
+        let stake_vault = guardian_pool_slots(&chain, &rules.stake_vault)?;
+        let reward_pool = guardian_pool_slots(&chain, &rules.reward_pool)?;
+        Ok(crate::guardian::guardian_state(
+            state.as_ref(),
+            tip,
+            &rules,
+            &stake_vault,
+            &reward_pool,
+            held,
+        ))
+    }
+
+    async fn get_stake_info(&self, owner: String) -> RpcResult<crate::guardian::StakeInfoResponse> {
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules);
+        let stake_vault = guardian_pool_slots(&chain, &rules.stake_vault)?;
+        Ok(crate::guardian::stake_info(
+            state.as_ref(),
+            &owner,
+            chain.tip_height(),
+            &rules,
+            &stake_vault,
+        ))
+    }
+
+    async fn get_reward_info(
+        &self,
+        owner: String,
+    ) -> RpcResult<crate::guardian::RewardInfoResponse> {
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules);
+        Ok(crate::guardian::reward_info(
+            state.as_ref(),
+            &owner,
+            chain.tip_height(),
+            &rules,
+        ))
+    }
+
+    async fn wallet_build_guardian_payment(
+        &self,
+        object: crate::guardian::GuardianPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::guardian::GuardianPaymentResponse> {
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let (_, active) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        let owner = parse_address_param(&active)?;
+        let (guardian_object, payments) =
+            crate::guardian::plan_guardian_payment(&object, owner, &rules).map_err(rpc_err)?;
+        let marker = guardian_object.marker();
+        let output_count = payments.len() + 2; // the marker and, at most, change
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints, required, next_height) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints =
+                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
+                    .map_err(rpc_err)?;
+            let required = crate::client_objects::client_payment_required_fee(
+                output_count as u64,
+                tip.active_slot_count,
+                tip.log_slots,
+            );
+            (
+                epoch_anchor,
+                tip.log_slots,
+                slot_hints,
+                required,
+                chain.tip_height().saturating_add(1),
+            )
+        };
+        if !jetsam_chain::consensus::params::v1_7_active_with(
+            next_height,
+            rules.activation_height,
+        ) {
+            return Err(rpc_err("guardian objects are carried from the v1.7 height only"));
+        }
+        let fee = fee_micro_jtm.unwrap_or(required);
+        let wallet = Arc::clone(&self.wallet);
+        let build_payments = payments.clone();
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    build_payments,
+                    marker.0,
+                    fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let guardian_intent = crate::guardian::guardian_intent_bytes(&guardian_object, &payment)
+            .map_err(rpc_err)?;
+        let txid = payment.logical_txid().0;
+        let output_slots: Vec<u32> = payment
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Held until mined, or until no block can include it any more, as a
+        // client-object payment: it never enters the fee pool either.
+        self.wallet
+            .reserve_pending_submission(
+                txid,
+                &input_slots,
+                &output_slots,
+                payments.iter().map(|(_, amount)| amount).sum(),
+                marker.0,
+            )
+            .map_err(rpc_err)?;
+        let built_at = self.chain.read().await.tip_height();
+        self.wallet.track_client_payment(txid, built_at);
+        Ok(crate::guardian::GuardianPaymentResponse {
+            kind: crate::guardian::kind_name(guardian_object.kind).into(),
+            payment_hex: hex::encode(&intent_bytes),
+            intent_hex: hex::encode(guardian_intent),
+            txid: hex::encode(txid),
+            fee_micro_jtm: fee,
+            marker: hex::encode(marker.0),
+        })
+    }
+
+    async fn plan_guardian_payout(&self, entry_id: u64) -> RpcResult<crate::guardian::PayoutPlan> {
+        use jetsam_chain::consensus::guardian::PayoutEntryKind;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules)
+            .ok_or_else(|| rpc_err(crate::guardian::DELEGATION_INACTIVE_MESSAGE))?;
+        let pool = match state.entries.get(&entry_id).map(|entry| entry.kind) {
+            Some(PayoutEntryKind::Stake) => rules.stake_vault,
+            Some(_) => rules.reward_pool,
+            None => return Err(rpc_err(format!("no open entry {entry_id}"))),
+        };
+        let slots = guardian_pool_slots(&chain, &pool)?;
+        let tip = chain.tip_header();
+        crate::guardian::plan_guardian_payout(
+            &state,
+            entry_id,
+            chain.tip_height().saturating_add(1),
+            &rules,
+            &slots,
+            tip.active_slot_count,
+            tip.log_slots,
+        )
+        .map_err(rpc_err)
+    }
+
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = jetsam_poseidon2b::primitives::TxBodyHash(hash_bytes);
@@ -4211,6 +4399,40 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// The v1.7 guardian state the tip's child is judged against (T3.7): at J a
+/// fresh one on the tip's `alloc_counter`, `None` below J.
+fn guardian_state_for_child(
+    chain: &jetsam_chain::storage::MdbxChainContext,
+    rules: &jetsam_chain::consensus::guardian::GuardianRules,
+) -> Option<jetsam_chain::consensus::guardian::GuardianState> {
+    jetsam_chain::consensus::guardian::GuardianState::for_child(
+        chain.guardian_state(),
+        chain.tip_header().alloc_counter,
+        chain.tip_height().saturating_add(1),
+        rules.activation_height,
+    )
+}
+
+/// The live slots of a guardian pool, from the store's owner index.
+fn guardian_pool_slots(
+    chain: &jetsam_chain::storage::MdbxChainContext,
+    pool: &jetsam_poseidon2b::primitives::Address,
+) -> RpcResult<Vec<crate::guardian::PoolSlot>> {
+    let snapshot = chain
+        .store
+        .get_verified_utxos_by_owner(&pool.0)
+        .map_err(|error| rpc_err(format!("pool slots: {error}")))?;
+    Ok(snapshot
+        .utxos
+        .iter()
+        .map(|utxo| crate::guardian::PoolSlot {
+            slot: utxo.slot_index,
+            amount: utxo.amount,
+            creation_id: utxo.creation_id,
+        })
+        .collect())
 }
 
 /// Parse a required address parameter from canonical bech32m (`o1…`).

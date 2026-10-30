@@ -283,6 +283,51 @@ pub trait JetsamApi {
         &self,
     ) -> RpcResult<crate::destination::DestinationCommitteeResponse>;
 
+    /// v1.7 (T3.7): hand a guardian intent (hex of `GuardianIntent::encode`:
+    /// an object with the transaction paying its marker) to this node's
+    /// mempool, for its miners. Attestations and equivocations: at most four
+    /// per second from this RPC. Refused below J.
+    #[method(name = "submitGuardianObject")]
+    async fn submit_guardian_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::guardian::SubmitGuardianObjectResponse>;
+
+    /// v1.7: the guardian state the tip's child is judged against — key,
+    /// revocation, attestations, `J`, `J_D`, the latch, the reward ledger —
+    /// and the two pools' payable balances.
+    #[method(name = "getGuardianState")]
+    async fn get_guardian_state(&self) -> RpcResult<crate::guardian::GuardianStateResponse>;
+
+    /// v1.7: an owner's stake (active, activating), its stake entries, and
+    /// `max_payable_entry` (the largest entry one payout can pay now).
+    #[method(name = "getStakeInfo")]
+    async fn get_stake_info(&self, owner: String) -> RpcResult<crate::guardian::StakeInfoResponse>;
+
+    /// v1.7: an owner's reward balance and entries, and a projected rate
+    /// (display only).
+    #[method(name = "getRewardInfo")]
+    async fn get_reward_info(&self, owner: String)
+        -> RpcResult<crate::guardian::RewardInfoResponse>;
+
+    /// v1.7 (A1 m10): build and prove, with the active wallet, the
+    /// transaction paying a guardian object owned by the active address (its
+    /// marker; the lock to the stake vault, the funding to the reward pool;
+    /// change back). Not submitted: pass `intent_hex` to
+    /// `submitGuardianObject`. Its inputs stay reserved until mined.
+    #[method(name = "walletBuildGuardianPayment")]
+    async fn wallet_build_guardian_payment(
+        &self,
+        object: crate::guardian::GuardianPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::guardian::GuardianPaymentResponse>;
+
+    /// v1.7: the payout of a due entry from its pool (inputs, outputs, fee);
+    /// no key is needed to pay it, the pools' secrets being published.
+    #[method(name = "planGuardianPayout")]
+    async fn plan_guardian_payout(&self, entry_id: u64)
+        -> RpcResult<crate::guardian::PayoutPlan>;
+
     /// Assemble a client proof bundle (hex) from its parts: the submission
     /// (`D`, IO commitment), its payment (hex intent) and the proof (hex,
     /// `encode_history_step_client_proof`). No side effect.

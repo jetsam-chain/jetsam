@@ -149,7 +149,35 @@ pub struct TemplateChainSnapshot {
     /// keys of the L1 committees it names (D57).
     pub destination: Option<jetsam_chain::consensus::destination::state::DestinationState>,
     pub committee_keys: jetsam_chain::consensus::destination::state::CommitteeKeyCache,
+    /// v1.7: the guardian state the child is judged against (at J a fresh
+    /// one on the parent's `alloc_counter`), `None` below J (T3.7).
+    pub guardian: Option<jetsam_chain::consensus::guardian::GuardianState>,
     store: MdbxStore,
+}
+
+/// The branch of the template's parent, for the rules of an attestation
+/// (T3.7): ids and chain work of the parent and its ancestors.
+impl jetsam_chain::consensus::guardian::GuardianBranch for TemplateChainSnapshot {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.parent.height {
+            return None;
+        }
+        if height == self.parent.height {
+            return Some(block_id(&self.parent));
+        }
+        self.store
+            .get_header(height)
+            .ok()
+            .flatten()
+            .map(|header| block_id(&header))
+    }
+
+    fn chain_work(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.parent.height {
+            return None;
+        }
+        self.store.get_chain_work(height).ok().flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +293,12 @@ impl TemplateChainSnapshot {
                 &jetsam_chain::consensus::destination::state::DestinationRules::current(),
             ),
             committee_keys: ctx.committee_keys().clone(),
+            guardian: jetsam_chain::consensus::guardian::GuardianState::for_child(
+                ctx.guardian_state(),
+                parent.alloc_counter,
+                parent.height.saturating_add(1),
+                jetsam_chain::consensus::guardian::GuardianRules::current().activation_height,
+            ),
             store: ctx.store.clone(),
         })
     }
@@ -551,14 +585,35 @@ impl TemplateBuilder {
             _ => crate::destination_slot::DestinationOffer::default(),
         };
         let offers_destination = !offer.is_empty();
+        // v1.7 guardian slot (T3.7): after the destination objects, in the
+        // order of T1.1 §10, within the section's objects and bytes.
+        let guardian_rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let guardian_offer = match &snapshot.guardian {
+            Some(state) => {
+                let candidates = self.mempool.guardian_candidates().await;
+                let anchor_ok =
+                    |anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation);
+                crate::guardian_slot::plan_guardian_offer(
+                    state,
+                    &guardian_rules,
+                    candidates,
+                    &anchor_ok,
+                    &offer.section_for(&offer.payment_order()),
+                )
+            }
+            None => crate::guardian_slot::GuardianOffer::default(),
+        };
+        let offers_guardian = !guardian_offer.is_empty();
         let held_pages: usize = held_payments
             .iter()
             .chain(offer.payments())
+            .chain(guardian_offer.payments())
             .map(|payment| payment.pages.len())
             .sum();
         let held_slots: HashSet<u32> = held_payments
             .iter()
             .chain(offer.payments())
+            .chain(guardian_offer.payments())
             .flat_map(|payment| payment.pages.iter())
             .flat_map(|page| {
                 page.body
@@ -640,7 +695,7 @@ impl TemplateBuilder {
             .map(|page| jetsam_tx::Transaction::new(page.body))
             .collect();
         let mempool_txs = txs.clone();
-        for payment in offer.payments() {
+        for payment in offer.payments().chain(guardian_offer.payments()) {
             if let Ok(spend) = jetsam_tx::validate_paged_spend(&payment.pages) {
                 proof_by_hash.insert(
                     spend.logical_txid,
@@ -649,6 +704,7 @@ impl TemplateBuilder {
             }
         }
         let destination_txs = offer.payment_order();
+        let guardian_txs = guardian_offer.payment_order();
         for payment in &held_payments {
             if let Ok(spend) = jetsam_tx::validate_paged_spend(&payment.pages) {
                 proof_by_hash.insert(spend.logical_txid, Some(payment.authorization_bytes.clone()));
@@ -664,8 +720,12 @@ impl TemplateBuilder {
         // The canonical snapshot itself remains metadata-only, so template
         // construction never clones unrelated UTXO columns.
         let mut state = snapshot.state.clone();
-        let hydrate: Vec<jetsam_tx::Transaction> =
-            txs.iter().chain(destination_txs.iter()).cloned().collect();
+        let hydrate: Vec<jetsam_tx::Transaction> = txs
+            .iter()
+            .chain(destination_txs.iter())
+            .chain(guardian_txs.iter())
+            .cloned()
+            .collect();
         if let Err(error) = snapshot.hydrate_transaction_segments(&mut state, &hydrate) {
             tracing::warn!(err = %error, "template touched-segment hydration failed");
             return None;
@@ -683,6 +743,11 @@ impl TemplateBuilder {
         // What a destination refusal blames, forgotten by the pool once the
         // CPU phase is over.
         let mut blamed: Option<crate::destination_slot::Culprits> = None;
+        let guardian_offer_ref = &guardian_offer;
+        let guardian_state = snapshot.guardian.as_ref();
+        let guardian_branch = &snapshot;
+        // What a guardian refusal blames (arrival numbers), likewise.
+        let mut guardian_blamed: Vec<u64> = Vec::new();
         let template_cpu_result = install_history_step_phase_cpu(|| {
             let build = |txs| {
                 jetsam_chain::consensus::template::build_node_owned_block_template(
@@ -739,15 +804,23 @@ impl TemplateBuilder {
             // destination rules applied to the block it makes, against the
             // parent's destination state: what the commit will judge.
             let judged_destination = |inner: &jetsam_chain::consensus::template::BlockTemplate,
-                                      with_destination: bool| {
+                                      with_destination: bool,
+                                      with_guardian: bool| {
                 if !destination_rules.active_at(child_height) {
                     return Ok(None);
                 }
-                let section = if with_destination {
+                let mut section = if with_destination {
                     offer_ref.section_for(&inner.txs)
                 } else {
                     jetsam_chain::consensus::destination::DestinationSection::default()
                 };
+                // v1.7 (T3.7): the guardian objects after the destination
+                // objects, in the order of their markers.
+                if with_guardian {
+                    section
+                        .objects
+                        .extend(guardian_offer_ref.objects_for(&inner.txs));
+                }
                 let Some(parent_state) = destination_state else {
                     return Err(
                         jetsam_chain::consensus::destination::state::DestinationBlockError::StateNotParent {
@@ -770,19 +843,44 @@ impl TemplateBuilder {
                 )
                 .map(|_| Some(section))
             };
+            // v1.7 (T3.7): the guardian rules applied to the block with its
+            // section, against the parent's guardian state.
+            let judged_guardian = |inner: &jetsam_chain::consensus::template::BlockTemplate,
+                                   section: Option<&jetsam_chain::consensus::destination::DestinationSection>| {
+                let Some(parent_state) = guardian_state else {
+                    return Ok(());
+                };
+                let block = Block {
+                    header: inner.clone().into_header(0),
+                    transactions: inner.all_txs(),
+                    client_objects: Vec::new(),
+                    destination: section.cloned(),
+                };
+                jetsam_chain::consensus::guardian::validate_block_guardian(
+                    &block,
+                    parent_state,
+                    guardian_branch,
+                    &guardian_rules,
+                )
+                .map(|_| ())
+            };
             enum Refusal {
                 Build(String),
                 Client(jetsam_chain::consensus::client_objects::ClientObjectError),
                 Destination(jetsam_chain::consensus::destination::state::DestinationBlockError),
+                Guardian(jetsam_chain::consensus::guardian::GuardianError),
             }
-            let attempt =
-                |txs: Vec<jetsam_tx::Transaction>, with_clients: bool, with_destination: bool| {
-                    let built = build(txs).map_err(|error| Refusal::Build(format!("{error:?}")))?;
-                    let slot = judged(&built.0, with_clients).map_err(Refusal::Client)?;
-                    let section = judged_destination(&built.0, with_destination)
-                        .map_err(Refusal::Destination)?;
-                    Ok::<_, Refusal>((built, slot, section))
-                };
+            let attempt = |txs: Vec<jetsam_tx::Transaction>,
+                           with_clients: bool,
+                           with_destination: bool,
+                           with_guardian: bool| {
+                let built = build(txs).map_err(|error| Refusal::Build(format!("{error:?}")))?;
+                let slot = judged(&built.0, with_clients).map_err(Refusal::Client)?;
+                let section = judged_destination(&built.0, with_destination, with_guardian)
+                    .map_err(Refusal::Destination)?;
+                judged_guardian(&built.0, section.as_ref()).map_err(Refusal::Guardian)?;
+                Ok::<_, Refusal>((built, slot, section))
+            };
             let report = |refusal: &Refusal, what: &str| match refusal {
                 Refusal::Build(error) => tracing::warn!(%error, "template build failed {what}"),
                 Refusal::Client(error) => {
@@ -791,11 +889,42 @@ impl TemplateBuilder {
                 Refusal::Destination(error) => {
                     tracing::warn!(%error, "template refused by the destination rules {what}")
                 }
+                Refusal::Guardian(error) => {
+                    tracing::warn!(%error, "template refused by the guardian rules {what}")
+                }
             };
             // 1. Everything held: client payments and the destination offer.
             let mut everything = txs.clone();
             everything.extend(destination_txs.iter().cloned());
-            match attempt(everything, true, offers_destination) {
+            let mut with_guardian = everything.clone();
+            with_guardian.extend(guardian_txs.iter().cloned());
+            let first = match attempt(with_guardian, true, offers_destination, offers_guardian) {
+                Ok(built) => return Some(built),
+                // v1.7 (T3.7): the guardian objects make a block the rules
+                // refuse, or one of their transactions no longer applies:
+                // the block goes out without them, and what the refusal
+                // blames is forgotten.
+                Err(refusal) if offers_guardian => {
+                    if let (Refusal::Guardian(error), Some(parent_state)) = (&refusal, guardian_state)
+                    {
+                        guardian_blamed = crate::guardian_slot::culprits_of(
+                            error,
+                            guardian_offer_ref,
+                            parent_state,
+                            child_height,
+                            guardian_branch,
+                            &guardian_rules,
+                        );
+                    }
+                    report(
+                        &refusal,
+                        "with its guardian objects: built again without them",
+                    );
+                    attempt(everything, true, offers_destination, false)
+                }
+                Err(refusal) => Err(refusal),
+            };
+            match first {
                 Ok(built) => return Some(built),
                 // The destination objects make a block the rules refuse, or
                 // one of their transactions no longer applies: the block goes
@@ -814,7 +943,7 @@ impl TemplateBuilder {
                         "with its destination objects: built again without them",
                     );
                     // 2. Without the destination offer.
-                    match attempt(txs.clone(), true, false) {
+                    match attempt(txs.clone(), true, false, false) {
                         Ok(built) => return Some(built),
                         Err(refusal) if offers_clients => report(
                             &refusal,
@@ -846,7 +975,7 @@ impl TemplateBuilder {
                 }
             }
             // 3. The mempool's selection alone.
-            match attempt(mempool_txs, false, false) {
+            match attempt(mempool_txs, false, false, false) {
                 Ok(built) => Some(built),
                 Err(refusal) => {
                     report(&refusal, "at its height");
@@ -854,6 +983,9 @@ impl TemplateBuilder {
                 }
             }
         });
+        if !guardian_blamed.is_empty() {
+            self.mempool.forget_guardian(&guardian_blamed).await;
+        }
         if let Some(culprits) = blamed {
             self.mempool
                 .forget_destination(
