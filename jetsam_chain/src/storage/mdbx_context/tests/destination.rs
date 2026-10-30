@@ -632,3 +632,73 @@ fn guardian_undo_keeps_the_last_16_blocks() {
     assert_eq!(undo.last().unwrap().0, tip);
     assert_eq!(undo.first().unwrap().0, tip + 1 - GUARDIAN_UNDO_BLOCKS);
 }
+
+/// A reorg whose ancestor is above J reverts the guardian state by its undo:
+/// the record then holds the undo of the new branch's blocks only, in
+/// increasing heights, reads back on reopen, and equals a node that only
+/// ever saw the new branch.
+#[test]
+fn a_reorg_above_j_truncates_the_guardian_state() {
+    use crate::consensus::guardian::{decode_guardian_record, test_rules as guardian_rules};
+    let _rules = test_rules::install(armed(J_T));
+    let _guardians = guardian_rules::install(armed_guardians());
+    let directory = tempfile::tempdir().unwrap();
+    let mut context = easy_block_context(directory.path());
+    let producer_dir = tempfile::tempdir().unwrap();
+    let mut producer = easy_block_context(producer_dir.path());
+    for _ in 0..2 {
+        let bundle = test_next_bundle_for_miner(&context, MINER);
+        accept_test_bundle(&mut context, &bundle);
+        accept_test_bundle(&mut producer, &bundle);
+    }
+    let third = test_next_bundle_for_miner(&context, MINER);
+    accept_test_bundle(&mut context, &third);
+    // The replacement: two blocks on J by another miner.
+    let mut branch = Vec::new();
+    for _ in 0..2 {
+        let bundle = test_next_bundle_for_miner(&producer, 0x62);
+        accept_test_bundle(&mut producer, &bundle);
+        branch.push(bundle);
+    }
+    let tip_block = Block::from_bytes(branch[1].block_bytes()).unwrap();
+    let genesis = context.get_header_from_store(0).unwrap().unwrap();
+    let authority = context
+        .verify_reorg_suffix(
+            J_T,
+            tip_block.header,
+            genesis,
+            branch[1].history_step_terminal_bytes().to_vec(),
+            |_| Ok(TerminalClientView::default()),
+        )
+        .unwrap();
+    let bodies: Vec<Vec<u8>> = branch.iter().map(|b| b.block_bytes().to_vec()).collect();
+    context
+        .apply_verified_reorg_suffix_with_applier(
+            authority,
+            &bodies,
+            tip_block.header.timestamp,
+            |block, state| {
+                crate::materialize_accepted_block_state(state, block)
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .unwrap();
+    assert_eq!(context.tip_height(), 4);
+    let record = context.store.get_guardian_record().unwrap().unwrap();
+    let (state, undo) = decode_guardian_record(&record).expect("a canonical record");
+    assert_eq!(
+        undo.iter().map(|(height, _)| *height).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    assert_eq!(Some(&state), context.guardian_state());
+    assert_eq!(producer.guardian_state(), Some(&state));
+    assert_eq!(
+        producer.store.get_guardian_record().unwrap(),
+        Some(record),
+        "byte for byte the record of a node that never saw the old branch"
+    );
+    drop(context);
+    let context =
+        MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap()).unwrap();
+    assert_eq!(context.guardian_state(), Some(&state));
+}
