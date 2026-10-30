@@ -29,7 +29,7 @@ curl --silent --show-error \
 - Targets and nonce bytes use their canonical little-endian encoding.
 - Addresses use canonical bech32m `j1…` unless a field explicitly says hex.
 - Unknown permanent objects generally return `null`.
-- Old block bodies return `null` after the 18-block retention window; their
+- Old block bodies return `null` after the 8-block retention window; their
   headers remain queryable.
 - Decimal strings carry aggregates that may exceed exact JSON-number range.
 - `*_eld` floating-point fields are display conveniences. Accounting code

@@ -109,8 +109,8 @@ storage contains:
 
 - permanent compact headers;
 - the exact current sparse UTXO State and owner index;
-- the latest 18 canonical block bodies;
-- 36 blocks of State undo data;
+- the latest 8 canonical block bodies;
+- 16 blocks of State undo data;
 - peer identity and peer store;
 - proof cache and temporary snapshot staging;
 - wallet keys, metadata and receipts when used.

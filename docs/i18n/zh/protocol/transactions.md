@@ -8,7 +8,7 @@
 
 | 字段 | 含义 |
 |---|---|
-| `epoch_anchor` | 当前 144 区块防重放[交易周期（epoch）锚点](../reference/glossary.md#transaction-epoch-anchor) |
+| `epoch_anchor` | 当前 32 区块防重放[交易周期（epoch）锚点](../reference/glossary.md#transaction-epoch-anchor) |
 | `fee` | 第一页上的逻辑手续费；后续页为零 |
 | `input_owner` | 所有有效输入共同的所有者 |
 | `inputs[8]` | 可能的 `{slot_index, amount, creation_id}` 记录 |
@@ -79,10 +79,10 @@ version || page_count || ordered_page_hashes
 每页使用当前交易周期锚点。对于子高度 `C > 0`，锚点是以下高度上的区块 ID：
 
 ```text
-floor((C - 1) / 144) × 144
+floor((C - 1) / 32) × 32
 ```
 
-高度 144 仍使用高度 0 的锚点；高度 145 开始使用高度 144。[内存池](../reference/glossary.md#mempool)会删除交易周期锚点已不再有效的意图。
+高度 32 仍使用高度 0 的锚点；高度 33 开始使用高度 32。[内存池](../reference/glossary.md#mempool)会删除交易周期锚点已不再有效的意图。
 
 ## 授权与 State 分离
 

@@ -489,7 +489,7 @@ A session MUST subscribe before it authorizes and MUST authorize before it submi
 
 The example above is the real header of mainnet block 2880 with its nonce lane zeroed; the nonce `153d56430000000002a091947bd4c50b` solves it (Appendix B.5).
 
-Jobs change roughly every 90 s (each new chain tip) and additionally when the pool's node refreshes its template on the same parent (new timestamp — a different `pow_fields_hex`, same height, `clean_jobs` usually `false`). A miner MUST switch to a `clean_jobs = true` job within one second; work on stale jobs is wasted.
+Jobs change roughly every 180 s (each new chain tip) and additionally when the pool's node refreshes its template on the same parent (new timestamp — a different `pow_fields_hex`, same height, `clean_jobs` usually `false`). A miner MUST switch to a `clean_jobs = true` job within one second; work on stale jobs is wasted.
 
 ### 5.6 `mining.submit` (client → server)
 
@@ -627,7 +627,7 @@ S: {"id":null,"method":"mining.notify","params":["5c2a9e01","0000000000000000000
    (miner hashes nonces 1b0300…07000000 … inside prefix 07000000)
 C: {"id":7,"method":"mining.submit","params":["j1whll…4y3h.rig1","5c2a9e01","1b030000000000000000000007000000"]}
 S: {"id":7,"result":true,"error":null}
-   (≈90 s later the chain tip moves)
+   (≈180 s later the chain tip moves)
 S: {"id":null,"method":"mining.set_target","params":["0000000000000000000000000000000000000000000000000000000000000100"]}
 S: {"id":null,"method":"mining.notify","params":["5c2a9e02","0000…(new fields)…",… ,true,2639]}
 C: {"id":8,"method":"mining.submit","params":["j1whll…4y3h.rig1","5c2a9e01","9f1a0000000000000000000007000000"]}
@@ -660,7 +660,7 @@ It was written for the TowerHash-only proof of work. Since block 24,846 the dige
 
 8. **Hashrate and share rate.** With share difficulty `D` and hashrate `H`, expect a share every `D / H` seconds. Pools tune `D` so this is 5–15 s. Report your own hashrate to the operator from counted attempts, not from shares. Pools compute your hashrate from accepted share work — declared figures are not used.
 
-9. **Latency budget.** A block is found network-wide about every 90 s. A job that reaches the miner 2 s late costs ~2 % of its work. Parse `mining.notify` off the hot path, and never block the network reader on the GPU.
+9. **Latency budget.** A block is found network-wide about every 180 s. A job that reaches the miner 2 s late costs ~1 % of its work. Parse `mining.notify` off the hot path, and never block the network reader on the GPU.
 
 10. **What you cannot do:** change the timestamp, the coinbase, the transaction set or any field but 0; get the block body; reuse a job across pools; submit a nonce outside your prefix. The protocol has no knob for any of these, which is intentional.
 

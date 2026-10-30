@@ -112,7 +112,7 @@ UTXO 写入槽位时分配的新标识符；代码字段为 `creation_id`。它�
 <a id="hard-finality"></a>
 ### 硬最终性（hard finality）
 
-候选链不得替换最近 18 区块后缀之前、已经具备最终性的前缀。这是共识规则，
+候选链不得替换最近 8 区块后缀之前、已经具备最终性的前缀。这是共识规则，
 不是界面确认策略。
 
 <a id="finality-boundary"></a>
@@ -124,8 +124,8 @@ UTXO 写入槽位时分配的新标识符；代码字段为 `creation_id`。它�
 <a id="reorganization"></a>
 ### 链重组（reorganization，reorg）
 
-规范链近期后缀被累计工作量更大的合格分支替换。共识允许的回滚深度严格小于
-18 个区块。
+规范链近期后缀被累计工作量更大的合格分支替换。共识允许的回滚深度最多为
+8 个区块。
 
 <a id="proof-of-work"></a>
 ### 工作量证明（proof of work，PoW）
@@ -173,7 +173,7 @@ UTXO 写入槽位时分配的新标识符；代码字段为 `creation_id`。它�
 <a id="body-retention-window"></a>
 ### 区块体保留窗口（block-body retention window）
 
-完整区块交易数据可由普通节点提供的最近 18 个区块窗口。区块头永久保存。
+完整区块交易数据可由普通节点提供的最近 8 个区块窗口。区块头永久保存。
 
 ## 交易与钱包
 
@@ -231,7 +231,7 @@ UTXO 中记录的 32 字节公开值，由对应的 256 位支出秘密通过 Po
 <a id="transaction-epoch-anchor"></a>
 ### 交易周期锚点（transaction epoch anchor）
 
-每 144 个区块更新一次的区块 ID，用于限制钱包授权和内存池交易的重放期限。
+每 32 个区块更新一次的区块 ID，用于限制钱包授权和内存池交易的重放期限。
 
 <a id="mempool"></a>
 ### 内存池（mempool）

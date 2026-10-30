@@ -26,8 +26,8 @@ an output owner without publishing a public key.
 
 The absolutely scheduled exponentially weighted target algorithm used to
 derive the exact proof-of-work target at every height. Jetsam uses a
-six-block reference epoch, a 120-second half-life and a 20-second target
-interval.
+six-block reference epoch, a 540-second half-life and a 180-second target
+interval (90 seconds before block 38,400), anchored on the parent's timestamp.
 
 ## Authorization capsule
 
@@ -79,7 +79,7 @@ only its nonce.
 
 ## Body retention
 
-The 18-block window in which complete block transaction data is served.
+The 8-block window in which complete block transaction data is served.
 Headers are permanent.
 
 ## Canonical chain and canonical tip
@@ -129,7 +129,7 @@ interpreted as a block ID or Merkle node.
 
 ## Epoch anchor
 
-The block ID at the current 144-block transaction boundary. Every page of a
+The block ID at the current 32-block transaction boundary. Every page of a
 `PagedSpend` carries it, and the mempool removes an intent when its anchor is no
 longer current.
 
@@ -196,8 +196,8 @@ must remain attached to the metric in which they are analysed.
 ## Hard finality
 
 The consensus rule that excludes candidate chains replacing the prefix deeper
-than the most recent 18-block suffix. The maximum accepted reorganization is
-17 blocks.
+than the most recent 8-block suffix. The maximum accepted reorganization is
+8 blocks.
 
 ## History-stateless
 
@@ -365,7 +365,7 @@ inclusion under a claimed canonical header transaction root.
 ## Reorganization (reorg)
 
 Replacement of recent canonical blocks by a different eligible branch with
-greater cumulative work. Jetsam accepts at most a 17-block rollback.
+greater cumulative work. Jetsam accepts at most an 8-block rollback.
 
 ## Round-by-round knowledge bound (RBR)
 

@@ -8,16 +8,16 @@ stated otherwise.
 | Parameter | Value |
 |---|---:|
 | Mainnet genesis timestamp | 2026-08-21 16:00:00 UTC (`1787328000`) |
-| Target block interval | 90 seconds |
+| Target block interval | 180 seconds since block 38,400 (90 seconds before) |
 | ASERT reference epoch | 6 blocks |
-| ASERT half-life | 120 seconds |
+| ASERT half-life | 540 seconds |
 | Median-time-past window | 11 headers |
 | Maximum future timestamp drift | 120 seconds |
-| Transaction epoch | 144 blocks |
-| Hard-finality depth | 18 blocks |
-| Maximum accepted reorganization | 17 blocks |
-| Recent block-body retention | 18 blocks |
-| Undo retention | 36 blocks |
+| Transaction epoch | 32 blocks |
+| Hard-finality depth | 8 blocks |
+| Maximum accepted reorganization | 8 blocks |
+| Recent block-body retention | 8 blocks |
+| Undo retention | 16 blocks |
 
 ## Block limits
 
@@ -58,10 +58,10 @@ stated otherwise.
 
 ## Proof classes
 
-| Class | Dimension | Effective page positions before block 17,750 | From block 17,750 |
-|---|---:|---:|---:|
-| Small (`B25`) | 22 | 0–25 | 0–24 |
-| B255 | 24 | 26–255 | 25–255 |
+| Class | Dimension before block 38,400 | Dimension from block 38,400 | Effective page positions before block 17,750 | From block 17,750 |
+|---|---:|---:|---:|---:|
+| Small (`B25`) | 22 | 23 | 0–25 | 0–24 |
+| B255 | 24 | 25 | 26–255 | 25–255 |
 
 The primary reward is excluded from effective page-position count. A live
 development payout counts as one position.
@@ -85,13 +85,14 @@ development payout counts as one position.
 | Atomic unit | 1 μJTM |
 | Units per JTM | 1,000,000 |
 | Starting subsidy | 50 JTM |
-| Permanent subsidy floor | 1 JTM |
+| Subsidy floor | none — the reward is 0 from height 3,467,664 |
+| Halvings | 7, by height, the last one trimmed so the sum is exactly 21,000,000 JTM |
 | Base transaction fee | 5,000 μJTM |
 | Fee per live input | 100 μJTM |
 | Fee per live output | 700 μJTM |
 | Base growth fee per net-new slot | 2,500 μJTM |
-| Development allocation period | 6,307,200 blocks |
-| Development payout interval | 5,760 blocks |
+| Development allocation period | blocks 1–369,600 (two target-time years; 747,000 JTM in all) |
+| Development payout interval | 960 blocks up to and including block 38,400, then 480 blocks |
 
 ## Storage and network
 

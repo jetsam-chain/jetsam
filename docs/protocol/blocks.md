@@ -94,7 +94,7 @@ The terminal includes metadata binding its version, height, semantic-header
 hash and proof class. Bundle decoding checks lengths before allocating and
 rejects trailing bytes, mismatched metadata or a terminal for another header.
 
-Canonical block bodies are retained for 18 blocks. A directly admitted block
+Canonical block bodies are retained for 8 blocks. A directly admitted block
 stores its complete bundle. During authenticated catch-up, one verified
 terminal at the suffix tip authorizes the exact linked intermediate bodies;
 the tip stores the complete bundle, while intermediate rows keep compact local

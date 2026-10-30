@@ -49,10 +49,10 @@ arrival order and peer identity have no role.
 
 ## Hard finality
 
-The most recent 18-block window is the only reorganizable part of the chain.
-A candidate that would change the finalized prefix is ineligible for fork
-choice. Because rollback depth must be strictly less than 18, the maximum
-accepted reorganization is 17 blocks.
+The most recent 8-block window is the only reorganizable part of the chain
+(`CONSENSUS_FINALITY_DEPTH`). A candidate that would change the finalized
+prefix is ineligible for fork choice; a reorganization may undo at most 8
+confirmations.
 
 Hard finality also separates State-expansion measurements from temporary
 forks. The 18-header occupancy window used for expansion ends at the finalized
@@ -63,9 +63,10 @@ boundary from height and reject deeper alternatives.
 
 ## Difficulty
 
-The target interval between accepted blocks is 90 seconds. Proof preparation,
-nonce search and propagation share that interval. ASERT adjusts the target
-using six-block reference epochs and a 120-second half-life. The target is
+The target interval between accepted blocks is 180 seconds since block
+38,400 (90 seconds before). Proof preparation, nonce search and propagation
+share that interval. ASERT adjusts the target using six-block reference epochs
+and a 540-second half-life, anchored on the parent's timestamp. The target is
 encoded as a 256-bit little-endian integer.
 
 Validation derives the one exact target from canonical header history. Miners
@@ -73,14 +74,14 @@ do not choose among a range of acceptable difficulties.
 
 ## Transaction clock
 
-User transactions bind to a block ID at the start of a 144-block transaction
+User transactions bind to a block ID at the start of a 32-block transaction
 epoch. The boundary block still accepts the preceding anchor; the new anchor
 becomes active for the next child.
 
 For child height `C > 0`, the anchor height is:
 
 ```text
-floor((C - 1) / 144) × 144
+floor((C - 1) / 32) × 32
 ```
 
 This clock is independent of the six-block ASERT epoch. It limits replay and

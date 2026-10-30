@@ -91,7 +91,7 @@ cannot replace proof of work or cumulative-work fork choice.
 
 ## Hard-finalized decisions
 
-Rollback depth is strictly less than 18 blocks. A candidate that changes the
+Rollback depth is at most 8 blocks. A candidate that changes the
 deeper finalized prefix is ineligible.
 
 State expansion reads only an 18-header window that is already hard-finalized.

@@ -9,8 +9,8 @@ recent suffix. Neither path trusts a peer's claim about State.
 
 ## Short gaps
 
-Every full node retains the latest 18 canonical block bodies. If a joining
-node is no more than 18 blocks behind, it authenticates the linked headers,
+Every full node retains the latest 8 canonical block bodies. If a joining
+node is no more than 8 blocks behind, it authenticates the linked headers,
 downloads the corresponding bodies and obtains one `HistoryStep` terminal for
 the suffix tip. The terminal is verified before any suffix body is committed.
 Its recursion covers the exact ancestry from the node's installed boundary to
@@ -67,7 +67,7 @@ The full cost profile is:
 | Header validation | Chain height |
 | Boundary terminal verification | Constant |
 | State transfer and installation | Live State |
-| Recent suffix | At most 18 block bodies plus one tip terminal |
+| Recent suffix | At most 8 block bodies plus one tip terminal |
 
 Jetsam removes historical execution replay; it does not pretend that proof
 of work can be compared without reading headers or that current State can be
@@ -94,7 +94,7 @@ CPU-, disk- or peer-bound.
 
 The finalized boundary is not reorganizable. Fork choice considers only
 candidate chains that preserve it, and the accepted rollback depth must be
-less than 18. The maximum canonical reorganization is therefore 17 blocks.
+at most 8 (`CONSENSUS_FINALITY_DEPTH`). The maximum canonical reorganization is therefore 8 blocks.
 
 Recent undo data and block bodies cover this suffix. A deeper competing
 history is rejected rather than reconstructed through a snapshot.

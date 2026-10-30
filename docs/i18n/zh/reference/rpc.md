@@ -28,7 +28,7 @@ curl --silent --show-error \
 - 目标值（target）与 nonce 字节使用各自规范的小端编码。
 - 地址默认使用规范 bech32m `j1…`，除非字段明确要求 hex。
 - 未知的永久对象通常返回 `null`。
-- 超出 18 区块保留窗口的旧区块体返回 `null`，其区块头仍可查询。
+- 超出 8 区块保留窗口的旧区块体返回 `null`，其区块头仍可查询。
 - 可能超出 JSON number 精确范围的聚合值使用 decimal string。
 - `*_eld` 浮点字段只为展示方便；记账代码应使用对应的
   `*_micro_jtm` 整数字段。

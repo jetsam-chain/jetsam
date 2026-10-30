@@ -46,7 +46,7 @@ A current full node keeps:
 - the exact Live State;
 - permanent compact headers;
 - the current `HistoryStep` terminal;
-- the latest 18 canonical block bodies;
+- the latest 8 canonical block bodies;
 - bounded undo data for shallow reorganization.
 
 Older transaction bodies are not part of the active validation requirement.
@@ -76,7 +76,7 @@ consensus participant without becoming a prover.
 
 ## Joining without replay
 
-For a gap of at most 18 blocks, a node downloads the retained block bodies and
+For a gap of at most 8 blocks, a node downloads the retained block bodies and
 one recursive terminal for the exact suffix tip. It verifies that terminal
 before checking and materializing the linked bodies in order. For a deeper
 gap, it downloads permanent headers, an authenticated snapshot at a finalized

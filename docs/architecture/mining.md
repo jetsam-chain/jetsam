@@ -38,14 +38,14 @@ The proof stack ships two authenticated matrix classes:
 
 | Class | Hypercube dimension | Effective page capacity |
 |---|---:|---:|
-| Small (`B25`) | `m=22` | Up to 24 since block 17,750 (25 before) |
-| B255 | `m=24` | Up to 255 |
+| Small (`B25`) | `m=23` since block 38,400 (`m=22` before) | Up to 24 since block 17,750 (25 before) |
+| B255 | `m=25` since block 38,400 (`m=24` before) | Up to 255 |
 
 The small class keeps its launch name `B25` in the code; under the v1.3 rules
 in force since block 17,750 it holds 24 page positions. Every miner begins
 with the small class. The node may use B255 when complete proof
 preparation timing shows that the larger relation is appropriate for the
-90-second block target. The decision uses measured end-to-end preparation, not
+180-second block target (90 seconds before block 38,400). The decision uses measured end-to-end preparation, not
 only one internal proving phase.
 
 ASERT applies that target to the complete interval between accepted blocks.

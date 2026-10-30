@@ -93,9 +93,10 @@ Equality fails.
 
 ## ASERT
 
-The target interval between accepted blocks is 90 seconds. Proof preparation,
-nonce search and propagation all occupy that interval. ASERT uses a six-block
-reference epoch and a 120-second half-life. At each height, validation derives
+The target interval between accepted blocks is 180 seconds since block
+38,400 (90 seconds before). Proof preparation, nonce search and propagation
+all occupy that interval. ASERT uses a six-block reference epoch and a
+540-second half-life. At each height, validation derives
 the exact target from the canonical anchor, elapsed time and height delta.
 
 A timestamp must also be greater than median time past over the previous 11
@@ -105,7 +106,7 @@ The first TowerWalk block could not inherit the sponge-era target: a walked
 attempt costs far more than a sponge attempt, and ASERT anchors on the
 parent's timestamp, so it absorbs a loss of hashrate but not a stall. Block
 24,846 therefore carries a fixed anchor target of `2^235`, set on the easy
-side; ASERT tightens from there towards the 90-second interval.
+side; ASERT tightens from there towards the target interval.
 
 ## Runtime kernels
 
