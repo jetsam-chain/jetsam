@@ -608,8 +608,11 @@ fn the_dormant_rules_write_no_guardian_record() {
     assert!(context.store.get_guardian_record().unwrap().is_none());
 }
 
-/// The record keeps the undo of the last 16 blocks, no more.
+/// The record keeps the undo of the last 16 blocks, no more. Default
+/// profile only: the test and rehearsal profiles arm the TowerWalk proof of
+/// work at height 6, which a test context cannot mine 18 blocks under (T2.3).
 #[test]
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
 fn guardian_undo_keeps_the_last_16_blocks() {
     use crate::consensus::guardian::{
         decode_guardian_record, test_rules as guardian_rules, GUARDIAN_UNDO_BLOCKS,
