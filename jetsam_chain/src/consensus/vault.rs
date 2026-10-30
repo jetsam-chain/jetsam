@@ -12,14 +12,15 @@
 //! * **V1-b** — every input of a release has a non-coinbase `creation_id`
 //!   above `bridge_vault_floor` (`alloc_counter` of the header J − 1): what was
 //!   sent to the published vault address before J stays frozen.
-//! * **V2** — a release's live outputs are exactly `(owner_n, amount_n −
-//!   RELEASE_FEE)`, then its marker (value 0), then at most one change output
-//!   to the vault; its fee is at most `RELEASE_FEE + FEE_PER_INPUT × (inputs −
-//!   1)` (**F1**, D55: the vault pays the consensus input fee of its own
-//!   fragmentation, so that a release needing more than 929 slots stays
-//!   buildable; the owner still receives `amount_n − RELEASE_FEE`).
+//! * **V2** — a release's live outputs are exactly `(owner_n, amount_n − R)`,
+//!   then its marker (value 0), then at most one change output to the vault;
+//!   its fee is at most `R`, where `R = max(RELEASE_FEE, consensus minimum fee
+//!   of the group)` ([`VaultRules::release_fee_for`], **D59**, replacing F1 of
+//!   D55): a release needing 930 slots or more stays buildable (cause 7 of the
+//!   porte R), and its burn, not the vault, pays the consensus fee of that
+//!   fragmentation. The vault gives at most `amount_n` (I2 strict).
 //!   Conservation is the paged-spend rule's.
-//! * **V3** — `amount_n ≥ RELEASE_FEE`.
+//! * **V3** — `amount_n ≥ R` (`≥ RELEASE_FEE` for every shape).
 //! * **V4** — an output to the vault is valid only in a deposit group or as a
 //!   release's change. A deposit group carries exactly one vault output and
 //!   exactly one marker `JTMBRDG1 ‖ recipient (20 B) ‖ 4 reserved bytes`, of
@@ -57,7 +58,8 @@ use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::destination::l1_read::L1ReadError;
 use crate::consensus::destination::{DestinationObject, DestinationObjectKind};
 use crate::consensus::params::{
-    is_coinbase_creation_id, v1_7_active_with, FEE_PER_INPUT, MICRO_PER_JTM, V1_7_ACTIVATION_HEIGHT,
+    is_coinbase_creation_id, v1_7_active_with, FEE_PER_INPUT, FEE_PER_OUTPUT, MICRO_PER_JTM,
+    MIN_FEE_BASE, STATE_GROWTH_FEE_BASE, V1_7_ACTIVATION_HEIGHT,
 };
 
 #[cfg(test)]
@@ -108,6 +110,16 @@ pub const fn bridge_deposits_from_height(v1_7_activation: Option<u64>) -> Option
 }
 
 const _: () = assert!(BRIDGE_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");
+// D59: the consensus minimum of a release group has a state-growth term only
+// when it creates more outputs (≤ 3) than it spends inputs, i.e. with one or
+// two inputs; even at the highest pressure (×8) that minimum stays below
+// `RELEASE_FEE`, so [`VaultRules::release_fee_for`] may leave the term out
+// (checked over every shape and pressure by
+// `release_fee_is_the_greater_of_release_fee_and_the_consensus_minimum`).
+const _: () = assert!(
+    MIN_FEE_BASE + FEE_PER_INPUT + 3 * FEE_PER_OUTPUT + 2 * 8 * STATE_GROWTH_FEE_BASE
+        < RELEASE_FEE_MICRO
+);
 const _: () = assert!(
     MIN_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO && MAX_DEPOSIT_MICRO <= VAULT_OUTSTANDING_CEIL_MICRO
 );
@@ -280,9 +292,8 @@ pub struct VaultRules {
     /// `F`: deposits only in blocks above it (V4-d); none while J is none.
     pub deposits_from_height: Option<u64>,
     pub vault: Address,
+    /// `RELEASE_FEE`: the least a burn pays for its release (D59).
     pub release_fee: u64,
-    /// F1: what each input beyond the first adds to a release's fee cap.
-    pub fee_per_input: u64,
     pub min_deposit: u64,
     pub max_deposit: u64,
     pub max_releases_per_block: usize,
@@ -299,7 +310,6 @@ impl VaultRules {
             deposits_from_height: bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
             vault: VAULT_ADDRESS,
             release_fee: RELEASE_FEE_MICRO,
-            fee_per_input: FEE_PER_INPUT,
             min_deposit: MIN_DEPOSIT_MICRO,
             max_deposit: MAX_DEPOSIT_MICRO,
             max_releases_per_block: MAX_RELEASES_PER_BLOCK,
@@ -321,11 +331,23 @@ impl VaultRules {
         }
     }
 
-    /// V2 under F1: the most a release spending `inputs` slots may pay in
-    /// fees.
-    pub const fn release_fee_cap(&self, inputs: u64) -> u64 {
-        self.release_fee
-            .saturating_add(self.fee_per_input.saturating_mul(inputs.saturating_sub(1)))
+    /// D59: the release fee `R` of a release group spending `inputs` vault
+    /// slots into `outputs` live outputs: `RELEASE_FEE`, or the group's
+    /// consensus minimum fee when that is higher (from 930 slots with a change
+    /// output, 937 without). The burn pays it: the owner receives `amount −
+    /// R` and the group's fee is at most `R`, so a release never takes more
+    /// from the vault than its burn removed from the L1 (I2 strict).
+    pub const fn release_fee_for(&self, inputs: u64, outputs: u64) -> u64 {
+        // The consensus minimum without its state-growth term, which is zero
+        // whenever this minimum can exceed `RELEASE_FEE` (assertion above).
+        let minimum = MIN_FEE_BASE
+            .saturating_add(FEE_PER_INPUT.saturating_mul(inputs))
+            .saturating_add(FEE_PER_OUTPUT.saturating_mul(outputs));
+        if minimum > self.release_fee {
+            minimum
+        } else {
+            self.release_fee
+        }
     }
 }
 
@@ -522,17 +544,17 @@ pub enum VaultError {
     /// A release takes more from the vault's post-floor slots than they
     /// hold: the caller's `bridge_locked` is not this block's parent's.
     VaultBalanceUnderflow { group: usize },
-    /// V3.
+    /// V3: the burn is below its group's release fee (D59).
     ReleaseBelowFee { amount: u64, fee: u64 },
     /// V2: the first output does not pay the burn's owner.
     ReleasePaysOtherOwner { group: usize },
-    /// V2: the first output is not `amount − RELEASE_FEE`.
+    /// V2: the first output is not `amount − R` (D59).
     ReleasePaysWrongAmount {
         group: usize,
         paid: u64,
         expected: u64,
     },
-    /// V2: the group's fee is above `RELEASE_FEE`.
+    /// V2: the group's fee is above its release fee `R` (D59).
     ReleaseFeeTooHigh { group: usize, fee: u64, max: u64 },
     /// V4: an output to the vault outside a deposit group or a release's
     /// change.
@@ -604,6 +626,7 @@ pub fn validate_block_vault(
         paid: u64,
         fee: u64,
         inputs: u64,
+        outputs: u64,
     }
     let mut releases = Vec::new();
     let mut deposits = Vec::new();
@@ -673,6 +696,7 @@ pub fn validate_block_vault(
                 paid: outputs[0].1,
                 fee: group.spend.fee,
                 inputs: u64::from(group.spend.live_inputs),
+                outputs: u64::from(group.spend.live_outputs),
             });
             continue;
         }
@@ -767,18 +791,20 @@ pub fn validate_block_vault(
         if ctx.released.contains(release.n) || decoded[..i].iter().any(|r| r.n == release.n) {
             return Err(VaultError::ReleaseAlreadyPaid { n: release.n });
         }
+        // D59: this group's release fee.
+        let release_fee = rules.release_fee_for(group.inputs, group.outputs);
         // V3.
-        if release.amount < rules.release_fee {
+        if release.amount < release_fee {
             return Err(VaultError::ReleaseBelowFee {
                 amount: release.amount,
-                fee: rules.release_fee,
+                fee: release_fee,
             });
         }
         // V2.
         if group.payee != release.owner {
             return Err(VaultError::ReleasePaysOtherOwner { group: group.group });
         }
-        let expected_paid = release.amount - rules.release_fee;
+        let expected_paid = release.amount - release_fee;
         if group.paid != expected_paid {
             return Err(VaultError::ReleasePaysWrongAmount {
                 group: group.group,
@@ -786,13 +812,12 @@ pub fn validate_block_vault(
                 expected: expected_paid,
             });
         }
-        // V2 under F1.
-        let max = rules.release_fee_cap(group.inputs);
-        if group.fee > max {
+        // V2: the burn pays the fee, the vault gives at most `amount` (D59).
+        if group.fee > release_fee {
             return Err(VaultError::ReleaseFeeTooHigh {
                 group: group.group,
                 fee: group.fee,
-                max,
+                max: release_fee,
             });
         }
         effect.released = effect.released.saturating_add(release.amount);

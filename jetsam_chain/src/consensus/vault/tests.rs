@@ -230,7 +230,7 @@ fn vault_address_is_the_addrfx_image_of_the_published_secret() {
 }
 
 /// F = J + 1 440 on the public profiles (D44), J_R + 32 = 128 in the
-/// rehearsal; V8's ceiling and F1's step are this build's constants.
+/// rehearsal; V8's ceiling and D59's release fee are this build's.
 #[test]
 fn bridge_opening_follows_the_v1_7_clock() {
     use crate::consensus::params::V1_7_ACTIVATION_HEIGHT;
@@ -252,9 +252,50 @@ fn bridge_opening_follows_the_v1_7_clock() {
         bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT)
     );
     assert_eq!(current.outstanding_ceil, 10_000 * MICRO_PER_JTM);
-    assert_eq!(current.fee_per_input, 100);
-    assert_eq!(current.release_fee_cap(1), RF);
-    assert_eq!(current.release_fee_cap(1_020), RF + 101_900);
+    assert_eq!(current.release_fee, RF);
+    assert_eq!(current.release_fee_for(1, 3), RF);
+    assert_eq!(current.release_fee_for(929, 3), RF);
+    assert_eq!(current.release_fee_for(930, 3), RF + 100);
+    assert_eq!(current.release_fee_for(936, 2), RF);
+    assert_eq!(current.release_fee_for(937, 2), RF + 100);
+    assert_eq!(current.release_fee_for(1_020, 3), RF + 9_100);
+}
+
+/// D59: `release_fee_for(k, m)` is `max(RELEASE_FEE, consensus minimum fee
+/// of the group)` for every release shape (1 to 1 020 inputs, 2 or 3 live
+/// outputs) under every occupancy pressure, the state-growth term included.
+#[test]
+fn release_fee_is_the_greater_of_release_fee_and_the_consensus_minimum() {
+    use crate::consensus::fees::{fee_breakdown, pressure_multiplier};
+    let current = VaultRules::current();
+    let states = [
+        (0u64, 24u32),
+        (1_000, 24),
+        (9_000_000, 24),
+        (13_000_000, 24),
+        (16_000_000, 24),
+    ];
+    let multipliers: Vec<u64> = states
+        .iter()
+        .map(|(a, l)| pressure_multiplier(*a, *l))
+        .collect();
+    assert_eq!(
+        multipliers,
+        vec![1, 1, 2, 4, 8],
+        "every pressure step is exercised"
+    );
+    for k in 1..=1_020u64 {
+        for m in [2u64, 3] {
+            for (active, log_slots) in states {
+                let minimum = fee_breakdown(k, m, active, log_slots).required_total;
+                assert_eq!(
+                    current.release_fee_for(k, m),
+                    RF.max(minimum),
+                    "k {k} m {m} active {active}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1182,14 +1223,13 @@ fn total_jtm_supply_unchanged_by_releases() {
 /// the window cap), release attempts (the template's policy, out-of-order
 /// picks, forged owners, amounts and pre-J inputs) built from a **multi-slot**
 /// vault (largest or smallest slots first, up to 1 020 inputs, fees anywhere
-/// in `[consensus minimum, F1 cap]`), and reorgs of up to 8 blocks. Every
+/// in `[consensus minimum, release fee R]`, D59), and reorgs of up to 8 blocks. Every
 /// block goes through `validate_block_vault`; the L1 is a model of the
 /// contract. After every step:
 ///
 /// * I1: JTM are neither created nor destroyed;
-/// * I2 under F1: `V + surplus ≥ S + P + D`, the surplus (fees above
-///   `RELEASE_FEE` paid out of the vault) bounded by `FEE_PER_INPUT` per
-///   vault slot ever created;
+/// * I2 strict (D59): `V ≥ S + P + D`, and no release takes more from the
+///   vault than its burn;
 /// * `bridge_locked` (V8) is the vault's post-floor balance and equals
 ///   `Σ deposits − Σ (paid + fee)` of the releases;
 /// * an honest, payable, unpaid release is never refused (outside V6), a
@@ -1200,14 +1240,13 @@ fn total_jtm_supply_unchanged_by_releases() {
 #[test]
 fn prop_vault_balance_covers_supply_plus_pending() {
     use crate::consensus::fees::fee_breakdown;
-    use crate::consensus::params::FEE_PER_INPUT;
     const FLOOR: u64 = 1_000;
     const TOTAL: u64 = 100_000 * MICRO_PER_JTM;
     const GIFT: u64 = 77 * MICRO_PER_JTM;
     let min_fee = |k: usize, outputs: usize| {
         fee_breakdown(k as u64, outputs as u64, 1_000, 24).required_total
     };
-    let f1_cap = |k: usize| RF + FEE_PER_INPUT * (k as u64 - 1);
+    let release_fee = |k: usize, outputs: usize| rules().release_fee_for(k as u64, outputs as u64);
     let poisoned_owners = [
         VAULT_ADDRESS,
         deposit_marker(&[5; 20]),
@@ -1229,7 +1268,6 @@ fn prop_vault_balance_covers_supply_plus_pending() {
         unminted: Vec<(u64, u64)>,
         deposited: u64,
         left_vault: u64,
-        surplus: u64,
         slots_created: u64,
         // L1.
         wjtm: u64,
@@ -1265,17 +1303,15 @@ fn prop_vault_balance_covers_supply_plus_pending() {
             assert_eq!(self.users + self.locked() + GIFT + self.miners, TOTAL);
             // V8's balance, exactly.
             assert_eq!(self.locked(), self.deposited - self.left_vault);
-            // I2 under F1.
+            // I2 strict (D59).
             assert!(
-                self.locked() + self.surplus >= self.wjtm + self.pending() + self.deposits(),
-                "V {} + surplus {} < S {} + P {} + D {}",
+                self.locked() >= self.wjtm + self.pending() + self.deposits(),
+                "V {} < S {} + P {} + D {}",
                 self.locked(),
-                self.surplus,
                 self.wjtm,
                 self.pending(),
                 self.deposits()
             );
-            assert!(self.surplus <= FEE_PER_INPUT * self.slots_created);
             // A poisoned burn is never paid.
             for (i, (_, _, payable)) in self.burns.iter().enumerate() {
                 assert!(*payable || !self.paid.contains(i as u64 + 1));
@@ -1302,20 +1338,30 @@ fn prop_vault_balance_covers_supply_plus_pending() {
     let (mut max_inputs, mut ceiling_refusals) = (0usize, 0);
 
     // One release attempt for `(n, owner, amount)`; `None` if the vault
-    // cannot fund it. Returns the block and what applying it does.
+    // cannot fund it. Returns the block, the slots spent, the fee, the
+    // change and what the owner is paid (D59: `amount − R`).
     #[allow(clippy::type_complexity)]
     let build = |world: &World,
                  r: &VaultRelease,
                  smallest_first: bool,
                  fee_pick: u64,
                  pre_j_input: bool|
-     -> Option<(Block, Vec<usize>, u64, u64)> {
-        let paid = r.amount.checked_sub(RF)?;
+     -> Option<(Block, Vec<usize>, u64, u64, u64)> {
         let mut order: Vec<usize> = (0..world.slots.len()).collect();
         order.sort_by_key(|i| world.slots[*i].0);
         if !smallest_first {
             order.reverse();
         }
+        // With a change (3 outputs) the slots must hold more than `paid +
+        // minimum`; without one (2 outputs), exactly `paid + fee`.
+        let fits_with_change = |k: usize, sum: u64| {
+            r.amount >= release_fee(k, 3) && sum > r.amount - release_fee(k, 3) + min_fee(k, 3)
+        };
+        let fits_exactly = |k: usize, sum: u64| {
+            r.amount >= release_fee(k, 2)
+                && sum >= r.amount - release_fee(k, 2) + min_fee(k, 2)
+                && sum <= r.amount
+        };
         let mut chosen = Vec::new();
         let mut sum = 0u64;
         for i in order {
@@ -1324,24 +1370,29 @@ fn prop_vault_balance_covers_supply_plus_pending() {
             if chosen.len() > MAX_PAGED_INPUTS {
                 return None;
             }
-            if sum >= paid + min_fee(chosen.len(), 3) {
+            if fits_with_change(chosen.len(), sum) || fits_exactly(chosen.len(), sum) {
                 break;
             }
         }
-        if sum < paid + min_fee(chosen.len(), 3) {
-            return None;
-        }
         let k = chosen.len();
-        let low = min_fee(k, 3);
-        let high = f1_cap(k).min(sum - paid);
-        // A third of the miners take the whole cap; the others anything from
-        // the consensus minimum up.
-        let fee = if fee_pick % 3 == 0 {
-            high
+        let (paid, fee, change) = if fits_with_change(k, sum) {
+            let paid = r.amount - release_fee(k, 3);
+            let low = min_fee(k, 3);
+            let high = release_fee(k, 3).min(sum - paid - 1);
+            // A third of the miners take the whole release fee; the others
+            // anything from the consensus minimum up.
+            let fee = if fee_pick % 3 == 0 {
+                high
+            } else {
+                low + (fee_pick / 3) % (high - low + 1)
+            };
+            (paid, fee, sum - paid - fee)
+        } else if fits_exactly(k, sum) {
+            let paid = r.amount - release_fee(k, 2);
+            (paid, sum - paid, 0)
         } else {
-            low + (fee_pick / 3) % (high - low + 1)
+            return None;
         };
-        let change = sum - paid - fee;
         let mut inputs: Vec<(u64, u64)> = chosen.iter().map(|i| world.slots[*i]).collect();
         if pre_j_input {
             inputs[0].1 = FLOOR;
@@ -1361,7 +1412,7 @@ fn prop_vault_balance_covers_supply_plus_pending() {
             )],
             std::slice::from_ref(r),
         );
-        Some((b, chosen, fee, change))
+        Some((b, chosen, fee, change, paid))
     };
     const MAX_PAGED_INPUTS: usize = 1_020;
 
@@ -1370,9 +1421,9 @@ fn prop_vault_balance_covers_supply_plus_pending() {
                          r: &VaultRelease,
                          chosen: &[usize],
                          fee: u64,
-                         change: u64| {
+                         change: u64,
+                         paid: u64| {
         history.push(world.clone());
-        let paid = r.amount - RF;
         let mut taken: Vec<usize> = chosen.to_vec();
         taken.sort_unstable_by(|a, b| b.cmp(a));
         let input: u64 = taken.iter().map(|i| world.slots[*i].0).sum();
@@ -1388,7 +1439,12 @@ fn prop_vault_balance_covers_supply_plus_pending() {
         world.users += paid;
         world.miners += fee;
         world.left_vault += input - change;
-        world.surplus += fee.saturating_sub(RF);
+        // D59: the vault gives at most the burned amount.
+        assert!(
+            input - change <= r.amount,
+            "the vault paid more than the burn"
+        );
+        assert_eq!(input - change, paid + fee);
         assert!(world.paid.insert(r.n));
         world.released_by_block.push(r.amount);
     };
@@ -1491,7 +1547,7 @@ fn prop_vault_balance_covers_supply_plus_pending() {
                 };
                 let pre_j_input = payable && next() % 12 == 0;
                 let r = release(n, owner, amount);
-                let Some((b, chosen, fee, change)) =
+                let Some((b, chosen, fee, change, paid)) =
                     build(&world, &r, next() % 4 == 0, next(), pre_j_input)
                 else {
                     continue;
@@ -1522,7 +1578,7 @@ fn prop_vault_balance_covers_supply_plus_pending() {
                         }
                         max_inputs = max_inputs.max(chosen.len());
                         accepted += 1;
-                        apply_release(&mut world, &mut history, &r, &chosen, fee, change);
+                        apply_release(&mut world, &mut history, &r, &chosen, fee, change, paid);
                         assert_eq!(effect.bridge_locked_after, world.locked());
                     }
                     Err(error) => {
@@ -1574,12 +1630,10 @@ fn prop_vault_balance_covers_supply_plus_pending() {
         "some release spent several pages of slots: {max_inputs}"
     );
     assert!(world.burns.iter().any(|(_, _, payable)| !payable));
-    assert!(world.surplus > 0, "F1 was exercised");
     eprintln!(
         "walk: accepted {accepted} refused {refused} reorgs {reorgs} out_of_order {out_of_order} \
-         ceiling_refusals {ceiling_refusals} max_inputs {max_inputs} surplus {} slots_created {} \
+         ceiling_refusals {ceiling_refusals} max_inputs {max_inputs} slots_created {} \
          burns {} poisoned {}",
-        world.surplus,
         world.slots_created,
         world.burns.len(),
         world.burns.iter().filter(|(_, _, p)| !p).count()
@@ -1609,9 +1663,10 @@ fn prop_vault_balance_covers_supply_plus_pending() {
             world.released_by_block.push(0);
             continue;
         }
-        let Some((b, chosen, fee, change)) = build(&world, &r, false, 1, false) else {
-            // Only F1's surplus can leave the vault short of a payable burn.
-            assert!(world.locked() + world.surplus >= world.pending());
+        let Some((b, chosen, fee, change, paid)) = build(&world, &r, false, 1, false) else {
+            // I2 strict: the vault always holds the pending burns; only the
+            // 1 020-input bound could leave one unbuildable.
+            assert!(world.locked() >= world.pending());
             break;
         };
         let ctx = VaultContext {
@@ -1621,7 +1676,7 @@ fn prop_vault_balance_covers_supply_plus_pending() {
             bridge_vault_floor: FLOOR,
         };
         validate_block_vault(&b, &ctx, &rules(), &mut proven).expect("a payable release");
-        apply_release(&mut world, &mut history, &r, &chosen, fee, change);
+        apply_release(&mut world, &mut history, &r, &chosen, fee, change, paid);
         world.invariants();
     }
     eprintln!(
@@ -1763,74 +1818,50 @@ fn release_needing_more_than_929_inputs_is_unbuildable_under_the_flat_cap() {
     );
 }
 
-/// F1 (D55): the fee cap of a release grows by `FEE_PER_INPUT` per input
-/// beyond the first, the owner still receives `amount − RELEASE_FEE`, and the
-/// surplus comes out of the vault's inputs.
+/// D59 at the boundary of cause 7: with three outputs, 929 slots pay
+/// `RELEASE_FEE`, 930 pay the consensus minimum (`RELEASE_FEE + 100`), out of
+/// the burn; the bare cap (owner still paid `amount − RELEASE_FEE`) and F1
+/// (cap `RELEASE_FEE + FEE_PER_INPUT × (k − 1)`) are refused; a burn below
+/// its group's release fee is refused as V3.
 #[test]
-fn release_fee_cap_grows_with_inputs_and_vault_pays_the_surplus() {
+fn release_fee_follows_the_consensus_minimum_from_930_inputs() {
     use crate::consensus::fees::fee_breakdown;
-    use crate::consensus::params::FEE_PER_INPUT;
-    let k = 930usize;
     let r = release(1, ALICE, 1_000 * MICRO_PER_JTM);
-    let fee = fee_breakdown(k as u64, 3, 1_000, 24).required_total;
-    assert!(fee > RF);
-    let paid = r.amount - RF;
     let change = 5 * MICRO_PER_JTM;
-    // 929 slots of ~1.08 JTM and one that balances the group.
-    let total = paid + change + fee;
-    let each = total / k as u64;
-    let mut inputs = vec![(each, 7u64); k - 1];
-    inputs.push((total - each * (k as u64 - 1), 7));
-    let outputs = [(ALICE, paid), (r.marker(), 0), (VAULT_ADDRESS, change)];
-    let b = block(
-        vec![group_with_inputs(
-            1_000,
-            VAULT_ADDRESS,
-            &inputs,
-            &outputs,
-            fee,
-        )],
-        &[r.clone()],
-    );
-    let effect = check(&b, ctx()).expect("buildable under F1");
+    let at_929 = release_with_k_inputs(&r, 929, r.amount - RF, RF, change);
+    assert!(check(&at_929, ctx()).is_ok());
+    let minimum = fee_breakdown(930, 3, 1_000, 24).required_total;
+    assert_eq!(minimum, RF + 100);
+    let at_930 = release_with_k_inputs(&r, 930, r.amount - minimum, minimum, change);
+    let effect = check(&at_930, ctx()).expect("buildable: the burn pays");
     assert_eq!(effect.releases, vec![(1, ALICE, r.amount)]);
-    // The cap itself: RELEASE_FEE + FEE_PER_INPUT × (k − 1), not one more.
-    let cap = RF + FEE_PER_INPUT * (k as u64 - 1);
-    let over = cap + 1;
-    let mut inputs_over = inputs.clone();
-    inputs_over[0].0 += over - fee;
-    let b = block(
-        vec![group_with_inputs(
-            1_000,
-            VAULT_ADDRESS,
-            &inputs_over,
-            &outputs,
-            over,
-        )],
-        &[r.clone()],
-    );
+    assert_eq!(effect.bridge_locked_after, LOCKED - r.amount);
+    // The bare cap: the owner kept `amount − RELEASE_FEE`, the vault paid 100.
     assert_eq!(
-        check(&b, ctx()),
-        Err(VaultError::ReleaseFeeTooHigh {
+        check(
+            &release_with_k_inputs(&r, 930, r.amount - RF, minimum, change),
+            ctx()
+        ),
+        Err(VaultError::ReleasePaysWrongAmount {
             group: 0,
-            fee: over,
-            max: cap
+            paid: r.amount - RF,
+            expected: r.amount - minimum
         })
     );
-    let mut inputs_cap = inputs.clone();
-    inputs_cap[0].0 += cap - fee;
-    let b = block(
-        vec![group_with_inputs(
-            1_000,
-            VAULT_ADDRESS,
-            &inputs_cap,
-            &outputs,
-            cap,
-        )],
-        &[r.clone()],
+    // F1's cap for 930 inputs.
+    let f1 = RF + FEE_PER_INPUT * 929;
+    assert_eq!(
+        check(
+            &release_with_k_inputs(&r, 930, r.amount - minimum, f1, change),
+            ctx()
+        ),
+        Err(VaultError::ReleaseFeeTooHigh {
+            group: 0,
+            fee: f1,
+            max: minimum
+        })
     );
-    assert!(check(&b, ctx()).is_ok());
-    // One input: the cap is RELEASE_FEE, as before.
+    // One input: `RELEASE_FEE`, as before.
     assert_eq!(
         check(
             &block(vec![release_group(100, &r, 0, RF + 1)], &[r.clone()]),
@@ -1842,6 +1873,188 @@ fn release_fee_cap_grows_with_inputs_and_vault_pays_the_surplus() {
             max: RF
         })
     );
+    // V3 against the group's release fee.
+    let small = release(2, ALICE, RF + 50);
+    assert_eq!(
+        check(&release_with_k_inputs(&small, 1_020, 0, RF + 50, 0), ctx()),
+        Err(VaultError::ReleaseBelowFee {
+            amount: RF + 50,
+            fee: fee_breakdown(1_020, 2, 1_000, 24).required_total
+        })
+    );
+}
+
+/// The release group of `r` spending `k` vault slots (creation id 7, above
+/// the test floor) that together hold `paid + fee + change` exactly; three
+/// live outputs with a change, two without.
+fn release_with_k_inputs(r: &VaultRelease, k: usize, paid: u64, fee: u64, change: u64) -> Block {
+    let total = paid + fee + change;
+    let each = total / k as u64;
+    let mut inputs = vec![(each, 7u64); k - 1];
+    inputs.push((total - each * (k as u64 - 1), 7));
+    let mut outputs = vec![(r.owner, paid), (r.marker(), 0)];
+    if change > 0 {
+        outputs.push((VAULT_ADDRESS, change));
+    }
+    block(
+        vec![group_with_inputs(
+            1_000,
+            VAULT_ADDRESS,
+            &inputs,
+            &outputs,
+            fee,
+        )],
+        std::slice::from_ref(r),
+    )
+}
+
+/// D59 (I2 strict): a release takes from the vault at most the amount its
+/// burn removed from the L1, whatever the number of slots it spends; its fee
+/// is at most `max(RELEASE_FEE, the group's consensus minimum)` and its
+/// owner receives the burn minus that. With 930 slots and more, the consensus
+/// minimum is above `RELEASE_FEE`: under F1 (D55) the vault paid the
+/// difference; under the bare cap `max(…)` it still would (the owner kept
+/// `amount − RELEASE_FEE`). Both leave the vault short; here neither passes.
+#[test]
+fn release_never_takes_more_than_its_burn_from_the_vault() {
+    use crate::consensus::fees::fee_breakdown;
+    let r = release(1, ALICE, 1_000 * MICRO_PER_JTM);
+    let parent = header(HEIGHT - 1);
+    for k in [1usize, 2, 8, 929, 930, 936, 937, 1_000, 1_020] {
+        for change in [0, 5 * MICRO_PER_JTM] {
+            let m = if change > 0 { 3 } else { 2 };
+            let minimum = fee_breakdown(k as u64, m, parent.active_slot_count, parent.log_slots)
+                .required_total;
+            let ceiling = RF.max(minimum);
+            // The honest group: the vault gives exactly the burned amount.
+            let honest = release_with_k_inputs(&r, k, r.amount - ceiling, ceiling, change);
+            let effect = check(&honest, ctx())
+                .unwrap_or_else(|e| panic!("k {k} m {m}: honest release refused: {e:?}"));
+            assert_eq!(
+                effect.bridge_locked_after,
+                LOCKED - r.amount,
+                "k {k} m {m}: the vault gives the burn, no more"
+            );
+            // Fees at the consensus minimum: the vault gives less.
+            let cheap = release_with_k_inputs(&r, k, r.amount - ceiling, minimum, change);
+            assert!(check(&cheap, ctx()).is_ok(), "k {k} m {m}");
+            // Every way of taking one µJTM more than the burn is refused.
+            for (paid, fee) in [
+                (r.amount - ceiling, ceiling + 1),
+                (r.amount - ceiling + 1, ceiling),
+                (r.amount - RF, ceiling),
+                (r.amount - RF, RF + FEE_PER_INPUT * (k as u64 - 1)),
+            ] {
+                if paid + fee <= r.amount || fee < minimum {
+                    continue;
+                }
+                let over = release_with_k_inputs(&r, k, paid, fee, change);
+                assert!(
+                    check(&over, ctx()).is_err(),
+                    "k {k} m {m}: paid {paid} + fee {fee} > burn {} accepted",
+                    r.amount
+                );
+            }
+        }
+    }
+}
+
+/// D59 in the regime the random walk above does not reach: a vault
+/// fragmented into 1-JTM deposits (D19's minimum), burns of 900 to 1 000 JTM
+/// (D54's maximum), each paid from the smallest slots first — 900 to 1 020
+/// inputs, with or without change, any fee from the consensus minimum to
+/// `R`. Every release is accepted, takes at most its burn from the vault, and
+/// after each one the vault covers what is minted and still pending (I2
+/// strict).
+#[test]
+fn prop_fragmented_vault_pays_large_releases_without_overdraft() {
+    use crate::consensus::fees::fee_breakdown;
+    let parent = header(HEIGHT - 1);
+    let minimum = |k: usize, m: u64| {
+        fee_breakdown(k as u64, m, parent.active_slot_count, parent.log_slots).required_total
+    };
+    let release_fee = |k: usize, m: u64| rules().release_fee_for(k as u64, m);
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut slots: Vec<u64> = vec![MICRO_PER_JTM; 3_000];
+    let mut wjtm = 3_000 * MICRO_PER_JTM;
+    let mut paid_set = ReleasedSet::new();
+    let (mut releases, mut above_929, mut exact, mut max_k) = (0u32, 0u32, 0u32, 0usize);
+    for n in 1..=40u64 {
+        // Refill the vault with dust deposits while it is low.
+        while slots.iter().sum::<u64>() < 1_200 * MICRO_PER_JTM {
+            slots.push(MICRO_PER_JTM);
+            wjtm += MICRO_PER_JTM;
+        }
+        let amount = (900 + next() % 101) * MICRO_PER_JTM;
+        wjtm -= amount;
+        let r = release(n, if n % 2 == 0 { ALICE } else { BOB }, amount);
+        slots.sort_unstable();
+        // Smallest first; with change when the slots hold more than the
+        // payout plus the minimum, exactly otherwise.
+        let (mut k, mut sum) = (0usize, 0u64);
+        let (paid, fee, change) = loop {
+            sum += slots[k];
+            k += 1;
+            assert!(
+                k <= 1_020,
+                "a 1-JTM vault pays 1 000 JTM in at most 1 020 slots"
+            );
+            let paid3 = amount - release_fee(k, 3);
+            if sum > paid3 + minimum(k, 3) {
+                let high = release_fee(k, 3).min(sum - paid3 - 1);
+                let low = minimum(k, 3);
+                let fee = if next() % 2 == 0 {
+                    high
+                } else {
+                    low + next() % (high - low + 1)
+                };
+                break (paid3, fee, sum - paid3 - fee);
+            }
+            let paid2 = amount - release_fee(k, 2);
+            if sum >= paid2 + minimum(k, 2) && sum <= amount {
+                break (paid2, sum - paid2, 0);
+            }
+        };
+        let locked: u64 = slots.iter().sum();
+        let b = release_with_k_inputs(&r, k, paid, fee, change);
+        let ctx = VaultContext {
+            released: &paid_set,
+            released_in_window: 0,
+            bridge_locked: locked,
+            bridge_vault_floor: 0,
+        };
+        let effect = validate_block_vault(&b, &ctx, &rules(), &mut proven)
+            .unwrap_or_else(|e| panic!("n {n} k {k}: {e:?}"));
+        assert!(
+            paid + fee <= amount,
+            "n {n} k {k}: the vault gave more than the burn"
+        );
+        assert_eq!(effect.bridge_locked_after, locked - paid - fee);
+        slots.drain(..k);
+        if change > 0 {
+            slots.push(change);
+        } else {
+            exact += 1;
+        }
+        assert!(paid_set.insert(n));
+        releases += 1;
+        above_929 += u32::from(k >= 930);
+        max_k = max_k.max(k);
+        // I2 strict: what is left covers the minted wJTM.
+        assert!(slots.iter().sum::<u64>() >= wjtm, "n {n}: vault short");
+    }
+    assert_eq!(releases, 40);
+    assert!(
+        above_929 >= 20,
+        "the 930-1 020 regime was exercised: {above_929}"
+    );
+    eprintln!("fragmented: releases {releases} k≥930 {above_929} exact {exact} max_k {max_k}");
 }
 
 /// A release of exactly `RELEASE_FEE` pays a live output of value 0 to its
