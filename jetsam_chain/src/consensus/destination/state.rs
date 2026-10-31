@@ -360,9 +360,19 @@ impl DestinationState {
     }
 
     /// What a snapshot of this state carries ([`DestinationSnapshotFile`]):
-    /// the updates that brought its committees (from `keys`) and its window;
+    /// the updates that brought its committees (from `keys`) and the
+    /// releases the window of the next block reads ([`snapshot_window_start`]);
     /// `None` if a committee's update is not in `keys`.
-    pub fn snapshot_file(&self, keys: &CommitteeKeyCache) -> Option<DestinationSnapshotFile> {
+    ///
+    /// The state may be a tip state truncated to the snapshot's boundary
+    /// (T7.1): its window was pruned for the higher tip, but by at most the
+    /// undo's depth, so what the next block reads is still all there.
+    pub fn snapshot_file(
+        &self,
+        keys: &CommitteeKeyCache,
+        window_blocks: u64,
+    ) -> Option<DestinationSnapshotFile> {
+        let first = snapshot_window_start(self.start, self.tip, window_blocks);
         Some(DestinationSnapshotFile {
             committee_updates: self
                 .committees
@@ -372,6 +382,7 @@ impl DestinationState {
             window_releases: self
                 .window
                 .iter()
+                .filter(|r| r.height >= first)
                 .map(|r| (r.n, r.owner, r.amount))
                 .collect(),
         })
@@ -969,9 +980,9 @@ pub struct DestinationSnapshotFile {
     /// The payloads of the committee updates whose `JTMLCU01` markers are the
     /// state's two latest (oldest first; fewer if there are fewer).
     pub committee_updates: Vec<Vec<u8>>,
-    /// `(n, owner, amount)` of every release marker created by the last
-    /// `window_blocks − 1 + DESTINATION_UNDO_BLOCKS` blocks, in creation order
-    /// (V6 of the next block, as a full node keeps it).
+    /// `(n, owner, amount)` of every release marker created by the blocks
+    /// the window (V6) of the next block reads, in creation order
+    /// ([`snapshot_window_start`]).
     pub window_releases: Vec<(u64, Address, u64)>,
 }
 
@@ -1116,10 +1127,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
         let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
 
         // V6: the releases of the blocks the next block's window reads.
-        let window_blocks = self.rules.vault.window_blocks;
-        let first = (self.tip + 2)
-            .saturating_sub(window_blocks + DESTINATION_UNDO_BLOCKS)
-            .max(start);
+        let first = snapshot_window_start(start, self.tip, self.rules.vault.window_blocks);
         let header =
             |h: u64| alloc_counter(h).ok_or(SnapshotDestinationError::HeaderMissing { height: h });
         let low = header(first - 1)?;
@@ -1210,6 +1218,18 @@ impl<'a> SnapshotDestinationCheck<'a> {
             undo: Vec::new(),
         })
     }
+}
+
+/// The first height whose releases a snapshot of the boundary `tip` carries:
+/// those the window (V6) of the block `tip + 1` reads, never below J (T7.1).
+///
+/// Not the `window − 1 + undo` blocks a full node keeps at its tip: a node
+/// exports a finalized boundary below its tip, whose truncated state lacks
+/// the oldest of those, while a snapshot node never truncates below its
+/// boundary and so never reads them. After the undo's depth of blocks, its
+/// state is a full node's again, byte for byte.
+pub fn snapshot_window_start(start: u64, tip: u64, window_blocks: u64) -> u64 {
+    (tip + 2).saturating_sub(window_blocks).max(start)
 }
 
 /// The floor a snapshot install reads: `alloc_counter` of the installed

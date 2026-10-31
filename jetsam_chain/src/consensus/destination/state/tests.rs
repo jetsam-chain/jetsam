@@ -872,6 +872,7 @@ const FLOOR: u64 = 1_000;
 /// A miniature chain: each block goes through `validate_block_destination`
 /// and `apply`; the live slots it creates and spends, and each header's
 /// `alloc_counter`, are kept as a node's UTXO state and headers would be.
+#[derive(Clone)]
 struct Chain {
     rules: DestinationRules,
     keys: CommitteeKeyCache,
@@ -1019,10 +1020,10 @@ impl Chain {
         self.releases.push((self.height, r.clone()));
     }
 
-    /// What a snapshot of this chain's tip carries.
+    /// What a snapshot of this chain's tip carries: the releases the window
+    /// of the next block reads (T7.1).
     fn snapshot_file(&self) -> DestinationSnapshotFile {
-        let first = (self.height + 2)
-            .saturating_sub(self.rules.vault.window_blocks + DESTINATION_UNDO_BLOCKS);
+        let first = (self.height + 2).saturating_sub(self.rules.vault.window_blocks);
         DestinationSnapshotFile {
             committee_updates: self.updates[self.updates.len().saturating_sub(2)..].to_vec(),
             window_releases: self
@@ -1090,7 +1091,12 @@ fn snapshot_install_rebuilds_destination_state() {
     let (installed, keys) = chain.install(&file).expect("the snapshot installs");
     assert_eq!(installed, without_undo(&chain.state));
     // A full node writes exactly this file from its state.
-    assert_eq!(chain.state.snapshot_file(&chain.keys), Some(file.clone()));
+    assert_eq!(
+        chain
+            .state
+            .snapshot_file(&chain.keys, chain.rules.vault.window_blocks),
+        Some(file.clone())
+    );
     // Its committees' keys came from the authenticated updates.
     for c in [&c1, &c2] {
         assert!(keys.get(&root_of(c)).is_some());
@@ -1104,6 +1110,47 @@ fn snapshot_install_rebuilds_destination_state() {
             "{len}"
         );
     }
+}
+
+/// T7.1: a node exports the snapshot of a finalized boundary B while its tip
+/// T is above it (up to the 16 blocks of the undo): the state of B is then
+/// its tip state truncated by the undo, whose window was pruned for T. The
+/// file it writes from that state is the one the check expects — the
+/// releases the window of B + 1 reads — and installs, for every block the
+/// snapshot node will judge, the state a full node had at B; and it is the
+/// file the node would have written at B itself.
+#[test]
+fn a_full_node_writes_a_snapshot_file_its_own_check_accepts() {
+    let w = crate::consensus::vault::VAULT_RELEASE_WINDOW_BLOCKS;
+    let (mut chain, [_, _, c2]) = sample_chain();
+    // A release at r, then B = r + W + 10: r is outside the window of B + 1
+    // but inside what a full node kept at B (W − 1 + 16 blocks back).
+    chain.pay(&release(7, ALICE, 4 * MICRO_PER_JTM), &c2, P0 + 2);
+    let r = chain.height;
+    chain.empty(w + 10);
+    let b = chain.height;
+    assert_eq!(b, r + w + 10);
+    let at_b = chain.clone();
+    assert!(at_b.state.window.iter().any(|entry| entry.height == r));
+    chain.empty(8);
+    let truncated = chain
+        .state
+        .clone()
+        .truncate_above(b)
+        .unwrap()
+        .expect("above J");
+    let file = truncated
+        .snapshot_file(&chain.keys, w)
+        .expect("the keys of its committees");
+    assert_eq!(at_b.state.snapshot_file(&at_b.keys, w), Some(file.clone()));
+    let (installed, _) = at_b.install(&file).expect("its own check accepts it");
+    assert_eq!(
+        installed.released_in_window(b + 1, w),
+        at_b.state.released_in_window(b + 1, w)
+    );
+    let mut expected = without_undo(&at_b.state);
+    expected.window.retain(|entry| entry.height + w >= b + 2);
+    assert_eq!(installed, expected);
 }
 
 #[test]
