@@ -489,9 +489,10 @@ impl AsyncMempool {
     /// v1.7 clock of the next block, the transaction against the current
     /// state (fee, epoch anchor, live inputs, empty outputs), a committee
     /// payment's marker, a release's index unpaid on the branch and its group
-    /// against the vault gate (`check_release_group`), then the transaction's
-    /// authorization, outside the lock. Not checked here: the L1 signatures
-    /// and proofs (the template's `validate_block_destination`). Held, never
+    /// against the vault gate (`check_release_group`); then, outside the
+    /// lock, the L1 rules of the block with the committee keys of the view
+    /// (A2-M1, [`crate::destination::verify_destination_intent`]: BLS, the
+    /// bridge account, V7), then the transaction's authorization. Held, never
     /// put in the fee pool; the miners are woken.
     pub async fn submit_destination(
         &self,
@@ -513,10 +514,20 @@ impl AsyncMempool {
                 max: MAX_AUTHORIZATION_BYTES,
             });
         }
-        {
+        let judge = {
             let st = self.state.lock().await;
-            check_destination_admission(&intent, &spend, &st)?;
-        }
+            check_destination_admission(&intent, &spend, &st)?
+        };
+        // v1.7 (A2-M1): the L1 rules of the block, before the authorization
+        // proof and outside the lock.
+        let (intent, judge, verified) = tokio::task::spawn_blocking(move || {
+            let verified = judge.verify(&intent);
+            (intent, judge, verified)
+        })
+        .await
+        .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?;
+        verified?;
+        let payment = intent.payment();
         let proof_bytes = payment.authorization_bytes.clone();
         let pages = payment.pages.clone();
         let executor = Arc::clone(&self.auth_verify_executor);
@@ -535,7 +546,11 @@ impl AsyncMempool {
             .map_err(SubmitError::InvalidProof)?;
         }
         let mut st = self.state.lock().await;
-        check_destination_admission(&intent, &spend, &st)?;
+        let current = check_destination_admission(&intent, &spend, &st)?;
+        // The view moved to other committees meanwhile: judged again by them.
+        if !current.judges_like(&judge) {
+            current.verify(&intent)?;
+        }
         let admitted = match &intent {
             DestinationIntent::CommitteeUpdate(update) => DestinationAdmitted::CommitteeUpdate {
                 period: update.next_period().unwrap_or_default(),
@@ -1484,13 +1499,48 @@ fn evict_vault_violations(
     refused.len()
 }
 
-/// The admission rules of a destination intent against `st` (module docs of
-/// [`crate::destination`]).
+/// What a destination intent is verified against beside the vault gate
+/// (A2-M1): the committees the branch of the next block knows, the
+/// destination rules and the committee keys of the pool's view.
+pub(crate) struct DestinationJudge {
+    committees: Vec<jetsam_chain::consensus::destination::state::CommitteeRef>,
+    rules: jetsam_chain::consensus::destination::state::DestinationRules,
+    keys: Arc<jetsam_chain::consensus::destination::state::CommitteeKeyCache>,
+}
+
+impl DestinationJudge {
+    /// [`crate::destination::verify_destination_intent`] by this judge.
+    fn verify(&self, intent: &crate::destination::DestinationIntent) -> Result<(), SubmitError> {
+        crate::destination::verify_destination_intent(
+            intent,
+            &self.committees,
+            &self.rules,
+            &self.keys,
+        )
+        .map_err(destination_submit_error)
+    }
+
+    /// Whether `other` gives every intent the same verdict: the same rules
+    /// and committees, the keys of each held by both or by neither (a key set
+    /// is the one its root commits to).
+    fn judges_like(&self, other: &Self) -> bool {
+        self.rules == other.rules
+            && self.committees == other.committees
+            && self
+                .committees
+                .iter()
+                .all(|c| self.keys.get(&c.root).is_some() == other.keys.get(&c.root).is_some())
+    }
+}
+
+/// The admission rules of a destination intent against `st` but its L1
+/// rules (module docs of [`crate::destination`]); returns the judge of
+/// those.
 fn check_destination_admission(
     intent: &crate::destination::DestinationIntent,
     spend: &PagedSpendFacts,
     st: &MempoolState,
-) -> Result<(), SubmitError> {
+) -> Result<DestinationJudge, SubmitError> {
     use crate::destination::DestinationIntent;
     use jetsam_chain::consensus::destination::DestinationError;
     use jetsam_chain::consensus::vault::{check_release_group, VaultError};
@@ -1503,6 +1553,7 @@ fn check_destination_admission(
     if !st.vault_rules.active_at(next_height) {
         return Err(before_j());
     }
+    let vault = st.view.vault.as_ref().ok_or_else(before_j)?;
     match intent {
         DestinationIntent::CommitteeUpdate(update) => {
             if spend.input_owner == st.vault_rules.vault {
@@ -1513,7 +1564,6 @@ fn check_destination_admission(
             run_admission_checks_with(&update.payment.pages, spend, st, Admission::ObjectPayment)?;
         }
         DestinationIntent::Release(release) => {
-            let vault = st.view.vault.as_ref().ok_or_else(before_j)?;
             if vault.released.contains(release.release.n) {
                 return Err(vault_submit_error(VaultError::ReleaseAlreadyPaid {
                     n: release.release.n,
@@ -1529,7 +1579,19 @@ fn check_destination_admission(
             run_admission_checks_with(&release.payment.pages, spend, st, Admission::VaultRelease)?;
         }
     }
-    Ok(())
+    Ok(DestinationJudge {
+        committees: vault.committees.clone(),
+        rules: st.view.destination_rules,
+        keys: Arc::clone(&st.view.committee_keys),
+    })
+}
+
+fn destination_submit_error(
+    error: jetsam_chain::consensus::destination::state::DestinationBlockError,
+) -> SubmitError {
+    SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::DestinationBlock(
+        error,
+    ))
 }
 
 /// Forget the destination intents the next block can no longer use: all of
@@ -2871,7 +2933,10 @@ mod tests {
 
     /// A vault slot created after the floor (not by a coinbase) and the
     /// release intent whose group spends it whole: `(owner, amount − R)` and
-    /// the marker, fee `R`, bound to the epoch anchor of the child of `tip`.
+    /// the marker, fee `R`, bound to the epoch anchor of the child of `tip`;
+    /// its objects are those of the synthetic signed L1 (A2-M1), which prove
+    /// the burn `(4, [0xa1; 32], 5 000 000)` only. The view knows the anchor
+    /// committee and holds its keys.
     struct ReleaseCase {
         state: ChainState,
         intent: crate::destination::DestinationIntent,
@@ -2880,15 +2945,14 @@ mod tests {
 
     impl ReleaseCase {
         fn new(tip: u64, n: u64, amount: u64, paid_delta: i64) -> Self {
-            use jetsam_chain::consensus::vault::{
-                encode_proof_nodes, VaultRelease, RELEASE_FEE_MICRO, VAULT_ADDRESS,
-            };
+            use jetsam_chain::consensus::vault::{VaultRelease, RELEASE_FEE_MICRO, VAULT_ADDRESS};
+            let l1 = crate::destination::tests::SyntheticL1::load();
             let rf = RELEASE_FEE_MICRO;
             let release = VaultRelease {
                 n,
                 owner: Address([0xa1; 32]),
                 amount,
-                storage_proof: vec![vec![0xee; 40]],
+                storage_proof: l1.release.storage_proof.clone(),
             };
             let paid = (amount - rf).saturating_add_signed(paid_delta);
             let mut state = ChainState::with_log_slots(6);
@@ -2931,15 +2995,13 @@ mod tests {
                 is_coinbase: false,
             })
             .unwrap()];
-            let mut proof = Vec::new();
-            encode_proof_nodes(&[vec![0xdd; 64]], &mut proof);
             Self {
                 state,
                 intent: crate::destination::DestinationIntent::Release(
                     crate::destination::ReleaseIntent {
                         release,
-                        finality: crate::destination::tests::finality_payload(),
-                        account_proof: proof,
+                        finality: l1.finality.clone(),
+                        account_proof: l1.account_proof.clone(),
                         payment: jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap(),
                     },
                 ),
@@ -2947,9 +3009,24 @@ mod tests {
             }
         }
 
+        /// The same intent with `edit` applied to its release.
+        fn with(&self, edit: impl FnOnce(&mut crate::destination::ReleaseIntent)) -> Self {
+            let crate::destination::DestinationIntent::Release(mut release) = self.intent.clone()
+            else {
+                unreachable!()
+            };
+            edit(&mut release);
+            Self {
+                state: self.state.clone(),
+                intent: crate::destination::DestinationIntent::Release(release),
+                n: self.n,
+            }
+        }
+
         fn view_at(&self, tip: u64, paid: &[u64]) -> ChainView {
             let mut view = view_of(&self.state, tip);
             if tip + 1 >= CROSSING_J {
+                let l1 = crate::destination::tests::SyntheticL1::load();
                 let mut released = jetsam_chain::consensus::vault::ReleasedSet::new();
                 for n in paid {
                     released.insert(*n);
@@ -2958,15 +3035,21 @@ mod tests {
                     bridge_locked: 1_000_000_000,
                     released,
                     floor: RELEASE_FLOOR,
-                    committees: Vec::new(),
+                    committees: vec![l1.anchor_committee()],
                 });
+                view.destination_rules = l1.rules(armed_vault_rules());
+                view.committee_keys = std::sync::Arc::new(l1.anchor_keys());
             }
             view
         }
 
         fn pool_at(&self, tip: u64, paid: &[u64]) -> AsyncMempool {
+            Self::pool_on(self.view_at(tip, paid))
+        }
+
+        fn pool_on(view: ChainView) -> AsyncMempool {
             AsyncMempool::new(
-                self.view_at(tip, paid),
+                view,
                 MempoolConfig::default()
                     .with_client_object_rules(armed_rules())
                     .with_vault_rules(armed_vault_rules()),
@@ -2981,6 +3064,298 @@ mod tests {
             pool.submit_destination(&self.intent.encode().unwrap())
                 .await
         }
+    }
+
+    /// The destination-block refusal of a destination submission.
+    fn destination_refusal(
+        result: Result<crate::destination::DestinationAdmitted, super::SubmitError>,
+    ) -> Option<jetsam_chain::consensus::destination::state::DestinationBlockError> {
+        match result {
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(error),
+            )) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// A2-M1: with the keys of the committees its branch knows, the pool
+    /// verifies a release as the block does — the finality update (BLS),
+    /// the bridge account under its finalized root, the storage proof (V7) —
+    /// and refuses, unheld, what the block would refuse: a storage proof
+    /// that proves nothing, an index never burned, another amount than the
+    /// burn, a finality update signed by a committee the branch does not
+    /// know, an account proof that does not open the root. Without the keys
+    /// (or before any committee) it refuses softly: the node's own fault.
+    #[tokio::test]
+    async fn bogus_release_intent_is_refused_at_admission_when_keys_are_held() {
+        use jetsam_chain::consensus::destination::light_client::LightClientError;
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        use jetsam_chain::consensus::vault::{encode_proof_nodes, VaultError};
+        let tip = CROSSING_J + 20;
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let mut account = Vec::new();
+        encode_proof_nodes(&[vec![0xdd; 64]], &mut account);
+        let bogus: [(ReleaseCase, fn(&E) -> bool); 5] = [
+            (
+                case.with(|r| r.release.storage_proof = vec![vec![0xee; 40]]),
+                |e| matches!(e, E::Vault(VaultError::NotProvenOnL1 { n: 4, .. })),
+            ),
+            (ReleaseCase::new(tip, 5, 5_000_000, 0), |e| {
+                matches!(e, E::Vault(VaultError::NotProvenOnL1 { n: 5, .. }))
+            }),
+            (ReleaseCase::new(tip, 4, 6_000_000, 0), |e| {
+                matches!(e, E::Vault(VaultError::NotProvenOnL1 { n: 4, .. }))
+            }),
+            (case.with(|r| r.finality = l1.finality_stranger.clone()), |e| {
+                *e == E::LightClient(LightClientError::BadSignature)
+            }),
+            (case.with(|r| r.account_proof = account.clone()), |e| {
+                matches!(e, E::BridgeAccount(_))
+            }),
+        ];
+        for (i, (bogus, expected)) in bogus.iter().enumerate() {
+            // Each on the state its group spends.
+            let pool = bogus.pool_at(tip, &[]);
+            let refusal = destination_refusal(bogus.submit(&pool).await);
+            assert!(
+                refusal.as_ref().is_some_and(expected),
+                "bogus intent {i}: {refusal:?}"
+            );
+            assert!(pool.destination_candidates().await.1.is_empty(), "not held");
+        }
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("the burn's own release");
+        assert_eq!(pool.destination_candidates().await.1.len(), 1);
+
+        // This node lacks the keys, or its branch knows no committee yet:
+        // refused, softly, and not held.
+        let mut keyless = case.view_at(tip, &[]);
+        keyless.committee_keys = std::sync::Arc::default();
+        let mut blind = case.view_at(tip, &[]);
+        blind.vault.as_mut().unwrap().committees.clear();
+        for (view, expected) in [
+            (
+                keyless,
+                E::CommitteeKeysUnavailable {
+                    root: l1.anchor.committee_root,
+                },
+            ),
+            (blind, E::NoCommitteeKnown),
+        ] {
+            let pool = ReleaseCase::pool_on(view);
+            let result = case.submit(&pool).await;
+            assert!(
+                result.as_ref().is_err_and(super::SubmitError::is_soft),
+                "{result:?}"
+            );
+            assert_eq!(destination_refusal(result), Some(expected));
+            assert!(pool.destination_candidates().await.1.is_empty());
+        }
+    }
+
+    /// A2-M1: what the L1 verification costs one admission (printed; run
+    /// with `--ignored`): the release (finality BLS, account, V7) and the
+    /// committee update signed by the known committee (BLS), alone; one whole
+    /// release admission (authorization stubbed); the copy of the key cache
+    /// a view takes per block.
+    #[tokio::test]
+    #[ignore]
+    async fn measure_destination_admission_cost() {
+        use crate::destination::verify_destination_intent;
+        use std::time::Instant;
+        let tip = CROSSING_J + 20;
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let rules = l1.rules(armed_vault_rules());
+        let keys = l1.anchor_keys();
+        let known = [l1.anchor_committee()];
+        let update = crate::destination::DestinationIntent::CommitteeUpdate(
+            crate::destination::CommitteeUpdateIntent {
+                payload: l1.next_update.clone(),
+                payment: case.intent.payment().clone(),
+            },
+        );
+        let runs = 40u32;
+        let time = |f: &dyn Fn()| {
+            f();
+            let start = Instant::now();
+            for _ in 0..runs {
+                f();
+            }
+            start.elapsed() / runs
+        };
+        let release = time(&|| {
+            verify_destination_intent(&case.intent, &known, &rules, &keys).unwrap();
+        });
+        let committee = time(&|| {
+            verify_destination_intent(&update, &known, &rules, &keys).unwrap();
+        });
+        let copy = time(&|| {
+            std::hint::black_box(keys.clone());
+        });
+        let pool = case.pool_at(tip, &[]);
+        let bytes = case.intent.encode().unwrap();
+        pool.submit_destination(&bytes).await.unwrap();
+        let start = Instant::now();
+        for _ in 0..runs {
+            pool.submit_destination(&bytes).await.unwrap();
+        }
+        let admission = start.elapsed() / runs;
+        println!(
+            "A2-M1 cost per call ({runs} runs): release verification {release:?}, \
+             committee-update verification {committee:?}, whole release admission \
+             {admission:?}, key cache copy (one committee) {copy:?}"
+        );
+    }
+
+    /// A2-M1: a release the pool holds, verified, is never replaced by an
+    /// intent of the same index that does not verify (a forged storage
+    /// proof, a finality update of another committee): the honest one stays
+    /// held, as it was.
+    #[tokio::test]
+    async fn a_held_verified_release_is_not_replaced_by_an_unverified_one() {
+        let tip = CROSSING_J + 20;
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("the honest release");
+        let crate::destination::DestinationIntent::Release(honest) = &case.intent else {
+            unreachable!()
+        };
+        for forged in [
+            case.with(|r| r.release.storage_proof = vec![vec![0xee; 40]]),
+            case.with(|r| r.finality = l1.finality_stranger.clone()),
+        ] {
+            assert!(forged.submit(&pool).await.is_err());
+            assert_eq!(
+                pool.destination_candidates().await.1,
+                vec![honest.clone()],
+                "the honest release stays held"
+            );
+        }
+    }
+
+    /// A2-M1: a committee update is verified at admission as the block
+    /// verifies it: while the branch knows no committee, only the anchor
+    /// update (the one whose next committee is the anchor's) is held; once it
+    /// knows one, only an update that committee signs, whose next committee
+    /// its branch proves. A refused update replaces nothing; without the
+    /// keys of the known committee the refusal is soft.
+    #[tokio::test]
+    async fn bogus_committee_update_is_refused_at_admission_when_keys_are_held() {
+        use jetsam_chain::consensus::destination::light_client::LightClientError;
+        use jetsam_chain::consensus::destination::ssz::LightClientUpdate;
+        use jetsam_chain::consensus::destination::state::{
+            committee_update_marker, DestinationBlockError as E,
+        };
+        let tip = CROSSING_J + 20;
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        let intent = |payload: &[u8]| {
+            let case = VaultCase::new(
+                tip,
+                Address([0xA5; 32]),
+                &[
+                    (Address([0x42; 32]), 10),
+                    (committee_update_marker(payload), 0),
+                ],
+            );
+            let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+                crate::destination::CommitteeUpdateIntent {
+                    payload: payload.to_vec(),
+                    payment: case.intent.clone(),
+                },
+            );
+            (case, intent.encode().unwrap())
+        };
+        let view = |case: &VaultCase, known: bool, keys: bool| {
+            let mut view = case.view_at(tip, 0);
+            view.destination_rules = l1.rules(armed_vault_rules());
+            if known {
+                view.vault.as_mut().unwrap().committees = vec![l1.anchor_committee()];
+            }
+            if keys {
+                view.committee_keys = std::sync::Arc::new(l1.anchor_keys());
+            }
+            view
+        };
+        let pool_on = |view: ChainView| {
+            AsyncMempool::new(
+                view,
+                MempoolConfig::default()
+                    .with_client_object_rules(armed_rules())
+                    .with_vault_rules(armed_vault_rules()),
+            )
+            .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())))
+        };
+        let tampered = {
+            let mut update = LightClientUpdate::decode_payload(&l1.next_update).unwrap();
+            update.next_sync_committee.pubkeys[0][0] ^= 1;
+            update.encode_payload()
+        };
+        let forged_signature = {
+            let mut update = LightClientUpdate::decode_payload(&l1.next_update).unwrap();
+            update.sync_aggregate.bits[0] ^= 1;
+            update.encode_payload()
+        };
+
+        // The branch knows no committee: the anchor update only.
+        let (anchor_case, anchor_bytes) = intent(&l1.anchor_update);
+        let pool = pool_on(view(&anchor_case, false, false));
+        for payload in [&l1.next_update, &tampered] {
+            let (_, bytes) = intent(payload);
+            assert_eq!(
+                destination_refusal(pool.submit_destination(&bytes).await),
+                Some(E::AnchorMismatch)
+            );
+        }
+        assert!(pool.destination_candidates().await.0.is_empty());
+        assert_eq!(
+            pool.submit_destination(&anchor_bytes).await.unwrap(),
+            crate::destination::DestinationAdmitted::CommitteeUpdate {
+                period: l1.anchor.period
+            }
+        );
+
+        // It knows the anchor committee and holds its keys: the update it
+        // signs is held; a tampered one is refused and replaces nothing.
+        let (next_case, next_bytes) = intent(&l1.next_update);
+        let pool = pool_on(view(&next_case, true, true));
+        assert_eq!(
+            pool.submit_destination(&next_bytes).await.unwrap(),
+            crate::destination::DestinationAdmitted::CommitteeUpdate {
+                period: l1.anchor.period + 1
+            }
+        );
+        for (payload, expected) in [
+            (&tampered, E::LightClient(LightClientError::NextCommitteeBranch)),
+            (&forged_signature, E::LightClient(LightClientError::BadSignature)),
+            (&l1.anchor_update, E::LightClient(LightClientError::PeriodMismatch {
+                known: l1.anchor.period,
+                update: l1.anchor.period - 1,
+            })),
+        ] {
+            let (_, bytes) = intent(payload);
+            assert_eq!(
+                destination_refusal(pool.submit_destination(&bytes).await),
+                Some(expected)
+            );
+            let held = pool.destination_candidates().await.0;
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].payload, l1.next_update, "the signed update stays held");
+        }
+
+        // Without the keys of the committee it knows: soft, not held.
+        let pool = pool_on(view(&next_case, true, false));
+        let result = pool.submit_destination(&next_bytes).await;
+        assert!(result.as_ref().is_err_and(super::SubmitError::is_soft), "{result:?}");
+        assert_eq!(
+            destination_refusal(result),
+            Some(E::CommitteeKeysUnavailable {
+                root: l1.anchor.committee_root
+            })
+        );
+        assert!(pool.destination_candidates().await.0.is_empty());
     }
 
     /// The exact bytes of every `BridgeIntentAdmitted` event received so far.
@@ -3144,7 +3519,25 @@ mod tests {
             Address([0xA5; 32]),
             &[(Address([0x42; 32]), 10), (marker, 0)],
         );
-        let pool = case.pool_at(tip, 0);
+        // A2-M1: the real update is the anchor update of a branch whose
+        // anchor is its next committee (the pool verifies it as the block).
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(
+            &payload,
+        )
+        .unwrap()
+        .next_sync_committee
+        .hash_tree_root();
+        let mut view = case.view_at(tip, 0);
+        view.destination_rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let pool = ReleaseCase::pool_on(view);
         let intent = crate::destination::DestinationIntent::CommitteeUpdate(
             crate::destination::CommitteeUpdateIntent {
                 payload,

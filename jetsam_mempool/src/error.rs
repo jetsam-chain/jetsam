@@ -67,7 +67,14 @@ pub enum SubmitError {
 impl SubmitError {
     /// Returns `true` if this error is a soft rejection (no evidence of malice).
     /// Soft rejections can be retried after the on-chain state changes.
+    ///
+    /// v1.7 (A2-M1): a destination intent this node cannot judge yet — it
+    /// lacks the keys of a committee its branch knows, its branch knows no
+    /// committee, or the finality update is signed in a period its branch
+    /// does not know (yet) — is the node's own state, not the intent's fault.
     pub fn is_soft(&self) -> bool {
+        use jetsam_chain::consensus::destination::light_client::LightClientError;
+        use jetsam_chain::consensus::destination::state::DestinationBlockError;
         matches!(
             self,
             SubmitError::AlreadyAdmitted(_)
@@ -76,6 +83,13 @@ impl SubmitError {
                 | SubmitError::Consensus(ConsensusError::SlotConflict)
                 | SubmitError::GuardianRateLimited { .. }
                 | SubmitError::GuardianNotHeld(_)
+                | SubmitError::Consensus(ConsensusError::DestinationBlock(
+                    DestinationBlockError::CommitteeKeysUnavailable { .. }
+                        | DestinationBlockError::NoCommitteeKnown
+                        | DestinationBlockError::LightClient(
+                            LightClientError::UnknownCommitteePeriod { .. }
+                        )
+                ))
         )
     }
 }

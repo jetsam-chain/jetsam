@@ -6,7 +6,7 @@
 
 use super::*;
 use jetsam_chain::consensus::destination::ssz::LightClientUpdate;
-use jetsam_chain::consensus::vault::{encode_proof_nodes, VAULT_ADDRESS};
+use jetsam_chain::consensus::vault::{decode_proof_nodes, encode_proof_nodes, VAULT_ADDRESS};
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{
     output_bitmap_bit, TxBody, TxInput, TxOutput, TxPage, PAGED_SPEND_END_BIT,
@@ -34,6 +34,104 @@ pub(crate) fn finality_payload() -> Vec<u8> {
     let mut payload = vec![1u8];
     payload.extend(testdata("fu_lodestar-mainnet.bin"));
     payload
+}
+
+/// A2-M1: the synthetic **signed** L1 of `testdata/l1_synthetic.txt` (test
+/// keys only, written by a temporary test of `jetsam_chain` from its
+/// destination test helpers): an anchor committee (its anchor update), the
+/// update it signs for the next period, a finality update it signs whose
+/// finalized root holds the bridge account and `withdrawals[n]` of one burn,
+/// the same finality update signed by a stranger committee.
+pub(crate) struct SyntheticL1 {
+    pub anchor: jetsam_chain::consensus::destination::state::L1Anchor,
+    pub bridge: jetsam_chain::consensus::destination::l1_read::L1BridgeParams,
+    pub release: VaultRelease,
+    pub anchor_update: Vec<u8>,
+    pub next_update: Vec<u8>,
+    pub finality: Vec<u8>,
+    pub finality_stranger: Vec<u8>,
+    pub account_proof: Vec<u8>,
+}
+
+impl SyntheticL1 {
+    pub(crate) fn load() -> Self {
+        let text = std::fs::read_to_string(format!(
+            "{}/src/destination/testdata/l1_synthetic.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture");
+        let field = |key: &str| -> String {
+            text.lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("fixture field {key}"))
+                .to_string()
+        };
+        let bytes = |key: &str| -> Vec<u8> {
+            let hex = field(key);
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let number = |key: &str| -> u64 { field(key).parse().expect("number") };
+        let storage = bytes("storage_proof");
+        let storage_proof = decode_proof_nodes(&mut storage.as_slice()).expect("storage proof");
+        Self {
+            anchor: jetsam_chain::consensus::destination::state::L1Anchor {
+                period: number("anchor_period"),
+                committee_root: bytes("anchor_root").try_into().unwrap(),
+            },
+            bridge: jetsam_chain::consensus::destination::l1_read::L1BridgeParams {
+                address: bytes("bridge_address").try_into().unwrap(),
+                code_hash: bytes("bridge_code_hash").try_into().unwrap(),
+                withdrawals_slot: number("bridge_withdrawals_slot"),
+            },
+            release: VaultRelease {
+                n: number("release_n"),
+                owner: Address(bytes("release_owner").try_into().unwrap()),
+                amount: number("release_amount"),
+                storage_proof,
+            },
+            anchor_update: bytes("anchor_update"),
+            next_update: bytes("next_update"),
+            finality: bytes("finality"),
+            finality_stranger: bytes("finality_stranger"),
+            account_proof: bytes("account_proof"),
+        }
+    }
+
+    /// The destination rules of this L1, the vault gate (and the v1.7 clock)
+    /// `vault`'s.
+    pub(crate) fn rules(
+        &self,
+        vault: jetsam_chain::consensus::vault::VaultRules,
+    ) -> jetsam_chain::consensus::destination::state::DestinationRules {
+        jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: vault.activation_height,
+            network: jetsam_chain::consensus::destination::forks::L1_MAINNET,
+            anchor: Some(self.anchor),
+            bridge: Some(self.bridge),
+            vault,
+        }
+    }
+
+    /// The anchor committee, as a branch knows it after its anchor update.
+    pub(crate) fn anchor_committee(&self) -> jetsam_chain::consensus::destination::state::CommitteeRef {
+        jetsam_chain::consensus::destination::state::CommitteeRef {
+            period: self.anchor.period,
+            root: self.anchor.committee_root,
+        }
+    }
+
+    /// The keys of the anchor committee, as a node holds them (D57).
+    pub(crate) fn anchor_keys(&self) -> jetsam_chain::consensus::destination::state::CommitteeKeyCache {
+        let mut keys = jetsam_chain::consensus::destination::state::CommitteeKeyCache::default();
+        assert_eq!(
+            keys.insert_update_payload(&self.anchor_update).unwrap(),
+            self.anchor.committee_root
+        );
+        keys
+    }
 }
 
 /// One page from `owner` into `outputs` (≤ 2), one input covering them and
@@ -299,4 +397,41 @@ fn destination_pool_holds_one_per_period_and_index_within_bounds() {
         .all(|u| u.next_period().unwrap() > period + 1));
     pool.clear();
     assert!(pool.is_empty());
+}
+
+/// A2-M1: a full release pool never refuses a lower `n` than what it holds
+/// (the template serves releases by increasing `n`): the largest held index
+/// gives way to it; a higher `n` than all is refused; a held index is
+/// replaced, not grown.
+#[test]
+fn full_release_pool_makes_room_for_a_lower_n() {
+    let mut pool = DestinationPool::default();
+    let first = 1_000_000u64;
+    let last = first + MAX_HELD_RELEASES as u64 - 1;
+    for n in first..=last {
+        pool.hold(release_intent(n, Address([0xa1; 32]), 5_000_000))
+            .unwrap();
+    }
+    let held = |pool: &DestinationPool| -> Vec<u64> { pool.releases().map(|r| r.release.n).collect() };
+    assert_eq!(
+        pool.hold(release_intent(last + 1, Address([0xa1; 32]), 5_000_000)),
+        Err(HoldError::Full),
+        "nothing lower to give way"
+    );
+    pool.hold(release_intent(7, Address([0xa1; 32]), 5_000_000))
+        .expect("a lower n makes room");
+    assert_eq!(pool.releases().count(), MAX_HELD_RELEASES);
+    assert_eq!(held(&pool).first(), Some(&7));
+    assert!(!held(&pool).contains(&last), "the largest gave way");
+    assert!(held(&pool).contains(&(last - 1)));
+    // A held index is replaced in place: nothing gives way.
+    pool.hold(release_intent(last - 1, Address([0xb0; 32]), 6_000_000))
+        .unwrap();
+    assert_eq!(pool.releases().count(), MAX_HELD_RELEASES);
+    assert!(held(&pool).contains(&(last - 2)));
+    // Between the held ones: the largest gives way again.
+    pool.hold(release_intent(first - 1, Address([0xa1; 32]), 5_000_000))
+        .unwrap();
+    assert!(!held(&pool).contains(&(last - 1)));
+    assert_eq!(held(&pool)[..2], [7, first - 1]);
 }

@@ -14,18 +14,24 @@
 //!   group: the spend from the vault (published secret) that pays the burn's
 //!   owner `amount − R` (D59), its `JTMVRL01` marker and the change.
 //!
-//! The pool checks at admission what does not need the L1 light client
-//! (shapes, the release group against the vault gate, slots, the payment's
-//! authorization). The BLS signatures and the storage proofs need the
-//! committee keys of the chain: the template checks the whole destination
-//! section with `validate_block_destination` before it mines, and builds
-//! again without the objects it refuses.
+//! The pool checks at admission the shapes, the release group against the
+//! vault gate, slots, then — A2-M1, with the committee keys this node holds
+//! (`ChainView::committee_keys`) — the L1 light client and the storage proof
+//! as the block does ([`verify_destination_intent`]), then the payment's
+//! authorization. An intent it cannot verify is refused (softly when the
+//! keys are missing: the node's own fault), so none is ever held, and a held
+//! one is never replaced by one that does not verify. The template still
+//! checks the whole destination section with `validate_block_destination`
+//! before it mines, and builds again without the objects it refuses.
 
 use std::collections::BTreeMap;
 
 use jetsam_chain::consensus::destination::forks::period_of_slot;
 use jetsam_chain::consensus::destination::ssz::{LightClientFinalityUpdate, LightClientUpdate};
-use jetsam_chain::consensus::destination::state::committee_update_marker;
+use jetsam_chain::consensus::destination::state::{
+    committee_update_marker, verify_committee_update_payload, verify_releases_on_l1,
+    CommitteeKeyCache, CommitteeRef, DestinationBlockError, DestinationRules,
+};
 use jetsam_chain::consensus::destination::{DestinationObject, DestinationObjectKind};
 use jetsam_chain::consensus::vault::{decode_proof_nodes, destination_marker_kind, VaultRelease};
 use jetsam_chain::consensus::wire_limits::{
@@ -312,10 +318,42 @@ pub enum HoldError {
     NoPeriod,
 }
 
+/// A2-M1: the L1 rules of the block for one destination intent, on a branch
+/// that knows `committees` with the keys `keys` this node holds — what
+/// `validate_block_destination` asks of the object beside the vault gate: a
+/// committee update is the anchor update or is signed by the last committee
+/// known ([`verify_committee_update_payload`]); a release's finality update
+/// is signed by a known committee, the bridge account opens its finalized
+/// root and the storage proof proves the burn (V7,
+/// [`verify_releases_on_l1`]). Pure; BLS for both kinds.
+pub fn verify_destination_intent(
+    intent: &DestinationIntent,
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    keys: &CommitteeKeyCache,
+) -> Result<(), DestinationBlockError> {
+    match intent {
+        DestinationIntent::CommitteeUpdate(update) => {
+            verify_committee_update_payload(&update.payload, committees, rules, keys).map(|_| ())
+        }
+        DestinationIntent::Release(release) => verify_releases_on_l1(
+            &release.finality,
+            &release.account_proof,
+            std::slice::from_ref(&release.release),
+            committees,
+            rules,
+            &CommitteeKeyCache::default(),
+            keys,
+        ),
+    }
+}
+
 impl DestinationPool {
-    /// Hold `intent`, replacing the one of the same period or index (the
-    /// newer proof wins: a relayer refreshes a release under a later finality
-    /// update).
+    /// Hold `intent` — verified at admission ([`verify_destination_intent`]):
+    /// no intent that does not verify is ever held, so none replaces a held
+    /// one — replacing the one of the same period or index (the newer proof
+    /// wins: a relayer refreshes a release under a later finality update). A
+    /// full release pool makes room for a lower index than its largest.
     pub fn hold(&mut self, intent: DestinationIntent) -> Result<(), HoldError> {
         match intent {
             DestinationIntent::CommitteeUpdate(update) => {
@@ -330,7 +368,14 @@ impl DestinationPool {
             DestinationIntent::Release(release) => {
                 let n = release.release.n;
                 if !self.releases.contains_key(&n) && self.releases.len() >= MAX_HELD_RELEASES {
-                    return Err(HoldError::Full);
+                    // Full: the largest index gives way to a lower one (the
+                    // template serves releases by increasing `n`, A2-M1).
+                    match self.releases.last_key_value() {
+                        Some((&largest, _)) if n < largest => {
+                            self.releases.remove(&largest);
+                        }
+                        _ => return Err(HoldError::Full),
+                    }
                 }
                 self.releases.insert(n, release);
             }

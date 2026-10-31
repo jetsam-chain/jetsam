@@ -26,7 +26,7 @@ use std::{
 
 use jetsam_chain::block_header::BlockHeader;
 use jetsam_chain::consensus::destination::state::{
-    CommitteeRef, DestinationRules, DestinationState,
+    CommitteeKeyCache, CommitteeRef, DestinationRules, DestinationState,
 };
 use jetsam_chain::consensus::guardian::{GuardianBranch, GuardianRules, GuardianState};
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
@@ -136,6 +136,14 @@ pub struct ChainView {
     /// below J; at J a fresh one on the tip's `alloc_counter`), T3.7.
     pub guardian: Option<Arc<GuardianState>>,
 
+    /// v1.7 (A2-M1): the destination rules the next block's objects are
+    /// judged by (its L1, the anchor, the bridge contract) and the keys of the
+    /// L1 committees this node holds (D57, `MdbxChainContext::committee_keys`):
+    /// a destination intent is verified at admission as the block verifies
+    /// it, against the committees of [`Self::vault`].
+    pub destination_rules: DestinationRules,
+    pub committee_keys: Arc<CommitteeKeyCache>,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -180,6 +188,8 @@ impl ChainView {
             tip_hash,
             vault: None,
             guardian: None,
+            destination_rules: DestinationRules::current(),
+            committee_keys: Arc::default(),
             state,
             store: None,
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::default())),
@@ -278,8 +288,9 @@ impl ChainView {
             ctx.destination_state(),
             tip_alloc_counter,
             ctx.tip_height.saturating_add(1),
-            &DestinationRules::current(),
+            &view.destination_rules,
         );
+        view.committee_keys = Arc::new(ctx.committee_keys().clone());
         view.guardian = GuardianState::for_child(
             ctx.guardian_state(),
             tip_alloc_counter,
