@@ -14,7 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use libp2p::core::ConnectedPoint;
 use libp2p::{multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
+
+use crate::onion::policy::AddressPolicy;
 
 // Bitcoin Core uses distinct automatic outbound netgroups, while production
 // Ethereum clients tolerate several co-located peers. Two paths per coarse
@@ -46,11 +49,25 @@ const MAX_PUBLIC_INBOUND_CONNECTIONS_PER_GROUP: usize = 96;
 // the entire node.
 const INBOUND_UNRESERVED_PEERS: usize = 96;
 const INBOUND_RESERVED_GROUP_PEERS: usize = 8;
+// Onion peers (D60) have no IP group, and an onion address costs nothing to
+// make. Every one of them rides Tor, so Tor is treated as their carrier. A
+// dual node, which has clearnet neighbours to keep diverse, lets all onion
+// peers together use what one public group may; a guardian, whose only path
+// is Tor, bounds them like the peers behind one relay. Every inbound onion
+// session arrives from the local Tor process, so inbound they are bounded
+// like the identities behind one public IP.
+const MAX_DUAL_ONION_OUTBOUND_PEERS: usize = MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP;
+const MAX_GUARDIAN_ONION_OUTBOUND_PEERS: usize = MAX_OUTBOUND_PEERS_PER_RELAY;
+const MAX_ONION_INBOUND_PEERS: usize = MAX_PUBLIC_INBOUND_PEERS_PER_IP;
+/// The one failure domain of every onion peer: they share Tor as carrier.
+pub(crate) const ONION_FAILURE_DOMAIN: u64 = 0x3000_0000_0000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PublicNetworkGroup {
     Ipv4([u8; 2]),
     Ipv6([u8; 4]),
+    /// Every onion peer, as one group (dial selection only).
+    Onion,
 }
 
 impl PublicNetworkGroup {
@@ -99,6 +116,8 @@ pub(crate) enum DiversityRejection {
     InboundRelayFull { relay: PeerId },
     InboundDiversityReserve { group: PublicNetworkGroup },
     InboundUnclassifiedReserve,
+    OutboundOnionFull,
+    InboundOnionFull,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,9 +153,99 @@ pub(crate) struct PeerDiversity {
     outbound_relays: HashMap<PeerId, HashMap<PeerId, usize>>,
     inbound_relays: HashMap<PeerId, HashMap<PeerId, usize>>,
     unclassified_inbound: HashSet<ConnectionId>,
+    /// Onion sessions (D60), keyed by direction (`true` = outbound). Also
+    /// recorded as untracked (`None`) in `connections`, so the close path is
+    /// the same as for any admitted connection.
+    address_policy: AddressPolicy,
+    onion_listeners: HashSet<Multiaddr>,
+    onion_peers: HashMap<bool, HashMap<PeerId, usize>>,
+    onion_connections: HashMap<ConnectionId, (PeerId, bool)>,
 }
 
 impl PeerDiversity {
+    pub(crate) fn with_address_policy(address_policy: AddressPolicy) -> Self {
+        Self {
+            address_policy,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn address_policy(&self) -> AddressPolicy {
+        self.address_policy
+    }
+
+    /// The bound local address of the onion service's loopback listener:
+    /// every inbound session on it is an onion session.
+    pub(crate) fn add_onion_listener(&mut self, addr: Multiaddr) {
+        self.onion_listeners.insert(addr);
+    }
+
+    /// The group a dial to `addr` counts against: its public group, or the
+    /// onion group when the node dials onion addresses.
+    pub(crate) fn dial_group(&self, addr: &Multiaddr) -> Option<PublicNetworkGroup> {
+        if self.address_policy.is_onion_dial(addr) {
+            return Some(PublicNetworkGroup::Onion);
+        }
+        public_network_group(addr)
+    }
+
+    fn onion_outbound_limit(&self) -> usize {
+        match self.address_policy {
+            AddressPolicy::OnionOnly => MAX_GUARDIAN_ONION_OUTBOUND_PEERS,
+            _ => MAX_DUAL_ONION_OUTBOUND_PEERS,
+        }
+    }
+
+    /// `Some(outbound)` for an onion session: a dial to an onion address,
+    /// or an inbound session on the onion service's listener.
+    fn onion_session(&self, endpoint: &ConnectedPoint) -> Option<bool> {
+        match endpoint {
+            ConnectedPoint::Dialer { address, .. } => {
+                self.address_policy.is_onion_dial(address).then_some(true)
+            }
+            ConnectedPoint::Listener { local_addr, .. } => (self.address_policy.uses_onion()
+                && self.onion_listeners.contains(local_addr))
+            .then_some(false),
+        }
+    }
+
+    /// [`Self::try_admit`] for a connection endpoint: onion sessions are
+    /// budgeted on their own (see the constants above), everything else
+    /// exactly as before.
+    pub(crate) fn try_admit_endpoint(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        endpoint: &ConnectedPoint,
+    ) -> Result<(), DiversityRejection> {
+        let Some(outbound) = self.onion_session(endpoint) else {
+            return self.try_admit(
+                connection_id,
+                peer,
+                endpoint.get_remote_address(),
+                endpoint.is_dialer(),
+            );
+        };
+        if outbound {
+            if distinct_peer_count(&self.onion_peers, &true, peer) >= self.onion_outbound_limit() {
+                return Err(DiversityRejection::OutboundOnionFull);
+            }
+        } else {
+            if distinct_peer_count(&self.onion_peers, &false, peer) >= MAX_ONION_INBOUND_PEERS {
+                return Err(DiversityRejection::InboundOnionFull);
+            }
+            if self.inbound_connection_count() >= INBOUND_UNRESERVED_PEERS {
+                return Err(DiversityRejection::InboundUnclassifiedReserve);
+            }
+            self.unclassified_inbound.insert(connection_id);
+        }
+        increment_peer_count(&mut self.onion_peers, outbound, peer);
+        self.onion_connections
+            .insert(connection_id, (peer, outbound));
+        self.connections.insert(connection_id, None);
+        Ok(())
+    }
+
     pub(crate) fn public_group_for_peer(&self, peer: PeerId) -> Option<PublicNetworkGroup> {
         self.connections
             .values()
@@ -146,6 +255,7 @@ impl PeerDiversity {
             .min_by_key(|group| match group {
                 PublicNetworkGroup::Ipv4(prefix) => (0u8, u32::from(u16::from_be_bytes(*prefix))),
                 PublicNetworkGroup::Ipv6(prefix) => (1u8, u32::from_be_bytes(*prefix)),
+                PublicNetworkGroup::Onion => (2u8, 0),
             })
     }
 
@@ -161,8 +271,16 @@ impl PeerDiversity {
             PublicNetworkGroup::Ipv6(prefix) => {
                 0x2000_0000_0000_0000u64 | u64::from(u32::from_be_bytes(prefix))
             }
+            PublicNetworkGroup::Onion => ONION_FAILURE_DOMAIN,
         });
         public.unwrap_or_else(|| {
+            if self
+                .onion_connections
+                .values()
+                .any(|(onion_peer, _)| *onion_peer == peer)
+            {
+                return ONION_FAILURE_DOMAIN;
+            }
             // FNV-1a is sufficient here: this is scheduling diversity, not a
             // cryptographic identity. PeerId authentication happens earlier.
             peer.to_bytes()
@@ -284,6 +402,9 @@ impl PeerDiversity {
 
     pub(crate) fn remove(&mut self, connection_id: ConnectionId) -> bool {
         self.unclassified_inbound.remove(&connection_id);
+        if let Some((peer, outbound)) = self.onion_connections.remove(&connection_id) {
+            decrement_peer_count(&mut self.onion_peers, outbound, peer);
+        }
         let Some(connection) = self.connections.remove(&connection_id) else {
             return false;
         };
@@ -316,6 +437,11 @@ impl PeerDiversity {
         remote_addr: &Multiaddr,
         pending_same_group: usize,
     ) -> bool {
+        if self.address_policy.is_onion_dial(remote_addr) {
+            return distinct_peer_count(&self.onion_peers, &true, peer)
+                .saturating_add(pending_same_group)
+                < self.onion_outbound_limit();
+        }
         // A circuit must be judged against the carrier budget here too, or the
         // node refuses to place the dial that admission would have accepted.
         if let Some(relay) = circuit_relay(remote_addr) {
@@ -343,6 +469,11 @@ impl PeerDiversity {
         let Some(existing) = self.connections.get(&connection_id) else {
             return Ok(());
         };
+        // An onion session has its own budget; the clearnet addresses its
+        // peer advertises say nothing about the path it took.
+        if self.onion_connections.contains_key(&connection_id) {
+            return Ok(());
+        }
         if existing.is_some() {
             return Ok(());
         }
@@ -903,5 +1034,240 @@ mod tests {
             None,
             "a direct address that merely names its peer is not a circuit"
         );
+    }
+}
+
+#[cfg(test)]
+mod onion_tests {
+    use super::*;
+    use libp2p::core::transport::PortUse;
+    use libp2p::core::Endpoint;
+
+    const SYNTHETIC: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead";
+    const OTHER: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid";
+    const LISTENER: &str = "/ip4/127.0.0.1/tcp/19700";
+
+    fn addr(value: &str) -> Multiaddr {
+        value.parse().unwrap()
+    }
+
+    fn dialer(address: &str) -> ConnectedPoint {
+        ConnectedPoint::Dialer {
+            address: addr(address),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::New,
+        }
+    }
+
+    fn listener(local: &str, from: &str) -> ConnectedPoint {
+        ConnectedPoint::Listener {
+            local_addr: addr(local),
+            send_back_addr: addr(from),
+        }
+    }
+
+    fn onion_dial() -> ConnectedPoint {
+        dialer(&format!("/onion3/{SYNTHETIC}:9700"))
+    }
+
+    fn id(n: usize) -> ConnectionId {
+        ConnectionId::new_unchecked(n)
+    }
+
+    #[test]
+    fn dual_mode_lets_all_onion_peers_use_what_one_public_group_may() {
+        let mut diversity = PeerDiversity::with_address_policy(AddressPolicy::ClearnetAndOnion);
+        let (first, second, third) = (PeerId::random(), PeerId::random(), PeerId::random());
+        diversity
+            .try_admit_endpoint(id(1), first, &onion_dial())
+            .unwrap();
+        diversity
+            .try_admit_endpoint(id(2), first, &dialer(&format!("/onion3/{OTHER}:9700")))
+            .expect("a second path of one identity");
+        diversity
+            .try_admit_endpoint(id(3), second, &onion_dial())
+            .unwrap();
+        assert!(!diversity.outbound_candidate_allowed_with_pending(
+            third,
+            &addr(&format!("/onion3/{OTHER}:9700")),
+            0
+        ));
+        assert_eq!(
+            diversity.try_admit_endpoint(id(4), third, &onion_dial()),
+            Err(DiversityRejection::OutboundOnionFull)
+        );
+        // Clearnet groups are untouched by the onion budget.
+        diversity
+            .try_admit_endpoint(id(5), third, &dialer("/ip4/8.8.8.8/tcp/9700"))
+            .unwrap();
+        diversity.remove(id(3));
+        assert!(diversity.outbound_candidate_allowed_with_pending(
+            third,
+            &addr(&format!("/onion3/{OTHER}:9700")),
+            0
+        ));
+        assert!(!diversity.outbound_candidate_allowed_with_pending(
+            third,
+            &addr(&format!("/onion3/{OTHER}:9700")),
+            1
+        ));
+        diversity
+            .try_admit_endpoint(id(6), third, &onion_dial())
+            .unwrap();
+        assert_eq!(
+            diversity.dial_group(&addr(&format!("/onion3/{SYNTHETIC}:9700"))),
+            Some(PublicNetworkGroup::Onion)
+        );
+        assert_eq!(
+            diversity.dial_group(&addr("/ip4/8.8.8.8/tcp/9700")),
+            Some(PublicNetworkGroup::Ipv4([8, 8]))
+        );
+    }
+
+    #[test]
+    fn a_guardian_bounds_its_onion_peers_like_the_peers_behind_one_relay() {
+        let mut diversity = PeerDiversity::with_address_policy(AddressPolicy::OnionOnly);
+        for n in 0..MAX_OUTBOUND_PEERS_PER_RELAY {
+            diversity
+                .try_admit_endpoint(id(n), PeerId::random(), &onion_dial())
+                .unwrap();
+        }
+        assert_eq!(
+            diversity.try_admit_endpoint(id(1000), PeerId::random(), &onion_dial()),
+            Err(DiversityRejection::OutboundOnionFull)
+        );
+    }
+
+    #[test]
+    fn inbound_onion_sessions_are_bounded_like_the_identities_behind_one_ip() {
+        let mut diversity = PeerDiversity::with_address_policy(AddressPolicy::ClearnetAndOnion);
+        diversity.add_onion_listener(addr(LISTENER));
+        for n in 0..MAX_PUBLIC_INBOUND_PEERS_PER_IP {
+            diversity
+                .try_admit_endpoint(
+                    id(n),
+                    PeerId::random(),
+                    &listener(LISTENER, "/ip4/127.0.0.1/tcp/40000"),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            diversity.try_admit_endpoint(
+                id(1000),
+                PeerId::random(),
+                &listener(LISTENER, "/ip4/127.0.0.1/tcp/40001")
+            ),
+            Err(DiversityRejection::InboundOnionFull)
+        );
+        // Another loopback listener is not the onion service.
+        diversity
+            .try_admit_endpoint(
+                id(1001),
+                PeerId::random(),
+                &listener("/ip4/127.0.0.1/tcp/9700", "/ip4/127.0.0.1/tcp/40002"),
+            )
+            .unwrap();
+        // Onion sessions consume the unreserved inbound pool like any other.
+        assert_eq!(
+            diversity.inbound_connection_count(),
+            MAX_PUBLIC_INBOUND_PEERS_PER_IP + 1
+        );
+        diversity.remove(id(0));
+        diversity
+            .try_admit_endpoint(
+                id(1002),
+                PeerId::random(),
+                &listener(LISTENER, "/ip4/127.0.0.1/tcp/40003"),
+            )
+            .expect("a closed session frees its slot");
+    }
+
+    #[test]
+    fn onion_peers_share_one_failure_domain() {
+        let mut diversity = PeerDiversity::with_address_policy(AddressPolicy::ClearnetAndOnion);
+        diversity.add_onion_listener(addr(LISTENER));
+        let (out, inbound, public) = (PeerId::random(), PeerId::random(), PeerId::random());
+        diversity
+            .try_admit_endpoint(id(1), out, &onion_dial())
+            .unwrap();
+        diversity
+            .try_admit_endpoint(
+                id(2),
+                inbound,
+                &listener(LISTENER, "/ip4/127.0.0.1/tcp/40000"),
+            )
+            .unwrap();
+        diversity
+            .try_admit_endpoint(id(3), public, &dialer("/ip4/8.8.8.8/tcp/9700"))
+            .unwrap();
+        assert_eq!(diversity.failure_domain(out), ONION_FAILURE_DOMAIN);
+        assert_eq!(diversity.failure_domain(inbound), ONION_FAILURE_DOMAIN);
+        assert_ne!(diversity.failure_domain(public), ONION_FAILURE_DOMAIN);
+        // A peer also reached on clearnet keeps its public domain.
+        diversity
+            .try_admit_endpoint(id(4), out, &dialer("/ip4/9.9.9.9/tcp/9700"))
+            .unwrap();
+        assert_eq!(
+            diversity.failure_domain(out),
+            0x1000_0000_0000_0000u64 | u64::from(u16::from_be_bytes([9, 9]))
+        );
+        diversity.remove(id(1));
+        diversity.remove(id(2));
+        diversity.remove(id(4));
+        assert_ne!(diversity.failure_domain(inbound), ONION_FAILURE_DOMAIN);
+    }
+
+    #[test]
+    fn identify_never_moves_an_onion_session_into_an_ip_group() {
+        let mut diversity = PeerDiversity::with_address_policy(AddressPolicy::ClearnetAndOnion);
+        let peer = PeerId::random();
+        diversity
+            .try_admit_endpoint(id(1), peer, &onion_dial())
+            .unwrap();
+        diversity
+            .classify_outbound_dns_connection(id(1), peer, &addr("/ip4/8.8.8.8/tcp/9700"))
+            .unwrap();
+        // Group 8.8/16 still has both its outbound places.
+        for n in 2..4 {
+            diversity
+                .try_admit_endpoint(id(n), PeerId::random(), &dialer("/ip4/8.8.1.1/tcp/9700"))
+                .unwrap();
+        }
+        assert_eq!(diversity.failure_domain(peer), ONION_FAILURE_DOMAIN);
+    }
+
+    #[test]
+    fn without_onion_every_endpoint_is_admitted_exactly_as_before() {
+        let mut onion_off = PeerDiversity::default();
+        let mut reference = PeerDiversity::default();
+        let peer = PeerId::random();
+        assert_eq!(onion_off.address_policy(), AddressPolicy::Clearnet);
+        onion_off.add_onion_listener(addr(LISTENER));
+        let endpoints = [
+            onion_dial(),
+            listener(LISTENER, "/ip4/127.0.0.1/tcp/40000"),
+            dialer("/ip4/8.8.8.8/tcp/9700"),
+            dialer("/ip4/8.8.4.4/tcp/9700"),
+            dialer("/ip4/8.8.2.2/tcp/9700"),
+            listener("/ip4/0.0.0.0/tcp/9700", "/ip4/9.9.9.9/tcp/50000"),
+        ];
+        for (n, endpoint) in endpoints.iter().enumerate() {
+            let peer = if n == 0 { peer } else { PeerId::random() };
+            assert_eq!(
+                onion_off.try_admit_endpoint(id(n), peer, endpoint),
+                reference.try_admit(
+                    id(n),
+                    peer,
+                    endpoint.get_remote_address(),
+                    endpoint.is_dialer()
+                ),
+                "{endpoint:?}"
+            );
+        }
+        assert_eq!(
+            onion_off.dial_group(&addr(&format!("/onion3/{SYNTHETIC}:9700"))),
+            None
+        );
+        assert_ne!(onion_off.failure_domain(peer), ONION_FAILURE_DOMAIN);
     }
 }
