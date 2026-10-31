@@ -3161,11 +3161,25 @@ pub enum NetworkCommand {
     AnnounceClientBatch {
         announcement: crate::client_object_protocol::ClientBatchAnnouncement,
     },
+    /// v1.7 (T7.1): publish a destination or guardian intent this node holds
+    /// on the bridge-intent topic (nothing when the topic is not joined).
+    BroadcastBridgeIntent { intent_bytes: Arc<[u8]> },
 }
 
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
+    /// v1.7 (T7.1): one destination or guardian intent relayed by `from` on
+    /// the bridge-intent topic (exactly one intent of `family` by its
+    /// canonical decoding). The node admits it with `from` as its source and
+    /// resolves `gossip_message_id` (`ResolveTxGossip`): only an `Accept`
+    /// forwards it.
+    BridgeIntentRelayed {
+        from: PeerId,
+        family: crate::bridge_intent_gossip::BridgeIntentFamily,
+        intent_bytes: Arc<[u8]>,
+        gossip_message_id: gossipsub::MessageId,
+    },
     /// A v1.5 client-proof announcement (M3.8). `from` is the directly
     /// connected publisher when there is one, else the relaying peer; both
     /// are provider candidates the node may ask for the bundle.
@@ -3766,6 +3780,7 @@ async fn run_swarm(
     let network_profile = NetworkProfile::for_proof_bank(history_proof_bank_id);
     let public_relay_enabled = !public_addresses.is_empty();
     let serves_client_objects = client_objects.is_some();
+    let joins_bridge_topic = topics.bridge_intents.is_some();
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
@@ -3788,6 +3803,7 @@ async fn run_swarm(
                 lan_discovery,
                 upnp_enabled,
                 serves_client_objects,
+                joins_bridge_topic,
             )
         })?
         .with_swarm_config(|cfg| {
@@ -3850,6 +3866,13 @@ async fn run_swarm(
             .behaviour_mut()
             .gossipsub
             .subscribe(client_transport.topic())?;
+    }
+    // v1.7 destination and guardian intents (T7.1): joined only when the
+    // v1.7 height is armed.
+    let mut bridge_gossip =
+        crate::bridge_intent_gossip::BridgeIntentGossip::new(topics.bridge_intents.as_deref());
+    if let Some(topic) = bridge_gossip.topic() {
+        swarm.behaviour_mut().gossipsub.subscribe(topic)?;
     }
 
     // One failed bind must not take the node down. A host with IPv6 disabled
@@ -4070,6 +4093,10 @@ async fn run_swarm(
                     &gossip_event_tx,
                     event,
                 ) else {
+                    continue;
+                };
+                let Some(event) = bridge_gossip.intercept(&mut swarm, &gossip_event_tx, event)
+                else {
                     continue;
                 };
                 handle_swarm_event(
@@ -5893,6 +5920,13 @@ async fn handle_network_command(
                 height,
                 providers,
                 "cascaded exact block availability to mesh peers"
+            );
+        }
+        NetworkCommand::BroadcastBridgeIntent { intent_bytes } => {
+            crate::bridge_intent_gossip::publish(
+                swarm,
+                topics.bridge_intents.as_deref(),
+                &intent_bytes,
             );
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {

@@ -204,6 +204,7 @@ fn classify(command: &NetworkCommand) -> CommandClass {
             CommandClass::Header
         }
         BroadcastTx { .. }
+        | BroadcastBridgeIntent { .. }
         | ResolveTxGossip { .. }
         | FetchObjects { .. }
         | FetchSnapshotHeaders { .. }

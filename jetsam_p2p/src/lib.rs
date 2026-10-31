@@ -11,6 +11,7 @@
 
 pub mod availability_codec;
 pub mod behaviour;
+pub mod bridge_intent_gossip;
 pub mod client_object_codec;
 pub mod client_object_protocol;
 pub mod client_object_transport;

@@ -214,6 +214,7 @@ impl NodeBehaviour {
         lan_discovery: bool,
         upnp_enabled: bool,
         client_objects: bool,
+        bridge_intents: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -259,7 +260,13 @@ impl NodeBehaviour {
             .mesh_n_low(2)
             .mesh_n_high(8)
             .mesh_outbound_min(1)
-            .max_transmit_size(MAX_TX_INTENT_BYTES_GLOBAL.max(MAX_HEADER_ANNOUNCE_BYTES))
+            // v1.7 (T7.1): a node on the bridge-intent topic also takes an
+            // intent whole (larger than a transaction); any other node keeps
+            // the limit of v1.6.
+            .max_transmit_size(crate::bridge_intent_gossip::gossip_max_transmit_size(
+                MAX_TX_INTENT_BYTES_GLOBAL.max(MAX_HEADER_ANNOUNCE_BYTES),
+                bridge_intents,
+            ))
             // Hold inbound messages until the network event loop has applied
             // structural, per-peer, and process-global admission. Without
             // manual validation, GossipSub forwards and retains a large block

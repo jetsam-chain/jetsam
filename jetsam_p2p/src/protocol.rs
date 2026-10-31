@@ -796,6 +796,10 @@ pub struct NetworkTopics {
     pub protocol_id: String,
     /// v1.5 client-proof announcements (112 bytes each, M3.8).
     pub client_proofs: String,
+    /// v1.7 destination and guardian intents (T7.1,
+    /// [`crate::bridge_intent_gossip`]): `None` unless the v1.7 height is
+    /// armed, and then nothing is joined or published.
+    pub bridge_intents: Option<String>,
 }
 
 impl NetworkTopics {
@@ -807,6 +811,8 @@ impl NetworkTopics {
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
             client_proofs: format!("{}/gossip/client-proofs/1", cfg.p2p_protocol_id),
+            bridge_intents: jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT
+                .map(|_| format!("{}/gossip/bridge-intents/1", cfg.p2p_protocol_id)),
         }
     }
 }
