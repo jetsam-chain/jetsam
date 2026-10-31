@@ -489,6 +489,10 @@ const TX_DIRECT_SMALL_NETWORK_MAX_PEERS: usize = 8;
 /// every newly admitted transaction independent first-hop paths without
 /// flooding all connections.
 const TX_DIRECT_LARGE_NETWORK_FANOUT: usize = 4;
+/// T3.10b: refused peers whose connection a probe may keep at once.
+const MAX_PROBE_HELD_PEERS: usize = 8;
+/// T3.10b: how long a probe may keep a refused peer's connection, per verdict.
+const MAX_PROBE_HOLD: Duration = Duration::from_secs(10 * 60);
 const TX_RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
 const TX_RELAY_RATE_MAX: u32 = 50;
 /// Raw GossipSub payloads accepted for propagation in one fixed window.
@@ -1271,6 +1275,12 @@ struct AutomaticPeerState {
     discovery_failures: u8,
     next_discovery_at: Instant,
     refused_branch: std::collections::HashSet<PeerId>,
+    /// T3.10b: refused peers the node is probing now (at most
+    /// [`MAX_PROBE_HELD_PEERS`]); this node's connection to one is kept.
+    probing: std::collections::HashSet<PeerId>,
+    /// When a refused peer's connection was first kept for a probe, for as
+    /// long as the verdict lasts: the hold ends [`MAX_PROBE_HOLD`] later.
+    probe_hold_since: std::collections::HashMap<PeerId, Instant>,
 }
 
 impl AutomaticPeerState {
@@ -1294,6 +1304,8 @@ impl AutomaticPeerState {
             discovery_failures: 0,
             next_discovery_at: initial_discovery_at,
             refused_branch: std::collections::HashSet::new(),
+            probing: std::collections::HashSet::new(),
+            probe_hold_since: std::collections::HashMap::new(),
         }
     }
 
@@ -1309,19 +1321,54 @@ impl AutomaticPeerState {
             .copied()
             .collect::<Vec<_>>();
         self.refused_branch = refused;
+        // A probe hold lasts at most one verdict.
+        let refused = &self.refused_branch;
+        self.probe_hold_since.retain(|peer, _| refused.contains(peer));
+        self.probing.retain(|peer| refused.contains(peer));
         for peer in changed {
             self.refresh_selected_identified(peer);
         }
     }
 
+    /// T3.10b (A3-2, option b): the refused peers the node is probing now. The
+    /// release of this node's connection to each is deferred, for at most
+    /// [`MAX_PROBE_HELD_PEERS`] peers and [`MAX_PROBE_HOLD`] per verdict; the
+    /// peer stays out of every topology count. A peer that is not refused has
+    /// nothing to hold.
+    fn set_probing_peers(&mut self, peers: impl IntoIterator<Item = PeerId>, now: Instant) {
+        self.probing.clear();
+        for peer in peers {
+            if self.probing.len() >= MAX_PROBE_HELD_PEERS
+                || !self.refused_branch.contains(&peer)
+                || self.probe_hold_expired(&peer, now)
+            {
+                continue;
+            }
+            self.probe_hold_since.entry(peer).or_insert(now);
+            self.probing.insert(peer);
+        }
+    }
+
+    fn probe_hold_expired(&self, peer: &PeerId, now: Instant) -> bool {
+        self.probe_hold_since
+            .get(peer)
+            .is_some_and(|since| now.saturating_duration_since(*since) >= MAX_PROBE_HOLD)
+    }
+
     /// Ordinary neighbour connections this node selected to a peer on a
-    /// refused branch: each one holds a slot a useful neighbour needs.
-    fn refused_neighbour_connections(&self) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
+    /// refused branch: each one holds a slot a useful neighbour needs. One
+    /// kept for a probe in flight is not listed until its hold ends.
+    fn refused_neighbour_connections(
+        &self,
+        now: Instant,
+    ) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
         self.managed_connections
             .iter()
             .filter(|(_, connection)| {
                 matches!(connection.kind, ManagedOutboundKind::Peer)
                     && self.refused_branch.contains(&connection.peer)
+                    && !(self.probing.contains(&connection.peer)
+                        && !self.probe_hold_expired(&connection.peer, now))
             })
             .map(|(connection_id, connection)| (*connection_id, connection.peer))
             .collect()
@@ -3060,6 +3107,11 @@ pub enum NetworkCommand {
     /// refuses. Local topology only, never sent on the wire: none of them
     /// holds a neighbour slot or replaces a seed while listed.
     RefusedBranchPeers { peers: Vec<PeerId> },
+    /// T3.10b: the complete current list of refused peers this node is
+    /// probing (branch observer). Local topology only: this node's own
+    /// connection to each is kept while the probe lasts, at most 8 peers and
+    /// 10 minutes per verdict; none of them holds a neighbour slot.
+    ProbingPeers { peers: Vec<PeerId> },
     /// Get current peer count.
     PeerCount {
         reply: tokio::sync::oneshot::Sender<usize>,
@@ -5464,7 +5516,7 @@ fn maintain_automatic_outbound(
     }
     // Already out of every count below; closing frees the transport slot.
     // An active relay carrier stays, as in every other release.
-    for (connection_id, peer) in automatic.refused_neighbour_connections() {
+    for (connection_id, peer) in automatic.refused_neighbour_connections(now) {
         if relay_reservations.protects_peer(peer) {
             continue;
         }
@@ -5981,6 +6033,9 @@ async fn handle_network_command(
         }
         NetworkCommand::RefusedBranchPeers { peers } => {
             automatic_peers.set_refused_branch_peers(peers);
+        }
+        NetworkCommand::ProbingPeers { peers } => {
+            automatic_peers.set_probing_peers(peers, Instant::now());
         }
         NetworkCommand::PeerCount { reply } => {
             let count = sync_paths.dispatchable_peer_count();
@@ -10616,7 +10671,7 @@ mod tests {
         );
         assert_eq!(state.topology_peer_count(), 0, "nor holds a neighbour slot");
         let released = state
-            .refused_neighbour_connections()
+            .refused_neighbour_connections(Instant::now())
             .into_iter()
             .map(|(connection_id, _)| connection_id)
             .collect::<std::collections::HashSet<_>>();
@@ -10631,7 +10686,7 @@ mod tests {
         // The verdict ended: a still-connected selected peer is a neighbour again.
         state.set_refused_branch_peers([]);
         assert_eq!(state.topology_peer_count(), old.len());
-        assert!(state.refused_neighbour_connections().is_empty());
+        assert!(state.refused_neighbour_connections(Instant::now()).is_empty());
     }
 
     /// The seed side of the same case: a configured seed proven on a refused branch
@@ -10659,7 +10714,105 @@ mod tests {
         state.set_refused_branch_peers([seeds[0]]);
 
         assert_eq!(state.connected_bootstrap_peer_ids(), vec![seeds[1]]);
-        assert!(state.refused_neighbour_connections().is_empty());
+        assert!(state.refused_neighbour_connections(Instant::now()).is_empty());
+    }
+
+    /// `n` ordinary neighbours this node selected, each with one identified
+    /// connection (ids from `first`).
+    fn selected_neighbours(
+        state: &mut AutomaticPeerState,
+        n: usize,
+        first: usize,
+    ) -> Vec<(PeerId, libp2p::swarm::ConnectionId)> {
+        (0..n)
+            .map(|index| {
+                let peer = PeerId::random();
+                let connection_id = libp2p::swarm::ConnectionId::new_unchecked(first + index);
+                state.note_connection_established(connection_id, peer, true);
+                state.note_identified(connection_id, peer);
+                (peer, connection_id)
+            })
+            .collect()
+    }
+
+    fn released_peers(state: &AutomaticPeerState, now: Instant) -> Vec<PeerId> {
+        let mut peers = state
+            .refused_neighbour_connections(now)
+            .into_iter()
+            .map(|(_, peer)| peer)
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers
+    }
+
+    /// T3.10b (A3-2, option b): a probe in flight to a peer on a refused
+    /// branch defers the release of this node's connection to it, at most
+    /// [`MAX_PROBE_HOLD`]; the peer still holds no neighbour slot meanwhile,
+    /// and the bound is not renewed while the verdict lasts.
+    #[test]
+    fn a_probe_in_flight_defers_closing_a_refused_neighbour_and_the_bound_forces_it() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        let peers = selected_neighbours(&mut state, 2, 500);
+        let (probed, other) = (peers[0].0, peers[1].0);
+        let start = Instant::now();
+        state.set_refused_branch_peers([probed, other]);
+        state.set_probing_peers([probed], start);
+        assert_eq!(released_peers(&state, start), vec![other]);
+        assert_eq!(state.topology_peer_count(), 0, "a held peer is no neighbour");
+        let almost = start + MAX_PROBE_HOLD - Duration::from_secs(1);
+        assert_eq!(released_peers(&state, almost), vec![other]);
+        // The bound: released whatever the node still asks.
+        let over = start + MAX_PROBE_HOLD;
+        let mut both = vec![probed, other];
+        both.sort_by_key(|peer| peer.to_bytes());
+        assert_eq!(released_peers(&state, over), both);
+        state.set_probing_peers([probed], over);
+        assert_eq!(released_peers(&state, over), both, "not renewed by asking again");
+        // Out of the probe set: released at once.
+        state.set_refused_branch_peers([probed, other]);
+        state.set_probing_peers([], start);
+        assert_eq!(released_peers(&state, start), both);
+        // A new verdict after the old one ended may be probed again.
+        state.set_refused_branch_peers([]);
+        state.set_refused_branch_peers([probed]);
+        let later = over + Duration::from_secs(1);
+        state.set_probing_peers([probed], later);
+        assert!(released_peers(&state, later).is_empty());
+    }
+
+    /// A probe never holds more than [`MAX_PROBE_HELD_PEERS`] connections,
+    /// and never one to a peer this node does not refuse (nothing to hold:
+    /// such a peer is an ordinary neighbour).
+    #[test]
+    fn probes_hold_at_most_eight_refused_peers_and_never_another() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        let peers = selected_neighbours(&mut state, MAX_PROBE_HELD_PEERS + 3, 600);
+        let refused = peers.iter().map(|(peer, _)| *peer).collect::<Vec<_>>();
+        let now = Instant::now();
+        state.set_refused_branch_peers(refused.clone());
+        state.set_probing_peers(refused.clone(), now);
+        // At most eight are held, whatever the node asks; this node's own
+        // neighbour connections (at most its outbound target) beyond them
+        // are released.
+        assert_eq!(state.probing.len(), MAX_PROBE_HELD_PEERS);
+        assert_eq!(state.probe_hold_since.len(), MAX_PROBE_HELD_PEERS);
+        let managed = state.managed_connections.len();
+        assert_eq!(
+            released_peers(&state, now).len(),
+            managed.saturating_sub(MAX_PROBE_HELD_PEERS)
+        );
+        for (peer, _) in &peers {
+            let held = state.probing.contains(peer);
+            assert!(!held || state.refused_branch.contains(peer));
+        }
+        // A probed peer this node does not refuse is held by nothing.
+        let mut fresh = AutomaticPeerState::new(PeerId::random());
+        let ordinary = selected_neighbours(&mut fresh, 1, 700)[0].0;
+        fresh.set_probing_peers([ordinary], now);
+        assert!(fresh.probe_hold_since.is_empty());
+        assert_eq!(fresh.topology_peer_count(), 1);
     }
 
     #[test]

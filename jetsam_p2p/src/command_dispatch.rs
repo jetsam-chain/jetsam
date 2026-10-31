@@ -196,6 +196,7 @@ fn classify(command: &NetworkCommand) -> CommandClass {
         Dial { .. }
         | BootstrapComplete
         | RefusedBranchPeers { .. }
+        | ProbingPeers { .. }
         | PeerCount { .. }
         | PeerVersions { .. }
         | AdvanceSnapshotGeneration { .. }
