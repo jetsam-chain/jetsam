@@ -3079,6 +3079,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_pause_explanations(matches!(cli.mode, NodeMode::Miner | NodeMode::Extminer));
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
+    // T3.10b: the record of refused branches, read back from the last run.
+    let branch_observer = jetsam_node::branch_observer_node::SharedBranchObserver::load(
+        data_dir.join(jetsam_node::branch_observer::FILE_NAME),
+        unix_now(),
+    );
+    let p2p_branch_observer = branch_observer.clone();
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
     let p2p_history_step_runtimes = history_step_runtimes.clone();
     let p2p_external_mining_attempts = external_mining_attempts.clone();
@@ -3100,6 +3106,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_external_mining_attempts,
             p2p_canonical_tip_changes,
             p2p_client_objects,
+            p2p_branch_observer,
         )
         .await
     });
@@ -3244,6 +3251,7 @@ async fn main() -> anyhow::Result<()> {
         client_objects.clone().map(|objects| {
             objects as jetsam_rpc::client_objects::SharedRpcClientObjects
         }),
+        Arc::new(branch_observer.clone()) as jetsam_rpc::observed_branches::SharedObservedBranches,
     )
     .await
     .context("start RPC server")?;
@@ -3527,6 +3535,9 @@ async fn main() -> anyhow::Result<()> {
     if !p2p_event_task.is_finished() {
         p2p_event_task.abort();
         let _ = (&mut p2p_event_task).await;
+    }
+    if let Err(error) = branch_observer.save(unix_now()) {
+        tracing::warn!(%error, "the branch observer's record could not be saved at shutdown");
     }
     tracing::info!("goodbye — MDBX flushed on drop");
     if let Some(error) = fatal_runtime_error {
@@ -10912,6 +10923,7 @@ async fn handle_p2p_events(
     external_mining_attempts: ExternalMiningAttemptInvalidator,
     mut canonical_tip_changes: tokio::sync::watch::Receiver<jetsam_p2p::object_protocol::ChainPoint>,
     client_objects: Option<Arc<jetsam_node::client_objects::ClientObjects>>,
+    branch_observer: jetsam_node::branch_observer_node::SharedBranchObserver,
 ) -> anyhow::Result<()> {
     use jetsam_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
@@ -11245,6 +11257,8 @@ async fn handle_p2p_events(
     // The verdicts last handed to the P2P layer, which keeps
     // those peers out of its neighbour slots and seed replacement.
     let mut refused_branch_peers_sent = std::collections::HashSet::new();
+    // T3.10b: the probes of the refused branches (`branch_observer_node`).
+    let mut branch_probes = jetsam_node::branch_observer_node::BranchProbes::new(branch_observer);
     match peer_chain_evidence.load_verdicts(
         &peer_verdicts_path,
         Instant::now(),
@@ -14030,6 +14044,9 @@ async fn handle_p2p_events(
                 records,
                 snapshot_boundary,
             }) => {
+                // T3.10b: an answer to a branch probe is read by the observer
+                // too, off this loop; the batch goes on unchanged.
+                let _ = branch_probes.observe_answer(from, &records, &snapshot_header_store);
                 suffix_inventory_probe_peers.remove(&from);
                 if let Some(boundary) = snapshot_boundary.filter(|boundary| {
                     boundary.height > 0
@@ -16598,6 +16615,9 @@ async fn handle_p2p_events(
                 Ok(AppliedExactSuffix::Reorg(applied)) => {
                     let reverted = applied.result.reverted_heights.len();
                     let applied_blocks = applied.result.applied_heights.len();
+                    // T3.10b: an accepted reorganization is recorded too.
+                    let _ = branch_probes
+                        .observe_reorg(&applied.result.reverted_heights, &snapshot_header_store);
                     let selected_tip_committed = !header_dag_faulted
                         && header_dag.best_tip() == completed.target;
                     if selected_tip_committed {
@@ -17676,6 +17696,31 @@ async fn handle_p2p_events(
             {
                 refused_branch_peers_sent = refused_branch_peers;
             }
+            // T3.10b: the refused branches are probed and recorded; a probed
+            // peer's connection is kept meanwhile (`ProbingPeers`).
+            branch_probes.heartbeat(
+                peer_chain_evidence.divergence_heights(now),
+                &refused_branch_peers_sent,
+                &manifest_peers,
+                &fetch_in_progress.clone(),
+                unix_now(),
+                |probe| {
+                    try_dispatch_header_fetch(
+                        &p2p_cmd,
+                        &mut fetch_in_progress,
+                        &mut recent_header_fetches,
+                        probe.peer,
+                        probe.start_height,
+                        probe.count,
+                        now,
+                    )
+                },
+                |peers| {
+                    p2p_cmd
+                        .try_send(jetsam_p2p::NetworkCommand::ProbingPeers { peers })
+                        .is_ok()
+                },
+            );
             if let Some(summary) = branch_warnings.summary_due(now) {
                 for (peer, motif, repeats) in summary {
                     tracing::info!(

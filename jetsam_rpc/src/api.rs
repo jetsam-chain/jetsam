@@ -122,6 +122,15 @@ pub trait JetsamApi {
     #[method(name = "getPeerVersions")]
     async fn get_peer_versions(&self) -> RpcResult<crate::types::PeerVersionsInfo>;
 
+    /// The branches this node refused (T3.10): those seen since `since_unix`,
+    /// with their headers and the work recomputed from them, the heaviest
+    /// first, bounded.
+    #[method(name = "getObservedBranches")]
+    async fn get_observed_branches(
+        &self,
+        since_unix: u64,
+    ) -> RpcResult<crate::observed_branches::ObservedBranchesResponse>;
+
     /// Daemon sync, mining, CPU backend and worker-pool status.
     #[method(name = "getNodeStatus")]
     async fn get_node_status(&self) -> RpcResult<NodeStatus>;

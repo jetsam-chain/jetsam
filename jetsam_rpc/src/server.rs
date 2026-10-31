@@ -1289,6 +1289,8 @@ pub struct RpcHandler {
     /// The node's v1.5 client objects (M3.8): offered to external-mining
     /// templates, reached by the client-object methods.
     pub client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
+    /// The node's record of refused branches (T3.10b, `getObservedBranches`).
+    pub observed_branches: crate::observed_branches::SharedObservedBranches,
 }
 
 #[derive(Clone)]
@@ -2709,6 +2711,26 @@ impl JetsamApiServer for RpcHandler {
                 "the P2P task did not answer; the node is starting or stopping",
             )),
         }
+    }
+
+    async fn get_observed_branches(
+        &self,
+        since_unix: u64,
+    ) -> RpcResult<crate::observed_branches::ObservedBranchesResponse> {
+        let (tip, work) = {
+            let chain = self.chain.read().await;
+            (
+                jetsam_p2p::object_protocol::ChainPoint::new(chain.tip_height(), chain.tip_hash()),
+                *chain.tip_chain_work(),
+            )
+        };
+        crate::observed_branches::get_observed_branches(
+            self.observed_branches.clone(),
+            since_unix,
+            tip,
+            work,
+        )
+        .await
     }
 
     async fn get_node_status(&self) -> RpcResult<NodeStatus> {
@@ -5058,6 +5080,7 @@ pub async fn start_rpc_server(
     allow_custom_coinbase: bool,
     rpc_is_loopback: bool,
     client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
+    observed_branches: crate::observed_branches::SharedObservedBranches,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -5148,6 +5171,7 @@ pub async fn start_rpc_server(
             external_mining_terminal_bytes,
         ))),
         client_objects,
+        observed_branches,
     };
 
     // Always add the RPC access-control middleware layer. Browser-originated

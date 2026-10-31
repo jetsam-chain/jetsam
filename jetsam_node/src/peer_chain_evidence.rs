@@ -230,6 +230,16 @@ impl<H> PeerChainEvidence<H> {
             .map(|record| record.height)
     }
 
+    /// Every peer whose divergence verdict holds, with its divergence height
+    /// (the branch observer's probes start there, T3.10b).
+    pub(crate) fn divergence_heights(&self, now: Instant) -> Vec<(PeerId, u64)> {
+        self.divergent
+            .iter()
+            .filter(|(_, verdict)| verdict.expires > now)
+            .map(|(peer, verdict)| (*peer, verdict.height))
+            .collect()
+    }
+
     /// Every peer whose divergence verdict holds.
     pub(crate) fn divergent_peers(&self, now: Instant) -> HashSet<PeerId> {
         self.divergent
@@ -461,6 +471,29 @@ mod tests {
     /// still there on every reconnection; before v1.5.1 it was wiped by each
     /// disconnect, and the peer's next (higher) manifest became the snapshot
     /// candidate.
+    /// T3.10b: the verdicts that hold, each with its divergence height (the
+    /// lowest refused), for the branch observer; an expired one is not listed.
+    #[test]
+    fn divergence_heights_are_the_verdicts_that_hold() {
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let mut peers = [PeerId::random(), PeerId::random()];
+        peers.sort_by_key(|peer| peer.to_bytes());
+        let [a, b] = peers;
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        evidence.mark_divergent(b, 7, now);
+        evidence.mark_divergent(a, 40, later);
+        evidence.mark_divergent(a, 38, later);
+        let mut held = evidence.divergence_heights(later);
+        held.sort_by_key(|(peer, _)| peer.to_bytes());
+        assert_eq!(held, [(a, 38), (b, 7)]);
+        assert_eq!(
+            evidence.divergence_heights(now + PEER_CHAIN_EVIDENCE_TTL),
+            [(a, 38)],
+            "b's verdict expired"
+        );
+    }
+
     #[test]
     fn a_refused_peer_stays_divergent_across_reconnections() {
         let mut evidence = PeerChainEvidence::<()>::default();
