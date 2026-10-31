@@ -880,22 +880,24 @@ mod tests {
     fn the_refused_bodies_are_bounded() {
         let now = Instant::now();
         let mut evidence = PeerChainEvidence::<()>::default();
+        let refused = |i: usize| body_of(96 + i as u64, 1, &i.to_le_bytes());
         for i in 0..REFUSED_BODY_CAPACITY + 10 {
-            let (_, body) = body_of(96 + i as u64, 1, &i.to_le_bytes());
-            evidence.refuse_body(body, now + Duration::from_millis(i as u64));
+            evidence.refuse_body(refused(i).1, now + Duration::from_millis(i as u64));
         }
         assert!(evidence.refused_bodies.len() <= REFUSED_BODY_CAPACITY);
-        let (h, newest) = body_of(
-            96 + (REFUSED_BODY_CAPACITY + 9) as u64,
-            1,
-            &(REFUSED_BODY_CAPACITY + 9).to_le_bytes(),
-        );
-        assert!(
+        let known = |i: usize| {
+            let (header, body) = refused(i);
             evidence
-                .refused_body_advertised([&record(h, Some(newest))], now)
-                .is_some(),
-            "the newest is kept"
+                .refused_body_advertised([&record(header, Some(body))], now)
+                .is_some()
+        };
+        // Past the bound, those closest to expiry go first: the oldest.
+        assert!(!known(0), "the oldest is evicted");
+        assert!(
+            known(REFUSED_BODY_CAPACITY),
+            "the one that crossed the bound is kept"
         );
+        assert!(known(REFUSED_BODY_CAPACITY + 9), "the newest is kept");
     }
 
     /// The refused bodies come back after a restart with what is left of
