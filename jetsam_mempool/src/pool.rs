@@ -3222,6 +3222,45 @@ mod tests {
         );
     }
 
+    /// A2-M1: a release verified outside the lock is judged again under it
+    /// when the pool's view moved to other committees meanwhile (a new tip
+    /// arrived during its authorization proof): one the new committees no
+    /// longer verify is refused and not held; the same release with the
+    /// view unmoved is held.
+    #[tokio::test]
+    async fn a_release_is_judged_again_when_the_view_moves_to_other_committees() {
+        use jetsam_chain::consensus::destination::state::{CommitteeRef, DestinationBlockError as E};
+        let tip = CROSSING_J + 20;
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let later = CommitteeRef {
+            period: l1.anchor.period + 2,
+            root: [0x77; 32],
+        };
+        let mut moved = case.view_at(tip, &[]);
+        moved.vault.as_mut().unwrap().committees = vec![later];
+        let pool = ReleaseCase::pool_on(case.view_at(tip, &[]));
+        let shared = pool.clone();
+        let next_view = std::sync::Mutex::new(Some(moved));
+        let pool = pool.with_authorization_verification_executor(std::sync::Arc::new(
+            move |_task| {
+                if let Some(view) = next_view.lock().unwrap().take() {
+                    shared.state.blocking_lock().view = view;
+                }
+                Ok(())
+            },
+        ));
+        assert_eq!(
+            destination_refusal(case.submit(&pool).await),
+            Some(E::CommitteeKeysUnavailable { root: later.root }),
+            "judged by the committees the view moved to"
+        );
+        assert!(pool.destination_candidates().await.1.is_empty());
+        case.submit(&case.pool_at(tip, &[]))
+            .await
+            .expect("unmoved, the same release is held");
+    }
+
     /// A2-M1: a release the pool holds, verified, is never replaced by an
     /// intent of the same index that does not verify (a forged storage
     /// proof, a finality update of another committee): the honest one stays
