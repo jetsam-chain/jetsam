@@ -3372,9 +3372,11 @@ async fn main() -> anyhow::Result<()> {
         p2p_background_capacity,
         cli.lan_discovery || cfg.network.lan_discovery,
         upnp_enabled,
-        client_objects.clone().map(|objects| {
-            objects as Arc<dyn jetsam_p2p::client_object_transport::ClientObjectSource>
-        }),
+        // v1.7 (T7.1): the same protocol serves this node's snapshot annexes.
+        jetsam_node::snapshot_annex::node_object_source(
+            client_objects.clone(),
+            &data_dir.join("snapshot-exports"),
+        ),
         onion.clone(),
     )
     .context("start P2P network")?;
@@ -5475,6 +5477,12 @@ fn snapshot_install_failure(
         jetsam_chain::storage::MdbxContextError::Consensus(
             jetsam_chain::consensus::ConsensusError::ClientObject(error),
         ) => SnapshotInstallError::Rejected(format!("snapshot client registry refused: {error}")),
+        // v1.7 (T7.1): the destination state file or the guardian journal
+        // the install refused: the candidate's data.
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            error @ (jetsam_chain::consensus::ConsensusError::DestinationSnapshot(_)
+            | jetsam_chain::consensus::ConsensusError::Guardian(_)),
+        ) => SnapshotInstallError::Rejected(format!("snapshot v1.7 state refused: {error}")),
         error => SnapshotInstallError::BeforeCommit(format!(
             "apply authenticated state snapshot: {error:?}"
         )),
@@ -11299,6 +11307,7 @@ async fn handle_p2p_events(
     use jetsam_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
     let mut snapshot_rebase_hint: Option<SnapshotRebaseHint> = None;
+    let snapshot_annex_router = jetsam_node::snapshot_annex::SnapshotAnnexRouter::default();
     {
         let ctx = chain.read().await;
         mining_peer_quorum.set_canonical_tip(ctx.tip_height(), ctx.tip_hash(), false);
@@ -12860,7 +12869,19 @@ async fn handle_p2p_events(
             let install_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
             let install_external_mining_attempts = external_mining_attempts.clone();
             let completion = snapshot_install_completion_tx.clone();
+            // v1.7 (T7.1): the annexes the manifest commits to, by content
+            // from the plan's peer, before the install.
+            let annex_fetcher = jetsam_node::snapshot_annex::NetworkAnnexFetcher::new(
+                p2p_cmd.clone(),
+                snapshot_annex_router.clone(),
+            );
             let install_task = tokio::spawn(async move {
+                let annexes = jetsam_node::snapshot_annex::fetch_manifest_annexes(
+                    &annex_fetcher,
+                    &[source],
+                    &manifest.annexes,
+                )
+                .await;
                 apply_verified_snapshot_boundary(
                     &install_chain,
                     &install_mempool,
@@ -12870,6 +12891,7 @@ async fn handle_p2p_events(
                     history_step,
                     &install_wallet_operation_gate,
                     &install_external_mining_attempts,
+                    annexes,
                 )
                 .await
             });
@@ -13921,6 +13943,20 @@ async fn handle_p2p_events(
                         notice,
                     );
                 }
+            }
+            // v1.7 (T7.1): the answers to snapshot annex fetches.
+            Ok(NetworkEvent::ClientObjectFetched { token, bytes, .. })
+                if jetsam_node::snapshot_annex::is_snapshot_annex_token(token) =>
+            {
+                snapshot_annex_router.fetched(token, &bytes);
+            }
+            Ok(NetworkEvent::ClientObjectFetchFailed { token, kind, .. })
+                if jetsam_node::snapshot_annex::is_snapshot_annex_token(token) =>
+            {
+                snapshot_annex_router.failed(
+                    token,
+                    kind == jetsam_p2p::network::RequestFailureKind::InvalidResponse,
+                );
             }
             Ok(NetworkEvent::ClientObjectFetched {
                 token, from, bytes, ..
@@ -19524,6 +19560,7 @@ async fn apply_verified_snapshot_boundary(
     history_step: VerifiedHistoryStepSnapshot,
     wallet_operation_gate: &WalletOperationGate,
     external_mining_attempts: &ExternalMiningAttemptInvalidator,
+    annexes: Result<jetsam_chain::storage::SnapshotAnnexes, String>,
 ) -> Result<AppliedVerifiedSnapshot, SnapshotInstallError> {
     if history_step.height != manifest.tip_height || history_step.block_hash != manifest.tip_hash {
         drop_verified_history_step(history_step);
@@ -19550,6 +19587,15 @@ async fn apply_verified_snapshot_boundary(
                     "snapshot manifest client registry is not canonical".into(),
                 ));
             }
+        }
+    };
+    // v1.7 (T7.1): the annexes fetched for it; what they are worth is decided
+    // by the install, against the installed state and headers.
+    let annexes = match annexes {
+        Ok(annexes) => annexes,
+        Err(error) => {
+            drop_verified_history_step(history_step);
+            return Err(SnapshotInstallError::Rejected(error));
         }
     };
     let VerifiedHistoryStepSnapshot {
@@ -19589,6 +19635,7 @@ async fn apply_verified_snapshot_boundary(
             &mut headers,
             allow_nonfinal_rebase,
             &client_registry,
+            &annexes,
         ) {
             drop(ctx);
             let _ = headers.discard();
