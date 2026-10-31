@@ -27,6 +27,8 @@ members = [
     # Prototype: a computed batch of catalogue entry 1 (capacity 128 listed
     # by the test network's catalogue only, as a test entry)
     "jetsam_client_agent_batch",
+    # v1.7 guardian software (T5.1-T5.6): observer, signer, aggregator, ceremony
+    "jetsam_guardian",
 ]
 resolver = "2"
 

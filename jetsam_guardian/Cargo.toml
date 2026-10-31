@@ -1,0 +1,30 @@
+[package]
+name = "jetsam_guardian"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+description = "Jetsam v1.7 guardian software (T5.1-T5.6): observer, signer, network side, aggregator, ceremony and keys."
+publish = false
+
+[dependencies]
+jetsam_chain = { path = "../jetsam_chain" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+blst = "=0.3.16"
+sha2 = "=0.10.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
+anyhow = { workspace = true }
+toml = "0.8"
+libc = "0.2"
+zeroize = "1"
+getrandom = "0.2"
+ed25519-dalek = "2"
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+argon2 = "0.5"
+bech32 = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
