@@ -151,6 +151,8 @@ pub struct Journal {
     pub fail_next_write: bool,
     /// The held `flock` (released on drop).
     _lock: Option<File>,
+    /// The hash of every record, in order.
+    hashes: Vec<[u8; 32]>,
 }
 
 /// One parsed record.
@@ -248,10 +250,12 @@ impl Journal {
             discarded_tail: 0,
             fail_next_write: false,
             _lock: None,
+            hashes: Vec::new(),
         };
         for r in &records {
             j.apply(r.rtype, &r.body)?;
             j.head = r.hash;
+            j.hashes.push(r.hash);
             j.records += 1;
         }
         match status {
@@ -351,10 +355,12 @@ impl Journal {
         anyhow::ensure!(self._lock.is_some(), "a read-only replay does not write");
         let mut bytes = Vec::new();
         let mut head = self.head;
+        let mut new_hashes = Vec::new();
         for (rtype, body) in records {
             let (rec, h) = encode_record(&head, *rtype, body);
             bytes.extend_from_slice(&rec);
             head = h;
+            new_hashes.push(h);
         }
         if std::mem::take(&mut self.fail_next_write) {
             anyhow::bail!("journal write failed (injected)");
@@ -366,6 +372,7 @@ impl Journal {
             self.records += 1;
         }
         self.head = head;
+        self.hashes.extend(new_hashes);
         Ok(())
     }
 
@@ -382,6 +389,26 @@ impl Journal {
             e.tx_root = h0_tx_root;
         }
         Ok(())
+    }
+
+    /// The hash of record `n` (1-based).
+    pub fn record_hash(&self, n: u64) -> Option<[u8; 32]> {
+        let i = usize::try_from(n.checked_sub(1)?).ok()?;
+        self.hashes.get(i).copied()
+    }
+
+    /// A head this signer published (`n` records, hash `head`) compared to
+    /// the journal: `None` if it is a prefix of it, else the reason for the
+    /// REPRISE state (design §4.4: a restored or lost journal).
+    pub fn check_published_head(&self, n: u64, head: &[u8; 32]) -> Option<String> {
+        if n == 0 {
+            return None;
+        }
+        match self.record_hash(n) {
+            None => Some("JOURNAL_BEHIND_PUBLISHED_HEAD".into()),
+            Some(h) if h != *head => Some("JOURNAL_DIVERGES_FROM_PUBLISHED_HEAD".into()),
+            Some(_) => None,
+        }
     }
 
     /// Write a HALT record and enter the HALT state.

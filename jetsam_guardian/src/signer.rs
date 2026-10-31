@@ -109,6 +109,8 @@ pub enum Refusal {
     Halted(String),
     /// TEST ONLY: a simulated crash between INTENT and the partial.
     Crashed,
+    /// REPRISE (design §4.4): the journal is behind or off what was published.
+    Reprise(String),
 }
 
 impl Refusal {
@@ -125,6 +127,7 @@ impl Refusal {
             Self::BelowTrustAnchor => "BELOW_TRUST_ANCHOR".into(),
             Self::Halted(cause) => format!("HALTED:{cause}"),
             Self::Crashed => "CRASHED".into(),
+            Self::Reprise(why) => format!("REPRISE:{why}"),
         }
     }
 }
@@ -168,6 +171,7 @@ pub struct Signer {
     pub commitments: Vec<[u8; 48]>,
     verdicts_o: HashMap<[u8; 32], Verdict>,
     verdicts_w: HashMap<[u8; 32], Verdict>,
+    reprise: Option<String>,
     pub faults: Faults,
 }
 
@@ -186,7 +190,7 @@ impl Signer {
             share.index
         );
         anyhow::ensure!(journal.genesis.is_some() && journal.t_max().is_some(), "the journal has no GENESIS record");
-        Ok(Self { cfg, journal, share, commitments, verdicts_o: HashMap::new(), verdicts_w: HashMap::new(), faults: Faults::default() })
+        Ok(Self { cfg, journal, share, commitments, verdicts_o: HashMap::new(), verdicts_w: HashMap::new(), reprise: None, faults: Faults::default() })
     }
 
     /// A verdict of `jg-observe`.
@@ -224,6 +228,9 @@ impl Signer {
     pub fn sign(&mut self, statement: &[u8; STATEMENT_BYTES], now: u64) -> Result<[u8; 96], Refusal> {
         if let Some(cause) = &self.journal.halted {
             return Err(Refusal::Halted(cause.clone()));
+        }
+        if let Some(why) = &self.reprise {
+            return Err(Refusal::Reprise(why.clone()));
         }
         // SG-11: form.
         let s = GuardianStatement::decode(statement).map_err(|_| Refusal::BadForm("non-canonical".into()))?;
@@ -393,6 +400,21 @@ impl Signer {
             Some(_) if s.height <= t_max => Err(Refusal::JournalConflict),
             Some(field) => Err(Refusal::RecomputeMismatch(field.into())),
         }
+    }
+
+    /// Enter the REPRISE state: every signature refused until restart.
+    pub fn enter_reprise(&mut self, why: &str) {
+        self.reprise = Some(why.to_string());
+    }
+
+    /// The REPRISE reason, if any.
+    pub fn reprise(&self) -> Option<&str> {
+        self.reprise.as_deref()
+    }
+
+    /// A HALT requested by `jg-net` (a second instance of this index) or the operator.
+    pub fn halt_external(&mut self, cause: &str, now: u64) {
+        let _ = self.journal.halt(cause, "requested over the signer's socket", now);
     }
 
     /// Wipe the share (SIGTERM, exit): the scalar buffer is zeroized on drop.

@@ -91,6 +91,13 @@ pub fn publish(points: &[PathBuf], index: u32, day: &str, line: &str) -> usize {
     reached
 }
 
+/// A second instance of share `index` (design §4.5): a heartbeat of `index`
+/// with another instance id, published after this instance started
+/// (`started`) and less than 10 min before `now`. `lines` = `(g, instance, t)`.
+pub fn second_instance(index: u32, mine: &str, started: u64, lines: &[(u32, String, u64)], now: u64) -> bool {
+    lines.iter().any(|(g, inst, t)| *g == index && inst != mine && *t >= started && *t + 600 >= now)
+}
+
 /// The UTC day of a Unix time, `YYYY-MM-DD`.
 pub fn utc_day(t: u64) -> String {
     // days since 1970-01-01 to a civil date (H. Hinnant's algorithm)

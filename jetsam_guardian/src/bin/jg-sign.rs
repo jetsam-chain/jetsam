@@ -100,10 +100,30 @@ fn handle_net(signer: &mut Signer, req: Value) -> Value {
                 }
             }
         }
+        Some("published_head") => {
+            let n = req["records"].as_u64().unwrap_or(0);
+            let Ok(head) = jetsam_guardian::parse32(req["head"].as_str().unwrap_or_default()) else {
+                return json!({"error": "head"});
+            };
+            match signer.journal().check_published_head(n, &head) {
+                Some(why) => {
+                    log(&format!("REPRISE: {why} (published {n} records)"));
+                    signer.enter_reprise(&why);
+                    json!({"reprise": why})
+                }
+                None => json!({"ok": true}),
+            }
+        }
+        Some("halt") => {
+            let cause = req["cause"].as_str().unwrap_or("HALT_REQUESTED").to_string();
+            log(&format!("HALT requested: {cause}"));
+            signer.halt_external(&cause, now_unix());
+            json!({"halted": cause})
+        }
         Some("status") => {
             let (t, id) = signer.t_max();
             let (records, head) = signer.journal().head();
-            json!({"halted": signer.halted(), "t_max": t, "t_max_id": hex::encode(id),
+            json!({"halted": signer.halted(), "reprise": signer.reprise(), "t_max": t, "t_max_id": hex::encode(id),
                    "journal_records": records, "journal_head": hex::encode(head), "index": signer.index()})
         }
         _ => json!({"error": "unknown op"}),

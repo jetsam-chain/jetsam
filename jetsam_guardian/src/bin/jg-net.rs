@@ -107,6 +107,7 @@ struct Net {
     published: HashSet<[u8; 32]>,
     refusals: BTreeMap<String, u64>,
     instance: String,
+    started: u64,
     last_state: String,
 }
 
@@ -179,14 +180,54 @@ impl Net {
         }
     }
 
+    /// My own published heartbeats: the highest journal head (→ REPRISE if the
+    /// signer's journal is behind it) and a second instance of my index (→ HALT).
+    fn check_own_feed(&mut self, now: u64) {
+        let mut best: Option<(u64, String)> = None;
+        let mut instances = Vec::new();
+        for day in [utc_day(now.saturating_sub(86_400)), utc_day(now)] {
+            for p in &self.cfg.publication_points {
+                let path = jetsam_guardian::feed::feed_path(p, self.cfg.index, &day);
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                for line in text.lines() {
+                    let Ok((g, body)) = verify_line(line, &self.keys) else { continue };
+                    if g != self.cfg.index || body["type"] != "hb" {
+                        continue;
+                    }
+                    instances.push((g, body["instance"].as_str().unwrap_or_default().to_string(), body["t"].as_u64().unwrap_or(0)));
+                    if let (Some(n), Some(h)) = (body["journal"]["records"].as_u64(), body["journal"]["head"].as_str()) {
+                        if best.as_ref().is_none_or(|(b, _)| n > *b) {
+                            best = Some((n, h.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((n, h)) = best {
+            let r = ipc::request(&self.run_dir.join("sign-net.sock"), &json!({"op": "published_head", "records": n, "head": h}), Duration::from_secs(5));
+            if let Ok(v) = r {
+                if v.get("reprise").is_some() {
+                    log(&format!("signer in REPRISE: {}", v["reprise"]));
+                }
+            }
+        }
+        if jetsam_guardian::feed::second_instance(self.cfg.index, &self.instance, self.started, &instances, now) {
+            log("SECOND INSTANCE of this index seen: HALT");
+            let _ = ipc::request(&self.run_dir.join("sign-net.sock"), &json!({"op": "halt", "cause": "SECOND_INSTANCE"}), Duration::from_secs(5));
+        }
+    }
+
     fn heartbeat(&mut self) {
         let now = now_unix();
+        self.check_own_feed(now);
         let sign = ipc::request(&self.run_dir.join("sign-net.sock"), &json!({"op": "status"}), Duration::from_secs(5)).unwrap_or(json!({"down": true}));
         let ids = ipc::request(&self.run_dir.join("obs.sock"), &json!({"op": "final_ids"}), Duration::from_secs(5)).unwrap_or(json!({}));
         let state = if sign.get("down").is_some() {
             "SIGNER_DOWN"
         } else if !sign["halted"].is_null() {
             "HALT"
+        } else if !sign["reprise"].is_null() {
+            "REPRISE"
         } else if self.refusals.is_empty() {
             "OK"
         } else {
@@ -229,6 +270,7 @@ fn run() -> anyhow::Result<()> {
         published: HashSet::new(),
         refusals: BTreeMap::new(),
         instance: hex::encode(inst),
+        started: now_unix(),
         last_state: String::new(),
     };
     let mut last_round = Instant::now() - Duration::from_secs(60);

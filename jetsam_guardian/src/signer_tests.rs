@@ -573,3 +573,42 @@ fn signer_single_signing_path() {
     assert_eq!(bin.matches("partial_sign").count(), 0, "the binary never signs by itself");
     assert_eq!(bin.matches(".sign(").count(), 1, "the binary reaches the signer's path once");
 }
+
+#[test]
+fn signer_refuses_everything_in_reprise() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = testkit::chain(40, 1);
+    let mut sg = signer(dir.path(), &chain, 1);
+    let s = att(&chain, 16);
+    verdicts(&mut sg, &chain, &s, NOW);
+    sg.enter_reprise("JOURNAL_BEHIND_PUBLISHED_HEAD");
+    assert_eq!(sg.sign(&s.encode(), NOW), Err(Refusal::Reprise("JOURNAL_BEHIND_PUBLISHED_HEAD".into())));
+    assert!(sg.journal().signed.is_empty());
+}
+
+#[test]
+fn net_detects_second_instance_of_same_index() {
+    use crate::feed::second_instance;
+    let mine = "aa";
+    let started = 1_000;
+    // my own lines, and an older instance's lines from before my start: no alarm
+    let lines = vec![(3u32, "aa".to_string(), 1_100u64), (3, "bb".to_string(), 990)];
+    assert!(!second_instance(3, mine, started, &lines, 1_200));
+    // another instance of index 3 publishing after my start: alarm
+    let lines = vec![(3u32, "aa".to_string(), 1_100u64), (3, "cc".to_string(), 1_150)];
+    assert!(second_instance(3, mine, started, &lines, 1_200));
+    // too old (more than 10 min): no alarm; another index: no alarm
+    assert!(!second_instance(3, mine, started, &[(3, "cc".to_string(), 1_150)], 1_800));
+    assert!(!second_instance(3, mine, started, &[(4, "cc".to_string(), 1_150)], 1_200));
+}
+
+#[test]
+fn signer_halts_on_operator_or_net_halt_and_persists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = testkit::chain(40, 1);
+    let mut sg = signer(dir.path(), &chain, 1);
+    sg.halt_external("SECOND_INSTANCE", 5);
+    drop(sg);
+    let again = reopen(dir.path(), 1);
+    assert_eq!(again.halted(), Some("SECOND_INSTANCE"));
+}

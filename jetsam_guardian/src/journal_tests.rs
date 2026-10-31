@@ -109,3 +109,24 @@ fn a_failed_write_is_an_error_and_changes_nothing() {
     drop(j);
     assert_eq!(Journal::open(dir.path()).unwrap().head(), before);
 }
+
+#[test]
+fn signer_detects_journal_behind_published_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = Journal::open(dir.path()).unwrap();
+    j.init_genesis(&genesis_body(), [0u8; 32]).unwrap();
+    j.append(RecordType::Published, b"{}".to_vec()).unwrap();
+    j.append(RecordType::Published, b"{}".to_vec()).unwrap();
+    let (n, head) = j.head();
+    assert_eq!(n, 3);
+    assert_eq!(j.check_published_head(3, &head), None);
+    let h1 = j.record_hash(1).unwrap();
+    assert_eq!(j.check_published_head(1, &h1), None, "an older published head on this chain");
+    assert_eq!(j.check_published_head(4, &[7u8; 32]).as_deref(), Some("JOURNAL_BEHIND_PUBLISHED_HEAD"));
+    assert_eq!(j.check_published_head(2, &[7u8; 32]).as_deref(), Some("JOURNAL_DIVERGES_FROM_PUBLISHED_HEAD"));
+    drop(j);
+    // the hashes are rebuilt by the replay
+    let r = Journal::replay_readonly(dir.path()).unwrap();
+    assert_eq!(r.record_hash(1), Some(h1));
+    assert_eq!(r.check_published_head(3, &head), None);
+}
