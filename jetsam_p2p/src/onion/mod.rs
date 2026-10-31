@@ -24,11 +24,19 @@
 //! - [`transport`]: an outbound-only libp2p transport for `/onion3/`
 //!   addresses, ready to be composed beside TCP.
 //! - [`announce`]: which addresses the node announces in each mode.
+//! - [`guardian`]: the onion-only mode of guardians (D60) and the startup
+//!   refusals that keep it fail-closed.
+//!
+//! Two modes, both off by default. **Dual** (`additional`) adds an onion
+//! address beside clearnet: more ways in, and the node's IP address stays
+//! public. **Guardian** is onion only and refuses to start whenever its host
+//! could still show on clearnet.
 
 pub mod address;
 pub mod announce;
 pub mod config;
 pub mod control;
+pub mod guardian;
 pub mod key_store;
 pub mod service;
 mod sha3;

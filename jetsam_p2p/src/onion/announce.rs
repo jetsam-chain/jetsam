@@ -14,7 +14,7 @@ use super::config::OnionMode;
 ///   then the onion address once the service is published. With no onion
 ///   address the result is the clearnet list unchanged, so a node that never
 ///   publishes a service announces what it announced before D57.
-/// - [`OnionMode::Exclusive`]: the onion address alone; no clearnet address
+/// - [`OnionMode::Guardian`]: the onion address alone; no clearnet address
 ///   is ever returned, even when one is passed in.
 ///
 /// `onion` is announced only in the bare `/onion3/<id>:<port>` form with a
@@ -32,7 +32,7 @@ pub fn addresses_to_announce(
     });
     let mut announced = match mode {
         OnionMode::Additional => clearnet.to_vec(),
-        OnionMode::Exclusive => Vec::new(),
+        OnionMode::Guardian => Vec::new(),
     };
     if let Some(onion) = onion {
         if !announced.contains(onion) {
@@ -75,16 +75,16 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_mode_never_announces_a_clearnet_address() {
+    fn guardian_mode_never_announces_a_clearnet_address() {
         assert_eq!(
-            addresses_to_announce(OnionMode::Exclusive, &clearnet(), Some(&onion())),
+            addresses_to_announce(OnionMode::Guardian, &clearnet(), Some(&onion())),
             vec![onion()]
         );
-        assert!(addresses_to_announce(OnionMode::Exclusive, &clearnet(), None).is_empty());
+        assert!(addresses_to_announce(OnionMode::Guardian, &clearnet(), None).is_empty());
         let clear = clearnet();
         for announced in [
-            addresses_to_announce(OnionMode::Exclusive, &clear, Some(&onion())),
-            addresses_to_announce(OnionMode::Exclusive, &clear, Some(&clear[0])),
+            addresses_to_announce(OnionMode::Guardian, &clear, Some(&onion())),
+            addresses_to_announce(OnionMode::Guardian, &clear, Some(&clear[0])),
         ] {
             for addr in announced {
                 assert!(
@@ -103,7 +103,7 @@ mod tests {
         forged_raw[34] = 3;
         let forged = Multiaddr::empty().with(Protocol::Onion3((forged_raw, 9700).into()));
         let clear = clearnet();
-        for mode in [OnionMode::Additional, OnionMode::Exclusive] {
+        for mode in [OnionMode::Additional, OnionMode::Guardian] {
             for bad in [&with_peer, &forged, &clear[0]] {
                 let announced = addresses_to_announce(mode, &[], Some(bad));
                 assert!(announced.is_empty(), "{mode:?} announced {bad}");

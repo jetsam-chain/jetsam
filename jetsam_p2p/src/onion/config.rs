@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::OnionError;
 
-/// Whether the onion service is offered beside the clearnet listeners or
-/// instead of them.
+/// Whether the onion service is offered beside the clearnet listeners (dual)
+/// or instead of them (guardian).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnionMode {
@@ -26,9 +26,13 @@ pub enum OnionMode {
     /// same identity keeps announcing on clearnet.
     #[default]
     Additional,
-    /// Onion only: no clearnet address is ever announced. See
-    /// [`check_exclusive_mode`] for the clearnet features this excludes.
-    Exclusive,
+    /// Onion only, for guardians (D60): listens only on the loopback target
+    /// of the service, dials only through Tor, announces only the onion
+    /// address, and refuses to start when anything could still expose the
+    /// host on clearnet (see [`super::guardian`]). `exclusive`, the name of
+    /// the D57 design, is accepted for it.
+    #[serde(alias = "exclusive")]
+    Guardian,
 }
 
 /// The `[network.onion]` section as written by the operator.
@@ -134,6 +138,12 @@ fn absolute_path(name: &str, path: &Option<PathBuf>) -> Result<(), OnionError> {
 }
 
 impl OnionConfig {
+    /// Whether the section is exactly the default one (and so need not be
+    /// written back into a config file).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// `Ok(None)` when disabled; the validated settings otherwise.
     pub fn validate(&self) -> Result<Option<OnionSettings>, OnionError> {
         if !self.enabled {
@@ -172,46 +182,6 @@ impl OnionConfig {
     }
 }
 
-fn is_loopback_only(addr: &Multiaddr) -> bool {
-    match addr.iter().next() {
-        Some(Protocol::Ip4(ip)) => ip.is_loopback(),
-        Some(Protocol::Ip6(ip)) => ip.is_loopback(),
-        _ => false,
-    }
-}
-
-/// Onion-only mode refuses every clearnet feature that would expose or
-/// announce this host: a listener on a non-loopback address, a declared
-/// public address, a UPnP mapping and LAN discovery.
-pub fn check_exclusive_mode(
-    listen_addrs: &[Multiaddr],
-    public_addresses: &[Multiaddr],
-    upnp: bool,
-    lan_discovery: bool,
-) -> Result<(), OnionError> {
-    if let Some(addr) = listen_addrs.iter().find(|addr| !is_loopback_only(addr)) {
-        return Err(OnionError::Config(format!(
-            "onion-only mode: P2P listener {addr} is not loopback"
-        )));
-    }
-    if let Some(addr) = public_addresses.first() {
-        return Err(OnionError::Config(format!(
-            "onion-only mode: public address {addr} would be announced"
-        )));
-    }
-    if upnp {
-        return Err(OnionError::Config(
-            "onion-only mode: UPnP would map a clearnet port".into(),
-        ));
-    }
-    if lan_discovery {
-        return Err(OnionError::Config(
-            "onion-only mode: LAN discovery would broadcast this node".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,15 +210,43 @@ mod tests {
     #[test]
     fn onion_config_parses_from_toml_like_json_with_defaults() {
         let config: OnionConfig =
-            serde_json::from_str(r#"{"enabled": true, "mode": "exclusive"}"#).unwrap();
+            serde_json::from_str(r#"{"enabled": true, "mode": "guardian"}"#).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.mode, OnionMode::Exclusive);
+        assert_eq!(config.mode, OnionMode::Guardian);
         assert_eq!(config.control, DEFAULT_CONTROL);
         assert_eq!(config.socks, DEFAULT_SOCKS);
         assert_eq!(config.virtual_port, DEFAULT_VIRTUAL_PORT);
         let config: OnionConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config, OnionConfig::default());
+        assert!(config.is_default());
+        assert!(!OnionConfig {
+            enabled: true,
+            ..OnionConfig::default()
+        }
+        .is_default());
         assert!(serde_json::from_str::<OnionConfig>(r#"{"mode": "onion-only"}"#).is_err());
+    }
+
+    #[test]
+    fn guardian_mode_is_named_guardian_and_accepts_the_d57_name() {
+        for (text, mode) in [
+            ("additional", OnionMode::Additional),
+            ("guardian", OnionMode::Guardian),
+            ("exclusive", OnionMode::Guardian),
+        ] {
+            let config: OnionConfig =
+                serde_json::from_str(&format!(r#"{{"mode": "{text}"}}"#)).unwrap();
+            assert_eq!(config.mode, mode, "{text}");
+        }
+        // Written back under its D60 name.
+        assert_eq!(
+            serde_json::to_value(OnionMode::Guardian).unwrap(),
+            serde_json::json!("guardian")
+        );
+        assert_eq!(
+            serde_json::to_value(OnionMode::Additional).unwrap(),
+            serde_json::json!("additional")
+        );
     }
 
     #[test]
@@ -341,26 +339,5 @@ mod tests {
         for config in refused {
             assert!(config.validate().is_err(), "{config:?} accepted");
         }
-    }
-
-    #[test]
-    fn exclusive_mode_refuses_every_clearnet_exposure() {
-        let loopback: Vec<Multiaddr> = vec![
-            "/ip4/127.0.0.1/tcp/9700".parse().unwrap(),
-            "/ip6/::1/tcp/9700".parse().unwrap(),
-        ];
-        assert!(check_exclusive_mode(&loopback, &[], false, false).is_ok());
-        assert!(check_exclusive_mode(&[], &[], false, false).is_ok());
-
-        let wildcard: Vec<Multiaddr> = vec!["/ip4/0.0.0.0/tcp/9700".parse().unwrap()];
-        assert!(check_exclusive_mode(&wildcard, &[], false, false).is_err());
-        let lan: Vec<Multiaddr> = vec!["/ip4/192.168.1.5/tcp/9700".parse().unwrap()];
-        assert!(check_exclusive_mode(&lan, &[], false, false).is_err());
-        let named: Vec<Multiaddr> = vec!["/dns4/localhost/tcp/9700".parse().unwrap()];
-        assert!(check_exclusive_mode(&named, &[], false, false).is_err());
-        let public: Vec<Multiaddr> = vec!["/ip4/8.8.8.8/tcp/9700".parse().unwrap()];
-        assert!(check_exclusive_mode(&loopback, &public, false, false).is_err());
-        assert!(check_exclusive_mode(&loopback, &[], true, false).is_err());
-        assert!(check_exclusive_mode(&loopback, &[], false, true).is_err());
     }
 }
