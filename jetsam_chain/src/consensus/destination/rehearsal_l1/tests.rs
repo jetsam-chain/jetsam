@@ -252,6 +252,51 @@ fn bridge_state_proves_each_burn_and_each_absence() {
     assert_eq!(bridge_state(&reversed).state_root, state.state_root);
 }
 
+/// Mutant a38-m15 survived the test above: four burns make no extension
+/// node. Three hundred do (the test checks that one is on a proof path), and
+/// every one of them is proven through it.
+#[test]
+fn bridge_state_proves_burns_through_extension_nodes() {
+    use crate::consensus::destination::mpt::rlp_decode;
+    let bridge = bridge_params();
+    let burns: Vec<Burn> = (1..=300u64)
+        .map(|n| Burn {
+            n,
+            owner: [n as u8; 32],
+            amount: n * MICRO_PER_JTM,
+        })
+        .collect();
+    let state = bridge_state(&burns);
+    let is_extension = |node: &Vec<u8>| {
+        let item = rlp_decode(node).expect("a node");
+        let items = item.list().expect("a list");
+        items.len() == 2
+            && items[0]
+                .bytes()
+                .is_some_and(|p| !p.is_empty() && p[0] >> 4 < 2)
+    };
+    let mut through_extension = 0;
+    for b in &burns {
+        let proof = state.storage_proof(b.n);
+        through_extension += usize::from(proof.iter().any(is_extension));
+        assert_eq!(
+            verify_withdrawal(
+                state.state_root,
+                &bridge,
+                &state.account_proof,
+                b.n,
+                &b.owner,
+                b.amount,
+                &proof
+            ),
+            Ok(()),
+            "burn {}",
+            b.n
+        );
+    }
+    assert!(through_extension > 0, "no extension node on any path");
+}
+
 fn object(kind: DestinationObjectKind, payload: Vec<u8>) -> DestinationObject {
     DestinationObject { kind, payload }
 }
