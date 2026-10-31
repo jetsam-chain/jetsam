@@ -383,3 +383,92 @@ fn wallet_build_guardian_payment_includes_marker_and_object() {
     assert_eq!(attestation.kind, GuardianObjectKind::Attestation);
     assert!(none.is_empty());
 }
+
+/// A3-5: the rate-limit source of an RPC client is its address: the local
+/// host (IPv4, IPv6, IPv4-mapped) shares one source of its own; a remote
+/// client is its IPv4 address or its IPv6 /64, whatever its port; an
+/// unknown address one shared source.
+#[test]
+fn guardian_rate_source_is_the_client_address() {
+    use jetsam_mempool::guardian::LOCAL_RPC_SOURCE;
+    let source = |addr: &str| guardian_rate_source(Some(addr.parse().unwrap()));
+    for local in ["127.0.0.1:9701", "[::1]:9701", "[::ffff:127.0.0.1]:9701", "127.8.9.10:1"] {
+        assert_eq!(source(local), LOCAL_RPC_SOURCE, "{local}");
+    }
+    assert_eq!(source("203.0.113.7:40001"), source("203.0.113.7:40002"));
+    assert_ne!(source("203.0.113.7:40001"), source("203.0.113.8:40001"));
+    assert_ne!(source("203.0.113.7:40001"), LOCAL_RPC_SOURCE);
+    assert_eq!(source("[::ffff:203.0.113.7]:1"), source("203.0.113.7:2"));
+    assert_eq!(
+        source("[2001:db8:1:2:3:4:5:6]:1"),
+        source("[2001:db8:1:2:ffff::]:2"),
+        "one /64"
+    );
+    assert_ne!(source("[2001:db8:1:2::1]:1"), source("[2001:db8:1:3::1]:1"));
+    assert_eq!(guardian_rate_source(None), "rpc:unknown");
+    assert_ne!(guardian_rate_source(None), source("203.0.113.7:1"));
+}
+
+/// A3-5: `submitGuardianObject` limits attestations and equivocations per
+/// client address, not for the whole RPC: a client that used its four per
+/// second leaves another client's quota, and the local host's, untouched.
+#[tokio::test]
+async fn guardian_objects_are_rate_limited_per_rpc_client_address() {
+    use jetsam_chain::consensus::guardian::{
+        u256_word, GuardianStatement, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION,
+    };
+    use jetsam_mempool::guardian::GUARDIAN_RATE_LIMIT_PER_SECOND;
+    let statement = GuardianStatement {
+        domain: GUARDIAN_STATEMENT_DOMAIN,
+        network: [0x4e; 32],
+        l1_chain_id: u256_word(1),
+        l1_bridge: [0xb7; 20],
+        schema_version: GUARDIAN_STATEMENT_VERSION,
+        height: J + 100,
+        block_id: [1; 32],
+        cum_work: [0; 32],
+        headers_digest: [0; 32],
+        anchor_root: [0; 32],
+        deposit_root: [0; 32],
+        deposit_count: 0,
+        not_after: 0,
+    };
+    let object = GuardianAttestation {
+        statement: statement.encode(),
+        signature: [0; 96],
+    }
+    .object();
+    let intent = hex::encode(
+        guardian_intent_bytes(&object, &wallet_page(ALICE, &[], Some(object.marker()))).unwrap(),
+    );
+    let view = jetsam_mempool::ChainView::new(
+        5,
+        std::collections::HashMap::new(),
+        0,
+        jetsam_chain::state::ChainState::with_log_slots(6).state,
+    );
+    let pool = jetsam_mempool::AsyncMempool::new(view, jetsam_mempool::MempoolConfig::default());
+    let from = |addr: &str| {
+        let mut extensions = jsonrpsee::Extensions::new();
+        extensions.insert(RpcRemoteAddr(addr.parse().unwrap()));
+        extensions
+    };
+    let limited = |result: Result<SubmitGuardianObjectResponse, String>| {
+        result.is_err_and(|error| error.contains("rate-limited"))
+    };
+    let client = from("203.0.113.7:40001");
+    for _ in 0..GUARDIAN_RATE_LIMIT_PER_SECOND {
+        // Refused (below J) but counted: the limit comes first.
+        assert!(!limited(submit_guardian_object(&pool, &client, &intent).await));
+    }
+    assert!(
+        limited(submit_guardian_object(&pool, &from("203.0.113.7:40002"), &intent).await),
+        "the same client from another port"
+    );
+    for other in ["198.51.100.2:40001", "127.0.0.1:50000"] {
+        assert!(
+            !limited(submit_guardian_object(&pool, &from(other), &intent).await),
+            "{other} has its own quota"
+        );
+    }
+}

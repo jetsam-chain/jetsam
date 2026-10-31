@@ -59,6 +59,9 @@ pub const GUARDIAN_RATE_LIMIT_PER_SECOND: usize = 4;
 /// Sources the limiter remembers at once (beyond, a new source is refused
 /// until older ones fall out of their window).
 pub const MAX_RATE_LIMITED_SOURCES: usize = 4_096;
+/// A3-5: the source of every RPC client on this node's own host. Its quota
+/// is its own and is always kept, whatever the number of other sources.
+pub const LOCAL_RPC_SOURCE: &str = "rpc:local";
 
 /// One guardian object with its transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,11 +475,16 @@ pub struct GuardianRateLimiter {
 impl GuardianRateLimiter {
     /// Whether `source` may hand in one more at `now`: fewer than
     /// [`GUARDIAN_RATE_LIMIT_PER_SECOND`] in the last second. A refusal is not
-    /// counted.
+    /// counted. [`LOCAL_RPC_SOURCE`] is remembered even when
+    /// [`MAX_RATE_LIMITED_SOURCES`] others are (A3-5).
     pub fn admit(&mut self, source: &str, now: Instant) -> bool {
         let window = Duration::from_secs(1);
         let fresh = |time: &Instant| now.saturating_duration_since(*time) < window;
-        if !self.seen.contains_key(source) && self.seen.len() >= MAX_RATE_LIMITED_SOURCES {
+        // A3-5: the local host's quota is always kept.
+        if source != LOCAL_RPC_SOURCE
+            && !self.seen.contains_key(source)
+            && self.seen.len() >= MAX_RATE_LIMITED_SOURCES
+        {
             self.seen.retain(|_, times| times.back().is_some_and(fresh));
             if self.seen.len() >= MAX_RATE_LIMITED_SOURCES {
                 return false;

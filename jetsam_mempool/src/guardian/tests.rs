@@ -513,6 +513,23 @@ fn unusable_key_rules_refuse_on_the_key_without_a_pairing() {
 // Admission
 // ---------------------------------------------------------------------------
 
+/// A3-5: the local host keeps its own quota even when the limiter already
+/// remembers as many other sources as it can (remote clients cannot crowd
+/// the project's own robot out), and is limited like any source.
+#[test]
+fn the_rate_limiter_keeps_a_quota_for_the_local_host() {
+    let mut limiter = GuardianRateLimiter::default();
+    let t0 = Instant::now();
+    for i in 0..MAX_RATE_LIMITED_SOURCES {
+        assert!(limiter.admit(&format!("rpc:198.51.{}.{}", i / 256, i % 256), t0));
+    }
+    assert!(!limiter.admit("rpc:203.0.113.9", t0), "no room for one more");
+    for _ in 0..GUARDIAN_RATE_LIMIT_PER_SECOND {
+        assert!(limiter.admit(LOCAL_RPC_SOURCE, t0), "the local host's quota");
+    }
+    assert!(!limiter.admit(LOCAL_RPC_SOURCE, t0), "limited like any source");
+}
+
 /// A1 m13: beyond four attestations or equivocations per second from one
 /// source, the pool refuses without verifying anything; a cheap refusal
 /// never reaches the BLS check either.

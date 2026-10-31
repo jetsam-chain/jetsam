@@ -286,8 +286,9 @@ pub trait JetsamApi {
     /// v1.7 (T3.7): hand a guardian intent (hex of `GuardianIntent::encode`:
     /// an object with the transaction paying its marker) to this node's
     /// mempool, for its miners. Attestations and equivocations: at most four
-    /// per second from this RPC. Refused below J.
-    #[method(name = "submitGuardianObject")]
+    /// per second per client address (A3-5: the local host has its own
+    /// quota). Refused below J.
+    #[method(name = "submitGuardianObject", with_extensions)]
     async fn submit_guardian_object(
         &self,
         intent_hex: String,

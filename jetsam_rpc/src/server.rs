@@ -3414,18 +3414,12 @@ impl JetsamApiServer for RpcHandler {
 
     async fn submit_guardian_object(
         &self,
+        ext: &jsonrpsee::Extensions,
         intent_hex: String,
     ) -> RpcResult<crate::guardian::SubmitGuardianObjectResponse> {
-        let bytes = hex::decode(intent_hex.trim())
-            .map_err(|error| rpc_err(format!("intent_hex: {error}")))?;
-        if bytes.len() > jetsam_mempool::guardian::MAX_GUARDIAN_INTENT_BYTES {
-            return Err(rpc_err("guardian intent too large"));
-        }
-        self.mempool
-            .submit_guardian(&bytes, "rpc")
+        crate::guardian::submit_guardian_object(&self.mempool, ext, &intent_hex)
             .await
-            .map(Into::into)
-            .map_err(|error| rpc_err(format!("guardian intent refused: {error}")))
+            .map_err(rpc_err)
     }
 
     async fn get_guardian_state(&self) -> RpcResult<crate::guardian::GuardianStateResponse> {
@@ -5165,14 +5159,51 @@ pub async fn start_rpc_server(
     // Pool operators:  jetsam --rpc-listen 0.0.0.0:9701 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
-    let server = Server::builder()
+    let services = Server::builder()
         .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
             expected: expected_bearer,
         }))
-        .build(listen)
+        .to_service_builder();
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| anyhow::anyhow!("build RPC server: {e}"))?;
-    let handle = server.start(handler.into_rpc());
+    let methods: jsonrpsee::Methods = handler.into_rpc().into();
+    let (stop, handle) = jsonrpsee::server::stop_channel();
+    // A3-5: jsonrpsee's own accept loop does not hand a method the client's
+    // address; this one (its low-level API) puts it in every request's
+    // extensions, for the guardian rate limit to key by it.
+    tokio::spawn(async move {
+        loop {
+            let (socket, remote) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::debug!(%error, "RPC: failed to accept a connection");
+                        continue;
+                    }
+                },
+                _ = stop.clone().shutdown() => break,
+            };
+            // As jsonrpsee's own loop does (its default `tcp_no_delay`).
+            if let Err(error) = socket.set_nodelay(true) {
+                tracing::warn!(%error, "RPC: could not set NODELAY on a connection");
+                continue;
+            }
+            let (services, methods, stop_conn) = (services.clone(), methods.clone(), stop.clone());
+            let service = tower::service_fn(move |mut request: http::Request<_>| {
+                request
+                    .extensions_mut()
+                    .insert(crate::guardian::RpcRemoteAddr(remote));
+                let mut service = services.clone().build(methods.clone(), stop_conn.clone());
+                async move { tower::Service::call(&mut service, request).await }
+            });
+            tokio::spawn(jsonrpsee::server::serve_with_graceful_shutdown(
+                socket,
+                service,
+                stop.clone().shutdown(),
+            ));
+        }
+    });
     tracing::debug!(%listen, "RPC server started");
     Ok((handle, stop_rx))
 }

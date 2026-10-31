@@ -71,6 +71,60 @@ impl From<jetsam_mempool::guardian::GuardianAdmitted> for SubmitGuardianObjectRe
     }
 }
 
+/// A3-5: the address the RPC server saw a request come from, in the
+/// request's extensions (the server's accept loop puts it there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpcRemoteAddr(pub std::net::SocketAddr);
+
+/// A3-5: the rate-limit source of the guardian objects an RPC client at
+/// `remote` hands in: every client of this node's own host shares
+/// [`LOCAL_RPC_SOURCE`] (a quota of its own, always kept); another client is
+/// keyed by its IPv4 address, or by its IPv6 /64 (one end site), never by
+/// its port; a request whose address is not known shares `rpc:unknown`.
+///
+/// [`LOCAL_RPC_SOURCE`]: jetsam_mempool::guardian::LOCAL_RPC_SOURCE
+pub fn guardian_rate_source(remote: Option<std::net::SocketAddr>) -> String {
+    use std::net::IpAddr;
+    let Some(remote) = remote else {
+        return "rpc:unknown".into();
+    };
+    let ip = match remote.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    if ip.is_loopback() {
+        return jetsam_mempool::guardian::LOCAL_RPC_SOURCE.into();
+    }
+    match ip {
+        IpAddr::V4(v4) => format!("rpc:{v4}"),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("rpc:{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
+/// `submitGuardianObject`: the intent `intent_hex` handed to `mempool`,
+/// rate-limited by the address of the client in `extensions` (A3-5).
+pub async fn submit_guardian_object(
+    mempool: &jetsam_mempool::AsyncMempool,
+    extensions: &jsonrpsee::Extensions,
+    intent_hex: &str,
+) -> Result<SubmitGuardianObjectResponse, String> {
+    let bytes = hex::decode(intent_hex.trim()).map_err(|error| format!("intent_hex: {error}"))?;
+    if bytes.len() > jetsam_mempool::guardian::MAX_GUARDIAN_INTENT_BYTES {
+        return Err("guardian intent too large".into());
+    }
+    let source = guardian_rate_source(extensions.get::<RpcRemoteAddr>().map(|remote| remote.0));
+    mempool
+        .submit_guardian(&bytes, &source)
+        .await
+        .map(Into::into)
+        .map_err(|error| format!("guardian intent refused: {error}"))
+}
+
 /// A live slot of a pool: `(slot, amount, creation_id)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolSlot {
