@@ -1815,14 +1815,21 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
     // retain a trailing /p2p/<PeerId>: it cryptographically binds the dial to
     // the identity selected by the operator.
     if seed.starts_with('/') {
-        return seed
+        let addr: libp2p::Multiaddr = seed
             .parse()
-            .with_context(|| format!("parse multiaddr: {seed}"));
+            .with_context(|| format!("parse multiaddr: {seed}"))?;
+        if jetsam_p2p::onion::address::asks_dns_for_an_onion(&addr) {
+            anyhow::bail!("{ONION_NAME_NOT_FOR_DNS}: {seed}");
+        }
+        return Ok(addr);
     }
 
     // Format 4: "dnsaddr:<hostname>" → /dnsaddr/<hostname>
     // Resolves _dnsaddr.<hostname> TXT records (libp2p standard).
     if let Some(host) = seed.strip_prefix("dnsaddr:") {
+        if jetsam_p2p::onion::address::onion_host(host.trim()).is_some() {
+            anyhow::bail!("{ONION_NAME_NOT_FOR_DNS}: {seed}");
+        }
         let ma_str = format!("/dnsaddr/{}", host.trim());
         return ma_str
             .parse()
@@ -1834,12 +1841,344 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
         return seed_host_port_to_multiaddr(seed);
     }
 
+    // An onion name (`<id>.onion`) is never resolved: `/onion3/<id>:<port>`.
+    if let Some(service) = jetsam_p2p::onion::address::onion_host(seed) {
+        let service = service.with_context(|| format!("invalid onion seed {seed:?}"))?;
+        return Ok(service.to_multiaddr(default_port)?);
+    }
+
     // Format 2: bare hostname — use default network port. `/dns/` lets
     // libp2p try both A and AAAA answers (up to its bounded dial limit).
     let ma_str = format!("/dns/{seed}/tcp/{default_port}");
     ma_str
         .parse()
         .with_context(|| format!("build DNS multiaddr for {seed:?}"))
+}
+
+/// Why `/dns*/<x>.onion` and `dnsaddr:<x>.onion` are refused everywhere: the
+/// lookup would name the service in clear to the resolver and the path.
+const ONION_NAME_NOT_FOR_DNS: &str = "an onion name is never looked up through DNS \
+     (write <id>.onion:PORT or /onion3/<id>:PORT)";
+
+/// The `[network.onion]` section, validated (D57, D60). In guardian mode,
+/// every setting that could still expose this host on clearnet stops the
+/// node here, before any database, wallet or socket is opened: a configured
+/// P2P listener (`explicit_listen`), a public address, UPnP, LAN discovery, a
+/// seed that is not an onion address, a JSON-RPC listener beyond loopback.
+#[allow(clippy::too_many_arguments)]
+fn onion_startup(
+    onion: &jetsam_p2p::onion::OnionConfig,
+    explicit_listen: &[libp2p::Multiaddr],
+    public_addresses: &[libp2p::Multiaddr],
+    upnp: bool,
+    lan_discovery: bool,
+    seeds: &[String],
+    default_port: u16,
+    rpc_listen: std::net::SocketAddr,
+) -> anyhow::Result<Option<jetsam_p2p::onion::OnionSettings>> {
+    use jetsam_p2p::onion::{guardian, OnionMode};
+
+    let Some(settings) = onion.validate().context("network.onion")? else {
+        return Ok(None);
+    };
+    match settings.mode {
+        OnionMode::Guardian => {
+            let seeds = seeds
+                .iter()
+                .map(|seed| {
+                    seed_to_multiaddr(seed, default_port)
+                        .with_context(|| format!("guardian mode (onion only): seed {seed:?}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            guardian::refuse_clearnet_exposure(
+                &settings,
+                &guardian::ClearnetExposure {
+                    listen: explicit_listen,
+                    public_addresses,
+                    upnp,
+                    lan_discovery,
+                    seeds: &seeds,
+                    rpc_listen: Some(rpc_listen),
+                },
+            )?;
+            if seeds.is_empty() {
+                tracing::warn!(
+                    "guardian mode: no .onion seed configured; this node can only be \
+                     reached, or reach peers it already knows"
+                );
+            }
+            tracing::info!(
+                socks = %settings.socks,
+                control = %settings.control,
+                "guardian mode (onion only): P2P listens only on the onion service's \
+                 loopback target, dials only through Tor's SOCKS port and announces only \
+                 its onion address; no DNS, AutoNAT, relay, DCUtR, UPnP or mDNS"
+            );
+        }
+        OnionMode::Additional => tracing::warn!(
+            "onion service in dual mode: this node stays on clearnet and keeps announcing \
+             its IP address under the same identity; the onion address adds a way in and \
+             does not hide this host (mode = \"guardian\" is onion only)"
+        ),
+    }
+    Ok(Some(settings))
+}
+
+/// The embedded DNS bootstrap names this node may resolve and dial. None for
+/// a guardian: resolving them would put the host on clearnet DNS, and it has
+/// no clearnet transport to dial the answers with.
+fn embedded_dns_seeds<'a>(
+    seeds: &'a [&'a str],
+    disabled: bool,
+    onion: Option<&jetsam_p2p::onion::OnionSettings>,
+) -> &'a [&'a str] {
+    if onion.is_some_and(|settings| settings.mode == jetsam_p2p::onion::OnionMode::Guardian) {
+        tracing::info!(
+            "guardian mode: the embedded DNS seeds are not used; only the configured \
+             .onion seeds are dialled"
+        );
+        return &[];
+    }
+    if disabled {
+        tracing::debug!("embedded DNS bootstrap disabled for isolated protocol test");
+        return &[];
+    }
+    seeds
+}
+
+#[cfg(test)]
+mod onion_startup_tests {
+    use super::*;
+    use jetsam_p2p::onion::{OnionConfig, OnionMode};
+
+    const ID: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead";
+
+    fn onion(mode: OnionMode) -> OnionConfig {
+        OnionConfig {
+            enabled: true,
+            mode,
+            ..OnionConfig::default()
+        }
+    }
+
+    fn addrs(texts: &[&str]) -> Vec<libp2p::Multiaddr> {
+        texts.iter().map(|text| text.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn onion_seeds_become_onion3_addresses_and_are_never_resolved() {
+        assert_eq!(
+            seed_to_multiaddr(&format!("{ID}.onion:9700"), 9700)
+                .unwrap()
+                .to_string(),
+            format!("/onion3/{ID}:9700")
+        );
+        assert_eq!(
+            seed_to_multiaddr(&format!("{ID}.onion"), 9701)
+                .unwrap()
+                .to_string(),
+            format!("/onion3/{ID}:9701")
+        );
+        let peer = libp2p::PeerId::random();
+        let explicit = format!("/onion3/{ID}:9700/p2p/{peer}");
+        assert_eq!(
+            seed_to_multiaddr(&explicit, 9700).unwrap().to_string(),
+            explicit
+        );
+        // An onion name handed to DNS is a query in clear naming the service.
+        for refused in [
+            format!("/dns/{ID}.onion/tcp/9700"),
+            format!("/dns4/{ID}.onion/tcp/9700"),
+            format!("/dnsaddr/{ID}.onion"),
+            format!("dnsaddr:{ID}.onion"),
+            "bad.onion:9700".to_string(),
+            "bad.onion".to_string(),
+            format!("{}.onion:9700", &ID[..55]),
+        ] {
+            assert!(
+                seed_to_multiaddr(&refused, 9700).is_err(),
+                "{refused} accepted"
+            );
+        }
+        // Clearnet seeds keep their forms.
+        assert_eq!(
+            seed_to_multiaddr("seed.example:9700", 9700)
+                .unwrap()
+                .to_string(),
+            "/dns/seed.example/tcp/9700"
+        );
+        assert_eq!(
+            seed_to_multiaddr("seed.example", 9700).unwrap().to_string(),
+            "/dns/seed.example/tcp/9700"
+        );
+    }
+
+    #[test]
+    fn a_disabled_or_dual_onion_section_refuses_nothing_a_node_did_before() {
+        let wildcard = addrs(&["/ip4/0.0.0.0/tcp/9700"]);
+        let public = addrs(&["/ip4/8.8.8.8/tcp/9700"]);
+        let seeds = vec!["seed.example:9700".to_string(), "not/a seed".to_string()];
+        let open_rpc: std::net::SocketAddr = "0.0.0.0:9701".parse().unwrap();
+        assert!(onion_startup(
+            &OnionConfig::default(),
+            &wildcard,
+            &public,
+            true,
+            true,
+            &seeds,
+            9700,
+            open_rpc
+        )
+        .unwrap()
+        .is_none());
+        // Even an invalid but disabled section.
+        let disabled = OnionConfig {
+            control: "192.168.1.2:9051".into(),
+            ..OnionConfig::default()
+        };
+        assert!(
+            onion_startup(&disabled, &wildcard, &public, true, true, &seeds, 9700, open_rpc)
+                .unwrap()
+                .is_none()
+        );
+        let dual = onion_startup(
+            &onion(OnionMode::Additional),
+            &wildcard,
+            &public,
+            true,
+            true,
+            &seeds,
+            9700,
+            open_rpc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dual.mode, OnionMode::Additional);
+    }
+
+    #[test]
+    fn a_guardian_refuses_to_start_on_every_clearnet_exposure() {
+        let rpc: std::net::SocketAddr = "127.0.0.1:9701".parse().unwrap();
+        let onion_seeds = vec![format!("{ID}.onion:9700"), format!("/onion3/{ID}:9701")];
+        let guardian = onion_startup(
+            &onion(OnionMode::Guardian),
+            &[],
+            &[],
+            false,
+            false,
+            &onion_seeds,
+            9700,
+            rpc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(guardian.mode, OnionMode::Guardian);
+
+        #[derive(Default)]
+        struct Exposure {
+            listen: Vec<libp2p::Multiaddr>,
+            public: Vec<libp2p::Multiaddr>,
+            upnp: bool,
+            lan: bool,
+            seeds: Vec<String>,
+            rpc: Option<std::net::SocketAddr>,
+        }
+        let with_onion_seeds = || Exposure {
+            seeds: onion_seeds.clone(),
+            ..Exposure::default()
+        };
+        let seeds = |seed: &str| Exposure {
+            seeds: vec![seed.to_string()],
+            ..Exposure::default()
+        };
+        let refusals = [
+            // UPnP is on by default: switching the mode on is not enough.
+            (
+                Exposure {
+                    upnp: true,
+                    ..with_onion_seeds()
+                },
+                "UPnP",
+            ),
+            (
+                Exposure {
+                    listen: addrs(&["/ip4/0.0.0.0/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "listener",
+            ),
+            (
+                Exposure {
+                    listen: addrs(&["/ip4/127.0.0.1/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "listener",
+            ),
+            (
+                Exposure {
+                    public: addrs(&["/ip4/8.8.8.8/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "public address",
+            ),
+            (
+                Exposure {
+                    lan: true,
+                    ..with_onion_seeds()
+                },
+                "LAN discovery",
+            ),
+            (seeds("seed.example:9700"), "seed"),
+            (seeds("seed.example"), "seed"),
+            (seeds("203.0.113.10:9700"), "seed"),
+            (seeds("[2001:db8::10]:9700"), "seed"),
+            (seeds("dnsaddr:seed.example"), "seed"),
+            (seeds("/not-a-protocol/1"), "seed"),
+            (
+                Exposure {
+                    rpc: Some("0.0.0.0:9701".parse().unwrap()),
+                    ..with_onion_seeds()
+                },
+                "JSON-RPC",
+            ),
+        ];
+        for (exposure, needle) in refusals {
+            let error = onion_startup(
+                &onion(OnionMode::Guardian),
+                &exposure.listen,
+                &exposure.public,
+                exposure.upnp,
+                exposure.lan,
+                &exposure.seeds,
+                9700,
+                exposure.rpc.unwrap_or(rpc),
+            )
+            .expect_err("a guardian with a clearnet exposure must not start");
+            let message = format!("{error:#}");
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        // A Tor that is not on this host is refused in either mode.
+        for mode in [OnionMode::Guardian, OnionMode::Additional] {
+            let remote = OnionConfig {
+                control: "192.168.1.2:9051".into(),
+                ..onion(mode)
+            };
+            assert!(onion_startup(&remote, &[], &[], false, false, &[], 9700, rpc).is_err());
+        }
+    }
+
+    #[test]
+    fn a_guardian_never_uses_the_embedded_dns_seeds() {
+        const SEEDS: &[&str] = &["seed1.example", "seed2.example"];
+        let settings = |mode| onion(mode).validate().unwrap().unwrap();
+        assert_eq!(embedded_dns_seeds(SEEDS, false, None), SEEDS);
+        assert!(embedded_dns_seeds(SEEDS, true, None).is_empty());
+        assert_eq!(
+            embedded_dns_seeds(SEEDS, false, Some(&settings(OnionMode::Additional))),
+            SEEDS
+        );
+        assert!(embedded_dns_seeds(SEEDS, false, Some(&settings(OnionMode::Guardian))).is_empty());
+    }
 }
 
 const SYSTEM_SEED_DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1946,7 +2285,14 @@ fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> 
     let protocol = match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(ip)) => format!("/ip4/{ip}"),
         Ok(std::net::IpAddr::V6(ip)) => format!("/ip6/{ip}"),
-        Err(_) => format!("/dns/{host}"),
+        // `<id>.onion:PORT` → `/onion3/<id>:PORT`, never `/dns/<id>.onion`.
+        Err(_) => match jetsam_p2p::onion::address::onion_host(host) {
+            Some(service) => {
+                let service = service.with_context(|| format!("invalid onion seed {addr:?}"))?;
+                return Ok(service.to_multiaddr(port)?);
+            }
+            None => format!("/dns/{host}"),
+        },
     };
     format!("{protocol}/tcp/{port}")
         .parse()
@@ -2704,6 +3050,35 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("--seed {raw_seed}"))?;
         cfg.network.seeds.push(ma.to_string());
     }
+    // D60: a guardian refuses here every setting that could expose its host
+    // on clearnet; its only P2P listener is the onion service's loopback
+    // target, bound by the network itself.
+    let listen_is_explicit = !cli.p2p_listen.is_empty()
+        || cfg
+            .network
+            .listen
+            .as_ref()
+            .is_some_and(|listen| !listen.as_slice().is_empty());
+    let onion = onion_startup(
+        &cfg.network.onion,
+        if listen_is_explicit {
+            listen_addrs.as_slice()
+        } else {
+            &[]
+        },
+        &public_p2p_addresses,
+        cfg.network.upnp && !cli.no_upnp,
+        cli.lan_discovery || cfg.network.lan_discovery,
+        &cfg.network.seeds,
+        net.default_p2p_port,
+        rpc_listen,
+    )?;
+    let (listen_addrs, listen_addr) = match onion.as_ref() {
+        Some(settings) if settings.mode == jetsam_p2p::onion::OnionMode::Guardian => {
+            (Vec::new(), settings.local_listen_multiaddr())
+        }
+        _ => (listen_addrs, listen_addr),
+    };
 
     let wallet_path = data_dir.join("wallet.key");
     // Read before anything can create it: this is the only moment at which the
@@ -2986,7 +3361,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("not asking the router for a port mapping (UPnP off)");
     }
-    let (p2p, mut p2p_task) = P2PNetwork::start(
+    let (p2p, mut p2p_task) = P2PNetwork::start_with_onion(
         listen_addrs.clone(),
         public_p2p_addresses,
         chain.clone(),
@@ -3000,6 +3375,7 @@ async fn main() -> anyhow::Result<()> {
         client_objects.clone().map(|objects| {
             objects as Arc<dyn jetsam_p2p::client_object_transport::ClientObjectSource>
         }),
+        onion.clone(),
     )
     .context("start P2P network")?;
     let p2p_health_rx = p2p.health_receiver();
@@ -3008,12 +3384,7 @@ async fn main() -> anyhow::Result<()> {
     // Dial seeds: CLI seeds + config seeds + the embedded DNS bootstrap set.
     // Isolated release-binary protocol tests disable only the final source;
     // explicit loopback seeds still exercise the normal P2P dial path.
-    let dns_seeds = if cli.disable_dns_seeds {
-        tracing::debug!("embedded DNS bootstrap disabled for isolated protocol test");
-        &[][..]
-    } else {
-        net.dns_seeds
-    };
+    let dns_seeds = embedded_dns_seeds(net.dns_seeds, cli.disable_dns_seeds, onion.as_ref());
     let mut registered_seed_addrs = std::collections::HashSet::new();
     for seed_addr in &cfg.network.seeds {
         let ma = seed_to_multiaddr(seed_addr, net.default_p2p_port);
