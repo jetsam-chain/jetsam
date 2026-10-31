@@ -596,6 +596,8 @@ impl TemplateBuilder {
                 crate::guardian_slot::plan_guardian_offer(
                     state,
                     &guardian_rules,
+                    child_height,
+                    &snapshot,
                     candidates,
                     &anchor_ok,
                     &offer.section_for(&offer.payment_order()),

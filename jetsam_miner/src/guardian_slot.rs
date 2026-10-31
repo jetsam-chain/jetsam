@@ -26,7 +26,7 @@ use jetsam_chain::consensus::guardian::{
     GuardianState, RewardFund,
 };
 use jetsam_chain::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
-use jetsam_mempool::guardian::{project, HeldGuardian};
+use jetsam_mempool::guardian::{apply_guardian_intent, project, HeldGuardian, Signatures};
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{PagedSpendIntent, Transaction};
 
@@ -92,14 +92,18 @@ fn funder(held: &HeldGuardian) -> Option<Address> {
         .map(|fund| fund.funder)
 }
 
-/// What the next block after a branch in `state` offers, from the intents
-/// the pool holds (`candidates`, in its order: the equivocation, the
-/// attestation, the delegation objects by arrival), after the `destination`
-/// objects already in its section. `anchor_ok` says whether a transaction's
-/// epoch anchor is minable in that block.
+/// What the block at `height` after a branch in `state` (the branch
+/// `branch`) offers, from the intents the pool holds (`candidates`, in its
+/// order: the equivocation, the attestation, the delegation objects by
+/// arrival), after the `destination` objects already in its section, each
+/// only if the pool's judge takes it after those placed before it (A3-7).
+/// `anchor_ok` says whether a transaction's epoch anchor is minable in that
+/// block.
 pub fn plan_guardian_offer(
     state: &GuardianState,
     rules: &GuardianRules,
+    height: u64,
+    branch: &dyn GuardianBranch,
     candidates: Vec<HeldGuardian>,
     anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
     destination: &DestinationSection,
@@ -148,6 +152,11 @@ pub fn plan_guardian_offer(
         }
     };
     let mut offer = GuardianOffer::default();
+    // A3-7: each object as the pool's judge takes it after those placed
+    // before it (signatures aside: verified at admission), so that none is
+    // offered beside one that voids it (an attestation after the
+    // equivocation that revokes the key, A-3).
+    let (mut projected, _) = project(state, height, std::iter::empty(), branch, rules);
     for held in ordered {
         if offer.held.len() >= budget {
             break;
@@ -156,9 +165,24 @@ pub fn plan_guardian_offer(
         if bytes + len > MAX_DESTINATION_SECTION_BYTES {
             continue;
         }
+        if apply_guardian_intent(
+            &mut projected,
+            height,
+            &held.group,
+            &held.intent.object,
+            branch,
+            rules,
+            Signatures::Defer,
+        )
+        .is_err()
+        {
+            continue;
+        }
         bytes += len;
         offer.held.push(held);
     }
+    // Before the latch nothing else a block may carry depends on a funding
+    // (the delegation objects wait for the latch): a half pair leaves alone.
     if !latched {
         let has = |fund: Address| offer.held.iter().any(|held| funder(held) == Some(fund));
         if !(has(rules.network_fund) && has(rules.lab_fund)) {

@@ -92,7 +92,9 @@ fn attestation_of(height: u64) -> GuardianObject {
         height,
         block_id: [height as u8; 32],
         cum_work: [0u8; 32],
-        headers_digest: [0u8; 32],
+        headers_digest: jetsam_chain::consensus::guardian::headers_digest(&std::array::from_fn(
+            |i| [(height - 7 + i as u64) as u8; 32],
+        )),
         anchor_root: [0u8; 32],
         deposit_root: [0u8; 32],
         deposit_count: 0,
@@ -184,6 +186,19 @@ fn any_anchor(_: &[u8; 32]) -> bool {
 /// A branch no attestation of these tests reads.
 struct NoBranch;
 
+/// The branch the attestations of these tests attest: block `h` has the id
+/// `[h as u8; 32]` and no work.
+struct TestBranch;
+
+impl GuardianBranch for TestBranch {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        Some([height as u8; 32])
+    }
+    fn chain_work(&self, _: u64) -> Option<[u8; 32]> {
+        Some([0u8; 32])
+    }
+}
+
 impl GuardianBranch for NoBranch {
     fn block_id(&self, _: u64) -> Option<[u8; 32]> {
         None
@@ -243,6 +258,8 @@ fn template_includes_valid_equivocation() {
     let offer = plan_guardian_offer(
         &latched(),
         &rules(),
+        height,
+        &TestBranch,
         candidates,
         &any_anchor,
         &DestinationSection::default(),
@@ -266,6 +283,8 @@ fn template_includes_valid_equivocation() {
     let bad = plan_guardian_offer(
         &latched(),
         &rules(),
+        height,
+        &TestBranch,
         vec![held(7, PAYER, forged.object(), &[]), lock(8)],
         &any_anchor,
         &DestinationSection::default(),
@@ -287,7 +306,15 @@ fn template_includes_valid_equivocation() {
 fn template_includes_pre_latch_funding_only_in_pairs() {
     let dormant = GuardianState::at_v1_7(10);
     let plan = |state: &GuardianState, candidates, destination: &DestinationSection| {
-        plan_guardian_offer(state, &rules(), candidates, &any_anchor, destination)
+        plan_guardian_offer(
+            state,
+            &rules(),
+            JD + 1,
+            &TestBranch,
+            candidates,
+            &any_anchor,
+            destination,
+        )
     };
     let none = DestinationSection::default();
     let alone = plan(
@@ -372,11 +399,20 @@ fn guardian_objects_follow_destination_within_the_section_budget() {
     let thirty = DestinationSection {
         objects: vec![payload(8); 30],
     };
-    let offer = plan_guardian_offer(&latched(), &rules(), candidates(), &any_anchor, &thirty);
+    let height = J + 200;
+    let offer = plan_guardian_offer(
+        &latched(),
+        &rules(),
+        height,
+        &TestBranch,
+        candidates(),
+        &any_anchor,
+        &thirty,
+    );
     assert_eq!(
         offer.seqs(),
-        vec![0, 1],
-        "32 objects in all, in the order of §10"
+        vec![0, 2],
+        "32 objects in all, in the order of §10 (A3-7: not the attestation the equivocation voids)"
     );
     // A section almost full of bytes: the equivocation (1 025 B) waits,
     // the attestation (512 B) and the locks (40 B) do not.
@@ -388,12 +424,22 @@ fn guardian_objects_follow_destination_within_the_section_budget() {
         destination_section_wire_len(&full),
         MAX_DESTINATION_SECTION_BYTES - room
     );
-    let offer = plan_guardian_offer(&latched(), &rules(), candidates(), &any_anchor, &full);
+    let offer = plan_guardian_offer(
+        &latched(),
+        &rules(),
+        height,
+        &TestBranch,
+        candidates(),
+        &any_anchor,
+        &full,
+    );
     assert_eq!(offer.seqs(), vec![1, 2, 3]);
     // An anchor the block cannot carry.
     let offer = plan_guardian_offer(
         &latched(),
         &rules(),
+        height,
+        &TestBranch,
         candidates(),
         &|anchor: &[u8; 32]| *anchor != ANCHOR,
         &DestinationSection::default(),
@@ -459,4 +505,43 @@ fn a_refused_block_blames_only_its_refused_guardian_objects() {
         &rules()
     )
     .is_empty());
+}
+
+/// A3-7: an equivocation and an attestation held together — the
+/// equivocation revokes the key, so the attestation it voids is not offered
+/// beside it (A-3): the block carries the equivocation and is valid, instead
+/// of being refused and built without any guardian object. Alone, the same
+/// attestation is offered.
+#[test]
+fn template_carries_the_equivocation_not_the_attestation_it_voids() {
+    let height = J + 200;
+    let plan = |candidates| {
+        plan_guardian_offer(
+            &latched(),
+            &rules(),
+            height,
+            &TestBranch,
+            candidates,
+            &any_anchor,
+            &DestinationSection::default(),
+        )
+    };
+    let attestation = || held(1, PAYER, attestation_of(J + 100), &[]);
+    assert_eq!(
+        kinds(&plan(vec![attestation()])),
+        vec![GuardianObjectKind::Attestation],
+        "alone, the attestation is offered"
+    );
+    let offer = plan(vec![
+        held(0, PAYER, valid_equivocation(), &[]),
+        attestation(),
+        lock(2),
+    ]);
+    assert_eq!(
+        kinds(&offer),
+        vec![GuardianObjectKind::Equivocation, GuardianObjectKind::StakeLock]
+    );
+    let after = apply_block_guardian(&latched(), &context(height, &offer), &TestBranch, &rules())
+        .expect("the block carries the equivocation and is valid");
+    assert_eq!(after.revoked_at, Some(height));
 }
