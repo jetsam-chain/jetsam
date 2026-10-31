@@ -110,6 +110,21 @@ pub const L1_MAINNET: L1Network = L1Network {
     gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
 };
 
+/// The rehearsal's synthetic L1 (`rehearsal_l1`, A3-8): genesis validators
+/// root `sha256("jetsam-v17-rehearsal/synthetic-l1/genesis-validators-root")`
+/// (checked by a test), the main network's Fulu epoch and versions. Read only
+/// by `rehearsal-v1-7` builds.
+pub const L1_REHEARSAL: L1Network = L1Network {
+    genesis_validators_root: [
+        0xc3, 0x5c, 0x80, 0x53, 0xc5, 0x3f, 0xe0, 0x59, 0xe4, 0x4b, 0xdd, 0xcc, 0x4a, 0x86, 0xf0,
+        0x73, 0x7a, 0xda, 0x23, 0x7d, 0xc1, 0x47, 0x48, 0x60, 0xf6, 0xe2, 0x1f, 0x73, 0x81, 0xe2,
+        0xdb, 0xdb,
+    ],
+    fulu_fork_epoch: 411_392,
+    fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
+    gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
+};
+
 /// Why a format cannot be read on a network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForkTableError {

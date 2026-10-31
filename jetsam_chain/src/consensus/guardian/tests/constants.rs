@@ -355,6 +355,13 @@ fn guardian_rules_current_are_this_builds_constants() {
     #[cfg(not(feature = "testnet"))]
     assert_eq!(GUARDIAN_L1_CHAIN_ID, 1);
     // The bridge address is frozen with the contract (T8.3); until then no
-    // statement can name it.
+    // statement can name it on the public and test networks. The rehearsal
+    // names its synthetic L1's bridge (A3-8).
+    #[cfg(not(feature = "rehearsal-v1-7"))]
     assert_eq!(GUARDIAN_L1_BRIDGE, None);
+    #[cfg(feature = "rehearsal-v1-7")]
+    assert_eq!(
+        GUARDIAN_L1_BRIDGE,
+        Some(crate::consensus::destination::state::REHEARSAL_L1_BRIDGE.address)
+    );
 }

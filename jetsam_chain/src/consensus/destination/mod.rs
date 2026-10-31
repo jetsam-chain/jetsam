@@ -30,6 +30,9 @@ pub mod forks;
 pub mod l1_read;
 pub mod light_client;
 pub mod mpt;
+/// **Private builds only**: the rehearsal's synthetic L1 (A3-8, T7.2).
+#[cfg(feature = "rehearsal-v1-7")]
+pub mod rehearsal_l1;
 pub mod ssz;
 pub mod state;
 

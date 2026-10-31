@@ -44,7 +44,7 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
 
 use super::bls::{committee_keys, CommitteeKeys};
-use super::forks::{period_of_slot, L1Network, L1_MAINNET};
+use super::forks::{period_of_slot, L1Network};
 use super::l1_read::{read_account, verify_withdrawal, L1BridgeParams, L1ReadError};
 use super::light_client::{
     verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
@@ -88,14 +88,58 @@ pub struct L1Anchor {
     pub committee_root: Root,
 }
 
-/// The anchor of this build: none on every profile until the bridge's
-/// genesis is fixed (T8.3 public, P9 test network, T7.2 rehearsal). While it
-/// is `None`, every committee update is refused, so no release is possible.
+/// The anchor of this build: none on the public and test networks until the
+/// bridge's genesis is fixed (T8.3 public, P9 test network). While it is
+/// `None`, every committee update is refused, so no release is possible.
+#[cfg(not(feature = "rehearsal-v1-7"))]
 pub const L1_ANCHOR: Option<L1Anchor> = None;
+/// **Private builds only** (`rehearsal-v1-7`, A3-8): the synthetic L1's.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const L1_ANCHOR: Option<L1Anchor> = Some(REHEARSAL_L1_ANCHOR);
 
-/// The bridge contract of this build (address, code hash, slot 9): none
-/// until T8.3 (DECISIONS 29/10). While it is `None`, no release is possible.
+/// The rehearsal's anchor: period 2 000 and the root of the synthetic L1's
+/// committee of that period (`rehearsal_l1::anchor`, checked by a test).
+pub const REHEARSAL_L1_ANCHOR: L1Anchor = L1Anchor {
+    period: 2_000,
+    committee_root: [
+        0xa2, 0x44, 0xce, 0xe5, 0xdc, 0x42, 0x97, 0x51, 0x0c, 0x91, 0x82, 0xaf, 0x45, 0x8d, 0x69,
+        0x61, 0xbe, 0x08, 0x32, 0x0f, 0xa0, 0x04, 0x0d, 0xe0, 0x32, 0xbe, 0x41, 0xbd, 0x87, 0x37,
+        0xb9, 0xe8,
+    ],
+};
+/// The rehearsal's bridge contract on the synthetic L1: a fixed, documented
+/// address `keccak("jetsam-v17-rehearsal/synthetic-l1/bridge-address")[12..]`
+/// and code hash `keccak("…/bridge-runtime-code")` (no local devnet address
+/// exists to take, T0.7 not built), slot 9 (`rehearsal_l1::bridge_params`,
+/// checked by a test).
+pub const REHEARSAL_L1_BRIDGE: L1BridgeParams = L1BridgeParams {
+    address: [
+        0xee, 0x8b, 0x5f, 0xca, 0x07, 0x23, 0x82, 0x78, 0x19, 0x99, 0x79, 0x8c, 0xf9, 0xd7, 0xc5,
+        0xb3, 0xf6, 0xc6, 0x3e, 0x2f,
+    ],
+    code_hash: [
+        0xa3, 0x9d, 0xc0, 0x1e, 0x1f, 0x92, 0x68, 0xbc, 0xd0, 0x3c, 0x0e, 0x47, 0xf3, 0x11, 0x64,
+        0x99, 0xba, 0x1b, 0x5f, 0x1e, 0x21, 0xb6, 0x97, 0xdb, 0x2d, 0xb4, 0x64, 0x05, 0x5f, 0x46,
+        0x62, 0x3c,
+    ],
+    withdrawals_slot: 9,
+};
+/// The L1 the light client reads: the L1's main network, except on the
+/// rehearsal profile, whose L1 is synthetic (its own genesis validators root).
+#[cfg(not(feature = "rehearsal-v1-7"))]
+pub const L1_NETWORK: L1Network = super::forks::L1_MAINNET;
+/// **Private builds only** (`rehearsal-v1-7`, A3-8).
+#[cfg(feature = "rehearsal-v1-7")]
+pub const L1_NETWORK: L1Network = super::forks::L1_REHEARSAL;
+
+/// The bridge contract of this build (address, code hash, slot 9): none on
+/// the public and test networks until T8.3 (DECISIONS 29/10). While it is
+/// `None`, no release is possible.
+#[cfg(not(feature = "rehearsal-v1-7"))]
 pub const L1_BRIDGE: Option<L1BridgeParams> = None;
+/// **Private builds only** (`rehearsal-v1-7`, A3-8): the synthetic L1's.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const L1_BRIDGE: Option<L1BridgeParams> = Some(REHEARSAL_L1_BRIDGE);
 
 /// The destination rules: the v1.7 clock, the L1, its anchor, the bridge
 /// contract, the vault gate.
@@ -112,7 +156,7 @@ impl DestinationRules {
     /// This build's consensus rules.
     pub const CONSENSUS: Self = Self {
         activation_height: V1_7_ACTIVATION_HEIGHT,
-        network: L1_MAINNET,
+        network: L1_NETWORK,
         anchor: L1_ANCHOR,
         bridge: L1_BRIDGE,
         vault: VaultRules::current(),

@@ -36,6 +36,9 @@ pub mod attestation;
 pub mod block;
 pub mod equivocation;
 pub mod persist;
+/// **Private builds only**: the rehearsal's test-key signer (A3-8, T7.2).
+#[cfg(feature = "rehearsal-v1-7")]
+pub mod rehearsal;
 pub mod reward;
 pub mod snapshot;
 pub mod stake;
@@ -146,9 +149,15 @@ pub const GUARDIAN_L1_CHAIN_ID: u64 = 11_155_111;
 pub const GUARDIAN_L1_CHAIN_ID: u64 = 31_337;
 
 /// The bridge contract (word 3 of an attestation): fixed with the contract's
-/// CREATE2 address (T8.3, and T7.2 for the rehearsal). Until then no
-/// attestation can name it, so none is accepted.
+/// CREATE2 address (T8.3). Until then no attestation can name it, so none is
+/// accepted on the public and test networks.
+#[cfg(not(feature = "rehearsal-v1-7"))]
 pub const GUARDIAN_L1_BRIDGE: Option<[u8; 20]> = None;
+/// **Private builds only** (`rehearsal-v1-7`, A3-8): the synthetic L1's
+/// bridge, the one the destination rules read releases from.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const GUARDIAN_L1_BRIDGE: Option<[u8; 20]> =
+    Some(crate::consensus::destination::state::REHEARSAL_L1_BRIDGE.address);
 
 /// The network a statement names (word 1): this profile's genesis block id.
 pub fn network_id() -> [u8; 32] {

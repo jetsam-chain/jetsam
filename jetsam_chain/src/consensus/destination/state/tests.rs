@@ -17,7 +17,7 @@ use blst::min_pk::{AggregateSignature, SecretKey, Signature};
 use super::*;
 use crate::consensus::destination::bls::sync_committee_domain;
 use crate::consensus::destination::forks::{
-    LightClientFormat, FULU_GINDICES, SLOTS_PER_SYNC_COMMITTEE_PERIOD,
+    LightClientFormat, FULU_GINDICES, L1_MAINNET, SLOTS_PER_SYNC_COMMITTEE_PERIOD,
 };
 use crate::consensus::destination::l1_read::withdrawal_commitment;
 use crate::consensus::destination::ssz::{
@@ -357,8 +357,23 @@ fn anchor_update_brings_the_anchor_committee() {
         validate_block_destination(&b, &parent, &unanchored, &CommitteeKeyCache::default()),
         Err(DestinationBlockError::AnchorUnset)
     );
-    assert_eq!(DestinationRules::CONSENSUS.anchor, None);
-    assert_eq!(DestinationRules::CONSENSUS.bridge, None);
+    // The public and test networks: no anchor, no bridge, the L1's main
+    // network (the rehearsal's synthetic L1: `rehearsal_l1` tests, A3-8).
+    #[cfg(not(feature = "rehearsal-v1-7"))]
+    {
+        assert_eq!(DestinationRules::CONSENSUS.anchor, None);
+        assert_eq!(DestinationRules::CONSENSUS.bridge, None);
+        assert_eq!(DestinationRules::CONSENSUS.network, L1_MAINNET);
+        assert_eq!((L1_ANCHOR, L1_BRIDGE), (None, None));
+    }
+    #[cfg(feature = "rehearsal-v1-7")]
+    assert_eq!(
+        (
+            DestinationRules::CONSENSUS.anchor,
+            DestinationRules::CONSENSUS.bridge
+        ),
+        (Some(REHEARSAL_L1_ANCHOR), Some(REHEARSAL_L1_BRIDGE))
+    );
 }
 
 #[test]
