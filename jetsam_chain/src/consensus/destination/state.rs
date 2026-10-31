@@ -671,10 +671,12 @@ pub enum DestinationBlockError {
 
 impl DestinationBlockError {
     /// Whether this refusal proves the **block** invalid rather than the
-    /// bytes a peer served or this node's own state. Until the condemnation
-    /// path is wired (T7.1, `main.rs`), nothing condemns a header.
+    /// bytes a peer served or this node's own state (A2 M3): only a vault
+    /// refusal of committed content ([`VaultError::condemns_block`]). The
+    /// light client, the account proof and the objects read the uncommitted
+    /// section; a missing key or state is this node's own fault.
     pub fn condemns_block(&self) -> bool {
-        false
+        matches!(self, Self::Vault(error) if error.condemns_block())
     }
 }
 

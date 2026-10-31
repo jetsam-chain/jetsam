@@ -843,6 +843,34 @@ pub fn validate_block_vault(
     Ok(effect)
 }
 
+impl VaultError {
+    /// Whether this refusal proves the **block** invalid rather than the
+    /// section bytes a peer served for it (A2 M3). These are decided by the
+    /// block's transactions (its header commits to them) and the branch's
+    /// state alone; a release's `n` is in clear in its committed marker, so a
+    /// paid or repeated `n` is too. A refusal that reads the section (the
+    /// objects matching the markers, a storage proof) never condemns.
+    pub fn condemns_block(&self) -> bool {
+        matches!(
+            self,
+            Self::MarkerInSystemRecord
+                | Self::MarkerCarriesValue { .. }
+                | Self::SpendFromLockedAddress { .. }
+                | Self::ReleaseShape { .. }
+                | Self::ReleaseMarkerOutsideRelease { .. }
+                | Self::ReleaseSpendsPreV1_7Slot { .. }
+                | Self::VaultOutputOutsideDeposit { .. }
+                | Self::VaultOutputInSystemRecord
+                | Self::DepositBeforeBridgeOpening { .. }
+                | Self::VaultCeilingReached { .. }
+                | Self::DepositShape { .. }
+                | Self::DepositAmount { .. }
+                | Self::TooManyReleases { .. }
+                | Self::ReleaseAlreadyPaid { .. }
+        )
+    }
+}
+
 /// Mempool and relay policy for one plain logical transaction offered for the
 /// block at `next_height`: from the v1.7 height on, it cannot spend from the
 /// vault (a release travels with its object, never alone), cannot carry a

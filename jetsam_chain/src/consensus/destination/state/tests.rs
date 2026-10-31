@@ -1363,3 +1363,85 @@ fn snapshot_with_a_foreign_anchor_update_is_refused() {
         })
     );
 }
+
+/// A2 M3 (T7.1): a vault refusal that only the block's transactions and the
+/// branch's state decide condemns the block (its header commits to them,
+/// whatever section bytes a relay served); a refusal that reads the
+/// uncommitted section (object counts, decodings, proofs, signatures) or
+/// this node's own state never does.
+#[test]
+fn only_destination_refusals_of_committed_content_condemn_the_block() {
+    use crate::consensus::destination::l1_read::L1ReadError;
+    use crate::consensus::destination::light_client::LightClientError;
+    use crate::consensus::destination::DestinationError;
+    let committed = [
+        VaultError::MarkerInSystemRecord,
+        VaultError::MarkerCarriesValue { group: 1 },
+        VaultError::SpendFromLockedAddress { group: 1 },
+        VaultError::ReleaseShape { group: 1 },
+        VaultError::ReleaseMarkerOutsideRelease { group: 1 },
+        VaultError::ReleaseSpendsPreV1_7Slot { group: 1 },
+        VaultError::VaultOutputOutsideDeposit { group: 1 },
+        VaultError::VaultOutputInSystemRecord,
+        VaultError::DepositBeforeBridgeOpening {
+            group: 1,
+            height: 9,
+            opening: 10,
+        },
+        VaultError::VaultCeilingReached {
+            group: 1,
+            locked: 1,
+            amount: 2,
+            ceil: 2,
+        },
+        VaultError::DepositShape { group: 1 },
+        VaultError::DepositAmount { group: 1, amount: 1 },
+        VaultError::TooManyReleases { count: 5, max: 4 },
+        VaultError::ReleaseAlreadyPaid { n: 3 },
+    ];
+    for error in committed {
+        assert!(error.condemns_block(), "{error:?} judges committed content");
+        assert!(
+            DestinationBlockError::Vault(error.clone()).condemns_block(),
+            "{error:?} through the destination rules"
+        );
+    }
+    let uncommitted = [
+        VaultError::PageStream,
+        VaultError::ReleasesDoNotMatchMarkers,
+        VaultError::NotProvenOnL1 {
+            n: 3,
+            error: L1ReadError::CodeHashMismatch,
+        },
+    ];
+    for error in uncommitted {
+        assert!(!error.condemns_block(), "{error:?} may be a relay's bytes");
+        assert!(!DestinationBlockError::Vault(error).condemns_block());
+    }
+    for error in [
+        DestinationBlockError::LightClient(LightClientError::HeaderFormat),
+        DestinationBlockError::BridgeAccount(L1ReadError::CodeHashMismatch),
+        DestinationBlockError::TooManyObjects {
+            kind: DestinationObjectKind::FinalityUpdate,
+        },
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::VaultRelease,
+        },
+        DestinationBlockError::ObjectsDoNotMatchMarkers,
+        DestinationBlockError::FinalityMissing,
+        DestinationBlockError::UnusedFinality,
+        DestinationBlockError::NoCommitteeKnown,
+        DestinationBlockError::CommitteeKeysUnavailable { root: [7; 32] },
+        DestinationBlockError::StateNotParent { tip: 1, height: 3 },
+    ] {
+        assert!(!error.condemns_block(), "{error:?} never condemns");
+    }
+    for error in [
+        DestinationError::SectionBeforeActivation,
+        DestinationError::SectionMissing,
+        DestinationError::SectionOverBudget { len: 2, max: 1 },
+        DestinationError::TooManyObjects { count: 2, max: 1 },
+    ] {
+        assert!(!error.condemns_block(), "{error:?}: the section is not committed");
+    }
+}

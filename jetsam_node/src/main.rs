@@ -5475,19 +5475,24 @@ fn exact_suffix_context_error_is_body_peer_fault(
 }
 
 /// Whether a failure to apply a body under a verified terminal proves the
-/// block itself invalid (M3.10): a native v1.5 client-object rule refusing
-/// what the header commits to. Anything else under a verified terminal may be
-/// a relay's corrupted bytes for an honest header, and condemns only the
-/// source.
+/// block itself invalid (M3.10): a native v1.5 client-object rule, or a v1.7
+/// destination or guardian rule (A2 M3, A3-3), refusing what the header
+/// commits to. Anything else under a verified terminal may be a relay's
+/// corrupted bytes for an honest header, and condemns only the source.
 fn exact_suffix_context_error_condemns_block(
     error: &jetsam_chain::storage::MdbxContextError,
 ) -> bool {
-    matches!(
-        error,
-        jetsam_chain::storage::MdbxContextError::Consensus(
-            jetsam_chain::consensus::ConsensusError::ClientObject(error)
-        ) if error.condemns_block()
-    )
+    use jetsam_chain::consensus::ConsensusError;
+    let jetsam_chain::storage::MdbxContextError::Consensus(error) = error else {
+        return false;
+    };
+    match error {
+        ConsensusError::ClientObject(error) => error.condemns_block(),
+        ConsensusError::Destination(error) => error.condemns_block(),
+        ConsensusError::DestinationBlock(error) => error.condemns_block(),
+        ConsensusError::Guardian(error) => error.condemns_block(),
+        _ => false,
+    }
 }
 
 /// A block proved invalid (M3.10) leaves the HeaderDAG with its descendants
@@ -20227,6 +20232,51 @@ mod condemned_block_tests {
         assert!(!invalid.is_terminal_fault());
         assert_eq!(ExactSuffixApplyError::body(peer, "x").condemned_block(), None);
         assert_eq!(ExactSuffixApplyError::terminal(peer, "x").condemned_block(), None);
+    }
+
+    /// A2 M3, A3-3 (T7.1): a v1.7 destination or guardian rule refusing
+    /// committed content condemns the block like a client-object rule; a
+    /// refusal that may come from a relay's section bytes, or from this
+    /// node's own state, condemns only the source.
+    #[test]
+    fn a_v1_7_refusal_of_committed_content_condemns_the_block() {
+        use jetsam_chain::consensus::destination::state::DestinationBlockError;
+        use jetsam_chain::consensus::destination::DestinationError;
+        use jetsam_chain::consensus::guardian::GuardianError;
+        use jetsam_chain::consensus::vault::VaultError;
+        let refused = MdbxContextError::Consensus;
+        for error in [
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::SpendFromLockedAddress { group: 0 },
+            )),
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::ReleaseAlreadyPaid { n: 4 },
+            )),
+            ConsensusError::Guardian(GuardianError::GuardianKeyRevoked),
+            ConsensusError::Guardian(GuardianError::MarkerInSystemRecord),
+        ] {
+            assert!(
+                exact_suffix_context_error_condemns_block(&refused(error.clone())),
+                "{error:?} condemns the block"
+            );
+        }
+        for error in [
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::ReleasesDoNotMatchMarkers,
+            )),
+            ConsensusError::DestinationBlock(DestinationBlockError::ObjectsDoNotMatchMarkers),
+            ConsensusError::DestinationBlock(DestinationBlockError::CommitteeKeysUnavailable {
+                root: [1; 32],
+            }),
+            ConsensusError::Destination(DestinationError::SectionMissing),
+            ConsensusError::Guardian(GuardianError::ObjectsDoNotMatchMarkers),
+            ConsensusError::Guardian(GuardianError::BranchUnavailable { height: 9 }),
+        ] {
+            assert!(
+                !exact_suffix_context_error_condemns_block(&refused(error.clone())),
+                "{error:?} condemns only the source"
+            );
+        }
     }
 
     use jetsam_chain::consensus::client_objects::{
