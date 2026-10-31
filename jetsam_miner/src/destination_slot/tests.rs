@@ -482,7 +482,9 @@ fn template_rebuilds_without_invalid_destination_objects() {
         committee_update: None,
         ..both.clone()
     };
-    let blame = |error: DestinationBlockError, offer: &DestinationOffer| culprits_of(&error, offer);
+    let blame = |error: DestinationBlockError, offer: &DestinationOffer| {
+        culprits_of(&error, offer, &rules().vault)
+    };
     assert_eq!(
         blame(
             DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
@@ -599,7 +601,7 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
     };
     let run = |offer: &DestinationOffer, error: DestinationBlockError, bad: &[u64]| {
         let mut tried = Vec::new();
-        let (built, blamed) = retry_without_culprits(offer, &error, |reduced| {
+        let (built, blamed) = retry_without_culprits(offer, &error, &rules().vault, |reduced| {
             tried.push(ns(reduced));
             judge(bad, reduced)
         });
@@ -662,10 +664,92 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
 
     // The reduced block refused for another reason: the tries end there.
     let mut tried = 0;
-    let (built, blamed) = retry_without_culprits(&offer, &not_proven(1), |_| {
+    let (built, blamed) = retry_without_culprits(&offer, &not_proven(1), &rules().vault, |_| {
         tried += 1;
         Err::<(), _>(None)
     });
     assert_eq!((built, tried), (None, 1));
     assert_eq!(blamed.releases, vec![1]);
+}
+
+/// A2-M2: a block refused by the vault gate for the group of a committee
+/// update's payment (it pays the vault, carries a deposit marker, a marker
+/// with value, spends from the vault) blames that update — the block is
+/// built again with the releases only — while a committee update whose
+/// payment pays no vault is never blamed for another group's vault fault (a
+/// plain deposit over the ceiling). (The admission half of A2-M2 is the
+/// test of the same name in `jetsam_mempool::pool`.)
+#[test]
+fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_template() {
+    let payload = update_for(1_895);
+    let marker = committee_update_marker(&payload);
+    let paying = |owner: Address, outputs: &[(Address, u64)]| CommitteeUpdateIntent {
+        payment: page(owner, 100, outputs, 50_000),
+        payload: payload.clone(),
+    };
+    let honest = committee(1_895);
+    let releases = vec![release(1, 5 * MICRO_PER_JTM), release(2, 5 * MICRO_PER_JTM)];
+    for (update, error) in [
+        (
+            paying(Address([0x51; 32]), &[(VAULT_ADDRESS, 10), (marker, 0)]),
+            VaultError::VaultOutputOutsideDeposit { group: 3 },
+        ),
+        (
+            paying(
+                Address([0x51; 32]),
+                &[(deposit_marker(&[0x42; 20]), 0), (marker, 0)],
+            ),
+            VaultError::DepositShape { group: 0 },
+        ),
+        (
+            paying(Address([0x51; 32]), &[(marker, 7)]),
+            VaultError::MarkerCarriesValue { group: 1 },
+        ),
+        (
+            paying(VAULT_ADDRESS, &[(marker, 0)]),
+            VaultError::SpendFromLockedAddress { group: 2 },
+        ),
+    ] {
+        let offer = DestinationOffer {
+            committee_update: Some(update),
+            releases: releases.clone(),
+        };
+        let error = DestinationBlockError::Vault(error);
+        assert_eq!(
+            culprits_of(&error, &offer, &rules().vault),
+            Culprits {
+                releases: Vec::new(),
+                committee_update: true
+            },
+            "{error:?}"
+        );
+        let (built, blamed) = retry_without_culprits(&offer, &error, &rules().vault, |reduced| {
+            judge(&[], reduced)
+        });
+        assert_eq!(built, Some((vec![1, 2], false)), "the releases stay");
+        assert!(blamed.committee_update);
+    }
+    let innocent = DestinationOffer {
+        committee_update: Some(honest),
+        releases,
+    };
+    for error in [
+        VaultError::VaultCeilingReached {
+            group: 4,
+            locked: VAULT_OUTSTANDING_CEIL_MICRO,
+            amount: MICRO_PER_JTM,
+            ceil: VAULT_OUTSTANDING_CEIL_MICRO,
+        },
+        VaultError::VaultOutputOutsideDeposit { group: 4 },
+    ] {
+        assert_eq!(
+            culprits_of(
+                &DestinationBlockError::Vault(error),
+                &innocent,
+                &rules().vault
+            ),
+            Culprits::default(),
+            "another group's fault"
+        );
+    }
 }

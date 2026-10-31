@@ -33,11 +33,14 @@ use jetsam_chain::consensus::destination::state::{
     CommitteeKeyCache, CommitteeRef, DestinationBlockError, DestinationRules,
 };
 use jetsam_chain::consensus::destination::{DestinationObject, DestinationObjectKind};
-use jetsam_chain::consensus::vault::{decode_proof_nodes, destination_marker_kind, VaultRelease};
+use jetsam_chain::consensus::vault::{
+    decode_proof_nodes, destination_marker_kind, DestinationMarkerKind, VaultError, VaultRelease,
+    VaultRules,
+};
 use jetsam_chain::consensus::wire_limits::{
     MAX_DESTINATION_SECTION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
 };
-use jetsam_tx::PagedSpendIntent;
+use jetsam_tx::{PagedSpendIntent, TxPage};
 
 /// First bytes of an encoded destination intent.
 pub const DESTINATION_INTENT_MAGIC: [u8; 8] = *b"JTMDIN01";
@@ -346,6 +349,47 @@ pub fn verify_destination_intent(
             keys,
         ),
     }
+}
+
+/// A2-M2: the vault rules of a transaction that pays for an object other
+/// than a release (a committee update's, a v1.5 client object's, a guardian
+/// object's), as the vault gate judges its group: what
+/// [`check_plain_vault_transaction`] asks of a plain transaction — no spend
+/// from the vault (V1), no destination marker carrying value, no release
+/// marker, no output to the vault and no deposit marker (V4: an object
+/// payment is never a deposit, its own marker beside a deposit marker being
+/// two markers in one group, M-3) — a committee-update marker aside (the
+/// update's own, which the intent's decoding pins). The caller applies it
+/// from J on.
+///
+/// [`check_plain_vault_transaction`]: jetsam_chain::consensus::vault::check_plain_vault_transaction
+pub fn check_object_payment_vault(pages: &[TxPage], rules: &VaultRules) -> Result<(), VaultError> {
+    if pages
+        .iter()
+        .any(|page| page.body.input_owner == rules.vault)
+    {
+        return Err(VaultError::SpendFromLockedAddress { group: 0 });
+    }
+    for page in pages {
+        for (_, output) in page.body.live_outputs() {
+            match destination_marker_kind(&output.owner) {
+                Some(_) if output.amount != 0 => {
+                    return Err(VaultError::MarkerCarriesValue { group: 0 })
+                }
+                Some(DestinationMarkerKind::Release) => {
+                    return Err(VaultError::ReleaseMarkerOutsideRelease { group: 0 })
+                }
+                Some(DestinationMarkerKind::Deposit) => {
+                    return Err(VaultError::DepositShape { group: 0 })
+                }
+                Some(DestinationMarkerKind::LightClientUpdate) | None => {}
+            }
+            if output.owner == rules.vault {
+                return Err(VaultError::VaultOutputOutsideDeposit { group: 0 });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl DestinationPool {

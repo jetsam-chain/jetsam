@@ -31,7 +31,9 @@ use jetsam_chain::consensus::vault::{
     destination_marker_kind, DestinationMarkerKind, VaultError, VaultRules,
 };
 use jetsam_chain::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
-use jetsam_mempool::destination::{CommitteeUpdateIntent, ReleaseIntent};
+use jetsam_mempool::destination::{
+    check_object_payment_vault, CommitteeUpdateIntent, ReleaseIntent,
+};
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{PagedSpendIntent, Transaction, TxPage};
 
@@ -307,11 +309,19 @@ pub struct Culprits {
 /// `offer`) blames: one release for its own proof or an index already paid;
 /// every release for their shared finality update or account proof; the
 /// committee update for the anchor, its payload or the light client when it
-/// was carried (else the releases' finality update). Nothing for a local
-/// fault (keys this node lacks, a state not the parent's) or for what the
-/// template itself decided (counts, window): the block is then built without
-/// destination objects and they stay held.
-pub fn culprits_of(error: &DestinationBlockError, offer: &DestinationOffer) -> Culprits {
+/// was carried (else the releases' finality update); the committee update
+/// for a vault-gate fault of one group (A2-M2: an output to the vault, a
+/// deposit, a marker with value, a spend from the vault) when its own payment
+/// has that fault ([`check_object_payment_vault`], `rules`) — the group index
+/// is the block's, the payment is found by what it carries. Nothing for a
+/// local fault (keys this node lacks, a state not the parent's) or for what
+/// the template itself decided (counts, window): the block is then built
+/// without destination objects and they stay held.
+pub fn culprits_of(
+    error: &DestinationBlockError,
+    offer: &DestinationOffer,
+    rules: &VaultRules,
+) -> Culprits {
     let all_releases = || {
         offer
             .releases
@@ -351,6 +361,21 @@ pub fn culprits_of(error: &DestinationBlockError, offer: &DestinationOffer) -> C
         | DestinationBlockError::MalformedObject {
             kind: DestinationObjectKind::CommitteeUpdate,
         } => update(),
+        DestinationBlockError::Vault(
+            VaultError::VaultOutputOutsideDeposit { .. }
+            | VaultError::DepositShape { .. }
+            | VaultError::DepositAmount { .. }
+            | VaultError::DepositBeforeBridgeOpening { .. }
+            | VaultError::VaultCeilingReached { .. }
+            | VaultError::MarkerCarriesValue { .. }
+            | VaultError::SpendFromLockedAddress { .. }
+            | VaultError::ReleaseMarkerOutsideRelease { .. },
+        ) => Culprits {
+            releases: Vec::new(),
+            committee_update: offer.committee_update.as_ref().is_some_and(|update| {
+                check_object_payment_vault(&update.payment.pages, rules).is_err()
+            }),
+        },
         _ => Culprits::default(),
     }
 }
@@ -368,11 +393,12 @@ pub fn culprits_of(error: &DestinationBlockError, offer: &DestinationOffer) -> C
 pub fn retry_without_culprits<T>(
     offer: &DestinationOffer,
     error: &DestinationBlockError,
+    rules: &VaultRules,
     mut attempt: impl FnMut(&DestinationOffer) -> Result<T, Option<DestinationBlockError>>,
 ) -> (Option<T>, Culprits) {
     let mut blamed = Culprits::default();
     let mut current = offer.clone();
-    let mut culprits = culprits_of(error, &current);
+    let mut culprits = culprits_of(error, &current, rules);
     loop {
         let reduced = current.without(&culprits);
         if reduced.is_empty() || reduced == current {
@@ -383,7 +409,7 @@ pub fn retry_without_culprits<T>(
         match attempt(&reduced) {
             Ok(built) => return (Some(built), blamed),
             Err(Some(error)) => {
-                culprits = culprits_of(&error, &reduced);
+                culprits = culprits_of(&error, &reduced, rules);
                 current = reduced;
             }
             Err(None) => return (None, blamed),

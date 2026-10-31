@@ -1041,3 +1041,44 @@ fn the_pool_judge_matches_the_block_rules() {
     assert_eq!(projected, block);
     assert_ne!(projected, state);
 }
+
+/// A2-M2: a guardian object's payment is held to the vault rules of any
+/// transaction but a release: an output to the bridge vault is refused at
+/// admission (no block could carry it: V4), before any proof.
+#[tokio::test]
+async fn guardian_payment_paying_the_vault_is_refused_at_admission() {
+    use jetsam_chain::consensus::destination::state::DestinationBlockError;
+    use jetsam_chain::consensus::vault::{VaultError, VaultRules, VAULT_ADDRESS};
+    let tip = J + 20;
+    let mut chain = Chain::new();
+    let paying = chain.intent(
+        tip,
+        PAYER,
+        equivocation(0, 1).object(),
+        &[(VAULT_ADDRESS, 10)],
+    );
+    let honest = chain.intent(tip, PAYER, equivocation(0, 1).object(), &[]);
+    let pool = || {
+        AsyncMempool::new(
+            chain.view(tip, Some(dormant())),
+            MempoolConfig::default()
+                .with_guardian_rules(rules())
+                .with_vault_rules(VaultRules {
+                    activation_height: Some(J),
+                    ..VaultRules::current()
+                }),
+        )
+        .with_authorization_verification_executor(Arc::new(|_task| Ok(())))
+    };
+    let refusing = pool();
+    assert!(matches!(
+        submit(&refusing, &paying).await,
+        Err(SubmitError::Consensus(ConsensusError::DestinationBlock(
+            DestinationBlockError::Vault(VaultError::VaultOutputOutsideDeposit { group: 0 })
+        )))
+    ));
+    assert!(refusing.guardian_candidates().await.is_empty());
+    submit(&pool(), &honest)
+        .await
+        .expect("the same without the vault");
+}

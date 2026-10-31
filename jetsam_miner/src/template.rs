@@ -941,6 +941,7 @@ impl TemplateBuilder {
                         let (built, culprits) = crate::destination_slot::retry_without_culprits(
                             offer_ref,
                             error,
+                            &destination_rules.vault,
                             |reduced| {
                                 let mut retry = txs.clone();
                                 retry.extend(reduced.payment_order());

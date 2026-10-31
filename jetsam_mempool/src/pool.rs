@@ -1339,6 +1339,19 @@ fn run_admission_checks_with(
             ),
         ));
     }
+    // v1.7 (A2-M2): a transaction paying for an object other than a release
+    // is held to the vault rules of a plain one (its own object's marker
+    // aside): the vault gate judges its group like any other.
+    if matches!(
+        admission,
+        Admission::ObjectPayment | Admission::GuardianPayment | Admission::GuardianPayout
+    ) && st
+        .vault_rules
+        .active_at(st.view.tip_height.saturating_add(1))
+    {
+        crate::destination::check_object_payment_vault(pages, &st.vault_rules)
+            .map_err(vault_submit_error)?;
+    }
     // v1.7: a transaction that does not travel with its guardian object
     // never touches the two pools and carries no guardian marker.
     if !matches!(admission, Admission::GuardianPayment | Admission::GuardianPayout) {
@@ -3576,6 +3589,98 @@ mod tests {
         }];
         pool.update_chain_view(view).await;
         assert!(pool.destination_candidates().await.0.is_empty());
+    }
+
+    /// A2-M2: a transaction that pays for an object other than a release —
+    /// a committee update's, a v1.5 client object's — is held to the vault
+    /// rules of a plain transaction (its own committee-update marker aside):
+    /// an output to the vault, a marker carrying value, a spend from the
+    /// vault are refused at admission (no block could carry them: V1, V4),
+    /// the committee update is never held. (The template half of A2-M2 is
+    /// the test of the same name in `jetsam_miner::destination_slot`.)
+    #[tokio::test]
+    async fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_template() {
+        use jetsam_chain::consensus::destination::state::{
+            committee_update_marker, DestinationBlockError as E, DestinationRules, L1Anchor,
+        };
+        use jetsam_chain::consensus::vault::{VaultError, VAULT_ADDRESS};
+        let tip = CROSSING_J + 20;
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let anchor =
+            jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(&payload)
+                .unwrap()
+                .next_sync_committee
+                .hash_tree_root();
+        let update = |outputs: &[(Address, u64)], owner: Address| {
+            let case = VaultCase::new(tip, owner, outputs);
+            let mut view = case.view_at(tip, 0);
+            view.destination_rules = DestinationRules {
+                activation_height: Some(CROSSING_J),
+                anchor: Some(L1Anchor {
+                    period: 1_895,
+                    committee_root: anchor,
+                }),
+                vault: armed_vault_rules(),
+                ..DestinationRules::CONSENSUS
+            };
+            let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+                crate::destination::CommitteeUpdateIntent {
+                    payload: payload.clone(),
+                    payment: case.intent.clone(),
+                },
+            );
+            (ReleaseCase::pool_on(view), intent.encode().unwrap())
+        };
+        for (outputs, owner, expected) in [
+            (
+                vec![(VAULT_ADDRESS, 10), (marker, 0)],
+                Address([0xA5; 32]),
+                VaultError::VaultOutputOutsideDeposit { group: 0 },
+            ),
+            (
+                vec![(Address([0x42; 32]), 10), (marker, 1)],
+                Address([0xA5; 32]),
+                VaultError::MarkerCarriesValue { group: 0 },
+            ),
+            (
+                vec![(Address([0x42; 32]), 10), (marker, 0)],
+                VAULT_ADDRESS,
+                VaultError::SpendFromLockedAddress { group: 0 },
+            ),
+        ] {
+            let (pool, bytes) = update(&outputs, owner);
+            assert_eq!(
+                destination_refusal(pool.submit_destination(&bytes).await),
+                Some(E::Vault(expected))
+            );
+            assert!(pool.destination_candidates().await.0.is_empty());
+        }
+        let (pool, bytes) = update(
+            &[(Address([0x42; 32]), 10), (marker, 0)],
+            Address([0xA5; 32]),
+        );
+        pool.submit_destination(&bytes)
+            .await
+            .expect("the same update, its payment paying no vault");
+
+        // A v1.5 client object's payment, checked like an admission.
+        let client = VaultCase::new(tip, Address([0xA5; 32]), &[(VAULT_ADDRESS, 10)]);
+        let pool = client.pool_at(tip, 0);
+        assert!(matches!(
+            pool.check_client_payment(&client.intent).await,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(E::Vault(
+                    VaultError::VaultOutputOutsideDeposit { group: 0 }
+                ))
+            ))
+        ));
+        let plain = VaultCase::new(tip, Address([0xA5; 32]), &[(Address([0x42; 32]), 10)]);
+        plain
+            .pool_at(tip, 0)
+            .check_client_payment(&plain.intent)
+            .await
+            .expect("the same payment, paying no vault");
     }
 
     /// A template for J built while the pool's view still lags at J - 2 (its
