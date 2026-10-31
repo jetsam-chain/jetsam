@@ -3207,6 +3207,10 @@ mod tests {
         let copy = time(&|| {
             std::hint::black_box(keys.clone());
         });
+        let decompress = time(&|| {
+            let mut cache = jetsam_chain::consensus::destination::state::CommitteeKeyCache::default();
+            cache.insert_update_payload(&l1.anchor_update).unwrap();
+        });
         let pool = case.pool_at(tip, &[]);
         let bytes = case.intent.encode().unwrap();
         pool.submit_destination(&bytes).await.unwrap();
@@ -3218,7 +3222,8 @@ mod tests {
         println!(
             "A2-M1 cost per call ({runs} runs): release verification {release:?}, \
              committee-update verification {committee:?}, whole release admission \
-             {admission:?}, key cache copy (one committee) {copy:?}"
+             {admission:?}, key cache copy (one committee) {copy:?}, decompression of one \
+             committee's keys (the block's, not the admission's) {decompress:?}"
         );
     }
 

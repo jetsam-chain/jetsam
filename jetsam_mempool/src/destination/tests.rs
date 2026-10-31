@@ -42,6 +42,7 @@ pub(crate) fn finality_payload() -> Vec<u8> {
 /// update it signs for the next period, a finality update it signs whose
 /// finalized root holds the bridge account and `withdrawals[n]` of one burn,
 /// the same finality update signed by a stranger committee.
+#[derive(Clone)]
 pub(crate) struct SyntheticL1 {
     pub anchor: jetsam_chain::consensus::destination::state::L1Anchor,
     pub bridge: jetsam_chain::consensus::destination::l1_read::L1BridgeParams,
@@ -54,7 +55,13 @@ pub(crate) struct SyntheticL1 {
 }
 
 impl SyntheticL1 {
+    /// The fixture, read once per test binary.
     pub(crate) fn load() -> Self {
+        static FIXTURE: std::sync::OnceLock<SyntheticL1> = std::sync::OnceLock::new();
+        FIXTURE.get_or_init(Self::read).clone()
+    }
+
+    fn read() -> Self {
         let text = std::fs::read_to_string(format!(
             "{}/src/destination/testdata/l1_synthetic.txt",
             env!("CARGO_MANIFEST_DIR")
@@ -123,14 +130,21 @@ impl SyntheticL1 {
         }
     }
 
-    /// The keys of the anchor committee, as a node holds them (D57).
+    /// The keys of the anchor committee, as a node holds them (D57),
+    /// decompressed once per test binary (≈ 0.1 s each in a debug build).
     pub(crate) fn anchor_keys(&self) -> jetsam_chain::consensus::destination::state::CommitteeKeyCache {
-        let mut keys = jetsam_chain::consensus::destination::state::CommitteeKeyCache::default();
-        assert_eq!(
-            keys.insert_update_payload(&self.anchor_update).unwrap(),
-            self.anchor.committee_root
-        );
-        keys
+        static KEYS: std::sync::OnceLock<jetsam_chain::consensus::destination::state::CommitteeKeyCache> =
+            std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let mut keys =
+                jetsam_chain::consensus::destination::state::CommitteeKeyCache::default();
+            assert_eq!(
+                keys.insert_update_payload(&self.anchor_update).unwrap(),
+                self.anchor.committee_root
+            );
+            keys
+        })
+        .clone()
     }
 }
 
