@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# jg-start <role> --state <dir> --config <guardian.toml> --bin-dir <dir> [--passphrase-file <f>]
+#   role: observe | net | sign
+# Design §8.1: the binary's SHA-256 and the configuration's must be listed in <state>/allowed.sha256
+# (edited BY HAND on the machine); no second instance (PID file + /proc start time + exe hash);
+# jg-sign is started inside an EMPTY network namespace (unshare --net), its passphrase handed on
+# descriptor 3 (never in the arguments or the environment); the PID file records PID, start time
+# (field 22 of /proc/<pid>/stat) and the SHA-256 of /proc/<pid>/exe. Nothing starts at boot: this
+# script is run by a human. No pkill, no killall, no pattern.
+set -Eeuo pipefail
+role=${1:?role}; shift
+state= config= bindir= pass=
+while [ $# -gt 0 ]; do case $1 in
+  --state) state=$2; shift 2;; --config) config=$2; shift 2;; --bin-dir) bindir=$2; shift 2;;
+  --passphrase-file) pass=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+: "${state:?--state}" "${config:?--config}" "${bindir:?--bin-dir}"
+case $role in observe|net|sign) ;; *) echo "role: observe | net | sign" >&2; exit 2;; esac
+bin=$bindir/jg-$role
+[ -x "$bin" ] || { echo "no $bin" >&2; exit 1; }
+allowed=$state/allowed.sha256
+[ -r "$allowed" ] || { echo "no $allowed: nothing starts" >&2; exit 1; }
+h=$(sha256sum "$bin" | cut -d' ' -f1); c=$(sha256sum "$config" | cut -d' ' -f1)
+grep -qx "$h" "$allowed" || { echo "REFUSED: $bin ($h) is not in $allowed" >&2; exit 3; }
+grep -qx "$c" "$allowed" || { echo "REFUSED: $config ($c) is not in $allowed" >&2; exit 3; }
+mkdir -p "$state/run" "$state/log"
+pidf=$state/run/$role.pid
+if [ -r "$pidf" ]; then
+  read -r opid ostart oexe < "$pidf" || true
+  if [ -n "${opid:-}" ] && [ -r "/proc/$opid/stat" ] && [ "$(awk '{print $22}' "/proc/$opid/stat")" = "$ostart" ]; then
+    echo "REFUSED: jg-$role already runs (PID $opid)" >&2; exit 4
+  fi
+fi
+log=$state/log/$role.log
+echo "=== $(date -u +%FT%TZ) jg-start $role bin=$h config=$c ===" >> "$log"
+if [ "$role" = sign ]; then
+  [ -r "${pass:-}" ] || { echo "sign: --passphrase-file needed (rehearsal) or a terminal" >&2; exit 2; }
+  setsid nohup unshare --net -- "$bin" --config "$config" --passphrase-fd 3 3< "$pass" >> "$log" 2>&1 < /dev/null &
+else
+  setsid nohup "$bin" --config "$config" >> "$log" 2>&1 < /dev/null &
+fi
+pid=$!
+for _ in $(seq 1 50); do [ -r "/proc/$pid/stat" ] && [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$(readlink -f "$bin")" ] && break; sleep 0.1; done
+start=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)
+exe=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1 || true)
+[ -n "$start" ] && [ "$exe" = "$h" ] || { echo "jg-$role did not start (see $log)" >&2; tail -5 "$log" >&2; exit 5; }
+echo "$pid $start $exe" > "$pidf"
+sleep 5
+if ! [ -r "/proc/$pid/stat" ] || [ "$(awk '{print $22}' "/proc/$pid/stat")" != "$start" ]; then
+  echo "jg-$role exited within 5 s (see $log)" >&2; tail -5 "$log" >&2; exit 5
+fi
+echo "jg-$role started PID $pid ($(ps -o etime= -p "$pid" | tr -d ' '))"

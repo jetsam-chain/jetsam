@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# jg-stop <role> --state <dir>
+# Design §8.2: the PID of <state>/run/<role>.pid is signalled only if its start time (field 22 of
+# /proc/<pid>/stat) and the SHA-256 of /proc/<pid>/exe are the recorded ones (otherwise the PID was
+# reused: REFUSED). SIGTERM, at most 30 s, then SIGKILL of that PID only. Never a pattern.
+set -Eeuo pipefail
+role=${1:?role}; shift
+state=
+while [ $# -gt 0 ]; do case $1 in --state) state=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+: "${state:?--state}"
+pidf=$state/run/$role.pid
+[ -r "$pidf" ] || { echo "jg-$role: no PID file"; exit 0; }
+read -r pid start exe < "$pidf"
+if ! [ -r "/proc/$pid/stat" ]; then echo "jg-$role (PID $pid) is not running"; rm -f "$pidf"; exit 0; fi
+now_start=$(awk '{print $22}' "/proc/$pid/stat")
+now_exe=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1 || true)
+if [ "$now_start" != "$start" ] || [ "$now_exe" != "$exe" ]; then
+  echo "REFUSED: PID $pid is not the recorded jg-$role (start $now_start vs $start, exe ${now_exe:0:12} vs ${exe:0:12}): reused PID" >&2
+  exit 3
+fi
+kill -TERM "$pid"
+for i in $(seq 1 30); do [ -r "/proc/$pid/stat" ] && [ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" = "$start" ] || break; sleep 1; done
+if [ -r "/proc/$pid/stat" ] && [ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" = "$start" ]; then
+  kill -KILL "$pid"; echo "jg-$role PID $pid killed after 30 s"
+else
+  echo "jg-$role PID $pid stopped after ${i}s"
+fi
+rm -f "$pidf"
