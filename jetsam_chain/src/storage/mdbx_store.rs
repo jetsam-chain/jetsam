@@ -92,7 +92,15 @@ const T_HISTORY_STEP_PROOF_OBJECTS: &str = "history_step_proof_objects";
 /// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
-const N_TABLES: u64 = 17;
+/// v1.7 (T7.1): the durable guardian journal, the source of a snapshot's
+/// `guardian-journal.bin`: every guardian object of the canonical branch
+/// from J on, in chain order. Key: `height_be[8] || rank_be[4]`; value:
+/// `kind[1] || body`. Written in the transaction of the block (or reorg) that
+/// carries the objects, and truncated above the ancestor of a reorg, under an
+/// armed clock only; the table is created by its first entry, so a dormant
+/// store is exactly what it was before v1.7.
+const T_GUARDIAN_JOURNAL: &str = "guardian_journal";
+const N_TABLES: u64 = 18;
 
 /// Maximum reclaimed-page list searched for one contiguous overflow value.
 ///
@@ -152,6 +160,175 @@ fn write_guardian_record(
     write_v1_7_record(txn, table, KEY_GUARDIAN_RECORD, guardian)
 }
 
+fn guardian_journal_key(height: u64, rank: u32) -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[..8].copy_from_slice(&height.to_be_bytes());
+    key[8..].copy_from_slice(&rank.to_be_bytes());
+    key
+}
+
+/// The journal table, if it exists (it never does under the dormant clock).
+fn open_guardian_journal<'txn, K: libmdbx::TransactionKind>(
+    txn: &'txn Transaction<'_, K, NoWriteMap>,
+) -> Result<Option<Table<'txn>>, StoreError> {
+    match txn.open_table(Some(T_GUARDIAN_JOURNAL)) {
+        Ok(table) => Ok(Some(table)),
+        Err(libmdbx::Error::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Drop every journal entry at or above `from_height`.
+fn delete_guardian_journal_from(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    from_height: u64,
+) -> Result<(), StoreError> {
+    let Some(table) = open_guardian_journal(txn)? else {
+        return Ok(());
+    };
+    let keys = {
+        let mut cursor = txn.cursor(&table)?;
+        let mut item: Option<(Vec<u8>, ())> =
+            cursor.set_range(&guardian_journal_key(from_height, 0))?;
+        let mut keys = Vec::new();
+        while let Some((key, ())) = item {
+            keys.push(key);
+            item = cursor.next()?;
+        }
+        keys
+    };
+    for key in keys {
+        txn.del(&table, key, None)?;
+    }
+    Ok(())
+}
+
+/// Append one block's entries, ranked in order.
+fn append_guardian_journal(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    height: u64,
+    entries: &[crate::consensus::guardian::GuardianJournalEntry],
+) -> Result<(), StoreError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let table = txn.create_table(Some(T_GUARDIAN_JOURNAL), TableFlags::empty())?;
+    for (rank, entry) in entries.iter().enumerate() {
+        if entry.height != height {
+            return Err(StoreError::Decode(
+                "guardian journal entry is not its block's",
+            ));
+        }
+        let rank = u32::try_from(rank)
+            .map_err(|_| StoreError::Decode("guardian journal rank overflows u32"))?;
+        let mut value = Vec::with_capacity(1 + entry.body.len());
+        value.push(entry.kind.section_code());
+        value.extend_from_slice(&entry.body);
+        txn.put(
+            &table,
+            guardian_journal_key(height, rank),
+            value,
+            WriteFlags::empty(),
+        )?;
+    }
+    Ok(())
+}
+
+/// What a commit does to the journal (T7.1), by the rule of the guardian
+/// record it writes: nothing under the dormant clock; no journal below J;
+/// otherwise the entries above `keep_through` dropped (the reorg's ancestor,
+/// or the parent of a block) and the blocks' entries appended.
+fn update_guardian_journal<'e>(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    record: DestinationWrite<'_>,
+    keep_through: Option<u64>,
+    blocks: impl IntoIterator<Item = (u64, &'e [crate::consensus::guardian::GuardianJournalEntry])>,
+) -> Result<(), StoreError> {
+    match record {
+        DestinationWrite::Untouched => Ok(()),
+        DestinationWrite::Delete => delete_guardian_journal_from(txn, 0),
+        DestinationWrite::Put(_) => {
+            delete_guardian_journal_from(txn, keep_through.map_or(0, |height| height + 1))?;
+            for (height, entries) in blocks {
+                append_guardian_journal(txn, height, entries)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The journal of an installed snapshot (T7.1): the one it was replayed from,
+/// or none (below J); whatever the store held before is dropped.
+fn replace_guardian_journal(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    journal: Option<&[crate::consensus::guardian::GuardianJournalEntry]>,
+) -> Result<(), StoreError> {
+    delete_guardian_journal_from(txn, 0)?;
+    for block in journal
+        .unwrap_or_default()
+        .chunk_by(|a, b| a.height == b.height)
+    {
+        append_guardian_journal(txn, block[0].height, block)?;
+    }
+    Ok(())
+}
+
+/// The journal up to the height `up_to`, in chain order: known kinds at their
+/// exact sizes, contiguous ranks, within the journal file's bound.
+fn read_guardian_journal<K: libmdbx::TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+    up_to: u64,
+) -> Result<Vec<crate::consensus::guardian::GuardianJournalEntry>, StoreError> {
+    use crate::consensus::guardian::{
+        guardian_body_len_allowed, GuardianJournalEntry, GuardianObjectKind,
+        MAX_GUARDIAN_JOURNAL_FILE_BYTES,
+    };
+    let Some(table) = open_guardian_journal(txn)? else {
+        return Ok(Vec::new());
+    };
+    let mut cursor = txn.cursor(&table)?;
+    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+    let mut entries: Vec<GuardianJournalEntry> = Vec::new();
+    // The file's magic, version and count.
+    let mut file_bytes = 8 + 1 + 8usize;
+    let mut last: Option<(u64, u32)> = None;
+    while let Some((key, value)) = item {
+        let key: [u8; 12] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decode("invalid guardian journal key length"))?;
+        let height = u64::from_be_bytes(key[..8].try_into().expect("8"));
+        let rank = u32::from_be_bytes(key[8..].try_into().expect("4"));
+        if height > up_to {
+            break;
+        }
+        let next_rank = match last {
+            Some((last_height, last_rank)) if last_height == height => last_rank + 1,
+            _ => 0,
+        };
+        let (kind, body) = value
+            .split_first()
+            .ok_or(StoreError::Decode("empty guardian journal entry"))?;
+        let kind = GuardianObjectKind::from_section_code(*kind)
+            .ok_or(StoreError::Decode("unknown guardian journal kind"))?;
+        if rank != next_rank || !guardian_body_len_allowed(kind, body.len()) {
+            return Err(StoreError::Decode("non-canonical guardian journal entry"));
+        }
+        file_bytes = file_bytes.saturating_add(8 + 1 + 4 + body.len());
+        if file_bytes > MAX_GUARDIAN_JOURNAL_FILE_BYTES {
+            return Err(StoreError::Decode("guardian journal exceeds its file bound"));
+        }
+        entries.push(GuardianJournalEntry {
+            height,
+            kind,
+            body: body.to_vec(),
+        });
+        last = Some((height, rank));
+        item = cursor.next()?;
+    }
+    Ok(entries)
+}
+
 fn write_v1_7_record(
     txn: &Transaction<'_, RW, NoWriteMap>,
     table: &Table<'_>,
@@ -173,6 +350,27 @@ fn write_v1_7_record(
     Ok(())
 }
 
+/// The branch a snapshot install replays its guardian journal on (T7.1): the
+/// headers and chain work written by the install's own transaction.
+struct InstalledGuardianBranch<'a, 'env, 'table> {
+    txn: &'a Transaction<'env, RW, NoWriteMap>,
+    headers: &'a Table<'table>,
+    work: &'a Table<'table>,
+}
+
+impl crate::consensus::guardian::GuardianBranch for InstalledGuardianBranch<'_, '_, '_> {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        let raw: Option<Vec<u8>> = self.txn.get(self.headers, &u64_key(height)).ok().flatten();
+        raw.and_then(|raw| decode_header(&raw))
+            .map(|header| crate::block_header::block_id(&header))
+    }
+
+    fn chain_work(&self, height: u64) -> Option<[u8; 32]> {
+        let raw: Option<Vec<u8>> = self.txn.get(self.work, &u64_key(height)).ok().flatten();
+        raw.and_then(|raw| decode_chain_work(&raw))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -187,6 +385,10 @@ pub enum StoreError {
     /// The v1.5 client registry a snapshot carries is not the one its state
     /// and headers prove (M3.8): the sender's data, not this store's.
     SnapshotClientRegistry(crate::consensus::client_objects::ClientObjectError),
+    /// The destination state file or the guardian journal a snapshot at or
+    /// above J carries is not what its state and headers prove (T7.1): the
+    /// sender's data, not this store's.
+    SnapshotV17(crate::storage::snapshot_annex::SnapshotV17Error),
 }
 
 impl std::fmt::Display for StoreError {
@@ -198,6 +400,7 @@ impl std::fmt::Display for StoreError {
             Self::SnapshotStaging(e) => write!(f, "snapshot staging: {e}"),
             Self::SnapshotHeaders(e) => write!(f, "snapshot headers: {e}"),
             Self::SnapshotClientRegistry(e) => write!(f, "snapshot client registry: {e}"),
+            Self::SnapshotV17(e) => write!(f, "snapshot v1.7 state: {e:?}"),
         }
     }
 }
@@ -208,7 +411,10 @@ impl std::error::Error for StoreError {
             Self::Mdbx(error) => Some(error),
             Self::HeaderAnchor(error) => Some(error),
             Self::SnapshotStaging(error) => Some(error),
-            Self::Decode(_) | Self::SnapshotHeaders(_) | Self::SnapshotClientRegistry(_) => None,
+            Self::Decode(_)
+            | Self::SnapshotHeaders(_)
+            | Self::SnapshotClientRegistry(_)
+            | Self::SnapshotV17(_) => None,
         }
     }
 }
@@ -303,6 +509,21 @@ impl MdbxHistoricalReadSnapshot<'_> {
                 .map_err(|_| StoreError::Decode("client registry is malformed"))
         })
         .transpose()
+    }
+
+    /// The v1.7 destination record committed with the tip, in this pinned
+    /// view (T7.1).
+    pub(super) fn get_destination_record(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let table = self.txn.open_table(Some(T_STATE_META))?;
+        Ok(self.txn.get(&table, KEY_DESTINATION_RECORD)?)
+    }
+
+    /// The durable guardian journal up to `up_to`, in this pinned view.
+    pub(super) fn get_guardian_journal(
+        &self,
+        up_to: u64,
+    ) -> Result<Vec<crate::consensus::guardian::GuardianJournalEntry>, StoreError> {
+        read_guardian_journal(&self.txn, up_to)
     }
 
     pub(super) fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
@@ -469,6 +690,8 @@ pub(crate) struct StagedAcceptedBlockCommit {
     pub hash: [u8; 32],
     pub cumulative_chainwork: [u8; 32],
     pub undo_log: BlockUndoLog,
+    /// The block's guardian objects, for the durable journal (T7.1).
+    pub guardian_journal: Vec<crate::consensus::guardian::GuardianJournalEntry>,
 }
 
 /// Payload authorization used by the single durable block-commit path.
@@ -1985,6 +2208,50 @@ impl MdbxStore {
         Ok(txn.get(&tbl, KEY_GUARDIAN_RECORD)?)
     }
 
+    /// The durable guardian journal (T7.1): every guardian object of the
+    /// canonical branch from J on, with its height, in chain order, up to
+    /// the height `up_to`. Empty under the dormant clock.
+    pub fn get_guardian_journal(
+        &self,
+        up_to: u64,
+    ) -> Result<Vec<crate::consensus::guardian::GuardianJournalEntry>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        read_guardian_journal(&txn, up_to)
+    }
+
+    /// Whether the guardian journal table exists (never under the dormant
+    /// clock).
+    #[cfg(test)]
+    pub(crate) fn has_guardian_journal_table(&self) -> bool {
+        let txn = self.db.begin_ro_txn().unwrap();
+        open_guardian_journal(&txn).unwrap().is_some()
+    }
+
+    /// Replace the destination record (a test that needs a state the
+    /// default profile's blocks cannot build).
+    #[cfg(test)]
+    pub(crate) fn put_destination_record_for_test(&self, bytes: &[u8]) {
+        let txn = self.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_STATE_META)).unwrap();
+        write_destination_record(&txn, &table, DestinationWrite::Put(bytes)).unwrap();
+        txn.commit().unwrap();
+    }
+
+    /// Drop the `guardian` or `destination` record, as a damaged store
+    /// would have lost it (A3-4 tests).
+    #[cfg(test)]
+    pub(crate) fn delete_v1_7_record_for_test(&self, which: &str) {
+        let txn = self.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_STATE_META)).unwrap();
+        let key = match which {
+            "guardian" => KEY_GUARDIAN_RECORD,
+            "destination" => KEY_DESTINATION_RECORD,
+            other => panic!("no v1.7 record {other}"),
+        };
+        txn.del(&table, key, None).unwrap();
+        txn.commit().unwrap();
+    }
+
     pub fn get_circulating_supply(&self) -> Result<Option<u128>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_STATE_META))?;
@@ -2453,6 +2720,7 @@ impl MdbxStore {
     /// The returned `ChainState` contains only compact exact summaries and
     /// evicted-segment metadata.  It is returned only after MDBX commit, so the
     /// context can switch hot state without a fallible post-commit disk reload.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_finalized_snapshot_staging<S: SnapshotHeaderInstallSource>(
         &self,
@@ -2464,6 +2732,37 @@ impl MdbxStore {
         allow_nonfinal_rebase: bool,
         client_registry: &crate::consensus::client_objects::ClientRegistryState,
     ) -> Result<ChainState, StoreError> {
+        self.install_finalized_snapshot_staging_v17(
+            staging,
+            consensus_meta,
+            canonical_recent_headers,
+            boundary,
+            header_source,
+            allow_nonfinal_rebase,
+            client_registry,
+            &crate::storage::snapshot_annex::SnapshotAnnexes::none(),
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// [`Self::install_finalized_snapshot_staging`] with the v1.7 annexes of
+    /// the boundary (T7.1): at or above J, the destination state file and
+    /// the guardian journal are authenticated against the state streamed and
+    /// the headers written by this same transaction, and the destination and
+    /// guardian records and the journal are written by it; below J (or under
+    /// a dormant clock) no annex is admitted and no record is kept.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_finalized_snapshot_staging_v17<S: SnapshotHeaderInstallSource>(
+        &self,
+        staging: &FinalizedSnapshotStaging,
+        consensus_meta: &ConsensusMeta,
+        canonical_recent_headers: &[BlockHeader],
+        boundary: &crate::storage::VerifiedSnapshotBoundary,
+        header_source: &mut S,
+        allow_nonfinal_rebase: bool,
+        client_registry: &crate::consensus::client_objects::ClientRegistryState,
+        annexes: &crate::storage::snapshot_annex::SnapshotAnnexes,
+    ) -> Result<(ChainState, crate::storage::snapshot_annex::InstalledV17), StoreError> {
         let metadata = staging.metadata();
         let tip_header = *metadata.header();
         let tip_hash = metadata.tip_hash();
@@ -2862,6 +3161,16 @@ impl MdbxStore {
             &client_rules,
         )
         .map_err(StoreError::SnapshotClientRegistry)?;
+        // v1.7 (T7.1): the destination state file and the guardian journal,
+        // against the state streamed below and the headers just written.
+        let mut v1_7_check = crate::storage::snapshot_annex::SnapshotV17Check::new(
+            annexes,
+            tip_header.height,
+            crate::consensus::destination::state::DestinationRules::current(),
+            crate::consensus::guardian::GuardianRules::current(),
+            &read_alloc_counter,
+        )
+        .map_err(StoreError::SnapshotV17)?;
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
@@ -2933,6 +3242,11 @@ impl MdbxStore {
                     slot.amount(),
                     slot.creation_id(),
                 );
+                v1_7_check.observe_slot(
+                    &jetsam_poseidon2b::primitives::Address(owner),
+                    slot.amount(),
+                    slot.creation_id(),
+                );
                 txn.put(
                     &owner_tbl,
                     owner_index_key(&owner, global),
@@ -2983,6 +3297,16 @@ impl MdbxStore {
         registry_check
             .finish(read_alloc_counter)
             .map_err(StoreError::SnapshotClientRegistry)?;
+        let installed_v1_7 = v1_7_check
+            .finish(
+                &read_alloc_counter,
+                &InstalledGuardianBranch {
+                    txn: &txn,
+                    headers: &header_tbl,
+                    work: &work_tbl,
+                },
+            )
+            .map_err(StoreError::SnapshotV17)?;
         let exact_root = exact
             .finish()
             .map_err(|_| StoreError::Decode("staged snapshot exact-root build failed"))?;
@@ -3047,13 +3371,40 @@ impl MdbxStore {
                 txn.del(&state_meta_tbl, KEY_CLIENT_REGISTRY, None)?;
             }
         }
-        // A snapshot installed here is below J (the context refuses one at or
-        // above it until its destination state is wired): no record.
-        write_destination_record(&txn, &state_meta_tbl, DestinationWrite::Delete)?;
-        write_guardian_record(&txn, &state_meta_tbl, DestinationWrite::Delete)?;
+        // v1.7: the records of the authenticated states (no undo: no reorg
+        // goes below the boundary) and the journal they were rebuilt from;
+        // below J, or under the dormant clock, none (a stale one is dropped).
+        let destination_record = installed_v1_7.destination.as_ref().map(|(state, keys)| {
+            crate::consensus::destination::state::encode_destination_record(state, keys)
+        });
+        write_destination_record(
+            &txn,
+            &state_meta_tbl,
+            destination_record
+                .as_deref()
+                .map_or(DestinationWrite::Delete, DestinationWrite::Put),
+        )?;
+        let guardian_record = installed_v1_7
+            .guardian
+            .as_ref()
+            .map(|state| crate::consensus::guardian::encode_guardian_record(state, &[]));
+        write_guardian_record(
+            &txn,
+            &state_meta_tbl,
+            guardian_record
+                .as_deref()
+                .map_or(DestinationWrite::Delete, DestinationWrite::Put),
+        )?;
+        replace_guardian_journal(
+            &txn,
+            installed_v1_7
+                .guardian
+                .as_ref()
+                .and(annexes.guardian_journal.as_deref()),
+        )?;
         prune_history_step_proof_objects(&txn, tip_header.height)?;
         txn.commit()?;
-        Ok(hot_state)
+        Ok((hot_state, installed_v1_7))
     }
 
     /// Look up a transaction by its body hash. Returns `(block_height, tx_pos_in_block)`.
@@ -3241,6 +3592,7 @@ impl MdbxStore {
         client_registry: Option<&crate::consensus::client_objects::ClientRegistryState>,
         destination: DestinationWrite<'_>,
         guardian: DestinationWrite<'_>,
+        guardian_journal: &[crate::consensus::guardian::GuardianJournalEntry],
     ) -> Result<(), StoreError> {
         if dirty_segments.len() != dirty_segment_summaries.len()
             || dirty_segments.iter().zip(dirty_segment_summaries).any(
@@ -3556,6 +3908,12 @@ impl MdbxStore {
         }
         write_destination_record(&txn, &meta_tbl, destination)?;
         write_guardian_record(&txn, &meta_tbl, guardian)?;
+        update_guardian_journal(
+            &txn,
+            guardian,
+            header.height.checked_sub(1),
+            [(header.height, guardian_journal)],
+        )?;
 
         // --- 7. BlockUndoLog ---
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
@@ -4247,6 +4605,14 @@ impl MdbxStore {
         }
         write_destination_record(&txn, &meta_tbl, destination)?;
         write_guardian_record(&txn, &meta_tbl, guardian)?;
+        update_guardian_journal(
+            &txn,
+            guardian,
+            Some(ancestor_height),
+            replacement
+                .iter()
+                .map(|staged| (staged.header.height, staged.guardian_journal.as_slice())),
+        )?;
         // Rebuild the owner accelerator from the exact post-reorg segment
         // table. Clear is an MDBX operation (no all-key Vec), and records are
         // written as each single decoded segment is visited (no owner map).
@@ -4345,6 +4711,9 @@ impl MdbxStore {
         for name in tables {
             let tbl = txn.open_table(Some(name))?;
             txn.clear_table(&tbl)?;
+        }
+        if let Some(journal) = open_guardian_journal(&txn)? {
+            txn.clear_table(&journal)?;
         }
         txn.commit()?;
         Ok(())
@@ -4535,6 +4904,122 @@ mod tests {
         [first, second]
     }
 
+    /// T7.1: the durable guardian journal at the store level — entries by
+    /// height and rank, read in chain order up to a height, truncated above a
+    /// height, dropped below J, replaced at a snapshot install; a damaged
+    /// entry is refused on reading; the table never exists before an entry.
+    #[test]
+    fn guardian_journal_table_follows_its_writes() {
+        use crate::consensus::guardian::{GuardianJournalEntry, GuardianObjectKind};
+        let entry = |height: u64, byte: u8| GuardianJournalEntry {
+            height,
+            kind: GuardianObjectKind::StakeLock,
+            body: vec![byte; 40],
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        assert!(!store.has_guardian_journal_table());
+        assert_eq!(store.get_guardian_journal(u64::MAX).unwrap(), Vec::new());
+        let write = |f: &dyn Fn(&libmdbx::Transaction<'_, RW, NoWriteMap>)| {
+            let txn = store.db.begin_rw_txn().unwrap();
+            f(&txn);
+            txn.commit().unwrap();
+        };
+        // Nothing to append creates nothing.
+        write(&|txn| {
+            update_guardian_journal(txn, DestinationWrite::Put(&[]), Some(2), [(3, &[][..])])
+                .unwrap()
+        });
+        assert!(!store.has_guardian_journal_table());
+        let block_3 = [entry(3, 1), entry(3, 2)];
+        let block_5 = [entry(5, 3)];
+        write(&|txn| {
+            update_guardian_journal(
+                txn,
+                DestinationWrite::Put(&[]),
+                Some(2),
+                [(3, &block_3[..]), (5, &block_5[..])],
+            )
+            .unwrap()
+        });
+        assert!(store.has_guardian_journal_table());
+        assert_eq!(
+            store.get_guardian_journal(u64::MAX).unwrap(),
+            vec![entry(3, 1), entry(3, 2), entry(5, 3)]
+        );
+        assert_eq!(
+            store.get_guardian_journal(4).unwrap(),
+            vec![entry(3, 1), entry(3, 2)]
+        );
+        assert_eq!(store.get_guardian_journal(2).unwrap(), Vec::new());
+        // The dormant clock touches nothing.
+        write(&|txn| {
+            update_guardian_journal(txn, DestinationWrite::Untouched, Some(0), [(1, &block_5[..])])
+                .unwrap()
+        });
+        assert_eq!(store.get_guardian_journal(u64::MAX).unwrap().len(), 3);
+        // A reorg to the ancestor 3 drops 5 and appends the new branch's.
+        let block_4 = [entry(4, 9)];
+        write(&|txn| {
+            update_guardian_journal(txn, DestinationWrite::Put(&[]), Some(3), [(4, &block_4[..])])
+                .unwrap()
+        });
+        assert_eq!(
+            store.get_guardian_journal(u64::MAX).unwrap(),
+            vec![entry(3, 1), entry(3, 2), entry(4, 9)]
+        );
+        // An entry of another block is refused.
+        {
+            let txn = store.db.begin_rw_txn().unwrap();
+            assert!(update_guardian_journal(
+                &txn,
+                DestinationWrite::Put(&[]),
+                Some(4),
+                [(5, &block_4[..])]
+            )
+            .is_err());
+        }
+        // Below J: no journal at all.
+        write(&|txn| {
+            update_guardian_journal(txn, DestinationWrite::Delete, Some(9), [(10, &block_5[..])])
+                .unwrap()
+        });
+        assert_eq!(store.get_guardian_journal(u64::MAX).unwrap(), Vec::new());
+        // A snapshot install replaces the journal with its own, or none.
+        write(&|txn| {
+            update_guardian_journal(txn, DestinationWrite::Put(&[]), Some(2), [(3, &block_3[..])])
+                .unwrap()
+        });
+        let installed = [entry(7, 4), entry(7, 5), entry(8, 6)];
+        write(&|txn| replace_guardian_journal(txn, Some(&installed)).unwrap());
+        assert_eq!(store.get_guardian_journal(u64::MAX).unwrap(), installed.to_vec());
+        write(&|txn| replace_guardian_journal(txn, None).unwrap());
+        assert_eq!(store.get_guardian_journal(u64::MAX).unwrap(), Vec::new());
+        // Damage: a rank gap, an unknown kind, a body of another size.
+        for (key, value) in [
+            (guardian_journal_key(9, 1), {
+                let mut value = vec![GuardianObjectKind::StakeLock.section_code()];
+                value.extend_from_slice(&[0; 40]);
+                value
+            }),
+            (guardian_journal_key(9, 0), vec![0xEE; 41]),
+            (guardian_journal_key(9, 0), {
+                let mut value = vec![GuardianObjectKind::StakeLock.section_code()];
+                value.extend_from_slice(&[0; 39]);
+                value
+            }),
+        ] {
+            write(&|txn| {
+                replace_guardian_journal(txn, None).unwrap();
+                let table = txn
+                    .create_table(Some(T_GUARDIAN_JOURNAL), TableFlags::empty())
+                    .unwrap();
+                txn.put(&table, key, &value, WriteFlags::empty()).unwrap();
+            });
+            assert!(store.get_guardian_journal(u64::MAX).is_err());
+        }
+    }
+
     fn commit_genesis(store: &MdbxStore) -> (BlockHeader, ConsensusMeta) {
         let genesis = crate::consensus::genesis::genesis_header();
         let hash = crate::hash_block_header(&genesis);
@@ -4560,6 +5045,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         (genesis, meta)
@@ -4598,6 +5084,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         assert_eq!(
@@ -4965,6 +5452,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         meta
@@ -5015,6 +5503,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
 
@@ -5245,6 +5734,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .is_err());
         assert_eq!(

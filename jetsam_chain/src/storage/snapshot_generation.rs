@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::client_objects::ClientRegistryState;
+use crate::storage::snapshot_annex::{
+    snapshot_annex_chunk_digests, SnapshotAnnexKind, SnapshotAnnexRef, SNAPSHOT_ANNEX_CHUNK_BYTES,
+};
 use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
@@ -162,6 +165,16 @@ pub struct SnapshotGeneration {
     manifest: SnapshotGenerationManifest,
     /// The v1.5 client registry of the target (empty below v1.5).
     client_registry: ClientRegistryState,
+    /// The v1.7 annexes of the target (T7.1), in kind order: none below J.
+    annexes: Vec<GenerationAnnex>,
+}
+
+/// One v1.7 annex file of a generation, as read and digested when the
+/// generation was opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationAnnex {
+    annex: SnapshotAnnexRef,
+    chunk_digests: Vec<[u8; 32]>,
 }
 
 impl SnapshotGeneration {
@@ -235,6 +248,74 @@ impl SnapshotGeneration {
             return self.read_bridge_terminal();
         }
         Err(SnapshotGenerationError::BridgeBlockNotInManifest(height))
+    }
+
+    /// The v1.7 annexes of this generation (T7.1), in kind order; none below
+    /// J and under the dormant clock.
+    pub fn annexes(&self) -> Vec<crate::storage::snapshot_annex::SnapshotAnnexRef> {
+        self.annexes.iter().map(|annex| annex.annex).collect()
+    }
+
+    fn annex(&self, annex: &SnapshotAnnexRef) -> Option<&GenerationAnnex> {
+        self.annexes.iter().find(|held| held.annex == *annex)
+    }
+
+    /// The whole annex file of `kind`, checked against its reference, if
+    /// this generation has one.
+    pub fn read_annex(
+        &self,
+        kind: crate::storage::snapshot_annex::SnapshotAnnexKind,
+    ) -> Result<Option<Vec<u8>>, SnapshotGenerationError> {
+        let Some(held) = self.annexes.iter().find(|held| held.annex.kind == kind) else {
+            return Ok(None);
+        };
+        let bytes = read_annex_file(&self.directory, kind)?
+            .ok_or(SnapshotGenerationError::InvalidPayload("snapshot annex file disappeared"))?;
+        if SnapshotAnnexRef::of(kind, &bytes) != Some(held.annex) {
+            return Err(SnapshotGenerationError::InvalidPayload(
+                "snapshot annex file changed on disk",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// The index (chunk digests) of `annex`, if it is exactly one of this
+    /// generation's.
+    pub fn annex_index(
+        &self,
+        annex: &crate::storage::snapshot_annex::SnapshotAnnexRef,
+    ) -> Option<Vec<u8>> {
+        self.annex(annex).map(|held| held.chunk_digests.concat())
+    }
+
+    /// Chunk `index` of `annex`, read from disk and checked against its
+    /// digest before it is served.
+    pub fn read_annex_chunk(
+        &self,
+        annex: &crate::storage::snapshot_annex::SnapshotAnnexRef,
+        index: u32,
+    ) -> Result<Vec<u8>, SnapshotGenerationError> {
+        let held = self.annex(annex).ok_or(SnapshotGenerationError::InvalidPayload(
+            "snapshot annex is not in this generation",
+        ))?;
+        let len = annex
+            .chunk_len(index)
+            .ok_or(SnapshotGenerationError::InvalidPayload(
+                "snapshot annex chunk is out of range",
+            ))?;
+        let mut file = File::open(self.directory.join(annex.kind.file_name()))?;
+        io::Seek::seek(
+            &mut file,
+            io::SeekFrom::Start(u64::from(index) * SNAPSHOT_ANNEX_CHUNK_BYTES as u64),
+        )?;
+        let mut chunk = vec![0u8; len];
+        file.read_exact(&mut chunk)?;
+        if !annex.chunk_matches(index, &chunk, &held.chunk_digests[index as usize]) {
+            return Err(SnapshotGenerationError::InvalidPayload(
+                "snapshot annex chunk changed on disk",
+            ));
+        }
+        Ok(chunk)
     }
 
     /// Read and authenticate one immutable post-snapshot block body.
@@ -940,6 +1021,14 @@ fn export_snapshot_generation_inner(
             &client_registry.encode(),
         )?;
     }
+    // v1.7 (T7.1): the annexes of a target at or above J, read in this same
+    // pinned view; outside the manifest digest, like the client registry.
+    let annex_files = v1_7_annex_files(&snapshot, tip_height, target_height)?;
+    let mut annexes = Vec::with_capacity(annex_files.len());
+    for (kind, bytes) in &annex_files {
+        write_synced_file(&temporary.path().join(kind.file_name()), bytes)?;
+        annexes.push(generation_annex(*kind, bytes)?);
+    }
 
     let manifest_bytes = encode_manifest(&manifest)?;
     let temporary_manifest = temporary.path().join(MANIFEST_TEMP_FILE_NAME);
@@ -964,7 +1053,10 @@ fn export_snapshot_generation_inner(
         }
         Err(_error) if final_directory.exists() => {
             let existing = open_snapshot_generation(&final_directory)?;
-            if existing.manifest != manifest || existing.client_registry != client_registry {
+            if existing.manifest != manifest
+                || existing.client_registry != client_registry
+                || existing.annexes != annexes
+            {
                 return Err(SnapshotGenerationError::PublishedGenerationConflict(
                     final_directory,
                 ));
@@ -1002,11 +1094,133 @@ pub fn open_snapshot_generation(
     let manifest = decode_manifest(&encoded)?;
     validate_manifest(&manifest)?;
     let client_registry = read_generation_client_registry(&directory, manifest.target_height)?;
+    let annexes = read_generation_annexes(&directory, manifest.target_height)?;
     Ok(SnapshotGeneration {
         directory,
         manifest,
         client_registry,
+        annexes,
     })
+}
+
+/// The v1.7 annex files of a target (T7.1): at or above J, the destination
+/// state file of the target (the tip's state truncated by its undo) and the
+/// durable guardian journal up to it; none below J or under a dormant clock.
+fn v1_7_annex_files(
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
+    tip_height: u64,
+    target_height: u64,
+) -> Result<Vec<(SnapshotAnnexKind, Vec<u8>)>, SnapshotGenerationError> {
+    use crate::consensus::destination::state::{decode_destination_record, DestinationRules};
+    use crate::consensus::guardian::{encode_guardian_journal, GuardianRules};
+    let mut files = Vec::new();
+    let destination_rules = DestinationRules::current();
+    if destination_rules.active_at(target_height) {
+        let record = snapshot
+            .get_destination_record()?
+            .ok_or(SnapshotGenerationError::Corrupt(
+                "destination record is missing at or above J",
+            ))?;
+        let (state, keys) = decode_destination_record(&record)
+            .map_err(|_| SnapshotGenerationError::Corrupt("destination record is malformed"))?;
+        if state.tip != tip_height {
+            return Err(SnapshotGenerationError::Corrupt(
+                "destination record is not the tip's",
+            ));
+        }
+        let state = state
+            .truncate_above(target_height)
+            .map_err(|_| {
+                SnapshotGenerationError::Corrupt("destination undo cannot reach the target")
+            })?
+            .ok_or(SnapshotGenerationError::Corrupt(
+                "no destination state at the target",
+            ))?;
+        let file = state
+            .snapshot_file(&keys, destination_rules.vault.window_blocks)
+            .ok_or(SnapshotGenerationError::Corrupt(
+                "destination record lacks a committee's keys",
+            ))?;
+        files.push((SnapshotAnnexKind::DestinationState, file.encode()));
+    }
+    if GuardianRules::current()
+        .activation_height
+        .is_some_and(|j| j <= target_height)
+    {
+        let journal = snapshot.get_guardian_journal(target_height)?;
+        files.push((
+            SnapshotAnnexKind::GuardianJournal,
+            encode_guardian_journal(&journal),
+        ));
+    }
+    Ok(files)
+}
+
+fn generation_annex(
+    kind: SnapshotAnnexKind,
+    bytes: &[u8],
+) -> Result<GenerationAnnex, SnapshotGenerationError> {
+    let annex = SnapshotAnnexRef::of(kind, bytes).ok_or(SnapshotGenerationError::InvalidPayload(
+        "snapshot annex is empty or exceeds its bound",
+    ))?;
+    Ok(GenerationAnnex {
+        annex,
+        chunk_digests: snapshot_annex_chunk_digests(kind, bytes),
+    })
+}
+
+/// One annex file of a generation directory, read within its kind's bound.
+fn read_annex_file(
+    directory: &Path,
+    kind: SnapshotAnnexKind,
+) -> Result<Option<Vec<u8>>, SnapshotGenerationError> {
+    let mut file = match File::open(directory.join(kind.file_name())) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(kind.max_len() as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > kind.max_len() {
+        return Err(SnapshotGenerationError::InvalidPayload(
+            "snapshot annex is empty or exceeds its bound",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// The annexes of a generation, if present: bounded, canonical, nothing above
+/// the target, and digested for serving by content.
+fn read_generation_annexes(
+    directory: &Path,
+    target_height: u64,
+) -> Result<Vec<GenerationAnnex>, SnapshotGenerationError> {
+    let mut annexes = Vec::new();
+    for kind in SnapshotAnnexKind::ALL {
+        let Some(bytes) = read_annex_file(directory, kind)? else {
+            continue;
+        };
+        let canonical = match kind {
+            SnapshotAnnexKind::DestinationState => {
+                crate::consensus::destination::state::DestinationSnapshotFile::decode(&bytes)
+                    .is_ok()
+            }
+            SnapshotAnnexKind::GuardianJournal => {
+                crate::consensus::guardian::decode_guardian_journal(&bytes).is_ok_and(|journal| {
+                    journal.iter().all(|entry| entry.height <= target_height)
+                })
+            }
+        };
+        if !canonical {
+            return Err(SnapshotGenerationError::Corrupt(
+                "snapshot annex is not the target's",
+            ));
+        }
+        annexes.push(generation_annex(kind, &bytes)?);
+    }
+    Ok(annexes)
 }
 
 /// The registry file of a generation, if present: bounded, canonical, and
@@ -1773,6 +1987,7 @@ mod tests {
         fs::write(&source, b"immutable-segment").unwrap();
         let previous = SnapshotGeneration {
             client_registry: ClientRegistryState::new(),
+            annexes: Vec::new(),
             directory: previous_root.path().to_path_buf(),
             manifest: SnapshotGenerationManifest {
                 version: SNAPSHOT_GENERATION_VERSION,
@@ -1860,6 +2075,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         let first = export_snapshot_generation(&store, exports.path(), 0, None).unwrap();
@@ -1936,6 +2152,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
 
@@ -2039,6 +2256,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         let bridged = export_snapshot_generation(&store, exports.path(), 1, Some(&second)).unwrap();

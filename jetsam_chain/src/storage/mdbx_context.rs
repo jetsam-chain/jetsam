@@ -62,6 +62,7 @@ use crate::consensus::destination::state::{
 };
 use crate::consensus::guardian::{
     decode_guardian_record, encode_guardian_record, validate_block_guardian, GuardianBranch,
+    GuardianJournalEntry,
     GuardianRules, GuardianState, GuardianUndo, GUARDIAN_UNDO_BLOCKS,
 };
 use crate::consensus::{
@@ -479,6 +480,44 @@ pub struct MdbxChainContext {
     /// [`GUARDIAN_UNDO_BLOCKS`] blocks, by increasing height (T3.6).
     guardian: Option<GuardianState>,
     guardian_undo: Vec<(u64, GuardianUndo)>,
+}
+
+/// Test seam (T7.1): guardian journal entries recorded with the block of a
+/// given id, as if it carried those objects (a context test cannot build a
+/// block with a 0xC2 section under the dormant clock of its profile).
+#[cfg(test)]
+pub(crate) mod test_journal {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    use crate::consensus::guardian::GuardianJournalEntry;
+
+    thread_local! {
+        static EXTRA: RefCell<BTreeMap<[u8; 32], Vec<GuardianJournalEntry>>> =
+            RefCell::new(BTreeMap::new());
+    }
+
+    pub(crate) fn set(block_id: [u8; 32], entries: Vec<GuardianJournalEntry>) {
+        EXTRA.with(|extra| extra.borrow_mut().insert(block_id, entries));
+    }
+
+    pub(crate) fn clear() {
+        EXTRA.with(|extra| extra.borrow_mut().clear());
+    }
+
+    pub(super) fn extra(block_id: &[u8; 32]) -> Vec<GuardianJournalEntry> {
+        EXTRA.with(|extra| extra.borrow().get(block_id).cloned().unwrap_or_default())
+    }
+}
+
+/// The guardian objects of `block` for the durable journal (T7.1), and in
+/// this crate's tests those the seam records for it.
+fn block_journal(block: &Block) -> Vec<GuardianJournalEntry> {
+    #[allow(unused_mut)]
+    let mut entries = crate::consensus::guardian::block_guardian_journal(block);
+    #[cfg(test)]
+    entries.extend(test_journal::extra(&block_id(&block.header)));
+    entries
 }
 
 /// The guardian record a commit writes: nothing under the dormant clock, the
@@ -1107,6 +1146,7 @@ impl MdbxChainContext {
             None,
             crate::storage::mdbx_store::DestinationWrite::Untouched,
             crate::storage::mdbx_store::DestinationWrite::Untouched,
+            &[],
         )?;
         Ok(())
     }
@@ -1549,6 +1589,8 @@ impl MdbxChainContext {
             }
         }
         let guardian_record = guardian_record_bytes(guardian_next.as_ref(), &next_guardian_undo);
+        // T7.1: the block's guardian objects, for the durable journal.
+        let guardian_journal = block_journal(block);
         let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
             .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
         let block_hash = block_id(&block.header);
@@ -1568,6 +1610,7 @@ impl MdbxChainContext {
                 hash: block_hash,
                 cumulative_chainwork: new_tip_chain_work,
                 undo_log: undo.clone(),
+                guardian_journal,
             });
         } else {
             let consensus_meta = ConsensusMeta {
@@ -1613,6 +1656,7 @@ impl MdbxChainContext {
                     persisted_client_registry(&next_client_registry),
                     destination_write(&destination_record),
                     destination_write(&guardian_record),
+                    &guardian_journal,
                 )
             })();
             if let Err(e) = commit_result {
@@ -3251,6 +3295,16 @@ impl MdbxChainContext {
     /// every entry and omit none (`SnapshotRegistryCheck`); otherwise the
     /// install is refused as `ClientObject`, the sender's data, with nothing
     /// written.
+    ///
+    /// `annexes` are the v1.7 files of a boundary at or above J (T7.1): the
+    /// destination state file and the guardian journal. Nothing of them is
+    /// believed: the destination state is rebuilt from the installed state's
+    /// markers and the installed header J − 1 (`SnapshotDestinationCheck`),
+    /// the guardian state is the replay of the journal, every entry matched
+    /// to its marker slot, on the installed headers (`check_snapshot_guardian`).
+    /// A file that does not match, a missing one at or above J, or one below J
+    /// refuses the install as `DestinationSnapshot` or `Guardian`, the
+    /// sender's data, with nothing written.
     pub fn apply_staged_state_snapshot<S: SnapshotHeaderInstallSource>(
         &mut self,
         staging: &FinalizedSnapshotStaging,
@@ -3258,6 +3312,7 @@ impl MdbxChainContext {
         header_source: &mut S,
         allow_nonfinal_rebase: bool,
         client_registry: &ClientRegistryState,
+        annexes: &crate::storage::snapshot_annex::SnapshotAnnexes,
     ) -> Result<(), MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
@@ -3277,15 +3332,6 @@ impl MdbxChainContext {
         if block_id(&tip_header) != tip_hash {
             return Err(MdbxContextError::Corrupt(
                 "staged snapshot tip hash does not match authenticated header",
-            ));
-        }
-        // v1.7: a boundary at or above J carries its destination state
-        // (`destination-state.bin`, checked by `SnapshotDestinationCheck`);
-        // its transport and install are not wired before T7.1, so such a
-        // snapshot is refused rather than installed without it.
-        if DestinationRules::current().active_at(tip_height) {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot at or above the v1.7 height needs its destination state",
             ));
         }
         if boundary.header() != &tip_header || boundary.block_hash() != tip_hash {
@@ -3356,9 +3402,9 @@ impl MdbxChainContext {
             &ClientObjectRules::current(),
         )
         .map_err(|error| MdbxContextError::Consensus(ConsensusError::ClientObject(error)))?;
-        let snapshot_state = self
+        let (snapshot_state, installed_v1_7) = self
             .store
-            .install_finalized_snapshot_staging(
+            .install_finalized_snapshot_staging_v17(
                 staging,
                 &consensus_meta,
                 &decoded_recent,
@@ -3366,11 +3412,18 @@ impl MdbxChainContext {
                 header_source,
                 allow_nonfinal_rebase,
                 client_registry,
+                annexes,
             )
             .map_err(|error| match error {
                 crate::storage::mdbx_store::StoreError::SnapshotClientRegistry(error) => {
                     MdbxContextError::Consensus(ConsensusError::ClientObject(error))
                 }
+                crate::storage::mdbx_store::StoreError::SnapshotV17(
+                    crate::storage::snapshot_annex::SnapshotV17Error::Destination(error),
+                ) => MdbxContextError::Consensus(ConsensusError::DestinationSnapshot(error)),
+                crate::storage::mdbx_store::StoreError::SnapshotV17(
+                    crate::storage::snapshot_annex::SnapshotV17Error::Guardian(error),
+                ) => MdbxContextError::Consensus(ConsensusError::Guardian(error)),
                 error => error.into(),
             })?;
         debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
@@ -3384,10 +3437,16 @@ impl MdbxChainContext {
         self.defer_finality_updates = false;
         // The registry the install authenticated and committed (M3.8).
         self.client_registry = client_registry.clone();
-        // Below J: no destination state (the install dropped any stale record).
-        self.destination = None;
-        self.committee_keys = CommitteeKeyCache::default();
-        self.guardian = None;
+        // v1.7 (T7.1): the authenticated states the install committed (none
+        // below J, where it dropped any stale record); no undo below the
+        // boundary.
+        let (destination, committee_keys) = match installed_v1_7.destination {
+            Some((state, keys)) => (Some(state), keys),
+            None => (None, CommitteeKeyCache::default()),
+        };
+        self.destination = destination;
+        self.committee_keys = committee_keys;
+        self.guardian = installed_v1_7.guardian;
         self.guardian_undo = Vec::new();
         Ok(())
     }
@@ -3525,6 +3584,7 @@ mod tests {
     mod client_registry;
     mod destination;
     mod relation_root;
+    mod snapshot_v17;
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
         test_next_bundle_for_miner(context, 0x44)
@@ -3673,6 +3733,7 @@ mod tests {
                 None,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
                 crate::storage::mdbx_store::DestinationWrite::Untouched,
+                &[],
             )
             .unwrap();
         MdbxChainContext {

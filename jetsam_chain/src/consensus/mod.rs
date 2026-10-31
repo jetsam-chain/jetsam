@@ -209,6 +209,9 @@ pub enum ConsensusError {
     DestinationBlock(destination::state::DestinationBlockError),
     /// v1.7 (T3.6): the guardian rules of a block.
     Guardian(guardian::GuardianError),
+    /// v1.7 (T7.1): a snapshot's destination state file does not open the
+    /// installed state's markers, or is missing (the sender's data).
+    DestinationSnapshot(destination::state::SnapshotDestinationError),
 }
 
 impl From<destination::DestinationError> for ConsensusError {
@@ -239,6 +242,7 @@ impl std::fmt::Display for ConsensusError {
             Self::Destination(error) => write!(f, "Destination({error})"),
             Self::DestinationBlock(error) => write!(f, "DestinationBlock({error})"),
             Self::Guardian(error) => write!(f, "Guardian({error:?})"),
+            Self::DestinationSnapshot(error) => write!(f, "DestinationSnapshot({error:?})"),
             other => write!(f, "{other:?}"),
         }
     }
