@@ -1527,6 +1527,7 @@ fn prepare_history_step_ghost_authorization() -> Result<
 }
 
 mod config;
+mod inventory_verdict;
 mod peer_chain_evidence;
 mod repeated_warnings;
 mod embedded_history_step_pack;
@@ -14222,16 +14223,20 @@ async fn handle_p2p_events(
                     );
                 }
 
-                let plan = plan_header_inventory(
+                // The plan settles the sender's verdict first
+                // (`inventory_verdict`, A3 §4).
+                let plan = inventory_verdict::plan_and_settle(
                     &chain,
                     &snapshot_header_store,
-                    &header_dag,
+                    &mut header_dag,
+                    &mut peer_chain_evidence,
+                    from,
                     records,
+                    Instant::now(),
                 )
                 .await;
                 match plan {
                     Ok(HeaderInventoryPlan::Confirmed { tip }) => {
-                        peer_chain_evidence.confirm_compatible_through(from, tip.height);
                         if active_suffix_sync.is_none() && tip.height >= highest_announced {
                             clear_manifest_round_state!();
                             mark_initial_sync_ready(&initial_sync_ready);
@@ -14276,7 +14281,6 @@ async fn handle_p2p_events(
                         old_tip,
                         target,
                     }) => {
-                        peer_chain_evidence.confirm_compatible_through(from, target.height);
                         if let Err(error) = record_validated_headers(&mut header_dag, &headers) {
                             header_dag_faulted = true;
                             tracing::warn!(
@@ -14757,7 +14761,6 @@ async fn handle_p2p_events(
                     Ok(HeaderInventoryPlan::FinalizedDivergence) => {
                         let finalized_height = header_dag.finalized().height;
                         mining_peer_quorum.reject_incompatible(from);
-                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, finalized_height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
                         warn_branch_once!(
@@ -14770,10 +14773,9 @@ async fn handle_p2p_events(
                     }
                     Ok(HeaderInventoryPlan::ConsensusFork { height, error }) => {
                         // v1.5.1: a header refused by a rule only a fork
-                        // explains marks its sender, like a missing common
-                        // ancestor does (c3a011c only logged it).
+                        // explains marks its sender (`plan_and_settle`), like
+                        // a missing common ancestor does (c3a011c only logged it).
                         mining_peer_quorum.reject_incompatible(from);
-                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
                         warn_branch_once!(
