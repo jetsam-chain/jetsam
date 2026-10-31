@@ -42,8 +42,10 @@ use jetsam_chain::consensus::{
 };
 use jetsam_chain::wire::BLOCK_HEADER_WIRE_SIZE;
 use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+pub use jetsam_rpc::observed_branches::{
+    BranchVerdict, ObservedBranchEntry, ObservedBranchesResponse, ObservedPoint,
+};
 use libp2p::PeerId;
-use serde::{Deserialize, Serialize};
 
 use crate::networking::ChainPoint;
 
@@ -109,69 +111,6 @@ pub struct BranchProbe {
     pub peer: PeerId,
     pub start_height: u64,
     pub count: u16,
-}
-
-/// What this node made of a recorded branch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BranchVerdict {
-    /// This node reorganized onto it.
-    Accepted,
-    /// It forks below the highest pin this node carries (rule (o)).
-    PinMismatch,
-    /// One of its headers fails a native header rule.
-    HeaderRule,
-    /// Its headers pass, but it forks deeper than finality allows.
-    DeeperThanFinality,
-    /// Its headers pass and it forks inside finality: fork choice decides.
-    Pending,
-}
-
-/// A block, hex id.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedPoint {
-    pub height: u64,
-    pub id: String,
-}
-
-/// One branch of `getObservedBranches`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedBranchEntry {
-    pub fork_height: u64,
-    pub fork_base_id: String,
-    pub tip_height: u64,
-    pub tip_id: String,
-    /// Every header from `fork + 1` passes the native header rules.
-    pub headers_valid: bool,
-    pub verdict: BranchVerdict,
-    /// The first refused header and its rule.
-    pub rule: Option<String>,
-    pub below_last_pin: bool,
-    pub reorg_depth: Option<u64>,
-    /// Recomputed work through the last valid header, 32 bytes little-endian.
-    pub work_hex: String,
-    pub first_seen_unix: u64,
-    pub last_seen_unix: u64,
-    pub canonical_height_at_last_seen: u64,
-    pub canonical_id_at_last_seen: String,
-    /// Raw 212-byte headers from `fork + 1`, hex.
-    pub headers: Vec<String>,
-    pub headers_truncated: bool,
-}
-
-/// The `getObservedBranches` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedBranchesResponse {
-    pub now_unix: u64,
-    /// Start of the record, restarts included.
-    pub recording_since_unix: u64,
-    pub canonical: ObservedPoint,
-    /// The node's own tip work: to be used only when the list is truncated.
-    pub node_tip_work_hex: String,
-    pub last_pin_height: Option<u64>,
-    /// Branches were left out.
-    pub truncated: bool,
-    pub branches: Vec<ObservedBranchEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
