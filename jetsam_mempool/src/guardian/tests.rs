@@ -750,6 +750,40 @@ async fn mempool_admits_pre_latch_funding_pending_its_pair() {
     assert_eq!(pool.guardian_candidates().await.len(), 2);
 }
 
+/// T7.1: a held guardian intent is announced once, with its exact bytes,
+/// for the node to relay it to its peers; a refused one never is.
+#[tokio::test]
+async fn admitted_guardian_intent_is_announced_with_its_bytes() {
+    use crate::event::MempoolEvent;
+    let tip = JD + 10;
+    let mut chain = Chain::new();
+    let fund = |chain: &mut Chain, funder: Address| {
+        chain.intent(
+            tip,
+            funder,
+            RewardFund {
+                funder,
+                amount: 5 * JTM,
+            }
+            .object(),
+            &[(REWARD_POOL, 5 * JTM)],
+        )
+    };
+    let network = fund(&mut chain, NETWORK_FUND_ADDRESS);
+    let stranger = fund(&mut chain, PAYER);
+    let (pool, _) = chain.pool(tip, Some(dormant()));
+    let mut events = pool.subscribe();
+    submit(&pool, &network).await.expect("held pending its pair");
+    assert!(submit(&pool, &stranger).await.is_err());
+    let mut relayed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MempoolEvent::BridgeIntentAdmitted { intent_bytes } = event {
+            relayed.push(intent_bytes.to_vec());
+        }
+    }
+    assert_eq!(relayed, vec![network.encode().unwrap()]);
+}
+
 /// T1.1 §10: a transaction that does not travel with its object never
 /// spends from or pays the two pools, nor pays a guardian marker; below J
 /// it is ordinary, and the crossing evicts it.

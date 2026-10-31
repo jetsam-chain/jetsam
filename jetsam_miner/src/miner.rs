@@ -189,7 +189,8 @@ async fn next_mining_mempool_refresh_with(
                 MempoolEvent::TxAdmitted { .. }
                 | MempoolEvent::TxConfirmed { .. }
                 | MempoolEvent::TxEvicted { .. }
-                | MempoolEvent::TxAuthorizationVerified { .. },
+                | MempoolEvent::TxAuthorizationVerified { .. }
+                | MempoolEvent::BridgeIntentAdmitted { .. },
             ) => {}
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 return MiningMempoolRefresh::ReceiverLagged(skipped);

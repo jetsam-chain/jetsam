@@ -43,6 +43,12 @@ pub enum MempoolEvent {
     /// builds its template again, even one that already carries
     /// transactions (SPEC retour §1.3: 2 to 3 min at the p90).
     DestinationObjectAdmitted { release: Option<u64> },
+
+    /// v1.7 (T7.1): a destination or guardian intent was held, with its
+    /// exact bytes (`DestinationIntent::encode` / `GuardianIntent::encode`),
+    /// for the node to relay it to its peers on the bridge-intent topic. No
+    /// miner is woken by this event.
+    BridgeIntentAdmitted { intent_bytes: Arc<[u8]> },
 }
 
 /// Why a transaction was evicted.

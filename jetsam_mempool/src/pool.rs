@@ -558,6 +558,9 @@ impl AsyncMempool {
                 DestinationAdmitted::CommitteeUpdate { .. } => None,
             },
         });
+        let _ = self.events.send(MempoolEvent::BridgeIntentAdmitted {
+            intent_bytes: Arc::from(bytes),
+        });
         tracing::info!(?admitted, "destination object admitted");
         Ok(admitted)
     }
@@ -689,6 +692,9 @@ impl AsyncMempool {
             .guardian
             .hold(intent, group)
             .map_err(|refusal| SubmitError::GuardianNotHeld(refusal.to_string()))?;
+        let _ = self.events.send(MempoolEvent::BridgeIntentAdmitted {
+            intent_bytes: Arc::from(bytes),
+        });
         tracing::info!(?kind, seq, pending_pair, "guardian object admitted");
         Ok(crate::guardian::GuardianAdmitted {
             kind,
@@ -2975,6 +2981,39 @@ mod tests {
             pool.submit_destination(&self.intent.encode().unwrap())
                 .await
         }
+    }
+
+    /// The exact bytes of every `BridgeIntentAdmitted` event received so far.
+    fn relayed_bridge_intents(
+        events: &mut tokio::sync::broadcast::Receiver<crate::event::MempoolEvent>,
+    ) -> Vec<Vec<u8>> {
+        let mut relayed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let crate::event::MempoolEvent::BridgeIntentAdmitted { intent_bytes } = event {
+                relayed.push(intent_bytes.to_vec());
+            }
+        }
+        relayed
+    }
+
+    /// T7.1: a held destination intent is announced once, with its exact
+    /// bytes, for the node to relay it to its peers; a refused one never is.
+    #[tokio::test]
+    async fn admitted_destination_intent_is_announced_with_its_bytes() {
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        let mut events = pool.subscribe();
+        case.submit(&pool).await.expect("a valid release intent");
+        assert_eq!(
+            relayed_bridge_intents(&mut events),
+            vec![case.intent.encode().unwrap()]
+        );
+        // Already paid by the branch: refused, nothing to relay.
+        let paid = case.pool_at(tip, &[4]);
+        let mut paid_events = paid.subscribe();
+        assert!(case.submit(&paid).await.is_err());
+        assert!(relayed_bridge_intents(&mut paid_events).is_empty());
     }
 
     /// T2.5: a release intent (object, finality update, account proof, and
