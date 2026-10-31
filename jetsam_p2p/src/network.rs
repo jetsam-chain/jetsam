@@ -10762,6 +10762,8 @@ mod tests {
         assert_eq!(state.topology_peer_count(), 0, "a held peer is no neighbour");
         let almost = start + MAX_PROBE_HOLD - Duration::from_secs(1);
         assert_eq!(released_peers(&state, almost), vec![other]);
+        // Asked again before the bound: the hold still dates from the start.
+        state.set_probing_peers([probed], almost);
         // The bound: released whatever the node still asks.
         let over = start + MAX_PROBE_HOLD;
         let mut both = vec![probed, other];
