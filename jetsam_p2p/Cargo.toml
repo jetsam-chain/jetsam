@@ -32,6 +32,12 @@ libc = "0.2"
 rand = "0.8"
 zstd = "0.13"
 blake3 = "1"
+# SAFECOOKIE authentication to Tor's ControlPort (HMAC-SHA256). Both crates
+# are already in this crate's build at these exact versions (hmac through
+# libp2p-identity -> hkdf, sha2 through jetsam_chain and ed25519-dalek):
+# pinned, so that no new code enters the build.
+hmac = { version = "=0.12.1", default-features = false }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 tokio = { workspace = true }
