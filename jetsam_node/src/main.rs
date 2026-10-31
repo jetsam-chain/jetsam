@@ -86,6 +86,9 @@ enum ExactSuffixApplyError {
     Body {
         sources: Vec<libp2p::PeerId>,
         error: String,
+        /// v1.7 gate 1: the body (these exact bytes) carries no destination
+        /// section at or above the v1.7 height ([`refused_branch_body`]).
+        refused_branch_body: Option<jetsam_p2p::object_protocol::BlockBodyObjectId>,
     },
     /// A block proved invalid (M3.10): its terminal verified (or verified up
     /// to a lane whose matrix no honest node can hold) and a native rule
@@ -112,6 +115,40 @@ impl ExactSuffixApplyError {
         Self::Body {
             sources: vec![source],
             error: error.into(),
+            refused_branch_body: None,
+        }
+    }
+
+    /// A body fault that is the mark of a branch without v1.7
+    /// ([`refused_branch_body`]): `body` names the exact bytes `source`
+    /// served.
+    fn branch_body(
+        source: libp2p::PeerId,
+        error: impl Into<String>,
+        body: jetsam_p2p::object_protocol::BlockBodyObjectId,
+    ) -> Self {
+        Self::Body {
+            sources: vec![source],
+            error: error.into(),
+            refused_branch_body: Some(body),
+        }
+    }
+
+    /// The source and the exact body of a branch without v1.7, if this is
+    /// such a refusal.
+    fn refused_branch_body(
+        &self,
+    ) -> Option<(
+        libp2p::PeerId,
+        jetsam_p2p::object_protocol::BlockBodyObjectId,
+    )> {
+        match self {
+            Self::Body {
+                sources,
+                refused_branch_body: Some(body),
+                ..
+            } => sources.first().map(|source| (*source, *body)),
+            _ => None,
         }
     }
 
@@ -6005,6 +6042,89 @@ fn judge_exact_suffix_client_objects(
     })
 }
 
+/// v1.7 gate 1 (private rehearsal, 2026-10-31). The body `bytes` of
+/// `block`, if it is the mark of a branch that does not carry v1.7: at or
+/// above the v1.7 height, no destination section (`SectionMissing`). That is
+/// what every body of the not-upgraded v1.6 branch looks like, and no honest
+/// v1.7 node ever holds such bytes. The header is not condemned for it (a
+/// relay may strip a section); the object id of these exact bytes is returned
+/// so that whoever serves or advertises them is known.
+fn refused_branch_body(
+    block: &jetsam_chain::Block,
+    bytes: &[u8],
+    v1_7_activation: Option<u64>,
+) -> Option<jetsam_p2p::object_protocol::BlockBodyObjectId> {
+    use jetsam_chain::consensus::destination::{check_destination_section, DestinationError};
+    match check_destination_section(block, v1_7_activation) {
+        Err(DestinationError::SectionMissing) => {
+            jetsam_p2p::object_protocol::BlockBodyObjectId::from_bytes(
+                jetsam_p2p::object_protocol::BlockBodyClaimId {
+                    height: block.header.height,
+                    block_hash: jetsam_chain::block_id(&block.header),
+                },
+                bytes,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Decode one body of an exact suffix and check it against its validated
+/// header. v1.7 gate 1: a body without destination section at or above the
+/// v1.7 height is refused here, before the suffix's terminal is verified
+/// (seconds of proof checking for a verdict the bytes already give), with
+/// the exact body it served ([`refused_branch_body`]).
+fn decode_exact_suffix_body(
+    bytes: &[u8],
+    source: libp2p::PeerId,
+    expected: &jetsam_chain::BlockHeader,
+    v1_7_activation: Option<u64>,
+) -> Result<jetsam_chain::Block, ExactSuffixApplyError> {
+    let block = jetsam_chain::Block::from_bytes(bytes).map_err(|error| {
+        ExactSuffixApplyError::body(source, format!("decode exact suffix body: {error:?}"))
+    })?;
+    if block.header != *expected {
+        return Err(ExactSuffixApplyError::body(
+            source,
+            "exact suffix body header differs from its validated header",
+        ));
+    }
+    if let Some(body) = refused_branch_body(&block, bytes, v1_7_activation) {
+        return Err(ExactSuffixApplyError::branch_body(
+            source,
+            format!(
+                "exact suffix body {} carries no destination section at or above the v1.7 \
+                 height: a branch without v1.7",
+                block.header.height
+            ),
+            body,
+        ));
+    }
+    Ok(block)
+}
+
+/// Every body of an exact suffix, decoded and checked against its validated
+/// header ([`decode_exact_suffix_body`]) under this build's v1.7 clock.
+fn decode_exact_suffix_bodies(
+    body_bytes: &[Vec<u8>],
+    body_sources: &[libp2p::PeerId],
+    headers: &[jetsam_node::networking::header_dag::ValidatedHeader],
+) -> Result<Vec<jetsam_chain::Block>, ExactSuffixApplyError> {
+    body_bytes
+        .iter()
+        .zip(body_sources)
+        .zip(headers)
+        .map(|((bytes, source), expected)| {
+            decode_exact_suffix_body(
+                bytes,
+                *source,
+                &expected.header,
+                jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+            )
+        })
+        .collect()
+}
+
 fn quarantine_exact_suffix_sources(
     header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
     rejected: &mut std::collections::HashSet<libp2p::PeerId>,
@@ -6078,26 +6198,7 @@ async fn apply_exact_suffix_offthread(
                 "exact suffix body/source count differs from its immutable plan".into(),
             ));
         }
-        let mut blocks = Vec::with_capacity(body_bytes.len());
-        for ((bytes, source), expected) in body_bytes
-            .iter()
-            .zip(&body_sources)
-            .zip(plan.headers())
-        {
-            let block = jetsam_chain::Block::from_bytes(bytes).map_err(|error| {
-                ExactSuffixApplyError::body(
-                    *source,
-                    format!("decode exact suffix body: {error:?}"),
-                )
-            })?;
-            if block.header != expected.header {
-                return Err(ExactSuffixApplyError::body(
-                    *source,
-                    "exact suffix body header differs from its validated header",
-                ));
-            }
-            blocks.push(block);
-        }
+        let blocks = decode_exact_suffix_bodies(&body_bytes, &body_sources, plan.headers())?;
         let tip_header = blocks
             .last()
             .expect("non-empty exact suffix checked above")
@@ -14561,6 +14662,30 @@ async fn handle_p2p_events(
                         continue;
                     }
                 }
+                // v1.7 gate 1: the very bytes of a body this node refused
+                // for a branch without v1.7 prove the sender on that branch:
+                // refused before its headers or its inventory count.
+                if let Some(height) = refuse_advertised_branch_body(
+                    &mut header_dag,
+                    &mut peer_chain_evidence,
+                    from,
+                    &records,
+                    probe_now,
+                ) {
+                    mining_peer_quorum.reject_incompatible(from);
+                    retire_snapshot_plan_refused_through!(from, height);
+                    warn_branch_once!(
+                        from,
+                        "body of a branch without v1.7",
+                        peer = %from,
+                        height,
+                        "this peer advertises a block body without the v1.7 destination \
+                         section at or above the v1.7 height: it follows a branch that did not \
+                         upgrade, and supplies nothing to this node any more (kept for {} min)",
+                        peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                    );
+                    continue;
+                }
                 // See the announcement path: a rejected source brings no
                 // headers (M3.10).
                 if rejected_suffix_object_peers.contains(&from)
@@ -17136,6 +17261,45 @@ async fn handle_p2p_events(
                             best_changed,
                             best_height = header_dag.best_tip().height,
                             "tip whose terminal every provider failed forgotten"
+                        );
+                    }
+                    // v1.7 gate 1: a body of a branch without v1.7. Its
+                    // source and every provider of the same bytes are proven
+                    // on that branch, and the branch leaves the selection
+                    // (`refuse_branch_body`): never a wait on it.
+                    if let Some((source, body)) = error.refused_branch_body() {
+                        let (refused, best_changed) = refuse_branch_body(
+                            &mut header_dag,
+                            &mut peer_chain_evidence,
+                            source,
+                            body,
+                            Instant::now(),
+                        );
+                        for peer in &refused {
+                            mining_peer_quorum.reject_incompatible(*peer);
+                            retire_snapshot_plan_refused_through!(*peer, body.claim.height);
+                            warn_branch_once!(
+                                *peer,
+                                "body of a branch without v1.7",
+                                peer = %peer,
+                                height = body.claim.height,
+                                "this peer serves a block body without the v1.7 destination \
+                                 section at or above the v1.7 height: it follows a branch that \
+                                 did not upgrade, and supplies nothing to this node any more \
+                                 (kept for {} min)",
+                                peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                            );
+                        }
+                        let committed_height = chain.read().await.tip_height();
+                        highest_announced = committed_height.max(header_dag.best_tip().height);
+                        tracing::warn!(
+                            height = body.claim.height,
+                            hash = %hex::encode(&body.claim.block_hash[..8]),
+                            refused_peers = refused.len(),
+                            best_changed,
+                            best_height = header_dag.best_tip().height,
+                            "branch without v1.7 refused: its block left the selection with its \
+                             descendants"
                         );
                     }
                     tracing::warn!(
@@ -19944,6 +20108,56 @@ fn refuse_peer_branch<H>(
     header_dag.remove_inventory_provider(peer);
 }
 
+/// v1.7 gate 1 (private rehearsal, 2026-10-31). `source` served `body`, a
+/// body of a branch without v1.7 ([`refused_branch_body`]). The bytes are
+/// remembered; `source` and every provider advertising the same bytes are
+/// proven on that branch ([`refuse_peer_branch`] at its height); and unless a
+/// provider offers another body for that block, the block leaves the
+/// HeaderDAG with all its descendants — beyond the plan's target too — so the
+/// best valid branch is selected again at once. Not condemned: an honest body
+/// of the same block, if it exists, may still be fetched. Returns the peers
+/// refused (ordered) and whether the best tip changed.
+///
+/// Before this, on the private chain, each v1.7 node refused the body of the
+/// v1.6 branch's 96' from one source at a time while its other peers kept the
+/// branch selected, and the heavier, unsuppliable tip held three nodes for
+/// ≈ 30 min (one waiting for a snapshot of that branch, its mining paused).
+fn refuse_branch_body<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    source: libp2p::PeerId,
+    body: jetsam_p2p::object_protocol::BlockBodyObjectId,
+    now: Instant,
+) -> (Vec<libp2p::PeerId>, bool) {
+    evidence.refuse_body(body, now);
+    let mut peers = header_dag.providers_of_body(&body);
+    if !peers.contains(&source) {
+        peers.push(source);
+        peers.sort_by_key(|peer| peer.to_bytes());
+    }
+    for peer in &peers {
+        refuse_peer_branch(header_dag, evidence, *peer, body.claim.height, now);
+    }
+    let best_changed =
+        !header_dag.offers_other_body(&body) && header_dag.forget(&body.claim.block_hash);
+    (peers, best_changed)
+}
+
+/// v1.7 gate 1: a batch from `from` that advertises a body this node refused
+/// ([`refuse_branch_body`]) proves `from` on that branch: refused at the
+/// lowest such height, which is returned; the caller drops the batch.
+fn refuse_advertised_branch_body<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    from: libp2p::PeerId,
+    records: &[jetsam_p2p::header_protocol::HeaderInventoryRecord],
+    now: Instant,
+) -> Option<u64> {
+    let height = evidence.refused_body_advertised(records.iter(), now)?;
+    refuse_peer_branch(header_dag, evidence, from, height, now);
+    Some(height)
+}
+
 #[cfg(test)]
 /// v1.5.1 — the stall of 2026-10-13 (forensic §4-5). A snapshot manifest
 /// from the 1.4.3 branch, which forks at 38 400' and is durably higher than
@@ -20299,6 +20513,366 @@ mod divergent_branch_capture_tests {
         assert!(unauthenticated_snapshot_plan_stalled(Some(t0), at, false));
         assert!(!unauthenticated_snapshot_plan_stalled(Some(t0), at, true), "local work in flight");
         assert!(!unauthenticated_snapshot_plan_stalled(None, at, false), "no plan");
+    }
+}
+
+#[cfg(test)]
+/// v1.7 gate 1 (private rehearsal P7a, 2026-10-31). The v1.6 branch that did
+/// not upgrade forked at 95 = J − 1 and became heavier inside the reorg
+/// window. Its headers and terminals pass v1.7's rules; only its bodies are
+/// refused, at 96', for the destination section they lack. Every v1.7 node
+/// tried to reorganize onto it, refused that body from one source, kept the
+/// branch selected through the others, and three froze for about thirty
+/// minutes (seed S2 at 99, node V at 100 until restarted, miner M1 at 102
+/// waiting for a snapshot of that branch, its mining paused).
+mod refused_branch_body_tests {
+    use super::*;
+    use jetsam_chain::block_header::block_id;
+    use jetsam_node::networking::{
+        header_dag::{HeaderDag, ValidatedHeader},
+        ChainPoint,
+    };
+    use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+    use jetsam_p2p::object_protocol::{BlockBodyClaimId, BlockBodyObjectId};
+    use peer_chain_evidence::PeerChainEvidence;
+
+    /// The private chain's v1.7 height.
+    const J: u64 = 96;
+
+    fn header_95() -> jetsam_chain::BlockHeader {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = J - 1;
+        header
+    }
+
+    /// `len` children of `parent` (whose cumulative work is `work`), salted,
+    /// each inserted in `dag`.
+    fn branch(
+        dag: &mut HeaderDag,
+        parent: jetsam_chain::BlockHeader,
+        work: [u8; 32],
+        len: u64,
+        salt: u128,
+    ) -> Vec<ValidatedHeader> {
+        let (mut parent, mut work) = (parent, work);
+        let mut headers = Vec::new();
+        for _ in 0..len {
+            let mut header = parent;
+            header.height = parent.height + 1;
+            header.prev_block_hash = block_id(&parent);
+            header.timestamp += 1;
+            header.nonce = salt + u128::from(header.height);
+            work =
+                jetsam_chain::add_work(&work, &jetsam_chain::block_work(&header.difficulty_target));
+            let validated = ValidatedHeader::new_after_consensus_checks(header, work);
+            dag.insert(validated).unwrap();
+            headers.push(validated);
+            parent = header;
+        }
+        headers
+    }
+
+    /// The body `marker` names for `header` (one marker, one set of bytes).
+    fn body(header: &ValidatedHeader, marker: u8) -> BlockBodyObjectId {
+        BlockBodyObjectId {
+            claim: BlockBodyClaimId {
+                height: header.header.height,
+                block_hash: header.hash,
+            },
+            byte_digest: [marker; 32],
+            encoded_len: 1,
+        }
+    }
+
+    fn offer(headers: &[ValidatedHeader], marker: u8) -> Vec<HeaderInventoryRecord> {
+        headers
+            .iter()
+            .map(|header| HeaderInventoryRecord {
+                header: header.header,
+                body: Some(body(header, marker)),
+                terminal: None,
+            })
+            .collect()
+    }
+
+    fn peers<const N: usize>() -> [libp2p::PeerId; N] {
+        let mut peers = [(); N].map(|_| libp2p::PeerId::random());
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers
+    }
+
+    /// Our 96..99 (applied) against their 96'..101'. R served the refused
+    /// 96' (its plan stopped at 100'); W advertises the same bytes up to
+    /// 101'. Both are proven on the branch, and the whole branch leaves the
+    /// selection — 101', beyond the refused plan's target, too: the best
+    /// valid branch is selected at once, by work among what remains.
+    #[test]
+    fn a_refused_branch_body_frees_the_selection_from_its_whole_branch() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 4, 0);
+        let theirs = branch(&mut dag, base, [1; 32], 6, 1 << 64);
+        assert_eq!(
+            dag.best_tip(),
+            theirs[5].point(),
+            "the heavier branch is selected"
+        );
+        let [r, w, honest] = peers::<3>();
+        dag.advertise_inventory(honest, &offer(&ours, 1)).unwrap();
+        dag.advertise_inventory(r, &offer(&theirs[..5], 2)).unwrap();
+        dag.advertise_inventory(w, &offer(&theirs, 2)).unwrap();
+        let refused = body(&theirs[0], 2);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+
+        let (refused_peers, best_changed) =
+            refuse_branch_body(&mut dag, &mut evidence, r, refused, now);
+        assert_eq!(refused_peers, [r, w]);
+        assert!(best_changed);
+        assert_eq!(
+            dag.best_tip(),
+            ours[3].point(),
+            "the best valid branch, at once"
+        );
+        for header in &theirs {
+            assert!(
+                dag.get(&header.hash).is_none(),
+                "{} left the DAG",
+                header.header.height
+            );
+            assert!(!dag.is_invalid(&header.hash), "forgotten, not condemned");
+        }
+        for peer in [r, w] {
+            assert_eq!(
+                evidence.divergence_height(&peer, now),
+                Some(J),
+                "visible to the observer"
+            );
+        }
+        assert!(!evidence.is_divergent(&honest, now));
+        assert!(dag.has_inventory(&ours[3].hash), "our providers are kept");
+        assert_eq!(
+            evidence.refused_body_advertised(offer(&theirs, 2).iter(), now),
+            Some(J)
+        );
+
+        // The source alone, when nobody else advertises the bytes.
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let theirs = branch(&mut dag, base, [1; 32], 2, 1 << 64);
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let (refused_peers, best_changed) =
+            refuse_branch_body(&mut dag, &mut evidence, r, body(&theirs[0], 2), now);
+        assert_eq!(refused_peers, [r]);
+        assert!(best_changed);
+        assert_eq!(dag.best_tip(), finalized);
+        assert!(evidence.is_divergent(&r, now));
+    }
+
+    /// A relay that strips the section of an honest body is refused, and only
+    /// it: the block, the branch and the provider of its real body stay, so
+    /// the node goes on following that branch.
+    #[test]
+    fn a_stripped_copy_of_an_honest_body_refuses_only_its_relay() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let _ours = branch(&mut dag, base, [1; 32], 2, 0);
+        let honest_chain = branch(&mut dag, base, [1; 32], 4, 1 << 64);
+        let [relay, honest] = peers::<2>();
+        dag.advertise_inventory(honest, &offer(&honest_chain, 3))
+            .unwrap();
+        dag.advertise_inventory(relay, &offer(&honest_chain, 4))
+            .unwrap();
+        let best = dag.best_tip();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+
+        let (refused_peers, best_changed) = refuse_branch_body(
+            &mut dag,
+            &mut evidence,
+            relay,
+            body(&honest_chain[0], 4),
+            now,
+        );
+        assert_eq!(refused_peers, [relay]);
+        assert!(!best_changed);
+        assert_eq!(dag.best_tip(), best);
+        assert!(evidence.is_divergent(&relay, now));
+        assert!(!evidence.is_divergent(&honest, now));
+        assert_eq!(dag.providers_of_body(&body(&honest_chain[0], 3)), [honest]);
+        assert!(dag.providers_of_body(&body(&honest_chain[0], 4)).is_empty());
+    }
+
+    /// A v1.6 peer this node never tried offers the branch again with the
+    /// bytes already refused: proven on it at once, its inventory dropped,
+    /// before its headers count. Other bytes for the block, or a header
+    /// without body, prove nothing.
+    #[test]
+    fn a_peer_advertising_a_refused_body_is_refused_before_its_headers_count() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let theirs = branch(&mut dag, base, [1; 32], 3, 1 << 64);
+        let [o, honest, header_only] = peers::<3>();
+        dag.advertise_inventory(o, &offer(&theirs[1..], 2)).unwrap();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, o, &offer(&theirs, 2), now),
+            None
+        );
+        assert!(!evidence.is_divergent(&o, now), "nothing refused yet");
+
+        evidence.refuse_body(body(&theirs[0], 2), now);
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, o, &offer(&theirs, 2), now),
+            Some(J)
+        );
+        assert_eq!(evidence.divergence_height(&o, now), Some(J));
+        assert!(
+            dag.inventory_providers(&theirs).is_empty(),
+            "it supplies nothing any more"
+        );
+
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, honest, &offer(&theirs, 3), now),
+            None
+        );
+        let bare = [HeaderInventoryRecord::header_only(theirs[0].header)];
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, header_only, &bare, now),
+            None
+        );
+        assert!(!evidence.is_divergent(&honest, now) && !evidence.is_divergent(&header_only, now));
+    }
+
+    fn block_at(height: u64) -> jetsam_chain::Block {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = height;
+        jetsam_chain::Block {
+            header,
+            transactions: Vec::new(),
+            client_objects: Vec::new(),
+            destination: None,
+        }
+    }
+
+    /// At or above J a body without destination section is refused when it
+    /// is decoded — before any terminal — as a body fault that names the
+    /// exact bytes served; below J, with v1.7 dormant, or with a section, it
+    /// decodes as before, and other refusals keep their shape.
+    #[test]
+    fn a_body_without_section_at_or_above_j_is_refused_before_its_terminal_with_its_bytes() {
+        let source = libp2p::PeerId::random();
+        for height in [J, J + 1, J + 960] {
+            let block = block_at(height);
+            let bytes = block.to_bytes();
+            let claim = BlockBodyClaimId {
+                height,
+                block_hash: block_id(&block.header),
+            };
+            let expected = BlockBodyObjectId::from_bytes(claim, &bytes).unwrap();
+            assert_eq!(refused_branch_body(&block, &bytes, Some(J)), Some(expected));
+            let error =
+                decode_exact_suffix_body(&bytes, source, &block.header, Some(J)).unwrap_err();
+            assert_eq!(
+                error.refused_branch_body(),
+                Some((source, expected)),
+                "{height}"
+            );
+            assert!(error.is_body_fault() && error.condemned_block().is_none());
+            assert_eq!(error.peer_sources(), &[source][..]);
+        }
+        let below = block_at(J - 1);
+        assert_eq!(
+            refused_branch_body(&below, &below.to_bytes(), Some(J)),
+            None
+        );
+        assert_eq!(
+            decode_exact_suffix_body(&below.to_bytes(), source, &below.header, Some(J)).unwrap(),
+            below
+        );
+        let at = block_at(J);
+        assert_eq!(
+            refused_branch_body(&at, &at.to_bytes(), None),
+            None,
+            "v1.7 dormant"
+        );
+        assert_eq!(
+            decode_exact_suffix_body(&at.to_bytes(), source, &at.header, None).unwrap(),
+            at
+        );
+        let mut with_section = block_at(J);
+        with_section.destination = Some(Default::default());
+        assert_eq!(refused_branch_body(&with_section, b"", Some(J)), None);
+        let mut early = block_at(J - 1);
+        early.destination = Some(Default::default());
+        assert_eq!(
+            refused_branch_body(&early, b"", Some(J)),
+            None,
+            "a section below J is another refusal, the block rules' own"
+        );
+
+        let error =
+            decode_exact_suffix_body(&at.to_bytes(), source, &block_at(J + 1).header, Some(J))
+                .unwrap_err();
+        assert!(error.is_body_fault() && error.refused_branch_body().is_none());
+        let error = decode_exact_suffix_body(b"junk", source, &at.header, Some(J)).unwrap_err();
+        assert!(error.is_body_fault() && error.refused_branch_body().is_none());
+    }
+
+    /// A suffix is decoded under the build's own clock: armed (the private
+    /// rehearsal build), its body at J without section is refused with the
+    /// bytes its source served; dormant (public and test builds), it decodes.
+    #[test]
+    fn a_suffix_is_judged_under_the_builds_v1_7_clock() {
+        let height = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.unwrap_or(J);
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let parent = branch(&mut dag, base, [1; 32], height - J, 0)
+            .last()
+            .map_or(base, |header| header.header);
+        let mut blocks = vec![block_at(height - 1), block_at(height), block_at(height + 1)];
+        blocks[0].header = parent;
+        for index in 1..blocks.len() {
+            let mut header = blocks[index - 1].header;
+            header.height += 1;
+            header.prev_block_hash = block_id(&blocks[index - 1].header);
+            blocks[index].header = header;
+        }
+        let headers = blocks
+            .iter()
+            .map(|block| ValidatedHeader::new_after_consensus_checks(block.header, [0; 32]))
+            .collect::<Vec<_>>();
+        let bytes = blocks
+            .iter()
+            .map(jetsam_chain::Block::to_bytes)
+            .collect::<Vec<_>>();
+        let [first, second, third] = peers::<3>();
+        let sources = [first, second, third];
+        let decoded = decode_exact_suffix_bodies(&bytes, &sources, &headers);
+        match jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT {
+            Some(_) => {
+                let error = decoded.unwrap_err();
+                let claim = BlockBodyClaimId {
+                    height,
+                    block_hash: block_id(&blocks[1].header),
+                };
+                let body = BlockBodyObjectId::from_bytes(claim, &bytes[1]).unwrap();
+                assert_eq!(
+                    error.refused_branch_body(),
+                    Some((second, body)),
+                    "the first body at J"
+                );
+            }
+            None => assert_eq!(decoded.unwrap(), blocks),
+        }
+        // A body that does not match its header is refused from its own source.
+        let error = decode_exact_suffix_bodies(&bytes, &sources, &headers[1..]).unwrap_err();
+        assert_eq!(error.peer_sources(), &[first][..]);
+        assert!(error.refused_branch_body().is_none());
     }
 }
 
