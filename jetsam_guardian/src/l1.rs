@@ -162,6 +162,11 @@ impl L1 {
     /// reverted transaction is a receipt with `status = false`; a call the
     /// node refuses to estimate is an error carrying the revert reason).
     pub fn send(&self, from: &str, to: &str, data: &[u8]) -> anyhow::Result<Receipt> {
+        // a call that would revert is not sent: its reason is the error
+        let probe = json!({"from": from, "to": to, "data": format!("0x{}", hex::encode(data))});
+        if let Err(e) = self.rpc("eth_call", json!([probe, "latest"])) {
+            anyhow::bail!("reverts: {e}");
+        }
         let tx = json!({"from": from, "to": to, "data": format!("0x{}", hex::encode(data)), "gas": "0x1c9c380"});
         let hash = self.rpc("eth_sendTransaction", json!([tx]))?;
         let hash = hash.as_str().ok_or_else(|| anyhow::anyhow!("no transaction hash"))?.to_string();

@@ -81,6 +81,7 @@ struct Agg {
     l1_pending: Vec<usize>,
     attested_try: Option<(u64, Instant)>,
     equivocations_sent: HashSet<String>,
+    last_refusal: HashMap<usize, String>,
 }
 
 impl Agg {
@@ -203,8 +204,11 @@ impl Agg {
                 }
                 Err(e) => {
                     let why = e.to_string();
-                    log(&format!("{fname} h={} refused: {why}", gs.height));
-                    self.event(json!({"t": now_unix(), "event": format!("{fname}_refused"), "height": gs.height, "why": why}));
+                    if self.last_refusal.get(&i) != Some(&why) {
+                        log(&format!("{fname} h={} refused: {why}", gs.height));
+                        self.event(json!({"t": now_unix(), "event": format!("{fname}_refused"), "height": gs.height, "why": why}));
+                        self.last_refusal.insert(i, why);
+                    }
                     keep.push(i);
                 }
             }
@@ -361,6 +365,7 @@ fn run() -> anyhow::Result<()> {
         l1_pending: Vec::new(),
         attested_try: None,
         equivocations_sent: HashSet::new(),
+        last_refusal: HashMap::new(),
     };
     log("started");
     let mut last_attest = Instant::now() - Duration::from_secs(60);
