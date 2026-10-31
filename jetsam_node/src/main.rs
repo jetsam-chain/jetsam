@@ -13576,6 +13576,22 @@ async fn handle_p2p_events(
                     }
                 }
             }
+            // v1.7 (T7.1): an intent a peer relayed on the bridge-intent
+            // topic. Not admitted yet: the mempool must first judge an intent
+            // as a block does (audit A2 M1, M2) before peers can feed it;
+            // until then it is dropped unforwarded, without penalty.
+            Ok(NetworkEvent::BridgeIntentRelayed {
+                from,
+                gossip_message_id,
+                ..
+            }) => {
+                resolve_tx_gossip(
+                    &p2p_cmd,
+                    from,
+                    Some(gossip_message_id),
+                    libp2p::gossipsub::MessageAcceptance::Ignore,
+                );
+            }
             Ok(NetworkEvent::NewTx {
                 from,
                 intent_bytes,
