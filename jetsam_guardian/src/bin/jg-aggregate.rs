@@ -377,6 +377,17 @@ fn run() -> anyhow::Result<()> {
         last_refusal: HashMap::new(),
         seen_lines: HashSet::new(),
     };
+    // the archive is the memory of a restarted aggregator: nothing is combined or archived twice
+    if let Ok(text) = std::fs::read_to_string(a.cfg.archive_dir.join("signatures.jsonl")) {
+        for line in text.lines() {
+            let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(gs) = serde_json::from_value::<GroupSignature>(e["group"].clone()) else { continue };
+            a.agg.restore(gs.clone());
+            let kind = e["kind"].as_str().unwrap_or("?").to_string();
+            a.done.push((gs, kind, e.get("proposal").cloned().filter(|p| !p.is_null())));
+        }
+        log(&format!("archive read back: {} group signatures", a.done.len()));
+    }
     log("started");
     let mut last_attest = Instant::now() - Duration::from_secs(60);
     while !STOP.load(Ordering::SeqCst) {

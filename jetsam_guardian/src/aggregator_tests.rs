@@ -115,3 +115,21 @@ fn aggregator_archives_before_acknowledging_or_submitting() {
     std::fs::write(&file, b"x").unwrap();
     assert!(archive(&file, &entry).is_err());
 }
+
+#[test]
+fn aggregator_restored_from_its_archive_does_not_sign_twice() {
+    let d = test_dealing("fixture");
+    let s = statement();
+    let m = crate::keccak256(&s);
+    let mut first = Aggregator::new(d.group_key, d.commitments.clone(), 1);
+    let mut g = None;
+    for share in &d.shares[..5] {
+        if let Added::Complete(x) = first.add(&s, share.index, 1, &partial_sign(share, &m), 9) {
+            g = Some(x);
+        }
+    }
+    let mut again = Aggregator::new(d.group_key, d.commitments.clone(), 1);
+    again.restore(g.unwrap());
+    assert_eq!(again.add(&s, 1, 1, &partial_sign(&d.shares[0], &m), 10), Added::AlreadyComplete);
+    assert_eq!(again.completed().count(), 1);
+}

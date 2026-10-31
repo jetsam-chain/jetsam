@@ -95,6 +95,14 @@ impl Aggregator {
         Added::Complete(g)
     }
 
+    /// A group signature read back from the archive (after a restart).
+    pub fn restore(&mut self, g: GroupSignature) {
+        if let Ok(m) = crate::parse32(&g.m) {
+            self.pending.remove(&m);
+            self.done.insert(m, g);
+        }
+    }
+
     /// The group signatures made so far.
     pub fn completed(&self) -> impl Iterator<Item = &GroupSignature> {
         self.done.values()
