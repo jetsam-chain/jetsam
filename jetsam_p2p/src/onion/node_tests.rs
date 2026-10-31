@@ -447,7 +447,13 @@ async fn a_node_without_onion_announces_exactly_what_it_announced_before() {
         .join(crate::onion::key_store::ONION_KEY_FILE)
         .exists());
     println!("PROTOCOLS {:?}", message.protocols);
-    assert_eq!(message.protocols, PRE_D57_PROTOCOLS);
+    // Read on a mainnet build; a testnet build names its own namespace.
+    let mut expected = PRE_D57_PROTOCOLS
+        .iter()
+        .map(|protocol| protocol.replace("/jetsam/mainnet/1.0.0", &topics().protocol_id))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(message.protocols, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
