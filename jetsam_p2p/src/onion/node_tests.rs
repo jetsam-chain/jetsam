@@ -614,6 +614,7 @@ async fn guardian_node_keeps_onion_addresses_from_identify_and_serves_them_to_ka
                 false,
                 false,
                 false,
+                false,
             )
         },
         |cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)),
