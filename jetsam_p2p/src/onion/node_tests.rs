@@ -876,3 +876,87 @@ async fn real_tor_guardian_publishes_republishes_and_stays_on_loopback() {
     tor.kill().unwrap();
     let _ = tor.wait();
 }
+
+/// Real Tor, never contacted beyond this host (`DisableNetwork 1`, ControlPort
+/// on 127.0.0.1, no SOCKS port). The node authenticates by SAFECOOKIE: real
+/// Tor accepts its client hash, so the cookie itself is never sent; with a
+/// cookie Tor does not hold, the node sees from Tor's server hash that it
+/// cannot prove anything, and answers nothing. Runs only with
+/// `JETSAM_TOR_BIN=/path/to/tor` and `--ignored`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a Tor binary in JETSAM_TOR_BIN; never reaches the Tor network"]
+async fn real_tor_authenticates_by_safecookie_and_detects_a_wrong_cookie() {
+    use crate::onion::config::ControlAuthConfig;
+    use crate::onion::control::{choose_auth, AuthChoice, AuthMethod, TorControl};
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tor_bin) = std::env::var_os("JETSAM_TOR_BIN") else {
+        eprintln!("JETSAM_TOR_BIN unset: real Tor test not run");
+        return;
+    };
+    let tor_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tor_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let control_port = free_port();
+    let cookie = tor_dir.path().join("control.authcookie");
+    let torrc = tor_dir.path().join("torrc");
+    std::fs::write(
+        &torrc,
+        format!(
+            "DataDirectory {data}\nDisableNetwork 1\nSocksPort 0\n\
+             ControlPort 127.0.0.1:{control_port}\nCookieAuthentication 1\n\
+             CookieAuthFile {cookie}\nLog notice stderr\n",
+            data = tor_dir.path().join("data").display(),
+            cookie = cookie.display(),
+        ),
+    )
+    .unwrap();
+    let mut tor = std::process::Command::new(&tor_bin)
+        .arg("-f")
+        .arg(&torrc)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("tor starts");
+    let control: std::net::SocketAddr = format!("127.0.0.1:{control_port}").parse().unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while tokio::net::TcpStream::connect(control).await.is_err() || !cookie.exists() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Tor's ControlPort comes up");
+
+    let auth = ControlAuthConfig {
+        cookie_file: Some(cookie.clone()),
+        password_file: None,
+    };
+    let mut session = TorControl::connect(control).await.unwrap();
+    let info = session.protocol_info().await.unwrap();
+    assert!(
+        info.methods.contains(&AuthMethod::SafeCookie),
+        "{:?}",
+        info.methods
+    );
+    assert_eq!(info.cookie_file.as_deref(), Some(cookie.as_path()));
+    let choice = choose_auth(&info, &auth).unwrap();
+    assert_eq!(choice, AuthChoice::SafeCookie(cookie.clone()));
+    session.authenticate(&choice).await.unwrap();
+    // Authenticated: Tor answers what it refuses (514) before.
+    let version = session.command("GETINFO version").await.unwrap();
+    assert!(version.lines[0].text.starts_with("version="), "{version:?}");
+
+    // A cookie Tor does not hold: Tor's server hash cannot match it.
+    let wrong = tor_dir.path().join("not-tor-s.cookie");
+    let mut bytes = std::fs::read(&cookie).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&wrong, &bytes).unwrap();
+    let mut session = TorControl::connect(control).await.unwrap();
+    session.protocol_info().await.unwrap();
+    assert!(matches!(
+        session.authenticate(&AuthChoice::SafeCookie(wrong)).await,
+        Err(crate::onion::OnionError::Auth(_))
+    ));
+    // Nothing was answered, so that session never became authenticated.
+    assert!(session.command("GETINFO version").await.is_err());
+    tor.kill().unwrap();
+    let _ = tor.wait();
+}
