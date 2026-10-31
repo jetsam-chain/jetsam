@@ -1021,3 +1021,69 @@ fn the_guardian_journal_follows_reorgs_and_restarts() {
     assert_eq!(context.tip_height(), 5);
     assert_eq!(context.store.get_guardian_journal(u64::MAX).unwrap(), Vec::new());
 }
+
+// ---------------------------------------------------------------------------
+// A3-4: closed when in doubt
+// ---------------------------------------------------------------------------
+
+/// A tip at or above J whose guardian or destination record is missing is a
+/// damaged store, never a state to start again from.
+#[test]
+fn a_missing_v1_7_record_above_j_is_corrupt() {
+    let _rules = arm();
+    for missing in ["guardian", "destination"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (producer, _) = producer_to(directory.path(), 3);
+        producer.store.delete_v1_7_record_for_test(missing);
+        drop(producer);
+        let reopened =
+            MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap());
+        assert!(
+            matches!(reopened, Err(MdbxContextError::Corrupt(_))),
+            "{missing}: {:?}",
+            reopened.map(|context| context.tip_height())
+        );
+    }
+}
+
+/// A block above J whose parent has no guardian (or destination) state is
+/// refused, never applied with the v1.7 rules skipped, and writes nothing.
+#[test]
+fn a_block_above_j_without_its_parents_v1_7_state_is_refused() {
+    let _rules = arm();
+    for missing in ["guardian", "destination"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut context, _) = producer_to(directory.path(), 3);
+        let record = (
+            context.store.get_destination_record().unwrap(),
+            context.store.get_guardian_record().unwrap(),
+        );
+        match missing {
+            "guardian" => context.guardian = None,
+            _ => context.destination = None,
+        }
+        let bundle = test_next_bundle_for_miner(&context, MINER);
+        let block = Block::from_bytes(bundle.block_bytes()).unwrap();
+        let result = context.apply_next_block(
+            &bundle,
+            block.header.timestamp,
+            |block, state| {
+                crate::materialize_accepted_block_state(state, block)
+                    .map_err(|error| format!("{error:?}"))
+            },
+            |_| Ok(TerminalClientView::default()),
+        );
+        assert!(
+            matches!(result, Err(MdbxContextError::Corrupt(_))),
+            "{missing}: {result:?}"
+        );
+        assert_eq!(context.tip_height(), 3);
+        assert_eq!(
+            (
+                context.store.get_destination_record().unwrap(),
+                context.store.get_guardian_record().unwrap(),
+            ),
+            record
+        );
+    }
+}

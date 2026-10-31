@@ -719,10 +719,18 @@ impl MdbxChainContext {
         store: &MdbxStore,
         tip_height: u64,
     ) -> Result<(Option<DestinationState>, CommitteeKeyCache), MdbxContextError> {
-        if DestinationRules::current().activation_height.is_none() {
+        let rules = DestinationRules::current();
+        if rules.activation_height.is_none() {
             return Ok((None, CommitteeKeyCache::default()));
         }
         let Some(bytes) = store.get_destination_record()? else {
+            // A3-4: every commit at or above J writes the record; a tip there
+            // without one is a damaged store, never a fresh start.
+            if rules.active_at(tip_height) {
+                return Err(MdbxContextError::Corrupt(
+                    "destination record is missing at or above J",
+                ));
+            }
             return Ok((None, CommitteeKeyCache::default()));
         };
         let (state, keys) = decode_destination_record(&bytes)
@@ -744,6 +752,12 @@ impl MdbxChainContext {
             return Ok((None, Vec::new()));
         }
         let Some(bytes) = store.get_guardian_record()? else {
+            // A3-4: as for the destination record.
+            if activation.is_some_and(|j| tip_height >= j) {
+                return Err(MdbxContextError::Corrupt(
+                    "guardian record is missing at or above J",
+                ));
+            }
             return Ok((None, Vec::new()));
         };
         let (state, undo) = decode_guardian_record(&bytes)
@@ -776,6 +790,13 @@ impl MdbxChainContext {
             height,
             rules.activation_height,
         ) else {
+            // A3-4: above J the parent always has a state; without it the
+            // rules would be skipped, so the block is refused instead.
+            if rules.activation_height.is_some_and(|j| height >= j) {
+                return Err(MdbxContextError::Corrupt(
+                    "v1.7 block without its parent's guardian state",
+                ));
+            }
             return Ok(None);
         };
         let branch = ContextGuardianBranch { context: self };
