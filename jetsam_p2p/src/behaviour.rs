@@ -128,7 +128,9 @@ pub struct NodeBehaviour {
     ///
     /// A relay reservation can make the node reachable via:
     ///   /ip4/<relay>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
-    pub relay_client: relay::client::Behaviour,
+    ///
+    /// Absent in onion-only (guardian) mode, as are DCUtR and AutoNAT.
+    pub relay_client: Toggle<relay::client::Behaviour>,
 
     /// Bounded Circuit Relay v2 service, enabled automatically only when this
     /// node declares a globally routable direct address. Private GUI nodes are
@@ -140,7 +142,7 @@ pub struct NodeBehaviour {
     /// Once two NAT'd nodes are connected through a relay, DCUtR coordinates
     /// simultaneous TCP/UDP connection attempts to punch through both NATs.
     /// On success the relay connection is replaced by a direct connection.
-    pub dcutr: dcutr::Behaviour,
+    pub dcutr: Toggle<dcutr::Behaviour>,
 
     /// UPnP / IGD — ask the router to map the listening port outward.
     ///
@@ -161,7 +163,7 @@ pub struct NodeBehaviour {
     /// Without it a node cannot tell a working inbound path from a broken one,
     /// so it reserves relay circuits it may not need and cannot know whether
     /// its UPnP mapping actually worked.
-    pub autonat: autonat::Behaviour,
+    pub autonat: Toggle<autonat::Behaviour>,
 
     /// State manifest sync — small control header only.
     pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
@@ -215,6 +217,57 @@ impl NodeBehaviour {
         upnp_enabled: bool,
         client_objects: bool,
         bridge_intents: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(
+            key,
+            protocol_id,
+            Some(relay_client),
+            background_capacity,
+            serve_relay,
+            lan_discovery,
+            upnp_enabled,
+            client_objects,
+            bridge_intents,
+            false,
+        )
+    }
+
+    /// The behaviour of a guardian (onion only, D60): no relay client or
+    /// server, no DCUtR, no AutoNAT, no UPnP, no mDNS, and Identify announces
+    /// the external (onion) address only, never a listen address.
+    pub fn onion_only(
+        key: &libp2p::identity::Keypair,
+        protocol_id: &str,
+        background_capacity: BackgroundCapacity,
+        client_objects: bool,
+        bridge_intents: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(
+            key,
+            protocol_id,
+            None,
+            background_capacity,
+            false,
+            false,
+            false,
+            client_objects,
+            bridge_intents,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        key: &libp2p::identity::Keypair,
+        protocol_id: &str,
+        relay_client: Option<relay::client::Behaviour>,
+        background_capacity: BackgroundCapacity,
+        serve_relay: bool,
+        lan_discovery: bool,
+        upnp_enabled: bool,
+        client_objects: bool,
+        bridge_intents: bool,
+        onion_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -527,7 +580,10 @@ impl NodeBehaviour {
                 .with_agent_version(crate::peer_versions::local_agent_version())
                 .with_push_listen_addr_updates(true)
                 // Re-identify periodically so address changes propagate.
-                .with_interval(Duration::from_secs(300)),
+                .with_interval(Duration::from_secs(300))
+                // A guardian announces its onion address (an external
+                // address) and never the loopback target it listens on.
+                .with_hide_listen_addrs(onion_only),
         );
 
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
@@ -537,7 +593,9 @@ impl NodeBehaviour {
         // ----------------------------------------------------------------
         // DCUtR: coordinates simultaneous dial attempts between two NAT'd
         // nodes connected through a relay, upgrading to a direct connection.
-        let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+        let relay_client = Toggle::from(relay_client);
+        let dcutr =
+            Toggle::from((!onion_only).then(|| dcutr::Behaviour::new(key.public().to_peer_id())));
 
         // UPnP: only a node that does NOT already declare a routable address
         // has anything to ask a router for. `serve_relay` is exactly that
@@ -552,15 +610,17 @@ impl NodeBehaviour {
         // AutoNAT client: peers dial us back, and the answer tells us whether
         // the mapping above (or a manual port forward) actually works. The
         // defaults probe rarely enough to cost nothing on a small network.
-        let autonat = autonat::Behaviour::new(
-            key.public().to_peer_id(),
-            autonat::Config {
-                // A young network has few servers; asking three of them keeps
-                // one unlucky peer from deciding our reachability alone.
-                confidence_max: 3,
-                ..autonat::Config::default()
-            },
-        );
+        let autonat = Toggle::from((!onion_only).then(|| {
+            autonat::Behaviour::new(
+                key.public().to_peer_id(),
+                autonat::Config {
+                    // A young network has few servers; asking three of them keeps
+                    // one unlucky peer from deciding our reachability alone.
+                    confidence_max: 3,
+                    ..autonat::Config::default()
+                },
+            )
+        }));
         let relay_server = serve_relay
             .then(|| {
                 relay::Behaviour::new(
