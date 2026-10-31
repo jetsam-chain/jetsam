@@ -26,6 +26,7 @@
 //! - [`announce`]: which addresses the node announces in each mode.
 //! - [`guardian`]: the onion-only mode of guardians (D60) and the startup
 //!   refusals that keep it fail-closed.
+//! - [`policy`]: which peer addresses a node keeps in each mode.
 //!
 //! Two modes, both off by default. **Dual** (`additional`) adds an onion
 //! address beside clearnet: more ways in, and the node's IP address stays
@@ -38,6 +39,7 @@ pub mod config;
 pub mod control;
 pub mod guardian;
 pub mod key_store;
+pub mod policy;
 pub mod service;
 mod sha3;
 pub mod socks5;

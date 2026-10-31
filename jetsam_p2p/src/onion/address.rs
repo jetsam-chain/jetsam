@@ -192,6 +192,40 @@ pub fn sanitize_advertised_onion_addr(peer: PeerId, addr: &Multiaddr) -> Option<
     target.service.to_multiaddr(target.port).ok()
 }
 
+fn is_onion_name(name: &str) -> bool {
+    onion_label(name).is_some()
+}
+
+/// `<label>` of `<label>.onion` (a trailing dot, any letter case of the
+/// suffix).
+fn onion_label(name: &str) -> Option<&str> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let split = name.len().checked_sub(".onion".len())?;
+    let (label, suffix) = (name.get(..split)?, name.get(split..)?);
+    suffix.eq_ignore_ascii_case(".onion").then_some(label)
+}
+
+/// The service named by `host` when it is an onion name (`<id>.onion`; a
+/// trailing dot and the letter case of the suffix do not matter): `None`
+/// when it is not one, an error when it is one but not a valid v3 service.
+/// Either way an onion name is never handed to DNS.
+pub fn onion_host(host: &str) -> Option<Result<OnionServiceId, OnionError>> {
+    onion_label(host).map(OnionServiceId::parse)
+}
+
+/// Whether `addr` would have DNS look up an onion name (`/dns*/<x>.onion`,
+/// `/dnsaddr/<x>.onion`): a query telling the resolver, and anyone on the
+/// path, which onion service this host is about to reach.
+pub fn asks_dns_for_an_onion(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Dns(name)
+        | Protocol::Dns4(name)
+        | Protocol::Dns6(name)
+        | Protocol::Dnsaddr(name) => is_onion_name(&name),
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +355,66 @@ mod tests {
         bad[34] = 4;
         let forged = Multiaddr::empty().with(Protocol::Onion3((bad, 9700).into()));
         assert_eq!(sanitize_advertised_onion_addr(peer, &forged), None);
+    }
+}
+
+#[cfg(test)]
+mod onion_name_tests {
+    use super::*;
+
+    const SYNTHETIC: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead";
+    const BAD_CHECKSUM: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3iead";
+
+    #[test]
+    fn onion_names_are_recognised_and_never_left_to_dns() {
+        let id = OnionServiceId::parse(SYNTHETIC).unwrap();
+        for host in [
+            format!("{SYNTHETIC}.onion"),
+            format!("{SYNTHETIC}.onion."),
+            format!("{SYNTHETIC}.ONION"),
+        ] {
+            assert_eq!(onion_host(&host).unwrap().unwrap(), id, "{host}");
+        }
+        for invalid in [
+            format!("{BAD_CHECKSUM}.onion"),
+            "example.onion".to_string(),
+            format!("www.{SYNTHETIC}.onion"),
+            format!("{}.onion", SYNTHETIC.to_uppercase()),
+            ".onion".to_string(),
+        ] {
+            assert!(onion_host(&invalid).unwrap().is_err(), "{invalid} accepted");
+        }
+        for clearnet in [
+            "seed.example",
+            "onion.example",
+            "example.onion.net",
+            "203.0.113.10",
+            "localhost",
+        ] {
+            assert!(onion_host(clearnet).is_none(), "{clearnet} taken for onion");
+        }
+
+        for asks in [
+            format!("/dns/{SYNTHETIC}.onion/tcp/9700"),
+            "/dns4/x.onion/tcp/9700".to_string(),
+            "/dns6/X.ONION./tcp/9700".to_string(),
+            "/dnsaddr/seed.onion".to_string(),
+            format!(
+                "/ip4/1.2.3.4/tcp/9700/p2p/{}/p2p-circuit/dns/x.onion",
+                PeerId::random()
+            ),
+        ] {
+            let addr: Multiaddr = asks.parse().unwrap();
+            assert!(asks_dns_for_an_onion(&addr), "{asks}");
+        }
+        for fine in [
+            format!("/onion3/{SYNTHETIC}:9700"),
+            "/dns/seed.example/tcp/9700".to_string(),
+            "/dnsaddr/onion.example".to_string(),
+            "/ip4/1.2.3.4/tcp/9700".to_string(),
+        ] {
+            let addr: Multiaddr = fine.parse().unwrap();
+            assert!(!asks_dns_for_an_onion(&addr), "{fine}");
+        }
     }
 }
