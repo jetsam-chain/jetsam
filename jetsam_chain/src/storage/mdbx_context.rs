@@ -3602,6 +3602,7 @@ impl MdbxChainContext {
 mod tests {
     use super::*;
 
+    mod apply_cost;
     mod client_registry;
     mod destination;
     mod relation_root;
