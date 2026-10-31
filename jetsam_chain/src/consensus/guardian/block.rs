@@ -272,6 +272,19 @@ fn section_objects(block: &Block) -> Vec<GuardianObject> {
         .collect()
 }
 
+/// The block's guardian objects in section order, with its height: what a
+/// node keeps durably of each block for its snapshots' journal (T7.1).
+pub fn block_guardian_journal(block: &Block) -> Vec<super::persist::GuardianJournalEntry> {
+    section_objects(block)
+        .into_iter()
+        .map(|object| super::persist::GuardianJournalEntry {
+            height: block.header.height,
+            kind: object.kind,
+            body: object.body,
+        })
+        .collect()
+}
+
 /// Read a block at or above the v1.7 height: rules M-2 .. M-6, and the
 /// facts the object rules need. `None` below the height (nothing is read,
 /// and objects are refused).

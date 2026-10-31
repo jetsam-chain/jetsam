@@ -47,7 +47,8 @@ mod tests;
 
 pub use attestation::{check_attestation, GuardianAttestation, ATTESTATION_BODY_BYTES};
 pub use block::{
-    apply_block_guardian, check_group_pool_gate, guardian_body_len_allowed, guardian_context,
+    apply_block_guardian, block_guardian_journal, check_group_pool_gate,
+    guardian_body_len_allowed, guardian_context,
     is_guardian_locked_address_at, validate_block_guardian, BlockGuardianContext, GuardianBranch,
     GuardianError, GuardianGroupFacts, GuardianObject,
 };

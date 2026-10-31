@@ -442,3 +442,32 @@ fn guardian_record_round_trips_and_refuses_damage() {
         .collect();
     assert!(decode_guardian_record(&encode_guardian_record(&state, &too_many)).is_err());
 }
+
+/// T7.1: what a node keeps durably of each block for its snapshots — the
+/// block's guardian objects, in section order, with its height — and nothing
+/// of the section's other objects.
+#[test]
+fn block_guardian_journal_lists_the_sections_guardian_objects_in_order() {
+    let lock = GuardianObject::new(GuardianObjectKind::StakeLock, vec![1; STAKE_BODY_BYTES]);
+    let unlock = GuardianObject::new(GuardianObjectKind::StakeUnlock, vec![2; STAKE_BODY_BYTES]);
+    let height = J + 3;
+    let entry = |object: &GuardianObject| GuardianJournalEntry {
+        height,
+        kind: object.kind,
+        body: object.body.clone(),
+    };
+    let block = block_of(height, &[lock.clone(), unlock.clone(), lock.clone()]);
+    let expected = vec![entry(&lock), entry(&unlock), entry(&lock)];
+    assert_eq!(block_guardian_journal(&block), expected);
+    let mut mixed = block.clone();
+    mixed.destination.as_mut().unwrap().objects.insert(
+        1,
+        crate::consensus::destination::DestinationObject {
+            kind: crate::consensus::destination::DestinationObjectKind::CommitteeUpdate,
+            payload: vec![7; 40],
+        },
+    );
+    assert_eq!(block_guardian_journal(&mixed), expected);
+    let bare = block_with(height, Address([9u8; 32]), Vec::new(), None);
+    assert!(block_guardian_journal(&bare).is_empty());
+}
