@@ -113,6 +113,11 @@ struct Seen {
 /// A peer with the production behaviour, listening on loopback, answering
 /// the network-profile handshake, recording every Identify it receives.
 async fn observer() -> (PeerId, u16, Arc<Mutex<Vec<Seen>>>) {
+    observer_with(None).await
+}
+
+/// [`observer`], announcing `external` as its own external address.
+async fn observer_with(external: Option<Multiaddr>) -> (PeerId, u16, Arc<Mutex<Vec<Seen>>>) {
     let protocol_id = topics().protocol_id;
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -146,6 +151,9 @@ async fn observer() -> (PeerId, u16, Arc<Mutex<Vec<Seen>>>) {
     swarm
         .listen_on(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
         .unwrap();
+    if let Some(external) = external {
+        swarm.add_external_address(external);
+    }
     let peer = *swarm.local_peer_id();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = seen.clone();
@@ -523,6 +531,121 @@ async fn onion_only_behaviour_has_no_discovery_and_no_nat_traversal() {
     assert!(ordinary.dcutr.is_enabled());
     assert!(ordinary.autonat.is_enabled());
     assert!(ordinary.upnp.is_enabled());
+}
+
+/// A third valid v3 address (public key 20 21 .. 3f, Python hashlib), which
+/// the observer advertises as its own; never contacted.
+const ADVERTISED: &str = "eaqseizeeutcokbjfivsyljof4ydcmrtgq2tmnzyhe5dwpb5hy74yhqd";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guardian_node_keeps_onion_addresses_from_identify_and_serves_them_to_kademlia() {
+    use crate::onion::swarm::{build_swarm, NodeTransports};
+    use libp2p::kad;
+
+    // A: an onion peer that advertises its onion address through Identify.
+    let advertised: Multiaddr = format!("/onion3/{ADVERTISED}:9700").parse().unwrap();
+    let (a_peer, a_port, a_seen) = observer_with(Some(advertised.clone())).await;
+    let proxy = FakeSocks::start(FakeSocksConfig::forwarding(
+        format!("127.0.0.1:{a_port}").parse().unwrap(),
+    ))
+    .await;
+    let tor = FakeTor::start(FakeTorConfig::null()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let chain = chain(directory.path());
+    let guardian = start(
+        directory.path(),
+        &chain,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        Some(onion_settings(OnionMode::Guardian, &tor, proxy.addr)),
+    )
+    .unwrap();
+    published(&tor).await;
+    guardian
+        .dial(
+            format!("/onion3/{REMOTE}:9700/p2p/{a_peer}")
+                .parse()
+                .unwrap(),
+        )
+        .await;
+    let guardian_peer = identified(&a_seen, |_| true).await.from;
+    // Identify runs both ways: let the guardian take in A's addresses.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // B reaches the guardian the way Tor would forward it: on the onion
+    // service's loopback target, named in the ADD_ONION line.
+    let target = tor
+        .received()
+        .into_iter()
+        .find_map(|line| {
+            line.strip_prefix("ADD_ONION ")?
+                .split_once("Port=9700,")?
+                .1
+                .trim_end()
+                .parse::<std::net::SocketAddr>()
+                .ok()
+        })
+        .expect("the onion target");
+    let b_proxy = FakeSocks::start(FakeSocksConfig::forwarding(
+        format!("127.0.0.1:{a_port}").parse().unwrap(),
+    ))
+    .await;
+    let protocol_id = topics().protocol_id;
+    let mut b = build_swarm(
+        libp2p::identity::Keypair::generate_ed25519(),
+        NodeTransports::ClearnetAndOnion {
+            socks: b_proxy.addr,
+        },
+        move |key, relay_client| {
+            NodeBehaviour::new(
+                key,
+                &protocol_id,
+                relay_client.expect("a relay client"),
+                BackgroundCapacity::Full,
+                false,
+                false,
+                false,
+                false,
+            )
+        },
+        |cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)),
+    )
+    .unwrap();
+    b.behaviour_mut().kad.add_address(
+        &guardian_peer,
+        format!("/ip4/{}/tcp/{}", target.ip(), target.port())
+            .parse()
+            .unwrap(),
+    );
+    b.behaviour_mut().kad.get_closest_peers(PeerId::random());
+    // The guardian answers with A and the addresses it keeps for A: B then
+    // dials the advertised onion address through its own proxy.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if b_proxy
+                .requests()
+                .iter()
+                .any(|request| request.domain() == Some(format!("{ADVERTISED}.onion")))
+            {
+                return;
+            }
+            tokio::select! {
+                event = b.select_next_some() => {
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(
+                        kad::Event::OutboundQueryProgressed { .. },
+                    )) = event
+                    {
+                        b.behaviour_mut().kad.get_closest_peers(PeerId::random());
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the guardian kept A's advertised onion address and served it");
 }
 
 /// Sockets of this process whose local or remote address is not loopback
