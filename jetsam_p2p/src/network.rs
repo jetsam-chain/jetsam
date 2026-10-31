@@ -401,6 +401,9 @@ impl SnapshotExportEntry {
             } else {
                 generation.client_registry().encode()
             },
+            // The v1.7 annexes of a boundary at or above J (T7.1); none
+            // below J, where the manifest is the released one.
+            annexes: generation.annexes(),
         };
         let (network_manifest, manifest_header, manifest_pages) =
             VerifiedStateManifest::prepare_local(network_manifest)?;

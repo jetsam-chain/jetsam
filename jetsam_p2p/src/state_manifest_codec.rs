@@ -21,9 +21,10 @@ use jetsam_chain::{
 };
 
 use crate::protocol::{
-    GetStateManifestHeader, GetStateManifestRequest, SnapshotManifestPageRef,
-    MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES, MAX_SNAPSHOT_MANIFEST_PAGES,
-    SNAPSHOT_MANIFEST_FORMAT_VERSION,
+    snapshot_annexes_are_canonical, GetStateManifestHeader, GetStateManifestRequest,
+    SnapshotAnnexKind, SnapshotAnnexRef, SnapshotManifestPageRef,
+    MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES, MAX_SNAPSHOT_MANIFEST_ANNEXES,
+    MAX_SNAPSHOT_MANIFEST_PAGES, SNAPSHOT_MANIFEST_FORMAT_VERSION,
 };
 
 // JETSAM: the leading byte E replaces the upstream magic's initial, so no
@@ -35,6 +36,13 @@ const RESPONSE_MAGIC: [u8; 4] = *b"JMH7";
 /// carries a registry uses it, so every pre-v1.5 frame is byte-identical to
 /// the released one.
 const RESPONSE_MAGIC_WITH_CLIENT_REGISTRY: [u8; 4] = *b"JMH8";
+/// v1.7 (T7.1): the same header, then the client registry (`u16` length,
+/// zero allowed, then its bytes), then the annexes of a boundary at or above
+/// J (`u8` count, then `kind:u8 ‖ len:u32 ‖ root:[32]` each). Only a manifest
+/// that carries annexes uses it, so every pre-v1.7 frame is byte-identical
+/// to the released one.
+const RESPONSE_MAGIC_WITH_ANNEXES: [u8; 4] = *b"JMH9";
+const ANNEX_REF_BYTES: usize = 1 + 4 + 32;
 const REQUEST_BYTES: usize = 4 + 8 + 32;
 const RESPONSE_HEADER_BYTES: usize =
     4 + 8 + 32 + 32 + 4 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4 + 2;
@@ -79,10 +87,12 @@ impl request_response::Codec for StateManifestCodec {
     {
         let mut encoded = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut encoded).await?;
-        let carries_client_registry = if encoded[..4] == RESPONSE_MAGIC {
-            false
+        let (carries_client_registry, carries_annexes) = if encoded[..4] == RESPONSE_MAGIC {
+            (false, false)
         } else if encoded[..4] == RESPONSE_MAGIC_WITH_CLIENT_REGISTRY {
-            true
+            (true, false)
+        } else if encoded[..4] == RESPONSE_MAGIC_WITH_ANNEXES {
+            (true, true)
         } else {
             return Err(invalid_data("invalid state-manifest header magic/version"));
         };
@@ -114,11 +124,33 @@ impl request_response::Codec for StateManifestCodec {
             let mut length = [0u8; 2];
             io.read_exact(&mut length).await?;
             let length = usize::from(u16::from_le_bytes(length));
-            if length == 0 || length > MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES {
+            // An annex frame may carry an empty registry; a registry frame
+            // carries one.
+            if (length == 0 && !carries_annexes) || length > MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES {
                 return Err(invalid_data("manifest client registry length is out of bounds"));
             }
             client_registry.resize(length, 0);
             io.read_exact(&mut client_registry).await?;
+        }
+        let mut annexes = Vec::new();
+        if carries_annexes {
+            let mut count = [0u8; 1];
+            io.read_exact(&mut count).await?;
+            let count = usize::from(count[0]);
+            if count == 0 || count > MAX_SNAPSHOT_MANIFEST_ANNEXES {
+                return Err(invalid_data("manifest annex count is out of bounds"));
+            }
+            for _ in 0..count {
+                let mut raw = [0u8; ANNEX_REF_BYTES];
+                io.read_exact(&mut raw).await?;
+                let kind = SnapshotAnnexKind::from_code(raw[0])
+                    .ok_or_else(|| invalid_data("unknown manifest annex kind"))?;
+                annexes.push(SnapshotAnnexRef {
+                    kind,
+                    len: u32::from_le_bytes(raw[1..5].try_into().unwrap()),
+                    root: raw[5..37].try_into().unwrap(),
+                });
+            }
         }
         ensure_eof(io).await?;
         let response = GetStateManifestHeader {
@@ -138,6 +170,7 @@ impl request_response::Codec for StateManifestCodec {
             segment_count: u32::from_le_bytes(encoded[237..241].try_into().unwrap()),
             descriptor_pages,
             client_registry,
+            annexes,
         };
         validate_header(&response)?;
         Ok(response)
@@ -170,7 +203,9 @@ impl request_response::Codec for StateManifestCodec {
     {
         validate_header(&response)?;
         let mut encoded = [0u8; RESPONSE_HEADER_BYTES];
-        encoded[..4].copy_from_slice(if response.client_registry.is_empty() {
+        encoded[..4].copy_from_slice(if !response.annexes.is_empty() {
+            &RESPONSE_MAGIC_WITH_ANNEXES
+        } else if response.client_registry.is_empty() {
             &RESPONSE_MAGIC
         } else {
             &RESPONSE_MAGIC_WITH_CLIENT_REGISTRY
@@ -201,10 +236,18 @@ impl request_response::Codec for StateManifestCodec {
             io.write_all(&page.encoded_len.to_le_bytes()).await?;
             io.write_all(&page.descriptor_count.to_le_bytes()).await?;
         }
-        if !response.client_registry.is_empty() {
+        if !response.client_registry.is_empty() || !response.annexes.is_empty() {
             io.write_all(&(response.client_registry.len() as u16).to_le_bytes())
                 .await?;
             io.write_all(&response.client_registry).await?;
+        }
+        if !response.annexes.is_empty() {
+            io.write_all(&[response.annexes.len() as u8]).await?;
+            for annex in &response.annexes {
+                io.write_all(&[annex.kind.code()]).await?;
+                io.write_all(&annex.len.to_le_bytes()).await?;
+                io.write_all(&annex.root).await?;
+            }
         }
         io.flush().await
     }
@@ -263,6 +306,9 @@ fn validate_header(header: &GetStateManifestHeader) -> io::Result<()> {
     if header.segment_count > maximum_segments {
         return Err(invalid_data("manifest segment count exceeds State domain"));
     }
+    if !snapshot_annexes_are_canonical(&header.annexes) {
+        return Err(invalid_data("manifest annexes are not canonical"));
+    }
     if !header.has_canonical_page_shape() || !header.has_valid_manifest_digest() {
         return Err(invalid_data("manifest page shape or digest is invalid"));
     }
@@ -311,6 +357,10 @@ mod tests {
         StreamProtocol::new("/jetsam/test/sync/manifest/7")
     }
 
+    fn hexed(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     fn populated() -> (GetStateManifestHeader, Vec<std::sync::Arc<[u8]>>) {
         let manifest = populated_manifest();
         manifest.to_header_and_pages().unwrap()
@@ -339,6 +389,7 @@ mod tests {
             segment_roots: vec![[0x33; 32], [0x44; 32]],
             segment_lengths: vec![209, 259],
             client_registry: Vec::new(),
+            annexes: Vec::new(),
         };
         assert!(manifest.seal_manifest_digest());
         manifest
@@ -464,6 +515,175 @@ mod tests {
             .write_response(&protocol(), &mut wire, late_header)
             .await
             .is_err());
+    }
+
+    /// T7.1: a manifest of a boundary below J (no annex, no registry) is the
+    /// released frame, byte for byte: pinned digest and frame hash.
+    #[tokio::test]
+    async fn a_manifest_without_annexes_is_byte_identical_to_the_released_one() {
+        let (header, _) = populated();
+        assert_eq!(
+            hexed(&header.manifest_digest),
+            "ced3219b0d2089cf33e489bb668c2bf6029b137bf929e4c75f666b1bfaaba4fb"
+        );
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, header)
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], b"JMH7");
+        assert_eq!(
+            hexed(blake3::hash(wire.get_ref()).as_bytes()),
+            "e66f85a537332e9223c4d3a024a9a7d0c585535c040453509ca6889cac76fde0"
+        );
+    }
+
+    /// T7.1: a manifest at or above J commits to its annexes (kind, length,
+    /// root) in a third frame (`JMH9`, with or without a client registry);
+    /// another root, a missing or repeated annex, an unknown kind, a bad
+    /// count or an annex out of its bound is refused.
+    #[tokio::test]
+    async fn a_manifest_commits_to_the_annexes_of_its_boundary() {
+        use jetsam_chain::storage::{SnapshotAnnexKind, SnapshotAnnexRef};
+        let (plain, _) = populated();
+        let destination = SnapshotAnnexRef {
+            kind: SnapshotAnnexKind::DestinationState,
+            len: 13,
+            root: [0xD5; 32],
+        };
+        let journal = SnapshotAnnexRef {
+            kind: SnapshotAnnexKind::GuardianJournal,
+            len: 2_000_000,
+            root: [0x6A; 32],
+        };
+        let mut carrying = populated_manifest();
+        carrying.annexes = vec![destination, journal];
+        assert!(carrying.seal_manifest_digest());
+        let (header, _) = carrying.to_header_and_pages().unwrap();
+        assert_eq!(header.annexes, vec![destination, journal]);
+        assert_ne!(header.manifest_digest, plain.manifest_digest, "the digest commits to them");
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, header.clone())
+            .await
+            .unwrap();
+        let bytes = wire.into_inner();
+        assert_eq!(&bytes[..4], b"JMH9");
+        assert_eq!(
+            bytes.len(),
+            RESPONSE_HEADER_BYTES + PAGE_REF_BYTES + 2 + 1 + 2 * ANNEX_REF_BYTES
+        );
+        assert_eq!(
+            StateManifestCodec
+                .read_response(&protocol(), &mut Cursor::new(bytes.clone()))
+                .await
+                .unwrap(),
+            header
+        );
+        // Another root: the digest no longer matches.
+        let mut altered = bytes.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert!(StateManifestCodec
+            .read_response(&protocol(), &mut Cursor::new(altered))
+            .await
+            .is_err());
+        // An unknown kind, a zero count, three annexes on the wire.
+        let count_at = RESPONSE_HEADER_BYTES + PAGE_REF_BYTES + 2;
+        for (at, value) in [(count_at + 1, 9u8), (count_at, 0), (count_at, 3)] {
+            let mut bad = bytes.clone();
+            bad[at] = value;
+            assert!(
+                StateManifestCodec
+                    .read_response(&protocol(), &mut Cursor::new(bad))
+                    .await
+                    .is_err(),
+                "{at} {value}"
+            );
+        }
+        // Non-canonical annex lists are sealed by no digest.
+        let oversized = SnapshotAnnexRef {
+            len: (4 << 20) + 1,
+            ..destination
+        };
+        let empty = SnapshotAnnexRef { len: 0, ..journal };
+        for annexes in [
+            vec![journal, destination],
+            vec![destination, destination],
+            vec![oversized],
+            vec![empty],
+        ] {
+            let mut bad = populated_manifest();
+            bad.annexes = annexes.clone();
+            assert!(!bad.seal_manifest_digest(), "{annexes:?}");
+        }
+        // With a client registry too: one JMH9 frame carrying both.
+        use jetsam_chain::consensus::client_objects::{
+            ClientObjectsEffect, ClientRegistryEntry, ClientRegistryState,
+        };
+        let mut registry = ClientRegistryState::new();
+        registry.apply(&ClientObjectsEffect {
+            registrations: vec![ClientRegistryEntry {
+                index: 0,
+                matrix_digest: [0xD1; 32],
+                matrix_file_root: [0xF1; 32],
+                matrix_file_len: 4_096,
+                registered_at: 70,
+                active_from: 550,
+                license: Default::default(),
+            }],
+            ..ClientObjectsEffect::default()
+        });
+        let mut both = carrying.clone();
+        both.client_registry = registry.encode();
+        assert!(both.seal_manifest_digest());
+        let (both_header, _) = both.to_header_and_pages().unwrap();
+        assert_ne!(both_header.manifest_digest, header.manifest_digest);
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, both_header.clone())
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], b"JMH9");
+        assert_eq!(
+            StateManifestCodec
+                .read_response(&protocol(), &mut Cursor::new(wire.into_inner()))
+                .await
+                .unwrap(),
+            both_header
+        );
+        // A registry frame (`JMH8`) never carries an empty registry.
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, plain.clone())
+            .await
+            .unwrap();
+        let mut empty_registry = wire.into_inner();
+        empty_registry[..4].copy_from_slice(b"JMH8");
+        empty_registry.extend_from_slice(&[0, 0]);
+        assert!(StateManifestCodec
+            .read_response(&protocol(), &mut Cursor::new(empty_registry))
+            .await
+            .is_err());
+        // An annex frame without an annex would be a second encoding of a
+        // plain manifest (its digest is the plain one): refused (found by
+        // mutant p06).
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, plain.clone())
+            .await
+            .unwrap();
+        let mut no_annex = wire.into_inner();
+        no_annex[..4].copy_from_slice(b"JMH9");
+        no_annex.extend_from_slice(&[0, 0, 0]);
+        assert!(StateManifestCodec
+            .read_response(&protocol(), &mut Cursor::new(no_annex))
+            .await
+            .is_err());
+        // The manifest assembled from its pages keeps them.
+        let (header, pages) = carrying.to_header_and_pages().unwrap();
+        let assembled = crate::protocol::VerifiedStateManifest::from_pages(&header, &pages).unwrap();
+        assert_eq!(assembled.annexes, vec![destination, journal]);
     }
 
     #[tokio::test]

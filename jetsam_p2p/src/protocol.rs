@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{ops::Deref, sync::Arc};
 
 use crate::header_protocol::HeaderInventoryRecord;
+pub use jetsam_chain::storage::{SnapshotAnnexKind, SnapshotAnnexRef};
 use crate::object_protocol::{ChainPoint, DataResponseStatus, SnapshotId};
 
 /// Deterministic finalized heights at which independent nodes build the same
@@ -186,6 +187,13 @@ pub struct GetStateManifestHeader {
     /// the installed state and headers.
     #[serde(default)]
     pub client_registry: Vec<u8>,
+    /// The v1.7 annexes of a boundary at or above J (T7.1): the destination
+    /// state file and the guardian journal, by kind, exact length and root,
+    /// in kind order; empty below J. The manifest digest commits to them;
+    /// they travel as content-addressed files on the client-object protocol,
+    /// and the receiver authenticates their content at the install.
+    #[serde(default)]
+    pub annexes: Vec<SnapshotAnnexRef>,
 }
 
 /// Manifest response: chain metadata + list of active segment IDs.
@@ -233,6 +241,22 @@ pub struct GetStateManifestResponse {
     /// when there is none (M3.8). See [`GetStateManifestHeader::client_registry`].
     #[serde(default)]
     pub client_registry: Vec<u8>,
+    /// The v1.7 annexes of the boundary (T7.1). See
+    /// [`GetStateManifestHeader::annexes`].
+    #[serde(default)]
+    pub annexes: Vec<SnapshotAnnexRef>,
+}
+
+/// At most one annex of each kind.
+pub const MAX_SNAPSHOT_MANIFEST_ANNEXES: usize = SnapshotAnnexKind::ALL.len();
+const SNAPSHOT_MANIFEST_ANNEX_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/V1.7-ANNEXES/V1";
+
+/// Whether a manifest's annexes are canonical: each kind at most once, in
+/// kind order, each admissible (non-empty, within its kind's bound).
+pub fn snapshot_annexes_are_canonical(annexes: &[SnapshotAnnexRef]) -> bool {
+    annexes.len() <= MAX_SNAPSHOT_MANIFEST_ANNEXES
+        && annexes.iter().all(SnapshotAnnexRef::is_admissible)
+        && annexes.windows(2).all(|pair| pair[0].kind < pair[1].kind)
 }
 
 /// Upper bound of the registry bytes a manifest carries: version, count, and
@@ -278,6 +302,19 @@ impl GetStateManifestHeader {
             hasher.update(SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN);
             hasher.update(&(self.client_registry.len() as u16).to_le_bytes());
             hasher.update(&self.client_registry);
+        }
+        // A manifest without annexes hashes exactly as before v1.7.
+        if !self.annexes.is_empty() {
+            if !snapshot_annexes_are_canonical(&self.annexes) {
+                return None;
+            }
+            hasher.update(SNAPSHOT_MANIFEST_ANNEX_DOMAIN);
+            hasher.update(&[self.annexes.len() as u8]);
+            for annex in &self.annexes {
+                hasher.update(&[annex.kind.code()]);
+                hasher.update(&annex.len.to_le_bytes());
+                hasher.update(&annex.root);
+            }
         }
         Some(*hasher.finalize().as_bytes())
     }
@@ -377,6 +414,7 @@ impl GetStateManifestHeader {
             segment_roots,
             segment_lengths,
             client_registry: self.client_registry.clone(),
+            annexes: self.annexes.clone(),
         };
         validate_manifest_descriptors(&response).then_some(response)
     }
@@ -522,6 +560,7 @@ impl GetStateManifestResponse {
             segment_count: u32::try_from(self.segment_ids.len()).ok()?,
             descriptor_pages: refs,
             client_registry: self.client_registry.clone(),
+            annexes: self.annexes.clone(),
         };
         header.seal_manifest_digest().then_some((header, pages))
     }
