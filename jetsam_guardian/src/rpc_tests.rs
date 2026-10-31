@@ -19,9 +19,14 @@ fn json_rpc_round_trip_over_a_local_socket() {
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
+        let mut req = String::new();
         let mut buf = vec![0u8; 4096];
-        let n = s.read(&mut buf).unwrap();
-        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        // the head and the body may arrive in two reads
+        while !req.contains("\"params\"") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the body");
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
         let body = r#"{"jsonrpc":"2.0","id":1,"result":42}"#;
         write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
         req
