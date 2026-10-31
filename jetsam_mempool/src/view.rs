@@ -74,6 +74,29 @@ pub fn vault_view_for_child(
     })
 }
 
+/// The v1.7 states the block at `height` is judged against, after a tip
+/// whose destination and guardian states are `destination` and `guardian`
+/// and whose header has `tip_alloc_counter` (the floor of both at J): the
+/// [`VaultView`] and the guardian state. A2-m5: `None` for both when the tip
+/// header cannot be read — never a floor 0, which would admit at J what the
+/// block refuses.
+pub fn v1_7_states_for_child(
+    destination: Option<&DestinationState>,
+    guardian: Option<&GuardianState>,
+    tip_alloc_counter: Option<u64>,
+    height: u64,
+    destination_rules: &DestinationRules,
+    guardian_activation: Option<u64>,
+) -> (Option<VaultView>, Option<Arc<GuardianState>>) {
+    let Some(floor) = tip_alloc_counter else {
+        return (None, None);
+    };
+    (
+        vault_view_for_child(destination, floor, height, destination_rules),
+        GuardianState::for_child(guardian, floor, height, guardian_activation).map(Arc::new),
+    )
+}
+
 #[derive(Debug)]
 pub enum ChainViewReadError {
     StaleOrUnavailable,
@@ -282,22 +305,16 @@ impl ChainView {
                     .ok()
                     .flatten()
                     .map(|header| header.alloc_counter)
-            })
-            .unwrap_or(0);
-        view.vault = vault_view_for_child(
+            });
+        (view.vault, view.guardian) = v1_7_states_for_child(
             ctx.destination_state(),
-            tip_alloc_counter,
-            ctx.tip_height.saturating_add(1),
-            &view.destination_rules,
-        );
-        view.committee_keys = Arc::new(ctx.committee_keys().clone());
-        view.guardian = GuardianState::for_child(
             ctx.guardian_state(),
             tip_alloc_counter,
             ctx.tip_height.saturating_add(1),
+            &view.destination_rules,
             GuardianRules::current().activation_height,
-        )
-        .map(Arc::new);
+        );
+        view.committee_keys = Arc::new(ctx.committee_keys().clone());
         let anchor_height = tx_epoch_anchor_height_for_child(ctx.tip_height + 1);
         view.user_epoch_anchor_id = ctx
             .get_header_from_store(anchor_height)
@@ -402,6 +419,39 @@ mod tests {
             vault_view_for_child(Some(&parent), 999, 962, &DestinationRules::CONSENSUS).is_some(),
             jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_some()
         );
+    }
+
+    /// A2-m5: a tip whose header cannot be read gives the next block no
+    /// vault view and no guardian state (nothing destination or guardian is
+    /// admitted), at J and above; with the header, J starts from its
+    /// `alloc_counter`.
+    #[test]
+    fn missing_tip_header_gives_no_vault_and_no_guardian_view() {
+        let j = 960;
+        let rules = DestinationRules {
+            activation_height: Some(j),
+            vault: jetsam_chain::consensus::vault::VaultRules {
+                activation_height: Some(j),
+                ..jetsam_chain::consensus::vault::VaultRules::current()
+            },
+            ..DestinationRules::CONSENSUS
+        };
+        let mut parent = DestinationState::at_v1_7(j, 77);
+        parent.tip = j + 1;
+        let guardian = GuardianState::at_v1_7(77);
+        for (height, destination, parent_guardian) in
+            [(j, None, None), (j + 2, Some(&parent), Some(&guardian))]
+        {
+            let (vault, guardian) =
+                v1_7_states_for_child(destination, parent_guardian, None, height, &rules, Some(j));
+            assert_eq!(vault, None, "height {height}");
+            assert!(guardian.is_none(), "height {height}");
+        }
+        let (vault, guardian) = v1_7_states_for_child(None, None, Some(77), j, &rules, Some(j));
+        assert_eq!(vault.expect("J").floor, 77);
+        assert_eq!(guardian.expect("J").vault_floor, 77);
+        let (vault, _) = v1_7_states_for_child(None, None, Some(77), j - 1, &rules, Some(j));
+        assert_eq!(vault, None, "below J");
     }
 
     /// JETSAM CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
