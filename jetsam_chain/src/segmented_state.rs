@@ -680,6 +680,14 @@ impl SegmentedFriState {
         self.segments[seg_id as usize].as_deref()
     }
 
+    /// The resident column version of a segment itself. Every write goes
+    /// through `Arc::make_mut`, so whoever holds a clone of this `Arc` keeps
+    /// an unchanging version.
+    #[inline]
+    pub(crate) fn shared_segment_columns(&self, seg_id: u16) -> Option<&Arc<SegmentColumns>> {
+        self.segments[seg_id as usize].as_ref()
+    }
+
     /// Borrow the column data for a segment (materialises if needed).
     ///
     /// For virtual zero segments at production size (`effective_log_seg ==
