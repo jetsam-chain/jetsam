@@ -183,7 +183,8 @@ impl FakeTor {
                 count.fetch_add(1, Ordering::SeqCst);
                 let config = config.clone();
                 let log = log.clone();
-                let close_rx = close_rx.clone();
+                let mut close_rx = close_rx.clone();
+                close_rx.borrow_and_update();
                 tokio::spawn(Self::session(stream, config, log, close_rx));
             }
         });

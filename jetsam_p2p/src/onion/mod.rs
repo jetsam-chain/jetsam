@@ -27,6 +27,8 @@
 //! - [`guardian`]: the onion-only mode of guardians (D60) and the startup
 //!   refusals that keep it fail-closed.
 //! - [`policy`]: which peer addresses a node keeps in each mode.
+//! - [`swarm`]: the transports of the node's swarm in each mode.
+//! - [`runtime`]: the running service — listener, publication, republication.
 //!
 //! Two modes, both off by default. **Dual** (`additional`) adds an onion
 //! address beside clearnet: more ways in, and the node's IP address stays
@@ -40,9 +42,11 @@ pub mod control;
 pub mod guardian;
 pub mod key_store;
 pub mod policy;
+pub mod runtime;
 pub mod service;
 mod sha3;
 pub mod socks5;
+pub mod swarm;
 pub mod transport;
 
 #[cfg(test)]
