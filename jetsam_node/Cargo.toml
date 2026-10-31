@@ -24,6 +24,13 @@ path = "src/main.rs"
 name = "jetsam-cli"
 path = "src/bin/jetsam_cli.rs"
 
+# --- PRIVATE rehearsal tool (T7.2): built only with `rehearsal-v1-7`, never
+# distributed. Synthetic L1 objects and test-key attestations as intents.
+[[bin]]
+name = "jetsam-rehearsal"
+path = "src/bin/jetsam_rehearsal.rs"
+required-features = ["rehearsal-v1-7"]
+
 [dependencies]
 jetsam_chain      = { path = "../jetsam_chain" }
 jetsam_block      = { path = "../jetsam_block" }
