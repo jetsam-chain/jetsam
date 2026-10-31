@@ -555,3 +555,117 @@ fn template_rebuilds_without_invalid_destination_objects() {
         .iter()
         .all(|r| r.release.n == 2));
 }
+
+/// The withdrawal indices an offer carries.
+fn ns(offer: &DestinationOffer) -> Vec<u64> {
+    offer.releases.iter().map(|r| r.release.n).collect()
+}
+
+fn not_proven(n: u64) -> DestinationBlockError {
+    DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
+        n,
+        error: jetsam_chain::consensus::destination::l1_read::L1ReadError::CommitmentMismatch,
+    })
+}
+
+/// A judge refusing the first carried release of `bad` (V7), else building
+/// the block: what it carries.
+fn judge(bad: &[u64], offer: &DestinationOffer) -> Result<(Vec<u64>, bool), Option<DestinationBlockError>> {
+    match offer.releases.iter().find(|r| bad.contains(&r.release.n)) {
+        Some(r) => Err(Some(not_proven(r.release.n))),
+        None => Ok((ns(offer), offer.committee_update.is_some())),
+    }
+}
+
+/// A2-M1: a block refused for one release is built again without that
+/// release only — the others stay in it — and again without the next one a
+/// new refusal blames; a committee update the light client refuses leaves
+/// the releases in; a refusal that blames nothing (a local fault), or every
+/// object, or a refusal of another kind ends the tries.
+#[test]
+fn template_keeps_the_other_releases_when_one_is_blamed() {
+    use jetsam_chain::consensus::destination::l1_read::L1ReadError;
+    use jetsam_chain::consensus::destination::light_client::LightClientError;
+    let releases = || {
+        vec![
+            release(1, 5 * MICRO_PER_JTM),
+            release(2, 5 * MICRO_PER_JTM),
+            release(3, 5 * MICRO_PER_JTM),
+        ]
+    };
+    let offer = DestinationOffer {
+        committee_update: None,
+        releases: releases(),
+    };
+    let run = |offer: &DestinationOffer, error: DestinationBlockError, bad: &[u64]| {
+        let mut tried = Vec::new();
+        let (built, blamed) = retry_without_culprits(offer, &error, |reduced| {
+            tried.push(ns(reduced));
+            judge(bad, reduced)
+        });
+        (built, blamed, tried)
+    };
+
+    // One bad release: the block carries the two others.
+    let (built, blamed, tried) = run(&offer, not_proven(2), &[2]);
+    assert_eq!(built, Some((vec![1, 3], false)));
+    assert_eq!(
+        blamed,
+        Culprits {
+            releases: vec![2],
+            committee_update: false
+        }
+    );
+    assert_eq!(tried, vec![vec![1, 3]]);
+
+    // Two bad releases: one try per refusal.
+    let (built, blamed, tried) = run(&offer, not_proven(2), &[2, 3]);
+    assert_eq!(built, Some((vec![1], false)));
+    assert_eq!(blamed.releases, vec![2, 3]);
+    assert_eq!(tried, vec![vec![1, 3], vec![1]]);
+
+    // A refused committee update: the releases stay.
+    let with_update = DestinationOffer {
+        committee_update: Some(committee(1_895)),
+        releases: releases(),
+    };
+    let (built, blamed, _) = run(
+        &with_update,
+        DestinationBlockError::LightClient(LightClientError::SlotOrder),
+        &[],
+    );
+    assert_eq!(built, Some((vec![1, 2, 3], false)));
+    assert_eq!(
+        blamed,
+        Culprits {
+            releases: Vec::new(),
+            committee_update: true
+        }
+    );
+
+    // Nothing blamed (a local fault): no try, nothing forgotten.
+    let (built, blamed, tried) = run(
+        &offer,
+        DestinationBlockError::CommitteeKeysUnavailable { root: [0; 32] },
+        &[],
+    );
+    assert_eq!((built, blamed, tried.len()), (None, Culprits::default(), 0));
+
+    // Every object blamed (their shared account proof): nothing left to try.
+    let (built, blamed, tried) = run(
+        &offer,
+        DestinationBlockError::BridgeAccount(L1ReadError::CodeHashMismatch),
+        &[],
+    );
+    assert_eq!((built, tried.len()), (None, 0));
+    assert_eq!(blamed.releases, vec![1, 2, 3]);
+
+    // The reduced block refused for another reason: the tries end there.
+    let mut tried = 0;
+    let (built, blamed) = retry_without_culprits(&offer, &not_proven(1), |_| {
+        tried += 1;
+        Err::<(), _>(None)
+    });
+    assert_eq!((built, tried), (None, 1));
+    assert_eq!(blamed.releases, vec![1]);
+}

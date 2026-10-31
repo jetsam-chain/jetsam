@@ -16,8 +16,9 @@
 //! is the offer's objects whose transactions the block kept, releases in the
 //! order of their markers ([`DestinationOffer::section_for`]); the template
 //! judges the block by `validate_block_destination` and, refused, builds it
-//! again without the destination objects, forgetting those the refusal blames
-//! ([`culprits_of`]).
+//! again without what the refusal blames ([`retry_without_culprits`], A2-M1),
+//! then, still refused, without the destination objects, forgetting those the
+//! refusals blame ([`culprits_of`]).
 
 use jetsam_chain::consensus::destination::state::{
     committee_update_marker, DestinationBlockError, DestinationRules, DestinationState,
@@ -351,6 +352,54 @@ pub fn culprits_of(error: &DestinationBlockError, offer: &DestinationOffer) -> C
             kind: DestinationObjectKind::CommitteeUpdate,
         } => update(),
         _ => Culprits::default(),
+    }
+}
+
+/// A2-M1: what a template does after the block carrying `offer` was refused
+/// with `error` by the destination rules, before it gives up the whole
+/// offer: it tries the offer without what the refusal blames ([`culprits_of`],
+/// [`DestinationOffer::without`]) — and again without what a new refusal of
+/// that one blames, while something is blamed and something is left. So one
+/// bad release (or a bad committee update) no longer takes the others out of
+/// the block. `attempt` builds and judges the block carrying an offer: `Ok`,
+/// or `Err(Some(error))` for a destination refusal, `Err(None)` for any
+/// other (no further try). Returns the first accepted build, if any, and
+/// everything blamed on the way (for the pool to forget).
+pub fn retry_without_culprits<T>(
+    offer: &DestinationOffer,
+    error: &DestinationBlockError,
+    mut attempt: impl FnMut(&DestinationOffer) -> Result<T, Option<DestinationBlockError>>,
+) -> (Option<T>, Culprits) {
+    let mut blamed = Culprits::default();
+    let mut current = offer.clone();
+    let mut culprits = culprits_of(error, &current);
+    loop {
+        let reduced = current.without(&culprits);
+        if reduced.is_empty() || reduced == current {
+            blamed.add(&culprits);
+            return (None, blamed);
+        }
+        blamed.add(&culprits);
+        match attempt(&reduced) {
+            Ok(built) => return (Some(built), blamed),
+            Err(Some(error)) => {
+                culprits = culprits_of(&error, &reduced);
+                current = reduced;
+            }
+            Err(None) => return (None, blamed),
+        }
+    }
+}
+
+impl Culprits {
+    /// Blame `other`'s objects too.
+    fn add(&mut self, other: &Culprits) {
+        for n in &other.releases {
+            if !self.releases.contains(n) {
+                self.releases.push(*n);
+            }
+        }
+        self.committee_update |= other.committee_update;
     }
 }
 

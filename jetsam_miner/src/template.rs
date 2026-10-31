@@ -931,7 +931,32 @@ impl TemplateBuilder {
                 // out without them, and what the refusal blames is forgotten.
                 Err(refusal) if offers_destination => {
                     if let Refusal::Destination(error) = &refusal {
-                        blamed = Some(crate::destination_slot::culprits_of(error, offer_ref));
+                        report(
+                            &refusal,
+                            "with its destination objects: built again without the ones it blames",
+                        );
+                        // 1b. (A2-M1) Without what the refusal blames, before
+                        // the whole offer is given up: one bad release no
+                        // longer takes the others out of the block.
+                        let (built, culprits) = crate::destination_slot::retry_without_culprits(
+                            offer_ref,
+                            error,
+                            |reduced| {
+                                let mut retry = txs.clone();
+                                retry.extend(reduced.payment_order());
+                                attempt(retry, true, true, false).map_err(|refusal| match refusal {
+                                    Refusal::Destination(error) => Some(error),
+                                    other => {
+                                        report(&other, "without the destination objects it blamed");
+                                        None
+                                    }
+                                })
+                            },
+                        );
+                        blamed = Some(culprits);
+                        if let Some(built) = built {
+                            return Some(built);
+                        }
                     }
                     if let (Refusal::Client(_), Some(batch), Some(source)) =
                         (&refusal, &offered_batch, &self.client_source)
