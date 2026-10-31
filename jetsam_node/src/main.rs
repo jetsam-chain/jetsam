@@ -3116,6 +3116,14 @@ async fn main() -> anyhow::Result<()> {
                         .send(jetsam_p2p::NetworkCommand::BroadcastTx { intent_bytes })
                         .await;
                 }
+                // v1.7 (T7.1): a held destination or guardian intent goes to
+                // the peers on the bridge-intent topic (nothing is sent when
+                // this node has no such topic).
+                Ok(jetsam_mempool::MempoolEvent::BridgeIntentAdmitted { intent_bytes }) => {
+                    let _ = p2p_tx_relay
+                        .send(jetsam_p2p::NetworkCommand::BroadcastBridgeIntent { intent_bytes })
+                        .await;
+                }
                 Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason }) => {
                     // The wallet release runs first, and the log second. An
                     // epoch boundary evicts the whole pool in one burst, and
@@ -13582,20 +13590,35 @@ async fn handle_p2p_events(
                 }
             }
             // v1.7 (T7.1): an intent a peer relayed on the bridge-intent
-            // topic. Not admitted yet: the mempool must first judge an intent
-            // as a block does (audit A2 M1, M2) before peers can feed it;
-            // until then it is dropped unforwarded, without penalty.
+            // topic, admitted with that peer as its source, off the event
+            // loop (its signatures and proofs are checked); only an intent
+            // this node holds is forwarded.
             Ok(NetworkEvent::BridgeIntentRelayed {
                 from,
+                family,
+                intent_bytes,
                 gossip_message_id,
-                ..
             }) => {
-                resolve_tx_gossip(
-                    &p2p_cmd,
-                    from,
-                    Some(gossip_message_id),
-                    libp2p::gossipsub::MessageAcceptance::Ignore,
-                );
+                let mempool_task = mempool.clone();
+                let p2p_cmd_task = p2p_cmd.clone();
+                tokio::spawn(async move {
+                    let result = jetsam_node::bridge_intents::submit_relayed_bridge_intent(
+                        &mempool_task,
+                        from,
+                        family,
+                        &intent_bytes,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        tracing::debug!(peer = %from, ?family, %error, "relayed bridge intent not held");
+                    }
+                    resolve_tx_gossip(
+                        &p2p_cmd_task,
+                        from,
+                        Some(gossip_message_id),
+                        jetsam_node::bridge_intents::relayed_intent_acceptance(&result),
+                    );
+                });
             }
             Ok(NetworkEvent::NewTx {
                 from,
