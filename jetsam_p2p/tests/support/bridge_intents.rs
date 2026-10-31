@@ -90,3 +90,21 @@ pub fn destination_intent_bytes(n: u64) -> Vec<u8> {
     .encode()
     .unwrap()
 }
+
+/// An attestation whose body is all `fill` (well-formed bytes: a statement
+/// and a signature that verify nowhere), its marker in the payment.
+pub fn attestation_intent_bytes(fill: u8) -> Vec<u8> {
+    use jetsam_chain::consensus::guardian::GuardianObjectKind;
+    use jetsam_chain::consensus::guardian::{GuardianObject, ATTESTATION_BODY_BYTES};
+    let object = GuardianObject::new(
+        GuardianObjectKind::Attestation,
+        vec![fill; ATTESTATION_BODY_BYTES],
+    );
+    let marker = object.marker();
+    GuardianIntent {
+        object,
+        payment: payment(Address([0x62; 32]), &[(marker, 0)], 50_000),
+    }
+    .encode()
+    .unwrap()
+}
