@@ -49,3 +49,14 @@ fn witness_source_must_report_height_as_final() {
     let ok = [src("g2", 110, 100, 1, 5), src("g3", 108, 100, 1, 5), silent];
     assert_eq!(witness(100, &[1u8; 32], &ok, NOW, r), (true, "OK".into()));
 }
+
+#[test]
+fn observer_stops_on_fast_path_revoked_on_the_l1() {
+    // SG-9, L1 side: a revoked fast path stops the co-signatures; attestations go on until Jetsam revokes
+    assert_eq!(l1_gate(Some(true), true), Err("KEY_REVOKED:fast_path_revoked_on_l1".to_string()));
+    assert_eq!(l1_gate(Some(true), false), Ok(()));
+    assert_eq!(l1_gate(Some(false), true), Ok(()));
+    // the L1 unreadable: SG-9 applies "if the L1 is read" (design §3.1, §10.4: never an extra condition)
+    assert_eq!(l1_gate(None, true), Ok(()));
+    assert_eq!(l1_gate(None, false), Ok(()));
+}

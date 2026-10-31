@@ -59,6 +59,16 @@ pub fn witness(height: u64, block_id: &[u8; 32], sources: &[SourceView], now: u6
     (true, "OK".into())
 }
 
+/// SG-9 on the L1 side (design §10.4: the L1 is read, never as a reason to sign):
+/// `fast_revoked` = the contract's `fastRevoked()` (`None`: unreadable); `cosign`
+/// = a statement meant for the L1 (a co-signature or the genesis).
+pub fn l1_gate(fast_revoked: Option<bool>, cosign: bool) -> Result<(), String> {
+    if cosign && fast_revoked == Some(true) {
+        return Err("KEY_REVOKED:fast_path_revoked_on_l1".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "witness_tests.rs"]
 mod tests;

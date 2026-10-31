@@ -152,6 +152,12 @@ impl Net {
                 sources.push(v);
             }
         }
+        // SG-9 on the L1 side, if the L1 is read
+        if let Err(code) = jetsam_guardian::witness::l1_gate(self.fast_revoked(), kind != "attestation") {
+            self.refuse(&code);
+            log(&format!("W refused {kind} h={} {code}", s.height));
+            return;
+        }
         let rule = WitnessRule { min_sources: self.cfg.min_sources, ..WitnessRule::default() };
         let (ok, code) = witness(s.height, &s.block_id, &sources, now, rule);
         if !ok {
@@ -215,6 +221,15 @@ impl Net {
             log("SECOND INSTANCE of this index seen: HALT");
             let _ = ipc::request(&self.run_dir.join("sign-net.sock"), &json!({"op": "halt", "cause": "SECOND_INSTANCE"}), Duration::from_secs(5));
         }
+    }
+
+    /// `fastRevoked()` of the L1 bridge (`None` when the L1 is not configured or unreadable).
+    fn fast_revoked(&self) -> Option<bool> {
+        let url = self.cfg.l1_rpc.as_ref()?;
+        let data = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("fastRevoked()")));
+        let v = call(url, "eth_call", json!([{"to": self.cfg.l1_bridge, "data": data}, "latest"]), Duration::from_secs(10)).ok()?;
+        let w = hex::decode(v.as_str()?.trim_start_matches("0x")).ok()?;
+        Some(w.last().copied()? == 1)
     }
 
     fn heartbeat(&mut self) {
