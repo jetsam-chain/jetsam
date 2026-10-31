@@ -23,7 +23,7 @@
 //!   the canonical chain ([`CanonicalView`]), the divergent peers and the
 //!   header batches. The probe plan only says which ranges to ask whom
 //!   ([`BranchObserver::probes_due`]); sending them, and the three call
-//!   points in the daemon, belong to T3.10b.
+//!   points in the daemon, are [`crate::branch_observer_node`]'s (T3.10b).
 //!
 //! Bounds: 64 branches and 32 MiB of headers recorded, 10 080 headers per
 //! branch, 8 peers probed with at most one probe in flight each, and a
@@ -388,6 +388,16 @@ impl BranchObserver {
         }
         due.sort_by_key(|probe| probe.peer.to_bytes());
         due
+    }
+
+    /// The peers whose probe is not over: those whose connection this node
+    /// asks the P2P layer to keep (`NetworkCommand::ProbingPeers`, T3.10b).
+    pub fn probing_peers(&self) -> HashSet<PeerId> {
+        self.probes
+            .iter()
+            .filter(|(_, probe)| !probe.done)
+            .map(|(peer, _)| *peer)
+            .collect()
     }
 
     /// A header batch from `from`. Only the answer to its probe in flight is

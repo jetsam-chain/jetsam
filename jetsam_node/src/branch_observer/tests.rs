@@ -927,3 +927,40 @@ fn observed_branches_excludes_real_143_and_151_zombie_headers() {
         );
     }
 }
+
+/// T3.10b: the peers whose probe is not over, those the node asks the P2P
+/// layer to keep connected: at most eight, and gone once the probe is over
+/// (here a peer that serves nothing below its divergence height) or the peer
+/// is no longer refused.
+#[test]
+fn probing_peers_are_the_probes_not_over() {
+    let canonical = Chain::from_genesis(20);
+    let mut observer = BranchObserver::with_rules(NO_POW, None, 1);
+    let mut peers = [PeerId::random(), PeerId::random()];
+    peers.sort_by_key(|peer| peer.to_bytes());
+    let [a, b] = peers;
+    let now = canonical.now();
+    observer.on_divergent_peers(&[divergent(a, 11, None), divergent(b, 15, None)], now);
+    assert_eq!(observer.probing_peers(), HashSet::from([a, b]));
+    let both = HashSet::from([a, b]);
+    assert_eq!(observer.probes_due(&both, &HashSet::new(), now).len(), 2);
+    assert_eq!(observer.probing_peers(), HashSet::from([a, b]), "in flight");
+    observer.on_headers(a, &[], &canonical, now);
+    assert_eq!(
+        observer.probing_peers(),
+        HashSet::from([b]),
+        "a served nothing: over"
+    );
+    observer.on_divergent_peers(&[divergent(a, 11, None)], now + 1);
+    assert!(
+        observer.probing_peers().is_empty(),
+        "b no longer refused, a over"
+    );
+
+    let crowd = (0..20)
+        .map(|_| divergent(PeerId::random(), 50, None))
+        .collect::<Vec<_>>();
+    let mut crowded = BranchObserver::with_rules(NO_POW, None, 1);
+    crowded.on_divergent_peers(&crowd, now);
+    assert_eq!(crowded.probing_peers().len(), MAX_PROBED_PEERS);
+}

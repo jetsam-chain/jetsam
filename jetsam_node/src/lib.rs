@@ -6,6 +6,7 @@
 //! fault-injection tests.
 
 pub mod branch_observer;
+pub mod branch_observer_node;
 pub mod bridge_intents;
 pub mod client_batches;
 pub mod client_objects;
