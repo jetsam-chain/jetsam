@@ -29,6 +29,7 @@ use crate::{
     object_protocol::DataResponseStatus,
 };
 use jetsam_chain::consensus::client_objects::{ClientSubmission, CLIENT_MATRIX_MAX_FILE_BYTES};
+use jetsam_chain::storage::{SnapshotAnnexKind, SnapshotAnnexRef};
 
 const REQUEST_MAGIC: [u8; 4] = *b"JCQ1";
 const RESPONSE_MAGIC: [u8; 4] = *b"JCS1";
@@ -37,6 +38,11 @@ const KIND_MANIFEST: u8 = 2;
 const KIND_CHUNK: u8 = 3;
 /// A v1.6 batch bundle.
 const KIND_BATCH: u8 = 4;
+/// v1.7 (T7.1): a snapshot annex's index, one of its chunks.
+const KIND_ANNEX_INDEX: u8 = 5;
+const KIND_ANNEX_CHUNK: u8 = 6;
+/// An annex reference on the wire: kind, length, root.
+const ANNEX_BYTES: usize = 1 + 4 + 32;
 const NONE_LEN: u32 = u32::MAX;
 
 /// Protocol path under the network's protocol id.
@@ -55,6 +61,16 @@ pub enum ClientObjectRequest {
     },
     /// A v1.6 batch bundle, by its id.
     Batch(crate::client_object_protocol::ClientBatchId),
+    /// v1.7 (T7.1): the index (chunk digests) of a snapshot annex, by the
+    /// reference its manifest commits to.
+    SnapshotAnnexIndex(SnapshotAnnexRef),
+    /// v1.7: chunk `index` of a snapshot annex; `digest` is the one its
+    /// index lists.
+    SnapshotAnnexChunk {
+        annex: SnapshotAnnexRef,
+        index: u32,
+        digest: Hash32,
+    },
 }
 
 impl ClientObjectRequest {
@@ -82,6 +98,8 @@ impl ClientObjectRequest {
                     && len <= crate::client_object_protocol::MAX_CLIENT_BATCH_BUNDLE_BYTES)
                     .then_some(len)
             }
+            Self::SnapshotAnnexIndex(annex) => annex.is_admissible().then(|| annex.index_len()),
+            Self::SnapshotAnnexChunk { annex, index, .. } => annex.chunk_len(*index),
         }
     }
 
@@ -95,6 +113,12 @@ impl ClientObjectRequest {
             Self::MatrixManifest(file) => file.verify_manifest(bytes).is_some(),
             Self::MatrixChunk { index, digest, .. } => matrix_chunk_matches(*index, bytes, digest),
             Self::Batch(id) => id.matches_bytes(bytes),
+            Self::SnapshotAnnexIndex(annex) => annex.verify_index(bytes).is_some(),
+            Self::SnapshotAnnexChunk {
+                annex,
+                index,
+                digest,
+            } => annex.chunk_matches(*index, bytes, digest),
         }
     }
 
@@ -129,6 +153,20 @@ impl ClientObjectRequest {
                 out.extend_from_slice(&id.bundle_digest);
                 out.extend_from_slice(&id.encoded_len.to_le_bytes());
             }
+            Self::SnapshotAnnexIndex(annex) => {
+                out.push(KIND_ANNEX_INDEX);
+                encode_annex(annex, out);
+            }
+            Self::SnapshotAnnexChunk {
+                annex,
+                index,
+                digest,
+            } => {
+                out.push(KIND_ANNEX_CHUNK);
+                encode_annex(annex, out);
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(digest);
+            }
         }
     }
 
@@ -141,6 +179,8 @@ impl ClientObjectRequest {
             KIND_MANIFEST => 68,
             KIND_CHUNK => 104,
             KIND_BATCH => 104,
+            KIND_ANNEX_INDEX => ANNEX_BYTES,
+            KIND_ANNEX_CHUNK => ANNEX_BYTES + 36,
             _ => return Err(invalid_data("unknown client object kind")),
         };
         let mut body = [0u8; 104];
@@ -153,7 +193,21 @@ impl ClientObjectRequest {
             file_root: hash(32),
             file_len: u32_at(64),
         };
+        let annex = || -> io::Result<SnapshotAnnexRef> {
+            Ok(SnapshotAnnexRef {
+                kind: SnapshotAnnexKind::from_code(body[0])
+                    .ok_or_else(|| invalid_data("unknown snapshot annex kind"))?,
+                len: u32_at(1),
+                root: hash(5),
+            })
+        };
         let request = match kind[0] {
+            KIND_ANNEX_INDEX => Self::SnapshotAnnexIndex(annex()?),
+            KIND_ANNEX_CHUNK => Self::SnapshotAnnexChunk {
+                annex: annex()?,
+                index: u32_at(ANNEX_BYTES),
+                digest: hash(ANNEX_BYTES + 4),
+            },
             KIND_PROOF => Self::Proof(ClientProofId {
                 submission: ClientSubmission {
                     matrix_digest: hash(0),
@@ -451,6 +505,12 @@ impl ClientObjectCodec {
             })?;
         Ok(Some(Arc::new(permit)))
     }
+}
+
+fn encode_annex(annex: &SnapshotAnnexRef, out: &mut Vec<u8>) {
+    out.push(annex.kind.code());
+    out.extend_from_slice(&annex.len.to_le_bytes());
+    out.extend_from_slice(&annex.root);
 }
 
 fn encode_file(file: &MatrixFileId, out: &mut Vec<u8>) {

@@ -103,7 +103,10 @@ fn fetched(objects: &ClientObjects, id: MatrixFileId, file: &[u8]) -> AssembledM
                     .nth(index as usize)
                     .unwrap()
                     .to_vec(),
-                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
+                ClientObjectRequest::Proof(_)
+                | ClientObjectRequest::Batch(_)
+                | ClientObjectRequest::SnapshotAnnexIndex(_)
+                | ClientObjectRequest::SnapshotAnnexChunk { .. } => unreachable!(),
             };
             match objects.on_fetched(fetch.token, &bytes).unwrap() {
                 ClientObjectFetched::MatrixAssembled(assembled) => return assembled,

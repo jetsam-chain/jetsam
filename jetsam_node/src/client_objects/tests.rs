@@ -320,6 +320,8 @@ fn a_missing_matrix_is_fetched_from_peers_and_a_liar_is_excluded() {
                             ClientObjectRequest::MatrixChunk { .. } => "chunk",
                             ClientObjectRequest::Proof(_) => "proof",
                             ClientObjectRequest::Batch(_) => "batch",
+                            ClientObjectRequest::SnapshotAnnexIndex(_)
+                            | ClientObjectRequest::SnapshotAnnexChunk { .. } => "annex",
                         });
                     }
                     ClientObjectFetched::MatrixAssembled(assembled) => {
@@ -371,7 +373,10 @@ fn answer_from_file(file: &[u8], request: &ClientObjectRequest) -> Vec<u8> {
             .nth(*index as usize)
             .unwrap()
             .to_vec(),
-        ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
+        ClientObjectRequest::Proof(_)
+        | ClientObjectRequest::Batch(_)
+        | ClientObjectRequest::SnapshotAnnexIndex(_)
+        | ClientObjectRequest::SnapshotAnnexChunk { .. } => unreachable!(),
     }
 }
 
@@ -1046,7 +1051,10 @@ fn a_batch_matrix_file_is_registered_fetched_in_chunks_and_held_across_a_restart
             match fetch.request {
                 ClientObjectRequest::MatrixManifest(_) => manifests += 1,
                 ClientObjectRequest::MatrixChunk { .. } => chunks += 1,
-                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => unreachable!(),
+                ClientObjectRequest::Proof(_)
+                | ClientObjectRequest::Batch(_)
+                | ClientObjectRequest::SnapshotAnnexIndex(_)
+                | ClientObjectRequest::SnapshotAnnexChunk { .. } => unreachable!(),
             }
             let bytes = holder.client_object(&fetch.request).unwrap();
             // The codec's check, off the executor in the node.
