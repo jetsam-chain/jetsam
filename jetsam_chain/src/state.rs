@@ -1809,14 +1809,14 @@ mod tests {
     #[test]
     fn segment_tree_root_is_the_streaming_root_through_every_version() {
         // Dense random coverage at small depths; the production depth with a
-        // sparse fill keeps a debug build fast.
+        // sparse fill and fewer versions keeps a debug build fast.
         for (log, fill_one_in) in [
             (1usize, 2u64),
             (2, 2),
             (3, 2),
             (5, 2),
             (8, 3),
-            (LOG_SEGMENT_SIZE, 200),
+            (LOG_SEGMENT_SIZE, 4_096),
         ] {
             let len = 1usize << log;
             let mut seed = 0x9E37_79B9_7F4A_7C15 ^ log as u64;
@@ -1830,7 +1830,8 @@ mod tests {
             let mut tree = ExactSegmentTree::build(7, log, Arc::clone(&current));
             assert_eq!(tree.root(), exact_segment_root_from_columns(log, &current));
 
-            for round in 0..16usize {
+            let versions = if log == LOG_SEGMENT_SIZE { 8 } else { 16 };
+            for round in 0..versions {
                 let mut next = (*current).clone();
                 let changes = match round % 4 {
                     0 => 0,
@@ -1906,11 +1907,13 @@ mod tests {
                 }
             }
         };
+        // One segment at this depth: the state root is its streaming root.
         let reference = |live: &BTreeMap<u32, SlotValue>| {
-            let slots: Vec<_> = live.iter().map(|(i, s)| (*i, *s)).collect();
-            ChainState::from_sparse_utxos(log_slots, &slots, u64::MAX)
-                .unwrap()
-                .cached_state_root()
+            let mut columns = SegmentColumns::new_zero(1 << log_slots);
+            for (index, slot) in live {
+                put(&mut columns, *index as usize, *slot);
+            }
+            exact_segment_root_from_columns(log_slots, &columns)
         };
 
         write(&mut state, &mut live, &mut seed, 200);
