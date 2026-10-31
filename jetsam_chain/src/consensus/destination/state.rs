@@ -776,45 +776,7 @@ pub fn validate_block_destination(
     let mut committees_after = None;
     let mut learned = CommitteeKeyCache::default();
     if let Some(payload) = committee_update {
-        let anchor = rules.anchor.ok_or(DestinationBlockError::AnchorUnset)?;
-        let update = LightClientUpdate::decode_payload(payload).map_err(|_| {
-            DestinationBlockError::MalformedObject {
-                kind: DestinationObjectKind::CommitteeUpdate,
-            }
-        })?;
-        let next = match committees.last() {
-            None => {
-                // The anchor update: its next committee is the anchor's.
-                if update.next_sync_committee.hash_tree_root() != anchor.committee_root
-                    || period_of_slot(update.attested_header.beacon.slot).checked_add(1)
-                        != Some(anchor.period)
-                {
-                    return Err(DestinationBlockError::AnchorMismatch);
-                }
-                CommitteeRef {
-                    period: anchor.period,
-                    root: anchor.committee_root,
-                }
-            }
-            Some(known) => {
-                let known_keys = keys
-                    .get(&known.root)
-                    .ok_or(DestinationBlockError::CommitteeKeysUnavailable { root: known.root })?;
-                let verified = verify_committee_update(
-                    &rules.network,
-                    &KnownCommittee {
-                        period: known.period,
-                        keys: known_keys.clone(),
-                    },
-                    &update,
-                )
-                .map_err(DestinationBlockError::LightClient)?;
-                CommitteeRef {
-                    period: verified.next_period,
-                    root: verified.next_committee_root,
-                }
-            }
-        };
+        let next = verify_committee_update_payload(payload, &committees, rules, keys)?;
         learned.insert_update_payload(payload)?;
         committees.push(next);
         if committees.len() > 2 {
@@ -824,73 +786,15 @@ pub fn validate_block_destination(
     }
 
     if releases > 0 {
-        let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
-        let finality =
-            LightClientFinalityUpdate::decode_payload(finality_update.expect("checked above"))
-                .map_err(|_| DestinationBlockError::MalformedObject {
-                    kind: DestinationObjectKind::FinalityUpdate,
-                })?;
-        if committees.is_empty() {
-            return Err(DestinationBlockError::NoCommitteeKnown);
-        }
-        let known: Vec<KnownCommittee> = committees
-            .iter()
-            .map(|committee| {
-                learned
-                    .get(&committee.root)
-                    .or_else(|| keys.get(&committee.root))
-                    .map(|k| KnownCommittee {
-                        period: committee.period,
-                        keys: k.clone(),
-                    })
-                    .ok_or(DestinationBlockError::CommitteeKeysUnavailable {
-                        root: committee.root,
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        let refs: Vec<&KnownCommittee> = known.iter().collect();
-        let finalized = verify_finality_update(&rules.network, &refs, &finality)
-            .map_err(DestinationBlockError::LightClient)?;
-        let state_root = finalized.execution.state_root;
-        let account_nodes = {
-            let mut src = account_proof.expect("checked above");
-            let nodes = decode_proof_nodes(&mut src).map_err(|_| {
-                DestinationBlockError::MalformedObject {
-                    kind: DestinationObjectKind::BridgeAccountProof,
-                }
-            })?;
-            if !src.is_empty() {
-                return Err(DestinationBlockError::MalformedObject {
-                    kind: DestinationObjectKind::BridgeAccountProof,
-                });
-            }
-            nodes
-        };
-        let account = read_account(state_root, &bridge.address, &account_nodes)
-            .map_err(DestinationBlockError::BridgeAccount)?;
-        if account.code_hash != bridge.code_hash {
-            return Err(DestinationBlockError::BridgeAccount(
-                L1ReadError::CodeHashMismatch,
-            ));
-        }
-        // V7.
-        for release in &to_prove {
-            verify_withdrawal(
-                state_root,
-                &bridge,
-                &account_nodes,
-                release.n,
-                &release.owner.0,
-                release.amount,
-                &release.storage_proof,
-            )
-            .map_err(|error| {
-                DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
-                    n: release.n,
-                    error,
-                })
-            })?;
-        }
+        verify_releases_on_l1(
+            finality_update.expect("checked above"),
+            account_proof.expect("checked above"),
+            &to_prove,
+            &committees,
+            rules,
+            &learned,
+            keys,
+        )?;
     }
 
     Ok(DestinationEffect {
@@ -899,6 +803,151 @@ pub fn validate_block_destination(
         committees_after,
         committee_update: committee_update.map(<[u8]>::to_vec),
     })
+}
+
+/// The light client's step of [`validate_block_destination`] for one
+/// committee update `payload` on a branch that knows `committees` (oldest
+/// first), with the keys `keys` this node holds: the anchor update while the
+/// branch knows none, else an update signed by the last committee known
+/// (D57). Returns the committee it brings. The keys it brings are not read
+/// here (the block does, `CommitteeKeyCache::insert_update_payload`).
+///
+/// A pure function of its arguments: the block applies it, and a mempool
+/// judges a committee update it is handed with it (A2-M1).
+pub fn verify_committee_update_payload(
+    payload: &[u8],
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    keys: &CommitteeKeyCache,
+) -> Result<CommitteeRef, DestinationBlockError> {
+    let anchor = rules.anchor.ok_or(DestinationBlockError::AnchorUnset)?;
+    let update = LightClientUpdate::decode_payload(payload).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::CommitteeUpdate,
+        }
+    })?;
+    Ok(match committees.last() {
+        None => {
+            // The anchor update: its next committee is the anchor's.
+            if update.next_sync_committee.hash_tree_root() != anchor.committee_root
+                || period_of_slot(update.attested_header.beacon.slot).checked_add(1)
+                    != Some(anchor.period)
+            {
+                return Err(DestinationBlockError::AnchorMismatch);
+            }
+            CommitteeRef {
+                period: anchor.period,
+                root: anchor.committee_root,
+            }
+        }
+        Some(known) => {
+            let known_keys = keys
+                .get(&known.root)
+                .ok_or(DestinationBlockError::CommitteeKeysUnavailable { root: known.root })?;
+            let verified = verify_committee_update(
+                &rules.network,
+                &KnownCommittee {
+                    period: known.period,
+                    keys: known_keys.clone(),
+                },
+                &update,
+            )
+            .map_err(DestinationBlockError::LightClient)?;
+            CommitteeRef {
+                period: verified.next_period,
+                root: verified.next_committee_root,
+            }
+        }
+    })
+}
+
+/// The light client's and V7's step of [`validate_block_destination`] for
+/// the releases `releases` (their other rules already checked) under the
+/// finality update `finality_payload` and the bridge account proof
+/// `account_proof`, on a branch that knows `committees` (after the block's
+/// committee update, if any): the finality update signed by one of them
+/// (keys from `learned`, the block's own update, then `keys`, this node's),
+/// the bridge account under its finalized root, then each release's storage
+/// proof.
+///
+/// A pure function of its arguments: the block applies it, and a mempool
+/// judges a release it is handed with it (A2-M1).
+pub fn verify_releases_on_l1(
+    finality_payload: &[u8],
+    account_proof: &[u8],
+    releases: &[VaultRelease],
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<(), DestinationBlockError> {
+    let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
+    let finality = LightClientFinalityUpdate::decode_payload(finality_payload).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FinalityUpdate,
+        }
+    })?;
+    if committees.is_empty() {
+        return Err(DestinationBlockError::NoCommitteeKnown);
+    }
+    let known: Vec<KnownCommittee> = committees
+        .iter()
+        .map(|committee| {
+            learned
+                .get(&committee.root)
+                .or_else(|| keys.get(&committee.root))
+                .map(|k| KnownCommittee {
+                    period: committee.period,
+                    keys: k.clone(),
+                })
+                .ok_or(DestinationBlockError::CommitteeKeysUnavailable {
+                    root: committee.root,
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&KnownCommittee> = known.iter().collect();
+    let finalized = verify_finality_update(&rules.network, &refs, &finality)
+        .map_err(DestinationBlockError::LightClient)?;
+    let state_root = finalized.execution.state_root;
+    let account_nodes = {
+        let mut src = account_proof;
+        let nodes =
+            decode_proof_nodes(&mut src).map_err(|_| DestinationBlockError::MalformedObject {
+                kind: DestinationObjectKind::BridgeAccountProof,
+            })?;
+        if !src.is_empty() {
+            return Err(DestinationBlockError::MalformedObject {
+                kind: DestinationObjectKind::BridgeAccountProof,
+            });
+        }
+        nodes
+    };
+    let account = read_account(state_root, &bridge.address, &account_nodes)
+        .map_err(DestinationBlockError::BridgeAccount)?;
+    if account.code_hash != bridge.code_hash {
+        return Err(DestinationBlockError::BridgeAccount(
+            L1ReadError::CodeHashMismatch,
+        ));
+    }
+    // V7.
+    for release in releases {
+        verify_withdrawal(
+            state_root,
+            &bridge,
+            &account_nodes,
+            release.n,
+            &release.owner.0,
+            release.amount,
+            &release.storage_proof,
+        )
+        .map_err(|error| {
+            DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
+                n: release.n,
+                error,
+            })
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
