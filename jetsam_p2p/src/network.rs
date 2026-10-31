@@ -694,6 +694,7 @@ fn prioritize_peer_addresses(
     addrs.sort_by_key(|addr| {
         (
             attempted.contains(addr),
+            crate::onion::address::parse_onion3_multiaddr(addr).is_some(),
             relay_circuit_route(destination, addr).is_some(),
         )
     });
@@ -1270,6 +1271,7 @@ struct AutomaticPeerState {
     /// expensive when many relay-only wallets join at once.
     initial_discovery_started: bool,
     retry_salt: Vec<u8>,
+    address_policy: crate::onion::policy::AddressPolicy,
     discovery_query: Option<kad::QueryId>,
     discovery_learned: bool,
     discovery_failures: u8,
@@ -1299,6 +1301,7 @@ impl AutomaticPeerState {
             bootstrap_complete: false,
             initial_discovery_started: false,
             retry_salt: local_peer.to_bytes(),
+            address_policy: crate::onion::policy::AddressPolicy::Clearnet,
             discovery_query: None,
             discovery_learned: false,
             discovery_failures: 0,
@@ -1382,6 +1385,12 @@ impl AutomaticPeerState {
         });
     }
 
+    /// Which peer addresses the manager keeps (onion, D60).
+    fn with_address_policy(mut self, address_policy: crate::onion::policy::AddressPolicy) -> Self {
+        self.address_policy = address_policy;
+        self
+    }
+
     fn add_peer_candidate(
         &mut self,
         local: PeerId,
@@ -1391,9 +1400,14 @@ impl AutomaticPeerState {
         if peer == local || self.is_bootstrap_peer(peer) {
             return false;
         }
+        let address_policy = self.address_policy;
         let mut accepted = addrs
             .into_iter()
-            .filter_map(|addr| sanitize_automatic_peer_addr(peer, addr))
+            .filter_map(|addr| {
+                address_policy.advertised(peer, &addr, |addr| {
+                    sanitize_automatic_peer_addr(peer, addr.clone())
+                })
+            })
             .collect::<Vec<_>>();
         accepted.sort_unstable_by(|a, b| a.to_string().cmp(&b.to_string()));
         accepted.dedup();
@@ -3579,10 +3593,61 @@ impl P2PNetwork {
         upnp_enabled: bool,
         client_objects: Option<Arc<dyn crate::client_object_transport::ClientObjectSource>>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+        Self::start_with_onion(
+            listen_addrs,
+            public_addresses,
+            chain,
+            mempool,
+            topics,
+            history_proof_bank_id,
+            data_dir,
+            background_capacity,
+            lan_discovery,
+            upnp_enabled,
+            client_objects,
+            None,
+        )
+    }
+
+    /// [`Self::start`] with a Tor onion service (D57, D60); `None` is
+    /// `start` exactly. Dual mode adds the service beside clearnet and hides
+    /// nothing. Guardian mode is onion only: every clearnet exposure is
+    /// refused here, before the identity is read (see
+    /// [`crate::onion::guardian`]), and the identity and onion key are the
+    /// guardian's own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_onion(
+        listen_addrs: Vec<Multiaddr>,
+        public_addresses: Vec<Multiaddr>,
+        chain: Arc<RwLock<MdbxChainContext>>,
+        mempool: AsyncMempool,
+        topics: NetworkTopics,
+        history_proof_bank_id: [u8; 32],
+        data_dir: std::path::PathBuf,
+        background_capacity: BackgroundCapacity,
+        lan_discovery: bool,
+        upnp_enabled: bool,
+        client_objects: Option<Arc<dyn crate::client_object_transport::ClientObjectSource>>,
+        onion: Option<crate::onion::OnionSettings>,
+    ) -> anyhow::Result<(Self, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+        if let Some(settings) = onion.as_ref() {
+            crate::onion::guardian::refuse_clearnet_exposure(
+                settings,
+                &crate::onion::guardian::ClearnetExposure {
+                    listen: &listen_addrs,
+                    public_addresses: &public_addresses,
+                    upnp: upnp_enabled,
+                    lan_discovery,
+                    ..Default::default()
+                },
+            )?;
+        }
         // Load before spawning so an absent, corrupt, symlinked, or publicly
         // readable private identity fails node startup instead of silently
         // leaving RPC alive with a dead P2P task.
-        let identity = crate::identity_store::load_or_create(&data_dir)?;
+        let identity = crate::identity_store::load_or_create(
+            &crate::onion::guardian::p2p_key_dir(&data_dir, onion.as_ref()),
+        )?;
         let local_peer_id = identity.public().to_peer_id();
         tracing::info!(peer = %local_peer_id, "loaded persistent P2P identity");
         let (cmd_tx, cmd_rx) = command_dispatch::channel();
@@ -3609,6 +3674,7 @@ impl P2PNetwork {
                 lan_discovery,
                 upnp_enabled,
                 client_objects,
+                onion,
             )
             .await
         });
@@ -3817,9 +3883,8 @@ async fn run_swarm(
     lan_discovery: bool,
     upnp_enabled: bool,
     client_objects: Option<Arc<dyn crate::client_object_transport::ClientObjectSource>>,
+    onion: Option<crate::onion::OnionSettings>,
 ) -> anyhow::Result<()> {
-    use libp2p::{noise, tcp, yamux, SwarmBuilder};
-
     // P2P data serving must remain responsive while expensive block proof
     // verification owns the mutable hot chain context. MDBX readers use
     // independent MVCC snapshots and never need that application-level lock.
@@ -3833,20 +3898,17 @@ async fn run_swarm(
     let public_relay_enabled = !public_addresses.is_empty();
     let serves_client_objects = client_objects.is_some();
     let joins_bridge_topic = topics.bridge_intents.is_some();
-    let mut swarm = SwarmBuilder::with_existing_identity(identity)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_dns()?
-        // Relay client transport: enables dialling and listening through relay
-        // nodes.  The relay::client::Behaviour is wired here by the builder
-        // and passed into NodeBehaviour::new() via the closure below.
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(move |key, relay_client| {
-            NodeBehaviour::new(
+    let address_policy = crate::onion::policy::AddressPolicy::of(onion.as_ref());
+    // TCP, DNS and the relay client transport, as always; the onion dial
+    // transport beside them in dual mode; the onion transports alone for a
+    // guardian, which then has no relay client (see `onion::swarm`). The
+    // relay::client::Behaviour is wired by the builder and passed into
+    // NodeBehaviour::new() via the closure below.
+    let mut swarm = crate::onion::swarm::build_swarm(
+        identity,
+        crate::onion::swarm::NodeTransports::of(onion.as_ref()),
+        move |key, relay_client| match relay_client {
+            Some(relay_client) => NodeBehaviour::new(
                 key,
                 &protocol_id,
                 relay_client,
@@ -3856,9 +3918,16 @@ async fn run_swarm(
                 upnp_enabled,
                 serves_client_objects,
                 joins_bridge_topic,
-            )
-        })?
-        .with_swarm_config(|cfg| {
+            ),
+            None => NodeBehaviour::onion_only(
+                key,
+                &protocol_id,
+                background_capacity,
+                serves_client_objects,
+                joins_bridge_topic,
+            ),
+        },
+        |cfg| {
             cfg.with_idle_connection_timeout(std::time::Duration::from_secs(300))
                 // A peer can advertise one direct path plus several relay
                 // paths. Swarm's default factor races up to eight addresses
@@ -3869,8 +3938,8 @@ async fn run_swarm(
                 // load without reducing the number of distinct neighbours
                 // that discovery may select.
                 .with_dial_concurrency_factor(std::num::NonZeroU8::new(1).expect("one is non-zero"))
-        })
-        .build();
+        },
+    )?;
 
     // A wildcard listen socket is not a public address. Circuit Relay v2
     // reservations are unusable unless the relay returns at least one
@@ -3947,6 +4016,10 @@ async fn run_swarm(
             ),
         }
     }
+    let onion_key_dir = crate::onion::guardian::p2p_key_dir(&data_dir, onion.as_ref());
+    let mut onion_runtime =
+        crate::onion::runtime::OnionRuntime::listen(&mut swarm, onion, onion_key_dir)?;
+    bound += usize::from(onion_runtime.is_some());
     if bound == 0 {
         anyhow::bail!("no P2P listen address could be bound");
     }
@@ -3959,10 +4032,11 @@ async fn run_swarm(
     // Load only previously successful outbound peers. They seed Kademlia and
     // enter the same bounded automatic manager as DNS bootstrap sources, so a
     // restart cannot create a second untracked dial burst.
-    let mut successful_peer_cache = crate::peer_store::load(&data_dir);
+    let mut successful_peer_cache = crate::peer_store::load_for(&data_dir, address_policy);
     let mut observed_peer_versions = crate::peer_versions::ObservedPeerVersions::default();
     let local_peer_id = *swarm.local_peer_id();
-    let mut automatic_peers = AutomaticPeerState::new(local_peer_id);
+    let mut automatic_peers =
+        AutomaticPeerState::new(local_peer_id).with_address_policy(address_policy);
     for peer in successful_peer_cache.entries() {
         automatic_peers.add_peer_candidate(local_peer_id, peer.peer_id, peer.addrs.iter().cloned());
     }
@@ -4017,12 +4091,15 @@ async fn run_swarm(
         BoundedPendingRequests::new(MAX_PENDING_STATE_SEGMENT_REQUESTS);
     let mut pending_history_step_requests =
         BoundedPendingRequests::new(MAX_PENDING_HISTORY_STEP_REQUESTS);
-    let mut peer_diversity = PeerDiversity::default();
+    let mut peer_diversity = PeerDiversity::with_address_policy(address_policy);
     let mut sync_paths = PeerSyncPaths::default();
     // A directly reachable public node is already discoverable and should
     // contribute bounded relay capacity, not build nested relay paths through
     // other public nodes. Private nodes reserve two diverse public paths.
-    let relay_reservation_target = if public_relay_enabled {
+    // A guardian has no relay client and never reserves a circuit.
+    let relay_reservation_target = if public_relay_enabled
+        || address_policy == crate::onion::policy::AddressPolicy::OnionOnly
+    {
         0
     } else {
         MAX_RELAY_RESERVATIONS
@@ -4151,6 +4228,11 @@ async fn run_swarm(
                 else {
                     continue;
                 };
+                if let Some(onion_runtime) = onion_runtime.as_mut() {
+                    if let Some(onion_listener) = onion_runtime.observe(&mut swarm, &event) {
+                        peer_diversity.add_onion_listener(onion_listener);
+                    }
+                }
                 handle_swarm_event(
                     &mut swarm,
                     event,
@@ -5042,6 +5124,13 @@ async fn run_swarm(
                     tracing::debug!(peer = %peer, failures, "retrying mempool sync");
                 }
             }
+
+            // The onion service was published, withdrawn, or refused.
+            update = crate::onion::runtime::OnionRuntime::next_update(onion_runtime.as_mut()) => {
+                if let Some(onion_runtime) = onion_runtime.as_mut() {
+                    onion_runtime.apply(&mut swarm, update);
+                }
+            }
         }
     }
     crate::peer_store::save(&data_dir, &successful_peer_cache);
@@ -5730,7 +5819,7 @@ fn maintain_automatic_outbound(
         addrs.shuffle(&mut rand::thread_rng());
         prioritize_peer_addresses(peer, &attempted_addrs, &mut addrs);
         let selected = addrs.into_iter().find_map(|addr| {
-            let group = crate::peer_diversity::public_network_group(&addr)?;
+            let group = peer_diversity.dial_group(&addr)?;
             let pending_same_group = automatic.pending_group_count(group);
             peer_diversity
                 .outbound_candidate_allowed_with_pending(peer, &addr, pending_same_group)
@@ -6847,11 +6936,15 @@ async fn handle_swarm_event(
                     dropped_addrs += 1;
                     continue;
                 }
-                if !is_routable_identify_addr(addr) {
+                let policy = peer_diversity.address_policy();
+                let kept = policy.advertised(peer_id, addr, |addr| {
+                    is_routable_identify_addr(addr).then(|| addr.clone())
+                });
+                let Some(addr) = kept else {
                     dropped_addrs += 1;
                     continue;
-                }
-                if relay_circuit_backoff.is_blocked(peer_id, addr, now) {
+                };
+                if relay_circuit_backoff.is_blocked(peer_id, &addr, now) {
                     dropped_addrs += 1;
                     continue;
                 }
@@ -9143,12 +9236,9 @@ async fn handle_swarm_event(
             let dialer = endpoint.is_dialer();
             let direct = !endpoint.is_relayed();
             sync_paths.insert(connection_id, peer_id, direct, dialer);
-            if let Err(reason) = peer_diversity.try_admit(
-                connection_id,
-                peer_id,
-                endpoint.get_remote_address(),
-                dialer,
-            ) {
+            if let Err(reason) =
+                peer_diversity.try_admit_endpoint(connection_id, peer_id, &endpoint)
+            {
                 sync_paths.mark_closing(connection_id);
                 automatic_peers.note_dial_failed(connection_id);
                 let _ = swarm.close_connection(connection_id);
@@ -9805,6 +9895,74 @@ mod tests {
             height: 1,
             block_hash: [1; 32],
         }));
+    }
+
+    #[test]
+    fn an_onion_address_is_never_a_relay_reservation_path() {
+        let peer = PeerId::random();
+        let onion: Multiaddr =
+            "/onion3/aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead:9700"
+                .parse()
+                .unwrap();
+        assert!(relay_reservation_addr(peer, onion.clone()).is_none());
+        assert!(
+            relay_reservation_addr(peer, onion.with(libp2p::multiaddr::Protocol::P2p(peer)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn automatic_candidates_keep_onion_addresses_only_when_onion_is_enabled() {
+        use crate::onion::policy::AddressPolicy;
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let onion: Multiaddr =
+            "/onion3/aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead:9700"
+                .parse()
+                .unwrap();
+        let clearnet: Multiaddr = "/ip4/8.8.8.8/tcp/9700".parse().unwrap();
+        let mut off = AutomaticPeerState::new(local);
+        assert!(!off.add_peer_candidate(local, peer, [onion.clone()]));
+        let mut dual =
+            AutomaticPeerState::new(local).with_address_policy(AddressPolicy::ClearnetAndOnion);
+        assert!(dual.add_peer_candidate(local, peer, [onion.clone(), clearnet.clone()]));
+        assert_eq!(dual.peers[&peer].addrs.len(), 2);
+        let mut guardian =
+            AutomaticPeerState::new(local).with_address_policy(AddressPolicy::OnionOnly);
+        assert!(guardian.add_peer_candidate(local, peer, [onion.clone(), clearnet]));
+        assert_eq!(guardian.peers[&peer].addrs, vec![onion]);
+    }
+
+    #[test]
+    fn a_peer_is_tried_on_clearnet_before_onion() {
+        let destination = PeerId::random();
+        let onion: Multiaddr =
+            "/onion3/aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead:9700"
+                .parse()
+                .unwrap();
+        let direct: Multiaddr = "/ip4/8.8.8.8/tcp/9700".parse().unwrap();
+        let relayed: Multiaddr = format!(
+            "/ip4/9.9.9.9/tcp/9700/p2p/{}/p2p-circuit/p2p/{destination}",
+            PeerId::random()
+        )
+        .parse()
+        .unwrap();
+        // An onion dial can take a minute to build its circuit: every
+        // clearnet path, relayed included, goes first.
+        let mut addresses = vec![onion.clone(), relayed.clone(), direct.clone()];
+        prioritize_peer_addresses(destination, &[], &mut addresses);
+        assert_eq!(
+            addresses,
+            vec![direct.clone(), relayed.clone(), onion.clone()]
+        );
+        // Once clearnet failed, the onion path is next.
+        let mut addresses = vec![direct.clone(), onion.clone(), relayed.clone()];
+        prioritize_peer_addresses(
+            destination,
+            &[direct.clone(), relayed.clone()],
+            &mut addresses,
+        );
+        assert_eq!(addresses[0], onion);
     }
 
     #[test]

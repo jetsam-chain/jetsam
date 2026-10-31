@@ -50,6 +50,8 @@ pub mod swarm;
 pub mod transport;
 
 #[cfg(test)]
+mod node_tests;
+#[cfg(test)]
 mod test_support;
 
 pub use address::{OnionServiceId, OnionTarget};

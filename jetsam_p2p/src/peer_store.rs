@@ -107,6 +107,9 @@ impl SuccessfulPeerCache {
     }
 }
 
+/// The cache as a node without onion reads it (the node itself calls
+/// [`load_for`] with its policy).
+#[cfg(test)]
 pub(crate) fn load(data_dir: &Path) -> SuccessfulPeerCache {
     load_for(data_dir, AddressPolicy::Clearnet)
 }
