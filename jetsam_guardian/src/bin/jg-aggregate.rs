@@ -82,6 +82,7 @@ struct Agg {
     attested_try: Option<(u64, Instant)>,
     equivocations_sent: HashSet<String>,
     last_refusal: HashMap<usize, String>,
+    seen_lines: HashSet<[u8; 32]>,
 }
 
 impl Agg {
@@ -122,6 +123,10 @@ impl Agg {
             }
         }
         for line in lines {
+            // only new partial lines are worth a signature check
+            if !line.contains("partial") || !self.seen_lines.insert(line_key(&line)) {
+                continue;
+            }
             let Ok((g, body)) = verify_line(&line, &self.keys) else { continue };
             if body["type"] != "partial" {
                 continue;
@@ -327,6 +332,10 @@ impl Agg {
     }
 }
 
+fn line_key(line: &str) -> [u8; 32] {
+    jetsam_guardian::keccak256(line.as_bytes())
+}
+
 fn dec<const N: usize>(text: &str) -> Option<[u8; N]> {
     hex::decode(text.trim_start_matches("0x")).ok()?.try_into().ok()
 }
@@ -366,6 +375,7 @@ fn run() -> anyhow::Result<()> {
         attested_try: None,
         equivocations_sent: HashSet::new(),
         last_refusal: HashMap::new(),
+        seen_lines: HashSet::new(),
     };
     log("started");
     let mut last_attest = Instant::now() - Duration::from_secs(60);

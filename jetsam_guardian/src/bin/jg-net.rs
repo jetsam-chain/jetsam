@@ -195,7 +195,9 @@ impl Net {
             for p in &self.cfg.publication_points {
                 let path = jetsam_guardian::feed::feed_path(p, self.cfg.index, &day);
                 let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                for line in text.lines() {
+                // the heartbeats of the last few hours are enough (a line per minute)
+                let all: Vec<&str> = text.lines().filter(|l| l.contains("hb")).collect();
+                for line in all.iter().skip(all.len().saturating_sub(400)) {
                     let Ok((g, body)) = verify_line(line, &self.keys) else { continue };
                     if g != self.cfg.index || body["type"] != "hb" {
                         continue;
