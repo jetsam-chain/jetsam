@@ -4096,10 +4096,7 @@ async fn run_swarm(
     // A directly reachable public node is already discoverable and should
     // contribute bounded relay capacity, not build nested relay paths through
     // other public nodes. Private nodes reserve two diverse public paths.
-    // A guardian has no relay client and never reserves a circuit.
-    let relay_reservation_target = if public_relay_enabled
-        || address_policy == crate::onion::policy::AddressPolicy::OnionOnly
-    {
+    let relay_reservation_target = if public_relay_enabled {
         0
     } else {
         MAX_RELAY_RESERVATIONS
