@@ -32,6 +32,36 @@ fn quote(bytes: &[u8]) -> String {
     out
 }
 
+/// The SAFECOOKIE hashes as Tor computes them (control-spec, AUTHCHALLENGE),
+/// written here apart from the node's own code so that a slip in either is
+/// seen: HMAC-SHA256 keyed by the two constant strings of the spec, over
+/// `cookie | client nonce | server nonce`. Returns (server hash, client hash).
+pub(crate) fn tor_safecookie_hashes(
+    cookie: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    use hmac::{Mac, SimpleHmac};
+    let hash = |key: &[u8]| {
+        let mut mac = SimpleHmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+        mac.update(cookie);
+        mac.update(client_nonce);
+        mac.update(server_nonce);
+        mac.finalize().into_bytes().to_vec()
+    };
+    (
+        hash(b"Tor safe cookie authentication server-to-controller hash"),
+        hash(b"Tor safe cookie authentication controller-to-server hash"),
+    )
+}
+
+/// The server nonce the fake ControlPort sends in AUTHCHALLENGE.
+pub(crate) const FAKE_SERVER_NONCE: [u8; 32] = [0xC3; 32];
+
+pub(crate) fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
 fn unhex(text: &str) -> Option<Vec<u8>> {
     if text.len() % 2 != 0 {
         return None;
@@ -159,9 +189,11 @@ impl FakeTorConfig {
 }
 
 /// A ControlPort with Tor's observable behaviour for the commands we use:
-/// commands must end with CRLF, everything but PROTOCOLINFO/AUTHENTICATE is
-/// refused with 514 before authentication, a failed AUTHENTICATE closes the
-/// connection, and a service exists only while its connection is open.
+/// commands must end with CRLF, everything but PROTOCOLINFO/AUTHCHALLENGE/
+/// AUTHENTICATE is refused with 514 before authentication, a failed
+/// AUTHENTICATE closes the connection, after an AUTHCHALLENGE only the client
+/// hash authenticates (as in Tor), and a service exists only while its
+/// connection is open.
 pub(crate) struct FakeTor {
     pub(crate) addr: SocketAddr,
     received: Arc<Mutex<Vec<String>>>,
@@ -204,6 +236,8 @@ impl FakeTor {
     ) {
         let mut stream = BufReader::new(stream);
         let mut authenticated = false;
+        // Set by AUTHCHALLENGE: the only secret AUTHENTICATE then accepts.
+        let mut expected_client_hash: Option<Vec<u8>> = None;
         loop {
             let mut line = String::new();
             tokio::select! {
@@ -240,6 +274,35 @@ impl FakeTor {
                         false,
                     )
                 }
+                "AUTHCHALLENGE" if !authenticated => {
+                    let nonce = args
+                        .strip_prefix("SAFECOOKIE ")
+                        .and_then(unhex)
+                        .filter(|nonce| nonce.len() == 32);
+                    match (config.methods.contains("SAFECOOKIE"), config.cookie, nonce) {
+                        (true, Some(cookie), Some(nonce)) => {
+                            let (server_hash, client_hash) =
+                                tor_safecookie_hashes(&cookie, &nonce, &FAKE_SERVER_NONCE);
+                            expected_client_hash = Some(client_hash);
+                            (
+                                format!(
+                                    "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                                    hex_upper(&server_hash),
+                                    hex_upper(&FAKE_SERVER_NONCE)
+                                ),
+                                false,
+                            )
+                        }
+                        (true, Some(_), None) => {
+                            ("513 Invalid base16 client nonce\r\n".to_string(), true)
+                        }
+                        _ => (
+                            "513 AUTHCHALLENGE only supports SAFECOOKIE authentication\r\n"
+                                .to_string(),
+                            true,
+                        ),
+                    }
+                }
                 "AUTHENTICATE" => {
                     let secret = if args.starts_with('"') {
                         crate::onion::control::unquote(args)
@@ -248,14 +311,18 @@ impl FakeTor {
                     } else {
                         unhex(args)
                     };
-                    let accepted = config.methods.contains("NULL")
-                        || (config.methods.contains("COOKIE")
-                            && config.cookie.is_some_and(|cookie| {
-                                secret.as_deref() == Some(cookie.as_slice())
-                            }))
-                        || (config.methods.contains("HASHEDPASSWORD")
-                            && config.password.is_some()
-                            && secret == config.password);
+                    let accepted = if let Some(expected) = expected_client_hash.take() {
+                        secret.as_deref() == Some(expected.as_slice())
+                    } else {
+                        config.methods.contains("NULL")
+                            || (config.methods.contains("COOKIE")
+                                && config.cookie.is_some_and(|cookie| {
+                                    secret.as_deref() == Some(cookie.as_slice())
+                                }))
+                            || (config.methods.contains("HASHEDPASSWORD")
+                                && config.password.is_some()
+                                && secret == config.password)
+                    };
                     if accepted {
                         authenticated = true;
                         ("250 OK\r\n".to_string(), false)
