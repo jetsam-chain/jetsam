@@ -568,3 +568,13 @@ fn revocation_certificate_height_is_unsignable_by_honest_guardians() {
     s.height = 1u64 << 63;
     assert_eq!(code(&obs, &s, now), "NOT_FINAL");
 }
+
+#[test]
+fn observer_deposit_count_at_or_below_bridge_opening_is_zero() {
+    // found in the rehearsal: a co-signature of L ≤ F made the observer panic (empty range F+1..=L)
+    let (obs, _, now) = warm();
+    assert_eq!(obs.deposits_up_to(F), 0);
+    assert_eq!(obs.deposits_up_to(F - 5), 0);
+    assert_eq!(code(&obs, &cosign(&obs, 26, 0), now), "OK");
+    assert_eq!(code(&obs, &cosign(&obs, 26, 1), now), "DEPOSIT_COUNT_IMPLAUSIBLE");
+}

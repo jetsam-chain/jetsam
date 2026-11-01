@@ -570,6 +570,9 @@ impl Observer {
 
     /// The cumulative V4 deposits of `]F ; height]` this node counted.
     pub fn deposits_up_to(&self, height: u64) -> u64 {
+        if height <= self.cfg.deposits_from_height {
+            return 0;
+        }
         self.deposits
             .range(self.cfg.deposits_from_height + 1..=height)
             .map(|(_, n)| u64::from(*n))
