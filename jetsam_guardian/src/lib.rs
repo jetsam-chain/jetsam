@@ -37,6 +37,7 @@ pub mod ipc;
 pub mod journal;
 pub mod l1;
 pub mod observer;
+pub mod relay;
 pub mod rpc;
 pub mod seal;
 pub mod signer;
@@ -50,6 +51,10 @@ pub use jetsam_chain::consensus::guardian::{
     GuardianStatement, GUARDIAN_DST, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION,
     SIGNATURE_BYTES, STATEMENT_BYTES,
 };
+
+/// The statements `jg-net` evaluates per 15 s round, the highest first:
+/// the proposals of the publication points and the attestations due.
+pub const NET_ROUND_CANDIDATES: usize = 32;
 
 /// keccak-256, the node's.
 pub fn keccak256(data: &[u8]) -> [u8; 32] {

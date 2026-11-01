@@ -8,7 +8,9 @@
 //! (`keccak(TAG ‖ public values)`: the "simulated proof"), submits them to the
 //! LOCAL L1, publishes the proposals the guardians sign, and claims the
 //! deposits of every finalized deposit root. It writes one JSON line per
-//! observation (`--events`) for the latency measures.
+//! observation (`--events`) for the latency measures. Which proposals stay on
+//! the points is [`jetsam_guardian::relay::plan`] (D63): every point that can
+//! still become final, and again the highest already-stable one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -21,6 +23,7 @@ use jetsam_chain::consensus::vault::{BRIDGE_DEPOSIT_MARKER_TAG, VAULT_ADDRESS};
 use jetsam_guardian::chain::{merkle_branch, merkle_root, Chain, HeaderInfo};
 use jetsam_guardian::checkpoint::{deposit_leaf, genesis_checkpoint, mock_proof, public_values, Checkpoint, Deposit, Mn};
 use jetsam_guardian::l1::{self, L1};
+use jetsam_guardian::relay::{self, Live, Point, Policy};
 use jetsam_guardian::rpc::call;
 use jetsam_guardian::{now_unix, u256, Domain};
 
@@ -84,6 +87,8 @@ fn word_u64(data: &[u8], i: usize) -> u64 {
 struct Known {
     cp: Checkpoint,
     ids: BTreeMap<u64, [u8; 32]>,
+    /// The proposal's other fields (`parent_id`, `fork_depth`, `mn`, `proof`), to propose it again.
+    extra: Value,
 }
 
 struct Relay {
@@ -100,7 +105,7 @@ struct Relay {
 
 impl Relay {
     fn save(&self) {
-        let known: Vec<Value> = self.known.values().map(|k| json!({"cp": k.cp, "ids": k.ids.iter().map(|(h, id)| (h, hex::encode(id))).collect::<Vec<_>>()})).collect();
+        let known: Vec<Value> = self.known.values().map(|k| json!({"cp": k.cp, "ids": k.ids.iter().map(|(h, id)| (h, hex::encode(id))).collect::<Vec<_>>(), "extra": k.extra})).collect();
         let deposits: Vec<Value> = self.deposits.iter().map(|(h, ds)| json!({"h": h, "d": ds})).collect();
         let v = json!({"known": known, "deposits": deposits, "claimed": self.claimed.keys().map(hex::encode).collect::<Vec<_>>(), "last_final": hex::encode(self.last_final)});
         let tmp = self.a.state.with_extension("tmp");
@@ -118,7 +123,7 @@ impl Relay {
             for e in k["ids"].as_array().cloned().unwrap_or_default() {
                 ids.insert(e[0].as_u64().unwrap_or(0), jetsam_guardian::parse32(e[1].as_str().unwrap_or_default())?);
             }
-            self.known.insert(cp.id(), Known { cp, ids });
+            self.known.insert(cp.id(), Known { cp, ids, extra: k["extra"].clone() });
         }
         for e in v["deposits"].as_array().cloned().unwrap_or_default() {
             let ds: Vec<Deposit> = serde_json::from_value(e["d"].clone())?;
@@ -160,6 +165,8 @@ impl Relay {
             self.event(json!({"t": now_unix(), "event": "reorg", "from": self.chain.tip_height(), "to": common}));
             self.chain.truncate_above(common);
             self.deposits.retain(|h, _| *h <= common);
+            // a replaced block is seen anew (the stability of a point counts from its own block)
+            self.seen_at.retain(|h, _| *h <= common);
         }
         let now = now_unix();
         for h in common + 1..=tip {
@@ -258,18 +265,57 @@ impl Relay {
         for p in &self.a.points {
             let dir = p.join("proposals");
             std::fs::create_dir_all(&dir)?;
-            let tmp = dir.join(format!(".{name}.tmp"));
+            // a co-signature proposal is named by its notAfter too: one proposed again never
+            // replaces one that may already carry partials
+            let file = if kind == "cosign" { format!("{name}-{na}") } else { name.to_string() };
+            let tmp = dir.join(format!(".{file}.tmp"));
             std::fs::write(&tmp, v.to_string())?;
-            std::fs::rename(&tmp, dir.join(format!("{name}.json")))?;
-            // keep the last 24 proposals: when blocks come fast, the newest locked blocks are
-            // younger than the guardians' stability (SG-4, 1 200 s) and only older points are signable
-            let mut files: Vec<_> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
-            files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            while files.len() > 24 {
-                let _ = std::fs::remove_file(files.remove(0));
-            }
+            std::fs::rename(&tmp, dir.join(format!("{file}.json")))?;
         }
         Ok(na)
+    }
+
+    /// D63: drop the proposals no guardian can make final any more, offer again the highest
+    /// point already stable for this relayer (`relay::plan`). After the bridge genesis only.
+    fn keep_proposals(&mut self) -> anyhow::Result<()> {
+        if word(&self.l1_word("genesisId()", &[])?, 0) == [0u8; 32] {
+            return Ok(());
+        }
+        let fin = word(&self.l1_word("finalId()", &[])?, 0);
+        let final_locked = self.known.get(&fin).map(|k| k.cp.locked_height).unwrap_or(0);
+        let points: Vec<Point> = self
+            .known
+            .values()
+            .map(|k| {
+                let l = k.cp.locked_height;
+                let seen = (l.saturating_sub(7)..=l).map(|h| self.seen_at.get(&h).copied().unwrap_or(u64::MAX / 4)).max().unwrap_or(u64::MAX / 4);
+                Point { id: k.cp.id(), locked_height: l, locked_seen_at: seen, on_chain: self.chain.id_at(k.cp.height) == Some(k.cp.tip_block_id) }
+            })
+            .collect();
+        let mut live = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.a.points[0].join("proposals")) {
+            for e in rd.flatten() {
+                let path = e.path();
+                let (Some(stem), true) = (path.file_stem().and_then(|s| s.to_str()), path.extension().is_some_and(|x| x == "json")) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap_or_default()) else { continue };
+                let (Ok(cp), Some(na)) = (serde_json::from_value::<Checkpoint>(v["checkpoint"].clone()), v["not_after"].as_u64()) else { continue };
+                live.push(Live { name: stem.to_string(), id: cp.id(), not_after: na });
+            }
+        }
+        let plan = relay::plan(&points, &live, final_locked, now_unix(), self.l1.next_time()?, &Policy::default());
+        for name in &plan.drop {
+            for p in &self.a.points {
+                let _ = std::fs::remove_file(p.join("proposals").join(format!("{name}.json")));
+            }
+            self.event(json!({"t": now_unix(), "event": "proposal_dropped", "name": name}));
+        }
+        if let Some(k) = plan.propose.and_then(|id| self.known.get(&id)).cloned() {
+            let name = format!("cp-{:08}-{}", k.cp.locked_height, &hex::encode(k.cp.id())[..12]);
+            let na = self.propose(&name, "cosign", &k.cp, k.extra.clone())?;
+            self.event(json!({"t": now_unix(), "event": "proposed_again", "locked_height": k.cp.locked_height, "tip_height": k.cp.height, "not_after": na}));
+            log(&format!("proposed again L={} T={} (already stable, notAfter {na})", k.cp.locked_height, k.cp.height));
+        }
+        Ok(())
     }
 
     fn step(&mut self) -> anyhow::Result<()> {
@@ -288,7 +334,7 @@ impl Relay {
                 }
                 let mut ids = BTreeMap::new();
                 ids.insert(l, cp.locked_block_id);
-                self.known.insert(cp.id(), Known { cp, ids });
+                self.known.insert(cp.id(), Known { cp, ids, extra: json!({}) });
             }
             return Ok(());
         }
@@ -342,9 +388,10 @@ impl Relay {
         }
         let ids = (cp.locked_height..=tip).filter_map(|h| self.chain.id_at(h).map(|id| (h, id))).collect();
         let name = format!("cp-{:08}-{}", l, &hex::encode(cp.id())[..12]);
-        let na = self.propose(&name, "cosign", &cp, json!({"parent_id": format!("0x{}", hex::encode(parent_id)), "fork_depth": fork_depth, "mn": mn, "proof": format!("0x{}", hex::encode(proof))}))?;
+        let extra = json!({"parent_id": format!("0x{}", hex::encode(parent_id)), "fork_depth": fork_depth, "mn": mn, "proof": format!("0x{}", hex::encode(proof))});
+        let na = self.propose(&name, "cosign", &cp, extra.clone())?;
         self.event(json!({"t": now_unix(), "event": "proposed", "locked_height": l, "tip_height": tip, "not_after": na, "deposit_count": deps.len()}));
-        self.known.insert(cp.id(), Known { cp, ids });
+        self.known.insert(cp.id(), Known { cp, ids, extra });
         Ok(())
     }
 
@@ -393,6 +440,9 @@ fn run() -> anyhow::Result<()> {
     while !STOP.load(Ordering::SeqCst) {
         if let Err(e) = r.step() {
             log(&format!("step: {e:#}"));
+        }
+        if let Err(e) = r.keep_proposals() {
+            log(&format!("proposals: {e:#}"));
         }
         r.save();
         for _ in 0..50 {
