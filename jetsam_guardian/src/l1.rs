@@ -195,6 +195,13 @@ impl L1 {
         hex_u64(&b["timestamp"])
     }
 
+    /// The time the NEXT block will carry, as far as this host can say: the
+    /// latest block's timestamp, or this host's clock if later (a local L1
+    /// that mines on demand keeps the time of its last transaction).
+    pub fn next_time(&self) -> anyhow::Result<u64> {
+        Ok(self.now()?.max(crate::now_unix()))
+    }
+
     /// `eth_getStorageAt`.
     pub fn storage(&self, to: &str, slot: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
         let v = self.rpc("eth_getStorageAt", json!([to, format!("0x{}", hex::encode(slot)), "latest"]))?;

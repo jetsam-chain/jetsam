@@ -243,7 +243,7 @@ impl Relay {
     }
 
     fn propose(&self, name: &str, kind: &str, cp: &Checkpoint, extra: Value) -> anyhow::Result<u64> {
-        let na = self.l1.now()? + 3_000;
+        let na = self.l1.next_time()? + 3_000;
         let mut v = json!({"kind": kind, "checkpoint": cp, "not_after": na, "created": now_unix(),
                            "domain": {"network": hex::encode(self.a.domain.network), "l1_chain_id": self.a.domain.l1_chain_id,
                                       "l1_bridge": format!("0x{}", hex::encode(self.a.domain.l1_bridge))}});
@@ -277,7 +277,7 @@ impl Relay {
             if tip >= l + 8 {
                 let cp = genesis_checkpoint(l, self.chain.id_at(l).unwrap_or_default(), u256::to_be(&self.chain.work_at(l).unwrap_or_default()), self.chain.headers_digest(l).unwrap_or_default());
                 let path = self.a.points[0].join("proposals").join("genesis.json");
-                let fresh = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["not_after"].as_u64()).is_some_and(|na| na > self.l1.now().unwrap_or(0) + 900);
+                let fresh = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["not_after"].as_u64()).is_some_and(|na| na > self.l1.next_time().unwrap_or(0) + 900);
                 if !fresh {
                     let na = self.propose("genesis", "genesis", &cp, json!({}))?;
                     self.event(json!({"t": now_unix(), "event": "genesis_proposed", "locked_height": l, "not_after": na}));
@@ -300,7 +300,7 @@ impl Relay {
         let fin = word(&self.l1_word("finalId()", &[])?, 0);
         if fin != self.last_final {
             self.last_final = fin;
-            self.event(json!({"t": now_unix(), "event": "final_changed", "final_id": hex::encode(fin), "l1_ts": self.l1.now().ok()}));
+            self.event(json!({"t": now_unix(), "event": "final_changed", "final_id": hex::encode(fin), "l1_ts": self.l1.next_time().ok()}));
             self.claim(fin, gl)?;
         }
         let Some(l) = self.chain.locked_height(tip) else { return Ok(()) };

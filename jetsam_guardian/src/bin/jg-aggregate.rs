@@ -188,7 +188,7 @@ impl Agg {
             let Ok(cp) = serde_json::from_value::<Checkpoint>(p["checkpoint"].clone()) else { continue };
             let na = p["not_after"].as_u64().unwrap_or(0);
             let sig256 = hex::decode(&gs.sig256).unwrap_or_default();
-            let l1_now = l1.now().unwrap_or(0);
+            let l1_now = l1.next_time().unwrap_or(0);
             if l1_now > na {
                 self.event(json!({"t": now_unix(), "event": "cosign_expired", "height": gs.height}));
                 continue;
