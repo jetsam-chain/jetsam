@@ -15402,6 +15402,7 @@ async fn handle_p2p_events(
                     let (height, best_changed) = refuse_manifest_branch(
                         &mut header_dag,
                         &mut peer_chain_evidence,
+                        &mut rejected_suffix_object_peers,
                         from,
                         &manifest,
                         v1_7_height,
@@ -20227,13 +20228,18 @@ fn branch_without_v1_7_manifest(
 /// block of the boundary's ancestry at or above J that the committed chain
 /// does not hold; that block leaves the HeaderDAG with all its descendants,
 /// so the best valid branch is selected again at once. Not condemned:
-/// announced again, the headers may come back. A boundary the HeaderDAG does
-/// not hold, or one on the committed chain, refuses the sender alone, at the
-/// boundary. Returns the height `sender` is refused at and whether the best
-/// tip changed.
+/// announced again by another peer, the headers may come back. `sender`
+/// joins `rejected`, as the source of a refused body does: it brings no
+/// headers any more, so the branch does not come back through it (replay
+/// D62, 2026-11-01: a divergent sender's next batch brought it back, and a
+/// node at 103 froze there). A boundary the HeaderDAG does not hold, or one
+/// on the committed chain, refuses the sender alone, at the boundary.
+/// Returns the height `sender` is refused at and whether the best tip
+/// changed.
 fn refuse_manifest_branch<H>(
     header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
     evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    rejected: &mut std::collections::HashSet<libp2p::PeerId>,
     sender: libp2p::PeerId,
     manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
     v1_7_height: u64,
@@ -20250,6 +20256,7 @@ fn refuse_manifest_branch<H>(
         .ok();
     let height = first.map_or(manifest.tip_height, |point| point.height);
     refuse_peer_branch(header_dag, evidence, sender, height, now);
+    quarantine_exact_suffix_sources(header_dag, rejected, &[sender]);
     let best_changed = first.is_some_and(|point| header_dag.forget(&point.hash));
     (height, best_changed)
 }
@@ -21039,7 +21046,9 @@ mod refused_branch_body_tests {
     /// above the fork leaves the selection (102' and above, and 96'..101'
     /// below it, still heavier than our 96), so our 96 is selected at once.
     /// Forgotten, not condemned; W, which only advertises the branch, is not
-    /// refused for it.
+    /// refused for it. The sender brings no headers any more, as the source
+    /// of a refused body (replay D62, 2026-11-01: otherwise its next batch
+    /// brought the branch back and a node at 103 froze there).
     #[test]
     fn a_manifest_without_v1_7_refuses_its_sender_and_forgets_its_branch() {
         let base = header_95();
@@ -21055,9 +21064,10 @@ mod refused_branch_body_tests {
         assert_eq!(manifest.tip_height, J + 6);
         let now = Instant::now();
         let mut evidence = PeerChainEvidence::<()>::default();
+        let mut rejected = std::collections::HashSet::new();
 
         assert_eq!(
-            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[0].point(), now),
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[0].point(), now),
             (J, true)
         );
         assert_eq!(dag.best_tip(), ours[0].point(), "our 96, at once");
@@ -21077,6 +21087,11 @@ mod refused_branch_body_tests {
         assert!(!evidence.is_divergent(&w, now), "the sender alone");
         assert!(!evidence.is_divergent(&honest, now));
         assert!(dag.has_inventory(&ours[0].hash), "our providers are kept");
+        assert_eq!(
+            rejected,
+            std::collections::HashSet::from([o]),
+            "its sender alone brings no headers any more"
+        );
     }
 
     /// The branch leaves from its first block at or above J that the
@@ -21087,6 +21102,7 @@ mod refused_branch_body_tests {
     fn a_branch_without_v1_7_leaves_from_its_first_block_off_our_chain_at_or_above_j() {
         let [o] = peers::<1>();
         let now = Instant::now();
+        let mut rejected = std::collections::HashSet::new();
 
         let base = header_95();
         let finalized = ChainPoint::new(J - 1, block_id(&base));
@@ -21098,7 +21114,7 @@ mod refused_branch_body_tests {
         let manifest = manifest_of(theirs[11].point(), Vec::new());
         let mut evidence = PeerChainEvidence::<()>::default();
         assert_eq!(
-            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[4].point(), now),
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[4].point(), now),
             (J + 3, true)
         );
         assert_eq!(dag.best_tip(), ours[4].point());
@@ -21119,7 +21135,7 @@ mod refused_branch_body_tests {
         let manifest = manifest_of(theirs[9].point(), Vec::new());
         let mut evidence = PeerChainEvidence::<()>::default();
         assert_eq!(
-            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[5].point(), now),
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[5].point(), now),
             (J, true)
         );
         assert_eq!(
@@ -21136,6 +21152,7 @@ mod refused_branch_body_tests {
         }
         assert!(theirs[3..].iter().all(|header| dag.get(&header.hash).is_none()));
         assert_eq!(evidence.divergence_height(&o, now), Some(J));
+        assert_eq!(rejected, std::collections::HashSet::from([o]));
     }
 
     /// A boundary the HeaderDAG does not hold (a node without validated
@@ -21151,9 +21168,10 @@ mod refused_branch_body_tests {
         let [stranger, stripper] = peers::<2>();
         let now = Instant::now();
         let mut evidence = PeerChainEvidence::<()>::default();
+        let mut rejected = std::collections::HashSet::new();
         let unknown = manifest_of(ChainPoint::new(J + 12, [9; 32]), Vec::new());
         assert_eq!(
-            refuse_manifest_branch(&mut dag, &mut evidence, stranger, &unknown, J, ours[7].point(), now),
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, stranger, &unknown, J, ours[7].point(), now),
             (J + 12, false)
         );
         let on_our_chain = manifest_of(ours[6].point(), Vec::new());
@@ -21161,6 +21179,7 @@ mod refused_branch_body_tests {
             refuse_manifest_branch(
                 &mut dag,
                 &mut evidence,
+                &mut rejected,
                 stripper,
                 &on_our_chain,
                 J,
@@ -21173,6 +21192,7 @@ mod refused_branch_body_tests {
         assert_eq!(dag.len(), 8, "nothing forgotten");
         assert_eq!(evidence.divergence_height(&stranger, now), Some(J + 12));
         assert_eq!(evidence.divergence_height(&stripper, now), Some(J + 6));
+        assert_eq!(rejected, std::collections::HashSet::from([stranger, stripper]));
     }
 }
 
