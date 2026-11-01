@@ -309,7 +309,7 @@ fn run() -> anyhow::Result<()> {
             }
             // the highest first: a co-signature is useful only while it is new
             work.sort_by(|a, b| b.1.height.cmp(&a.1.height).then(a.1.not_after.cmp(&b.1.not_after)));
-            for (kind, s) in work.iter().take(12) {
+            for (kind, s) in work.iter().take(32) {
                 if STOP.load(Ordering::SeqCst) {
                     break;
                 }

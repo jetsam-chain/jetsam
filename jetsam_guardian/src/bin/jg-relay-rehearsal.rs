@@ -261,10 +261,11 @@ impl Relay {
             let tmp = dir.join(format!(".{name}.tmp"));
             std::fs::write(&tmp, v.to_string())?;
             std::fs::rename(&tmp, dir.join(format!("{name}.json")))?;
-            // keep the last 3 proposals only
+            // keep the last 24 proposals: when blocks come fast, the newest locked blocks are
+            // younger than the guardians' stability (SG-4, 1 200 s) and only older points are signable
             let mut files: Vec<_> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
             files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            while files.len() > 3 {
+            while files.len() > 24 {
                 let _ = std::fs::remove_file(files.remove(0));
             }
         }
