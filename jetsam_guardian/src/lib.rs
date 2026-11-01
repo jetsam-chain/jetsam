@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! The Jetsam v1.7 guardian software (plan T5.1-T5.6, design
+//! `jetsam-v17-gardien-logiciel_DESIGN.md`).
+//!
+//! Four programs run on a guardian machine, each with its own trust boundary:
+//!
+//! * `jg-observe` reads **its** node only (loopback RPC, an allow-list of
+//!   methods) and applies the signing policy SG-1..SG-9 and SG-17
+//!   ([`observer`]);
+//! * `jg-net` is the only one that talks to the network: the other sources
+//!   (SG-10, [`witness`]), the proposals, the publication of the signed feed
+//!   ([`feed`]); it holds no signing secret;
+//! * `jg-sign` holds the share and the journal, in an EMPTY network
+//!   namespace; it re-does every safety computation itself (SG-11..SG-16,
+//!   [`signer`], [`journal`]) and has a single signing path;
+//! * `jg-aggregate` combines any 5 valid partials into the group signature
+//!   ([`aggregator`]); anyone may run it.
+//!
+//! Keys: [`ceremony`] (offline dealing, Shamir 5 of 7, Feldman commitments,
+//! re-sharing at a constant group key, revocation certificate) and [`seal`]
+//! (a share at rest is sealed for its machine key, itself sealed by the
+//! operator's passphrase).
+//!
+//! The statement (416 bytes), its message, the DST, the equivocation body and
+//! the anchor leaf are the node's own code (`jetsam_chain::consensus::guardian`),
+//! linked from the same commit: nothing of the format is redefined here.
+
+pub mod aggregator;
+pub mod ceremony;
+pub mod chain;
+pub mod checkpoint;
+pub mod config;
+pub mod feed;
+pub mod ipc;
+pub mod journal;
+pub mod l1;
+pub mod observer;
+pub mod rpc;
+pub mod seal;
+pub mod signer;
+#[doc(hidden)]
+pub mod testkit;
+pub mod threshold;
+pub mod u256;
+pub mod witness;
+
+pub use jetsam_chain::consensus::guardian::{
+    GuardianStatement, GUARDIAN_DST, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION,
+    SIGNATURE_BYTES, STATEMENT_BYTES,
+};
+
+/// keccak-256, the node's.
+pub fn keccak256(data: &[u8]) -> [u8; 32] {
+    jetsam_chain::consensus::destination::mpt::keccak256(data)
+}
+
+/// Lower-case hex without prefix.
+pub fn hex32(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// Parse 32 bytes of hex (with or without `0x`).
+pub fn parse32(text: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(text.trim().trim_start_matches("0x"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected 32 bytes of hex"))
+}
+
+/// The domain words a guardian signs under (words 0-4 of a statement):
+/// fixed by its configuration, compared by the signer to every statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Domain {
+    /// Word 1: the Jetsam network (block id of the profile's genesis).
+    pub network: [u8; 32],
+    /// Word 2: the L1 chain id.
+    pub l1_chain_id: u64,
+    /// Word 3: the L1 bridge contract.
+    pub l1_bridge: [u8; 20],
+}
+
+impl Domain {
+    /// Words 0-4 match this domain and the schema.
+    pub fn matches(&self, s: &GuardianStatement) -> bool {
+        s.domain == GUARDIAN_STATEMENT_DOMAIN
+            && s.network == self.network
+            && s.l1_chain_id == jetsam_chain::consensus::guardian::u256_word(self.l1_chain_id)
+            && s.l1_bridge == self.l1_bridge
+            && s.schema_version == GUARDIAN_STATEMENT_VERSION
+    }
+}
+
+/// Seconds since the Unix epoch, on this machine's clock.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

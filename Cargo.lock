@@ -2866,6 +2866,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetsam_guardian"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "bech32",
+ "blst",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "jetsam_chain",
+ "jetsam_poseidon2b",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "jetsam_gui"
 version = "1.6.0"
 dependencies = [
