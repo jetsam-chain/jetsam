@@ -164,7 +164,8 @@ impl L1 {
     pub fn send(&self, from: &str, to: &str, data: &[u8]) -> anyhow::Result<Receipt> {
         // a call that would revert is not sent: its reason is the error
         let probe = json!({"from": from, "to": to, "data": format!("0x{}", hex::encode(data))});
-        if let Err(e) = self.rpc("eth_call", json!([probe, "latest"])) {
+        // probed on the pending block: it carries the time the transaction will see
+        if let Err(e) = self.rpc("eth_call", json!([probe, "pending"])) {
             anyhow::bail!("reverts: {e}");
         }
         let tx = json!({"from": from, "to": to, "data": format!("0x{}", hex::encode(data)), "gas": "0x1c9c380"});
