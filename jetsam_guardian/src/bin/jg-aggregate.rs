@@ -384,7 +384,12 @@ fn run() -> anyhow::Result<()> {
             let Ok(gs) = serde_json::from_value::<GroupSignature>(e["group"].clone()) else { continue };
             a.agg.restore(gs.clone());
             let kind = e["kind"].as_str().unwrap_or("?").to_string();
+            let l1 = kind == "genesis" || kind == "cosign";
             a.done.push((gs, kind, e.get("proposal").cloned().filter(|p| !p.is_null())));
+            if l1 {
+                // not yet known to be on the L1: tried again (an expired one is dropped)
+                a.l1_pending.push(a.done.len() - 1);
+            }
         }
         log(&format!("archive read back: {} group signatures", a.done.len()));
     }
