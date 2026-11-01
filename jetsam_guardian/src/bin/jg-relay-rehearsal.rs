@@ -211,6 +211,9 @@ impl Relay {
     /// The deposits of `]gl ; l]` with their global index.
     fn deposits_upto(&self, gl: u64, l: u64) -> Vec<Deposit> {
         let mut out = Vec::new();
+        if l <= gl {
+            return out;
+        }
         for (_, ds) in self.deposits.range(gl + 1..=l) {
             for d in ds {
                 let mut d = *d;
