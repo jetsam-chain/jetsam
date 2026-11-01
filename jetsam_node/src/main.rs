@@ -15386,6 +15386,47 @@ async fn handle_p2p_events(
                     continue;
                 }
                 manifest_requested_peers.remove(&from);
+                // D62: a manifest at or above J without v1.7 annexes is the
+                // mark of a branch that did not upgrade. Its sender is proven
+                // on that branch and the branch leaves the selection
+                // (`refuse_manifest_branch`); the manifest is then ignored as
+                // any refused sender's, below.
+                if let Some(v1_7_height) = branch_without_v1_7_manifest(
+                    &manifest,
+                    jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+                ) {
+                    let committed = {
+                        let ctx = chain.read().await;
+                        jetsam_node::networking::ChainPoint::new(ctx.tip_height(), ctx.tip_hash())
+                    };
+                    let (height, best_changed) = refuse_manifest_branch(
+                        &mut header_dag,
+                        &mut peer_chain_evidence,
+                        from,
+                        &manifest,
+                        v1_7_height,
+                        committed,
+                        Instant::now(),
+                    );
+                    mining_peer_quorum.reject_incompatible(from);
+                    retire_snapshot_plan_refused_through!(from, height);
+                    if best_changed {
+                        highest_announced = committed.height.max(header_dag.best_tip().height);
+                    }
+                    warn_branch_once!(
+                        from,
+                        "manifest of a branch without v1.7",
+                        from = %from,
+                        boundary = manifest.tip_height,
+                        height,
+                        best_changed,
+                        best_height = header_dag.best_tip().height,
+                        "this peer offers a snapshot at or above the v1.7 height without the v1.7 \
+                         annexes: it follows a branch that did not upgrade, which leaves the \
+                         selection, and supplies nothing to this node any more (kept for {} min)",
+                        peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                    );
+                }
                 if peer_chain_evidence.is_divergent(&from, Instant::now()) {
                     warn_branch_once!(
                         from,
@@ -20158,6 +20199,61 @@ fn refuse_advertised_branch_body<H>(
     Some(height)
 }
 
+/// D62 (decided 2026-11-01), the first contact gate 1 leaves open. At or
+/// above J, a snapshot manifest that carries no v1.7 annex is the mark of a
+/// branch without v1.7: every v1.7 export of a boundary at or above J carries
+/// at least the destination state (`v1_7_annex_files`), while the v1.6 branch
+/// that did not upgrade exports none. Returns J when `manifest` is such a
+/// mark under the v1.7 clock `v1_7_activation`.
+fn branch_without_v1_7_manifest(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    v1_7_activation: Option<u64>,
+) -> Option<u64> {
+    v1_7_activation.filter(|j| manifest.tip_height >= *j && manifest.annexes.is_empty())
+}
+
+/// D62: `sender` offered `manifest`, the mark of a branch without v1.7 at or
+/// above `v1_7_height` ([`branch_without_v1_7_manifest`]).
+///
+/// The hole it closes: gate 1 knows that branch by the bodies it refused
+/// ([`refuse_branch_body`]). A node that never refused one and meets the
+/// branch when it is already more than 2 × `CONSENSUS_FINALITY_DEPTH` headers
+/// above the fork takes the snapshot path: it fetches no body, asks the peer
+/// that sent the branch for a manifest, and waited for a snapshot of that
+/// branch (private rehearsal P7a, 2026-10-31: miner M1, ≈ 30 min, its mining
+/// paused).
+///
+/// `sender` is proven on that branch ([`refuse_peer_branch`]) at the first
+/// block of the boundary's ancestry at or above J that the committed chain
+/// does not hold; that block leaves the HeaderDAG with all its descendants,
+/// so the best valid branch is selected again at once. Not condemned:
+/// announced again, the headers may come back. A boundary the HeaderDAG does
+/// not hold, or one on the committed chain, refuses the sender alone, at the
+/// boundary. Returns the height `sender` is refused at and whether the best
+/// tip changed.
+fn refuse_manifest_branch<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    sender: libp2p::PeerId,
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    v1_7_height: u64,
+    committed: jetsam_node::networking::ChainPoint,
+    now: Instant,
+) -> (u64, bool) {
+    let boundary =
+        jetsam_node::networking::ChainPoint::new(manifest.tip_height, manifest.tip_hash);
+    let first = header_dag
+        .common_ancestor(committed, boundary)
+        .and_then(|fork| {
+            header_dag.point_at_height(boundary, fork.height.saturating_add(1).max(v1_7_height))
+        })
+        .ok();
+    let height = first.map_or(manifest.tip_height, |point| point.height);
+    refuse_peer_branch(header_dag, evidence, sender, height, now);
+    let best_changed = first.is_some_and(|point| header_dag.forget(&point.hash));
+    (height, best_changed)
+}
+
 #[cfg(test)]
 /// v1.5.1 — the stall of 2026-10-13 (forensic §4-5). A snapshot manifest
 /// from the 1.4.3 branch, which forks at 38 400' and is durably higher than
@@ -20873,6 +20969,210 @@ mod refused_branch_body_tests {
         let error = decode_exact_suffix_bodies(&bytes, &sources, &headers[1..]).unwrap_err();
         assert_eq!(error.peer_sources(), &[first][..]);
         assert!(error.refused_branch_body().is_none());
+    }
+
+    /// A manifest whose boundary is `point`, with `annexes`.
+    fn manifest_of(
+        point: ChainPoint,
+        annexes: Vec<jetsam_p2p::protocol::SnapshotAnnexRef>,
+    ) -> jetsam_p2p::protocol::GetStateManifestResponse {
+        jetsam_p2p::protocol::GetStateManifestResponse {
+            tip_height: point.height,
+            tip_hash: point.hash,
+            annexes,
+            ..Default::default()
+        }
+    }
+
+    fn annex(kind: jetsam_p2p::protocol::SnapshotAnnexKind) -> jetsam_p2p::protocol::SnapshotAnnexRef {
+        jetsam_p2p::protocol::SnapshotAnnexRef {
+            kind,
+            len: 30,
+            root: [kind.code(); 32],
+        }
+    }
+
+    /// D62 (2026-11-01): at or above J, a manifest without any v1.7 annex is
+    /// the mark of a branch without v1.7 — every v1.7 export there carries
+    /// the destination state, the v1.6 branch that did not upgrade none.
+    /// Below J, with v1.7 dormant, or with an annex, it is not.
+    #[test]
+    fn a_manifest_without_annexes_at_or_above_j_is_the_mark_of_a_branch_without_v1_7() {
+        use jetsam_p2p::protocol::SnapshotAnnexKind::{DestinationState, GuardianJournal};
+        let point = |height: u64| ChainPoint::new(height, [height as u8; 32]);
+        for height in [J, J + 1, J + 960] {
+            assert_eq!(
+                branch_without_v1_7_manifest(&manifest_of(point(height), Vec::new()), Some(J)),
+                Some(J),
+                "{height}"
+            );
+        }
+        for (manifest, why) in [
+            (manifest_of(point(J - 1), Vec::new()), "below J"),
+            (manifest_of(point(0), Vec::new()), "no snapshot offered"),
+        ] {
+            assert_eq!(branch_without_v1_7_manifest(&manifest, Some(J)), None, "{why}");
+        }
+        assert_eq!(
+            branch_without_v1_7_manifest(&manifest_of(point(J), Vec::new()), None),
+            None,
+            "v1.7 dormant"
+        );
+        for annexes in [
+            vec![annex(DestinationState), annex(GuardianJournal)],
+            vec![annex(DestinationState)],
+            vec![annex(GuardianJournal)],
+        ] {
+            assert_eq!(
+                branch_without_v1_7_manifest(&manifest_of(point(J + 6), annexes.clone()), Some(J)),
+                None,
+                "{annexes:?}"
+            );
+        }
+    }
+
+    /// D62, the hole of gate 1 (first contact). Our 96 is committed and the
+    /// v1.6 branch is already 96'..113', 18 headers above the fork: the node
+    /// takes the snapshot path, fetches no body (gate 1 never sees one), and
+    /// asks the peer that sent the branch for a manifest — 102', without
+    /// annex. Its sender is proven on the branch at 96'; the whole branch
+    /// above the fork leaves the selection (102' and above, and 96'..101'
+    /// below it, still heavier than our 96), so our 96 is selected at once.
+    /// Forgotten, not condemned; W, which only advertises the branch, is not
+    /// refused for it.
+    #[test]
+    fn a_manifest_without_v1_7_refuses_its_sender_and_forgets_its_branch() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 1, 0);
+        let theirs = branch(&mut dag, base, [1; 32], 18, 1 << 64);
+        assert_eq!(dag.best_tip(), theirs[17].point(), "the heavier branch is selected");
+        let [o, w, honest] = peers::<3>();
+        dag.advertise_inventory(honest, &offer(&ours, 1)).unwrap();
+        dag.advertise_inventory(w, &offer(&theirs, 2)).unwrap();
+        let manifest = manifest_of(theirs[6].point(), Vec::new());
+        assert_eq!(manifest.tip_height, J + 6);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[0].point(), now),
+            (J, true)
+        );
+        assert_eq!(dag.best_tip(), ours[0].point(), "our 96, at once");
+        for header in &theirs {
+            assert!(
+                dag.get(&header.hash).is_none(),
+                "{} left the DAG",
+                header.header.height
+            );
+            assert!(!dag.is_invalid(&header.hash), "forgotten, not condemned");
+        }
+        assert_eq!(
+            evidence.divergence_height(&o, now),
+            Some(J),
+            "visible to the observer"
+        );
+        assert!(!evidence.is_divergent(&w, now), "the sender alone");
+        assert!(!evidence.is_divergent(&honest, now));
+        assert!(dag.has_inventory(&ours[0].hash), "our providers are kept");
+    }
+
+    /// The branch leaves from its first block at or above J that the
+    /// committed chain does not hold: just above the fork when the fork is
+    /// at or above J (our 96..100 stay, their 99'.. go), at J when the fork is
+    /// below it (their 93'..95' stay: below J nothing is proven).
+    #[test]
+    fn a_branch_without_v1_7_leaves_from_its_first_block_off_our_chain_at_or_above_j() {
+        let [o] = peers::<1>();
+        let now = Instant::now();
+
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 5, 0);
+        let fork = ours[2];
+        assert_eq!(fork.header.height, J + 2);
+        let theirs = branch(&mut dag, fork.header, fork.cumulative_work, 20, 1 << 64);
+        let manifest = manifest_of(theirs[11].point(), Vec::new());
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[4].point(), now),
+            (J + 3, true)
+        );
+        assert_eq!(dag.best_tip(), ours[4].point());
+        for header in &ours {
+            assert!(dag.get(&header.hash).is_some(), "our {} stays", header.header.height);
+        }
+        assert!(theirs.iter().all(|header| dag.get(&header.hash).is_none()));
+        assert_eq!(evidence.divergence_height(&o, now), Some(J + 3));
+
+        let mut root = header_95();
+        root.height = J - 6;
+        let finalized = ChainPoint::new(J - 6, block_id(&root));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, root, [1; 32], 6, 0);
+        let fork = ours[1];
+        let theirs = branch(&mut dag, fork.header, fork.cumulative_work, 28, 1 << 64);
+        assert_eq!(theirs[3].header.height, J);
+        let manifest = manifest_of(theirs[9].point(), Vec::new());
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, o, &manifest, J, ours[5].point(), now),
+            (J, true)
+        );
+        assert_eq!(
+            dag.best_tip(),
+            ours[5].point(),
+            "our 96 against what is left of theirs, 95'"
+        );
+        for header in &theirs[..3] {
+            assert!(
+                dag.get(&header.hash).is_some(),
+                "their {} stays: below J",
+                header.header.height
+            );
+        }
+        assert!(theirs[3..].iter().all(|header| dag.get(&header.hash).is_none()));
+        assert_eq!(evidence.divergence_height(&o, now), Some(J));
+    }
+
+    /// A boundary the HeaderDAG does not hold (a node without validated
+    /// headers yet) or one on the committed chain (a v1.7 export stripped of
+    /// its annexes): its sender is refused at the boundary, nothing leaves
+    /// the selection.
+    #[test]
+    fn a_manifest_without_v1_7_off_the_header_view_refuses_its_sender_alone() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 8, 0);
+        let [stranger, stripper] = peers::<2>();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let unknown = manifest_of(ChainPoint::new(J + 12, [9; 32]), Vec::new());
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, stranger, &unknown, J, ours[7].point(), now),
+            (J + 12, false)
+        );
+        let on_our_chain = manifest_of(ours[6].point(), Vec::new());
+        assert_eq!(
+            refuse_manifest_branch(
+                &mut dag,
+                &mut evidence,
+                stripper,
+                &on_our_chain,
+                J,
+                ours[7].point(),
+                now
+            ),
+            (J + 6, false)
+        );
+        assert_eq!(dag.best_tip(), ours[7].point());
+        assert_eq!(dag.len(), 8, "nothing forgotten");
+        assert_eq!(evidence.divergence_height(&stranger, now), Some(J + 12));
+        assert_eq!(evidence.divergence_height(&stripper, now), Some(J + 6));
     }
 }
 
