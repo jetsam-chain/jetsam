@@ -20,6 +20,15 @@ use crate::{u256, Domain, GuardianStatement};
 /// Heights below the tip whose ids the observer re-reads each poll (reorgs).
 const REORG_SCAN: u64 = 64;
 
+/// SG-4 on the mainnet network: `stability_secs` below this refuses to start
+/// (A4-3). The default is this same value; the private rehearsal is not bound.
+pub const STABILITY_SECS_FLOOR_MAINNET: u64 = 1_200;
+
+/// `stability_secs` respects the floor of `network`.
+pub fn stability_floor_ok(network: &[u8; 32], stability_secs: u64) -> bool {
+    *network != crate::MAINNET_NETWORK || stability_secs >= STABILITY_SECS_FLOOR_MAINNET
+}
+
 /// The policy thresholds (§3.1), all configurable, the design's defaults.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -213,6 +222,11 @@ impl Observer {
             "sign_depth {} is below the floor {SIGN_DEPTH_FLOOR}: the observer does not start",
             cfg.thresholds.sign_depth
         );
+        anyhow::ensure!(
+            stability_floor_ok(&cfg.domain.network, cfg.thresholds.stability_secs),
+            "stability_secs {} is below the mainnet floor {STABILITY_SECS_FLOOR_MAINNET} (SG-4): the observer does not start",
+            cfg.thresholds.stability_secs
+        );
         anyhow::ensure!(cfg.attest_every > 0, "attest_every must be positive");
         Ok(Self {
             cfg,
@@ -387,11 +401,8 @@ impl Observer {
             None => {}
         }
         // SG-4: L−7..L unchanged under continuous observation
-        for x in s.height - 7..=s.height {
-            match self.first_seen.get(&x) {
-                Some((id, t)) if Some(*id) == self.chain.id_at(x) && now >= t + th.stability_secs => {}
-                _ => return Outcome::no("POINT_NOT_STABLE"),
-            }
+        if !self.point_stable(s.height, now) {
+            return Outcome::no("POINT_NOT_STABLE");
         }
         // SG-6: no reorganization deeper than 2 in the last hour
         let recent_deep = self.reorgs.iter().any(|(t, d)| *t + th.reorg_window >= now && *d > th.reorg_max_depth)
@@ -427,6 +438,23 @@ impl Observer {
             return Outcome::no("DEPOSIT_COUNT_IMPLAUSIBLE");
         }
         Outcome::ok()
+    }
+
+    /// SG-4: heights `height − 7 ..= height` seen with their current ids, each
+    /// for at least `stability_secs` of continuous observation.
+    /// Below 7 there is no such window: never stable (A4-7).
+    fn point_stable(&self, height: u64, now: u64) -> bool {
+        let th = &self.cfg.thresholds;
+        let Some(low) = height.checked_sub(7) else {
+            return false;
+        };
+        for x in low..=height {
+            match self.first_seen.get(&x) {
+                Some((id, t)) if Some(*id) == self.chain.id_at(x) && now >= t + th.stability_secs => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// SG-8: the first field that differs from the chain, if any.

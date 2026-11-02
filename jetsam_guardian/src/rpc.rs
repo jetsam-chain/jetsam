@@ -5,9 +5,14 @@
 //! dependency beyond `std`, and the node client of `jg-observe`, bound to an
 //! ALLOW-LIST of read methods (design §10.1): a call to any other method
 //! (`walletSend`, `stop`, …) fails before any byte is sent.
+//!
+//! [`Egress`] (A4-1, D60): `jg-net` reaches the seeds and the L1 either in
+//! the clear (private rehearsal) or onion only — a loopback IP address
+//! directly, a `.onion` name through Tor's SOCKS5 port, anything else refused
+//! before any socket or DNS lookup.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -30,20 +35,199 @@ pub const OBSERVER_ALLOWLIST: &[&str] = &[
     "getVaultState",
 ];
 
-/// One JSON-RPC call to `url` (`http://host:port[/path]`).
-pub fn call(url: &str, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+/// Tor's default SOCKS port.
+pub const DEFAULT_TOR_SOCKS: &str = "127.0.0.1:9050";
+
+/// How the guardian reaches an RPC (A4-1, D60).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Egress {
+    /// Plain TCP to the URL's host, resolved by the system: the private
+    /// rehearsal on its private bridge, and the programs that are not a
+    /// guardian's network side. A `.onion` name is refused (resolving it
+    /// would hand it to the system's DNS).
+    Clearnet,
+    /// Onion only (D60): a loopback IP address is reached directly (nothing
+    /// leaves the machine), a `<56>.onion` name through Tor's SOCKS port
+    /// `socks` (Tor resolves it, never this machine); anything else is
+    /// refused before any socket or DNS lookup.
+    Onion { socks: SocketAddr },
+}
+
+/// Where one call is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Plain TCP, `host:port` resolved by the system ([`Egress::Clearnet`] only).
+    Resolve(String),
+    /// Plain TCP to a loopback IP address: no lookup, nothing leaves the machine.
+    Loopback(SocketAddr),
+    /// Tor's SOCKS5 port, `CONNECT <host>:<port>` with the host as a NAME.
+    Socks { proxy: SocketAddr, host: String, port: u16 },
+}
+
+/// A `http://host[:port][/path]` URL taken apart (the port defaults to 80).
+struct Target<'a> {
+    /// The host, IPv6 brackets removed.
+    host: &'a str,
+    port: u16,
+    /// `host[:port]` as written (the `Host` header).
+    authority: &'a str,
+    path: &'a str,
+}
+
+fn target(url: &str) -> anyhow::Result<Target<'_>> {
     let rest = url.strip_prefix("http://").ok_or_else(|| anyhow::anyhow!("only http:// URLs: {url}"))?;
-    let (hostport, path) = match rest.find('/') {
+    let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (host, after) = v6.split_once(']').ok_or_else(|| anyhow::anyhow!("unclosed [ in {url}"))?;
+            (host, after.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    anyhow::ensure!(!host.is_empty(), "no host in {url}");
+    let port = match port {
+        Some(p) => p.parse::<u16>().map_err(|_| anyhow::anyhow!("bad port in {url}"))?,
+        None => 80,
+    };
+    Ok(Target { host, port, authority, path })
+}
+
+/// `<56 base32 characters>.onion` (a v3 onion service, lower case).
+pub fn is_onion_v3(host: &str) -> bool {
+    host.strip_suffix(".onion")
+        .is_some_and(|id| id.len() == 56 && id.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))
+}
+
+impl Egress {
+    /// The onion-only egress through the SOCKS port `socks`: a loopback IP
+    /// address and port, never a name (it would need a lookup) nor another
+    /// address (the SOCKS connection itself would leave the machine).
+    pub fn onion(socks: &str) -> anyhow::Result<Self> {
+        let proxy: SocketAddr = socks
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{socks:?} is not an IP address and port such as 127.0.0.1:9050"))?;
+        anyhow::ensure!(proxy.ip().is_loopback(), "{socks} is not a loopback address: the SOCKS connection would leave the machine");
+        Ok(Self::Onion { socks: proxy })
+    }
+
+    /// Where a call to `url` goes; an error means NO socket and no lookup.
+    pub fn route(&self, url: &str) -> anyhow::Result<Route> {
+        let t = target(url)?;
+        match self {
+            Egress::Clearnet => {
+                anyhow::ensure!(
+                    !t.host.ends_with(".onion"),
+                    "{url}: a .onion address needs [egress] mode = \"onion\" (the system would resolve the name)"
+                );
+                let hostport = if t.host.contains(':') { format!("[{}]:{}", t.host, t.port) } else { format!("{}:{}", t.host, t.port) };
+                Ok(Route::Resolve(hostport))
+            }
+            Egress::Onion { socks } => {
+                if let Ok(ip) = t.host.parse::<std::net::IpAddr>() {
+                    anyhow::ensure!(
+                        ip.is_loopback(),
+                        "onion-only egress refuses {url}: {ip} is not a loopback address (no direct connection off this machine)"
+                    );
+                    return Ok(Route::Loopback(SocketAddr::new(ip, t.port)));
+                }
+                anyhow::ensure!(
+                    is_onion_v3(t.host),
+                    "onion-only egress refuses {url}: {} is neither a loopback IP address nor a .onion address (no DNS lookup, no direct connection)",
+                    t.host
+                );
+                Ok(Route::Socks { proxy: *socks, host: t.host.to_string(), port: t.port })
+            }
+        }
+    }
+}
+
+/// What a SOCKS5 reply code means (RFC 1928 and Tor's onion codes).
+fn socks_reply(code: u8) -> &'static str {
+    match code {
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        0xf0 => "onion service descriptor can not be found",
+        0xf1 => "onion service descriptor is invalid",
+        0xf2 => "onion service introduction failed",
+        0xf3 => "onion service rendezvous failed",
+        0xf4 => "onion service missing client authorization",
+        0xf5 => "onion service wrong client authorization",
+        0xf6 => "onion service invalid address",
+        0xf7 => "onion service introduction timed out",
+        _ => "unknown SOCKS reply",
+    }
+}
+
+/// SOCKS5 (RFC 1928) on `s`: no authentication, `CONNECT host:port` with the
+/// host as a domain name (address type 3), the reply consumed whole.
+fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+    s.write_all(&[5, 1, 0])?;
+    let mut choice = [0u8; 2];
+    s.read_exact(&mut choice)?;
+    anyhow::ensure!(choice == [5, 0], "the SOCKS port did not accept the no-authentication method ({choice:?})");
+    let len = u8::try_from(host.len()).map_err(|_| anyhow::anyhow!("host name too long for SOCKS"))?;
+    let mut req = vec![5, 1, 0, 3, len];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req)?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head)?;
+    anyhow::ensure!(head[0] == 5, "SOCKS reply version {}", head[0]);
+    anyhow::ensure!(head[1] == 0, "Tor refused {host}:{port}: {} ({:#04x})", socks_reply(head[1]), head[1]);
+    let bound = match head[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l)?;
+            usize::from(l[0])
+        }
+        other => anyhow::bail!("SOCKS reply address type {other:#04x}"),
+    };
+    let mut rest = vec![0u8; bound + 2];
+    s.read_exact(&mut rest)?;
+    Ok(())
+}
+
+/// One JSON-RPC call to `url` (`http://host:port[/path]`), plain TCP.
+pub fn call(url: &str, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+    call_via(&Egress::Clearnet, url, method, params, timeout)
+}
+
+/// One JSON-RPC call to `url` by `egress` (an onion-only egress never
+/// resolves a name and never connects off the machine except to Tor).
+pub fn call_via(egress: &Egress, url: &str, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+    let route = egress.route(url)?;
+    let Target { authority, path, .. } = target(url)?;
     let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))?;
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport)?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
-    let mut s = TcpStream::connect_timeout(&addr, timeout)?;
+    let mut s = match &route {
+        Route::Resolve(hostport) => {
+            let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
+            TcpStream::connect_timeout(&addr, timeout)?
+        }
+        Route::Loopback(addr) => TcpStream::connect_timeout(addr, timeout)?,
+        Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
+    };
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
+    if let Route::Socks { host, port, .. } = &route {
+        socks5_connect(&mut s, host, *port)?;
+    }
+    let hostport = authority;
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
