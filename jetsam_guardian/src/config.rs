@@ -39,7 +39,7 @@ pub struct GuardianConfig {
     pub attest_every: u64,
     #[serde(default)]
     pub attest_from: Option<u64>,
-    /// The node's loopback RPC.
+    /// The node's RPC: a loopback IP address, or its `.onion` (D66).
     pub node_rpc: String,
     /// Seeds' RPC (SG-10 sources).
     #[serde(default)]
@@ -61,8 +61,9 @@ pub struct GuardianConfig {
     /// SG-10: minimal number of agreeing sources.
     #[serde(default = "default_min_sources")]
     pub min_sources: usize,
-    /// How `seed_rpcs` and `l1_rpc` are reached (A4-1, D60): onion only
-    /// unless the configuration says otherwise.
+    /// How `seed_rpcs` and `l1_rpc` are reached (A4-1, D60, D66): onion only
+    /// unless the configuration says otherwise (`node_rpc`: always on the
+    /// loopback or as a `.onion`).
     #[serde(default)]
     pub egress: EgressConfig,
     /// The uids allowed on the local sockets (A4-2).
@@ -79,8 +80,9 @@ pub enum EgressMode {
     /// anything else refuses to start.
     #[default]
     Onion,
-    /// Plain TCP to any host: a private rehearsal on a private bridge only,
-    /// refused on the mainnet network.
+    /// Plain TCP, the private rehearsal only (D66: refused on the mainnet and
+    /// on the public test network), to IP addresses on the loopback or on its
+    /// bridge 10.77.0.0/24 only.
     Clearnet,
 }
 
@@ -143,14 +145,16 @@ impl GuardianConfig {
         let c: Self = toml::from_str(text)?;
         anyhow::ensure!((1..=7).contains(&c.index), "index {} outside 1..=7", c.index);
         anyhow::ensure!(c.thresholds.sign_depth >= 8, "sign_depth below the floor 8");
-        let network = crate::parse32(&c.network).unwrap_or([0u8; 32]);
+        let domain = c.domain()?;
         anyhow::ensure!(
-            crate::observer::stability_floor_ok(&network, c.thresholds.stability_secs),
-            "stability_secs {} is below the mainnet floor {} (SG-4): the guardian does not start",
+            crate::observer::stability_floor_ok(&domain, c.thresholds.stability_secs),
+            "stability_secs {} is below the floor {} of {} (SG-4, D66): the guardian does not start",
             c.thresholds.stability_secs,
-            crate::observer::STABILITY_SECS_FLOOR_MAINNET
+            crate::observer::STABILITY_SECS_FLOOR,
+            crate::Profile::of(&domain)
         );
         c.egress()?;
+        c.node_egress()?;
         Ok(c)
     }
 
@@ -161,35 +165,32 @@ impl GuardianConfig {
         Ok((Self::parse(&text)?, digest))
     }
 
-    /// The configured network is the mainnet one.
-    pub fn is_mainnet(&self) -> bool {
-        crate::parse32(&self.network).ok() == Some(crate::MAINNET_NETWORK)
+    /// The profile this guardian starts under (D66).
+    pub fn profile(&self) -> anyhow::Result<crate::Profile> {
+        Ok(crate::Profile::of(&self.domain()?))
     }
 
     /// The egress of `seed_rpcs` and `l1_rpc`, every source checked against
-    /// it: an error here means the guardian does not start (A4-1, D60).
+    /// it: an error here means the guardian does not start (A4-1, D60, D66).
     pub fn egress(&self) -> anyhow::Result<crate::rpc::Egress> {
-        use crate::rpc::Egress;
-        let egress = match self.egress.mode {
-            EgressMode::Clearnet => {
-                anyhow::ensure!(
-                    !self.is_mainnet(),
-                    "[egress] mode = \"clearnet\" is refused on the mainnet network (D60: a guardian reaches the \
-                     network through Tor only): the guardian does not start"
-                );
-                Egress::Clearnet
-            }
-            EgressMode::Onion => Egress::onion(&self.egress.tor_socks)
-                .map_err(|e| anyhow::anyhow!("[egress] tor_socks: {e}: the guardian does not start"))?,
-        };
-        let sources = self.seed_rpcs.iter().enumerate().map(|(i, url)| (format!("seed_rpcs[{i}]"), url));
-        for (name, url) in sources.chain(self.l1_rpc.iter().map(|url| ("l1_rpc".to_string(), url))) {
-            if let Err(e) = egress.route(url) {
-                anyhow::bail!(
-                    "{name} = {url}: {e}: the guardian does not start (a private rehearsal on a private bridge sets \
-                     [egress] mode = \"clearnet\")"
-                );
-            }
+        let seeds = self.seed_rpcs.iter().enumerate().map(|(i, url)| (format!("seed_rpcs[{i}]"), url.as_str()));
+        let l1 = self.l1_rpc.iter().map(|url| ("l1_rpc".to_string(), url.as_str()));
+        checked_egress(&self.egress, Some(&self.domain()?), seeds.chain(l1))
+            .map_err(|e| anyhow::anyhow!("{e}: the guardian does not start"))
+    }
+
+    /// The egress of `node_rpc`, `jg-observe`'s own node (D66): a loopback IP
+    /// address, or a `.onion` address through Tor's SOCKS port, in every
+    /// profile and every mode; anything else means the guardian does not start.
+    pub fn node_egress(&self) -> anyhow::Result<crate::rpc::Egress> {
+        let egress = crate::rpc::Egress::onion(&self.egress.tor_socks)
+            .map_err(|e| anyhow::anyhow!("[egress] tor_socks: {e}: the guardian does not start"))?;
+        if let Err(e) = egress.route(&self.node_rpc) {
+            anyhow::bail!(
+                "node_rpc = {}: {e}: the guardian does not start (jg-observe reads its own node: its loopback RPC, \
+                 or its .onion through Tor)",
+                self.node_rpc
+            );
         }
         Ok(egress)
     }
@@ -223,6 +224,44 @@ impl GuardianConfig {
             .map(|(k, v)| Ok((k.trim_start_matches('g').parse::<u32>()?, crate::parse32(v)?)))
             .collect()
     }
+}
+
+/// The egress of a guardian program's remote sources (A4-1, D60, D66), each
+/// `(name, url)` of `sources` checked against it before any socket or lookup.
+/// `onion` (the default): a loopback IP address directly, a `.onion` address
+/// through Tor. `clearnet`: only for the private rehearsal (`domain`, which a
+/// program that does not know its domain leaves `None`), and then only to the
+/// loopback or the rehearsal's bridge 10.77.0.0/24. An error: the program
+/// does not start.
+pub fn checked_egress<'a>(
+    cfg: &EgressConfig,
+    domain: Option<&crate::Domain>,
+    sources: impl IntoIterator<Item = (String, &'a str)>,
+) -> anyhow::Result<crate::rpc::Egress> {
+    use crate::rpc::Egress;
+    let egress = match cfg.mode {
+        EgressMode::Clearnet => match domain.map(crate::Profile::of) {
+            Some(crate::Profile::PrivateRehearsal) => Egress::PrivateBridge,
+            Some(p) => anyhow::bail!(
+                "[egress] mode = \"clearnet\" is refused on {p} (D60, D66: a guardian of a public network reaches it \
+                 through Tor only)"
+            ),
+            None => anyhow::bail!(
+                "[egress] mode = \"clearnet\" needs the private rehearsal's domain (network, l1_chain_id, l1_bridge): \
+                 without it, onion only (D66)"
+            ),
+        },
+        EgressMode::Onion => Egress::onion(&cfg.tor_socks).map_err(|e| anyhow::anyhow!("[egress] tor_socks: {e}"))?,
+    };
+    for (name, url) in sources {
+        if let Err(e) = egress.route(url) {
+            anyhow::bail!(
+                "{name} = {url}: {e} (only the private rehearsal, on its bridge {}, sets [egress] mode = \"clearnet\")",
+                crate::rpc::REHEARSAL_BRIDGE
+            );
+        }
+    }
+    Ok(egress)
 }
 
 pub fn hex48(text: &str) -> anyhow::Result<[u8; 48]> {

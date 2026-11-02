@@ -20,13 +20,14 @@ use crate::{u256, Domain, GuardianStatement};
 /// Heights below the tip whose ids the observer re-reads each poll (reorgs).
 const REORG_SCAN: u64 = 64;
 
-/// SG-4 on the mainnet network: `stability_secs` below this refuses to start
-/// (A4-3). The default is this same value; the private rehearsal is not bound.
-pub const STABILITY_SECS_FLOOR_MAINNET: u64 = 1_200;
+/// SG-4 on the public networks, mainnet and public test network alike (A4-3,
+/// D66): `stability_secs` below this refuses to start. The default is this
+/// same value; the private rehearsal is not bound.
+pub const STABILITY_SECS_FLOOR: u64 = 1_200;
 
-/// `stability_secs` respects the floor of `network`.
-pub fn stability_floor_ok(network: &[u8; 32], stability_secs: u64) -> bool {
-    *network != crate::MAINNET_NETWORK || stability_secs >= STABILITY_SECS_FLOOR_MAINNET
+/// `stability_secs` respects the floor of the profile of `domain`.
+pub fn stability_floor_ok(domain: &Domain, stability_secs: u64) -> bool {
+    !crate::Profile::of(domain).strict() || stability_secs >= STABILITY_SECS_FLOOR
 }
 
 /// The policy thresholds (§3.1), all configurable, the design's defaults.
@@ -223,9 +224,10 @@ impl Observer {
             cfg.thresholds.sign_depth
         );
         anyhow::ensure!(
-            stability_floor_ok(&cfg.domain.network, cfg.thresholds.stability_secs),
-            "stability_secs {} is below the mainnet floor {STABILITY_SECS_FLOOR_MAINNET} (SG-4): the observer does not start",
-            cfg.thresholds.stability_secs
+            stability_floor_ok(&cfg.domain, cfg.thresholds.stability_secs),
+            "stability_secs {} is below the floor {STABILITY_SECS_FLOOR} of {} (SG-4, D66): the observer does not start",
+            cfg.thresholds.stability_secs,
+            crate::Profile::of(&cfg.domain)
         );
         anyhow::ensure!(cfg.attest_every > 0, "attest_every must be positive");
         Ok(Self {

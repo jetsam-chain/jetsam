@@ -4,7 +4,7 @@ use super::*;
 fn observer_rpc_client_rejects_non_allowlisted_methods() {
     // a port nothing listens on: an allowed method fails on the connection,
     // a forbidden one fails before any connection is attempted
-    let c = NodeClient::observer("http://127.0.0.1:9");
+    let c = NodeClient::observer("http://127.0.0.1:9", Egress::onion(DEFAULT_TOR_SOCKS).unwrap());
     for m in ["walletSend", "stop", "submitTxIntent", "walletGetAddress", "submitGuardianObject"] {
         let e = c.call(m, json!([])).unwrap_err().to_string();
         assert!(e.contains("allow-list"), "{m}: {e}");
@@ -210,4 +210,117 @@ fn onion_egress_never_resolves_nor_dials_a_name_even_one_that_is_local() {
     assert_eq!(call_via(&e, &format!("http://127.0.0.1:{port}"), "x", json!([]), Duration::from_secs(5)).unwrap(), json!(3));
     server.join().unwrap();
     assert_eq!(socks.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "loopback is not sent to Tor");
+}
+
+// ---- D66: the private rehearsal's clearnet reaches its bridge and the loopback only; the node client's egress ----
+
+#[test]
+fn private_bridge_egress_routes_the_loopback_and_10_77_0_x_only() {
+    let e = Egress::PrivateBridge;
+    assert_eq!(e.route("http://10.77.0.1:19711").unwrap(), Route::Bridge("10.77.0.1:19711".parse().unwrap()));
+    assert_eq!(e.route("http://10.77.0.254:18545/rpc").unwrap(), Route::Bridge("10.77.0.254:18545".parse().unwrap()));
+    assert_eq!(e.route("http://10.77.0.0").unwrap(), Route::Bridge("10.77.0.0:80".parse().unwrap()));
+    assert_eq!(e.route("http://127.0.0.1:19801").unwrap(), Route::Loopback("127.0.0.1:19801".parse().unwrap()));
+    assert_eq!(e.route("http://[::1]:8545").unwrap(), Route::Loopback("[::1]:8545".parse().unwrap()));
+    for url in [
+        "http://10.77.1.1:19711".to_string(),
+        "http://10.78.0.1:19711".into(),
+        "http://10.76.0.1:19711".into(),
+        "http://11.77.0.1:19711".into(),
+        "http://10.0.77.1:19711".into(),
+        "http://192.168.1.10:19711".into(),
+        "http://203.0.113.7:8545".into(),
+        "http://0.0.0.0:8545".into(),
+        "http://[::ffff:10.77.0.1]:8545".into(),
+        "http://[2001:db8::1]:8545".into(),
+        "http://localhost:8545".into(),
+        "http://seed.example.org:19711".into(),
+        format!("http://{}:19711", onion('a')),
+    ] {
+        let err = e.route(&url).unwrap_err().to_string();
+        assert!(err.contains("10.77.0.0/24") || err.contains(".onion"), "{url}: {err}");
+    }
+    assert!(e.route("https://10.77.0.1:8545").is_err(), "only http://");
+}
+
+#[test]
+fn rehearsal_bridge_is_10_77_0_0_slash_24() {
+    for (ip, on) in [
+        ("10.77.0.0", true),
+        ("10.77.0.1", true),
+        ("10.77.0.255", true),
+        ("10.77.1.0", false),
+        ("10.76.255.255", false),
+        ("10.78.0.0", false),
+        ("11.77.0.1", false),
+        ("10.0.77.1", false),
+        ("77.10.0.1", false),
+        ("127.0.0.1", false),
+        ("::ffff:10.77.0.1", false),
+        ("::1", false),
+    ] {
+        assert_eq!(on_rehearsal_bridge(ip.parse().unwrap()), on, "{ip}");
+    }
+}
+
+#[test]
+fn private_bridge_egress_never_resolves_nor_dials_a_name() {
+    // `localhost:<port>` listened on at both ::1 and 127.0.0.1: whichever address a lookup gave first, a
+    // connection would land on one of them
+    let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let port = v6.local_addr().unwrap().port();
+    let target = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for l in [&v6, &target] {
+        l.set_nonblocking(true).unwrap();
+    }
+    let e = Egress::PrivateBridge;
+    for url in [format!("http://localhost:{port}"), format!("http://localhost.:{port}"), format!("http://ip6-localhost:{port}")] {
+        let err = call_via(&e, &url, "jetsam_blockCount", json!([]), Duration::from_secs(2)).unwrap_err().to_string();
+        assert!(err.contains("10.77.0.0/24"), "{url}: refused for what it is, before any socket: {err}");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    for l in [&v6, &target] {
+        assert_eq!(l.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "no connection to a name");
+    }
+    // the loopback IP literal is reached directly
+    let server = std::thread::spawn(move || {
+        target.set_nonblocking(false).unwrap();
+        let (mut s, _) = target.accept().unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut req = String::new();
+        while !req.contains("\"params\"") {
+            let n = s.read(&mut buf).unwrap();
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":5}"#;
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    assert_eq!(call_via(&e, &format!("http://127.0.0.1:{port}"), "x", json!([]), Duration::from_secs(5)).unwrap(), json!(5));
+    server.join().unwrap();
+}
+
+#[test]
+fn node_client_reaches_an_onion_node_through_socks_and_refuses_the_rest_before_any_socket() {
+    let (proxy, server) = fake_socks(0, json!(12));
+    let n = onion('n');
+    let c = NodeClient::observer(&format!("http://{n}:19801"), Egress::Onion { socks: proxy });
+    assert_eq!(c.call("blockCount", json!([])).unwrap(), json!(12));
+    let (seen, host, port, req) = server.join().unwrap();
+    assert_eq!(seen, vec![5, 1, 0, 5, 1, 0, 3], "CONNECT with a domain name");
+    assert_eq!((host.as_str(), port), (n.as_str(), 19801));
+    assert!(req.contains("\"method\":\"jetsam_blockCount\""), "{req}");
+    // a node off the loopback: refused before any socket (neither direct nor through Tor)
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let port = target.local_addr().unwrap().port();
+    let socks = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socks.set_nonblocking(true).unwrap();
+    for url in [format!("http://localhost:{port}"), format!("http://10.77.0.1:{port}")] {
+        let c = NodeClient::observer(&url, Egress::Onion { socks: socks.local_addr().unwrap() });
+        let e = c.call("blockCount", json!([])).unwrap_err().to_string();
+        assert!(e.contains("onion-only"), "{url}: {e}");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(socks.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }

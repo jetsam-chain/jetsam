@@ -624,3 +624,29 @@ fn observer_statement_below_height_7_is_refused_by_evaluate() {
         assert_eq!(code(&obs, &s, now), "FIELD_MISMATCH:headersDigest", "height {h}");
     }
 }
+
+#[test]
+fn observer_refuses_to_start_with_stability_below_1200_on_the_public_testnet() {
+    // D66: the public test network has the mainnet's SG-4 floor
+    let chain = testkit::chain(10, 1);
+    let bridge = jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address;
+    let mut c = cfg(&chain);
+    for (network, l1_chain_id, l1_bridge) in [
+        (crate::TESTNET_NETWORK, 11_155_111, [0x11u8; 20]),
+        (crate::TESTNET_NETWORK, 31_337, [0xee; 20]),
+        ([0x5a; 32], 11_155_111, bridge),
+    ] {
+        c.domain = Domain { network, l1_chain_id, l1_bridge };
+        for secs in [0, 600, 1_199] {
+            c.thresholds.stability_secs = secs;
+            let e = Observer::new(c.clone(), chain.clone()).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("stability_secs") && e.contains("1200"), "{:?} {secs}: {e:?}", c.domain);
+        }
+        c.thresholds.stability_secs = 1_200;
+        assert!(Observer::new(c.clone(), chain.clone()).is_ok());
+    }
+    // the private rehearsal (the test chain's genesis with its own L1 domain) keeps its values
+    c.domain = Domain { network: crate::TESTNET_NETWORK, l1_chain_id: 31_337, l1_bridge: bridge };
+    c.thresholds.stability_secs = 600;
+    assert!(Observer::new(c, chain).is_ok());
+}
