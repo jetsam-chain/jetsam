@@ -6,10 +6,10 @@
 //! ALLOW-LIST of read methods (design §10.1): a call to any other method
 //! (`walletSend`, `stop`, …) fails before any byte is sent.
 //!
-//! [`Egress`] (A4-1, D60): `jg-net` reaches the seeds and the L1 either in
-//! the clear (private rehearsal) or onion only — a loopback IP address
-//! directly, a `.onion` name through Tor's SOCKS5 port, anything else refused
-//! before any socket or DNS lookup.
+//! [`Egress`] (A4-1, D60, D66): the guardian programs reach their sources
+//! onion only — a loopback IP address directly, a `.onion` name through Tor's
+//! SOCKS5 port, anything else refused before any socket or DNS lookup — or,
+//! in the private rehearsal only, in the clear on its bridge 10.77.0.0/24.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -41,16 +41,28 @@ pub const DEFAULT_TOR_SOCKS: &str = "127.0.0.1:9050";
 /// How the guardian reaches an RPC (A4-1, D60).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Egress {
-    /// Plain TCP to the URL's host, resolved by the system: the private
-    /// rehearsal on its private bridge, and the programs that are not a
-    /// guardian's network side. A `.onion` name is refused (resolving it
-    /// would hand it to the system's DNS).
+    /// Plain TCP to the URL's host, resolved by the system: the rehearsal
+    /// tools ([`call`]), never the configured egress of a guardian program. A
+    /// `.onion` name is refused (resolving it would hand it to the system's
+    /// DNS).
     Clearnet,
     /// Onion only (D60): a loopback IP address is reached directly (nothing
     /// leaves the machine), a `<56>.onion` name through Tor's SOCKS port
     /// `socks` (Tor resolves it, never this machine); anything else is
     /// refused before any socket or DNS lookup.
     Onion { socks: SocketAddr },
+    /// `[egress] mode = "clearnet"` of the private rehearsal (D66): plain TCP
+    /// to a loopback IP address or to an IP address of the rehearsal's private
+    /// bridge 10.77.0.0/24, nothing else (no name, so no lookup).
+    PrivateBridge,
+}
+
+/// The private rehearsal's bridge, `10.77.0.0/24` (D66).
+pub const REHEARSAL_BRIDGE: &str = "10.77.0.0/24";
+
+/// `ip` is on the private rehearsal's bridge 10.77.0.0/24.
+pub fn on_rehearsal_bridge(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[..3] == [10, 77, 0])
 }
 
 /// Where one call is sent.
@@ -60,6 +72,8 @@ pub enum Route {
     Resolve(String),
     /// Plain TCP to a loopback IP address: no lookup, nothing leaves the machine.
     Loopback(SocketAddr),
+    /// Plain TCP to an IP address of the private rehearsal's bridge: no lookup.
+    Bridge(SocketAddr),
     /// Tor's SOCKS5 port, `CONNECT <host>:<port>` with the host as a NAME.
     Socks { proxy: SocketAddr, host: String, port: u16 },
 }
@@ -143,6 +157,20 @@ impl Egress {
                 );
                 Ok(Route::Socks { proxy: *socks, host: t.host.to_string(), port: t.port })
             }
+            Egress::PrivateBridge => {
+                let refused = || {
+                    anyhow::anyhow!(
+                        "the private rehearsal's clearnet refuses {url}: only a loopback IP address or an IP address of \
+                         its bridge {REHEARSAL_BRIDGE} (no name, no lookup)"
+                    )
+                };
+                let ip: std::net::IpAddr = t.host.parse().map_err(|_| refused())?;
+                if ip.is_loopback() {
+                    return Ok(Route::Loopback(SocketAddr::new(ip, t.port)));
+                }
+                anyhow::ensure!(on_rehearsal_bridge(ip), refused());
+                Ok(Route::Bridge(SocketAddr::new(ip, t.port)))
+            }
         }
     }
 }
@@ -219,7 +247,7 @@ pub fn call_via(egress: &Egress, url: &str, method: &str, params: Value, timeout
                 .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
             TcpStream::connect_timeout(&addr, timeout)?
         }
-        Route::Loopback(addr) => TcpStream::connect_timeout(addr, timeout)?,
+        Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
         Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
     };
     s.set_read_timeout(Some(timeout))?;
@@ -277,11 +305,13 @@ pub struct NodeClient {
     pub url: String,
     pub allow: &'static [&'static str],
     pub timeout: Duration,
+    /// How the node is reached (D66: its loopback RPC, or its `.onion` through Tor).
+    pub egress: Egress,
 }
 
 impl NodeClient {
-    pub fn observer(url: &str) -> Self {
-        Self { url: url.to_string(), allow: OBSERVER_ALLOWLIST, timeout: Duration::from_secs(30) }
+    pub fn observer(url: &str, egress: Egress) -> Self {
+        Self { url: url.to_string(), allow: OBSERVER_ALLOWLIST, timeout: Duration::from_secs(30), egress }
     }
 
     /// `jetsam_<method>`, refused unless allow-listed.
@@ -289,7 +319,7 @@ impl NodeClient {
         if !self.allow.contains(&method) {
             anyhow::bail!("method {method} is not in this client's allow-list");
         }
-        call(&self.url, &format!("jetsam_{method}"), params, self.timeout)
+        call_via(&self.egress, &self.url, &format!("jetsam_{method}"), params, self.timeout)
     }
 }
 

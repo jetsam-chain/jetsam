@@ -91,7 +91,7 @@ fn run() -> anyhow::Result<()> {
     }
     let (cfg, digest) = GuardianConfig::load(&config)?;
     log(&format!("config {} sha256 {}", config.display(), hex::encode(digest)));
-    let mut node = NodeClient::observer(&cfg.node_rpc);
+    let mut node = NodeClient::observer(&cfg.node_rpc, cfg.node_egress()?);
     let genesis = node.header(0)?.ok_or_else(|| anyhow::anyhow!("the node has no block 0"))?;
     let domain = cfg.domain()?;
     anyhow::ensure!(genesis.id == domain.network, "the node's genesis is not the configured network");

@@ -12,6 +12,11 @@
 //! E1) in the archive and in any published group signature (`forged/` of a
 //! publication point in the rehearsal): the 0x21 body is then built and
 //! submitted to Jetsam and to the L1 (`proveEquivocation`).
+//!
+//! The L1 and the robot node are reached by the configured egress (D66), as
+//! by `jg-net`: onion only by default (a loopback IP address directly, a
+//! `.onion` address through Tor's SOCKS port), any other address refuses the
+//! start; `clearnet` only for the private rehearsal's domain, on its bridge.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -23,10 +28,10 @@ use serde_json::{json, Value};
 
 use jetsam_guardian::aggregator::{archive, Added, Aggregator, GroupSignature};
 use jetsam_guardian::checkpoint::Checkpoint;
-use jetsam_guardian::config::hex48;
+use jetsam_guardian::config::{checked_egress, hex48, EgressConfig};
 use jetsam_guardian::feed::{utc_day, verify_line};
 use jetsam_guardian::l1::{self, L1};
-use jetsam_guardian::rpc::call;
+use jetsam_guardian::rpc::{call_via, Egress};
 use jetsam_guardian::{now_unix, GuardianStatement};
 use jetsam_chain::consensus::guardian::GuardianEquivocation;
 
@@ -65,6 +70,17 @@ struct AggConfig {
     watch_equivocations: bool,
     /// One JSON line per L1 / Jetsam action (time, gas, result).
     events_file: PathBuf,
+    /// The network and L1 chain this aggregator serves (with `l1_bridge`, its
+    /// domain): needed by `[egress] mode = "clearnet"` only, which is the
+    /// private rehearsal's (D66).
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    l1_chain_id: Option<u64>,
+    /// How `l1_rpc` and `robot_rpc` are reached (D66): onion only unless the
+    /// configuration says otherwise, as for `jg-net`.
+    #[serde(default)]
+    egress: EgressConfig,
 }
 
 fn yes() -> bool {
@@ -83,6 +99,8 @@ struct Agg {
     equivocations_sent: HashSet<String>,
     last_refusal: HashMap<usize, String>,
     seen_lines: HashSet<[u8; 32]>,
+    /// How `l1_rpc` and `robot_rpc` are reached (checked at start).
+    egress: Egress,
 }
 
 impl Agg {
@@ -174,7 +192,7 @@ impl Agg {
             return;
         }
         let (Some(url), Some(from), Some(bridge)) = (&self.cfg.l1_rpc, &self.cfg.l1_from, &self.cfg.l1_bridge) else { return };
-        let l1 = L1::new(url);
+        let l1 = L1::via(url, self.egress);
         let mut keep = Vec::new();
         // only the newest co-signature needs a finalization: its roots cover the older ones
         let pending = std::mem::take(&mut self.l1_pending);
@@ -227,7 +245,7 @@ impl Agg {
         }
         let Some(robot) = &self.cfg.robot_rpc else { return };
         let t = Duration::from_secs(60);
-        let Ok(gs) = call(robot, "jetsam_getGuardianState", json!([]), t) else { return };
+        let Ok(gs) = call_via(&self.egress, robot, "jetsam_getGuardianState", json!([]), t) else { return };
         let last = gs["last_attested_height"].as_u64();
         if gs["revoked_at"].as_u64().is_some() {
             return;
@@ -245,10 +263,10 @@ impl Agg {
             .max_by_key(|(g, _, _)| g.height);
         let Some((g, kind, _)) = best else { return };
         let body = format!("{}{}", g.statement, g.sig96);
-        let built = call(robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "attestation", "body": body}, null]), t);
+        let built = call_via(&self.egress, robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "attestation", "body": body}, null]), t);
         let res = built.and_then(|b| {
             let intent = b["intent_hex"].as_str().unwrap_or_default().to_string();
-            call(robot, "jetsam_submitGuardianObject", json!([intent]), t).map(|r| (b, r))
+            call_via(&self.egress, robot, "jetsam_submitGuardianObject", json!([intent]), t).map(|r| (b, r))
         });
         match res {
             Ok((b, r)) => {
@@ -312,13 +330,13 @@ impl Agg {
                     json!({"body": hex::encode(&body), "hints": hex::encode(&hints)}).to_string());
                 if let Some(robot) = &self.cfg.robot_rpc {
                     let t = Duration::from_secs(120);
-                    let r = call(robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "equivocation", "body": hex::encode(&body)}, null]), t)
-                        .and_then(|b| call(robot, "jetsam_submitGuardianObject", json!([b["intent_hex"].as_str().unwrap_or_default()]), t));
+                    let r = call_via(&self.egress, robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "equivocation", "body": hex::encode(&body)}, null]), t)
+                        .and_then(|b| call_via(&self.egress, robot, "jetsam_submitGuardianObject", json!([b["intent_hex"].as_str().unwrap_or_default()]), t));
                     self.event(json!({"t": now_unix(), "event": "equivocation_jetsam", "result": format!("{r:?}")}));
                     log(&format!("equivocation to Jetsam: {r:?}"));
                 }
                 if let (Some(url), Some(from), Some(bridge)) = (&self.cfg.l1_rpc, &self.cfg.l1_from, &self.cfg.l1_bridge) {
-                    let r = L1::new(url).send(from, bridge, &l1::prove_equivocation(&body, &hints));
+                    let r = L1::via(url, self.egress).send(from, bridge, &l1::prove_equivocation(&body, &hints));
                     match r {
                         Ok(rc) => {
                             log(&format!("proveEquivocation status {} gas {}", rc.status, rc.gas_used));
@@ -349,6 +367,23 @@ fn domain_of(v: &Value) -> Option<jetsam_guardian::Domain> {
     })
 }
 
+/// The egress of `l1_rpc` and `robot_rpc`, both checked (D66); the domain,
+/// when the configuration gives all three of its words, decides whether
+/// `clearnet` may be used.
+fn egress_of(cfg: &AggConfig) -> anyhow::Result<Egress> {
+    let domain = match (&cfg.network, cfg.l1_chain_id, &cfg.l1_bridge) {
+        (Some(network), Some(l1_chain_id), Some(bridge)) => Some(jetsam_guardian::Domain {
+            network: jetsam_guardian::parse32(network)?,
+            l1_chain_id,
+            l1_bridge: dec::<20>(bridge).ok_or_else(|| anyhow::anyhow!("l1_bridge: 20 bytes of hex"))?,
+        }),
+        _ => None,
+    };
+    let l1 = cfg.l1_rpc.iter().map(|url| ("l1_rpc".to_string(), url.as_str()));
+    let robot = cfg.robot_rpc.iter().map(|url| ("robot_rpc".to_string(), url.as_str()));
+    checked_egress(&cfg.egress, domain.as_ref(), l1.chain(robot))
+}
+
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let config = PathBuf::from(args.iter().position(|a| a == "--config").and_then(|i| args.get(i + 1)).ok_or_else(|| anyhow::anyhow!("--config <agg.toml>"))?);
@@ -357,6 +392,8 @@ fn run() -> anyhow::Result<()> {
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
     let cfg: AggConfig = toml::from_str(&std::fs::read_to_string(&config)?)?;
+    let egress = egress_of(&cfg).map_err(|e| anyhow::anyhow!("{e:#}: jg-aggregate does not start"))?;
+    log(&format!("egress {egress:?}"));
     let group_key = hex48(&cfg.group_key)?;
     let commitments = cfg.commitments.iter().map(|c| hex48(c)).collect::<anyhow::Result<Vec<_>>>()?;
     let keys = cfg
@@ -376,6 +413,7 @@ fn run() -> anyhow::Result<()> {
         equivocations_sent: HashSet::new(),
         last_refusal: HashMap::new(),
         seen_lines: HashSet::new(),
+        egress,
     };
     // the archive is the memory of a restarted aggregator: nothing is combined or archived twice
     if let Ok(text) = std::fs::read_to_string(a.cfg.archive_dir.join("signatures.jsonl")) {

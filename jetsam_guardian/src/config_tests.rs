@@ -5,7 +5,7 @@ index = 3
 generation = 1
 network = "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85"
 l1_chain_id = 31337
-l1_bridge = "0xee8b5fca00000000000000000000000000003e2f"
+l1_bridge = "0xee8b5fca072382781999798cf9d7c5b3f6c63e2f"
 v1_7_height = 96
 deposits_from_height = 128
 genesis_go = "120:1111111111111111111111111111111111111111111111111111111111111111"
@@ -25,7 +25,7 @@ g1 = "0101010101010101010101010101010101010101010101010101010101010101"
 min_dispatchable_peers = 6
 "#;
 
-/// The private rehearsal's egress (its seeds and L1 sit on a private bridge).
+/// The private rehearsal's egress (its seeds and L1 sit on its private bridge 10.77.0.0/24).
 const CLEARNET: &str = "\n[egress]\nmode = \"clearnet\"\n";
 
 #[test]
@@ -107,12 +107,12 @@ fn config_clearnet_egress_is_refused_on_mainnet() {
     assert!(e.contains("clearnet") && e.contains("mainnet"), "{e}");
     // even with sources that would be fine in onion mode
     assert!(GuardianConfig::parse(&on_mainnet(&format!("{}{CLEARNET}", onion_sources(TEXT)))).is_err());
-    assert!(GuardianConfig::parse(&on_mainnet(&onion_sources(TEXT))).unwrap().is_mainnet());
-    assert!(!GuardianConfig::parse(&onion_sources(TEXT)).unwrap().is_mainnet());
+    assert_eq!(GuardianConfig::parse(&on_mainnet(&onion_sources(TEXT))).unwrap().profile().unwrap(), crate::Profile::Mainnet);
+    assert_eq!(GuardianConfig::parse(&onion_sources(TEXT)).unwrap().profile().unwrap(), crate::Profile::PrivateRehearsal);
 }
 
 #[test]
-fn config_refuses_stability_below_1200_on_mainnet_only() {
+fn config_refuses_stability_below_1200_on_mainnet() {
     let with = |text: &str, secs: u64| text.replace("min_dispatchable_peers = 6\n", &format!("min_dispatchable_peers = 6\nstability_secs = {secs}\n"));
     let main = on_mainnet(&onion_sources(TEXT));
     let e = err(&with(&main, 1_199));
@@ -144,4 +144,179 @@ fn mainnet_network_is_the_mainnet_genesis_id() {
     } else {
         assert_ne!(id, crate::MAINNET_NETWORK, "a test-chain build");
     }
+}
+
+// ---- D66: the public test network has the mainnet's rules; the private rehearsal is told apart by its L1 domain ----
+
+const REHEARSAL_DOMAIN: &str = "l1_chain_id = 31337\nl1_bridge = \"0xee8b5fca072382781999798cf9d7c5b3f6c63e2f\"";
+
+/// The fixture as a guardian of the public test network: same genesis (the test chain's), its L1 is Sepolia.
+fn on_public_testnet(text: &str) -> String {
+    let out = text.replace(REHEARSAL_DOMAIN, "l1_chain_id = 11155111\nl1_bridge = \"0x1111111111111111111111111111111111111111\"");
+    assert_ne!(out, text);
+    out
+}
+
+fn with_stability(text: &str, secs: u64) -> String {
+    let out = text.replace("min_dispatchable_peers = 6\n", &format!("min_dispatchable_peers = 6\nstability_secs = {secs}\n"));
+    assert_ne!(out, text);
+    out
+}
+
+fn domain(network: [u8; 32], l1_chain_id: u64, l1_bridge: [u8; 20]) -> crate::Domain {
+    crate::Domain { network, l1_chain_id, l1_bridge }
+}
+
+#[test]
+fn profile_tells_the_three_networks_apart_by_genesis_and_l1_domain() {
+    use crate::Profile::*;
+    use crate::{MAINNET_NETWORK as MAIN, TESTNET_NETWORK as TEST};
+    let bridge = jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address;
+    assert_eq!(hex::encode(bridge), "ee8b5fca072382781999798cf9d7c5b3f6c63e2f", "the rehearsal's synthetic bridge");
+    let other = [0x5a; 32];
+    for (d, p) in [
+        (domain(MAIN, 1, [0x11; 20]), Mainnet),
+        // the mainnet genesis is the mainnet, whatever L1 it names
+        (domain(MAIN, 31_337, bridge), Mainnet),
+        (domain(TEST, 11_155_111, [0x11; 20]), PublicTestnet),
+        (domain(TEST, 11_155_111, bridge), PublicTestnet),
+        // the test chain's genesis is shared with the rehearsal: only the rehearsal's WHOLE L1 domain is the rehearsal
+        (domain(TEST, 31_337, [0xee; 20]), PublicTestnet),
+        (domain(TEST, 31_338, bridge), PublicTestnet),
+        (domain(TEST, 31_337, bridge), PrivateRehearsal),
+        // another network: the rehearsal's L1 only; any other L1 is treated as public
+        (domain(other, 31_337, [0xee; 20]), PrivateRehearsal),
+        (domain(other, 11_155_111, [0xee; 20]), OtherNetwork),
+        (domain(other, 1, bridge), OtherNetwork),
+    ] {
+        assert_eq!(crate::Profile::of(&d), p, "{d:?}");
+        assert_eq!(p.strict(), p != PrivateRehearsal);
+    }
+    assert!(Mainnet.strict() && PublicTestnet.strict() && OtherNetwork.strict() && !PrivateRehearsal.strict());
+    assert_eq!(crate::REHEARSAL_L1_CHAIN_ID, 31_337);
+}
+
+#[test]
+fn testnet_network_is_the_test_chain_genesis_id() {
+    use jetsam_chain::consensus::genesis::{genesis_header, GENESIS_TIMESTAMP};
+    let id = jetsam_chain::block_header::block_id(&genesis_header());
+    assert_eq!(hex::encode(crate::TESTNET_NETWORK), "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85");
+    assert_ne!(crate::TESTNET_NETWORK, crate::MAINNET_NETWORK);
+    if GENESIS_TIMESTAMP == 1_791_385_200 {
+        assert_eq!(id, crate::TESTNET_NETWORK, "a test-chain build: the test chain's genesis");
+    } else {
+        assert_ne!(id, crate::TESTNET_NETWORK, "the mainnet build");
+    }
+}
+
+#[test]
+fn config_clearnet_egress_is_refused_on_the_public_testnet() {
+    let e = err(&on_public_testnet(&format!("{TEXT}{CLEARNET}")));
+    assert!(e.contains("clearnet") && e.contains("public test network") && e.contains("does not start"), "{e}");
+    // even with sources that would be fine in onion mode
+    assert!(GuardianConfig::parse(&on_public_testnet(&format!("{}{CLEARNET}", onion_sources(TEXT)))).is_err());
+    let c = GuardianConfig::parse(&on_public_testnet(&onion_sources(TEXT))).unwrap();
+    assert_eq!(c.profile().unwrap(), crate::Profile::PublicTestnet);
+    // the test chain's genesis with the rehearsal's chain id but another bridge is not the rehearsal
+    let half = TEXT.replace("0xee8b5fca072382781999798cf9d7c5b3f6c63e2f", "0xee8b5fca00000000000000000000000000003e2f");
+    let e = err(&format!("{half}{CLEARNET}"));
+    assert!(e.contains("clearnet") && e.contains("public test network"), "{e}");
+    // an unknown network that names a public L1 is not the rehearsal either
+    let other = on_public_testnet(&TEXT.replace("d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85", &"5a".repeat(32)));
+    assert!(err(&format!("{other}{CLEARNET}")).contains("clearnet"));
+    // the private rehearsal keeps its clearnet
+    assert_eq!(GuardianConfig::parse(&format!("{TEXT}{CLEARNET}")).unwrap().egress().unwrap(), crate::rpc::Egress::PrivateBridge);
+}
+
+#[test]
+fn config_rehearsal_clearnet_reaches_only_the_loopback_and_its_bridge() {
+    let seeds = |list: &str| format!("{}{CLEARNET}", TEXT.replace(REHEARSAL_SEED, &format!("seed_rpcs = [{list}]")));
+    let ok = seeds(r#""http://10.77.0.1:19711", "http://10.77.0.254:19721", "http://127.0.0.1:19731", "http://[::1]:19741""#);
+    assert!(GuardianConfig::parse(&ok).is_ok(), "{:?}", GuardianConfig::parse(&ok).err());
+    let l1 = format!("{ok}").replace("seed_rpcs = [", "l1_rpc = \"http://10.77.0.1:18545\"\nseed_rpcs = [");
+    assert!(GuardianConfig::parse(&l1).is_ok());
+    for bad in [
+        "http://10.77.1.1:19711",
+        "http://10.78.0.1:19711",
+        "http://10.76.0.1:19711",
+        "http://192.168.1.10:19711",
+        "http://203.0.113.7:19711",
+        "http://[::ffff:10.77.0.1]:19711",
+        "http://seed.example.org:19711",
+        "http://localhost:19711",
+        "http://mseed1.jetsamchain.com:19711",
+    ] {
+        let e = err(&seeds(&format!("\"http://10.77.0.1:19711\", \"{bad}\"")));
+        assert!(e.contains("seed_rpcs[1]") && e.contains("does not start"), "{bad}: {e}");
+        let e = err(&l1.replace("http://10.77.0.1:18545", bad));
+        assert!(e.contains("l1_rpc") && e.contains("does not start"), "{bad}: {e}");
+    }
+    let e = err(&seeds(&format!("\"http://{}:19711\"", onion('a'))));
+    assert!(e.contains("seed_rpcs[0]") && e.contains(".onion"), "{e}");
+}
+
+#[test]
+fn config_refuses_stability_below_1200_on_the_public_testnet() {
+    let public = on_public_testnet(&onion_sources(TEXT));
+    let e = err(&with_stability(&public, 1_199));
+    assert!(e.contains("stability_secs") && e.contains("1200") && e.contains("public test network"), "{e}");
+    assert!(GuardianConfig::parse(&with_stability(&public, 0)).is_err());
+    assert_eq!(GuardianConfig::parse(&with_stability(&public, 1_200)).unwrap().thresholds.stability_secs, 1_200);
+    assert_eq!(GuardianConfig::parse(&public).unwrap().thresholds.stability_secs, 1_200, "the default is unchanged");
+    let other = public.replace("d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85", &"5a".repeat(32));
+    assert!(GuardianConfig::parse(&with_stability(&other, 600)).is_err(), "an unknown network naming a public L1");
+    // the private rehearsal keeps its own values, in both modes
+    assert_eq!(GuardianConfig::parse(&with_stability(&format!("{TEXT}{CLEARNET}"), 600)).unwrap().thresholds.stability_secs, 600);
+}
+
+#[test]
+fn config_node_rpc_must_be_loopback_or_onion_in_every_profile() {
+    let node = |text: &str, url: &str| {
+        let out = text.replace("node_rpc = \"http://127.0.0.1:19801\"", &format!("node_rpc = \"{url}\""));
+        assert_ne!(out, text);
+        out
+    };
+    let rehearsal = format!("{TEXT}{CLEARNET}");
+    for base in [onion_sources(TEXT), on_public_testnet(&onion_sources(TEXT)), on_mainnet(&onion_sources(TEXT)), rehearsal.clone()] {
+        for bad in [
+            "http://10.77.0.1:19801",
+            "http://192.168.1.2:19801",
+            "http://localhost:19801",
+            "http://node.example.org:19801",
+            "https://127.0.0.1:19801",
+            "http://[::ffff:127.0.0.1]:19801",
+        ] {
+            let e = err(&node(&base, bad));
+            assert!(e.contains("node_rpc") && e.contains("does not start"), "{bad}: {e}");
+        }
+        assert!(GuardianConfig::parse(&node(&base, "http://[::1]:19801")).is_ok());
+        let c = GuardianConfig::parse(&node(&base, &format!("http://{}:19801", onion('n')))).unwrap();
+        assert_eq!(c.node_egress().unwrap(), crate::rpc::Egress::Onion { socks: "127.0.0.1:9050".parse().unwrap() });
+    }
+    // the configured SOCKS port is the one used for an onion node
+    let text = format!("{}\n[egress]\ntor_socks = \"127.0.0.1:9150\"\n", onion_sources(TEXT));
+    assert_eq!(GuardianConfig::parse(&text).unwrap().node_egress().unwrap(), crate::rpc::Egress::Onion { socks: "127.0.0.1:9150".parse().unwrap() });
+    // the rehearsal's own node is on the loopback as well
+    assert_eq!(GuardianConfig::parse(&rehearsal).unwrap().node_egress().unwrap(), crate::rpc::Egress::Onion { socks: "127.0.0.1:9050".parse().unwrap() });
+}
+
+#[test]
+fn checked_egress_without_a_domain_refuses_clearnet() {
+    // jg-aggregate's case: a program that may not know its domain
+    let clearnet = EgressConfig { mode: EgressMode::Clearnet, tor_socks: "127.0.0.1:9050".into() };
+    let l1 = || [("l1_rpc".to_string(), "http://10.77.0.1:18545")];
+    let e = format!("{:#}", checked_egress(&clearnet, None, l1()).unwrap_err());
+    assert!(e.contains("clearnet") && e.contains("domain"), "{e}");
+    let bridge = jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address;
+    let rehearsal = domain(crate::TESTNET_NETWORK, 31_337, bridge);
+    assert_eq!(checked_egress(&clearnet, Some(&rehearsal), l1()).unwrap(), crate::rpc::Egress::PrivateBridge);
+    let public = domain(crate::TESTNET_NETWORK, 11_155_111, bridge);
+    assert!(format!("{:#}", checked_egress(&clearnet, Some(&public), l1()).unwrap_err()).contains("public test network"));
+    let onion_cfg = EgressConfig::default();
+    assert!(checked_egress(&onion_cfg, None, l1()).is_err(), "onion mode: the bridge is refused");
+    let ok = format!("http://{}:8545", onion('l'));
+    assert_eq!(
+        checked_egress(&onion_cfg, None, [("l1_rpc".to_string(), ok.as_str()), ("robot_rpc".to_string(), "http://127.0.0.1:19751")]).unwrap(),
+        crate::rpc::Egress::Onion { socks: "127.0.0.1:9050".parse().unwrap() }
+    );
 }

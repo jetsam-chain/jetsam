@@ -59,6 +59,79 @@ pub const MAINNET_NETWORK: [u8; 32] = [
     0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1, 0x2f, 0xda, 0xb4, 0x2c, 0x44, 0x8c, 0x5f, 0x44,
 ];
 
+/// The block id of the test chain's genesis (anchored in `jetsam_chain`,
+/// `testnet_genesis_block_id_is_canonical_and_differs_from_mainnet`): the
+/// `network` of a public test network guardian, and also of the private
+/// rehearsal's, whose builds (`rehearsal-v1-7`) are made from the test chain
+/// profile and share its genesis.
+pub const TESTNET_NETWORK: [u8; 32] = [
+    0xd9, 0xd1, 0x56, 0xee, 0x35, 0xe7, 0x25, 0xcf, 0x6b, 0x13, 0x32, 0x16, 0x80, 0x9c, 0x1b, 0x0f, 0x16, 0x5d,
+    0x11, 0x20, 0xc9, 0xcf, 0x42, 0xcc, 0x2b, 0xfe, 0xb0, 0xef, 0x90, 0x31, 0xee, 0x85,
+];
+
+/// The private rehearsal's L1, a local devnet: `GUARDIAN_L1_CHAIN_ID` of the
+/// `rehearsal-v1-7` builds (`jetsam_chain::consensus::guardian`). A public
+/// network's guardians sign for another L1 (1 on the mainnet, 11 155 111 on the
+/// test network), and its nodes refuse a statement naming this one.
+pub const REHEARSAL_L1_CHAIN_ID: u64 = 31_337;
+
+/// The rules a guardian program starts under (D66), from the domain it signs
+/// for. The mainnet and the public test network have the same strict rules:
+/// SG-4 floor, every source through Tor or on the loopback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// The mainnet network (its genesis id).
+    Mainnet,
+    /// The public test network: the test chain's genesis, with any L1 domain
+    /// but the rehearsal's.
+    PublicTestnet,
+    /// Any other network whose guardians sign for an L1 other than the
+    /// rehearsal's: strict as well (a public test chain relaunched with a new
+    /// genesis is never taken for a rehearsal).
+    OtherNetwork,
+    /// The private rehearsal: the rehearsal's L1 (chain 31 337) on a network
+    /// that is not the mainnet; on the test chain's genesis, which it shares
+    /// with the public test network, its synthetic bridge as well.
+    PrivateRehearsal,
+}
+
+impl Profile {
+    /// The profile of a guardian signing for `domain`.
+    pub fn of(domain: &Domain) -> Self {
+        let rehearsal_l1 = domain.l1_chain_id == REHEARSAL_L1_CHAIN_ID;
+        if domain.network == MAINNET_NETWORK {
+            Profile::Mainnet
+        } else if domain.network == TESTNET_NETWORK {
+            let bridge = jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address;
+            if rehearsal_l1 && domain.l1_bridge == bridge {
+                Profile::PrivateRehearsal
+            } else {
+                Profile::PublicTestnet
+            }
+        } else if rehearsal_l1 {
+            Profile::PrivateRehearsal
+        } else {
+            Profile::OtherNetwork
+        }
+    }
+
+    /// The public networks' rules apply (everything but the private rehearsal).
+    pub fn strict(self) -> bool {
+        self != Profile::PrivateRehearsal
+    }
+}
+
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Profile::Mainnet => "the mainnet network",
+            Profile::PublicTestnet => "the public test network",
+            Profile::OtherNetwork => "a network that is not the private rehearsal's",
+            Profile::PrivateRehearsal => "the private rehearsal",
+        })
+    }
+}
+
 /// The statements `jg-net` evaluates per 15 s round, the highest first:
 /// the proposals of the publication points and the attestations due.
 pub const NET_ROUND_CANDIDATES: usize = 32;

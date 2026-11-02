@@ -4,6 +4,12 @@
 //! configured uid, and so do `jg-sign`'s two sockets. A fake SOCKS port, a
 //! fake node, fake `jg-observe` / `jg-sign` sockets (TEST keys for the real
 //! `jg-sign`): nothing leaves the loopback.
+//!
+//! D66: the public test network has the mainnet's rules (no clearnet, SG-4
+//! floor); the private rehearsal's clearnet reaches the loopback and its bridge
+//! 10.77.0.0/24 only; `jg-observe` reaches its node on the loopback or as a
+//! `.onion` through Tor; `jg-aggregate` reaches its L1 and its robot node like
+//! `jg-net`, or does not start.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -176,6 +182,11 @@ struct Guardian {
 }
 
 fn guardian(network: &[u8; 32], sources: &str, extra: &str) -> Guardian {
+    guardian_on(network, 31_337, &BRIDGE, sources, extra)
+}
+
+/// [`guardian`] for the domain `(network, l1_chain_id, l1_bridge)`.
+fn guardian_on(network: &[u8; 32], l1_chain_id: u64, l1_bridge: &[u8; 20], sources: &str, extra: &str) -> Guardian {
     let node_rpc = if sources.contains("node_rpc") { "" } else { "node_rpc = \"http://127.0.0.1:9\"\n" };
     let sources = format!("{node_rpc}{sources}");
     let root = tempfile::tempdir().unwrap();
@@ -185,11 +196,11 @@ fn guardian(network: &[u8; 32], sources: &str, extra: &str) -> Guardian {
     std::fs::create_dir_all(dir.join("pub")).unwrap();
     std::fs::write(dir.join("state/net/feed.key"), hex::encode([7u8; 32])).unwrap();
     let text = format!(
-        "index = 1\ngeneration = 1\nnetwork = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nv1_7_height = 0\n\
+        "index = 1\ngeneration = 1\nnetwork = \"{}\"\nl1_chain_id = {l1_chain_id}\nl1_bridge = \"0x{}\"\nv1_7_height = 0\n\
          deposits_from_height = 0\nnode_version = \"jetsam/test\"\n{sources}\npublication_points = [\"{}\"]\n\
          group_key = \"{}\"\ncommitments = []\nstate_dir = \"{}\"\n{extra}\n[feed_keys]\ng1 = \"{}\"\n",
         hex::encode(network),
-        hex::encode(BRIDGE),
+        hex::encode(l1_bridge),
         dir.join("pub").display(),
         "00".repeat(48),
         dir.join("state").display(),
@@ -486,4 +497,307 @@ fn jg_sign_sockets_answer_only_their_configured_uids() {
             assert_refused(na, &format!("{extra:?}: sign-net.sock"));
         }
     }
+}
+
+// ---- D66 ----
+
+const REHEARSAL_BRIDGE: [u8; 20] = [
+    0xee, 0x8b, 0x5f, 0xca, 0x07, 0x23, 0x82, 0x78, 0x19, 0x99, 0x79, 0x8c, 0xf9, 0xd7, 0xc5, 0xb3, 0xf6, 0xc6, 0x3e, 0x2f,
+];
+const CLEARNET: &str = "[egress]\nmode = \"clearnet\"";
+
+/// A listener nobody should reach, and a SOCKS port nobody should reach (both non-blocking).
+fn untouchable() -> (TcpListener, TcpListener) {
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    socks.set_nonblocking(true).unwrap();
+    (target, socks)
+}
+
+fn untouched(target: &TcpListener, socks: &TcpListener, what: &str) {
+    assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "{what}: no direct connection");
+    assert_eq!(socks.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "{what}: nothing through Tor either");
+}
+
+/// Spawn `bin --config config`; its exit code if it exits within 30 s (else stopped, `None`), and its log.
+fn exit_of(bin: &str, config: &Path, log_path: &Path) -> (Option<Option<i32>>, String) {
+    let log = std::fs::File::create(log_path).unwrap();
+    let mut child = Command::new(bin).arg("--config").arg(config).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let mut code = None;
+    let end = Instant::now() + Duration::from_secs(30);
+    while code.is_none() && Instant::now() < end {
+        code = child.try_wait().unwrap().map(|st| st.code());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if code.is_none() {
+        stop(child);
+    }
+    (code, std::fs::read_to_string(log_path).unwrap_or_default())
+}
+
+#[test]
+fn jg_net_and_jg_observe_refuse_clearnet_on_the_public_networks_and_off_the_rehearsal_bridge() {
+    let (target, socks) = untouchable();
+    let port = target.local_addr().unwrap().port();
+    let socks_cfg = format!("[egress]\ntor_socks = \"127.0.0.1:{}\"", socks.local_addr().unwrap().port());
+    let bridge_seed = format!("seed_rpcs = [\"http://10.77.0.1:{port}\"]");
+    let onion_seed = format!("seed_rpcs = [\"http://{}:19711\"]", onion('a'));
+    let test = jetsam_guardian::TESTNET_NETWORK;
+    let main = jetsam_guardian::MAINNET_NETWORK;
+    let cases: Vec<(&str, [u8; 32], u64, [u8; 20], String, String, Vec<&str>)> = vec![
+        ("public testnet + clearnet", test, 11_155_111, REHEARSAL_BRIDGE, bridge_seed.clone(), CLEARNET.into(), vec!["clearnet", "public test network"]),
+        ("test genesis, 31337, not the rehearsal bridge", test, 31_337, BRIDGE, bridge_seed.clone(), CLEARNET.into(), vec!["clearnet", "public test network"]),
+        ("mainnet + clearnet", main, 1, BRIDGE, "seed_rpcs = [\"http://127.0.0.1:19711\"]".into(), CLEARNET.into(), vec!["clearnet", "mainnet"]),
+        ("rehearsal clearnet, a name", test, 31_337, REHEARSAL_BRIDGE, format!("seed_rpcs = [\"http://localhost:{port}\"]"), CLEARNET.into(), vec!["seed_rpcs[0]", "10.77.0.0/24"]),
+        (
+            "rehearsal clearnet, an L1 off the bridge",
+            test,
+            31_337,
+            REHEARSAL_BRIDGE,
+            format!("{bridge_seed}\nl1_rpc = \"http://192.168.77.1:{port}\""),
+            CLEARNET.into(),
+            vec!["l1_rpc", "10.77.0.0/24"],
+        ),
+        (
+            "public testnet, SG-4 below 1200",
+            test,
+            11_155_111,
+            REHEARSAL_BRIDGE,
+            onion_seed.clone(),
+            format!("{socks_cfg}\n[thresholds]\nstability_secs = 600"),
+            vec!["stability_secs", "1200", "public test network"],
+        ),
+    ];
+    for (label, network, chain_id, bridge, sources, extra, want) in cases {
+        let g = guardian_on(&network, chain_id, &bridge, &sources, &extra);
+        for bin in [env!("CARGO_BIN_EXE_jg-net"), env!("CARGO_BIN_EXE_jg-observe")] {
+            let (code, log) = exit_of(bin, &g.config, &g.dir.join("refusal.log"));
+            assert_eq!(code, Some(Some(1)), "{label} ({bin}): must exit at once; log:\n{log}");
+            assert!(want.iter().all(|w| log.contains(w)) && log.contains("does not start"), "{label} ({bin}): {log}");
+            untouched(&target, &socks, label);
+        }
+    }
+}
+
+#[test]
+fn jg_net_rehearsal_clearnet_reaches_its_loopback_sources_directly() {
+    // the private rehearsal (test chain genesis, its L1 domain, clearnet said): still works
+    let (s, _) = test_statement();
+    let id = hex::encode(s.block_id);
+    let answer: Answer = Arc::new(move |method, params| match method {
+        "jetsam_blockCount" => json!({"result": 40}),
+        "jetsam_getBlockHash" if params[0] == json!(20) => json!({"result": id}),
+        "eth_call" => json!({"result": format!("0x{}", "00".repeat(32))}),
+        _ => json!({"error": {"code": -32601, "message": "no"}}),
+    });
+    let (a, seen_a) = fake_http(answer.clone());
+    let (b, seen_b) = fake_http(answer.clone());
+    let (l1, seen_l1) = fake_http(answer);
+    let g = guardian_on(
+        &jetsam_guardian::TESTNET_NETWORK,
+        31_337,
+        &REHEARSAL_BRIDGE,
+        &format!("seed_rpcs = [\"http://127.0.0.1:{a}\", \"http://127.0.0.1:{b}\"]\nl1_rpc = \"http://127.0.0.1:{l1}\""),
+        CLEARNET,
+    );
+    let run = g.dir.join("state/run");
+    let stmt = hex::encode(s.encode());
+    let _obs = fake_socket(&run.join("obs.sock"), observer_answer, stmt.clone());
+    let _sign = fake_socket(&run.join("sign-net.sock"), signer_answer, stmt.clone());
+    let net = spawn(env!("CARGO_BIN_EXE_jg-net"), &g, "net");
+    let published = wait_for(90, || !partials(&g).is_empty());
+    stop(net);
+    let log = std::fs::read_to_string(g.dir.join("net.log")).unwrap_or_default();
+    assert!(published, "no partial published; jg-net log:\n{log}");
+    assert!(log.contains("egress PrivateBridge"), "{log}");
+    for (name, seen) in [("seed A", &seen_a), ("seed B", &seen_b)] {
+        assert!(seen.lock().unwrap().iter().any(|(.., m)| m == "jetsam_getBlockHash"), "{name}");
+    }
+    assert!(seen_l1.lock().unwrap().iter().any(|(.., m)| m == "eth_call"), "the L1");
+}
+
+fn genesis_node() -> Answer {
+    let genesis = testkit::genesis();
+    let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
+    Arc::new(move |method, params| match method {
+        "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
+        "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
+        "jetsam_blockCount" => json!({"result": 0}),
+        _ => json!({"error": {"code": -32601, "message": "not in this fake"}}),
+    })
+}
+
+#[test]
+fn jg_observe_reaches_an_onion_node_through_the_socks_port_only() {
+    let (socks, seen) = fake_tor(genesis_node());
+    let n = onion('n');
+    let g = guardian(
+        &testkit::genesis().id,
+        &format!("node_rpc = \"http://{n}:19801\"\nseed_rpcs = []"),
+        &format!("[egress]\ntor_socks = \"127.0.0.1:{socks}\""),
+    );
+    let sock = g.dir.join("state/run/obs.sock");
+    let obs = spawn(env!("CARGO_BIN_EXE_jg-observe"), &g, "observe");
+    let up = wait_for(90, || sock.exists());
+    stop(obs);
+    let log = std::fs::read_to_string(g.dir.join("observe.log")).unwrap_or_default();
+    assert!(up, "jg-observe did not start on its onion node; log:\n{log}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.is_empty() && seen.iter().all(|(atyp, host, port, _)| *atyp == 3 && *host == n && *port == 19801), "{seen:?}");
+    assert!(seen.iter().any(|(.., m)| m == "jetsam_getHeaderByHeight"), "{seen:?}");
+}
+
+#[test]
+fn jg_observe_refuses_a_node_off_the_loopback_and_dials_nothing() {
+    let (target, socks) = untouchable();
+    let port = target.local_addr().unwrap().port();
+    let socks_cfg = format!("[egress]\ntor_socks = \"127.0.0.1:{}\"", socks.local_addr().unwrap().port());
+    let genesis = testkit::genesis().id;
+    for (label, node, extra) in [
+        ("a name", format!("http://localhost:{port}"), socks_cfg.clone()),
+        ("an address off the loopback", format!("http://10.77.0.1:{port}"), socks_cfg.clone()),
+        // even the private rehearsal's clearnet does not take its node off the loopback
+        ("rehearsal clearnet, on the bridge", format!("http://10.77.0.1:{port}"), CLEARNET.to_string()),
+    ] {
+        let g = guardian(&genesis, &format!("node_rpc = \"{node}\"\nseed_rpcs = []"), &extra);
+        let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-observe"), &g.config, &g.dir.join("observe.log"));
+        assert_eq!(code, Some(Some(1)), "{label}: must exit at once; log:\n{log}");
+        assert!(log.contains("node_rpc") && log.contains("does not start"), "{label}: {log}");
+        untouched(&target, &socks, label);
+    }
+}
+
+/// An aggregator directory: `agg.toml` with `lines` (top level) and `extra`
+/// (tables), the events file, and an archive holding two expired, CONFLICTING
+/// co-signatures of height 20 (TEST bytes, never verified on this path): at
+/// start the aggregator reads the L1's time, offers an attestation to the robot
+/// node, and reports the equivocation to the robot node and to the L1 — every
+/// remote call it has.
+fn aggregator(lines: &str, extra: &str) -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("archive")).unwrap();
+    std::fs::create_dir_all(dir.join("pub")).unwrap();
+    let h = |b: &str| b.repeat(32);
+    let checkpoint = json!({"height": 20, "cum_work": h("00"), "headers_digest": h("11"), "deposit_root": h("22"), "deposit_count": 0,
+                            "anchor_root": h("33"), "locked_height": 12, "tip_block_id": h("44"), "locked_block_id": h("55"),
+                            "locked_cum_work": h("00")});
+    let mut archive = String::new();
+    for (m, id) in [("66", "44"), ("77", "55")] {
+        // words 0-4 zero, word 5 = height 20, word 6 = the block id, words 7-12 zero
+        let statement = format!("{}{:064x}{}{}", "00".repeat(160), 20, id.repeat(32), "00".repeat(192));
+        let group = json!({"statement": statement, "m": h(m), "sig96": "00".repeat(96), "sig256": "00".repeat(256),
+                           "indices": [1, 2, 3, 4, 5], "generation": 1, "height": 20, "combined_unix": 0});
+        let entry = json!({"group": group, "kind": "cosign", "proposal": {"checkpoint": checkpoint, "not_after": 1}});
+        archive += &format!("{entry}\n");
+    }
+    std::fs::write(dir.join("archive/signatures.jsonl"), archive).unwrap();
+    let text = format!(
+        "publication_points = [\"{}\"]\narchive_dir = \"{}\"\ngroup_key = \"{}\"\ncommitments = []\ngeneration = 1\n\
+         l1_from = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\nevents_file = \"{}\"\n{lines}\n{extra}\n[feed_keys]\ng1 = \"{}\"\n",
+        dir.join("pub").display(),
+        dir.join("archive").display(),
+        "00".repeat(48),
+        dir.join("events.jsonl").display(),
+        "00".repeat(32),
+    );
+    std::fs::write(dir.join("agg.toml"), text).unwrap();
+    (root, dir)
+}
+
+fn chain_answer() -> Answer {
+    Arc::new(|method, _| match method {
+        "jetsam_getGuardianState" => json!({"result": {"tip_height": 30}}),
+        "jetsam_walletBuildGuardianPayment" => json!({"result": {"intent_hex": "ab", "txid": "00"}}),
+        "eth_getBlockByNumber" => json!({"result": {"timestamp": "0x10"}}),
+        _ => json!({"error": {"code": -32601, "message": "not in this fake"}}),
+    })
+}
+
+#[test]
+fn jg_aggregate_reaches_its_l1_and_robot_through_the_socks_port_only() {
+    let (socks, seen) = fake_tor(chain_answer());
+    let (c, r) = (onion('c'), onion('r'));
+    let (_root, dir) = aggregator(
+        &format!("l1_rpc = \"http://{c}:8545\"\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://{r}:19751\"", hex::encode(BRIDGE)),
+        &format!("[egress]\ntor_socks = \"127.0.0.1:{socks}\""),
+    );
+    let log = std::fs::File::create(dir.join("agg.log")).unwrap();
+    let agg = Command::new(env!("CARGO_BIN_EXE_jg-aggregate")).arg("--config").arg(dir.join("agg.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let count = |host: &str, port: u16, method: &str| seen.lock().unwrap().iter().filter(|(a, h, p, m)| *a == 3 && h == host && *p == port && m == method).count();
+    // the L1's time (finalization), the probe of proveEquivocation; the robot's state, then an attestation and the equivocation
+    let all = wait_for(60, || {
+        count(&c, 8545, "eth_getBlockByNumber") >= 1
+            && count(&c, 8545, "eth_call") >= 1
+            && count(&r, 19751, "jetsam_getGuardianState") >= 1
+            && count(&r, 19751, "jetsam_walletBuildGuardianPayment") >= 2
+            && count(&r, 19751, "jetsam_submitGuardianObject") >= 2
+    });
+    stop(agg);
+    let log = std::fs::read_to_string(dir.join("agg.log")).unwrap_or_default();
+    let seen = seen.lock().unwrap().clone();
+    assert!(all, "{seen:?}; log:\n{log}");
+    assert!(seen.iter().all(|(atyp, ..)| *atyp == 3), "every target named as a NAME: {seen:?}");
+    let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+    for e in ["cosign_expired", "attestation_refused", "equivocation_detected", "equivocation_jetsam", "proveEquivocation_refused"] {
+        assert!(events.contains(e), "{e}: {events}");
+    }
+}
+
+#[test]
+fn jg_aggregate_refuses_to_start_on_a_clearnet_source_and_dials_nothing() {
+    let (target, socks) = untouchable();
+    let port = target.local_addr().unwrap().port();
+    let socks_cfg = format!("[egress]\ntor_socks = \"127.0.0.1:{}\"", socks.local_addr().unwrap().port());
+    let rb = format!("0x{}", hex::encode(REHEARSAL_BRIDGE));
+    let rehearsal = format!("network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"{rb}\"", hex::encode(jetsam_guardian::TESTNET_NETWORK));
+    let bridge_l1 = format!("l1_rpc = \"http://10.77.0.1:{port}\"");
+    let cases: Vec<(&str, String, String, Vec<&str>)> = vec![
+        ("onion mode, an L1 on the bridge", format!("{bridge_l1}\nl1_bridge = \"{rb}\""), socks_cfg.clone(), vec!["l1_rpc", "onion-only"]),
+        ("onion mode, a robot by name", format!("robot_rpc = \"http://localhost:{port}\""), socks_cfg.clone(), vec!["robot_rpc", "onion-only"]),
+        ("clearnet without a domain", format!("{bridge_l1}\nl1_bridge = \"{rb}\""), CLEARNET.into(), vec!["clearnet", "domain"]),
+        (
+            "clearnet on the public testnet",
+            format!("{bridge_l1}\nnetwork = \"{}\"\nl1_chain_id = 11155111\nl1_bridge = \"{rb}\"", hex::encode(jetsam_guardian::TESTNET_NETWORK)),
+            CLEARNET.into(),
+            vec!["clearnet", "public test network"],
+        ),
+        (
+            "clearnet on the mainnet",
+            format!("{bridge_l1}\nnetwork = \"{}\"\nl1_chain_id = 1\nl1_bridge = \"{rb}\"", hex::encode(jetsam_guardian::MAINNET_NETWORK)),
+            CLEARNET.into(),
+            vec!["clearnet", "mainnet"],
+        ),
+        ("rehearsal clearnet, an L1 off the bridge", format!("{rehearsal}\nl1_rpc = \"http://192.168.77.1:{port}\""), CLEARNET.into(), vec!["l1_rpc", "10.77.0.0/24"]),
+        ("rehearsal clearnet, a robot by name", format!("{rehearsal}\nrobot_rpc = \"http://localhost:{port}\""), CLEARNET.into(), vec!["robot_rpc", "10.77.0.0/24"]),
+    ];
+    for (label, lines, extra, want) in cases {
+        let (_root, dir) = aggregator(&lines, &extra);
+        let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-aggregate"), &dir.join("agg.toml"), &dir.join("agg.log"));
+        assert_eq!(code, Some(Some(1)), "{label}: must exit at once; log:\n{log}");
+        assert!(want.iter().all(|w| log.contains(w)) && log.contains("does not start"), "{label}: {log}");
+        untouched(&target, &socks, label);
+    }
+}
+
+#[test]
+fn jg_aggregate_rehearsal_clearnet_reaches_its_loopback_l1_and_robot_directly() {
+    let (l1, seen_l1) = fake_http(chain_answer());
+    let (robot, seen_robot) = fake_http(chain_answer());
+    let rb = format!("0x{}", hex::encode(REHEARSAL_BRIDGE));
+    let (_root, dir) = aggregator(
+        &format!(
+            "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"{rb}\"\nl1_rpc = \"http://127.0.0.1:{l1}\"\nrobot_rpc = \"http://127.0.0.1:{robot}\"",
+            hex::encode(jetsam_guardian::TESTNET_NETWORK)
+        ),
+        CLEARNET,
+    );
+    let log = std::fs::File::create(dir.join("agg.log")).unwrap();
+    let agg = Command::new(env!("CARGO_BIN_EXE_jg-aggregate")).arg("--config").arg(dir.join("agg.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let has = |s: &Seen, m: &str| s.lock().unwrap().iter().any(|(.., x)| x == m);
+    let both = wait_for(60, || has(&seen_l1, "eth_getBlockByNumber") && has(&seen_robot, "jetsam_getGuardianState"));
+    stop(agg);
+    let log = std::fs::read_to_string(dir.join("agg.log")).unwrap_or_default();
+    assert!(both, "log:\n{log}");
 }

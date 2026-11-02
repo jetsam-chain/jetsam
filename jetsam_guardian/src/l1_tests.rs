@@ -46,3 +46,48 @@ fn call_data_matches_cast() {
     assert_eq!(k(&prove_equivocation(&[1, 2], &[3, 4, 5])), "0xd8d63462be65030b631fc8509b0a39f2ae1eb09d7a65a1680af3bbde414801a3");
     assert_eq!(k(&burn(30_000_000, &rep(0x44))), "0xe7217e0d32d486503751b64fceaa7b8cb8edf546b2732245b1eec004e33fc104");
 }
+
+#[test]
+fn l1_client_goes_through_its_egress() {
+    // a fake Tor SOCKS port: one CONNECT recorded, then one JSON-RPC answer
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut greeting = [0u8; 3];
+        s.read_exact(&mut greeting).unwrap();
+        s.write_all(&[5, 0]).unwrap();
+        let mut head = [0u8; 5];
+        s.read_exact(&mut head).unwrap();
+        let mut rest = vec![0u8; head[4] as usize + 2];
+        s.read_exact(&mut rest).unwrap();
+        s.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        let mut req = String::new();
+        let mut buf = vec![0u8; 4096];
+        while !req.contains("\"params\"") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0);
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"timestamp":"0x10"}}"#;
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        (head[3], String::from_utf8(rest[..head[4] as usize].to_vec()).unwrap(), req)
+    });
+    let host = format!("jetsamtest{}.onion", "l".repeat(46));
+    let l1 = L1::via(&format!("http://{host}:8545"), crate::rpc::Egress::Onion { socks });
+    assert_eq!(l1.now().unwrap(), 16);
+    let (atyp, seen_host, req) = server.join().unwrap();
+    assert_eq!((atyp, seen_host.as_str()), (3, host.as_str()), "the L1 reached through Tor by name");
+    assert!(req.contains("eth_getBlockByNumber"), "{req}");
+    // an L1 off the loopback is refused before any socket
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let port = target.local_addr().unwrap().port();
+    let l1 = L1::via(&format!("http://localhost:{port}"), crate::rpc::Egress::Onion { socks });
+    assert!(l1.now().unwrap_err().to_string().contains("onion-only"));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    // the rehearsal tools keep plain TCP
+    assert_eq!(L1::new("http://10.77.0.1:18545").egress, crate::rpc::Egress::Clearnet);
+}

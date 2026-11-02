@@ -130,6 +130,8 @@ pub fn burn(amount: u64, jetsam_recipient: &[u8; 32]) -> Vec<u8> {
 pub struct L1 {
     pub url: String,
     pub timeout: Duration,
+    /// How the endpoint is reached (`jg-aggregate`: its configured egress, D66).
+    pub egress: crate::rpc::Egress,
 }
 
 /// A mined transaction.
@@ -144,12 +146,18 @@ pub struct Receipt {
 }
 
 impl L1 {
+    /// Plain TCP (the rehearsal tools).
     pub fn new(url: &str) -> Self {
-        Self { url: url.to_string(), timeout: Duration::from_secs(60) }
+        Self::via(url, crate::rpc::Egress::Clearnet)
+    }
+
+    /// Reached by `egress`.
+    pub fn via(url: &str, egress: crate::rpc::Egress) -> Self {
+        Self { url: url.to_string(), timeout: Duration::from_secs(60), egress }
     }
 
     pub fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        crate::rpc::call(&self.url, method, params, self.timeout)
+        crate::rpc::call_via(&self.egress, &self.url, method, params, self.timeout)
     }
 
     /// `eth_call` of `data` at `to`.
