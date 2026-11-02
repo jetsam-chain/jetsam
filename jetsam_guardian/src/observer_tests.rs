@@ -578,3 +578,49 @@ fn observer_deposit_count_at_or_below_bridge_opening_is_zero() {
     assert_eq!(code(&obs, &cosign(&obs, 26, 0), now), "OK");
     assert_eq!(code(&obs, &cosign(&obs, 26, 1), now), "DEPOSIT_COUNT_IMPLAUSIBLE");
 }
+
+#[test]
+fn observer_refuses_to_start_with_stability_below_1200_on_mainnet() {
+    let chain = testkit::chain(10, 1);
+    let mut c = cfg(&chain);
+    c.domain.network = crate::MAINNET_NETWORK;
+    for secs in [0, 600, 1_199] {
+        c.thresholds.stability_secs = secs;
+        let e = Observer::new(c.clone(), chain.clone()).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("stability_secs") && e.contains("1200"), "{secs}: {e:?}");
+    }
+    c.thresholds.stability_secs = 1_200;
+    assert!(Observer::new(c.clone(), chain.clone()).is_ok());
+    c.thresholds = Thresholds::default();
+    assert!(Observer::new(c, chain.clone()).is_ok(), "the default (1 200 s) is unchanged");
+    // the private rehearsal (another network) keeps its own values
+    let mut r = cfg(&chain);
+    r.thresholds.stability_secs = 600;
+    assert!(Observer::new(r, chain).is_ok());
+}
+
+#[test]
+fn observer_refuses_points_below_height_7_without_panicking() {
+    // SG-4 reads L−7..L: below 7 that window does not exist (A4-7: `s.height - 7`
+    // panicked in debug and skipped SG-4 in release)
+    let (obs, _, now) = warm();
+    for h in 0..7 {
+        assert!(!obs.point_stable(h, now), "height {h}");
+    }
+    assert!(obs.point_stable(7, now), "height 7: L−7 = 0, the window exists");
+    assert!(obs.point_stable(obs.chain().tip_height() - 8, now));
+}
+
+#[test]
+fn observer_statement_below_height_7_is_refused_by_evaluate() {
+    // a statement below 7 with the chain's own id and work: refused, never a panic
+    // (SG-8 refuses it before SG-4: the chain has no headers digest below 7)
+    let (obs, _, now) = warm();
+    let mut s = att(&obs, 10);
+    for h in 0..7 {
+        s.height = h;
+        s.block_id = obs.chain().id_at(h).unwrap();
+        s.cum_work = crate::u256::to_be(&obs.chain().work_at(h).unwrap());
+        assert_eq!(code(&obs, &s, now), "FIELD_MISMATCH:headersDigest", "height {h}");
+    }
+}

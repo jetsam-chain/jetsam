@@ -118,7 +118,7 @@ fn run() -> anyhow::Result<()> {
         }
     }
     let run_dir = cfg.state_dir.join("run");
-    let listener = ipc::bind(&run_dir.join("obs.sock"))?;
+    let listener = ipc::bind(&run_dir.join("obs.sock"), cfg.ipc.net_or(ipc::own_uid()))?;
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let mut last_save = Instant::now();
     while !STOP.load(Ordering::SeqCst) {

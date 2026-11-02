@@ -9,6 +9,10 @@
 //! the headers to `jg-sign`) → verdict W (SG-10: the other guardians' signed
 //! `obs` lines and the seeds' `getBlockHash`) → `jg-sign` → the partial,
 //! published on every point. Every 60 s: `hb` and `obs` lines.
+//!
+//! The seeds and the L1 are reached by the configured egress (A4-1, D60):
+//! onion only by default — a loopback IP address directly, a `.onion`
+//! address through Tor's SOCKS port; any other source refuses the start.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,7 +24,7 @@ use serde_json::{json, Value};
 use jetsam_guardian::checkpoint::Checkpoint;
 use jetsam_guardian::config::GuardianConfig;
 use jetsam_guardian::feed::{publish, sign_line, utc_day, verify_line, FeedKey};
-use jetsam_guardian::rpc::call;
+use jetsam_guardian::rpc::{call_via, Egress};
 use jetsam_guardian::signer::Verdict;
 use jetsam_guardian::witness::{witness, SourceView, WitnessRule};
 use jetsam_guardian::{ipc, now_unix, GuardianStatement};
@@ -88,10 +92,10 @@ fn feed_sources(points: &[PathBuf], keys: &HashMap<u32, [u8; 32]>, me: u32, now:
 }
 
 /// One seed's view of `height` (SG-10).
-fn seed_source(url: &str, height: u64, now: u64) -> Option<SourceView> {
+fn seed_source(egress: &Egress, url: &str, height: u64, now: u64) -> Option<SourceView> {
     let t = Duration::from_secs(10);
-    let tip = call(url, "jetsam_blockCount", json!([]), t).ok()?.as_u64()?;
-    let id = call(url, "jetsam_getBlockHash", json!([height]), t).ok()?;
+    let tip = call_via(egress, url, "jetsam_blockCount", json!([]), t).ok()?.as_u64()?;
+    let id = call_via(egress, url, "jetsam_getBlockHash", json!([height]), t).ok()?;
     let mut ids = BTreeMap::new();
     if let Some(text) = id.as_str() {
         ids.insert(height, jetsam_guardian::parse32(text).ok()?);
@@ -101,6 +105,7 @@ fn seed_source(url: &str, height: u64, now: u64) -> Option<SourceView> {
 
 struct Net {
     cfg: GuardianConfig,
+    egress: Egress,
     key: FeedKey,
     keys: HashMap<u32, [u8; 32]>,
     run_dir: PathBuf,
@@ -148,7 +153,7 @@ impl Net {
         let now = now_unix();
         let mut sources = feed_sources(&self.cfg.publication_points, &self.keys, self.cfg.index, now);
         for url in &self.cfg.seed_rpcs {
-            if let Some(v) = seed_source(url, s.height, now) {
+            if let Some(v) = seed_source(&self.egress, url, s.height, now) {
                 sources.push(v);
             }
         }
@@ -229,7 +234,7 @@ impl Net {
     fn fast_revoked(&self) -> Option<bool> {
         let url = self.cfg.l1_rpc.as_ref()?;
         let data = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("fastRevoked()")));
-        let v = call(url, "eth_call", json!([{"to": self.cfg.l1_bridge, "data": data}, "latest"]), Duration::from_secs(10)).ok()?;
+        let v = call_via(&self.egress, url, "eth_call", json!([{"to": self.cfg.l1_bridge, "data": data}, "latest"]), Duration::from_secs(10)).ok()?;
         let w = hex::decode(v.as_str()?.trim_start_matches("0x")).ok()?;
         Some(w.last().copied()? == 1)
     }
@@ -272,6 +277,8 @@ fn run() -> anyhow::Result<()> {
     }
     let (cfg, digest) = GuardianConfig::load(&config)?;
     log(&format!("config {} sha256 {}", config.display(), hex::encode(digest)));
+    let egress = cfg.egress()?;
+    log(&format!("egress {egress:?}"));
     let key_hex = std::fs::read_to_string(cfg.state_dir.join("net").join("feed.key"))?;
     let key = FeedKey::from_secret(jetsam_guardian::parse32(key_hex.trim())?);
     let keys = cfg.feed_keys()?;
@@ -282,6 +289,7 @@ fn run() -> anyhow::Result<()> {
     let mut net = Net {
         run_dir: cfg.state_dir.join("run"),
         cfg,
+        egress,
         key,
         keys,
         published: HashSet::new(),

@@ -52,6 +52,13 @@ pub use jetsam_chain::consensus::guardian::{
     SIGNATURE_BYTES, STATEMENT_BYTES,
 };
 
+/// The block id of the mainnet genesis: the `network` of a mainnet guardian
+/// (anchored in `jetsam_chain`, `genesis_block_id_is_canonical`; it never moves).
+pub const MAINNET_NETWORK: [u8; 32] = [
+    0x6e, 0x59, 0x2c, 0x07, 0xbe, 0x6f, 0xd1, 0xb4, 0x25, 0x9e, 0xea, 0xcb, 0xf4, 0xeb, 0x7e, 0xb2, 0x94, 0x8a,
+    0x77, 0xf1, 0xd0, 0x26, 0x26, 0xa1, 0x2f, 0xda, 0xb4, 0x2c, 0x44, 0x8c, 0x5f, 0x44,
+];
+
 /// The statements `jg-net` evaluates per 15 s round, the highest first:
 /// the proposals of the publication points and the attestations due.
 pub const NET_ROUND_CANDIDATES: usize = 32;

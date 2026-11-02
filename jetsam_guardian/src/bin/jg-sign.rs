@@ -183,8 +183,8 @@ fn run() -> anyhow::Result<()> {
     let (t, _) = signer.t_max();
     log(&format!("started: index {index} generation {generation} T_max {t} halted {:?}", signer.halted()));
     let run_dir = cfg.state_dir.join("run");
-    let obs = ipc::bind(&run_dir.join("sign-obs.sock"))?;
-    let net = ipc::bind(&run_dir.join("sign-net.sock"))?;
+    let obs = ipc::bind(&run_dir.join("sign-obs.sock"), cfg.ipc.observe_or(ipc::own_uid()))?;
+    let net = ipc::bind(&run_dir.join("sign-net.sock"), cfg.ipc.net_or(ipc::own_uid()))?;
     while !STOP.load(Ordering::SeqCst) {
         let a = ipc::serve_one(&obs, &mut |req| handle_obs(&mut signer, req))?;
         let b = ipc::serve_one(&net, &mut |req| handle_net(&mut signer, req))?;

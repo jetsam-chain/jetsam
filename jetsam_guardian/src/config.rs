@@ -61,6 +61,73 @@ pub struct GuardianConfig {
     /// SG-10: minimal number of agreeing sources.
     #[serde(default = "default_min_sources")]
     pub min_sources: usize,
+    /// How `seed_rpcs` and `l1_rpc` are reached (A4-1, D60): onion only
+    /// unless the configuration says otherwise.
+    #[serde(default)]
+    pub egress: EgressConfig,
+    /// The uids allowed on the local sockets (A4-2).
+    #[serde(default)]
+    pub ipc: IpcConfig,
+}
+
+/// `[egress] mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressMode {
+    /// The default (D60): a source is a loopback IP address (reached
+    /// directly) or a `.onion` address (reached through Tor's SOCKS port);
+    /// anything else refuses to start.
+    #[default]
+    Onion,
+    /// Plain TCP to any host: a private rehearsal on a private bridge only,
+    /// refused on the mainnet network.
+    Clearnet,
+}
+
+/// `[egress]`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressConfig {
+    #[serde(default)]
+    pub mode: EgressMode,
+    /// Tor's SOCKS port, a loopback IP address and port (`127.0.0.1:9050`).
+    #[serde(default = "default_tor_socks")]
+    pub tor_socks: String,
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        Self { mode: EgressMode::default(), tor_socks: default_tor_socks() }
+    }
+}
+
+fn default_tor_socks() -> String {
+    crate::rpc::DEFAULT_TOR_SOCKS.to_string()
+}
+
+/// `[ipc]` (design §2.3): the uid of each client of the local sockets,
+/// checked by `SO_PEERCRED` on every connection. Unset: the server's own uid
+/// (one account, or the private rehearsal where every process is root).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcConfig {
+    /// `jg-observe`'s uid, the only client of `sign-obs.sock`.
+    #[serde(default)]
+    pub observe_uid: Option<u32>,
+    /// `jg-net`'s uid, the only client of `obs.sock` and `sign-net.sock`.
+    #[serde(default)]
+    pub net_uid: Option<u32>,
+}
+
+impl IpcConfig {
+    /// The uid allowed on `sign-obs.sock` (`own`: the server's uid).
+    pub fn observe_or(&self, own: u32) -> u32 {
+        self.observe_uid.unwrap_or(own)
+    }
+    /// The uid allowed on `obs.sock` and `sign-net.sock` (`own`: the server's uid).
+    pub fn net_or(&self, own: u32) -> u32 {
+        self.net_uid.unwrap_or(own)
+    }
 }
 
 fn default_attest_every() -> u64 {
@@ -76,6 +143,14 @@ impl GuardianConfig {
         let c: Self = toml::from_str(text)?;
         anyhow::ensure!((1..=7).contains(&c.index), "index {} outside 1..=7", c.index);
         anyhow::ensure!(c.thresholds.sign_depth >= 8, "sign_depth below the floor 8");
+        let network = crate::parse32(&c.network).unwrap_or([0u8; 32]);
+        anyhow::ensure!(
+            crate::observer::stability_floor_ok(&network, c.thresholds.stability_secs),
+            "stability_secs {} is below the mainnet floor {} (SG-4): the guardian does not start",
+            c.thresholds.stability_secs,
+            crate::observer::STABILITY_SECS_FLOOR_MAINNET
+        );
+        c.egress()?;
         Ok(c)
     }
 
@@ -84,6 +159,39 @@ impl GuardianConfig {
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
         Ok((Self::parse(&text)?, digest))
+    }
+
+    /// The configured network is the mainnet one.
+    pub fn is_mainnet(&self) -> bool {
+        crate::parse32(&self.network).ok() == Some(crate::MAINNET_NETWORK)
+    }
+
+    /// The egress of `seed_rpcs` and `l1_rpc`, every source checked against
+    /// it: an error here means the guardian does not start (A4-1, D60).
+    pub fn egress(&self) -> anyhow::Result<crate::rpc::Egress> {
+        use crate::rpc::Egress;
+        let egress = match self.egress.mode {
+            EgressMode::Clearnet => {
+                anyhow::ensure!(
+                    !self.is_mainnet(),
+                    "[egress] mode = \"clearnet\" is refused on the mainnet network (D60: a guardian reaches the \
+                     network through Tor only): the guardian does not start"
+                );
+                Egress::Clearnet
+            }
+            EgressMode::Onion => Egress::onion(&self.egress.tor_socks)
+                .map_err(|e| anyhow::anyhow!("[egress] tor_socks: {e}: the guardian does not start"))?,
+        };
+        let sources = self.seed_rpcs.iter().enumerate().map(|(i, url)| (format!("seed_rpcs[{i}]"), url));
+        for (name, url) in sources.chain(self.l1_rpc.iter().map(|url| ("l1_rpc".to_string(), url))) {
+            if let Err(e) = egress.route(url) {
+                anyhow::bail!(
+                    "{name} = {url}: {e}: the guardian does not start (a private rehearsal on a private bridge sets \
+                     [egress] mode = \"clearnet\")"
+                );
+            }
+        }
+        Ok(egress)
     }
 
     pub fn domain(&self) -> anyhow::Result<Domain> {
