@@ -10,7 +10,6 @@
 
 use std::{io, sync::Arc};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::{
@@ -78,7 +77,6 @@ impl StateSegmentCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for StateSegmentCodec {
     type Protocol = StreamProtocol;
     type Request = GetStateSegmentRequest;

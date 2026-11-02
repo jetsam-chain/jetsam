@@ -7299,6 +7299,7 @@ async fn handle_swarm_event(
             relay::Event::CircuitReqDenied {
                 src_peer_id,
                 dst_peer_id,
+                ..
             } => {
                 tracing::debug!(source = %src_peer_id, destination = %dst_peer_id, "relay: circuit request denied");
             }
@@ -7345,13 +7346,19 @@ async fn handle_swarm_event(
         // only consumes it. Success and definitive failure are therefore INFO,
         // not debug: a silent failure here is what leaves a node a leaf.
         SwarmEvent::Behaviour(NodeBehaviourEvent::Upnp(ev)) => match ev {
-            upnp::Event::NewExternalAddr(addr) => {
+            upnp::Event::NewExternalAddr {
+                external_addr: addr,
+                ..
+            } => {
                 tracing::info!(
                     %addr,
                     "upnp: router mapped our port — this node is reachable from outside"
                 );
             }
-            upnp::Event::ExpiredExternalAddr(addr) => {
+            upnp::Event::ExpiredExternalAddr {
+                external_addr: addr,
+                ..
+            } => {
                 tracing::info!(%addr, "upnp: port mapping expired");
             }
             upnp::Event::GatewayNotFound => {

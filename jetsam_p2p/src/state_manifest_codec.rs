@@ -10,7 +10,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::{
@@ -51,7 +50,6 @@ const PAGE_REF_BYTES: usize = 2 + 32 + 4 + 2;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StateManifestCodec;
 
-#[async_trait]
 impl request_response::Codec for StateManifestCodec {
     type Protocol = StreamProtocol;
     type Request = GetStateManifestRequest;

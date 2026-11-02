@@ -13,7 +13,6 @@
 
 use std::{io, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{
     request_response::{self, ProtocolSupport},
@@ -316,7 +315,6 @@ pub fn client_object_behaviour(
     ))
 }
 
-#[async_trait]
 impl request_response::Codec for ClientObjectCodec {
     type Protocol = StreamProtocol;
     type Request = ClientObjectRequest;

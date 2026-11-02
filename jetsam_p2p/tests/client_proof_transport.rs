@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt, StreamExt};
 use jetsam_chain::consensus::client_objects::{ClientObject, ClientSubmission};
 use jetsam_p2p::client_object_codec::{
@@ -138,7 +137,6 @@ async fn spawn_server(objects: BTreeMap<ClientObjectRequest, Vec<u8>>) -> (PeerI
 #[derive(Clone, Default)]
 struct LyingCodec;
 
-#[async_trait]
 impl Codec for LyingCodec {
     type Protocol = StreamProtocol;
     type Request = ClientObjectRequest;
