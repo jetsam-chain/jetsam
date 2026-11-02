@@ -3869,6 +3869,39 @@ fn listen_failure_reason(error: &libp2p::TransportError<std::io::Error>) -> Stri
     }
 }
 
+/// D65. AutoNAT found that peers cannot dial this node and the operator
+/// declared no `network.public_addresses`: inbound peers reach it only
+/// through relays and hole punching, so it keeps fewer peers and the blocks
+/// it finds reach the network later. The operator is told once per run, at
+/// the first such verdict: AutoNAT keeps probing and may say `Private` again
+/// every few minutes, and the same advice repeated is noise that buries it.
+struct PrivateReachabilityNotice {
+    public_addresses_declared: bool,
+    given: bool,
+}
+
+impl PrivateReachabilityNotice {
+    fn new(public_addresses_declared: bool) -> Self {
+        Self {
+            public_addresses_declared,
+            given: false,
+        }
+    }
+
+    /// True exactly once: at the first `Private` verdict of a node that
+    /// declared no public address.
+    fn take(&mut self, status: &autonat::NatStatus) -> bool {
+        if self.given
+            || self.public_addresses_declared
+            || !matches!(status, autonat::NatStatus::Private)
+        {
+            return false;
+        }
+        self.given = true;
+        true
+    }
+}
+
 async fn run_swarm(
     listen_addrs: Vec<Multiaddr>,
     public_addresses: Vec<Multiaddr>,
@@ -3950,6 +3983,8 @@ async fn run_swarm(
     // direct path to ordinary peers. Public operators declare those addresses
     // explicitly; private GUI nodes leave the list empty and reserve paths
     // through public peers instead.
+    let mut private_reachability_notice =
+        PrivateReachabilityNotice::new(!public_addresses.is_empty());
     for address in public_addresses {
         let has_public_ip = crate::peer_diversity::contains_public_ip(&address);
         let has_tcp = address.iter().any(
@@ -4281,6 +4316,7 @@ async fn run_swarm(
                     &mut relay_circuit_backoff,
                     &mut successful_peer_cache,
                     &mut observed_peer_versions,
+                    &mut private_reachability_notice,
                 )
                 .await;
             }
@@ -6693,6 +6729,7 @@ async fn handle_swarm_event(
     relay_circuit_backoff: &mut RelayCircuitBackoff,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
     observed_peer_versions: &mut crate::peer_versions::ObservedPeerVersions,
+    private_reachability_notice: &mut PrivateReachabilityNotice,
 ) {
     let implicit_bootstraps = stop_implicit_kad_bootstraps(swarm);
     if implicit_bootstraps > 0 {
@@ -7366,6 +7403,26 @@ async fn handle_swarm_event(
                 autonat::NatStatus::Unknown => tracing::debug!(
                     ?old, "autonat: reachability still undetermined"
                 ),
+            }
+            if private_reachability_notice.take(&new) {
+                // As for UPnP above, the port comes from the swarm: the advice
+                // must name the port this node actually listens on.
+                let port = swarm.listeners().find_map(|addr| {
+                    addr.iter().find_map(|segment| match segment {
+                        libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+                        _ => None,
+                    })
+                });
+                tracing::warn!(
+                    port,
+                    "peers cannot dial this node and network.public_addresses is empty: \
+                     it is reached only through relays and hole punching, keeps fewer \
+                     peers, and the blocks it finds reach the network later (more \
+                     orphans for a miner or a pool). Forward this TCP port to this \
+                     machine, then declare its external address in jetsam.toml, \
+                     [network] public_addresses = [\"<public-ip>:<port>\"], and restart \
+                     the node"
+                );
             }
         }
 
@@ -11922,5 +11979,33 @@ mod tests {
         assert!(schedule_mempool_sync_retry(&mut retries, local, peer).is_none());
         assert!(retries.is_empty());
         assert!(mempool_sync_retry_jitter(local, peer) < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn an_unreachable_node_without_public_addresses_is_warned_once() {
+        let mut notice = PrivateReachabilityNotice::new(false);
+        assert!(!notice.take(&autonat::NatStatus::Unknown));
+        assert!(notice.take(&autonat::NatStatus::Private));
+        // AutoNAT keeps probing: the same verdict, or one that flaps back,
+        // must not repeat the advice.
+        assert!(!notice.take(&autonat::NatStatus::Private));
+        assert!(!notice.take(&autonat::NatStatus::Unknown));
+        assert!(!notice.take(&autonat::NatStatus::Private));
+    }
+
+    #[test]
+    fn a_node_that_declares_public_addresses_is_never_warned() {
+        let mut notice = PrivateReachabilityNotice::new(true);
+        assert!(!notice.take(&autonat::NatStatus::Private));
+        assert!(!notice.take(&autonat::NatStatus::Private));
+    }
+
+    #[test]
+    fn a_reachable_node_is_never_warned() {
+        let mut notice = PrivateReachabilityNotice::new(false);
+        let public = autonat::NatStatus::Public("/ip4/203.0.113.7/tcp/9700".parse().unwrap());
+        assert!(!notice.take(&public));
+        assert!(!notice.take(&autonat::NatStatus::Unknown));
+        assert!(!notice.take(&public));
     }
 }
