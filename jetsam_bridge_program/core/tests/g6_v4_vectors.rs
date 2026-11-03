@@ -180,3 +180,15 @@ fn pages_that_are_not_the_headers_body_prove_nothing() {
     }
     let _ = std::panic::take_hook();
 }
+
+/// At most 256 leaves (the tree of the header): more is not a block, refused before any hashing of the
+/// tree.
+#[test]
+fn more_than_256_leaves_prove_nothing() {
+    let c = &cases("g6_v4_vectors.json")[0];
+    let mut refs: Vec<&[u8]> = vec![c.pages[0].as_slice()];
+    refs.extend(std::iter::repeat_n(c.pages[1].as_slice(), 256));
+    assert_eq!(try_block_deposits(c.height, &c.tx_root, &refs, &c.rule), Err(BlockError::Body("tx tree leaves")));
+    refs.pop();
+    assert_eq!(try_block_deposits(c.height, &c.tx_root, &refs, &c.rule), Err(BlockError::TxRoot));
+}

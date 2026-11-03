@@ -35,6 +35,8 @@ members = [
     # the guests themselves build alone for the zkVM target
     "jetsam_bridge_program/core",
     "jetsam_bridge_program/towerwalk",
+    # G6 = V4 in CI: the node's gate and the program on the same blocks
+    "jetsam_bridge_program/xtest",
 ]
 resolver = "2"
 

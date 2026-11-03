@@ -2996,6 +2996,17 @@ name = "jetsam_bridge_towerwalk"
 version = "1.6.0"
 
 [[package]]
+name = "jetsam_bridge_xtest"
+version = "1.6.0"
+dependencies = [
+ "jetsam_bridge_program",
+ "jetsam_chain",
+ "jetsam_poseidon2b",
+ "jetsam_tx",
+ "jetsam_vault_rule",
+]
+
+[[package]]
 name = "jetsam_chain"
 version = "1.6.0"
 dependencies = [

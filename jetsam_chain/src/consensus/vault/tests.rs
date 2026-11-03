@@ -274,6 +274,25 @@ fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
     );
     let test = rules().deposit_rule();
     assert_eq!(test, DepositRule::for_activation(Some(J)));
+    // every field is the rules' own, not a constant
+    let odd = VaultRules {
+        activation_height: Some(7),
+        deposits_from_height: Some(11),
+        vault: ALICE,
+        min_deposit: 3,
+        max_deposit: 5,
+        ..rules()
+    };
+    assert_eq!(
+        odd.deposit_rule(),
+        DepositRule {
+            activation_height: Some(7),
+            deposits_from_height: Some(11),
+            vault: ALICE.0,
+            min_deposit: 3,
+            max_deposit: 5,
+        }
+    );
     for h in [0, J - 1, J, F - 1, F, F + 1, u64::MAX] {
         assert_eq!(rules().active_at(h), test.active_at(h), "{h}");
         assert_eq!(rules().deposits_open_at(h), test.deposits_open_at(h), "{h}");
