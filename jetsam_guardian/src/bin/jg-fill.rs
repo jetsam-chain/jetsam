@@ -15,7 +15,8 @@
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
 //!   with its cause. Either way the robot keeps observing, journaling and checking its repayments.
 //! * The decision journal `<state_dir>/decisions.jsonl` is public: one signed, chained line per decision
-//!   (why advanced, why refused, repaid, lost, halts), labels and hashes only.
+//!   (why advanced, why refused, repaid, lost, halts), labels and hashes only; `<state_dir>/queue.json`, the
+//!   waiting deposits first in first out (the published queue of the degraded mode), rewritten every step.
 //! * The transactions are `eth_sendTransaction` from `hot_address` to the L1 endpoint (a local signer on
 //!   the loopback holds the hot key; anvil's TEST account in the rehearsal): this program signs nothing.
 
@@ -345,6 +346,13 @@ impl Robot {
             cands.push(Candidate { dep: d, conf, confirmed_at: self.state.confirmed_at.get(&key).copied(), taken, minted });
         }
         let verdicts = fill::plan(&cands, &self.state.ledger, caps, &g, now, l1_now, min_advance, &self.cfg.params);
+        // the published queue (first in, first out; degraded mode when the stock is dry)
+        let queue = json!({"t": now, "l1_t": l1_now, "halt": g.halt, "pause": g.pause, "min_advance": min_advance, "stock": caps.stock,
+                           "fee_bps": self.cfg.params.fee_bps, "queue": fill::published_queue(&cands, &verdicts)});
+        let qpath = self.cfg.state_dir.join("queue.json");
+        if std::fs::write(qpath.with_extension("tmp"), queue.to_string()).is_ok() {
+            let _ = std::fs::rename(qpath.with_extension("tmp"), &qpath);
+        }
         let mut orders = Vec::new();
         for (c, v) in cands.iter().zip(&verdicts) {
             let key = hex::encode(c.dep.key());

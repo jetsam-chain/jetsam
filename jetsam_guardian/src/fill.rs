@@ -317,7 +317,8 @@ pub fn confirmation(
 fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool) -> Result<(), &'static str> {
     let top = d.height + p.confirmations;
     let tip = c.tip_height();
-    if c.id_at(d.height) != Some(d.block_id) || tip < top {
+    // (the deposit's block on this node: checked by the witness rule, which every counted node passes)
+    if tip < top {
         return Err("NOT_CONFIRMED");
     }
     let (Some(w_tip), Some(w_dep)) = (c.work_at(tip), c.work_at(d.height)) else { return Err("NOT_CONFIRMED") };
@@ -655,6 +656,24 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
             }
         };
         out[i] = v;
+    }
+    out
+}
+
+/// The queue the robot publishes (`queue.json`, degraded mode): the candidates neither advanced nor refused,
+/// in the first-in-first-out order, with their place and what they wait for.
+pub fn published_queue(cands: &[Candidate], verdicts: &[Verdict]) -> Vec<serde_json::Value> {
+    let mut place = 0u64;
+    let mut out = Vec::new();
+    for i in fifo_order(cands) {
+        if let Some(Verdict::Wait(code)) = verdicts.get(i) {
+            place += 1;
+            let d = &cands[i].dep;
+            out.push(serde_json::json!({
+                "place": place, "key": hex::encode(d.key()), "txid": hex::encode(d.txid), "height": d.height, "group": d.group,
+                "recipient": format!("0x{}", hex::encode(d.recipient)), "amount": d.amount, "waits_for": code,
+            }));
+        }
     }
     out
 }

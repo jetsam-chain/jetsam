@@ -395,6 +395,8 @@ fn the_contract_tip_is_checked_against_the_chain() {
     // the contract tip above our nodes' tip
     let high = cp(70, 62, &c);
     assert_eq!(tip_check(&high, &high.id(), &testkit::chain(65, 1)), TipCheck::ContextNotOurs);
+    // its locked block above our nodes' tip: they are behind, pause
+    assert_eq!(tip_check(&high, &high.id(), &testkit::chain(61, 1)), TipCheck::ContextNotOurs);
     // another locked block
     let mut far = testkit::chain(40, 1);
     testkit::extend(&mut far, 30, 3, 20);
@@ -455,6 +457,21 @@ fn a_heavier_or_close_competing_branch_counts_an_honest_short_fork_does_not() {
     let mut old = mk(91, 10, "deeper_than_finality");
     old.branches[0].last_seen = NOW - p.branch_window - 1;
     assert!(!competing_branch(&c, &old, NOW, &p));
+    // two blocks only, but heavier than our tip (16 times the work each, forking 10 deep): counted
+    let heavy = {
+        let mut prev = c.id_at(90).unwrap();
+        let hs: Vec<HeaderInfo> = (91..=92u64)
+            .map(|h| {
+                let x = testkit::header(prev, h, 1_700_000_000 + 180 * h + 7, testkit::target_bits(24), 9);
+                prev = x.id;
+                x
+            })
+            .collect();
+        let mut b = branch(90, hs, c.id_at(90).unwrap(), "deeper_than_finality", NOW - 60);
+        b.canonical_height_at_last_seen = 100;
+        Branches { recording_since: 0, last_pin_height: None, branches: vec![b] }
+    };
+    assert!(competing_branch(&c, &heavy, NOW, &p));
     // invalid headers never count
     let mut bad = mk(91, 10, "header_rule");
     bad.branches[0].headers_valid = false;
@@ -962,4 +979,17 @@ fn the_stock_must_cover_what_is_paid_not_the_amount() {
     let p = paid(7 * JTM, 75);
     assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { stock: p, ..caps() }), vec![Verdict::Advance]);
     assert_eq!(run(&[c], &Ledger::default(), Caps { stock: p - 1, ..caps() }), vec![Verdict::Wait("STOCK")]);
+}
+
+/// The queue the robot publishes (degraded mode, study n°3 §2.k): the deposits it has not advanced nor refused,
+/// first in first out, each with its place and why it waits.
+#[test]
+fn the_published_queue_is_the_fifo_of_the_waiting_deposits() {
+    let cands = vec![cand(12, 1, 3, 5 * JTM), cand(10, 2, 1, 100 * JTM), cand(10, 1, 2, 6 * JTM), cand(9, 1, 4, 2 * JTM)];
+    let verdicts = vec![Verdict::Wait("QUEUED_BEHIND"), Verdict::Wait("STOCK"), Verdict::Advance, Verdict::Refuse("BELOW_MIN_ADVANCE")];
+    let q = published_queue(&cands, &verdicts);
+    let rows: Vec<(u64, u64, u32, &str)> = q.iter().map(|r| (r["place"].as_u64().unwrap(), r["height"].as_u64().unwrap(), r["group"].as_u64().unwrap() as u32, r["waits_for"].as_str().unwrap())).collect();
+    assert_eq!(rows, vec![(1, 10, 2, "STOCK"), (2, 12, 1, "QUEUED_BEHIND")]);
+    assert_eq!(q[0]["key"].as_str().unwrap(), hex::encode(cands[1].dep.key()));
+    assert_eq!(q[0]["amount"].as_u64().unwrap(), 100 * JTM);
 }
