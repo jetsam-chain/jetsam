@@ -393,6 +393,15 @@ const PRE_D57_PROTOCOLS: &[&str] = &[
     "/meshsub/1.2.0",
 ];
 
+/// Announced on top of [`PRE_D57_PROTOCOLS`] since libp2p 0.57 (D67, accepted
+/// in D71): gossipsub 0.50 puts `/meshsub/1.3.0` first in its default
+/// protocol list and has no public API to leave it out. The addition is
+/// backwards compatible: multistream-select still settles on
+/// `/meshsub/1.2.0` with a v1.6.0 node, which announces no 1.3.0 (measured in
+/// D67 by an identify probe and the v1.6.0 interop replay I1). Nothing else
+/// changed: every other identifier is the pre-D57 capture.
+const ADDED_BY_GOSSIPSUB_0_50: &[&str] = &["/meshsub/1.3.0"];
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_without_onion_announces_exactly_what_it_announced_before() {
     let directory = tempfile::tempdir().unwrap();
@@ -450,6 +459,7 @@ async fn a_node_without_onion_announces_exactly_what_it_announced_before() {
     // Read on a mainnet build; a testnet build names its own namespace.
     let mut expected = PRE_D57_PROTOCOLS
         .iter()
+        .chain(ADDED_BY_GOSSIPSUB_0_50)
         .map(|protocol| protocol.replace("/jetsam/mainnet/1.0.0", &topics().protocol_id))
         .collect::<Vec<_>>();
     expected.sort();
