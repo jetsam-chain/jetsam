@@ -14,7 +14,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
@@ -37,7 +36,6 @@ pub enum AvailabilityResponse {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AvailabilityCodec;
 
-#[async_trait]
 impl request_response::Codec for AvailabilityCodec {
     type Protocol = StreamProtocol;
     type Request = AvailabilityRequest;

@@ -603,13 +603,13 @@ mod tests {
         let digest = [0xab; 32];
         for what in ["client proof announcement", "client registration"] {
             let events = recorded(|| {
-                log_publish_outcome(what, &digest, Err(gossipsub::PublishError::InsufficientPeers))
+                log_publish_outcome(what, &digest, Err(gossipsub::PublishError::NoPeersSubscribedToTopic))
             });
             assert_eq!(events.len(), 1, "{events:?}");
             let (level, fields) = &events[0];
             assert_eq!(*level, tracing::Level::WARN, "{fields}");
             assert!(fields.contains(&"ab".repeat(32)), "{fields}");
-            assert!(fields.contains("InsufficientPeers"), "{fields}");
+            assert!(fields.contains("NoPeersSubscribedToTopic"), "{fields}");
             assert!(fields.contains(what), "{fields}");
         }
         let events = recorded(|| {

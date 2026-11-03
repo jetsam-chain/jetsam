@@ -623,7 +623,7 @@ impl NodeBehaviour {
         }));
         let relay_server = serve_relay
             .then(|| {
-                relay::Behaviour::new(
+                let mut relay_server = relay::Behaviour::new(
                     key.public().to_peer_id(),
                     relay::Config {
                         max_reservations: background_capacity.relay_max_reservations(),
@@ -644,7 +644,13 @@ impl NodeBehaviour {
                         max_circuit_bytes: 80 * 1024 * 1024,
                         ..relay::Config::default()
                     },
-                )
+                );
+                // libp2p-relay 0.22 serves the hop protocol only once an
+                // external address is confirmed, unless told otherwise. A node
+                // that declares a public address has always served it from the
+                // start, as with libp2p-relay 0.19: keep it so.
+                relay_server.set_status(Some(relay::Status::Enable));
+                relay_server
             })
             .into();
 

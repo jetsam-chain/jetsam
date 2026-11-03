@@ -6,7 +6,6 @@
 
 use std::{io, sync::Arc};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
@@ -46,7 +45,6 @@ impl Default for ManifestPageCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for ManifestPageCodec {
     type Protocol = StreamProtocol;
     type Request = GetSnapshotManifestPageRequest;

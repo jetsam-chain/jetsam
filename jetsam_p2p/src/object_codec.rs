@@ -6,7 +6,6 @@
 
 use std::{collections::HashSet, io, sync::Arc};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit;
@@ -71,7 +70,6 @@ impl ObjectCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for ObjectCodec {
     type Protocol = StreamProtocol;
     type Request = GetObjectsRequest;
