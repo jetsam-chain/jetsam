@@ -50,6 +50,13 @@
 //!
 //! Pure functions: the branch's paid set, window sum, `bridge_locked`, floor
 //! and the V7 proof come from the caller (the chain state, `DestinationState`).
+//!
+//! **V4 is not written here**: its constants and its decisions (V4-0, the
+//! value of a marker, the class of a group, a deposit's shape, amount and
+//! `F`) are the crate `jetsam_vault_rule`, which the L1's proof program runs
+//! too (G6 = V4, SPEC-v3 §6.4); this gate calls it, and adds what needs the
+//! branch state, the section or the L1 (V1-b, V2/V3 against the object, D52,
+//! V6, V7, V8).
 
 use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
@@ -65,22 +72,18 @@ use crate::consensus::params::{
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// The vault's published spend secret. Its address is [`VAULT_ADDRESS`].
-pub const VAULT_SECRET: [u8; 32] = *b"JTM/CONSENSUS/V1.7/VAULT-SECRET/";
+pub use jetsam_vault_rule::{
+    bridge_deposits_from_height, DestinationMarkerKind, BRIDGE_DEPOSIT_MARKER_TAG,
+    BRIDGE_OPENING_DELAY, LIGHT_CLIENT_UPDATE_MARKER_TAG, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO,
+    VAULT_RELEASE_MARKER_TAG, VAULT_SECRET,
+};
+use jetsam_vault_rule::{DepositRule, GroupClass, RuleError};
 
 /// `ADDRFX(VAULT_SECRET)` (checked by a test against `derive_address`).
-pub const VAULT_ADDRESS: Address = Address([
-    0x0e, 0x96, 0x94, 0xb6, 0xeb, 0x00, 0xe3, 0xd9, 0x47, 0x7c, 0x83, 0xc1, 0x31, 0x29, 0x86, 0x5b,
-    0x29, 0x6a, 0x5b, 0xc2, 0xb4, 0x8e, 0xf0, 0xf3, 0xa5, 0xc4, 0x92, 0x41, 0x72, 0x06, 0xc2, 0x64,
-]);
+pub const VAULT_ADDRESS: Address = Address(jetsam_vault_rule::VAULT_ADDRESS);
 
 /// The fee a release pays out of the burned amount, and the L1's minimum burn.
 pub const RELEASE_FEE_MICRO: u64 = MICRO_PER_JTM / 10;
-/// Smallest deposit (D19).
-pub const MIN_DEPOSIT_MICRO: u64 = MICRO_PER_JTM;
-/// Largest deposit: the L1 contract's per-deposit cap (D28): a larger one could
-/// never be minted.
-pub const MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
 /// Releases one block may carry.
 pub const MAX_RELEASES_PER_BLOCK: usize = 4;
 /// The sliding window of the release cap, in blocks.
@@ -92,24 +95,10 @@ pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
 /// `OUTSTANDING_CEIL`).
 pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 10_000 * MICRO_PER_JTM;
 
-/// Blocks between J and the bridge opening `F` (D44): the public profiles
-/// open ≈ 3 days after J, once the branch that did not update is dead.
-#[cfg(not(feature = "rehearsal-v1-7"))]
-pub const BRIDGE_OPENING_DELAY: u64 = 1_440;
-/// The rehearsal opens 32 blocks after its J (`F_R = J_R + 32`).
-#[cfg(feature = "rehearsal-v1-7")]
-pub const BRIDGE_OPENING_DELAY: u64 = 32;
-
-/// `F` (`BRIDGE_DEPOSITS_FROM_HEIGHT`) of a v1.7 clock: none while J is
-/// none; a deposit is valid only in a block above it (V4-d).
-pub const fn bridge_deposits_from_height(v1_7_activation: Option<u64>) -> Option<u64> {
-    match v1_7_activation {
-        Some(j) => Some(j + BRIDGE_OPENING_DELAY),
-        None => None,
-    }
-}
-
-const _: () = assert!(BRIDGE_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");
+// The shared rule counts in the same unit, and carries this build's clock:
+// `F_R = J_R + 32` exactly when this crate is built for the rehearsal.
+const _: () = assert!(jetsam_vault_rule::MICRO_PER_JTM == MICRO_PER_JTM);
+const _: () = assert!(jetsam_vault_rule::REHEARSAL_CLOCK == cfg!(feature = "rehearsal-v1-7"));
 // D59: the consensus minimum of a release group has a state-growth term only
 // when it creates more outputs (≤ 3) than it spends inputs, i.e. with one or
 // two inputs; even at the highest pressure (×8) that minimum stays below
@@ -124,33 +113,12 @@ const _: () = assert!(
     MIN_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO && MAX_DEPOSIT_MICRO <= VAULT_OUTSTANDING_CEIL_MICRO
 );
 
-/// Marker of a deposit: `tag ‖ L1 recipient (20 B) ‖ 4 reserved zero bytes`.
-pub const BRIDGE_DEPOSIT_MARKER_TAG: [u8; 8] = *b"JTMBRDG1";
-/// Marker of a release: `tag ‖ n (8 B, little-endian) ‖ 16 bytes of its
-/// object's commitment` (D52: `n` is read back in clear).
-pub const VAULT_RELEASE_MARKER_TAG: [u8; 8] = *b"JTMVRL01";
-/// Marker of an L1 committee update: `tag ‖ 24 bytes of its commitment`.
-pub const LIGHT_CLIENT_UPDATE_MARKER_TAG: [u8; 8] = *b"JTMLCU01";
-
 const RELEASE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/DESTINATION-OBJECT/VAULT-RELEASE";
-
-/// The three v1.7 markers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DestinationMarkerKind {
-    Deposit,
-    Release,
-    LightClientUpdate,
-}
 
 /// The v1.7 marker an owner carries, if any (only meaningful from the v1.7
 /// height on; below it these are ordinary owners).
 pub fn destination_marker_kind(owner: &Address) -> Option<DestinationMarkerKind> {
-    match owner.0[..8].try_into().expect("eight bytes") {
-        BRIDGE_DEPOSIT_MARKER_TAG => Some(DestinationMarkerKind::Deposit),
-        VAULT_RELEASE_MARKER_TAG => Some(DestinationMarkerKind::Release),
-        LIGHT_CLIENT_UPDATE_MARKER_TAG => Some(DestinationMarkerKind::LightClientUpdate),
-        _ => None,
-    }
+    jetsam_vault_rule::destination_marker_kind(&owner.0)
 }
 
 /// The withdrawal index a release marker carries in clear; `None` for any
@@ -325,9 +293,17 @@ impl VaultRules {
 
     /// V4-d: whether a block at `height` may carry a deposit.
     pub const fn deposits_open_at(&self, height: u64) -> bool {
-        match self.deposits_from_height {
-            Some(opening) => height > opening,
-            None => false,
+        self.deposit_rule().deposits_open_at(height)
+    }
+
+    /// V4 under these rules (the shared crate's view of them).
+    pub const fn deposit_rule(&self) -> DepositRule {
+        DepositRule {
+            activation_height: self.activation_height,
+            deposits_from_height: self.deposits_from_height,
+            vault: self.vault.0,
+            min_deposit: self.min_deposit,
+            max_deposit: self.max_deposit,
         }
     }
 
@@ -480,10 +456,7 @@ impl VaultRelease {
 
 /// The deposit marker owner for an L1 `recipient`.
 pub fn deposit_marker(recipient: &[u8; 20]) -> Address {
-    let mut owner = [0u8; 32];
-    owner[..8].copy_from_slice(&BRIDGE_DEPOSIT_MARKER_TAG);
-    owner[8..28].copy_from_slice(recipient);
-    Address(owner)
+    Address(jetsam_vault_rule::deposit_marker(recipient))
 }
 
 /// The branch state a block is judged against.
@@ -607,17 +580,14 @@ pub fn validate_block_vault(
     let stream =
         validate_block_page_stream(&block.transactions).map_err(|_| VaultError::PageStream)?;
     let (system, user) = block.transactions.split_at(stream.user_start_index);
-    for record in system {
-        for (_, output) in record.body.live_outputs() {
-            if destination_marker_kind(&output.owner).is_some() {
-                return Err(VaultError::MarkerInSystemRecord);
-            }
-            // V4-0.
-            if output.owner == rules.vault {
-                return Err(VaultError::VaultOutputInSystemRecord);
-            }
-        }
-    }
+    let rule = rules.deposit_rule();
+    // V4-0, and no marker in a system record.
+    jetsam_vault_rule::check_system_outputs(
+        system
+            .iter()
+            .flat_map(|record| record.body.live_outputs().map(|(_, o)| &o.owner.0)),
+        &rule,
+    )?;
 
     struct ReleaseGroup {
         group: usize,
@@ -634,45 +604,20 @@ pub fn validate_block_vault(
     let mut locked = ctx.bridge_locked;
     for (index, group) in stream.groups.iter().enumerate() {
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
-        let outputs: Vec<(Address, u64)> = pages
+        let outputs: Vec<([u8; 32], u64)> = pages
             .iter()
-            .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+            .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner.0, o.amount)))
             .collect();
-        let mut kinds = Vec::new();
-        for (owner, amount) in &outputs {
-            if let Some(kind) = destination_marker_kind(owner) {
-                if *amount != 0 {
-                    return Err(VaultError::MarkerCarriesValue { group: index });
-                }
-                kinds.push(kind);
-            }
-        }
-        let count = |k: DestinationMarkerKind| kinds.iter().filter(|x| **x == k).count();
-        let vault_outputs: Vec<u64> = outputs
-            .iter()
-            .filter(|(owner, _)| *owner == rules.vault)
-            .map(|(_, amount)| *amount)
-            .collect();
-
-        if group.spend.input_owner == rules.vault {
-            // V1/V2: owner, marker, optional change to the vault; nothing else.
-            let shape_ok = match outputs.as_slice() {
-                [(payee, _), (marker, 0)] | [(payee, _), (marker, 0), (_, _)] => {
-                    destination_marker_kind(marker) == Some(DestinationMarkerKind::Release)
-                        && *payee != rules.vault
-                        && destination_marker_kind(payee).is_none()
-                        && outputs
-                            .get(2)
-                            .is_none_or(|(change, _)| *change == rules.vault)
-                }
-                _ => false,
-            };
-            if count(DestinationMarkerKind::Release) == 0 {
-                return Err(VaultError::SpendFromLockedAddress { group: index });
-            }
-            if !shape_ok || kinds.len() != 1 {
-                return Err(VaultError::ReleaseShape { group: index });
-            }
+        // V4 and V5 (value) on the group: the markers, then a release's shape
+        // (V1/V2) or a deposit's (V4-a .. V4-e, V4-d).
+        let class = jetsam_vault_rule::classify_group(
+            index,
+            &group.spend.input_owner.0,
+            &outputs,
+            height,
+            &rule,
+        )?;
+        if class == GroupClass::Release {
             // V1-b, and V8's balance: the inputs leave, the change returns.
             let mut taken = 0u64;
             for page in pages {
@@ -691,62 +636,29 @@ pub fn validate_block_vault(
                 .saturating_add(outputs.get(2).map_or(0, |(_, change)| *change));
             releases.push(ReleaseGroup {
                 group: index,
-                marker: outputs[1].0,
-                payee: outputs[0].0,
+                marker: Address(outputs[1].0),
+                payee: Address(outputs[0].0),
                 paid: outputs[0].1,
                 fee: group.spend.fee,
                 inputs: u64::from(group.spend.live_inputs),
                 outputs: u64::from(group.spend.live_outputs),
             });
-            continue;
-        }
-        if count(DestinationMarkerKind::Release) != 0 {
-            return Err(VaultError::ReleaseMarkerOutsideRelease { group: index });
-        }
-        let deposit_markers: Vec<&Address> = outputs
-            .iter()
-            .map(|(owner, _)| owner)
-            .filter(|owner| destination_marker_kind(owner) == Some(DestinationMarkerKind::Deposit))
-            .collect();
-        match (deposit_markers.as_slice(), vault_outputs.as_slice()) {
-            ([], []) => {}
-            ([], [_, ..]) => return Err(VaultError::VaultOutputOutsideDeposit { group: index }),
-            ([marker], [amount]) => {
-                let recipient: [u8; 20] = marker.0[8..28].try_into().expect("20 bytes");
-                if marker.0[28..] != [0u8; 4] || recipient == [0u8; 20] {
-                    return Err(VaultError::DepositShape { group: index });
-                }
-                if *amount < rules.min_deposit || *amount > rules.max_deposit {
-                    return Err(VaultError::DepositAmount {
-                        group: index,
-                        amount: *amount,
-                    });
-                }
-                // V4-d.
-                if !rules.deposits_open_at(height) {
-                    return Err(VaultError::DepositBeforeBridgeOpening {
-                        group: index,
-                        height,
-                        opening: rules.deposits_from_height.unwrap_or(u64::MAX),
-                    });
-                }
-                // V8.
-                if locked.saturating_add(*amount) > rules.outstanding_ceil {
-                    return Err(VaultError::VaultCeilingReached {
-                        group: index,
-                        locked,
-                        amount: *amount,
-                        ceil: rules.outstanding_ceil,
-                    });
-                }
-                locked += *amount;
-                deposits.push(VaultDeposit {
+        } else if let GroupClass::Deposit { recipient, amount } = class {
+            // V8.
+            if locked.saturating_add(amount) > rules.outstanding_ceil {
+                return Err(VaultError::VaultCeilingReached {
                     group: index,
-                    recipient,
-                    amount: *amount,
+                    locked,
+                    amount,
+                    ceil: rules.outstanding_ceil,
                 });
             }
-            _ => return Err(VaultError::DepositShape { group: index }),
+            locked += amount;
+            deposits.push(VaultDeposit {
+                group: index,
+                recipient,
+                amount,
+            });
         }
     }
 
@@ -843,6 +755,36 @@ pub fn validate_block_vault(
     Ok(effect)
 }
 
+impl From<RuleError> for VaultError {
+    /// The shared rule's refusals are this gate's, name for name.
+    fn from(error: RuleError) -> Self {
+        match error {
+            RuleError::MarkerInSystemRecord => Self::MarkerInSystemRecord,
+            RuleError::VaultOutputInSystemRecord => Self::VaultOutputInSystemRecord,
+            RuleError::MarkerCarriesValue { group } => Self::MarkerCarriesValue { group },
+            RuleError::SpendFromLockedAddress { group } => Self::SpendFromLockedAddress { group },
+            RuleError::ReleaseShape { group } => Self::ReleaseShape { group },
+            RuleError::ReleaseMarkerOutsideRelease { group } => {
+                Self::ReleaseMarkerOutsideRelease { group }
+            }
+            RuleError::VaultOutputOutsideDeposit { group } => {
+                Self::VaultOutputOutsideDeposit { group }
+            }
+            RuleError::DepositShape { group } => Self::DepositShape { group },
+            RuleError::DepositAmount { group, amount } => Self::DepositAmount { group, amount },
+            RuleError::DepositBeforeBridgeOpening {
+                group,
+                height,
+                opening,
+            } => Self::DepositBeforeBridgeOpening {
+                group,
+                height,
+                opening,
+            },
+        }
+    }
+}
+
 impl VaultError {
     /// Whether this refusal proves the **block** invalid rather than the
     /// section bytes a peer served for it (A2 M3). These are decided by the
@@ -891,47 +833,20 @@ pub fn check_plain_vault_transaction(
     {
         return Err(VaultError::SpendFromLockedAddress { group: 0 });
     }
-    let outputs: Vec<(Address, u64)> = pages
+    let outputs: Vec<([u8; 32], u64)> = pages
         .iter()
-        .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+        .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner.0, o.amount)))
         .collect();
-    let mut deposit_markers = Vec::new();
     for (owner, amount) in &outputs {
-        match destination_marker_kind(owner) {
+        match jetsam_vault_rule::destination_marker_kind(owner) {
             Some(_) if *amount != 0 => return Err(VaultError::MarkerCarriesValue { group: 0 }),
-            Some(DestinationMarkerKind::Deposit) => deposit_markers.push(*owner),
+            Some(DestinationMarkerKind::Deposit) | None => {}
             Some(_) => return Err(VaultError::ReleaseMarkerOutsideRelease { group: 0 }),
-            None => {}
         }
     }
-    let vault_outputs: Vec<u64> = outputs
-        .iter()
-        .filter(|(owner, _)| *owner == rules.vault)
-        .map(|(_, amount)| *amount)
-        .collect();
-    match (deposit_markers.as_slice(), vault_outputs.as_slice()) {
-        ([], []) => Ok(()),
-        ([], [_, ..]) => Err(VaultError::VaultOutputOutsideDeposit { group: 0 }),
-        ([marker], [amount]) => {
-            if marker.0[28..] != [0u8; 4] || marker.0[8..28] == [0u8; 20] {
-                Err(VaultError::DepositShape { group: 0 })
-            } else if *amount < rules.min_deposit || *amount > rules.max_deposit {
-                Err(VaultError::DepositAmount {
-                    group: 0,
-                    amount: *amount,
-                })
-            } else if !rules.deposits_open_at(next_height) {
-                Err(VaultError::DepositBeforeBridgeOpening {
-                    group: 0,
-                    height: next_height,
-                    opening: rules.deposits_from_height.unwrap_or(u64::MAX),
-                })
-            } else {
-                Ok(())
-            }
-        }
-        _ => Err(VaultError::DepositShape { group: 0 }),
-    }
+    // V4: the deposit's shape, amount and F, as in a block.
+    jetsam_vault_rule::deposit_shape(0, &outputs, next_height, &rules.deposit_rule())?;
+    Ok(())
 }
 
 /// Whether a burn `(owner, amount)` has a shape a block can ever pay (the

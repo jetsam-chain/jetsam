@@ -3006,6 +3006,7 @@ dependencies = [
  "jetsam_fri_binius",
  "jetsam_poseidon2b",
  "jetsam_tx",
+ "jetsam_vault_rule",
  "libmdbx",
  "rayon",
  "serde",
