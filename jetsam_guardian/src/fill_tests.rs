@@ -835,6 +835,196 @@ fn g6_vectors() -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------- G6 = V4: the edges (T4.9, proof program v3)
+
+/// The edges of V4 the 13 vectors above do not reach, for the proof program v3 (`tests/fixtures/g6_v4_vectors_edges.json`,
+/// same layout plus `activation_height` and the rule each case is about). Every decision is the node's rule through the
+/// robot's own path ([`deposits_in_block`]: the body against `tx_root`, then `validate_block_vault`); a block without a
+/// destination section also goes through the bytes ([`deposits_of_block`]) and must get the same decision. Written with
+/// `JETSAM_WRITE_VECTORS=1`; otherwise the file must be exactly what the code gives.
+#[test]
+fn g6_matches_v4_bytes_edge_vectors_are_stable() {
+    let text = serde_json::to_string_pretty(&g6_edge_vectors()).unwrap() + "\n";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/g6_v4_vectors_edges.json");
+    if std::env::var("JETSAM_WRITE_VECTORS").as_deref() == Ok("1") {
+        std::fs::write(&path, &text).unwrap();
+    }
+    let on_disk = std::fs::read_to_string(&path).expect("the edge vectors file (JETSAM_WRITE_VECTORS=1 writes it)");
+    assert_eq!(on_disk, text, "the node-side edge vectors changed: G6 = V4 must be re-checked on every implementation");
+}
+
+/// A block at `height` with the system records `system` (a coinbase first), the user `groups`, and a destination section
+/// with `releases` when there are any.
+fn block_with(height: u64, system: Vec<Transaction>, groups: Vec<Vec<Transaction>>, releases: &[jetsam_chain::consensus::vault::VaultRelease]) -> Block {
+    let mut transactions = system;
+    for g in groups {
+        transactions.extend(g);
+    }
+    let root = compute_tx_root(&transactions);
+    let destination = (!releases.is_empty()).then(|| jetsam_chain::consensus::destination::DestinationSection {
+        objects: releases.iter().map(jetsam_chain::consensus::vault::VaultRelease::object).collect(),
+    });
+    Block { header: bheader(height, root), transactions, client_objects: Vec::new(), destination }
+}
+
+fn coinbase_paying(height: u64, owner: Address) -> Transaction {
+    let mut t = coinbase(height);
+    t.body.outputs[0].owner = owner;
+    Transaction::new(t.body)
+}
+
+/// The two-output development payout shape (the second system record).
+fn development_payout(owners: [Address; 2]) -> Transaction {
+    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+    outputs[0] = TxOutput { slot_index: 15_000_001, amount: 17, owner: owners[0] };
+    outputs[1] = TxOutput { slot_index: 15_000_002, amount: 17, owner: owners[1] };
+    Transaction::new(TxBody {
+        epoch_anchor: [7u8; 32],
+        fee: 0,
+        input_owner: Address([0u8; 32]),
+        inputs: [TxInput::dummy(); TX_INPUTS],
+        outputs,
+        validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
+        is_coinbase: true,
+    })
+}
+
+fn g6_edge_vectors() -> serde_json::Value {
+    use jetsam_chain::consensus::vault::{VaultRelease, LIGHT_CLIENT_UPDATE_MARKER_TAG, RELEASE_FEE_MICRO};
+    let marker = |r: u8| deposit_marker(&rcpt(r));
+    let reserved = |byte: usize| {
+        let mut m = marker(0xa1);
+        m.0[byte] = 1;
+        m
+    };
+    let recipient_with = |byte: usize| {
+        let mut r = [0u8; 20];
+        r[byte] = 1;
+        r
+    };
+    let lcu = {
+        let mut m = [0x33u8; 32];
+        m[..8].copy_from_slice(&LIGHT_CLIENT_UPDATE_MARKER_TAG);
+        Address(m)
+    };
+    let release = |n: u64, owner: Address, amount: u64| VaultRelease { n, owner, amount, storage_proof: vec![vec![0xee; 40]] };
+    let r1 = release(1, Address([0xa1; 32]), 5 * JTM);
+    let r2 = release(2, Address([0xb0; 32]), 3 * JTM);
+    // the release group: the owner gets amount − R, the marker, then the change back to the vault (V2, V4)
+    let release_group = |slot: u32, r: &VaultRelease, change: u64| {
+        let mut outputs = vec![(r.owner, r.amount - RELEASE_FEE_MICRO), (r.marker(), 0)];
+        if change > 0 {
+            outputs.push((VAULT_ADDRESS, change));
+        }
+        logical(slot, VAULT_ADDRESS, &outputs)
+    };
+    let pay = |b: u8, amount: u64| (Address([b; 32]), amount);
+    let vault = |amount: u64| (VAULT_ADDRESS, amount);
+    // the v2 prototype's own vault (a placeholder): an ordinary owner for the node
+    let v2_vault = Address(*b"JTMVAULT/PLACEHOLDER/MAINNET/v0\0");
+    let cb = |h: u64| vec![coinbase(h)];
+    let one = |h: u64, g: Vec<Transaction>| block_with(h, cb(h), vec![g], &[]);
+    let cases: Vec<(&str, &str, Block)> = vec![
+        // V4-c, one group over several pages
+        ("x_min_on_second_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), vault(JTM), (marker(0xa1), 0)]))),
+        ("x_max_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(1_000 * JTM), (marker(0xa1), 0)]))),
+        ("x_min_minus_one_on_second_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), vault(JTM - 1), (marker(0xa1), 0)]))),
+        ("x_max_plus_one_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(1_000 * JTM + 1), (marker(0xa1), 0)]))),
+        ("x_one_micro", "V4-c", one(F + 1, deposit_tx(1, rcpt(0xa1), 1))),
+        ("x_zero_amount_vault_output", "V4-c", one(F + 1, deposit_tx(1, rcpt(0xa1), 0))),
+        // V4-e: exactly one vault output, whatever the sum
+        ("x_two_vault_outputs_each_in_range_sum_above_max", "V4-e", one(F + 1, logical(1, PAYER, &[vault(600 * JTM), vault(600 * JTM), (marker(0xa1), 0)]))),
+        ("x_two_vault_outputs_each_below_min_sum_in_range", "V4-e", one(F + 1, logical(1, PAYER, &[vault(JTM / 2), vault(JTM / 2 + JTM / 10), (marker(0xa1), 0)]))),
+        ("x_two_vault_outputs_on_two_pages", "V4-e", one(F + 1, logical(1, PAYER, &[vault(3 * JTM), pay(0x77, JTM), vault(4 * JTM), (marker(0xa1), 0)]))),
+        // V4-e: exactly one JTMBRDG1 marker
+        ("x_duplicate_marker_same_recipient", "V4-e", one(F + 1, logical(1, PAYER, &[vault(7 * JTM), (marker(0xa1), 0), (marker(0xa1), 0)]))),
+        ("x_marker_without_vault_output", "V4-e", one(F + 1, logical(1, PAYER, &[(marker(0xa1), 0)]))),
+        ("x_marker_and_payment_without_vault_output", "V4-e", one(F + 1, logical(1, PAYER, &[pay(0x77, 7 * JTM), (marker(0xa1), 0)]))),
+        ("x_deposit_to_the_v2_placeholder_vault", "V4-e", one(F + 1, logical(1, PAYER, &[(v2_vault, 7 * JTM), (marker(0xa1), 0)]))),
+        ("x_vault_output_after_marker_on_next_page", "V4", one(F + 1, logical(1, PAYER, &[pay(0x77, JTM), (marker(0xa1), 0), vault(7 * JTM)]))),
+        // V4-a, V4-b: every reserved byte, the recipient's two ends
+        ("x_reserved_byte_28", "V4-a", one(F + 1, logical(1, PAYER, &[vault(7 * JTM), (reserved(28), 0)]))),
+        ("x_reserved_byte_30", "V4-a", one(F + 1, logical(1, PAYER, &[vault(7 * JTM), (reserved(30), 0)]))),
+        ("x_recipient_last_byte_only", "V4-b", one(F + 1, deposit_tx(1, recipient_with(19), 7 * JTM))),
+        ("x_recipient_first_byte_only", "V4-b", one(F + 1, deposit_tx(1, recipient_with(0), 7 * JTM))),
+        // other v1.7 markers in a group that does not spend from the vault
+        ("x_release_marker_in_deposit_group", "V4", one(F + 1, logical(1, PAYER, &[vault(7 * JTM), (marker(0xa1), 0), (r1.marker(), 0)]))),
+        ("x_light_client_marker_in_deposit_group", "V4", one(F + 1, logical(1, PAYER, &[vault(7 * JTM), (marker(0xa1), 0), (lcu, 0)]))),
+        ("x_release_marker_with_value_in_payment", "V5", one(F + 1, logical(1, PAYER, &[pay(0x77, JTM), (r1.marker(), 5)]))),
+        ("x_light_client_marker_with_value", "V5", one(F + 1, logical(1, PAYER, &[pay(0x77, JTM), (lcu, 5)]))),
+        // groups spending from the vault: releases, never deposits
+        ("x_deposit_shape_spending_from_the_vault", "V1", one(F + 1, logical(1, VAULT_ADDRESS, &[vault(7 * JTM), (marker(0xa1), 0)]))),
+        ("x_release_with_change_to_the_vault", "V4 change", block_with(F + 1, cb(F + 1), vec![release_group(100, &r1, 9_000)], std::slice::from_ref(&r1))),
+        ("x_release_without_change", "V2", block_with(F + 1, cb(F + 1), vec![release_group(100, &r1, 0)], std::slice::from_ref(&r1))),
+        ("x_release_then_deposit", "V4 change", block_with(F + 2, cb(F + 2), vec![release_group(100, &r2, 7_000), deposit_tx(200, rcpt(0xc3), 11 * JTM)], std::slice::from_ref(&r2))),
+        ("x_deposit_marker_in_release_group", "V2", block_with(F + 1, cb(F + 1), vec![logical(100, VAULT_ADDRESS, &[(r1.owner, r1.amount - RELEASE_FEE_MICRO), (r1.marker(), 0), (marker(0xa1), 0)])], std::slice::from_ref(&r1))),
+        // V4-0: the system records
+        ("x_v4_0_coinbase_pays_the_vault", "V4-0", block_with(F + 1, vec![coinbase_paying(F + 1, VAULT_ADDRESS)], vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
+        ("x_v4_0_development_payout_pays_the_vault", "V4-0", block_with(F + 1, vec![coinbase(F + 1), development_payout([VAULT_ADDRESS, Address([0x55; 32])])], vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
+        ("x_development_payout_then_deposit", "V4-0", block_with(F + 1, vec![coinbase(F + 1), development_payout([Address([0x55; 32]), Address([0x56; 32])])], vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
+        ("x_deposit_marker_in_coinbase", "V5", block_with(F + 1, vec![coinbase_paying(F + 1, marker(0xa1))], vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
+        // V4-d and the v1.7 clock
+        ("x_v4_d_one_below_opening", "V4-d", one(F - 1, deposit_tx(1, rcpt(0xa1), 7 * JTM))),
+        ("x_v4_d_at_activation", "V4-d", one(J, deposit_tx(1, rcpt(0xa1), 7 * JTM))),
+        ("x_below_activation_nothing_is_read", "V4-d", block_with(J - 1, cb(J - 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), logical(50, PAYER, &[vault(JTM)])], &[])),
+        ("x_far_above_opening", "V4-d", one(F + 1_000_000, deposit_tx(1, rcpt(0xa1), 7 * JTM))),
+        // the block, not the group: one bad group refuses every deposit of the block
+        ("x_valid_deposit_then_bare_vault_output", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), logical(50, PAYER, &[vault(JTM)])], &[])),
+        ("x_bare_vault_output_then_valid_deposit", "V4", block_with(F + 1, cb(F + 1), vec![logical(50, PAYER, &[vault(JTM)]), deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
+        ("x_valid_deposit_then_bad_amount", "V4-c", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM + 1)], &[])),
+        ("x_three_deposits_one_block", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM - 1), deposit_tx(100, rcpt(0xc3), 1_000 * JTM)], &[])),
+        ("x_payment_only", "V4", one(F + 1, logical(1, PAYER, &[pay(0x77, 3 * JTM)]))),
+    ];
+    let mut out = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (name, rule, b) in cases {
+        assert!(names.insert(name), "{name} twice");
+        let decision = |r: anyhow::Result<Vec<FoundDeposit>>| match r {
+            Ok(found) => serde_json::json!({
+                "accepted": true,
+                "deposits": found.iter().map(|d| serde_json::json!({
+                    "group": d.group,
+                    "txid": hex::encode(d.txid),
+                    "recipient": format!("0x{}", hex::encode(d.recipient)),
+                    "amount": d.amount,
+                    "advance_key": hex::encode(d.key()),
+                })).collect::<Vec<_>>(),
+            }),
+            Err(e) => serde_json::json!({"accepted": false, "node_error": format!("{e:#}")}),
+        };
+        let node = decision(deposits_in_block(&b, &rules()));
+        let (raw, id) = raw_and_id(&b);
+        if b.destination.is_none() {
+            assert_eq!(decision(deposits_of_block(&raw, &id, &rules())), node, "{name}: the bytes and the decoded block disagree");
+        }
+        let pages: Vec<String> = b
+            .transactions
+            .iter()
+            .map(|t| if t.body.is_coinbase { hex::encode(t.body.to_bytes()) } else { hex::encode(jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().unwrap()) })
+            .collect();
+        let txids: Vec<String> = jetsam_chain::block::try_compute_logical_txids(&b.transactions).unwrap().iter().map(|t| hex::encode(t.0)).collect();
+        out.push(serde_json::json!({
+            "name": name,
+            "rule": rule,
+            "height": b.header.height,
+            "activation_height": J,
+            "deposits_from_height": F,
+            "vault": hex::encode(VAULT_ADDRESS.0),
+            "block_id": hex::encode(id),
+            "tx_root": hex::encode(b.header.tx_root),
+            "block": hex::encode(&raw),
+            "pages": pages,
+            "logical_txids": txids,
+            "node": node,
+        }));
+    }
+    serde_json::json!({
+        "what": "G6 = V4 edge vectors (T4.9): decisions of the node's vault rule (validate_block_vault, through the robot's deposits_in_block) on the edges of V4, V4-0 and V4-d; a block with a destination section carries it in `block` (v1.7 encoding)",
+        "key": "keccak256(abi.encode(bytes32 txid, address recipient, uint64 amount))",
+        "vectors": out,
+    })
+}
+
 // ---------------------------------------------------------------- the configuration (A4 / D66 egress, start checks)
 
 const REH_BRIDGE: &str = "0xee8b5fca072382781999798cf9d7c5b3f6c63e2f";
