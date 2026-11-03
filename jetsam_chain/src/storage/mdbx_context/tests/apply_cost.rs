@@ -116,7 +116,7 @@ fn populated_columns(live: usize) -> SegmentColumns {
 
 /// A durable genesis at production depth whose segment 0 holds `live` UTXOs,
 /// committed to MDBX and then evicted, as after any committed block.
-fn populated_context(path: &Path, live: usize) -> MdbxChainContext {
+pub(super) fn populated_context(path: &Path, live: usize) -> MdbxChainContext {
     let store = MdbxStore::open(path).unwrap();
     let log_slots = crate::consensus::params::LOG_SLOTS_GENESIS;
     let columns = populated_columns(live);

@@ -1973,3 +1973,6 @@ mod tests {
         assert_eq!(state.try_state_root().unwrap(), root);
     }
 }
+
+#[cfg(test)]
+mod segment_tree_equivalence;
