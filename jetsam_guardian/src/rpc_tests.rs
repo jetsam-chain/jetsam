@@ -324,3 +324,43 @@ fn node_client_reaches_an_onion_node_through_socks_and_refuses_the_rest_before_a
     assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(socks.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }
+
+/// `jg-fill`'s node client: the observer's read methods and the raw block, nothing that writes.
+#[test]
+fn fill_rpc_client_reads_raw_blocks_and_nothing_else() {
+    let c = NodeClient::fill("http://127.0.0.1:9", Egress::onion(DEFAULT_TOR_SOCKS).unwrap());
+    for m in ["walletSend", "stop", "submitTxIntent", "walletBuildGuardianPayment", "submitGuardianObject", "submitTx"] {
+        let e = c.call(m, json!([])).unwrap_err().to_string();
+        assert!(e.contains("allow-list"), "{m}: {e}");
+    }
+    for m in ["getBlock", "blockCount", "getHeaderByHeight", "getObservedBranches"] {
+        let e = c.call(m, json!([1])).unwrap_err().to_string();
+        assert!(!e.contains("allow-list"), "{m}: {e}");
+    }
+    assert!(FILL_ALLOWLIST.iter().all(|m| !m.starts_with("wallet") && !m.starts_with("submit") && *m != "stop"));
+}
+
+#[test]
+fn a_raw_block_is_read_as_bytes_and_none_when_pruned() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for answer in [r#""b3c0ffee""#, "null"] {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut req = String::new();
+            while !req.contains("\"params\"") {
+                let n = s.read(&mut buf).unwrap();
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            assert!(req.contains("jetsam_getBlock"), "{req}");
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{answer}}}"#);
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    let c = NodeClient::fill(&format!("http://127.0.0.1:{port}"), Egress::onion(DEFAULT_TOR_SOCKS).unwrap());
+    assert_eq!(c.raw_block(5).unwrap(), Some(vec![0xb3, 0xc0, 0xff, 0xee]));
+    assert_eq!(c.raw_block(6).unwrap(), None);
+    server.join().unwrap();
+}

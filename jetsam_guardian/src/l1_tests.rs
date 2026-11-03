@@ -91,3 +91,39 @@ fn l1_client_goes_through_its_egress() {
     // the rehearsal tools keep plain TCP
     assert_eq!(L1::new("http://10.77.0.1:18545").egress, crate::rpc::Egress::Clearnet);
 }
+
+fn order1() -> AdvanceOrder {
+    AdvanceOrder { jetsam_tx_id: rep(0x11), recipient: [0x22; 20], amount: 123_456_789, fee_bps: 75, refund_to: [0x33; 20], evidence: rep(0x44) }
+}
+
+fn order2() -> AdvanceOrder {
+    AdvanceOrder { jetsam_tx_id: rep(0x55), recipient: [0x66; 20], amount: 1_000_000_000, fee_bps: 100, refund_to: [0u8; 20], evidence: [0u8; 32] }
+}
+
+/// Contract v3-advance (D72): vectors `cast sig` / `cast calldata … ; cast keccak` (foundry 1.4.4), 2026-11-03;
+/// the selectors are the ones of `ADVANCER_INTERFACE.md` §4.
+#[test]
+fn advance_call_data_matches_cast() {
+    let seen = rep(0x77);
+    assert_eq!(advance(&order1(), &seen)[..4], [0xe5, 0xbf, 0xef, 0x77]);
+    assert_eq!(k(&advance(&order1(), &seen)), "0x29e3cd909ac2c14a71668d500fc4ad7bf4beabef99f5325866072987dd3bfbeb");
+    let batch = advance_batch(&[order1(), order2()], &seen);
+    assert_eq!(batch[..4], [0x90, 0xea, 0x90, 0x43]);
+    assert_eq!(batch.len(), 484);
+    assert_eq!(k(&batch), "0x3be1f5cc892588737e7452fe7ddb7d96f45fc0f94741753fd63d8f28c48bc6ea");
+    assert_eq!(k(&advance_batch(&[], &seen)), "0x597ca98a7a5ee2fe155fc5425a90b0d6471b1e4e03148d950e6a193de1e1d895");
+    // D73: the genesis by the one-shot genesis key, and the slow finality
+    assert_eq!(init_genesis_by_key(&cp())[..4], [0xeb, 0xda, 0x85, 0x52]);
+    assert_eq!(k(&init_genesis_by_key(&cp())), "0x3a1b1a68586abe8699aa5fd6cad437474be26897cdaf551c91b2c31aa9dd1549");
+    assert_eq!(finalize_slow(&cp())[..4], [0xeb, 0x8b, 0xb0, 0x9f]);
+    assert_eq!(k(&finalize_slow(&cp())), "0xf2a3c894156694d2f40fcd4d3f7719925658c84554d5ced2c0e947cceb928c7c");
+}
+
+#[test]
+fn advance_event_topics_are_the_interfaces() {
+    let t = |sig: &str| format!("0x{}", hex::encode(keccak256(sig.as_bytes())));
+    assert_eq!(t("Advanced(bytes32,bytes32,address,address,uint64,uint16,address,bytes32)"), TOPIC_ADVANCED);
+    assert_eq!(t("AdvanceSkipped(uint256,bytes32,bytes4)"), TOPIC_ADVANCE_SKIPPED);
+    assert_eq!(t("AdvanceRepaid(bytes32,bytes32,address,uint64)"), TOPIC_ADVANCE_REPAID);
+    assert_eq!(t(&format!("CheckpointAccepted(bytes32,bytes32,{CHECKPOINT_TUPLE},uint8)")), TOPIC_CHECKPOINT_ACCEPTED);
+}

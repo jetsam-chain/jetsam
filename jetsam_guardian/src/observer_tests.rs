@@ -650,3 +650,24 @@ fn observer_refuses_to_start_with_stability_below_1200_on_the_public_testnet() {
     c.thresholds.stability_secs = 600;
     assert!(Observer::new(c, chain).is_ok());
 }
+
+/// `jg-fill` reads its nodes through an observer each: the reorganizations it went through, its last tip
+/// change, its facts (branches) are what the robot's guard needs.
+#[test]
+fn the_observer_tells_its_reorganizations_tip_change_and_branches() {
+    let chain = testkit::chain(30, 1);
+    let mut node = FakeNode { facts: facts(&chain), chain: chain.clone(), wrong_hash_at: None, work_offset: false };
+    let mut o = Observer::new(cfg(&chain), Chain::from_genesis(chain.header_at(0).unwrap().clone())).unwrap();
+    o.poll(T0, &mut node).unwrap();
+    assert!(o.reorgs().is_empty());
+    assert_eq!(o.tip_changed_at(), T0);
+    o.poll(T0 + 30, &mut node).unwrap();
+    assert_eq!(o.tip_changed_at(), T0, "no new block");
+    let mut other = testkit::chain(27, 1);
+    testkit::extend(&mut other, 5, 2, 20);
+    node.chain = other;
+    o.poll(T0 + 60, &mut node).unwrap();
+    assert_eq!(o.reorgs(), &[(T0 + 60, 3)]);
+    assert_eq!(o.tip_changed_at(), T0 + 60);
+    assert_eq!(o.facts(), &node.facts);
+}
