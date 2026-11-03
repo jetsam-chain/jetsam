@@ -1,0 +1,9 @@
+[package]
+name = "jetsam_bridge_towerwalk"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bridge proof program: no_std copy of the Jetsam v1.6.0 TowerWalk and Poseidon2b flat permutation, with software GF(2^128) multiplication, for the RISC-V proving VM (imported from the v2 prototype tw-core)."
+
+[dependencies]

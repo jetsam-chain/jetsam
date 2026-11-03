@@ -2983,6 +2983,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetsam_bridge_program"
+version = "1.6.0"
+dependencies = [
+ "jetsam_bridge_towerwalk",
+]
+
+[[package]]
+name = "jetsam_bridge_towerwalk"
+version = "1.6.0"
+
+[[package]]
 name = "jetsam_chain"
 version = "1.6.0"
 dependencies = [

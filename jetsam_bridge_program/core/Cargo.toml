@@ -1,0 +1,14 @@
+[package]
+name = "jetsam_bridge_program"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bridge proof program core (no_std): the relations the SP1 guests prove (checkpoint, deposit claim). Imported from the v2 prototype spv-core."
+
+[features]
+# The test chain profile (genesis d9d156ee, v1.6 at 4800). Default: the public network (v1.6 at 46080).
+testnet = []
+
+[dependencies]
+tw-core = { package = "jetsam_bridge_towerwalk", path = "../towerwalk" }
