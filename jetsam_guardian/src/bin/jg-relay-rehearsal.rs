@@ -2,15 +2,17 @@
 // Copyright (C) 2026 the Jetsam developers.
 
 //! `jg-relay-rehearsal` — **TEST ONLY** relayer of the private rehearsal
-//! (it is not T4.10). It reads the Jetsam chain from a node, builds the
-//! checkpoints v3 with honest values (the same code as the guardians:
-//! `chain`, `checkpoint`), proves them with the TEST mock verifier
-//! (`keccak(TAG ‖ public values)`: the "simulated proof"), submits them to the
-//! LOCAL L1, publishes the proposals the guardians sign, and claims the
-//! deposits of every finalized deposit root. It writes one JSON line per
-//! observation (`--events`) for the latency measures. Which proposals stay on
-//! the points is [`jetsam_guardian::relay::plan`] (D63): every point that can
-//! still become final, and again the highest already-stable one.
+//! (it is not T4.10), for the contract v3-advance (D72): no guardian, no
+//! co-signature. It reads the Jetsam chain from a node, has the genesis
+//! installed ONCE by the genesis key (`initGenesis(cp)`, D73), builds the
+//! checkpoints v3 with honest values (`chain`, `checkpoint`), proves them with
+//! the TEST mock verifier (`keccak(TAG ‖ public values)`: the "simulated
+//! proof") and submits one every `--cadence-secs` (D-AV3, default 6 600 s,
+//! [`jetsam_guardian::relay::checkpoint_due`]), finalizes the highest point
+//! that has waited 24 h without a switch (`finalizeSlow`), and claims the
+//! deposits of every finalized deposit root. Its deposits are read from the
+//! node's `getBlockDetails` (not from the raw block as `jg-fill` does: two
+//! readings that must agree). One JSON line per observation (`--events`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -23,7 +25,7 @@ use jetsam_chain::consensus::vault::{BRIDGE_DEPOSIT_MARKER_TAG, VAULT_ADDRESS};
 use jetsam_guardian::chain::{merkle_branch, merkle_root, Chain, HeaderInfo};
 use jetsam_guardian::checkpoint::{deposit_leaf, genesis_checkpoint, mock_proof, public_values, Checkpoint, Deposit, Mn};
 use jetsam_guardian::l1::{self, L1};
-use jetsam_guardian::relay::{self, Live, Point, Policy};
+use jetsam_guardian::relay::{check_cadence, checkpoint_due, DEFAULT_CHECKPOINT_CADENCE};
 use jetsam_guardian::rpc::call;
 use jetsam_guardian::{now_unix, u256, Domain};
 
@@ -41,13 +43,15 @@ struct Args {
     node: String,
     l1: String,
     from: String,
+    /// The TEST account of the one-shot genesis key (D73).
+    genesis_from: String,
     bridge: String,
-    points: Vec<PathBuf>,
     genesis_l: u64,
     events: PathBuf,
     state: PathBuf,
     domain: Domain,
     f: u64,
+    cadence: u64,
 }
 
 fn args() -> anyhow::Result<Args> {
@@ -55,17 +59,23 @@ fn args() -> anyhow::Result<Args> {
     let get = |n: &str| a.iter().position(|x| x == n).and_then(|i| a.get(i + 1)).cloned().ok_or_else(|| anyhow::anyhow!("missing {n}"));
     let bridge = get("--bridge")?;
     let b20: [u8; 20] = hex::decode(bridge.trim_start_matches("0x"))?.try_into().map_err(|_| anyhow::anyhow!("bridge: 20 bytes"))?;
+    let cadence = match get("--cadence-secs") {
+        Ok(c) => c.parse()?,
+        Err(_) => DEFAULT_CHECKPOINT_CADENCE,
+    };
+    check_cadence(cadence)?;
     Ok(Args {
         node: get("--node")?,
         l1: get("--l1")?,
         from: get("--from")?,
+        genesis_from: get("--genesis-from")?,
         bridge,
-        points: get("--points")?.split(',').map(PathBuf::from).collect(),
         genesis_l: get("--genesis-l")?.parse()?,
         events: PathBuf::from(get("--events")?),
         state: PathBuf::from(get("--state")?),
         domain: Domain { network: jetsam_guardian::parse32(&get("--network")?)?, l1_chain_id: get("--l1-chain-id")?.parse()?, l1_bridge: b20 },
         f: get("--deposits-from")?.parse()?,
+        cadence,
     })
 }
 
@@ -87,8 +97,8 @@ fn word_u64(data: &[u8], i: usize) -> u64 {
 struct Known {
     cp: Checkpoint,
     ids: BTreeMap<u64, [u8; 32]>,
-    /// The proposal's other fields (`parent_id`, `fork_depth`, `mn`, `proof`), to propose it again.
-    extra: Value,
+    /// Its L1 acceptance time (the genesis's included).
+    accepted_at: u64,
 }
 
 struct Relay {
@@ -105,7 +115,7 @@ struct Relay {
 
 impl Relay {
     fn save(&self) {
-        let known: Vec<Value> = self.known.values().map(|k| json!({"cp": k.cp, "ids": k.ids.iter().map(|(h, id)| (h, hex::encode(id))).collect::<Vec<_>>(), "extra": k.extra})).collect();
+        let known: Vec<Value> = self.known.values().map(|k| json!({"cp": k.cp, "ids": k.ids.iter().map(|(h, id)| (h, hex::encode(id))).collect::<Vec<_>>(), "accepted_at": k.accepted_at})).collect();
         let deposits: Vec<Value> = self.deposits.iter().map(|(h, ds)| json!({"h": h, "d": ds})).collect();
         let v = json!({"known": known, "deposits": deposits, "claimed": self.claimed.keys().map(hex::encode).collect::<Vec<_>>(), "last_final": hex::encode(self.last_final)});
         let tmp = self.a.state.with_extension("tmp");
@@ -123,7 +133,7 @@ impl Relay {
             for e in k["ids"].as_array().cloned().unwrap_or_default() {
                 ids.insert(e[0].as_u64().unwrap_or(0), jetsam_guardian::parse32(e[1].as_str().unwrap_or_default())?);
             }
-            self.known.insert(cp.id(), Known { cp, ids, extra: k["extra"].clone() });
+            self.known.insert(cp.id(), Known { cp, ids, accepted_at: k["accepted_at"].as_u64().unwrap_or(0) });
         }
         for e in v["deposits"].as_array().cloned().unwrap_or_default() {
             let ds: Vec<Deposit> = serde_json::from_value(e["d"].clone())?;
@@ -252,68 +262,32 @@ impl Relay {
         ))
     }
 
-    fn propose(&self, name: &str, kind: &str, cp: &Checkpoint, extra: Value) -> anyhow::Result<u64> {
-        let na = self.l1.next_time()? + 3_000;
-        let mut v = json!({"kind": kind, "checkpoint": cp, "not_after": na, "created": now_unix(),
-                           "domain": {"network": hex::encode(self.a.domain.network), "l1_chain_id": self.a.domain.l1_chain_id,
-                                      "l1_bridge": format!("0x{}", hex::encode(self.a.domain.l1_bridge))}});
-        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
-            for (k, x) in e {
-                o.insert(k.clone(), x.clone());
-            }
-        }
-        for p in &self.a.points {
-            let dir = p.join("proposals");
-            std::fs::create_dir_all(&dir)?;
-            // a co-signature proposal is named by its notAfter too: one proposed again never
-            // replaces one that may already carry partials
-            let file = if kind == "cosign" { format!("{name}-{na}") } else { name.to_string() };
-            let tmp = dir.join(format!(".{file}.tmp"));
-            std::fs::write(&tmp, v.to_string())?;
-            std::fs::rename(&tmp, dir.join(format!("{file}.json")))?;
-        }
-        Ok(na)
-    }
-
-    /// D63: drop the proposals no guardian can make final any more, offer again the highest
-    /// point already stable for this relayer (`relay::plan`). After the bridge genesis only.
-    fn keep_proposals(&mut self) -> anyhow::Result<()> {
-        if word(&self.l1_word("genesisId()", &[])?, 0) == [0u8; 32] {
-            return Ok(());
-        }
+    /// The highest point that has waited `D_SLOW` (24 h) after its acceptance and after the last branch
+    /// switch, finalized (`finalizeSlow`, the only finality of v3-advance); the contract's probe decides.
+    fn finalize(&mut self) -> anyhow::Result<()> {
         let fin = word(&self.l1_word("finalId()", &[])?, 0);
         let final_locked = self.known.get(&fin).map(|k| k.cp.locked_height).unwrap_or(0);
-        let points: Vec<Point> = self
+        let last_switch = word_u64(&self.l1_word("lastSwitchAt()", &[])?, 0);
+        let l1_now = self.l1.next_time()?;
+        let mut ready: Vec<Known> = self
             .known
             .values()
-            .map(|k| {
-                let l = k.cp.locked_height;
-                let seen = (l.saturating_sub(7)..=l).map(|h| self.seen_at.get(&h).copied().unwrap_or(u64::MAX / 4)).max().unwrap_or(u64::MAX / 4);
-                Point { id: k.cp.id(), locked_height: l, locked_seen_at: seen, on_chain: self.chain.id_at(k.cp.height) == Some(k.cp.tip_block_id) }
-            })
+            .filter(|k| k.cp.locked_height > final_locked && k.accepted_at.max(last_switch) + 86_400 <= l1_now)
+            .cloned()
             .collect();
-        let mut live = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.a.points[0].join("proposals")) {
-            for e in rd.flatten() {
-                let path = e.path();
-                let (Some(stem), true) = (path.file_stem().and_then(|s| s.to_str()), path.extension().is_some_and(|x| x == "json")) else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap_or_default()) else { continue };
-                let (Ok(cp), Some(na)) = (serde_json::from_value::<Checkpoint>(v["checkpoint"].clone()), v["not_after"].as_u64()) else { continue };
-                live.push(Live { name: stem.to_string(), id: cp.id(), not_after: na });
+        ready.sort_by_key(|k| std::cmp::Reverse(k.cp.locked_height));
+        for k in ready {
+            match self.l1.send(&self.a.from, &self.a.bridge, &l1::finalize_slow(&k.cp)) {
+                Ok(r) => {
+                    self.event(json!({"t": now_unix(), "event": "finalizeSlow", "status": r.status, "gas": r.gas_used, "l1_ts": r.block_timestamp,
+                                      "locked_height": k.cp.locked_height, "tip_height": k.cp.height, "checkpoint_id": hex::encode(k.cp.id())}));
+                    log(&format!("finalizeSlow L={} T={} status {} gas {}", k.cp.locked_height, k.cp.height, r.status, r.gas_used));
+                    if r.status {
+                        return Ok(());
+                    }
+                }
+                Err(e) => log(&format!("finalizeSlow L={} refused: {e:#}", k.cp.locked_height)),
             }
-        }
-        let plan = relay::plan(&points, &live, final_locked, now_unix(), self.l1.next_time()?, &Policy::default());
-        for name in &plan.drop {
-            for p in &self.a.points {
-                let _ = std::fs::remove_file(p.join("proposals").join(format!("{name}.json")));
-            }
-            self.event(json!({"t": now_unix(), "event": "proposal_dropped", "name": name}));
-        }
-        if let Some(k) = plan.propose.and_then(|id| self.known.get(&id)).cloned() {
-            let name = format!("cp-{:08}-{}", k.cp.locked_height, &hex::encode(k.cp.id())[..12]);
-            let na = self.propose(&name, "cosign", &k.cp, k.extra.clone())?;
-            self.event(json!({"t": now_unix(), "event": "proposed_again", "locked_height": k.cp.locked_height, "tip_height": k.cp.height, "not_after": na}));
-            log(&format!("proposed again L={} T={} (already stable, notAfter {na})", k.cp.locked_height, k.cp.height));
         }
         Ok(())
     }
@@ -325,16 +299,17 @@ impl Relay {
         if genesis == [0u8; 32] {
             let l = self.a.genesis_l;
             if tip >= l + 8 {
+                // D73: the one-shot genesis key installs the genesis once; it has no power after
                 let cp = genesis_checkpoint(l, self.chain.id_at(l).unwrap_or_default(), u256::to_be(&self.chain.work_at(l).unwrap_or_default()), self.chain.headers_digest(l).unwrap_or_default());
-                let path = self.a.points[0].join("proposals").join("genesis.json");
-                let fresh = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["not_after"].as_u64()).is_some_and(|na| na > self.l1.next_time().unwrap_or(0) + 900);
-                if !fresh {
-                    let na = self.propose("genesis", "genesis", &cp, json!({}))?;
-                    self.event(json!({"t": now_unix(), "event": "genesis_proposed", "locked_height": l, "not_after": na}));
+                let r = self.l1.send(&self.a.genesis_from, &self.a.bridge, &l1::init_genesis_by_key(&cp))?;
+                self.event(json!({"t": now_unix(), "event": "initGenesis", "status": r.status, "gas": r.gas_used, "l1_ts": r.block_timestamp,
+                                  "locked_height": l, "checkpoint_id": hex::encode(cp.id()), "from": self.a.genesis_from}));
+                log(&format!("initGenesis L={l} by the genesis key: status {} gas {}", r.status, r.gas_used));
+                if r.status {
+                    let mut ids = BTreeMap::new();
+                    ids.insert(l, cp.locked_block_id);
+                    self.known.insert(cp.id(), Known { cp, ids, accepted_at: r.block_timestamp });
                 }
-                let mut ids = BTreeMap::new();
-                ids.insert(l, cp.locked_block_id);
-                self.known.insert(cp.id(), Known { cp, ids, extra: json!({}) });
             }
             return Ok(());
         }
@@ -352,6 +327,12 @@ impl Relay {
             self.last_final = fin;
             self.event(json!({"t": now_unix(), "event": "final_changed", "final_id": hex::encode(fin), "l1_ts": self.l1.next_time().ok()}));
             self.claim(fin, gl)?;
+        }
+        self.finalize()?;
+        // D-AV3: one point every `cadence` seconds of the L1 after the last accepted one
+        let last = self.known.values().map(|k| k.accepted_at).max();
+        if !checkpoint_due(last, self.l1.next_time()?, self.a.cadence) {
+            return Ok(());
         }
         let Some(l) = self.chain.locked_height(tip) else { return Ok(()) };
         if l <= parent.cp.locked_height || tip <= parent.cp.height {
@@ -387,11 +368,8 @@ impl Relay {
             return Ok(());
         }
         let ids = (cp.locked_height..=tip).filter_map(|h| self.chain.id_at(h).map(|id| (h, id))).collect();
-        let name = format!("cp-{:08}-{}", l, &hex::encode(cp.id())[..12]);
-        let extra = json!({"parent_id": format!("0x{}", hex::encode(parent_id)), "fork_depth": fork_depth, "mn": mn, "proof": format!("0x{}", hex::encode(proof))});
-        let na = self.propose(&name, "cosign", &cp, extra.clone())?;
-        self.event(json!({"t": now_unix(), "event": "proposed", "locked_height": l, "tip_height": tip, "not_after": na, "deposit_count": deps.len()}));
-        self.known.insert(cp.id(), Known { cp, ids, extra });
+        let _ = deps;
+        self.known.insert(cp.id(), Known { cp, ids, accepted_at: r.block_timestamp });
         Ok(())
     }
 
@@ -436,13 +414,10 @@ fn run() -> anyhow::Result<()> {
     anyhow::ensure!(genesis.id == a.domain.network, "the node's genesis is not --network");
     let mut r = Relay { l1: L1::new(&a.l1), a, chain: Chain::from_genesis(genesis), deposits: BTreeMap::new(), seen_at: BTreeMap::new(), known: HashMap::new(), claimed: HashMap::new(), last_final: [0u8; 32] };
     r.load()?;
-    log("started (TEST relayer, simulated proofs)");
+    log(&format!("started (TEST relayer, simulated proofs, contract v3-advance, a point every {} s)", r.a.cadence));
     while !STOP.load(Ordering::SeqCst) {
         if let Err(e) = r.step() {
             log(&format!("step: {e:#}"));
-        }
-        if let Err(e) = r.keep_proposals() {
-            log(&format!("proposals: {e:#}"));
         }
         r.save();
         for _ in 0..50 {
