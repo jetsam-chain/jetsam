@@ -1,0 +1,13 @@
+[package]
+name = "jetsam_vault_rule"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "V4, the deposit rule of the v1.7 bridge vault (V4-0, V4-a..V4-e, V4-d), no_std and without dependencies: the one implementation the node's vault gate and the L1's proof program both run (SPEC-v3 G6 = V4)."
+
+[features]
+# The private rehearsal clock (F_R = J_R + 32), enabled by `jetsam_chain/rehearsal-v1-7`.
+rehearsal-v1-7 = []
+
+[dependencies]

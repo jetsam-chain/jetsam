@@ -29,6 +29,8 @@ members = [
     "jetsam_client_agent_batch",
     # v1.7 guardian software (T5.1-T5.6): observer, signer, aggregator, ceremony
     "jetsam_guardian",
+    # v1.7 bridge vault: V4, the deposit rule the node and the proof program share
+    "jetsam_vault_rule",
     # v1.7 bridge proof program (T4.9): the relations its SP1 guests prove;
     # the guests themselves build alone for the zkVM target
     "jetsam_bridge_program/core",
