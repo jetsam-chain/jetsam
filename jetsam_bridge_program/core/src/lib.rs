@@ -13,7 +13,11 @@
 //!
 //! Bridge relations (option H, contract `SPEC.md`): [`spv`] = the checkpoint program
 //! (G1-G9, public values v2), [`claim`] = the individual deposit-claim program (P1-P3);
-//! both apply the one deposit rule of [`deposit`] (C4).
+//! both apply the one deposit relation of [`deposit`].
+//!
+//! **v3 (T4.9)**: [`deposit`] reads whole blocks and runs the node's own deposit rule, the crate
+//! `jetsam_vault_rule` (V4, V4-0, V4-d), so that G6 = V4 by construction; [`claim`] is the v3 claim
+//! program (public values unchanged); [`spv`] has the v3 G6 inside the v2 checkpoint frame (see there).
 #![no_std]
 extern crate alloc;
 

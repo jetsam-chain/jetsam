@@ -9,6 +9,15 @@ description = "Bridge proof program core (no_std): the relations the SP1 guests 
 [features]
 # The test chain profile (genesis d9d156ee, v1.6 at 4800). Default: the public network (v1.6 at 46080).
 testnet = []
+# The private rehearsal clock (J_R = 96, F_R = 128), as `jetsam_chain/rehearsal-v1-7`.
+rehearsal-v1-7 = ["jetsam_vault_rule/rehearsal-v1-7"]
+# TEST ONLY: the clock of the node's G6 = V4 vectors (J = 69 120), to run them through a guest; never
+# a deployed program.
+test-clock-j69120 = []
 
 [dependencies]
 tw-core = { package = "jetsam_bridge_towerwalk", path = "../towerwalk" }
+jetsam_vault_rule = { path = "../../jetsam_vault_rule" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

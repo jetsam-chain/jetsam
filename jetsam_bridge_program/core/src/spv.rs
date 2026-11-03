@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The checkpoint relation proven by the guest (format v2, option H).
 //!
+//! **v3 (T4.9) inside this v2 frame: G6 only.** The deposits are read from WHOLE blocks under the
+//! node's rule ([`crate::deposit::block_deposits`], V4 = G6, SPEC-v3 §6.4): every deposit of a block
+//! the input gives, in group order, none of a block it does not give (a relayer may still omit a whole
+//! block, never one deposit of a block, nor invent one). The rest is still the v2 checkpoint of option
+//! H — 6 fields, 320 bytes of public values, the window `]h_prev − 8 ; h − 8]` — not the v3 one
+//! (10 fields, 608 bytes, `lockedHeight`, MN values, G11, SPEC-v3 §2.1-§2.3, §6.1): that frame is
+//! still to write, and no v3 contract verifies this program.
+//!
 //! Checkpoint (as `JetsamBridge.sol` and SPEC.md §2): {height, cumWork,
 //! headersDigest, depositRoot, depositCount, anchorRoot};
 //! prevId = keccak(abi.encode(CP_DOMAIN_V2, height, cumWork, headersDigest, depositRoot,
@@ -27,7 +35,7 @@ use crate::tx;
 use crate::u256;
 use alloc::vec::Vec;
 
-pub const MAGIC: &[u8; 8] = b"JSPVIN03";
+pub const MAGIC: &[u8; 8] = b"JSPVIN04";
 /// Bytes of the public values (`JetsamBridge.publicValues`, v2).
 pub const PV_LEN: usize = 320;
 pub const CP_DOMAIN: &[u8] = b"jetsam-bridge/checkpoint/v2";
@@ -184,7 +192,6 @@ impl<'a> Rd<'a> {
         s
     }
     fn u8(&mut self) -> u8 { self.take(1)[0] }
-    fn u16(&mut self) -> u16 { let s = self.take(2); u16::from_le_bytes([s[0], s[1]]) }
     fn u32(&mut self) -> u32 { u32_at(self.take(4), 0) }
     fn u64(&mut self) -> u64 { u64_at(self.take(8), 0) }
     fn b32(&mut self) -> [u8; 32] { b32_at(self.take(32), 0) }
@@ -209,21 +216,21 @@ pub struct Out {
     /// (height, block id, tx_root) of every anchor leaf this checkpoint added, in order.
     pub new_anchors: Vec<(u64, [u8; 32], [u8; 32])>,
     /// Deposits added to the batch tree, in order: (index, deposit).
-    pub new_deposits: Vec<(u64, deposit::VaultDeposit)>,
+    pub new_deposits: Vec<(u64, deposit::BlockDeposit)>,
 }
 
-/// The relation under this program's own schedule and vault (what the guest proves).
+/// The relation under this program's own schedule and deposit rule (what the guest proves).
 pub fn run(input: &[u8], kf: PermuteFn, pad: &mut [u64]) -> Out {
-    run_with(input, kf, pad, &rules::PRODUCTION, &deposit::VAULT_ADDRESS)
+    run_with(input, kf, pad, &rules::PRODUCTION, &deposit::DEPOSIT_RULE)
 }
 
-/// Verify a checkpoint transition under `s` and `vault`; panics (= no proof) on any rule failure.
+/// Verify a checkpoint transition under `s` and `rule`; panics (= no proof) on any rule failure.
 ///
-/// Input `JSPVIN03`: genesis_height u64 | prev {height u64, cumWork 32 (LE), depositRoot 32,
+/// Input `JSPVIN04`: genesis_height u64 | prev {height u64, cumWork 32 (LE), depositRoot 32,
 /// depositCount u64} | deposit frontier 32 x 32 | prev anchorRoot 32 | anchor frontier 32 x 32 |
-/// forkDepth u8 | n_ctx u32 | n_ctx headers | n_new u32 | n_new headers | n_dep u32 |
-/// deposits {height u64, position u32, tx_count u32, path 8 x 32, n_pages u16, pages}.
-pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, vault: &[u8; 32]) -> Out {
+/// forkDepth u8 | n_ctx u32 | n_ctx headers | n_new u32 | n_new headers | n_blk u32 |
+/// deposit blocks {height u64, n_pages u32, every page of the block, 323 bytes each}.
+pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule: &deposit::DepositRule) -> Out {
     let mut r = Rd { b: input, o: 0 };
     assert!(r.take(8) == MAGIC, "magic");
     let genesis_height = r.u64();
@@ -360,39 +367,33 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, vaul
     }
     let anchor_root = frontier_root(kf, &anchor_branch, anchor_count, &z);
 
-    // G6: vault deposits final in the new branch, in chain order, under the shared
-    // deposit rule (the recipient is the one written in the deposit's marker).
+    // G6 (v3): the vault deposits of whole blocks final in the new branch, in chain order, under
+    // V4, the node's own rule (the recipient is the one written in the deposit's marker).
     let mut count = prev_count;
-    let mut last_key: Option<(u64, u32)> = None;
+    let mut last_height: Option<u64> = None;
     let mut new_deposits = Vec::new();
-    let n_dep = r.u32() as usize;
-    for _ in 0..n_dep {
+    let n_blk = r.u32() as usize;
+    for _ in 0..n_blk {
         let height = r.u64();
-        let position = r.u32();
-        let tx_count = r.u32();
-        let mut path = [[0u8; 32]; tx::TX_TREE_DEPTH];
-        for p in path.iter_mut() {
-            *p = r.b32();
-        }
-        let n_pages = r.u16() as usize;
-        let mut pages: Vec<&[u8]> = Vec::with_capacity(n_pages);
+        let n_pages = r.u32() as usize;
+        let mut pages: Vec<&[u8]> = Vec::new();
         for _ in 0..n_pages {
             pages.push(r.take(tx::BODY));
         }
-        assert!(height > lo && height <= hi, "deposit not final in window");
-        let key = (height, position);
-        if let Some(prev) = last_key {
-            assert!(key > prev, "deposit order");
+        assert!(height > lo && height <= hi, "deposit block not final in window");
+        if let Some(prev) = last_height {
+            assert!(height > prev, "deposit block order");
         }
-        last_key = Some(key);
+        last_height = Some(height);
         let rec = recs[(height - first_height) as usize];
         assert!(rec.height == height);
-        let d = deposit::prove_deposit_with(vault, &rec.tx_root, position, tx_count, &path, &pages);
-        assert!(count < MAX_LEAVES, "deposit tree full");
-        let leaf = deposit_leaf(kf, count, &d.recipient, d.amount, &d.txid);
-        frontier_insert(kf, &mut branch, count, leaf);
-        new_deposits.push((count, d));
-        count += 1;
+        for d in deposit::block_deposits(height, &rec.tx_root, &pages, rule) {
+            assert!(count < MAX_LEAVES, "deposit tree full");
+            let leaf = deposit_leaf(kf, count, &d.recipient, d.amount, &d.txid);
+            frontier_insert(kf, &mut branch, count, leaf);
+            new_deposits.push((count, d));
+            count += 1;
+        }
     }
     assert!(r.o == input.len(), "trailing input");
     let root = frontier_root(kf, &branch, count, &z);

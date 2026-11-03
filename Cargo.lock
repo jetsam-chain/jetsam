@@ -2987,6 +2987,8 @@ name = "jetsam_bridge_program"
 version = "1.6.0"
 dependencies = [
  "jetsam_bridge_towerwalk",
+ "jetsam_vault_rule",
+ "serde_json",
 ]
 
 [[package]]
