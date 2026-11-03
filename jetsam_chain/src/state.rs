@@ -499,6 +499,14 @@ impl ExactSegmentTreeCache {
         if self.entries.len() > EXACT_SEGMENT_TREE_CACHE_SEGMENTS {
             self.entries.remove(0);
         }
+        // The streaming walk this cache replaces stays the oracle of every
+        // debug build, so each test that roots a segment through the cache
+        // also checks it. Compiled out of release builds.
+        debug_assert_eq!(
+            root,
+            exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new()),
+            "segment tree cache diverged from the streaming root of segment {segment_id}"
+        );
         root
     }
 
