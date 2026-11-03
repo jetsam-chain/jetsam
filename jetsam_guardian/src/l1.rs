@@ -126,6 +126,73 @@ pub fn burn(amount: u64, jetsam_recipient: &[u8; 32]) -> Vec<u8> {
     encode_call("burn(uint64,bytes32)", &[Arg::Words(vec![w(amount), *jetsam_recipient])])
 }
 
+/// Contract v3-advance (D72, D73): `initGenesis(cp)`, sent once by the genesis key.
+pub fn init_genesis_by_key(c: &Checkpoint) -> Vec<u8> {
+    encode_call(&format!("initGenesis({CHECKPOINT_TUPLE})"), &[Arg::Words(c.words().to_vec())])
+}
+
+/// `finalizeSlow(cp)`: the only finality of the contract v3-advance (24 h without a switch).
+pub fn finalize_slow(c: &Checkpoint) -> Vec<u8> {
+    encode_call(&format!("finalizeSlow({CHECKPOINT_TUPLE})"), &[Arg::Words(c.words().to_vec())])
+}
+
+pub const ADVANCE_ORDER_TUPLE: &str = "(bytes32,address,uint64,uint16,address,bytes32)";
+
+/// topic0 of `Advanced(bytes32,bytes32,address,address,uint64,uint16,address,bytes32)`.
+pub const TOPIC_ADVANCED: &str = "0x7920df7ac525028a91c141dd8a1c7d7a445b2fa4b63b78a4ab674ba4e796863e";
+/// topic0 of `AdvanceSkipped(uint256,bytes32,bytes4)`.
+pub const TOPIC_ADVANCE_SKIPPED: &str = "0x8e013f08267d3ff5f03b3add7d4fd72183fd8bc6c02abbb114cbd637e89ce570";
+/// topic0 of `AdvanceRepaid(bytes32,bytes32,address,uint64)`.
+pub const TOPIC_ADVANCE_REPAID: &str = "0x374af8d08c7aeb84535775e8a485766641992214748b0a320ca05ca2ed046e79";
+/// topic0 of `CheckpointAccepted(bytes32,bytes32,<checkpoint>,uint8)`.
+pub const TOPIC_CHECKPOINT_ACCEPTED: &str = "0x53f50399429a0b4cc6bb816066c322d4eca835e2392cbffa4ee9d486298c89dd";
+
+/// One `AdvanceOrder` of the contract v3-advance (`ADVANCER_INTERFACE.md` §2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvanceOrder {
+    pub jetsam_tx_id: [u8; 32],
+    pub recipient: [u8; 20],
+    /// µJTM.
+    pub amount: u64,
+    pub fee_bps: u16,
+    /// The claim owner the slow mint repays (0: the caller).
+    pub refund_to: [u8; 20],
+    pub evidence: [u8; 32],
+}
+
+/// An address as an ABI word.
+pub fn address_word(a: &[u8; 20]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(a);
+    out
+}
+
+impl AdvanceOrder {
+    /// The six static words of the tuple, in ABI order.
+    pub fn words(&self) -> [[u8; 32]; 6] {
+        [self.jetsam_tx_id, address_word(&self.recipient), w(self.amount), w(u64::from(self.fee_bps)), address_word(&self.refund_to), self.evidence]
+    }
+}
+
+/// `advance(order, seenCheckpoint)`.
+pub fn advance(o: &AdvanceOrder, seen: &[u8; 32]) -> Vec<u8> {
+    encode_call(&format!("advance({ADVANCE_ORDER_TUPLE},bytes32)"), &[Arg::Words(o.words().to_vec()), Arg::Words(vec![*seen])])
+}
+
+/// `advanceBatch(orders, seenCheckpoint)`: a dynamic array of static tuples, then the checkpoint.
+pub fn advance_batch(orders: &[AdvanceOrder], seen: &[u8; 32]) -> Vec<u8> {
+    let mut out = selector(&format!("advanceBatch({ADVANCE_ORDER_TUPLE}[],bytes32)")).to_vec();
+    out.extend_from_slice(&w(64));
+    out.extend_from_slice(seen);
+    out.extend_from_slice(&w(orders.len() as u64));
+    for o in orders {
+        for word in o.words() {
+            out.extend_from_slice(&word);
+        }
+    }
+    out
+}
+
 /// An Ethereum JSON-RPC endpoint (the local L1).
 pub struct L1 {
     pub url: String,

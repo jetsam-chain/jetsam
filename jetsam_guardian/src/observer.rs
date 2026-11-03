@@ -249,6 +249,21 @@ impl Observer {
         &self.chain
     }
 
+    /// `(time, depth)` of the reorganizations seen (kept twice `reorg_window`; `jg-fill`'s guard).
+    pub fn reorgs(&self) -> &[(u64, u64)] {
+        &self.reorgs
+    }
+
+    /// When the tip last changed, on this program's clock.
+    pub fn tip_changed_at(&self) -> u64 {
+        self.tip_changed_at
+    }
+
+    /// The facts of the last poll (health, branches, …).
+    pub fn facts(&self) -> &Facts {
+        &self.facts
+    }
+
     /// One poll of the node at `now`.
     pub fn poll(&mut self, now: u64, node: &mut dyn NodeSource) -> anyhow::Result<()> {
         let old_tip = self.chain.tip_height();

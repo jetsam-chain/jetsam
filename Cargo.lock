@@ -3089,6 +3089,7 @@ dependencies = [
  "hkdf 0.12.4",
  "jetsam_chain",
  "jetsam_poseidon2b",
+ "jetsam_tx",
  "libc",
  "serde",
  "serde_json",

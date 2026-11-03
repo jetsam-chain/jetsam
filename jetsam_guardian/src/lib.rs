@@ -33,6 +33,7 @@ pub mod chain;
 pub mod checkpoint;
 pub mod config;
 pub mod feed;
+pub mod fill;
 pub mod ipc;
 pub mod journal;
 pub mod l1;

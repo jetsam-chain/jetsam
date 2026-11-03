@@ -105,6 +105,94 @@ pub fn plan(points: &[Point], live: &[Live], final_locked: u64, now: u64, l1_now
     Plan { drop, propose }
 }
 
+// ---------------------------------------------------------------- D-AV3: the checkpoint cadence
+
+/// The contract's MN-3 window (`W_STALL`, `JetsamBridge.sol`): no submission seen in it, or less than 35 %
+/// of the work its tip's target produces in it, and `stalled()` is true.
+pub const W_STALL: u64 = 7_200;
+/// Kept below `W_STALL` for the proof and the L1 inclusion of a point: a point is accepted at most
+/// `cadence + delay` after the previous one, which stays below `W_STALL` while the delay stays below this.
+pub const CADENCE_MARGIN_SECS: u64 = 600;
+/// D-AV3 (user, 03/11): one point every ≈ 1 h 50 (≈ 13 a day).
+pub const DEFAULT_CHECKPOINT_CADENCE: u64 = W_STALL - CADENCE_MARGIN_SECS;
+
+/// A cadence is positive and never above `W_STALL − CADENCE_MARGIN_SECS`.
+pub fn check_cadence(cadence: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cadence > 0 && cadence <= W_STALL - CADENCE_MARGIN_SECS,
+        "checkpoint cadence {cadence} s outside 1..={} (W_STALL {W_STALL} − margin {CADENCE_MARGIN_SECS}): above it, \
+         stalled() would be true between two points (D-AV3)",
+        W_STALL - CADENCE_MARGIN_SECS
+    );
+    Ok(())
+}
+
+/// A new point is due at L1 time `l1_now` when `cadence` has elapsed since the last accepted one (its
+/// `acceptedAt`), or when there is none yet after the genesis.
+pub fn checkpoint_due(last_accepted: Option<u64>, l1_now: u64, cadence: u64) -> bool {
+    last_accepted.is_none_or(|t| l1_now >= t + cadence)
+}
+
+/// The contract's `stalled()` (MN-3), line for line: the samples `(acceptedAt, cumWork)` of the genesis
+/// and of every submission in a ring of 64, `tipBlockWork` of the last submission (0 before the first).
+/// `stalled(now) := now ≥ genesisAt + W_STALL ∧ (tipCumWork − W(now − W_STALL)) × 180 × 100 < 35 ×
+/// tipBlockWork × W_STALL`, `W(t)` the most recent sample at or before `t`, else the oldest kept.
+#[derive(Clone, Debug)]
+pub struct StallModel {
+    genesis_at: u64,
+    tip_cum_work: [u8; 32],
+    tip_block_work: [u8; 32],
+    ring: Vec<(u64, [u8; 32])>,
+    pushes: u64,
+}
+
+/// The contract's ring of MN-3 samples.
+pub const STALL_SAMPLES: u64 = 64;
+
+impl StallModel {
+    /// After `initGenesis` at `t` with the genesis's `cum_work` (u256 little-endian, like the whole model).
+    pub fn genesis(t: u64, cum_work: [u8; 32]) -> Self {
+        let mut m = Self { genesis_at: t, tip_cum_work: cum_work, tip_block_work: [0u8; 32], ring: vec![(0, [0u8; 32]); STALL_SAMPLES as usize], pushes: 0 };
+        m.push(t, cum_work);
+        m
+    }
+
+    /// A `submitCheckpoint` accepted at `t`.
+    pub fn submit(&mut self, t: u64, cum_work: [u8; 32], tip_block_work: [u8; 32]) {
+        self.tip_cum_work = cum_work;
+        self.tip_block_work = tip_block_work;
+        self.push(t, cum_work);
+    }
+
+    fn push(&mut self, t: u64, cum_work: [u8; 32]) {
+        self.ring[(self.pushes % STALL_SAMPLES) as usize] = (t, cum_work);
+        self.pushes += 1;
+    }
+
+    fn work_at(&self, t: u64) -> [u8; 32] {
+        let end = self.pushes;
+        let first = end.saturating_sub(STALL_SAMPLES);
+        let (mut lo, mut hi) = (first, end);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.ring[(mid % STALL_SAMPLES) as usize].0 <= t {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.ring[((if lo == first { first } else { lo - 1 }) % STALL_SAMPLES) as usize].1
+    }
+
+    pub fn stalled(&self, now: u64) -> bool {
+        if now < self.genesis_at + W_STALL {
+            return false;
+        }
+        let produced = crate::u256::sub(&self.tip_cum_work, &self.work_at(now - W_STALL));
+        !crate::u256::mul_ge(&produced, 180 * 100, &self.tip_block_work, 35 * W_STALL)
+    }
+}
+
 #[cfg(test)]
 #[path = "relay_tests.rs"]
 mod tests;

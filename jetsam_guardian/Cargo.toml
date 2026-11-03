@@ -6,6 +6,11 @@ license = "Apache-2.0"
 description = "Jetsam v1.7 guardian software (T5.1-T5.6): observer, signer, network side, aggregator, ceremony and keys."
 publish = false
 
+[features]
+# `jg-fill` reads the network's blocks with the build's v1.7 clock (`Block::from_bytes`,
+# `VaultRules::current`): its private-rehearsal build is made with this profile, like the nodes'.
+rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7"]
+
 [dependencies]
 jetsam_chain = { path = "../jetsam_chain" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
@@ -28,3 +33,4 @@ bech32 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+jetsam_tx = { path = "../jetsam_tx" }

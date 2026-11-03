@@ -37,11 +37,32 @@ impl FeedKey {
 
 /// One signed line for `body` (it must carry `"g": index`).
 pub fn sign_line(key: &FeedKey, body: &serde_json::Value) -> String {
+    sign_line_in(key, FEED_DOMAIN, body)
+}
+
+/// A line of the same form signed under another `domain` (the decision journal
+/// of `jg-fill`: never mistaken for a guardian feed line).
+pub fn sign_line_in(key: &FeedKey, domain: &[u8], body: &serde_json::Value) -> String {
     let text = serde_json::to_string(body).expect("json");
-    let mut msg = FEED_DOMAIN.to_vec();
+    let mut msg = domain.to_vec();
     msg.extend_from_slice(text.as_bytes());
     let sig = key.0.sign(&msg);
     serde_json::json!({"body": text, "sig": hex::encode(sig.to_bytes())}).to_string()
+}
+
+/// Check a line of [`sign_line_in`] under `domain` against `public`; its body.
+pub fn verify_line_in(line: &str, domain: &[u8], public: &[u8; 32]) -> anyhow::Result<serde_json::Value> {
+    let outer: serde_json::Value = serde_json::from_str(line)?;
+    let text = outer["body"].as_str().ok_or_else(|| anyhow::anyhow!("line without body"))?;
+    let sig: [u8; 64] = hex::decode(outer["sig"].as_str().unwrap_or_default())?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signature: 64 bytes"))?;
+    let vk = VerifyingKey::from_bytes(public)?;
+    let mut msg = domain.to_vec();
+    msg.extend_from_slice(text.as_bytes());
+    vk.verify(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
+        .map_err(|_| anyhow::anyhow!("bad signature"))?;
+    Ok(serde_json::from_str(text)?)
 }
 
 /// Check a line against the feed keys `keys` (index → public key): the index

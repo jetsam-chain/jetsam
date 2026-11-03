@@ -207,3 +207,173 @@ fn relay_plan_finalizes_at_the_sg4_floor_with_fast_blocks_and_after_an_outage() 
     let (l, t) = finals[0];
     assert!(t >= seen[l as usize] + LAG + 1_200 && t - seen[l as usize + 8] >= 1_200 - 8 * 30);
 }
+
+// ---------------------------------------------------------------- D-AV3: the checkpoint cadence and MN-3
+
+#[test]
+fn the_cadence_is_one_point_every_6600_s_by_default_never_above_w_stall_minus_the_margin() {
+    assert_eq!(DEFAULT_CHECKPOINT_CADENCE, 6_600);
+    assert_eq!(W_STALL, 7_200, "the contract's W_STALL (JetsamBridge.sol)");
+    assert_eq!(DEFAULT_CHECKPOINT_CADENCE, W_STALL - CADENCE_MARGIN_SECS);
+    assert!(check_cadence(DEFAULT_CHECKPOINT_CADENCE).is_ok());
+    assert!(check_cadence(600).is_ok(), "more often is allowed");
+    assert!(check_cadence(W_STALL - CADENCE_MARGIN_SECS + 1).is_err());
+    assert!(check_cadence(W_STALL).is_err());
+    assert!(check_cadence(0).is_err());
+}
+
+#[test]
+fn a_checkpoint_is_due_once_the_cadence_has_elapsed_since_the_last_accepted_one() {
+    assert!(checkpoint_due(None, 1_000, 6_600), "the first point after the genesis");
+    assert!(!checkpoint_due(Some(1_000), 7_599, 6_600));
+    assert!(checkpoint_due(Some(1_000), 7_600, 6_600));
+}
+
+const GEN: u64 = 1_800_000_000;
+
+fn w(n: u64) -> [u8; 32] {
+    crate::u256::from_u64(n)
+}
+
+#[test]
+fn the_stall_model_is_the_contracts_rule() {
+    // unit block work 1000; 7 200 s = 40 blocks at 180 s; stalled below 35 % of them = 14 blocks
+    let mut m = StallModel::genesis(GEN, w(1_000_000));
+    assert!(!m.stalled(GEN + 100_000), "no submission yet: tipBlockWork is 0, never stalled");
+    m.submit(GEN + 100, w(1_000_000 + 14_000), w(1_000));
+    assert!(!m.stalled(GEN + 7_199), "never within W_STALL of the genesis");
+    // at GEN + 7 200: W(GEN) = 1 000 000 (genesis sample), produced 14 000 = 14 blocks: not < 14
+    assert!(!m.stalled(GEN + 7_200));
+    // at GEN + 7 300: the sample at or before GEN + 100 is the submission: produced 0
+    assert!(m.stalled(GEN + 7_300));
+    let mut m = StallModel::genesis(GEN, w(1_000_000));
+    m.submit(GEN + 100, w(1_000_000 + 13_999), w(1_000));
+    assert!(m.stalled(GEN + 7_200), "13.999 blocks of work in 2 h: stalled");
+    // more than 64 samples: the oldest kept one stands for older times (stall declared earlier)
+    // (tipBlockWork 5 000: stalled below 70 000 produced)
+    let mut m = StallModel::genesis(GEN, w(0));
+    for i in 1..=100u64 {
+        m.submit(GEN + 10 * i, w(1_000 * i), w(5_000));
+    }
+    // the ring keeps submissions 37..=100 (GEN + 370 ..): at GEN + 7 569, no kept sample is at or before
+    // GEN + 369, the oldest kept (37 000) stands for it: produced 63 000 < 70 000 (with the genesis
+    // sample it would be 100 000)
+    assert!(m.stalled(GEN + 7_569));
+    // at GEN + 8 199: the sample at or before GEN + 999 is submission 99: produced 1 000
+    assert!(m.stalled(GEN + 8_199));
+    // at GEN + 7 570: the sample of GEN + 370 itself (37 000): the same 63 000
+    assert!(m.stalled(GEN + 7_570));
+    // the same submissions, other tip block works: 63 000 produced at GEN + 7 569 is not a stall at 4 000
+    // (threshold 56 000; the ring index must not wrap to the newest sample), and is one at 4 540 (threshold
+    // 63 560; a ring of more than 64 would keep submission 36 and see 64 000)
+    for (tbw, stalled) in [(4_000u64, false), (4_540, true)] {
+        let mut m = StallModel::genesis(GEN, w(0));
+        for i in 1..=100u64 {
+            m.submit(GEN + 10 * i, w(1_000 * i), w(tbw));
+        }
+        assert_eq!(m.stalled(GEN + 7_569), stalled, "tipBlockWork {tbw}");
+    }
+    // within W_STALL of the genesis, never stalled, even with 1 block of work in that time
+    let mut m = StallModel::genesis(GEN, w(1_000_000));
+    m.submit(GEN + 100, w(1_000_000 + 1_000), w(1_000));
+    assert!(!m.stalled(GEN + 7_000));
+}
+
+/// The relayer of the simulation: a point when due (cadence after the last accepted one), included after
+/// `delay` (poll, proof, L1 inclusion) and carrying the chain's work at its proof start.
+fn simulate_cadence(cadence: u64, blocks: &[u64], delays: &mut dyn FnMut() -> (u64, u64), until: u64, step: u64) -> (u64, u64) {
+    const UNIT: u64 = 1_000;
+    let work_at = |t: u64| -> u64 { 1_000_000 + UNIT * blocks.partition_point(|b| *b <= t) as u64 };
+    let mut m = StallModel::genesis(GEN, w(work_at(GEN)));
+    let mut last = GEN;
+    let mut next_due = GEN + cadence;
+    let (mut stalled, mut samples) = (0u64, 0u64);
+    let (mut d, mut proof) = delays();
+    let mut t = GEN;
+    while t <= until {
+        if t >= next_due + d {
+            // the point lands at t; its proof started `proof` seconds before
+            m.submit(t, w(work_at(t - proof)), w(UNIT));
+            last = t;
+            next_due = last + cadence;
+            (d, proof) = delays();
+        }
+        if m.stalled(t) {
+            stalled += 1;
+        }
+        samples += 1;
+        t += step;
+    }
+    let _ = last;
+    (stalled, samples)
+}
+
+/// xorshift64*: a fixed, reproducible stream.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Exponential block intervals of mean 180 s (a steady hashrate, the target at equilibrium).
+fn poisson_blocks(seed: u64, until: u64) -> Vec<u64> {
+    let mut r = Rng(seed);
+    let mut t = GEN as f64;
+    let mut out = Vec::new();
+    while (t as u64) < until {
+        t += -180.0 * (1.0 - r.unit()).ln();
+        out.push(t as u64);
+    }
+    out
+}
+
+/// D-AV3: with one point every 6 600 s (≈ 1 h 50) and any delay below the 600 s margin, `stalled()` is
+/// never true in a normal regime — blocks of 180 s on average, here 30 days of exponential intervals over
+/// 8 seeds and also blocks every 180 s exactly — sampled every 60 s.
+#[test]
+fn stalled_is_never_true_in_a_normal_regime_at_the_default_cadence() {
+    let until = GEN + 30 * 86_400;
+    let exact: Vec<u64> = (1..=(30 * 86_400 / 180)).map(|i| GEN + 180 * i).collect();
+    let mut worst = || (CADENCE_MARGIN_SECS - 1, CADENCE_MARGIN_SECS - 1);
+    let (s, n) = simulate_cadence(DEFAULT_CHECKPOINT_CADENCE, &exact, &mut worst, until, 60);
+    assert_eq!((s, n), (0, 30 * 86_400 / 60 + 1), "exact blocks, the longest delay of the margin");
+    for seed in 1..=8u64 {
+        let blocks = poisson_blocks(seed, until);
+        let mut r = Rng(seed * 7_919);
+        let mut delays = || {
+            let d = r.next() % CADENCE_MARGIN_SECS;
+            (d, r.next() % (d + 1))
+        };
+        let (s, _) = simulate_cadence(DEFAULT_CHECKPOINT_CADENCE, &blocks, &mut delays, until, 60);
+        assert_eq!(s, 0, "seed {seed}: stalled() true on {s} samples");
+    }
+}
+
+/// The model gives the contract's measured figures (`ADVANCER_INTERFACE.md` §11.1): one point every 6 h ⇒
+/// stalled 192 / 288 samples of a day (66.7 %); every 2 h without any delay ⇒ 0 / 288; and a point every
+/// W_STALL with any delay stalls: the margin is needed. The same four scenarios run on the real contract
+/// (forge) give the same counts.
+#[test]
+fn the_stall_model_reproduces_the_contracts_measures() {
+    let until = GEN + 3 * 86_400;
+    let exact: Vec<u64> = (1..=(3 * 86_400 / 180)).map(|i| GEN + 180 * i).collect();
+    let day = |cadence: u64, delay: u64| {
+        let mut d = || (delay, 0);
+        let all = simulate_cadence(cadence, &exact, &mut d, GEN + 2 * 86_400 - 300, 300);
+        let first = simulate_cadence(cadence, &exact, &mut d, GEN + 86_400 - 300, 300);
+        (all.0 - first.0, all.1 - first.1)
+    };
+    assert_eq!(day(21_600, 0), (192, 288));
+    assert_eq!(day(7_200, 0), (0, 288));
+    // the same scenario on the real contract (forge, scratch copy of v3-advance, JGFILL report): 12 / 288
+    assert_eq!(day(7_200, 60), (12, 288), "a point every W_STALL with 60 s of delay stalls");
+    assert_eq!(day(DEFAULT_CHECKPOINT_CADENCE, CADENCE_MARGIN_SECS - 1), (0, 288));
+    let _ = until;
+}

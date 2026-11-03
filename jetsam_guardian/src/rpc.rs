@@ -35,6 +35,23 @@ pub const OBSERVER_ALLOWLIST: &[&str] = &[
     "getVaultState",
 ];
 
+/// The node methods `jg-fill` may call: the observer's, and the raw block (its deposits are read with
+/// the node's own rule from the bytes, checked against the header).
+pub const FILL_ALLOWLIST: &[&str] = &[
+    "blockCount",
+    "getChainInfo",
+    "getBlockHash",
+    "getHeaderByHeight",
+    "getBlockHeader",
+    "getNodeStatus",
+    "getPeerVersions",
+    "getPeerCount",
+    "getObservedBranches",
+    "getGuardianState",
+    "getVaultState",
+    "getBlock",
+];
+
 /// Tor's default SOCKS port.
 pub const DEFAULT_TOR_SOCKS: &str = "127.0.0.1:9050";
 
@@ -312,6 +329,19 @@ pub struct NodeClient {
 impl NodeClient {
     pub fn observer(url: &str, egress: Egress) -> Self {
         Self { url: url.to_string(), allow: OBSERVER_ALLOWLIST, timeout: Duration::from_secs(30), egress }
+    }
+
+    /// The client of `jg-fill`'s nodes ([`FILL_ALLOWLIST`]).
+    pub fn fill(url: &str, egress: Egress) -> Self {
+        Self { url: url.to_string(), allow: FILL_ALLOWLIST, timeout: Duration::from_secs(30), egress }
+    }
+
+    /// `getBlock(height)`: the block's bytes, `None` once its body is pruned.
+    pub fn raw_block(&self, height: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.call("getBlock", json!([height]))?.as_str() {
+            Some(text) => Ok(Some(hex::decode(text.trim_start_matches("0x"))?)),
+            None => Ok(None),
+        }
     }
 
     /// `jetsam_<method>`, refused unless allow-listed.
