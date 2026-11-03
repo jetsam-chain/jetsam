@@ -96,7 +96,9 @@ pub enum DestinationMarkerKind {
 /// The v1.7 marker an owner carries, if any (only meaningful from the v1.7 height on; below it these
 /// are ordinary owners).
 pub fn destination_marker_kind(owner: &[u8; 32]) -> Option<DestinationMarkerKind> {
-    let tag = [owner[0], owner[1], owner[2], owner[3], owner[4], owner[5], owner[6], owner[7]];
+    let tag = [
+        owner[0], owner[1], owner[2], owner[3], owner[4], owner[5], owner[6], owner[7],
+    ];
     match tag {
         BRIDGE_DEPOSIT_MARKER_TAG => Some(DestinationMarkerKind::Deposit),
         VAULT_RELEASE_MARKER_TAG => Some(DestinationMarkerKind::Release),
@@ -297,13 +299,16 @@ pub fn classify_group(
         }
     }
     if *input_owner == rule.vault {
-        // A release: owner, its marker, optional change to the vault; nothing else.
+        // A release: owner, its marker, optional change to the vault; nothing else. (Every marker
+        // here carries no value: checked above.)
         let shape_ok = match outputs {
-            [(payee, _), (marker, 0)] | [(payee, _), (marker, 0), (_, _)] => {
+            [(payee, _), (marker, _)] | [(payee, _), (marker, _), (_, _)] => {
                 destination_marker_kind(marker) == Some(DestinationMarkerKind::Release)
                     && *payee != rule.vault
                     && destination_marker_kind(payee).is_none()
-                    && outputs.get(2).is_none_or(|(change, _)| *change == rule.vault)
+                    && outputs
+                        .get(2)
+                        .is_none_or(|(change, _)| *change == rule.vault)
             }
             _ => false,
         };

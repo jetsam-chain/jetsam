@@ -19,11 +19,14 @@ use jetsam_chain::block_header::BlockHeader;
 use jetsam_chain::consensus::destination::DestinationSection;
 use jetsam_chain::consensus::params::GENESIS_TARGET;
 use jetsam_chain::consensus::vault::{
-    deposit_marker, validate_block_vault, ReleasedSet, VaultContext, VaultError, VaultRelease, VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG,
-    RELEASE_FEE_MICRO, VAULT_ADDRESS,
+    deposit_marker, validate_block_vault, ReleasedSet, VaultContext, VaultError, VaultRelease,
+    VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG, RELEASE_FEE_MICRO, VAULT_ADDRESS,
 };
 use jetsam_poseidon2b::primitives::Address;
-use jetsam_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TxPage, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS};
+use jetsam_tx::{
+    output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TxPage, PAGED_SPEND_END_BIT,
+    PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+};
 use std::collections::BTreeMap;
 
 const J: u64 = 69_120;
@@ -35,7 +38,12 @@ const FEE: u64 = 47_200;
 const PAYER: Address = Address([0x51; 32]);
 
 fn node_rules() -> VaultRules {
-    VaultRules { activation_height: Some(J), deposits_from_height: Some(F), outstanding_ceil: u64::MAX, ..VaultRules::current() }
+    VaultRules {
+        activation_height: Some(J),
+        deposits_from_height: Some(F),
+        outstanding_ceil: u64::MAX,
+        ..VaultRules::current()
+    }
 }
 
 fn program_rule() -> DepositRule {
@@ -64,7 +72,11 @@ fn system_record(owners: &[Address]) -> Transaction {
     let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     let mut bitmap = 0u16;
     for (i, owner) in owners.iter().enumerate() {
-        outputs[i] = TxOutput { slot_index: 15_000_000 + i as u32, amount: 17, owner: *owner };
+        outputs[i] = TxOutput {
+            slot_index: 15_000_000 + i as u32,
+            amount: 17,
+            owner: *owner,
+        };
         bitmap |= output_bitmap_bit(i);
     }
     Transaction::new(TxBody {
@@ -81,18 +93,34 @@ fn system_record(owners: &[Address]) -> Transaction {
 /// One logical transaction from `owner`: one input covering the outputs and the fee, two outputs a page.
 fn logical(slot_base: u32, owner: Address, outputs: &[(Address, u64)]) -> Vec<Transaction> {
     let pages = outputs.len().div_ceil(TX_OUTPUTS).max(1);
-    let input_amount = outputs.iter().map(|(_, a)| a).fold(FEE, |s, a| s.saturating_add(*a));
+    let input_amount = outputs
+        .iter()
+        .map(|(_, a)| a)
+        .fold(FEE, |s, a| s.saturating_add(*a));
     (0..pages)
         .map(|page| {
             let mut inputs = [TxInput::dummy(); TX_INPUTS];
             let mut bitmap = 0u16;
             if page == 0 {
-                inputs[0] = TxInput { slot_index: slot_base, amount: input_amount, creation_id: 1 };
+                inputs[0] = TxInput {
+                    slot_index: slot_base,
+                    amount: input_amount,
+                    creation_id: 1,
+                };
                 bitmap |= 1 | PAGED_SPEND_START_BIT;
             }
             let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
-            for (slot, (o, a)) in outputs.iter().skip(page * TX_OUTPUTS).take(TX_OUTPUTS).enumerate() {
-                page_outputs[slot] = TxOutput { slot_index: slot_base + 1 + (page * TX_OUTPUTS + slot) as u32, amount: *a, owner: *o };
+            for (slot, (o, a)) in outputs
+                .iter()
+                .skip(page * TX_OUTPUTS)
+                .take(TX_OUTPUTS)
+                .enumerate()
+            {
+                page_outputs[slot] = TxOutput {
+                    slot_index: slot_base + 1 + (page * TX_OUTPUTS + slot) as u32,
+                    amount: *a,
+                    owner: *o,
+                };
                 bitmap |= output_bitmap_bit(slot);
             }
             if page + 1 == pages {
@@ -119,12 +147,21 @@ struct Group {
 }
 
 fn build(height: u64, system: &[Vec<Address>], groups: &[Group]) -> Block {
-    let mut transactions: Vec<Transaction> = system.iter().map(|owners| system_record(owners)).collect();
+    let mut transactions: Vec<Transaction> =
+        system.iter().map(|owners| system_record(owners)).collect();
     for (i, g) in groups.iter().enumerate() {
         transactions.extend(logical(100 + 40 * i as u32, g.owner, &g.outputs));
     }
-    let objects: Vec<_> = groups.iter().filter_map(|g| g.release.as_ref().map(VaultRelease::object)).collect();
-    Block { header: header(height, compute_tx_root(&transactions)), transactions, client_objects: Vec::new(), destination: Some(DestinationSection { objects }) }
+    let objects: Vec<_> = groups
+        .iter()
+        .filter_map(|g| g.release.as_ref().map(VaultRelease::object))
+        .collect();
+    Block {
+        header: header(height, compute_tx_root(&transactions)),
+        transactions,
+        client_objects: Vec::new(),
+        destination: Some(DestinationSection { objects }),
+    }
 }
 
 /// The node's decision, in the program's terms: `Ok((group, txid, recipient, amount))` or the error's Debug.
@@ -138,17 +175,39 @@ fn node(block: &Block) -> Result<Vec<(u32, [u8; 32], [u8; 20], u64)>, String> {
         .flat_map(|t| t.body.live_inputs().map(|(_, i)| i.amount))
         .sum();
     let released = ReleasedSet::new();
-    let ctx = VaultContext { released: &released, released_in_window: 0, bridge_locked: taken, bridge_vault_floor: 0 };
+    let ctx = VaultContext {
+        released: &released,
+        released_in_window: 0,
+        bridge_locked: taken,
+        bridge_vault_floor: 0,
+    };
     match validate_block_vault(block, &ctx, &rules, &mut |_| Ok(())) {
         Ok(effect) if effect.deposits.is_empty() => Ok(Vec::new()),
         Ok(effect) => {
             // the node's leaf of each deposit's group
             let stream = validate_block_page_stream(&block.transactions).unwrap();
-            Ok(effect.deposits.iter().map(|d| (d.group as u32, stream.groups[d.group].spend.logical_txid.0, d.recipient, d.amount)).collect())
+            Ok(effect
+                .deposits
+                .iter()
+                .map(|d| {
+                    (
+                        d.group as u32,
+                        stream.groups[d.group].spend.logical_txid.0,
+                        d.recipient,
+                        d.amount,
+                    )
+                })
+                .collect())
         }
         Err(e) => {
             assert!(
-                e.condemns_block() && !matches!(e, VaultError::VaultCeilingReached { .. } | VaultError::TooManyReleases { .. } | VaultError::ReleaseAlreadyPaid { .. }),
+                e.condemns_block()
+                    && !matches!(
+                        e,
+                        VaultError::VaultCeilingReached { .. }
+                            | VaultError::TooManyReleases { .. }
+                            | VaultError::ReleaseAlreadyPaid { .. }
+                    ),
                 "a refusal out of V4's reach: the generator is wrong: {e:?}"
             );
             Err(format!("{e:?}"))
@@ -161,11 +220,30 @@ fn program(block: &Block) -> Result<Vec<(u32, [u8; 32], [u8; 20], u64)>, String>
     let pages: Vec<Vec<u8>> = block
         .transactions
         .iter()
-        .map(|t| if t.body.is_coinbase { t.body.to_bytes().to_vec() } else { TxPage { body: t.body.clone() }.to_bytes().unwrap().to_vec() })
+        .map(|t| {
+            if t.body.is_coinbase {
+                t.body.to_bytes().to_vec()
+            } else {
+                TxPage {
+                    body: t.body.clone(),
+                }
+                .to_bytes()
+                .unwrap()
+                .to_vec()
+            }
+        })
         .collect();
     let refs: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
-    match try_block_deposits(block.header.height, &block.header.tx_root, &refs, &program_rule()) {
-        Ok(d) => Ok(d.iter().map(|d| (d.group, d.txid, d.recipient, d.amount)).collect()),
+    match try_block_deposits(
+        block.header.height,
+        &block.header.tx_root,
+        &refs,
+        &program_rule(),
+    ) {
+        Ok(d) => Ok(d
+            .iter()
+            .map(|d| (d.group, d.txid, d.recipient, d.amount))
+            .collect()),
         Err(BlockError::Rule(r)) => Err(format!("{r:?}")),
         Err(other) => panic!("the program does not read a canonical block: {other:?}"),
     }
@@ -192,7 +270,12 @@ fn tagged(tag: [u8; 8], fill: u8) -> Address {
 }
 
 fn release_of(n: u64, owner: u8, amount: u64) -> VaultRelease {
-    VaultRelease { n, owner: Address([owner; 32]), amount, storage_proof: vec![vec![0xee; 40]] }
+    VaultRelease {
+        n,
+        owner: Address([owner; 32]),
+        amount,
+        storage_proof: vec![vec![0xee; 40]],
+    }
 }
 
 /// The alphabet of the exhaustive test: one output of each kind V4 tells apart.
@@ -222,10 +305,16 @@ fn alphabet() -> Vec<(&'static str, (Address, u64))> {
 #[test]
 fn the_programs_clock_and_constants_are_the_nodes() {
     use jetsam_bridge_program::deposit::{DEPOSIT_RULE, V1_7_ACTIVATION_HEIGHT};
-    assert_eq!(V1_7_ACTIVATION_HEIGHT, jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT);
+    assert_eq!(
+        V1_7_ACTIVATION_HEIGHT,
+        jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT
+    );
     assert_eq!(DEPOSIT_RULE, VaultRules::current().deposit_rule());
     assert_eq!(DEPOSIT_RULE.vault, VAULT_ADDRESS.0);
-    assert_eq!(DEPOSIT_RULE.deposits_from_height, VaultRules::current().deposits_from_height);
+    assert_eq!(
+        DEPOSIT_RULE.deposits_from_height,
+        VaultRules::current().deposits_from_height
+    );
 }
 
 /// Every group of up to two outputs from the alphabet (111 sequences; three outputs, 1 111 sequences,
@@ -248,24 +337,47 @@ fn every_short_group_is_decided_as_the_node_does() {
         }
         seqs.extend(next);
     }
-    assert_eq!(seqs.len(), if full { 1 + 10 + 100 + 1_000 } else { 1 + 10 + 100 });
-    let ok_deposit = Group { owner: PAYER, outputs: vec![(VAULT_ADDRESS, 9 * JTM), (deposit_marker(&[0xc3; 20]), 0)], release: None };
+    assert_eq!(
+        seqs.len(),
+        if full {
+            1 + 10 + 100 + 1_000
+        } else {
+            1 + 10 + 100
+        }
+    );
+    let ok_deposit = Group {
+        owner: PAYER,
+        outputs: vec![(VAULT_ADDRESS, 9 * JTM), (deposit_marker(&[0xc3; 20]), 0)],
+        release: None,
+    };
     let mut table: BTreeMap<String, usize> = BTreeMap::new();
     for s in &seqs {
         let outputs: Vec<(Address, u64)> = s.iter().map(|k| alpha[*k].1).collect();
         let name: Vec<&str> = s.iter().map(|k| alpha[*k].0).collect();
         for owner in [PAYER, VAULT_ADDRESS] {
             // the release marker of the alphabet opens release 1 (the node then judges its object: same owner, amount)
-            let release = (owner == VAULT_ADDRESS && s.contains(&8)).then(|| release_of(1, 0xb0, 5 * JTM));
+            let release =
+                (owner == VAULT_ADDRESS && s.contains(&8)).then(|| release_of(1, 0xb0, 5 * JTM));
             for height in [J - 1, F, F + 1] {
                 for after in [false, true] {
                     let mut groups = Vec::new();
                     if after {
-                        groups.push(Group { owner: ok_deposit.owner, outputs: ok_deposit.outputs.clone(), release: None });
+                        groups.push(Group {
+                            owner: ok_deposit.owner,
+                            outputs: ok_deposit.outputs.clone(),
+                            release: None,
+                        });
                     }
-                    groups.push(Group { owner, outputs: outputs.clone(), release: release.clone() });
+                    groups.push(Group {
+                        owner,
+                        outputs: outputs.clone(),
+                        release: release.clone(),
+                    });
                     let block = build(height, &[vec![Address([9u8; 32])]], &groups);
-                    let what = format!("{name:?} from {} at {height}, after a deposit: {after}", if owner == PAYER { "payer" } else { "vault" });
+                    let what = format!(
+                        "{name:?} from {} at {height}, after a deposit: {after}",
+                        if owner == PAYER { "payer" } else { "vault" }
+                    );
                     *table.entry(same(&block, &what)).or_default() += 1;
                 }
             }
@@ -274,7 +386,19 @@ fn every_short_group_is_decided_as_the_node_does() {
     eprintln!("exhaustive: {table:#?}");
     assert_eq!(table.values().sum::<usize>(), seqs.len() * 2 * 3 * 2);
     // every kind of V4's refusal and acceptance was reached
-    for k in ["accepted, 0 deposit(s)", "accepted, 1 deposit(s)", "accepted, 2 deposit(s)", "MarkerCarriesValue", "SpendFromLockedAddress", "ReleaseShape", "ReleaseMarkerOutsideRelease", "VaultOutputOutsideDeposit", "DepositShape", "DepositAmount", "DepositBeforeBridgeOpening"] {
+    for k in [
+        "accepted, 0 deposit(s)",
+        "accepted, 1 deposit(s)",
+        "accepted, 2 deposit(s)",
+        "MarkerCarriesValue",
+        "SpendFromLockedAddress",
+        "ReleaseShape",
+        "ReleaseMarkerOutsideRelease",
+        "VaultOutputOutsideDeposit",
+        "DepositShape",
+        "DepositAmount",
+        "DepositBeforeBridgeOpening",
+    ] {
         assert!(table.contains_key(k), "{k} never reached");
     }
 }
@@ -302,7 +426,20 @@ impl Rng {
 }
 
 fn random_amount(r: &mut Rng) -> u64 {
-    let a = r.pick(&[0, 1, MIN - 1, MIN, MIN + 1, 7 * JTM, 250 * JTM + 1, 600 * JTM, MAX - 1, MAX, MAX + 1, 5_000 * JTM]);
+    let a = r.pick(&[
+        0,
+        1,
+        MIN - 1,
+        MIN,
+        MIN + 1,
+        7 * JTM,
+        250 * JTM + 1,
+        600 * JTM,
+        MAX - 1,
+        MAX,
+        MAX + 1,
+        5_000 * JTM,
+    ]);
     if r.chance(20) {
         MIN + r.below(MAX - MIN + 1)
     } else {
@@ -335,15 +472,29 @@ fn random_group(r: &mut Rng, n: &mut u64) -> Group {
         0 | 1 => {
             let mut outputs: Vec<_> = (0..1 + r.below(3)).map(|_| pay(r)).collect();
             if r.chance(15) {
-                outputs.push((tagged(LIGHT_CLIENT_UPDATE_MARKER_TAG, 3), if r.chance(30) { 1 } else { 0 }));
+                outputs.push((
+                    tagged(LIGHT_CLIENT_UPDATE_MARKER_TAG, 3),
+                    if r.chance(30) { 1 } else { 0 },
+                ));
             }
-            Group { owner: PAYER, outputs, release: None }
+            Group {
+                owner: PAYER,
+                outputs,
+                release: None,
+            }
         }
         // a release, often of the right shape
         2 | 3 => {
             *n += 1;
-            let rel = release_of(*n, 0xb0 + r.below(4) as u8, RELEASE_FEE_MICRO + r.below(50 * JTM));
-            let mut outputs = vec![(rel.owner, rel.amount - RELEASE_FEE_MICRO), (rel.marker(), 0)];
+            let rel = release_of(
+                *n,
+                0xb0 + r.below(4) as u8,
+                RELEASE_FEE_MICRO + r.below(50 * JTM),
+            );
+            let mut outputs = vec![
+                (rel.owner, rel.amount - RELEASE_FEE_MICRO),
+                (rel.marker(), 0),
+            ];
             if r.chance(60) {
                 outputs.push((VAULT_ADDRESS, r.below(JTM)));
             }
@@ -362,7 +513,11 @@ fn random_group(r: &mut Rng, n: &mut u64) -> Group {
                 7 => outputs.push(pay(r)),
                 _ => {}
             }
-            Group { owner: VAULT_ADDRESS, outputs, release }
+            Group {
+                owner: VAULT_ADDRESS,
+                outputs,
+                release,
+            }
         }
         // a deposit, often of the right shape
         _ => {
@@ -388,7 +543,11 @@ fn random_group(r: &mut Rng, n: &mut u64) -> Group {
                 _ => {}
             }
             let owner = if r.chance(5) { VAULT_ADDRESS } else { PAYER };
-            Group { owner, outputs, release: None }
+            Group {
+                owner,
+                outputs,
+                release: None,
+            }
         }
     }
 }
@@ -398,7 +557,10 @@ fn random_group(r: &mut Rng, n: &mut u64) -> Group {
 /// heights around J and F: the program decides each as the node does.
 #[test]
 fn random_blocks_are_decided_as_the_node_does() {
-    let blocks: u64 = std::env::var("JETSAM_XTEST_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    let blocks: u64 = std::env::var("JETSAM_XTEST_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
     let mut r = Rng(0x6a65_7473_616d_5633);
     let mut table: BTreeMap<String, usize> = BTreeMap::new();
     for i in 0..blocks {
@@ -414,13 +576,24 @@ fn random_blocks_are_decided_as_the_node_does() {
             system.push(vec![odd(&mut r), odd(&mut r)]);
         }
         let mut n = 0u64;
-        let groups: Vec<Group> = (0..r.below(5)).map(|_| random_group(&mut r, &mut n)).collect();
+        let groups: Vec<Group> = (0..r.below(5))
+            .map(|_| random_group(&mut r, &mut n))
+            .collect();
         let block = build(height, &system, &groups);
-        *table.entry(same(&block, &format!("random block {i}"))).or_default() += 1;
+        *table
+            .entry(same(&block, &format!("random block {i}")))
+            .or_default() += 1;
     }
     eprintln!("random ({blocks} blocks): {table:#?}");
     assert_eq!(table.values().sum::<usize>() as u64, blocks);
-    for k in ["accepted, 1 deposit(s)", "VaultOutputInSystemRecord", "MarkerInSystemRecord", "DepositShape", "DepositAmount", "ReleaseShape"] {
+    for k in [
+        "accepted, 1 deposit(s)",
+        "VaultOutputInSystemRecord",
+        "MarkerInSystemRecord",
+        "DepositShape",
+        "DepositAmount",
+        "ReleaseShape",
+    ] {
         assert!(table.contains_key(k), "{k} never reached");
     }
 }
