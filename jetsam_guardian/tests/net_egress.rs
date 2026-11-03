@@ -801,3 +801,123 @@ fn jg_aggregate_rehearsal_clearnet_reaches_its_loopback_l1_and_robot_directly() 
     let log = std::fs::read_to_string(dir.join("agg.log")).unwrap_or_default();
     assert!(both, "log:\n{log}");
 }
+
+// ---------------------------------------------------------------- jg-fill (D72): the advance robot
+
+/// A `fill.toml` under a fresh directory: `network`, L1 chain 31 337 unless said, `nodes`, `l1`, `tail` (tables).
+fn fill_dir(network: &str, chain: u64, nodes: &[String], l1: &str, tail: &str) -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().to_path_buf();
+    let nodes: String = nodes.iter().enumerate().map(|(i, u)| format!("[[nodes]]\nname = \"n{}\"\nrpc = \"{u}\"\n", i + 1)).collect();
+    let text = format!(
+        "network = \"{network}\"\nl1_chain_id = {chain}\nl1_bridge = \"0x{}\"\nv1_7_height = 96\ndeposits_from_height = 128\n\
+         l1_rpc = \"{l1}\"\nhot_address = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n\
+         refund_to = \"0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC\"\nwei_per_jtm = \"1000000000000000\"\nstate_dir = \"{}\"\n\
+         poll_secs = 1\n{nodes}{tail}\n",
+        hex::encode(REHEARSAL_BRIDGE),
+        dir.join("state").display()
+    );
+    std::fs::write(dir.join("fill.toml"), text).unwrap();
+    (root, dir)
+}
+
+const REH_PARAMS: &str = "[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n";
+
+/// A1-1 / D66 for the robot: off Tor or the loopback (the rehearsal: off its bridge) it does not start,
+/// before any socket.
+#[test]
+fn jg_fill_refuses_to_start_off_tor_or_the_loopback_and_dials_nothing() {
+    let (target, socks) = untouchable();
+    let port = target.local_addr().unwrap().port();
+    let socks_cfg = format!("[egress]\ntor_socks = \"127.0.0.1:{}\"\n", socks.local_addr().unwrap().port());
+    let testnet = hex::encode(jetsam_guardian::TESTNET_NETWORK);
+    let mainnet = hex::encode(jetsam_guardian::MAINNET_NETWORK);
+    let lo = |p: u16| format!("http://127.0.0.1:{p}");
+    let cases: Vec<(&str, String, u64, Vec<String>, String, String, Vec<&str>)> = vec![
+        ("clearnet on the public testnet", testnet.clone(), 11_155_111, vec![lo(port), lo(port + 1)], lo(port), format!("{CLEARNET}\n"), vec!["clearnet", "public test network"]),
+        ("clearnet on the mainnet", mainnet.clone(), 1, vec![lo(port), lo(port + 1)], lo(port), format!("{CLEARNET}\n"), vec!["clearnet", "mainnet"]),
+        ("onion mode, a node by name", testnet.clone(), 11_155_111, vec![lo(port), format!("http://localhost:{port}")], lo(port), socks_cfg.clone(), vec!["nodes[1]", "onion-only"]),
+        ("onion mode, the L1 on the bridge", testnet.clone(), 11_155_111, vec![lo(port), lo(port + 1)], format!("http://10.77.0.1:{port}"), socks_cfg.clone(), vec!["l1_rpc", "onion-only"]),
+        ("rehearsal clearnet, a node off the bridge", testnet.clone(), 31_337, vec![lo(port), format!("http://192.168.77.1:{port}")], lo(port), format!("{REH_PARAMS}{CLEARNET}\n"), vec!["nodes[1]", "10.77.0.0/24"]),
+        ("rehearsal clearnet, the L1 by name", testnet.clone(), 31_337, vec![lo(port), lo(port + 1)], format!("http://localhost:{port}"), format!("{REH_PARAMS}{CLEARNET}\n"), vec!["l1_rpc", "10.77.0.0/24"]),
+    ];
+    for (label, network, chain, nodes, l1, tail, want) in cases {
+        let (_root, dir) = fill_dir(&network, chain, &nodes, &l1, &tail);
+        let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+        assert_eq!(code, Some(Some(1)), "{label}: must exit at once; log:\n{log}");
+        assert!(want.iter().all(|w| log.contains(w)) && log.contains("does not start"), "{label}: {log}");
+        untouched(&target, &socks, label);
+    }
+}
+
+/// A fake world behind the SOCKS port: two onion nodes (the testkit genesis only) and an onion L1 (chain
+/// 31 337, a token, the hot key's balance `stock`).
+fn fill_world(stock: u64) -> Answer {
+    let genesis = testkit::genesis();
+    let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
+    let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
+    Arc::new(move |method, params| match method {
+        "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
+        "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
+        "jetsam_blockCount" => json!({"result": 0}),
+        "eth_chainId" => json!({"result": "0x7a69"}),
+        "eth_gasPrice" => json!({"result": "0x3b9aca00"}),
+        "eth_getBlockByNumber" => json!({"result": {"timestamp": "0x6b49d200"}}),
+        "eth_getLogs" => json!({"result": []}),
+        "eth_call" => {
+            let data = params[0]["data"].as_str().unwrap_or_default();
+            if data.starts_with("0xfc0c546a") {
+                json!({"result": token})
+            } else if data.starts_with("0x70a08231") {
+                json!({"result": format!("0x{stock:064x}")})
+            } else {
+                json!({"result": format!("0x{}", "00".repeat(32 * 6))})
+            }
+        }
+        _ => json!({"error": {"code": -32601, "message": "not in this fake"}}),
+    })
+}
+
+/// Through Tor only, by name: its two nodes and its L1; a hot key above `max_stock` refuses the start
+/// (only the capped stock sits on the hot key). This build reads blocks with its own v1.7 clock: a build
+/// of another clock refuses the start as well, before any socket.
+#[test]
+fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_its_cap() {
+    let rehearsal_build = jetsam_chain::consensus::vault::VaultRules::current().activation_height == Some(96);
+    let (n1, n2, c) = (onion('a'), onion('b'), onion('c'));
+    let network = hex::encode(testkit::genesis().id);
+    let nodes = vec![format!("http://{n1}:19801"), format!("http://{n2}:19801")];
+    let cap = 1_200_000_000u64;
+    if !rehearsal_build {
+        let (target, socks) = untouchable();
+        let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{}\"\n", socks.local_addr().unwrap().port());
+        let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+        let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+        assert_eq!(code, Some(Some(1)), "log:\n{log}");
+        assert!(log.contains("v1.7 clock") && log.contains("does not start"), "{log}");
+        untouched(&target, &socks, "another build's clock");
+        return;
+    }
+    // above the cap: no start, and only Tor was dialled
+    let (socks, seen) = fake_tor(fill_world(cap + 1));
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("max_stock") && log.contains("does not start"), "{log}");
+    assert!(seen.lock().unwrap().iter().all(|(atyp, host, ..)| *atyp == 3 && *host == c), "{:?}", seen.lock().unwrap());
+    // at the cap: it starts, reads both nodes and the L1, by name through Tor
+    let (socks, seen) = fake_tor(fill_world(cap));
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let hit = |host: &str, m: &str| seen.lock().unwrap().iter().any(|(a, h, _, x)| *a == 3 && h == host && x == m);
+    let all = wait_for(60, || hit(&n1, "jetsam_blockCount") && hit(&n2, "jetsam_blockCount") && hit(&c, "eth_gasPrice"));
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(all, "{:?}; log:\n{log}", seen.lock().unwrap());
+    assert!(seen.lock().unwrap().iter().all(|(atyp, h, ..)| *atyp == 3 && (*h == n1 || *h == n2 || *h == c)), "every target named, through Tor");
+    let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    assert!(journal.contains("\\\"kind\\\":\\\"start\\\""), "{journal}");
+}
