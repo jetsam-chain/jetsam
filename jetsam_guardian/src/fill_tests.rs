@@ -993,3 +993,27 @@ fn the_published_queue_is_the_fifo_of_the_waiting_deposits() {
     assert_eq!(q[0]["key"].as_str().unwrap(), hex::encode(cands[1].dep.key()));
     assert_eq!(q[0]["amount"].as_u64().unwrap(), 100 * JTM);
 }
+
+/// A journal line is never a guardian feed line (another domain), and a line spliced from another journal of the
+/// same key (a fork after a restore) breaks the chain even with the right number.
+#[test]
+fn journal_lines_are_not_feed_lines_and_a_spliced_line_breaks_the_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = || crate::feed::FeedKey::from_secret([5u8; 32]);
+    let public = key().public();
+    let (a, b) = (dir.path().join("a.jsonl"), dir.path().join("b.jsonl"));
+    let mut ja = DecisionJournal::open(&a, key()).unwrap();
+    ja.append(serde_json::json!({"kind": "start", "t": 1})).unwrap();
+    ja.append(serde_json::json!({"kind": "advance", "t": 2})).unwrap();
+    let mut jb = DecisionJournal::open(&b, key()).unwrap();
+    jb.append(serde_json::json!({"kind": "start", "t": 9})).unwrap();
+    jb.append(serde_json::json!({"kind": "refuse", "t": 10})).unwrap();
+    let la: Vec<String> = std::fs::read_to_string(&a).unwrap().lines().map(String::from).collect();
+    let lb: Vec<String> = std::fs::read_to_string(&b).unwrap().lines().map(String::from).collect();
+    std::fs::write(&a, format!("{}\n{}\n", la[0], lb[1])).unwrap();
+    assert!(DecisionJournal::verify(&a, &public).unwrap_err().to_string().contains("chain"), "line 2 of another journal");
+    // a body signed as a guardian feed line by the same key
+    let feed = crate::feed::sign_line(&key(), &serde_json::json!({"kind": "start", "n": 1, "prev": hex::encode([0u8; 32])}));
+    std::fs::write(&a, format!("{feed}\n")).unwrap();
+    assert!(DecisionJournal::verify(&a, &public).is_err());
+}

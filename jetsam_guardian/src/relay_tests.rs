@@ -263,6 +263,20 @@ fn the_stall_model_is_the_contracts_rule() {
     assert!(m.stalled(GEN + 8_199));
     // at GEN + 7 570: the sample of GEN + 370 itself (37 000): the same 63 000
     assert!(m.stalled(GEN + 7_570));
+    // the same submissions, other tip block works: 63 000 produced at GEN + 7 569 is not a stall at 4 000
+    // (threshold 56 000; the ring index must not wrap to the newest sample), and is one at 4 540 (threshold
+    // 63 560; a ring of more than 64 would keep submission 36 and see 64 000)
+    for (tbw, stalled) in [(4_000u64, false), (4_540, true)] {
+        let mut m = StallModel::genesis(GEN, w(0));
+        for i in 1..=100u64 {
+            m.submit(GEN + 10 * i, w(1_000 * i), w(tbw));
+        }
+        assert_eq!(m.stalled(GEN + 7_569), stalled, "tipBlockWork {tbw}");
+    }
+    // within W_STALL of the genesis, never stalled, even with 1 block of work in that time
+    let mut m = StallModel::genesis(GEN, w(1_000_000));
+    m.submit(GEN + 100, w(1_000_000 + 1_000), w(1_000));
+    assert!(!m.stalled(GEN + 7_000));
 }
 
 /// The relayer of the simulation: a point when due (cadence after the last accepted one), included after
