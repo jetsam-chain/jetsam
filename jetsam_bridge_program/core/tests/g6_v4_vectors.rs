@@ -192,3 +192,72 @@ fn more_than_256_leaves_prove_nothing() {
     refs.pop();
     assert_eq!(try_block_deposits(c.height, &c.tx_root, &refs, &c.rule), Err(BlockError::TxRoot));
 }
+
+/// What the program reads of a body is the node's canonical stream (a primary coinbase, the optional
+/// two-output development payout, START..END groups of one input owner, no coinbase among them): any
+/// other body proves nothing, even when its `tx_root` (recomputed here with the program's own tree) is
+/// the header's.
+#[test]
+fn a_body_the_node_would_not_read_proves_nothing() {
+    use jetsam_bridge_program::tx::{body_hash, paged_spend_txid, root, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT};
+    let c = cases("g6_v4_vectors_edges.json").into_iter().find(|c| c.name == "x_min_on_second_page").unwrap();
+    assert_eq!(c.pages.len(), 3, "coinbase, then one deposit group of two pages");
+    let bitmap = |p: &[u8]| u16::from_le_bytes([p[320], p[321]]);
+    let set_bitmap = |p: &mut Vec<u8>, b: u16| p[320..322].copy_from_slice(&b.to_le_bytes());
+    // the root the header would carry if these pages were a block, with the groups read START..END
+    let root_of = |pages: &[Vec<u8>], system: usize| {
+        let mut leaves: Vec<[u8; 32]> = pages[..system].iter().map(|p| body_hash(p)).collect();
+        let mut group = Vec::new();
+        for p in &pages[system..] {
+            group.push(body_hash(p));
+            if bitmap(p) & PAGED_SPEND_END_BIT != 0 {
+                leaves.push(paged_spend_txid(&group));
+                group.clear();
+            }
+        }
+        if !group.is_empty() {
+            leaves.push(paged_spend_txid(&group));
+        }
+        root(&leaves)
+    };
+    let run = |pages: &[Vec<u8>], system: usize| {
+        let refs: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+        try_block_deposits(c.height, &root_of(pages, system), &refs, &c.rule)
+    };
+    assert_eq!(run(&c.pages, 1).map(|d| d.len()), Ok(1), "the unchanged body is read");
+    assert_eq!(try_block_deposits(c.height, &c.tx_root, &[], &c.rule), Err(BlockError::Body("no page")));
+    let short: Vec<&[u8]> = vec![&c.pages[0][..322]];
+    assert_eq!(try_block_deposits(c.height, &c.tx_root, &short, &c.rule), Err(BlockError::Body("page size")));
+    // the first record is not a primary coinbase: not a coinbase, or the payout's two-output shape
+    let mut p = c.pages.clone();
+    p[0][322] = 0;
+    assert_eq!(run(&p, 1), Err(BlockError::Body("primary coinbase")));
+    let mut p = c.pages.clone();
+    set_bitmap(&mut p[0], 0x300);
+    assert_eq!(run(&p, 1), Err(BlockError::Body("primary coinbase")));
+    // a coinbase among the groups, also one of one output at the payout's place
+    let mut p = c.pages.clone();
+    p.insert(1, c.pages[0].clone());
+    assert_eq!(run(&p, 1), Err(BlockError::Body("coinbase among the groups")));
+    let mut p = c.pages.clone();
+    p[2][322] = 1;
+    assert_eq!(run(&p, 1), Err(BlockError::Body("coinbase among the groups")));
+    // START on a later page, or no START on the first
+    let mut p = c.pages.clone();
+    let b = bitmap(&p[2]);
+    set_bitmap(&mut p[2], b | PAGED_SPEND_START_BIT);
+    assert_eq!(run(&p, 1), Err(BlockError::Body("group start")));
+    let mut p = c.pages.clone();
+    let b = bitmap(&p[1]);
+    set_bitmap(&mut p[1], b & !PAGED_SPEND_START_BIT);
+    assert_eq!(run(&p, 1), Err(BlockError::Body("group start")));
+    // a later page of the group from another input owner (here the vault: a release would be read)
+    let mut p = c.pages.clone();
+    p[2][40..72].copy_from_slice(&jetsam_bridge_program::deposit::VAULT_ADDRESS);
+    assert_eq!(run(&p, 1), Err(BlockError::Body("input owner")));
+    // the last group never ends
+    let mut p = c.pages.clone();
+    let b = bitmap(&p[2]);
+    set_bitmap(&mut p[2], b & !PAGED_SPEND_END_BIT);
+    assert_eq!(run(&p, 1), Err(BlockError::Body("unterminated group")));
+}
