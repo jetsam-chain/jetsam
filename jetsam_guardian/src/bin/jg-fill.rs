@@ -388,6 +388,10 @@ impl Robot {
     fn send(&mut self, orders: &[(FoundDeposit, AdvanceOrder, Vec<u8>)], seen: &[u8; 32], l1_now: u64) -> anyhow::Result<()> {
         if self.cfg.dry_run {
             for (d, o, pre) in orders {
+                // once per deposit: nothing is recorded in the ledger in this mode
+                if self.state.decided.get(&hex::encode(d.key())).map(String::as_str) == Some("advance") {
+                    continue;
+                }
                 self.journal(json!({"kind": "would_advance", "key": hex::encode(d.key()), "txid": hex::encode(d.txid), "height": d.height,
                                     "recipient": hex0x(&d.recipient), "amount": d.amount, "fee_bps": o.fee_bps, "evidence": hex::encode(o.evidence),
                                     "evidence_preimage": hex::encode(pre), "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
@@ -408,6 +412,11 @@ impl Robot {
                 return Ok(());
             }
         };
+        if !receipt.status {
+            log(&format!("advance transaction reverted: {}", receipt.tx_hash));
+            self.journal(json!({"kind": "send_reverted", "orders": list.len(), "l1_tx": receipt.tx_hash, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+            return Ok(());
+        }
         let mut paid_keys = HashSet::new();
         for lg in &receipt.logs {
             let topics: Vec<String> = lg["topics"].as_array().cloned().unwrap_or_default().iter().map(|t| t.as_str().unwrap_or_default().to_lowercase()).collect();
