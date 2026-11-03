@@ -921,3 +921,45 @@ fn v8_is_c6_the_node_admits_up_to_the_contracts_ceiling() {
     let over = validate_block_vault(&b, &ctx(CONTRACT_OUTSTANDING_CEIL - 7 * JTM + 1), &rules(), &mut |_| Ok(()));
     assert!(over.is_err(), "one µJTM above the contract's ceiling");
 }
+
+// ---------------------------------------------------------------- added for the mutants (boundaries)
+
+#[test]
+fn top_share_is_rounded_up() {
+    // 5 blocks of A and 4 of B over 9: 55.6 % → 56 (> 55: halt), never rounded down to 55
+    let mut c = Chain::from_genesis(testkit::genesis());
+    for i in 0..9u64 {
+        let h = c.tip_height() + 1;
+        let miner = if i % 2 == 0 { Address([0xaa; 32]) } else { Address([0xbb; 32]) };
+        let hd = BlockHeader {
+            prev_block_hash: c.tip_id(),
+            state_root: [1u8; 32],
+            tx_root: [2u8; 32],
+            timestamp: 1_700_000_000 + 180 * h,
+            height: h,
+            miner_address: miner,
+            nonce: 0,
+            difficulty_target: testkit::target_bits(20),
+            log_slots: 16,
+            active_slot_count: h,
+            alloc_counter: h,
+        };
+        c.extend(HeaderInfo::from_header(&hd)).unwrap();
+    }
+    assert_eq!(top_share_pct(&c, 480), 56);
+    assert_eq!(top_share_pct(&c, 3), 67, "the window: the last 3 blocks (A, B, A)");
+}
+
+#[test]
+fn one_plan_counts_its_own_advances_to_a_recipient() {
+    let v = run(&[cand(10, 1, 7, 600 * JTM), cand(11, 1, 7, 401 * JTM)], &Ledger::default(), Caps { ..caps() });
+    assert_eq!(v[1], Verdict::Refuse("RECIPIENT_CAP"), "600 + 401 > 1 000 to one recipient");
+}
+
+#[test]
+fn the_stock_must_cover_what_is_paid_not_the_amount() {
+    let c = cand(10, 1, 1, 7 * JTM);
+    let p = paid(7 * JTM, 75);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { stock: p, ..caps() }), vec![Verdict::Advance]);
+    assert_eq!(run(&[c], &Ledger::default(), Caps { stock: p - 1, ..caps() }), vec![Verdict::Wait("STOCK")]);
+}
