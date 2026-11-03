@@ -853,6 +853,10 @@ fn jg_fill_refuses_to_start_off_tor_or_the_loopback_and_dials_nothing() {
 /// A fake world behind the SOCKS port: two onion nodes (the testkit genesis only) and an onion L1 (chain
 /// 31 337, a token, the hot key's balance `stock`).
 fn fill_world(stock: u64) -> Answer {
+    fill_world_on(stock, "0x7a69")
+}
+
+fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
     let genesis = testkit::genesis();
     let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
     let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
@@ -860,7 +864,7 @@ fn fill_world(stock: u64) -> Answer {
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
         "jetsam_blockCount" => json!({"result": 0}),
-        "eth_chainId" => json!({"result": "0x7a69"}),
+        "eth_chainId" => json!({"result": chain_id}),
         "eth_gasPrice" => json!({"result": "0x3b9aca00"}),
         "eth_getBlockByNumber" => json!({"result": {"timestamp": "0x6b49d200"}}),
         "eth_getLogs" => json!({"result": []}),
@@ -906,6 +910,13 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert_eq!(code, Some(Some(1)), "log:\n{log}");
     assert!(log.contains("max_stock") && log.contains("does not start"), "{log}");
     assert!(seen.lock().unwrap().iter().all(|(atyp, host, ..)| *atyp == 3 && *host == c), "{:?}", seen.lock().unwrap());
+    // an L1 endpoint of another chain: no start
+    let (socks, _) = fake_tor(fill_world_on(cap, "0x1"));
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("is chain 1, not 31337") && log.contains("does not start"), "{log}");
     // at the cap: it starts, reads both nodes and the L1, by name through Tor
     let (socks, seen) = fake_tor(fill_world(cap));
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
