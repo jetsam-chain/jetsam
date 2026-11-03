@@ -137,7 +137,7 @@ pub fn try_block_deposits(height: u64, tx_root: &[u8; 32], pages: &[&[u8]], rule
     if leaves.len() > tx::TX_TREE_LEAVES {
         return Err(BlockError::Body("tx tree leaves"));
     }
-    if tx::root_and_path(&leaves, 0).0 != *tx_root {
+    if tx::root(&leaves) != *tx_root {
         return Err(BlockError::TxRoot);
     }
     let deposits = jetsam_vault_rule::block_deposits(height, &system_owners, &groups, rule).map_err(BlockError::Rule)?;

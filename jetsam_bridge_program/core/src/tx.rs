@@ -113,6 +113,21 @@ pub fn root_and_path(hashes: &[[u8; 32]], index: usize) -> ([u8; 32], [[u8; 32];
     (compress_with_tag(TAG_TXROOT, &layer[0], &count_digest(hashes.len())), path)
 }
 
+/// The root of [`root_and_path`] for the leaves `hashes` (at most 256), without hashing the empty
+/// subtrees: the leaves past `hashes.len()` are zero, so a node all of whose leaves are past it is the
+/// zero subtree of its level. About `hashes.len() + 16` compressions instead of 255 — what a block body
+/// costs the guests (v3).
+pub fn root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    assert!(hashes.len() <= TX_TREE_LEAVES, "tx tree leaves");
+    let mut zero = [0u8; 32];
+    let mut layer: Vec<[u8; 32]> = hashes.to_vec();
+    for _ in 0..TX_TREE_DEPTH {
+        layer = layer.chunks(2).map(|p| compress(&p[0], p.get(1).unwrap_or(&zero))).collect();
+        zero = compress(&zero, &zero);
+    }
+    compress_with_tag(TAG_TXROOT, layer.first().unwrap_or(&zero), &count_digest(hashes.len()))
+}
+
 /// Logical transactions of a block's page stream: (first page index, page count, txid).
 /// Primary reward at 0, optional two-output development payout at 1, then
 /// START..END groups (`block::try_compute_logical_txids`).

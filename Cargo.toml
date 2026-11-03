@@ -78,6 +78,14 @@ codegen-units = 1
 lto = "thin"
 codegen-units = 1
 
+# The bridge proof program hashes with software GF(2^128) (it is written for the zkVM): unoptimized, one
+# block of its cross tests takes a quarter of a second. Optimized in test builds too; no other crate is
+# affected.
+[profile.dev.package.jetsam_bridge_towerwalk]
+opt-level = 3
+[profile.dev.package.jetsam_bridge_program]
+opt-level = 3
+
 # The published libmdbx 0.6.6 does not compile for x86_64-pc-windows-gnu: it
 # assumes every Windows build is MSVC, while bindgen picks a different integer
 # type under mingw. The fix is two `#[cfg]` attributes, vendored in-tree so the
