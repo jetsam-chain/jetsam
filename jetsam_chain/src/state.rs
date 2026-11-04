@@ -317,6 +317,19 @@ pub(crate) fn exact_segment_root_from_columns(
 /// column version they hash (3 MiB, usually the resident one).
 const EXACT_SEGMENT_TREE_CACHE_SEGMENTS: usize = 4;
 
+/// Whether a build of any profile re-checks the cache-served segment root
+/// `root` against the streaming walk (the v1.6.1 method, which stays the
+/// source of truth): the roots whose first byte is zero, one in 256.
+///
+/// The rule reads the root alone, so it samples the same roots in every
+/// process, clone and cache history: the final root of a miner's template,
+/// whose cache starts empty with every template, is checked as often as the
+/// root a node computes when it applies a block. A check costs one streaming
+/// walk of the segment, about 1.5 s when the segment is full.
+fn exact_segment_tree_oracle_samples(root: &StateHash) -> bool {
+    root[0] == 0
+}
+
 /// Every node of one segment's exact sparse-Merkle tree, together with the
 /// exact column version the nodes were hashed from.
 ///
@@ -495,6 +508,26 @@ impl ExactSegmentTreeCache {
             }
         };
         let root = tree.root();
+        // Release builds have no other oracle: a sampled root is compared
+        // with the streaming walk. On a divergence every tree is suspect, so
+        // the cache is emptied, and the state gets the streaming root.
+        if exact_segment_tree_oracle_samples(&root) {
+            let streamed = exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new());
+            if streamed != root {
+                let hex = |hash: &StateHash| -> String {
+                    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+                };
+                tracing::error!(
+                    segment = segment_id,
+                    depth = log,
+                    cached = %hex(&root),
+                    streamed = %hex(&streamed),
+                    "exact segment tree cache diverged from the streaming root: cache emptied, streaming root used"
+                );
+                self.entries.clear();
+                return streamed;
+            }
+        }
         self.entries.push(tree);
         if self.entries.len() > EXACT_SEGMENT_TREE_CACHE_SEGMENTS {
             self.entries.remove(0);
@@ -854,8 +887,18 @@ impl ChainState {
         }
         if self.exact_roots.log_slots > self.state.log_slots() {
             self.exact_roots.shrink_to(self.state.log_slots());
+            // The dropped upper segments are never rooted again at this
+            // depth: their trees would only pin their last columns.
+            let segments = self.state.num_segments();
+            self.exact_trees
+                .entries
+                .retain(|tree| usize::from(tree.segment_id) < segments);
         }
-        let dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        // Ascending, not the dirty set's hash order: which trees stay in the
+        // cache after a block over many segments is then the same in every
+        // process.
+        let mut dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        dirty.sort_unstable();
         for segment_id in dirty {
             if self.state.is_evicted(segment_id) {
                 return Err(ExactStateReadError::EvictedSegment { seg_id: segment_id });
@@ -863,7 +906,11 @@ impl ChainState {
             let log = self.state.effective_log_segment_size();
             let root = match self.state.shared_segment_columns(segment_id).cloned() {
                 Some(columns) => self.exact_trees.segment_root(segment_id, log, &columns),
-                None => exact_segment_root_with_updates(log, None, &BTreeMap::new()),
+                None => {
+                    // Emptied: its tree would only pin the dropped columns.
+                    self.exact_trees.forget(segment_id);
+                    exact_segment_root_with_updates(log, None, &BTreeMap::new())
+                }
             };
             self.exact_roots.set_segment_root(segment_id, root);
         }
@@ -1976,3 +2023,6 @@ mod tests {
 
 #[cfg(test)]
 mod segment_tree_equivalence;
+
+#[cfg(test)]
+mod segment_tree_cases;
