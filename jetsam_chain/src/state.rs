@@ -887,6 +887,12 @@ impl ChainState {
         }
         if self.exact_roots.log_slots > self.state.log_slots() {
             self.exact_roots.shrink_to(self.state.log_slots());
+            // The dropped upper segments are never rooted again at this
+            // depth: their trees would only pin their last columns.
+            let segments = self.state.num_segments();
+            self.exact_trees
+                .entries
+                .retain(|tree| usize::from(tree.segment_id) < segments);
         }
         // Ascending, not the dirty set's hash order: which trees stay in the
         // cache after a block over many segments is then the same in every
@@ -900,7 +906,11 @@ impl ChainState {
             let log = self.state.effective_log_segment_size();
             let root = match self.state.shared_segment_columns(segment_id).cloned() {
                 Some(columns) => self.exact_trees.segment_root(segment_id, log, &columns),
-                None => exact_segment_root_with_updates(log, None, &BTreeMap::new()),
+                None => {
+                    // Emptied: its tree would only pin the dropped columns.
+                    self.exact_trees.forget(segment_id);
+                    exact_segment_root_with_updates(log, None, &BTreeMap::new())
+                }
             };
             self.exact_roots.set_segment_root(segment_id, root);
         }

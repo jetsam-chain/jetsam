@@ -113,13 +113,20 @@ fn expand_then_shrink_without_rooting_keeps_the_pinned_tree_exact() {
 }
 
 // A segment emptied (its columns dropped, virtual zero again) and then
-// re-materialised with different content: the stale tree pinned to the old
-// content must re-root by comparison.
+// re-materialised with different content. Between two roots, the stale tree
+// pinned to the old content must re-root by comparison; once the emptied
+// segment is rooted, its tree goes with its columns and the next content is
+// rooted through a rebuilt tree.
 #[test]
 fn an_emptied_segment_rematerialised_reroots_from_its_stale_tree() {
     let mut state = ChainState::with_log_slots(LOG_SEGMENT_SIZE + 1);
     let mut live = BTreeMap::new();
     let base = 1u32 << LOG_SEGMENT_SIZE;
+    let spend_segment_1 = |live: &BTreeMap<u32, SlotValue>| -> Vec<(u32, SlotValue)> {
+        live.range(base..)
+            .map(|(index, _)| (*index, SlotValue::EMPTY))
+            .collect()
+    };
     apply(
         &mut state,
         &mut live,
@@ -130,23 +137,15 @@ fn an_emptied_segment_rematerialised_reroots_from_its_stale_tree() {
         ],
     );
     check(&mut state, &live, "segment 1 populated");
-    assert!(pinned_tree(&state, 1).is_some());
-    apply(
-        &mut state,
-        &mut live,
-        &[
-            (base + 5, SlotValue::EMPTY),
-            (base + 70_000 - 65_536, SlotValue::EMPTY),
-            (base + 65_535, SlotValue::EMPTY),
-        ],
-    );
+    let stale = Arc::clone(&pinned_tree(&state, 1).unwrap().columns);
+
+    // Emptied and re-materialised between two roots.
+    let spends = spend_segment_1(&live);
+    apply(&mut state, &mut live, &spends);
     assert!(
         state.state.shared_segment_columns(1).is_none(),
         "segment 1 should be virtual zero"
     );
-    check(&mut state, &live, "segment 1 emptied");
-    // The stale tree is still there, pinned to the old content.
-    assert!(pinned_tree(&state, 1).is_some());
     apply(
         &mut state,
         &mut live,
@@ -156,7 +155,37 @@ fn an_emptied_segment_rematerialised_reroots_from_its_stale_tree() {
             (base + 1, slot(11)),
         ],
     );
-    check(&mut state, &live, "segment 1 re-materialised");
+    // The stale tree is still there, pinned to the old content.
+    assert!(Arc::ptr_eq(
+        &pinned_tree(&state, 1).unwrap().columns,
+        &stale
+    ));
+    check(
+        &mut state,
+        &live,
+        "segment 1 re-materialised from its stale tree",
+    );
+
+    // Emptied and rooted: the tree would only pin the dropped columns.
+    let spends = spend_segment_1(&live);
+    apply(&mut state, &mut live, &spends);
+    assert!(state.state.shared_segment_columns(1).is_none());
+    check(&mut state, &live, "segment 1 emptied");
+    assert!(pinned_tree(&state, 1).is_none());
+    apply(
+        &mut state,
+        &mut live,
+        &[
+            (base + 5, slot(13)),
+            (base + 70_000 - 65_536, slot(14)),
+            (base + 65_535, slot(15)),
+        ],
+    );
+    check(
+        &mut state,
+        &live,
+        "segment 1 re-materialised through a rebuilt tree",
+    );
     // And a single change on each boundary slot.
     apply(&mut state, &mut live, &[(base, slot(12))]);
     check(&mut state, &live, "slot 0 changed");
@@ -782,4 +811,45 @@ fn a_block_over_more_segments_than_the_cache_keeps_leaves_the_highest_ones_warm(
             .collect();
         assert_eq!(warm, [4, 5, 6, 7], "round {round}");
     }
+}
+
+#[test]
+fn a_shrink_drops_the_trees_of_the_discarded_segments() {
+    let base = 1u32 << LOG_SEGMENT_SIZE;
+    let mut state = ChainState::with_log_slots(LOG_SEGMENT_SIZE + 2);
+    let mut live = BTreeMap::new();
+    apply(
+        &mut state,
+        &mut live,
+        &[
+            (3, slot(1)),
+            (2 * base + 5, slot(2)),
+            (3 * base + 7, slot(3)),
+        ],
+    );
+    check(&mut state, &live, "segments 0, 2 and 3 warm");
+    assert!(pinned_tree(&state, 2).is_some() && pinned_tree(&state, 3).is_some());
+
+    // A rollback empties the upper half, then shrinks before any rooting:
+    // the emptied segments are never rooted again at this depth.
+    apply(
+        &mut state,
+        &mut live,
+        &[
+            (2 * base + 5, SlotValue::EMPTY),
+            (3 * base + 7, SlotValue::EMPTY),
+        ],
+    );
+    state
+        .state
+        .shrink_exact_metadata_to_log_slots(LOG_SEGMENT_SIZE + 1)
+        .unwrap();
+    check(&mut state, &live, "shrunk to two segments");
+    let warm: Vec<u16> = state
+        .exact_trees
+        .entries
+        .iter()
+        .map(|tree| tree.segment_id)
+        .collect();
+    assert_eq!(warm, [0]);
 }
