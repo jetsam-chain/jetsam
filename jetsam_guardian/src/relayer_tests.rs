@@ -140,6 +140,12 @@ fn no_child_that_the_contract_would_refuse() {
     assert_eq!(plan_submission(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[], ts(&c, GL) + 13_501), Err(NoSubmission::WorkRateTooLow));
     // an unknown tip
     assert_eq!(plan_submission(&c, &known, &[9u8; 32], &g.cp.cum_work, GL, &none, &[], at), Err(NoSubmission::NoParentOnThisChain));
+    // MN-5 from 1 800 s after the base: 15 blocks of a quarter of the base's work in 2 700 s are too slow
+    let mut slow = testkit::chain(GL, 1);
+    testkit::extend(&mut slow, 15, 1, 18);
+    let (sgid, sg) = genesis_known(&slow);
+    let known_s = HashMap::from([(sgid, sg.clone())]);
+    assert_eq!(plan_submission(&slow, &known_s, &sgid, &sg.cp.cum_work, GL, &none, &[], ts(&slow, 25) + 60), Err(NoSubmission::WorkRateTooLow));
 }
 
 #[test]
