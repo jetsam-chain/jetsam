@@ -159,17 +159,19 @@ impl Relay {
     fn sync_from(&mut self, i: usize) -> anyhow::Result<()> {
         let n = &mut self.nodes[i];
         let tip = n.tip_height()?;
-        let mut common = self.chain.tip_height().min(tip);
+        let top = self.chain.tip_height().min(tip);
+        let mut common = top;
         while common > 0 && n.block_hash(common)? != self.chain.id_at(common) {
             common -= 1;
         }
-        if common < self.chain.tip_height() {
+        // a node that is only behind agrees up to its tip: nothing is dropped (its lag is no reorganization)
+        if common < top {
             let from = self.chain.tip_height();
             self.chain.truncate_above(common);
             self.archive.follow(&self.chain);
             self.event(json!({"event": "reorg", "from": from, "to": common, "node": self.cfg.nodes[i].name}));
         }
-        for h in common + 1..=tip {
+        for h in self.chain.tip_height() + 1..=tip {
             let Some(hd) = self.nodes[i].header(h)? else { break };
             self.chain.extend(hd)?;
         }
