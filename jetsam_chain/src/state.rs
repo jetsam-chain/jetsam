@@ -1976,3 +1976,6 @@ mod tests {
 
 #[cfg(test)]
 mod segment_tree_equivalence;
+
+#[cfg(test)]
+mod segment_tree_cases;
