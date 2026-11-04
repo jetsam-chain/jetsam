@@ -19,7 +19,7 @@ use serde_json::json;
 use jetsam_guardian::chain::Chain;
 use jetsam_guardian::checkpoint::{genesis_checkpoint, mock_proof, public_values};
 use jetsam_guardian::fill::FoundDeposit;
-use jetsam_guardian::l1::{self, hex_u64, AdvanceOrder, L1};
+use jetsam_guardian::l1::{self, AdvanceOrder, L1};
 use jetsam_guardian::l1tx::{FeePolicy, HotKey, Sender};
 use jetsam_guardian::relayer::{self, Known};
 use jetsam_guardian::{testkit, u256};
