@@ -1454,3 +1454,39 @@ fn a5_7_the_relayers_blocks_are_beside_its_final_json() {
     let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
     assert_eq!(c.relay_blocks_dir(), None);
 }
+
+/// A5-15: fill.toml (it names the claim owner of every repayment) is private to the robot's user.
+#[test]
+fn a5_15_fill_toml_must_be_private_to_the_robots_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fill.toml");
+    std::fs::write(&path, "network = \"x\"\n").unwrap();
+    for mode in [0o600, 0o400] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(check_config_file(&path).is_ok(), "{mode:o}");
+    }
+    for mode in [0o644, 0o640, 0o604, 0o660, 0o620, 0o602, 0o700, 0o4600] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let e = check_config_file(&path).unwrap_err().to_string();
+        assert!(e.contains("0600") && e.contains("does not start"), "{mode:o}: {e}");
+    }
+    assert!(check_config_file(&dir.path().join("absent.toml")).is_err());
+    // another owner (the test host runs as root, which may chown)
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::os::unix::fs::chown(&path, Some(4242), None).is_ok() {
+        let e = check_config_file(&path).unwrap_err().to_string();
+        assert!(e.contains("uid 4242"), "{e}");
+    }
+}
+
+/// A5-15: a second jg-fill on the same state_dir does not start.
+#[test]
+fn a5_15_one_robot_per_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = lock_state_dir(dir.path()).unwrap();
+    let e = lock_state_dir(dir.path()).unwrap_err().to_string();
+    assert!(e.contains("another jg-fill") && e.contains("does not start"), "{e}");
+    drop(first);
+    assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
+}

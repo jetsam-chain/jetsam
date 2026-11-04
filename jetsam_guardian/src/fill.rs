@@ -838,6 +838,34 @@ pub fn u64_saturating(word: &[u8; 32]) -> u64 {
     u64::from_be_bytes(word[24..].try_into().expect("8 bytes"))
 }
 
+/// A5-15: `fill.toml` names the claim owner every repayment goes to (`refund_to`): it must be private to this
+/// process's user (mode 0600 or 0400, owned by its uid), or jg-fill does not start.
+pub fn check_config_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}: jg-fill does not start", path.display()))?;
+    let mode = meta.mode() & 0o7777;
+    anyhow::ensure!(
+        mode == 0o600 || mode == 0o400,
+        "{}: mode {mode:o}, it must be private to its owner (0600 or 0400): it names the claim owner of every repayment, jg-fill does not start",
+        path.display()
+    );
+    // SAFETY: geteuid has no precondition.
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(meta.uid() == euid, "{}: owned by uid {}, not by this process's uid {euid}: jg-fill does not start", path.display(), meta.uid());
+    Ok(())
+}
+
+/// A5-15: one jg-fill per `state_dir` (its pending transaction, ledger and journal): an exclusive `flock` on
+/// `<state_dir>/lock`, held as long as the returned file is open (as the signer's journal does).
+pub fn lock_state_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    // SAFETY: flock on a descriptor we own.
+    let r = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    anyhow::ensure!(r == 0, "another jg-fill holds {}: jg-fill does not start", dir.join("lock").display());
+    Ok(lock)
+}
+
 /// The start check of the hot key: it holds the capped stock only.
 pub fn check_stock(balance: u64, max_stock: u64) -> anyhow::Result<()> {
     anyhow::ensure!(

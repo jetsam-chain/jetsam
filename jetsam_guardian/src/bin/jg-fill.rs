@@ -10,6 +10,9 @@
 //!
 //! * Egress (A4-1, D60, D66): its nodes and its L1 through Tor or on the loopback only, or it does not
 //!   start; the private rehearsal's clearnet (`[egress] mode = "clearnet"`) to its bridge 10.77.0.0/24 only.
+//! * A5-15: hardened first (no core dump, not dumpable, memory locked when no later allocation can be refused),
+//!   `fill.toml` private to its user (0600 or 0400, its uid: it names `refund_to`), one robot per
+//!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
 //!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, and the hot key's stock ≤ `max_stock`
 //!   (else no start).
@@ -627,6 +630,19 @@ fn run() -> anyhow::Result<()> {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
+    // A5-15: hardened before anything is read (the hot key, fill.toml)
+    let h = jetsam_guardian::harden::harden();
+    log(&format!(
+        "hardened: dumpable {}, core dumps {}, memory {}",
+        if h.dumpable_off { "off" } else { "ON (prctl refused)" },
+        if h.core_off { "off" } else { "ON (setrlimit refused)" },
+        match &h.memory_locked {
+            Ok(()) => "locked".to_string(),
+            Err(why) => format!("NOT locked ({why})"),
+        }
+    ));
+    anyhow::ensure!(h.dumpable_off && h.core_off, "the process cannot be hardened: jg-fill does not start");
+    fill::check_config_file(&path)?;
     let text = std::fs::read_to_string(&path)?;
     let digest: [u8; 32] = {
         use sha2::Digest;
@@ -643,6 +659,8 @@ fn run() -> anyhow::Result<()> {
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?} ({}), {} nodes, dry_run {}", cfg.profile()?, cfg.nodes.len(), cfg.dry_run));
     std::fs::create_dir_all(&cfg.state_dir)?;
+    // A5-15: one robot per state_dir, held until the end
+    let _lock = fill::lock_state_dir(&cfg.state_dir)?;
     let l1 = L1::via(&cfg.l1_rpc, egress);
     let chain_id = l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
     anyhow::ensure!(chain_id == cfg.l1_chain_id, "the L1 endpoint is chain {chain_id}, not {}: jg-fill does not start", cfg.l1_chain_id);
