@@ -888,7 +888,11 @@ impl ChainState {
         if self.exact_roots.log_slots > self.state.log_slots() {
             self.exact_roots.shrink_to(self.state.log_slots());
         }
-        let dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        // Ascending, not the dirty set's hash order: which trees stay in the
+        // cache after a block over many segments is then the same in every
+        // process.
+        let mut dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        dirty.sort_unstable();
         for segment_id in dirty {
             if self.state.is_evicted(segment_id) {
                 return Err(ExactStateReadError::EvictedSegment { seg_id: segment_id });

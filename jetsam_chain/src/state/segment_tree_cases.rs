@@ -751,3 +751,35 @@ fn cost_of_the_release_oracle() {
         );
     }
 }
+
+#[test]
+fn a_block_over_more_segments_than_the_cache_keeps_leaves_the_highest_ones_warm() {
+    // The dirty segments are rooted in ascending order, whatever the order of
+    // the writes and of the dirty set: the cache ends on the last four, in
+    // every process alike.
+    let base = 1u32 << LOG_SEGMENT_SIZE;
+    for round in 0..4u32 {
+        let mut state = ChainState::with_log_slots(LOG_SEGMENT_SIZE + 3);
+        let mut live = BTreeMap::new();
+        let mut writes: Vec<_> = (0..8u32)
+            .map(|segment| {
+                (
+                    segment * base + 11 + round,
+                    slot(u64::from(round * 8 + segment + 1)),
+                )
+            })
+            .collect();
+        if round % 2 == 1 {
+            writes.reverse();
+        }
+        apply(&mut state, &mut live, &writes);
+        check(&mut state, &live, "eight segments in one block");
+        let warm: Vec<u16> = state
+            .exact_trees
+            .entries
+            .iter()
+            .map(|tree| tree.segment_id)
+            .collect();
+        assert_eq!(warm, [4, 5, 6, 7], "round {round}");
+    }
+}
