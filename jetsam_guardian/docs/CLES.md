@@ -86,3 +86,53 @@ funding is written here: origin (no identity data), date, amount.
 The private rehearsal uses the T0.5 TEST dealing `fixture` (`jg-ceremony test --label fixture`), the group
 key pinned in the node's `rehearsal-v1-7` profile, TEST passphrases in clear and `--test-kdf`. None of it
 is ever used outside the private rehearsal.
+
+## Bridge genesis key (D-AV1, D73; audit A5-8)
+
+The contract's `genesisKey` installs the bridge genesis once (`initGenesis(cp)`) and has no power after it
+(`test_genesis_key_has_no_power_after_genesis`). Before it, it is the bridge's single root of trust: a false
+genesis (a block off the chain, or a private branch) kills the bridge or, with >= 40 % of the reference
+hashrate, lets fictitious deposits be minted. Holder: **[NV]** (not recorded yet; to be written here).
+
+Procedure (written down, nothing deployed by it):
+
+1. The key is generated on the offline machine of the ceremony (RAM only), used once, never on a guardian
+   machine, a mining machine or the agents' workstation.
+2. The genesis checkpoint is printed by `jg-relay --config <relay.toml> print-genesis <L>` on **two** relayer
+   hosts reading **different** nodes; the two `checkpoint_id` and `calldata` must be equal byte for byte, and
+   `L` must be in `[J ; BRIDGE_DEPOSITS_FROM_HEIGHT]`.
+3. The same `checkpoint_id` is pinned in the nodes' profile (`L1BridgeParams`, A5-8: no release is payable
+   while the contract's `genesisId` (slot 13) is not the pinned one) BEFORE the profile's `L1_BRIDGE` is set
+   (T8.3).
+4. `initGenesis` is sent; the `BridgeGenesis(id, lockedHeight, lockedBlockId, lockedCumWork)` event and
+   `genesisId()` are read back from two L1 endpoints and compared with step 2.
+5. The key is then destroyed: the key file overwritten and deleted (`shred -u`), the RAM machine powered off; a
+   multisig genesis key has its shares discarded the same way. Written here: date (UTC), who did it, the
+   `genesisId`, the L1 transaction, the two hosts of step 2.
+
+| Date (UTC) | genesisId | L1 tx | Hosts of step 2 | Destroyed by |
+|---|---|---|---|---|
+| — | — | — | — | — |
+
+## Hot keys of `jg-fill` and `jg-relay` (decision 10 of the audit A5, A5-15)
+
+Decision (user, 04/11, recommendation of the audit): the hot keys stay in a **clear file, mode 0600** (or
+0400), owned by the uid of the process, so that the robot and the relayer restart without an operator; the
+risk is bounded by the **stock** of the robot (`max_stock`: the robot refuses to start above it) and by the
+gas of the relayer's account. The processes are hardened (no core dump, not dumpable, memory locked) and
+their configuration (`fill.toml`, which carries `refund_to`) is refused unless 0600 and owned by the process.
+Holder of each hot key: **[NV]** (to be written here).
+
+## Loss per incident (decision 11 of the audit A5)
+
+What is said publicly: **the maximum loss per incident is the robot's stock (`max_stock`)**. The contract's
+per-advancer outstanding cap (`ADVANCE_OUTSTANDING_CAP`, 3 000 JTM) is a circuit breaker against a faulty
+robot, not a property of the system; no figure is derived from a pool's dated share. The bridge assumes an
+honest majority of the mining (a majority can prove deposits that do not exist, A5-21).
+
+## Relayers (decision 12 of the audit A5, A5-9)
+
+A second relayer is allowed only with a contract that carries the A5-4 fix (`MustExtendTip`: a point on the
+tip's own chain that does not extend the tip is refused, the finality clock does not move): before it, two
+honest relayers out of step restarted the 24 h clock. Two relayers then share nothing but the L1: a proof
+made while the other's point landed is void (refused, made again on the new tip).

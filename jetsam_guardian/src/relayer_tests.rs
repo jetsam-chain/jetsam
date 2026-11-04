@@ -433,6 +433,7 @@ fn a5_5_the_fast_cadence() {
     assert_eq!(rate_at_least(&half, &w, RATE_WINDOW_BLOCKS, 50), Some(true));
     assert_eq!(rate_at_least(&half, &w, RATE_WINDOW_BLOCKS, 51), Some(false));
     assert_eq!(rate_at_least(&spaced(5, 180), &w, RATE_WINDOW_BLOCKS, 1), None, "too short");
+    assert_eq!(rate_at_least(&spaced(30, 0), &w, RATE_WINDOW_BLOCKS, 1), None, "no time elapsed: no measure");
     // a refusal (WorkRateTooLow) pending: fast, whatever the rate
     assert!(fast_cadence(false, true, &full, Some(&w)));
     // from normal: below 60 % turns it on, 70 % does not
