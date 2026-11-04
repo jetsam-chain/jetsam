@@ -43,6 +43,7 @@
 //! * **V8** — `bridge_locked + amount ≤ VAULT_OUTSTANDING_CEIL` for each
 //!   deposit, in group order, where `bridge_locked` is the sum of the vault's
 //!   live slots created after the floor, not by a coinbase ([`bridge_locked_of`]).
+//!   Its relation with the contract's C-6 is [`VAULT_OUTSTANDING_CEIL_MICRO`]'s.
 //!
 //! **No order** (porte R, D52): a release `n` is valid when no release marker
 //! of the branch carries `n`, nor an earlier release of the same block. The
@@ -94,7 +95,23 @@ pub const VAULT_RELEASE_WINDOW_BLOCKS: u64 = 480;
 /// costs at most this per window.
 pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
 /// V8: most the vault holds for the bridge (D45, = the contract's
-/// `OUTSTANDING_CEIL`).
+/// `OUTSTANDING_CEIL`, `10_000e6` µJTM).
+///
+/// A5-18, the exact relation with the contract's C-6: V8 admits a deposit
+/// while `bridge_locked + amount ≤` this ceiling, C-6 mints one while
+/// `totalSupply + amount ≤ OUTSTANDING_CEIL`: the same number, both
+/// inclusive. In the normal regime every wJTM is backed by JTM locked in the
+/// vault (minted only for a locked deposit, burned before its release leaves
+/// the vault), so `totalSupply` stays at most `bridge_locked` less the
+/// deposits not yet minted, and V8 implies C-6. After the contract rolls
+/// back finalized checkpoints (MN-3b), the wJTM minted from them stay in
+/// `totalSupply` (counted in `suspectMinted`, never burned by the contract)
+/// with no JTM locked for them on the nodes' branch: C-6 is then the
+/// stricter, and a deposit the nodes admitted waits, unminted, until wJTM
+/// are burned. The contract stays prudent (decided), V8 does not change,
+/// and an advancing robot must read the contract's ceiling and supply
+/// (`OUTSTANDING_CEIL`, `totalSupply`, `suspectMinted`), never this
+/// constant, before it advances.
 pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 10_000 * MICRO_PER_JTM;
 
 // The shared rule counts in the same unit, and carries this build's clock:
