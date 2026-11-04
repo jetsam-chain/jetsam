@@ -21,8 +21,8 @@ use super::forks::{
     MIN_SYNC_PARTICIPANTS,
 };
 use super::l1_read::{
-    read_account, read_storage_word, verify_withdrawal, withdrawal_commitment, withdrawal_slot,
-    L1BridgeParams, L1ReadError,
+    genesis_slot, read_account, read_storage_word, verify_bridge_account, verify_withdrawal,
+    withdrawal_commitment, withdrawal_slot, L1BridgeParams, L1ReadError,
 };
 use super::light_client::{
     verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
@@ -362,6 +362,124 @@ pub(crate) fn prototype_bridge() -> L1BridgeParams {
         address: [0x1b; 20],
         code_hash: [0xc0; 32],
         withdrawals_slot: 6,
+        genesis_id_slot: 13,
+        genesis_id: [0x9e; 32],
+    }
+}
+
+/// Hex-prefix encoding of a partial nibble path.
+fn hex_prefix(path: &[u8], leaf: bool) -> Vec<u8> {
+    let flag = if leaf { 2 } else { 0 } + (path.len() % 2) as u8;
+    let mut out = Vec::with_capacity(path.len() / 2 + 1);
+    let rest = if path.len() % 2 == 1 {
+        out.push((flag << 4) | path[0]);
+        &path[1..]
+    } else {
+        out.push(flag << 4);
+        path
+    };
+    for pair in rest.chunks(2) {
+        out.push((pair[0] << 4) | pair[1]);
+    }
+    out
+}
+
+/// A trie holding two keys: one branch at the first nibble where their
+/// hashed paths part (below an extension over the nibbles they share, if
+/// any), a leaf under it for each: (root, proof of `a`, proof of `b`).
+fn two_leaf_trie(a: (&[u8], Vec<u8>), b: (&[u8], Vec<u8>)) -> (Root, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let nibbles = |key: &[u8]| -> Vec<u8> {
+        keccak256(key)
+            .iter()
+            .flat_map(|byte| [byte >> 4, byte & 0x0f])
+            .collect()
+    };
+    let (pa, pb) = (nibbles(a.0), nibbles(b.0));
+    let common = pa.iter().zip(&pb).take_while(|(x, y)| x == y).count();
+    assert!(common < 64, "two distinct keys");
+    let leaf = |path: &[u8], value_rlp: &[u8]| {
+        rlp_list(&[
+            rlp_bytes(&hex_prefix(&path[common + 1..], true)),
+            rlp_bytes(value_rlp),
+        ])
+    };
+    let (leaf_a, leaf_b) = (leaf(&pa, &a.1), leaf(&pb, &b.1));
+    let mut items = vec![rlp_bytes(&[]); 17];
+    items[usize::from(pa[common])] = rlp_bytes(&keccak256(&leaf_a));
+    items[usize::from(pb[common])] = rlp_bytes(&keccak256(&leaf_b));
+    let branch = rlp_list(&items);
+    let mut top = Vec::new();
+    if common > 0 {
+        top.push(rlp_list(&[
+            rlp_bytes(&hex_prefix(&pa[..common], false)),
+            rlp_bytes(&keccak256(&branch)),
+        ]));
+    }
+    top.push(branch);
+    let root = keccak256(&top[0]);
+    let proof = |leaf: Vec<u8>| -> Vec<Vec<u8>> {
+        let mut nodes = top.clone();
+        nodes.push(leaf);
+        nodes
+    };
+    (root, proof(leaf_a), proof(leaf_b))
+}
+
+/// The L1 of one bridge account (A5-8): its state root, the account proof,
+/// the storage proof of `withdrawals[n]` and that of `genesisId`.
+pub(crate) struct SyntheticBridge {
+    pub state_root: Root,
+    pub account_proof: Vec<Vec<u8>>,
+    pub storage_proof: Vec<Vec<u8>>,
+    pub genesis_proof: Vec<Vec<u8>>,
+}
+
+impl SyntheticBridge {
+    /// The `BridgeAccountProof` object payload: the account proof, then the
+    /// storage proof of `genesisId`.
+    pub(crate) fn account_payload(&self) -> Vec<u8> {
+        crate::consensus::vault::encode_bridge_account_proof(
+            &self.account_proof,
+            &self.genesis_proof,
+        )
+    }
+}
+
+/// One bridge account holding `withdrawals[n] = value` and, at
+/// `bridge.genesis_id_slot`, the genesis `genesis` (none: an uninitialized
+/// contract, whose slot is proven empty).
+pub(crate) fn synthetic_bridge_with_genesis(
+    bridge: &L1BridgeParams,
+    n: u64,
+    value: Root,
+    genesis: Option<Root>,
+) -> SyntheticBridge {
+    let withdrawal = withdrawal_slot(n, bridge.withdrawals_slot);
+    let (storage_root, storage_proof, genesis_proof) = match genesis {
+        Some(genesis) => two_leaf_trie(
+            (&withdrawal, rlp_bytes(&stripped(&value))),
+            (
+                &genesis_slot(bridge.genesis_id_slot),
+                rlp_bytes(&stripped(&genesis)),
+            ),
+        ),
+        None => {
+            let (root, node) = one_leaf_trie(&withdrawal, rlp_bytes(&stripped(&value)));
+            (root, vec![node.clone()], vec![node])
+        }
+    };
+    let account = rlp_list(&[
+        rlp_bytes(&[1]),
+        rlp_bytes(&[]),
+        rlp_bytes(&storage_root),
+        rlp_bytes(&bridge.code_hash),
+    ]);
+    let (state_root, account_node) = one_leaf_trie(&bridge.address, account);
+    SyntheticBridge {
+        state_root,
+        account_proof: vec![account_node],
+        storage_proof,
+        genesis_proof,
     }
 }
 
@@ -867,6 +985,7 @@ fn bridge_codehash_mismatch_is_refused() {
         address: r.address,
         code_hash: pinned,
         withdrawals_slot: 3,
+        ..prototype_bridge()
     };
     assert_eq!(
         verify_withdrawal(
@@ -994,6 +1113,164 @@ fn zero_slot_value_is_not_a_release() {
     assert_eq!(
         verify_withdrawal(state, &bridge, &acc, 1, &[0; 32], 0, &sto),
         Err(L1ReadError::WithdrawalAbsent)
+    );
+}
+
+// --- A5-8: the bridge's genesis, pinned and read by V7 ---
+
+/// The pinned genesis is read at its slot (13, `genesisId` of the v3
+/// layout) under the account's storage root, beside `withdrawals[n]`.
+#[test]
+fn the_pinned_bridge_genesis_is_read_under_the_account() {
+    let (owner, amount, _, value) = fork_vector();
+    let bridge = prototype_bridge();
+    assert_eq!(genesis_slot(13), {
+        let mut slot = [0u8; 32];
+        slot[31] = 13;
+        slot
+    });
+    let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, Some(bridge.genesis_id));
+    let account = verify_bridge_account(
+        l1.state_root,
+        &bridge,
+        &l1.account_proof,
+        &l1.genesis_proof,
+    )
+    .expect("the pinned genesis");
+    assert_eq!(account.code_hash, bridge.code_hash);
+    assert_eq!(
+        read_storage_word(
+            account.storage_root,
+            &genesis_slot(bridge.genesis_id_slot),
+            &l1.genesis_proof
+        ),
+        Ok(bridge.genesis_id)
+    );
+    // The withdrawal beside it still proves the burn.
+    assert_eq!(
+        verify_withdrawal(
+            l1.state_root,
+            &bridge,
+            &l1.account_proof,
+            1,
+            &owner,
+            amount,
+            &l1.storage_proof
+        ),
+        Ok(())
+    );
+}
+
+/// Another genesis (a contract installed on another checkpoint, hence on
+/// another branch or another chain) is refused, to the last bit.
+#[test]
+fn a_bridge_of_another_genesis_is_refused() {
+    let (_, _, _, value) = fork_vector();
+    let bridge = prototype_bridge();
+    for i in [0usize, 13, 31] {
+        let mut other = bridge.genesis_id;
+        other[i] ^= 1;
+        let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, Some(other));
+        assert_eq!(
+            verify_bridge_account(l1.state_root, &bridge, &l1.account_proof, &l1.genesis_proof),
+            Err(L1ReadError::GenesisMismatch),
+            "byte {i}"
+        );
+    }
+}
+
+/// A contract whose genesis is not installed (`genesisId` empty) pays
+/// nothing, whatever the pin, a zero pin included.
+#[test]
+fn a_bridge_without_genesis_is_refused_even_under_a_zero_pin() {
+    let (_, _, _, value) = fork_vector();
+    let bridge = prototype_bridge();
+    let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, None);
+    assert_eq!(
+        verify_bridge_account(l1.state_root, &bridge, &l1.account_proof, &l1.genesis_proof),
+        Err(L1ReadError::GenesisAbsent)
+    );
+    let unpinned = L1BridgeParams {
+        genesis_id: [0; 32],
+        ..bridge
+    };
+    let l1 = synthetic_bridge_with_genesis(&unpinned, 1, value, None);
+    assert_eq!(
+        verify_bridge_account(l1.state_root, &unpinned, &l1.account_proof, &l1.genesis_proof),
+        Err(L1ReadError::GenesisAbsent)
+    );
+}
+
+/// The genesis is proven at its own slot under this account: the proof of
+/// another slot, a pin read at another slot, an account of another code are
+/// all refused.
+#[test]
+fn the_genesis_proof_must_open_its_own_slot() {
+    let (_, _, _, value) = fork_vector();
+    let bridge = prototype_bridge();
+    let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, Some(bridge.genesis_id));
+    // The withdrawal's path given as the genesis proof.
+    assert!(matches!(
+        verify_bridge_account(l1.state_root, &bridge, &l1.account_proof, &l1.storage_proof),
+        Err(L1ReadError::Mpt(_))
+    ));
+    // No genesis proof at all.
+    assert!(matches!(
+        verify_bridge_account(l1.state_root, &bridge, &l1.account_proof, &[]),
+        Err(L1ReadError::Mpt(_))
+    ));
+    // The pin read at slot 12: nothing there (or not this proof).
+    let slot_12 = L1BridgeParams {
+        genesis_id_slot: 12,
+        ..bridge
+    };
+    assert!(
+        verify_bridge_account(l1.state_root, &slot_12, &l1.account_proof, &l1.genesis_proof)
+            .is_err()
+    );
+    // The code is checked as before.
+    let other_code = L1BridgeParams {
+        code_hash: [0xc1; 32],
+        ..bridge
+    };
+    assert_eq!(
+        verify_bridge_account(l1.state_root, &other_code, &l1.account_proof, &l1.genesis_proof),
+        Err(L1ReadError::CodeHashMismatch)
+    );
+}
+
+/// The `BridgeAccountProof` payload is the account proof, then the storage
+/// proof of `genesisId`, nothing after: one list alone, or a trailing byte,
+/// is not a payload.
+#[test]
+fn the_bridge_account_proof_payload_carries_the_genesis_proof() {
+    use crate::consensus::vault::{
+        decode_bridge_account_proof, encode_bridge_account_proof, encode_proof_nodes,
+        VaultPayloadError,
+    };
+    let (_, _, _, value) = fork_vector();
+    let bridge = prototype_bridge();
+    let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, Some(bridge.genesis_id));
+    let payload = encode_bridge_account_proof(&l1.account_proof, &l1.genesis_proof);
+    let mut expected = Vec::new();
+    encode_proof_nodes(&l1.account_proof, &mut expected);
+    encode_proof_nodes(&l1.genesis_proof, &mut expected);
+    assert_eq!(payload, expected);
+    assert_eq!(
+        decode_bridge_account_proof(&payload),
+        Ok((l1.account_proof.clone(), l1.genesis_proof.clone()))
+    );
+    let mut account_only = Vec::new();
+    encode_proof_nodes(&l1.account_proof, &mut account_only);
+    assert_eq!(
+        decode_bridge_account_proof(&account_only),
+        Err(VaultPayloadError::Truncated)
+    );
+    let mut trailing = payload.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_bridge_account_proof(&trailing),
+        Err(VaultPayloadError::TrailingBytes)
     );
 }
 

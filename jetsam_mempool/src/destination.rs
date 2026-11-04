@@ -34,8 +34,8 @@ use jetsam_chain::consensus::destination::state::{
 };
 use jetsam_chain::consensus::destination::{DestinationObject, DestinationObjectKind};
 use jetsam_chain::consensus::vault::{
-    decode_proof_nodes, destination_marker_kind, DestinationMarkerKind, VaultError, VaultRelease,
-    VaultRules,
+    decode_bridge_account_proof, destination_marker_kind, DestinationMarkerKind, VaultError,
+    VaultRelease, VaultRules,
 };
 use jetsam_chain::consensus::wire_limits::{
     MAX_DESTINATION_SECTION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
@@ -90,7 +90,9 @@ pub struct ReleaseIntent {
     pub release: VaultRelease,
     /// The `LightClientFinalityUpdate` payload it is proven under.
     pub finality: Vec<u8>,
-    /// The bridge account proof under that update's finalized root.
+    /// The bridge account proof under that update's finalized root, then the
+    /// storage proof of the contract's `genesisId` (A5-8): the
+    /// `BridgeAccountProof` object payload.
     pub account_proof: Vec<u8>,
     /// The release group: a spend from the vault.
     pub payment: PagedSpendIntent,
@@ -235,14 +237,13 @@ impl DestinationIntent {
                 LightClientFinalityUpdate::decode_payload(finality).map_err(|_| {
                     DestinationIntentError::MalformedObject(DestinationObjectKind::FinalityUpdate)
                 })?;
+                // The account proof, then the genesis proof (A5-8).
                 let account_proof = object_bytes(&mut src)?;
-                let mut proof = account_proof;
-                decode_proof_nodes(&mut proof)
-                    .ok()
-                    .filter(|_| proof.is_empty())
-                    .ok_or(DestinationIntentError::MalformedObject(
+                decode_bridge_account_proof(account_proof).map_err(|_| {
+                    DestinationIntentError::MalformedObject(
                         DestinationObjectKind::BridgeAccountProof,
-                    ))?;
+                    )
+                })?;
                 let payment = payment_of(take(&mut src)?)?;
                 Self::Release(ReleaseIntent {
                     release,

@@ -3097,19 +3097,24 @@ mod tests {
     /// and refuses, unheld, what the block would refuse: a storage proof
     /// that proves nothing, an index never burned, another amount than the
     /// burn, a finality update signed by a committee the branch does not
-    /// know, an account proof that does not open the root. Without the keys
+    /// know, an account proof that does not open the root, a genesis proof
+    /// that does not open the contract's `genesisId` (A5-8). Without the keys
     /// (or before any committee) it refuses softly: the node's own fault.
     #[tokio::test]
     async fn bogus_release_intent_is_refused_at_admission_when_keys_are_held() {
         use jetsam_chain::consensus::destination::light_client::LightClientError;
         use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
-        use jetsam_chain::consensus::vault::{encode_proof_nodes, VaultError};
+        use jetsam_chain::consensus::vault::{
+            decode_bridge_account_proof, encode_bridge_account_proof, VaultError,
+        };
         let tip = CROSSING_J + 20;
         let l1 = crate::destination::tests::SyntheticL1::load();
         let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
-        let mut account = Vec::new();
-        encode_proof_nodes(&[vec![0xdd; 64]], &mut account);
-        let bogus: [(ReleaseCase, fn(&E) -> bool); 5] = [
+        let (real_account, real_genesis) = decode_bridge_account_proof(&l1.account_proof).unwrap();
+        let account = encode_bridge_account_proof(&[vec![0xdd; 64]], &real_genesis);
+        // A5-8: the genesis proof replaced by the withdrawal's storage path.
+        let no_genesis = encode_bridge_account_proof(&real_account, &l1.release.storage_proof);
+        let bogus: [(ReleaseCase, fn(&E) -> bool); 6] = [
             (
                 case.with(|r| r.release.storage_proof = vec![vec![0xee; 40]]),
                 |e| matches!(e, E::Vault(VaultError::NotProvenOnL1 { n: 4, .. })),
@@ -3125,6 +3130,14 @@ mod tests {
             }),
             (case.with(|r| r.account_proof = account.clone()), |e| {
                 matches!(e, E::BridgeAccount(_))
+            }),
+            (case.with(|r| r.account_proof = no_genesis.clone()), |e| {
+                matches!(
+                    e,
+                    E::BridgeAccount(
+                        jetsam_chain::consensus::destination::l1_read::L1ReadError::Mpt(_)
+                    )
+                )
             }),
         ];
         for (i, (bogus, expected)) in bogus.iter().enumerate() {

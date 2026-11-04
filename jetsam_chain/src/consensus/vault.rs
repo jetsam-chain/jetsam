@@ -37,7 +37,9 @@
 //!   `VAULT_RELEASE_WINDOW_BLOCKS` consecutive blocks.
 //! * **V7** — each release is proven on the L1: `withdrawals[n]` of the pinned
 //!   bridge contract holds `keccak(owner ‖ amount)` under a finalized root
-//!   (`destination::l1_read::verify_withdrawal`).
+//!   (`destination::l1_read::verify_withdrawal`), and that contract's
+//!   `genesisId` is the pinned genesis (A5-8,
+//!   `destination::l1_read::verify_bridge_account`, once per block).
 //! * **V8** — `bridge_locked + amount ≤ VAULT_OUTSTANDING_CEIL` for each
 //!   deposit, in group order, where `bridge_locked` is the sum of the vault's
 //!   live slots created after the floor, not by a coinbase ([`bridge_locked_of`]).
@@ -394,6 +396,31 @@ pub fn decode_proof_nodes(src: &mut &[u8]) -> Result<Vec<Vec<u8>>, VaultPayloadE
         nodes.push(take(src, len)?.to_vec());
     }
     Ok(nodes)
+}
+
+/// The `BridgeAccountProof` object payload (A5-8): the account proof of the
+/// bridge contract, then the storage proof of its `genesisId`, each a node
+/// list ([`encode_proof_nodes`]). One per block, shared by its releases.
+pub fn encode_bridge_account_proof(account: &[Vec<u8>], genesis: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proof_nodes(account, &mut out);
+    encode_proof_nodes(genesis, &mut out);
+    out
+}
+
+/// Decode [`encode_bridge_account_proof`]: `(account proof, genesis
+/// proof)`, both lists present and nothing after them.
+#[allow(clippy::type_complexity)]
+pub fn decode_bridge_account_proof(
+    bytes: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), VaultPayloadError> {
+    let mut src = bytes;
+    let account = decode_proof_nodes(&mut src)?;
+    let genesis = decode_proof_nodes(&mut src)?;
+    if !src.is_empty() {
+        return Err(VaultPayloadError::TrailingBytes);
+    }
+    Ok((account, genesis))
 }
 
 /// Bytes of a release's fields: `n:u64 LE ‖ owner ‖ amount:u64 LE`.

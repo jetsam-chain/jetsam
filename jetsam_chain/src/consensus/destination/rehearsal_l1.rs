@@ -17,7 +17,8 @@
 //!   ([`super::state::REHEARSAL_L1_ANCHOR`]).
 //! * **Bridge contract**: the address `keccak("…/bridge-address")[12..]`, the
 //!   code hash `keccak("…/bridge-runtime-code")`, the `withdrawals` mapping
-//!   at slot 9 (DECISIONS 29/10) ([`super::state::REHEARSAL_L1_BRIDGE`]).
+//!   at slot 9 (DECISIONS 29/10), the genesis `keccak("…/bridge-genesis-id")`
+//!   at slot 13 (A5-8) ([`super::state::REHEARSAL_L1_BRIDGE`]).
 //!
 //! The builders below make what this L1 would serve: the anchor update, the
 //! committee updates (rotations), finality updates over any execution state
@@ -35,7 +36,7 @@ use super::forks::{
     L1Network, LightClientFormat, FULU_GINDICES, L1_MAINNET, SLOTS_PER_SYNC_COMMITTEE_PERIOD,
     SYNC_COMMITTEE_SIZE,
 };
-use super::l1_read::{withdrawal_commitment, withdrawal_slot, L1BridgeParams};
+use super::l1_read::{genesis_slot, withdrawal_commitment, withdrawal_slot, L1BridgeParams};
 use super::mpt::keccak256;
 use super::ssz::{
     sha256_pair, BeaconBlockHeader, ExecutionPayloadHeader, LightClientExecution,
@@ -58,6 +59,8 @@ pub const KEYS_PER_COMMITTEE: usize = 8;
 pub const SIGNING_SEATS: usize = 480;
 /// The slot of the bridge contract's `withdrawals` mapping (contract v3).
 pub const WITHDRAWALS_SLOT: u64 = 9;
+/// The slot of the bridge contract's `genesisId` (contract v3, A5-8).
+pub const GENESIS_ID_SLOT: u64 = 13;
 
 /// The sync committees' signature suite (the L1's, proof of possession).
 const SYNC_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -88,6 +91,8 @@ pub fn bridge_params() -> L1BridgeParams {
         address,
         code_hash: keccak256(&labelled("bridge-runtime-code")),
         withdrawals_slot: WITHDRAWALS_SLOT,
+        genesis_id_slot: GENESIS_ID_SLOT,
+        genesis_id: keccak256(&labelled("bridge-genesis-id")),
     }
 }
 
@@ -327,15 +332,36 @@ impl BridgeState {
     pub fn storage_proof(&self, n: u64) -> Vec<Vec<u8>> {
         self.storage.proof(&withdrawal_slot(n, WITHDRAWALS_SLOT))
     }
+
+    /// The storage proof of `genesisId` (A5-8).
+    pub fn genesis_proof(&self) -> Vec<Vec<u8>> {
+        self.storage.proof(&genesis_slot(GENESIS_ID_SLOT))
+    }
+
+    /// The `BridgeAccountProof` object payload: the account proof, then the
+    /// storage proof of `genesisId`.
+    pub fn account_payload(&self) -> Vec<u8> {
+        crate::consensus::vault::encode_bridge_account_proof(
+            &self.account_proof,
+            &self.genesis_proof(),
+        )
+    }
 }
 
 /// The state after `burns` (any order, distinct `n`; none is allowed). The
 /// contract's storage always holds a word at slot 0 too (its configuration),
-/// so that an absent `withdrawals[n]` has a proof.
+/// so that an absent `withdrawals[n]` has a proof, and its genesis at slot 13
+/// (A5-8, [`bridge_params`]).
 pub fn bridge_state(burns: &[Burn]) -> BridgeState {
     let mut word0 = [0u8; 32];
     word0[31] = 1;
-    let mut storage: Vec<(Root, Vec<u8>)> = vec![([0u8; 32], rlp_bytes(&stripped(&word0)))];
+    let mut storage: Vec<(Root, Vec<u8>)> = vec![
+        ([0u8; 32], rlp_bytes(&stripped(&word0))),
+        (
+            genesis_slot(GENESIS_ID_SLOT),
+            rlp_bytes(&stripped(&bridge_params().genesis_id)),
+        ),
+    ];
     for burn in burns {
         let slot = withdrawal_slot(burn.n, WITHDRAWALS_SLOT);
         assert!(

@@ -11,7 +11,8 @@ use jetsam_chain::consensus::destination::state::{
 };
 use jetsam_chain::consensus::params::MICRO_PER_JTM;
 use jetsam_chain::consensus::vault::{
-    deposit_marker, encode_proof_nodes, VaultError, VaultRelease, RELEASE_FEE_MICRO, VAULT_ADDRESS,
+    deposit_marker, encode_bridge_account_proof, VaultError, VaultRelease, RELEASE_FEE_MICRO,
+    VAULT_ADDRESS,
     VAULT_OUTSTANDING_CEIL_MICRO,
 };
 use jetsam_poseidon2b::primitives::Address;
@@ -99,8 +100,7 @@ fn release_with(n: u64, amount: u64, finality: Vec<u8>, fee: u64) -> ReleaseInte
         amount,
         storage_proof: vec![vec![0xee; 40]],
     };
-    let mut proof = Vec::new();
-    encode_proof_nodes(&[vec![0xdd; 64]], &mut proof);
+    let proof = encode_bridge_account_proof(&[vec![0xdd; 64]], &[vec![0xdc; 64]]);
     ReleaseIntent {
         payment: page(
             VAULT_ADDRESS,
@@ -133,6 +133,8 @@ fn rules() -> DestinationRules {
                 address: [0x11; 20],
                 code_hash: [0x22; 32],
                 withdrawals_slot: 9,
+                genesis_id_slot: 13,
+                genesis_id: [0x33; 32],
             },
         ),
         ..DestinationRules::CONSENSUS

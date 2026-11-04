@@ -31,7 +31,9 @@ pub const MAX_BLOCK_BYTES: usize =
 /// v1.7: budget of a block's destination section (0xC2), marker and count
 /// included, **outside** [`MAX_BLOCK_BYTES`]. The largest section measured
 /// (one committee update, one finality update, the bridge account proof and
-/// four releases) is 44 645 bytes of objects.
+/// four releases) is 44 645 bytes of objects; 47 559 with the storage proof
+/// of the contract's `genesisId` the account proof carries since A5-8
+/// (counted at a release's measured storage proof).
 pub const MAX_DESTINATION_SECTION_BYTES: usize = 48 * 1024;
 
 /// Largest v1.7 block: everything [`MAX_BLOCK_BYTES`] bounds, then a

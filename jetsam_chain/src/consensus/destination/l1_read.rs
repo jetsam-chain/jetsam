@@ -5,9 +5,11 @@
 //!
 //! Under a finalized execution state root: the account proof of
 //! `L1_BRIDGE_ADDRESS`, whose code hash must be the pinned
-//! `L1_BRIDGE_CODEHASH`, then the storage proof of the slot of
+//! `L1_BRIDGE_CODEHASH`, the storage proof of its `genesisId`, which must be
+//! the pinned genesis (A5-8: the contract's only root of trust, chosen once
+//! by its genesis key), then the storage proof of the slot of
 //! `withdrawals[n]`, whose value must be exactly `keccak(owner ‖ amount)`.
-//! A zero (absent) value is never a release.
+//! A zero (absent) value is never a release, nor a genesis.
 
 use super::mpt::{keccak256, mpt_get, rlp_decode, rlp_uint, MptError};
 use super::ssz::Root;
@@ -22,6 +24,14 @@ pub struct L1BridgeParams {
     pub code_hash: Root,
     /// The storage slot of the `withdrawals` mapping.
     pub withdrawals_slot: u64,
+    /// The storage slot of the contract's `genesisId` (13 in the v3 layout,
+    /// `storage-layout-v3.txt`).
+    pub genesis_id_slot: u64,
+    /// A5-8: the `checkpointId` of the bridge's genesis checkpoint, the word
+    /// `initGenesis` writes once at `genesis_id_slot`. It names the Jetsam
+    /// block the contract's chain of checkpoints starts from; a contract of
+    /// this code installed on any other checkpoint pays nothing.
+    pub genesis_id: Root,
 }
 
 /// One L1 account, as its proof shows it.
@@ -45,6 +55,11 @@ pub enum L1ReadError {
     WithdrawalAbsent,
     /// The slot holds another commitment than `keccak(owner ‖ amount)`.
     CommitmentMismatch,
+    /// A5-8: the contract's `genesisId` is empty: its genesis is not
+    /// installed.
+    GenesisAbsent,
+    /// A5-8: the contract's `genesisId` is not the pinned genesis.
+    GenesisMismatch,
 }
 
 impl From<MptError> for L1ReadError {
@@ -65,6 +80,12 @@ pub fn withdrawal_slot(n: u64, withdrawals_slot: u64) -> Root {
     preimage[..32].copy_from_slice(&u256_be(n));
     preimage[32..].copy_from_slice(&u256_be(withdrawals_slot));
     keccak256(&preimage)
+}
+
+/// The storage slot of the contract's `genesisId`: `u256(genesis_id_slot)`
+/// (a value type, stored at its own slot).
+pub fn genesis_slot(genesis_id_slot: u64) -> Root {
+    u256_be(genesis_id_slot)
 }
 
 /// What `burn` writes at `withdrawals[n]`: `keccak(owner 32 B ‖ amount 8 B
@@ -127,8 +148,38 @@ pub fn read_storage_word(
     Ok(word)
 }
 
-/// Rule V7: under `state_root`, the bridge account carries the pinned code,
-/// and `withdrawals[n]` holds exactly `keccak(owner ‖ amount)`.
+/// Rule V7, once per block: under `state_root`, the account at the pinned
+/// address carries the pinned code, and (A5-8) its `genesisId`, read with
+/// `genesis_proof` at `genesis_id_slot`, is the pinned genesis. Until the
+/// contract holds exactly that genesis, no release is payable.
+pub fn verify_bridge_account(
+    state_root: Root,
+    bridge: &L1BridgeParams,
+    account_proof: &[Vec<u8>],
+    genesis_proof: &[Vec<u8>],
+) -> Result<L1Account, L1ReadError> {
+    let account = read_account(state_root, &bridge.address, account_proof)?;
+    if account.code_hash != bridge.code_hash {
+        return Err(L1ReadError::CodeHashMismatch);
+    }
+    let genesis = read_storage_word(
+        account.storage_root,
+        &genesis_slot(bridge.genesis_id_slot),
+        genesis_proof,
+    )?;
+    // An empty slot first: a zero pin never matches an uninstalled genesis.
+    if genesis == [0u8; 32] {
+        return Err(L1ReadError::GenesisAbsent);
+    }
+    if genesis != bridge.genesis_id {
+        return Err(L1ReadError::GenesisMismatch);
+    }
+    Ok(account)
+}
+
+/// Rule V7, for each release: under `state_root`, the bridge account carries
+/// the pinned code, and `withdrawals[n]` holds exactly `keccak(owner ‖
+/// amount)`. The block's genesis check is [`verify_bridge_account`].
 pub fn verify_withdrawal(
     state_root: Root,
     bridge: &L1BridgeParams,

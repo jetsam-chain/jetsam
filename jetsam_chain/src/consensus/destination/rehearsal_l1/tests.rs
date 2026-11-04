@@ -11,7 +11,9 @@ use super::*;
 use crate::block::Block;
 use crate::consensus::destination::bls::committee_keys;
 use crate::consensus::destination::forks::{period_of_slot, L1_MAINNET, L1_REHEARSAL};
-use crate::consensus::destination::l1_read::{read_account, verify_withdrawal, L1ReadError};
+use crate::consensus::destination::l1_read::{
+    read_account, verify_bridge_account, verify_withdrawal, L1ReadError,
+};
 use crate::consensus::destination::light_client::{
     verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
 };
@@ -67,6 +69,12 @@ fn rehearsal_l1_constants_are_the_synthetic_l1() {
         keccak256(b"jetsam-v17-rehearsal/synthetic-l1/bridge-runtime-code")
     );
     assert_eq!(bridge.withdrawals_slot, 9);
+    // A5-8: the synthetic contract's genesis, at the v3 layout's slot 13.
+    assert_eq!(bridge.genesis_id_slot, 13);
+    assert_eq!(
+        bridge.genesis_id,
+        keccak256(b"jetsam-v17-rehearsal/synthetic-l1/bridge-genesis-id")
+    );
     let a = anchor();
     assert_eq!(a.period, ANCHOR_PERIOD);
     assert_eq!(a.committee_root, committee(ANCHOR_PERIOD).root());
@@ -188,6 +196,13 @@ fn bridge_state_proves_each_burn_and_each_absence() {
     let account = read_account(state.state_root, &bridge.address, &state.account_proof)
         .expect("the bridge account");
     assert_eq!(account.code_hash, bridge.code_hash);
+    // A5-8: every state of the synthetic contract holds the pinned genesis.
+    for s in [&state, &bridge_state(&[])] {
+        assert_eq!(
+            verify_bridge_account(s.state_root, &bridge, &s.account_proof, &s.genesis_proof()),
+            read_account(s.state_root, &bridge.address, &s.account_proof)
+        );
+    }
     for b in &burns {
         assert_eq!(
             verify_withdrawal(
@@ -327,8 +342,7 @@ fn release_block(
         amount: burn.amount,
         storage_proof: l1.storage_proof(burn.n),
     };
-    let mut account = Vec::new();
-    encode_proof_nodes(&l1.account_proof, &mut account);
+    let account = l1.account_payload();
     let mut b = block_at(height, vec![release_group(100, &r, 0, FEE)], &[r]);
     let section = b.destination.as_mut().expect("section");
     section.objects.insert(
