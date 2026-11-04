@@ -8,7 +8,7 @@ use super::*;
 use alloc::vec;
 
 const J: u64 = 69_120;
-const F: u64 = J + 1_440;
+const F: u64 = J + BRIDGE_OPENING_DELAY;
 const H: u64 = F + 1;
 const JTM: u64 = MICRO_PER_JTM;
 const PAYER: [u8; 32] = [0x51; 32];
