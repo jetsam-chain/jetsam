@@ -37,6 +37,7 @@ pub mod fill;
 pub mod ipc;
 pub mod journal;
 pub mod l1;
+pub mod l1tx;
 pub mod observer;
 pub mod relay;
 pub mod rpc;

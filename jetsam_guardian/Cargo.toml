@@ -30,6 +30,9 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 argon2 = "0.5"
 bech32 = "0.11"
+# Local signing of the robots' L1 transactions (secp256k1 ECDSA, RFC 6979): the relayer and jg-fill hold their
+# own hot key (BRIDGE-REST). RustCrypto, pure Rust; already in the offline registry.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
