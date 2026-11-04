@@ -317,6 +317,19 @@ pub(crate) fn exact_segment_root_from_columns(
 /// column version they hash (3 MiB, usually the resident one).
 const EXACT_SEGMENT_TREE_CACHE_SEGMENTS: usize = 4;
 
+/// Whether a build of any profile re-checks the cache-served segment root
+/// `root` against the streaming walk (the v1.6.1 method, which stays the
+/// source of truth): the roots whose first byte is zero, one in 256.
+///
+/// The rule reads the root alone, so it samples the same roots in every
+/// process, clone and cache history: the final root of a miner's template,
+/// whose cache starts empty with every template, is checked as often as the
+/// root a node computes when it applies a block. A check costs one streaming
+/// walk of the segment, about 1.5 s when the segment is full.
+fn exact_segment_tree_oracle_samples(root: &StateHash) -> bool {
+    root[0] == 0
+}
+
 /// Every node of one segment's exact sparse-Merkle tree, together with the
 /// exact column version the nodes were hashed from.
 ///
@@ -495,6 +508,26 @@ impl ExactSegmentTreeCache {
             }
         };
         let root = tree.root();
+        // Release builds have no other oracle: a sampled root is compared
+        // with the streaming walk. On a divergence every tree is suspect, so
+        // the cache is emptied, and the state gets the streaming root.
+        if exact_segment_tree_oracle_samples(&root) {
+            let streamed = exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new());
+            if streamed != root {
+                let hex = |hash: &StateHash| -> String {
+                    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+                };
+                tracing::error!(
+                    segment = segment_id,
+                    depth = log,
+                    cached = %hex(&root),
+                    streamed = %hex(&streamed),
+                    "exact segment tree cache diverged from the streaming root: cache emptied, streaming root used"
+                );
+                self.entries.clear();
+                return streamed;
+            }
+        }
         self.entries.push(tree);
         if self.entries.len() > EXACT_SEGMENT_TREE_CACHE_SEGMENTS {
             self.entries.remove(0);

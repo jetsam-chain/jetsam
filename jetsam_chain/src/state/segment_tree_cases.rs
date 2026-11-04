@@ -471,3 +471,283 @@ fn cost_of_a_build_versus_the_stream() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The release oracle: a sampled cache root is re-checked against the stream.
+// ---------------------------------------------------------------------------
+
+/// The events a test logs: level and every field, `name=value`.
+#[derive(Clone, Default)]
+struct Logged(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl Logged {
+    fn errors(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::ERROR)
+            .map(|(_, text)| text.clone())
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for Logged {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn core::fmt::Debug,
+            ) {
+                self.0.push_str(&format!("{}={:?} ", field.name(), value));
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), fields.0));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn hex(hash: &StateHash) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A stand-in node value, distinct for each `k`.
+fn fault(k: u64) -> StateHash {
+    let mut node = [0xA5u8; 32];
+    node[..8].copy_from_slice(&k.to_le_bytes());
+    node
+}
+
+/// The rule the oracle samples by: the cache roots whose first byte is zero.
+fn sampled(root: &StateHash) -> bool {
+    root[0] == 0
+}
+
+/// Four production segments, 0, 1 and 2 live and their trees warm; then a
+/// write in the left half of segment 1, whose cached tree has its right-half
+/// node overwritten: re-rooting it hashes the new left half with that wrong
+/// node. The wrong node is chosen so that the root the cache gives is
+/// `sampled` or not. Returns the state, its live set and that wrong root.
+fn state_with_a_faulty_tree(sample: bool) -> (ChainState, BTreeMap<u32, SlotValue>, StateHash) {
+    let log_slots = LOG_SEGMENT_SIZE + 2;
+    let base = 1u32 << LOG_SEGMENT_SIZE;
+    let mut state = ChainState::with_log_slots(log_slots);
+    let mut live = BTreeMap::new();
+    apply(
+        &mut state,
+        &mut live,
+        &[
+            (5, slot(1)),
+            (base + 3, slot(2)),
+            (base + 40_000, slot(3)),
+            (2 * base + 7, slot(4)),
+        ],
+    );
+    check(&mut state, &live, "three warm segments");
+    assert_eq!(state.exact_trees.entries.len(), 3);
+
+    apply(&mut state, &mut live, &[(base + 9, slot(5))]);
+    let truth = ExactSegmentTree::build(
+        1,
+        LOG_SEGMENT_SIZE,
+        Arc::clone(state.state.shared_segment_columns(1).unwrap()),
+    );
+    let (left, right) = (truth.nodes[2], truth.nodes[3]);
+    let (node, root) = (1u64..)
+        .map(|k| (fault(k), state_node_hash(left, fault(k))))
+        .find(|(node, root)| *node != right && sampled(root) == sample)
+        .unwrap();
+    assert_ne!(root, truth.root());
+    let tree = state
+        .exact_trees
+        .entries
+        .iter_mut()
+        .find(|tree| tree.segment_id == 1)
+        .unwrap();
+    Arc::make_mut(tree).nodes[3] = node;
+    (state, live, root)
+}
+
+#[test]
+fn a_sampled_cache_root_that_diverges_is_logged_dropped_and_replaced_by_the_stream() {
+    let (mut state, mut live, wrong) = state_with_a_faulty_tree(true);
+    let logged = Logged::default();
+    let root =
+        tracing::subscriber::with_default(logged.clone(), || state.try_state_root().unwrap());
+    // The stream's root, never the cache's.
+    assert_eq!(root, global_root(state.state.log_slots(), &live));
+    assert!(
+        state.exact_trees.entries.is_empty(),
+        "the cache must be emptied, not just the faulty tree"
+    );
+    let errors = logged.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("segment=1 "), "{errors:?}");
+    assert!(errors[0].contains(&hex(&wrong)), "{errors:?}");
+    let streamed = exact_segment_root_from_columns(
+        LOG_SEGMENT_SIZE,
+        state.state.shared_segment_columns(1).unwrap(),
+    );
+    assert!(errors[0].contains(&hex(&streamed)), "{errors:?}");
+
+    // The next block roots segment 1 through a rebuilt tree, warm again.
+    apply(&mut state, &mut live, &[(1 << LOG_SEGMENT_SIZE, slot(6))]);
+    check(&mut state, &live, "after the cache was emptied");
+    assert!(Arc::ptr_eq(
+        &pinned_tree(&state, 1).unwrap().columns,
+        state.state.shared_segment_columns(1).unwrap()
+    ));
+}
+
+/// The other side of the sample: an unsampled root is served from the cache
+/// as it is in a release build (only the debug oracle sees it), which is
+/// what keeps the stream's cost off 255 roots in 256.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "segment tree cache diverged from the streaming root of segment 1")
+)]
+fn an_unsampled_cache_root_is_not_rechecked_by_a_release_build() {
+    let (mut state, live, wrong) = state_with_a_faulty_tree(false);
+    let logged = Logged::default();
+    let root =
+        tracing::subscriber::with_default(logged.clone(), || state.try_state_root().unwrap());
+    assert_ne!(root, global_root(state.state.log_slots(), &live));
+    assert_eq!(state.cached_exact_segment_root(1), Some(wrong));
+    assert!(pinned_tree(&state, 1).is_some());
+    assert!(logged.errors().is_empty());
+}
+
+#[test]
+fn a_sampled_hydration_root_that_diverges_is_replaced_and_the_durable_segment_accepted() {
+    let base = 1u32 << LOG_SEGMENT_SIZE;
+    let mut state = ChainState::with_log_slots(LOG_SEGMENT_SIZE + 1);
+    let mut live = BTreeMap::new();
+    apply(
+        &mut state,
+        &mut live,
+        &[(1, slot(1)), (base + 2, slot(2)), (base + 65_000, slot(3))],
+    );
+    let root = check(&mut state, &live, "two warm segments");
+    let durable = state.state.try_get_segment_columns(1).unwrap().clone();
+    state.state.clear_dirty();
+    state.state.evict_all_persisted_segments();
+    assert!(state.state.is_evicted(1));
+
+    // The payload will be the very content the tree pins, so re-rooting it
+    // recomputes nothing and serves the root node: overwrite that.
+    let truth = exact_segment_root_from_columns(LOG_SEGMENT_SIZE, &durable);
+    let wrong = (1u64..)
+        .map(fault)
+        .find(|node| *node != truth && sampled(node))
+        .unwrap();
+    let tree = state
+        .exact_trees
+        .entries
+        .iter_mut()
+        .find(|tree| tree.segment_id == 1)
+        .unwrap();
+    Arc::make_mut(tree).nodes[1] = wrong;
+
+    let logged = Logged::default();
+    tracing::subscriber::with_default(logged.clone(), || {
+        state.restore_evicted_segment(1, durable).unwrap()
+    });
+    assert!(!state.state.is_evicted(1));
+    assert!(state.exact_trees.entries.is_empty());
+    let errors = logged.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains(&hex(&wrong)), "{errors:?}");
+    assert_eq!(check(&mut state, &live, "hydrated"), root);
+}
+
+#[test]
+fn the_oracle_samples_the_roots_whose_first_byte_is_zero_one_in_256() {
+    assert!(exact_segment_tree_oracle_samples(&[0u8; 32]));
+    let mut root = [0xFFu8; 32];
+    root[0] = 0;
+    assert!(exact_segment_tree_oracle_samples(&root));
+    for first in [1u8, 0x80, 0xFF] {
+        let mut root = [0u8; 32];
+        root[0] = first;
+        assert!(!exact_segment_tree_oracle_samples(&root));
+    }
+    // Over real node hashes the rate is one in 256: 64 expected of 16 384.
+    let count = (0u64..1 << 14)
+        .map(|k| state_node_hash(fault(k), fault(k + 1)))
+        .filter(exact_segment_tree_oracle_samples)
+        .count();
+    assert!((32..=104).contains(&count), "{count} sampled of 16384");
+}
+
+// Cost of the release oracle on one production segment, per fill: a block
+// that changes one live slot on a clone of the state, as a node applies a
+// block, rooted through the warm cache; blocks follow until one root is
+// sampled, which pays the cache then the stream.
+#[test]
+#[ignore = "measurement, release build"]
+fn cost_of_the_release_oracle() {
+    let len = 1usize << LOG_SEGMENT_SIZE;
+    for live in [655usize, 32_768, 65_536] {
+        let stride = 40_503usize | 1;
+        let mut local = 0usize;
+        let slots: Vec<(u32, SlotValue)> = (0..live)
+            .map(|i| {
+                local = (local + stride) & (len - 1);
+                (local as u32, slot(i as u64 + 1))
+            })
+            .collect();
+        let state = ChainState::from_sparse_utxos(LOG_SEGMENT_SIZE, &slots, u64::MAX).unwrap();
+        let target = slots[0].0;
+        let mut unsampled_ms = Vec::new();
+        let mut sampled_ms = 0.0;
+        for seed in 1_000_000u64.. {
+            let mut child = state.clone();
+            child
+                .state
+                .apply_delta_unrooted(&[(target, slot(seed))])
+                .unwrap();
+            let t = Instant::now();
+            let root = child.try_state_root().unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if sampled(&root) {
+                sampled_ms = ms;
+                break;
+            }
+            unsampled_ms.push(ms);
+        }
+        unsampled_ms.sort_by(f64::total_cmp);
+        let median = unsampled_ms[unsampled_ms.len() / 2];
+        let columns = Arc::clone(state.state.shared_segment_columns(0).unwrap());
+        let t = Instant::now();
+        exact_segment_root_from_columns(LOG_SEGMENT_SIZE, &columns);
+        let stream_ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "oracle cost: live {live:>6} | re-root unsampled median {median:7.2} ms | sampled {sampled_ms:8.2} ms | stream {stream_ms:8.2} ms | {} blocks to the first sampled root | mean added per re-root (1/256) {:6.2} ms",
+            unsampled_ms.len() + 1,
+            (sampled_ms - median) / 256.0
+        );
+    }
+}
