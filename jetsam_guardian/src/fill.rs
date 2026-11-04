@@ -113,6 +113,14 @@ pub fn deposits_of_block(raw: &[u8], expected_id: &[u8; 32], rules: &VaultRules)
         hex::encode(expected_id),
         hex::encode(id)
     );
+    deposits_in_block(&block, rules)
+}
+
+/// [`deposits_of_block`] on a block already decoded: its body against its header's `tx_root`, then the
+/// node's rule in the same permissive context.
+pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Vec<FoundDeposit>> {
+    let id = block_id(&block.header);
+    let height = block.header.height;
     let root = try_compute_tx_root(&block.transactions).map_err(|e| anyhow::anyhow!("block {height}: {e:?}"))?;
     anyhow::ensure!(root == block.header.tx_root, "block {height}: the body does not match the header's tx_root");
     let stream = validate_block_page_stream(&block.transactions).map_err(|e| anyhow::anyhow!("block {height}: {e:?}"))?;
@@ -129,7 +137,7 @@ pub fn deposits_of_block(raw: &[u8], expected_id: &[u8; 32], rules: &VaultRules)
     }
     let released = ReleasedSet::new();
     let ctx = VaultContext { released: &released, released_in_window: 0, bridge_locked: taken, bridge_vault_floor: 0 };
-    let effect = validate_block_vault(&block, &ctx, rules, &mut |_| Ok(()))
+    let effect = validate_block_vault(block, &ctx, rules, &mut |_| Ok(()))
         .map_err(|e| anyhow::anyhow!("the node's vault rule refuses block {height}: {e:?}"))?;
     Ok(effect
         .deposits

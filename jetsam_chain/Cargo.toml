@@ -17,13 +17,15 @@ rehearsal-v1-6 = ["testnet"]
 # PRIVATE BUILDS ONLY: the private chain of rehearsal-v1-6 with v1.7 armed
 # at 96 (params::REHEARSAL_V1_7_ACTIVATION). Never in a release build, never
 # on a public network.
-rehearsal-v1-7 = ["rehearsal-v1-6"]
+rehearsal-v1-7 = ["rehearsal-v1-6", "jetsam_vault_rule/rehearsal-v1-7"]
 
 [dependencies]
 tracing = { workspace = true }
 jetsam_core = { path = "../jetsam_core" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
 jetsam_tx = { path = "../jetsam_tx" }
+# V4, the deposit rule of the bridge vault, shared with the L1's proof program (G6 = V4).
+jetsam_vault_rule = { path = "../jetsam_vault_rule" }
 jetsam_fri = { path = "../jetsam_fri" }
 jetsam_fri_binius = { path = "../jetsam_fri_binius" }
 rayon = "1.10"

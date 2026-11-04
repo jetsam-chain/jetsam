@@ -29,6 +29,14 @@ members = [
     "jetsam_client_agent_batch",
     # v1.7 guardian software (T5.1-T5.6): observer, signer, aggregator, ceremony
     "jetsam_guardian",
+    # v1.7 bridge vault: V4, the deposit rule the node and the proof program share
+    "jetsam_vault_rule",
+    # v1.7 bridge proof program (T4.9): the relations its SP1 guests prove;
+    # the guests themselves build alone for the zkVM target
+    "jetsam_bridge_program/core",
+    "jetsam_bridge_program/towerwalk",
+    # G6 = V4 in CI: the node's gate and the program on the same blocks
+    "jetsam_bridge_program/xtest",
 ]
 resolver = "2"
 
@@ -71,6 +79,14 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# The bridge proof program hashes with software GF(2^128) (it is written for the zkVM): unoptimized, one
+# block of its cross tests takes a quarter of a second. Optimized in test builds too; no other crate is
+# affected.
+[profile.dev.package.jetsam_bridge_towerwalk]
+opt-level = 3
+[profile.dev.package.jetsam_bridge_program]
+opt-level = 3
 
 # The published libmdbx 0.6.6 does not compile for x86_64-pc-windows-gnu: it
 # assumes every Windows build is MSVC, while bindgen picks a different integer

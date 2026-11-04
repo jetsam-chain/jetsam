@@ -261,6 +261,71 @@ fn bridge_opening_follows_the_v1_7_clock() {
     assert_eq!(current.release_fee_for(1_020, 3), RF + 9_100);
 }
 
+/// G6 = V4: this gate's V4 is the shared crate's, the one the L1's proof
+/// program runs — the same constants, the same clock, the same refusals.
+#[test]
+fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
+    use crate::consensus::params::V1_7_ACTIVATION_HEIGHT;
+    use jetsam_vault_rule::DepositRule;
+    assert_eq!(VAULT_ADDRESS.0, jetsam_vault_rule::VAULT_ADDRESS);
+    assert_eq!(
+        VaultRules::current().deposit_rule(),
+        DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT)
+    );
+    let test = rules().deposit_rule();
+    assert_eq!(test, DepositRule::for_activation(Some(J)));
+    // every field is the rules' own, not a constant
+    let odd = VaultRules {
+        activation_height: Some(7),
+        deposits_from_height: Some(11),
+        vault: ALICE,
+        min_deposit: 3,
+        max_deposit: 5,
+        ..rules()
+    };
+    assert_eq!(
+        odd.deposit_rule(),
+        DepositRule {
+            activation_height: Some(7),
+            deposits_from_height: Some(11),
+            vault: ALICE.0,
+            min_deposit: 3,
+            max_deposit: 5,
+        }
+    );
+    for h in [0, J - 1, J, F - 1, F, F + 1, u64::MAX] {
+        assert_eq!(rules().active_at(h), test.active_at(h), "{h}");
+        assert_eq!(rules().deposits_open_at(h), test.deposits_open_at(h), "{h}");
+    }
+    // a refusal of the crate is this gate's, field for field
+    let group = logical(
+        1,
+        PAYER,
+        &[
+            (VAULT_ADDRESS, 3 * MICRO_PER_JTM),
+            (VAULT_ADDRESS, 4 * MICRO_PER_JTM),
+            (deposit_marker(&[1; 20]), 0),
+        ],
+        FEE,
+    );
+    assert_eq!(
+        check(&block(vec![group], &[]), ctx()),
+        Err(VaultError::DepositShape { group: 0 })
+    );
+    assert_eq!(
+        VaultError::from(jetsam_vault_rule::RuleError::DepositBeforeBridgeOpening {
+            group: 2,
+            height: 7,
+            opening: 9
+        }),
+        VaultError::DepositBeforeBridgeOpening {
+            group: 2,
+            height: 7,
+            opening: 9
+        }
+    );
+}
+
 /// D59: `release_fee_for(k, m)` is `max(RELEASE_FEE, consensus minimum fee
 /// of the group)` for every release shape (1 to 1 020 inputs, 2 or 3 live
 /// outputs) under every occupancy pressure, the state-growth term included.
@@ -689,6 +754,31 @@ fn marker_in_coinbase_is_refused() {
             destination: Some(DestinationSection::default()),
         };
         assert_eq!(check(&b, ctx()), Err(VaultError::MarkerInSystemRecord));
+    }
+}
+
+/// Mempool: a plain transaction never carries a committee-update marker
+/// (its object travels with it, as an intention), even beside a deposit;
+/// a block may (the destination rules judge it).
+#[test]
+fn plain_transaction_with_committee_update_marker_is_refused() {
+    let mut lcu = [0x33u8; 32];
+    lcu[..8].copy_from_slice(&LIGHT_CLIENT_UPDATE_MARKER_TAG);
+    let lcu = Address(lcu);
+    for outputs in [
+        vec![(BOB, MICRO_PER_JTM), (lcu, 0)],
+        vec![
+            (VAULT_ADDRESS, 7 * MICRO_PER_JTM),
+            (deposit_marker(&[3; 20]), 0),
+            (lcu, 0),
+        ],
+    ] {
+        let group = logical(100, PAYER, &outputs, FEE);
+        assert_eq!(
+            check_plain_vault_transaction(&pages(group.clone()), HEIGHT, &rules()),
+            Err(VaultError::ReleaseMarkerOutsideRelease { group: 0 })
+        );
+        assert!(check(&block(vec![group], &[]), ctx()).is_ok());
     }
 }
 

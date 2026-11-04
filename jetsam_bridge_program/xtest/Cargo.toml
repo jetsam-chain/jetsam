@@ -1,0 +1,18 @@
+[package]
+name = "jetsam_bridge_xtest"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "G6 = V4 in CI: the node's vault gate and the bridge proof program on the same blocks (differential and exhaustive), and the program's clock against the node's. Tests only."
+
+[features]
+# The private rehearsal: the node and the program on their rehearsal clocks.
+rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7", "jetsam_bridge_program/rehearsal-v1-7"]
+
+[dependencies]
+jetsam_chain = { path = "../../jetsam_chain" }
+jetsam_tx = { path = "../../jetsam_tx" }
+jetsam_poseidon2b = { path = "../../jetsam_poseidon2b" }
+jetsam_vault_rule = { path = "../../jetsam_vault_rule" }
+jetsam_bridge_program = { path = "../core" }
