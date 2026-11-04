@@ -975,6 +975,36 @@ pub fn check_release_group(
     Ok(())
 }
 
+/// A5-7: whether `block` is a bridge deposit block, whose body a node keeps
+/// for `BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH`: one of its groups is a deposit
+/// under V4 (the shared rule's classification, as the gate reads it), in a
+/// block above `F`. A block the gate would refuse is not one.
+pub fn block_carries_deposit(block: &Block, rules: &VaultRules) -> bool {
+    let height = block.header.height;
+    let Ok(stream) = validate_block_page_stream(&block.transactions) else {
+        return false;
+    };
+    let user = &block.transactions[stream.user_start_index..];
+    let rule = rules.deposit_rule();
+    stream.groups.iter().enumerate().any(|(index, group)| {
+        let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
+        let outputs: Vec<([u8; 32], u64)> = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner.0, o.amount)))
+            .collect();
+        matches!(
+            jetsam_vault_rule::classify_group(
+                index,
+                &group.spend.input_owner.0,
+                &outputs,
+                height,
+                &rule
+            ),
+            Ok(GroupClass::Deposit { .. })
+        )
+    })
+}
+
 /// V8 at admission, against the tip's `bridge_locked`: a deposit that would
 /// take the vault over the ceiling is refused (it stays with its owner; the
 /// template applies V8 again in block order, T1.1 §18.2).

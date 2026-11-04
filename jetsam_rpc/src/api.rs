@@ -88,6 +88,13 @@ pub trait JetsamApi {
     #[method(name = "getBlock")]
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>>;
 
+    /// A5-7: the full canonical block at `height`, as hex (as `getBlock`):
+    /// served while it is in the `getBlock` window, or, far longer
+    /// (`BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH`), when it is a bridge deposit
+    /// block. Never a block of another branch. Null otherwise.
+    #[method(name = "getDepositBlock")]
+    async fn get_deposit_block(&self, height: u64) -> RpcResult<Option<String>>;
+
     /// Permanent header plus full body detail when the block remains retained.
     #[method(name = "getBlockDetails")]
     async fn get_block_details(&self, height: u64) -> RpcResult<Option<BlockDetailsInfo>>;

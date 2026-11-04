@@ -100,7 +100,14 @@ const T_RETENTION_META: &str = "retention_meta";
 /// armed clock only; the table is created by its first entry, so a dormant
 /// store is exactly what it was before v1.7.
 const T_GUARDIAN_JOURNAL: &str = "guardian_journal";
-const N_TABLES: u64 = 18;
+/// v1.7 (A5-7): the bodies of bridge deposit blocks
+/// ([`crate::consensus::vault::block_carries_deposit`]), kept for
+/// `BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH` blocks. Key: as
+/// [`T_BLOCK_BODY_OBJECTS`] (`height_be[8] || block_hash`); value: the
+/// block's bytes. Created by its first entry, as the guardian journal: a
+/// dormant store is exactly what it was before v1.7.
+const T_BRIDGE_DEPOSIT_BODIES: &str = "bridge_deposit_bodies";
+const N_TABLES: u64 = 19;
 
 /// Maximum reclaimed-page list searched for one contiguous overflow value.
 ///
@@ -920,7 +927,32 @@ fn archive_block_body_object(
         block_bytes,
         WriteFlags::empty(),
     )?;
+    // A5-7: a bridge deposit block is kept far longer, for `getDepositBlock`.
+    if crate::consensus::vault::block_carries_deposit(
+        &block,
+        &crate::consensus::destination::state::DestinationRules::current().vault,
+    ) {
+        let deposits = txn.create_table(Some(T_BRIDGE_DEPOSIT_BODIES), TableFlags::empty())?;
+        txn.put(
+            &deposits,
+            block_body_object_key(expected_height, expected_hash),
+            block_bytes,
+            WriteFlags::empty(),
+        )?;
+    }
     Ok(())
+}
+
+/// The deposit-body table, if it exists (it never does under the dormant
+/// clock).
+fn open_bridge_deposit_bodies<'txn, K: libmdbx::TransactionKind>(
+    txn: &'txn Transaction<'_, K, NoWriteMap>,
+) -> Result<Option<Table<'txn>>, StoreError> {
+    match txn.open_table(Some(T_BRIDGE_DEPOSIT_BODIES)) {
+        Ok(table) => Ok(Some(table)),
+        Err(libmdbx::Error::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn archive_history_step_proof_object(
@@ -1031,6 +1063,41 @@ fn prune_block_body_objects(
             bytes = bytes.checked_add(value_len).ok_or(StoreError::Decode(
                 "block-body prune byte accounting overflow",
             ))?;
+            keys.push(key);
+            item = cursor.next()?;
+        }
+        keys
+    };
+    for key in deletions {
+        txn.del(&table, key, None)?;
+    }
+    // A5-7: the deposit bodies, on their own horizon (no lease shortens it).
+    prune_bridge_deposit_bodies(txn, current_height)
+}
+
+/// A5-7: drop the deposit bodies below `current_height −
+/// BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH`, a bounded batch at a time.
+fn prune_bridge_deposit_bodies(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    current_height: u64,
+) -> Result<(), StoreError> {
+    let Some(table) = open_bridge_deposit_bodies(txn)? else {
+        return Ok(());
+    };
+    let cutoff = current_height
+        .saturating_sub(crate::consensus::params::BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH);
+    let deletions = {
+        let mut cursor = txn.cursor(&table)?;
+        let mut item: Option<(Vec<u8>, ObjectLength)> = cursor.first()?;
+        let mut keys = Vec::new();
+        while let Some((key, _)) = item {
+            if key.len() != BLOCK_BODY_OBJECT_KEY_BYTES {
+                return Err(StoreError::Decode("invalid deposit-body key length"));
+            }
+            let height = u64::from_be_bytes(key[..8].try_into().unwrap());
+            if height >= cutoff || keys.len() == BLOCK_BODY_OBJECT_PRUNE_LIMIT {
+                break;
+            }
             keys.push(key);
             item = cursor.next()?;
         }
@@ -2408,6 +2475,35 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         Ok(txn.get(&tbl, &u64_key(height))?)
+    }
+
+    /// A5-7 (`getDepositBlock`): the bytes of the **canonical** block at
+    /// `height`, when this node serves them: from the `getBlock` window
+    /// (the canonical height row), or, beyond it, a bridge deposit block
+    /// kept under the hash of the canonical header at `height` (never a body
+    /// of another branch).
+    pub fn get_canonical_deposit_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let recent = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let row: Option<Vec<u8>> = txn.get(&recent, &u64_key(height))?;
+        if row.is_some() {
+            return Ok(row);
+        }
+        let Some(deposits) = open_bridge_deposit_bodies(&txn)? else {
+            return Ok(None);
+        };
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        let Some(header) = raw.as_deref().and_then(decode_header) else {
+            return Ok(None);
+        };
+        if header.height != height {
+            return Err(StoreError::Decode("canonical header row is not at its height"));
+        }
+        // Keyed by the canonical header's hash: a body of another branch at
+        // this height (one a reorg displaced) is never found.
+        let key = block_body_object_key(height, crate::block_header::block_id(&header));
+        Ok(txn.get(&deposits, &key)?)
     }
 
     /// Read one bounded content-addressed block body independently of the
@@ -4715,6 +4811,9 @@ impl MdbxStore {
         if let Some(journal) = open_guardian_journal(&txn)? {
             txn.clear_table(&journal)?;
         }
+        if let Some(deposits) = open_bridge_deposit_bodies(&txn)? {
+            txn.clear_table(&deposits)?;
+        }
         txn.commit()?;
         Ok(())
     }
@@ -5573,6 +5672,164 @@ mod tests {
         prune_block_body_objects(&txn, 200, None).unwrap();
         txn.commit().unwrap();
         assert!(store.get_block_body_object(2, hash).unwrap().is_none());
+    }
+
+    /// A5-7: the store under v1.7 rules (`F` = `vault::tests::F`), a deposit
+    /// block and a plain block of the vault tests at `height` and
+    /// `height + 1`, archived, their headers canonical. (No destination
+    /// section: this profile's wire does not carry one.)
+    fn deposit_store(
+        height: u64,
+    ) -> (
+        tempfile::TempDir,
+        MdbxStore,
+        crate::consensus::destination::state::test_rules::Installed,
+        [(crate::Block, [u8; 32]); 2],
+    ) {
+        use crate::consensus::destination::state::{test_rules, DestinationRules};
+        use crate::consensus::vault::tests::{block_at, deposit, logical, rules, ALICE, FEE, PAYER};
+        let installed = test_rules::install(DestinationRules {
+            activation_height: rules().activation_height,
+            vault: rules(),
+            ..DestinationRules::CONSENSUS
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let blocks = [
+            block_at(height, vec![deposit(200, [7; 20], 5_000_000)], &[]),
+            block_at(height + 1, vec![logical(300, PAYER, &[(ALICE, 5)], FEE)], &[]),
+        ]
+        .map(|mut b| {
+            b.destination = None;
+            let hash = crate::block_header::block_id(&b.header);
+            (b, hash)
+        });
+        let txn = store.db.begin_rw_txn().unwrap();
+        let headers = txn.open_table(Some(T_HEADERS)).unwrap();
+        for (b, hash) in &blocks {
+            archive_block_body_object(&txn, b.header.height, *hash, &b.to_bytes()).unwrap();
+            txn.put(
+                &headers,
+                u64_key(b.header.height),
+                encode_header(&b.header),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        (directory, store, installed, blocks)
+    }
+
+    /// A5-7: the body of a deposit block (V4, above F) is kept for
+    /// `BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH` blocks, far beyond the body
+    /// objects' window and the serving window, and is served for its height
+    /// while its header is canonical; a plain block's is not kept.
+    #[test]
+    fn a_deposit_block_body_outlives_the_serving_windows() {
+        use crate::consensus::params::{
+            BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH, RETAINED_BLOCK_SERVING_DEPTH,
+        };
+        let height = crate::consensus::vault::tests::HEIGHT;
+        let (_directory, store, _rules, [(deposit, deposit_hash), (plain, plain_hash)]) =
+            deposit_store(height);
+        assert!(
+            BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH
+                > BLOCK_BODY_OBJECT_MAX_PIN_DEPTH.max(RETAINED_BLOCK_SERVING_DEPTH)
+        );
+        // Past every other window: the body objects are pruned (the same
+        // maintenance prunes the deposit bodies, on their own horizon).
+        for tip in [
+            height + BLOCK_BODY_OBJECT_MAX_PIN_DEPTH + 1,
+            height + BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH,
+        ] {
+            let txn = store.db.begin_rw_txn().unwrap();
+            prune_block_body_objects(&txn, tip, Some(height)).unwrap();
+            txn.commit().unwrap();
+        }
+        assert!(store.get_block_body_object(height, deposit_hash).unwrap().is_none());
+        assert!(store.get_block_body_object(height + 1, plain_hash).unwrap().is_none());
+        assert_eq!(store.get_recent_block(height).unwrap(), None);
+        // The deposit block is still served, exactly; the plain one is not.
+        assert_eq!(
+            store.get_canonical_deposit_block(height).unwrap(),
+            Some(deposit.to_bytes())
+        );
+        assert_eq!(store.get_canonical_deposit_block(height + 1).unwrap(), None);
+        let _ = plain;
+        // One block later it leaves the deposit window too.
+        let txn = store.db.begin_rw_txn().unwrap();
+        prune_block_body_objects(&txn, height + BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH + 1, None)
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_canonical_deposit_block(height).unwrap(), None);
+    }
+
+    /// A5-7: `getDepositBlock` serves the canonical block of a height only:
+    /// a retained deposit body whose header is no longer the canonical one
+    /// (another branch won the height) is never served, and a block within
+    /// the `getBlock` window is served as `getBlock` serves it.
+    #[test]
+    fn a_deposit_body_is_served_only_for_the_canonical_header() {
+        let height = crate::consensus::vault::tests::HEIGHT;
+        let (_directory, store, _rules, [(deposit, _), _]) = deposit_store(height);
+        assert_eq!(
+            store.get_canonical_deposit_block(height).unwrap(),
+            Some(deposit.to_bytes())
+        );
+        // Another header wins the height.
+        let mut other = deposit.header;
+        other.nonce ^= 1;
+        let txn = store.db.begin_rw_txn().unwrap();
+        let headers = txn.open_table(Some(T_HEADERS)).unwrap();
+        txn.put(&headers, u64_key(height), encode_header(&other), WriteFlags::empty())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_canonical_deposit_block(height).unwrap(), None);
+        // No canonical header at all: nothing.
+        assert_eq!(store.get_canonical_deposit_block(height + 7).unwrap(), None);
+        // The `getBlock` window: the canonical row, whatever the block.
+        let txn = store.db.begin_rw_txn().unwrap();
+        let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+        txn.put(&recent, u64_key(height + 9), [0xC0u8; 3], WriteFlags::empty())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            store.get_canonical_deposit_block(height + 9).unwrap(),
+            store.get_recent_block(height + 9).unwrap()
+        );
+        // A wiped store keeps no deposit body either.
+        store.clear_all().unwrap();
+        let txn = store.db.begin_ro_txn().unwrap();
+        let table = txn.open_table(Some(T_BRIDGE_DEPOSIT_BODIES)).unwrap();
+        assert_eq!(txn.table_stat(&table).unwrap().entries(), 0);
+    }
+
+    /// A5-7: under the dormant clock (this profile's consensus rules), no
+    /// block is a deposit block: the store keeps nothing more than before,
+    /// and has no deposit table at all.
+    #[test]
+    fn a_dormant_store_keeps_no_deposit_body() {
+        let height = crate::consensus::vault::tests::HEIGHT;
+        let (_directory, store, rules, [(deposit, hash), _]) = deposit_store(height);
+        drop(rules);
+        let directory = tempfile::tempdir().unwrap();
+        let dormant = MdbxStore::open(directory.path()).unwrap();
+        if crate::consensus::params::V1_7_ACTIVATION_HEIGHT.is_none() {
+            let txn = dormant.db.begin_rw_txn().unwrap();
+            archive_block_body_object(&txn, height, hash, &deposit.to_bytes()).unwrap();
+            let headers = txn.open_table(Some(T_HEADERS)).unwrap();
+            txn.put(&headers, u64_key(height), encode_header(&deposit.header), WriteFlags::empty())
+                .unwrap();
+            txn.commit().unwrap();
+            let txn = dormant.db.begin_ro_txn().unwrap();
+            assert!(matches!(
+                txn.open_table(Some(T_BRIDGE_DEPOSIT_BODIES)),
+                Err(libmdbx::Error::NotFound)
+            ));
+            drop(txn);
+            assert_eq!(dormant.get_canonical_deposit_block(height).unwrap(), None);
+        }
+        let _ = store;
     }
 
     #[test]

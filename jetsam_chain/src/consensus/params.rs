@@ -1916,6 +1916,29 @@ pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 pub const RETAINED_BLOCK_SERVING_DEPTH: u64 =
     CONSENSUS_FINALITY_DEPTH + RECENT_BLOCK_RETENTION_DEPTH + 6;
 
+/// A5-7: how many blocks a node keeps the body of a bridge **deposit block**
+/// (one with a group V4 classifies as a deposit, above
+/// `BRIDGE_DEPOSITS_FROM_HEIGHT`), served by `getDepositBlock` long after
+/// `RETAINED_BLOCK_SERVING_DEPTH` and the body objects' window: 14 days of
+/// 180-second blocks.
+///
+/// A deposit is proven from its whole block (the relayer's checkpoint, the
+/// claim program), and its root may become claimable late: 24 h of the
+/// contract's slow path (`D_SLOW`) after its checkpoint, plus the contract's
+/// pauses (at most 48 h each and 96 h per 30 days), i.e. up to five days;
+/// the nine further days leave an operator the time to bring a stopped
+/// relayer back, re-prove a branch, or claim a deposit directly.
+///
+/// Operational, not consensus: it never decides a block's validity, and it
+/// may be raised without a fork. Bounded: at most one body per block, so
+/// 6 720 bodies of at most `MAX_V1_7_BLOCK_BYTES` (about 0.9 GB) in the
+/// worst case of every block being a full deposit block for 14 days.
+pub const BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH: u64 = 14 * 24 * 60 * 60 / BLOCK_TIME_V1_5;
+
+// At least D_SLOW and one longest pause, and more than every other window.
+const _: () = assert!(BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH * BLOCK_TIME_V1_5 >= (24 + 48) * 3_600);
+const _: () = assert!(BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH > RETAINED_BLOCK_SERVING_DEPTH);
+
 /// Number of hard-finalized block headers used for the state-expansion trigger.
 ///
 /// Expansion requires a strict majority of this complete window to be at or

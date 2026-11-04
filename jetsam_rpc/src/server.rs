@@ -2328,6 +2328,15 @@ impl JetsamApiServer for RpcHandler {
         }
     }
 
+    async fn get_deposit_block(&self, height: u64) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
+        match chain.store.get_canonical_deposit_block(height) {
+            Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
     async fn get_block_details(&self, height: u64) -> RpcResult<Option<BlockDetailsInfo>> {
         let (header, retained_bytes) = {
             let chain = self.chain.read().await;
