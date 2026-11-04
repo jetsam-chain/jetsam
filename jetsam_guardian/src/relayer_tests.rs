@@ -178,6 +178,13 @@ fn a_tip_off_this_chain_or_with_other_roots_is_passed_over_for_its_nearest_good_
     let s = plan_submission(&c, &known, &b2id, &b2.cp.cum_work, GL, &found, &[], at).unwrap();
     assert_eq!(s.parent, aid, "a parent whose roots are not this chain's is not extended");
     assert_eq!(s.deposits.len(), 1);
+    // nor one whose anchor root is not this chain's (another anchor base, a forged point)
+    let (_, mut b3) = known_at(&c, 50, aid, &deposits_upto(&found, GL, 42), 400);
+    b3.cp.anchor_root = [0xab; 32];
+    let b3id = b3.cp.id();
+    let known = HashMap::from([(aid, known[&aid].clone()), (gid, known[&gid].clone()), (b3id, b3.clone())]);
+    let s = plan_submission(&c, &known, &b3id, &b3.cp.cum_work, GL, &found, &[], at).unwrap();
+    assert_eq!(s.parent, aid, "a parent whose anchor root is not this chain's is not extended");
 }
 
 #[test]
