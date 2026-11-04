@@ -1207,3 +1207,63 @@ fn journal_lines_are_not_feed_lines_and_a_spliced_line_breaks_the_chain() {
     std::fs::write(&a, format!("{feed}\n")).unwrap();
     assert!(DecisionJournal::verify(&a, &public).is_err());
 }
+
+// ---------------------------------------------------------------- own repayments (BRIDGE-REST)
+
+fn advanced(txid: u8, recipient: u8, amount: u64, status: AdvanceStatus) -> Advanced {
+    Advanced {
+        key: advance_key(&[txid; 32], &rcpt(recipient), amount),
+        txid: [txid; 32],
+        height: F + 1,
+        block_id: [0u8; 32],
+        recipient: rcpt(recipient),
+        amount,
+        fee_bps: 75,
+        paid: paid(amount, 75),
+        sent_at: 0,
+        tx_hash: String::new(),
+        status,
+    }
+}
+
+#[test]
+fn the_robot_claims_only_its_pending_advances_whose_exact_tuple_is_in_the_final_root() {
+    use crate::checkpoint::{deposit_leaf, Deposit};
+    let deps: Vec<Deposit> = [(1u8, 0xa1u8, 7 * JTM), (2, 0xa2, 400 * JTM), (3, 0xa3, 3 * JTM), (4, 0xa4, 5 * JTM), (5, 0xa5, 9 * JTM)]
+        .iter()
+        .enumerate()
+        .map(|(i, (t, r, a))| Deposit { index: i as u64, recipient: rcpt(*r), amount: *a, jetsam_tx_id: [*t; 32] })
+        .collect();
+    let ledger = Ledger {
+        advances: vec![
+            advanced(1, 0xa1, 7 * JTM, AdvanceStatus::Pending),
+            advanced(2, 0xa2, 401 * JTM, AdvanceStatus::Pending), // another amount: another tuple, never repaid by this mint
+            advanced(3, 0xa3, 3 * JTM, AdvanceStatus::Repaid),
+            advanced(4, 0xa4, 5 * JTM, AdvanceStatus::Pending),   // minted already (by a claimer)
+            advanced(9, 0xa9, 5 * JTM, AdvanceStatus::Pending),   // not in this root yet
+            advanced(5, 0xa5, 9 * JTM, AdvanceStatus::Pending),
+        ],
+    };
+    let minted = |t: &[u8; 32]| *t == [4u8; 32];
+    let claims = own_claims(&ledger, &deps, &minted, 4);
+    assert_eq!(claims.iter().map(|(d, _)| d.jetsam_tx_id[0]).collect::<Vec<_>>(), vec![1, 5]);
+    let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
+    let root = crate::chain::merkle_root(&leaves);
+    for (d, branch) in &claims {
+        let mut n = deposit_leaf(d);
+        for (h, b) in branch.iter().enumerate() {
+            let mut pre = [0u8; 64];
+            if (d.index >> h) & 1 == 1 {
+                pre[..32].copy_from_slice(b);
+                pre[32..].copy_from_slice(&n);
+            } else {
+                pre[..32].copy_from_slice(&n);
+                pre[32..].copy_from_slice(b);
+            }
+            n = crate::keccak256(&pre);
+        }
+        assert_eq!(n, root, "a valid branch");
+    }
+    assert_eq!(own_claims(&ledger, &deps, &minted, 1).len(), 1, "at most max");
+    assert!(own_claims(&ledger, &deps, &|_| true, 4).is_empty());
+}

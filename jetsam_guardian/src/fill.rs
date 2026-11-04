@@ -562,6 +562,25 @@ pub struct Advanced {
     pub status: AdvanceStatus,
 }
 
+/// The claims of the robot's own repayments in a final root's deposits `deps` (those of a published
+/// `final.json`, already checked against its root): every PENDING advance whose EXACT tuple (txid,
+/// recipient, amount) is a deposit of the root, not minted (`minted`), with its Merkle branch; at most `max`.
+pub fn own_claims(ledger: &Ledger, deps: &[crate::checkpoint::Deposit], minted: &dyn Fn(&[u8; 32]) -> bool, max: usize) -> Vec<(crate::checkpoint::Deposit, [[u8; 32]; crate::chain::TREE_DEPTH])> {
+    let leaves: Vec<[u8; 32]> = deps.iter().map(crate::checkpoint::deposit_leaf).collect();
+    let mut out = Vec::new();
+    for a in ledger.advances.iter().filter(|a| a.status == AdvanceStatus::Pending) {
+        if out.len() >= max {
+            break;
+        }
+        let Some(d) = deps.iter().find(|d| d.jetsam_tx_id == a.txid && d.recipient == a.recipient && d.amount == a.amount) else { continue };
+        if minted(&a.txid) {
+            continue;
+        }
+        out.push((*d, crate::chain::merkle_branch(&leaves, d.index as usize)));
+    }
+    out
+}
+
 /// The robot's own book of its advances (its caps per hour and per recipient count them).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {

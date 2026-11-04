@@ -481,17 +481,17 @@ impl Robot {
         if word(&self.view("isFinalDepositRoot(bytes32)", &fin.deposit_root)?, 0)[31] != 1 {
             return Ok(());
         }
-        let leaves: Vec<[u8; 32]> = deps.iter().map(jetsam_guardian::checkpoint::deposit_leaf).collect();
-        let mut sent = 0;
-        let pending: Vec<Advanced> = self.state.ledger.advances.iter().filter(|a| a.status == AdvanceStatus::Pending).cloned().collect();
-        for a in pending {
-            let Some(d) = deps.iter().find(|d| d.jetsam_tx_id == a.txid && d.recipient == a.recipient && d.amount == a.amount) else { continue };
-            if sent >= 4 || word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1 {
-                continue;
-            }
-            let branch = jetsam_guardian::chain::merkle_branch(&leaves, d.index as usize);
-            sent += 1;
-            match self.tx.send(&self.l1, &self.bridge, &l1::claim_deposit(d, &fin.deposit_root, &branch), "claimDeposit") {
+        let l1 = &self.l1;
+        let bridge = &self.bridge;
+        let minted = |t: &[u8; 32]| {
+            let mut data = l1::selector("isMinted(bytes32)").to_vec();
+            data.extend_from_slice(t);
+            l1.call(bridge, &data).map(|w| word(&w, 0)[31] == 1).unwrap_or(true)
+        };
+        let claims = fill::own_claims(&self.state.ledger, &deps, &minted, 4);
+        for (d, branch) in claims {
+            let Some(a) = self.state.ledger.advances.iter().find(|a| a.txid == d.jetsam_tx_id && a.recipient == d.recipient && a.amount == d.amount).cloned() else { continue };
+            match self.tx.send(&self.l1, &self.bridge, &l1::claim_deposit(&d, &fin.deposit_root, &branch), "claimDeposit") {
                 Ok(r) => {
                     log(&format!("claimed own repayment key {} status {} gas {}", hex::encode(a.key), r.status, r.gas_used));
                     self.journal(json!({"kind": "claimed_own", "key": hex::encode(a.key), "txid": hex::encode(a.txid), "status": r.status,
