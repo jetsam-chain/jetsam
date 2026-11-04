@@ -757,6 +757,31 @@ fn marker_in_coinbase_is_refused() {
     }
 }
 
+/// Mempool: a plain transaction never carries a committee-update marker
+/// (its object travels with it, as an intention), even beside a deposit;
+/// a block may (the destination rules judge it).
+#[test]
+fn plain_transaction_with_committee_update_marker_is_refused() {
+    let mut lcu = [0x33u8; 32];
+    lcu[..8].copy_from_slice(&LIGHT_CLIENT_UPDATE_MARKER_TAG);
+    let lcu = Address(lcu);
+    for outputs in [
+        vec![(BOB, MICRO_PER_JTM), (lcu, 0)],
+        vec![
+            (VAULT_ADDRESS, 7 * MICRO_PER_JTM),
+            (deposit_marker(&[3; 20]), 0),
+            (lcu, 0),
+        ],
+    ] {
+        let group = logical(100, PAYER, &outputs, FEE);
+        assert_eq!(
+            check_plain_vault_transaction(&pages(group.clone()), HEIGHT, &rules()),
+            Err(VaultError::ReleaseMarkerOutsideRelease { group: 0 })
+        );
+        assert!(check(&block(vec![group], &[]), ctx()).is_ok());
+    }
+}
+
 #[test]
 fn releases_above_block_cap_are_refused() {
     let releases: Vec<VaultRelease> = (1..=5).map(|n| release(n, ALICE, MICRO_PER_JTM)).collect();
