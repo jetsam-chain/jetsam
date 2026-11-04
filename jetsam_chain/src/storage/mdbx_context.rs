@@ -3602,9 +3602,11 @@ impl MdbxChainContext {
 mod tests {
     use super::*;
 
+    mod apply_cost;
     mod client_registry;
     mod destination;
     mod relation_root;
+    mod segment_tree_equivalence;
     mod snapshot_v17;
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
