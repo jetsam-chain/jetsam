@@ -350,7 +350,7 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     let e = |extra: &str| RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, extra)).unwrap_err().to_string();
     assert!(e("[prover]\nmode = \"mock\"\n").contains("refused"), "simulated proofs off the rehearsal");
     assert!(e("[prover]\nmode = \"command\"\n").contains("empty"));
-    assert!(e(&format!("cadence_secs = 7200\n{cmd}")).contains("cadence"), "W_STALL − 600 at most");
+    assert!(e(&format!("cadence_secs = 7000\n{cmd}timeout_secs = 100\n")).contains("outside 1..=6600"), "W_STALL − 600 at most, whatever the prover");
     assert!(e(&format!("{cmd}timeout_secs = 541\n")).contains("stalled()"), "a proof that would land after W_STALL");
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}timeout_secs = 3000\nprove_ahead_secs = 2500\n"))).is_ok(), "a slow prover started ahead");
     assert!(e(&format!("min_nodes = 1\n{cmd}")).contains("floor"));
