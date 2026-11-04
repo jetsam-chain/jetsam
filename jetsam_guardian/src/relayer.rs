@@ -541,6 +541,74 @@ impl ProofRequest {
     }
 }
 
+/// The checkpoint program's checkpoint, from the relayer's (same fields, works big-endian).
+fn to_program(c: &Checkpoint) -> jetsam_bridge_program::spv::CheckpointV3 {
+    jetsam_bridge_program::spv::CheckpointV3 {
+        height: c.height,
+        cum_work: c.cum_work,
+        headers_digest: c.headers_digest,
+        deposit_root: c.deposit_root,
+        deposit_count: c.deposit_count,
+        anchor_root: c.anchor_root,
+        locked_height: c.locked_height,
+        tip_block_id: c.tip_block_id,
+        locked_block_id: c.locked_block_id,
+        locked_cum_work: c.locked_cum_work,
+    }
+}
+
+/// The checkpoint program's input (`JSPVIN05`) for a request: the parent's context exactly as the program
+/// bounds it (`context_range`: this chain up to the fork base, then the parent's abandoned headers), the new
+/// branch above the base, the pages of the deposit blocks.
+pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
+    use jetsam_bridge_program::spv;
+    let parent = to_program(&req.parent);
+    let (first, last) = spv::context_range(&parent, req.fork_depth);
+    let base = req.parent.height - u64::from(req.fork_depth);
+    anyhow::ensure!(first >= req.headers_from, "the request starts its headers at {}, the program needs {first}", req.headers_from);
+    let ours = |h: u64| -> anyhow::Result<[u8; 212]> {
+        let raw = req.headers.get((h - req.headers_from) as usize).ok_or_else(|| anyhow::anyhow!("header {h} not in the request"))?;
+        raw.as_slice().try_into().map_err(|_| anyhow::anyhow!("header {h}: not 212 bytes"))
+    };
+    let mut context = Vec::new();
+    for h in first..=base {
+        context.push(ours(h)?);
+    }
+    anyhow::ensure!(req.abandoned.len() as u64 == last - base, "{} abandoned headers, the fork needs {}", req.abandoned.len(), last - base);
+    for raw in &req.abandoned {
+        context.push(raw.as_slice().try_into().map_err(|_| anyhow::anyhow!("abandoned header: not 212 bytes"))?);
+    }
+    let new: Vec<[u8; 212]> = (base + 1..=req.next.height).map(ours).collect::<anyhow::Result<_>>()?;
+    let mut blocks = Vec::new();
+    for (h, pages) in &req.deposit_blocks {
+        let p: Vec<[u8; 323]> = pages.iter().map(|x| x.as_slice().try_into().map_err(|_| anyhow::anyhow!("page: not 323 bytes"))).collect::<anyhow::Result<_>>()?;
+        blocks.push((*h, p));
+    }
+    Ok(spv::encode_input(&parent, req.anchor_base, &req.deposit_frontier, &req.anchor_frontier, req.fork_depth, &context, &new, &blocks))
+}
+
+/// The checkpoint program's relation run natively on `input` (what the guest proves): its 608 bytes of
+/// public values, or its refusal (the rule it panicked on).
+pub fn run_native(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut pad = vec![0u64; tw_core::towerwalk::CELLS];
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        jetsam_bridge_program::spv::run(input, jetsam_bridge_program::keccak::keccak_f_soft, &mut pad)
+    }))
+    .map_err(|e| {
+        let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        anyhow::anyhow!("the checkpoint program refuses the transition: {why}")
+    })?;
+    Ok(out.public_values.to_vec())
+}
+
+/// Before any proof: the program, run natively on the request's input, commits exactly the request's
+/// public values (else the proof would be of something else, or none).
+pub fn check_native(req: &ProofRequest) -> anyhow::Result<()> {
+    let pv = run_native(&program_input(req)?)?;
+    anyhow::ensure!(pv == req.public_values, "the checkpoint program commits other public values than the relayer's checkpoint");
+    Ok(())
+}
+
 /// Makes the proof of a submission.
 pub trait Prover {
     fn prove(&self, req: &ProofRequest) -> anyhow::Result<Vec<u8>>;
@@ -675,6 +743,14 @@ pub struct ProverConfig {
     /// Headers given below the lower of the parent's L and the fork base (the header rules' window).
     #[serde(default = "default_context_below")]
     pub context_below: u64,
+    /// Run the program natively on every request before proving it (`check_native`): mandatory off the
+    /// private rehearsal; the rehearsal may turn it off for synthetic chains.
+    #[serde(default = "default_true")]
+    pub native_check: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_prove_timeout() -> u64 {
@@ -755,6 +831,7 @@ impl RelayConfig {
             "command" => anyhow::ensure!(!c.prover.command.is_empty(), "[prover] command is empty"),
             other => anyhow::bail!("[prover] mode = {other:?}: \"command\" or \"mock\""),
         }
+        anyhow::ensure!(c.prover.native_check || rehearsal, "[prover] native_check = false is refused on {profile}");
         // the point lands before W_STALL: started `ahead` before it is due, proven within the timeout
         anyhow::ensure!(
             c.prover.timeout_secs + INCLUSION_SECS <= crate::relay::W_STALL - c.cadence_secs + c.prover.prove_ahead_secs,

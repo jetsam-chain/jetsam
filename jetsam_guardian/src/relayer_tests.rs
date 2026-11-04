@@ -93,7 +93,7 @@ fn the_fork_base_is_the_highest_shared_block_of_the_parents_context() {
 
 #[test]
 fn deposits_are_indexed_from_the_genesis_in_chain_order() {
-    let found = found_of(&[dep(9, 1, JTM), dep(12, 2, 2 * JTM), dep(12, 3, 3 * JTM), dep(20, 4, 4 * JTM)]);
+    let found = found_of(&[dep(9, 1, JTM), dep(GL, 9, 9 * JTM), dep(12, 2, 2 * JTM), dep(12, 3, 3 * JTM), dep(20, 4, 4 * JTM)]);
     let d = deposits_upto(&found, GL, 20);
     assert_eq!(d.iter().map(|x| (x.index, x.amount)).collect::<Vec<_>>(), vec![(0, 2 * JTM), (1, 3 * JTM), (2, 4 * JTM)], "none at or below the genesis's L");
     assert_eq!(deposits_upto(&found, GL, 19).len(), 2);
@@ -114,6 +114,9 @@ fn the_honest_child_extends_the_contract_tip_and_moves_l() {
     assert_eq!(s.mn, mn_values(&c, GL, 40).unwrap());
     assert_eq!((s.mn.fork_base_timestamp, s.mn.max_timestamp), (ts(&c, GL), ts(&c, 40)));
     assert_eq!(s.next.anchor_root, c.anchor_root(GL, 32).unwrap());
+    // the digest names L−7..=L (the engaged identity), never the tip's eight
+    let ids: Vec<[u8; 32]> = (25..=32).map(|h| c.id_at(h).unwrap()).collect();
+    assert_eq!(s.next.headers_digest, jetsam_chain::consensus::guardian::headers_digest(&ids.try_into().unwrap()));
 }
 
 #[test]

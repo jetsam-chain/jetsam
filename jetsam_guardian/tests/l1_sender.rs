@@ -229,3 +229,32 @@ fn a_transaction_left_unmined_is_replaced_and_the_replacement_is_mined() {
     assert!(hex_u64(&tx["maxFeePerGas"]).unwrap() as u128 > p.fees.1 / 2, "higher fees");
     assert_eq!(nonce(&l1, &key(TEST_KEY_2).address()), 1, "one nonce for all the versions");
 }
+
+#[test]
+fn a_transaction_is_written_ahead_before_it_leaves_the_host() {
+    let Some(a) = anvil() else { return };
+    let l1 = L1::new(&a.url);
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = sender(TEST_KEY_1, dir.path());
+    s.replace_after = Duration::from_secs(3_600);
+    l1.rpc("evm_setAutomine", json!([false])).unwrap();
+    let (url, path) = (a.url.clone(), s.pending_path.clone());
+    let handle = std::thread::spawn(move || s.send(&L1::new(&url), TARGET, b"ahead", "test"));
+    // in flight, not mined: its signed bytes are already on disk, and they are what the endpoint holds
+    let mut written = None;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            written = Some(serde_json::from_str::<Pending>(&text).unwrap());
+            break;
+        }
+    }
+    let p = written.expect("written ahead while in flight");
+    assert_eq!(p.sent.len(), 1);
+    let pooled = l1.rpc("eth_getTransactionByHash", json!([p.sent[0].0])).unwrap();
+    assert!(!pooled.is_null() && pooled["blockNumber"].is_null(), "sent, not mined yet");
+    l1.rpc("evm_mine", json!([])).unwrap();
+    let r = handle.join().unwrap().unwrap();
+    assert_eq!(r.tx_hash, p.sent[0].0, "the very transaction written ahead");
+    assert!(!path.exists(), "cleared once mined");
+}

@@ -388,6 +388,10 @@ impl Relay {
         }
         let parent = &known[&s.parent];
         let req = ProofRequest::build(&s, parent, &self.chain, &self.archive, gl, anchor_base, self.cfg.prover.context_below)?;
+        if self.cfg.prover.native_check {
+            // the program itself, natively: no proof is asked for a transition it refuses or commits otherwise
+            relayer::check_native(&req)?;
+        }
         let started = std::time::Instant::now();
         let proof = self.prover.prove(&req)?;
         let proving = started.elapsed().as_secs();
@@ -487,11 +491,6 @@ fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The checkpoint program's input bytes: the program's v3 encoder (not wired in this build).
-fn program_input(_req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
-    anyhow::bail!("this build has no encoder of the checkpoint program v3 input: [prover] mode = \"command\" cannot run")
-}
-
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let (cfg, digest) = config(&args)?;
@@ -535,7 +534,7 @@ fn run() -> anyhow::Result<()> {
             argv: cfg.prover.command.clone(),
             work_dir: cfg.state_dir.join("proofs"),
             timeout: Duration::from_secs(cfg.prover.timeout_secs),
-            encode: program_input,
+            encode: relayer::program_input,
         }),
     };
     let state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();

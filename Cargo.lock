@@ -3189,6 +3189,8 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hkdf 0.12.4",
+ "jetsam_bridge_program",
+ "jetsam_bridge_towerwalk",
  "jetsam_chain",
  "jetsam_poseidon2b",
  "jetsam_tx",

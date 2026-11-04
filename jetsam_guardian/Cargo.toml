@@ -9,7 +9,7 @@ publish = false
 [features]
 # `jg-fill` reads the network's blocks with the build's v1.7 clock (`Block::from_bytes`,
 # `VaultRules::current`): its private-rehearsal build is made with this profile, like the nodes'.
-rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7"]
+rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7", "jetsam_bridge_program/rehearsal-v1-7"]
 
 [dependencies]
 jetsam_chain = { path = "../jetsam_chain" }
@@ -32,6 +32,9 @@ argon2 = "0.5"
 bech32 = "0.11"
 # the 323-byte pages of a deposit block, as the checkpoint program reads them (relayer)
 jetsam_tx = { path = "../jetsam_tx" }
+# the checkpoint program v3: its input encoder and its relation, run natively before any proof (relayer)
+jetsam_bridge_program = { path = "../jetsam_bridge_program/core" }
+tw-core = { package = "jetsam_bridge_towerwalk", path = "../jetsam_bridge_program/towerwalk" }
 # Local signing of the robots' L1 transactions (secp256k1 ECDSA, RFC 6979): the relayer and jg-fill hold their
 # own hot key (BRIDGE-REST). RustCrypto, pure Rust; already in the offline registry.
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
