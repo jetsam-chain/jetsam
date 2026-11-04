@@ -3,7 +3,7 @@
 //! Jetsam header segment on the previous bridge checkpoint v3 and its context (G1, G11), computes the new
 //! locked block L and the checkpoint's ten fields and MN values (G10), the block anchors and the vault
 //! deposits of whole blocks of `]parent.L ; L]` under V4 — the node's own rule (`jetsam_vault_rule`,
-//! G6 = V4) — and commits the 608 bytes of `JetsamBridge.publicValues` (G8, see
+//! G6 = V4) — and commits the 672 bytes of `JetsamBridge.publicValues` (G8, see
 //! `jetsam_bridge_program::spv`).
 #![no_main]
 sp1_zkvm::entrypoint!(main);

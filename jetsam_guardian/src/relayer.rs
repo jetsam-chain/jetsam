@@ -151,6 +151,7 @@ pub fn mn_values(chain: &Chain, base: u64, t: u64) -> Option<Mn> {
         fork_base_work: u256::to_be(&b.work),
         segment_work: u256::to_be(&u256::sub(&chain.work_at(t)?, &chain.work_at(base)?)),
         max_timestamp: max_ts,
+        tip_on_branch: false, // relative to the bridge's tip: `plan_submission` sets it
     })
 }
 
@@ -176,6 +177,9 @@ pub struct Submission {
     pub mn: Mn,
     /// The deposits of `]gl ; next.L]`, indexed (the parent's first).
     pub deposits: Vec<Deposit>,
+    /// The contract's `tipBlockId` the submission is planned against (public value 19, A5-4): the proof is
+    /// valid only while it is the tip's block.
+    pub bridge_tip_block: [u8; 32],
 }
 
 /// Why no submission now.
@@ -195,16 +199,30 @@ pub enum NoSubmission {
     TimestampAhead,
     /// The chain cannot say (headers missing).
     ChainTooShort,
+    /// MN-1 (A5-4): the contract's tip is on this chain but its roots are not this relayer's (another
+    /// submitter left deposits out): a point that does not extend it would be refused (`MustExtendTip`).
+    MustExtendTip,
+}
+
+/// MN-1 (A5-4), as the program decides it: the block `bridge_tip_block` is on the new branch, i.e. among
+/// the headers of `chain` from the first height of the parent's context (`context_range`) to `t` (the
+/// context up to the fork base is `chain`'s, the new segment above it too).
+pub fn tip_on_branch(chain: &Chain, parent: &Checkpoint, fork_depth: u8, t: u64, bridge_tip_block: &[u8; 32]) -> bool {
+    let (first, _) = jetsam_bridge_program::spv::context_range(&to_program(parent), fork_depth);
+    (first..=t).any(|h| chain.id_at(h).as_ref() == Some(bridge_tip_block))
 }
 
 /// The submission on top of the contract's tip `tip` (or of the nearest ancestor of it whose locked block
 /// and roots are those of `chain`), for the highest tip of `chain` whose locked block stays below the
-/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in).
+/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in). `bridge_tip_block` is
+/// the contract's `tipBlockId` (the block of `tip`).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_submission(
     chain: &Chain,
     known: &HashMap<[u8; 32], Known>,
     tip: &[u8; 32],
     tip_cum_work_be: &[u8; 32],
+    bridge_tip_block: &[u8; 32],
     gl: u64,
     found: &BTreeMap<u64, Vec<FoundDeposit>>,
     missing: &[u64],
@@ -261,14 +279,59 @@ pub fn plan_submission(
     if u256::cmp(&u256::from_be(&next.cum_work), &u256::from_be(tip_cum_work_be)) != std::cmp::Ordering::Greater {
         return Err(NoSubmission::NotHeavier);
     }
-    let mn = mn_values(chain, base, t).ok_or(NoSubmission::ChainTooShort)?;
+    let mut mn = mn_values(chain, base, t).ok_or(NoSubmission::ChainTooShort)?;
+    mn.tip_on_branch = tip_on_branch(chain, &parent.cp, fork_depth, t, bridge_tip_block);
+    // MN-1 (A5-4): a point that does not extend the tip must leave the tip's block behind
+    if (parent_id != *tip || fork_depth != 0) && mn.tip_on_branch {
+        return Err(NoSubmission::MustExtendTip);
+    }
     if mn.max_timestamp > l1_at + MAX_TS_DRIFT {
         return Err(NoSubmission::TimestampAhead);
     }
     if !mn5_ok(&mn, l1_at) {
         return Err(NoSubmission::WorkRateTooLow);
     }
-    Ok(Submission { parent: parent_id, fork_depth, base, next, mn, deposits })
+    Ok(Submission { parent: parent_id, fork_depth, base, next, mn, deposits, bridge_tip_block: *bridge_tip_block })
+}
+
+// ---------------------------------------------------------------- A5-5: the fast cadence
+
+/// A5-5: MN-5 is measured from the fork base, never more recent than the parent's tip block. After a
+/// durable drop of the hashrate below 40 % of that block's target, every point is refused
+/// (`WorkRateTooLow`) once 1 800 s have passed since that block, and the contract stalls. The relayer then
+/// submits as soon as its chain moves the locked block (the fast cadence: each point lands within 1 800 s
+/// of its parent's tip block, where MN-5 does not apply): from the first refusal (planned or reverted), or
+/// as soon as the chain's work over its last [`RATE_WINDOW_BLOCKS`] blocks falls below [`FAST_ENTER_PCT`] %
+/// of what the tip's target produces in their time, until it is back at [`FAST_EXIT_PCT`] % and no refusal
+/// is pending. About 4.4 times the gas of the 6 600 s cadence while it lasts.
+pub const FAST_ENTER_PCT: u64 = 60;
+pub const FAST_EXIT_PCT: u64 = 80;
+pub const RATE_WINDOW_BLOCKS: u64 = 10;
+
+/// The work of the last `blocks` blocks of `chain` is at least `pct` % of what a target of block work
+/// `reference_work` (little-endian) produces in their time at 180 s a block; `None` when the chain is too
+/// short or their timestamps do not increase.
+pub fn rate_at_least(chain: &Chain, reference_work: &[u8; 32], blocks: u64, pct: u64) -> Option<bool> {
+    let t = chain.tip_height();
+    let from = t.checked_sub(blocks)?;
+    let elapsed = chain.header_at(t)?.timestamp.checked_sub(chain.header_at(from)?.timestamp).filter(|e| *e > 0)?;
+    let work = u256::sub(&chain.work_at(t)?, &chain.work_at(from)?);
+    Some(u256::mul_ge(&work, 180 * 100, reference_work, pct * elapsed))
+}
+
+/// The cadence mode after this step: fast while a `WorkRateTooLow` refusal is pending, or (hysteresis) when
+/// the recent rate against `reference_work` (the tip's target) is below [`FAST_ENTER_PCT`] (from normal) or
+/// not yet at [`FAST_EXIT_PCT`] (from fast); unchanged when the rate cannot be measured.
+pub fn fast_cadence(was_fast: bool, refusal_pending: bool, chain: &Chain, reference_work: Option<&[u8; 32]>) -> bool {
+    if refusal_pending {
+        return true;
+    }
+    let Some(w) = reference_work else { return was_fast };
+    if was_fast {
+        rate_at_least(chain, w, RATE_WINDOW_BLOCKS, FAST_EXIT_PCT) != Some(true)
+    } else {
+        rate_at_least(chain, w, RATE_WINDOW_BLOCKS, FAST_ENTER_PCT) == Some(false)
+    }
 }
 
 /// The points to try to finalize (`finalizeSlow`), the highest locked height first: canonical, above the
@@ -332,10 +395,13 @@ pub enum Body {
         block_id: [u8; 32],
         deposits: Vec<FoundDeposit>,
     },
-    /// No longer served when the relayer came to it: its deposits are unknown.
+    /// No longer served when the relayer came to it, or served by no source in a form the relayer could
+    /// verify (`reason`): its deposits are unknown.
     Missing {
         #[serde(with = "crate::checkpoint::hex32")]
         block_id: [u8; 32],
+        #[serde(default)]
+        reason: String,
     },
     /// Missing, and an operator accepted that no checkpoint of this relayer proves its deposits (D41).
     Acknowledged {
@@ -348,7 +414,7 @@ pub enum Body {
 impl Body {
     pub fn block_id(&self) -> [u8; 32] {
         match self {
-            Body::Read { block_id, .. } | Body::Missing { block_id } | Body::Acknowledged { block_id, .. } => *block_id,
+            Body::Read { block_id, .. } | Body::Missing { block_id, .. } | Body::Acknowledged { block_id, .. } => *block_id,
         }
     }
 }
@@ -406,14 +472,14 @@ impl Archive {
         }
     }
 
-    pub fn record_missing(&mut self, height: u64, id: &[u8; 32]) {
-        self.index.insert(height, Body::Missing { block_id: *id });
+    pub fn record_missing(&mut self, height: u64, id: &[u8; 32], reason: &str) {
+        self.index.insert(height, Body::Missing { block_id: *id, reason: reason.to_string() });
     }
 
     /// An operator's decision on a `Missing` block: its omission is accepted.
     pub fn acknowledge(&mut self, height: u64, reason: &str) -> anyhow::Result<()> {
         match self.index.get(&height) {
-            Some(Body::Missing { block_id }) => {
+            Some(Body::Missing { block_id, .. }) => {
                 let block_id = *block_id;
                 self.index.insert(height, Body::Acknowledged { block_id, reason: reason.to_string() });
                 Ok(())
@@ -457,6 +523,47 @@ impl Archive {
     }
 }
 
+/// One source of a block body: its name and a reader (`Ok(None)`: it does not serve the block).
+pub type BodySource<'a> = (String, Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>> + 'a>);
+
+/// A5-7: record the body of block `height` (id `id` on the relayer's chain) from the first of `sources`
+/// that serves bytes the archive verifies (id, `tx_root`, the node's vault rule): a source that fails (an
+/// error, or a corrupt or incomplete body) never stops the others. `Err(reason)` when none does.
+pub fn record_from_sources(
+    archive: &mut Archive,
+    height: u64,
+    id: &[u8; 32],
+    sources: Vec<BodySource>,
+    rules: &jetsam_chain::consensus::vault::VaultRules,
+) -> Result<(String, Vec<FoundDeposit>), String> {
+    let mut why = Vec::new();
+    for (name, mut read) in sources {
+        match read() {
+            Ok(Some(raw)) => match archive.record(height, id, &raw, rules) {
+                Ok(found) => return Ok((name, found.to_vec())),
+                Err(e) => why.push(format!("{name}: {e:#}")),
+            },
+            Ok(None) => why.push(format!("{name}: not served")),
+            Err(e) => why.push(format!("{name}: {e:#}")),
+        }
+    }
+    Err(if why.is_empty() { "no source".to_string() } else { why.join("; ") })
+}
+
+/// A5-7: the body of block `height` (id `id`) in an archive mirror `dir` (another archiver's publication
+/// directory, laid out as `blocks/<height>-<id>.bin`, or the bare files), `None` when it has none.
+pub fn mirror_body(dir: &Path, height: u64, id: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+    let name = format!("{height}-{}.bin", hex::encode(id));
+    for p in [dir.join("blocks").join(&name), dir.join(&name)] {
+        match std::fs::read(&p) {
+            Ok(raw) => return Ok(Some(raw)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
+}
+
 /// The 323-byte pages of a block as the checkpoint program reads them (the coinbase as a body, every other
 /// transaction as a page).
 pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -477,13 +584,15 @@ pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 // ---------------------------------------------------------------- proofs
 
 /// What the checkpoint program needs to prove a submission (every header from `headers_from` (the parent's L
-/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 608 bytes it must commit.
+/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 672 bytes it must commit.
 #[derive(Clone, Debug)]
 pub struct ProofRequest {
     pub parent_id: [u8; 32],
     pub parent: Checkpoint,
     pub fork_depth: u8,
     pub anchor_base: u64,
+    /// The contract's `tipBlockId` the proof is made against (public value 19).
+    pub bridge_tip_block: [u8; 32],
     pub next: Checkpoint,
     pub mn: Mn,
     /// `JetsamBridge.publicValues(parentId, next, forkDepth, mn)`.
@@ -504,7 +613,7 @@ impl ProofRequest {
     /// Built from the chain, the archive and the parent's known context.
     #[allow(clippy::too_many_arguments)]
     pub fn build(s: &Submission, parent: &Known, chain: &Chain, archive: &Archive, gl: u64, anchor_base: u64, context_below: u64) -> anyhow::Result<Self> {
-        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.mn);
+        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.mn);
         // (the fork base is never below the parent's L: MN-2, `fork_base`)
         let from = parent.cp.locked_height.saturating_sub(context_below).max(chain.base_height());
         let headers = (from..=s.next.height)
@@ -530,6 +639,7 @@ impl ProofRequest {
             parent: parent.cp,
             fork_depth: s.fork_depth,
             anchor_base,
+            bridge_tip_block: s.bridge_tip_block,
             next: s.next,
             mn: s.mn,
             public_values: pv,
@@ -559,7 +669,7 @@ fn to_program(c: &Checkpoint) -> jetsam_bridge_program::spv::CheckpointV3 {
     }
 }
 
-/// The checkpoint program's input (`JSPVIN05`) for a request: the parent's context exactly as the program
+/// The checkpoint program's input (`JSPVIN06`) for a request: the parent's context exactly as the program
 /// bounds it (`context_range`: this chain up to the fork base, then the parent's abandoned headers), the new
 /// branch above the base, the pages of the deposit blocks.
 pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
@@ -586,10 +696,10 @@ pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
         let p: Vec<[u8; 323]> = pages.iter().map(|x| x.as_slice().try_into().map_err(|_| anyhow::anyhow!("page: not 323 bytes"))).collect::<anyhow::Result<_>>()?;
         blocks.push((*h, p));
     }
-    Ok(spv::encode_input(&parent, req.anchor_base, &req.deposit_frontier, &req.anchor_frontier, req.fork_depth, &context, &new, &blocks))
+    Ok(spv::encode_input(&parent, req.anchor_base, &req.bridge_tip_block, &req.deposit_frontier, &req.anchor_frontier, req.fork_depth, &context, &new, &blocks))
 }
 
-/// The checkpoint program's relation run natively on `input` (what the guest proves): its 608 bytes of
+/// The checkpoint program's relation run natively on `input` (what the guest proves): its 672 bytes of
 /// public values, or its refusal (the rule it panicked on).
 pub fn run_native(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut pad = vec![0u64; tw_core::towerwalk::CELLS];
@@ -739,9 +849,10 @@ pub struct ProverConfig {
     /// At most this long per proof (with `prove_ahead_secs` and the cadence: the point lands before `W_STALL`).
     #[serde(default = "default_prove_timeout")]
     pub timeout_secs: u64,
-    /// A point is started this long before it is due (a slow prover).
+    /// A point is started this long before it is due (a slow prover). A5-6: by default
+    /// [`DEFAULT_PROVE_AHEAD_SECS`] (below a cadence that short, the rehearsal's, half the cadence).
     #[serde(default)]
-    pub prove_ahead_secs: u64,
+    pub prove_ahead_secs: Option<u64>,
     /// Headers given below the lower of the parent's L and the fork base (the header rules' window).
     #[serde(default = "default_context_below")]
     pub context_below: u64,
@@ -758,6 +869,11 @@ fn default_true() -> bool {
 fn default_prove_timeout() -> u64 {
     480
 }
+
+/// A5-6: a point is started 900 s before it is due by default, so that a proof slower than expected, an L1
+/// replacement (+180 s) or a slow Tor circuit still lands before `W_STALL` (MN-4 and MN-5 are evaluated at
+/// the expected inclusion time).
+pub const DEFAULT_PROVE_AHEAD_SECS: u64 = 900;
 fn default_context_below() -> u64 {
     32
 }
@@ -790,6 +906,10 @@ pub struct RelayConfig {
     pub state_dir: PathBuf,
     /// Published for claimers (`final.json`) and provers (`blocks/`).
     pub publish_dir: PathBuf,
+    /// A5-7: second archives, read when no node serves a block above F any more: other archivers'
+    /// publication directories (`blocks/<height>-<id>.bin`), every body re-verified.
+    #[serde(default)]
+    pub archive_mirrors: Vec<PathBuf>,
     #[serde(default = "default_poll")]
     pub poll_secs: u64,
     /// Claims per step at most (each waits for its receipt).
@@ -822,6 +942,7 @@ impl RelayConfig {
         let profile = c.profile()?;
         let rehearsal = profile == crate::Profile::PrivateRehearsal;
         crate::relay::check_cadence(c.cadence_secs)?;
+        let prove_ahead = c.prove_ahead();
         anyhow::ensure!(c.min_nodes >= if rehearsal { 1 } else { 2 }, "min_nodes {} below the floor (2 off the rehearsal)", c.min_nodes);
         anyhow::ensure!(c.nodes.len() >= c.min_nodes, "{} nodes configured, min_nodes = {}", c.nodes.len(), c.min_nodes);
         for (i, n) in c.nodes.iter().enumerate() {
@@ -836,17 +957,26 @@ impl RelayConfig {
         anyhow::ensure!(c.prover.native_check || rehearsal, "[prover] native_check = false is refused on {profile}");
         // the point lands before W_STALL: started `ahead` before it is due, proven within the timeout
         anyhow::ensure!(
-            c.prover.timeout_secs + INCLUSION_SECS <= crate::relay::W_STALL - c.cadence_secs + c.prover.prove_ahead_secs,
+            c.prover.timeout_secs + INCLUSION_SECS <= crate::relay::W_STALL - c.cadence_secs + prove_ahead,
             "[prover] timeout_secs {} + {INCLUSION_SECS} s of inclusion > W_STALL {} − cadence {} + prove_ahead_secs {}: \
              stalled() could become true between two points (D-AV3)",
             c.prover.timeout_secs,
             crate::relay::W_STALL,
             c.cadence_secs,
-            c.prover.prove_ahead_secs
+            prove_ahead
         );
-        anyhow::ensure!(c.prover.prove_ahead_secs < c.cadence_secs, "prove_ahead_secs must stay below the cadence");
+        anyhow::ensure!(prove_ahead < c.cadence_secs, "prove_ahead_secs must stay below the cadence");
         anyhow::ensure!(c.poll_secs > 0 && c.claims_per_step > 0, "poll_secs and claims_per_step must be positive");
         Ok(c)
+    }
+
+    /// `[prover] prove_ahead_secs`, else [`DEFAULT_PROVE_AHEAD_SECS`] (half the cadence below 1 800 s).
+    pub fn prove_ahead(&self) -> u64 {
+        self.prover.prove_ahead_secs.unwrap_or(if self.cadence_secs > 2 * DEFAULT_PROVE_AHEAD_SECS {
+            DEFAULT_PROVE_AHEAD_SECS
+        } else {
+            self.cadence_secs / 2
+        })
     }
 
     pub fn domain(&self) -> anyhow::Result<crate::Domain> {

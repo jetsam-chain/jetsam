@@ -3,7 +3,7 @@
 
 //! The contract v3 checkpoint (SPEC-v3 §2.1), its id, the statement the
 //! contract builds from it (§2.4: the identity of the LOCKED block L, never
-//! the tip T), the 608-byte public values (§2.2), the deposit leaf, and the
+//! the tip T), the 672-byte public values (§2.2, revised by A5-4), the deposit leaf, and the
 //! TEST mock proof (`MockProofVerifier`: keccak(TAG ‖ public values)).
 
 use crate::{keccak256, Domain, GuardianStatement, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION};
@@ -42,6 +42,9 @@ pub struct Mn {
     #[serde(with = "hex32")]
     pub segment_work: [u8; 32],
     pub max_timestamp: u64,
+    /// MN-1 (A5-4): the bridge's current tip block (`tipBlockId`) is on the new branch.
+    #[serde(default)]
+    pub tip_on_branch: bool,
 }
 
 /// One deposit of the deposit tree.
@@ -106,19 +109,22 @@ impl Checkpoint {
 }
 
 impl Mn {
-    pub fn words(&self) -> [[u8; 32]; 5] {
+    /// The six fields of the contract's `MN` tuple, in order.
+    pub fn words(&self) -> [[u8; 32]; 6] {
         [
             self.tip_block_work,
             w64(self.fork_base_timestamp),
             self.fork_base_work,
             self.segment_work,
             w64(self.max_timestamp),
+            w64(u64::from(self.tip_on_branch)),
         ]
     }
 }
 
-/// The 608 bytes of the public values (contract `publicValues`).
-pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anchor_base: u64, mn: &Mn) -> Vec<u8> {
+/// The 672 bytes of the public values (contract `publicValues`): 19 words, then the bridge's current tip
+/// block `bridge_tip_block` (`tipBlockId`, read by the contract from its storage) and `mn.tip_on_branch`.
+pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anchor_base: u64, bridge_tip_block: &[u8; 32], mn: &Mn) -> Vec<u8> {
     let words: Vec<[u8; 32]> = vec![
         keccak256(b"jetsam-bridge/public-values/v3"),
         *prev_id,
@@ -133,12 +139,15 @@ pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anch
         w64(anchor_base),
         next.tip_block_id,
     ];
-    let mut out = Vec::with_capacity(608);
-    for w in words.iter().chain(mn.words().iter()) {
+    let mn_words = mn.words();
+    let mut out = Vec::with_capacity(672);
+    for w in words.iter().chain(mn_words[..5].iter()) {
         out.extend_from_slice(w);
     }
     out.extend_from_slice(&next.locked_block_id);
     out.extend_from_slice(&next.locked_cum_work);
+    out.extend_from_slice(bridge_tip_block);
+    out.extend_from_slice(&mn_words[5]);
     out
 }
 

@@ -60,6 +60,7 @@ fn to_program_mn(m: &gcp::Mn) -> spv::Mn {
         fork_base_work: m.fork_base_work,
         segment_work: m.segment_work,
         max_timestamp: m.max_timestamp,
+        tip_on_branch: m.tip_on_branch,
     }
 }
 
@@ -135,6 +136,10 @@ struct World {
     vectors: Vec<Value>,
     /// F of the clock the deposits are read under (no deposit at or below it)
     deposits_from: Option<u64>,
+    /// A5-4: the contract's `tipBlockId` now (the vectors are submitted in order), and, by checkpoint id,
+    /// the one before its first acceptance (a point re-proven under another base is submitted there)
+    tip_block: [u8; 32],
+    tip_before: BTreeMap<[u8; 32], [u8; 32]>,
 }
 
 fn pages_of(raw: &[u8]) -> Vec<Page> {
@@ -197,6 +202,7 @@ fn unhex(s: &str) -> Vec<u8> {
 struct Input {
     parent: CheckpointV3,
     anchor_base: u64,
+    bridge_tip: [u8; 32],
     frontiers: ([[u8; 32]; 32], [[u8; 32]; 32]),
     fork_depth: u8,
     context: Vec<H>,
@@ -209,6 +215,7 @@ impl Input {
         spv::encode_input(
             &self.parent,
             self.anchor_base,
+            &self.bridge_tip,
             &self.frontiers.0,
             &self.frontiers.1,
             self.fork_depth,
@@ -284,6 +291,8 @@ impl World {
         }
         let fork_depth = (parent.cp.height - base) as u8;
         let bh = chain.header_at(base).unwrap();
+        let first_acceptance = !self.tip_before.contains_key(&cp.id());
+        let bridge_tip = *self.tip_before.entry(cp.id()).or_insert(self.tip_block);
         let mn = gcp::Mn {
             tip_block_work: gu::to_be(&chain.header_at(tip).unwrap().work),
             fork_base_timestamp: bh.timestamp,
@@ -296,12 +305,17 @@ impl World {
                 .map(|h| chain.header_at(h).unwrap().timestamp)
                 .max()
                 .unwrap(),
+            tip_on_branch: jetsam_guardian::relayer::tip_on_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip),
         };
         let anchor_base = self.gl + 1;
-        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &mn);
+        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &bridge_tip, &mn);
+        if first_acceptance {
+            self.tip_block = cp.tip_block_id;
+        }
 
         // ---- the program, on what an honest relayer gives it
-        let input = self.input(parent, b, tip, fork_depth, l);
+        let mut input = self.input(parent, b, tip, fork_depth, l);
+        input.bridge_tip = bridge_tip;
         let out = quiet(|| run(&input.bytes(), &self.schedule, &self.rule))
             .unwrap_or_else(|e| panic!("{name}: the program refuses: {e}"));
         dump(name, &input.bytes(), Some(&out.public_values));
@@ -309,7 +323,8 @@ impl World {
         assert_eq!(out.next, to_program(&cp), "{name}: the ten fields");
         assert_eq!(out.mn, to_program_mn(&mn), "{name}: MN");
         assert_eq!(out.fork_depth, fork_depth, "{name}");
-        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 608 bytes");
+        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 672 bytes");
+        assert_eq!(out.bridge_tip_block, bridge_tip, "{name}: the bridge's tip block");
         assert_eq!(out.next.id(kf), cp.id(), "{name}: checkpointId");
         assert_eq!(
             out.new_deposits.len() as u64,
@@ -330,10 +345,12 @@ impl World {
             "name": name,
             "parentId": hex(&parent.cp.id()),
             "forkDepth": fork_depth,
+            "bridgeTipBlock": hex(&bridge_tip),
             "next": cp_json(&cp),
             "mn": {
                 "tipBlockWork": hex(&mn.tip_block_work), "forkBaseTimestamp": mn.fork_base_timestamp,
                 "forkBaseWork": hex(&mn.fork_base_work), "segmentWork": hex(&mn.segment_work), "maxTimestamp": mn.max_timestamp,
+                "tipOnBranch": mn.tip_on_branch,
             },
             "publicValues": hex(&out.public_values),
             "checkpointId": hex(&out.next.id(kf)),
@@ -357,6 +374,7 @@ impl World {
         Input {
             parent: p,
             anchor_base: self.gl + 1,
+            bridge_tip: parent.cp.tip_block_id,
             frontiers: parent.frontiers,
             fork_depth,
             context: (lo..=hi).map(|x| parent.branch.h(x)).collect(),
@@ -369,7 +387,7 @@ impl World {
         }
     }
 
-    fn genesis(&self, b: &Branch) -> Known {
+    fn genesis(&mut self, b: &Branch) -> Known {
         let chain = chain_of(&self.base, b, self.gl);
         let cp = gcp::genesis_checkpoint(
             self.gl,
@@ -377,6 +395,7 @@ impl World {
             gu::to_be(&chain.work_at(self.gl).unwrap()),
             chain.headers_digest(self.gl).unwrap(),
         );
+        self.tip_block = cp.tip_block_id;
         Known {
             cp,
             branch: b.clone(),
@@ -549,6 +568,8 @@ mod mainnet {
             deposits: BTreeMap::new(),
             vectors: Vec::new(),
             deposits_from: None,
+            tip_block: [0u8; 32],
+            tip_before: BTreeMap::new(),
         };
         let g = world.genesis(&b);
         let p1 = world.step("mainnet-44580", &g, &b, 44_580, None);
@@ -636,6 +657,8 @@ mod rehearsal {
             deposits,
             vectors: Vec::new(),
             deposits_from: rules.deposits_from_height,
+            tip_block: [0u8; 32],
+            tip_before: BTreeMap::new(),
         }
     }
 
@@ -840,6 +863,7 @@ mod rehearsal {
                     &next,
                     ok.fork_depth,
                     ok.anchor_base,
+                    &ok.bridge_tip_block,
                     &ok.mn
                 ),
                 ok.public_values

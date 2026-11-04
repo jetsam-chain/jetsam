@@ -50,6 +50,7 @@ pub const FILL_ALLOWLIST: &[&str] = &[
     "getGuardianState",
     "getVaultState",
     "getBlock",
+    "getDepositBlock",
 ];
 
 /// Tor's default SOCKS port.
@@ -339,6 +340,16 @@ impl NodeClient {
     /// `getBlock(height)`: the block's bytes, `None` once its body is pruned.
     pub fn raw_block(&self, height: u64) -> anyhow::Result<Option<Vec<u8>>> {
         match self.call("getBlock", json!([height]))?.as_str() {
+            Some(text) => Ok(Some(hex::decode(text.trim_start_matches("0x"))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A5-7: `getDepositBlock(height)`: the bytes of the canonical block at `height` while `getBlock` serves
+    /// it, and long after for a block that holds a vault deposit (the node's long retention); `None`
+    /// otherwise.
+    pub fn raw_deposit_block(&self, height: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.call("getDepositBlock", json!([height]))?.as_str() {
             Some(text) => Ok(Some(hex::decode(text.trim_start_matches("0x"))?)),
             None => Ok(None),
         }

@@ -11,6 +11,9 @@
 //! stable point (`relayer::finalize_order`) → the robot claims its own repayments from the published final
 //! root (`relayer::read_published_final`) → the relayer claims what is left (`relayer::claims_of`): the
 //! cold claim owner holds exactly the advanced amounts, the third recipient its mint, nothing twice.
+//! Audit A5 on the real contract: a third party's point on the relayer's own chain from the genesis (one
+//! block more) is refused (`MustExtendTip`) and the finality clock does not move (A5-4); the third deposit,
+//! advanced just before the relayer's claim, repays only what was paid and its recipient gets 100 % (A5-1).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -109,13 +112,32 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
 
     // the relayer's point: the honest child of the genesis, simulated proof
     let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false })]);
-    let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, GL, &found, &[], now(&l1) + 60).unwrap();
+    let tip_block = word(&view(&l1, &bridge, "tipBlockId()", &[]), 0);
+    assert_eq!(tip_block, gcp.tip_block_id, "the genesis's block");
+    let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, &tip_block, GL, &found, &[], now(&l1) + 60).unwrap();
     assert_eq!((s.next.locked_height, s.next.deposit_count, s.fork_depth), (52, 3, 0));
-    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.mn);
+    assert!(s.mn.tip_on_branch, "an extension holds the tip's block");
+    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.mn);
     let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &mock_proof(&pv)), "submitCheckpoint").unwrap();
     assert!(r.status, "submitCheckpoint");
     let cid = s.next.id();
     known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true });
+    assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
+    assert_eq!(word(&view(&l1, &bridge, "tipBlockId()", &[]), 0), s.next.tip_block_id);
+
+    // A5-4: a third party proves, from the genesis, one block more of the SAME chain: its branch holds the
+    // tip's block (the program says so), the contract refuses it and the finality clock does not move
+    let switched = word_u64(&view(&l1, &bridge, "lastSwitchAt()", &[]), 0);
+    let mut longer = chain.clone();
+    longer.extend(testkit::header(longer.tip_id(), 61, now(&l1) - 60, testkit::target_bits(20), 1)).unwrap();
+    let only_genesis = HashMap::from([(gid, known[&gid].clone())]);
+    let third = relayer::plan_submission(&longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, GL, &found, &[], now(&l1) + 60).unwrap();
+    assert!(third.mn.tip_on_branch && third.parent == gid && third.next.height == 61);
+    let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &third.mn);
+    let refused = sender(GENESIS_KEY, &gd).send(&l1, &bridge, &l1::submit_checkpoint(&gid, &third.next, 0, &third.mn, &mock_proof(&tpv)), "submitCheckpoint");
+    let err = format!("{:#}", refused.err().expect("a same-chain point that does not extend the tip"));
+    assert!(err.contains(&hex::encode(l1::selector("MustExtendTip()"))), "MustExtendTip: {err}");
+    assert_eq!(word_u64(&view(&l1, &bridge, "lastSwitchAt()", &[]), 0), switched);
     assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
 
     // the robot's stock: a TEST credit (500 wJTM minted by the bridge's address, impersonated on anvil)
@@ -174,17 +196,24 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
         assert!(r.logs.iter().any(|lg| lg["topics"][0].as_str().unwrap().to_lowercase() == l1::TOPIC_ADVANCE_REPAID), "an advance repaid");
         eprintln!("own claimDeposit gas {}", r.gas_used);
     }
-    // the relayer claims what is left: the third deposit (no advance: minted to its recipient)
+    // A5-1: the third deposit, final already, advanced just before the relayer's claim (no risk taken)
+    assert_eq!(balance(&l1, &token, &COLD), 407 * JTM, "the cold claim owner holds exactly the advanced amounts");
+    let d3f = found[&33][0];
+    let r = robot.send(&l1, &bridge, &l1::advance_batch(&[order(&d3f)], &cid), "advanceBatch").unwrap();
+    assert!(r.status);
+    let paid3 = 3 * JTM - 3 * JTM * 75 / 10_000;
+    assert_eq!(balance(&l1, &token, &d3f.recipient), paid3);
+    // the relayer claims what is left: the third deposit, its advance younger than 2 h
     let minted = |t: &[u8; 32]| word(&view(&l1, &bridge, "isMinted(bytes32)", &[*t]), 0)[31] == 1;
     let claims = relayer::claims_of(&known[&cid].cp, &found, GL, &minted).unwrap();
     assert_eq!(claims.len(), 1, "the robot's two are minted already");
     let (d3, branch) = claims[0];
     let r = relay.send(&l1, &bridge, &l1::claim_deposit(&d3, &known[&cid].cp.deposit_root, &branch), "claimDeposit").unwrap();
     assert!(r.status);
-    assert_eq!(balance(&l1, &token, &COLD), 407 * JTM, "the cold claim owner holds exactly the advanced amounts");
-    assert_eq!(balance(&l1, &token, &d3.recipient), 3 * JTM, "the third recipient its mint");
+    assert_eq!(balance(&l1, &token, &COLD), 407 * JTM + paid3, "the young advance repaid only what it paid");
+    assert_eq!(balance(&l1, &token, &d3.recipient), 3 * JTM, "the third recipient 100 % (advance + its fee minted to it)");
     assert_eq!(balance(&l1, &token, &d1.recipient), 7 * JTM - 7 * JTM * 75 / 10_000, "nothing twice");
-    for d in [d1, d2] {
+    for d in [d1, d2, d3f] {
         let a = view(&l1, &bridge, "advanceOf(bytes32)", &[jetsam_guardian::fill::advance_key(&d.txid, &d.recipient, d.amount)]);
         assert_eq!(word(&a, 2)[31], 2, "REPAID");
     }

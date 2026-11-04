@@ -22,7 +22,7 @@ pub fn selector(signature: &str) -> [u8; 4] {
 
 pub const CHECKPOINT_TUPLE: &str =
     "(uint64,uint256,bytes32,bytes32,uint64,bytes32,uint64,bytes32,bytes32,uint256)";
-pub const MN_TUPLE: &str = "(uint256,uint64,uint256,uint256,uint64)";
+pub const MN_TUPLE: &str = "(uint256,uint64,uint256,uint256,uint64,bool)";
 
 /// An ABI argument.
 pub enum Arg<'a> {

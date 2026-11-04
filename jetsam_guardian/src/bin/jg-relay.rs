@@ -5,13 +5,18 @@
 //! `jetsam_guardian::relayer`; this program reads, decides, proves, sends and keeps:
 //!
 //! * the Jetsam chain from its nodes (headers recomputed: ids, links, work), every block above F read
-//!   while the nodes serve it (22 blocks), its deposits taken with the node's rule, the body of every
-//!   deposit block archived and published (`<publish_dir>/blocks/`); a body read too late is MISSING: no
-//!   point of this relayer locks it until an operator imports it or acknowledges its omission;
+//!   while a source serves it (A5-7: every node's `getBlock` (22 blocks), then their long retention of
+//!   deposit blocks `getDepositBlock`, then the `archive_mirrors`; a failing source never stops the others
+//!   nor the next blocks), its deposits taken with the node's rule, the body of every deposit block archived
+//!   and published (`<publish_dir>/blocks/`); a body no source serves verifiable is MISSING (retried): no
+//!   point of this relayer locks it until a source serves it, or an operator imports it or acknowledges it;
 //! * every checkpoint the contract accepted (`CheckpointAccepted`: anyone may submit), with its context
 //!   when it is on this chain;
-//! * a point every `cadence_secs` (D-AV3), at once when the contract has stalled, proven by `[prover]`,
-//!   only when `min_nodes` nodes have its tip and its locked block;
+//! * a point every `cadence_secs` (D-AV3), started `prove_ahead_secs` early (A5-6, 900 s by default), at
+//!   once when the contract has stalled, and as soon as the chain allows it under the fast cadence (A5-5:
+//!   MN-5 refused a point, or the chain's work rate fell below 60 % of the tip's target), proven by
+//!   `[prover]` against the contract's current tip (A5-4: a proof made against a former tip is void), only
+//!   when `min_nodes` nodes have its tip and its locked block;
 //! * `finalizeSlow` of the highest point stable for 24 h; `claimDeposit` of every unminted deposit of the
 //!   final root (a mint, or the repayment of its advance), and `<publish_dir>/final.json` (what a claimer,
 //!   the advance robot first, needs to claim by itself);
@@ -77,6 +82,7 @@ fn reason_name(text: &str) -> String {
         "ForkTooDeep()",
         "WorkRateTooLow()",
         "TimestampTooFarAhead()",
+        "MustExtendTip()",
         "InvalidProof()",
         "NotInitialized()",
     ] {
@@ -98,6 +104,12 @@ struct State {
     minted: HashSet<String>,
     /// The final point last published.
     published_final: String,
+    /// A5-5: the fast cadence is on.
+    #[serde(default)]
+    fast: bool,
+    /// A5-5: a `WorkRateTooLow` refusal (planned or reverted) since the last accepted point.
+    #[serde(default)]
+    work_rate_refused: bool,
 }
 
 struct Relay {
@@ -178,42 +190,60 @@ impl Relay {
         Ok(())
     }
 
-    /// Every block above F not read yet: its body from any node that still serves it, else MISSING.
+    /// Every block above F not read yet, and every MISSING one again (a node or a mirror may serve it
+    /// later): its body from any source that serves it verifiable, else MISSING.
     fn read_bodies(&mut self) {
         let tip = self.chain.tip_height();
-        let mut read = 0;
+        let (mut read, mut retried) = (0, 0);
         for h in self.cfg.deposits_from_height + 1..=tip {
-            if self.archive.index.contains_key(&h) || read >= 64 {
+            let was_missing = matches!(self.archive.index.get(&h), Some(relayer::Body::Missing { .. }));
+            if self.archive.index.contains_key(&h) && !was_missing {
                 continue;
             }
-            read += 1;
-            let Some(id) = self.chain.id_at(h) else { continue };
-            let mut raw = None;
-            for n in &self.nodes {
-                if let Ok(Some(r)) = n.raw_block(h) {
-                    raw = Some(r);
-                    break;
+            // 64 new blocks and the 8 lowest missing ones per step: the retries never starve the reading
+            if was_missing {
+                if retried >= 8 {
+                    continue;
                 }
+                retried += 1;
+            } else {
+                if read >= 64 {
+                    continue;
+                }
+                read += 1;
             }
-            match raw {
-                Some(raw) => match self.archive.record(h, &id, &raw, &self.rules) {
-                    Ok(found) => {
-                        let found = found.to_vec();
-                        if !found.is_empty() {
+            let Some(id) = self.chain.id_at(h) else { continue };
+            // A5-7: every node's getBlock, then every node's long retention (getDepositBlock), then the
+            // archive mirrors; a source that fails never stops the others, nor the blocks above
+            let mut sources: Vec<relayer::BodySource> = Vec::new();
+            for (i, n) in self.nodes.iter().enumerate() {
+                sources.push((format!("{} getBlock", self.cfg.nodes[i].name), Box::new(move || n.raw_block(h))));
+            }
+            for (i, n) in self.nodes.iter().enumerate() {
+                sources.push((format!("{} getDepositBlock", self.cfg.nodes[i].name), Box::new(move || n.raw_deposit_block(h))));
+            }
+            for dir in &self.cfg.archive_mirrors {
+                sources.push((format!("mirror {}", dir.display()), Box::new(move || relayer::mirror_body(dir, h, &id))));
+            }
+            match relayer::record_from_sources(&mut self.archive, h, &id, sources, &self.rules) {
+                Ok((source, found)) => {
+                    if was_missing {
+                        log(&format!("block {h}: body found again ({source})"));
+                    }
+                    if !found.is_empty() {
+                        if let Ok(Some(raw)) = self.archive.body(h) {
                             let _ = std::fs::create_dir_all(self.cfg.publish_dir.join("blocks"));
                             let _ = std::fs::write(self.cfg.publish_dir.join("blocks").join(format!("{h}-{}.bin", hex::encode(id))), &raw);
-                            self.event(json!({"event": "deposit_block", "height": h, "id": hex::encode(id), "deposits": found}));
                         }
+                        self.event(json!({"event": "deposit_block", "height": h, "id": hex::encode(id), "deposits": found, "source": source}));
                     }
-                    Err(e) => {
-                        log(&format!("block {h}: {e:#}"));
-                        return;
+                }
+                Err(reason) => {
+                    self.archive.record_missing(h, &id, &reason);
+                    if !was_missing {
+                        log(&format!("ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"));
+                        self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason}));
                     }
-                },
-                None => {
-                    self.archive.record_missing(h, &id);
-                    log(&format!("ALERT MISSING_DEPOSIT_BODY:{h} (no node serves it any more): no point of this relayer locks it until an operator imports it or acknowledges it"));
-                    self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id)}));
                 }
             }
         }
@@ -369,16 +399,21 @@ impl Relay {
         Ok(())
     }
 
-    fn submit(&mut self, gl: u64, anchor_base: u64, tip_id: [u8; 32], tip_cum_work: [u8; 32], l1_now: u64) -> anyhow::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn submit(&mut self, gl: u64, anchor_base: u64, tip_id: [u8; 32], tip_cum_work: [u8; 32], tip_block: [u8; 32], l1_now: u64) -> anyhow::Result<()> {
         let known = self.known();
         let missing = self.archive.missing();
         let found = self.archive.found();
         let at = l1_now + self.cfg.prover.timeout_secs + relayer::INCLUSION_SECS;
-        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, gl, &found, &missing, at) {
+        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, gl, &found, &missing, at) {
             Ok(s) => s,
             Err(why) => {
-                // WorkRateTooLow: MN-5 since the fork base, which only a faster chain can lift (a G9 question, BRIDGE-REST)
-                if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow) {
+                // WorkRateTooLow: MN-5 since the fork base; the fast cadence takes over (A5-5)
+                if why == NoSubmission::WorkRateTooLow {
+                    self.state.work_rate_refused = true;
+                }
+                // MustExtendTip: the tip is on this chain with roots that are not ours (A5-4: a new question, noted)
+                if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
                     log(&format!("ALERT NO_SUBMISSION {why:?}"));
                 }
                 self.event(json!({"event": "no_submission", "why": format!("{why:?}")}));
@@ -398,8 +433,24 @@ impl Relay {
         let started = std::time::Instant::now();
         let proof = self.prover.prove(&req)?;
         let proving = started.elapsed().as_secs();
+        // A5-4: the proof names the tip it was made against; another point landed meanwhile: made again
+        let now_tip = word(&self.view("tipBlockId()", &[])?, 0);
+        if now_tip != s.bridge_tip_block {
+            log(&format!("the bridge tip moved during the proof ({proving} s): this proof is void, planned again at the next step"));
+            self.event(json!({"event": "proof_void_tip_moved", "planned_tip_block": hex::encode(s.bridge_tip_block), "tip_block": hex::encode(now_tip)}));
+            return Ok(());
+        }
         let data = l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &proof);
-        let r = self.tx.send(&self.l1, &self.bridge, &data, "submitCheckpoint").map_err(|e| anyhow::anyhow!("{} ({e:#})", reason_name(&format!("{e:#}"))))?;
+        let r = match self.tx.send(&self.l1, &self.bridge, &data, "submitCheckpoint") {
+            Ok(r) => r,
+            Err(e) => {
+                let why = reason_name(&format!("{e:#}"));
+                if why == "WorkRateTooLow" {
+                    self.state.work_rate_refused = true;
+                }
+                anyhow::bail!("{why} ({e:#})");
+            }
+        };
         let id = s.next.id();
         log(&format!("submitCheckpoint T={} L={} forkDepth={} deposits={} status {} gas {} (proof {proving} s)", s.next.height, s.next.locked_height, s.fork_depth, s.next.deposit_count, r.status, r.gas_used));
         self.event(json!({"event": "submitCheckpoint", "id": hex::encode(id), "parent": hex::encode(s.parent), "height": s.next.height, "locked_height": s.next.locked_height,
@@ -407,6 +458,7 @@ impl Relay {
         if r.status {
             let k = Known { cp: s.next, parent: s.parent, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &self.chain), ours: true };
             self.state.known.insert(hex::encode(id), k);
+            self.state.work_rate_refused = false;
         }
         Ok(())
     }
@@ -423,7 +475,11 @@ impl Relay {
         let anchor_base = word_u64(&self.view("anchorBase()", &[])?, 0);
         let gl = anchor_base - 1;
         let t = self.view("tip()", &[])?;
-        let (tip_id, tip_cum_work) = (word(&t, 0), word(&t, 2));
+        let (tip_id, tip_height, tip_cum_work) = (word(&t, 0), word_u64(&t, 1), word(&t, 2));
+        let tip_block = word(&self.view("tipBlockId()", &[])?, 0);
+        if let Some(k) = self.state.known.get(&hex::encode(tip_id)) {
+            anyhow::ensure!(k.cp.tip_block_id == tip_block, "the contract's tipBlockId is not its tip's block");
+        }
         let fin = word(&self.view("finalId()", &[])?, 0);
         let last_switch = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
@@ -433,12 +489,20 @@ impl Relay {
         let fin = word(&self.view("finalId()", &[])?, 0);
         self.claim(&fin, gl)?;
         let tip_accepted = self.state.known.get(&hex::encode(tip_id)).map(|k| k.accepted_at);
-        let due = checkpoint_due(tip_accepted.map(|a| a.saturating_sub(self.cfg.prover.prove_ahead_secs)), l1_now, self.cfg.cadence_secs);
-        if due || stalled {
+        let due = checkpoint_due(tip_accepted.map(|a| a.saturating_sub(self.cfg.prove_ahead())), l1_now, self.cfg.cadence_secs);
+        // A5-5: the fast cadence, measured against the target of the tip's block on this chain
+        let reference = self.chain.header_at(tip_height).map(|h| h.work);
+        let fast = relayer::fast_cadence(self.state.fast, self.state.work_rate_refused, &self.chain, reference.as_ref());
+        if fast != self.state.fast {
+            log(&format!("ALERT FAST_CADENCE {}: {}", if fast { "on" } else { "off" }, if self.state.work_rate_refused { "MN-5 refused a point (WorkRateTooLow)" } else { "the chain's recent work rate against the tip's target" }));
+            self.event(json!({"event": "fast_cadence", "on": fast, "work_rate_refused": self.state.work_rate_refused}));
+            self.state.fast = fast;
+        }
+        if due || stalled || fast {
             if stalled {
                 log("ALERT the contract has stalled (MN-3): a point now");
             }
-            self.submit(gl, anchor_base, tip_id, tip_cum_work, l1_now)?;
+            self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, l1_now)?;
         }
         Ok(())
     }
@@ -470,7 +534,7 @@ fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
             let h: u64 = cmd.get(1).ok_or_else(|| anyhow::anyhow!("import-block <height> <file>"))?.parse()?;
             let raw = std::fs::read(cmd.get(2).ok_or_else(|| anyhow::anyhow!("import-block <height> <file>"))?)?;
             let id = match archive.index.get(&h) {
-                Some(relayer::Body::Missing { block_id }) | Some(relayer::Body::Acknowledged { block_id, .. }) => *block_id,
+                Some(relayer::Body::Missing { block_id, .. }) | Some(relayer::Body::Acknowledged { block_id, .. }) => *block_id,
                 other => anyhow::bail!("block {h} is not missing ({other:?})"),
             };
             let n = archive.record(h, &id, &raw, &VaultRules::current())?.len();
