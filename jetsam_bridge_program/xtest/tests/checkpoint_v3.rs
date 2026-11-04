@@ -698,6 +698,29 @@ mod rehearsal {
         w.vectors_file("rehearsal-relayer", &g, json!({}));
     }
 
+    /// MN-4's value is the segment's LARGEST timestamp, not its last one: on three FIXTURE headers mined
+    /// above 144 (`jgfill-fixture-145-147.json`), the middle one dated below its parent.
+    #[test]
+    fn the_largest_timestamp_of_a_segment_is_not_its_last() {
+        let mut d = data();
+        let fx: Value =
+            serde_json::from_str(include_str!("fixtures/jgfill-fixture-145-147.json")).unwrap();
+        for (i, h) in fx["headers"].as_array().unwrap().iter().enumerate() {
+            d.main.headers.insert(
+                145 + i as u64,
+                unhex(h.as_str().unwrap()).try_into().unwrap(),
+            );
+        }
+        let ts = |x: u64| u64::from_le_bytes(d.main.h(x)[96..104].try_into().unwrap());
+        assert!(ts(146) < ts(145) && ts(147) < ts(145));
+        let mut w = world(&d, 120);
+        let g = w.genesis(&d.main);
+        let p = w.step("fixture-132", &g, &d.main, 132, None);
+        let p = w.step("fixture-144", &p, &d.main, 144, None);
+        w.step("fixture-147", &p, &d.main, 147, None);
+        assert_eq!(w.vectors.last().unwrap()["mn"]["maxTimestamp"], ts(145));
+    }
+
     /// Real forks: the four orphans as parents' tips, each followed by the chain's branch (`forkDepth` 1),
     /// on a genesis at 70; the 7 JTM deposit enters through a fork (]115 ; 133]); and the fork from 127'
     /// at every deeper base down to the parent's L, re-proving the shared blocks.
