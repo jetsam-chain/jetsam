@@ -3,10 +3,12 @@
 //! `jetsam_chain::consensus::{params, difficulty, header, timestamps, slot_expansion}`:
 //! the v1.5.1 rules below the v1.6 height and the v1.6 rules from it on.
 //!
-//! One profile per build, as in the node (cargo feature `testnet`):
+//! One profile per build, as in the node (cargo features `testnet`, `rehearsal-v1-7`):
 //! - default: the public network (v1.6 at 46080);
-//! - `testnet`: the test chain (genesis d9d156ee, v1.6 at 4800).
-//! The two builds are two programs with two program keys.
+//! - `testnet`: the test chain (genesis d9d156ee, v1.6 at 4800);
+//! - `rehearsal-v1-7`: the PRIVATE rehearsal chain (the test chain's genesis, v1.5 at 36, v1.6 at 64,
+//!   no pin: `rehearsal-v1-6` / `rehearsal-v1-7` in the node), never a deployed program.
+//! Each build is its own program with its own key.
 //!
 //! Every rule takes a [`Schedule`] so that the native tool can replay another
 //! schedule (negative controls, node test vectors); the guest only ever uses
@@ -98,11 +100,24 @@ pub const TESTNET: Schedule = Schedule {
     pins: &TESTNET_PINS,
 };
 
+/// The private rehearsal chain's clocks (`rehearsal-v1-6`, and so `rehearsal-v1-7`, in the node:
+/// `REHEARSAL_V1_5_ACTIVATION`, `REHEARSAL_V1_6_ACTIVATION`, no hard checkpoint), on the test profile.
+pub const REHEARSAL: Schedule = Schedule {
+    polynomial_fix_height: 0,
+    v1_4_activation: 6,
+    v1_4_anchor_target: GENESIS_TARGET,
+    v1_5_activation: 36,
+    v1_6_activation: Some(64),
+    pins: &[],
+};
+
 /// The schedule this program is built with.
-#[cfg(not(feature = "testnet"))]
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
 pub const PRODUCTION: Schedule = MAINNET;
-#[cfg(feature = "testnet")]
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const PRODUCTION: Schedule = TESTNET;
+#[cfg(feature = "rehearsal-v1-7")]
+pub const PRODUCTION: Schedule = REHEARSAL;
 
 /// `params::v1_6_schedule_is_valid`, checked at compile time like the node.
 pub const fn v1_6_schedule_is_valid(s: &Schedule) -> bool {

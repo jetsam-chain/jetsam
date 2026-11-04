@@ -11,13 +11,14 @@
 //!   (v1.5.1 rules below the v1.6 height, v1.6 rules from it on)          -> [`rules`]
 //! TowerWalk + POWHDR sponge come from `tw-core` (gated 150/150 in the earlier bench).
 //!
-//! Bridge relations (option H, contract `SPEC.md`): [`spv`] = the checkpoint program
-//! (G1-G9, public values v2), [`claim`] = the individual deposit-claim program (P1-P3);
-//! both apply the one deposit relation of [`deposit`].
+//! Bridge relations (contract `SPEC-v3.md`): [`spv`] = the checkpoint program (frame v3, G1-G11, the
+//! 608 bytes of public values), [`claim`] = the individual deposit-claim program (P1-P3); both apply the
+//! one deposit relation of [`deposit`].
 //!
 //! **v3 (T4.9)**: [`deposit`] reads whole blocks and runs the node's own deposit rule, the crate
 //! `jetsam_vault_rule` (V4, V4-0, V4-d), so that G6 = V4 by construction; [`claim`] is the v3 claim
-//! program (public values unchanged); [`spv`] has the v3 G6 inside the v2 checkpoint frame (see there).
+//! program (public values unchanged); [`spv`] is the v3 checkpoint frame (10 fields, `lockedHeight`, MN
+//! values, G11), with the host-side encoder of its input.
 #![no_std]
 extern crate alloc;
 
