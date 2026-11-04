@@ -375,7 +375,8 @@ impl Relay {
         let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, gl, &found, &missing, at) {
             Ok(s) => s,
             Err(why) => {
-                if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier) {
+                // WorkRateTooLow: MN-5 since the fork base, which only a faster chain can lift (a G9 question, BRIDGE-REST)
+                if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow) {
                     log(&format!("ALERT NO_SUBMISSION {why:?}"));
                 }
                 self.event(json!({"event": "no_submission", "why": format!("{why:?}")}));
