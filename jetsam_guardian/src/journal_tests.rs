@@ -130,3 +130,21 @@ fn signer_detects_journal_behind_published_head() {
     assert_eq!(r.record_hash(1), Some(h1));
     assert_eq!(r.check_published_head(3, &head), None);
 }
+
+/// The journal's `flock` belongs to the open file description, which a forked child shares until its
+/// `exec` (`tests/fork_and_journal.rs` shows it): a unit test that forks makes the journal tests of the
+/// same process fail at random ("locked by another signer instance"). So no source of the library spawns
+/// a process; a test that must fork lives in a test binary of its own (`tests/`).
+#[test]
+fn no_library_source_spawns_a_process_so_its_unit_tests_never_fork() {
+    let needle = concat!("process::", "Command");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") && std::fs::read_to_string(&path).unwrap().contains(needle) {
+            found.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    assert!(found.is_empty(), "these library sources spawn a process (move such a test to tests/): {found:?}");
+}

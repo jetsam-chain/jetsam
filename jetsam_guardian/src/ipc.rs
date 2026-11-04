@@ -239,39 +239,8 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[test]
-    fn so_peercred_reads_the_real_uid_of_another_account() {
-        // root only: a client under uid 65534, gid 65533 (setpriv) on a socket meant
-        // for uid 65534 is served, root on the same socket is refused
-        if own_uid() != 0 {
-            eprintln!("SKIPPED: needs root (setpriv to another uid)");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = dir.path().join("s.sock");
-        let stop = Arc::new(AtomicBool::new(false));
-        let handled = Arc::new(AtomicUsize::new(0));
-        let listener = bind(&path, 65_534).unwrap();
-        // (the group route of 0660 is not what is tested here: open the file to everyone)
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let server = spawn_server(listener, stop.clone(), handled.clone());
-        let client = r#"import socket,sys
-s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b'{"op":"x"}\n')
-print(s.makefile().readline().strip())"#;
-        let out = std::process::Command::new("setpriv")
-            .args(["--reuid=65534", "--regid=65533", "--clear-groups", "python3", "-I", "-c", client])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let answer: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(answer, json!({"echo": {"op": "x"}}), "uid 65534 is the expected peer");
-        assert_refused(request(&path, &json!({"op": "x"}), Duration::from_secs(5)));
-        assert_eq!(handled.load(Ordering::SeqCst), 1, "root is not served");
-        stop.store(true, Ordering::SeqCst);
-        server.join().unwrap();
-    }
+    // `so_peercred_reads_the_real_uid_of_another_account` spawns a process: it lives in
+    // `tests/ipc_peer_uid.rs` (a forking unit test breaks the journal tests, `tests/fork_and_journal.rs`).
 
     #[test]
     fn peer_uid_of_a_socket_pair_is_this_process() {
