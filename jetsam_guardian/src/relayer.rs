@@ -476,8 +476,8 @@ pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 
 // ---------------------------------------------------------------- proofs
 
-/// What the checkpoint program needs to prove a submission (every header from `headers_from` to the new
-/// tip, raw; the parent's context and abandoned headers included), and the 608 bytes it must commit.
+/// What the checkpoint program needs to prove a submission (every header from `headers_from` (the parent's L
+/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 608 bytes it must commit.
 #[derive(Clone, Debug)]
 pub struct ProofRequest {
     pub parent_id: [u8; 32],
@@ -505,7 +505,8 @@ impl ProofRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn build(s: &Submission, parent: &Known, chain: &Chain, archive: &Archive, gl: u64, anchor_base: u64, context_below: u64) -> anyhow::Result<Self> {
         let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.mn);
-        let from = parent.cp.locked_height.min(s.base).saturating_sub(context_below).max(chain.base_height());
+        // (the fork base is never below the parent's L: MN-2, `fork_base`)
+        let from = parent.cp.locked_height.saturating_sub(context_below).max(chain.base_height());
         let headers = (from..=s.next.height)
             .map(|h| chain.header_at(h).map(|x| x.raw.clone()).ok_or_else(|| anyhow::anyhow!("header {h} not on the chain")))
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -520,8 +521,9 @@ impl ProofRequest {
                 deposit_blocks.push((h, block_pages(&raw)?));
             }
         }
-        let found = archive.found();
-        let prev_leaves: Vec<[u8; 32]> = deposits_upto(&found, gl, parent.cp.locked_height).iter().map(deposit_leaf).collect();
+        // the parent's leaves: the first ones of the submission's deposits (the plan checked they make its root)
+        let prev = usize::try_from(parent.cp.deposit_count).ok().filter(|n| *n <= s.deposits.len()).ok_or_else(|| anyhow::anyhow!("the parent holds more deposits than the submission"))?;
+        let prev_leaves: Vec<[u8; 32]> = s.deposits[..prev].iter().map(deposit_leaf).collect();
         let anchor_leaves = chain.anchor_leaves(gl, parent.cp.locked_height).ok_or_else(|| anyhow::anyhow!("anchor leaves of the parent"))?;
         Ok(Self {
             parent_id: s.parent,

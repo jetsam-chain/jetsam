@@ -241,10 +241,13 @@ fn the_frontier_rebuilds_the_root_for_every_count() {
 fn the_proof_request_carries_the_context_the_abandoned_headers_and_the_parents_frontiers() {
     let c = testkit::chain(60, 1);
     let (gid, g) = genesis_known(&c);
-    let (aid, a) = known_at(&c, 30, gid, &[], 100);
+    // the parent holds two deposits (its frontier is not empty)
+    let found = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM)]);
+    let (aid, a) = known_at(&c, 30, gid, &deposits_upto(&found, GL, 22), 100);
+    assert_eq!(a.cp.deposit_count, 2);
     let c2 = fork_of(&c, 26, 40, 2);
     let known = HashMap::from([(gid, g), (aid, a.clone())]);
-    let s = plan_submission(&c2, &known, &aid, &a.cp.cum_work, GL, &BTreeMap::new(), &[], ts(&c2, 66) + 60).unwrap();
+    let s = plan_submission(&c2, &known, &aid, &a.cp.cum_work, GL, &found, &[], ts(&c2, 66) + 60).unwrap();
     assert_eq!((s.parent, s.fork_depth, s.base), (aid, 4, 26));
     let dir = tempfile::tempdir().unwrap();
     let archive = Archive::open(dir.path()).unwrap();
