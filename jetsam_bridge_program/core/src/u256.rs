@@ -106,3 +106,31 @@ pub fn to_be(a: &[u8; 32]) -> [u8; 32] {
     }
     r
 }
+
+/// 32-byte big-endian ABI word -> little-endian u256.
+pub fn from_be(a: &[u8; 32]) -> [u8; 32] {
+    to_be(a)
+}
+
+/// `a ≥ k × b`, exact (the product on 320 bits).
+pub fn ge_mul(a: &[u8; 32], k: u64, b: &[u8; 32]) -> bool {
+    let limb = |x: &[u8; 32], i: usize| u64::from_le_bytes(x[8 * i..8 * i + 8].try_into().unwrap());
+    let mut product = [0u64; 5];
+    let mut carry = 0u128;
+    for (i, p) in product.iter_mut().take(4).enumerate() {
+        let t = limb(b, i) as u128 * k as u128 + carry;
+        *p = t as u64;
+        carry = t >> 64;
+    }
+    product[4] = carry as u64;
+    if product[4] != 0 {
+        return false;
+    }
+    for i in (0..4).rev() {
+        let x = limb(a, i);
+        if x != product[i] {
+            return x > product[i];
+        }
+    }
+    true
+}
