@@ -496,6 +496,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
         confirmed_at: Some(NOW - 1_000),
         taken: false,
         minted: false,
+        published: Ok(()),
     }
 }
 
@@ -1405,4 +1406,51 @@ fn a5_18_the_ceiling_read_on_the_bridge_is_the_nodes_v8_ceiling() {
     w = [0u8; 32];
     w[0] = 0x80;
     assert_eq!(u64_saturating(&w), u64::MAX);
+}
+
+/// A5-7: a deposit is advanced only when the relayer archived and published its block's body (read again and
+/// checked: its id, its body against its header, the deposit in it); otherwise it waits.
+#[test]
+fn a5_7_only_a_deposit_whose_block_body_the_relayer_published_is_advanced() {
+    let b = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM), deposit_tx(200, rcpt(0xb2), 9 * JTM)]);
+    let (raw, id) = raw_and_id(&b);
+    let d = deposits_of_block(&raw, &id, &rules()).unwrap()[1];
+    let dir = tempfile::tempdir().unwrap();
+    let blocks = dir.path().join("blocks");
+    std::fs::create_dir_all(&blocks).unwrap();
+    let file = blocks.join(format!("{}-{}.bin", F + 1, hex::encode(id)));
+    assert_eq!(published_body(None, &d, &rules()), Err("BODY_NOT_PUBLISHED"), "no relayer configured");
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("BODY_NOT_PUBLISHED"), "not published yet");
+    std::fs::write(&file, &raw).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Ok(()));
+    // another block's bytes under this name, a body its header does not commit to, garbage: fail-closed
+    let (other, _) = raw_and_id(&block_of(F + 2, vec![deposit_tx(100, rcpt(0xa1), 9 * JTM)]));
+    std::fs::write(&file, &other).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    let mut forged = b.clone();
+    forged.transactions = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM), deposit_tx(200, rcpt(0xb2), 8 * JTM)]).transactions;
+    std::fs::write(&file, forged.to_bytes()).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    std::fs::write(&file, &raw[..raw.len() - 1]).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    // the right block, but not this deposit's tuple
+    std::fs::write(&file, &raw).unwrap();
+    for wrong in [FoundDeposit { amount: 9 * JTM + 1, ..d }, FoundDeposit { recipient: rcpt(0xa1), ..d }, FoundDeposit { txid: [0x3a; 32], ..d }, FoundDeposit { group: 0, ..d }] {
+        assert_eq!(published_body(Some(&blocks), &wrong, &rules()), Err("PUBLISHED_BODY_MISMATCH"), "{wrong:?}");
+    }
+    // in the plan: a wait (never a refusal), that does not hold the queue behind it
+    let mut c = cand(10, 1, 1, 7 * JTM);
+    c.published = Err("BODY_NOT_PUBLISHED");
+    assert_eq!(run(&[c.clone(), cand(11, 1, 2, 7 * JTM)], &Ledger::default(), caps()), vec![Verdict::Wait("BODY_NOT_PUBLISHED"), Verdict::Advance]);
+    c.published = Err("PUBLISHED_BODY_MISMATCH");
+    assert_eq!(run(&[c], &Ledger::default(), caps()), vec![Verdict::Wait("PUBLISHED_BODY_MISMATCH")]);
+}
+
+/// A5-7: the relayer publishes its archive beside its `final.json`.
+#[test]
+fn a5_7_the_relayers_blocks_are_beside_its_final_json() {
+    let c = FillConfig::parse(&rehearsal("relay_final = \"/srv/relay/publish/final.json\"\n[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
+    assert_eq!(c.relay_blocks_dir(), Some(std::path::PathBuf::from("/srv/relay/publish/blocks")));
+    let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
+    assert_eq!(c.relay_blocks_dir(), None);
 }

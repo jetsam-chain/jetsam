@@ -27,7 +27,8 @@
 //!   gas estimate plus a margin, fee caps, written ahead before they leave the host, found again after a stop;
 //!   `jetsam_guardian::l1tx`); only the private rehearsal may still use the endpoint's unlocked TEST account.
 //! * With `relay_final` (the relayer's published `final.json`), the robot claims the repayment of its own
-//!   advances as soon as their root is final on the contract.
+//!   advances as soon as their root is final on the contract; and it advances only a deposit whose block
+//!   body the relayer archived and published beside it (`blocks/<h>-<id>.bin`, read again and checked: A5-7).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -328,6 +329,7 @@ impl Robot {
         let deposits: Vec<FoundDeposit> = self.state.scanned.values().flat_map(|(_, ds)| ds.clone()).collect();
         let chains: Vec<Chain> = self.observers.iter().map(|o| o.chain().clone()).collect();
         let mut cands = Vec::new();
+        let blocks_dir = self.cfg.relay_blocks_dir();
         for d in deposits {
             let key = hex::encode(d.key());
             if self.state.ledger.has(&d.key()) || self.state.decided.get(&key).is_some_and(|v| v.starts_with("refuse:")) {
@@ -372,7 +374,9 @@ impl Robot {
                     continue;
                 }
             }
-            cands.push(Candidate { dep: d, conf, confirmed_at: self.state.confirmed_at.get(&key).copied(), taken, minted });
+            // A5-7: the relayer's archive of the block (read again only for a confirmed deposit)
+            let published = if conf.is_ok() { fill::published_body(blocks_dir.as_deref(), &d, &self.rules) } else { Err("NOT_CONFIRMED") };
+            cands.push(Candidate { dep: d, conf, confirmed_at: self.state.confirmed_at.get(&key).copied(), taken, minted, published });
         }
         let verdicts = fill::plan(&cands, &self.state.ledger, caps, &g, now, l1_now, min_advance, &self.cfg.params);
         // the published queue (first in, first out; degraded mode when the stock is dry)
@@ -632,6 +636,10 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config {} sha256 {}", path.display(), hex::encode(digest)));
     let rules = VaultRules::current();
     cfg.build_matches(&rules)?;
+    match cfg.relay_blocks_dir() {
+        Some(dir) => log(&format!("deposit bodies: the relayer's archive {} (A5-7: none advanced before it is published there)", dir.display())),
+        None => log("WARNING no relay_final: no deposit is advanced (A5-7: the relayer's published archive of each deposit body is required)"),
+    }
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?} ({}), {} nodes, dry_run {}", cfg.profile()?, cfg.nodes.len(), cfg.dry_run));
     std::fs::create_dir_all(&cfg.state_dir)?;

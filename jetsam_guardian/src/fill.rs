@@ -384,6 +384,21 @@ fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_o
     Ok(())
 }
 
+/// A5-7: the body of `d`'s block as the relayer archived and published it
+/// (`<publish_dir>/blocks/<height>-<block id hex>.bin`, `blocks_dir` = [`FillConfig::relay_blocks_dir`]), read
+/// again: its header must be the block `d.block_id`, its body the one that header commits to, and the node's
+/// rule must read `d` in it (same group, txid, recipient, amount). Without it no proof of the deposit is ever
+/// possible once the nodes stop serving the body, and the advance would never be repaid: the robot waits
+/// (`BODY_NOT_PUBLISHED`, `PUBLISHED_BODY_MISMATCH`), it never decides for good on it.
+pub fn published_body(blocks_dir: Option<&Path>, d: &FoundDeposit, rules: &VaultRules) -> Result<(), &'static str> {
+    let Some(dir) = blocks_dir else { return Err("BODY_NOT_PUBLISHED") };
+    let Ok(raw) = std::fs::read(dir.join(format!("{}-{}.bin", d.height, hex::encode(d.block_id)))) else { return Err("BODY_NOT_PUBLISHED") };
+    match deposits_of_block(&raw, &d.block_id, rules) {
+        Ok(found) if found.contains(d) => Ok(()),
+        _ => Err("PUBLISHED_BODY_MISMATCH"),
+    }
+}
+
 /// The contract's tip compared with the robot's chain (R-6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TipCheck {
@@ -558,6 +573,8 @@ pub struct Candidate {
     pub taken: bool,
     /// `isMinted[txId]`.
     pub minted: bool,
+    /// A5-7: [`published_body`], the relayer's archive of its block.
+    pub published: Result<(), &'static str>,
 }
 
 /// The contract's view of this advancer (`advancerCaps`), the hot key's wJTM balance and the token's
@@ -698,6 +715,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
         } else if l1_now.saturating_sub(d.block_ts) > p.late_after_secs {
             Verdict::Refuse("LATE_SLOW_PATH_NEAR")
         } else if let Err(code) = c.conf {
+            Verdict::Wait(code)
+        } else if let Err(code) = c.published {
             Verdict::Wait(code)
         } else if d.amount > p.grace_from && now < c.confirmed_at.unwrap_or(now) + p.grace_secs {
             Verdict::Wait("GRACE")
@@ -957,9 +976,18 @@ pub struct FillConfig {
     pub signer: crate::l1tx::SignerConfig,
     /// The relayer's published `final.json` (`jg-relay`'s `publish_dir`): the robot claims the repayment of
     /// its own advances from it (`claimDeposit`), checked against the contract's final root, without
-    /// waiting for anyone. Absent: it waits for a claimer.
+    /// waiting for anyone. Absent: it waits for a claimer. The relayer's archive of the deposit blocks beside
+    /// it (`blocks/`) is required for every advance (A5-7): absent, nothing is advanced.
     #[serde(default)]
     pub relay_final: Option<PathBuf>,
+}
+
+impl FillConfig {
+    /// A5-7: where the relayer publishes the deposit blocks it archived: `blocks/` beside its `final.json`
+    /// (`relay_final` = `<publish_dir>/final.json`); none without `relay_final`, and then nothing is advanced.
+    pub fn relay_blocks_dir(&self) -> Option<PathBuf> {
+        self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks"))
+    }
 }
 
 fn default_advance_gas() -> u64 {
