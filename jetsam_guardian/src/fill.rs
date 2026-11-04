@@ -41,6 +41,9 @@ pub const ADVANCE_MIN_AMOUNT: u64 = 1_000_000;
 pub const SLOW_PER_DEPOSIT: u64 = 1_000_000_000;
 /// A-3.
 pub const MAX_FILL_FEE_BPS: u16 = 100;
+/// C-6 of the contract: it mints while `token().totalSupply() + amount ≤ OUTSTANDING_CEIL` (`OUTSTANDING_CEIL()`,
+/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start).
+pub const OUTSTANDING_CEIL: u64 = 10_000_000_000;
 /// A-13, A-14: the contract's caps per advancer.
 pub const ADVANCE_OUTSTANDING_CAP: u64 = 3_000_000_000;
 pub const ADVANCE_CAP_24H: u64 = 2_500_000_000;
@@ -497,6 +500,9 @@ pub struct GuardInput {
     pub tip: TipCheck,
     /// [`top_share_pct`].
     pub top_share_pct: u64,
+    /// A5-18: the contract's `suspectMinted()` is not 0 (wJTM minted from abandoned final points, still in
+    /// `totalSupply`).
+    pub suspect_minted: bool,
 }
 
 /// A halt (latched: only an operator restarts, D41) and a pause (lifts with its cause).
@@ -522,6 +528,8 @@ pub fn guard(g: &GuardInput, p: &FillParams) -> Guard {
     };
     let pause = if g.stalled {
         Some("PAUSE_STALLED")
+    } else if g.suspect_minted {
+        Some("PAUSE_SUSPECT_MINTED")
     } else if g.l1_now < g.last_switch_at.saturating_add(p.switch_pause_secs) {
         Some("PAUSE_RECENT_SWITCH")
     } else if g.now > g.tip_changed_at + p.tip_max_age {
@@ -552,12 +560,14 @@ pub struct Candidate {
     pub minted: bool,
 }
 
-/// The contract's view of this advancer (`advancerCaps`) and the hot key's wJTM balance.
+/// The contract's view of this advancer (`advancerCaps`), the hot key's wJTM balance and the token's
+/// `totalSupply()` (A5-18, saturated to `u64::MAX`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     pub outstanding: u64,
     pub spent24h: u64,
     pub stock: u64,
+    pub total_supply: u64,
 }
 
 /// The decision on one candidate.
@@ -628,6 +638,12 @@ impl Ledger {
         self.advances.iter().any(|a| a.key == *key)
     }
 
+    /// A5-18: the amounts of its advances still pending (not minted yet: the slow mint of each adds its
+    /// amount to `totalSupply`).
+    pub fn pending_sum(&self) -> u64 {
+        self.advances.iter().filter(|a| a.status == AdvanceStatus::Pending).map(|a| a.amount).fold(0u64, u64::saturating_add)
+    }
+
     /// Advanced over `]now − window ; now]`, to `recipient` only if given.
     pub fn sum(&self, now: u64, window: u64, recipient: Option<&[u8; 20]>) -> u64 {
         self.advances
@@ -646,8 +662,9 @@ pub fn fifo_order(cands: &[Candidate]) -> Vec<usize> {
 }
 
 /// The decision on every candidate (same order as `cands`), the queue taken first in first out; at most
-/// one batch of `batch_max` advances. A wait for capacity (hour, 24 h, outstanding, stock) blocks every
-/// later candidate: in degraded mode (stock dry) nobody passes the head of the queue.
+/// one batch of `batch_max` advances. A wait for capacity (hour, 24 h, outstanding, the contract's supply
+/// ceiling, stock) blocks every later candidate: in degraded mode (stock dry) nobody passes the head of the
+/// queue.
 #[allow(clippy::too_many_arguments)]
 pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now: u64, l1_now: u64, min_advance: u64, p: &FillParams) -> Vec<Verdict> {
     if guard.halt.is_some() {
@@ -661,6 +678,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     let mut day = caps.spent24h;
     let mut outstanding = caps.outstanding;
     let mut stock = caps.stock;
+    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted
+    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum());
     let outstanding_cap = p.outstanding_cap.min(ADVANCE_OUTSTANDING_CAP);
     let mut batch = 0usize;
     let mut per_recipient: HashMap<[u8; 20], u64> = HashMap::new();
@@ -697,6 +716,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
                 Some("DAY_CAP")
             } else if outstanding + d.amount > outstanding_cap {
                 Some("OUTSTANDING_CAP")
+            } else if d.amount > supply_room {
+                Some("SUPPLY_CEILING")
             } else if pay > stock {
                 Some("STOCK")
             } else {
@@ -711,6 +732,7 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
                     hour += d.amount;
                     day += d.amount;
                     outstanding += d.amount;
+                    supply_room -= d.amount;
                     stock -= pay;
                     batch += 1;
                     *per_recipient.entry(d.recipient).or_default() += d.amount;
@@ -778,6 +800,23 @@ impl Ledger {
         }
         n
     }
+}
+
+/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with.
+pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read == OUTSTANDING_CEIL,
+        "the bridge's OUTSTANDING_CEIL() is {read} µwJTM, not {OUTSTANDING_CEIL}: jg-fill does not start (it counts the room under that ceiling)"
+    );
+    Ok(())
+}
+
+/// A uint256 word (big-endian) as a `u64`, `u64::MAX` when it does not fit.
+pub fn u64_saturating(word: &[u8; 32]) -> u64 {
+    if word[..24] != [0u8; 24] {
+        return u64::MAX;
+    }
+    u64::from_be_bytes(word[24..].try_into().expect("8 bytes"))
 }
 
 /// The start check of the hot key: it holds the capped stock only.

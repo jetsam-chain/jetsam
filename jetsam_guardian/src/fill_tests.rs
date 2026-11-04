@@ -287,6 +287,7 @@ fn quiet(now: u64) -> GuardInput {
         l1_now: now,
         tip: TipCheck::Ours,
         top_share_pct: 40,
+        suspect_minted: false,
     }
 }
 
@@ -499,7 +500,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0 }
 }
 
 fn open() -> Guard {
@@ -1352,4 +1353,56 @@ fn a5_11_a_batch_refused_for_its_gas_is_halved_down_to_one() {
     assert_eq!(smaller_batch(&refusal, 1), None, "one order: nothing smaller");
     assert_eq!(smaller_batch("reverts: server error: execution reverted 0xff7c2768", 23), None);
     assert_eq!(smaller_batch("base fee 9 + priority 1 wei/gas above the cap 5: not sent", 23), None);
+}
+
+/// A5-18 (C-6 kept prudent): the contract mints while `totalSupply + amount ≤ OUTSTANDING_CEIL`; the robot
+/// advances only what the ceiling still holds after the slow mints of its own pending advances.
+#[test]
+fn a5_18_an_advance_needs_room_under_the_supply_ceiling_after_the_robots_pending_advances() {
+    // a pending advance of 300 JTM outside the hour and recipient windows: only the ceiling sees it
+    let l = ledger_with(&[(1, 300 * JTM, NOW - 100_000)]);
+    assert_eq!(l.pending_sum(), 300 * JTM);
+    let c = cand(10, 1, 2, 200 * JTM);
+    let supply = |s: u64| Caps { total_supply: s, ..caps() };
+    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM)), vec![Verdict::Advance], "10 000 − 9 500 − 300 = 200");
+    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c.clone()], &l, supply(u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")], "a supply above the ceiling");
+    // repaid or lost advances are minted already (in totalSupply): they are not counted twice
+    let mut done = ledger_with(&[(1, 300 * JTM, NOW - 100_000), (3, 100 * JTM, NOW - 100_000)]);
+    done.advances[0].status = AdvanceStatus::Repaid;
+    done.advances[1].status = AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into());
+    assert_eq!(done.pending_sum(), 0);
+    assert_eq!(run(&[c.clone()], &done, supply(9_800 * JTM)), vec![Verdict::Advance]);
+    // within one plan the batch counts itself, and the wait keeps the queue's order
+    let cands = vec![cand(10, 1, 2, 150 * JTM), cand(11, 1, 3, 100 * JTM), cand(12, 1, 4, 5 * JTM)];
+    let v = run(&cands, &l, supply(9_500 * JTM));
+    assert_eq!(v, vec![Verdict::Advance, Verdict::Wait("SUPPLY_CEILING"), Verdict::Wait("QUEUED_BEHIND")]);
+}
+
+#[test]
+fn a5_18_wjtm_minted_from_abandoned_final_points_pauses() {
+    let p = FillParams::default();
+    let mut s = quiet(NOW);
+    s.suspect_minted = true;
+    let g = guard(&s, &p);
+    assert_eq!((g.halt.as_deref(), g.pause.as_deref()), (None, Some("PAUSE_SUSPECT_MINTED")), "a pause: not latched, lifts with its cause");
+    assert_eq!(plan(&[cand(10, 1, 1, 7 * JTM)], &Ledger::default(), caps(), &g, NOW, NOW, 5 * JTM, &p), vec![Verdict::Wait("PAUSED")]);
+}
+
+#[test]
+fn a5_18_the_ceiling_read_on_the_bridge_is_the_nodes_v8_ceiling() {
+    use jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO;
+    assert_eq!(OUTSTANDING_CEIL, VAULT_OUTSTANDING_CEIL_MICRO);
+    assert!(check_ceiling(10_000 * JTM).is_ok());
+    for bad in [10_000 * JTM + 1, 10_000 * JTM - 1, 0, u64::MAX] {
+        assert!(check_ceiling(bad).unwrap_err().to_string().contains("does not start"), "{bad}");
+    }
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&(10_000 * JTM).to_be_bytes());
+    assert_eq!(u64_saturating(&w), 10_000 * JTM);
+    w[23] = 1;
+    assert_eq!(u64_saturating(&w), u64::MAX, "a uint256 above u64 saturates");
+    w = [0u8; 32];
+    w[0] = 0x80;
+    assert_eq!(u64_saturating(&w), u64::MAX);
 }

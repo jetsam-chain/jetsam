@@ -11,7 +11,11 @@
 //! * Egress (A4-1, D60, D66): its nodes and its L1 through Tor or on the loopback only, or it does not
 //!   start; the private rehearsal's clearnet (`[egress] mode = "clearnet"`) to its bridge 10.77.0.0/24 only.
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
-//!   the L1 chain id, the bridge's genesis, and the hot key's stock ≤ `max_stock` (else no start).
+//!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, and the hot key's stock ≤ `max_stock`
+//!   (else no start).
+//! * A5-18: every step reads the token's `totalSupply()` and the bridge's `suspectMinted()`: nothing is
+//!   advanced while `suspectMinted() > 0`, nor beyond what the contract's ceiling holds after the mints of the
+//!   robot's own pending advances (C-6 kept prudent).
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
 //!   with its cause. Either way the robot keeps observing, journaling and checking its repayments. A loss
 //!   (its deposit minted to another tuple) halts; an advance not repaid after 72 h is an ALERT only, still
@@ -189,6 +193,16 @@ impl Robot {
         Ok(None)
     }
 
+    /// The amount `AdvanceRepaid(key, txId, refundTo, amount)` minted to the claim owner of advance `key`.
+    fn repaid_amount(&self, key: &[u8; 32]) -> anyhow::Result<Option<u64>> {
+        let filter = json!([{"address": self.bridge, "fromBlock": "0x0", "toBlock": "latest", "topics": [l1::TOPIC_ADVANCE_REPAID, hex0x(key)]}]);
+        let logs = self.l1.rpc("eth_getLogs", filter)?;
+        let Some(lg) = logs.as_array().and_then(|l| l.first()) else { return Ok(None) };
+        let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
+        anyhow::ensure!(data.len() == 32, "AdvanceRepaid data of {} bytes", data.len());
+        Ok(Some(word_u64(&data, 0)))
+    }
+
     /// Read the deposits of the blocks above F that node 0's chain holds and that are not read yet (or
     /// were replaced by a reorganization), with the node's own rule.
     fn scan(&mut self) {
@@ -252,7 +266,10 @@ impl Robot {
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
         let last_switch_at = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
         let caps_raw = self.view("advancerCaps(address)", &l1::address_word(&self.hot))?;
-        let caps = Caps { outstanding: word_u64(&caps_raw, 0), spent24h: word_u64(&caps_raw, 1), stock: self.balance()? };
+        // A5-18: the token's supply under the contract's ceiling, and wJTM minted from abandoned final points
+        let total_supply = fill::u64_saturating(&word(&self.l1.call(&self.token, &l1::selector("totalSupply()"))?, 0));
+        let suspect_minted = word(&self.view("suspectMinted()", &[])?, 0) != [0u8; 32];
+        let caps = Caps { outstanding: word_u64(&caps_raw, 0), spent24h: word_u64(&caps_raw, 1), stock: self.balance()?, total_supply };
         let gas_price = u128::from_str_radix(self.l1.rpc("eth_gasPrice", json!([]))?.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
         // R-6: the contract's tip against every node's chain (the worst)
         let tip = if tip_id == [0u8; 32] {
@@ -282,6 +299,7 @@ impl Robot {
             l1_now,
             tip,
             top_share_pct: fill::top_share_pct(self.observers[0].chain(), self.cfg.params.share_window),
+            suspect_minted,
         };
         let mut g = fill::guard(&gi, &self.cfg.params);
         // an advance whose deposit left the chain: halt
@@ -541,8 +559,15 @@ impl Robot {
             let at = word_u64(&v, 5);
             if status == 2 {
                 self.state.ledger.advances[i].status = AdvanceStatus::Repaid;
-                log(&format!("REPAID key {} ({} µJTM to the claim owner {})", hex::encode(a.key), a.amount, hex0x(&word_addr(&v, 0))));
-                self.journal(json!({"kind": "repaid", "key": hex::encode(a.key), "amount": a.amount, "claim_owner": hex0x(&word_addr(&v, 0)), "l1_t": l1_now}));
+                // A5-1: a mint less than ADVANCE_MIN_AGE after the advance repays only what the advance paid
+                // (the recipient gets the fee): the amount minted to the claim owner is AdvanceRepaid's
+                let repaid = self.repaid_amount(&a.key).unwrap_or_else(|e| {
+                    log(&format!("AdvanceRepaid of key {} not read: {e:#}", hex::encode(a.key)));
+                    None
+                });
+                let shown = repaid.map_or_else(|| "?".to_string(), |r| r.to_string());
+                log(&format!("REPAID key {} (advanced {} µJTM, {shown} µwJTM minted to the claim owner {})", hex::encode(a.key), a.amount, hex0x(&word_addr(&v, 0))));
+                self.journal(json!({"kind": "repaid", "key": hex::encode(a.key), "amount": a.amount, "repaid": repaid, "claim_owner": hex0x(&word_addr(&v, 0)), "l1_t": l1_now}));
                 continue;
             }
             let minted = word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1;
@@ -616,6 +641,7 @@ fn run() -> anyhow::Result<()> {
     let bridge = hex0x(&fill::parse20(&cfg.l1_bridge)?);
     let token = hex0x(&word_addr(&l1.call(&bridge, &l1::selector("token()"))?, 0));
     anyhow::ensure!(token != hex0x(&[0u8; 20]), "the bridge {bridge} answers no token: jg-fill does not start");
+    fill::check_ceiling(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0)))?;
     let hot = cfg.hot()?;
     let mut probe = l1::selector("balanceOf(address)").to_vec();
     probe.extend_from_slice(&l1::address_word(&hot));
