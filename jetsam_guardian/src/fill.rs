@@ -128,7 +128,8 @@ pub fn deposits_of_block(raw: &[u8], expected_id: &[u8; 32], rules: &VaultRules)
 }
 
 /// [`deposits_of_block`] on a block already decoded: its body against its header's `tx_root`, then the
-/// node's rule in the same permissive context.
+/// node's rule in the same permissive context; each deposit under the vault rule's logical txid
+/// (`jetsam_vault_rule::txid`, the proof program's), checked equal to the chain's.
 pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Vec<FoundDeposit>> {
     let id = block_id(&block.header);
     let height = block.header.height;
@@ -150,19 +151,30 @@ pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Ve
     let ctx = VaultContext { released: &released, released_in_window: 0, bridge_locked: taken, bridge_vault_floor: 0 };
     let effect = validate_block_vault(block, &ctx, rules, &mut |_| Ok(()))
         .map_err(|e| anyhow::anyhow!("the node's vault rule refuses block {height}: {e:?}"))?;
-    Ok(effect
+    effect
         .deposits
         .iter()
-        .map(|d| FoundDeposit {
-            height,
-            group: d.group as u32,
-            block_id: id,
-            txid: stream.groups[d.group].spend.logical_txid.0,
-            recipient: d.recipient,
-            amount: d.amount,
-            block_ts: block.header.timestamp,
+        .map(|d| {
+            // A5-12: the deposit's txid is the vault rule's (the one the proof program proves and the contract
+            // mints under), from the group's 323-byte pages; it must be the chain's own (the header's tx_root
+            // commits to that one), or the block gives no deposit
+            let g = &stream.groups[d.group];
+            let wire = user[usize::from(g.start_page)..g.end_page_exclusive()]
+                .iter()
+                .map(|t| jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().map_err(|e| anyhow::anyhow!("block {height}: page: {e:?}")))
+                .collect::<anyhow::Result<Vec<[u8; jetsam_tx::TX_BODY_WIRE_SIZE]>>>()?;
+            let pages: Vec<&[u8]> = wire.iter().map(|p| p.as_slice()).collect();
+            let txid = jetsam_vault_rule::txid::logical_txid(&pages);
+            anyhow::ensure!(
+                txid == g.spend.logical_txid.0,
+                "block {height} group {}: the vault rule's txid {} is not the chain's {}: no deposit read",
+                d.group,
+                hex::encode(txid),
+                hex::encode(g.spend.logical_txid.0)
+            );
+            Ok(FoundDeposit { height, group: d.group as u32, block_id: id, txid, recipient: d.recipient, amount: d.amount, block_ts: block.header.timestamp })
         })
-        .collect())
+        .collect()
 }
 
 /// The robot's parameters (study n°2 §8.1, D72, D-AV4), the defaults those of the study. Amounts in µJTM,

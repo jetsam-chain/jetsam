@@ -3194,6 +3194,7 @@ dependencies = [
  "jetsam_chain",
  "jetsam_poseidon2b",
  "jetsam_tx",
+ "jetsam_vault_rule",
  "k256",
  "libc",
  "serde",
@@ -3425,6 +3426,9 @@ dependencies = [
 [[package]]
 name = "jetsam_vault_rule"
 version = "1.6.0"
+dependencies = [
+ "jetsam_bridge_towerwalk",
+]
 
 [[package]]
 name = "jni"

@@ -795,7 +795,8 @@ fn g6_matches_v4_bytes_node_vectors_are_stable() {
     assert_eq!(on_disk, text, "the node-side vectors changed: G6 = V4 must be re-checked on every implementation");
 }
 
-fn g6_vectors() -> serde_json::Value {
+/// The 13 cases of `g6_v4_vectors.json`.
+fn g6_cases() -> Vec<(&'static str, Block)> {
     let mut reserved = deposit_marker(&rcpt(0xa1));
     reserved.0[31] = 1;
     let with_value = |amount: u64| {
@@ -819,8 +820,12 @@ fn g6_vectors() -> serde_json::Value {
         ("refused_v5_marker_with_value", block_of(F + 1, vec![with_value(7 * JTM)])),
         ("refused_vault_output_without_marker", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 7 * JTM)])])),
     ];
+    cases
+}
+
+fn g6_vectors() -> serde_json::Value {
     let mut out = Vec::new();
-    for (name, b) in cases {
+    for (name, b) in g6_cases() {
         let (raw, id) = raw_and_id(&b);
         // the 323-byte pages as the block carries them (a coinbase as a body, the others as `TxPage`)
         let pages: Vec<String> = b
@@ -916,7 +921,8 @@ fn development_payout(owners: [Address; 2]) -> Transaction {
     })
 }
 
-fn g6_edge_vectors() -> serde_json::Value {
+/// The cases of `g6_v4_vectors_edges.json` (name, rule, block).
+fn g6_edge_cases() -> Vec<(&'static str, &'static str, Block)> {
     use jetsam_chain::consensus::vault::{VaultRelease, LIGHT_CLIENT_UPDATE_MARKER_TAG, RELEASE_FEE_MICRO};
     let marker = |r: u8| deposit_marker(&rcpt(r));
     let reserved = |byte: usize| {
@@ -1002,9 +1008,13 @@ fn g6_edge_vectors() -> serde_json::Value {
         ("x_three_deposits_one_block", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM - 1), deposit_tx(100, rcpt(0xc3), 1_000 * JTM)], &[])),
         ("x_payment_only", "V4", one(F + 1, logical(1, PAYER, &[pay(0x77, 3 * JTM)]))),
     ];
+    cases
+}
+
+fn g6_edge_vectors() -> serde_json::Value {
     let mut out = Vec::new();
     let mut names = std::collections::HashSet::new();
-    for (name, rule, b) in cases {
+    for (name, rule, b) in g6_edge_cases() {
         assert!(names.insert(name), "{name} twice");
         let decision = |r: anyhow::Result<Vec<FoundDeposit>>| match r {
             Ok(found) => serde_json::json!({
@@ -1489,4 +1499,91 @@ fn a5_15_one_robot_per_state_dir() {
     assert!(e.contains("another jg-fill") && e.contains("does not start"), "{e}");
     drop(first);
     assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
+}
+
+// ---------------------------------------------------------------- the robot's activation gate (A5-12)
+
+/// **The activation gate of the robot `jg-fill`** (A5-12, CI): green, the robot may advance; red, it must not
+/// be activated. On the very files the proof program replays (`jetsam_bridge_program/core/tests/g6_v4_vectors.rs`:
+/// `tests/fixtures/g6_v4_vectors.json`, 13, and `g6_v4_vectors_edges.json`, 40; checked here to be exactly what
+/// these cases give), the robot (its own path: `deposits_in_block`, the node's `validate_block_vault`) and the
+/// proof program (`deposit::try_block_deposits` on the same pages) decide the same deposits with ONE logical
+/// txid, `jetsam_vault_rule::txid`, which is leaf by leaf the chain's consensus txid (`jetsam_tx`, through
+/// `try_compute_logical_txids`). A bit of difference and the slow mint pays under another key: the advance is
+/// never repaid.
+#[test]
+fn robot_activation_gate_node_program_and_robot_decide_the_g6_vectors_with_one_txid() {
+    use jetsam_bridge_program::deposit::{try_block_deposits, DepositRule};
+    use jetsam_chain::block::{try_compute_logical_txids, validate_block_page_stream};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for (file, value) in [("g6_v4_vectors.json", g6_vectors()), ("g6_v4_vectors_edges.json", g6_edge_vectors())] {
+        let on_disk = std::fs::read_to_string(dir.join(file)).unwrap();
+        assert_eq!(on_disk, serde_json::to_string_pretty(&value).unwrap() + "\n", "{file}: the program's file is these cases");
+    }
+    let (base, edges) = (g6_cases(), g6_edge_cases());
+    assert_eq!((base.len(), edges.len()), (13, 40));
+    let all: Vec<(&str, Block)> = base.into_iter().chain(edges.into_iter().map(|(n, _, b)| (n, b))).collect();
+    let rule = DepositRule { deposits_from_height: Some(F), ..DepositRule::for_activation(Some(J)) };
+    let mut deposits = 0;
+    for (name, b) in &all {
+        let pages: Vec<Vec<u8>> = b
+            .transactions
+            .iter()
+            .map(|t| if t.body.is_coinbase { t.body.to_bytes().to_vec() } else { jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().unwrap().to_vec() })
+            .collect();
+        let refs: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+        // 1. the vault rule's txid of every leaf (a system record: its body hash; a group: its logical txid) is
+        //    the chain's consensus txid
+        let stream = validate_block_page_stream(&b.transactions).unwrap();
+        let user = stream.user_start_index;
+        let mut ours: Vec<[u8; 32]> = refs[..user].iter().map(|p| jetsam_vault_rule::txid::body_hash(p)).collect();
+        for g in &stream.groups {
+            ours.push(jetsam_vault_rule::txid::logical_txid(&refs[user + usize::from(g.start_page)..user + g.end_page_exclusive()]));
+        }
+        let chain: Vec<[u8; 32]> = try_compute_logical_txids(&b.transactions).unwrap().iter().map(|t| t.0).collect();
+        assert_eq!(ours, chain, "{name}: the vault rule's txids are the chain's");
+        // 2. the robot and the program: the same deposits, under the vault rule's txid of their group
+        let robot = deposits_in_block(b, &rules());
+        let program = try_block_deposits(b.header.height, &b.header.tx_root, &refs, &rule);
+        match (&robot, &program) {
+            (Ok(r), Ok(p)) => {
+                let r: Vec<(u32, [u8; 32], [u8; 20], u64)> = r.iter().map(|d| (d.group, d.txid, d.recipient, d.amount)).collect();
+                let p: Vec<(u32, [u8; 32], [u8; 20], u64)> = p.iter().map(|d| (d.group, d.txid, d.recipient, d.amount)).collect();
+                assert_eq!(r, p, "{name}: the robot and the program");
+                for (group, txid, _, _) in &r {
+                    assert_eq!(*txid, ours[user + *group as usize], "{name}: group {group}");
+                }
+                deposits += r.len();
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!("{name}: robot {robot:?}, program {program:?}"),
+        }
+    }
+    assert_eq!(deposits, 17, "the deposits of the accepted vectors");
+}
+
+/// The activation gate, structurally: neither the proof program nor the robot defines the sponge, the body hash
+/// or the paged-spend txid; `jetsam_vault_rule` does, and the robot's deposits take its txid.
+#[test]
+fn robot_activation_gate_the_logical_txid_has_one_implementation() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let defs = ["fn paged_spend_txid", "fn body_hash", "struct Sponge", "fn compress_with_tag", "fn logical_txid("];
+    for dir in ["jetsam_bridge_program/core/src", "jetsam_guardian/src"] {
+        for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") || path.file_name().is_some_and(|n| n == "fill_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for d in defs {
+                assert!(!text.contains(d), "{} defines `{d}`: the txid has one implementation, jetsam_vault_rule::txid", path.display());
+            }
+        }
+    }
+    let vault = std::fs::read_to_string(root.join("jetsam_vault_rule/src/txid.rs")).unwrap() + &std::fs::read_to_string(root.join("jetsam_vault_rule/src/p2b.rs")).unwrap();
+    for d in defs {
+        assert!(vault.contains(d), "jetsam_vault_rule defines `{d}`");
+    }
+    let fill = std::fs::read_to_string(root.join("jetsam_guardian/src/fill.rs")).unwrap();
+    assert!(fill.contains("jetsam_vault_rule::txid::logical_txid"), "the robot's deposits take the vault rule's txid");
 }
