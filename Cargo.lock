@@ -3000,10 +3000,13 @@ name = "jetsam_bridge_xtest"
 version = "1.6.0"
 dependencies = [
  "jetsam_bridge_program",
+ "jetsam_bridge_towerwalk",
  "jetsam_chain",
+ "jetsam_guardian",
  "jetsam_poseidon2b",
  "jetsam_tx",
  "jetsam_vault_rule",
+ "serde_json",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "G6 = V4 in CI: the node's vault gate and the bridge proof program on the same blocks (differential and exhaustive), and the program's clock against the node's. Tests only."
+description = "In CI: G6 = V4 (the node's vault gate and the bridge proof program on the same blocks, differential and exhaustive), the program's clocks against the node's, and the checkpoint frame v3 against the relayer's reference (jetsam_guardian) on real headers. Tests only."
 
 [features]
 # The private rehearsal: the node and the program on their rehearsal clocks.
@@ -16,3 +16,9 @@ jetsam_tx = { path = "../../jetsam_tx" }
 jetsam_poseidon2b = { path = "../../jetsam_poseidon2b" }
 jetsam_vault_rule = { path = "../../jetsam_vault_rule" }
 jetsam_bridge_program = { path = "../core" }
+
+[dev-dependencies]
+# The checkpoint frame v3 against the relayer's reference values (tests/checkpoint_v3.rs).
+jetsam_guardian = { path = "../../jetsam_guardian" }
+tw-core = { package = "jetsam_bridge_towerwalk", path = "../towerwalk" }
+serde_json = { workspace = true }
