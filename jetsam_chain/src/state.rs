@@ -319,15 +319,30 @@ const EXACT_SEGMENT_TREE_CACHE_SEGMENTS: usize = 4;
 
 /// Whether a build of any profile re-checks the cache-served segment root
 /// `root` against the streaming walk (the v1.6.1 method, which stays the
-/// source of truth): the roots whose first byte is zero, one in 256.
+/// source of truth): one root in 256, those with `keccak(root ‖ salt)[0] ==
+/// 0` under this process's salt.
 ///
-/// The rule reads the root alone, so it samples the same roots in every
-/// process, clone and cache history: the final root of a miner's template,
-/// whose cache starts empty with every template, is checked as often as the
-/// root a node computes when it applies a block. A check costs one streaming
-/// walk of the segment, about 1.5 s when the segment is full.
+/// A5-24: the salt is drawn once per process from the operating system's
+/// random source, so the sample is unpredictable and differs from node to
+/// node: no block content can be ground out of (or into) it, and a defect a
+/// given root triggers is checked by about one node in 256 rather than by
+/// all of them or by none. Within a process it is stable: the final root of
+/// a miner's template, whose cache starts empty with every template, is
+/// checked as often as the root a node computes when it applies a block. A
+/// check costs one streaming walk of the segment, about 1.5 s when the
+/// segment is full.
 fn exact_segment_tree_oracle_samples(root: &StateHash) -> bool {
-    root[0] == 0
+    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        let mut salt = [0u8; 32];
+        getrandom::getrandom(&mut salt)
+            .expect("the operating system's random source for the segment tree oracle's salt");
+        salt
+    });
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(root);
+    preimage[32..].copy_from_slice(salt);
+    crate::consensus::destination::mpt::keccak256(&preimage)[0] == 0
 }
 
 /// Every node of one segment's exact sparse-Merkle tree, together with the
@@ -508,6 +523,15 @@ impl ExactSegmentTreeCache {
             }
         };
         let root = tree.root();
+        // The streaming walk this cache replaces stays the oracle of every
+        // debug build, so each test that roots a segment through the cache
+        // also checks it. Compiled out of release builds. Before the release
+        // sample (A5-24): a divergence the sample would repair asserts here.
+        debug_assert_eq!(
+            root,
+            exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new()),
+            "segment tree cache diverged from the streaming root of segment {segment_id}"
+        );
         // Release builds have no other oracle: a sampled root is compared
         // with the streaming walk. On a divergence every tree is suspect, so
         // the cache is emptied, and the state gets the streaming root.
@@ -532,14 +556,6 @@ impl ExactSegmentTreeCache {
         if self.entries.len() > EXACT_SEGMENT_TREE_CACHE_SEGMENTS {
             self.entries.remove(0);
         }
-        // The streaming walk this cache replaces stays the oracle of every
-        // debug build, so each test that roots a segment through the cache
-        // also checks it. Compiled out of release builds.
-        debug_assert_eq!(
-            root,
-            exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new()),
-            "segment tree cache diverged from the streaming root of segment {segment_id}"
-        );
         root
     }
 

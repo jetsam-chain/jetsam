@@ -38,6 +38,9 @@ serde = { version = "1", features = ["derive"] }
 blst = "=0.3.16"
 sha2 = "=0.10.9"
 tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
+# A5-24: the salt of the segment tree cache's release oracle, drawn once per
+# process from the operating system (the version the workspace already locks).
+getrandom = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true }
