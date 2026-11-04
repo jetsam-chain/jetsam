@@ -190,3 +190,14 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     }
     assert!(relayer::claims_of(&known[&cid].cp, &found, GL, &minted).unwrap().is_empty());
 }
+
+/// The synthetic chain the `jg-relay` bench's fake nodes serve (`E2E_WRITE_CHAIN=<file>`): 60 blocks, the
+/// newest dated now.
+#[test]
+#[ignore = "writes the jg-relay bench's chain when E2E_WRITE_CHAIN is set"]
+fn write_the_bench_chain() {
+    let Ok(path) = std::env::var("E2E_WRITE_CHAIN") else { return };
+    let c = chain_ending_at(60, jetsam_guardian::now_unix());
+    let v: Vec<serde_json::Value> = (0..=60).map(|h| json!({"height": h, "id": hex::encode(c.id_at(h).unwrap()), "raw": c.header_at(h).unwrap().raw_hex()})).collect();
+    std::fs::write(path, serde_json::to_string(&v).unwrap()).unwrap();
+}
