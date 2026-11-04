@@ -405,19 +405,31 @@ impl Robot {
             }
             return Ok(());
         }
-        let list: Vec<AdvanceOrder> = orders.iter().map(|(_, o, _)| *o).collect();
-        let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
-        let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
-        let receipt = match self.tx.send(&self.l1, &self.bridge, &data, label) {
-            Ok(r) => r,
-            Err(e) => {
-                let text = format!("{e:#}");
-                let reason = text.split("0x").nth(1).and_then(|h| hex::decode(h.get(..8)?).ok()).map(|s| reason_name(&s)).unwrap_or_else(|| "refused".into());
-                log(&format!("advance refused by the contract before sending: {reason} ({text})"));
-                self.journal(json!({"kind": "send_refused", "reason": reason, "orders": list.len(), "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
-                return Ok(());
+        // A5-11: a batch refused for its gas goes again with half of its orders, down to one; the orders
+        // left out are planned again at the next step
+        let mut n = orders.len();
+        let (receipt, list) = loop {
+            let list: Vec<AdvanceOrder> = orders[..n].iter().map(|(_, o, _)| *o).collect();
+            let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
+            let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
+            match self.tx.send(&self.l1, &self.bridge, &data, label) {
+                Ok(r) => break (r, list),
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if let Some(m) = fill::smaller_batch(&text, n) {
+                        log(&format!("batch of {n} refused for its gas, sent again with {m} ({text})"));
+                        self.journal(json!({"kind": "send_refused", "reason": "EXCEEDS_MAX_GAS", "orders": n, "again_with": m, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+                        n = m;
+                        continue;
+                    }
+                    let reason = text.split("0x").nth(1).and_then(|h| hex::decode(h.get(..8)?).ok()).map(|s| reason_name(&s)).unwrap_or_else(|| "refused".into());
+                    log(&format!("advance refused by the contract before sending: {reason} ({text})"));
+                    self.journal(json!({"kind": "send_refused", "reason": reason, "orders": list.len(), "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+                    return Ok(());
+                }
             }
         };
+        let orders = &orders[..n];
         if !receipt.status {
             log(&format!("advance transaction reverted: {}", receipt.tx_hash));
             self.journal(json!({"kind": "send_reverted", "orders": list.len(), "l1_tx": receipt.tx_hash, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));

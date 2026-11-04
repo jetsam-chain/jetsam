@@ -655,8 +655,9 @@ fn a_halt_or_a_pause_advances_nothing() {
 fn one_plan_advances_at_most_one_batch() {
     let cands: Vec<Candidate> = (0..40).map(|i| cand(10 + i, 1, i as u8, 5 * JTM)).collect();
     let v = run(&cands, &Ledger::default(), caps());
-    assert_eq!(v.iter().filter(|x| **x == Verdict::Advance).count(), MAX_ADVANCE_BATCH);
-    assert_eq!(v[MAX_ADVANCE_BATCH], Verdict::Wait("NEXT_BATCH"));
+    let n = FillParams::default().batch_max;
+    assert_eq!(v.iter().filter(|x| **x == Verdict::Advance).count(), n);
+    assert_eq!(v[n], Verdict::Wait("NEXT_BATCH"));
 }
 
 // ---------------------------------------------------------------- losses, stock, parameters
@@ -680,11 +681,11 @@ fn a_hot_key_holding_more_than_its_cap_refuses_to_start() {
 #[test]
 fn parameters_below_their_floors_are_refused() {
     let strict = crate::Profile::Mainnet;
-    assert!(FillParams::default().check(strict).is_ok());
+    assert!(FillParams::default().check(strict, 3_000_000, 25).is_ok());
     let bad = |f: &dyn Fn(&mut FillParams)| {
         let mut p = FillParams::default();
         f(&mut p);
-        p.check(strict).is_err()
+        p.check(strict, 3_000_000, 25).is_err()
     };
     assert!(bad(&|p| p.confirmations = 7));
     assert!(bad(&|p| p.min_nodes = 1));
@@ -701,9 +702,9 @@ fn parameters_below_their_floors_are_refused() {
     let mut p = FillParams::default();
     p.share_halt_pct = 100;
     p.switch_pause_secs = 300;
-    assert!(p.check(crate::Profile::PrivateRehearsal).is_ok());
+    assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_ok());
     p.confirmations = 7;
-    assert!(p.check(crate::Profile::PrivateRehearsal).is_err());
+    assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_err());
 }
 
 // ---------------------------------------------------------------- evidence and journal
@@ -1266,4 +1267,61 @@ fn the_robot_claims_only_its_pending_advances_whose_exact_tuple_is_in_the_final_
     }
     assert_eq!(own_claims(&ledger, &deps, &minted, 1).len(), 1, "at most max");
     assert!(own_claims(&ledger, &deps, &|_| true, 4).is_empty());
+}
+
+// ---------------------------------------------------------------- audit A5
+
+/// A5-11: `(21 000 + n × 97 800) × (100 + margin) / 100 ≤ max_gas`, at most the contract's 32 (the gas
+/// measured for `advanceBatch`, `ADVANCER_INTERFACE.md` §10: 3 orders, 293 340 gas).
+#[test]
+fn a5_11_a_batch_is_bounded_by_the_signers_gas_cap_with_its_margin() {
+    // (21 000 + 24 × 97 800) × 1.25 = 2 960 250 ≤ 3 000 000 < (21 000 + 25 × 97 800) × 1.25 = 3 082 500
+    assert_eq!(batch_gas_bound(3_000_000, 25), 24);
+    // × 1.10: 27 orders 2 927 760, 28 orders 3 035 340
+    assert_eq!(batch_gas_bound(3_000_000, 10), 27);
+    // exactly at the cap: (21 000 + 24 × 97 800) × 1.25 = 2 960 250
+    assert_eq!(batch_gas_bound(2_960_250, 25), 24);
+    assert_eq!(batch_gas_bound(2_960_249, 25), 23);
+    assert_eq!(batch_gas_bound(30_000_000, 25), MAX_ADVANCE_BATCH, "never above the contract's 32");
+    assert_eq!(batch_gas_bound(148_500, 25), 1);
+    assert_eq!(batch_gas_bound(148_499, 25), 0, "not even one order");
+    // the default batch fits the default signer (3 000 000, 25 %), with one order of room
+    let p = FillParams::default();
+    let fee = crate::l1tx::FeePolicy::default();
+    assert_eq!((fee.max_gas, fee.gas_margin_pct), (3_000_000, 25));
+    assert_eq!(p.batch_max, 23);
+    assert!(fee.gas_limit(TX_BASE_GAS + p.batch_max as u64 * BATCH_ORDER_GAS).is_ok());
+    assert!(fee.gas_limit(TX_BASE_GAS + 25 * BATCH_ORDER_GAS).is_err(), "the audit's 25 orders exceed max_gas");
+}
+
+#[test]
+fn a5_11_a_batch_above_the_gas_bound_does_not_start() {
+    let strict = crate::Profile::Mainnet;
+    let with = |n: usize| FillParams { batch_max: n, ..FillParams::default() };
+    assert!(with(24).check(strict, 3_000_000, 25).is_ok());
+    let e = with(25).check(strict, 3_000_000, 25).unwrap_err().to_string();
+    assert!(e.contains("batch_max 25") && e.contains("max_gas"), "{e}");
+    assert!(with(32).check(strict, 3_000_000, 25).is_err());
+    assert!(with(1).check(strict, 148_499, 25).is_err(), "a cap below one order");
+    // through fill.toml: the signer's max_gas bounds the default batch
+    let tight = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\nmax_gas = 2000000\n");
+    let e = FillConfig::parse(&tight).unwrap_err().to_string();
+    assert!(e.contains("batch_max") && e.contains("does not start"), "{e}");
+    let fits = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 16\n[signer]\nmax_gas = 2000000\n");
+    assert!(FillConfig::parse(&fits).is_ok());
+}
+
+/// A5-11: refused for its gas, the batch is sent again with half of its orders, down to one; any other
+/// refusal is not retried.
+#[test]
+fn a5_11_a_batch_refused_for_its_gas_is_halved_down_to_one() {
+    // the refusal is l1tx's own text
+    let refusal = crate::l1tx::FeePolicy::default().gas_limit(2_500_000).unwrap_err().to_string();
+    assert_eq!(smaller_batch(&refusal, 23), Some(12));
+    assert_eq!(smaller_batch(&refusal, 12), Some(6));
+    assert_eq!(smaller_batch(&refusal, 3), Some(2));
+    assert_eq!(smaller_batch(&refusal, 2), Some(1));
+    assert_eq!(smaller_batch(&refusal, 1), None, "one order: nothing smaller");
+    assert_eq!(smaller_batch("reverts: server error: execution reverted 0xff7c2768", 23), None);
+    assert_eq!(smaller_batch("base fee 9 + priority 1 wei/gas above the cap 5: not sent", 23), None);
 }

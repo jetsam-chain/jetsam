@@ -46,6 +46,14 @@ pub const ADVANCE_OUTSTANDING_CAP: u64 = 3_000_000_000;
 pub const ADVANCE_CAP_24H: u64 = 2_500_000_000;
 /// AB-1.
 pub const MAX_ADVANCE_BATCH: usize = 32;
+/// A5-11: the gas of a transaction, and of one order of `advanceBatch` on top of it (measured,
+/// `ADVANCER_INTERFACE.md` §10: 3 orders to fresh recipients, 293 340 gas in all, ≈ 97 780 an order
+/// with the transaction's 21 000 included; counted here on top of it).
+pub const TX_BASE_GAS: u64 = 21_000;
+pub const BATCH_ORDER_GAS: u64 = 97_800;
+/// The default batch: 23 orders (`(21 000 + 23 × 97 800) × 1.25 = 2 838 000` gas under the default
+/// `max_gas` of 3 000 000, one order of room below [`batch_gas_bound`]'s 24).
+pub const DEFAULT_ADVANCE_BATCH: usize = 23;
 /// The floors no configuration lowers: the nodes' finality (8 blocks), two nodes.
 pub const CONFIRMATIONS_FLOOR: u64 = 8;
 pub const MIN_NODES_FLOOR: usize = 2;
@@ -208,7 +216,7 @@ pub struct FillParams {
     pub share_halt_pct: u64,
     /// A pending advance older than this is noted lost (the contract never says it).
     pub loss_after_secs: u64,
-    /// Orders per `advanceBatch` (≤ 32).
+    /// Orders per `advanceBatch` (≤ 32, and within the signer's `max_gas`: [`batch_gas_bound`]).
     pub batch_max: usize,
 }
 
@@ -243,15 +251,35 @@ impl Default for FillParams {
             share_window: 480,
             share_halt_pct: 55,
             loss_after_secs: 259_200,
-            batch_max: MAX_ADVANCE_BATCH,
+            batch_max: DEFAULT_ADVANCE_BATCH,
         }
     }
 }
 
+/// A5-11: the most orders of one `advanceBatch` whose gas, with the signer's margin, stays within its
+/// `max_gas` (`l1tx::FeePolicy::gas_limit` refuses above it): `(21 000 + n × 97 800) × (100 + margin) /
+/// 100 ≤ max_gas`, at most the contract's 32.
+pub fn batch_gas_bound(max_gas: u64, gas_margin_pct: u64) -> usize {
+    (0..=MAX_ADVANCE_BATCH)
+        .rev()
+        .find(|n| {
+            let gas = u128::from(TX_BASE_GAS) + *n as u128 * u128::from(BATCH_ORDER_GAS);
+            (gas * u128::from(100 + gas_margin_pct)).div_ceil(100) <= u128::from(max_gas)
+        })
+        .unwrap_or(0)
+}
+
+/// A5-11: the batch `l1tx` refused for its gas (`… exceeds max_gas …`), `n` orders, is sent again with
+/// half of its orders (rounded up), down to one; `None` for any other refusal or a single order.
+pub fn smaller_batch(refusal: &str, n: usize) -> Option<usize> {
+    (n > 1 && refusal.contains("exceeds max_gas")).then(|| n.div_ceil(2))
+}
+
 impl FillParams {
     /// The floors and the contract's bounds; the private rehearsal may lift the concentration halt and
-    /// shorten the pause after a switch (2-3 miners, a fresh genesis), nothing else.
-    pub fn check(&self, profile: crate::Profile) -> anyhow::Result<()> {
+    /// shorten the pause after a switch (2-3 miners, a fresh genesis), nothing else. `max_gas` and
+    /// `gas_margin_pct` are the signer's (`[signer]`): a batch must fit them (A5-11).
+    pub fn check(&self, profile: crate::Profile, max_gas: u64, gas_margin_pct: u64) -> anyhow::Result<()> {
         anyhow::ensure!(self.confirmations >= CONFIRMATIONS_FLOOR, "confirmations {} is below the floor {CONFIRMATIONS_FLOOR}", self.confirmations);
         anyhow::ensure!(self.min_nodes >= MIN_NODES_FLOOR, "min_nodes {} is below the floor {MIN_NODES_FLOOR}", self.min_nodes);
         anyhow::ensure!(self.work_blocks >= CONFIRMATIONS_FLOOR, "work_blocks {} is below the floor {CONFIRMATIONS_FLOOR}", self.work_blocks);
@@ -263,6 +291,13 @@ impl FillParams {
             self.max_stock
         );
         anyhow::ensure!((1..=MAX_ADVANCE_BATCH).contains(&self.batch_max), "batch_max {} outside 1..={MAX_ADVANCE_BATCH}", self.batch_max);
+        let bound = batch_gas_bound(max_gas, gas_margin_pct);
+        anyhow::ensure!(
+            self.batch_max <= bound,
+            "batch_max {} above {bound}: (21 000 + {} × {BATCH_ORDER_GAS}) gas with the signer's {gas_margin_pct} % margin exceeds its max_gas {max_gas}",
+            self.batch_max,
+            self.batch_max
+        );
         if profile.strict() {
             anyhow::ensure!(self.share_halt_pct <= SHARE_HALT_CEIL, "share_halt_pct {} is above {SHARE_HALT_CEIL} on {profile}", self.share_halt_pct);
             anyhow::ensure!(self.switch_pause_secs >= SWITCH_PAUSE_FLOOR, "switch_pause_secs {} is below {SWITCH_PAUSE_FLOOR} on {profile}", self.switch_pause_secs);
@@ -892,7 +927,14 @@ impl FillConfig {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let c: Self = toml::from_str(text)?;
         let profile = c.profile()?;
-        c.params.check(profile).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
+        // without `[signer]` (the rehearsal's endpoint account) the batch keeps the default signer's bound
+        let (max_gas, margin) = if c.signer == crate::l1tx::SignerConfig::default() {
+            let fee = crate::l1tx::FeePolicy::default();
+            (fee.max_gas, fee.gas_margin_pct)
+        } else {
+            (c.signer.max_gas, c.signer.gas_margin_pct)
+        };
+        c.params.check(profile, max_gas, margin).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
         anyhow::ensure!(
             c.nodes.len() >= c.params.min_nodes,
             "{} nodes configured, min_nodes = {}: jg-fill does not start (each deposit is confirmed on that many nodes)",
