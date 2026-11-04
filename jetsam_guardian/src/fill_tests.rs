@@ -662,13 +662,37 @@ fn one_plan_advances_at_most_one_batch() {
 
 // ---------------------------------------------------------------- losses, stock, parameters
 
+/// A5-16: a loss is a mint of the deposit to another tuple only (it halts, latched); a pending advance not
+/// repaid after `loss_after_secs` (72 h) is an alert: still pending, still followed, still claimed.
 #[test]
-fn a_loss_is_noted_after_72h_or_when_another_tuple_was_minted() {
+fn a5_16_only_a_mint_to_another_tuple_is_a_loss_an_old_pending_advance_is_an_alert() {
     let p = FillParams::default();
-    assert_eq!(loss(1, true, NOW, NOW - 10, &p), Some("LOST_MINTED_TO_ANOTHER_TUPLE"));
-    assert_eq!(loss(1, false, NOW, NOW - p.loss_after_secs - 1, &p), Some("LOST_NOT_REPAID_72H"));
-    assert_eq!(loss(1, false, NOW, NOW - p.loss_after_secs, &p), None);
-    assert_eq!(loss(2, true, NOW, NOW - 10 * p.loss_after_secs, &p), None, "repaid");
+    assert_eq!(loss(1, true), Some("LOST_MINTED_TO_ANOTHER_TUPLE"));
+    assert_eq!(loss(1, false), None, "72 h unrepaid is no loss");
+    assert_eq!(loss(1, false), None);
+    assert_eq!(loss(2, true), None, "repaid");
+    assert!(overdue(1, false, NOW, NOW - p.loss_after_secs - 1, &p));
+    assert!(!overdue(1, false, NOW, NOW - p.loss_after_secs, &p));
+    assert!(!overdue(1, true, NOW, NOW - p.loss_after_secs - 1, &p), "minted elsewhere: a loss, not an alert");
+    assert!(!overdue(2, false, NOW, NOW - 10 * p.loss_after_secs, &p), "repaid");
+}
+
+/// A5-16: the advances an older robot noted lost after 72 h only are followed (and claimed) again; a mint
+/// to another tuple stays a loss.
+#[test]
+fn a5_16_advances_noted_lost_for_72h_only_are_followed_again() {
+    let mut l = Ledger {
+        advances: vec![
+            advanced(1, 0xa1, 7 * JTM, AdvanceStatus::Lost("LOST_NOT_REPAID_72H".into())),
+            advanced(2, 0xa2, 7 * JTM, AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into())),
+            advanced(3, 0xa3, 7 * JTM, AdvanceStatus::Repaid),
+            advanced(4, 0xa4, 7 * JTM, AdvanceStatus::Pending),
+        ],
+    };
+    assert_eq!(l.reopen_overdue(), 1);
+    let st: Vec<AdvanceStatus> = l.advances.iter().map(|a| a.status.clone()).collect();
+    assert_eq!(st, vec![AdvanceStatus::Pending, AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into()), AdvanceStatus::Repaid, AdvanceStatus::Pending]);
+    assert_eq!(l.reopen_overdue(), 0);
 }
 
 #[test]
@@ -1309,6 +1333,10 @@ fn a5_11_a_batch_above_the_gas_bound_does_not_start() {
     assert!(e.contains("batch_max") && e.contains("does not start"), "{e}");
     let fits = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 16\n[signer]\nmax_gas = 2000000\n");
     assert!(FillConfig::parse(&fits).is_ok());
+    // without [signer] (the rehearsal's endpoint account): the default signer's bound, 24
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 24\n")).is_ok());
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 25\n")).unwrap_err().to_string();
+    assert!(e.contains("batch_max 25"), "{e}");
 }
 
 /// A5-11: refused for its gas, the batch is sent again with half of its orders, down to one; any other

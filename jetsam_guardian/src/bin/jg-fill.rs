@@ -13,7 +13,9 @@
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
 //!   the L1 chain id, the bridge's genesis, and the hot key's stock ≤ `max_stock` (else no start).
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
-//!   with its cause. Either way the robot keeps observing, journaling and checking its repayments.
+//!   with its cause. Either way the robot keeps observing, journaling and checking its repayments. A loss
+//!   (its deposit minted to another tuple) halts; an advance not repaid after 72 h is an ALERT only, still
+//!   followed and claimed (A5-16).
 //! * The decision journal `<state_dir>/decisions.jsonl` is public: one signed, chained line per decision
 //!   (why advanced, why refused, repaid, lost, halts), labels and hashes only; `<state_dir>/queue.json`, the
 //!   waiting deposits first in first out (the published queue of the degraded mode), rewritten every step.
@@ -101,6 +103,9 @@ struct State {
     checkpoints: HashMap<String, Checkpoint>,
     /// The observers' states (rate samples, reorganizations), by node name.
     observers: HashMap<String, Value>,
+    /// A5-16: the keys of the pending advances already alerted as not repaid for long (one alert each).
+    #[serde(default)]
+    overdue: HashSet<String>,
 }
 
 struct Robot {
@@ -541,7 +546,12 @@ impl Robot {
                 continue;
             }
             let minted = word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1;
-            if let Some(code) = fill::loss(status, minted, l1_now, at, &self.cfg.params) {
+            // A5-16: not repaid for long is an alert (once), the advance stays pending, followed and claimed
+            if fill::overdue(status, minted, l1_now, at, &self.cfg.params) && self.state.overdue.insert(hex::encode(a.key)) {
+                log(&format!("ALERT key {}: ALERT_NOT_REPAID_72H (still pending, still followed and claimed)", hex::encode(a.key)));
+                self.journal(json!({"kind": "alert", "key": hex::encode(a.key), "reason": "ALERT_NOT_REPAID_72H", "amount": a.amount, "at": at, "l1_t": l1_now}));
+            }
+            if let Some(code) = fill::loss(status, minted) {
                 self.state.ledger.advances[i].status = AdvanceStatus::Lost(code.into());
                 let reason = format!("HALT_ADVANCE_LOST:{code}");
                 log(&format!("LOST key {}: {code}", hex::encode(a.key)));
@@ -634,7 +644,11 @@ fn run() -> anyhow::Result<()> {
         observers.push(Observer::new(ocfg, Chain::from_genesis(genesis))?);
         clients.push(c);
     }
-    let state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let reopened = state.ledger.reopen_overdue();
+    if reopened > 0 {
+        log(&format!("{reopened} advance(s) noted LOST_NOT_REPAID_72H by an older robot are pending again (A5-16: an alert, never a loss)"));
+    }
     for (o, n) in observers.iter_mut().zip(&cfg.nodes) {
         if let Some(v) = state.observers.get(&n.name) {
             if let Err(e) = o.import_state(v) {

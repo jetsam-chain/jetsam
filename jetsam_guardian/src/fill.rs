@@ -214,7 +214,8 @@ pub struct FillParams {
     /// The largest share of one miner address over the last `share_window` blocks above which it halts.
     pub share_window: u64,
     pub share_halt_pct: u64,
-    /// A pending advance older than this is noted lost (the contract never says it).
+    /// A pending advance older than this raises an alert (A5-16: never a loss, never a halt; the robot keeps
+    /// following and claiming it).
     pub loss_after_secs: u64,
     /// Orders per `advanceBatch` (≤ 32, and within the signer's `max_gas`: [`batch_gas_bound`]).
     pub batch_max: usize,
@@ -752,18 +753,31 @@ pub fn min_advance(p: &FillParams, gas_price_wei: u128, advance_gas: u64, wei_pe
 }
 
 /// A loss the robot notes for one of its advances (the contract never writes one, D-AV6): `status` of
-/// `advanceOf(key)`, `minted` = `isMinted[txId]`, `at` = the L1 time of the advance.
-pub fn loss(status: u8, minted: bool, l1_now: u64, at: u64, p: &FillParams) -> Option<&'static str> {
-    if status != 1 {
-        return None;
+/// `advanceOf(key)` still pending while `minted` = `isMinted[txId]`, its deposit minted to another tuple
+/// (A5-16: the only loss; an advance not repaid for long is [`overdue`], an alert).
+pub fn loss(status: u8, minted: bool) -> Option<&'static str> {
+    (status == 1 && minted).then_some("LOST_MINTED_TO_ANOTHER_TUPLE")
+}
+
+/// A5-16: a pending advance not repaid `loss_after_secs` after it was made (`at`, L1 time): an alert, never a
+/// loss (a slow mint can legitimately take longer: freeze, finality, the slow window).
+pub fn overdue(status: u8, minted: bool, l1_now: u64, at: u64, p: &FillParams) -> bool {
+    status == 1 && !minted && l1_now > at.saturating_add(p.loss_after_secs)
+}
+
+impl Ledger {
+    /// A5-16: the advances an older robot noted `LOST_NOT_REPAID_72H` are pending again (followed, claimed);
+    /// how many.
+    pub fn reopen_overdue(&mut self) -> usize {
+        let mut n = 0;
+        for a in &mut self.advances {
+            if a.status == AdvanceStatus::Lost("LOST_NOT_REPAID_72H".into()) {
+                a.status = AdvanceStatus::Pending;
+                n += 1;
+            }
+        }
+        n
     }
-    if minted {
-        return Some("LOST_MINTED_TO_ANOTHER_TUPLE");
-    }
-    if l1_now > at.saturating_add(p.loss_after_secs) {
-        return Some("LOST_NOT_REPAID_72H");
-    }
-    None
 }
 
 /// The start check of the hot key: it holds the capped stock only.
