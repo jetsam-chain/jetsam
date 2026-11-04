@@ -302,6 +302,7 @@ pub enum Recovered {
 }
 
 /// Sends a robot's transactions, signed by its key, one at a time.
+#[derive(Debug)]
 pub struct Sender {
     pub key: HotKey,
     pub chain_id: u64,
@@ -538,6 +539,110 @@ impl Sender {
         self.write_pending(&p)?;
         self.broadcast(l1, &hex0x(&signed.raw))?;
         self.wait(l1, p)?.ok_or_else(|| anyhow::anyhow!("{label}: nonce {nonce} was used by another transaction, dropped"))
+    }
+}
+
+/// `[signer]` of `jg-relay` and `jg-fill`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignerConfig {
+    /// `"local"`: this program signs with `key_file` (the only mode of the public networks). `"endpoint"`:
+    /// `eth_sendTransaction` from an account the L1 endpoint holds unlocked (the private rehearsal's anvil
+    /// only). Absent: `"local"`, except on the private rehearsal where it stays `"endpoint"` (as before).
+    pub mode: Option<String>,
+    /// The hot key (`HotKey::load`: 0600 or 0400, owned by this user).
+    pub key_file: Option<PathBuf>,
+    #[serde(default = "default_margin")]
+    pub gas_margin_pct: u64,
+    #[serde(default = "default_max_gas")]
+    pub max_gas: u64,
+    /// The cap of the fee per gas, wei.
+    #[serde(default = "default_max_fee")]
+    pub max_fee_per_gas_wei: u64,
+    /// The priority fee, wei per gas (absent: the endpoint's).
+    pub priority_fee_wei: Option<u64>,
+}
+
+fn default_margin() -> u64 {
+    FeePolicy::default().gas_margin_pct
+}
+fn default_max_gas() -> u64 {
+    FeePolicy::default().max_gas
+}
+fn default_max_fee() -> u64 {
+    FeePolicy::default().max_fee_per_gas as u64
+}
+
+/// How a robot's transactions are signed.
+#[derive(Debug)]
+pub enum L1Tx {
+    /// By this program (`Sender`).
+    Local(Sender),
+    /// By the endpoint, from its unlocked TEST account (the private rehearsal only).
+    Endpoint { from: [u8; 20] },
+}
+
+impl SignerConfig {
+    fn policy(&self) -> FeePolicy {
+        FeePolicy {
+            gas_margin_pct: self.gas_margin_pct,
+            max_gas: self.max_gas,
+            max_fee_per_gas: u128::from(self.max_fee_per_gas_wei),
+            priority_fee: self.priority_fee_wei.map(u128::from),
+        }
+    }
+
+    /// The signer of a robot of `profile` whose transactions come from `address` (`None`: the key's),
+    /// its write-ahead under `state_dir`. An error means the program does not start.
+    pub fn open(&self, profile: crate::Profile, chain_id: u64, address: Option<[u8; 20]>, state_dir: &Path) -> anyhow::Result<L1Tx> {
+        let rehearsal = profile == crate::Profile::PrivateRehearsal;
+        let mode = match self.mode.as_deref() {
+            Some(m) => m,
+            None if rehearsal && self.key_file.is_none() => "endpoint",
+            None => "local",
+        };
+        match mode {
+            "local" => {
+                let path = self.key_file.as_ref().ok_or_else(|| anyhow::anyhow!("[signer] key_file is required (mode \"local\")"))?;
+                let key = HotKey::load(path)?;
+                if let Some(a) = address {
+                    anyhow::ensure!(key.address() == a, "[signer] key_file is the key of 0x{}, not of the configured address 0x{}", hex::encode(key.address()), hex::encode(a));
+                }
+                Ok(L1Tx::Local(Sender::new(key, chain_id, self.policy(), state_dir)?))
+            }
+            "endpoint" => {
+                anyhow::ensure!(rehearsal, "[signer] mode = \"endpoint\" is refused on {profile}: an unlocked account on an L1 endpoint is the private rehearsal's only");
+                anyhow::ensure!(self.key_file.is_none(), "[signer] key_file with mode \"endpoint\": choose one");
+                let from = address.ok_or_else(|| anyhow::anyhow!("[signer] mode \"endpoint\" needs the sending address"))?;
+                Ok(L1Tx::Endpoint { from })
+            }
+            other => anyhow::bail!("[signer] mode = {other:?}: \"local\" or \"endpoint\""),
+        }
+    }
+}
+
+impl L1Tx {
+    pub fn address(&self) -> [u8; 20] {
+        match self {
+            L1Tx::Local(s) => s.address(),
+            L1Tx::Endpoint { from } => *from,
+        }
+    }
+
+    /// Settle what a stop left in flight (`Local` only).
+    pub fn recover(&self, l1: &L1) -> anyhow::Result<Recovered> {
+        match self {
+            L1Tx::Local(s) => s.recover(l1),
+            L1Tx::Endpoint { .. } => Ok(Recovered::Nothing),
+        }
+    }
+
+    /// Send a call and wait for its receipt.
+    pub fn send(&self, l1: &L1, to: &str, data: &[u8], label: &str) -> anyhow::Result<Receipt> {
+        match self {
+            L1Tx::Local(s) => s.send(l1, to, data, label),
+            L1Tx::Endpoint { from } => l1.send(&hex0x(from), to, data),
+        }
     }
 }
 

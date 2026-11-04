@@ -11,7 +11,7 @@ use jetsam_chain::consensus::vault::{deposit_marker, VaultRules, VAULT_ADDRESS};
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS};
 
-const JTM: u64 = 1_000_000;
+pub(crate) const JTM: u64 = 1_000_000;
 const NOW: u64 = 1_800_000_000;
 
 // ---------------------------------------------------------------- the key, the payment
@@ -37,12 +37,12 @@ fn paid_rounds_in_the_recipients_favour() {
 
 // ---------------------------------------------------------------- deposits read with the node's V4 rule
 
-const J: u64 = 69_120;
-const F: u64 = J + 1_440;
-const PAYER: Address = Address([0x51; 32]);
+pub(crate) const J: u64 = 69_120;
+pub(crate) const F: u64 = J + 1_440;
+pub(crate) const PAYER: Address = Address([0x51; 32]);
 const FEE: u64 = 47_200;
 
-fn rules() -> VaultRules {
+pub(crate) fn rules() -> VaultRules {
     VaultRules { activation_height: Some(J), deposits_from_height: Some(F), ..VaultRules::current() }
 }
 
@@ -77,7 +77,7 @@ fn coinbase(height: u64) -> Transaction {
 }
 
 /// One logical transaction from `owner`: one input covering the outputs and the fee, two outputs a page.
-fn logical(slot_base: u32, owner: Address, outputs: &[(Address, u64)]) -> Vec<Transaction> {
+pub(crate) fn logical(slot_base: u32, owner: Address, outputs: &[(Address, u64)]) -> Vec<Transaction> {
     let pages = outputs.len().div_ceil(TX_OUTPUTS).max(1);
     let input_amount = outputs.iter().map(|(_, a)| a).sum::<u64>() + FEE;
     (0..pages)
@@ -109,12 +109,12 @@ fn logical(slot_base: u32, owner: Address, outputs: &[(Address, u64)]) -> Vec<Tr
         .collect()
 }
 
-fn deposit_tx(slot_base: u32, recipient: [u8; 20], amount: u64) -> Vec<Transaction> {
+pub(crate) fn deposit_tx(slot_base: u32, recipient: [u8; 20], amount: u64) -> Vec<Transaction> {
     logical(slot_base, PAYER, &[(VAULT_ADDRESS, amount), (deposit_marker(&recipient), 0)])
 }
 
 /// A block at `height` with `groups`, its header committing to them (`tx_root`).
-fn block_of(height: u64, groups: Vec<Vec<Transaction>>) -> Block {
+pub(crate) fn block_of(height: u64, groups: Vec<Vec<Transaction>>) -> Block {
     let mut transactions = vec![coinbase(height)];
     for g in groups {
         transactions.extend(g);
@@ -123,11 +123,11 @@ fn block_of(height: u64, groups: Vec<Vec<Transaction>>) -> Block {
     Block { header: bheader(height, root), transactions, client_objects: Vec::new(), destination: None }
 }
 
-fn raw_and_id(b: &Block) -> (Vec<u8>, [u8; 32]) {
+pub(crate) fn raw_and_id(b: &Block) -> (Vec<u8>, [u8; 32]) {
     (b.to_bytes(), block_id(&b.header))
 }
 
-fn rcpt(b: u8) -> [u8; 20] {
+pub(crate) fn rcpt(b: u8) -> [u8; 20] {
     [b; 20]
 }
 

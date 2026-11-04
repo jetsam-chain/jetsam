@@ -1,0 +1,795 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! The production relayer of the bridge (T4.10, contract v3-advance, D72): what `jg-relay` decides, in pure
+//! functions. Nothing here can mint: every checkpoint is proven, every root waits 24 h without a switch,
+//! and the contract re-checks everything. The relayer only keeps the slow path alive and moving:
+//!
+//! * **Checkpoints** ([`plan_submission`]): one point every `cadence` seconds of the L1 (D-AV3, 6 600 s,
+//!   never above `W_STALL − 600`, so that `stalled()` stays false), at once when the contract has stalled.
+//!   The parent is the contract's tip when its locked block and its roots are those of the relayer's chain,
+//!   else the nearest ancestor that is (a branch switch, which the contract allows when heavier: R3); the
+//!   child's values are the honest ones of the chain (`Chain`: L, its id and work, the digest of L−7..L,
+//!   the cumulative deposit and anchor roots, the MN values) and are checked against MN-2, R3, R4 and MN-5
+//!   before any proof is asked for.
+//! * **Finalization** ([`finalize_order`]): every point that has waited `D_SLOW` after its acceptance and
+//!   after the last switch, the highest first — an older stable point is finalized while newer ones wait
+//!   (the slow-path form of D63: the relayer never waits for its newest point).
+//! * **Claims** ([`claims_of`]): every deposit of the final root not minted yet, by its Merkle branch
+//!   (`claimDeposit`): this mints to the recipient, or repays the advance of exactly that deposit (A-10).
+//! * **Deposit bodies** ([`Archive`]): the nodes serve the last 22 blocks only, and a proof of a deposit
+//!   needs its WHOLE block (G6 = V4 reads whole blocks): every block above F is read while it is served,
+//!   its deposits taken with the node's own rule, and the body of every block holding a deposit is kept on
+//!   disk, verified (id, `tx_root`). A block read too late is `Missing`: no checkpoint locks it (its
+//!   deposits could never be proven by anyone) until an operator imports its body or acknowledges the
+//!   omission (D41: a person decides, never the program).
+//! * **Proofs** ([`Prover`]): a command (the prover of the checkpoint program, given the program's input
+//!   file) or, on the private rehearsal only, the TEST mock verifier's simulated proof.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::chain::{merkle_branch, merkle_root, Chain, TREE_DEPTH};
+use crate::checkpoint::{deposit_leaf, public_values, Checkpoint, Deposit, Mn};
+use crate::fill::FoundDeposit;
+use crate::u256;
+
+/// `D_SLOW` of the contract: the only finality, 24 h after acceptance and after the last switch.
+pub const D_SLOW: u64 = 86_400;
+/// MN-5 of the contract: from this many seconds after the fork base, the new blocks must carry at least
+/// 4/10 of the work their base's target produces in the elapsed time (`BLOCK_TIME` 180 s).
+pub const MN5_MIN_ELAPSED: u64 = 1_800;
+/// MN-4: no new block dated more than this after the L1 clock.
+pub const MAX_TS_DRIFT: u64 = 120;
+
+/// A checkpoint the contract accepted, as the relayer knows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Known {
+    pub cp: Checkpoint,
+    /// Its parent's id (0 for the genesis).
+    #[serde(with = "crate::checkpoint::hex32")]
+    pub parent: [u8; 32],
+    /// L1 time of its acceptance.
+    pub accepted_at: u64,
+    /// Raw headers of its context `L..=T` (hex), when the relayer saw them on its chain: what a child that
+    /// forks inside this context has to prove (G11). Empty when it never was on the relayer's chain.
+    pub headers: BTreeMap<u64, String>,
+    /// Submitted by this relayer.
+    pub ours: bool,
+}
+
+impl Known {
+    /// The ids of its context, from its headers.
+    pub fn ids(&self) -> BTreeMap<u64, [u8; 32]> {
+        self.headers
+            .iter()
+            .filter_map(|(h, raw)| crate::chain::HeaderInfo::from_hex(raw).ok().map(|x| (*h, x.id)))
+            .collect()
+    }
+
+    /// From the chain at the time it is learned: `L..=T` when its tip block is on `chain`.
+    pub fn context_from(cp: &Checkpoint, chain: &Chain) -> BTreeMap<u64, String> {
+        if chain.id_at(cp.height) != Some(cp.tip_block_id) || chain.id_at(cp.locked_height) != Some(cp.locked_block_id) {
+            return BTreeMap::new();
+        }
+        (cp.locked_height..=cp.height).filter_map(|h| chain.header_at(h).map(|x| (h, x.raw_hex()))).collect()
+    }
+}
+
+/// The highest height of `parent`'s context that is still on `chain` (the fork base of a child on this
+/// chain), `None` when its locked block L is not (MN-2: no child of it on this chain).
+pub fn fork_base(parent: &Known, chain: &Chain) -> Option<u64> {
+    let l = parent.cp.locked_height;
+    if chain.id_at(l) != Some(parent.cp.locked_block_id) {
+        return None;
+    }
+    if chain.id_at(parent.cp.height) == Some(parent.cp.tip_block_id) {
+        return Some(parent.cp.height);
+    }
+    let ids = parent.ids();
+    // without the context, only the locked block is known to be shared (and its tip is not)
+    let mut base = l;
+    for h in l + 1..parent.cp.height {
+        match (ids.get(&h), chain.id_at(h)) {
+            (Some(a), Some(b)) if *a == b => base = h,
+            _ => break,
+        }
+    }
+    // a child that forks needs the abandoned headers above the base (G11): without them, no child
+    if base < parent.cp.height && !(base + 1..=parent.cp.height).all(|h| ids.contains_key(&h)) {
+        return None;
+    }
+    Some(base)
+}
+
+/// The deposits of `]gl ; l]` on the relayer's chain, in chain order, with their index in the cumulative
+/// tree (0 at the genesis).
+pub fn deposits_upto(found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, l: u64) -> Vec<Deposit> {
+    let mut out = Vec::new();
+    if l <= gl {
+        return out;
+    }
+    for ds in found.range(gl + 1..=l).map(|(_, ds)| ds) {
+        for d in ds {
+            out.push(Deposit { index: out.len() as u64, recipient: d.recipient, amount: d.amount, jetsam_tx_id: d.txid });
+        }
+    }
+    out
+}
+
+/// The honest checkpoint of tip `t` on `chain` over the bridge genesis's locked height `gl`, the
+/// deposits of `]gl ; L]` being `deposits` (already indexed).
+pub fn honest(chain: &Chain, gl: u64, t: u64, deposits: &[Deposit]) -> Option<Checkpoint> {
+    let l = chain.locked_height(t)?;
+    let leaves: Vec<[u8; 32]> = deposits.iter().map(deposit_leaf).collect();
+    Some(Checkpoint {
+        height: t,
+        cum_work: u256::to_be(&chain.work_at(t)?),
+        headers_digest: chain.headers_digest(l)?,
+        deposit_root: merkle_root(&leaves),
+        deposit_count: deposits.len() as u64,
+        anchor_root: chain.anchor_root(gl, l)?,
+        locked_height: l,
+        tip_block_id: chain.id_at(t)?,
+        locked_block_id: chain.id_at(l)?,
+        locked_cum_work: u256::to_be(&chain.work_at(l)?),
+    })
+}
+
+/// The MN values of a child of tip `t` whose fork base is `base`.
+pub fn mn_values(chain: &Chain, base: u64, t: u64) -> Option<Mn> {
+    let b = chain.header_at(base)?;
+    let mut max_ts = 0;
+    for h in base + 1..=t {
+        max_ts = max_ts.max(chain.header_at(h)?.timestamp);
+    }
+    Some(Mn {
+        tip_block_work: u256::to_be(&chain.header_at(t)?.work),
+        fork_base_timestamp: b.timestamp,
+        fork_base_work: u256::to_be(&b.work),
+        segment_work: u256::to_be(&u256::sub(&chain.work_at(t)?, &chain.work_at(base)?)),
+        max_timestamp: max_ts,
+    })
+}
+
+/// MN-5 at L1 time `at`: `segmentWork × 180 × 10 ≥ 4 × forkBaseWork × elapsed` once `elapsed ≥ 1 800`.
+pub fn mn5_ok(mn: &Mn, at: u64) -> bool {
+    if at < mn.fork_base_timestamp + MN5_MIN_ELAPSED {
+        return true;
+    }
+    let elapsed = at - mn.fork_base_timestamp;
+    let seg = u256::from_be(&mn.segment_work);
+    let base = u256::from_be(&mn.fork_base_work);
+    u256::mul_ge(&seg, 1_800, &base, 4 * elapsed)
+}
+
+/// A submission the relayer can prove now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub parent: [u8; 32],
+    pub fork_depth: u8,
+    /// The fork base (the parent's tip when `fork_depth` is 0).
+    pub base: u64,
+    pub next: Checkpoint,
+    pub mn: Mn,
+    /// The deposits of `]gl ; next.L]`, indexed (the parent's first).
+    pub deposits: Vec<Deposit>,
+}
+
+/// Why no submission now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoSubmission {
+    /// No known checkpoint of the contract has its locked block and roots on this chain.
+    NoParentOnThisChain,
+    /// The chain has not moved its locked block past the parent's (R4).
+    NotAdvancing,
+    /// The chain is not heavier than the contract's tip (R3): its branch is the heavier one.
+    NotHeavier,
+    /// The body of this block was never read: no checkpoint may lock it yet.
+    MissingBody(u64),
+    /// The new blocks would fail MN-5 (the chain has been too slow since the fork base).
+    WorkRateTooLow,
+    /// The newest block is dated too far ahead of the L1 clock (MN-4).
+    TimestampAhead,
+    /// The chain cannot say (headers missing).
+    ChainTooShort,
+}
+
+/// The submission on top of the contract's tip `tip` (or of the nearest ancestor of it whose locked block
+/// and roots are those of `chain`), for the highest tip of `chain` whose locked block stays below the
+/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in).
+pub fn plan_submission(
+    chain: &Chain,
+    known: &HashMap<[u8; 32], Known>,
+    tip: &[u8; 32],
+    tip_cum_work_be: &[u8; 32],
+    gl: u64,
+    found: &BTreeMap<u64, Vec<FoundDeposit>>,
+    missing: &[u64],
+    l1_at: u64,
+) -> Result<Submission, NoSubmission> {
+    // the parent: the tip, else its nearest ancestor on this chain with our roots
+    let mut cursor = *tip;
+    let (parent_id, parent, base) = loop {
+        let Some(k) = known.get(&cursor) else { return Err(NoSubmission::NoParentOnThisChain) };
+        let ours_upto = deposits_upto(found, gl, k.cp.locked_height);
+        let leaves: Vec<[u8; 32]> = ours_upto.iter().map(deposit_leaf).collect();
+        let roots_ok = merkle_root(&leaves) == k.cp.deposit_root
+            && ours_upto.len() as u64 == k.cp.deposit_count
+            && chain.anchor_root(gl, k.cp.locked_height) == Some(k.cp.anchor_root);
+        // (a block missing below the parent's L is locked by the contract already: nothing to wait for)
+        if roots_ok {
+            if let Some(b) = fork_base(k, chain) {
+                break (cursor, k, b);
+            }
+        }
+        if k.parent == [0u8; 32] {
+            return Err(NoSubmission::NoParentOnThisChain);
+        }
+        cursor = k.parent;
+    };
+    // the tip T: the highest whose L stays below the first unread body above the parent's L
+    let first_missing = missing.iter().copied().filter(|m| *m > parent.cp.locked_height).min();
+    let mut t = chain.tip_height();
+    loop {
+        let l = chain.locked_height(t).ok_or(NoSubmission::ChainTooShort)?;
+        match first_missing {
+            Some(m) if l >= m => {
+                if t <= parent.cp.height {
+                    return Err(NoSubmission::MissingBody(m));
+                }
+                t -= 1;
+            }
+            _ => break,
+        }
+    }
+    let l = chain.locked_height(t).ok_or(NoSubmission::ChainTooShort)?;
+    let fork_depth = parent.cp.height - base;
+    // R4: L never goes back, the tip never goes down; an extension moves L itself
+    if l < parent.cp.locked_height || t < parent.cp.height || (fork_depth == 0 && l == parent.cp.locked_height) {
+        return Err(match first_missing {
+            Some(m) if chain.locked_height(chain.tip_height()).is_some_and(|x| x >= m) => NoSubmission::MissingBody(m),
+            _ => NoSubmission::NotAdvancing,
+        });
+    }
+    let fork_depth = u8::try_from(fork_depth).map_err(|_| NoSubmission::NoParentOnThisChain)?;
+    let deposits = deposits_upto(found, gl, l);
+    let next = honest(chain, gl, t, &deposits).ok_or(NoSubmission::ChainTooShort)?;
+    // R3: strictly heavier than the contract's tip
+    if u256::cmp(&u256::from_be(&next.cum_work), &u256::from_be(tip_cum_work_be)) != std::cmp::Ordering::Greater {
+        return Err(NoSubmission::NotHeavier);
+    }
+    let mn = mn_values(chain, base, t).ok_or(NoSubmission::ChainTooShort)?;
+    if mn.max_timestamp > l1_at + MAX_TS_DRIFT {
+        return Err(NoSubmission::TimestampAhead);
+    }
+    if !mn5_ok(&mn, l1_at) {
+        return Err(NoSubmission::WorkRateTooLow);
+    }
+    Ok(Submission { parent: parent_id, fork_depth, base, next, mn, deposits })
+}
+
+/// The points to try to finalize (`finalizeSlow`), the highest locked height first: canonical, above the
+/// final point, accepted at least `D_SLOW` ago and with no switch in the last `D_SLOW`.
+pub fn finalize_order(known: &HashMap<[u8; 32], Known>, canonical: &HashSet<[u8; 32]>, final_locked: u64, last_switch: u64, l1_now: u64) -> Vec<[u8; 32]> {
+    let mut v: Vec<(&[u8; 32], &Known)> = known
+        .iter()
+        .filter(|(id, k)| canonical.contains(*id) && k.cp.locked_height > final_locked && k.accepted_at.max(last_switch) + D_SLOW <= l1_now)
+        .collect();
+    v.sort_by_key(|(id, k)| (std::cmp::Reverse(k.cp.locked_height), **id));
+    v.into_iter().map(|(id, _)| *id).collect()
+}
+
+/// The claims of a final point `fin`: its deposits (those of `]gl ; L]` on the relayer's chain, which
+/// must be exactly its root) not minted yet, each with its Merkle branch. `Err` when the root is not the
+/// relayer's (another relayer's point that left deposits out): no claim by Merkle branch from here.
+pub fn claims_of(fin: &Checkpoint, found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, minted: &dyn Fn(&[u8; 32]) -> bool) -> Result<Vec<(Deposit, [[u8; 32]; TREE_DEPTH])>, String> {
+    let deps = deposits_upto(found, gl, fin.locked_height);
+    let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
+    if merkle_root(&leaves) != fin.deposit_root || deps.len() as u64 != fin.deposit_count {
+        return Err(format!(
+            "the final root holds {} deposits, this relayer reads {} in ]{gl} ; {}] (another relayer's point left some out)",
+            fin.deposit_count,
+            deps.len(),
+            fin.locked_height
+        ));
+    }
+    Ok(deps.iter().enumerate().filter(|(_, d)| !minted(&d.jetsam_tx_id)).map(|(i, d)| (*d, merkle_branch(&leaves, i))).collect())
+}
+
+/// The frontier of the depth-32 keccak tree of `leaves`: `branch[h]` is the root of the last complete
+/// left subtree of height `h` (the program's `frontier_insert`, `JetsamBridge`'s `DepositMerkle`).
+pub fn frontier(leaves: &[[u8; 32]]) -> [[u8; 32]; TREE_DEPTH] {
+    let mut branch = [[0u8; 32]; TREE_DEPTH];
+    for (i, leaf) in leaves.iter().enumerate() {
+        let mut n = *leaf;
+        let mut size = i as u64 + 1;
+        for b in branch.iter_mut() {
+            if size & 1 == 1 {
+                *b = n;
+                break;
+            }
+            let mut pre = [0u8; 64];
+            pre[..32].copy_from_slice(b);
+            pre[32..].copy_from_slice(&n);
+            n = crate::keccak256(&pre);
+            size >>= 1;
+        }
+    }
+    branch
+}
+
+// ---------------------------------------------------------------- the archive of deposit bodies
+
+/// What the relayer knows of the body of one block above F.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Body {
+    /// Read and judged by the node's rule; its body kept on disk when it holds a deposit.
+    Read {
+        #[serde(with = "crate::checkpoint::hex32")]
+        block_id: [u8; 32],
+        deposits: Vec<FoundDeposit>,
+    },
+    /// No longer served when the relayer came to it: its deposits are unknown.
+    Missing {
+        #[serde(with = "crate::checkpoint::hex32")]
+        block_id: [u8; 32],
+    },
+    /// Missing, and an operator accepted that no checkpoint of this relayer proves its deposits (D41).
+    Acknowledged {
+        #[serde(with = "crate::checkpoint::hex32")]
+        block_id: [u8; 32],
+        reason: String,
+    },
+}
+
+impl Body {
+    pub fn block_id(&self) -> [u8; 32] {
+        match self {
+            Body::Read { block_id, .. } | Body::Missing { block_id } | Body::Acknowledged { block_id, .. } => *block_id,
+        }
+    }
+}
+
+/// The bodies of the blocks above F, kept under `dir` (`index.json`, `blocks/<height>-<id>.bin`).
+#[derive(Debug)]
+pub struct Archive {
+    pub dir: PathBuf,
+    pub index: BTreeMap<u64, Body>,
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(d) = path.parent() {
+        std::fs::File::open(d)?.sync_all()?;
+    }
+    Ok(())
+}
+
+impl Archive {
+    pub fn open(dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir.join("blocks"))?;
+        let index = match std::fs::read_to_string(dir.join("index.json")) {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self { dir: dir.to_path_buf(), index })
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        write_atomic(&self.dir.join("index.json"), serde_json::to_string(&self.index)?.as_bytes())
+    }
+
+    pub fn body_path(&self, height: u64, id: &[u8; 32]) -> PathBuf {
+        self.dir.join("blocks").join(format!("{height}-{}.bin", hex::encode(id)))
+    }
+
+    /// Record the body `raw` of block `height` whose id on the relayer's chain is `id`: verified (id,
+    /// `tx_root`, the node's vault rule), its deposits recorded, its bytes kept when it holds one.
+    pub fn record(&mut self, height: u64, id: &[u8; 32], raw: &[u8], rules: &jetsam_chain::consensus::vault::VaultRules) -> anyhow::Result<&[FoundDeposit]> {
+        let deposits = crate::fill::deposits_of_block(raw, id, rules)?;
+        if !deposits.is_empty() {
+            write_atomic(&self.body_path(height, id), raw)?;
+        }
+        self.index.insert(height, Body::Read { block_id: *id, deposits });
+        match self.index.get(&height) {
+            Some(Body::Read { deposits, .. }) => Ok(deposits),
+            _ => unreachable!("just inserted"),
+        }
+    }
+
+    pub fn record_missing(&mut self, height: u64, id: &[u8; 32]) {
+        self.index.insert(height, Body::Missing { block_id: *id });
+    }
+
+    /// An operator's decision on a `Missing` block: its omission is accepted.
+    pub fn acknowledge(&mut self, height: u64, reason: &str) -> anyhow::Result<()> {
+        match self.index.get(&height) {
+            Some(Body::Missing { block_id }) => {
+                let block_id = *block_id;
+                self.index.insert(height, Body::Acknowledged { block_id, reason: reason.to_string() });
+                Ok(())
+            }
+            other => anyhow::bail!("block {height} is not missing ({other:?})"),
+        }
+    }
+
+    /// Forget every entry whose block is no longer the one at its height on `chain` (a reorganization),
+    /// and every entry above its tip; the bodies stay on disk under their ids.
+    pub fn follow(&mut self, chain: &Chain) {
+        self.index.retain(|h, b| chain.id_at(*h) == Some(b.block_id()));
+    }
+
+    /// The deposits read, by height.
+    pub fn found(&self) -> BTreeMap<u64, Vec<FoundDeposit>> {
+        self.index
+            .iter()
+            .filter_map(|(h, b)| match b {
+                Body::Read { deposits, .. } if !deposits.is_empty() => Some((*h, deposits.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The heights whose body is missing and not acknowledged.
+    pub fn missing(&self) -> Vec<u64> {
+        self.index.iter().filter(|(_, b)| matches!(b, Body::Missing { .. })).map(|(h, _)| *h).collect()
+    }
+
+    /// The kept body of a deposit block, re-verified against its id.
+    pub fn body(&self, height: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(Body::Read { block_id, deposits }) = self.index.get(&height) else { return Ok(None) };
+        if deposits.is_empty() {
+            return Ok(None);
+        }
+        let raw = std::fs::read(self.body_path(height, block_id))?;
+        let block = jetsam_chain::block::Block::from_bytes(&raw).map_err(|e| anyhow::anyhow!("archived block {height}: {e:?}"))?;
+        anyhow::ensure!(jetsam_chain::consensus::pow::block_id(&block.header) == *block_id, "archived block {height}: not the recorded block");
+        Ok(Some(raw))
+    }
+}
+
+/// The 323-byte pages of a block as the checkpoint program reads them (the coinbase as a body, every other
+/// transaction as a page).
+pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let block = jetsam_chain::block::Block::from_bytes(raw).map_err(|e| anyhow::anyhow!("block bytes: {e:?}"))?;
+    block
+        .transactions
+        .iter()
+        .map(|t| {
+            if t.body.is_coinbase {
+                Ok(t.body.to_bytes().to_vec())
+            } else {
+                jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().map(|b| b.to_vec()).map_err(|e| anyhow::anyhow!("page: {e:?}"))
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------- proofs
+
+/// What the checkpoint program needs to prove a submission (every header from `headers_from` to the new
+/// tip, raw; the parent's context and abandoned headers included), and the 608 bytes it must commit.
+#[derive(Clone, Debug)]
+pub struct ProofRequest {
+    pub parent_id: [u8; 32],
+    pub parent: Checkpoint,
+    pub fork_depth: u8,
+    pub anchor_base: u64,
+    pub next: Checkpoint,
+    pub mn: Mn,
+    /// `JetsamBridge.publicValues(parentId, next, forkDepth, mn)`.
+    pub public_values: Vec<u8>,
+    /// Raw headers of the relayer's chain, ascending, from `headers_from` to `next.height`.
+    pub headers_from: u64,
+    pub headers: Vec<Vec<u8>>,
+    /// Raw headers of the parent's abandoned context `base + 1 ..= parent.height` (empty when extending).
+    pub abandoned: Vec<Vec<u8>>,
+    /// The pages of every deposit block of `]parent.L ; next.L]`, ascending.
+    pub deposit_blocks: Vec<(u64, Vec<Vec<u8>>)>,
+    /// Frontiers of the parent's deposit and anchor trees.
+    pub deposit_frontier: [[u8; 32]; TREE_DEPTH],
+    pub anchor_frontier: [[u8; 32]; TREE_DEPTH],
+}
+
+impl ProofRequest {
+    /// Built from the chain, the archive and the parent's known context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(s: &Submission, parent: &Known, chain: &Chain, archive: &Archive, gl: u64, anchor_base: u64, context_below: u64) -> anyhow::Result<Self> {
+        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.mn);
+        let from = parent.cp.locked_height.min(s.base).saturating_sub(context_below).max(chain.base_height());
+        let headers = (from..=s.next.height)
+            .map(|h| chain.header_at(h).map(|x| x.raw.clone()).ok_or_else(|| anyhow::anyhow!("header {h} not on the chain")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let abandoned = (s.base + 1..=parent.cp.height)
+            .map(|h| {
+                parent.headers.get(&h).ok_or_else(|| anyhow::anyhow!("abandoned header {h} unknown")).and_then(|x| Ok(hex::decode(x)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut deposit_blocks = Vec::new();
+        for h in parent.cp.locked_height + 1..=s.next.locked_height {
+            if let Some(raw) = archive.body(h)? {
+                deposit_blocks.push((h, block_pages(&raw)?));
+            }
+        }
+        let found = archive.found();
+        let prev_leaves: Vec<[u8; 32]> = deposits_upto(&found, gl, parent.cp.locked_height).iter().map(deposit_leaf).collect();
+        let anchor_leaves = chain.anchor_leaves(gl, parent.cp.locked_height).ok_or_else(|| anyhow::anyhow!("anchor leaves of the parent"))?;
+        Ok(Self {
+            parent_id: s.parent,
+            parent: parent.cp,
+            fork_depth: s.fork_depth,
+            anchor_base,
+            next: s.next,
+            mn: s.mn,
+            public_values: pv,
+            headers_from: from,
+            headers,
+            abandoned,
+            deposit_blocks,
+            deposit_frontier: frontier(&prev_leaves),
+            anchor_frontier: frontier(&anchor_leaves),
+        })
+    }
+}
+
+/// Makes the proof of a submission.
+pub trait Prover {
+    fn prove(&self, req: &ProofRequest) -> anyhow::Result<Vec<u8>>;
+    fn name(&self) -> String;
+}
+
+/// TEST ONLY: the simulated proof the private rehearsal's mock verifier accepts. The relayer refuses it
+/// outside the rehearsal's domain.
+pub struct MockProver;
+
+impl Prover for MockProver {
+    fn prove(&self, req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
+        Ok(crate::checkpoint::mock_proof(&req.public_values).to_vec())
+    }
+    fn name(&self) -> String {
+        "mock (TEST)".into()
+    }
+}
+
+/// The program's input bytes for a request (the checkpoint program's own encoder).
+pub type InputEncoder = fn(&ProofRequest) -> anyhow::Result<Vec<u8>>;
+
+/// A prover reached by a command: the program's input is written to `{input}`, the command must write the
+/// proof bytes to `{proof}` and may write the public values it proved to `{public_values}` (checked
+/// against the request when present). Run under a timeout; never through a shell.
+pub struct CommandProver {
+    pub argv: Vec<String>,
+    pub work_dir: PathBuf,
+    pub timeout: std::time::Duration,
+    pub encode: InputEncoder,
+}
+
+impl Prover for CommandProver {
+    fn prove(&self, req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
+        std::fs::create_dir_all(&self.work_dir)?;
+        let tag = hex::encode(&crate::keccak256(&req.public_values)[..8]);
+        let input = self.work_dir.join(format!("{tag}.input"));
+        let proof = self.work_dir.join(format!("{tag}.proof"));
+        let pv = self.work_dir.join(format!("{tag}.pv"));
+        let _ = std::fs::remove_file(&proof);
+        let _ = std::fs::remove_file(&pv);
+        write_atomic(&input, &(self.encode)(req)?)?;
+        let subst = |a: &String| {
+            a.replace("{input}", &input.to_string_lossy()).replace("{proof}", &proof.to_string_lossy()).replace("{public_values}", &pv.to_string_lossy())
+        };
+        let argv: Vec<String> = self.argv.iter().map(subst).collect();
+        anyhow::ensure!(!argv.is_empty(), "empty prover command");
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if start.elapsed() > self.timeout {
+                // this child's PID only
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("prover timed out after {:?}", self.timeout);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        anyhow::ensure!(status.success(), "prover exited with {status}");
+        if let Ok(got) = std::fs::read(&pv) {
+            anyhow::ensure!(got == req.public_values, "the prover proved other public values than the request's");
+        }
+        let bytes = std::fs::read(&proof)?;
+        anyhow::ensure!(!bytes.is_empty(), "the prover wrote an empty proof");
+        Ok(bytes)
+    }
+    fn name(&self) -> String {
+        format!("command {}", self.argv.first().cloned().unwrap_or_default())
+    }
+}
+
+/// `final.json` of the publication directory: the final point and its deposits (what a claimer needs to
+/// build a Merkle branch: the robot `jg-fill` claims its own repayments from it).
+pub fn published_final(id: &[u8; 32], fin: &Checkpoint, deposits: &[Deposit], heights: &[u64]) -> serde_json::Value {
+    serde_json::json!({
+        "checkpoint_id": format!("0x{}", hex::encode(id)),
+        "checkpoint": fin,
+        "deposits": deposits.iter().zip(heights).map(|(d, h)| serde_json::json!({
+            "index": d.index, "height": h, "recipient": format!("0x{}", hex::encode(d.recipient)), "amount": d.amount,
+            "txid": format!("0x{}", hex::encode(d.jetsam_tx_id)),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The deposits of a published `final.json`, checked against its checkpoint's root and count.
+pub fn read_published_final(v: &serde_json::Value) -> anyhow::Result<(Checkpoint, Vec<Deposit>)> {
+    let fin: Checkpoint = serde_json::from_value(v["checkpoint"].clone())?;
+    let mut deps = Vec::new();
+    for (i, d) in v["deposits"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        let dep = Deposit {
+            index: d["index"].as_u64().ok_or_else(|| anyhow::anyhow!("index"))?,
+            recipient: crate::fill::parse20(d["recipient"].as_str().unwrap_or_default())?,
+            amount: d["amount"].as_u64().ok_or_else(|| anyhow::anyhow!("amount"))?,
+            jetsam_tx_id: crate::parse32(d["txid"].as_str().unwrap_or_default())?,
+        };
+        anyhow::ensure!(dep.index == i as u64, "deposit {i} has index {}", dep.index);
+        deps.push(dep);
+    }
+    let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
+    anyhow::ensure!(
+        merkle_root(&leaves) == fin.deposit_root && deps.len() as u64 == fin.deposit_count,
+        "the published deposits are not those of the published root"
+    );
+    Ok((fin, deps))
+}
+
+// ---------------------------------------------------------------- relay.toml
+
+/// `[prover]`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProverConfig {
+    /// `"command"` (the production prover) or `"mock"` (the private rehearsal's simulated proofs only).
+    pub mode: String,
+    /// The command and its arguments; `{input}`, `{proof}`, `{public_values}` are replaced by paths.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// At most this long per proof (with `prove_ahead_secs` and the cadence: the point lands before `W_STALL`).
+    #[serde(default = "default_prove_timeout")]
+    pub timeout_secs: u64,
+    /// A point is started this long before it is due (a slow prover).
+    #[serde(default)]
+    pub prove_ahead_secs: u64,
+    /// Headers given below the lower of the parent's L and the fork base (the header rules' window).
+    #[serde(default = "default_context_below")]
+    pub context_below: u64,
+}
+
+fn default_prove_timeout() -> u64 {
+    480
+}
+fn default_context_below() -> u64 {
+    32
+}
+
+/// Seconds allowed for the L1 inclusion of a point after its proof.
+pub const INCLUSION_SECS: u64 = 60;
+
+/// `relay.toml`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    pub network: String,
+    pub l1_chain_id: u64,
+    pub l1_bridge: String,
+    pub l1_rpc: String,
+    /// The first L1 block to read `CheckpointAccepted` from (the bridge's deployment).
+    #[serde(default)]
+    pub l1_from_block: u64,
+    /// F: deposits only in the blocks above it.
+    pub deposits_from_height: u64,
+    pub nodes: Vec<crate::fill::NodeSourceConfig>,
+    /// A point is submitted only when this many nodes have its tip and its locked block.
+    #[serde(default = "default_min_nodes")]
+    pub min_nodes: usize,
+    #[serde(default)]
+    pub egress: crate::config::EgressConfig,
+    /// D-AV3: one point every this many seconds of the L1 (≤ `W_STALL − 600`).
+    #[serde(default = "default_cadence")]
+    pub cadence_secs: u64,
+    pub state_dir: PathBuf,
+    /// Published for claimers (`final.json`) and provers (`blocks/`).
+    pub publish_dir: PathBuf,
+    #[serde(default = "default_poll")]
+    pub poll_secs: u64,
+    /// Claims per step at most (each waits for its receipt).
+    #[serde(default = "default_claims_per_step")]
+    pub claims_per_step: usize,
+    #[serde(default)]
+    pub signer: crate::l1tx::SignerConfig,
+    /// The address of the endpoint's unlocked account (`[signer] mode = "endpoint"`, the rehearsal only).
+    pub from_address: Option<String>,
+    pub prover: ProverConfig,
+}
+
+fn default_min_nodes() -> usize {
+    2
+}
+fn default_cadence() -> u64 {
+    crate::relay::DEFAULT_CHECKPOINT_CADENCE
+}
+fn default_poll() -> u64 {
+    10
+}
+fn default_claims_per_step() -> usize {
+    8
+}
+
+impl RelayConfig {
+    /// Parse and check; an error means jg-relay does not start.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let c: Self = toml::from_str(text)?;
+        let profile = c.profile()?;
+        let rehearsal = profile == crate::Profile::PrivateRehearsal;
+        crate::relay::check_cadence(c.cadence_secs)?;
+        anyhow::ensure!(c.min_nodes >= if rehearsal { 1 } else { 2 }, "min_nodes {} below the floor (2 off the rehearsal)", c.min_nodes);
+        anyhow::ensure!(c.nodes.len() >= c.min_nodes, "{} nodes configured, min_nodes = {}", c.nodes.len(), c.min_nodes);
+        for (i, n) in c.nodes.iter().enumerate() {
+            anyhow::ensure!(!c.nodes[..i].iter().any(|m| m.rpc == n.rpc || m.name == n.name), "nodes[{i}] ({}) is configured twice", n.name);
+        }
+        c.egress()?;
+        match c.prover.mode.as_str() {
+            "mock" => anyhow::ensure!(rehearsal, "[prover] mode = \"mock\" (simulated proofs) is refused on {profile}"),
+            "command" => anyhow::ensure!(!c.prover.command.is_empty(), "[prover] command is empty"),
+            other => anyhow::bail!("[prover] mode = {other:?}: \"command\" or \"mock\""),
+        }
+        // the point lands before W_STALL: started `ahead` before it is due, proven within the timeout
+        anyhow::ensure!(
+            c.prover.timeout_secs + INCLUSION_SECS <= crate::relay::W_STALL - c.cadence_secs + c.prover.prove_ahead_secs,
+            "[prover] timeout_secs {} + {INCLUSION_SECS} s of inclusion > W_STALL {} − cadence {} + prove_ahead_secs {}: \
+             stalled() could become true between two points (D-AV3)",
+            c.prover.timeout_secs,
+            crate::relay::W_STALL,
+            c.cadence_secs,
+            c.prover.prove_ahead_secs
+        );
+        anyhow::ensure!(c.prover.prove_ahead_secs < c.cadence_secs, "prove_ahead_secs must stay below the cadence");
+        anyhow::ensure!(c.poll_secs > 0 && c.claims_per_step > 0, "poll_secs and claims_per_step must be positive");
+        Ok(c)
+    }
+
+    pub fn domain(&self) -> anyhow::Result<crate::Domain> {
+        Ok(crate::Domain { network: crate::parse32(&self.network)?, l1_chain_id: self.l1_chain_id, l1_bridge: crate::fill::parse20(&self.l1_bridge)? })
+    }
+
+    pub fn profile(&self) -> anyhow::Result<crate::Profile> {
+        Ok(crate::Profile::of(&self.domain()?))
+    }
+
+    /// Every node and the L1, checked before any socket (onion only unless the private rehearsal).
+    pub fn egress(&self) -> anyhow::Result<crate::rpc::Egress> {
+        let nodes = self.nodes.iter().enumerate().map(|(i, n)| (format!("nodes[{i}]"), n.rpc.as_str()));
+        let l1 = std::iter::once(("l1_rpc".to_string(), self.l1_rpc.as_str()));
+        crate::config::checked_egress(&self.egress, Some(&self.domain()?), nodes.chain(l1))
+    }
+
+    pub fn from(&self) -> anyhow::Result<Option<[u8; 20]>> {
+        self.from_address.as_deref().map(crate::fill::parse20).transpose()
+    }
+}
+
+#[cfg(test)]
+#[path = "relayer_tests.rs"]
+mod tests;

@@ -844,6 +844,15 @@ pub struct FillConfig {
     pub egress: crate::config::EgressConfig,
     #[serde(default)]
     pub params: FillParams,
+    /// How the robot signs its transactions (BRIDGE-REST): its own hot key (`key_file`, the key of
+    /// `hot_address`); on the private rehearsal, absent, the endpoint's unlocked TEST account as before.
+    #[serde(default)]
+    pub signer: crate::l1tx::SignerConfig,
+    /// The relayer's published `final.json` (`jg-relay`'s `publish_dir`): the robot claims the repayment of
+    /// its own advances from it (`claimDeposit`), checked against the contract's final root, without
+    /// waiting for anyone. Absent: it waits for a claimer.
+    #[serde(default)]
+    pub relay_final: Option<PathBuf>,
 }
 
 fn default_advance_gas() -> u64 {
@@ -932,4 +941,4 @@ impl FillConfig {
 
 #[cfg(test)]
 #[path = "fill_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -17,8 +17,11 @@
 //! * The decision journal `<state_dir>/decisions.jsonl` is public: one signed, chained line per decision
 //!   (why advanced, why refused, repaid, lost, halts), labels and hashes only; `<state_dir>/queue.json`, the
 //!   waiting deposits first in first out (the published queue of the degraded mode), rewritten every step.
-//! * The transactions are `eth_sendTransaction` from `hot_address` to the L1 endpoint (a local signer on
-//!   the loopback holds the hot key; anvil's TEST account in the rehearsal): this program signs nothing.
+//! * The transactions are signed by the robot itself (`[signer] key_file`, the key of `hot_address`: EIP-1559,
+//!   gas estimate plus a margin, fee caps, written ahead before they leave the host, found again after a stop;
+//!   `jetsam_guardian::l1tx`); only the private rehearsal may still use the endpoint's unlocked TEST account.
+//! * With `relay_final` (the relayer's published `final.json`), the robot claims the repayment of its own
+//!   advances as soon as their root is final on the contract.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,6 +39,7 @@ use jetsam_guardian::fill::{
     self, AdvanceStatus, Advanced, Candidate, Caps, DecisionJournal, FillConfig, FoundDeposit, GuardInput, Ledger, NodeView, TipCheck, Verdict,
 };
 use jetsam_guardian::l1::{self, AdvanceOrder, L1};
+use jetsam_guardian::l1tx::{L1Tx, Recovered};
 use jetsam_guardian::observer::{Observer, ObserverConfig, Thresholds};
 use jetsam_guardian::rpc::NodeClient;
 use jetsam_guardian::{now_unix, parse32};
@@ -102,6 +106,8 @@ struct State {
 struct Robot {
     cfg: FillConfig,
     l1: L1,
+    /// Signs and sends (the hot key; on the rehearsal without `[signer]`, the endpoint's TEST account).
+    tx: L1Tx,
     bridge: String,
     token: String,
     hot: [u8; 20],
@@ -401,8 +407,8 @@ impl Robot {
         }
         let list: Vec<AdvanceOrder> = orders.iter().map(|(_, o, _)| *o).collect();
         let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
-        let from = hex0x(&self.hot);
-        let receipt = match self.l1.send(&from, &self.bridge, &data) {
+        let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
+        let receipt = match self.tx.send(&self.l1, &self.bridge, &data, label) {
             Ok(r) => r,
             Err(e) => {
                 let text = format!("{e:#}");
@@ -466,8 +472,48 @@ impl Robot {
         Ok(())
     }
 
+    /// The repayment of its own pending advances claimed by the robot itself (`claimDeposit`), from the
+    /// relayer's published final root once the contract holds that root final: the deposit of an advance,
+    /// the exact tuple, not minted yet. At most 4 per step.
+    fn claim_own(&mut self, path: &std::path::Path, l1_now: u64) -> anyhow::Result<()> {
+        let Ok(text) = std::fs::read_to_string(path) else { return Ok(()) };
+        let (fin, deps) = jetsam_guardian::relayer::read_published_final(&serde_json::from_str(&text)?)?;
+        if word(&self.view("isFinalDepositRoot(bytes32)", &fin.deposit_root)?, 0)[31] != 1 {
+            return Ok(());
+        }
+        let leaves: Vec<[u8; 32]> = deps.iter().map(jetsam_guardian::checkpoint::deposit_leaf).collect();
+        let mut sent = 0;
+        let pending: Vec<Advanced> = self.state.ledger.advances.iter().filter(|a| a.status == AdvanceStatus::Pending).cloned().collect();
+        for a in pending {
+            let Some(d) = deps.iter().find(|d| d.jetsam_tx_id == a.txid && d.recipient == a.recipient && d.amount == a.amount) else { continue };
+            if sent >= 4 || word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1 {
+                continue;
+            }
+            let branch = jetsam_guardian::chain::merkle_branch(&leaves, d.index as usize);
+            sent += 1;
+            match self.tx.send(&self.l1, &self.bridge, &l1::claim_deposit(d, &fin.deposit_root, &branch), "claimDeposit") {
+                Ok(r) => {
+                    log(&format!("claimed own repayment key {} status {} gas {}", hex::encode(a.key), r.status, r.gas_used));
+                    self.journal(json!({"kind": "claimed_own", "key": hex::encode(a.key), "txid": hex::encode(a.txid), "status": r.status,
+                                        "l1_tx": r.tx_hash, "gas": r.gas_used, "l1_t": l1_now}));
+                }
+                Err(e) => {
+                    // a full window, the ceiling or a freeze: the relayer or a later step claims it
+                    log(&format!("own claim of key {} not sent: {e:#}", hex::encode(a.key)));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The repayment (or the noted loss) of every pending advance.
     fn check_repayments(&mut self, l1_now: u64) -> anyhow::Result<()> {
+        if let Some(path) = self.cfg.relay_final.clone() {
+            if let Err(e) = self.claim_own(&path, l1_now) {
+                log(&format!("own claims: {e:#}"));
+            }
+        }
         for i in 0..self.state.ledger.advances.len() {
             let a = self.state.ledger.advances[i].clone();
             if a.status != AdvanceStatus::Pending {
@@ -588,9 +634,17 @@ fn run() -> anyhow::Result<()> {
     log(&format!("journal key (public) {}", hex::encode(key.public())));
     let journal = DecisionJournal::open(&cfg.state_dir.join("decisions.jsonl"), key)?;
     let refund = cfg.refund()?;
+    let tx = cfg.signer.open(cfg.profile()?, chain_id, Some(hot), &cfg.state_dir)?;
+    match tx.recover(&l1)? {
+        Recovered::Nothing => {}
+        // an advance mined before the stop is found on the contract (`advanceOf`) and recorded as recovered
+        Recovered::Mined(r, label) => log(&format!("the {label} in flight at the stop was mined (block {}, status {})", r.block_number, r.status)),
+        Recovered::Dropped(label) => log(&format!("the {label} in flight at the stop was dropped (its nonce was used)")),
+    }
+    log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, cfg };
+    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, cfg };
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }

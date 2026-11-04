@@ -40,6 +40,7 @@ pub mod l1;
 pub mod l1tx;
 pub mod observer;
 pub mod relay;
+pub mod relayer;
 pub mod rpc;
 pub mod seal;
 pub mod signer;

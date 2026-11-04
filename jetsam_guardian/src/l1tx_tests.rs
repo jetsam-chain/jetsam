@@ -141,3 +141,31 @@ fn fees_follow_the_base_fee_within_the_cap() {
     assert_eq!(p.bump((100, 900)).unwrap(), (113, 1_000));
     assert!(p.bump((100, 1_000)).is_err(), "already at the cap");
 }
+
+#[test]
+fn the_signer_is_local_off_the_rehearsal_and_its_key_is_the_configured_address() {
+    use crate::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let k = write_key(dir.path(), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", 0o600);
+    let addr: [u8; 20] = hex::decode("f39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap().try_into().unwrap();
+    let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
+    let local = parse(&format!("key_file = {:?}", k.display().to_string()));
+    for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::PrivateRehearsal] {
+        let s = local.open(p, 1, Some(addr), dir.path()).unwrap();
+        assert!(matches!(s, L1Tx::Local(_)), "{p}");
+        assert_eq!(s.address(), addr);
+        assert!(local.open(p, 1, Some([9u8; 20]), dir.path()).is_err(), "another address than the key's");
+    }
+    let none = parse("");
+    assert!(none.open(Profile::Mainnet, 1, Some(addr), dir.path()).unwrap_err().to_string().contains("key_file is required"));
+    assert!(matches!(none.open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).unwrap(), L1Tx::Endpoint { .. }), "the rehearsal as before");
+    let endpoint = parse("mode = \"endpoint\"");
+    for p in [Profile::Mainnet, Profile::PublicTestnet] {
+        assert!(endpoint.open(p, 1, Some(addr), dir.path()).unwrap_err().to_string().contains("refused"), "{p}");
+    }
+    assert!(endpoint.open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_ok());
+    assert!(parse("mode = \"remote\"").open(Profile::PrivateRehearsal, 1, Some(addr), dir.path()).is_err());
+    assert!(parse(&format!("mode = \"endpoint\"\nkey_file = {:?}", k.display().to_string())).open(Profile::PrivateRehearsal, 1, Some(addr), dir.path()).is_err());
+    assert!(parse(&format!("key_file = {:?}\ngas_margin_pct = 5", k.display().to_string())).open(Profile::Mainnet, 1, None, dir.path()).is_err(), "the margin floor");
+    assert!(toml::from_str::<SignerConfig>("unknown = 1").is_err());
+}
