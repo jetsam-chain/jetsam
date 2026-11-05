@@ -1138,6 +1138,79 @@ fn vault_ceiling_refuses_deposit_over_ceiling() {
     );
 }
 
+/// A5-18: V8's ceiling is the contract's C-6 ceiling, the same number and
+/// the same inclusive comparison: `JetsamBridge.OUTSTANDING_CEIL = 10_000e6`
+/// µJTM, and C-6 refuses only `totalSupply + amount > OUTSTANDING_CEIL`
+/// (equality mints), as V8 refuses only `bridge_locked + amount > ceil`.
+#[test]
+fn vault_ceiling_is_the_contracts_outstanding_ceil() {
+    /// `uint64 public constant OUTSTANDING_CEIL = 10_000e6;` (JetsamBridge.sol).
+    const CONTRACT_OUTSTANDING_CEIL: u64 = 10_000_000_000;
+    assert_eq!(VAULT_OUTSTANDING_CEIL_MICRO, CONTRACT_OUTSTANDING_CEIL);
+    assert_eq!(
+        VaultRules::current().outstanding_ceil,
+        CONTRACT_OUTSTANDING_CEIL
+    );
+    // Inclusive, at the block gate and at admission alike.
+    let d = deposit(200, [7; 20], MICRO_PER_JTM);
+    let at = |bridge_locked| VaultContext {
+        bridge_locked,
+        ..ctx()
+    };
+    let b = block(vec![d.clone()], &[]);
+    let room = CONTRACT_OUTSTANDING_CEIL - MICRO_PER_JTM;
+    assert!(check(&b, at(room)).is_ok());
+    assert!(check(&b, at(room + 1)).is_err());
+    assert_eq!(
+        check_vault_deposit_room(&pages(d.clone()), room, &rules()),
+        Ok(())
+    );
+    assert!(check_vault_deposit_room(&pages(d), room + 1, &rules()).is_err());
+}
+
+/// A5-7: the blocks whose bodies a node keeps for the bridge are those with
+/// a group V4 classifies as a deposit, above F; a release's change to the
+/// vault, a plain group, a deposit V4 refuses, a block at F or a dormant
+/// clock are not.
+#[test]
+fn a_block_carries_a_deposit_only_with_a_v4_deposit_group_above_f() {
+    let r = rules();
+    let d = deposit(200, [7; 20], 5 * MICRO_PER_JTM);
+    let plain = logical(300, PAYER, &[(ALICE, 5)], FEE);
+    assert!(block_carries_deposit(&block(vec![d.clone()], &[]), &r));
+    assert!(block_carries_deposit(
+        &block(vec![plain.clone(), d.clone()], &[]),
+        &r
+    ));
+    assert!(!block_carries_deposit(&block(vec![plain], &[]), &r));
+    let rel = release(1, ALICE, 10 * MICRO_PER_JTM);
+    assert!(!block_carries_deposit(
+        &block(
+            vec![release_group(100, &rel, 3 * MICRO_PER_JTM, RF)],
+            &[rel.clone()]
+        ),
+        &r
+    ));
+    assert!(!block_carries_deposit(
+        &block(vec![deposit(200, [7; 20], MIN_DEPOSIT_MICRO - 1)], &[]),
+        &r
+    ));
+    assert!(!block_carries_deposit(
+        &block_at(F, vec![d.clone()], &[]),
+        &r
+    ));
+    assert!(block_carries_deposit(
+        &block_at(F + 1, vec![d.clone()], &[]),
+        &r
+    ));
+    let dormant = VaultRules {
+        activation_height: None,
+        deposits_from_height: None,
+        ..r
+    };
+    assert!(!block_carries_deposit(&block(vec![d], &[]), &dormant));
+}
+
 /// V8 is evaluated in group order: a release placed before a deposit makes
 /// room for it, one placed after does not.
 #[test]

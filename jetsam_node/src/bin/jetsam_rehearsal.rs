@@ -42,7 +42,7 @@ use jetsam_chain::consensus::guardian::GuardianAttestation;
 use jetsam_chain::consensus::params::is_coinbase_creation_id;
 use jetsam_chain::consensus::pow::block_id;
 use jetsam_chain::consensus::vault::{
-    deposit_marker, encode_proof_nodes, VaultRelease, VaultRules, VAULT_ADDRESS, VAULT_SECRET,
+    deposit_marker, VaultRelease, VaultRules, VAULT_ADDRESS, VAULT_SECRET,
 };
 use jetsam_gkr::{prove_paged_spend_authorization, OwnerAuthWitness};
 use jetsam_mempool::destination::{CommitteeUpdateIntent, DestinationIntent, ReleaseIntent};
@@ -605,8 +605,8 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
             let (pages, r) = release_group(&release, &inputs, node.anchor().await?, &hints)?;
             let payment = prove(pages, VAULT_SECRET)?;
             let txid = hex::encode(payment.logical_txid().0);
-            let mut account_proof = Vec::new();
-            encode_proof_nodes(&l1.account_proof, &mut account_proof);
+            // The account proof and, since A5-8, the genesis proof after it.
+            let account_proof = l1.account_payload();
             let intent = DestinationIntent::Release(ReleaseIntent {
                 release,
                 finality: finality_update(period, l1.state_root, block_number).encode_payload(),

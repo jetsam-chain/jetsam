@@ -37,10 +37,13 @@
 //!   `VAULT_RELEASE_WINDOW_BLOCKS` consecutive blocks.
 //! * **V7** — each release is proven on the L1: `withdrawals[n]` of the pinned
 //!   bridge contract holds `keccak(owner ‖ amount)` under a finalized root
-//!   (`destination::l1_read::verify_withdrawal`).
+//!   (`destination::l1_read::verify_withdrawal`), and that contract's
+//!   `genesisId` is the pinned genesis (A5-8,
+//!   `destination::l1_read::verify_bridge_account`, once per block).
 //! * **V8** — `bridge_locked + amount ≤ VAULT_OUTSTANDING_CEIL` for each
 //!   deposit, in group order, where `bridge_locked` is the sum of the vault's
 //!   live slots created after the floor, not by a coinbase ([`bridge_locked_of`]).
+//!   Its relation with the contract's C-6 is [`VAULT_OUTSTANDING_CEIL_MICRO`]'s.
 //!
 //! **No order** (porte R, D52): a release `n` is valid when no release marker
 //! of the branch carries `n`, nor an earlier release of the same block. The
@@ -92,7 +95,23 @@ pub const VAULT_RELEASE_WINDOW_BLOCKS: u64 = 480;
 /// costs at most this per window.
 pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
 /// V8: most the vault holds for the bridge (D45, = the contract's
-/// `OUTSTANDING_CEIL`).
+/// `OUTSTANDING_CEIL`, `10_000e6` µJTM).
+///
+/// A5-18, the exact relation with the contract's C-6: V8 admits a deposit
+/// while `bridge_locked + amount ≤` this ceiling, C-6 mints one while
+/// `totalSupply + amount ≤ OUTSTANDING_CEIL`: the same number, both
+/// inclusive. In the normal regime every wJTM is backed by JTM locked in the
+/// vault (minted only for a locked deposit, burned before its release leaves
+/// the vault), so `totalSupply` stays at most `bridge_locked` less the
+/// deposits not yet minted, and V8 implies C-6. After the contract rolls
+/// back finalized checkpoints (MN-3b), the wJTM minted from them stay in
+/// `totalSupply` (counted in `suspectMinted`, never burned by the contract)
+/// with no JTM locked for them on the nodes' branch: C-6 is then the
+/// stricter, and a deposit the nodes admitted waits, unminted, until wJTM
+/// are burned. The contract stays prudent (decided), V8 does not change,
+/// and an advancing robot must read the contract's ceiling and supply
+/// (`OUTSTANDING_CEIL`, `totalSupply`, `suspectMinted`), never this
+/// constant, before it advances.
 pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 10_000 * MICRO_PER_JTM;
 
 // The shared rule counts in the same unit, and carries this build's clock:
@@ -394,6 +413,31 @@ pub fn decode_proof_nodes(src: &mut &[u8]) -> Result<Vec<Vec<u8>>, VaultPayloadE
         nodes.push(take(src, len)?.to_vec());
     }
     Ok(nodes)
+}
+
+/// The `BridgeAccountProof` object payload (A5-8): the account proof of the
+/// bridge contract, then the storage proof of its `genesisId`, each a node
+/// list ([`encode_proof_nodes`]). One per block, shared by its releases.
+pub fn encode_bridge_account_proof(account: &[Vec<u8>], genesis: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proof_nodes(account, &mut out);
+    encode_proof_nodes(genesis, &mut out);
+    out
+}
+
+/// Decode [`encode_bridge_account_proof`]: `(account proof, genesis
+/// proof)`, both lists present and nothing after them.
+#[allow(clippy::type_complexity)]
+pub fn decode_bridge_account_proof(
+    bytes: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), VaultPayloadError> {
+    let mut src = bytes;
+    let account = decode_proof_nodes(&mut src)?;
+    let genesis = decode_proof_nodes(&mut src)?;
+    if !src.is_empty() {
+        return Err(VaultPayloadError::TrailingBytes);
+    }
+    Ok((account, genesis))
 }
 
 /// Bytes of a release's fields: `n:u64 LE ‖ owner ‖ amount:u64 LE`.
@@ -946,6 +990,36 @@ pub fn check_release_group(
         });
     }
     Ok(())
+}
+
+/// A5-7: whether `block` is a bridge deposit block, whose body a node keeps
+/// for `BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH`: one of its groups is a deposit
+/// under V4 (the shared rule's classification, as the gate reads it), in a
+/// block above `F`. A block the gate would refuse is not one.
+pub fn block_carries_deposit(block: &Block, rules: &VaultRules) -> bool {
+    let height = block.header.height;
+    let Ok(stream) = validate_block_page_stream(&block.transactions) else {
+        return false;
+    };
+    let user = &block.transactions[stream.user_start_index..];
+    let rule = rules.deposit_rule();
+    stream.groups.iter().enumerate().any(|(index, group)| {
+        let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
+        let outputs: Vec<([u8; 32], u64)> = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner.0, o.amount)))
+            .collect();
+        matches!(
+            jetsam_vault_rule::classify_group(
+                index,
+                &group.spend.input_owner.0,
+                &outputs,
+                height,
+                &rule
+            ),
+            Ok(GroupClass::Deposit { .. })
+        )
+    })
 }
 
 /// V8 at admission, against the tip's `bridge_locked`: a deposit that would

@@ -569,9 +569,9 @@ fn fault(k: u64) -> StateHash {
     node
 }
 
-/// The rule the oracle samples by: the cache roots whose first byte is zero.
+/// The rule the oracle samples by, in this process (A5-24: salted).
 fn sampled(root: &StateHash) -> bool {
-    root[0] == 0
+    exact_segment_tree_oracle_samples(root)
 }
 
 /// Four production segments, 0, 1 and 2 live and their trees warm; then a
@@ -619,7 +619,15 @@ fn state_with_a_faulty_tree(sample: bool) -> (ChainState, BTreeMap<u32, SlotValu
     (state, live, root)
 }
 
+/// A release build logs a sampled divergence, empties the cache and serves
+/// the stream's root. A debug build asserts first (A5-24): its oracle runs
+/// on every root before the sample, so a divergence is never repaired
+/// there, sampled or not.
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "segment tree cache diverged from the streaming root of segment 1")
+)]
 fn a_sampled_cache_root_that_diverges_is_logged_dropped_and_replaced_by_the_stream() {
     let (mut state, mut live, wrong) = state_with_a_faulty_tree(true);
     let logged = Logged::default();
@@ -669,7 +677,13 @@ fn an_unsampled_cache_root_is_not_rechecked_by_a_release_build() {
     assert!(logged.errors().is_empty());
 }
 
+/// As above for a hydration: replaced in a release build, asserted in a
+/// debug build (A5-24).
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "segment tree cache diverged from the streaming root of segment 1")
+)]
 fn a_sampled_hydration_root_that_diverges_is_replaced_and_the_durable_segment_accepted() {
     let base = 1u32 << LOG_SEGMENT_SIZE;
     let mut state = ChainState::with_log_slots(LOG_SEGMENT_SIZE + 1);
@@ -712,23 +726,90 @@ fn a_sampled_hydration_root_that_diverges_is_replaced_and_the_durable_segment_ac
     assert_eq!(check(&mut state, &live, "hydrated"), root);
 }
 
+/// The indices `k < 16 384` whose root `state_node_hash(fault(k),
+/// fault(k + 1))` this process samples.
+fn sampled_indices() -> Vec<u64> {
+    (0u64..1 << 14)
+        .filter(|k| exact_segment_tree_oracle_samples(&state_node_hash(fault(*k), fault(k + 1))))
+        .collect()
+}
+
+/// A5-24: one root in 256, but not chosen by its content: roots whose first
+/// byte is zero escape it, others are taken, so a miner cannot grind a root
+/// out of (or into) the sample.
 #[test]
-fn the_oracle_samples_the_roots_whose_first_byte_is_zero_one_in_256() {
-    assert!(exact_segment_tree_oracle_samples(&[0u8; 32]));
-    let mut root = [0xFFu8; 32];
-    root[0] = 0;
-    assert!(exact_segment_tree_oracle_samples(&root));
-    for first in [1u8, 0x80, 0xFF] {
-        let mut root = [0u8; 32];
-        root[0] = first;
-        assert!(!exact_segment_tree_oracle_samples(&root));
-    }
-    // Over real node hashes the rate is one in 256: 64 expected of 16 384.
-    let count = (0u64..1 << 14)
+fn the_oracle_samples_one_root_in_256_not_by_its_first_byte() {
+    let roots: Vec<StateHash> = (0u64..1 << 14)
         .map(|k| state_node_hash(fault(k), fault(k + 1)))
-        .filter(exact_segment_tree_oracle_samples)
-        .count();
+        .collect();
+    let count = roots.iter().filter(|r| sampled(r)).count();
     assert!((32..=104).contains(&count), "{count} sampled of 16384");
+    assert!(
+        roots.iter().any(|r| r[0] == 0 && !sampled(r)),
+        "a root of first byte zero escapes the sample"
+    );
+    assert!(
+        roots.iter().any(|r| r[0] != 0 && sampled(r)),
+        "a root of another first byte is sampled"
+    );
+    // 512 roots of first byte zero: about 2 sampled, never all.
+    let zeros = (0u64..512)
+        .map(|k| {
+            let mut root = [0xFFu8; 32];
+            root[0] = 0;
+            root[1..9].copy_from_slice(&k.to_le_bytes());
+            root
+        })
+        .filter(|r| sampled(r))
+        .count();
+    assert!(
+        zeros < 32,
+        "{zeros} of 512 roots of first byte zero sampled"
+    );
+    // Stable within the process: the same roots each time.
+    assert_eq!(sampled_indices(), sampled_indices());
+}
+
+/// Run by [`each_process_samples_other_roots`] in a child process: the
+/// sampled indices of that process.
+#[test]
+#[ignore = "child of each_process_samples_other_roots"]
+fn print_the_roots_this_process_samples() {
+    let line: Vec<String> = sampled_indices().iter().map(u64::to_string).collect();
+    println!("SAMPLED={}", line.join(","));
+}
+
+/// A5-24: each process draws its own sample (a salt from the OS, once): two
+/// processes, and this one, check different roots, so a defect a root
+/// triggers is seen by about 1/256 of the nodes, not by all or none.
+#[test]
+fn each_process_samples_other_roots() {
+    let child = || -> Vec<u64> {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "print_the_roots_this_process_samples",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        // The harness may print the test's name first on the same line.
+        let line = text
+            .lines()
+            .find_map(|l| l.split_once("SAMPLED=").map(|(_, rest)| rest.trim()))
+            .unwrap_or_else(|| panic!("no SAMPLED line in {text}"));
+        line.split(',').map(|k| k.parse().unwrap()).collect()
+    };
+    let (a, b, here) = (child(), child(), sampled_indices());
+    for set in [&a, &b, &here] {
+        assert!((32..=104).contains(&set.len()), "{} sampled", set.len());
+    }
+    assert_ne!(a, b);
+    assert_ne!(a, here);
+    assert_ne!(b, here);
 }
 
 // Cost of the release oracle on one production segment, per fill: a block

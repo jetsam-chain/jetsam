@@ -6,7 +6,9 @@
 
 use super::*;
 use jetsam_chain::consensus::destination::ssz::LightClientUpdate;
-use jetsam_chain::consensus::vault::{decode_proof_nodes, encode_proof_nodes, VAULT_ADDRESS};
+use jetsam_chain::consensus::vault::{
+    decode_proof_nodes, encode_bridge_account_proof, encode_proof_nodes, VAULT_ADDRESS,
+};
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{
     output_bitmap_bit, TxBody, TxInput, TxOutput, TxPage, PAGED_SPEND_END_BIT,
@@ -40,8 +42,9 @@ pub(crate) fn finality_payload() -> Vec<u8> {
 /// keys only, written by a temporary test of `jetsam_chain` from its
 /// destination test helpers): an anchor committee (its anchor update), the
 /// update it signs for the next period, a finality update it signs whose
-/// finalized root holds the bridge account and `withdrawals[n]` of one burn,
-/// the same finality update signed by a stranger committee.
+/// finalized root holds the bridge account, its genesis (A5-8) and
+/// `withdrawals[n]` of one burn, the same finality update signed by a
+/// stranger committee.
 #[derive(Clone)]
 pub(crate) struct SyntheticL1 {
     pub anchor: jetsam_chain::consensus::destination::state::L1Anchor,
@@ -92,6 +95,8 @@ impl SyntheticL1 {
                 address: bytes("bridge_address").try_into().unwrap(),
                 code_hash: bytes("bridge_code_hash").try_into().unwrap(),
                 withdrawals_slot: number("bridge_withdrawals_slot"),
+                genesis_id_slot: number("bridge_genesis_id_slot"),
+                genesis_id: bytes("bridge_genesis_id").try_into().unwrap(),
             },
             release: VaultRelease {
                 n: number("release_n"),
@@ -199,8 +204,7 @@ pub(crate) fn release_intent(n: u64, owner: Address, amount: u64) -> Destination
         amount,
         storage_proof: vec![vec![0xee; 40]],
     };
-    let mut proof = Vec::new();
-    encode_proof_nodes(&[vec![0xdd; 64]], &mut proof);
+    let proof = encode_bridge_account_proof(&[vec![0xdd; 64]], &[vec![0xdc; 64]]);
     let rf = jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
     DestinationIntent::Release(ReleaseIntent {
         payment: payment(
@@ -335,6 +339,16 @@ fn destination_intent_objects_must_decode() {
     bad_proof.account_proof.push(0);
     assert_eq!(
         DestinationIntent::decode(&DestinationIntent::Release(bad_proof).encode().unwrap()),
+        Err(DestinationIntentError::MalformedObject(
+            DestinationObjectKind::BridgeAccountProof
+        ))
+    );
+    // A5-8: the account proof alone, without the genesis proof after it.
+    let mut account_only = release.clone();
+    account_only.account_proof.clear();
+    encode_proof_nodes(&[vec![0xdd; 64]], &mut account_only.account_proof);
+    assert_eq!(
+        DestinationIntent::decode(&DestinationIntent::Release(account_only).encode().unwrap()),
         Err(DestinationIntentError::MalformedObject(
             DestinationObjectKind::BridgeAccountProof
         ))

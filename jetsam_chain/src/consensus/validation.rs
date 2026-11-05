@@ -721,8 +721,10 @@ mod tests {
 
     /// The destination section of a v1.7 block, at the sizes the SPEC
     /// measured: one committee update (26 913 B), one finality update
-    /// (2 090 B), the bridge account proof (3 794 B) and four releases of
-    /// 48 + 2 914 B: 44 645 bytes of objects.
+    /// (2 090 B), the bridge account proof (3 794 B) followed by the storage
+    /// proof of `genesisId` (A5-8: one storage path of the same contract,
+    /// counted at a release's measured 2 914 B) and four releases of
+    /// 48 + 2 914 B: 47 559 bytes of objects.
     fn largest_measured_destination_section() -> crate::consensus::destination::DestinationSection
     {
         use crate::consensus::destination::{
@@ -735,7 +737,7 @@ mod tests {
         let mut objects = vec![
             object(DestinationObjectKind::CommitteeUpdate, 26_913),
             object(DestinationObjectKind::FinalityUpdate, 2_090),
-            object(DestinationObjectKind::BridgeAccountProof, 3_794),
+            object(DestinationObjectKind::BridgeAccountProof, 3_794 + 2_914),
         ];
         objects.extend((0..4).map(|_| object(DestinationObjectKind::VaultRelease, 48 + 2_914)));
         DestinationSection { objects }
@@ -887,11 +889,12 @@ mod tests {
         ));
     }
 
-    /// The largest destination section the SPEC measured (44.6 kB of objects)
-    /// rides on the largest v1.6 block: the section is outside
-    /// `MAX_BLOCK_BYTES`, under its own budget.
+    /// The largest destination section the SPEC measured, with the genesis
+    /// proof A5-8 adds to the account proof (47.6 kB of objects), rides on
+    /// the largest v1.6 block: the section is outside `MAX_BLOCK_BYTES`,
+    /// under its own budget.
     #[test]
-    fn max_section_44_6_kb_is_accepted() {
+    fn max_section_47_6_kb_is_accepted() {
         use crate::consensus::destination::destination_section_wire_len;
         use crate::consensus::wire_limits::{
             MAX_BLOCK_BYTES, MAX_DESTINATION_SECTION_BYTES, MAX_V1_7_BLOCK_BYTES,
@@ -901,7 +904,7 @@ mod tests {
         transactions.extend((0..255).map(|i| user(i, 4, 2)));
         let section = largest_measured_destination_section();
         let payload: usize = section.objects.iter().map(|o| o.payload.len()).sum();
-        assert_eq!(payload, 44_645);
+        assert_eq!(payload, 47_559);
         let section_len = destination_section_wire_len(&section);
         assert!(section_len <= MAX_DESTINATION_SECTION_BYTES);
         let block = Block {

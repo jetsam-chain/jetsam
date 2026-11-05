@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use jetsam_chain::consensus::guardian::StakeLock;
-use jetsam_chain::consensus::vault::{encode_proof_nodes, VaultRelease};
+use jetsam_chain::consensus::vault::{encode_bridge_account_proof, VaultRelease};
 use jetsam_mempool::destination::{DestinationIntent, ReleaseIntent};
 use jetsam_mempool::guardian::GuardianIntent;
 use jetsam_poseidon2b::primitives::Address;
@@ -74,8 +74,8 @@ pub fn destination_intent_bytes(n: u64) -> Vec<u8> {
     finality.extend_from_slice(include_bytes!(
         "../../../jetsam_chain/src/consensus/destination/testdata/fu_lodestar-mainnet.bin"
     ));
-    let mut account_proof = Vec::new();
-    encode_proof_nodes(&[vec![0xdd; 64]], &mut account_proof);
+    // The account proof, then the genesis proof (A5-8): well-formed bytes.
+    let account_proof = encode_bridge_account_proof(&[vec![0xdd; 64]], &[vec![0xdc; 64]]);
     let marker = release.marker();
     DestinationIntent::Release(ReleaseIntent {
         payment: payment(

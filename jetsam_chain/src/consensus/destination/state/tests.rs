@@ -8,7 +8,7 @@
 //! The L1 here is synthetic but **signed**: committees of BLS keys this test
 //! holds, Merkle trees built so that every branch the light client checks
 //! opens (gindices 87, 169, 25), a finalized execution state root that holds
-//! the bridge account of `destination::tests::synthetic_bridge`.
+//! the bridge account of `destination::tests::synthetic_bridge_with_genesis`.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -24,7 +24,7 @@ use crate::consensus::destination::ssz::{
     sha256_pair, BeaconBlockHeader, ExecutionPayloadHeader, LightClientExecution,
     LightClientHeader, SyncAggregate, SyncCommittee,
 };
-use crate::consensus::destination::tests::{prototype_bridge, synthetic_bridge};
+use crate::consensus::destination::tests::{prototype_bridge, synthetic_bridge_with_genesis};
 use crate::consensus::destination::{DestinationObject, DestinationSection};
 use crate::consensus::params::MICRO_PER_JTM;
 use crate::consensus::vault::tests::{
@@ -502,15 +502,32 @@ fn committee_update_must_open_its_marker() {
 /// A block paying release `r` under a finality update of `signers` (period
 /// `period`) whose root holds the bridge account and `withdrawals[r.n]`.
 fn release_block(height: u64, r: &VaultRelease, signers: &Committee, period: u64) -> Block {
+    release_block_under(
+        height,
+        r,
+        signers,
+        period,
+        Some(prototype_bridge().genesis_id),
+    )
+}
+
+/// [`release_block`] under an L1 whose bridge holds the genesis `genesis`
+/// (none: not installed).
+fn release_block_under(
+    height: u64,
+    r: &VaultRelease,
+    signers: &Committee,
+    period: u64,
+    genesis: Option<Root>,
+) -> Block {
     let bridge = prototype_bridge();
     let commitment = withdrawal_commitment(&r.owner.0, r.amount);
-    let (l1_root, account_proof, storage_proof) = synthetic_bridge(&bridge, r.n, Some(commitment));
+    let l1 = synthetic_bridge_with_genesis(&bridge, r.n, commitment, genesis);
+    let (l1_root, account) = (l1.state_root, l1.account_payload());
     let r = VaultRelease {
-        storage_proof,
+        storage_proof: l1.storage_proof,
         ..r.clone()
     };
-    let mut account = Vec::new();
-    encode_proof_nodes(&account_proof, &mut account);
     let mut b = block_at(height, vec![release_group(100, &r, 0, FEE)], &[r.clone()]);
     let section = b.destination.as_mut().unwrap();
     section.objects.insert(
@@ -655,6 +672,73 @@ fn releases_need_their_finality_update_and_a_bridge() {
     assert_eq!(
         validate_block_destination(&full, &blind, &rules, &keys),
         Err(DestinationBlockError::NoCommitteeKnown)
+    );
+}
+
+/// A5-8: a release is paid only while the bridge contract holds the pinned
+/// genesis, proven in the block (the shared account proof carries the
+/// storage proof of `genesisId`): another genesis, none installed, or no
+/// genesis proof in the object, and the whole block's releases are refused.
+#[test]
+fn releases_are_paid_only_under_the_pinned_bridge_genesis() {
+    let c0 = committee(1);
+    let rules = anchored_rules(&c0);
+    let parent = state_at(
+        HEIGHT - 1,
+        vec![CommitteeRef {
+            period: P0,
+            root: root_of(&c0),
+        }],
+    );
+    let keys = keys_of(&[&c0]);
+    let r = release(2, ALICE, 5 * MICRO_PER_JTM);
+    let pinned = prototype_bridge().genesis_id;
+    assert!(validate_block_destination(
+        &release_block_under(HEIGHT, &r, &c0, P0, Some(pinned)),
+        &parent,
+        &rules,
+        &keys
+    )
+    .is_ok());
+
+    let mut other = pinned;
+    other[0] ^= 0x80;
+    assert_eq!(
+        validate_block_destination(
+            &release_block_under(HEIGHT, &r, &c0, P0, Some(other)),
+            &parent,
+            &rules,
+            &keys
+        ),
+        Err(DestinationBlockError::BridgeAccount(
+            L1ReadError::GenesisMismatch
+        ))
+    );
+    assert_eq!(
+        validate_block_destination(
+            &release_block_under(HEIGHT, &r, &c0, P0, None),
+            &parent,
+            &rules,
+            &keys
+        ),
+        Err(DestinationBlockError::BridgeAccount(
+            L1ReadError::GenesisAbsent
+        ))
+    );
+
+    // The account proof alone, as before A5-8: not an account proof object.
+    let mut bare = release_block(HEIGHT, &r, &c0, P0);
+    let section = bare.destination.as_mut().unwrap();
+    let (account, _) =
+        crate::consensus::vault::decode_bridge_account_proof(&section.objects[1].payload).unwrap();
+    let mut payload = Vec::new();
+    encode_proof_nodes(&account, &mut payload);
+    section.objects[1].payload = payload;
+    assert_eq!(
+        validate_block_destination(&bare, &parent, &rules, &keys),
+        Err(DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::BridgeAccountProof
+        })
     );
 }
 
@@ -991,13 +1075,15 @@ impl Chain {
             .max()
             .expect("a vault slot");
         let bridge = prototype_bridge();
-        let (l1_root, account_proof, storage_proof) = synthetic_bridge(
+        let l1 = synthetic_bridge_with_genesis(
             &bridge,
             r.n,
-            Some(withdrawal_commitment(&r.owner.0, r.amount)),
+            withdrawal_commitment(&r.owner.0, r.amount),
+            Some(bridge.genesis_id),
         );
+        let (l1_root, account) = (l1.state_root, l1.account_payload());
         let r = VaultRelease {
-            storage_proof,
+            storage_proof: l1.storage_proof,
             ..r.clone()
         };
         let paid = r.amount - crate::consensus::vault::RELEASE_FEE_MICRO;
@@ -1009,8 +1095,6 @@ impl Chain {
             &[(r.owner, paid), (r.marker(), 0), (vault, change)],
             FEE,
         );
-        let mut account = Vec::new();
-        encode_proof_nodes(&account_proof, &mut account);
         let mut b = block_at(self.height + 1, vec![group], &[r.clone()]);
         let section = b.destination.as_mut().unwrap();
         section.objects.insert(

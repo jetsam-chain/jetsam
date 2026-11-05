@@ -45,7 +45,7 @@ use jetsam_poseidon2b::primitives::Address;
 
 use super::bls::{committee_keys, CommitteeKeys};
 use super::forks::{period_of_slot, L1Network};
-use super::l1_read::{read_account, verify_withdrawal, L1BridgeParams, L1ReadError};
+use super::l1_read::{verify_bridge_account, verify_withdrawal, L1BridgeParams, L1ReadError};
 use super::light_client::{
     verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
 };
@@ -56,9 +56,9 @@ use crate::consensus::params::{
     v1_7_active_with, CONSENSUS_FINALITY_DEPTH, V1_7_ACTIVATION_HEIGHT,
 };
 use crate::consensus::vault::{
-    decode_proof_nodes, destination_marker_kind, validate_block_vault, DestinationMarkerKind,
-    ReleasedSet, VaultContext, VaultEffect, VaultError, VaultRelease, VaultRules,
-    LIGHT_CLIENT_UPDATE_MARKER_TAG,
+    decode_bridge_account_proof, destination_marker_kind, validate_block_vault,
+    DestinationMarkerKind, ReleasedSet, VaultContext, VaultEffect, VaultError, VaultRelease,
+    VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG,
 };
 
 #[cfg(test)]
@@ -110,8 +110,16 @@ pub const REHEARSAL_L1_ANCHOR: L1Anchor = L1Anchor {
 /// The rehearsal's bridge contract on the synthetic L1: a fixed, documented
 /// address `keccak("jetsam-v17-rehearsal/synthetic-l1/bridge-address")[12..]`
 /// and code hash `keccak("…/bridge-runtime-code")` (no local devnet address
-/// exists to take, T0.7 not built), slot 9 (`rehearsal_l1::bridge_params`,
+/// exists to take, T0.7 not built), slot 9, and (A5-8) the genesis
+/// `keccak("…/bridge-genesis-id")` at slot 13 (`rehearsal_l1::bridge_params`,
 /// checked by a test).
+///
+/// The genesis is the synthetic contract's, which every synthetic state
+/// holds (`rehearsal_l1::bridge_state`): the nodes' V7 reads only the
+/// synthetic L1 (its committees sign it). The rehearsal's local L1 contract
+/// (chain id 31 337) is given its genesis at run time on each fresh chain
+/// (`jg-relay --genesis-l`), a value no build constant can follow; no node
+/// reads it.
 pub const REHEARSAL_L1_BRIDGE: L1BridgeParams = L1BridgeParams {
     address: [
         0xee, 0x8b, 0x5f, 0xca, 0x07, 0x23, 0x82, 0x78, 0x19, 0x99, 0x79, 0x8c, 0xf9, 0xd7, 0xc5,
@@ -123,6 +131,12 @@ pub const REHEARSAL_L1_BRIDGE: L1BridgeParams = L1BridgeParams {
         0x62, 0x3c,
     ],
     withdrawals_slot: 9,
+    genesis_id_slot: 13,
+    genesis_id: [
+        0x26, 0xbd, 0xc5, 0xda, 0xd9, 0x98, 0x83, 0x11, 0xd7, 0xe0, 0x1c, 0x67, 0x0c, 0xe0, 0xa4,
+        0xca, 0xf2, 0xde, 0xe9, 0xcb, 0x12, 0xe3, 0xe6, 0x10, 0xaa, 0xf4, 0xac, 0x0c, 0xde, 0xaf,
+        0x0f, 0xad,
+    ],
 };
 /// The L1 the light client reads: the L1's main network, except on the
 /// rehearsal profile, whose L1 is synthetic (its own genesis validators root).
@@ -132,9 +146,9 @@ pub const L1_NETWORK: L1Network = super::forks::L1_MAINNET;
 #[cfg(feature = "rehearsal-v1-7")]
 pub const L1_NETWORK: L1Network = super::forks::L1_REHEARSAL;
 
-/// The bridge contract of this build (address, code hash, slot 9): none on
-/// the public and test networks until T8.3 (DECISIONS 29/10). While it is
-/// `None`, no release is possible.
+/// The bridge contract of this build (address, code hash, slot 9, and its
+/// genesis at slot 13, A5-8): none on the public and test networks until
+/// T8.3 (DECISIONS 29/10). While it is `None`, no release is possible.
 #[cfg(not(feature = "rehearsal-v1-7"))]
 pub const L1_BRIDGE: Option<L1BridgeParams> = None;
 /// **Private builds only** (`rehearsal-v1-7`, A3-8): the synthetic L1's.
@@ -922,8 +936,9 @@ pub fn verify_committee_update_payload(
 /// `account_proof`, on a branch that knows `committees` (after the block's
 /// committee update, if any): the finality update signed by one of them
 /// (keys from `learned`, the block's own update, then `keys`, this node's),
-/// the bridge account under its finalized root, then each release's storage
-/// proof.
+/// the bridge account under its finalized root with its pinned code and
+/// pinned genesis (A5-8: `account_proof` carries the storage proof of
+/// `genesisId`), then each release's storage proof.
 ///
 /// A pure function of its arguments: the block applies it, and a mempool
 /// judges a release it is handed with it (A2-M1).
@@ -964,27 +979,16 @@ pub fn verify_releases_on_l1(
     let finalized = verify_finality_update(&rules.network, &refs, &finality)
         .map_err(DestinationBlockError::LightClient)?;
     let state_root = finalized.execution.state_root;
-    let account_nodes = {
-        let mut src = account_proof;
-        let nodes =
-            decode_proof_nodes(&mut src).map_err(|_| DestinationBlockError::MalformedObject {
+    let (account_nodes, genesis_nodes) =
+        decode_bridge_account_proof(account_proof).map_err(|_| {
+            DestinationBlockError::MalformedObject {
                 kind: DestinationObjectKind::BridgeAccountProof,
-            })?;
-        if !src.is_empty() {
-            return Err(DestinationBlockError::MalformedObject {
-                kind: DestinationObjectKind::BridgeAccountProof,
-            });
-        }
-        nodes
-    };
-    let account = read_account(state_root, &bridge.address, &account_nodes)
+            }
+        })?;
+    // V7, once for the block: the pinned code, and the pinned genesis (A5-8).
+    verify_bridge_account(state_root, &bridge, &account_nodes, &genesis_nodes)
         .map_err(DestinationBlockError::BridgeAccount)?;
-    if account.code_hash != bridge.code_hash {
-        return Err(DestinationBlockError::BridgeAccount(
-            L1ReadError::CodeHashMismatch,
-        ));
-    }
-    // V7.
+    // V7, each release.
     for release in releases {
         verify_withdrawal(
             state_root,
