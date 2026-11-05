@@ -161,7 +161,10 @@ pub fn omitted_by(found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, parent_l: u
         return None;
     }
     let mut o = parent_omitted.to_vec();
-    o.extend(found.range(parent_l + 1..=cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+    // a point locked at its parent's L has no window of its own (never a reversed range: it panics)
+    if cp.locked_height > parent_l {
+        o.extend(found.range(parent_l + 1..=cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+    }
     let deps = tree_of(found, gl, cp.locked_height, &o).0;
     let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
     (deps.len() as u64 == cp.deposit_count && merkle_root(&leaves) == cp.deposit_root).then_some(o)
@@ -556,7 +559,9 @@ pub fn listed_omission(known: &HashMap<[u8; 32], Known>, found: &BTreeMap<u64, V
         if k.cp.locked_height < parent_l {
             return None;
         }
-        omitted.extend(found.range(parent_l + 1..=k.cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+        if k.cp.locked_height > parent_l {
+            omitted.extend(found.range(parent_l + 1..=k.cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+        }
     }
     Some(omitted)
 }
@@ -580,6 +585,10 @@ pub fn direct_claims_needed(
         None if now < fin.accepted_at.saturating_add(TREE_WAIT_SECS) => listed_omission(known, found, fin_id),
         None => None,
     };
+    // the genesis as the final point (L = gl): nothing under it, and never a reversed range (it panics)
+    if fin.cp.locked_height <= gl {
+        return Vec::new();
+    }
     found
         .range(gl + 1..=fin.cp.locked_height)
         .filter(|(h, _)| omitted.as_ref().is_none_or(|o| o.contains(h)))
