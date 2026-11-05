@@ -34,11 +34,13 @@ fn checkpoint_id_matches_the_contract_encoding() {
 }
 
 /// A5-4 and the re-audit's N1: 23 words, the bridge's tip block (0x88…) and `tip_on_branch`, then the
-/// bridge tip's locked block (0x99…) and `locked_on_branch` last. Vectors: `cast abi-encode` of the 23
-/// static values then `cast keccak` (foundry 1.4.4), 2026-11-05 (the same method gives the 21-word vector
-/// of A5-4, f6ba8aeb…, again).
+/// bridge tip's locked block (0x99…) and `locked_on_branch`; the second re-audit's C1 (option B): word 23, the
+/// keccak256 of the heights of the whole blocks the proof gave (`abi.encodePacked(uint64[])`, here 129 and 133).
+/// Vectors: `cast abi-encode` of the 24 static values then `cast keccak` (foundry 1.4.4), 2026-11-05
+/// (`/opt/jetsam-v17-logs/A5FIX3/tools/cast-vectors.sh`; the same method gives the 23-word vector of N1,
+/// f7f67386…, again).
 #[test]
-fn public_values_are_736_bytes_and_match_the_contract_encoding() {
+fn public_values_are_768_bytes_and_match_the_contract_encoding() {
     let mn = Mn {
         tip_block_work: be(16),
         fork_base_timestamp: 1_700_000_000,
@@ -48,25 +50,32 @@ fn public_values_are_736_bytes_and_match_the_contract_encoding() {
         tip_on_branch: true,
         locked_on_branch: true,
     };
-    let pv = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &mn);
-    assert_eq!(pv.len(), 736);
+    let blocks = [129u64, 133];
+    let pv = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &mn, &blocks);
+    assert_eq!(pv.len(), 768);
     assert_eq!(pv[608..640], rep(0x88));
     assert_eq!(pv[640..672], be(1));
     assert_eq!(pv[672..704], rep(0x99));
     assert_eq!(pv[704..736], be(1));
+    assert_eq!(hex::encode(deposit_blocks_hash(&blocks)), "2d89d65fa67f8377cfdaa57b0fa725f2fd923c36134c784fd2aeb311d7fa4a72");
+    assert_eq!(pv[736..768], deposit_blocks_hash(&blocks));
+    assert_eq!(hex::encode(deposit_blocks_hash(&[])), "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", "keccak256 of no byte");
     assert_eq!(
         hex::encode(keccak256(&pv)),
-        "f7f6738603751a4880913ee71517ce0bc3652a020a8f94b42901d6b6f75c9696"
+        "be6378108e1a2044938204342e0da4c82903d521fb2c75e92f065586fa315ef9"
     );
     assert_eq!(
         hex::encode(mock_proof(&pv)),
-        "c9a197947d17015c118a046e21c114a333842ac602e5a894eca78a84631c6734"
+        "1e73b4c2f4ca94d6f2fe61f771de75b6186693ef5563f307d0965ad1f0430c94"
     );
-    let off = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &Mn { tip_on_branch: false, ..mn });
+    let off = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &Mn { tip_on_branch: false, ..mn }, &blocks);
     assert_eq!((off[..640] == pv[..640], off[640..672] == [0u8; 32], off[672..] == pv[672..]), (true, true, true));
-    let unlocked = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &Mn { locked_on_branch: false, ..mn });
-    assert_eq!(hex::encode(keccak256(&unlocked)), "6c8de2aa7d907888213924c12bd1e1bb45e277551180588aaf3345b25e2482e4");
-    assert_eq!((unlocked[..704] == pv[..704], unlocked[704..736] == [0u8; 32]), (true, true));
+    let unlocked = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &Mn { locked_on_branch: false, ..mn }, &blocks);
+    assert_eq!(hex::encode(keccak256(&unlocked)), "74b91812db80b42afc9cd6d968ffdbb990184557f9d334ff8affa893c017e896");
+    assert_eq!((unlocked[..704] == pv[..704], unlocked[704..736] == [0u8; 32], unlocked[736..] == pv[736..]), (true, true, true));
+    let none = public_values(&rep(0x66), &vector_checkpoint(), 2, 101, &rep(0x88), &rep(0x99), &mn, &[]);
+    assert_eq!(hex::encode(keccak256(&none)), "fe5ffab3c588b2b256fafed82bfbfa572673edd8b578c748b1a8971c1af965fe");
+    assert_eq!(none[..736], pv[..736]);
 }
 
 #[test]

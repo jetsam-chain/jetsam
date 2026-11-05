@@ -36,7 +36,15 @@ fn call_data_matches_cast() {
     let sig = [0x01u8; 256];
     assert_eq!(k(&finalize_fast(&cp(), 1_700_003_600, &sig)), "0xbacc1b0bffa6f486f9b7171e9093da971bbc5d33ad8143f12a84c893f4b812f2");
     assert_eq!(k(&init_genesis(&cp(), 1_700_003_600, &sig)), "0x8259e4e8f58e5ec3f0aab1a98049a7f48cb7e649dcb5b3e3feffc697a7547d0d");
-    assert_eq!(k(&submit_checkpoint(&rep(0x66), &cp(), 2, &mn(), &rep(0x77))), "0x5d9d91e0f7b951555e1ae2975ebf1210d7f3c1e00cf605e333917940951525ba");
+    // C1 (re-audit n°2, option B): the heights of the whole blocks the proof gave, `uint64[]` before the proof
+    // (A5FIX3 vectors, 2026-11-05: `/opt/jetsam-v17-logs/A5FIX3/tools/cast-vectors.sh`)
+    let sub = submit_checkpoint(&rep(0x66), &cp(), 2, &mn(), &[129, 133], &rep(0x77));
+    assert_eq!(sub[..4], [0x71, 0x2c, 0x9f, 0x64]);
+    assert_eq!(sub.len(), 836);
+    assert_eq!(k(&sub), "0x594251ba82b94f1864b1bdb23d2de6e38f250964baca58bc9fd197e21f4a1a2c");
+    let none = submit_checkpoint(&rep(0x66), &cp(), 2, &mn(), &[], &rep(0x77));
+    assert_eq!(none.len(), 772);
+    assert_eq!(k(&none), "0x2851845914a4ae6afd662d2e0d80c19c8baf88768001c552515d8fc0375b1982");
     assert_eq!(
         k(&submit_and_finalize_fast(&rep(0x66), &cp(), 2, &mn(), &rep(0x77), 1_700_003_600, &sig)),
         "0x4fe11c196d1ba7a5b9089f99971f044f79268c260421c17dd02f0333c422f4c8"
@@ -143,5 +151,34 @@ fn advance_event_topics_are_the_interfaces() {
     assert_eq!(t("Advanced(bytes32,bytes32,address,address,uint64,uint16,address,bytes32)"), TOPIC_ADVANCED);
     assert_eq!(t("AdvanceSkipped(uint256,bytes32,bytes4)"), TOPIC_ADVANCE_SKIPPED);
     assert_eq!(t("AdvanceRepaid(bytes32,bytes32,address,uint64)"), TOPIC_ADVANCE_REPAID);
-    assert_eq!(t(&format!("CheckpointAccepted(bytes32,bytes32,{CHECKPOINT_TUPLE},uint8)")), TOPIC_CHECKPOINT_ACCEPTED);
+    assert_eq!(t(&format!("CheckpointAccepted(bytes32,bytes32,{CHECKPOINT_TUPLE},uint8,uint64[])")), TOPIC_CHECKPOINT_ACCEPTED);
+}
+
+/// C1 (re-audit n°2, option B): the data of `CheckpointAccepted(id, prevId, checkpoint, forkDepth, depositBlocks)`
+/// (the ten words, the fork depth, the offset of the list, its length, the heights) read back; its bytes are
+/// those of `cast abi-encode "f(<checkpoint>,uint8,uint64[])"` (A5FIX3 vectors, 2026-11-05).
+#[test]
+fn the_checkpoint_accepted_event_is_read_with_its_deposit_blocks() {
+    let mut data: Vec<u8> = cp().words().concat();
+    data.extend_from_slice(&w64(2));
+    data.extend_from_slice(&w64(12 * 32));
+    data.extend_from_slice(&w64(3));
+    for h in [129u64, 133, 140] {
+        data.extend_from_slice(&w64(h));
+    }
+    assert_eq!(data.len(), 512);
+    assert_eq!(k(&data), "0x2a04d1521f101031005a72ae4012af5cc8c304d23fa7fd4491da6f46cf9bd94c");
+    assert_eq!(checkpoint_accepted(&data).unwrap(), (cp(), 2, vec![129, 133, 140]));
+    let mut empty: Vec<u8> = cp().words().concat();
+    empty.extend_from_slice(&w64(0));
+    empty.extend_from_slice(&w64(12 * 32));
+    empty.extend_from_slice(&w64(0));
+    assert_eq!(k(&empty), "0xe5a174a4432db93090ac9a672feaca7bad849f3b78344bd34f31953dbc2cd424");
+    assert_eq!(checkpoint_accepted(&empty).unwrap(), (cp(), 0, vec![]));
+    // not this event's data: refused, never read as an empty list
+    assert!(checkpoint_accepted(&data[..11 * 32]).is_err(), "no list");
+    assert!(checkpoint_accepted(&data[..14 * 32]).is_err(), "a list shorter than its length");
+    let mut moved = data.clone();
+    moved[11 * 32..12 * 32].copy_from_slice(&w64(13 * 32));
+    assert!(checkpoint_accepted(&moved).is_err(), "an offset that is not the list's");
 }
