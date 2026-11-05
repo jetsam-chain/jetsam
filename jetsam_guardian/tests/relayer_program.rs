@@ -4,8 +4,8 @@
 //! The relayer's own path on the REAL private rehearsal chain of the JGFILL run (headers 0..144, the bodies
 //! of 123..144, a vault deposit of 7 JTM at 129: the fixture of `jetsam_bridge_xtest`): the deposit bodies
 //! judged by the node's rule into the archive, the submission planned on the bridge genesis (L = 120),
-//! the proof request, the program's input (`JSPVIN07`), and the checkpoint program run natively commits
-//! exactly the relayer's 736 bytes — for a first point and for the point that extends it. A page altered
+//! the proof request, the program's input (`JSPVIN08`), and the checkpoint program run natively commits
+//! exactly the relayer's 768 bytes — for a first point and for the point that extends it. A page altered
 //! in the archive, the request of another transition, or the relayer's `tipOnBranch` against another tip
 //! block than the request's (A5-4), is refused by the program. Built with the
 //! rehearsal's clock only (`--features rehearsal-v1-7`): the build's clock is the chain's.
