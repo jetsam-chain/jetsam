@@ -675,3 +675,19 @@ fn n2_claim_direct_requests_are_queued_read_and_closed() {
     assert!(!a.exists() && a.with_extension("done").exists());
     assert_eq!(claim_requests(&q).unwrap().len(), 1);
 }
+
+/// A5-22: the deposit-claim program's input `JCLMIN03` as `claim.rs` reads it (integers little-endian): magic,
+/// height, tx_root, group, page count, pages. The real rehearsal deposit is group 0 (`relayer_program`): the
+/// byte order of the group is pinned here.
+#[test]
+fn a5_22_the_claim_input_is_the_programs_layout() {
+    let pages = vec![vec![0xaa; jetsam_tx::TX_BODY_WIRE_SIZE], vec![0xbb; jetsam_tx::TX_BODY_WIRE_SIZE]];
+    let v = claim_input(129, &[0x55; 32], 0x0102_0304, &pages);
+    assert_eq!(&v[..8], b"JCLMIN03");
+    assert_eq!(v[8..16], 129u64.to_le_bytes());
+    assert_eq!(v[16..48], [0x55; 32]);
+    assert_eq!(v[48..52], [4, 3, 2, 1], "the group, little-endian");
+    assert_eq!(v[52..56], 2u32.to_le_bytes());
+    assert_eq!(v.len(), 56 + 2 * jetsam_tx::TX_BODY_WIRE_SIZE);
+    assert_eq!(v[56..56 + jetsam_tx::TX_BODY_WIRE_SIZE], pages[0][..]);
+}
