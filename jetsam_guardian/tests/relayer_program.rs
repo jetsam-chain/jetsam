@@ -156,4 +156,8 @@ fn n2_a_point_that_leaves_the_rehearsal_deposit_out_is_extended_and_the_deposit_
     other.input[48] ^= 1; // JCLMIN03: magic 8 | height 8 | tx_root 32 | group u32 at 48
     assert!(relayer::check_claim_native(&other).is_err(), "another group");
     assert!(relayer::ClaimRequest::build(&ar, 130, &d.txid).is_err(), "no such deposit in 130");
+    // the request's 192 bytes are what the program commits, byte for byte
+    let mut wrong = claim.clone();
+    wrong.public_values[127] ^= 1;
+    assert!(relayer::check_claim_native(&wrong).unwrap_err().to_string().contains("other public values"));
 }
