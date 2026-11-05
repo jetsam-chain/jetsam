@@ -14,6 +14,8 @@
 //! Audit A5 on the real contract: a third party's point on the relayer's own chain from the genesis (one
 //! block more) is refused (`MustExtendTip`) and the finality clock does not move (A5-4); the third deposit,
 //! advanced just before the relayer's claim, repays only what was paid and its recipient gets 100 % (A5-1).
+//! Re-audit n°2, C1: the heights of the deposit blocks the relayer's proof gives are submitted with it and read
+//! back from the real contract's `CheckpointAccepted` (`l1::checkpoint_accepted`).
 //! Re-audit N2 / A5-22: a deposit of a block that no root of the branch holds (a block left out) is minted by
 //! `claimDepositDirect` (`l1::claim_deposit_direct`, the anchor branch `relayer::anchor_branch` of the final
 //! point's anchor root, the 192 bytes `relayer::deposit_claim_values`, the TEST mock claim proof), once.
@@ -127,6 +129,10 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn, &s.deposit_blocks);
     let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &s.deposit_blocks, &mock_proof(&pv)), "submitCheckpoint").unwrap();
     assert!(r.status, "submitCheckpoint");
+    // C1: the real contract's CheckpointAccepted carries the heights, as the relayer reads them back
+    let ev = r.logs.iter().find(|lg| lg["topics"][0].as_str() == Some(l1::TOPIC_CHECKPOINT_ACCEPTED)).expect("CheckpointAccepted");
+    let data = hex::decode(ev["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+    assert_eq!(l1::checkpoint_accepted(&data).unwrap(), (s.next, 0, vec![30, 31, 33]));
     let cid = s.next.id();
     known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true, omitted: Some(s.omitted.clone()), deposit_blocks: Some(s.deposit_blocks.clone()) });
     assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
