@@ -818,6 +818,8 @@ fn fill_dir(network: &str, chain: u64, nodes: &[String], l1: &str, tail: &str) -
         dir.join("state").display()
     );
     std::fs::write(dir.join("fill.toml"), text).unwrap();
+    // A5-15: jg-fill reads a fill.toml private to its user only
+    std::fs::set_permissions(dir.join("fill.toml"), std::fs::Permissions::from_mode(0o600)).unwrap();
     (root, dir)
 }
 
@@ -860,6 +862,8 @@ fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
     let genesis = testkit::genesis();
     let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
     let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
+    // A5-18: the bridge's ceiling, read at start
+    let ceiling = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("OUTSTANDING_CEIL()")));
     Arc::new(move |method, params| match method {
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
@@ -874,6 +878,8 @@ fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
                 json!({"result": token})
             } else if data.starts_with("0x70a08231") {
                 json!({"result": format!("0x{stock:064x}")})
+            } else if data.starts_with(&ceiling) {
+                json!({"result": format!("0x{:064x}", 10_000_000_000u64)})
             } else {
                 json!({"result": format!("0x{}", "00".repeat(32 * 6))})
             }

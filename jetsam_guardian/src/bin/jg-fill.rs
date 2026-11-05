@@ -10,10 +10,19 @@
 //!
 //! * Egress (A4-1, D60, D66): its nodes and its L1 through Tor or on the loopback only, or it does not
 //!   start; the private rehearsal's clearnet (`[egress] mode = "clearnet"`) to its bridge 10.77.0.0/24 only.
+//! * A5-15: hardened first (no core dump, not dumpable, memory locked when no later allocation can be refused),
+//!   `fill.toml` private to its user (0600 or 0400, its uid: it names `refund_to`), one robot per
+//!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
-//!   the L1 chain id, the bridge's genesis, and the hot key's stock ≤ `max_stock` (else no start).
+//!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, and the hot key's stock ≤ `max_stock`
+//!   (else no start).
+//! * A5-18: every step reads the token's `totalSupply()` and the bridge's `suspectMinted()`: nothing is
+//!   advanced while `suspectMinted() > 0`, nor beyond what the contract's ceiling holds after the mints of the
+//!   robot's own pending advances (C-6 kept prudent).
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
-//!   with its cause. Either way the robot keeps observing, journaling and checking its repayments.
+//!   with its cause. Either way the robot keeps observing, journaling and checking its repayments. A loss
+//!   (its deposit minted to another tuple) halts; an advance not repaid after 72 h is an ALERT only, still
+//!   followed and claimed (A5-16).
 //! * The decision journal `<state_dir>/decisions.jsonl` is public: one signed, chained line per decision
 //!   (why advanced, why refused, repaid, lost, halts), labels and hashes only; `<state_dir>/queue.json`, the
 //!   waiting deposits first in first out (the published queue of the degraded mode), rewritten every step.
@@ -21,7 +30,8 @@
 //!   gas estimate plus a margin, fee caps, written ahead before they leave the host, found again after a stop;
 //!   `jetsam_guardian::l1tx`); only the private rehearsal may still use the endpoint's unlocked TEST account.
 //! * With `relay_final` (the relayer's published `final.json`), the robot claims the repayment of its own
-//!   advances as soon as their root is final on the contract.
+//!   advances as soon as their root is final on the contract; and it advances only a deposit whose block
+//!   body the relayer archived and published beside it (`blocks/<h>-<id>.bin`, read again and checked: A5-7).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -101,6 +111,9 @@ struct State {
     checkpoints: HashMap<String, Checkpoint>,
     /// The observers' states (rate samples, reorganizations), by node name.
     observers: HashMap<String, Value>,
+    /// A5-16: the keys of the pending advances already alerted as not repaid for long (one alert each).
+    #[serde(default)]
+    overdue: HashSet<String>,
 }
 
 struct Robot {
@@ -184,6 +197,16 @@ impl Robot {
         Ok(None)
     }
 
+    /// The amount `AdvanceRepaid(key, txId, refundTo, amount)` minted to the claim owner of advance `key`.
+    fn repaid_amount(&self, key: &[u8; 32]) -> anyhow::Result<Option<u64>> {
+        let filter = json!([{"address": self.bridge, "fromBlock": "0x0", "toBlock": "latest", "topics": [l1::TOPIC_ADVANCE_REPAID, hex0x(key)]}]);
+        let logs = self.l1.rpc("eth_getLogs", filter)?;
+        let Some(lg) = logs.as_array().and_then(|l| l.first()) else { return Ok(None) };
+        let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
+        anyhow::ensure!(data.len() == 32, "AdvanceRepaid data of {} bytes", data.len());
+        Ok(Some(word_u64(&data, 0)))
+    }
+
     /// Read the deposits of the blocks above F that node 0's chain holds and that are not read yet (or
     /// were replaced by a reorganization), with the node's own rule.
     fn scan(&mut self) {
@@ -247,7 +270,10 @@ impl Robot {
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
         let last_switch_at = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
         let caps_raw = self.view("advancerCaps(address)", &l1::address_word(&self.hot))?;
-        let caps = Caps { outstanding: word_u64(&caps_raw, 0), spent24h: word_u64(&caps_raw, 1), stock: self.balance()? };
+        // A5-18: the token's supply under the contract's ceiling, and wJTM minted from abandoned final points
+        let total_supply = fill::u64_saturating(&word(&self.l1.call(&self.token, &l1::selector("totalSupply()"))?, 0));
+        let suspect_minted = word(&self.view("suspectMinted()", &[])?, 0) != [0u8; 32];
+        let caps = Caps { outstanding: word_u64(&caps_raw, 0), spent24h: word_u64(&caps_raw, 1), stock: self.balance()?, total_supply };
         let gas_price = u128::from_str_radix(self.l1.rpc("eth_gasPrice", json!([]))?.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
         // R-6: the contract's tip against every node's chain (the worst)
         let tip = if tip_id == [0u8; 32] {
@@ -277,6 +303,7 @@ impl Robot {
             l1_now,
             tip,
             top_share_pct: fill::top_share_pct(self.observers[0].chain(), self.cfg.params.share_window),
+            suspect_minted,
         };
         let mut g = fill::guard(&gi, &self.cfg.params);
         // an advance whose deposit left the chain: halt
@@ -305,6 +332,7 @@ impl Robot {
         let deposits: Vec<FoundDeposit> = self.state.scanned.values().flat_map(|(_, ds)| ds.clone()).collect();
         let chains: Vec<Chain> = self.observers.iter().map(|o| o.chain().clone()).collect();
         let mut cands = Vec::new();
+        let blocks_dir = self.cfg.relay_blocks_dir();
         for d in deposits {
             let key = hex::encode(d.key());
             if self.state.ledger.has(&d.key()) || self.state.decided.get(&key).is_some_and(|v| v.starts_with("refuse:")) {
@@ -349,7 +377,9 @@ impl Robot {
                     continue;
                 }
             }
-            cands.push(Candidate { dep: d, conf, confirmed_at: self.state.confirmed_at.get(&key).copied(), taken, minted });
+            // A5-7: the relayer's archive of the block (read again only for a confirmed deposit)
+            let published = if conf.is_ok() { fill::published_body(blocks_dir.as_deref(), &d, &self.rules) } else { Err("NOT_CONFIRMED") };
+            cands.push(Candidate { dep: d, conf, confirmed_at: self.state.confirmed_at.get(&key).copied(), taken, minted, published });
         }
         let verdicts = fill::plan(&cands, &self.state.ledger, caps, &g, now, l1_now, min_advance, &self.cfg.params);
         // the published queue (first in, first out; degraded mode when the stock is dry)
@@ -405,19 +435,31 @@ impl Robot {
             }
             return Ok(());
         }
-        let list: Vec<AdvanceOrder> = orders.iter().map(|(_, o, _)| *o).collect();
-        let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
-        let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
-        let receipt = match self.tx.send(&self.l1, &self.bridge, &data, label) {
-            Ok(r) => r,
-            Err(e) => {
-                let text = format!("{e:#}");
-                let reason = text.split("0x").nth(1).and_then(|h| hex::decode(h.get(..8)?).ok()).map(|s| reason_name(&s)).unwrap_or_else(|| "refused".into());
-                log(&format!("advance refused by the contract before sending: {reason} ({text})"));
-                self.journal(json!({"kind": "send_refused", "reason": reason, "orders": list.len(), "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
-                return Ok(());
+        // A5-11: a batch refused for its gas goes again with half of its orders, down to one; the orders
+        // left out are planned again at the next step
+        let mut n = orders.len();
+        let (receipt, list) = loop {
+            let list: Vec<AdvanceOrder> = orders[..n].iter().map(|(_, o, _)| *o).collect();
+            let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
+            let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
+            match self.tx.send(&self.l1, &self.bridge, &data, label) {
+                Ok(r) => break (r, list),
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if let Some(m) = fill::smaller_batch(&text, n) {
+                        log(&format!("batch of {n} refused for its gas, sent again with {m} ({text})"));
+                        self.journal(json!({"kind": "send_refused", "reason": "EXCEEDS_MAX_GAS", "orders": n, "again_with": m, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+                        n = m;
+                        continue;
+                    }
+                    let reason = text.split("0x").nth(1).and_then(|h| hex::decode(h.get(..8)?).ok()).map(|s| reason_name(&s)).unwrap_or_else(|| "refused".into());
+                    log(&format!("advance refused by the contract before sending: {reason} ({text})"));
+                    self.journal(json!({"kind": "send_refused", "reason": reason, "orders": list.len(), "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+                    return Ok(());
+                }
             }
         };
+        let orders = &orders[..n];
         if !receipt.status {
             log(&format!("advance transaction reverted: {}", receipt.tx_hash));
             self.journal(json!({"kind": "send_reverted", "orders": list.len(), "l1_tx": receipt.tx_hash, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
@@ -524,12 +566,24 @@ impl Robot {
             let at = word_u64(&v, 5);
             if status == 2 {
                 self.state.ledger.advances[i].status = AdvanceStatus::Repaid;
-                log(&format!("REPAID key {} ({} µJTM to the claim owner {})", hex::encode(a.key), a.amount, hex0x(&word_addr(&v, 0))));
-                self.journal(json!({"kind": "repaid", "key": hex::encode(a.key), "amount": a.amount, "claim_owner": hex0x(&word_addr(&v, 0)), "l1_t": l1_now}));
+                // A5-1: a mint less than ADVANCE_MIN_AGE after the advance repays only what the advance paid
+                // (the recipient gets the fee): the amount minted to the claim owner is AdvanceRepaid's
+                let repaid = self.repaid_amount(&a.key).unwrap_or_else(|e| {
+                    log(&format!("AdvanceRepaid of key {} not read: {e:#}", hex::encode(a.key)));
+                    None
+                });
+                let shown = repaid.map_or_else(|| "?".to_string(), |r| r.to_string());
+                log(&format!("REPAID key {} (advanced {} µJTM, {shown} µwJTM minted to the claim owner {})", hex::encode(a.key), a.amount, hex0x(&word_addr(&v, 0))));
+                self.journal(json!({"kind": "repaid", "key": hex::encode(a.key), "amount": a.amount, "repaid": repaid, "claim_owner": hex0x(&word_addr(&v, 0)), "l1_t": l1_now}));
                 continue;
             }
             let minted = word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1;
-            if let Some(code) = fill::loss(status, minted, l1_now, at, &self.cfg.params) {
+            // A5-16: not repaid for long is an alert (once), the advance stays pending, followed and claimed
+            if fill::overdue(status, minted, l1_now, at, &self.cfg.params) && self.state.overdue.insert(hex::encode(a.key)) {
+                log(&format!("ALERT key {}: ALERT_NOT_REPAID_72H (still pending, still followed and claimed)", hex::encode(a.key)));
+                self.journal(json!({"kind": "alert", "key": hex::encode(a.key), "reason": "ALERT_NOT_REPAID_72H", "amount": a.amount, "at": at, "l1_t": l1_now}));
+            }
+            if let Some(code) = fill::loss(status, minted) {
                 self.state.ledger.advances[i].status = AdvanceStatus::Lost(code.into());
                 let reason = format!("HALT_ADVANCE_LOST:{code}");
                 log(&format!("LOST key {}: {code}", hex::encode(a.key)));
@@ -576,6 +630,19 @@ fn run() -> anyhow::Result<()> {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
+    // A5-15: hardened before anything is read (the hot key, fill.toml)
+    let h = jetsam_guardian::harden::harden();
+    log(&format!(
+        "hardened: dumpable {}, core dumps {}, memory {}",
+        if h.dumpable_off { "off" } else { "ON (prctl refused)" },
+        if h.core_off { "off" } else { "ON (setrlimit refused)" },
+        match &h.memory_locked {
+            Ok(()) => "locked".to_string(),
+            Err(why) => format!("NOT locked ({why})"),
+        }
+    ));
+    anyhow::ensure!(h.dumpable_off && h.core_off, "the process cannot be hardened: jg-fill does not start");
+    fill::check_config_file(&path)?;
     let text = std::fs::read_to_string(&path)?;
     let digest: [u8; 32] = {
         use sha2::Digest;
@@ -585,15 +652,22 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config {} sha256 {}", path.display(), hex::encode(digest)));
     let rules = VaultRules::current();
     cfg.build_matches(&rules)?;
+    match cfg.relay_blocks_dir() {
+        Some(dir) => log(&format!("deposit bodies: the relayer's archive {} (A5-7: none advanced before it is published there)", dir.display())),
+        None => log("WARNING no relay_final: no deposit is advanced (A5-7: the relayer's published archive of each deposit body is required)"),
+    }
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?} ({}), {} nodes, dry_run {}", cfg.profile()?, cfg.nodes.len(), cfg.dry_run));
     std::fs::create_dir_all(&cfg.state_dir)?;
+    // A5-15: one robot per state_dir, held until the end
+    let _lock = fill::lock_state_dir(&cfg.state_dir)?;
     let l1 = L1::via(&cfg.l1_rpc, egress);
     let chain_id = l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
     anyhow::ensure!(chain_id == cfg.l1_chain_id, "the L1 endpoint is chain {chain_id}, not {}: jg-fill does not start", cfg.l1_chain_id);
     let bridge = hex0x(&fill::parse20(&cfg.l1_bridge)?);
     let token = hex0x(&word_addr(&l1.call(&bridge, &l1::selector("token()"))?, 0));
     anyhow::ensure!(token != hex0x(&[0u8; 20]), "the bridge {bridge} answers no token: jg-fill does not start");
+    fill::check_ceiling(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0)))?;
     let hot = cfg.hot()?;
     let mut probe = l1::selector("balanceOf(address)").to_vec();
     probe.extend_from_slice(&l1::address_word(&hot));
@@ -622,7 +696,11 @@ fn run() -> anyhow::Result<()> {
         observers.push(Observer::new(ocfg, Chain::from_genesis(genesis))?);
         clients.push(c);
     }
-    let state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let reopened = state.ledger.reopen_overdue();
+    if reopened > 0 {
+        log(&format!("{reopened} advance(s) noted LOST_NOT_REPAID_72H by an older robot are pending again (A5-16: an alert, never a loss)"));
+    }
     for (o, n) in observers.iter_mut().zip(&cfg.nodes) {
         if let Some(v) = state.observers.get(&n.name) {
             if let Err(e) = o.import_state(v) {

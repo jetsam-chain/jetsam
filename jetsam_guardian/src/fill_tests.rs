@@ -287,6 +287,7 @@ fn quiet(now: u64) -> GuardInput {
         l1_now: now,
         tip: TipCheck::Ours,
         top_share_pct: 40,
+        suspect_minted: false,
     }
 }
 
@@ -495,11 +496,12 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
         confirmed_at: Some(NOW - 1_000),
         taken: false,
         minted: false,
+        published: Ok(()),
     }
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0 }
 }
 
 fn open() -> Guard {
@@ -655,19 +657,44 @@ fn a_halt_or_a_pause_advances_nothing() {
 fn one_plan_advances_at_most_one_batch() {
     let cands: Vec<Candidate> = (0..40).map(|i| cand(10 + i, 1, i as u8, 5 * JTM)).collect();
     let v = run(&cands, &Ledger::default(), caps());
-    assert_eq!(v.iter().filter(|x| **x == Verdict::Advance).count(), MAX_ADVANCE_BATCH);
-    assert_eq!(v[MAX_ADVANCE_BATCH], Verdict::Wait("NEXT_BATCH"));
+    let n = FillParams::default().batch_max;
+    assert_eq!(v.iter().filter(|x| **x == Verdict::Advance).count(), n);
+    assert_eq!(v[n], Verdict::Wait("NEXT_BATCH"));
 }
 
 // ---------------------------------------------------------------- losses, stock, parameters
 
+/// A5-16: a loss is a mint of the deposit to another tuple only (it halts, latched); a pending advance not
+/// repaid after `loss_after_secs` (72 h) is an alert: still pending, still followed, still claimed.
 #[test]
-fn a_loss_is_noted_after_72h_or_when_another_tuple_was_minted() {
+fn a5_16_only_a_mint_to_another_tuple_is_a_loss_an_old_pending_advance_is_an_alert() {
     let p = FillParams::default();
-    assert_eq!(loss(1, true, NOW, NOW - 10, &p), Some("LOST_MINTED_TO_ANOTHER_TUPLE"));
-    assert_eq!(loss(1, false, NOW, NOW - p.loss_after_secs - 1, &p), Some("LOST_NOT_REPAID_72H"));
-    assert_eq!(loss(1, false, NOW, NOW - p.loss_after_secs, &p), None);
-    assert_eq!(loss(2, true, NOW, NOW - 10 * p.loss_after_secs, &p), None, "repaid");
+    assert_eq!(loss(1, true), Some("LOST_MINTED_TO_ANOTHER_TUPLE"));
+    assert_eq!(loss(1, false), None, "72 h unrepaid is no loss");
+    assert_eq!(loss(1, false), None);
+    assert_eq!(loss(2, true), None, "repaid");
+    assert!(overdue(1, false, NOW, NOW - p.loss_after_secs - 1, &p));
+    assert!(!overdue(1, false, NOW, NOW - p.loss_after_secs, &p));
+    assert!(!overdue(1, true, NOW, NOW - p.loss_after_secs - 1, &p), "minted elsewhere: a loss, not an alert");
+    assert!(!overdue(2, false, NOW, NOW - 10 * p.loss_after_secs, &p), "repaid");
+}
+
+/// A5-16: the advances an older robot noted lost after 72 h only are followed (and claimed) again; a mint
+/// to another tuple stays a loss.
+#[test]
+fn a5_16_advances_noted_lost_for_72h_only_are_followed_again() {
+    let mut l = Ledger {
+        advances: vec![
+            advanced(1, 0xa1, 7 * JTM, AdvanceStatus::Lost("LOST_NOT_REPAID_72H".into())),
+            advanced(2, 0xa2, 7 * JTM, AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into())),
+            advanced(3, 0xa3, 7 * JTM, AdvanceStatus::Repaid),
+            advanced(4, 0xa4, 7 * JTM, AdvanceStatus::Pending),
+        ],
+    };
+    assert_eq!(l.reopen_overdue(), 1);
+    let st: Vec<AdvanceStatus> = l.advances.iter().map(|a| a.status.clone()).collect();
+    assert_eq!(st, vec![AdvanceStatus::Pending, AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into()), AdvanceStatus::Repaid, AdvanceStatus::Pending]);
+    assert_eq!(l.reopen_overdue(), 0);
 }
 
 #[test]
@@ -680,11 +707,11 @@ fn a_hot_key_holding_more_than_its_cap_refuses_to_start() {
 #[test]
 fn parameters_below_their_floors_are_refused() {
     let strict = crate::Profile::Mainnet;
-    assert!(FillParams::default().check(strict).is_ok());
+    assert!(FillParams::default().check(strict, 3_000_000, 25).is_ok());
     let bad = |f: &dyn Fn(&mut FillParams)| {
         let mut p = FillParams::default();
         f(&mut p);
-        p.check(strict).is_err()
+        p.check(strict, 3_000_000, 25).is_err()
     };
     assert!(bad(&|p| p.confirmations = 7));
     assert!(bad(&|p| p.min_nodes = 1));
@@ -701,9 +728,9 @@ fn parameters_below_their_floors_are_refused() {
     let mut p = FillParams::default();
     p.share_halt_pct = 100;
     p.switch_pause_secs = 300;
-    assert!(p.check(crate::Profile::PrivateRehearsal).is_ok());
+    assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_ok());
     p.confirmations = 7;
-    assert!(p.check(crate::Profile::PrivateRehearsal).is_err());
+    assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_err());
 }
 
 // ---------------------------------------------------------------- evidence and journal
@@ -768,7 +795,8 @@ fn g6_matches_v4_bytes_node_vectors_are_stable() {
     assert_eq!(on_disk, text, "the node-side vectors changed: G6 = V4 must be re-checked on every implementation");
 }
 
-fn g6_vectors() -> serde_json::Value {
+/// The 13 cases of `g6_v4_vectors.json`.
+fn g6_cases() -> Vec<(&'static str, Block)> {
     let mut reserved = deposit_marker(&rcpt(0xa1));
     reserved.0[31] = 1;
     let with_value = |amount: u64| {
@@ -792,8 +820,12 @@ fn g6_vectors() -> serde_json::Value {
         ("refused_v5_marker_with_value", block_of(F + 1, vec![with_value(7 * JTM)])),
         ("refused_vault_output_without_marker", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 7 * JTM)])])),
     ];
+    cases
+}
+
+fn g6_vectors() -> serde_json::Value {
     let mut out = Vec::new();
-    for (name, b) in cases {
+    for (name, b) in g6_cases() {
         let (raw, id) = raw_and_id(&b);
         // the 323-byte pages as the block carries them (a coinbase as a body, the others as `TxPage`)
         let pages: Vec<String> = b
@@ -889,7 +921,8 @@ fn development_payout(owners: [Address; 2]) -> Transaction {
     })
 }
 
-fn g6_edge_vectors() -> serde_json::Value {
+/// The cases of `g6_v4_vectors_edges.json` (name, rule, block).
+fn g6_edge_cases() -> Vec<(&'static str, &'static str, Block)> {
     use jetsam_chain::consensus::vault::{VaultRelease, LIGHT_CLIENT_UPDATE_MARKER_TAG, RELEASE_FEE_MICRO};
     let marker = |r: u8| deposit_marker(&rcpt(r));
     let reserved = |byte: usize| {
@@ -975,9 +1008,13 @@ fn g6_edge_vectors() -> serde_json::Value {
         ("x_three_deposits_one_block", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM - 1), deposit_tx(100, rcpt(0xc3), 1_000 * JTM)], &[])),
         ("x_payment_only", "V4", one(F + 1, logical(1, PAYER, &[pay(0x77, 3 * JTM)]))),
     ];
+    cases
+}
+
+fn g6_edge_vectors() -> serde_json::Value {
     let mut out = Vec::new();
     let mut names = std::collections::HashSet::new();
-    for (name, rule, b) in cases {
+    for (name, rule, b) in g6_edge_cases() {
         assert!(names.insert(name), "{name} twice");
         let decision = |r: anyhow::Result<Vec<FoundDeposit>>| match r {
             Ok(found) => serde_json::json!({
@@ -1266,4 +1303,287 @@ fn the_robot_claims_only_its_pending_advances_whose_exact_tuple_is_in_the_final_
     }
     assert_eq!(own_claims(&ledger, &deps, &minted, 1).len(), 1, "at most max");
     assert!(own_claims(&ledger, &deps, &|_| true, 4).is_empty());
+}
+
+// ---------------------------------------------------------------- audit A5
+
+/// A5-11: `(21 000 + n × 97 800) × (100 + margin) / 100 ≤ max_gas`, at most the contract's 32 (the gas
+/// measured for `advanceBatch`, `ADVANCER_INTERFACE.md` §10: 3 orders, 293 340 gas).
+#[test]
+fn a5_11_a_batch_is_bounded_by_the_signers_gas_cap_with_its_margin() {
+    // (21 000 + 24 × 97 800) × 1.25 = 2 960 250 ≤ 3 000 000 < (21 000 + 25 × 97 800) × 1.25 = 3 082 500
+    assert_eq!(batch_gas_bound(3_000_000, 25), 24);
+    // × 1.10: 27 orders 2 927 760, 28 orders 3 035 340
+    assert_eq!(batch_gas_bound(3_000_000, 10), 27);
+    // exactly at the cap: (21 000 + 24 × 97 800) × 1.25 = 2 960 250
+    assert_eq!(batch_gas_bound(2_960_250, 25), 24);
+    assert_eq!(batch_gas_bound(2_960_249, 25), 23);
+    assert_eq!(batch_gas_bound(30_000_000, 25), MAX_ADVANCE_BATCH, "never above the contract's 32");
+    assert_eq!(batch_gas_bound(148_500, 25), 1);
+    assert_eq!(batch_gas_bound(148_499, 25), 0, "not even one order");
+    // the default batch fits the default signer (3 000 000, 25 %), with one order of room
+    let p = FillParams::default();
+    let fee = crate::l1tx::FeePolicy::default();
+    assert_eq!((fee.max_gas, fee.gas_margin_pct), (3_000_000, 25));
+    assert_eq!(p.batch_max, 23);
+    assert!(fee.gas_limit(TX_BASE_GAS + p.batch_max as u64 * BATCH_ORDER_GAS).is_ok());
+    assert!(fee.gas_limit(TX_BASE_GAS + 25 * BATCH_ORDER_GAS).is_err(), "the audit's 25 orders exceed max_gas");
+}
+
+#[test]
+fn a5_11_a_batch_above_the_gas_bound_does_not_start() {
+    let strict = crate::Profile::Mainnet;
+    let with = |n: usize| FillParams { batch_max: n, ..FillParams::default() };
+    assert!(with(24).check(strict, 3_000_000, 25).is_ok());
+    let e = with(25).check(strict, 3_000_000, 25).unwrap_err().to_string();
+    assert!(e.contains("batch_max 25") && e.contains("max_gas"), "{e}");
+    assert!(with(32).check(strict, 3_000_000, 25).is_err());
+    assert!(with(1).check(strict, 148_499, 25).is_err(), "a cap below one order");
+    // through fill.toml: the signer's max_gas bounds the default batch
+    let tight = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\nmax_gas = 2000000\n");
+    let e = FillConfig::parse(&tight).unwrap_err().to_string();
+    assert!(e.contains("batch_max") && e.contains("does not start"), "{e}");
+    let fits = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 16\n[signer]\nmax_gas = 2000000\n");
+    assert!(FillConfig::parse(&fits).is_ok());
+    // without [signer] (the rehearsal's endpoint account): the default signer's bound, 24
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 24\n")).is_ok());
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 25\n")).unwrap_err().to_string();
+    assert!(e.contains("batch_max 25"), "{e}");
+}
+
+/// A5-11: refused for its gas, the batch is sent again with half of its orders, down to one; any other
+/// refusal is not retried.
+#[test]
+fn a5_11_a_batch_refused_for_its_gas_is_halved_down_to_one() {
+    // the refusal is l1tx's own text
+    let refusal = crate::l1tx::FeePolicy::default().gas_limit(2_500_000).unwrap_err().to_string();
+    assert_eq!(smaller_batch(&refusal, 23), Some(12));
+    assert_eq!(smaller_batch(&refusal, 12), Some(6));
+    assert_eq!(smaller_batch(&refusal, 3), Some(2));
+    assert_eq!(smaller_batch(&refusal, 2), Some(1));
+    assert_eq!(smaller_batch(&refusal, 1), None, "one order: nothing smaller");
+    assert_eq!(smaller_batch("reverts: server error: execution reverted 0xff7c2768", 23), None);
+    assert_eq!(smaller_batch("base fee 9 + priority 1 wei/gas above the cap 5: not sent", 23), None);
+}
+
+/// A5-18 (C-6 kept prudent): the contract mints while `totalSupply + amount ≤ OUTSTANDING_CEIL`; the robot
+/// advances only what the ceiling still holds after the slow mints of its own pending advances.
+#[test]
+fn a5_18_an_advance_needs_room_under_the_supply_ceiling_after_the_robots_pending_advances() {
+    // a pending advance of 300 JTM outside the hour and recipient windows: only the ceiling sees it
+    let l = ledger_with(&[(1, 300 * JTM, NOW - 100_000)]);
+    assert_eq!(l.pending_sum(), 300 * JTM);
+    let c = cand(10, 1, 2, 200 * JTM);
+    let supply = |s: u64| Caps { total_supply: s, ..caps() };
+    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM)), vec![Verdict::Advance], "10 000 − 9 500 − 300 = 200");
+    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c.clone()], &l, supply(u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")], "a supply above the ceiling");
+    // repaid or lost advances are minted already (in totalSupply): they are not counted twice
+    let mut done = ledger_with(&[(1, 300 * JTM, NOW - 100_000), (3, 100 * JTM, NOW - 100_000)]);
+    done.advances[0].status = AdvanceStatus::Repaid;
+    done.advances[1].status = AdvanceStatus::Lost("LOST_MINTED_TO_ANOTHER_TUPLE".into());
+    assert_eq!(done.pending_sum(), 0);
+    assert_eq!(run(&[c.clone()], &done, supply(9_800 * JTM)), vec![Verdict::Advance]);
+    // within one plan the batch counts itself, and the wait keeps the queue's order
+    let cands = vec![cand(10, 1, 2, 150 * JTM), cand(11, 1, 3, 100 * JTM), cand(12, 1, 4, 5 * JTM)];
+    let v = run(&cands, &l, supply(9_500 * JTM));
+    assert_eq!(v, vec![Verdict::Advance, Verdict::Wait("SUPPLY_CEILING"), Verdict::Wait("QUEUED_BEHIND")]);
+}
+
+#[test]
+fn a5_18_wjtm_minted_from_abandoned_final_points_pauses() {
+    let p = FillParams::default();
+    let mut s = quiet(NOW);
+    s.suspect_minted = true;
+    let g = guard(&s, &p);
+    assert_eq!((g.halt.as_deref(), g.pause.as_deref()), (None, Some("PAUSE_SUSPECT_MINTED")), "a pause: not latched, lifts with its cause");
+    assert_eq!(plan(&[cand(10, 1, 1, 7 * JTM)], &Ledger::default(), caps(), &g, NOW, NOW, 5 * JTM, &p), vec![Verdict::Wait("PAUSED")]);
+}
+
+#[test]
+fn a5_18_the_ceiling_read_on_the_bridge_is_the_nodes_v8_ceiling() {
+    use jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO;
+    assert_eq!(OUTSTANDING_CEIL, VAULT_OUTSTANDING_CEIL_MICRO);
+    assert!(check_ceiling(10_000 * JTM).is_ok());
+    for bad in [10_000 * JTM + 1, 10_000 * JTM - 1, 0, u64::MAX] {
+        assert!(check_ceiling(bad).unwrap_err().to_string().contains("does not start"), "{bad}");
+    }
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&(10_000 * JTM).to_be_bytes());
+    assert_eq!(u64_saturating(&w), 10_000 * JTM);
+    w[23] = 1;
+    assert_eq!(u64_saturating(&w), u64::MAX, "a uint256 above u64 saturates");
+    w = [0u8; 32];
+    w[0] = 0x80;
+    assert_eq!(u64_saturating(&w), u64::MAX);
+}
+
+/// A5-7: a deposit is advanced only when the relayer archived and published its block's body (read again and
+/// checked: its id, its body against its header, the deposit in it); otherwise it waits.
+#[test]
+fn a5_7_only_a_deposit_whose_block_body_the_relayer_published_is_advanced() {
+    let b = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM), deposit_tx(200, rcpt(0xb2), 9 * JTM)]);
+    let (raw, id) = raw_and_id(&b);
+    let d = deposits_of_block(&raw, &id, &rules()).unwrap()[1];
+    let dir = tempfile::tempdir().unwrap();
+    let blocks = dir.path().join("blocks");
+    std::fs::create_dir_all(&blocks).unwrap();
+    let file = blocks.join(format!("{}-{}.bin", F + 1, hex::encode(id)));
+    assert_eq!(published_body(None, &d, &rules()), Err("BODY_NOT_PUBLISHED"), "no relayer configured");
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("BODY_NOT_PUBLISHED"), "not published yet");
+    std::fs::write(&file, &raw).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Ok(()));
+    // another block's bytes under this name, a body its header does not commit to, garbage: fail-closed
+    let (other, _) = raw_and_id(&block_of(F + 2, vec![deposit_tx(100, rcpt(0xa1), 9 * JTM)]));
+    std::fs::write(&file, &other).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    let mut forged = b.clone();
+    forged.transactions = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM), deposit_tx(200, rcpt(0xb2), 8 * JTM)]).transactions;
+    std::fs::write(&file, forged.to_bytes()).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    std::fs::write(&file, &raw[..raw.len() - 1]).unwrap();
+    assert_eq!(published_body(Some(&blocks), &d, &rules()), Err("PUBLISHED_BODY_MISMATCH"));
+    // the right block, but not this deposit's tuple
+    std::fs::write(&file, &raw).unwrap();
+    for wrong in [FoundDeposit { amount: 9 * JTM + 1, ..d }, FoundDeposit { recipient: rcpt(0xa1), ..d }, FoundDeposit { txid: [0x3a; 32], ..d }, FoundDeposit { group: 0, ..d }] {
+        assert_eq!(published_body(Some(&blocks), &wrong, &rules()), Err("PUBLISHED_BODY_MISMATCH"), "{wrong:?}");
+    }
+    // in the plan: a wait (never a refusal), that does not hold the queue behind it
+    let mut c = cand(10, 1, 1, 7 * JTM);
+    c.published = Err("BODY_NOT_PUBLISHED");
+    assert_eq!(run(&[c.clone(), cand(11, 1, 2, 7 * JTM)], &Ledger::default(), caps()), vec![Verdict::Wait("BODY_NOT_PUBLISHED"), Verdict::Advance]);
+    c.published = Err("PUBLISHED_BODY_MISMATCH");
+    assert_eq!(run(&[c], &Ledger::default(), caps()), vec![Verdict::Wait("PUBLISHED_BODY_MISMATCH")]);
+}
+
+/// A5-7: the relayer publishes its archive beside its `final.json`.
+#[test]
+fn a5_7_the_relayers_blocks_are_beside_its_final_json() {
+    let c = FillConfig::parse(&rehearsal("relay_final = \"/srv/relay/publish/final.json\"\n[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
+    assert_eq!(c.relay_blocks_dir(), Some(std::path::PathBuf::from("/srv/relay/publish/blocks")));
+    let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
+    assert_eq!(c.relay_blocks_dir(), None);
+}
+
+/// A5-15: fill.toml (it names the claim owner of every repayment) is private to the robot's user.
+#[test]
+fn a5_15_fill_toml_must_be_private_to_the_robots_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fill.toml");
+    std::fs::write(&path, "network = \"x\"\n").unwrap();
+    for mode in [0o600, 0o400] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(check_config_file(&path).is_ok(), "{mode:o}");
+    }
+    for mode in [0o644, 0o640, 0o604, 0o660, 0o620, 0o602, 0o700, 0o4600] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let e = check_config_file(&path).unwrap_err().to_string();
+        assert!(e.contains("0600") && e.contains("does not start"), "{mode:o}: {e}");
+    }
+    assert!(check_config_file(&dir.path().join("absent.toml")).is_err());
+    // another owner (the test host runs as root, which may chown)
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::os::unix::fs::chown(&path, Some(4242), None).is_ok() {
+        let e = check_config_file(&path).unwrap_err().to_string();
+        assert!(e.contains("uid 4242"), "{e}");
+    }
+}
+
+/// A5-15: a second jg-fill on the same state_dir does not start.
+#[test]
+fn a5_15_one_robot_per_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = lock_state_dir(dir.path()).unwrap();
+    let e = lock_state_dir(dir.path()).unwrap_err().to_string();
+    assert!(e.contains("another jg-fill") && e.contains("does not start"), "{e}");
+    drop(first);
+    assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
+}
+
+// ---------------------------------------------------------------- the robot's activation gate (A5-12)
+
+/// **The activation gate of the robot `jg-fill`** (A5-12, CI): green, the robot may advance; red, it must not
+/// be activated. On the very files the proof program replays (`jetsam_bridge_program/core/tests/g6_v4_vectors.rs`:
+/// `tests/fixtures/g6_v4_vectors.json`, 13, and `g6_v4_vectors_edges.json`, 40; checked here to be exactly what
+/// these cases give), the robot (its own path: `deposits_in_block`, the node's `validate_block_vault`) and the
+/// proof program (`deposit::try_block_deposits` on the same pages) decide the same deposits with ONE logical
+/// txid, `jetsam_vault_rule::txid`, which is leaf by leaf the chain's consensus txid (`jetsam_tx`, through
+/// `try_compute_logical_txids`). A bit of difference and the slow mint pays under another key: the advance is
+/// never repaid.
+#[test]
+fn robot_activation_gate_node_program_and_robot_decide_the_g6_vectors_with_one_txid() {
+    use jetsam_bridge_program::deposit::{try_block_deposits, DepositRule};
+    use jetsam_chain::block::{try_compute_logical_txids, validate_block_page_stream};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for (file, value) in [("g6_v4_vectors.json", g6_vectors()), ("g6_v4_vectors_edges.json", g6_edge_vectors())] {
+        let on_disk = std::fs::read_to_string(dir.join(file)).unwrap();
+        assert_eq!(on_disk, serde_json::to_string_pretty(&value).unwrap() + "\n", "{file}: the program's file is these cases");
+    }
+    let (base, edges) = (g6_cases(), g6_edge_cases());
+    assert_eq!((base.len(), edges.len()), (13, 40));
+    let all: Vec<(&str, Block)> = base.into_iter().chain(edges.into_iter().map(|(n, _, b)| (n, b))).collect();
+    let rule = DepositRule { deposits_from_height: Some(F), ..DepositRule::for_activation(Some(J)) };
+    let mut deposits = 0;
+    for (name, b) in &all {
+        let pages: Vec<Vec<u8>> = b
+            .transactions
+            .iter()
+            .map(|t| if t.body.is_coinbase { t.body.to_bytes().to_vec() } else { jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().unwrap().to_vec() })
+            .collect();
+        let refs: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+        // 1. the vault rule's txid of every leaf (a system record: its body hash; a group: its logical txid) is
+        //    the chain's consensus txid
+        let stream = validate_block_page_stream(&b.transactions).unwrap();
+        let user = stream.user_start_index;
+        let mut ours: Vec<[u8; 32]> = refs[..user].iter().map(|p| jetsam_vault_rule::txid::body_hash(p)).collect();
+        for g in &stream.groups {
+            ours.push(jetsam_vault_rule::txid::logical_txid(&refs[user + usize::from(g.start_page)..user + g.end_page_exclusive()]));
+        }
+        let chain: Vec<[u8; 32]> = try_compute_logical_txids(&b.transactions).unwrap().iter().map(|t| t.0).collect();
+        assert_eq!(ours, chain, "{name}: the vault rule's txids are the chain's");
+        // 2. the robot and the program: the same deposits, under the vault rule's txid of their group
+        let robot = deposits_in_block(b, &rules());
+        let program = try_block_deposits(b.header.height, &b.header.tx_root, &refs, &rule);
+        match (&robot, &program) {
+            (Ok(r), Ok(p)) => {
+                let r: Vec<(u32, [u8; 32], [u8; 20], u64)> = r.iter().map(|d| (d.group, d.txid, d.recipient, d.amount)).collect();
+                let p: Vec<(u32, [u8; 32], [u8; 20], u64)> = p.iter().map(|d| (d.group, d.txid, d.recipient, d.amount)).collect();
+                assert_eq!(r, p, "{name}: the robot and the program");
+                for (group, txid, _, _) in &r {
+                    assert_eq!(*txid, ours[user + *group as usize], "{name}: group {group}");
+                }
+                deposits += r.len();
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!("{name}: robot {robot:?}, program {program:?}"),
+        }
+    }
+    assert_eq!(deposits, 17, "the deposits of the accepted vectors");
+}
+
+/// The activation gate, structurally: neither the proof program nor the robot defines the sponge, the body hash
+/// or the paged-spend txid; `jetsam_vault_rule` does, and the robot's deposits take its txid.
+#[test]
+fn robot_activation_gate_the_logical_txid_has_one_implementation() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let defs = ["fn paged_spend_txid", "fn body_hash", "struct Sponge", "fn compress_with_tag", "fn logical_txid("];
+    for dir in ["jetsam_bridge_program/core/src", "jetsam_guardian/src"] {
+        for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") || path.file_name().is_some_and(|n| n == "fill_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for d in defs {
+                assert!(!text.contains(d), "{} defines `{d}`: the txid has one implementation, jetsam_vault_rule::txid", path.display());
+            }
+        }
+    }
+    let vault = std::fs::read_to_string(root.join("jetsam_vault_rule/src/txid.rs")).unwrap() + &std::fs::read_to_string(root.join("jetsam_vault_rule/src/p2b.rs")).unwrap();
+    for d in defs {
+        assert!(vault.contains(d), "jetsam_vault_rule defines `{d}`");
+    }
+    let fill = std::fs::read_to_string(root.join("jetsam_guardian/src/fill.rs")).unwrap();
+    assert!(fill.contains("jetsam_vault_rule::txid::logical_txid"), "the robot's deposits take the vault rule's txid");
 }

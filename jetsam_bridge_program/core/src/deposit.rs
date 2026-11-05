@@ -20,6 +20,7 @@ use crate::tx;
 use alloc::vec::Vec;
 
 pub use jetsam_vault_rule::{DepositRule, RuleError, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO, VAULT_ADDRESS};
+use jetsam_vault_rule::Group;
 
 /// J of the v1.7 clock this program is built for: `V1_7_ACTIVATION_HEIGHT` of the node's profile of the
 /// same name (default and test network: none yet, so no deposit is valid; private rehearsal: 96). The
@@ -39,7 +40,8 @@ compile_error!("rehearsal-v1-7 and test-clock-j69120 are two clocks");
 /// V4 under this program's clock and the definitive constants (vault, amounts, `F = J + delay`).
 pub const DEPOSIT_RULE: DepositRule = DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT);
 
-/// A deposit of a block, as the program proves it: its user group, logical txid, recipient, amount.
+/// A deposit of a block, as the program proves it: its user group, logical txid (`jetsam_vault_rule`'s, the
+/// one the robot advances under, A5-12), recipient, amount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockDeposit {
     pub group: u32,
@@ -103,12 +105,11 @@ pub fn try_block_deposits(height: u64, tx_root: &[u8; 32], pages: &[&[u8]], rule
     let system_owners: Vec<[u8; 32]> = system.iter().map(|(owner, _)| *owner).collect();
 
     // The groups: START .. first END, one input owner, no coinbase.
-    let mut groups: Vec<([u8; 32], Vec<([u8; 32], u64)>)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     let mut i = user_start;
     while i < pages.len() {
         let start = i;
         let owner = input_owner(pages[start]);
-        let mut hashes = Vec::new();
         let mut outputs = Vec::new();
         loop {
             let Some(page) = pages.get(i) else {
@@ -124,15 +125,16 @@ pub fn try_block_deposits(height: u64, tx_root: &[u8; 32], pages: &[&[u8]], rule
             if input_owner(page) != owner {
                 return Err(BlockError::Body("input owner"));
             }
-            hashes.push(tx::body_hash(page));
             live_outputs(page, &mut outputs);
             i += 1;
             if bitmap & tx::PAGED_SPEND_END_BIT != 0 {
                 break;
             }
         }
-        leaves.push(tx::paged_spend_txid(&hashes));
-        groups.push((owner, outputs));
+        // the vault rule's logical txid (A5-12): the tree's leaf, and the key of the group's deposit
+        let txid = jetsam_vault_rule::txid::logical_txid(&pages[start..i]);
+        leaves.push(txid);
+        groups.push(Group { input_owner: owner, outputs, txid });
     }
     if leaves.len() > tx::TX_TREE_LEAVES {
         return Err(BlockError::Body("tx tree leaves"));
@@ -145,7 +147,7 @@ pub fn try_block_deposits(height: u64, tx_root: &[u8; 32], pages: &[&[u8]], rule
         .iter()
         .map(|d| BlockDeposit {
             group: d.group as u32,
-            txid: leaves[user_start + d.group],
+            txid: d.txid,
             recipient: d.recipient,
             amount: d.amount,
         })

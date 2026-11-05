@@ -41,11 +41,22 @@ pub const ADVANCE_MIN_AMOUNT: u64 = 1_000_000;
 pub const SLOW_PER_DEPOSIT: u64 = 1_000_000_000;
 /// A-3.
 pub const MAX_FILL_FEE_BPS: u16 = 100;
+/// C-6 of the contract: it mints while `token().totalSupply() + amount ≤ OUTSTANDING_CEIL` (`OUTSTANDING_CEIL()`,
+/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start).
+pub const OUTSTANDING_CEIL: u64 = 10_000_000_000;
 /// A-13, A-14: the contract's caps per advancer.
 pub const ADVANCE_OUTSTANDING_CAP: u64 = 3_000_000_000;
 pub const ADVANCE_CAP_24H: u64 = 2_500_000_000;
 /// AB-1.
 pub const MAX_ADVANCE_BATCH: usize = 32;
+/// A5-11: the gas of a transaction, and of one order of `advanceBatch` on top of it (measured,
+/// `ADVANCER_INTERFACE.md` §10: 3 orders to fresh recipients, 293 340 gas in all, ≈ 97 780 an order
+/// with the transaction's 21 000 included; counted here on top of it).
+pub const TX_BASE_GAS: u64 = 21_000;
+pub const BATCH_ORDER_GAS: u64 = 97_800;
+/// The default batch: 23 orders (`(21 000 + 23 × 97 800) × 1.25 = 2 838 000` gas under the default
+/// `max_gas` of 3 000 000, one order of room below [`batch_gas_bound`]'s 24).
+pub const DEFAULT_ADVANCE_BATCH: usize = 23;
 /// The floors no configuration lowers: the nodes' finality (8 blocks), two nodes.
 pub const CONFIRMATIONS_FLOOR: u64 = 8;
 pub const MIN_NODES_FLOOR: usize = 2;
@@ -117,7 +128,8 @@ pub fn deposits_of_block(raw: &[u8], expected_id: &[u8; 32], rules: &VaultRules)
 }
 
 /// [`deposits_of_block`] on a block already decoded: its body against its header's `tx_root`, then the
-/// node's rule in the same permissive context.
+/// node's rule in the same permissive context; each deposit under the vault rule's logical txid
+/// (`jetsam_vault_rule::txid`, the proof program's), checked equal to the chain's.
 pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Vec<FoundDeposit>> {
     let id = block_id(&block.header);
     let height = block.header.height;
@@ -139,19 +151,30 @@ pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Ve
     let ctx = VaultContext { released: &released, released_in_window: 0, bridge_locked: taken, bridge_vault_floor: 0 };
     let effect = validate_block_vault(block, &ctx, rules, &mut |_| Ok(()))
         .map_err(|e| anyhow::anyhow!("the node's vault rule refuses block {height}: {e:?}"))?;
-    Ok(effect
+    effect
         .deposits
         .iter()
-        .map(|d| FoundDeposit {
-            height,
-            group: d.group as u32,
-            block_id: id,
-            txid: stream.groups[d.group].spend.logical_txid.0,
-            recipient: d.recipient,
-            amount: d.amount,
-            block_ts: block.header.timestamp,
+        .map(|d| {
+            // A5-12: the deposit's txid is the vault rule's (the one the proof program proves and the contract
+            // mints under), from the group's 323-byte pages; it must be the chain's own (the header's tx_root
+            // commits to that one), or the block gives no deposit
+            let g = &stream.groups[d.group];
+            let wire = user[usize::from(g.start_page)..g.end_page_exclusive()]
+                .iter()
+                .map(|t| jetsam_tx::TxPage { body: t.body.clone() }.to_bytes().map_err(|e| anyhow::anyhow!("block {height}: page: {e:?}")))
+                .collect::<anyhow::Result<Vec<[u8; jetsam_tx::TX_BODY_WIRE_SIZE]>>>()?;
+            let pages: Vec<&[u8]> = wire.iter().map(|p| p.as_slice()).collect();
+            let txid = jetsam_vault_rule::txid::logical_txid(&pages);
+            anyhow::ensure!(
+                txid == g.spend.logical_txid.0,
+                "block {height} group {}: the vault rule's txid {} is not the chain's {}: no deposit read",
+                d.group,
+                hex::encode(txid),
+                hex::encode(g.spend.logical_txid.0)
+            );
+            Ok(FoundDeposit { height, group: d.group as u32, block_id: id, txid, recipient: d.recipient, amount: d.amount, block_ts: block.header.timestamp })
         })
-        .collect())
+        .collect()
 }
 
 /// The robot's parameters (study n°2 §8.1, D72, D-AV4), the defaults those of the study. Amounts in µJTM,
@@ -206,9 +229,10 @@ pub struct FillParams {
     /// The largest share of one miner address over the last `share_window` blocks above which it halts.
     pub share_window: u64,
     pub share_halt_pct: u64,
-    /// A pending advance older than this is noted lost (the contract never says it).
+    /// A pending advance older than this raises an alert (A5-16: never a loss, never a halt; the robot keeps
+    /// following and claiming it).
     pub loss_after_secs: u64,
-    /// Orders per `advanceBatch` (≤ 32).
+    /// Orders per `advanceBatch` (≤ 32, and within the signer's `max_gas`: [`batch_gas_bound`]).
     pub batch_max: usize,
 }
 
@@ -243,15 +267,35 @@ impl Default for FillParams {
             share_window: 480,
             share_halt_pct: 55,
             loss_after_secs: 259_200,
-            batch_max: MAX_ADVANCE_BATCH,
+            batch_max: DEFAULT_ADVANCE_BATCH,
         }
     }
 }
 
+/// A5-11: the most orders of one `advanceBatch` whose gas, with the signer's margin, stays within its
+/// `max_gas` (`l1tx::FeePolicy::gas_limit` refuses above it): `(21 000 + n × 97 800) × (100 + margin) /
+/// 100 ≤ max_gas`, at most the contract's 32.
+pub fn batch_gas_bound(max_gas: u64, gas_margin_pct: u64) -> usize {
+    (0..=MAX_ADVANCE_BATCH)
+        .rev()
+        .find(|n| {
+            let gas = u128::from(TX_BASE_GAS) + *n as u128 * u128::from(BATCH_ORDER_GAS);
+            (gas * u128::from(100 + gas_margin_pct)).div_ceil(100) <= u128::from(max_gas)
+        })
+        .unwrap_or(0)
+}
+
+/// A5-11: the batch `l1tx` refused for its gas (`… exceeds max_gas …`), `n` orders, is sent again with
+/// half of its orders (rounded up), down to one; `None` for any other refusal or a single order.
+pub fn smaller_batch(refusal: &str, n: usize) -> Option<usize> {
+    (n > 1 && refusal.contains("exceeds max_gas")).then(|| n.div_ceil(2))
+}
+
 impl FillParams {
     /// The floors and the contract's bounds; the private rehearsal may lift the concentration halt and
-    /// shorten the pause after a switch (2-3 miners, a fresh genesis), nothing else.
-    pub fn check(&self, profile: crate::Profile) -> anyhow::Result<()> {
+    /// shorten the pause after a switch (2-3 miners, a fresh genesis), nothing else. `max_gas` and
+    /// `gas_margin_pct` are the signer's (`[signer]`): a batch must fit them (A5-11).
+    pub fn check(&self, profile: crate::Profile, max_gas: u64, gas_margin_pct: u64) -> anyhow::Result<()> {
         anyhow::ensure!(self.confirmations >= CONFIRMATIONS_FLOOR, "confirmations {} is below the floor {CONFIRMATIONS_FLOOR}", self.confirmations);
         anyhow::ensure!(self.min_nodes >= MIN_NODES_FLOOR, "min_nodes {} is below the floor {MIN_NODES_FLOOR}", self.min_nodes);
         anyhow::ensure!(self.work_blocks >= CONFIRMATIONS_FLOOR, "work_blocks {} is below the floor {CONFIRMATIONS_FLOOR}", self.work_blocks);
@@ -263,6 +307,13 @@ impl FillParams {
             self.max_stock
         );
         anyhow::ensure!((1..=MAX_ADVANCE_BATCH).contains(&self.batch_max), "batch_max {} outside 1..={MAX_ADVANCE_BATCH}", self.batch_max);
+        let bound = batch_gas_bound(max_gas, gas_margin_pct);
+        anyhow::ensure!(
+            self.batch_max <= bound,
+            "batch_max {} above {bound}: (21 000 + {} × {BATCH_ORDER_GAS}) gas with the signer's {gas_margin_pct} % margin exceeds its max_gas {max_gas}",
+            self.batch_max,
+            self.batch_max
+        );
         if profile.strict() {
             anyhow::ensure!(self.share_halt_pct <= SHARE_HALT_CEIL, "share_halt_pct {} is above {SHARE_HALT_CEIL} on {profile}", self.share_halt_pct);
             anyhow::ensure!(self.switch_pause_secs >= SWITCH_PAUSE_FLOOR, "switch_pause_secs {} is below {SWITCH_PAUSE_FLOOR} on {profile}", self.switch_pause_secs);
@@ -343,6 +394,21 @@ fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_o
         }
     }
     Ok(())
+}
+
+/// A5-7: the body of `d`'s block as the relayer archived and published it
+/// (`<publish_dir>/blocks/<height>-<block id hex>.bin`, `blocks_dir` = [`FillConfig::relay_blocks_dir`]), read
+/// again: its header must be the block `d.block_id`, its body the one that header commits to, and the node's
+/// rule must read `d` in it (same group, txid, recipient, amount). Without it no proof of the deposit is ever
+/// possible once the nodes stop serving the body, and the advance would never be repaid: the robot waits
+/// (`BODY_NOT_PUBLISHED`, `PUBLISHED_BODY_MISMATCH`), it never decides for good on it.
+pub fn published_body(blocks_dir: Option<&Path>, d: &FoundDeposit, rules: &VaultRules) -> Result<(), &'static str> {
+    let Some(dir) = blocks_dir else { return Err("BODY_NOT_PUBLISHED") };
+    let Ok(raw) = std::fs::read(dir.join(format!("{}-{}.bin", d.height, hex::encode(d.block_id)))) else { return Err("BODY_NOT_PUBLISHED") };
+    match deposits_of_block(&raw, &d.block_id, rules) {
+        Ok(found) if found.contains(d) => Ok(()),
+        _ => Err("PUBLISHED_BODY_MISMATCH"),
+    }
 }
 
 /// The contract's tip compared with the robot's chain (R-6).
@@ -461,6 +527,9 @@ pub struct GuardInput {
     pub tip: TipCheck,
     /// [`top_share_pct`].
     pub top_share_pct: u64,
+    /// A5-18: the contract's `suspectMinted()` is not 0 (wJTM minted from abandoned final points, still in
+    /// `totalSupply`).
+    pub suspect_minted: bool,
 }
 
 /// A halt (latched: only an operator restarts, D41) and a pause (lifts with its cause).
@@ -486,6 +555,8 @@ pub fn guard(g: &GuardInput, p: &FillParams) -> Guard {
     };
     let pause = if g.stalled {
         Some("PAUSE_STALLED")
+    } else if g.suspect_minted {
+        Some("PAUSE_SUSPECT_MINTED")
     } else if g.l1_now < g.last_switch_at.saturating_add(p.switch_pause_secs) {
         Some("PAUSE_RECENT_SWITCH")
     } else if g.now > g.tip_changed_at + p.tip_max_age {
@@ -514,14 +585,18 @@ pub struct Candidate {
     pub taken: bool,
     /// `isMinted[txId]`.
     pub minted: bool,
+    /// A5-7: [`published_body`], the relayer's archive of its block.
+    pub published: Result<(), &'static str>,
 }
 
-/// The contract's view of this advancer (`advancerCaps`) and the hot key's wJTM balance.
+/// The contract's view of this advancer (`advancerCaps`), the hot key's wJTM balance and the token's
+/// `totalSupply()` (A5-18, saturated to `u64::MAX`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     pub outstanding: u64,
     pub spent24h: u64,
     pub stock: u64,
+    pub total_supply: u64,
 }
 
 /// The decision on one candidate.
@@ -592,6 +667,12 @@ impl Ledger {
         self.advances.iter().any(|a| a.key == *key)
     }
 
+    /// A5-18: the amounts of its advances still pending (not minted yet: the slow mint of each adds its
+    /// amount to `totalSupply`).
+    pub fn pending_sum(&self) -> u64 {
+        self.advances.iter().filter(|a| a.status == AdvanceStatus::Pending).map(|a| a.amount).fold(0u64, u64::saturating_add)
+    }
+
     /// Advanced over `]now − window ; now]`, to `recipient` only if given.
     pub fn sum(&self, now: u64, window: u64, recipient: Option<&[u8; 20]>) -> u64 {
         self.advances
@@ -610,8 +691,9 @@ pub fn fifo_order(cands: &[Candidate]) -> Vec<usize> {
 }
 
 /// The decision on every candidate (same order as `cands`), the queue taken first in first out; at most
-/// one batch of `batch_max` advances. A wait for capacity (hour, 24 h, outstanding, stock) blocks every
-/// later candidate: in degraded mode (stock dry) nobody passes the head of the queue.
+/// one batch of `batch_max` advances. A wait for capacity (hour, 24 h, outstanding, the contract's supply
+/// ceiling, stock) blocks every later candidate: in degraded mode (stock dry) nobody passes the head of the
+/// queue.
 #[allow(clippy::too_many_arguments)]
 pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now: u64, l1_now: u64, min_advance: u64, p: &FillParams) -> Vec<Verdict> {
     if guard.halt.is_some() {
@@ -625,6 +707,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     let mut day = caps.spent24h;
     let mut outstanding = caps.outstanding;
     let mut stock = caps.stock;
+    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted
+    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum());
     let outstanding_cap = p.outstanding_cap.min(ADVANCE_OUTSTANDING_CAP);
     let mut batch = 0usize;
     let mut per_recipient: HashMap<[u8; 20], u64> = HashMap::new();
@@ -644,6 +728,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
             Verdict::Refuse("LATE_SLOW_PATH_NEAR")
         } else if let Err(code) = c.conf {
             Verdict::Wait(code)
+        } else if let Err(code) = c.published {
+            Verdict::Wait(code)
         } else if d.amount > p.grace_from && now < c.confirmed_at.unwrap_or(now) + p.grace_secs {
             Verdict::Wait("GRACE")
         } else if ledger.sum(now, p.recipient_window, Some(&d.recipient)) + per_recipient.get(&d.recipient).copied().unwrap_or(0) + d.amount > p.recipient_cap {
@@ -661,6 +747,8 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
                 Some("DAY_CAP")
             } else if outstanding + d.amount > outstanding_cap {
                 Some("OUTSTANDING_CAP")
+            } else if d.amount > supply_room {
+                Some("SUPPLY_CEILING")
             } else if pay > stock {
                 Some("STOCK")
             } else {
@@ -675,6 +763,7 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
                     hour += d.amount;
                     day += d.amount;
                     outstanding += d.amount;
+                    supply_room -= d.amount;
                     stock -= pay;
                     batch += 1;
                     *per_recipient.entry(d.recipient).or_default() += d.amount;
@@ -717,18 +806,76 @@ pub fn min_advance(p: &FillParams, gas_price_wei: u128, advance_gas: u64, wei_pe
 }
 
 /// A loss the robot notes for one of its advances (the contract never writes one, D-AV6): `status` of
-/// `advanceOf(key)`, `minted` = `isMinted[txId]`, `at` = the L1 time of the advance.
-pub fn loss(status: u8, minted: bool, l1_now: u64, at: u64, p: &FillParams) -> Option<&'static str> {
-    if status != 1 {
-        return None;
+/// `advanceOf(key)` still pending while `minted` = `isMinted[txId]`, its deposit minted to another tuple
+/// (A5-16: the only loss; an advance not repaid for long is [`overdue`], an alert).
+pub fn loss(status: u8, minted: bool) -> Option<&'static str> {
+    (status == 1 && minted).then_some("LOST_MINTED_TO_ANOTHER_TUPLE")
+}
+
+/// A5-16: a pending advance not repaid `loss_after_secs` after it was made (`at`, L1 time): an alert, never a
+/// loss (a slow mint can legitimately take longer: freeze, finality, the slow window).
+pub fn overdue(status: u8, minted: bool, l1_now: u64, at: u64, p: &FillParams) -> bool {
+    status == 1 && !minted && l1_now > at.saturating_add(p.loss_after_secs)
+}
+
+impl Ledger {
+    /// A5-16: the advances an older robot noted `LOST_NOT_REPAID_72H` are pending again (followed, claimed);
+    /// how many.
+    pub fn reopen_overdue(&mut self) -> usize {
+        let mut n = 0;
+        for a in &mut self.advances {
+            if a.status == AdvanceStatus::Lost("LOST_NOT_REPAID_72H".into()) {
+                a.status = AdvanceStatus::Pending;
+                n += 1;
+            }
+        }
+        n
     }
-    if minted {
-        return Some("LOST_MINTED_TO_ANOTHER_TUPLE");
+}
+
+/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with.
+pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read == OUTSTANDING_CEIL,
+        "the bridge's OUTSTANDING_CEIL() is {read} µwJTM, not {OUTSTANDING_CEIL}: jg-fill does not start (it counts the room under that ceiling)"
+    );
+    Ok(())
+}
+
+/// A uint256 word (big-endian) as a `u64`, `u64::MAX` when it does not fit.
+pub fn u64_saturating(word: &[u8; 32]) -> u64 {
+    if word[..24] != [0u8; 24] {
+        return u64::MAX;
     }
-    if l1_now > at.saturating_add(p.loss_after_secs) {
-        return Some("LOST_NOT_REPAID_72H");
-    }
-    None
+    u64::from_be_bytes(word[24..].try_into().expect("8 bytes"))
+}
+
+/// A5-15: `fill.toml` names the claim owner every repayment goes to (`refund_to`): it must be private to this
+/// process's user (mode 0600 or 0400, owned by its uid), or jg-fill does not start.
+pub fn check_config_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}: jg-fill does not start", path.display()))?;
+    let mode = meta.mode() & 0o7777;
+    anyhow::ensure!(
+        mode == 0o600 || mode == 0o400,
+        "{}: mode {mode:o}, it must be private to its owner (0600 or 0400): it names the claim owner of every repayment, jg-fill does not start",
+        path.display()
+    );
+    // SAFETY: geteuid has no precondition.
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(meta.uid() == euid, "{}: owned by uid {}, not by this process's uid {euid}: jg-fill does not start", path.display(), meta.uid());
+    Ok(())
+}
+
+/// A5-15: one jg-fill per `state_dir` (its pending transaction, ledger and journal): an exclusive `flock` on
+/// `<state_dir>/lock`, held as long as the returned file is open (as the signer's journal does).
+pub fn lock_state_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    // SAFETY: flock on a descriptor we own.
+    let r = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    anyhow::ensure!(r == 0, "another jg-fill holds {}: jg-fill does not start", dir.join("lock").display());
+    Ok(lock)
 }
 
 /// The start check of the hot key: it holds the capped stock only.
@@ -869,9 +1016,18 @@ pub struct FillConfig {
     pub signer: crate::l1tx::SignerConfig,
     /// The relayer's published `final.json` (`jg-relay`'s `publish_dir`): the robot claims the repayment of
     /// its own advances from it (`claimDeposit`), checked against the contract's final root, without
-    /// waiting for anyone. Absent: it waits for a claimer.
+    /// waiting for anyone. Absent: it waits for a claimer. The relayer's archive of the deposit blocks beside
+    /// it (`blocks/`) is required for every advance (A5-7): absent, nothing is advanced.
     #[serde(default)]
     pub relay_final: Option<PathBuf>,
+}
+
+impl FillConfig {
+    /// A5-7: where the relayer publishes the deposit blocks it archived: `blocks/` beside its `final.json`
+    /// (`relay_final` = `<publish_dir>/final.json`); none without `relay_final`, and then nothing is advanced.
+    pub fn relay_blocks_dir(&self) -> Option<PathBuf> {
+        self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks"))
+    }
 }
 
 fn default_advance_gas() -> u64 {
@@ -892,7 +1048,14 @@ impl FillConfig {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let c: Self = toml::from_str(text)?;
         let profile = c.profile()?;
-        c.params.check(profile).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
+        // without `[signer]` (the rehearsal's endpoint account) the batch keeps the default signer's bound
+        let (max_gas, margin) = if c.signer == crate::l1tx::SignerConfig::default() {
+            let fee = crate::l1tx::FeePolicy::default();
+            (fee.max_gas, fee.gas_margin_pct)
+        } else {
+            (c.signer.max_gas, c.signer.gas_margin_pct)
+        };
+        c.params.check(profile, max_gas, margin).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
         anyhow::ensure!(
             c.nodes.len() >= c.params.min_nodes,
             "{} nodes configured, min_nodes = {}: jg-fill does not start (each deposit is confirmed on that many nodes)",

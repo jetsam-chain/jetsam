@@ -38,6 +38,11 @@ use alloc::vec::Vec;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "txid")]
+pub mod p2b;
+#[cfg(feature = "txid")]
+pub mod txid;
+
 /// µJTM per JTM.
 pub const MICRO_PER_JTM: u64 = 1_000_000;
 
@@ -195,12 +200,24 @@ pub enum GroupClass {
     Deposit { recipient: [u8; 20], amount: u64 },
 }
 
-/// A deposit of a block: its user group, recipient and amount.
+/// A deposit of a block: its user group, its logical txid (the slow mint's single key, A5-12), recipient
+/// and amount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deposit {
     pub group: usize,
+    pub txid: [u8; 32],
     pub recipient: [u8; 20],
     pub amount: u64,
+}
+
+/// A user group of a block as V4 reads it: the owner it spends from, its live outputs `(owner, amount)` (all
+/// its pages, in order), and its logical txid (`txid::logical_txid` of its pages, with the feature `txid`),
+/// which its deposit carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub input_owner: [u8; 32],
+    pub outputs: Vec<([u8; 32], u64)>,
+    pub txid: [u8; 32],
 }
 
 /// V4-0 on the owners of the live outputs of a block's system records, in order.
@@ -330,12 +347,12 @@ pub fn classify_group(
 }
 
 /// V4 on a whole block at `height`: the owners of its system records' live outputs, then each user
-/// group `(input owner, live outputs)` in order. Below the v1.7 height nothing is read and nothing is
-/// refused. Its deposits, in group order.
+/// [`Group`] in order. Below the v1.7 height nothing is read and nothing is refused. Its deposits, in
+/// group order, each with its group's logical txid.
 pub fn block_deposits(
     height: u64,
     system_owners: &[[u8; 32]],
-    groups: &[([u8; 32], Vec<([u8; 32], u64)>)],
+    groups: &[Group],
     rule: &DepositRule,
 ) -> Result<Vec<Deposit>, RuleError> {
     if !rule.active_at(height) {
@@ -343,12 +360,13 @@ pub fn block_deposits(
     }
     check_system_outputs(system_owners, rule)?;
     let mut deposits = Vec::new();
-    for (group, (input_owner, outputs)) in groups.iter().enumerate() {
+    for (group, g) in groups.iter().enumerate() {
         if let GroupClass::Deposit { recipient, amount } =
-            classify_group(group, input_owner, outputs, height, rule)?
+            classify_group(group, &g.input_owner, &g.outputs, height, rule)?
         {
             deposits.push(Deposit {
                 group,
+                txid: g.txid,
                 recipient,
                 amount,
             });

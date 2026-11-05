@@ -18,7 +18,8 @@ test-clock-j69120 = []
 
 [dependencies]
 tw-core = { package = "jetsam_bridge_towerwalk", path = "../towerwalk" }
-jetsam_vault_rule = { path = "../../jetsam_vault_rule" }
+# V4 and the logical txid of a deposit (A5-12): the one implementation the robot runs too
+jetsam_vault_rule = { path = "../../jetsam_vault_rule", features = ["txid"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

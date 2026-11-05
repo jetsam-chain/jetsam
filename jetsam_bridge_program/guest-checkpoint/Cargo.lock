@@ -297,6 +297,9 @@ version = "1.6.0"
 [[package]]
 name = "jetsam_vault_rule"
 version = "1.6.0"
+dependencies = [
+ "jetsam_bridge_towerwalk",
+]
 
 [[package]]
 name = "lazy_static"

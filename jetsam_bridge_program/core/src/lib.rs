@@ -6,7 +6,8 @@
 //! - `jetsam_poseidon2b::native::compression` sponge / `compress_with_tag` -> [`p2b`]
 //! - `jetsam_chain::block_header::hash_block_header`                       -> [`hdr::block_id`]
 //! - `jetsam_tx::body_hash`, `paged_spend::hash_paged_spend_unchecked`,
-//!   `jetsam_chain::tx_tree`                                                -> [`tx`]
+//!   `jetsam_chain::tx_tree`                                                -> [`tx`] (the bodies and the
+//!   logical txid, with the sponge [`p2b`], live in `jetsam_vault_rule::{txid, p2b}`: A5-12)
 //! - `jetsam_chain::consensus::{params, difficulty, header, timestamps, slot_expansion}`
 //!   (v1.5.1 rules below the v1.6 height, v1.6 rules from it on)          -> [`rules`]
 //! TowerWalk + POWHDR sponge come from `tw-core` (gated 150/150 in the earlier bench).
