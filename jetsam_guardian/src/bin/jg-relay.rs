@@ -137,6 +137,9 @@ struct Relay {
     state: State,
     prover: Box<dyn Prover>,
     events: PathBuf,
+    /// N2: (deposit blocks read, points known) at the last rebuild of the trees: rebuilt again only when
+    /// one of them changed (a search costs up to `MAX_OMISSION_ROOTS` roots per point).
+    trees_at: Option<(usize, usize)>,
 }
 
 impl Relay {
@@ -313,6 +316,10 @@ impl Relay {
     /// out); an ALERT for each block left out, and once for each point whose tree cannot be rebuilt.
     fn resolve_trees(&mut self, gl: u64) {
         let found = self.archive.found();
+        if self.trees_at == Some((found.len(), self.state.known.len())) {
+            return;
+        }
+        self.trees_at = Some((found.len(), self.state.known.len()));
         let mut known = self.known();
         for (id, own) in relayer::resolve_trees(&mut known, &found, gl) {
             let txids: Vec<String> = own.iter().flat_map(|h| found.get(h).into_iter().flatten().map(move |d| format!("{h}:0x{}", hex::encode(d.txid)))).collect();
@@ -783,6 +790,7 @@ fn run() -> anyhow::Result<()> {
         state,
         prover,
         events,
+        trees_at: None,
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
