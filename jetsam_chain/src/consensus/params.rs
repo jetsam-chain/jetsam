@@ -475,7 +475,7 @@ pub const REHEARSAL_V1_5_ACTIVATION: u64 = 36;
 /// The v1.6 height of a private build (`rehearsal-v1-6`): above
 /// the private v1.5 height, on a 32-block transaction epoch boundary (v1.6
 /// moves neither the ASERT clock nor the payout cadence; the first payout
-/// after the private v1.5 height is at 516, past the private run). The v1.6
+/// after the private v1.5 height is at 480, the relation's cadence: T7.7). The v1.6
 /// pack does not depend on it (the relation is rooted at a height given at
 /// startup).
 pub const REHEARSAL_V1_6_ACTIVATION: u64 = 64;
