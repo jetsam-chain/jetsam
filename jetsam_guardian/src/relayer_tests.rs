@@ -640,9 +640,13 @@ fn n2_a_tree_is_rebuilt_only_from_whole_blocks_of_this_chain() {
     let mut ghost = all.clone();
     ghost.push(Deposit { index: 3, recipient: [9; 20], amount: JTM, jetsam_tx_id: [9; 32] });
     let (hid, h) = known_at(&c, 40, gid, &ghost, 100);
-    let mut known = HashMap::from([(gid, g), (pid, p), (hid, h)]);
+    // as many deposits as this relayer reads, one of them not its: nothing left out, and not its tree either
+    let mut other = all.clone();
+    other[2] = Deposit { index: 2, recipient: [9; 20], amount: JTM, jetsam_tx_id: [9; 32] };
+    let (oid, o) = known_at(&c, 40, gid, &other, 100);
+    let mut known = HashMap::from([(gid, g), (pid, p), (hid, h), (oid, o)]);
     assert!(resolve_trees(&mut known, &found, GL).is_empty());
-    assert_eq!((known[&pid].omitted.clone(), known[&hid].omitted.clone()), (None, None));
+    assert_eq!((known[&pid].omitted.clone(), known[&hid].omitted.clone(), known[&oid].omitted.clone()), (None, None, None));
     // a window with more deposit blocks than the search takes: unknown; within the bound: found, the smallest set
     let many: Vec<FoundDeposit> = (0..=MAX_OMISSION_BLOCKS as u64).map(|i| dep(11 + i, i as u8, JTM)).collect();
     let found = found_of(&many);
