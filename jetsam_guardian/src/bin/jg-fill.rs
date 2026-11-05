@@ -14,8 +14,11 @@
 //!   `fill.toml` private to its user (0600 or 0400, its uid: it names `refund_to`), one robot per
 //!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
-//!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, and the hot key's stock ≤ `max_stock`
-//!   (else no start).
+//!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and
+//!   the hot key's stock ≤ `max_stock` (else no start).
+//! * A5-1: no advance of a deposit at or below the locked height of the contract's tip (its point is accepted: a
+//!   mint less than 24 h after an advance made now repays what it paid only); an advance the relayer's point
+//!   overtakes in the minutes between the robot's read of the tip and its advance loses its fee (accepted).
 //! * A5-18: every step reads the token's `totalSupply()` and the bridge's `suspectMinted()`: nothing is
 //!   advanced while `suspectMinted() > 0`, nor beyond what the contract's ceiling holds after the mints of the
 //!   robot's own pending advances (C-6 kept prudent).
@@ -273,19 +276,23 @@ impl Robot {
         // A5-18: the token's supply under the contract's ceiling, and wJTM minted from abandoned final points
         let total_supply = fill::u64_saturating(&word(&self.l1.call(&self.token, &l1::selector("totalSupply()"))?, 0));
         let suspect_minted = word(&self.view("suspectMinted()", &[])?, 0) != [0u8; 32];
-        let caps = Caps { outstanding: word_u64(&caps_raw, 0), spent24h: word_u64(&caps_raw, 1), stock: self.balance()?, total_supply };
         let gas_price = u128::from_str_radix(self.l1.rpc("eth_gasPrice", json!([]))?.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
         // R-6: the contract's tip against every node's chain (the worst)
-        let tip = if tip_id == [0u8; 32] {
-            TipCheck::Unknown
-        } else {
-            match self.checkpoint(&tip_id)? {
-                Some(cp) => {
-                    let checks: Vec<TipCheck> = self.observers.iter().map(|o| fill::tip_check(&cp, &tip_id, o.chain())).collect();
-                    [TipCheck::LockedNotOurs, TipCheck::Unknown, TipCheck::ContextNotOurs].into_iter().find(|c| checks.contains(c)).unwrap_or(TipCheck::Ours)
-                }
-                None => TipCheck::Unknown,
+        let tip_cp = if tip_id == [0u8; 32] { None } else { self.checkpoint(&tip_id)? };
+        let tip = match &tip_cp {
+            Some(cp) => {
+                let checks: Vec<TipCheck> = self.observers.iter().map(|o| fill::tip_check(cp, &tip_id, o.chain())).collect();
+                [TipCheck::LockedNotOurs, TipCheck::Unknown, TipCheck::ContextNotOurs].into_iter().find(|c| checks.contains(c)).unwrap_or(TipCheck::Ours)
             }
+            None => TipCheck::Unknown,
+        };
+        // A5-1: no advance of a deposit at or below the tip's locked height (its point is accepted already)
+        let caps = Caps {
+            outstanding: word_u64(&caps_raw, 0),
+            spent24h: word_u64(&caps_raw, 1),
+            stock: self.balance()?,
+            total_supply,
+            tip_locked_height: tip_cp.map(|cp| cp.locked_height),
         };
         let mut reorgs: Vec<(u64, u64)> = self.observers.iter().flat_map(|o| o.reorgs().to_vec()).collect();
         reorgs.sort_unstable();
@@ -670,6 +677,8 @@ fn run() -> anyhow::Result<()> {
     let token = hex0x(&word_addr(&l1.call(&bridge, &l1::selector("token()"))?, 0));
     anyhow::ensure!(token != hex0x(&[0u8; 20]), "the bridge {bridge} answers no token: jg-fill does not start");
     fill::check_ceiling(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0)))?;
+    // A5-1: the contract keeps the fee of an advance at least 24 h old at its mint, the age the robot's rule gives
+    fill::check_advance_min_age(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("ADVANCE_MIN_AGE()"))?, 0)))?;
     let hot = cfg.hot()?;
     let mut probe = l1::selector("balanceOf(address)").to_vec();
     probe.extend_from_slice(&l1::address_word(&hot));

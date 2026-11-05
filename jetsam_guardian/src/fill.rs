@@ -590,13 +590,15 @@ pub struct Candidate {
 }
 
 /// The contract's view of this advancer (`advancerCaps`), the hot key's wJTM balance and the token's
-/// `totalSupply()` (A5-18, saturated to `u64::MAX`).
+/// `totalSupply()` (A5-18, saturated to `u64::MAX`); the locked height of the contract's tip (A5-1, from its
+/// `CheckpointAccepted`; `None`: not known).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     pub outstanding: u64,
     pub spent24h: u64,
     pub stock: u64,
     pub total_supply: u64,
+    pub tip_locked_height: Option<u64>,
 }
 
 /// The decision on one candidate.
@@ -722,6 +724,12 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
             Verdict::Refuse("ADVANCED_BY_ANOTHER")
         } else if c.minted {
             Verdict::Refuse("ALREADY_MINTED")
+        } else if caps.tip_locked_height.is_none() {
+            Verdict::Wait("CONTRACT_TIP_UNKNOWN")
+        } else if caps.tip_locked_height.is_some_and(|l| d.height <= l) {
+            // A5-1: its point is accepted, its mint may come less than ADVANCE_MIN_AGE after an advance made now:
+            // the fee would go to the recipient; the slow path pays the recipient within 24 h
+            Verdict::Refuse("ALREADY_UNDER_A_POINT")
         } else if d.amount < min_advance {
             Verdict::Refuse("BELOW_MIN_ADVANCE")
         } else if l1_now.saturating_sub(d.block_ts) > p.late_after_secs {
@@ -838,6 +846,23 @@ pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         read == OUTSTANDING_CEIL,
         "the bridge's OUTSTANDING_CEIL() is {read} µwJTM, not {OUTSTANDING_CEIL}: jg-fill does not start (it counts the room under that ceiling)"
+    );
+    Ok(())
+}
+
+/// A5-1 (contract revised): an advance younger than this at the mint of its deposit is repaid what it paid only,
+/// its fee going to the recipient. `D_SLOW` (24 h): an advance made before the acceptance of the point that covers
+/// its deposit is always that old at the mint (finality is 24 h after acceptance at the earliest), one made after it
+/// may not be — hence the robot's rule `ALREADY_UNDER_A_POINT` ([`plan`]).
+pub const ADVANCE_MIN_AGE: u64 = 86_400;
+
+/// A5-1: `ADVANCE_MIN_AGE()` read on the bridge is the 24 h the robot's rule counts on (with 2 h, an advance at
+/// `finality − 2 h` keeps its fee: the rent the revision closes), or jg-fill does not start.
+pub fn check_advance_min_age(read: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read == ADVANCE_MIN_AGE,
+        "the bridge's ADVANCE_MIN_AGE() is {read} s, not {ADVANCE_MIN_AGE} (D_SLOW): jg-fill does not start (its rule, no advance of a \
+         deposit under the tip's locked height, keeps its fee under that contract only)"
     );
     Ok(())
 }

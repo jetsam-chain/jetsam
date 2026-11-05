@@ -876,15 +876,17 @@ fn jg_fill_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
 /// A fake world behind the SOCKS port: two onion nodes (the testkit genesis only) and an onion L1 (chain
 /// 31 337, a token, the hot key's balance `stock`).
 fn fill_world(stock: u64) -> Answer {
-    fill_world_on(stock, "0x7a69")
+    fill_world_on(stock, "0x7a69", 86_400)
 }
 
-fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
+/// `min_age`: the bridge's `ADVANCE_MIN_AGE()` (A5-1: 86 400 for the revised contract, 7 200 before it).
+fn fill_world_on(stock: u64, chain_id: &'static str, min_age: u64) -> Answer {
     let genesis = testkit::genesis();
     let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
     let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
     // A5-18: the bridge's ceiling, read at start
     let ceiling = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("OUTSTANDING_CEIL()")));
+    let age = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("ADVANCE_MIN_AGE()")));
     Arc::new(move |method, params| match method {
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
@@ -901,6 +903,8 @@ fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
                 json!({"result": format!("0x{stock:064x}")})
             } else if data.starts_with(&ceiling) {
                 json!({"result": format!("0x{:064x}", 10_000_000_000u64)})
+            } else if data.starts_with(&age) {
+                json!({"result": format!("0x{min_age:064x}")})
             } else {
                 json!({"result": format!("0x{}", "00".repeat(32 * 6))})
             }
@@ -938,12 +942,19 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert!(log.contains("max_stock") && log.contains("does not start"), "{log}");
     assert!(seen.lock().unwrap().iter().all(|(atyp, host, ..)| *atyp == 3 && *host == c), "{:?}", seen.lock().unwrap());
     // an L1 endpoint of another chain: no start
-    let (socks, _) = fake_tor(fill_world_on(cap, "0x1"));
+    let (socks, _) = fake_tor(fill_world_on(cap, "0x1", 86_400));
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
     let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
     let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
     assert_eq!(code, Some(Some(1)), "log:\n{log}");
     assert!(log.contains("is chain 1, not 31337") && log.contains("does not start"), "{log}");
+    // A5-1: a bridge that keeps the fee of an advance of 2 h (the contract before its revision): no start
+    let (socks, _) = fake_tor(fill_world_on(cap, "0x7a69", 7_200));
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("ADVANCE_MIN_AGE() is 7200 s, not 86400") && log.contains("does not start"), "{log}");
     // at the cap: it starts, reads both nodes and the L1, by name through Tor
     let (socks, seen) = fake_tor(fill_world(cap));
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");

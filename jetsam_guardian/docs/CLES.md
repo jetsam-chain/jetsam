@@ -133,6 +133,13 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
   (a refill while it runs is used as is: a question noted, not decided); the contract adds 3 000 JTM
   outstanding and 2 500 JTM / 24 h per advancer. **The maximum loss per incident is the hot key's stock.**
   Repayments go to `refund_to`, a cold address other than the hot key.
+- **Fee of an advance** (A5-1, contract revised: `ADVANCE_MIN_AGE` = `D_SLOW` = 24 h): an advance less than 24 h
+  old at the mint of its deposit is repaid what it paid only, its fee going to the recipient. An advance made before
+  the acceptance of the point that covers its deposit is always 24 h old at the mint; so `jg-fill` never advances a
+  deposit at or below the locked height of the contract's tip (`ALREADY_UNDER_A_POINT`: the slow path pays the
+  recipient within 24 h), and does not start unless the bridge's `ADVANCE_MIN_AGE()` is 86 400. **An advance
+  doubled by the relayer** (its point covering the deposit lands in the few minutes between the robot's read of the
+  tip and its advance) **loses its fee: accepted** (the recipient gets it; the robot is repaid what it paid).
 - Holder of each hot key and rotation procedure: **[NV]** (to be written here).
 
 ## Loss per incident (decision 11 of the audit A5)

@@ -501,7 +501,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0 }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0) }
 }
 
 fn open() -> Guard {
@@ -1499,6 +1499,36 @@ fn a5_15_one_robot_per_state_dir() {
     assert!(e.contains("another jg-fill") && e.contains("does not start"), "{e}");
     drop(first);
     assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
+}
+
+/// A5-1: under the revised contract (`ADVANCE_MIN_AGE` = `D_SLOW`, 24 h) an advance made after the acceptance of
+/// the point that covers its deposit is repaid what it paid only (its fee goes to the recipient): the robot never
+/// advances a deposit at or below the locked height of the contract's tip — refused (the slow path pays the
+/// recipient within 24 h), the queue behind it goes on; with no tip known, a wait, never a refusal.
+#[test]
+fn a5_1_a_deposit_already_under_the_contracts_tip_is_not_advanced() {
+    let tip_at = |l: Option<u64>| Caps { tip_locked_height: l, ..caps() };
+    let c = cand(10, 1, 1, 7 * JTM);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(9))), vec![Verdict::Advance], "above the tip's locked height");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(10))), vec![Verdict::Refuse("ALREADY_UNDER_A_POINT")], "at it");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(11))), vec![Verdict::Refuse("ALREADY_UNDER_A_POINT")], "below it");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(None)), vec![Verdict::Wait("CONTRACT_TIP_UNKNOWN")], "no tip known");
+    let v = run(&[cand(10, 1, 1, 7 * JTM), cand(11, 1, 2, 7 * JTM)], &Ledger::default(), tip_at(Some(10)));
+    assert_eq!(v, vec![Verdict::Refuse("ALREADY_UNDER_A_POINT"), Verdict::Advance], "the queue behind it goes on");
+}
+
+/// A5-1: the robot's rule keeps its fee only under a contract that repays the fee of an advance at least 24 h old
+/// at its mint (`D_SLOW`: an advance made before the point that covers its deposit was accepted always is): it reads
+/// `ADVANCE_MIN_AGE()` at start and does not start under another.
+#[test]
+fn a5_1_the_bridge_must_keep_the_fee_of_an_advance_of_24_hours_only() {
+    assert_eq!(ADVANCE_MIN_AGE, 86_400);
+    assert_eq!(ADVANCE_MIN_AGE, crate::relayer::D_SLOW);
+    assert!(check_advance_min_age(86_400).is_ok());
+    for bad in [7_200, 86_399, 86_401, 0, u64::MAX] {
+        let e = check_advance_min_age(bad).unwrap_err().to_string();
+        assert!(e.contains("ADVANCE_MIN_AGE") && e.contains("does not start"), "{bad}: {e}");
+    }
 }
 
 /// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name
