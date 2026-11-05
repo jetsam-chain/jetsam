@@ -128,6 +128,9 @@ struct State {
     /// C1: (L1 time, gas used) of the `claimDepositDirect` sent in the last 24 h (`claim_direct_daily_gas`).
     #[serde(default)]
     direct_gas: Vec<(u64, u64)>,
+    /// A5-13: its own transactions reverted in a row, none explained by a race (`relayer::after_own_receipt`).
+    #[serde(default)]
+    reverts: u32,
 }
 
 struct Relay {
@@ -162,6 +165,34 @@ impl Relay {
         let mut data = l1::selector(sig).to_vec();
         data.extend_from_slice(args);
         self.l1.call(&self.bridge, &data)
+    }
+
+    /// `isMinted(txid)`, false when it cannot be read.
+    fn minted_now(&self, txid: &[u8; 32]) -> bool {
+        self.view("isMinted(bytes32)", txid).is_ok_and(|v| word(&v, 0)[31] == 1)
+    }
+
+    /// A5-13: the receipt of one of its own transactions; `raced`: a reverted one is explained by another transaction
+    /// landing first. `MAX_CONSECUTIVE_REVERTS` unexplained reverts in a row latch `HALT_REPEATED_REVERTS` in
+    /// `<state_dir>/HALT`: it then sends nothing until an operator removes the file (D41).
+    /// True when the halt is reached now (the caller sends nothing more).
+    fn receipt_seen(&mut self, label: &str, status: bool, raced: bool) -> bool {
+        let (n, halt) = relayer::after_own_receipt(self.state.reverts, status, raced);
+        self.state.reverts = n;
+        if !status {
+            log(&format!("{label} reverted ({}; {n} unexplained in a row)", if raced { "another transaction landed first" } else { "unexplained" }));
+        }
+        let Some(code) = halt else { return false };
+        match relayer::latch_relay_halt(&self.cfg.state_dir, code) {
+            Ok(()) => log(&format!(
+                "HALT {code}: {} of its transactions reverted in a row (latched in {}; an operator removes it)",
+                jetsam_guardian::fill::MAX_CONSECUTIVE_REVERTS,
+                self.cfg.state_dir.join("HALT").display()
+            )),
+            Err(e) => log(&format!("HALT {code} NOT LATCHED: {e:#}")),
+        }
+        self.event(json!({"event": "halt", "reason": code}));
+        true
     }
 
     fn save(&self) {
@@ -393,7 +424,9 @@ impl Relay {
                 Ok(r) => {
                     log(&format!("finalizeSlow L={} T={} status {} gas {}", k.cp.locked_height, k.cp.height, r.status, r.gas_used));
                     self.event(json!({"event": "finalizeSlow", "id": hex::encode(id), "locked_height": k.cp.locked_height, "status": r.status, "gas": r.gas_used, "l1_tx": r.tx_hash}));
-                    if r.status {
+                    // A5-13: another point finalized first explains a revert
+                    let raced = !r.status && self.view("finalId()", &[]).is_ok_and(|v| word(&v, 0) != *fin_id);
+                    if self.receipt_seen("finalizeSlow", r.status, raced) || r.status {
                         return Ok(());
                     }
                 }
@@ -403,7 +436,8 @@ impl Relay {
         Ok(())
     }
 
-    fn claim(&mut self, fin_id: &[u8; 32], gl: u64) -> anyhow::Result<()> {
+    /// `halted` (A5-13): `final.json` published and the direct claims queued, nothing sent.
+    fn claim(&mut self, fin_id: &[u8; 32], gl: u64, l1_now: u64, halted: bool) -> anyhow::Result<()> {
         let Some(fin) = self.state.known.get(&hex::encode(fin_id)).cloned() else { return Ok(()) };
         let found = self.archive.found();
         // N2: the final point's tree (the blocks it or an ancestor left out excluded)
@@ -421,7 +455,8 @@ impl Relay {
             }
         }
         let minted = self.state.minted.clone();
-        let direct = relayer::direct_claims_needed(&fin, &found, gl, &|t| minted.contains(&hex::encode(t)));
+        // R3-6: under an unknown tree, the deposits of the blocks its proof gave wait for it (TREE_WAIT_SECS)
+        let direct = relayer::direct_claims_needed(fin_id, &self.known(), &found, gl, &|t| minted.contains(&hex::encode(t)), l1_now);
         if !direct.is_empty() && self.state.direct_alerted != hex_id {
             let cmds: Vec<String> = direct.iter().map(|d| format!("claim-direct {} 0x{}", d.height, hex::encode(d.txid))).collect();
             log(&format!(
@@ -444,6 +479,9 @@ impl Relay {
             }
             Err(e) => log(&format!("ALERT claim-direct NOT QUEUED: {e:#}")),
         }
+        if halted {
+            return Ok(());
+        }
         let claims = match relayer::claims_of(&fin, &found, gl, &|t| minted.contains(&hex::encode(t))) {
             Ok(c) => c,
             Err(e) => {
@@ -464,6 +502,11 @@ impl Relay {
                     if r.status {
                         self.state.minted.insert(hex::encode(d.jetsam_tx_id));
                     }
+                    // A5-13: minted first by another transaction explains a revert
+                    let raced = !r.status && self.minted_now(&d.jetsam_tx_id);
+                    if self.receipt_seen("claimDeposit", r.status, raced) {
+                        break;
+                    }
                 }
                 Err(e) => {
                     let why = reason_name(&format!("{e:#}"));
@@ -480,13 +523,28 @@ impl Relay {
         Ok(())
     }
 
-    /// N2 / A5-22: the oldest queued `claim-direct` request (one per step: a claim proof each): minted by
-    /// `claimDepositDirect` against the final point's anchor root, with the claim program's proof; a request
-    /// waits (logged) while its block is not under a final anchor root of this chain, no claim prover answers,
-    /// or the daily gas budget is spent (C1: `claim_direct_daily_gas`).
+    /// N2 / A5-22: the oldest queued `claim-direct` request that may go now (one per step: a claim proof each):
+    /// minted by `claimDepositDirect` against the final point's anchor root, with the claim program's proof; a
+    /// request waits (logged) while its block is not under a final anchor root of this chain — without holding the
+    /// requests behind it (R3-3) —, no claim prover answers, or the daily gas budget is spent (C1:
+    /// `claim_direct_daily_gas`).
     fn claim_direct(&mut self, gl: u64, l1_now: u64) -> anyhow::Result<()> {
         let queue = self.cfg.state_dir.join("claim-direct");
-        let Some((path, h, txid)) = relayer::claim_requests(&queue)?.into_iter().next() else { return Ok(()) };
+        let requests = relayer::claim_requests(&queue)?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let fin_id = word(&self.view("finalId()", &[])?, 0);
+        let Some(fin) = self.state.known.get(&hex::encode(fin_id)).cloned() else {
+            log(&format!("claim-direct: {} requests wait: the final point is not known yet", requests.len()));
+            return Ok(());
+        };
+        let queued = requests.len();
+        // R3-3: a request whose block is not under the final point of this chain waits apart
+        let Some((path, h, txid)) = relayer::claim_requests_ready(requests, &self.archive, &self.chain, gl, fin.cp.locked_height).into_iter().next() else {
+            log(&format!("claim-direct: {queued} requests wait: none is under the final point (L={}) of this chain", fin.cp.locked_height));
+            return Ok(());
+        };
         let tx = format!("0x{}", hex::encode(txid));
         if word(&self.view("isMinted(bytes32)", &txid)?, 0)[31] == 1 {
             self.state.minted.insert(hex::encode(txid));
@@ -494,11 +552,6 @@ impl Relay {
             log(&format!("claim-direct {h} {tx}: already minted"));
             return Ok(());
         }
-        let fin_id = word(&self.view("finalId()", &[])?, 0);
-        let Some(fin) = self.state.known.get(&hex::encode(fin_id)).cloned() else {
-            log(&format!("claim-direct {h} {tx} waits: the final point is not known yet"));
-            return Ok(());
-        };
         let archived = match self.archive.index.get(&h) {
             Some(relayer::Body::Read { block_id, .. }) => *block_id,
             other => {
@@ -561,6 +614,9 @@ impl Relay {
                     self.state.minted.insert(hex::encode(txid));
                     relayer::close_claim_request(&path, &json!({"outcome": "minted", "height": h, "txid": tx, "l1_tx": r.tx_hash}))?;
                 }
+                // A5-13: a front-run (minted first by another transaction, R3-4) explains a revert
+                let raced = !r.status && self.minted_now(&txid);
+                self.receipt_seen("claimDepositDirect", r.status, raced);
             }
             Err(e) => log(&format!("claimDepositDirect {h} {tx}: {} (waits)", reason_name(&format!("{e:#}")))),
         }
@@ -573,7 +629,9 @@ impl Relay {
         let missing = self.archive.missing();
         let found = self.archive.found();
         let at = l1_now + self.cfg.prover.timeout_secs + relayer::INCLUSION_SECS;
-        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at) {
+        // R3-5: no more deposit blocks a point than the signer's max_gas lets its submitCheckpoint carry
+        let bound = self.cfg.deposit_blocks_bound();
+        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at, bound) {
             Ok(s) => s,
             Err(why) => {
                 // WorkRateTooLow: MN-5 since the fork base; the fast cadence takes over (A5-5)
@@ -583,6 +641,12 @@ impl Relay {
                 // MustExtendTip: the tip is on this chain with roots that are not ours (A5-4: a new question, noted)
                 if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
                     log(&format!("ALERT NO_SUBMISSION {why:?}"));
+                }
+                if let NoSubmission::TooManyDepositBlocks(n) = why {
+                    log(&format!(
+                        "ALERT NO_SUBMISSION TooManyDepositBlocks({n}): a point within {n} deposit blocks (the signer's max_gas {} with its margin) does not advance or fails MN-5: raise [signer] max_gas",
+                        self.cfg.signer.max_gas
+                    ));
                 }
                 self.event(json!({"event": "no_submission", "why": format!("{why:?}")}));
                 return Ok(());
@@ -626,6 +690,11 @@ impl Relay {
         log(&format!("submitCheckpoint T={} L={} forkDepth={} deposits={} status {} gas {} (proof {proving} s)", s.next.height, s.next.locked_height, s.fork_depth, s.next.deposit_count, r.status, r.gas_used));
         self.event(json!({"event": "submitCheckpoint", "id": hex::encode(id), "parent": hex::encode(s.parent), "height": s.next.height, "locked_height": s.next.locked_height,
                           "fork_depth": s.fork_depth, "deposit_count": s.next.deposit_count, "status": r.status, "gas": r.gas_used, "l1_tx": r.tx_hash, "l1_ts": r.block_timestamp, "proof_secs": proving}));
+        // A5-13: another point landed first (the tip moved: this proof was void) explains a revert
+        let raced = !r.status
+            && (self.view("tipBlockId()", &[]).is_ok_and(|v| word(&v, 0) != s.bridge_tip_block)
+                || self.view("tipLockedBlockId()", &[]).is_ok_and(|v| word(&v, 0) != s.bridge_tip_locked_block));
+        self.receipt_seen("submitCheckpoint", r.status, raced);
         if r.status {
             let k = Known {
                 cp: s.next,
@@ -666,11 +735,25 @@ impl Relay {
         let last_switch = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
         let l1_now = self.l1.next_time()?;
+        // A5-13: latched on repeated reverts, the relayer reads, learns, rebuilds, publishes and queues, and sends
+        // nothing (checked again after each phase that sends)
+        let halted = |s: &Self| relayer::relay_halted(&s.cfg.state_dir);
+        if let Some(h) = halted(self) {
+            log(&format!("HALTED ({}): nothing is sent until an operator removes {}", h.replace('\n', ", "), self.cfg.state_dir.join("HALT").display()));
+        }
         let final_locked = self.state.known.get(&hex::encode(fin)).map_or(gl, |k| k.cp.locked_height);
-        self.finalize(&fin, final_locked, last_switch, l1_now)?;
+        if halted(self).is_none() {
+            self.finalize(&fin, final_locked, last_switch, l1_now)?;
+        }
         let fin = word(&self.view("finalId()", &[])?, 0);
-        self.claim(&fin, gl)?;
+        self.claim(&fin, gl, l1_now, halted(self).is_some())?;
+        if halted(self).is_some() {
+            return Ok(());
+        }
         self.claim_direct(gl, l1_now)?;
+        if halted(self).is_some() {
+            return Ok(());
+        }
         let tip_accepted = self.state.known.get(&hex::encode(tip_id)).map(|k| k.accepted_at);
         let due = checkpoint_due(tip_accepted.map(|a| a.saturating_sub(self.cfg.prove_ahead())), l1_now, self.cfg.cadence_secs);
         // A5-5: the fast cadence, measured against the target of the tip's block on this chain
@@ -801,6 +884,7 @@ fn run() -> anyhow::Result<()> {
         Recovered::Nothing => {}
         Recovered::Mined(r, label) => log(&format!("the {label} in flight at the stop was mined (block {}, status {})", r.block_number, r.status)),
         Recovered::Dropped(label) => log(&format!("the {label} in flight at the stop was dropped")),
+        Recovered::Cancelled(label) => log(&format!("the {label} in flight at the stop was cancelled")),
     }
     let domain = cfg.domain()?;
     let mut nodes = Vec::new();

@@ -126,7 +126,14 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
 - **Fees** (A5-13, `jg-fill` and `jg-relay` alike): off the private rehearsal `[signer] priority_fee_wei` is
   required (the L1 endpoint's `eth_maxPriorityFeePerGas` is never taken), at most `max_priority_fee_wei` (10 gwei
   by default, replacements included), else no start. `jg-fill` halts (`HALT_REPEATED_REVERTS`, latched) after 3 of
-  its transactions reverted in a row, and keeps no refusal that depends on the L1 clock.
+  its transactions reverted in a row, and keeps no refusal that depends on the L1 clock. `jg-relay` too (A5FIX4):
+  3 of its own transactions reverted in a row, none explained by another one landing first (the tip moved, the
+  deposit minted, another point finalized), latch `HALT_REPEATED_REVERTS` in `<state_dir>/HALT`; it then reads,
+  learns, rebuilds, publishes `final.json` and queues, and sends nothing until an operator removes the file.
+- **An advance in flight at a stop** (M8 of the re-audit n°2, A5FIX4): `jg-fill`'s signer never sends again an
+  advance it finds unmined at a recovery (start, or a send after a receipt timeout): its rule `ALREADY_UNDER_A_POINT`
+  was decided before the stop. Its nonce goes to a zero-value transfer of the hot key to itself (fees raised by 1/8,
+  so that it replaces the advance in any pool still holding it); the orders are decided again at the next step.
 - **Process** (A5-15): `jg-fill` and `jg-relay` harden themselves before reading anything
   (`jetsam_guardian::harden`): `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` (they do not start otherwise);
   `mlockall` when `RLIMIT_MEMLOCK` is unlimited or the process has `CAP_IPC_LOCK`, else a warning — then the
@@ -191,6 +198,22 @@ yet** (re-audit n°2, M3: never an empty list). A deposit in no root is minted o
    **`claim_direct_daily_gas`** (default 10 000 000 gas in 24 h of the L1 clock, about 22 direct claims; 450 000
    counted before each; 0: none; over budget: `ALERT CLAIM_DIRECT_BUDGET`, the request waits). Without
    `claim_command` the request waits, with an alert. Done or refused: `<height>-<txid>.done` (its outcome).
+   A request whose block is not under the final point of this chain (above its L, at or below the bridge genesis,
+   or an orphan's archived body: an operator's request may wait for ever) waits apart and never holds the requests
+   behind it (R3-3 of the re-audit n°3).
+
+**A final point whose tree is unknown here** (a block its list names not read yet, R3-6 of the re-audit n°3): the
+deposits of the blocks it left out (named by no list on its branch) are queued at once; those of the blocks it gave
+are in its root, one body away from a `claimDeposit` (≈ 81 k gas instead of ≈ 407 k): they wait for the tree up to
+48 h after the point's acceptance (`TREE_WAIT_SECS`, 24 h after the earliest finality), then are queued for
+`claimDepositDirect` as well (M3). **`acknowledge` (D41) of a block a third party's point lists** (R3-7) means this
+relayer never rebuilds that point's tree, so never extends it: import the body instead whenever one exists.
+
+**A point after a long stop** (R3-5 of the re-audit n°3): `submitCheckpoint` costs ≈ 750 gas per height listed;
+`jg-relay` lowers the point's tip until its window lists at most `(max_gas / (1 + margin) − 400 000) / 800` deposit
+blocks (2 500 with the default signer), the next point taking the rest. When that point does not advance or MN-5
+refuses it (a stop long enough for the bound to bite: ≈ 2 500 blocks with a deposit each, more than 5 days):
+`ALERT NO_SUBMISSION TooManyDepositBlocks(n)`, raise `[signer] max_gas`.
 
 An advance of such a deposit is repaid by that mint as by any other (same key: txid, recipient, amount). A third
 party who forces every deposit this way (by being first to extend at every cycle) costs the relayer one claim

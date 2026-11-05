@@ -310,6 +310,9 @@ pub enum Recovered {
     Mined(Receipt, String),
     /// Its nonce was used by another transaction (none of its versions): it never will be mined.
     Dropped(String),
+    /// M8: found unmined, its label one of [`Sender::cancel_at_recovery`]: its nonce went to a zero-value transfer to
+    /// the key itself, it never will be mined.
+    Cancelled(String),
 }
 
 /// Sends a robot's transactions, signed by its key, one at a time.
@@ -324,6 +327,10 @@ pub struct Sender {
     pub replace_after: Duration,
     /// No receipt after this long: an error (the transaction stays pending, settled at the next send).
     pub receipt_timeout: Duration,
+    /// M8 (re-audit n°2): the labels whose transaction, found unmined at a recovery, is cancelled (its nonce given to a
+    /// zero-value transfer to the key itself, fees raised) instead of being sent again: what was decided before the
+    /// stop may no longer hold (`jg-fill`'s advances: `fill::CANCEL_AT_RECOVERY`). Empty: every one is sent again.
+    pub cancel_at_recovery: Vec<String>,
 }
 
 fn hex0x(b: &[u8]) -> String {
@@ -346,6 +353,7 @@ impl Sender {
             pending_path: state_dir.join("pending.json"),
             replace_after: Duration::from_secs(180),
             receipt_timeout: Duration::from_secs(1_800),
+            cancel_at_recovery: Vec::new(),
         })
     }
 
@@ -434,6 +442,32 @@ impl Sender {
             self.clear_pending()?;
             return Ok(Recovered::Dropped(p.label));
         }
+        // M8: never mined, its nonce still free, and not to be sent again: cancelled (a transfer of 0 to the key itself
+        // at its nonce, fees raised so that it replaces the transaction in a pool still holding it), written ahead as a
+        // version of its own label ("…, cancelled": a later recovery sends that one again); one of the transaction's
+        // own versions may still be mined first
+        if self.cancel_at_recovery.contains(&p.label) {
+            let mut p = p;
+            let label = p.label.clone();
+            let own: Vec<String> = p.sent.iter().map(|(h, _)| h.clone()).collect();
+            let fees = self.policy.bump(p.fees)?;
+            let me = hex0x(&self.address());
+            let signed = self.tx(p.nonce, fees, 21_000, &me, "")?.sign(&self.key);
+            p.sent.push((hex0x(&signed.hash), hex0x(&signed.raw)));
+            p.label = format!("{label}, cancelled");
+            p.fees = fees;
+            p.to = me;
+            p.data = "0x".into();
+            p.gas_limit = 21_000;
+            p.sent_at = crate::now_unix();
+            self.write_pending(&p)?;
+            self.broadcast(l1, &hex0x(&signed.raw))?;
+            return match self.wait(l1, p)? {
+                Some(r) if own.contains(&r.tx_hash) => Ok(Recovered::Mined(r, label)),
+                Some(_) => Ok(Recovered::Cancelled(label)),
+                None => Ok(Recovered::Dropped(label)),
+            };
+        }
         // never mined, its nonce still free: the last version again (an endpoint restarted may have lost it)
         if let Some((_, raw)) = p.sent.last() {
             self.broadcast(l1, raw)?;
@@ -516,6 +550,7 @@ impl Sender {
                 eprintln!("{} l1tx: the pending {old} was mined in block {} (status {})", crate::now_unix(), r.block_number, r.status)
             }
             Recovered::Dropped(old) => eprintln!("{} l1tx: the pending {old} was dropped (its nonce was used)", crate::now_unix()),
+            Recovered::Cancelled(old) => eprintln!("{} l1tx: the pending {old} was cancelled, never sent again (M8)", crate::now_unix()),
         }
         let from = hex0x(&self.address());
         let call = json!({"from": from, "to": to, "data": hex0x(data)});
@@ -662,6 +697,13 @@ impl L1Tx {
         match self {
             L1Tx::Local(s) => s.address(),
             L1Tx::Endpoint { from } => *from,
+        }
+    }
+
+    /// M8: the labels cancelled when found unmined at a recovery ([`Sender::cancel_at_recovery`], `Local` only).
+    pub fn cancel_at_recovery(&mut self, labels: &[&str]) {
+        if let L1Tx::Local(s) = self {
+            s.cancel_at_recovery = labels.iter().map(|l| l.to_string()).collect();
         }
     }
 

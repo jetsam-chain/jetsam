@@ -18,7 +18,7 @@ fn plan(
 ) -> Result<Submission, NoSubmission> {
     let block = known.get(tip).map_or([0u8; 32], |k| k.cp.tip_block_id);
     let locked = known.get(tip).map_or([0u8; 32], |k| k.cp.locked_block_id);
-    plan_submission(c, known, tip, cum, &block, &locked, gl, found, missing, at)
+    plan_submission(c, known, tip, cum, &block, &locked, gl, found, missing, at, deposit_blocks_bound(3_000_000, 25))
 }
 
 /// The bridge genesis's locked height of these tests.
@@ -627,9 +627,9 @@ fn n2_a_point_that_leaves_a_block_out_is_rebuilt_extended_and_alerted() {
     }
     let why = finalize_alert(&fin, Some(&known[&gid])).unwrap();
     assert!(why.contains("[20]") && why.contains("claim-direct"), "{why}");
-    let direct = direct_claims_needed(&fin, &found, GL, &|_| false);
+    let direct = direct_claims_needed(&aid, &known, &found, GL, &|_| false, fin.accepted_at + D_SLOW);
     assert_eq!(direct.iter().map(|d| d.txid).collect::<Vec<_>>(), vec![found[&20][0].txid, found[&20][1].txid]);
-    assert_eq!(direct_claims_needed(&fin, &found, GL, &|t| *t == found[&20][0].txid).len(), 1, "minted already");
+    assert_eq!(direct_claims_needed(&aid, &known, &found, GL, &|t| *t == found[&20][0].txid, fin.accepted_at + D_SLOW).len(), 1, "minted already");
     // the child that extends A inherits the omission: nothing new to say once A is the final point
     let child = Known { cp: s.next, parent: aid, accepted_at: 200, headers: BTreeMap::new(), ours: true, omitted: Some(s.omitted.clone()), deposit_blocks: Some(s.deposit_blocks.clone()) };
     assert_eq!(finalize_alert(&child, Some(&fin)), None);
@@ -718,7 +718,7 @@ fn c1_a_foreign_extension_that_leaves_one_of_21_deposit_blocks_out_is_extended_f
     let claims = claims_of(&fin, &found, GL, &|_| false).unwrap();
     assert_eq!(claims.len(), 21);
     assert!(claims.iter().any(|(d, _)| d.amount == 800 * JTM));
-    assert_eq!(direct_claims_needed(&fin, &found, GL, &|_| false), vec![found[&11][0]]);
+    assert_eq!(direct_claims_needed(&aid, &known, &found, GL, &|_| false, fin.accepted_at + D_SLOW), vec![found[&11][0]]);
 }
 
 /// C1: no bound any more: 4 or 5 deposit blocks left out of 20 (the former search gave up beyond 4 096
@@ -745,10 +745,11 @@ fn m3_an_unknown_final_tree_lists_every_unminted_deposit_under_it() {
     let c = testkit::chain(60, 1);
     let (gid, _) = genesis_known(&c);
     let found = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(25, 3, 3 * JTM), dep(45, 4, 4 * JTM)]);
-    let (_, a) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[20]).0, 100);
+    let (aid, a) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[20]).0, 100);
     assert_eq!(a.omitted, None);
+    let known = HashMap::from([(aid, a.clone())]);
     let minted = found[&15][0].txid;
-    assert_eq!(direct_claims_needed(&a, &found, GL, &|t| *t == minted), vec![found[&20][0], found[&25][0]], "]10 ; 32], 15 minted, 45 above L");
+    assert_eq!(direct_claims_needed(&aid, &known, &found, GL, &|t| *t == minted, a.accepted_at + D_SLOW), vec![found[&20][0], found[&25][0]], "]10 ; 32], 15 minted, 45 above L");
     let why = finalize_alert(&a, None).unwrap();
     assert!(why.contains("claimDepositDirect"), "{why}");
 }

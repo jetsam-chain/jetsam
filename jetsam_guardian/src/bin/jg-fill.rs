@@ -505,7 +505,7 @@ impl Robot {
         let (receipt, list) = loop {
             let list: Vec<AdvanceOrder> = orders[..n].iter().map(|(_, o, _)| *o).collect();
             let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
-            let label = if list.len() == 1 { "advance" } else { "advanceBatch" };
+            let label = if list.len() == 1 { fill::LABEL_ADVANCE } else { fill::LABEL_ADVANCE_BATCH };
             match self.tx.send(&self.l1, &self.bridge, &data, label) {
                 Ok(r) => break (r, list),
                 Err(e) => {
@@ -803,12 +803,15 @@ fn run() -> anyhow::Result<()> {
     log(&format!("journal key (public) {}", hex::encode(key.public())));
     let journal = DecisionJournal::open(&cfg.state_dir.join("decisions.jsonl"), key)?;
     let refund = cfg.refund()?;
-    let tx = cfg.signer.open(cfg.profile()?, chain_id, Some(hot), &cfg.state_dir)?;
+    let mut tx = cfg.signer.open(cfg.profile()?, chain_id, Some(hot), &cfg.state_dir)?;
+    // M8: an advance found unmined at a recovery (here, and before every send) is cancelled, never sent again
+    tx.cancel_at_recovery(&fill::CANCEL_AT_RECOVERY);
     match tx.recover(&l1)? {
         Recovered::Nothing => {}
         // an advance mined before the stop is found on the contract (`advanceOf`) and recorded as recovered
         Recovered::Mined(r, label) => log(&format!("the {label} in flight at the stop was mined (block {}, status {})", r.block_number, r.status)),
         Recovered::Dropped(label) => log(&format!("the {label} in flight at the stop was dropped (its nonce was used)")),
+        Recovered::Cancelled(label) => log(&format!("the {label} in flight at the stop was cancelled, never sent again: its orders are decided again (M8)")),
     }
     log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
     let halt_file = cfg.state_dir.join("HALT");

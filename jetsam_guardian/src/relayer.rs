@@ -289,6 +289,22 @@ pub enum NoSubmission {
     /// MN-1 (A5-4): the contract's tip is on this chain but its roots are not this relayer's (another
     /// submitter left deposits out): a point that does not extend it would be refused (`MustExtendTip`).
     MustExtendTip,
+    /// R3-5 (re-audit n°3): the window would list more deposit blocks than this bound (the signer's `max_gas`,
+    /// [`deposit_blocks_bound`]), and the point within it does not advance or fails MN-5: raise `max_gas`.
+    TooManyDepositBlocks(usize),
+}
+
+/// R3-5 (re-audit n°3): the gas of a `submitCheckpoint` without its list (357 115 with the real Groth16 verifier and
+/// an empty list, A5FIX3), rounded up, and per height it lists (≈ 586 of execution and ≈ 164 of calldata, measured by
+/// the re-audit n°3), rounded up.
+pub const SUBMIT_BASE_GAS: u64 = 400_000;
+pub const SUBMIT_GAS_PER_DEPOSIT_BLOCK: u64 = 800;
+
+/// R3-5: the most deposit blocks one point lists so that its `submitCheckpoint` stays within the signer's `max_gas`
+/// with its margin (`l1tx::FeePolicy::gas_limit` refuses the relayer's own transaction above).
+pub fn deposit_blocks_bound(max_gas: u64, gas_margin_pct: u64) -> usize {
+    let within = u128::from(max_gas) * 100 / u128::from(100 + gas_margin_pct);
+    (within.saturating_sub(u128::from(SUBMIT_BASE_GAS)) / u128::from(SUBMIT_GAS_PER_DEPOSIT_BLOCK)) as usize
 }
 
 /// MN-1, as the program decides it: the block `block` (the bridge tip's block for `tip_on_branch`, A5-4;
@@ -302,9 +318,9 @@ pub fn on_new_branch(chain: &Chain, parent: &Checkpoint, fork_depth: u8, t: u64,
 
 /// The submission on top of the contract's tip `tip` (or of the nearest ancestor of it whose locked block
 /// and roots are those of `chain`), for the highest tip of `chain` whose locked block stays below the
-/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in). `bridge_tip_block` and
-/// `bridge_tip_locked_block` are the contract's `tipBlockId` and `tipLockedBlockId` (the block and the
-/// locked block of `tip`).
+/// first `Missing` body and lists at most `max_deposit_blocks` deposit blocks (R3-5: [`deposit_blocks_bound`]), at
+/// L1 time `l1_at` (when the transaction is expected in). `bridge_tip_block` and `bridge_tip_locked_block` are the
+/// contract's `tipBlockId` and `tipLockedBlockId` (the block and the locked block of `tip`).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_submission(
     chain: &Chain,
@@ -317,6 +333,7 @@ pub fn plan_submission(
     found: &BTreeMap<u64, Vec<FoundDeposit>>,
     missing: &[u64],
     l1_at: u64,
+    max_deposit_blocks: usize,
 ) -> Result<Submission, NoSubmission> {
     // the parent: the tip, else its nearest ancestor on this chain with our roots
     let mut cursor = *tip;
@@ -340,19 +357,28 @@ pub fn plan_submission(
         }
         cursor = k.parent;
     };
-    // the tip T: the highest whose L stays below the first unread body above the parent's L
+    // the tip T: the highest whose L stays below the first unread body above the parent's L, and (R3-5) below the
+    // deposit block that would be the list's `max_deposit_blocks + 1`-th (the next point takes the rest)
     let first_missing = missing.iter().copied().filter(|m| *m > parent.cp.locked_height).min();
+    let first_over = found.range(parent.cp.locked_height + 1..).nth(max_deposit_blocks).map(|(h, _)| *h);
+    // the tip the unread bodies alone would allow, when the bound lowered it
+    let mut unbounded_t = None;
     let mut t = chain.tip_height();
     loop {
         let l = chain.locked_height(t).ok_or(NoSubmission::ChainTooShort)?;
-        match first_missing {
-            Some(m) if l >= m => {
-                if t <= parent.cp.height {
-                    return Err(NoSubmission::MissingBody(m));
-                }
-                t -= 1;
+        if let Some(m) = first_missing.filter(|m| l >= *m) {
+            if t <= parent.cp.height {
+                return Err(NoSubmission::MissingBody(m));
             }
-            _ => break,
+            t -= 1;
+        } else if first_over.is_some_and(|o| l >= o) {
+            if t <= parent.cp.height {
+                return Err(NoSubmission::TooManyDepositBlocks(max_deposit_blocks));
+            }
+            unbounded_t.get_or_insert(t);
+            t -= 1;
+        } else {
+            break;
         }
     }
     let l = chain.locked_height(t).ok_or(NoSubmission::ChainTooShort)?;
@@ -361,6 +387,7 @@ pub fn plan_submission(
     if l < parent.cp.locked_height || t < parent.cp.height || (fork_depth == 0 && l == parent.cp.locked_height) {
         return Err(match first_missing {
             Some(m) if chain.locked_height(chain.tip_height()).is_some_and(|x| x >= m) => NoSubmission::MissingBody(m),
+            _ if unbounded_t.is_some() => NoSubmission::TooManyDepositBlocks(max_deposit_blocks),
             _ => NoSubmission::NotAdvancing,
         });
     }
@@ -385,7 +412,9 @@ pub fn plan_submission(
         return Err(NoSubmission::TimestampAhead);
     }
     if !mn5_ok(&mn, l1_at) {
-        return Err(NoSubmission::WorkRateTooLow);
+        // R3-5: the bound is why when the tip the unread bodies alone allow would pass MN-5
+        let bound_is_why = unbounded_t.and_then(|u| mn_values(chain, base, u)).is_some_and(|m| mn5_ok(&m, l1_at));
+        return Err(if bound_is_why { NoSubmission::TooManyDepositBlocks(max_deposit_blocks) } else { NoSubmission::WorkRateTooLow });
     }
     Ok(Submission {
         parent: parent_id,
@@ -496,14 +525,64 @@ pub fn finalize_alert(k: &Known, fin: Option<&Known>) -> Option<String> {
     }
 }
 
-/// N2: the deposits under the final point `fin` (at or below its L) in no root of its branch (the blocks its
+/// R3-6 (re-audit n°3): how long after its acceptance the deposits a final point's proof gave wait for its tree
+/// when a block its list names is not read here yet (they are in its root: a `claimDeposit`, ≈ 81 k gas, once the
+/// body is read), before they are queued for `claimDepositDirect` (≈ 407 k) all the same (M3): 24 h after the
+/// earliest finality.
+pub const TREE_WAIT_SECS: u64 = 2 * D_SLOW;
+
+/// R3-6 (re-audit n°3): the blocks of this relayer's chain that the point `id` or one of its ancestors left out of
+/// its window, from the published lists alone (no root is checked): a point's rebuilt tree when it has one, else
+/// its parent's and the deposit blocks of its window `]parent.L ; L]` that its list does not name. `None` when a
+/// point on the way, or its list, is not known.
+pub fn listed_omission(known: &HashMap<[u8; 32], Known>, found: &BTreeMap<u64, Vec<FoundDeposit>>, id: &[u8; 32]) -> Option<Vec<u64>> {
+    let mut path = Vec::new();
+    let mut cursor = *id;
+    let mut omitted = loop {
+        let k = known.get(&cursor)?;
+        if let Some(o) = &k.omitted {
+            break o.clone();
+        }
+        if k.parent == [0u8; 32] || path.len() > known.len() {
+            return None;
+        }
+        path.push(cursor);
+        cursor = k.parent;
+    };
+    for id in path.iter().rev() {
+        let k = &known[id];
+        let parent_l = known.get(&k.parent)?.cp.locked_height;
+        let given = k.deposit_blocks.as_ref()?;
+        if k.cp.locked_height < parent_l {
+            return None;
+        }
+        omitted.extend(found.range(parent_l + 1..=k.cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+    }
+    Some(omitted)
+}
+
+/// N2: the deposits under the final point `fin_id` (at or below its L) in no root of its branch (the blocks its
 /// tree left out), not minted yet: what only `claimDepositDirect` mints. M3 (re-audit n°2): when its tree is
-/// unknown, every deposit of `]gl ; L]` not minted yet (this relayer cannot claim any of them by Merkle branch).
-pub fn direct_claims_needed(fin: &Known, found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, minted: &dyn Fn(&[u8; 32]) -> bool) -> Vec<FoundDeposit> {
-    let omitted = fin.omitted.as_deref();
+/// unknown, every deposit of `]gl ; L]` not minted yet (this relayer cannot claim any of them by Merkle branch);
+/// R3-6 (re-audit n°3): but while the lists say which blocks were left out ([`listed_omission`]), only theirs, until
+/// [`TREE_WAIT_SECS`] after the point's acceptance (`now`, the L1 clock): the others are in its root, one body away.
+pub fn direct_claims_needed(
+    fin_id: &[u8; 32],
+    known: &HashMap<[u8; 32], Known>,
+    found: &BTreeMap<u64, Vec<FoundDeposit>>,
+    gl: u64,
+    minted: &dyn Fn(&[u8; 32]) -> bool,
+    now: u64,
+) -> Vec<FoundDeposit> {
+    let Some(fin) = known.get(fin_id) else { return Vec::new() };
+    let omitted = match &fin.omitted {
+        Some(o) => Some(o.clone()),
+        None if now < fin.accepted_at.saturating_add(TREE_WAIT_SECS) => listed_omission(known, found, fin_id),
+        None => None,
+    };
     found
         .range(gl + 1..=fin.cp.locked_height)
-        .filter(|(h, _)| omitted.is_none_or(|o| o.contains(h)))
+        .filter(|(h, _)| omitted.as_ref().is_none_or(|o| o.contains(h)))
         .flat_map(|(_, ds)| ds.iter().copied())
         .filter(|d| !minted(&d.txid))
         .collect()
@@ -616,6 +695,20 @@ pub fn claim_requests(dir: &Path) -> anyhow::Result<Vec<(PathBuf, u64, [u8; 32])
     Ok(out)
 }
 
+/// R3-3 (re-audit n°3): the queued requests that may go now under the final point locked at `fin_l` of `chain`, in
+/// their order: a request whose block is at or below the bridge genesis's `gl`, above `fin_l`, or whose archived body
+/// is not this chain's block there (an orphan's: an operator's request may wait for ever) waits without holding the
+/// requests behind it. A request without an archived body stays (it is closed, refused, when tried).
+pub fn claim_requests_ready(requests: Vec<(PathBuf, u64, [u8; 32])>, archive: &Archive, chain: &Chain, gl: u64, fin_l: u64) -> Vec<(PathBuf, u64, [u8; 32])> {
+    requests
+        .into_iter()
+        .filter(|(_, h, _)| match archive.index.get(h) {
+            Some(Body::Read { block_id, .. }) => *h > gl && *h <= fin_l && chain.id_at(*h) == Some(*block_id),
+            _ => true,
+        })
+        .collect()
+}
+
 /// C1, option B (decision 8 of the re-audit n°2): the deposits no final root holds (`direct_claims_needed`), queued
 /// by the relayer itself as an operator's `claim-direct` would be, each once: one queued or done (minted, or
 /// refused for good) is not queued again. Returns how many were queued now.
@@ -654,6 +747,36 @@ pub fn claim_direct_within_budget(spent: &[(u64, u64)], now: u64, budget: u64) -
 pub fn close_claim_request(path: &Path, outcome: &serde_json::Value) -> anyhow::Result<()> {
     write_atomic(&path.with_extension("done"), outcome.to_string().as_bytes())?;
     std::fs::remove_file(path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- A5-13: the relayer's halt on reverts
+
+/// A5-13 for the relayer (as `jg-fill`'s [`crate::fill::after_receipt`]): the count of its consecutive reverted
+/// transactions after a receipt of `status`, and the halt it reaches (`HALT_REPEATED_REVERTS` at
+/// [`crate::fill::MAX_CONSECUTIVE_REVERTS`]). `raced`: the revert is explained by another transaction landing first
+/// (the tip moved, the deposit minted, another point finalized): neither counted nor a success.
+pub fn after_own_receipt(reverts: u32, status: bool, raced: bool) -> (u32, Option<&'static str>) {
+    if !status && raced {
+        return (reverts, None);
+    }
+    crate::fill::after_receipt(reverts, status)
+}
+
+/// The relayer's latched halt (`<state_dir>/HALT`, its reasons, one a line), if any: while it is there, the relayer
+/// sends nothing (it reads, learns and rebuilds); only an operator removes it (D41).
+pub fn relay_halted(state_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(state_dir.join("HALT")).ok().map(|s| s.trim().to_string())
+}
+
+/// Latch `code` in `<state_dir>/HALT` (once: a code already there is not added again).
+pub fn latch_relay_halt(state_dir: &Path, code: &str) -> anyhow::Result<()> {
+    let mut text = std::fs::read_to_string(state_dir.join("HALT")).unwrap_or_default();
+    if !text.lines().any(|l| l.trim() == code) {
+        text.push_str(code);
+        text.push('\n');
+        write_atomic(&state_dir.join("HALT"), text.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -1325,6 +1448,18 @@ impl RelayConfig {
         anyhow::ensure!(prove_ahead < c.cadence_secs, "prove_ahead_secs must stay below the cadence");
         anyhow::ensure!(c.poll_secs > 0 && c.claims_per_step > 0, "poll_secs and claims_per_step must be positive");
         Ok(c)
+    }
+
+    /// R3-5: [`deposit_blocks_bound`] of this relayer's signer (without `[signer]`, the rehearsal's endpoint
+    /// account: the default signer's, as `jg-fill`'s batch bound).
+    pub fn deposit_blocks_bound(&self) -> usize {
+        let (max_gas, margin) = if self.signer == crate::l1tx::SignerConfig::default() {
+            let f = crate::l1tx::FeePolicy::default();
+            (f.max_gas, f.gas_margin_pct)
+        } else {
+            (self.signer.max_gas, self.signer.gas_margin_pct)
+        };
+        deposit_blocks_bound(max_gas, margin)
     }
 
     /// `[prover] prove_ahead_secs`, else [`DEFAULT_PROVE_AHEAD_SECS`] (half the cadence below 1 800 s).

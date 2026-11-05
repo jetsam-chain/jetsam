@@ -820,6 +820,14 @@ pub fn decided_for_good(code: &str) -> bool {
 pub const MAX_CONSECUTIVE_REVERTS: u32 = 3;
 pub const HALT_REPEATED_REVERTS: &str = "HALT_REPEATED_REVERTS";
 
+/// The labels of the robot's advances (one order, a batch).
+pub const LABEL_ADVANCE: &str = "advance";
+pub const LABEL_ADVANCE_BATCH: &str = "advanceBatch";
+/// M8 (re-audit n°2): an advance found unmined at a recovery of the robot's signer is cancelled, never sent again (its
+/// rule `ALREADY_UNDER_A_POINT` was decided before the stop, a point may have been accepted since: the fee would go
+/// to the recipient); its orders are decided again at the next step.
+pub const CANCEL_AT_RECOVERY: [&str; 2] = [LABEL_ADVANCE, LABEL_ADVANCE_BATCH];
+
 /// A5-13: the count of the robot's consecutive reverted transactions after a receipt of `status` (a success resets
 /// it), and the halt it reaches — the count back to 0 then, counted again after the operator's restart.
 pub fn after_receipt(reverts: u32, status: bool) -> (u32, Option<&'static str>) {
