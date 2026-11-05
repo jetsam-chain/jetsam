@@ -13,7 +13,7 @@
 //! TowerWalk + POWHDR sponge come from `tw-core` (gated 150/150 in the earlier bench).
 //!
 //! Bridge relations (contract `SPEC-v3.md`): [`spv`] = the checkpoint program (frame v3, G1-G11, the
-//! 736 bytes of public values), [`claim`] = the individual deposit-claim program (P1-P3); both apply the
+//! 768 bytes of public values), [`claim`] = the individual deposit-claim program (P1-P3); both apply the
 //! one deposit relation of [`deposit`].
 //!
 //! **v3 (T4.9)**: [`deposit`] reads whole blocks and runs the node's own deposit rule, the crate

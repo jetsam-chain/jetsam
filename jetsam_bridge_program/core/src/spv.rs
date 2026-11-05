@@ -15,7 +15,8 @@
 //! What a checkpoint adds (G6, G9): the blocks of `]parent.L ; L]` of the new branch — one anchor leaf
 //! (height, id, tx_root) per height at index `height − anchorBase` (`anchorBase = genesis.L + 1`, a public
 //! value the contract supplies), and the vault deposits of the whole blocks the input gives (a relayer may
-//! omit a whole block, never one deposit of a block it gives, nor invent one).
+//! omit a whole block, never one deposit of a block it gives, nor invent one; which blocks it gave is public
+//! value 23, C1 below).
 //!
 //! The context (G11): the parent's headers from [`context_range`]`.0` to `parent.height`, authenticated by
 //! the parent itself — `id[L−7..L]` by `headersDigest`, `id(L)` by `lockedBlockId`, every header up to T by
@@ -35,7 +36,15 @@
 //! the contract restarts its finality clock only when it does not (a real switch, deeper than the 8 blocks the
 //! nodes reorganize), never on a fork of the tip's unlocked context (an orphan above L).
 //!
-//! Public values (G8): the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` ([`public_values`]).
+//! C1 (re-audit n°2, option B): a point may leave whole blocks of its window out, and nothing else on the L1
+//! told which, so its deposit tree could be one no relayer rebuilds (and, the tip being on their chain, none
+//! could extend nor replace it: the bridge stopped for good). The program commits the heights of the whole
+//! blocks the input gives, in chain order (public value 23: `keccak256(abi.encodePacked(uint64[] heights))`,
+//! one 32-byte big-endian word per height, [`deposit_blocks_hash`]); the contract takes the list in calldata,
+//! checks it against word 23 and publishes it in `CheckpointAccepted`: every tree is a function of public data.
+//!
+//! Public values (G8): the 768 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn, depositBlocks)`
+//! ([`public_values`]).
 use crate::deposit;
 use crate::hdr::{b32_at, block_id, pow_valid, u32_at, u64_at, Hdr, HEADER_WIRE_SIZE};
 use crate::keccak::{keccak256, Keccak, PermuteFn};
@@ -44,9 +53,10 @@ use crate::tx;
 use crate::u256;
 use alloc::vec::Vec;
 
-pub const MAGIC: &[u8; 8] = b"JSPVIN07";
-/// Bytes of the public values (`JetsamBridge.publicValues`, v3 revised by A5-4 and the re-audit's N1: 23 words).
-pub const PV_LEN: usize = 736;
+pub const MAGIC: &[u8; 8] = b"JSPVIN08";
+/// Bytes of the public values (`JetsamBridge.publicValues`, v3 revised by A5-4, the re-audit's N1 and the second
+/// re-audit's C1: 24 words).
+pub const PV_LEN: usize = 768;
 /// Bytes of an encoded checkpoint in the input.
 pub const CHECKPOINT_LEN: usize = 248;
 pub const CP_DOMAIN: &[u8] = b"jetsam-bridge/checkpoint/v3";
@@ -188,6 +198,17 @@ pub struct Mn {
     pub locked_on_branch: bool,
 }
 
+/// Public value 23 (C1, re-audit n°2): `keccak256(abi.encodePacked(uint64[] heights))` of the heights of the whole
+/// blocks a transition gave, in the order given: one 32-byte big-endian word per height (Solidity pads the
+/// elements of a packed array); no height: keccak256 of no byte.
+pub fn deposit_blocks_hash(kf: PermuteFn, heights: &[u64]) -> [u8; 32] {
+    let mut k = Keccak::new(kf);
+    for h in heights {
+        k.update(&word_u64(*h));
+    }
+    k.finalize()
+}
+
 /// SPEC §2: keccak256 of the 8 block ids, ascending heights.
 pub fn headers_digest(kf: PermuteFn, ids: &[[u8; 32]]) -> [u8; 32] {
     assert!(ids.len() == DIGEST_HEADERS, "digest arity");
@@ -278,9 +299,10 @@ pub fn anchor_leaf(kf: PermuteFn, height: u64, block_id: &[u8; 32], tx_root: &[u
     k.finalize()
 }
 
-/// G8: the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` under `anchorBase`, the
-/// bridge's current tip block `bridge_tip_block` (`JetsamBridge.tipBlockId`) and its locked block
-/// `bridge_tip_locked_block` (`JetsamBridge.tipLockedBlockId`).
+/// G8: the 768 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn, depositBlocks)` under
+/// `anchorBase`, the bridge's current tip block `bridge_tip_block` (`JetsamBridge.tipBlockId`), its locked block
+/// `bridge_tip_locked_block` (`JetsamBridge.tipLockedBlockId`) and the [`deposit_blocks_hash`] of the heights of
+/// the whole blocks given.
 #[allow(clippy::too_many_arguments)]
 pub fn public_values(
     kf: PermuteFn,
@@ -291,8 +313,9 @@ pub fn public_values(
     bridge_tip_block: &[u8; 32],
     bridge_tip_locked_block: &[u8; 32],
     mn: &Mn,
+    deposit_blocks_hash: &[u8; 32],
 ) -> [u8; PV_LEN] {
-    let words: [[u8; 32]; 23] = [
+    let words: [[u8; 32]; 24] = [
         keccak256(kf, PV_DOMAIN),
         *prev_id,
         word_u64(next.height),
@@ -316,6 +339,7 @@ pub fn public_values(
         word_u64(mn.tip_on_branch as u64),
         *bridge_tip_locked_block,
         word_u64(mn.locked_on_branch as u64),
+        *deposit_blocks_hash,
     ];
     let mut pv = [0u8; PV_LEN];
     for (i, w) in words.iter().enumerate() {
@@ -347,9 +371,10 @@ pub fn context_range(parent: &ParentV3, fork_depth: u8) -> (u64, u64) {
     (core::cmp::min(digest_first, base.saturating_sub(BASE_CONTEXT)), parent.height)
 }
 
-/// Host side: the guest's input (`JSPVIN07`, see [`run_with`]). `context` must be the headers of
+/// Host side: the guest's input (`JSPVIN08`, see [`run_with`]). `context` must be the headers of
 /// [`context_range`]`(parent, fork_depth)`, `new_headers` the new branch above the fork base, and
-/// `deposit_blocks` whole blocks of `]parent.L ; L]` in chain order (every page of each); the
+/// `deposit_blocks` whole blocks of `]parent.L ; L]` in chain order (every page of each; their heights are public
+/// value 23); the
 /// frontiers are those of the parent's trees (`parent.depositCount` and `parent.L + 1 − anchor_base`
 /// leaves); `bridge_tip_block` and `bridge_tip_locked_block` are the bridge's `tipBlockId` and
 /// `tipLockedBlockId` when the proof is made (the proof is valid only while they are the bridge tip's).
@@ -439,6 +464,10 @@ pub struct Out {
     pub new_anchors: Vec<(u64, [u8; 32], [u8; 32])>,
     /// Deposits added to the deposit tree, in order: (index, deposit).
     pub new_deposits: Vec<(u64, deposit::BlockDeposit)>,
+    /// C1 (re-audit n°2): the heights of the whole blocks given, in order, and their [`deposit_blocks_hash`]
+    /// (public value 23, the contract's `depositBlocks`).
+    pub deposit_blocks: Vec<u64>,
+    pub deposit_blocks_hash: [u8; 32],
 }
 
 /// The relation under this program's own schedule and deposit rule (what the guest proves).
@@ -448,7 +477,7 @@ pub fn run(input: &[u8], kf: PermuteFn, pad: &mut [u64]) -> Out {
 
 /// Verify a checkpoint transition under `s` and `rule`; panics (= no proof) on any rule failure.
 ///
-/// Input `JSPVIN07` (integers little-endian, the parent's works big-endian as on the L1):
+/// Input `JSPVIN08` (integers little-endian, the parent's works big-endian as on the L1):
 /// anchorBase u64 | bridge tip block id 32 | bridge tip's locked block id 32 | parent {height u64, cumWork 32, headersDigest 32, depositRoot 32, depositCount u64,
 /// anchorRoot 32, lockedHeight u64, tipBlockId 32, lockedBlockId 32, lockedCumWork 32} | deposit frontier
 /// 32 x 32 | anchor frontier 32 x 32 | forkDepth u8 | n_ctx u32 | n_ctx headers (212 bytes, the heights
@@ -612,6 +641,7 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
     let mut count = prev.deposit_count;
     let mut last_height: Option<u64> = None;
     let mut new_deposits = Vec::new();
+    let mut deposit_blocks = Vec::new();
     let n_blk = r.u32() as usize;
     for _ in 0..n_blk {
         let height = r.u64();
@@ -625,6 +655,7 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
             assert!(height > prev, "deposit block order");
         }
         last_height = Some(height);
+        deposit_blocks.push(height);
         let rec = at(&recs, height);
         for d in deposit::block_deposits(height, &rec.tx_root, &pages, rule) {
             assert!(count < MAX_LEAVES, "deposit tree full");
@@ -636,6 +667,7 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
     }
     assert!(r.o == input.len(), "trailing input");
     let deposit_root = frontier_root(kf, &branch, count, &z);
+    let deposit_blocks_hash = deposit_blocks_hash(kf, &deposit_blocks);
 
     for (i, id) in ids.iter_mut().enumerate() {
         *id = at(&recs, locked - (DIGEST_HEADERS as u64 - 1) + i as u64).hash;
@@ -661,9 +693,9 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
         tip_on_branch,
         locked_on_branch,
     };
-    // G8: the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)`.
+    // G8: the 768 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn, depositBlocks)`.
     Out {
-        public_values: public_values(kf, &prev_id, &next, fork_depth, anchor_base, &bridge_tip_block, &bridge_tip_locked_block, &mn),
+        public_values: public_values(kf, &prev_id, &next, fork_depth, anchor_base, &bridge_tip_block, &bridge_tip_locked_block, &mn, &deposit_blocks_hash),
         prev_id,
         anchor_base,
         bridge_tip_block,
@@ -675,5 +707,7 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
         anchor_frontier: anchor_branch,
         new_anchors,
         new_deposits,
+        deposit_blocks,
+        deposit_blocks_hash,
     }
 }

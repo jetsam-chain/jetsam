@@ -6,7 +6,9 @@
 //! other the honest values the relayer computes with `jetsam_guardian` (`Chain::locked_height`,
 //! `headers_digest`, `anchor_root`, `work_at`, `checkpoint::{Checkpoint, Mn, public_values}`, the node's
 //! own reading of a block's deposits, `fill::deposits_of_block`), with the fork base found as the
-//! rehearsal relayer finds it. Required: the ten fields, the MN values and the 736 bytes, byte for byte.
+//! rehearsal relayer finds it. Required: the ten fields, the MN values and the 768 bytes, byte for byte; the
+//! program is given what the relayer gives it, the whole deposit blocks of the window (C1 of the re-audit n°2:
+//! their heights are public value 23, the contract's `depositBlocks`).
 //!
 //! Data:
 //! - default build: the real mainnet headers 44 544..44 581 (the program's fixture, public data);
@@ -313,8 +315,12 @@ impl World {
             tip_on_branch: jetsam_guardian::relayer::on_new_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip),
             locked_on_branch: jetsam_guardian::relayer::on_new_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip_locked),
         };
+        // C1: the relayer gives every deposit block of ]parent.L ; L] (`plan_submission`), by height
+        let deposit_blocks: Vec<u64> = (parent.cp.locked_height + 1..=l)
+            .filter(|x| self.deposits.get(&chain.id_at(*x).unwrap()).is_some_and(|ds| !ds.is_empty()))
+            .collect();
         let anchor_base = self.gl + 1;
-        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &bridge_tip, &bridge_tip_locked, &mn);
+        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &bridge_tip, &bridge_tip_locked, &mn, &deposit_blocks);
         if first_acceptance {
             self.tip_block = cp.tip_block_id;
             self.tip_locked = cp.locked_block_id;
@@ -331,7 +337,8 @@ impl World {
         assert_eq!(out.next, to_program(&cp), "{name}: the ten fields");
         assert_eq!(out.mn, to_program_mn(&mn), "{name}: MN");
         assert_eq!(out.fork_depth, fork_depth, "{name}");
-        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 736 bytes");
+        assert_eq!(out.deposit_blocks, deposit_blocks, "{name}: the heights given");
+        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 768 bytes");
         assert_eq!(out.bridge_tip_block, bridge_tip, "{name}: the bridge's tip block");
         assert_eq!(out.bridge_tip_locked_block, bridge_tip_locked, "{name}: the bridge's tip's locked block");
         assert_eq!(out.next.id(kf), cp.id(), "{name}: checkpointId");
@@ -362,6 +369,7 @@ impl World {
                 "forkBaseWork": hex(&mn.fork_base_work), "segmentWork": hex(&mn.segment_work), "maxTimestamp": mn.max_timestamp,
                 "tipOnBranch": mn.tip_on_branch, "lockedOnBranch": mn.locked_on_branch,
             },
+            "depositBlocks": deposit_blocks,
             "publicValues": hex(&out.public_values),
             "checkpointId": hex(&out.next.id(kf)),
             "lockedFloor": parent.cp.locked_height,
@@ -390,9 +398,14 @@ impl World {
             fork_depth,
             context: (lo..=hi).map(|x| parent.branch.h(x)).collect(),
             new: (base + 1..=tip).map(|x| b.h(x)).collect(),
+            // the whole deposit blocks of the window, as the relayer gives them (its archive keeps those)
             blocks: b
                 .blocks
                 .range(parent.cp.locked_height + 1..=l)
+                .filter(|(x, _)| {
+                    let id = HeaderInfo::from_raw(&b.h(**x)).unwrap().id;
+                    self.deposits.get(&id).is_some_and(|ds| !ds.is_empty())
+                })
                 .map(|(x, raw)| (*x, pages_of(raw)))
                 .collect(),
         }
@@ -866,7 +879,7 @@ mod rehearsal {
             Some("anchor frontier"),
             "the parent's anchor root binds its count"
         );
-        // L is the program's: the 736 bytes of a point claiming L ± 1 are not the program's
+        // L is the program's: the 768 bytes of a point claiming L ± 1 are not the program's
         for dl in [-1i64, 1] {
             let mut next = ok.next;
             next.locked_height = (next.locked_height as i64 + dl) as u64;
@@ -879,7 +892,8 @@ mod rehearsal {
                     ok.anchor_base,
                     &ok.bridge_tip_block,
                     &ok.bridge_tip_locked_block,
-                    &ok.mn
+                    &ok.mn,
+                    &ok.deposit_blocks_hash
                 ),
                 ok.public_values
             );
