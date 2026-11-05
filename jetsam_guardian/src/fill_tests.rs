@@ -1501,6 +1501,92 @@ fn a5_15_one_robot_per_state_dir() {
     assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
 }
 
+/// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name
+/// (`<file name>.tmp`: never a sibling's), overwriting one a crash left, leaving none.
+#[test]
+fn a5_14_write_atomic_replaces_the_file_whole_under_its_own_temporary() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("state.json");
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+    crate::write_atomic(&p, b"one").unwrap();
+    assert_eq!(read(&p), "one");
+    // a temporary left by a crash before its rename is replaced, none is left
+    std::fs::write(dir.path().join("state.json.tmp"), "stale and longer").unwrap();
+    crate::write_atomic(&p, b"two").unwrap();
+    assert_eq!(read(&p), "two");
+    assert!(!dir.path().join("state.json.tmp").exists(), "no temporary left");
+    // a sibling of the same stem is not its temporary
+    std::fs::write(dir.path().join("state.tmp"), "a sibling").unwrap();
+    crate::write_atomic(&p, b"three").unwrap();
+    assert_eq!((read(&p).as_str(), read(&dir.path().join("state.tmp")).as_str()), ("three", "a sibling"));
+    assert!(crate::write_atomic(&dir.path().join("absent/state.json"), b"x").is_err());
+}
+
+/// A5-14: the file is synced before its rename and the directory after it (the order of the system calls, read
+/// with strace in a child process: this test binary again, `a5_14_write_atomic_child` only). Without strace on
+/// the host: skipped, said.
+#[test]
+fn a5_14_write_atomic_syncs_the_file_then_renames_it_then_syncs_the_directory() {
+    if std::env::var_os("JG_WRITE_ATOMIC_CHILD").is_some() {
+        return;
+    }
+    if std::process::Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("SKIPPED: no strace on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    let (trace, target) = (real.join("trace"), real.join("state.json"));
+    let out = std::process::Command::new("strace")
+        .args(["-f", "-y", "-qq", "-e", "trace=fsync,fdatasync,rename,renameat,renameat2", "-o"])
+        .arg(&trace)
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "fill::tests::a5_14_write_atomic_child", "--test-threads", "1"])
+        .env("JG_WRITE_ATOMIC_CHILD", &target)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"child\":1}");
+    let text = std::fs::read_to_string(&trace).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let tmp = format!("{}.tmp", target.display());
+    let at = |what: &dyn Fn(&str) -> bool| lines.iter().position(|l| what(l));
+    let file_synced = at(&|l: &str| (l.contains("fsync(") || l.contains("fdatasync(")) && l.contains(&format!("<{tmp}>)")));
+    let renamed = at(&|l: &str| l.contains("rename") && l.contains(&format!("\"{tmp}\"")) && l.contains(&format!("\"{}\"", target.display())));
+    let dir_synced = at(&|l: &str| l.contains("fsync(") && l.contains(&format!("<{}>)", real.display())));
+    let (Some(f), Some(r), Some(d)) = (file_synced, renamed, dir_synced) else { panic!("file synced {file_synced:?}, renamed {renamed:?}, directory synced {dir_synced:?}:\n{text}") };
+    assert!(f < r && r < d, "the file synced, then renamed, then the directory synced:\n{text}");
+}
+
+#[test]
+fn a5_14_write_atomic_child() {
+    let Some(target) = std::env::var_os("JG_WRITE_ATOMIC_CHILD") else { return };
+    crate::write_atomic(std::path::Path::new(&target), b"{\"child\":1}").unwrap();
+}
+
+/// A5-14: `state.json` absent is a first start; present but unreadable, jg-fill does not start (its ledger is what
+/// its caps and its repayments count: an operator restores it, or removes it knowingly).
+#[test]
+fn a5_14_a_state_present_but_unreadable_refuses_to_start() {
+    #[derive(Debug, Default, PartialEq, Deserialize)]
+    struct S {
+        n: u64,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("state.json");
+    assert_eq!(read_state::<S>(&p).unwrap(), S::default(), "absent: a first start");
+    std::fs::write(&p, "{\"n\":7}").unwrap();
+    assert_eq!(read_state::<S>(&p).unwrap(), S { n: 7 });
+    for bad in ["", "{\"n\":", "garbage", "{\"n\":\"7\"}", "{}"] {
+        std::fs::write(&p, bad).unwrap();
+        let e = read_state::<S>(&p).unwrap_err().to_string();
+        assert!(e.contains("state.json") && e.contains("does not start"), "{bad:?}: {e}");
+    }
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir(&p).unwrap();
+    assert!(read_state::<S>(&p).unwrap_err().to_string().contains("does not start"), "not a readable file");
+}
+
 // ---------------------------------------------------------------- the robot's activation gate (A5-12)
 
 /// **The activation gate of the robot `jg-fill`** (A5-12, CI): green, the robot may advance; red, it must not

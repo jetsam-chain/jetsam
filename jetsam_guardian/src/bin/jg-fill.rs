@@ -19,6 +19,8 @@
 //! * A5-18: every step reads the token's `totalSupply()` and the bridge's `suspectMinted()`: nothing is
 //!   advanced while `suspectMinted() > 0`, nor beyond what the contract's ceiling holds after the mints of the
 //!   robot's own pending advances (C-6 kept prudent).
+//! * A5-14: `<state_dir>/state.json` (its ledger, what its caps and repayments count) is written synced, file then
+//!   directory, around its rename (`jetsam_guardian::write_atomic`); present but unreadable, the robot does not start.
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
 //!   with its cause. Either way the robot keeps observing, journaling and checking its repayments. A loss
 //!   (its deposit minted to another tuple) halts; an advance not repaid after 72 h is an ALERT only, still
@@ -148,13 +150,11 @@ impl Robot {
         Ok(word_u64(&self.l1.call(&self.token, &data)?, 0))
     }
 
+    /// A5-14: `state.json` synced before and after its rename (file, then directory).
     fn save(&self) {
-        let path = self.cfg.state_dir.join("state.json");
-        let tmp = path.with_extension("tmp");
-        if let Ok(text) = serde_json::to_string(&self.state) {
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        let written = serde_json::to_vec(&self.state).map_err(anyhow::Error::from).and_then(|b| jetsam_guardian::write_atomic(&self.cfg.state_dir.join("state.json"), &b));
+        if let Err(e) = written {
+            log(&format!("STATE WRITE FAILED: {e:#}"));
         }
     }
 
@@ -661,6 +661,8 @@ fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.state_dir)?;
     // A5-15: one robot per state_dir, held until the end
     let _lock = fill::lock_state_dir(&cfg.state_dir)?;
+    // A5-14: a state.json present but unreadable stops the start here, before any socket
+    let mut state: State = fill::read_state(&cfg.state_dir.join("state.json"))?;
     let l1 = L1::via(&cfg.l1_rpc, egress);
     let chain_id = l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
     anyhow::ensure!(chain_id == cfg.l1_chain_id, "the L1 endpoint is chain {chain_id}, not {}: jg-fill does not start", cfg.l1_chain_id);
@@ -696,7 +698,6 @@ fn run() -> anyhow::Result<()> {
         observers.push(Observer::new(ocfg, Chain::from_genesis(genesis))?);
         clients.push(c);
     }
-    let mut state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let reopened = state.ledger.reopen_overdue();
     if reopened > 0 {
         log(&format!("{reopened} advance(s) noted LOST_NOT_REPAID_72H by an older robot are pending again (A5-16: an alert, never a loss)"));

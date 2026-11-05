@@ -852,6 +852,27 @@ fn jg_fill_refuses_to_start_off_tor_or_the_loopback_and_dials_nothing() {
     }
 }
 
+/// A5-14: a `state.json` present but unreadable stops jg-fill at its start, before any socket, and is left as it
+/// was (an operator restores it or removes it knowingly). Only the rehearsal build gets that far (another build's
+/// v1.7 clock stops it before: `jg_fill_reaches_its_nodes_…`).
+#[test]
+fn jg_fill_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let (target, socks) = untouchable();
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{}\"\n", socks.local_addr().unwrap().port());
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), "{\"ledger\":").unwrap();
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("state.json") && log.contains("unreadable") && log.contains("does not start"), "{log}");
+    untouched(&target, &socks, "an unreadable state.json");
+    assert_eq!(std::fs::read_to_string(dir.join("state/state.json")).unwrap(), "{\"ledger\":", "left as it was");
+}
+
 /// A fake world behind the SOCKS port: two onion nodes (the testkit genesis only) and an onion L1 (chain
 /// 31 337, a token, the hot key's balance `stock`).
 fn fill_world(stock: u64) -> Answer {

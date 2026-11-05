@@ -878,6 +878,18 @@ pub fn lock_state_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
     Ok(lock)
 }
 
+/// A5-14: the robot's `state.json` at start (written by [`crate::write_atomic`]): absent, a first start (the
+/// default); present but unreadable or not a state, jg-fill does not start — its ledger is what its caps and its
+/// repayments count, an operator restores it (or removes it knowingly).
+pub fn read_state<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => anyhow::bail!("{}: present but not readable ({e}): jg-fill does not start", path.display()),
+    };
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: present but unreadable ({e}): jg-fill does not start (restore it, or remove it knowingly)", path.display()))
+}
+
 /// The start check of the hot key: it holds the capped stock only.
 pub fn check_stock(balance: u64, max_stock: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
