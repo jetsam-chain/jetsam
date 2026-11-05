@@ -146,6 +146,12 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
   recipient within 24 h), and does not start unless the bridge's `ADVANCE_MIN_AGE()` is 86 400. **An advance
   doubled by the relayer** (its point covering the deposit lands in the few minutes between the robot's read of the
   tip and its advance) **loses its fee: accepted** (the recipient gets it; the robot is repaid what it paid).
+- **The rent of an advance after its point (re-audit n°2, a known limit, written as is)**: an advance made after the
+  acceptance of the point that covers its deposit is young at the earliest mint to the second only: minted one L1
+  block (12 s) later, it keeps its 1 %. **A third party can still take 1 % on the deposits the robot leaves
+  (`ALREADY_UNDER_A_POINT`), against 24 h of capital**, with no reorganization risk: about the service the robot
+  renders, so fair competition, not a flaw (contract test
+  `test_known_limit_an_advance_one_l1_block_after_the_point_keeps_its_fee_for_24h_of_capital`).
 - Holder of each hot key and rotation procedure: **[NV]** (to be written here).
 
 ## Loss per incident (decision 11 of the audit A5)
@@ -162,26 +168,33 @@ tip's own chain that does not extend the tip is refused, the finality clock does
 honest relayers out of step restarted the 24 h clock. Two relayers then share nothing but the L1: a proof
 made while the other's point landed is void (refused, made again on the new tip).
 
-## Deposits in no root (re-audit N2, A5-22)
+## Deposits in no root (re-audit N2, A5-22; C1 of the re-audit n°2)
 
 Anyone may submit a point that leaves whole deposit blocks out (the program allows it; it never lets one
-deposit of a block out, nor invents one). `jg-relay` rebuilds the tree of every point it learns (which of its
-deposit blocks the point left out: `ALERT POINT_LEAVES_DEPOSITS_OUT`, or `ALERT POINT_TREE_UNKNOWN` when it
-cannot), extends such a point when it is the contract's tip, finalizes it all the same with
-`ALERT FINALIZING_POINT_NOT_COMPLETE` (those deposits are in no root of its branch for ever; refusing would hold
-every other deposit), and names what is left with `ALERT DEPOSITS_IN_NO_FINAL_ROOT` and the commands to run.
-A deposit in no root is minted only by `claimDepositDirect` (a person decides, D41):
+deposit of a block out, nor invents one). Since the second re-audit (C1, option B) the proof commits the heights
+of the blocks it gave (public value 23) and the contract publishes them in `CheckpointAccepted`: `jg-relay`
+rebuilds the tree of every point it learns from that list, without any search (which of its deposit blocks the
+point left out: `ALERT POINT_LEAVES_DEPOSITS_OUT`; `ALERT POINT_TREE_UNKNOWN` only while a listed block's body is
+not read here, or for a point of another chain), extends such a point when it is the contract's tip, finalizes it
+all the same with `ALERT FINALIZING_POINT_NOT_COMPLETE` (those deposits are in no root of its branch for ever;
+refusing would hold every other deposit), and names what is left with `ALERT DEPOSITS_IN_NO_FINAL_ROOT`: the
+deposits its tree left out or, when the final point's tree is unknown here, **every deposit under it not minted
+yet** (re-audit n°2, M3: never an empty list). A deposit in no root is minted only by `claimDepositDirect`:
 
-1. `jg-relay --config <relay.toml> claim-direct <height> <txid>` on the relayer's host: it checks that the
-   archive holds the body of block `<height>` with that deposit and queues the request
-   (`<state_dir>/claim-direct/<height>-<txid>.req`); it never touches the L1.
-2. The running `jg-relay` (the only process signing with its key) proves it with `[prover] claim_command` (the
-   deposit-claim program, input `JCLMIN03`: the whole archived block and the deposit's group, `{input}`,
-   `{proof}`, `{public_values}` as for `command`), runs the program natively first, and sends
-   `claimDepositDirect` against the final point's anchor root once block `<height>` is under it. Without
+1. **The relayer queues it by itself** (`<state_dir>/claim-direct/<height>-<txid>.req`, once: a request done is not
+   queued again), the same queue as an operator's `jg-relay --config <relay.toml> claim-direct <height> <txid>`
+   (which checks that the archive holds the body of block `<height>` with that deposit; it never touches the L1).
+2. The running `jg-relay` (the only process signing with its key) proves the oldest request with `[prover]
+   claim_command` (the deposit-claim program, input `JCLMIN03`: the whole archived block and the deposit's group,
+   `{input}`, `{proof}`, `{public_values}` as for `command`), runs the program natively first, and sends
+   `claimDepositDirect` against the final point's anchor root once block `<height>` is under it, within
+   **`claim_direct_daily_gas`** (default 10 000 000 gas in 24 h of the L1 clock, about 22 direct claims; 450 000
+   counted before each; 0: none; over budget: `ALERT CLAIM_DIRECT_BUDGET`, the request waits). Without
    `claim_command` the request waits, with an alert. Done or refused: `<height>-<txid>.done` (its outcome).
 
-An advance of such a deposit is repaid by that mint as by any other (same key: txid, recipient, amount).
+An advance of such a deposit is repaid by that mint as by any other (same key: txid, recipient, amount). A third
+party who forces every deposit this way (by being first to extend at every cycle) costs the relayer one claim
+proof and ≈ 0.4 M gas per deposit, bounded by the budget; the deposits wait beyond it, none is lost.
 
 ## Hashrate (audit A5-5, written publicly)
 
@@ -189,6 +202,21 @@ The bridge stops by itself when the mining collapses durably below about 15 % of
 again only when the hashrate returns: a point is accepted only if it lands within 1 800 s of its parent's tip
 block or carries at least 40 % of the work its fork base's target produces in the time since (MN-5, kept on
 purpose: a rate relative to the current target would be an attacker's lever). Burns and releases go on.
+
+What a miner can do to the bridge, with MN-5 (re-audit n°2, §1.4; these replace the "5-10 %" written after A5FIX2):
+**with about 40 % of the reference hashrate, freeze the finality (never steal)**: a real switch abandons the tip's
+locked block, 10 blocks from its fork base within 4 500 s; **with about 30 %, decanonize points without freezing**:
+shift the tip without abandoning its locked block, 2 blocks + a proof + its inclusion within 1 800 s of the fork
+base (about 15 % with a public orphan exactly at the tip's height). Contract tests
+`test_known_limit_shifting_the_tip_without_a_switch_must_land_within_1800s_of_its_base`,
+`test_known_limit_a_real_switch_needs_ten_blocks_within_4500s_of_its_base`.
+
+## Proofs and the address (A5-28)
+
+Two programs fix the bridge's CREATE2 address, through the vkeys in `verifier` and `claimVerifier`: the checkpoint
+program (`JSPVIN08`, 768 bytes) and the deposit-claim program (`JCLMIN03`, 192 bytes, now on the nominal path of the
+deposits a point leaves out). **Neither has ever produced a real proof** (SP1 executor and TEST verifier only). **No
+address is frozen before a real proof of each has been verified by the deployed verifier.**
 
 ## Robot and relayer on one host (re-audit, A5-7)
 
