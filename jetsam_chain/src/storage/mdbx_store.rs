@@ -5705,6 +5705,10 @@ mod tests {
             (b, hash)
         });
         let txn = store.db.begin_rw_txn().unwrap();
+        // An armed store also has its guardian journal: both tables created
+        // by their first entry fit within `N_TABLES`.
+        txn.create_table(Some(T_GUARDIAN_JOURNAL), TableFlags::empty())
+            .unwrap();
         let headers = txn.open_table(Some(T_HEADERS)).unwrap();
         for (b, hash) in &blocks {
             archive_block_body_object(&txn, b.header.height, *hash, &b.to_bytes()).unwrap();
