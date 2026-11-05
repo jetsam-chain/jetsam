@@ -771,6 +771,48 @@ mod rehearsal {
         assert_eq!(w.vectors.last().unwrap()["mn"]["maxTimestamp"], ts(145));
     }
 
+    /// M6 (re-audit n°2): a real switch, the bridge tip's LOCKED block abandoned (`lockedOnBranch` false), which no
+    /// real chain at hand has (its orphans are single blocks, always above a locked block of the chain). On a genesis
+    /// at 122: a point X on a FIXTURE branch mined on block 122 (`jgfill-fixture-switch-123-131.json`: nine headers
+    /// under every header rule, 170 s apart, no body), whose locked block 123' is its own; then the chain's point at
+    /// 142 from the same parent, heavier, with the 7 JTM deposit of 129: it holds neither X's tip block nor X's locked
+    /// block (`tipOnBranch` and `lockedOnBranch` false), the contract restarts its finality clock (a switch,
+    /// CheckpointV3Vectors). The vectors file `rehearsal-switch`.
+    #[test]
+    fn a_real_switch_abandons_the_tips_locked_block() {
+        let d = data();
+        let fx: Value = serde_json::from_str(include_str!("fixtures/jgfill-fixture-switch-123-131.json")).unwrap();
+        let mut alt = d.main.clone();
+        alt.headers.retain(|x, _| *x <= 122);
+        alt.blocks.retain(|x, _| *x <= 122);
+        for (i, h) in fx["headers"].as_array().unwrap().iter().enumerate() {
+            alt.headers.insert(123 + i as u64, unhex(h.as_str().unwrap()).try_into().unwrap());
+        }
+        assert_eq!(alt.headers.len(), 132, "0..=122 of the chain, 123'..=131'");
+        let mut w = world(&d, 122);
+        let g = w.genesis(&d.main);
+        let x = w.step("switch-alt-131", &g, &alt, 131, None);
+        let main_id = |h: u64| HeaderInfo::from_raw(&d.main.h(h)).unwrap().id;
+        assert_eq!(x.cp.locked_height, 123);
+        assert_ne!(x.cp.locked_block_id, main_id(123), "X's locked block is its own, not the chain's");
+        let n = w.step("switch-back-142", &g, &d.main, 142, None);
+        let last = w.vectors.last().unwrap().clone();
+        assert_eq!((last["forkDepth"].as_u64(), n.cp.locked_height), (Some(0), 133));
+        assert_eq!(last["mn"]["tipOnBranch"], false, "X's tip block 131' is not on the chain");
+        assert_eq!(last["mn"]["lockedOnBranch"], false, "nor X's locked block 123': a real switch");
+        assert_eq!(last["bridgeTipLockedBlock"], hex(&x.cp.locked_block_id));
+        assert_eq!(last["depositBlocks"], json!([129]));
+        assert!(gu::cmp(&gu::from_be(&n.cp.cum_work), &gu::from_be(&x.cp.cum_work)) == std::cmp::Ordering::Greater, "heavier than X (R3)");
+        // the program decides the bit on the block named: the same transition against a tip whose locked block is
+        // the chain's (the genesis's own) holds it
+        let mut i = w.input(&g, &d.main, 142, 0, 133);
+        i.bridge_tip = x.cp.tip_block_id;
+        i.bridge_tip_locked = g.cp.locked_block_id;
+        let held = quiet(|| run(&i.bytes(), &w.schedule, &w.rule)).unwrap();
+        assert!(held.mn.locked_on_branch && !held.mn.tip_on_branch);
+        w.vectors_file("rehearsal-switch", &g, json!({}));
+    }
+
     /// Real forks: the four orphans as parents' tips, each followed by the chain's branch (`forkDepth` 1),
     /// on a genesis at 70; the 7 JTM deposit enters through a fork (]115 ; 133]); and the fork from 127'
     /// at every deeper base down to the parent's L, re-proving the shared blocks.
