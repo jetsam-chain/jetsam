@@ -941,3 +941,16 @@ fn a5_13_three_unexplained_reverts_of_the_relayer_halt_it_until_an_operator_rest
     std::fs::remove_file(dir.path().join("HALT")).unwrap();
     assert_eq!(relay_halted(dir.path()), None, "an operator removed it");
 }
+
+/// R3-5: the relayer's bound is its signer's (`RelayConfig::deposit_blocks_bound`): the default signer's without
+/// `[signer]` (the rehearsal's endpoint account), the configured `max_gas` and margin otherwise. (Written after the
+/// code; its mutant `r35-config-default-zero` is the red.)
+#[test]
+fn r3_5_the_deposit_blocks_bound_is_the_signers() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    assert_eq!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, cmd)).unwrap().deposit_blocks_bound(), 2_500);
+    let signer = "[signer]\nkey_file = \"/k\"\nmax_gas = 1000000\ngas_margin_pct = 25\n";
+    assert_eq!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}{signer}"))).unwrap().deposit_blocks_bound(), 500);
+}
