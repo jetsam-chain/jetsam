@@ -6,7 +6,7 @@
 //! `jg-fill` advances under it (`jetsam_guardian::fill`); the contract keys a deposit's single mint on it.
 //! It is the chain's own logical txid (`jetsam_tx::wire::body_hash`, `paged_spend::hash_paged_spend_unchecked`)
 //! recomputed from the 323-byte wire pages, checked equal to it on the G6 vectors in CI
-//! (`jetsam_guardian/tests/robot_activation_gate.rs`) and by the robot on every block it reads; the chain
+//! (`robot_activation_gate_*` in `jetsam_guardian/src/fill_tests.rs`) and by the robot on every block it reads; the chain
 //! keeps `jetsam_tx`'s as its consensus txid.
 //!
 //! (Moved from the proof program's `tx.rs`, unchanged: transaction bodies, their 31-permutation hash, the

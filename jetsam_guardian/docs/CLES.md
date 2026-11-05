@@ -148,3 +148,36 @@ A second relayer is allowed only with a contract that carries the A5-4 fix (`Mus
 tip's own chain that does not extend the tip is refused, the finality clock does not move): before it, two
 honest relayers out of step restarted the 24 h clock. Two relayers then share nothing but the L1: a proof
 made while the other's point landed is void (refused, made again on the new tip).
+
+## Deposits in no root (re-audit N2, A5-22)
+
+Anyone may submit a point that leaves whole deposit blocks out (the program allows it; it never lets one
+deposit of a block out, nor invents one). `jg-relay` rebuilds the tree of every point it learns (which of its
+deposit blocks the point left out: `ALERT POINT_LEAVES_DEPOSITS_OUT`, or `ALERT POINT_TREE_UNKNOWN` when it
+cannot), extends such a point when it is the contract's tip, finalizes it all the same with
+`ALERT FINALIZING_POINT_NOT_COMPLETE` (those deposits are in no root of its branch for ever; refusing would hold
+every other deposit), and names what is left with `ALERT DEPOSITS_IN_NO_FINAL_ROOT` and the commands to run.
+A deposit in no root is minted only by `claimDepositDirect` (a person decides, D41):
+
+1. `jg-relay --config <relay.toml> claim-direct <height> <txid>` on the relayer's host: it checks that the
+   archive holds the body of block `<height>` with that deposit and queues the request
+   (`<state_dir>/claim-direct/<height>-<txid>.req`); it never touches the L1.
+2. The running `jg-relay` (the only process signing with its key) proves it with `[prover] claim_command` (the
+   deposit-claim program, input `JCLMIN03`: the whole archived block and the deposit's group, `{input}`,
+   `{proof}`, `{public_values}` as for `command`), runs the program natively first, and sends
+   `claimDepositDirect` against the final point's anchor root once block `<height>` is under it. Without
+   `claim_command` the request waits, with an alert. Done or refused: `<height>-<txid>.done` (its outcome).
+
+An advance of such a deposit is repaid by that mint as by any other (same key: txid, recipient, amount).
+
+## Robot and relayer on one host (re-audit, A5-7)
+
+`jg-fill` advances only a deposit whose block body the relayer published (`<publish_dir>/blocks/`): the robot
+reads that directory locally. Deploy the robot on the relayer's host, or give it the directory on a shared
+file system it can only read.
+
+## Rehearsal binaries (re-audit N5)
+
+The format of `BridgeAccountProof` (A5-8: the account and the storage of slot 13) is not the one of the
+binary 7869181 (that node refuses the new payload: `MalformedObject`): every node of a rehearsal runs the same
+build; a rehearsal is redeployed as a whole, never node by node.
