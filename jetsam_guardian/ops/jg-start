@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # jg-start <role> --state <dir> --config <guardian.toml> --bin-dir <dir> [--passphrase-file <f>]
-#   role: observe | net | sign | fill
+#   role: observe | net | sign | fill | relay
 # Design §8.1: the binary's SHA-256 and the configuration's must be listed in <state>/allowed.sha256
 # (edited BY HAND on the machine); no second instance (PID file + /proc start time + exe hash);
 # jg-sign is started inside an EMPTY network namespace (unshare --net), its passphrase handed on
@@ -14,7 +14,7 @@ while [ $# -gt 0 ]; do case $1 in
   --state) state=$2; shift 2;; --config) config=$2; shift 2;; --bin-dir) bindir=$2; shift 2;;
   --passphrase-file) pass=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 : "${state:?--state}" "${config:?--config}" "${bindir:?--bin-dir}"
-case $role in observe|net|sign|fill) ;; *) echo "role: observe | net | sign | fill" >&2; exit 2;; esac
+case $role in observe|net|sign|fill|relay) ;; *) echo "role: observe | net | sign | fill | relay" >&2; exit 2;; esac
 bin=$bindir/jg-$role
 [ -x "$bin" ] || { echo "no $bin" >&2; exit 1; }
 allowed=$state/allowed.sha256

@@ -559,6 +559,18 @@ fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
 }
 
 fn run() -> anyhow::Result<()> {
+    // A5-15, decision 10 of the audit A5: hardened before anything is read (the hot key in clear, 0600)
+    let h = jetsam_guardian::harden::harden();
+    log(&format!(
+        "hardened: dumpable {}, core dumps {}, memory {}",
+        if h.dumpable_off { "off" } else { "ON (prctl refused)" },
+        if h.core_off { "off" } else { "ON (setrlimit refused)" },
+        match &h.memory_locked {
+            Ok(()) => "locked".to_string(),
+            Err(why) => format!("NOT locked ({why})"),
+        }
+    ));
+    anyhow::ensure!(h.dumpable_off && h.core_off, "the process cannot be hardened: jg-relay does not start");
     let args: Vec<String> = std::env::args().collect();
     let (cfg, digest) = config(&args)?;
     if let Some(i) = args.iter().position(|a| a == "--config") {

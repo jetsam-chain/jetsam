@@ -118,10 +118,22 @@ Procedure (written down, nothing deployed by it):
 
 Decision (user, 04/11, recommendation of the audit): the hot keys stay in a **clear file, mode 0600** (or
 0400), owned by the uid of the process, so that the robot and the relayer restart without an operator; the
-risk is bounded by the **stock** of the robot (`max_stock`: the robot refuses to start above it) and by the
-gas of the relayer's account. The processes are hardened (no core dump, not dumpable, memory locked) and
-their configuration (`fill.toml`, which carries `refund_to`) is refused unless 0600 and owned by the process.
-Holder of each hot key: **[NV]** (to be written here).
+risk is bounded by the **stock** of the robot and by the gas of the relayer's account.
+
+- **Key** (each): secp256k1, `[signer] key_file`, 64 hex characters in clear; refused unless 0600 or 0400 and
+  owned by the process's uid (`HotKey::load`); never logged, never passed over IPC, its `Debug` shows the
+  address only, zeroized when dropped. `jg-fill`: `key_file` must match `hot_address` of `fill.toml`.
+- **Process** (A5-15): `jg-fill` and `jg-relay` harden themselves before reading anything
+  (`jetsam_guardian::harden`): `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` (they do not start otherwise);
+  `mlockall` when `RLIMIT_MEMLOCK` is unlimited or the process has `CAP_IPC_LOCK`, else a warning — then the
+  host's swap must be off or encrypted. Started by `ops/jg-start fill|relay` only (SHA-256 of the binary and of
+  the configuration in `allowed.sha256`, one instance, PID file); `jg-fill` also holds a `flock` on its
+  `state_dir` and refuses a `fill.toml` that is not 0600/0400 and owned by its uid (it names `refund_to`).
+- **Stock** (robot): wJTM balance of the hot key ≤ `max_stock` (1 200 JTM by default), checked at start only
+  (a refill while it runs is used as is: a question noted, not decided); the contract adds 3 000 JTM
+  outstanding and 2 500 JTM / 24 h per advancer. **The maximum loss per incident is the hot key's stock.**
+  Repayments go to `refund_to`, a cold address other than the hot key.
+- Holder of each hot key and rotation procedure: **[NV]** (to be written here).
 
 ## Loss per incident (decision 11 of the audit A5)
 

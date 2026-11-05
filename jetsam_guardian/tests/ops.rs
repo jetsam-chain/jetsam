@@ -103,24 +103,34 @@ fn no_pattern_kill_in_ops_scripts() {
 /// instance), the TEST sleeper standing for jg-fill.
 #[test]
 fn start_knows_the_fill_role_under_the_same_rules() {
+    start_knows_the_role("fill");
+}
+
+/// A5-15 for the relayer's hot key (decision 10 of the audit A5): `jg-start relay` likewise.
+#[test]
+fn start_knows_the_relay_role_under_the_same_rules() {
+    start_knows_the_role("relay");
+}
+
+fn start_knows_the_role(role: &str) {
     let root = tempfile::tempdir().unwrap();
     let (bin, state) = (root.path().join("bin"), root.path().join("state"));
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&state).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_jg-test-sleep"), bin.join("jg-fill")).unwrap();
-    let config = root.path().join("fill.toml");
+    std::fs::copy(env!("CARGO_BIN_EXE_jg-test-sleep"), bin.join(format!("jg-{role}"))).unwrap();
+    let config = root.path().join(format!("{role}.toml"));
     std::fs::write(&config, "dry_run = true\n").unwrap();
     let run = |role: &str| Command::new(ops("jg-start")).args([role, "--state"]).arg(&state).arg("--config").arg(&config).arg("--bin-dir").arg(&bin).output().unwrap();
     std::fs::write(state.join("allowed.sha256"), sha(&config) + "\n").unwrap();
-    let out = run("fill");
+    let out = run(role);
     assert_eq!(out.status.code(), Some(3), "binary not allowed: {}", String::from_utf8_lossy(&out.stderr));
-    std::fs::write(state.join("allowed.sha256"), format!("{}\n{}\n", sha(&config), sha(&bin.join("jg-fill")))).unwrap();
-    let out = run("fill");
+    std::fs::write(state.join("allowed.sha256"), format!("{}\n{}\n", sha(&config), sha(&bin.join(format!("jg-{role}"))))).unwrap();
+    let out = run(role);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let pid: u32 = std::fs::read_to_string(state.join("run/fill.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let pid: u32 = std::fs::read_to_string(state.join(format!("run/{role}.pid"))).unwrap().split_whitespace().next().unwrap().parse().unwrap();
     assert!(alive(pid));
-    assert_eq!(run("fill").status.code(), Some(4), "a second instance is refused");
-    assert!(Command::new(ops("jg-stop")).args(["fill", "--state"]).arg(&state).status().unwrap().success());
+    assert_eq!(run(role).status.code(), Some(4), "a second instance is refused");
+    assert!(Command::new(ops("jg-stop")).args([role, "--state"]).arg(&state).status().unwrap().success());
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!alive(pid));
 }
