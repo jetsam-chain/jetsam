@@ -573,7 +573,8 @@ impl Relay {
         let now_locked = word(&self.view("tipLockedBlockId()", &[])?, 0);
         if now_tip != s.bridge_tip_block || now_locked != s.bridge_tip_locked_block {
             log(&format!("the bridge tip moved during the proof ({proving} s): this proof is void, planned again at the next step"));
-            self.event(json!({"event": "proof_void_tip_moved", "planned_tip_block": hex::encode(s.bridge_tip_block), "tip_block": hex::encode(now_tip)}));
+            // N3 (re-audit): the cost of an extension landed first, one proof made again
+            self.event(json!({"event": "proof_void_tip_moved", "planned_tip_block": hex::encode(s.bridge_tip_block), "tip_block": hex::encode(now_tip), "proof_secs": proving}));
             return Ok(());
         }
         let data = l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &proof);

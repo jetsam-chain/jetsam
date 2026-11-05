@@ -170,6 +170,13 @@ A deposit in no root is minted only by `claimDepositDirect` (a person decides, D
 
 An advance of such a deposit is repaid by that mint as by any other (same key: txid, recipient, amount).
 
+## Hashrate (audit A5-5, written publicly)
+
+The bridge stops by itself when the mining collapses durably below about 15 % of its reference rate, and starts
+again only when the hashrate returns: a point is accepted only if it lands within 1 800 s of its parent's tip
+block or carries at least 40 % of the work its fork base's target produces in the time since (MN-5, kept on
+purpose: a rate relative to the current target would be an attacker's lever). Burns and releases go on.
+
 ## Robot and relayer on one host (re-audit, A5-7)
 
 `jg-fill` advances only a deposit whose block body the relayer published (`<publish_dir>/blocks/`): the robot
