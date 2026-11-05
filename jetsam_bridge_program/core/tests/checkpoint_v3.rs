@@ -106,6 +106,17 @@ fn hex32(s: &str) -> [u8; 32] {
     v.try_into().unwrap()
 }
 
+/// `keccak256(abi.encodePacked(uint64[] heights))`: one 32-byte big-endian word per height (Solidity pads
+/// the elements of a packed array), written out here from the definition.
+fn heights_hash(heights: &[u64]) -> [u8; 32] {
+    let mut pre = Vec::new();
+    for h in heights {
+        pre.extend_from_slice(&[0u8; 24]);
+        pre.extend_from_slice(&h.to_be_bytes());
+    }
+    keccak256(kf, &pre)
+}
+
 /// L by its definition (SPEC-v3 §2.3), from `floor` up, on integers.
 fn locked_by_definition(m: &Mainnet, floor: u64, tip: u64) -> Option<u64> {
     (floor..=tip).rev().find(|&x| (x + 1..=tip).map(|y| m.work(y)).sum::<u128>() >= 8 * m.work(x))
@@ -320,9 +331,9 @@ fn a_genesis_parent_extends_on_real_mainnet_headers() {
     assert_eq!(out.anchor_base, 44_570);
     assert!(out.new_deposits.is_empty(), "no deposit on the mainnet");
     assert_eq!(out.new_anchors.len() as u64, l - 44_569);
-    // the 23 words of `publicValues`
+    // the 24 words of `publicValues`
     let pv = out.public_values;
-    assert_eq!(pv.len(), 736);
+    assert_eq!(pv.len(), 768);
     let word = |i: usize| -> [u8; 32] { pv[32 * i..32 * i + 32].try_into().unwrap() };
     assert_eq!(word(0), keccak256(kf, b"jetsam-bridge/public-values/v3"));
     assert_eq!(word(1), g.id(kf));
@@ -336,6 +347,11 @@ fn a_genesis_parent_extends_on_real_mainnet_headers() {
     assert_eq!([word(17), word(18)], [next.locked_block_id, next.locked_cum_work]);
     assert_eq!([word(19), word(20)], [g.tip_block_id, spv::word_u64(1)]);
     assert_eq!([word(21), word(22)], [g.locked_block_id, spv::word_u64(1)]);
+    // C1 (re-audit n°2, option B): word 23 is keccak256 of the heights of the whole blocks given, one 32-byte
+    // big-endian word each (`abi.encodePacked(uint64[])`): here the fixture's real blocks of ]44 569 ; 44 575]
+    assert_eq!(out.deposit_blocks, vec![44_570, 44_571, 44_572, 44_573]);
+    assert_eq!(word(23), heights_hash(&[44_570, 44_571, 44_572, 44_573]));
+    assert_eq!(out.deposit_blocks_hash, word(23));
     assert_eq!(out.bridge_tip_block, g.tip_block_id);
     assert_eq!(out.bridge_tip_locked_block, g.locked_block_id);
     // the frontiers carry the trees to the next transition
@@ -580,10 +596,13 @@ fn deposit_blocks_only_from_the_locked_window_in_chain_order() {
         quiet(|| s.run()).map(|o| o.public_values.to_vec())
     };
     let pv = with(Vec::new()).unwrap();
-    // every real block of ]44 569 ; 44 575] the fixture holds (44 570 to 44 573): the same values
+    // every real block of ]44 569 ; 44 575] the fixture holds (44 570 to 44 573): the same values (no deposit
+    // on the mainnet) but word 23, the heights given (C1)
     let inside: Vec<_> = m.blocks_in(44_569, 44_575);
     assert_eq!(inside.iter().map(|b| b.0).collect::<Vec<_>>(), vec![44_570, 44_571, 44_572, 44_573]);
-    assert_eq!(with(inside.clone()).unwrap(), pv);
+    let given = with(inside.clone()).unwrap();
+    assert_eq!(given[..736], pv[..736]);
+    assert_eq!(given[736..], heights_hash(&[44_570, 44_571, 44_572, 44_573]));
     // the parent's L is outside, and anything below it
     assert_eq!(with(vec![block(44_569)]).err().as_deref(), Some("deposit block not in the locked window"));
     assert_eq!(with(vec![block(44_564)]).err().as_deref(), Some("deposit block not in the locked window"));
@@ -596,6 +615,38 @@ fn deposit_blocks_only_from_the_locked_window_in_chain_order() {
     bad.1[0][100] ^= 1;
     assert_eq!(with(vec![bad]).err().as_deref(), Some("tx_root"));
     assert_eq!(with(vec![(44_572, inside[0].1.clone())]).err().as_deref(), Some("tx_root"));
+}
+
+/// C1 (re-audit n°2, option B): a point may leave whole blocks of its window out (G6), and its tree is then
+/// none of the relayer's; the program commits WHICH blocks it gave (word 23: keccak256 of their heights, in
+/// chain order), the contract takes the list in calldata, checks it against word 23 and publishes it in
+/// `CheckpointAccepted`: every tree is rebuilt from public data, no search. The list is the input's: any
+/// subset of the window's whole blocks, in order, empty included; nothing else of the 768 bytes moves (no
+/// deposit on the mainnet).
+#[test]
+fn the_heights_of_the_blocks_given_are_committed() {
+    let m = mainnet();
+    let g = genesis(&m, 44_569, w44569(&m));
+    let block = |x: u64| m.blocks.iter().find(|(h, _)| *h == x).cloned().unwrap();
+    let with = |heights: &[u64]| {
+        let s = Step { blocks: heights.iter().map(|x| block(*x)).collect(), ..Step::on(&m, g, 44_570, NO_FRONTIER, 0, 44_581) };
+        quiet(|| s.run()).expect("accepted")
+    };
+    let none = with(&[]);
+    assert!(none.deposit_blocks.is_empty());
+    assert_eq!(none.deposit_blocks_hash, heights_hash(&[]));
+    assert_eq!(none.public_values[736..768], heights_hash(&[]), "keccak256 of no byte");
+    for heights in [vec![44_570], vec![44_572], vec![44_571, 44_573], vec![44_570, 44_571, 44_572, 44_573]] {
+        let out = with(&heights);
+        assert_eq!(out.deposit_blocks, heights);
+        assert_eq!(out.public_values[736..768], heights_hash(&heights), "{heights:?}");
+        assert_eq!(out.public_values[..736], none.public_values[..736], "{heights:?}: only word 23 moves");
+        assert_eq!(out.next, none.next);
+    }
+    // the same blocks, one more or one fewer: another word 23
+    assert_ne!(with(&[44_570, 44_571]).public_values, with(&[44_570]).public_values);
+    // the program's own function is that definition
+    assert_eq!(spv::deposit_blocks_hash(kf, &[44_570, 44_573]), heights_hash(&[44_570, 44_573]));
 }
 
 #[test]
@@ -639,7 +690,7 @@ fn the_input_layout_is_the_documented_one() {
     let g = genesis(&m, 44_569, w44569(&m));
     let s = Step::on(&m, g, 44_570, NO_FRONTIER, 0, 44_575);
     let v = s.input();
-    assert_eq!(&v[..8], b"JSPVIN07");
+    assert_eq!(&v[..8], b"JSPVIN08");
     assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 44_570);
     assert_eq!(v[16..48], g.tip_block_id);
     assert_eq!(v[48..80], g.locked_block_id);
