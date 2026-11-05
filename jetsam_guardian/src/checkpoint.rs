@@ -3,7 +3,8 @@
 
 //! The contract v3 checkpoint (SPEC-v3 §2.1), its id, the statement the
 //! contract builds from it (§2.4: the identity of the LOCKED block L, never
-//! the tip T), the 736-byte public values (§2.2, revised by A5-4 and the re-audit's N1), the deposit leaf, and the
+//! the tip T), the 768-byte public values (§2.2, revised by A5-4, the re-audit's N1 and the second re-audit's C1), the
+//! deposit leaf, and the
 //! TEST mock proof (`MockProofVerifier`: keccak(TAG ‖ public values)).
 
 use crate::{keccak256, Domain, GuardianStatement, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION};
@@ -127,10 +128,22 @@ impl Mn {
     }
 }
 
-/// The 736 bytes of the public values (contract `publicValues`): 19 words, then the bridge's current tip
+/// Public value 23 (C1, re-audit n°2, option B): `keccak256(abi.encodePacked(uint64[] heights))` of the heights of
+/// the whole blocks a proof gave (one 32-byte big-endian word each), the contract's `depositBlocks`.
+pub fn deposit_blocks_hash(heights: &[u64]) -> [u8; 32] {
+    let mut pre = Vec::with_capacity(32 * heights.len());
+    for h in heights {
+        pre.extend_from_slice(&w64(*h));
+    }
+    keccak256(&pre)
+}
+
+/// The 768 bytes of the public values (contract `publicValues`): 19 words, then the bridge's current tip
 /// block `bridge_tip_block` (`tipBlockId`, read by the contract from its storage) and `mn.tip_on_branch`,
 /// then the bridge's current tip's locked block `bridge_tip_locked_block` (`tipLockedBlockId`, from its
-/// storage too) and `mn.locked_on_branch`.
+/// storage too) and `mn.locked_on_branch`, then [`deposit_blocks_hash`] of `deposit_blocks`, the heights of the
+/// whole blocks the proof gives (C1).
+#[allow(clippy::too_many_arguments)]
 pub fn public_values(
     prev_id: &[u8; 32],
     next: &Checkpoint,
@@ -139,6 +152,7 @@ pub fn public_values(
     bridge_tip_block: &[u8; 32],
     bridge_tip_locked_block: &[u8; 32],
     mn: &Mn,
+    deposit_blocks: &[u64],
 ) -> Vec<u8> {
     let words: Vec<[u8; 32]> = vec![
         keccak256(b"jetsam-bridge/public-values/v3"),
@@ -155,7 +169,7 @@ pub fn public_values(
         next.tip_block_id,
     ];
     let mn_words = mn.words();
-    let mut out = Vec::with_capacity(736);
+    let mut out = Vec::with_capacity(768);
     for w in words.iter().chain(mn_words[..5].iter()) {
         out.extend_from_slice(w);
     }
@@ -165,6 +179,7 @@ pub fn public_values(
     out.extend_from_slice(&mn_words[5]);
     out.extend_from_slice(bridge_tip_locked_block);
     out.extend_from_slice(&mn_words[6]);
+    out.extend_from_slice(&deposit_blocks_hash(deposit_blocks));
     out
 }
 

@@ -17,12 +17,14 @@
 //!   (the slow-path form of D63: the relayer never waits for its newest point).
 //! * **Claims** ([`claims_of`]): every deposit of the final root not minted yet, by its Merkle branch
 //!   (`claimDeposit`): this mints to the recipient, or repays the advance of exactly that deposit (A-10).
-//! * **Points that leave blocks out** (N2 of the re-audit A5, [`resolve_trees`]): anyone may submit a point
-//!   that leaves whole deposit blocks out (G6). The relayer rebuilds the tree of every point it learns (which of
-//!   its deposit blocks the point left out), extends such a point when it is the contract's tip (no sibling
-//!   can replace it: MustExtendTip), claims what its root holds, alerts before finalizing it
-//!   ([`finalize_alert`]), and names the deposits left out ([`direct_claims_needed`]): those are minted only
-//!   by `claimDepositDirect` (an operator's `claim-direct <height> <txid>`, [`ClaimRequest`]).
+//! * **Points that leave blocks out** (N2 of the re-audit A5, C1 of the re-audit n°2, [`resolve_trees`]): anyone
+//!   may submit a point that leaves whole deposit blocks out (G6). Its proof commits the heights of the blocks it
+//!   gave (public value 23) and the contract publishes them in `CheckpointAccepted`: the relayer rebuilds the tree
+//!   of every point it learns from that list ([`omitted_by`], no search), extends such a point when it is the
+//!   contract's tip (no sibling can replace it: MustExtendTip), claims what its root holds, alerts before
+//!   finalizing it ([`finalize_alert`]), and names the deposits left out ([`direct_claims_needed`]): those are
+//!   minted only by `claimDepositDirect`, which the relayer queues by itself ([`queue_direct_claims`], as an
+//!   operator's `claim-direct <height> <txid>`, [`ClaimRequest`]) and sends within a daily gas budget.
 //! * **Deposit bodies** ([`Archive`]): the nodes serve the last 22 blocks only, and a proof of a deposit
 //!   needs its WHOLE block (G6 = V4 reads whole blocks): every block above F is read while it is served,
 //!   its deposits taken with the node's own rule, and the body of every block holding a deposit is kept on
@@ -68,6 +70,10 @@ pub struct Known {
     /// heights (left out by it or by an ancestor); `None` while unknown (not rebuilt: [`resolve_trees`]).
     #[serde(default)]
     pub omitted: Option<Vec<u64>>,
+    /// C1 (re-audit n°2, option B): the heights of the whole blocks its proof gave, in order (public value 23, its
+    /// `CheckpointAccepted`); `None` while not known (its tree is then not rebuilt).
+    #[serde(default)]
+    pub deposit_blocks: Option<Vec<u64>>,
 }
 
 impl Known {
@@ -145,67 +151,25 @@ pub fn tree_of(found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, l: u64, omitte
     (out, heights)
 }
 
-/// N2: at most this many deposit blocks in the window of one point are searched for the ones it left out,
-/// and at most this many candidate roots computed (a point that leaves more out stays unknown: alert).
-pub const MAX_OMISSION_BLOCKS: usize = 20;
-pub const MAX_OMISSION_ROOTS: usize = 4_096;
-
-/// N2 (re-audit A5): the blocks a point `cp` left out of its window `]parent_l ; cp.L]`, its parent's tree
-/// leaving out `parent_omitted`: the smallest set of the relayer's deposit blocks of the window whose omission
-/// gives `cp`'s count and root, with the parent's; `None` when none does within the bounds (a block this
-/// relayer could not read, another chain, a root that is not of whole blocks of this chain).
-pub fn find_omitted(found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, parent_l: u64, parent_omitted: &[u64], cp: &Checkpoint) -> Option<Vec<u64>> {
+/// C1 (re-audit n°2, option B): the deposit blocks a point `cp` left out of its window `]parent_l ; cp.L]`, its
+/// parent's tree leaving out `parent_omitted`, from the heights its proof says it gave (`given`, public value 23,
+/// published in its `CheckpointAccepted`): this relayer's deposit blocks of the window that it did not give, after
+/// `parent_omitted`. `None` when the deposits of the blocks it gave, as this relayer reads them, do not make its
+/// count and root (a listed block whose body this relayer has not read yet, another chain's blocks).
+pub fn omitted_by(found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, parent_l: u64, parent_omitted: &[u64], cp: &Checkpoint, given: &[u64]) -> Option<Vec<u64>> {
     if cp.locked_height < parent_l {
         return None;
     }
-    let window: Vec<(u64, u64)> = found.range(parent_l + 1..=cp.locked_height).map(|(h, ds)| (*h, ds.len() as u64)).collect();
-    let all = tree_of(found, gl, cp.locked_height, parent_omitted).0.len() as u64;
-    let drop = all.checked_sub(cp.deposit_count)?;
-    let matches = |extra: &[u64]| -> bool {
-        let mut o = parent_omitted.to_vec();
-        o.extend_from_slice(extra);
-        let deps = tree_of(found, gl, cp.locked_height, &o).0;
-        let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
-        deps.len() as u64 == cp.deposit_count && merkle_root(&leaves) == cp.deposit_root
-    };
-    if drop == 0 {
-        return matches(&[]).then(|| parent_omitted.to_vec());
-    }
-    if window.len() > MAX_OMISSION_BLOCKS {
-        return None;
-    }
-    // the subsets of the window by size, the smallest first, whose deposits number `drop`
-    let n = window.len();
-    let mut roots = 0;
-    for size in 1..=n {
-        let mut pick: Vec<usize> = (0..size).collect();
-        loop {
-            if pick.iter().map(|&i| window[i].1).sum::<u64>() == drop {
-                roots += 1;
-                if roots > MAX_OMISSION_ROOTS {
-                    return None;
-                }
-                let extra: Vec<u64> = pick.iter().map(|&i| window[i].0).collect();
-                if matches(&extra) {
-                    let mut o = parent_omitted.to_vec();
-                    o.extend_from_slice(&extra);
-                    return Some(o);
-                }
-            }
-            // the next combination of `size` among `n`
-            let Some(i) = (0..size).rev().find(|&i| pick[i] < n - size + i) else { break };
-            pick[i] += 1;
-            for j in i + 1..size {
-                pick[j] = pick[j - 1] + 1;
-            }
-        }
-    }
-    None
+    let mut o = parent_omitted.to_vec();
+    o.extend(found.range(parent_l + 1..=cp.locked_height).map(|(h, _)| *h).filter(|h| !given.contains(h)));
+    let deps = tree_of(found, gl, cp.locked_height, &o).0;
+    let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
+    (deps.len() as u64 == cp.deposit_count && merkle_root(&leaves) == cp.deposit_root).then_some(o)
 }
 
 /// N2: rebuild the tree of every known point whose tree is unknown, parents first (a child's tree is its
-/// parent's and whole blocks of its window). Returns the points newly rebuilt that left blocks of their own
-/// window out, with those heights (to alert on).
+/// parent's and the whole blocks of its window its proof gave, C1). Returns the points newly rebuilt that left
+/// blocks of their own window out, with those heights (to alert on).
 pub fn resolve_trees(known: &mut HashMap<[u8; 32], Known>, found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64) -> Vec<([u8; 32], Vec<u64>)> {
     let mut todo: Vec<([u8; 32], u64)> = known.iter().filter(|(_, k)| k.omitted.is_none()).map(|(id, k)| (*id, k.cp.locked_height)).collect();
     todo.sort_by_key(|(id, l)| (*l, *id));
@@ -216,8 +180,8 @@ pub fn resolve_trees(known: &mut HashMap<[u8; 32], Known>, found: &BTreeMap<u64,
             // the genesis: empty roots (IG-3)
             (k.cp.deposit_count == 0).then(Vec::new)
         } else {
-            match known.get(&k.parent).map(|p| (p.cp.locked_height, p.omitted.clone())) {
-                Some((pl, Some(po))) => find_omitted(found, gl, pl, &po, &k.cp).map(|o| (o, po)).map(|(o, po)| {
+            match (known.get(&k.parent).map(|p| (p.cp.locked_height, p.omitted.clone())), &k.deposit_blocks) {
+                (Some((pl, Some(po))), Some(given)) => omitted_by(found, gl, pl, &po, &k.cp, given).map(|o| {
                     let own: Vec<u64> = o.iter().copied().filter(|h| !po.contains(h)).collect();
                     if !own.is_empty() {
                         alerts.push((id, own));
@@ -300,6 +264,9 @@ pub struct Submission {
     pub bridge_tip_locked_block: [u8; 32],
     /// N2: the blocks the parent's tree leaves out (the new point's tree leaves out the same, no more).
     pub omitted: Vec<u64>,
+    /// C1: the heights of the whole blocks the proof gives (every deposit block of `]parent.L ; next.L]`), public
+    /// value 23 and `submitCheckpoint`'s `depositBlocks`.
+    pub deposit_blocks: Vec<u64>,
 }
 
 /// Why no submission now.
@@ -398,8 +365,9 @@ pub fn plan_submission(
         });
     }
     let fork_depth = u8::try_from(fork_depth).map_err(|_| NoSubmission::NoParentOnThisChain)?;
-    // the parent's tree, then every deposit block of the window ]parent.L ; L]
+    // the parent's tree, then every deposit block of the window ]parent.L ; L] (C1: their heights are public)
     let deposits = tree_of(found, gl, l, &omitted).0;
+    let deposit_blocks: Vec<u64> = found.range(parent.cp.locked_height + 1..=l).map(|(h, _)| *h).collect();
     let next = honest(chain, gl, t, &deposits).ok_or(NoSubmission::ChainTooShort)?;
     // R3: strictly heavier than the contract's tip
     if u256::cmp(&u256::from_be(&next.cum_work), &u256::from_be(tip_cum_work_be)) != std::cmp::Ordering::Greater {
@@ -429,6 +397,7 @@ pub fn plan_submission(
         bridge_tip_block: *bridge_tip_block,
         bridge_tip_locked_block: *bridge_tip_locked_block,
         omitted,
+        deposit_blocks,
     })
 }
 
@@ -515,7 +484,7 @@ pub fn finalize_alert(k: &Known, fin: Option<&Known>) -> Option<String> {
     match &k.omitted {
         None => Some(format!(
             "its deposit tree ({} deposits of ]..; {}]) is not one this relayer rebuilds: no claim by Merkle branch from here; \
-             every deposit it holds is claimable by claimDepositDirect once final (jg-relay claim-direct <height> <txid>)",
+             every deposit under it not minted is listed and queued for claimDepositDirect once final (as jg-relay claim-direct <height> <txid>)",
             k.cp.deposit_count, k.cp.locked_height
         )),
         Some(o) => {
@@ -528,12 +497,13 @@ pub fn finalize_alert(k: &Known, fin: Option<&Known>) -> Option<String> {
 }
 
 /// N2: the deposits under the final point `fin` (at or below its L) in no root of its branch (the blocks its
-/// tree left out), not minted yet: what only `claimDepositDirect` mints.
+/// tree left out), not minted yet: what only `claimDepositDirect` mints. M3 (re-audit n°2): when its tree is
+/// unknown, every deposit of `]gl ; L]` not minted yet (this relayer cannot claim any of them by Merkle branch).
 pub fn direct_claims_needed(fin: &Known, found: &BTreeMap<u64, Vec<FoundDeposit>>, gl: u64, minted: &dyn Fn(&[u8; 32]) -> bool) -> Vec<FoundDeposit> {
-    let Some(omitted) = &fin.omitted else { return Vec::new() };
+    let omitted = fin.omitted.as_deref();
     found
         .range(gl + 1..=fin.cp.locked_height)
-        .filter(|(h, _)| omitted.contains(h))
+        .filter(|(h, _)| omitted.is_none_or(|o| o.contains(h)))
         .flat_map(|(_, ds)| ds.iter().copied())
         .filter(|d| !minted(&d.txid))
         .collect()
@@ -644,6 +614,40 @@ pub fn claim_requests(dir: &Path) -> anyhow::Result<Vec<(PathBuf, u64, [u8; 32])
     }
     out.sort_by_key(|(p, h, _)| (*h, p.clone()));
     Ok(out)
+}
+
+/// C1, option B (decision 8 of the re-audit n°2): the deposits no final root holds (`direct_claims_needed`), queued
+/// by the relayer itself as an operator's `claim-direct` would be, each once: one queued or done (minted, or
+/// refused for good) is not queued again. Returns how many were queued now.
+pub fn queue_direct_claims(dir: &Path, deposits: &[FoundDeposit]) -> anyhow::Result<usize> {
+    let mut n = 0;
+    for d in deposits {
+        let path = dir.join(format!("{}-{}.req", d.height, hex::encode(d.txid)));
+        if !path.exists() && !path.with_extension("done").exists() {
+            queue_claim_request(dir, d.height, &d.txid)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// The window of the `claimDepositDirect` gas budget (L1 seconds).
+pub const CLAIM_DIRECT_WINDOW_SECS: u64 = 86_400;
+/// The gas one `claimDepositDirect` is counted for before it is sent (≈ 407 000 with the real Groth16 verifier,
+/// A5FIX2's measure; 197 550 against the rehearsal's mock).
+pub const CLAIM_DIRECT_GAS_ESTIMATE: u64 = 450_000;
+/// `claim_direct_daily_gas` by default: about 22 direct claims a day.
+pub const DEFAULT_CLAIM_DIRECT_DAILY_GAS: u64 = 10_000_000;
+
+/// The gas of the `claimDepositDirect` this relayer sent (`spent`: (L1 time, gas used)) in the
+/// [`CLAIM_DIRECT_WINDOW_SECS`] before `now`.
+pub fn claim_direct_gas_spent(spent: &[(u64, u64)], now: u64) -> u64 {
+    spent.iter().filter(|(t, _)| t + CLAIM_DIRECT_WINDOW_SECS > now).map(|(_, g)| *g).fold(0, u64::saturating_add)
+}
+
+/// One more `claimDepositDirect` stays within the daily gas `budget` (0: none from this relayer).
+pub fn claim_direct_within_budget(spent: &[(u64, u64)], now: u64, budget: u64) -> bool {
+    claim_direct_gas_spent(spent, now).saturating_add(CLAIM_DIRECT_GAS_ESTIMATE) <= budget
 }
 
 /// A request done (`outcome` "minted", "already minted", or a definitive refusal): renamed `.done` with it.
@@ -875,7 +879,7 @@ pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 // ---------------------------------------------------------------- proofs
 
 /// What the checkpoint program needs to prove a submission (every header from `headers_from` (the parent's L
-/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 736 bytes it must commit.
+/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 768 bytes it must commit.
 #[derive(Clone, Debug)]
 pub struct ProofRequest {
     pub parent_id: [u8; 32],
@@ -888,14 +892,15 @@ pub struct ProofRequest {
     pub bridge_tip_locked_block: [u8; 32],
     pub next: Checkpoint,
     pub mn: Mn,
-    /// `JetsamBridge.publicValues(parentId, next, forkDepth, mn)`.
+    /// `JetsamBridge.publicValues(parentId, next, forkDepth, mn, depositBlocks)`.
     pub public_values: Vec<u8>,
     /// Raw headers of the relayer's chain, ascending, from `headers_from` to `next.height`.
     pub headers_from: u64,
     pub headers: Vec<Vec<u8>>,
     /// Raw headers of the parent's abandoned context `base + 1 ..= parent.height` (empty when extending).
     pub abandoned: Vec<Vec<u8>>,
-    /// The pages of every deposit block of `]parent.L ; next.L]`, ascending.
+    /// The pages of every deposit block of `]parent.L ; next.L]`, ascending (their heights: the submission's
+    /// `deposit_blocks`, public value 23).
     pub deposit_blocks: Vec<(u64, Vec<Vec<u8>>)>,
     /// Frontiers of the parent's deposit and anchor trees.
     pub deposit_frontier: [[u8; 32]; TREE_DEPTH],
@@ -906,7 +911,7 @@ impl ProofRequest {
     /// Built from the chain, the archive and the parent's known context.
     #[allow(clippy::too_many_arguments)]
     pub fn build(s: &Submission, parent: &Known, chain: &Chain, archive: &Archive, gl: u64, anchor_base: u64, context_below: u64) -> anyhow::Result<Self> {
-        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn);
+        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn, &s.deposit_blocks);
         // (the fork base is never below the parent's L: MN-2, `fork_base`)
         let from = parent.cp.locked_height.saturating_sub(context_below).max(chain.base_height());
         let headers = (from..=s.next.height)
@@ -923,6 +928,14 @@ impl ProofRequest {
                 deposit_blocks.push((h, block_pages(&raw)?));
             }
         }
+        // C1: the blocks given are exactly the ones the public values name
+        anyhow::ensure!(
+            deposit_blocks.iter().map(|(h, _)| *h).eq(s.deposit_blocks.iter().copied()),
+            "the archive's deposit blocks of ]{} ; {}] are not the submission's {:?}",
+            parent.cp.locked_height,
+            s.next.locked_height,
+            s.deposit_blocks
+        );
         // the parent's leaves: the first ones of the submission's deposits (the plan checked they make its root)
         let prev = usize::try_from(parent.cp.deposit_count).ok().filter(|n| *n <= s.deposits.len()).ok_or_else(|| anyhow::anyhow!("the parent holds more deposits than the submission"))?;
         let prev_leaves: Vec<[u8; 32]> = s.deposits[..prev].iter().map(deposit_leaf).collect();
@@ -963,7 +976,7 @@ fn to_program(c: &Checkpoint) -> jetsam_bridge_program::spv::CheckpointV3 {
     }
 }
 
-/// The checkpoint program's input (`JSPVIN07`) for a request: the parent's context exactly as the program
+/// The checkpoint program's input (`JSPVIN08`) for a request: the parent's context exactly as the program
 /// bounds it (`context_range`: this chain up to the fork base, then the parent's abandoned headers), the new
 /// branch above the base, the pages of the deposit blocks.
 pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
@@ -1004,7 +1017,7 @@ pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
     ))
 }
 
-/// The checkpoint program's relation run natively on `input` (what the guest proves): its 736 bytes of
+/// The checkpoint program's relation run natively on `input` (what the guest proves): its 768 bytes of
 /// public values, or its refusal (the rule it panicked on).
 pub fn run_native(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut pad = vec![0u64; tw_core::towerwalk::CELLS];
@@ -1170,7 +1183,8 @@ pub struct ProverConfig {
     #[serde(default)]
     pub command: Vec<String>,
     /// N2 / A5-22: the deposit-claim program's prover, the same way (input `JCLMIN03`, 192 bytes of public
-    /// values); used by `claim-direct` only. Empty: the requests wait, with an alert.
+    /// values); used by `claim-direct` only (the relayer's own requests, C1, and the operator's). Empty: the
+    /// requests wait, with an alert.
     #[serde(default)]
     pub claim_command: Vec<String>,
     /// At most this long per proof (with `prove_ahead_secs` and the cadence: the point lands before `W_STALL`).
@@ -1251,6 +1265,10 @@ pub struct RelayConfig {
     /// Claims per step at most (each waits for its receipt).
     #[serde(default = "default_claims_per_step")]
     pub claims_per_step: usize,
+    /// C1 (option B): at most this much gas of `claimDepositDirect` in 24 h of the L1 clock (the relayer's own
+    /// requests and the operator's; [`CLAIM_DIRECT_GAS_ESTIMATE`] counted before each one); 0: none.
+    #[serde(default = "default_claim_direct_daily_gas")]
+    pub claim_direct_daily_gas: u64,
     #[serde(default)]
     pub signer: crate::l1tx::SignerConfig,
     /// The address of the endpoint's unlocked account (`[signer] mode = "endpoint"`, the rehearsal only).
@@ -1269,6 +1287,9 @@ fn default_poll() -> u64 {
 }
 fn default_claims_per_step() -> usize {
     8
+}
+fn default_claim_direct_daily_gas() -> u64 {
+    DEFAULT_CLAIM_DIRECT_DAILY_GAS
 }
 
 impl RelayConfig {

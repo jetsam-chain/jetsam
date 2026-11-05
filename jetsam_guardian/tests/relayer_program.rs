@@ -53,7 +53,7 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     assert_eq!((found[&129][0].amount, found[&129].len()), (7_000_000, 1), "the 7 JTM deposit at 129, read by the node's rule");
     let gcp = genesis_checkpoint(GL, full.id_at(GL).unwrap(), u256::to_be(&full.work_at(GL).unwrap()), full.headers_digest(GL).unwrap());
     let gid = gcp.id();
-    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()) })]);
+    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()), deposit_blocks: Some(Vec::new()) })]);
     // a first point on the chain as it stood at 142 (the JGFILL relayer's point with the deposit: T 142, L 133)
     let mut c135 = full.clone();
     c135.truncate_above(142);
@@ -62,9 +62,10 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     assert_eq!((s1.next.height, s1.next.locked_height, s1.next.deposit_count, s1.fork_depth), (142, 133, 1, 0));
     let r1 = ProofRequest::build(&s1, &known[&gid], &c135, &ar, GL, GL + 1, 32).unwrap();
     assert_eq!(r1.deposit_blocks.len(), 1, "the whole block of the deposit");
+    assert_eq!(s1.deposit_blocks, vec![129], "its height, public value 23 (C1)");
     relayer::check_native(&r1).unwrap();
     // the point that extends it, on the chain at 144
-    known.insert(s1.next.id(), Known { cp: s1.next, parent: gid, accepted_at: 1, headers: Known::context_from(&s1.next, &c135), ours: true, omitted: Some(s1.omitted.clone()) });
+    known.insert(s1.next.id(), Known { cp: s1.next, parent: gid, accepted_at: 1, headers: Known::context_from(&s1.next, &c135), ours: true, omitted: Some(s1.omitted.clone()), deposit_blocks: Some(s1.deposit_blocks.clone()) });
     let s2 = relayer::plan_submission(&full, &known, &s1.next.id(), &s1.next.cum_work, &s1.next.tip_block_id, &s1.next.locked_block_id, GL, &found, &ar.missing(), at(&full)).unwrap();
     assert_eq!((s2.parent, s2.next.height, s2.next.locked_height, s2.fork_depth), (s1.next.id(), 144, 136, 0));
     let r2 = ProofRequest::build(&s2, &known[&s1.next.id()], &full, &ar, GL, GL + 1, 32).unwrap();
@@ -96,7 +97,8 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
 }
 
 /// N2 and A5-22 on the REAL rehearsal chain: a third party's point A on the bridge genesis (T 142, L 133) leaves
-/// the deposit block 129 out, a valid transition. The relayer rebuilds A's tree (129 left out), extends A — the
+/// the deposit block 129 out, a valid transition. The relayer rebuilds A's tree from the heights its proof gave
+/// (none: C1, its `CheckpointAccepted`; 129 left out), extends A — the
 /// checkpoint program natively accepts the extension on A's rebuilt frontier —, names the 7 JTM deposit as the
 /// one only `claimDepositDirect` mints, and the deposit-claim program natively commits exactly the relayer's
 /// 192 bytes for it (the whole block 129, its group), under A's anchor root.
@@ -114,8 +116,9 @@ fn n2_a_point_that_leaves_the_rehearsal_deposit_out_is_extended_and_the_deposit_
     let a = relayer::honest(&c142, GL, 142, &relayer::tree_of(&found, GL, 133, &[129]).0).unwrap();
     assert_eq!((a.locked_height, a.deposit_count), (133, 0));
     let mut known = HashMap::from([
-        (gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()) }),
-        (a.id(), Known { cp: a, parent: gid, accepted_at: 1, headers: Known::context_from(&a, &c142), ours: false, omitted: None }),
+        (gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()), deposit_blocks: Some(Vec::new()) }),
+        // C1: its CheckpointAccepted says it gave no block of ]120 ; 133]
+        (a.id(), Known { cp: a, parent: gid, accepted_at: 1, headers: Known::context_from(&a, &c142), ours: false, omitted: None, deposit_blocks: Some(Vec::new()) }),
     ]);
     assert_eq!(relayer::resolve_trees(&mut known, &found, GL), vec![(a.id(), vec![129])]);
     let at = |c: &Chain| c.header_at(c.tip_height()).unwrap().timestamp + 60;

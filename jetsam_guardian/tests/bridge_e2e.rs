@@ -114,7 +114,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
         [(30, vec![dep(30, 0xa1, 7 * JTM, &chain)]), (31, vec![dep(31, 0xa2, 400 * JTM, &chain)]), (33, vec![dep(33, 0xa3, 3 * JTM, &chain)])].into();
 
     // the relayer's point: the honest child of the genesis, simulated proof
-    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false, omitted: Some(Vec::new()) })]);
+    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false, omitted: Some(Vec::new()), deposit_blocks: Some(Vec::new()) })]);
     let tip_block = word(&view(&l1, &bridge, "tipBlockId()", &[]), 0);
     assert_eq!(tip_block, gcp.tip_block_id, "the genesis's block");
     let tip_locked = word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0);
@@ -122,11 +122,13 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, &tip_block, &tip_locked, GL, &found, &[], now(&l1) + 60).unwrap();
     assert_eq!((s.next.locked_height, s.next.deposit_count, s.fork_depth), (52, 3, 0));
     assert!(s.mn.tip_on_branch && s.mn.locked_on_branch, "an extension holds the tip's block and its locked block");
-    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn);
-    let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &mock_proof(&pv)), "submitCheckpoint").unwrap();
+    // C1 (re-audit n°2): the heights of the whole blocks the proof gives, the deposit blocks of ]10 ; 52]
+    assert_eq!(s.deposit_blocks, vec![30, 31, 33]);
+    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn, &s.deposit_blocks);
+    let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &s.deposit_blocks, &mock_proof(&pv)), "submitCheckpoint").unwrap();
     assert!(r.status, "submitCheckpoint");
     let cid = s.next.id();
-    known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true, omitted: Some(s.omitted.clone()) });
+    known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true, omitted: Some(s.omitted.clone()), deposit_blocks: Some(s.deposit_blocks.clone()) });
     assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
     assert_eq!(word(&view(&l1, &bridge, "tipBlockId()", &[]), 0), s.next.tip_block_id);
     assert_eq!(word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0), s.next.locked_block_id);
@@ -139,8 +141,8 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let only_genesis = HashMap::from([(gid, known[&gid].clone())]);
     let third = relayer::plan_submission(&longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], now(&l1) + 60).unwrap();
     assert!(third.mn.tip_on_branch && third.parent == gid && third.next.height == 61);
-    let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &s.next.locked_block_id, &third.mn);
-    let refused = sender(GENESIS_KEY, &gd).send(&l1, &bridge, &l1::submit_checkpoint(&gid, &third.next, 0, &third.mn, &mock_proof(&tpv)), "submitCheckpoint");
+    let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &s.next.locked_block_id, &third.mn, &third.deposit_blocks);
+    let refused = sender(GENESIS_KEY, &gd).send(&l1, &bridge, &l1::submit_checkpoint(&gid, &third.next, 0, &third.mn, &third.deposit_blocks, &mock_proof(&tpv)), "submitCheckpoint");
     let err = format!("{:#}", refused.err().expect("a same-chain point that does not extend the tip"));
     assert!(err.contains(&hex::encode(l1::selector("MustExtendTip()"))), "MustExtendTip: {err}");
     assert_eq!(word_u64(&view(&l1, &bridge, "lastSwitchAt()", &[]), 0), switched);

@@ -362,9 +362,11 @@ impl Relay {
             // N1: and its locked block always does (MN-2: the fork base is never below the parent's L)
             locked_on_branch: true,
         };
-        let pv = public_values(&parent_id, &cp, fork_depth, anchor_base, &parent.cp.tip_block_id, &parent.cp.locked_block_id, &mn);
+        // C1 (re-audit n°2): the heights of the deposit blocks of ]parent.L ; L], the whole blocks a proof gives
+        let blocks: Vec<u64> = self.deposits.range(parent.cp.locked_height + 1..=cp.locked_height).filter(|(_, ds)| !ds.is_empty()).map(|(h, _)| *h).collect();
+        let pv = public_values(&parent_id, &cp, fork_depth, anchor_base, &parent.cp.tip_block_id, &parent.cp.locked_block_id, &mn, &blocks);
         let proof = mock_proof(&pv);
-        let r = self.l1.send(&self.a.from, &self.a.bridge, &l1::submit_checkpoint(&parent_id, &cp, fork_depth, &mn, &proof))?;
+        let r = self.l1.send(&self.a.from, &self.a.bridge, &l1::submit_checkpoint(&parent_id, &cp, fork_depth, &mn, &blocks, &proof))?;
         self.event(json!({"t": now_unix(), "event": "submitCheckpoint", "status": r.status, "gas": r.gas_used, "l1_ts": r.block_timestamp,
                           "tip_height": tip, "locked_height": l, "fork_depth": fork_depth, "deposit_count": cp.deposit_count, "checkpoint_id": hex::encode(cp.id())}));
         log(&format!("submitCheckpoint T={tip} L={l} forkDepth={fork_depth} deposits={} status {} gas {}", cp.deposit_count, r.status, r.gas_used));

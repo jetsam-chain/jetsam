@@ -30,6 +30,8 @@ pub enum Arg<'a> {
     Words(Vec<[u8; 32]>),
     /// `bytes`: dynamic.
     Bytes(&'a [u8]),
+    /// `uint64[]`: dynamic (its length, then one word per element).
+    U64s(&'a [u64]),
 }
 
 /// `selector ‖ abi.encode(args)`.
@@ -38,7 +40,7 @@ pub fn encode_call(signature: &str, args: &[Arg<'_>]) -> Vec<u8> {
         .iter()
         .map(|a| match a {
             Arg::Words(w) => w.len(),
-            Arg::Bytes(_) => 1,
+            Arg::Bytes(_) | Arg::U64s(_) => 1,
         })
         .sum();
     let mut head: Vec<[u8; 32]> = Vec::with_capacity(head_words);
@@ -52,6 +54,13 @@ pub fn encode_call(signature: &str, args: &[Arg<'_>]) -> Vec<u8> {
                 tail.extend_from_slice(b);
                 let pad = (32 - b.len() % 32) % 32;
                 tail.extend(std::iter::repeat_n(0u8, pad));
+            }
+            Arg::U64s(xs) => {
+                head.push(crate::checkpoint::w64((head_words * 32 + tail.len()) as u64));
+                tail.extend_from_slice(&crate::checkpoint::w64(xs.len() as u64));
+                for x in *xs {
+                    tail.extend_from_slice(&crate::checkpoint::w64(*x));
+                }
             }
         }
     }
@@ -81,14 +90,17 @@ pub fn init_genesis(c: &Checkpoint, not_after: u64, sig256: &[u8]) -> Vec<u8> {
     )
 }
 
-pub fn submit_checkpoint(parent: &[u8; 32], next: &Checkpoint, fork_depth: u8, mn: &Mn, proof: &[u8]) -> Vec<u8> {
+/// `submitCheckpoint(parentId, next, forkDepth, mn, depositBlocks, proof)`: `deposit_blocks` are the heights of
+/// the whole blocks the proof gave (C1, re-audit n°2: public value 23, published in `CheckpointAccepted`).
+pub fn submit_checkpoint(parent: &[u8; 32], next: &Checkpoint, fork_depth: u8, mn: &Mn, deposit_blocks: &[u64], proof: &[u8]) -> Vec<u8> {
     encode_call(
-        &format!("submitCheckpoint(bytes32,{CHECKPOINT_TUPLE},uint8,{MN_TUPLE},bytes)"),
+        &format!("submitCheckpoint(bytes32,{CHECKPOINT_TUPLE},uint8,{MN_TUPLE},uint64[],bytes)"),
         &[
             Arg::Words(vec![*parent]),
             Arg::Words(next.words().to_vec()),
             Arg::Words(vec![w(u64::from(fork_depth))]),
             Arg::Words(mn.words().to_vec()),
+            Arg::U64s(deposit_blocks),
             Arg::Bytes(proof),
         ],
     )
@@ -168,8 +180,40 @@ pub const TOPIC_ADVANCED: &str = "0x7920df7ac525028a91c141dd8a1c7d7a445b2fa4b63b
 pub const TOPIC_ADVANCE_SKIPPED: &str = "0x8e013f08267d3ff5f03b3add7d4fd72183fd8bc6c02abbb114cbd637e89ce570";
 /// topic0 of `AdvanceRepaid(bytes32,bytes32,address,uint64)`.
 pub const TOPIC_ADVANCE_REPAID: &str = "0x374af8d08c7aeb84535775e8a485766641992214748b0a320ca05ca2ed046e79";
-/// topic0 of `CheckpointAccepted(bytes32,bytes32,<checkpoint>,uint8)`.
-pub const TOPIC_CHECKPOINT_ACCEPTED: &str = "0x53f50399429a0b4cc6bb816066c322d4eca835e2392cbffa4ee9d486298c89dd";
+/// topic0 of `CheckpointAccepted(bytes32,bytes32,<checkpoint>,uint8,uint64[])` (C1: the heights of the whole
+/// blocks the point's proof gave, last).
+pub const TOPIC_CHECKPOINT_ACCEPTED: &str = "0xea05d2c1684beb945db7c655a95930d9016f2febfff07d69d06421c2cadc8b80";
+
+/// The data of a `CheckpointAccepted` log: the checkpoint (ten words), the fork depth, and the heights of the whole
+/// blocks its proof gave (C1, re-audit n°2), exactly as the contract encodes them; anything else is refused.
+pub fn checkpoint_accepted(data: &[u8]) -> anyhow::Result<(Checkpoint, u8, Vec<u64>)> {
+    let word = |i: usize| -> anyhow::Result<[u8; 32]> {
+        data.get(32 * i..32 * i + 32).and_then(|x| x.try_into().ok()).ok_or_else(|| anyhow::anyhow!("CheckpointAccepted data of {} bytes: no word {i}", data.len()))
+    };
+    let small = |i: usize| -> anyhow::Result<u64> {
+        let x = word(i)?;
+        anyhow::ensure!(x[..24].iter().all(|b| *b == 0), "CheckpointAccepted word {i} is not a uint64");
+        Ok(u64::from_be_bytes(x[24..].try_into().expect("8")))
+    };
+    let cp = Checkpoint {
+        height: small(0)?,
+        cum_work: word(1)?,
+        headers_digest: word(2)?,
+        deposit_root: word(3)?,
+        deposit_count: small(4)?,
+        anchor_root: word(5)?,
+        locked_height: small(6)?,
+        tip_block_id: word(7)?,
+        locked_block_id: word(8)?,
+        locked_cum_work: word(9)?,
+    };
+    let fork_depth = u8::try_from(small(10)?)?;
+    anyhow::ensure!(small(11)? == 12 * 32, "CheckpointAccepted: the list is not where the contract puts it");
+    let n = usize::try_from(small(12)?)?;
+    anyhow::ensure!(n.checked_add(13).and_then(|x| x.checked_mul(32)) == Some(data.len()), "CheckpointAccepted data of {} bytes for {n} heights", data.len());
+    let heights = (0..n).map(|i| small(13 + i)).collect::<anyhow::Result<Vec<u64>>>()?;
+    Ok((cp, fork_depth, heights))
+}
 
 /// One `AdvanceOrder` of the contract v3-advance (`ADVANCER_INTERFACE.md` §2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
