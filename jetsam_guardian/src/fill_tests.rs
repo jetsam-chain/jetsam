@@ -1792,3 +1792,11 @@ fn robot_activation_gate_the_logical_txid_has_one_implementation() {
     let fill = std::fs::read_to_string(root.join("jetsam_guardian/src/fill.rs")).unwrap();
     assert!(fill.contains("jetsam_vault_rule::txid::logical_txid"), "the robot's deposits take the vault rule's txid");
 }
+
+/// M8 (re-audit n°2): the labels the robot sends its advances under are the ones its signer cancels when it
+/// finds one unmined at a recovery (`l1tx::Sender::cancel_at_recovery`): never sent again.
+#[test]
+fn m8_the_robots_advances_are_the_labels_cancelled_at_a_recovery() {
+    assert_eq!(CANCEL_AT_RECOVERY, [LABEL_ADVANCE, LABEL_ADVANCE_BATCH]);
+    assert_eq!((LABEL_ADVANCE, LABEL_ADVANCE_BATCH), ("advance", "advanceBatch"));
+}

@@ -809,3 +809,134 @@ fn a5_22_the_claim_input_is_the_programs_layout() {
     assert_eq!(v.len(), 56 + 2 * jetsam_tx::TX_BODY_WIRE_SIZE);
     assert_eq!(v[56..56 + jetsam_tx::TX_BODY_WIRE_SIZE], pages[0][..]);
 }
+
+// ---------------------------------------------------------------- re-audit n°3 (A5FIX4)
+
+/// R3-6 (re-audit n°3): a final point whose tree stays unknown because a block its list names is not read here
+/// yet. The deposits of the blocks it LEFT OUT (named by no list) are in no root: queued at once. Those of the blocks
+/// it GAVE are in its root (one body away from a claim by Merkle branch, ≈ 81 k gas instead of ≈ 407 k): they wait
+/// for the tree, [`TREE_WAIT_SECS`] after the point's acceptance at most, then go to `claimDepositDirect` as well
+/// (M3). A point whose list is not known: every deposit at once, as M3 did.
+#[test]
+fn r3_6_an_unknown_final_tree_waits_for_its_listed_blocks_and_queues_the_others_at_once() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let all = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(25, 3, 3 * JTM), dep(45, 4, 4 * JTM)]);
+    // block 20 not read here (yet)
+    let read = found_of(&[dep(15, 1, JTM), dep(25, 3, 3 * JTM), dep(45, 4, 4 * JTM)]);
+    // A: T 40, L 32, gave 15 and 20, left 25 out
+    let (aid, a) = known_at(&c, 40, gid, &tree_of(&all, GL, 32, &[25]).0, 100);
+    let mut known = HashMap::from([(gid, g.clone()), (aid, Known { ours: false, deposit_blocks: Some(vec![15, 20]), ..a.clone() })]);
+    assert!(resolve_trees(&mut known, &read, GL).is_empty());
+    assert_eq!(known[&aid].omitted, None, "block 20 not read: the tree is unknown here");
+    assert_eq!(listed_omission(&known, &read, &aid), Some(vec![25]), "from the lists alone: 25 left out");
+    let final_at = 100 + D_SLOW;
+    assert_eq!(direct_claims_needed(&aid, &known, &read, GL, &|_| false, final_at), vec![read[&25][0]], "only what the point left out");
+    assert_eq!(direct_claims_needed(&aid, &known, &read, GL, &|_| false, 100 + TREE_WAIT_SECS - 1), vec![read[&25][0]]);
+    assert_eq!(direct_claims_needed(&aid, &known, &read, GL, &|_| false, 100 + TREE_WAIT_SECS), vec![read[&15][0], read[&25][0]], "the wait is over: M3");
+    // a child B of A (T 60, L 52) that gave nothing: 45 left out by B, 25 by A
+    let (bid, b) = known_at(&c, 60, aid, &tree_of(&all, GL, 52, &[25, 45]).0, 200);
+    known.insert(bid, Known { ours: false, deposit_blocks: Some(vec![]), ..b });
+    assert_eq!(listed_omission(&known, &read, &bid), Some(vec![25, 45]));
+    assert_eq!(direct_claims_needed(&bid, &known, &read, GL, &|t| *t == read[&45][0].txid, 200 + D_SLOW), vec![read[&25][0]], "45 minted already");
+    // once block 20 is read: the trees are known, nothing waits, nothing changes for the deposits left out
+    let mut k2 = known.clone();
+    resolve_trees(&mut k2, &all, GL);
+    assert_eq!(k2[&aid].omitted, Some(vec![25]));
+    assert_eq!(direct_claims_needed(&aid, &k2, &all, GL, &|_| false, final_at), vec![all[&25][0]]);
+    // a point whose list is not known: every deposit under it at once (M3)
+    let (uid, u) = known_at(&c, 40, gid, &tree_of(&all, GL, 32, &[25]).0, 100);
+    let ku = HashMap::from([(gid, g), (uid, Known { ours: false, ..u })]);
+    assert_eq!(listed_omission(&ku, &read, &uid), None);
+    assert_eq!(direct_claims_needed(&uid, &ku, &read, GL, &|_| false, final_at), vec![read[&15][0], read[&25][0]]);
+}
+
+/// R3-3 (re-audit n°3): a queued `claim-direct` request that cannot go now (its block above the final point, at or
+/// below the bridge genesis, or its archived body an orphan's, not this chain's block: an operator's request may wait
+/// for ever) no longer holds the requests behind it; a request without an archived body stays listed (it is
+/// closed, refused, when tried).
+#[test]
+fn r3_3_a_waiting_claim_request_does_not_hold_the_ones_behind_it() {
+    let c = testkit::chain(60, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let mut archive = Archive::open(&dir.path().join("archive")).unwrap();
+    let read = |h: u64, id: [u8; 32]| Body::Read { block_id: id, deposits: vec![dep(h, 1, JTM)] };
+    archive.index.insert(5, read(5, c.id_at(5).unwrap()));
+    archive.index.insert(12, read(12, [0xee; 32])); // an orphan's body, archived by an operator
+    archive.index.insert(20, read(20, c.id_at(20).unwrap()));
+    archive.index.insert(45, read(45, c.id_at(45).unwrap()));
+    let q = dir.path().join("claim-direct");
+    for h in [5u64, 12, 20, 30, 45] {
+        queue_claim_request(&q, h, &dep(h, 1, JTM).txid).unwrap();
+    }
+    let all = claim_requests(&q).unwrap();
+    assert_eq!(all[0].1, 5, "the oldest height first");
+    let ready: Vec<u64> = claim_requests_ready(all, &archive, &c, GL, 32).iter().map(|(_, h, _)| *h).collect();
+    assert_eq!(ready, vec![20, 30], "5 (at or below the genesis), 12 (an orphan's body) and 45 (above L) wait; 30 has no body: tried, refused");
+    let later: Vec<u64> = claim_requests_ready(claim_requests(&q).unwrap(), &archive, &c, GL, 52).iter().map(|(_, h, _)| *h).collect();
+    assert_eq!(later, vec![20, 30, 45], "45 under the next final point");
+}
+
+/// R3-5 (re-audit n°3): `submitCheckpoint` costs ≈ 750 gas per height listed; the signer refuses its own transaction
+/// above `max_gas` with its margin, so a point never lists more deposit blocks than [`deposit_blocks_bound`]: its tip
+/// is lowered until its window holds no more (the next point takes the rest), and when MN-5 refuses that lower point
+/// the planner says so (`TooManyDepositBlocks`: raise `max_gas`), never a silent `NotAdvancing`.
+#[test]
+fn r3_5_a_point_lists_no_more_deposit_blocks_than_the_signers_max_gas_allows() {
+    assert_eq!(deposit_blocks_bound(3_000_000, 25), 2_500, "the default signer: (3 000 000 / 1.25 − 400 000) / 800");
+    assert_eq!(deposit_blocks_bound(1_000_000, 25), 500);
+    assert_eq!(deposit_blocks_bound(400_000, 25), 0);
+    // a deposit in every block of 11..=50
+    let found = found_of(&(11..=50u64).map(|h| dep(h, h as u8, JTM)).collect::<Vec<_>>());
+    // the chain at 30, five blocks a point at most: L 15 (the sixth deposit block above 10 is 16), T 23
+    let c30 = testkit::chain(30, 1);
+    let (gid, g) = genesis_known(&c30);
+    let known = HashMap::from([(gid, g.clone())]);
+    let at = ts(&c30, 30) + 60;
+    let s = plan_submission(&c30, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at, 5).unwrap();
+    assert_eq!((s.next.height, s.next.locked_height, s.deposit_blocks.clone()), (23, 15, vec![11, 12, 13, 14, 15]));
+    assert_eq!(s.next.deposit_count, 5);
+    // the next point takes the next five
+    let first = Known { cp: s.next, parent: gid, accepted_at: at, headers: Known::context_from(&s.next, &c30), ours: true, omitted: Some(vec![]), deposit_blocks: Some(s.deposit_blocks.clone()) };
+    let known2 = HashMap::from([(gid, g.clone()), (s.next.id(), first.clone())]);
+    let s2 = plan_submission(&c30, &known2, &s.next.id(), &s.next.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], at, 5).unwrap();
+    assert_eq!((s2.parent, s2.next.locked_height, s2.deposit_blocks.clone()), (s.next.id(), 20, vec![16, 17, 18, 19, 20]));
+    // the chain at 60 an L1 hour and a half after block 10: the five-block point fails MN-5, said so
+    let c60 = testkit::chain(60, 1);
+    let at60 = ts(&c60, 60) + 60;
+    assert_eq!(
+        plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 5),
+        Err(NoSubmission::TooManyDepositBlocks(5))
+    );
+    // under the default signer's bound: the whole window, its 40 deposit blocks
+    let s = plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, deposit_blocks_bound(3_000_000, 25)).unwrap();
+    assert_eq!((s.next.locked_height, s.deposit_blocks.len()), (52, 40));
+    // no point at all within the bound (0): said so
+    assert_eq!(
+        plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 0),
+        Err(NoSubmission::TooManyDepositBlocks(0))
+    );
+}
+
+/// A5-13 for the relayer (left from A5FIX3): three of its own transactions reverted in a row halt it, latched in
+/// `<state_dir>/HALT` (`HALT_REPEATED_REVERTS`, an operator removes it), as `jg-fill`; a revert another
+/// transaction explains (the tip moved, the deposit minted, another point finalized: a race) is neither counted
+/// nor a success.
+#[test]
+fn a5_13_three_unexplained_reverts_of_the_relayer_halt_it_until_an_operator_restarts_it() {
+    use crate::fill::HALT_REPEATED_REVERTS;
+    assert_eq!(after_own_receipt(0, false, false), (1, None));
+    assert_eq!(after_own_receipt(1, false, true), (1, None), "a race: not counted");
+    assert_eq!(after_own_receipt(1, false, false), (2, None));
+    assert_eq!(after_own_receipt(2, true, false), (0, None), "a success resets");
+    assert_eq!(after_own_receipt(2, true, true), (0, None));
+    assert_eq!(after_own_receipt(2, false, false), (0, Some(HALT_REPEATED_REVERTS)), "the third in a row");
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(relay_halted(dir.path()), None);
+    latch_relay_halt(dir.path(), HALT_REPEATED_REVERTS).unwrap();
+    latch_relay_halt(dir.path(), HALT_REPEATED_REVERTS).unwrap();
+    let h = relay_halted(dir.path()).unwrap();
+    assert_eq!(h.matches(HALT_REPEATED_REVERTS).count(), 1, "latched once: {h}");
+    std::fs::remove_file(dir.path().join("HALT")).unwrap();
+    assert_eq!(relay_halted(dir.path()), None, "an operator removed it");
+}

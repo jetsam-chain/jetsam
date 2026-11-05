@@ -258,3 +258,45 @@ fn a_transaction_is_written_ahead_before_it_leaves_the_host() {
     assert_eq!(r.tx_hash, p.sent[0].0, "the very transaction written ahead");
     assert!(!path.exists(), "cleared once mined");
 }
+
+/// M8 (re-audit n°2, left from A5FIX3): a robot's advance found unmined at a recovery (a stop, a receipt
+/// timeout) is never sent again: the rule `ALREADY_UNDER_A_POINT` was decided before the stop and a point may have
+/// been accepted since. Its nonce goes to a zero-value transfer of the key to itself (fees raised, so that it
+/// replaces the advance in any pool that still holds it), and the robot decides its orders again. Written ahead
+/// like any version; a label not listed is still sent again as the same bytes (the test above).
+#[test]
+fn m8_an_advance_found_unmined_at_a_recovery_is_cancelled_never_sent_again() {
+    let Some(a) = anvil() else { return };
+    let l1 = L1::new(&a.url);
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = sender(TEST_KEY_1, dir.path());
+    s.cancel_at_recovery = vec!["advance".into(), "advanceBatch".into()];
+    // (1) stopped after the write-ahead, before the broadcast
+    let (p, _) = signed_at(&l1, TEST_KEY_1, 0, b"stale advance");
+    std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
+    match s.recover(&l1).unwrap() {
+        Recovered::Cancelled(label) => assert_eq!(label, "advanceBatch"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(nonce(&l1, &s.address()), 1, "its nonce is used");
+    assert!(l1.rpc("eth_getTransactionByHash", json!([p.sent[0].0])).unwrap().is_null(), "the advance never left");
+    assert!(s.pending().unwrap().is_none());
+    let me = format!("0x{}", hex::encode(s.address()));
+    let block = l1.rpc("eth_getBlockByNumber", json!(["latest", true])).unwrap();
+    let tx = &block["transactions"][0];
+    assert_eq!((tx["to"].as_str().unwrap().to_lowercase(), tx["input"].as_str().unwrap()), (me.clone(), "0x"), "a transfer to itself");
+    assert_eq!(hex_u64(&tx["value"]).unwrap(), 0);
+    // (2) the advance already in a pool (sent before the stop, not mined): replaced by the cancel
+    l1.rpc("evm_setAutomine", json!([false])).unwrap();
+    let (p, raw) = signed_at(&l1, TEST_KEY_1, 1, b"pooled advance");
+    l1.rpc("eth_sendRawTransaction", json!([raw])).unwrap();
+    std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
+    let url = a.url.clone();
+    let handle = std::thread::spawn(move || s.recover(&L1::new(&url)).map(|r| format!("{r:?}")));
+    std::thread::sleep(Duration::from_millis(1_500));
+    l1.rpc("evm_mine", json!([])).unwrap();
+    let r = handle.join().unwrap().unwrap();
+    assert!(r.starts_with("Cancelled"), "{r}");
+    assert!(l1.rpc("eth_getTransactionReceipt", json!([p.sent[0].0])).unwrap().is_null(), "the pooled advance was replaced, never mined");
+    assert_eq!(nonce(&l1, &key(TEST_KEY_1).address()), 2);
+}
