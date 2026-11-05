@@ -762,7 +762,10 @@ fn the_oracle_samples_one_root_in_256_not_by_its_first_byte() {
         })
         .filter(|r| sampled(r))
         .count();
-    assert!(zeros < 32, "{zeros} of 512 roots of first byte zero sampled");
+    assert!(
+        zeros < 32,
+        "{zeros} of 512 roots of first byte zero sampled"
+    );
     // Stable within the process: the same roots each time.
     assert_eq!(sampled_indices(), sampled_indices());
 }

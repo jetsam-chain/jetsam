@@ -502,7 +502,13 @@ fn committee_update_must_open_its_marker() {
 /// A block paying release `r` under a finality update of `signers` (period
 /// `period`) whose root holds the bridge account and `withdrawals[r.n]`.
 fn release_block(height: u64, r: &VaultRelease, signers: &Committee, period: u64) -> Block {
-    release_block_under(height, r, signers, period, Some(prototype_bridge().genesis_id))
+    release_block_under(
+        height,
+        r,
+        signers,
+        period,
+        Some(prototype_bridge().genesis_id),
+    )
 }
 
 /// [`release_block`] under an L1 whose bridge holds the genesis `genesis`
@@ -715,15 +721,16 @@ fn releases_are_paid_only_under_the_pinned_bridge_genesis() {
             &rules,
             &keys
         ),
-        Err(DestinationBlockError::BridgeAccount(L1ReadError::GenesisAbsent))
+        Err(DestinationBlockError::BridgeAccount(
+            L1ReadError::GenesisAbsent
+        ))
     );
 
     // The account proof alone, as before A5-8: not an account proof object.
     let mut bare = release_block(HEIGHT, &r, &c0, P0);
     let section = bare.destination.as_mut().unwrap();
     let (account, _) =
-        crate::consensus::vault::decode_bridge_account_proof(&section.objects[1].payload)
-            .unwrap();
+        crate::consensus::vault::decode_bridge_account_proof(&section.objects[1].payload).unwrap();
     let mut payload = Vec::new();
     encode_proof_nodes(&account, &mut payload);
     section.objects[1].payload = payload;

@@ -12,8 +12,7 @@ use jetsam_chain::consensus::destination::state::{
 use jetsam_chain::consensus::params::MICRO_PER_JTM;
 use jetsam_chain::consensus::vault::{
     deposit_marker, encode_bridge_account_proof, VaultError, VaultRelease, RELEASE_FEE_MICRO,
-    VAULT_ADDRESS,
-    VAULT_OUTSTANDING_CEIL_MICRO,
+    VAULT_ADDRESS, VAULT_OUTSTANDING_CEIL_MICRO,
 };
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{

@@ -2498,7 +2498,9 @@ impl MdbxStore {
             return Ok(None);
         };
         if header.height != height {
-            return Err(StoreError::Decode("canonical header row is not at its height"));
+            return Err(StoreError::Decode(
+                "canonical header row is not at its height",
+            ));
         }
         // Keyed by the canonical header's hash: a body of another branch at
         // this height (one a reorg displaced) is never found.
@@ -5687,7 +5689,9 @@ mod tests {
         [(crate::Block, [u8; 32]); 2],
     ) {
         use crate::consensus::destination::state::{test_rules, DestinationRules};
-        use crate::consensus::vault::tests::{block_at, deposit, logical, rules, ALICE, FEE, PAYER};
+        use crate::consensus::vault::tests::{
+            block_at, deposit, logical, rules, ALICE, FEE, PAYER,
+        };
         let installed = test_rules::install(DestinationRules {
             activation_height: rules().activation_height,
             vault: rules(),
@@ -5697,7 +5701,11 @@ mod tests {
         let store = MdbxStore::open(directory.path()).unwrap();
         let blocks = [
             block_at(height, vec![deposit(200, [7; 20], 5_000_000)], &[]),
-            block_at(height + 1, vec![logical(300, PAYER, &[(ALICE, 5)], FEE)], &[]),
+            block_at(
+                height + 1,
+                vec![logical(300, PAYER, &[(ALICE, 5)], FEE)],
+                &[],
+            ),
         ]
         .map(|mut b| {
             b.destination = None;
@@ -5750,8 +5758,14 @@ mod tests {
             prune_block_body_objects(&txn, tip, Some(height)).unwrap();
             txn.commit().unwrap();
         }
-        assert!(store.get_block_body_object(height, deposit_hash).unwrap().is_none());
-        assert!(store.get_block_body_object(height + 1, plain_hash).unwrap().is_none());
+        assert!(store
+            .get_block_body_object(height, deposit_hash)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_block_body_object(height + 1, plain_hash)
+            .unwrap()
+            .is_none());
         assert_eq!(store.get_recent_block(height).unwrap(), None);
         // The deposit block is still served, exactly; the plain one is not.
         assert_eq!(
@@ -5785,8 +5799,13 @@ mod tests {
         other.nonce ^= 1;
         let txn = store.db.begin_rw_txn().unwrap();
         let headers = txn.open_table(Some(T_HEADERS)).unwrap();
-        txn.put(&headers, u64_key(height), encode_header(&other), WriteFlags::empty())
-            .unwrap();
+        txn.put(
+            &headers,
+            u64_key(height),
+            encode_header(&other),
+            WriteFlags::empty(),
+        )
+        .unwrap();
         txn.commit().unwrap();
         assert_eq!(store.get_canonical_deposit_block(height).unwrap(), None);
         // No canonical header at all: nothing.
@@ -5794,8 +5813,13 @@ mod tests {
         // The `getBlock` window: the canonical row, whatever the block.
         let txn = store.db.begin_rw_txn().unwrap();
         let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
-        txn.put(&recent, u64_key(height + 9), [0xC0u8; 3], WriteFlags::empty())
-            .unwrap();
+        txn.put(
+            &recent,
+            u64_key(height + 9),
+            [0xC0u8; 3],
+            WriteFlags::empty(),
+        )
+        .unwrap();
         txn.commit().unwrap();
         assert_eq!(
             store.get_canonical_deposit_block(height + 9).unwrap(),
@@ -5822,8 +5846,13 @@ mod tests {
             let txn = dormant.db.begin_rw_txn().unwrap();
             archive_block_body_object(&txn, height, hash, &deposit.to_bytes()).unwrap();
             let headers = txn.open_table(Some(T_HEADERS)).unwrap();
-            txn.put(&headers, u64_key(height), encode_header(&deposit.header), WriteFlags::empty())
-                .unwrap();
+            txn.put(
+                &headers,
+                u64_key(height),
+                encode_header(&deposit.header),
+                WriteFlags::empty(),
+            )
+            .unwrap();
             txn.commit().unwrap();
             let txn = dormant.db.begin_ro_txn().unwrap();
             assert!(matches!(

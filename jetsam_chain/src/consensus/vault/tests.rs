@@ -1161,7 +1161,10 @@ fn vault_ceiling_is_the_contracts_outstanding_ceil() {
     let room = CONTRACT_OUTSTANDING_CEIL - MICRO_PER_JTM;
     assert!(check(&b, at(room)).is_ok());
     assert!(check(&b, at(room + 1)).is_err());
-    assert_eq!(check_vault_deposit_room(&pages(d.clone()), room, &rules()), Ok(()));
+    assert_eq!(
+        check_vault_deposit_room(&pages(d.clone()), room, &rules()),
+        Ok(())
+    );
     assert!(check_vault_deposit_room(&pages(d), room + 1, &rules()).is_err());
 }
 
@@ -1192,8 +1195,14 @@ fn a_block_carries_a_deposit_only_with_a_v4_deposit_group_above_f() {
         &block(vec![deposit(200, [7; 20], MIN_DEPOSIT_MICRO - 1)], &[]),
         &r
     ));
-    assert!(!block_carries_deposit(&block_at(F, vec![d.clone()], &[]), &r));
-    assert!(block_carries_deposit(&block_at(F + 1, vec![d.clone()], &[]), &r));
+    assert!(!block_carries_deposit(
+        &block_at(F, vec![d.clone()], &[]),
+        &r
+    ));
+    assert!(block_carries_deposit(
+        &block_at(F + 1, vec![d.clone()], &[]),
+        &r
+    ));
     let dormant = VaultRules {
         activation_height: None,
         deposits_from_height: None,

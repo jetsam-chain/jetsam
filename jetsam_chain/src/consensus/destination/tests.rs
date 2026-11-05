@@ -1130,13 +1130,9 @@ fn the_pinned_bridge_genesis_is_read_under_the_account() {
         slot
     });
     let l1 = synthetic_bridge_with_genesis(&bridge, 1, value, Some(bridge.genesis_id));
-    let account = verify_bridge_account(
-        l1.state_root,
-        &bridge,
-        &l1.account_proof,
-        &l1.genesis_proof,
-    )
-    .expect("the pinned genesis");
+    let account =
+        verify_bridge_account(l1.state_root, &bridge, &l1.account_proof, &l1.genesis_proof)
+            .expect("the pinned genesis");
     assert_eq!(account.code_hash, bridge.code_hash);
     assert_eq!(
         read_storage_word(
@@ -1196,7 +1192,12 @@ fn a_bridge_without_genesis_is_refused_even_under_a_zero_pin() {
     };
     let l1 = synthetic_bridge_with_genesis(&unpinned, 1, value, None);
     assert_eq!(
-        verify_bridge_account(l1.state_root, &unpinned, &l1.account_proof, &l1.genesis_proof),
+        verify_bridge_account(
+            l1.state_root,
+            &unpinned,
+            &l1.account_proof,
+            &l1.genesis_proof
+        ),
         Err(L1ReadError::GenesisAbsent)
     );
 }
@@ -1224,17 +1225,25 @@ fn the_genesis_proof_must_open_its_own_slot() {
         genesis_id_slot: 12,
         ..bridge
     };
-    assert!(
-        verify_bridge_account(l1.state_root, &slot_12, &l1.account_proof, &l1.genesis_proof)
-            .is_err()
-    );
+    assert!(verify_bridge_account(
+        l1.state_root,
+        &slot_12,
+        &l1.account_proof,
+        &l1.genesis_proof
+    )
+    .is_err());
     // The code is checked as before.
     let other_code = L1BridgeParams {
         code_hash: [0xc1; 32],
         ..bridge
     };
     assert_eq!(
-        verify_bridge_account(l1.state_root, &other_code, &l1.account_proof, &l1.genesis_proof),
+        verify_bridge_account(
+            l1.state_root,
+            &other_code,
+            &l1.account_proof,
+            &l1.genesis_proof
+        ),
         Err(L1ReadError::CodeHashMismatch)
     );
 }

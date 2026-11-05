@@ -979,11 +979,12 @@ pub fn verify_releases_on_l1(
     let finalized = verify_finality_update(&rules.network, &refs, &finality)
         .map_err(DestinationBlockError::LightClient)?;
     let state_root = finalized.execution.state_root;
-    let (account_nodes, genesis_nodes) = decode_bridge_account_proof(account_proof).map_err(|_| {
-        DestinationBlockError::MalformedObject {
-            kind: DestinationObjectKind::BridgeAccountProof,
-        }
-    })?;
+    let (account_nodes, genesis_nodes) =
+        decode_bridge_account_proof(account_proof).map_err(|_| {
+            DestinationBlockError::MalformedObject {
+                kind: DestinationObjectKind::BridgeAccountProof,
+            }
+        })?;
     // V7, once for the block: the pinned code, and the pinned genesis (A5-8).
     verify_bridge_account(state_root, &bridge, &account_nodes, &genesis_nodes)
         .map_err(DestinationBlockError::BridgeAccount)?;
