@@ -1094,3 +1094,36 @@ fn halts_after_three_reverts(before: Option<&str>) {
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
 }
+
+// ---------------------------------------------------------------- jg-relay: its state (re-audit R5, A5-14)
+
+/// A5-14 for the relayer: a `state.json` present but unreadable is no start (a default would forget every
+/// point it knows and every mint it saw), before any socket; the file is left as it was.
+#[test]
+fn jg_relay_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
+    let (target, socks) = untouchable();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let text = format!(
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nl1_rpc = \"http://{}:8545\"\ndeposits_from_height = 128\n\
+         state_dir = \"{}\"\npublish_dir = \"{}\"\npoll_secs = 1\n\
+         [[nodes]]\nname = \"a\"\nrpc = \"http://{}:19801\"\n[[nodes]]\nname = \"b\"\nrpc = \"http://{}:19801\"\n\
+         [egress]\ntor_socks = \"127.0.0.1:{}\"\n[prover]\nmode = \"mock\"\n",
+        hex::encode(testkit::genesis().id),
+        hex::encode(REHEARSAL_BRIDGE),
+        onion('c'),
+        dir.join("state").display(),
+        dir.join("publish").display(),
+        onion('a'),
+        onion('b'),
+        socks.local_addr().unwrap().port()
+    );
+    std::fs::write(dir.join("relay.toml"), text).unwrap();
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), "{\"known\":").unwrap();
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-relay"), &dir.join("relay.toml"), &dir.join("relay.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("state.json") && log.contains("does not start"), "{log}");
+    untouched(&target, &socks, "an unreadable state.json");
+    assert_eq!(std::fs::read_to_string(dir.join("state/state.json")).unwrap(), "{\"known\":", "left as it was");
+}

@@ -160,12 +160,15 @@ impl Relay {
     }
 
     fn save(&self) {
+        // A5-14 (re-audit R5): synced around its rename, as jg-fill's
         let path = self.cfg.state_dir.join("state.json");
-        if let Ok(text) = serde_json::to_string(&self.state) {
-            let tmp = path.with_extension("tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+        match serde_json::to_string(&self.state) {
+            Ok(text) => {
+                if let Err(e) = jetsam_guardian::write_atomic(&path, text.as_bytes()) {
+                    log(&format!("ALERT STATE NOT SAVED: {e:#}"));
+                }
             }
+            Err(e) => log(&format!("ALERT STATE NOT SAVED: {e}")),
         }
         if let Err(e) = self.archive.save() {
             log(&format!("ARCHIVE INDEX NOT SAVED: {e:#}"));
@@ -667,6 +670,16 @@ fn config(args: &[String]) -> anyhow::Result<(RelayConfig, String)> {
     Ok((cfg, hex::encode(digest)))
 }
 
+/// A5-14 (re-audit R5): the state kept across a restart; none yet is a fresh start, a file present but
+/// unreadable is no start (a default would forget every known point and every mint seen).
+fn read_state(path: &std::path::Path) -> anyhow::Result<State> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}: jg-relay does not start", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) => Err(anyhow::anyhow!("{}: {e}: jg-relay does not start", path.display())),
+    }
+}
+
 /// Operator commands (D41): they change the archive or the request queue only, never the L1 (the running
 /// relayer, the only process signing with its key, sends what is queued).
 fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
@@ -746,6 +759,8 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config sha256 {digest}, {profile}, egress {egress:?}, {} nodes, cadence {} s, prover {}", cfg.nodes.len(), cfg.cadence_secs, cfg.prover.mode));
     std::fs::create_dir_all(&cfg.state_dir)?;
     std::fs::create_dir_all(&cfg.publish_dir)?;
+    // A5-14: read before any socket (an unreadable state is no start, and nothing is dialled)
+    let state = read_state(&cfg.state_dir.join("state.json"))?;
     let l1 = L1::via(&cfg.l1_rpc, egress);
     let chain_id = l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
     anyhow::ensure!(chain_id == cfg.l1_chain_id, "the L1 endpoint is chain {chain_id}, not {}: jg-relay does not start", cfg.l1_chain_id);
@@ -775,7 +790,6 @@ fn run() -> anyhow::Result<()> {
             encode: relayer::program_input,
         }),
     };
-    let state: State = std::fs::read_to_string(cfg.state_dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let archive = Archive::open(&cfg.state_dir.join("archive"))?;
     log(&format!("signer 0x{} ({}), {} checkpoints known, {} bodies archived, {} missing", hex::encode(tx.address()), if matches!(tx, L1Tx::Local(_)) { "local key" } else { "endpoint, TEST" }, state.known.len(), archive.index.len(), archive.missing().len()));
     let events = cfg.state_dir.join("events.jsonl");
