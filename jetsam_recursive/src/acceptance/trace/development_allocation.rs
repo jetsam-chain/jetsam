@@ -1118,4 +1118,39 @@ mod tests {
         }
         assert_ne!(v1_6, digest(V1_5, 0), "the v1.6 schedule is not the v1.5 matrix");
     }
+
+    /// T7.7: the private rehearsal chain of 2026-11-04 stopped at 479, every
+    /// miner's history step for 480 refused ("live-muxed tx-root entry 1 !=
+    /// the padded-tree leaf"): the v1.6 relation of this profile pays on the
+    /// multiples of 480 above `J` (it takes `J` for a multiple of 960, which
+    /// the public and test networks' is), while the native schedule paid at
+    /// `J + 480·k`. On every profile, at every height of a run and around the
+    /// window end, the native schedule must be the one the relation proves:
+    /// same payout due, same amount, same miner subsidy, the honest amount
+    /// satisfying the gadget.
+    #[test]
+    fn the_native_schedule_is_the_v1_6_relations_at_every_height() {
+        let j = V1_6_PAYOUT_ACTIVATION;
+        let end = development_allocation_end_height_with(Some(j));
+        let mut heights: Vec<u64> = (1..=2_000).collect();
+        heights.extend([end - 480, end - 1, end, end + 1, end + 480]);
+        let mut wrong = Vec::new();
+        for height in heights {
+            let native = development_allocation_with(height, Some(j)).unwrap();
+            let (satisfied, due, each, miner) = v1_6_case(height, j + 960, native.payout_each.unwrap_or(0));
+            if !satisfied
+                || due != boolean(native.payout_due)
+                || each != alloc_block_value(native.payout_each.unwrap_or(0))
+                || miner != alloc_block_value(native.miner_subsidy)
+            {
+                wrong.push((height, native.payout_due));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "J = {j}: the native schedule is not the relation's at {} heights (height, native payout due): {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(12)]
+        );
+    }
 }
