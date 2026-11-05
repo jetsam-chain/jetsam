@@ -3,7 +3,8 @@
 
 //! A5-15: `jg-fill` hardens itself before it reads anything (no core dump, not dumpable, memory locked when
 //! that is safe), and refuses a `fill.toml` that is not private to its user, before parsing it; the shared
-//! `jetsam_guardian::harden` in a child process.
+//! `jetsam_guardian::harden` in a child process. A5-14: `jetsam_guardian::write_atomic`'s system calls, under strace
+//! in a child process.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -80,4 +81,46 @@ fn harden_in_a_child_process() {
         if h.memory_locked.is_ok() { "ok" } else { "no" }
     );
     assert!(h.dumpable_off && h.core_off);
+}
+
+/// A5-14: `write_atomic` syncs the file before its rename and the directory after it (the order of the system calls,
+/// read with strace in a child process: this test binary again, `a5_14_write_atomic_child` only; never a unit test
+/// of the library, see `journal_tests.rs`). Without strace on the host: skipped, said.
+#[test]
+fn a5_14_write_atomic_syncs_the_file_then_renames_it_then_syncs_the_directory() {
+    if std::env::var_os("JG_WRITE_ATOMIC_CHILD").is_some() {
+        return;
+    }
+    if std::process::Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("SKIPPED: no strace on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    let (trace, target) = (real.join("trace"), real.join("state.json"));
+    let out = std::process::Command::new("strace")
+        .args(["-f", "-y", "-qq", "-e", "trace=fsync,fdatasync,rename,renameat,renameat2", "-o"])
+        .arg(&trace)
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "a5_14_write_atomic_child", "--test-threads", "1"])
+        .env("JG_WRITE_ATOMIC_CHILD", &target)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"child\":1}");
+    let text = std::fs::read_to_string(&trace).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let tmp = format!("{}.tmp", target.display());
+    let at = |what: &dyn Fn(&str) -> bool| lines.iter().position(|l| what(l));
+    let file_synced = at(&|l: &str| (l.contains("fsync(") || l.contains("fdatasync(")) && l.contains(&format!("<{tmp}>)")));
+    let renamed = at(&|l: &str| l.contains("rename") && l.contains(&format!("\"{tmp}\"")) && l.contains(&format!("\"{}\"", target.display())));
+    let dir_synced = at(&|l: &str| l.contains("fsync(") && l.contains(&format!("<{}>)", real.display())));
+    let (Some(f), Some(r), Some(d)) = (file_synced, renamed, dir_synced) else { panic!("file synced {file_synced:?}, renamed {renamed:?}, directory synced {dir_synced:?}:\n{text}") };
+    assert!(f < r && r < d, "the file synced, then renamed, then the directory synced:\n{text}");
+}
+
+#[test]
+fn a5_14_write_atomic_child() {
+    let Some(target) = std::env::var_os("JG_WRITE_ATOMIC_CHILD") else { return };
+    jetsam_guardian::write_atomic(std::path::Path::new(&target), b"{\"child\":1}").unwrap();
 }

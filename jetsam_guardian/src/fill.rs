@@ -203,7 +203,7 @@ pub struct FillParams {
     pub recipient_window: u64,
     /// Outstanding (advanced, not repaid) at most this (≤ the contract's 3 000 JTM).
     pub outstanding_cap: u64,
-    /// The hot key's stock cap: at start, a balance above it refuses to start.
+    /// The hot key's stock cap: at start, a balance above it refuses to start; at every step, it pauses (N9).
     pub max_stock: u64,
     /// The smallest advance, and the gas floor: an advance is at least `gas_multiple` × its gas cost.
     pub min_advance: u64,
@@ -530,6 +530,8 @@ pub struct GuardInput {
     /// A5-18: the contract's `suspectMinted()` is not 0 (wJTM minted from abandoned final points, still in
     /// `totalSupply`).
     pub suspect_minted: bool,
+    /// N9: the hot key's wJTM balance, read at every step.
+    pub stock: u64,
 }
 
 /// A halt (latched: only an operator restarts, D41) and a pause (lifts with its cause).
@@ -557,6 +559,10 @@ pub fn guard(g: &GuardInput, p: &FillParams) -> Guard {
         Some("PAUSE_STALLED")
     } else if g.suspect_minted {
         Some("PAUSE_SUSPECT_MINTED")
+    } else if g.stock > p.max_stock {
+        // N9: the hot key holds the capped stock only, at every step (a refill above it, or a gift: the operator moves
+        // the excess to the cold claim owner)
+        Some("PAUSE_STOCK_ABOVE_CAP")
     } else if g.l1_now < g.last_switch_at.saturating_add(p.switch_pause_secs) {
         Some("PAUSE_RECENT_SWITCH")
     } else if g.now > g.tip_changed_at + p.tip_max_age {
@@ -590,13 +596,28 @@ pub struct Candidate {
 }
 
 /// The contract's view of this advancer (`advancerCaps`), the hot key's wJTM balance and the token's
-/// `totalSupply()` (A5-18, saturated to `u64::MAX`).
+/// `totalSupply()` (A5-18, saturated to `u64::MAX`); the locked height of the contract's tip (A5-1, from its
+/// `CheckpointAccepted`; `None`: not known).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     pub outstanding: u64,
     pub spent24h: u64,
     pub stock: u64,
     pub total_supply: u64,
+    pub tip_locked_height: Option<u64>,
+    /// N9: [`locked_unminted`] under the tip (0 without a tip).
+    pub locked_unminted: u64,
+}
+
+/// N9: what the mints of the deposits the contract's tip already commits to (at or below its locked height) and not
+/// minted yet will add to `totalSupply` before any deposit the robot may advance now (those are above it, A5-1):
+/// their amounts, saturated, except the deposits `minted` says are minted and the robot's own advances (counted by
+/// [`Ledger::pending_sum`] while pending, minted otherwise). `minted` is asked lowest first (the oldest are minted
+/// first); a deposit it does not know minted counts (prudent: at worst the robot waits for room it has).
+pub fn locked_unminted(deposits: &[FoundDeposit], locked_height: u64, ledger: &Ledger, minted: &mut dyn FnMut(&FoundDeposit) -> bool) -> u64 {
+    let mut locked: Vec<&FoundDeposit> = deposits.iter().filter(|d| d.height <= locked_height && !ledger.has(&d.key())).collect();
+    locked.sort_by_key(|d| (d.height, d.group, d.txid));
+    locked.into_iter().filter(|d| !minted(d)).map(|d| d.amount).fold(0u64, u64::saturating_add)
 }
 
 /// The decision on one candidate.
@@ -707,8 +728,9 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     let mut day = caps.spent24h;
     let mut outstanding = caps.outstanding;
     let mut stock = caps.stock;
-    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted
-    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum());
+    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted, and
+    // (N9) the deposits its tip already commits to
+    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum()).saturating_sub(caps.locked_unminted);
     let outstanding_cap = p.outstanding_cap.min(ADVANCE_OUTSTANDING_CAP);
     let mut batch = 0usize;
     let mut per_recipient: HashMap<[u8; 20], u64> = HashMap::new();
@@ -722,6 +744,12 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
             Verdict::Refuse("ADVANCED_BY_ANOTHER")
         } else if c.minted {
             Verdict::Refuse("ALREADY_MINTED")
+        } else if caps.tip_locked_height.is_none() {
+            Verdict::Wait("CONTRACT_TIP_UNKNOWN")
+        } else if caps.tip_locked_height.is_some_and(|l| d.height <= l) {
+            // A5-1: its point is accepted, its mint may come less than ADVANCE_MIN_AGE after an advance made now:
+            // the fee would go to the recipient; the slow path pays the recipient within 24 h
+            Verdict::Refuse("ALREADY_UNDER_A_POINT")
         } else if d.amount < min_advance {
             Verdict::Refuse("BELOW_MIN_ADVANCE")
         } else if l1_now.saturating_sub(d.block_ts) > p.late_after_secs {
@@ -774,6 +802,36 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
         out[i] = v;
     }
     out
+}
+
+/// A5-13: the refusals of [`plan`] that depend on a clock — `l1_now`, the time of the L1 endpoint's latest block,
+/// which may lie (18 h ahead: every deposit `LATE_SLOW_PATH_NEAR`) — never final.
+pub const CLOCK_REFUSALS: [&str; 1] = ["LATE_SLOW_PATH_NEAR"];
+
+/// A5-13: a decision journaled as `code` (`advance`, `wait:…`, `refuse:…`) that ends the robot's interest in a
+/// deposit (jg-fill reads it no more): a refusal that does not depend on a clock. A clock's refusal is decided
+/// again at the next step.
+pub fn decided_for_good(code: &str) -> bool {
+    code.strip_prefix("refuse:").is_some_and(|c| !CLOCK_REFUSALS.contains(&c))
+}
+
+/// A5-13: this many of the robot's transactions reverted in a row (its `eth_call` probe and its reads come from
+/// one L1 endpoint, which may lie; each revert costs gas) halt it, latched: [`HALT_REPEATED_REVERTS`].
+pub const MAX_CONSECUTIVE_REVERTS: u32 = 3;
+pub const HALT_REPEATED_REVERTS: &str = "HALT_REPEATED_REVERTS";
+
+/// A5-13: the count of the robot's consecutive reverted transactions after a receipt of `status` (a success resets
+/// it), and the halt it reaches — the count back to 0 then, counted again after the operator's restart.
+pub fn after_receipt(reverts: u32, status: bool) -> (u32, Option<&'static str>) {
+    if status {
+        return (0, None);
+    }
+    let n = reverts.saturating_add(1);
+    if n >= MAX_CONSECUTIVE_REVERTS {
+        (0, Some(HALT_REPEATED_REVERTS))
+    } else {
+        (n, None)
+    }
 }
 
 /// The queue the robot publishes (`queue.json`, degraded mode): the candidates neither advanced nor refused,
@@ -842,6 +900,23 @@ pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A5-1 (contract revised): an advance younger than this at the mint of its deposit is repaid what it paid only,
+/// its fee going to the recipient. `D_SLOW` (24 h): an advance made before the acceptance of the point that covers
+/// its deposit is always that old at the mint (finality is 24 h after acceptance at the earliest), one made after it
+/// may not be — hence the robot's rule `ALREADY_UNDER_A_POINT` ([`plan`]).
+pub const ADVANCE_MIN_AGE: u64 = 86_400;
+
+/// A5-1: `ADVANCE_MIN_AGE()` read on the bridge is the 24 h the robot's rule counts on (with 2 h, an advance at
+/// `finality − 2 h` keeps its fee: the rent the revision closes), or jg-fill does not start.
+pub fn check_advance_min_age(read: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read == ADVANCE_MIN_AGE,
+        "the bridge's ADVANCE_MIN_AGE() is {read} s, not {ADVANCE_MIN_AGE} (D_SLOW): jg-fill does not start (its rule, no advance of a \
+         deposit under the tip's locked height, keeps its fee under that contract only)"
+    );
+    Ok(())
+}
+
 /// A uint256 word (big-endian) as a `u64`, `u64::MAX` when it does not fit.
 pub fn u64_saturating(word: &[u8; 32]) -> u64 {
     if word[..24] != [0u8; 24] {
@@ -876,6 +951,18 @@ pub fn lock_state_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
     let r = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     anyhow::ensure!(r == 0, "another jg-fill holds {}: jg-fill does not start", dir.join("lock").display());
     Ok(lock)
+}
+
+/// A5-14: the robot's `state.json` at start (written by [`crate::write_atomic`]): absent, a first start (the
+/// default); present but unreadable or not a state, jg-fill does not start — its ledger is what its caps and its
+/// repayments count, an operator restores it (or removes it knowingly).
+pub fn read_state<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => anyhow::bail!("{}: present but not readable ({e}): jg-fill does not start", path.display()),
+    };
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: present but unreadable ({e}): jg-fill does not start (restore it, or remove it knowingly)", path.display()))
 }
 
 /// The start check of the hot key: it holds the capped stock only.
@@ -1017,16 +1104,21 @@ pub struct FillConfig {
     /// The relayer's published `final.json` (`jg-relay`'s `publish_dir`): the robot claims the repayment of
     /// its own advances from it (`claimDeposit`), checked against the contract's final root, without
     /// waiting for anyone. Absent: it waits for a claimer. The relayer's archive of the deposit blocks beside
-    /// it (`blocks/`) is required for every advance (A5-7): absent, nothing is advanced.
+    /// it (`blocks/`, or `relay_blocks_dir`) is required for every advance (A5-7): absent, nothing is advanced.
     #[serde(default)]
     pub relay_final: Option<PathBuf>,
+    /// N9: the relayer's published archive of the deposit blocks (A5-7), named explicitly (another mount, a
+    /// mirror); absent, `blocks/` beside `relay_final`.
+    #[serde(default)]
+    pub relay_blocks_dir: Option<PathBuf>,
 }
 
 impl FillConfig {
-    /// A5-7: where the relayer publishes the deposit blocks it archived: `blocks/` beside its `final.json`
-    /// (`relay_final` = `<publish_dir>/final.json`); none without `relay_final`, and then nothing is advanced.
+    /// A5-7: where the relayer publishes the deposit blocks it archived: `relay_blocks_dir` if set (N9), else
+    /// `blocks/` beside its `final.json` (`relay_final` = `<publish_dir>/final.json`); none without either, and then
+    /// nothing is advanced.
     pub fn relay_blocks_dir(&self) -> Option<PathBuf> {
-        self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks"))
+        self.relay_blocks_dir.clone().or_else(|| self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks")))
     }
 }
 
@@ -1070,6 +1162,8 @@ impl FillConfig {
             );
         }
         c.egress()?;
+        // A5-13: the signer's priority fee, before any socket (its open() checks it again)
+        c.signer.check_fees(profile).map_err(|e| anyhow::anyhow!("{e}: jg-fill does not start"))?;
         let hot = parse20(&c.hot_address)?;
         let refund = parse20(&c.refund_to)?;
         anyhow::ensure!(hot != [0u8; 20], "hot_address is 0: jg-fill does not start");

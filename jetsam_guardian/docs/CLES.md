@@ -123,16 +123,29 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
 - **Key** (each): secp256k1, `[signer] key_file`, 64 hex characters in clear; refused unless 0600 or 0400 and
   owned by the process's uid (`HotKey::load`); never logged, never passed over IPC, its `Debug` shows the
   address only, zeroized when dropped. `jg-fill`: `key_file` must match `hot_address` of `fill.toml`.
+- **Fees** (A5-13, `jg-fill` and `jg-relay` alike): off the private rehearsal `[signer] priority_fee_wei` is
+  required (the L1 endpoint's `eth_maxPriorityFeePerGas` is never taken), at most `max_priority_fee_wei` (10 gwei
+  by default, replacements included), else no start. `jg-fill` halts (`HALT_REPEATED_REVERTS`, latched) after 3 of
+  its transactions reverted in a row, and keeps no refusal that depends on the L1 clock.
 - **Process** (A5-15): `jg-fill` and `jg-relay` harden themselves before reading anything
   (`jetsam_guardian::harden`): `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` (they do not start otherwise);
   `mlockall` when `RLIMIT_MEMLOCK` is unlimited or the process has `CAP_IPC_LOCK`, else a warning — then the
   host's swap must be off or encrypted. Started by `ops/jg-start fill|relay` only (SHA-256 of the binary and of
   the configuration in `allowed.sha256`, one instance, PID file); `jg-fill` also holds a `flock` on its
   `state_dir` and refuses a `fill.toml` that is not 0600/0400 and owned by its uid (it names `refund_to`).
-- **Stock** (robot): wJTM balance of the hot key ≤ `max_stock` (1 200 JTM by default), checked at start only
-  (a refill while it runs is used as is: a question noted, not decided); the contract adds 3 000 JTM
-  outstanding and 2 500 JTM / 24 h per advancer. **The maximum loss per incident is the hot key's stock.**
-  Repayments go to `refund_to`, a cold address other than the hot key.
+- **Stock** (robot): wJTM balance of the hot key ≤ `max_stock` (1 200 JTM by default), checked at start (no
+  start above it) and at every step (N9: above it, `PAUSE_STOCK_ABOVE_CAP` and an ALERT, nothing advanced until
+  the excess is moved to `refund_to`; anyone can push the hot key over its cap by sending it wJTM — a gift that
+  pauses the robot until the operator moves it); the contract adds 3 000 JTM outstanding and 2 500 JTM / 24 h per
+  advancer. **The maximum loss per incident is the hot key's stock.** Repayments go to `refund_to`, a cold address
+  other than the hot key.
+- **Fee of an advance** (A5-1, contract revised: `ADVANCE_MIN_AGE` = `D_SLOW` = 24 h): an advance less than 24 h
+  old at the mint of its deposit is repaid what it paid only, its fee going to the recipient. An advance made before
+  the acceptance of the point that covers its deposit is always 24 h old at the mint; so `jg-fill` never advances a
+  deposit at or below the locked height of the contract's tip (`ALREADY_UNDER_A_POINT`: the slow path pays the
+  recipient within 24 h), and does not start unless the bridge's `ADVANCE_MIN_AGE()` is 86 400. **An advance
+  doubled by the relayer** (its point covering the deposit lands in the few minutes between the robot's read of the
+  tip and its advance) **loses its fee: accepted** (the recipient gets it; the robot is repaid what it paid).
 - Holder of each hot key and rotation procedure: **[NV]** (to be written here).
 
 ## Loss per incident (decision 11 of the audit A5)

@@ -41,7 +41,7 @@ const GL: u64 = 20;
 
 fn sender(k: &str, dir: &std::path::Path) -> Sender {
     let key = HotKey::from_bytes(&jetsam_guardian::parse32(k).unwrap()).unwrap();
-    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 100_000_000_000, priority_fee: None };
+    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 100_000_000_000, priority_fee: None, max_priority_fee_per_gas: 100_000_000_000 };
     Sender::new(key, 31_337, policy, dir).unwrap()
 }
 

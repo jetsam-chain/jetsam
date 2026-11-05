@@ -209,15 +209,20 @@ pub struct FeePolicy {
     pub max_gas: u64,
     /// No fee per gas above this (wei).
     pub max_fee_per_gas: u128,
-    /// The priority fee (wei per gas); `None`: the endpoint's `eth_maxPriorityFeePerGas`.
+    /// The priority fee (wei per gas); `None`: the endpoint's `eth_maxPriorityFeePerGas` (the private rehearsal
+    /// only: `SignerConfig::check_fees`).
     pub priority_fee: Option<u128>,
+    /// A5-13: no priority fee above this (wei per gas), configured, the endpoint's or a replacement's: a cap of the
+    /// tip of its own, far under `max_fee_per_gas` (a lying endpoint made the tip ≈ the whole fee cap).
+    pub max_priority_fee_per_gas: u128,
 }
 
 impl Default for FeePolicy {
     fn default() -> Self {
         // 25 %: `advanceBatch` and `claimDeposit` vary with fresh storage slots and recipients; the estimate
-        // is taken on the pending block, the margin covers the state moving before inclusion.
-        Self { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 200_000_000_000, priority_fee: None }
+        // is taken on the pending block, the margin covers the state moving before inclusion. A tip of 10 gwei at
+        // most (A5-13).
+        Self { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 200_000_000_000, priority_fee: None, max_priority_fee_per_gas: 10_000_000_000 }
     }
 }
 
@@ -227,6 +232,9 @@ impl FeePolicy {
         anyhow::ensure!((10..=100).contains(&self.gas_margin_pct), "gas_margin_pct {} outside 10..=100", self.gas_margin_pct);
         anyhow::ensure!(self.max_gas >= 21_000, "max_gas {} below 21 000", self.max_gas);
         anyhow::ensure!(self.max_fee_per_gas > 0, "max_fee_per_gas is 0");
+        if let Some(p) = self.priority_fee {
+            anyhow::ensure!(p <= self.max_priority_fee_per_gas, "priority fee {p} above its cap {}", self.max_priority_fee_per_gas);
+        }
         Ok(())
     }
 
@@ -244,9 +252,11 @@ impl FeePolicy {
     }
 
     /// `(priority fee, max fee)` for `base` (the latest base fee) and the endpoint's `tip`: `2 × base +
-    /// priority`, capped; refused when the cap cannot pay `base + priority`.
+    /// priority`, capped; refused when the priority is above its own cap (A5-13) or the cap cannot pay `base +
+    /// priority`.
     pub fn fees(&self, base: u128, tip: u128) -> anyhow::Result<(u128, u128)> {
         let prio = self.priority_fee.unwrap_or(tip);
+        anyhow::ensure!(prio <= self.max_priority_fee_per_gas, "priority fee {prio} wei/gas above its cap {}: not sent", self.max_priority_fee_per_gas);
         anyhow::ensure!(
             base.saturating_add(prio) <= self.max_fee_per_gas,
             "base fee {base} + priority {prio} wei/gas above the cap {}: not sent",
@@ -256,12 +266,13 @@ impl FeePolicy {
     }
 
     /// The fees of a replacement of a transaction sent with `old`: both raised by 1/8, rounded up, within
-    /// the cap; refused when the cap leaves less than the 10 % raise the endpoints require.
+    /// their caps (the tip's own, A5-13); refused when a cap leaves less than the 10 % raise the endpoints
+    /// require.
     pub fn bump(&self, old: (u128, u128)) -> anyhow::Result<(u128, u128)> {
         let up = |x: u128| x.saturating_mul(9).div_ceil(8).max(x + 1);
         let tenth = |x: u128| x.saturating_mul(11).div_ceil(10);
         let max_fee = up(old.1).min(self.max_fee_per_gas);
-        let prio = up(old.0).min(max_fee);
+        let prio = up(old.0).min(max_fee).min(self.max_priority_fee_per_gas);
         anyhow::ensure!(
             max_fee >= tenth(old.1) && prio >= tenth(old.0),
             "fees ({}, {}) cannot be raised by 10 % under the cap {}",
@@ -559,8 +570,13 @@ pub struct SignerConfig {
     /// The cap of the fee per gas, wei.
     #[serde(default = "default_max_fee")]
     pub max_fee_per_gas_wei: u64,
-    /// The priority fee, wei per gas (absent: the endpoint's).
+    /// The priority fee, wei per gas. A5-13: required off the private rehearsal (the L1 endpoint's
+    /// `eth_maxPriorityFeePerGas` is never taken there); absent on the rehearsal: the endpoint's.
     pub priority_fee_wei: Option<u64>,
+    /// A5-13: the cap of the priority fee, wei per gas (10 gwei by default), replacements included; a configured
+    /// `priority_fee_wei` above it does not start.
+    #[serde(default = "default_max_priority_fee")]
+    pub max_priority_fee_wei: u64,
 }
 
 fn default_margin() -> u64 {
@@ -571,6 +587,9 @@ fn default_max_gas() -> u64 {
 }
 fn default_max_fee() -> u64 {
     FeePolicy::default().max_fee_per_gas as u64
+}
+fn default_max_priority_fee() -> u64 {
+    FeePolicy::default().max_priority_fee_per_gas as u64
 }
 
 /// How a robot's transactions are signed.
@@ -589,7 +608,23 @@ impl SignerConfig {
             max_gas: self.max_gas,
             max_fee_per_gas: u128::from(self.max_fee_per_gas_wei),
             priority_fee: self.priority_fee_wei.map(u128::from),
+            max_priority_fee_per_gas: u128::from(self.max_priority_fee_wei),
         }
+    }
+
+    /// A5-13: off the private rehearsal the priority fee is configured, and never above its cap: the rule of
+    /// `jg-fill` and of `jg-relay` alike (`open` applies it to every local signer). An error: no start.
+    pub fn check_fees(&self, profile: crate::Profile) -> anyhow::Result<()> {
+        if profile.strict() {
+            anyhow::ensure!(
+                self.priority_fee_wei.is_some(),
+                "[signer] priority_fee_wei is required on {profile} (A5-13: the tip is never the L1 endpoint's word there)"
+            );
+        }
+        if let Some(p) = self.priority_fee_wei {
+            anyhow::ensure!(p <= self.max_priority_fee_wei, "[signer] priority_fee_wei {p} is above max_priority_fee_wei {}", self.max_priority_fee_wei);
+        }
+        Ok(())
     }
 
     /// The signer of a robot of `profile` whose transactions come from `address` (`None`: the key's),
@@ -604,6 +639,7 @@ impl SignerConfig {
         match mode {
             "local" => {
                 let path = self.key_file.as_ref().ok_or_else(|| anyhow::anyhow!("[signer] key_file is required (mode \"local\")"))?;
+                self.check_fees(profile)?;
                 let key = HotKey::load(path)?;
                 if let Some(a) = address {
                     anyhow::ensure!(key.address() == a, "[signer] key_file is the key of 0x{}, not of the configured address 0x{}", hex::encode(key.address()), hex::encode(a));

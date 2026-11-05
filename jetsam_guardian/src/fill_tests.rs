@@ -288,6 +288,7 @@ fn quiet(now: u64) -> GuardInput {
         tip: TipCheck::Ours,
         top_share_pct: 40,
         suspect_minted: false,
+        stock: FillParams::default().max_stock,
     }
 }
 
@@ -501,7 +502,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0 }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0), locked_unminted: 0 }
 }
 
 fn open() -> Guard {
@@ -1098,7 +1099,7 @@ fn a_public_network_refuses_the_clear_and_any_source_off_tor_or_the_loopback() {
     assert!(e.contains("refused on the public test network"), "{e}");
     let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
     // onion only (the default): a loopback node and an onion node, an onion L1: starts
-    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), ""));
+    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), "[signer]\npriority_fee_wei = 1000000000\n"));
     assert!(ok.is_ok(), "{:?}", ok.err());
     // a node on the bridge, or the L1 in the clear: refused before any socket
     let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", "http://10.77.0.12:19801"], "http://127.0.0.1:8545", "")).unwrap_err().to_string();
@@ -1499,6 +1500,210 @@ fn a5_15_one_robot_per_state_dir() {
     assert!(e.contains("another jg-fill") && e.contains("does not start"), "{e}");
     drop(first);
     assert!(lock_state_dir(dir.path()).is_ok(), "released with its holder");
+}
+
+/// A5-1: under the revised contract (`ADVANCE_MIN_AGE` = `D_SLOW`, 24 h) an advance made after the acceptance of
+/// the point that covers its deposit is repaid what it paid only (its fee goes to the recipient): the robot never
+/// advances a deposit at or below the locked height of the contract's tip — refused (the slow path pays the
+/// recipient within 24 h), the queue behind it goes on; with no tip known, a wait, never a refusal.
+#[test]
+fn a5_1_a_deposit_already_under_the_contracts_tip_is_not_advanced() {
+    let tip_at = |l: Option<u64>| Caps { tip_locked_height: l, ..caps() };
+    let c = cand(10, 1, 1, 7 * JTM);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(9))), vec![Verdict::Advance], "above the tip's locked height");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(10))), vec![Verdict::Refuse("ALREADY_UNDER_A_POINT")], "at it");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(Some(11))), vec![Verdict::Refuse("ALREADY_UNDER_A_POINT")], "below it");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), tip_at(None)), vec![Verdict::Wait("CONTRACT_TIP_UNKNOWN")], "no tip known");
+    let v = run(&[cand(10, 1, 1, 7 * JTM), cand(11, 1, 2, 7 * JTM)], &Ledger::default(), tip_at(Some(10)));
+    assert_eq!(v, vec![Verdict::Refuse("ALREADY_UNDER_A_POINT"), Verdict::Advance], "the queue behind it goes on");
+}
+
+/// A5-1: the robot's rule keeps its fee only under a contract that repays the fee of an advance at least 24 h old
+/// at its mint (`D_SLOW`: an advance made before the point that covers its deposit was accepted always is): it reads
+/// `ADVANCE_MIN_AGE()` at start and does not start under another.
+#[test]
+fn a5_1_the_bridge_must_keep_the_fee_of_an_advance_of_24_hours_only() {
+    assert_eq!(ADVANCE_MIN_AGE, 86_400);
+    assert_eq!(ADVANCE_MIN_AGE, crate::relayer::D_SLOW);
+    assert!(check_advance_min_age(86_400).is_ok());
+    for bad in [7_200, 86_399, 86_401, 0, u64::MAX] {
+        let e = check_advance_min_age(bad).unwrap_err().to_string();
+        assert!(e.contains("ADVANCE_MIN_AGE") && e.contains("does not start"), "{bad}: {e}");
+    }
+}
+
+/// N9 (a): the hot key's balance is checked against `max_stock` at every step, not only at start: above it, a
+/// pause (not latched: it lifts when the operator moves the excess to the cold claim owner), nothing advanced.
+#[test]
+fn n9_a_a_stock_above_its_cap_pauses_at_every_step() {
+    let p = FillParams::default();
+    let mut s = quiet(NOW);
+    s.stock = p.max_stock + 1;
+    let g = guard(&s, &p);
+    assert_eq!((g.halt.as_deref(), g.pause.as_deref()), (None, Some("PAUSE_STOCK_ABOVE_CAP")));
+    assert_eq!(plan(&[cand(10, 1, 1, 7 * JTM)], &Ledger::default(), caps(), &g, NOW, NOW, 5 * JTM, &p), vec![Verdict::Wait("PAUSED")]);
+    s.stock = p.max_stock;
+    assert_eq!(guard(&s, &p).pause, None, "at the cap: no pause");
+    s.stock = 0;
+    assert_eq!(guard(&s, &p).pause, None, "a dry stock is the queue's wait (STOCK), not this pause");
+}
+
+/// N9 (b): the room under the contract's supply ceiling also leaves out the deposits the contract's tip already
+/// commits to (at or below its locked height `L`) and not minted yet: their mints come before any deposit the robot
+/// may advance now (above `L`, A5-1). Its own advances are counted once (pending: `pending_sum`; repaid: minted); a
+/// deposit not known minted counts; `minted` is asked lowest first.
+#[test]
+fn n9_b_the_room_under_the_ceiling_leaves_out_the_deposits_locked_under_the_tip_and_not_minted() {
+    let d = |h: u64, g: u32, a: u64| FoundDeposit { height: h, group: g, block_id: [h as u8; 32], txid: [h as u8 ^ ((g as u8) << 5); 32], recipient: rcpt(g as u8), amount: a, block_ts: NOW - 900 };
+    let deps = vec![d(12, 1, 30 * JTM), d(8, 1, 100 * JTM), d(10, 2, 7 * JTM), d(9, 2, 50 * JTM), d(10, 1, 20 * JTM), d(11, 1, 40 * JTM)];
+    let mut l = Ledger::default();
+    l.advances.push(Advanced { key: deps[3].key(), txid: deps[3].txid, height: 9, block_id: deps[3].block_id, recipient: deps[3].recipient, amount: 50 * JTM, fee_bps: 75, paid: paid(50 * JTM, 75), sent_at: NOW - 100_000, tx_hash: String::new(), status: AdvanceStatus::Pending });
+    let mut asked = Vec::new();
+    let sum = locked_unminted(&deps, 10, &l, &mut |x: &FoundDeposit| {
+        asked.push((x.height, x.group));
+        x.height == 8
+    });
+    assert_eq!(sum, 27 * JTM, "the two at 10: 8 is minted, 9 is the robot's own, 11 and 12 are above L");
+    assert_eq!(asked, vec![(8, 1), (10, 1), (10, 2)], "lowest first, the robot's own advances never asked");
+    assert_eq!(locked_unminted(&deps, 10, &l, &mut |_: &FoundDeposit| false), 127 * JTM, "not known minted: counted");
+    assert_eq!(locked_unminted(&deps, 7, &l, &mut |_: &FoundDeposit| false), 0, "nothing under L");
+    assert_eq!(locked_unminted(&[d(1, 1, u64::MAX), d(2, 1, 5)], 10, &Ledger::default(), &mut |_: &FoundDeposit| false), u64::MAX, "saturated");
+    // in the plan: the room is CEIL − supply − the robot's pending − the locked deposits not minted
+    let c = cand(13, 1, 5, 200 * JTM);
+    let at = |supply: u64, locked: u64| Caps { total_supply: supply, tip_locked_height: Some(10), locked_unminted: locked, ..caps() };
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM)), vec![Verdict::Advance], "10 000 − 9 700 − 100 = 200");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c], &Ledger::default(), at(0, u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+}
+
+/// N9 (c): `relay_blocks_dir` names the relayer's archive explicitly (another host's mount, a mirror); absent, it
+/// stays `blocks/` beside `relay_final` (every configuration so far).
+#[test]
+fn n9_c_the_relayers_archive_may_be_named_explicitly() {
+    let p = "[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n";
+    let both = FillConfig::parse(&rehearsal(&format!("relay_final = \"/srv/relay/publish/final.json\"\nrelay_blocks_dir = \"/mnt/archive/blocks\"\n{p}"))).unwrap();
+    assert_eq!(both.relay_blocks_dir(), Some(std::path::PathBuf::from("/mnt/archive/blocks")));
+    let alone = FillConfig::parse(&rehearsal(&format!("relay_blocks_dir = \"/mnt/archive/blocks\"\n{p}"))).unwrap();
+    assert_eq!(alone.relay_blocks_dir(), Some(std::path::PathBuf::from("/mnt/archive/blocks")), "without relay_final: advances, repayments claimed by others");
+    let default = FillConfig::parse(&rehearsal(&format!("relay_final = \"/srv/relay/publish/final.json\"\n{p}"))).unwrap();
+    assert_eq!(default.relay_blocks_dir(), Some(std::path::PathBuf::from("/srv/relay/publish/blocks")));
+}
+
+/// A5-13: on a public network fill.toml names the priority fee of its signer under its cap, or jg-fill does not start
+/// (checked with the configuration, before any socket).
+#[test]
+fn a5_13_a_public_network_needs_the_priority_fee_in_fill_toml() {
+    let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
+    let l1 = format!("http://jetsamtest{}.onion:8545", "b".repeat(46));
+    let public = |extra: &str| FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &l1, extra));
+    for extra in ["", "[signer]\n", "[signer]\npriority_fee_wei = 10000000001\n"] {
+        let e = public(extra).unwrap_err().to_string();
+        assert!(e.contains("priority_fee_wei") && e.contains("does not start"), "{extra:?}: {e}");
+    }
+    assert!(public("[signer]\npriority_fee_wei = 1000000000\n").is_ok());
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).is_ok(), "the rehearsal: not required");
+}
+
+/// A5-13: three reverted transactions of the robot in a row halt it (latched, `HALT_REPEATED_REVERTS`): its probe
+/// (`eth_call`) and its reads come from one L1 endpoint, and each revert costs gas; a success resets the count, the
+/// halt too (counted again after the operator's restart).
+#[test]
+fn a5_13_three_reverted_transactions_in_a_row_halt() {
+    assert_eq!(MAX_CONSECUTIVE_REVERTS, 3);
+    assert_eq!(after_receipt(0, false), (1, None));
+    assert_eq!(after_receipt(1, false), (2, None));
+    assert_eq!(after_receipt(2, false), (0, Some(HALT_REPEATED_REVERTS)), "the third in a row");
+    assert_eq!(after_receipt(2, true), (0, None), "a success resets");
+    assert_eq!(after_receipt(u32::MAX, false), (0, Some(HALT_REPEATED_REVERTS)));
+    let mut n = 0;
+    let mut halts = Vec::new();
+    for status in [false, false, true, false, false, false] {
+        let (m, h) = after_receipt(n, status);
+        n = m;
+        halts.push(h);
+    }
+    assert_eq!(halts, vec![None, None, None, None, None, Some(HALT_REPEATED_REVERTS)]);
+}
+
+/// A5-13: a refusal that depends on the L1 clock (`l1_now`: the time of the endpoint's latest block, which may lie)
+/// is never final: the deposit is decided again at the next step. Every other refusal is. Checked on the plan
+/// itself: whatever refusal changes with the L1 clock alone is not final; and jg-fill skips a deposit only on a final
+/// decision.
+#[test]
+fn a5_13_a_refusal_that_depends_on_the_l1_clock_is_never_final() {
+    assert!(!decided_for_good("refuse:LATE_SLOW_PATH_NEAR"));
+    for code in ["ALREADY_ADVANCED", "ADVANCED_BY_ANOTHER", "ALREADY_MINTED", "ALREADY_UNDER_A_POINT", "BELOW_MIN_ADVANCE", "RECIPIENT_CAP"] {
+        assert!(decided_for_good(&format!("refuse:{code}")), "{code}");
+    }
+    for code in ["advance", "wait:NOT_CONFIRMED", "wait:LATE_SLOW_PATH_NEAR", ""] {
+        assert!(!decided_for_good(code), "{code}");
+    }
+    let p = FillParams::default();
+    let mut late = cand(11, 1, 2, 7 * JTM);
+    late.dep.block_ts = NOW - p.late_after_secs - 1;
+    let cands = vec![cand(10, 1, 1, 7 * JTM), late, cand(12, 1, 3, 2 * JTM), cand(13, 1, 4, 7 * JTM)];
+    let at = |l1: u64| plan(&cands, &Ledger::default(), caps(), &open(), NOW, l1, 5 * JTM, &p);
+    let base = at(NOW);
+    let mut changed = 0;
+    for l1 in [0, NOW - 86_400, NOW + p.late_after_secs, NOW + 10 * 86_400, u64::MAX] {
+        for (x, y) in base.iter().zip(at(l1)) {
+            if *x != y {
+                changed += 1;
+                for v in [*x, y] {
+                    if let Verdict::Refuse(code) = v {
+                        assert!(!decided_for_good(&format!("refuse:{code}")), "{code} changes with the L1 clock alone: not final");
+                    }
+                }
+            }
+        }
+    }
+    assert!(changed > 0, "the L1 clock moved some verdict");
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::decided_for_good(") && !robot.contains("starts_with(\"refuse:\")"), "jg-fill skips a deposit on a final decision only");
+}
+
+/// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name
+/// (`<file name>.tmp`: never a sibling's), overwriting one a crash left, leaving none.
+#[test]
+fn a5_14_write_atomic_replaces_the_file_whole_under_its_own_temporary() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("state.json");
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+    crate::write_atomic(&p, b"one").unwrap();
+    assert_eq!(read(&p), "one");
+    // a temporary left by a crash before its rename is replaced, none is left
+    std::fs::write(dir.path().join("state.json.tmp"), "stale and longer").unwrap();
+    crate::write_atomic(&p, b"two").unwrap();
+    assert_eq!(read(&p), "two");
+    assert!(!dir.path().join("state.json.tmp").exists(), "no temporary left");
+    // a sibling of the same stem is not its temporary
+    std::fs::write(dir.path().join("state.tmp"), "a sibling").unwrap();
+    crate::write_atomic(&p, b"three").unwrap();
+    assert_eq!((read(&p).as_str(), read(&dir.path().join("state.tmp")).as_str()), ("three", "a sibling"));
+    assert!(crate::write_atomic(&dir.path().join("absent/state.json"), b"x").is_err());
+}
+
+/// A5-14: `state.json` absent is a first start; present but unreadable, jg-fill does not start (its ledger is what
+/// its caps and its repayments count: an operator restores it, or removes it knowingly).
+#[test]
+fn a5_14_a_state_present_but_unreadable_refuses_to_start() {
+    #[derive(Debug, Default, PartialEq, Deserialize)]
+    struct S {
+        n: u64,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("state.json");
+    assert_eq!(read_state::<S>(&p).unwrap(), S::default(), "absent: a first start");
+    std::fs::write(&p, "{\"n\":7}").unwrap();
+    assert_eq!(read_state::<S>(&p).unwrap(), S { n: 7 });
+    for bad in ["", "{\"n\":", "garbage", "{\"n\":\"7\"}", "{}"] {
+        std::fs::write(&p, bad).unwrap();
+        let e = read_state::<S>(&p).unwrap_err().to_string();
+        assert!(e.contains("state.json") && e.contains("does not start"), "{bad:?}: {e}");
+    }
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir(&p).unwrap();
+    assert!(read_state::<S>(&p).unwrap_err().to_string().contains("does not start"), "not a readable file");
 }
 
 // ---------------------------------------------------------------- the robot's activation gate (A5-12)

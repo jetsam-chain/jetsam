@@ -17,6 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -852,18 +853,46 @@ fn jg_fill_refuses_to_start_off_tor_or_the_loopback_and_dials_nothing() {
     }
 }
 
+/// A5-14: a `state.json` present but unreadable stops jg-fill at its start, before any socket, and is left as it
+/// was (an operator restores it or removes it knowingly). Only the rehearsal build gets that far (another build's
+/// v1.7 clock stops it before: `jg_fill_reaches_its_nodes_…`).
+#[test]
+fn jg_fill_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let (target, socks) = untouchable();
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{}\"\n", socks.local_addr().unwrap().port());
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), "{\"ledger\":").unwrap();
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("state.json") && log.contains("unreadable") && log.contains("does not start"), "{log}");
+    untouched(&target, &socks, "an unreadable state.json");
+    assert_eq!(std::fs::read_to_string(dir.join("state/state.json")).unwrap(), "{\"ledger\":", "left as it was");
+}
+
 /// A fake world behind the SOCKS port: two onion nodes (the testkit genesis only) and an onion L1 (chain
 /// 31 337, a token, the hot key's balance `stock`).
 fn fill_world(stock: u64) -> Answer {
-    fill_world_on(stock, "0x7a69")
+    fill_world_on(stock, "0x7a69", 86_400)
 }
 
-fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
+/// `min_age`: the bridge's `ADVANCE_MIN_AGE()` (A5-1: 86 400 for the revised contract, 7 200 before it).
+fn fill_world_on(stock: u64, chain_id: &'static str, min_age: u64) -> Answer {
+    fill_world_live(Arc::new(AtomicU64::new(stock)), chain_id, min_age)
+}
+
+/// N9: the hot key's balance as it is when read (a test changes it while the robot runs).
+fn fill_world_live(stock: Arc<AtomicU64>, chain_id: &'static str, min_age: u64) -> Answer {
     let genesis = testkit::genesis();
     let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
     let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
     // A5-18: the bridge's ceiling, read at start
     let ceiling = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("OUTSTANDING_CEIL()")));
+    let age = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("ADVANCE_MIN_AGE()")));
     Arc::new(move |method, params| match method {
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
@@ -877,9 +906,11 @@ fn fill_world_on(stock: u64, chain_id: &'static str) -> Answer {
             if data.starts_with("0xfc0c546a") {
                 json!({"result": token})
             } else if data.starts_with("0x70a08231") {
-                json!({"result": format!("0x{stock:064x}")})
+                json!({"result": format!("0x{:064x}", stock.load(Ordering::SeqCst))})
             } else if data.starts_with(&ceiling) {
                 json!({"result": format!("0x{:064x}", 10_000_000_000u64)})
+            } else if data.starts_with(&age) {
+                json!({"result": format!("0x{min_age:064x}")})
             } else {
                 json!({"result": format!("0x{}", "00".repeat(32 * 6))})
             }
@@ -917,12 +948,19 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert!(log.contains("max_stock") && log.contains("does not start"), "{log}");
     assert!(seen.lock().unwrap().iter().all(|(atyp, host, ..)| *atyp == 3 && *host == c), "{:?}", seen.lock().unwrap());
     // an L1 endpoint of another chain: no start
-    let (socks, _) = fake_tor(fill_world_on(cap, "0x1"));
+    let (socks, _) = fake_tor(fill_world_on(cap, "0x1", 86_400));
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
     let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
     let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
     assert_eq!(code, Some(Some(1)), "log:\n{log}");
     assert!(log.contains("is chain 1, not 31337") && log.contains("does not start"), "{log}");
+    // A5-1: a bridge that keeps the fee of an advance of 2 h (the contract before its revision): no start
+    let (socks, _) = fake_tor(fill_world_on(cap, "0x7a69", 7_200));
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&network, 31_337, &nodes, &format!("http://{c}:8545"), &tail);
+    let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+    assert_eq!(code, Some(Some(1)), "log:\n{log}");
+    assert!(log.contains("ADVANCE_MIN_AGE() is 7200 s, not 86400") && log.contains("does not start"), "{log}");
     // at the cap: it starts, reads both nodes and the L1, by name through Tor
     let (socks, seen) = fake_tor(fill_world(cap));
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
@@ -937,4 +975,122 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert!(seen.lock().unwrap().iter().all(|(atyp, h, ..)| *atyp == 3 && (*h == n1 || *h == n2 || *h == c)), "every target named, through Tor");
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("\\\"kind\\\":\\\"start\\\""), "{journal}");
+}
+
+/// N9 (a): the hot key's stock is read again at every step: a refill above `max_stock` while the robot runs pauses
+/// it (`PAUSE_STOCK_ABOVE_CAP` in its published queue, an ALERT), and the pause lifts when the excess is gone.
+/// Rehearsal build only (another build's v1.7 clock stops it at start).
+#[test]
+fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let cap = 1_200_000_000u64;
+    let stock = Arc::new(AtomicU64::new(cap));
+    let (socks, _) = fake_tor(fill_world_live(stock.clone(), "0x7a69", 86_400));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let queue = dir.join("state/queue.json");
+    let pause = || std::fs::read_to_string(&queue).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).map(|q| q["pause"].clone());
+    let stepped = wait_for(60, || pause().is_some_and(|p| p != json!("PAUSE_STOCK_ABOVE_CAP")));
+    stock.store(cap + 1, Ordering::SeqCst);
+    let paused = wait_for(60, || pause() == Some(json!("PAUSE_STOCK_ABOVE_CAP")));
+    stock.store(cap, Ordering::SeqCst);
+    let lifted = wait_for(60, || pause().is_some_and(|p| p != json!("PAUSE_STOCK_ABOVE_CAP")));
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(stepped && paused && lifted, "stepped {stepped}, paused {paused}, lifted {lifted}; log:\n{log}");
+    assert_eq!(log.matches("ALERT the hot key holds 1200000001").count(), 1, "one alert per crossing:\n{log}");
+    let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    assert!(journal.contains("PAUSE_STOCK_ABOVE_CAP"), "{journal}");
+}
+
+/// The fake L1 of `inner` where the bridge holds every root final and every transaction sent through the endpoint's
+/// account (the rehearsal without `[signer]`) is mined reverted.
+fn reverting(inner: Answer) -> Answer {
+    let final_root = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("isFinalDepositRoot(bytes32)")));
+    Arc::new(move |method, params| match method {
+        "eth_call" if params[0]["data"].as_str().unwrap_or_default().starts_with(&final_root) => json!({"result": format!("0x{:064x}", 1)}),
+        "eth_sendTransaction" => json!({"result": format!("0x{}", "ab".repeat(32))}),
+        "eth_getTransactionReceipt" => json!({"result": {"status": "0x0", "gasUsed": "0x5208", "blockNumber": "0x10", "logs": []}}),
+        _ => inner(method, params),
+    })
+}
+
+/// A5-13: three of the robot's transactions reverted in a row (here its own claim of a repayment, the endpoint saying
+/// the root is final and the deposit not minted, the chain reverting each one) halt it, latched and named
+/// (`HALT_REPEATED_REVERTS`), and it sends nothing more — also when another halt was latched before (own claims go on
+/// under the others): its line is added. Rehearsal build only.
+#[test]
+fn jg_fill_halts_after_three_reverted_transactions_and_sends_nothing_more() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    halts_after_three_reverts(None);
+    halts_after_three_reverts(Some("HALT_DEEP_REORG"));
+}
+
+fn halts_after_three_reverts(before: Option<&str>) {
+    use jetsam_guardian::checkpoint::{deposit_leaf, Checkpoint, Deposit};
+    use jetsam_guardian::fill::{advance_key, paid, AdvanceStatus, Advanced, Ledger};
+    let (socks, seen) = fake_tor(reverting(fill_world(1_200_000_000)));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    // a pending advance of the robot whose deposit is in the relayer's published final root
+    let (txid, recipient, amount) = ([0x5au8; 32], [0xa1u8; 20], 7_000_000u64);
+    let dep = Deposit { index: 0, recipient, amount, jetsam_tx_id: txid };
+    let fin = Checkpoint {
+        height: 300,
+        cum_work: [1; 32],
+        headers_digest: [2; 32],
+        deposit_root: jetsam_guardian::chain::merkle_root(&[deposit_leaf(&dep)]),
+        deposit_count: 1,
+        anchor_root: [3; 32],
+        locked_height: 292,
+        tip_block_id: [4; 32],
+        locked_block_id: [5; 32],
+        locked_cum_work: [6; 32],
+    };
+    std::fs::create_dir_all(dir.join("publish")).unwrap();
+    std::fs::write(dir.join("publish/final.json"), jetsam_guardian::relayer::published_final(&fin.id(), &fin, &[dep], &[200]).to_string()).unwrap();
+    let advanced = Advanced {
+        key: advance_key(&txid, &recipient, amount),
+        txid,
+        height: 200,
+        block_id: [7; 32],
+        recipient,
+        amount,
+        fee_bps: 75,
+        paid: paid(amount, 75),
+        sent_at: 1,
+        tx_hash: String::new(),
+        status: AdvanceStatus::Pending,
+    };
+    let state = json!({"ledger": Ledger { advances: vec![advanced] }, "scanned": {}, "confirmed_at": {}, "decided": {}, "checkpoints": {}, "observers": {}});
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), state.to_string()).unwrap();
+    if let Some(h) = before {
+        std::fs::write(dir.join("state/HALT"), format!("{h}\n")).unwrap();
+    }
+    let toml = std::fs::read_to_string(dir.join("fill.toml")).unwrap();
+    std::fs::write(dir.join("fill.toml"), format!("relay_final = \"{}\"\n{toml}", dir.join("publish/final.json").display())).unwrap();
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let sends = || seen.lock().unwrap().iter().filter(|(.., m)| m == "eth_sendTransaction").count();
+    let want = before.map_or("HALT_REPEATED_REVERTS".to_string(), |h| format!("{h}\nHALT_REPEATED_REVERTS"));
+    let halted = wait_for(60, || std::fs::read_to_string(dir.join("state/HALT")).is_ok_and(|h| h.trim() == want));
+    let at_halt = sends();
+    // several more steps (poll_secs = 1): nothing more is sent
+    std::thread::sleep(Duration::from_secs(5));
+    let after = sends();
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(halted, "{before:?}: log:\n{log}");
+    assert_eq!((at_halt, after), (3, 3), "{before:?}: three reverted sends, then none; log:\n{log}");
+    let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
 }

@@ -188,3 +188,25 @@ pub fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// A5-14: write `bytes` to `path` so that a stop or a power cut leaves either the previous file or the new one,
+/// whole: a temporary beside it under its own name (`<file name>.tmp`, replaced if a crash left one), synced
+/// (`sync_all`), renamed over `path`, then its directory synced (the rename itself is on disk when it returns).
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let name = path.file_name().ok_or_else(|| anyhow::anyhow!("{}: not a file path", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let mut f = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    f.write_all(bytes).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    f.sync_all().map_err(|e| anyhow::anyhow!("{}: sync: {e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{} -> {}: {e}", tmp.display(), path.display()))?;
+    std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| anyhow::anyhow!("{}: sync: {e}", dir.display()))?;
+    Ok(())
+}

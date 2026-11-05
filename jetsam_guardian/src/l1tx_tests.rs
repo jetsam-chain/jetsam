@@ -119,7 +119,7 @@ fn a_hot_key_never_prints_its_secret() {
 
 #[test]
 fn gas_limit_is_the_estimate_with_its_margin_rounded_up_and_capped() {
-    let p = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 100, priority_fee: Some(2) };
+    let p = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 100, priority_fee: Some(2), max_priority_fee_per_gas: 100 };
     assert_eq!(p.gas_limit(100_000).unwrap(), 125_000);
     assert_eq!(p.gas_limit(100_001).unwrap(), 125_002);
     assert_eq!(p.gas_limit(800_000).unwrap(), 1_000_000);
@@ -131,7 +131,7 @@ fn gas_limit_is_the_estimate_with_its_margin_rounded_up_and_capped() {
 
 #[test]
 fn fees_follow_the_base_fee_within_the_cap() {
-    let p = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(5) };
+    let p = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(5), max_priority_fee_per_gas: 1_000 };
     assert_eq!(p.fees(100, 7).unwrap(), (5, 205), "configured tip, 2 × base + tip");
     assert_eq!(FeePolicy { priority_fee: None, ..p }.fees(100, 7).unwrap(), (7, 207), "the endpoint's tip");
     assert_eq!(p.fees(600, 7).unwrap(), (5, 1_000), "capped");
@@ -149,7 +149,8 @@ fn the_signer_is_local_off_the_rehearsal_and_its_key_is_the_configured_address()
     let k = write_key(dir.path(), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", 0o600);
     let addr: [u8; 20] = hex::decode("f39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap().try_into().unwrap();
     let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
-    let local = parse(&format!("key_file = {:?}", k.display().to_string()));
+    // A5-13: off the rehearsal the priority fee is configured
+    let local = parse(&format!("key_file = {:?}\npriority_fee_wei = 1000000000", k.display().to_string()));
     for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::PrivateRehearsal] {
         let s = local.open(p, 1, Some(addr), dir.path()).unwrap();
         assert!(matches!(s, L1Tx::Local(_)), "{p}");
@@ -168,4 +169,53 @@ fn the_signer_is_local_off_the_rehearsal_and_its_key_is_the_configured_address()
     assert!(parse(&format!("mode = \"endpoint\"\nkey_file = {:?}", k.display().to_string())).open(Profile::PrivateRehearsal, 1, Some(addr), dir.path()).is_err());
     assert!(parse(&format!("key_file = {:?}\ngas_margin_pct = 5", k.display().to_string())).open(Profile::Mainnet, 1, None, dir.path()).is_err(), "the margin floor");
     assert!(toml::from_str::<SignerConfig>("unknown = 1").is_err());
+}
+
+/// A5-13: the priority fee has a cap of its own (`max_priority_fee_per_gas`, far under `max_fee_per_gas`): a tip
+/// above it, configured or the endpoint's, is not sent, and a replacement never raises it above it.
+#[test]
+fn a5_13_the_priority_fee_has_a_cap_of_its_own() {
+    let p = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(5), max_priority_fee_per_gas: 10 };
+    assert_eq!(p.fees(100, 7).unwrap(), (5, 205));
+    assert_eq!(FeePolicy { priority_fee: Some(10), ..p }.fees(100, 7).unwrap(), (10, 210), "at the cap");
+    let e = FeePolicy { priority_fee: Some(11), ..p }.fees(100, 7).unwrap_err().to_string();
+    assert!(e.contains("priority") && e.contains("cap") && e.contains("not sent"), "{e}");
+    assert_eq!(FeePolicy { priority_fee: None, ..p }.fees(100, 10).unwrap(), (10, 210), "the endpoint's tip at the cap");
+    assert!(FeePolicy { priority_fee: None, ..p }.fees(100, 500).is_err(), "a lying endpoint's tip: not sent");
+    // a replacement raises the tip by 1/8 up to its cap, then no more (the 10 % the endpoints require cannot be met)
+    assert_eq!(p.bump((5, 205)).unwrap(), (6, 231));
+    assert_eq!(p.bump((9, 300)).unwrap(), (10, 338), "raised to the cap, not to 11");
+    assert!(p.bump((10, 300)).is_err(), "the tip at its cap");
+    assert!(FeePolicy { priority_fee: Some(11), ..p }.check().is_err(), "a configured tip above its cap");
+    assert!(p.check().is_ok());
+    assert_eq!(FeePolicy::default().max_priority_fee_per_gas, 10_000_000_000, "10 gwei by default");
+}
+
+/// A5-13: off the private rehearsal a robot's `[signer]` names its priority fee (an L1 endpoint's
+/// `eth_maxPriorityFeePerGas` is never its word there), at most `max_priority_fee_wei` (10 gwei by default):
+/// otherwise its signer does not open, for jg-fill and jg-relay alike (`open`, shared). The rehearsal may still take
+/// the endpoint's, under the same cap at each send.
+#[test]
+fn a5_13_off_the_rehearsal_the_priority_fee_is_configured_and_under_its_cap() {
+    use crate::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let k = write_key(dir.path(), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", 0o600);
+    let addr: [u8; 20] = hex::decode("f39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap().try_into().unwrap();
+    let key = format!("key_file = {:?}", k.display().to_string());
+    let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
+    assert_eq!(parse(&key).max_priority_fee_wei, 10_000_000_000);
+    for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::OtherNetwork] {
+        let e = parse(&key).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
+        assert!(e.contains("priority_fee_wei") && e.contains("required"), "{p}: {e}");
+        assert!(parse(&format!("{key}\npriority_fee_wei = 1000000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}");
+        assert!(parse(&format!("{key}\npriority_fee_wei = 10000000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: at the cap");
+        let e = parse(&format!("{key}\npriority_fee_wei = 10000000001")).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
+        assert!(e.contains("max_priority_fee_wei"), "{p}: {e}");
+        let raised = format!("{key}\npriority_fee_wei = 20000000000\nmax_priority_fee_wei = 20000000000");
+        assert!(parse(&raised).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: a cap raised knowingly");
+        assert!(parse(&key).check_fees(p).is_err() && SignerConfig::default().check_fees(p).is_err(), "{p}");
+    }
+    assert!(parse(&key).open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_ok(), "the rehearsal: the endpoint's tip, capped");
+    assert!(parse(&format!("{key}\npriority_fee_wei = 10000000001")).open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_err(), "above its cap even there");
+    assert!(SignerConfig::default().check_fees(Profile::PrivateRehearsal).is_ok(), "the rehearsal's endpoint account");
 }
