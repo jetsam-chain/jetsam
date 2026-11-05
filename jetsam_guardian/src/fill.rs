@@ -203,7 +203,7 @@ pub struct FillParams {
     pub recipient_window: u64,
     /// Outstanding (advanced, not repaid) at most this (≤ the contract's 3 000 JTM).
     pub outstanding_cap: u64,
-    /// The hot key's stock cap: at start, a balance above it refuses to start.
+    /// The hot key's stock cap: at start, a balance above it refuses to start; at every step, it pauses (N9).
     pub max_stock: u64,
     /// The smallest advance, and the gas floor: an advance is at least `gas_multiple` × its gas cost.
     pub min_advance: u64,
@@ -530,6 +530,8 @@ pub struct GuardInput {
     /// A5-18: the contract's `suspectMinted()` is not 0 (wJTM minted from abandoned final points, still in
     /// `totalSupply`).
     pub suspect_minted: bool,
+    /// N9: the hot key's wJTM balance, read at every step.
+    pub stock: u64,
 }
 
 /// A halt (latched: only an operator restarts, D41) and a pause (lifts with its cause).
@@ -557,6 +559,10 @@ pub fn guard(g: &GuardInput, p: &FillParams) -> Guard {
         Some("PAUSE_STALLED")
     } else if g.suspect_minted {
         Some("PAUSE_SUSPECT_MINTED")
+    } else if g.stock > p.max_stock {
+        // N9: the hot key holds the capped stock only, at every step (a refill above it, or a gift: the operator moves
+        // the excess to the cold claim owner)
+        Some("PAUSE_STOCK_ABOVE_CAP")
     } else if g.l1_now < g.last_switch_at.saturating_add(p.switch_pause_secs) {
         Some("PAUSE_RECENT_SWITCH")
     } else if g.now > g.tip_changed_at + p.tip_max_age {
@@ -599,6 +605,19 @@ pub struct Caps {
     pub stock: u64,
     pub total_supply: u64,
     pub tip_locked_height: Option<u64>,
+    /// N9: [`locked_unminted`] under the tip (0 without a tip).
+    pub locked_unminted: u64,
+}
+
+/// N9: what the mints of the deposits the contract's tip already commits to (at or below its locked height) and not
+/// minted yet will add to `totalSupply` before any deposit the robot may advance now (those are above it, A5-1):
+/// their amounts, saturated, except the deposits `minted` says are minted and the robot's own advances (counted by
+/// [`Ledger::pending_sum`] while pending, minted otherwise). `minted` is asked lowest first (the oldest are minted
+/// first); a deposit it does not know minted counts (prudent: at worst the robot waits for room it has).
+pub fn locked_unminted(deposits: &[FoundDeposit], locked_height: u64, ledger: &Ledger, minted: &mut dyn FnMut(&FoundDeposit) -> bool) -> u64 {
+    let mut locked: Vec<&FoundDeposit> = deposits.iter().filter(|d| d.height <= locked_height && !ledger.has(&d.key())).collect();
+    locked.sort_by_key(|d| (d.height, d.group, d.txid));
+    locked.into_iter().filter(|d| !minted(d)).map(|d| d.amount).fold(0u64, u64::saturating_add)
 }
 
 /// The decision on one candidate.
@@ -709,8 +728,9 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     let mut day = caps.spent24h;
     let mut outstanding = caps.outstanding;
     let mut stock = caps.stock;
-    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted
-    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum());
+    // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted, and
+    // (N9) the deposits its tip already commits to
+    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum()).saturating_sub(caps.locked_unminted);
     let outstanding_cap = p.outstanding_cap.min(ADVANCE_OUTSTANDING_CAP);
     let mut batch = 0usize;
     let mut per_recipient: HashMap<[u8; 20], u64> = HashMap::new();
@@ -1054,16 +1074,21 @@ pub struct FillConfig {
     /// The relayer's published `final.json` (`jg-relay`'s `publish_dir`): the robot claims the repayment of
     /// its own advances from it (`claimDeposit`), checked against the contract's final root, without
     /// waiting for anyone. Absent: it waits for a claimer. The relayer's archive of the deposit blocks beside
-    /// it (`blocks/`) is required for every advance (A5-7): absent, nothing is advanced.
+    /// it (`blocks/`, or `relay_blocks_dir`) is required for every advance (A5-7): absent, nothing is advanced.
     #[serde(default)]
     pub relay_final: Option<PathBuf>,
+    /// N9: the relayer's published archive of the deposit blocks (A5-7), named explicitly (another mount, a
+    /// mirror); absent, `blocks/` beside `relay_final`.
+    #[serde(default)]
+    pub relay_blocks_dir: Option<PathBuf>,
 }
 
 impl FillConfig {
-    /// A5-7: where the relayer publishes the deposit blocks it archived: `blocks/` beside its `final.json`
-    /// (`relay_final` = `<publish_dir>/final.json`); none without `relay_final`, and then nothing is advanced.
+    /// A5-7: where the relayer publishes the deposit blocks it archived: `relay_blocks_dir` if set (N9), else
+    /// `blocks/` beside its `final.json` (`relay_final` = `<publish_dir>/final.json`); none without either, and then
+    /// nothing is advanced.
     pub fn relay_blocks_dir(&self) -> Option<PathBuf> {
-        self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks"))
+        self.relay_blocks_dir.clone().or_else(|| self.relay_final.as_ref().and_then(|f| f.parent()).map(|p| p.join("blocks")))
     }
 }
 

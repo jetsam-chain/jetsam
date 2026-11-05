@@ -288,6 +288,7 @@ fn quiet(now: u64) -> GuardInput {
         tip: TipCheck::Ours,
         top_share_pct: 40,
         suspect_minted: false,
+        stock: FillParams::default().max_stock,
     }
 }
 
@@ -501,7 +502,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0) }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0), locked_unminted: 0 }
 }
 
 fn open() -> Guard {
@@ -1529,6 +1530,63 @@ fn a5_1_the_bridge_must_keep_the_fee_of_an_advance_of_24_hours_only() {
         let e = check_advance_min_age(bad).unwrap_err().to_string();
         assert!(e.contains("ADVANCE_MIN_AGE") && e.contains("does not start"), "{bad}: {e}");
     }
+}
+
+/// N9 (a): the hot key's balance is checked against `max_stock` at every step, not only at start: above it, a
+/// pause (not latched: it lifts when the operator moves the excess to the cold claim owner), nothing advanced.
+#[test]
+fn n9_a_a_stock_above_its_cap_pauses_at_every_step() {
+    let p = FillParams::default();
+    let mut s = quiet(NOW);
+    s.stock = p.max_stock + 1;
+    let g = guard(&s, &p);
+    assert_eq!((g.halt.as_deref(), g.pause.as_deref()), (None, Some("PAUSE_STOCK_ABOVE_CAP")));
+    assert_eq!(plan(&[cand(10, 1, 1, 7 * JTM)], &Ledger::default(), caps(), &g, NOW, NOW, 5 * JTM, &p), vec![Verdict::Wait("PAUSED")]);
+    s.stock = p.max_stock;
+    assert_eq!(guard(&s, &p).pause, None, "at the cap: no pause");
+    s.stock = 0;
+    assert_eq!(guard(&s, &p).pause, None, "a dry stock is the queue's wait (STOCK), not this pause");
+}
+
+/// N9 (b): the room under the contract's supply ceiling also leaves out the deposits the contract's tip already
+/// commits to (at or below its locked height `L`) and not minted yet: their mints come before any deposit the robot
+/// may advance now (above `L`, A5-1). Its own advances are counted once (pending: `pending_sum`; repaid: minted); a
+/// deposit not known minted counts; `minted` is asked lowest first.
+#[test]
+fn n9_b_the_room_under_the_ceiling_leaves_out_the_deposits_locked_under_the_tip_and_not_minted() {
+    let d = |h: u64, g: u32, a: u64| FoundDeposit { height: h, group: g, block_id: [h as u8; 32], txid: [h as u8 ^ ((g as u8) << 5); 32], recipient: rcpt(g as u8), amount: a, block_ts: NOW - 900 };
+    let deps = vec![d(12, 1, 30 * JTM), d(8, 1, 100 * JTM), d(10, 2, 7 * JTM), d(9, 2, 50 * JTM), d(10, 1, 20 * JTM), d(11, 1, 40 * JTM)];
+    let mut l = Ledger::default();
+    l.advances.push(Advanced { key: deps[3].key(), txid: deps[3].txid, height: 9, block_id: deps[3].block_id, recipient: deps[3].recipient, amount: 50 * JTM, fee_bps: 75, paid: paid(50 * JTM, 75), sent_at: NOW - 100_000, tx_hash: String::new(), status: AdvanceStatus::Pending });
+    let mut asked = Vec::new();
+    let sum = locked_unminted(&deps, 10, &l, &mut |x: &FoundDeposit| {
+        asked.push((x.height, x.group));
+        x.height == 8
+    });
+    assert_eq!(sum, 27 * JTM, "the two at 10: 8 is minted, 9 is the robot's own, 11 and 12 are above L");
+    assert_eq!(asked, vec![(8, 1), (10, 1), (10, 2)], "lowest first, the robot's own advances never asked");
+    assert_eq!(locked_unminted(&deps, 10, &l, &mut |_: &FoundDeposit| false), 127 * JTM, "not known minted: counted");
+    assert_eq!(locked_unminted(&deps, 7, &l, &mut |_: &FoundDeposit| false), 0, "nothing under L");
+    assert_eq!(locked_unminted(&[d(1, 1, u64::MAX), d(2, 1, 5)], 10, &Ledger::default(), &mut |_: &FoundDeposit| false), u64::MAX, "saturated");
+    // in the plan: the room is CEIL − supply − the robot's pending − the locked deposits not minted
+    let c = cand(13, 1, 5, 200 * JTM);
+    let at = |supply: u64, locked: u64| Caps { total_supply: supply, tip_locked_height: Some(10), locked_unminted: locked, ..caps() };
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM)), vec![Verdict::Advance], "10 000 − 9 700 − 100 = 200");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c], &Ledger::default(), at(0, u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+}
+
+/// N9 (c): `relay_blocks_dir` names the relayer's archive explicitly (another host's mount, a mirror); absent, it
+/// stays `blocks/` beside `relay_final` (every configuration so far).
+#[test]
+fn n9_c_the_relayers_archive_may_be_named_explicitly() {
+    let p = "[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n";
+    let both = FillConfig::parse(&rehearsal(&format!("relay_final = \"/srv/relay/publish/final.json\"\nrelay_blocks_dir = \"/mnt/archive/blocks\"\n{p}"))).unwrap();
+    assert_eq!(both.relay_blocks_dir(), Some(std::path::PathBuf::from("/mnt/archive/blocks")));
+    let alone = FillConfig::parse(&rehearsal(&format!("relay_blocks_dir = \"/mnt/archive/blocks\"\n{p}"))).unwrap();
+    assert_eq!(alone.relay_blocks_dir(), Some(std::path::PathBuf::from("/mnt/archive/blocks")), "without relay_final: advances, repayments claimed by others");
+    let default = FillConfig::parse(&rehearsal(&format!("relay_final = \"/srv/relay/publish/final.json\"\n{p}"))).unwrap();
+    assert_eq!(default.relay_blocks_dir(), Some(std::path::PathBuf::from("/srv/relay/publish/blocks")));
 }
 
 /// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name

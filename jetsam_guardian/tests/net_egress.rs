@@ -17,6 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -881,6 +882,11 @@ fn fill_world(stock: u64) -> Answer {
 
 /// `min_age`: the bridge's `ADVANCE_MIN_AGE()` (A5-1: 86 400 for the revised contract, 7 200 before it).
 fn fill_world_on(stock: u64, chain_id: &'static str, min_age: u64) -> Answer {
+    fill_world_live(Arc::new(AtomicU64::new(stock)), chain_id, min_age)
+}
+
+/// N9: the hot key's balance as it is when read (a test changes it while the robot runs).
+fn fill_world_live(stock: Arc<AtomicU64>, chain_id: &'static str, min_age: u64) -> Answer {
     let genesis = testkit::genesis();
     let (raw, id) = (genesis.raw_hex(), hex::encode(genesis.id));
     let token = format!("0x{}{}", "00".repeat(12), "77".repeat(20));
@@ -900,7 +906,7 @@ fn fill_world_on(stock: u64, chain_id: &'static str, min_age: u64) -> Answer {
             if data.starts_with("0xfc0c546a") {
                 json!({"result": token})
             } else if data.starts_with("0x70a08231") {
-                json!({"result": format!("0x{stock:064x}")})
+                json!({"result": format!("0x{:064x}", stock.load(Ordering::SeqCst))})
             } else if data.starts_with(&ceiling) {
                 json!({"result": format!("0x{:064x}", 10_000_000_000u64)})
             } else if data.starts_with(&age) {
@@ -969,4 +975,35 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert!(seen.lock().unwrap().iter().all(|(atyp, h, ..)| *atyp == 3 && (*h == n1 || *h == n2 || *h == c)), "every target named, through Tor");
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("\\\"kind\\\":\\\"start\\\""), "{journal}");
+}
+
+/// N9 (a): the hot key's stock is read again at every step: a refill above `max_stock` while the robot runs pauses
+/// it (`PAUSE_STOCK_ABOVE_CAP` in its published queue, an ALERT), and the pause lifts when the excess is gone.
+/// Rehearsal build only (another build's v1.7 clock stops it at start).
+#[test]
+fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let cap = 1_200_000_000u64;
+    let stock = Arc::new(AtomicU64::new(cap));
+    let (socks, _) = fake_tor(fill_world_live(stock.clone(), "0x7a69", 86_400));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let queue = dir.join("state/queue.json");
+    let pause = || std::fs::read_to_string(&queue).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).map(|q| q["pause"].clone());
+    let stepped = wait_for(60, || pause().is_some_and(|p| p != json!("PAUSE_STOCK_ABOVE_CAP")));
+    stock.store(cap + 1, Ordering::SeqCst);
+    let paused = wait_for(60, || pause() == Some(json!("PAUSE_STOCK_ABOVE_CAP")));
+    stock.store(cap, Ordering::SeqCst);
+    let lifted = wait_for(60, || pause().is_some_and(|p| p != json!("PAUSE_STOCK_ABOVE_CAP")));
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(stepped && paused && lifted, "stepped {stepped}, paused {paused}, lifted {lifted}; log:\n{log}");
+    assert_eq!(log.matches("ALERT the hot key holds 1200000001").count(), 1, "one alert per crossing:\n{log}");
+    let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    assert!(journal.contains("PAUSE_STOCK_ABOVE_CAP"), "{journal}");
 }

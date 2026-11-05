@@ -21,7 +21,11 @@
 //!   overtakes in the minutes between the robot's read of the tip and its advance loses its fee (accepted).
 //! * A5-18: every step reads the token's `totalSupply()` and the bridge's `suspectMinted()`: nothing is
 //!   advanced while `suspectMinted() > 0`, nor beyond what the contract's ceiling holds after the mints of the
-//!   robot's own pending advances (C-6 kept prudent).
+//!   robot's own pending advances and (N9) of the deposits the contract's tip already commits to and not minted
+//!   yet (`isMinted` asked for at most 16 of them a step, lowest first, the minted ones remembered; C-6 kept
+//!   prudent).
+//! * N9: every step reads the hot key's balance again: above `max_stock` the robot pauses
+//!   (`PAUSE_STOCK_ABOVE_CAP`, an ALERT once per crossing).
 //! * A5-14: `<state_dir>/state.json` (its ledger, what its caps and repayments count) is written synced, file then
 //!   directory, around its rename (`jetsam_guardian::write_atomic`); present but unreadable, the robot does not start.
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
@@ -36,7 +40,8 @@
 //!   `jetsam_guardian::l1tx`); only the private rehearsal may still use the endpoint's unlocked TEST account.
 //! * With `relay_final` (the relayer's published `final.json`), the robot claims the repayment of its own
 //!   advances as soon as their root is final on the contract; and it advances only a deposit whose block
-//!   body the relayer archived and published beside it (`blocks/<h>-<id>.bin`, read again and checked: A5-7).
+//!   body the relayer archived and published beside it (`blocks/<h>-<id>.bin`, read again and checked: A5-7), or
+//!   in `relay_blocks_dir` when the configuration names it (N9).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -119,7 +124,14 @@ struct State {
     /// A5-16: the keys of the pending advances already alerted as not repaid for long (one alert each).
     #[serde(default)]
     overdue: HashSet<String>,
+    /// N9: the txids known minted (`isMinted` never turns back), for the room under the supply ceiling.
+    #[serde(default)]
+    minted: HashSet<String>,
 }
+
+/// N9: `isMinted` asked at most this many times a step for the deposits locked under the contract's tip (lowest
+/// first); the others not known minted count as not minted (prudent).
+const MINT_PROBES_PER_STEP: usize = 16;
 
 struct Robot {
     cfg: FillConfig,
@@ -138,6 +150,8 @@ struct Robot {
     state: State,
     journal: DecisionJournal,
     halt_file: PathBuf,
+    /// N9: the stock above `max_stock` was alerted (once per crossing).
+    stock_alerted: bool,
 }
 
 impl Robot {
@@ -286,6 +300,32 @@ impl Robot {
             }
             None => TipCheck::Unknown,
         };
+        // N9: the deposits the tip commits to and not minted yet take their room under the ceiling first
+        let locked_unminted = match &tip_cp {
+            Some(cp) => {
+                let deposits: Vec<FoundDeposit> = self.state.scanned.values().flat_map(|(_, ds)| ds.iter().copied()).collect();
+                let (l1, bridge, known) = (&self.l1, &self.bridge, &mut self.state.minted);
+                let mut budget = MINT_PROBES_PER_STEP;
+                fill::locked_unminted(&deposits, cp.locked_height, &self.state.ledger, &mut |d: &FoundDeposit| {
+                    let txid = hex::encode(d.txid);
+                    if known.contains(&txid) {
+                        return true;
+                    }
+                    if budget == 0 {
+                        return false;
+                    }
+                    budget -= 1;
+                    let mut data = l1::selector("isMinted(bytes32)").to_vec();
+                    data.extend_from_slice(&d.txid);
+                    let minted = l1.call(bridge, &data).is_ok_and(|w| word(&w, 0)[31] == 1);
+                    if minted {
+                        known.insert(txid);
+                    }
+                    minted
+                })
+            }
+            None => 0,
+        };
         // A5-1: no advance of a deposit at or below the tip's locked height (its point is accepted already)
         let caps = Caps {
             outstanding: word_u64(&caps_raw, 0),
@@ -293,7 +333,15 @@ impl Robot {
             stock: self.balance()?,
             total_supply,
             tip_locked_height: tip_cp.map(|cp| cp.locked_height),
+            locked_unminted,
         };
+        // N9: the stock is checked at every step (a refill above max_stock pauses, alerted once per crossing)
+        let over = caps.stock > self.cfg.params.max_stock;
+        if over && !self.stock_alerted {
+            log(&format!("ALERT the hot key holds {} µwJTM, above max_stock = {}: paused (PAUSE_STOCK_ABOVE_CAP) until the excess goes to the claim owner", caps.stock, self.cfg.params.max_stock));
+            self.journal(json!({"kind": "alert", "reason": "PAUSE_STOCK_ABOVE_CAP", "stock": caps.stock, "max_stock": self.cfg.params.max_stock, "l1_t": l1_now}));
+        }
+        self.stock_alerted = over;
         let mut reorgs: Vec<(u64, u64)> = self.observers.iter().flat_map(|o| o.reorgs().to_vec()).collect();
         reorgs.sort_unstable();
         let competing = self
@@ -311,6 +359,7 @@ impl Robot {
             tip,
             top_share_pct: fill::top_share_pct(self.observers[0].chain(), self.cfg.params.share_window),
             suspect_minted,
+            stock: caps.stock,
         };
         let mut g = fill::guard(&gi, &self.cfg.params);
         // an advance whose deposit left the chain: halt
@@ -661,7 +710,7 @@ fn run() -> anyhow::Result<()> {
     cfg.build_matches(&rules)?;
     match cfg.relay_blocks_dir() {
         Some(dir) => log(&format!("deposit bodies: the relayer's archive {} (A5-7: none advanced before it is published there)", dir.display())),
-        None => log("WARNING no relay_final: no deposit is advanced (A5-7: the relayer's published archive of each deposit body is required)"),
+        None => log("WARNING no relay_final nor relay_blocks_dir: no deposit is advanced (A5-7: the relayer's published archive of each deposit body is required)"),
     }
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?} ({}), {} nodes, dry_run {}", cfg.profile()?, cfg.nodes.len(), cfg.dry_run));
@@ -732,7 +781,7 @@ fn run() -> anyhow::Result<()> {
     log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, cfg };
+    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, cfg };
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }
