@@ -991,4 +991,27 @@ fn r3_5_a_bounded_point_that_fails_mn5_like_the_whole_window_is_work_rate_too_lo
     let plan = |bound: usize| plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], late, bound);
     assert_eq!(plan(deposit_blocks_bound(3_000_000, 25)), Err(NoSubmission::WorkRateTooLow));
     assert_eq!(plan(5), Err(NoSubmission::WorkRateTooLow), "bounded, but the whole window fails MN-5 as well");
+
+/// T7.7 (the real private chain, 2026-11-05): while the contract's final point is still the genesis (its L is
+/// `gl`), the first deposit block the relayer archived made every step of `jg-relay` panic in
+/// `direct_claims_needed` (`found.range(gl + 1..=gl)`: "range start is greater than range end in BTreeMap"),
+/// at every restart too. No deposit is under the genesis: nothing to claim directly, and no panic.
+#[test]
+fn t77_no_direct_claim_under_the_genesis_and_no_panic() {
+    let c = testkit::chain(60, 1);
+    let (_, g) = genesis_known(&c);
+    let found = found_of(&[dep(15, 1, JTM)]);
+    assert!(direct_claims_needed(&g, &found, GL, &|_| false).is_empty());
+}
+
+/// T7.7: the same reversed range in `find_omitted`: a point locked at its parent's L (a fork that keeps L)
+/// has an empty window of its own, never `found.range(L + 1..=L)`.
+#[test]
+fn t77_a_point_locked_at_its_parents_l_has_an_empty_window() {
+    let c = testkit::chain(60, 1);
+    let (gid, _) = genesis_known(&c);
+    let found = found_of(&[dep(15, 1, JTM)]);
+    let (_, p) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[]).0, 100);
+    assert!(p.cp.locked_height > 15);
+    assert_eq!(find_omitted(&found, GL, p.cp.locked_height, &[], &p.cp), Some(Vec::new()));
 }
