@@ -161,3 +161,41 @@ fn n2_a_point_that_leaves_the_rehearsal_deposit_out_is_extended_and_the_deposit_
     wrong.public_values[127] ^= 1;
     assert!(relayer::check_claim_native(&wrong).unwrap_err().to_string().contains("other public values"));
 }
+
+/// A5-22, the operator's command itself: `jg-relay --config relay.toml claim-direct <height> <txid>` checks the
+/// archived body and the deposit, queues the request for the running relayer (never the L1: no L1 or node is
+/// reachable here), and refuses a txid the archived block does not hold.
+#[test]
+fn a5_22_the_claim_direct_command_queues_an_archived_deposit_only() {
+    let (full, v) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let ar = archive_of(&full, &v, &state.join("archive"));
+    ar.save().unwrap();
+    let d = ar.found()[&129][0];
+    let toml = format!(
+        "network = \"0x{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\n\
+         l1_rpc = \"http://127.0.0.1:9\"\ndeposits_from_height = 128\nstate_dir = \"{}\"\npublish_dir = \"{}\"\n\
+         [[nodes]]\nname = \"a\"\nrpc = \"http://127.0.0.1:9\"\n[[nodes]]\nname = \"b\"\nrpc = \"http://127.0.0.1:10\"\n\
+         [prover]\nmode = \"mock\"\n",
+        hex::encode(full.id_at(0).unwrap()),
+        // the rehearsal's synthetic bridge on the test chain's genesis: the private rehearsal's profile
+        hex::encode(jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address),
+        state.display(),
+        dir.path().join("publish").display()
+    );
+    let cfg = dir.path().join("relay.toml");
+    std::fs::write(&cfg, toml).unwrap();
+    let run = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(&cfg).args(args).output().unwrap();
+    let txid = format!("0x{}", hex::encode(d.txid));
+    let out = run(&["claim-direct", "129", &txid]);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("queued") && text.contains("7000000"), "{text}");
+    let q = relayer::claim_requests(&state.join("claim-direct")).unwrap();
+    assert_eq!(q.iter().map(|(_, h, t)| (*h, *t)).collect::<Vec<_>>(), vec![(129, d.txid)]);
+    // a deposit the archived block 130 does not hold: refused, nothing queued
+    let out = run(&["claim-direct", "130", &txid]);
+    assert!(!out.status.success());
+    assert_eq!(relayer::claim_requests(&state.join("claim-direct")).unwrap().len(), 1);
+}
