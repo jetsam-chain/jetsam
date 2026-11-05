@@ -6,7 +6,7 @@
 //! other the honest values the relayer computes with `jetsam_guardian` (`Chain::locked_height`,
 //! `headers_digest`, `anchor_root`, `work_at`, `checkpoint::{Checkpoint, Mn, public_values}`, the node's
 //! own reading of a block's deposits, `fill::deposits_of_block`), with the fork base found as the
-//! rehearsal relayer finds it. Required: the ten fields, the MN values and the 608 bytes, byte for byte.
+//! rehearsal relayer finds it. Required: the ten fields, the MN values and the 736 bytes, byte for byte.
 //!
 //! Data:
 //! - default build: the real mainnet headers 44 544..44 581 (the program's fixture, public data);
@@ -61,6 +61,7 @@ fn to_program_mn(m: &gcp::Mn) -> spv::Mn {
         segment_work: m.segment_work,
         max_timestamp: m.max_timestamp,
         tip_on_branch: m.tip_on_branch,
+        locked_on_branch: m.locked_on_branch,
     }
 }
 
@@ -137,9 +138,11 @@ struct World {
     /// F of the clock the deposits are read under (no deposit at or below it)
     deposits_from: Option<u64>,
     /// A5-4: the contract's `tipBlockId` now (the vectors are submitted in order), and, by checkpoint id,
-    /// the one before its first acceptance (a point re-proven under another base is submitted there)
+    /// the one before its first acceptance (a point re-proven under another base is submitted there); N1:
+    /// the same for `tipLockedBlockId`
     tip_block: [u8; 32],
-    tip_before: BTreeMap<[u8; 32], [u8; 32]>,
+    tip_locked: [u8; 32],
+    tip_before: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
 }
 
 fn pages_of(raw: &[u8]) -> Vec<Page> {
@@ -203,6 +206,7 @@ struct Input {
     parent: CheckpointV3,
     anchor_base: u64,
     bridge_tip: [u8; 32],
+    bridge_tip_locked: [u8; 32],
     frontiers: ([[u8; 32]; 32], [[u8; 32]; 32]),
     fork_depth: u8,
     context: Vec<H>,
@@ -216,6 +220,7 @@ impl Input {
             &self.parent,
             self.anchor_base,
             &self.bridge_tip,
+            &self.bridge_tip_locked,
             &self.frontiers.0,
             &self.frontiers.1,
             self.fork_depth,
@@ -292,7 +297,7 @@ impl World {
         let fork_depth = (parent.cp.height - base) as u8;
         let bh = chain.header_at(base).unwrap();
         let first_acceptance = !self.tip_before.contains_key(&cp.id());
-        let bridge_tip = *self.tip_before.entry(cp.id()).or_insert(self.tip_block);
+        let (bridge_tip, bridge_tip_locked) = *self.tip_before.entry(cp.id()).or_insert((self.tip_block, self.tip_locked));
         let mn = gcp::Mn {
             tip_block_work: gu::to_be(&chain.header_at(tip).unwrap().work),
             fork_base_timestamp: bh.timestamp,
@@ -305,17 +310,20 @@ impl World {
                 .map(|h| chain.header_at(h).unwrap().timestamp)
                 .max()
                 .unwrap(),
-            tip_on_branch: jetsam_guardian::relayer::tip_on_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip),
+            tip_on_branch: jetsam_guardian::relayer::on_new_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip),
+            locked_on_branch: jetsam_guardian::relayer::on_new_branch(&chain, &parent.cp, fork_depth, tip, &bridge_tip_locked),
         };
         let anchor_base = self.gl + 1;
-        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &bridge_tip, &mn);
+        let pv = gcp::public_values(&parent.cp.id(), &cp, fork_depth, anchor_base, &bridge_tip, &bridge_tip_locked, &mn);
         if first_acceptance {
             self.tip_block = cp.tip_block_id;
+            self.tip_locked = cp.locked_block_id;
         }
 
         // ---- the program, on what an honest relayer gives it
         let mut input = self.input(parent, b, tip, fork_depth, l);
         input.bridge_tip = bridge_tip;
+        input.bridge_tip_locked = bridge_tip_locked;
         let out = quiet(|| run(&input.bytes(), &self.schedule, &self.rule))
             .unwrap_or_else(|e| panic!("{name}: the program refuses: {e}"));
         dump(name, &input.bytes(), Some(&out.public_values));
@@ -323,8 +331,9 @@ impl World {
         assert_eq!(out.next, to_program(&cp), "{name}: the ten fields");
         assert_eq!(out.mn, to_program_mn(&mn), "{name}: MN");
         assert_eq!(out.fork_depth, fork_depth, "{name}");
-        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 672 bytes");
+        assert_eq!(out.public_values.to_vec(), pv, "{name}: the 736 bytes");
         assert_eq!(out.bridge_tip_block, bridge_tip, "{name}: the bridge's tip block");
+        assert_eq!(out.bridge_tip_locked_block, bridge_tip_locked, "{name}: the bridge's tip's locked block");
         assert_eq!(out.next.id(kf), cp.id(), "{name}: checkpointId");
         assert_eq!(
             out.new_deposits.len() as u64,
@@ -346,11 +355,12 @@ impl World {
             "parentId": hex(&parent.cp.id()),
             "forkDepth": fork_depth,
             "bridgeTipBlock": hex(&bridge_tip),
+            "bridgeTipLockedBlock": hex(&bridge_tip_locked),
             "next": cp_json(&cp),
             "mn": {
                 "tipBlockWork": hex(&mn.tip_block_work), "forkBaseTimestamp": mn.fork_base_timestamp,
                 "forkBaseWork": hex(&mn.fork_base_work), "segmentWork": hex(&mn.segment_work), "maxTimestamp": mn.max_timestamp,
-                "tipOnBranch": mn.tip_on_branch,
+                "tipOnBranch": mn.tip_on_branch, "lockedOnBranch": mn.locked_on_branch,
             },
             "publicValues": hex(&out.public_values),
             "checkpointId": hex(&out.next.id(kf)),
@@ -375,6 +385,7 @@ impl World {
             parent: p,
             anchor_base: self.gl + 1,
             bridge_tip: parent.cp.tip_block_id,
+            bridge_tip_locked: parent.cp.locked_block_id,
             frontiers: parent.frontiers,
             fork_depth,
             context: (lo..=hi).map(|x| parent.branch.h(x)).collect(),
@@ -396,6 +407,7 @@ impl World {
             chain.headers_digest(self.gl).unwrap(),
         );
         self.tip_block = cp.tip_block_id;
+        self.tip_locked = cp.locked_block_id;
         Known {
             cp,
             branch: b.clone(),
@@ -569,6 +581,7 @@ mod mainnet {
             vectors: Vec::new(),
             deposits_from: None,
             tip_block: [0u8; 32],
+            tip_locked: [0u8; 32],
             tip_before: BTreeMap::new(),
         };
         let g = world.genesis(&b);
@@ -658,6 +671,7 @@ mod rehearsal {
             vectors: Vec::new(),
             deposits_from: rules.deposits_from_height,
             tip_block: [0u8; 32],
+            tip_locked: [0u8; 32],
             tip_before: BTreeMap::new(),
         }
     }
@@ -852,7 +866,7 @@ mod rehearsal {
             Some("anchor frontier"),
             "the parent's anchor root binds its count"
         );
-        // L is the program's: the 608 bytes of a point claiming L ± 1 are not the program's
+        // L is the program's: the 736 bytes of a point claiming L ± 1 are not the program's
         for dl in [-1i64, 1] {
             let mut next = ok.next;
             next.locked_height = (next.locked_height as i64 + dl) as u64;
@@ -864,6 +878,7 @@ mod rehearsal {
                     ok.fork_depth,
                     ok.anchor_base,
                     &ok.bridge_tip_block,
+                    &ok.bridge_tip_locked_block,
                     &ok.mn
                 ),
                 ok.public_values

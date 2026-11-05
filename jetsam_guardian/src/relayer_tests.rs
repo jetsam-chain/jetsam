@@ -3,7 +3,8 @@ use crate::checkpoint::genesis_checkpoint;
 use crate::fill::tests::{block_of, deposit_tx, raw_and_id, rcpt, rules, F, JTM};
 use crate::testkit;
 
-/// `plan_submission` with the contract's `tipBlockId` = the block of `tip` as known (zero when unknown).
+/// `plan_submission` with the contract's `tipBlockId` and `tipLockedBlockId` = the blocks of `tip` as known
+/// (zero when unknown).
 #[allow(clippy::too_many_arguments)]
 fn plan(
     c: &Chain,
@@ -16,7 +17,8 @@ fn plan(
     at: u64,
 ) -> Result<Submission, NoSubmission> {
     let block = known.get(tip).map_or([0u8; 32], |k| k.cp.tip_block_id);
-    plan_submission(c, known, tip, cum, &block, gl, found, missing, at)
+    let locked = known.get(tip).map_or([0u8; 32], |k| k.cp.locked_block_id);
+    plan_submission(c, known, tip, cum, &block, &locked, gl, found, missing, at)
 }
 
 /// The bridge genesis's locked height of these tests.
@@ -127,7 +129,11 @@ fn the_honest_child_extends_the_contract_tip_and_moves_l() {
     assert_eq!(s.next.locked_height, 32);
     assert_eq!(s.deposits.len(), 1, "the deposit at 36 is above L");
     assert_eq!(s.next, honest(&c, GL, 40, &s.deposits).unwrap());
-    assert_eq!(s.mn, Mn { tip_on_branch: true, ..mn_values(&c, GL, 40).unwrap() }, "an extension holds the tip's block (A5-4)");
+    assert_eq!(
+        s.mn,
+        Mn { tip_on_branch: true, locked_on_branch: true, ..mn_values(&c, GL, 40).unwrap() },
+        "an extension holds the tip's block (A5-4) and its locked block (N1)"
+    );
     assert_eq!((s.mn.fork_base_timestamp, s.mn.max_timestamp), (ts(&c, GL), ts(&c, 40)));
     assert_eq!(s.next.anchor_root, c.anchor_root(GL, 32).unwrap());
     // the digest names L−7..=L (the engaged identity), never the tip's eight
@@ -268,10 +274,12 @@ fn the_proof_request_carries_the_context_the_abandoned_headers_and_the_parents_f
     let dir = tempfile::tempdir().unwrap();
     let archive = Archive::open(dir.path()).unwrap();
     let req = ProofRequest::build(&s, &a, &c2, &archive, GL, GL + 1, 8).unwrap();
-    assert_eq!(req.public_values.len(), 672);
-    assert_eq!(s.bridge_tip_block, a.cp.tip_block_id);
-    assert!(!s.mn.tip_on_branch, "a real fork: the parent's (= tip's) block 30 is not on c2");
-    assert_eq!(req.public_values, public_values(&aid, &s.next, 4, GL + 1, &a.cp.tip_block_id, &s.mn));
+    assert_eq!(req.public_values.len(), 736);
+    assert_eq!((s.bridge_tip_block, s.bridge_tip_locked_block), (a.cp.tip_block_id, a.cp.locked_block_id));
+    assert!(!s.mn.tip_on_branch, "a fork of the context: the parent's (= tip's) block 30 is not on c2");
+    assert!(s.mn.locked_on_branch, "... above its L 22 (N1: no switch)");
+    assert_eq!(req.public_values, public_values(&aid, &s.next, 4, GL + 1, &a.cp.tip_block_id, &a.cp.locked_block_id, &s.mn));
+    assert_eq!(req.bridge_tip_locked_block, a.cp.locked_block_id);
     assert_eq!(req.headers_from, 14, "8 below the lower of L and the base");
     assert_eq!(req.headers.len() as u64, s.next.height - 14 + 1);
     assert_eq!(req.headers[0], c2.header_at(14).unwrap().raw);
@@ -395,7 +403,7 @@ fn a5_4_no_point_on_the_tips_own_chain_that_does_not_extend_the_tip() {
     let known = HashMap::from([(gid, g.clone()), (aid, a.clone())]);
     let at = ts(&c, 50) + 60;
     assert_eq!(plan(&c, &known, &aid, &a.cp.cum_work, GL, &found, &[], at), Err(NoSubmission::MustExtendTip));
-    assert!(tip_on_branch(&c, &g.cp, 0, 50, &a.cp.tip_block_id));
+    assert!(on_new_branch(&c, &g.cp, 0, 50, &a.cp.tip_block_id));
     // the same tip with the relayer's roots: an extension, which holds the tip's block
     let (bid, b) = known_at(&c, 30, gid, &deposits_upto(&found, GL, 22), 100);
     let known = HashMap::from([(gid, g.clone()), (bid, b.clone())]);
@@ -407,9 +415,47 @@ fn a5_4_no_point_on_the_tips_own_chain_that_does_not_extend_the_tip() {
     assert_eq!((s.parent, s.fork_depth, s.mn.tip_on_branch), (bid, 4, false));
     // the program's window: from the first height of the parent's context to T
     let (first, _) = jetsam_bridge_program::spv::context_range(&to_program(&b.cp), 4);
-    assert!(tip_on_branch(&c2, &b.cp, 4, 56, &c2.id_at(first).unwrap()));
-    assert!(!tip_on_branch(&c2, &b.cp, 4, 56, &c2.id_at(first - 1).unwrap()), "below the window: not seen");
-    assert!(!tip_on_branch(&c2, &b.cp, 4, 55, &c2.id_at(56).unwrap()), "above T: not on the branch");
+    assert!(on_new_branch(&c2, &b.cp, 4, 56, &c2.id_at(first).unwrap()));
+    assert!(!on_new_branch(&c2, &b.cp, 4, 56, &c2.id_at(first - 1).unwrap()), "below the window: not seen");
+    assert!(!on_new_branch(&c2, &b.cp, 4, 55, &c2.id_at(56).unwrap()), "above T: not on the branch");
+}
+
+/// Re-audit N1, the relayer's side: a third party extended the relayer's point X with one orphan block O
+/// (the tip A, whose block is O, is not on the relayer's chain and its context is unknown here). The
+/// relayer plans on X (forkDepth 0), its chain leaves O behind (`tip_on_branch` false) and keeps A's locked
+/// block, an honest block (`locked_on_branch` true: the contract does not restart its clock); both bits are
+/// the program's, over the same window. A chain that left A's locked block itself (a fork below it) is a
+/// real switch (`locked_on_branch` false).
+#[test]
+fn n1_an_orphan_on_the_tip_is_left_behind_without_a_switch() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let found = BTreeMap::new();
+    let (xid, x) = known_at(&c, 40, gid, &[], 100);
+    // A = X + one orphan block on top of X's block 40: a block 41 of another branch
+    let orphan = fork_of(&c, 40, 1, 7);
+    let a_cp = honest(&orphan, GL, 41, &[]).unwrap();
+    assert_ne!(Some(a_cp.tip_block_id), c.id_at(41));
+    assert_eq!(c.id_at(a_cp.locked_height), Some(a_cp.locked_block_id), "A's locked block is an honest block");
+    let a = Known { cp: a_cp, parent: xid, accepted_at: 200, headers: BTreeMap::new(), ours: false };
+    let known = HashMap::from([(gid, g.clone()), (xid, x.clone()), (a_cp.id(), a.clone())]);
+    let s = plan(&c, &known, &a_cp.id(), &a_cp.cum_work, GL, &found, &[], ts(&c, 60) + 60).unwrap();
+    assert_eq!((s.parent, s.fork_depth), (xid, 0), "planned on X: A's context is not known here");
+    assert_eq!((s.mn.tip_on_branch, s.mn.locked_on_branch), (false, true));
+    assert_eq!((s.bridge_tip_block, s.bridge_tip_locked_block), (a_cp.tip_block_id, a_cp.locked_block_id));
+    let (first, _) = jetsam_bridge_program::spv::context_range(&to_program(&x.cp), 0);
+    assert!(first <= a_cp.locked_height, "A's locked block is inside the program's window");
+    // with the orphan's header known (A's context), the child of A that drops O: the same two bits
+    let a_known = Known { headers: Known::context_from(&a_cp, &orphan), ..a.clone() };
+    let known = HashMap::from([(gid, g.clone()), (xid, x.clone()), (a_cp.id(), a_known)]);
+    let s = plan(&c, &known, &a_cp.id(), &a_cp.cum_work, GL, &found, &[], ts(&c, 60) + 60).unwrap();
+    assert_eq!((s.parent, s.fork_depth), (a_cp.id(), 1));
+    assert_eq!((s.mn.tip_on_branch, s.mn.locked_on_branch), (false, true));
+    // the chain forked below A's locked block (a reorganization deeper than 8 blocks): a real switch
+    let deep = fork_of(&c, a_cp.locked_height - 2, 30, 9);
+    let s = plan(&deep, &known, &a_cp.id(), &a_cp.cum_work, GL, &found, &[], ts(&deep, deep.tip_height()) + 60).unwrap();
+    assert!(!s.mn.locked_on_branch, "A's locked block abandoned");
+    assert!(!s.mn.tip_on_branch);
 }
 
 /// A chain of `n` blocks of target 20 after the genesis, `spacing` seconds apart.

@@ -151,6 +151,8 @@ struct Step<'a> {
     anchor_base: u64,
     /// The bridge's current tip block (`JetsamBridge.tipBlockId`); the parent's own tip by default.
     bridge_tip: [u8; 32],
+    /// The bridge's current tip's locked block (`JetsamBridge.tipLockedBlockId`); the parent's own by default.
+    bridge_tip_locked: [u8; 32],
     deposit_frontier: [[u8; 32]; 32],
     anchor_frontier: [[u8; 32]; 32],
     fork_depth: u8,
@@ -169,6 +171,7 @@ impl<'a> Step<'a> {
             parent,
             anchor_base,
             bridge_tip: parent.tip_block_id,
+            bridge_tip_locked: parent.locked_block_id,
             deposit_frontier: frontiers.0,
             anchor_frontier: frontiers.1,
             fork_depth,
@@ -183,6 +186,7 @@ impl<'a> Step<'a> {
             &self.parent,
             self.anchor_base,
             &self.bridge_tip,
+            &self.bridge_tip_locked,
             &self.deposit_frontier,
             &self.anchor_frontier,
             self.fork_depth,
@@ -309,15 +313,16 @@ fn a_genesis_parent_extends_on_real_mainnet_headers() {
         segment_work: be((44_570..=44_581).map(|x| m.work(x)).sum()),
         max_timestamp: (44_570..=44_581).map(|x| Hdr(&m.h(x)).timestamp()).max().unwrap(),
         tip_on_branch: true, // the bridge tip is the parent (genesis): its block is the fork base
+        locked_on_branch: true, // and its locked block too (the genesis: tip = locked block)
     };
     assert_eq!(out.mn, mn);
     assert_eq!(out.prev_id, g.id(kf));
     assert_eq!(out.anchor_base, 44_570);
     assert!(out.new_deposits.is_empty(), "no deposit on the mainnet");
     assert_eq!(out.new_anchors.len() as u64, l - 44_569);
-    // the 21 words of `publicValues`
+    // the 23 words of `publicValues`
     let pv = out.public_values;
-    assert_eq!(pv.len(), 672);
+    assert_eq!(pv.len(), 736);
     let word = |i: usize| -> [u8; 32] { pv[32 * i..32 * i + 32].try_into().unwrap() };
     assert_eq!(word(0), keccak256(kf, b"jetsam-bridge/public-values/v3"));
     assert_eq!(word(1), g.id(kf));
@@ -330,7 +335,9 @@ fn a_genesis_parent_extends_on_real_mainnet_headers() {
     assert_eq!([word(12), word(13), word(14), word(15), word(16)], [mn.tip_block_work, spv::word_u64(mn.fork_base_timestamp), mn.fork_base_work, mn.segment_work, spv::word_u64(mn.max_timestamp)]);
     assert_eq!([word(17), word(18)], [next.locked_block_id, next.locked_cum_work]);
     assert_eq!([word(19), word(20)], [g.tip_block_id, spv::word_u64(1)]);
+    assert_eq!([word(21), word(22)], [g.locked_block_id, spv::word_u64(1)]);
     assert_eq!(out.bridge_tip_block, g.tip_block_id);
+    assert_eq!(out.bridge_tip_locked_block, g.locked_block_id);
     // the frontiers carry the trees to the next transition
     assert_eq!(spv::frontier_root(kf, &out.anchor_frontier, leaves.len() as u64, &z), next.anchor_root);
 }
@@ -367,6 +374,48 @@ fn the_bridge_tip_block_on_the_new_branch() {
         assert!(!out.mn.tip_on_branch, "{name}");
         assert_eq!(out.public_values[608..640], tip, "{name}");
         assert_eq!(out.public_values[640..672], [0u8; 32], "{name}");
+    }
+}
+
+/// MN-1 (re-audit N1): `locked_on_branch` says whether the bridge's current tip's LOCKED block (input,
+/// public value 21) is on the new branch, in the same window as `tip_on_branch`: only a branch that does
+/// not hold it is a switch. A fork of the tip's context above its L always holds it (MN-2: the fork base is
+/// never below the parent's L).
+#[test]
+fn the_bridge_tip_locked_block_on_the_new_branch() {
+    let m = mainnet();
+    let one = quiet(|| p1(&m));
+    let frontiers = (one.deposit_frontier, one.anchor_frontier);
+    let l1 = one.next.locked_height;
+    assert_eq!(l1, 44_574);
+    // the bridge tip is `one`: every base of a child of `one`, from its tip down to its L, keeps its L
+    for k in 0..=(44_580 - l1) as u8 {
+        let s = Step::on(&m, one.next, 44_570, frontiers, k, 44_581);
+        assert_eq!(s.bridge_tip_locked, m.id(l1));
+        let out = quiet(|| s.run()).unwrap_or_else(|e| panic!("fork depth {k}: {e}"));
+        assert!(out.mn.locked_on_branch, "fork depth {k}");
+        assert_eq!(out.public_values[672..704], m.id(l1), "fork depth {k}");
+        assert_eq!(out.public_values[704..736], spv::word_u64(1), "fork depth {k}");
+        assert_eq!(out.bridge_tip_locked_block, m.id(l1));
+    }
+    // the tip's locked block in the new segment (a bridge tip locked higher than the parent's L)
+    let g = genesis(&m, 44_569, w44569(&m));
+    let s = Step { bridge_tip_locked: m.id(44_574), ..Step::on(&m, g, 44_570, NO_FRONTIER, 0, 44_581) };
+    assert!(quiet(|| s.run()).expect("segment").mn.locked_on_branch);
+    // not held: above the new tip (a branch that does not reach it abandons it), an id of no block, a
+    // block of the chain below the parent's context (not seen: a restart, the conservative answer)
+    for (name, locked, parent) in [("above", m.id(44_581), 0), ("none", [0x55u8; 32], 0), ("below the context", m.id(44_550), 1)] {
+        let s = if parent == 0 {
+            Step { bridge_tip_locked: locked, ..Step::on(&m, g, 44_570, NO_FRONTIER, 0, 44_580) }
+        } else {
+            Step { bridge_tip_locked: locked, ..Step::on(&m, one.next, 44_570, frontiers, 0, 44_581) }
+        };
+        let out = quiet(|| s.run()).expect(name);
+        assert!(!out.mn.locked_on_branch, "{name}");
+        assert_eq!(out.public_values[672..704], locked, "{name}");
+        assert_eq!(out.public_values[704..736], [0u8; 32], "{name}");
+        // the two bits are independent: the tip's block (the parent's own by default) is still held
+        assert!(out.mn.tip_on_branch, "{name}");
     }
 }
 
@@ -590,10 +639,11 @@ fn the_input_layout_is_the_documented_one() {
     let g = genesis(&m, 44_569, w44569(&m));
     let s = Step::on(&m, g, 44_570, NO_FRONTIER, 0, 44_575);
     let v = s.input();
-    assert_eq!(&v[..8], b"JSPVIN06");
+    assert_eq!(&v[..8], b"JSPVIN07");
     assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 44_570);
     assert_eq!(v[16..48], g.tip_block_id);
-    let p = &v[48..48 + spv::CHECKPOINT_LEN];
+    assert_eq!(v[48..80], g.locked_block_id);
+    let p = &v[80..80 + spv::CHECKPOINT_LEN];
     assert_eq!(u64::from_le_bytes(p[0..8].try_into().unwrap()), g.height);
     assert_eq!(p[8..40], g.cum_work);
     assert_eq!(p[40..72], g.headers_digest);
@@ -604,7 +654,7 @@ fn the_input_layout_is_the_documented_one() {
     assert_eq!(p[152..184], g.tip_block_id);
     assert_eq!(p[184..216], g.locked_block_id);
     assert_eq!(p[216..248], g.locked_cum_work);
-    let mut o = 48 + 248 + 2 * 1024;
+    let mut o = 80 + 248 + 2 * 1024;
     assert_eq!(v[o], 0);
     o += 1;
     assert_eq!(u32::from_le_bytes(v[o..o + 4].try_into().unwrap()), 26);

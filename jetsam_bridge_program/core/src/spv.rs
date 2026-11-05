@@ -29,9 +29,13 @@
 //! MN-1 (A5-4): the input names the block id of the bridge's current tip (`JetsamBridge.tipBlockId`, public
 //! value 19, which the contract reads from its storage) and the program commits whether the new branch holds
 //! that block (`Mn::tip_on_branch`, public value 20): the contract refuses a non-extension whose branch holds it
-//! (the tip's own chain re-proven from an older point) and restarts its finality clock only on a real switch.
+//! (the tip's own chain re-proven from an older point). Re-audit N1: the input also names the block id of the
+//! bridge's current tip's LOCKED block (`JetsamBridge.tipLockedBlockId`, public value 21, from the contract's
+//! storage) and the program commits whether the new branch holds it (`Mn::locked_on_branch`, public value 22):
+//! the contract restarts its finality clock only when it does not (a real switch, deeper than the 8 blocks the
+//! nodes reorganize), never on a fork of the tip's unlocked context (an orphan above L).
 //!
-//! Public values (G8): the 672 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` ([`public_values`]).
+//! Public values (G8): the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` ([`public_values`]).
 use crate::deposit;
 use crate::hdr::{b32_at, block_id, pow_valid, u32_at, u64_at, Hdr, HEADER_WIRE_SIZE};
 use crate::keccak::{keccak256, Keccak, PermuteFn};
@@ -40,9 +44,9 @@ use crate::tx;
 use crate::u256;
 use alloc::vec::Vec;
 
-pub const MAGIC: &[u8; 8] = b"JSPVIN06";
-/// Bytes of the public values (`JetsamBridge.publicValues`, v3 revised by A5-4: 21 words).
-pub const PV_LEN: usize = 672;
+pub const MAGIC: &[u8; 8] = b"JSPVIN07";
+/// Bytes of the public values (`JetsamBridge.publicValues`, v3 revised by A5-4 and the re-audit's N1: 23 words).
+pub const PV_LEN: usize = 736;
 /// Bytes of an encoded checkpoint in the input.
 pub const CHECKPOINT_LEN: usize = 248;
 pub const CP_DOMAIN: &[u8] = b"jetsam-bridge/checkpoint/v3";
@@ -165,7 +169,7 @@ impl CheckpointV3 {
     }
 }
 
-/// The node-mimicking values of a transition (`JetsamBridge.MN`, public values 12-16 and 20); big-endian works.
+/// The node-mimicking values of a transition (`JetsamBridge.MN`, public values 12-16, 20 and 22); big-endian works.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mn {
     /// `block_work` of the tip's target (MN-3).
@@ -180,6 +184,8 @@ pub struct Mn {
     pub max_timestamp: u64,
     /// The bridge's current tip block (public value 19) is on the new branch (MN-1, A5-4).
     pub tip_on_branch: bool,
+    /// The bridge's current tip's locked block (public value 21) is on the new branch (MN-1, re-audit N1).
+    pub locked_on_branch: bool,
 }
 
 /// SPEC §2: keccak256 of the 8 block ids, ascending heights.
@@ -272,8 +278,10 @@ pub fn anchor_leaf(kf: PermuteFn, height: u64, block_id: &[u8; 32], tx_root: &[u
     k.finalize()
 }
 
-/// G8: the 672 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` under `anchorBase` and the
-/// bridge's current tip block `bridge_tip_block` (`JetsamBridge.tipBlockId`).
+/// G8: the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)` under `anchorBase`, the
+/// bridge's current tip block `bridge_tip_block` (`JetsamBridge.tipBlockId`) and its locked block
+/// `bridge_tip_locked_block` (`JetsamBridge.tipLockedBlockId`).
+#[allow(clippy::too_many_arguments)]
 pub fn public_values(
     kf: PermuteFn,
     prev_id: &[u8; 32],
@@ -281,9 +289,10 @@ pub fn public_values(
     fork_depth: u8,
     anchor_base: u64,
     bridge_tip_block: &[u8; 32],
+    bridge_tip_locked_block: &[u8; 32],
     mn: &Mn,
 ) -> [u8; PV_LEN] {
-    let words: [[u8; 32]; 21] = [
+    let words: [[u8; 32]; 23] = [
         keccak256(kf, PV_DOMAIN),
         *prev_id,
         word_u64(next.height),
@@ -305,6 +314,8 @@ pub fn public_values(
         next.locked_cum_work,
         *bridge_tip_block,
         word_u64(mn.tip_on_branch as u64),
+        *bridge_tip_locked_block,
+        word_u64(mn.locked_on_branch as u64),
     ];
     let mut pv = [0u8; PV_LEN];
     for (i, w) in words.iter().enumerate() {
@@ -336,17 +347,19 @@ pub fn context_range(parent: &ParentV3, fork_depth: u8) -> (u64, u64) {
     (core::cmp::min(digest_first, base.saturating_sub(BASE_CONTEXT)), parent.height)
 }
 
-/// Host side: the guest's input (`JSPVIN06`, see [`run_with`]). `context` must be the headers of
+/// Host side: the guest's input (`JSPVIN07`, see [`run_with`]). `context` must be the headers of
 /// [`context_range`]`(parent, fork_depth)`, `new_headers` the new branch above the fork base, and
 /// `deposit_blocks` whole blocks of `]parent.L ; L]` in chain order (every page of each); the
 /// frontiers are those of the parent's trees (`parent.depositCount` and `parent.L + 1 − anchor_base`
-/// leaves); `bridge_tip_block` is the bridge's `tipBlockId` when the proof is made (the proof is valid only
-/// while that block is the bridge tip's). Nothing is checked here: [`run`] decides.
+/// leaves); `bridge_tip_block` and `bridge_tip_locked_block` are the bridge's `tipBlockId` and
+/// `tipLockedBlockId` when the proof is made (the proof is valid only while they are the bridge tip's).
+/// Nothing is checked here: [`run`] decides.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_input(
     parent: &ParentV3,
     anchor_base: u64,
     bridge_tip_block: &[u8; 32],
+    bridge_tip_locked_block: &[u8; 32],
     deposit_frontier: &[[u8; 32]; DEPTH],
     anchor_frontier: &[[u8; 32]; DEPTH],
     fork_depth: u8,
@@ -355,10 +368,11 @@ pub fn encode_input(
     deposit_blocks: &[(u64, Vec<[u8; tx::BODY]>)],
 ) -> Vec<u8> {
     let pages: usize = deposit_blocks.iter().map(|(_, p)| 12 + p.len() * tx::BODY).sum();
-    let mut v = Vec::with_capacity(8 + 8 + 32 + CHECKPOINT_LEN + 2 * DEPTH * 32 + 1 + 12 + (context.len() + new_headers.len()) * HEADER_WIRE_SIZE + pages);
+    let mut v = Vec::with_capacity(8 + 8 + 64 + CHECKPOINT_LEN + 2 * DEPTH * 32 + 1 + 12 + (context.len() + new_headers.len()) * HEADER_WIRE_SIZE + pages);
     v.extend_from_slice(MAGIC);
     v.extend_from_slice(&anchor_base.to_le_bytes());
     v.extend_from_slice(bridge_tip_block);
+    v.extend_from_slice(bridge_tip_locked_block);
     parent.encode(&mut v);
     for b in deposit_frontier.iter().chain(anchor_frontier.iter()) {
         v.extend_from_slice(b);
@@ -412,6 +426,8 @@ pub struct Out {
     pub anchor_base: u64,
     /// The bridge's current tip block the proof was made against (public value 19).
     pub bridge_tip_block: [u8; 32],
+    /// The bridge's current tip's locked block the proof was made against (public value 21).
+    pub bridge_tip_locked_block: [u8; 32],
     pub fork_depth: u8,
     /// The new checkpoint (its id is `next.id(kf)`).
     pub next: CheckpointV3,
@@ -432,8 +448,8 @@ pub fn run(input: &[u8], kf: PermuteFn, pad: &mut [u64]) -> Out {
 
 /// Verify a checkpoint transition under `s` and `rule`; panics (= no proof) on any rule failure.
 ///
-/// Input `JSPVIN06` (integers little-endian, the parent's works big-endian as on the L1):
-/// anchorBase u64 | bridge tip block id 32 | parent {height u64, cumWork 32, headersDigest 32, depositRoot 32, depositCount u64,
+/// Input `JSPVIN07` (integers little-endian, the parent's works big-endian as on the L1):
+/// anchorBase u64 | bridge tip block id 32 | bridge tip's locked block id 32 | parent {height u64, cumWork 32, headersDigest 32, depositRoot 32, depositCount u64,
 /// anchorRoot 32, lockedHeight u64, tipBlockId 32, lockedBlockId 32, lockedCumWork 32} | deposit frontier
 /// 32 x 32 | anchor frontier 32 x 32 | forkDepth u8 | n_ctx u32 | n_ctx headers (212 bytes, the heights
 /// of [`context_range`]) | n_new u32 | n_new headers | n_blk u32 | deposit blocks {height u64, n_pages
@@ -443,6 +459,7 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
     assert!(r.take(8) == MAGIC, "magic");
     let anchor_base = r.u64();
     let bridge_tip_block = r.b32();
+    let bridge_tip_locked_block = r.b32();
     let prev = CheckpointV3::read(&mut r);
     let mut branch = r.frontier();
     let mut anchor_branch = r.frontier();
@@ -558,6 +575,11 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
     // chain held the tip's block below its own height would carry more work than the tip, the heaviest
     // checkpoint the bridge accepted.
     let tip_on_branch = recs.iter().any(|x| x.hash == bridge_tip_block);
+    // MN-1 (re-audit N1): the same window for the tip's locked block. When the parent is an ancestor of the
+    // tip, the tip's L is at or above the parent's L, inside the window; a branch that does not reach it, or
+    // a block below the window (a parent of another branch, locked above the tip), is "not held": the
+    // contract restarts its clock, the conservative answer.
+    let locked_on_branch = recs.iter().any(|x| x.hash == bridge_tip_locked_block);
     let cum_work = u256::add(&work, &segment_work);
 
     // G10: L of the new branch, never below the parent's; W(L) from the parent's lockedCumWork along
@@ -637,13 +659,15 @@ pub fn run_with(input: &[u8], kf: PermuteFn, pad: &mut [u64], s: &Schedule, rule
         segment_work: u256::to_be(&segment_work),
         max_timestamp,
         tip_on_branch,
+        locked_on_branch,
     };
-    // G8: the 672 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)`.
+    // G8: the 736 bytes of `JetsamBridge.publicValues(prevId, next, forkDepth, mn)`.
     Out {
-        public_values: public_values(kf, &prev_id, &next, fork_depth, anchor_base, &bridge_tip_block, &mn),
+        public_values: public_values(kf, &prev_id, &next, fork_depth, anchor_base, &bridge_tip_block, &bridge_tip_locked_block, &mn),
         prev_id,
         anchor_base,
         bridge_tip_block,
+        bridge_tip_locked_block,
         fork_depth,
         next,
         mn,

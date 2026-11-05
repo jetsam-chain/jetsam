@@ -3,7 +3,7 @@
 
 //! The contract v3 checkpoint (SPEC-v3 §2.1), its id, the statement the
 //! contract builds from it (§2.4: the identity of the LOCKED block L, never
-//! the tip T), the 672-byte public values (§2.2, revised by A5-4), the deposit leaf, and the
+//! the tip T), the 736-byte public values (§2.2, revised by A5-4 and the re-audit's N1), the deposit leaf, and the
 //! TEST mock proof (`MockProofVerifier`: keccak(TAG ‖ public values)).
 
 use crate::{keccak256, Domain, GuardianStatement, GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION};
@@ -45,6 +45,10 @@ pub struct Mn {
     /// MN-1 (A5-4): the bridge's current tip block (`tipBlockId`) is on the new branch.
     #[serde(default)]
     pub tip_on_branch: bool,
+    /// MN-1 (re-audit N1): the bridge's current tip's locked block (`tipLockedBlockId`) is on the new
+    /// branch; only a branch that does not hold it restarts the contract's finality clock.
+    #[serde(default)]
+    pub locked_on_branch: bool,
 }
 
 /// One deposit of the deposit tree.
@@ -109,8 +113,8 @@ impl Checkpoint {
 }
 
 impl Mn {
-    /// The six fields of the contract's `MN` tuple, in order.
-    pub fn words(&self) -> [[u8; 32]; 6] {
+    /// The seven fields of the contract's `MN` tuple, in order.
+    pub fn words(&self) -> [[u8; 32]; 7] {
         [
             self.tip_block_work,
             w64(self.fork_base_timestamp),
@@ -118,13 +122,24 @@ impl Mn {
             self.segment_work,
             w64(self.max_timestamp),
             w64(u64::from(self.tip_on_branch)),
+            w64(u64::from(self.locked_on_branch)),
         ]
     }
 }
 
-/// The 672 bytes of the public values (contract `publicValues`): 19 words, then the bridge's current tip
-/// block `bridge_tip_block` (`tipBlockId`, read by the contract from its storage) and `mn.tip_on_branch`.
-pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anchor_base: u64, bridge_tip_block: &[u8; 32], mn: &Mn) -> Vec<u8> {
+/// The 736 bytes of the public values (contract `publicValues`): 19 words, then the bridge's current tip
+/// block `bridge_tip_block` (`tipBlockId`, read by the contract from its storage) and `mn.tip_on_branch`,
+/// then the bridge's current tip's locked block `bridge_tip_locked_block` (`tipLockedBlockId`, from its
+/// storage too) and `mn.locked_on_branch`.
+pub fn public_values(
+    prev_id: &[u8; 32],
+    next: &Checkpoint,
+    fork_depth: u8,
+    anchor_base: u64,
+    bridge_tip_block: &[u8; 32],
+    bridge_tip_locked_block: &[u8; 32],
+    mn: &Mn,
+) -> Vec<u8> {
     let words: Vec<[u8; 32]> = vec![
         keccak256(b"jetsam-bridge/public-values/v3"),
         *prev_id,
@@ -140,7 +155,7 @@ pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anch
         next.tip_block_id,
     ];
     let mn_words = mn.words();
-    let mut out = Vec::with_capacity(672);
+    let mut out = Vec::with_capacity(736);
     for w in words.iter().chain(mn_words[..5].iter()) {
         out.extend_from_slice(w);
     }
@@ -148,6 +163,8 @@ pub fn public_values(prev_id: &[u8; 32], next: &Checkpoint, fork_depth: u8, anch
     out.extend_from_slice(&next.locked_cum_work);
     out.extend_from_slice(bridge_tip_block);
     out.extend_from_slice(&mn_words[5]);
+    out.extend_from_slice(bridge_tip_locked_block);
+    out.extend_from_slice(&mn_words[6]);
     out
 }
 

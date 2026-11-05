@@ -15,7 +15,8 @@
 //! * a point every `cadence_secs` (D-AV3), started `prove_ahead_secs` early (A5-6, 900 s by default), at
 //!   once when the contract has stalled, and as soon as the chain allows it under the fast cadence (A5-5:
 //!   MN-5 refused a point, or the chain's work rate fell below 60 % of the tip's target), proven by
-//!   `[prover]` against the contract's current tip (A5-4: a proof made against a former tip is void), only
+//!   `[prover]` against the contract's current tip, its block and its locked block (A5-4, N1: a proof made
+//!   against a former tip is void), only
 //!   when `min_nodes` nodes have its tip and its locked block;
 //! * `finalizeSlow` of the highest point stable for 24 h; `claimDeposit` of every unminted deposit of the
 //!   final root (a mint, or the repayment of its advance), and `<publish_dir>/final.json` (what a claimer,
@@ -400,12 +401,12 @@ impl Relay {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit(&mut self, gl: u64, anchor_base: u64, tip_id: [u8; 32], tip_cum_work: [u8; 32], tip_block: [u8; 32], l1_now: u64) -> anyhow::Result<()> {
+    fn submit(&mut self, gl: u64, anchor_base: u64, tip_id: [u8; 32], tip_cum_work: [u8; 32], tip_block: [u8; 32], tip_locked: [u8; 32], l1_now: u64) -> anyhow::Result<()> {
         let known = self.known();
         let missing = self.archive.missing();
         let found = self.archive.found();
         let at = l1_now + self.cfg.prover.timeout_secs + relayer::INCLUSION_SECS;
-        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, gl, &found, &missing, at) {
+        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at) {
             Ok(s) => s,
             Err(why) => {
                 // WorkRateTooLow: MN-5 since the fork base; the fast cadence takes over (A5-5)
@@ -433,9 +434,11 @@ impl Relay {
         let started = std::time::Instant::now();
         let proof = self.prover.prove(&req)?;
         let proving = started.elapsed().as_secs();
-        // A5-4: the proof names the tip it was made against; another point landed meanwhile: made again
+        // A5-4, N1: the proof names the tip it was made against (its block and its locked block); another
+        // point landed meanwhile: made again
         let now_tip = word(&self.view("tipBlockId()", &[])?, 0);
-        if now_tip != s.bridge_tip_block {
+        let now_locked = word(&self.view("tipLockedBlockId()", &[])?, 0);
+        if now_tip != s.bridge_tip_block || now_locked != s.bridge_tip_locked_block {
             log(&format!("the bridge tip moved during the proof ({proving} s): this proof is void, planned again at the next step"));
             self.event(json!({"event": "proof_void_tip_moved", "planned_tip_block": hex::encode(s.bridge_tip_block), "tip_block": hex::encode(now_tip)}));
             return Ok(());
@@ -477,8 +480,10 @@ impl Relay {
         let t = self.view("tip()", &[])?;
         let (tip_id, tip_height, tip_cum_work) = (word(&t, 0), word_u64(&t, 1), word(&t, 2));
         let tip_block = word(&self.view("tipBlockId()", &[])?, 0);
+        let tip_locked = word(&self.view("tipLockedBlockId()", &[])?, 0);
         if let Some(k) = self.state.known.get(&hex::encode(tip_id)) {
             anyhow::ensure!(k.cp.tip_block_id == tip_block, "the contract's tipBlockId is not its tip's block");
+            anyhow::ensure!(k.cp.locked_block_id == tip_locked, "the contract's tipLockedBlockId is not its tip's locked block");
         }
         let fin = word(&self.view("finalId()", &[])?, 0);
         let last_switch = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
@@ -502,7 +507,7 @@ impl Relay {
             if stalled {
                 log("ALERT the contract has stalled (MN-3): a point now");
             }
-            self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, l1_now)?;
+            self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, tip_locked, l1_now)?;
         }
         Ok(())
     }

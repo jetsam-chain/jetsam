@@ -114,16 +114,19 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false })]);
     let tip_block = word(&view(&l1, &bridge, "tipBlockId()", &[]), 0);
     assert_eq!(tip_block, gcp.tip_block_id, "the genesis's block");
-    let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, &tip_block, GL, &found, &[], now(&l1) + 60).unwrap();
+    let tip_locked = word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0);
+    assert_eq!(tip_locked, gcp.locked_block_id, "the genesis's locked block (N1)");
+    let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, &tip_block, &tip_locked, GL, &found, &[], now(&l1) + 60).unwrap();
     assert_eq!((s.next.locked_height, s.next.deposit_count, s.fork_depth), (52, 3, 0));
-    assert!(s.mn.tip_on_branch, "an extension holds the tip's block");
-    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.mn);
+    assert!(s.mn.tip_on_branch && s.mn.locked_on_branch, "an extension holds the tip's block and its locked block");
+    let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn);
     let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &mock_proof(&pv)), "submitCheckpoint").unwrap();
     assert!(r.status, "submitCheckpoint");
     let cid = s.next.id();
     known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true });
     assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
     assert_eq!(word(&view(&l1, &bridge, "tipBlockId()", &[]), 0), s.next.tip_block_id);
+    assert_eq!(word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0), s.next.locked_block_id);
 
     // A5-4: a third party proves, from the genesis, one block more of the SAME chain: its branch holds the
     // tip's block (the program says so), the contract refuses it and the finality clock does not move
@@ -131,9 +134,9 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let mut longer = chain.clone();
     longer.extend(testkit::header(longer.tip_id(), 61, now(&l1) - 60, testkit::target_bits(20), 1)).unwrap();
     let only_genesis = HashMap::from([(gid, known[&gid].clone())]);
-    let third = relayer::plan_submission(&longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, GL, &found, &[], now(&l1) + 60).unwrap();
+    let third = relayer::plan_submission(&longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], now(&l1) + 60).unwrap();
     assert!(third.mn.tip_on_branch && third.parent == gid && third.next.height == 61);
-    let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &third.mn);
+    let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &s.next.locked_block_id, &third.mn);
     let refused = sender(GENESIS_KEY, &gd).send(&l1, &bridge, &l1::submit_checkpoint(&gid, &third.next, 0, &third.mn, &mock_proof(&tpv)), "submitCheckpoint");
     let err = format!("{:#}", refused.err().expect("a same-chain point that does not extend the tip"));
     assert!(err.contains(&hex::encode(l1::selector("MustExtendTip()"))), "MustExtendTip: {err}");

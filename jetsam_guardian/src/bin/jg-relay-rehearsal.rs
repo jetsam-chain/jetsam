@@ -359,8 +359,10 @@ impl Relay {
             max_timestamp: max_ts,
             // A5-4: the parent is the contract's tip; its block stays on the branch only when it is extended
             tip_on_branch: fork_depth == 0,
+            // N1: and its locked block always does (MN-2: the fork base is never below the parent's L)
+            locked_on_branch: true,
         };
-        let pv = public_values(&parent_id, &cp, fork_depth, anchor_base, &parent.cp.tip_block_id, &mn);
+        let pv = public_values(&parent_id, &cp, fork_depth, anchor_base, &parent.cp.tip_block_id, &parent.cp.locked_block_id, &mn);
         let proof = mock_proof(&pv);
         let r = self.l1.send(&self.a.from, &self.a.bridge, &l1::submit_checkpoint(&parent_id, &cp, fork_depth, &mn, &proof))?;
         self.event(json!({"t": now_unix(), "event": "submitCheckpoint", "status": r.status, "gas": r.gas_used, "l1_ts": r.block_timestamp,

@@ -21,7 +21,7 @@ fn cp() -> Checkpoint {
 }
 
 fn mn() -> Mn {
-    Mn { tip_block_work: w64(16), fork_base_timestamp: 1_700_000_000, fork_base_work: w64(32), segment_work: w64(48), max_timestamp: 1_700_000_500, tip_on_branch: true }
+    Mn { tip_block_work: w64(16), fork_base_timestamp: 1_700_000_000, fork_base_work: w64(32), segment_work: w64(48), max_timestamp: 1_700_000_500, tip_on_branch: true, locked_on_branch: true }
 }
 
 fn k(data: &[u8]) -> String {
@@ -29,16 +29,17 @@ fn k(data: &[u8]) -> String {
 }
 
 /// Vectors: `cast calldata … | cast keccak` (foundry 1.4.4), 2026-10-31; those with the MN tuple again on
-/// 2026-11-05 (A5-4: `tipOnBranch`, here true, its sixth field).
+/// 2026-11-05 (A5-4: `tipOnBranch`, here true, its sixth field; re-audit N1: `lockedOnBranch`, here true,
+/// its seventh).
 #[test]
 fn call_data_matches_cast() {
     let sig = [0x01u8; 256];
     assert_eq!(k(&finalize_fast(&cp(), 1_700_003_600, &sig)), "0xbacc1b0bffa6f486f9b7171e9093da971bbc5d33ad8143f12a84c893f4b812f2");
     assert_eq!(k(&init_genesis(&cp(), 1_700_003_600, &sig)), "0x8259e4e8f58e5ec3f0aab1a98049a7f48cb7e649dcb5b3e3feffc697a7547d0d");
-    assert_eq!(k(&submit_checkpoint(&rep(0x66), &cp(), 2, &mn(), &rep(0x77))), "0x15f7ceb1730a8702fdc25773de5f2d76a59dd736b04c59ee3c474bb1f3cb5c89");
+    assert_eq!(k(&submit_checkpoint(&rep(0x66), &cp(), 2, &mn(), &rep(0x77))), "0x5d9d91e0f7b951555e1ae2975ebf1210d7f3c1e00cf605e333917940951525ba");
     assert_eq!(
         k(&submit_and_finalize_fast(&rep(0x66), &cp(), 2, &mn(), &rep(0x77), 1_700_003_600, &sig)),
-        "0xea03a2d55b909828729adfef2faba26c653711c74e7335bf523ba03bda52ae94"
+        "0x4fe11c196d1ba7a5b9089f99971f044f79268c260421c17dd02f0333c422f4c8"
     );
     let mut recipient = [0u8; 20];
     recipient[19] = 0xa1;

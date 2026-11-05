@@ -151,7 +151,8 @@ pub fn mn_values(chain: &Chain, base: u64, t: u64) -> Option<Mn> {
         fork_base_work: u256::to_be(&b.work),
         segment_work: u256::to_be(&u256::sub(&chain.work_at(t)?, &chain.work_at(base)?)),
         max_timestamp: max_ts,
-        tip_on_branch: false, // relative to the bridge's tip: `plan_submission` sets it
+        tip_on_branch: false,    // relative to the bridge's tip: `plan_submission` sets it
+        locked_on_branch: false, // relative to the bridge's tip's locked block: `plan_submission` sets it
     })
 }
 
@@ -180,6 +181,8 @@ pub struct Submission {
     /// The contract's `tipBlockId` the submission is planned against (public value 19, A5-4): the proof is
     /// valid only while it is the tip's block.
     pub bridge_tip_block: [u8; 32],
+    /// The contract's `tipLockedBlockId` the submission is planned against (public value 21, re-audit N1).
+    pub bridge_tip_locked_block: [u8; 32],
 }
 
 /// Why no submission now.
@@ -204,18 +207,20 @@ pub enum NoSubmission {
     MustExtendTip,
 }
 
-/// MN-1 (A5-4), as the program decides it: the block `bridge_tip_block` is on the new branch, i.e. among
-/// the headers of `chain` from the first height of the parent's context (`context_range`) to `t` (the
-/// context up to the fork base is `chain`'s, the new segment above it too).
-pub fn tip_on_branch(chain: &Chain, parent: &Checkpoint, fork_depth: u8, t: u64, bridge_tip_block: &[u8; 32]) -> bool {
+/// MN-1, as the program decides it: the block `block` (the bridge tip's block for `tip_on_branch`, A5-4;
+/// the bridge tip's locked block for `locked_on_branch`, re-audit N1) is on the new branch, i.e. among the
+/// headers of `chain` from the first height of the parent's context (`context_range`) to `t` (the context
+/// up to the fork base is `chain`'s, the new segment above it too).
+pub fn on_new_branch(chain: &Chain, parent: &Checkpoint, fork_depth: u8, t: u64, block: &[u8; 32]) -> bool {
     let (first, _) = jetsam_bridge_program::spv::context_range(&to_program(parent), fork_depth);
-    (first..=t).any(|h| chain.id_at(h).as_ref() == Some(bridge_tip_block))
+    (first..=t).any(|h| chain.id_at(h).as_ref() == Some(block))
 }
 
 /// The submission on top of the contract's tip `tip` (or of the nearest ancestor of it whose locked block
 /// and roots are those of `chain`), for the highest tip of `chain` whose locked block stays below the
-/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in). `bridge_tip_block` is
-/// the contract's `tipBlockId` (the block of `tip`).
+/// first `Missing` body, at L1 time `l1_at` (when the transaction is expected in). `bridge_tip_block` and
+/// `bridge_tip_locked_block` are the contract's `tipBlockId` and `tipLockedBlockId` (the block and the
+/// locked block of `tip`).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_submission(
     chain: &Chain,
@@ -223,6 +228,7 @@ pub fn plan_submission(
     tip: &[u8; 32],
     tip_cum_work_be: &[u8; 32],
     bridge_tip_block: &[u8; 32],
+    bridge_tip_locked_block: &[u8; 32],
     gl: u64,
     found: &BTreeMap<u64, Vec<FoundDeposit>>,
     missing: &[u64],
@@ -280,7 +286,9 @@ pub fn plan_submission(
         return Err(NoSubmission::NotHeavier);
     }
     let mut mn = mn_values(chain, base, t).ok_or(NoSubmission::ChainTooShort)?;
-    mn.tip_on_branch = tip_on_branch(chain, &parent.cp, fork_depth, t, bridge_tip_block);
+    mn.tip_on_branch = on_new_branch(chain, &parent.cp, fork_depth, t, bridge_tip_block);
+    // N1 (re-audit): the contract restarts its clock only when the branch leaves the tip's locked block
+    mn.locked_on_branch = on_new_branch(chain, &parent.cp, fork_depth, t, bridge_tip_locked_block);
     // MN-1 (A5-4): a point that does not extend the tip must leave the tip's block behind
     if (parent_id != *tip || fork_depth != 0) && mn.tip_on_branch {
         return Err(NoSubmission::MustExtendTip);
@@ -291,7 +299,16 @@ pub fn plan_submission(
     if !mn5_ok(&mn, l1_at) {
         return Err(NoSubmission::WorkRateTooLow);
     }
-    Ok(Submission { parent: parent_id, fork_depth, base, next, mn, deposits, bridge_tip_block: *bridge_tip_block })
+    Ok(Submission {
+        parent: parent_id,
+        fork_depth,
+        base,
+        next,
+        mn,
+        deposits,
+        bridge_tip_block: *bridge_tip_block,
+        bridge_tip_locked_block: *bridge_tip_locked_block,
+    })
 }
 
 // ---------------------------------------------------------------- A5-5: the fast cadence
@@ -584,7 +601,7 @@ pub fn block_pages(raw: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 // ---------------------------------------------------------------- proofs
 
 /// What the checkpoint program needs to prove a submission (every header from `headers_from` (the parent's L
-/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 672 bytes it must commit.
+/// less `context_below`) to the new tip, raw; the parent's context and abandoned headers included), and the 736 bytes it must commit.
 #[derive(Clone, Debug)]
 pub struct ProofRequest {
     pub parent_id: [u8; 32],
@@ -593,6 +610,8 @@ pub struct ProofRequest {
     pub anchor_base: u64,
     /// The contract's `tipBlockId` the proof is made against (public value 19).
     pub bridge_tip_block: [u8; 32],
+    /// The contract's `tipLockedBlockId` the proof is made against (public value 21).
+    pub bridge_tip_locked_block: [u8; 32],
     pub next: Checkpoint,
     pub mn: Mn,
     /// `JetsamBridge.publicValues(parentId, next, forkDepth, mn)`.
@@ -613,7 +632,7 @@ impl ProofRequest {
     /// Built from the chain, the archive and the parent's known context.
     #[allow(clippy::too_many_arguments)]
     pub fn build(s: &Submission, parent: &Known, chain: &Chain, archive: &Archive, gl: u64, anchor_base: u64, context_below: u64) -> anyhow::Result<Self> {
-        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.mn);
+        let pv = public_values(&s.parent, &s.next, s.fork_depth, anchor_base, &s.bridge_tip_block, &s.bridge_tip_locked_block, &s.mn);
         // (the fork base is never below the parent's L: MN-2, `fork_base`)
         let from = parent.cp.locked_height.saturating_sub(context_below).max(chain.base_height());
         let headers = (from..=s.next.height)
@@ -640,6 +659,7 @@ impl ProofRequest {
             fork_depth: s.fork_depth,
             anchor_base,
             bridge_tip_block: s.bridge_tip_block,
+            bridge_tip_locked_block: s.bridge_tip_locked_block,
             next: s.next,
             mn: s.mn,
             public_values: pv,
@@ -669,7 +689,7 @@ fn to_program(c: &Checkpoint) -> jetsam_bridge_program::spv::CheckpointV3 {
     }
 }
 
-/// The checkpoint program's input (`JSPVIN06`) for a request: the parent's context exactly as the program
+/// The checkpoint program's input (`JSPVIN07`) for a request: the parent's context exactly as the program
 /// bounds it (`context_range`: this chain up to the fork base, then the parent's abandoned headers), the new
 /// branch above the base, the pages of the deposit blocks.
 pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
@@ -696,10 +716,21 @@ pub fn program_input(req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
         let p: Vec<[u8; 323]> = pages.iter().map(|x| x.as_slice().try_into().map_err(|_| anyhow::anyhow!("page: not 323 bytes"))).collect::<anyhow::Result<_>>()?;
         blocks.push((*h, p));
     }
-    Ok(spv::encode_input(&parent, req.anchor_base, &req.bridge_tip_block, &req.deposit_frontier, &req.anchor_frontier, req.fork_depth, &context, &new, &blocks))
+    Ok(spv::encode_input(
+        &parent,
+        req.anchor_base,
+        &req.bridge_tip_block,
+        &req.bridge_tip_locked_block,
+        &req.deposit_frontier,
+        &req.anchor_frontier,
+        req.fork_depth,
+        &context,
+        &new,
+        &blocks,
+    ))
 }
 
-/// The checkpoint program's relation run natively on `input` (what the guest proves): its 672 bytes of
+/// The checkpoint program's relation run natively on `input` (what the guest proves): its 736 bytes of
 /// public values, or its refusal (the rule it panicked on).
 pub fn run_native(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut pad = vec![0u64; tw_core::towerwalk::CELLS];

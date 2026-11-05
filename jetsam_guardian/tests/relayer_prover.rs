@@ -32,9 +32,10 @@ fn request() -> ProofRequest {
         fork_depth: 0,
         anchor_base: 11,
         bridge_tip_block: [9u8; 32],
+        bridge_tip_locked_block: [10u8; 32],
         next: cp,
         mn: Mn::default(),
-        public_values: vec![0x5a; 672],
+        public_values: vec![0x5a; 736],
         headers_from: 0,
         headers: Vec::new(),
         abandoned: Vec::new(),
@@ -65,7 +66,7 @@ fn prover(dir: &Path, cmd: String, timeout: Duration) -> CommandProver {
 fn the_command_gets_the_input_and_its_proof_is_returned() {
     let dir = tempfile::tempdir().unwrap();
     let expect = dir.path().join("pv");
-    std::fs::write(&expect, vec![0x5a; 672]).unwrap();
+    std::fs::write(&expect, vec![0x5a; 736]).unwrap();
     let seen = dir.path().join("seen");
     let cmd = script(dir.path(), "ok", &format!("cp \"$1\" {s}; printf PROOF > \"$2\"; cp {e} \"$3\"", s = seen.display(), e = expect.display()));
     let proof = prover(dir.path(), cmd, Duration::from_secs(30)).prove(&request()).unwrap();
