@@ -67,7 +67,7 @@ fn key(text: &str) -> HotKey {
 }
 
 fn sender(k: &str, dir: &std::path::Path) -> Sender {
-    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 100_000_000_000, priority_fee: None };
+    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 100_000_000_000, priority_fee: None, max_priority_fee_per_gas: 100_000_000_000 };
     Sender::new(key(k), 31_337, policy, dir).unwrap()
 }
 
@@ -112,11 +112,11 @@ fn what_would_fail_is_refused_before_anything_is_signed() {
     let e = s.send(&l1, reverter, &[1, 2, 3], "test").unwrap_err().to_string();
     assert!(e.contains("reverts"), "{e}");
     // fees: a cap below the base fee
-    let low = Sender::new(key(TEST_KEY_1), 31_337, FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1, priority_fee: Some(0) }, dir.path()).unwrap();
+    let low = Sender::new(key(TEST_KEY_1), 31_337, FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1, priority_fee: Some(0), max_priority_fee_per_gas: 1 }, dir.path()).unwrap();
     let e = low.send(&l1, TARGET, &[], "test").unwrap_err().to_string();
     assert!(e.contains("above the cap"), "{e}");
     // gas: an estimate above the cap with its margin
-    let small = Sender::new(key(TEST_KEY_1), 31_337, FeePolicy { gas_margin_pct: 25, max_gas: 21_000, max_fee_per_gas: 100_000_000_000, priority_fee: None }, dir.path()).unwrap();
+    let small = Sender::new(key(TEST_KEY_1), 31_337, FeePolicy { gas_margin_pct: 25, max_gas: 21_000, max_fee_per_gas: 100_000_000_000, priority_fee: None, max_priority_fee_per_gas: 100_000_000_000 }, dir.path()).unwrap();
     let e = small.send(&l1, TARGET, &[], "test").unwrap_err().to_string();
     assert!(e.contains("exceeds max_gas"), "{e}");
     // ether: a key with none

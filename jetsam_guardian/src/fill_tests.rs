@@ -1099,7 +1099,7 @@ fn a_public_network_refuses_the_clear_and_any_source_off_tor_or_the_loopback() {
     assert!(e.contains("refused on the public test network"), "{e}");
     let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
     // onion only (the default): a loopback node and an onion node, an onion L1: starts
-    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), ""));
+    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), "[signer]\npriority_fee_wei = 1000000000\n"));
     assert!(ok.is_ok(), "{:?}", ok.err());
     // a node on the bridge, or the L1 in the clear: refused before any socket
     let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", "http://10.77.0.12:19801"], "http://127.0.0.1:8545", "")).unwrap_err().to_string();
@@ -1587,6 +1587,79 @@ fn n9_c_the_relayers_archive_may_be_named_explicitly() {
     assert_eq!(alone.relay_blocks_dir(), Some(std::path::PathBuf::from("/mnt/archive/blocks")), "without relay_final: advances, repayments claimed by others");
     let default = FillConfig::parse(&rehearsal(&format!("relay_final = \"/srv/relay/publish/final.json\"\n{p}"))).unwrap();
     assert_eq!(default.relay_blocks_dir(), Some(std::path::PathBuf::from("/srv/relay/publish/blocks")));
+}
+
+/// A5-13: on a public network fill.toml names the priority fee of its signer under its cap, or jg-fill does not start
+/// (checked with the configuration, before any socket).
+#[test]
+fn a5_13_a_public_network_needs_the_priority_fee_in_fill_toml() {
+    let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
+    let l1 = format!("http://jetsamtest{}.onion:8545", "b".repeat(46));
+    let public = |extra: &str| FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &l1, extra));
+    for extra in ["", "[signer]\n", "[signer]\npriority_fee_wei = 10000000001\n"] {
+        let e = public(extra).unwrap_err().to_string();
+        assert!(e.contains("priority_fee_wei") && e.contains("does not start"), "{extra:?}: {e}");
+    }
+    assert!(public("[signer]\npriority_fee_wei = 1000000000\n").is_ok());
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).is_ok(), "the rehearsal: not required");
+}
+
+/// A5-13: three reverted transactions of the robot in a row halt it (latched, `HALT_REPEATED_REVERTS`): its probe
+/// (`eth_call`) and its reads come from one L1 endpoint, and each revert costs gas; a success resets the count, the
+/// halt too (counted again after the operator's restart).
+#[test]
+fn a5_13_three_reverted_transactions_in_a_row_halt() {
+    assert_eq!(MAX_CONSECUTIVE_REVERTS, 3);
+    assert_eq!(after_receipt(0, false), (1, None));
+    assert_eq!(after_receipt(1, false), (2, None));
+    assert_eq!(after_receipt(2, false), (0, Some(HALT_REPEATED_REVERTS)), "the third in a row");
+    assert_eq!(after_receipt(2, true), (0, None), "a success resets");
+    assert_eq!(after_receipt(u32::MAX, false), (0, Some(HALT_REPEATED_REVERTS)));
+    let mut n = 0;
+    let mut halts = Vec::new();
+    for status in [false, false, true, false, false, false] {
+        let (m, h) = after_receipt(n, status);
+        n = m;
+        halts.push(h);
+    }
+    assert_eq!(halts, vec![None, None, None, None, None, Some(HALT_REPEATED_REVERTS)]);
+}
+
+/// A5-13: a refusal that depends on the L1 clock (`l1_now`: the time of the endpoint's latest block, which may lie)
+/// is never final: the deposit is decided again at the next step. Every other refusal is. Checked on the plan
+/// itself: whatever refusal changes with the L1 clock alone is not final; and jg-fill skips a deposit only on a final
+/// decision.
+#[test]
+fn a5_13_a_refusal_that_depends_on_the_l1_clock_is_never_final() {
+    assert!(!decided_for_good("refuse:LATE_SLOW_PATH_NEAR"));
+    for code in ["ALREADY_ADVANCED", "ADVANCED_BY_ANOTHER", "ALREADY_MINTED", "ALREADY_UNDER_A_POINT", "BELOW_MIN_ADVANCE", "RECIPIENT_CAP"] {
+        assert!(decided_for_good(&format!("refuse:{code}")), "{code}");
+    }
+    for code in ["advance", "wait:NOT_CONFIRMED", "wait:LATE_SLOW_PATH_NEAR", ""] {
+        assert!(!decided_for_good(code), "{code}");
+    }
+    let p = FillParams::default();
+    let mut late = cand(11, 1, 2, 7 * JTM);
+    late.dep.block_ts = NOW - p.late_after_secs - 1;
+    let cands = vec![cand(10, 1, 1, 7 * JTM), late, cand(12, 1, 3, 2 * JTM), cand(13, 1, 4, 7 * JTM)];
+    let at = |l1: u64| plan(&cands, &Ledger::default(), caps(), &open(), NOW, l1, 5 * JTM, &p);
+    let base = at(NOW);
+    let mut changed = 0;
+    for l1 in [0, NOW - 86_400, NOW + p.late_after_secs, NOW + 10 * 86_400, u64::MAX] {
+        for (x, y) in base.iter().zip(at(l1)) {
+            if *x != y {
+                changed += 1;
+                for v in [*x, y] {
+                    if let Verdict::Refuse(code) = v {
+                        assert!(!decided_for_good(&format!("refuse:{code}")), "{code} changes with the L1 clock alone: not final");
+                    }
+                }
+            }
+        }
+    }
+    assert!(changed > 0, "the L1 clock moved some verdict");
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::decided_for_good(") && !robot.contains("starts_with(\"refuse:\")"), "jg-fill skips a deposit on a final decision only");
 }
 
 /// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name

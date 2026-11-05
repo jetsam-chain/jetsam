@@ -804,6 +804,36 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     out
 }
 
+/// A5-13: the refusals of [`plan`] that depend on a clock — `l1_now`, the time of the L1 endpoint's latest block,
+/// which may lie (18 h ahead: every deposit `LATE_SLOW_PATH_NEAR`) — never final.
+pub const CLOCK_REFUSALS: [&str; 1] = ["LATE_SLOW_PATH_NEAR"];
+
+/// A5-13: a decision journaled as `code` (`advance`, `wait:…`, `refuse:…`) that ends the robot's interest in a
+/// deposit (jg-fill reads it no more): a refusal that does not depend on a clock. A clock's refusal is decided
+/// again at the next step.
+pub fn decided_for_good(code: &str) -> bool {
+    code.strip_prefix("refuse:").is_some_and(|c| !CLOCK_REFUSALS.contains(&c))
+}
+
+/// A5-13: this many of the robot's transactions reverted in a row (its `eth_call` probe and its reads come from
+/// one L1 endpoint, which may lie; each revert costs gas) halt it, latched: [`HALT_REPEATED_REVERTS`].
+pub const MAX_CONSECUTIVE_REVERTS: u32 = 3;
+pub const HALT_REPEATED_REVERTS: &str = "HALT_REPEATED_REVERTS";
+
+/// A5-13: the count of the robot's consecutive reverted transactions after a receipt of `status` (a success resets
+/// it), and the halt it reaches — the count back to 0 then, counted again after the operator's restart.
+pub fn after_receipt(reverts: u32, status: bool) -> (u32, Option<&'static str>) {
+    if status {
+        return (0, None);
+    }
+    let n = reverts.saturating_add(1);
+    if n >= MAX_CONSECUTIVE_REVERTS {
+        (0, Some(HALT_REPEATED_REVERTS))
+    } else {
+        (n, None)
+    }
+}
+
 /// The queue the robot publishes (`queue.json`, degraded mode): the candidates neither advanced nor refused,
 /// in the first-in-first-out order, with their place and what they wait for.
 pub fn published_queue(cands: &[Candidate], verdicts: &[Verdict]) -> Vec<serde_json::Value> {
@@ -1132,6 +1162,8 @@ impl FillConfig {
             );
         }
         c.egress()?;
+        // A5-13: the signer's priority fee, before any socket (its open() checks it again)
+        c.signer.check_fees(profile).map_err(|e| anyhow::anyhow!("{e}: jg-fill does not start"))?;
         let hot = parse20(&c.hot_address)?;
         let refund = parse20(&c.refund_to)?;
         anyhow::ensure!(hot != [0u8; 20], "hot_address is 0: jg-fill does not start");

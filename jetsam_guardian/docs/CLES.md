@@ -123,6 +123,10 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
 - **Key** (each): secp256k1, `[signer] key_file`, 64 hex characters in clear; refused unless 0600 or 0400 and
   owned by the process's uid (`HotKey::load`); never logged, never passed over IPC, its `Debug` shows the
   address only, zeroized when dropped. `jg-fill`: `key_file` must match `hot_address` of `fill.toml`.
+- **Fees** (A5-13, `jg-fill` and `jg-relay` alike): off the private rehearsal `[signer] priority_fee_wei` is
+  required (the L1 endpoint's `eth_maxPriorityFeePerGas` is never taken), at most `max_priority_fee_wei` (10 gwei
+  by default, replacements included), else no start. `jg-fill` halts (`HALT_REPEATED_REVERTS`, latched) after 3 of
+  its transactions reverted in a row, and keeps no refusal that depends on the L1 clock.
 - **Process** (A5-15): `jg-fill` and `jg-relay` harden themselves before reading anything
   (`jetsam_guardian::harden`): `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` (they do not start otherwise);
   `mlockall` when `RLIMIT_MEMLOCK` is unlimited or the process has `CAP_IPC_LOCK`, else a warning — then the

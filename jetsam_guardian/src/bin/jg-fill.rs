@@ -26,6 +26,10 @@
 //!   prudent).
 //! * N9: every step reads the hot key's balance again: above `max_stock` the robot pauses
 //!   (`PAUSE_STOCK_ABOVE_CAP`, an ALERT once per crossing).
+//! * A5-13 (one L1 endpoint is an oracle): off the private rehearsal `[signer] priority_fee_wei` is required, at
+//!   most `max_priority_fee_wei` (10 gwei by default; replacements capped too); three of its transactions reverted
+//!   in a row halt it (`HALT_REPEATED_REVERTS`, latched; it then sends nothing, own claims included); a refusal that
+//!   depends on the L1 clock (`LATE_SLOW_PATH_NEAR`) is never kept as final, the deposit is decided again.
 //! * A5-14: `<state_dir>/state.json` (its ledger, what its caps and repayments count) is written synced, file then
 //!   directory, around its rename (`jetsam_guardian::write_atomic`); present but unreadable, the robot does not start.
 //! * A halt is latched in `<state_dir>/HALT` (its reason): only an operator removes it (D41); a pause lifts
@@ -127,6 +131,9 @@ struct State {
     /// N9: the txids known minted (`isMinted` never turns back), for the room under the supply ceiling.
     #[serde(default)]
     minted: HashSet<String>,
+    /// A5-13: the robot's transactions reverted in a row (advances and own claims; a success resets it).
+    #[serde(default)]
+    reverts: u32,
 }
 
 /// N9: `isMinted` asked at most this many times a step for the deposits locked under the contract's tip (lowest
@@ -391,7 +398,8 @@ impl Robot {
         let blocks_dir = self.cfg.relay_blocks_dir();
         for d in deposits {
             let key = hex::encode(d.key());
-            if self.state.ledger.has(&d.key()) || self.state.decided.get(&key).is_some_and(|v| v.starts_with("refuse:")) {
+            // A5-13: a refusal that depends on the L1 clock is decided again at every step
+            if self.state.ledger.has(&d.key()) || self.state.decided.get(&key).is_some_and(|v| fill::decided_for_good(v)) {
                 continue;
             }
             let conf = {
@@ -516,6 +524,7 @@ impl Robot {
             }
         };
         let orders = &orders[..n];
+        self.receipt_seen(receipt.status, l1_now)?;
         if !receipt.status {
             log(&format!("advance transaction reverted: {}", receipt.tx_hash));
             self.journal(json!({"kind": "send_reverted", "orders": list.len(), "l1_tx": receipt.tx_hash, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
@@ -594,6 +603,9 @@ impl Robot {
                     log(&format!("claimed own repayment key {} status {} gas {}", hex::encode(a.key), r.status, r.gas_used));
                     self.journal(json!({"kind": "claimed_own", "key": hex::encode(a.key), "txid": hex::encode(a.txid), "status": r.status,
                                         "l1_tx": r.tx_hash, "gas": r.gas_used, "l1_t": l1_now}));
+                    if self.receipt_seen(r.status, l1_now)? {
+                        break;
+                    }
                 }
                 Err(e) => {
                     // a full window, the ceiling or a freeze: the relayer or a later step claims it
@@ -605,9 +617,29 @@ impl Robot {
         Ok(())
     }
 
+    /// A5-13: the receipt of one of the robot's own transactions: `MAX_CONSECUTIVE_REVERTS` reverted in a row halt it
+    /// (latched in `HALT`, `HALT_REPEATED_REVERTS`); true when that halt is reached now.
+    fn receipt_seen(&mut self, status: bool, l1_now: u64) -> anyhow::Result<bool> {
+        let (n, halt) = fill::after_receipt(self.state.reverts, status);
+        self.state.reverts = n;
+        let Some(code) = halt else { return Ok(false) };
+        log(&format!("HALT {code}: {} of its transactions reverted in a row (latched in {}; an operator removes it)", fill::MAX_CONSECUTIVE_REVERTS, self.halt_file.display()));
+        // latched even under another halt (own claims go on under the others): its line is added to the file
+        if !self.halted().is_some_and(|h| h.contains(code)) {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new().create(true).append(true).open(&self.halt_file)?.write_all(format!("{code}\n").as_bytes())?;
+            self.journal(json!({"kind": "halt", "reason": code, "l1_t": l1_now}));
+        }
+        self.save();
+        Ok(true)
+    }
+
     /// The repayment (or the noted loss) of every pending advance.
     fn check_repayments(&mut self, l1_now: u64) -> anyhow::Result<()> {
-        if let Some(path) = self.cfg.relay_final.clone() {
+        // A5-13: latched on repeated reverts, the robot sends nothing until an operator restarts it (the relayer
+        // claims its repayments meanwhile)
+        let reverting = self.halted().is_some_and(|h| h.contains(fill::HALT_REPEATED_REVERTS));
+        if let (Some(path), false) = (self.cfg.relay_final.clone(), reverting) {
             if let Err(e) = self.claim_own(&path, l1_now) {
                 log(&format!("own claims: {e:#}"));
             }

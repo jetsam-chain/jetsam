@@ -1007,3 +1007,90 @@ fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("PAUSE_STOCK_ABOVE_CAP"), "{journal}");
 }
+
+/// The fake L1 of `inner` where the bridge holds every root final and every transaction sent through the endpoint's
+/// account (the rehearsal without `[signer]`) is mined reverted.
+fn reverting(inner: Answer) -> Answer {
+    let final_root = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("isFinalDepositRoot(bytes32)")));
+    Arc::new(move |method, params| match method {
+        "eth_call" if params[0]["data"].as_str().unwrap_or_default().starts_with(&final_root) => json!({"result": format!("0x{:064x}", 1)}),
+        "eth_sendTransaction" => json!({"result": format!("0x{}", "ab".repeat(32))}),
+        "eth_getTransactionReceipt" => json!({"result": {"status": "0x0", "gasUsed": "0x5208", "blockNumber": "0x10", "logs": []}}),
+        _ => inner(method, params),
+    })
+}
+
+/// A5-13: three of the robot's transactions reverted in a row (here its own claim of a repayment, the endpoint saying
+/// the root is final and the deposit not minted, the chain reverting each one) halt it, latched and named
+/// (`HALT_REPEATED_REVERTS`), and it sends nothing more — also when another halt was latched before (own claims go on
+/// under the others): its line is added. Rehearsal build only.
+#[test]
+fn jg_fill_halts_after_three_reverted_transactions_and_sends_nothing_more() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    halts_after_three_reverts(None);
+    halts_after_three_reverts(Some("HALT_DEEP_REORG"));
+}
+
+fn halts_after_three_reverts(before: Option<&str>) {
+    use jetsam_guardian::checkpoint::{deposit_leaf, Checkpoint, Deposit};
+    use jetsam_guardian::fill::{advance_key, paid, AdvanceStatus, Advanced, Ledger};
+    let (socks, seen) = fake_tor(reverting(fill_world(1_200_000_000)));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    // a pending advance of the robot whose deposit is in the relayer's published final root
+    let (txid, recipient, amount) = ([0x5au8; 32], [0xa1u8; 20], 7_000_000u64);
+    let dep = Deposit { index: 0, recipient, amount, jetsam_tx_id: txid };
+    let fin = Checkpoint {
+        height: 300,
+        cum_work: [1; 32],
+        headers_digest: [2; 32],
+        deposit_root: jetsam_guardian::chain::merkle_root(&[deposit_leaf(&dep)]),
+        deposit_count: 1,
+        anchor_root: [3; 32],
+        locked_height: 292,
+        tip_block_id: [4; 32],
+        locked_block_id: [5; 32],
+        locked_cum_work: [6; 32],
+    };
+    std::fs::create_dir_all(dir.join("publish")).unwrap();
+    std::fs::write(dir.join("publish/final.json"), jetsam_guardian::relayer::published_final(&fin.id(), &fin, &[dep], &[200]).to_string()).unwrap();
+    let advanced = Advanced {
+        key: advance_key(&txid, &recipient, amount),
+        txid,
+        height: 200,
+        block_id: [7; 32],
+        recipient,
+        amount,
+        fee_bps: 75,
+        paid: paid(amount, 75),
+        sent_at: 1,
+        tx_hash: String::new(),
+        status: AdvanceStatus::Pending,
+    };
+    let state = json!({"ledger": Ledger { advances: vec![advanced] }, "scanned": {}, "confirmed_at": {}, "decided": {}, "checkpoints": {}, "observers": {}});
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), state.to_string()).unwrap();
+    if let Some(h) = before {
+        std::fs::write(dir.join("state/HALT"), format!("{h}\n")).unwrap();
+    }
+    let toml = std::fs::read_to_string(dir.join("fill.toml")).unwrap();
+    std::fs::write(dir.join("fill.toml"), format!("relay_final = \"{}\"\n{toml}", dir.join("publish/final.json").display())).unwrap();
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let sends = || seen.lock().unwrap().iter().filter(|(.., m)| m == "eth_sendTransaction").count();
+    let want = before.map_or("HALT_REPEATED_REVERTS".to_string(), |h| format!("{h}\nHALT_REPEATED_REVERTS"));
+    let halted = wait_for(60, || std::fs::read_to_string(dir.join("state/HALT")).is_ok_and(|h| h.trim() == want));
+    let at_halt = sends();
+    // several more steps (poll_secs = 1): nothing more is sent
+    std::thread::sleep(Duration::from_secs(5));
+    let after = sends();
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(halted, "{before:?}: log:\n{log}");
+    assert_eq!((at_halt, after), (3, 3), "{before:?}: three reverted sends, then none; log:\n{log}");
+    let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
+}
