@@ -121,6 +121,22 @@ fn advance_call_data_matches_cast() {
     assert_eq!(k(&finalize_slow(&cp())), "0xf2a3c894156694d2f40fcd4d3f7719925658c84554d5ced2c0e947cceb928c7c");
 }
 
+/// N2 / A5-22: `claimDepositDirect`. Vectors `cast sig` / `cast calldata … ; cast keccak` (foundry 1.4.4),
+/// 2026-11-05: anchor (129, 0x44…, 0x55…), anchor root 0x66…, the branch 32 × 0x99…, recipient …a1, 7 JTM,
+/// txid 0x77…, proof 32 × 0x01; and `depositClaimValues` (`cast abi-encode` of its six words).
+#[test]
+fn claim_deposit_direct_matches_cast() {
+    let mut recipient = [0u8; 20];
+    recipient[19] = 0xa1;
+    let data = claim_deposit_direct(129, &rep(0x44), &rep(0x55), &rep(0x66), &[rep(0x99); 32], &recipient, 7_000_000, &rep(0x77), &rep(0x01));
+    assert_eq!(data[..4], [0x62, 0x3d, 0x24, 0x0d]);
+    assert_eq!(data.len(), 1348);
+    assert_eq!(k(&data), "0xcd61b93f9092d28091b3d8fb780bd9c5e941a6b724cf187dbd42dcd2a3f70eca");
+    let pv = crate::relayer::deposit_claim_values(129, &rep(0x55), &recipient, 7_000_000, &rep(0x77));
+    assert_eq!(pv.len(), 192);
+    assert_eq!(k(&pv), "0x58c721d42847043220497d902b64ef159e8d4abc9440de37a5bcdae96d7556d4");
+}
+
 #[test]
 fn advance_event_topics_are_the_interfaces() {
     let t = |sig: &str| format!("0x{}", hex::encode(keccak256(sig.as_bytes())));

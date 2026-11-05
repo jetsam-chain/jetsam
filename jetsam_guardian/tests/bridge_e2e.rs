@@ -14,6 +14,9 @@
 //! Audit A5 on the real contract: a third party's point on the relayer's own chain from the genesis (one
 //! block more) is refused (`MustExtendTip`) and the finality clock does not move (A5-4); the third deposit,
 //! advanced just before the relayer's claim, repays only what was paid and its recipient gets 100 % (A5-1).
+//! Re-audit N2 / A5-22: a deposit of a block that no root of the branch holds (a block left out) is minted by
+//! `claimDepositDirect` (`l1::claim_deposit_direct`, the anchor branch `relayer::anchor_branch` of the final
+//! point's anchor root, the 192 bytes `relayer::deposit_claim_values`, the TEST mock claim proof), once.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -111,7 +114,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
         [(30, vec![dep(30, 0xa1, 7 * JTM, &chain)]), (31, vec![dep(31, 0xa2, 400 * JTM, &chain)]), (33, vec![dep(33, 0xa3, 3 * JTM, &chain)])].into();
 
     // the relayer's point: the honest child of the genesis, simulated proof
-    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false })]);
+    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: r.block_timestamp, headers: Known::context_from(&gcp, &chain), ours: false, omitted: Some(Vec::new()) })]);
     let tip_block = word(&view(&l1, &bridge, "tipBlockId()", &[]), 0);
     assert_eq!(tip_block, gcp.tip_block_id, "the genesis's block");
     let tip_locked = word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0);
@@ -123,7 +126,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let r = relay.send(&l1, &bridge, &l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &mock_proof(&pv)), "submitCheckpoint").unwrap();
     assert!(r.status, "submitCheckpoint");
     let cid = s.next.id();
-    known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true });
+    known.insert(cid, Known { cp: s.next, parent: gid, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &chain), ours: true, omitted: Some(s.omitted.clone()) });
     assert_eq!(word(&view(&l1, &bridge, "tip()", &[]), 0), cid);
     assert_eq!(word(&view(&l1, &bridge, "tipBlockId()", &[]), 0), s.next.tip_block_id);
     assert_eq!(word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0), s.next.locked_block_id);
@@ -208,7 +211,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     assert_eq!(balance(&l1, &token, &d3f.recipient), paid3);
     // the relayer claims what is left: the third deposit, its advance younger than 2 h
     let minted = |t: &[u8; 32]| word(&view(&l1, &bridge, "isMinted(bytes32)", &[*t]), 0)[31] == 1;
-    let claims = relayer::claims_of(&known[&cid].cp, &found, GL, &minted).unwrap();
+    let claims = relayer::claims_of(&known[&cid], &found, GL, &minted).unwrap();
     assert_eq!(claims.len(), 1, "the robot's two are minted already");
     let (d3, branch) = claims[0];
     let r = relay.send(&l1, &bridge, &l1::claim_deposit(&d3, &known[&cid].cp.deposit_root, &branch), "claimDeposit").unwrap();
@@ -220,7 +223,30 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
         let a = view(&l1, &bridge, "advanceOf(bytes32)", &[jetsam_guardian::fill::advance_key(&d.txid, &d.recipient, d.amount)]);
         assert_eq!(word(&a, 2)[31], 2, "REPAID");
     }
-    assert!(relayer::claims_of(&known[&cid].cp, &found, GL, &minted).unwrap().is_empty());
+    assert!(relayer::claims_of(&known[&cid], &found, GL, &minted).unwrap().is_empty());
+
+    // N2 / A5-22: a deposit of block 34 that no root holds (a block left out), minted by claimDepositDirect
+    // under the final point's anchor root (L 52), with the claim program's (TEST mock) proof
+    let mut rcpt4 = [0u8; 20];
+    rcpt4[19] = 0xa4;
+    let (h4, amount4, txid4) = (34u64, 5 * JTM, [0x34u8; 32]);
+    let tx_root4 = chain.header_at(h4).unwrap().tx_root;
+    let (root, branch) = relayer::anchor_branch(&chain, GL, 52, h4).unwrap();
+    assert_eq!(root, known[&cid].cp.anchor_root, "the final point's anchor root, rebuilt from the relayer's chain");
+    assert_eq!(word(&view(&l1, &bridge, "isFinalAnchorRoot(bytes32)", &[root]), 0)[31], 1);
+    let pv4 = relayer::deposit_claim_values(h4, &tx_root4, &rcpt4, amount4, &txid4);
+    let direct = l1::claim_deposit_direct(h4, &chain.id_at(h4).unwrap(), &tx_root4, &root, &branch, &rcpt4, amount4, &txid4, &mock_proof(&pv4));
+    let r = relay.send(&l1, &bridge, &direct, "claimDepositDirect").unwrap();
+    assert!(r.status, "claimDepositDirect");
+    eprintln!("claimDepositDirect gas {}", r.gas_used);
+    assert_eq!(balance(&l1, &token, &rcpt4), amount4);
+    assert!(minted(&txid4));
+    // once: the same claim again is refused (AlreadyMinted; anvil renders its bytes32 argument as text)
+    assert!(relay.send(&l1, &bridge, &direct, "claimDepositDirect").is_err(), "one mint per txid");
+    assert_eq!(balance(&l1, &token, &rcpt4), amount4);
+    // a proof of other public values (another amount) is refused
+    let lie = l1::claim_deposit_direct(h4, &chain.id_at(h4).unwrap(), &tx_root4, &root, &branch, &rcpt4, amount4 + 1, &[0x35u8; 32], &mock_proof(&pv4));
+    assert!(relay.send(&l1, &bridge, &lie, "claimDepositDirect").is_err(), "InvalidProof");
 }
 
 /// The synthetic chain the `jg-relay` bench's fake nodes serve (`E2E_WRITE_CHAIN=<file>`): 60 blocks, the

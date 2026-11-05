@@ -53,7 +53,7 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     assert_eq!((found[&129][0].amount, found[&129].len()), (7_000_000, 1), "the 7 JTM deposit at 129, read by the node's rule");
     let gcp = genesis_checkpoint(GL, full.id_at(GL).unwrap(), u256::to_be(&full.work_at(GL).unwrap()), full.headers_digest(GL).unwrap());
     let gid = gcp.id();
-    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false })]);
+    let mut known = HashMap::from([(gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()) })]);
     // a first point on the chain as it stood at 142 (the JGFILL relayer's point with the deposit: T 142, L 133)
     let mut c135 = full.clone();
     c135.truncate_above(142);
@@ -64,7 +64,7 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     assert_eq!(r1.deposit_blocks.len(), 1, "the whole block of the deposit");
     relayer::check_native(&r1).unwrap();
     // the point that extends it, on the chain at 144
-    known.insert(s1.next.id(), Known { cp: s1.next, parent: gid, accepted_at: 1, headers: Known::context_from(&s1.next, &c135), ours: true });
+    known.insert(s1.next.id(), Known { cp: s1.next, parent: gid, accepted_at: 1, headers: Known::context_from(&s1.next, &c135), ours: true, omitted: Some(s1.omitted.clone()) });
     let s2 = relayer::plan_submission(&full, &known, &s1.next.id(), &s1.next.cum_work, &s1.next.tip_block_id, &s1.next.locked_block_id, GL, &found, &ar.missing(), at(&full)).unwrap();
     assert_eq!((s2.parent, s2.next.height, s2.next.locked_height, s2.fork_depth), (s1.next.id(), 144, 136, 0));
     let r2 = ProofRequest::build(&s2, &known[&s1.next.id()], &full, &ar, GL, GL + 1, 32).unwrap();
@@ -93,4 +93,67 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     short.headers.drain(..drop);
     short.headers_from = 96;
     assert!(relayer::check_native(&short).unwrap_err().to_string().contains("needs 95"), "a context that starts too high");
+}
+
+/// N2 and A5-22 on the REAL rehearsal chain: a third party's point A on the bridge genesis (T 142, L 133) leaves
+/// the deposit block 129 out, a valid transition. The relayer rebuilds A's tree (129 left out), extends A — the
+/// checkpoint program natively accepts the extension on A's rebuilt frontier —, names the 7 JTM deposit as the
+/// one only `claimDepositDirect` mints, and the deposit-claim program natively commits exactly the relayer's
+/// 192 bytes for it (the whole block 129, its group), under A's anchor root.
+#[test]
+fn n2_a_point_that_leaves_the_rehearsal_deposit_out_is_extended_and_the_deposit_claimed_directly() {
+    let (full, v) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let ar = archive_of(&full, &v, dir.path());
+    let found = ar.found();
+    let gcp = genesis_checkpoint(GL, full.id_at(GL).unwrap(), u256::to_be(&full.work_at(GL).unwrap()), full.headers_digest(GL).unwrap());
+    let gid = gcp.id();
+    let mut c142 = full.clone();
+    c142.truncate_above(142);
+    // A: the honest point at 142 without the block 129
+    let a = relayer::honest(&c142, GL, 142, &relayer::tree_of(&found, GL, 133, &[129]).0).unwrap();
+    assert_eq!((a.locked_height, a.deposit_count), (133, 0));
+    let mut known = HashMap::from([
+        (gid, Known { cp: gcp, parent: [0u8; 32], accepted_at: 0, headers: Known::context_from(&gcp, &full), ours: false, omitted: Some(Vec::new()) }),
+        (a.id(), Known { cp: a, parent: gid, accepted_at: 1, headers: Known::context_from(&a, &c142), ours: false, omitted: None }),
+    ]);
+    assert_eq!(relayer::resolve_trees(&mut known, &found, GL), vec![(a.id(), vec![129])]);
+    let at = |c: &Chain| c.header_at(c.tip_height()).unwrap().timestamp + 60;
+    let s = relayer::plan_submission(&full, &known, &a.id(), &a.cum_work, &a.tip_block_id, &a.locked_block_id, GL, &found, &ar.missing(), at(&full)).unwrap();
+    assert_eq!((s.parent, s.fork_depth, s.next.locked_height, s.next.deposit_count, s.omitted.clone()), (a.id(), 0, 136, 0, vec![129]));
+    let req = ProofRequest::build(&s, &known[&a.id()], &full, &ar, GL, GL + 1, 32).unwrap();
+    assert!(req.deposit_blocks.is_empty(), "the window ]133 ; 136] holds no deposit");
+    relayer::check_native(&req).unwrap();
+    // the 7 JTM deposit: in no root of A's branch, minted by claimDepositDirect only
+    let direct = relayer::direct_claims_needed(&known[&a.id()], &found, GL, &|_| false);
+    assert_eq!(direct.len(), 1);
+    let d = direct[0];
+    assert_eq!((d.height, d.amount), (129, 7_000_000));
+    let claim = relayer::ClaimRequest::build(&ar, 129, &d.txid).unwrap();
+    relayer::check_claim_native(&claim).unwrap();
+    assert_eq!(claim.tx_root, full.header_at(129).unwrap().tx_root);
+    assert_eq!(claim.public_values, relayer::deposit_claim_values(129, &claim.tx_root, &d.recipient, d.amount, &d.txid));
+    let (root, branch) = relayer::anchor_branch(&full, GL, a.locked_height, 129).unwrap();
+    assert_eq!(root, a.anchor_root, "A's anchor root holds every block of its window, the one left out included");
+    let leaf = jetsam_chain::consensus::guardian::anchor_leaf_hash(129, &full.id_at(129).unwrap(), &claim.tx_root);
+    let mut n = leaf;
+    let mut index = 129 - GL - 1;
+    for b in branch.iter() {
+        let mut pre = [0u8; 64];
+        if index & 1 == 1 {
+            pre[..32].copy_from_slice(b);
+            pre[32..].copy_from_slice(&n);
+        } else {
+            pre[..32].copy_from_slice(&n);
+            pre[32..].copy_from_slice(b);
+        }
+        n = jetsam_guardian::keccak256(&pre);
+        index >>= 1;
+    }
+    assert_eq!(n, root, "the anchor branch of 129");
+    // a claim of another group, or of another block, is refused by the program
+    let mut other = claim.clone();
+    other.input[48] ^= 1; // JCLMIN03: magic 8 | height 8 | tx_root 32 | group u32 at 48
+    assert!(relayer::check_claim_native(&other).is_err(), "another group");
+    assert!(relayer::ClaimRequest::build(&ar, 130, &d.txid).is_err(), "no such deposit in 130");
 }

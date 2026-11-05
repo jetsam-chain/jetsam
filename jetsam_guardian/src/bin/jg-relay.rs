@@ -18,14 +18,20 @@
 //!   `[prover]` against the contract's current tip, its block and its locked block (A5-4, N1: a proof made
 //!   against a former tip is void), only
 //!   when `min_nodes` nodes have its tip and its locked block;
+//! * every point's deposit tree rebuilt (N2 of the re-audit A5: a submitter may leave whole deposit blocks
+//!   out; the relayer finds which and extends such a point when it is the tip), an ALERT for each block left
+//!   out, and before finalizing a point that leaves blocks out;
 //! * `finalizeSlow` of the highest point stable for 24 h; `claimDeposit` of every unminted deposit of the
 //!   final root (a mint, or the repayment of its advance), and `<publish_dir>/final.json` (what a claimer,
-//!   the advance robot first, needs to claim by itself);
+//!   the advance robot first, needs to claim by itself); an ALERT naming every deposit under the final point
+//!   that no root of its branch holds (claimable only by `claimDepositDirect`);
+//! * the operator's queued `claim-direct` requests (A5-22): the claim program's proof (`[prover]
+//!   claim_command`) and `claimDepositDirect` against the final anchor root;
 //! * its own transactions signed by its hot key (`[signer]`), written ahead before they leave the host.
 //!
 //! Egress (A4-1, D60, D66): nodes and L1 through Tor or on the loopback only (the private rehearsal's
 //! clearnet: its bridge only). Operator commands: `acknowledge <height> <reason>`, `import-block <height>
-//! <file>`, `print-genesis <locked height>`.
+//! <file>`, `print-genesis <locked height>`, `claim-direct <height> <txid>` (queued for the running relayer).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -111,6 +117,12 @@ struct State {
     /// A5-5: a `WorkRateTooLow` refusal (planned or reverted) since the last accepted point.
     #[serde(default)]
     work_rate_refused: bool,
+    /// N2: the points whose unknown tree was alerted (once each).
+    #[serde(default)]
+    tree_unknown_alerted: HashSet<String>,
+    /// N2: the final point whose deposits left out of every root were last alerted.
+    #[serde(default)]
+    direct_alerted: String,
 }
 
 struct Relay {
@@ -250,9 +262,11 @@ impl Relay {
         }
     }
 
-    /// `CheckpointAccepted` since the last read: every checkpoint anyone submitted, its id recomputed.
+    /// `CheckpointAccepted` since the last read: every checkpoint anyone submitted, its id recomputed; up to
+    /// `l1_confirmations` blocks below the L1's latest (A5-9: a short L1 reorganization never makes the relayer
+    /// learn a point that is gone).
     fn learn(&mut self) -> anyhow::Result<()> {
-        let latest = l1::hex_u64(&self.l1.rpc("eth_blockNumber", json!([]))?)?;
+        let latest = l1::hex_u64(&self.l1.rpc("eth_blockNumber", json!([]))?)?.saturating_sub(self.cfg.l1_confirmations()?);
         let mut from = self.state.logs_to.max(self.cfg.l1_from_block.saturating_sub(1)) + 1;
         if self.state.logs_to == 0 {
             from = self.cfg.l1_from_block;
@@ -280,7 +294,7 @@ impl Relay {
                     continue;
                 }
                 let node = self.view("nodeOf(bytes32)", &id)?;
-                let k = Known { cp, parent: prev, accepted_at: word_u64(&node, 3), headers: Known::context_from(&cp, &self.chain), ours: false };
+                let k = Known { cp, parent: prev, accepted_at: word_u64(&node, 3), headers: Known::context_from(&cp, &self.chain), ours: false, omitted: None };
                 log(&format!("learned checkpoint {} L={} T={} (another submitter's, context {})", hex::encode(id), cp.locked_height, cp.height, if k.headers.is_empty() { "off this chain" } else { "on this chain" }));
                 self.event(json!({"event": "checkpoint_learned", "id": hex::encode(id), "parent": hex::encode(prev), "locked_height": cp.locked_height, "height": cp.height, "on_chain": !k.headers.is_empty()}));
                 self.state.known.insert(hex::encode(id), k);
@@ -293,6 +307,32 @@ impl Relay {
 
     fn known(&self) -> HashMap<[u8; 32], Known> {
         self.state.known.iter().filter_map(|(id, k)| parse32(id).ok().map(|i| (i, k.clone()))).collect()
+    }
+
+    /// N2: the deposit tree of every point not rebuilt yet (which of this relayer's deposit blocks it left
+    /// out); an ALERT for each block left out, and once for each point whose tree cannot be rebuilt.
+    fn resolve_trees(&mut self, gl: u64) {
+        let found = self.archive.found();
+        let mut known = self.known();
+        for (id, own) in relayer::resolve_trees(&mut known, &found, gl) {
+            let txids: Vec<String> = own.iter().flat_map(|h| found.get(h).into_iter().flatten().map(move |d| format!("{h}:0x{}", hex::encode(d.txid)))).collect();
+            log(&format!(
+                "ALERT POINT_LEAVES_DEPOSITS_OUT {} leaves the deposit blocks {own:?} out ({}): no root of its branch will hold them, claimDepositDirect only (claim-direct)",
+                hex::encode(id),
+                txids.join(", ")
+            ));
+            self.event(json!({"event": "point_leaves_deposits_out", "id": hex::encode(id), "heights": own, "deposits": txids}));
+        }
+        for (id, k) in known {
+            let hid = hex::encode(id);
+            if k.omitted.is_none() && self.state.tree_unknown_alerted.insert(hid.clone()) {
+                log(&format!("ALERT POINT_TREE_UNKNOWN {hid} (L={}, {} deposits): its deposit tree is not one this relayer rebuilds from its blocks", k.cp.locked_height, k.cp.deposit_count));
+                self.event(json!({"event": "point_tree_unknown", "id": hid, "locked_height": k.cp.locked_height, "deposit_count": k.cp.deposit_count}));
+            }
+            if let Some(e) = self.state.known.get_mut(&hid) {
+                e.omitted = k.omitted;
+            }
+        }
     }
 
     /// `min_nodes` nodes have block `id` at `h` and none another one there.
@@ -317,7 +357,7 @@ impl Relay {
         agree >= self.cfg.min_nodes
     }
 
-    fn finalize(&mut self, final_locked: u64, last_switch: u64, l1_now: u64) -> anyhow::Result<()> {
+    fn finalize(&mut self, fin_id: &[u8; 32], final_locked: u64, last_switch: u64, l1_now: u64) -> anyhow::Result<()> {
         let known = self.known();
         let mut canonical = HashSet::new();
         for (id, k) in &known {
@@ -331,6 +371,12 @@ impl Relay {
                 // its locked block is not on this chain: never finalized by this relayer
                 log(&format!("ALERT FINALIZABLE_POINT_OFF_THIS_CHAIN {} (L={}): not finalized here", hex::encode(id), k.cp.locked_height));
                 continue;
+            }
+            // N2: a point that leaves deposit blocks out is finalized all the same (they are in no root of its
+            // branch for ever; refusing would hold every other deposit), never in silence
+            if let Some(why) = relayer::finalize_alert(k, known.get(fin_id)) {
+                log(&format!("ALERT FINALIZING_POINT_NOT_COMPLETE {} (L={}): {why}", hex::encode(id), k.cp.locked_height));
+                self.event(json!({"event": "finalize_point_not_complete", "id": hex::encode(id), "locked_height": k.cp.locked_height, "why": why}));
             }
             match self.tx.send(&self.l1, &self.bridge, &l1::finalize_slow(&k.cp), "finalizeSlow") {
                 Ok(r) => {
@@ -349,10 +395,10 @@ impl Relay {
     fn claim(&mut self, fin_id: &[u8; 32], gl: u64) -> anyhow::Result<()> {
         let Some(fin) = self.state.known.get(&hex::encode(fin_id)).cloned() else { return Ok(()) };
         let found = self.archive.found();
-        let deps = relayer::deposits_upto(&found, gl, fin.cp.locked_height);
+        // N2: the final point's tree (the blocks it or an ancestor left out excluded)
+        let (deps, heights) = relayer::tree_of(&found, gl, fin.cp.locked_height, fin.omitted.as_deref().unwrap_or(&[]));
         let hex_id = hex::encode(fin_id);
         if self.state.published_final != hex_id {
-            let heights: Vec<u64> = found.range(gl + 1..=fin.cp.locked_height).flat_map(|(h, ds)| ds.iter().map(move |_| *h)).collect();
             let v = relayer::published_final(fin_id, &fin.cp, &deps, &heights);
             if relayer::read_published_final(&v).is_ok() {
                 std::fs::create_dir_all(&self.cfg.publish_dir)?;
@@ -364,7 +410,18 @@ impl Relay {
             }
         }
         let minted = self.state.minted.clone();
-        let claims = match relayer::claims_of(&fin.cp, &found, gl, &|t| minted.contains(&hex::encode(t))) {
+        let direct = relayer::direct_claims_needed(&fin, &found, gl, &|t| minted.contains(&hex::encode(t)));
+        if !direct.is_empty() && self.state.direct_alerted != hex_id {
+            let cmds: Vec<String> = direct.iter().map(|d| format!("claim-direct {} 0x{}", d.height, hex::encode(d.txid))).collect();
+            log(&format!(
+                "ALERT DEPOSITS_IN_NO_FINAL_ROOT {} deposits under the final point {hex_id} are in no root of its branch: mint them with jg-relay --config <relay.toml> {}",
+                direct.len(),
+                cmds.join(" ; ")
+            ));
+            self.event(json!({"event": "deposits_in_no_final_root", "final": hex_id, "commands": cmds}));
+            self.state.direct_alerted = hex_id.clone();
+        }
+        let claims = match relayer::claims_of(&fin, &found, gl, &|t| minted.contains(&hex::encode(t))) {
             Ok(c) => c,
             Err(e) => {
                 log(&format!("ALERT FINAL_ROOT_NOT_OURS: {e}"));
@@ -396,6 +453,82 @@ impl Relay {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// N2 / A5-22: the oldest queued `claim-direct` request (one per step: a claim proof each): minted by
+    /// `claimDepositDirect` against the final point's anchor root, with the claim program's proof; a request
+    /// waits (logged) while its block is not under a final anchor root of this chain or no claim prover answers.
+    fn claim_direct(&mut self, gl: u64) -> anyhow::Result<()> {
+        let queue = self.cfg.state_dir.join("claim-direct");
+        let Some((path, h, txid)) = relayer::claim_requests(&queue)?.into_iter().next() else { return Ok(()) };
+        let tx = format!("0x{}", hex::encode(txid));
+        if word(&self.view("isMinted(bytes32)", &txid)?, 0)[31] == 1 {
+            self.state.minted.insert(hex::encode(txid));
+            relayer::close_claim_request(&path, &json!({"outcome": "already minted", "height": h, "txid": tx}))?;
+            log(&format!("claim-direct {h} {tx}: already minted"));
+            return Ok(());
+        }
+        let fin_id = word(&self.view("finalId()", &[])?, 0);
+        let Some(fin) = self.state.known.get(&hex::encode(fin_id)).cloned() else {
+            log(&format!("claim-direct {h} {tx} waits: the final point is not known yet"));
+            return Ok(());
+        };
+        let archived = match self.archive.index.get(&h) {
+            Some(relayer::Body::Read { block_id, .. }) => *block_id,
+            other => {
+                relayer::close_claim_request(&path, &json!({"outcome": "refused", "why": format!("no archived body at {h}: {other:?}")}))?;
+                log(&format!("ALERT claim-direct {h} {tx} refused: no archived body"));
+                return Ok(());
+            }
+        };
+        if h > fin.cp.locked_height || self.chain.id_at(h) != Some(archived) {
+            log(&format!("claim-direct {h} {tx} waits: block {h} is not under the final point (L={}) of this chain", fin.cp.locked_height));
+            return Ok(());
+        }
+        let Some((root, branch)) = relayer::anchor_branch(&self.chain, gl, fin.cp.locked_height, h) else {
+            log(&format!("claim-direct {h} {tx} waits: no anchor branch on this chain"));
+            return Ok(());
+        };
+        if root != fin.cp.anchor_root || word(&self.view("isFinalAnchorRoot(bytes32)", &root)?, 0)[31] != 1 {
+            log(&format!("ALERT claim-direct {h} {tx} waits: this chain does not rebuild the final anchor root"));
+            return Ok(());
+        }
+        let req = match relayer::ClaimRequest::build(&self.archive, h, &txid) {
+            Ok(r) => r,
+            Err(e) => {
+                relayer::close_claim_request(&path, &json!({"outcome": "refused", "why": format!("{e:#}")}))?;
+                log(&format!("ALERT claim-direct {h} {tx} refused: {e:#}"));
+                return Ok(());
+            }
+        };
+        if self.cfg.prover.native_check {
+            if let Err(e) = relayer::check_claim_native(&req) {
+                relayer::close_claim_request(&path, &json!({"outcome": "refused", "why": format!("{e:#}")}))?;
+                log(&format!("ALERT claim-direct {h} {tx} refused: {e:#}"));
+                return Ok(());
+            }
+        }
+        let proof = match self.prover.prove_claim(&req) {
+            Ok(p) => p,
+            Err(e) => {
+                log(&format!("ALERT claim-direct {h} {tx} waits: {e:#}"));
+                return Ok(());
+            }
+        };
+        let d = req.deposit;
+        let data = l1::claim_deposit_direct(h, &archived, &req.tx_root, &root, &branch, &d.recipient, d.amount, &d.txid, &proof);
+        match self.tx.send(&self.l1, &self.bridge, &data, "claimDepositDirect") {
+            Ok(r) => {
+                log(&format!("claimDepositDirect {h} {tx} {} µJTM status {} gas {}", d.amount, r.status, r.gas_used));
+                self.event(json!({"event": "claimDepositDirect", "height": h, "txid": tx, "amount": d.amount, "status": r.status, "gas": r.gas_used, "l1_tx": r.tx_hash}));
+                if r.status {
+                    self.state.minted.insert(hex::encode(txid));
+                    relayer::close_claim_request(&path, &json!({"outcome": "minted", "height": h, "txid": tx, "l1_tx": r.tx_hash}))?;
+                }
+            }
+            Err(e) => log(&format!("claimDepositDirect {h} {tx}: {} (waits)", reason_name(&format!("{e:#}")))),
         }
         Ok(())
     }
@@ -459,7 +592,7 @@ impl Relay {
         self.event(json!({"event": "submitCheckpoint", "id": hex::encode(id), "parent": hex::encode(s.parent), "height": s.next.height, "locked_height": s.next.locked_height,
                           "fork_depth": s.fork_depth, "deposit_count": s.next.deposit_count, "status": r.status, "gas": r.gas_used, "l1_tx": r.tx_hash, "l1_ts": r.block_timestamp, "proof_secs": proving}));
         if r.status {
-            let k = Known { cp: s.next, parent: s.parent, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &self.chain), ours: true };
+            let k = Known { cp: s.next, parent: s.parent, accepted_at: r.block_timestamp, headers: Known::context_from(&s.next, &self.chain), ours: true, omitted: Some(s.omitted.clone()) };
             self.state.known.insert(hex::encode(id), k);
             self.state.work_rate_refused = false;
         }
@@ -477,6 +610,7 @@ impl Relay {
         self.learn()?;
         let anchor_base = word_u64(&self.view("anchorBase()", &[])?, 0);
         let gl = anchor_base - 1;
+        self.resolve_trees(gl);
         let t = self.view("tip()", &[])?;
         let (tip_id, tip_height, tip_cum_work) = (word(&t, 0), word_u64(&t, 1), word(&t, 2));
         let tip_block = word(&self.view("tipBlockId()", &[])?, 0);
@@ -490,9 +624,10 @@ impl Relay {
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
         let l1_now = self.l1.next_time()?;
         let final_locked = self.state.known.get(&hex::encode(fin)).map_or(gl, |k| k.cp.locked_height);
-        self.finalize(final_locked, last_switch, l1_now)?;
+        self.finalize(&fin, final_locked, last_switch, l1_now)?;
         let fin = word(&self.view("finalId()", &[])?, 0);
         self.claim(&fin, gl)?;
+        self.claim_direct(gl)?;
         let tip_accepted = self.state.known.get(&hex::encode(tip_id)).map(|k| k.accepted_at);
         let due = checkpoint_due(tip_accepted.map(|a| a.saturating_sub(self.cfg.prove_ahead())), l1_now, self.cfg.cadence_secs);
         // A5-5: the fast cadence, measured against the target of the tip's block on this chain
@@ -524,7 +659,8 @@ fn config(args: &[String]) -> anyhow::Result<(RelayConfig, String)> {
     Ok((cfg, hex::encode(digest)))
 }
 
-/// Operator commands (D41): they change the archive only, never the L1.
+/// Operator commands (D41): they change the archive or the request queue only, never the L1 (the running
+/// relayer, the only process signing with its key, sends what is queued).
 fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
     let mut archive = Archive::open(&cfg.state_dir.join("archive"))?;
     match cmd.first().map(String::as_str) {
@@ -558,7 +694,16 @@ fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
             let cp = genesis_checkpoint(l, chain.id_at(l).unwrap_or_default(), u256::to_be(&chain.work_at(l).unwrap_or_default()), chain.headers_digest(l).ok_or_else(|| anyhow::anyhow!("L ≥ 7"))?);
             println!("{}", json!({"checkpoint": cp, "checkpoint_id": hex0x(&cp.id()), "calldata": hex0x(&l1::init_genesis_by_key(&cp))}));
         }
-        other => anyhow::bail!("unknown command {other:?}: acknowledge | import-block | print-genesis"),
+        Some("claim-direct") => {
+            // N2 / A5-22: a deposit no final root of the branch holds, minted by claimDepositDirect
+            let usage = || anyhow::anyhow!("claim-direct <height> <txid>");
+            let h: u64 = cmd.get(1).ok_or_else(usage)?.parse()?;
+            let txid = parse32(cmd.get(2).ok_or_else(usage)?)?;
+            let req = relayer::ClaimRequest::build(&archive, h, &txid)?;
+            let path = relayer::queue_claim_request(&cfg.state_dir.join("claim-direct"), h, &txid)?;
+            println!("queued {} ({} µJTM to 0x{}): the running jg-relay proves and sends it once block {h} is under a final anchor root", path.display(), req.deposit.amount, hex::encode(req.deposit.recipient));
+        }
+        other => anyhow::bail!("unknown command {other:?}: acknowledge | import-block | print-genesis | claim-direct"),
     }
     Ok(())
 }
@@ -616,6 +761,7 @@ fn run() -> anyhow::Result<()> {
         "mock" => Box::new(MockProver),
         _ => Box::new(CommandProver {
             argv: cfg.prover.command.clone(),
+            claim_argv: cfg.prover.claim_command.clone(),
             work_dir: cfg.state_dir.join("proofs"),
             timeout: Duration::from_secs(cfg.prover.timeout_secs),
             encode: relayer::program_input,

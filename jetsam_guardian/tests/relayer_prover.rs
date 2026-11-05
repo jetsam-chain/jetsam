@@ -59,7 +59,7 @@ fn script(dir: &Path, name: &str, body: &str) -> String {
 }
 
 fn prover(dir: &Path, cmd: String, timeout: Duration) -> CommandProver {
-    CommandProver { argv: vec![cmd, "{input}".into(), "{proof}".into(), "{public_values}".into()], work_dir: dir.join("work"), timeout, encode }
+    CommandProver { argv: vec![cmd, "{input}".into(), "{proof}".into(), "{public_values}".into()], claim_argv: Vec::new(), work_dir: dir.join("work"), timeout, encode }
 }
 
 #[test]

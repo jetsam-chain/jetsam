@@ -118,6 +118,30 @@ pub fn claim_deposit(d: &Deposit, deposit_root: &[u8; 32], branch: &[[u8; 32]; 3
     encode_call("claimDeposit((uint64,address,uint64,bytes32),bytes32,bytes32[32])", &[Arg::Words(words)])
 }
 
+/// N2 / A5-22: `claimDepositDirect(anchor (height, blockId, txRoot), anchorRoot, anchorBranch, (recipient,
+/// amount, txid), proof)`: the mint of a vault deposit of a block anchored by a final point, with a proof of
+/// the deposit-claim program.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_deposit_direct(
+    height: u64,
+    block_id: &[u8; 32],
+    tx_root: &[u8; 32],
+    anchor_root: &[u8; 32],
+    anchor_branch: &[[u8; 32]; 32],
+    recipient: &[u8; 20],
+    amount: u64,
+    txid: &[u8; 32],
+    proof: &[u8],
+) -> Vec<u8> {
+    let mut words = vec![w(height), *block_id, *tx_root, *anchor_root];
+    words.extend_from_slice(anchor_branch);
+    words.extend_from_slice(&[address_word(recipient), w(amount), *txid]);
+    encode_call(
+        "claimDepositDirect((uint64,bytes32,bytes32),bytes32,bytes32[32],(address,uint64,bytes32),bytes)",
+        &[Arg::Words(words), Arg::Bytes(proof)],
+    )
+}
+
 pub fn prove_equivocation(body: &[u8], hints: &[u8]) -> Vec<u8> {
     encode_call("proveEquivocation(bytes,bytes)", &[Arg::Bytes(body), Arg::Bytes(hints)])
 }

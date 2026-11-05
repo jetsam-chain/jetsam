@@ -26,12 +26,13 @@ const GL: u64 = 10;
 
 fn genesis_known(c: &Chain) -> ([u8; 32], Known) {
     let cp = genesis_checkpoint(GL, c.id_at(GL).unwrap(), u256::to_be(&c.work_at(GL).unwrap()), c.headers_digest(GL).unwrap());
-    (cp.id(), Known { cp, parent: [0u8; 32], accepted_at: 1, headers: Known::context_from(&cp, c), ours: false })
+    (cp.id(), Known { cp, parent: [0u8; 32], accepted_at: 1, headers: Known::context_from(&cp, c), ours: false, omitted: Some(Vec::new()) })
 }
 
 fn known_at(c: &Chain, t: u64, parent: [u8; 32], deps: &[Deposit], accepted_at: u64) -> ([u8; 32], Known) {
     let cp = honest(c, GL, t, deps).unwrap();
-    (cp.id(), Known { cp, parent, accepted_at, headers: Known::context_from(&cp, c), ours: true })
+    // its tree unknown (`None`): the planner takes it complete, as before N2, unless `resolve_trees` rebuilt it
+    (cp.id(), Known { cp, parent, accepted_at, headers: Known::context_from(&cp, c), ours: true, omitted: None })
 }
 
 /// `c` up to `at`, then `n` blocks of branch `salt`.
@@ -192,7 +193,7 @@ fn a_tip_off_this_chain_or_with_other_roots_is_passed_over_for_its_nearest_good_
     // another relayer's child of A on a branch that left this chain at 32 (its L, 34, is not on it)
     let cb = fork_of(&c, 32, 10, 9);
     let bcp = honest(&cb, GL, 42, &[]).unwrap();
-    let b = Known { cp: bcp, parent: aid, accepted_at: 200, headers: Known::context_from(&bcp, &c), ours: false };
+    let b = Known { cp: bcp, parent: aid, accepted_at: 200, headers: Known::context_from(&bcp, &c), ours: false, omitted: None };
     assert!(b.headers.is_empty(), "never on this chain");
     let known = HashMap::from([(gid, g.clone()), (aid, a.clone()), (bcp.id(), b)]);
     let at = ts(&c, 60) + 60;
@@ -239,16 +240,19 @@ fn the_claims_of_a_final_root_are_its_unminted_deposits_with_valid_branches() {
     let (gid, _) = genesis_known(&c);
     let found = found_of(&[dep(20, 1, JTM), dep(20, 2, 2 * JTM), dep(25, 3, 3 * JTM), dep(45, 4, 4 * JTM)]);
     let deps = deposits_upto(&found, GL, 32);
-    let (_, fin) = known_at(&c, 40, gid, &deps, 0);
-    let claims = claims_of(&fin.cp, &found, GL, &|_| false).unwrap();
+    let (_, mut fin) = known_at(&c, 40, gid, &deps, 0);
+    assert!(claims_of(&fin, &found, GL, &|_| false).is_err(), "its tree not rebuilt: no branch from here");
+    fin.omitted = Some(Vec::new());
+    let claims = claims_of(&fin, &found, GL, &|_| false).unwrap();
     assert_eq!(claims.len(), 3);
     for (d, branch) in &claims {
         assert_eq!(root_of(deposit_leaf(d), d.index, branch), fin.cp.deposit_root);
     }
     let first = claims[0].0.jetsam_tx_id;
-    assert_eq!(claims_of(&fin.cp, &found, GL, &|t| *t == first).unwrap().len(), 2, "minted already: no claim");
-    let (_, short) = known_at(&c, 40, gid, &deps[..2], 0);
-    assert!(claims_of(&short.cp, &found, GL, &|_| false).is_err(), "a root without one of our deposits: no branch from here");
+    assert_eq!(claims_of(&fin, &found, GL, &|t| *t == first).unwrap().len(), 2, "minted already: no claim");
+    let (_, mut short) = known_at(&c, 40, gid, &deps[..2], 0);
+    short.omitted = Some(Vec::new());
+    assert!(claims_of(&short, &found, GL, &|_| false).is_err(), "a root without one of our deposits, taken complete: no branch from here");
 }
 
 #[test]
@@ -387,6 +391,25 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}bogus = 1\n"))).is_err(), "unknown field");
 }
 
+/// A5-9: the relayer learns the contract's points 12 L1 blocks below the latest by default, as configured
+/// otherwise, and at the latest on the private rehearsal (its L1 mines on demand); `[prover] claim_command`
+/// is optional (N2: `claim-direct` requests then wait, with an alert).
+#[test]
+fn a5_9_points_are_learned_below_the_l1s_latest() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let c = RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, cmd)).unwrap();
+    assert_eq!((c.l1_confirmations().unwrap(), c.prover.claim_command.len()), (DEFAULT_L1_CONFIRMATIONS, 0));
+    assert_eq!(DEFAULT_L1_CONFIRMATIONS, 12);
+    let c = RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("l1_confirmations = 64\n{cmd}claim_command = [\"/bin/claim\", \"{{input}}\"]\n"))).unwrap();
+    assert_eq!((c.l1_confirmations().unwrap(), c.prover.claim_command.len()), (64, 2));
+    let rehearsal = relay_toml(&hex::encode([0x42u8; 32]), 31_337, bridge, "[prover]\nmode = \"mock\"\n");
+    let c = RelayConfig::parse(&rehearsal).unwrap();
+    assert_eq!(c.profile().unwrap(), crate::Profile::PrivateRehearsal);
+    assert_eq!(c.l1_confirmations().unwrap(), 0);
+}
+
 // ---------------------------------------------------------------- audit A5
 
 /// A5-4: the contract refuses a point that does not extend its tip when the point's branch holds the tip's
@@ -437,7 +460,7 @@ fn n1_an_orphan_on_the_tip_is_left_behind_without_a_switch() {
     let a_cp = honest(&orphan, GL, 41, &[]).unwrap();
     assert_ne!(Some(a_cp.tip_block_id), c.id_at(41));
     assert_eq!(c.id_at(a_cp.locked_height), Some(a_cp.locked_block_id), "A's locked block is an honest block");
-    let a = Known { cp: a_cp, parent: xid, accepted_at: 200, headers: BTreeMap::new(), ours: false };
+    let a = Known { cp: a_cp, parent: xid, accepted_at: 200, headers: BTreeMap::new(), ours: false, omitted: None };
     let known = HashMap::from([(gid, g.clone()), (xid, x.clone()), (a_cp.id(), a.clone())]);
     let s = plan(&c, &known, &a_cp.id(), &a_cp.cum_work, GL, &found, &[], ts(&c, 60) + 60).unwrap();
     assert_eq!((s.parent, s.fork_depth), (xid, 0), "planned on X: A's context is not known here");
@@ -551,4 +574,100 @@ fn a5_7_a_failing_source_never_stops_the_others() {
     // a missing body keeps its reason
     ar2.record_missing(F + 2, &[2u8; 32], "no source");
     assert!(matches!(ar2.index.get(&(F + 2)), Some(Body::Missing { reason, .. }) if reason == "no source"));
+}
+
+/// N2 (re-audit A5): a third party's point A on the genesis, on the relayer's chain, leaves the deposit block
+/// 20 out (a valid proof: whole blocks may be left out, G6). Before the rebuild the relayer is stuck
+/// (MustExtendTip, as at A5FIX). The relayer rebuilds A's tree (block 20 left out), extends A, claims what A's
+/// root holds, alerts before finalizing it and names the deposits only `claimDepositDirect` mints.
+#[test]
+fn n2_a_point_that_leaves_a_block_out_is_rebuilt_extended_and_alerted() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let found = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(20, 3, 3 * JTM), dep(25, 4, 4 * JTM), dep(45, 5, 5 * JTM)]);
+    // A: T 40, L 32; its tree: the deposits of 15 and 25, not the two of block 20
+    let without_20 = tree_of(&found, GL, 32, &[20]).0;
+    assert_eq!(without_20.len(), 2);
+    let (aid, a) = known_at(&c, 40, gid, &without_20, 100);
+    let mut known = HashMap::from([(gid, g.clone()), (aid, Known { ours: false, ..a.clone() })]);
+    let at = ts(&c, 60) + 60;
+    assert_eq!(plan(&c, &known, &aid, &a.cp.cum_work, GL, &found, &[], at), Err(NoSubmission::MustExtendTip));
+    let alerts = resolve_trees(&mut known, &found, GL);
+    assert_eq!(alerts, vec![(aid, vec![20])]);
+    assert_eq!(known[&aid].omitted, Some(vec![20]));
+    assert!(resolve_trees(&mut known, &found, GL).is_empty(), "rebuilt once");
+    // the relayer extends A: A's tree, then every deposit block of ]32 ; L]
+    let s = plan(&c, &known, &aid, &a.cp.cum_work, GL, &found, &[], at).unwrap();
+    assert_eq!((s.parent, s.fork_depth, s.omitted.clone()), (aid, 0, vec![20]));
+    assert_eq!(s.next.locked_height, 52);
+    assert_eq!(s.deposits.iter().map(|d| d.jetsam_tx_id).collect::<Vec<_>>(), vec![found[&15][0].txid, found[&25][0].txid, found[&45][0].txid]);
+    let dir = tempfile::tempdir().unwrap();
+    let archive = Archive::open(dir.path()).unwrap();
+    let req = ProofRequest::build(&s, &known[&aid], &c, &archive, GL, GL + 1, 8).unwrap();
+    assert_eq!(frontier_root(&req.deposit_frontier, a.cp.deposit_count), a.cp.deposit_root, "A's frontier, from its rebuilt tree");
+    // A final: its root's claims, the alert before finalizing it, the deposits of block 20 for claimDepositDirect
+    let fin = known[&aid].clone();
+    let claims = claims_of(&fin, &found, GL, &|_| false).unwrap();
+    assert_eq!(claims.iter().map(|(d, _)| d.jetsam_tx_id).collect::<Vec<_>>(), vec![found[&15][0].txid, found[&25][0].txid]);
+    for (d, branch) in &claims {
+        assert_eq!(root_of(deposit_leaf(d), d.index, branch), a.cp.deposit_root);
+    }
+    let why = finalize_alert(&fin, Some(&known[&gid])).unwrap();
+    assert!(why.contains("[20]") && why.contains("claim-direct"), "{why}");
+    let direct = direct_claims_needed(&fin, &found, GL, &|_| false);
+    assert_eq!(direct.iter().map(|d| d.txid).collect::<Vec<_>>(), vec![found[&20][0].txid, found[&20][1].txid]);
+    assert_eq!(direct_claims_needed(&fin, &found, GL, &|t| *t == found[&20][0].txid).len(), 1, "minted already");
+    // the child that extends A inherits the omission: nothing new to say once A is the final point
+    let child = Known { cp: s.next, parent: aid, accepted_at: 200, headers: BTreeMap::new(), ours: true, omitted: Some(s.omitted.clone()) };
+    assert_eq!(finalize_alert(&child, Some(&fin)), None);
+    assert!(finalize_alert(&child, Some(&known[&gid])).is_some());
+    // a complete point: no alert; a tree not rebuilt: an alert
+    let (_, mut full) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[]).0, 100);
+    assert_eq!(finalize_alert(&full, None).map(|w| w.contains("not one this relayer rebuilds")), Some(true));
+    full.omitted = Some(Vec::new());
+    assert_eq!(finalize_alert(&full, None), None);
+}
+
+/// N2: what the rebuild never guesses: a root that is not of whole blocks of the relayer's chain (one deposit
+/// of block 20 left out), a deposit of a block the relayer never read; and the bound of the search.
+#[test]
+fn n2_a_tree_is_rebuilt_only_from_whole_blocks_of_this_chain() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let found = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(20, 3, 3 * JTM)]);
+    let all = tree_of(&found, GL, 32, &[]).0;
+    let (pid, p) = known_at(&c, 40, gid, &all[..2], 100);
+    let mut ghost = all.clone();
+    ghost.push(Deposit { index: 3, recipient: [9; 20], amount: JTM, jetsam_tx_id: [9; 32] });
+    let (hid, h) = known_at(&c, 40, gid, &ghost, 100);
+    let mut known = HashMap::from([(gid, g), (pid, p), (hid, h)]);
+    assert!(resolve_trees(&mut known, &found, GL).is_empty());
+    assert_eq!((known[&pid].omitted.clone(), known[&hid].omitted.clone()), (None, None));
+    // a window with more deposit blocks than the search takes: unknown; within the bound: found, the smallest set
+    let many: Vec<FoundDeposit> = (0..=MAX_OMISSION_BLOCKS as u64).map(|i| dep(11 + i, i as u8, JTM)).collect();
+    let found = found_of(&many);
+    let cp = honest(&c, GL, 40, &tree_of(&found, GL, 32, &[11]).0).unwrap();
+    assert_eq!(find_omitted(&found, GL, GL, &[], &cp), None, "{} deposit blocks in the window", many.len());
+    let few = found_of(&many[..6]);
+    let cp = honest(&c, GL, 40, &tree_of(&few, GL, 32, &[12, 14]).0).unwrap();
+    assert_eq!(find_omitted(&few, GL, GL, &[], &cp), Some(vec![12, 14]));
+    let cp = honest(&c, GL, 40, &tree_of(&few, GL, 32, &[]).0).unwrap();
+    assert_eq!(find_omitted(&few, GL, GL, &[], &cp), Some(vec![]), "nothing left out");
+}
+
+/// N2 / A5-22: an operator's `claim-direct` is queued for the running relayer (the only signer of its key),
+/// read back oldest height first, closed with its outcome.
+#[test]
+fn n2_claim_direct_requests_are_queued_read_and_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = dir.path().join("claim-direct");
+    assert!(claim_requests(&q).unwrap().is_empty(), "no queue yet");
+    let b = queue_claim_request(&q, 130, &[0xbb; 32]).unwrap();
+    let a = queue_claim_request(&q, 129, &[0xaa; 32]).unwrap();
+    std::fs::write(q.join("note.txt"), "not a request").unwrap();
+    let r = claim_requests(&q).unwrap();
+    assert_eq!(r.iter().map(|(p, h, t)| (p.clone(), *h, *t)).collect::<Vec<_>>(), vec![(a.clone(), 129, [0xaa; 32]), (b.clone(), 130, [0xbb; 32])]);
+    close_claim_request(&a, &serde_json::json!({"outcome": "minted"})).unwrap();
+    assert!(!a.exists() && a.with_extension("done").exists());
+    assert_eq!(claim_requests(&q).unwrap().len(), 1);
 }
