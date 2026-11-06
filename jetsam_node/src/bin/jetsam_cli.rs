@@ -3043,8 +3043,8 @@ fn deposits_line(state: &Value) -> String {
     match state["deposit_heights_unread"].as_u64().unwrap_or(0) {
         0 => format!("{counted} in the last 1024 blocks"),
         unread => format!(
-            "{counted} in the last 1024 blocks ({unread} of them no longer retained by the node: \
-             not counted)"
+            "{counted} in the last 1024 blocks ({unread} of these heights no longer retained by \
+             the node: their deposits not counted)"
         ),
     }
 }
