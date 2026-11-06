@@ -18,6 +18,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jetsam_chain::consensus::identity::TICKER;
 use jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
+use jetsam_chain::consensus::vault::VaultRules;
 
 /// Where the daemon of *this* build listens by default.
 ///
@@ -421,6 +422,13 @@ enum Command {
     #[command(subcommand)]
     Stake(StakeCommand),
 
+    // ---- Bridge (v1.7) --------------------------------------------------------
+    /// The bridge to Base/EVM (v1.7): deposit to the bridge vault for a
+    /// Base/EVM address, and read the bridge's state. Deposits are refused
+    /// while this build carries no v1.7 activation height.
+    #[command(subcommand)]
+    Bridge(BridgeCommand),
+
     // ---- Node control ---------------------------------------------------------
     /// Gracefully stop the Jetsam daemon.
     Stop,
@@ -500,6 +508,63 @@ enum StakeCommand {
         #[arg(value_name = "ENTRY_ID")]
         entry_id: u64,
     },
+}
+
+/// `jetsam-cli bridge …` (v1.7, F4 of the final audit): deposit to the bridge
+/// vault for a Base/EVM address, and read the bridge's state. No graphical
+/// interface yet.
+#[derive(Subcommand)]
+enum BridgeCommand {
+    #[command(
+        about = format!(
+            "Deposit {TICKER} of the active address to the bridge vault, minted on Base/EVM."
+        ),
+        long_about = format!(
+            "Deposit {TICKER} of the active address to the bridge vault for a Base/EVM address.\n\n\
+             The daemon's wallet builds and signs one transaction: the amount to the vault, a \
+             marker naming the Base/EVM address, the change back. The bridge mints the same \
+             amount to that address on Base/EVM: by the slow lane, at the next checkpoint (about \
+             every 1 h 50) then about 24 h; or sooner, less a fee, if an advancer advances it. \
+             Deposits left out beyond 22 a day wait; none is lost.\n\n\
+             A deposit cannot be cancelled. The plan is shown first and nothing is sent until \
+             you type yes (or pass --yes). Refused while this build carries no v1.7 activation \
+             height (never on mainnet before that), until the block after the bridge opening, \
+             and outside the limits of one deposit (see 'jetsam-cli bridge status').\n\n\
+             Examples:\n  \
+             jetsam-cli bridge deposit 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed 25 --dry-run\n  \
+             jetsam-cli bridge deposit 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed 25"
+        )
+    )]
+    Deposit {
+        /// The Base/EVM address that receives the minted coins: 0x and 40
+        /// hexadecimal digits (mixed case must match its checksum). Use an
+        /// address you control.
+        #[arg(value_name = "BASE_EVM_ADDRESS")]
+        recipient: String,
+        #[arg(
+            value_name = "AMOUNT",
+            help = format!(
+                "Amount in {TICKER}, e.g. 25 or 12.5, within the limits of one deposit \
+                 ('jetsam-cli bridge status')."
+            )
+        )]
+        amount: String,
+        /// Explicit fee of the deposit transaction. Omit for the automatic one.
+        #[arg(long, value_name = "AMOUNT")]
+        fee: Option<String>,
+        /// Show the plan only: nothing is built or sent.
+        #[arg(long)]
+        dry_run: bool,
+        /// Send without asking (scripts). Required when there is no terminal
+        /// to type yes in.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// The bridge to Base/EVM as the node sees it (read only): armed or not,
+    /// the block from which deposits are valid, the vault's balance and room,
+    /// the limits of one deposit.
+    Status,
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +661,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Receipt { txhash } => cmd_receipt(&ctx, txhash).await,
         Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
         Command::Stake(command) => cmd_stake(&ctx, command).await,
+        Command::Bridge(command) => cmd_bridge(&ctx, command).await,
         Command::Stop => cmd_stop(&ctx).await,
         Command::BlockTemplate { miner_addr } => cmd_block_template(&ctx, miner_addr).await,
         Command::SubmitBlock {
@@ -2857,6 +2923,407 @@ async fn cmd_stake_payout(ctx: &Ctx<'_>, entry_id: u64) -> anyhow::Result<()> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Bridge (v1.7): deposits for Base/EVM
+// ---------------------------------------------------------------------------
+
+/// A `--fee` above this is refused, as for `send`: a fee is a few thousandths
+/// of one coin, paid to a miner, never recovered.
+const BRIDGE_FEE_SANITY_LIMIT_MICRO: u64 = MICRO_PER_ELD;
+
+/// How long `walletBridgeDeposit` may take: the node's wallet proves the
+/// deposit, seconds on a calm machine, measured over the client's 60 s on a
+/// loaded one (the call was then cut, and the node dropped the deposit).
+const BRIDGE_DEPOSIT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What to say when the deposit call got no answer (any error but a reply of
+/// the node): its outcome is unknown, so it must be checked before a second
+/// deposit is sent.
+fn unknown_outcome_message(error: &anyhow::Error) -> Option<String> {
+    if error.downcast_ref::<RpcCallError>().is_some() {
+        return None;
+    }
+    Some(format!(
+        "No answer from the node to the deposit ({error:#}). Its outcome is unknown: the node may \
+         have submitted it, or dropped it. Check 'jetsam-cli mempool', 'jetsam-cli history' and \
+         'jetsam-cli bridge status' before you deposit again: sending it again could deposit \
+         twice."
+    ))
+}
+
+/// Why this build sends no deposit at all, said before the node is asked
+/// anything: its v1.7 height is not set (the public network and the test
+/// network today). The vault is then an ordinary address whose spend secret
+/// is published.
+fn build_refusal(rules: &VaultRules, is_test_chain: bool) -> Option<String> {
+    if rules.activation_height.is_some() && rules.deposits_from_height.is_some() {
+        return None;
+    }
+    let build = if is_test_chain {
+        "This test-network build"
+    } else {
+        "This mainnet build"
+    };
+    Some(format!(
+        "{build} has no v1.7 activation height (V1_7_ACTIVATION_HEIGHT is None): the bridge is \
+         not armed, and its vault is an ordinary address whose spend secret is published, so \
+         anyone could take coins sent there. Deposits open with the release that arms v1.7."
+    ))
+}
+
+/// Why the node's next block can carry no deposit (its `getVaultState`
+/// reply, judged with this CLI's `rules`), if it cannot: this build not
+/// armed, the node's v1.7 rules not active, an opening `F` other than this
+/// CLI's, or the next block not above `F` yet.
+fn deposits_closed_reason(state: &Value, rules: &VaultRules) -> Option<String> {
+    if let Some(refusal) = build_refusal(rules, jetsam_chain::consensus::identity::IS_TEST_CHAIN) {
+        return Some(refusal);
+    }
+    let (Some(tip), Some(opening)) = (state["tip_height"].as_u64(), rules.deposits_from_height)
+    else {
+        return Some("the node's getVaultState reply has no tip height".to_string());
+    };
+    if state["active"].as_bool() != Some(true) {
+        return Some(format!(
+            "the node's v1.7 rules are not active at its next block (its tip is {tip}): no \
+             deposit is valid yet"
+        ));
+    }
+    let node_opening = state["deposits_from_height"].as_u64();
+    if node_opening != Some(opening) {
+        return Some(format!(
+            "the node and this CLI disagree about the bridge opening (node: {}, this CLI: \
+             {opening}): use the jetsam-cli of the node's release",
+            node_opening.map_or_else(|| "none".to_string(), |f| f.to_string())
+        ));
+    }
+    if tip < opening {
+        let wait = opening - tip;
+        return Some(format!(
+            "deposits are valid from block {} on; the node is at block {tip}: {wait} more block{} \
+             to go",
+            opening + 1,
+            if wait == 1 { "" } else { "s" }
+        ));
+    }
+    None
+}
+
+/// A deposit checked against the node's bridge before it is planned: open in
+/// its next block, within the limits of one deposit (V4, the rule this build
+/// carries) and within the vault's room (V8, as the node reports it). The
+/// next block's height.
+fn deposit_preflight(
+    state: &Value,
+    amount: u64,
+    recipient: &[u8; 20],
+    rules: &VaultRules,
+) -> Result<u64, String> {
+    if let Some(reason) = deposits_closed_reason(state, rules) {
+        return Err(reason);
+    }
+    let next = state["tip_height"].as_u64().unwrap_or(0).saturating_add(1);
+    jetsam_rpc::bridge::check_deposit(amount, recipient, next, rules).map_err(|e| e.to_string())?;
+    let room = state["room"].as_u64().unwrap_or(0);
+    if amount > room {
+        return Err(format!(
+            "the vault has room for {} {TICKER} more under its ceiling, this deposit is {} \
+             {TICKER}: deposit less, or later",
+            jetsam_str(room),
+            jetsam_str(amount)
+        ));
+    }
+    Ok(next)
+}
+
+/// The deposits `getVaultState` counted over its last 1 024 heights, and the
+/// heights among them whose block the node no longer retains (not counted).
+fn deposits_line(state: &Value) -> String {
+    let counted = state["deposits_last_1024"].as_u64().unwrap_or(0);
+    match state["deposit_heights_unread"].as_u64().unwrap_or(0) {
+        0 => format!("{counted} in the last 1024 blocks"),
+        unread => format!(
+            "{counted} in the last 1024 blocks ({unread} of these heights no longer retained by \
+             the node: their deposits not counted)"
+        ),
+    }
+}
+
+/// Only the word itself confirms a deposit.
+fn is_confirmation(answer: &str) -> bool {
+    answer.trim().eq_ignore_ascii_case("yes")
+}
+
+async fn cmd_bridge(ctx: &Ctx<'_>, command: &BridgeCommand) -> anyhow::Result<()> {
+    match command {
+        BridgeCommand::Status => cmd_bridge_status(ctx).await,
+        BridgeCommand::Deposit {
+            recipient,
+            amount,
+            fee,
+            dry_run,
+            yes,
+        } => cmd_bridge_deposit(ctx, recipient, amount, fee.as_deref(), *dry_run, *yes).await,
+    }
+}
+
+async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let rules = VaultRules::current();
+    let state = rpc(ctx, "getVaultState", &[])
+        .await
+        .context("getVaultState")?;
+    let closed = deposits_closed_reason(&state, &rules);
+    if ctx.json {
+        return print_json(&serde_json::json!({
+            "deposits_open": closed.is_none(),
+            "closed_reason": closed,
+            "this_cli": {
+                "network": jetsam_chain::consensus::identity::CHAIN_NAME,
+                "v1_7_activation_height": rules.activation_height,
+                "deposits_from_height": rules.deposits_from_height,
+                "min_deposit_micro": rules.min_deposit,
+                "max_deposit_micro": rules.max_deposit,
+                "vault": rules.vault.to_bech32(),
+            },
+            "node": state,
+        }));
+    }
+    let coins = |value: &Value| format!("{} {TICKER}", jetsam_str(value.as_u64().unwrap_or(0)));
+    let height =
+        |value: Option<u64>| value.map_or_else(|| "not set".to_string(), |h| h.to_string());
+    section("Bridge to Base/EVM (v1.7)");
+    match &closed {
+        None => ok_msg("deposits are open: the node's next block can carry one"),
+        Some(reason) => warn_msg(&format!("deposits are closed: {reason}")),
+    }
+    println!();
+    kv("This CLI", jetsam_chain::consensus::identity::CHAIN_NAME);
+    kv("v1.7 height", &height(rules.activation_height));
+    kv2(
+        "Opening F",
+        &height(rules.deposits_from_height),
+        "(deposits valid in the blocks above it)",
+    );
+    kv(
+        "One deposit",
+        &format!(
+            "{} to {} {TICKER}",
+            jetsam_str(rules.min_deposit),
+            jetsam_str(rules.max_deposit)
+        ),
+    );
+    kv("Vault", &rules.vault.to_bech32());
+    println!();
+    kv("Node tip", &height(state["tip_height"].as_u64()));
+    kv(
+        "Node v1.7",
+        if state["active"].as_bool() == Some(true) {
+            "active at its next block"
+        } else {
+            "not active"
+        },
+    );
+    kv(
+        "Node opening F",
+        &height(state["deposits_from_height"].as_u64()),
+    );
+    kv("Locked", &coins(&state["bridge_locked"]));
+    kv2(
+        "Room",
+        &coins(&state["room"]),
+        &format!("(ceiling {})", coins(&state["ceiling"])),
+    );
+    kv("Deposits", &deposits_line(&state));
+    kv(
+        "Releases paid",
+        &state["released_count"].as_u64().unwrap_or(0).to_string(),
+    );
+    Ok(())
+}
+
+async fn cmd_bridge_deposit(
+    ctx: &Ctx<'_>,
+    recipient_text: &str,
+    amount_text: &str,
+    fee_text: Option<&str>,
+    dry_run: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use jetsam_rpc::bridge::{
+        checksummed, parse_recipient, BridgeDepositPlan, BridgeDepositResult,
+    };
+    let rules = VaultRules::current();
+
+    // --- What is checked before the node is asked anything ---
+    let recipient = parse_recipient(recipient_text).map_err(|error| {
+        anyhow::anyhow!("Invalid Base/EVM address {recipient_text:?}: {error}.")
+    })?;
+    let amount = parse_jetsam_amount(amount_text)
+        .with_context(|| format!("invalid amount {amount_text:?}"))?;
+    let fee = fee_text
+        .map(|text| parse_jetsam_amount(text).with_context(|| format!("invalid fee {text:?}")))
+        .transpose()?;
+    if fee.is_some_and(|fee| fee > BRIDGE_FEE_SANITY_LIMIT_MICRO) {
+        bail!(
+            "Refusing a fee above one {TICKER}: a fee is normally a few thousandths of one {TICKER}, \
+             paid to a miner and never recovered. Omit --fee to let the node price it."
+        );
+    }
+    if let Some(refusal) = build_refusal(&rules, jetsam_chain::consensus::identity::IS_TEST_CHAIN) {
+        bail!("{refusal} Nothing was sent.");
+    }
+
+    // --- The node's bridge, then the plan (no side effect) ---
+    let state = rpc(ctx, "getVaultState", &[])
+        .await
+        .context("getVaultState")?;
+    let next = deposit_preflight(&state, amount, &recipient, &rules)
+        .map_err(|reason| anyhow::anyhow!("Deposit refused: {reason}. Nothing was sent."))?;
+    let shown = checksummed(&recipient);
+    let plan: BridgeDepositPlan = serde_json::from_value(
+        rpc(
+            ctx,
+            "walletPlanBridgeDeposit",
+            &[
+                shown.clone().into(),
+                amount.into(),
+                fee.map_or(Value::Null, Value::from),
+            ],
+        )
+        .await
+        .context("walletPlanBridgeDeposit")?,
+    )
+    .context("walletPlanBridgeDeposit reply")?;
+    if plan.total_micro_jtm > plan.spendable_micro_jtm {
+        bail!(
+            "Insufficient funds: the deposit and its fee take {} {TICKER}, the active address \
+             {} can spend {} {TICKER}. Nothing was sent.",
+            jetsam_str(plan.total_micro_jtm),
+            plan.from,
+            jetsam_str(plan.spendable_micro_jtm)
+        );
+    }
+    if ctx.json && dry_run {
+        return print_json(&serde_json::to_value(&plan)?);
+    }
+    if !ctx.json {
+        section("Bridge deposit to Base/EVM");
+        kv("From", &plan.from);
+        kv("To (Base/EVM)", &plan.recipient);
+        kv2(
+            "Amount",
+            &format!("{} {TICKER}", jetsam_str(amount)),
+            &format!("({amount} \u{03bc}{TICKER})"),
+        );
+        kv2(
+            "Fee",
+            &format!("{} {TICKER}", jetsam_str(plan.fee_micro_jtm)),
+            if fee.is_none() { "(auto)" } else { "" },
+        );
+        kv(
+            "Total",
+            &format!("{} {TICKER}", jetsam_str(plan.total_micro_jtm)),
+        );
+        kv("Vault", &plan.vault);
+        kv2(
+            "Next block",
+            &next.to_string(),
+            &format!("(deposits valid above {})", plan.deposits_from_height),
+        );
+        println!();
+        warn_msg(
+            "A deposit cannot be cancelled or sent elsewhere. Check the Base/EVM address above, \
+             and use one you control (not an exchange's deposit address).",
+        );
+        println!(
+            "  {} The bridge mints the same amount to it on Base/EVM: by the slow lane, at the \
+             next checkpoint (about every 1 h 50) then about 24 h; or sooner, less a fee, if an \
+             advancer advances it. Deposits left out beyond 22 a day wait; none is lost.",
+            c!(DIM, "Note:")
+        );
+    }
+    if dry_run {
+        println!("  {} Dry run: nothing was built or sent.", c!(DIM, "Note:"));
+        return Ok(());
+    }
+
+    // --- Explicit confirmation ---
+    if !yes {
+        if ctx.json || !io::stdin().is_terminal() {
+            bail!("Confirmation required: run again with --yes to send this deposit. Nothing was sent.");
+        }
+        print!(
+            "  Type {} to lock {} {TICKER} in the bridge vault for {}: ",
+            c!(BOLD, "yes"),
+            jetsam_str(amount),
+            plan.recipient
+        );
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !is_confirmation(&answer) {
+            println!("  {}", c!(DIM, "Cancelled: nothing was sent."));
+            return Ok(());
+        }
+    }
+
+    // --- Built, signed and submitted by the daemon's wallet, at the fee shown ---
+    if !ctx.json {
+        println!(
+            "  {} The node's wallet builds and signs the deposit (it can take a minute)\u{2026}",
+            c!(DIM, "\u{23f3}")
+        );
+    }
+    let result = match rpc_with_timeout(
+        ctx,
+        "walletBridgeDeposit",
+        &[
+            plan.recipient.clone().into(),
+            amount.into(),
+            plan.fee_micro_jtm.into(),
+        ],
+        Some(BRIDGE_DEPOSIT_RPC_TIMEOUT),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(message) = input_limit_exceeded_message(&error) {
+                bail!(message);
+            }
+            if let Some(message) = unknown_outcome_message(&error) {
+                bail!(message);
+            }
+            return Err(error).context("walletBridgeDeposit: deposit not sent");
+        }
+    };
+    if ctx.json {
+        return print_json(&result);
+    }
+    let result: BridgeDepositResult =
+        serde_json::from_value(result).context("walletBridgeDeposit reply")?;
+    println!();
+    section("Deposit submitted");
+    ok_msg(&format!("TX {}", result.txid));
+    kv("To (Base/EVM)", &result.recipient);
+    kv(
+        "Amount",
+        &format!("{} {TICKER}", jetsam_str(result.amount_micro_jtm)),
+    );
+    kv(
+        "Fee",
+        &format!("{} {TICKER}", jetsam_str(result.fee_micro_jtm)),
+    );
+    println!();
+    println!(
+        "  {} Pending until a block carries it. Keep the txid: it names your deposit on the \
+         bridge. Follow it with {}.",
+        c!(DIM, "\u{23f3}"),
+        c!(BOLD, "'jetsam-cli bridge status'")
+    );
+    Ok(())
+}
+
 async fn cmd_stop(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     match rpc(ctx, "stop", &[]).await {
         Ok(r) => {
@@ -2973,6 +3440,16 @@ fn input_limit_exceeded_message(error: &anyhow::Error) -> Option<String> {
 }
 
 async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Value> {
+    rpc_with_timeout(ctx, method, params, None).await
+}
+
+/// [`rpc`] with a timeout of its own instead of the client's 60 s.
+async fn rpc_with_timeout(
+    ctx: &Ctx<'_>,
+    method: &str,
+    params: &[Value],
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<Value> {
     let method_full = format!("jetsam_{method}");
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -2981,10 +3458,11 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
         "params":  params,
     });
 
-    let resp: Value = ctx
-        .client
-        .post(ctx.rpc)
-        .json(&body)
+    let mut request = ctx.client.post(ctx.rpc).json(&body);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let resp: Value = request
         .send()
         .await
         .map_err(|e| {
@@ -3539,5 +4017,272 @@ mod stake_tests {
             parse(&["jetsam-cli", "stake", "info"]),
             StakeCommand::Info { address: None }
         ));
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::{
+        build_refusal, deposit_preflight, deposits_closed_reason, deposits_line, is_confirmation,
+        unknown_outcome_message, BridgeCommand, Cli, Command, RpcCallError,
+        BRIDGE_DEPOSIT_RPC_TIMEOUT,
+    };
+    use clap::{CommandFactory, Parser};
+    use jetsam_chain::consensus::vault::{
+        bridge_deposits_from_height, VaultRules, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO,
+    };
+    use serde_json::json;
+
+    const ONE: u64 = 1_000_000;
+    const RECIPIENT: [u8; 20] = [0x5a; 20];
+    const ADDRESS: &str = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+
+    fn armed(j: u64) -> VaultRules {
+        let mut rules = VaultRules::current();
+        rules.activation_height = Some(j);
+        rules.deposits_from_height = bridge_deposits_from_height(Some(j));
+        rules
+    }
+
+    fn unarmed() -> VaultRules {
+        let mut rules = VaultRules::current();
+        rules.activation_height = None;
+        rules.deposits_from_height = None;
+        rules
+    }
+
+    /// A `getVaultState` reply at `tip` with the opening `f` and `room` left.
+    fn state(active: bool, tip: u64, f: Option<u64>, room: u64) -> serde_json::Value {
+        json!({
+            "active": active, "tip_height": tip, "bridge_locked": 10_000 * ONE - room,
+            "ceiling": 10_000 * ONE, "room": room, "floor": 95, "deposits_from_height": f,
+            "released_count": 0, "released_in_window": 0, "window_blocks": 480,
+            "window_cap": 2_500 * ONE, "deposits_by_height": [], "deposits_last_1024": 0,
+            "held_releases": 0, "deposit_heights_unread": 0,
+        })
+    }
+
+    #[test]
+    fn the_bridge_commands_parse() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").cmd {
+            Command::Bridge(command) => command,
+            _ => panic!("not a bridge command"),
+        };
+        match parse(&["jetsam-cli", "bridge", "deposit", ADDRESS, "12.5"]) {
+            BridgeCommand::Deposit {
+                recipient,
+                amount,
+                fee,
+                dry_run,
+                yes,
+            } => {
+                assert_eq!(recipient, ADDRESS);
+                assert_eq!(amount, "12.5");
+                assert_eq!(fee, None);
+                assert!(
+                    !dry_run && !yes,
+                    "neither a dry run nor confirmed by default"
+                );
+            }
+            _ => panic!("not a deposit"),
+        }
+        assert!(matches!(
+            parse(&[
+                "jetsam-cli", "bridge", "deposit", ADDRESS, "3", "--fee", "0.05", "--yes",
+                "--dry-run"
+            ]),
+            BridgeCommand::Deposit { fee: Some(fee), yes: true, dry_run: true, .. } if fee == "0.05"
+        ));
+        assert!(matches!(
+            parse(&["jetsam-cli", "bridge", "status"]),
+            BridgeCommand::Status
+        ));
+        assert!(
+            Cli::try_parse_from(["jetsam-cli", "bridge", "deposit", ADDRESS]).is_err(),
+            "an amount is required"
+        );
+    }
+
+    /// While the build's v1.7 height is none the CLI sends nothing and says
+    /// why, before it asks the node anything; on the public network it says
+    /// so in as many words.
+    #[test]
+    fn this_build_refuses_every_deposit_while_its_v1_7_height_is_none() {
+        let mainnet = build_refusal(&unarmed(), false).expect("refused");
+        assert!(mainnet.contains("mainnet"), "{mainnet}");
+        assert!(mainnet.contains("not armed"), "{mainnet}");
+        assert!(
+            !mainnet.contains("Nothing was sent"),
+            "a reason, read by bridge status too: {mainnet}"
+        );
+        let testnet = build_refusal(&unarmed(), true).expect("refused");
+        assert!(!testnet.contains("mainnet"), "{testnet}");
+        assert!(testnet.contains("not armed"), "{testnet}");
+        assert_eq!(build_refusal(&armed(9_600), false), None);
+        assert_eq!(build_refusal(&armed(9_600), true), None);
+        let current = build_refusal(
+            &VaultRules::current(),
+            jetsam_chain::consensus::identity::IS_TEST_CHAIN,
+        );
+        assert_eq!(
+            current.is_some(),
+            jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_none()
+        );
+    }
+
+    /// The node is asked before anything is planned: not active at its next
+    /// block, an opening other than this CLI's, or not open yet — each said
+    /// in clear; open from the block after F.
+    #[test]
+    fn deposits_are_open_only_when_the_node_and_this_cli_agree() {
+        let rules = armed(9_600);
+        let f = rules.deposits_from_height.unwrap();
+        let room = 10_000 * ONE;
+        assert_eq!(
+            deposits_closed_reason(&state(true, f, Some(f), room), &rules),
+            None
+        );
+        assert_eq!(
+            deposits_closed_reason(&state(true, f + 500, Some(f), room), &rules),
+            None
+        );
+        let not_yet = deposits_closed_reason(&state(true, f - 1, Some(f), room), &rules)
+            .expect("closed at F");
+        assert!(
+            not_yet.contains(&format!("{}", f + 1)) && not_yet.contains("1 more block"),
+            "{not_yet}"
+        );
+        let below_j = deposits_closed_reason(&state(false, 100, Some(f), room), &rules)
+            .expect("closed below J");
+        assert!(below_j.contains("not active"), "{below_j}");
+        let other = deposits_closed_reason(&state(true, f + 5, Some(f + 960), room), &rules)
+            .expect("disagree");
+        assert!(other.contains("disagree"), "{other}");
+        let none = deposits_closed_reason(&state(true, f + 5, None, room), &rules)
+            .expect("the node has no F");
+        assert!(
+            none.contains("disagree") || none.contains("not armed"),
+            "{none}"
+        );
+        let this_build = deposits_closed_reason(&state(true, f + 5, Some(f), room), &unarmed())
+            .expect("this build is not armed");
+        assert!(this_build.contains("not armed"), "{this_build}");
+    }
+
+    /// The amount: within the limits of one deposit and within the vault's
+    /// room (V8, as the node reports it); the next block's height otherwise.
+    #[test]
+    fn a_deposit_is_checked_against_the_limits_and_the_room_before_it_is_planned() {
+        let rules = armed(9_600);
+        let f = rules.deposits_from_height.unwrap();
+        let open = state(true, f + 3, Some(f), 50 * ONE);
+        assert_eq!(
+            deposit_preflight(&open, 50 * ONE, &RECIPIENT, &rules),
+            Ok(f + 4)
+        );
+        let full = deposit_preflight(&open, 50 * ONE + 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(full.contains("room"), "{full}");
+        let wide = state(true, f + 3, Some(f), 10_000 * ONE);
+        let small =
+            deposit_preflight(&wide, MIN_DEPOSIT_MICRO - 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(small.contains("minimum"), "{small}");
+        let large =
+            deposit_preflight(&wide, MAX_DEPOSIT_MICRO + 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(large.contains("maximum"), "{large}");
+        let zero = deposit_preflight(&wide, 10 * ONE, &[0u8; 20], &rules).unwrap_err();
+        assert!(zero.contains("zero"), "{zero}");
+        let closed = deposit_preflight(
+            &state(true, f - 1, Some(f), 50 * ONE),
+            5 * ONE,
+            &RECIPIENT,
+            &rules,
+        );
+        assert!(closed.is_err());
+    }
+
+    /// `bridge status` counts the deposits of the heights the node still
+    /// retains, and says how many it no longer does (the rehearsal's node
+    /// counted 0 over 1 024 blocks with 308 locked: 845 heights unread).
+    #[test]
+    fn the_status_says_which_deposits_it_did_not_count() {
+        let mut node = state(true, 986, Some(128), 9_692 * ONE);
+        node["deposits_last_1024"] = json!(0);
+        node["deposit_heights_unread"] = json!(845);
+        let line = deposits_line(&node);
+        assert!(
+            line.contains("845") && line.contains("not counted"),
+            "{line}"
+        );
+        node["deposits_last_1024"] = json!(3);
+        node["deposit_heights_unread"] = json!(0);
+        assert_eq!(deposits_line(&node), "3 in the last 1024 blocks");
+    }
+
+    /// The deposit call proves the deposit in the node's wallet: measured
+    /// over the client's 60 s on this machine at load 560 (the call was cut,
+    /// the node dropped the deposit). It gets ten minutes, and a call that
+    /// still gets no answer is said to have an unknown outcome — never "the
+    /// node is not responding" alone, which invites sending a second deposit.
+    /// A refusal of the node is a refusal.
+    #[test]
+    fn a_deposit_without_an_answer_has_an_unknown_outcome() {
+        assert!(BRIDGE_DEPOSIT_RPC_TIMEOUT >= std::time::Duration::from_secs(600));
+        let cut = anyhow::anyhow!("Node is not responding.\n\tIs the jetsam daemon running?");
+        let message = unknown_outcome_message(&cut).expect("no answer");
+        assert!(
+            message.contains("unknown")
+                && message.contains("twice")
+                && message.contains("bridge status"),
+            "{message}"
+        );
+        let refused = anyhow::Error::new(RpcCallError {
+            code: -32000,
+            message: "deposit refused by the mempool: BelowMinFee".into(),
+            data: None,
+        });
+        assert_eq!(unknown_outcome_message(&refused), None);
+    }
+
+    /// Only the word itself confirms a deposit: not `y`, not an empty line.
+    #[test]
+    fn only_yes_confirms_a_deposit() {
+        for answer in ["yes", "YES", "Yes", " yes\n"] {
+            assert!(is_confirmation(answer), "{answer:?}");
+        }
+        for answer in ["", "\n", "y", "Y", "no", "oui", "yes please", "ye"] {
+            assert!(!is_confirmation(answer), "{answer:?}");
+        }
+    }
+
+    /// Public text: the bridge's help and messages say Base/EVM, never the
+    /// network's name nor the two-letter name of the proof technique.
+    #[test]
+    fn the_bridge_texts_say_base_evm_only() {
+        let mut command = Cli::command();
+        command.build();
+        let bridge = command
+            .find_subcommand_mut("bridge")
+            .expect("a bridge command");
+        let mut help = bridge.render_long_help().to_string();
+        for sub in bridge.get_subcommands_mut() {
+            help.push_str(&sub.render_long_help().to_string());
+        }
+        assert!(help.contains("Base/EVM"), "{help}");
+        let source = include_str!("jetsam_cli.rs");
+        let code = source.split(&["#[cfg", "(test)]"].concat()).next().unwrap();
+        let network = ["ether", "eum"].concat();
+        let technique = ["z", "k"].concat();
+        for text in [help.as_str(), code] {
+            let lower = text.to_ascii_lowercase();
+            assert!(!lower.contains(&network), "the network's name");
+            assert!(
+                !lower
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word == technique),
+                "the technique's name"
+            );
+        }
+        let refusal = build_refusal(&unarmed(), false).unwrap();
+        assert!(!refusal.to_ascii_lowercase().contains(&network));
     }
 }
