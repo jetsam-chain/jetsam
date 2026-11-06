@@ -202,3 +202,74 @@ fn a5_22_the_claim_direct_command_queues_an_archived_deposit_only() {
     assert!(!out.status.success());
     assert_eq!(relayer::claim_requests(&state.join("claim-direct")).unwrap().len(), 1);
 }
+
+/// Holds `<dir>/lock` (an exclusive `flock`) as long as the file is open: the place of a running `jg-relay`.
+fn hold_state_dir(dir: &std::path::Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(dir).unwrap();
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock")).unwrap();
+    // SAFETY: flock on a descriptor we own.
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    f
+}
+
+/// T7.7 (A3, the private rehearsal's "J-RACE", 2026-11-05): `acknowledge 129` while jg-relay ran said "omission
+/// acknowledged", the index read back `Acknowledged`, and 25 s later `Missing` again (the running relayer writes its
+/// archive index from its memory at every step): a success that did not happen; `import-block` the same. One process
+/// at a time on the state directory (`<state_dir>/lock`): while it is held, `acknowledge` and `import-block` are
+/// refused, nothing written, the reason said; `claim-direct` (a queue the running relayer reads) still goes; a relayer
+/// does not start (before any socket). Released, both commands are done.
+#[test]
+fn t77_an_operators_acknowledge_is_never_lost_to_a_running_relayer() {
+    let (full, v) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let mut ar = archive_of(&full, &v, &state.join("archive"));
+    // two bodies no source served: 130 (an operator holds its body) and 131 (lost)
+    ar.record_missing(130, &full.id_at(130).unwrap(), "not served");
+    ar.record_missing(131, &full.id_at(131).unwrap(), "not served");
+    ar.save().unwrap();
+    let body130 = dir.path().join("130.bin");
+    std::fs::write(&body130, hex::decode(v["blocks"]["130"].as_str().unwrap()).unwrap()).unwrap();
+    let toml = format!(
+        "network = \"0x{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\n\
+         l1_rpc = \"http://127.0.0.1:9\"\ndeposits_from_height = 128\nstate_dir = \"{}\"\npublish_dir = \"{}\"\n\
+         [[nodes]]\nname = \"a\"\nrpc = \"http://127.0.0.1:9\"\n[[nodes]]\nname = \"b\"\nrpc = \"http://127.0.0.1:10\"\n\
+         [prover]\nmode = \"mock\"\n",
+        hex::encode(full.id_at(0).unwrap()),
+        hex::encode(jetsam_chain::consensus::destination::state::REHEARSAL_L1_BRIDGE.address),
+        state.display(),
+        dir.path().join("publish").display()
+    );
+    let cfg = dir.path().join("relay.toml");
+    std::fs::write(&cfg, toml).unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(&cfg).args(args).output().unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let index = || Archive::open(&state.join("archive")).unwrap().index;
+    let lock = state.join("lock").display().to_string();
+    // held (a running relayer): refused, nothing written, the reason said
+    let held = hold_state_dir(&state);
+    let (ok, text) = run(&["acknowledge", "131", "body", "lost"]);
+    assert!(!ok && text.contains(&lock) && text.contains("refused"), "{text}");
+    assert!(matches!(index().get(&131), Some(relayer::Body::Missing { .. })), "nothing written");
+    let (ok, text) = run(&["import-block", "130", body130.to_str().unwrap()]);
+    assert!(!ok && text.contains(&lock) && text.contains("refused"), "{text}");
+    assert!(matches!(index().get(&130), Some(relayer::Body::Missing { .. })), "nothing written");
+    // the queue the running relayer reads: still open
+    let d = ar.found()[&129][0];
+    let (ok, text) = run(&["claim-direct", "129", &format!("0x{}", hex::encode(d.txid))]);
+    assert!(ok, "{text}");
+    // a second relayer on the same state directory does not start
+    let (ok, text) = run(&[]);
+    assert!(!ok && text.contains(&lock) && text.contains("does not start"), "{text}");
+    // released: both done
+    drop(held);
+    let (ok, text) = run(&["acknowledge", "131", "body", "lost"]);
+    assert!(ok, "{text}");
+    assert!(matches!(index().get(&131), Some(relayer::Body::Acknowledged { .. })));
+    let (ok, text) = run(&["import-block", "130", body130.to_str().unwrap()]);
+    assert!(ok && text.contains("0 deposits"), "{text}");
+    assert!(matches!(index().get(&130), Some(relayer::Body::Read { .. })));
+}
