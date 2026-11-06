@@ -1056,3 +1056,62 @@ fn t77_the_state_directory_is_held_by_one_process_at_a_time() {
     drop(first);
     assert!(lock_relay_state_dir(&state).is_ok(), "released with its holder");
 }
+
+/// Blocks `1..=outputs.len()` over `testkit::genesis()` (`alloc_counter` 0), block `h` creating `outputs[h − 1]` outputs:
+/// its header's `alloc_counter` is its parent's plus that many.
+fn chain_of_outputs(outputs: &[u64]) -> Chain {
+    let mut c = Chain::from_genesis(testkit::genesis());
+    let mut alloc = 0;
+    for (h, n) in (1u64..).zip(outputs) {
+        alloc += n;
+        let hd = jetsam_chain::block_header::BlockHeader {
+            prev_block_hash: c.tip_id(),
+            state_root: [1; 32],
+            tx_root: [h as u8; 32],
+            timestamp: 1_700_000_000 + 180 * h,
+            height: h,
+            miner_address: jetsam_poseidon2b::primitives::Address([7u8; 32]),
+            nonce: 1,
+            difficulty_target: testkit::target_bits(20),
+            log_slots: 16,
+            active_slot_count: h,
+            alloc_counter: alloc,
+        };
+        c.extend(crate::chain::HeaderInfo::from_header(&hd)).unwrap();
+    }
+    c
+}
+
+/// T7.7 (A5, the real private chain, j1): a relayer stopped for more than 22 blocks found every block of the gap
+/// without a deposit `MISSING` (no source serves a pruned body that holds none) and the operator acknowledged them
+/// blind (the vault's balance his only evidence). A block whose header says it created one output — its coinbase's:
+/// `alloc_counter` counts every live output ever created and the primary coinbase has exactly one, both checked by
+/// consensus — holds no deposit: known without its body, never missing, nothing to acknowledge. Any other unserved
+/// block stays MISSING, its reason kept (its deposits unknown, nothing concluded: an operator decides, D41).
+#[test]
+fn t77_an_unserved_block_is_known_without_deposit_only_when_its_header_proves_it() {
+    // block 3 created 3 outputs (a deposit's two and the coinbase's), block 5 two (one besides the coinbase's)
+    let c = chain_of_outputs(&[1, 1, 3, 1, 2, 1]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    let id = |h: u64| c.id_at(h).unwrap();
+    assert!(ar.record_unserved(&c, 2, &id(2), "not served"), "the coinbase's output only: no deposit");
+    assert!(!ar.missing().contains(&2) && ar.index.contains_key(&2) && !ar.found().contains_key(&2));
+    assert!(ar.acknowledge(2, "no").is_err(), "nothing to acknowledge");
+    assert!(!ar.record_unserved(&c, 3, &id(3), "not served"), "three outputs: a deposit is possible");
+    assert!(matches!(ar.index.get(&3), Some(Body::Missing { reason, .. }) if reason == "not served"));
+    assert!(!ar.record_unserved(&c, 5, &id(5), "not served"), "one output besides the coinbase's: not proven");
+    assert!(!ar.record_unserved(&c, 4, &[9u8; 32], "not served"), "another block than the chain's at 4: not concluded");
+    assert_eq!(ar.missing(), vec![3, 4, 5]);
+    // a block missing from an earlier step is settled when retried
+    ar.record_missing(6, &id(6), "not served");
+    assert!(ar.record_unserved(&c, 6, &id(6), "not served"));
+    assert_eq!(ar.missing(), vec![3, 4, 5]);
+    // its parent's header not kept (a chain from a trust anchor): not proven
+    let mut anchored = Chain::with_anchor(0, c.id_at(0).unwrap(), c.work_at(0).unwrap());
+    anchored.extend(c.header_at(1).unwrap().clone()).unwrap();
+    assert!(!ar.record_unserved(&anchored, 1, &id(1), "not served"));
+    // durable
+    ar.save().unwrap();
+    assert_eq!(Archive::open(dir.path()).unwrap().index, ar.index);
+}

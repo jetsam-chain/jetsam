@@ -273,3 +273,30 @@ fn t77_an_operators_acknowledge_is_never_lost_to_a_running_relayer() {
     assert!(ok && text.contains("0 deposits"), "{text}");
     assert!(matches!(index().get(&130), Some(relayer::Body::Read { .. })));
 }
+
+/// T7.7 (A5) on the REAL rehearsal chain: every block of 123..=144 created exactly the outputs its header's
+/// `alloc_counter` adds to its parent's (counted in its body: measured, not assumed); a block no source would serve is
+/// known without deposit only when it created its coinbase's output alone, and each of those holds no deposit by the
+/// node's rule; the deposit block 129 is not one of them.
+#[test]
+fn t77_the_header_proof_of_no_deposit_holds_on_the_real_rehearsal_blocks() {
+    let (full, v) = fixture();
+    let alloc = |h: u64| jetsam_chain::block_header::BlockHeader::decode(&mut full.header_at(h).unwrap().raw.as_slice()).unwrap().alloc_counter;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    let mut known = Vec::new();
+    for h in 123..=144u64 {
+        let raw = hex::decode(v["blocks"][h.to_string()].as_str().unwrap()).unwrap();
+        let block = jetsam_chain::block::Block::from_bytes(&raw).unwrap();
+        let outputs: u64 = block.transactions.iter().map(|t| t.body.live_outputs().count() as u64).sum();
+        assert_eq!(outputs, alloc(h) - alloc(h - 1), "block {h}: the outputs of its body are its header's count");
+        if ar.record_unserved(&full, h, &full.id_at(h).unwrap(), "pruned") {
+            assert_eq!(outputs, 1, "block {h}");
+            assert!(jetsam_guardian::fill::deposits_of_block(&raw, &full.id_at(h).unwrap(), &VaultRules::current()).unwrap().is_empty(), "block {h}");
+            known.push(h);
+        }
+    }
+    assert!(!known.contains(&129), "the deposit block");
+    assert!(!known.is_empty(), "coinbase-only blocks in 123..=144: {known:?}");
+    eprintln!("coinbase-only, known without their bodies: {known:?}; missing: {:?}", ar.missing());
+}
