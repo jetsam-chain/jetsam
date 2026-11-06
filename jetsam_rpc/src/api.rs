@@ -339,6 +339,35 @@ pub trait JetsamApi {
         fee_micro_jtm: Option<u64>,
     ) -> RpcResult<crate::guardian::GuardianPaymentResponse>;
 
+    /// v1.7 (F4): the deposit `walletBridgeDeposit` would build now, from the
+    /// active address to the bridge vault for the Base/EVM `recipient` (`0x`
+    /// and 40 hex digits; mixed case must match its checksum): fee
+    /// (automatic when none is given), total, spendable balance, the next
+    /// block and `F`. Refused while the build carries no v1.7 height, until
+    /// the block after `F`, and outside the limits of one deposit (V4).
+    /// Nothing is built, reserved or sent.
+    #[method(name = "walletPlanBridgeDeposit")]
+    async fn wallet_plan_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::bridge::BridgeDepositPlan>;
+
+    /// v1.7 (F4): build, prove and submit, with the active wallet, a deposit
+    /// to the bridge vault for the Base/EVM `recipient`: the vault output,
+    /// the `JTMBRDG1` marker naming the recipient, the change. Same refusals
+    /// as `walletPlanBridgeDeposit`; the fee is the one its plan gave (never
+    /// chosen here); the mempool admits it under V4 and V8 at the next block,
+    /// or its inputs are released. One-way: it cannot be cancelled.
+    #[method(name = "walletBridgeDeposit")]
+    async fn wallet_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
+    ) -> RpcResult<crate::bridge::BridgeDepositResult>;
+
     /// v1.7: the payout of a due entry from its pool (inputs, outputs, fee);
     /// no key is needed to pay it, the pools' secrets being published.
     #[method(name = "planGuardianPayout")]

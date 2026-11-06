@@ -1575,6 +1575,54 @@ impl RpcHandler {
         )))
     }
 
+    /// v1.7 (F4): the plan of a deposit from the active address for the
+    /// Base/EVM `recipient`, refused before anything is built by this build's
+    /// rules (no v1.7 height, the next block not above `F`, V4's limits:
+    /// `crate::bridge::check_deposit`). The recipient's 20 bytes with it.
+    async fn bridge_deposit_plan(
+        &self,
+        recipient: &str,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<(crate::bridge::BridgeDepositPlan, [u8; 20])> {
+        use crate::bridge::{check_deposit, checksummed, deposit_fee, parse_recipient};
+        use jetsam_chain::consensus::vault::{deposit_marker, VaultRules};
+        let recipient =
+            parse_recipient(recipient).map_err(|error| rpc_err(format!("recipient: {error}")))?;
+        let rules = VaultRules::current();
+        let next_height = self.chain.read().await.tip_height().saturating_add(1);
+        check_deposit(amount_micro_jtm, &recipient, next_height, &rules)
+            .map_err(|refusal| rpc_err(format!("deposit refused: {refusal}")))?;
+        let deposits_from_height = rules
+            .deposits_from_height
+            .ok_or_else(|| rpc_err("deposit refused: the bridge is not armed in this build"))?;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.fee_floor().await;
+        let fee = fee_micro_jtm.unwrap_or_else(|| deposit_fee(active_slot_count, log_slots, floor));
+        let total_micro_jtm = amount_micro_jtm
+            .checked_add(fee)
+            .ok_or_else(|| rpc_err("amount plus fee overflows u64"))?;
+        let (_, from) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        Ok((
+            crate::bridge::BridgeDepositPlan {
+                recipient: checksummed(&recipient),
+                amount_micro_jtm,
+                fee_micro_jtm: fee,
+                total_micro_jtm,
+                from,
+                spendable_micro_jtm: self.wallet.get_balance().spendable_micro_jtm,
+                vault: rules.vault.to_bech32(),
+                marker: hex::encode(deposit_marker(&recipient).0),
+                next_height,
+                deposits_from_height,
+            },
+            recipient,
+        ))
+    }
+
     async fn collect_slot_hints(&self, count: u32, salt_seed: u64) -> RpcResult<Vec<u32>> {
         let count = (count as usize).min(256);
         if count == 0 {
@@ -3598,6 +3646,136 @@ impl JetsamApiServer for RpcHandler {
             fee_micro_jtm: fee,
             marker: hex::encode(marker.0),
         })
+    }
+
+    async fn wallet_plan_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::bridge::BridgeDepositPlan> {
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        Ok(self
+            .bridge_deposit_plan(&recipient, amount_micro_jtm, fee_micro_jtm)
+            .await?
+            .0)
+    }
+
+    async fn wallet_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
+    ) -> RpcResult<crate::bridge::BridgeDepositResult> {
+        use jetsam_chain::consensus::vault::VAULT_ADDRESS;
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        if fee_micro_jtm == 0 {
+            return Err(rpc_err(
+                "walletBridgeDeposit pays the fee its plan gave (walletPlanBridgeDeposit)",
+            ));
+        }
+        let (plan, recipient) = self
+            .bridge_deposit_plan(&recipient, amount_micro_jtm, Some(fee_micro_jtm))
+            .await?;
+        if plan.total_micro_jtm > plan.spendable_micro_jtm {
+            return Err(rpc_err(format!(
+                "insufficient funds: the deposit and its fee take {} \u{03bc}{ticker}, the active address can spend {} \u{03bc}{ticker}",
+                plan.total_micro_jtm,
+                plan.spendable_micro_jtm,
+                ticker = jetsam_chain::consensus::identity::TICKER
+            )));
+        }
+        // The vault, then the marker (the one definition of a deposit's
+        // outputs); the wallet adds the change after them.
+        let outputs = crate::bridge::deposit_outputs(amount_micro_jtm, &recipient);
+        let payments = vec![(outputs[0].0 .0, outputs[0].1)];
+        let marker = outputs[1].0;
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints = collect_empty_slot_hints(
+                &chain,
+                &reserved_outputs,
+                seed,
+                crate::bridge::DEPOSIT_OUTPUTS_WITH_CHANGE as usize,
+            )
+            .map_err(rpc_err)?;
+            (epoch_anchor, tip.log_slots, slot_hints)
+        };
+        let wallet = Arc::clone(&self.wallet);
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    payments,
+                    marker.0,
+                    fee_micro_jtm,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let intent = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let facts = jetsam_tx::validate_paged_spend(&intent.pages)
+            .map_err(|error| rpc_err(format!("wallet PagedSpend: {error}")))?;
+        let output_slots: Vec<u32> = intent
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Reserved before admission, rolled back if the mempool refuses it
+        // (V4 and V8 are checked there, at the next block's height).
+        let reservation = PendingAdmissionGuard::reserve(
+            Arc::clone(&self.wallet),
+            facts.logical_txid.0,
+            input_slots,
+            output_slots,
+            amount_micro_jtm,
+            VAULT_ADDRESS.0,
+        )
+        .map_err(rpc_err)?;
+        match self
+            .wallet_submission_mempool
+            .submit(intent, intent_bytes)
+            .await
+        {
+            Ok(txid) => {
+                reservation.commit();
+                tracing::info!(
+                    amount_micro_jtm,
+                    fee_micro_jtm,
+                    next_height = plan.next_height,
+                    recipient = %plan.recipient,
+                    "bridge deposit admitted"
+                );
+                Ok(crate::bridge::BridgeDepositResult {
+                    txid: hex::encode(txid.0),
+                    recipient: plan.recipient,
+                    amount_micro_jtm,
+                    fee_micro_jtm: facts.fee,
+                    input_count: usize::from(facts.live_inputs),
+                    output_count: usize::from(facts.live_outputs),
+                    next_height: plan.next_height,
+                })
+            }
+            Err(error) => {
+                drop(reservation);
+                Err(rpc_err(format!("deposit refused by the mempool: {error}")))
+            }
+        }
     }
 
     async fn plan_guardian_payout(&self, entry_id: u64) -> RpcResult<crate::guardian::PayoutPlan> {
