@@ -977,3 +977,18 @@ fn r3_6_an_ancestors_known_omission_carries_to_a_child_whose_tree_is_unknown() {
     assert_eq!(listed_omission(&known, &read, &bid), Some(vec![25, 47]));
     assert_eq!(direct_claims_needed(&bid, &known, &read, GL, &|_| false, 200 + D_SLOW), vec![read[&25][0], read[&47][0]]);
 }
+
+/// R3-5: when the whole window would fail MN-5 too, the bound is not why: `WorkRateTooLow` (the fast cadence's
+/// trigger), not `TooManyDepositBlocks`. (Added after the mutant `r35-mn5-why-always` survived the first test.)
+#[test]
+fn r3_5_a_bounded_point_that_fails_mn5_like_the_whole_window_is_work_rate_too_low() {
+    let found = found_of(&(11..=50u64).map(|h| dep(h, h as u8, JTM)).collect::<Vec<_>>());
+    let c60 = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c60);
+    let known = HashMap::from([(gid, g.clone())]);
+    // 50 blocks of the base's target since block 10 carry 40 % of what it produces in 22 500 s: later, every T fails
+    let late = ts(&c60, 10) + 30_000;
+    let plan = |bound: usize| plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], late, bound);
+    assert_eq!(plan(deposit_blocks_bound(3_000_000, 25)), Err(NoSubmission::WorkRateTooLow));
+    assert_eq!(plan(5), Err(NoSubmission::WorkRateTooLow), "bounded, but the whole window fails MN-5 as well");
+}
