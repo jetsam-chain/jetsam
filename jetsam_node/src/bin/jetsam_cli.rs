@@ -2931,6 +2931,26 @@ async fn cmd_stake_payout(ctx: &Ctx<'_>, entry_id: u64) -> anyhow::Result<()> {
 /// of one coin, paid to a miner, never recovered.
 const BRIDGE_FEE_SANITY_LIMIT_MICRO: u64 = MICRO_PER_ELD;
 
+/// How long `walletBridgeDeposit` may take: the node's wallet proves the
+/// deposit, seconds on a calm machine, measured over the client's 60 s on a
+/// loaded one (the call was then cut, and the node dropped the deposit).
+const BRIDGE_DEPOSIT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What to say when the deposit call got no answer (any error but a reply of
+/// the node): its outcome is unknown, so it must be checked before a second
+/// deposit is sent.
+fn unknown_outcome_message(error: &anyhow::Error) -> Option<String> {
+    if error.downcast_ref::<RpcCallError>().is_some() {
+        return None;
+    }
+    Some(format!(
+        "No answer from the node to the deposit ({error:#}). Its outcome is unknown: the node may \
+         have submitted it, or dropped it. Check 'jetsam-cli mempool', 'jetsam-cli history' and \
+         'jetsam-cli bridge status' before you deposit again: sending it again could deposit \
+         twice."
+    ))
+}
+
 /// Why this build sends no deposit at all, said before the node is asked
 /// anything: its v1.7 height is not set (the public network and the test
 /// network today). The vault is then an ordinary address whose spend secret
@@ -3248,7 +3268,13 @@ async fn cmd_bridge_deposit(
     }
 
     // --- Built, signed and submitted by the daemon's wallet, at the fee shown ---
-    let result = match rpc(
+    if !ctx.json {
+        println!(
+            "  {} The node's wallet builds and signs the deposit (it can take a minute)\u{2026}",
+            c!(DIM, "\u{23f3}")
+        );
+    }
+    let result = match rpc_with_timeout(
         ctx,
         "walletBridgeDeposit",
         &[
@@ -3256,12 +3282,16 @@ async fn cmd_bridge_deposit(
             amount.into(),
             plan.fee_micro_jtm.into(),
         ],
+        Some(BRIDGE_DEPOSIT_RPC_TIMEOUT),
     )
     .await
     {
         Ok(result) => result,
         Err(error) => {
             if let Some(message) = input_limit_exceeded_message(&error) {
+                bail!(message);
+            }
+            if let Some(message) = unknown_outcome_message(&error) {
                 bail!(message);
             }
             return Err(error).context("walletBridgeDeposit: deposit not sent");
@@ -3410,6 +3440,16 @@ fn input_limit_exceeded_message(error: &anyhow::Error) -> Option<String> {
 }
 
 async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Value> {
+    rpc_with_timeout(ctx, method, params, None).await
+}
+
+/// [`rpc`] with a timeout of its own instead of the client's 60 s.
+async fn rpc_with_timeout(
+    ctx: &Ctx<'_>,
+    method: &str,
+    params: &[Value],
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<Value> {
     let method_full = format!("jetsam_{method}");
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -3418,10 +3458,11 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
         "params":  params,
     });
 
-    let resp: Value = ctx
-        .client
-        .post(ctx.rpc)
-        .json(&body)
+    let mut request = ctx.client.post(ctx.rpc).json(&body);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let resp: Value = request
         .send()
         .await
         .map_err(|e| {
