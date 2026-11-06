@@ -6,8 +6,10 @@ license = "Apache-2.0"
 
 [features]
 # Test-chain identity: distinct genesis, address HRP, protocol namespace,
-# ports and data directory. Never enable for a mainnet release.
-testnet = ["jetsam_poseidon2b/testnet"]
+# ports and data directory. Never enable for a mainnet release. It names the
+# profile to V4's crate too (no rule changes there), which the bridge proof
+# program of the same build follows (M5: the relayer's, the cross tests').
+testnet = ["jetsam_poseidon2b/testnet", "jetsam_vault_rule/testnet"]
 # PRIVATE BUILDS ONLY: the test profile with
 # v1.5 armed at 36 and v1.6 at 64, the short client activation delay from
 # genesis, so a private chain on a loopback-only network crosses both in a

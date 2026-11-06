@@ -7,7 +7,7 @@
 //!
 //! One profile per build, as in the node (cargo features `testnet`, `rehearsal-v1-7`):
 //! - default: the public network (v1.6 at 46080);
-//! - `testnet`: the test chain (genesis d9d156ee, v1.6 at 4800);
+//! - `testnet` (or the node's `jetsam_chain/testnet` in the same build): the test chain (genesis d9d156ee, v1.6 at 4800);
 //! - `rehearsal-v1-7`: the PRIVATE rehearsal chain (the test chain's genesis, v1.5 at 36, v1.6 at 64,
 //!   no pin: `rehearsal-v1-6` / `rehearsal-v1-7` in the node), never a deployed program.
 //! Each build is its own program with its own key.
@@ -118,9 +118,9 @@ pub const REHEARSAL: Schedule = Schedule {
     pins: &[],
 };
 
-/// The schedule this program is built with.
+/// The schedule this program is built with; without a profile of its own, the node's (M5: `TESTNET_PROFILE`).
 #[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
-pub const PRODUCTION: Schedule = MAINNET;
+pub const PRODUCTION: Schedule = if jetsam_vault_rule::TESTNET_PROFILE { TESTNET } else { MAINNET };
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const PRODUCTION: Schedule = TESTNET;
 #[cfg(feature = "rehearsal-v1-7")]

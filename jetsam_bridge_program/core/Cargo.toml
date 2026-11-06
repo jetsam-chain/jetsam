@@ -7,7 +7,9 @@ publish = false
 description = "Bridge proof program core (no_std): the relations the SP1 guests prove (checkpoint, deposit claim). Imported from the v2 prototype spv-core."
 
 [features]
-# The test chain profile (genesis d9d156ee, v1.6 at 4800). Default: the public network (v1.6 at 46080).
+# The test chain profile (genesis d9d156ee, v1.6 at 4800). Default: the public network (v1.6 at 46080), or
+# the test chain when the build holds the node's `jetsam_chain/testnet` (`jetsam_vault_rule::TESTNET_PROFILE`, M5).
+# Never enables `jetsam_vault_rule/testnet` itself: the guests' builds (no node in them) stay as they are.
 testnet = []
 # The private rehearsal: its v1.7 clock (J_R = 96, F_R = 128) and its header clocks (v1.5 at 36, v1.6 at 64,
 # no pin), as `jetsam_chain/rehearsal-v1-7`.

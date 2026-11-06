@@ -9,6 +9,10 @@ description = "V4, the deposit rule of the v1.7 bridge vault (V4-0, V4-a..V4-e, 
 [features]
 # The private rehearsal clock (F_R = J_R + 32), enabled by `jetsam_chain/rehearsal-v1-7`.
 rehearsal-v1-7 = []
+# The test chain's profile, enabled by `jetsam_chain/testnet`. Nothing in V4 changes (the test chain's v1.7
+# clock is the public one's); it carries the node's profile to the proof program of the same build
+# (`TESTNET_PROFILE`), so that a build naming `jetsam_chain/testnet` alone has the test chain's program.
+testnet = []
 # A5-12: the logical txid of a deposit (`txid`, `p2b`), the one implementation the proof program and the
 # robot run; it needs the Poseidon2b permutation of the program's no_std, dependency-free `towerwalk`. The
 # node does not enable it (its consensus txid is `jetsam_tx`'s, checked equal on the G6 vectors).

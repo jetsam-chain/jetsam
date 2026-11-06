@@ -374,3 +374,8 @@ pub fn block_deposits(
     }
     Ok(deposits)
 }
+
+/// Whether this build carries the node's test chain profile (`jetsam_chain/testnet`), the private rehearsal's
+/// excepted (its builds name it on both sides): the proof program built without a profile of its own follows it
+/// (`jetsam_bridge_program::rules::PRODUCTION`). Nothing in V4 reads it.
+pub const TESTNET_PROFILE: bool = cfg!(all(feature = "testnet", not(feature = "rehearsal-v1-7")));
