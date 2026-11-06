@@ -1023,3 +1023,23 @@ fn t77_a_point_locked_at_its_parents_l_has_an_empty_window() {
     let known: HashMap<[u8; 32], Known> = [(gid, g), (aid, a), (bid, b)].into();
     assert_eq!(listed_omission(&known, &found, &bid), Some(Vec::new()));
 }
+
+/// T7.7 (A4, the real private chain, 2026-11-05, j0): a relayer started late (bodies 129..457 never read) said
+/// `NO_SUBMISSION WorkRateTooLow` for hours: its tip, lowered under the first unread body, was too short for MN-5,
+/// while the tip the chain allowed passed it (the first point after the acknowledgments was accepted). The unread
+/// body is why: `MissingBody`, the operator's to settle. When the whole chain fails MN-5 as well, `WorkRateTooLow`
+/// (the fast cadence's trigger) stays.
+#[test]
+fn t77_a_tip_lowered_under_an_unread_body_that_fails_mn5_is_missing_body() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let known = HashMap::from([(gid, g.clone())]);
+    let none = BTreeMap::new();
+    // the body of 12 unread: the tip is lowered to 19 (L 11); 9 blocks since the base pass MN-5 up to 4 050 s after
+    // it, the 50 of the chain up to 22 500 s
+    let s = plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[12], ts(&c, GL) + 3_000).unwrap();
+    assert_eq!((s.next.height, s.next.locked_height), (19, 11));
+    assert_eq!(plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[12], ts(&c, GL) + 10_000), Err(NoSubmission::MissingBody(12)), "the chain alone would pass MN-5");
+    assert!(plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[], ts(&c, GL) + 10_000).is_ok(), "it does, once the body is read");
+    assert_eq!(plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[12], ts(&c, GL) + 30_000), Err(NoSubmission::WorkRateTooLow), "the whole chain fails MN-5 too");
+}
