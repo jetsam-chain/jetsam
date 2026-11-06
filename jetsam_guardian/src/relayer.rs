@@ -398,7 +398,13 @@ pub fn plan_submission(
     let fork_depth = u8::try_from(fork_depth).map_err(|_| NoSubmission::NoParentOnThisChain)?;
     // the parent's tree, then every deposit block of the window ]parent.L ; L] (C1: their heights are public)
     let deposits = tree_of(found, gl, l, &omitted).0;
-    let deposit_blocks: Vec<u64> = found.range(parent.cp.locked_height + 1..=l).map(|(h, _)| *h).collect();
+    // F2 (final audit): a child that forks may keep its parent's L (R4 refuses that only to an extension): its
+    // window is empty, never a reversed range (it panics as soon as `found` holds a deposit)
+    let deposit_blocks: Vec<u64> = if l > parent.cp.locked_height {
+        found.range(parent.cp.locked_height + 1..=l).map(|(h, _)| *h).collect()
+    } else {
+        Vec::new()
+    };
     let next = honest(chain, gl, t, &deposits).ok_or(NoSubmission::ChainTooShort)?;
     // R3: strictly heavier than the contract's tip
     if u256::cmp(&u256::from_be(&next.cum_work), &u256::from_be(tip_cum_work_be)) != std::cmp::Ordering::Greater {

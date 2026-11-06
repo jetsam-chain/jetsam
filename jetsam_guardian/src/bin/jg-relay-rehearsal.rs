@@ -363,7 +363,13 @@ impl Relay {
             locked_on_branch: true,
         };
         // C1 (re-audit n°2): the heights of the deposit blocks of ]parent.L ; L], the whole blocks a proof gives
-        let blocks: Vec<u64> = self.deposits.range(parent.cp.locked_height + 1..=cp.locked_height).filter(|(_, ds)| !ds.is_empty()).map(|(h, _)| *h).collect();
+        // F2 (final audit): never a reversed range (it panics on a non-empty map); `l > parent.L` above makes the
+        // window non-empty today, this keeps it so if that test moves
+        let blocks: Vec<u64> = if cp.locked_height > parent.cp.locked_height {
+            self.deposits.range(parent.cp.locked_height + 1..=cp.locked_height).filter(|(_, ds)| !ds.is_empty()).map(|(h, _)| *h).collect()
+        } else {
+            Vec::new()
+        };
         let pv = public_values(&parent_id, &cp, fork_depth, anchor_base, &parent.cp.tip_block_id, &parent.cp.locked_block_id, &mn, &blocks);
         let proof = mock_proof(&pv);
         let r = self.l1.send(&self.a.from, &self.a.bridge, &l1::submit_checkpoint(&parent_id, &cp, fork_depth, &mn, &blocks, &proof))?;

@@ -398,16 +398,20 @@ impl World {
             fork_depth,
             context: (lo..=hi).map(|x| parent.branch.h(x)).collect(),
             new: (base + 1..=tip).map(|x| b.h(x)).collect(),
-            // the whole deposit blocks of the window, as the relayer gives them (its archive keeps those)
-            blocks: b
-                .blocks
-                .range(parent.cp.locked_height + 1..=l)
-                .filter(|(x, _)| {
-                    let id = HeaderInfo::from_raw(&b.h(**x)).unwrap().id;
-                    self.deposits.get(&id).is_some_and(|ds| !ds.is_empty())
-                })
-                .map(|(x, raw)| (*x, pages_of(raw)))
-                .collect(),
+            // the whole deposit blocks of the window, as the relayer gives them (its archive keeps those); a
+            // window ]L ; L] is empty, never a reversed range (F2: it panics on a non-empty map)
+            blocks: if l > parent.cp.locked_height {
+                b.blocks
+                    .range(parent.cp.locked_height + 1..=l)
+                    .filter(|(x, _)| {
+                        let id = HeaderInfo::from_raw(&b.h(**x)).unwrap().id;
+                        self.deposits.get(&id).is_some_and(|ds| !ds.is_empty())
+                    })
+                    .map(|(x, raw)| (*x, pages_of(raw)))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
