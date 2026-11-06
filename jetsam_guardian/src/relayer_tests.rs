@@ -1000,19 +1000,26 @@ fn r3_5_a_bounded_point_that_fails_mn5_like_the_whole_window_is_work_rate_too_lo
 #[test]
 fn t77_no_direct_claim_under_the_genesis_and_no_panic() {
     let c = testkit::chain(60, 1);
-    let (_, g) = genesis_known(&c);
+    let (gid, g) = genesis_known(&c);
+    let at = g.accepted_at + D_SLOW;
+    let known: HashMap<[u8; 32], Known> = [(gid, g)].into();
     let found = found_of(&[dep(15, 1, JTM)]);
-    assert!(direct_claims_needed(&g, &found, GL, &|_| false).is_empty());
+    assert!(direct_claims_needed(&gid, &known, &found, GL, &|_| false, at).is_empty());
 }
 
-/// T7.7: the same reversed range in `find_omitted`: a point locked at its parent's L (a fork that keeps L)
-/// has an empty window of its own, never `found.range(L + 1..=L)`.
+/// T7.7: the same reversed range in `listed_omission`: a point locked at its parent's L has an empty window of
+/// its own, never `found.range(L + 1..=L)`.
 #[test]
 fn t77_a_point_locked_at_its_parents_l_has_an_empty_window() {
     let c = testkit::chain(60, 1);
-    let (gid, _) = genesis_known(&c);
+    let (gid, g) = genesis_known(&c);
     let found = found_of(&[dep(15, 1, JTM)]);
-    let (_, p) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[]).0, 100);
-    assert!(p.cp.locked_height > 15);
-    assert_eq!(find_omitted(&found, GL, p.cp.locked_height, &[], &p.cp), Some(Vec::new()));
+    let (aid, mut a) = known_at(&c, 40, gid, &tree_of(&found, GL, 32, &[]).0, 100);
+    a.deposit_blocks = Some(vec![15]);
+    a.omitted = Some(Vec::new());
+    let (bid, mut b) = known_at(&c, 41, aid, &tree_of(&found, GL, 32, &[]).0, 200);
+    b.cp.locked_height = a.cp.locked_height;
+    b.deposit_blocks = Some(Vec::new());
+    let known: HashMap<[u8; 32], Known> = [(gid, g), (aid, a), (bid, b)].into();
+    assert_eq!(listed_omission(&known, &found, &bid), Some(Vec::new()));
 }
