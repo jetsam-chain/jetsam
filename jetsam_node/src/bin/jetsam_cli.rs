@@ -3976,8 +3976,8 @@ mod stake_tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::{
-        build_refusal, deposit_preflight, deposits_closed_reason, is_confirmation, BridgeCommand,
-        Cli, Command,
+        build_refusal, deposit_preflight, deposits_closed_reason, deposits_line, is_confirmation,
+        BridgeCommand, Cli, Command,
     };
     use clap::{CommandFactory, Parser};
     use jetsam_chain::consensus::vault::{
@@ -4063,7 +4063,7 @@ mod bridge_tests {
         let mainnet = build_refusal(&unarmed(), false).expect("refused");
         assert!(mainnet.contains("mainnet"), "{mainnet}");
         assert!(mainnet.contains("not armed"), "{mainnet}");
-        assert!(mainnet.contains("Nothing was sent"), "{mainnet}");
+        assert!(!mainnet.contains("sent"), "a reason, read by bridge status too: {mainnet}");
         let testnet = build_refusal(&unarmed(), true).expect("refused");
         assert!(!testnet.contains("mainnet"), "{testnet}");
         assert!(testnet.contains("not armed"), "{testnet}");
@@ -4147,6 +4147,21 @@ mod bridge_tests {
             &rules,
         );
         assert!(closed.is_err());
+    }
+
+    /// `bridge status` counts the deposits of the heights the node still
+    /// retains, and says how many it no longer does (the rehearsal's node
+    /// counted 0 over 1 024 blocks with 308 locked: 845 heights unread).
+    #[test]
+    fn the_status_says_which_deposits_it_did_not_count() {
+        let mut node = state(true, 986, Some(128), 9_692 * ONE);
+        node["deposits_last_1024"] = json!(0);
+        node["deposit_heights_unread"] = json!(845);
+        let line = deposits_line(&node);
+        assert!(line.contains("845") && line.contains("not counted"), "{line}");
+        node["deposits_last_1024"] = json!(3);
+        node["deposit_heights_unread"] = json!(0);
+        assert_eq!(deposits_line(&node), "3 in the last 1024 blocks");
     }
 
     /// Only the word itself confirms a deposit: not `y`, not an empty line.
