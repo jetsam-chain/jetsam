@@ -9,8 +9,16 @@
 # Environment: SP1_RUSTC   the succinct rustc (default /opt/jetsam-proto-zkvm/sp1/toolchain/bin/rustc)
 #              CARGO_HOME  a cargo home whose registry holds sp1-zkvm 6.10.0 and its dependencies
 #              CARGO_TARGET_DIR  (default <out-dir>/target-<kind>-<profile>)
+# Reproducible (A5FIX5): the ELF, hence the vkey and the bridge's CREATE2 address, does not depend on where the tree,
+# CARGO_HOME or the toolchain sit. The flags below go in CARGO_ENCODED_RUSTFLAGS, which REPLACES the repository's
+# build.rustflags (and its --remap-path-prefix), so the remap is here: the tree is /jetsam and CARGO_HOME is /cargo
+# in every panic location. The symbol table is stripped: the crate ids cargo derives (-C metadata) still depend on
+# the build's paths, and only the mangled symbol names carry them (nothing loaded). SP1 6.10.0 reads one symbol,
+# __SUCCINCT_TRAP_CONTEXT (its trap handler); these guests define none, so stripping changes neither the loaded
+# image nor the vkey. Two trees at two paths, two CARGO_HOME and two toolchain copies give the same file.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd -P)
 kind=${1:?claim|checkpoint}; profile=${2:?mainnet|testnet|rehearsal|test-clock}; out=${3:?out-dir}
 case $kind in
   claim) dir=guest-claim; pkg=jetsam-bridge-claim-guest;;
@@ -25,9 +33,11 @@ case $profile in
   *) echo "profile: mainnet, testnet, rehearsal or test-clock" >&2; exit 2;;
 esac
 : "${CARGO_HOME:?CARGO_HOME with an offline registry holding sp1-zkvm 6.10.0}"
-export RUSTC=${SP1_RUSTC:-/opt/jetsam-proto-zkvm/sp1/toolchain/bin/rustc} RUSTC_BOOTSTRAP=1 CARGO_INCREMENTAL=0
+# rustc sees the registry under CARGO_HOME exactly as cargo is given it: one absolute, physical spelling.
+CARGO_HOME=$(cd "$CARGO_HOME" && pwd -P)
+export CARGO_HOME RUSTC=${SP1_RUSTC:-/opt/jetsam-proto-zkvm/sp1/toolchain/bin/rustc} RUSTC_BOOTSTRAP=1 CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$out/target-$kind-$profile}
-flags=$'-C\x1fpasses=lower-atomic\x1f-C\x1flink-arg=--image-base=2013265920\x1f-C\x1fpanic=abort\x1f--cfg\x1fgetrandom_backend="custom"\x1f-C\x1fllvm-args=-misched-prera-direction=bottomup\x1f-C\x1fllvm-args=-misched-postra-direction=bottomup'
+flags="--remap-path-prefix=$root=/jetsam"$'\x1f'"--remap-path-prefix=$CARGO_HOME=/cargo"$'\x1f-C\x1fstrip=symbols\x1f-C\x1fpasses=lower-atomic\x1f-C\x1flink-arg=--image-base=2013265920\x1f-C\x1fpanic=abort\x1f--cfg\x1fgetrandom_backend="custom"\x1f-C\x1fllvm-args=-misched-prera-direction=bottomup\x1f-C\x1fllvm-args=-misched-postra-direction=bottomup'
 mkdir -p "$out"
 (cd "$here/$dir" && CARGO_ENCODED_RUSTFLAGS="$flags" \
   cargo +1.96.0 build --release --offline --locked --target riscv64im-succinct-zkvm-elf -j "${JOBS:-8}" "${feat[@]}")
