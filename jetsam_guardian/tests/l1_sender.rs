@@ -127,6 +127,18 @@ fn what_would_fail_is_refused_before_anything_is_signed() {
     assert!(s.pending().unwrap().is_none(), "nothing was written ahead");
 }
 
+/// Until the transaction `hash` has a receipt (anvil's automine mines shortly AFTER `eth_sendRawTransaction` returns:
+/// A5FIX4, `a_transaction_signed_before_a_stop_*` read the chain before it, 3 runs of 12 on 3c452fc).
+fn mined(l1: &L1, hash: &str) {
+    for _ in 0..200 {
+        if !l1.rpc("eth_getTransactionReceipt", json!([hash])).unwrap().is_null() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{hash} not mined");
+}
+
 /// A version of a transaction of `k` at `nonce`, signed outside the sender, as a stop would leave it.
 fn signed_at(l1: &L1, k: &str, n: u64, data: &[u8]) -> (Pending, String) {
     let base = u128::from_str_radix(l1.rpc("eth_getBlockByNumber", json!(["latest", false])).unwrap()["baseFeePerGas"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
@@ -167,6 +179,7 @@ fn a_transaction_signed_before_a_stop_is_found_again_never_signed_anew() {
     // (2) stopped after the broadcast: found mined, not sent again
     let (p, raw) = signed_at(&l1, TEST_KEY_1, 1, b"two");
     l1.rpc("eth_sendRawTransaction", json!([raw])).unwrap();
+    mined(&l1, &p.sent[0].0);
     std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
     match s.recover(&l1).unwrap() {
         Recovered::Mined(r, _) => assert_eq!(r.tx_hash, p.sent[0].0),
@@ -175,8 +188,9 @@ fn a_transaction_signed_before_a_stop_is_found_again_never_signed_anew() {
     assert_eq!(nonce(&l1, &s.address()), 2, "one transaction, not two");
     // (3) its nonce used by another transaction: dropped, and the next send takes the next nonce
     let (p, _) = signed_at(&l1, TEST_KEY_1, 2, b"three");
-    let (_, other) = signed_at(&l1, TEST_KEY_1, 2, b"another");
+    let (q, other) = signed_at(&l1, TEST_KEY_1, 2, b"another");
     l1.rpc("eth_sendRawTransaction", json!([other])).unwrap();
+    mined(&l1, &q.sent[0].0);
     std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
     assert!(matches!(s.recover(&l1).unwrap(), Recovered::Dropped(_)));
     assert!(s.pending().unwrap().is_none());
@@ -292,8 +306,12 @@ fn m8_an_advance_found_unmined_at_a_recovery_is_cancelled_never_sent_again() {
     l1.rpc("eth_sendRawTransaction", json!([raw])).unwrap();
     std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
     let url = a.url.clone();
+    let path = s.pending_path.clone();
     let handle = std::thread::spawn(move || s.recover(&L1::new(&url)).map(|r| format!("{r:?}")));
     std::thread::sleep(Duration::from_millis(1_500));
+    // written ahead before it left: the cancel as a version of its own label, marked (a later recovery sends it again)
+    let w: Pending = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!((w.label.as_str(), w.sent.len(), w.to.to_lowercase(), w.data.as_str(), w.gas_limit), ("advanceBatch, cancelled", 2, me, "0x", 21_000));
     l1.rpc("evm_mine", json!([])).unwrap();
     let r = handle.join().unwrap().unwrap();
     assert!(r.starts_with("Cancelled"), "{r}");
