@@ -3391,6 +3391,7 @@ dependencies = [
  "jetsam_poseidon2b",
  "jetsam_recursive",
  "jetsam_tx",
+ "jetsam_vault_rule",
  "jsonrpsee",
  "serde",
  "serde_json",
