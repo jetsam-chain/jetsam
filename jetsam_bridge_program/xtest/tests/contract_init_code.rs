@@ -9,23 +9,59 @@
 //!
 //! INFORMATION ONLY (A5-28, PROCEDURE_GEL step 7): its genesis and pause keys are test keys, its official
 //! verifier address an assumption, its vkeys those of ELFs never proven; its address is not the bridge's,
-//! and nothing here pins one. Public profile only: the rehearsal has its own synthetic bridge.
+//! and nothing here pins one.
+//!
+//! One vector per network (final audit F5): `bridge_init_code_v3.json` for the public network,
+//! `bridge_init_code_v3_testnet.json` for the test chain (`init_code_vector.sh testnet`, the testnet guests'
+//! vkeys), chosen by the node's own profile (its genesis, `network_id()`): under `jetsam_chain/testnet` the
+//! test chain's. The rehearsal has its own synthetic bridge.
 #![cfg(not(feature = "rehearsal-v1-7"))]
 
 use jetsam_chain::consensus::destination::mpt::keccak256;
 use jetsam_chain::consensus::guardian::{network_id, GUARDIAN_L1_BRIDGE};
-use jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT;
+use jetsam_chain::consensus::params::{v1_7_schedule_is_valid, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT};
 use jetsam_chain::consensus::vault::{
     bridge_deposits_from_height, MAX_DEPOSIT_MICRO, RELEASE_FEE_MICRO, VAULT_ADDRESS,
     VAULT_OUTSTANDING_CEIL_MICRO,
 };
 use serde_json::Value;
 
-const VECTOR: &str = include_str!("fixtures/bridge_init_code_v3.json");
+/// A network of the bridge: its name (the contract's `V3_PROFILE`), its genesis block id (the node's
+/// `network_id()`), its init-code vector, and the v1.7 height planned for it. `params.rs` arms J at G4 (T8.4,
+/// public network) or before G3 (test chain); until then the contract's J is held to the plan, afterwards to
+/// `V1_7_ACTIVATION_HEIGHT` itself.
+struct Profile {
+    name: &'static str,
+    network: &'static str,
+    vector: &'static str,
+    planned_j: u64,
+}
 
-/// D1: the v1.7 height planned for the public network. `params.rs` arms it at G4 (T8.4); until then the
-/// contract's J is held to the plan, afterwards to `V1_7_ACTIVATION_HEIGHT` itself.
-const D1_PLANNED_J: u64 = 69_120;
+const PROFILES: [Profile; 2] = [
+    // D1: 69 120 on the public network.
+    Profile {
+        name: "mainnet",
+        network: "6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44",
+        vector: include_str!("fixtures/bridge_init_code_v3.json"),
+        planned_j: 69_120,
+    },
+    // FINAL1 (F5): 24 000 = 25 x 960 on the test chain (its v1.6 at 4 800), not armed before G3.
+    Profile {
+        name: "testnet",
+        network: "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85",
+        vector: include_str!("fixtures/bridge_init_code_v3_testnet.json"),
+        planned_j: 24_000,
+    },
+];
+
+/// The profile of the node this test is built with (`jetsam_chain`'s features), by its genesis.
+fn this_profile() -> &'static Profile {
+    let id = hex(&network_id());
+    PROFILES
+        .iter()
+        .find(|p| p.network == id)
+        .unwrap_or_else(|| panic!("no bridge network for the node's genesis {id}"))
+}
 /// The deterministic deployment proxy every CREATE2 of the bridge goes through.
 const FACTORY: &str = "4e59b44847b379578588920ca78fbf26c0b4956c";
 
@@ -65,7 +101,9 @@ fn as_address(w: &[u8]) -> Vec<u8> {
 
 #[test]
 fn bridge_constants_match_contract_init_code() {
-    let v: Value = serde_json::from_str(VECTOR).unwrap();
+    let p = this_profile();
+    let v: Value = serde_json::from_str(p.vector).unwrap();
+    assert_eq!(v["profile"].as_str(), Some(p.name), "the vector of the node's network");
     let factory = bytes(&v["factory"]);
     assert_eq!(hex(&factory), FACTORY);
 
@@ -105,8 +143,9 @@ fn bridge_constants_match_contract_init_code() {
     let f = as_u64(word(config, 4));
     match V1_7_ACTIVATION_HEIGHT {
         Some(armed) => assert_eq!(j, armed, "the contract's J is params.rs's"),
-        None => assert_eq!(j, D1_PLANNED_J, "J is not armed in params.rs: the contract's is the plan's (D1)"),
+        None => assert_eq!(j, p.planned_j, "J is not armed in params.rs: the contract's is the plan's ({})", p.name),
     }
+    assert!(v1_7_schedule_is_valid(V1_6_ACTIVATION_HEIGHT, Some(j)), "{j} is not a v1.7 height of this profile");
     assert_eq!(Some(f), bridge_deposits_from_height(Some(j)));
     // Word 5: the network is this profile's genesis block id.
     assert_eq!(word(config, 5), &network_id()[..]);
@@ -129,4 +168,21 @@ fn bridge_constants_match_contract_init_code() {
 
     // A5-28: the vector informs, it pins nothing.
     assert_eq!(GUARDIAN_L1_BRIDGE, None, "no bridge address is pinned before a real proof of both programs");
+}
+
+/// F5: the two vectors are two bridges, each of its own network: its name, its genesis, its J, its address;
+/// checked whatever profile the node is built with.
+#[test]
+fn each_network_has_its_own_init_code_vector() {
+    let [m, t] = PROFILES.map(|p| {
+        let v: Value = serde_json::from_str(p.vector).unwrap();
+        assert_eq!(v["profile"].as_str(), Some(p.name));
+        assert_eq!(hex(&bytes(&v["config"]["jetsamNetwork"])), p.network, "{}", p.name);
+        assert_eq!(v["config"]["genesisMinLockedHeight"].as_u64(), Some(p.planned_j), "{}", p.name);
+        assert_eq!(bridge_deposits_from_height(Some(p.planned_j)), v["config"]["depositsFromHeight"].as_u64(), "{}", p.name);
+        v
+    });
+    assert_ne!(m["bridge"]["address"], t["bridge"]["address"]);
+    assert_ne!(m["checkpointVerifier"]["vkey"], t["checkpointVerifier"]["vkey"], "one checkpoint program per network");
+    assert_eq!(m["factory"], t["factory"]);
 }
