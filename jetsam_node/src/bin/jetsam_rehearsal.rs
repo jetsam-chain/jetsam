@@ -41,9 +41,7 @@ use jetsam_chain::consensus::guardian::rehearsal::rehearsal_attestation;
 use jetsam_chain::consensus::guardian::GuardianAttestation;
 use jetsam_chain::consensus::params::is_coinbase_creation_id;
 use jetsam_chain::consensus::pow::block_id;
-use jetsam_chain::consensus::vault::{
-    deposit_marker, VaultRelease, VaultRules, VAULT_ADDRESS, VAULT_SECRET,
-};
+use jetsam_chain::consensus::vault::{VaultRelease, VaultRules, VAULT_ADDRESS, VAULT_SECRET};
 use jetsam_gkr::{prove_paged_spend_authorization, OwnerAuthWitness};
 use jetsam_mempool::destination::{CommitteeUpdateIntent, DestinationIntent, ReleaseIntent};
 use jetsam_mempool::guardian::GuardianIntent;
@@ -74,10 +72,9 @@ pub fn committee_update_outputs(payload: &[u8]) -> Vec<(Address, u64)> {
     vec![(committee_update_marker(payload), 0)]
 }
 
-/// The outputs of a deposit of `amount` for the L1 `recipient`, before the change.
-pub fn deposit_outputs(amount: u64, recipient: &[u8; 20]) -> Vec<(Address, u64)> {
-    vec![(VAULT_ADDRESS, amount), (deposit_marker(recipient), 0)]
-}
+/// The outputs of a deposit of `amount` for the L1 `recipient`, before the
+/// change: the definition `jetsam-cli bridge deposit` builds with too.
+pub use jetsam_rpc::bridge::deposit_outputs;
 
 /// The outputs of a guardian object's payment, before the change.
 pub fn guardian_outputs(attestation: &GuardianAttestation) -> Vec<(Address, u64)> {
