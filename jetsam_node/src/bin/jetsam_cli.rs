@@ -3983,7 +3983,8 @@ mod stake_tests {
 mod bridge_tests {
     use super::{
         build_refusal, deposit_preflight, deposits_closed_reason, deposits_line, is_confirmation,
-        BridgeCommand, Cli, Command,
+        unknown_outcome_message, BridgeCommand, Cli, Command, RpcCallError,
+        BRIDGE_DEPOSIT_RPC_TIMEOUT,
     };
     use clap::{CommandFactory, Parser};
     use jetsam_chain::consensus::vault::{
@@ -4174,6 +4175,31 @@ mod bridge_tests {
         node["deposits_last_1024"] = json!(3);
         node["deposit_heights_unread"] = json!(0);
         assert_eq!(deposits_line(&node), "3 in the last 1024 blocks");
+    }
+
+    /// The deposit call proves the deposit in the node's wallet: measured
+    /// over the client's 60 s on this machine at load 560 (the call was cut,
+    /// the node dropped the deposit). It gets ten minutes, and a call that
+    /// still gets no answer is said to have an unknown outcome — never "the
+    /// node is not responding" alone, which invites sending a second deposit.
+    /// A refusal of the node is a refusal.
+    #[test]
+    fn a_deposit_without_an_answer_has_an_unknown_outcome() {
+        assert!(BRIDGE_DEPOSIT_RPC_TIMEOUT >= std::time::Duration::from_secs(600));
+        let cut = anyhow::anyhow!("Node is not responding.\n\tIs the jetsam daemon running?");
+        let message = unknown_outcome_message(&cut).expect("no answer");
+        assert!(
+            message.contains("unknown")
+                && message.contains("twice")
+                && message.contains("bridge status"),
+            "{message}"
+        );
+        let refused = anyhow::Error::new(RpcCallError {
+            code: -32000,
+            message: "deposit refused by the mempool: BelowMinFee".into(),
+            data: None,
+        });
+        assert_eq!(unknown_outcome_message(&refused), None);
     }
 
     /// Only the word itself confirms a deposit: not `y`, not an empty line.
