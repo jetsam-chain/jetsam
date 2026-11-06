@@ -3541,3 +3541,223 @@ mod stake_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::{
+        build_refusal, deposit_preflight, deposits_closed_reason, is_confirmation, BridgeCommand,
+        Cli, Command,
+    };
+    use clap::{CommandFactory, Parser};
+    use jetsam_chain::consensus::vault::{
+        bridge_deposits_from_height, VaultRules, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO,
+    };
+    use serde_json::json;
+
+    const ONE: u64 = 1_000_000;
+    const RECIPIENT: [u8; 20] = [0x5a; 20];
+    const ADDRESS: &str = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+
+    fn armed(j: u64) -> VaultRules {
+        let mut rules = VaultRules::current();
+        rules.activation_height = Some(j);
+        rules.deposits_from_height = bridge_deposits_from_height(Some(j));
+        rules
+    }
+
+    fn unarmed() -> VaultRules {
+        let mut rules = VaultRules::current();
+        rules.activation_height = None;
+        rules.deposits_from_height = None;
+        rules
+    }
+
+    /// A `getVaultState` reply at `tip` with the opening `f` and `room` left.
+    fn state(active: bool, tip: u64, f: Option<u64>, room: u64) -> serde_json::Value {
+        json!({
+            "active": active, "tip_height": tip, "bridge_locked": 10_000 * ONE - room,
+            "ceiling": 10_000 * ONE, "room": room, "floor": 95, "deposits_from_height": f,
+            "released_count": 0, "released_in_window": 0, "window_blocks": 480,
+            "window_cap": 2_500 * ONE, "deposits_by_height": [], "deposits_last_1024": 0,
+            "held_releases": 0, "deposit_heights_unread": 0,
+        })
+    }
+
+    #[test]
+    fn the_bridge_commands_parse() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").cmd {
+            Command::Bridge(command) => command,
+            _ => panic!("not a bridge command"),
+        };
+        match parse(&["jetsam-cli", "bridge", "deposit", ADDRESS, "12.5"]) {
+            BridgeCommand::Deposit {
+                recipient,
+                amount,
+                fee,
+                dry_run,
+                yes,
+            } => {
+                assert_eq!(recipient, ADDRESS);
+                assert_eq!(amount, "12.5");
+                assert_eq!(fee, None);
+                assert!(
+                    !dry_run && !yes,
+                    "neither a dry run nor confirmed by default"
+                );
+            }
+            _ => panic!("not a deposit"),
+        }
+        assert!(matches!(
+            parse(&[
+                "jetsam-cli", "bridge", "deposit", ADDRESS, "3", "--fee", "0.05", "--yes",
+                "--dry-run"
+            ]),
+            BridgeCommand::Deposit { fee: Some(fee), yes: true, dry_run: true, .. } if fee == "0.05"
+        ));
+        assert!(matches!(
+            parse(&["jetsam-cli", "bridge", "status"]),
+            BridgeCommand::Status
+        ));
+        assert!(
+            Cli::try_parse_from(["jetsam-cli", "bridge", "deposit", ADDRESS]).is_err(),
+            "an amount is required"
+        );
+    }
+
+    /// While the build's v1.7 height is none the CLI sends nothing and says
+    /// why, before it asks the node anything; on the public network it says
+    /// so in as many words.
+    #[test]
+    fn this_build_refuses_every_deposit_while_its_v1_7_height_is_none() {
+        let mainnet = build_refusal(&unarmed(), false).expect("refused");
+        assert!(mainnet.contains("mainnet"), "{mainnet}");
+        assert!(mainnet.contains("not armed"), "{mainnet}");
+        assert!(mainnet.contains("Nothing was sent"), "{mainnet}");
+        let testnet = build_refusal(&unarmed(), true).expect("refused");
+        assert!(!testnet.contains("mainnet"), "{testnet}");
+        assert!(testnet.contains("not armed"), "{testnet}");
+        assert_eq!(build_refusal(&armed(9_600), false), None);
+        assert_eq!(build_refusal(&armed(9_600), true), None);
+        let current = build_refusal(
+            &VaultRules::current(),
+            jetsam_chain::consensus::identity::IS_TEST_CHAIN,
+        );
+        assert_eq!(
+            current.is_some(),
+            jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_none()
+        );
+    }
+
+    /// The node is asked before anything is planned: not active at its next
+    /// block, an opening other than this CLI's, or not open yet — each said
+    /// in clear; open from the block after F.
+    #[test]
+    fn deposits_are_open_only_when_the_node_and_this_cli_agree() {
+        let rules = armed(9_600);
+        let f = rules.deposits_from_height.unwrap();
+        let room = 10_000 * ONE;
+        assert_eq!(
+            deposits_closed_reason(&state(true, f, Some(f), room), &rules),
+            None
+        );
+        assert_eq!(
+            deposits_closed_reason(&state(true, f + 500, Some(f), room), &rules),
+            None
+        );
+        let not_yet = deposits_closed_reason(&state(true, f - 1, Some(f), room), &rules)
+            .expect("closed at F");
+        assert!(
+            not_yet.contains(&format!("{}", f + 1)) && not_yet.contains("1 more block"),
+            "{not_yet}"
+        );
+        let below_j = deposits_closed_reason(&state(false, 100, Some(f), room), &rules)
+            .expect("closed below J");
+        assert!(below_j.contains("not active"), "{below_j}");
+        let other = deposits_closed_reason(&state(true, f + 5, Some(f + 960), room), &rules)
+            .expect("disagree");
+        assert!(other.contains("disagree"), "{other}");
+        let none = deposits_closed_reason(&state(true, f + 5, None, room), &rules)
+            .expect("the node has no F");
+        assert!(
+            none.contains("disagree") || none.contains("not armed"),
+            "{none}"
+        );
+        let this_build = deposits_closed_reason(&state(true, f + 5, Some(f), room), &unarmed())
+            .expect("this build is not armed");
+        assert!(this_build.contains("not armed"), "{this_build}");
+    }
+
+    /// The amount: within the limits of one deposit and within the vault's
+    /// room (V8, as the node reports it); the next block's height otherwise.
+    #[test]
+    fn a_deposit_is_checked_against_the_limits_and_the_room_before_it_is_planned() {
+        let rules = armed(9_600);
+        let f = rules.deposits_from_height.unwrap();
+        let open = state(true, f + 3, Some(f), 50 * ONE);
+        assert_eq!(
+            deposit_preflight(&open, 50 * ONE, &RECIPIENT, &rules),
+            Ok(f + 4)
+        );
+        let full = deposit_preflight(&open, 50 * ONE + 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(full.contains("room"), "{full}");
+        let wide = state(true, f + 3, Some(f), 10_000 * ONE);
+        let small =
+            deposit_preflight(&wide, MIN_DEPOSIT_MICRO - 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(small.contains("minimum"), "{small}");
+        let large =
+            deposit_preflight(&wide, MAX_DEPOSIT_MICRO + 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(large.contains("maximum"), "{large}");
+        let zero = deposit_preflight(&wide, 10 * ONE, &[0u8; 20], &rules).unwrap_err();
+        assert!(zero.contains("zero"), "{zero}");
+        let closed = deposit_preflight(
+            &state(true, f - 1, Some(f), 50 * ONE),
+            5 * ONE,
+            &RECIPIENT,
+            &rules,
+        );
+        assert!(closed.is_err());
+    }
+
+    /// Only the word itself confirms a deposit: not `y`, not an empty line.
+    #[test]
+    fn only_yes_confirms_a_deposit() {
+        for answer in ["yes", "YES", "Yes", " yes\n"] {
+            assert!(is_confirmation(answer), "{answer:?}");
+        }
+        for answer in ["", "\n", "y", "Y", "no", "oui", "yes please", "ye"] {
+            assert!(!is_confirmation(answer), "{answer:?}");
+        }
+    }
+
+    /// Public text: the bridge's help and messages say Base/EVM, never the
+    /// network's name nor the two-letter name of the proof technique.
+    #[test]
+    fn the_bridge_texts_say_base_evm_only() {
+        let mut command = Cli::command();
+        command.build();
+        let bridge = command
+            .find_subcommand_mut("bridge")
+            .expect("a bridge command");
+        let mut help = bridge.render_long_help().to_string();
+        for sub in bridge.get_subcommands_mut() {
+            help.push_str(&sub.render_long_help().to_string());
+        }
+        assert!(help.contains("Base/EVM"), "{help}");
+        let source = include_str!("jetsam_cli.rs");
+        let code = source.split(&["#[cfg", "(test)]"].concat()).next().unwrap();
+        let network = ["ether", "eum"].concat();
+        let technique = ["z", "k"].concat();
+        for text in [help.as_str(), code] {
+            let lower = text.to_ascii_lowercase();
+            assert!(!lower.contains(&network), "the network's name");
+            assert!(
+                !lower
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word == technique),
+                "the technique's name"
+            );
+        }
+        let refusal = build_refusal(&unarmed(), false).unwrap();
+        assert!(!refusal.to_ascii_lowercase().contains(&network));
+    }
+}
