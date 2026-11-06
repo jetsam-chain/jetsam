@@ -9,6 +9,9 @@ description = "In CI: G6 = V4 (the node's vault gate and the bridge proof progra
 [features]
 # The private rehearsal: the node and the program on their rehearsal clocks.
 rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7", "jetsam_bridge_program/rehearsal-v1-7"]
+# The test chain: the node and the program on its clocks (`jetsam_chain/testnet` alone arms the program too,
+# through `jetsam_vault_rule::TESTNET_PROFILE`; this names both, as `rehearsal-v1-7` does).
+testnet = ["jetsam_chain/testnet", "jetsam_bridge_program/testnet"]
 
 [dependencies]
 jetsam_chain = { path = "../../jetsam_chain" }
