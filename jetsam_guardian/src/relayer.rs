@@ -786,6 +786,20 @@ pub fn relay_halted(state_dir: &Path) -> Option<String> {
     std::fs::read_to_string(state_dir.join("HALT")).ok().map(|s| s.trim().to_string())
 }
 
+/// T7.7 (A3, the private rehearsal's "J-RACE"): one process at a time writes a relayer's state directory. The running
+/// `jg-relay` holds an exclusive `flock` on `<state_dir>/lock` for its whole run (it writes its archive index from its
+/// memory at every step); an operator's `acknowledge` or `import-block` takes it for its write, so it is refused while
+/// a relayer runs — never a success its next step undoes. Held as long as the returned file is open.
+pub fn lock_relay_state_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    // SAFETY: flock on a descriptor we own.
+    let r = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    anyhow::ensure!(r == 0, "another process holds {} (a running jg-relay, or an operator's acknowledge or import-block)", dir.join("lock").display());
+    Ok(lock)
+}
+
 /// Latch `code` in `<state_dir>/HALT` (once: a code already there is not added again).
 pub fn latch_relay_halt(state_dir: &Path, code: &str) -> anyhow::Result<()> {
     let mut text = std::fs::read_to_string(state_dir.join("HALT")).unwrap_or_default();

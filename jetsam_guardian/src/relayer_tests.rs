@@ -1043,3 +1043,16 @@ fn t77_a_tip_lowered_under_an_unread_body_that_fails_mn5_is_missing_body() {
     assert!(plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[], ts(&c, GL) + 10_000).is_ok(), "it does, once the body is read");
     assert_eq!(plan(&c, &known, &gid, &g.cp.cum_work, GL, &none, &[12], ts(&c, GL) + 30_000), Err(NoSubmission::WorkRateTooLow), "the whole chain fails MN-5 too");
 }
+
+/// T7.7 (A3): `<state_dir>/lock` is held by one process at a time, the reason said, and released with its holder.
+/// (Written with the code; its mutant `a3-lock-never-held` is the red.)
+#[test]
+fn t77_the_state_directory_is_held_by_one_process_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let first = lock_relay_state_dir(&state).unwrap();
+    let e = lock_relay_state_dir(&state).unwrap_err().to_string();
+    assert!(e.contains("another process holds") && e.contains(&state.join("lock").display().to_string()), "{e}");
+    drop(first);
+    assert!(lock_relay_state_dir(&state).is_ok(), "released with its holder");
+}

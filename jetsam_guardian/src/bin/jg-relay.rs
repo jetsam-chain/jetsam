@@ -33,7 +33,8 @@
 //!
 //! Egress (A4-1, D60, D66): nodes and L1 through Tor or on the loopback only (the private rehearsal's
 //! clearnet: its bridge only). Operator commands: `acknowledge <height> <reason>`, `import-block <height>
-//! <file>`, `print-genesis <locked height>`, `claim-direct <height> <txid>` (queued for the running relayer).
+//! <file>` (the relayer stopped: refused while it holds `<state_dir>/lock`, T7.7), `print-genesis <locked height>`,
+//! `claim-direct <height> <txid>` (queued for the running relayer).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -805,6 +806,14 @@ fn read_state(path: &std::path::Path) -> anyhow::Result<State> {
 /// Operator commands (D41): they change the archive or the request queue only, never the L1 (the running
 /// relayer, the only process signing with its key, sends what is queued).
 fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
+    // T7.7 (A3): acknowledge and import-block write the archive index, which a running relayer writes over from its
+    // memory at its next step: refused while another process holds the state directory, never a success then lost
+    let _lock = match cmd.first().map(String::as_str) {
+        Some(c @ ("acknowledge" | "import-block")) => Some(relayer::lock_relay_state_dir(&cfg.state_dir).map_err(|e| {
+            anyhow::anyhow!("{e:#}: {c} refused, nothing written (a running jg-relay would write its own archive index over it at its next step): stop it by its PID, then run {c} again")
+        })?),
+        _ => None,
+    };
     let mut archive = Archive::open(&cfg.state_dir.join("archive"))?;
     match cmd.first().map(String::as_str) {
         Some("acknowledge") => {
@@ -881,6 +890,9 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config sha256 {digest}, {profile}, egress {egress:?}, {} nodes, cadence {} s, prover {}", cfg.nodes.len(), cfg.cadence_secs, cfg.prover.mode));
     std::fs::create_dir_all(&cfg.state_dir)?;
     std::fs::create_dir_all(&cfg.publish_dir)?;
+    // T7.7 (A3): the state directory is this process's for the whole run (an operator's acknowledge or import-block
+    // meanwhile is refused instead of written over), taken before any socket
+    let _lock = relayer::lock_relay_state_dir(&cfg.state_dir).map_err(|e| anyhow::anyhow!("{e:#}: jg-relay does not start"))?;
     // A5-14: read before any socket (an unreadable state is no start, and nothing is dialled)
     let state = read_state(&cfg.state_dir.join("state.json"))?;
     let l1 = L1::via(&cfg.l1_rpc, egress);
