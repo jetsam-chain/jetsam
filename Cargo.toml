@@ -58,7 +58,11 @@ resolver = "2"
 # 1.6.1 keeps the 1.6.0 consensus rules and activation heights, and pins
 # blocks 46079 and 46080 (the public network's v1.6 crossing): a node
 # installed or re-synced from now on can only follow the real chain.
-version = "1.6.1"
+# 1.7.0 is the first build that knows the v1.7 fork (the bridge vault and
+# its destination rules). It ships dormant: neither the public network nor
+# the test chain carries a v1.7 height yet, so below one it applies the
+# 1.6.1 consensus rules, its pins included.
+version = "1.7.0"
 edition = "2021"
 license = "Apache-2.0"
 

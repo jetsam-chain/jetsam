@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "jetsam_bridge_program"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "jetsam_bridge_towerwalk",
  "jetsam_vault_rule",
@@ -291,11 +291,11 @@ dependencies = [
 
 [[package]]
 name = "jetsam_bridge_towerwalk"
-version = "1.6.1"
+version = "1.7.0"
 
 [[package]]
 name = "jetsam_vault_rule"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "jetsam_bridge_towerwalk",
 ]
