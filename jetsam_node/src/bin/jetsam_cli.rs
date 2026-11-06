@@ -2947,8 +2947,7 @@ fn build_refusal(rules: &VaultRules, is_test_chain: bool) -> Option<String> {
     Some(format!(
         "{build} has no v1.7 activation height (V1_7_ACTIVATION_HEIGHT is None): the bridge is \
          not armed, and its vault is an ordinary address whose spend secret is published, so \
-         anyone could take coins sent there. Nothing was sent. Deposits open with the release \
-         that arms v1.7."
+         anyone could take coins sent there. Deposits open with the release that arms v1.7."
     ))
 }
 
@@ -3015,6 +3014,19 @@ fn deposit_preflight(
         ));
     }
     Ok(next)
+}
+
+/// The deposits `getVaultState` counted over its last 1 024 heights, and the
+/// heights among them whose block the node no longer retains (not counted).
+fn deposits_line(state: &Value) -> String {
+    let counted = state["deposits_last_1024"].as_u64().unwrap_or(0);
+    match state["deposit_heights_unread"].as_u64().unwrap_or(0) {
+        0 => format!("{counted} in the last 1024 blocks"),
+        unread => format!(
+            "{counted} in the last 1024 blocks ({unread} of them no longer retained by the node: \
+             not counted)"
+        ),
+    }
 }
 
 /// Only the word itself confirms a deposit.
@@ -3101,13 +3113,7 @@ async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         &coins(&state["room"]),
         &format!("(ceiling {})", coins(&state["ceiling"])),
     );
-    kv(
-        "Deposits",
-        &format!(
-            "{} in the last 1024 blocks",
-            state["deposits_last_1024"].as_u64().unwrap_or(0)
-        ),
-    );
+    kv("Deposits", &deposits_line(&state));
     kv(
         "Releases paid",
         &state["released_count"].as_u64().unwrap_or(0).to_string(),
@@ -3144,7 +3150,7 @@ async fn cmd_bridge_deposit(
         );
     }
     if let Some(refusal) = build_refusal(&rules, jetsam_chain::consensus::identity::IS_TEST_CHAIN) {
-        bail!(refusal);
+        bail!("{refusal} Nothing was sent.");
     }
 
     // --- The node's bridge, then the plan (no side effect) ---
@@ -4063,7 +4069,10 @@ mod bridge_tests {
         let mainnet = build_refusal(&unarmed(), false).expect("refused");
         assert!(mainnet.contains("mainnet"), "{mainnet}");
         assert!(mainnet.contains("not armed"), "{mainnet}");
-        assert!(!mainnet.contains("sent"), "a reason, read by bridge status too: {mainnet}");
+        assert!(
+            !mainnet.contains("Nothing was sent"),
+            "a reason, read by bridge status too: {mainnet}"
+        );
         let testnet = build_refusal(&unarmed(), true).expect("refused");
         assert!(!testnet.contains("mainnet"), "{testnet}");
         assert!(testnet.contains("not armed"), "{testnet}");
@@ -4158,7 +4167,10 @@ mod bridge_tests {
         node["deposits_last_1024"] = json!(0);
         node["deposit_heights_unread"] = json!(845);
         let line = deposits_line(&node);
-        assert!(line.contains("845") && line.contains("not counted"), "{line}");
+        assert!(
+            line.contains("845") && line.contains("not counted"),
+            "{line}"
+        );
         node["deposits_last_1024"] = json!(3);
         node["deposit_heights_unread"] = json!(0);
         assert_eq!(deposits_line(&node), "3 in the last 1024 blocks");
