@@ -28,6 +28,8 @@ pub struct HeaderInfo {
     pub target: [u8; 32],
     /// `block_work(target)`, u256 little-endian.
     pub work: [u8; 32],
+    /// Every live output the chain created up to this block included (consensus checks it at every block).
+    pub alloc_counter: u64,
     /// The 212 raw bytes.
     pub raw: Vec<u8>,
 }
@@ -52,6 +54,7 @@ impl HeaderInfo {
             timestamp: header.timestamp,
             target: header.difficulty_target,
             work: block_work(&header.difficulty_target),
+            alloc_counter: header.alloc_counter,
             raw: raw.to_vec(),
         })
     }

@@ -30,7 +30,8 @@
 //!   its deposits taken with the node's own rule, and the body of every block holding a deposit is kept on
 //!   disk, verified (id, `tx_root`). A block read too late is `Missing`: no checkpoint locks it (its
 //!   deposits could never be proven by anyone) until an operator imports its body or acknowledges the
-//!   omission (D41: a person decides, never the program).
+//!   omission (D41: a person decides, never the program) — unless its header proves it holds no deposit
+//!   (T7.7: it created one output, its coinbase's, [`outputs_created`]).
 //! * **Proofs** ([`Prover`]): a command (the prover of the checkpoint program, given the program's input
 //!   file) or, on the private rehearsal only, the TEST mock verifier's simulated proof.
 
@@ -845,7 +846,7 @@ pub enum Body {
         deposits: Vec<FoundDeposit>,
     },
     /// No longer served when the relayer came to it, or served by no source in a form the relayer could
-    /// verify (`reason`): its deposits are unknown.
+    /// verify (`reason`), and its header does not prove it holds no deposit: its deposits are unknown.
     Missing {
         #[serde(with = "crate::checkpoint::hex32")]
         block_id: [u8; 32],
@@ -858,12 +859,18 @@ pub enum Body {
         block_id: [u8; 32],
         reason: String,
     },
+    /// T7.7 (A5): served by no source, and its header proves it holds no deposit: it created one output, its
+    /// coinbase's ([`outputs_created`]). No body to keep, nothing to acknowledge.
+    CoinbaseOnly {
+        #[serde(with = "crate::checkpoint::hex32")]
+        block_id: [u8; 32],
+    },
 }
 
 impl Body {
     pub fn block_id(&self) -> [u8; 32] {
         match self {
-            Body::Read { block_id, .. } | Body::Missing { block_id, .. } | Body::Acknowledged { block_id, .. } => *block_id,
+            Body::Read { block_id, .. } | Body::Missing { block_id, .. } | Body::Acknowledged { block_id, .. } | Body::CoinbaseOnly { block_id } => *block_id,
         }
     }
 }
@@ -925,9 +932,14 @@ impl Archive {
         self.index.insert(height, Body::Missing { block_id: *id, reason: reason.to_string() });
     }
 
-    /// A block no source serves (`reason`), whose id on `_chain` is `id`: `Missing`. True when it is known all the same
-    /// (never, yet).
-    pub fn record_unserved(&mut self, _chain: &Chain, height: u64, id: &[u8; 32], reason: &str) -> bool {
+    /// T7.7 (A5): a block no source serves (`reason`), whose id on `chain` is `id`: known without deposit when its
+    /// header proves it ([`Body::CoinbaseOnly`]), else `Missing` (its deposits unknown: nothing is concluded, an operator
+    /// imports its body or acknowledges its omission, D41). True when it is known.
+    pub fn record_unserved(&mut self, chain: &Chain, height: u64, id: &[u8; 32], reason: &str) -> bool {
+        if chain.id_at(height) == Some(*id) && outputs_created(chain, height) == Some(1) {
+            self.index.insert(height, Body::CoinbaseOnly { block_id: *id });
+            return true;
+        }
         self.record_missing(height, id, reason);
         false
     }
@@ -977,6 +989,15 @@ impl Archive {
         anyhow::ensure!(jetsam_chain::consensus::pow::block_id(&block.header) == *block_id, "archived block {height}: not the recorded block");
         Ok(Some(raw))
     }
+}
+
+/// T7.7 (A5): the live outputs block `height` of `chain` created, by its header: its `alloc_counter` less its parent's
+/// (every live output ever created, the coinbase's included, checked by consensus at every block). `None` when its
+/// parent's header is not kept. One is its primary coinbase's alone (every block but the genesis has one, of exactly
+/// one live output: `validate_block_page_stream`): no user output, so no deposit — known without its body.
+pub fn outputs_created(chain: &Chain, height: u64) -> Option<u64> {
+    let parent = chain.header_at(height.checked_sub(1)?)?;
+    chain.header_at(height)?.alloc_counter.checked_sub(parent.alloc_counter)
 }
 
 /// One source of a block body: its name and a reader (`Ok(None)`: it does not serve the block).

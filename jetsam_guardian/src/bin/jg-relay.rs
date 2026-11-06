@@ -295,11 +295,20 @@ impl Relay {
                     }
                 }
                 Err(reason) => {
+                    // T7.7 (A5): known without its body only when its header proves it holds no deposit, else MISSING
+                    // (nothing concluded: an operator decides)
                     if self.archive.record_unserved(&self.chain, h, &id, &reason) {
+                        if was_missing {
+                            log(&format!("block {h}: no deposit, proven by its header (its coinbase's output only): no longer missing"));
+                        }
                         continue;
                     }
                     if !was_missing {
-                        log(&format!("ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"));
+                        let outputs = relayer::outputs_created(&self.chain, h).map_or("an unknown number of".to_string(), |n| n.to_string());
+                        log(&format!(
+                            "ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): its body is unknown and its header does not prove it holds no deposit ({outputs} outputs created, \
+                             the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
+                        ));
                         self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason}));
                     }
                 }
