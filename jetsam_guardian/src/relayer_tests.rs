@@ -991,6 +991,7 @@ fn r3_5_a_bounded_point_that_fails_mn5_like_the_whole_window_is_work_rate_too_lo
     let plan = |bound: usize| plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], late, bound);
     assert_eq!(plan(deposit_blocks_bound(3_000_000, 25)), Err(NoSubmission::WorkRateTooLow));
     assert_eq!(plan(5), Err(NoSubmission::WorkRateTooLow), "bounded, but the whole window fails MN-5 as well");
+}
 
 /// T7.7 (the real private chain, 2026-11-05): while the contract's final point is still the genesis (its L is
 /// `gl`), the first deposit block the relayer archived made every step of `jg-relay` panic in
