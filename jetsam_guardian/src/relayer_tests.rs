@@ -1115,3 +1115,55 @@ fn t77_an_unserved_block_is_known_without_deposit_only_when_its_header_proves_it
     ar.save().unwrap();
     assert_eq!(Archive::open(dir.path()).unwrap().index, ar.index);
 }
+
+/// Final audit F2 (its PoC): a child that forks (`fork_depth` ≥ 1) may keep its parent's L — the contract refuses
+/// a child at its parent's L only when it extends it (`forkDepth == 0`, `JetsamBridge.sol`, R4) — so the window
+/// `]parent.L ; L]` of `plan_submission` is empty: no deposit block, never `found.range(L + 1..=L)` ("range start is
+/// greater than range end in BTreeMap", raised only on a non-empty map, hence "from the first deposit" in T7.7).
+/// Here the bridge's tip X is a sibling of the relayer's block at the same height, with the same work: not
+/// strictly heavier (R3), with an empty map and with a deposit below L alike.
+#[test]
+fn f2_a_forking_child_locked_at_its_parents_l_with_the_same_work_is_not_heavier_and_never_panics() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    // X: height 40 on a sibling branch (c up to 39, another block 40)
+    let sib = fork_of(&c, 39, 1, 7);
+    // the relayer's chain: the honest branch, its tip at the same height 40
+    let mut c40 = c.clone();
+    c40.truncate_above(40);
+    for found in [found_of(&[]), found_of(&[dep(20, 1, 3 * JTM)])] {
+        let l = sib.locked_height(40).unwrap();
+        let (xid, x) = known_at(&sib, 40, gid, &deposits_upto(&found, GL, l), 100);
+        assert_ne!(Some(x.cp.tip_block_id), c40.id_at(40), "X's block 40 is a sibling of the relayer's");
+        assert_eq!(c40.locked_height(40), Some(x.cp.locked_height), "the same L");
+        let known = HashMap::from([(gid, g.clone()), (xid, x.clone())]);
+        let r = plan(&c40, &known, &xid, &x.cp.cum_work, GL, &found, &[], ts(&c40, 40) + 60);
+        assert_eq!(r.map(|s| s.fork_depth), Err(NoSubmission::NotHeavier), "{} deposit block(s)", found.len());
+    }
+}
+
+/// F2, the submission itself: the relayer's block at the parent's tip height carries more work than X's sibling
+/// while L stays the parent's (blocks 33..=39 four times as heavy as 32, so neither block 40 moves L off 32): a
+/// child with `fork_depth` 1, the parent's L, and an empty list of deposit blocks, with or without deposits.
+#[test]
+fn f2_a_heavier_forking_child_locked_at_its_parents_l_is_planned_with_no_deposit_block() {
+    let mut c = testkit::chain(32, 1);
+    testkit::extend(&mut c, 7, 1, 22);
+    let (gid, g) = genesis_known(&c);
+    // X: block 40' of the work of block 32; the relayer's block 40: twice that
+    let sib = fork_of(&c, 39, 1, 7);
+    let mut ours = c.clone();
+    testkit::extend(&mut ours, 1, 1, 21);
+    assert_eq!((sib.locked_height(40), ours.locked_height(40)), (Some(32), Some(32)), "the same L");
+    for found in [found_of(&[]), found_of(&[dep(20, 1, 3 * JTM)])] {
+        let (xid, x) = known_at(&sib, 40, gid, &deposits_upto(&found, GL, 32), 100);
+        let known = HashMap::from([(gid, g.clone()), (xid, x.clone())]);
+        let s = plan(&ours, &known, &xid, &x.cp.cum_work, GL, &found, &[], ts(&ours, 40) + 60)
+            .unwrap_or_else(|e| panic!("{} deposit block(s): {e:?}", found.len()));
+        assert_eq!((s.parent, s.fork_depth, s.base), (xid, 1, 39));
+        assert_eq!((s.next.height, s.next.locked_height), (40, x.cp.locked_height));
+        assert_eq!(s.next.tip_block_id, ours.id_at(40).unwrap());
+        assert!(s.deposit_blocks.is_empty(), "the window ]L ; L] holds no deposit block");
+        assert_eq!(s.deposits, deposits_upto(&found, GL, 32), "the parent's tree, unchanged");
+    }
+}
