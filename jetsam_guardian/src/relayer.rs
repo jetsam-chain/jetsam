@@ -925,6 +925,13 @@ impl Archive {
         self.index.insert(height, Body::Missing { block_id: *id, reason: reason.to_string() });
     }
 
+    /// A block no source serves (`reason`), whose id on `_chain` is `id`: `Missing`. True when it is known all the same
+    /// (never, yet).
+    pub fn record_unserved(&mut self, _chain: &Chain, height: u64, id: &[u8; 32], reason: &str) -> bool {
+        self.record_missing(height, id, reason);
+        false
+    }
+
     /// An operator's decision on a `Missing` block: its omission is accepted.
     pub fn acknowledge(&mut self, height: u64, reason: &str) -> anyhow::Result<()> {
         match self.index.get(&height) {

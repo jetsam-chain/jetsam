@@ -295,7 +295,9 @@ impl Relay {
                     }
                 }
                 Err(reason) => {
-                    self.archive.record_missing(h, &id, &reason);
+                    if self.archive.record_unserved(&self.chain, h, &id, &reason) {
+                        continue;
+                    }
                     if !was_missing {
                         log(&format!("ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"));
                         self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason}));
