@@ -858,6 +858,69 @@ mod tests {
         }
     }
 
+    /// The same through the public network's v1.6 crossing (block 46 080,
+    /// 2026-10-29): a node left on v1.5.1 goes on mining its own 46 080' on the
+    /// real 46 079. A header at 46 079 or 46 080 that is not the pinned block is
+    /// refused by `CheckpointMismatch` before parent, target or proof-of-work
+    /// are read, on every acceptance path; the real headers are the pins and
+    /// pass the pin step. The raw headers are those the four mainnet seeds
+    /// served on 2026-10-30 (`jetsam_getHeaderByHeight`, the bytes of the
+    /// v1.6.1 release's crossing test).
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn a_header_at_46079_or_46080_other_than_the_pinned_block_is_refused() {
+        use crate::consensus::params::{hard_checkpoint, HARD_CHECKPOINTS};
+        const SEED_HEADER_46079: &str = "3f3578cad1c7d8fb40f247ca4554de26322b06043310edf560a3a5fbde88633b0577d4b4374fbae064aeff79888a07fc02c27362706f10643f78d7b51de79d6e72cd2a5cd9127f0e41c8adbc59cd7d351435255fbed884e1e3f66c28318a8b4ba8c0e36a00000000ffb30000000000008f2bdf39af91926de8204283e0a01a661ef9292bb30792adb54295c6faa0607dc13602000000c00055586517aa06000007d9df5f3824cefb090b780852676292bf3bb3a537faa05e1abbdaed0f00000018000000b8e7000000000000a1d0010000000000";
+        const SEED_HEADER_46080: &str = "cf00a7d007821cd38488ec025a78a456bfaf7f6958595606798e0de8a852a6934bcb98ca2bc921f4818762f135f9e29127e30601162271d438bbe708754c641c14414e912da7410ec1e25821cca329cf2791314ea4e6df62b83232a92156dd5830c1e36a0000000000b40000000000002f3c1654dd1288326987fa6cc82f8108b84ae31beb23e3907457cff6bc9de442174b010000007006f121269bf1f15403cbe1eb41a33bafc0c07dfeb3c3436a457006f79603ed262a8205beb90d00000018000000bbe7000000000000a4d0010000000000";
+        fn header(hex: &str) -> BlockHeader {
+            let bytes = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            BlockHeader::from_bytes(&bytes).unwrap()
+        }
+        let (h46079, h46080) = (header(SEED_HEADER_46079), header(SEED_HEADER_46080));
+        assert_eq!((h46079.height, h46080.height), (46_079, 46_080));
+        assert_eq!(h46080.prev_block_hash, block_id(&h46079), "one chain");
+        for real in [h46079, h46080] {
+            assert_eq!(
+                hard_checkpoint(real.height),
+                Some(block_id(&real)),
+                "the block at {} is pinned",
+                real.height
+            );
+            assert_eq!(check_hard_checkpoint(&real, HARD_CHECKPOINTS), Ok(()));
+            let parent = make_header(real.height - 1, real.timestamp - BLOCK_TIME, None);
+            assert_ne!(
+                validate_header_timeless(
+                    &real,
+                    &parent,
+                    &[parent.timestamp],
+                    &[],
+                    &anchor_at(parent),
+                ),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+            // The other branch's block at the same height, on the same parent.
+            let mut other = real;
+            other.nonce ^= 1;
+            assert_eq!(other.prev_block_hash, real.prev_block_hash);
+            assert_eq!(
+                check_hard_checkpoint(&other, HARD_CHECKPOINTS),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+            assert_eq!(
+                validate_header_timeless(
+                    &other,
+                    &parent,
+                    &[parent.timestamp],
+                    &[],
+                    &anchor_at(parent),
+                ),
+                Err(ConsensusError::CheckpointMismatch)
+            );
+        }
+    }
+
     /// Through the production validator and the real pin list: the reset test
     /// chain carries no pin yet, so no block is refused for a checkpoint. Once
     /// the new chain has crossed its own blocks, pin one and restore the refusal
