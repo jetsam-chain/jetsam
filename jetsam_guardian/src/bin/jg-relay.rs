@@ -638,8 +638,15 @@ impl Relay {
                 if why == NoSubmission::WorkRateTooLow {
                     self.state.work_rate_refused = true;
                 }
+                // T7.7 (A4): an unread body says what settles it
+                if let NoSubmission::MissingBody(m) = why {
+                    log(&format!(
+                        "ALERT NO_SUBMISSION MissingBody({m}): the body of block {m} is unknown (no source served it): \
+                         no point locks it until a source serves it, or an operator (jg-relay stopped) imports it (import-block) or acknowledges its omission (acknowledge)"
+                    ));
+                }
                 // MustExtendTip: the tip is on this chain with roots that are not ours (A5-4: a new question, noted)
-                if matches!(why, NoSubmission::MissingBody(_) | NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
+                if matches!(why, NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
                     log(&format!("ALERT NO_SUBMISSION {why:?}"));
                 }
                 if let NoSubmission::TooManyDepositBlocks(n) = why {

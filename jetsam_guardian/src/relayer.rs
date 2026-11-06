@@ -415,6 +415,14 @@ pub fn plan_submission(
         return Err(NoSubmission::TimestampAhead);
     }
     if !mn5_ok(&mn, l1_at) {
+        // T7.7 (A4): an unread body is why when the highest tip the bound alone allows (it locks that body) would pass
+        // MN-5 — the operator's to settle, never a misleading WorkRateTooLow
+        if let Some(m) = first_missing {
+            let free = (t + 1..=chain.tip_height()).rev().find(|u| chain.locked_height(*u).is_some_and(|x| first_over.is_none_or(|o| x < o)));
+            if free.and_then(|u| mn_values(chain, base, u)).is_some_and(|v| mn5_ok(&v, l1_at)) {
+                return Err(NoSubmission::MissingBody(m));
+            }
+        }
         // R3-5: the bound is why when the tip the unread bodies alone allow would pass MN-5
         let bound_is_why = unbounded_t.and_then(|u| mn_values(chain, base, u)).is_some_and(|m| mn5_ok(&m, l1_at));
         return Err(if bound_is_why { NoSubmission::TooManyDepositBlocks(max_deposit_blocks) } else { NoSubmission::WorkRateTooLow });
