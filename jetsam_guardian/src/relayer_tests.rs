@@ -954,3 +954,26 @@ fn r3_5_the_deposit_blocks_bound_is_the_signers() {
     let signer = "[signer]\nkey_file = \"/k\"\nmax_gas = 1000000\ngas_margin_pct = 25\n";
     assert_eq!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}{signer}"))).unwrap().deposit_blocks_bound(), 500);
 }
+
+/// R3-6: an ancestor whose tree IS known carries its omission to a child whose tree is not. A (T 40, L 32) gave 15
+/// and 20, left 25 out, rebuilt here; its child B (T 60, L 52) gave 45, not read here yet, and left 47 out. B's
+/// deposits in no root: 25 (by A) and 47 (by B), queued at once; 15 and 20 (in B's root) wait for B's tree. (Added
+/// after the mutant `r36-ancestors-ignored` survived the first test.)
+#[test]
+fn r3_6_an_ancestors_known_omission_carries_to_a_child_whose_tree_is_unknown() {
+    let c = testkit::chain(60, 1);
+    let (gid, g) = genesis_known(&c);
+    let all = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(25, 3, 3 * JTM), dep(45, 4, 4 * JTM), dep(47, 5, 5 * JTM)]);
+    let read = found_of(&[dep(15, 1, JTM), dep(20, 2, 2 * JTM), dep(25, 3, 3 * JTM), dep(47, 5, 5 * JTM)]);
+    let (aid, a) = known_at(&c, 40, gid, &tree_of(&all, GL, 32, &[25]).0, 100);
+    let (bid, b) = known_at(&c, 60, aid, &tree_of(&all, GL, 52, &[25, 47]).0, 200);
+    let mut known = HashMap::from([
+        (gid, g),
+        (aid, Known { ours: false, deposit_blocks: Some(vec![15, 20]), ..a }),
+        (bid, Known { ours: false, deposit_blocks: Some(vec![45]), ..b }),
+    ]);
+    assert_eq!(resolve_trees(&mut known, &read, GL), vec![(aid, vec![25])]);
+    assert_eq!((known[&aid].omitted.clone(), known[&bid].omitted.clone()), (Some(vec![25]), None), "A rebuilt, B not (45 not read)");
+    assert_eq!(listed_omission(&known, &read, &bid), Some(vec![25, 47]));
+    assert_eq!(direct_claims_needed(&bid, &known, &read, GL, &|_| false, 200 + D_SLOW), vec![read[&25][0], read[&47][0]]);
+}
