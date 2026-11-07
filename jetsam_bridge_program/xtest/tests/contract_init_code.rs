@@ -45,12 +45,12 @@ const PROFILES: [Profile; 2] = [
         vector: include_str!("fixtures/bridge_init_code_v3.json"),
         planned_j: 69_120,
     },
-    // FINAL1 (F5): 24 000 = 25 x 960 on the test chain (its v1.6 at 4 800), not armed before G3.
+    // D75 (G3): 8 640 = 9 x 960 on the test chain (its v1.6 at 4 800), armed in params.rs.
     Profile {
         name: "testnet",
         network: "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85",
         vector: include_str!("fixtures/bridge_init_code_v3_testnet.json"),
-        planned_j: 24_000,
+        planned_j: 8_640,
     },
 ];
 
