@@ -59,9 +59,9 @@ resolver = "2"
 # blocks 46079 and 46080 (the public network's v1.6 crossing): a node
 # installed or re-synced from now on can only follow the real chain.
 # 1.7.0 is the first build that knows the v1.7 fork (the bridge vault and
-# its destination rules). It ships dormant: neither the public network nor
-# the test chain carries a v1.7 height yet, so below one it applies the
-# 1.6.1 consensus rules, its pins included.
+# its destination rules). It ships dormant on the public network, which
+# carries no v1.7 height yet; the test chain arms it at 8640. Below its
+# profile's v1.7 height it applies the 1.6.1 consensus rules, its pins included.
 version = "1.7.0"
 edition = "2021"
 license = "Apache-2.0"

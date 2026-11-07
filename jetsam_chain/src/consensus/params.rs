@@ -588,9 +588,10 @@ const _: () = assert!(
 /// destination section (0xC2), even empty, after its client-object section;
 /// below it a block carries none.
 ///
-/// **`None` keeps every v1.7 rule dormant** on both public profiles: a binary
-/// validates, relays and announces byte for byte what v1.6.0 does until it,
-/// and for ever while this constant is `None`.
+/// **`None` keeps every v1.7 rule dormant**: a binary validates, relays and
+/// announces byte for byte what v1.6.0 does until it, and for ever while this
+/// constant is `None` (the public network today). Armed, a block below it is
+/// still judged by the v1.6.1 rules (the test chain, below 8 640).
 ///
 /// # What it switches
 ///
@@ -612,11 +613,15 @@ const _: () = assert!(
 #[cfg(not(feature = "testnet"))]
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// The test chain's v1.7 height: none until it is decided with the operator
-/// against the tip of the day. Declared per profile, like
+/// The test chain's v1.7 height: 8 640 = 9 × 960, decided with the operator
+/// against the tip of the day (D75, 7 November 2026, tip ≈ 7 830): the
+/// nearest multiple of 960 above its v1.6 height 4 800 that leaves a day to
+/// build, rehearse and redeploy every node of the test chain. Moved later
+/// only. A release of this profile needs no v1.7 pack (v1.7 is not a
+/// HistoryStep generation). Declared per profile, like
 /// [`V1_6_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8640);
 
 /// **Private builds only** (`rehearsal-v1-7`): v1.7 armed at
 /// [`REHEARSAL_V1_7_ACTIVATION`], above the private v1.6 height. The public
@@ -2511,18 +2516,62 @@ mod tests {
         ));
     }
 
-    /// The public network and the test chain carry no v1.7 height until it
-    /// is armed with the operator; only a private build arms it.
+    /// The public network carries no v1.7 height until it is armed with the
+    /// operator; the test chain carries 8 640 (D75); a private build its own.
     #[test]
-    fn v1_7_is_dormant_outside_a_private_build() {
-        #[cfg(not(feature = "rehearsal-v1-7"))]
+    fn the_v1_7_height_of_each_profile() {
+        #[cfg(not(feature = "testnet"))]
         assert_eq!(V1_7_ACTIVATION_HEIGHT, None);
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(8_640));
         #[cfg(feature = "rehearsal-v1-7")]
         {
             assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(REHEARSAL_V1_7_ACTIVATION));
             assert!(REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION);
             assert!(REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS));
         }
+    }
+
+    /// D75: the test chain crosses v1.7 at block 8 640 and not one block
+    /// earlier. J − 1 keeps every clock of the 1.6.1 test build (v1.4 at 6,
+    /// v1.5 at 960, v1.6 at 4 800, the v1.6 body cap, the v1.6 relation);
+    /// J and J + 1 are v1.7 blocks. The clocks that hang off J follow it:
+    /// deposits from F = 10 080, delegation from J_D = 24 000.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    #[test]
+    fn the_test_chain_crosses_v1_7_at_8640() {
+        use crate::consensus::wire_limits::{
+            block_bytes_limit, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES,
+        };
+        assert_eq!(V1_4_ACTIVATION_HEIGHT, Some(6));
+        assert_eq!(V1_5_ACTIVATION_HEIGHT, Some(960));
+        assert_eq!(V1_6_ACTIVATION_HEIGHT, Some(4_800));
+        assert!(!v1_7_active(8_639));
+        assert!(v1_7_active(8_640));
+        assert!(v1_7_active(8_641));
+        assert_eq!(block_bytes_limit(8_639), MAX_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_640), MAX_V1_7_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_641), MAX_V1_7_BLOCK_BYTES);
+        // An armed build bounds the transport by the largest v1.7 body and
+        // judges each block by the cap of its own height (above).
+        assert_eq!(MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES);
+        // v1.7 is not a HistoryStep generation: the relation stays v1.6's.
+        for height in [8_639, 8_640, 8_641] {
+            assert!(v1_6_active(height));
+            assert_eq!(
+                HistoryStepPackGeneration::at_height(height),
+                HistoryStepPackGeneration::V1_6,
+                "height {height}"
+            );
+        }
+        assert_eq!(
+            crate::consensus::vault::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
+            Some(10_080)
+        );
+        assert_eq!(
+            crate::consensus::guardian::DELEGATION_ACTIVATION_HEIGHT,
+            Some(24_000)
+        );
     }
 
     /// v1.6 is the fourth relation. It is chosen by its own clock, at the

@@ -491,10 +491,9 @@ mod tests {
     #[cfg(not(feature = "testnet"))]
     const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
 
-    /// The test chain's v1.7 height: none until it is decided with the
-    /// operator.
+    /// The test chain's v1.7 height: 8 640, decided with the operator (D75).
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8640);
 
     /// A private build's v1.7 height (`rehearsal-v1-7`, never a release).
     #[cfg(feature = "rehearsal-v1-7")]

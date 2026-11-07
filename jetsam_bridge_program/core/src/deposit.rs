@@ -23,20 +23,20 @@ pub use jetsam_vault_rule::{DepositRule, RuleError, MAX_DEPOSIT_MICRO, MIN_DEPOS
 use jetsam_vault_rule::Group;
 
 /// J of the v1.7 clock this program is built for: `V1_7_ACTIVATION_HEIGHT` of the node's profile of the
-/// same name (default and test network: none yet, so no deposit is valid; private rehearsal: 96). The
-/// cross test of `jetsam_bridge_xtest` checks it against the node's `params.rs`. Changing it changes the
-/// program's key.
-#[cfg(not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120")))]
-pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+/// same name (public network: none yet, so no deposit is valid; test chain: 8 640, D75; rehearsal: 96),
+/// without a profile of its own the node's (`TESTNET_PROFILE`, as `rules::PRODUCTION`). The cross test of
+/// `jetsam_bridge_xtest` checks it against the node's `params.rs`. Changing it changes the program's key.
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7", feature = "test-clock-j69120")))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = if jetsam_vault_rule::TESTNET_PROFILE { Some(8_640) } else { None };
+#[cfg(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8_640);
 #[cfg(all(feature = "rehearsal-v1-7", not(feature = "test-clock-j69120")))]
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(96);
-/// TEST ONLY: the clock of the node's G6 = V4 vectors (J = 69 120, D1), to run them through a guest. A
-/// program built with it is never deployed (its key is not the profile's).
+/// TEST ONLY: the clock of the node's G6 = V4 vectors (J = 69 120, D1), run through a guest; never deployed.
 #[cfg(all(feature = "test-clock-j69120", not(feature = "rehearsal-v1-7")))]
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(69_120);
 #[cfg(all(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))]
 compile_error!("rehearsal-v1-7 and test-clock-j69120 are two clocks");
-
 /// V4 under this program's clock and the definitive constants (vault, amounts, `F = J + delay`).
 pub const DEPOSIT_RULE: DepositRule = DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT);
 

@@ -2765,6 +2765,10 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
         "{}",
         v1_6_arming_line(jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT)
     );
+    println!(
+        "{}",
+        v1_7_arming_line(jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT)
+    );
 }
 
 /// What `--bench` says of the walked figure. Release checks read its first
@@ -2803,6 +2807,14 @@ fn v1_6_arming_line(activation: Option<u64>) -> String {
     match activation {
         Some(height) => format!("From block {height} the chain runs the v1.6 rules."),
         None => "This build does not arm the v1.6 rules.".to_owned(),
+    }
+}
+
+/// The v1.7 clock as `--bench` reports it, read back the same way.
+fn v1_7_arming_line(activation: Option<u64>) -> String {
+    match activation {
+        Some(height) => format!("From block {height} the chain runs the v1.7 rules."),
+        None => "This build does not arm the v1.7 rules.".to_owned(),
     }
 }
 
@@ -2850,6 +2862,25 @@ mod bench_v1_6_line_tests {
         assert_eq!(
             v1_6_arming_line(None),
             "This build does not arm the v1.6 rules."
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_v1_7_line_tests {
+    use super::v1_7_arming_line;
+
+    /// The same read-back for the v1.7 clock: a release is checked against
+    /// the height the binary reports (8 640 on the test chain, D75).
+    #[test]
+    fn the_bench_names_the_v1_7_height_or_says_it_is_not_armed() {
+        assert_eq!(
+            v1_7_arming_line(Some(8_640)),
+            "From block 8640 the chain runs the v1.7 rules."
+        );
+        assert_eq!(
+            v1_7_arming_line(None),
+            "This build does not arm the v1.7 rules."
         );
     }
 }
