@@ -415,9 +415,12 @@ mod tests {
         assert_eq!(above.floor, 77, "the floor stays J − 1's");
         assert_eq!(above.bridge_locked, 5_000);
         assert!(above.released.contains(3));
+        // The production rules give a view where the production clock is
+        // active: none while dormant, one above the private J (96), none
+        // below the test chain's (8 640).
         assert_eq!(
             vault_view_for_child(Some(&parent), 999, 962, &DestinationRules::CONSENSUS).is_some(),
-            jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_some()
+            DestinationRules::CONSENSUS.active_at(962)
         );
     }
 

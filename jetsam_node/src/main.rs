@@ -20986,12 +20986,10 @@ mod refused_branch_body_tests {
     #[test]
     fn a_suffix_is_judged_under_the_builds_v1_7_clock() {
         let height = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.unwrap_or(J);
-        let base = header_95();
-        let finalized = ChainPoint::new(J - 1, block_id(&base));
-        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
-        let parent = branch(&mut dag, base, [1; 32], height - J, 0)
-            .last()
-            .map_or(base, |header| header.header);
+        // The block before the build's J: 95 on the private clock and while
+        // dormant, 8 639 on the test chain (decoding needs no header DAG).
+        let mut parent = header_95();
+        parent.height = height - 1;
         let mut blocks = vec![block_at(height - 1), block_at(height), block_at(height + 1)];
         blocks[0].header = parent;
         for index in 1..blocks.len() {
