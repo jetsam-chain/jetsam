@@ -19,7 +19,9 @@
 
 use jetsam_chain::consensus::destination::mpt::keccak256;
 use jetsam_chain::consensus::guardian::{network_id, GUARDIAN_L1_BRIDGE};
-use jetsam_chain::consensus::params::{v1_7_schedule_is_valid, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT};
+use jetsam_chain::consensus::params::{
+    v1_7_schedule_is_valid_on, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_ALIGNMENT, V1_7_ACTIVATION_HEIGHT,
+};
 use jetsam_chain::consensus::vault::{
     bridge_deposits_from_height, MAX_DEPOSIT_MICRO, RELEASE_FEE_MICRO, VAULT_ADDRESS,
     VAULT_OUTSTANDING_CEIL_MICRO,
@@ -45,12 +47,12 @@ const PROFILES: [Profile; 2] = [
         vector: include_str!("fixtures/bridge_init_code_v3.json"),
         planned_j: 69_120,
     },
-    // D75 (G3): 8 640 = 9 x 960 on the test chain (its v1.6 at 4 800), armed in params.rs.
+    // D78: 8 160 = 255 x 32 on the test chain (its v1.6 at 4 800), armed in params.rs.
     Profile {
         name: "testnet",
         network: "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85",
         vector: include_str!("fixtures/bridge_init_code_v3_testnet.json"),
-        planned_j: 8_640,
+        planned_j: 8_160,
     },
 ];
 
@@ -145,7 +147,10 @@ fn bridge_constants_match_contract_init_code() {
         Some(armed) => assert_eq!(j, armed, "the contract's J is params.rs's"),
         None => assert_eq!(j, p.planned_j, "J is not armed in params.rs: the contract's is the plan's ({})", p.name),
     }
-    assert!(v1_7_schedule_is_valid(V1_6_ACTIVATION_HEIGHT, Some(j)), "{j} is not a v1.7 height of this profile");
+    assert!(
+        v1_7_schedule_is_valid_on(V1_6_ACTIVATION_HEIGHT, Some(j), V1_7_ACTIVATION_ALIGNMENT),
+        "{j} is not a v1.7 height of this profile"
+    );
     assert_eq!(Some(f), bridge_deposits_from_height(Some(j)));
     // Word 5: the network is this profile's genesis block id.
     assert_eq!(word(config, 5), &network_id()[..]);

@@ -220,12 +220,12 @@ fn every_deposit_is_refused_while_the_v1_7_height_is_none() {
             Err(DepositRefusal::NotArmed)
         );
     }
-    // Armed today: the private rehearsal build, and the test chain at 8 640
-    // (D75), where the armed rules decide (`a_deposit_waits_for_the_block_after_f`).
+    // Armed today: the private rehearsal build, and the test chain at 8 160
+    // (D78), where the armed rules decide (`a_deposit_waits_for_the_block_after_f`).
     // The public network is not armed.
     if !jetsam_vault_rule::REHEARSAL_CLOCK {
         let expected = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
-            Some(8_640)
+            Some(8_160)
         } else {
             None
         };

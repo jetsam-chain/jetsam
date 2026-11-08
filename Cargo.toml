@@ -60,7 +60,7 @@ resolver = "2"
 # installed or re-synced from now on can only follow the real chain.
 # 1.7.0 is the first build that knows the v1.7 fork (the bridge vault and
 # its destination rules). It ships dormant on the public network, which
-# carries no v1.7 height yet; the test chain arms it at 8640. Below its
+# carries no v1.7 height yet; the test chain arms it at 8160. Below its
 # profile's v1.7 height it applies the 1.6.1 consensus rules, its pins included.
 version = "1.7.0"
 edition = "2021"

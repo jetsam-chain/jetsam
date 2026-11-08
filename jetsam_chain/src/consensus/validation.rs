@@ -839,13 +839,13 @@ mod tests {
         }
     }
 
-    /// D75: the test chain's frontier through the production wire and the
-    /// production rule, no clock injected. Block 8 639 is a 1.6.1 block: a
+    /// D78: the test chain's frontier through the production wire and the
+    /// production rule, no clock injected. Block 8 159 is a 1.6.1 block: a
     /// destination section is trailing bytes on the wire and refused by the
-    /// rule, none is needed. Blocks 8 640 and 8 641 must carry one.
+    /// rule, none is needed. Blocks 8 160 and 8 161 must carry one.
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     #[test]
-    fn the_test_chain_frontier_is_8640_in_the_production_rule() {
+    fn the_test_chain_frontier_is_8160_in_the_production_rule() {
         use crate::consensus::destination::{DestinationError, DestinationSection};
         let at = |height: u64, destination| Block {
             header: header(height),
@@ -853,10 +853,10 @@ mod tests {
             client_objects: Vec::new(),
             destination,
         };
-        let before = at(8_639, None);
+        let before = at(8_159, None);
         assert!(validate_block_resource_preflight(&before).is_ok());
         assert_eq!(Block::from_bytes(&before.to_bytes()).as_ref(), Ok(&before));
-        let with_section = at(8_639, Some(DestinationSection::default()));
+        let with_section = at(8_159, Some(DestinationSection::default()));
         assert_eq!(
             Block::from_bytes(&with_section.to_bytes()),
             Err(jetsam_tx::wire::WireError::TrailingBytes)
@@ -867,7 +867,7 @@ mod tests {
                 DestinationError::SectionBeforeActivation
             ))
         );
-        for height in [8_640, 8_641] {
+        for height in [8_160, 8_161] {
             assert_eq!(
                 validate_block_resource_preflight(&at(height, None)),
                 Err(ConsensusError::Destination(DestinationError::SectionMissing)),

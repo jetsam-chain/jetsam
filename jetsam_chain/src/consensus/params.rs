@@ -591,7 +591,7 @@ const _: () = assert!(
 /// **`None` keeps every v1.7 rule dormant**: a binary validates, relays and
 /// announces byte for byte what v1.6.0 does until it, and for ever while this
 /// constant is `None` (the public network today). Armed, a block below it is
-/// still judged by the v1.6.1 rules (the test chain, below 8 640).
+/// still judged by the v1.6.1 rules (the test chain, below 8 160).
 ///
 /// # What it switches
 ///
@@ -603,8 +603,9 @@ const _: () = assert!(
 /// # Constraints
 ///
 /// Armed only after v1.6 ([`V1_6_ACTIVATION_HEIGHT`] armed, and strictly
-/// below it), on a multiple of 960. Checked at compile time by
-/// [`v1_7_schedule_is_valid`].
+/// below it), on a multiple of [`V1_7_ACTIVATION_ALIGNMENT`]: 960 on the
+/// public network, 32 on the test chain (D78). Checked at compile time by
+/// [`v1_7_schedule_is_valid_on`].
 ///
 /// # Arming (operator decision, never a routine edit)
 ///
@@ -613,15 +614,16 @@ const _: () = assert!(
 #[cfg(not(feature = "testnet"))]
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
 
-/// The test chain's v1.7 height: 8 640 = 9 × 960, decided with the operator
-/// against the tip of the day (D75, 7 November 2026, tip ≈ 7 830): the
-/// nearest multiple of 960 above its v1.6 height 4 800 that leaves a day to
-/// build, rehearse and redeploy every node of the test chain. Moved later
-/// only. A release of this profile needs no v1.7 pack (v1.7 is not a
-/// HistoryStep generation). Declared per profile, like
+/// The test chain's v1.7 height: 8 160 = 255 × 32, decided with the operator
+/// against the tip of the day (D78, 8 November 2026, tip ≈ 8 095), brought
+/// forward from 8 640 (D75): the test chain has a single miner, its operator,
+/// and every node it runs is redeployed before it. On a 32-block transaction
+/// epoch ([`V1_7_ACTIVATION_ALIGNMENT`]) and on the guardians' 480-block
+/// reward period (17 × 480). A release of this profile needs no v1.7 pack
+/// (v1.7 is not a HistoryStep generation). Declared per profile, like
 /// [`V1_6_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8640);
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8160);
 
 /// **Private builds only** (`rehearsal-v1-7`): v1.7 armed at
 /// [`REHEARSAL_V1_7_ACTIVATION`], above the private v1.6 height. The public
@@ -650,22 +652,49 @@ pub const fn v1_7_active_with(height: u64, activation_height: Option<u64>) -> bo
 }
 
 /// Whether a v1.7 height may sit beside a v1.6 height: dormant, or armed
-/// strictly after an armed v1.6, on a multiple of 960.
+/// strictly after an armed v1.6, on a multiple of 960 (the public network's
+/// rule).
 pub const fn v1_7_schedule_is_valid(
     v1_6_activation: Option<u64>,
     v1_7_activation: Option<u64>,
 ) -> bool {
+    v1_7_schedule_is_valid_on(v1_6_activation, v1_7_activation, 960)
+}
+
+/// [`v1_7_schedule_is_valid`] with the alignment injected: dormant, or armed
+/// strictly after an armed v1.6, on a multiple of `alignment`.
+pub const fn v1_7_schedule_is_valid_on(
+    v1_6_activation: Option<u64>,
+    v1_7_activation: Option<u64>,
+    alignment: u64,
+) -> bool {
     match (v1_6_activation, v1_7_activation) {
         (_, None) => true,
-        (Some(v1_6), Some(v1_7)) => v1_7 > v1_6 && v1_7.is_multiple_of(960),
+        (Some(v1_6), Some(v1_7)) => {
+            alignment > 0 && v1_7 > v1_6 && v1_7.is_multiple_of(alignment)
+        }
         (None, Some(_)) => false,
     }
 }
 
+/// The multiple a v1.7 height of this profile must sit on: 960 on the public
+/// network.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_ACTIVATION_ALIGNMENT: u64 = 960;
+
+/// The multiple a v1.7 height of the test chain must sit on: a 32-block
+/// transaction epoch, as the rehearsal's (D78).
+#[cfg(feature = "testnet")]
+pub const V1_7_ACTIVATION_ALIGNMENT: u64 = TX_EPOCH_BLOCKS;
+
 #[cfg(not(feature = "rehearsal-v1-7"))]
 const _: () = assert!(
-    v1_7_schedule_is_valid(V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT),
-    "V1_7_ACTIVATION_HEIGHT must be None, or a multiple of 960 strictly above an armed V1_6_ACTIVATION_HEIGHT"
+    v1_7_schedule_is_valid_on(
+        V1_6_ACTIVATION_HEIGHT,
+        V1_7_ACTIVATION_HEIGHT,
+        V1_7_ACTIVATION_ALIGNMENT
+    ),
+    "V1_7_ACTIVATION_HEIGHT must be None, or a multiple of V1_7_ACTIVATION_ALIGNMENT strictly above an armed V1_6_ACTIVATION_HEIGHT"
 );
 
 #[cfg(feature = "rehearsal-v1-7")]
@@ -2507,23 +2536,64 @@ mod tests {
         assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_600)));
         assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_121)));
         assert!(!v1_7_schedule_is_valid(Some(46_080), Some(0)));
-        // The schedule this build carries (a private build has its own rule,
-        // checked at compile time beside its height).
+        // The schedule this build carries, under its profile's alignment (a
+        // private build has its own rule, checked at compile time beside its
+        // height).
         #[cfg(not(feature = "rehearsal-v1-7"))]
-        assert!(v1_7_schedule_is_valid(
+        assert!(v1_7_schedule_is_valid_on(
             V1_6_ACTIVATION_HEIGHT,
-            V1_7_ACTIVATION_HEIGHT
+            V1_7_ACTIVATION_HEIGHT,
+            V1_7_ACTIVATION_ALIGNMENT
         ));
     }
 
+    /// D78: the public network keeps the 960 rule for its v1.7 height; the
+    /// test chain's sits on a 32-block transaction epoch, as the rehearsal's
+    /// does. The public rule refuses the test chain's 8 160.
+    #[test]
+    fn the_v1_7_alignment_of_each_profile() {
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(V1_7_ACTIVATION_ALIGNMENT, 960);
+            for (v1_6, v1_7) in [
+                (Some(46_080), Some(69_120)),
+                (Some(46_080), Some(69_600)),
+                (Some(46_080), Some(46_112)),
+                (Some(4_800), Some(8_160)),
+                (Some(4_800), Some(8_640)),
+                (None, Some(69_120)),
+                (Some(46_080), None),
+            ] {
+                assert_eq!(
+                    v1_7_schedule_is_valid_on(v1_6, v1_7, V1_7_ACTIVATION_ALIGNMENT),
+                    v1_7_schedule_is_valid(v1_6, v1_7),
+                    "{v1_6:?} {v1_7:?}"
+                );
+            }
+        }
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        {
+            assert_eq!(V1_7_ACTIVATION_ALIGNMENT, TX_EPOCH_BLOCKS);
+            assert!(v1_7_schedule_is_valid_on(Some(4_800), Some(8_160), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(v1_7_schedule_is_valid_on(Some(4_800), Some(4_832), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(8_150), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(4_800), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(None, Some(8_160), V1_7_ACTIVATION_ALIGNMENT));
+        }
+        // The public rule itself never moves: 960, whatever the profile.
+        assert!(!v1_7_schedule_is_valid(Some(4_800), Some(8_160)));
+        assert!(v1_7_schedule_is_valid(Some(4_800), Some(8_640)));
+        assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(8_160), 0));
+    }
+
     /// The public network carries no v1.7 height until it is armed with the
-    /// operator; the test chain carries 8 640 (D75); a private build its own.
+    /// operator; the test chain carries 8 160 (D78); a private build its own.
     #[test]
     fn the_v1_7_height_of_each_profile() {
         #[cfg(not(feature = "testnet"))]
         assert_eq!(V1_7_ACTIVATION_HEIGHT, None);
         #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-        assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(8_640));
+        assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(8_160));
         #[cfg(feature = "rehearsal-v1-7")]
         {
             assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(REHEARSAL_V1_7_ACTIVATION));
@@ -2532,31 +2602,31 @@ mod tests {
         }
     }
 
-    /// D75: the test chain crosses v1.7 at block 8 640 and not one block
+    /// D78: the test chain crosses v1.7 at block 8 160 and not one block
     /// earlier. J − 1 keeps every clock of the 1.6.1 test build (v1.4 at 6,
     /// v1.5 at 960, v1.6 at 4 800, the v1.6 body cap, the v1.6 relation);
     /// J and J + 1 are v1.7 blocks. The clocks that hang off J follow it:
-    /// deposits from F = 10 080, delegation from J_D = 24 000.
+    /// deposits from F = 9 600, delegation from J_D = 23 520.
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     #[test]
-    fn the_test_chain_crosses_v1_7_at_8640() {
+    fn the_test_chain_crosses_v1_7_at_8160() {
         use crate::consensus::wire_limits::{
             block_bytes_limit, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES,
         };
         assert_eq!(V1_4_ACTIVATION_HEIGHT, Some(6));
         assert_eq!(V1_5_ACTIVATION_HEIGHT, Some(960));
         assert_eq!(V1_6_ACTIVATION_HEIGHT, Some(4_800));
-        assert!(!v1_7_active(8_639));
-        assert!(v1_7_active(8_640));
-        assert!(v1_7_active(8_641));
-        assert_eq!(block_bytes_limit(8_639), MAX_BLOCK_BYTES);
-        assert_eq!(block_bytes_limit(8_640), MAX_V1_7_BLOCK_BYTES);
-        assert_eq!(block_bytes_limit(8_641), MAX_V1_7_BLOCK_BYTES);
+        assert!(!v1_7_active(8_159));
+        assert!(v1_7_active(8_160));
+        assert!(v1_7_active(8_161));
+        assert_eq!(block_bytes_limit(8_159), MAX_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_160), MAX_V1_7_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_161), MAX_V1_7_BLOCK_BYTES);
         // An armed build bounds the transport by the largest v1.7 body and
         // judges each block by the cap of its own height (above).
         assert_eq!(MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES);
         // v1.7 is not a HistoryStep generation: the relation stays v1.6's.
-        for height in [8_639, 8_640, 8_641] {
+        for height in [8_159, 8_160, 8_161] {
             assert!(v1_6_active(height));
             assert_eq!(
                 HistoryStepPackGeneration::at_height(height),
@@ -2566,12 +2636,15 @@ mod tests {
         }
         assert_eq!(
             crate::consensus::vault::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
-            Some(10_080)
+            Some(9_600)
         );
         assert_eq!(
             crate::consensus::guardian::DELEGATION_ACTIVATION_HEIGHT,
-            Some(24_000)
+            Some(23_520)
         );
+        // J and J_D sit on the guardians' 480-block reward period (checked at
+        // compile time in guardian/mod.rs).
+        assert!(8_160_u64.is_multiple_of(crate::consensus::guardian::REWARD_PERIOD_BLOCKS));
     }
 
     /// v1.6 is the fourth relation. It is chosen by its own clock, at the
