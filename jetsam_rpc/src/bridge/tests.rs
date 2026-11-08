@@ -200,7 +200,7 @@ fn deposit_outputs_are_a_deposit_under_v4_above_f_only() {
 /// While the build's v1.7 height is none, every deposit is refused, at any
 /// height: the vault is then an ordinary address whose spend secret is
 /// published (anyone could take what is sent there). This is the case of
-/// the public network and of the test network today.
+/// the public network today; the test chain is armed at 8 640 (D75).
 #[test]
 fn every_deposit_is_refused_while_the_v1_7_height_is_none() {
     let mut unarmed = VaultRules::current();
@@ -220,12 +220,19 @@ fn every_deposit_is_refused_while_the_v1_7_height_is_none() {
             Err(DepositRefusal::NotArmed)
         );
     }
-    // The private rehearsal build is the only one armed today.
+    // Armed today: the private rehearsal build, and the test chain at 8 640
+    // (D75), where the armed rules decide (`a_deposit_waits_for_the_block_after_f`).
+    // The public network is not armed.
     if !jetsam_vault_rule::REHEARSAL_CLOCK {
+        let expected = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+            Some(8_640)
+        } else {
+            None
+        };
         assert_eq!(
             jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
-            None,
-            "a public profile armed v1.7: the refusal above no longer covers it"
+            expected,
+            "a public profile's v1.7 height moved: the refusal above no longer covers it as it did"
         );
     }
 }
