@@ -1251,6 +1251,26 @@ impl Prover for MockProver {
     }
 }
 
+/// TEST ONLY (D103): the empty proof the test bridge's verifier (`Sp1EmptyProofTestVerifier`) accepts, the
+/// public values checked natively before (`native_check`, mandatory here). The relayer refuses it off the
+/// public test network over Base Sepolia.
+pub struct EmptyTestProver;
+
+impl Prover for EmptyTestProver {
+    fn prove(&self, _req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    fn prove_claim(&self, _req: &ClaimRequest) -> anyhow::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    fn name(&self) -> String {
+        "empty proof (TEST verifier only)".into()
+    }
+}
+
+/// The L1 of the test bridge fed empty proofs (D103): Base Sepolia.
+pub const EMPTY_PROOF_L1_CHAIN_ID: u64 = 84_532;
+
 /// The program's input bytes for a request (the checkpoint program's own encoder).
 pub type InputEncoder = fn(&ProofRequest) -> anyhow::Result<Vec<u8>>;
 
@@ -1366,7 +1386,8 @@ pub fn read_published_final(v: &serde_json::Value) -> anyhow::Result<(Checkpoint
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProverConfig {
-    /// `"command"` (the production prover) or `"mock"` (the private rehearsal's simulated proofs only).
+    /// `"command"` (the production prover), `"empty-test"` (the test bridge's empty proofs, the public test
+    /// network over Base Sepolia only, D103) or `"mock"` (the private rehearsal's simulated proofs only).
     pub mode: String,
     /// The command and its arguments; `{input}`, `{proof}`, `{public_values}` are replaced by paths.
     #[serde(default)]
@@ -1498,7 +1519,12 @@ impl RelayConfig {
         match c.prover.mode.as_str() {
             "mock" => anyhow::ensure!(rehearsal, "[prover] mode = \"mock\" (simulated proofs) is refused on {profile}"),
             "command" => anyhow::ensure!(!c.prover.command.is_empty(), "[prover] command is empty"),
-            other => anyhow::bail!("[prover] mode = {other:?}: \"command\" or \"mock\""),
+            "empty-test" => anyhow::ensure!(
+                profile == crate::Profile::PublicTestnet && c.l1_chain_id == EMPTY_PROOF_L1_CHAIN_ID,
+                "[prover] mode = \"empty-test\" (empty proofs) is refused on {profile} over L1 {}: the public test network over Base Sepolia only",
+                c.l1_chain_id
+            ),
+            other => anyhow::bail!("[prover] mode = {other:?}: \"command\", \"empty-test\" or \"mock\""),
         }
         anyhow::ensure!(c.prover.native_check || rehearsal, "[prover] native_check = false is refused on {profile}");
         // the point lands before W_STALL: started `ahead` before it is due, proven within the timeout

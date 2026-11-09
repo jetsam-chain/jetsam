@@ -412,6 +412,25 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}bogus = 1\n"))).is_err(), "unknown field");
 }
 
+/// D103: the test bridge on Base Sepolia (its verifier, `Sp1EmptyProofTestVerifier`, passes an empty proof only)
+/// is fed empty proofs, the public values still computed natively first; on no other network nor L1.
+#[test]
+fn the_empty_proof_mode_starts_only_on_the_public_test_network_over_base_sepolia() {
+    let testnet = hex::encode(crate::TESTNET_NETWORK);
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let empty = "[prover]\nmode = \"empty-test\"\n";
+    let c = RelayConfig::parse(&relay_toml(&testnet, 84_532, bridge, empty)).unwrap();
+    assert_eq!(c.profile().unwrap(), crate::Profile::PublicTestnet);
+    let e = |net: &str, chain: u64, extra: &str| RelayConfig::parse(&relay_toml(net, chain, bridge, extra)).unwrap_err().to_string();
+    assert!(e(&mainnet, 8_453, empty).contains("refused"), "never on the mainnet");
+    assert!(e(&mainnet, 84_532, empty).contains("refused"), "never on the mainnet, whatever the L1");
+    assert!(e(&testnet, 8_453, empty).contains("refused"), "the test chain over Base itself: no");
+    assert!(e(&testnet, 11_155_111, empty).contains("refused"), "nor over another test L1");
+    assert!(e(&testnet, 84_532, &format!("{empty}native_check = false\n")).contains("native_check"), "the public values are still computed natively");
+    assert!(EmptyTestProver.name().contains("TEST"));
+}
+
 /// A5-9: the relayer learns the contract's points 12 L1 blocks below the latest by default, as configured
 /// otherwise, and at the latest on the private rehearsal (its L1 mines on demand); `[prover] claim_command`
 /// is optional (N2: `claim-direct` requests then wait, with an alert).

@@ -929,6 +929,7 @@ fn run() -> anyhow::Result<()> {
     }
     let prover: Box<dyn Prover> = match cfg.prover.mode.as_str() {
         "mock" => Box::new(MockProver),
+        "empty-test" => Box::new(relayer::EmptyTestProver),
         _ => Box::new(CommandProver {
             argv: cfg.prover.command.clone(),
             claim_argv: cfg.prover.claim_command.clone(),
