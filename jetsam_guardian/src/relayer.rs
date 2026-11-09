@@ -489,11 +489,12 @@ pub fn fast_cadence(was_fast: bool, refusal_pending: bool, chain: &Chain, refere
 }
 
 /// The points to try to finalize (`finalizeSlow`), the highest locked height first: canonical, above the
-/// final point, accepted at least `D_SLOW` ago and with no switch in the last `D_SLOW`.
-pub fn finalize_order(known: &HashMap<[u8; 32], Known>, canonical: &HashSet<[u8; 32]>, final_locked: u64, last_switch: u64, l1_now: u64) -> Vec<[u8; 32]> {
+/// final point, accepted at least `D_SLOW` ago, with no switch and no freeze (the contract's `pausedUntil`: the
+/// end of the last freeze, or of an early unpause) in the last `D_SLOW`, as `finalizeSlow` requires.
+pub fn finalize_order(known: &HashMap<[u8; 32], Known>, canonical: &HashSet<[u8; 32]>, final_locked: u64, last_switch: u64, paused_until: u64, l1_now: u64) -> Vec<[u8; 32]> {
     let mut v: Vec<(&[u8; 32], &Known)> = known
         .iter()
-        .filter(|(id, k)| canonical.contains(*id) && k.cp.locked_height > final_locked && k.accepted_at.max(last_switch) + D_SLOW <= l1_now)
+        .filter(|(id, k)| canonical.contains(*id) && k.cp.locked_height > final_locked && k.accepted_at.max(last_switch).max(paused_until) + D_SLOW <= l1_now)
         .collect();
     v.sort_by_key(|(id, k)| (std::cmp::Reverse(k.cp.locked_height), **id));
     v.into_iter().map(|(id, _)| *id).collect()

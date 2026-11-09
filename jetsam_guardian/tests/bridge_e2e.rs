@@ -190,7 +190,8 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     l1.rpc("evm_mine", json!([])).unwrap();
     let last_switch = word_u64(&view(&l1, &bridge, "lastSwitchAt()", &[]), 0);
     let canonical: HashSet<[u8; 32]> = known.keys().copied().filter(|id| word(&view(&l1, &bridge, "nodeOf(bytes32)", &[*id]), 4)[31] == 1).collect();
-    let order_f = relayer::finalize_order(&known, &canonical, GL, last_switch, now(&l1));
+    let paused_until = word_u64(&view(&l1, &bridge, "pausedUntil()", &[]), 0);
+    let order_f = relayer::finalize_order(&known, &canonical, GL, last_switch, paused_until, now(&l1));
     assert_eq!(order_f, vec![cid]);
     let r = relay.send(&l1, &bridge, &l1::finalize_slow(&known[&cid].cp), "finalizeSlow").unwrap();
     assert!(r.status, "finalizeSlow");

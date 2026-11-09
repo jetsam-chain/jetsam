@@ -227,12 +227,28 @@ fn the_highest_stable_point_is_finalized_first_and_younger_ones_wait() {
     let known = HashMap::from([(p1, k1), (p2, k2), (p3, k3)]);
     let all: HashSet<[u8; 32]> = [p1, p2, p3].into();
     let now = 2_000 + D_SLOW;
-    assert_eq!(finalize_order(&known, &all, GL, 500, now), vec![p2, p1], "the highest stable first, the young one waits");
-    assert_eq!(finalize_order(&known, &all, GL, 2_000, now), vec![p2, p1]);
-    assert!(finalize_order(&known, &all, GL, 2_001, now).is_empty(), "a switch restarts every clock");
-    assert_eq!(finalize_order(&known, &all, 22, 500, now), vec![p2], "not at or below the final point");
+    assert_eq!(finalize_order(&known, &all, GL, 500, 0, now), vec![p2, p1], "the highest stable first, the young one waits");
+    assert_eq!(finalize_order(&known, &all, GL, 2_000, 0, now), vec![p2, p1]);
+    assert!(finalize_order(&known, &all, GL, 2_001, 0, now).is_empty(), "a switch restarts every clock");
+    assert_eq!(finalize_order(&known, &all, 22, 500, 0, now), vec![p2], "not at or below the final point");
     let some: HashSet<[u8; 32]> = [p1, p3].into();
-    assert_eq!(finalize_order(&known, &some, GL, 500, now), vec![p1], "canonical only");
+    assert_eq!(finalize_order(&known, &some, GL, 500, 0, now), vec![p1], "canonical only");
+}
+
+#[test]
+fn a_freeze_holds_every_clock_until_d_slow_after_its_end() {
+    // the contract (v3-tn 80945c3): stable since max(acceptedAt, lastSwitchAt, pausedUntil), refused while frozen
+    let c = testkit::chain(50, 1);
+    let (gid, _) = genesis_known(&c);
+    let (p1, k1) = known_at(&c, 30, gid, &[], 1_000);
+    let known = HashMap::from([(p1, k1)]);
+    let all: HashSet<[u8; 32]> = [p1].into();
+    let now = 1_000 + D_SLOW;
+    assert_eq!(finalize_order(&known, &all, GL, 500, 0, now), vec![p1], "no freeze: stable");
+    assert!(finalize_order(&known, &all, GL, 500, now + 3_600, now).is_empty(), "frozen now");
+    assert!(finalize_order(&known, &all, GL, 500, 1_001, now).is_empty(), "a freeze that ended after acceptance restarts the clock");
+    assert_eq!(finalize_order(&known, &all, GL, 500, 1_001, now + 1), vec![p1], "D_SLOW after the end of the freeze");
+    assert_eq!(finalize_order(&known, &all, GL, 500, 999, now), vec![p1], "a freeze over before acceptance changes nothing");
 }
 
 #[test]

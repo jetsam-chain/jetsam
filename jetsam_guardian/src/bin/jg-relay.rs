@@ -411,7 +411,7 @@ impl Relay {
         agree >= self.cfg.min_nodes
     }
 
-    fn finalize(&mut self, fin_id: &[u8; 32], final_locked: u64, last_switch: u64, l1_now: u64) -> anyhow::Result<()> {
+    fn finalize(&mut self, fin_id: &[u8; 32], final_locked: u64, last_switch: u64, paused_until: u64, l1_now: u64) -> anyhow::Result<()> {
         let known = self.known();
         let mut canonical = HashSet::new();
         for (id, k) in &known {
@@ -419,7 +419,7 @@ impl Relay {
                 canonical.insert(*id);
             }
         }
-        for id in relayer::finalize_order(&known, &canonical, final_locked, last_switch, l1_now) {
+        for id in relayer::finalize_order(&known, &canonical, final_locked, last_switch, paused_until, l1_now) {
             let k = &known[&id];
             if self.chain.id_at(k.cp.locked_height) != Some(k.cp.locked_block_id) {
                 // its locked block is not on this chain: never finalized by this relayer
@@ -752,6 +752,7 @@ impl Relay {
         }
         let fin = word(&self.view("finalId()", &[])?, 0);
         let last_switch = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
+        let paused_until = word_u64(&self.view("pausedUntil()", &[])?, 0);
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
         let l1_now = self.l1.next_time()?;
         // A5-13: latched on repeated reverts, the relayer reads, learns, rebuilds, publishes and queues, and sends
@@ -762,7 +763,7 @@ impl Relay {
         }
         let final_locked = self.state.known.get(&hex::encode(fin)).map_or(gl, |k| k.cp.locked_height);
         if halted(self).is_none() {
-            self.finalize(&fin, final_locked, last_switch, l1_now)?;
+            self.finalize(&fin, final_locked, last_switch, paused_until, l1_now)?;
         }
         let fin = word(&self.view("finalId()", &[])?, 0);
         self.claim(&fin, gl, l1_now, halted(self).is_some())?;
