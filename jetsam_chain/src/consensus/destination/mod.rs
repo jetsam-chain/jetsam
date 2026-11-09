@@ -25,6 +25,7 @@
 //! the guardian objects 0x20..=0x26) is judged by the rules that read it, not
 //! by the wire, which checks only a guardian object's exact size.
 
+pub mod base_read;
 pub mod bls;
 pub mod forks;
 pub mod l1_read;

@@ -238,6 +238,19 @@ pub fn execution_header_number(rlp: &[u8]) -> Result<u64, MptError> {
     rlp_uint(number)
 }
 
+/// The timestamp of an RLP execution header (item 11, a canonical integer):
+/// the L1 time at which its state root holds (the return over Base reads the
+/// registry's clocks against it).
+pub fn execution_header_timestamp(rlp: &[u8]) -> Result<u64, MptError> {
+    let item = rlp_decode(rlp)?;
+    let items = item.list().ok_or(MptError::Malformed)?;
+    let timestamp = items
+        .get(11)
+        .and_then(RlpItem::bytes)
+        .ok_or(MptError::Malformed)?;
+    rlp_uint(timestamp)
+}
+
 /// A canonical RLP unsigned integer of at most 8 bytes.
 pub fn rlp_uint(bytes: &[u8]) -> Result<u64, MptError> {
     if bytes.len() > 8 || bytes.first() == Some(&0) {
