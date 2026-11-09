@@ -286,6 +286,17 @@ fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
         DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT)
     );
     let test = rules().deposit_rule();
+    // The test clock is the public one (J = 69 120, F = J + 1 440, the clock of the G6 vectors): the
+    // crate's rule at J with that F; on the public profile, the crate's rule at J itself (the test
+    // chain opens J + 544 after its J, D104).
+    assert_eq!(
+        test,
+        DepositRule {
+            deposits_from_height: Some(F),
+            ..DepositRule::for_activation(Some(J))
+        }
+    );
+    #[cfg(not(feature = "testnet"))]
     assert_eq!(test, DepositRule::for_activation(Some(J)));
     // every field is the rules' own, not a constant
     let odd = VaultRules {
