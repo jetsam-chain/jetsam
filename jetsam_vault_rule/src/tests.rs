@@ -68,10 +68,15 @@ fn constants_are_the_definitive_ones() {
     assert_eq!(&BRIDGE_DEPOSIT_MARKER_TAG, b"JTMBRDG1");
     assert_eq!(&VAULT_RELEASE_MARKER_TAG, b"JTMVRL01");
     assert_eq!(&LIGHT_CLIENT_UPDATE_MARKER_TAG, b"JTMLCU01");
-    #[cfg(not(feature = "rehearsal-v1-7"))]
-    assert_eq!((BRIDGE_OPENING_DELAY, REHEARSAL_CLOCK), (1_440, false));
+    // D104: the test chain opens 544 = 17 x 32 blocks after its J; the public network keeps 1 440 (D44).
+    #[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
+    assert_eq!((BRIDGE_OPENING_DELAY, REHEARSAL_CLOCK, TESTNET_PROFILE), (1_440, false, false));
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert_eq!((BRIDGE_OPENING_DELAY, REHEARSAL_CLOCK, TESTNET_PROFILE), (544, false, true));
     #[cfg(feature = "rehearsal-v1-7")]
-    assert_eq!((BRIDGE_OPENING_DELAY, REHEARSAL_CLOCK), (32, true));
+    assert_eq!((BRIDGE_OPENING_DELAY, REHEARSAL_CLOCK, TESTNET_PROFILE), (32, true, false));
+    assert_eq!(TESTNET_OPENING_DELAY, 544);
+    assert!(TESTNET_OPENING_DELAY.is_multiple_of(32) && TESTNET_OPENING_DELAY >= 8);
     assert_eq!(bridge_deposits_from_height(None), None);
     assert_eq!(
         bridge_deposits_from_height(Some(J)),

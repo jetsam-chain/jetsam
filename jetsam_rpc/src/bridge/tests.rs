@@ -234,6 +234,16 @@ fn every_deposit_is_refused_while_the_v1_7_height_is_none() {
             expected,
             "a public profile's v1.7 height moved: the refusal above no longer covers it as it did"
         );
+        // ... and its bridge opening: F = 8 704 on the test chain (J + 544, D104), none on the public network.
+        let expected_f = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+            Some(8_704)
+        } else {
+            None
+        };
+        assert_eq!(
+            current.deposits_from_height, expected_f,
+            "a public profile's bridge opening moved: the refusal above no longer covers it as it did"
+        );
     }
 }
 

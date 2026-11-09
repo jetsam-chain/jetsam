@@ -61,12 +61,12 @@ pub const MIN_DEPOSIT_MICRO: u64 = MICRO_PER_JTM;
 /// Largest deposit: the L1 contract's per-deposit cap (D28): a larger one could never be minted.
 pub const MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
 
-/// Blocks between J and the bridge opening `F` (D44): the public profiles open ≈ 3 days after J.
-#[cfg(not(feature = "rehearsal-v1-7"))]
+/// Blocks between J and the bridge opening `F` (D44): the public network opens ≈ 3 days after J.
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
 pub const BRIDGE_OPENING_DELAY: u64 = 1_440;
-/// The rehearsal opens 32 blocks after its J (`F_R = J_R + 32`).
-#[cfg(feature = "rehearsal-v1-7")]
-pub const BRIDGE_OPENING_DELAY: u64 = 32;
+/// The test chain opens [`TESTNET_OPENING_DELAY`] blocks after its J (D104), the rehearsal 32 (`F_R = J_R + 32`).
+#[cfg(any(feature = "testnet", feature = "rehearsal-v1-7"))]
+pub const BRIDGE_OPENING_DELAY: u64 = if TESTNET_PROFILE { TESTNET_OPENING_DELAY } else { 32 };
 
 /// Whether this build carries the rehearsal clock (the node checks it against its own feature).
 pub const REHEARSAL_CLOCK: bool = cfg!(feature = "rehearsal-v1-7");
@@ -377,5 +377,13 @@ pub fn block_deposits(
 
 /// Whether this build carries the node's test chain profile (`jetsam_chain/testnet`), the private rehearsal's
 /// excepted (its builds name it on both sides): the proof program built without a profile of its own follows it
-/// (`jetsam_bridge_program::rules::PRODUCTION`). Nothing in V4 reads it.
+/// (`jetsam_bridge_program::rules::PRODUCTION`). V4 reads it for the test chain's bridge opening only
+/// ([`BRIDGE_OPENING_DELAY`]).
 pub const TESTNET_PROFILE: bool = cfg!(all(feature = "testnet", not(feature = "rehearsal-v1-7")));
+
+/// The test chain's bridge opening delay (D104): `F = J + 544 = 8 160 + 544 = 8 704`, 544 = 17 x 32 blocks (≈ 27 h)
+/// instead of the public 1 440. [`BRIDGE_OPENING_DELAY`] of a build holding `testnet`; the proof program reads it
+/// under its own `testnet` feature, whose guest builds do not hold this crate's (`jetsam_bridge_program::deposit`).
+pub const TESTNET_OPENING_DELAY: u64 = 544;
+
+const _: () = assert!(TESTNET_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");

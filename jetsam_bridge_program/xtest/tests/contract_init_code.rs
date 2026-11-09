@@ -37,6 +37,8 @@ struct Profile {
     network: &'static str,
     vector: &'static str,
     planned_j: u64,
+    /// F = J + the profile's opening delay: 1 440 on the public network (D44), 544 on the test chain (D104).
+    planned_f: u64,
 }
 
 const PROFILES: [Profile; 2] = [
@@ -46,13 +48,15 @@ const PROFILES: [Profile; 2] = [
         network: "6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44",
         vector: include_str!("fixtures/bridge_init_code_v3.json"),
         planned_j: 69_120,
+        planned_f: 69_120 + 1_440,
     },
-    // D78: 8 160 = 255 x 32 on the test chain (its v1.6 at 4 800), armed in params.rs.
+    // D78: 8 160 = 255 x 32 on the test chain (its v1.6 at 4 800), armed in params.rs; D104: F = 8 160 + 544.
     Profile {
         name: "testnet",
         network: "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85",
         vector: include_str!("fixtures/bridge_init_code_v3_testnet.json"),
         planned_j: 8_160,
+        planned_f: 8_704,
     },
 ];
 
@@ -140,7 +144,7 @@ fn bridge_constants_match_contract_init_code() {
 
     // Word 2: the L1's minimum burn is the vault's release fee.
     assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
-    // Words 3 and 4: J, and F = BRIDGE_DEPOSITS_FROM_HEIGHT by the node's own rule (J + 1 440).
+    // Words 3 and 4: J, and F = BRIDGE_DEPOSITS_FROM_HEIGHT by the node's own rule (J + the profile's delay).
     let j = as_u64(word(config, 3));
     let f = as_u64(word(config, 4));
     match V1_7_ACTIVATION_HEIGHT {
@@ -152,6 +156,7 @@ fn bridge_constants_match_contract_init_code() {
         "{j} is not a v1.7 height of this profile"
     );
     assert_eq!(Some(f), bridge_deposits_from_height(Some(j)));
+    assert_eq!(f, p.planned_f, "the contract's F is the plan's ({})", p.name);
     // Word 5: the network is this profile's genesis block id.
     assert_eq!(word(config, 5), &network_id()[..]);
 
@@ -184,7 +189,7 @@ fn each_network_has_its_own_init_code_vector() {
         assert_eq!(v["profile"].as_str(), Some(p.name));
         assert_eq!(hex(&bytes(&v["config"]["jetsamNetwork"])), p.network, "{}", p.name);
         assert_eq!(v["config"]["genesisMinLockedHeight"].as_u64(), Some(p.planned_j), "{}", p.name);
-        assert_eq!(bridge_deposits_from_height(Some(p.planned_j)), v["config"]["depositsFromHeight"].as_u64(), "{}", p.name);
+        assert_eq!(v["config"]["depositsFromHeight"].as_u64(), Some(p.planned_f), "{}", p.name);
         v
     });
     assert_ne!(m["bridge"]["address"], t["bridge"]["address"]);

@@ -37,8 +37,8 @@ pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(96);
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(69_120);
 #[cfg(all(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))]
 compile_error!("rehearsal-v1-7 and test-clock-j69120 are two clocks");
-/// V4 under this program's clock and the definitive constants (vault, amounts, `F = J + delay`).
-pub const DEPOSIT_RULE: DepositRule = DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT);
+/// V4 under this program's clock and the definitive constants (vault, amounts, `F` = [`DEPOSITS_FROM_HEIGHT`]).
+pub const DEPOSIT_RULE: DepositRule = DepositRule { deposits_from_height: DEPOSITS_FROM_HEIGHT, ..DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT) };
 
 /// A deposit of a block, as the program proves it: its user group, logical txid (`jetsam_vault_rule`'s, the
 /// one the robot advances under, A5-12), recipient, amount.
@@ -163,3 +163,16 @@ pub fn block_deposits(height: u64, tx_root: &[u8; 32], pages: &[&[u8]], rule: &D
         Err(BlockError::Rule(e)) => panic!("V4: {e:?}"),
     }
 }
+
+/// `F` of this program's clock, `J + delay` of the node's profile of the same name: on the program's own `testnet`, the
+/// test chain's delay (`TESTNET_OPENING_DELAY`, D104: 8 160 + 544 = 8 704), since its guest build does not hold
+/// `jetsam_vault_rule/testnet` (core/Cargo.toml); otherwise `jetsam_vault_rule`'s rule (public network: none while J is
+/// none; rehearsal: J_R + 32; a build holding the node's `jetsam_chain/testnet`: J + 544). Changing it changes the
+/// program's key; the cross test of `jetsam_bridge_xtest` checks it against the node's.
+#[cfg(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))))]
+pub const DEPOSITS_FROM_HEIGHT: Option<u64> = match V1_7_ACTIVATION_HEIGHT {
+    Some(j) => Some(j + jetsam_vault_rule::TESTNET_OPENING_DELAY),
+    None => None,
+};
+#[cfg(not(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120")))))]
+pub const DEPOSITS_FROM_HEIGHT: Option<u64> = jetsam_vault_rule::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT);

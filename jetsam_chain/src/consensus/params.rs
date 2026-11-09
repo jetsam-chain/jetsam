@@ -2606,7 +2606,7 @@ mod tests {
     /// earlier. J − 1 keeps every clock of the 1.6.1 test build (v1.4 at 6,
     /// v1.5 at 960, v1.6 at 4 800, the v1.6 body cap, the v1.6 relation);
     /// J and J + 1 are v1.7 blocks. The clocks that hang off J follow it:
-    /// deposits from F = 9 600, delegation from J_D = 23 520.
+    /// deposits from F = 8 704 (J + 544, D104), delegation from J_D = 23 520.
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     #[test]
     fn the_test_chain_crosses_v1_7_at_8160() {
@@ -2636,7 +2636,7 @@ mod tests {
         }
         assert_eq!(
             crate::consensus::vault::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
-            Some(9_600)
+            Some(8_704)
         );
         assert_eq!(
             crate::consensus::guardian::DELEGATION_ACTIVATION_HEIGHT,
