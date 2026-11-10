@@ -351,6 +351,35 @@ impl L1 {
         let v = self.rpc("eth_getStorageAt", json!([to, format!("0x{}", hex::encode(slot)), "latest"]))?;
         crate::parse32(v.as_str().unwrap_or_default())
     }
+
+    /// E-1 (audit 2026-11-10): the logs of `address` under `topics` in the blocks `from..=to`; an answer that is
+    /// not a list (`null`, an object, a string) is an error, never "no event".
+    pub fn logs(&self, address: &str, topics: Value, from: u64, to: u64) -> anyhow::Result<Vec<Value>> {
+        let filter = json!([{"address": address, "fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "topics": topics}]);
+        match self.rpc("eth_getLogs", filter)? {
+            Value::Array(logs) => Ok(logs),
+            other => anyhow::bail!("eth_getLogs {from}..={to} answered {} instead of a list of logs", printable(&other.to_string())),
+        }
+    }
+
+    /// E-1: the block up to which logs may be read now, `confirmations` below `eth_blockNumber`, and its timestamp;
+    /// an error when the endpoint does not serve that block itself (a number ahead of its own chain: logs read up to
+    /// it would leave every later event unread).
+    pub fn readable_head(&self, confirmations: u64) -> anyhow::Result<(u64, u64)> {
+        let latest = hex_u64(&self.rpc("eth_blockNumber", json!([]))?)?;
+        let head = latest.saturating_sub(confirmations);
+        let b = self.rpc("eth_getBlockByNumber", json!([format!("0x{head:x}"), false]))?;
+        anyhow::ensure!(
+            hex_u64(&b["number"]).ok() == Some(head),
+            "eth_blockNumber says {latest}, but the endpoint does not serve block {head} ({latest} − {confirmations}): no log is read past it"
+        );
+        Ok((head, hex_u64(&b["timestamp"])?))
+    }
+}
+
+/// At most 200 characters of an endpoint's answer, as it may appear in a log.
+fn printable(text: &str) -> String {
+    text.chars().take(200).map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
 /// A `0x…` quantity.

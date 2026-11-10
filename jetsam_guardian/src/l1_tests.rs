@@ -182,3 +182,87 @@ fn the_checkpoint_accepted_event_is_read_with_its_deposit_blocks() {
     moved[11 * 32..12 * 32].copy_from_slice(&w64(13 * 32));
     assert!(checkpoint_accepted(&moved).is_err(), "an offset that is not the list's");
 }
+
+/// A fake JSON-RPC endpoint on 127.0.0.1 (plain TCP): every request answered `{"result": answer(method, params)}`,
+/// every request seen kept.
+fn endpoint(answer: impl Fn(&str, &Value) -> Value + Send + Sync + 'static) -> (L1, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { continue };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let req: Value = loop {
+                let n = s.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break Value::Null;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&raw[..i]).to_ascii_lowercase();
+                let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+                if raw.len() >= i + 4 + len {
+                    break serde_json::from_slice(&raw[i + 4..i + 4 + len]).unwrap_or(Value::Null);
+                }
+            };
+            seen2.lock().unwrap().push(req.clone());
+            let body = json!({"jsonrpc": "2.0", "id": 1, "result": answer(req["method"].as_str().unwrap_or_default(), &req["params"])}).to_string();
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        }
+    });
+    (L1::new(&url), seen)
+}
+
+/// E-1 (audit 2026-11-10): an `eth_getLogs` answer that is not a list is an error, never "no event"; a list is the
+/// logs, read in the window asked for.
+#[test]
+fn logs_are_a_list_or_an_error_never_no_event() {
+    for bad in [Value::Null, json!({"logs": []}), json!("0x"), json!(0)] {
+        let shown = bad.to_string();
+        let (l1, _) = endpoint(move |_, _| bad.clone());
+        let e = l1.logs("0xee", json!([TOPIC_CHECKPOINT_ACCEPTED]), 1, 5000).unwrap_err().to_string();
+        assert!(e.contains("instead of a list of logs") && e.contains("1..=5000"), "{shown}: {e}");
+    }
+    let (l1, seen) = endpoint(|_, _| json!([{"data": "0x"}, {"data": "0x01"}]));
+    assert_eq!(l1.logs("0xee", json!([TOPIC_CHECKPOINT_ACCEPTED, ["0x01"]]), 16, 31).unwrap().len(), 2);
+    assert_eq!(l1.logs("0xee", json!([TOPIC_CHECKPOINT_ACCEPTED]), 0, 0).unwrap().len(), 2);
+    let f = &seen.lock().unwrap()[0]["params"][0];
+    assert_eq!((f["fromBlock"].as_str(), f["toBlock"].as_str(), f["address"].as_str()), (Some("0x10"), Some("0x1f"), Some("0xee")));
+    assert_eq!(f["topics"], json!([TOPIC_CHECKPOINT_ACCEPTED, ["0x01"]]));
+}
+
+/// E-1: logs are read up to `confirmations` below `eth_blockNumber` only when the endpoint serves that block itself
+/// (an `eth_blockNumber` ahead of its own chain is refused: read up to it, every later event would be lost).
+#[test]
+fn logs_are_read_up_to_a_block_the_endpoint_serves_only() {
+    let chain = |latest: u64, served: u64| {
+        endpoint(move |method, params| match method {
+            "eth_blockNumber" => json!(format!("0x{latest:x}")),
+            "eth_getBlockByNumber" => {
+                let n = u64::from_str_radix(params[0].as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap();
+                if n <= served {
+                    json!({"number": format!("0x{n:x}"), "timestamp": format!("0x{:x}", 1_000 + n)})
+                } else {
+                    Value::Null
+                }
+            }
+            _ => Value::Null,
+        })
+        .0
+    };
+    assert_eq!(chain(100, 100).readable_head(12).unwrap(), (88, 1_088));
+    assert_eq!(chain(100, 100).readable_head(0).unwrap(), (100, 1_100));
+    assert_eq!(chain(5, 5).readable_head(12).unwrap(), (0, 1_000), "a chain shorter than the confirmations: its block 0");
+    let e = chain(10_000_000, 100).readable_head(12).unwrap_err().to_string();
+    assert!(e.contains("does not serve block 9999988"), "{e}");
+    // a block answered under another number is not the block asked for
+    let (l1, _) = endpoint(|method, _| match method {
+        "eth_blockNumber" => json!("0x64"),
+        _ => json!({"number": "0x63", "timestamp": "0x10"}),
+    });
+    assert!(l1.readable_head(0).is_err());
+}

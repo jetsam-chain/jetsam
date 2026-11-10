@@ -149,7 +149,15 @@ struct Relay {
     /// N2: (deposit blocks read, points known) at the last rebuild of the trees: rebuilt again only when
     /// one of them changed (C1: a rebuild from a point's list is one root per point not rebuilt yet).
     trees_at: Option<(usize, usize)>,
+    /// E-1: the timestamp of L1 block `state.logs_to` when the last `learn` read every block up to it (0: none yet).
+    read_to_time: u64,
+    /// E-1: when the points the contract names and this relayer does not know were last read again by their ids.
+    reread_at: Option<u64>,
 }
+
+/// E-1: the points the contract names (its tip, its final point) and this relayer does not know are read again by
+/// their ids at most this often.
+const REREAD_EVERY_SECS: u64 = 600;
 
 impl Relay {
     fn event(&self, mut v: Value) {
@@ -318,39 +326,97 @@ impl Relay {
 
     /// `CheckpointAccepted` since the last read: every checkpoint anyone submitted, its id recomputed; up to
     /// `l1_confirmations` blocks below the L1's latest (A5-9: a short L1 reorganization never makes the relayer
-    /// learn a point that is gone).
+    /// learn a point that is gone). E-1: never up to a block the endpoint does not serve itself, and a window whose
+    /// answer is not a list of logs is not read: it is read again at the next step.
     fn learn(&mut self) -> anyhow::Result<()> {
-        let latest = l1::hex_u64(&self.l1.rpc("eth_blockNumber", json!([]))?)?.saturating_sub(self.cfg.l1_confirmations()?);
+        let (latest, latest_time) = self.l1.readable_head(self.cfg.l1_confirmations()?)?;
         let mut from = self.state.logs_to.max(self.cfg.l1_from_block.saturating_sub(1)) + 1;
         if self.state.logs_to == 0 {
             from = self.cfg.l1_from_block;
         }
         while from <= latest {
             let to = latest.min(from + 4_999);
-            let filter = json!([{"address": self.bridge, "fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "topics": [l1::TOPIC_CHECKPOINT_ACCEPTED]}]);
-            for lg in self.l1.rpc("eth_getLogs", filter)?.as_array().cloned().unwrap_or_default() {
-                let topics: Vec<String> = lg["topics"].as_array().cloned().unwrap_or_default().iter().map(|t| t.as_str().unwrap_or_default().to_string()).collect();
-                let (Some(id), Some(prev)) = (topics.get(1).and_then(|t| parse32(t).ok()), topics.get(2).and_then(|t| parse32(t).ok())) else { continue };
-                let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
-                // C1: the checkpoint, and the heights of the whole blocks its proof gave
-                let (cp, _, blocks) = match l1::checkpoint_accepted(&data) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        log(&format!("ALERT CHECKPOINT_EVENT_UNREADABLE {}: {e:#}", hex::encode(id)));
-                        continue;
-                    }
-                };
-                if cp.id() != id || self.state.known.contains_key(&hex::encode(id)) {
-                    continue;
-                }
-                let node = self.view("nodeOf(bytes32)", &id)?;
-                let k = Known { cp, parent: prev, accepted_at: word_u64(&node, 3), headers: Known::context_from(&cp, &self.chain), ours: false, omitted: None, deposit_blocks: Some(blocks) };
-                log(&format!("learned checkpoint {} L={} T={} (another submitter's, context {})", hex::encode(id), cp.locked_height, cp.height, if k.headers.is_empty() { "off this chain" } else { "on this chain" }));
-                self.event(json!({"event": "checkpoint_learned", "id": hex::encode(id), "parent": hex::encode(prev), "locked_height": cp.locked_height, "height": cp.height, "on_chain": !k.headers.is_empty()}));
-                self.state.known.insert(hex::encode(id), k);
+            for lg in self.l1.logs(&self.bridge, json!([l1::TOPIC_CHECKPOINT_ACCEPTED]), from, to)? {
+                self.learn_log(&lg)?;
             }
             self.state.logs_to = to;
             from = to + 1;
+        }
+        if self.state.logs_to == latest {
+            self.read_to_time = latest_time;
+        }
+        Ok(())
+    }
+
+    /// One `CheckpointAccepted` log: its checkpoint, its id recomputed, learned once.
+    fn learn_log(&mut self, lg: &Value) -> anyhow::Result<()> {
+        let topics: Vec<String> = lg["topics"].as_array().cloned().unwrap_or_default().iter().map(|t| t.as_str().unwrap_or_default().to_string()).collect();
+        let (Some(id), Some(prev)) = (topics.get(1).and_then(|t| parse32(t).ok()), topics.get(2).and_then(|t| parse32(t).ok())) else { return Ok(()) };
+        let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
+        // C1: the checkpoint, and the heights of the whole blocks its proof gave
+        let (cp, _, blocks) = match l1::checkpoint_accepted(&data) {
+            Ok(x) => x,
+            Err(e) => {
+                log(&format!("ALERT CHECKPOINT_EVENT_UNREADABLE {}: {e:#}", hex::encode(id)));
+                return Ok(());
+            }
+        };
+        if cp.id() != id || self.state.known.contains_key(&hex::encode(id)) {
+            return Ok(());
+        }
+        let node = self.view("nodeOf(bytes32)", &id)?;
+        let k = Known { cp, parent: prev, accepted_at: word_u64(&node, 3), headers: Known::context_from(&cp, &self.chain), ours: false, omitted: None, deposit_blocks: Some(blocks) };
+        log(&format!("learned checkpoint {} L={} T={} (another submitter's, context {})", hex::encode(id), cp.locked_height, cp.height, if k.headers.is_empty() { "off this chain" } else { "on this chain" }));
+        self.event(json!({"event": "checkpoint_learned", "id": hex::encode(id), "parent": hex::encode(prev), "locked_height": cp.locked_height, "height": cp.height, "on_chain": !k.headers.is_empty()}));
+        self.state.known.insert(hex::encode(id), k);
+        Ok(())
+    }
+
+    /// E-1: the points of `ids` (the contract's tip and final point) that this relayer does not know although the
+    /// contract accepted them before the last block it read: their `CheckpointAccepted` read again by their ids
+    /// (`topics[1]`) over the blocks read, newest first, at most once every [`REREAD_EVERY_SECS`] (an answer that left
+    /// a log out never loses its point for ever).
+    fn reread(&mut self, ids: &[[u8; 32]]) -> anyhow::Result<()> {
+        let now = now_unix();
+        if self.read_to_time == 0 || self.reread_at.is_some_and(|t| now < t + REREAD_EVERY_SECS) {
+            return Ok(());
+        }
+        let mut want = Vec::new();
+        for id in ids {
+            if *id == [0u8; 32] || want.contains(id) || self.state.known.contains_key(&hex::encode(id)) {
+                continue;
+            }
+            if word_u64(&self.view("nodeOf(bytes32)", id)?, 3) < self.read_to_time {
+                want.push(*id);
+            }
+        }
+        if want.is_empty() {
+            return Ok(());
+        }
+        self.reread_at = Some(now);
+        let names: Vec<String> = want.iter().map(hex::encode).collect();
+        log(&format!(
+            "ALERT POINT_NOT_LEARNED {}: the contract accepted it before L1 block {}, no answer gave its CheckpointAccepted: read again by its id",
+            names.join(", "),
+            self.state.logs_to
+        ));
+        self.event(json!({"event": "point_read_again", "ids": names}));
+        let topics = json!([l1::TOPIC_CHECKPOINT_ACCEPTED, want.iter().map(|id| hex0x(id)).collect::<Vec<_>>()]);
+        let first = self.cfg.l1_from_block;
+        let mut to = self.state.logs_to;
+        while to >= first && want.iter().any(|id| !self.state.known.contains_key(&hex::encode(id))) {
+            let from = to.saturating_sub(4_999).max(first);
+            for lg in self.l1.logs(&self.bridge, topics.clone(), from, to)? {
+                self.learn_log(&lg)?;
+            }
+            if from == first {
+                break;
+            }
+            to = from - 1;
+        }
+        let lost: Vec<String> = want.iter().filter(|id| !self.state.known.contains_key(&hex::encode(id))).map(hex::encode).collect();
+        if !lost.is_empty() {
+            log(&format!("ALERT POINT_NOT_FOUND_AGAIN {}: read again in {REREAD_EVERY_SECS} s", lost.join(", ")));
         }
         Ok(())
     }
@@ -744,13 +810,17 @@ impl Relay {
         self.resolve_trees(gl);
         let t = self.view("tip()", &[])?;
         let (tip_id, tip_height, tip_cum_work) = (word(&t, 0), word_u64(&t, 1), word(&t, 2));
+        let fin = word(&self.view("finalId()", &[])?, 0);
+        // E-1: the tip or the final point not known: read again by their ids
+        if let Err(e) = self.reread(&[tip_id, fin]) {
+            log(&format!("read again by id: {e:#}"));
+        }
         let tip_block = word(&self.view("tipBlockId()", &[])?, 0);
         let tip_locked = word(&self.view("tipLockedBlockId()", &[])?, 0);
         if let Some(k) = self.state.known.get(&hex::encode(tip_id)) {
             anyhow::ensure!(k.cp.tip_block_id == tip_block, "the contract's tipBlockId is not its tip's block");
             anyhow::ensure!(k.cp.locked_block_id == tip_locked, "the contract's tipLockedBlockId is not its tip's locked block");
         }
-        let fin = word(&self.view("finalId()", &[])?, 0);
         let last_switch = word_u64(&self.view("lastSwitchAt()", &[])?, 0);
         let paused_until = word_u64(&self.view("pausedUntil()", &[])?, 0);
         let stalled = word(&self.view("stalled()", &[])?, 0)[31] == 1;
@@ -953,6 +1023,8 @@ fn run() -> anyhow::Result<()> {
         prover,
         events,
         trees_at: None,
+        read_to_time: 0,
+        reread_at: None,
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
