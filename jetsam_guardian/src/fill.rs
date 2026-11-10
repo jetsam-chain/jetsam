@@ -1097,6 +1097,10 @@ pub struct FillConfig {
     pub v1_7_height: u64,
     pub deposits_from_height: u64,
     pub l1_rpc: String,
+    /// E-8 (audit 2026-11-10): the first L1 block the robot reads logs from (the bridge's deployment); its queries are
+    /// windows of `l1::LOG_WINDOW` blocks above it, newest first.
+    #[serde(default)]
+    pub l1_from_block: u64,
     /// The hot key (the `from` of the advances).
     pub hot_address: String,
     /// The cold claim owner the slow mint repays (never the hot key).

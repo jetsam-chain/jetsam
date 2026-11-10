@@ -377,6 +377,28 @@ impl L1 {
     }
 }
 
+/// E-8 (audit 2026-11-10): blocks per `eth_getLogs` query of [`L1::newest_logs`] (an endpoint bounds the range of
+/// one query: 50 000 blocks at publicnode).
+pub const LOG_WINDOW: u64 = 5_000;
+
+impl L1 {
+    /// E-8: the logs of `address` under `topics` in the blocks from `from` to the latest, read in windows of
+    /// [`LOG_WINDOW`] blocks from the newest down, up to the first window that holds any: that window's logs (none:
+    /// an empty list).
+    pub fn newest_logs(&self, address: &str, topics: Value, from: u64) -> anyhow::Result<Vec<Value>> {
+        let mut to = hex_u64(&self.rpc("eth_blockNumber", json!([]))?)?;
+        while to >= from {
+            let low = to.saturating_sub(LOG_WINDOW - 1).max(from);
+            let logs = self.logs(address, topics.clone(), low, to)?;
+            if !logs.is_empty() || low == from {
+                return Ok(logs);
+            }
+            to = low - 1;
+        }
+        Ok(Vec::new())
+    }
+}
+
 /// At most 200 characters of an endpoint's answer, as it may appear in a log.
 fn printable(text: &str) -> String {
     text.chars().take(200).map(|c| if c.is_control() { '?' } else { c }).collect()

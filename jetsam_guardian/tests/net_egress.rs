@@ -1095,7 +1095,7 @@ fn halts_after_three_reverts(before: Option<&str>) {
     assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
 }
 
-// ---------------------------------------------------------------- jg-fill: the audit of 2026-11-10 (E-6)
+// ---------------------------------------------------------------- jg-fill: the audit of 2026-11-10 (E-6, E-8)
 
 fn hexsel(sig: &str) -> String {
     format!("0x{}", hex::encode(jetsam_guardian::l1::selector(sig)))
@@ -1196,6 +1196,77 @@ fn jg_fill_never_halts_on_reverts_another_transaction_explains() {
     assert_eq!(after, 3, "three claims, each sent once; log:\n{log}");
     assert!(!dir.join("state/HALT").exists(), "halted: {:?}; log:\n{log}", std::fs::read_to_string(dir.join("state/HALT")));
     assert!(log.contains("another transaction landed first"), "{log}");
+}
+
+/// The fake L1 of `inner` that is 10 000 000 blocks long, whose `eth_getLogs` refuses a range of more than 50 000
+/// blocks (a public endpoint's bound, publicnode's) and whose contract's tip is `cp`, accepted at block 9 999 000.
+fn bounded_logs(inner: Answer, cp: jetsam_guardian::checkpoint::Checkpoint) -> Answer {
+    let tip = hexsel("tip()");
+    let id = format!("0x{}", hex::encode(cp.id()));
+    let mut data = cp.words().concat();
+    for w in [0u64, 12 * 32, 0] {
+        let mut x = [0u8; 32];
+        x[24..].copy_from_slice(&w.to_be_bytes());
+        data.extend_from_slice(&x);
+    }
+    let log = json!({"blockNumber": "0x9892b8", "topics": [jetsam_guardian::l1::TOPIC_CHECKPOINT_ACCEPTED, id.clone(), format!("0x{}", "00".repeat(32))], "data": format!("0x{}", hex::encode(data))});
+    Arc::new(move |method, params| {
+        let num = |v: &Value| match v.as_str() {
+            Some("latest") | None => 10_000_000u64,
+            Some(x) => u64::from_str_radix(x.trim_start_matches("0x"), 16).unwrap_or(0),
+        };
+        match method {
+            "eth_blockNumber" => json!({"result": "0x989680"}),
+            "eth_getLogs" => {
+                let (from, to) = (num(&params[0]["fromBlock"]), num(&params[0]["toBlock"]));
+                if to.saturating_sub(from) >= 50_000 {
+                    return json!({"error": {"code": -32701, "message": "exceed maximum block range: 50000"}});
+                }
+                let wanted = params[0]["topics"][1].as_str().map(str::to_lowercase) == Some(id.clone()) && params[0]["topics"][0] == json!(jetsam_guardian::l1::TOPIC_CHECKPOINT_ACCEPTED);
+                json!({"result": if wanted && (from..=to).contains(&9_999_000) { vec![log.clone()] } else { vec![] }})
+            }
+            "eth_call" if params[0]["data"].as_str().unwrap_or_default().starts_with(&tip) => {
+                json!({"result": format!("0x{}{}", hex::encode(cp.id()), "00".repeat(96))})
+            }
+            _ => inner(method, params),
+        }
+    })
+}
+
+/// E-8 (audit 2026-11-10): the robot reads the preimage of the contract's tip in windows its endpoint accepts (newest
+/// first), never from block 0 to the latest in one query: an endpoint that bounds the range (50 000 blocks) does not make
+/// it inert. Rehearsal build only.
+#[test]
+fn jg_fill_reads_its_logs_in_windows_its_endpoint_accepts() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let cp = jetsam_guardian::checkpoint::Checkpoint {
+        height: 300,
+        cum_work: [1; 32],
+        headers_digest: [2; 32],
+        deposit_root: [3; 32],
+        deposit_count: 0,
+        anchor_root: [4; 32],
+        locked_height: 292,
+        tip_block_id: [5; 32],
+        locked_block_id: [6; 32],
+        locked_cum_work: [7; 32],
+    };
+    let (socks, _) = fake_tor(bounded_logs(fill_world(1_200_000_000), cp));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let id = hex::encode(cp.id());
+    let read = wait_for(60, || {
+        std::fs::read_to_string(dir.join("state/state.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|v| v["checkpoints"].get(&id).is_some())
+    });
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(read, "the tip's checkpoint is never read; log:\n{log}");
+    assert!(!log.contains("exceed maximum block range"), "{log}");
 }
 
 // ---------------------------------------------------------------- jg-relay: its state (re-audit R5, A5-14)

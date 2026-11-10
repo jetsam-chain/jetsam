@@ -266,3 +266,32 @@ fn logs_are_read_up_to_a_block_the_endpoint_serves_only() {
     });
     assert!(l1.readable_head(0).is_err());
 }
+
+/// E-8 (audit 2026-11-10): `newest_logs` reads windows of at most `LOG_WINDOW` blocks, from the latest down to `from`,
+/// and stops at the first that holds a log; it never asks below `from`, nor from block 0 to "latest" in one query.
+#[test]
+fn newest_logs_reads_bounded_windows_from_the_latest_down() {
+    let (l1, seen) = endpoint(|method, params| match method {
+        "eth_blockNumber" => json!("0x3039"),
+        _ => {
+            let n = |k: &str| u64::from_str_radix(params[0][k].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+            if (n("fromBlock")..=n("toBlock")).contains(&3_000) {
+                json!([{"blockNumber": "0xbb8"}])
+            } else {
+                json!([])
+            }
+        }
+    });
+    assert_eq!(l1.newest_logs("0xee", json!([TOPIC_ADVANCE_REPAID, "0x01"]), 1_000).unwrap(), vec![json!({"blockNumber": "0xbb8"})]);
+    let windows: Vec<(String, String)> = seen.lock().unwrap().iter().filter(|r| r["method"] == "eth_getLogs").map(|r| (r["params"][0]["fromBlock"].as_str().unwrap().to_string(), r["params"][0]["toBlock"].as_str().unwrap().to_string())).collect();
+    assert_eq!(windows, vec![(format!("0x{:x}", 7_346), format!("0x{:x}", 12_345)), (format!("0x{:x}", 2_346), format!("0x{:x}", 7_345))], "newest first, 5 000 blocks each, stopped at the first log");
+    // none: every window down to `from`, and never below it
+    seen.lock().unwrap().clear();
+    assert!(l1.newest_logs("0xee", json!([TOPIC_ADVANCE_REPAID, "0x02"]), 3_001).unwrap().is_empty());
+    let lows: Vec<String> = seen.lock().unwrap().iter().filter(|r| r["method"] == "eth_getLogs").map(|r| r["params"][0]["fromBlock"].as_str().unwrap().to_string()).collect();
+    assert_eq!(lows, vec![format!("0x{:x}", 7_346), format!("0x{:x}", 3_001)]);
+    // from above the latest: nothing asked
+    seen.lock().unwrap().clear();
+    assert!(l1.newest_logs("0xee", json!([TOPIC_ADVANCE_REPAID]), 20_000).unwrap().is_empty());
+    assert!(seen.lock().unwrap().iter().all(|r| r["method"] != "eth_getLogs"));
+}

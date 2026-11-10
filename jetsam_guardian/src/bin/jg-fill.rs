@@ -197,9 +197,9 @@ impl Robot {
         if let Some(cp) = self.state.checkpoints.get(&hex::encode(id)) {
             return Ok(Some(*cp));
         }
-        let filter = json!([{"address": self.bridge, "fromBlock": "0x0", "toBlock": "latest", "topics": [l1::TOPIC_CHECKPOINT_ACCEPTED, hex0x(id)]}]);
-        let logs = self.l1.rpc("eth_getLogs", filter)?;
-        for lg in logs.as_array().cloned().unwrap_or_default() {
+        // E-8: windows of l1::LOG_WINDOW blocks from the newest down to l1_from_block (never 0..latest in one query)
+        let logs = self.l1.newest_logs(&self.bridge, json!([l1::TOPIC_CHECKPOINT_ACCEPTED, hex0x(id)]), self.cfg.l1_from_block)?;
+        for lg in logs {
             let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
             let cp = Checkpoint {
                 height: word_u64(&data, 0),
@@ -223,9 +223,9 @@ impl Robot {
 
     /// The amount `AdvanceRepaid(key, txId, refundTo, amount)` minted to the claim owner of advance `key`.
     fn repaid_amount(&self, key: &[u8; 32]) -> anyhow::Result<Option<u64>> {
-        let filter = json!([{"address": self.bridge, "fromBlock": "0x0", "toBlock": "latest", "topics": [l1::TOPIC_ADVANCE_REPAID, hex0x(key)]}]);
-        let logs = self.l1.rpc("eth_getLogs", filter)?;
-        let Some(lg) = logs.as_array().and_then(|l| l.first()) else { return Ok(None) };
+        // E-8: as `checkpoint`
+        let logs = self.l1.newest_logs(&self.bridge, json!([l1::TOPIC_ADVANCE_REPAID, hex0x(key)]), self.cfg.l1_from_block)?;
+        let Some(lg) = logs.first() else { return Ok(None) };
         let data = hex::decode(lg["data"].as_str().unwrap_or("0x").trim_start_matches("0x"))?;
         anyhow::ensure!(data.len() == 32, "AdvanceRepaid data of {} bytes", data.len());
         Ok(Some(word_u64(&data, 0)))
