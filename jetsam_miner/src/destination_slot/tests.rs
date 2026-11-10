@@ -997,10 +997,11 @@ fn the_template_keeps_only_the_advances_the_block_rule_accepts_together() {
         advance_entry(2_030, CAROL, 3, CAROL, RELEASE_FEE_MICRO, fee),
         // 4: an advance of 5, released by the offer: left out.
         advance_entry(2_040, CAROL, 5, OWNER, 10 * jtm, fee),
-        // 5, 6: PAYER over its cap (1 010 held, then 1 000, then 991): the
-        // second placed left out (entry 1 still fits after the first).
-        advance_entry(2_050, PAYER, 11, OWNER, 1_000 * jtm, fee + 4),
-        advance_entry(2_060, PAYER, 12, OWNER, 991 * jtm, fee + 3),
+        // 5, 6: PAYER over its cap (D123: 50 000 JTM; 1 010 held, then
+        // 25 000, then 23 991): the second placed left out (entry 1 still
+        // fits after the first).
+        advance_entry(2_050, PAYER, 11, OWNER, 25_000 * jtm, fee + 4),
+        advance_entry(2_060, PAYER, 12, OWNER, 23_991 * jtm, fee + 3),
         // 7, 8: the claim of 9 moved twice: the second placed left out.
         page(
             PAYER,
