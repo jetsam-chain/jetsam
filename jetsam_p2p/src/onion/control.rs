@@ -139,32 +139,23 @@ pub fn safecookie_hashes(
 
 /// Pick an authentication from what Tor offers and what the operator set.
 ///
-/// `NULL` when Tor asks for nothing; otherwise the configured password when
-/// Tor accepts passwords; otherwise the configured cookie file through
-/// `SAFECOOKIE`, provided Tor names that very file. Tor never chooses which
-/// file the node reads, and the cookie itself is never sent.
+/// `NULL` when Tor asks for nothing and the operator set no method (C-3: never
+/// once a cookie or a password is configured: whatever answers on the port
+/// cannot bring the node down to it); otherwise the configured cookie file
+/// through `SAFECOOKIE`, provided Tor names that very file (C-3: first, Tor
+/// proves it holds the cookie); otherwise the configured password when Tor
+/// accepts passwords. Tor never chooses which file the node reads, and the
+/// cookie itself is never sent.
 pub fn choose_auth(
     info: &ProtocolInfo,
     auth: &ControlAuthConfig,
 ) -> Result<AuthChoice, OnionError> {
     let offers = |method: &AuthMethod| info.methods.contains(method);
-    if offers(&AuthMethod::Null) {
+    let configured = auth.cookie_file.is_some() || auth.password_file.is_some();
+    if offers(&AuthMethod::Null) && !configured {
         return Ok(AuthChoice::Null);
     }
-    if let Some(password) = &auth.password_file {
-        if offers(&AuthMethod::HashedPassword) {
-            return Ok(AuthChoice::Password(password.clone()));
-        }
-    }
     if let Some(cookie) = &auth.cookie_file {
-        if offers(&AuthMethod::Cookie) && !offers(&AuthMethod::SafeCookie) {
-            return Err(OnionError::Auth(
-                "Tor offers COOKIE without SAFECOOKIE: the node never sends the cookie itself \
-                 (it would hand it to whatever answers on this port); configure \
-                 control_password_file, or run a Tor that offers SAFECOOKIE"
-                    .into(),
-            ));
-        }
         if offers(&AuthMethod::SafeCookie) {
             return match &info.cookie_file {
                 Some(announced) if announced == cookie => {
@@ -180,6 +171,27 @@ pub fn choose_auth(
                 )),
             };
         }
+    }
+    if let Some(password) = &auth.password_file {
+        if offers(&AuthMethod::HashedPassword) {
+            return Ok(AuthChoice::Password(password.clone()));
+        }
+    }
+    if auth.cookie_file.is_some() && offers(&AuthMethod::Cookie) {
+        return Err(OnionError::Auth(
+            "Tor offers COOKIE without SAFECOOKIE: the node never sends the cookie itself \
+             (it would hand it to whatever answers on this port); configure \
+             control_password_file, or run a Tor that offers SAFECOOKIE"
+                .into(),
+        ));
+    }
+    if offers(&AuthMethod::Null) {
+        return Err(OnionError::Auth(
+            "the ControlPort asks for no authentication while cookie_file or \
+             control_password_file is configured: refused, never a fall back to NULL \
+             (whatever answers on this port may not be this host's Tor)"
+                .into(),
+        ));
     }
     Err(OnionError::Auth(format!(
         "no usable authentication: Tor offers {:?}; configure control_password_file (HASHEDPASSWORD) or cookie_file (SAFECOOKIE)",
@@ -1050,6 +1062,67 @@ mod tests {
         assert!(choose_auth(&info(vec![AuthMethod::HashedPassword], None), &cookie).is_err());
         assert!(choose_auth(&info(vec![AuthMethod::SafeCookie], tor_cookie), &none).is_err());
         assert!(choose_auth(&info(vec![], None), &both).is_err());
+    }
+
+    /// C-3 (audit 2026-11-10): whatever answers on the ControlPort (a local account that took
+    /// the port while Tor restarts) cannot bring the node down to NULL once the operator set a
+    /// method, and SAFECOOKIE, where Tor proves it holds the cookie, is tried before the
+    /// password.
+    #[test]
+    fn control_auth_never_falls_back_to_null_and_tries_safecookie_before_the_password() {
+        let cookie = ControlAuthConfig {
+            cookie_file: Some("/run/tor/control.authcookie".into()),
+            password_file: None,
+        };
+        let password = ControlAuthConfig {
+            cookie_file: None,
+            password_file: Some("/etc/jetsam/tor-password".into()),
+        };
+        let both = ControlAuthConfig {
+            cookie_file: cookie.cookie_file.clone(),
+            password_file: password.password_file.clone(),
+        };
+        let tor_cookie = Some("/run/tor/control.authcookie");
+        let safecookie = AuthChoice::SafeCookie("/run/tor/control.authcookie".into());
+
+        // NULL offered beside the configured method: the method.
+        assert_eq!(
+            choose_auth(
+                &info(vec![AuthMethod::Null, AuthMethod::Cookie, AuthMethod::SafeCookie], tor_cookie),
+                &cookie
+            )
+            .unwrap(),
+            safecookie
+        );
+        assert_eq!(
+            choose_auth(&info(vec![AuthMethod::Null, AuthMethod::HashedPassword], None), &password)
+                .unwrap(),
+            AuthChoice::Password("/etc/jetsam/tor-password".into())
+        );
+        // NULL alone while a method is configured: refused (nothing is sent, no key is added).
+        for auth in [&cookie, &password, &both] {
+            assert!(
+                choose_auth(&info(vec![AuthMethod::Null], None), auth).is_err(),
+                "{auth:?}: NULL taken"
+            );
+        }
+        // Both configured and both offered: SAFECOOKIE first.
+        assert_eq!(
+            choose_auth(
+                &info(
+                    vec![AuthMethod::HashedPassword, AuthMethod::Cookie, AuthMethod::SafeCookie],
+                    tor_cookie
+                ),
+                &both
+            )
+            .unwrap(),
+            safecookie
+        );
+        // Nothing configured: NULL when Tor asks for nothing, as before.
+        assert_eq!(
+            choose_auth(&info(vec![AuthMethod::Null], None), &ControlAuthConfig::default()).unwrap(),
+            AuthChoice::Null
+        );
     }
 
     /// Computed with Python's `hmac`/`hashlib` (key = the spec's constant,
