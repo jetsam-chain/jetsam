@@ -1228,6 +1228,42 @@ fn install(
     check.finish(alloc, &mut CommitteeKeyCache::default())
 }
 
+/// A snapshot of a tip at or above the return-over-Base height reads its
+/// committees from the return's anchor (the rules of its tip); below that
+/// height there is no anchor, and a committee marker is a mismatch.
+#[test]
+fn a_snapshot_above_the_return_height_reads_the_returns_anchor() {
+    let mut rules = snapshot_rules();
+    rules.base_return.anchor = rules.anchor.take();
+    let payload = super::tests::anchor_update(&committee(1)).encode_payload();
+    let marker = committee_update_marker(&payload);
+    let file = DestinationSnapshotFile {
+        committee_updates: vec![payload],
+        window_releases: Vec::new(),
+        advances: Vec::new(),
+        fast: Some(FastSnapshot::default()),
+    };
+    let floor = alloc(rules.activation_height.unwrap() - 1).unwrap();
+    let mut check = SnapshotDestinationCheck::new(&file, HEIGHT + 20, floor, rules);
+    check.observe_slot(&marker, 0, (HB + 1) * 10 - 3);
+    let state = check
+        .finish(alloc, &mut CommitteeKeyCache::default())
+        .expect("the return's anchor");
+    assert_eq!(
+        state.committees.last().map(|c| (c.period, c.root)),
+        Some((P0, root_of(&committee(1))))
+    );
+    let below = DestinationSnapshotFile {
+        fast: None,
+        ..file.clone()
+    };
+    let mut check = SnapshotDestinationCheck::new(&below, HB - 2, floor, rules);
+    check.observe_slot(&marker, 0, (HB - 3) * 10 - 3);
+    assert!(check
+        .finish(alloc, &mut CommitteeKeyCache::default())
+        .is_err());
+}
+
 #[test]
 fn a_snapshot_rebuilds_the_advances_from_their_markers() {
     use crate::consensus::destination::advance::advance_marker;
