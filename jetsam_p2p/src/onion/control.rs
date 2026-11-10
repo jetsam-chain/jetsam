@@ -37,7 +37,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::address::OnionServiceId;
-use super::config::ControlAuthConfig;
+use super::config::{ControlAuthConfig, OnionMode};
 use super::key_store::OnionKey;
 use super::OnionError;
 
@@ -150,9 +150,35 @@ pub fn choose_auth(
     info: &ProtocolInfo,
     auth: &ControlAuthConfig,
 ) -> Result<AuthChoice, OnionError> {
+    choose_auth_for(info, auth, OnionMode::Additional)
+}
+
+/// What a guardian whose ControlPort asks for no authentication is told.
+const GUARDIAN_NULL_REFUSED: &str = "guardian mode: the Tor ControlPort asks for no \
+    authentication (NULL) and none is configured: a guardian never authenticates with NULL \
+    (whatever answers on this port may not be this host's Tor), so the onion service is not \
+    published. Turn on Tor's cookie authentication: add `CookieAuthentication 1` (and, to fix \
+    its path, `CookieAuthFile /run/tor/control.authcookie`) to torrc, restart Tor, make the \
+    cookie readable by this node's user (e.g. the debian-tor group), then set \
+    cookie_file = \"/run/tor/control.authcookie\" in [network.onion]; or set \
+    HashedControlPassword in torrc and control_password_file here";
+
+/// [`choose_auth`] for a node in `mode`. C-3 (audit 2026-11-10, D117): a
+/// guardian never authenticates with `NULL`, even with no method configured
+/// (fail closed: the node does not publish, and says how to turn on
+/// `CookieAuthentication 1`); a plain onion node keeps [`choose_auth`]'s
+/// choice.
+pub fn choose_auth_for(
+    info: &ProtocolInfo,
+    auth: &ControlAuthConfig,
+    mode: OnionMode,
+) -> Result<AuthChoice, OnionError> {
     let offers = |method: &AuthMethod| info.methods.contains(method);
     let configured = auth.cookie_file.is_some() || auth.password_file.is_some();
     if offers(&AuthMethod::Null) && !configured {
+        if mode == OnionMode::Guardian {
+            return Err(OnionError::Auth(GUARDIAN_NULL_REFUSED.into()));
+        }
         return Ok(AuthChoice::Null);
     }
     if let Some(cookie) = &auth.cookie_file {
@@ -1062,6 +1088,54 @@ mod tests {
         assert!(choose_auth(&info(vec![AuthMethod::HashedPassword], None), &cookie).is_err());
         assert!(choose_auth(&info(vec![AuthMethod::SafeCookie], tor_cookie), &none).is_err());
         assert!(choose_auth(&info(vec![], None), &both).is_err());
+    }
+
+    /// C-3 remainder (audit 2026-11-10, D117): a node in guardian mode never authenticates
+    /// with NULL, even when no method is configured (fail closed, the error says how to turn
+    /// on `CookieAuthentication 1`); a configured method works for it as for any node; a plain
+    /// onion node keeps NULL when Tor asks for nothing and nothing is configured.
+    #[test]
+    fn a_guardian_never_authenticates_with_null_even_with_no_method_configured() {
+        let none = ControlAuthConfig::default();
+        let cookie = ControlAuthConfig {
+            cookie_file: Some("/run/tor/control.authcookie".into()),
+            password_file: None,
+        };
+        let password = ControlAuthConfig {
+            cookie_file: None,
+            password_file: Some("/etc/jetsam/tor-password".into()),
+        };
+        let tor_cookie = Some("/run/tor/control.authcookie");
+        for offered in [vec![AuthMethod::Null], vec![AuthMethod::Null, AuthMethod::HashedPassword]] {
+            match choose_auth_for(&info(offered.clone(), None), &none, OnionMode::Guardian) {
+                Err(OnionError::Auth(message)) => {
+                    assert!(message.contains("CookieAuthentication 1"), "{message}");
+                    assert!(message.contains("cookie_file"), "{message}");
+                }
+                other => panic!("a guardian on NULL ({offered:?}): {other:?}"),
+            }
+            // A plain onion node: as before.
+            assert_eq!(
+                choose_auth_for(&info(offered.clone(), None), &none, OnionMode::Additional).unwrap(),
+                AuthChoice::Null
+            );
+            assert_eq!(choose_auth(&info(offered, None), &none).unwrap(), AuthChoice::Null);
+        }
+        // With a method configured, a guardian authenticates by it.
+        assert_eq!(
+            choose_auth_for(
+                &info(vec![AuthMethod::Null, AuthMethod::Cookie, AuthMethod::SafeCookie], tor_cookie),
+                &cookie,
+                OnionMode::Guardian
+            )
+            .unwrap(),
+            AuthChoice::SafeCookie("/run/tor/control.authcookie".into())
+        );
+        assert_eq!(
+            choose_auth_for(&info(vec![AuthMethod::HashedPassword], None), &password, OnionMode::Guardian)
+                .unwrap(),
+            AuthChoice::Password("/etc/jetsam/tor-password".into())
+        );
     }
 
     /// C-3 (audit 2026-11-10): whatever answers on the ControlPort (a local account that took

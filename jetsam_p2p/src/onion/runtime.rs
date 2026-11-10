@@ -277,11 +277,23 @@ mod tests {
     use libp2p::swarm::dummy;
 
     fn settings(mode: OnionMode, control: SocketAddr, local_port: u16) -> OnionSettings {
+        settings_with(mode, control, local_port, None)
+    }
+
+    /// C-3: a guardian authenticates with the cookie its bench's Tor names
+    /// (`test_support::guardian_tor`).
+    fn settings_with(
+        mode: OnionMode,
+        control: SocketAddr,
+        local_port: u16,
+        cookie_file: Option<PathBuf>,
+    ) -> OnionSettings {
         OnionConfig {
             enabled: true,
             mode,
             control: control.to_string(),
             local_port,
+            cookie_file,
             ..OnionConfig::default()
         }
         .validate()
@@ -345,8 +357,10 @@ mod tests {
     #[tokio::test]
     async fn onion_runtime_announces_the_service_and_republishes_it_when_tor_restarts() {
         let directory = tempfile::tempdir().unwrap();
-        let tor = FakeTor::start(FakeTorConfig::null()).await;
-        let settings = settings(OnionMode::Guardian, tor.addr, 0);
+        let cookie_dir = tempfile::tempdir().unwrap();
+        let (tor_config, cookie) = crate::onion::test_support::guardian_tor(cookie_dir.path());
+        let tor = FakeTor::start(tor_config).await;
+        let settings = settings_with(OnionMode::Guardian, tor.addr, 0, Some(cookie));
         let mut swarm = swarm(&settings);
         let mut runtime =
             OnionRuntime::listen(&mut swarm, Some(settings), directory.path().to_path_buf())
@@ -404,12 +418,14 @@ mod tests {
     #[tokio::test]
     async fn onion_runtime_never_announces_a_service_tor_refused_and_keeps_trying() {
         let directory = tempfile::tempdir().unwrap();
+        let cookie_dir = tempfile::tempdir().unwrap();
+        let (tor_config, cookie) = crate::onion::test_support::guardian_tor(cookie_dir.path());
         let tor = FakeTor::start(FakeTorConfig {
             add_onion_error: Some("551 Failed to add onion service".into()),
-            ..FakeTorConfig::null()
+            ..tor_config
         })
         .await;
-        let settings = settings(OnionMode::Guardian, tor.addr, 0);
+        let settings = settings_with(OnionMode::Guardian, tor.addr, 0, Some(cookie));
         let mut swarm = swarm(&settings);
         let mut runtime =
             OnionRuntime::listen(&mut swarm, Some(settings), directory.path().to_path_buf())

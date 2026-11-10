@@ -188,6 +188,17 @@ impl FakeTorConfig {
     }
 }
 
+/// C-3: a guardian never authenticates with NULL, so a guardian's bench runs
+/// a ControlPort that asks for its cookie (`CookieAuthentication 1`): the
+/// fake Tor's configuration, and the cookie file it names (written in `dir`),
+/// for the guardian's `cookie_file`.
+pub(crate) fn guardian_tor(dir: &Path) -> (FakeTorConfig, PathBuf) {
+    let path = dir.join("control.authcookie");
+    let cookie: [u8; 32] = std::array::from_fn(|index| index as u8 ^ 0x3c);
+    std::fs::write(&path, cookie).expect("the bench's cookie file");
+    (FakeTorConfig::cookie(&path, cookie), path)
+}
+
 /// A ControlPort with Tor's observable behaviour for the commands we use:
 /// commands must end with CRLF, everything but PROTOCOLINFO/AUTHCHALLENGE/
 /// AUTHENTICATE is refused with 514 before authentication, a failed

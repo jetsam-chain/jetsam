@@ -16,7 +16,7 @@ use libp2p::Multiaddr;
 
 use super::address::OnionServiceId;
 use super::config::OnionSettings;
-use super::control::{choose_auth, KeyRequest, TorControl};
+use super::control::{choose_auth_for, KeyRequest, TorControl};
 use super::key_store;
 use super::OnionError;
 
@@ -66,7 +66,7 @@ pub async fn publish(
 
     let mut control = TorControl::connect(settings.control).await?;
     let info = control.protocol_info().await?;
-    let choice = choose_auth(&info, &settings.auth)?;
+    let choice = choose_auth_for(&info, &settings.auth, settings.mode)?;
     control.authenticate(&choice).await?;
 
     let request = match &stored {
@@ -260,6 +260,31 @@ mod tests {
         }
         assert!(add_onion_lines(&tor).is_empty());
         assert_eq!(tor.connections(), 0);
+    }
+
+    /// C-3 remainder: a guardian whose ControlPort asks for no authentication,
+    /// with no method configured, never publishes (no ADD_ONION is sent) and
+    /// says how to turn on cookie authentication; a plain onion node does.
+    #[tokio::test]
+    async fn a_guardian_never_publishes_through_a_control_port_asking_for_no_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let tor = FakeTor::start(FakeTorConfig::null()).await;
+        let guardian = OnionSettings {
+            mode: crate::onion::config::OnionMode::Guardian,
+            ..settings(tor.addr)
+        };
+        match publish(&guardian, directory.path(), target()).await {
+            Err(OnionError::Auth(message)) => {
+                assert!(message.contains("CookieAuthentication 1"), "{message}")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a guardian published through NULL"),
+        }
+        assert!(add_onion_lines(&tor).is_empty());
+        assert!(!tor.received().contains(&"AUTHENTICATE\r\n".to_string()));
+        publish(&settings(tor.addr), directory.path(), target())
+            .await
+            .expect("a plain onion node, as before");
     }
 
     #[tokio::test]

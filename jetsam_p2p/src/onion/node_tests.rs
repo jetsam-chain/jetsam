@@ -49,11 +49,23 @@ fn free_port() -> u16 {
 }
 
 fn onion_settings(mode: OnionMode, tor: &FakeTor, socks: std::net::SocketAddr) -> OnionSettings {
+    onion_settings_with(mode, tor, socks, None)
+}
+
+/// C-3: a guardian authenticates with the cookie its bench's Tor names
+/// (`test_support::guardian_tor`).
+fn onion_settings_with(
+    mode: OnionMode,
+    tor: &FakeTor,
+    socks: std::net::SocketAddr,
+    cookie_file: Option<std::path::PathBuf>,
+) -> OnionSettings {
     OnionConfig {
         enabled: true,
         mode,
         control: tor.addr.to_string(),
         socks: socks.to_string(),
+        cookie_file,
         ..OnionConfig::default()
     }
     .validate()
@@ -258,7 +270,8 @@ async fn guardian_node_announces_only_its_onion_address_and_dials_only_through_t
         format!("127.0.0.1:{observer_port}").parse().unwrap(),
     ))
     .await;
-    let tor = FakeTor::start(FakeTorConfig::null()).await;
+    let (tor_config, cookie) = crate::onion::test_support::guardian_tor(directory.path());
+    let tor = FakeTor::start(tor_config).await;
     let chain = chain(directory.path());
     let guardian = start(
         directory.path(),
@@ -267,7 +280,12 @@ async fn guardian_node_announces_only_its_onion_address_and_dials_only_through_t
         Vec::new(),
         false,
         false,
-        Some(onion_settings(OnionMode::Guardian, &tor, proxy.addr)),
+        Some(onion_settings_with(
+            OnionMode::Guardian,
+            &tor,
+            proxy.addr,
+            Some(cookie),
+        )),
     )
     .expect("an onion-only configuration starts");
     published(&tor).await;
@@ -565,8 +583,9 @@ async fn guardian_node_keeps_onion_addresses_from_identify_and_serves_them_to_ka
         format!("127.0.0.1:{a_port}").parse().unwrap(),
     ))
     .await;
-    let tor = FakeTor::start(FakeTorConfig::null()).await;
     let directory = tempfile::tempdir().unwrap();
+    let (tor_config, cookie) = crate::onion::test_support::guardian_tor(directory.path());
+    let tor = FakeTor::start(tor_config).await;
     let chain = chain(directory.path());
     let guardian = start(
         directory.path(),
@@ -575,7 +594,12 @@ async fn guardian_node_keeps_onion_addresses_from_identify_and_serves_them_to_ka
         Vec::new(),
         false,
         false,
-        Some(onion_settings(OnionMode::Guardian, &tor, proxy.addr)),
+        Some(onion_settings_with(
+            OnionMode::Guardian,
+            &tor,
+            proxy.addr,
+            Some(cookie),
+        )),
     )
     .unwrap();
     published(&tor).await;
