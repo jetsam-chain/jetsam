@@ -234,6 +234,7 @@ impl SyntheticBase {
             network: jetsam_chain::consensus::destination::forks::L1_MAINNET,
             base: jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA,
             advance: jetsam_chain::consensus::destination::advance::AdvanceRules::CONSENSUS,
+            fast: jetsam_chain::consensus::destination::fast::FastLaneRules::CONSENSUS,
         };
         rules
     }

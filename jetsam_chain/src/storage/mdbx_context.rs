@@ -1562,7 +1562,12 @@ impl MdbxChainContext {
         if let Some(effect) = destination_effect {
             let applied = next_destination
                 .as_mut()
-                .map(|state| state.apply(effect, destination_rules.vault.window_blocks));
+                .map(|state| {
+                    state.apply(
+                        effect,
+                        destination_rules.release_retention_at(block.header.height),
+                    )
+                });
             if !matches!(applied, Some(Ok(()))) {
                 return Err(self.reject_uncommitted_block(
                     undo,

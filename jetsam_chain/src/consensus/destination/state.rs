@@ -49,12 +49,21 @@ use super::advance::{
     AdvanceKey, AdvanceRules,
 };
 use super::base_read::{
-    decode_game_proof, decode_output_root_preimage, verify_base_state_root, BaseParams,
-    BaseReturnError,
+    decode_game_proof, decode_output_root_preimage, judge_game_fast, open_output_root,
+    read_game_facts, verify_base_state_root, BaseParams, BaseReturnError, BaseState,
+};
+use super::fast::{
+    fast_marker_kind, fast_release_marker, revocation_marker, verify_attestation,
+    verify_revocation, ContradictionEntry, FastAttestation, FastContradiction, FastEffect,
+    FastLaneRules, FastLaneState, FastMarkerKind, FastRecord, FastRevocation, FastSignatureError,
+    FastUndo, KEY_BYTES,
 };
 use super::bls::{committee_keys, CommitteeKeys};
 use super::forks::{period_of_slot, L1Network};
-use super::l1_read::{verify_bridge_account, verify_withdrawal, L1BridgeParams, L1ReadError};
+use super::l1_read::{
+    read_account, read_storage_word, verify_bridge_account, verify_withdrawal,
+    withdrawal_commitment, withdrawal_slot, L1BridgeParams, L1ReadError,
+};
 use super::light_client::{
     verify_committee_update, verify_finality_update, FinalizedExecution, KnownCommittee,
     LightClientError,
@@ -67,7 +76,7 @@ use crate::consensus::params::{
     V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT,
 };
 use crate::consensus::vault::{
-    decode_bridge_account_proof, destination_marker_kind, validate_block_vault_paying,
+    decode_bridge_account_proof, destination_marker_kind, validate_block_vault_with,
     DestinationMarkerKind, ReleasedSet, VaultContext, VaultEffect, VaultError, VaultRelease,
     VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG,
 };
@@ -76,6 +85,8 @@ use crate::consensus::vault::{
 mod tests;
 #[cfg(test)]
 mod base_return_tests;
+#[cfg(test)]
+mod fast_tests;
 
 /// Blocks whose undo a destination state keeps: twice the deepest reorg.
 pub const DESTINATION_UNDO_BLOCKS: u64 = 2 * CONSENSUS_FINALITY_DEPTH;
@@ -200,6 +211,8 @@ pub struct BaseReturnRules {
     pub network: L1Network,
     pub base: BaseParams,
     pub advance: AdvanceRules,
+    /// The fast lane (D127, D130): its keys and horizon.
+    pub fast: FastLaneRules,
 }
 
 impl BaseReturnRules {
@@ -208,6 +221,7 @@ impl BaseReturnRules {
         network: BASE_RETURN_L1_NETWORK,
         base: BASE_RETURN_PARAMS,
         advance: AdvanceRules::CONSENSUS,
+        fast: FastLaneRules::CONSENSUS,
     };
 
     pub const fn active_at(&self, height: u64) -> bool {
@@ -265,6 +279,22 @@ impl DestinationRules {
 
     pub const fn active_at(&self, height: u64) -> bool {
         v1_7_active_with(height, self.activation_height)
+    }
+
+    /// The blocks of releases a state keeps after its block at `height`
+    /// (before the undo's margin): the window (V6), or, from the
+    /// return-over-Base height on, the fast lane's horizon when longer (a
+    /// snapshot opens every release of the horizon, RETOUR-RAPIDE SPEC §7).
+    pub const fn release_retention_at(&self, height: u64) -> u64 {
+        // One block more than the horizon: a snapshot of a boundary as deep
+        // as the undo below the tip still opens every release a record of
+        // its state was paid by (`snapshot_fast_start`).
+        let horizon = self.base_return.fast.reconcile_blocks.saturating_add(1);
+        if self.base_return.active_at(height) && horizon > self.vault.window_blocks {
+            horizon
+        } else {
+            self.vault.window_blocks
+        }
     }
 }
 
@@ -342,6 +372,8 @@ pub struct DestinationUndo {
     pub committees_before: Option<Vec<CommitteeRef>>,
     /// What it did to the advances (empty below the return over Base).
     pub advances: AdvanceUndo,
+    /// What it did to the fast lane (empty below the return over Base).
+    pub fast: FastUndo,
 }
 
 /// The destination state of a branch after its block `tip` (module docs).
@@ -362,6 +394,8 @@ pub struct DestinationState {
     pub window: Vec<WindowRelease>,
     /// The advances not yet consumed (the return over Base; empty below it).
     pub advances: AdvanceBook,
+    /// The fast lane (the return over Base; empty below it).
+    pub fast: FastLaneState,
     /// One per block, the last [`DESTINATION_UNDO_BLOCKS`] at most,
     /// increasing heights ending at `tip` (none for a state installed from
     /// a snapshot: no reorg goes below its boundary).
@@ -392,6 +426,7 @@ impl DestinationState {
             bridge_locked: 0,
             window: Vec::new(),
             advances: AdvanceBook::new(),
+            fast: FastLaneState::default(),
             undo: Vec::new(),
         }
     }
@@ -446,8 +481,18 @@ impl DestinationState {
                 height: effect.height,
             });
         }
-        let paid: Vec<u64> = effect.vault.releases.iter().map(|(n, _, _)| *n).collect();
+        // The indices the block marks paid: every release's but the one more
+        // release of a contradicted fast release's `n`, paid already (its
+        // undo must not unmark it).
+        let paid: Vec<u64> = effect
+            .vault
+            .releases
+            .iter()
+            .map(|(n, _, _)| *n)
+            .filter(|n| !self.released.contains(*n))
+            .collect();
         let advances = self.apply_advances(&effect.advances);
+        let fast = self.fast.apply(&effect.fast);
         self.undo.push(DestinationUndo {
             height: effect.height,
             paid: paid.clone(),
@@ -457,6 +502,7 @@ impl DestinationState {
                 .as_ref()
                 .map(|_| self.committees.clone()),
             advances,
+            fast,
         });
         if self.undo.len() as u64 > DESTINATION_UNDO_BLOCKS {
             self.undo.remove(0);
@@ -549,6 +595,7 @@ impl DestinationState {
                 self.committees = committees;
             }
             self.undo_advances(&undo.advances);
+            self.fast.undo(&undo.fast);
             self.window.retain(|r| r.height < undo.height);
             self.tip -= 1;
         }
@@ -582,21 +629,75 @@ impl DestinationState {
                 .map(|r| (r.n, r.owner, r.amount))
                 .collect(),
             advances: self.advances.iter().map(|(n, entry)| (n, *entry)).collect(),
+            fast: None,
         })
     }
 
+    /// [`Self::snapshot_file`] under `rules`: from the return-over-Base
+    /// height on, the file of the fast lane (`JTMDST03`): every release of the
+    /// horizon ([`snapshot_fast_start`]), each fast or slow, the window drawn
+    /// from them; the contradictions and revocations.
+    pub fn snapshot_file_at(
+        &self,
+        keys: &CommitteeKeyCache,
+        rules: &DestinationRules,
+    ) -> Option<DestinationSnapshotFile> {
+        let mut file = self.snapshot_file(keys, rules.vault.window_blocks)?;
+        if !rules.base_return.active_at(self.tip) {
+            return Some(file);
+        }
+        let first = snapshot_fast_start(self.start, self.tip, rules);
+        file.window_releases = Vec::new();
+        file.fast = Some(FastSnapshot {
+            releases: self
+                .window
+                .iter()
+                .filter(|r| r.height >= first)
+                .map(|r| SnapshotRelease {
+                    n: r.n,
+                    owner: r.owner,
+                    amount: r.amount,
+                    fast_l2_block: self
+                        .fast
+                        .records
+                        .get(&r.n)
+                        .filter(|record| {
+                            record.height == r.height
+                                && record.owner == r.owner
+                                && record.amount == r.amount
+                        })
+                        .map(|record| record.l2_block),
+                })
+                .collect(),
+            contradictions: self.fast.contradictions.clone(),
+            revocations: self.fast.revocations.clone(),
+        });
+        Some(file)
+    }
+
     /// Whether the state holds anything of the advances (the return over
-    /// Base): only then is it encoded as version 2.
+    /// Base): only then is it encoded as version 2 (or 3).
     fn carries_advances(&self) -> bool {
         !self.advances.is_empty() || self.undo.iter().any(|undo| !undo.advances.is_empty())
     }
 
+    /// Whether the state holds anything of the fast lane: only then is it
+    /// encoded as version 3.
+    fn carries_fast(&self) -> bool {
+        !self.fast.is_empty() || self.undo.iter().any(|undo| !undo.fast.is_empty())
+    }
+
     /// Canonical bytes (little-endian, counted lists): version 1, exactly as
     /// before the return over Base, while the state holds nothing of the
-    /// advances; version 2, the same then the advances, otherwise.
+    /// advances nor of the fast lane; version 2, the same then the advances,
+    /// when it holds advances only; version 3, version 2's bytes (the
+    /// advances, maybe none) then the fast lane, when it holds the fast lane.
     pub fn encode(&self) -> Vec<u8> {
-        let advanced = self.carries_advances();
-        let mut out = vec![if advanced {
+        let fast = self.carries_fast();
+        let advanced = fast || self.carries_advances();
+        let mut out = vec![if fast {
+            DESTINATION_STATE_VERSION_FAST
+        } else if advanced {
             DESTINATION_STATE_VERSION_ADVANCES
         } else {
             DESTINATION_STATE_VERSION
@@ -638,7 +739,39 @@ impl DestinationState {
         if advanced {
             self.encode_advances(&mut out);
         }
+        if fast {
+            self.encode_fast(&mut out);
+        }
         out
+    }
+
+    /// Version 3's tail: the fast records by increasing `n`, the
+    /// contradictions and revocations in chain order, then each undo's: the
+    /// records it created, those it forgot, the contradictions it appended,
+    /// the records it consumed, whether it revoked.
+    fn encode_fast(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.fast.records.len() as u32).to_le_bytes());
+        for (n, record) in &self.fast.records {
+            put_fast_record(*n, record, out);
+        }
+        out.extend_from_slice(&(self.fast.contradictions.len() as u32).to_le_bytes());
+        for entry in &self.fast.contradictions {
+            put_contradiction(entry, out);
+        }
+        out.extend_from_slice(&(self.fast.revocations.len() as u32).to_le_bytes());
+        for key in &self.fast.revocations {
+            out.extend_from_slice(key);
+        }
+        for undo in &self.undo {
+            put_u64s(&undo.fast.created, out);
+            out.extend_from_slice(&(undo.fast.expired.len() as u32).to_le_bytes());
+            for (n, record) in &undo.fast.expired {
+                put_fast_record(*n, record, out);
+            }
+            out.extend_from_slice(&undo.fast.contradicted.to_le_bytes());
+            put_u64s(&undo.fast.consumed, out);
+            out.push(u8::from(undo.fast.revoked));
+        }
     }
 
     /// Version 2's tail: the advances by increasing key `(n, owner, amount)`,
@@ -671,7 +804,10 @@ impl DestinationState {
     pub fn decode(bytes: &[u8]) -> Result<Self, DestinationStateError> {
         let mut r = Reader(bytes);
         let version = r.u8()?;
-        if version != DESTINATION_STATE_VERSION && version != DESTINATION_STATE_VERSION_ADVANCES {
+        if version != DESTINATION_STATE_VERSION
+            && version != DESTINATION_STATE_VERSION_ADVANCES
+            && version != DESTINATION_STATE_VERSION_FAST
+        {
             return Err(DestinationStateError::Malformed);
         }
         let start = r.u64()?;
@@ -723,13 +859,25 @@ impl DestinationState {
                 bridge_locked_before,
                 committees_before,
                 advances: AdvanceUndo::default(),
+                fast: FastUndo::default(),
             });
         }
         let mut advances = AdvanceBook::new();
-        if version == DESTINATION_STATE_VERSION_ADVANCES {
+        if version == DESTINATION_STATE_VERSION_ADVANCES || version == DESTINATION_STATE_VERSION_FAST {
             r.advances(&mut advances, &mut undo)?;
             // Canonical: version 2 only for a state holding advances.
-            if advances.is_empty() && undo.iter().all(|u| u.advances.is_empty()) {
+            if version == DESTINATION_STATE_VERSION_ADVANCES
+                && advances.is_empty()
+                && undo.iter().all(|u| u.advances.is_empty())
+            {
+                return Err(DestinationStateError::Malformed);
+            }
+        }
+        let mut fast = FastLaneState::default();
+        if version == DESTINATION_STATE_VERSION_FAST {
+            r.fast(&mut fast, &mut undo)?;
+            // Canonical: version 3 only for a state holding the fast lane.
+            if fast.is_empty() && undo.iter().all(|u| u.fast.is_empty()) {
                 return Err(DestinationStateError::Malformed);
             }
         }
@@ -748,6 +896,7 @@ impl DestinationState {
             bridge_locked,
             window,
             advances,
+            fast,
             undo,
         })
     }
@@ -757,6 +906,39 @@ impl DestinationState {
 pub const DESTINATION_STATE_VERSION: u8 = 1;
 /// Version byte of a state that holds advances (the return over Base).
 pub const DESTINATION_STATE_VERSION_ADVANCES: u8 = 2;
+/// Version byte of a state that holds the fast lane (the return over Base).
+pub const DESTINATION_STATE_VERSION_FAST: u8 = 3;
+
+/// Bytes of one encoded fast record: `n`, owner, amount, L2 block, height,
+/// flags.
+const FAST_RECORD_BYTES: usize = 8 + 32 + 8 + 8 + 8 + 1;
+/// Bytes of one encoded contradiction, at least: `n`, owner, amount, L2
+/// block, height, key flag (and the key when set).
+const CONTRADICTION_MIN_BYTES: usize = 8 + 32 + 8 + 8 + 8 + 1;
+
+fn put_fast_record(n: u64, record: &FastRecord, out: &mut Vec<u8>) {
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&record.owner.0);
+    out.extend_from_slice(&record.amount.to_le_bytes());
+    out.extend_from_slice(&record.l2_block.to_le_bytes());
+    out.extend_from_slice(&record.height.to_le_bytes());
+    out.push(u8::from(record.contradicted) | (u8::from(record.consumed) << 1));
+}
+
+fn put_contradiction(entry: &ContradictionEntry, out: &mut Vec<u8>) {
+    out.extend_from_slice(&entry.n.to_le_bytes());
+    out.extend_from_slice(&entry.owner.0);
+    out.extend_from_slice(&entry.amount.to_le_bytes());
+    out.extend_from_slice(&entry.l2_block.to_le_bytes());
+    out.extend_from_slice(&entry.height.to_le_bytes());
+    match &entry.key {
+        None => out.push(0),
+        Some(key) => {
+            out.push(1);
+            out.extend_from_slice(key);
+        }
+    }
+}
 
 fn put_u64s(values: &[u64], out: &mut Vec<u8>) {
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
@@ -887,6 +1069,111 @@ impl Reader<'_> {
         Ok(())
     }
 
+    /// One fast record: `n`, owner, amount (non-zero), L2 block, height,
+    /// flags (consumed only once contradicted).
+    fn fast_record(&mut self) -> Result<(u64, FastRecord), DestinationStateError> {
+        let n = self.u64()?;
+        let owner = self.address()?;
+        let amount = self.u64()?;
+        let l2_block = self.u64()?;
+        let height = self.u64()?;
+        let flags = self.u8()?;
+        if amount == 0 || flags > 3 || flags == 2 {
+            return Err(DestinationStateError::Malformed);
+        }
+        Ok((
+            n,
+            FastRecord {
+                owner,
+                amount,
+                l2_block,
+                height,
+                contradicted: flags & 1 != 0,
+                consumed: flags & 2 != 0,
+            },
+        ))
+    }
+
+    /// One contradiction ([`put_contradiction`]).
+    fn contradiction(&mut self) -> Result<ContradictionEntry, DestinationStateError> {
+        let n = self.u64()?;
+        let owner = self.address()?;
+        let amount = self.u64()?;
+        let l2_block = self.u64()?;
+        let height = self.u64()?;
+        let key = match self.u8()? {
+            0 => None,
+            1 => Some(self.take(KEY_BYTES)?.try_into().expect("48")),
+            _ => return Err(DestinationStateError::Malformed),
+        };
+        if amount == 0 {
+            return Err(DestinationStateError::Malformed);
+        }
+        Ok(ContradictionEntry {
+            n,
+            owner,
+            amount,
+            l2_block,
+            height,
+            key,
+        })
+    }
+
+    /// Version 3's tail ([`DestinationState::encode_fast`]) into `lane` and
+    /// the undo entries already read.
+    fn fast(
+        &mut self,
+        lane: &mut FastLaneState,
+        undo: &mut [DestinationUndo],
+    ) -> Result<(), DestinationStateError> {
+        let records = self.u32()? as usize;
+        if records > self.0.len() / FAST_RECORD_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        for _ in 0..records {
+            let (n, record) = self.fast_record()?;
+            if lane.records.last_key_value().is_some_and(|(last, _)| *last >= n) {
+                return Err(DestinationStateError::Malformed);
+            }
+            lane.records.insert(n, record);
+        }
+        let contradictions = self.u32()? as usize;
+        if contradictions > self.0.len() / CONTRADICTION_MIN_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        for _ in 0..contradictions {
+            let entry = self.contradiction()?;
+            lane.contradictions.push(entry);
+        }
+        let revocations = self.u32()? as usize;
+        if revocations > self.0.len() / KEY_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        for _ in 0..revocations {
+            lane.revocations
+                .push(self.take(KEY_BYTES)?.try_into().expect("48"));
+        }
+        for entry in undo.iter_mut() {
+            entry.fast.created = self.u64s(false)?;
+            let expired = self.u32()? as usize;
+            if expired > self.0.len() / FAST_RECORD_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            for _ in 0..expired {
+                let record = self.fast_record()?;
+                entry.fast.expired.push(record);
+            }
+            entry.fast.contradicted = self.u32()?;
+            entry.fast.consumed = self.u64s(false)?;
+            entry.fast.revoked = match self.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DestinationStateError::Malformed),
+            };
+        }
+        Ok(())
+    }
+
     /// Version 2's tail ([`DestinationState::encode_advances`]) into `book`
     /// and the undo entries already read.
     fn advances(
@@ -985,6 +1272,8 @@ pub struct DestinationEffect {
     pub committee_update: Option<Vec<u8>>,
     /// What it does to the advances (the return over Base; empty below it).
     pub advances: AdvanceEffect,
+    /// What it does to the fast lane (the return over Base; empty below it).
+    pub fast: FastEffect,
 }
 
 /// Why a block breaks a destination rule.
@@ -1034,6 +1323,44 @@ pub enum DestinationBlockError {
     BaseReturn(BaseReturnError),
     /// An advance or a transfer of its claim (the return over Base).
     Advance(AdvanceError),
+    /// The fast lane: an attestation or a contradiction in a block that
+    /// carries a committee update (D107's budget).
+    FastObjectWithCommitteeUpdate,
+    /// The fast lane: an attestation and a contradiction in one block (one
+    /// game proof, one mode).
+    FastWithContradiction,
+    /// The fast lane: this build has no relay key.
+    FastKeyUnset,
+    /// The fast lane: this build has no revocation key.
+    FastRevokeKeyUnset,
+    /// The fast lane: the relay's key was closed on the branch (revoked, or
+    /// fused by a contradiction), or by this block's revocation.
+    FastKeyClosed,
+    /// The fast lane: a statement of another network, chain, bridge or key.
+    FastStatementMismatch,
+    /// The fast lane: the signature does not verify under the key.
+    FastBadSignature,
+    /// The fast lane: the attested game, L2 block or root claim is not what
+    /// the game proof reads.
+    FastStatementNotTheGame,
+    /// The fast lane: the contradiction or revocation objects are not
+    /// exactly the openings of the block's markers, in order.
+    FastObjectsDoNotMatchMarkers,
+    /// The fast lane: a system record carries one of its markers.
+    FastMarkerInSystemRecord,
+    /// The fast lane: one of its markers carries value.
+    FastMarkerCarriesValue,
+    /// A contradiction of an `n` the branch holds no fast release of.
+    NoFastRecord { n: u64 },
+    /// A contradiction of a fast release contradicted already.
+    AlreadyContradicted { n: u64 },
+    /// A contradiction read under a game before the fast release's.
+    ContradictionTooEarly { n: u64 },
+    /// `withdrawals[n]` holds what the fast lane paid: no contradiction.
+    NotAContradiction { n: u64 },
+    /// The one more release of a contradicted `n` pays the burn the fast
+    /// lane paid already.
+    RepeatsTheFastRecord { n: u64 },
 }
 
 impl DestinationBlockError {
@@ -1105,6 +1432,9 @@ pub fn validate_block_destination(
     let account_proof = single(DestinationObjectKind::BridgeAccountProof)?;
     let game_proof = single(DestinationObjectKind::BaseGameProof)?;
     let output_preimage = single(DestinationObjectKind::OutputRootPreimage)?;
+    let attestation = single(DestinationObjectKind::FastGameAttestation)?;
+    let revocation = single(DestinationObjectKind::FastKeyRevocation)?;
+    let contradictions: Vec<&[u8]> = of_kind(DestinationObjectKind::FastContradiction).collect();
     let releases = of_kind(DestinationObjectKind::VaultRelease).count();
 
     // The committee update opens the block's one `JTMLCU01` marker.
@@ -1123,18 +1453,43 @@ pub fn validate_block_destination(
         _ => return Err(DestinationBlockError::ObjectsDoNotMatchMarkers),
     }
     let base_objects = game_proof.is_some() || output_preimage.is_some();
-    if base_objects && !over_base {
+    let fast_objects = attestation.is_some() || revocation.is_some() || !contradictions.is_empty();
+    if (base_objects || fast_objects) && !over_base {
         return Err(DestinationBlockError::BaseObjectBeforeActivation);
     }
+    // The fast lane's markers (from the return over Base on): never in a
+    // system record, never with value; a contradiction's and a revocation's
+    // groups carry one each, opened by the block's objects, in order.
+    let (fast_markers, revocation_markers) = if over_base {
+        fast_lane_markers(block, stream.user_start_index)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if fast_markers.len() != contradictions.len()
+        || revocation_markers.len() != usize::from(revocation.is_some())
+    {
+        return Err(DestinationBlockError::FastObjectsDoNotMatchMarkers);
+    }
     // D107: the game proof and a committee update never share a block (the
-    // 48 KiB budget holds; a release waits one block per ≈ 27 h).
+    // 48 KiB budget holds; a release waits one block per ≈ 27 h); nor do the
+    // fast lane's objects that ride with a game proof.
+    if (attestation.is_some() || !contradictions.is_empty()) && committee_update.is_some() {
+        return Err(DestinationBlockError::FastObjectWithCommitteeUpdate);
+    }
     if game_proof.is_some() && committee_update.is_some() {
         return Err(DestinationBlockError::GameProofWithCommitteeUpdate);
     }
-    if releases == 0 && (finality_update.is_some() || account_proof.is_some() || base_objects) {
+    if attestation.is_some() && !contradictions.is_empty() {
+        return Err(DestinationBlockError::FastWithContradiction);
+    }
+    let proving = releases > 0 || !contradictions.is_empty();
+    if !proving && (finality_update.is_some() || account_proof.is_some() || base_objects) {
         return Err(DestinationBlockError::UnusedFinality);
     }
-    if releases > 0 {
+    if attestation.is_some() && releases == 0 {
+        return Err(DestinationBlockError::UnusedFinality);
+    }
+    if proving {
         if rules.bridge.is_none() {
             return Err(DestinationBlockError::BridgeUnset);
         }
@@ -1145,10 +1500,52 @@ pub fn validate_block_destination(
             return Err(DestinationBlockError::BaseProofMissing);
         }
     }
+    let malformed = |kind| DestinationBlockError::MalformedObject { kind };
+    let attestation = attestation
+        .map(FastAttestation::decode_payload)
+        .transpose()
+        .map_err(|_| malformed(DestinationObjectKind::FastGameAttestation))?;
+    let contradictions = contradictions
+        .into_iter()
+        .map(FastContradiction::decode_payload)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| malformed(DestinationObjectKind::FastContradiction))?;
+    let fast_rules = &rules.base_return.fast;
+
+    // The cold key's revocation first: it closes the relay's key for this
+    // very block.
+    let mut revoked = None;
+    if let Some(payload) = revocation {
+        let revocation = FastRevocation::decode_payload(payload)
+            .map_err(|_| malformed(DestinationObjectKind::FastKeyRevocation))?;
+        let key = check_revocation(&revocation, fast_rules, &parent.fast)?;
+        if revocation_marker(&key) != revocation_markers[0] {
+            return Err(DestinationBlockError::FastObjectsDoNotMatchMarkers);
+        }
+        revoked = Some(key);
+    }
+
+    // The `n` a slow release may pay once more: a fast release contradicted
+    // on the branch or by this block, not yet paid to its real burner.
+    let mut reopened: BTreeMap<u64, FastRecord> = BTreeMap::new();
+    if attestation.is_none() {
+        for (n, record) in parent.fast.reopened() {
+            reopened.insert(n, *record);
+        }
+        for contradiction in &contradictions {
+            if let Some(record) = parent.fast.records.get(&contradiction.n) {
+                reopened.insert(contradiction.n, *record);
+            }
+        }
+    }
+    let mut released = parent.released.clone();
+    for n in reopened.keys() {
+        released.remove(*n);
+    }
 
     // The vault gate, its proofs deferred: every rule but V7. From the return
     // over Base on, a release of an advanced burn pays the advance's creditor
-    // (V2 there).
+    // (V2 there); a fast release's group carries the fast lane's marker.
     let mut to_prove: Vec<VaultRelease> = Vec::new();
     let payee = |release: &VaultRelease| {
         if over_base {
@@ -1157,17 +1554,37 @@ pub fn validate_block_destination(
             release.owner
         }
     };
-    let vault = validate_block_vault_paying(
+    let attested_l2 = attestation.map(|a| a.statement.l2_block);
+    let marker = |release: &VaultRelease| match attested_l2 {
+        Some(l2_block) => fast_release_marker(release.n, &release.owner, release.amount, l2_block),
+        None => release.marker(),
+    };
+    let vault = validate_block_vault_with(
         block,
-        &parent.vault_context(height, &rules.vault),
+        &VaultContext {
+            released: &released,
+            ..parent.vault_context(height, &rules.vault)
+        },
         &rules.vault,
         &payee,
+        &marker,
         &mut |release| {
             to_prove.push(release.clone());
             Ok(())
         },
     )
     .map_err(DestinationBlockError::Vault)?;
+    // The one more release of a contradicted `n` pays another burn than the
+    // one the fast lane paid.
+    let mut consumed = Vec::new();
+    for (n, owner, amount) in &vault.releases {
+        if let Some(record) = reopened.get(n) {
+            if record.owner == *owner && record.amount == *amount {
+                return Err(DestinationBlockError::RepeatsTheFastRecord { n: *n });
+            }
+            consumed.push(*n);
+        }
+    }
 
     // The advances and their claims' transfers, then what the releases
     // consume (the return over Base).
@@ -1203,21 +1620,66 @@ pub fn validate_block_destination(
         committees_after = Some(committees.clone());
     }
 
-    if releases > 0 {
+    let mut fast = FastEffect {
+        revoked,
+        ..FastEffect::default()
+    };
+    if proving {
         if over_base {
-            verify_releases_on_base(
-                &BaseReleaseObjects {
-                    finality: finality_update.expect("checked above"),
-                    game_proof: game_proof.expect("checked above"),
-                    output_preimage: output_preimage.expect("checked above"),
-                    account_proof: account_proof.expect("checked above"),
-                },
-                &to_prove,
-                &committees,
-                rules,
-                &learned,
-                keys,
-            )?;
+            let objects = BaseReleaseObjects {
+                finality: finality_update.expect("checked above"),
+                game_proof: game_proof.expect("checked above"),
+                output_preimage: output_preimage.expect("checked above"),
+                account_proof: account_proof.expect("checked above"),
+            };
+            if let Some(attestation) = &attestation {
+                let key = check_attestation_key(attestation, fast_rules, &parent.fast, revoked)?;
+                let _ = key;
+                verify_fast_releases_on_base(
+                    &objects,
+                    attestation,
+                    &to_prove,
+                    &committees,
+                    rules,
+                    &learned,
+                    keys,
+                )?;
+                fast.created = vault
+                    .releases
+                    .iter()
+                    .map(|(n, owner, amount)| {
+                        (
+                            *n,
+                            FastRecord {
+                                owner: *owner,
+                                amount: *amount,
+                                l2_block: attestation.statement.l2_block,
+                                height,
+                                contradicted: false,
+                                consumed: false,
+                            },
+                        )
+                    })
+                    .collect();
+            } else {
+                let base = verify_releases_on_base(
+                    &objects,
+                    &to_prove,
+                    &committees,
+                    rules,
+                    &learned,
+                    keys,
+                )?;
+                fast.contradicted = check_contradictions(
+                    &contradictions,
+                    &fast_markers,
+                    &base,
+                    &objects,
+                    &parent.fast,
+                    rules,
+                )?;
+                fast.consumed = consumed;
+            }
         } else {
             verify_releases_on_l1(
                 finality_update.expect("checked above"),
@@ -1230,6 +1692,25 @@ pub fn validate_block_destination(
             )?;
         }
     }
+    if over_base {
+        // The fast releases past the horizon, but those that wait for their
+        // real burner.
+        let contradicted: Vec<u64> = fast.contradicted.iter().map(|c| c.n).collect();
+        fast.expired = parent
+            .fast
+            .records
+            .iter()
+            .filter(|(n, record)| {
+                FastRecord {
+                    contradicted: record.contradicted || contradicted.contains(n),
+                    consumed: record.consumed || fast.consumed.contains(n),
+                    ..**record
+                }
+                .expires_at(height, fast_rules.reconcile_blocks)
+            })
+            .map(|(n, _)| *n)
+            .collect();
+    }
 
     Ok(DestinationEffect {
         height,
@@ -1237,7 +1718,204 @@ pub fn validate_block_destination(
         committees_after,
         committee_update: committee_update.map(<[u8]>::to_vec),
         advances,
+        fast,
     })
+}
+
+/// The fast lane's markers among the block's live outputs: the contradiction
+/// and the revocation markers of its user groups, in block order; refused in
+/// a system record or with value (V5).
+fn fast_lane_markers(
+    block: &Block,
+    user_start_index: usize,
+) -> Result<(Vec<Address>, Vec<Address>), DestinationBlockError> {
+    let (system, user) = block.transactions.split_at(user_start_index);
+    if system
+        .iter()
+        .flat_map(|record| record.body.live_outputs())
+        .any(|(_, output)| fast_marker_kind(&output.owner).is_some())
+    {
+        return Err(DestinationBlockError::FastMarkerInSystemRecord);
+    }
+    let (mut contradictions, mut revocations) = (Vec::new(), Vec::new());
+    for (_, output) in user.iter().flat_map(|tx| tx.body.live_outputs()) {
+        let Some(kind) = fast_marker_kind(&output.owner) else {
+            continue;
+        };
+        if output.amount != 0 {
+            return Err(DestinationBlockError::FastMarkerCarriesValue);
+        }
+        match kind {
+            FastMarkerKind::Contradiction => contradictions.push(output.owner),
+            FastMarkerKind::Revocation => revocations.push(output.owner),
+        }
+    }
+    Ok((contradictions, revocations))
+}
+
+fn fast_signature(error: FastSignatureError, unset: DestinationBlockError) -> DestinationBlockError {
+    match error {
+        FastSignatureError::KeyUnset => unset,
+        FastSignatureError::BadSignature => DestinationBlockError::FastBadSignature,
+    }
+}
+
+/// A revocation: the cold key of this build signed the closing of this
+/// build's relay key, on this network, not closed yet. The key it closes.
+fn check_revocation(
+    revocation: &FastRevocation,
+    rules: &FastLaneRules,
+    lane: &FastLaneState,
+) -> Result<[u8; KEY_BYTES], DestinationBlockError> {
+    let revoke_key = rules
+        .revoke_key
+        .ok_or(DestinationBlockError::FastRevokeKeyUnset)?;
+    if revocation.network != crate::consensus::guardian::network_id()
+        || Some(revocation.key) != rules.release_key
+    {
+        return Err(DestinationBlockError::FastStatementMismatch);
+    }
+    if lane.is_closed(&revocation.key) {
+        return Err(DestinationBlockError::FastKeyClosed);
+    }
+    verify_revocation(revocation, Some(&revoke_key))
+        .map_err(|e| fast_signature(e, DestinationBlockError::FastRevokeKeyUnset))?;
+    Ok(revocation.key)
+}
+
+/// An attestation's key and statement: this build's relay key, open on the
+/// branch and not revoked by the block, a statement of this network, L1,
+/// Base chain and bridge, signed by that key. The key.
+fn check_attestation_key(
+    attestation: &FastAttestation,
+    rules: &FastLaneRules,
+    lane: &FastLaneState,
+    revoked_here: Option<[u8; KEY_BYTES]>,
+) -> Result<[u8; KEY_BYTES], DestinationBlockError> {
+    let key = rules
+        .release_key
+        .ok_or(DestinationBlockError::FastKeyUnset)?;
+    if lane.is_closed(&key) || revoked_here == Some(key) {
+        return Err(DestinationBlockError::FastKeyClosed);
+    }
+    let statement = &attestation.statement;
+    if statement.network != crate::consensus::guardian::network_id()
+        || statement.l1_chain_id != rules.l1_chain_id
+        || statement.base_chain_id != rules.base_chain_id
+    {
+        return Err(DestinationBlockError::FastStatementMismatch);
+    }
+    verify_attestation(attestation, Some(&key))
+        .map_err(|e| fast_signature(e, DestinationBlockError::FastKeyUnset))?;
+    Ok(key)
+}
+
+/// V7 over Base for a fast block: as [`verify_releases_on_base`], but the
+/// game is judged by the fast lane ([`judge_game_fast`]: proposed, not
+/// final) and must be exactly the attested one — game, L2 block, root claim —
+/// for the attested bridge.
+fn verify_fast_releases_on_base(
+    objects: &BaseReleaseObjects<'_>,
+    attestation: &FastAttestation,
+    releases: &[VaultRelease],
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<BaseState, DestinationBlockError> {
+    let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
+    if attestation.statement.bridge != bridge.address {
+        return Err(DestinationBlockError::FastStatementMismatch);
+    }
+    let decoded = decode_base_objects(objects)?;
+    let finalized = finalized_execution(&decoded.finality, committees, rules, learned, keys)?;
+    let l1_time = finalized
+        .timestamp
+        .ok_or(DestinationBlockError::L1TimeUnknown)?;
+    let base_error = |e| DestinationBlockError::BaseReturn(BaseReturnError::Game(e));
+    let facts = read_game_facts(finalized.state_root, &rules.base_return.base, &decoded.game)
+        .map_err(base_error)?;
+    let game = judge_game_fast(&facts, l1_time, &rules.base_return.base).map_err(base_error)?;
+    let statement = &attestation.statement;
+    if statement.game != game.game
+        || statement.l2_block != game.l2_block_number
+        || statement.root_claim != game.root_claim
+    {
+        return Err(DestinationBlockError::FastStatementNotTheGame);
+    }
+    let base = BaseState {
+        game: game.game,
+        l2_block_number: game.l2_block_number,
+        state_root: open_output_root(&game.root_claim, &decoded.preimage)
+            .map_err(DestinationBlockError::BaseReturn)?,
+    };
+    verify_bridge_reads(&base, &bridge, &decoded, releases)?;
+    Ok(base)
+}
+
+/// The contradictions of a slow block, under the Base state root `base` of
+/// its final game: each of a fast release the branch holds, not yet
+/// contradicted, once; read under a game at or after the fast release's;
+/// `withdrawals[n]` not the burn the fast lane paid (absent counts: the word
+/// is written once and never cleared); each opening the block's marker, in
+/// order. The entries kept, each closing the build's relay key.
+fn check_contradictions(
+    contradictions: &[FastContradiction],
+    markers: &[Address],
+    base: &BaseState,
+    objects: &BaseReleaseObjects<'_>,
+    lane: &FastLaneState,
+    rules: &DestinationRules,
+) -> Result<Vec<ContradictionEntry>, DestinationBlockError> {
+    if contradictions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
+    let (account_nodes, _) = decode_bridge_account_proof(objects.account_proof).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::BridgeAccountProof,
+        }
+    })?;
+    let account = read_account(base.state_root, &bridge.address, &account_nodes)
+        .map_err(DestinationBlockError::BridgeAccount)?;
+    let mut entries: Vec<ContradictionEntry> = Vec::with_capacity(contradictions.len());
+    for (contradiction, marker) in contradictions.iter().zip(markers) {
+        let n = contradiction.n;
+        let record = lane
+            .records
+            .get(&n)
+            .ok_or(DestinationBlockError::NoFastRecord { n })?;
+        if record.contradicted || entries.iter().any(|e| e.n == n) {
+            return Err(DestinationBlockError::AlreadyContradicted { n });
+        }
+        if base.l2_block_number < record.l2_block {
+            return Err(DestinationBlockError::ContradictionTooEarly { n });
+        }
+        let word = read_storage_word(
+            account.storage_root,
+            &withdrawal_slot(n, bridge.withdrawals_slot),
+            &contradiction.storage_proof,
+        )
+        .map_err(|error| {
+            DestinationBlockError::Vault(VaultError::NotProvenOnL1 { n, error })
+        })?;
+        if word == withdrawal_commitment(&record.owner.0, record.amount) {
+            return Err(DestinationBlockError::NotAContradiction { n });
+        }
+        let entry = ContradictionEntry {
+            n,
+            owner: record.owner,
+            amount: record.amount,
+            l2_block: record.l2_block,
+            height: record.height,
+            key: rules.base_return.fast.release_key,
+        };
+        if entry.marker() != *marker {
+            return Err(DestinationBlockError::FastObjectsDoNotMatchMarkers);
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 /// The light client's step of [`validate_block_destination`] for one
@@ -1404,7 +2082,8 @@ pub struct BaseReleaseObjects<'a> {
 /// it, the game is one Base holds valid at that time
 /// (`AnchorStateRegistry.isGameClaimValid`, [`super::base_read`]); its root
 /// claim opens to a Base state root; under that root, the bridge has its
-/// pinned code and genesis, then each release's `withdrawals[n]`.
+/// pinned code and genesis, then each release's `withdrawals[n]`. The Base
+/// state read (a contradiction of the fast lane reads under it too).
 ///
 /// A pure function of its arguments, as [`verify_releases_on_l1`].
 pub fn verify_releases_on_base(
@@ -1414,8 +2093,37 @@ pub fn verify_releases_on_base(
     rules: &DestinationRules,
     learned: &CommitteeKeyCache,
     keys: &CommitteeKeyCache,
-) -> Result<(), DestinationBlockError> {
+) -> Result<BaseState, DestinationBlockError> {
     let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
+    let decoded = decode_base_objects(objects)?;
+    let finalized = finalized_execution(&decoded.finality, committees, rules, learned, keys)?;
+    let l1_time = finalized
+        .timestamp
+        .ok_or(DestinationBlockError::L1TimeUnknown)?;
+    let base = verify_base_state_root(
+        finalized.state_root,
+        l1_time,
+        &rules.base_return.base,
+        &decoded.game,
+        &decoded.preimage,
+    )
+    .map_err(DestinationBlockError::BaseReturn)?;
+    verify_bridge_reads(&base, &bridge, &decoded, releases)?;
+    Ok(base)
+}
+
+/// The objects of a block that releases over Base, decoded.
+struct DecodedBaseObjects {
+    finality: LightClientFinalityUpdate,
+    game: super::base_read::GameProof,
+    preimage: super::base_read::OutputRootPreimage,
+    account_nodes: Vec<Vec<u8>>,
+    genesis_nodes: Vec<Vec<u8>>,
+}
+
+fn decode_base_objects(
+    objects: &BaseReleaseObjects<'_>,
+) -> Result<DecodedBaseObjects, DestinationBlockError> {
     let malformed = |kind| DestinationBlockError::MalformedObject { kind };
     let finality = LightClientFinalityUpdate::decode_payload(objects.finality)
         .map_err(|_| malformed(DestinationObjectKind::FinalityUpdate))?;
@@ -1425,28 +2133,35 @@ pub fn verify_releases_on_base(
         .map_err(|_| malformed(DestinationObjectKind::OutputRootPreimage))?;
     let (account_nodes, genesis_nodes) = decode_bridge_account_proof(objects.account_proof)
         .map_err(|_| malformed(DestinationObjectKind::BridgeAccountProof))?;
-    let finalized = finalized_execution(&finality, committees, rules, learned, keys)?;
-    let l1_time = finalized
-        .timestamp
-        .ok_or(DestinationBlockError::L1TimeUnknown)?;
-    let base = verify_base_state_root(
-        finalized.state_root,
-        l1_time,
-        &rules.base_return.base,
-        &game,
-        &preimage,
+    Ok(DecodedBaseObjects {
+        finality,
+        game,
+        preimage,
+        account_nodes,
+        genesis_nodes,
+    })
+}
+
+/// V7 under the Base state root `base`: once for the block, the pinned code
+/// and the pinned genesis (A5-8); then each release's `withdrawals[n]`.
+fn verify_bridge_reads(
+    base: &BaseState,
+    bridge: &L1BridgeParams,
+    decoded: &DecodedBaseObjects,
+    releases: &[VaultRelease],
+) -> Result<(), DestinationBlockError> {
+    verify_bridge_account(
+        base.state_root,
+        bridge,
+        &decoded.account_nodes,
+        &decoded.genesis_nodes,
     )
-    .map_err(DestinationBlockError::BaseReturn)?;
-    // V7 under the Base state root, once for the block: the pinned code and
-    // the pinned genesis (A5-8).
-    verify_bridge_account(base.state_root, &bridge, &account_nodes, &genesis_nodes)
-        .map_err(DestinationBlockError::BridgeAccount)?;
-    // V7, each release.
+    .map_err(DestinationBlockError::BridgeAccount)?;
     for release in releases {
         verify_withdrawal(
             base.state_root,
-            &bridge,
-            &account_nodes,
+            bridge,
+            &decoded.account_nodes,
             release.n,
             &release.owner.0,
             release.amount,
@@ -1471,6 +2186,10 @@ pub const DESTINATION_SNAPSHOT_MAGIC: [u8; 8] = *b"JTMDST01";
 /// First bytes of the file of a state that holds advances (the return over
 /// Base): the version-1 file, then the advances.
 pub const DESTINATION_SNAPSHOT_MAGIC_ADVANCES: [u8; 8] = *b"JTMDST02";
+/// First bytes of the file of a boundary the return over Base governs: the
+/// committee updates, the releases of the fast lane's horizon (the window is
+/// drawn from them), the advances, the contradictions, the revocations.
+pub const DESTINATION_SNAPSHOT_MAGIC_FAST: [u8; 8] = *b"JTMDST03";
 
 /// Largest `destination-state.bin` a node reads: two committee updates and a
 /// window of releases (4 per block) fit many times over.
@@ -1492,11 +2211,54 @@ pub struct DestinationSnapshotFile {
     /// `(n, owner, amount)`: each opens its `JTMADV01` marker, its creditor
     /// the latest `JTMADT01` marker naming it (or is its origin).
     pub advances: Vec<(u64, AdvanceEntry)>,
+    /// From the return-over-Base height on (`JTMDST03`): the fast lane. Its
+    /// releases replace `window_releases` (empty then): the window is drawn
+    /// from them.
+    pub fast: Option<FastSnapshot>,
+}
+
+/// One release of a snapshot's horizon: its burn, and the L2 block of its
+/// game when it was a fast release (then it opens the fast lane's marker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotRelease {
+    pub n: u64,
+    pub owner: Address,
+    pub amount: u64,
+    pub fast_l2_block: Option<u64>,
+}
+
+impl SnapshotRelease {
+    /// The marker of the group that paid it.
+    pub fn marker(&self) -> Address {
+        match self.fast_l2_block {
+            Some(l2_block) => fast_release_marker(self.n, &self.owner, self.amount, l2_block),
+            None => VaultRelease {
+                n: self.n,
+                owner: self.owner,
+                amount: self.amount,
+                storage_proof: Vec::new(),
+            }
+            .marker(),
+        }
+    }
+}
+
+/// The fast lane of a snapshot (RETOUR-RAPIDE SPEC §7): every release
+/// created in the blocks of the horizon, in creation order, each opening its
+/// marker; every contradiction and revocation of the branch, in creation
+/// order, each opening its marker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FastSnapshot {
+    pub releases: Vec<SnapshotRelease>,
+    pub contradictions: Vec<ContradictionEntry>,
+    pub revocations: Vec<[u8; KEY_BYTES]>,
 }
 
 impl DestinationSnapshotFile {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = if self.advances.is_empty() {
+        let mut out = if self.fast.is_some() {
+            DESTINATION_SNAPSHOT_MAGIC_FAST.to_vec()
+        } else if self.advances.is_empty() {
             DESTINATION_SNAPSHOT_MAGIC.to_vec()
         } else {
             DESTINATION_SNAPSHOT_MAGIC_ADVANCES.to_vec()
@@ -1505,6 +2267,33 @@ impl DestinationSnapshotFile {
         for payload in &self.committee_updates {
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(payload);
+        }
+        if let Some(fast) = &self.fast {
+            // `JTMDST03`: the horizon's releases, the advances (maybe none),
+            // the contradictions, the revocations.
+            out.extend_from_slice(&(fast.releases.len() as u32).to_le_bytes());
+            for release in &fast.releases {
+                out.extend_from_slice(&release.n.to_le_bytes());
+                out.extend_from_slice(&release.owner.0);
+                out.extend_from_slice(&release.amount.to_le_bytes());
+                match release.fast_l2_block {
+                    None => out.push(0),
+                    Some(l2_block) => {
+                        out.push(1);
+                        out.extend_from_slice(&l2_block.to_le_bytes());
+                    }
+                }
+            }
+            encode_snapshot_advances(&self.advances, &mut out);
+            out.extend_from_slice(&(fast.contradictions.len() as u32).to_le_bytes());
+            for entry in &fast.contradictions {
+                put_contradiction(entry, &mut out);
+            }
+            out.extend_from_slice(&(fast.revocations.len() as u32).to_le_bytes());
+            for key in &fast.revocations {
+                out.extend_from_slice(key);
+            }
+            return out;
         }
         out.extend_from_slice(&(self.window_releases.len() as u32).to_le_bytes());
         for (n, owner, amount) in &self.window_releases {
@@ -1525,7 +2314,8 @@ impl DestinationSnapshotFile {
         let mut r = Reader(bytes);
         let magic = r.take(8)?;
         let advanced = magic == DESTINATION_SNAPSHOT_MAGIC_ADVANCES;
-        if magic != DESTINATION_SNAPSHOT_MAGIC && !advanced {
+        let fast = magic == DESTINATION_SNAPSHOT_MAGIC_FAST;
+        if magic != DESTINATION_SNAPSHOT_MAGIC && !advanced && !fast {
             return Err(DestinationStateError::Malformed);
         }
         let updates = usize::from(r.u8()?);
@@ -1536,6 +2326,59 @@ impl DestinationSnapshotFile {
         for _ in 0..updates {
             let len = r.u32()? as usize;
             committee_updates.push(r.take(len)?.to_vec());
+        }
+        if fast {
+            let count = r.u32()? as usize;
+            if count > r.0.len() / 49 {
+                return Err(DestinationStateError::Malformed);
+            }
+            let mut releases = Vec::with_capacity(count);
+            for _ in 0..count {
+                let n = r.u64()?;
+                let owner = r.address()?;
+                let amount = r.u64()?;
+                let fast_l2_block = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    _ => return Err(DestinationStateError::Malformed),
+                };
+                releases.push(SnapshotRelease {
+                    n,
+                    owner,
+                    amount,
+                    fast_l2_block,
+                });
+            }
+            let advances = r.snapshot_advances()?;
+            let count = r.u32()? as usize;
+            if count > r.0.len() / CONTRADICTION_MIN_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            let mut contradictions = Vec::with_capacity(count);
+            for _ in 0..count {
+                contradictions.push(r.contradiction()?);
+            }
+            let count = r.u32()? as usize;
+            if count > r.0.len() / KEY_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            let mut revocations = Vec::with_capacity(count);
+            for _ in 0..count {
+                revocations.push(r.take(KEY_BYTES)?.try_into().expect("48"));
+            }
+            if !r.0.is_empty() {
+                return Err(DestinationStateError::Malformed);
+            }
+            return Ok(Self {
+                committee_updates,
+                window_releases: Vec::new(),
+                advances,
+                fast: Some(FastSnapshot {
+                    releases,
+                    contradictions,
+                    revocations,
+                }),
+            });
         }
         let releases = r.u32()? as usize;
         if releases > r.0.len() / 48 {
@@ -1563,6 +2406,7 @@ impl DestinationSnapshotFile {
             committee_updates,
             window_releases,
             advances,
+            fast: None,
         })
     }
 }
@@ -1645,6 +2489,9 @@ pub struct SnapshotDestinationCheck<'a> {
     /// `JTMADV01` and `JTMADT01` slots `(creation_id, owner)`.
     advance_markers: Vec<(u64, Address)>,
     transfer_markers: Vec<(u64, Address)>,
+    /// The fast lane's `JTMFCT01` and `JTMFRV01` slots `(creation_id, owner)`.
+    contradiction_markers: Vec<(u64, Address)>,
+    revocation_markers: Vec<(u64, Address)>,
 }
 
 impl<'a> SnapshotDestinationCheck<'a> {
@@ -1666,6 +2513,8 @@ impl<'a> SnapshotDestinationCheck<'a> {
             update_markers: Vec::new(),
             advance_markers: Vec::new(),
             transfer_markers: Vec::new(),
+            contradiction_markers: Vec::new(),
+            revocation_markers: Vec::new(),
         }
     }
 
@@ -1696,7 +2545,15 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 Some(super::advance::AdvanceMarkerKind::Transfer) => {
                     self.transfer_markers.push((creation_id, *owner));
                 }
-                None => {}
+                None => match fast_marker_kind(owner) {
+                    Some(FastMarkerKind::Contradiction) => {
+                        self.contradiction_markers.push((creation_id, *owner));
+                    }
+                    Some(FastMarkerKind::Revocation) => {
+                        self.revocation_markers.push((creation_id, *owner));
+                    }
+                    None => {}
+                },
             },
         }
     }
@@ -1717,49 +2574,18 @@ impl<'a> SnapshotDestinationCheck<'a> {
             })?;
         let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
 
-        // V6: the releases of the blocks the next block's window reads.
-        let first = snapshot_window_start(start, self.tip, self.rules.vault.window_blocks);
         let header =
             |h: u64| alloc_counter(h).ok_or(SnapshotDestinationError::HeaderMissing { height: h });
-        let low = header(first - 1)?;
         self.release_markers.sort_unstable_by_key(|(id, _)| *id);
-        let in_window: Vec<&(u64, Address)> = self
-            .release_markers
-            .iter()
-            .filter(|(id, _)| *id > low)
-            .collect();
-        if in_window.len() != self.file.window_releases.len() {
-            return Err(mismatch("window releases do not match the release markers"));
-        }
-        let mut window: Vec<WindowRelease> = Vec::new();
-        let mut height = first;
-        let mut height_top = header(first)?;
-        for ((id, marker), (n, owner, amount)) in
-            in_window.into_iter().zip(&self.file.window_releases)
-        {
-            let opened = VaultRelease {
-                n: *n,
-                owner: *owner,
-                amount: *amount,
-                storage_proof: Vec::new(),
-            };
-            if opened.marker() != *marker {
-                return Err(mismatch("a window release does not open its marker"));
-            }
-            while *id > height_top {
-                height += 1;
-                if height > self.tip {
-                    return Err(mismatch("a release marker above the boundary"));
+        let (window, fast) = match &self.file.fast {
+            Some(fast) => self.rebuild_fast(start, fast, &header)?,
+            None => {
+                if self.rules.base_return.active_at(self.tip) {
+                    return Err(mismatch("the return over Base needs the fast lane's file"));
                 }
-                height_top = header(height)?;
+                (self.rebuild_window(start, &header)?, FastLaneState::default())
             }
-            window.push(WindowRelease {
-                height,
-                n: *n,
-                owner: *owner,
-                amount: *amount,
-            });
-        }
+        };
 
         // The committees: the two latest committee-update markers open the
         // file's updates; the first update of a branch is the anchor's.
@@ -1808,8 +2634,198 @@ impl<'a> SnapshotDestinationCheck<'a> {
             bridge_locked: self.bridge_locked,
             window,
             advances,
+            fast,
             undo: Vec::new(),
         })
+    }
+
+    /// V6 below the return over Base: the releases of the blocks the next
+    /// block's window reads, each opening its marker (`window_releases`).
+    fn rebuild_window(
+        &self,
+        start: u64,
+        header: &impl Fn(u64) -> Result<u64, SnapshotDestinationError>,
+    ) -> Result<Vec<WindowRelease>, SnapshotDestinationError> {
+        let first = snapshot_window_start(start, self.tip, self.rules.vault.window_blocks);
+        let opened = self.open_releases(
+            first,
+            self.file.window_releases.iter().map(|(n, owner, amount)| SnapshotRelease {
+                n: *n,
+                owner: *owner,
+                amount: *amount,
+                fast_l2_block: None,
+            }),
+            self.file.window_releases.len(),
+            header,
+            [
+                "window releases do not match the release markers",
+                "a window release does not open its marker",
+            ],
+        )?;
+        Ok(opened
+            .into_iter()
+            .map(|(height, r)| WindowRelease {
+                height,
+                n: r.n,
+                owner: r.owner,
+                amount: r.amount,
+            })
+            .collect())
+    }
+
+    /// The release markers created from `first` on (`release_markers` in
+    /// creation order), opened one by one by `releases` (as many), each
+    /// with the height of the block that created it.
+    fn open_releases(
+        &self,
+        first: u64,
+        releases: impl Iterator<Item = SnapshotRelease>,
+        count: usize,
+        header: &impl Fn(u64) -> Result<u64, SnapshotDestinationError>,
+        [count_reason, open_reason]: [&'static str; 2],
+    ) -> Result<Vec<(u64, SnapshotRelease)>, SnapshotDestinationError> {
+        let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
+        let low = header(first - 1)?;
+        let in_range: Vec<&(u64, Address)> = self
+            .release_markers
+            .iter()
+            .filter(|(id, _)| *id > low)
+            .collect();
+        if in_range.len() != count {
+            return Err(mismatch(count_reason));
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut height = first;
+        let mut height_top = header(first)?;
+        for ((id, marker), release) in in_range.into_iter().zip(releases) {
+            if release.marker() != *marker {
+                return Err(mismatch(open_reason));
+            }
+            while *id > height_top {
+                height += 1;
+                if height > self.tip {
+                    return Err(mismatch("a release marker above the boundary"));
+                }
+                height_top = header(height)?;
+            }
+            out.push((height, release));
+        }
+        Ok(out)
+    }
+
+    /// The window and the fast lane of a boundary the return over Base
+    /// governs (`JTMDST03`): every release of the horizon opens its marker
+    /// (fast or slow: none can be hidden, none invented), the window is drawn
+    /// from them, the fast ones are the records; every contradiction and
+    /// revocation made from the return-over-Base height on opens its marker,
+    /// in creation order; a contradicted `n` with a second release marker was
+    /// paid to its real burner (consumed; forgotten past the horizon).
+    fn rebuild_fast(
+        &self,
+        start: u64,
+        fast: &FastSnapshot,
+        header: &impl Fn(u64) -> Result<u64, SnapshotDestinationError>,
+    ) -> Result<(Vec<WindowRelease>, FastLaneState), SnapshotDestinationError> {
+        let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
+        if !self.rules.base_return.active_at(self.tip) || !self.file.window_releases.is_empty() {
+            return Err(mismatch("a fast lane's file below the return over Base"));
+        }
+        let first = snapshot_fast_start(start, self.tip, &self.rules);
+        let opened = self.open_releases(
+            first,
+            fast.releases.iter().copied(),
+            fast.releases.len(),
+            header,
+            [
+                "the horizon's releases do not match the release markers",
+                "a release of the horizon does not open its marker",
+            ],
+        )?;
+        let window_first = snapshot_window_start(start, self.tip, self.rules.vault.window_blocks);
+        let window = opened
+            .iter()
+            .filter(|(height, _)| *height >= window_first)
+            .map(|(height, r)| WindowRelease {
+                height: *height,
+                n: r.n,
+                owner: r.owner,
+                amount: r.amount,
+            })
+            .collect();
+        let mut lane = FastLaneState::default();
+        for (height, release) in &opened {
+            if let Some(l2_block) = release.fast_l2_block {
+                lane.records.insert(
+                    release.n,
+                    FastRecord {
+                        owner: release.owner,
+                        amount: release.amount,
+                        l2_block,
+                        height: *height,
+                        contradicted: false,
+                        consumed: false,
+                    },
+                );
+            }
+        }
+        let height_base = self
+            .rules
+            .base_return
+            .activation_height
+            .expect("active at the boundary");
+        let base_floor = header(height_base.saturating_sub(1))?;
+        let markers_of = |list: &[(u64, Address)]| {
+            let mut out: Vec<(u64, Address)> =
+                list.iter().filter(|(id, _)| *id > base_floor).copied().collect();
+            out.sort_unstable_by_key(|(id, _)| *id);
+            out
+        };
+        let contradictions = markers_of(&self.contradiction_markers);
+        let revocations = markers_of(&self.revocation_markers);
+        if contradictions.len() != fast.contradictions.len() || revocations.len() != fast.revocations.len() {
+            return Err(mismatch("the fast lane's objects do not match their markers"));
+        }
+        let paid_twice = |n: u64| {
+            self.release_markers
+                .iter()
+                .filter(|(_, marker)| crate::consensus::vault::release_marker_n(marker) == Some(n))
+                .count()
+                >= 2
+        };
+        for ((_, marker), entry) in contradictions.iter().zip(&fast.contradictions) {
+            if entry.marker() != *marker {
+                return Err(mismatch("a contradiction does not open its marker"));
+            }
+            let consumed = paid_twice(entry.n);
+            match lane.records.get_mut(&entry.n) {
+                Some(record) => {
+                    record.contradicted = true;
+                    record.consumed = consumed;
+                }
+                None if !consumed => {
+                    lane.records.insert(
+                        entry.n,
+                        FastRecord {
+                            owner: entry.owner,
+                            amount: entry.amount,
+                            l2_block: entry.l2_block,
+                            height: entry.height,
+                            contradicted: true,
+                            consumed: false,
+                        },
+                    );
+                }
+                None => {}
+            }
+            lane.contradictions.push(*entry);
+        }
+        for ((_, marker), key) in revocations.iter().zip(&fast.revocations) {
+            if revocation_marker(key) != *marker {
+                return Err(mismatch("a revocation does not open its marker"));
+            }
+            lane.revocations.push(*key);
+        }
+        Ok((window, lane))
     }
 
     /// The advances of the boundary (the return over Base): the `JTMADV01`
@@ -1892,6 +2908,17 @@ impl<'a> SnapshotDestinationCheck<'a> {
         }
         Ok(book)
     }
+}
+
+/// The first height whose releases a snapshot of the boundary `tip` carries
+/// when the return over Base governs it: the fast lane's horizon (a record of
+/// the state after `tip` was paid at `tip + 1 − FAST_RECONCILE_BLOCKS` or
+/// later), never below J nor the return-over-Base height.
+pub fn snapshot_fast_start(start: u64, tip: u64, rules: &DestinationRules) -> u64 {
+    (tip + 1)
+        .saturating_sub(rules.base_return.fast.reconcile_blocks)
+        .max(start)
+        .max(rules.base_return.activation_height.unwrap_or(start))
 }
 
 /// The first height whose releases a snapshot of the boundary `tip` carries:

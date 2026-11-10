@@ -1137,7 +1137,7 @@ fn v1_7_annex_files(
                 "no destination state at the target",
             ))?;
         let file = state
-            .snapshot_file(&keys, destination_rules.vault.window_blocks)
+            .snapshot_file_at(&keys, &destination_rules)
             .ok_or(SnapshotGenerationError::Corrupt(
                 "destination record lacks a committee's keys",
             ))?;

@@ -449,7 +449,8 @@ pub fn verify_destination_intent(
             rules,
             &CommitteeKeyCache::default(),
             keys,
-        ),
+        )
+        .map(|_| ()),
         DestinationIntent::Release(release) => verify_releases_on_l1(
             &release.finality,
             &release.account_proof,

@@ -765,6 +765,7 @@ fn effect_at(
         committees_after: committees,
         committee_update: None,
         advances: AdvanceEffect::default(),
+        fast: Default::default(),
     }
 }
 
@@ -1134,6 +1135,7 @@ impl Chain {
                 .map(|(_, r)| (r.n, r.owner, r.amount))
                 .collect(),
             advances: Vec::new(),
+            fast: None,
         }
     }
 
@@ -1505,6 +1507,7 @@ fn snapshot_with_a_foreign_anchor_update_is_refused() {
         committee_updates: vec![foreign],
         window_releases: Vec::new(),
         advances: Vec::new(),
+        fast: None,
     };
     assert_eq!(
         chain.install(&file).map(|_| ()),

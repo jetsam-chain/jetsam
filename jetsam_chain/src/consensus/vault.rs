@@ -698,6 +698,21 @@ pub fn validate_block_vault_paying(
     payee: &dyn Fn(&VaultRelease) -> Address,
     prove: &mut dyn FnMut(&VaultRelease) -> Result<(), L1ReadError>,
 ) -> Result<VaultEffect, VaultError> {
+    validate_block_vault_with(block, ctx, rules, payee, &VaultRelease::marker, prove)
+}
+
+/// [`validate_block_vault_paying`] where each release group carries
+/// `marker(release)`: [`VaultRelease::marker`], or, for a fast release of the
+/// return over Base, the fast lane's (`destination::fast::fast_release_marker`,
+/// same tag and `n`, another commitment).
+pub fn validate_block_vault_with(
+    block: &Block,
+    ctx: &VaultContext<'_>,
+    rules: &VaultRules,
+    payee: &dyn Fn(&VaultRelease) -> Address,
+    marker: &dyn Fn(&VaultRelease) -> Address,
+    prove: &mut dyn FnMut(&VaultRelease) -> Result<(), L1ReadError>,
+) -> Result<VaultEffect, VaultError> {
     let height = block.header.height;
     if !rules.active_at(height) {
         return Ok(VaultEffect {
@@ -810,7 +825,7 @@ pub fn validate_block_vault_paying(
     if decoded
         .iter()
         .zip(&releases)
-        .any(|(release, group)| release.marker() != group.marker)
+        .any(|(release, group)| marker(release) != group.marker)
     {
         return Err(VaultError::ReleasesDoNotMatchMarkers);
     }

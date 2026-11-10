@@ -1103,7 +1103,8 @@ pub fn client_object_marker_kind_at(
 /// bridge's markers (`vault::is_destination_locked_address_at`, rule V5) and
 /// the guardians' (`guardian::is_guardian_locked_address_at`, rule M-5); from
 /// the return-over-Base height on, the advance's markers
-/// (`destination::advance::is_advance_locked_address_at`).
+/// (`destination::advance::is_advance_locked_address_at`) and the fast lane's
+/// (`destination::fast::is_fast_locked_address_at`).
 pub fn is_client_locked_address_at(owner: &Address, height: u64, batch: &ClientBatchRules) -> bool {
     *owner == CLIENT_LICENSE_BURN_ADDRESS
         || *owner == CLIENT_LICENSE_POOL_ADDRESS
@@ -1119,6 +1120,11 @@ pub fn is_client_locked_address_at(owner: &Address, height: u64, batch: &ClientB
             crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
         )
         || crate::consensus::destination::advance::is_advance_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_BASE_RETURN_HEIGHT,
+        )
+        || crate::consensus::destination::fast::is_fast_locked_address_at(
             owner,
             height,
             crate::consensus::params::V1_7_BASE_RETURN_HEIGHT,

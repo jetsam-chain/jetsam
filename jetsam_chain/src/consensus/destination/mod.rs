@@ -28,6 +28,7 @@
 pub mod advance;
 pub mod base_read;
 pub mod bls;
+pub mod fast;
 pub mod forks;
 pub mod l1_read;
 pub mod light_client;
@@ -65,6 +66,9 @@ const TAG_BRIDGE_ACCOUNT_PROOF: u8 = 3;
 const TAG_VAULT_RELEASE: u8 = 4;
 const TAG_BASE_GAME_PROOF: u8 = 5;
 const TAG_OUTPUT_ROOT_PREIMAGE: u8 = 6;
+const TAG_FAST_GAME_ATTESTATION: u8 = 7;
+const TAG_FAST_CONTRADICTION: u8 = 8;
+const TAG_FAST_KEY_REVOCATION: u8 = 9;
 
 /// What a destination object is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -86,6 +90,16 @@ pub enum DestinationObjectKind {
     /// ([`base_read::encode_output_root_preimage`]). Decoded only by a build
     /// whose return-over-Base height is armed.
     OutputRootPreimage,
+    /// The fast lane of the return over Base (D127, D130): the relay's
+    /// signature over a game Base has proposed ([`fast::FastAttestation`]).
+    /// Decoded only by a build whose return-over-Base height is armed.
+    FastGameAttestation,
+    /// The fast lane: `withdrawals[n]` under a final game, against a fast
+    /// release ([`fast::FastContradiction`]). Decoded only once armed.
+    FastContradiction,
+    /// The fast lane: the cold key closes the relay's ([`fast::FastRevocation`]).
+    /// Decoded only once armed.
+    FastKeyRevocation,
     /// A guardian object (codes 0x20..=0x26), judged by
     /// [`crate::consensus::guardian`].
     Guardian(GuardianObjectKind),
@@ -100,6 +114,9 @@ impl DestinationObjectKind {
             Self::VaultRelease => TAG_VAULT_RELEASE,
             Self::BaseGameProof => TAG_BASE_GAME_PROOF,
             Self::OutputRootPreimage => TAG_OUTPUT_ROOT_PREIMAGE,
+            Self::FastGameAttestation => TAG_FAST_GAME_ATTESTATION,
+            Self::FastContradiction => TAG_FAST_CONTRADICTION,
+            Self::FastKeyRevocation => TAG_FAST_KEY_REVOCATION,
             Self::Guardian(kind) => kind.section_code(),
         }
     }
@@ -112,6 +129,9 @@ impl DestinationObjectKind {
             TAG_VAULT_RELEASE => Some(Self::VaultRelease),
             TAG_BASE_GAME_PROOF => Some(Self::BaseGameProof),
             TAG_OUTPUT_ROOT_PREIMAGE => Some(Self::OutputRootPreimage),
+            TAG_FAST_GAME_ATTESTATION => Some(Self::FastGameAttestation),
+            TAG_FAST_CONTRADICTION => Some(Self::FastContradiction),
+            TAG_FAST_KEY_REVOCATION => Some(Self::FastKeyRevocation),
             code => match GuardianObjectKind::from_section_code(code) {
                 Some(kind) => Some(Self::Guardian(kind)),
                 None => None,
@@ -121,14 +141,22 @@ impl DestinationObjectKind {
 }
 
 impl DestinationObjectKind {
-    /// The objects of the return over Base (tags 5 and 6).
+    /// The objects of the return over Base (tags 5 and 6) and of its fast
+    /// lane (7, 8 and 9).
     pub const fn is_base_return(self) -> bool {
-        matches!(self, Self::BaseGameProof | Self::OutputRootPreimage)
+        matches!(
+            self,
+            Self::BaseGameProof
+                | Self::OutputRootPreimage
+                | Self::FastGameAttestation
+                | Self::FastContradiction
+                | Self::FastKeyRevocation
+        )
     }
 }
 
 /// Whether this build decodes the objects of the return over Base: only once
-/// its return-over-Base height is armed. A dormant build reads tags 5 and 6
+/// its return-over-Base height is armed. A dormant build reads tags 5 to 9
 /// as a build without them does (an unknown tag), so that, until the
 /// operator arms the height, its wire is exactly theirs.
 pub fn base_objects_on_the_wire() -> bool {

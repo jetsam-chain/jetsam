@@ -33,28 +33,29 @@ use crate::consensus::vault::tests::{
 use crate::consensus::vault::{VAULT_ADDRESS, VAULT_RELEASE_WINDOW_BLOCKS};
 use jetsam_tx::wire::WireError;
 
-const JTM: u64 = MICRO_PER_JTM;
+pub(super) const JTM: u64 = MICRO_PER_JTM;
 /// The return over Base armed five blocks below the test height.
-const HB: u64 = HEIGHT - 5;
+pub(super) const HB: u64 = HEIGHT - 5;
 /// The L1 time of the test finality updates: the Fulu header of slot
 /// `P0 × 8 192 + 300` carries `slot × 12`.
-const L1_TIME: u64 = (P0 * SLOTS_PER_SYNC_COMMITTEE_PERIOD + 300) * 12;
+pub(super) const L1_TIME: u64 = (P0 * SLOTS_PER_SYNC_COMMITTEE_PERIOD + 300) * 12;
 /// A game created, then resolved well before that time, after the
 /// retirement.
-const TIMES: (u64, u64, u64) = (100_000_000, 150_000_000, 50_000_000);
+pub(super) const TIMES: (u64, u64, u64) = (100_000_000, 150_000_000, 50_000_000);
 
-fn base_rules(anchor: &Committee) -> DestinationRules {
+pub(super) fn base_rules(anchor: &Committee) -> DestinationRules {
     let mut rules = anchored_rules(anchor);
     rules.base_return = BaseReturnRules {
         activation_height: Some(HB),
         network: L1_MAINNET,
         base: BASE_SEPOLIA,
         advance: AdvanceRules::CONSENSUS,
+        fast: crate::consensus::destination::fast::FastLaneRules::CONSENSUS,
     };
     rules
 }
 
-fn known(c: &Committee) -> Vec<CommitteeRef> {
+pub(super) fn known(c: &Committee) -> Vec<CommitteeRef> {
     vec![CommitteeRef {
         period: P0,
         root: root_of(c),
@@ -65,15 +66,15 @@ fn known(c: &Committee) -> Vec<CommitteeRef> {
 /// `withdrawals[n] = keccak(owner ‖ amount)` and its genesis, the preimage of
 /// its output root, and an L1 state root holding Base's five contracts and a
 /// game claiming that output root.
-struct BaseWorld {
-    l1_root: Root,
-    game: GameProof,
-    preimage: OutputRootPreimage,
-    account: Vec<u8>,
-    storage_proof: Vec<Vec<u8>>,
+pub(super) struct BaseWorld {
+    pub(super) l1_root: Root,
+    pub(super) game: GameProof,
+    pub(super) preimage: OutputRootPreimage,
+    pub(super) account: Vec<u8>,
+    pub(super) storage_proof: Vec<Vec<u8>>,
 }
 
-fn base_world(r: &VaultRelease, knobs: Knobs, times: (u64, u64, u64)) -> BaseWorld {
+pub(super) fn base_world(r: &VaultRelease, knobs: Knobs, times: (u64, u64, u64)) -> BaseWorld {
     let bridge = prototype_bridge();
     let l2 = synthetic_bridge_with_genesis(
         &bridge,
@@ -99,7 +100,7 @@ fn base_world(r: &VaultRelease, knobs: Knobs, times: (u64, u64, u64)) -> BaseWor
 
 /// The section objects of a release over Base, in their usual order: the
 /// finality update, the game proof, the preimage, the account proof.
-fn base_objects(world: &BaseWorld, signers: &Committee) -> Vec<DestinationObject> {
+pub(super) fn base_objects(world: &BaseWorld, signers: &Committee) -> Vec<DestinationObject> {
     vec![
         object(
             DestinationObjectKind::FinalityUpdate,
@@ -121,7 +122,7 @@ fn base_objects(world: &BaseWorld, signers: &Committee) -> Vec<DestinationObject
 }
 
 /// A block at `height` releasing `r` over Base, its first output to `payee`.
-fn base_release_block(
+pub(super) fn base_release_block(
     height: u64,
     r: &VaultRelease,
     payee: Address,
@@ -146,7 +147,7 @@ fn base_release_block(
     b
 }
 
-fn drop_kind(b: &Block, kind: DestinationObjectKind) -> Block {
+pub(super) fn drop_kind(b: &Block, kind: DestinationObjectKind) -> Block {
     let mut b = b.clone();
     b.destination
         .as_mut()
@@ -623,7 +624,7 @@ fn over_base_the_light_client_reads_the_l1_base_settles_on() {
 // The advance through a block
 // ---------------------------------------------------------------------------
 
-fn advance_group(
+pub(super) fn advance_group(
     slot_base: u32,
     advancer: Address,
     n: u64,
@@ -828,6 +829,7 @@ fn effect(height: u64, advances: AdvanceEffect) -> DestinationEffect {
         committees_after: None,
         committee_update: None,
         advances,
+        fast: Default::default(),
     }
 }
 
@@ -1071,11 +1073,31 @@ fn snapshot_rules() -> DestinationRules {
 }
 
 /// The check of a snapshot at `tip` fed `slots` `(owner, creation_id)`.
+/// From the return-over-Base height on the file is the fast lane's
+/// (`JTMDST03`, RETOUR-RAPIDE SPEC §7): its releases are every release of the
+/// horizon — here the window's, the only ones these tests make.
 fn install(
     file: &DestinationSnapshotFile,
     tip: u64,
     slots: &[(Address, u64)],
 ) -> Result<DestinationState, SnapshotDestinationError> {
+    let file = &DestinationSnapshotFile {
+        window_releases: Vec::new(),
+        fast: Some(FastSnapshot {
+            releases: file
+                .window_releases
+                .iter()
+                .map(|(n, owner, amount)| SnapshotRelease {
+                    n: *n,
+                    owner: *owner,
+                    amount: *amount,
+                    fast_l2_block: None,
+                })
+                .collect(),
+            ..FastSnapshot::default()
+        }),
+        ..file.clone()
+    };
     let rules = snapshot_rules();
     let floor = alloc(rules.activation_height.unwrap() - 1).unwrap();
     let mut check = SnapshotDestinationCheck::new(file, tip, floor, rules);
@@ -1112,6 +1134,7 @@ fn a_snapshot_rebuilds_the_advances_from_their_markers() {
         committee_updates: Vec::new(),
         window_releases: Vec::new(),
         advances: vec![(3, a3), (4, a4)],
+        fast: None,
     };
     // The window of the next block reads the release of block HB + 9.
     let file = DestinationSnapshotFile {
@@ -1208,6 +1231,7 @@ fn a_snapshot_rebuilds_several_advances_of_one_n_each_with_its_creditor() {
         committee_updates: Vec::new(),
         window_releases: Vec::new(),
         advances: vec![(3, fake), (3, honest), (3, plain)],
+        fast: None,
     };
     let state = install(&file, tip, &slots).expect("three advances of 3");
     assert_eq!(state.advances.len(), 3);
@@ -1277,6 +1301,7 @@ fn a_snapshot_rebuilds_several_advances_of_one_n_each_with_its_creditor() {
         committee_updates: Vec::new(),
         window_releases: vec![(3, ALICE, 5 * JTM)],
         advances: Vec::new(),
+        fast: None,
     };
     assert_eq!(
         install(&none, tip, &released).map(|s| s.advances.len()),
@@ -1300,6 +1325,7 @@ fn a_snapshot_reads_for_an_advance_only_the_transfers_made_after_it() {
         committee_updates: Vec::new(),
         window_releases: Vec::new(),
         advances: vec![(3, live)],
+        fast: None,
     };
     assert_eq!(
         install(&file, tip, &slots).map(|s| s.advances.get(&live.key(3)).copied()),
@@ -1318,6 +1344,7 @@ fn a_snapshot_file_without_advances_is_the_file_of_before() {
         committee_updates: Vec::new(),
         window_releases: vec![(1, ALICE, JTM)],
         advances: Vec::new(),
+        fast: None,
     };
     let bytes = file.encode();
     assert_eq!(&bytes[..8], b"JTMDST01");
@@ -1335,6 +1362,7 @@ fn a_snapshot_file_without_advances_is_the_file_of_before() {
         committee_updates: Vec::new(),
         window_releases: Vec::new(),
         advances: vec![(3, entry_of(PAYER, ALICE, JTM))],
+        fast: None,
     };
     assert!(install(&early, HB - 3, &[]).is_err());
 }
