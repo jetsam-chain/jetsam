@@ -12,25 +12,28 @@
 //!
 //! * **The advance** — an ordinary spend from the advancer `A` whose live
 //!   outputs are exactly `(owner_n, paid)`, the marker
-//!   `JTMADV01 ‖ n:u64 ‖ amount:u32 ‖ c12` (value 0), then at most one change
-//!   output to `A`; `c12` is 12 bytes of the tagged byte-hash of
-//!   `(n, owner_n, amount_n, A)`. `RELEASE_FEE ≤ amount_n ≤ 1 000 JTM`,
-//!   `paid ≥ amount_n − RELEASE_FEE − ⌈amount_n × 1 %⌉`; `n` not paid on the
-//!   branch (D52), not released by the same block; the advances of `A` not
-//!   yet consumed stay at most 3 000 JTM (D72's outstanding cap, per
-//!   advancer).
+//!   `JTMADV02 ‖ n:u64 ‖ amount:u64 ‖ c8` (value 0), then at most one change
+//!   output to `A`; `c8` is 8 bytes of the tagged byte-hash of
+//!   `(n, owner_n, amount_n, A)`. `RELEASE_FEE ≤ amount_n ≤ 50 000 JTM`
+//!   (D123: the operator's bond), `paid ≥ amount_n − RELEASE_FEE −
+//!   ⌈amount_n × 1 %⌉`; `n` not paid on the branch (D52), not released by the
+//!   same block; the advances of `A` not yet consumed stay at most 50 000 JTM
+//!   (D72's outstanding cap, per advancer, at the bond since D123). The
+//!   markers of before (`JTMADV01`, `JTMADT01`: a 32-bit amount, which cannot
+//!   carry 50 000 JTM) are refused in any group (D128 Q2); no network ever saw
+//!   one.
 //! * **Its key is the burn** `(n, owner, amount)` (D114, D72's tuple): a
 //!   branch holds any number of advances of one `n`, at most one per key (the
 //!   same burn is advanced once). An advance of another burn of `n` placed
 //!   first blocks nothing (D72's `test_wrong_tuple_placed_first_blocks_nothing`).
-//!   Two advances whose markers share their 12 commitment bytes are never held
-//!   together (only a search of 2⁴⁸ hashes finds two; a transfer names its
-//!   advance by them).
+//!   Two advances whose markers share their 8 commitment bytes are never held
+//!   together (a transfer names its advance by them; blocking another's
+//!   advance this way takes a second preimage, 2⁶⁴ hashes).
 //! * **The claim's transfer** (D72's transferable claim, `transferAdvanceClaim
 //!   (key, to)`) — an ordinary spend from the advance's current creditor whose
 //!   live outputs are exactly `(new_creditor, any)`, the marker
-//!   `JTMADT01 ‖ a12 ‖ t12` (value 0; `a12`: the commitment bytes of the
-//!   advance's marker, which name it; `t12`: 12 bytes of the tagged byte-hash
+//!   `JTMADT02 ‖ a8 ‖ t16` (value 0; `a8`: the commitment bytes of the
+//!   advance's marker, which name it; `t16`: 16 bytes of the tagged byte-hash
 //!   of `(n, owner, amount, A, new_creditor)`), then at most one change output
 //!   to the creditor; at most one per advance and per block, never in a block
 //!   that releases its `n`.
@@ -61,23 +64,33 @@ use crate::consensus::vault::{release_marker_n, release_shape_ok, ReleasedSet, V
 #[cfg(test)]
 mod tests;
 
-/// First bytes of an advance marker.
-pub const ADVANCE_MARKER_TAG: [u8; 8] = *b"JTMADV01";
+/// First bytes of an advance marker (its second format: the amount on 64
+/// bits, D128 Q2).
+pub const ADVANCE_MARKER_TAG: [u8; 8] = *b"JTMADV02";
 /// First bytes of the marker of an advance's claim transfer.
-pub const ADVANCE_TRANSFER_MARKER_TAG: [u8; 8] = *b"JTMADT01";
-/// The largest burn an advance may cover (spec §4, = the contract's
-/// `SLOW_PER_DEPOSIT` of D72).
-pub const ADVANCE_MAX_AMOUNT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
+pub const ADVANCE_TRANSFER_MARKER_TAG: [u8; 8] = *b"JTMADT02";
+/// The tags of the format of before, refused in any group.
+pub const OBSOLETE_ADVANCE_MARKER_TAG: [u8; 8] = *b"JTMADV01";
+pub const OBSOLETE_ADVANCE_TRANSFER_MARKER_TAG: [u8; 8] = *b"JTMADT01";
+/// The largest burn an advance may cover: the operator's bond (D123), as
+/// the contract's `SLOW_PER_DEPOSIT` and the vault's release window.
+pub const ADVANCE_MAX_AMOUNT_MICRO: u64 = 50_000 * MICRO_PER_JTM;
 /// The advancer's fee at most, in basis points of the burn (`MAX_FILL_FEE_BPS`).
 pub const ADVANCE_MAX_FEE_BPS: u64 = 100;
-/// The advances of one advancer not yet consumed, at most (D72, D107).
-pub const ADVANCE_OUTSTANDING_CAP_MICRO: u64 = 3_000 * MICRO_PER_JTM;
+/// The advances of one advancer not yet consumed, at most (D72, D107; the
+/// bond since D123, as the contract's `ADVANCE_OUTSTANDING_CAP`).
+pub const ADVANCE_OUTSTANDING_CAP_MICRO: u64 = 50_000 * MICRO_PER_JTM;
+/// The commitment bytes an advance marker ends with (they name it).
+pub const ADVANCE_COMMITMENT_BYTES: usize = 8;
 
-// The amount fits the marker's 32 bits.
-const _: () = assert!(ADVANCE_MAX_AMOUNT_MICRO <= u32::MAX as u64);
+// An advance covers a burn the vault can release (B-2 = V6).
+const _: () = assert!(
+    ADVANCE_MAX_AMOUNT_MICRO <= crate::consensus::vault::VAULT_RELEASE_WINDOW_CAP_MICRO
+);
 
-const ADVANCE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE";
-const TRANSFER_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE-CLAIM-TRANSFER";
+const ADVANCE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE/V2";
+const TRANSFER_COMMITMENT_DOMAIN: &[u8] =
+    b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE-CLAIM-TRANSFER/V2";
 
 /// The advance's parameters; [`AdvanceRules::CONSENSUS`] is this build's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +120,8 @@ impl AdvanceRules {
 pub enum AdvanceMarkerKind {
     Advance,
     Transfer,
+    /// A marker of the format of before (`JTMADV01`, `JTMADT01`).
+    Obsolete,
 }
 
 /// The advance marker an owner carries, if any (meaningful only from the
@@ -116,6 +131,9 @@ pub fn advance_marker_kind(owner: &Address) -> Option<AdvanceMarkerKind> {
     match tag {
         ADVANCE_MARKER_TAG => Some(AdvanceMarkerKind::Advance),
         ADVANCE_TRANSFER_MARKER_TAG => Some(AdvanceMarkerKind::Transfer),
+        OBSOLETE_ADVANCE_MARKER_TAG | OBSOLETE_ADVANCE_TRANSFER_MARKER_TAG => {
+            Some(AdvanceMarkerKind::Obsolete)
+        }
         _ => None,
     }
 }
@@ -134,13 +152,19 @@ pub const fn is_advance_locked_address_at(
         owner.0[0], owner.0[1], owner.0[2], owner.0[3], owner.0[4], owner.0[5], owner.0[6],
         owner.0[7],
     ];
-    matches!(tag, ADVANCE_MARKER_TAG | ADVANCE_TRANSFER_MARKER_TAG)
+    matches!(
+        tag,
+        ADVANCE_MARKER_TAG
+            | ADVANCE_TRANSFER_MARKER_TAG
+            | OBSOLETE_ADVANCE_MARKER_TAG
+            | OBSOLETE_ADVANCE_TRANSFER_MARKER_TAG
+    )
 }
 
-/// The marker of an advance of the burn `(n, owner, amount)` by `advancer`.
-/// `amount` must fit 32 bits (every valid advance does).
+/// The marker of an advance of the burn `(n, owner, amount)` by `advancer`:
+/// the tag, `n` and `amount` in clear (64 bits each), then 8 bytes of the
+/// tagged byte-hash of the four.
 pub fn advance_marker(n: u64, owner: &Address, amount: u64, advancer: &Address) -> Address {
-    let amount32 = u32::try_from(amount).unwrap_or(u32::MAX);
     let mut fields = [0u8; 8 + 32 + 8 + 32];
     fields[..8].copy_from_slice(&n.to_le_bytes());
     fields[8..40].copy_from_slice(&owner.0);
@@ -150,8 +174,8 @@ pub fn advance_marker(n: u64, owner: &Address, amount: u64, advancer: &Address) 
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&ADVANCE_MARKER_TAG);
     out[8..16].copy_from_slice(&n.to_le_bytes());
-    out[16..20].copy_from_slice(&amount32.to_le_bytes());
-    out[20..].copy_from_slice(&commitment[..12]);
+    out[16..24].copy_from_slice(&amount.to_le_bytes());
+    out[24..].copy_from_slice(&commitment[..ADVANCE_COMMITMENT_BYTES]);
     Address(out)
 }
 
@@ -161,16 +185,14 @@ pub fn advance_marker_fields(owner: &Address) -> Option<(u64, u64)> {
     (advance_marker_kind(owner) == Some(AdvanceMarkerKind::Advance)).then(|| {
         (
             u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")),
-            u64::from(u32::from_le_bytes(
-                owner.0[16..20].try_into().expect("four bytes"),
-            )),
+            u64::from_le_bytes(owner.0[16..24].try_into().expect("eight bytes")),
         )
     })
 }
 
-/// The 12 commitment bytes of an advance marker: what names its advance.
-pub fn advance_marker_commitment(marker: &Address) -> [u8; 12] {
-    marker.0[20..].try_into().expect("twelve bytes")
+/// The commitment bytes of an advance marker: what names its advance.
+pub fn advance_marker_commitment(marker: &Address) -> [u8; ADVANCE_COMMITMENT_BYTES] {
+    marker.0[24..].try_into().expect("eight bytes")
 }
 
 /// The marker of the transfer of the claim of the advance of the burn
@@ -192,16 +214,16 @@ pub fn advance_transfer_marker(
     let commitment = poseidon2b_hash_bytes(TRANSFER_COMMITMENT_DOMAIN, &fields);
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&ADVANCE_TRANSFER_MARKER_TAG);
-    out[8..20].copy_from_slice(&advance_marker_commitment(&advance));
-    out[20..].copy_from_slice(&commitment[..12]);
+    out[8..16].copy_from_slice(&advance_marker_commitment(&advance));
+    out[16..].copy_from_slice(&commitment[..16]);
     Address(out)
 }
 
 /// The commitment bytes of the advance marker a transfer marker names; `None`
 /// for any other owner.
-pub fn advance_transfer_marker_advance(owner: &Address) -> Option<[u8; 12]> {
+pub fn advance_transfer_marker_advance(owner: &Address) -> Option<[u8; ADVANCE_COMMITMENT_BYTES]> {
     (advance_marker_kind(owner) == Some(AdvanceMarkerKind::Transfer))
-        .then(|| owner.0[8..20].try_into().expect("twelve bytes"))
+        .then(|| owner.0[8..16].try_into().expect("eight bytes"))
 }
 
 /// The key of an advance (D114, D72's tuple): the burn it advances.
@@ -278,7 +300,7 @@ impl AdvanceEntry {
 pub struct AdvanceBook {
     entries: BTreeMap<AdvanceKey, AdvanceEntry>,
     /// The commitment bytes of each advance's marker.
-    by_marker: BTreeMap<[u8; 12], AdvanceKey>,
+    by_marker: BTreeMap<[u8; ADVANCE_COMMITMENT_BYTES], AdvanceKey>,
     /// By the advancer's owner bytes.
     outstanding: BTreeMap<[u8; 32], u64>,
 }
@@ -307,7 +329,10 @@ impl AdvanceBook {
     }
 
     /// The advance whose marker has the commitment bytes `commitment`.
-    pub fn by_marker(&self, commitment: &[u8; 12]) -> Option<(AdvanceKey, &AdvanceEntry)> {
+    pub fn by_marker(
+        &self,
+        commitment: &[u8; ADVANCE_COMMITMENT_BYTES],
+    ) -> Option<(AdvanceKey, &AdvanceEntry)> {
         let key = self.by_marker.get(commitment)?;
         self.entries.get(key).map(|entry| (*key, entry))
     }
@@ -441,6 +466,8 @@ pub enum AdvanceError {
     TransferNotByCreditor { group: usize, n: u64 },
     /// A second transfer of one advance in the block.
     TransferredTwice { n: u64 },
+    /// A group carries an advance marker of the format of before.
+    ObsoleteAdvanceMarker { group: usize },
 }
 
 impl AdvanceError {
@@ -520,13 +547,22 @@ impl<'a> AdvanceCheck<'a> {
         let Some(&(_, first_kind)) = markers.first() else {
             return Ok(());
         };
+        // D128 Q2: the format of before is refused wherever it appears.
+        if markers
+            .iter()
+            .any(|(_, kind)| *kind == AdvanceMarkerKind::Obsolete)
+        {
+            return Err(AdvanceError::ObsoleteAdvanceMarker { group: index });
+        }
         // V5: no value on either marker.
         if markers.iter().any(|(i, _)| outputs[*i].1 != 0) {
             return Err(AdvanceError::MarkerCarriesValue { group: index });
         }
         let shape_error = |kind| match kind {
-            AdvanceMarkerKind::Advance => AdvanceError::AdvanceShape { group: index },
             AdvanceMarkerKind::Transfer => AdvanceError::TransferShape { group: index },
+            AdvanceMarkerKind::Advance | AdvanceMarkerKind::Obsolete => {
+                AdvanceError::AdvanceShape { group: index }
+            }
         };
         // The shape: the payee, the group's one marker, at most one change
         // back to the spender; never spent from the vault.
@@ -548,8 +584,10 @@ impl<'a> AdvanceCheck<'a> {
             return Err(shape_error(kind));
         }
         match kind {
-            AdvanceMarkerKind::Advance => self.advance(index, from, payee, paid, marker),
             AdvanceMarkerKind::Transfer => self.transfer(index, from, payee, marker),
+            AdvanceMarkerKind::Advance | AdvanceMarkerKind::Obsolete => {
+                self.advance(index, from, payee, paid, marker)
+            }
         }
     }
 

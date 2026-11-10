@@ -1319,7 +1319,7 @@ fn a_snapshot_reads_for_an_advance_only_the_transfers_made_after_it() {
     let at = |h: u64| h * 10 - 3;
     let live = entry_of(PAYER, ALICE, 5 * JTM);
     let mut stale_transfer = entry_of(BOB, BOB, JTM).transfer_marker(6, &CAROL_ADDR);
-    stale_transfer.0[8..20].copy_from_slice(&live.marker(3).0[20..]);
+    stale_transfer.0[8..16].copy_from_slice(&live.marker(3).0[24..]);
     let slots = vec![(stale_transfer, at(HB + 1)), (live.marker(3), at(HB + 2))];
     let file = DestinationSnapshotFile {
         committee_updates: Vec::new(),

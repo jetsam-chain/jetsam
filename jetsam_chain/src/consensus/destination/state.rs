@@ -2545,6 +2545,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 Some(super::advance::AdvanceMarkerKind::Transfer) => {
                     self.transfer_markers.push((creation_id, *owner));
                 }
+                Some(super::advance::AdvanceMarkerKind::Obsolete) => {}
                 None => match fast_marker_kind(owner) {
                     Some(FastMarkerKind::Contradiction) => {
                         self.contradiction_markers.push((creation_id, *owner));
@@ -2857,7 +2858,8 @@ impl<'a> SnapshotDestinationCheck<'a> {
             .ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
         // The live advances' markers, by commitment bytes: `(creation id,
         // marker)`.
-        let mut live: BTreeMap<[u8; 12], (u64, Address)> = BTreeMap::new();
+        let mut live: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], (u64, Address)> =
+            BTreeMap::new();
         for (id, marker) in self.advance_markers.iter().filter(|(id, _)| *id > floor) {
             let (n, _) = advance_marker_fields(marker).expect("an advance marker");
             if self.released.contains(n) {
