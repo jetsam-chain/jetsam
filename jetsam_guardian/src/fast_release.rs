@@ -646,7 +646,7 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
             "fast-release --key <secret file> --l1 <url> --base <url> --base <url> [--base <url>…] --node <url> \
-             --finality <file: hex of the finality update's payload> --game-index <i> --n <n> --owner <address> \
+             (--finality <file: hex of the finality update's payload> | --beacon <url>) --game-index <i> --n <n> --owner <address> \
              --amount <µJTM> [--capture-dir <dir>] [--dry-run --out <file>]"
         )
     };
@@ -720,8 +720,19 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
         bridge: bridge.address,
     };
     // 1. The L1 block: the one the finality update names (the node verifies its signature).
-    let finality_path = value("--finality").ok_or_else(usage)?;
-    let finality = crate::base_capture::hex_bytes(std::fs::read_to_string(&finality_path)?.trim())?;
+    let finality = match (value("--finality"), value("--beacon")) {
+        (Some(path), _) => crate::base_capture::hex_bytes(std::fs::read_to_string(&path)?.trim())?,
+        (None, Some(url)) => crate::light_feed::fetch_finality(
+            &crate::light_feed::HttpBeacon {
+                url,
+                egress: crate::rpc::Egress::Clearnet,
+            },
+            &l1,
+            crate::light_feed::SEPOLIA_GLOAS_FORK_EPOCH,
+        )
+        .map_err(|e| alert(format!("no finality update: {e:#}")))?,
+        (None, None) => return Err(usage()),
+    };
     let update = LightClientFinalityUpdate::decode_payload(&finality)
         .map_err(|e| alert(format!("the finality update does not decode: {e:?}")))?;
     let l1_block = finalized_execution(&update).map_err(|e| {
@@ -789,15 +800,30 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
     };
     let objects = assemble(&finality, &proof, &capture, &burn, &attestation, &rules)
         .map_err(|why| alert(format!("game #{index}, burn {}: {why}", burn.n)))?;
-    // 4. The release group from the vault.
-    let reads = read_node(&node, &burn, &rules.vault.vault)?;
+    let summary = release_with(&node, &rules, &objects, &burn, if dry_run { out.as_deref() } else { None })
+        .map_err(|e| alert(format!("{e:#}")))?;
+    say(&format!(
+        "{} {summary}",
+        if dry_run { "DRY RUN, NOT SENT:" } else { "SENT fast release" }
+    ));
+    Ok(())
+}
+
+/// The release group of `objects` from the vault (the payee of `getAdvances`,
+/// `amount − R`, the fast lane's marker, the change), checked against the
+/// block's gate, proven, then the intent handed to `node` — or, given
+/// `dry_out`, written there and not sent. What was done, as JSON.
+pub fn release_with(
+    node: &crate::rpc::NodeClient,
+    rules: &DestinationRules,
+    objects: &FastReleaseObjects,
+    burn: &Burn,
+    dry_out: Option<&std::path::Path>,
+) -> anyhow::Result<Value> {
+    let reads = read_node(node, burn, &rules.vault.vault)?;
     let vault_rules = rules.vault.at(reads.tip.saturating_add(1));
-    let inputs = select_vault_slots(&reads.slots, reads.floor, burn.amount).ok_or_else(|| {
-        alert(format!(
-            "the vault's slots do not cover {} µJTM",
-            burn.amount
-        ))
-    })?;
+    let inputs = select_vault_slots(&reads.slots, reads.floor, burn.amount)
+        .ok_or_else(|| anyhow!("the vault's slots do not cover {} µJTM", burn.amount))?;
     let (pages, fee) = fast_release_group(
         &objects.release,
         objects.game.l2_block_number,
@@ -808,11 +834,11 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
         &vault_rules,
         reads.floor,
     )
-    .map_err(|e| alert(format!("the release group: {e:#}")))?;
+    .context("the release group")?;
     let payment = prove_vault_group(pages)?;
     let txid = hex::encode(payment.logical_txid().0);
-    let intent = fast_release_intent(&objects, payment)?;
-    let summary = json!({
+    let intent = fast_release_intent(objects, payment)?;
+    let mut summary = json!({
         "game": format!("0x{}", hex::encode(objects.game.game)),
         "l2_block": objects.game.l2_block_number,
         "l1_block": objects.l1.block_number,
@@ -824,23 +850,14 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
         "txid": txid,
         "intent_bytes": intent.len(),
     });
-    // 5. To the node, or nowhere.
-    if dry_run {
-        let out = out.expect("checked above");
-        std::fs::write(&out, hex::encode(&intent))?;
-        say(&format!(
-            "DRY RUN, NOT SENT: {summary} written to {}",
-            out.display()
-        ));
-        return Ok(());
+    if let Some(out) = dry_out {
+        std::fs::write(out, hex::encode(&intent))?;
+        summary["written_to"] = json!(out.display().to_string());
+        return Ok(summary);
     }
-    match node.call("submitDestinationObject", json!([hex::encode(&intent)])) {
-        Ok(admitted) => {
-            say(&format!("SENT fast release {summary}: {admitted}"));
-            Ok(())
-        }
-        Err(e) => Err(alert(format!(
-            "the node refused fast release {summary}: {e:#}"
-        ))),
-    }
+    let admitted = node
+        .call("submitDestinationObject", json!([hex::encode(&intent)]))
+        .with_context(|| format!("the node refused fast release {summary}"))?;
+    summary["admitted"] = admitted;
+    Ok(summary)
 }

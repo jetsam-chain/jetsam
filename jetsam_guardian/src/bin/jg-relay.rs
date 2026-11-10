@@ -988,6 +988,14 @@ fn run() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("fast-release") {
         return jetsam_guardian::fast_release::fast_release_cli(&args[2..]);
     }
+    // The fast lane run for real: burns, captures at once, fast releases, contradictions; and the cold
+    // key's revocation of the relay key.
+    if args.get(1).map(String::as_str) == Some("fast-run") {
+        return jetsam_guardian::fast_run::run_cli(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("fast-revoke") {
+        return jetsam_guardian::fast_run::revoke_cli(&args[2..]);
+    }
     // The light client of the L1: the committee updates the relay's node needs (and the anchor check).
     if args.get(1).map(String::as_str) == Some("light-feed") {
         return jetsam_guardian::light_feed::feed_cli(&args[2..]);

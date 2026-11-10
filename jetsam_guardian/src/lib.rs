@@ -35,6 +35,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod fast;
 pub mod fast_release;
+pub mod fast_run;
 pub mod feed;
 pub mod fill;
 pub mod harden;
