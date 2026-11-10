@@ -235,6 +235,21 @@ fn the_highest_stable_point_is_finalized_first_and_younger_ones_wait() {
     assert_eq!(finalize_order(&known, &some, GL, 500, 0, now), vec![p1], "canonical only");
 }
 
+/// TN1: the relayer finalizes a point exactly when the contract of its network allows it: 1 h after its
+/// acceptance on the test chain, 24 h elsewhere; the tree of a final point waits twice that.
+#[test]
+fn tn1_a_point_is_finalized_after_the_slow_delay_of_the_network() {
+    let d = if jetsam_vault_rule::TESTNET_PROFILE { 3_600 } else { 86_400 };
+    assert_eq!((D_SLOW, TREE_WAIT_SECS), (d, 2 * d));
+    let c = testkit::chain(50, 1);
+    let (gid, _) = genesis_known(&c);
+    let (p1, k1) = known_at(&c, 30, gid, &[], 1_000);
+    let known = HashMap::from([(p1, k1)]);
+    let all: HashSet<[u8; 32]> = [p1].into();
+    assert!(finalize_order(&known, &all, GL, 500, 0, 1_000 + d - 1).is_empty(), "one second early");
+    assert_eq!(finalize_order(&known, &all, GL, 500, 0, 1_000 + d), vec![p1], "at the delay");
+}
+
 #[test]
 fn a_freeze_holds_every_clock_until_d_slow_after_its_end() {
     // the contract (v3-tn 80945c3): stable since max(acceptedAt, lastSwitchAt, pausedUntil), refused while frozen

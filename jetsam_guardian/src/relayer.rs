@@ -45,8 +45,10 @@ use crate::checkpoint::{deposit_leaf, public_values, Checkpoint, Deposit, Mn};
 use crate::fill::FoundDeposit;
 use crate::u256;
 
-/// `D_SLOW` of the contract: the only finality, 24 h after acceptance and after the last switch.
-pub const D_SLOW: u64 = 86_400;
+/// `D_SLOW` of the contract: the only finality, 24 h after acceptance and after the last switch; 1 h on the test
+/// chain (TN1: its bridge fixes `D_SLOW` = 3 600 s from its network), the profile of this build
+/// (`jetsam_vault_rule::TESTNET_PROFILE`, the node's `jetsam_chain/testnet`).
+pub const D_SLOW: u64 = if jetsam_vault_rule::TESTNET_PROFILE { 3_600 } else { 86_400 };
 /// MN-5 of the contract: from this many seconds after the fork base, the new blocks must carry at least
 /// 4/10 of the work their base's target produces in the elapsed time (`BLOCK_TIME` 180 s).
 pub const MN5_MIN_ELAPSED: u64 = 1_800;

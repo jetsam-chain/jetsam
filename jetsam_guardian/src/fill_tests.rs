@@ -1539,14 +1539,33 @@ fn a5_1_a_deposit_already_under_the_contracts_tip_is_not_advanced() {
 /// A5-1: the robot's rule keeps its fee only under a contract that repays the fee of an advance at least 24 h old
 /// at its mint (`D_SLOW`: an advance made before the point that covers its deposit was accepted always is): it reads
 /// `ADVANCE_MIN_AGE()` at start and does not start under another.
+/// TN1: the 24 h are the bridge's `D_SLOW`, 1 h on the test chain (`tn1_…` below).
 #[test]
 fn a5_1_the_bridge_must_keep_the_fee_of_an_advance_of_24_hours_only() {
-    assert_eq!(ADVANCE_MIN_AGE, 86_400);
+    let d = if jetsam_vault_rule::TESTNET_PROFILE { 3_600 } else { 86_400 };
+    assert_eq!(ADVANCE_MIN_AGE, d);
     assert_eq!(ADVANCE_MIN_AGE, crate::relayer::D_SLOW);
-    assert!(check_advance_min_age(86_400).is_ok());
-    for bad in [7_200, 86_399, 86_401, 0, u64::MAX] {
+    assert!(check_advance_min_age(d).is_ok());
+    for bad in [7_200, d - 1, d + 1, 0, u64::MAX] {
         let e = check_advance_min_age(bad).unwrap_err().to_string();
         assert!(e.contains("ADVANCE_MIN_AGE") && e.contains("does not start"), "{bad}: {e}");
+    }
+}
+
+/// TN1: the test chain's bridge waits 1 h (`D_SLOW` = 3 600 s), every other network's 24 h: jg-fill of the test
+/// profile starts only under a bridge whose `ADVANCE_MIN_AGE()` is 3 600, any other build only under 86 400.
+#[test]
+fn tn1_jg_fill_counts_on_the_slow_delay_of_its_network() {
+    if jetsam_vault_rule::TESTNET_PROFILE {
+        assert_eq!((ADVANCE_MIN_AGE, crate::relayer::D_SLOW), (3_600, 3_600));
+        assert!(check_advance_min_age(3_600).is_ok());
+        let e = check_advance_min_age(86_400).unwrap_err().to_string();
+        assert!(e.contains("is 86400 s, not 3600") && e.contains("does not start"), "{e}");
+    } else {
+        assert_eq!((ADVANCE_MIN_AGE, crate::relayer::D_SLOW), (86_400, 86_400));
+        assert!(check_advance_min_age(86_400).is_ok());
+        let e = check_advance_min_age(3_600).unwrap_err().to_string();
+        assert!(e.contains("is 3600 s, not 86400") && e.contains("does not start"), "{e}");
     }
 }
 
