@@ -1134,8 +1134,11 @@ fn a_public_network_refuses_the_clear_and_any_source_off_tor_or_the_loopback() {
     // a node on the bridge, or the L1 in the clear: refused before any socket
     let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", "http://10.77.0.12:19801"], "http://127.0.0.1:8545", "")).unwrap_err().to_string();
     assert!(e.contains("nodes[1]") && e.contains("does not start"), "{e}");
-    let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], "https://l1.example:443", "")).unwrap_err().to_string();
+    let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], "http://l1.example:8545", "")).unwrap_err().to_string();
     assert!(e.contains("l1_rpc") && e.contains("does not start"), "{e}");
+    // C-2 (audit 2026-11-10): a public L1 named in https:// is reached through Tor, TLS end to end: starts
+    let https = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], "https://l1.example:443", "[signer]\npriority_fee_wei = 1000000\n"));
+    assert!(https.is_ok(), "{:?}", https.err());
     // the mainnet refuses the clear too
     let mainnet = hex::encode(crate::MAINNET_NETWORK);
     let e = FillConfig::parse(&fill_toml(&mainnet, 1, REH_BRIDGE, "[egress]\nmode = \"clearnet\"\n", &["http://127.0.0.1:1", "http://127.0.0.1:2"], "http://127.0.0.1:8545", "")).unwrap_err().to_string();

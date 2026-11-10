@@ -76,7 +76,10 @@ pub struct GuardianConfig {
 #[serde(rename_all = "lowercase")]
 pub enum EgressMode {
     /// The default (D60): a source is a loopback IP address (reached
-    /// directly) or a `.onion` address (reached through Tor's SOCKS port);
+    /// directly) or a `.onion` address (reached through Tor's SOCKS port), or
+    /// (C-2, audit 2026-11-10) an `https://` public name, reached through Tor's
+    /// SOCKS port too, the name resolved by Tor and TLS end to end with it (a
+    /// public L1 endpoint without a cleartext relay on the loopback);
     /// anything else refuses to start.
     #[default]
     Onion,

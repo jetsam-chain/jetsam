@@ -384,3 +384,159 @@ fn a_raw_block_is_read_as_bytes_and_none_when_pruned() {
     assert_eq!(c.raw_block(6).unwrap(), None);
     server.join().unwrap();
 }
+
+// ---- C-2 (audit 2026-11-10): a public https:// name through Tor, TLS end to end ----
+
+/// C-2: the onion-only egress hands an `https://` NAME to Tor as a name (Tor resolves it, TLS runs end to end with
+/// the server so named): a public L1 endpoint is reached without a cleartext relay on the loopback. Nothing else
+/// changes: a cleartext name, an https IP literal or .onion, a name without a dot or a malformed one are refused.
+#[test]
+fn c2_onion_egress_sends_an_https_name_to_tor_as_a_name() {
+    let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
+    let e = Egress::onion("127.0.0.1:9050").unwrap();
+    assert_eq!(e.route("https://mainnet.base.org").unwrap(), Route::Socks { proxy, host: "mainnet.base.org".into(), port: 443 });
+    assert_eq!(
+        e.route("https://base-rpc.publicnode.com:8443/x").unwrap(),
+        Route::Socks { proxy, host: "base-rpc.publicnode.com".into(), port: 8443 }
+    );
+    let a = onion('a');
+    for url in [
+        "http://mainnet.base.org".to_string(),
+        "https://127.0.0.1:8545".into(),
+        "https://203.0.113.7".into(),
+        "https://[::1]:8545".into(),
+        "https://localhost:8545".into(),
+        format!("https://{a}"),
+        "https://-bad.example".into(),
+        "https://bad..example".into(),
+        "https://under_score.example".into(),
+        "https://example.".into(),
+    ] {
+        let err = e.route(&url).unwrap_err().to_string();
+        assert!(err.contains("onion-only"), "{url}: {err}");
+    }
+}
+
+/// C-2: the private rehearsal's clearnet stays on its bridge and loopback, in http:// only.
+#[test]
+fn c2_the_private_bridge_takes_no_https() {
+    for url in ["https://10.77.0.1:8545", "https://127.0.0.1:8545", "https://rpc.example.com"] {
+        assert!(Egress::PrivateBridge.route(url).is_err(), "{url}");
+    }
+}
+
+/// A stream that records every byte it reads (what the fake Tor received after CONNECT).
+struct Recorded {
+    s: std::net::TcpStream,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Read for Recorded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.s.read(buf)?;
+        self.seen.lock().unwrap().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl Write for Recorded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.s.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.s.flush()
+    }
+}
+
+/// A fake Tor SOCKS port whose CONNECT leads to a TLS server holding a test certificate for `cert_name` (trusted by
+/// the returned roots only), answering one JSON-RPC `result`: (host and port of the CONNECT, its address type, the
+/// bytes received after it, the request decrypted).
+#[allow(clippy::type_complexity)]
+fn fake_tls_tor(
+    cert_name: &str,
+    result: Value,
+) -> (std::net::SocketAddr, rustls::RootCertStore, std::thread::JoinHandle<(String, u16, u8, Vec<u8>, String)>) {
+    let ck = rcgen::generate_simple_self_signed(vec![cert_name.to_string()]).unwrap();
+    let cert = ck.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+    let config = std::sync::Arc::new(
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut greeting = [0u8; 3];
+        s.read_exact(&mut greeting).unwrap();
+        s.write_all(&[5, 0]).unwrap();
+        let mut head = [0u8; 5];
+        s.read_exact(&mut head).unwrap();
+        let mut rest = vec![0u8; head[4] as usize + 2];
+        s.read_exact(&mut rest).unwrap();
+        let host = String::from_utf8(rest[..head[4] as usize].to_vec()).unwrap();
+        let port = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
+        s.write_all(&[5, 0, 0, 1, 10, 0, 0, 1, 0x1f, 0x90]).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = Recorded { s, seen: seen.clone() };
+        let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), rec);
+        let mut req = String::new();
+        let mut buf = vec![0u8; 4096];
+        while !req.contains("\"params\"") {
+            match tls.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => req.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        if req.contains("\"params\"") {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+            let _ = write!(tls, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+        let raw = seen.lock().unwrap().clone();
+        (host, port, head[3], raw, req)
+    });
+    (addr, roots, h)
+}
+
+/// C-2: an https:// call through Tor: the name reaches Tor as a name (address type 3), the bytes after the CONNECT
+/// are a TLS handshake and never the request in the clear, and the server is checked under that name.
+#[test]
+fn c2_an_https_call_through_tor_is_tls_end_to_end_with_the_name_unresolved() {
+    let (proxy, roots, server) = fake_tls_tor("rpc.example.com", json!("0x2105"));
+    let e = Egress::Onion { socks: proxy };
+    let v = with_test_roots(roots, || call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)));
+    assert_eq!(v.unwrap(), json!("0x2105"));
+    let (host, port, atyp, raw, req) = server.join().unwrap();
+    assert_eq!((host.as_str(), port, atyp), ("rpc.example.com", 443, 3), "the name reaches Tor as a name");
+    assert_eq!(raw.first(), Some(&0x16), "a TLS handshake first");
+    assert!(!raw.windows(11).any(|w| w == b"eth_chainId"), "never the request in the clear");
+    assert!(req.starts_with("POST / HTTP/1.1\r\n") && req.contains("Host: rpc.example.com\r\n") && req.contains("eth_chainId"), "{req}");
+}
+
+/// C-2: a server whose certificate is not for the name asked (or not under the trusted roots) gets no request.
+#[test]
+fn c2_an_https_server_of_another_name_gets_no_request() {
+    let (proxy, roots, server) = fake_tls_tor("other.example.com", json!(1));
+    let e = Egress::Onion { socks: proxy };
+    let err = with_test_roots(roots, || call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)))
+        .unwrap_err()
+        .to_string();
+    assert!(err.to_lowercase().contains("certificate"), "{err}");
+    let (_, _, _, raw, req) = server.join().unwrap();
+    assert!(req.is_empty(), "no request decrypted: {req}");
+    assert!(!raw.windows(11).any(|w| w == b"eth_chainId"), "never the request in the clear");
+    // and without the test roots, the web's roots do not trust the test certificate either
+    let (proxy, _, server) = fake_tls_tor("rpc.example.com", json!(1));
+    let e = Egress::Onion { socks: proxy };
+    assert!(call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)).is_err());
+    assert!(server.join().unwrap().4.is_empty());
+}
