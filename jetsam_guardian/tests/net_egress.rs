@@ -1008,7 +1008,7 @@ fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
     stop(robot);
     let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
     assert!(stepped && paused && lifted, "stepped {stepped}, paused {paused}, lifted {lifted}; log:\n{log}");
-    assert_eq!(log.matches("ALERT the hot key holds 1200000001").count(), 1, "one alert per crossing:\n{log}");
+    assert_eq!(log.matches(&format!("ALERT the hot key holds {}", cap + 1)).count(), 1, "one alert per crossing:\n{log}");
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("PAUSE_STOCK_ABOVE_CAP"), "{journal}");
 }
