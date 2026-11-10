@@ -235,10 +235,10 @@ fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
             height: J + 500,
             n: 1,
             owner: Address([1; 32]),
-            amount: 1_000 * MICRO_PER_JTM,
+            amount: 49_000 * MICRO_PER_JTM,
         });
     state.released.insert(1);
-    // n = 2 (1 600 JTM) waits for the window: n = 3 must not jump it.
+    // n = 2 (1 600 JTM) waits for the window (49 000 + 1 600 > 50 000, D123): n = 3 must not jump it.
     let offer = plan(
         &state,
         Vec::new(),
