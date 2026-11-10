@@ -230,12 +230,26 @@ block or carries at least 40 % of the work its fork base's target produces in th
 purpose: a rate relative to the current target would be an attacker's lever). Burns and releases go on.
 
 What a miner can do to the bridge, with MN-5 (re-audit n°2, §1.4; these replace the "5-10 %" written after A5FIX2):
-**with about 40 % of the reference hashrate, freeze the finality (never steal)**: a real switch abandons the tip's
+**with about 40 % of the reference hashrate, freeze the finality**: a real switch abandons the tip's
 locked block, 10 blocks from its fork base within 4 500 s; **with about 30 %, decanonize points without freezing**:
 shift the tip without abandoning its locked block, 2 blocks + a proof + its inclusion within 1 800 s of the fork
 base (about 15 % with a public orphan exactly at the tip's height). Contract tests
 `test_known_limit_shifting_the_tip_without_a_switch_must_land_within_1800s_of_its_base`,
 `test_known_limit_a_real_switch_needs_ten_blocks_within_4500s_of_its_base`.
+
+**A miner with more than half of the hashrate, held about 25 hours, can steal** (audit 2026-11-10, A-1/A-3; the
+"never steal" written here before was wrong above 50 %). The proof checks the headers' work and the deposit's shape,
+never that its inputs exist: a private branch that outworks the public chain can carry a deposit no Jetsam node
+would accept, and once the bridge's 24 h slow finality has passed on it, its deposits are minted. Bounded by the
+caps, nothing else (D123, figures of 10/11/2026): **at most 50 000 wJTM per 24 h and 50 000 wJTM outstanding**,
+the amount of the operator's bond (50 000 JTM). Its cost is the attacker's rewards on the public chain while it
+mines in private: about 6 600 JTM a day for a 55 % share (480 blocks a day at 25 JTM a block; the share of the
+largest pool measured by the audit of 10/11/2026). **At these caps the theft is worth more than it costs**: what
+stands against it is the majority miner's interest in the network, the pause key (which only delays it: at most
+96 h in 30 days) and the bond, not the code. The same theft needs only about 10 % of the hashrate when no relayer
+submits a point for about 28 hours (A-2). Below 50 %, with a relayer submitting, a branch of the attacker's never
+becomes final (the relayer's heavier branch resets the clock). Keep the largest miner under 50 % before real
+deposits are opened.
 
 ## Proofs and the address (A5-28)
 
