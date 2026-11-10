@@ -566,6 +566,40 @@ pub fn fast_lane_of(
     }
 }
 
+/// `walletBuildDestinationPayment`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationPaymentResponse {
+    /// The proved `PagedSpendIntent`, hex: the payment of the intent the
+    /// caller assembles for `submitDestinationObject`.
+    pub payment_hex: String,
+    pub txid: String,
+    pub fee_micro_jtm: u64,
+    /// The marker it carries, hex.
+    pub marker: String,
+}
+
+/// The marker a `walletBuildDestinationPayment` carries: 32 bytes (hex) of a
+/// destination object a relay pays for — a committee update (`JTMLCU01`),
+/// a contradiction (`JTMFCT01`) or a revocation (`JTMFRV01`) of the fast lane.
+/// Anything else is refused: the wallet never pays a value-0 output to any
+/// other owner.
+pub fn destination_payment_marker(marker: &str) -> Result<Address, String> {
+    let bytes = hex::decode(marker.strip_prefix("0x").unwrap_or(marker))
+        .map_err(|_| "marker: not hex".to_string())?;
+    let owner: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "marker: not 32 bytes".to_string())?;
+    let tag: [u8; 8] = owner[..8].try_into().expect("eight bytes");
+    if tag == jetsam_vault_rule::LIGHT_CLIENT_UPDATE_MARKER_TAG
+        || tag == jetsam_chain::consensus::destination::fast::FAST_CONTRADICTION_MARKER_TAG
+        || tag == jetsam_chain::consensus::destination::fast::FAST_REVOCATION_MARKER_TAG
+    {
+        Ok(Address(owner))
+    } else {
+        Err("marker: not a committee update's, a contradiction's or a revocation's".into())
+    }
+}
+
 #[cfg(test)]
 mod fast_lane_tests {
     use super::*;
@@ -576,6 +610,32 @@ mod fast_lane_tests {
     /// `getFastLane` reads the tip's fast lane: records with what a
     /// contradiction's marker commits to, closed keys, the deficit; the kinds
     /// `submitDestinationObject` answers for the fast lane.
+    #[test]
+    fn a_destination_payment_carries_only_a_relays_object_marker() {
+        let tagged = |tag: &[u8; 8]| {
+            let mut owner = [0x5a; 32];
+            owner[..8].copy_from_slice(tag);
+            owner
+        };
+        for tag in [b"JTMLCU01", b"JTMFCT01", b"JTMFRV01"] {
+            let owner = tagged(tag);
+            assert_eq!(
+                destination_payment_marker(&hex::encode(owner)),
+                Ok(Address(owner))
+            );
+            assert_eq!(
+                destination_payment_marker(&format!("0x{}", hex::encode(owner))),
+                Ok(Address(owner))
+            );
+        }
+        // A release's, an advance's, a client object's or any owner: never.
+        for tag in [b"JTMVRL01", b"JTMADV02", b"JTMREL01", b"JTMLCU02", b"\0\0\0\0\0\0\0\0"] {
+            assert!(destination_payment_marker(&hex::encode(tagged(tag))).is_err());
+        }
+        assert!(destination_payment_marker(&hex::encode([0x4a; 31])).is_err());
+        assert!(destination_payment_marker("zz").is_err());
+    }
+
     #[test]
     fn rpc_get_fast_lane_reports_the_branchs_fast_lane() {
         let mut rules = DestinationRules::CONSENSUS;

@@ -359,6 +359,19 @@ pub trait JetsamApi {
         fee_micro_jtm: Option<u64>,
     ) -> RpcResult<crate::guardian::GuardianPaymentResponse>;
 
+    /// v1.7 (fast lane): build and prove, with the active wallet, the
+    /// transaction carrying the marker of a destination object a relay pays
+    /// for — a committee update (`JTMLCU01`), a contradiction (`JTMFCT01`) or
+    /// a revocation (`JTMFRV01`): the marker (value 0), then the change. Not
+    /// submitted: the caller assembles the intent for
+    /// `submitDestinationObject`. Its inputs stay reserved until mined.
+    #[method(name = "walletBuildDestinationPayment")]
+    async fn wallet_build_destination_payment(
+        &self,
+        marker: String,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse>;
+
     /// v1.7 (F4): the deposit `walletBridgeDeposit` would build now, from the
     /// active address to the bridge vault for the Base/EVM `recipient` (`0x`
     /// and 40 hex digits; mixed case must match its checksum): fee
