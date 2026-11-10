@@ -19618,25 +19618,22 @@ async fn handle_p2p_events(
                     )
                 };
                 let cold_headers = (!header_dag_faulted).then_some(&header_dag);
+                let tip_authority = *initial_sync_ready.borrow() && snapshot_rebase_hint.is_none();
                 ballot.retain(|(generation, peer, manifest, rebase_anchor)| {
-                    let validated_view = (*initial_sync_ready.borrow()
-                        && rebase_anchor.is_none()
-                        && snapshot_rebase_hint.is_none()
-                        && !header_dag_faulted)
-                        .then_some(&header_dag);
-                    *generation == snapshot_sync_generation
-                        && manifest.tip_height > close_tip.height
-                        && judge_snapshot_manifest(
-                            manifest,
-                            jetsam_chain::consensus::params::HARD_CHECKPOINTS,
-                            &peer_chain_evidence,
-                            peer,
-                            now,
-                            close_tip,
-                            &close_work,
-                            validated_view,
-                            cold_headers,
-                        ) == ManifestCandidacy::Admit
+                    cold_offer_admitted_at_close(
+                        *generation,
+                        peer,
+                        manifest,
+                        rebase_anchor.is_some(),
+                        snapshot_sync_generation,
+                        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+                        &peer_chain_evidence,
+                        cold_headers,
+                        tip_authority,
+                        close_tip,
+                        &close_work,
+                        now,
+                    )
                 });
                 let offers = ballot
                     .iter()
@@ -20458,7 +20455,7 @@ fn learn_from_failed_snapshot_claim<H>(
     match staging.next_height() {
         Ok(next_height) => {
             let staged_tip = next_height.saturating_sub(1);
-            if !gap_requires_snapshot_sync(local_height, staged_tip) {
+            if stalled_plan_draws_a_ceiling(local_height, staged_tip) {
                 evidence.mark_unserved_ceiling(staged_tip, now);
             }
         }
@@ -20480,6 +20477,56 @@ fn staged_chain_holds_the_claimed_boundary(
     staging
         .matches_exact_point(claim.tip_height, claim.tip_hash, claim.cumulative_chainwork)
         .unwrap_or(false)
+}
+
+/// S-1 (audit 2026-11-10): whether an unverified plan that stalled once its
+/// validated headers reached `staged_tip` draws the ceiling of
+/// [`peer_chain_evidence::PeerChainEvidence::mark_unserved_ceiling`]: only
+/// within direct reach of the local tip (`local_height`) — a restarted seed,
+/// which needs no snapshot to catch up. Never a snapshot gap away: a node far
+/// behind needs the snapshot, and the real boundaries it waits for are the
+/// ones its staged headers just validated.
+fn stalled_plan_draws_a_ceiling(local_height: u64, staged_tip: u64) -> bool {
+    !gap_requires_snapshot_sync(local_height, staged_tip)
+}
+
+/// S-1 (audit 2026-11-10): whether an offer of a cold node's election is still
+/// a candidate when the window closes: of the current snapshot generation,
+/// still above the local tip, and admitted by [`judge_snapshot_manifest`] on
+/// what the node knows at the close — with tip authority gained meanwhile
+/// (`tip_authority`: initial sync done, no rebase armed; the offer itself
+/// asked for no rebase anchor), the synced node's rule applies.
+#[allow(clippy::too_many_arguments)]
+fn cold_offer_admitted_at_close(
+    generation: u64,
+    sender: &libp2p::PeerId,
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    asks_a_rebase: bool,
+    current_generation: u64,
+    pins: &[(u64, [u8; 32])],
+    evidence: &peer_chain_evidence::PeerChainEvidence<HeldSnapshotManifest>,
+    validated_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    tip_authority: bool,
+    close_tip: jetsam_node::networking::ChainPoint,
+    close_work: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let validated_view = (tip_authority && !asks_a_rebase)
+        .then_some(validated_headers)
+        .flatten();
+    generation == current_generation
+        && manifest.tip_height > close_tip.height
+        && judge_snapshot_manifest(
+            manifest,
+            pins,
+            evidence,
+            sender,
+            now,
+            close_tip,
+            close_work,
+            validated_view,
+            validated_headers,
+        ) == ManifestCandidacy::Admit
 }
 
 /// v1.5.1 — how long a snapshot plan that has verified nothing may go
@@ -21220,6 +21267,54 @@ mod divergent_branch_capture_tests {
                 ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
             );
         }
+    }
+
+    /// S-1: a seed restarted on the tip. A peer offered a boundary 8 above
+    /// it during the election window and was admitted cold; meanwhile a tip
+    /// probe confirmed the seed's tip (tip authority), and the offer was
+    /// still planned when the window closed — its staging held the seed's
+    /// imports until its stall. Every offer is judged again at the close, on
+    /// what the node knows then.
+    #[test]
+    fn s1_a_cold_offer_is_judged_again_when_the_election_closes() {
+        let (dag, headers) = validated_chain(60);
+        let tip = headers[59].point();
+        let local_work = headers[59].cumulative_work;
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let peer = libp2p::PeerId::random();
+        let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
+        assert_eq!(
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None, None),
+            ManifestCandidacy::Admit,
+            "admitted while cold"
+        );
+        let at_close = |generation: u64, rebase: bool, authority: bool, close_tip: ChainPoint| {
+            cold_offer_admitted_at_close(
+                generation, &peer, &mseed2, rebase, 7, &[], &evidence, Some(&dag), authority, close_tip,
+                &local_work, now,
+            )
+        };
+        assert!(!at_close(7, false, true, tip), "tip authority gained during the window");
+        assert!(at_close(7, false, false, tip), "still cold: staging will judge it");
+        assert!(at_close(7, true, true, tip), "an offer that asks a rebase is judged as on arrival");
+        assert!(!at_close(6, false, false, tip), "another generation");
+        assert!(!at_close(7, false, false, ChainPoint::new(68, [0xB2; 32])), "no longer above the tip");
+    }
+
+    /// S-1: the ceiling drawn after a stall holds only within direct reach of
+    /// the local tip (a restarted seed, which needs no snapshot). A new node
+    /// a snapshot gap behind gets none: it needs the snapshot, and the real
+    /// boundaries it waits for are just below the headers its stalled plan
+    /// validated.
+    #[test]
+    fn s1_a_stall_a_snapshot_gap_below_the_real_tip_draws_no_ceiling() {
+        let reach = jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000), "a seed restarted on the tip");
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_005));
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000 + reach));
+        assert!(!stalled_plan_draws_a_ceiling(46_000, 46_000 + reach + 1));
+        assert!(!stalled_plan_draws_a_ceiling(0, 50_000), "a new node");
     }
 
     /// S-1: on a cold node a provider ended its own plan whenever it chose,
