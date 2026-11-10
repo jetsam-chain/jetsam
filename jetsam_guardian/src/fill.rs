@@ -1118,8 +1118,9 @@ pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
 /// A5-1 (contract revised): an advance younger than this at the mint of its deposit is repaid what it paid only,
 /// its fee going to the recipient. `D_SLOW` (24 h): an advance made before the acceptance of the point that covers
 /// its deposit is always that old at the mint (finality is 24 h after acceptance at the earliest), one made after it
-/// may not be — hence the robot's rule `ALREADY_UNDER_A_POINT` ([`plan`]).
-pub const ADVANCE_MIN_AGE: u64 = 86_400;
+/// may not be — hence the robot's rule `ALREADY_UNDER_A_POINT` ([`plan`]). TN1: the bridge's `D_SLOW` of this
+/// build's network, 1 h on the test chain.
+pub const ADVANCE_MIN_AGE: u64 = crate::relayer::D_SLOW;
 
 /// A5-1: `ADVANCE_MIN_AGE()` read on the bridge is the 24 h the robot's rule counts on (with 2 h, an advance at
 /// `finality − 2 h` keeps its fee: the rent the revision closes), or jg-fill does not start.

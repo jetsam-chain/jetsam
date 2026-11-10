@@ -45,8 +45,10 @@ use crate::checkpoint::{deposit_leaf, public_values, Checkpoint, Deposit, Mn};
 use crate::fill::FoundDeposit;
 use crate::u256;
 
-/// `D_SLOW` of the contract: the only finality, 24 h after acceptance and after the last switch.
-pub const D_SLOW: u64 = 86_400;
+/// `D_SLOW` of the contract: the only finality, 24 h after acceptance and after the last switch; 1 h on the test
+/// chain (TN1: its bridge fixes `D_SLOW` = 3 600 s from its network), the profile of this build
+/// (`jetsam_vault_rule::TESTNET_PROFILE`, the node's `jetsam_chain/testnet`).
+pub const D_SLOW: u64 = if jetsam_vault_rule::TESTNET_PROFILE { 3_600 } else { 86_400 };
 /// MN-5 of the contract: from this many seconds after the fork base, the new blocks must carry at least
 /// 4/10 of the work their base's target produces in the elapsed time (`BLOCK_TIME` 180 s).
 pub const MN5_MIN_ELAPSED: u64 = 1_800;
@@ -1263,25 +1265,73 @@ impl Prover for MockProver {
     }
 }
 
-/// TEST ONLY (D103): the empty proof the test bridge's verifier (`Sp1EmptyProofTestVerifier`) accepts, the
-/// public values checked natively before (`native_check`, mandatory here). The relayer refuses it off the
-/// public test network over Base Sepolia.
-pub struct EmptyTestProver;
+/// A-7 (audit 2026-11-10): the domain of the digest the test bridge's verifier (`Sp1RelaySignedTestVerifier.DOMAIN`)
+/// checks: keccak256("jetsam-bridge/v3 TEST verifier: relay-signed proofs").
+pub const SIGNED_TEST_DOMAIN: [u8; 32] = [
+    0x46, 0xb4, 0xa8, 0x5e, 0x46, 0x89, 0x78, 0x6e, 0x21, 0xf5, 0xe8, 0x65, 0xa7, 0xbf, 0x5f, 0xe9, 0x9e, 0x5c, 0x22, 0x5d, 0x0b, 0x10,
+    0x6d, 0xae, 0xa0, 0xb9, 0x37, 0x87, 0x81, 0x0f, 0x0e, 0x5f,
+];
 
-impl Prover for EmptyTestProver {
-    fn prove(&self, _req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-    fn prove_claim(&self, _req: &ClaimRequest) -> anyhow::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-    fn name(&self) -> String {
-        "empty proof (TEST verifier only)".into()
+/// A-7: what the relayer signs for a proof of the program `vkey` with `public_values`:
+/// keccak256(SIGNED_TEST_DOMAIN ‖ vkey ‖ public values) (`Sp1RelaySignedTestVerifier.digest`).
+pub fn signed_test_digest(vkey: &[u8; 32], public_values: &[u8]) -> [u8; 32] {
+    let mut pre = Vec::with_capacity(64 + public_values.len());
+    pre.extend_from_slice(&SIGNED_TEST_DOMAIN);
+    pre.extend_from_slice(vkey);
+    pre.extend_from_slice(public_values);
+    crate::keccak256(&pre)
+}
+
+/// A-7: the test bridge's proof, 65 bytes r ‖ s ‖ v (v = 27 + parity, low s, RFC 6979) of [`signed_test_digest`].
+pub fn signed_test_proof(key: &crate::l1tx::HotKey, vkey: &[u8; 32], public_values: &[u8]) -> Vec<u8> {
+    let (parity, r, s) = key.sign_prehash(&signed_test_digest(vkey, public_values));
+    let mut proof = Vec::with_capacity(65);
+    proof.extend_from_slice(&r);
+    proof.extend_from_slice(&s);
+    proof.push(27 + parity);
+    proof
+}
+
+/// TEST ONLY (A-7, replacing D103's empty proofs): the proof the test bridge's verifier (`Sp1RelaySignedTestVerifier`)
+/// accepts, this relayer's signature of the public values (checked natively before: `native_check`, mandatory here)
+/// under each program's vkey, read on the bridge at start. Refused off the public test network over Base Sepolia.
+pub struct SignedTestProver {
+    key: crate::l1tx::HotKey,
+    checkpoint_vkey: [u8; 32],
+    claim_vkey: [u8; 32],
+}
+
+impl SignedTestProver {
+    pub fn new(key: crate::l1tx::HotKey, checkpoint_vkey: [u8; 32], claim_vkey: [u8; 32]) -> Self {
+        Self { key, checkpoint_vkey, claim_vkey }
     }
 }
 
-/// The L1 of the test bridge fed empty proofs (D103): Base Sepolia.
-pub const EMPTY_PROOF_L1_CHAIN_ID: u64 = 84_532;
+impl Prover for SignedTestProver {
+    fn prove(&self, req: &ProofRequest) -> anyhow::Result<Vec<u8>> {
+        Ok(signed_test_proof(&self.key, &self.checkpoint_vkey, &req.public_values))
+    }
+    fn prove_claim(&self, req: &ClaimRequest) -> anyhow::Result<Vec<u8>> {
+        Ok(signed_test_proof(&self.key, &self.claim_vkey, &req.public_values))
+    }
+    fn name(&self) -> String {
+        format!("relay-signed proofs (TEST verifier only), key 0x{}", hex::encode(self.key.address()))
+    }
+}
+
+/// A-7: mode "signed-test" starts only when the bridge's test verifier (`relayKey()`, `read`) takes this relayer's key.
+pub fn check_signed_test_key(read: &[u8; 20], mine: &[u8; 20]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read == mine,
+        "the bridge's test verifier takes the signatures of 0x{}, not of this relayer's key 0x{}: jg-relay does not start",
+        hex::encode(read),
+        hex::encode(mine)
+    );
+    Ok(())
+}
+
+/// The L1 of the test bridge fed the relayer's signatures (A-7; D103's empty proofs before): Base Sepolia.
+pub const SIGNED_TEST_L1_CHAIN_ID: u64 = 84_532;
 
 /// The program's input bytes for a request (the checkpoint program's own encoder).
 pub type InputEncoder = fn(&ProofRequest) -> anyhow::Result<Vec<u8>>;
@@ -1398,8 +1448,9 @@ pub fn read_published_final(v: &serde_json::Value) -> anyhow::Result<(Checkpoint
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProverConfig {
-    /// `"command"` (the production prover), `"empty-test"` (the test bridge's empty proofs, the public test
-    /// network over Base Sepolia only, D103) or `"mock"` (the private rehearsal's simulated proofs only).
+    /// `"command"` (the production prover), `"signed-test"` (A-7: the test bridge's proofs, this relayer's
+    /// signatures, the public test network over Base Sepolia only; D103's `"empty-test"` is refused) or `"mock"`
+    /// (the private rehearsal's simulated proofs only).
     pub mode: String,
     /// The command and its arguments; `{input}`, `{proof}`, `{public_values}` are replaced by paths.
     #[serde(default)]
@@ -1531,12 +1582,15 @@ impl RelayConfig {
         match c.prover.mode.as_str() {
             "mock" => anyhow::ensure!(rehearsal, "[prover] mode = \"mock\" (simulated proofs) is refused on {profile}"),
             "command" => anyhow::ensure!(!c.prover.command.is_empty(), "[prover] command is empty"),
-            "empty-test" => anyhow::ensure!(
-                profile == crate::Profile::PublicTestnet && c.l1_chain_id == EMPTY_PROOF_L1_CHAIN_ID,
-                "[prover] mode = \"empty-test\" (empty proofs) is refused on {profile} over L1 {}: the public test network over Base Sepolia only",
+            "signed-test" => anyhow::ensure!(
+                profile == crate::Profile::PublicTestnet && c.l1_chain_id == SIGNED_TEST_L1_CHAIN_ID,
+                "[prover] mode = \"signed-test\" (the relayer's signatures) is refused on {profile} over L1 {}: the public test network over Base Sepolia only",
                 c.l1_chain_id
             ),
-            other => anyhow::bail!("[prover] mode = {other:?}: \"command\", \"empty-test\" or \"mock\""),
+            "empty-test" => anyhow::bail!(
+                "[prover] mode = \"empty-test\" is refused (A-7: the test bridge takes no empty proof, only the relayer's signatures: mode = \"signed-test\")"
+            ),
+            other => anyhow::bail!("[prover] mode = {other:?}: \"command\", \"signed-test\" or \"mock\""),
         }
         anyhow::ensure!(c.prover.native_check || rehearsal, "[prover] native_check = false is refused on {profile}");
         // the point lands before W_STALL: started `ahead` before it is due, proven within the timeout

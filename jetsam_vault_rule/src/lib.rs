@@ -153,7 +153,7 @@ pub struct LegacyDepositCap {
 /// it is `None` a test node judges every block exactly as before. The node (`params::V1_7_TESTNET_CAPS_HEIGHT`)
 /// and the proof program (`jetsam_bridge_program::deposit`, its own `testnet` feature) both read this one
 /// constant. The public network and the rehearsal have no such height: D123's caps from their J.
-pub const TESTNET_CAPS_HEIGHT: Option<u64> = None;
+pub const TESTNET_CAPS_HEIGHT: Option<u64> = Some(8_910);
 /// The test chain's largest deposit below its caps height (D28's 1 000 JTM, the contract's cap of before).
 pub const TESTNET_PRE_D123_MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
 /// The test chain's deposit cap of before D123, until [`TESTNET_CAPS_HEIGHT`].

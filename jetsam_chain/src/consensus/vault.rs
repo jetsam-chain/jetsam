@@ -78,7 +78,7 @@ pub(crate) mod tests;
 pub use jetsam_vault_rule::{
     bridge_deposits_from_height, DestinationMarkerKind, BRIDGE_DEPOSIT_MARKER_TAG,
     BRIDGE_OPENING_DELAY, LIGHT_CLIENT_UPDATE_MARKER_TAG, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO,
-    VAULT_RELEASE_MARKER_TAG, VAULT_SECRET,
+    TESTNET_PROFILE, VAULT_RELEASE_MARKER_TAG, VAULT_SECRET,
 };
 use jetsam_vault_rule::{DepositRule, GroupClass, RuleError};
 

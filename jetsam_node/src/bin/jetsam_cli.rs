@@ -20,6 +20,18 @@ use jetsam_chain::consensus::identity::TICKER;
 use jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
 use jetsam_chain::consensus::vault::VaultRules;
 
+/// TN1: how long the bridge's slow lane waits after the checkpoint that covers a deposit (the contract's
+/// `D_SLOW`, fixed by its network): 1 h on the test chain, 24 h on the public network.
+const SLOW_LANE_WAIT: &str = if jetsam_chain::consensus::vault::TESTNET_PROFILE { "1 h" } else { "24 h" };
+
+/// The slow lane of a deposit, in the help of `bridge deposit` and in its plan (TN1: its wait is the profile's).
+fn slow_lane() -> String {
+    format!(
+        "by the slow lane, at the next checkpoint (about every 1 h 50) then about {SLOW_LANE_WAIT}; or sooner, less \
+         a fee, if an advancer advances it. Deposits left out beyond 22 a day wait; none is lost."
+    )
+}
+
 /// Where the daemon of *this* build listens by default.
 ///
 /// A testnet daemon listens on 9711, not 9701. A client that assumes the
@@ -529,16 +541,15 @@ enum BridgeCommand {
             "Deposit {TICKER} of the active address to the bridge vault for a Base/EVM address.\n\n\
              The daemon's wallet builds and signs one transaction: the amount to the vault, a \
              marker naming the Base/EVM address, the change back. The bridge mints the same \
-             amount to that address on Base/EVM: by the slow lane, at the next checkpoint (about \
-             every 1 h 50) then about 24 h; or sooner, less a fee, if an advancer advances it. \
-             Deposits left out beyond 22 a day wait; none is lost.\n\n\
+             amount to that address on Base/EVM: {}\n\n\
              A deposit cannot be cancelled. The plan is shown first and nothing is sent until \
              you type yes (or pass --yes). Refused while this build carries no v1.7 activation \
              height (never on mainnet before that), until the block after the bridge opening, \
              and outside the limits of one deposit (see 'jetsam-cli bridge status').\n\n\
              Examples:\n  \
              jetsam-cli bridge deposit 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed 25 --dry-run\n  \
-             jetsam-cli bridge deposit 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed 25"
+             jetsam-cli bridge deposit 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed 25",
+            slow_lane()
         )
     )]
     Deposit {
@@ -3300,10 +3311,9 @@ async fn cmd_bridge_deposit(
              and use one you control (not an exchange's deposit address).",
         );
         println!(
-            "  {} The bridge mints the same amount to it on Base/EVM: by the slow lane, at the \
-             next checkpoint (about every 1 h 50) then about 24 h; or sooner, less a fee, if an \
-             advancer advances it. Deposits left out beyond 22 a day wait; none is lost.",
-            c!(DIM, "Note:")
+            "  {} The bridge mints the same amount to it on Base/EVM: {}",
+            c!(DIM, "Note:"),
+            slow_lane()
         );
     }
     if dry_run {
@@ -4151,6 +4161,25 @@ mod bridge_tests {
         bridge_deposits_from_height, VaultRules, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO,
     };
     use serde_json::json;
+
+    /// TN1: `bridge deposit --help` names the slow lane's wait of this build's network (the bridge's
+    /// D_SLOW): about 1 h on the test chain, about 24 h elsewhere.
+    #[test]
+    fn tn1_the_deposit_help_names_the_slow_lane_of_this_network() {
+        let mut cli = Cli::command();
+        let deposit = cli
+            .find_subcommand_mut("bridge")
+            .and_then(|b| b.find_subcommand_mut("deposit"))
+            .expect("bridge deposit");
+        let help = deposit.render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let testnet = jetsam_chain::consensus::vault::TESTNET_PROFILE;
+        let (want, never) = if testnet { ("then about 1 h;", "about 24 h") } else { ("then about 24 h;", "about 1 h;") };
+        assert!(help.contains(want) && !help.contains(never), "{help}");
+        // the plan printed before a deposit says the same
+        let plan = super::slow_lane();
+        assert!(plan.contains(want) && !plan.contains(never) && help.contains(&plan), "{plan}");
+    }
 
     const ONE: u64 = 1_000_000;
     const RECIPIENT: [u8; 20] = [0x5a; 20];

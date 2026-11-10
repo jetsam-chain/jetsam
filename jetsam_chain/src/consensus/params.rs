@@ -2697,7 +2697,7 @@ mod tests {
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     #[test]
     fn the_test_chain_caps_height_is_not_chosen() {
-        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, None);
+        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, Some(8_910));
         assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, jetsam_vault_rule::TESTNET_CAPS_HEIGHT);
         assert!(testnet_caps_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_TESTNET_CAPS_HEIGHT));
     }

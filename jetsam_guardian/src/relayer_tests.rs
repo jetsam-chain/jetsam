@@ -235,6 +235,21 @@ fn the_highest_stable_point_is_finalized_first_and_younger_ones_wait() {
     assert_eq!(finalize_order(&known, &some, GL, 500, 0, now), vec![p1], "canonical only");
 }
 
+/// TN1: the relayer finalizes a point exactly when the contract of its network allows it: 1 h after its
+/// acceptance on the test chain, 24 h elsewhere; the tree of a final point waits twice that.
+#[test]
+fn tn1_a_point_is_finalized_after_the_slow_delay_of_the_network() {
+    let d = if jetsam_vault_rule::TESTNET_PROFILE { 3_600 } else { 86_400 };
+    assert_eq!((D_SLOW, TREE_WAIT_SECS), (d, 2 * d));
+    let c = testkit::chain(50, 1);
+    let (gid, _) = genesis_known(&c);
+    let (p1, k1) = known_at(&c, 30, gid, &[], 1_000);
+    let known = HashMap::from([(p1, k1)]);
+    let all: HashSet<[u8; 32]> = [p1].into();
+    assert!(finalize_order(&known, &all, GL, 500, 0, 1_000 + d - 1).is_empty(), "one second early");
+    assert_eq!(finalize_order(&known, &all, GL, 500, 0, 1_000 + d), vec![p1], "at the delay");
+}
+
 #[test]
 fn a_freeze_holds_every_clock_until_d_slow_after_its_end() {
     // the contract (v3-tn 80945c3): stable since max(acceptedAt, lastSwitchAt, pausedUntil), refused while frozen
@@ -412,23 +427,116 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}bogus = 1\n"))).is_err(), "unknown field");
 }
 
-/// D103: the test bridge on Base Sepolia (its verifier, `Sp1EmptyProofTestVerifier`, passes an empty proof only)
-/// is fed empty proofs, the public values still computed natively first; on no other network nor L1.
+/// A-7 (audit 2026-11-10): the test bridge on Base Sepolia (its verifier, `Sp1RelaySignedTestVerifier`, passes the
+/// relayer's signature of the public values only) is fed this relayer's signatures, the public values still computed
+/// natively first; on no other network nor L1. The empty proofs of before (D103) are refused everywhere.
 #[test]
-fn the_empty_proof_mode_starts_only_on_the_public_test_network_over_base_sepolia() {
+fn a7_the_signed_test_mode_starts_only_on_the_public_test_network_over_base_sepolia() {
     let testnet = hex::encode(crate::TESTNET_NETWORK);
     let mainnet = hex::encode(crate::MAINNET_NETWORK);
     let bridge = "0x1111111111111111111111111111111111111111";
-    let empty = "[prover]\nmode = \"empty-test\"\n";
-    let c = RelayConfig::parse(&relay_toml(&testnet, 84_532, bridge, empty)).unwrap();
+    let signed = "[prover]\nmode = \"signed-test\"\n";
+    let c = RelayConfig::parse(&relay_toml(&testnet, 84_532, bridge, signed)).unwrap();
     assert_eq!(c.profile().unwrap(), crate::Profile::PublicTestnet);
     let e = |net: &str, chain: u64, extra: &str| RelayConfig::parse(&relay_toml(net, chain, bridge, extra)).unwrap_err().to_string();
-    assert!(e(&mainnet, 8_453, empty).contains("refused"), "never on the mainnet");
-    assert!(e(&mainnet, 84_532, empty).contains("refused"), "never on the mainnet, whatever the L1");
-    assert!(e(&testnet, 8_453, empty).contains("refused"), "the test chain over Base itself: no");
-    assert!(e(&testnet, 11_155_111, empty).contains("refused"), "nor over another test L1");
-    assert!(e(&testnet, 84_532, &format!("{empty}native_check = false\n")).contains("native_check"), "the public values are still computed natively");
-    assert!(EmptyTestProver.name().contains("TEST"));
+    assert!(e(&mainnet, 8_453, signed).contains("refused"), "never on the mainnet");
+    assert!(e(&mainnet, 84_532, signed).contains("refused"), "never on the mainnet, whatever the L1");
+    assert!(e(&testnet, 8_453, signed).contains("refused"), "the test chain over Base itself: no");
+    assert!(e(&testnet, 11_155_111, signed).contains("refused"), "nor over another test L1");
+    assert!(e(&testnet, 84_532, &format!("{signed}native_check = false\n")).contains("native_check"), "the public values are still computed natively");
+    // A-7: the empty proofs of before, nowhere
+    let empty = "[prover]\nmode = \"empty-test\"\n";
+    for (net, chain) in [(&testnet, 84_532), (&testnet, 8_453), (&mainnet, 8_453)] {
+        assert!(e(net, chain, empty).contains("A-7"), "{net} {chain}");
+    }
+}
+
+/// A-7: the proof is the 65 bytes r ‖ s ‖ v (v = 27 + parity, low s, RFC 6979) of keccak256(DOMAIN ‖ vkey ‖ public
+/// values) by the relayer's key: the very vector the contract's test checks (RelaySignedTestVerifier.t.sol,
+/// `test_a7_the_vector_jg_relay_signs`, key 1).
+#[test]
+fn a7_the_signed_test_proof_is_the_vector_the_test_verifier_checks() {
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    let key = crate::l1tx::HotKey::from_bytes(&one).unwrap();
+    assert_eq!(hex::encode(key.address()), "7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+    let vkey: [u8; 32] = hex::decode("00e21d6e19b834ac40e8dfa5826f2dfce65cbdc8f11112e2eabc49f964695437").unwrap().try_into().unwrap();
+    let pv = hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+    assert_eq!(hex::encode(SIGNED_TEST_DOMAIN), "46b4a85e4689786e21f5e865a7bf5fe99e5c225d0b106daea0b93787810f0e5f");
+    assert_eq!(SIGNED_TEST_DOMAIN, crate::keccak256(b"jetsam-bridge/v3 TEST verifier: relay-signed proofs"));
+    assert_eq!(hex::encode(signed_test_digest(&vkey, &pv)), "ca07e62a9bf7eed2e5f88663677399cb47b02216fdaa86c3ec53d6ae49ba9d0a");
+    assert_eq!(
+        hex::encode(signed_test_proof(&key, &vkey, &pv)),
+        "510235ae8554db1d2982586d1bb1431c19db6e7020a3b723efbc6b763c80b4cc0ac0f94134f724ef7ba224eba6623aa7b487cf672948cde4c25e82f6dadafa641c"
+    );
+}
+
+/// A-7: each program's proof is signed under its own vkey (the checkpoint program's for a point, the claim
+/// program's for a `claimDepositDirect`), over exactly the request's public values.
+#[test]
+fn a7_the_signed_test_prover_signs_each_program_under_its_own_vkey() {
+    let key = crate::l1tx::HotKey::from_bytes(&[0x42; 32]).unwrap();
+    let me = key.address();
+    let (cp, claim) = ([0x0c; 32], [0x0d; 32]);
+    let prover = SignedTestProver::new(key, cp, claim);
+    assert!(prover.name().contains("TEST") && prover.name().contains(&hex::encode(me)));
+    let signer = |vkey: &[u8; 32], pv: &[u8], proof: &[u8]| {
+        assert_eq!(proof.len(), 65);
+        assert!(proof[64] == 27 || proof[64] == 28);
+        let (r, s): ([u8; 32], [u8; 32]) = (proof[..32].try_into().unwrap(), proof[32..64].try_into().unwrap());
+        crate::l1tx::recover(&signed_test_digest(vkey, pv), proof[64] - 27, &r, &s).unwrap()
+    };
+    let mut req = proof_request_for_tests();
+    req.public_values = vec![0x5a; 736];
+    let p = prover.prove(&req).unwrap();
+    assert_eq!(signer(&cp, &req.public_values, &p), me);
+    assert_ne!(signer(&claim, &req.public_values, &p), me, "not the claim program's");
+    let d = dep(30, 1, 5 * JTM);
+    let creq = ClaimRequest { deposit: d, tx_root: [7; 32], input: vec![1, 2, 3], public_values: vec![0x6b; 192] };
+    let q = prover.prove_claim(&creq).unwrap();
+    assert_eq!(signer(&claim, &creq.public_values, &q), me);
+    assert_ne!(signer(&cp, &creq.public_values, &q), me, "not the checkpoint program's");
+}
+
+/// A-7: jg-relay starts in mode "signed-test" only when the bridge's test verifier takes its key.
+#[test]
+fn a7_the_test_verifier_must_take_this_relayers_key() {
+    let me = [0x11; 20];
+    assert!(check_signed_test_key(&me, &me).is_ok());
+    let e = check_signed_test_key(&[0x22; 20], &me).unwrap_err().to_string();
+    assert!(e.contains("0x2222") && e.contains("0x1111") && e.contains("does not start"), "{e}");
+}
+
+pub(crate) fn proof_request_for_tests() -> ProofRequest {
+    let cp = Checkpoint {
+        height: 40,
+        cum_work: [1u8; 32],
+        headers_digest: [2u8; 32],
+        deposit_root: [3u8; 32],
+        deposit_count: 0,
+        anchor_root: [4u8; 32],
+        locked_height: 32,
+        tip_block_id: [5u8; 32],
+        locked_block_id: [6u8; 32],
+        locked_cum_work: [7u8; 32],
+    };
+    ProofRequest {
+        parent_id: [8u8; 32],
+        parent: cp,
+        fork_depth: 0,
+        anchor_base: 11,
+        bridge_tip_block: [9u8; 32],
+        bridge_tip_locked_block: [10u8; 32],
+        next: cp,
+        mn: Mn::default(),
+        public_values: Vec::new(),
+        headers_from: 0,
+        headers: Vec::new(),
+        abandoned: Vec::new(),
+        deposit_blocks: Vec::new(),
+        deposit_frontier: [[0u8; 32]; 32],
+        anchor_frontier: [[0u8; 32]; 32],
+    }
 }
 
 /// A5-9: the relayer learns the contract's points 12 L1 blocks below the latest by default, as configured
