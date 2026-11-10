@@ -469,3 +469,80 @@ fn one_node_alone_never_makes_jg_relay_drop_a_known_points_locked_block() {
     assert_eq!(reorgs(&dir), Vec::<(u64, u64)>::new(), "seven blocks dropped below L = 25 on one node's word; log:\n{log}");
     assert!(alerted && log.contains("locked floor 25"), "log:\n{log}");
 }
+
+// ---------------------------------------------------------------- E-2
+
+/// `bin --config <dir>/relay.toml` (with `args` before `--config`) under a bounded `RLIMIT_MEMLOCK` and without
+/// `CAP_IPC_LOCK` (the test host runs as root): its memory cannot be locked. `None` without `prlimit`/`setpriv`.
+pub(crate) fn unlockable(bin: &str, config: &Path, args: &[&str], log: &Path) -> Option<Child> {
+    if Command::new("setpriv").arg("--version").output().is_err() || Command::new("prlimit").arg("--version").output().is_err() {
+        eprintln!("SKIPPED: no setpriv or prlimit on this host");
+        return None;
+    }
+    let out = std::fs::File::create(log).unwrap();
+    Some(
+        Command::new("prlimit")
+            .args(["--memlock=1048576:1048576", "setpriv", "--bounding-set=-ipc_lock", bin])
+            .args(args)
+            .arg("--config")
+            .arg(config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(out)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn exited(mut child: Child, secs: u64) -> Option<i32> {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st.code();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop(child);
+    None
+}
+
+/// E-2 (audit 2026-11-10): `jg-relay` with a hot key (`[signer] key_file`) does not start when its memory cannot be
+/// locked — before it reads the key, before any socket —; `--allow-unlocked-memory` starts it with an ALERT; without
+/// a hot key (the rehearsal's endpoint account) it starts as before.
+#[test]
+fn jg_relay_holding_a_hot_key_does_not_start_with_its_memory_unlocked_unless_told() {
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (l1_port, n0, n1) = (l1(world.clone()), genesis_only(), genesis_only());
+    let (_root, dir) = relay_dir(l1_port, &[n0, n1], 2, "");
+    let key = dir.join("hot.key");
+    let text = std::fs::read_to_string(dir.join("relay.toml")).unwrap().replace(&format!("from_address = \"{FROM}\"\n"), "");
+    std::fs::write(dir.join("local.toml"), format!("{text}[signer]\nkey_file = \"{}\"\n", key.display())).unwrap();
+    let bin = env!("CARGO_BIN_EXE_jg-relay");
+    // a hot key, memory not locked: no start, the key never read, nothing dialled
+    let Some(child) = unlockable(bin, &dir.join("local.toml"), &[], &dir.join("a.log")) else { return };
+    let code = exited(child, 30);
+    let log = std::fs::read_to_string(dir.join("a.log")).unwrap_or_default();
+    assert_eq!(code, Some(1), "log:\n{log}");
+    assert!(log.contains("memory NOT locked") && log.contains("holds a hot key and its memory is not locked") && log.contains("jg-relay does not start"), "{log}");
+    assert!(!log.contains("ALERT MEMORY_NOT_LOCKED"), "not started anyway: {log}");
+    assert!(!log.contains("hot.key"), "the key file is never opened: {log}");
+    let dialled = {
+        let w = world.lock().unwrap();
+        w.block_number_calls + w.filters.len() as u64
+    };
+    assert_eq!(dialled, 0, "nothing dialled");
+    // told: an ALERT, then it goes on (to the key file, missing here)
+    let child = unlockable(bin, &dir.join("local.toml"), &["--allow-unlocked-memory"], &dir.join("b.log")).unwrap();
+    let code = exited(child, 30);
+    let log = std::fs::read_to_string(dir.join("b.log")).unwrap_or_default();
+    assert_eq!(code, Some(1), "log:\n{log}");
+    assert!(log.contains("ALERT MEMORY_NOT_LOCKED") && log.contains("--allow-unlocked-memory"), "{log}");
+    assert!(log.contains("hot key") && log.contains("hot.key"), "past the gate, to the key file: {log}");
+    // no hot key: it starts and runs
+    let child = unlockable(bin, &dir.join("relay.toml"), &[], &dir.join("c.log")).unwrap();
+    let ran = wait_for(30, || world.lock().unwrap().block_number_calls >= 1);
+    let code = exited(child, 1);
+    let log = std::fs::read_to_string(dir.join("c.log")).unwrap_or_default();
+    assert!(ran && code.is_none(), "{code:?}; log:\n{log}");
+    assert!(log.contains("memory NOT locked") && !log.contains("does not start"), "{log}");
+}

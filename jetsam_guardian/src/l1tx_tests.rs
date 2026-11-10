@@ -171,6 +171,22 @@ fn the_signer_is_local_off_the_rehearsal_and_its_key_is_the_configured_address()
     assert!(toml::from_str::<SignerConfig>("unknown = 1").is_err());
 }
 
+/// E-2 (audit 2026-11-10): which signers load a hot key into the process (the ones whose memory must be locked):
+/// exactly those `open` makes `L1Tx::Local`.
+#[test]
+fn a_signer_holds_a_hot_key_exactly_when_it_opens_a_local_one() {
+    use crate::Profile;
+    let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
+    let key = "key_file = \"/k\"";
+    for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::PrivateRehearsal] {
+        assert!(parse(key).holds_hot_key(p), "{p}: a key file");
+        assert!(parse("mode = \"local\"").holds_hot_key(p), "{p}: mode local");
+        assert!(!parse("mode = \"endpoint\"").holds_hot_key(p), "{p}: the endpoint's account");
+    }
+    assert!(parse("").holds_hot_key(Profile::Mainnet), "no signer off the rehearsal: local (its key_file required)");
+    assert!(!parse("").holds_hot_key(Profile::PrivateRehearsal), "the rehearsal's endpoint account");
+}
+
 /// A5-13: the priority fee has a cap of its own (`max_priority_fee_per_gas`, far under `max_fee_per_gas`): a tip
 /// above it, configured or the endpoint's, is not sent, and a replacement never raises it above it.
 #[test]

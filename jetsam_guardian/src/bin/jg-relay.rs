@@ -977,12 +977,19 @@ fn run() -> anyhow::Result<()> {
     ));
     anyhow::ensure!(h.dumpable_off && h.core_off, "the process cannot be hardened: jg-relay does not start");
     let args: Vec<String> = std::env::args().collect();
+    let allow_unlocked = args.iter().any(|a| a == jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY);
+    let args: Vec<String> = args.into_iter().filter(|a| a != jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY).collect();
     let (cfg, digest) = config(&args)?;
     if let Some(i) = args.iter().position(|a| a == "--config") {
         let rest: Vec<String> = args.iter().skip(i + 2).cloned().collect();
         if !rest.is_empty() {
             return operator(&cfg, &rest);
         }
+    }
+    // E-2: the hot key is held in locked memory only, unless the operator's explicit flag (an ALERT then)
+    let gate = jetsam_guardian::harden::memory_gate(&h, cfg.signer.holds_hot_key(cfg.profile()?), allow_unlocked);
+    if let Some(alert) = gate.map_err(|e| anyhow::anyhow!("{e:#}: jg-relay does not start"))? {
+        log(&alert);
     }
     unsafe {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);

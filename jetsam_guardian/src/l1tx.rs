@@ -647,6 +647,21 @@ impl SignerConfig {
         }
     }
 
+    /// The signer's mode on `profile`: the configured one, else `"endpoint"` on the private rehearsal without a
+    /// `key_file`, else `"local"`.
+    fn mode(&self, profile: crate::Profile) -> &str {
+        match self.mode.as_deref() {
+            Some(m) => m,
+            None if profile == crate::Profile::PrivateRehearsal && self.key_file.is_none() => "endpoint",
+            None => "local",
+        }
+    }
+
+    /// E-2 (audit 2026-11-10): [`open`](Self::open) on `profile` loads a hot key into this process (mode `"local"`).
+    pub fn holds_hot_key(&self, profile: crate::Profile) -> bool {
+        self.mode(profile) == "local"
+    }
+
     /// A5-13: off the private rehearsal the priority fee is configured, and never above its cap: the rule of
     /// `jg-fill` and of `jg-relay` alike (`open` applies it to every local signer). An error: no start.
     pub fn check_fees(&self, profile: crate::Profile) -> anyhow::Result<()> {
@@ -666,12 +681,7 @@ impl SignerConfig {
     /// its write-ahead under `state_dir`. An error means the program does not start.
     pub fn open(&self, profile: crate::Profile, chain_id: u64, address: Option<[u8; 20]>, state_dir: &Path) -> anyhow::Result<L1Tx> {
         let rehearsal = profile == crate::Profile::PrivateRehearsal;
-        let mode = match self.mode.as_deref() {
-            Some(m) => m,
-            None if rehearsal && self.key_file.is_none() => "endpoint",
-            None => "local",
-        };
-        match mode {
+        match self.mode(profile) {
             "local" => {
                 let path = self.key_file.as_ref().ok_or_else(|| anyhow::anyhow!("[signer] key_file is required (mode \"local\")"))?;
                 self.check_fees(profile)?;

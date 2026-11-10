@@ -737,6 +737,12 @@ fn run() -> anyhow::Result<()> {
         sha2::Sha256::digest(text.as_bytes()).into()
     };
     let cfg = FillConfig::parse(&text)?;
+    // E-2: the hot key is held in locked memory only, unless the operator's explicit flag (an ALERT then)
+    let allow_unlocked = args.iter().any(|a| a == jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY);
+    let gate = jetsam_guardian::harden::memory_gate(&h, cfg.signer.holds_hot_key(cfg.profile()?), allow_unlocked);
+    if let Some(alert) = gate.map_err(|e| anyhow::anyhow!("{e:#}: jg-fill does not start"))? {
+        log(&alert);
+    }
     log(&format!("config {} sha256 {}", path.display(), hex::encode(digest)));
     let rules = VaultRules::current();
     cfg.build_matches(&rules)?;

@@ -4,6 +4,8 @@
 //! A5-15: the hardening of a process that holds a secret in memory (the robots' hot keys): no core dump,
 //! not readable by a debugger of the same user (`PR_SET_DUMPABLE = 0`), memory locked out of the swap when
 //! that can never refuse a later allocation. As `jg-sign` does for its share (`jg-sign.rs`, `harden`).
+//! E-2 (audit 2026-11-10): a robot that holds its hot key does not start with its memory not locked
+//! ([`memory_gate`]), unless the operator says so ([`ALLOW_UNLOCKED_MEMORY`], an ALERT).
 
 /// What [`harden`] obtained.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,27 @@ fn cap_eff() -> u64 {
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("CapEff:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|h| u64::from_str_radix(h, 16).ok()))
         .unwrap_or(0)
+}
+
+/// E-2 (audit 2026-11-10): the command-line flag that starts a program holding a hot key with its memory not locked
+/// (an ALERT then).
+pub const ALLOW_UNLOCKED_MEMORY: &str = "--allow-unlocked-memory";
+
+/// E-2: a process that holds a hot key (`holds_hot_key`) starts only with its memory locked (`h.memory_locked`):
+/// an error otherwise (it does not start), unless `allow_unlocked` (the operator's [`ALLOW_UNLOCKED_MEMORY`]): then
+/// `Some` ALERT line to log. `None`: nothing to say (memory locked, or no hot key).
+pub fn memory_gate(h: &Hardened, holds_hot_key: bool, allow_unlocked: bool) -> anyhow::Result<Option<String>> {
+    match &h.memory_locked {
+        Err(why) if holds_hot_key && allow_unlocked => Ok(Some(format!(
+            "ALERT MEMORY_NOT_LOCKED ({why}): started with {ALLOW_UNLOCKED_MEMORY}, the hot key may be written to swap (keep the swap off or encrypted)"
+        ))),
+        Err(why) if holds_hot_key => anyhow::bail!(
+            "this process holds a hot key and its memory is not locked ({why}): raise RLIMIT_MEMLOCK to unlimited \
+             (LimitMEMLOCK=infinity, or memlock unlimited in limits.conf) or grant CAP_IPC_LOCK; {ALLOW_UNLOCKED_MEMORY} \
+             starts it anyway, with an ALERT"
+        ),
+        _ => Ok(None),
+    }
 }
 
 /// Harden this process (see the module).

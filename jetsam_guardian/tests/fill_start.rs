@@ -124,3 +124,49 @@ fn a5_14_write_atomic_child() {
     let Some(target) = std::env::var_os("JG_WRITE_ATOMIC_CHILD") else { return };
     jetsam_guardian::write_atomic(std::path::Path::new(&target), b"{\"child\":1}").unwrap();
 }
+
+/// E-2 (audit 2026-11-10): `jg-fill` with its hot key (`[signer] key_file`) does not start when its memory cannot be
+/// locked (a bounded `RLIMIT_MEMLOCK`, no `CAP_IPC_LOCK`): before the key is read and before any socket;
+/// `--allow-unlocked-memory` lets it go on, with an ALERT. Without `prlimit`/`setpriv` on the host: skipped, said.
+#[test]
+fn jg_fill_holding_its_hot_key_does_not_start_with_its_memory_unlocked_unless_told() {
+    if Command::new("setpriv").arg("--version").output().is_err() || Command::new("prlimit").arg("--version").output().is_err() {
+        eprintln!("SKIPPED: no setpriv or prlimit on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("hot.key");
+    let config = dir.path().join("fill.toml");
+    let text = format!(
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nv1_7_height = 96\ndeposits_from_height = 128\n\
+         l1_rpc = \"http://127.0.0.1:9\"\nhot_address = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n\
+         refund_to = \"0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC\"\nwei_per_jtm = \"1000000000000000\"\nstate_dir = \"{}\"\npoll_secs = 1\n\
+         [[nodes]]\nname = \"n1\"\nrpc = \"http://127.0.0.1:9\"\n[[nodes]]\nname = \"n2\"\nrpc = \"http://127.0.0.1:10\"\n\
+         [params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[egress]\nmode = \"clearnet\"\n[signer]\nkey_file = \"{}\"\n",
+        hex::encode(jetsam_guardian::testkit::genesis().id),
+        "ee".repeat(20),
+        dir.path().join("state").display(),
+        key.display()
+    );
+    std::fs::write(&config, text).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new("prlimit")
+            .args(["--memlock=1048576:1048576", "setpriv", "--bounding-set=-ipc_lock", env!("CARGO_BIN_EXE_jg-fill")])
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, err) = run(&[]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("memory NOT locked") && err.contains("holds a hot key and its memory is not locked") && err.contains("jg-fill does not start"), "{err}");
+    assert!(!err.contains("ALERT MEMORY_NOT_LOCKED"), "not started anyway: {err}");
+    assert!(!err.contains("hot.key") && !err.contains("egress"), "refused before the key and before any socket: {err}");
+    let (code, err) = run(&["--allow-unlocked-memory"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("ALERT MEMORY_NOT_LOCKED") && err.contains("--allow-unlocked-memory"), "{err}");
+    assert!(!err.contains("its memory is not locked"), "past the gate: {err}");
+}
