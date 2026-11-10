@@ -1114,7 +1114,7 @@ fn a_public_network_refuses_the_clear_and_any_source_off_tor_or_the_loopback() {
     assert!(e.contains("refused on the public test network"), "{e}");
     let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
     // onion only (the default): a loopback node and an onion node, an onion L1: starts
-    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), "[signer]\npriority_fee_wei = 1000000000\n"));
+    let ok = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &format!("http://jetsamtest{}.onion:8545", "b".repeat(46)), "[signer]\npriority_fee_wei = 1000000\n"));
     assert!(ok.is_ok(), "{:?}", ok.err());
     // a node on the bridge, or the L1 in the clear: refused before any socket
     let e = FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", "http://10.77.0.12:19801"], "http://127.0.0.1:8545", "")).unwrap_err().to_string();
@@ -1614,11 +1614,11 @@ fn a5_13_a_public_network_needs_the_priority_fee_in_fill_toml() {
     let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
     let l1 = format!("http://jetsamtest{}.onion:8545", "b".repeat(46));
     let public = |extra: &str| FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], &l1, extra));
-    for extra in ["", "[signer]\n", "[signer]\npriority_fee_wei = 10000000001\n"] {
+    for extra in ["", "[signer]\n", "[signer]\npriority_fee_wei = 100000001\n"] {
         let e = public(extra).unwrap_err().to_string();
         assert!(e.contains("priority_fee_wei") && e.contains("does not start"), "{extra:?}: {e}");
     }
-    assert!(public("[signer]\npriority_fee_wei = 1000000000\n").is_ok());
+    assert!(public("[signer]\npriority_fee_wei = 1000000\n").is_ok());
     assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).is_ok(), "the rehearsal: not required");
 }
 
@@ -2064,4 +2064,26 @@ fn e7_a_deposit_on_a_chain_of_wrong_targets_is_not_confirmed() {
     let mut v = std::collections::HashSet::new();
     let mut target = |c: &Chain, h: u64| targets_ok(c, h, &s, &mut v);
     assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&asert), &p, &mut yes, &mut target), Ok(()));
+}
+
+// ---------------------------------------------------------------- E-9: a daily gas budget
+
+/// E-9: `fill.toml` without a gas budget gets the robot's default (30 M gas per 24 h of the L1 clock); a budget below
+/// one transaction at `max_gas` does not start.
+#[test]
+fn e9_the_robot_always_has_a_daily_gas_budget() {
+    assert_eq!(DEFAULT_DAILY_GAS_BUDGET, 30_000_000);
+    let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
+    assert_eq!(c.signer.daily_gas_budget, Some(DEFAULT_DAILY_GAS_BUDGET));
+    let set = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 3000000\n")).unwrap();
+    assert_eq!(set.signer.daily_gas_budget, Some(3_000_000));
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 2999999\n")).unwrap_err().to_string();
+    assert!(e.contains("daily_gas_budget") && e.contains("does not start"), "{e}");
+}
+
+/// E-9: a refusal of the budget is named as such (the robot alerts on it, never counts it a revert).
+#[test]
+fn e9_a_refusal_of_the_gas_budget_is_recognized() {
+    assert!(gas_budget_refusal(&format!("{} advanceBatch: not sent", crate::l1tx::GAS_BUDGET_ALERT)));
+    assert!(!gas_budget_refusal("reverts: execution reverted"));
 }

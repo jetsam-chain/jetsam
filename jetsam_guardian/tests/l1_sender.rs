@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use jetsam_guardian::l1::{hex_u64, L1};
-use jetsam_guardian::l1tx::{FeePolicy, HotKey, Pending, Recovered, Sender, Tx1559};
+use jetsam_guardian::l1tx::{FeePolicy, HotKey, Pending, Recovered, Sender, Tx1559, GAS_BUDGET_ALERT};
 
 /// Anvil's TEST account #1 (published by foundry; never a real key).
 const TEST_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
@@ -317,4 +317,38 @@ fn m8_an_advance_found_unmined_at_a_recovery_is_cancelled_never_sent_again() {
     assert!(r.starts_with("Cancelled"), "{r}");
     assert!(l1.rpc("eth_getTransactionReceipt", json!([p.sent[0].0])).unwrap().is_null(), "the pooled advance was replaced, never mined");
     assert_eq!(nonce(&l1, &key(TEST_KEY_1).address()), 2);
+}
+
+
+/// E-9: with a daily gas budget, a transaction whose gas limit would take the gas of the last 24 h of the L1 clock
+/// above it is refused before anything is signed (the nonce does not move), with the alert; the gas of the mined
+/// ones survives a restart (`gas.json` under the state directory); 24 h of the L1 clock later there is room again.
+#[test]
+fn e9_a_daily_gas_budget_refuses_before_signing_and_survives_a_restart() {
+    let Some(a) = anvil() else { return };
+    let l1 = L1::new(&a.url);
+    let dir = tempfile::tempdir().unwrap();
+    // a plain transfer: 21 000 gas used, a limit of 26 250 (25 % margin)
+    let s = sender(TEST_KEY_2, dir.path()).with_gas_budget(Some(60_000));
+    let who = s.address();
+    let r = s.send(&l1, TARGET, &[], "first").unwrap();
+    assert!(r.status);
+    assert_eq!(r.gas_used, 21_000);
+    // 21 000 + 26 250 <= 60 000: sent
+    assert!(s.send(&l1, TARGET, &[], "second").unwrap().status);
+    let n = nonce(&l1, &who);
+    // 42 000 + 26 250 > 60 000: refused before signing
+    let e = s.send(&l1, TARGET, &[], "third").unwrap_err().to_string();
+    assert!(e.contains(GAS_BUDGET_ALERT), "{e}");
+    assert_eq!(nonce(&l1, &who), n, "nothing signed");
+    assert!(s.pending().unwrap().is_none(), "nothing written ahead");
+    // a restart on the same state directory remembers the gas
+    let again = sender(TEST_KEY_2, dir.path()).with_gas_budget(Some(60_000));
+    assert!(again.send(&l1, TARGET, &[], "after a restart").unwrap_err().to_string().contains(GAS_BUDGET_ALERT));
+    // without a budget (jg-relay's default) nothing is refused for its gas
+    assert!(sender(TEST_KEY_2, dir.path()).send(&l1, TARGET, &[], "no budget").unwrap().status);
+    // 24 h of the L1 clock later, room again
+    l1.rpc("evm_increaseTime", json!([86_400])).unwrap();
+    l1.rpc("evm_mine", json!([])).unwrap();
+    assert!(again.send(&l1, TARGET, &[], "a day later").unwrap().status);
 }

@@ -124,8 +124,10 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
   owned by the process's uid (`HotKey::load`); never logged, never passed over IPC, its `Debug` shows the
   address only, zeroized when dropped. `jg-fill`: `key_file` must match `hot_address` of `fill.toml`.
 - **Fees** (A5-13, `jg-fill` and `jg-relay` alike): off the private rehearsal `[signer] priority_fee_wei` is
-  required (the L1 endpoint's `eth_maxPriorityFeePerGas` is never taken), at most `max_priority_fee_wei` (10 gwei
-  by default, replacements included), else no start. `jg-fill` halts (`HALT_REPEATED_REVERTS`, latched) after 3 of
+  required (the L1 endpoint's `eth_maxPriorityFeePerGas` is never taken), at most `max_priority_fee_wei` (0.1 gwei
+  by default since E-9, adapted to Base; replacements included), else no start. E-9: `jg-fill`'s transactions stay
+  within `[signer] daily_gas_budget` (30 M gas per 24 h of the L1 clock by default, kept in `<state_dir>/gas.json`):
+  above it a send is refused before signing, `ALERT GAS_BUDGET` journaled; `jg-relay` has none unless configured. `jg-fill` halts (`HALT_REPEATED_REVERTS`, latched) after 3 of
   its transactions reverted in a row, and keeps no refusal that depends on the L1 clock. `jg-relay` too (A5FIX4):
   3 of its own transactions reverted in a row, none explained by another one landing first (the tip moved, the
   deposit minted, another point finalized), latch `HALT_REPEATED_REVERTS` in `<state_dir>/HALT`; it then reads,

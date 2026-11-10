@@ -484,6 +484,20 @@ pub fn check_bridge_caps(slow_per_deposit: u64, advance_outstanding_cap: u64, ad
     Ok(())
 }
 
+/// E-9 (audit 2026-11-10): the robot's daily gas budget when `[signer] daily_gas_budget` is not set: 30 M gas per 24 h of
+/// the L1 clock, all its own transactions counted (advances, own claims). 10 full transactions at the default `max_gas`
+/// (≈ 220 advances in batches of 22, or ≈ 160 own claims of ≈ 184 000 gas); on Base (10/11/2026, 1 024 blocks read with
+/// `eth_feeHistory`: base fee 0.005 gwei, tips p50 ≈ 0.0012 gwei, p99 0.03 gwei; Base Sepolia the same base fee, tips
+/// p90 0.001 gwei) at most 30 M × (0.005 + the 0.1 gwei tip cap) ≈ 0.0032 ETH a day, ≈ 0.0002 ETH at the usual tips,
+/// plus Base's L1 data fee.
+pub const DEFAULT_DAILY_GAS_BUDGET: u64 = 30_000_000;
+
+/// E-9: a send refused by the daily gas budget (`l1tx::GAS_BUDGET_ALERT`): an alert, never a revert nor a halt; the
+/// orders are planned again at a later step.
+pub fn gas_budget_refusal(text: &str) -> bool {
+    text.contains(crate::l1tx::GAS_BUDGET_ALERT)
+}
+
 /// A5-7: the body of `d`'s block as the relayer archived and published it
 /// (`<publish_dir>/blocks/<height>-<block id hex>.bin`, `blocks_dir` = [`FillConfig::relay_blocks_dir`]), read
 /// again: its header must be the block `d.block_id`, its body the one that header commits to, and the node's
@@ -1345,7 +1359,7 @@ pub fn parse20(text: &str) -> anyhow::Result<[u8; 20]> {
 impl FillConfig {
     /// Parse and check; an error means jg-fill does not start.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let c: Self = toml::from_str(text)?;
+        let mut c: Self = toml::from_str(text)?;
         let profile = c.profile()?;
         // without `[signer]` (the rehearsal's endpoint account) the batch keeps the default signer's bound
         let (max_gas, margin) = if c.signer == crate::l1tx::SignerConfig::default() {
@@ -1354,7 +1368,14 @@ impl FillConfig {
         } else {
             (c.signer.max_gas, c.signer.gas_margin_pct)
         };
+        // E-9: the robot always has a daily gas budget (its default unless set)
+        c.signer.daily_gas_budget.get_or_insert(DEFAULT_DAILY_GAS_BUDGET);
         c.params.check(profile, max_gas, margin).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
+        let budget = c.signer.daily_gas_budget.unwrap_or(DEFAULT_DAILY_GAS_BUDGET);
+        anyhow::ensure!(
+            budget >= max_gas,
+            "[signer] daily_gas_budget {budget} is below one transaction at max_gas {max_gas}: jg-fill does not start (E-9)"
+        );
         anyhow::ensure!(
             c.nodes.len() >= c.params.min_nodes,
             "{} nodes configured, min_nodes = {}: jg-fill does not start (each deposit is confirmed on that many nodes)",

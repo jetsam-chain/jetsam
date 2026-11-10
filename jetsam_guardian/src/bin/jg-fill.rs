@@ -13,13 +13,16 @@
 //! * A5-15: hardened first (no core dump, not dumpable, memory locked when no later allocation can be refused),
 //!   `fill.toml` private to its user (0600 or 0400, its uid: it names `refund_to`), one robot per
 //!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
-//! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key, D123: `outstanding_cap ≤ max_stock`),
-//!   this build's v1.7 clock, the L1 chain id, the bridge's
+//! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key, D123: `outstanding_cap ≤ max_stock`,
+//!   E-9: a daily gas budget of at least one transaction), this build's v1.7 clock, the L1 chain id, the bridge's
 //!   genesis, its `OUTSTANDING_CEIL()`, D123: its `SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()` and
 //!   `ADVANCE_CAP_24H()` (50 000 JTM each, the robot's mirrors), its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and the hot
 //!   key's stock ≤ `max_stock` (else no start).
 //! * E-7: a deposit is confirmed only on headers whose targets are ASERT's from genesis (`fill::targets_ok`, the proof
 //!   program's rule of this build), not only proofs of work against the targets they declare.
+//! * E-9: all its own transactions within `[signer] daily_gas_budget` (30 M gas per 24 h of the L1 clock by default),
+//!   their gas kept in `<state_dir>/gas.json`; a send above it is refused with `ALERT GAS_BUDGET` (journaled), planned
+//!   again at a later step.
 //! * A5-1: no advance of a deposit at or below the locked height of the contract's tip (its point is accepted: a
 //!   mint less than 24 h after an advance made now repays what it paid only); an advance the relayer's point
 //!   overtakes in the minutes between the robot's read of the tip and its advance loses its fee (accepted).
@@ -31,7 +34,7 @@
 //! * N9: every step reads the hot key's balance again: above `max_stock` the robot pauses
 //!   (`PAUSE_STOCK_ABOVE_CAP`, an ALERT once per crossing).
 //! * A5-13 (one L1 endpoint is an oracle): off the private rehearsal `[signer] priority_fee_wei` is required, at
-//!   most `max_priority_fee_wei` (10 gwei by default; replacements capped too); three of its transactions reverted
+//!   most `max_priority_fee_wei` (0.1 gwei by default, E-9; replacements capped too); three of its transactions reverted
 //!   in a row halt it (`HALT_REPEATED_REVERTS`, latched; it then sends nothing, own claims included); a refusal that
 //!   depends on the L1 clock (`LATE_SLOW_PATH_NEAR`) is never kept as final, the deposit is decided again.
 //! * A5-14: `<state_dir>/state.json` (its ledger, what its caps and repayments count) is written synced, file then
@@ -498,6 +501,12 @@ impl Robot {
                 Ok(r) => break (r, list),
                 Err(e) => {
                     let text = format!("{e:#}");
+                    // E-9: the daily gas budget is spent: an alert, the orders are planned again later
+                    if fill::gas_budget_refusal(&text) {
+                        log(&text);
+                        self.journal(json!({"kind": "alert", "reason": "GAS_BUDGET", "orders": n, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
+                        return Ok(());
+                    }
                     if let Some(m) = fill::smaller_batch(&text, n) {
                         log(&format!("batch of {n} refused for its gas, sent again with {m} ({text})"));
                         self.journal(json!({"kind": "send_refused", "reason": "EXCEEDS_MAX_GAS", "orders": n, "again_with": m, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
@@ -605,7 +614,12 @@ impl Robot {
                 }
                 Err(e) => {
                     // a full window, the ceiling or a freeze: the relayer or a later step claims it
-                    log(&format!("own claim of key {} not sent: {e:#}", hex::encode(a.key)));
+                    let text = format!("{e:#}");
+                    log(&format!("own claim of key {} not sent: {text}", hex::encode(a.key)));
+                    // E-9: the daily gas budget is spent: an alert
+                    if fill::gas_budget_refusal(&text) {
+                        self.journal(json!({"kind": "alert", "reason": "GAS_BUDGET", "key": hex::encode(a.key), "l1_t": l1_now}));
+                    }
                     break;
                 }
             }
@@ -822,7 +836,11 @@ fn run() -> anyhow::Result<()> {
         Recovered::Dropped(label) => log(&format!("the {label} in flight at the stop was dropped (its nonce was used)")),
         Recovered::Cancelled(label) => log(&format!("the {label} in flight at the stop was cancelled, never sent again: its orders are decided again (M8)")),
     }
-    log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
+    log(&format!(
+        "signer: {}, daily gas budget {:?} (E-9)",
+        if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" },
+        cfg.signer.daily_gas_budget
+    ));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
     let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), targets_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), cfg };
