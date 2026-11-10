@@ -1116,8 +1116,11 @@ const _: () = assert!(
 /// refused here by its id at 46 080. Read back from the four mainnet seeds
 /// (`jetsam_getBlockHash` and `jetsam_getHeaderByHeight`, 2026-10-30, identical
 /// on all four); each is the `prev_block_hash` of the next one.
+///
+/// H-2 (audit 2026-11-10): the public network's pins through its v1.6 crossing;
+/// its v1.7 crossing joins them when declared ([`V1_7_CROSSING_PINS`]).
 #[cfg(not(feature = "testnet"))]
-pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
+pub(crate) const PINS_THROUGH_V1_6: [(u64, [u8; 32]); 5] = [
     (
         24846,
         [
@@ -1159,6 +1162,91 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
         ],
     ),
 ];
+
+/// H-2 (audit 2026-11-10): the public network's v1.7 crossing, the ids of
+/// blocks J − 1 and J (in that order). They exist only once mined, so they
+/// ship in the release that follows the crossing (`MAINFIX_RAPPORT.md`, H-2:
+/// read back from the four seeds within hours of J, the seeds updated first);
+/// `None` until then. Set together with [`V1_7_CROSSING_SEED_HEADERS`]: they
+/// then join [`HARD_CHECKPOINTS`] at J − 1 and J, on every acceptance path, so
+/// the branch of the nodes left on the old rules is refused by its id at J
+/// whatever its height or its work. Until then a node of this profile that
+/// already holds a chain reaching J does not start
+/// ([`V1_7_CROSSING_PIN_REQUIRED`]).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_CROSSING_PINS: Option<([u8; 32], [u8; 32])> = None;
+
+/// H-2: the raw wire headers J − 1, J and J + 1 (hex, `jetsam_getHeaderByHeight`,
+/// identical on the four seeds), the source of [`V1_7_CROSSING_PINS`]: the
+/// test `h2_the_public_network_pins_its_v1_7_crossing_exactly_as_declared`
+/// hashes and links them. `None` with the pins.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_CROSSING_SEED_HEADERS: Option<[&str; 3]> = None;
+
+#[cfg(not(feature = "testnet"))]
+const MAINNET_PIN_COUNT: usize =
+    PINS_THROUGH_V1_6.len() + if V1_7_CROSSING_PINS.is_some() { 2 } else { 0 };
+
+#[cfg(not(feature = "testnet"))]
+const MAINNET_PINS: [(u64, [u8; 32]); MAINNET_PIN_COUNT] =
+    with_v1_7_crossing(&PINS_THROUGH_V1_6, V1_7_ACTIVATION_HEIGHT, V1_7_CROSSING_PINS);
+
+/// The public network's pins: [`PINS_THROUGH_V1_6`], then its v1.7 crossing
+/// once declared ([`V1_7_CROSSING_PINS`]).
+#[cfg(not(feature = "testnet"))]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &MAINNET_PINS;
+
+/// H-2: `base`, then a declared v1.7 crossing at `j`: `(j − 1, before)` and
+/// `(j, at)`; `base` alone without one. `N` is the length of the result,
+/// checked when a constant is built with it.
+pub(crate) const fn with_v1_7_crossing<const N: usize>(
+    base: &[(u64, [u8; 32])],
+    j: Option<u64>,
+    crossing: Option<([u8; 32], [u8; 32])>,
+) -> [(u64, [u8; 32]); N] {
+    let mut out = [(0u64, [0u8; 32]); N];
+    let mut i = 0;
+    while i < base.len() {
+        out[i] = base[i];
+        i += 1;
+    }
+    match (j, crossing) {
+        (_, None) => assert!(N == base.len(), "no crossing declared: the pins before it only"),
+        (Some(j), Some((before, at))) => {
+            assert!(N == base.len() + 2, "a declared crossing adds J - 1 and J");
+            out[i] = (j - 1, before);
+            out[i + 1] = (j, at);
+        }
+        (None, Some(_)) => panic!("a v1.7 crossing is pinned only with V1_7_ACTIVATION_HEIGHT armed"),
+    }
+    out
+}
+
+/// H-2: whether `pins` hold both blocks of the v1.7 crossing at `j` (J − 1 and
+/// J); a profile without J has nothing to pin.
+pub const fn v1_7_crossing_pinned_in(pins: &[(u64, [u8; 32])], j: Option<u64>) -> bool {
+    let Some(j) = j else {
+        return true;
+    };
+    let (mut before, mut at) = (false, false);
+    let mut i = 0;
+    while i < pins.len() {
+        if pins[i].0 + 1 == j {
+            before = true;
+        }
+        if pins[i].0 == j {
+            at = true;
+        }
+        i += 1;
+    }
+    before && at
+}
+
+/// H-2: whether a node of this profile needs its v1.7 crossing pinned once its
+/// stored chain reaches J: the public network's. The test chain crossed 8 160
+/// unpinned (one operator, every node redeployed before it, D78) and a private
+/// build starts a new chain.
+pub const V1_7_CROSSING_PIN_REQUIRED: bool = cfg!(not(feature = "testnet"));
 
 /// The test chain was reset on 2026-10-07 (walked from block 6). It crossed
 /// v1.6 at 4 800 on 2026-10-21: 4 799 and 4 800 read
@@ -1237,6 +1325,80 @@ pub(crate) mod hard_checkpoint_tests {
             "the genesis moved: clear HARD_CHECKPOINTS, and pin again only once \
              the new chain has crossed its own fork"
         );
+    }
+
+    /// H-2 (audit 2026-11-10): a v1.7 crossing is pinned when both J − 1 and J are; a profile without J has
+    /// nothing to pin.
+    #[test]
+    fn h2_a_crossing_is_pinned_with_both_of_its_blocks_only() {
+        let pins = [(10, [1; 32]), (95, [2; 32]), (96, [3; 32])];
+        assert!(v1_7_crossing_pinned_in(&pins, Some(96)));
+        assert!(!v1_7_crossing_pinned_in(&pins[..2], Some(96)), "J − 1 alone");
+        assert!(!v1_7_crossing_pinned_in(&[(10, [1; 32]), (96, [3; 32])], Some(96)), "J alone");
+        assert!(!v1_7_crossing_pinned_in(&pins, Some(128)), "another J");
+        assert!(v1_7_crossing_pinned_in(&[], None));
+    }
+
+    /// H-2: the declared crossing joins the pinned list at J − 1 and J, after the pins before it; without a
+    /// declaration the list is the same, entry for entry.
+    #[test]
+    fn h2_the_declared_crossing_joins_the_pinned_list() {
+        let base = [(5, [5; 32]), (9, [9; 32])];
+        let with: [(u64, [u8; 32]); 4] = with_v1_7_crossing(&base, Some(96), Some(([7; 32], [8; 32])));
+        assert_eq!(with, [(5, [5; 32]), (9, [9; 32]), (95, [7; 32]), (96, [8; 32])]);
+        assert_eq!(hard_checkpoint_in(&with, 96), Some([8; 32]));
+        assert_eq!(hard_checkpoint_in(&with, 95), Some([7; 32]));
+        assert!(v1_7_crossing_pinned_in(&with, Some(96)));
+        let without: [(u64, [u8; 32]); 2] = with_v1_7_crossing(&base, Some(96), None);
+        assert_eq!(without, base);
+        assert!(!v1_7_crossing_pinned_in(&without, Some(96)));
+        let unarmed: [(u64, [u8; 32]); 2] = with_v1_7_crossing(&base, None, None);
+        assert_eq!(unarmed, base);
+    }
+
+    /// H-2, the freeze: the public network's crossing is pinned exactly when it is declared — `None` until the
+    /// release that follows it, then J − 1 and J at the end of HARD_CHECKPOINTS, the ids of the raw headers the
+    /// four seeds serve (J − 1, J, J + 1, each the `prev_block_hash` of the next); and its nodes need it once past J.
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn h2_the_public_network_pins_its_v1_7_crossing_exactly_as_declared() {
+        assert!(V1_7_CROSSING_PIN_REQUIRED, "the public network's nodes need the crossing pinned past J");
+        match (V1_7_CROSSING_PINS, V1_7_CROSSING_SEED_HEADERS) {
+            (None, None) => {
+                assert_eq!(HARD_CHECKPOINTS, &PINS_THROUGH_V1_6[..], "nothing pinned beyond v1.6");
+                if let Some(j) = V1_7_ACTIVATION_HEIGHT {
+                    assert!(!v1_7_crossing_pinned_in(HARD_CHECKPOINTS, Some(j)));
+                }
+            }
+            (Some((before, at)), Some(raw)) => {
+                use crate::block_header::BlockHeader;
+                let j = V1_7_ACTIVATION_HEIGHT.expect("a crossing is pinned only with J armed");
+                let n = HARD_CHECKPOINTS.len();
+                assert_eq!(&HARD_CHECKPOINTS[..n - 2], &PINS_THROUGH_V1_6[..]);
+                assert_eq!(HARD_CHECKPOINTS[n - 2..], [(j - 1, before), (j, at)]);
+                let h: Vec<BlockHeader> = raw
+                    .iter()
+                    .map(|hex| {
+                        let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                        BlockHeader::from_bytes(&bytes).expect("a wire header")
+                    })
+                    .collect();
+                assert_eq!((h[0].height, h[1].height, h[2].height), (j - 1, j, j + 1));
+                assert_eq!((block_id(&h[0]), block_id(&h[1])), (before, at));
+                assert_eq!(h[1].prev_block_hash, block_id(&h[0]));
+                assert_eq!(h[2].prev_block_hash, block_id(&h[1]));
+                assert!(v1_7_crossing_pinned_in(HARD_CHECKPOINTS, Some(j)));
+            }
+            _ => panic!("the crossing's pins and the seeds' headers they come from are set together"),
+        }
+    }
+
+    /// H-2: the test chain crossed v1.7 unpinned (one operator, every node redeployed, D78) and a private build
+    /// starts a new chain: neither needs the crossing pinned.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn h2_only_the_public_network_needs_its_crossing_pinned() {
+        assert!(!V1_7_CROSSING_PIN_REQUIRED);
     }
 
     #[test]

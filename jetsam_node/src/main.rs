@@ -2657,6 +2657,37 @@ fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// H-2 (audit 2026-11-10): a release that arms v1.7 at `j` without pinning its
+/// crossing (blocks J − 1 and J in `pins`) does not start on a stored chain
+/// that already reaches J, where its profile needs the crossing pinned
+/// (`params::V1_7_CROSSING_PIN_REQUIRED`, the public network): restarted past J
+/// without those pins, a node can be held by a heavier minority branch of the
+/// old rules (selected by its work, its bodies refused, selected again). Below
+/// J, with both pins, without J or on a profile that needs none, it starts.
+fn refuse_unpinned_v1_7_crossing(
+    tip_height: u64,
+    j: Option<u64>,
+    pins: &[(u64, [u8; 32])],
+    required: bool,
+) -> anyhow::Result<()> {
+    let Some(j) = j else {
+        return Ok(());
+    };
+    if !required
+        || tip_height < j
+        || jetsam_chain::consensus::params::v1_7_crossing_pinned_in(pins, Some(j))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this release arms v1.7 at J = {j} but does not pin its crossing (blocks {} and {j}), and the \
+         stored chain already reaches {tip_height}: restarted past J without those pins, a node can be \
+         held by a heavier minority branch of the old rules (audit H-2). Install the release that pins \
+         the crossing, then start again; nothing was changed",
+        j - 1
+    )
+}
+
 /// Open the stored chain and hold it against the pinned blocks
 /// (`HARD_CHECKPOINTS`). Every new header is checked against them, but a chain
 /// stored by an older release never was: a node that followed the 1.4.3
@@ -2728,6 +2759,35 @@ fn open_chain_on_pinned_branch(
          folder. Syncing again from genesis."
     );
     MdbxChainContext::open_or_create(data_dir).context("open MDBX")
+}
+
+#[cfg(test)]
+mod v1_7_crossing_pin_tests {
+    use super::refuse_unpinned_v1_7_crossing;
+
+    /// H-2 (audit 2026-11-10): a release that arms v1.7 but does not pin its crossing (J − 1 and J) does not
+    /// start on a stored chain that already reaches J, where its profile needs the crossing pinned (the public
+    /// network): restarted there, it could be held by a heavier minority branch of the old rules. Below J, with
+    /// both pins, without J, or on a profile that needs no pin, it starts.
+    #[test]
+    fn h2_an_armed_release_without_its_crossing_pins_refuses_a_chain_past_j() {
+        let j = 69_120;
+        let unpinned = [(46_079, [1; 32]), (46_080, [2; 32])];
+        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (j - 1, [3; 32]), (j, [4; 32])];
+        for tip in [0, j - 1] {
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true).is_ok(), "tip {tip} below J");
+        }
+        for tip in [j, j + 1, j + 10_000] {
+            let e = refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true).unwrap_err().to_string();
+            assert!(e.contains("69120") && e.contains("69119") && e.contains(&tip.to_string()) && e.contains("pins"), "{e}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &pinned, true).is_ok(), "pinned, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, false).is_ok(), "no pin needed, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, None, &unpinned, true).is_ok(), "v1.7 not armed, tip {tip}");
+        }
+        // J − 1 alone, or J alone, is no pinned crossing
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &pinned[..3], true).is_err());
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &[(j, [4; 32])], true).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -3401,6 +3461,12 @@ async fn main() -> anyhow::Result<()> {
         jetsam_chain::consensus::params::HARD_CHECKPOINTS,
     )?;
     let tip_height = ctx.tip_height();
+    refuse_unpinned_v1_7_crossing(
+        tip_height,
+        jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+        jetsam_chain::consensus::params::V1_7_CROSSING_PIN_REQUIRED,
+    )?;
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
     // v1.5 client objects (M3.8): the registered matrices this node holds
