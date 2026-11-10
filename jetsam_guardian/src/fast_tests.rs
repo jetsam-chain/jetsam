@@ -272,3 +272,37 @@ fn a_dry_run_journal_is_checked_line_by_line() {
     let (_, other) = throwaway_key("other").expect("a key");
     assert!(check_journal(&path, &other, 1).is_err());
 }
+
+/// fast-keygen: a secret from the system's randomness, in a 0600 file created
+/// for it (never over another), never in the output; the public key it
+/// prints is the secret's, and signs what the consensus verifies.
+#[test]
+fn fast_keygen_writes_a_0600_secret_and_gives_its_public_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("fast-release.key");
+    let public = fast_keygen(&path).expect("a key");
+    let mode = std::fs::metadata(&path).expect("file").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(text.starts_with(FAST_SECRET_FILE_TAG));
+    assert!(!text.contains(&hex::encode(public)), "the file holds the secret only");
+    let secret = load_fast_secret(&path).expect("loads");
+    assert_eq!(secret.sk_to_pk().compress(), public);
+    let a = sign(&verdict(&real_game(), &bases(), &ancestors()).expect("signed"), &secret);
+    assert_eq!(verify_attestation(&a, Some(&public)), Ok(()));
+    // Never over an existing file (the key there stays as it was).
+    assert!(fast_keygen(&path).is_err());
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    // Another key each time.
+    let other = fast_keygen(&dir.path().join("cold.key")).expect("a key");
+    assert_ne!(other, public);
+    // A secret readable by others is refused.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+    assert!(load_fast_secret(&path).is_err());
+    // Not a secret file.
+    let junk = dir.path().join("junk");
+    std::fs::write(&junk, "jetsam-fast-bls-secret-v1\nzz\n").expect("write");
+    std::fs::set_permissions(&junk, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(load_fast_secret(&junk).is_err());
+}

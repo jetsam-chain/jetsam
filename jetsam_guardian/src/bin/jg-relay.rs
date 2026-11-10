@@ -983,6 +983,19 @@ fn run() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("fast-dry-run") {
         return jetsam_guardian::fast::dry_run_cli(&args[2..]);
     }
+    // The fast lane's keys (the relay's, the cold revocation key): a secret from the system's randomness in a
+    // file created 0600 (never over another), never printed; its public key printed.
+    if args.get(1).map(String::as_str) == Some("fast-keygen") {
+        let out = args
+            .iter()
+            .position(|a| a == "--out")
+            .and_then(|i| args.get(i + 1))
+            .ok_or_else(|| anyhow::anyhow!("fast-keygen --out <file>"))?;
+        let public = jetsam_guardian::fast::fast_keygen(std::path::Path::new(out))?;
+        println!("public 0x{}", hex::encode(public));
+        log(&format!("fast-keygen: secret written to {out} (0600, never printed); public key above"));
+        return Ok(());
+    }
     let (cfg, digest) = config(&args)?;
     if let Some(i) = args.iter().position(|a| a == "--config") {
         let rest: Vec<String> = args.iter().skip(i + 2).cloned().collect();

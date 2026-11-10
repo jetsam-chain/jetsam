@@ -281,6 +281,70 @@ pub fn throwaway_key(label: &str) -> anyhow::Result<(SecretKey, [u8; KEY_BYTES])
 }
 
 // ---------------------------------------------------------------------------
+// The keys (fast-keygen): the relay's key and the cold revocation key
+// ---------------------------------------------------------------------------
+
+/// First line of a secret file written by [`fast_keygen`].
+pub const FAST_SECRET_FILE_TAG: &str = "jetsam-fast-bls-secret-v1";
+
+/// A new BLS12-381 min-pk secret from the system's randomness, written to
+/// `out` (created, never over an existing file, mode 0600), never printed;
+/// its public key (what a profile's `FAST_RELEASE_KEY` or `FAST_REVOKE_KEY`
+/// holds).
+pub fn fast_keygen(out: &Path) -> anyhow::Result<[u8; KEY_BYTES]> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut ikm = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(&mut *ikm).map_err(|e| anyhow!("no randomness from the system: {e}"))?;
+    let secret =
+        SecretKey::key_gen(&*ikm, &[]).map_err(|e| anyhow!("no key from the randomness: {e:?}"))?;
+    let bytes = zeroize::Zeroizing::new(secret.to_bytes());
+    let text = zeroize::Zeroizing::new(format!(
+        "{FAST_SECRET_FILE_TAG}\n{}\n",
+        hex::encode(&*bytes)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out)
+        .with_context(|| format!("{}: not created (an existing file is never replaced)", out.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(secret.sk_to_pk().compress())
+}
+
+/// The secret of a file [`fast_keygen`] wrote; refused when the file is
+/// readable or writable by anyone but its owner.
+pub fn load_fast_secret(path: &Path) -> anyhow::Result<SecretKey> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("{}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "{}: mode {:o}, readable or writable by others than its owner: refused",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    let text = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
+    let mut lines = text.lines();
+    if lines.next() != Some(FAST_SECRET_FILE_TAG) {
+        bail!("{}: not a fast-lane secret file", path.display());
+    }
+    let bytes = zeroize::Zeroizing::new(
+        hex::decode(lines.next().unwrap_or_default().trim())
+            .map_err(|_| anyhow!("{}: not a fast-lane secret file", path.display()))?,
+    );
+    if bytes.len() != 32 || lines.next().is_some() {
+        bail!("{}: not a fast-lane secret file", path.display());
+    }
+    SecretKey::from_bytes(&bytes).map_err(|_| anyhow!("{}: not a BLS secret", path.display()))
+}
+
+// ---------------------------------------------------------------------------
 // Reading (eth_call, eth_getBlockByNumber only)
 // ---------------------------------------------------------------------------
 
