@@ -49,6 +49,12 @@ const MAX_PUBLIC_INBOUND_CONNECTIONS_PER_GROUP: usize = 96;
 // the entire node.
 const INBOUND_UNRESERVED_PEERS: usize = 96;
 const INBOUND_RESERVED_GROUP_PEERS: usize = 8;
+// Audit 2026-11-10, P-2: seven IPs on five /16s held all 128 slots for good.
+// Past this many inbound sessions a newcomer is admitted only by closing the
+// youngest direct session of the most represented group, and only when that
+// group outnumbers the newcomer's own. It sits below the swarm's 128 so a
+// newcomer can still complete its handshake and be judged here at all.
+const INBOUND_EVICTION_THRESHOLD: usize = 120;
 // Onion peers (D60) have no IP group, and an onion address costs nothing to
 // make. Every one of them rides Tor, so Tor is treated as their carrier. A
 // dual node, which has clearnet neighbours to keep diverse, lets all onion
@@ -118,6 +124,8 @@ pub(crate) enum DiversityRejection {
     InboundUnclassifiedReserve,
     OutboundOnionFull,
     InboundOnionFull,
+    /// Past the eviction threshold with no group outnumbering the newcomer's.
+    InboundEvictionRefused { group: PublicNetworkGroup },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +144,8 @@ struct TrackedConnection {
     /// `failure_domain` keeps treating everyone behind one relay as sharing a
     /// fate — which they do — while admission is budgeted per carrier.
     relay: Option<PeerId>,
+    /// Admission order: eviction closes the youngest session of a group.
+    admitted: u64,
 }
 
 /// Tracks admitted public connections so limits are released exactly when the
@@ -160,6 +170,9 @@ pub(crate) struct PeerDiversity {
     onion_listeners: HashSet<Multiaddr>,
     onion_peers: HashMap<bool, HashMap<PeerId, usize>>,
     onion_connections: HashMap<ConnectionId, (PeerId, bool)>,
+    next_admission: u64,
+    /// Sessions chosen for eviction whose close has not arrived yet.
+    evicting: HashSet<ConnectionId>,
 }
 
 impl PeerDiversity {
@@ -244,6 +257,110 @@ impl PeerDiversity {
             .insert(connection_id, (peer, outbound));
         self.connections.insert(connection_id, None);
         Ok(())
+    }
+
+    /// [`Self::try_admit_endpoint`], then inbound eviction (audit 2026-11-10,
+    /// P-2): `Ok(Some(victim))` names an admitted connection the caller must
+    /// close to make room for this one.
+    pub(crate) fn try_admit_endpoint_with_eviction(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        endpoint: &ConnectedPoint,
+    ) -> Result<Option<ConnectionId>, DiversityRejection> {
+        self.try_admit_endpoint(connection_id, peer, endpoint)?;
+        // Only a direct public session can trigger, or suffer, an eviction:
+        // onion, LAN and relayed sessions keep the bounds they always had.
+        let Some(Some(admitted)) = self.connections.get(&connection_id).copied() else {
+            return Ok(None);
+        };
+        if !matches!(admitted.direction, TrackedDirection::Inbound) || admitted.relay.is_some() {
+            return Ok(None);
+        }
+        if self
+            .inbound_connection_count()
+            .saturating_sub(self.evicting.len())
+            <= INBOUND_EVICTION_THRESHOLD
+        {
+            return Ok(None);
+        }
+        match self.eviction_victim(connection_id, admitted.group) {
+            Some(victim) => {
+                self.evicting.insert(victim);
+                Ok(Some(victim))
+            }
+            None => {
+                self.remove(connection_id);
+                Err(DiversityRejection::InboundEvictionRefused {
+                    group: admitted.group,
+                })
+            }
+        }
+    }
+
+    /// The youngest direct inbound session of the most represented group,
+    /// when that group outnumbers the newcomer's own.
+    fn eviction_victim(
+        &self,
+        newcomer: ConnectionId,
+        newcomer_group: PublicNetworkGroup,
+    ) -> Option<ConnectionId> {
+        let mut groups: HashMap<PublicNetworkGroup, (usize, Option<(u64, ConnectionId)>)> =
+            HashMap::new();
+        for (connection_id, connection) in &self.connections {
+            let Some(connection) = connection else {
+                continue;
+            };
+            if !matches!(connection.direction, TrackedDirection::Inbound)
+                || connection.relay.is_some()
+                || self.evicting.contains(connection_id)
+            {
+                continue;
+            }
+            let (count, youngest) = groups.entry(connection.group).or_insert((0, None));
+            *count += 1;
+            if *connection_id != newcomer
+                && youngest.is_none_or(|(admitted, _)| connection.admitted > admitted)
+            {
+                *youngest = Some((connection.admitted, *connection_id));
+            }
+        }
+        let newcomer_count = groups.get(&newcomer_group).map_or(1, |(count, _)| *count);
+        let (count, youngest) = groups
+            .values()
+            .max_by_key(|(count, youngest)| (*count, youngest.map(|(admitted, _)| admitted)))?;
+        if *count <= newcomer_count {
+            return None;
+        }
+        youngest.map(|(_, connection_id)| connection_id)
+    }
+
+    fn next_admission(&mut self) -> u64 {
+        self.next_admission += 1;
+        self.next_admission
+    }
+
+    /// Distinct peers this node currently reaches through a relay circuit.
+    pub(crate) fn outbound_relayed_peer_count(&self) -> usize {
+        self.outbound_relays
+            .values()
+            .flat_map(HashMap::keys)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// The globally routable IPs `peer` is connected from on a direct path.
+    pub(crate) fn direct_public_ips(&self, peer: PeerId) -> Vec<IpAddr> {
+        let mut ips = self
+            .connections
+            .values()
+            .flatten()
+            .filter(|connection| connection.peer == peer && connection.relay.is_none())
+            .map(|connection| connection.ip)
+            .collect::<Vec<_>>();
+        ips.sort();
+        ips.dedup();
+        ips
     }
 
     pub(crate) fn public_group_for_peer(&self, peer: PeerId) -> Option<PublicNetworkGroup> {
@@ -338,6 +455,7 @@ impl PeerDiversity {
                 }
                 increment_peer_count(&mut self.inbound_relays, relay, peer);
             }
+            let admitted = self.next_admission();
             let previous = self.connections.insert(
                 connection_id,
                 Some(TrackedConnection {
@@ -350,6 +468,7 @@ impl PeerDiversity {
                         TrackedDirection::Inbound
                     },
                     relay: Some(relay),
+                    admitted,
                 }),
             );
             debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
@@ -386,6 +505,7 @@ impl PeerDiversity {
             increment_peer_count(&mut self.inbound_groups, group, peer);
             TrackedDirection::Inbound
         };
+        let admitted = self.next_admission();
         let previous = self.connections.insert(
             connection_id,
             Some(TrackedConnection {
@@ -394,6 +514,7 @@ impl PeerDiversity {
                 group,
                 direction,
                 relay: None,
+                admitted,
             }),
         );
         debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
@@ -402,6 +523,7 @@ impl PeerDiversity {
 
     pub(crate) fn remove(&mut self, connection_id: ConnectionId) -> bool {
         self.unclassified_inbound.remove(&connection_id);
+        self.evicting.remove(&connection_id);
         if let Some((peer, outbound)) = self.onion_connections.remove(&connection_id) {
             decrement_peer_count(&mut self.onion_peers, outbound, peer);
         }
@@ -499,6 +621,7 @@ impl PeerDiversity {
             }
             increment_peer_count(&mut self.outbound_groups, group, peer);
         }
+        let admitted = self.next_admission();
         self.connections.insert(
             connection_id,
             Some(TrackedConnection {
@@ -507,6 +630,7 @@ impl PeerDiversity {
                 group,
                 direction: TrackedDirection::Outbound,
                 relay,
+                admitted,
             }),
         );
         Ok(())
@@ -844,6 +968,250 @@ mod tests {
             ),
             Err(DiversityRejection::InboundUnclassifiedReserve)
         ));
+    }
+
+    fn listener(remote: &str) -> ConnectedPoint {
+        ConnectedPoint::Listener {
+            local_addr: addr("/ip4/0.0.0.0/tcp/9700"),
+            send_back_addr: addr(remote),
+        }
+    }
+
+    /// Audit 2026-11-10, P-2: three IPs of one /16 plus a few other /16s
+    /// filled every inbound slot of a seed, and nothing ever made room.
+    #[test]
+    fn a_full_inbound_table_makes_room_for_a_new_network_group() {
+        let mut diversity = PeerDiversity::default();
+        let mut id = 0usize;
+        let mut crowded = Vec::new();
+        for host in 1..=3u8 {
+            for _ in 0..MAX_PUBLIC_INBOUND_PEERS_PER_IP {
+                id += 1;
+                let connection = ConnectionId::new_unchecked(id);
+                let remote = listener(&format!("/ip4/8.8.0.{host}/tcp/40000"));
+                assert_eq!(
+                    diversity.try_admit_endpoint_with_eviction(
+                        connection,
+                        PeerId::random(),
+                        &remote
+                    ),
+                    Ok(None)
+                );
+                crowded.push(connection);
+            }
+        }
+        for first_octet in 20u8..23 {
+            for _ in 0..INBOUND_RESERVED_GROUP_PEERS {
+                id += 1;
+                let remote = listener(&format!("/ip4/{first_octet}.1.1.1/tcp/40000"));
+                assert_eq!(
+                    diversity.try_admit_endpoint_with_eviction(
+                        ConnectionId::new_unchecked(id),
+                        PeerId::random(),
+                        &remote
+                    ),
+                    Ok(None)
+                );
+            }
+        }
+        assert_eq!(
+            diversity.inbound_connection_count(),
+            INBOUND_EVICTION_THRESHOLD
+        );
+
+        id += 1;
+        let victim = diversity
+            .try_admit_endpoint_with_eviction(
+                ConnectionId::new_unchecked(id),
+                PeerId::random(),
+                &listener("/ip4/77.1.2.3/tcp/40000"),
+            )
+            .expect("a new network group is admitted")
+            .expect("the most represented group makes room");
+        assert_eq!(
+            Some(&victim),
+            crowded.last(),
+            "the youngest session of the most represented group"
+        );
+
+        id += 1;
+        assert!(
+            diversity
+                .try_admit_endpoint_with_eviction(
+                    ConnectionId::new_unchecked(id),
+                    PeerId::random(),
+                    &listener("/ip4/8.8.0.1/tcp/40000"),
+                )
+                .is_err(),
+            "the crowded group cannot take the slot back"
+        );
+
+        id += 1;
+        let second = diversity
+            .try_admit_endpoint_with_eviction(
+                ConnectionId::new_unchecked(id),
+                PeerId::random(),
+                &listener("/ip4/78.1.2.3/tcp/40000"),
+            )
+            .expect("a second new group is admitted")
+            .expect("by evicting from the crowded one");
+        assert_eq!(Some(&second), crowded.get(crowded.len() - 2));
+
+        assert!(diversity.remove(victim));
+        assert!(diversity.remove(second));
+        assert_eq!(
+            diversity.inbound_connection_count(),
+            INBOUND_EVICTION_THRESHOLD
+        );
+    }
+
+    /// Below the threshold nothing is ever evicted: the real network keeps
+    /// connecting exactly as before.
+    #[test]
+    fn eviction_starts_only_past_the_threshold() {
+        let mut diversity = PeerDiversity::default();
+        for id in 1..=INBOUND_EVICTION_THRESHOLD {
+            let remote = listener(&format!(
+                "/ip4/{}.{}.1.1/tcp/40000",
+                30 + id / 200,
+                id % 200
+            ));
+            assert_eq!(
+                diversity.try_admit_endpoint_with_eviction(
+                    ConnectionId::new_unchecked(id),
+                    PeerId::random(),
+                    &remote
+                ),
+                Ok(None),
+                "connection {id}"
+            );
+        }
+        // Every group holds one session: no group outnumbers a newcomer.
+        assert!(diversity
+            .try_admit_endpoint_with_eviction(
+                ConnectionId::new_unchecked(10_000),
+                PeerId::random(),
+                &listener("/ip4/99.99.1.1/tcp/40000"),
+            )
+            .is_err());
+    }
+
+    /// Onion sessions (all from the local Tor process) and LAN sessions are
+    /// never chosen: only a direct public session can be evicted.
+    #[test]
+    fn eviction_never_closes_an_onion_or_lan_session() {
+        let mut diversity = PeerDiversity::default();
+        let mut id = 0usize;
+        for _ in 0..INBOUND_UNRESERVED_PEERS {
+            id += 1;
+            diversity
+                .try_admit_endpoint_with_eviction(
+                    ConnectionId::new_unchecked(id),
+                    PeerId::random(),
+                    &listener("/ip4/127.0.0.1/tcp/40000"),
+                )
+                .unwrap();
+        }
+        let mut public = Vec::new();
+        for first_octet in 40u8..43 {
+            for _ in 0..INBOUND_RESERVED_GROUP_PEERS {
+                id += 1;
+                diversity
+                    .try_admit_endpoint_with_eviction(
+                        ConnectionId::new_unchecked(id),
+                        PeerId::random(),
+                        &listener(&format!("/ip4/{first_octet}.1.1.1/tcp/40000")),
+                    )
+                    .unwrap();
+                public.push(ConnectionId::new_unchecked(id));
+            }
+        }
+        id += 1;
+        let victim = diversity
+            .try_admit_endpoint_with_eviction(
+                ConnectionId::new_unchecked(id),
+                PeerId::random(),
+                &listener("/ip4/77.1.2.3/tcp/40000"),
+            )
+            .unwrap()
+            .expect("a public group outnumbers the newcomer");
+        assert!(public.contains(&victim));
+    }
+
+    /// Audit 2026-11-10, P-6: an IP ban must name only the peer's own direct
+    /// public addresses, never a relay's or a shared private one.
+    #[test]
+    fn direct_public_ips_name_only_the_peers_direct_public_paths() {
+        let mut diversity = PeerDiversity::default();
+        let peer = PeerId::random();
+        let relay = PeerId::random();
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(1),
+                peer,
+                &addr("/ip4/8.8.8.8/tcp/40000"),
+                false,
+            )
+            .unwrap();
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(2),
+                peer,
+                &addr(&format!(
+                    "/ip4/9.9.9.9/tcp/9700/p2p/{relay}/p2p-circuit/p2p/{peer}"
+                )),
+                false,
+            )
+            .unwrap();
+        let other = PeerId::random();
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(3),
+                other,
+                &addr("/ip4/10.0.0.1/tcp/40000"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            diversity.direct_public_ips(peer),
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+        assert!(diversity.direct_public_ips(other).is_empty());
+    }
+
+    /// Audit 2026-11-10, P-5: the automatic topology needs to know how many of
+    /// its neighbours ride a circuit, whatever relay carries them.
+    #[test]
+    fn relayed_outbound_peers_are_counted_across_relays() {
+        let mut diversity = PeerDiversity::default();
+        let mut id = 0usize;
+        for relay in [PeerId::random(), PeerId::random()] {
+            for _ in 0..2 {
+                id += 1;
+                let peer = PeerId::random();
+                diversity
+                    .try_admit(
+                        ConnectionId::new_unchecked(id),
+                        peer,
+                        &addr(&format!(
+                            "/ip4/8.8.8.8/tcp/9700/p2p/{relay}/p2p-circuit/p2p/{peer}"
+                        )),
+                        true,
+                    )
+                    .unwrap();
+            }
+        }
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(99),
+                PeerId::random(),
+                &addr("/ip4/9.9.1.1/tcp/9700"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(diversity.outbound_relayed_peer_count(), 4);
+        assert!(diversity.remove(ConnectionId::new_unchecked(1)));
+        assert_eq!(diversity.outbound_relayed_peer_count(), 3);
     }
 
     #[test]

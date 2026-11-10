@@ -738,7 +738,15 @@ struct SyncPath {
     availability_capable: bool,
     profile_handshake_started: bool,
     closing: bool,
+    established_at: Instant,
 }
+
+/// An inbound session whose dialer has not completed the network-profile
+/// handshake by then is closed (audit 2026-11-10, P-2). Only the dialer
+/// starts that handshake, so an inbound path that never asks kept its slot
+/// for good. An honest dialer asks as soon as Identify arrives and gives up
+/// itself after its 10 s request timeout; the margin covers Tor.
+const INBOUND_PROFILE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Mirrors every connection visible to request-response and exposes only
 /// peers for which arbitrary per-peer connection selection is safe.
@@ -1034,9 +1042,29 @@ impl PeerSyncPaths {
                 availability_capable: false,
                 profile_handshake_started: false,
                 closing: false,
+                established_at: Instant::now(),
             },
         );
         debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
+    }
+
+    /// Inbound paths past [`INBOUND_PROFILE_DEADLINE`] whose peer has no
+    /// verified network profile.
+    fn expired_unprofiled_inbound(
+        &self,
+        now: Instant,
+    ) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
+        self.paths
+            .iter()
+            .filter(|(_, path)| {
+                !path.dialer
+                    && !path.closing
+                    && !self.profile_verified.contains(&path.peer)
+                    && now.saturating_duration_since(path.established_at)
+                        >= INBOUND_PROFILE_DEADLINE
+            })
+            .map(|(connection_id, path)| (*connection_id, path.peer))
+            .collect()
     }
 
     /// Select one canonical direct path and return exact connections to close.
@@ -1224,6 +1252,8 @@ enum PendingAutomaticDial {
     Peer {
         peer: PeerId,
         group: PublicNetworkGroup,
+        /// The dial rides a relay circuit (audit 2026-11-10, P-5).
+        relayed: bool,
     },
     /// A direct address learned through mDNS. LAN discovery shares the same
     /// bounded neighbour slots but has no public failure-domain group.
@@ -1844,12 +1874,20 @@ impl AutomaticPeerState {
                 PendingAutomaticDial::Peer {
                     peer,
                     group: candidate_group,
+                    ..
                 } if *candidate_group == group => Some(*peer),
                 PendingAutomaticDial::Lan { .. } => None,
                 _ => None,
             })
             .collect::<std::collections::HashSet<_>>()
             .len()
+    }
+
+    fn pending_circuit_count(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|pending| matches!(pending, PendingAutomaticDial::Peer { relayed: true, .. }))
+            .count()
     }
 
     fn pending_bootstrap_count(&self) -> usize {
@@ -4039,6 +4077,14 @@ async fn run_swarm(
     let txs_topic = gossipsub::IdentTopic::new(topics.txs.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
+    // The transaction topic keeps no score: its rejections are decided by the
+    // node, which does not know the author, and a transaction format a newer
+    // release adds would otherwise graylist the honest neighbours relaying it.
+    crate::behaviour::apply_topic_scores(
+        &mut swarm.behaviour_mut().gossipsub,
+        std::slice::from_ref(&blocks_topic),
+    )
+    .map_err(|error| anyhow::anyhow!("gossipsub topic scores: {error}"))?;
     // v1.5 client objects (M3.8): their own request-response behaviour and
     // announcement topic, handled beside the main reactor. A node without
     // client objects (no v1.5 relation armed) answers every request with
@@ -4191,6 +4237,10 @@ async fn run_swarm(
     let header_response_prepare_semaphore = Arc::new(Semaphore::new(
         background_capacity.header_response_prepare_slots(),
     ));
+    let header_preparation_peers = PeerPreparationSlots::default();
+    let header_inventory_cache = Arc::new(std::sync::Mutex::new(
+        crate::header_protocol::HeaderInventoryCache::default(),
+    ));
     let history_step_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
     let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
@@ -4308,6 +4358,8 @@ async fn run_swarm(
                     &network_profile,
                     &header_response_tx,
                     &header_response_prepare_semaphore,
+                    &header_preparation_peers,
+                    &header_inventory_cache,
                     &history_step_response_tx,
                     &history_step_response_prepare_semaphore,
                     &segment_response_tx,
@@ -4822,6 +4874,15 @@ async fn run_swarm(
             _ = automatic_peer_timer.tick() => {
                 client_transport.sweep(&required_event_tx);
                 let now = Instant::now();
+                for (connection_id, peer) in sync_paths.expired_unprofiled_inbound(now) {
+                    sync_paths.mark_closing(connection_id);
+                    if swarm.close_connection(connection_id) {
+                        tracing::debug!(
+                            peer = %peer,
+                            "closing inbound connection whose dialer never verified the network profile"
+                        );
+                    }
+                }
                 let mut wedged_sync_peers = std::collections::HashSet::new();
 
                 let expired_profiles = pending_network_profile_requests.take_where_entries(
@@ -5592,6 +5653,7 @@ fn begin_peer_dial(
     addr: Multiaddr,
     group: PublicNetworkGroup,
 ) -> bool {
+    let relayed = crate::peer_diversity::circuit_relay(&addr).is_some();
     let options = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
         .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
         // Maintained neighbours are ordinary outbound sessions. Allocate an
@@ -5602,9 +5664,14 @@ fn begin_peer_dial(
         .addresses(vec![addr])
         .build();
     let connection_id = options.connection_id();
-    automatic
-        .pending
-        .insert(connection_id, PendingAutomaticDial::Peer { peer, group });
+    automatic.pending.insert(
+        connection_id,
+        PendingAutomaticDial::Peer {
+            peer,
+            group,
+            relayed,
+        },
+    );
     match swarm.dial(options) {
         Ok(()) => {
             tracing::debug!(peer = %peer, "automatic peer dial started");
@@ -5879,6 +5946,14 @@ fn maintain_automatic_outbound(
         addrs.shuffle(&mut rand::thread_rng());
         prioritize_peer_addresses(peer, &attempted_addrs, &mut addrs);
         let selected = addrs.into_iter().find_map(|addr| {
+            if crate::peer_diversity::circuit_relay(&addr).is_some()
+                && !automatic_circuit_room(
+                    peer_diversity.outbound_relayed_peer_count(),
+                    automatic.pending_circuit_count(),
+                )
+            {
+                return None;
+            }
             let group = peer_diversity.dial_group(&addr)?;
             let pending_same_group = automatic.pending_group_count(group);
             peer_diversity
@@ -5899,6 +5974,146 @@ fn maintain_automatic_outbound(
     }
 }
 
+/// Our canonical tip as [`crate::header_protocol::precheck_announcement`]
+/// needs it, read from the MVCC store (never the chain lock).
+fn announcement_reference(
+    store: &MdbxStore,
+) -> Option<crate::header_protocol::AnnouncementReference> {
+    let (tip_height, _) = store.get_chain_tip().ok().flatten()?;
+    let headers = store.get_headers(tip_height.saturating_sub(1), 2).ok()?;
+    let tip = headers.iter().find(|header| header.height == tip_height)?;
+    // A snapshot-installed tip may lack its parent: assume the slowest block.
+    let tip_parent_timestamp = headers
+        .iter()
+        .find(|header| header.height.saturating_add(1) == tip_height)
+        .map_or_else(
+            || {
+                tip.timestamp
+                    .saturating_sub(jetsam_chain::consensus::params::BLOCK_TIME_V1_5)
+            },
+            |parent| parent.timestamp,
+        );
+    Some(crate::header_protocol::AnnouncementReference {
+        tip_height,
+        tip_target: tip.difficulty_target,
+        tip_parent_timestamp,
+    })
+}
+
+/// The verdict on a message rejected for its bytes alone (audit 2026-11-10,
+/// P-6). Now that a `Reject` costs the forwarder its score on the block topic,
+/// only the signed author who handed it to us directly is blamed: a release
+/// that does not yet pre-check announcements (v1.6) relays such a header in
+/// good faith, and graylisting it would also drop its real blocks.
+fn rejection_from(
+    author: Option<PeerId>,
+    propagation_source: PeerId,
+) -> gossipsub::MessageAcceptance {
+    if author == Some(propagation_source) {
+        gossipsub::MessageAcceptance::Reject
+    } else {
+        gossipsub::MessageAcceptance::Ignore
+    }
+}
+
+fn unix_time_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Disconnect `peer` and refuse it, and the public IPs it reached us from
+/// directly, for [`crate::behaviour::PEER_BAN_DURATION`] (audit 2026-11-10,
+/// P-6). Used only for a fault no honest peer of any release can commit.
+fn penalize_peer(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    peer_diversity: &PeerDiversity,
+    peer: PeerId,
+    reason: &'static str,
+) {
+    let ips = peer_diversity.direct_public_ips(peer);
+    swarm
+        .behaviour_mut()
+        .inbound_gate
+        .ban(peer, ips.iter().copied(), Instant::now());
+    swarm.behaviour_mut().kad.remove_peer(&peer);
+    let _ = swarm.disconnect_peer_id(peer);
+    tracing::info!(
+        peer = %peer,
+        ?ips,
+        reason,
+        ban_s = crate::behaviour::PEER_BAN_DURATION.as_secs(),
+        "penalized peer: disconnected and refused for a while"
+    );
+}
+
+/// Header-range preparations one peer may hold at once on the shared
+/// workers (audit 2026-11-10, P-3). A single peer used to occupy all of them.
+/// Two, not one: an honest node can overlap a general header fetch with a
+/// snapshot header fetch to the same source.
+const MAX_HEADER_PREPARATIONS_PER_PEER: usize = 2;
+
+/// Per-peer share of a pool of preparation workers.
+#[derive(Clone, Default)]
+struct PeerPreparationSlots {
+    active: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>,
+}
+
+/// One held share; released when dropped, wherever the preparation ends.
+struct PeerPreparationSlot {
+    active: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, usize>>>,
+    peer: PeerId,
+}
+
+impl PeerPreparationSlots {
+    fn try_acquire(&self, peer: PeerId, per_peer: usize) -> Option<PeerPreparationSlot> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = active.get(&peer).copied().unwrap_or(0);
+        if held >= per_peer {
+            return None;
+        }
+        active.insert(peer, held + 1);
+        Some(PeerPreparationSlot {
+            active: Arc::clone(&self.active),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerPreparationSlot {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = active.get_mut(&self.peer) {
+            *held -= 1;
+            if *held == 0 {
+                active.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Retained-object inventory is served to peers with a verified network
+/// profile only (audit 2026-11-10, P-3); a header-only range stays open.
+fn header_inventory_allowed(include_inventory: bool, profile_verified: bool) -> bool {
+    !include_inventory || profile_verified
+}
+
+/// Automatic neighbours that may ride a relay circuit, whatever the relay
+/// (audit 2026-11-10, P-5). One host with a relay and a handful of reserved
+/// identities used to hold all eight automatic outbound slots of a private
+/// node. Half of them stay direct, under the per-/16 budget.
+const MAX_AUTOMATIC_RELAYED_NEIGHBOURS: usize = AUTOMATIC_OUTBOUND_TARGET / 2;
+
+fn automatic_circuit_room(relayed_peers: usize, pending_circuits: usize) -> bool {
+    relayed_peers.saturating_add(pending_circuits) < MAX_AUTOMATIC_RELAYED_NEIGHBOURS
+}
+
 fn desired_bootstrap_connections(
     bootstrap_complete: bool,
     stable_non_bootstrap: usize,
@@ -5911,7 +6126,12 @@ fn desired_bootstrap_connections(
     // Once sync is complete, one independently discovered connection replaces
     // the bootstrap transport. The replacement is established first by the
     // caller, so releasing the seed never creates a connectivity gap.
-    fanout.saturating_sub(stable_non_bootstrap)
+    // One seed always stays (audit 2026-11-10, P-5): "stable" only means 30 s
+    // after Identify, so neighbours chosen by an attacker used to release
+    // every seed and leave the node with nobody but them.
+    fanout
+        .saturating_sub(stable_non_bootstrap)
+        .max(fanout.min(1))
 }
 
 /// Pending DNS transports are probes, not authenticated connectivity. Keep
@@ -6692,6 +6912,8 @@ async fn handle_swarm_event(
     network_profile: &NetworkProfile,
     header_response_tx: &mpsc::Sender<PendingHeaderResponse>,
     header_response_prepare_semaphore: &Arc<Semaphore>,
+    header_preparation_peers: &PeerPreparationSlots,
+    header_inventory_cache: &Arc<std::sync::Mutex<crate::header_protocol::HeaderInventoryCache>>,
     history_step_response_tx: &mpsc::Sender<PendingHistoryStepTerminalResponse>,
     history_step_response_prepare_semaphore: &Arc<Semaphore>,
     segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
@@ -6823,6 +7045,30 @@ async fn handle_swarm_event(
                             tracing::debug!(peer = %propagation_source, "block announcement rate limit exceeded — dropped before propagation");
                             return;
                         }
+                        // Audit 2026-11-10, P-4: judge the proof of work before
+                        // anything is relayed.
+                        let precheck = crate::header_protocol::precheck_announcement(
+                            &announcement.header,
+                            announcement_reference(chain_store).as_ref(),
+                            unix_time_now(),
+                        );
+                        if precheck == crate::header_protocol::AnnouncementPrecheck::Invalid {
+                            report_gossip_validation(
+                                swarm,
+                                &message_id,
+                                &propagation_source,
+                                rejection_from(message.source, propagation_source),
+                            );
+                            if message.source == Some(propagation_source) {
+                                penalize_peer(
+                                    swarm,
+                                    peer_diversity,
+                                    propagation_source,
+                                    "authored a header announcement without valid proof of work",
+                                );
+                            }
+                            return;
+                        }
                         let source_has_objects = direct_origin.is_some()
                             && announcement.providers.serves_body()
                             && announcement.providers.serves_terminal();
@@ -6835,7 +7081,9 @@ async fn handle_swarm_event(
                             swarm,
                             &message_id,
                             &propagation_source,
-                            if queued.is_ok() {
+                            if queued.is_ok()
+                                && precheck == crate::header_protocol::AnnouncementPrecheck::Relay
+                            {
                                 gossipsub::MessageAcceptance::Accept
                             } else {
                                 gossipsub::MessageAcceptance::Ignore
@@ -6850,7 +7098,7 @@ async fn handle_swarm_event(
                             swarm,
                             &message_id,
                             &propagation_source,
-                            gossipsub::MessageAcceptance::Reject,
+                            rejection_from(message.source, propagation_source),
                         );
                         tracing::debug!(
                             peer = %propagation_source,
@@ -8051,12 +8299,24 @@ async fn handle_swarm_event(
             let start_height = request.start_height;
             let include_inventory = request.include_inventory;
             let store = chain_store.clone();
-            let preparation_permit = match header_response_prepare_semaphore
-                .clone()
-                .try_acquire_owned()
-            {
-                Ok(permit) => permit,
-                Err(_) => {
+            // Audit 2026-11-10, P-3: retained inventory only for a verified
+            // profile, and one peer holds only its share of the workers.
+            let admitted = header_inventory_allowed(
+                include_inventory,
+                sync_paths.profile_verified.contains(&peer),
+            )
+            .then(|| header_preparation_peers.try_acquire(peer, MAX_HEADER_PREPARATIONS_PER_PEER))
+            .flatten()
+            .and_then(|peer_slot| {
+                header_response_prepare_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| (peer_slot, permit))
+            });
+            let (peer_slot, preparation_permit) = match admitted {
+                Some(admitted) => admitted,
+                None => {
                     let retry_after_ms = data_plane_busy_retry_ms(*swarm.local_peer_id(), peer);
                     let response = GetHeadersResponse {
                         status: DataResponseStatus::Busy { retry_after_ms },
@@ -8083,8 +8343,10 @@ async fn handle_swarm_event(
                 }
             };
             let completion = header_response_tx.clone();
+            let inventory_cache = Arc::clone(header_inventory_cache);
             tokio::spawn(async move {
                 let _preparation_permit = preparation_permit;
+                let _peer_slot = peer_slot;
                 let loaded = tokio::task::spawn_blocking(move || {
                     let snapshot_boundary = local_history_step_boundary(&store)
                         .map(|(height, hash)| crate::object_protocol::ChainPoint::new(height, hash));
@@ -8131,10 +8393,12 @@ async fn handle_swarm_event(
                                             })
                                         })
                                         .flatten();
-                                    match HeaderInventoryRecord::from_retained_objects(
+                                    match crate::header_protocol::HeaderInventoryCache::record_through(
+                                        &inventory_cache,
                                         header,
                                         body.as_deref(),
                                         terminal.as_deref(),
+                                        HeaderInventoryRecord::from_retained_objects,
                                     ) {
                                         Ok(record) => record,
                                         Err(error) => {
@@ -9324,9 +9588,20 @@ async fn handle_swarm_event(
             let dialer = endpoint.is_dialer();
             let direct = !endpoint.is_relayed();
             sync_paths.insert(connection_id, peer_id, direct, dialer);
-            if let Err(reason) =
-                peer_diversity.try_admit_endpoint(connection_id, peer_id, &endpoint)
-            {
+            let admission =
+                peer_diversity.try_admit_endpoint_with_eviction(connection_id, peer_id, &endpoint);
+            if let Ok(Some(victim)) = admission {
+                // Audit 2026-11-10, P-2: a full inbound table makes room for a
+                // newcomer from an under-represented network group.
+                sync_paths.mark_closing(victim);
+                let _ = swarm.close_connection(victim);
+                tracing::debug!(
+                    newcomer = %peer_id,
+                    ?victim,
+                    "evicting the youngest inbound session of the most represented group"
+                );
+            }
+            if let Err(reason) = admission {
                 sync_paths.mark_closing(connection_id);
                 automatic_peers.note_dial_failed(connection_id);
                 let _ = swarm.close_connection(connection_id);
@@ -10432,6 +10707,41 @@ mod tests {
         assert!(!paths.should_start_profile_handshake(connection));
     }
 
+    /// Audit 2026-11-10, P-2: an inbound path whose dialer never asks for the
+    /// network profile used to keep its slot for good.
+    #[test]
+    fn an_inbound_path_without_a_verified_profile_is_closed_after_the_deadline() {
+        let silent = PeerId::random();
+        let honest = PeerId::random();
+        let dialed = PeerId::random();
+        let silent_path = libp2p::swarm::ConnectionId::new_unchecked(100_010);
+        let honest_path = libp2p::swarm::ConnectionId::new_unchecked(100_011);
+        let dialed_path = libp2p::swarm::ConnectionId::new_unchecked(100_012);
+        let mut paths = PeerSyncPaths::default();
+        let start = Instant::now();
+        paths.insert(silent_path, silent, true, false);
+        paths.insert(honest_path, honest, true, false);
+        paths.insert(dialed_path, dialed, true, true);
+        paths.mark_identified(silent_path);
+        paths.mark_identified(honest_path);
+        paths.mark_profile_verified(honest);
+
+        assert!(paths
+            .expired_unprofiled_inbound(start + INBOUND_PROFILE_DEADLINE - Duration::from_secs(1))
+            .is_empty());
+        let late = start + INBOUND_PROFILE_DEADLINE + Duration::from_secs(1);
+        assert_eq!(
+            paths.expired_unprofiled_inbound(late),
+            vec![(silent_path, silent)]
+        );
+
+        paths.mark_closing(silent_path);
+        assert!(
+            paths.expired_unprofiled_inbound(late).is_empty(),
+            "a path already closing is not closed twice"
+        );
+    }
+
     #[test]
     fn replacement_listener_waits_for_the_dialers_profile_request() {
         let peer = PeerId::random();
@@ -10887,9 +11197,112 @@ mod tests {
         assert_eq!(RequestFailureKind::from(&transient), RequestFailureKind::Io);
     }
 
+    /// Audit 2026-11-10, P-3: one peer held every header preparation worker.
+    #[test]
+    fn one_peer_holds_at_most_its_share_of_header_preparations() {
+        let slots = PeerPreparationSlots::default();
+        let peer = PeerId::random();
+        let first = slots.try_acquire(peer, MAX_HEADER_PREPARATIONS_PER_PEER);
+        let second = slots.try_acquire(peer, MAX_HEADER_PREPARATIONS_PER_PEER);
+        assert!(first.is_some() && second.is_some());
+        assert!(slots
+            .try_acquire(peer, MAX_HEADER_PREPARATIONS_PER_PEER)
+            .is_none());
+        assert!(slots
+            .try_acquire(PeerId::random(), MAX_HEADER_PREPARATIONS_PER_PEER)
+            .is_some());
+        drop(first);
+        assert!(slots
+            .try_acquire(peer, MAX_HEADER_PREPARATIONS_PER_PEER)
+            .is_some());
+        drop(second);
+        assert!(
+            slots.active.lock().unwrap().is_empty(),
+            "a peer with nothing in flight leaves no entry behind"
+        );
+        assert!(
+            MAX_HEADER_PREPARATIONS_PER_PEER
+                < BackgroundCapacity::Full.header_response_prepare_slots()
+        );
+        assert!(
+            MAX_HEADER_PREPARATIONS_PER_PEER
+                < BackgroundCapacity::MiningReserved.header_response_prepare_slots()
+        );
+    }
+
+    /// Audit 2026-11-10, P-6: only the signed author that handed us a bad
+    /// message is penalized; an honest relayer of an older release is not.
+    #[test]
+    fn only_the_direct_author_of_a_bad_message_is_penalized() {
+        let author = PeerId::random();
+        let relayer = PeerId::random();
+        assert_eq!(
+            rejection_from(Some(author), author),
+            gossipsub::MessageAcceptance::Reject
+        );
+        assert_eq!(
+            rejection_from(Some(author), relayer),
+            gossipsub::MessageAcceptance::Ignore
+        );
+        assert_eq!(
+            rejection_from(None, relayer),
+            gossipsub::MessageAcceptance::Ignore
+        );
+    }
+
+    #[test]
+    fn retained_inventory_is_served_to_verified_profiles_only() {
+        assert!(header_inventory_allowed(false, false));
+        assert!(header_inventory_allowed(false, true));
+        assert!(header_inventory_allowed(true, true));
+        assert!(!header_inventory_allowed(true, false));
+    }
+
+    /// Audit 2026-11-10, P-5: a relay host with reserved identities could hold
+    /// every automatic outbound slot of a private node.
+    #[test]
+    fn most_automatic_neighbours_stay_off_relay_circuits() {
+        assert_eq!(
+            MAX_AUTOMATIC_RELAYED_NEIGHBOURS,
+            AUTOMATIC_OUTBOUND_TARGET / 2
+        );
+        assert!(automatic_circuit_room(0, 0));
+        assert!(automatic_circuit_room(
+            MAX_AUTOMATIC_RELAYED_NEIGHBOURS - 1,
+            0
+        ));
+        assert!(!automatic_circuit_room(MAX_AUTOMATIC_RELAYED_NEIGHBOURS, 0));
+        assert!(!automatic_circuit_room(
+            MAX_AUTOMATIC_RELAYED_NEIGHBOURS - 1,
+            1
+        ));
+        assert!(!automatic_circuit_room(0, MAX_AUTOMATIC_RELAYED_NEIGHBOURS));
+    }
+
+    /// Audit 2026-11-10, P-5: once two neighbours were "stable" (30 s after
+    /// Identify, with no judgement of their chain) every seed was released.
+    /// One seed now stays as an anchor the eclipse has to get past.
+    #[test]
+    fn a_completed_bootstrap_keeps_one_seed_as_an_anchor() {
+        for ordinary in [2, 3, 12, 500] {
+            assert_eq!(
+                desired_bootstrap_connections(true, ordinary, 3),
+                1,
+                "ordinary={ordinary}"
+            );
+        }
+        assert_eq!(desired_bootstrap_connections(true, 12, 1), 1);
+        assert_eq!(
+            desired_bootstrap_connections(true, 12, 0),
+            0,
+            "no seed configured"
+        );
+    }
+
     #[test]
     fn bootstrap_preserves_two_peer_quorum_until_ordinary_replacement() {
-        for (ordinary, expected_seeds) in [(0, 2), (1, 1), (2, 0), (12, 0)] {
+        // One seed stays as an anchor (audit 2026-11-10, P-5).
+        for (ordinary, expected_seeds) in [(0, 2), (1, 1), (2, 1), (12, 1)] {
             assert_eq!(
                 desired_bootstrap_connections(true, ordinary, 6),
                 expected_seeds,
@@ -10946,8 +11359,8 @@ mod tests {
                 state.stable_non_bootstrap_peer_count(stable),
                 configured
             ),
-            0,
-            "without a verdict two stable neighbours replace both seeds"
+            1,
+            "without a verdict two stable neighbours replace all seeds but the anchor"
         );
 
         state.set_refused_branch_peers(old);
@@ -11710,6 +12123,7 @@ mod tests {
                 PendingAutomaticDial::Peer {
                     peer: PeerId::random(),
                     group: PublicNetworkGroup::Ipv4([8, 8]),
+                    relayed: false,
                 },
             );
         }
@@ -11874,6 +12288,7 @@ mod tests {
                 PendingAutomaticDial::Peer {
                     peer: PeerId::random(),
                     group,
+                    relayed: false,
                 },
             );
         }
