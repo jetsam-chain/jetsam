@@ -55,7 +55,7 @@ use jetsam_tx::{
 use crate::config::MempoolConfig;
 use crate::error::SubmitError;
 use crate::event::{EvictReason, MempoolEvent};
-use crate::floor::FeeFloor;
+use crate::floor::{FeeFloor, RelayFloor};
 use crate::view::ChainView;
 
 /// One CPU-heavy authorization verification ready to run on a node-owned
@@ -120,7 +120,7 @@ pub struct MempoolEntryMetadata {
 /// One lock-consistent compact view of fee floor and all entry metadata.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MempoolMetadataSnapshot {
-    pub fee_floor: u64,
+    pub fee_floor: RelayFloor,
     pub entries: Vec<MempoolEntryMetadata>,
 }
 
@@ -131,7 +131,7 @@ pub struct MempoolUsageSnapshot {
     pub capacity: usize,
     pub intent_bytes: usize,
     pub max_intent_bytes: usize,
-    pub fee_floor: u64,
+    pub fee_floor: RelayFloor,
 }
 
 /// Minimal owned block-template selection.
@@ -417,7 +417,6 @@ impl AsyncMempool {
         // suffix of this allocation rather than a second retained proof copy.
         let intent_bytes: Arc<[u8]> = intent_bytes.into();
         st.pool.set_intent_bytes(&hash, Arc::clone(&intent_bytes));
-        st.floor.record(fee);
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
             fee,
@@ -854,6 +853,15 @@ impl AsyncMempool {
     ) {
         let mut st = self.state.lock().await;
 
+        // M-1 (audit 2026-11-10): the floor learns what blocks paid — the
+        // rates of this pool's transactions the block carried — never what
+        // was merely admitted.
+        for hash in confirmed_hashes {
+            if let Some(fee_rate) = st.pool.get(hash).map(|entry| entry.fee_rate) {
+                st.floor.record_mined(fee_rate);
+            }
+        }
+
         // Remove confirmed txs.
         let removed = st.pool.on_block_confirmed(confirmed_hashes);
         for &hash in confirmed_hashes {
@@ -1045,8 +1053,9 @@ impl AsyncMempool {
         self.len().await == 0
     }
 
-    /// Current dynamic fee floor (μJTM).
-    pub async fn fee_floor(&self) -> u64 {
+    /// Current dynamic fee floor: a rate asked of each transaction for its
+    /// weight ([`RelayFloor::required`]).
+    pub async fn relay_floor(&self) -> RelayFloor {
         self.state.lock().await.floor.current()
     }
 
@@ -1318,7 +1327,10 @@ fn run_admission_checks_with(
     let required = if matches!(admission, Admission::VaultRelease | Admission::GuardianPayout) {
         consensus_required
     } else {
-        st.floor.current().max(consensus_required)
+        st.floor
+            .current()
+            .required(u64::from(spend.live_inputs), u64::from(spend.live_outputs))
+            .max(consensus_required)
     };
     let actual = spend.fee;
     if actual < required {
@@ -1329,6 +1341,24 @@ fn run_admission_checks_with(
 
     validate_paged_spend(pages)
         .map_err(|error| SubmitError::MalformedIntent(format!("PagedSpend: {error}")))?;
+    // M-1 (audit 2026-11-10): a group the template builder never places — 256
+    // touched segments beside the coinbase's — stayed here unmined, relayed to
+    // every node, its fee their floor. Judged by the builder's own predicate,
+    // before any state read.
+    if pool_rules {
+        let group: Vec<jetsam_tx::Transaction> = pages
+            .iter()
+            .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
+            .collect();
+        if !jetsam_chain::consensus::template::group_fits_an_empty_template(&group, spend) {
+            return Err(SubmitError::NoTemplateCarries(format!(
+                "{} pages, {} inputs, {} outputs exceed one block's resources beside its coinbase",
+                pages.len(),
+                spend.live_inputs,
+                spend.live_outputs
+            )));
+        }
+    }
     // v1.5: a spend from the license addresses or a marker owner can never be
     // mined, and a transaction paying a client object is mined only with its
     // object (it does not travel as a plain transaction). Inert before v1.5.
@@ -2196,14 +2226,16 @@ mod tests {
         let pool = AsyncMempool::new(view.clone(), MempoolConfig::default());
         {
             let mut locked = pool.state.lock().await;
-            locked.floor.record(100_000);
-            assert!(locked.floor.current() > MIN_FEE_BASE);
+            for _ in 0..crate::floor::FEE_FLOOR_MIN_SAMPLES {
+                locked.floor.record_mined(100_000);
+            }
+            assert!(locked.floor.current().required(1, 1) > MIN_FEE_BASE);
             assert!(locked.pool.is_empty());
         }
 
         pool.on_new_block(&[], 1, view).await;
 
-        assert_eq!(pool.fee_floor().await, MIN_FEE_BASE);
+        assert_eq!(pool.relay_floor().await.required(1, 1), MIN_FEE_BASE);
     }
 
     /// The worst burst is the whole pool evicted at a boundary while the block
@@ -2451,6 +2483,240 @@ mod tests {
         let facts = validate_paged_spend(&candidate).unwrap();
         run_admission_checks(&candidate, &facts, &probe_state)
             .expect("accepted tip reward is spendable in its child block");
+    }
+
+    // --- M-1 (audit 2026-11-10): what the pool admits and the floor it sets ---
+
+    /// What every M-1 input slot holds: 1 000 JTM.
+    const M1_INPUT: u64 = 1_000_000_000;
+
+    /// A view whose slots `1..=inputs` each hold [`M1_INPUT`] for the
+    /// returned owner (minted at height 3), at `log_slots`, and a pool over it
+    /// whose authorization check is a stand-in: these tests are about fees
+    /// and block resources, and the proof is checked after both.
+    fn m1_pool(inputs: u32, log_slots: usize) -> (AsyncMempool, ChainView, Address) {
+        use jetsam_chain::consensus::params::coinbase_creation_id;
+
+        let owner = Address([0xA5; 32]);
+        let mut state = ChainState::with_log_slots(log_slots);
+        // One root computation for every input (a debug build pays seconds
+        // for each).
+        let slots: Vec<(u32, SlotValue)> = (1..=inputs)
+            .map(|slot| {
+                let value = SlotValue::with_owner_fields(
+                    M1_INPUT,
+                    coinbase_creation_id(3),
+                    owner.as_fields(),
+                );
+                (slot, value)
+            })
+            .collect();
+        if !slots.is_empty() {
+            state.state.apply_delta(&slots).unwrap();
+        }
+        let genesis = genesis_header();
+        let mut tip = genesis.clone();
+        tip.height = 3;
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis);
+        headers.insert(3, tip);
+        let view = ChainView::new(3, headers, u64::from(inputs), state.state);
+        let pool = AsyncMempool::new(view.clone(), MempoolConfig::default())
+            .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())));
+        (pool, view, owner)
+    }
+
+    /// The intent spending input slot `input` of [`m1_pool`] to `outputs`
+    /// (slot, amount) pairs with `fee`, paged as the consensus requires, and
+    /// its wire bytes.
+    fn m1_intent(
+        view: &ChainView,
+        owner: Address,
+        input: u32,
+        outputs: &[(u32, u64)],
+        fee: u64,
+    ) -> (jetsam_tx::PagedSpendIntent, Vec<u8>) {
+        use jetsam_chain::consensus::params::coinbase_creation_id;
+
+        let page_count = outputs.len().div_ceil(TX_OUTPUTS).max(1);
+        let pages = (0..page_count)
+            .map(|index| {
+                let mut inputs = [TxInput::dummy(); TX_INPUTS];
+                let mut bitmap = 0u16;
+                if index == 0 {
+                    inputs[0] = TxInput {
+                        slot_index: input,
+                        amount: M1_INPUT,
+                        creation_id: coinbase_creation_id(3),
+                    };
+                    bitmap |= 1 | PAGED_SPEND_START_BIT;
+                }
+                if index + 1 == page_count {
+                    bitmap |= PAGED_SPEND_END_BIT;
+                }
+                let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+                for (offset, (slot, amount)) in outputs
+                    .iter()
+                    .skip(index * TX_OUTPUTS)
+                    .take(TX_OUTPUTS)
+                    .enumerate()
+                {
+                    page_outputs[offset] = TxOutput {
+                        slot_index: *slot,
+                        amount: *amount,
+                        owner: Address([0xB6; 32]),
+                    };
+                    bitmap |= output_bitmap_bit(offset);
+                }
+                TxPage::new(TxBody {
+                    epoch_anchor: view.user_epoch_anchor_id,
+                    fee: if index == 0 { fee } else { 0 },
+                    input_owner: owner,
+                    inputs,
+                    outputs: page_outputs,
+                    validity_bitmap: bitmap,
+                    is_coinbase: false,
+                })
+                .unwrap()
+            })
+            .collect();
+        let intent = jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap();
+        let bytes = intent.to_bytes().unwrap();
+        (intent, bytes)
+    }
+
+    /// A spend of input slot `input` to one output (slot `input + 100`)
+    /// with `fee`, or to two when `two_outputs`.
+    fn m1_simple(
+        view: &ChainView,
+        owner: Address,
+        input: u32,
+        fee: u64,
+        two_outputs: bool,
+    ) -> (jetsam_tx::PagedSpendIntent, Vec<u8>) {
+        let left = M1_INPUT - fee;
+        let outputs = if two_outputs {
+            vec![(input + 100, left / 2), (input + 200, left - left / 2)]
+        } else {
+            vec![(input + 100, left)]
+        };
+        m1_intent(view, owner, input, &outputs, fee)
+    }
+
+    fn m1_consensus_fee(view: &ChainView, inputs: u64, outputs: u64) -> u64 {
+        jetsam_chain::consensus::fee_breakdown(
+            inputs,
+            outputs,
+            view.active_slot_count,
+            view.log_slots(),
+        )
+        .required_total
+    }
+
+    /// M-1 (a): a fee the pool admitted but no block ever carried used to fix
+    /// the floor every later admission paid — an unminable 10 JTM intent made
+    /// every node refuse ordinary fees for as long as it stayed. Only what is
+    /// mined says what the network pays.
+    #[tokio::test]
+    async fn a_fee_admitted_but_never_mined_sets_no_floor() {
+        let intents = crate::floor::FEE_FLOOR_MIN_SAMPLES as u32;
+        let (pool, view, owner) = m1_pool(intents + 1, 8);
+        for input in 1..=intents {
+            let (attacker, bytes) = m1_simple(&view, owner, input, 10_000_000, false);
+            pool.submit(attacker, bytes)
+                .await
+                .expect("a 10 JTM fee is admitted");
+        }
+
+        let ordinary = m1_consensus_fee(&view, 1, 1);
+        let (victim, bytes) = m1_simple(&view, owner, intents + 1, ordinary, false);
+        pool.submit(victim, bytes)
+            .await
+            .expect("the consensus minimum is admitted beside an unmined 10 JTM intent");
+    }
+
+    /// M-1: the floor is 0.9 x the median fee RATE (per weight unit,
+    /// `MempoolEntry::compute_fee_rate`) of the pool's transactions blocks
+    /// carried, asked of each transaction for its own weight; under
+    /// `FEE_FLOOR_MIN_SAMPLES` mined samples there is no floor.
+    #[tokio::test]
+    async fn the_floor_is_the_fee_rate_of_mined_transactions_for_each_shape() {
+        use crate::floor::FEE_FLOOR_MIN_SAMPLES;
+        use crate::SubmitError;
+        use jetsam_chain::consensus::ConsensusError;
+
+        let samples = FEE_FLOOR_MIN_SAMPLES as u32;
+        let (pool, view, owner) = m1_pool(samples + 4, 8);
+        // 1 JTM over one input and one output: weight 2, rate 500 000.
+        let mined_fee = 1_000_000;
+        let mut mined = Vec::new();
+        for input in 1..=samples {
+            let (intent, bytes) = m1_simple(&view, owner, input, mined_fee, false);
+            mined.push(pool.submit(intent, bytes).await.expect("admitted"));
+        }
+        // One more stays in the pool: the floor is forgotten only when the
+        // pool drains.
+        let (waiting, bytes) = m1_simple(&view, owner, samples + 1, mined_fee, false);
+        pool.submit(waiting, bytes).await.expect("admitted");
+
+        // One sample short: no floor yet.
+        pool.on_new_block(&mined[..mined.len() - 1], 4, view.clone())
+            .await;
+        let (below, bytes) = m1_simple(
+            &view,
+            owner,
+            samples + 2,
+            m1_consensus_fee(&view, 1, 1),
+            false,
+        );
+        pool.submit(below, bytes)
+            .await
+            .expect("no floor below FEE_FLOOR_MIN_SAMPLES mined samples");
+
+        pool.on_new_block(&mined[mined.len() - 1..], 5, view.clone())
+            .await;
+        // Rate floor 0.9 x 500 000 = 450 000; one input and two outputs weigh
+        // 1 + 2 + 4 x 1 = 7: 3 150 000 asked, where the old absolute floor
+        // asked 0.9 JTM of every shape.
+        let required = 3_150_000;
+        let (short, bytes) = m1_simple(&view, owner, samples + 3, required - 1, true);
+        match pool.submit(short, bytes).await {
+            Err(SubmitError::Consensus(ConsensusError::BelowMinFee {
+                required: asked, ..
+            })) => {
+                assert_eq!(asked, required, "the rate floor times this shape's weight")
+            }
+            other => panic!("a fee under the mined rate floor must be refused, got {other:?}"),
+        }
+        let (enough, bytes) = m1_simple(&view, owner, samples + 3, required, true);
+        pool.submit(enough, bytes)
+            .await
+            .expect("the mined rate floor for this shape is admitted");
+    }
+
+    /// M-1 (main): the template builder skips every group that, with the
+    /// coinbase's reserved segment, touches more than 256 segments
+    /// (`TemplateResourceSelection::with_group`), so such a group is never
+    /// mined; the pool used to admit it, hold it and relay it. It is refused
+    /// at admission now, by the template's own predicate (its bound is
+    /// pinned in `jetsam_chain::consensus::template`), before any state read.
+    #[tokio::test]
+    async fn admission_refuses_a_group_no_template_can_carry() {
+        use crate::SubmitError;
+
+        // log_slots 24: 256 segments of 2^16 slots. The input is in segment 0,
+        // one output in each of the 255 others: 256, plus the coinbase's. The
+        // input need not be live: the group is refused before any state read.
+        let (pool, view, owner) = m1_pool(0, 24);
+        let fee = m1_consensus_fee(&view, 1, 255);
+        let mut outputs: Vec<(u32, u64)> = (1..=255u32).map(|segment| (segment << 16, 1)).collect();
+        outputs[254].1 = M1_INPUT - fee - 254;
+        let (intent, bytes) = m1_intent(&view, owner, 1, &outputs, fee);
+        match pool.submit(intent, bytes).await {
+            Err(SubmitError::NoTemplateCarries(_)) => {}
+            other => panic!("a group no template carries must be refused, got {other:?}"),
+        }
+        assert_eq!(pool.len().await, 0);
     }
 
     /// M3.8: a transaction paying a v1.5 client object travels with its
@@ -3782,9 +4048,12 @@ mod tests {
         {
             let mut locked = pool.state.lock().await;
             for _ in 0..64 {
-                locked.floor.record(10_000_000);
+                locked.floor.record_mined(10_000_000);
             }
-            assert!(locked.floor.current() > jetsam_chain::consensus::vault::RELEASE_FEE_MICRO);
+            assert!(
+                locked.floor.current().required(1, 1)
+                    > jetsam_chain::consensus::vault::RELEASE_FEE_MICRO
+            );
         }
         let mut events = pool.subscribe();
         let admitted = case.submit(&pool).await.expect("a valid release intent");

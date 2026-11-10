@@ -171,7 +171,7 @@ pub trait WalletOps: Send + Sync {
         explicit_fee_micro_jtm: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
-        relay_floor: u64,
+        relay_floor: jetsam_mempool::RelayFloor,
     ) -> Result<WalletSendPlan, WalletSendPlanError>;
 
     /// Build, prove, and serialize a send transaction.
@@ -226,7 +226,7 @@ pub trait WalletOps: Send + Sync {
         max_inputs: usize,
         active_slot_count: u64,
         log_slots: u32,
-        relay_floor: u64,
+        relay_floor: jetsam_mempool::RelayFloor,
     ) -> Result<WalletConsolidationPlan, WalletSendPlanError>;
 
     /// Build, prove, and serialize the exact consolidation approved above.

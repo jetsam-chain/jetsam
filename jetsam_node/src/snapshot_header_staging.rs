@@ -571,6 +571,25 @@ impl SnapshotHeaderStaging {
             && record.cumulative_chainwork == expected_chainwork)
     }
 
+    /// S-1 (audit 2026-11-10): the `count` highest staged points (height,
+    /// block id, cumulative work), lowest first; the base is not one. Each
+    /// was validated against this node's rules when it was appended.
+    pub fn recent_points(&mut self, count: u64) -> Result<Vec<(u64, [u8; 32], [u8; 32])>> {
+        if self.poisoned {
+            return Err(SnapshotHeaderStagingError::Poisoned);
+        }
+        (self.count.saturating_sub(count)..self.count)
+            .map(|index| {
+                let record = self.read_record(index)?;
+                Ok((
+                    record.header.height,
+                    record.block_hash,
+                    record.cumulative_chainwork,
+                ))
+            })
+            .collect()
+    }
+
     /// Bind the staged tip, exact work and transaction-epoch header.
     pub fn exact_boundary(
         &mut self,
@@ -1828,6 +1847,29 @@ mod tests {
             )
             .unwrap());
     }
+    /// Audit 2026-11-10, S-1: the headers a plan staged were validated, then
+    /// deleted with the plan, and nothing of them judged the next claim.
+    /// Their highest points are read back for that.
+    #[test]
+    fn the_highest_staged_points_are_read_back_as_validated() {
+        let db = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let path = stage_dir.path().join("candidate");
+        let chain = jetsam_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
+        assert_eq!(staging.recent_points(64).unwrap(), Vec::new(), "the base is not a staged point");
+        staging
+            .append_batch(store, &fixture_chain()[1..=1])
+            .unwrap();
+        let tip = staging.tip_record().unwrap();
+        let staged = (tip.header.height, tip.block_hash, tip.cumulative_chainwork);
+        assert_eq!(staging.recent_points(64).unwrap(), vec![staged]);
+        assert_eq!(staging.recent_points(1).unwrap(), vec![staged]);
+        assert_eq!(staging.recent_points(0).unwrap(), Vec::new());
+    }
+
     #[test]
     fn appended_partial_record_after_validation_cannot_be_streamed() {
         let db = tempfile::tempdir().unwrap();

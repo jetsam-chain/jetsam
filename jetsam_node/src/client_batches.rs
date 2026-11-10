@@ -359,6 +359,18 @@ pub fn registry_leaves(registry: &ClientRegistryState) -> Vec<[u8; 32]> {
     leaves
 }
 
+/// G-1 (audit 2026-11-10): a batch proof is decided over the registry's
+/// leaves, and a batch covers registered clients only, so over an empty
+/// registry no batch can be decided. It is refused before the native
+/// decision (seconds of CPU per batch), as `retry:` since the registry may
+/// fill: the batch is not fetched or decided again before the tip moves.
+fn refuse_over_an_empty_registry(registry: &ClientRegistryState) -> Result<(), String> {
+    if registry.is_empty() {
+        return Err("retry: the client registry is empty: no batch can be decided over it".into());
+    }
+    Ok(())
+}
+
 /// Releases one reception slot when dropped.
 struct ReceptionSlot<'a>(&'a std::sync::atomic::AtomicUsize);
 
@@ -555,6 +567,7 @@ impl ClientBatches {
         bundle: ClientBatchBundle,
         tip: &BatchTip<'_>,
     ) -> Result<ClientBatchAnnouncement, String> {
+        refuse_over_an_empty_registry(tip.registry)?;
         let child = tip.height.saturating_add(1);
         let lanes = self
             .parent_lanes(tip.height, tip.terminal)

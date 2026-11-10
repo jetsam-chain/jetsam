@@ -383,6 +383,18 @@ impl TemplateResourceSelection {
     }
 }
 
+/// M-1 (audit 2026-11-10): whether this builder would place the group `pages`
+/// in a block that carries nothing else — the coinbase alone, its segment
+/// reserved as [`TemplateResourceSelection::with_group`] reserves it in every
+/// template. No node running this builder ever mines a group outside it,
+/// though the consensus would accept one (256 touched segments): the mempool
+/// admits only groups inside it. Node policy: block validation never calls it.
+pub fn group_fits_an_empty_template(pages: &[Transaction], spend: &PagedSpendFacts) -> bool {
+    TemplateResourceSelection::with_system_outputs(0, 1)
+        .with_group(pages, spend)
+        .is_some()
+}
+
 #[derive(Debug)]
 struct CandidatePagedSpend {
     pages: Vec<Transaction>,
@@ -815,6 +827,80 @@ mod tests {
         output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
         TX_INPUTS, TX_OUTPUTS,
     };
+
+    /// One input in segment 0 and one output in each of segments
+    /// `1..=output_segments` (`slot >> LOG_SEGMENT_SIZE`), paged as the
+    /// consensus requires.
+    fn group_over_segments(output_segments: u32) -> Vec<jetsam_tx::TxPage> {
+        let page_count = (output_segments as usize).div_ceil(TX_OUTPUTS).max(1);
+        let fee = 1_000;
+        let input_amount = u64::from(output_segments) + fee;
+        (0..page_count)
+            .map(|index| {
+                let mut inputs = [TxInput::dummy(); TX_INPUTS];
+                let mut bitmap = 0u16;
+                if index == 0 {
+                    inputs[0] = TxInput {
+                        slot_index: 1,
+                        amount: input_amount,
+                        creation_id: 1,
+                    };
+                    bitmap |= 1 | PAGED_SPEND_START_BIT;
+                }
+                if index + 1 == page_count {
+                    bitmap |= PAGED_SPEND_END_BIT;
+                }
+                let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+                for (offset, segment) in (1..=output_segments)
+                    .skip(index * TX_OUTPUTS)
+                    .take(TX_OUTPUTS)
+                    .enumerate()
+                {
+                    outputs[offset] = TxOutput {
+                        slot_index: segment << crate::consensus::params::LOG_SEGMENT_SIZE,
+                        amount: 1,
+                        owner: Address([0xB6; 32]),
+                    };
+                    bitmap |= output_bitmap_bit(offset);
+                }
+                jetsam_tx::TxPage::new(TxBody {
+                    epoch_anchor: [1; 32],
+                    fee: if index == 0 { fee } else { 0 },
+                    input_owner: Address([0xA5; 32]),
+                    inputs,
+                    outputs,
+                    validity_bitmap: bitmap,
+                    is_coinbase: false,
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// M-1 (audit 2026-11-10): the bound mempool admission asks of a group is
+    /// the template builder's own — every resource, the coinbase's segment
+    /// reserved: 255 touched segments fit, 256 do not (consensus would accept
+    /// 256, the template never offers them).
+    #[test]
+    fn a_group_fits_an_empty_template_up_to_the_segment_bound() {
+        for (output_segments, fits) in [(254, true), (255, false)] {
+            let group = group_over_segments(output_segments);
+            let spend = jetsam_tx::validate_paged_spend(&group).unwrap();
+            let pages: Vec<Transaction> = group
+                .into_iter()
+                .map(|page| Transaction::new(page.body))
+                .collect();
+            assert_eq!(
+                group_fits_an_empty_template(&pages, &spend),
+                fits,
+                "{} touched segments",
+                output_segments + 1
+            );
+            // The template builder itself agrees.
+            let resources = TemplateResourceSelection::with_system_outputs(0, 1);
+            assert_eq!(resources.with_group(&pages, &spend).is_some(), fits);
+        }
+    }
 
     fn parent(state: &mut ChainState) -> BlockHeader {
         BlockHeader {

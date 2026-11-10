@@ -59,6 +59,16 @@ impl FeeKey {
 // MempoolEntry
 // ---------------------------------------------------------------------------
 
+/// The weight a fee rate is counted per: `inputs + outputs + 4 x net new
+/// slots`, at least 1 ([`MempoolEntry::fee_rate`]).
+pub fn fee_weight(n_inputs: u64, n_outputs: u64) -> u64 {
+    let net_new_slots = n_outputs.saturating_sub(n_inputs);
+    n_inputs
+        .saturating_add(n_outputs)
+        .saturating_add(net_new_slots.saturating_mul(4))
+        .max(1)
+}
+
 /// One indivisible logical PagedSpend admitted to the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
@@ -91,14 +101,7 @@ pub struct MempoolEntry {
 impl MempoolEntry {
     /// Compute fee rate from group-wide live resources.
     pub fn compute_fee_rate(spend: &PagedSpendFacts) -> u64 {
-        let n_inputs = u64::from(spend.live_inputs);
-        let n_outputs = u64::from(spend.live_outputs);
-        let net_new_slots = n_outputs.saturating_sub(n_inputs);
-        let weight = n_inputs
-            .saturating_add(n_outputs)
-            .saturating_add(net_new_slots.saturating_mul(4))
-            .max(1);
-        spend.fee / weight
+        spend.fee / fee_weight(u64::from(spend.live_inputs), u64::from(spend.live_outputs))
     }
 
     /// Create a new entry.

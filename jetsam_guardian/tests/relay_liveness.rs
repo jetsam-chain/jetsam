@@ -427,9 +427,12 @@ fn one_node_alone_never_makes_jg_relay_drop_more_than_eight_blocks() {
     *c0.lock().unwrap() = b.clone();
     let alerted = wait_for(30, || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default().matches("ALERT DEEP_REORG_REFUSED").count() >= 2);
     let alone = reorgs(&dir);
-    // both nodes on b: followed
+    // both nodes on b: followed. The relayer writes the reorganization before it reads b's blocks above 5: node 0
+    // moves on to c only once the relayer has read b's tip (12), else on a loaded host it reads 11-13 on c
+    // without ever holding b's 11-12, and there is no reorganization of two blocks to see.
+    served0.store(0, Ordering::SeqCst);
     *c1.lock().unwrap() = b.clone();
-    let followed = wait_for(30, || reorgs(&dir).contains(&(30, 5)));
+    let followed = wait_for(30, || reorgs(&dir).contains(&(30, 5)) && served0.load(Ordering::SeqCst) >= 12);
     // node 0 alone on c (two blocks): followed
     *c0.lock().unwrap() = c.clone();
     let shallow = wait_for(30, || reorgs(&dir).contains(&(12, 10)));
