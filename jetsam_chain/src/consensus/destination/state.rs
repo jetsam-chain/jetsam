@@ -234,10 +234,9 @@ pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
 /// computed offline before its deployment: CREATE2 address and runtime code
 /// hash with its immutables), `withdrawals` at slot 9 and `genesisId` at
 /// slot 13 (`JetsamBridge.sol` of `v3-tn1` 69941b0, unchanged layout).
-/// **`genesis_id` is zero until the bridge's `initGenesis`**: a zero pin
-/// matches no installed genesis, so nothing is payable until it is written
-/// here (and in the test that pins it), with the address and code hash read
-/// again on the deployed contract.
+/// `genesis_id` is the deployed bridge's `genesisId()` after its
+/// `initGenesis`, written here (and in the test that pins it) with the
+/// address and code hash read again on the deployed contract (update n°2).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
     address: [
@@ -251,7 +250,11 @@ pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
     ],
     withdrawals_slot: 9,
     genesis_id_slot: 13,
-    genesis_id: [0u8; 32],
+    genesis_id: [
+        0x0d, 0x16, 0xf5, 0x14, 0xc6, 0xb4, 0x78, 0x7c, 0xef, 0x1c, 0x9a, 0xaf, 0xd0, 0xaf, 0x20,
+        0x28, 0xd8, 0xad, 0x8a, 0x9b, 0x8a, 0x40, 0x76, 0x37, 0xdb, 0x83, 0x3a, 0x17, 0xce, 0xa0,
+        0xa2, 0xb9,
+    ],
 });
 /// **Private builds only**: none.
 #[cfg(feature = "rehearsal-v1-7")]

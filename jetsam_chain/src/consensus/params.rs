@@ -642,8 +642,8 @@ pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
 /// carries no committee update, and the advance (`JTMADV01`) and its claim's
 /// transfer (`JTMADT01`) are rules.
 ///
-/// **`None` on every profile** (the public network, the test chain and the
-/// private rehearsal builds): the operator chooses it at deployment. While it
+/// **`None` on the public network and the private rehearsal builds**, armed
+/// on the test chain (update n°2): the operator chooses it at deployment. While it
 /// is `None` a node judges every block exactly as a node without this code
 /// (the Base objects do not even decode). Armed, it sits strictly above an
 /// armed [`V1_7_ACTIVATION_HEIGHT`] ([`base_return_schedule_is_valid`]).
@@ -652,9 +652,9 @@ pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
 #[cfg(not(feature = "testnet"))]
 pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
 /// The test chain's: the only one an operator arms (update n°2 of the test
-/// chain, `FAST_ARMING.txt`); `None` until then.
+/// chain, `FAST_ARMING.txt`): 8982.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = Some(8_982);
 /// The private rehearsal's: dormant.
 #[cfg(feature = "rehearsal-v1-7")]
 pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
@@ -2726,10 +2726,26 @@ mod tests {
     }
 
     #[test]
-    fn the_base_return_height_is_none_on_every_profile() {
-        assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);
-        assert!(!v1_7_base_return_active(u64::MAX));
+    fn the_base_return_height_of_each_profile() {
         assert!(base_return_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, None));
+        assert!(base_return_schedule_is_valid(
+            V1_7_ACTIVATION_HEIGHT,
+            V1_7_BASE_RETURN_HEIGHT
+        ));
+        #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);
+            assert!(!v1_7_base_return_active(u64::MAX));
+        }
+        // The test chain's, armed by update n°2: from 8982 on, not one block earlier.
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, Some(8_982));
+            assert!(!v1_7_base_return_active(8_982 - 1));
+            assert!(v1_7_base_return_active(8_982));
+            assert!(v1_7_base_return_active(8_982 + 1));
+            assert!(v1_7_base_return_active(u64::MAX));
+        }
     }
 
     /// Armed, the return over Base sits strictly above an armed v1.7 height

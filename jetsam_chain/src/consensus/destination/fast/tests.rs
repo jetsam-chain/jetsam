@@ -59,18 +59,42 @@ fn statement() -> FastStatement {
     }
 }
 
-/// Armed by two deliberate edits: the constants, then this test. The
-/// return-over-Base height is `None` too: the lane is inert twice over.
+/// Armed by two deliberate edits: the constants, then this test. The public
+/// network and the private rehearsal: no key and the return-over-Base height
+/// `None` (the lane is inert twice over). The test chain (update n°2): the
+/// relay's key and the cold key, distinct, from its height 8982 on.
 #[test]
-fn the_fast_lane_keys_are_none_on_every_profile() {
-    assert_eq!(FAST_RELEASE_KEY, None);
-    assert_eq!(FAST_REVOKE_KEY, None);
-    assert_eq!(FastLaneRules::CONSENSUS.release_key, None);
-    assert_eq!(FastLaneRules::CONSENSUS.revoke_key, None);
+fn the_fast_lane_keys_of_each_profile() {
+    assert_eq!(FastLaneRules::CONSENSUS.release_key, FAST_RELEASE_KEY);
+    assert_eq!(FastLaneRules::CONSENSUS.revoke_key, FAST_REVOKE_KEY);
+    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    {
+        assert_eq!(FAST_RELEASE_KEY, None);
+        assert_eq!(FAST_REVOKE_KEY, None);
+        assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, None);
+    }
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        assert_eq!(
+            FAST_RELEASE_KEY.expect("the relay's key").to_vec(),
+            hex("80745c70916a6fb2d759fdb13f313882bada31e770fa460f27e79c4475ad4bd5f92126e7e8973c265f9fb25cdf574ff8")
+        );
+        assert_eq!(
+            FAST_REVOKE_KEY.expect("the cold key").to_vec(),
+            hex("a2e306dd132d59924642b80e15e4b8f7ae0508722596bedbdbaa3fd108020e4bdc327d16ca6da4661ebdff88a5d2cafe")
+        );
+        assert!(fast_keys_are_valid(FAST_RELEASE_KEY, FAST_REVOKE_KEY));
+        assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, Some(8_982));
+    }
     // D: 30 days at 480 blocks a day (jetsamRD, 10/11).
     assert_eq!(FAST_RECONCILE_BLOCKS, 14_400);
     assert_eq!(FastLaneRules::CONSENSUS.reconcile_blocks, 14_400);
-    assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, None);
     #[cfg(not(feature = "testnet"))]
     assert_eq!((FAST_L1_CHAIN_ID, FAST_BASE_CHAIN_ID), (1, 8_453));
     #[cfg(feature = "testnet")]

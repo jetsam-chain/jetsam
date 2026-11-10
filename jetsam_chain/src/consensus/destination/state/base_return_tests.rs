@@ -163,14 +163,33 @@ pub(super) fn drop_kind(b: &Block, kind: DestinationObjectKind) -> Block {
 // The height and the rules of each profile
 // ---------------------------------------------------------------------------
 
-/// Dormant on every profile; the L1 and the Base network of each profile.
+/// Dormant on the public network and the private rehearsal; on the test
+/// chain (update n°2) in force from 8982, with its anchor and bridge from that
+/// height only; the L1 and the Base network of each profile.
 #[test]
-fn the_return_over_base_is_dormant_and_reads_its_profiles_base() {
+fn the_return_over_base_reads_its_profiles_base_from_its_height() {
     let rules = DestinationRules::CONSENSUS;
-    assert_eq!(rules.base_return.activation_height, None);
     assert_eq!(rules.base_return.advance, AdvanceRules::CONSENSUS);
-    assert!(!rules.base_return.active_at(u64::MAX));
-    assert_eq!(rules.effective_at(u64::MAX), rules);
+    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    {
+        assert_eq!(rules.base_return.activation_height, None);
+        assert!(!rules.base_return.active_at(u64::MAX));
+        assert_eq!(rules.effective_at(u64::MAX), rules);
+    }
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        const H: u64 = 8_982;
+        assert_eq!(rules.base_return.activation_height, Some(H));
+        assert!(!rules.base_return.active_at(H - 1));
+        assert!(rules.base_return.active_at(H));
+        assert_eq!(rules.effective_at(H - 1), rules);
+        let at_h = rules.effective_at(H);
+        assert_eq!(at_h.network, crate::consensus::destination::forks::L1_SEPOLIA);
+        assert_eq!(at_h.anchor, BASE_RETURN_ANCHOR);
+        assert_eq!(at_h.bridge, BASE_RETURN_BRIDGE);
+        assert!(at_h.anchor.is_some() && at_h.bridge.is_some());
+        assert_eq!(rules.effective_at(u64::MAX), at_h);
+    }
     #[cfg(not(feature = "testnet"))]
     {
         assert_eq!(rules.base_return.network, L1_MAINNET);
@@ -280,8 +299,9 @@ fn the_return_over_base_brings_its_anchor_and_bridge_from_its_height() {
 }
 
 /// Each profile's anchor and bridge of the return over Base. The test
-/// chain's genesis is zero until TN1's bridge is initialized: filling it is a
-/// deliberate edit of the constant and of this test.
+/// chain's genesis is the deployed bridge's `genesisId()` after its
+/// `initGenesis` (update n°2): a deliberate edit of the constant and of this
+/// test.
 #[test]
 fn the_profiles_base_return_anchor_and_bridge() {
     let base = DestinationRules::CONSENSUS.base_return;
@@ -316,7 +336,10 @@ fn the_profiles_base_return_anchor_and_bridge() {
             hex("ec2c82249680d925cf8718550e5ce35573bae8ecc0a8afb2546d97e989839f75")
         );
         assert_eq!((bridge.withdrawals_slot, bridge.genesis_id_slot), (9, 13));
-        assert_eq!(bridge.genesis_id, [0u8; 32], "pending TN1's initGenesis");
+        assert_eq!(
+            bridge.genesis_id.to_vec(),
+            hex("0d16f514c6b4787cef1c9aafd0af2028d8ad8a9b8a407637db833a17cea0a2b9")
+        );
         // The L1's own stay unset on the test chain.
         assert_eq!(L1_ANCHOR, None);
         assert_eq!(L1_BRIDGE, None);
