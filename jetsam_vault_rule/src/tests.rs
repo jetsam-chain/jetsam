@@ -821,7 +821,7 @@ fn d123_the_test_chain_raises_its_deposit_cap_at_its_caps_height() {
 #[test]
 fn d123_only_the_test_chain_carries_the_cap_of_before() {
     assert_eq!(TESTNET_PRE_D123_MAX_DEPOSIT_MICRO, 1_000 * JTM);
-    assert_eq!(TESTNET_CAPS_HEIGHT, None);
+    assert_eq!(TESTNET_CAPS_HEIGHT, Some(8_910));
     assert_eq!(
         TESTNET_LEGACY_DEPOSIT_CAP,
         LegacyDepositCap { raised_at: TESTNET_CAPS_HEIGHT, max_deposit: TESTNET_PRE_D123_MAX_DEPOSIT_MICRO }

@@ -2790,12 +2790,19 @@ fn d123_the_caps_of_each_profile() {
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     {
         assert_eq!(current.legacy, Some(TESTNET_LEGACY_VAULT_CAPS));
-        assert_eq!(current.legacy.unwrap().raised_at, None);
-        let today = current.at(u64::MAX);
+        assert_eq!(current.legacy.unwrap().raised_at, Some(8_910));
+        let before = current.at(8_909);
         assert_eq!(
-            (today.max_deposit, today.window_cap, today.outstanding_ceil),
+            (before.max_deposit, before.window_cap, before.outstanding_ceil),
             (1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM)
         );
+        for at in [8_910, u64::MAX] {
+            let from = current.at(at);
+            assert_eq!(
+                (from.max_deposit, from.window_cap, from.outstanding_ceil),
+                (MAX_DEPOSIT_MICRO, VAULT_RELEASE_WINDOW_CAP_MICRO, VAULT_OUTSTANDING_CEIL_MICRO)
+            );
+        }
     }
     #[cfg(any(not(feature = "testnet"), feature = "rehearsal-v1-7"))]
     assert_eq!(current.legacy, None);
