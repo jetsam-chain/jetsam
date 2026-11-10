@@ -979,6 +979,10 @@ fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let allow_unlocked = args.iter().any(|a| a == jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY);
     let args: Vec<String> = args.into_iter().filter(|a| a != jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY).collect();
+    // The fast lane's dry run (RETOUR-RAPIDE SPEC §10): RPC reads only, a throwaway key, nothing sent.
+    if args.get(1).map(String::as_str) == Some("fast-dry-run") {
+        return jetsam_guardian::fast::dry_run_cli(&args[2..]);
+    }
     let (cfg, digest) = config(&args)?;
     if let Some(i) = args.iter().position(|a| a == "--config") {
         let rest: Vec<String> = args.iter().skip(i + 2).cloned().collect();

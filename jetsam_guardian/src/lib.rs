@@ -33,6 +33,7 @@ pub mod ceremony;
 pub mod chain;
 pub mod checkpoint;
 pub mod config;
+pub mod fast;
 pub mod feed;
 pub mod fill;
 pub mod harden;
