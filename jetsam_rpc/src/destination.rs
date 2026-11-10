@@ -23,7 +23,8 @@ pub const DEPOSIT_COUNT_HEIGHTS: u64 = 1_024;
 /// What `submitDestinationObject` admitted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitDestinationObjectResponse {
-    /// `"committee_update"`, `"release"` or `"release_over_base"`.
+    /// `"committee_update"`, `"release"`, `"release_over_base"`, and for the
+    /// fast lane `"fast_release"`, `"fast_contradiction"`, `"fast_revocation"`.
     pub kind: String,
     /// The period a committee update brings.
     pub period: Option<u64>,
@@ -49,6 +50,21 @@ impl From<jetsam_mempool::destination::DestinationAdmitted> for SubmitDestinatio
                 kind: "release_over_base".into(),
                 period: None,
                 n: Some(n),
+            },
+            DestinationAdmitted::FastRelease { n } => Self {
+                kind: "fast_release".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::FastContradiction { n } => Self {
+                kind: "fast_contradiction".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::FastRevocation => Self {
+                kind: "fast_revocation".into(),
+                period: None,
+                n: None,
             },
         }
     }
@@ -468,5 +484,142 @@ mod tests {
         assert!(!dormant.active);
         assert!(dormant.advances.is_empty());
         assert_eq!(dormant.payee, Some(alice.to_bech32()));
+    }
+}
+
+/// One fast release the branch remembers (`getFastLane`), byte fields in hex:
+/// what a contradiction's marker commits to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastRecordInfo {
+    pub n: u64,
+    /// The burn's owner, 32 bytes hex.
+    pub owner: String,
+    pub amount: u64,
+    pub l2_block: u64,
+    pub height: u64,
+    pub contradicted: bool,
+    pub consumed: bool,
+}
+
+/// `getFastLane`: the fast lane of the tip's branch (the return over Base).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLaneResponse {
+    /// Whether the return over Base governs the next block.
+    pub active: bool,
+    /// This build's relay key (48 bytes hex), if any, and whether the branch
+    /// closed it (revoked, or fused by a contradiction).
+    pub release_key: Option<String>,
+    pub release_key_closed: bool,
+    /// Every key the branch closed, 48 bytes hex, in chain order.
+    pub closed_keys: Vec<String>,
+    /// What the vault paid that Base contradicted (µJTM).
+    pub deficit: u64,
+    /// The horizon of a fast release, in blocks.
+    pub reconcile_blocks: u64,
+    pub records: Vec<FastRecordInfo>,
+}
+
+/// The `getFastLane` answer for the tip's destination state `state`.
+pub fn fast_lane_of(
+    state: Option<&jetsam_chain::consensus::destination::state::DestinationState>,
+    tip: u64,
+    rules: &jetsam_chain::consensus::destination::state::DestinationRules,
+) -> FastLaneResponse {
+    let fast = &rules.base_return.fast;
+    let lane = state.map(|s| &s.fast);
+    let closed_keys = lane
+        .map(|l| {
+            l.contradictions
+                .iter()
+                .filter_map(|c| c.key)
+                .chain(l.revocations.iter().copied())
+                .map(hex::encode)
+                .collect()
+        })
+        .unwrap_or_default();
+    FastLaneResponse {
+        active: rules.base_return.active_at(tip.saturating_add(1)),
+        release_key: fast.release_key.map(hex::encode),
+        release_key_closed: match (lane, fast.release_key) {
+            (Some(l), Some(key)) => l.is_closed(&key),
+            _ => false,
+        },
+        closed_keys,
+        deficit: lane.map_or(0, |l| l.deficit()),
+        reconcile_blocks: fast.reconcile_blocks,
+        records: lane
+            .map(|l| {
+                l.records
+                    .iter()
+                    .map(|(n, r)| FastRecordInfo {
+                        n: *n,
+                        owner: hex::encode(r.owner.0),
+                        amount: r.amount,
+                        l2_block: r.l2_block,
+                        height: r.height,
+                        contradicted: r.contradicted,
+                        consumed: r.consumed,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod fast_lane_tests {
+    use super::*;
+    use jetsam_chain::consensus::destination::fast::{ContradictionEntry, FastRecord};
+    use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
+    use jetsam_poseidon2b::primitives::Address;
+
+    /// `getFastLane` reads the tip's fast lane: records with what a
+    /// contradiction's marker commits to, closed keys, the deficit; the kinds
+    /// `submitDestinationObject` answers for the fast lane.
+    #[test]
+    fn rpc_get_fast_lane_reports_the_branchs_fast_lane() {
+        let mut rules = DestinationRules::CONSENSUS;
+        rules.base_return.activation_height = Some(100);
+        rules.base_return.fast.release_key = Some([0x22; 48]);
+        let mut state = DestinationState::at_v1_7(90, 0);
+        state.tip = 120;
+        state.fast.records.insert(
+            7,
+            FastRecord {
+                owner: Address([0xa1; 32]),
+                amount: 5,
+                l2_block: 9,
+                height: 110,
+                contradicted: true,
+                consumed: false,
+            },
+        );
+        state.fast.contradictions.push(ContradictionEntry {
+            n: 7,
+            owner: Address([0xa1; 32]),
+            amount: 5,
+            l2_block: 9,
+            height: 110,
+            key: Some([0x22; 48]),
+        });
+        let lane = fast_lane_of(Some(&state), 120, &rules);
+        assert!(lane.active);
+        assert!(lane.release_key_closed);
+        assert_eq!(lane.closed_keys, vec![hex::encode([0x22; 48])]);
+        assert_eq!(lane.deficit, 5);
+        assert_eq!(lane.records.len(), 1);
+        assert_eq!(lane.records[0].owner, hex::encode([0xa1; 32]));
+        assert_eq!(lane.reconcile_blocks, 14_400);
+        // Dormant: nothing.
+        let dormant = fast_lane_of(None, 120, &DestinationRules::CONSENSUS);
+        assert!(!dormant.active && dormant.records.is_empty() && dormant.release_key.is_none());
+        use jetsam_mempool::destination::DestinationAdmitted;
+        for (admitted, kind) in [
+            (DestinationAdmitted::FastRelease { n: 1 }, "fast_release"),
+            (DestinationAdmitted::FastContradiction { n: 1 }, "fast_contradiction"),
+            (DestinationAdmitted::FastRevocation, "fast_revocation"),
+        ] {
+            assert_eq!(SubmitDestinationObjectResponse::from(admitted).kind, kind);
+        }
     }
 }

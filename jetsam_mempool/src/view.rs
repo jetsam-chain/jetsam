@@ -57,6 +57,9 @@ pub struct VaultView {
     /// below its height): a release pays the creditor of the advance of
     /// exactly its burn, an advance or a transfer is judged against them.
     pub advances: AdvanceBook,
+    /// The fast lane of the branch (the return over Base; empty below its
+    /// height): the keys it closed, the fast releases a contradiction reads.
+    pub fast: jetsam_chain::consensus::destination::fast::FastLaneState,
 }
 
 /// The [`VaultView`] of the block at `height` after a tip whose destination
@@ -76,6 +79,7 @@ pub fn vault_view_for_child(
             floor: state.floor,
             committees: state.committees,
             advances: state.advances,
+            fast: state.fast,
         }
     })
 }

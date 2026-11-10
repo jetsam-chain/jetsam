@@ -16,4 +16,6 @@ thiserror     = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# the fast lane's tests sign with deterministic test keys (the same crate as jetsam_chain)
+blst     = "=0.3.16"
 tokio    = { workspace = true }

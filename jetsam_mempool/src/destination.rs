@@ -20,6 +20,13 @@
 //!   exactly its burn, if the branch holds one (D107 V2, D114), else the
 //!   owner. While that height is `None` (every profile today) its kind decodes
 //!   as an unknown one, exactly as in a build without it.
+//! * The fast lane of the return over Base (D127, D130, same height): a
+//!   **fast release** (a release over Base with the relay's
+//!   `FastGameAttestation`, its group carrying the fast lane's marker), a
+//!   **contradiction** (`FastContradiction` with the slow Base objects it is
+//!   read under, and the transaction carrying its `JTMFCT01` marker) and a
+//!   **revocation** (`FastKeyRevocation` with the transaction carrying its
+//!   `JTMFRV01` marker). Unknown kinds while the height is `None`.
 //!
 //! The pool checks at admission the shapes, the release group against the
 //! vault gate, slots, then — A2-M1, with the committee keys this node holds
@@ -38,8 +45,13 @@ use jetsam_chain::consensus::destination::base_read::{
 };
 use jetsam_chain::consensus::destination::forks::period_of_slot;
 use jetsam_chain::consensus::destination::ssz::{LightClientFinalityUpdate, LightClientUpdate};
+use jetsam_chain::consensus::destination::fast::{
+    fast_marker_kind, fast_release_marker, revocation_marker, FastAttestation, FastContradiction,
+    FastLaneState, FastMarkerKind, FastRevocation,
+};
 use jetsam_chain::consensus::destination::state::{
-    committee_update_marker, verify_committee_update_payload, verify_releases_on_base,
+    committee_update_marker, verify_committee_update_payload, verify_fast_contradiction,
+    verify_fast_release_intent, verify_fast_revocation, verify_releases_on_base,
     verify_releases_on_l1, BaseReleaseObjects, CommitteeKeyCache, CommitteeRef,
     DestinationBlockError, DestinationRules,
 };
@@ -68,10 +80,15 @@ pub const MAX_DESTINATION_INTENT_BYTES: usize = DESTINATION_INTENT_MAGIC.len()
 pub const MAX_HELD_COMMITTEE_UPDATES: usize = 4;
 /// Releases held at once (one per withdrawal index `n`).
 pub const MAX_HELD_RELEASES: usize = 64;
+/// Contradictions held at once (one per withdrawal index `n`).
+pub const MAX_HELD_CONTRADICTIONS: usize = 8;
 
 const KIND_COMMITTEE_UPDATE: u8 = 1;
 const KIND_RELEASE: u8 = 2;
 const KIND_RELEASE_OVER_BASE: u8 = 3;
+const KIND_FAST_RELEASE: u8 = 4;
+const KIND_FAST_CONTRADICTION: u8 = 5;
+const KIND_FAST_REVOCATION: u8 = 6;
 
 /// A committee update with the transaction that pays for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +131,73 @@ pub struct ReleaseIntent {
     /// the output root preimage; `account_proof` is then under the Base
     /// state root they open.
     pub base: Option<BaseReleaseProofs>,
+    /// The fast lane: the `FastGameAttestation` payload (only over Base);
+    /// the group then carries the fast lane's marker.
+    pub fast: Option<Vec<u8>>,
+}
+
+/// A contradiction of a fast release, with the slow Base objects it is read
+/// under and the transaction that carries its marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastContradictionIntent {
+    /// The `FastContradiction` payload.
+    pub payload: Vec<u8>,
+    pub finality: Vec<u8>,
+    pub base: BaseReleaseProofs,
+    /// The bridge account proof under the Base state root.
+    pub account_proof: Vec<u8>,
+    /// Carries the contradiction's `JTMFCT01` marker.
+    pub payment: PagedSpendIntent,
+}
+
+impl FastContradictionIntent {
+    /// The withdrawal index contradicted.
+    pub fn n(&self) -> u64 {
+        FastContradiction::decode_payload(&self.payload).map_or(0, |c| c.n)
+    }
+
+    /// The marker its transaction carries.
+    pub fn marker(&self) -> Option<jetsam_poseidon2b::primitives::Address> {
+        fast_markers_of(&self.payment)
+            .into_iter()
+            .find(|owner| fast_marker_kind(owner) == Some(FastMarkerKind::Contradiction))
+    }
+
+    pub fn object(&self) -> DestinationObject {
+        DestinationObject {
+            kind: DestinationObjectKind::FastContradiction,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+/// A revocation of the relay's key by the cold key, with the transaction
+/// that carries its marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastRevocationIntent {
+    /// The `FastKeyRevocation` payload.
+    pub payload: Vec<u8>,
+    /// Carries the revocation's `JTMFRV01` marker.
+    pub payment: PagedSpendIntent,
+}
+
+impl FastRevocationIntent {
+    pub fn object(&self) -> DestinationObject {
+        DestinationObject {
+            kind: DestinationObjectKind::FastKeyRevocation,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+/// The fast lane's markers a transaction's live outputs carry.
+fn fast_markers_of(intent: &PagedSpendIntent) -> Vec<jetsam_poseidon2b::primitives::Address> {
+    intent
+        .pages
+        .iter()
+        .flat_map(|page| page.body.live_outputs().map(|(_, o)| o.owner))
+        .filter(|owner| fast_marker_kind(owner).is_some())
+        .collect()
 }
 
 /// What a release over Base is proven under beside its finality update.
@@ -137,11 +221,36 @@ impl ReleaseIntent {
 
     /// Whether it shares the block's proofs with `other`: one finality
     /// update, one account proof and, over Base, one game proof and preimage
-    /// per block.
+    /// per block, and one attestation (or none) — one mode per block.
     pub fn shares_proofs_with(&self, other: &Self) -> bool {
         self.finality == other.finality
             && self.account_proof == other.account_proof
             && self.base == other.base
+            && self.fast == other.fast
+    }
+
+    /// The marker its group carries: the release's, or for a fast release
+    /// the fast lane's (the attested L2 block).
+    pub fn marker(&self) -> Option<jetsam_poseidon2b::primitives::Address> {
+        match &self.fast {
+            None => Some(self.release.marker()),
+            Some(payload) => FastAttestation::decode_payload(payload).ok().map(|a| {
+                fast_release_marker(
+                    self.release.n,
+                    &self.release.owner,
+                    self.release.amount,
+                    a.statement.l2_block,
+                )
+            }),
+        }
+    }
+
+    /// The `FastGameAttestation` object, for a fast release.
+    pub fn attestation_object(&self) -> Option<DestinationObject> {
+        self.fast.as_ref().map(|payload| DestinationObject {
+            kind: DestinationObjectKind::FastGameAttestation,
+            payload: payload.clone(),
+        })
     }
 }
 
@@ -150,6 +259,8 @@ impl ReleaseIntent {
 pub enum DestinationIntent {
     CommitteeUpdate(CommitteeUpdateIntent),
     Release(ReleaseIntent),
+    FastContradiction(FastContradictionIntent),
+    FastRevocation(FastRevocationIntent),
 }
 
 /// Why bytes are not a destination intent.
@@ -240,18 +351,36 @@ impl DestinationIntent {
                 put(&mut out, &payment(&update.payment)?);
             }
             Self::Release(release) => {
-                out.push(match release.base {
-                    None => KIND_RELEASE,
-                    Some(_) => KIND_RELEASE_OVER_BASE,
+                out.push(match (&release.base, &release.fast) {
+                    (None, _) => KIND_RELEASE,
+                    (Some(_), None) => KIND_RELEASE_OVER_BASE,
+                    (Some(_), Some(_)) => KIND_FAST_RELEASE,
                 });
                 put(&mut out, &release.release.encode_payload());
                 put(&mut out, &release.finality);
                 if let Some(base) = &release.base {
                     put(&mut out, &base.game_proof);
                     put(&mut out, &base.output_preimage);
+                    if let Some(attestation) = &release.fast {
+                        put(&mut out, attestation);
+                    }
                 }
                 put(&mut out, &release.account_proof);
                 put(&mut out, &payment(&release.payment)?);
+            }
+            Self::FastContradiction(c) => {
+                out.push(KIND_FAST_CONTRADICTION);
+                put(&mut out, &c.payload);
+                put(&mut out, &c.finality);
+                put(&mut out, &c.base.game_proof);
+                put(&mut out, &c.base.output_preimage);
+                put(&mut out, &c.account_proof);
+                put(&mut out, &payment(&c.payment)?);
+            }
+            Self::FastRevocation(r) => {
+                out.push(KIND_FAST_REVOCATION);
+                put(&mut out, &r.payload);
+                put(&mut out, &payment(&r.payment)?);
             }
         }
         Ok(out)
@@ -292,7 +421,9 @@ impl DestinationIntent {
                     payment,
                 })
             }
-            KIND_RELEASE | KIND_RELEASE_OVER_BASE if kind == KIND_RELEASE || over_base => {
+            KIND_RELEASE | KIND_RELEASE_OVER_BASE | KIND_FAST_RELEASE
+                if kind == KIND_RELEASE || over_base =>
+            {
                 let release =
                     VaultRelease::decode_payload(object_bytes(&mut src)?).map_err(|_| {
                         DestinationIntentError::MalformedObject(DestinationObjectKind::VaultRelease)
@@ -301,23 +432,19 @@ impl DestinationIntent {
                 LightClientFinalityUpdate::decode_payload(finality).map_err(|_| {
                     DestinationIntentError::MalformedObject(DestinationObjectKind::FinalityUpdate)
                 })?;
-                let base = if kind == KIND_RELEASE_OVER_BASE {
-                    let game_proof = object_bytes(&mut src)?;
-                    decode_game_proof(game_proof).map_err(|_| {
+                let base = if kind != KIND_RELEASE {
+                    Some(base_proofs(&mut src)?)
+                } else {
+                    None
+                };
+                let fast = if kind == KIND_FAST_RELEASE {
+                    let attestation = object_bytes(&mut src)?;
+                    FastAttestation::decode_payload(attestation).map_err(|_| {
                         DestinationIntentError::MalformedObject(
-                            DestinationObjectKind::BaseGameProof,
+                            DestinationObjectKind::FastGameAttestation,
                         )
                     })?;
-                    let output_preimage = object_bytes(&mut src)?;
-                    decode_output_root_preimage(output_preimage).map_err(|_| {
-                        DestinationIntentError::MalformedObject(
-                            DestinationObjectKind::OutputRootPreimage,
-                        )
-                    })?;
-                    Some(BaseReleaseProofs {
-                        game_proof: game_proof.to_vec(),
-                        output_preimage: output_preimage.to_vec(),
-                    })
+                    Some(attestation.to_vec())
                 } else {
                     None
                 };
@@ -335,6 +462,47 @@ impl DestinationIntent {
                     account_proof: account_proof.to_vec(),
                     payment,
                     base,
+                    fast,
+                })
+            }
+            KIND_FAST_CONTRADICTION if over_base => {
+                let payload = object_bytes(&mut src)?;
+                FastContradiction::decode_payload(payload).map_err(|_| {
+                    DestinationIntentError::MalformedObject(
+                        DestinationObjectKind::FastContradiction,
+                    )
+                })?;
+                let finality = object_bytes(&mut src)?;
+                LightClientFinalityUpdate::decode_payload(finality).map_err(|_| {
+                    DestinationIntentError::MalformedObject(DestinationObjectKind::FinalityUpdate)
+                })?;
+                let base = base_proofs(&mut src)?;
+                let account_proof = object_bytes(&mut src)?;
+                decode_bridge_account_proof(account_proof).map_err(|_| {
+                    DestinationIntentError::MalformedObject(
+                        DestinationObjectKind::BridgeAccountProof,
+                    )
+                })?;
+                let payment = payment_of(take(&mut src)?)?;
+                Self::FastContradiction(FastContradictionIntent {
+                    payload: payload.to_vec(),
+                    finality: finality.to_vec(),
+                    base,
+                    account_proof: account_proof.to_vec(),
+                    payment,
+                })
+            }
+            KIND_FAST_REVOCATION if over_base => {
+                let payload = object_bytes(&mut src)?;
+                FastRevocation::decode_payload(payload).map_err(|_| {
+                    DestinationIntentError::MalformedObject(
+                        DestinationObjectKind::FastKeyRevocation,
+                    )
+                })?;
+                let payment = payment_of(take(&mut src)?)?;
+                Self::FastRevocation(FastRevocationIntent {
+                    payload: payload.to_vec(),
+                    payment,
                 })
             }
             other => return Err(DestinationIntentError::UnknownKind(other)),
@@ -348,7 +516,11 @@ impl DestinationIntent {
 
     /// The transaction is this object's: a committee update's payment carries
     /// exactly one v1.7 marker, its own `JTMLCU01`; a release's group carries
-    /// its own `JTMVRL01` (the rest of its shape is the pool's admission).
+    /// its own `JTMVRL01` (a fast release, the fast lane's commitment), and no
+    /// fast-lane marker (the rest of its shape is the pool's admission); a
+    /// contradiction's or a revocation's transaction carries no v1.7 marker
+    /// and exactly one fast-lane marker, of its kind (a revocation's opens
+    /// its key; a contradiction's is judged against the branch's record).
     fn check_payment_markers(&self) -> Result<(), DestinationIntentError> {
         let markers = |intent: &PagedSpendIntent| -> Vec<jetsam_poseidon2b::primitives::Address> {
             intent
@@ -361,8 +533,23 @@ impl DestinationIntent {
         let ok = match self {
             Self::CommitteeUpdate(update) => {
                 markers(&update.payment) == [committee_update_marker(&update.payload)]
+                    && fast_markers_of(&update.payment).is_empty()
             }
-            Self::Release(release) => markers(&release.payment) == [release.release.marker()],
+            Self::Release(release) => {
+                release.marker().is_some_and(|m| markers(&release.payment) == [m])
+                    && fast_markers_of(&release.payment).is_empty()
+            }
+            Self::FastContradiction(c) => {
+                markers(&c.payment).is_empty()
+                    && fast_markers_of(&c.payment).len() == 1
+                    && c.marker().is_some()
+            }
+            Self::FastRevocation(r) => {
+                markers(&r.payment).is_empty()
+                    && FastRevocation::decode_payload(&r.payload).is_ok_and(|rev| {
+                        fast_markers_of(&r.payment) == [revocation_marker(&rev.key)]
+                    })
+            }
         };
         if ok {
             Ok(())
@@ -377,8 +564,26 @@ impl DestinationIntent {
         match self {
             Self::CommitteeUpdate(update) => &update.payment,
             Self::Release(release) => &release.payment,
+            Self::FastContradiction(c) => &c.payment,
+            Self::FastRevocation(r) => &r.payment,
         }
     }
+}
+
+/// A game proof and an output root preimage, each decoded as its object.
+fn base_proofs(src: &mut &[u8]) -> Result<BaseReleaseProofs, DestinationIntentError> {
+    let game_proof = object_bytes(src)?;
+    decode_game_proof(game_proof).map_err(|_| {
+        DestinationIntentError::MalformedObject(DestinationObjectKind::BaseGameProof)
+    })?;
+    let output_preimage = object_bytes(src)?;
+    decode_output_root_preimage(output_preimage).map_err(|_| {
+        DestinationIntentError::MalformedObject(DestinationObjectKind::OutputRootPreimage)
+    })?;
+    Ok(BaseReleaseProofs {
+        game_proof: game_proof.to_vec(),
+        output_preimage: output_preimage.to_vec(),
+    })
 }
 
 /// What [`crate::AsyncMempool::submit_destination`] admitted.
@@ -390,6 +595,12 @@ pub enum DestinationAdmitted {
     Release { n: u64 },
     /// The release of withdrawal index `n` over Base.
     ReleaseOverBase { n: u64 },
+    /// The fast release of withdrawal index `n` (the fast lane).
+    FastRelease { n: u64 },
+    /// A contradiction of the fast release of `n`.
+    FastContradiction { n: u64 },
+    /// A revocation of the relay's key.
+    FastRevocation,
 }
 
 /// What the pool holds: committee updates by the period they bring, releases
@@ -398,6 +609,8 @@ pub enum DestinationAdmitted {
 pub struct DestinationPool {
     committee_updates: BTreeMap<u64, CommitteeUpdateIntent>,
     releases: BTreeMap<u64, ReleaseIntent>,
+    contradictions: BTreeMap<u64, FastContradictionIntent>,
+    revocation: Option<FastRevocationIntent>,
 }
 
 /// Why the pool does not hold an intent it was offered.
@@ -425,9 +638,52 @@ pub fn verify_destination_intent(
     intent: &DestinationIntent,
     committees: &[CommitteeRef],
     rules: &DestinationRules,
+    lane: &FastLaneState,
     keys: &CommitteeKeyCache,
 ) -> Result<(), DestinationBlockError> {
     match intent {
+        DestinationIntent::Release(ReleaseIntent {
+            release,
+            finality,
+            account_proof,
+            base: Some(base),
+            fast: Some(attestation),
+            ..
+        }) => verify_fast_release_intent(
+            &BaseReleaseObjects {
+                finality,
+                game_proof: &base.game_proof,
+                output_preimage: &base.output_preimage,
+                account_proof,
+            },
+            attestation,
+            std::slice::from_ref(release),
+            committees,
+            rules,
+            lane,
+            &CommitteeKeyCache::default(),
+            keys,
+        )
+        .map(|_| ()),
+        DestinationIntent::FastContradiction(c) => verify_fast_contradiction(
+            &BaseReleaseObjects {
+                finality: &c.finality,
+                game_proof: &c.base.game_proof,
+                output_preimage: &c.base.output_preimage,
+                account_proof: &c.account_proof,
+            },
+            &c.payload,
+            c.marker().ok_or(DestinationBlockError::FastObjectsDoNotMatchMarkers)?,
+            committees,
+            rules,
+            lane,
+            &CommitteeKeyCache::default(),
+            keys,
+        )
+        .map(|_| ()),
+        DestinationIntent::FastRevocation(r) => {
+            verify_fast_revocation(&r.payload, rules, lane).map(|_| ())
+        }
         DestinationIntent::CommitteeUpdate(update) => {
             verify_committee_update_payload(&update.payload, committees, rules, keys).map(|_| ())
         }
@@ -535,8 +791,44 @@ impl DestinationPool {
                 }
                 self.releases.insert(n, release);
             }
+            DestinationIntent::FastContradiction(c) => {
+                let n = c.n();
+                if !self.contradictions.contains_key(&n)
+                    && self.contradictions.len() >= MAX_HELD_CONTRADICTIONS
+                {
+                    return Err(HoldError::Full);
+                }
+                self.contradictions.insert(n, c);
+            }
+            DestinationIntent::FastRevocation(r) => {
+                self.revocation = Some(r);
+            }
         }
         Ok(())
+    }
+
+    /// Contradictions by increasing `n`.
+    pub fn contradictions(&self) -> impl Iterator<Item = &FastContradictionIntent> {
+        self.contradictions.values()
+    }
+
+    /// The revocation held, if any.
+    pub fn revocation(&self) -> Option<&FastRevocationIntent> {
+        self.revocation.as_ref()
+    }
+
+    /// Forget the fast lane's intents `lane` makes useless: a revocation of a
+    /// closed key, a contradiction of an `n` without an open record.
+    pub fn prune_fast(&mut self, lane: &FastLaneState) -> usize {
+        let before = self.len();
+        if self.revocation.as_ref().is_some_and(|r| {
+            FastRevocation::decode_payload(&r.payload).map_or(true, |rev| lane.is_closed(&rev.key))
+        }) {
+            self.revocation = None;
+        }
+        self.contradictions
+            .retain(|n, _| lane.records.get(n).is_some_and(|record| !record.contradicted));
+        before - self.len()
     }
 
     /// Releases by increasing `n` (the template's policy, porte R §3.3).
@@ -550,7 +842,10 @@ impl DestinationPool {
     }
 
     pub fn len(&self) -> usize {
-        self.committee_updates.len() + self.releases.len()
+        self.committee_updates.len()
+            + self.releases.len()
+            + self.contradictions.len()
+            + usize::from(self.revocation.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -587,10 +882,23 @@ impl DestinationPool {
         before - self.len()
     }
 
+    /// Forget the contradictions of `contradictions` and, if `revocation`,
+    /// the revocation (a template's block was refused for them).
+    pub fn forget_fast(&mut self, contradictions: &[u64], revocation: bool) -> usize {
+        let before = self.len();
+        self.contradictions.retain(|n, _| !contradictions.contains(n));
+        if revocation {
+            self.revocation = None;
+        }
+        before - self.len()
+    }
+
     /// Forget everything (below J, or a view the pool cannot judge by).
     pub fn clear(&mut self) {
         self.committee_updates.clear();
         self.releases.clear();
+        self.contradictions.clear();
+        self.revocation = None;
     }
 }
 

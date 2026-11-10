@@ -570,14 +570,17 @@ impl TemplateBuilder {
         let offer = match &snapshot.destination {
             Some(state) if destination_rules.active_at(child_height) => {
                 let (updates, releases) = self.mempool.destination_candidates().await;
+                let (contradictions, revocation) = self.mempool.fast_candidates().await;
                 let anchor_ok =
                     |anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation);
-                crate::destination_slot::plan_destination_offer(
+                crate::destination_slot::plan_destination_offer_with(
                     state,
                     &destination_rules,
                     child_height,
                     updates,
                     releases,
+                    contradictions,
+                    revocation,
                     &anchor_ok,
                     0,
                 )
@@ -1043,6 +1046,9 @@ impl TemplateBuilder {
                         })
                         .flatten(),
                 )
+                .await;
+            self.mempool
+                .forget_fast_destination(&culprits.contradictions, culprits.revocation)
                 .await;
         }
         let ((inner, prepared_state_commit), client_slot, destination) = match template_cpu_result {

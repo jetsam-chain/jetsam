@@ -3232,6 +3232,7 @@ dependencies = [
 name = "jetsam_mempool"
 version = "1.7.0"
 dependencies = [
+ "blst",
  "jetsam_chain",
  "jetsam_core",
  "jetsam_gkr",
@@ -3249,6 +3250,7 @@ version = "1.7.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "blst",
  "hex",
  "jetsam-ivc-core",
  "jetsam-ivc-prover",

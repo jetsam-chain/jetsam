@@ -303,6 +303,14 @@ pub trait JetsamApi {
     /// for withdrawal index `n` and, given the burn (`owner` bech32m and
     /// `amount` µJTM), whom its release group must pay at the tip's child
     /// (V2). Nothing is read while the return over Base is dormant.
+    /// v1.7, the fast lane of the return over Base (D127, D130): the relay
+    /// key of this build and whether the branch closed it, the keys closed,
+    /// the deficit, the fast releases the branch still remembers (what a
+    /// contradiction's marker commits to). Nothing while the return is
+    /// dormant.
+    #[method(name = "getFastLane")]
+    async fn get_fast_lane(&self) -> RpcResult<crate::destination::FastLaneResponse>;
+
     #[method(name = "getAdvances")]
     async fn get_advances(
         &self,

@@ -3495,6 +3495,16 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn get_fast_lane(&self) -> RpcResult<crate::destination::FastLaneResponse> {
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let chain = self.chain.read().await;
+        Ok(crate::destination::fast_lane_of(
+            chain.destination_state(),
+            chain.tip_height(),
+            &rules,
+        ))
+    }
+
     async fn get_advances(
         &self,
         n: u64,

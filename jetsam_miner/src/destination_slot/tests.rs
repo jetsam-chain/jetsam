@@ -114,6 +114,7 @@ fn release_with(n: u64, amount: u64, finality: Vec<u8>, fee: u64) -> ReleaseInte
         finality,
         account_proof: proof,
         base: None,
+        fast: None,
     }
 }
 
@@ -369,6 +370,7 @@ fn destination_section_follows_the_markers_of_the_built_block() {
             release(3, 6 * MICRO_PER_JTM),
             release(4, 7 * MICRO_PER_JTM),
         ],
+        ..DestinationOffer::default()
     };
     let txs = |payments: &[&PagedSpendIntent]| -> Vec<jetsam_tx::Transaction> {
         payments
@@ -446,6 +448,7 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
     let offer = DestinationOffer {
         committee_update: None,
         releases: vec![release(2, 7 * MICRO_PER_JTM + RELEASE_FEE_MICRO)],
+        ..DestinationOffer::default()
     };
     let kept = deposits_within_ceiling(
         vec![second.clone(), first.clone()],
@@ -460,6 +463,7 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
     let late = DestinationOffer {
         committee_update: None,
         releases: vec![release_with(2, 6 * MICRO_PER_JTM, finality(), 10_000)],
+        ..DestinationOffer::default()
     };
     let kept = deposits_within_ceiling(
         vec![second, first.clone()],
@@ -484,6 +488,7 @@ fn template_rebuilds_without_invalid_destination_objects() {
     let both = DestinationOffer {
         committee_update: Some(committee(1_895)),
         releases: vec![release(2, 5 * MICRO_PER_JTM), release(3, 5 * MICRO_PER_JTM)],
+        ..DestinationOffer::default()
     };
     let releases_only = DestinationOffer {
         committee_update: None,
@@ -502,7 +507,8 @@ fn template_rebuilds_without_invalid_destination_objects() {
         ),
         Culprits {
             releases: vec![3],
-            committee_update: false
+            committee_update: false,
+            ..Culprits::default()
         }
     );
     assert_eq!(
@@ -512,7 +518,8 @@ fn template_rebuilds_without_invalid_destination_objects() {
         ),
         Culprits {
             releases: vec![2],
-            committee_update: false
+            committee_update: false,
+            ..Culprits::default()
         }
     );
     assert_eq!(
@@ -522,7 +529,8 @@ fn template_rebuilds_without_invalid_destination_objects() {
         ),
         Culprits {
             releases: vec![2, 3],
-            committee_update: false
+            committee_update: false,
+            ..Culprits::default()
         }
     );
     let light = DestinationBlockError::LightClient(LightClientError::SlotOrder);
@@ -530,21 +538,24 @@ fn template_rebuilds_without_invalid_destination_objects() {
         blame(light.clone(), &both),
         Culprits {
             releases: Vec::new(),
-            committee_update: true
+            committee_update: true,
+            ..Culprits::default()
         }
     );
     assert_eq!(
         blame(light, &releases_only),
         Culprits {
             releases: vec![2, 3],
-            committee_update: false
+            committee_update: false,
+            ..Culprits::default()
         }
     );
     assert_eq!(
         blame(DestinationBlockError::AnchorMismatch, &both),
         Culprits {
             releases: Vec::new(),
-            committee_update: true
+            committee_update: true,
+            ..Culprits::default()
         }
     );
     assert_eq!(
@@ -558,7 +569,8 @@ fn template_rebuilds_without_invalid_destination_objects() {
     assert!(both
         .without(&Culprits {
             releases: vec![3],
-            committee_update: true
+            committee_update: true,
+            ..Culprits::default()
         })
         .releases
         .iter()
@@ -608,6 +620,7 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
     let offer = DestinationOffer {
         committee_update: None,
         releases: releases(),
+        ..DestinationOffer::default()
     };
     let run = |offer: &DestinationOffer, error: DestinationBlockError, bad: &[u64]| {
         let mut tried = Vec::new();
@@ -625,7 +638,8 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
         blamed,
         Culprits {
             releases: vec![2],
-            committee_update: false
+            committee_update: false,
+            ..Culprits::default()
         }
     );
     assert_eq!(tried, vec![vec![1, 3]]);
@@ -640,6 +654,7 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
     let with_update = DestinationOffer {
         committee_update: Some(committee(1_895)),
         releases: releases(),
+        ..DestinationOffer::default()
     };
     let (built, blamed, _) = run(
         &with_update,
@@ -651,7 +666,8 @@ fn template_keeps_the_other_releases_when_one_is_blamed() {
         blamed,
         Culprits {
             releases: Vec::new(),
-            committee_update: true
+            committee_update: true,
+            ..Culprits::default()
         }
     );
 
@@ -723,13 +739,15 @@ fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_tem
         let offer = DestinationOffer {
             committee_update: Some(update),
             releases: releases.clone(),
+            ..DestinationOffer::default()
         };
         let error = DestinationBlockError::Vault(error);
         assert_eq!(
             culprits_of(&error, &offer, &rules().vault),
             Culprits {
                 releases: Vec::new(),
-                committee_update: true
+                committee_update: true,
+                ..Culprits::default()
             },
             "{error:?}"
         );
@@ -742,6 +760,7 @@ fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_tem
     let innocent = DestinationOffer {
         committee_update: Some(honest),
         releases,
+        ..DestinationOffer::default()
     };
     for error in [
         VaultError::VaultCeilingReached {
@@ -1026,6 +1045,7 @@ fn the_template_keeps_only_the_advances_the_block_rule_accepts_together() {
     let offer = DestinationOffer {
         committee_update: None,
         releases: vec![base_release(5, 10 * jtm, OWNER, 7)],
+        ..DestinationOffer::default()
     };
     let kept_of = |rules: &DestinationRules| -> Vec<usize> {
         let tagged: Vec<(usize, PagedSpendIntent)> = entries.iter().cloned().enumerate().collect();
@@ -1116,4 +1136,283 @@ fn d123_the_template_follows_the_caps_of_its_block() {
     };
     assert!(kept(c - 1).is_empty(), "over the ceiling of before");
     assert_eq!(kept(c).len(), 1, "within D123's ceiling");
+}
+
+// ---------------------------------------------------------------------------
+// The fast lane (D127, D130): fast releases, contradictions, revocation
+// ---------------------------------------------------------------------------
+
+mod fast_lane {
+    use super::*;
+    use blst::min_pk::SecretKey;
+    use jetsam_chain::consensus::destination::fast::{
+        fast_release_marker, revocation_marker, ContradictionEntry, FastAttestation,
+        FastContradiction, FastRecord, FastRevocation, FastStatement, FAST_RELEASE_DST,
+        FAST_REVOKE_DST,
+    };
+    use jetsam_chain::consensus::destination::mpt::keccak256;
+    use jetsam_mempool::destination::{FastContradictionIntent, FastRevocationIntent};
+
+    fn key(label: &str) -> (SecretKey, [u8; 48]) {
+        let sk = SecretKey::key_gen(&keccak256(label.as_bytes()), &[]).expect("a test key");
+        let pk = sk.sk_to_pk().compress();
+        (sk, pk)
+    }
+
+    const L2: u64 = 56_993_063;
+
+    fn attestation() -> Vec<u8> {
+        let (relay, _) = key("jetsam-v17-FAST-TEST-ONLY/relay");
+        let statement = FastStatement {
+            network: [0x4e; 32],
+            l1_chain_id: 1,
+            base_chain_id: 8_453,
+            bridge: [0x1b; 20],
+            game: [0x5e; 20],
+            l2_block: L2,
+            root_claim: [0x7b; 32],
+        };
+        FastAttestation {
+            statement,
+            signature: relay.sign(&statement.message(), FAST_RELEASE_DST, &[]).compress(),
+        }
+        .encode_payload()
+    }
+
+    /// A fast release of `n` paying `payee`: its group carries the fast marker.
+    pub(super) fn fast_release(n: u64, amount: u64, payee: Address) -> ReleaseIntent {
+        let mut intent = base_release(n, amount, payee, 1);
+        intent.fast = Some(attestation());
+        let marker = fast_release_marker(n, &intent.release.owner, amount, L2);
+        intent.payment = page(
+            VAULT_ADDRESS,
+            1_000 + n as u32 * 4,
+            &[(payee, amount - RELEASE_FEE_MICRO), (marker, 0)],
+            RELEASE_FEE_MICRO,
+        );
+        intent
+    }
+
+    fn entry(n: u64) -> ContradictionEntry {
+        ContradictionEntry {
+            n,
+            owner: OWNER,
+            amount: 5 * MICRO_PER_JTM,
+            l2_block: L2,
+            height: J + 5,
+            key: Some(key("jetsam-v17-FAST-TEST-ONLY/relay").1),
+        }
+    }
+
+    fn contradiction(n: u64, tag: u8) -> FastContradictionIntent {
+        let base = base_release(n, 5 * MICRO_PER_JTM, OWNER, tag);
+        FastContradictionIntent {
+            payload: FastContradiction {
+                n,
+                storage_proof: vec![vec![0xee; 40]],
+            }
+            .encode_payload(),
+            finality: base.finality.clone(),
+            base: base.base.clone().expect("over Base"),
+            account_proof: base.account_proof.clone(),
+            payment: page(PAYER, 3_000 + n as u32 * 4, &[(entry(n).marker(), 0), (BOB, 5)], 50_000),
+        }
+    }
+
+    fn revocation() -> FastRevocationIntent {
+        let (cold, _) = key("jetsam-v17-FAST-TEST-ONLY/cold");
+        let (_, relay) = key("jetsam-v17-FAST-TEST-ONLY/relay");
+        let unsigned = FastRevocation {
+            network: [0x4e; 32],
+            key: relay,
+            signature: [0; 96],
+        };
+        let payload = FastRevocation {
+            signature: cold.sign(&unsigned.message(), FAST_REVOKE_DST, &[]).compress(),
+            ..unsigned
+        }
+        .encode_payload();
+        FastRevocationIntent {
+            payload,
+            payment: page(PAYER, 4_000, &[(revocation_marker(&relay), 0), (BOB, 5)], 50_000),
+        }
+    }
+
+    fn plan_fast(
+        state: &DestinationState,
+        releases: Vec<ReleaseIntent>,
+        contradictions: Vec<FastContradictionIntent>,
+        revocation: Option<FastRevocationIntent>,
+    ) -> DestinationOffer {
+        plan_destination_offer_with(
+            state,
+            &base_rules(),
+            state.tip + 1,
+            Vec::new(),
+            releases,
+            contradictions,
+            revocation,
+            &|anchor| *anchor == ANCHOR,
+            0,
+        )
+    }
+
+    fn kinds(section: &DestinationSection) -> Vec<DestinationObjectKind> {
+        section.objects.iter().map(|o| o.kind).collect()
+    }
+
+    /// A fast release's section: the shared proofs, its attestation, the
+    /// release found by the fast lane's marker of its group.
+    #[test]
+    fn a_fast_release_offer_carries_its_attestation_and_finds_its_group_by_the_fast_marker() {
+        let state = state_at(J + 20);
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER), fast_release(4, 2 * MICRO_PER_JTM, OWNER)],
+            Vec::new(),
+            None,
+        );
+        assert_eq!(offer.releases.len(), 2);
+        let section = offer.section_for(&offer.payment_order());
+        assert_eq!(
+            kinds(&section),
+            vec![
+                DestinationObjectKind::FinalityUpdate,
+                DestinationObjectKind::BaseGameProof,
+                DestinationObjectKind::OutputRootPreimage,
+                DestinationObjectKind::BridgeAccountProof,
+                DestinationObjectKind::FastGameAttestation,
+                DestinationObjectKind::VaultRelease,
+                DestinationObjectKind::VaultRelease,
+            ]
+        );
+        assert_eq!(offer.object_count(), section.objects.len());
+        // A slow release never shares a block with fast ones (one mode).
+        let mixed = plan_fast(
+            &state,
+            vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER), base_release(4, 2 * MICRO_PER_JTM, OWNER, 1)],
+            Vec::new(),
+            None,
+        );
+        assert_eq!(mixed.releases.len(), 1);
+        // Dormant: nothing of the fast lane.
+        let dormant = plan_destination_offer_with(
+            &state,
+            &rules(),
+            state.tip + 1,
+            Vec::new(),
+            Vec::new(),
+            vec![contradiction(3, 1)],
+            Some(revocation()),
+            &|anchor| *anchor == ANCHOR,
+            0,
+        );
+        assert!(dormant.is_empty());
+    }
+
+    /// The revocation while its key is open; a contradiction of an open fast
+    /// record, never beside a fast release, under the Base objects of the
+    /// first one (or of the releases it shares them with).
+    #[test]
+    fn the_template_offers_the_revocation_and_contradictions_as_the_block_rule_takes_them() {
+        let mut state = state_at(J + 20);
+        let offer = plan_fast(&state, Vec::new(), Vec::new(), Some(revocation()));
+        assert!(offer.revocation.is_some());
+        let section = offer.section_for(&offer.payment_order());
+        assert_eq!(kinds(&section), vec![DestinationObjectKind::FastKeyRevocation]);
+        state.fast.revocations.push(key("jetsam-v17-FAST-TEST-ONLY/relay").1);
+        assert!(plan_fast(&state, Vec::new(), Vec::new(), Some(revocation())).is_empty());
+        let mut state = state_at(J + 20);
+        // No record of 3: no contradiction.
+        assert!(plan_fast(&state, Vec::new(), vec![contradiction(3, 1)], None).is_empty());
+        state.fast.records.insert(
+            3,
+            FastRecord {
+                owner: OWNER,
+                amount: 5 * MICRO_PER_JTM,
+                l2_block: L2,
+                height: J + 5,
+                contradicted: false,
+                consumed: false,
+            },
+        );
+        state.fast.records.insert(4, state.fast.records[&3]);
+        let offer = plan_fast(&state, Vec::new(), vec![contradiction(3, 1), contradiction(4, 2)], None);
+        // The second reads under other proofs: it waits.
+        assert_eq!(offer.contradictions.len(), 1);
+        let section = offer.section_for(&offer.payment_order());
+        assert_eq!(
+            kinds(&section),
+            vec![
+                DestinationObjectKind::FinalityUpdate,
+                DestinationObjectKind::BaseGameProof,
+                DestinationObjectKind::OutputRootPreimage,
+                DestinationObjectKind::BridgeAccountProof,
+                DestinationObjectKind::FastContradiction,
+            ]
+        );
+        assert_eq!(offer.object_count(), section.objects.len());
+        // Beside a slow release of the same proofs (the real burner paid in
+        // the same block): taken, after the release.
+        let offer = plan_fast(
+            &state,
+            vec![base_release(7, 2 * MICRO_PER_JTM, OWNER, 1)],
+            vec![contradiction(3, 1)],
+            None,
+        );
+        assert_eq!((offer.releases.len(), offer.contradictions.len()), (1, 1));
+        // Never beside a fast release.
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(7, 2 * MICRO_PER_JTM, OWNER)],
+            vec![contradiction(3, 1)],
+            None,
+        );
+        assert!(offer.contradictions.is_empty());
+        // A record contradicted already: none.
+        state.fast.records.get_mut(&3).unwrap().contradicted = true;
+        assert!(plan_fast(&state, Vec::new(), vec![contradiction(3, 1)], None).is_empty());
+    }
+
+    /// What a refused block blames of the fast lane.
+    #[test]
+    fn culprits_of_the_fast_lane() {
+        let offer = DestinationOffer {
+            releases: vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER)],
+            contradictions: vec![contradiction(4, 1)],
+            revocation: Some(revocation()),
+            ..DestinationOffer::default()
+        };
+        let rules = rules().vault;
+        assert_eq!(
+            culprits_of(&DestinationBlockError::NotAContradiction { n: 4 }, &offer, &rules),
+            Culprits {
+                contradictions: vec![4],
+                ..Culprits::default()
+            }
+        );
+        assert_eq!(
+            culprits_of(&DestinationBlockError::FastKeyClosed, &offer, &rules),
+            Culprits {
+                releases: vec![3],
+                revocation: true,
+                ..Culprits::default()
+            }
+        );
+        assert_eq!(
+            culprits_of(&DestinationBlockError::FastObjectsDoNotMatchMarkers, &offer, &rules),
+            Culprits {
+                contradictions: vec![4],
+                revocation: true,
+                ..Culprits::default()
+            }
+        );
+        let without = offer.without(&Culprits {
+            contradictions: vec![4],
+            revocation: true,
+            ..Culprits::default()
+        });
+        assert!(without.contradictions.is_empty() && without.revocation.is_none());
+        assert_eq!(without.releases.len(), 1);
+    }
 }

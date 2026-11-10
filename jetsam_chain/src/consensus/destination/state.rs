@@ -1722,6 +1722,71 @@ pub fn validate_block_destination(
     })
 }
 
+/// The fast lane's rules of one fast release intent (the mempool's A2-M1
+/// check, the block's own functions): this build's relay key, open on the
+/// branch `lane`, over a statement of this network, chains and bridge, that
+/// signs exactly the game the proof reads, proposed by Base; then V7 of
+/// `releases` under its Base state root. `attestation` is the object's
+/// payload.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fast_release_intent(
+    objects: &BaseReleaseObjects<'_>,
+    attestation: &[u8],
+    releases: &[VaultRelease],
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    lane: &FastLaneState,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<BaseState, DestinationBlockError> {
+    let attestation = FastAttestation::decode_payload(attestation).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FastGameAttestation,
+        }
+    })?;
+    check_attestation_key(&attestation, &rules.base_return.fast, lane, None)?;
+    verify_fast_releases_on_base(objects, &attestation, releases, committees, rules, learned, keys)
+}
+
+/// The rules of one revocation (payload of the object): the key it closes.
+pub fn verify_fast_revocation(
+    payload: &[u8],
+    rules: &DestinationRules,
+    lane: &FastLaneState,
+) -> Result<[u8; KEY_BYTES], DestinationBlockError> {
+    let revocation = FastRevocation::decode_payload(payload).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FastKeyRevocation,
+        }
+    })?;
+    check_revocation(&revocation, &rules.base_return.fast, lane)
+}
+
+/// The rules of one contradiction (payload of the object) whose group
+/// carries `marker`, under the slow Base objects `objects` (a final game):
+/// the entry the branch keeps.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fast_contradiction(
+    objects: &BaseReleaseObjects<'_>,
+    payload: &[u8],
+    marker: Address,
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    lane: &FastLaneState,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<ContradictionEntry, DestinationBlockError> {
+    let contradiction = FastContradiction::decode_payload(payload).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FastContradiction,
+        }
+    })?;
+    let base = verify_releases_on_base(objects, &[], committees, rules, learned, keys)?;
+    let mut entries =
+        check_contradictions(&[contradiction], &[marker], &base, objects, lane, rules)?;
+    Ok(entries.remove(0))
+}
+
 /// The fast lane's markers among the block's live outputs: the contradiction
 /// and the revocation markers of its user groups, in block order; refused in
 /// a system record or with value (V5).

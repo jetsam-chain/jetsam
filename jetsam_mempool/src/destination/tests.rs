@@ -303,6 +303,7 @@ pub(crate) fn release_intent(n: u64, owner: Address, amount: u64) -> Destination
         finality: finality_payload(),
         account_proof: proof,
         base: None,
+        fast: None,
     })
 }
 
@@ -622,4 +623,255 @@ fn full_release_pool_makes_room_for_a_lower_n() {
         .unwrap();
     assert!(!held(&pool).contains(&(last - 1)));
     assert_eq!(held(&pool)[..2], [7, first - 1]);
+}
+
+// ---------------------------------------------------------------------------
+// The fast lane (D127, D130): fast release, contradiction, revocation
+// ---------------------------------------------------------------------------
+
+mod fast_lane {
+    use super::*;
+    use blst::min_pk::SecretKey;
+    use jetsam_chain::consensus::destination::fast::{
+        ContradictionEntry, FastLaneRules, FastLaneState, FastStatement, FAST_RELEASE_DST,
+        FAST_REVOKE_DST,
+    };
+    use jetsam_chain::consensus::destination::mpt::keccak256;
+    use jetsam_chain::consensus::guardian::network_id;
+
+    fn key(label: &str) -> (SecretKey, [u8; 48]) {
+        let sk = SecretKey::key_gen(&keccak256(label.as_bytes()), &[]).expect("a test key");
+        let pk = sk.sk_to_pk().compress();
+        (sk, pk)
+    }
+
+    const L2: u64 = 56_993_063;
+
+    fn fast_release() -> ReleaseIntent {
+        let base = SyntheticBase::load();
+        let (relay, _) = key("jetsam-v17-FAST-TEST-ONLY/relay");
+        let statement = FastStatement {
+            network: network_id(),
+            l1_chain_id: 1,
+            base_chain_id: 8_453,
+            bridge: [0x1b; 20],
+            game: [0x5e; 20],
+            l2_block: L2,
+            root_claim: [0x7b; 32],
+        };
+        let attestation = FastAttestation {
+            statement,
+            signature: relay.sign(&statement.message(), FAST_RELEASE_DST, &[]).compress(),
+        };
+        let DestinationIntent::Release(mut release) =
+            release_intent(base.release.n, base.release.owner, base.release.amount)
+        else {
+            unreachable!()
+        };
+        let rf = jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
+        let marker = fast_release_marker(base.release.n, &base.release.owner, base.release.amount, L2);
+        release.payment = payment(
+            VAULT_ADDRESS,
+            &[(base.release.owner, base.release.amount - rf), (marker, 0)],
+            rf,
+        );
+        release.base = Some(base.proofs());
+        release.fast = Some(attestation.encode_payload());
+        release
+    }
+
+    fn entry() -> ContradictionEntry {
+        ContradictionEntry {
+            n: 3,
+            owner: Address([0xa1; 32]),
+            amount: 5_000_000,
+            l2_block: L2,
+            height: 77,
+            key: Some(key("jetsam-v17-FAST-TEST-ONLY/relay").1),
+        }
+    }
+
+    fn contradiction() -> FastContradictionIntent {
+        let base = SyntheticBase::load();
+        FastContradictionIntent {
+            payload: FastContradiction {
+                n: 3,
+                storage_proof: vec![vec![0xee; 40]],
+            }
+            .encode_payload(),
+            finality: base.finality.clone(),
+            base: base.proofs(),
+            account_proof: base.account_proof.clone(),
+            payment: payment(Address([0x51; 32]), &[(entry().marker(), 0), (Address([0x52; 32]), 10)], 50_000),
+        }
+    }
+
+    fn revocation_by(signer: &str, revoked: [u8; 48]) -> FastRevocationIntent {
+        let (cold, _) = key(signer);
+        let unsigned = FastRevocation {
+            network: network_id(),
+            key: revoked,
+            signature: [0; 96],
+        };
+        let payload = FastRevocation {
+            signature: cold.sign(&unsigned.message(), FAST_REVOKE_DST, &[]).compress(),
+            ..unsigned
+        }
+        .encode_payload();
+        FastRevocationIntent {
+            payload,
+            payment: payment(
+                Address([0x51; 32]),
+                &[(revocation_marker(&revoked), 0), (Address([0x52; 32]), 10)],
+                50_000,
+            ),
+        }
+    }
+
+    fn revocation() -> FastRevocationIntent {
+        revocation_by("jetsam-v17-FAST-TEST-ONLY/cold", key("jetsam-v17-FAST-TEST-ONLY/relay").1)
+    }
+
+    #[test]
+    fn the_fast_lanes_intents_round_trip_only_once_the_height_is_armed() {
+        for (intent, kind) in [
+            (DestinationIntent::Release(fast_release()), 4u8),
+            (DestinationIntent::FastContradiction(contradiction()), 5),
+            (DestinationIntent::FastRevocation(revocation()), 6),
+        ] {
+            let bytes = intent.encode().unwrap();
+            assert_eq!(bytes[8], kind);
+            assert!(bytes.len() <= MAX_DESTINATION_INTENT_BYTES);
+            assert_eq!(DestinationIntent::decode_with(&bytes, true), Ok(intent.clone()));
+            // Dormant (every profile today): a kind of a build without them.
+            assert_eq!(
+                DestinationIntent::decode_with(&bytes, false),
+                Err(DestinationIntentError::UnknownKind(kind))
+            );
+            assert_eq!(
+                DestinationIntent::decode(&bytes),
+                Err(DestinationIntentError::UnknownKind(kind))
+            );
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(DestinationIntent::decode_with(&longer, true).is_err());
+        }
+        let mut bad = fast_release();
+        bad.fast.as_mut().unwrap().push(0);
+        assert_eq!(
+            DestinationIntent::decode_with(&DestinationIntent::Release(bad).encode().unwrap(), true),
+            Err(DestinationIntentError::MalformedObject(
+                DestinationObjectKind::FastGameAttestation
+            ))
+        );
+    }
+
+    /// Each transaction carries exactly its object's marker: a fast release
+    /// the fast lane's (never the slow one), a revocation the marker of the
+    /// key it revokes, a contradiction one `JTMFCT01`.
+    #[test]
+    fn a_fast_intents_transaction_carries_exactly_its_marker() {
+        let rf = jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
+        let mut slow_marker = fast_release();
+        slow_marker.payment = payment(
+            VAULT_ADDRESS,
+            &[(slow_marker.release.owner, slow_marker.release.amount - rf), (slow_marker.release.marker(), 0)],
+            rf,
+        );
+        let mut other_key = revocation();
+        other_key.payment = payment(
+            Address([0x51; 32]),
+            &[(revocation_marker(&[0x11; 48]), 0), (Address([0x52; 32]), 10)],
+            50_000,
+        );
+        let mut none = contradiction();
+        none.payment = payment(Address([0x51; 32]), &[(Address([0x52; 32]), 10)], 50_000);
+        let mut two = revocation();
+        two.payment = payment(
+            Address([0x51; 32]),
+            &[(revocation_marker(&key("jetsam-v17-FAST-TEST-ONLY/relay").1), 0), (entry().marker(), 0)],
+            50_000,
+        );
+        for intent in [
+            DestinationIntent::Release(slow_marker),
+            DestinationIntent::FastRevocation(other_key),
+            DestinationIntent::FastContradiction(none),
+            DestinationIntent::FastRevocation(two),
+        ] {
+            assert!(matches!(
+                DestinationIntent::decode_with(&intent.encode().unwrap(), true),
+                Err(DestinationIntentError::Payment(_))
+            ));
+        }
+    }
+
+    /// A revocation is judged as the block judges it: the cold key of the
+    /// build, the relay's key open on the branch.
+    #[test]
+    fn a_revocation_is_judged_against_the_cold_key_and_the_branch() {
+        let l1 = SyntheticL1::load();
+        let mut rules = SyntheticBase::rules(&l1, jetsam_chain::consensus::vault::VaultRules::current(), 10);
+        rules.base_return.fast = FastLaneRules {
+            release_key: Some(key("jetsam-v17-FAST-TEST-ONLY/relay").1),
+            revoke_key: Some(key("jetsam-v17-FAST-TEST-ONLY/cold").1),
+            ..FastLaneRules::CONSENSUS
+        };
+        let judge = |intent: &DestinationIntent, lane: &FastLaneState| {
+            verify_destination_intent(intent, &[], &rules, lane, &CommitteeKeyCache::default())
+        };
+        let open = FastLaneState::default();
+        assert_eq!(judge(&DestinationIntent::FastRevocation(revocation()), &open), Ok(()));
+        let mut closed = FastLaneState::default();
+        closed.revocations.push(key("jetsam-v17-FAST-TEST-ONLY/relay").1);
+        assert_eq!(
+            judge(&DestinationIntent::FastRevocation(revocation()), &closed),
+            Err(DestinationBlockError::FastKeyClosed)
+        );
+        let by_relay = revocation_by(
+            "jetsam-v17-FAST-TEST-ONLY/relay",
+            key("jetsam-v17-FAST-TEST-ONLY/relay").1,
+        );
+        assert_eq!(
+            judge(&DestinationIntent::FastRevocation(by_relay), &open),
+            Err(DestinationBlockError::FastBadSignature)
+        );
+        // A contradiction of an `n` the branch holds no fast release of is
+        // refused before anything is read under Base.
+        assert!(judge(&DestinationIntent::FastContradiction(contradiction()), &open).is_err());
+    }
+
+    #[test]
+    fn the_pool_holds_the_fast_lanes_intents_and_forgets_the_useless() {
+        let mut pool = DestinationPool::default();
+        pool.hold(DestinationIntent::FastContradiction(contradiction())).unwrap();
+        pool.hold(DestinationIntent::FastRevocation(revocation())).unwrap();
+        pool.hold(DestinationIntent::Release(fast_release())).unwrap();
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.contradictions().count(), 1);
+        assert!(pool.revocation().is_some());
+        // The branch holds the record of 3, open, and the key open: kept.
+        let mut lane = FastLaneState::default();
+        lane.records.insert(
+            3,
+            jetsam_chain::consensus::destination::fast::FastRecord {
+                owner: Address([0xa1; 32]),
+                amount: 5_000_000,
+                l2_block: L2,
+                height: 77,
+                contradicted: false,
+                consumed: false,
+            },
+        );
+        assert_eq!(pool.prune_fast(&lane), 0);
+        // Contradicted, and the key closed: both forgotten.
+        lane.records.get_mut(&3).unwrap().contradicted = true;
+        lane.revocations.push(key("jetsam-v17-FAST-TEST-ONLY/relay").1);
+        assert_eq!(pool.prune_fast(&lane), 2);
+        assert_eq!(pool.len(), 1);
+        pool.hold(DestinationIntent::FastContradiction(contradiction())).unwrap();
+        pool.hold(DestinationIntent::FastRevocation(revocation())).unwrap();
+        assert_eq!(pool.forget_fast(&[3], true), 2);
+        pool.clear();
+        assert!(pool.is_empty());
+    }
 }

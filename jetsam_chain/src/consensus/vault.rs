@@ -1051,6 +1051,19 @@ pub fn check_release_group_paying(
     floor: u64,
     payee: &Address,
 ) -> Result<(), VaultError> {
+    check_release_group_marked(pages, release, rules, floor, payee, &release.marker())
+}
+
+/// [`check_release_group_paying`] where the group carries `marker`: the
+/// release's own, or a fast release's (`destination::fast::fast_release_marker`).
+pub fn check_release_group_marked(
+    pages: &[jetsam_tx::TxPage],
+    release: &VaultRelease,
+    rules: &VaultRules,
+    floor: u64,
+    payee: &Address,
+    marker: &Address,
+) -> Result<(), VaultError> {
     if !release_shape_ok(&release.owner, release.amount, rules) {
         return Err(VaultError::ReleaseShape { group: 0 });
     }
@@ -1063,8 +1076,8 @@ pub fn check_release_group_paying(
         .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
         .collect();
     let shape_ok = match outputs.as_slice() {
-        [(paid_to, _), (marker, 0)] | [(paid_to, _), (marker, 0), (_, _)] => {
-            *marker == release.marker()
+        [(paid_to, _), (carried, 0)] | [(paid_to, _), (carried, 0), (_, _)] => {
+            *carried == *marker
                 && *paid_to == *payee
                 && outputs
                     .get(2)

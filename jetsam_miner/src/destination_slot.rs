@@ -41,8 +41,10 @@ use jetsam_chain::consensus::vault::{
     destination_marker_kind, DestinationMarkerKind, VaultError, VaultRules,
 };
 use jetsam_chain::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
+use jetsam_chain::consensus::destination::fast::{fast_marker_kind, FastMarkerKind};
 use jetsam_mempool::destination::{
-    check_object_payment_vault, CommitteeUpdateIntent, ReleaseIntent,
+    check_object_payment_vault, CommitteeUpdateIntent, FastContradictionIntent,
+    FastRevocationIntent, ReleaseIntent,
 };
 use jetsam_poseidon2b::primitives::Address;
 use jetsam_tx::{PagedSpendIntent, Transaction, TxPage};
@@ -51,24 +53,43 @@ use jetsam_tx::{PagedSpendIntent, Transaction, TxPage};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DestinationOffer {
     pub committee_update: Option<CommitteeUpdateIntent>,
-    /// By increasing `n`, all proven under the first one's finality update.
+    /// By increasing `n`, all proven under the first one's finality update
+    /// (and, over Base, its game proof and preimage; fast releases its
+    /// attestation: one mode per block).
     pub releases: Vec<ReleaseIntent>,
+    /// The fast lane's contradictions (never beside a fast release), under
+    /// the Base objects of the releases, or of the first contradiction.
+    pub contradictions: Vec<FastContradictionIntent>,
+    /// The cold key's revocation of the relay's key.
+    pub revocation: Option<FastRevocationIntent>,
 }
 
 impl DestinationOffer {
     pub fn is_empty(&self) -> bool {
-        self.committee_update.is_none() && self.releases.is_empty()
+        self.committee_update.is_none()
+            && self.releases.is_empty()
+            && self.contradictions.is_empty()
+            && self.revocation.is_none()
     }
 
     /// The section objects the offer makes when all of it is carried: the
     /// shared proofs once (finality update and account proof, and over Base
-    /// the game proof and output root preimage), then one per release.
+    /// the game proof and output root preimage, and a fast release's
+    /// attestation), then one per release and contradiction; the
+    /// revocation.
     pub fn object_count(&self) -> usize {
-        usize::from(self.committee_update.is_some())
-            + match self.releases.first() {
-                None => 0,
-                Some(first) => (if first.base.is_some() { 4 } else { 2 }) + self.releases.len(),
+        let shared = match (self.releases.first(), self.contradictions.first()) {
+            (Some(first), _) => {
+                (if first.base.is_some() { 4 } else { 2 }) + usize::from(first.fast.is_some())
             }
+            (None, Some(_)) => 4,
+            (None, None) => 0,
+        };
+        usize::from(self.committee_update.is_some())
+            + shared
+            + self.releases.len()
+            + self.contradictions.len()
+            + usize::from(self.revocation.is_some())
     }
 
     /// The transactions the offer brings, committee update first.
@@ -77,6 +98,8 @@ impl DestinationOffer {
             .iter()
             .map(|update| &update.payment)
             .chain(self.releases.iter().map(|release| &release.payment))
+            .chain(self.contradictions.iter().map(|c| &c.payment))
+            .chain(self.revocation.iter().map(|r| &r.payment))
     }
 
     /// Their pages as transactions, in [`Self::payments`] order.
@@ -89,10 +112,13 @@ impl DestinationOffer {
 
     /// The section of a block whose transactions are `txs`: the committee
     /// update if its marker is there; the finality update and account proof
-    /// once, then the release objects in the order of their markers, if any
-    /// release group is there.
+    /// once (over Base the game proof and preimage, and a fast release's
+    /// attestation), then the release objects in the order of their markers,
+    /// if any release group is there (else the contradictions' proofs, if any
+    /// contradiction is there); the contradictions in the order of their
+    /// markers; the revocation if its marker is there.
     pub fn section_for(&self, txs: &[Transaction]) -> DestinationSection {
-        let markers: Vec<Address> = txs
+        let owners: Vec<Address> = txs
             .iter()
             .flat_map(|tx| {
                 tx.body
@@ -100,6 +126,10 @@ impl DestinationOffer {
                     .map(|(_, output)| output.owner)
                     .collect::<Vec<_>>()
             })
+            .collect();
+        let markers: Vec<Address> = owners
+            .iter()
+            .copied()
             .filter(|owner| destination_marker_kind(owner).is_some())
             .collect();
         let mut objects = Vec::new();
@@ -116,29 +146,60 @@ impl DestinationOffer {
             .filter_map(|marker| {
                 self.releases
                     .iter()
-                    .find(|release| release.release.marker() == *marker)
+                    .find(|release| release.marker() == Some(*marker))
             })
             .collect();
-        if let Some(first) = carried.first() {
+        let contradicted: Vec<&FastContradictionIntent> = owners
+            .iter()
+            .filter(|owner| fast_marker_kind(owner) == Some(FastMarkerKind::Contradiction))
+            .filter_map(|marker| self.contradictions.iter().find(|c| c.marker() == Some(*marker)))
+            .collect();
+        let shared = match (carried.first(), contradicted.first()) {
+            (Some(first), _) => Some((
+                first.finality.clone(),
+                first.base.clone(),
+                first.account_proof.clone(),
+                first.attestation_object(),
+            )),
+            (None, Some(first)) => Some((
+                first.finality.clone(),
+                Some(first.base.clone()),
+                first.account_proof.clone(),
+                None,
+            )),
+            (None, None) => None,
+        };
+        if let Some((finality, base, account_proof, attestation)) = shared {
             objects.push(DestinationObject {
                 kind: DestinationObjectKind::FinalityUpdate,
-                payload: first.finality.clone(),
+                payload: finality,
             });
-            if let Some(base) = &first.base {
+            if let Some(base) = base {
                 objects.push(DestinationObject {
                     kind: DestinationObjectKind::BaseGameProof,
-                    payload: base.game_proof.clone(),
+                    payload: base.game_proof,
                 });
                 objects.push(DestinationObject {
                     kind: DestinationObjectKind::OutputRootPreimage,
-                    payload: base.output_preimage.clone(),
+                    payload: base.output_preimage,
                 });
             }
             objects.push(DestinationObject {
                 kind: DestinationObjectKind::BridgeAccountProof,
-                payload: first.account_proof.clone(),
+                payload: account_proof,
             });
+            objects.extend(attestation);
             objects.extend(carried.iter().map(|release| release.release.object()));
+            objects.extend(contradicted.iter().map(|c| c.object()));
+        }
+        if let Some(revocation) = &self.revocation {
+            let revoked = jetsam_chain::consensus::destination::fast::FastRevocation::decode_payload(
+                &revocation.payload,
+            )
+            .map(|r| jetsam_chain::consensus::destination::fast::revocation_marker(&r.key));
+            if revoked.is_ok_and(|marker| owners.contains(&marker)) {
+                objects.push(revocation.object());
+            }
         }
         DestinationSection { objects }
     }
@@ -156,6 +217,13 @@ impl DestinationOffer {
                 .filter(|release| !culprits.releases.contains(&release.release.n))
                 .cloned()
                 .collect(),
+            contradictions: self
+                .contradictions
+                .iter()
+                .filter(|c| !culprits.contradictions.contains(&c.n()))
+                .cloned()
+                .collect(),
+            revocation: self.revocation.clone().filter(|_| !culprits.revocation),
         }
     }
 
@@ -175,6 +243,100 @@ fn anchor_of(payment: &PagedSpendIntent) -> Option<[u8; 32]> {
 /// (module docs). `anchor_ok` says whether a transaction's epoch anchor is
 /// minable at `height`.
 pub fn plan_destination_offer(
+    state: &DestinationState,
+    rules: &DestinationRules,
+    height: u64,
+    committee_updates: Vec<CommitteeUpdateIntent>,
+    releases: Vec<ReleaseIntent>,
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+    other_objects: usize,
+) -> DestinationOffer {
+    plan_destination_offer_with(
+        state,
+        rules,
+        height,
+        committee_updates,
+        releases,
+        Vec::new(),
+        None,
+        anchor_ok,
+        other_objects,
+    )
+}
+
+/// [`plan_destination_offer`] with the fast lane's intents (from the
+/// return-over-Base height on): the revocation if its key is still open (it
+/// may share a block with a committee update); contradictions of open fast
+/// records, never beside a committee update nor a fast release, under the
+/// Base objects of the releases offered (or of the first contradiction).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_destination_offer_with(
+    state: &DestinationState,
+    rules: &DestinationRules,
+    height: u64,
+    committee_updates: Vec<CommitteeUpdateIntent>,
+    releases: Vec<ReleaseIntent>,
+    contradictions: Vec<FastContradictionIntent>,
+    revocation: Option<FastRevocationIntent>,
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+    other_objects: usize,
+) -> DestinationOffer {
+    let mut offer = plan_releases(state, rules, height, committee_updates, releases, anchor_ok, other_objects);
+    let budget = MAX_BLOCK_DESTINATION_OBJECTS.saturating_sub(other_objects);
+    if !rules.base_return.active_at(height) || rules.bridge.is_none() {
+        return offer;
+    }
+    if let Some(revocation) = revocation {
+        let open = jetsam_chain::consensus::destination::fast::FastRevocation::decode_payload(
+            &revocation.payload,
+        )
+        .is_ok_and(|r| !state.fast.is_closed(&r.key));
+        if open && anchor_of(&revocation.payment).is_some_and(|a| anchor_ok(&a)) {
+            let mut candidate = offer.clone();
+            candidate.revocation = Some(revocation);
+            if candidate.fits(budget) {
+                offer = candidate;
+            }
+        }
+    }
+    if offer.committee_update.is_some()
+        || offer.releases.first().is_some_and(|first| first.fast.is_some())
+    {
+        return offer;
+    }
+    for contradiction in contradictions {
+        let n = contradiction.n();
+        let open = state.fast.records.get(&n).is_some_and(|r| !r.contradicted);
+        if !open || !anchor_of(&contradiction.payment).is_some_and(|a| anchor_ok(&a)) {
+            continue;
+        }
+        let shares = match (offer.releases.first(), offer.contradictions.first()) {
+            (Some(first), _) => {
+                first.finality == contradiction.finality
+                    && first.account_proof == contradiction.account_proof
+                    && first.base.as_ref() == Some(&contradiction.base)
+            }
+            (None, Some(first)) => {
+                first.finality == contradiction.finality
+                    && first.account_proof == contradiction.account_proof
+                    && first.base == contradiction.base
+            }
+            (None, None) => true,
+        };
+        if !shares {
+            continue;
+        }
+        let mut candidate = offer.clone();
+        candidate.contradictions.push(contradiction);
+        if candidate.fits(budget) {
+            offer = candidate;
+        }
+    }
+    offer
+}
+
+/// The committee update and the releases of [`plan_destination_offer`].
+fn plan_releases(
     state: &DestinationState,
     rules: &DestinationRules,
     height: u64,
@@ -411,6 +573,10 @@ pub struct Culprits {
     pub releases: Vec<u64>,
     /// Whether to forget the committee update.
     pub committee_update: bool,
+    /// The fast lane: the contradictions (by `n`) to forget.
+    pub contradictions: Vec<u64>,
+    /// The fast lane: whether to forget the revocation.
+    pub revocation: bool,
 }
 
 /// The objects `error` (from `validate_block_destination` on a block carrying
@@ -445,12 +611,50 @@ pub fn culprits_of(
             .filter(|offered| *offered == n)
             .collect(),
         committee_update: false,
+        ..Culprits::default()
     };
     let update = || Culprits {
         releases: Vec::new(),
         committee_update: offer.committee_update.is_some(),
+        ..Culprits::default()
+    };
+    let contradiction = |n: u64| Culprits {
+        contradictions: vec![n],
+        ..Culprits::default()
+    };
+    // The fast lane's key or statement: the fast releases and the revocation.
+    let fast_lane = || Culprits {
+        releases: if offer.releases.first().is_some_and(|r| r.fast.is_some()) {
+            all_releases()
+        } else {
+            Vec::new()
+        },
+        revocation: offer.revocation.is_some(),
+        ..Culprits::default()
     };
     match error {
+        DestinationBlockError::NoFastRecord { n }
+        | DestinationBlockError::AlreadyContradicted { n }
+        | DestinationBlockError::ContradictionTooEarly { n }
+        | DestinationBlockError::NotAContradiction { n } => contradiction(*n),
+        DestinationBlockError::FastKeyUnset
+        | DestinationBlockError::FastRevokeKeyUnset
+        | DestinationBlockError::FastKeyClosed
+        | DestinationBlockError::FastBadSignature
+        | DestinationBlockError::FastStatementMismatch
+        | DestinationBlockError::FastStatementNotTheGame
+        | DestinationBlockError::MalformedObject {
+            kind:
+                DestinationObjectKind::FastGameAttestation | DestinationObjectKind::FastKeyRevocation,
+        } => fast_lane(),
+        DestinationBlockError::FastObjectsDoNotMatchMarkers
+        | DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FastContradiction,
+        } => Culprits {
+            contradictions: offer.contradictions.iter().map(|c| c.n()).collect(),
+            revocation: offer.revocation.is_some(),
+            ..Culprits::default()
+        },
         DestinationBlockError::Vault(VaultError::NotProvenOnL1 { n, .. })
         | DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n }) => one(*n),
         DestinationBlockError::LightClient(_) if offer.committee_update.is_some() => update(),
@@ -468,6 +672,7 @@ pub fn culprits_of(
         } => Culprits {
             releases: all_releases(),
             committee_update: false,
+            ..Culprits::default()
         },
         DestinationBlockError::AnchorMismatch
         | DestinationBlockError::MalformedObject {
@@ -487,6 +692,7 @@ pub fn culprits_of(
             committee_update: offer.committee_update.as_ref().is_some_and(|update| {
                 check_object_payment_vault(&update.payment.pages, rules).is_err()
             }),
+            ..Culprits::default()
         },
         _ => Culprits::default(),
     }
@@ -538,6 +744,12 @@ impl Culprits {
             }
         }
         self.committee_update |= other.committee_update;
+        for n in &other.contradictions {
+            if !self.contradictions.contains(n) {
+                self.contradictions.push(*n);
+            }
+        }
+        self.revocation |= other.revocation;
     }
 }
 

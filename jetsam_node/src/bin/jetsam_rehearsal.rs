@@ -610,6 +610,7 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
                 account_proof,
                 payment,
                 base: None,
+                fast: None,
             })
             .encode()
             .map_err(|e| anyhow::anyhow!("{e}"))?;

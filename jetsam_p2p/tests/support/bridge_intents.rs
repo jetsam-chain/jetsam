@@ -87,6 +87,7 @@ pub fn destination_intent_bytes(n: u64) -> Vec<u8> {
         finality,
         account_proof,
         base: None,
+        fast: None,
     })
     .encode()
     .unwrap()

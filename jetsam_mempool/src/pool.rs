@@ -564,6 +564,11 @@ impl AsyncMempool {
             DestinationIntent::CommitteeUpdate(update) => DestinationAdmitted::CommitteeUpdate {
                 period: update.next_period().unwrap_or_default(),
             },
+            DestinationIntent::Release(release) if release.fast.is_some() => {
+                DestinationAdmitted::FastRelease {
+                    n: release.release.n,
+                }
+            }
             DestinationIntent::Release(release) if release.base.is_some() => {
                 DestinationAdmitted::ReleaseOverBase {
                     n: release.release.n,
@@ -572,6 +577,10 @@ impl AsyncMempool {
             DestinationIntent::Release(release) => DestinationAdmitted::Release {
                 n: release.release.n,
             },
+            DestinationIntent::FastContradiction(c) => {
+                DestinationAdmitted::FastContradiction { n: c.n() }
+            }
+            DestinationIntent::FastRevocation(_) => DestinationAdmitted::FastRevocation,
         };
         st.destination.hold(intent).map_err(|error| match error {
             HoldError::Full => SubmitError::Full {
@@ -583,10 +592,12 @@ impl AsyncMempool {
         })?;
         let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
             release: match admitted {
-                DestinationAdmitted::Release { n } | DestinationAdmitted::ReleaseOverBase { n } => {
-                    Some(n)
-                }
-                DestinationAdmitted::CommitteeUpdate { .. } => None,
+                DestinationAdmitted::Release { n }
+                | DestinationAdmitted::ReleaseOverBase { n }
+                | DestinationAdmitted::FastRelease { n } => Some(n),
+                DestinationAdmitted::CommitteeUpdate { .. }
+                | DestinationAdmitted::FastContradiction { .. }
+                | DestinationAdmitted::FastRevocation => None,
             },
         });
         let _ = self.events.send(MempoolEvent::BridgeIntentAdmitted {
@@ -594,6 +605,24 @@ impl AsyncMempool {
         });
         tracing::info!(?admitted, "destination object admitted");
         Ok(admitted)
+    }
+
+    /// Forget the fast lane's intents a template's block was refused for
+    /// (the contradictions of `contradictions`, the revocation if
+    /// `revocation`).
+    pub async fn forget_fast_destination(&self, contradictions: &[u64], revocation: bool) {
+        let forgotten = self
+            .state
+            .lock()
+            .await
+            .destination
+            .forget_fast(contradictions, revocation);
+        if forgotten > 0 {
+            tracing::warn!(
+                forgotten,
+                "fast-lane intents forgotten: a template's block was refused for them"
+            );
+        }
     }
 
     /// Forget the destination intents a template's block was refused for
@@ -615,6 +644,21 @@ impl AsyncMempool {
                 "destination intents forgotten: a template's block was refused for them"
             );
         }
+    }
+
+    /// The fast lane's intents held for the template: contradictions by
+    /// increasing `n`, the revocation.
+    pub async fn fast_candidates(
+        &self,
+    ) -> (
+        Vec<crate::destination::FastContradictionIntent>,
+        Option<crate::destination::FastRevocationIntent>,
+    ) {
+        let st = self.state.lock().await;
+        (
+            st.destination.contradictions().cloned().collect(),
+            st.destination.revocation().cloned(),
+        )
     }
 
     /// The destination intents held for the template: committee updates by
@@ -1683,6 +1727,8 @@ pub(crate) struct DestinationJudge {
     committees: Vec<jetsam_chain::consensus::destination::state::CommitteeRef>,
     rules: jetsam_chain::consensus::destination::state::DestinationRules,
     keys: Arc<jetsam_chain::consensus::destination::state::CommitteeKeyCache>,
+    /// The branch's fast lane (closed keys, fast releases).
+    fast: Arc<jetsam_chain::consensus::destination::fast::FastLaneState>,
 }
 
 impl DestinationJudge {
@@ -1692,6 +1738,7 @@ impl DestinationJudge {
             intent,
             &self.committees,
             &self.rules,
+            &self.fast,
             &self.keys,
         )
         .map_err(destination_submit_error)
@@ -1703,6 +1750,7 @@ impl DestinationJudge {
     fn judges_like(&self, other: &Self) -> bool {
         self.rules == other.rules
             && self.committees == other.committees
+            && self.fast == other.fast
             && self
                 .committees
                 .iter()
@@ -1722,7 +1770,7 @@ fn check_destination_admission(
     use jetsam_chain::consensus::destination::advance::{advance_marker_kind, release_payee};
     use jetsam_chain::consensus::destination::state::DestinationBlockError;
     use jetsam_chain::consensus::destination::DestinationError;
-    use jetsam_chain::consensus::vault::{check_release_group_paying, VaultError};
+    use jetsam_chain::consensus::vault::{check_release_group_marked, VaultError};
     let next_height = st.view.tip_height.saturating_add(1);
     let before_j = || {
         SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::Destination(
@@ -1742,6 +1790,28 @@ fn check_destination_admission(
             }
             run_admission_checks_with(&update.payment.pages, spend, st, Admission::ObjectPayment)?;
         }
+        DestinationIntent::FastContradiction(crate::destination::FastContradictionIntent {
+            payment,
+            ..
+        })
+        | DestinationIntent::FastRevocation(crate::destination::FastRevocationIntent {
+            payment,
+            ..
+        }) => {
+            // The fast lane (from the return-over-Base height on): a
+            // transaction paying for its object, never from the vault.
+            if !st.view.destination_rules.base_return.active_at(next_height) {
+                return Err(destination_submit_error(
+                    DestinationBlockError::BaseObjectBeforeActivation,
+                ));
+            }
+            if spend.input_owner == st.vault_rules.vault {
+                return Err(vault_submit_error(VaultError::SpendFromLockedAddress {
+                    group: 0,
+                }));
+            }
+            run_admission_checks_with(&payment.pages, spend, st, Admission::ObjectPayment)?;
+        }
         DestinationIntent::Release(release) => {
             if vault.released.contains(release.release.n) {
                 return Err(vault_submit_error(VaultError::ReleaseAlreadyPaid {
@@ -1754,6 +1824,11 @@ fn check_destination_admission(
             // (D107 V2, D114). A burn owned by an advance marker is never
             // payable over Base (the advance rule refuses its group).
             let over_base = st.view.destination_rules.base_return.active_at(next_height);
+            if release.fast.is_some() && release.base.is_none() {
+                return Err(destination_submit_error(
+                    DestinationBlockError::BaseProofMissing,
+                ));
+            }
             let payee = match (over_base, &release.base) {
                 (false, None) => release.release.owner,
                 (false, Some(_)) => {
@@ -1779,12 +1854,16 @@ fn check_destination_admission(
                 }
             };
             // D123: the window cap of the next block.
-            check_release_group_paying(
+            let marker = release
+                .marker()
+                .ok_or(vault_submit_error(VaultError::ReleasesDoNotMatchMarkers))?;
+            check_release_group_marked(
                 &release.payment.pages,
                 &release.release,
                 &st.vault_rules.at(next_height),
                 vault.floor,
                 &payee,
+                &marker,
             )
             .map_err(vault_submit_error)?;
             run_admission_checks_with(&release.payment.pages, spend, st, Admission::VaultRelease)?;
@@ -1796,6 +1875,7 @@ fn check_destination_admission(
         // client reads the L1 Base settles on.
         rules: st.view.destination_rules.effective_at(next_height),
         keys: Arc::clone(&st.view.committee_keys),
+        fast: Arc::new(vault.fast.clone()),
     })
 }
 
@@ -1863,6 +1943,7 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
         },
         vault.committees.last().map(|committee| committee.period),
     );
+    let forgotten = forgotten + st.destination.prune_fast(&vault.fast);
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
@@ -3279,6 +3360,7 @@ mod tests {
                     floor: 0,
                     committees: Vec::new(),
                     advances: Default::default(),
+                    fast: Default::default(),
                 });
             }
             view
@@ -3585,6 +3667,7 @@ mod tests {
                         account_proof: l1.account_proof.clone(),
                         payment: jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap(),
                         base: None,
+                        fast: None,
                     },
                 ),
                 n,
@@ -3619,6 +3702,7 @@ mod tests {
                     floor: RELEASE_FLOOR,
                     committees: vec![l1.anchor_committee()],
                     advances: Default::default(),
+                    fast: Default::default(),
                 });
                 view.destination_rules = l1.rules(armed_vault_rules());
                 view.committee_keys = std::sync::Arc::new(l1.anchor_keys());
@@ -3782,10 +3866,11 @@ mod tests {
             start.elapsed() / runs
         };
         let release = time(&|| {
-            verify_destination_intent(&case.intent, &known, &rules, &keys).unwrap();
+            verify_destination_intent(&case.intent, &known, &rules, &Default::default(), &keys)
+                .unwrap();
         });
         let committee = time(&|| {
-            verify_destination_intent(&update, &known, &rules, &keys).unwrap();
+            verify_destination_intent(&update, &known, &rules, &Default::default(), &keys).unwrap();
         });
         let copy = time(&|| {
             std::hint::black_box(keys.clone());
