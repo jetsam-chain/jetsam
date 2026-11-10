@@ -609,6 +609,7 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
                 finality: finality_update(period, l1.state_root, block_number).encode_payload(),
                 account_proof,
                 payment,
+                base: None,
             })
             .encode()
             .map_err(|e| anyhow::anyhow!("{e}"))?;

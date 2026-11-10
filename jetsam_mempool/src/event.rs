@@ -77,6 +77,10 @@ pub enum EvictReason {
     /// it spends from or pays the stake vault or the reward pool, spends from
     /// a guardian marker, or pays a guardian marker without its object.
     GuardianRule,
+    /// From the return-over-Base height on no block may carry it: it is an
+    /// advance or a transfer of its claim the rule refuses (D107, D114), or
+    /// carries an advance marker without being one.
+    AdvanceRule,
 }
 
 impl EvictReason {
@@ -116,6 +120,11 @@ impl EvictReason {
                 "from the v1.7 height no block may carry it alone: it touches the stake \
                  vault or the reward pool, or pays a guardian marker without its object"
             }
+            Self::AdvanceRule => {
+                "from the return-over-Base height no block may carry it: it is an advance \
+                 or a claim transfer the rule refuses (malformed, its burn paid or already \
+                 advanced), or carries an advance marker without being one"
+            }
         }
     }
 }
@@ -134,6 +143,7 @@ mod tests {
             EvictReason::ClientObjectRule,
             EvictReason::VaultRule,
             EvictReason::GuardianRule,
+            EvictReason::AdvanceRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {

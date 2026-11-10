@@ -13,6 +13,13 @@
 //!   update and the bridge account proof it was proven under, and its release
 //!   group: the spend from the vault (published secret) that pays the burn's
 //!   owner `amount − R` (D59), its `JTMVRL01` marker and the change.
+//! * From the return-over-Base height on (D101, D107), a **release over
+//!   Base**: the same, with the Base game proof (object 5) and the output root
+//!   preimage (object 6) it was proven under, its account proof under the Base
+//!   state root, and a release group that pays the creditor of the advance of
+//!   exactly its burn, if the branch holds one (D107 V2, D114), else the
+//!   owner. While that height is `None` (every profile today) its kind decodes
+//!   as an unknown one, exactly as in a build without it.
 //!
 //! The pool checks at admission the shapes, the release group against the
 //! vault gate, slots, then — A2-M1, with the committee keys this node holds
@@ -26,13 +33,19 @@
 
 use std::collections::BTreeMap;
 
+use jetsam_chain::consensus::destination::base_read::{
+    decode_game_proof, decode_output_root_preimage,
+};
 use jetsam_chain::consensus::destination::forks::period_of_slot;
 use jetsam_chain::consensus::destination::ssz::{LightClientFinalityUpdate, LightClientUpdate};
 use jetsam_chain::consensus::destination::state::{
-    committee_update_marker, verify_committee_update_payload, verify_releases_on_l1,
-    CommitteeKeyCache, CommitteeRef, DestinationBlockError, DestinationRules,
+    committee_update_marker, verify_committee_update_payload, verify_releases_on_base,
+    verify_releases_on_l1, BaseReleaseObjects, CommitteeKeyCache, CommitteeRef,
+    DestinationBlockError, DestinationRules,
 };
-use jetsam_chain::consensus::destination::{DestinationObject, DestinationObjectKind};
+use jetsam_chain::consensus::destination::{
+    base_objects_on_the_wire, DestinationObject, DestinationObjectKind,
+};
 use jetsam_chain::consensus::vault::{
     decode_bridge_account_proof, destination_marker_kind, DestinationMarkerKind, VaultError,
     VaultRelease, VaultRules,
@@ -58,6 +71,7 @@ pub const MAX_HELD_RELEASES: usize = 64;
 
 const KIND_COMMITTEE_UPDATE: u8 = 1;
 const KIND_RELEASE: u8 = 2;
+const KIND_RELEASE_OVER_BASE: u8 = 3;
 
 /// A committee update with the transaction that pays for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +110,39 @@ pub struct ReleaseIntent {
     pub account_proof: Vec<u8>,
     /// The release group: a spend from the vault.
     pub payment: PagedSpendIntent,
+    /// Over Base (from the return-over-Base height on): the game proof and
+    /// the output root preimage; `account_proof` is then under the Base
+    /// state root they open.
+    pub base: Option<BaseReleaseProofs>,
+}
+
+/// What a release over Base is proven under beside its finality update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseReleaseProofs {
+    /// The `BaseGameProof` object payload (deduplicated nodes, D107 §9.2).
+    pub game_proof: Vec<u8>,
+    /// The `OutputRootPreimage` object payload.
+    pub output_preimage: Vec<u8>,
+}
+
+impl ReleaseIntent {
+    /// What its group pays first: the payee V2 reads.
+    pub fn paid_to(&self) -> Option<jetsam_poseidon2b::primitives::Address> {
+        self.payment
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| output.owner))
+            .next()
+    }
+
+    /// Whether it shares the block's proofs with `other`: one finality
+    /// update, one account proof and, over Base, one game proof and preimage
+    /// per block.
+    pub fn shares_proofs_with(&self, other: &Self) -> bool {
+        self.finality == other.finality
+            && self.account_proof == other.account_proof
+            && self.base == other.base
+    }
 }
 
 /// One destination object with its transaction.
@@ -176,7 +223,9 @@ fn payment_of(bytes: &[u8]) -> Result<PagedSpendIntent, DestinationIntentError> 
 impl DestinationIntent {
     /// `magic ‖ kind ‖ (len:u32 LE ‖ bytes)*`: a committee update carries its
     /// payload and its payment; a release its object payload, finality
-    /// update, account proof and release group.
+    /// update, account proof and release group; a release over Base its
+    /// object payload, finality update, game proof, output root preimage,
+    /// account proof and release group.
     pub fn encode(&self) -> Result<Vec<u8>, DestinationIntentError> {
         let mut out = DESTINATION_INTENT_MAGIC.to_vec();
         let payment = |intent: &PagedSpendIntent| {
@@ -191,9 +240,16 @@ impl DestinationIntent {
                 put(&mut out, &payment(&update.payment)?);
             }
             Self::Release(release) => {
-                out.push(KIND_RELEASE);
+                out.push(match release.base {
+                    None => KIND_RELEASE,
+                    Some(_) => KIND_RELEASE_OVER_BASE,
+                });
                 put(&mut out, &release.release.encode_payload());
                 put(&mut out, &release.finality);
+                if let Some(base) = &release.base {
+                    put(&mut out, &base.game_proof);
+                    put(&mut out, &base.output_preimage);
+                }
                 put(&mut out, &release.account_proof);
                 put(&mut out, &payment(&release.payment)?);
             }
@@ -202,8 +258,16 @@ impl DestinationIntent {
     }
 
     /// The canonical decoding, bounded before anything is allocated beyond
-    /// the input; each object payload is decoded as its object.
+    /// the input; each object payload is decoded as its object. A release
+    /// over Base decodes only once this build's return-over-Base height is
+    /// armed ([`base_objects_on_the_wire`]): before, its kind is unknown.
     pub fn decode(bytes: &[u8]) -> Result<Self, DestinationIntentError> {
+        Self::decode_with(bytes, base_objects_on_the_wire())
+    }
+
+    /// [`Self::decode`], a release over Base read only if `over_base` (the
+    /// destination rules arm a return-over-Base height).
+    pub fn decode_with(bytes: &[u8], over_base: bool) -> Result<Self, DestinationIntentError> {
         if bytes.len() > MAX_DESTINATION_INTENT_BYTES {
             return Err(DestinationIntentError::TooLarge {
                 actual: bytes.len(),
@@ -228,7 +292,7 @@ impl DestinationIntent {
                     payment,
                 })
             }
-            KIND_RELEASE => {
+            KIND_RELEASE | KIND_RELEASE_OVER_BASE if kind == KIND_RELEASE || over_base => {
                 let release =
                     VaultRelease::decode_payload(object_bytes(&mut src)?).map_err(|_| {
                         DestinationIntentError::MalformedObject(DestinationObjectKind::VaultRelease)
@@ -237,6 +301,26 @@ impl DestinationIntent {
                 LightClientFinalityUpdate::decode_payload(finality).map_err(|_| {
                     DestinationIntentError::MalformedObject(DestinationObjectKind::FinalityUpdate)
                 })?;
+                let base = if kind == KIND_RELEASE_OVER_BASE {
+                    let game_proof = object_bytes(&mut src)?;
+                    decode_game_proof(game_proof).map_err(|_| {
+                        DestinationIntentError::MalformedObject(
+                            DestinationObjectKind::BaseGameProof,
+                        )
+                    })?;
+                    let output_preimage = object_bytes(&mut src)?;
+                    decode_output_root_preimage(output_preimage).map_err(|_| {
+                        DestinationIntentError::MalformedObject(
+                            DestinationObjectKind::OutputRootPreimage,
+                        )
+                    })?;
+                    Some(BaseReleaseProofs {
+                        game_proof: game_proof.to_vec(),
+                        output_preimage: output_preimage.to_vec(),
+                    })
+                } else {
+                    None
+                };
                 // The account proof, then the genesis proof (A5-8).
                 let account_proof = object_bytes(&mut src)?;
                 decode_bridge_account_proof(account_proof).map_err(|_| {
@@ -250,6 +334,7 @@ impl DestinationIntent {
                     finality: finality.to_vec(),
                     account_proof: account_proof.to_vec(),
                     payment,
+                    base,
                 })
             }
             other => return Err(DestinationIntentError::UnknownKind(other)),
@@ -303,6 +388,8 @@ pub enum DestinationAdmitted {
     CommitteeUpdate { period: u64 },
     /// The release of withdrawal index `n`.
     Release { n: u64 },
+    /// The release of withdrawal index `n` over Base.
+    ReleaseOverBase { n: u64 },
 }
 
 /// What the pool holds: committee updates by the period they bring, releases
@@ -329,7 +416,11 @@ pub enum HoldError {
 /// known ([`verify_committee_update_payload`]); a release's finality update
 /// is signed by a known committee, the bridge account opens its finalized
 /// root and the storage proof proves the burn (V7,
-/// [`verify_releases_on_l1`]). Pure; BLS for both kinds.
+/// [`verify_releases_on_l1`]); a release over Base, its game, output root,
+/// bridge account and storage proof under the Base state root
+/// ([`verify_releases_on_base`]). `rules` are those of the next block
+/// (`DestinationRules::effective_at`: from the return-over-Base height on,
+/// the light client reads the L1 Base settles on). Pure; BLS for every kind.
 pub fn verify_destination_intent(
     intent: &DestinationIntent,
     committees: &[CommitteeRef],
@@ -340,6 +431,25 @@ pub fn verify_destination_intent(
         DestinationIntent::CommitteeUpdate(update) => {
             verify_committee_update_payload(&update.payload, committees, rules, keys).map(|_| ())
         }
+        DestinationIntent::Release(ReleaseIntent {
+            release,
+            finality,
+            account_proof,
+            base: Some(base),
+            ..
+        }) => verify_releases_on_base(
+            &BaseReleaseObjects {
+                finality,
+                game_proof: &base.game_proof,
+                output_preimage: &base.output_preimage,
+                account_proof,
+            },
+            std::slice::from_ref(release),
+            committees,
+            rules,
+            &CommitteeKeyCache::default(),
+            keys,
+        ),
         DestinationIntent::Release(release) => verify_releases_on_l1(
             &release.finality,
             &release.account_proof,

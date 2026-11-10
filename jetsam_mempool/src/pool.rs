@@ -499,9 +499,19 @@ impl AsyncMempool {
         bytes: &[u8],
     ) -> Result<crate::destination::DestinationAdmitted, SubmitError> {
         use crate::destination::{DestinationAdmitted, DestinationIntent, HoldError};
-        let intent = DestinationIntent::decode(bytes).map_err(|error| {
-            SubmitError::MalformedIntent(format!("destination intent: {error}"))
-        })?;
+        // A release over Base is read only under rules that arm its height.
+        let over_base_on_the_wire = self
+            .state
+            .lock()
+            .await
+            .view
+            .destination_rules
+            .base_return
+            .activation_height
+            .is_some();
+        let intent = DestinationIntent::decode_with(bytes, over_base_on_the_wire).map_err(
+            |error| SubmitError::MalformedIntent(format!("destination intent: {error}")),
+        )?;
         let payment = intent.payment();
         let spend = validate_paged_spend(&payment.pages)
             .map_err(|e| SubmitError::MalformedIntent(format!("PagedSpend: {e}")))?;
@@ -555,6 +565,11 @@ impl AsyncMempool {
             DestinationIntent::CommitteeUpdate(update) => DestinationAdmitted::CommitteeUpdate {
                 period: update.next_period().unwrap_or_default(),
             },
+            DestinationIntent::Release(release) if release.base.is_some() => {
+                DestinationAdmitted::ReleaseOverBase {
+                    n: release.release.n,
+                }
+            }
             DestinationIntent::Release(release) => DestinationAdmitted::Release {
                 n: release.release.n,
             },
@@ -569,7 +584,9 @@ impl AsyncMempool {
         })?;
         let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
             release: match admitted {
-                DestinationAdmitted::Release { n } => Some(n),
+                DestinationAdmitted::Release { n } | DestinationAdmitted::ReleaseOverBase { n } => {
+                    Some(n)
+                }
                 DestinationAdmitted::CommitteeUpdate { .. } => None,
             },
         });
@@ -959,6 +976,7 @@ impl AsyncMempool {
         evict_client_object_violations(&mut st, next_height, &self.events);
         // v1.7: likewise for the vault rule (crossing J, reorg).
         evict_vault_violations(&mut st, next_height, &self.events);
+        evict_advance_violations(&mut st, next_height, &self.events);
         evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1124,6 +1142,7 @@ impl AsyncMempool {
         let next_height = st.view.tip_height.saturating_add(1);
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
+            + evict_advance_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1146,6 +1165,7 @@ impl AsyncMempool {
         let mut st = self.state.lock().await;
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
+            + evict_advance_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
@@ -1352,6 +1372,10 @@ fn run_admission_checks_with(
         crate::destination::check_object_payment_vault(pages, &st.vault_rules)
             .map_err(vault_submit_error)?;
     }
+    // v1.7, the return over Base: an advance or a transfer of its claim is
+    // judged as the block judges its group, against the branch's advances
+    // (D114); any other transaction carrying an advance marker is refused.
+    check_advance_admission(pages, spend, st).map_err(destination_submit_error)?;
     // v1.7: a transaction that does not travel with its guardian object
     // never touches the two pools and carries no guardian marker.
     if !matches!(admission, Admission::GuardianPayment | Admission::GuardianPayout) {
@@ -1468,6 +1492,115 @@ fn vault_submit_error(error: jetsam_chain::consensus::vault::VaultError) -> Subm
     ))
 }
 
+/// The live outputs of a transaction's group, in order.
+fn group_outputs(pages: &[TxPage]) -> Vec<(jetsam_poseidon2b::primitives::Address, u64)> {
+    pages
+        .iter()
+        .flat_map(|page| {
+            page.body
+                .live_outputs()
+                .map(|(_, output)| (output.owner, output.amount))
+        })
+        .collect()
+}
+
+/// The return over Base (D107, D114) for one transaction offered for the
+/// block after the view's tip: from the return-over-Base height on, the rule
+/// of the block's advance groups (`AdvanceCheck`) on its group, against the
+/// view's advances and paid set — the same checks, so that no admitted group
+/// can make a template refused. What depends on the other groups of the
+/// block (a burn advanced twice, the cap over several, a transfer twice, the
+/// release of `n` beside it) is the template's (`advances_within_rules`).
+/// Inert below that height (every profile today).
+fn check_advance_admission(
+    pages: &[TxPage],
+    spend: &PagedSpendFacts,
+    st: &MempoolState,
+) -> Result<(), jetsam_chain::consensus::destination::state::DestinationBlockError> {
+    use jetsam_chain::consensus::destination::advance::{carries_advance_marker, AdvanceCheck};
+    use jetsam_chain::consensus::destination::state::DestinationBlockError;
+    let next_height = st.view.tip_height.saturating_add(1);
+    let base_return = &st.view.destination_rules.base_return;
+    if !base_return.active_at(next_height) {
+        return Ok(());
+    }
+    let outputs = group_outputs(pages);
+    if !carries_advance_marker(&outputs) {
+        return Ok(());
+    }
+    let Some(vault) = st.view.vault.as_ref() else {
+        return Err(DestinationBlockError::StateNotParent {
+            tip: st.view.tip_height,
+            height: next_height,
+        });
+    };
+    AdvanceCheck::new(
+        &vault.advances,
+        &vault.released,
+        Vec::new(),
+        &st.vault_rules,
+        &base_return.advance,
+    )
+    .group(0, spend.input_owner, &outputs)
+    .map_err(DestinationBlockError::Advance)
+}
+
+/// Evict every entry that carries an advance marker and that the block at
+/// `next_height` can never carry as it is (from the return-over-Base height
+/// on): a refusal of its own group, or one the branch makes final (its burn
+/// paid or advanced already, a marker taken). A transfer whose advance or
+/// creditor is still to come, and an advance over its advancer's cap (it fits
+/// once an advance is consumed), stay: the template leaves them out
+/// meanwhile. Inert below that height. Returns the number evicted.
+fn evict_advance_violations(
+    st: &mut MempoolState,
+    next_height: u64,
+    events: &broadcast::Sender<MempoolEvent>,
+) -> usize {
+    use jetsam_chain::consensus::destination::advance::AdvanceError;
+    use jetsam_chain::consensus::destination::state::DestinationBlockError;
+    if !st
+        .view
+        .destination_rules
+        .base_return
+        .active_at(next_height)
+    {
+        return 0;
+    }
+    let refused: Vec<TxBodyHash> = st
+        .pool
+        .iter()
+        .filter(|(_, entry)| {
+            let Ok(spend) = validate_paged_spend(&entry.pages) else {
+                return false;
+            };
+            match check_advance_admission(&entry.pages, &spend, st) {
+                Ok(()) => false,
+                Err(DestinationBlockError::Advance(
+                    AdvanceError::OutstandingCapReached { .. }
+                    | AdvanceError::NoAdvanceToTransfer { .. }
+                    | AdvanceError::TransferNotByCreditor { .. },
+                )) => false,
+                Err(_) => true,
+            }
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in &refused {
+        st.pool.remove(hash);
+        tracing::info!(
+            ?hash,
+            next_height,
+            "tx evicted: no block from the return-over-Base height may carry this advance"
+        );
+        let _ = events.send(MempoolEvent::TxEvicted {
+            hash: *hash,
+            reason: EvictReason::AdvanceRule,
+        });
+    }
+    refused.len()
+}
+
 /// Evict every entry the block at `next_height` may not carry as a plain
 /// transaction under the v1.7 vault rule of that height
 /// (`check_plain_vault_transaction`): a spend from the vault, a release or
@@ -1555,8 +1688,10 @@ fn check_destination_admission(
     st: &MempoolState,
 ) -> Result<DestinationJudge, SubmitError> {
     use crate::destination::DestinationIntent;
+    use jetsam_chain::consensus::destination::advance::{advance_marker_kind, release_payee};
+    use jetsam_chain::consensus::destination::state::DestinationBlockError;
     use jetsam_chain::consensus::destination::DestinationError;
-    use jetsam_chain::consensus::vault::{check_release_group, VaultError};
+    use jetsam_chain::consensus::vault::{check_release_group_paying, VaultError};
     let next_height = st.view.tip_height.saturating_add(1);
     let before_j = || {
         SubmitError::Consensus(jetsam_chain::consensus::ConsensusError::Destination(
@@ -1582,11 +1717,42 @@ fn check_destination_admission(
                     n: release.release.n,
                 }));
             }
-            check_release_group(
+            // From the return-over-Base height on a release is proven over
+            // Base (objects 5 and 6), never before; and it pays the creditor
+            // of the advance of exactly its burn, if the branch holds one
+            // (D107 V2, D114). A burn owned by an advance marker is never
+            // payable over Base (the advance rule refuses its group).
+            let over_base = st.view.destination_rules.base_return.active_at(next_height);
+            let payee = match (over_base, &release.base) {
+                (false, None) => release.release.owner,
+                (false, Some(_)) => {
+                    return Err(destination_submit_error(
+                        DestinationBlockError::BaseObjectBeforeActivation,
+                    ))
+                }
+                (true, None) => {
+                    return Err(destination_submit_error(
+                        DestinationBlockError::BaseProofMissing,
+                    ))
+                }
+                (true, Some(_)) => {
+                    if advance_marker_kind(&release.release.owner).is_some() {
+                        return Err(vault_submit_error(VaultError::ReleaseShape { group: 0 }));
+                    }
+                    release_payee(
+                        &vault.advances,
+                        release.release.n,
+                        &release.release.owner,
+                        release.release.amount,
+                    )
+                }
+            };
+            check_release_group_paying(
                 &release.payment.pages,
                 &release.release,
                 &st.vault_rules,
                 vault.floor,
+                &payee,
             )
             .map_err(vault_submit_error)?;
             run_admission_checks_with(&release.payment.pages, spend, st, Admission::VaultRelease)?;
@@ -1594,7 +1760,9 @@ fn check_destination_admission(
     }
     Ok(DestinationJudge {
         committees: vault.committees.clone(),
-        rules: st.view.destination_rules,
+        // The next block's: from the return-over-Base height on, the light
+        // client reads the L1 Base settles on.
+        rules: st.view.destination_rules.effective_at(next_height),
         keys: Arc::clone(&st.view.committee_keys),
     })
 }
@@ -1621,9 +1789,26 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
         return;
     };
     let view = &st.view;
+    let over_base = view.destination_rules.base_return.active_at(next_height);
     let forgotten = st.destination.prune(
         |n| vault.released.contains(n),
         |release| {
+            // Proven for the other side of the return-over-Base height, or
+            // paying another than V2 now asks (an advance made meanwhile).
+            if over_base != release.base.is_some()
+                || (over_base
+                    && release.paid_to()
+                        != Some(
+                            jetsam_chain::consensus::destination::advance::release_payee(
+                                &vault.advances,
+                                release.release.n,
+                                &release.release.owner,
+                                release.release.amount,
+                            ),
+                        ))
+            {
+                return true;
+            }
             let Some(owner) = release
                 .payment
                 .pages
@@ -2798,6 +2983,7 @@ mod tests {
                     released: Default::default(),
                     floor: 0,
                     committees: Vec::new(),
+                    advances: Default::default(),
                 });
             }
             view
@@ -2958,15 +3144,52 @@ mod tests {
 
     impl ReleaseCase {
         fn new(tip: u64, n: u64, amount: u64, paid_delta: i64) -> Self {
-            use jetsam_chain::consensus::vault::{VaultRelease, RELEASE_FEE_MICRO, VAULT_ADDRESS};
             let l1 = crate::destination::tests::SyntheticL1::load();
-            let rf = RELEASE_FEE_MICRO;
-            let release = VaultRelease {
+            let release = jetsam_chain::consensus::vault::VaultRelease {
                 n,
                 owner: Address([0xa1; 32]),
                 amount,
                 storage_proof: l1.release.storage_proof.clone(),
             };
+            let payee = release.owner;
+            Self::paying(tip, release, payee, paid_delta)
+        }
+
+        /// RET3: the release over Base of the burn of the Base fixture
+        /// (`(3, [0xa1; 32], 5 000 000)`), its group paying `payee`.
+        fn over_base(tip: u64, payee: Address) -> Self {
+            let base = crate::destination::tests::SyntheticBase::load();
+            Self::over_base_of(tip, base.release, payee)
+        }
+
+        /// The release over Base of `release` under the Base fixture's
+        /// proofs, its group paying `payee`.
+        fn over_base_of(
+            tip: u64,
+            release: jetsam_chain::consensus::vault::VaultRelease,
+            payee: Address,
+        ) -> Self {
+            let base = crate::destination::tests::SyntheticBase::load();
+            let mut case = Self::paying(tip, release, payee, 0);
+            let crate::destination::DestinationIntent::Release(release) = &mut case.intent else {
+                unreachable!()
+            };
+            release.finality = base.finality.clone();
+            release.account_proof = base.account_proof.clone();
+            release.base = Some(base.proofs());
+            case
+        }
+
+        fn paying(
+            tip: u64,
+            release: jetsam_chain::consensus::vault::VaultRelease,
+            payee: Address,
+            paid_delta: i64,
+        ) -> Self {
+            use jetsam_chain::consensus::vault::{RELEASE_FEE_MICRO, VAULT_ADDRESS};
+            let l1 = crate::destination::tests::SyntheticL1::load();
+            let rf = RELEASE_FEE_MICRO;
+            let (n, amount) = (release.n, release.amount);
             let paid = (amount - rf).saturating_add_signed(paid_delta);
             let mut state = ChainState::with_log_slots(6);
             state
@@ -2987,7 +3210,7 @@ mod tests {
             outputs[0] = TxOutput {
                 slot_index: 8,
                 amount: paid,
-                owner: release.owner,
+                owner: payee,
             };
             outputs[1] = TxOutput {
                 slot_index: 9,
@@ -3016,6 +3239,7 @@ mod tests {
                         finality: l1.finality.clone(),
                         account_proof: l1.account_proof.clone(),
                         payment: jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap(),
+                        base: None,
                     },
                 ),
                 n,
@@ -3049,6 +3273,7 @@ mod tests {
                     released,
                     floor: RELEASE_FLOOR,
                     committees: vec![l1.anchor_committee()],
+                    advances: Default::default(),
                 });
                 view.destination_rules = l1.rules(armed_vault_rules());
                 view.committee_keys = std::sync::Arc::new(l1.anchor_keys());
@@ -3751,5 +3976,310 @@ mod tests {
         assert_eq!(pool.evict_unminable_at(CROSSING_J).await, 1);
         assert_eq!(pool.len().await, 0);
         assert_eq!(pool.client_object_rules(), armed_rules());
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.7, the return over Base (D101, D107, D114): dormant on every profile
+    // -----------------------------------------------------------------------
+
+    /// The return-over-Base height of these tests, above the crossing's J.
+    const BASE_HEIGHT: u64 = CROSSING_J + 10;
+
+    /// `view` with the return over Base armed at [`BASE_HEIGHT`] and the
+    /// branch holding `advances`.
+    fn over_base_view(
+        mut view: ChainView,
+        advances: &[(u64, jetsam_chain::consensus::destination::advance::AdvanceEntry)],
+    ) -> ChainView {
+        let l1 = crate::destination::tests::SyntheticL1::load();
+        view.destination_rules =
+            crate::destination::tests::SyntheticBase::rules(&l1, armed_vault_rules(), BASE_HEIGHT);
+        if let Some(vault) = view.vault.as_mut() {
+            for (n, entry) in advances {
+                vault.advances.insert(*n, *entry);
+            }
+        }
+        view
+    }
+
+    fn pool_over(view: ChainView) -> AsyncMempool {
+        AsyncMempool::new(
+            view,
+            MempoolConfig::default()
+                .with_client_object_rules(armed_rules())
+                .with_vault_rules(armed_vault_rules()),
+        )
+        .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())))
+    }
+
+    const ALICE: Address = Address([0xa1; 32]);
+    const PAYER: Address = Address([0x51; 32]);
+    const BOB: Address = Address([0xb0; 32]);
+    const STRANGER: Address = Address([0x5e; 32]);
+
+    fn advance_refusal(
+        result: Result<jetsam_poseidon2b::primitives::TxBodyHash, super::SubmitError>,
+    ) -> Option<jetsam_chain::consensus::destination::advance::AdvanceError> {
+        use jetsam_chain::consensus::destination::state::DestinationBlockError;
+        match result {
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(
+                    DestinationBlockError::Advance(error),
+                ),
+            )) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// D107, D114: from the return-over-Base height on, the pool judges an
+    /// advance or a transfer of its claim as the block judges its group,
+    /// against the branch's advances: a malformed or underpaid one, a burn
+    /// already advanced or paid, a transfer by another than the creditor are
+    /// refused; an advance of another burn of `n` than one held is admitted
+    /// (it blocks nothing). Below the height, and while the height is `None`,
+    /// an advance-shaped group is an ordinary spend, as for a node without
+    /// the rule.
+    #[tokio::test]
+    async fn over_base_the_pool_judges_an_advance_as_the_block_does() {
+        use jetsam_chain::consensus::destination::advance::{
+            advance_marker, AdvanceEntry, AdvanceError, AdvanceRules,
+        };
+        use jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
+        let jtm = jetsam_chain::consensus::params::MICRO_PER_JTM;
+        let amount = 10 * jtm;
+        let paid = AdvanceRules::CONSENSUS.min_paid(amount, RELEASE_FEE_MICRO);
+        let marker = advance_marker(3, &ALICE, amount, &PAYER);
+        let tip = BASE_HEIGHT;
+        let good = VaultCase::new(tip, PAYER, &[(ALICE, paid), (marker, 0)]);
+        let with_value = VaultCase::new(tip, PAYER, &[(ALICE, paid), (marker, 9)]);
+        let underpaid = VaultCase::new(tip, PAYER, &[(ALICE, paid - 1), (marker, 0)]);
+        let held = AdvanceEntry {
+            origin: BOB,
+            creditor: BOB,
+            owner: ALICE,
+            amount,
+        };
+        let stranger = AdvanceEntry {
+            origin: STRANGER,
+            creditor: STRANGER,
+            owner: STRANGER,
+            amount: RELEASE_FEE_MICRO,
+        };
+        let pool_with = |case: &VaultCase, held: &[(u64, AdvanceEntry)], paid: &[u64]| {
+            let mut view = over_base_view(case.view_at(tip, 0), held);
+            for n in paid {
+                view.vault.as_mut().unwrap().released.insert(*n);
+            }
+            pool_over(view)
+        };
+        // Admitted, alone or beside a stranger's advance of another burn of 3.
+        for others in [vec![], vec![(3, stranger)]] {
+            let pool = pool_with(&good, &others, &[]);
+            good.submit(&pool).await.expect("an advance");
+            assert_eq!(pool.len().await, 1);
+        }
+        for (case, held, paid, expected) in [
+            (&with_value, vec![], vec![], AdvanceError::MarkerCarriesValue { group: 0 }),
+            (
+                &underpaid,
+                vec![],
+                vec![],
+                AdvanceError::AdvanceUnderpaid {
+                    group: 0,
+                    paid: paid - 1,
+                    min: paid,
+                },
+            ),
+            (&good, vec![(3, held)], vec![], AdvanceError::AlreadyAdvanced { n: 3 }),
+            (&good, vec![], vec![3], AdvanceError::AdvanceOfReleased { n: 3 }),
+        ] {
+            let pool = pool_with(case, &held, &paid);
+            assert_eq!(advance_refusal(case.submit(&pool).await), Some(expected));
+            assert_eq!(pool.len().await, 0);
+        }
+        // The claim's transfer: by its creditor only.
+        let transfer = |from| VaultCase::new(tip, from, &[(PAYER, 0), (held.transfer_marker(3, &PAYER), 0)]);
+        let by_creditor = transfer(BOB);
+        let pool = pool_with(&by_creditor, &[(3, held)], &[]);
+        by_creditor.submit(&pool).await.expect("the creditor transfers");
+        let by_stranger = transfer(STRANGER);
+        let pool = pool_with(&by_stranger, &[(3, held)], &[]);
+        assert_eq!(
+            advance_refusal(by_stranger.submit(&pool).await),
+            Some(AdvanceError::TransferNotByCreditor { group: 0, n: 3 })
+        );
+        // Below the height, or dormant (this build): an ordinary spend.
+        let below = VaultCase::new(BASE_HEIGHT - 2, PAYER, &[(ALICE, paid), (marker, 9)]);
+        let pool = pool_over(over_base_view(below.view_at(BASE_HEIGHT - 2, 0), &[]));
+        below.submit(&pool).await.expect("an ordinary spend below the height");
+        let pool = with_value.pool_at(tip, 0);
+        with_value.submit(&pool).await.expect("an ordinary spend while dormant");
+    }
+
+    /// An advance-shaped group admitted below the return-over-Base height is
+    /// evicted when the next block reaches it if no block can carry it (a
+    /// marker with value), with its own reason; one over its advancer's cap
+    /// stays (it fits once an advance is consumed; the template leaves it out
+    /// meanwhile).
+    #[tokio::test]
+    async fn crossing_the_return_over_base_evicts_the_advances_no_block_carries() {
+        use crate::event::{EvictReason, MempoolEvent};
+        use jetsam_chain::consensus::destination::advance::{
+            advance_marker, AdvanceEntry, AdvanceRules,
+        };
+        use jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
+        let jtm = jetsam_chain::consensus::params::MICRO_PER_JTM;
+        let amount = 10 * jtm;
+        let paid = AdvanceRules::CONSENSUS.min_paid(amount, RELEASE_FEE_MICRO);
+        let marker = advance_marker(3, &ALICE, amount, &PAYER);
+        let before = BASE_HEIGHT - 2;
+        let bad = VaultCase::new(before, PAYER, &[(ALICE, paid), (marker, 9)]);
+        let pool = pool_over(over_base_view(bad.view_at(before, 0), &[]));
+        let mut events = pool.subscribe();
+        let hash = bad.submit(&pool).await.expect("below the height");
+        pool.on_new_block(&[], BASE_HEIGHT - 1, over_base_view(bad.view_at(BASE_HEIGHT - 1, 0), &[]))
+            .await;
+        assert_eq!(pool.len().await, 0, "no block from the height carries it");
+        let mut evicted = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let MempoolEvent::TxEvicted { hash, reason } = event {
+                evicted.push((hash, reason));
+            }
+        }
+        assert_eq!(evicted, vec![(hash, EvictReason::AdvanceRule)]);
+        // Over the cap: kept.
+        let full: Vec<(u64, AdvanceEntry)> = (10..13)
+            .map(|n| {
+                (
+                    n,
+                    AdvanceEntry {
+                        origin: PAYER,
+                        creditor: PAYER,
+                        owner: ALICE,
+                        amount: 1_000 * jtm,
+                    },
+                )
+            })
+            .collect();
+        let capped = VaultCase::new(before, PAYER, &[(ALICE, paid), (marker, 0)]);
+        let pool = pool_over(over_base_view(capped.view_at(before, 0), &full));
+        capped.submit(&pool).await.expect("below the height");
+        pool.on_new_block(&[], BASE_HEIGHT - 1, over_base_view(capped.view_at(BASE_HEIGHT - 1, 0), &full))
+            .await;
+        assert_eq!(pool.len().await, 1, "over the cap for now: kept");
+        // Dormant: nothing evicted.
+        let pool = bad.pool_at(before, 0);
+        bad.submit(&pool).await.expect("dormant");
+        pool.on_new_block(&[], BASE_HEIGHT - 1, bad.view_at(BASE_HEIGHT - 1, 0)).await;
+        assert_eq!(pool.len().await, 1);
+    }
+
+    /// D101, D107, D114: from the return-over-Base height on, the pool admits
+    /// a release proven over Base (game proof, output root preimage, bridge
+    /// under the Base root, all verified as the block does) paying what V2
+    /// asks of the branch: the creditor of the advance of exactly its burn,
+    /// else the owner (an advance of another burn of `n` changes nothing).
+    /// Refused: one paying another payee; a release read on the L1 after
+    /// the height; one over Base below it; a game that does not hold; a burn
+    /// owned by an advance marker. While the height is `None` (this build),
+    /// its kind does not even decode. A held release paying the owner is
+    /// forgotten once an advance of exactly its burn appears.
+    #[tokio::test]
+    async fn over_base_a_release_is_proven_over_base_and_pays_v2s_payee() {
+        use jetsam_chain::consensus::destination::advance::{advance_marker, AdvanceEntry};
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        use jetsam_chain::consensus::vault::VaultError;
+        let tip = BASE_HEIGHT + 5;
+        let base = crate::destination::tests::SyntheticBase::load();
+        let burn = base.release.clone();
+        assert_eq!(burn.owner, ALICE);
+        let advance = AdvanceEntry {
+            origin: PAYER,
+            creditor: BOB,
+            owner: burn.owner,
+            amount: burn.amount,
+        };
+        let stranger = AdvanceEntry {
+            origin: STRANGER,
+            creditor: STRANGER,
+            owner: STRANGER,
+            amount: jetsam_chain::consensus::vault::RELEASE_FEE_MICRO,
+        };
+        let to_owner = ReleaseCase::over_base(tip, ALICE);
+        let to_creditor = ReleaseCase::over_base(tip, BOB);
+        let pool_of = |case: &ReleaseCase, held: &[(u64, AdvanceEntry)], at: u64| {
+            pool_over(over_base_view(case.view_at(at, &[]), held))
+        };
+        for held in [vec![], vec![(burn.n, stranger)]] {
+            let pool = pool_of(&to_owner, &held, tip);
+            assert_eq!(
+                to_owner.submit(&pool).await.expect("admitted"),
+                crate::destination::DestinationAdmitted::ReleaseOverBase { n: burn.n }
+            );
+            assert_eq!(pool.destination_candidates().await.1.len(), 1);
+        }
+        let pool = pool_of(&to_creditor, &[(burn.n, advance)], tip);
+        to_creditor.submit(&pool).await.expect("repays the creditor");
+        let refused = [
+            (
+                pool_of(&to_owner, &[(burn.n, advance)], tip),
+                &to_owner,
+                E::Vault(VaultError::ReleaseShape { group: 0 }),
+            ),
+            (
+                pool_of(&to_creditor, &[], tip),
+                &to_creditor,
+                E::Vault(VaultError::ReleaseShape { group: 0 }),
+            ),
+        ];
+        for (pool, case, expected) in refused {
+            assert_eq!(destination_refusal(case.submit(&pool).await), Some(expected));
+            assert!(pool.destination_candidates().await.1.is_empty());
+        }
+        // Read on the L1 after the height; over Base below it.
+        let l1 = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = pool_over(over_base_view(l1.view_at(tip, &[]), &[]));
+        assert_eq!(destination_refusal(l1.submit(&pool).await), Some(E::BaseProofMissing));
+        let early = ReleaseCase::over_base(BASE_HEIGHT - 3, ALICE);
+        let pool = pool_of(&early, &[], BASE_HEIGHT - 3);
+        assert_eq!(
+            destination_refusal(early.submit(&pool).await),
+            Some(E::BaseObjectBeforeActivation)
+        );
+        // A game that does not hold: the preimage of another output root.
+        let wrong = to_owner.with(|r| r.base.as_mut().unwrap().output_preimage[100] ^= 1);
+        let pool = pool_of(&wrong, &[], tip);
+        assert!(matches!(
+            destination_refusal(wrong.submit(&pool).await),
+            Some(E::BaseReturn(_))
+        ));
+        // A burn owned by an advance marker is never payable over Base.
+        let tagged = advance_marker(9, &ALICE, 1, &PAYER);
+        let marker_owner = ReleaseCase::over_base_of(
+            tip,
+            jetsam_chain::consensus::vault::VaultRelease {
+                owner: tagged,
+                ..burn.clone()
+            },
+            tagged,
+        );
+        let pool = pool_of(&marker_owner, &[], tip);
+        assert_eq!(
+            destination_refusal(marker_owner.submit(&pool).await),
+            Some(E::Vault(VaultError::ReleaseShape { group: 0 }))
+        );
+        // Dormant (this build): kind 3 is unknown.
+        let pool = to_owner.pool_at(tip, &[]);
+        assert!(matches!(
+            to_owner.submit(&pool).await,
+            Err(super::SubmitError::MalformedIntent(_))
+        ));
+        // Held paying the owner, then an advance of exactly the burn: the
+        // release no longer pays what V2 asks and is forgotten.
+        let pool = pool_of(&to_owner, &[], tip);
+        to_owner.submit(&pool).await.expect("held");
+        pool.update_chain_view(over_base_view(to_owner.view_at(tip, &[]), &[(burn.n, advance)]))
+            .await;
+        assert!(pool.destination_candidates().await.1.is_empty());
     }
 }

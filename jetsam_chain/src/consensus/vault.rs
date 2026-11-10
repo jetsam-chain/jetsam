@@ -949,6 +949,19 @@ pub fn check_release_group(
     rules: &VaultRules,
     floor: u64,
 ) -> Result<(), VaultError> {
+    check_release_group_paying(pages, release, rules, floor, &release.owner)
+}
+
+/// [`check_release_group`] where V2 pays the group's first output to
+/// `payee`: the burn's owner, or, from the return over Base on, the creditor
+/// of the advance of exactly that burn (`destination::advance::release_payee`).
+pub fn check_release_group_paying(
+    pages: &[jetsam_tx::TxPage],
+    release: &VaultRelease,
+    rules: &VaultRules,
+    floor: u64,
+    payee: &Address,
+) -> Result<(), VaultError> {
     if !release_shape_ok(&release.owner, release.amount, rules) {
         return Err(VaultError::ReleaseShape { group: 0 });
     }
@@ -961,9 +974,9 @@ pub fn check_release_group(
         .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
         .collect();
     let shape_ok = match outputs.as_slice() {
-        [(payee, _), (marker, 0)] | [(payee, _), (marker, 0), (_, _)] => {
+        [(paid_to, _), (marker, 0)] | [(paid_to, _), (marker, 0), (_, _)] => {
             *marker == release.marker()
-                && *payee == release.owner
+                && *paid_to == *payee
                 && outputs
                     .get(2)
                     .is_none_or(|(change, _)| *change == rules.vault)

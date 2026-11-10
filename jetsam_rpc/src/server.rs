@@ -3491,6 +3491,28 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn get_advances(
+        &self,
+        n: u64,
+        owner: Option<String>,
+        amount: Option<u64>,
+    ) -> RpcResult<crate::destination::AdvancesResponse> {
+        let burn = match (owner, amount) {
+            (Some(owner), Some(amount)) => Some((parse_address_param(&owner)?, amount)),
+            (None, None) => None,
+            _ => return Err(rpc_err("owner and amount go together")),
+        };
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let chain = self.chain.read().await;
+        Ok(crate::destination::advances_of(
+            chain.destination_state(),
+            chain.tip_height(),
+            &rules,
+            n,
+            burn,
+        ))
+    }
+
     async fn submit_guardian_object(
         &self,
         ext: &jsonrpsee::Extensions,

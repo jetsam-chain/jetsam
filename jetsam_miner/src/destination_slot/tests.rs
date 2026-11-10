@@ -113,6 +113,7 @@ fn release_with(n: u64, amount: u64, finality: Vec<u8>, fee: u64) -> ReleaseInte
         release,
         finality,
         account_proof: proof,
+        base: None,
     }
 }
 
@@ -573,7 +574,10 @@ fn not_proven(n: u64) -> DestinationBlockError {
 
 /// A judge refusing the first carried release of `bad` (V7), else building
 /// the block: what it carries.
-fn judge(bad: &[u64], offer: &DestinationOffer) -> Result<(Vec<u64>, bool), Option<DestinationBlockError>> {
+fn judge(
+    bad: &[u64],
+    offer: &DestinationOffer,
+) -> Result<(Vec<u64>, bool), Option<DestinationBlockError>> {
     match offer.releases.iter().find(|r| bad.contains(&r.release.n)) {
         Some(r) => Err(Some(not_proven(r.release.n))),
         None => Ok((ns(offer), offer.committee_update.is_some())),
@@ -753,4 +757,309 @@ fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_tem
             "another group's fault"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The return over Base (D101, D107, D114): dormant on every profile today
+// ---------------------------------------------------------------------------
+
+/// The rules with the return over Base armed at `J + 1`.
+fn base_rules() -> DestinationRules {
+    let mut rules = rules();
+    rules.base_return.activation_height = Some(J + 1);
+    rules
+}
+
+fn base_plan(
+    state: &DestinationState,
+    rules: &DestinationRules,
+    updates: Vec<CommitteeUpdateIntent>,
+    releases: Vec<ReleaseIntent>,
+) -> DestinationOffer {
+    plan_destination_offer(
+        state,
+        rules,
+        state.tip + 1,
+        updates,
+        releases,
+        &|anchor| *anchor == ANCHOR,
+        0,
+    )
+}
+
+fn base_proofs(tag: u8) -> jetsam_mempool::destination::BaseReleaseProofs {
+    jetsam_mempool::destination::BaseReleaseProofs {
+        game_proof: vec![tag; 300],
+        output_preimage: vec![tag.wrapping_add(1); 128],
+    }
+}
+
+/// A release of `n` over Base whose group pays `payee`.
+fn base_release(n: u64, amount: u64, payee: Address, tag: u8) -> ReleaseIntent {
+    let mut intent = release(n, amount);
+    intent.payment = page(
+        VAULT_ADDRESS,
+        1_000 + n as u32 * 4,
+        &[
+            (payee, amount - RELEASE_FEE_MICRO),
+            (intent.release.marker(), 0),
+        ],
+        RELEASE_FEE_MICRO,
+    );
+    intent.base = Some(base_proofs(tag));
+    intent
+}
+
+const OWNER: Address = Address([0xa1; 32]);
+const PAYER: Address = Address([0x51; 32]);
+const BOB: Address = Address([0xb0; 32]);
+const CAROL: Address = Address([0xca; 32]);
+
+/// From the return-over-Base height on the template offers releases over
+/// Base only, each paying what V2 asks of the branch (the creditor of the
+/// advance of exactly its burn, D114), all sharing one game proof and
+/// preimage; their section carries objects 5 and 6. Dormant (every profile
+/// today), it offers none of them, and the L1 releases as before.
+#[test]
+fn over_base_the_template_offers_releases_over_base_paying_v2s_payee() {
+    use jetsam_chain::consensus::destination::advance::AdvanceEntry;
+    let amount = 10 * MICRO_PER_JTM;
+    let mut state = state_at(J + 20);
+    state.advances.insert(
+        3,
+        AdvanceEntry {
+            origin: PAYER,
+            creditor: BOB,
+            owner: OWNER,
+            amount,
+        },
+    );
+    // A stranger's advance of another burn of 4 changes nothing for 4.
+    state.advances.insert(
+        4,
+        AdvanceEntry {
+            origin: CAROL,
+            creditor: CAROL,
+            owner: CAROL,
+            amount: RELEASE_FEE_MICRO,
+        },
+    );
+    let releases = vec![
+        base_release(3, amount, OWNER, 7),
+        base_release(3, amount, BOB, 7),
+        release(4, amount),
+        base_release(4, amount, OWNER, 7),
+        base_release(5, amount, OWNER, 9),
+        base_release(6, amount, OWNER, 7),
+    ];
+    let offer = base_plan(&state, &base_rules(), Vec::new(), releases.clone());
+    let paid: Vec<(u64, Option<Address>)> = offer
+        .releases
+        .iter()
+        .map(|r| (r.release.n, r.paid_to()))
+        .collect();
+    assert_eq!(
+        paid,
+        vec![(3, Some(BOB)), (4, Some(OWNER)), (6, Some(OWNER))],
+        "3 pays the creditor, the L1 release of 4 and 5's other proofs are left"
+    );
+    assert_eq!(offer.object_count(), 4 + 3);
+    let section = offer.section_for(&offer.payment_order());
+    let kinds: Vec<DestinationObjectKind> = section.objects.iter().map(|o| o.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            DestinationObjectKind::FinalityUpdate,
+            DestinationObjectKind::BaseGameProof,
+            DestinationObjectKind::OutputRootPreimage,
+            DestinationObjectKind::BridgeAccountProof,
+            DestinationObjectKind::VaultRelease,
+            DestinationObjectKind::VaultRelease,
+            DestinationObjectKind::VaultRelease,
+        ]
+    );
+    assert_eq!(section.objects[1].payload, base_proofs(7).game_proof);
+    assert_eq!(section.objects[2].payload, base_proofs(7).output_preimage);
+    // Dormant: no release over Base, the L1 one as before.
+    let dormant = base_plan(&state, &rules(), Vec::new(), releases);
+    assert_eq!(ns(&dormant), vec![4]);
+    assert!(dormant.releases[0].base.is_none());
+    assert_eq!(dormant.object_count(), 2 + 1);
+}
+
+/// D107 §9.1: never a game proof in a block that carries a committee update:
+/// the update goes first, the releases over Base wait one block. Below the
+/// return over Base, the L1 releases still go beside an update.
+#[test]
+fn over_base_no_release_shares_a_block_with_a_committee_update() {
+    let amount = 10 * MICRO_PER_JTM;
+    let state = state_at(J + 20);
+    let offer = base_plan(
+        &state,
+        &base_rules(),
+        vec![committee(1_894)],
+        vec![base_release(3, amount, OWNER, 7)],
+    );
+    assert!(offer.committee_update.is_some());
+    assert!(offer.releases.is_empty());
+    let section = offer.section_for(&offer.payment_order());
+    assert!(!section
+        .objects
+        .iter()
+        .any(|o| o.kind == DestinationObjectKind::BaseGameProof));
+    // The update not due (the branch knows 1 894): the release goes.
+    let mut known = state.clone();
+    known.committees = vec![CommitteeRef {
+        period: 1_894,
+        root: [0xaa; 32],
+    }];
+    let offer = base_plan(
+        &known,
+        &base_rules(),
+        vec![committee(1_894)],
+        vec![base_release(3, amount, OWNER, 7)],
+    );
+    assert!(offer.committee_update.is_none());
+    assert_eq!(ns(&offer), vec![3]);
+    // Dormant: an L1 release beside the update, as before.
+    let offer = base_plan(
+        &state,
+        &rules(),
+        vec![committee(1_894)],
+        vec![release(3, amount)],
+    );
+    assert!(offer.committee_update.is_some());
+    assert_eq!(ns(&offer), vec![3]);
+}
+
+/// An advance group: `advancer` advances the burn `(n, owner, amount)`.
+fn advance_entry(
+    slot: u32,
+    advancer: Address,
+    n: u64,
+    owner: Address,
+    amount: u64,
+    fee: u64,
+) -> PagedSpendIntent {
+    use jetsam_chain::consensus::destination::advance::{advance_marker, AdvanceRules};
+    let paid = AdvanceRules::CONSENSUS.min_paid(amount, RELEASE_FEE_MICRO);
+    page(
+        advancer,
+        slot,
+        &[
+            (owner, paid),
+            (advance_marker(n, &owner, amount, &advancer), 0),
+        ],
+        fee,
+    )
+}
+
+/// The advances and claim transfers of the mempool's selection the template
+/// keeps are those the block rule accepts together beside the offer's
+/// releases (D114): a burn advanced once, each advancer within its cap, a
+/// claim moved once, nothing beside the release of its `n`, no malformed
+/// group (one admitted before the height as an ordinary spend); what is kept
+/// is accepted in any order. Dormant, the selection is untouched.
+#[test]
+fn the_template_keeps_only_the_advances_the_block_rule_accepts_together() {
+    use jetsam_chain::consensus::destination::advance::{
+        advance_marker, AdvanceCheck, AdvanceEntry,
+    };
+    let jtm = MICRO_PER_JTM;
+    let mut state = state_at(J + 20);
+    let held = AdvanceEntry {
+        origin: PAYER,
+        creditor: PAYER,
+        owner: OWNER,
+        amount: 2_000 * jtm / 2,
+    };
+    state.advances.insert(9, held);
+    state.advances.insert(
+        10,
+        AdvanceEntry {
+            amount: 10 * jtm,
+            ..held
+        },
+    );
+    let fee = 50_000;
+    let entries = vec![
+        // 0: a plain spend, kept.
+        page(Address([0x77; 32]), 2_000, &[(BOB, 5 * jtm)], fee),
+        // 1, 2: the same burn of 3 by two advancers: the first placed kept.
+        advance_entry(2_010, PAYER, 3, OWNER, 10 * jtm, fee + 2),
+        advance_entry(2_020, BOB, 3, OWNER, 10 * jtm, fee + 1),
+        // 3: another burn of 3 (a stranger's): kept, it blocks nothing.
+        advance_entry(2_030, CAROL, 3, CAROL, RELEASE_FEE_MICRO, fee),
+        // 4: an advance of 5, released by the offer: left out.
+        advance_entry(2_040, CAROL, 5, OWNER, 10 * jtm, fee),
+        // 5, 6: PAYER over its cap (1 010 held, then 1 000, then 991): the
+        // second placed left out (entry 1 still fits after the first).
+        advance_entry(2_050, PAYER, 11, OWNER, 1_000 * jtm, fee + 4),
+        advance_entry(2_060, PAYER, 12, OWNER, 991 * jtm, fee + 3),
+        // 7, 8: the claim of 9 moved twice: the second placed left out.
+        page(
+            PAYER,
+            2_070,
+            &[(BOB, 0), (held.transfer_marker(9, &BOB), 0)],
+            fee + 6,
+        ),
+        page(
+            PAYER,
+            2_080,
+            &[(CAROL, 0), (held.transfer_marker(9, &CAROL), 0)],
+            fee + 5,
+        ),
+        // 9: a marker carrying value (admitted below the height): left out.
+        page(
+            CAROL,
+            2_090,
+            &[(OWNER, 1), (advance_marker(13, &OWNER, jtm, &CAROL), 7)],
+            fee,
+        ),
+    ];
+    let offer = DestinationOffer {
+        committee_update: None,
+        releases: vec![base_release(5, 10 * jtm, OWNER, 7)],
+    };
+    let kept_of = |rules: &DestinationRules| -> Vec<usize> {
+        let tagged: Vec<(usize, PagedSpendIntent)> = entries.iter().cloned().enumerate().collect();
+        advances_within_rules(
+            tagged,
+            |(_, e)| e.pages.as_slice(),
+            &offer,
+            &state,
+            rules,
+            J + 21,
+        )
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect()
+    };
+    let kept = kept_of(&base_rules());
+    assert_eq!(kept, vec![0, 1, 3, 5, 7]);
+    // What is kept is accepted together, in any order, with the release.
+    let armed = base_rules();
+    for order in [kept.clone(), kept.iter().rev().copied().collect()] {
+        let mut check = AdvanceCheck::new(
+            &state.advances,
+            &state.released,
+            vec![5],
+            &armed.vault,
+            &armed.base_return.advance,
+        );
+        for (index, i) in order.iter().enumerate() {
+            let pages = &entries[*i].pages;
+            let outputs: Vec<(Address, u64)> = pages
+                .iter()
+                .flat_map(|p| p.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+                .collect();
+            assert_eq!(
+                check.group(index, pages[0].body.input_owner, &outputs),
+                Ok(()),
+                "entry {i}"
+            );
+        }
+    }
+    // Dormant (every profile today): untouched.
+    assert_eq!(kept_of(&rules()), (0..entries.len()).collect::<Vec<_>>());
 }

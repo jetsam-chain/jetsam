@@ -8,7 +8,9 @@
 //! the mempool; `getVaultState` reports V8's balance, its ceiling and room,
 //! the paid indices, the V6 window and the deposits per height over the last
 //! 1 024 heights (the guardian's SG-17); `getDestinationCommittee` the L1
-//! committees the branch knows and whether this node holds their keys.
+//! committees the branch knows and whether this node holds their keys;
+//! `getAdvances` (the return over Base, D107, D114) the advances the branch
+//! holds for one withdrawal index and whom the release of a burn must pay.
 
 use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
 use jetsam_chain::consensus::vault::{destination_marker_kind, DestinationMarkerKind};
@@ -21,7 +23,7 @@ pub const DEPOSIT_COUNT_HEIGHTS: u64 = 1_024;
 /// What `submitDestinationObject` admitted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitDestinationObjectResponse {
-    /// `"committee_update"` or `"release"`.
+    /// `"committee_update"`, `"release"` or `"release_over_base"`.
     pub kind: String,
     /// The period a committee update brings.
     pub period: Option<u64>,
@@ -43,7 +45,82 @@ impl From<jetsam_mempool::destination::DestinationAdmitted> for SubmitDestinatio
                 period: None,
                 n: Some(n),
             },
+            DestinationAdmitted::ReleaseOverBase { n } => Self {
+                kind: "release_over_base".into(),
+                period: None,
+                n: Some(n),
+            },
         }
+    }
+}
+
+/// One advance of `getAdvances` (addresses in bech32m).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceInfo {
+    /// Who advanced (its outstanding counts it).
+    pub origin: String,
+    /// Whom the release of exactly this burn pays.
+    pub creditor: String,
+    /// The burn advanced: its owner and amount (µJTM).
+    pub owner: String,
+    pub amount: u64,
+    /// What `origin` has outstanding in all (≤ 3 000 JTM).
+    pub origin_outstanding: u64,
+}
+
+/// `getAdvances`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvancesResponse {
+    /// Whether the return over Base governs the tip's child.
+    pub active: bool,
+    pub n: u64,
+    /// Whether the branch has paid `n` (D52: no advance of it any more).
+    pub released: bool,
+    /// The advances of `n`, by key `(owner, amount)`.
+    pub advances: Vec<AdvanceInfo>,
+    /// Given a burn `(owner, amount)`: the payee its release's first output
+    /// must pay at the tip's child (V2): the creditor of the advance of
+    /// exactly that burn over Base, else the owner.
+    pub payee: Option<String>,
+}
+
+/// The `getAdvances` reply from the tip's destination state (`None` below
+/// J) for withdrawal index `n`, and the payee of the burn `burn` if given.
+pub fn advances_of(
+    state: Option<&DestinationState>,
+    tip_height: u64,
+    rules: &DestinationRules,
+    n: u64,
+    burn: Option<(Address, u64)>,
+) -> AdvancesResponse {
+    use jetsam_chain::consensus::destination::advance::release_payee;
+    let active = rules.base_return.active_at(tip_height.saturating_add(1));
+    let advances = state
+        .filter(|_| active)
+        .map(|state| {
+            state
+                .advances
+                .of_n(n)
+                .map(|entry| AdvanceInfo {
+                    origin: entry.origin.to_bech32(),
+                    creditor: entry.creditor.to_bech32(),
+                    owner: entry.owner.to_bech32(),
+                    amount: entry.amount,
+                    origin_outstanding: state.advances.outstanding_of(&entry.origin),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let payee = burn.map(|(owner, amount)| match state {
+        Some(state) if active => release_payee(&state.advances, n, &owner, amount).to_bech32(),
+        _ => owner.to_bech32(),
+    });
+    AdvancesResponse {
+        active,
+        n,
+        released: state.is_some_and(|state| state.released.contains(n)),
+        advances,
+        payee,
     }
 }
 
@@ -292,5 +369,73 @@ mod tests {
         let below = destination_committee(None, &rules(), |_| true);
         assert!(!below.active);
         assert!(below.committees.is_empty());
+    }
+
+    /// `getAdvances` (D107, D114): the advances of `n` by key, each with its
+    /// creditor and its origin's outstanding, and the payee of a burn — the
+    /// creditor of the advance of exactly that burn over Base, else the
+    /// owner; nothing while the return over Base is dormant.
+    #[test]
+    fn rpc_get_advances_reports_the_advances_of_n_and_the_payee_of_a_burn() {
+        use jetsam_chain::consensus::destination::advance::AdvanceEntry;
+        use jetsam_poseidon2b::primitives::Address;
+        let (alice, payer, bob, stranger) = (
+            Address([0xa1; 32]),
+            Address([0x51; 32]),
+            Address([0xb0; 32]),
+            Address([0x5e; 32]),
+        );
+        let mut armed = rules();
+        armed.base_return.activation_height = Some(1_000);
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.tip = 1_500;
+        state.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: payer,
+                creditor: bob,
+                owner: alice,
+                amount: 5 * MICRO_PER_JTM,
+            },
+        );
+        state.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: stranger,
+                creditor: stranger,
+                owner: stranger,
+                amount: MICRO_PER_JTM / 10,
+            },
+        );
+        state.released.insert(2);
+        let reply = advances_of(
+            Some(&state),
+            1_500,
+            &armed,
+            3,
+            Some((alice, 5 * MICRO_PER_JTM)),
+        );
+        assert!(reply.active);
+        assert!(!reply.released);
+        assert_eq!(reply.advances.len(), 2);
+        assert_eq!(reply.advances[0].owner, stranger.to_bech32());
+        assert_eq!(reply.advances[1].creditor, bob.to_bech32());
+        assert_eq!(reply.advances[1].origin_outstanding, 5 * MICRO_PER_JTM);
+        assert_eq!(reply.payee, Some(bob.to_bech32()));
+        // Another burn of 3: its owner.
+        let other = advances_of(Some(&state), 1_500, &armed, 3, Some((alice, 1)));
+        assert_eq!(other.payee, Some(alice.to_bech32()));
+        assert!(advances_of(Some(&state), 1_500, &armed, 2, None).released);
+        // Dormant (every profile today): no advance read, the owner paid.
+        let dormant = advances_of(
+            Some(&state),
+            1_500,
+            &rules(),
+            3,
+            Some((alice, 5 * MICRO_PER_JTM)),
+        );
+        assert!(!dormant.active);
+        assert!(dormant.advances.is_empty());
+        assert_eq!(dormant.payee, Some(alice.to_bech32()));
     }
 }

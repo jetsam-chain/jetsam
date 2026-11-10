@@ -19,7 +19,17 @@
 //! again without what the refusal blames ([`retry_without_culprits`], A2-M1),
 //! then, still refused, without the destination objects, forgetting those the
 //! refusals blame ([`culprits_of`]).
+//!
+//! From the return-over-Base height on (D101, D107; dormant on every profile
+//! today): releases are offered over Base only (their game proof and output
+//! root preimage shared like the finality update), each paying what V2 asks
+//! of the branch (the creditor of the advance of exactly its burn, D114);
+//! never in a block that carries a committee update (D107 §9.1: the update
+//! goes first, the releases wait one block); and the mempool's advances and
+//! claim transfers are placed only as the block rule accepts them together
+//! ([`advances_within_rules`]).
 
+use jetsam_chain::consensus::destination::advance::{release_payee, AdvanceCheck};
 use jetsam_chain::consensus::destination::state::{
     committee_update_marker, DestinationBlockError, DestinationRules, DestinationState,
 };
@@ -50,13 +60,14 @@ impl DestinationOffer {
         self.committee_update.is_none() && self.releases.is_empty()
     }
 
-    /// The section objects the offer makes when all of it is carried.
+    /// The section objects the offer makes when all of it is carried: the
+    /// shared proofs once (finality update and account proof, and over Base
+    /// the game proof and output root preimage), then one per release.
     pub fn object_count(&self) -> usize {
         usize::from(self.committee_update.is_some())
-            + if self.releases.is_empty() {
-                0
-            } else {
-                2 + self.releases.len()
+            + match self.releases.first() {
+                None => 0,
+                Some(first) => (if first.base.is_some() { 4 } else { 2 }) + self.releases.len(),
             }
     }
 
@@ -113,6 +124,16 @@ impl DestinationOffer {
                 kind: DestinationObjectKind::FinalityUpdate,
                 payload: first.finality.clone(),
             });
+            if let Some(base) = &first.base {
+                objects.push(DestinationObject {
+                    kind: DestinationObjectKind::BaseGameProof,
+                    payload: base.game_proof.clone(),
+                });
+                objects.push(DestinationObject {
+                    kind: DestinationObjectKind::OutputRootPreimage,
+                    payload: base.output_preimage.clone(),
+                });
+            }
             objects.push(DestinationObject {
                 kind: DestinationObjectKind::BridgeAccountProof,
                 payload: first.account_proof.clone(),
@@ -181,6 +202,11 @@ pub fn plan_destination_offer(
     if rules.bridge.is_none() {
         return offer;
     }
+    let over_base = rules.base_return.active_at(height);
+    // D107 §9.1: never a game proof beside a committee update.
+    if over_base && offer.committee_update.is_some() {
+        return offer;
+    }
     releases.sort_by_key(|release| release.release.n);
     let mut window = state.released_in_window(height, rules.vault.window_blocks);
     for release in releases {
@@ -192,8 +218,21 @@ pub fn plan_destination_offer(
         {
             continue;
         }
+        // Over Base only from its height on, paying what V2 asks there.
+        if over_base != release.base.is_some()
+            || (over_base
+                && release.paid_to()
+                    != Some(release_payee(
+                        &state.advances,
+                        release.release.n,
+                        &release.release.owner,
+                        release.release.amount,
+                    )))
+        {
+            continue;
+        }
         if let Some(first) = offer.releases.first() {
-            if release.finality != first.finality || release.account_proof != first.account_proof {
+            if !release.shares_proofs_with(first) {
                 continue;
             }
         }
@@ -296,6 +335,71 @@ pub fn deposits_within_ceiling<E>(
         .collect()
 }
 
+/// The entries of `entries` (the mempool's selection, `pages_of` their pages)
+/// whose advance and claim-transfer groups the block at `height` after a
+/// branch in `state` accepts together with `offer`'s releases (the return over
+/// Base, D107, D114): one by one in the order the chain template places them
+/// (decreasing fee, then logical txid), an entry the rule refuses beside
+/// those kept before it is left out (it stays in the pool). The rule refuses
+/// only what another group brings (a burn twice, a cap, a transfer twice, the
+/// release of its `n`) or what the branch holds, so the entries kept are
+/// accepted in any order, and without the offer too. Every entry below the
+/// return-over-Base height (none today). Order of `entries` kept.
+pub fn advances_within_rules<E>(
+    entries: Vec<E>,
+    pages_of: impl Fn(&E) -> &[TxPage],
+    offer: &DestinationOffer,
+    state: &DestinationState,
+    rules: &DestinationRules,
+    height: u64,
+) -> Vec<E> {
+    if !rules.base_return.active_at(height) {
+        return entries;
+    }
+    let released_here: Vec<u64> = offer
+        .releases
+        .iter()
+        .map(|release| release.release.n)
+        .collect();
+    let mut check = AdvanceCheck::new(
+        &state.advances,
+        &state.released,
+        released_here,
+        &rules.vault,
+        &rules.base_return.advance,
+    );
+    let mut placed: Vec<(u64, [u8; 32], usize)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            jetsam_tx::validate_paged_spend(pages_of(entry))
+                .ok()
+                .map(|facts| (facts.fee, facts.logical_txid.0, index))
+        })
+        .collect();
+    placed.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut dropped = std::collections::HashSet::new();
+    for (_, _, index) in placed {
+        let pages = pages_of(&entries[index]);
+        let outputs: Vec<(Address, u64)> = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
+            .collect();
+        let from = pages
+            .first()
+            .map_or(Address([0; 32]), |page| page.body.input_owner);
+        if check.group(index, from, &outputs).is_err() {
+            dropped.insert(index);
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped.contains(index))
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
 /// What a refused block blames among the destination objects it carried.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Culprits {
@@ -348,11 +452,15 @@ pub fn culprits_of(
         DestinationBlockError::LightClient(_) if offer.committee_update.is_some() => update(),
         DestinationBlockError::LightClient(_)
         | DestinationBlockError::BridgeAccount(_)
+        | DestinationBlockError::BaseReturn(_)
+        | DestinationBlockError::L1TimeUnknown
         | DestinationBlockError::MalformedObject {
             kind:
                 DestinationObjectKind::FinalityUpdate
                 | DestinationObjectKind::BridgeAccountProof
-                | DestinationObjectKind::VaultRelease,
+                | DestinationObjectKind::VaultRelease
+                | DestinationObjectKind::BaseGameProof
+                | DestinationObjectKind::OutputRootPreimage,
         } => Culprits {
             releases: all_releases(),
             committee_update: false,

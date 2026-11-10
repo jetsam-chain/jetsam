@@ -299,6 +299,18 @@ pub trait JetsamApi {
         &self,
     ) -> RpcResult<crate::destination::DestinationCommitteeResponse>;
 
+    /// v1.7, the return over Base (D107, D114): the advances the branch holds
+    /// for withdrawal index `n` and, given the burn (`owner` bech32m and
+    /// `amount` µJTM), whom its release group must pay at the tip's child
+    /// (V2). Nothing is read while the return over Base is dormant.
+    #[method(name = "getAdvances")]
+    async fn get_advances(
+        &self,
+        n: u64,
+        owner: Option<String>,
+        amount: Option<u64>,
+    ) -> RpcResult<crate::destination::AdvancesResponse>;
+
     /// v1.7 (T3.7): hand a guardian intent (hex of `GuardianIntent::encode`:
     /// an object with the transaction paying its marker) to this node's
     /// mempool, for its miners. Attestations and equivocations: at most four

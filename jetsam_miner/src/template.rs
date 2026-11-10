@@ -667,6 +667,20 @@ impl TemplateBuilder {
             ),
             None => entries,
         };
+        // The return over Base (D107, D114): the advances and claim
+        // transfers the block rule accepts together, beside the offer's
+        // releases; the others stay in the pool. Inert below its height.
+        let entries = match &snapshot.destination {
+            Some(state) => crate::destination_slot::advances_within_rules(
+                entries,
+                |entry| entry.pages.as_slice(),
+                &offer,
+                state,
+                &destination_rules,
+                child_height,
+            ),
+            None => entries,
+        };
         // Keep each authorization paired with its indivisible logical group;
         // flatten only the public pages passed into the chain template.
         let (authorization_bytes, groups): (Vec<Option<Vec<u8>>>, Vec<_>) = entries

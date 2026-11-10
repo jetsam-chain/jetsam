@@ -129,7 +129,9 @@ impl SyntheticL1 {
     }
 
     /// The anchor committee, as a branch knows it after its anchor update.
-    pub(crate) fn anchor_committee(&self) -> jetsam_chain::consensus::destination::state::CommitteeRef {
+    pub(crate) fn anchor_committee(
+        &self,
+    ) -> jetsam_chain::consensus::destination::state::CommitteeRef {
         jetsam_chain::consensus::destination::state::CommitteeRef {
             period: self.anchor.period,
             root: self.anchor.committee_root,
@@ -138,9 +140,12 @@ impl SyntheticL1 {
 
     /// The keys of the anchor committee, as a node holds them (D57),
     /// decompressed once per test binary (≈ 0.1 s each in a debug build).
-    pub(crate) fn anchor_keys(&self) -> jetsam_chain::consensus::destination::state::CommitteeKeyCache {
-        static KEYS: std::sync::OnceLock<jetsam_chain::consensus::destination::state::CommitteeKeyCache> =
-            std::sync::OnceLock::new();
+    pub(crate) fn anchor_keys(
+        &self,
+    ) -> jetsam_chain::consensus::destination::state::CommitteeKeyCache {
+        static KEYS: std::sync::OnceLock<
+            jetsam_chain::consensus::destination::state::CommitteeKeyCache,
+        > = std::sync::OnceLock::new();
         KEYS.get_or_init(|| {
             let mut keys =
                 jetsam_chain::consensus::destination::state::CommitteeKeyCache::default();
@@ -151,6 +156,86 @@ impl SyntheticL1 {
             keys
         })
         .clone()
+    }
+}
+
+/// RET3: the synthetic **signed** L1 of `testdata/base_synthetic.txt` (test
+/// keys only, written by a temporary test of `jetsam_chain` from its
+/// return-over-Base test helpers): a finality update signed by the anchor
+/// committee of [`SyntheticL1`] whose finalized root holds Base's five
+/// contracts (pinned as `BASE_SEPOLIA`) and a game Base holds valid at its
+/// L1 time, claiming a Base state root under which the bridge (the same
+/// contract and genesis) holds `withdrawals[n]` of one burn.
+#[derive(Clone)]
+pub(crate) struct SyntheticBase {
+    pub release: VaultRelease,
+    pub finality: Vec<u8>,
+    pub game_proof: Vec<u8>,
+    pub output_preimage: Vec<u8>,
+    pub account_proof: Vec<u8>,
+}
+
+impl SyntheticBase {
+    pub(crate) fn load() -> Self {
+        let text = std::fs::read_to_string(format!(
+            "{}/src/destination/testdata/base_synthetic.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture");
+        let field = |key: &str| -> String {
+            text.lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("fixture field {key}"))
+                .to_string()
+        };
+        let bytes = |key: &str| -> Vec<u8> {
+            let hex = field(key);
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let storage = bytes("storage_proof");
+        Self {
+            release: VaultRelease {
+                n: field("release_n").parse().unwrap(),
+                owner: Address(bytes("release_owner").try_into().unwrap()),
+                amount: field("release_amount").parse().unwrap(),
+                storage_proof: decode_proof_nodes(&mut storage.as_slice()).expect("storage"),
+            },
+            finality: bytes("finality"),
+            game_proof: bytes("game_proof"),
+            output_preimage: bytes("output_preimage"),
+            account_proof: bytes("account_proof"),
+        }
+    }
+
+    pub(crate) fn proofs(&self) -> BaseReleaseProofs {
+        BaseReleaseProofs {
+            game_proof: self.game_proof.clone(),
+            output_preimage: self.output_preimage.clone(),
+        }
+    }
+
+    /// The destination rules of [`SyntheticL1`] with the return over Base
+    /// armed at `height` on Base Sepolia's pins. The fixture signs for the L1
+    /// main network, the L1 the return reads from the height on; below it the
+    /// light client reads Sepolia here, so that only the rules of the next
+    /// block (`DestinationRules::effective_at`) verify the fixture.
+    pub(crate) fn rules(
+        l1: &SyntheticL1,
+        vault: jetsam_chain::consensus::vault::VaultRules,
+        height: u64,
+    ) -> jetsam_chain::consensus::destination::state::DestinationRules {
+        let mut rules = l1.rules(vault);
+        rules.network = jetsam_chain::consensus::destination::forks::L1_SEPOLIA;
+        rules.base_return = jetsam_chain::consensus::destination::state::BaseReturnRules {
+            activation_height: Some(height),
+            network: jetsam_chain::consensus::destination::forks::L1_MAINNET,
+            base: jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA,
+            advance: jetsam_chain::consensus::destination::advance::AdvanceRules::CONSENSUS,
+        };
+        rules
     }
 }
 
@@ -216,6 +301,7 @@ pub(crate) fn release_intent(n: u64, owner: Address, amount: u64) -> Destination
         release,
         finality: finality_payload(),
         account_proof: proof,
+        base: None,
     })
 }
 
@@ -265,6 +351,77 @@ fn destination_intent_round_trips_and_refuses_damage() {
         DestinationIntent::decode(&vec![0u8; MAX_DESTINATION_INTENT_BYTES + 1]),
         Err(DestinationIntentError::TooLarge { .. })
     ));
+}
+
+/// A release over Base (kind 3): its game proof and output root preimage
+/// between the finality update and the account proof. It decodes only under
+/// rules that arm the return over Base: while the height is `None` (this
+/// build, every profile) its kind is unknown, exactly as before. Damage and
+/// malformed objects are refused.
+#[test]
+fn a_release_over_base_round_trips_only_once_the_height_is_armed() {
+    let base = SyntheticBase::load();
+    let DestinationIntent::Release(mut release) = release_intent(3, base.release.owner, 5_000_000)
+    else {
+        unreachable!()
+    };
+    release.base = Some(base.proofs());
+    let intent = DestinationIntent::Release(release.clone());
+    let bytes = intent.encode().unwrap();
+    assert_eq!(bytes[8], 3, "kind 3");
+    assert!(bytes.len() <= MAX_DESTINATION_INTENT_BYTES);
+    assert_eq!(
+        DestinationIntent::decode_with(&bytes, true),
+        Ok(intent.clone())
+    );
+    // Dormant: the kind of a build without the return over Base.
+    assert_eq!(
+        DestinationIntent::decode(&bytes),
+        Err(DestinationIntentError::UnknownKind(3))
+    );
+    assert_eq!(
+        DestinationIntent::decode_with(&bytes, false),
+        Err(DestinationIntentError::UnknownKind(3))
+    );
+    // A release of before is still read either way.
+    let plain = release_intent(3, base.release.owner, 5_000_000)
+        .encode()
+        .unwrap();
+    assert!(DestinationIntent::decode_with(&plain, true).is_ok());
+    for cut in [9, 13, bytes.len() / 2, bytes.len() - 1] {
+        assert!(
+            DestinationIntent::decode_with(&bytes[..cut], true).is_err(),
+            "cut {cut}"
+        );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(
+        DestinationIntent::decode_with(&longer, true),
+        Err(DestinationIntentError::TrailingBytes)
+    );
+    let mut bad_game = release.clone();
+    bad_game.base.as_mut().unwrap().game_proof.push(0);
+    assert_eq!(
+        DestinationIntent::decode_with(
+            &DestinationIntent::Release(bad_game).encode().unwrap(),
+            true
+        ),
+        Err(DestinationIntentError::MalformedObject(
+            DestinationObjectKind::BaseGameProof
+        ))
+    );
+    let mut bad_preimage = release;
+    bad_preimage.base.as_mut().unwrap().output_preimage.push(0);
+    assert_eq!(
+        DestinationIntent::decode_with(
+            &DestinationIntent::Release(bad_preimage).encode().unwrap(),
+            true
+        ),
+        Err(DestinationIntentError::MalformedObject(
+            DestinationObjectKind::OutputRootPreimage
+        ))
+    );
 }
 
 /// The transaction of an intent carries exactly its object's marker: no
@@ -441,7 +598,8 @@ fn full_release_pool_makes_room_for_a_lower_n() {
         pool.hold(release_intent(n, Address([0xa1; 32]), 5_000_000))
             .unwrap();
     }
-    let held = |pool: &DestinationPool| -> Vec<u64> { pool.releases().map(|r| r.release.n).collect() };
+    let held =
+        |pool: &DestinationPool| -> Vec<u64> { pool.releases().map(|r| r.release.n).collect() };
     assert_eq!(
         pool.hold(release_intent(last + 1, Address([0xa1; 32]), 5_000_000)),
         Err(HoldError::Full),

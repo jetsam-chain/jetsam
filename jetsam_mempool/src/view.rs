@@ -25,6 +25,7 @@ use std::{
 };
 
 use jetsam_chain::block_header::BlockHeader;
+use jetsam_chain::consensus::destination::advance::AdvanceBook;
 use jetsam_chain::consensus::destination::state::{
     CommitteeKeyCache, CommitteeRef, DestinationRules, DestinationState,
 };
@@ -52,6 +53,10 @@ pub struct VaultView {
     pub released: ReleasedSet,
     pub floor: u64,
     pub committees: Vec<CommitteeRef>,
+    /// The advances the branch holds (the return over Base, D114; empty
+    /// below its height): a release pays the creditor of the advance of
+    /// exactly its burn, an advance or a transfer is judged against them.
+    pub advances: AdvanceBook,
 }
 
 /// The [`VaultView`] of the block at `height` after a tip whose destination
@@ -70,6 +75,7 @@ pub fn vault_view_for_child(
             released: state.released,
             floor: state.floor,
             committees: state.committees,
+            advances: state.advances,
         }
     })
 }
