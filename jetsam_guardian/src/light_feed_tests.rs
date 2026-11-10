@@ -365,12 +365,21 @@ fn an_http_body_is_read_by_length_or_by_chunks() {
 
 /// Two beacon nodes: one serves the update, the other the committee's seats
 /// and keys (as their answers were read).
-struct Seats;
+struct Seats {
+    /// One seat's key altered (a beacon node that disagrees).
+    altered: bool,
+}
 
 impl Beacon for Seats {
     fn get(&self, path: &str) -> anyhow::Result<Value> {
-        let keys = fixture("sepolia_committee_1409.publicnode.json");
-        let keys = keys["pubkeys"].as_array().unwrap();
+        let fixture_keys = fixture("sepolia_committee_1409.publicnode.json");
+        let mut keys = fixture_keys["pubkeys"].as_array().unwrap().clone();
+        if self.altered {
+            // Seat 0 given the key of another seat that holds no other seat.
+            let other = keys.iter().find(|k| keys.iter().filter(|x| x == k).count() == 1 && **k != keys[0]).unwrap().clone();
+            keys[0] = other;
+        }
+        let keys = &keys;
         if path.starts_with("/eth/v1/beacon/states/finalized/sync_committees?epoch=360704") {
             // A seat per key, repeated keys sharing an index.
             let mut index_of = std::collections::BTreeMap::new();
@@ -406,9 +415,29 @@ impl Beacon for Seats {
 fn the_anchor_tool_gives_the_committee_both_beacon_nodes_agree_on() {
     let lc = MockBeacon { head_slot: 0 };
     assert_eq!(
-        anchor_of(&lc, &Seats, 1_409, SEPOLIA_GLOAS_FORK_EPOCH).expect("agree"),
+        anchor_of(&lc, &Seats { altered: false }, 1_409, SEPOLIA_GLOAS_FORK_EPOCH).expect("agree"),
         (1_409, root_1409())
     );
     // Another period's committee is not this one.
-    assert!(anchor_of(&lc, &Seats, 1_410, SEPOLIA_GLOAS_FORK_EPOCH).is_err());
+    assert!(anchor_of(&lc, &Seats { altered: false }, 1_410, SEPOLIA_GLOAS_FORK_EPOCH).is_err());
+    // One seat that differs between the two beacon nodes: no anchor.
+    assert!(anchor_of(&lc, &Seats { altered: true }, 1_409, SEPOLIA_GLOAS_FORK_EPOCH).is_err());
+}
+
+/// A beacon node answering the update of another period than the one asked.
+struct WrongPeriod;
+
+impl Beacon for WrongPeriod {
+    fn get(&self, _path: &str) -> anyhow::Result<Value> {
+        Ok(json!([updates()[1].clone()]))
+    }
+    fn name(&self) -> String {
+        "wrong-period".into()
+    }
+}
+
+#[test]
+fn an_update_of_another_period_than_asked_is_refused() {
+    assert!(fetch_update(&[&WrongPeriod], 1_408, SEPOLIA_GLOAS_FORK_EPOCH).is_err());
+    assert!(fetch_update(&[&WrongPeriod], 1_409, SEPOLIA_GLOAS_FORK_EPOCH).is_ok());
 }
