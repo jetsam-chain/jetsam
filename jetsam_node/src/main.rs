@@ -1766,11 +1766,21 @@ struct Cli {
     /// (`Authorization: Bearer <cookie>`; jetsam-cli reads it by itself). A
     /// pool's miners given the token can mine and read, not spend.
     ///
+    /// Also read from the JETSAM_MINING_KEY environment variable (its value is
+    /// never shown): the command line of a process is readable by every local
+    /// user, its environment by its own user only. Given both, --mining-key
+    /// wins.
+    ///
     /// Pool example:
     ///   jetsam --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
     ///   # External miner: Authorization: Bearer s3cr3t (mining and reads)
     ///   # Payouts, on this machine: Authorization: Bearer <contents of rpc.cookie>
-    #[arg(long, value_name = "TOKEN")]
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        env = "JETSAM_MINING_KEY",
+        hide_env_values = true
+    )]
     mining_key: Option<String>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
@@ -2039,6 +2049,43 @@ mod rpc_access_help_tests {
     /// mining key to their external miners while the key opened every method,
     /// `walletSend` and `stop` included. It says what the key opens now, and
     /// that the wallet and `stop` answer only to the cookie.
+    /// R-1 (audit 2026-11-10): the key can come from `JETSAM_MINING_KEY`,
+    /// out of the command line every local user reads in /proc/<pid>/cmdline;
+    /// given both, the command line wins; the help names the variable and never
+    /// shows its value; `--allow-custom-coinbase` is satisfied by it.
+    #[test]
+    fn the_mining_key_is_read_from_the_environment_and_never_shown() {
+        use clap::Parser;
+        std::env::set_var("JETSAM_MINING_KEY", "from-the-environment-0123");
+        let from_env = Cli::try_parse_from(["jetsam", "--mode", "extminer"]);
+        let both = Cli::try_parse_from([
+            "jetsam",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "from-the-command-line",
+        ]);
+        let custom =
+            Cli::try_parse_from(["jetsam", "--mode", "extminer", "--allow-custom-coinbase"]);
+        let help = Cli::command().render_long_help().to_string();
+        std::env::remove_var("JETSAM_MINING_KEY");
+        assert_eq!(
+            from_env.unwrap().mining_key.as_deref(),
+            Some("from-the-environment-0123")
+        );
+        assert_eq!(
+            both.unwrap().mining_key.as_deref(),
+            Some("from-the-command-line"),
+            "the command line wins"
+        );
+        assert!(custom.is_ok(), "{:?}", custom.err());
+        assert!(help.contains("JETSAM_MINING_KEY"), "{help}");
+        assert!(
+            !help.contains("from-the-environment-0123"),
+            "the help never shows the key"
+        );
+    }
+
     #[test]
     fn the_mining_key_help_never_hands_out_the_wallet() {
         let help = long_help("mining_key");
@@ -3030,7 +3077,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Mode validation ---
     if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
-        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+        anyhow::bail!("--mode extminer requires --mining-key <TOKEN> (or JETSAM_MINING_KEY)");
     }
     if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
         tracing::warn!(

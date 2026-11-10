@@ -31,7 +31,7 @@ use jetsam_guardian::checkpoint::Checkpoint;
 use jetsam_guardian::config::{checked_egress, hex48, EgressConfig};
 use jetsam_guardian::feed::{utc_day, verify_line};
 use jetsam_guardian::l1::{self, L1};
-use jetsam_guardian::rpc::{call_via, Egress};
+use jetsam_guardian::rpc::{call_via, call_via_bearer, Egress};
 use jetsam_guardian::{now_unix, GuardianStatement};
 use jetsam_chain::consensus::guardian::GuardianEquivocation;
 
@@ -62,6 +62,12 @@ struct AggConfig {
     l1_bridge: Option<String>,
     #[serde(default)]
     robot_rpc: Option<String>,
+    /// The robot node's RPC cookie file (`rpc.cookie` in its data directory):
+    /// `walletBuildGuardianPayment` spends the robot's wallet, which answers
+    /// only to that cookie (audit 2026-11-10, R-1). Read again at every wallet
+    /// call: the node writes a new one at each start.
+    #[serde(default)]
+    robot_cookie: Option<PathBuf>,
     #[serde(default = "yes")]
     submit_l1: bool,
     #[serde(default = "yes")]
@@ -104,6 +110,23 @@ struct Agg {
 }
 
 impl Agg {
+    /// A wallet call to the robot node, with its cookie read now; a clear
+    /// refusal, and nothing sent, when the cookie is not configured or cannot
+    /// be read.
+    fn robot_wallet_call(&self, robot: &str, method: &str, params: Value, t: Duration) -> anyhow::Result<Value> {
+        let path = self.cfg.robot_cookie.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "robot_cookie is not configured: {method} spends the robot node's wallet, which answers only to \
+                 its RPC cookie (rpc.cookie in its data directory)"
+            )
+        })?;
+        let cookie = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("robot_cookie {}: {e}", path.display()))?;
+        let cookie = cookie.trim();
+        anyhow::ensure!(!cookie.is_empty(), "robot_cookie {}: empty", path.display());
+        call_via_bearer(&self.egress, robot, method, params, t, Some(cookie))
+    }
+
     fn event(&self, v: Value) {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.cfg.events_file) {
@@ -263,7 +286,7 @@ impl Agg {
             .max_by_key(|(g, _, _)| g.height);
         let Some((g, kind, _)) = best else { return };
         let body = format!("{}{}", g.statement, g.sig96);
-        let built = call_via(&self.egress, robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "attestation", "body": body}, null]), t);
+        let built = self.robot_wallet_call(robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "attestation", "body": body}, null]), t);
         let res = built.and_then(|b| {
             let intent = b["intent_hex"].as_str().unwrap_or_default().to_string();
             call_via(&self.egress, robot, "jetsam_submitGuardianObject", json!([intent]), t).map(|r| (b, r))
@@ -330,7 +353,7 @@ impl Agg {
                     json!({"body": hex::encode(&body), "hints": hex::encode(&hints)}).to_string());
                 if let Some(robot) = &self.cfg.robot_rpc {
                     let t = Duration::from_secs(120);
-                    let r = call_via(&self.egress, robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "equivocation", "body": hex::encode(&body)}, null]), t)
+                    let r = self.robot_wallet_call(robot, "jetsam_walletBuildGuardianPayment", json!([{"kind": "equivocation", "body": hex::encode(&body)}, null]), t)
                         .and_then(|b| call_via(&self.egress, robot, "jetsam_submitGuardianObject", json!([b["intent_hex"].as_str().unwrap_or_default()]), t));
                     self.event(json!({"t": now_unix(), "event": "equivocation_jetsam", "result": format!("{r:?}")}));
                     log(&format!("equivocation to Jetsam: {r:?}"));
