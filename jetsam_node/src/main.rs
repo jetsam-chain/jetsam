@@ -1845,6 +1845,25 @@ struct Cli {
 /// DNS setup for format 4:
 ///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9700/p2p/12D3KooW..."
 ///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9700/p2p/12D3KooW..."
+/// A seed in any of the forms below may end in `/p2p/<PeerId>` (audit
+/// 2026-11-10, P-10). A hostname alone lets whoever answers the DNS query
+/// choose a fresh node's first peers; a pinned identity makes the Noise
+/// handshake refuse anyone but that seed, wherever the name points.
+fn split_pinned_seed(seed: &str) -> anyhow::Result<(&str, Option<libp2p::PeerId>)> {
+    if seed.starts_with('/') {
+        return Ok((seed, None));
+    }
+    match seed.rsplit_once("/p2p/") {
+        Some((base, peer)) => {
+            let peer = peer
+                .parse::<libp2p::PeerId>()
+                .with_context(|| format!("invalid pinned PeerId in seed {seed:?}"))?;
+            Ok((base, Some(peer)))
+        }
+        None => Ok((seed, None)),
+    }
+}
+
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
     let seed = s.trim();
 
@@ -1859,6 +1878,17 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
             anyhow::bail!("{ONION_NAME_NOT_FOR_DNS}: {seed}");
         }
         return Ok(addr);
+    }
+
+    if let (base, Some(peer)) = split_pinned_seed(seed)? {
+        let addr = seed_to_multiaddr(base, default_port)?;
+        if addr
+            .iter()
+            .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+        {
+            anyhow::bail!("seed {seed:?} names two identities");
+        }
+        return Ok(addr.with(libp2p::multiaddr::Protocol::P2p(peer)));
     }
 
     // Format 4: "dnsaddr:<hostname>" → /dnsaddr/<hostname>
@@ -2272,8 +2302,14 @@ async fn embedded_seed_multiaddrs(
     default_port: u16,
 ) -> anyhow::Result<Vec<libp2p::Multiaddr>> {
     let original = seed_to_multiaddr(seed, default_port)?;
-    match resolve_embedded_seed_with_system_dns(seed, default_port).await {
+    let (host, pinned) = split_pinned_seed(seed.trim())?;
+    match resolve_embedded_seed_with_system_dns(host, default_port).await {
         Ok(mut addresses) => {
+            if let Some(peer) = pinned {
+                for address in &mut addresses {
+                    address.push(libp2p::multiaddr::Protocol::P2p(peer));
+                }
+            }
             tracing::debug!(
                 seed,
                 addresses = addresses.len(),
@@ -9507,6 +9543,44 @@ mod tests {
                 Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
             )
         }));
+    }
+
+    /// Audit 2026-11-10, P-10: an embedded seed named by hostname alone let a
+    /// lying resolver choose every first peer of a fresh node. A seed entry
+    /// may pin its identity; every address the node dials for it then carries
+    /// that PeerId, and the Noise handshake refuses anyone else.
+    #[tokio::test]
+    async fn a_pinned_embedded_seed_dials_only_its_peer_id() {
+        let peer = libp2p::PeerId::random();
+        let resolved = embedded_seed_multiaddrs(&format!("localhost/p2p/{peer}"), 9700)
+            .await
+            .unwrap();
+        assert!(resolved
+            .iter()
+            .any(|addr| addr.to_string() == format!("/dns/localhost/tcp/9700/p2p/{peer}")));
+        assert!(resolved.iter().any(|addr| {
+            matches!(
+                addr.iter().next(),
+                Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
+            )
+        }));
+        for addr in &resolved {
+            assert_eq!(
+                addr.iter().last(),
+                Some(libp2p::multiaddr::Protocol::P2p(peer)),
+                "{addr} must name the pinned identity"
+            );
+        }
+        assert_eq!(
+            seed_to_multiaddr(&format!("seed.example:9800/p2p/{peer}"), 9700)
+                .unwrap()
+                .to_string(),
+            format!("/dns/seed.example/tcp/9800/p2p/{peer}")
+        );
+        assert!(
+            seed_to_multiaddr("seed.example/p2p/not-a-peer-id", 9700).is_err(),
+            "a malformed pin is refused, never dialled unpinned"
+        );
     }
 
     #[test]
