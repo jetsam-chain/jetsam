@@ -626,86 +626,113 @@ pub fn dry_run_cli(args: &[String]) -> anyhow::Result<()> {
     let started = crate::now_unix();
     let mut first = true;
     loop {
+        // A read that fails (a public RPC reset, a pruned state) is an ALERT and is tried again at the next pass;
+        // it never leads to a signature (every check reads first).
         if let (Some(dir), Some(anchor), Some(base)) = (&capture_dir, anchor, bases.first()) {
-            let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
-            let plan = crate::base_capture::CapturePlan {
-                address: bridge,
-                slots: crate::base_capture::capture_slots(13, 9, &[]),
-                anchor,
-                interval: crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
-                window: crate::base_capture::CAPTURE_WINDOW_BLOCKS,
+            let pass = || -> anyhow::Result<crate::base_capture::PassReport> {
+                let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
+                let plan = crate::base_capture::CapturePlan {
+                    address: bridge,
+                    slots: crate::base_capture::capture_slots(13, 9, &[]),
+                    anchor,
+                    interval: crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
+                    window: crate::base_capture::CAPTURE_WINDOW_BLOCKS,
+                };
+                crate::base_capture::capture_pass(base, &plan, head, crate::now_unix(), dir)
             };
-            let report =
-                crate::base_capture::capture_pass(base, &plan, head, crate::now_unix(), dir)?;
-            for b in &report.captured {
-                say(&format!("captured the bridge at Base block {b}"));
-            }
-            for (b, why) in &report.refused {
-                say(&format!("ALERT FAST CAPTURE {b}: {why}"));
+            match pass() {
+                Ok(report) => {
+                    for b in &report.captured {
+                        say(&format!("captured the bridge at Base block {b}"));
+                    }
+                    for (b, why) in &report.refused {
+                        say(&format!("ALERT FAST CAPTURE {b}: {why}"));
+                    }
+                }
+                Err(e) => say(&format!("ALERT FAST CAPTURE pass: {e:#}")),
             }
         }
-        let fin = finalized_l1_block(&l1)?;
-        let count = game_count(&l1, &params, fin)?;
+        let count = finalized_l1_block(&l1).and_then(|fin| game_count(&l1, &params, fin));
+        let count = match count {
+            Ok(count) => count,
+            Err(e) => {
+                say(&format!("ALERT FAST RPC the game count: {e:#}"));
+                0
+            }
+        };
         let from = if first {
             count.saturating_sub(games)
         } else {
             count.saturating_sub(games.max(4))
         };
-        first = false;
+        if count > 0 {
+            first = false;
+        }
         for index in from..count {
             if !seen.insert(index) {
                 continue;
             }
-            // Read at a finalized block taken now (a public RPC keeps little history).
-            let fin = finalized_l1_block(&l1)?;
-            let game = read_game(&l1, &params, index, fin)?;
-            let mut views = Vec::with_capacity(bases.len());
-            for base in &bases {
-                match read_base(base, game.l2_block) {
-                    Ok(view) => views.push(view),
-                    Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", base.url)),
+            let mut one = || -> anyhow::Result<()> {
+                // Read at a finalized block taken now (a public RPC keeps little history).
+                let fin = finalized_l1_block(&l1)?;
+                let game = read_game(&l1, &params, index, fin)?;
+                let mut views = Vec::with_capacity(bases.len());
+                for base in &bases {
+                    match read_base(base, game.l2_block) {
+                        Ok(view) => views.push(view),
+                        Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", base.url)),
+                    }
                 }
+                let ancestors = read_ancestors(
+                    &l1,
+                    &params,
+                    game.parent,
+                    "latest",
+                    crate::now_unix(),
+                    &mut cache,
+                )?;
+                let verdict =
+                    judge(&game, &params, &views, &ancestors, &domain).map(|s| sign(&s, &secret));
+                let mut line = journal_line(index, &game, &verdict);
+                line["l1_finalized"] = json!(fin);
+                line["ancestors_walked"] = json!(ancestors.len());
+                if let Some(dir) = &capture_dir {
+                    line["capture"] =
+                        json!(crate::base_capture::load(dir, game.l2_block)?.is_some());
+                }
+                // The control: the same game with its claim altered is never signed.
+                let mut altered = game;
+                altered.root_claim[31] ^= 1;
+                let control = judge(&altered, &params, &views, &ancestors, &domain);
+                line["control_altered_root_refused"] = json!(control.is_err());
+                match &verdict {
+                    Ok(_) => say(&format!(
+                        "SIGNED game #{index} 0x{} L2 {} root 0x{} (control refused: {})",
+                        hex::encode(game.game),
+                        game.l2_block,
+                        hex::encode(game.root_claim),
+                        control.is_err()
+                    )),
+                    Err(why) => say(&format!("ALERT FAST game #{index} not signed: {why}")),
+                }
+                if control.is_ok() {
+                    bail!("game #{index}: an altered root would have been signed");
+                }
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&journal)?;
+                writeln!(file, "{line}")?;
+                Ok(())
+            };
+            if let Err(e) = one() {
+                if e.to_string().contains("an altered root would have been signed") {
+                    return Err(e);
+                }
+                say(&format!("ALERT FAST RPC game #{index}: {e:#} (tried again at the next pass)"));
+                seen.remove(&index);
             }
-            let ancestors = read_ancestors(
-                &l1,
-                &params,
-                game.parent,
-                "latest",
-                crate::now_unix(),
-                &mut cache,
-            )?;
-            let verdict =
-                judge(&game, &params, &views, &ancestors, &domain).map(|s| sign(&s, &secret));
-            let mut line = journal_line(index, &game, &verdict);
-            line["l1_finalized"] = json!(fin);
-            line["ancestors_walked"] = json!(ancestors.len());
-            if let Some(dir) = &capture_dir {
-                line["capture"] = json!(crate::base_capture::load(dir, game.l2_block)?.is_some());
-            }
-            // The control: the same game with its claim altered is never signed.
-            let mut altered = game;
-            altered.root_claim[31] ^= 1;
-            let control = judge(&altered, &params, &views, &ancestors, &domain);
-            line["control_altered_root_refused"] = json!(control.is_err());
-            match &verdict {
-                Ok(_) => say(&format!(
-                    "SIGNED game #{index} 0x{} L2 {} root 0x{} (control refused: {})",
-                    hex::encode(game.game),
-                    game.l2_block,
-                    hex::encode(game.root_claim),
-                    control.is_err()
-                )),
-                Err(why) => say(&format!("ALERT FAST game #{index} not signed: {why}")),
-            }
-            if control.is_ok() {
-                bail!("game #{index}: an altered root would have been signed");
-            }
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&journal)?;
-            writeln!(file, "{line}")?;
         }
         if crate::now_unix() >= started + watch {
             break;
