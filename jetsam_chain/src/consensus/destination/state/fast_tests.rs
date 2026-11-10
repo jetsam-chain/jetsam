@@ -1297,7 +1297,7 @@ fn a_snapshot_export_carries_the_releases_of_the_horizon() {
     assert_eq!(below_file.fast, None);
     // The undo's margin: a boundary one block below the tip still opens the
     // release.
-    assert_eq!(l.rules.release_retention_at(HEIGHT), 4_801);
+    assert_eq!(l.rules.release_retention_at(HEIGHT), 14_401);
     assert_eq!(
         l.rules.release_retention_at(HB - 1),
         VAULT_RELEASE_WINDOW_BLOCKS

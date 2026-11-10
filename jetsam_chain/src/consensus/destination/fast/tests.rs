@@ -67,7 +67,9 @@ fn the_fast_lane_keys_are_none_on_every_profile() {
     assert_eq!(FAST_REVOKE_KEY, None);
     assert_eq!(FastLaneRules::CONSENSUS.release_key, None);
     assert_eq!(FastLaneRules::CONSENSUS.revoke_key, None);
-    assert_eq!(FastLaneRules::CONSENSUS.reconcile_blocks, 4_800);
+    // D: 30 days at 480 blocks a day (jetsamRD, 10/11).
+    assert_eq!(FAST_RECONCILE_BLOCKS, 14_400);
+    assert_eq!(FastLaneRules::CONSENSUS.reconcile_blocks, 14_400);
     assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, None);
     #[cfg(not(feature = "testnet"))]
     assert_eq!((FAST_L1_CHAIN_ID, FAST_BASE_CHAIN_ID), (1, 8_453));

@@ -103,11 +103,11 @@ pub const FAST_REVOKE_KEY: Option<[u8; KEY_BYTES]> = None;
 #[cfg(feature = "rehearsal-v1-7")]
 pub const FAST_REVOKE_KEY: Option<[u8; KEY_BYTES]> = None;
 
-/// Blocks a fast release stays open to a contradiction (≈ 10 days at 480
-/// blocks a day: Base's five days to finality, and five of margin for a
-/// pause of Base or of the relay). After it, the branch forgets it, unless it
-/// was contradicted.
-pub const FAST_RECONCILE_BLOCKS: u64 = 4_800;
+/// Blocks a fast release stays open to a contradiction: 30 days at 480
+/// blocks a day (jetsamRD, 10/11: longer is safer; Base's five days to
+/// finality and a wide margin for a pause of Base or of the relay). After it,
+/// the branch forgets it, unless it was contradicted.
+pub const FAST_RECONCILE_BLOCKS: u64 = 14_400;
 
 /// The chain the games and the factory live on (the game's address is
 /// read under its root): the L1's main network.
