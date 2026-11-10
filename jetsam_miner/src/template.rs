@@ -565,8 +565,11 @@ impl TemplateBuilder {
         // v1.7 destination slot (T2.5): what the branch can use of the
         // destination intents the pool holds, their transactions offered
         // beside the client payments.
+        // The child's rules: from the return-over-Base height on, its anchor
+        // and bridge.
         let destination_rules =
-            jetsam_chain::consensus::destination::state::DestinationRules::current();
+            jetsam_chain::consensus::destination::state::DestinationRules::current()
+                .effective_at(child_height);
         let offer = match &snapshot.destination {
             Some(state) if destination_rules.active_at(child_height) => {
                 let (updates, releases) = self.mempool.destination_candidates().await;

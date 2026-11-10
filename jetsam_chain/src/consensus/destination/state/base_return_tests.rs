@@ -51,6 +51,8 @@ pub(super) fn base_rules(anchor: &Committee) -> DestinationRules {
         base: BASE_SEPOLIA,
         advance: AdvanceRules::CONSENSUS,
         fast: crate::consensus::destination::fast::FastLaneRules::CONSENSUS,
+        anchor: None,
+        bridge: None,
     };
     rules
 }
@@ -198,13 +200,132 @@ fn the_return_over_base_is_dormant_and_reads_its_profiles_base() {
     };
     assert_eq!(armed.effective_at(HB - 1), armed);
     assert_eq!(armed.effective_at(HB).network, L1_REHEARSAL);
+    // Nothing else changes but the return's anchor and bridge, when it has
+    // them (the next test).
     assert_eq!(
         DestinationRules {
             network: armed.network,
+            anchor: armed.anchor,
+            bridge: armed.bridge,
             ..armed.effective_at(HB)
         },
         armed
     );
+}
+
+/// The return over Base brings the anchor of the light client of the L1 Base
+/// settles on and the bridge on Base: in force from its height only, so that
+/// no committee update nor release reads them before (a node of before the
+/// update knows none of them).
+#[test]
+fn the_return_over_base_brings_its_anchor_and_bridge_from_its_height() {
+    let l1_anchor = L1Anchor {
+        period: 7,
+        committee_root: [7; 32],
+    };
+    let base_anchor = L1Anchor {
+        period: 1_409,
+        committee_root: [9; 32],
+    };
+    let base_bridge = L1BridgeParams {
+        address: [0x52; 20],
+        ..prototype_bridge()
+    };
+    let rules = DestinationRules {
+        anchor: None,
+        bridge: None,
+        base_return: BaseReturnRules {
+            activation_height: Some(HB),
+            anchor: Some(base_anchor),
+            bridge: Some(base_bridge),
+            ..DestinationRules::CONSENSUS.base_return
+        },
+        ..DestinationRules::CONSENSUS
+    };
+    assert_eq!(rules.effective_at(HB - 1).anchor, None);
+    assert_eq!(rules.effective_at(HB - 1).bridge, None);
+    assert_eq!(rules.effective_at(HB).anchor, Some(base_anchor));
+    assert_eq!(rules.effective_at(HB).bridge, Some(base_bridge));
+    // Dormant, never.
+    let dormant = DestinationRules {
+        base_return: BaseReturnRules {
+            activation_height: None,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    assert_eq!(dormant.effective_at(u64::MAX).anchor, None);
+    assert_eq!(dormant.effective_at(u64::MAX).bridge, None);
+    // A chain whose L1 has its own keeps them where the return brings none,
+    // and takes the return's where it brings them.
+    let l1 = DestinationRules {
+        anchor: Some(l1_anchor),
+        bridge: Some(prototype_bridge()),
+        base_return: BaseReturnRules {
+            anchor: None,
+            bridge: None,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    assert_eq!(l1.effective_at(HB).anchor, Some(l1_anchor));
+    assert_eq!(l1.effective_at(HB).bridge, Some(prototype_bridge()));
+    let both = DestinationRules {
+        base_return: rules.base_return,
+        ..l1
+    };
+    assert_eq!(both.effective_at(HB - 1).anchor, Some(l1_anchor));
+    assert_eq!(both.effective_at(HB).anchor, Some(base_anchor));
+    assert_eq!(both.effective_at(HB).bridge, Some(base_bridge));
+}
+
+/// Each profile's anchor and bridge of the return over Base. The test
+/// chain's genesis is zero until TN1's bridge is initialized: filling it is a
+/// deliberate edit of the constant and of this test.
+#[test]
+fn the_profiles_base_return_anchor_and_bridge() {
+    let base = DestinationRules::CONSENSUS.base_return;
+    assert_eq!(base.anchor, BASE_RETURN_ANCHOR);
+    assert_eq!(base.bridge, BASE_RETURN_BRIDGE);
+    #[cfg(not(feature = "testnet"))]
+    {
+        assert_eq!(BASE_RETURN_ANCHOR, None);
+        assert_eq!(BASE_RETURN_BRIDGE, None);
+    }
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let anchor = BASE_RETURN_ANCHOR.expect("Sepolia's committee 1409");
+        assert_eq!(anchor.period, 1_409);
+        assert_eq!(
+            anchor.committee_root.to_vec(),
+            hex("2e9d359d79f40d0bd65eb738332cd9d9d1999a23f741e996e3e0766d6c37babc")
+        );
+        let bridge = BASE_RETURN_BRIDGE.expect("TN1's test bridge");
+        assert_eq!(
+            bridge.address.to_vec(),
+            hex("5221245deb99771dd76ccf785fd39a5d4f692254")
+        );
+        assert_eq!(
+            bridge.code_hash.to_vec(),
+            hex("ec2c82249680d925cf8718550e5ce35573bae8ecc0a8afb2546d97e989839f75")
+        );
+        assert_eq!((bridge.withdrawals_slot, bridge.genesis_id_slot), (9, 13));
+        assert_eq!(bridge.genesis_id, [0u8; 32], "pending TN1's initGenesis");
+        // The L1's own stay unset on the test chain.
+        assert_eq!(L1_ANCHOR, None);
+        assert_eq!(L1_BRIDGE, None);
+    }
+    #[cfg(feature = "rehearsal-v1-7")]
+    {
+        assert_eq!(BASE_RETURN_ANCHOR, None);
+        assert_eq!(BASE_RETURN_BRIDGE, None);
+    }
 }
 
 /// A dormant build reads tags 5 and 6 as an unknown tag (the wire of a build

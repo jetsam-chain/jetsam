@@ -647,6 +647,16 @@ pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
 /// is `None` a node judges every block exactly as a node without this code
 /// (the Base objects do not even decode). Armed, it sits strictly above an
 /// armed [`V1_7_ACTIVATION_HEIGHT`] ([`base_return_schedule_is_valid`]).
+/// Declared per profile, like [`V1_7_ACTIVATION_HEIGHT`], so that arming the
+/// test chain's can never arm another's.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+/// The test chain's: the only one an operator arms (update n°2 of the test
+/// chain, `FAST_ARMING.txt`); `None` until then.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
 pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
 
 /// Whether the return over Base governs the block at `height`.

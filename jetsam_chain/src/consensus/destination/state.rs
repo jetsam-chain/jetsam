@@ -200,9 +200,67 @@ pub const BASE_RETURN_PARAMS: BaseParams = super::base_read::BASE_MAINNET;
 #[cfg(feature = "testnet")]
 pub const BASE_RETURN_PARAMS: BaseParams = super::base_read::BASE_SEPOLIA;
 
+/// The anchor of the light client of the L1 Base settles on, in force from
+/// the return-over-Base height on ([`DestinationRules::effective_at`]): none
+/// on the public network yet.
+#[cfg(not(feature = "testnet"))]
+pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = None;
+/// The test chain's: Sepolia's sync committee of period 1 409 (from slot
+/// 11 542 528, 2026-11-09), finalized when read on 2026-11-10 19:40 UTC.
+/// Its root is the `hash_tree_root` of the next committee of the best update
+/// of period 1 408 served by `lodestar-sepolia.chainsafe.io`, whose 512
+/// public keys are, seat by seat, those publicnode's Sepolia beacon API
+/// gives for that committee (`states/finalized/sync_committees?epoch=360704`
+/// then `states/finalized/validators`); checked by
+/// `jetsam_guardian::light_feed` on both answers, kept in its fixtures.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = Some(L1Anchor {
+    period: 1_409,
+    committee_root: [
+        0x2e, 0x9d, 0x35, 0x9d, 0x79, 0xf4, 0x0d, 0x0b, 0xd6, 0x5e, 0xb7, 0x38, 0x33, 0x2c, 0xd9,
+        0xd9, 0xd1, 0x99, 0x9a, 0x23, 0xf7, 0x41, 0xe9, 0x96, 0xe3, 0xe0, 0x76, 0x6d, 0x6c, 0x37,
+        0xba, 0xbc,
+    ],
+});
+/// **Private builds only**: none (the rehearsal's return over Base is dormant).
+#[cfg(feature = "rehearsal-v1-7")]
+pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = None;
+
+/// The bridge on Base the return reads under a Base state root, in force from
+/// the return-over-Base height on: none on the public network yet.
+#[cfg(not(feature = "testnet"))]
+pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
+/// The test chain's: TN1's test bridge on Base Sepolia (`TN1_READY_BRIDGE.txt`,
+/// computed offline before its deployment: CREATE2 address and runtime code
+/// hash with its immutables), `withdrawals` at slot 9 and `genesisId` at
+/// slot 13 (`JetsamBridge.sol` of `v3-tn1` 69941b0, unchanged layout).
+/// **`genesis_id` is zero until the bridge's `initGenesis`**: a zero pin
+/// matches no installed genesis, so nothing is payable until it is written
+/// here (and in the test that pins it), with the address and code hash read
+/// again on the deployed contract.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
+    address: [
+        0x52, 0x21, 0x24, 0x5d, 0xeb, 0x99, 0x77, 0x1d, 0xd7, 0x6c, 0xcf, 0x78, 0x5f, 0xd3, 0x9a,
+        0x5d, 0x4f, 0x69, 0x22, 0x54,
+    ],
+    code_hash: [
+        0xec, 0x2c, 0x82, 0x24, 0x96, 0x80, 0xd9, 0x25, 0xcf, 0x87, 0x18, 0x55, 0x0e, 0x5c, 0xe3,
+        0x55, 0x73, 0xba, 0xe8, 0xec, 0xc0, 0xa8, 0xaf, 0xb2, 0x54, 0x6d, 0x97, 0xe9, 0x89, 0x83,
+        0x9f, 0x75,
+    ],
+    withdrawals_slot: 9,
+    genesis_id_slot: 13,
+    genesis_id: [0u8; 32],
+});
+/// **Private builds only**: none.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
+
 /// The return over Base (D94, D101, D107): its height, the L1 it reads from
-/// that height on, Base's pinned contracts there, the advance. The bridge it
-/// reads under the Base state root is [`DestinationRules::bridge`].
+/// that height on, Base's pinned contracts there, the advance. From its
+/// height on, its anchor and bridge (when set) take the place of the L1's
+/// ([`DestinationRules::effective_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseReturnRules {
     /// [`V1_7_BASE_RETURN_HEIGHT`]: `None` on every profile until armed.
@@ -213,6 +271,9 @@ pub struct BaseReturnRules {
     pub advance: AdvanceRules,
     /// The fast lane (D127, D130): its keys and horizon.
     pub fast: FastLaneRules,
+    /// [`BASE_RETURN_ANCHOR`], [`BASE_RETURN_BRIDGE`].
+    pub anchor: Option<L1Anchor>,
+    pub bridge: Option<L1BridgeParams>,
 }
 
 impl BaseReturnRules {
@@ -222,6 +283,8 @@ impl BaseReturnRules {
         base: BASE_RETURN_PARAMS,
         advance: AdvanceRules::CONSENSUS,
         fast: FastLaneRules::CONSENSUS,
+        anchor: BASE_RETURN_ANCHOR,
+        bridge: BASE_RETURN_BRIDGE,
     };
 
     pub const fn active_at(&self, height: u64) -> bool {
@@ -253,12 +316,21 @@ impl DestinationRules {
     };
 
     /// The rules a block at `height` is judged by: from the return-over-Base
-    /// height on, the light client reads the L1 Base settles on; below it
-    /// (and under a dormant height), these rules unchanged.
+    /// height on, the light client reads the L1 Base settles on, from the
+    /// return's anchor and with the return's bridge when it has them; below
+    /// it (and under a dormant height), these rules unchanged.
     pub const fn effective_at(&self, height: u64) -> Self {
         if self.base_return.active_at(height) {
             Self {
                 network: self.base_return.network,
+                anchor: match self.base_return.anchor {
+                    Some(anchor) => Some(anchor),
+                    None => self.anchor,
+                },
+                bridge: match self.base_return.bridge {
+                    Some(bridge) => Some(bridge),
+                    None => self.bridge,
+                },
                 ..*self
             }
         } else {
@@ -2569,7 +2641,9 @@ impl<'a> SnapshotDestinationCheck<'a> {
     ) -> Self {
         Self {
             file,
-            rules,
+            // The committees of a tip at or above the return-over-Base height
+            // start from the return's anchor.
+            rules: rules.effective_at(tip),
             tip,
             floor,
             released: ReleasedSet::new(),

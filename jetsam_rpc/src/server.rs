@@ -3485,8 +3485,11 @@ impl JetsamApiServer for RpcHandler {
     async fn get_destination_committee(
         &self,
     ) -> RpcResult<crate::destination::DestinationCommitteeResponse> {
-        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
         let chain = self.chain.read().await;
+        // The next block's rules: from the return-over-Base height on, its
+        // anchor and bridge.
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current()
+            .effective_at(chain.tip_height().saturating_add(1));
         let keys = chain.committee_keys();
         Ok(crate::destination::destination_committee(
             chain.destination_state(),
