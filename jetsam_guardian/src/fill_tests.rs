@@ -747,14 +747,21 @@ fn parameters_below_their_floors_are_refused() {
     assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_ok());
     p.confirmations = 7;
     assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_err());
-    // D148: the public test chain is mined by its operator alone: it may lift the concentration halt, never the
-    // pause after a switch; the mainnet keeps the 55 % ceiling
+    // D148: the public test chain is mined by its operator alone: it may lift the concentration halt; the mainnet
+    // keeps the 55 % ceiling
     let mut t = FillParams::default();
     t.share_halt_pct = 100;
     assert!(t.check(crate::Profile::PublicTestnet, 3_000_000, 25).is_ok());
     assert!(t.check(crate::Profile::Mainnet, 3_000_000, 25).is_err());
-    t.switch_pause_secs = 21_599;
+    // D153: its pause after a switch follows its slow delay (1 h, D_SLOW of the test bridge): a quarter of it, 900 s,
+    // as 6 h is a quarter of the mainnet's 24 h; never shorter there, and the mainnet keeps 6 h
+    t.switch_pause_secs = 900;
+    assert!(t.check(crate::Profile::PublicTestnet, 3_000_000, 25).is_ok());
+    t.switch_pause_secs = 899;
     assert!(t.check(crate::Profile::PublicTestnet, 3_000_000, 25).is_err());
+    let mut m = FillParams::default();
+    m.switch_pause_secs = 900;
+    assert!(m.check(crate::Profile::Mainnet, 3_000_000, 25).is_err());
 }
 
 // ---------------------------------------------------------------- evidence and journal

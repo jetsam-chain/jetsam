@@ -67,6 +67,8 @@ pub const CONFIRMATIONS_FLOOR: u64 = 8;
 pub const MIN_NODES_FLOOR: usize = 2;
 /// On the public networks the pause after a branch switch of the contract lasts at least 6 h.
 pub const SWITCH_PAUSE_FLOOR: u64 = 21_600;
+/// D153: on the public test chain (D_SLOW 1 h), a quarter of its slow delay, as 6 h is of the mainnet's 24 h.
+pub const TESTNET_SWITCH_PAUSE_FLOOR: u64 = 900;
 /// The user's rule: above 55 % of the blocks to one miner address, no advance (public networks).
 pub const SHARE_HALT_CEIL: u64 = 55;
 
@@ -337,7 +339,9 @@ impl FillParams {
             // D148: the public test chain is mined by its operator alone, its concentration halt may be lifted
             let ceil = if profile == crate::Profile::PublicTestnet { 100 } else { SHARE_HALT_CEIL };
             anyhow::ensure!(self.share_halt_pct <= ceil, "share_halt_pct {} is above {ceil} on {profile}", self.share_halt_pct);
-            anyhow::ensure!(self.switch_pause_secs >= SWITCH_PAUSE_FLOOR, "switch_pause_secs {} is below {SWITCH_PAUSE_FLOOR} on {profile}", self.switch_pause_secs);
+            // D153: on the public test chain the pause follows its slow delay (1 h): a quarter of it, as on the mainnet
+            let floor = if profile == crate::Profile::PublicTestnet { TESTNET_SWITCH_PAUSE_FLOOR } else { SWITCH_PAUSE_FLOOR };
+            anyhow::ensure!(self.switch_pause_secs >= floor, "switch_pause_secs {} is below {floor} on {profile}", self.switch_pause_secs);
         } else {
             anyhow::ensure!(self.share_halt_pct <= 100, "share_halt_pct {} above 100", self.share_halt_pct);
         }
