@@ -35,9 +35,10 @@ pub enum OnionMode {
     Guardian,
 }
 
-/// The `[network.onion]` section as written by the operator.
+/// The `[network.onion]` section as written by the operator. C-1: a key it does not know
+/// is refused (a misspelt `enabled` or `mode` is never dropped in silence).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OnionConfig {
     /// Off unless the operator turns it on.
     pub enabled: bool,
@@ -144,9 +145,17 @@ impl OnionConfig {
         *self == Self::default()
     }
 
-    /// `Ok(None)` when disabled; the validated settings otherwise.
+    /// `Ok(None)` when disabled; the validated settings otherwise. C-1: a guardian never falls
+    /// back to clearnet: `mode = "guardian"` without `enabled = true` is an error (no start).
     pub fn validate(&self) -> Result<Option<OnionSettings>, OnionError> {
         if !self.enabled {
+            if self.mode == OnionMode::Guardian {
+                return Err(OnionError::Config(
+                    "mode = \"guardian\" without enabled = true: a guardian never runs on clearnet; \
+                     set enabled = true in [network.onion]"
+                        .into(),
+                ));
+            }
             return Ok(None);
         }
         let control = loopback_endpoint("onion control", &self.control)?;
@@ -339,5 +348,47 @@ mod tests {
         for config in refused {
             assert!(config.validate().is_err(), "{config:?} accepted");
         }
+    }
+
+    /// C-1 (audit 2026-11-10): a guardian never falls back to clearnet. `mode = "guardian"`
+    /// without `enabled = true` (the README's example) is refused, not a clearnet node; so is
+    /// a key the section does not know (a misspelt `enabled` or `mode` would otherwise be
+    /// dropped in silence).
+    #[test]
+    fn a_guardian_section_that_is_not_enabled_or_misspelt_is_refused_never_clearnet() {
+        for text in [
+            r#"{"mode": "guardian"}"#,
+            r#"{"mode": "exclusive"}"#,
+            r#"{"enabled": false, "mode": "guardian"}"#,
+        ] {
+            let config: OnionConfig = serde_json::from_str(text).unwrap();
+            match config.validate() {
+                Err(OnionError::Config(message)) => assert!(
+                    message.contains("guardian") && message.contains("enabled = true"),
+                    "{text}: {message}"
+                ),
+                other => panic!("{text}: {other:?} (a guardian would run on clearnet)"),
+            }
+        }
+        for text in [
+            r#"{"enabeld": true, "mode": "guardian"}"#,
+            r#"{"enabled": true, "mdoe": "guardian"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<OnionConfig>(text).is_err(),
+                "{text}: an unknown key is refused"
+            );
+        }
+        // Enabled, it is the onion-only guardian.
+        let settings = OnionConfig {
+            mode: OnionMode::Guardian,
+            ..enabled()
+        }
+        .validate()
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings.mode, OnionMode::Guardian);
+        // A disabled dual-mode section stays no obstacle.
+        assert_eq!(OnionConfig::default().validate().unwrap(), None);
     }
 }

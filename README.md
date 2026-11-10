@@ -575,8 +575,9 @@ bounded number of reservations and circuits.
 
 When AutoNAT concludes that peers cannot dial the node and `public_addresses`
 is empty, the node logs one warning, naming the port to forward. A guardian
-(`[network.onion] mode = "guardian"`) runs no AutoNAT and refuses any public
-address, so this does not apply to it.
+(`[network.onion]` with `enabled = true` and `mode = "guardian"`; without
+`enabled = true` the node refuses to start) runs no AutoNAT and refuses any
+public address, so this does not apply to it.
 
 ### CLI
 
