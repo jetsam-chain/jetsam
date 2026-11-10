@@ -419,3 +419,309 @@ fn the_fast_lanes_records_are_read_from_get_fast_lane() {
     );
     assert_eq!(fast_paid_of(&json!({"active": false})).unwrap(), vec![]);
 }
+
+// ---------------------------------------------------------------------------
+// The captures, in their own thread, follow Base's head
+// ---------------------------------------------------------------------------
+
+/// Base's public RPC for the captures: its head moves 5 blocks per second
+/// (in seconds of `ms_per_second` real milliseconds) from `h0`; it serves a
+/// block and the proofs at it only from its head down to `serve` blocks
+/// behind it (a public RPC: ≈ 200 blocks, ≈ 40 s), never above its head
+/// (asking one is recorded); the bridge's burn is at block `burn_block`.
+struct LiveBase {
+    w: World,
+    h0: std::sync::atomic::AtomicU64,
+    started: Instant,
+    ms_per_second: u64,
+    serve: u64,
+    burn_block: u64,
+    above_head: Mutex<Vec<u64>>,
+    asked: Mutex<Vec<u64>>,
+}
+
+impl LiveBase {
+    fn new(h0: u64, ms_per_second: u64, serve: u64, burn_block: u64) -> Self {
+        Self {
+            w: world(),
+            h0: h0.into(),
+            started: Instant::now(),
+            ms_per_second,
+            serve,
+            burn_block,
+            above_head: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn head(&self) -> u64 {
+        self.h0.load(std::sync::atomic::Ordering::SeqCst) + 5 * self.started.elapsed().as_millis() as u64 / self.ms_per_second
+    }
+
+    fn served(&self, block: u64) -> anyhow::Result<()> {
+        let head = self.head();
+        if block > head {
+            self.above_head.lock().unwrap().push(block);
+            bail!("header not found");
+        }
+        if head - block > self.serve {
+            bail!("missing trie node (state not available)");
+        }
+        Ok(())
+    }
+}
+
+fn quantity_of(v: &Value) -> u64 {
+    u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+}
+
+impl BaseRpc for LiveBase {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let w = &self.w;
+        match method {
+            "eth_blockNumber" => Ok(json!(format!("0x{:x}", self.head()))),
+            "eth_getLogs" => {
+                let (from, to) = (quantity_of(&params[0]["fromBlock"]), quantity_of(&params[0]["toBlock"]));
+                if to > self.head() {
+                    self.above_head.lock().unwrap().push(to);
+                }
+                if !(from..=to).contains(&self.burn_block) {
+                    return Ok(json!([]));
+                }
+                let mut n = [0u8; 32];
+                n[24..].copy_from_slice(&w.burn.n.to_be_bytes());
+                let mut amount = [0u8; 32];
+                amount[24..].copy_from_slice(&w.burn.amount.to_be_bytes());
+                Ok(json!([{
+                    "address": word_hex(&w.bridge.address),
+                    "topics": [word_hex(&burned_topic()), word_hex(&n), word_hex(&[0u8; 32])],
+                    "data": format!("0x{}{}", hex::encode(w.burn.owner.0), hex::encode(amount)),
+                    "blockNumber": format!("0x{:x}", self.burn_block),
+                    "removed": false,
+                }]))
+            }
+            "eth_getBlockByNumber" => {
+                let block = quantity_of(&params[0]);
+                self.asked.lock().unwrap().push(block);
+                self.served(block)?;
+                Ok(json!({
+                    "number": format!("0x{block:x}"),
+                    "hash": word_hex(&w.preimage.block_hash),
+                    "stateRoot": word_hex(&w.preimage.state_root),
+                    "withdrawalsRoot": word_hex(&w.preimage.message_passer_storage_root),
+                    "timestamp": format!("0x{:x}", T - 60),
+                }))
+            }
+            "eth_getProof" => {
+                self.served(quantity_of(&params[2]))?;
+                let nodes = |n: &[Vec<u8>]| n.iter().map(|x| word_hex(x)).collect::<Vec<_>>();
+                let storage: Vec<Value> = params[1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|k| {
+                        let key = crate::base_capture::hex32_of(k.as_str().unwrap()).unwrap();
+                        if key == genesis_slot(w.bridge.genesis_id_slot) {
+                            json!({"key": k, "value": word_hex(&w.bridge.genesis_id), "proof": nodes(&w.genesis)})
+                        } else {
+                            assert_eq!(key, withdrawal_slot(w.burn.n, w.bridge.withdrawals_slot));
+                            json!({"key": k, "value": word_hex(&withdrawal_commitment(&w.burn.owner.0, w.burn.amount)), "proof": nodes(&w.withdrawal)})
+                        }
+                    })
+                    .collect();
+                Ok(json!({"address": word_hex(&w.bridge.address), "accountProof": nodes(&w.account), "storageProof": storage}))
+            }
+            other => bail!("unexpected {other}"),
+        }
+    }
+}
+
+/// A proposal block of the tests (the anchor).
+const A: u64 = 57_143_063;
+
+fn holds_the_burn(w: &World, c: &Capture) -> bool {
+    c.storage.iter().any(|s| s.key == withdrawal_slot(w.burn.n, w.bridge.withdrawals_slot))
+}
+
+/// THE DECOUPLING: during a walk of the ancestors that takes 5 minutes and
+/// a half (330 calls of 1 s, batches refused), the captures, in their own
+/// thread every 10 s, capture each of the 5 proposal blocks that appear
+/// (proposals every 60 s here, to see five) within the 40 s the RPC serves
+/// it, with the burn seen before it; no block above the head is asked.
+/// Time: 1 s = 20 ms.
+#[test]
+fn a_five_minute_walk_misses_no_capture_the_captures_follow_bases_head_in_their_own_thread() {
+    const MS: u64 = 20;
+    let interval = 300;
+    let base = LiveBase::new(A - 150, MS, 200, A - 100);
+    let w = world();
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let state = Mutex::new(RunState {
+        scanned_to: Some(A - 1_000),
+        proposal_anchor: Some(A),
+        ..RunState::default()
+    });
+    let mut l1 = crate::fast::tests::ChainL1::new(110, false);
+    l1.delay = Duration::from_millis(MS);
+    let ticks = std::sync::atomic::AtomicUsize::new(0);
+    let tick = || {
+        capture_tick(&base, &w.bridge, 0, interval, crate::base_capture::CAPTURE_WINDOW_BLOCKS, &state, &state_file, &captures, T)
+            .expect("a tick");
+        ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (walked, took) = with_captures(Duration::from_millis(10 * MS), tick, |alive| {
+        let started = Instant::now();
+        let mut parents = crate::fast::ParentCache::new();
+        let views = crate::fast::read_ancestors(&l1, &jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA, crate::fast::tests::g(1), "latest", &mut parents, &mut |_, _| {})
+            .expect("walked")
+            .0;
+        assert!(alive());
+        (views.len(), started.elapsed())
+    });
+    assert_eq!(walked, 110);
+    assert!(took >= Duration::from_millis(330 * MS), "the walk took {took:?}: not 5 minutes and a half");
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) >= 30, "captures every 10 s during the walk");
+    for k in 0..5 {
+        let block = A + k * interval;
+        let capture = load(&captures, block).unwrap().unwrap_or_else(|| panic!("proposal block {block} (k = {k}) not captured during the walk"));
+        assert!(holds_the_burn(&w, &capture), "block {block}: captured without the burn seen before it");
+    }
+    assert!(base.above_head.lock().unwrap().is_empty(), "asked above the head: {:?}", base.above_head.lock().unwrap());
+    assert!(lock(&state).burns.contains_key(&w.burn.n));
+}
+
+/// A tick asks the proposal blocks at or below the head only, the newest
+/// first, and what it captured is never asked again.
+#[test]
+fn a_tick_never_asks_a_block_above_bases_head_and_asks_the_newest_first() {
+    let base = LiveBase::new(A + 150, u64::MAX / 8, 200, 0);
+    let w = world();
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let state = Mutex::new(RunState {
+        scanned_to: Some(A + 1_000),
+        proposal_anchor: Some(A),
+        ..RunState::default()
+    });
+    let tick = || capture_tick(&base, &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
+    let first = tick();
+    assert_eq!(first.head, A + 150);
+    assert_eq!(first.capture.captured, vec![A]);
+    assert_eq!(first.capture.refused.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![A - 300]);
+    // (Proposals every 300 blocks: the next one is always near, a block 750 behind waits.)
+    assert_eq!(first.deferred, vec![A - 600]);
+    assert_eq!(*base.asked.lock().unwrap(), vec![A, A - 300]);
+    // One block below the next proposal: nothing new is asked.
+    base.h0.store(A + 299, std::sync::atomic::Ordering::SeqCst);
+    base.asked.lock().unwrap().clear();
+    let second = tick();
+    assert!(second.capture.captured.is_empty());
+    assert_eq!(*base.asked.lock().unwrap(), vec![A - 300]);
+    // The proposal block is the head: asked at once, first.
+    base.h0.store(A + 300, std::sync::atomic::Ordering::SeqCst);
+    base.asked.lock().unwrap().clear();
+    let third = tick();
+    assert_eq!(third.capture.captured, vec![A + 300]);
+    assert_eq!(base.asked.lock().unwrap()[0], A + 300);
+    assert!(base.above_head.lock().unwrap().is_empty(), "asked above the head: {:?}", base.above_head.lock().unwrap());
+}
+
+/// A block still not captured 2 minutes after it appeared is asked again
+/// only while the next proposal block is more than 2 minutes away: its slow
+/// retries never delay a new block (the real schedule: 6 000 blocks).
+#[test]
+fn an_old_block_is_asked_again_only_while_the_next_proposal_block_is_far() {
+    let base = LiveBase::new(A + 3_000, u64::MAX / 8, 200, 0);
+    let w = world();
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let state = Mutex::new(RunState {
+        scanned_to: Some(A + 100_000),
+        proposal_anchor: Some(A),
+        ..RunState::default()
+    });
+    let (interval, window) = (crate::base_capture::PROPOSAL_INTERVAL_BLOCKS, crate::base_capture::CAPTURE_WINDOW_BLOCKS);
+    let tick = || capture_tick(&base, &w.bridge, 0, interval, window, &state, &state_file, &captures, T).unwrap();
+    let at = |head: u64| {
+        base.h0.store(head, std::sync::atomic::Ordering::SeqCst);
+        base.asked.lock().unwrap().clear();
+        let report = tick();
+        (report, base.asked.lock().unwrap().clone())
+    };
+    // The next proposal 3 000 blocks away: the old block A is asked (and refused: too old).
+    let (report, asked) = at(A + 3_000);
+    assert_eq!((asked, report.deferred), (vec![A], vec![]));
+    // 500 blocks away (100 s): A waits.
+    let (report, asked) = at(A + 5_500);
+    assert_eq!((asked, report.deferred), (vec![], vec![A]));
+    // The proposal block itself: asked first, then A again (the next one is 6 000 blocks away).
+    let (report, asked) = at(A + 6_000);
+    assert_eq!(asked, vec![A + 6_000, A]);
+    assert_eq!(report.capture.captured, vec![A + 6_000]);
+}
+
+/// A tick reads the burns up to the head BEFORE it captures: a burn just
+/// before a proposal block is in that block's capture; the burns and the
+/// block scanned to are kept on disk.
+#[test]
+fn a_burn_is_seen_before_the_proposal_block_after_it_is_captured() {
+    let base = LiveBase::new(A + 10, u64::MAX / 8, 200, A - 3);
+    let w = world();
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let state = Mutex::new(RunState {
+        scanned_to: Some(A - 200),
+        proposal_anchor: Some(A),
+        ..RunState::default()
+    });
+    let report = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &state_file, &captures, T).unwrap();
+    assert_eq!(report.burns.iter().map(|b| (b.burn.n, b.block)).collect::<Vec<_>>(), vec![(w.burn.n, A - 3)]);
+    assert_eq!(report.capture.captured, vec![A]);
+    assert!(holds_the_burn(&w, &load(&captures, A).unwrap().unwrap()));
+    let kept = RunState::load(&state_file).unwrap();
+    assert_eq!(kept.scanned_to, Some(A + 10));
+    assert!(kept.burns.contains_key(&w.burn.n));
+    // Without a proposal block known yet, a tick reads the burns and captures nothing.
+    let none = Mutex::new(RunState { scanned_to: Some(A - 200), ..RunState::default() });
+    let report = capture_tick(&base, &w.bridge, 0, 300, 100, &none, &dir.path().join("other.json"), &dir.path().join("other"), T).unwrap();
+    assert_eq!(report.burns.len(), 1);
+    assert!(report.capture.captured.is_empty() && report.capture.refused.is_empty());
+}
+
+/// Each pass says when it begins and when it ends, how long it took and what
+/// it did, or why it failed (what was done is then kept); the passes stop
+/// when the captures stopped; `once` is one pass.
+#[test]
+fn each_pass_says_when_it_begins_and_ends_how_long_it_took_and_why_it_failed() {
+    let lines = Mutex::new(Vec::<String>::new());
+    let say = |line: &str| lines.lock().unwrap().push(line.to_string());
+    let (errors, checks) = (Cell::new(0), Cell::new(0));
+    let alive = || {
+        checks.set(checks.get() + 1);
+        checks.get() <= 3
+    };
+    let mut pass = |n: u64| -> anyhow::Result<String> {
+        if n == 2 {
+            bail!("empty answer from http://127.0.0.1:8546")
+        }
+        Ok(format!("games #{n}"))
+    };
+    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &alive, || errors.set(errors.get() + 1));
+    assert!(stopped.unwrap_err().to_string().contains("the captures stopped"));
+    assert_eq!(errors.get(), 1);
+    let lines = lines.into_inner().unwrap();
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[0], "pass 1 begins");
+    assert!(lines[1].starts_with("pass 1 done in ") && lines[1].ends_with(" s: games #1"), "{}", lines[1]);
+    assert_eq!(lines[2], "pass 2 begins");
+    assert!(
+        lines[3].starts_with("ALERT FAST_RUN pass 2 failed after ") && lines[3].contains("empty answer from http://127.0.0.1:8546"),
+        "{}",
+        lines[3]
+    );
+    assert!(lines[5].starts_with("pass 3 done in "));
+    let once = Mutex::new(0);
+    run_passes(&|_| *once.lock().unwrap() += 1, &mut |_| Ok(String::new()), true, Duration::ZERO, &|| true, || {}).unwrap();
+    assert_eq!(*once.lock().unwrap(), 2);
+}

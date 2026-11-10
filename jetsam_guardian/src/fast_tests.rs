@@ -306,3 +306,235 @@ fn fast_keygen_writes_a_0600_secret_and_gives_its_public_key() {
     std::fs::set_permissions(&junk, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     assert!(load_fast_secret(&junk).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The ancestors' walk on an L1 that holds a chain of games
+// ---------------------------------------------------------------------------
+
+/// Game `k` of the chain the mock L1 holds.
+pub(crate) fn g(k: usize) -> [u8; 20] {
+    let mut a = [0u8; 20];
+    a[0] = 0x6a;
+    a[16..].copy_from_slice(&(k as u32).to_be_bytes());
+    a
+}
+
+fn k_of(a: &[u8; 20]) -> usize {
+    assert_eq!(a[..16], g(0)[..16], "a game of the chain");
+    u32::from_be_bytes(a[16..].try_into().unwrap()) as usize
+}
+
+/// An L1 holding games `g(1)`, `g(2)`, …: `g(k)`'s parent is `g(k + 1)`;
+/// all in progress but `g(n)`, resolved for the defender. It records each
+/// read (game, what) and each request; it takes JSON-RPC batches unless
+/// `batches` is false; each single call takes `delay`; reading the status of
+/// `fail` is an error (a connection reset).
+pub(crate) struct ChainL1 {
+    pub(crate) status: std::cell::RefCell<BTreeMap<[u8; 20], u8>>,
+    pub(crate) blacklisted: std::cell::RefCell<std::collections::BTreeSet<[u8; 20]>>,
+    pub(crate) asked: std::cell::RefCell<Vec<([u8; 20], &'static str)>>,
+    pub(crate) requests: std::cell::Cell<usize>,
+    pub(crate) fail: std::cell::Cell<Option<[u8; 20]>>,
+    pub(crate) batches: bool,
+    pub(crate) delay: std::time::Duration,
+}
+
+impl ChainL1 {
+    pub(crate) fn new(n: usize, batches: bool) -> Self {
+        let status = (1..=n)
+            .map(|k| (g(k), if k == n { GAME_STATUS_DEFENDER_WINS } else { GAME_STATUS_IN_PROGRESS }))
+            .collect();
+        Self {
+            status: std::cell::RefCell::new(status),
+            blacklisted: Default::default(),
+            asked: Default::default(),
+            requests: Default::default(),
+            fail: Default::default(),
+            batches,
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    fn answer(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+        assert_eq!(method, "eth_call");
+        assert_eq!(params[1], json!("latest"), "the ancestors are read at the latest block");
+        let to = hex20(params[0]["to"].as_str().unwrap()).unwrap();
+        let data = hex::decode(params[0]["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let word = |w: [u8; 32]| json!(format!("0x{}", hex::encode(w)));
+        if data[..4] == selector("isGameBlacklisted(address)") {
+            assert_eq!(to, BASE_SEPOLIA.anchor_state_registry);
+            let game: [u8; 20] = data[16..36].try_into().unwrap();
+            self.asked.borrow_mut().push((game, "blacklisted"));
+            return Ok(word(word_u64(u64::from(self.blacklisted.borrow().contains(&game)))));
+        }
+        let k = k_of(&to);
+        if data[..4] == selector("status()") {
+            if self.fail.get() == Some(to) {
+                bail!("Connection reset by peer");
+            }
+            self.asked.borrow_mut().push((to, "status"));
+            // Past the chain: older games, resolved.
+            let status = self.status.borrow().get(&to).copied().unwrap_or(GAME_STATUS_DEFENDER_WINS);
+            return Ok(word(word_u64(u64::from(status))));
+        }
+        if data[..4] == selector("parentAddress()") {
+            self.asked.borrow_mut().push((to, "parent"));
+            return Ok(word(word_address(&g(k + 1))));
+        }
+        panic!("unexpected call {}", hex::encode(&data[..4]));
+    }
+
+    pub(crate) fn asked(&self, what: &str) -> Vec<[u8; 20]> {
+        self.asked.borrow().iter().filter(|(_, w)| *w == what).map(|(g, _)| *g).collect()
+    }
+
+    fn forget(&self) {
+        self.asked.borrow_mut().clear();
+        self.requests.set(0);
+    }
+}
+
+impl BaseRpc for ChainL1 {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.requests.set(self.requests.get() + 1);
+        std::thread::sleep(self.delay);
+        self.answer(method, &params)
+    }
+
+    fn rpc_batch(&self, calls: &[(&str, Value)]) -> anyhow::Result<Vec<Value>> {
+        self.requests.set(self.requests.get() + 1);
+        if !self.batches {
+            bail!("batch requests are not supported");
+        }
+        calls.iter().map(|(m, p)| self.answer(m, p)).collect()
+    }
+}
+
+fn walk(l1: &ChainL1, parents: &mut ParentCache) -> (Vec<AncestorView>, WalkStats) {
+    read_ancestors(l1, &BASE_SEPOLIA, g(1), "latest", parents, &mut |_, _| {}).expect("walked")
+}
+
+/// The parent of an ancestor is read once; its status and its blacklisting
+/// in every walk, [`ANCESTOR_BATCH`] ancestors per request.
+#[test]
+fn every_walk_reads_each_ancestors_status_and_blacklisting_again_and_its_parent_once() {
+    let l1 = ChainL1::new(120, true);
+    let mut parents = ParentCache::new();
+    let mut told = Vec::new();
+    let (first, stats) =
+        read_ancestors(&l1, &BASE_SEPOLIA, g(1), "latest", &mut parents, &mut |s, _| told.push(s.ancestors)).unwrap();
+    assert_eq!(first.len(), 120);
+    assert_eq!(first.iter().map(|v| v.game).collect::<Vec<_>>(), (1..=120).map(g).collect::<Vec<_>>());
+    assert_eq!(first[119].status, GAME_STATUS_DEFENDER_WINS);
+    assert_eq!(told, (1..=120).collect::<Vec<_>>());
+    // Nothing known: one request per ancestor, its parent with it.
+    assert_eq!((stats.parents_read, stats.requests, stats.calls), (120, 120, 360));
+    assert_eq!(parents.len(), 120);
+    // The next walk: no parent read again, three requests for 120 ancestors (the last one also reads
+    // g(121), the resolved one's parent, known: harmless).
+    l1.forget();
+    let (second, stats) = walk(&l1, &mut parents);
+    assert_eq!(second, first);
+    assert!(l1.asked("parent").is_empty());
+    assert_eq!((stats.parents_read, stats.requests, stats.calls, stats.batches_refused), (0, 3, 242, 0));
+    assert_eq!(l1.requests.get(), 3);
+    // THE RULE: every ancestor returned had its status and its blacklisting read in this walk.
+    for v in &second {
+        assert!(l1.asked("status").contains(&v.game), "status of 0x{} not read again", hex::encode(v.game));
+        assert!(l1.asked("blacklisted").contains(&v.game), "blacklisting of 0x{} not read again", hex::encode(v.game));
+    }
+}
+
+/// What changes after a walk (a challenger's win, a blacklisting, of an
+/// ancestor in progress or of the resolved one the walk stops at) is seen by
+/// the next walk, and the game is not signed.
+#[test]
+fn a_challengers_win_or_a_blacklisting_after_a_walk_is_seen_by_the_next_and_nothing_is_signed() {
+    let l1 = ChainL1::new(120, true);
+    let mut parents = ParentCache::new();
+    let signed = |parents: &mut ParentCache| verdict(&real_game(), &bases(), &walk(&l1, parents).0);
+    assert!(signed(&mut parents).is_ok());
+    l1.status.borrow_mut().insert(g(60), GAME_STATUS_CHALLENGER_WINS);
+    assert_eq!(signed(&mut parents), Err(Refusal::AncestorChallenged(g(60))));
+    l1.status.borrow_mut().insert(g(60), GAME_STATUS_IN_PROGRESS);
+    l1.blacklisted.borrow_mut().insert(g(30));
+    assert_eq!(signed(&mut parents), Err(Refusal::AncestorBlacklisted(g(30))));
+    l1.blacklisted.borrow_mut().clear();
+    l1.blacklisted.borrow_mut().insert(g(120));
+    assert_eq!(signed(&mut parents), Err(Refusal::AncestorBlacklisted(g(120))));
+    l1.blacklisted.borrow_mut().clear();
+    // The chain resolved further down: the walk stops at the first resolved ancestor.
+    l1.status.borrow_mut().insert(g(40), GAME_STATUS_DEFENDER_WINS);
+    let (views, _) = walk(&l1, &mut parents);
+    assert_eq!(views.len(), 40);
+    assert!(signed(&mut parents).is_ok());
+}
+
+/// A walk that fails keeps the parents it read (handed to `keep` every 50
+/// ancestors and at the end); after a restart they are read back from the
+/// file, and only the missing ones are read. The walk says when it begins,
+/// every 50 ancestors, and when it ends.
+#[test]
+fn the_parents_are_kept_across_a_failed_walk_and_a_restart_and_the_walk_says_how_far_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ancestors.json");
+    let l1 = ChainL1::new(120, true);
+    l1.fail.set(Some(g(75)));
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let say = |line: &str| lines.borrow_mut().push(line.to_string());
+    let mut parents = ParentCache::new();
+    let failed = walk_ancestors_logged(&l1, &BASE_SEPOLIA, 30_082, g(1), &mut parents, &say, &mut |p| {
+        store_parents(&path, p).unwrap()
+    });
+    assert!(failed.is_err());
+    assert_eq!(load_parents(&path).unwrap().len(), 74);
+    {
+        let lines = lines.borrow();
+        assert!(lines[0].starts_with("game #30082: walking its ancestors from 0x6a"), "{}", lines[0]);
+        assert!(lines.iter().any(|l| l.starts_with("game #30082: 50 ancestors read in")), "{lines:?}");
+        assert!(lines.last().unwrap().contains("the walk of its ancestors failed after"), "{lines:?}");
+        assert_eq!(lines.len(), 3);
+    }
+    // A restart: the parents from the file; only the 46 not known are read.
+    l1.fail.set(None);
+    l1.forget();
+    lines.borrow_mut().clear();
+    let mut parents = load_parents(&path).unwrap();
+    let views = walk_ancestors_logged(&l1, &BASE_SEPOLIA, 30_082, g(1), &mut parents, &say, &mut |p| {
+        store_parents(&path, p).unwrap()
+    })
+    .unwrap();
+    assert_eq!(views.len(), 120);
+    assert_eq!(l1.asked("parent"), (75..=120).map(g).collect::<Vec<_>>());
+    assert_eq!(load_parents(&path).unwrap(), parents);
+    assert_eq!(parents.len(), 120);
+    let lines = lines.borrow();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines[1].starts_with("game #30082: 50 ancestors read in"));
+    assert!(lines[2].starts_with("game #30082: 100 ancestors read in"));
+    assert!(
+        lines[3].starts_with("game #30082: 120 ancestors walked in") && lines[3].contains("46 parents read"),
+        "{}",
+        lines[3]
+    );
+    // An unreadable file is an error (fast-run then reads the parents again).
+    std::fs::write(&path, b"{\"parents\": 3}").unwrap();
+    assert!(load_parents(&path).is_err());
+    assert_eq!(load_parents(&dir.path().join("none.json")).unwrap(), ParentCache::new());
+}
+
+/// An endpoint that refuses batches is asked one call at a time: the same
+/// ancestors.
+#[test]
+fn a_refused_batch_is_asked_one_call_at_a_time() {
+    let batching = ChainL1::new(120, true);
+    let mut known = ParentCache::new();
+    walk(&batching, &mut known);
+    let reference = walk(&batching, &mut known).0;
+    let l1 = ChainL1::new(120, false);
+    let mut parents = known.clone();
+    let (views, stats) = walk(&l1, &mut parents);
+    assert_eq!(views, reference);
+    assert_eq!((stats.batches_refused, stats.requests, stats.calls), (3, 3 + 242, 242));
+    assert_eq!(l1.asked("status").len(), 121);
+}

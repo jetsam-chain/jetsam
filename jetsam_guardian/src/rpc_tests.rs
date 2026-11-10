@@ -384,3 +384,66 @@ fn a_raw_block_is_read_as_bytes_and_none_when_pruned() {
     assert_eq!(c.raw_block(6).unwrap(), None);
     server.join().unwrap();
 }
+
+/// Serves one connection: reads one whole request (head and Content-Length
+/// body), answers `body` with HTTP 200; the request.
+fn serve_once(body: String) -> (u16, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the whole request");
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw).to_string();
+            if let Some(i) = text.find("\r\n\r\n") {
+                let length: usize = text[..i]
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                    .unwrap();
+                if raw.len() >= i + 4 + length {
+                    break;
+                }
+            }
+        }
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        String::from_utf8_lossy(&raw).to_string()
+    });
+    (port, server)
+}
+
+/// A JSON-RPC batch is ONE request; its answers are matched by id (any
+/// order); an answer that is no list, misses or repeats an id, or holds an
+/// error is an error.
+#[test]
+fn a_json_rpc_batch_is_one_request_and_its_answers_are_matched_by_id() {
+    let calls = [("eth_call", json!([{"to": "0x01"}, "latest"])), ("eth_call", json!([{"to": "0x02"}, "latest"])), ("eth_chainId", json!([]))];
+    let (port, server) = serve_once(
+        r#"[{"jsonrpc":"2.0","id":2,"result":"0xaa36a7"},{"jsonrpc":"2.0","id":0,"result":"0x01"},{"jsonrpc":"2.0","id":1,"result":"0x02"}]"#.into(),
+    );
+    let url = format!("http://127.0.0.1:{port}");
+    let got = call_batch_via(&Egress::Clearnet, &url, &calls, Duration::from_secs(5)).unwrap();
+    assert_eq!(got, vec![json!("0x01"), json!("0x02"), json!("0xaa36a7")]);
+    let req = server.join().unwrap();
+    let body: Value = serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 3);
+    assert_eq!(body[2], json!({"jsonrpc": "2.0", "id": 2, "method": "eth_chainId", "params": []}));
+    for answer in [
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batch requests are not supported"}}"#,
+        r#"[{"jsonrpc":"2.0","id":0,"result":"0x01"},{"jsonrpc":"2.0","id":1,"result":"0x02"}]"#,
+        r#"[{"jsonrpc":"2.0","id":0,"result":"0x01"},{"jsonrpc":"2.0","id":0,"result":"0x01"},{"jsonrpc":"2.0","id":2,"result":"0x02"}]"#,
+        r#"[{"jsonrpc":"2.0","id":0,"result":"0x01"},{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"too many requests"}},{"jsonrpc":"2.0","id":2,"result":"0x02"}]"#,
+    ] {
+        let (port, server) = serve_once(answer.into());
+        let e = call_batch_via(&Egress::Clearnet, &format!("http://127.0.0.1:{port}"), &calls, Duration::from_secs(5));
+        assert!(e.is_err(), "{answer}");
+        server.join().unwrap();
+    }
+    // A single call is unchanged.
+    let (port, server) = serve_once(r#"{"jsonrpc":"2.0","id":1,"result":42}"#.into());
+    assert_eq!(call(&format!("http://127.0.0.1:{port}"), "eth_chainId", json!([]), Duration::from_secs(5)).unwrap(), json!(42));
+    server.join().unwrap();
+}
