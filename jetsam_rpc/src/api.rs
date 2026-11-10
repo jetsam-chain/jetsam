@@ -372,6 +372,21 @@ pub trait JetsamApi {
         fee_micro_jtm: Option<u64>,
     ) -> RpcResult<crate::destination::DestinationPaymentResponse>;
 
+    /// v1.7 (return over Base): build and prove, with the active wallet, the
+    /// advance of the burn `(n, owner, amount)`: `owner` paid `paid` µJTM
+    /// (the least the rule allows when none is given), the `JTMADV02` marker,
+    /// the change. Not submitted: pass `payment_hex` to `submitTxIntent`. The
+    /// vault repays the active address when the burn is released.
+    #[method(name = "walletBuildAdvance")]
+    async fn wallet_build_advance(
+        &self,
+        n: u64,
+        owner: String,
+        amount_micro_jtm: u64,
+        paid_micro_jtm: Option<u64>,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse>;
+
     /// v1.7 (F4): the deposit `walletBridgeDeposit` would build now, from the
     /// active address to the bridge vault for the Base/EVM `recipient` (`0x`
     /// and 40 hex digits; mixed case must match its checksum): fee

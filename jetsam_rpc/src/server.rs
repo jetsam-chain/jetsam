@@ -1398,6 +1398,88 @@ impl RpcHandler {
         result
     }
 
+    /// The transaction of the active wallet paying `payments`, then carrying
+    /// `marker` (value 0), then its change: proven, its inputs reserved until
+    /// mined (`walletBuildDestinationPayment`, `walletBuildAdvance`).
+    async fn build_marker_payment(
+        &self,
+        payments: Vec<([u8; 32], u64)>,
+        marker: jetsam_poseidon2b::primitives::Address,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse> {
+        let output_count = payments.len() + 2; // the payments, the marker and, at most, change
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints, required, next_height) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints =
+                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
+                    .map_err(rpc_err)?;
+            let required = crate::client_objects::client_payment_required_fee(
+                output_count as u64,
+                tip.active_slot_count,
+                tip.log_slots,
+            );
+            (
+                epoch_anchor,
+                tip.log_slots,
+                slot_hints,
+                required,
+                chain.tip_height().saturating_add(1),
+            )
+        };
+        if !jetsam_chain::consensus::destination::state::DestinationRules::current()
+            .active_at(next_height)
+        {
+            return Err(rpc_err("destination objects are carried from the v1.7 height only"));
+        }
+        let fee = fee_micro_jtm.unwrap_or(required);
+        let wallet = Arc::clone(&self.wallet);
+        let paid: u64 = payments.iter().map(|(_, amount)| amount).sum();
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    payments,
+                    marker.0,
+                    fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let txid = payment.logical_txid().0;
+        let output_slots: Vec<u32> = payment
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Held until mined, or until no block can include it any more, as a
+        // guardian object's payment.
+        self.wallet
+            .reserve_pending_submission(txid, &input_slots, &output_slots, paid, marker.0)
+            .map_err(rpc_err)?;
+        let built_at = self.chain.read().await.tip_height();
+        self.wallet.track_client_payment(txid, built_at);
+        Ok(crate::destination::DestinationPaymentResponse {
+            payment_hex: hex::encode(&intent_bytes),
+            txid: hex::encode(txid),
+            fee_micro_jtm: fee,
+            marker: hex::encode(marker.0),
+        })
+    }
+
     async fn reload_active_wallet(&self) -> RpcResult<WalletScanResult> {
         let preview = self.wallet.preview_active_reload().map_err(rpc_err)?;
         let (_address, scan) = self.install_wallet_activation(preview).await?;
@@ -3696,76 +3778,34 @@ impl JetsamApiServer for RpcHandler {
         if self.wallet.active_address().is_none() {
             return Err(rpc_err("no active wallet address"));
         }
-        let output_count = 2; // the marker and, at most, change
-        let reserved_outputs = self.mempool.reserved_output_slots().await;
-        let (epoch_anchor, log_slots, slot_hints, required, next_height) = {
-            let chain = self.chain.read().await;
-            let tip = chain.tip_header();
-            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
-                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
-            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
-            let slot_hints =
-                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
-                    .map_err(rpc_err)?;
-            let required = crate::client_objects::client_payment_required_fee(
-                output_count as u64,
-                tip.active_slot_count,
-                tip.log_slots,
-            );
-            (
-                epoch_anchor,
-                tip.log_slots,
-                slot_hints,
-                required,
-                chain.tip_height().saturating_add(1),
-            )
-        };
-        if !jetsam_chain::consensus::destination::state::DestinationRules::current()
-            .active_at(next_height)
-        {
-            return Err(rpc_err("destination objects are carried from the v1.7 height only"));
-        }
-        let fee = fee_micro_jtm.unwrap_or(required);
-        let wallet = Arc::clone(&self.wallet);
-        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
-            jetsam_miner::install_wallet_proof_cpu(|| {
-                wallet.build_client_payment(
-                    Vec::new(),
-                    marker.0,
-                    fee,
-                    epoch_anchor,
-                    slot_hints,
-                    log_slots,
-                )
-            })
-            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
-            .and_then(|result| result)
-        })
-        .await
-        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        self.build_marker_payment(Vec::new(), marker, fee_micro_jtm).await
+    }
+
+    async fn wallet_build_advance(
+        &self,
+        n: u64,
+        owner: String,
+        amount_micro_jtm: u64,
+        paid_micro_jtm: Option<u64>,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse> {
+        let (_, active) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        let advancer = parse_address_param(&active)?;
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let (payments, marker) = crate::destination::advance_plan(
+            n,
+            owner,
+            amount_micro_jtm,
+            paid_micro_jtm,
+            advancer,
+            &rules,
+        )
         .map_err(rpc_err)?;
-        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
-            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
-        let txid = payment.logical_txid().0;
-        let output_slots: Vec<u32> = payment
-            .pages
-            .iter()
-            .flat_map(|page| page.body.live_outputs())
-            .map(|(_, output)| output.slot_index)
-            .collect();
-        // Held until mined, or until no block can include it any more, as a
-        // guardian object's payment.
-        self.wallet
-            .reserve_pending_submission(txid, &input_slots, &output_slots, 0, marker.0)
-            .map_err(rpc_err)?;
-        let built_at = self.chain.read().await.tip_height();
-        self.wallet.track_client_payment(txid, built_at);
-        Ok(crate::destination::DestinationPaymentResponse {
-            payment_hex: hex::encode(&intent_bytes),
-            txid: hex::encode(txid),
-            fee_micro_jtm: fee,
-            marker: hex::encode(marker.0),
-        })
+        self.build_marker_payment(payments, marker, fee_micro_jtm).await
     }
 
     async fn wallet_plan_bridge_deposit(
@@ -5795,6 +5835,7 @@ mod rpc_access_tests {
         "jetsam_walletBuildClientPayment",
         "jetsam_walletBuildGuardianPayment",
         "jetsam_walletBuildDestinationPayment",
+        "jetsam_walletBuildAdvance",
         "jetsam_walletBridgeDeposit",
         "jetsam_walletGetBalance",
         "jetsam_stop",
