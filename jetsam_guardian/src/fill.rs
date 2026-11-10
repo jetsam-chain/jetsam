@@ -19,7 +19,7 @@
 //!   2 500 JTM / 24 h and 3 000 JTM outstanding), the gas-indexed minimum, the stock.
 //! * [`DecisionJournal`]: every decision (why advanced, why refused), signed and chained, for the public page.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -827,6 +827,97 @@ pub const LABEL_ADVANCE_BATCH: &str = "advanceBatch";
 /// rule `ALREADY_UNDER_A_POINT` was decided before the stop, a point may have been accepted since: the fee would go
 /// to the recipient); its orders are decided again at the next step.
 pub const CANCEL_AT_RECOVERY: [&str; 2] = [LABEL_ADVANCE, LABEL_ADVANCE_BATCH];
+
+/// E-12 (audit 2026-11-10): what the robot's sources say of one block body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BodyRead {
+    /// Served by a source and read with the node's rule: its deposits.
+    Deposits(Vec<FoundDeposit>),
+    /// Every source answered that it does not serve it: its deposits are not advanced.
+    NotServed,
+    /// No source served it readable (an error, a body the node's rule refuses): read again at a later step.
+    Failed(String),
+}
+
+/// E-12: the body of block `id` from the first of `sources` (every node's `getBlock`, then every node's
+/// `getDepositBlock`) that serves bytes the node's rule reads ([`deposits_of_block`]); a source that fails never stops
+/// the others.
+pub fn read_body(sources: Vec<crate::relayer::BodySource>, id: &[u8; 32], rules: &VaultRules) -> BodyRead {
+    let mut why = Vec::new();
+    for (name, mut read) in sources {
+        match read() {
+            Ok(Some(raw)) => match deposits_of_block(&raw, id, rules) {
+                Ok(found) => return BodyRead::Deposits(found),
+                Err(e) => why.push(format!("{name}: {e:#}")),
+            },
+            Ok(None) => {}
+            Err(e) => why.push(format!("{name}: {e:#}")),
+        }
+    }
+    if why.is_empty() {
+        BodyRead::NotServed
+    } else {
+        BodyRead::Failed(why.join("; "))
+    }
+}
+
+/// E-12: at most this many blocks not tried yet, and this many that failed before, per step of the robot's scan.
+pub const SCAN_NEW_PER_STEP: usize = 64;
+pub const SCAN_RETRIES_PER_STEP: usize = 8;
+
+/// E-12: one step of the robot's scan of the blocks of `chain` from `from` (the first above F). `scanned` (height →
+/// block id, its deposits) forgets the blocks no longer on `chain`; then [`SCAN_NEW_PER_STEP`] blocks not tried yet and
+/// [`SCAN_RETRIES_PER_STEP`] that failed before (`failed`), lowest first, are read (`read`: what their sources say). A
+/// block no source serves readable is tried again at a later step and never stops the blocks above it.
+pub fn scan_step(
+    scanned: &mut BTreeMap<u64, (String, Vec<FoundDeposit>)>,
+    failed: &mut BTreeSet<u64>,
+    chain: &Chain,
+    from: u64,
+    read: &mut dyn FnMut(u64, &[u8; 32]) -> BodyRead,
+    log: &mut dyn FnMut(String),
+) {
+    let tip = chain.tip_height();
+    scanned.retain(|h, (id, _)| *h <= tip && chain.id_at(*h).map(hex::encode).as_deref() == Some(id.as_str()));
+    failed.retain(|h| *h <= tip && !scanned.contains_key(h));
+    let (mut new, mut retried) = (0, 0);
+    for h in from..=tip {
+        if scanned.contains_key(&h) {
+            continue;
+        }
+        if failed.contains(&h) {
+            if retried >= SCAN_RETRIES_PER_STEP {
+                continue;
+            }
+            retried += 1;
+        } else {
+            if new >= SCAN_NEW_PER_STEP {
+                continue;
+            }
+            new += 1;
+        }
+        let Some(id) = chain.id_at(h) else { continue };
+        match read(h, &id) {
+            BodyRead::Deposits(found) => {
+                for d in &found {
+                    log(format!("deposit seen at {h}: {} µJTM to 0x{} (txid {})", d.amount, hex::encode(d.recipient), hex::encode(d.txid)));
+                }
+                failed.remove(&h);
+                scanned.insert(h, (hex::encode(id), found));
+            }
+            BodyRead::NotServed => {
+                log(format!("block {h}: no node serves its body (getBlock, getDepositBlock), its deposits are not advanced"));
+                failed.remove(&h);
+                scanned.insert(h, (hex::encode(id), Vec::new()));
+            }
+            BodyRead::Failed(why) => {
+                if failed.insert(h) {
+                    log(format!("block {h} not read ({why}): read again at the next steps, the blocks above it are read"));
+                }
+            }
+        }
+    }
+}
 
 /// E-6 (audit 2026-11-10): the robot's advance of `orders` against the checkpoint `seen`: always `advanceBatch`, one
 /// order too (an order another advancer paid first, `AdvanceExists`, or minted meanwhile is skipped by the contract,

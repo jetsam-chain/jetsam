@@ -1831,3 +1831,70 @@ fn e6_a_reverted_advance_is_explained_only_by_its_checkpoint_left_canonical() {
     assert!(!advance_raced(None), "not read: counted");
     assert!(!advance_raced(Some(&[0u8; 64])), "an answer too short: counted");
 }
+
+/// E-12 (audit 2026-11-10): a block's body from the first source that serves it readable — node 0's `getBlock` failing,
+/// node 1's or a `getDepositBlock` serves it —; every source saying "not served": not served; anything else: failed
+/// (read again later).
+#[test]
+fn e12_a_body_comes_from_any_source_that_serves_it_readable() {
+    let b = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM)]);
+    let (raw, id) = raw_and_id(&b);
+    type Src = fn(&[u8]) -> anyhow::Result<Option<Vec<u8>>>;
+    let run = |plan: &[Src]| {
+        let sources: Vec<crate::relayer::BodySource> = plan.iter().enumerate().map(|(i, f)| {
+            let (f, raw) = (*f, raw.clone());
+            (format!("s{i}"), Box::new(move || f(&raw)) as Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>>>)
+        }).collect();
+        read_body(sources, &id, &rules())
+    };
+    let serves: Src = |r| Ok(Some(r.to_vec()));
+    let none: Src = |_| Ok(None);
+    let fails: Src = |_| anyhow::bail!("connection refused");
+    let garbage: Src = |_| Ok(Some(vec![0xde, 0xad, 0xbe, 0xef]));
+    let one = |r: BodyRead| match r {
+        BodyRead::Deposits(d) => d.len(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(one(run(&[fails, serves, none, none])), 1, "node 0 fails, node 1 serves");
+    assert_eq!(one(run(&[garbage, none, serves, none])), 1, "node 0 unreadable, a getDepositBlock serves");
+    assert_eq!(run(&[none, none, none, none]), BodyRead::NotServed);
+    assert!(matches!(run(&[none, fails, none, none]), BodyRead::Failed(w) if w.contains("s1: connection refused")));
+    assert!(matches!(run(&[garbage, none, none, none]), BodyRead::Failed(w) if w.starts_with("s0: ")));
+}
+
+/// E-12: a block no source serves readable never stops the scan: the blocks above it are read in the same step, it is
+/// read again at the next ones (8 such blocks a step at most, beside 64 new ones), a block no source serves is marked
+/// without deposit.
+#[test]
+fn e12_the_scan_goes_past_a_block_it_cannot_read_and_reads_it_again() {
+    let c = testkit::chain(140, 1);
+    let mut scanned = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let mut read = |h: u64, _: &[u8; 32]| {
+        asked.borrow_mut().push(h);
+        if h == 129 { BodyRead::Failed("unreadable".into()) } else { BodyRead::NotServed }
+    };
+    let mut lines = Vec::new();
+    scan_step(&mut scanned, &mut failed, &c, 129, &mut read, &mut |l| lines.push(l));
+    assert_eq!(scanned.keys().copied().collect::<Vec<_>>(), (130..=140).collect::<Vec<_>>(), "past 129");
+    assert_eq!(failed, BTreeSet::from([129]));
+    assert!(scanned.values().all(|(_, d)| d.is_empty()));
+    asked.borrow_mut().clear();
+    scan_step(&mut scanned, &mut failed, &c, 129, &mut read, &mut |l| lines.push(l));
+    assert_eq!(*asked.borrow(), vec![129], "read again, alone");
+    assert_eq!(lines.iter().filter(|l| l.starts_with("block 129 not read")).count(), 1, "said once");
+    // budgets: 64 new blocks and 8 failed ones a step
+    let c = testkit::chain(300, 1);
+    let (mut scanned, mut failed) = (BTreeMap::new(), BTreeSet::new());
+    let asked = std::cell::RefCell::new(Vec::new());
+    let mut read = |h: u64, _: &[u8; 32]| {
+        asked.borrow_mut().push(h);
+        BodyRead::Failed("unreadable".into())
+    };
+    scan_step(&mut scanned, &mut failed, &c, 1, &mut read, &mut |_| {});
+    assert_eq!(*asked.borrow(), (1..=64).collect::<Vec<_>>());
+    asked.borrow_mut().clear();
+    scan_step(&mut scanned, &mut failed, &c, 1, &mut read, &mut |_| {});
+    assert_eq!(*asked.borrow(), (1..=8).chain(65..=128).collect::<Vec<_>>(), "8 failed ones again, 64 new ones");
+}

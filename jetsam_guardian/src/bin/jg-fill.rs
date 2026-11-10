@@ -47,7 +47,7 @@
 //!   body the relayer archived and published beside it (`blocks/<h>-<id>.bin`, read again and checked: A5-7), or
 //!   in `relay_blocks_dir` when the configuration names it (N9).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -159,6 +159,8 @@ struct Robot {
     halt_file: PathBuf,
     /// N9: the stock above `max_stock` was alerted (once per crossing).
     stock_alerted: bool,
+    /// E-12: the blocks above F no source served readable (read again, 8 a step).
+    scan_failed: BTreeSet<u64>,
 }
 
 impl Robot {
@@ -232,45 +234,22 @@ impl Robot {
     }
 
     /// Read the deposits of the blocks above F that node 0's chain holds and that are not read yet (or
-    /// were replaced by a reorganization), with the node's own rule.
+    /// were replaced by a reorganization), with the node's own rule. E-12: from every node, `getBlock` then
+    /// `getDepositBlock`; a block none serves readable is read again later, never the end of the scan.
     fn scan(&mut self) {
         let chain = self.observers[0].chain().clone();
-        let tip = chain.tip_height();
-        self.state.scanned.retain(|h, (id, _)| *h <= tip && chain.id_at(*h).map(hex::encode).as_deref() == Some(id.as_str()));
-        let from = self.cfg.deposits_from_height + 1;
-        let mut read = 0;
-        for h in from..=tip {
-            if self.state.scanned.contains_key(&h) {
-                continue;
+        let (clients, nodes, rules) = (&self.clients, &self.cfg.nodes, &self.rules);
+        let mut read = |h: u64, id: &[u8; 32]| {
+            let mut sources: Vec<jetsam_guardian::relayer::BodySource> = Vec::new();
+            for (c, n) in clients.iter().zip(nodes) {
+                sources.push((format!("{} getBlock", n.name), Box::new(move || c.raw_block(h))));
             }
-            if read >= 64 {
-                break;
+            for (c, n) in clients.iter().zip(nodes) {
+                sources.push((format!("{} getDepositBlock", n.name), Box::new(move || c.raw_deposit_block(h))));
             }
-            read += 1;
-            let Some(id) = chain.id_at(h) else { continue };
-            match self.clients[0].raw_block(h) {
-                Ok(Some(raw)) => match fill::deposits_of_block(&raw, &id, &self.rules) {
-                    Ok(found) => {
-                        for d in &found {
-                            log(&format!("deposit seen at {h}: {} µJTM to {} (txid {})", d.amount, hex0x(&d.recipient), hex::encode(d.txid)));
-                        }
-                        self.state.scanned.insert(h, (hex::encode(id), found));
-                    }
-                    Err(e) => {
-                        log(&format!("block {h} not read: {e:#}"));
-                        break;
-                    }
-                },
-                Ok(None) => {
-                    log(&format!("block {h}: body pruned on node 0, its deposits are not advanced"));
-                    self.state.scanned.insert(h, (hex::encode(id), Vec::new()));
-                }
-                Err(e) => {
-                    log(&format!("getBlock({h}): {e:#}"));
-                    break;
-                }
-            }
-        }
+            fill::read_body(sources, id, rules)
+        };
+        fill::scan_step(&mut self.state.scanned, &mut self.scan_failed, &chain, self.cfg.deposits_from_height + 1, &mut read, &mut |m| log(&m));
     }
 
     fn halted(&self) -> Option<String> {
@@ -834,7 +813,7 @@ fn run() -> anyhow::Result<()> {
     log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, cfg };
+    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), cfg };
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }

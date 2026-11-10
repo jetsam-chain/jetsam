@@ -1095,7 +1095,7 @@ fn halts_after_three_reverts(before: Option<&str>) {
     assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
 }
 
-// ---------------------------------------------------------------- jg-fill: the audit of 2026-11-10 (E-6, E-8)
+// ---------------------------------------------------------------- jg-fill: the audit of 2026-11-10 (E-6, E-8, E-12)
 
 fn hexsel(sig: &str) -> String {
     format!("0x{}", hex::encode(jetsam_guardian::l1::selector(sig)))
@@ -1267,6 +1267,56 @@ fn jg_fill_reads_its_logs_in_windows_its_endpoint_accepts() {
     let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
     assert!(read, "the tip's checkpoint is never read; log:\n{log}");
     assert!(!log.contains("exceed maximum block range"), "{log}");
+}
+
+/// The fake world of `inner` whose nodes serve the chain `c` (headers), the body of block 129 unreadable on every node,
+/// no other body (pruned, no deposit retained).
+fn unreadable_129(inner: Answer, c: jetsam_guardian::chain::Chain) -> Answer {
+    Arc::new(move |method, params| {
+        let h = params[0].as_u64().unwrap_or(u64::MAX);
+        match method {
+            "jetsam_blockCount" => json!({"result": c.tip_height()}),
+            "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
+            "jetsam_getHeaderByHeight" => json!({"result": c.header_at(h).map(|x| x.raw_hex())}),
+            "jetsam_getBlock" if h == 129 => json!({"result": "deadbeef"}),
+            "jetsam_getBlock" | "jetsam_getDepositBlock" => json!({"result": null}),
+            _ => inner(method, params),
+        }
+    })
+}
+
+/// E-12 (audit 2026-11-10): a block whose body no source serves readable (129) never stops the robot's scan: the blocks
+/// above it are read (here: no source serves them, every node said so), 129 is tried again at the next steps. Before:
+/// a permanent `break` at 129, the robot blind to every deposit above it. Rehearsal build only.
+#[test]
+fn jg_fill_scans_past_a_block_whose_body_no_source_serves_readable() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    let (socks, seen) = fake_tor(unreadable_129(fill_world(1_200_000_000), testkit::chain(140, 1)));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let scanned = || -> Vec<u64> {
+        std::fs::read_to_string(dir.join("state/state.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v["scanned"].as_object().map(|o| o.keys().filter_map(|k| k.parse().ok()).collect()))
+            .unwrap_or_default()
+    };
+    let past = wait_for(60, || scanned().contains(&140));
+    // once 130..=140 are read, only 129 is asked again: two nodes, two more steps
+    let count = || seen.lock().unwrap().iter().filter(|(.., m)| m == "jetsam_getBlock").count();
+    let c0 = count();
+    let again = wait_for(30, || count() >= c0 + 4);
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(past, "scanned {:?}; log:\n{log}", scanned());
+    let s = scanned();
+    assert!(!s.contains(&129) && (130..=140).all(|h| s.contains(&h)), "{s:?}");
+    assert!(again, "block 129 tried again; log:\n{log}");
 }
 
 // ---------------------------------------------------------------- jg-relay: its state (re-audit R5, A5-14)
