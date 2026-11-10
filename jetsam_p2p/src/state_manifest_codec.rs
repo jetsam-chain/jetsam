@@ -23,7 +23,8 @@ use crate::protocol::{
     snapshot_annexes_are_canonical, GetStateManifestHeader, GetStateManifestRequest,
     SnapshotAnnexKind, SnapshotAnnexRef, SnapshotManifestPageRef,
     MAX_SNAPSHOT_CLIENT_REGISTRY_BYTES, MAX_SNAPSHOT_MANIFEST_ANNEXES,
-    MAX_SNAPSHOT_MANIFEST_PAGES, SNAPSHOT_MANIFEST_FORMAT_VERSION,
+    MAX_SNAPSHOT_MANIFEST_PAGES, MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT,
+    SNAPSHOT_MANIFEST_FORMAT_VERSION,
 };
 
 // JETSAM: the leading byte E replaces the upstream magic's initial, so no
@@ -259,6 +260,11 @@ fn validate_header(header: &GetStateManifestHeader) -> io::Result<()> {
             ));
         }
         return Ok(());
+    }
+    if header.tip_height > MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT {
+        return Err(invalid_data(
+            "manifest tip height is beyond the highest boundary a manifest may name",
+        ));
     }
     if header.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION {
         return Err(invalid_data("unsupported snapshot manifest format"));
@@ -692,5 +698,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES);
+    }
+
+    /// The header of `manifest` as a peer puts it on the wire, whatever this
+    /// node's encoder would accept: the frame of the honest `populated()`
+    /// header with every field `manifest` changes written over it (same
+    /// descriptor pages, so the page references are unchanged).
+    async fn raw_header_frame(manifest: &GetStateManifestResponse) -> Vec<u8> {
+        let (honest, _) = populated();
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, honest)
+            .await
+            .unwrap();
+        let mut bytes = wire.into_inner();
+        bytes[4..12].copy_from_slice(&manifest.tip_height.to_le_bytes());
+        bytes[12..44].copy_from_slice(&manifest.tip_hash);
+        bytes[44..76].copy_from_slice(&manifest.cumulative_chainwork);
+        bytes[112..144].copy_from_slice(&manifest.manifest_digest);
+        bytes[165..173].copy_from_slice(&manifest.bridge_tip_height.to_le_bytes());
+        bytes[173..205].copy_from_slice(&manifest.bridge_tip_hash);
+        bytes[205..237].copy_from_slice(&manifest.bridge_cumulative_chainwork);
+        bytes
+    }
+
+    /// `populated_manifest()` moved to `height`, its bridge at the same block,
+    /// digest sealed: every other check of the header holds.
+    fn manifest_at(height: u64) -> GetStateManifestResponse {
+        let mut manifest = populated_manifest();
+        manifest.tip_height = height;
+        manifest.bridge_tip_height = height;
+        manifest.bridge_tip_hash = manifest.tip_hash;
+        manifest.bridge_cumulative_chainwork = manifest.cumulative_chainwork;
+        assert!(manifest.seal_manifest_digest());
+        manifest
+    }
+
+    /// Audit 2026-11-10, S-2: a header naming the last u64 height (its bridge
+    /// equal) passed every check of the codec; the node later found no
+    /// successor height for it and stopped. It is refused as the peer's bad
+    /// response when it is read (InvalidData, which the swarm reports as
+    /// InvalidResponse), and this node never writes one.
+    #[tokio::test]
+    async fn a_manifest_header_at_the_last_height_is_refused_on_the_wire() {
+        let manifest = manifest_at(u64::MAX);
+        let error = StateManifestCodec
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(raw_header_frame(&manifest).await),
+            )
+            .await
+            .expect_err("a header at u64::MAX must not decode");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("height"), "{error}");
+
+        let (header, _) = manifest.to_header_and_pages().unwrap();
+        assert!(StateManifestCodec
+            .write_response(&protocol(), &mut Cursor::new(Vec::new()), header)
+            .await
+            .is_err());
+    }
+
+    /// The bound itself is a height a manifest may name, on the wire and as a
+    /// verified manifest; the next one is refused by both.
+    #[tokio::test]
+    async fn a_manifest_may_name_the_highest_boundary_and_not_the_next() {
+        use crate::protocol::{VerifiedStateManifest, MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT};
+
+        let highest = manifest_at(MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT);
+        let decoded = StateManifestCodec
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(raw_header_frame(&highest).await),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decoded.tip_height, MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT);
+        assert!(VerifiedStateManifest::verify(highest).is_some());
+
+        let beyond = manifest_at(MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT + 1);
+        let error = StateManifestCodec
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(raw_header_frame(&beyond).await),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(VerifiedStateManifest::verify(beyond).is_none());
     }
 }

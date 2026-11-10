@@ -9844,6 +9844,57 @@ mod tests {
         manifest.to_header_and_pages().unwrap().0
     }
 
+    /// Audit 2026-11-10, S-2: the swarm assembles a manifest from its header
+    /// and exact pages before the node sees it. One naming the last u64
+    /// height (its bridge equal, every page exact) never becomes a
+    /// `VerifiedStateManifest`: its assembly ends with no manifest, and the
+    /// reactor then tombstones the candidate and reports InvalidResponse for
+    /// each of its providers.
+    #[tokio::test]
+    async fn a_manifest_at_the_last_height_is_never_assembled() {
+        let mut manifest = GetStateManifestResponse {
+            tip_height: u64::MAX,
+            tip_hash: [0x5A; 32],
+            cumulative_chainwork: [0xA5; 32],
+            format_version: crate::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x5B; 32],
+            log_slots: 17,
+            active_slot_count: 9,
+            alloc_counter: 12,
+            eff_log: 16,
+            bridge_tip_height: u64::MAX,
+            bridge_tip_hash: [0x5A; 32],
+            bridge_cumulative_chainwork: [0xA5; 32],
+            segment_ids: vec![0, 1],
+            segment_roots: vec![[3; 32], [4; 32]],
+            segment_lengths: vec![209, 259],
+            ..Default::default()
+        };
+        assert!(manifest.seal_manifest_digest());
+        let (header, pages) = manifest.to_header_and_pages().unwrap();
+        let key = ManifestAssemblyKey {
+            generation: 1,
+            snapshot: header.snapshot_id().unwrap(),
+        };
+        let mut assembly = ManifestPageAssembly::new(header, PeerId::random(), 10).unwrap();
+        for (slot, bytes) in assembly.pages.iter_mut().zip(pages) {
+            *slot = Some(VerifiedManifestPageBytes {
+                bytes,
+                _inbound_memory_permit: None,
+            });
+        }
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+
+        start_manifest_assembly_if_ready(key, &mut assembly, &completion_tx);
+        let completed = completion_rx.recv().await.unwrap();
+
+        assert!(completed.key == key);
+        assert!(
+            completed.result.is_none(),
+            "a manifest at u64::MAX must not become a VerifiedStateManifest"
+        );
+    }
+
     #[test]
     fn rejected_manifest_provider_cannot_reenter_the_same_candidate() {
         let peer = PeerId::random();

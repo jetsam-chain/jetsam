@@ -267,6 +267,18 @@ const SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIF
 pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 2;
 const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/V2";
 
+/// Highest boundary a snapshot manifest may name: 2^32 - 1 (audit
+/// 2026-11-10, S-2). At one block every 90 s, the shortest target spacing
+/// this chain has had, a chain reaches it after about 12 000 years, so no
+/// honest manifest is refused. Every height a manifest carries then stays far
+/// from the end of u64: its tip, its bridge at most
+/// `RECENT_BLOCK_RETENTION_DEPTH` above, and the successor heights snapshot
+/// staging derives from them. A manifest at u64::MAX passed every other check
+/// and stopped the node that staged it. A higher claim is the peer's bad
+/// response: refused when its header is read, before any descriptor page is
+/// fetched, and by every constructor of a `VerifiedStateManifest`.
+pub const MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT: u64 = u32::MAX as u64;
+
 impl GetStateManifestHeader {
     pub fn computed_manifest_digest(&self) -> Option<[u8; 32]> {
         if self.tip_height == 0 || !self.has_canonical_page_shape() {
@@ -592,6 +604,7 @@ fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
     };
 
     if manifest.tip_height == 0
+        || manifest.tip_height > MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT
         || manifest.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
         || manifest.segment_ids.len() != manifest.segment_roots.len()
         || manifest.segment_ids.len() != manifest.segment_lengths.len()

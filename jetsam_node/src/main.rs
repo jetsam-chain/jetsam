@@ -9530,6 +9530,63 @@ mod tests {
         assert!(unrelated.exists());
     }
 
+    /// Audit 2026-11-10, S-2: a manifest whose tip is the last u64 height (its
+    /// bridge at the same block) passed every manifest check; header staging
+    /// then found no successor height and returned a local Fatal, which ended
+    /// the P2P event task and stopped the node. Followed here along the
+    /// node's own path: the P2P gate that builds every VerifiedStateManifest,
+    /// then the header staging the node starts for it. A peer's manifest may
+    /// be refused on that path; it may never become a local failure.
+    #[test]
+    fn a_manifest_at_the_last_height_never_stops_the_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let mut manifest = jetsam_p2p::protocol::GetStateManifestResponse {
+            tip_height: u64::MAX,
+            tip_hash: [0x5A; 32],
+            cumulative_chainwork: [0xA5; 32],
+            format_version: jetsam_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x5B; 32],
+            log_slots: 17,
+            active_slot_count: 9,
+            alloc_counter: 12,
+            eff_log: 16,
+            bridge_tip_height: u64::MAX,
+            bridge_tip_hash: [0x5A; 32],
+            bridge_cumulative_chainwork: [0xA5; 32],
+            segment_ids: vec![0, 1],
+            segment_roots: vec![[3; 32], [4; 32]],
+            segment_lengths: vec![209, 259],
+            ..Default::default()
+        };
+        assert!(manifest.seal_manifest_digest());
+
+        let outcome = match jetsam_p2p::protocol::VerifiedStateManifest::verify(manifest) {
+            None => "refused as a candidate by the P2P manifest gate".to_owned(),
+            Some(verified) => match super::prepare_snapshot_header_sync(
+                &directory.path().join("snapshot-staging"),
+                &ctx.store,
+                libp2p::PeerId::random(),
+                verified,
+                None,
+                None,
+            ) {
+                Err(super::SnapshotHeaderPrepareError::Fatal(error)) => {
+                    panic!("a peer's manifest stops the node: {error}")
+                }
+                Err(super::SnapshotHeaderPrepareError::BaseMoved(error)) => {
+                    format!("staging refused, base moved: {error}")
+                }
+                Ok(_) => "staged".to_owned(),
+            },
+        };
+
+        assert_eq!(outcome, "refused as a candidate by the P2P manifest gate");
+    }
+
     #[test]
     fn first_start_creates_and_reuses_default_config() {
         let temp = tempfile::tempdir().unwrap();
