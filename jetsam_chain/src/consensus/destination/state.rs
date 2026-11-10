@@ -44,9 +44,9 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
 
 use super::advance::{
-    advance_marker, advance_marker_fields, advance_transfer_marker, advance_transfer_marker_n,
-    release_payee, validate_block_advances, AdvanceBook, AdvanceEffect, AdvanceEntry,
-    AdvanceError, AdvanceRules,
+    advance_marker_commitment, advance_marker_fields, advance_transfer_marker_advance,
+    release_payee, validate_block_advances, AdvanceBook, AdvanceEffect, AdvanceEntry, AdvanceError,
+    AdvanceKey, AdvanceRules,
 };
 use super::base_read::{
     decode_game_proof, decode_output_root_preimage, verify_base_state_root, BaseParams,
@@ -318,11 +318,11 @@ pub struct WindowRelease {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdvanceUndo {
     /// The advances it made.
-    pub created: Vec<u64>,
+    pub created: Vec<AdvanceKey>,
     /// The advances its releases consumed, as they were.
     pub consumed: Vec<(u64, AdvanceEntry)>,
     /// The claims it transferred, each with its creditor before.
-    pub transfers: Vec<(u64, Address)>,
+    pub transfers: Vec<(AdvanceKey, Address)>,
 }
 
 impl AdvanceUndo {
@@ -490,22 +490,23 @@ impl DestinationState {
     }
 
     /// A block's effect on the advances, and its undo: the releases consume
-    /// first, then the block's advances are made and its claims transferred
-    /// (a block never does two of these to one `n`).
+    /// first — every advance of each `n` released (D114) — then the block's
+    /// advances are made and its claims transferred (a block never does two
+    /// of these to one `n`).
     fn apply_advances(&mut self, effect: &AdvanceEffect) -> AdvanceUndo {
         let mut undo = AdvanceUndo::default();
         for n in &effect.consumed {
-            if let Some(entry) = self.advances.remove(*n) {
+            for entry in self.advances.remove_n(*n) {
                 undo.consumed.push((*n, entry));
             }
         }
         for (n, entry) in &effect.created {
             self.advances.insert(*n, *entry);
-            undo.created.push(*n);
+            undo.created.push(entry.key(*n));
         }
-        for (n, creditor) in &effect.transfers {
-            if let Some(before) = self.advances.set_creditor(*n, *creditor) {
-                undo.transfers.push((*n, before));
+        for (key, creditor) in &effect.transfers {
+            if let Some(before) = self.advances.set_creditor(key, *creditor) {
+                undo.transfers.push((*key, before));
             }
         }
         undo
@@ -513,11 +514,11 @@ impl DestinationState {
 
     /// Undo [`Self::apply_advances`].
     fn undo_advances(&mut self, undo: &AdvanceUndo) {
-        for (n, before) in undo.transfers.iter().rev() {
-            self.advances.set_creditor(*n, *before);
+        for (key, before) in undo.transfers.iter().rev() {
+            self.advances.set_creditor(key, *before);
         }
-        for n in undo.created.iter().rev() {
-            self.advances.remove(*n);
+        for key in undo.created.iter().rev() {
+            self.advances.remove(key);
         }
         for (n, entry) in undo.consumed.iter().rev() {
             self.advances.insert(*n, *entry);
@@ -640,21 +641,26 @@ impl DestinationState {
         out
     }
 
-    /// Version 2's tail: the advances by increasing `n`, then each undo's.
+    /// Version 2's tail: the advances by increasing key `(n, owner, amount)`,
+    /// then each undo's: the keys it made, the advances it consumed, the
+    /// claims it transferred with their creditor before.
     fn encode_advances(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.advances.len() as u32).to_le_bytes());
         for (n, entry) in self.advances.iter() {
             put_advance(n, entry, out);
         }
         for undo in &self.undo {
-            put_u64s(&undo.advances.created, out);
+            out.extend_from_slice(&(undo.advances.created.len() as u32).to_le_bytes());
+            for key in &undo.advances.created {
+                put_advance_key(key, out);
+            }
             out.extend_from_slice(&(undo.advances.consumed.len() as u32).to_le_bytes());
             for (n, entry) in &undo.advances.consumed {
                 put_advance(*n, entry, out);
             }
             out.extend_from_slice(&(undo.advances.transfers.len() as u32).to_le_bytes());
-            for (n, before) in &undo.advances.transfers {
-                out.extend_from_slice(&n.to_le_bytes());
+            for (key, before) in &undo.advances.transfers {
+                put_advance_key(key, out);
                 out.extend_from_slice(&before.0);
             }
         }
@@ -848,6 +854,39 @@ impl Reader<'_> {
         Ok(entry)
     }
 
+    /// The key of an advance: `n`, owner, amount (non-zero).
+    fn advance_key(&mut self) -> Result<AdvanceKey, DestinationStateError> {
+        let key = AdvanceKey {
+            n: self.u64()?,
+            owner: self.address()?,
+            amount: self.u64()?,
+        };
+        if key.amount == 0 {
+            return Err(DestinationStateError::Malformed);
+        }
+        Ok(key)
+    }
+
+    /// Advances by strictly increasing key: into `book`.
+    fn advance_list(&mut self, book: &mut AdvanceBook) -> Result<(), DestinationStateError> {
+        let count = self.u32()? as usize;
+        if count > self.0.len() / ADVANCE_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        let mut last: Option<AdvanceKey> = None;
+        for _ in 0..count {
+            let n = self.u64()?;
+            let entry = self.advance_entry()?;
+            let key = entry.key(n);
+            if last.is_some_and(|last| last >= key) {
+                return Err(DestinationStateError::Malformed);
+            }
+            last = Some(key);
+            book.insert(n, entry);
+        }
+        Ok(())
+    }
+
     /// Version 2's tail ([`DestinationState::encode_advances`]) into `book`
     /// and the undo entries already read.
     fn advances(
@@ -855,22 +894,16 @@ impl Reader<'_> {
         book: &mut AdvanceBook,
         undo: &mut [DestinationUndo],
     ) -> Result<(), DestinationStateError> {
-        let count = self.u32()? as usize;
-        if count > self.0.len() / ADVANCE_BYTES {
-            return Err(DestinationStateError::Malformed);
-        }
-        let mut last: Option<u64> = None;
-        for _ in 0..count {
-            let n = self.u64()?;
-            if last.is_some_and(|last| last >= n) {
+        self.advance_list(book)?;
+        for entry in undo.iter_mut() {
+            let created = self.u32()? as usize;
+            if created > self.0.len() / ADVANCE_KEY_BYTES {
                 return Err(DestinationStateError::Malformed);
             }
-            last = Some(n);
-            let entry = self.advance_entry()?;
-            book.insert(n, entry);
-        }
-        for entry in undo.iter_mut() {
-            entry.advances.created = self.u64s_increasing_or_any()?;
+            for _ in 0..created {
+                let key = self.advance_key()?;
+                entry.advances.created.push(key);
+            }
             let consumed = self.u32()? as usize;
             if consumed > self.0.len() / ADVANCE_BYTES {
                 return Err(DestinationStateError::Malformed);
@@ -881,13 +914,13 @@ impl Reader<'_> {
                 entry.advances.consumed.push((n, advance));
             }
             let transfers = self.u32()? as usize;
-            if transfers > self.0.len() / 40 {
+            if transfers > self.0.len() / (ADVANCE_KEY_BYTES + 32) {
                 return Err(DestinationStateError::Malformed);
             }
             for _ in 0..transfers {
-                let n = self.u64()?;
+                let key = self.advance_key()?;
                 let before = self.address()?;
-                entry.advances.transfers.push((n, before));
+                entry.advances.transfers.push((key, before));
             }
         }
         Ok(())
@@ -1152,7 +1185,7 @@ pub fn validate_block_destination(
             .releases
             .iter()
             .map(|(n, _, _)| *n)
-            .filter(|n| parent.advances.get(*n).is_some())
+            .filter(|n| parent.advances.holds_n(*n))
             .collect();
     }
 
@@ -1455,9 +1488,9 @@ pub struct DestinationSnapshotFile {
     /// the window (V6) of the next block reads, in creation order
     /// ([`snapshot_window_start`]).
     pub window_releases: Vec<(u64, Address, u64)>,
-    /// The advances of the state (the return over Base), by increasing `n`:
-    /// each opens its `JTMADV01` marker, its creditor the latest `JTMADT01`
-    /// marker of its `n` (or is its origin).
+    /// The advances of the state (the return over Base), by increasing key
+    /// `(n, owner, amount)`: each opens its `JTMADV01` marker, its creditor
+    /// the latest `JTMADT01` marker naming it (or is its origin).
     pub advances: Vec<(u64, AdvanceEntry)>,
 }
 
@@ -1535,7 +1568,7 @@ impl DestinationSnapshotFile {
 }
 
 /// The advances of a snapshot file: `count:u32 ‖ (n:u64 ‖ origin ‖ creditor
-/// ‖ owner ‖ amount:u64)*`, increasing `n`.
+/// ‖ owner ‖ amount:u64)*`, increasing key `(n, owner, amount)`.
 fn encode_snapshot_advances(advances: &[(u64, AdvanceEntry)], out: &mut Vec<u8>) {
     out.extend_from_slice(&(advances.len() as u32).to_le_bytes());
     for (n, entry) in advances {
@@ -1545,6 +1578,14 @@ fn encode_snapshot_advances(advances: &[(u64, AdvanceEntry)], out: &mut Vec<u8>)
 
 /// Bytes of one encoded advance: `n`, origin, creditor, owner, amount.
 const ADVANCE_BYTES: usize = 8 + 3 * 32 + 8;
+/// Bytes of one encoded advance key: `n`, owner, amount.
+const ADVANCE_KEY_BYTES: usize = 8 + 32 + 8;
+
+fn put_advance_key(key: &AdvanceKey, out: &mut Vec<u8>) {
+    out.extend_from_slice(&key.n.to_le_bytes());
+    out.extend_from_slice(&key.owner.0);
+    out.extend_from_slice(&key.amount.to_le_bytes());
+}
 
 fn put_advance(n: u64, entry: &AdvanceEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&n.to_le_bytes());
@@ -1564,10 +1605,14 @@ impl Reader<'_> {
         let mut advances: Vec<(u64, AdvanceEntry)> = Vec::with_capacity(count);
         for _ in 0..count {
             let n = self.u64()?;
-            if advances.last().is_some_and(|(last, _)| *last >= n) {
+            let entry = self.advance_entry()?;
+            if advances
+                .last()
+                .is_some_and(|(last_n, last)| last.key(*last_n) >= entry.key(n))
+            {
                 return Err(DestinationStateError::Malformed);
             }
-            advances.push((n, self.advance_entry()?));
+            advances.push((n, entry));
         }
         Ok(advances)
     }
@@ -1769,8 +1814,12 @@ impl<'a> SnapshotDestinationCheck<'a> {
 
     /// The advances of the boundary (the return over Base): the `JTMADV01`
     /// markers created from its height on (above the `alloc_counter` of the
-    /// header below it) whose `n` is not paid, each opened by the file, its
-    /// creditor the latest `JTMADT01` marker of its `n` (or its origin).
+    /// header below it) whose `n` is not paid (the release of `n` consumes
+    /// every advance of it), each opened by exactly one advance of the file;
+    /// its creditor the latest `JTMADT01` marker naming it (by its marker's
+    /// commitment bytes) created after it, or its origin. An advance whose
+    /// marker shares its commitment bytes with a held one is never made, so
+    /// the transfers naming those bytes after it are its own.
     fn rebuild_advances(
         &self,
         alloc_counter: &impl Fn(u64) -> Option<u64>,
@@ -1788,43 +1837,56 @@ impl<'a> SnapshotDestinationCheck<'a> {
             return Ok(AdvanceBook::new());
         };
         let below = height.saturating_sub(1);
-        let floor =
-            alloc_counter(below).ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
-        // One advance marker per `n` at most; those of a paid `n` are
-        // consumed.
-        let mut live: BTreeMap<u64, Address> = BTreeMap::new();
-        for (_, marker) in self.advance_markers.iter().filter(|(id, _)| *id > floor) {
+        let floor = alloc_counter(below)
+            .ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
+        // The live advances' markers, by commitment bytes: `(creation id,
+        // marker)`.
+        let mut live: BTreeMap<[u8; 12], (u64, Address)> = BTreeMap::new();
+        for (id, marker) in self.advance_markers.iter().filter(|(id, _)| *id > floor) {
             let (n, _) = advance_marker_fields(marker).expect("an advance marker");
-            if live.insert(n, *marker).is_some() {
-                return Err(mismatch("two advance markers of one withdrawal"));
+            if self.released.contains(n) {
+                continue;
+            }
+            if live
+                .insert(advance_marker_commitment(marker), (*id, *marker))
+                .is_some()
+            {
+                return Err(mismatch("two live advance markers share their commitment"));
             }
         }
-        live.retain(|n, _| !self.released.contains(*n));
         if live.len() != self.file.advances.len() {
             return Err(mismatch("advances do not match their markers"));
         }
         let mut book = AdvanceBook::new();
-        for ((n, marker), (file_n, entry)) in live.iter().zip(&self.file.advances) {
-            if n != file_n {
-                return Err(mismatch("advances do not match their markers"));
+        let mut last: Option<AdvanceKey> = None;
+        for (n, entry) in &self.file.advances {
+            let key = entry.key(*n);
+            if last.is_some_and(|last| last >= key) {
+                return Err(mismatch("advances out of order"));
             }
-            if advance_marker(*n, &entry.owner, entry.amount, &entry.origin) != *marker {
-                return Err(mismatch("an advance does not open its marker"));
-            }
-            // Its creditor: the latest transfer marker of `n`, else its origin.
+            last = Some(key);
+            let marker = entry.marker(*n);
+            let created = match live.remove(&advance_marker_commitment(&marker)) {
+                Some((id, live_marker)) if live_marker == marker => id,
+                _ => return Err(mismatch("an advance does not open its marker")),
+            };
+            // Its creditor: the latest transfer naming it, after it.
+            let named = advance_marker_commitment(&marker);
             let latest = self
                 .transfer_markers
                 .iter()
                 .filter(|(id, transfer)| {
-                    *id > floor && advance_transfer_marker_n(transfer) == Some(*n)
+                    *id > created && advance_transfer_marker_advance(transfer) == Some(named)
                 })
                 .max_by_key(|(id, _)| *id);
             let creditor_opens = match latest {
-                Some((_, transfer)) => advance_transfer_marker(*n, &entry.creditor) == *transfer,
+                Some((_, transfer)) => entry.transfer_marker(*n, &entry.creditor) == *transfer,
                 None => entry.creditor == entry.origin,
             };
             if !creditor_opens {
-                return Err(mismatch("an advance's creditor does not open its latest transfer"));
+                return Err(mismatch(
+                    "an advance's creditor does not open its latest transfer",
+                ));
             }
             book.insert(*n, *entry);
         }

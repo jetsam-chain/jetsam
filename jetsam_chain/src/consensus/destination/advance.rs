@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 the Jetsam developers.
 
-//! v1.7, the return over Base: the advance (D101, D107, SPEC retour Base §4).
+//! v1.7, the return over Base: the advance (D101, D107, D114, SPEC retour
+//! Base §4).
 //!
 //! Base holds a burn final ≈ 121 h after it is made; a reserve pays its owner
 //! in minutes with its own JTM and the vault repays the reserve when the burn
@@ -15,21 +16,31 @@
 //!   output to `A`; `c12` is 12 bytes of the tagged byte-hash of
 //!   `(n, owner_n, amount_n, A)`. `RELEASE_FEE ≤ amount_n ≤ 1 000 JTM`,
 //!   `paid ≥ amount_n − RELEASE_FEE − ⌈amount_n × 1 %⌉`; `n` not paid on the
-//!   branch (D52), not advanced yet (the first advance of `n` holds), not
-//!   released by the same block; the advances of `A` not yet consumed stay at
-//!   most 3 000 JTM (D72's outstanding cap, per advancer).
-//! * **The claim's transfer** (D72's transferable claim) — an ordinary spend
-//!   from the advance's current creditor whose live outputs are exactly
-//!   `(new_creditor, any)`, the marker `JTMADT01 ‖ n:u64 ‖ c16` (value 0;
-//!   `c16`: 16 bytes of the tagged byte-hash of `(n, new_creditor)`), then at
-//!   most one change output to the creditor; at most one per `n` and per
-//!   block, never in a block that releases `n`.
-//! * **V2 at the release of `n`** — when the branch holds an advance of `n`
-//!   whose `(owner, amount)` is exactly the burn's, the release pays its
-//!   current creditor `amount − R`; otherwise the burn's owner (a wrong
-//!   advance loses the advancer's money, never the owner's). Either way the
-//!   advance is consumed. No advance expires (D107: a timer would take the
-//!   advancer's money during a pause of Base).
+//!   branch (D52), not released by the same block; the advances of `A` not
+//!   yet consumed stay at most 3 000 JTM (D72's outstanding cap, per
+//!   advancer).
+//! * **Its key is the burn** `(n, owner, amount)` (D114, D72's tuple): a
+//!   branch holds any number of advances of one `n`, at most one per key (the
+//!   same burn is advanced once). An advance of another burn of `n` placed
+//!   first blocks nothing (D72's `test_wrong_tuple_placed_first_blocks_nothing`).
+//!   Two advances whose markers share their 12 commitment bytes are never held
+//!   together (only a search of 2⁴⁸ hashes finds two; a transfer names its
+//!   advance by them).
+//! * **The claim's transfer** (D72's transferable claim, `transferAdvanceClaim
+//!   (key, to)`) — an ordinary spend from the advance's current creditor whose
+//!   live outputs are exactly `(new_creditor, any)`, the marker
+//!   `JTMADT01 ‖ a12 ‖ t12` (value 0; `a12`: the commitment bytes of the
+//!   advance's marker, which name it; `t12`: 12 bytes of the tagged byte-hash
+//!   of `(n, owner, amount, A, new_creditor)`), then at most one change output
+//!   to the creditor; at most one per advance and per block, never in a block
+//!   that releases its `n`.
+//! * **V2 at the release of `n`** — when the branch holds the advance whose
+//!   key is exactly the burn proven, the release pays its current creditor
+//!   `amount − R`; otherwise the burn's owner (a wrong advance loses the
+//!   advancer's money, never the owner's). Either way **every** advance of
+//!   `n` is consumed: the others are lost by their authors and their
+//!   outstanding no longer counts them. No advance expires (D107: a timer
+//!   would take the advancer's money during a pause of Base).
 //! * **V5** — both markers carry no value, cannot be spent and never appear
 //!   in a system record.
 //!
@@ -37,6 +48,7 @@
 //! snapshot rebuilds the advances from its live slots and a file it can
 //! check, as it does the releases (T2.3, I12).
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
@@ -65,7 +77,7 @@ pub const ADVANCE_OUTSTANDING_CAP_MICRO: u64 = 3_000 * MICRO_PER_JTM;
 const _: () = assert!(ADVANCE_MAX_AMOUNT_MICRO <= u32::MAX as u64);
 
 const ADVANCE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE";
-const TRANSFER_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE-TRANSFER";
+const TRANSFER_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE-CLAIM-TRANSFER";
 
 /// The advance's parameters; [`AdvanceRules::CONSENSUS`] is this build's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,23 +168,75 @@ pub fn advance_marker_fields(owner: &Address) -> Option<(u64, u64)> {
     })
 }
 
-/// The marker of the transfer of the claim of advance `n` to `new_creditor`.
-pub fn advance_transfer_marker(n: u64, new_creditor: &Address) -> Address {
-    let mut fields = [0u8; 8 + 32];
+/// The 12 commitment bytes of an advance marker: what names its advance.
+pub fn advance_marker_commitment(marker: &Address) -> [u8; 12] {
+    marker.0[20..].try_into().expect("twelve bytes")
+}
+
+/// The marker of the transfer of the claim of the advance of the burn
+/// `(n, owner, amount)` by `advancer` to `new_creditor`.
+pub fn advance_transfer_marker(
+    n: u64,
+    owner: &Address,
+    amount: u64,
+    advancer: &Address,
+    new_creditor: &Address,
+) -> Address {
+    let advance = advance_marker(n, owner, amount, advancer);
+    let mut fields = [0u8; 8 + 32 + 8 + 32 + 32];
     fields[..8].copy_from_slice(&n.to_le_bytes());
-    fields[8..].copy_from_slice(&new_creditor.0);
+    fields[8..40].copy_from_slice(&owner.0);
+    fields[40..48].copy_from_slice(&amount.to_le_bytes());
+    fields[48..80].copy_from_slice(&advancer.0);
+    fields[80..].copy_from_slice(&new_creditor.0);
     let commitment = poseidon2b_hash_bytes(TRANSFER_COMMITMENT_DOMAIN, &fields);
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&ADVANCE_TRANSFER_MARKER_TAG);
-    out[8..16].copy_from_slice(&n.to_le_bytes());
-    out[16..].copy_from_slice(&commitment[..16]);
+    out[8..20].copy_from_slice(&advance_marker_commitment(&advance));
+    out[20..].copy_from_slice(&commitment[..12]);
     Address(out)
 }
 
-/// The `n` a transfer marker carries in clear; `None` for any other owner.
-pub fn advance_transfer_marker_n(owner: &Address) -> Option<u64> {
+/// The commitment bytes of the advance marker a transfer marker names; `None`
+/// for any other owner.
+pub fn advance_transfer_marker_advance(owner: &Address) -> Option<[u8; 12]> {
     (advance_marker_kind(owner) == Some(AdvanceMarkerKind::Transfer))
-        .then(|| u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")))
+        .then(|| owner.0[8..20].try_into().expect("twelve bytes"))
+}
+
+/// The key of an advance (D114, D72's tuple): the burn it advances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AdvanceKey {
+    pub n: u64,
+    pub owner: Address,
+    pub amount: u64,
+}
+
+impl AdvanceKey {
+    fn order(&self) -> (u64, [u8; 32], u64) {
+        (self.n, self.owner.0, self.amount)
+    }
+
+    /// The least key of `n`.
+    fn first_of(n: u64) -> Self {
+        Self {
+            n,
+            owner: Address([0; 32]),
+            amount: 0,
+        }
+    }
+}
+
+impl Ord for AdvanceKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl PartialOrd for AdvanceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// One advance a branch holds.
@@ -187,11 +251,34 @@ pub struct AdvanceEntry {
     pub amount: u64,
 }
 
-/// The advances a branch holds, by withdrawal index, and what each advancer
-/// has outstanding (derived, never encoded).
+impl AdvanceEntry {
+    /// Its key as an advance of `n`.
+    pub fn key(&self, n: u64) -> AdvanceKey {
+        AdvanceKey {
+            n,
+            owner: self.owner,
+            amount: self.amount,
+        }
+    }
+
+    /// Its marker as an advance of `n`.
+    pub fn marker(&self, n: u64) -> Address {
+        advance_marker(n, &self.owner, self.amount, &self.origin)
+    }
+
+    /// The marker of the transfer of its claim to `new_creditor`.
+    pub fn transfer_marker(&self, n: u64, new_creditor: &Address) -> Address {
+        advance_transfer_marker(n, &self.owner, self.amount, &self.origin, new_creditor)
+    }
+}
+
+/// The advances a branch holds, by key; which marker names each and what each
+/// advancer has outstanding are derived, never encoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdvanceBook {
-    entries: BTreeMap<u64, AdvanceEntry>,
+    entries: BTreeMap<AdvanceKey, AdvanceEntry>,
+    /// The commitment bytes of each advance's marker.
+    by_marker: BTreeMap<[u8; 12], AdvanceKey>,
     /// By the advancer's owner bytes.
     outstanding: BTreeMap<[u8; 32], u64>,
 }
@@ -201,8 +288,28 @@ impl AdvanceBook {
         Self::default()
     }
 
-    pub fn get(&self, n: u64) -> Option<&AdvanceEntry> {
-        self.entries.get(&n)
+    /// The advance of exactly the burn `key`.
+    pub fn get(&self, key: &AdvanceKey) -> Option<&AdvanceEntry> {
+        self.entries.get(key)
+    }
+
+    /// The advances of `n`, by key.
+    pub fn of_n(&self, n: u64) -> impl Iterator<Item = &AdvanceEntry> + '_ {
+        self.entries
+            .range(AdvanceKey::first_of(n)..)
+            .take_while(move |(key, _)| key.n == n)
+            .map(|(_, entry)| entry)
+    }
+
+    /// Whether the branch holds an advance of `n`.
+    pub fn holds_n(&self, n: u64) -> bool {
+        self.of_n(n).next().is_some()
+    }
+
+    /// The advance whose marker has the commitment bytes `commitment`.
+    pub fn by_marker(&self, commitment: &[u8; 12]) -> Option<(AdvanceKey, &AdvanceEntry)> {
+        let key = self.by_marker.get(commitment)?;
+        self.entries.get(key).map(|entry| (*key, entry))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -213,9 +320,9 @@ impl AdvanceBook {
         self.entries.len()
     }
 
-    /// The advances, by increasing `n`.
+    /// The advances, by increasing key.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &AdvanceEntry)> + '_ {
-        self.entries.iter().map(|(n, entry)| (*n, entry))
+        self.entries.iter().map(|(key, entry)| (key.n, entry))
     }
 
     /// What `origin` has advanced and not yet seen consumed.
@@ -223,29 +330,50 @@ impl AdvanceBook {
         self.outstanding.get(&origin.0).copied().unwrap_or(0)
     }
 
-    /// Record an advance; the previous entry of `n`, if any.
+    /// Record an advance of `n`; the previous entry of its key, if any. The
+    /// caller never records two advances whose markers share their
+    /// commitment bytes (the rule refuses the second).
     pub fn insert(&mut self, n: u64, entry: AdvanceEntry) -> Option<AdvanceEntry> {
-        let previous = self.remove(n);
+        let key = entry.key(n);
+        let previous = self.remove(&key);
         *self.outstanding.entry(entry.origin.0).or_insert(0) += entry.amount;
-        self.entries.insert(n, entry);
+        self.by_marker
+            .insert(advance_marker_commitment(&entry.marker(n)), key);
+        self.entries.insert(key, entry);
         previous
     }
 
-    /// Forget the advance of `n`.
-    pub fn remove(&mut self, n: u64) -> Option<AdvanceEntry> {
-        let entry = self.entries.remove(&n)?;
+    /// Forget the advance of the burn `key`.
+    pub fn remove(&mut self, key: &AdvanceKey) -> Option<AdvanceEntry> {
+        let entry = self.entries.remove(key)?;
         if let Some(sum) = self.outstanding.get_mut(&entry.origin.0) {
             *sum -= entry.amount;
             if *sum == 0 {
                 self.outstanding.remove(&entry.origin.0);
             }
         }
+        let commitment = advance_marker_commitment(&entry.marker(key.n));
+        if self.by_marker.get(&commitment) == Some(key) {
+            self.by_marker.remove(&commitment);
+        }
         Some(entry)
     }
 
-    /// Name `creditor` the creditor of advance `n`; the previous one.
-    pub fn set_creditor(&mut self, n: u64, creditor: Address) -> Option<Address> {
-        let entry = self.entries.get_mut(&n)?;
+    /// Forget every advance of `n` (its release consumes them); they are
+    /// returned by key.
+    pub fn remove_n(&mut self, n: u64) -> Vec<AdvanceEntry> {
+        let keys: Vec<AdvanceKey> = self
+            .entries
+            .range(AdvanceKey::first_of(n)..)
+            .take_while(|(key, _)| key.n == n)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.iter().filter_map(|key| self.remove(key)).collect()
+    }
+
+    /// Name `creditor` the creditor of the advance `key`; the previous one.
+    pub fn set_creditor(&mut self, key: &AdvanceKey, creditor: Address) -> Option<Address> {
+        let entry = self.entries.get_mut(key)?;
         Some(std::mem::replace(&mut entry.creditor, creditor))
     }
 }
@@ -256,9 +384,9 @@ impl AdvanceBook {
 pub struct AdvanceEffect {
     /// The advances it makes, in group order.
     pub created: Vec<(u64, AdvanceEntry)>,
-    /// The claims it transfers: `(n, new creditor)`, in group order.
-    pub transfers: Vec<(u64, Address)>,
-    /// The advances its releases consume.
+    /// The claims it transfers: `(advance, new creditor)`, in group order.
+    pub transfers: Vec<(AdvanceKey, Address)>,
+    /// The withdrawal indices whose advances its releases consume.
     pub consumed: Vec<u64>,
 }
 
@@ -289,8 +417,11 @@ pub enum AdvanceError {
     AdvanceUnderpaid { group: usize, paid: u64, min: u64 },
     /// `n` was paid by the branch.
     AdvanceOfReleased { n: u64 },
-    /// `n` is advanced already (on the branch or earlier in the block).
+    /// This burn is advanced already (on the branch or earlier in the block).
     AlreadyAdvanced { n: u64 },
+    /// Another advance held (or made earlier in the block) has a marker with
+    /// the same commitment bytes.
+    AdvanceMarkerTaken { group: usize },
     /// The block releases `n` too.
     ReleasedInTheSameBlock { n: u64 },
     /// The advancer's outstanding would pass the cap.
@@ -302,13 +433,13 @@ pub enum AdvanceError {
     },
     /// A transfer group not of the shape new creditor, marker, change.
     TransferShape { group: usize },
-    /// The transfer marker does not commit to `(n, new creditor)`.
+    /// The transfer marker does not commit to its advance and new creditor.
     TransferMarkerMismatch { group: usize },
-    /// A transfer of an `n` the branch holds no advance of.
-    NoAdvanceToTransfer { n: u64 },
+    /// A transfer naming no advance the branch holds.
+    NoAdvanceToTransfer { group: usize },
     /// A transfer spent from another owner than the creditor.
     TransferNotByCreditor { group: usize, n: u64 },
-    /// A second transfer of `n` in the block.
+    /// A second transfer of one advance in the block.
     TransferredTwice { n: u64 },
 }
 
@@ -324,6 +455,214 @@ impl AdvanceError {
 /// guardian pool.
 fn payable(owner: &Address, vault: &VaultRules) -> bool {
     advance_marker_kind(owner).is_none() && release_shape_ok(owner, vault.release_fee, vault)
+}
+
+/// Whether a group's live outputs carry an advance or transfer marker: the
+/// only groups the rule reads.
+pub fn carries_advance_marker(outputs: &[(Address, u64)]) -> bool {
+    outputs
+        .iter()
+        .any(|(owner, _)| advance_marker_kind(owner).is_some())
+}
+
+/// The rule of the advance groups of one block, group by group, in block
+/// order: the block applies it to all of them; a mempool to one transaction
+/// against its view; a template while it places the groups it may carry.
+#[derive(Clone, Debug)]
+pub struct AdvanceCheck<'a> {
+    book: &'a AdvanceBook,
+    released: &'a ReleasedSet,
+    /// The withdrawal indices the block releases.
+    released_here: Vec<u64>,
+    vault: &'a VaultRules,
+    rules: &'a AdvanceRules,
+    effect: AdvanceEffect,
+    /// What each advancer advances in the block so far.
+    advanced_here: BTreeMap<[u8; 32], u64>,
+}
+
+impl<'a> AdvanceCheck<'a> {
+    /// The rule against the branch's advances `book` and paid set `released`,
+    /// for a block that releases `released_here`.
+    pub fn new(
+        book: &'a AdvanceBook,
+        released: &'a ReleasedSet,
+        released_here: Vec<u64>,
+        vault: &'a VaultRules,
+        rules: &'a AdvanceRules,
+    ) -> Self {
+        Self {
+            book,
+            released,
+            released_here,
+            vault,
+            rules,
+            effect: AdvanceEffect::default(),
+            advanced_here: BTreeMap::new(),
+        }
+    }
+
+    /// The next group of the block, `index`-th, spent from `from`, with its
+    /// live `outputs`: accepted (and counted for the groups after it), or
+    /// refused (and nothing of it counted). Groups without an advance marker
+    /// are not read.
+    pub fn group(
+        &mut self,
+        index: usize,
+        from: Address,
+        outputs: &[(Address, u64)],
+    ) -> Result<(), AdvanceError> {
+        let markers: Vec<(usize, AdvanceMarkerKind)> = outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (owner, _))| advance_marker_kind(owner).map(|kind| (i, kind)))
+            .collect();
+        let Some(&(_, first_kind)) = markers.first() else {
+            return Ok(());
+        };
+        // V5: no value on either marker.
+        if markers.iter().any(|(i, _)| outputs[*i].1 != 0) {
+            return Err(AdvanceError::MarkerCarriesValue { group: index });
+        }
+        let shape_error = |kind| match kind {
+            AdvanceMarkerKind::Advance => AdvanceError::AdvanceShape { group: index },
+            AdvanceMarkerKind::Transfer => AdvanceError::TransferShape { group: index },
+        };
+        // The shape: the payee, the group's one marker, at most one change
+        // back to the spender; never spent from the vault.
+        let kind = match outputs {
+            [_, (marker, _)] | [_, (marker, _), _] => advance_marker_kind(marker),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            return Err(shape_error(first_kind));
+        };
+        let vault = self.vault;
+        let (payee, paid) = outputs[0];
+        let marker = outputs[1].0;
+        let shape_ok = from != vault.vault
+            && markers.len() == 1
+            && payable(&payee, vault)
+            && outputs.get(2).is_none_or(|(change, _)| *change == from);
+        if !shape_ok {
+            return Err(shape_error(kind));
+        }
+        match kind {
+            AdvanceMarkerKind::Advance => self.advance(index, from, payee, paid, marker),
+            AdvanceMarkerKind::Transfer => self.transfer(index, from, payee, marker),
+        }
+    }
+
+    fn advance(
+        &mut self,
+        index: usize,
+        from: Address,
+        payee: Address,
+        paid: u64,
+        marker: Address,
+    ) -> Result<(), AdvanceError> {
+        let (n, amount) = advance_marker_fields(&marker).expect("an advance marker");
+        if advance_marker(n, &payee, amount, &from) != marker {
+            return Err(AdvanceError::AdvanceMarkerMismatch { group: index });
+        }
+        if amount < self.vault.release_fee || amount > self.rules.max_amount {
+            return Err(AdvanceError::AdvanceAmount {
+                group: index,
+                amount,
+            });
+        }
+        let min = self.rules.min_paid(amount, self.vault.release_fee);
+        if paid < min {
+            return Err(AdvanceError::AdvanceUnderpaid {
+                group: index,
+                paid,
+                min,
+            });
+        }
+        // D52, then the burn advanced once (D72's tuple, D114).
+        if self.released.contains(n) {
+            return Err(AdvanceError::AdvanceOfReleased { n });
+        }
+        let entry = AdvanceEntry {
+            origin: from,
+            creditor: from,
+            owner: payee,
+            amount,
+        };
+        let key = entry.key(n);
+        if self.book.get(&key).is_some()
+            || self.effect.created.iter().any(|(m, e)| e.key(*m) == key)
+        {
+            return Err(AdvanceError::AlreadyAdvanced { n });
+        }
+        // The marker names its advance for a transfer: never two held with
+        // the same commitment bytes.
+        let commitment = advance_marker_commitment(&marker);
+        if self.book.by_marker(&commitment).is_some()
+            || self
+                .effect
+                .created
+                .iter()
+                .any(|(m, e)| advance_marker_commitment(&e.marker(*m)) == commitment)
+        {
+            return Err(AdvanceError::AdvanceMarkerTaken { group: index });
+        }
+        if self.released_here.contains(&n) {
+            return Err(AdvanceError::ReleasedInTheSameBlock { n });
+        }
+        // D72 / D107: the advancer's outstanding, this block's included.
+        let outstanding = self
+            .book
+            .outstanding_of(&from)
+            .saturating_add(self.advanced_here.get(&from.0).copied().unwrap_or(0));
+        if outstanding.saturating_add(amount) > self.rules.outstanding_cap {
+            return Err(AdvanceError::OutstandingCapReached {
+                group: index,
+                outstanding,
+                amount,
+                cap: self.rules.outstanding_cap,
+            });
+        }
+        *self.advanced_here.entry(from.0).or_insert(0) += amount;
+        self.effect.created.push((n, entry));
+        Ok(())
+    }
+
+    fn transfer(
+        &mut self,
+        index: usize,
+        from: Address,
+        payee: Address,
+        marker: Address,
+    ) -> Result<(), AdvanceError> {
+        let named = advance_transfer_marker_advance(&marker).expect("a transfer marker");
+        let (key, entry) = self
+            .book
+            .by_marker(&named)
+            .ok_or(AdvanceError::NoAdvanceToTransfer { group: index })?;
+        if entry.transfer_marker(key.n, &payee) != marker {
+            return Err(AdvanceError::TransferMarkerMismatch { group: index });
+        }
+        if entry.creditor != from {
+            return Err(AdvanceError::TransferNotByCreditor {
+                group: index,
+                n: key.n,
+            });
+        }
+        if self.released_here.contains(&key.n) {
+            return Err(AdvanceError::ReleasedInTheSameBlock { n: key.n });
+        }
+        if self.effect.transfers.iter().any(|(moved, _)| *moved == key) {
+            return Err(AdvanceError::TransferredTwice { n: key.n });
+        }
+        self.effect.transfers.push((key, payee));
+        Ok(())
+    }
+
+    /// What the groups accepted do.
+    pub fn finish(self) -> AdvanceEffect {
+        self.effect
+    }
 }
 
 /// The rule of the advances and transfers of one block at a height the
@@ -354,129 +693,25 @@ pub fn validate_block_advances(
         .flat_map(|page| page.body.live_outputs())
         .filter_map(|(_, output)| release_marker_n(&output.owner))
         .collect();
-    let mut effect = AdvanceEffect::default();
-    let mut advanced_here: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    let mut check = AdvanceCheck::new(book, released, released_here, vault, rules);
     for (index, group) in stream.groups.iter().enumerate() {
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         let outputs: Vec<(Address, u64)> = pages
             .iter()
             .flat_map(|page| page.body.live_outputs().map(|(_, o)| (o.owner, o.amount)))
             .collect();
-        let markers: Vec<(usize, AdvanceMarkerKind)> = outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (owner, _))| advance_marker_kind(owner).map(|kind| (i, kind)))
-            .collect();
-        let Some(&(_, first_kind)) = markers.first() else {
-            continue;
-        };
-        // V5: no value on either marker.
-        if markers.iter().any(|(i, _)| outputs[*i].1 != 0) {
-            return Err(AdvanceError::MarkerCarriesValue { group: index });
-        }
-        let shape_error = |kind| match kind {
-            AdvanceMarkerKind::Advance => AdvanceError::AdvanceShape { group: index },
-            AdvanceMarkerKind::Transfer => AdvanceError::TransferShape { group: index },
-        };
-        // The shape: the payee, the group's one marker, at most one change
-        // back to the spender; never spent from the vault.
-        let kind = match outputs.as_slice() {
-            [_, (marker, _)] | [_, (marker, _), _] => advance_marker_kind(marker),
-            _ => None,
-        };
-        let Some(kind) = kind else {
-            return Err(shape_error(first_kind));
-        };
-        let from = group.spend.input_owner;
-        let (payee, paid) = outputs[0];
-        let marker = outputs[1].0;
-        let shape_ok = from != vault.vault
-            && markers.len() == 1
-            && payable(&payee, vault)
-            && outputs.get(2).is_none_or(|(change, _)| *change == from);
-        if !shape_ok {
-            return Err(shape_error(kind));
-        }
-        match kind {
-            AdvanceMarkerKind::Advance => {
-                let (n, amount) = advance_marker_fields(&marker).expect("an advance marker");
-                if advance_marker(n, &payee, amount, &from) != marker {
-                    return Err(AdvanceError::AdvanceMarkerMismatch { group: index });
-                }
-                if amount < vault.release_fee || amount > rules.max_amount {
-                    return Err(AdvanceError::AdvanceAmount {
-                        group: index,
-                        amount,
-                    });
-                }
-                let min = rules.min_paid(amount, vault.release_fee);
-                if paid < min {
-                    return Err(AdvanceError::AdvanceUnderpaid {
-                        group: index,
-                        paid,
-                        min,
-                    });
-                }
-                // D52, then the first advance of `n` holds.
-                if released.contains(n) {
-                    return Err(AdvanceError::AdvanceOfReleased { n });
-                }
-                if book.get(n).is_some() || effect.created.iter().any(|(m, _)| *m == n) {
-                    return Err(AdvanceError::AlreadyAdvanced { n });
-                }
-                if released_here.contains(&n) {
-                    return Err(AdvanceError::ReleasedInTheSameBlock { n });
-                }
-                // D72 / D107: the advancer's outstanding, this block's included.
-                let outstanding = book
-                    .outstanding_of(&from)
-                    .saturating_add(advanced_here.get(&from.0).copied().unwrap_or(0));
-                if outstanding.saturating_add(amount) > rules.outstanding_cap {
-                    return Err(AdvanceError::OutstandingCapReached {
-                        group: index,
-                        outstanding,
-                        amount,
-                        cap: rules.outstanding_cap,
-                    });
-                }
-                *advanced_here.entry(from.0).or_insert(0) += amount;
-                effect.created.push((
-                    n,
-                    AdvanceEntry {
-                        origin: from,
-                        creditor: from,
-                        owner: payee,
-                        amount,
-                    },
-                ));
-            }
-            AdvanceMarkerKind::Transfer => {
-                let n = advance_transfer_marker_n(&marker).expect("a transfer marker");
-                if advance_transfer_marker(n, &payee) != marker {
-                    return Err(AdvanceError::TransferMarkerMismatch { group: index });
-                }
-                let entry = book.get(n).ok_or(AdvanceError::NoAdvanceToTransfer { n })?;
-                if entry.creditor != from {
-                    return Err(AdvanceError::TransferNotByCreditor { group: index, n });
-                }
-                if released_here.contains(&n) {
-                    return Err(AdvanceError::ReleasedInTheSameBlock { n });
-                }
-                if effect.transfers.iter().any(|(m, _)| *m == n) {
-                    return Err(AdvanceError::TransferredTwice { n });
-                }
-                effect.transfers.push((n, payee));
-            }
-        }
+        check.group(index, group.spend.input_owner, &outputs)?;
     }
-    Ok(effect)
+    Ok(check.finish())
 }
 
 /// V2 at the release of `(n, owner, amount)` against the advances `book`: the
-/// creditor of an advance of exactly that burn, else the burn's owner.
+/// creditor of the advance of exactly that burn, else the burn's owner.
 pub fn release_payee(book: &AdvanceBook, n: u64, owner: &Address, amount: u64) -> Address {
-    match book.get(n) {
-        Some(entry) if entry.owner == *owner && entry.amount == amount => entry.creditor,
-        _ => *owner,
-    }
+    book.get(&AdvanceKey {
+        n,
+        owner: *owner,
+        amount,
+    })
+    .map_or(*owner, |entry| entry.creditor)
 }

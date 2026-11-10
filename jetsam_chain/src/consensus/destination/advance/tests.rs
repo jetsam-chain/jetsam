@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 the Jetsam developers.
 
-//! The advance of the return over Base (SPEC retour Base §4, D107): its
-//! markers, its shape and bounds, the first advance of `n` holding, the
-//! outstanding cap per advancer, the claim's transfer, V2 at the release.
+//! The advance of the return over Base (SPEC retour Base §4, D107, D114): its
+//! markers, its shape and bounds, its key the burn `(n, owner, amount)` (an
+//! advance of another burn of `n` blocks nothing), the outstanding cap per
+//! advancer, the claim's transfer by its advance, V2 at the release.
 
 use super::*;
 use crate::block::Block;
@@ -53,19 +54,25 @@ fn advance_group(
     logical(slot_base, advancer, &outputs, FEE)
 }
 
-/// A transfer group of the claim of `n` from `creditor` to `to`.
+/// A transfer group of the claim of the advance `(n, advance)` from
+/// `creditor` to `to`.
 fn transfer_group(
     slot_base: u32,
     creditor: Address,
     n: u64,
+    advance: &AdvanceEntry,
     to: Address,
 ) -> Vec<jetsam_tx::Transaction> {
     logical(
         slot_base,
         creditor,
-        &[(to, 0), (advance_transfer_marker(n, &to), 0)],
+        &[(to, 0), (advance.transfer_marker(n, &to), 0)],
         FEE,
     )
+}
+
+fn key(n: u64, owner: Address, amount: u64) -> AdvanceKey {
+    AdvanceKey { n, owner, amount }
 }
 
 fn block(groups: Vec<Vec<jetsam_tx::Transaction>>) -> Block {
@@ -109,7 +116,6 @@ fn the_advance_marker_carries_n_and_amount_in_clear_and_commits_to_the_rest() {
     assert_eq!(m.0[16..20], (5 * JTM as u32).to_le_bytes());
     assert_eq!(advance_marker_fields(&m), Some((N, 5 * JTM)));
     assert_eq!(advance_marker_kind(&m), Some(AdvanceMarkerKind::Advance));
-    assert_eq!(advance_transfer_marker_n(&m), None);
     // Every field moves the marker: another owner, amount, advancer, n.
     for other in [
         advance_marker(N, &BOB, 5 * JTM, &PAYER),
@@ -120,17 +126,34 @@ fn the_advance_marker_carries_n_and_amount_in_clear_and_commits_to_the_rest() {
         assert_ne!(other, m);
         assert_ne!(other.0[20..], m.0[20..], "the commitment differs");
     }
-    let t = advance_transfer_marker(N, &BOB);
+    // The transfer marker names its advance by the advance marker's
+    // commitment bytes, then commits to the burn, the advancer and the new
+    // creditor.
+    let t = advance_transfer_marker(N, &ALICE, 5 * JTM, &PAYER, &BOB);
     assert_eq!(&t.0[..8], b"JTMADT01");
-    assert_eq!(advance_transfer_marker_n(&t), Some(N));
+    assert_eq!(t.0[8..20], m.0[20..]);
+    assert_eq!(
+        advance_transfer_marker_advance(&t),
+        Some(advance_marker_commitment(&m))
+    );
     assert_eq!(advance_marker_kind(&t), Some(AdvanceMarkerKind::Transfer));
     assert_eq!(advance_marker_fields(&t), None);
-    assert_ne!(advance_transfer_marker(N, &CAROL), t);
-    assert_ne!(advance_transfer_marker(N + 1, &BOB), t);
+    assert_eq!(advance_transfer_marker_advance(&m), None);
+    assert_eq!(entry(PAYER, ALICE, 5 * JTM).transfer_marker(N, &BOB), t);
+    assert_eq!(entry(PAYER, ALICE, 5 * JTM).marker(N), m);
+    for other in [
+        advance_transfer_marker(N, &ALICE, 5 * JTM, &PAYER, &CAROL),
+        advance_transfer_marker(N + 1, &ALICE, 5 * JTM, &PAYER, &BOB),
+        advance_transfer_marker(N, &CAROL, 5 * JTM, &PAYER, &BOB),
+        advance_transfer_marker(N, &ALICE, 5 * JTM + 1, &PAYER, &BOB),
+        advance_transfer_marker(N, &ALICE, 5 * JTM, &CAROL, &BOB),
+    ] {
+        assert_ne!(other.0[20..], t.0[20..], "the commitment differs");
+    }
     for plain in [ALICE, VAULT_ADDRESS, deposit_marker(&[3; 20])] {
         assert_eq!(advance_marker_kind(&plain), None);
         assert_eq!(advance_marker_fields(&plain), None);
-        assert_eq!(advance_transfer_marker_n(&plain), None);
+        assert_eq!(advance_transfer_marker_advance(&plain), None);
     }
 }
 
@@ -141,7 +164,7 @@ fn the_advance_markers_are_locked_from_the_return_over_base_on() {
     let hb = HEIGHT;
     for marker in [
         advance_marker(N, &ALICE, 5 * JTM, &PAYER),
-        advance_transfer_marker(N, &BOB),
+        advance_transfer_marker(N, &ALICE, 5 * JTM, &PAYER, &BOB),
     ] {
         assert!(is_advance_locked_address_at(&marker, hb, Some(hb)));
         assert!(is_advance_locked_address_at(&marker, hb + 9, Some(hb)));
@@ -298,7 +321,7 @@ fn an_advance_of_another_shape_is_refused() {
             vec![
                 (ALICE, paid),
                 (marker, 0),
-                (advance_transfer_marker(N, &BOB), 0),
+                (advance_transfer_marker(N, &ALICE, amount, &PAYER, &BOB), 0),
             ],
             PAYER,
             shape.clone(),
@@ -333,7 +356,7 @@ fn an_advance_of_another_shape_is_refused() {
         300,
         PAYER,
         N,
-        advance_transfer_marker(N, &BOB),
+        advance_transfer_marker(N, &ALICE, amount, &PAYER, &BOB),
         amount,
         paid,
         0,
@@ -384,11 +407,11 @@ fn an_advance_whose_marker_names_another_burn_or_advancer_is_refused() {
     }
 }
 
-/// D52 and the first advance of `n` holding: never for a paid `n`, never a
-/// second one (from the branch or earlier in the block), never in the block
-/// that releases `n`.
+/// D52 and D114: never for a paid `n`; the same burn advanced once (a second
+/// advance of it, by anyone, from the branch or earlier in the block, is
+/// refused); never in the block that releases `n`.
 #[test]
-fn the_first_advance_of_n_holds_and_none_follows_its_release() {
+fn a_burn_is_advanced_once_and_none_follows_its_release() {
     let amount = 10 * JTM;
     let group = |slot, from| advance_group(slot, from, N, ALICE, amount, min_paid(amount), 0);
     let mut paid = ReleasedSet::new();
@@ -410,7 +433,26 @@ fn the_first_advance_of_n_holds_and_none_follows_its_release() {
         ),
         Err(AdvanceError::AlreadyAdvanced { n: N })
     );
-    // Another n beside it is fine.
+    // Another burn of n (another owner or amount), or another n, beside it.
+    for other in [
+        advance_group(400, BOB, N, CAROL, amount, min_paid(amount), 0),
+        advance_group(400, BOB, N, ALICE, amount + 1, min_paid(amount + 1), 0),
+        advance_group(400, BOB, N + 1, ALICE, amount, min_paid(amount), 0),
+    ] {
+        assert_eq!(
+            check(&block(vec![other.clone()]), &held, &ReleasedSet::new()).map(|e| e.created.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            check(
+                &block(vec![group(300, PAYER), other]),
+                &AdvanceBook::new(),
+                &ReleasedSet::new()
+            )
+            .map(|e| e.created.len()),
+            Ok(2)
+        );
+    }
     let other = advance_group(400, BOB, N + 1, ALICE, amount, min_paid(amount), 0);
     assert_eq!(
         check(
@@ -432,6 +474,52 @@ fn the_first_advance_of_n_holds_and_none_follows_its_release() {
         check(&b, &AdvanceBook::new(), &ReleasedSet::new()),
         Err(AdvanceError::ReleasedInTheSameBlock { n: N })
     );
+}
+
+/// D114, mirror of D72's `test_wrong_tuple_placed_first_blocks_nothing`: an
+/// advance of another burn of `n` placed first — a stranger advancing the
+/// release fee to himself, paying nothing — blocks nothing: the reserve still
+/// advances the true burn of `n`, in a later block or in the same one.
+#[test]
+fn a_wrong_advance_placed_first_blocks_nothing() {
+    let amount = 300 * JTM;
+    let fake = advance_group(300, CAROL, N, CAROL, RF, 0, 0);
+    let honest = advance_group(400, PAYER, N, ALICE, amount, min_paid(amount), 0);
+    let effect = check(
+        &block(vec![fake.clone()]),
+        &AdvanceBook::new(),
+        &ReleasedSet::new(),
+    )
+    .expect("the stranger's advance is one too");
+    assert_eq!(effect.created, vec![(N, entry(CAROL, CAROL, RF))]);
+    let mut book = AdvanceBook::new();
+    for (n, e) in &effect.created {
+        book.insert(*n, *e);
+    }
+    // A later block: the fake is the branch's.
+    assert_eq!(
+        check(&block(vec![honest.clone()]), &book, &ReleasedSet::new()).map(|e| e.created),
+        Ok(vec![(N, entry(PAYER, ALICE, amount))])
+    );
+    // The same block, the fake first.
+    assert_eq!(
+        check(
+            &block(vec![fake, honest]),
+            &AdvanceBook::new(),
+            &ReleasedSet::new()
+        )
+        .map(|e| e.created),
+        Ok(vec![
+            (N, entry(CAROL, CAROL, RF)),
+            (N, entry(PAYER, ALICE, amount))
+        ])
+    );
+    // Both are the branch's, each counted for its own advancer.
+    let mut both = book.clone();
+    both.insert(N, entry(PAYER, ALICE, amount));
+    assert_eq!(both.len(), 2);
+    assert_eq!(both.outstanding_of(&CAROL), RF);
+    assert_eq!(both.outstanding_of(&PAYER), amount);
 }
 
 /// D72 / D107: what one advancer has outstanding stays within 3 000 JTM; the
@@ -492,12 +580,35 @@ fn the_outstanding_of_an_advancer_stays_within_three_thousand_jtm() {
     .is_ok());
     // A transfer keeps the outstanding with the origin.
     let mut moved = held.clone();
-    moved.set_creditor(1, BOB);
+    moved.set_creditor(&key(1, ALICE, big), BOB);
     assert_eq!(moved.outstanding_of(&PAYER), 2_500 * JTM);
     assert_eq!(moved.outstanding_of(&BOB), 0);
+    // Several advances of one n count each for its own advancer.
+    let mut many = held.clone();
+    many.insert(1, entry(PAYER, BOB, 100 * JTM));
+    many.insert(1, entry(BOB, CAROL, 7 * JTM));
+    assert_eq!(many.outstanding_of(&PAYER), 2_600 * JTM);
+    assert_eq!(many.outstanding_of(&BOB), 7 * JTM);
+    assert_eq!(
+        check(
+            &block(vec![g(300, PAYER, 9, 400 * JTM + 1)]),
+            &many,
+            &ReleasedSet::new()
+        ),
+        Err(AdvanceError::OutstandingCapReached {
+            group: 0,
+            outstanding: 2_600 * JTM,
+            amount: 400 * JTM + 1,
+            cap: 3_000 * JTM
+        })
+    );
+    // The release of n consumes all of them: each origin's room comes back.
+    assert_eq!(many.remove_n(1).len(), 3);
+    assert_eq!(many.outstanding_of(&PAYER), 1_500 * JTM);
+    assert_eq!(many.outstanding_of(&BOB), 0);
     // A consumed one frees its room.
     let mut freed = held;
-    freed.remove(1);
+    freed.remove(&key(1, ALICE, big));
     assert_eq!(freed.outstanding_of(&PAYER), 1_500 * JTM);
     assert!(check(
         &block(vec![g(300, PAYER, 9, big)]),
@@ -512,7 +623,7 @@ fn the_outstanding_of_an_advancer_stays_within_three_thousand_jtm() {
 fn no_advance_marker_in_a_system_record() {
     for marker in [
         advance_marker(N, &ALICE, 5 * JTM, &PAYER),
-        advance_transfer_marker(N, &BOB),
+        advance_transfer_marker(N, &ALICE, 5 * JTM, &PAYER, &BOB),
     ] {
         let mut b = block(vec![]);
         b.transactions[0] = coinbase(&header(HEIGHT - 1), marker);
@@ -529,47 +640,83 @@ fn no_advance_marker_in_a_system_record() {
 
 #[test]
 fn the_creditor_transfers_the_claim() {
-    let held = book_with(&[(N, entry(PAYER, ALICE, 10 * JTM))]);
-    let b = block(vec![transfer_group(300, PAYER, N, BOB)]);
+    let a = entry(PAYER, ALICE, 10 * JTM);
+    let k = key(N, ALICE, 10 * JTM);
+    let held = book_with(&[(N, a)]);
+    let b = block(vec![transfer_group(300, PAYER, N, &a, BOB)]);
     assert_eq!(
         check(&b, &held, &ReleasedSet::new()).map(|e| e.transfers),
-        Ok(vec![(N, BOB)])
+        Ok(vec![(k, BOB)])
     );
     // With change back to the creditor, and a payment to the new one.
     let b = block(vec![logical(
         300,
         PAYER,
-        &[(BOB, 4), (advance_transfer_marker(N, &BOB), 0), (PAYER, 9)],
+        &[(BOB, 4), (a.transfer_marker(N, &BOB), 0), (PAYER, 9)],
         FEE,
     )]);
     assert!(check(&b, &held, &ReleasedSet::new()).is_ok());
     // A later creditor transfers it on.
     let mut moved = held.clone();
-    moved.set_creditor(N, BOB);
-    let b = block(vec![transfer_group(300, BOB, N, CAROL)]);
+    moved.set_creditor(&k, BOB);
+    let b = block(vec![transfer_group(300, BOB, N, &a, CAROL)]);
     assert_eq!(
         check(&b, &moved, &ReleasedSet::new()).map(|e| e.transfers),
-        Ok(vec![(N, CAROL)])
+        Ok(vec![(k, CAROL)])
     );
     // ...and the origin no longer can.
-    let b = block(vec![transfer_group(300, PAYER, N, CAROL)]);
+    let b = block(vec![transfer_group(300, PAYER, N, &a, CAROL)]);
     assert_eq!(
         check(&b, &moved, &ReleasedSet::new()),
         Err(AdvanceError::TransferNotByCreditor { group: 0, n: N })
     );
 }
 
+/// D114: a transfer names one advance (D72's `transferAdvanceClaim(key,
+/// to)`), never every advance of its `n`; the others keep their creditor.
+#[test]
+fn a_transfer_moves_the_claim_of_its_advance_only() {
+    let a = entry(PAYER, ALICE, 10 * JTM);
+    let fake = entry(CAROL, CAROL, RF);
+    // The same creditor holds two advances of N (one was transferred to it).
+    let mut held = book_with(&[(N, a), (N, fake)]);
+    held.set_creditor(&key(N, CAROL, RF), PAYER);
+    let b = block(vec![transfer_group(300, PAYER, N, &a, BOB)]);
+    let effect = check(&b, &held, &ReleasedSet::new()).expect("a transfer");
+    assert_eq!(effect.transfers, vec![(key(N, ALICE, 10 * JTM), BOB)]);
+    // Both of them, in one block: each is its own claim.
+    let b = block(vec![
+        transfer_group(300, PAYER, N, &a, BOB),
+        transfer_group(400, PAYER, N, &fake, BOB),
+    ]);
+    assert_eq!(
+        check(&b, &held, &ReleasedSet::new()).map(|e| e.transfers.len()),
+        Ok(2)
+    );
+    // A transfer marker naming one advance but committing to another burn
+    // of the same n: refused.
+    let mut forged = fake.transfer_marker(N, &BOB);
+    forged.0[8..20].copy_from_slice(&advance_marker_commitment(&a.marker(N)));
+    let b = block(vec![logical(300, PAYER, &[(BOB, 0), (forged, 0)], FEE)]);
+    assert_eq!(
+        check(&b, &held, &ReleasedSet::new()),
+        Err(AdvanceError::TransferMarkerMismatch { group: 0 })
+    );
+}
+
 #[test]
 fn a_transfer_without_its_advance_or_of_another_shape_is_refused() {
-    let held = book_with(&[(N, entry(PAYER, ALICE, 10 * JTM))]);
+    let a = entry(PAYER, ALICE, 10 * JTM);
+    let held = book_with(&[(N, a)]);
     let none = ReleasedSet::new();
+    let elsewhere = entry(PAYER, ALICE, 10 * JTM);
     assert_eq!(
         check(
-            &block(vec![transfer_group(300, PAYER, N + 1, BOB)]),
+            &block(vec![transfer_group(300, PAYER, N + 1, &elsewhere, BOB)]),
             &held,
             &none
         ),
-        Err(AdvanceError::NoAdvanceToTransfer { n: N + 1 })
+        Err(AdvanceError::NoAdvanceToTransfer { group: 0 })
     );
     // An advance and its transfer in one block: the advance is not the
     // branch's yet.
@@ -578,25 +725,25 @@ fn a_transfer_without_its_advance_or_of_another_shape_is_refused() {
         check(
             &block(vec![
                 advance_group(300, PAYER, N + 1, ALICE, amount, min_paid(amount), 0),
-                transfer_group(400, PAYER, N + 1, BOB),
+                transfer_group(400, PAYER, N + 1, &elsewhere, BOB),
             ]),
             &held,
             &none
         ),
-        Err(AdvanceError::NoAdvanceToTransfer { n: N + 1 })
+        Err(AdvanceError::NoAdvanceToTransfer { group: 1 })
     );
     // The marker names another new creditor than the one paid.
     let b = block(vec![logical(
         300,
         PAYER,
-        &[(BOB, 0), (advance_transfer_marker(N, &CAROL), 0)],
+        &[(BOB, 0), (a.transfer_marker(N, &CAROL), 0)],
         FEE,
     )]);
     assert_eq!(
         check(&b, &held, &none),
         Err(AdvanceError::TransferMarkerMismatch { group: 0 })
     );
-    let marker = advance_transfer_marker(N, &BOB);
+    let marker = a.transfer_marker(N, &BOB);
     for outputs in [
         vec![(marker, 0), (BOB, 0)],
         vec![(BOB, 0), (marker, 0), (CAROL, 1)],
@@ -612,7 +759,7 @@ fn a_transfer_without_its_advance_or_of_another_shape_is_refused() {
     }
     // To a marker or the vault.
     for to in [VAULT_ADDRESS, advance_marker(N, &ALICE, amount, &PAYER)] {
-        let b = block(vec![transfer_group(300, PAYER, N, to)]);
+        let b = block(vec![transfer_group(300, PAYER, N, &a, to)]);
         assert_eq!(
             check(&b, &held, &none),
             Err(AdvanceError::TransferShape { group: 0 })
@@ -627,31 +774,63 @@ fn a_transfer_without_its_advance_or_of_another_shape_is_refused() {
 
 #[test]
 fn a_claim_moves_once_per_block_and_never_beside_its_release() {
-    let held = book_with(&[(N, entry(PAYER, ALICE, 10 * JTM))]);
+    let a = entry(PAYER, ALICE, 10 * JTM);
+    let held = book_with(&[(N, a)]);
     assert_eq!(
         check(
             &block(vec![
-                transfer_group(300, PAYER, N, BOB),
-                transfer_group(400, PAYER, N, CAROL)
+                transfer_group(300, PAYER, N, &a, BOB),
+                transfer_group(400, PAYER, N, &a, CAROL)
             ]),
             &held,
             &ReleasedSet::new()
         ),
         Err(AdvanceError::TransferredTwice { n: N })
     );
-    let r = release(N, ALICE, 10 * JTM);
-    let b = block_at(
-        HEIGHT,
-        vec![
-            release_group(100, &r, 0, FEE),
-            transfer_group(300, PAYER, N, BOB),
-        ],
-        &[r],
-    );
+    // The release of n beside the transfer of any advance of n: refused,
+    // whichever burn the release proves.
+    for released in [release(N, ALICE, 10 * JTM), release(N, BOB, JTM)] {
+        let b = block_at(
+            HEIGHT,
+            vec![
+                release_group(100, &released, 0, FEE),
+                transfer_group(300, PAYER, N, &a, BOB),
+            ],
+            &[released],
+        );
+        assert_eq!(
+            check(&b, &held, &ReleasedSet::new()),
+            Err(AdvanceError::ReleasedInTheSameBlock { n: N })
+        );
+    }
+}
+
+/// The commitment bytes of an advance marker name it for a transfer: an
+/// advance whose marker shares them with a held one (or one earlier in the
+/// block) is refused. Two such markers take a search of 2⁴⁸ hashes; the
+/// test forges the book's index instead.
+#[test]
+fn no_two_advances_held_share_their_markers_commitment() {
+    let amount = 10 * JTM;
+    let honest = entry(PAYER, ALICE, amount);
+    let mut held = book_with(&[(N, entry(CAROL, CAROL, RF))]);
+    // Forge: the held advance's index entry under the honest one's bytes.
+    let commitment = advance_marker_commitment(&honest.marker(N));
+    held.by_marker.insert(commitment, key(N, CAROL, RF));
+    let b = block(vec![advance_group(
+        300,
+        PAYER,
+        N,
+        ALICE,
+        amount,
+        min_paid(amount),
+        0,
+    )]);
     assert_eq!(
         check(&b, &held, &ReleasedSet::new()),
-        Err(AdvanceError::ReleasedInTheSameBlock { n: N })
+        Err(AdvanceError::AdvanceMarkerTaken { group: 0 })
     );
+    assert!(check(&b, &AdvanceBook::new(), &ReleasedSet::new()).is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +842,7 @@ fn the_release_pays_the_creditor_of_an_advance_of_exactly_its_burn() {
     let amount = 10 * JTM;
     let mut held = book_with(&[(N, entry(PAYER, ALICE, amount))]);
     assert_eq!(release_payee(&held, N, &ALICE, amount), PAYER);
-    held.set_creditor(N, BOB);
+    held.set_creditor(&key(N, ALICE, amount), BOB);
     assert_eq!(release_payee(&held, N, &ALICE, amount), BOB);
     // Another burn than the one advanced: its owner is paid.
     assert_eq!(release_payee(&held, N, &ALICE, amount + 1), ALICE);
@@ -671,6 +850,14 @@ fn the_release_pays_the_creditor_of_an_advance_of_exactly_its_burn() {
     // No advance.
     assert_eq!(release_payee(&held, N + 1, &ALICE, amount), ALICE);
     assert_eq!(release_payee(&AdvanceBook::new(), N, &ALICE, amount), ALICE);
+    // D114: advances of other burns of n beside it change nothing; the burn
+    // proven finds its own.
+    held.insert(N, entry(CAROL, CAROL, RF));
+    held.insert(N, entry(CAROL, ALICE, amount + 1));
+    assert_eq!(release_payee(&held, N, &ALICE, amount), BOB);
+    assert_eq!(release_payee(&held, N, &ALICE, amount + 1), CAROL);
+    assert_eq!(release_payee(&held, N, &CAROL, RF), CAROL);
+    assert_eq!(release_payee(&held, N, &BOB, amount), BOB);
 }
 
 #[test]
@@ -679,6 +866,8 @@ fn every_advance_refusal_condemns_the_block() {
         AdvanceError::AlreadyAdvanced { n: 1 },
         AdvanceError::AdvanceShape { group: 0 },
         AdvanceError::TransferNotByCreditor { group: 0, n: 1 },
+        AdvanceError::AdvanceMarkerTaken { group: 0 },
+        AdvanceError::NoAdvanceToTransfer { group: 0 },
         AdvanceError::OutstandingCapReached {
             group: 0,
             outstanding: 0,

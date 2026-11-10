@@ -749,6 +749,71 @@ fn the_release_of_an_advanced_burn_repays_the_creditor() {
     assert!(effect.advances.is_empty());
 }
 
+/// D114: several advances of one `n`. The release of the proven burn repays
+/// the creditor of the advance of exactly that burn — whatever was placed
+/// before it — and consumes every advance of `n`: the others are lost by their
+/// authors, whose outstanding no longer counts them.
+#[test]
+fn the_release_repays_only_the_advance_of_the_proven_burn_and_consumes_every_advance_of_n() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    const STRANGER: Address = Address([0x5e; 32]);
+    let fake = AdvanceEntry {
+        origin: STRANGER,
+        creditor: STRANGER,
+        owner: STRANGER,
+        amount: RF,
+    };
+    let honest = AdvanceEntry {
+        origin: PAYER,
+        creditor: BOB,
+        owner: ALICE,
+        amount: r.amount,
+    };
+    let other_amount = AdvanceEntry {
+        origin: STRANGER,
+        creditor: STRANGER,
+        owner: ALICE,
+        amount: r.amount + 1,
+    };
+    let mut parent = state_at(HEIGHT - 1, known(&c0));
+    parent.advances.insert(3, fake);
+    parent.advances.insert(3, honest);
+    parent.advances.insert(3, other_amount);
+    parent.advances.insert(4, entry_of(STRANGER, ALICE, JTM));
+    assert_eq!(parent.advances.len(), 4);
+    let to_creditor = base_release_block(HEIGHT, &r, BOB, &c0, &world);
+    let effect =
+        validate_block_destination(&to_creditor, &parent, &rules, &keys).expect("repays BOB");
+    assert_eq!(effect.advances.consumed, vec![3]);
+    for wrong in [ALICE, STRANGER, PAYER] {
+        assert_eq!(
+            validate_block_destination(
+                &base_release_block(HEIGHT, &r, wrong, &c0, &world),
+                &parent,
+                &rules,
+                &keys
+            ),
+            Err(DestinationBlockError::Vault(
+                VaultError::ReleasePaysOtherOwner { group: 0 }
+            ))
+        );
+    }
+    let mut state = parent.clone();
+    state.apply(&effect, VAULT_RELEASE_WINDOW_BLOCKS).unwrap();
+    assert_eq!(state.advances.len(), 1, "only the advance of 4 is left");
+    assert_eq!(state.advances.outstanding_of(&PAYER), 0);
+    assert_eq!(state.advances.outstanding_of(&STRANGER), JTM);
+    // The undo brings all three back.
+    assert_eq!(
+        state.clone().truncate_above(HEIGHT - 1).unwrap(),
+        Some(parent)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // State: apply, undo, encoding
 // ---------------------------------------------------------------------------
@@ -792,13 +857,14 @@ fn advances_apply_and_undo_with_the_branch() {
     )
     .unwrap();
     let after_1 = s.clone();
-    assert_eq!(s.advances.get(3), Some(&a));
+    let k3 = a.key(3);
+    assert_eq!(s.advances.get(&k3), Some(&a));
     assert_eq!(s.advances.outstanding_of(&PAYER), 5 * JTM);
     s.apply(
         &effect(
             HEIGHT + 1,
             AdvanceEffect {
-                transfers: vec![(3, BOB)],
+                transfers: vec![(k3, BOB)],
                 ..AdvanceEffect::default()
             },
         ),
@@ -806,7 +872,7 @@ fn advances_apply_and_undo_with_the_branch() {
     )
     .unwrap();
     let after_2 = s.clone();
-    assert_eq!(s.advances.get(3).map(|e| e.creditor), Some(BOB));
+    assert_eq!(s.advances.get(&k3).map(|e| e.creditor), Some(BOB));
     assert_eq!(s.advances.outstanding_of(&PAYER), 5 * JTM);
     s.apply(
         &effect(
@@ -819,7 +885,7 @@ fn advances_apply_and_undo_with_the_branch() {
         VAULT_RELEASE_WINDOW_BLOCKS,
     )
     .unwrap();
-    assert_eq!(s.advances.get(3), None);
+    assert_eq!(s.advances.get(&k3), None);
     assert_eq!(s.advances.outstanding_of(&PAYER), 0);
     assert_eq!(s.advances.len(), 1);
     assert_eq!(
@@ -857,7 +923,7 @@ fn a_state_without_advances_encodes_as_before_and_one_with_them_as_version_2() {
         &effect(
             HEIGHT + 1,
             AdvanceEffect {
-                transfers: vec![(3, BOB)],
+                transfers: vec![(entry_of(PAYER, ALICE, 5 * JTM).key(3), BOB)],
                 ..AdvanceEffect::default()
             },
         ),
@@ -922,6 +988,74 @@ fn a_state_without_advances_encodes_as_before_and_one_with_them_as_version_2() {
     );
 }
 
+/// D114 in the state's bytes: several advances of one `n`, by increasing key
+/// `(n, owner, amount)`; the undo names keys; a list out of key order, a key
+/// twice, or two advances whose markers share their commitment bytes, is not
+/// a state.
+#[test]
+fn a_state_with_several_advances_of_one_n_encodes_them_by_key() {
+    const STRANGER: Address = Address([0x5e; 32]);
+    let fake = entry_of(STRANGER, STRANGER, RF);
+    let honest = entry_of(PAYER, ALICE, 5 * JTM);
+    let mut s = state_at(HEIGHT - 1, Vec::new());
+    s.apply(
+        &effect(
+            HEIGHT,
+            AdvanceEffect {
+                created: vec![(3, honest), (3, fake), (4, honest)],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    s.apply(
+        &effect(
+            HEIGHT + 1,
+            AdvanceEffect {
+                transfers: vec![(fake.key(3), BOB)],
+                consumed: vec![4],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    assert_eq!(s.advances.len(), 2);
+    let bytes = s.encode();
+    assert_eq!(DestinationState::decode(&bytes), Ok(s.clone()));
+    // The list: count, then (3, STRANGER, RF) before (3, ALICE, 5 JTM).
+    let body = {
+        let mut plain = s.clone();
+        plain.advances = AdvanceBook::new();
+        for undo in &mut plain.undo {
+            undo.advances = AdvanceUndo::default();
+        }
+        plain.encode().len()
+    };
+    let at = body + 4;
+    assert_eq!(bytes[at..at + 8], 3u64.to_le_bytes());
+    assert_eq!(bytes[at + 8 + 64..at + 8 + 96], STRANGER.0);
+    let mut swapped = bytes.clone();
+    let first = swapped[at..at + 112].to_vec();
+    let second = swapped[at + 112..at + 224].to_vec();
+    swapped[at..at + 112].copy_from_slice(&second);
+    swapped[at + 112..at + 224].copy_from_slice(&first);
+    assert_eq!(
+        DestinationState::decode(&swapped),
+        Err(DestinationStateError::Malformed)
+    );
+    let mut twice = bytes.clone();
+    twice[at + 112..at + 224].copy_from_slice(&first);
+    assert_eq!(
+        DestinationState::decode(&twice),
+        Err(DestinationStateError::Malformed)
+    );
+    // Back two blocks: exactly the state before them.
+    let back = s.truncate_above(HEIGHT - 1).unwrap().unwrap();
+    assert_eq!(back.advances, AdvanceBook::new());
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot: the advances rebuilt from their markers
 // ---------------------------------------------------------------------------
@@ -953,7 +1087,7 @@ fn install(
 
 #[test]
 fn a_snapshot_rebuilds_the_advances_from_their_markers() {
-    use crate::consensus::destination::advance::{advance_marker, advance_transfer_marker};
+    use crate::consensus::destination::advance::advance_marker;
     let tip = HEIGHT + 20;
     let a3 = AdvanceEntry {
         origin: PAYER,
@@ -967,8 +1101,8 @@ fn a_snapshot_rebuilds_the_advances_from_their_markers() {
         // Before the return over Base: an ordinary owner then, not an advance.
         (advance_marker(8, &ALICE, JTM, &PAYER), at(HB - 1)),
         (advance_marker(3, &ALICE, 5 * JTM, &PAYER), at(HB + 1)),
-        (advance_transfer_marker(3, &PAYER), at(HB + 2)),
-        (advance_transfer_marker(3, &BOB), at(HB + 3)),
+        (a3.transfer_marker(3, &PAYER), at(HB + 2)),
+        (a3.transfer_marker(3, &BOB), at(HB + 3)),
         (advance_marker(4, &ALICE, 2 * JTM, &BOB), at(HB + 3) + 1),
         // Advanced, then released: consumed.
         (advance_marker(6, &ALICE, JTM, &PAYER), at(HB + 4)),
@@ -985,8 +1119,8 @@ fn a_snapshot_rebuilds_the_advances_from_their_markers() {
         ..file
     };
     let state = install(&file, tip, &slots).expect("the advances");
-    assert_eq!(state.advances.get(3), Some(&a3));
-    assert_eq!(state.advances.get(4), Some(&a4));
+    assert_eq!(state.advances.get(&a3.key(3)), Some(&a3));
+    assert_eq!(state.advances.get(&a4.key(4)), Some(&a4));
     assert_eq!(state.advances.len(), 2);
     assert_eq!(state.advances.outstanding_of(&PAYER), 5 * JTM);
     // The file round-trips, as version 2 (JTMDST02).
@@ -1020,6 +1154,7 @@ fn a_snapshot_rebuilds_the_advances_from_their_markers() {
         vec![(3, a3)],
         vec![(3, a3), (4, a4), (6, entry_of(PAYER, ALICE, JTM))],
         vec![(4, a4), (3, a3)],
+        vec![(3, a3), (3, a3), (4, a4)],
     ] {
         let lying = DestinationSnapshotFile {
             advances,
@@ -1030,11 +1165,152 @@ fn a_snapshot_rebuilds_the_advances_from_their_markers() {
             Err(SnapshotDestinationError::Mismatch { .. })
         ));
     }
-    // Two advance markers of one n (no branch makes them): refused.
+    // An advance marker no file advance opens: refused.
     let mut doubled = slots.clone();
     doubled.push((advance_marker(3, &BOB, 5 * JTM, &PAYER), at(HB + 5)));
     assert!(install(&file, tip, &doubled).is_err());
 }
+
+/// D114 through a snapshot: several advances of one `n`, each with its own
+/// transfers; the file lists them by key; a creditor is read from the
+/// transfers naming its own advance only.
+#[test]
+fn a_snapshot_rebuilds_several_advances_of_one_n_each_with_its_creditor() {
+    use crate::consensus::destination::advance::advance_marker_commitment;
+    const STRANGER: Address = Address([0x5e; 32]);
+    let tip = HEIGHT + 20;
+    let at = |h: u64| h * 10 - 3;
+    let honest = AdvanceEntry {
+        origin: PAYER,
+        creditor: BOB,
+        owner: ALICE,
+        amount: 5 * JTM,
+    };
+    let fake = AdvanceEntry {
+        origin: STRANGER,
+        creditor: PAYER,
+        owner: STRANGER,
+        amount: RF,
+    };
+    let plain = entry_of(STRANGER, ALICE, 5 * JTM + 1);
+    let slots = vec![
+        (fake.marker(3), at(HB + 1)),
+        (honest.marker(3), at(HB + 2)),
+        (plain.marker(3), at(HB + 2) + 1),
+        // The stranger hands its claim to PAYER; PAYER hands the honest
+        // one to BOB: neither is the other's.
+        (fake.transfer_marker(3, &PAYER), at(HB + 3)),
+        (honest.transfer_marker(3, &BOB), at(HB + 4)),
+    ];
+    // By key (owner bytes 0x5e… before 0xa1…): (3, STRANGER, RF),
+    // (3, ALICE, 5 JTM), (3, ALICE, 5 JTM + 1).
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: vec![(3, fake), (3, honest), (3, plain)],
+    };
+    let state = install(&file, tip, &slots).expect("three advances of 3");
+    assert_eq!(state.advances.len(), 3);
+    assert_eq!(state.advances.get(&honest.key(3)), Some(&honest));
+    assert_eq!(state.advances.get(&fake.key(3)), Some(&fake));
+    assert_eq!(state.advances.get(&plain.key(3)), Some(&plain));
+    assert_eq!(state.advances.outstanding_of(&STRANGER), RF + 5 * JTM + 1);
+    assert_eq!(
+        state
+            .advances
+            .by_marker(&advance_marker_commitment(&honest.marker(3)))
+            .map(|(key, _)| key),
+        Some(honest.key(3))
+    );
+    let bytes = file.encode();
+    assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file.clone()));
+    // Out of key order, or a creditor taken from another advance's transfer.
+    for advances in [
+        vec![(3, honest), (3, fake), (3, plain)],
+        vec![
+            (3, fake),
+            (
+                3,
+                AdvanceEntry {
+                    creditor: PAYER,
+                    ..honest
+                },
+            ),
+            (3, plain),
+        ],
+        vec![
+            (
+                3,
+                AdvanceEntry {
+                    creditor: BOB,
+                    ..fake
+                },
+            ),
+            (3, honest),
+            (3, plain),
+        ],
+        vec![
+            (3, fake),
+            (3, honest),
+            (
+                3,
+                AdvanceEntry {
+                    creditor: BOB,
+                    ..plain
+                },
+            ),
+        ],
+    ] {
+        let lying = DestinationSnapshotFile {
+            advances,
+            ..file.clone()
+        };
+        assert!(matches!(
+            install(&lying, tip, &slots),
+            Err(SnapshotDestinationError::Mismatch { .. })
+        ));
+    }
+    // Every advance of a released n is consumed, whichever burn was proven.
+    let mut released = slots.clone();
+    released.push((release(3, ALICE, 5 * JTM).marker(), at(HB + 9)));
+    let none = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: vec![(3, ALICE, 5 * JTM)],
+        advances: Vec::new(),
+    };
+    assert_eq!(
+        install(&none, tip, &released).map(|s| s.advances.len()),
+        Ok(0)
+    );
+}
+
+/// A transfer marker naming the commitment bytes of an advance that was
+/// consumed before a later advance took the same bytes (a search of 2⁴⁸
+/// hashes; forged here) is not the later one's: only the transfers created
+/// after an advance's marker are read for it.
+#[test]
+fn a_snapshot_reads_for_an_advance_only_the_transfers_made_after_it() {
+    let tip = HEIGHT + 20;
+    let at = |h: u64| h * 10 - 3;
+    let live = entry_of(PAYER, ALICE, 5 * JTM);
+    let mut stale_transfer = entry_of(BOB, BOB, JTM).transfer_marker(6, &CAROL_ADDR);
+    stale_transfer.0[8..20].copy_from_slice(&live.marker(3).0[20..]);
+    let slots = vec![(stale_transfer, at(HB + 1)), (live.marker(3), at(HB + 2))];
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: vec![(3, live)],
+    };
+    assert_eq!(
+        install(&file, tip, &slots).map(|s| s.advances.get(&live.key(3)).copied()),
+        Ok(Some(live))
+    );
+    // The same marker after it is read (and opens to no creditor).
+    let after = vec![(live.marker(3), at(HB + 2)), (stale_transfer, at(HB + 3))];
+    assert!(install(&file, tip, &after).is_err());
+}
+
+const CAROL_ADDR: Address = Address([0xca; 32]);
 
 #[test]
 fn a_snapshot_file_without_advances_is_the_file_of_before() {
