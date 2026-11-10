@@ -212,23 +212,28 @@ fn yes(_: &HeaderInfo) -> bool {
     true
 }
 
+/// E-7: the target rule left out (the synthetic chains carry fixed targets); `e7_*` test it.
+fn any_target(_: &Chain, _: u64) -> bool {
+    true
+}
+
 #[test]
 fn eight_blocks_above_on_two_nodes_confirm_seven_do_not() {
     let p = FillParams::default();
     let c7 = testkit::chain(57, 1);
     let d = dep_on(&c7, 50, 7 * JTM);
     let both7 = [c7.clone(), c7.clone()];
-    assert_eq!(confirmation(&d, &views(&both7, NOW), NOW, l1_after(&c7), &p, &mut yes), Err("NOT_CONFIRMED"));
+    assert_eq!(confirmation(&d, &views(&both7, NOW), NOW, l1_after(&c7), &p, &mut yes, &mut any_target), Err("NOT_CONFIRMED"));
     let c8 = testkit::chain(58, 1);
     let both8 = [c8.clone(), c8.clone()];
-    assert_eq!(confirmation(&d, &views(&both8, NOW), NOW, l1_after(&c8), &p, &mut yes), Ok(()));
+    assert_eq!(confirmation(&d, &views(&both8, NOW), NOW, l1_after(&c8), &p, &mut yes, &mut any_target), Ok(()));
     // one node only (the other one 7 blocks above)
     let one = [c8.clone(), c7.clone()];
-    assert_eq!(confirmation(&d, &views(&one, NOW), NOW, l1_after(&c8), &p, &mut yes), Err("NOT_CONFIRMED"));
+    assert_eq!(confirmation(&d, &views(&one, NOW), NOW, l1_after(&c8), &p, &mut yes, &mut any_target), Err("NOT_CONFIRMED"));
     // a stale read of a node does not count
     let mut v = views(&both8, NOW);
     v[1].polled_at = NOW - p.max_source_age - 1;
-    assert_eq!(confirmation(&d, &v, NOW, l1_after(&c8), &p, &mut yes), Err("NOT_CONFIRMED"));
+    assert_eq!(confirmation(&d, &v, NOW, l1_after(&c8), &p, &mut yes, &mut any_target), Err("NOT_CONFIRMED"));
 }
 
 #[test]
@@ -238,7 +243,7 @@ fn a_node_with_another_block_at_the_deposit_height_refuses() {
     let mut b = testkit::chain(49, 1);
     testkit::extend(&mut b, 11, 2, 20);
     let d = dep_on(&a, 50, 7 * JTM);
-    assert_eq!(confirmation(&d, &views(&[a.clone(), b], NOW), NOW, l1_after(&a), &p, &mut yes), Err("NODES_DISAGREE"));
+    assert_eq!(confirmation(&d, &views(&[a.clone(), b], NOW), NOW, l1_after(&a), &p, &mut yes, &mut any_target), Err("NODES_DISAGREE"));
 }
 
 #[test]
@@ -250,11 +255,11 @@ fn confirmations_need_the_work_above_the_deposit() {
     testkit::extend(&mut c, 1, 1, 20);
     let d = dep_on(&c, 50, 7 * JTM);
     let both = [c.clone(), c.clone()];
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut yes), Err("WORK_ABOVE_TOO_LOW"));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut yes, &mut any_target), Err("WORK_ABOVE_TOO_LOW"));
     // enough blocks of the tip's target later
     testkit::extend(&mut c, 8, 1, 20);
     let both = [c.clone(), c.clone()];
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut yes), Ok(()));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut yes, &mut any_target), Ok(()));
 }
 
 #[test]
@@ -264,15 +269,15 @@ fn the_eighth_block_from_the_future_or_without_proof_of_work_does_not_confirm() 
     let d = dep_on(&c, 50, 7 * JTM);
     let both = [c.clone(), c.clone()];
     let ts8 = c.header_at(58).unwrap().timestamp;
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, ts8 - p.max_ahead_secs - 1, &p, &mut yes), Err("CONFIRMATION_FROM_THE_FUTURE"));
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, ts8 - p.max_ahead_secs, &p, &mut yes), Ok(()));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, ts8 - p.max_ahead_secs - 1, &p, &mut yes, &mut any_target), Err("CONFIRMATION_FROM_THE_FUTURE"));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, ts8 - p.max_ahead_secs, &p, &mut yes, &mut any_target), Ok(()));
     let bad = c.id_at(54).unwrap();
     let mut pow = |h: &HeaderInfo| h.id != bad;
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut pow), Err("BAD_PROOF_OF_WORK"));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut pow, &mut any_target), Err("BAD_PROOF_OF_WORK"));
     // the deposit's own block too
     let own = c.id_at(50).unwrap();
     let mut pow = |h: &HeaderInfo| h.id != own;
-    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut pow), Err("BAD_PROOF_OF_WORK"));
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&c), &p, &mut pow, &mut any_target), Err("BAD_PROOF_OF_WORK"));
 }
 
 // ---------------------------------------------------------------- halts and pauses
@@ -1977,3 +1982,86 @@ fn d123_the_bridges_caps_read_at_start_are_the_robots() {
     }
 }
 
+
+// ---------------------------------------------------------------- E-7: the robot checks the ASERT target
+
+fn rehearsal_chain() -> Chain {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../jetsam_bridge_program/xtest/tests/fixtures/jgfill-rehearsal-chain.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let headers: Vec<HeaderInfo> = v["headers"].as_array().unwrap().iter().map(|h| HeaderInfo::from_hex(h.as_str().unwrap()).unwrap()).collect();
+    let mut c = Chain::from_genesis(headers[0].clone());
+    for h in &headers[1..] {
+        c.extend(h.clone()).unwrap();
+    }
+    c
+}
+
+/// A synthetic chain whose every target is the one ASERT gives under `s` (the robot's chains are from genesis), each
+/// header 180 s after its parent; the header at `bad` (if any) carries `forged` instead, and the headers above it
+/// follow ASERT from it.
+fn asert_chain(n: u64, s: &jetsam_bridge_program::rules::Schedule, bad: Option<(u64, [u8; 32])>) -> Chain {
+    let mut c = Chain::from_genesis(testkit::header([0u8; 32], 0, 1_700_000_000, jetsam_bridge_program::rules::GENESIS_TARGET, 0));
+    for h in 1..=n {
+        let want = expected_target(&c, h, s).unwrap();
+        let target = match bad {
+            Some((at, forged)) if at == h => forged,
+            _ => want,
+        };
+        c.extend(testkit::header(c.tip_id(), h, 1_700_000_000 + 180 * h, target, 3)).unwrap();
+    }
+    c
+}
+
+/// E-7: the real rehearsal chain (headers 0..144, v1.5 at 36, v1.6 at 64): every target is ASERT's under the
+/// rehearsal schedule; checked once (the ids remembered), again for free.
+#[test]
+fn e7_every_target_of_a_real_chain_is_the_asert_target() {
+    let c = rehearsal_chain();
+    assert_eq!(c.tip_height(), 144);
+    let s = jetsam_bridge_program::rules::REHEARSAL;
+    let mut verified = std::collections::HashSet::new();
+    assert!(targets_ok(&c, 144, &s, &mut verified));
+    assert_eq!(verified.len(), 144);
+    assert!(targets_ok(&c, 100, &s, &mut verified));
+    // under another schedule (the public network's clocks) the same headers are not ASERT's
+    assert!(!targets_ok(&c, 144, &jetsam_bridge_program::rules::MAINNET, &mut std::collections::HashSet::new()));
+}
+
+/// E-7: a header whose target is not ASERT's (an easier one: a branch of trivial difficulty) fails the check, and
+/// so does every header above it, though their targets follow ASERT from it; the headers below it pass. A chain
+/// without its genesis header is never verified.
+#[test]
+fn e7_a_forged_target_fails_at_and_above_it_even_below_the_deposit() {
+    let s = jetsam_bridge_program::rules::REHEARSAL;
+    let good = asert_chain(120, &s, None);
+    assert!(targets_ok(&good, 120, &s, &mut std::collections::HashSet::new()));
+    let easy = jetsam_bridge_program::rules::MAX_TARGET;
+    let forged = asert_chain(120, &s, Some((90, easy)));
+    let mut v = std::collections::HashSet::new();
+    assert!(targets_ok(&forged, 89, &s, &mut v));
+    assert!(!targets_ok(&forged, 90, &s, &mut v));
+    // a deposit at 100: its block and the 8 above follow ASERT from the forged one, the forgery is below them
+    assert!(!targets_ok(&forged, 108, &s, &mut v), "an ancestor's forged target");
+    let anchored = Chain::with_anchor(0, good.id_at(0).unwrap(), good.work_at(0).unwrap());
+    assert!(!targets_ok(&anchored, 0, &s, &mut std::collections::HashSet::new()));
+}
+
+/// E-7 in the confirmation rule: on chains whose targets are not ASERT's (the synthetic ones, fixed targets) the
+/// robot's checker refuses the deposit (`BAD_TARGET`), whatever their proof of work; on an ASERT chain it confirms.
+#[test]
+fn e7_a_deposit_on_a_chain_of_wrong_targets_is_not_confirmed() {
+    let p = FillParams::default();
+    let s = jetsam_bridge_program::rules::REHEARSAL;
+    let fixed = testkit::chain(58, 1);
+    let d = dep_on(&fixed, 50, 7 * JTM);
+    let both = [fixed.clone(), fixed.clone()];
+    let mut v = std::collections::HashSet::new();
+    let mut target = |c: &Chain, h: u64| targets_ok(c, h, &s, &mut v);
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&fixed), &p, &mut yes, &mut target), Err("BAD_TARGET"));
+    let asert = asert_chain(58, &s, None);
+    let d = dep_on(&asert, 50, 7 * JTM);
+    let both = [asert.clone(), asert.clone()];
+    let mut v = std::collections::HashSet::new();
+    let mut target = |c: &Chain, h: u64| targets_ok(c, h, &s, &mut v);
+    assert_eq!(confirmation(&d, &views(&both, NOW), NOW, l1_after(&asert), &p, &mut yes, &mut target), Ok(()));
+}

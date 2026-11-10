@@ -18,6 +18,8 @@
 //!   genesis, its `OUTSTANDING_CEIL()`, D123: its `SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()` and
 //!   `ADVANCE_CAP_24H()` (50 000 JTM each, the robot's mirrors), its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and the hot
 //!   key's stock ≤ `max_stock` (else no start).
+//! * E-7: a deposit is confirmed only on headers whose targets are ASERT's from genesis (`fill::targets_ok`, the proof
+//!   program's rule of this build), not only proofs of work against the targets they declare.
 //! * A5-1: no advance of a deposit at or below the locked height of the contract's tip (its point is accepted: a
 //!   mint less than 24 h after an advance made now repays what it paid only); an advance the relayer's point
 //!   overtakes in the minutes between the robot's read of the tip and its advance loses its fee (accepted).
@@ -156,6 +158,8 @@ struct Robot {
     observers: Vec<Observer>,
     polled_at: Vec<u64>,
     pow_ok: HashSet<[u8; 32]>,
+    /// E-7: the ids of the headers whose ASERT target was checked.
+    targets_ok: HashSet<[u8; 32]>,
     state: State,
     journal: DecisionJournal,
     halt_file: PathBuf,
@@ -387,7 +391,10 @@ impl Robot {
                 let views: Vec<NodeView> = chains.iter().zip(&names).zip(&self.polled_at).map(|((c, n), at)| NodeView { name: n, chain: c, polled_at: *at }).collect();
                 let cache = &mut self.pow_ok;
                 let mut pow = |h: &HeaderInfo| self_pow(cache, h);
-                fill::confirmation(&d, &views, now, l1_now, &self.cfg.params, &mut pow)
+                // E-7: the targets of the nodes' rule (this build's schedule), from genesis
+                let targets = &mut self.targets_ok;
+                let mut target = |c: &Chain, h: u64| fill::targets_ok(c, h, &jetsam_bridge_program::rules::PRODUCTION, targets);
+                fill::confirmation(&d, &views, now, l1_now, &self.cfg.params, &mut pow, &mut target)
             };
             match conf {
                 Ok(()) => {
@@ -818,7 +825,7 @@ fn run() -> anyhow::Result<()> {
     log(&format!("signer: {}", if matches!(tx, L1Tx::Local(_)) { "the hot key, local" } else { "the endpoint's TEST account (rehearsal)" }));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), cfg };
+    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), targets_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), cfg };
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }

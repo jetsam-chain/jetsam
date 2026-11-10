@@ -18,6 +18,8 @@
 //!   of 10 min above 250 JTM, the caps (D123: 5 000 JTM an hour, 10 000 JTM per recipient per 24 h, an
 //!   outstanding within the stock of 10 000 JTM, under the contract's 50 000 JTM / 24 h and 50 000 JTM
 //!   outstanding), the gas-indexed minimum, the stock.
+//! * E-7 (audit 2026-11-10): every header a confirmation counts carries the target the nodes' difficulty rule
+//!   gives it ([`targets_ok`], from genesis), not only a proof of work against the target it declares.
 //! * [`DecisionJournal`]: every decision (why advanced, why refused), signed and chained, for the public page.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -358,6 +360,7 @@ pub fn confirmation(
     l1_now: u64,
     p: &FillParams,
     pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool,
+    target_ok: &mut dyn FnMut(&Chain, u64) -> bool,
 ) -> Result<(), &'static str> {
     let rule = WitnessRule { min_sources: p.min_nodes, max_age: p.max_source_age, depth: p.confirmations };
     let view = |n: &NodeView<'_>| SourceView {
@@ -374,7 +377,7 @@ pub fn confirmation(
     let mut why = "NOT_CONFIRMED";
     let mut good = Vec::new();
     for n in nodes {
-        match node_confirms(d, n.chain, l1_now, p, pow_ok) {
+        match node_confirms(d, n.chain, l1_now, p, pow_ok, target_ok) {
             Ok(()) => good.push(view(n)),
             Err(code) => {
                 if why == "NOT_CONFIRMED" {
@@ -390,7 +393,14 @@ pub fn confirmation(
     }
 }
 
-fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool) -> Result<(), &'static str> {
+fn node_confirms(
+    d: &FoundDeposit,
+    c: &Chain,
+    l1_now: u64,
+    p: &FillParams,
+    pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool,
+    target_ok: &mut dyn FnMut(&Chain, u64) -> bool,
+) -> Result<(), &'static str> {
     let top = d.height + p.confirmations;
     let tip = c.tip_height();
     // (the deposit's block on this node: checked by the witness rule, which every counted node passes)
@@ -406,11 +416,58 @@ fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_o
         return Err("CONFIRMATION_FROM_THE_FUTURE");
     }
     for h in d.height..=top {
+        // E-7: the target the nodes' rule gives the header, then a proof of work against it
+        if !target_ok(c, h) {
+            return Err("BAD_TARGET");
+        }
         if !pow_ok(c.header_at(h).ok_or("NOT_CONFIRMED")?) {
             return Err("BAD_PROOF_OF_WORK");
         }
     }
     Ok(())
+}
+
+/// E-7 (audit 2026-11-10): the target the nodes' difficulty rule gives the header at `height` of `c` — ASERT from its
+/// anchor, `jetsam_bridge_program::rules` (the proof program's port of the node's rule, cross-tested against it) on the
+/// schedule `s` — from the headers `c` holds; `None` when one it needs is missing.
+pub fn expected_target(c: &Chain, height: u64, s: &jetsam_bridge_program::rules::Schedule) -> Option<[u8; 32]> {
+    let parent = c.header_at(height.checked_sub(1)?)?;
+    let ah = s.anchor_height(parent.height);
+    let anchor = c.header_at(ah)?;
+    // the anchor's parent is read by the v1.6 rule only, whose anchor is never the genesis
+    let anchor_parent_ts = match ah.checked_sub(1) {
+        Some(below) => c.header_at(below)?.timestamp,
+        None => anchor.timestamp,
+    };
+    Some(s.expected_target(ah, anchor.timestamp, anchor_parent_ts, &anchor.target, height, parent.timestamp))
+}
+
+/// E-7: whether every header of `c` from its genesis up to `upto` carries the target [`expected_target`] gives it,
+/// under `s` (the build's: `jetsam_bridge_program::rules::PRODUCTION`): a branch of trivial difficulty served by
+/// every node of the robot is refused, the targets of its blocks below the deposit included (an ASERT target follows
+/// its anchor's: one forged anchor would make the blocks above it look right). `verified` keeps the ids already
+/// checked (a reorganization brings new ids, checked from their first unverified ancestor). A chain without its
+/// genesis header (`Chain::with_anchor`) is never verified.
+pub fn targets_ok(c: &Chain, upto: u64, s: &jetsam_bridge_program::rules::Schedule, verified: &mut std::collections::HashSet<[u8; 32]>) -> bool {
+    if c.base_height() != 0 || c.header_at(0).is_none() || upto > c.tip_height() {
+        return false;
+    }
+    let mut from = upto;
+    while from > 0 {
+        match c.header_at(from) {
+            Some(h) if verified.contains(&h.id) => break,
+            Some(_) => from -= 1,
+            None => return false,
+        }
+    }
+    for h in from + 1..=upto {
+        let (Some(header), Some(want)) = (c.header_at(h), expected_target(c, h, s)) else { return false };
+        if header.target != want {
+            return false;
+        }
+        verified.insert(header.id);
+    }
+    true
 }
 
 /// D123: the bridge's per-deposit cap and the caps of its advancers (`SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()`,
