@@ -297,6 +297,8 @@ fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
         test,
         DepositRule {
             deposits_from_height: Some(F),
+            // the test clock has D123's caps on every profile (`rules()`)
+            legacy: None,
             ..DepositRule::for_activation(Some(J))
         }
     );

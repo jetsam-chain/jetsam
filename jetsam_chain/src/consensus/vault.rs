@@ -957,8 +957,6 @@ pub fn check_plain_vault_transaction(
     if !rules.active_at(next_height) {
         return Ok(());
     }
-    // D123: the caps of the next block's height.
-    let rules = &rules.at(next_height);
     if pages
         .iter()
         .any(|page| page.body.input_owner == rules.vault)
