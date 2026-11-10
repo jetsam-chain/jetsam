@@ -33,7 +33,7 @@
 //! holds them — while a peer offering another body for the same block is left
 //! alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -56,6 +56,29 @@ pub(crate) const PIN_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Bound on the refused bodies kept (one per refused branch, in practice).
 pub(crate) const REFUSED_BODY_CAPACITY: usize = 1_024;
+
+/// S-1 (audit 2026-11-10): how many points of a header chain this node
+/// validated itself (snapshot header staging) it keeps once the plan that
+/// staged them has ended: the highest ones. A real snapshot boundary is a
+/// finalized one, at most `CONSENSUS_FINALITY_DEPTH` plus one boundary
+/// interval below the tip of the chain it was staged on; 64 covers that with
+/// room for the chain to move on meanwhile.
+pub(crate) const VALIDATED_POINT_CAPACITY: usize = 64;
+
+/// S-1: bound on the snapshot boundaries (height and block id) kept because a
+/// plan toward them went unserved or was refuted by validated headers.
+pub(crate) const UNSERVED_BOUNDARY_CAPACITY: usize = 1_024;
+
+/// S-1: how long a node without tip authority takes no unverified snapshot
+/// boundary above the height where the last one went unserved, when that
+/// height was within direct reach of its tip. Long enough for a restarted
+/// seed to import the few blocks it lacks and get its tip confirmed; short
+/// enough that a node which really fell behind meanwhile is not held long.
+pub(crate) const UNSERVED_CEILING_TTL: Duration = Duration::from_secs(600);
+
+/// A point of a header chain this node validated against its own rules:
+/// height, block id, cumulative work.
+pub(crate) type ValidatedPoint = (u64, [u8; 32], [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Verdict {
@@ -106,6 +129,16 @@ pub(crate) struct PeerChainEvidence<H = ()> {
     /// Bodies (their exact bytes, by object id) refused at or above the v1.7
     /// height because they carry no destination section, with their expiry.
     refused_bodies: HashMap<BlockBodyObjectId, Instant>,
+    /// S-1: the highest points of the header chains this node staged and
+    /// validated itself, by height: block id, cumulative work, expiry.
+    validated_points: BTreeMap<u64, ([u8; 32], [u8; 32], Instant)>,
+    /// S-1: snapshot boundaries (height, block id) whose plan went unserved
+    /// or was refuted by validated headers, with their expiry, whoever
+    /// offers them.
+    unserved_boundaries: HashMap<(u64, [u8; 32]), Instant>,
+    /// S-1: the height at which the last unverified snapshot plan went
+    /// unserved, when it was within direct reach of the local tip.
+    unserved_ceiling: Option<Verdict>,
     /// A divergence verdict was taken or ended, or a body refused, since
     /// [`Self::take_changed`].
     changed: bool,
@@ -118,6 +151,9 @@ impl<H> Default for PeerChainEvidence<H> {
             pinned: HashMap::new(),
             unserved: HashMap::new(),
             refused_bodies: HashMap::new(),
+            validated_points: BTreeMap::new(),
+            unserved_boundaries: HashMap::new(),
+            unserved_ceiling: None,
             changed: false,
             probe_wanted: HashMap::new(),
             probe_inflight: HashMap::new(),
@@ -315,6 +351,94 @@ impl<H> PeerChainEvidence<H> {
             .get(peer)
             .filter(|record| record.expires > now)
             .map(|record| record.height)
+    }
+
+    /// S-1: `points` belong to a header chain this node staged and validated
+    /// against its own rules. Kept for [`PEER_CHAIN_EVIDENCE_TTL`], the
+    /// [`VALIDATED_POINT_CAPACITY`] highest ones, whatever peer served them:
+    /// a snapshot boundary at one of these heights is checked against them,
+    /// not against its sender's word.
+    pub(crate) fn learn_validated_points(
+        &mut self,
+        points: impl IntoIterator<Item = ValidatedPoint>,
+        now: Instant,
+    ) {
+        let expires = now + PEER_CHAIN_EVIDENCE_TTL;
+        for (height, hash, work) in points {
+            self.validated_points.insert(height, (hash, work, expires));
+        }
+        self.validated_points
+            .retain(|_, (_, _, expires)| *expires > now);
+        while self.validated_points.len() > VALIDATED_POINT_CAPACITY {
+            self.validated_points.pop_first();
+        }
+    }
+
+    /// S-1: the validated point at `height` (block id, cumulative work), while
+    /// it holds.
+    pub(crate) fn validated_point(&self, height: u64, now: Instant) -> Option<([u8; 32], [u8; 32])> {
+        self.validated_points
+            .get(&height)
+            .filter(|(_, _, expires)| *expires > now)
+            .map(|(hash, work, _)| (*hash, *work))
+    }
+
+    /// S-1: the height of the highest validated point kept, while it holds.
+    pub(crate) fn highest_validated_point(&self, now: Instant) -> Option<u64> {
+        self.validated_points
+            .iter()
+            .rev()
+            .find(|(_, (_, _, expires))| *expires > now)
+            .map(|(height, _)| *height)
+    }
+
+    /// S-1: a snapshot plan toward the boundary `(height, hash)` went unserved,
+    /// or the headers this node validated reached `height` with another block.
+    /// Kept for [`PEER_CHAIN_EVIDENCE_TTL`], whoever offers it next.
+    pub(crate) fn mark_unserved_boundary(&mut self, height: u64, hash: [u8; 32], now: Instant) {
+        self.unserved_boundaries
+            .insert((height, hash), now + PEER_CHAIN_EVIDENCE_TTL);
+        if self.unserved_boundaries.len() > UNSERVED_BOUNDARY_CAPACITY {
+            self.unserved_boundaries.retain(|_, expires| *expires > now);
+        }
+        if self.unserved_boundaries.len() > UNSERVED_BOUNDARY_CAPACITY {
+            let mut by_expiry = self
+                .unserved_boundaries
+                .iter()
+                .map(|(boundary, expires)| (*expires, *boundary))
+                .collect::<Vec<_>>();
+            by_expiry.sort();
+            let excess = self.unserved_boundaries.len() - UNSERVED_BOUNDARY_CAPACITY * 3 / 4;
+            for (_, boundary) in by_expiry.into_iter().take(excess) {
+                self.unserved_boundaries.remove(&boundary);
+            }
+        }
+    }
+
+    /// S-1: whether the boundary `(height, hash)` went unserved, while that
+    /// record holds.
+    pub(crate) fn boundary_unserved(&self, height: u64, hash: [u8; 32], now: Instant) -> bool {
+        self.unserved_boundaries
+            .get(&(height, hash))
+            .is_some_and(|expires| *expires > now)
+    }
+
+    /// S-1: an unverified snapshot plan went unserved once the headers this
+    /// node validated reached `height`, within direct reach of its tip: no
+    /// connected peer served a header past it. Kept for
+    /// [`UNSERVED_CEILING_TTL`].
+    pub(crate) fn mark_unserved_ceiling(&mut self, height: u64, now: Instant) {
+        self.unserved_ceiling = Some(Verdict {
+            height,
+            expires: now + UNSERVED_CEILING_TTL,
+        });
+    }
+
+    /// S-1: the height of [`Self::mark_unserved_ceiling`], while it holds.
+    pub(crate) fn unserved_ceiling(&self, now: Instant) -> Option<u64> {
+        self.unserved_ceiling
+            .filter(|ceiling| ceiling.expires > now)
+            .map(|ceiling| ceiling.height)
     }
 
     /// Every peer whose divergence verdict holds, with its divergence height
@@ -759,6 +883,59 @@ mod tests {
         assert!(!evidence.is_divergent(&peer, now), "not a fork verdict");
         assert_eq!(evidence.unserved_claim(&PeerId::random(), now), None);
         assert_eq!(evidence.unserved_claim(&peer, now + PEER_CHAIN_EVIDENCE_TTL), None);
+    }
+
+    /// Audit 2026-11-10, S-1: the record of an unserved plan was its
+    /// provider's identity, and a fresh identity offering the very same
+    /// boundary was a clean candidate. The boundary itself is remembered now.
+    #[test]
+    fn a_boundary_that_went_unserved_is_remembered_whatever_identity_offers_it() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        evidence.mark_unserved_boundary(50_000, [0xF0; 32], now);
+        let later = now + Duration::from_secs(60);
+        assert!(evidence.boundary_unserved(50_000, [0xF0; 32], later));
+        assert!(!evidence.boundary_unserved(50_000, [0xF1; 32], later), "another block");
+        assert!(!evidence.boundary_unserved(50_006, [0xF0; 32], later), "another height");
+        assert!(!evidence.boundary_unserved(50_000, [0xF0; 32], now + PEER_CHAIN_EVIDENCE_TTL));
+        for height in 0..(UNSERVED_BOUNDARY_CAPACITY as u64 * 2) {
+            evidence.mark_unserved_boundary(height, [0xF2; 32], later);
+        }
+        assert!(evidence.unserved_boundaries.len() <= UNSERVED_BOUNDARY_CAPACITY, "bounded");
+    }
+
+    /// S-1: what this node validated itself outlives the plan that staged
+    /// it — the highest points, for the TTL, the newest staging winning a
+    /// height.
+    #[test]
+    fn the_validated_points_kept_are_the_highest_and_expire() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let point = |height: u64, salt: u8| (height, [salt; 32], [height as u8; 32]);
+        evidence.learn_validated_points((1..=200).map(|height| point(height, 1)), now);
+        let top = 200 - VALIDATED_POINT_CAPACITY as u64 + 1;
+        assert_eq!(evidence.validated_point(200, now), Some(([1; 32], [200; 32])));
+        assert_eq!(evidence.validated_point(top, now), Some(([1; 32], [top as u8; 32])));
+        assert_eq!(evidence.validated_point(top - 1, now), None, "below the highest kept");
+        assert_eq!(evidence.validated_point(201, now), None);
+        assert_eq!(evidence.highest_validated_point(now), Some(200));
+        evidence.learn_validated_points([point(200, 2)], now);
+        assert_eq!(evidence.validated_point(200, now), Some(([2; 32], [200; 32])));
+        assert_eq!(evidence.validated_point(200, now + PEER_CHAIN_EVIDENCE_TTL), None);
+        assert_eq!(evidence.highest_validated_point(now + PEER_CHAIN_EVIDENCE_TTL), None);
+    }
+
+    /// S-1: the height where an unverified plan went unserved, within reach
+    /// of the tip, holds for its own TTL only.
+    #[test]
+    fn an_unserved_ceiling_holds_for_its_ttl() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(evidence.unserved_ceiling(now), None);
+        evidence.mark_unserved_ceiling(46_100, now);
+        assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL / 2), Some(46_100));
+        assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL), None);
+        assert!(UNSERVED_CEILING_TTL <= PEER_CHAIN_EVIDENCE_TTL);
     }
 
     /// The verdicts lived in memory only. A
