@@ -75,6 +75,17 @@ impl HotKey {
     pub fn address(&self) -> [u8; 20] {
         self.address
     }
+
+    /// `(yParity, r, s)` of `hash` (RFC 6979, low s): a transaction's signature, and A-7's test proofs.
+    pub fn sign_prehash(&self, hash: &[u8; 32]) -> (u8, [u8; 32], [u8; 32]) {
+        let (sig, rec): (Signature, RecoveryId) = self.key.sign_prehash_recoverable(hash).expect("a 32-byte prehash signs");
+        // k256 already signs with a low s; if it ever did not, the negated s flips the parity
+        let (sig, rec) = match sig.normalize_s() {
+            Some(low) => (low, RecoveryId::new(!rec.is_y_odd(), rec.is_x_reduced())),
+            None => (sig, rec),
+        };
+        (u8::from(rec.is_y_odd()), sig.r().to_bytes().into(), sig.s().to_bytes().into())
+    }
 }
 
 /// Minimal RLP (the Ethereum yellow paper, appendix B): byte strings, unsigned integers, lists.
@@ -169,15 +180,7 @@ impl Tx1559 {
     /// Signed by `key` (RFC 6979, low s): `0x02 ‖ rlp([..., yParity, r, s])`.
     pub fn sign(&self, key: &HotKey) -> SignedTx {
         let hash = self.signing_hash();
-        let (sig, rec): (Signature, RecoveryId) = key.key.sign_prehash_recoverable(&hash).expect("a 32-byte prehash signs");
-        // k256 already signs with a low s; if it ever did not, the negated s flips the parity
-        let (sig, rec) = match sig.normalize_s() {
-            Some(low) => (low, RecoveryId::new(!rec.is_y_odd(), rec.is_x_reduced())),
-            None => (sig, rec),
-        };
-        let r: [u8; 32] = sig.r().to_bytes().into();
-        let s: [u8; 32] = sig.s().to_bytes().into();
-        let parity = u8::from(rec.is_y_odd());
+        let (parity, r, s) = key.sign_prehash(&hash);
         let mut fields = self.fields();
         fields.push(rlp::uint(u128::from(parity)));
         fields.push(scalar(&r));

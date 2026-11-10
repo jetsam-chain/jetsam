@@ -1027,7 +1027,7 @@ fn run() -> anyhow::Result<()> {
     }
     let prover: Box<dyn Prover> = match cfg.prover.mode.as_str() {
         "mock" => Box::new(MockProver),
-        "empty-test" => Box::new(relayer::EmptyTestProver),
+        "signed-test" => Box::new(signed_test_prover(&cfg, &l1, &tx)?),
         _ => Box::new(CommandProver {
             argv: cfg.prover.command.clone(),
             claim_argv: cfg.prover.claim_command.clone(),
@@ -1071,6 +1071,32 @@ fn run() -> anyhow::Result<()> {
     r.save();
     log("stopped");
     Ok(())
+}
+
+/// A-7: the test bridge's prover, this relayer's own key (`[signer] key_file`, read like the signer's: never argv)
+/// signing under each program's vkey as the bridge's adapters hold them (`verifier()`/`claimVerifier()` →
+/// `programVKey()`), only when their test verifier (`sp1()` → `relayKey()`) takes this key.
+fn signed_test_prover(cfg: &RelayConfig, l1: &L1, tx: &L1Tx) -> anyhow::Result<relayer::SignedTestProver> {
+    let path = cfg.signer.key_file.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("[prover] mode = \"signed-test\" signs with the relayer's own key: [signer] key_file is required")
+    })?;
+    let key = jetsam_guardian::l1tx::HotKey::load(path)?;
+    anyhow::ensure!(key.address() == tx.address(), "[prover] mode = \"signed-test\": the signer is not the key of [signer] key_file");
+    let read = |to: &[u8; 20], sig: &str| -> anyhow::Result<[u8; 32]> { Ok(word(&l1.call(&hex0x(to), &l1::selector(sig))?, 0)) };
+    let address = |w: [u8; 32]| -> [u8; 20] { w[12..].try_into().expect("20 bytes") };
+    let bridge = jetsam_guardian::fill::parse20(&cfg.l1_bridge)?;
+    let (cp, claim) = (address(read(&bridge, "verifier()")?), address(read(&bridge, "claimVerifier()")?));
+    let (cp_vkey, claim_vkey) = (read(&cp, "programVKey()")?, read(&claim, "programVKey()")?);
+    let (test, test_claim) = (address(read(&cp, "sp1()")?), address(read(&claim, "sp1()")?));
+    anyhow::ensure!(test == test_claim, "the bridge's two adapters wrap two verifiers (0x{} / 0x{}): jg-relay does not start", hex::encode(test), hex::encode(test_claim));
+    relayer::check_signed_test_key(&address(read(&test, "relayKey()")?), &key.address())?;
+    log(&format!(
+        "A-7 test verifier 0x{} takes this relayer's key; vkeys: checkpoint 0x{}, claim 0x{}",
+        hex::encode(test),
+        hex::encode(cp_vkey),
+        hex::encode(claim_vkey)
+    ));
+    Ok(relayer::SignedTestProver::new(key, cp_vkey, claim_vkey))
 }
 
 fn main() {
