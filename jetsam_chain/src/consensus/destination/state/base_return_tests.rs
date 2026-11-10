@@ -352,7 +352,8 @@ fn the_profiles_base_return_anchor_and_bridge() {
 }
 
 /// A dormant build reads tags 5 and 6 as an unknown tag (the wire of a build
-/// without them); an armed one decodes them.
+/// without them); an armed one decodes them (and its rules refuse them below
+/// the height: `BaseObjectBeforeActivation`).
 #[test]
 fn the_base_objects_decode_only_once_the_height_is_armed() {
     let objects = vec![
@@ -375,11 +376,19 @@ fn the_base_objects_decode_only_once_the_height_is_armed() {
                 6
             }
         );
-        assert!(!crate::consensus::destination::base_objects_on_the_wire());
+        // This build: dormant on the public network and the rehearsal, armed
+        // on the test chain.
+        let armed_build = crate::consensus::params::V1_7_BASE_RETURN_HEIGHT.is_some();
         assert_eq!(
-            decode_destination_section(&mut wire.as_slice()),
-            Err(WireError::BadMarker)
+            crate::consensus::destination::base_objects_on_the_wire(),
+            armed_build
         );
+        if !armed_build {
+            assert_eq!(
+                decode_destination_section(&mut wire.as_slice()),
+                Err(WireError::BadMarker)
+            );
+        }
         let _armed = test_rules::install(base_rules(&committee(1)));
         assert!(crate::consensus::destination::base_objects_on_the_wire());
         assert_eq!(

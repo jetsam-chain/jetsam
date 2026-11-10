@@ -359,9 +359,9 @@ fn destination_intent_round_trips_and_refuses_damage() {
 
 /// A release over Base (kind 3): its game proof and output root preimage
 /// between the finality update and the account proof. It decodes only under
-/// rules that arm the return over Base: while the height is `None` (this
-/// build, every profile) its kind is unknown, exactly as before. Damage and
-/// malformed objects are refused.
+/// rules that arm the return over Base: while the height is `None` (the
+/// public network, the rehearsal) its kind is unknown, exactly as before; the
+/// test chain's build is armed. Damage and malformed objects are refused.
 #[test]
 fn a_release_over_base_round_trips_only_once_the_height_is_armed() {
     let base = SyntheticBase::load();
@@ -378,10 +378,16 @@ fn a_release_over_base_round_trips_only_once_the_height_is_armed() {
         DestinationIntent::decode_with(&bytes, true),
         Ok(intent.clone())
     );
-    // Dormant: the kind of a build without the return over Base.
+    // This build: dormant (the kind of a build without the return over
+    // Base) on the public network and the rehearsal, armed on the test chain.
+    let armed_build = jetsam_chain::consensus::params::V1_7_BASE_RETURN_HEIGHT.is_some();
     assert_eq!(
         DestinationIntent::decode(&bytes),
-        Err(DestinationIntentError::UnknownKind(3))
+        if armed_build {
+            Ok(intent.clone())
+        } else {
+            Err(DestinationIntentError::UnknownKind(3))
+        }
     );
     assert_eq!(
         DestinationIntent::decode_with(&bytes, false),
@@ -745,14 +751,19 @@ mod fast_lane {
             assert_eq!(bytes[8], kind);
             assert!(bytes.len() <= MAX_DESTINATION_INTENT_BYTES);
             assert_eq!(DestinationIntent::decode_with(&bytes, true), Ok(intent.clone()));
-            // Dormant (every profile today): a kind of a build without them.
+            // Dormant (the public network, the rehearsal): a kind of a build
+            // without them; the test chain's build is armed.
             assert_eq!(
                 DestinationIntent::decode_with(&bytes, false),
                 Err(DestinationIntentError::UnknownKind(kind))
             );
             assert_eq!(
                 DestinationIntent::decode(&bytes),
-                Err(DestinationIntentError::UnknownKind(kind))
+                if jetsam_chain::consensus::params::V1_7_BASE_RETURN_HEIGHT.is_some() {
+                    Ok(intent.clone())
+                } else {
+                    Err(DestinationIntentError::UnknownKind(kind))
+                }
             );
             let mut longer = bytes.clone();
             longer.push(0);

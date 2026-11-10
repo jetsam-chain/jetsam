@@ -726,9 +726,15 @@ mod fast_lane_tests {
         assert_eq!(lane.records.len(), 1);
         assert_eq!(lane.records[0].owner, hex::encode([0xa1; 32]));
         assert_eq!(lane.reconcile_blocks, 14_400);
-        // Dormant: nothing.
+        // This build below its height (the test chain's is armed at 8 982,
+        // the others dormant): not active, nothing remembered; the build's
+        // key as it has it (none but on the test chain).
         let dormant = fast_lane_of(None, 120, &DestinationRules::CONSENSUS);
-        assert!(!dormant.active && dormant.records.is_empty() && dormant.release_key.is_none());
+        assert!(!dormant.active && dormant.records.is_empty());
+        assert_eq!(
+            dormant.release_key,
+            jetsam_chain::consensus::destination::fast::FAST_RELEASE_KEY.map(hex::encode)
+        );
         use jetsam_mempool::destination::DestinationAdmitted;
         for (admitted, kind) in [
             (DestinationAdmitted::FastRelease { n: 1 }, "fast_release"),

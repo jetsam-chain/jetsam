@@ -583,7 +583,9 @@ fn the_fast_lane_is_dormant_below_the_height() {
         l.check(&at, &parent),
         Err(DestinationBlockError::FastMarkerCarriesValue)
     );
-    // Tags 7, 8 and 9 on the wire: unknown to a dormant build.
+    // Tags 7, 8 and 9 on the wire: unknown to a dormant build (the test
+    // chain's build is armed: it decodes them, its rules refuse them below
+    // the height, above).
     for kind in [
         DestinationObjectKind::FastGameAttestation,
         DestinationObjectKind::FastContradiction,
@@ -597,10 +599,12 @@ fn the_fast_lane_is_dormant_below_the_height() {
             &mut wire,
         );
         assert!(matches!(wire[2], 7..=9));
-        assert_eq!(
-            decode_destination_section(&mut wire.as_slice()),
-            Err(WireError::BadMarker)
-        );
+        if crate::consensus::params::V1_7_BASE_RETURN_HEIGHT.is_none() {
+            assert_eq!(
+                decode_destination_section(&mut wire.as_slice()),
+                Err(WireError::BadMarker)
+            );
+        }
         let _armed = test_rules::install(l.rules);
         assert!(decode_destination_section(&mut wire.as_slice()).is_ok());
     }

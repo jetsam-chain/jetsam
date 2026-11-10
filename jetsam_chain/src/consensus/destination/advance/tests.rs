@@ -179,14 +179,22 @@ fn the_advance_markers_are_locked_from_the_return_over_base_on() {
         assert!(!is_advance_locked_address_at(&marker, hb, None));
     }
     assert!(!is_advance_locked_address_at(&ALICE, hb, Some(hb)));
-    // This build's height is dormant: nothing is locked by it.
-    assert!(
-        !crate::consensus::client_objects::is_client_locked_address_at(
+    // This build's height: dormant (the public network, the rehearsal),
+    // nothing is locked by it; armed (the test chain), from it on only.
+    let locked = |height: u64| {
+        crate::consensus::client_objects::is_client_locked_address_at(
             &advance_marker(N, &ALICE, 5 * JTM, &PAYER),
-            HEIGHT,
+            height,
             &crate::consensus::client_objects::ClientBatchRules::current(),
         )
-    );
+    };
+    match crate::consensus::params::V1_7_BASE_RETURN_HEIGHT {
+        None => assert!(!locked(HEIGHT)),
+        Some(armed) => {
+            assert!(!locked(armed - 1));
+            assert!(locked(armed));
+        }
+    }
 }
 
 #[test]

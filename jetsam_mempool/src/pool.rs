@@ -4701,12 +4701,15 @@ mod tests {
             destination_refusal(marker_owner.submit(&pool).await),
             Some(E::Vault(VaultError::ReleaseShape { group: 0 }))
         );
-        // Dormant (this build): kind 3 is unknown.
-        let pool = to_owner.pool_at(tip, &[]);
-        assert!(matches!(
-            to_owner.submit(&pool).await,
-            Err(super::SubmitError::MalformedIntent(_))
-        ));
+        // Dormant (the public network, the rehearsal): kind 3 is unknown;
+        // the test chain's build is armed.
+        if jetsam_chain::consensus::params::V1_7_BASE_RETURN_HEIGHT.is_none() {
+            let pool = to_owner.pool_at(tip, &[]);
+            assert!(matches!(
+                to_owner.submit(&pool).await,
+                Err(super::SubmitError::MalformedIntent(_))
+            ));
+        }
         // Held paying the owner, then an advance of exactly the burn: the
         // release no longer pays what V2 asks and is forgotten.
         let pool = pool_of(&to_owner, &[], tip);

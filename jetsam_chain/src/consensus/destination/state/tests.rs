@@ -224,7 +224,13 @@ pub(super) fn anchored_rules(anchor: &Committee) -> DestinationRules {
         }),
         bridge: Some(prototype_bridge()),
         vault: crate::consensus::vault::tests::rules(),
-        base_return: BaseReturnRules::CONSENSUS,
+        // The L1's own light client: the return over Base dormant, whatever
+        // the profile (the test chain's is armed; base_return_tests arm it
+        // where they need it).
+        base_return: BaseReturnRules {
+            activation_height: None,
+            ..BaseReturnRules::CONSENSUS
+        },
     }
 }
 
