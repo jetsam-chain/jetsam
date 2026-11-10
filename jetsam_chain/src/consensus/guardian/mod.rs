@@ -413,11 +413,24 @@ pub fn verify_guardian_signature(
     signature: &[u8; SIGNATURE_BYTES],
 ) -> Result<(), GuardianSignatureError> {
     let key = key.ok_or(GuardianSignatureError::KeyUnset)?;
+    verify_bls_min_pk(key, &keccak256(statement), GUARDIAN_DST, signature)
+}
+
+/// BLS12-381 min-pk, basic scheme: `signature` (G2, compressed) over
+/// `message` under `key` (G1, compressed, validated: on the curve, in the
+/// subgroup, not the identity) and the suite tag `dst`. The guardians' check,
+/// shared with the fast lane of the return over Base, which signs under
+/// tags of its own (`destination::fast`).
+pub fn verify_bls_min_pk(
+    key: &[u8; GROUP_KEY_BYTES],
+    message: &[u8],
+    dst: &[u8],
+    signature: &[u8; SIGNATURE_BYTES],
+) -> Result<(), GuardianSignatureError> {
     let key = PublicKey::key_validate(key).map_err(|_| GuardianSignatureError::BadGroupKey)?;
     let signature =
         Signature::from_bytes(signature).map_err(|_| GuardianSignatureError::BadSignature)?;
-    let message = keccak256(statement);
-    match signature.verify(true, &message, GUARDIAN_DST, &[], &key, true) {
+    match signature.verify(true, message, dst, &[], &key, true) {
         BLST_ERROR::BLST_SUCCESS => Ok(()),
         _ => Err(GuardianSignatureError::BadSignature),
     }
