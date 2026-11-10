@@ -567,9 +567,10 @@ impl TemplateBuilder {
         // beside the client payments.
         // The child's rules: from the return-over-Base height on, its anchor
         // and bridge.
-        let destination_rules =
-            jetsam_chain::consensus::destination::state::DestinationRules::current()
-                .effective_at(child_height);
+        let destination_rules = child_destination_rules(
+            jetsam_chain::consensus::destination::state::DestinationRules::current(),
+            child_height,
+        );
         let offer = match &snapshot.destination {
             Some(state) if destination_rules.active_at(child_height) => {
                 let (updates, releases) = self.mempool.destination_candidates().await;
@@ -1257,6 +1258,17 @@ pub(crate) fn template_timestamp(
         v1_6_activation,
     ))
 }
+
+/// The destination rules of a template for the child at `child_height`: the
+/// rules its block is judged by — from the return-over-Base height on, the
+/// return's anchor and bridge (`DestinationRules::effective_at`) — with the
+/// rules injected for the tests.
+pub(crate) fn child_destination_rules(
+    rules: jetsam_chain::consensus::destination::state::DestinationRules,
+    child_height: u64,
+) -> jetsam_chain::consensus::destination::state::DestinationRules {
+    rules.effective_at(child_height)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,6 +1637,59 @@ mod tests {
         assert_eq!(template_timestamp(parent_ts - 2_000, &parent_of(K - 1), &prev, Some(K)), parent_ts - 899);
         // A clock past the floor is kept.
         assert_eq!(template_timestamp(parent_ts + 5, &parent_of(K), &prev, Some(K)), parent_ts + 5);
+    }
+
+    /// The template offers and judges the child's destination objects under
+    /// the rules its block is judged by: from the return-over-Base height on,
+    /// the return's anchor and bridge; below it, and while the height is
+    /// dormant, the L1's.
+    #[test]
+    fn a_template_takes_the_return_over_bases_anchor_and_bridge_from_its_height() {
+        use jetsam_chain::consensus::destination::state::{
+            BaseReturnRules, DestinationRules, L1Anchor,
+        };
+        const HB: u64 = 9_000;
+        let base_anchor = L1Anchor {
+            period: 1_409,
+            committee_root: [9; 32],
+        };
+        let consensus = DestinationRules::current();
+        let l1_bridge = jetsam_chain::consensus::destination::l1_read::L1BridgeParams {
+            address: [0x11; 20],
+            code_hash: [0x22; 32],
+            withdrawals_slot: 9,
+            genesis_id_slot: 13,
+            genesis_id: [0x33; 32],
+        };
+        let base_bridge = jetsam_chain::consensus::destination::l1_read::L1BridgeParams {
+            address: [0x52; 20],
+            ..l1_bridge
+        };
+        let rules = DestinationRules {
+            anchor: None,
+            bridge: Some(l1_bridge),
+            base_return: BaseReturnRules {
+                activation_height: Some(HB),
+                anchor: Some(base_anchor),
+                bridge: Some(base_bridge),
+                ..consensus.base_return
+            },
+            ..consensus
+        };
+        let at_h = child_destination_rules(rules, HB);
+        assert_eq!(at_h.anchor, Some(base_anchor));
+        assert_eq!(at_h.bridge, Some(base_bridge));
+        assert_eq!(at_h.network, rules.base_return.network);
+        assert_eq!(child_destination_rules(rules, HB + 1).anchor, Some(base_anchor));
+        assert_eq!(child_destination_rules(rules, HB - 1), rules);
+        let dormant = DestinationRules {
+            base_return: BaseReturnRules {
+                activation_height: None,
+                ..rules.base_return
+            },
+            ..rules
+        };
+        assert_eq!(child_destination_rules(dormant, u64::MAX), dormant);
     }
 
 }
