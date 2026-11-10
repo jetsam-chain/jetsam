@@ -255,6 +255,20 @@ pub fn call(url: &str, method: &str, params: Value, timeout: Duration) -> anyhow
 /// One JSON-RPC call to `url` by `egress` (an onion-only egress never
 /// resolves a name and never connects off the machine except to Tor).
 pub fn call_via(egress: &Egress, url: &str, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+    call_via_bearer(egress, url, method, params, timeout, None)
+}
+
+/// [`call_via`] with `Authorization: Bearer <bearer>` when one is given: a
+/// node's RPC cookie, which its wallet methods answer to only (audit
+/// 2026-11-10, R-1).
+pub fn call_via_bearer(
+    egress: &Egress,
+    url: &str,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    bearer: Option<&str>,
+) -> anyhow::Result<Value> {
     let route = egress.route(url)?;
     let Target { authority, path, .. } = target(url)?;
     let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))?;
@@ -274,8 +288,9 @@ pub fn call_via(egress: &Egress, url: &str, method: &str, params: Value, timeout
         socks5_connect(&mut s, host, *port)?;
     }
     let hostport = authority;
+    let auth = bearer.map(|b| format!("Authorization: Bearer {b}\r\n")).unwrap_or_default();
     let head = format!(
-        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{auth}\r\n",
         body.len()
     );
     s.write_all(head.as_bytes())?;
