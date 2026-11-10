@@ -12334,11 +12334,16 @@ async fn handle_p2p_events(
         ($peer:expr, $height:expr) => {{
             let peer = $peer;
             let height: u64 = $height;
-            !snapshot_plan_holds_verified_authority!()
-                && pending_manifest.as_ref().is_some_and(|pending| {
-                    (pending.preferred_peer == peer || pending.providers.contains(&peer))
-                        && height <= pending.manifest.tip_height
-                })
+            let verified = snapshot_plan_holds_verified_authority!();
+            pending_manifest.as_ref().is_some_and(|pending| {
+                provider_refusal_retires_snapshot_plan(
+                    *initial_sync_ready.borrow(),
+                    verified,
+                    pending.preferred_peer == peer || pending.providers.contains(&peer),
+                    height,
+                    pending.manifest.tip_height,
+                )
+            })
         }};
     }
 
@@ -15807,6 +15812,7 @@ async fn handle_p2p_events(
                         our_tip,
                         &our_work,
                         validated_view,
+                        (!header_dag_faulted).then_some(&header_dag),
                     ) {
                         ManifestCandidacy::Admit => {
                             admitted_without_validated_view = validated_view.is_none();
@@ -17232,6 +17238,42 @@ async fn handle_p2p_events(
                         ));
                     }
                     snapshot_header_pipeline = None;
+                    // S-1 (audit 2026-11-10): the staged chain is complete only
+                    // if its tip is the claimed boundary. Before, a boundary
+                    // claimed on or below the real tip with another block
+                    // reached this point on the real headers, counted as
+                    // verified authority (it no longer yielded nor stalled),
+                    // and was refuted only once a terminal had come and failed.
+                    let mut sync = sync;
+                    if !staged_chain_holds_the_claimed_boundary(&mut sync.staging, &sync.manifest) {
+                        let providers = pending_manifest
+                            .as_ref()
+                            .map(|pending| pending.providers.iter().copied().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let local_height = sync.staging.base().header.height;
+                        learn_from_failed_snapshot_claim(
+                            &mut peer_chain_evidence,
+                            &sync.manifest,
+                            providers.iter().copied(),
+                            Some(&mut sync.staging),
+                            local_height,
+                            false,
+                            Instant::now(),
+                        );
+                        tracing::warn!(
+                            boundary = sync.manifest.tip_height,
+                            claimed_hash = %hex::encode(sync.manifest.tip_hash),
+                            providers = providers.len(),
+                            "the headers this node validated reach the snapshot boundary's height \
+                             with another block or other work — the boundary is refuted, whoever \
+                             offers it"
+                        );
+                        let preferred_peer = sync.preferred_peer;
+                        cleanup_snapshot_header_staging_offthread(sync.staging);
+                        retire_snapshot_plan!();
+                        request_bounded_manifest_failover!(preferred_peer, false);
+                        continue;
+                    }
                     let terminal_height = sync.manifest.tip_height;
                     let terminal_hash = sync.manifest.tip_hash;
                     if let Some(payload) = prefetched_snapshot_boundary_terminal.take() {
@@ -18895,8 +18937,23 @@ async fn handle_p2p_events(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                for peer in &claimants {
-                    peer_chain_evidence.mark_unserved_claim(*peer, boundary, now);
+                // S-1 (audit 2026-11-10): the record above is an identity,
+                // which a fresh one erases. What the stall proved is kept for
+                // whoever offers next: this boundary, the headers staged and
+                // validated toward it, and — within direct reach of the tip —
+                // the height past which no connected peer served a header.
+                if let Some(pending) = pending_manifest.as_ref() {
+                    learn_from_failed_snapshot_claim(
+                        &mut peer_chain_evidence,
+                        &pending.manifest,
+                        claimants.iter().copied(),
+                        pending_snapshot_header_sync
+                            .as_mut()
+                            .map(|sync| &mut sync.staging),
+                        our_height,
+                        true,
+                        now,
+                    );
                 }
                 tracing::warn!(
                     boundary,
@@ -19612,22 +19669,58 @@ async fn handle_p2p_events(
                 }
             }
 
-            // A node without a validated header view plans
-            // the boundary most peers offered during its election window,
-            // not the first one admitted.
+            // A node without a validated header view plans, among the
+            // boundaries offered during its election window and still
+            // admitted at its close, one its own headers validated, else the
+            // highest (S-1: never by the number of identities offering it).
             if cold_snapshot_ballot_opened.is_some_and(|opened| {
                 now.saturating_duration_since(opened) >= COLD_SNAPSHOT_ELECTION_WINDOW
             }) {
                 cold_snapshot_ballot_opened = None;
                 let mut ballot = std::mem::take(&mut cold_snapshot_ballot);
-                ballot.retain(|(generation, peer, _, _)| {
-                    *generation == snapshot_sync_generation
-                        && !peer_chain_evidence.is_divergent(peer, now)
-                        && peer_chain_evidence.unserved_claim(peer, now).is_none()
+                // S-1 (audit 2026-11-10): every offer is judged again at the
+                // close, on what this node knows then — tip authority gained
+                // during the window (a restarted seed whose tip a peer has
+                // just confirmed), headers validated since, plans that went
+                // unserved meanwhile. Before, an offer admitted cold stayed
+                // admitted, whatever the node had learnt.
+                let (close_tip, close_work) = {
+                    let ctx = chain.read().await;
+                    (
+                        jetsam_node::networking::ChainPoint::new(ctx.tip_height(), ctx.tip_hash()),
+                        *ctx.tip_chain_work(),
+                    )
+                };
+                let cold_headers = (!header_dag_faulted).then_some(&header_dag);
+                let tip_authority = *initial_sync_ready.borrow() && snapshot_rebase_hint.is_none();
+                ballot.retain(|(generation, peer, manifest, rebase_anchor)| {
+                    cold_offer_admitted_at_close(
+                        *generation,
+                        peer,
+                        manifest,
+                        rebase_anchor.is_some(),
+                        snapshot_sync_generation,
+                        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+                        &peer_chain_evidence,
+                        cold_headers,
+                        tip_authority,
+                        close_tip,
+                        &close_work,
+                        now,
+                    )
                 });
                 let offers = ballot
                     .iter()
-                    .map(|(_, _, manifest, _)| (manifest.tip_height, manifest.tip_hash))
+                    .map(|(_, _, manifest, _)| ColdSnapshotOffer {
+                        height: manifest.tip_height,
+                        hash: manifest.tip_hash,
+                        validated: snapshot_boundary_validated(
+                            manifest,
+                            &peer_chain_evidence,
+                            cold_headers,
+                            now,
+                        ),
+                    })
                     .collect::<Vec<_>>();
                 if let Some(elected) = elect_cold_snapshot_boundary(&offers) {
                     let (_, from, manifest, rebase_anchor) = ballot.swap_remove(elected);
@@ -19644,16 +19737,13 @@ async fn handle_p2p_events(
                                 .is_some_and(|objects| objects.awaits_matrices()),
                         );
                     if plannable {
-                        let votes = offers
-                            .iter()
-                            .filter(|offer| **offer == offers[elected])
-                            .count();
                         tracing::info!(
                             from = %from,
                             tip = manifest.tip_height,
-                            votes,
+                            validated = offers[elected].validated,
                             offers = offers.len(),
-                            "snapshot election closed: validating the boundary most peers offered"
+                            "snapshot election closed: staging the boundary its own headers \
+                             validated, else the highest offered"
                         );
                         candidate_manifest_providers.clear();
                         candidate_manifest_providers.insert(from);
@@ -20183,12 +20273,25 @@ enum ManifestCandidacy {
 ///   progress, HeaderDAG sound), the boundary must be on the HeaderDAG's
 ///   selected chain with exactly that work — or beyond the validated view
 ///   while that view is itself a snapshot gap above the local tip;
-/// * otherwise a sender whose last snapshot plan went unserved (it verified
-///   nothing and stalled) offers no candidate while that record holds: a
-///   boundary claimed above the real tip costs the node the staging of the
-///   real headers and the stall delay, once per sender, not once per cycle;
+/// * otherwise (S-1, audit 2026-11-10) a boundary at a point of a header
+///   chain this node validated itself, with exactly that work
+///   ([`snapshot_boundary_validated`]), is admitted whoever sends it: its
+///   work is verified, not announced;
+/// * any other boundary at or below the highest header this node validated
+///   is refused whoever sends it (it would cost a staging to refute, once
+///   per identity);
+/// * so is a boundary whose plan went unserved, or that validated headers
+///   refuted;
+/// * and any boundary above the height where an unverified plan last went
+///   unserved within direct reach of the local tip, while that record holds
+///   and no validated header shows a snapshot gap above it;
+/// * a sender whose last snapshot plan went unserved (it verified
+///   nothing and stalled) offers no candidate while that record holds;
 /// * and its sender must have shown the highest pinned block below the
 ///   boundary, so the boundary cannot descend from a refused branch.
+///
+/// `cold_headers` are the HeaderDAG's validated headers, used without tip
+/// authority: as verified work, and as the highest height validated.
 #[allow(clippy::too_many_arguments)]
 fn judge_snapshot_manifest(
     manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
@@ -20199,6 +20302,7 @@ fn judge_snapshot_manifest(
     local_tip: jetsam_node::networking::ChainPoint,
     local_work: &[u8; 32],
     validated_view: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    cold_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
 ) -> ManifestCandidacy {
     if evidence.is_divergent(sender, now) {
         return ManifestCandidacy::Refuse("its sender follows a branch this node refuses");
@@ -20239,6 +20343,31 @@ fn judge_snapshot_manifest(
             return ManifestCandidacy::Refuse("its boundary is beyond the validated header view");
         }
     }
+    // S-1: from here on the boundary is beyond any view with tip authority.
+    if snapshot_boundary_validated(manifest, evidence, cold_headers, now) {
+        return ManifestCandidacy::Admit;
+    }
+    let validated_top = evidence
+        .highest_validated_point(now)
+        .max(cold_headers.map(|dag| dag.best_tip().height));
+    if validated_top.is_some_and(|top| manifest.tip_height <= top) {
+        return ManifestCandidacy::Refuse(
+            "it is at or below the highest header this node validated, and not one of them",
+        );
+    }
+    if evidence.boundary_unserved(manifest.tip_height, manifest.tip_hash, now) {
+        return ManifestCandidacy::Refuse(
+            "its boundary went unserved or was refuted by validated headers",
+        );
+    }
+    if let Some(ceiling) = evidence.unserved_ceiling(now) {
+        let validated_best = validated_top.unwrap_or(local_tip.height).max(local_tip.height);
+        if manifest.tip_height > ceiling && !gap_requires_snapshot_sync(ceiling, validated_best) {
+            return ManifestCandidacy::Refuse(
+                "it is above the height where the last unverified snapshot plan went unserved",
+            );
+        }
+    }
     if evidence.unserved_claim(sender, now).is_some() {
         return ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved");
     }
@@ -20274,6 +20403,28 @@ fn snapshot_plan_yields_to_tip_extension(
         && !plan_holds_verified_authority
 }
 
+/// v1.5.1 — whether the active snapshot plan is retired because one of its
+/// providers (`provider_of_plan`) was shown at `height` on a branch this node
+/// refuses, at or below the plan's `boundary`: its boundary then descends
+/// from a refused block (2026-10-13: 30 min 46 s behind such a plan).
+///
+/// S-1 (audit 2026-11-10): not without tip authority. There, the provider's
+/// behaviour is the provider's choice: serving one refused header ended its
+/// own plan at once, the next identity's claim won the next election, and the
+/// node never staged the real headers that would have shown the claims
+/// false. A cold node's unverified plan is judged on the headers it stages
+/// instead — refuted when they reach the boundary with another block, retired
+/// after its stall otherwise — and both teach every identity's next claim.
+fn provider_refusal_retires_snapshot_plan(
+    tip_authority: bool,
+    plan_holds_verified_authority: bool,
+    provider_of_plan: bool,
+    height: u64,
+    boundary: u64,
+) -> bool {
+    tip_authority && !plan_holds_verified_authority && provider_of_plan && height <= boundary
+}
+
 /// v1.5.1 — whether one discovery round for the active snapshot plan's
 /// exact generation is complete: a request went out, or no connected peer is
 /// left to ask (every one answered that it does not serve that generation).
@@ -20287,15 +20438,169 @@ fn snapshot_discovery_round_completed(dispatched: usize, askable_peers: usize) -
 /// admitted manifest became the plan at once.
 const COLD_SNAPSHOT_ELECTION_WINDOW: Duration = Duration::from_secs(3);
 
-/// Which of the snapshot boundaries `(height, hash)` offered during a cold
-/// node's election window becomes the plan: the one the most peers offered;
-/// on a tie the lowest (a boundary claimed above the real tip loses to a real
-/// one); then the first offered.
-fn elect_cold_snapshot_boundary(offers: &[(u64, [u8; 32])]) -> Option<usize> {
+/// S-1 (audit 2026-11-10): one snapshot boundary offered during a cold
+/// node's election window, judged again when the window closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColdSnapshotOffer {
+    height: u64,
+    hash: [u8; 32],
+    /// At a point of a header chain this node validated, with exactly the
+    /// claimed work ([`snapshot_boundary_validated`]).
+    validated: bool,
+}
+
+/// Which of the snapshot boundaries offered during a cold node's election
+/// window becomes the plan (S-1, audit 2026-11-10): one this node's own
+/// headers validated, the highest of them; else the highest offered; then the
+/// lower block id; then the first offered. Never by the number of identities
+/// offering it — five Sybil peers outvoted two honest ones — and never the
+/// lower boundary first: one identity offering a fake just below the real
+/// boundary won the tie and walked the node up one claim at a time. The
+/// highest unverified boundary is staged first because its headers, validated
+/// from every connected peer, either reach it or show where the real chain
+/// stands: the plan is then refuted or stalls, and every real boundary below
+/// is validated for the next election.
+fn elect_cold_snapshot_boundary(offers: &[ColdSnapshotOffer]) -> Option<usize> {
     (0..offers.len()).min_by_key(|&index| {
-        let votes = offers.iter().filter(|offer| **offer == offers[index]).count();
-        (std::cmp::Reverse(votes), offers[index].0, index)
+        let offer = offers[index];
+        (
+            std::cmp::Reverse(offer.validated),
+            std::cmp::Reverse(offer.height),
+            offer.hash,
+            index,
+        )
     })
+}
+
+/// S-1 (audit 2026-11-10): whether `manifest`'s boundary is a point of a
+/// header chain this node validated against its own rules — the highest
+/// points of its last snapshot header stagings, or a header of the
+/// HeaderDAG — with exactly the work the manifest claims.
+fn snapshot_boundary_validated<H>(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    evidence: &peer_chain_evidence::PeerChainEvidence<H>,
+    validated_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    now: Instant,
+) -> bool {
+    let claimed = (manifest.tip_hash, manifest.cumulative_chainwork);
+    evidence.validated_point(manifest.tip_height, now) == Some(claimed)
+        || validated_headers.is_some_and(|dag| {
+            dag.cumulative_work(jetsam_node::networking::ChainPoint::new(
+                manifest.tip_height,
+                manifest.tip_hash,
+            ))
+            .is_ok_and(|work| work == manifest.cumulative_chainwork)
+        })
+}
+
+/// S-1 (audit 2026-11-10): what a snapshot plan that verified nothing teaches
+/// when it ends without its boundary — it stalled (`stalled`), or the headers
+/// it staged reached the boundary's height with another block. Kept whatever
+/// identity offers next: the boundary itself, the highest points of the
+/// validated `staging`, and, after a stall within direct reach of the local
+/// tip (`local_height`), the height where nobody served a further header.
+/// Its `providers` are remembered too, as before.
+fn learn_from_failed_snapshot_claim<H>(
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    claim: &jetsam_p2p::protocol::GetStateManifestResponse,
+    providers: impl IntoIterator<Item = libp2p::PeerId>,
+    staging: Option<&mut jetsam_node::snapshot_header_staging::SnapshotHeaderStaging>,
+    local_height: u64,
+    stalled: bool,
+    now: Instant,
+) {
+    evidence.mark_unserved_boundary(claim.tip_height, claim.tip_hash, now);
+    for peer in providers {
+        evidence.mark_unserved_claim(peer, claim.tip_height, now);
+    }
+    let Some(staging) = staging else {
+        return;
+    };
+    match staging.recent_points(peer_chain_evidence::VALIDATED_POINT_CAPACITY as u64) {
+        Ok(points) => evidence.learn_validated_points(points, now),
+        Err(error) => tracing::warn!(
+            %error,
+            "the headers a failed snapshot plan validated could not be read back"
+        ),
+    }
+    if !stalled {
+        return;
+    }
+    match staging.next_height() {
+        Ok(next_height) => {
+            let staged_tip = next_height.saturating_sub(1);
+            if stalled_plan_draws_a_ceiling(local_height, staged_tip) {
+                evidence.mark_unserved_ceiling(staged_tip, now);
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "the staged tip of a stalled snapshot plan could not be read"
+        ),
+    }
+}
+
+/// S-1 (audit 2026-11-10): the staged header chain has reached the plan's
+/// boundary height. Whether its tip is the claimed boundary — that block,
+/// that cumulative work. Until v1.7 a complete staged chain counted as
+/// verified authority before its tip was compared with the claim.
+fn staged_chain_holds_the_claimed_boundary(
+    staging: &mut jetsam_node::snapshot_header_staging::SnapshotHeaderStaging,
+    claim: &jetsam_p2p::protocol::GetStateManifestResponse,
+) -> bool {
+    staging
+        .matches_exact_point(claim.tip_height, claim.tip_hash, claim.cumulative_chainwork)
+        .unwrap_or(false)
+}
+
+/// S-1 (audit 2026-11-10): whether an unverified plan that stalled once its
+/// validated headers reached `staged_tip` draws the ceiling of
+/// [`peer_chain_evidence::PeerChainEvidence::mark_unserved_ceiling`]: only
+/// within direct reach of the local tip (`local_height`) — a restarted seed,
+/// which needs no snapshot to catch up. Never a snapshot gap away: a node far
+/// behind needs the snapshot, and the real boundaries it waits for are the
+/// ones its staged headers just validated.
+fn stalled_plan_draws_a_ceiling(local_height: u64, staged_tip: u64) -> bool {
+    !gap_requires_snapshot_sync(local_height, staged_tip)
+}
+
+/// S-1 (audit 2026-11-10): whether an offer of a cold node's election is still
+/// a candidate when the window closes: of the current snapshot generation,
+/// still above the local tip, and admitted by [`judge_snapshot_manifest`] on
+/// what the node knows at the close — with tip authority gained meanwhile
+/// (`tip_authority`: initial sync done, no rebase armed; the offer itself
+/// asked for no rebase anchor), the synced node's rule applies.
+#[allow(clippy::too_many_arguments)]
+fn cold_offer_admitted_at_close(
+    generation: u64,
+    sender: &libp2p::PeerId,
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    asks_a_rebase: bool,
+    current_generation: u64,
+    pins: &[(u64, [u8; 32])],
+    evidence: &peer_chain_evidence::PeerChainEvidence<HeldSnapshotManifest>,
+    validated_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    tip_authority: bool,
+    close_tip: jetsam_node::networking::ChainPoint,
+    close_work: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let validated_view = (tip_authority && !asks_a_rebase)
+        .then_some(validated_headers)
+        .flatten();
+    generation == current_generation
+        && manifest.tip_height > close_tip.height
+        && judge_snapshot_manifest(
+            manifest,
+            pins,
+            evidence,
+            sender,
+            now,
+            close_tip,
+            close_work,
+            validated_view,
+            validated_headers,
+        ) == ManifestCandidacy::Admit
 }
 
 /// v1.5.1 — how long a snapshot plan that has verified nothing may go
@@ -20459,7 +20764,7 @@ mod divergent_branch_capture_tests {
         header_dag::{HeaderDag, ValidatedHeader},
         ChainPoint,
     };
-    use peer_chain_evidence::PeerChainEvidence;
+    use peer_chain_evidence::{PeerChainEvidence, UNSERVED_CEILING_TTL};
 
     /// A validated chain from genesis: `len` children, each one block of the
     /// genesis target's work, in a HeaderDAG finalized at genesis.
@@ -20576,7 +20881,7 @@ mod divergent_branch_capture_tests {
             evidence.on_disconnect(&forked);
             let later = now + Duration::from_secs(60 * reconnection);
             assert_eq!(
-                judge_snapshot_manifest(&higher, &[], &evidence, &forked, later, tip, &local_work, None),
+                judge_snapshot_manifest(&higher, &[], &evidence, &forked, later, tip, &local_work, None, None),
                 ManifestCandidacy::Refuse("its sender follows a branch this node refuses"),
                 "reconnection {reconnection}"
             );
@@ -20603,7 +20908,7 @@ mod divergent_branch_capture_tests {
 
         for (peer, offered) in [(forked, &theirs), (honest, &ours)] {
             assert_eq!(
-                judge_snapshot_manifest(offered, &pins, &evidence, &peer, now, cold_tip, &[0; 32], None),
+                judge_snapshot_manifest(offered, &pins, &evidence, &peer, now, cold_tip, &[0; 32], None, None),
                 ManifestCandidacy::AwaitPinProof { pin_height: 16 }
             );
         }
@@ -20612,11 +20917,11 @@ mod divergent_branch_capture_tests {
         evidence.observe_headers(forked, [&their_16], &pins, now);
         evidence.observe_headers(honest, [&headers[15].header], &pins, now);
         assert_eq!(
-            judge_snapshot_manifest(&theirs, &pins, &evidence, &forked, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&theirs, &pins, &evidence, &forked, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Refuse("its sender follows a branch this node refuses")
         );
         assert_eq!(
-            judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Admit
         );
     }
@@ -20637,31 +20942,231 @@ mod divergent_branch_capture_tests {
         evidence.observe_headers(staller, [&headers[15].header], &pins, now);
         let next = manifest(28, [0xC3; 32], [0xFF; 32]);
         assert_eq!(
-            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Admit,
             "the pin proof alone admits it"
         );
         evidence.mark_unserved_claim(staller, 10_000, now);
         assert_eq!(
-            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved")
         );
     }
 
-    /// On a cold node the first admitted manifest was the
-    /// plan. A peer that answers first with a boundary above the real tip
-    /// won every cycle; the peers offering the real boundary now outvote it,
-    /// and a tie goes to the lower boundary.
+    fn offer(height: u64, salt: u8, validated: bool) -> ColdSnapshotOffer {
+        ColdSnapshotOffer {
+            height,
+            hash: [salt; 32],
+            validated,
+        }
+    }
+
+    /// Audit 2026-11-10, S-1. The cold election counted identities: five
+    /// Sybil peers offering a boundary above the real tip outvoted the two
+    /// offering a boundary this node had validated itself. Identities count
+    /// for nothing now: a validated boundary wins.
     #[test]
-    fn a_cold_node_plans_the_boundary_most_peers_offer() {
-        let (fake, real, newer) = ((50_000, [0xF0; 32]), (39_000, [0x39; 32]), (39_024, [0x3A; 32]));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, real, real]), Some(1));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real, newer]), Some(1));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, real]), Some(1), "tie: the lower");
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real]), Some(2), "tie: the lower");
-        assert_eq!(elect_cold_snapshot_boundary(&[real, (39_000, [0x40; 32])]), Some(0), "then the first");
-        assert_eq!(elect_cold_snapshot_boundary(&[real]), Some(0));
+    fn s1_sybil_identities_never_outvote_a_boundary_this_node_validated() {
+        let fake = offer(50_000, 0xF0, false);
+        let real = offer(39_000, 0x39, true);
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, fake, fake, fake, fake, real, real]), Some(5));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, fake, real]), Some(2));
+        let older_real = offer(38_994, 0x38, true);
+        assert_eq!(
+            elect_cold_snapshot_boundary(&[older_real, real, fake]),
+            Some(1),
+            "among validated boundaries, the highest"
+        );
         assert_eq!(elect_cold_snapshot_boundary(&[]), None);
+    }
+
+    /// S-1: on a tie the lower boundary won, so one identity offering a fake
+    /// boundary just below the real one beat it, and walked the node up one
+    /// claim at a time. Among unverified boundaries the highest is staged
+    /// first: its headers, validated from every connected peer, either reach
+    /// it or show where the real chain stands — after which every real
+    /// boundary below is validated and wins. Then the lower block id, then
+    /// the first offered: never a count.
+    #[test]
+    fn s1_a_boundary_offered_just_below_the_real_one_no_longer_wins() {
+        let fake_below = offer(38_994, 0xF0, false);
+        let real = offer(39_000, 0x39, false);
+        assert_eq!(elect_cold_snapshot_boundary(&[fake_below, real]), Some(1));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake_below, fake_below, fake_below, real]), Some(3));
+        let twin = offer(39_000, 0x38, false);
+        assert_eq!(elect_cold_snapshot_boundary(&[real, real, twin]), Some(2), "then the lower id");
+        assert_eq!(elect_cold_snapshot_boundary(&[real, real]), Some(0), "then the first");
+    }
+
+    /// S-1: on a cold node the work a manifest claims was taken on trust
+    /// until its headers were staged, and its sender only had to replay the
+    /// (public) pinned header. A boundary at a point this node validated
+    /// itself, with exactly that work, is admitted whoever sends it — even a
+    /// sender with no pin proof and an unserved plan behind it; the same
+    /// height with any other block or work is not validated by it.
+    #[test]
+    fn s1_a_boundary_this_node_validated_is_admitted_whoever_sends_it() {
+        let (_, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        evidence.learn_validated_points(
+            headers[23..=29].iter().map(|header| (header.header.height, header.hash, header.cumulative_work)),
+            now,
+        );
+        let replayer = libp2p::PeerId::random();
+        evidence.mark_unserved_claim(replayer, 50_000, now);
+        let real = manifest(24, headers[23].hash, headers[23].cumulative_work);
+        assert!(snapshot_boundary_validated(&real, &evidence, None, now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &pins, &evidence, &replayer, now, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit
+        );
+        let other_block = manifest(24, [0xB2; 32], headers[23].cumulative_work);
+        let other_work = manifest(24, headers[23].hash, more_work(headers[23].cumulative_work, 1));
+        assert!(!snapshot_boundary_validated(&other_block, &evidence, None, now));
+        assert!(!snapshot_boundary_validated(&other_work, &evidence, None, now));
+        // A fresh identity that shows the pin: at or below the highest header
+        // this node validated, a boundary that is none of its points is
+        // refused (it would cost a staging to refute, once per identity).
+        let fresh = libp2p::PeerId::random();
+        evidence.observe_headers(fresh, [&headers[15].header], &pins, now);
+        for claim in [&other_block, &other_work, &manifest(12, [0xB3; 32], [0xFF; 32])] {
+            assert_eq!(
+                judge_snapshot_manifest(claim, &pins, &evidence, &fresh, now, cold_tip, &[0; 32], None, None),
+                ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+            );
+        }
+        let above = manifest(31, [0xB4; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&above, &pins, &evidence, &fresh, now, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit,
+            "above them, an unverified claim may still be staged"
+        );
+    }
+
+    /// S-1: the headers the HeaderDAG validated are verified work too, with
+    /// or without tip authority (a restarted seed's tip probes).
+    #[test]
+    fn s1_headers_the_dag_validated_verify_a_boundary_on_a_cold_node() {
+        let (dag, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let unproven = libp2p::PeerId::random();
+        let real = manifest(24, headers[23].hash, headers[23].cumulative_work);
+        assert!(snapshot_boundary_validated(&real, &evidence, Some(&dag), now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Admit,
+            "no pin proof needed"
+        );
+        let wrong_work = manifest(24, headers[23].hash, more_work(headers[23].cumulative_work, 3));
+        assert!(!snapshot_boundary_validated(&wrong_work, &evidence, Some(&dag), now));
+        assert_eq!(
+            judge_snapshot_manifest(&wrong_work, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+        );
+        let above = manifest(31, [0xB4; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&above, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::AwaitPinProof { pin_height: 16 },
+            "above them, the v1.5.1 pin proof still applies"
+        );
+    }
+
+    /// S-1, along the node's own path: a cold node staged the real headers
+    /// toward a boundary claimed above the real tip; nobody served a header
+    /// past the real tip and the plan was retired after its stall delay. A
+    /// fresh identity, with the pin replayed, then offered the same boundary
+    /// or any other above it, and was a clean candidate (freeze after
+    /// freeze). What the stall taught now holds for every identity.
+    #[test]
+    fn s1_after_an_unserved_plan_no_fresh_identity_restarts_the_freeze() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create_at_canonical_boundary(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let (staller, fresh) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        let claim = manifest(50_000, [0xF0; 32], [0xFF; 32]);
+        learn_from_failed_snapshot_claim(&mut evidence, &claim, [staller], Some(&mut staging), 0, true, now);
+
+        let later = now + Duration::from_secs(5);
+        assert_eq!(
+            judge_snapshot_manifest(&claim, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Refuse("its boundary went unserved or was refuted by validated headers"),
+            "the same boundary, from a fresh identity"
+        );
+        let other = manifest(60_000, [0xF1; 32], [0xFF; 32]);
+        assert_eq!(
+            judge_snapshot_manifest(&other, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Refuse("it is above the height where the last unverified snapshot plan went unserved"),
+            "any other boundary above where nobody served a header"
+        );
+        assert_eq!(
+            judge_snapshot_manifest(&other, &[], &evidence, &fresh, now + UNSERVED_CEILING_TTL, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit,
+            "the ceiling holds for its TTL only"
+        );
+        // A validated header chain a snapshot gap above the ceiling releases it.
+        let (dag, headers) = validated_chain(30);
+        let far = manifest(31, [0xF2; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&far, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Admit
+        );
+    }
+
+    /// S-1: a plan whose staged headers reached its boundary height with
+    /// another block (a boundary claimed on or below the real tip) is refuted
+    /// by those headers — until v1.7 the complete staged chain counted as
+    /// verified authority first. The boundary is refused whoever offers it,
+    /// but no ceiling is drawn: the chain may go on above it.
+    #[test]
+    fn s1_a_boundary_refuted_by_validated_headers_is_refused_whoever_offers_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create_at_canonical_boundary(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        let real = manifest(0, base.block_hash, base.cumulative_chainwork);
+        let fake = manifest(0, [0xF0; 32], base.cumulative_chainwork);
+        let heavier = manifest(0, base.block_hash, [0xFF; 32]);
+        assert!(staged_chain_holds_the_claimed_boundary(&mut staging, &real));
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &fake), "another block");
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &heavier), "other work");
+
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let claim = manifest(40, [0xF0; 32], [0xFF; 32]);
+        let liar = libp2p::PeerId::random();
+        learn_from_failed_snapshot_claim(&mut evidence, &claim, [liar], Some(&mut staging), 0, false, now);
+        assert!(evidence.boundary_unserved(40, [0xF0; 32], now));
+        assert_eq!(evidence.unserved_claim(&liar, now), Some(40));
+        assert_eq!(evidence.unserved_ceiling(now), None, "a refutation draws no ceiling");
     }
 
     #[test]
@@ -20674,7 +21179,7 @@ mod divergent_branch_capture_tests {
         let cold_tip = ChainPoint::new(0, block_id(&genesis));
         let other_24 = manifest(24, [0xB2; 32], more_work([0; 32], 40));
         assert_eq!(
-            judge_snapshot_manifest(&other_24, &pins, &evidence, &libp2p::PeerId::random(), now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&other_24, &pins, &evidence, &libp2p::PeerId::random(), now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::ContradictsPin { height: 24 }
         );
     }
@@ -20692,12 +21197,12 @@ mod divergent_branch_capture_tests {
         let peer = libp2p::PeerId::random();
         let taller_but_lighter = manifest(28, [0x01; 32], more_work([0; 32], 10));
         assert_eq!(
-            judge_snapshot_manifest(&taller_but_lighter, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&taller_but_lighter, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Refuse("it carries no more work than the local tip")
         );
         let heavier = manifest(28, [0x01; 32], more_work(local_work, 8));
         assert_eq!(
-            judge_snapshot_manifest(&heavier, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&heavier, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Admit
         );
     }
@@ -20720,22 +21225,22 @@ mod divergent_branch_capture_tests {
         let local_work = headers[19].cumulative_work;
         let on_chain = manifest(36, headers[35].hash, headers[35].cumulative_work);
         assert_eq!(
-            judge_snapshot_manifest(&on_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&on_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Admit
         );
         let off_chain = manifest(36, [0xB2; 32], more_work(headers[35].cumulative_work, 5));
         assert_eq!(
-            judge_snapshot_manifest(&off_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&off_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
         );
         let wrong_work = manifest(36, headers[35].hash, more_work(headers[35].cumulative_work, 5));
         assert_eq!(
-            judge_snapshot_manifest(&wrong_work, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&wrong_work, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
         );
         let beyond_far_view = manifest(70, [0xC3; 32], more_work(headers[59].cumulative_work, 20));
         assert_eq!(
-            judge_snapshot_manifest(&beyond_far_view, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&beyond_far_view, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Admit
         );
 
@@ -20745,15 +21250,159 @@ mod divergent_branch_capture_tests {
         let local_work = headers[59].cumulative_work;
         let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
         assert_eq!(
-            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is beyond the validated header view")
         );
         // Without tip authority (cold bootstrap) the same claim may be staged:
         // staging validates every header against the node's rules.
         assert_eq!(
-            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Admit
         );
+    }
+
+    /// S-1, along the node's own path with a header this node really
+    /// validates (the pre-mined child of genesis that the staging tests use):
+    /// a claim naming another block at that height is refuted once staging
+    /// reaches it, and the staged point is learnt — the real boundary there is
+    /// then admitted whoever sends it, any other block there is refused
+    /// whoever sends it. (Added after the red run: its red is mutation m12,
+    /// which stops the learning.)
+    #[test]
+    fn s1_the_headers_a_refuted_plan_staged_judge_every_next_claim() {
+        use jetsam_chain::consensus::{asert_anchor_height, expected_target, AnchorInfo};
+        // As `snapshot_header_staging::tests::FIXTURE_CHAIN_NONCE`.
+        const FIXTURE_CHAIN_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+            611_542
+        } else {
+            162_878
+        };
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let anchor_height = asert_anchor_height(genesis.height);
+        assert_eq!(anchor_height, 0);
+        let child = jetsam_chain::block_header::BlockHeader {
+            prev_block_hash: jetsam_chain::hash_block_header(&genesis),
+            state_root: [1; 32],
+            tx_root: [0x41; 32],
+            timestamp: genesis.timestamp + jetsam_chain::consensus::params::block_time_at(1),
+            height: 1,
+            miner_address: genesis.miner_address,
+            nonce: FIXTURE_CHAIN_NONCE,
+            difficulty_target: expected_target(
+                &AnchorInfo {
+                    anchor_height,
+                    anchor_timestamp: genesis.timestamp,
+                    anchor_parent_timestamp: genesis.timestamp,
+                    anchor_target: genesis.difficulty_target,
+                },
+                1,
+                genesis.timestamp,
+            ),
+            log_slots: genesis.log_slots,
+            active_slot_count: genesis.active_slot_count,
+            alloc_counter: genesis.alloc_counter,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        staging.append_batch(&ctx.store, &[child]).unwrap();
+        let real_work = jetsam_chain::add_work(
+            &base.cumulative_chainwork,
+            &jetsam_chain::block_work(&child.difficulty_target),
+        );
+        let real = manifest(1, jetsam_chain::hash_block_header(&child), real_work);
+        let fake = manifest(1, [0xF0; 32], more_work(real_work, 40));
+        assert!(staged_chain_holds_the_claimed_boundary(&mut staging, &real));
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &fake));
+
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let (liar, fresh) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        learn_from_failed_snapshot_claim(&mut evidence, &fake, [liar], Some(&mut staging), 0, false, now);
+        let cold_tip = ChainPoint::new(0, base.block_hash);
+        assert!(snapshot_boundary_validated(&real, &evidence, None, now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &[], &evidence, &liar, now, cold_tip, &base.cumulative_chainwork, None, None),
+            ManifestCandidacy::Admit,
+            "the real boundary, even from the liar"
+        );
+        for claim in [&fake, &manifest(1, [0xF3; 32], more_work(real_work, 2))] {
+            assert_eq!(
+                judge_snapshot_manifest(claim, &[], &evidence, &fresh, now, cold_tip, &base.cumulative_chainwork, None, None),
+                ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+            );
+        }
+    }
+
+    /// S-1: a seed restarted on the tip. A peer offered a boundary 8 above
+    /// it during the election window and was admitted cold; meanwhile a tip
+    /// probe confirmed the seed's tip (tip authority), and the offer was
+    /// still planned when the window closed — its staging held the seed's
+    /// imports until its stall. Every offer is judged again at the close, on
+    /// what the node knows then.
+    #[test]
+    fn s1_a_cold_offer_is_judged_again_when_the_election_closes() {
+        let (dag, headers) = validated_chain(60);
+        let tip = headers[59].point();
+        let local_work = headers[59].cumulative_work;
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let peer = libp2p::PeerId::random();
+        let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
+        assert_eq!(
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None, None),
+            ManifestCandidacy::Admit,
+            "admitted while cold"
+        );
+        let at_close = |generation: u64, rebase: bool, authority: bool, close_tip: ChainPoint| {
+            cold_offer_admitted_at_close(
+                generation, &peer, &mseed2, rebase, 7, &[], &evidence, Some(&dag), authority, close_tip,
+                &local_work, now,
+            )
+        };
+        assert!(!at_close(7, false, true, tip), "tip authority gained during the window");
+        assert!(at_close(7, false, false, tip), "still cold: staging will judge it");
+        assert!(at_close(7, true, true, tip), "an offer that asks a rebase is judged as on arrival");
+        assert!(!at_close(6, false, false, tip), "another generation");
+        assert!(!at_close(7, false, false, ChainPoint::new(68, [0xB2; 32])), "no longer above the tip");
+    }
+
+    /// S-1: the ceiling drawn after a stall holds only within direct reach of
+    /// the local tip (a restarted seed, which needs no snapshot). A new node
+    /// a snapshot gap behind gets none: it needs the snapshot, and the real
+    /// boundaries it waits for are just below the headers its stalled plan
+    /// validated.
+    #[test]
+    fn s1_a_stall_a_snapshot_gap_below_the_real_tip_draws_no_ceiling() {
+        let reach = jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000), "a seed restarted on the tip");
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_005));
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000 + reach));
+        assert!(!stalled_plan_draws_a_ceiling(46_000, 46_000 + reach + 1));
+        assert!(!stalled_plan_draws_a_ceiling(0, 50_000), "a new node");
+    }
+
+    /// S-1: on a cold node a provider ended its own plan whenever it chose,
+    /// by serving one refused header, and a fresh identity's claim took the
+    /// next election — the real headers were never staged, so nothing ever
+    /// showed the claims false. Without tip authority the plan stays and is
+    /// judged on the headers it stages; with it, v1.5.1 holds unchanged.
+    #[test]
+    fn s1_a_provider_cannot_end_a_cold_plan_at_will() {
+        assert!(!provider_refusal_retires_snapshot_plan(false, false, true, 40_000, 50_000), "cold");
+        assert!(provider_refusal_retires_snapshot_plan(true, false, true, 40_000, 50_000));
+        assert!(!provider_refusal_retires_snapshot_plan(true, true, true, 40_000, 50_000), "verified plan");
+        assert!(!provider_refusal_retires_snapshot_plan(true, false, false, 40_000, 50_000), "not a provider");
+        assert!(!provider_refusal_retires_snapshot_plan(true, false, true, 50_001, 50_000), "above the boundary");
     }
 
     /// A validated direct extension of the committed tip is never held behind
