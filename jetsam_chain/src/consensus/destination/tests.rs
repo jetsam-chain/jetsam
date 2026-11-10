@@ -25,7 +25,8 @@ use super::l1_read::{
     withdrawal_commitment, withdrawal_slot, L1BridgeParams, L1ReadError,
 };
 use super::light_client::{
-    verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
+    finalized_execution, verify_committee_update, verify_finality_update, KnownCommittee,
+    LightClientError,
 };
 use super::mpt::{keccak256, mpt_get, MptError};
 use super::ssz::{
@@ -1396,12 +1397,20 @@ fn gloas_execution_header_rlp_matches_block_hash() {
         verify_finality_update(&SEPOLIA, &committee_refs(&committees), &bad).map(|_| ()),
         Err(LightClientError::ExecutionHeaderMissing)
     );
-    let mut bad = fu;
+    let mut bad = fu.clone();
     bad.execution_rlp = Some(rlp_hex("gloas_blk_now.rlp.hex"));
     assert_eq!(
         verify_finality_update(&SEPOLIA, &committee_refs(&committees), &bad).map(|_| ()),
         Err(LightClientError::ExecutionHeaderHash)
     );
+    // A relay reads the same execution block out of the update without the
+    // committees (it never judges the signature: the node does), and the
+    // same refusals of its execution header.
+    assert_eq!(finalized_execution(&fu), Ok(out.execution));
+    assert_eq!(finalized_execution(&bad), Err(LightClientError::ExecutionHeaderHash));
+    let mut bad = fu;
+    bad.execution_rlp = None;
+    assert_eq!(finalized_execution(&bad), Err(LightClientError::ExecutionHeaderMissing));
 }
 
 /// A Gloas object read as Fulu (version or gindices), and a Fulu object

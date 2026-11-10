@@ -1635,6 +1635,33 @@ fn the_real_proposed_game_is_valid_for_the_fast_lane_only() {
     );
 }
 
+/// The slots a relay asks `eth_getProof` for a game are the ones the rule
+/// reads, in its order: the real capture's keys (which `read_game_facts`
+/// reads above).
+#[test]
+fn the_slots_a_relay_asks_are_the_ones_the_rule_reads() {
+    let c = sep_fast();
+    let game = address(&c["game"]["address"]);
+    let args = hx(c["game"]["args"].as_str().expect("args"));
+    let portal = address(&c["contracts"]["portal"]);
+    let slots = game_proof_slots(&BASE_SEPOLIA, &game, &args, &portal).expect("a game's arguments");
+    let keys = |name: &str| -> Vec<Root> {
+        c["proofs"][name]["storageProof"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .map(|s| word(&s["key"]))
+            .collect()
+    };
+    assert_eq!(slots.anchor_state_registry, keys("asr"));
+    assert_eq!(slots.dispute_game_factory, keys("factory"));
+    assert_eq!(slots.game, keys("game"));
+    assert_eq!(slots.system_config, keys("system_config"));
+    assert_eq!(slots.superchain_config, keys("superchain_config"));
+    // Arguments of another length: nothing to ask.
+    assert_eq!(game_proof_slots(&BASE_SEPOLIA, &game, &args[1..], &portal), None);
+}
+
 /// Every step of the slow judgment but finality, then in progress,
 /// initialized, at least one proof, not countered.
 #[test]

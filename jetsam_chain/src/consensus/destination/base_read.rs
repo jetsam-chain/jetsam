@@ -491,6 +491,56 @@ fn read_contract(
     Ok((account, words))
 }
 
+/// The slots [`read_game_facts`] reads of each contract, in the order of a
+/// [`GameProof`]'s slot proofs, the game's being the fast lane's three
+/// ([`FAST_GAME_SLOTS`]): what a relay asks `eth_getProof` for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GameProofSlots {
+    pub anchor_state_registry: Vec<Root>,
+    pub dispute_game_factory: Vec<Root>,
+    pub game: Vec<Root>,
+    pub system_config: Vec<Root>,
+    pub superchain_config: Vec<Root>,
+}
+
+/// The slots of [`GameProofSlots`] for the game `game` of immutable arguments
+/// `args`, `optimism_portal` being `SystemConfig.optimismPortal()` (the pause
+/// identifier); `None` when `args` are not of the pinned implementations'
+/// length.
+pub fn game_proof_slots(
+    params: &BaseParams,
+    game: &Address,
+    args: &[u8],
+    optimism_portal: &Address,
+) -> Option<GameProofSlots> {
+    if args.len() != ARGS_FIXED_BYTES + 32 * params.intermediate_roots {
+        return None;
+    }
+    let root_claim: Root = args[0x14..0x34].try_into().expect("32 bytes");
+    let uuid = game_uuid(params.game_type, &root_claim, &args[0x54..]);
+    Some(GameProofSlots {
+        anchor_state_registry: vec![
+            u256(ASR_SYSTEM_CONFIG_SLOT),
+            u256(ASR_FACTORY_SLOT),
+            mapping_slot(&padded(game), ASR_BLACKLIST_MAPPING),
+            u256(ASR_RETIREMENT_SLOT),
+            IMPLEMENTATION_SLOT,
+        ],
+        dispute_game_factory: vec![mapping_slot(&uuid, FACTORY_GAMES_MAPPING), IMPLEMENTATION_SLOT],
+        game: FAST_GAME_SLOTS.iter().map(|slot| u256(*slot)).collect(),
+        system_config: vec![
+            u256(SYSTEM_CONFIG_SUPERCHAIN_SLOT),
+            OPTIMISM_PORTAL_SLOT,
+            IMPLEMENTATION_SLOT,
+        ],
+        superchain_config: vec![
+            mapping_slot(&[0u8; 32], SUPERCHAIN_PAUSE_MAPPING),
+            mapping_slot(&padded(optimism_portal), SUPERCHAIN_PAUSE_MAPPING),
+            IMPLEMENTATION_SLOT,
+        ],
+    })
+}
+
 /// Read, under the L1 state root `l1_state_root`, a game and what judges it.
 /// Refuses only what is not a proof (or not a game of a pinned
 /// implementation); [`judge_game`] decides validity.

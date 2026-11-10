@@ -355,6 +355,43 @@ pub(crate) fn verify_committee_update_with_rules(
     })
 }
 
+/// The finalized execution block `update` names (its execution header
+/// checked against the block hash under Gloas), **without** judging its
+/// signature or branches: what a relay reads before handing the update to a
+/// node, which verifies it ([`verify_finality_update`]).
+pub fn finalized_execution(
+    update: &LightClientFinalityUpdate,
+) -> Result<FinalizedExecution, LightClientError> {
+    let finalized = &update.finalized_header.beacon;
+    Ok(match &update.finalized_header.execution {
+        LightClientExecution::Fulu { header, .. } => FinalizedExecution {
+            beacon_slot: finalized.slot,
+            block_number: header.block_number,
+            block_hash: header.block_hash,
+            state_root: header.state_root,
+            timestamp: Some(header.timestamp),
+        },
+        LightClientExecution::Gloas { block_hash, .. } => {
+            let rlp = update
+                .execution_rlp
+                .as_deref()
+                .ok_or(LightClientError::ExecutionHeaderMissing)?;
+            if keccak256(rlp) != *block_hash {
+                return Err(LightClientError::ExecutionHeaderHash);
+            }
+            FinalizedExecution {
+                beacon_slot: finalized.slot,
+                block_number: execution_header_number(rlp)
+                    .map_err(|_| LightClientError::ExecutionHeaderMalformed)?,
+                block_hash: *block_hash,
+                state_root: execution_header_state_root(rlp)
+                    .map_err(|_| LightClientError::ExecutionHeaderMalformed)?,
+                timestamp: execution_header_timestamp(rlp).ok(),
+            }
+        }
+    })
+}
+
 /// Verify a finality update against the committees the node knows, and
 /// return the finalized execution block it proves.
 pub fn verify_finality_update(
@@ -391,33 +428,7 @@ pub fn verify_finality_update(
         attested,
         &update.sync_aggregate,
     )?;
-    let execution = match &update.finalized_header.execution {
-        LightClientExecution::Fulu { header, .. } => FinalizedExecution {
-            beacon_slot: finalized.slot,
-            block_number: header.block_number,
-            block_hash: header.block_hash,
-            state_root: header.state_root,
-            timestamp: Some(header.timestamp),
-        },
-        LightClientExecution::Gloas { block_hash, .. } => {
-            let rlp = update
-                .execution_rlp
-                .as_deref()
-                .ok_or(LightClientError::ExecutionHeaderMissing)?;
-            if keccak256(rlp) != *block_hash {
-                return Err(LightClientError::ExecutionHeaderHash);
-            }
-            FinalizedExecution {
-                beacon_slot: finalized.slot,
-                block_number: execution_header_number(rlp)
-                    .map_err(|_| LightClientError::ExecutionHeaderMalformed)?,
-                block_hash: *block_hash,
-                state_root: execution_header_state_root(rlp)
-                    .map_err(|_| LightClientError::ExecutionHeaderMalformed)?,
-                timestamp: execution_header_timestamp(rlp).ok(),
-            }
-        }
-    };
+    let execution = finalized_execution(update)?;
     Ok(VerifiedFinality {
         execution,
         participants,
