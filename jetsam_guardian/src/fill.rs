@@ -828,6 +828,20 @@ pub const LABEL_ADVANCE_BATCH: &str = "advanceBatch";
 /// to the recipient); its orders are decided again at the next step.
 pub const CANCEL_AT_RECOVERY: [&str; 2] = [LABEL_ADVANCE, LABEL_ADVANCE_BATCH];
 
+/// E-6 (audit 2026-11-10): the robot's advance of `orders` against the checkpoint `seen`: always `advanceBatch`, one
+/// order too (an order another advancer paid first, `AdvanceExists`, or minted meanwhile is skipped by the contract,
+/// never a revert of the call), and its label.
+pub fn advance_call(orders: &[crate::l1::AdvanceOrder], seen: &[u8; 32]) -> (Vec<u8>, &'static str) {
+    (crate::l1::advance_batch(orders, seen), LABEL_ADVANCE_BATCH)
+}
+
+/// E-6: a reverted `advanceBatch` of the robot is explained by another transaction landing first when the checkpoint
+/// it was checked against is no longer canonical on the contract (a branch switch: `StaleCheckpoint`, the only refusal
+/// of the whole batch). `node_of`: the contract's `nodeOf(seen)` read after the receipt (`None`: not read, counted).
+pub fn advance_raced(node_of: Option<&[u8]>) -> bool {
+    node_of.and_then(|n| n.get(4 * 32..5 * 32)).is_some_and(|canonical| canonical.iter().all(|b| *b == 0))
+}
+
 /// A5-13: the count of the robot's consecutive reverted transactions after a receipt of `status` (a success resets
 /// it), and the halt it reaches — the count back to 0 then, counted again after the operator's restart.
 pub fn after_receipt(reverts: u32, status: bool) -> (u32, Option<&'static str>) {

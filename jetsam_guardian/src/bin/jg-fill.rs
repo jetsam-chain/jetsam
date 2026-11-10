@@ -504,8 +504,8 @@ impl Robot {
         let mut n = orders.len();
         let (receipt, list) = loop {
             let list: Vec<AdvanceOrder> = orders[..n].iter().map(|(_, o, _)| *o).collect();
-            let data = if list.len() == 1 { l1::advance(&list[0], seen) } else { l1::advance_batch(&list, seen) };
-            let label = if list.len() == 1 { fill::LABEL_ADVANCE } else { fill::LABEL_ADVANCE_BATCH };
+            // E-6: always advanceBatch (an order paid or minted first is skipped, never a revert)
+            let (data, label) = fill::advance_call(&list, seen);
             match self.tx.send(&self.l1, &self.bridge, &data, label) {
                 Ok(r) => break (r, list),
                 Err(e) => {
@@ -524,7 +524,9 @@ impl Robot {
             }
         };
         let orders = &orders[..n];
-        self.receipt_seen(receipt.status, l1_now)?;
+        // E-6: the checkpoint it was checked against no longer canonical (a branch switch) explains a revert
+        let raced = !receipt.status && fill::advance_raced(self.view("nodeOf(bytes32)", seen).ok().as_deref());
+        self.receipt_seen(receipt.status, raced, l1_now)?;
         if !receipt.status {
             log(&format!("advance transaction reverted: {}", receipt.tx_hash));
             self.journal(json!({"kind": "send_reverted", "orders": list.len(), "l1_tx": receipt.tx_hash, "seen_checkpoint": hex::encode(seen), "l1_t": l1_now}));
@@ -603,7 +605,13 @@ impl Robot {
                     log(&format!("claimed own repayment key {} status {} gas {}", hex::encode(a.key), r.status, r.gas_used));
                     self.journal(json!({"kind": "claimed_own", "key": hex::encode(a.key), "txid": hex::encode(a.txid), "status": r.status,
                                         "l1_tx": r.tx_hash, "gas": r.gas_used, "l1_t": l1_now}));
-                    if self.receipt_seen(r.status, l1_now)? {
+                    // E-6: its deposit minted first by another transaction (the relayer's claim) explains a revert
+                    let raced = !r.status && {
+                        let mut data = l1::selector("isMinted(bytes32)").to_vec();
+                        data.extend_from_slice(&a.txid);
+                        self.l1.call(&self.bridge, &data).is_ok_and(|w| word(&w, 0)[31] == 1)
+                    };
+                    if self.receipt_seen(r.status, raced, l1_now)? {
                         break;
                     }
                 }
@@ -618,10 +626,14 @@ impl Robot {
     }
 
     /// A5-13: the receipt of one of the robot's own transactions: `MAX_CONSECUTIVE_REVERTS` reverted in a row halt it
-    /// (latched in `HALT`, `HALT_REPEATED_REVERTS`); true when that halt is reached now.
-    fn receipt_seen(&mut self, status: bool, l1_now: u64) -> anyhow::Result<bool> {
-        let (n, halt) = fill::after_receipt(self.state.reverts, status);
+    /// (latched in `HALT`, `HALT_REPEATED_REVERTS`); true when that halt is reached now. E-6: `raced`, a revert
+    /// explained by another transaction landing first, is not counted (as the relayer's, `after_own_receipt`).
+    fn receipt_seen(&mut self, status: bool, raced: bool, l1_now: u64) -> anyhow::Result<bool> {
+        let (n, halt) = jetsam_guardian::relayer::after_own_receipt(self.state.reverts, status, raced);
         self.state.reverts = n;
+        if !status {
+            log(&format!("transaction reverted ({}; {n} unexplained in a row)", if raced { "another transaction landed first" } else { "unexplained" }));
+        }
         let Some(code) = halt else { return Ok(false) };
         log(&format!("HALT {code}: {} of its transactions reverted in a row (latched in {}; an operator removes it)", fill::MAX_CONSECUTIVE_REVERTS, self.halt_file.display()));
         // latched even under another halt (own claims go on under the others): its line is added to the file

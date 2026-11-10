@@ -1095,6 +1095,109 @@ fn halts_after_three_reverts(before: Option<&str>) {
     assert!(journal.contains("HALT_REPEATED_REVERTS"), "{journal}");
 }
 
+// ---------------------------------------------------------------- jg-fill: the audit of 2026-11-10 (E-6)
+
+fn hexsel(sig: &str) -> String {
+    format!("0x{}", hex::encode(jetsam_guardian::l1::selector(sig)))
+}
+
+/// The fake L1 of `inner` where a `claimDeposit` the robot sends is minted first by another transaction (the relayer's):
+/// once sent, its deposit is minted (`isMinted`) and the advance of `keys` (key → txid, hex) repaid (`advanceOf`).
+fn minted_first(inner: Answer, keys: std::collections::HashMap<String, String>) -> Answer {
+    let minted: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
+    let (claim, is_minted, advance_of) = (hexsel("claimDeposit((uint64,address,uint64,bytes32),bytes32,bytes32[32])"), hexsel("isMinted(bytes32)"), hexsel("advanceOf(bytes32)"));
+    Arc::new(move |method, params| {
+        let data = params[0]["data"].as_str().unwrap_or_default().to_lowercase();
+        match method {
+            "eth_sendTransaction" if data.starts_with(&claim) => {
+                minted.lock().unwrap().insert(data[10 + 192..10 + 256].to_string());
+                inner(method, params)
+            }
+            "eth_call" if data.starts_with(&is_minted) => json!({"result": format!("0x{:064x}", u8::from(minted.lock().unwrap().contains(&data[10..74])))}),
+            "eth_call" if data.starts_with(&advance_of) => {
+                let repaid = keys.get(&data[10..74]).is_some_and(|t| minted.lock().unwrap().contains(t));
+                json!({"result": format!("0x{}{:064x}{}", "00".repeat(64), if repaid { 2 } else { 0 }, "00".repeat(96))})
+            }
+            _ => inner(method, params),
+        }
+    })
+}
+
+/// E-6 (audit 2026-11-10): a revert another transaction explains never counts towards the halt: here the robot's own
+/// claims of three repayments, each minted first by another claim (the relayer's): three reverted sends, no halt,
+/// the advances repaid, nothing claimed again. Before: `HALT_REPEATED_REVERTS` (a third party halted the robot).
+/// Rehearsal build only.
+#[test]
+fn jg_fill_never_halts_on_reverts_another_transaction_explains() {
+    if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
+        return;
+    }
+    use jetsam_guardian::checkpoint::{deposit_leaf, Checkpoint, Deposit};
+    use jetsam_guardian::fill::{advance_key, paid, AdvanceStatus, Advanced, Ledger};
+    let deps: Vec<Deposit> = (0..3u8).map(|i| Deposit { index: u64::from(i), recipient: [0xa1 + i; 20], amount: 7_000_000 + u64::from(i), jetsam_tx_id: [0x50 + i; 32] }).collect();
+    let keys = deps.iter().map(|d| (hex::encode(advance_key(&d.jetsam_tx_id, &d.recipient, d.amount)), hex::encode(d.jetsam_tx_id))).collect();
+    let (socks, seen) = fake_tor(minted_first(reverting(fill_world(1_200_000_000)), keys));
+    let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
+    let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
+    let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);
+    let leaves: Vec<[u8; 32]> = deps.iter().map(deposit_leaf).collect();
+    let fin = Checkpoint {
+        height: 300,
+        cum_work: [1; 32],
+        headers_digest: [2; 32],
+        deposit_root: jetsam_guardian::chain::merkle_root(&leaves),
+        deposit_count: 3,
+        anchor_root: [3; 32],
+        locked_height: 292,
+        tip_block_id: [4; 32],
+        locked_block_id: [5; 32],
+        locked_cum_work: [6; 32],
+    };
+    std::fs::create_dir_all(dir.join("publish")).unwrap();
+    std::fs::write(dir.join("publish/final.json"), jetsam_guardian::relayer::published_final(&fin.id(), &fin, &deps, &[200, 201, 202]).to_string()).unwrap();
+    let advances: Vec<Advanced> = deps
+        .iter()
+        .enumerate()
+        .map(|(i, d)| Advanced {
+            key: advance_key(&d.jetsam_tx_id, &d.recipient, d.amount),
+            txid: d.jetsam_tx_id,
+            height: 200 + i as u64,
+            block_id: [7; 32],
+            recipient: d.recipient,
+            amount: d.amount,
+            fee_bps: 75,
+            paid: paid(d.amount, 75),
+            sent_at: 1,
+            tx_hash: String::new(),
+            status: AdvanceStatus::Pending,
+        })
+        .collect();
+    let state = json!({"ledger": Ledger { advances }, "scanned": {}, "confirmed_at": {}, "decided": {}, "checkpoints": {}, "observers": {}});
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("state/state.json"), state.to_string()).unwrap();
+    let toml = std::fs::read_to_string(dir.join("fill.toml")).unwrap();
+    std::fs::write(dir.join("fill.toml"), format!("relay_final = \"{}\"\n{toml}", dir.join("publish/final.json").display())).unwrap();
+    let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+    let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let sends = || seen.lock().unwrap().iter().filter(|(.., m)| m == "eth_sendTransaction").count();
+    let repaid = || {
+        std::fs::read_to_string(dir.join("state/state.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| v["ledger"]["advances"].as_array().is_some_and(|a| a.iter().all(|x| x["status"] == json!("Repaid"))))
+    };
+    let all = wait_for(60, || sends() >= 3 && repaid());
+    // several more steps: nothing more is sent, nothing latched
+    std::thread::sleep(Duration::from_secs(4));
+    let after = sends();
+    stop(robot);
+    let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+    assert!(all, "sends {}; log:\n{log}", sends());
+    assert_eq!(after, 3, "three claims, each sent once; log:\n{log}");
+    assert!(!dir.join("state/HALT").exists(), "halted: {:?}; log:\n{log}", std::fs::read_to_string(dir.join("state/HALT")));
+    assert!(log.contains("another transaction landed first"), "{log}");
+}
+
 // ---------------------------------------------------------------- jg-relay: its state (re-audit R5, A5-14)
 
 /// A5-14 for the relayer: a `state.json` present but unreadable is no start (a default would forget every

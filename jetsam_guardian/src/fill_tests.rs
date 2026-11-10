@@ -1800,3 +1800,34 @@ fn m8_the_robots_advances_are_the_labels_cancelled_at_a_recovery() {
     assert_eq!(CANCEL_AT_RECOVERY, [LABEL_ADVANCE, LABEL_ADVANCE_BATCH]);
     assert_eq!((LABEL_ADVANCE, LABEL_ADVANCE_BATCH), ("advance", "advanceBatch"));
 }
+
+/// E-6 (audit 2026-11-10): the robot's advance is always `advanceBatch`, one order too (the contract skips an order
+/// another advancer paid first, never reverting the call), under its batch label (cancelled at a recovery, M8).
+#[test]
+fn e6_an_advance_is_always_a_batch_one_order_too() {
+    let o = |b: u8| crate::l1::AdvanceOrder { jetsam_tx_id: [b; 32], recipient: [b; 20], amount: 7 * JTM, fee_bps: 75, refund_to: [0xc0; 20], evidence: [0xee; 32] };
+    let seen = [0x5e; 32];
+    let batch = crate::l1::selector(&format!("advanceBatch({}[],bytes32)", crate::l1::ADVANCE_ORDER_TUPLE));
+    for orders in [vec![o(1)], vec![o(1), o(2)]] {
+        let (data, label) = advance_call(&orders, &seen);
+        assert_eq!(data, crate::l1::advance_batch(&orders, &seen), "{} order(s)", orders.len());
+        assert_eq!((&data[..4], label), (&batch[..], LABEL_ADVANCE_BATCH));
+        assert!(CANCEL_AT_RECOVERY.contains(&label));
+    }
+}
+
+/// E-6: a reverted batch is explained by another transaction only when the checkpoint it was checked against is no
+/// longer canonical (`nodeOf(seen).canonical`, its fifth word, 0: a branch switch, `StaleCheckpoint`); unread, it counts.
+#[test]
+fn e6_a_reverted_advance_is_explained_only_by_its_checkpoint_left_canonical() {
+    let node = |canonical: u8| {
+        let mut n = vec![0u8; 6 * 32];
+        n[3 * 32 + 31] = 9; // acceptedAt
+        n[4 * 32 + 31] = canonical;
+        n
+    };
+    assert!(advance_raced(Some(&node(0))), "no longer canonical: a branch switch");
+    assert!(!advance_raced(Some(&node(1))), "still canonical: unexplained");
+    assert!(!advance_raced(None), "not read: counted");
+    assert!(!advance_raced(Some(&[0u8; 64])), "an answer too short: counted");
+}
