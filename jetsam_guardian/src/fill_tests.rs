@@ -747,6 +747,14 @@ fn parameters_below_their_floors_are_refused() {
     assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_ok());
     p.confirmations = 7;
     assert!(p.check(crate::Profile::PrivateRehearsal, 3_000_000, 25).is_err());
+    // D148: the public test chain is mined by its operator alone: it may lift the concentration halt, never the
+    // pause after a switch; the mainnet keeps the 55 % ceiling
+    let mut t = FillParams::default();
+    t.share_halt_pct = 100;
+    assert!(t.check(crate::Profile::PublicTestnet, 3_000_000, 25).is_ok());
+    assert!(t.check(crate::Profile::Mainnet, 3_000_000, 25).is_err());
+    t.switch_pause_secs = 21_599;
+    assert!(t.check(crate::Profile::PublicTestnet, 3_000_000, 25).is_err());
 }
 
 // ---------------------------------------------------------------- evidence and journal

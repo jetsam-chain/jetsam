@@ -334,7 +334,9 @@ impl FillParams {
             self.batch_max
         );
         if profile.strict() {
-            anyhow::ensure!(self.share_halt_pct <= SHARE_HALT_CEIL, "share_halt_pct {} is above {SHARE_HALT_CEIL} on {profile}", self.share_halt_pct);
+            // D148: the public test chain is mined by its operator alone, its concentration halt may be lifted
+            let ceil = if profile == crate::Profile::PublicTestnet { 100 } else { SHARE_HALT_CEIL };
+            anyhow::ensure!(self.share_halt_pct <= ceil, "share_halt_pct {} is above {ceil} on {profile}", self.share_halt_pct);
             anyhow::ensure!(self.switch_pause_secs >= SWITCH_PAUSE_FLOOR, "switch_pause_secs {} is below {SWITCH_PAUSE_FLOOR} on {profile}", self.switch_pause_secs);
         } else {
             anyhow::ensure!(self.share_halt_pct <= 100, "share_halt_pct {} above 100", self.share_halt_pct);
