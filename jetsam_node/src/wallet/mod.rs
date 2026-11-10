@@ -881,7 +881,7 @@ impl WalletOps for WalletHandle {
         explicit_fee_micro_jtm: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
-        relay_floor: u64,
+        relay_floor: jetsam_mempool::RelayFloor,
     ) -> Result<WalletSendPlan, WalletSendPlanError> {
         if amount_micro_jtm == 0 {
             return Err(WalletSendPlanError::Other(
@@ -919,7 +919,9 @@ impl WalletOps for WalletHandle {
         // still computed below from the selected transaction's real I/O.
         let one_input_one_output =
             jetsam_chain::consensus::fee_breakdown(1, 1, active_slot_count, log_slots);
-        let one_input_one_output_minimum = one_input_one_output.required_total.max(relay_floor);
+        let one_input_one_output_minimum = one_input_one_output
+            .required_total
+            .max(relay_floor.required(1, 1));
         if let Some(fee) = explicit_fee_micro_jtm {
             if fee < one_input_one_output_minimum {
                 return Err(WalletSendPlanError::Other(format!(
@@ -968,7 +970,9 @@ impl WalletOps for WalletHandle {
                     active_slot_count,
                     log_slots,
                 );
-                let minimum = breakdown.required_total.max(relay_floor);
+                let minimum = breakdown
+                    .required_total
+                    .max(relay_floor.required(input_count as u64, output_count as u64));
                 if fee < minimum {
                     return Err(WalletSendPlanError::Other(format!(
                         "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} \u{03bc}{TICKER}, got {fee} \u{03bc}{TICKER}"
@@ -984,7 +988,9 @@ impl WalletOps for WalletHandle {
                 active_slot_count,
                 log_slots,
             );
-            let one_output_fee = one_output_breakdown.required_total.max(relay_floor);
+            let one_output_fee = one_output_breakdown
+                .required_total
+                .max(relay_floor.required(input_count as u64, 1));
             if selected_value > amount_micro_jtm {
                 let two_output_breakdown = jetsam_chain::consensus::fee_breakdown(
                     input_count as u64,
@@ -992,7 +998,9 @@ impl WalletOps for WalletHandle {
                     active_slot_count,
                     log_slots,
                 );
-                let two_output_fee = two_output_breakdown.required_total.max(relay_floor);
+                let two_output_fee = two_output_breakdown
+                    .required_total
+                    .max(relay_floor.required(input_count as u64, 2));
                 let two_output_need =
                     amount_micro_jtm
                         .checked_add(two_output_fee)
@@ -1056,6 +1064,7 @@ impl WalletOps for WalletHandle {
             active_slot_count,
             log_slots,
         );
+        let relay_floor = relay_floor.required(input_count as u64, output_count as u64);
         let minimum = breakdown.required_total.max(relay_floor);
         if fee_micro_jtm < minimum {
             return Err(WalletSendPlanError::Other(format!(
@@ -1155,7 +1164,7 @@ impl WalletOps for WalletHandle {
         max_inputs: usize,
         active_slot_count: u64,
         log_slots: u32,
-        relay_floor: u64,
+        relay_floor: jetsam_mempool::RelayFloor,
     ) -> Result<WalletConsolidationPlan, WalletSendPlanError> {
         if !(2..=WALLET_CONSOLIDATION_INPUT_LIMIT).contains(&max_inputs) {
             return Err(WalletSendPlanError::Other(format!(
@@ -1213,6 +1222,7 @@ impl WalletOps for WalletHandle {
             active_slot_count,
             log_slots,
         );
+        let relay_floor = relay_floor.required(input_count as u64, 1);
         let fee_micro_jtm = breakdown.required_total.max(relay_floor);
         let Some(output_value_micro_jtm) = input_value_micro_jtm.checked_sub(fee_micro_jtm) else {
             return Err(WalletSendPlanError::InsufficientFunds {
@@ -1560,7 +1570,13 @@ mod tests {
     fn planner_accepts_a_payment_that_needs_multiple_pages() {
         let (_dir, handle) = handle_with_utxos(&[10_000; 20]);
         let plan = handle
-            .plan_send(150_000, Some(10_000), 0, 24, 0)
+            .plan_send(
+                150_000,
+                Some(10_000),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
             .expect("16-input PagedSpend plan");
         assert_eq!(plan.input_count, 16);
         assert_eq!(plan.output_count, 1);
@@ -1575,7 +1591,7 @@ mod tests {
     fn automatic_fee_path_selects_more_than_one_physical_page() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
         let plan = handle
-            .plan_send(10_000, None, 0, 24, 0)
+            .plan_send(10_000, None, 0, 24, jetsam_mempool::RelayFloor::default())
             .expect("automatic multi-page plan");
         assert!(plan.input_count > jetsam_tx::TX_INPUTS);
         assert!(plan.input_count <= MAX_PAGED_SPEND_INPUTS);
@@ -1586,7 +1602,13 @@ mod tests {
         let values = vec![10_000; MAX_PAGED_SPEND_INPUTS + 1];
         let (_dir, handle) = handle_with_utxos(&values);
         let error = handle
-            .plan_send(10_110_000, Some(100_000), 0, 24, 0)
+            .plan_send(
+                10_110_000,
+                Some(100_000),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
             .unwrap_err();
         assert_eq!(
             error,
@@ -1602,7 +1624,12 @@ mod tests {
         let expected_balance: u64 = values.iter().sum();
         let (_dir, handle) = handle_with_utxos(&values);
         let plan = handle
-            .plan_consolidation(WALLET_CONSOLIDATION_INPUT_LIMIT, 0, 24, 0)
+            .plan_consolidation(
+                WALLET_CONSOLIDATION_INPUT_LIMIT,
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
             .unwrap();
 
         assert_eq!(plan.input_count, 63);
@@ -1634,7 +1661,12 @@ mod tests {
         let expected_balance: u64 = values.iter().sum();
         let (_dir, handle) = handle_with_utxos(&values);
         let plan = handle
-            .plan_consolidation(WALLET_CONSOLIDATION_INPUT_LIMIT, 0, 24, 0)
+            .plan_consolidation(
+                WALLET_CONSOLIDATION_INPUT_LIMIT,
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
             .unwrap();
 
         assert_eq!(plan.input_count, WALLET_CONSOLIDATION_INPUT_LIMIT);
@@ -1653,7 +1685,15 @@ mod tests {
     #[test]
     fn explicit_fee_below_one_by_one_minimum_is_rejected_before_selection() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
-        let error = handle.plan_send(10_000, Some(1), 0, 24, 0).unwrap_err();
+        let error = handle
+            .plan_send(
+                10_000,
+                Some(1),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
+            .unwrap_err();
         assert_eq!(
             error,
             WalletSendPlanError::Other(format!(
@@ -1698,7 +1738,15 @@ mod tests {
     #[test]
     fn explicit_fee_prefers_exact_single_before_greedy_change() {
         let (_dir, handle) = handle_with_utxos(&[100_000, 95_800]);
-        let plan = handle.plan_send(90_000, Some(5_800), 0, 24, 0).unwrap();
+        let plan = handle
+            .plan_send(
+                90_000,
+                Some(5_800),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
+            .unwrap();
         assert_eq!(plan.input_count, 1);
         assert_eq!(plan.output_count, 1);
         assert_eq!(plan.change_micro_jtm, 0);
@@ -1829,7 +1877,15 @@ mod tests {
             let mut guard = handle.inner.lock().unwrap();
             guard.as_mut().unwrap().pending_input_slots.insert(0);
         }
-        let err = handle.plan_send(9_000, Some(6_000), 0, 24, 0).unwrap_err();
+        let err = handle
+            .plan_send(
+                9_000,
+                Some(6_000),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
+            .unwrap_err();
         assert_eq!(
             err,
             WalletSendPlanError::InsufficientFunds {
@@ -1848,7 +1904,9 @@ mod tests {
             wallet.pending_input_slots.insert(0);
         }
 
-        assert!(handle.plan_send(3_000, None, 0, 24, 0).is_err());
+        assert!(handle
+            .plan_send(3_000, None, 0, 24, jetsam_mempool::RelayFloor::default())
+            .is_err());
         let balance = handle.get_balance();
         assert_eq!(balance.balance_micro_jtm, 4_000);
         assert_eq!(balance.pending_outbound_micro_jtm, 2_000);
@@ -2454,7 +2512,15 @@ mod tests {
         let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
         let amount = 200_000_001;
         let fee = 18_500;
-        let plan = handle.plan_send(amount, Some(fee), 0, 24, 0).unwrap();
+        let plan = handle
+            .plan_send(
+                amount,
+                Some(fee),
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
+            .unwrap();
         assert_eq!(plan.amount_micro_jtm, amount);
         assert_eq!(plan.input_count, 5);
 
@@ -2468,7 +2534,9 @@ mod tests {
     #[test]
     fn plan_keeps_small_payment_fee_at_baseline() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
-        let plan = handle.plan_send(50_000, None, 0, 24, 0).unwrap();
+        let plan = handle
+            .plan_send(50_000, None, 0, 24, jetsam_mempool::RelayFloor::default())
+            .unwrap();
         assert_eq!(plan.fee_micro_jtm, 9_000);
         assert_eq!(plan.input_count, 1);
         assert_eq!(plan.output_count, 2);
@@ -2478,7 +2546,9 @@ mod tests {
     #[test]
     fn plan_handles_no_change_boundary_without_oscillation() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
-        let plan = handle.plan_send(91_000, None, 0, 24, 0).unwrap();
+        let plan = handle
+            .plan_send(91_000, None, 0, 24, jetsam_mempool::RelayFloor::default())
+            .unwrap();
         assert_eq!(plan.fee_micro_jtm, 9_000);
         assert_eq!(plan.output_count, 1);
         assert_eq!(plan.change_micro_jtm, 0);
@@ -2489,7 +2559,15 @@ mod tests {
     #[test]
     fn plan_charges_actual_io_for_five_input_send() {
         let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
-        let plan = handle.plan_send(200_000_001, None, 0, 24, 0).unwrap();
+        let plan = handle
+            .plan_send(
+                200_000_001,
+                None,
+                0,
+                24,
+                jetsam_mempool::RelayFloor::default(),
+            )
+            .unwrap();
         assert_eq!(plan.input_count, 5);
         assert_eq!(plan.output_count, 2);
         assert_eq!(plan.fee_micro_jtm, 6_900);

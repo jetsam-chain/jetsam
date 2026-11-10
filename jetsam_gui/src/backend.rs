@@ -1291,13 +1291,20 @@ impl Backend {
             method: format!("jetsam_{method}"),
             params,
         };
-        let rpc_url = self.config_snapshot()?.rpc_url;
-        let response = self
+        let config = self.config_snapshot()?;
+        let mut request = self
             .inner
             .client
-            .post(rpc_url)
+            .post(&config.rpc_url)
             .json(&body)
-            .timeout(timeout)
+            .timeout(timeout);
+        // R-1 (audit 2026-11-10): the wallet methods and `stop` answer only
+        // to the cookie of the node this application started, new at each of
+        // its starts: read at every call.
+        if let Some(cookie) = local_rpc_cookie(&config.rpc_url, &config.data_dir) {
+            request = request.bearer_auth(cookie);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| format!("local node RPC: {error}"))?;
@@ -1870,6 +1877,25 @@ fn find_node_binary() -> PathBuf {
             "jetsam"
         })
     })
+}
+
+/// R-1 (audit 2026-11-10): the cookie the node this application started
+/// wrote in `rpc.cookie` of their data directory, for a loopback `rpc_url`
+/// only — it never leaves this machine.
+fn local_rpc_cookie(rpc_url: &str, data_dir: &Path) -> Option<String> {
+    let host = reqwest::Url::parse(rpc_url).ok()?.host_str()?.to_owned();
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return None;
+    }
+    let cookie = std::fs::read_to_string(data_dir.join("rpc.cookie")).ok()?;
+    let cookie = cookie.trim();
+    (!cookie.is_empty()).then(|| cookie.to_owned())
 }
 
 fn rpc_listen_from_url(url: &str) -> Option<&str> {
@@ -3051,6 +3077,30 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-1 (audit 2026-11-10): the application sends the cookie its node
+    /// wrote in their data directory, to a loopback RPC only.
+    #[test]
+    fn the_wallet_sends_its_nodes_cookie_to_a_local_rpc_only() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            local_rpc_cookie("http://127.0.0.1:9701", directory.path()),
+            None
+        );
+        std::fs::write(directory.path().join("rpc.cookie"), "c00k1e\n").unwrap();
+        assert_eq!(
+            local_rpc_cookie("http://127.0.0.1:9701", directory.path()).as_deref(),
+            Some("c00k1e")
+        );
+        assert_eq!(
+            local_rpc_cookie("http://localhost:9711", directory.path()).as_deref(),
+            Some("c00k1e")
+        );
+        assert_eq!(
+            local_rpc_cookie("http://10.0.0.2:9701", directory.path()),
+            None
+        );
+    }
 
     #[test]
     fn address_shape_follows_this_network_not_the_upstream_one() {
