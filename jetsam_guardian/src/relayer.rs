@@ -1656,6 +1656,20 @@ impl RelayConfig {
     pub fn from(&self) -> anyhow::Result<Option<[u8; 20]>> {
         self.from_address.as_deref().map(crate::fill::parse20).transpose()
     }
+
+    /// E-10 (audit 2026-11-10): this build reads the network's deposits with its v1.7 clock (`VaultRules::current`):
+    /// its F must be the configuration's (as `jg-fill`'s `FillConfig::build_matches`).
+    pub fn build_matches(&self, built: &jetsam_chain::consensus::vault::VaultRules) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            built.deposits_from_height == Some(self.deposits_from_height),
+            "this build's v1.7 clock (J {:?}, F {:?}) is not the configuration's deposits_from_height {}: it would publish \
+             roots that leave deposits out (build it with the network's profile)",
+            built.activation_height,
+            built.deposits_from_height,
+            self.deposits_from_height
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

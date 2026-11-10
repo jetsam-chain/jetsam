@@ -893,6 +893,8 @@ fn config(args: &[String]) -> anyhow::Result<(RelayConfig, String)> {
         sha2::Sha256::digest(text.as_bytes()).into()
     };
     let cfg = RelayConfig::parse(&text).map_err(|e| anyhow::anyhow!("{e:#}: jg-relay does not start"))?;
+    // E-10: before any socket and before any operator command (import-block records deposits with this clock)
+    cfg.build_matches(&VaultRules::current()).map_err(|e| anyhow::anyhow!("{e:#}: jg-relay does not start"))?;
     Ok((cfg, hex::encode(digest)))
 }
 

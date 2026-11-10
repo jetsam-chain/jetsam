@@ -1453,11 +1453,13 @@ fn jg_fill_scans_past_a_block_whose_body_no_source_serves_readable() {
 /// point it knows and every mint it saw), before any socket; the file is left as it was.
 #[test]
 fn jg_relay_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
+    // E-10: jg-relay starts only with its build's F (none before J is armed: the default profile does not get here)
+    let Some(f) = jetsam_chain::consensus::vault::VaultRules::current().deposits_from_height else { return };
     let (target, socks) = untouchable();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path();
     let text = format!(
-        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nl1_rpc = \"http://{}:8545\"\ndeposits_from_height = 128\n\
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nl1_rpc = \"http://{}:8545\"\ndeposits_from_height = {f}\n\
          state_dir = \"{}\"\npublish_dir = \"{}\"\npoll_secs = 1\n\
          [[nodes]]\nname = \"a\"\nrpc = \"http://{}:19801\"\n[[nodes]]\nname = \"b\"\nrpc = \"http://{}:19801\"\n\
          [egress]\ntor_socks = \"127.0.0.1:{}\"\n[prover]\nmode = \"mock\"\n",
