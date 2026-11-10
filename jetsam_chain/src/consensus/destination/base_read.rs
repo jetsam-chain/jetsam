@@ -203,7 +203,12 @@ pub struct GameFacts {
     pub created_at: u64,
     pub resolved_at: u64,
     pub status: u8,
+    /// `initialized` (offset 17 of slot 0).
+    pub initialized: bool,
     pub was_respected: bool,
+    /// The two words the fast lane reads (slots 5 and 7), when the game's
+    /// proof carries them ([`FAST_GAME_SLOTS`]); `None` otherwise.
+    pub fast: Option<FastGameFacts>,
     /// The proxy the factory registered for the game's UUID (zero if none).
     pub registered_proxy: Address,
     pub blacklisted: bool,
@@ -220,6 +225,28 @@ pub struct GameFacts {
     /// `SystemConfig`, `SuperchainConfig`.
     pub implementations: [Address; 4],
 }
+
+/// What the fast lane reads of a game beside its slot 0 (D127, RETOUR-RAPIDE
+/// SPEC §3): `counteredByIntermediateRootIndexPlusOne` (slot 5, uint256, 0 =
+/// not countered) and `proofCount` (slot 7, offset 8, one byte; offset 0 holds
+/// `expectedResolution`). Layout of `AggregateVerifier` 0.3.0 (Clone and
+/// Solady's ReentrancyGuard hold no sequential slot): 0 the clocks and flags,
+/// 1-2 `startingOutputRoot`, 3 `bondRecipient` and its flags, 4 `bondAmount`,
+/// 5 `counteredBy…`, 6 `proofTypeToProver`, 7 `expectedResolution` and
+/// `proofCount`, 8 `scheduleId`; each word checked against its getter on two
+/// real games of Base Sepolia, 2026-11-10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FastGameFacts {
+    pub proof_count: u8,
+    pub countered_by: Root,
+}
+
+/// The slots of a game the fast lane reads, in the order of its proof: the
+/// state word, `counteredByIntermediateRootIndexPlusOne`, the word holding
+/// `proofCount`. The slow return reads slot 0 alone.
+pub const FAST_GAME_SLOTS: [u64; 3] = [GAME_STATE_SLOT, GAME_COUNTERED_SLOT, GAME_PROOF_COUNT_SLOT];
+const GAME_COUNTERED_SLOT: u64 = 5;
+const GAME_PROOF_COUNT_SLOT: u64 = 7;
 
 /// A game Base holds valid at the L1 block read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +320,17 @@ pub enum BaseGameError {
     NotResolved,
     NotFinalized,
     NotDefenderWins,
+    /// The fast lane: the game is resolved (no longer `IN_PROGRESS`).
+    NotInProgress,
+    /// The fast lane: the game is not initialized.
+    NotInitialized,
+    /// The fast lane: the proof does not carry slots 5 and 7.
+    FastFactsMissing,
+    /// The fast lane: no proof was verified for the game (`proofCount == 0`).
+    NoProof,
+    /// The fast lane: the game was countered (a challenge proved one of its
+    /// intermediate roots wrong).
+    Countered,
 }
 
 impl From<L1ReadError> for BaseGameError {
@@ -463,7 +501,8 @@ pub fn read_game_facts(
 ) -> Result<GameFacts, BaseGameError> {
     let args = &proof.args;
     if args.len() != ARGS_FIXED_BYTES + 32 * params.intermediate_roots
-        || proof.game_account.slots.len() != 1
+        || (proof.game_account.slots.len() != 1
+            && proof.game_account.slots.len() != FAST_GAME_SLOTS.len())
     {
         return Err(BaseGameError::ProofShape);
     }
@@ -480,6 +519,25 @@ pub fn read_game_facts(
         &u256(GAME_STATE_SLOT),
         &proof.game_account.slots[0],
     )?;
+    // The fast lane's words, when the proof carries them (slots 5 and 7).
+    let fast = if proof.game_account.slots.len() == FAST_GAME_SLOTS.len() {
+        let countered_by = read_storage_word(
+            game.storage_root,
+            &u256(GAME_COUNTERED_SLOT),
+            &proof.game_account.slots[1],
+        )?;
+        let word7 = read_storage_word(
+            game.storage_root,
+            &u256(GAME_PROOF_COUNT_SLOT),
+            &proof.game_account.slots[2],
+        )?;
+        Some(FastGameFacts {
+            proof_count: field(&word7, 8, 1)[0],
+            countered_by,
+        })
+    } else {
+        None
+    };
     let root_claim: Root = args[0x14..0x34].try_into().expect("32 bytes");
     let l2_word: Root = args[0x54..0x74].try_into().expect("32 bytes");
     if l2_word[..24] != [0u8; 24] {
@@ -539,7 +597,9 @@ pub fn read_game_facts(
         created_at: field_u64(&state, 0, 8),
         resolved_at: field_u64(&state, 8, 8),
         status: field(&state, 16, 1)[0],
+        initialized: field(&state, 17, 1)[0] != 0,
         was_respected: field(&state, 18, 1)[0] != 0,
+        fast,
         // GameId: type (bits 224..256), timestamp (160..224), proxy (0..160).
         registered_proxy: field_address(&factory[0], 0),
         blacklisted: asr[ASR_SLOT_BLACKLIST] != [0u8; 32],
@@ -579,6 +639,36 @@ pub fn judge_game(
     l1_timestamp: u64,
     params: &BaseParams,
 ) -> Result<ValidGame, BaseGameError> {
+    judge_game_proper(facts, l1_timestamp, params)?;
+    // isGameFinalized: resolved, then strictly past the delay (a time before
+    // the resolution would revert there).
+    let resolved = facts.resolved_at != 0
+        && (facts.status == GAME_STATUS_CHALLENGER_WINS
+            || facts.status == GAME_STATUS_DEFENDER_WINS);
+    if !resolved {
+        return Err(BaseGameError::NotResolved);
+    }
+    match l1_timestamp.checked_sub(facts.resolved_at) {
+        Some(elapsed) if elapsed > params.finality_delay_seconds => {}
+        _ => return Err(BaseGameError::NotFinalized),
+    }
+    if facts.status != GAME_STATUS_DEFENDER_WINS {
+        return Err(BaseGameError::NotDefenderWins);
+    }
+    Ok(ValidGame {
+        game: facts.game,
+        l2_block_number: facts.l2_block_number,
+        root_claim: facts.root_claim,
+    })
+}
+
+/// Steps 0-5 of [`judge_game`], the slow return's and the fast lane's alike:
+/// pins and wiring, then `isGameProper` and `isGameRespected`.
+fn judge_game_proper(
+    facts: &GameFacts,
+    l1_timestamp: u64,
+    params: &BaseParams,
+) -> Result<(), BaseGameError> {
     let pinned = [
         (
             params.anchor_state_registry_impl,
@@ -637,20 +727,33 @@ pub fn judge_game(
     if !facts.was_respected {
         return Err(BaseGameError::NotRespected);
     }
-    // isGameFinalized: resolved, then strictly past the delay (a time before
-    // the resolution would revert there).
-    let resolved = facts.resolved_at != 0
-        && (facts.status == GAME_STATUS_CHALLENGER_WINS
-            || facts.status == GAME_STATUS_DEFENDER_WINS);
-    if !resolved {
-        return Err(BaseGameError::NotResolved);
+    Ok(())
+}
+
+/// The fast lane's judgment of a game (D127, RETOUR-RAPIDE SPEC §3): the
+/// steps 0-5 of [`judge_game`] unchanged (pinned, wired, registered by the
+/// factory, not blacklisted, not retired, not paused, respected), then, in
+/// place of finality: in progress, initialized, at least one proof verified
+/// (a game is created only with one: `initializeWithInitData` verifies it),
+/// not countered.
+pub fn judge_game_fast(
+    facts: &GameFacts,
+    l1_timestamp: u64,
+    params: &BaseParams,
+) -> Result<ValidGame, BaseGameError> {
+    judge_game_proper(facts, l1_timestamp, params)?;
+    if facts.status != GAME_STATUS_IN_PROGRESS {
+        return Err(BaseGameError::NotInProgress);
     }
-    match l1_timestamp.checked_sub(facts.resolved_at) {
-        Some(elapsed) if elapsed > params.finality_delay_seconds => {}
-        _ => return Err(BaseGameError::NotFinalized),
+    if !facts.initialized {
+        return Err(BaseGameError::NotInitialized);
     }
-    if facts.status != GAME_STATUS_DEFENDER_WINS {
-        return Err(BaseGameError::NotDefenderWins);
+    let fast = facts.fast.ok_or(BaseGameError::FastFactsMissing)?;
+    if fast.proof_count == 0 {
+        return Err(BaseGameError::NoProof);
+    }
+    if fast.countered_by != [0u8; 32] {
+        return Err(BaseGameError::Countered);
     }
     Ok(ValidGame {
         game: facts.game,

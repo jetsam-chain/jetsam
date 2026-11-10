@@ -1017,6 +1017,12 @@ pub(crate) struct Knobs {
     pub(crate) respected: bool,
     pub(crate) status: u8,
     pub(crate) registered: Option<Address>,
+    /// `initialized` (slot 0, offset 17).
+    pub(crate) initialized: bool,
+    /// The fast lane's words: `(proofCount, counteredByIntermediateRootIndexPlusOne)`
+    /// in slots 7 and 5, proven with slot 0 ([`FAST_GAME_SLOTS`]); `None`:
+    /// slot 0 alone, as the slow return proves it.
+    pub(crate) fast: Option<(u8, u64)>,
 }
 
 const PORTAL: Address = [0x49; 20];
@@ -1066,8 +1072,16 @@ pub(crate) fn synthetic_game_at(
     state[24..].copy_from_slice(&created.to_be_bytes());
     state[16..24].copy_from_slice(&resolved.to_be_bytes());
     state[15] = knobs.status;
-    state[14] = 1; // initialized
+    state[14] = u8::from(knobs.initialized);
     state[13] = u8::from(knobs.respected);
+    let mut game_storage = vec![(w_u64(0), state)];
+    if let Some((proof_count, countered)) = knobs.fast {
+        // Slot 7: expectedResolution (offset 0, 8 bytes), proofCount (offset 8).
+        let mut word7 = w_u64(created + 432_000);
+        word7[23] = proof_count;
+        game_storage.push((w_u64(5), w_u64(countered)));
+        game_storage.push((w_u64(7), word7));
+    }
     let mut superchain = w_addr(&p.superchain_config);
     superchain[4..12].copy_from_slice(&5_000_000u64.to_be_bytes()); // minBaseFee, offset 20
     let blacklist_slot = mapping(&w_addr(&game), 5);
@@ -1096,7 +1110,7 @@ pub(crate) fn synthetic_game_at(
         Synthetic {
             address: game,
             code_hash: keccak256(&clone_code(&p.game_impls[0], &args)),
-            storage: vec![(w_u64(0), state)],
+            storage: game_storage,
         },
         Synthetic {
             address: p.system_config,
@@ -1148,6 +1162,16 @@ pub(crate) const VALID: Knobs = Knobs {
     respected: true,
     status: GAME_STATUS_DEFENDER_WINS,
     registered: None,
+    initialized: true,
+    fast: None,
+};
+
+/// A game Base has proposed and not resolved: in progress, one proof, not
+/// countered, its slots 5 and 7 proven (the fast lane's).
+pub(crate) const PROPOSED: Knobs = Knobs {
+    status: GAME_STATUS_IN_PROGRESS,
+    fast: Some((1, 0)),
+    ..VALID
 };
 
 #[test]
@@ -1541,4 +1565,289 @@ fn the_output_root_preimage_object_is_its_four_words() {
         decode_output_root_preimage(&longer),
         Err(BaseCodecError::TrailingBytes)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fast lane (D127, D130, RETOUR-RAPIDE SPEC §3): a game Base has proposed
+// ---------------------------------------------------------------------------
+
+/// Game #30 061 of Base Sepolia, in progress, captured 2026-11-10 under the
+/// finalized Sepolia block 12 105 367 with its slots 0, 5 and 7
+/// (`FAST/tools/capture_fast.py`: `eth_getProof` on a public L1 RPC, the
+/// getters by `eth_call` at the same block, the Base header of its L2 block
+/// from two public RPCs of Base Sepolia).
+fn sep_fast() -> Value {
+    fixture("base_sep_l1_fast_30061.json")
+}
+
+#[test]
+fn the_real_proposed_game_is_valid_for_the_fast_lane_only() {
+    let c = sep_fast();
+    let facts = read_game_facts(l1_root(&c), &BASE_SEPOLIA, &game_proof(&c)).expect("reads");
+    // What the proofs show is what the getters answered at the same block.
+    assert_eq!(facts.game, address(&c["game"]["address"]));
+    assert_eq!(facts.game_impl, BASE_SEPOLIA.game_impls[0]);
+    assert_eq!(facts.root_claim, word(&c["truth"]["game.rootClaim"]));
+    assert_eq!(facts.l2_block_number, truth_u64(&c, "game.l2SequenceNumber"));
+    assert_eq!(u64::from(facts.status), truth_u64(&c, "game.status"));
+    assert_eq!(facts.status, GAME_STATUS_IN_PROGRESS);
+    assert_eq!(facts.created_at, truth_u64(&c, "game.createdAt"));
+    assert_eq!(facts.resolved_at, 0);
+    assert!(facts.initialized);
+    let fast = facts.fast.expect("slots 5 and 7 proven");
+    assert_eq!(u64::from(fast.proof_count), truth_u64(&c, "game.proofCount"));
+    assert_eq!(fast.proof_count, 1);
+    assert_eq!(
+        fast.countered_by,
+        w_u64(truth_u64(&c, "game.counteredByIntermediateRootIndexPlusOne"))
+    );
+    assert_eq!(fast.countered_by, [0u8; 32]);
+    assert_eq!(facts.registered_proxy, address(&c["truth"]["factory.games.proxy"]));
+    // The registry does not hold it valid (in progress): the slow return
+    // refuses it as the registry does; the fast lane takes it.
+    assert!(!c["truth"]["isGameClaimValid"].as_bool().expect("bool"));
+    assert!(c["truth"]["isGameProper"].as_bool().expect("bool"));
+    assert_eq!(
+        judge_game(&facts, l1_time(&c), &BASE_SEPOLIA),
+        Err(BaseGameError::NotResolved)
+    );
+    assert_eq!(
+        judge_game_fast(&facts, l1_time(&c), &BASE_SEPOLIA),
+        Ok(ValidGame {
+            game: facts.game,
+            l2_block_number: 56_993_063,
+            root_claim: facts.root_claim,
+        })
+    );
+    // Its claim opens to the Base header both public RPCs served.
+    for header in [&c["l2"]["header"], &c["l2"]["header_rpc2"]] {
+        assert_eq!(
+            open_output_root(&facts.root_claim, &preimage(header)),
+            Ok(word(&header["stateRoot"]))
+        );
+    }
+    // Through the section object, as a block carries it.
+    let bytes = encode_game_proof(&game_proof(&c));
+    let decoded = decode_game_proof(&bytes).expect("decodes");
+    assert_eq!(
+        read_game_facts(l1_root(&c), &BASE_SEPOLIA, &decoded),
+        Ok(facts)
+    );
+}
+
+/// Every step of the slow judgment but finality, then in progress,
+/// initialized, at least one proof, not countered.
+#[test]
+fn the_fast_lane_refuses_what_base_has_not_proposed_or_has_countered() {
+    let c = sep_fast();
+    let t = l1_time(&c);
+    let real = read_game_facts(l1_root(&c), &BASE_SEPOLIA, &game_proof(&c)).expect("reads");
+    let fast = real.fast.expect("fast facts");
+    let judge = |f: &GameFacts| judge_game_fast(f, t, &BASE_SEPOLIA);
+    assert!(judge(&real).is_ok());
+    let mut f = real;
+    f.fast = Some(FastGameFacts {
+        proof_count: 0,
+        ..fast
+    });
+    assert_eq!(judge(&f), Err(BaseGameError::NoProof));
+    let mut countered = [0u8; 32];
+    countered[31] = 1;
+    f.fast = Some(FastGameFacts {
+        countered_by: countered,
+        ..fast
+    });
+    assert_eq!(judge(&f), Err(BaseGameError::Countered));
+    countered[0] = 1;
+    f.fast = Some(FastGameFacts {
+        countered_by: countered,
+        ..fast
+    });
+    assert_eq!(judge(&f), Err(BaseGameError::Countered));
+    // Two proofs (TEE and the validity proof): still taken.
+    f.fast = Some(FastGameFacts {
+        proof_count: 2,
+        ..fast
+    });
+    assert!(judge(&f).is_ok());
+    let mut f = real;
+    f.fast = None;
+    assert_eq!(judge(&f), Err(BaseGameError::FastFactsMissing));
+    for status in [GAME_STATUS_CHALLENGER_WINS, GAME_STATUS_DEFENDER_WINS, 3] {
+        let mut f = real;
+        f.status = status;
+        f.resolved_at = t - 10;
+        assert_eq!(judge(&f), Err(BaseGameError::NotInProgress));
+    }
+    let mut f = real;
+    f.initialized = false;
+    assert_eq!(judge(&f), Err(BaseGameError::NotInitialized));
+    // Steps 0-5 are the slow judgment's, with its refusals.
+    let mut f = real;
+    f.registered_proxy[0] ^= 1;
+    assert_eq!(judge(&f), Err(BaseGameError::NotRegistered));
+    let mut f = real;
+    f.blacklisted = true;
+    assert_eq!(judge(&f), Err(BaseGameError::Blacklisted));
+    let mut f = real;
+    f.retirement_timestamp = f.created_at;
+    assert_eq!(judge(&f), Err(BaseGameError::Retired));
+    let mut f = real;
+    f.pause_portal = w_u64(t - 1);
+    assert_eq!(judge(&f), Err(BaseGameError::Paused));
+    let mut f = real;
+    f.was_respected = false;
+    assert_eq!(judge(&f), Err(BaseGameError::NotRespected));
+    let mut f = real;
+    f.implementations[1][0] ^= 1;
+    assert_eq!(
+        judge(&f),
+        Err(BaseGameError::UnknownImplementation(
+            BaseContract::DisputeGameFactory
+        ))
+    );
+    let mut f = real;
+    f.game_impl[0] ^= 1;
+    assert_eq!(judge(&f), Err(BaseGameError::UnknownGameCode));
+    let mut f = real;
+    f.asr_dispute_game_factory[0] ^= 1;
+    assert_eq!(
+        judge(&f),
+        Err(BaseGameError::Wiring(BaseContract::DisputeGameFactory))
+    );
+}
+
+/// The fast words are read only from a proof of exactly slots 0, 5 and 7;
+/// the slow return's one-slot proof reads as before.
+#[test]
+fn the_fast_words_come_only_from_a_proof_of_slots_0_5_and_7() {
+    let c = sep_fast();
+    let root = l1_root(&c);
+    let full = game_proof(&c);
+    let mut one = full.clone();
+    one.game_account.slots.truncate(1);
+    let slow = read_game_facts(root, &BASE_SEPOLIA, &one).expect("reads");
+    assert_eq!(slow.fast, None);
+    assert_eq!(
+        judge_game_fast(&slow, l1_time(&c), &BASE_SEPOLIA),
+        Err(BaseGameError::FastFactsMissing)
+    );
+    let mut two = full.clone();
+    two.game_account.slots.truncate(2);
+    assert_eq!(
+        read_game_facts(root, &BASE_SEPOLIA, &two),
+        Err(BaseGameError::ProofShape)
+    );
+    let mut four = full.clone();
+    four.game_account.slots.push(full.game_account.slots[2].clone());
+    assert_eq!(
+        read_game_facts(root, &BASE_SEPOLIA, &four),
+        Err(BaseGameError::ProofShape)
+    );
+    // Slot 5's proof in place of slot 7's: it does not open for slot 7.
+    let mut swapped = full.clone();
+    swapped.game_account.slots[2] = full.game_account.slots[1].clone();
+    assert!(matches!(
+        read_game_facts(root, &BASE_SEPOLIA, &swapped),
+        Err(BaseGameError::Read(_))
+    ));
+    // A tampered node of slot 7's proof.
+    let mut tampered = full;
+    let last = tampered.game_account.slots[2].len() - 1;
+    let node = &mut tampered.game_account.slots[2][last];
+    let at = node.len() - 1;
+    node[at] ^= 1;
+    assert!(matches!(
+        read_game_facts(root, &BASE_SEPOLIA, &tampered),
+        Err(BaseGameError::Read(_))
+    ));
+}
+
+/// The synthetic L1 state gives the words real data leaves at their usual
+/// values (countered, no proof, several proofs, not initialized).
+#[test]
+fn synthetic_proposals_are_judged_through_their_proofs() {
+    let t = CREATED + 600;
+    let (root, proof) = synthetic_game_at(PROPOSED, None, (CREATED, 0, RETIREMENT));
+    let facts = read_game_facts(root, &BASE_SEPOLIA, &proof).expect("reads");
+    assert_eq!(
+        facts.fast,
+        Some(FastGameFacts {
+            proof_count: 1,
+            countered_by: [0; 32]
+        })
+    );
+    assert!(judge_game_fast(&facts, t, &BASE_SEPOLIA).is_ok());
+    assert_eq!(
+        judge_game(&facts, t, &BASE_SEPOLIA),
+        Err(BaseGameError::NotResolved)
+    );
+    let cases = [
+        (
+            Knobs {
+                fast: Some((0, 0)),
+                ..PROPOSED
+            },
+            Err(BaseGameError::NoProof),
+        ),
+        (
+            Knobs {
+                fast: Some((1, 4)),
+                ..PROPOSED
+            },
+            Err(BaseGameError::Countered),
+        ),
+        (
+            Knobs {
+                fast: Some((2, 0)),
+                ..PROPOSED
+            },
+            Ok(()),
+        ),
+        (
+            Knobs {
+                initialized: false,
+                ..PROPOSED
+            },
+            Err(BaseGameError::NotInitialized),
+        ),
+        (
+            Knobs {
+                status: GAME_STATUS_CHALLENGER_WINS,
+                ..PROPOSED
+            },
+            Err(BaseGameError::NotInProgress),
+        ),
+        (
+            Knobs {
+                blacklisted: true,
+                ..PROPOSED
+            },
+            Err(BaseGameError::Blacklisted),
+        ),
+        (
+            Knobs {
+                registered: Some([0x77; 20]),
+                ..PROPOSED
+            },
+            Err(BaseGameError::NotRegistered),
+        ),
+        (
+            Knobs {
+                fast: None,
+                ..PROPOSED
+            },
+            Err(BaseGameError::FastFactsMissing),
+        ),
+    ];
+    for (knobs, expected) in cases {
+        let (root, proof) = synthetic_game_at(knobs, None, (CREATED, 0, RETIREMENT));
+        let facts = read_game_facts(root, &BASE_SEPOLIA, &proof).expect("reads");
+        assert_eq!(
+            judge_game_fast(&facts, t, &BASE_SEPOLIA).map(|_| ()),
+            expected,
+            "{:?}",
+            knobs.fast
+        );
+    }
 }
