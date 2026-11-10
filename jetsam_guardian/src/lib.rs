@@ -28,6 +28,7 @@
 //! linked from the same commit: nothing of the format is redefined here.
 
 pub mod aggregator;
+pub mod base_capture;
 pub mod ceremony;
 pub mod chain;
 pub mod checkpoint;
