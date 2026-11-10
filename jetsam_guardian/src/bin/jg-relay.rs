@@ -983,6 +983,11 @@ fn run() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("fast-dry-run") {
         return jetsam_guardian::fast::dry_run_cli(&args[2..]);
     }
+    // The fast lane for real: one fast release assembled, checked natively and handed to the node (or, with
+    // --dry-run, written and not sent).
+    if args.get(1).map(String::as_str) == Some("fast-release") {
+        return jetsam_guardian::fast_release::fast_release_cli(&args[2..]);
+    }
     // The fast lane's keys (the relay's, the cold revocation key): a secret from the system's randomness in a
     // file created 0600 (never over another), never printed; its public key printed.
     if args.get(1).map(String::as_str) == Some("fast-keygen") {

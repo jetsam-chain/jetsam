@@ -53,6 +53,19 @@ pub const FILL_ALLOWLIST: &[&str] = &[
     "getDepositBlock",
 ];
 
+/// The node methods `jg-relay fast-release` may call: public reads (the tip, the vault's floor and
+/// slots, the payee of a burn, an epoch anchor, slot hints) and the one submission of its intent; nothing
+/// that spends, signs with or reveals a wallet.
+pub const FAST_RELEASE_ALLOWLIST: &[&str] = &[
+    "blockCount",
+    "getVaultState",
+    "getSlotsByOwner",
+    "getAdvances",
+    "getEpochAnchor",
+    "getSlotHints",
+    "submitDestinationObject",
+];
+
 /// Tor's default SOCKS port.
 pub const DEFAULT_TOR_SOCKS: &str = "127.0.0.1:9050";
 
@@ -350,6 +363,11 @@ impl NodeClient {
     /// The client of `jg-fill`'s nodes ([`FILL_ALLOWLIST`]).
     pub fn fill(url: &str, egress: Egress) -> Self {
         Self { url: url.to_string(), allow: FILL_ALLOWLIST, timeout: Duration::from_secs(30), egress }
+    }
+
+    /// The client of `jg-relay fast-release` ([`FAST_RELEASE_ALLOWLIST`]).
+    pub fn fast_release(url: &str, egress: Egress) -> Self {
+        Self { url: url.to_string(), allow: FAST_RELEASE_ALLOWLIST, timeout: Duration::from_secs(120), egress }
     }
 
     /// `getBlock(height)`: the block's bytes, `None` once its body is pruned.

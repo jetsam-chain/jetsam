@@ -368,7 +368,7 @@ fn word_address(a: &[u8; 20]) -> [u8; 32] {
 
 /// `eth_call` of `signature(args)` at `to`, at the L1 block `block` (hex
 /// quantity or tag).
-fn call(
+pub(crate) fn call(
     rpc: &dyn BaseRpc,
     to: &[u8; 20],
     signature: &str,

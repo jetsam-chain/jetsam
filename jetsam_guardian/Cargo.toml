@@ -40,6 +40,10 @@ tw-core = { package = "jetsam_bridge_towerwalk", path = "../jetsam_bridge_progra
 # Local signing of the robots' L1 transactions (secp256k1 ECDSA, RFC 6979): the relayer and jg-fill hold their
 # own hot key (BRIDGE-REST). RustCrypto, pure Rust; already in the offline registry.
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
+# The fast lane's release (jg-relay fast-release): the intent's encoding as the node's mempool reads it,
+# and the vault group's spend authorization (the vault's published secret).
+jetsam_mempool = { path = "../jetsam_mempool" }
+jetsam_gkr = { path = "../jetsam_gkr" }
 
 [dev-dependencies]
 tempfile = "3"

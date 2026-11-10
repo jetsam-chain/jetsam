@@ -157,7 +157,7 @@ fn quantity(value: &Value, what: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("{what}: {text}"))
 }
 
-fn nodes(value: &Value, what: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+pub(crate) fn nodes(value: &Value, what: &str) -> anyhow::Result<Vec<Vec<u8>>> {
     value
         .as_array()
         .ok_or_else(|| anyhow!("{what}: not a list"))?

@@ -341,6 +341,21 @@ fn fill_rpc_client_reads_raw_blocks_and_nothing_else() {
 }
 
 #[test]
+fn fast_release_rpc_client_reads_and_submits_its_intent_and_nothing_else() {
+    let c = NodeClient::fast_release("http://127.0.0.1:9", Egress::onion(DEFAULT_TOR_SOCKS).unwrap());
+    for m in ["walletSend", "stop", "submitTxIntent", "walletBuildGuardianPayment", "submitGuardianObject", "submitTx", "getBlock"] {
+        let e = c.call(m, json!([])).unwrap_err().to_string();
+        assert!(e.contains("allow-list"), "{m}: {e}");
+    }
+    for m in ["getSlotsByOwner", "getAdvances", "getVaultState", "submitDestinationObject"] {
+        let e = c.call(m, json!([1])).unwrap_err().to_string();
+        assert!(!e.contains("allow-list"), "{m}: {e}");
+    }
+    assert!(FAST_RELEASE_ALLOWLIST.iter().all(|m| !m.starts_with("wallet") && *m != "stop"));
+    assert_eq!(FAST_RELEASE_ALLOWLIST.iter().filter(|m| m.starts_with("submit")).count(), 1);
+}
+
+#[test]
 fn a_raw_block_is_read_as_bytes_and_none_when_pruned() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

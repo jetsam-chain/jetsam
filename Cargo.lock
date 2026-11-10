@@ -3193,6 +3193,8 @@ dependencies = [
  "jetsam_bridge_program",
  "jetsam_bridge_towerwalk",
  "jetsam_chain",
+ "jetsam_gkr",
+ "jetsam_mempool",
  "jetsam_poseidon2b",
  "jetsam_tx",
  "jetsam_vault_rule",
