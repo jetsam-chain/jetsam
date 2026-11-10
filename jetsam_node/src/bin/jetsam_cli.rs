@@ -183,6 +183,12 @@ struct Cli {
     )]
     rpc: String,
 
+    /// The node's RPC cookie file: the wallet commands and `stop` need it.
+    /// Default: rpc.cookie in the node's default data directory, sent to a
+    /// loopback --rpc only.
+    #[arg(long, env = "JETSAM_RPC_COOKIE", value_name = "PATH", global = true)]
+    rpc_cookie: Option<std::path::PathBuf>,
+
     /// Output raw JSON (for scripting / piping to jq).
     #[arg(long, short = 'j', global = true)]
     json: bool,
@@ -609,9 +615,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
+    let bearer = rpc_bearer(
+        &cli.rpc,
+        cli.rpc_cookie.as_deref(),
+        jetsam_node::rpc_cookie::default_path().as_deref(),
+    )?;
     let ctx = Ctx {
         client: &client,
         rpc: &cli.rpc,
+        bearer: bearer.as_deref(),
         json: cli.json,
     };
 
@@ -678,7 +690,45 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 struct Ctx<'a> {
     client: &'a reqwest::Client,
     rpc: &'a str,
+    /// The node's RPC cookie, sent as `Authorization: Bearer` (R-1).
+    bearer: Option<&'a str>,
     json: bool,
+}
+
+/// R-1 (audit 2026-11-10): the cookie this client sends: the file `explicit`
+/// names, wherever `--rpc` points (unreadable: an error); else the node's
+/// default one (`default`), to a loopback `--rpc` only, when it is there — a
+/// remote node's cookie is not on this machine, and this one never leaves it.
+fn rpc_bearer(
+    rpc_url: &str,
+    explicit: Option<&std::path::Path>,
+    default: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(path) = explicit {
+        return jetsam_node::rpc_cookie::read(path)
+            .map(Some)
+            .with_context(|| format!("read the RPC cookie {}", path.display()));
+    }
+    if !rpc_url_is_loopback(rpc_url) {
+        return Ok(None);
+    }
+    Ok(default.and_then(|path| jetsam_node::rpc_cookie::read(path).ok()))
+}
+
+/// Whether `rpc_url` names this machine (a loopback address or `localhost`).
+fn rpc_url_is_loopback(rpc_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(rpc_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl<'a> Ctx<'a> {
@@ -1417,6 +1467,12 @@ async fn cmd_adoption(
         let node = Ctx {
             client: ctx.client,
             rpc: endpoint,
+            // The cookie is this node's only, never another's.
+            bearer: if *endpoint == ctx.rpc {
+                ctx.bearer
+            } else {
+                None
+            },
             json: ctx.json,
         };
         let answer = rpc(&node, "getPeerVersions", &[])
@@ -3459,6 +3515,9 @@ async fn rpc_with_timeout(
     });
 
     let mut request = ctx.client.post(ctx.rpc).json(&body);
+    if let Some(bearer) = ctx.bearer {
+        request = request.bearer_auth(bearer);
+    }
     if let Some(timeout) = timeout {
         request = request.timeout(timeout);
     }
@@ -3514,6 +3573,58 @@ fn looks_like_address(candidate: &str) -> bool {
         .trim()
         .to_ascii_lowercase()
         .starts_with(&prefix.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod rpc_cookie_tests {
+    use super::rpc_bearer;
+
+    /// R-1 (audit 2026-11-10): the wallet commands and `stop` need the
+    /// node's cookie, so the CLI sends it by itself — to a loopback node
+    /// only: a remote node's cookie is not on this machine, and this one
+    /// never leaves it. A file named explicitly goes wherever --rpc points.
+    #[test]
+    fn the_cli_sends_the_local_cookie_to_a_local_node_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let default = directory.path().join("rpc.cookie");
+        std::fs::write(&default, "c00k1e\n").unwrap();
+        for local in [
+            "http://127.0.0.1:9701",
+            "http://localhost:9711/",
+            "http://[::1]:9701",
+        ] {
+            assert_eq!(
+                rpc_bearer(local, None, Some(&default)).unwrap().as_deref(),
+                Some("c00k1e"),
+                "{local}"
+            );
+        }
+        for remote in [
+            "http://10.77.0.10:9701",
+            "https://rpc.jetsamchain.com",
+            "not a url",
+        ] {
+            assert_eq!(
+                rpc_bearer(remote, None, Some(&default)).unwrap(),
+                None,
+                "{remote}"
+            );
+        }
+        assert_eq!(
+            rpc_bearer("http://10.77.0.10:9701", Some(&default), None)
+                .unwrap()
+                .as_deref(),
+            Some("c00k1e")
+        );
+        // No cookie on this machine: the reads still work, without one.
+        let missing = directory.path().join("missing");
+        assert_eq!(
+            rpc_bearer("http://127.0.0.1:9701", None, Some(&missing)).unwrap(),
+            None
+        );
+        // A file named and unreadable is an error, not an anonymous call.
+        assert!(rpc_bearer("http://127.0.0.1:9701", Some(&missing), None).is_err());
+    }
 }
 
 #[cfg(test)]
