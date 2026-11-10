@@ -236,10 +236,11 @@ pub fn plan_destination_offer(
                 continue;
             }
         }
-        // Never jump a payable release that waits only for the window.
+        // Never jump a payable release that waits only for the window (D123:
+        // the window cap of the block at `height`).
         let Some(after) = window
             .checked_add(release.release.amount)
-            .filter(|after| *after <= rules.vault.window_cap)
+            .filter(|after| *after <= rules.vault.at(height).window_cap)
         else {
             break;
         };
@@ -257,16 +258,19 @@ pub fn plan_destination_offer(
 /// The entries of `entries` (the mempool's selection, `pages_of` their pages)
 /// that keep V8 when the chain template places them with `offer`'s
 /// transactions by decreasing fee then logical txid, the vault holding
-/// `bridge_locked` before the block: a deposit that would take it over the
-/// ceiling is left out (it stays in the pool), a release gives back what it
-/// takes. Order of `entries` kept.
+/// `bridge_locked` before the block at `height`: a deposit that would take it
+/// over that block's ceiling (D123: [`VaultRules::at`]) is left out (it stays
+/// in the pool), a release gives back what it takes. Order of `entries` kept.
 pub fn deposits_within_ceiling<E>(
     entries: Vec<E>,
     pages_of: impl Fn(&E) -> &[TxPage],
     offer: &DestinationOffer,
     bridge_locked: u64,
     rules: &VaultRules,
+    height: u64,
 ) -> Vec<E> {
+    // D123: the ceiling of the block at `height`.
+    let rules = &rules.at(height);
     enum Effect {
         Release(u64),
         Deposit(usize, u64),

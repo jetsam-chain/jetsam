@@ -38,11 +38,11 @@ fn hx(b: &[u8]) -> String {
 }
 
 /// The program's rule under the vector's clock: the program's own vault and amounts (never the
-/// vector's), J and F of the vector.
+/// vector's), J and F of the vector; D123's largest deposit (the vectors' test clock has no caps of before).
 fn rule_of(v: &Value) -> DepositRule {
     let j = v["activation_height"].as_u64().unwrap_or(VECTORS_J);
     let f = v["deposits_from_height"].as_u64().unwrap();
-    let rule = DepositRule { deposits_from_height: Some(f), ..DepositRule::for_activation(Some(j)) };
+    let rule = DepositRule { deposits_from_height: Some(f), legacy: None, ..DepositRule::for_activation(Some(j)) };
     assert_eq!(hx(&rule.vault), v["vault"].as_str().unwrap(), "{}: the program's vault is not the node's", v["name"]);
     rule
 }

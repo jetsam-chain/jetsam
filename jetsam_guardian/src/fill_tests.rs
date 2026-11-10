@@ -42,8 +42,9 @@ pub(crate) const F: u64 = J + 1_440;
 pub(crate) const PAYER: Address = Address([0x51; 32]);
 const FEE: u64 = 47_200;
 
+/// The test clock (J = 69 120, F = J + 1 440) with D123's caps on every profile (the G6 vectors' clock).
 pub(crate) fn rules() -> VaultRules {
-    VaultRules { activation_height: Some(J), deposits_from_height: Some(F), ..VaultRules::current() }
+    VaultRules { activation_height: Some(J), deposits_from_height: Some(F), legacy: None, ..VaultRules::current() }
 }
 
 fn bheader(height: u64, tx_root: [u8; 32]) -> BlockHeader {
@@ -174,7 +175,7 @@ fn a_block_the_vault_rule_refuses_gives_no_deposit() {
         ("V4-a reserved bytes", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 7 * JTM), (reserved, 0)])])),
         ("V4-b zero recipient", block_of(F + 1, vec![deposit_tx(1, [0u8; 20], 7 * JTM)])),
         ("V4-c below MIN_DEPOSIT", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), JTM - 1)])),
-        ("V4-c above MAX_DEPOSIT", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 1_000 * JTM + 1)])),
+        ("V4-c above MAX_DEPOSIT", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 50_000 * JTM + 1)])),
         ("V4-d at F", block_of(F, vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)])),
         ("V4-e two vault outputs", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 3 * JTM), (VAULT_ADDRESS, 4 * JTM), (deposit_marker(&rcpt(0xa1)), 0)])])),
     ];
@@ -575,43 +576,52 @@ fn ledger_with(entries: &[(u8, u64, u64)]) -> Ledger {
 }
 
 #[test]
-fn at_most_1000_jtm_per_recipient_over_24h() {
+fn at_most_10000_jtm_per_recipient_over_24h() {
+    // D123: one stock (10 000 JTM) per recipient per 24 h (1 000 before)
     let p = FillParams::default();
-    let l = ledger_with(&[(1, 800 * JTM, NOW - 86_399)]);
-    let c = cand(10, 1, 1, 201 * JTM);
-    assert_eq!(run(&[c.clone()], &l, Caps { outstanding: 800 * JTM, ..caps() }), vec![Verdict::Refuse("RECIPIENT_CAP")]);
-    let l = ledger_with(&[(1, 800 * JTM, NOW - p.recipient_window)]);
-    assert_eq!(run(&[c], &l, Caps { outstanding: 800 * JTM, ..caps() }), vec![Verdict::Advance]);
+    let l = ledger_with(&[(1, 8_000 * JTM, NOW - 86_399)]);
+    let c = cand(10, 1, 1, 2_001 * JTM);
+    assert_eq!(run(&[c.clone()], &l, Caps { outstanding: 7_000 * JTM, ..caps() }), vec![Verdict::Refuse("RECIPIENT_CAP")]);
+    let l = ledger_with(&[(1, 8_000 * JTM, NOW - p.recipient_window)]);
+    assert_eq!(run(&[c], &l, Caps { outstanding: 7_000 * JTM, ..caps() }), vec![Verdict::Advance]);
     // another recipient is not concerned (the hour is free)
-    let l = ledger_with(&[(1, 800 * JTM, NOW - 3_700)]);
-    assert_eq!(run(&[cand(10, 1, 2, 200 * JTM)], &l, Caps { outstanding: 800 * JTM, ..caps() }), vec![Verdict::Advance]);
+    let l = ledger_with(&[(1, 8_000 * JTM, NOW - 3_700)]);
+    assert_eq!(run(&[cand(10, 1, 2, 2_000 * JTM)], &l, Caps { outstanding: 7_000 * JTM, ..caps() }), vec![Verdict::Advance]);
 }
 
 #[test]
-fn at_most_600_jtm_an_hour_and_more_only_when_the_hour_is_empty() {
+fn at_most_5000_jtm_an_hour_and_more_only_when_the_hour_is_empty() {
+    // D123: half the stock an hour (600 of 1 200 before)
     let p = FillParams::default();
-    let l = ledger_with(&[(1, 400 * JTM, NOW - 3_599)]);
-    assert_eq!(run(&[cand(10, 1, 2, 201 * JTM)], &l, caps()), vec![Verdict::Wait("HOUR_CAP")]);
-    assert_eq!(run(&[cand(10, 1, 2, 200 * JTM)], &l, caps()), vec![Verdict::Advance]);
-    let l = ledger_with(&[(1, 400 * JTM, NOW - p.hour_window)]);
-    assert_eq!(run(&[cand(10, 1, 2, 201 * JTM)], &l, caps()), vec![Verdict::Advance], "the hour slid");
-    // 900 JTM: only with an empty hour
-    assert_eq!(run(&[cand(10, 1, 2, 900 * JTM)], &Ledger::default(), caps()), vec![Verdict::Advance]);
+    let l = ledger_with(&[(1, 4_000 * JTM, NOW - 3_599)]);
+    assert_eq!(run(&[cand(10, 1, 2, 1_001 * JTM)], &l, caps()), vec![Verdict::Wait("HOUR_CAP")]);
+    assert_eq!(run(&[cand(10, 1, 2, 1_000 * JTM)], &l, caps()), vec![Verdict::Advance]);
+    let l = ledger_with(&[(1, 4_000 * JTM, NOW - p.hour_window)]);
+    assert_eq!(run(&[cand(10, 1, 2, 1_001 * JTM)], &l, caps()), vec![Verdict::Advance], "the hour slid");
+    // 9 000 JTM: only with an empty hour (a stock of 10 000)
+    let full = Caps { stock: 10_000 * JTM, ..caps() };
+    assert_eq!(run(&[cand(10, 1, 2, 9_000 * JTM)], &Ledger::default(), full), vec![Verdict::Advance]);
     let l = ledger_with(&[(1, 5 * JTM, NOW - 10)]);
-    assert_eq!(run(&[cand(10, 1, 2, 900 * JTM)], &l, caps()), vec![Verdict::Wait("HOUR_CAP")]);
+    assert_eq!(run(&[cand(10, 1, 2, 9_000 * JTM)], &l, full), vec![Verdict::Wait("HOUR_CAP")]);
     // in one plan: the second deposit counts the first
-    let v = run(&[cand(10, 1, 2, 400 * JTM), cand(11, 1, 3, 300 * JTM)], &Ledger::default(), caps());
+    let v = run(&[cand(10, 1, 2, 4_000 * JTM), cand(11, 1, 3, 3_000 * JTM)], &Ledger::default(), full);
     assert_eq!(v, vec![Verdict::Advance, Verdict::Wait("HOUR_CAP")]);
 }
 
 #[test]
 fn the_contracts_caps_are_never_crossed() {
-    // 24 h: spent24h + amount <= 2 500 JTM; outstanding + amount <= 3 000 JTM (advancerCaps of the contract)
+    // 24 h: spent24h + amount <= 50 000 JTM (advancerCaps of the contract, D123); outstanding + amount <= the robot's
+    // outstanding_cap (10 000 JTM, within its stock), and never above the contract's 50 000
     let c = cand(10, 1, 2, 200 * JTM);
-    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { spent24h: 2_301 * JTM, ..caps() }), vec![Verdict::Wait("DAY_CAP")]);
-    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { spent24h: 2_300 * JTM, ..caps() }), vec![Verdict::Advance]);
-    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { outstanding: 2_801 * JTM, ..caps() }), vec![Verdict::Wait("OUTSTANDING_CAP")]);
-    assert_eq!(run(&[c], &Ledger::default(), Caps { outstanding: 2_800 * JTM, ..caps() }), vec![Verdict::Advance]);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { spent24h: 49_801 * JTM, ..caps() }), vec![Verdict::Wait("DAY_CAP")]);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { spent24h: 49_800 * JTM, ..caps() }), vec![Verdict::Advance]);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { outstanding: 9_801 * JTM, ..caps() }), vec![Verdict::Wait("OUTSTANDING_CAP")]);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), Caps { outstanding: 9_800 * JTM, ..caps() }), vec![Verdict::Advance]);
+    // a robot whose stock is the whole contract cap: the contract's 50 000 bind
+    let all = FillParams { max_stock: ADVANCE_OUTSTANDING_CAP, outstanding_cap: ADVANCE_OUTSTANDING_CAP, ..FillParams::default() };
+    let at = |outstanding: u64| plan(&[c.clone()], &Ledger::default(), Caps { outstanding, ..caps() }, &open(), NOW, NOW, 5 * JTM, &all);
+    assert_eq!(at(49_801 * JTM), vec![Verdict::Wait("OUTSTANDING_CAP")]);
+    assert_eq!(at(49_800 * JTM), vec![Verdict::Advance]);
 }
 
 #[test]
@@ -718,8 +728,8 @@ fn parameters_below_their_floors_are_refused() {
     assert!(bad(&|p| p.min_nodes = 1));
     assert!(bad(&|p| p.work_blocks = 7));
     assert!(bad(&|p| p.fee_bps = 101));
-    assert!(bad(&|p| p.outstanding_cap = 3_000 * JTM + 1));
-    assert!(bad(&|p| p.max_stock = 3_000 * JTM + 1));
+    assert!(bad(&|p| p.outstanding_cap = ADVANCE_OUTSTANDING_CAP + 1));
+    assert!(bad(&|p| p.max_stock = ADVANCE_OUTSTANDING_CAP + 1));
     assert!(bad(&|p| p.max_stock = 0));
     assert!(bad(&|p| p.batch_max = 33));
     assert!(bad(&|p| p.share_halt_pct = 56));
@@ -808,13 +818,13 @@ fn g6_cases() -> Vec<(&'static str, Block)> {
     let three_pages = logical(1, PAYER, &[(Address([0x77; 32]), 2 * JTM), (Address([0x78; 32]), 2 * JTM), (VAULT_ADDRESS, 9 * JTM), (deposit_marker(&rcpt(0xc3)), 0), (Address([0x79; 32]), JTM)]);
     let cases: Vec<(&str, Block)> = vec![
         ("valid_one_page_min", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), JTM)])),
-        ("valid_one_page_max", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 1_000 * JTM)])),
+        ("valid_one_page_max", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 50_000 * JTM)])),
         ("valid_three_pages_with_change", block_of(F + 3, vec![three_pages])),
         ("valid_two_deposits_after_a_payment", block_of(F + 4, vec![logical(500, PAYER, &[(Address([0x77; 32]), 3 * JTM)]), deposit_tx(100, rcpt(0xa1), 7 * JTM), deposit_tx(200, rcpt(0xb2), 250 * JTM + 1)])),
         ("refused_v4a_reserved_bytes", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 7 * JTM), (reserved, 0)])])),
         ("refused_v4b_zero_recipient", block_of(F + 1, vec![deposit_tx(1, [0u8; 20], 7 * JTM)])),
         ("refused_v4c_below_min", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), JTM - 1)])),
-        ("refused_v4c_above_max", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 1_000 * JTM + 1)])),
+        ("refused_v4c_above_max", block_of(F + 1, vec![deposit_tx(1, rcpt(0xa1), 50_000 * JTM + 1)])),
         ("refused_v4d_at_opening", block_of(F, vec![deposit_tx(1, rcpt(0xa1), 7 * JTM)])),
         ("refused_v4e_two_vault_outputs", block_of(F + 1, vec![logical(1, PAYER, &[(VAULT_ADDRESS, 3 * JTM), (VAULT_ADDRESS, 4 * JTM), (deposit_marker(&rcpt(0xa1)), 0)])])),
         ("refused_v4e_two_markers", block_of(F + 1, vec![two_markers])),
@@ -961,13 +971,13 @@ fn g6_edge_cases() -> Vec<(&'static str, &'static str, Block)> {
     let cases: Vec<(&str, &str, Block)> = vec![
         // V4-c, one group over several pages
         ("x_min_on_second_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), vault(JTM), (marker(0xa1), 0)]))),
-        ("x_max_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(1_000 * JTM), (marker(0xa1), 0)]))),
+        ("x_max_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(50_000 * JTM), (marker(0xa1), 0)]))),
         ("x_min_minus_one_on_second_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), vault(JTM - 1), (marker(0xa1), 0)]))),
-        ("x_max_plus_one_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(1_000 * JTM + 1), (marker(0xa1), 0)]))),
+        ("x_max_plus_one_on_third_page", "V4-c", one(F + 1, logical(1, PAYER, &[pay(0x77, 2 * JTM), pay(0x78, 2 * JTM), pay(0x79, JTM), pay(0x7a, JTM), vault(50_000 * JTM + 1), (marker(0xa1), 0)]))),
         ("x_one_micro", "V4-c", one(F + 1, deposit_tx(1, rcpt(0xa1), 1))),
         ("x_zero_amount_vault_output", "V4-c", one(F + 1, deposit_tx(1, rcpt(0xa1), 0))),
         // V4-e: exactly one vault output, whatever the sum
-        ("x_two_vault_outputs_each_in_range_sum_above_max", "V4-e", one(F + 1, logical(1, PAYER, &[vault(600 * JTM), vault(600 * JTM), (marker(0xa1), 0)]))),
+        ("x_two_vault_outputs_each_in_range_sum_above_max", "V4-e", one(F + 1, logical(1, PAYER, &[vault(30_000 * JTM), vault(30_000 * JTM), (marker(0xa1), 0)]))),
         ("x_two_vault_outputs_each_below_min_sum_in_range", "V4-e", one(F + 1, logical(1, PAYER, &[vault(JTM / 2), vault(JTM / 2 + JTM / 10), (marker(0xa1), 0)]))),
         ("x_two_vault_outputs_on_two_pages", "V4-e", one(F + 1, logical(1, PAYER, &[vault(3 * JTM), pay(0x77, JTM), vault(4 * JTM), (marker(0xa1), 0)]))),
         // V4-e: exactly one JTMBRDG1 marker
@@ -1005,7 +1015,7 @@ fn g6_edge_cases() -> Vec<(&'static str, &'static str, Block)> {
         // the block, not the group: one bad group refuses every deposit of the block
         ("x_valid_deposit_then_bare_vault_output", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), logical(50, PAYER, &[vault(JTM)])], &[])),
         ("x_bare_vault_output_then_valid_deposit", "V4", block_with(F + 1, cb(F + 1), vec![logical(50, PAYER, &[vault(JTM)]), deposit_tx(1, rcpt(0xa1), 7 * JTM)], &[])),
-        ("x_valid_deposit_then_bad_amount", "V4-c", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM + 1)], &[])),
+        ("x_valid_deposit_then_bad_amount", "V4-c", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), 7 * JTM), deposit_tx(50, rcpt(0xb2), 50_000 * JTM + 1)], &[])),
         ("x_three_deposits_one_block", "V4", block_with(F + 1, cb(F + 1), vec![deposit_tx(1, rcpt(0xa1), JTM), deposit_tx(50, rcpt(0xb2), 1_000 * JTM - 1), deposit_tx(100, rcpt(0xc3), 1_000 * JTM)], &[])),
         ("x_payment_only", "V4", one(F + 1, logical(1, PAYER, &[pay(0x77, 3 * JTM)]))),
     ];
@@ -1150,13 +1160,13 @@ fn a_build_of_another_v1_7_clock_does_not_start() {
 }
 
 /// V8 = C-6 (A1 M4): the node admits a deposit up to the ceiling the contract mints to (`OUTSTANDING_CEIL =
-/// 10_000e6` of `JetsamBridge.sol`, asserted there by `test_outstanding_ceiling_is_static_and_equals_params` and
+/// 50_000e6` of `JetsamBridge.sol` since D123, asserted there by `test_outstanding_ceiling_is_static_and_equals_params` and
 /// `testFuzz_node_cap_never_admits_a_deposit_the_contract_cannot_mint` of `Caps.t.sol`), and
 /// not one µJTM above: a deposit the robot reads is never one the contract cannot mint for the outstanding.
 #[test]
 fn v8_is_c6_the_node_admits_up_to_the_contracts_ceiling() {
     use jetsam_chain::consensus::vault::{validate_block_vault, ReleasedSet, VaultContext, VAULT_OUTSTANDING_CEIL_MICRO};
-    const CONTRACT_OUTSTANDING_CEIL: u64 = 10_000 * JTM;
+    const CONTRACT_OUTSTANDING_CEIL: u64 = 50_000 * JTM;
     assert_eq!(VAULT_OUTSTANDING_CEIL_MICRO, CONTRACT_OUTSTANDING_CEIL);
     let released = ReleasedSet::new();
     let ctx = |locked: u64| VaultContext { released: &released, released_in_window: 0, bridge_locked: locked, bridge_vault_floor: 0 };
@@ -1197,8 +1207,8 @@ fn top_share_is_rounded_up() {
 
 #[test]
 fn one_plan_counts_its_own_advances_to_a_recipient() {
-    let v = run(&[cand(10, 1, 7, 600 * JTM), cand(11, 1, 7, 401 * JTM)], &Ledger::default(), Caps { ..caps() });
-    assert_eq!(v[1], Verdict::Refuse("RECIPIENT_CAP"), "600 + 401 > 1 000 to one recipient");
+    let v = run(&[cand(10, 1, 7, 6_000 * JTM), cand(11, 1, 7, 4_001 * JTM)], &Ledger::default(), Caps { stock: 10_000 * JTM, ..caps() });
+    assert_eq!(v[1], Verdict::Refuse("RECIPIENT_CAP"), "6 000 + 4 001 > 10 000 to one recipient (D123)");
 }
 
 #[test]
@@ -1308,25 +1318,28 @@ fn the_robot_claims_only_its_pending_advances_whose_exact_tuple_is_in_the_final_
 
 // ---------------------------------------------------------------- audit A5
 
-/// A5-11: `(21 000 + n × 97 800) × (100 + margin) / 100 ≤ max_gas`, at most the contract's 32 (the gas
-/// measured for `advanceBatch`, `ADVANCER_INTERFACE.md` §10: 3 orders, 293 340 gas).
+/// A5-11: `(21 000 + n × 106 500) × (100 + margin) / 100 ≤ max_gas`, at most the contract's 32 (the gas
+/// measured for `advanceBatch`, `ADVANCER_INTERFACE.md` §10: 3 orders, 293 340 gas, + 26 138 for D123's
+/// outstanding slot = 319 478, ≈ 106 500 an order with the transaction's 21 000).
 #[test]
 fn a5_11_a_batch_is_bounded_by_the_signers_gas_cap_with_its_margin() {
-    // (21 000 + 24 × 97 800) × 1.25 = 2 960 250 ≤ 3 000 000 < (21 000 + 25 × 97 800) × 1.25 = 3 082 500
-    assert_eq!(batch_gas_bound(3_000_000, 25), 24);
-    // × 1.10: 27 orders 2 927 760, 28 orders 3 035 340
-    assert_eq!(batch_gas_bound(3_000_000, 10), 27);
-    // exactly at the cap: (21 000 + 24 × 97 800) × 1.25 = 2 960 250
-    assert_eq!(batch_gas_bound(2_960_250, 25), 24);
-    assert_eq!(batch_gas_bound(2_960_249, 25), 23);
+    assert_eq!(BATCH_ORDER_GAS, 106_500);
+    // (21 000 + 22 × 106 500) × 1.25 = 2 955 000 ≤ 3 000 000 < (21 000 + 23 × 106 500) × 1.25 = 3 088 125
+    assert_eq!(batch_gas_bound(3_000_000, 25), 22);
+    // × 1.10: 25 orders 2 951 850, 26 orders 3 069 000
+    assert_eq!(batch_gas_bound(3_000_000, 10), 25);
+    // exactly at the cap: (21 000 + 22 × 106 500) × 1.25 = 2 955 000
+    assert_eq!(batch_gas_bound(2_955_000, 25), 22);
+    assert_eq!(batch_gas_bound(2_954_999, 25), 21);
     assert_eq!(batch_gas_bound(30_000_000, 25), MAX_ADVANCE_BATCH, "never above the contract's 32");
-    assert_eq!(batch_gas_bound(148_500, 25), 1);
-    assert_eq!(batch_gas_bound(148_499, 25), 0, "not even one order");
+    // (21 000 + 106 500) × 1.25 = 159 375
+    assert_eq!(batch_gas_bound(159_375, 25), 1);
+    assert_eq!(batch_gas_bound(159_374, 25), 0, "not even one order");
     // the default batch fits the default signer (3 000 000, 25 %), with one order of room
     let p = FillParams::default();
     let fee = crate::l1tx::FeePolicy::default();
     assert_eq!((fee.max_gas, fee.gas_margin_pct), (3_000_000, 25));
-    assert_eq!(p.batch_max, 23);
+    assert_eq!(p.batch_max, 22);
     assert!(fee.gas_limit(TX_BASE_GAS + p.batch_max as u64 * BATCH_ORDER_GAS).is_ok());
     assert!(fee.gas_limit(TX_BASE_GAS + 25 * BATCH_ORDER_GAS).is_err(), "the audit's 25 orders exceed max_gas");
 }
@@ -1335,21 +1348,21 @@ fn a5_11_a_batch_is_bounded_by_the_signers_gas_cap_with_its_margin() {
 fn a5_11_a_batch_above_the_gas_bound_does_not_start() {
     let strict = crate::Profile::Mainnet;
     let with = |n: usize| FillParams { batch_max: n, ..FillParams::default() };
-    assert!(with(24).check(strict, 3_000_000, 25).is_ok());
-    let e = with(25).check(strict, 3_000_000, 25).unwrap_err().to_string();
-    assert!(e.contains("batch_max 25") && e.contains("max_gas"), "{e}");
+    assert!(with(22).check(strict, 3_000_000, 25).is_ok());
+    let e = with(23).check(strict, 3_000_000, 25).unwrap_err().to_string();
+    assert!(e.contains("batch_max 23") && e.contains("max_gas"), "{e}");
     assert!(with(32).check(strict, 3_000_000, 25).is_err());
-    assert!(with(1).check(strict, 148_499, 25).is_err(), "a cap below one order");
+    assert!(with(1).check(strict, 159_374, 25).is_err(), "a cap below one order");
     // through fill.toml: the signer's max_gas bounds the default batch
     let tight = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\nmax_gas = 2000000\n");
     let e = FillConfig::parse(&tight).unwrap_err().to_string();
     assert!(e.contains("batch_max") && e.contains("does not start"), "{e}");
-    let fits = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 16\n[signer]\nmax_gas = 2000000\n");
+    let fits = rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 14\n[signer]\nmax_gas = 2000000\n");
     assert!(FillConfig::parse(&fits).is_ok());
-    // without [signer] (the rehearsal's endpoint account): the default signer's bound, 24
-    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 24\n")).is_ok());
-    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 25\n")).unwrap_err().to_string();
-    assert!(e.contains("batch_max 25"), "{e}");
+    // without [signer] (the rehearsal's endpoint account): the default signer's bound, 22
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 22\n")).is_ok());
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nbatch_max = 23\n")).unwrap_err().to_string();
+    assert!(e.contains("batch_max 23"), "{e}");
 }
 
 /// A5-11: refused for its gas, the batch is sent again with half of its orders, down to one; any other
@@ -1376,8 +1389,8 @@ fn a5_18_an_advance_needs_room_under_the_supply_ceiling_after_the_robots_pending
     assert_eq!(l.pending_sum(), 300 * JTM);
     let c = cand(10, 1, 2, 200 * JTM);
     let supply = |s: u64| Caps { total_supply: s, ..caps() };
-    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM)), vec![Verdict::Advance], "10 000 − 9 500 − 300 = 200");
-    assert_eq!(run(&[c.clone()], &l, supply(9_500 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c.clone()], &l, supply(49_500 * JTM)), vec![Verdict::Advance], "50 000 − 49 500 − 300 = 200");
+    assert_eq!(run(&[c.clone()], &l, supply(49_500 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
     assert_eq!(run(&[c.clone()], &l, supply(u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")], "a supply above the ceiling");
     // repaid or lost advances are minted already (in totalSupply): they are not counted twice
     let mut done = ledger_with(&[(1, 300 * JTM, NOW - 100_000), (3, 100 * JTM, NOW - 100_000)]);
@@ -1387,7 +1400,7 @@ fn a5_18_an_advance_needs_room_under_the_supply_ceiling_after_the_robots_pending
     assert_eq!(run(&[c.clone()], &done, supply(9_800 * JTM)), vec![Verdict::Advance]);
     // within one plan the batch counts itself, and the wait keeps the queue's order
     let cands = vec![cand(10, 1, 2, 150 * JTM), cand(11, 1, 3, 100 * JTM), cand(12, 1, 4, 5 * JTM)];
-    let v = run(&cands, &l, supply(9_500 * JTM));
+    let v = run(&cands, &l, supply(49_500 * JTM));
     assert_eq!(v, vec![Verdict::Advance, Verdict::Wait("SUPPLY_CEILING"), Verdict::Wait("QUEUED_BEHIND")]);
 }
 
@@ -1405,8 +1418,8 @@ fn a5_18_wjtm_minted_from_abandoned_final_points_pauses() {
 fn a5_18_the_ceiling_read_on_the_bridge_is_the_nodes_v8_ceiling() {
     use jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO;
     assert_eq!(OUTSTANDING_CEIL, VAULT_OUTSTANDING_CEIL_MICRO);
-    assert!(check_ceiling(10_000 * JTM).is_ok());
-    for bad in [10_000 * JTM + 1, 10_000 * JTM - 1, 0, u64::MAX] {
+    assert!(check_ceiling(50_000 * JTM).is_ok());
+    for bad in [50_000 * JTM + 1, 50_000 * JTM - 1, 10_000 * JTM, 0, u64::MAX] {
         assert!(check_ceiling(bad).unwrap_err().to_string().contains("does not start"), "{bad}");
     }
     let mut w = [0u8; 32];
@@ -1571,8 +1584,8 @@ fn n9_b_the_room_under_the_ceiling_leaves_out_the_deposits_locked_under_the_tip_
     // in the plan: the room is CEIL − supply − the robot's pending − the locked deposits not minted
     let c = cand(13, 1, 5, 200 * JTM);
     let at = |supply: u64, locked: u64| Caps { total_supply: supply, tip_locked_height: Some(10), locked_unminted: locked, ..caps() };
-    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM)), vec![Verdict::Advance], "10 000 − 9 700 − 100 = 200");
-    assert_eq!(run(&[c.clone()], &Ledger::default(), at(9_700 * JTM, 100 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(49_700 * JTM, 100 * JTM)), vec![Verdict::Advance], "50 000 − 49 700 − 100 = 200");
+    assert_eq!(run(&[c.clone()], &Ledger::default(), at(49_700 * JTM, 100 * JTM + 1)), vec![Verdict::Wait("SUPPLY_CEILING")]);
     assert_eq!(run(&[c], &Ledger::default(), at(0, u64::MAX)), vec![Verdict::Wait("SUPPLY_CEILING")]);
 }
 
@@ -1728,7 +1741,7 @@ fn robot_activation_gate_node_program_and_robot_decide_the_g6_vectors_with_one_t
     let (base, edges) = (g6_cases(), g6_edge_cases());
     assert_eq!((base.len(), edges.len()), (13, 40));
     let all: Vec<(&str, Block)> = base.into_iter().chain(edges.into_iter().map(|(n, _, b)| (n, b))).collect();
-    let rule = DepositRule { deposits_from_height: Some(F), ..DepositRule::for_activation(Some(J)) };
+    let rule = DepositRule { deposits_from_height: Some(F), legacy: None, ..DepositRule::for_activation(Some(J)) };
     let mut deposits = 0;
     for (name, b) in &all {
         let pages: Vec<Vec<u8>> = b
@@ -1898,3 +1911,69 @@ fn e12_the_scan_goes_past_a_block_it_cannot_read_and_reads_it_again() {
     scan_step(&mut scanned, &mut failed, &c, 1, &mut read, &mut |_| {});
     assert_eq!(*asked.borrow(), (1..=8).chain(65..=128).collect::<Vec<_>>(), "8 failed ones again, 64 new ones");
 }
+
+
+// ---------------------------------------------------------------- D123: the caps are the bond, 50 000 JTM
+
+/// The robot's mirrors of the contract's caps (D123): 50 000 JTM each, the per-deposit cap the nodes' largest
+/// deposit, the ceiling the nodes' V8.
+#[test]
+fn d123_the_robots_mirrors_are_the_contracts_caps() {
+    use jetsam_chain::consensus::vault::{MAX_DEPOSIT_MICRO, VAULT_OUTSTANDING_CEIL_MICRO};
+    for (name, v) in [
+        ("SLOW_PER_DEPOSIT", SLOW_PER_DEPOSIT),
+        ("OUTSTANDING_CEIL", OUTSTANDING_CEIL),
+        ("ADVANCE_OUTSTANDING_CAP", ADVANCE_OUTSTANDING_CAP),
+        ("ADVANCE_CAP_24H", ADVANCE_CAP_24H),
+    ] {
+        assert_eq!(v, 50_000 * JTM, "{name}");
+    }
+    assert_eq!(SLOW_PER_DEPOSIT, MAX_DEPOSIT_MICRO);
+    assert_eq!(OUTSTANDING_CEIL, VAULT_OUTSTANDING_CEIL_MICRO);
+}
+
+/// D123: the robot's own caps sit under the contract's, its outstanding within its stock (« avances en cours ≤ ce
+/// que le robot a en stock »): 10 000 JTM of stock and of outstanding, 5 000 JTM an hour (half the stock, as 600 of
+/// 1 200 before), 10 000 JTM per recipient per 24 h (one stock), the grace of 10 min above 250 JTM kept.
+#[test]
+fn d123_the_robots_defaults_sit_under_the_contracts_caps() {
+    let p = FillParams::default();
+    assert_eq!(
+        (p.max_stock, p.outstanding_cap, p.hour_cap, p.recipient_cap, p.grace_from, p.grace_secs),
+        (10_000 * JTM, 10_000 * JTM, 5_000 * JTM, 10_000 * JTM, 250 * JTM, 600)
+    );
+    assert!(p.outstanding_cap <= p.max_stock && p.max_stock <= ADVANCE_OUTSTANDING_CAP);
+    assert!(p.hour_cap <= p.max_stock && p.recipient_cap <= ADVANCE_CAP_24H);
+    assert!(p.check(crate::Profile::Mainnet, 3_000_000, 25).is_ok());
+}
+
+/// D123: an outstanding cap above the stock cap does not start (the robot's advances in flight stay within what it
+/// holds); equal starts.
+#[test]
+fn d123_an_outstanding_cap_above_the_stock_does_not_start() {
+    let strict = crate::Profile::Mainnet;
+    let p = FillParams { max_stock: 2_000 * JTM, outstanding_cap: 2_000 * JTM, ..FillParams::default() };
+    assert!(p.check(strict, 3_000_000, 25).is_ok());
+    let over = FillParams { outstanding_cap: 2_000 * JTM + 1, ..p };
+    let e = over.check(strict, 3_000_000, 25).unwrap_err().to_string();
+    assert!(e.contains("outstanding_cap") && e.contains("max_stock"), "{e}");
+}
+
+/// D123: at start the robot reads the bridge's per-deposit and advance caps and refuses to start on any other
+/// value than its mirrors (a robot of before facing the new bridge, or the reverse).
+#[test]
+fn d123_the_bridges_caps_read_at_start_are_the_robots() {
+    assert!(check_bridge_caps(50_000 * JTM, 50_000 * JTM, 50_000 * JTM).is_ok());
+    for (a, b, c) in [
+        (1_000 * JTM, 50_000 * JTM, 50_000 * JTM),
+        (50_000 * JTM, 3_000 * JTM, 50_000 * JTM),
+        (50_000 * JTM, 50_000 * JTM, 2_500 * JTM),
+        (50_000 * JTM + 1, 50_000 * JTM, 50_000 * JTM),
+        (50_000 * JTM, 50_000 * JTM - 1, 50_000 * JTM),
+        (50_000 * JTM, 50_000 * JTM, u64::MAX),
+    ] {
+        let e = check_bridge_caps(a, b, c).unwrap_err().to_string();
+        assert!(e.contains("does not start"), "{e}");
+    }
+}
+

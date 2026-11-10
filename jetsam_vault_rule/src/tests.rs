@@ -61,7 +61,8 @@ fn deposit(recipient: u8, amount: u64) -> Result<GroupClass, RuleError> {
 fn constants_are_the_definitive_ones() {
     assert_eq!(MICRO_PER_JTM, 1_000_000);
     assert_eq!(MIN_DEPOSIT_MICRO, 1_000_000);
-    assert_eq!(MAX_DEPOSIT_MICRO, 1_000_000_000);
+    // D123: the bridge's largest exposure is the operator's bond, 50 000 JTM
+    assert_eq!(MAX_DEPOSIT_MICRO, 50_000_000_000);
     assert_eq!(&VAULT_SECRET, b"JTM/CONSENSUS/V1.7/VAULT-SECRET/");
     assert_eq!(VAULT_ADDRESS[..4], [0x0e, 0x96, 0x94, 0xb6]);
     assert_eq!(VAULT_ADDRESS[28..], [0x72, 0x06, 0xc2, 0x64]);
@@ -234,15 +235,15 @@ fn neither_vault_nor_marker_is_plain() {
 
 #[test]
 fn v4_c_min_and_max_are_inclusive_one_unit_beyond_is_refused() {
+    // the largest deposit of this build's rule at H (the test chain's of before D123 while its caps
+    // height is not reached, D123's elsewhere)
+    let max = rule().max_deposit_at(H);
     assert_eq!(
         classify(&[vault(MIN_DEPOSIT_MICRO), marker(0xa1)]),
         deposit(0xa1, MIN_DEPOSIT_MICRO)
     );
-    assert_eq!(
-        classify(&[vault(MAX_DEPOSIT_MICRO), marker(0xa1)]),
-        deposit(0xa1, MAX_DEPOSIT_MICRO)
-    );
-    for amount in [0, 1, MIN_DEPOSIT_MICRO - 1, MAX_DEPOSIT_MICRO + 1, u64::MAX] {
+    assert_eq!(classify(&[vault(max), marker(0xa1)]), deposit(0xa1, max));
+    for amount in [0, 1, MIN_DEPOSIT_MICRO - 1, max + 1, u64::MAX] {
         assert_eq!(
             classify(&[vault(amount), marker(0xa1)]),
             Err(RuleError::DepositAmount { group: 0, amount }),
@@ -253,6 +254,7 @@ fn v4_c_min_and_max_are_inclusive_one_unit_beyond_is_refused() {
     let narrow = DepositRule {
         min_deposit: 5 * JTM,
         max_deposit: 6 * JTM,
+        legacy: None,
         ..rule()
     };
     let c = |a| classify_group(0, &PAYER, &[vault(a), marker(1)], H, &narrow);
@@ -755,4 +757,79 @@ fn the_logical_txid_of_a_three_page_group_is_the_chains() {
     let swapped = [refs[1], refs[0], refs[2]];
     assert_ne!(crate::txid::logical_txid(&swapped), crate::txid::logical_txid(&refs));
     assert_ne!(crate::txid::logical_txid(&refs[..2]), crate::txid::logical_txid(&refs));
+}
+
+// ---------------------------------------------------------------- D123
+
+/// A rule with D123's caps from J (the public network, the rehearsal) and one of a chain that raises them
+/// at `raised_at` (the test chain).
+fn d123() -> DepositRule {
+    DepositRule {
+        legacy: None,
+        ..rule()
+    }
+}
+
+fn raising(raised_at: Option<u64>) -> DepositRule {
+    DepositRule {
+        legacy: Some(LegacyDepositCap {
+            raised_at,
+            max_deposit: TESTNET_PRE_D123_MAX_DEPOSIT_MICRO,
+        }),
+        ..rule()
+    }
+}
+
+/// D123: a deposit of exactly 50 000 JTM is valid, 50 000 JTM + 1 µJTM is not.
+#[test]
+fn d123_the_largest_deposit_is_the_bond_inclusive() {
+    let r = d123();
+    assert_eq!(r.max_deposit_at(H), 50_000 * JTM);
+    assert_eq!(classify_group(0, &PAYER, &[vault(50_000 * JTM), marker(1)], H, &r), deposit(1, 50_000 * JTM));
+    assert_eq!(
+        classify_group(0, &PAYER, &[vault(50_000 * JTM + 1), marker(1)], H, &r),
+        Err(RuleError::DepositAmount { group: 0, amount: 50_000 * JTM + 1 })
+    );
+}
+
+/// D123 on the test chain: below its caps height the cap of before (1 000 JTM), from it on D123's; not
+/// chosen (`None`), the cap of before at every height.
+#[test]
+fn d123_the_test_chain_raises_its_deposit_cap_at_its_caps_height() {
+    let c = H + 100;
+    let r = raising(Some(c));
+    let at = |h: u64, a: u64| classify_group(0, &PAYER, &[vault(a), marker(1)], h, &r);
+    assert_eq!(r.max_deposit_at(c - 1), 1_000 * JTM);
+    assert_eq!(r.max_deposit_at(c), 50_000 * JTM);
+    assert_eq!(at(c - 1, 1_000 * JTM), deposit(1, 1_000 * JTM));
+    assert_eq!(at(c - 1, 1_000 * JTM + 1), Err(RuleError::DepositAmount { group: 0, amount: 1_000 * JTM + 1 }));
+    assert_eq!(at(c - 1, 50_000 * JTM), Err(RuleError::DepositAmount { group: 0, amount: 50_000 * JTM }));
+    assert_eq!(at(c, 1_000 * JTM + 1), deposit(1, 1_000 * JTM + 1));
+    assert_eq!(at(c, 50_000 * JTM), deposit(1, 50_000 * JTM));
+    assert_eq!(at(c, 50_000 * JTM + 1), Err(RuleError::DepositAmount { group: 0, amount: 50_000 * JTM + 1 }));
+    let never = raising(None);
+    for h in [H, c, u64::MAX] {
+        assert_eq!(never.max_deposit_at(h), 1_000 * JTM, "{h}");
+    }
+    assert!(!d123_caps_at(None, u64::MAX));
+    assert!(!d123_caps_at(Some(c), c - 1) && d123_caps_at(Some(c), c) && d123_caps_at(Some(c), u64::MAX));
+}
+
+/// The profiles: the test chain carries the cap of before until its caps height, not chosen yet (the
+/// operator arms it at deployment, a hard fork of the test chain); the public network and the rehearsal
+/// carry none.
+#[test]
+fn d123_only_the_test_chain_carries_the_cap_of_before() {
+    assert_eq!(TESTNET_PRE_D123_MAX_DEPOSIT_MICRO, 1_000 * JTM);
+    assert_eq!(TESTNET_CAPS_HEIGHT, None);
+    assert_eq!(
+        TESTNET_LEGACY_DEPOSIT_CAP,
+        LegacyDepositCap { raised_at: TESTNET_CAPS_HEIGHT, max_deposit: TESTNET_PRE_D123_MAX_DEPOSIT_MICRO }
+    );
+    let legacy = DepositRule::for_activation(Some(J)).legacy;
+    if TESTNET_PROFILE {
+        assert_eq!(legacy, Some(TESTNET_LEGACY_DEPOSIT_CAP));
+    } else {
+        assert_eq!(legacy, None);
+    }
 }

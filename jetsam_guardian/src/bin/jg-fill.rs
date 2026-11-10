@@ -13,9 +13,11 @@
 //! * A5-15: hardened first (no core dump, not dumpable, memory locked when no later allocation can be refused),
 //!   `fill.toml` private to its user (0600 or 0400, its uid: it names `refund_to`), one robot per
 //!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
-//! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key), this build's v1.7 clock,
-//!   the L1 chain id, the bridge's genesis, its `OUTSTANDING_CEIL()`, its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and
-//!   the hot key's stock ≤ `max_stock` (else no start).
+//! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key, D123: `outstanding_cap ≤ max_stock`),
+//!   this build's v1.7 clock, the L1 chain id, the bridge's
+//!   genesis, its `OUTSTANDING_CEIL()`, D123: its `SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()` and
+//!   `ADVANCE_CAP_24H()` (50 000 JTM each, the robot's mirrors), its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and the hot
+//!   key's stock ≤ `max_stock` (else no start).
 //! * A5-1: no advance of a deposit at or below the locked height of the contract's tip (its point is accepted: a
 //!   mint less than 24 h after an advance made now repays what it paid only); an advance the relayer's point
 //!   overtakes in the minutes between the robot's read of the tip and its advance loses its fee (accepted).
@@ -755,6 +757,9 @@ fn run() -> anyhow::Result<()> {
     let token = hex0x(&word_addr(&l1.call(&bridge, &l1::selector("token()"))?, 0));
     anyhow::ensure!(token != hex0x(&[0u8; 20]), "the bridge {bridge} answers no token: jg-fill does not start");
     fill::check_ceiling(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0)))?;
+    // D123: the bridge's per-deposit and advance caps are the robot's mirrors
+    let cap = |sig: &str| -> anyhow::Result<u64> { Ok(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector(sig))?, 0))) };
+    fill::check_bridge_caps(cap("SLOW_PER_DEPOSIT()")?, cap("ADVANCE_OUTSTANDING_CAP()")?, cap("ADVANCE_CAP_24H()")?)?;
     // A5-1: the contract keeps the fee of an advance at least 24 h old at its mint, the age the robot's rule gives
     fill::check_advance_min_age(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("ADVANCE_MIN_AGE()"))?, 0)))?;
     let hot = cfg.hot()?;

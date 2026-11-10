@@ -664,6 +664,7 @@ impl TemplateBuilder {
                 &crate::destination_slot::DestinationOffer::default(),
                 state.bridge_locked,
                 &destination_rules.vault,
+                child_height,
             ),
             None => entries,
         };

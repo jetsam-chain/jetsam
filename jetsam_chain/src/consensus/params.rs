@@ -679,6 +679,46 @@ const _: () = assert!(
     "V1_7_BASE_RETURN_HEIGHT must be None, or strictly above an armed V1_7_ACTIVATION_HEIGHT"
 );
 
+/// v1.7, D123 (10 November 2026): the bridge's caps are the operator's bond,
+/// 50 000 JTM — a deposit (`MAX_DEPOSIT`, V4-c), the release window (V6) and
+/// the vault (V8), as the contract's C-4, C-5, C-6, B-2, A-13 and A-14. The
+/// public network and the private rehearsal have them from their v1.7 height
+/// on: no height of their own.
+///
+/// The test chain ran v1.7 from 8 160 under the caps of before (1 000 JTM a
+/// deposit, 2 500 a release window, 10 000 in the vault,
+/// `vault::TESTNET_LEGACY_VAULT_CAPS`): there D123's caps are a **hard fork at
+/// this height** — a block at or above it is judged under D123's caps, a block
+/// below it under the old ones (more is valid from it on: a node without this
+/// height refuses those blocks).
+///
+/// **`None` until the operator chooses it at deployment**: while it is `None`
+/// a test node judges every block exactly as before. Its value is
+/// `jetsam_vault_rule::TESTNET_CAPS_HEIGHT` (the test chain's proof program
+/// reads that one too); `tests::the_test_chain_caps_height_is_not_chosen` pins
+/// it, the second deliberate edit of an arming. Armed, it sits strictly above
+/// the test chain's v1.7 height ([`testnet_caps_schedule_is_valid`]) and every
+/// node of the test chain, its relayer, its robot and the test bridge's
+/// programs are rebuilt with it.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_TESTNET_CAPS_HEIGHT: Option<u64> = jetsam_vault_rule::TESTNET_CAPS_HEIGHT;
+
+/// Whether a caps height may sit beside a v1.7 height: dormant, or strictly
+/// above an armed v1.7 height.
+pub const fn testnet_caps_schedule_is_valid(v1_7_activation: Option<u64>, caps: Option<u64>) -> bool {
+    match (v1_7_activation, caps) {
+        (_, None) => true,
+        (Some(v1_7), Some(caps)) => caps > v1_7,
+        (None, Some(_)) => false,
+    }
+}
+
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const _: () = assert!(
+    testnet_caps_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_TESTNET_CAPS_HEIGHT),
+    "V1_7_TESTNET_CAPS_HEIGHT must be None, or strictly above V1_7_ACTIVATION_HEIGHT"
+);
+
 /// Whether one candidate block height is governed by the v1.7 rules.
 #[inline]
 pub const fn v1_7_active(height: u64) -> bool {
@@ -2650,6 +2690,31 @@ mod tests {
     /// every profile until the operator chooses it at deployment: the public
     /// network, the test chain and the private rehearsal builds alike (a test
     /// arms it on its own thread through injected rules only).
+    /// D123: the test chain's caps height is not chosen (`None`) until the
+    /// operator arms it at deployment, in `jetsam_vault_rule::TESTNET_CAPS_HEIGHT`
+    /// (the proof program reads it too); this test is the second, deliberate
+    /// edit of an arming. Armed, it sits strictly above the test chain's J.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    #[test]
+    fn the_test_chain_caps_height_is_not_chosen() {
+        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, None);
+        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, jetsam_vault_rule::TESTNET_CAPS_HEIGHT);
+        assert!(testnet_caps_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_TESTNET_CAPS_HEIGHT));
+    }
+
+    /// D123: a caps height is dormant, or strictly above an armed v1.7 height
+    /// (the test chain ran v1.7 under its caps of before from J on).
+    #[test]
+    fn the_caps_height_sits_strictly_above_v1_7() {
+        assert!(testnet_caps_schedule_is_valid(None, None));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), None));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), Some(8_161)));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), Some(9_600)));
+        assert!(!testnet_caps_schedule_is_valid(Some(8_160), Some(8_160)));
+        assert!(!testnet_caps_schedule_is_valid(Some(8_160), Some(8_000)));
+        assert!(!testnet_caps_schedule_is_valid(None, Some(9_600)));
+    }
+
     #[test]
     fn the_base_return_height_is_none_on_every_profile() {
         assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);

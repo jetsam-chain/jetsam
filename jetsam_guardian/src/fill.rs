@@ -15,8 +15,9 @@
 //!   block at that height stops everything (`witness`, SG-10's rule).
 //! * [`guard`]: halts (latched, restarted by hand only, D41) and pauses (while their cause lasts).
 //! * [`plan`]: the order of the queue (first in, first out by height then position, published), the grace
-//!   of 10 min above 250 JTM, the caps (600 JTM an hour, 1 000 JTM per recipient per 24 h, the contract's
-//!   2 500 JTM / 24 h and 3 000 JTM outstanding), the gas-indexed minimum, the stock.
+//!   of 10 min above 250 JTM, the caps (D123: 5 000 JTM an hour, 10 000 JTM per recipient per 24 h, an
+//!   outstanding within the stock of 10 000 JTM, under the contract's 50 000 JTM / 24 h and 50 000 JTM
+//!   outstanding), the gas-indexed minimum, the stock.
 //! * [`DecisionJournal`]: every decision (why advanced, why refused), signed and chained, for the public page.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -36,27 +37,29 @@ use crate::observer::Branches;
 use crate::u256;
 use crate::witness::{witness, SourceView, WitnessRule};
 
-/// A-2 of the contract: an advance is of 1 to 1 000 JTM (µJTM).
+/// A-2 of the contract: an advance is of 1 to 50 000 JTM (µJTM; D123: `SLOW_PER_DEPOSIT`, the nodes' `MAX_DEPOSIT`).
 pub const ADVANCE_MIN_AMOUNT: u64 = 1_000_000;
-pub const SLOW_PER_DEPOSIT: u64 = 1_000_000_000;
+pub const SLOW_PER_DEPOSIT: u64 = 50_000_000_000;
 /// A-3.
 pub const MAX_FILL_FEE_BPS: u16 = 100;
 /// C-6 of the contract: it mints while `token().totalSupply() + amount ≤ OUTSTANDING_CEIL` (`OUTSTANDING_CEIL()`,
-/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start).
-pub const OUTSTANDING_CEIL: u64 = 10_000_000_000;
-/// A-13, A-14: the contract's caps per advancer.
-pub const ADVANCE_OUTSTANDING_CAP: u64 = 3_000_000_000;
-pub const ADVANCE_CAP_24H: u64 = 2_500_000_000;
+/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start). D123: 50 000 JTM, the operator's bond.
+pub const OUTSTANDING_CEIL: u64 = 50_000_000_000;
+/// A-13, A-14: the contract's caps per advancer (D123: 50 000 JTM each; read on the bridge at start,
+/// [`check_bridge_caps`]).
+pub const ADVANCE_OUTSTANDING_CAP: u64 = 50_000_000_000;
+pub const ADVANCE_CAP_24H: u64 = 50_000_000_000;
 /// AB-1.
 pub const MAX_ADVANCE_BATCH: usize = 32;
 /// A5-11: the gas of a transaction, and of one order of `advanceBatch` on top of it (measured,
 /// `ADVANCER_INTERFACE.md` §10: 3 orders to fresh recipients, 293 340 gas in all, ≈ 97 780 an order
-/// with the transaction's 21 000 included; counted here on top of it).
+/// with the transaction's 21 000 included; D123 adds the advancer's outstanding slot, + 26 138 for the 3
+/// orders (forge): 319 478, ≈ 106 500 an order; counted here on top of the 21 000).
 pub const TX_BASE_GAS: u64 = 21_000;
-pub const BATCH_ORDER_GAS: u64 = 97_800;
-/// The default batch: 23 orders (`(21 000 + 23 × 97 800) × 1.25 = 2 838 000` gas under the default
-/// `max_gas` of 3 000 000, one order of room below [`batch_gas_bound`]'s 24).
-pub const DEFAULT_ADVANCE_BATCH: usize = 23;
+pub const BATCH_ORDER_GAS: u64 = 106_500;
+/// The default batch: 22 orders (`(21 000 + 22 × 106 500) × 1.25 = 2 955 000` gas under the default
+/// `max_gas` of 3 000 000, [`batch_gas_bound`]'s 22).
+pub const DEFAULT_ADVANCE_BATCH: usize = 22;
 /// The floors no configuration lowers: the nodes' finality (8 blocks), two nodes.
 pub const CONFIRMATIONS_FLOOR: u64 = 8;
 pub const MIN_NODES_FLOOR: usize = 2;
@@ -192,18 +195,23 @@ pub struct FillParams {
     pub max_ahead_secs: u64,
     /// A node's read older than this does not count.
     pub max_source_age: u64,
-    /// Above this amount, wait `grace_secs` after the confirmation (D72: 250 JTM, 10 min).
+    /// Above this amount, wait `grace_secs` after the confirmation (D72: 250 JTM, 10 min; D123: the tranche now
+    /// reaches the largest deposit, 50 000 JTM).
     pub grace_from: u64,
     pub grace_secs: u64,
-    /// At most `hour_cap` advanced over `hour_window`; more (up to 1 000 JTM) only when that window is empty.
+    /// At most `hour_cap` advanced over `hour_window`; more (up to `SLOW_PER_DEPOSIT`) only when that window is
+    /// empty.
     pub hour_cap: u64,
     pub hour_window: u64,
     /// At most `recipient_cap` to one recipient over `recipient_window`.
     pub recipient_cap: u64,
     pub recipient_window: u64,
-    /// Outstanding (advanced, not repaid) at most this (≤ the contract's 3 000 JTM).
+    /// Outstanding (advanced, not repaid) at most this: ≤ `max_stock` (D123: the advances in flight within the
+    /// stock), ≤ the contract's 50 000 JTM.
     pub outstanding_cap: u64,
     /// The hot key's stock cap: at start, a balance above it refuses to start; at every step, it pauses (N9).
+    /// D123: wJTM of the stock count under the contract's 50 000 JTM ceiling, so the default keeps 40 000 of it
+    /// for the mints.
     pub max_stock: u64,
     /// The smallest advance, and the gas floor: an advance is at least `gas_multiple` × its gas cost.
     pub min_advance: u64,
@@ -246,12 +254,14 @@ impl Default for FillParams {
             max_source_age: 300,
             grace_from: 250_000_000,
             grace_secs: 600,
-            hour_cap: 600_000_000,
+            // D123: half the stock an hour (600 of 1 200 before), one stock per recipient per 24 h (1 000 before,
+            // the largest deposit then), the advances in flight within the stock of 10 000 JTM
+            hour_cap: 5_000_000_000,
             hour_window: 3_600,
-            recipient_cap: 1_000_000_000,
+            recipient_cap: 10_000_000_000,
             recipient_window: 86_400,
-            outstanding_cap: ADVANCE_OUTSTANDING_CAP,
-            max_stock: 1_200_000_000,
+            outstanding_cap: 10_000_000_000,
+            max_stock: 10_000_000_000,
             min_advance: 5_000_000,
             gas_multiple: 20,
             fee_bps: 75,
@@ -304,6 +314,13 @@ impl FillParams {
         anyhow::ensure!(
             (1..=ADVANCE_OUTSTANDING_CAP).contains(&self.max_stock),
             "max_stock {} outside 1..={ADVANCE_OUTSTANDING_CAP} (the hot key holds a capped stock)",
+            self.max_stock
+        );
+        // D123: « avances en cours ≤ ce que le robot a en stock »
+        anyhow::ensure!(
+            self.outstanding_cap <= self.max_stock,
+            "outstanding_cap {} is above max_stock {} (D123: the advances in flight stay within the stock)",
+            self.outstanding_cap,
             self.max_stock
         );
         anyhow::ensure!((1..=MAX_ADVANCE_BATCH).contains(&self.batch_max), "batch_max {} outside 1..={MAX_ADVANCE_BATCH}", self.batch_max);
@@ -392,6 +409,20 @@ fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_o
         if !pow_ok(c.header_at(h).ok_or("NOT_CONFIRMED")?) {
             return Err("BAD_PROOF_OF_WORK");
         }
+    }
+    Ok(())
+}
+
+/// D123: the bridge's per-deposit cap and the caps of its advancers (`SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()`,
+/// `ADVANCE_CAP_24H()`, read at start) are this robot's mirrors, or jg-fill does not start (a robot built for other
+/// caps would plan its queue against caps the contract does not have).
+pub fn check_bridge_caps(slow_per_deposit: u64, advance_outstanding_cap: u64, advance_cap_24h: u64) -> anyhow::Result<()> {
+    for (name, read, ours) in [
+        ("SLOW_PER_DEPOSIT", slow_per_deposit, SLOW_PER_DEPOSIT),
+        ("ADVANCE_OUTSTANDING_CAP", advance_outstanding_cap, ADVANCE_OUTSTANDING_CAP),
+        ("ADVANCE_CAP_24H", advance_cap_24h, ADVANCE_CAP_24H),
+    ] {
+        anyhow::ensure!(read == ours, "the bridge's {name}() is {read} µJTM, not {ours}: jg-fill does not start (it plans against these caps)");
     }
     Ok(())
 }
@@ -1004,7 +1035,7 @@ impl Ledger {
     }
 }
 
-/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with.
+/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with (D123: 50 000 JTM).
 pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         read == OUTSTANDING_CEIL,
@@ -1198,7 +1229,7 @@ pub struct FillConfig {
     pub refund_to: String,
     /// The price of 1 JTM in wei (decimal), for the gas floor of an advance.
     pub wei_per_jtm: String,
-    /// The gas of one advance (measured: 141 974 the first, 122 120 the next).
+    /// The gas of one advance (measured: 141 974 the first, 122 120 the next; D123: ≈ 166 000 the first).
     #[serde(default = "default_advance_gas")]
     pub advance_gas: u64,
     pub state_dir: PathBuf,
@@ -1239,8 +1270,10 @@ impl FillConfig {
     }
 }
 
+/// The gas of one advance, for the gas floor (measured 141 974 the first of an address; D123 adds its outstanding
+/// slot, + 24 200 at the first: ≈ 166 000).
 fn default_advance_gas() -> u64 {
-    142_000
+    166_000
 }
 
 fn default_poll() -> u64 {

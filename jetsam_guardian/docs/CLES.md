@@ -140,11 +140,12 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
   host's swap must be off or encrypted. Started by `ops/jg-start fill|relay` only (SHA-256 of the binary and of
   the configuration in `allowed.sha256`, one instance, PID file); `jg-fill` also holds a `flock` on its
   `state_dir` and refuses a `fill.toml` that is not 0600/0400 and owned by its uid (it names `refund_to`).
-- **Stock** (robot): wJTM balance of the hot key ≤ `max_stock` (1 200 JTM by default), checked at start (no
+- **Stock** (robot): wJTM balance of the hot key ≤ `max_stock` (10 000 JTM by default since D123), checked at start (no
   start above it) and at every step (N9: above it, `PAUSE_STOCK_ABOVE_CAP` and an ALERT, nothing advanced until
   the excess is moved to `refund_to`; anyone can push the hot key over its cap by sending it wJTM — a gift that
-  pauses the robot until the operator moves it); the contract adds 3 000 JTM outstanding and 2 500 JTM / 24 h per
-  advancer. **The maximum loss per incident is the hot key's stock.** Repayments go to `refund_to`, a cold address
+  pauses the robot until the operator moves it); its own advances in flight stay within it (`outstanding_cap ≤
+  max_stock`, D123), under the contract's 50 000 JTM outstanding and 50 000 JTM / 24 h per advancer. **The maximum
+  loss per incident is the hot key's stock.** Repayments go to `refund_to`, a cold address
   other than the hot key.
 - **Fee of an advance** (A5-1, contract revised: `ADVANCE_MIN_AGE` = `D_SLOW` = 24 h): an advance less than 24 h
   old at the mint of its deposit is repaid what it paid only, its fee going to the recipient. An advance made before
@@ -164,7 +165,7 @@ risk is bounded by the **stock** of the robot and by the gas of the relayer's ac
 ## Loss per incident (decision 11 of the audit A5)
 
 What is said publicly: **the maximum loss per incident is the robot's stock (`max_stock`)**. The contract's
-per-advancer outstanding cap (`ADVANCE_OUTSTANDING_CAP`, 3 000 JTM) is a circuit breaker against a faulty
+per-advancer outstanding cap (`ADVANCE_OUTSTANDING_CAP`, 50 000 JTM since D123) is a circuit breaker against a faulty
 robot, not a property of the system; no figure is derived from a pool's dated share. The bridge assumes an
 honest majority of the mining (a majority can prove deposits that do not exist, A5-21).
 

@@ -277,7 +277,12 @@ fn a_deposit_is_between_the_minimum_and_the_maximum() {
     let rules = armed(9_600);
     let next = rules.deposits_from_height.unwrap() + 1;
     assert_eq!(MIN_DEPOSIT_MICRO, JTM);
-    assert_eq!(MAX_DEPOSIT_MICRO, 1_000 * JTM);
+    // D123: the bond, 50 000 JTM (the test chain keeps 1 000 below its caps height)
+    assert_eq!(MAX_DEPOSIT_MICRO, 50_000 * JTM);
+    let rules = VaultRules {
+        legacy: None,
+        ..rules
+    };
     assert_eq!(
         check_deposit(MIN_DEPOSIT_MICRO, &RECIPIENT, next, &rules),
         Ok(())
@@ -388,4 +393,36 @@ fn the_messages_say_base_evm_only() {
     }
     assert!(texts[0].contains("Base/EVM"));
     assert!(texts[4].contains("not armed"));
+}
+
+/// D123: the largest deposit a refusal names is the next block's: on a chain raising its caps at `c` (the test
+/// chain), 1 000 JTM below `c`, 50 000 JTM from `c` on.
+#[test]
+fn d123_a_deposit_is_checked_against_the_maximum_of_the_next_block() {
+    use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+    let f = armed(9_600).deposits_from_height.unwrap();
+    let c = f + 100;
+    let rules = VaultRules {
+        legacy: Some(LegacyVaultCaps {
+            raised_at: Some(c),
+            ..TESTNET_LEGACY_VAULT_CAPS
+        }),
+        ..armed(9_600)
+    };
+    assert_eq!(check_deposit(1_000 * JTM, &RECIPIENT, c - 1, &rules), Ok(()));
+    assert_eq!(
+        check_deposit(1_000 * JTM + 1, &RECIPIENT, c - 1, &rules),
+        Err(DepositRefusal::AboveMaximum {
+            amount: 1_000 * JTM + 1,
+            maximum: 1_000 * JTM
+        })
+    );
+    assert_eq!(check_deposit(50_000 * JTM, &RECIPIENT, c, &rules), Ok(()));
+    assert_eq!(
+        check_deposit(50_000 * JTM + 1, &RECIPIENT, c, &rules),
+        Err(DepositRefusal::AboveMaximum {
+            amount: 50_000 * JTM + 1,
+            maximum: 50_000 * JTM
+        })
+    );
 }

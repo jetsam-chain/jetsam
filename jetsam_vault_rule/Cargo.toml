@@ -10,7 +10,8 @@ description = "V4, the deposit rule of the v1.7 bridge vault (V4-0, V4-a..V4-e, 
 # The private rehearsal clock (F_R = J_R + 32), enabled by `jetsam_chain/rehearsal-v1-7`.
 rehearsal-v1-7 = []
 # The test chain's profile, enabled by `jetsam_chain/testnet`. Its bridge opens `TESTNET_OPENING_DELAY` = 544
-# blocks after its J instead of 1 440 (D104: F = 8 704); the rest of V4 is the public one's. It also carries the
+# blocks after its J instead of 1 440 (D104: F = 8 704), and keeps its largest deposit of before D123 (1 000 JTM)
+# below `TESTNET_CAPS_HEIGHT` (not chosen: every height); the rest of V4 is the public one's. It also carries the
 # node's profile to the proof program of the same build (`TESTNET_PROFILE`), so that a build naming
 # `jetsam_chain/testnet` alone has the test chain's program.
 testnet = []
