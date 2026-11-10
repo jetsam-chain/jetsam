@@ -47,6 +47,12 @@ pub enum SubmitError {
     #[error("invalid auth authorization: {0}")]
     InvalidProof(String),
 
+    /// M-1 (audit 2026-11-10): the template builder never places this group
+    /// (`group_fits_an_empty_template`), so no block of this node would carry
+    /// it. Policy, not consensus: an older node relays such a group.
+    #[error("no block template carries this transaction: {0}")]
+    NoTemplateCarries(String),
+
     /// Internal error (lock poisoned, channel closed, etc).
     #[error("internal: {0}")]
     Internal(String),
@@ -83,6 +89,7 @@ impl SubmitError {
                 | SubmitError::Consensus(ConsensusError::SlotConflict)
                 | SubmitError::GuardianRateLimited { .. }
                 | SubmitError::GuardianNotHeld(_)
+                | SubmitError::NoTemplateCarries(_)
                 | SubmitError::Consensus(ConsensusError::DestinationBlock(
                     DestinationBlockError::CommitteeKeysUnavailable { .. }
                         | DestinationBlockError::NoCommitteeKnown

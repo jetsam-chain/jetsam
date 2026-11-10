@@ -327,7 +327,7 @@ fn the_zero_recipient_is_refused() {
 #[test]
 fn the_automatic_fee_pays_any_deposit_of_one_input_page() {
     for (active, log_slots) in [(1_055u64, 24u32), (40_000, 24), (3_000_000, 26)] {
-        let fee = deposit_fee(active, log_slots, 0);
+        let fee = deposit_fee(active, log_slots, jetsam_mempool::RelayFloor::default());
         for inputs in 1..=TX_INPUTS as u64 {
             for outputs in [2u64, 3] {
                 let minimum = fee_breakdown(inputs, outputs, active, log_slots).required_total;
@@ -337,9 +337,14 @@ fn the_automatic_fee_pays_any_deposit_of_one_input_page() {
                 );
             }
         }
+        // M-1: the floor is a rate; the deposit pays it for its heaviest shape.
+        let floor = jetsam_mempool::RelayFloor { rate: fee };
         assert_eq!(
-            deposit_fee(active, log_slots, fee + 1),
-            fee + 1,
+            deposit_fee(active, log_slots, floor),
+            (1..=TX_INPUTS as u64)
+                .map(|inputs| floor.required(inputs, DEPOSIT_OUTPUTS_WITH_CHANGE))
+                .max()
+                .unwrap(),
             "the relay floor"
         );
     }

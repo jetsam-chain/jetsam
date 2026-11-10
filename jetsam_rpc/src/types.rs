@@ -846,7 +846,9 @@ pub struct MempoolTxInfo {
 pub struct MempoolInfo {
     /// Number of pending transactions.
     pub size: usize,
-    /// Current dynamic fee floor in μJTM.
+    /// Current dynamic fee floor in μJTM of a transaction with one input and
+    /// one output; a larger one is asked the floor's rate times its weight
+    /// (`estimateFeeDetailed` gives it for any shape).
     pub fee_floor: u64,
     /// All pending transactions.
     pub txs: Vec<MempoolTxInfo>,

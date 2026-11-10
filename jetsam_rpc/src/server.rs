@@ -1597,7 +1597,7 @@ impl RpcHandler {
             .deposits_from_height
             .ok_or_else(|| rpc_err("deposit refused: the bridge is not armed in this build"))?;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self.mempool.relay_floor().await;
         let fee = fee_micro_jtm.unwrap_or_else(|| deposit_fee(active_slot_count, log_slots, floor));
         let total_micro_jtm = amount_micro_jtm
             .checked_add(fee)
@@ -2817,11 +2817,11 @@ impl JetsamApiServer for RpcHandler {
 
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self.mempool.relay_floor().await;
         Ok(
             jetsam_chain::consensus::fee_breakdown(1, n_outputs as u64, active_slot_count, log_slots)
                 .required_total
-                .max(floor),
+                .max(floor.required(1, n_outputs as u64)),
         )
     }
 
@@ -2830,7 +2830,11 @@ impl JetsamApiServer for RpcHandler {
         let n_outputs = n_outputs as usize;
         validate_tx_counts(n_inputs, n_outputs)?;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self
+            .mempool
+            .relay_floor()
+            .await
+            .required(n_inputs as u64, n_outputs as u64);
         let breakdown = jetsam_chain::consensus::fee_breakdown(
             n_inputs as u64,
             n_outputs as u64,
@@ -4373,7 +4377,7 @@ impl JetsamApiServer for RpcHandler {
         self.reload_active_wallet().await?;
         let _to_address = parse_address_param(&to_address)?.0;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self.mempool.relay_floor().await;
         self.wallet
             .plan_send(
                 amount_micro_jtm,
@@ -4400,7 +4404,7 @@ impl JetsamApiServer for RpcHandler {
         let to_address = parse_address_param(&to_address)?.0;
 
         let (fee_active_slot_count, fee_log_slots) = self.mempool.fee_context().await;
-        let fee_floor = self.mempool.fee_floor().await;
+        let fee_floor = self.mempool.relay_floor().await;
         let plan = self
             .wallet
             .plan_send(
@@ -4436,7 +4440,7 @@ impl JetsamApiServer for RpcHandler {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let relay_floor = self.mempool.fee_floor().await;
+        let relay_floor = self.mempool.relay_floor().await;
         self.wallet
             .plan_consolidation(
                 WALLET_CONSOLIDATION_INPUT_LIMIT,
@@ -4461,7 +4465,7 @@ impl JetsamApiServer for RpcHandler {
             .ok_or_else(|| rpc_err("wallet not initialized"))?;
         let active_address = parse_address_param(&active_address)?.0;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let relay_floor = self.mempool.fee_floor().await;
+        let relay_floor = self.mempool.relay_floor().await;
         let plan = self
             .wallet
             .plan_consolidation(
@@ -4590,7 +4594,7 @@ impl JetsamApiServer for RpcHandler {
 
         Ok(MempoolInfo {
             size: txs.len(),
-            fee_floor: snapshot.fee_floor,
+            fee_floor: snapshot.fee_floor.required(1, 1),
             txs,
         })
     }
@@ -4602,7 +4606,7 @@ impl JetsamApiServer for RpcHandler {
             capacity: usage.capacity,
             intent_bytes: usage.intent_bytes as u64,
             max_intent_bytes: usage.max_intent_bytes as u64,
-            fee_floor: usage.fee_floor,
+            fee_floor: usage.fee_floor.required(1, 1),
         })
     }
 }

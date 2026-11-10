@@ -248,9 +248,13 @@ pub fn check_deposit(
 }
 
 /// The fee of a deposit when none is given: the consensus minimum of a
-/// deposit group of one input page (1 to 8 inputs) with its change, the most
-/// of them, and at least the relay floor.
-pub fn deposit_fee(active_slot_count: u64, log_slots: u32, relay_floor: u64) -> u64 {
+/// deposit group of one input page (1 to 8 inputs) with its change, and at
+/// least the relay floor of that shape, the most of them.
+pub fn deposit_fee(
+    active_slot_count: u64,
+    log_slots: u32,
+    relay_floor: jetsam_mempool::RelayFloor,
+) -> u64 {
     (1..=jetsam_tx::TX_INPUTS as u64)
         .map(|inputs| {
             fee_breakdown(
@@ -260,10 +264,10 @@ pub fn deposit_fee(active_slot_count: u64, log_slots: u32, relay_floor: u64) -> 
                 log_slots,
             )
             .required_total
+            .max(relay_floor.required(inputs, DEPOSIT_OUTPUTS_WITH_CHANGE))
         })
         .max()
         .unwrap_or(0)
-        .max(relay_floor)
 }
 
 /// `walletPlanBridgeDeposit`: what `walletBridgeDeposit` builds now, with
