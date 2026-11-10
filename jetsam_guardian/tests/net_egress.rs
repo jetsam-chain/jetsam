@@ -720,8 +720,15 @@ fn chain_answer() -> Answer {
 fn jg_aggregate_reaches_its_l1_and_robot_through_the_socks_port_only() {
     let (socks, seen) = fake_tor(chain_answer());
     let (c, r) = (onion('c'), onion('r'));
+    // R-1 (audit 2026-11-10): the robot's wallet answers only to its cookie.
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cookie.path(), "robot-cookie\n").unwrap();
     let (_root, dir) = aggregator(
-        &format!("l1_rpc = \"http://{c}:8545\"\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://{r}:19751\"", hex::encode(BRIDGE)),
+        &format!(
+            "l1_rpc = \"http://{c}:8545\"\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://{r}:19751\"\nrobot_cookie = \"{}\"",
+            hex::encode(BRIDGE),
+            cookie.path().display()
+        ),
         &format!("[egress]\ntor_socks = \"127.0.0.1:{socks}\""),
     );
     let log = std::fs::File::create(dir.join("agg.log")).unwrap();
@@ -801,6 +808,122 @@ fn jg_aggregate_rehearsal_clearnet_reaches_its_loopback_l1_and_robot_directly() 
     stop(agg);
     let log = std::fs::read_to_string(dir.join("agg.log")).unwrap_or_default();
     assert!(both, "log:\n{log}");
+}
+
+/// A plain HTTP JSON-RPC robot on 127.0.0.1 that records each call's method
+/// and `Authorization` header; `on_wallet` runs after each wallet call.
+type SeenAuth = Arc<Mutex<Vec<(String, Option<String>)>>>;
+fn fake_robot(on_wallet: Arc<dyn Fn() + Send + Sync>) -> (u16, SeenAuth) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: SeenAuth = Arc::default();
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { continue };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let (head, body) = loop {
+                let Ok(n) = s.read(&mut buf) else { break (String::new(), Vec::new()) };
+                if n == 0 {
+                    break (String::new(), Vec::new());
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&raw[..i]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                    .unwrap_or(0);
+                while raw.len() < i + 4 + len {
+                    let Ok(n) = s.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                break (head, raw[i + 4..(i + 4 + len).min(raw.len())].to_vec());
+            };
+            let Ok(req) = serde_json::from_slice::<Value>(&body) else { continue };
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            let auth = head.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization").then(|| value.trim().to_string())
+            });
+            seen2.lock().unwrap().push((method.clone(), auth));
+            let answer = chain_answer()(&method, &req["params"]);
+            write_rpc(&mut s, answer);
+            if method.starts_with("jetsam_wallet") {
+                on_wallet();
+            }
+        }
+    });
+    (port, seen)
+}
+
+/// The rehearsal aggregator's lines for a loopback robot on `robot`, plus `tail`.
+fn robot_lines(robot: u16, tail: &str) -> String {
+    format!(
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://127.0.0.1:{robot}\"\n{tail}",
+        hex::encode(jetsam_guardian::TESTNET_NETWORK),
+        hex::encode(REHEARSAL_BRIDGE)
+    )
+}
+
+fn run_aggregator(dir: &Path, until: impl FnMut() -> bool) -> (bool, String) {
+    let log = std::fs::File::create(dir.join("agg.log")).unwrap();
+    let agg = Command::new(env!("CARGO_BIN_EXE_jg-aggregate")).arg("--config").arg(dir.join("agg.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let done = wait_for(60, until);
+    stop(agg);
+    (done, std::fs::read_to_string(dir.join("agg.log")).unwrap_or_default())
+}
+
+/// R-1 (audit 2026-11-10): `walletBuildGuardianPayment` spends the robot
+/// node's wallet, which answers only to that node's RPC cookie. `robot_cookie`
+/// names the cookie file; it is read again at every wallet call (the node
+/// writes a new one at each start: here it "restarts" after the first call),
+/// and sent to the wallet calls only.
+#[test]
+fn jg_aggregate_pays_through_the_robot_with_its_cookie_read_at_every_call() {
+    let cookie_dir = tempfile::tempdir().unwrap();
+    let cookie = cookie_dir.path().join("rpc.cookie");
+    std::fs::write(&cookie, "first-cookie\n").unwrap();
+    let rewrite = cookie.clone();
+    let (robot, seen) = fake_robot(Arc::new(move || {
+        let _ = std::fs::write(&rewrite, "second-cookie\n");
+    }));
+    let (_root, dir) = aggregator(&robot_lines(robot, &format!("robot_cookie = \"{}\"", cookie.display())), CLEARNET);
+    let wallet_calls = |seen: &SeenAuth| -> Vec<Option<String>> {
+        seen.lock().unwrap().iter().filter(|(m, _)| m == "jetsam_walletBuildGuardianPayment").map(|(_, a)| a.clone()).collect()
+    };
+    let (both, log) = run_aggregator(&dir, || wallet_calls(&seen).len() >= 2);
+    assert!(both, "{:?}; log:\n{log}", seen.lock().unwrap());
+    let calls = wallet_calls(&seen);
+    assert_eq!(calls[0].as_deref(), Some("Bearer first-cookie"), "{calls:?}");
+    assert_eq!(calls[1].as_deref(), Some("Bearer second-cookie"), "read again at every call: {calls:?}");
+    let others: Vec<_> = seen.lock().unwrap().iter().filter(|(m, _)| !m.starts_with("jetsam_wallet")).cloned().collect();
+    assert!(!others.is_empty() && others.iter().all(|(_, a)| a.is_none()), "the cookie goes to wallet calls only: {others:?}");
+}
+
+/// R-1: without a readable cookie the aggregator says why, names
+/// `robot_cookie`, and never offers the robot an unauthenticated wallet call.
+#[test]
+fn jg_aggregate_says_why_without_a_readable_robot_cookie() {
+    let missing = tempfile::tempdir().unwrap().path().join("rpc.cookie");
+    for (label, tail, want) in [
+        ("no robot_cookie", String::new(), "robot_cookie is not configured".to_string()),
+        ("an unreadable robot_cookie", format!("robot_cookie = \"{}\"", missing.display()), format!("robot_cookie {}", missing.display())),
+    ] {
+        let (robot, seen) = fake_robot(Arc::new(|| {}));
+        let (_root, dir) = aggregator(&robot_lines(robot, &tail), CLEARNET);
+        let events = |d: &Path| std::fs::read_to_string(d.join("events.jsonl")).unwrap_or_default();
+        let (refused, log) = run_aggregator(&dir, || events(&dir).contains("attestation_refused") && events(&dir).contains("equivocation_jetsam"));
+        let events = events(&dir);
+        assert!(refused, "{label}: {events}; log:\n{log}");
+        assert!(events.contains(&want), "{label}: the why names it: {events}");
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().all(|(m, _)| !m.starts_with("jetsam_wallet")), "{label}: no wallet call without the cookie: {seen:?}");
+    }
 }
 
 // ---------------------------------------------------------------- jg-fill (D72): the advance robot

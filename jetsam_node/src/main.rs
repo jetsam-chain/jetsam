@@ -1756,13 +1756,31 @@ struct Cli {
     /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
     ///
     /// When set, external callers must include `Authorization: Bearer <TOKEN>` in
-    /// HTTP requests to use the mining methods. Without this flag the mining API
-    /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
+    /// HTTP requests to use the mining methods and the read methods. Without this
+    /// flag the mining API only accepts connections from 127.0.0.1 (enforced by
+    /// --rpc-listen default).
+    ///
+    /// The token never opens the wallet methods, `stop` nor `registerClient`:
+    /// those answer only to the RPC cookie this node writes at every start in
+    /// `rpc.cookie` of its data directory, readable by its user only
+    /// (`Authorization: Bearer <cookie>`; jetsam-cli reads it by itself). A
+    /// pool's miners given the token can mine and read, not spend.
+    ///
+    /// Also read from the JETSAM_MINING_KEY environment variable (its value is
+    /// never shown): the command line of a process is readable by every local
+    /// user, its environment by its own user only. Given both, --mining-key
+    /// wins.
     ///
     /// Pool example:
     ///   jetsam --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
-    ///   # External miner: Authorization: Bearer s3cr3t
-    #[arg(long, value_name = "TOKEN")]
+    ///   # External miner: Authorization: Bearer s3cr3t (mining and reads)
+    ///   # Payouts, on this machine: Authorization: Bearer <contents of rpc.cookie>
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        env = "JETSAM_MINING_KEY",
+        hide_env_values = true
+    )]
     mining_key: Option<String>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
@@ -2011,6 +2029,69 @@ fn embedded_dns_seeds<'a>(
         return &[];
     }
     seeds
+}
+
+#[cfg(test)]
+mod rpc_access_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    fn long_help(id: &str) -> String {
+        Cli::command()
+            .get_arguments()
+            .find(|arg| arg.get_id() == id)
+            .and_then(|arg| arg.get_long_help())
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    /// R-2 (audit 2026-11-10): the help told pool operators to hand the
+    /// mining key to their external miners while the key opened every method,
+    /// `walletSend` and `stop` included. It says what the key opens now, and
+    /// that the wallet and `stop` answer only to the cookie.
+    /// R-1 (audit 2026-11-10): the key can come from `JETSAM_MINING_KEY`,
+    /// out of the command line every local user reads in /proc/<pid>/cmdline;
+    /// given both, the command line wins; the help names the variable and never
+    /// shows its value; `--allow-custom-coinbase` is satisfied by it.
+    #[test]
+    fn the_mining_key_is_read_from_the_environment_and_never_shown() {
+        use clap::Parser;
+        std::env::set_var("JETSAM_MINING_KEY", "from-the-environment-0123");
+        let from_env = Cli::try_parse_from(["jetsam", "--mode", "extminer"]);
+        let both = Cli::try_parse_from([
+            "jetsam",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "from-the-command-line",
+        ]);
+        let custom =
+            Cli::try_parse_from(["jetsam", "--mode", "extminer", "--allow-custom-coinbase"]);
+        let help = Cli::command().render_long_help().to_string();
+        std::env::remove_var("JETSAM_MINING_KEY");
+        assert_eq!(
+            from_env.unwrap().mining_key.as_deref(),
+            Some("from-the-environment-0123")
+        );
+        assert_eq!(
+            both.unwrap().mining_key.as_deref(),
+            Some("from-the-command-line"),
+            "the command line wins"
+        );
+        assert!(custom.is_ok(), "{:?}", custom.err());
+        assert!(help.contains("JETSAM_MINING_KEY"), "{help}");
+        assert!(
+            !help.contains("from-the-environment-0123"),
+            "the help never shows the key"
+        );
+    }
+
+    #[test]
+    fn the_mining_key_help_never_hands_out_the_wallet() {
+        let help = long_help("mining_key");
+        assert!(help.contains("rpc.cookie"), "{help}");
+        assert!(help.contains("never opens the wallet methods"), "{help}");
+    }
 }
 
 #[cfg(test)]
@@ -2996,7 +3077,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Mode validation ---
     if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
-        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+        anyhow::bail!("--mode extminer requires --mining-key <TOKEN> (or JETSAM_MINING_KEY)");
     }
     if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
         tracing::warn!(
@@ -3136,15 +3217,17 @@ async fn main() -> anyhow::Result<()> {
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
 
     // An RPC endpoint reachable from outside this machine, with no bearer, is
-    // the wallet handed to whoever finds the port: `walletSend` needs no other
-    // secret. The node still starts — an operator may be fronting it with their
-    // own authentication — but it says so, loudly, every time.
+    // this node's reads and mining API handed to whoever finds the port (the
+    // wallet methods and `stop` answer only to the RPC cookie, R-1). The node
+    // still starts — an operator may be fronting it with their own
+    // authentication — but it says so, loudly, every time.
     if !rpc_listen.ip().is_loopback() && cli.mining_key.is_none() {
         tracing::warn!(
             listen = %rpc_listen,
             "the JSON-RPC endpoint is reachable beyond this machine and has no \
-             --mining-key: anyone who can reach it can spend this wallet and stop \
-             this node. Bind 127.0.0.1, or set --mining-key."
+             --mining-key: anyone who can reach it can read it and use its mining \
+             API (the wallet methods and stop still need the RPC cookie). Bind \
+             127.0.0.1, or set --mining-key."
         );
     }
 
@@ -3719,6 +3802,18 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // R-1 (audit 2026-11-10): what the wallet methods, `stop` and
+    // `registerClient` answer to; new at every start, this user's only.
+    let rpc_cookie = jetsam_node::rpc_cookie::write_new(&data_dir).with_context(|| {
+        format!(
+            "write the RPC cookie {}",
+            jetsam_node::rpc_cookie::path_in(&data_dir).display()
+        )
+    })?;
+    tracing::info!(
+        path = %jetsam_node::rpc_cookie::path_in(&data_dir).display(),
+        "RPC cookie written: the wallet methods and stop answer only to it"
+    );
     let (rpc_handle, rpc_stop_rx) = start_rpc_server(
         rpc_listen,
         chain.clone(),
@@ -3747,6 +3842,7 @@ async fn main() -> anyhow::Result<()> {
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
         cli.mining_key,
+        rpc_cookie,
         cli.allow_custom_coinbase,
         rpc_listen.ip().is_loopback(),
         client_objects.clone().map(|objects| {

@@ -398,6 +398,8 @@ pub struct WalletInputLimitExceeded {
 
 /// The template id was never issued by this node, or has been purged.
 pub const ERR_TEMPLATE_UNKNOWN: i32 = -32020;
+/// R-1 (audit 2026-11-10): the method needs the node's RPC cookie.
+pub const ERR_RPC_COOKIE_REQUIRED: i32 = -32030;
 /// The template existed and its lifetime ran out. Fetch a new one.
 pub const ERR_TEMPLATE_EXPIRED: i32 = -32021;
 /// Another submission already claimed this template. The race was lost; the
@@ -846,7 +848,9 @@ pub struct MempoolTxInfo {
 pub struct MempoolInfo {
     /// Number of pending transactions.
     pub size: usize,
-    /// Current dynamic fee floor in μJTM.
+    /// Current dynamic fee floor in μJTM of a transaction with one input and
+    /// one output; a larger one is asked the floor's rate times its weight
+    /// (`estimateFeeDetailed` gives it for any shape).
     pub fee_floor: u64,
     /// All pending transactions.
     pub txs: Vec<MempoolTxInfo>,
