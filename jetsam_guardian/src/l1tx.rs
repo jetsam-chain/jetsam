@@ -220,9 +220,11 @@ pub struct FeePolicy {
 impl Default for FeePolicy {
     fn default() -> Self {
         // 25 %: `advanceBatch` and `claimDeposit` vary with fresh storage slots and recipients; the estimate
-        // is taken on the pending block, the margin covers the state moving before inclusion. A tip of 10 gwei at
-        // most (A5-13).
-        Self { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 200_000_000_000, priority_fee: None, max_priority_fee_per_gas: 10_000_000_000 }
+        // is taken on the pending block, the margin covers the state moving before inclusion. A tip of 0.1 gwei at
+        // most (A5-13; E-9, adapted to Base: over 1 024 blocks on 10/11/2026 Base's tips were p50 ≈ 0.0012 gwei,
+        // p99 0.03 gwei, Base Sepolia's p90 0.001 gwei, the base fee 0.005 gwei on both: 100 × the deployed tip of
+        // 1e6 wei, 3 × Base's p99; it was 10 gwei, ≈ 10 000 × the deployed tip).
+        Self { gas_margin_pct: 25, max_gas: 3_000_000, max_fee_per_gas: 200_000_000_000, priority_fee: None, max_priority_fee_per_gas: 100_000_000 }
     }
 }
 
@@ -331,6 +333,39 @@ pub struct Sender {
     /// zero-value transfer to the key itself, fees raised) instead of being sent again: what was decided before the
     /// stop may no longer hold (`jg-fill`'s advances: `fill::CANCEL_AT_RECOVERY`). Empty: every one is sent again.
     pub cancel_at_recovery: Vec<String>,
+    /// E-9 (audit 2026-11-10): the gas this key's transactions may use over any 24 h of the L1 clock (`None`: no budget).
+    /// A send whose gas limit would take the gas used in the last 24 h above it is refused before anything is signed
+    /// ([`GAS_BUDGET_ALERT`]); the gas of each mined one is kept in `gas.json` beside `pending.json`, across restarts.
+    pub gas_budget: Option<u64>,
+}
+
+/// E-9: the text of a send refused by the daily gas budget (an alert of the caller, never a revert).
+pub const GAS_BUDGET_ALERT: &str = "ALERT GAS_BUDGET";
+/// E-9: the window of the gas budget, L1 seconds.
+pub const GAS_BUDGET_WINDOW_SECS: u64 = 86_400;
+
+/// E-9: the gas used by a key's mined transactions, `(L1 time of its block, gas used)`, the last 24 h.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GasBook {
+    pub used: Vec<(u64, u64)>,
+}
+
+impl GasBook {
+    /// The gas used in the [`GAS_BUDGET_WINDOW_SECS`] before `now`.
+    pub fn spent(&self, now: u64) -> u64 {
+        self.used.iter().filter(|(t, _)| t.saturating_add(GAS_BUDGET_WINDOW_SECS) > now).map(|(_, g)| *g).fold(0, u64::saturating_add)
+    }
+
+    /// Whether a transaction of gas limit `gas` stays within `budget` now (inclusive).
+    pub fn admits(&self, now: u64, gas: u64, budget: u64) -> bool {
+        self.spent(now).saturating_add(gas) <= budget
+    }
+
+    /// One mined transaction, the entries out of the window of `now` dropped.
+    pub fn record(&mut self, t: u64, gas: u64, now: u64) {
+        self.used.retain(|(u, _)| u.saturating_add(GAS_BUDGET_WINDOW_SECS) > now);
+        self.used.push((t, gas));
+    }
 }
 
 fn hex0x(b: &[u8]) -> String {
@@ -354,7 +389,37 @@ impl Sender {
             replace_after: Duration::from_secs(180),
             receipt_timeout: Duration::from_secs(1_800),
             cancel_at_recovery: Vec::new(),
+            gas_budget: None,
         })
+    }
+
+    /// E-9: the same sender with a daily gas budget (`None`: none).
+    pub fn with_gas_budget(mut self, budget: Option<u64>) -> Self {
+        self.gas_budget = budget;
+        self
+    }
+
+    fn gas_book_path(&self) -> PathBuf {
+        self.pending_path.with_file_name("gas.json")
+    }
+
+    /// E-9: `gas.json` (absent: empty; unreadable: an error, nothing is sent).
+    pub fn gas_book(&self) -> anyhow::Result<GasBook> {
+        match std::fs::read_to_string(self.gas_book_path()) {
+            Ok(text) => Ok(serde_json::from_str(&text)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GasBook::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// E-9: the gas of a mined transaction of this key, kept (written and synced) when a budget is set.
+    fn record_gas(&self, r: &Receipt) -> anyhow::Result<()> {
+        if self.gas_budget.is_none() {
+            return Ok(());
+        }
+        let mut book = self.gas_book()?;
+        book.record(r.block_timestamp, r.gas_used, r.block_timestamp);
+        crate::write_atomic(&self.gas_book_path(), &serde_json::to_vec(&book)?)
     }
 
     pub fn address(&self) -> [u8; 20] {
@@ -434,6 +499,7 @@ impl Sender {
         let Some(p) = self.pending()? else { return Ok(Recovered::Nothing) };
         for (hash, _) in &p.sent {
             if let Some(r) = self.receipt_of(l1, hash)? {
+                self.record_gas(&r)?;
                 self.clear_pending()?;
                 return Ok(Recovered::Mined(r, p.label));
             }
@@ -487,6 +553,7 @@ impl Sender {
         loop {
             for (hash, _) in p.sent.iter().rev() {
                 if let Some(r) = self.receipt_of(l1, hash)? {
+                    self.record_gas(&r)?;
                     self.clear_pending()?;
                     return Ok(Some(r));
                 }
@@ -495,6 +562,7 @@ impl Sender {
                 // mined between the two reads: one more look at the versions before calling it dropped
                 for (hash, _) in p.sent.iter().rev() {
                     if let Some(r) = self.receipt_of(l1, hash)? {
+                        self.record_gas(&r)?;
                         self.clear_pending()?;
                         return Ok(Some(r));
                     }
@@ -560,6 +628,16 @@ impl Sender {
         let estimate = hex_u64(&l1.rpc("eth_estimateGas", json!([call, "pending"]))?)?;
         let gas_limit = self.policy.gas_limit(estimate)?;
         let latest = l1.rpc("eth_getBlockByNumber", json!(["latest", false]))?;
+        // E-9: within the daily gas budget, its whole gas limit counted, before anything is signed
+        if let Some(budget) = self.gas_budget {
+            let l1_now = hex_u64(&latest["timestamp"])?;
+            let book = self.gas_book()?;
+            anyhow::ensure!(
+                book.admits(l1_now, gas_limit, budget),
+                "{GAS_BUDGET_ALERT}: {label} may use {gas_limit} gas, {} used in the last 24 h of the L1 clock, daily_gas_budget {budget}: not sent",
+                book.spent(l1_now)
+            );
+        }
         let base = quantity(&latest["baseFeePerGas"]).unwrap_or(0);
         let tip = match self.policy.priority_fee {
             Some(p) => p,
@@ -608,10 +686,14 @@ pub struct SignerConfig {
     /// The priority fee, wei per gas. A5-13: required off the private rehearsal (the L1 endpoint's
     /// `eth_maxPriorityFeePerGas` is never taken there); absent on the rehearsal: the endpoint's.
     pub priority_fee_wei: Option<u64>,
-    /// A5-13: the cap of the priority fee, wei per gas (10 gwei by default), replacements included; a configured
+    /// A5-13: the cap of the priority fee, wei per gas (0.1 gwei by default, E-9), replacements included; a configured
     /// `priority_fee_wei` above it does not start.
     #[serde(default = "default_max_priority_fee")]
     pub max_priority_fee_wei: u64,
+    /// E-9: the gas this key's transactions may use over any 24 h of the L1 clock (`Sender::gas_budget`); absent: none
+    /// (jg-fill sets its default, `fill::DEFAULT_DAILY_GAS_BUDGET`).
+    #[serde(default)]
+    pub daily_gas_budget: Option<u64>,
 }
 
 fn default_margin() -> u64 {
@@ -689,7 +771,7 @@ impl SignerConfig {
                 if let Some(a) = address {
                     anyhow::ensure!(key.address() == a, "[signer] key_file is the key of 0x{}, not of the configured address 0x{}", hex::encode(key.address()), hex::encode(a));
                 }
-                Ok(L1Tx::Local(Sender::new(key, chain_id, self.policy(), state_dir)?))
+                Ok(L1Tx::Local(Sender::new(key, chain_id, self.policy(), state_dir)?.with_gas_budget(self.daily_gas_budget)))
             }
             "endpoint" => {
                 anyhow::ensure!(rehearsal, "[signer] mode = \"endpoint\" is refused on {profile}: an unlocked account on an L1 endpoint is the private rehearsal's only");

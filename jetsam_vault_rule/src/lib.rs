@@ -58,8 +58,10 @@ pub const VAULT_ADDRESS: [u8; 32] = [
 
 /// Smallest deposit (D19).
 pub const MIN_DEPOSIT_MICRO: u64 = MICRO_PER_JTM;
-/// Largest deposit: the L1 contract's per-deposit cap (D28): a larger one could never be minted.
-pub const MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
+/// Largest deposit: the L1 contract's per-deposit cap (D28): a larger one could never be minted. D123: the
+/// bridge's largest exposure is the operator's bond, 50 000 JTM (the contract's `SLOW_PER_DEPOSIT` and
+/// `MAX_BURN_AMOUNT`); the test chain keeps 1 000 JTM below its caps height ([`TESTNET_CAPS_HEIGHT`]).
+pub const MAX_DEPOSIT_MICRO: u64 = 50_000 * MICRO_PER_JTM;
 
 /// Blocks between J and the bridge opening `F` (D44): the public network opens ≈ 3 days after J.
 #[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
@@ -129,10 +131,54 @@ pub struct DepositRule {
     pub deposits_from_height: Option<u64>,
     pub vault: [u8; 32],
     pub min_deposit: u64,
+    /// The largest deposit, D123's ([`MAX_DEPOSIT_MICRO`]): read it with [`DepositRule::max_deposit_at`].
+    pub max_deposit: u64,
+    /// D123 on a chain that ran v1.7 under the cap of before (the test chain): that cap below its caps
+    /// height; `None` elsewhere (the public network and the rehearsal have D123's from J).
+    pub legacy: Option<LegacyDepositCap>,
+}
+
+/// D123 on a chain that ran v1.7 under the cap of before (the test chain, from J = 8 160): the largest
+/// deposit is `max_deposit` below `raised_at`, and at every height while `raised_at` is `None` (not chosen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyDepositCap {
+    pub raised_at: Option<u64>,
     pub max_deposit: u64,
 }
 
+/// D123 (10 November 2026): the test chain's caps height. From the block at this height on, the test chain
+/// judges its deposits, releases and vault under D123's caps (50 000 JTM, [`MAX_DEPOSIT_MICRO`] here, V6 and
+/// V8 in the node's vault gate); below it under the caps it ran v1.7 with since J = 8 160 (1 000 / 2 500 /
+/// 10 000 JTM): a hard fork of the test chain. **`None` until the operator chooses it at deployment**: while
+/// it is `None` a test node judges every block exactly as before. The node (`params::V1_7_TESTNET_CAPS_HEIGHT`)
+/// and the proof program (`jetsam_bridge_program::deposit`, its own `testnet` feature) both read this one
+/// constant. The public network and the rehearsal have no such height: D123's caps from their J.
+pub const TESTNET_CAPS_HEIGHT: Option<u64> = None;
+/// The test chain's largest deposit below its caps height (D28's 1 000 JTM, the contract's cap of before).
+pub const TESTNET_PRE_D123_MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
+/// The test chain's deposit cap of before D123, until [`TESTNET_CAPS_HEIGHT`].
+pub const TESTNET_LEGACY_DEPOSIT_CAP: LegacyDepositCap =
+    LegacyDepositCap { raised_at: TESTNET_CAPS_HEIGHT, max_deposit: TESTNET_PRE_D123_MAX_DEPOSIT_MICRO };
+
+/// Whether D123's caps govern the block at `height` of a chain that raises them at `raised_at` (`None`:
+/// not chosen, never).
+pub const fn d123_caps_at(raised_at: Option<u64>, height: u64) -> bool {
+    matches!(raised_at, Some(h) if height >= h)
+}
+
+const _: () = assert!(MIN_DEPOSIT_MICRO <= TESTNET_PRE_D123_MAX_DEPOSIT_MICRO);
+const _: () = assert!(TESTNET_PRE_D123_MAX_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO);
+
 impl DepositRule {
+    /// V4-c's largest deposit in the block at `height`: D123's, or the cap of before below the caps height of a
+    /// chain that carries one ([`LegacyDepositCap`]).
+    pub const fn max_deposit_at(&self, height: u64) -> u64 {
+        match self.legacy {
+            Some(legacy) if !d123_caps_at(legacy.raised_at, height) => legacy.max_deposit,
+            _ => self.max_deposit,
+        }
+    }
+
     /// The definitive rule (this build's constants) under the v1.7 clock `activation_height`.
     pub const fn for_activation(activation_height: Option<u64>) -> Self {
         Self {
@@ -141,6 +187,7 @@ impl DepositRule {
             vault: VAULT_ADDRESS,
             min_deposit: MIN_DEPOSIT_MICRO,
             max_deposit: MAX_DEPOSIT_MICRO,
+            legacy: if TESTNET_PROFILE { Some(TESTNET_LEGACY_DEPOSIT_CAP) } else { None },
         }
     }
 
@@ -271,8 +318,8 @@ pub fn deposit_shape(
             if marker[28..] != [0u8; 4] || recipient == [0u8; 20] {
                 return Err(RuleError::DepositShape { group });
             }
-            // V4-c.
-            if amount < rule.min_deposit || amount > rule.max_deposit {
+            // V4-c (D123: the largest deposit of the block's height).
+            if amount < rule.min_deposit || amount > rule.max_deposit_at(height) {
                 return Err(RuleError::DepositAmount { group, amount });
             }
             // V4-d.
@@ -377,8 +424,8 @@ pub fn block_deposits(
 
 /// Whether this build carries the node's test chain profile (`jetsam_chain/testnet`), the private rehearsal's
 /// excepted (its builds name it on both sides): the proof program built without a profile of its own follows it
-/// (`jetsam_bridge_program::rules::PRODUCTION`). V4 reads it for the test chain's bridge opening only
-/// ([`BRIDGE_OPENING_DELAY`]).
+/// (`jetsam_bridge_program::rules::PRODUCTION`). V4 reads it for the test chain's bridge opening
+/// ([`BRIDGE_OPENING_DELAY`]) and its deposit cap of before D123 ([`TESTNET_LEGACY_DEPOSIT_CAP`]).
 pub const TESTNET_PROFILE: bool = cfg!(all(feature = "testnet", not(feature = "rehearsal-v1-7")));
 
 /// The test chain's bridge opening delay (D104): `F = J + 544 = 8 160 + 544 = 8 704`, 544 = 17 x 32 blocks (≈ 27 h)

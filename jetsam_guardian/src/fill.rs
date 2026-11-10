@@ -15,8 +15,11 @@
 //!   block at that height stops everything (`witness`, SG-10's rule).
 //! * [`guard`]: halts (latched, restarted by hand only, D41) and pauses (while their cause lasts).
 //! * [`plan`]: the order of the queue (first in, first out by height then position, published), the grace
-//!   of 10 min above 250 JTM, the caps (600 JTM an hour, 1 000 JTM per recipient per 24 h, the contract's
-//!   2 500 JTM / 24 h and 3 000 JTM outstanding), the gas-indexed minimum, the stock.
+//!   of 10 min above 250 JTM, the caps (D123: 5 000 JTM an hour, 10 000 JTM per recipient per 24 h, an
+//!   outstanding within the stock of 10 000 JTM, under the contract's 50 000 JTM / 24 h and 50 000 JTM
+//!   outstanding), the gas-indexed minimum, the stock.
+//! * E-7 (audit 2026-11-10): every header a confirmation counts carries the target the nodes' difficulty rule
+//!   gives it ([`targets_ok`], from genesis), not only a proof of work against the target it declares.
 //! * [`DecisionJournal`]: every decision (why advanced, why refused), signed and chained, for the public page.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -36,27 +39,29 @@ use crate::observer::Branches;
 use crate::u256;
 use crate::witness::{witness, SourceView, WitnessRule};
 
-/// A-2 of the contract: an advance is of 1 to 1 000 JTM (µJTM).
+/// A-2 of the contract: an advance is of 1 to 50 000 JTM (µJTM; D123: `SLOW_PER_DEPOSIT`, the nodes' `MAX_DEPOSIT`).
 pub const ADVANCE_MIN_AMOUNT: u64 = 1_000_000;
-pub const SLOW_PER_DEPOSIT: u64 = 1_000_000_000;
+pub const SLOW_PER_DEPOSIT: u64 = 50_000_000_000;
 /// A-3.
 pub const MAX_FILL_FEE_BPS: u16 = 100;
 /// C-6 of the contract: it mints while `token().totalSupply() + amount ≤ OUTSTANDING_CEIL` (`OUTSTANDING_CEIL()`,
-/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start).
-pub const OUTSTANDING_CEIL: u64 = 10_000_000_000;
-/// A-13, A-14: the contract's caps per advancer.
-pub const ADVANCE_OUTSTANDING_CAP: u64 = 3_000_000_000;
-pub const ADVANCE_CAP_24H: u64 = 2_500_000_000;
+/// µwJTM, = the nodes' V8 ceiling; read on the bridge at start). D123: 50 000 JTM, the operator's bond.
+pub const OUTSTANDING_CEIL: u64 = 50_000_000_000;
+/// A-13, A-14: the contract's caps per advancer (D123: 50 000 JTM each; read on the bridge at start,
+/// [`check_bridge_caps`]).
+pub const ADVANCE_OUTSTANDING_CAP: u64 = 50_000_000_000;
+pub const ADVANCE_CAP_24H: u64 = 50_000_000_000;
 /// AB-1.
 pub const MAX_ADVANCE_BATCH: usize = 32;
 /// A5-11: the gas of a transaction, and of one order of `advanceBatch` on top of it (measured,
 /// `ADVANCER_INTERFACE.md` §10: 3 orders to fresh recipients, 293 340 gas in all, ≈ 97 780 an order
-/// with the transaction's 21 000 included; counted here on top of it).
+/// with the transaction's 21 000 included; D123 adds the advancer's outstanding slot, + 26 138 for the 3
+/// orders (forge): 319 478, ≈ 106 500 an order; counted here on top of the 21 000).
 pub const TX_BASE_GAS: u64 = 21_000;
-pub const BATCH_ORDER_GAS: u64 = 97_800;
-/// The default batch: 23 orders (`(21 000 + 23 × 97 800) × 1.25 = 2 838 000` gas under the default
-/// `max_gas` of 3 000 000, one order of room below [`batch_gas_bound`]'s 24).
-pub const DEFAULT_ADVANCE_BATCH: usize = 23;
+pub const BATCH_ORDER_GAS: u64 = 106_500;
+/// The default batch: 22 orders (`(21 000 + 22 × 106 500) × 1.25 = 2 955 000` gas under the default
+/// `max_gas` of 3 000 000, [`batch_gas_bound`]'s 22).
+pub const DEFAULT_ADVANCE_BATCH: usize = 22;
 /// The floors no configuration lowers: the nodes' finality (8 blocks), two nodes.
 pub const CONFIRMATIONS_FLOOR: u64 = 8;
 pub const MIN_NODES_FLOOR: usize = 2;
@@ -192,18 +197,23 @@ pub struct FillParams {
     pub max_ahead_secs: u64,
     /// A node's read older than this does not count.
     pub max_source_age: u64,
-    /// Above this amount, wait `grace_secs` after the confirmation (D72: 250 JTM, 10 min).
+    /// Above this amount, wait `grace_secs` after the confirmation (D72: 250 JTM, 10 min; D123: the tranche now
+    /// reaches the largest deposit, 50 000 JTM).
     pub grace_from: u64,
     pub grace_secs: u64,
-    /// At most `hour_cap` advanced over `hour_window`; more (up to 1 000 JTM) only when that window is empty.
+    /// At most `hour_cap` advanced over `hour_window`; more (up to `SLOW_PER_DEPOSIT`) only when that window is
+    /// empty.
     pub hour_cap: u64,
     pub hour_window: u64,
     /// At most `recipient_cap` to one recipient over `recipient_window`.
     pub recipient_cap: u64,
     pub recipient_window: u64,
-    /// Outstanding (advanced, not repaid) at most this (≤ the contract's 3 000 JTM).
+    /// Outstanding (advanced, not repaid) at most this: ≤ `max_stock` (D123: the advances in flight within the
+    /// stock), ≤ the contract's 50 000 JTM.
     pub outstanding_cap: u64,
     /// The hot key's stock cap: at start, a balance above it refuses to start; at every step, it pauses (N9).
+    /// D123: wJTM of the stock count under the contract's 50 000 JTM ceiling, so the default keeps 40 000 of it
+    /// for the mints.
     pub max_stock: u64,
     /// The smallest advance, and the gas floor: an advance is at least `gas_multiple` × its gas cost.
     pub min_advance: u64,
@@ -246,12 +256,14 @@ impl Default for FillParams {
             max_source_age: 300,
             grace_from: 250_000_000,
             grace_secs: 600,
-            hour_cap: 600_000_000,
+            // D123: half the stock an hour (600 of 1 200 before), one stock per recipient per 24 h (1 000 before,
+            // the largest deposit then), the advances in flight within the stock of 10 000 JTM
+            hour_cap: 5_000_000_000,
             hour_window: 3_600,
-            recipient_cap: 1_000_000_000,
+            recipient_cap: 10_000_000_000,
             recipient_window: 86_400,
-            outstanding_cap: ADVANCE_OUTSTANDING_CAP,
-            max_stock: 1_200_000_000,
+            outstanding_cap: 10_000_000_000,
+            max_stock: 10_000_000_000,
             min_advance: 5_000_000,
             gas_multiple: 20,
             fee_bps: 75,
@@ -306,6 +318,13 @@ impl FillParams {
             "max_stock {} outside 1..={ADVANCE_OUTSTANDING_CAP} (the hot key holds a capped stock)",
             self.max_stock
         );
+        // D123: « avances en cours ≤ ce que le robot a en stock »
+        anyhow::ensure!(
+            self.outstanding_cap <= self.max_stock,
+            "outstanding_cap {} is above max_stock {} (D123: the advances in flight stay within the stock)",
+            self.outstanding_cap,
+            self.max_stock
+        );
         anyhow::ensure!((1..=MAX_ADVANCE_BATCH).contains(&self.batch_max), "batch_max {} outside 1..={MAX_ADVANCE_BATCH}", self.batch_max);
         let bound = batch_gas_bound(max_gas, gas_margin_pct);
         anyhow::ensure!(
@@ -341,6 +360,7 @@ pub fn confirmation(
     l1_now: u64,
     p: &FillParams,
     pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool,
+    target_ok: &mut dyn FnMut(&Chain, u64) -> bool,
 ) -> Result<(), &'static str> {
     let rule = WitnessRule { min_sources: p.min_nodes, max_age: p.max_source_age, depth: p.confirmations };
     let view = |n: &NodeView<'_>| SourceView {
@@ -357,7 +377,7 @@ pub fn confirmation(
     let mut why = "NOT_CONFIRMED";
     let mut good = Vec::new();
     for n in nodes {
-        match node_confirms(d, n.chain, l1_now, p, pow_ok) {
+        match node_confirms(d, n.chain, l1_now, p, pow_ok, target_ok) {
             Ok(()) => good.push(view(n)),
             Err(code) => {
                 if why == "NOT_CONFIRMED" {
@@ -373,7 +393,14 @@ pub fn confirmation(
     }
 }
 
-fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool) -> Result<(), &'static str> {
+fn node_confirms(
+    d: &FoundDeposit,
+    c: &Chain,
+    l1_now: u64,
+    p: &FillParams,
+    pow_ok: &mut dyn FnMut(&HeaderInfo) -> bool,
+    target_ok: &mut dyn FnMut(&Chain, u64) -> bool,
+) -> Result<(), &'static str> {
     let top = d.height + p.confirmations;
     let tip = c.tip_height();
     // (the deposit's block on this node: checked by the witness rule, which every counted node passes)
@@ -389,11 +416,86 @@ fn node_confirms(d: &FoundDeposit, c: &Chain, l1_now: u64, p: &FillParams, pow_o
         return Err("CONFIRMATION_FROM_THE_FUTURE");
     }
     for h in d.height..=top {
+        // E-7: the target the nodes' rule gives the header, then a proof of work against it
+        if !target_ok(c, h) {
+            return Err("BAD_TARGET");
+        }
         if !pow_ok(c.header_at(h).ok_or("NOT_CONFIRMED")?) {
             return Err("BAD_PROOF_OF_WORK");
         }
     }
     Ok(())
+}
+
+/// E-7 (audit 2026-11-10): the target the nodes' difficulty rule gives the header at `height` of `c` — ASERT from its
+/// anchor, `jetsam_bridge_program::rules` (the proof program's port of the node's rule, cross-tested against it) on the
+/// schedule `s` — from the headers `c` holds; `None` when one it needs is missing.
+pub fn expected_target(c: &Chain, height: u64, s: &jetsam_bridge_program::rules::Schedule) -> Option<[u8; 32]> {
+    let parent = c.header_at(height.checked_sub(1)?)?;
+    let ah = s.anchor_height(parent.height);
+    let anchor = c.header_at(ah)?;
+    // the anchor's parent is read by the v1.6 rule only, whose anchor is never the genesis
+    let anchor_parent_ts = match ah.checked_sub(1) {
+        Some(below) => c.header_at(below)?.timestamp,
+        None => anchor.timestamp,
+    };
+    Some(s.expected_target(ah, anchor.timestamp, anchor_parent_ts, &anchor.target, height, parent.timestamp))
+}
+
+/// E-7: whether every header of `c` from its genesis up to `upto` carries the target [`expected_target`] gives it,
+/// under `s` (the build's: `jetsam_bridge_program::rules::PRODUCTION`): a branch of trivial difficulty served by
+/// every node of the robot is refused, the targets of its blocks below the deposit included (an ASERT target follows
+/// its anchor's: one forged anchor would make the blocks above it look right). `verified` keeps the ids already
+/// checked (a reorganization brings new ids, checked from their first unverified ancestor). A chain without its
+/// genesis header (`Chain::with_anchor`) is never verified.
+pub fn targets_ok(c: &Chain, upto: u64, s: &jetsam_bridge_program::rules::Schedule, verified: &mut std::collections::HashSet<[u8; 32]>) -> bool {
+    if c.base_height() != 0 || c.header_at(0).is_none() || upto > c.tip_height() {
+        return false;
+    }
+    let mut from = upto;
+    while from > 0 {
+        match c.header_at(from) {
+            Some(h) if verified.contains(&h.id) => break,
+            Some(_) => from -= 1,
+            None => return false,
+        }
+    }
+    for h in from + 1..=upto {
+        let (Some(header), Some(want)) = (c.header_at(h), expected_target(c, h, s)) else { return false };
+        if header.target != want {
+            return false;
+        }
+        verified.insert(header.id);
+    }
+    true
+}
+
+/// D123: the bridge's per-deposit cap and the caps of its advancers (`SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()`,
+/// `ADVANCE_CAP_24H()`, read at start) are this robot's mirrors, or jg-fill does not start (a robot built for other
+/// caps would plan its queue against caps the contract does not have).
+pub fn check_bridge_caps(slow_per_deposit: u64, advance_outstanding_cap: u64, advance_cap_24h: u64) -> anyhow::Result<()> {
+    for (name, read, ours) in [
+        ("SLOW_PER_DEPOSIT", slow_per_deposit, SLOW_PER_DEPOSIT),
+        ("ADVANCE_OUTSTANDING_CAP", advance_outstanding_cap, ADVANCE_OUTSTANDING_CAP),
+        ("ADVANCE_CAP_24H", advance_cap_24h, ADVANCE_CAP_24H),
+    ] {
+        anyhow::ensure!(read == ours, "the bridge's {name}() is {read} µJTM, not {ours}: jg-fill does not start (it plans against these caps)");
+    }
+    Ok(())
+}
+
+/// E-9 (audit 2026-11-10): the robot's daily gas budget when `[signer] daily_gas_budget` is not set: 30 M gas per 24 h of
+/// the L1 clock, all its own transactions counted (advances, own claims). 10 full transactions at the default `max_gas`
+/// (≈ 220 advances in batches of 22, or ≈ 160 own claims of ≈ 184 000 gas); on Base (10/11/2026, 1 024 blocks read with
+/// `eth_feeHistory`: base fee 0.005 gwei, tips p50 ≈ 0.0012 gwei, p99 0.03 gwei; Base Sepolia the same base fee, tips
+/// p90 0.001 gwei) at most 30 M × (0.005 + the 0.1 gwei tip cap) ≈ 0.0032 ETH a day, ≈ 0.0002 ETH at the usual tips,
+/// plus Base's L1 data fee.
+pub const DEFAULT_DAILY_GAS_BUDGET: u64 = 30_000_000;
+
+/// E-9: a send refused by the daily gas budget (`l1tx::GAS_BUDGET_ALERT`): an alert, never a revert nor a halt; the
+/// orders are planned again at a later step.
+pub fn gas_budget_refusal(text: &str) -> bool {
+    text.contains(crate::l1tx::GAS_BUDGET_ALERT)
 }
 
 /// A5-7: the body of `d`'s block as the relayer archived and published it
@@ -1004,7 +1106,7 @@ impl Ledger {
     }
 }
 
-/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with.
+/// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with (D123: 50 000 JTM).
 pub fn check_ceiling(read: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         read == OUTSTANDING_CEIL,
@@ -1198,7 +1300,7 @@ pub struct FillConfig {
     pub refund_to: String,
     /// The price of 1 JTM in wei (decimal), for the gas floor of an advance.
     pub wei_per_jtm: String,
-    /// The gas of one advance (measured: 141 974 the first, 122 120 the next).
+    /// The gas of one advance (measured: 141 974 the first, 122 120 the next; D123: ≈ 166 000 the first).
     #[serde(default = "default_advance_gas")]
     pub advance_gas: u64,
     pub state_dir: PathBuf,
@@ -1239,8 +1341,10 @@ impl FillConfig {
     }
 }
 
+/// The gas of one advance, for the gas floor (measured 141 974 the first of an address; D123 adds its outstanding
+/// slot, + 24 200 at the first: ≈ 166 000).
 fn default_advance_gas() -> u64 {
-    142_000
+    166_000
 }
 
 fn default_poll() -> u64 {
@@ -1255,7 +1359,7 @@ pub fn parse20(text: &str) -> anyhow::Result<[u8; 20]> {
 impl FillConfig {
     /// Parse and check; an error means jg-fill does not start.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let c: Self = toml::from_str(text)?;
+        let mut c: Self = toml::from_str(text)?;
         let profile = c.profile()?;
         // without `[signer]` (the rehearsal's endpoint account) the batch keeps the default signer's bound
         let (max_gas, margin) = if c.signer == crate::l1tx::SignerConfig::default() {
@@ -1264,7 +1368,14 @@ impl FillConfig {
         } else {
             (c.signer.max_gas, c.signer.gas_margin_pct)
         };
+        // E-9: the robot always has a daily gas budget (its default unless set)
+        c.signer.daily_gas_budget.get_or_insert(DEFAULT_DAILY_GAS_BUDGET);
         c.params.check(profile, max_gas, margin).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
+        let budget = c.signer.daily_gas_budget.unwrap_or(DEFAULT_DAILY_GAS_BUDGET);
+        anyhow::ensure!(
+            budget >= max_gas,
+            "[signer] daily_gas_budget {budget} is below one transaction at max_gas {max_gas}: jg-fill does not start (E-9)"
+        );
         anyhow::ensure!(
             c.nodes.len() >= c.params.min_nodes,
             "{} nodes configured, min_nodes = {}: jg-fill does not start (each deposit is confirmed on that many nodes)",

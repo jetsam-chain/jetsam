@@ -141,6 +141,8 @@ fn rules() -> DestinationRules {
     };
     rules.vault.activation_height = Some(J);
     rules.vault.deposits_from_height = Some(J + 8);
+    // D123's caps on every profile (the test chain's caps of before: `d123_*`)
+    rules.vault.legacy = None;
     rules
 }
 
@@ -233,10 +235,10 @@ fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
             height: J + 500,
             n: 1,
             owner: Address([1; 32]),
-            amount: 1_000 * MICRO_PER_JTM,
+            amount: 49_000 * MICRO_PER_JTM,
         });
     state.released.insert(1);
-    // n = 2 (1 600 JTM) waits for the window: n = 3 must not jump it.
+    // n = 2 (1 600 JTM) waits for the window (49 000 + 1 600 > 50 000, D123): n = 3 must not jump it.
     let offer = plan(
         &state,
         Vec::new(),
@@ -432,6 +434,7 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
         &DestinationOffer::default(),
         locked,
         &rules().vault,
+        J + 1,
     );
     assert_eq!(
         kept,
@@ -450,6 +453,7 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
         &offer,
         locked,
         &rules().vault,
+        J + 1,
     );
     assert_eq!(kept.len(), 2);
     // Placed after them (a lower fee), it frees nothing for them.
@@ -463,6 +467,7 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
         &late,
         locked,
         &rules().vault,
+        J + 1,
     );
     assert_eq!(kept, vec![first]);
 }
@@ -1062,4 +1067,52 @@ fn the_template_keeps_only_the_advances_the_block_rule_accepts_together() {
     }
     // Dormant (every profile today): untouched.
     assert_eq!(kept_of(&rules()), (0..entries.len()).collect::<Vec<_>>());
+}
+
+/// D123: the template offers the releases and places the deposits of the block it builds under the caps of that
+/// block's height. On a chain raising its caps at `c` (the test chain), a release of 3 000 JTM waits below `c`
+/// (window cap 2 500 JTM) and is offered from `c` on; a deposit taking the vault over 10 000 JTM stays in the pool
+/// below `c` and is placed from `c` on.
+#[test]
+fn d123_the_template_follows_the_caps_of_its_block() {
+    use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+    let c = J + 600;
+    let mut raising = rules();
+    raising.vault.legacy = Some(LegacyVaultCaps {
+        raised_at: Some(c),
+        ..TESTNET_LEGACY_VAULT_CAPS
+    });
+    let state = state_at(c - 2);
+    let offer_at = |height| {
+        plan_destination_offer(
+            &state,
+            &raising,
+            height,
+            Vec::new(),
+            vec![release(1, 3_000 * MICRO_PER_JTM)],
+            &|anchor| *anchor == ANCHOR,
+            0,
+        )
+    };
+    assert!(offer_at(c - 1).releases.is_empty(), "over the window of before");
+    assert_eq!(offer_at(c).releases.len(), 1, "within D123's window");
+    let deposit = page(
+        Address([0x51; 32]),
+        10,
+        &[(VAULT_ADDRESS, 6 * MICRO_PER_JTM), (deposit_marker(&[7; 20]), 0)],
+        90_000,
+    );
+    let locked = 10_000 * MICRO_PER_JTM - 5 * MICRO_PER_JTM;
+    let kept = |height| {
+        deposits_within_ceiling(
+            vec![deposit.clone()],
+            |p: &PagedSpendIntent| p.pages.as_slice(),
+            &DestinationOffer::default(),
+            locked,
+            &raising.vault,
+            height,
+        )
+    };
+    assert!(kept(c - 1).is_empty(), "over the ceiling of before");
+    assert_eq!(kept(c).len(), 1, "within D123's ceiling");
 }

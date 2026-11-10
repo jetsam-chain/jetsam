@@ -3049,6 +3049,12 @@ fn deposits_line(state: &Value) -> String {
     }
 }
 
+/// D123: the rules of the node's next block (`getVaultState`'s tip + 1), whose
+/// caps a deposit planned now meets.
+fn rules_of_next_block(state: &Value, rules: &VaultRules) -> VaultRules {
+    rules.at(state["tip_height"].as_u64().unwrap_or(0).saturating_add(1))
+}
+
 /// Only the word itself confirms a deposit.
 fn is_confirmation(answer: &str) -> bool {
     answer.trim().eq_ignore_ascii_case("yes")
@@ -3073,6 +3079,8 @@ async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .await
         .context("getVaultState")?;
     let closed = deposits_closed_reason(&state, &rules);
+    // D123: the limits of the node's next block
+    let next = rules_of_next_block(&state, &rules);
     if ctx.json {
         return print_json(&serde_json::json!({
             "deposits_open": closed.is_none(),
@@ -3081,8 +3089,8 @@ async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
                 "network": jetsam_chain::consensus::identity::CHAIN_NAME,
                 "v1_7_activation_height": rules.activation_height,
                 "deposits_from_height": rules.deposits_from_height,
-                "min_deposit_micro": rules.min_deposit,
-                "max_deposit_micro": rules.max_deposit,
+                "min_deposit_micro": next.min_deposit,
+                "max_deposit_micro": next.max_deposit,
                 "vault": rules.vault.to_bech32(),
             },
             "node": state,
@@ -3108,8 +3116,8 @@ async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         "One deposit",
         &format!(
             "{} to {} {TICKER}",
-            jetsam_str(rules.min_deposit),
-            jetsam_str(rules.max_deposit)
+            jetsam_str(next.min_deposit),
+            jetsam_str(next.max_deposit)
         ),
     );
     kv("Vault", &rules.vault.to_bech32());
@@ -4024,7 +4032,7 @@ mod stake_tests {
 mod bridge_tests {
     use super::{
         build_refusal, deposit_preflight, deposits_closed_reason, deposits_line, is_confirmation,
-        unknown_outcome_message, BridgeCommand, Cli, Command, RpcCallError,
+        rules_of_next_block, unknown_outcome_message, BridgeCommand, Cli, Command, RpcCallError,
         BRIDGE_DEPOSIT_RPC_TIMEOUT,
     };
     use clap::{CommandFactory, Parser};
@@ -4256,6 +4264,29 @@ mod bridge_tests {
 
     /// Public text: the bridge's help and messages say Base/EVM, never the
     /// network's name nor the two-letter name of the proof technique.
+    /// D123: `bridge status` names the limits of the node's next block: on a
+    /// chain raising its caps at `c` (the test chain), 1 000 JTM a deposit
+    /// while the next block is below `c`, 50 000 JTM from `c` on.
+    #[test]
+    fn d123_the_status_names_the_largest_deposit_of_the_next_block() {
+        use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+        let base = armed(9_600);
+        let f = base.deposits_from_height.unwrap();
+        let c = f + 50;
+        let rules = VaultRules {
+            legacy: Some(LegacyVaultCaps {
+                raised_at: Some(c),
+                ..TESTNET_LEGACY_VAULT_CAPS
+            }),
+            ..base
+        };
+        let before = rules_of_next_block(&state(true, c - 2, Some(f), 10 * ONE), &rules);
+        assert_eq!(before.max_deposit, 1_000 * ONE);
+        let from = rules_of_next_block(&state(true, c - 1, Some(f), 10 * ONE), &rules);
+        assert_eq!(from.max_deposit, 50_000 * ONE);
+        assert_eq!(MAX_DEPOSIT_MICRO, 50_000 * ONE);
+    }
+
     #[test]
     fn the_bridge_texts_say_base_evm_only() {
         let mut command = Cli::command();

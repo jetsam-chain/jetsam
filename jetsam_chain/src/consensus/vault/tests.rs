@@ -25,10 +25,13 @@ pub(crate) const BOB: Address = Address([0xb0; 32]);
 pub(crate) const RF: u64 = RELEASE_FEE_MICRO;
 pub(crate) const FEE: u64 = 47_200;
 
+/// The rules of the test clock, with D123's caps on every profile (the test chain's caps of before D123 and
+/// their height are tested on their own: `d123_*`).
 pub(crate) fn rules() -> VaultRules {
     VaultRules {
         activation_height: Some(J),
         deposits_from_height: Some(F),
+        legacy: None,
         ..VaultRules::current()
     }
 }
@@ -224,9 +227,10 @@ fn vault_address_is_the_addrfx_image_of_the_published_secret() {
     assert!(destination_marker_kind(&VAULT_ADDRESS).is_none());
     assert_eq!(RELEASE_FEE_MICRO, 100_000);
     assert_eq!(MIN_DEPOSIT_MICRO, 1_000_000);
-    assert_eq!(MAX_DEPOSIT_MICRO, 1_000_000_000);
+    // D123: the bridge's caps are the operator's bond, 50 000 JTM
+    assert_eq!(MAX_DEPOSIT_MICRO, 50_000_000_000);
     assert_eq!(MAX_RELEASES_PER_BLOCK, 4);
-    assert_eq!(VAULT_RELEASE_WINDOW_CAP_MICRO, 2_500_000_000);
+    assert_eq!(VAULT_RELEASE_WINDOW_CAP_MICRO, 50_000_000_000);
 }
 
 /// F = J + 1 440 on the public network (D44, none while its J is none),
@@ -264,7 +268,7 @@ fn bridge_opening_follows_the_v1_7_clock() {
         current.deposits_from_height,
         bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT)
     );
-    assert_eq!(current.outstanding_ceil, 10_000 * MICRO_PER_JTM);
+    assert_eq!(current.outstanding_ceil, 50_000 * MICRO_PER_JTM);
     assert_eq!(current.release_fee, RF);
     assert_eq!(current.release_fee_for(1, 3), RF);
     assert_eq!(current.release_fee_for(929, 3), RF);
@@ -293,6 +297,8 @@ fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
         test,
         DepositRule {
             deposits_from_height: Some(F),
+            // the test clock has D123's caps on every profile (`rules()`)
+            legacy: None,
             ..DepositRule::for_activation(Some(J))
         }
     );
@@ -315,6 +321,7 @@ fn the_gate_reads_v4_from_the_crate_the_proof_program_runs() {
             vault: ALICE.0,
             min_deposit: 3,
             max_deposit: 5,
+            legacy: None,
         }
     );
     for h in [0, J - 1, J, F - 1, F, F + 1, u64::MAX] {
@@ -677,8 +684,13 @@ fn vault_output_without_deposit_marker_is_refused() {
         (MAX_DEPOSIT_MICRO + 1, false),
     ] {
         let d = deposit(200, [7; 20], amount);
+        // an empty vault: V8 (D123: as large as MAX_DEPOSIT) never decides here
+        let empty = VaultContext {
+            bridge_locked: 0,
+            ..ctx()
+        };
         assert_eq!(
-            check(&block(vec![d.clone()], &[]), ctx()).is_ok(),
+            check(&block(vec![d.clone()], &[]), empty).is_ok(),
             ok,
             "{amount}"
         );
@@ -840,19 +852,23 @@ fn window_cap_is_enforced() {
             cap
         })
     );
-    // Within one block: four releases of 700 JTM are over the cap.
+    // Within one block: four releases of 15 000 JTM are over the cap (D123: 50 000).
     let big: Vec<VaultRelease> = (1..=4)
-        .map(|n| release(n, ALICE, 700 * MICRO_PER_JTM))
+        .map(|n| release(n, ALICE, 15_000 * MICRO_PER_JTM))
         .collect();
     let groups = big
         .iter()
         .enumerate()
         .map(|(i, r)| release_group(100 + 10 * i as u32, r, 0, FEE))
         .collect();
+    let held = VaultContext {
+        bridge_locked: 60_000 * MICRO_PER_JTM,
+        ..ctx()
+    };
     assert_eq!(
-        check(&block(groups, &big), at(0)),
+        check(&block(groups, &big), held),
         Err(VaultError::WindowCapExceeded {
-            released: 2_800 * MICRO_PER_JTM,
+            released: 60_000 * MICRO_PER_JTM,
             cap
         })
     );
@@ -1128,7 +1144,7 @@ const CEIL: u64 = VAULT_OUTSTANDING_CEIL_MICRO;
 /// V8: `bridge_locked + amount ≤ VAULT_OUTSTANDING_CEIL`.
 #[test]
 fn vault_ceiling_refuses_deposit_over_ceiling() {
-    assert_eq!(CEIL, 10_000 * MICRO_PER_JTM);
+    assert_eq!(CEIL, 50_000 * MICRO_PER_JTM);
     let locked = |bridge_locked| VaultContext {
         bridge_locked,
         ..ctx()
@@ -1163,13 +1179,13 @@ fn vault_ceiling_refuses_deposit_over_ceiling() {
 }
 
 /// A5-18: V8's ceiling is the contract's C-6 ceiling, the same number and
-/// the same inclusive comparison: `JetsamBridge.OUTSTANDING_CEIL = 10_000e6`
-/// µJTM, and C-6 refuses only `totalSupply + amount > OUTSTANDING_CEIL`
+/// the same inclusive comparison: `JetsamBridge.OUTSTANDING_CEIL = 50_000e6`
+/// µJTM (D123), and C-6 refuses only `totalSupply + amount > OUTSTANDING_CEIL`
 /// (equality mints), as V8 refuses only `bridge_locked + amount > ceil`.
 #[test]
 fn vault_ceiling_is_the_contracts_outstanding_ceil() {
-    /// `uint64 public constant OUTSTANDING_CEIL = 10_000e6;` (JetsamBridge.sol).
-    const CONTRACT_OUTSTANDING_CEIL: u64 = 10_000_000_000;
+    /// `uint64 public constant OUTSTANDING_CEIL = 50_000e6;` (JetsamBridge.sol, D123).
+    const CONTRACT_OUTSTANDING_CEIL: u64 = 50_000_000_000;
     assert_eq!(VAULT_OUTSTANDING_CEIL_MICRO, CONTRACT_OUTSTANDING_CEIL);
     assert_eq!(
         VaultRules::current().outstanding_ceil,
@@ -2306,8 +2322,13 @@ fn release_above_window_cap_is_refused_even_alone() {
     let over = VAULT_RELEASE_WINDOW_CAP_MICRO + 1;
     let r = release(1, ALICE, over);
     let b = block(vec![release_group(100, &r, 0, FEE)], &[r]);
+    // the vault holds what the release takes (D123: more than LOCKED)
+    let held = VaultContext {
+        bridge_locked: over,
+        ..ctx()
+    };
     assert_eq!(
-        check(&b, ctx()),
+        check(&b, held),
         Err(VaultError::WindowCapExceeded {
             released: over,
             cap: VAULT_RELEASE_WINDOW_CAP_MICRO
@@ -2639,4 +2660,151 @@ fn release_group_check_matches_the_block_gate() {
         FEE,
     );
     assert!(check_release_group(&pages(group), &poisoned, &rules(), floor).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// D123: the bridge's caps are the operator's bond, 50 000 JTM (V4-c, V6, V8)
+// ---------------------------------------------------------------------------
+
+const BOND: u64 = 50_000 * MICRO_PER_JTM;
+
+/// The test chain's rules with its caps of before D123 below `raised_at`.
+fn raising(raised_at: Option<u64>) -> VaultRules {
+    VaultRules {
+        legacy: Some(LegacyVaultCaps {
+            raised_at,
+            ..TESTNET_LEGACY_VAULT_CAPS
+        }),
+        ..rules()
+    }
+}
+
+/// V4-c, V6 and V8 of `r` in a block at `h`: (largest deposit accepted, one µJTM more refused), (window
+/// filled exactly, one µJTM more refused), (vault filled exactly, one µJTM more refused), each at the edge
+/// `cap` the caller names.
+fn edges_at(r: &VaultRules, h: u64, max_deposit: u64, window_cap: u64, ceil: u64) {
+    let gate = |b: &Block, ctx: VaultContext| validate_block_vault(b, &ctx, r, &mut proven);
+    // V4-c, into an empty vault
+    let empty = || VaultContext { bridge_locked: 0, ..ctx() };
+    let at_cap = block_at(h, vec![deposit(200, [7; 20], max_deposit)], &[]);
+    assert!(gate(&at_cap, empty()).is_ok(), "V4-c {max_deposit} at {h}");
+    let over = block_at(h, vec![deposit(200, [7; 20], max_deposit + 1)], &[]);
+    assert_eq!(
+        gate(&over, empty()),
+        Err(VaultError::DepositAmount { group: 0, amount: max_deposit + 1 }),
+        "V4-c at {h}"
+    );
+    // V6: a release of 10 JTM into a window holding the rest
+    let rel = release(1, ALICE, 10 * MICRO_PER_JTM);
+    let b = block_at(h, vec![release_group(100, &rel, 0, FEE)], std::slice::from_ref(&rel));
+    let window = |released_in_window| VaultContext { released_in_window, bridge_locked: rel.amount, ..ctx() };
+    assert!(gate(&b, window(window_cap - rel.amount)).is_ok(), "V6 {window_cap} at {h}");
+    assert_eq!(
+        gate(&b, window(window_cap - rel.amount + 1)),
+        Err(VaultError::WindowCapExceeded { released: window_cap + 1, cap: window_cap }),
+        "V6 at {h}"
+    );
+    // V8: a deposit of 5 JTM into a vault holding the rest
+    let d = block_at(h, vec![deposit(200, [7; 20], 5 * MICRO_PER_JTM)], &[]);
+    let locked = |bridge_locked| VaultContext { bridge_locked, ..ctx() };
+    assert_eq!(
+        gate(&d, locked(ceil - 5 * MICRO_PER_JTM)).map(|e| e.bridge_locked_after),
+        Ok(ceil),
+        "V8 {ceil} at {h}"
+    );
+    assert_eq!(
+        gate(&d, locked(ceil - 5 * MICRO_PER_JTM + 1)),
+        Err(VaultError::VaultCeilingReached {
+            group: 0,
+            locked: ceil - 5 * MICRO_PER_JTM + 1,
+            amount: 5 * MICRO_PER_JTM,
+            ceil
+        }),
+        "V8 at {h}"
+    );
+}
+
+/// D123: exactly 50 000 JTM passes each cap (a deposit, the release window, the vault), 50 000 JTM + 1 µJTM
+/// is refused.
+#[test]
+fn d123_each_cap_is_the_bond_at_its_edge() {
+    edges_at(&rules(), HEIGHT, BOND, BOND, BOND);
+    assert_eq!((rules().max_deposit, rules().window_cap, rules().outstanding_ceil), (BOND, BOND, BOND));
+}
+
+/// D123 on the test chain: below its caps height the caps it ran v1.7 with (1 000 / 2 500 / 10 000 JTM),
+/// from it on D123's; its height not chosen, the caps of before at every height.
+#[test]
+fn d123_the_test_chain_raises_its_caps_at_its_caps_height() {
+    let c = HEIGHT + 32;
+    let r = raising(Some(c));
+    edges_at(&r, c - 1, 1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM);
+    edges_at(&r, c, BOND, BOND, BOND);
+    edges_at(&r, c + 1_000, BOND, BOND, BOND);
+    let never = raising(None);
+    edges_at(&never, c, 1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM);
+    edges_at(&never, u64::MAX - 1, 1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM);
+}
+
+/// `at(h)`: the caps of the block at `h`, no longer height-dependent (`legacy` none); the rules of D123
+/// unchanged; the shared crate's V4 reads the same largest deposit.
+#[test]
+fn d123_at_gives_the_caps_of_one_height() {
+    let c = HEIGHT + 32;
+    let r = raising(Some(c));
+    let before = r.at(c - 1);
+    assert_eq!(
+        (before.max_deposit, before.window_cap, before.outstanding_ceil, before.legacy),
+        (1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM, None)
+    );
+    let after = r.at(c);
+    assert_eq!((after.max_deposit, after.window_cap, after.outstanding_ceil, after.legacy), (BOND, BOND, BOND, None));
+    assert_eq!(rules().at(HEIGHT), rules());
+    for h in [c - 1, c, c + 1] {
+        assert_eq!(r.deposit_rule().max_deposit_at(h), r.at(h).max_deposit, "{h}");
+        assert_eq!(r.at(h).at(h), r.at(h), "{h}");
+    }
+    // the release shape a mempool admits follows the caps of its block
+    assert!(release_shape_ok(&ALICE, BOND, &r.at(c)));
+    assert!(!release_shape_ok(&ALICE, BOND + 1, &r.at(c)));
+    assert!(release_shape_ok(&ALICE, 2_500 * MICRO_PER_JTM, &r.at(c - 1)));
+    assert!(!release_shape_ok(&ALICE, 2_500 * MICRO_PER_JTM + 1, &r.at(c - 1)));
+}
+
+/// The caps of each profile: the test chain carries its caps of before until its caps height, not chosen
+/// (`params::V1_7_TESTNET_CAPS_HEIGHT`, armed at deployment); the public network and the rehearsal have
+/// D123's from J. The relations hold on both sets: a deposit and a burn never larger than the release window
+/// (B-2: the contract's `MAX_BURN_AMOUNT` is `MAX_DEPOSIT`) nor than the vault (V8 = the contract's C-6).
+#[test]
+fn d123_the_caps_of_each_profile() {
+    assert_eq!(
+        TESTNET_LEGACY_VAULT_CAPS,
+        LegacyVaultCaps {
+            raised_at: jetsam_vault_rule::TESTNET_CAPS_HEIGHT,
+            max_deposit: 1_000 * MICRO_PER_JTM,
+            window_cap: 2_500 * MICRO_PER_JTM,
+            outstanding_ceil: 10_000 * MICRO_PER_JTM,
+        }
+    );
+    let current = VaultRules::current();
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        assert_eq!(current.legacy, Some(TESTNET_LEGACY_VAULT_CAPS));
+        assert_eq!(current.legacy.unwrap().raised_at, None);
+        let today = current.at(u64::MAX);
+        assert_eq!(
+            (today.max_deposit, today.window_cap, today.outstanding_ceil),
+            (1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM, 10_000 * MICRO_PER_JTM)
+        );
+    }
+    #[cfg(any(not(feature = "testnet"), feature = "rehearsal-v1-7"))]
+    assert_eq!(current.legacy, None);
+    assert_eq!(current.deposit_rule().legacy.map(|l| l.max_deposit), current.legacy.map(|l| l.max_deposit));
+    for caps in [(MAX_DEPOSIT_MICRO, VAULT_RELEASE_WINDOW_CAP_MICRO, VAULT_OUTSTANDING_CEIL_MICRO), {
+        let l = TESTNET_LEGACY_VAULT_CAPS;
+        (l.max_deposit, l.window_cap, l.outstanding_ceil)
+    }] {
+        let (max_deposit, window_cap, ceil) = caps;
+        assert!(MIN_DEPOSIT_MICRO <= max_deposit && max_deposit <= window_cap && max_deposit <= ceil, "{caps:?}");
+    }
 }

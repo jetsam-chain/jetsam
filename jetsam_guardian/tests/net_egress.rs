@@ -893,6 +893,11 @@ fn fill_world_live(stock: Arc<AtomicU64>, chain_id: &'static str, min_age: u64) 
     // A5-18: the bridge's ceiling, read at start
     let ceiling = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("OUTSTANDING_CEIL()")));
     let age = format!("0x{}", hex::encode(jetsam_guardian::l1::selector("ADVANCE_MIN_AGE()")));
+    // D123: the bridge's per-deposit and advance caps, read at start
+    let caps: Vec<String> = ["SLOW_PER_DEPOSIT()", "ADVANCE_OUTSTANDING_CAP()", "ADVANCE_CAP_24H()"]
+        .iter()
+        .map(|sig| format!("0x{}", hex::encode(jetsam_guardian::l1::selector(sig))))
+        .collect();
     Arc::new(move |method, params| match method {
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
@@ -907,8 +912,8 @@ fn fill_world_live(stock: Arc<AtomicU64>, chain_id: &'static str, min_age: u64) 
                 json!({"result": token})
             } else if data.starts_with("0x70a08231") {
                 json!({"result": format!("0x{:064x}", stock.load(Ordering::SeqCst))})
-            } else if data.starts_with(&ceiling) {
-                json!({"result": format!("0x{:064x}", 10_000_000_000u64)})
+            } else if data.starts_with(&ceiling) || caps.iter().any(|c| data.starts_with(c.as_str())) {
+                json!({"result": format!("0x{:064x}", 50_000_000_000u64)})
             } else if data.starts_with(&age) {
                 json!({"result": format!("0x{min_age:064x}")})
             } else {
@@ -928,7 +933,7 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     let (n1, n2, c) = (onion('a'), onion('b'), onion('c'));
     let network = hex::encode(testkit::genesis().id);
     let nodes = vec![format!("http://{n1}:19801"), format!("http://{n2}:19801")];
-    let cap = 1_200_000_000u64;
+    let cap = 10_000_000_000u64; // the default max_stock (D123)
     if !rehearsal_build {
         let (target, socks) = untouchable();
         let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{}\"\n", socks.local_addr().unwrap().port());
@@ -985,7 +990,7 @@ fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
     if jetsam_chain::consensus::vault::VaultRules::current().activation_height != Some(96) {
         return;
     }
-    let cap = 1_200_000_000u64;
+    let cap = 10_000_000_000u64; // the default max_stock (D123)
     let stock = Arc::new(AtomicU64::new(cap));
     let (socks, _) = fake_tor(fill_world_live(stock.clone(), "0x7a69", 86_400));
     let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
@@ -1003,7 +1008,7 @@ fn jg_fill_pauses_when_its_stock_goes_above_its_cap_while_it_runs() {
     stop(robot);
     let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
     assert!(stepped && paused && lifted, "stepped {stepped}, paused {paused}, lifted {lifted}; log:\n{log}");
-    assert_eq!(log.matches("ALERT the hot key holds 1200000001").count(), 1, "one alert per crossing:\n{log}");
+    assert_eq!(log.matches(&format!("ALERT the hot key holds {}", cap + 1)).count(), 1, "one alert per crossing:\n{log}");
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("PAUSE_STOCK_ABOVE_CAP"), "{journal}");
 }
@@ -1036,7 +1041,7 @@ fn jg_fill_halts_after_three_reverted_transactions_and_sends_nothing_more() {
 fn halts_after_three_reverts(before: Option<&str>) {
     use jetsam_guardian::checkpoint::{deposit_leaf, Checkpoint, Deposit};
     use jetsam_guardian::fill::{advance_key, paid, AdvanceStatus, Advanced, Ledger};
-    let (socks, seen) = fake_tor(reverting(fill_world(1_200_000_000)));
+    let (socks, seen) = fake_tor(reverting(fill_world(10_000_000_000)));
     let nodes = vec![format!("http://{}:19801", onion('a')), format!("http://{}:19801", onion('b'))];
     let tail = format!("{REH_PARAMS}[egress]\ntor_socks = \"127.0.0.1:{socks}\"\n");
     let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &nodes, &format!("http://{}:8545", onion('c')), &tail);

@@ -92,10 +92,13 @@ pub const MAX_RELEASES_PER_BLOCK: usize = 4;
 /// The sliding window of the release cap, in blocks.
 pub const VAULT_RELEASE_WINDOW_BLOCKS: u64 = 480;
 /// Most the vault releases over any window (D19): a corrupted L1 committee
-/// costs at most this per window.
-pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
+/// costs at most this per window. D123: the bridge's largest exposure is the
+/// operator's bond, 50 000 JTM; at least `MAX_DEPOSIT` (B-2: the contract's
+/// largest burn is `MAX_DEPOSIT`, inclusive here: a release of that size is
+/// payable in a window where nothing else was released).
+pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 50_000 * MICRO_PER_JTM;
 /// V8: most the vault holds for the bridge (D45, = the contract's
-/// `OUTSTANDING_CEIL`, `10_000e6` µJTM).
+/// `OUTSTANDING_CEIL`, `50_000e6` µJTM since D123).
 ///
 /// A5-18, the exact relation with the contract's C-6: V8 admits a deposit
 /// while `bridge_locked + amount ≤` this ceiling, C-6 mints one while
@@ -112,7 +115,20 @@ pub const VAULT_RELEASE_WINDOW_CAP_MICRO: u64 = 2_500 * MICRO_PER_JTM;
 /// and an advancing robot must read the contract's ceiling and supply
 /// (`OUTSTANDING_CEIL`, `totalSupply`, `suspectMinted`), never this
 /// constant, before it advances.
-pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 10_000 * MICRO_PER_JTM;
+pub const VAULT_OUTSTANDING_CEIL_MICRO: u64 = 50_000 * MICRO_PER_JTM;
+
+/// D123 on the test chain, which ran v1.7 from J = 8 160 under the caps of
+/// before (D28: 1 000 JTM a deposit, D19: 2 500 JTM a release window, D45:
+/// 10 000 JTM in the vault): those caps below its caps height
+/// (`params::V1_7_TESTNET_CAPS_HEIGHT`, `None` until the operator chooses it:
+/// at every height), D123's from it on. The public network and the rehearsal
+/// carry none ([`VaultRules::legacy`]).
+pub const TESTNET_LEGACY_VAULT_CAPS: LegacyVaultCaps = LegacyVaultCaps {
+    raised_at: jetsam_vault_rule::TESTNET_CAPS_HEIGHT,
+    max_deposit: jetsam_vault_rule::TESTNET_PRE_D123_MAX_DEPOSIT_MICRO,
+    window_cap: 2_500 * MICRO_PER_JTM,
+    outstanding_ceil: 10_000 * MICRO_PER_JTM,
+};
 
 // The shared rule counts in the same unit, and carries this build's clock:
 // `F_R = J_R + 32` exactly when this crate is built for the rehearsal.
@@ -130,6 +146,14 @@ const _: () = assert!(
 );
 const _: () = assert!(
     MIN_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO && MAX_DEPOSIT_MICRO <= VAULT_OUTSTANDING_CEIL_MICRO
+);
+// B-2 (D54): the contract's largest burn is MAX_DEPOSIT, within V6 (inclusive).
+const _: () = assert!(MAX_DEPOSIT_MICRO <= VAULT_RELEASE_WINDOW_CAP_MICRO);
+// The same relations under the test chain's caps of before D123.
+const _: () = assert!(
+    MIN_DEPOSIT_MICRO <= TESTNET_LEGACY_VAULT_CAPS.max_deposit
+        && TESTNET_LEGACY_VAULT_CAPS.max_deposit <= TESTNET_LEGACY_VAULT_CAPS.window_cap
+        && TESTNET_LEGACY_VAULT_CAPS.max_deposit <= TESTNET_LEGACY_VAULT_CAPS.outstanding_ceil
 );
 
 const RELEASE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/DESTINATION-OBJECT/VAULT-RELEASE";
@@ -288,9 +312,43 @@ pub struct VaultRules {
     pub window_cap: u64,
     /// V8.
     pub outstanding_ceil: u64,
+    /// D123: the caps of before on a chain that ran v1.7 under them (the test
+    /// chain, [`TESTNET_LEGACY_VAULT_CAPS`]); `None` elsewhere. `max_deposit`,
+    /// `window_cap` and `outstanding_ceil` above are D123's: a block is judged
+    /// under [`VaultRules::at`] its height.
+    pub legacy: Option<LegacyVaultCaps>,
+}
+
+/// D123 on a chain that ran v1.7 under the caps of before: those caps below
+/// `raised_at`, and at every height while it is `None` (not chosen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyVaultCaps {
+    pub raised_at: Option<u64>,
+    pub max_deposit: u64,
+    pub window_cap: u64,
+    pub outstanding_ceil: u64,
 }
 
 impl VaultRules {
+    /// The rules of the block at `height`: D123's caps, or a chain's caps of
+    /// before below its caps height. The result no longer depends on a height
+    /// (`legacy` none): it is the rules of that block only.
+    pub const fn at(&self, height: u64) -> Self {
+        match self.legacy {
+            Some(legacy) if !jetsam_vault_rule::d123_caps_at(legacy.raised_at, height) => Self {
+                max_deposit: legacy.max_deposit,
+                window_cap: legacy.window_cap,
+                outstanding_ceil: legacy.outstanding_ceil,
+                legacy: None,
+                ..*self
+            },
+            _ => Self {
+                legacy: None,
+                ..*self
+            },
+        }
+    }
+
     pub const fn current() -> Self {
         Self {
             activation_height: V1_7_ACTIVATION_HEIGHT,
@@ -303,6 +361,11 @@ impl VaultRules {
             window_blocks: VAULT_RELEASE_WINDOW_BLOCKS,
             window_cap: VAULT_RELEASE_WINDOW_CAP_MICRO,
             outstanding_ceil: VAULT_OUTSTANDING_CEIL_MICRO,
+            legacy: if jetsam_vault_rule::TESTNET_PROFILE {
+                Some(TESTNET_LEGACY_VAULT_CAPS)
+            } else {
+                None
+            },
         }
     }
 
@@ -323,6 +386,13 @@ impl VaultRules {
             vault: self.vault.0,
             min_deposit: self.min_deposit,
             max_deposit: self.max_deposit,
+            legacy: match self.legacy {
+                Some(legacy) => Some(jetsam_vault_rule::LegacyDepositCap {
+                    raised_at: legacy.raised_at,
+                    max_deposit: legacy.max_deposit,
+                }),
+                None => None,
+            },
         }
     }
 
@@ -635,6 +705,8 @@ pub fn validate_block_vault_paying(
             ..VaultEffect::default()
         });
     }
+    // D123: the caps of this block's height.
+    let rules = &rules.at(height);
     let stream =
         validate_block_page_stream(&block.transactions).map_err(|_| VaultError::PageStream)?;
     let (system, user) = block.transactions.split_at(stream.user_start_index);
@@ -911,7 +983,8 @@ pub fn check_plain_vault_transaction(
 /// porte R's causes 1-6): not the vault, not one of the 13 marker tags
 /// (destination, guardians, clients), not one of the guardians' two pools,
 /// and `RELEASE_FEE ≤ amount ≤` the window cap. The mempool refuses a release
-/// of any other shape at admission (T2.5); the CLI warns with it.
+/// of any other shape at admission (T2.5); the CLI warns with it. `rules` are
+/// those of the block (D123: [`VaultRules::at`] its height).
 pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
     use crate::consensus::client_objects::{
         CLIENT_BATCH_SUBMISSION_MARKER_TAG, CLIENT_REGISTRATION_MARKER_TAG,
@@ -943,6 +1016,7 @@ pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> boo
 /// 0), at most one change to the vault (V2); `amount ≥ R` (V3) and its fee is
 /// at most `R` ([`VaultRules::release_fee_for`], D59). What depends on the
 /// block (paid set, window, V8, V7) is the template's and the block's.
+/// `rules` are those of the block (D123: [`VaultRules::at`] its height).
 pub fn check_release_group(
     pages: &[jetsam_tx::TxPage],
     release: &VaultRelease,
@@ -1051,7 +1125,8 @@ pub fn block_carries_deposit(block: &Block, rules: &VaultRules) -> bool {
 
 /// V8 at admission, against the tip's `bridge_locked`: a deposit that would
 /// take the vault over the ceiling is refused (it stays with its owner; the
-/// template applies V8 again in block order, T1.1 §18.2).
+/// template applies V8 again in block order, T1.1 §18.2). `rules` are those of
+/// the next block (D123: [`VaultRules::at`] its height).
 pub fn check_vault_deposit_room(
     pages: &[jetsam_tx::TxPage],
     bridge_locked: u64,

@@ -167,8 +167,9 @@ pub fn vault_state(
     deposits: &[(u64, u32)],
     held_releases: usize,
 ) -> VaultStateResponse {
-    let vault = &rules.vault;
     let next = tip_height.saturating_add(1);
+    // D123: the caps of the next block.
+    let vault = &rules.vault.at(next);
     let from = tip_height.saturating_sub(DEPOSIT_COUNT_HEIGHTS - 1);
     let mut deposits_by_height: Vec<(u64, u32)> = deposits
         .iter()
@@ -279,6 +280,8 @@ mod tests {
         };
         rules.vault.activation_height = Some(960);
         rules.vault.deposits_from_height = Some(970);
+        // D123's caps on every profile (the test chain's caps of before: `d123_*`)
+        rules.vault.legacy = None;
         rules
     }
 
@@ -305,7 +308,7 @@ mod tests {
         assert!(reply.active);
         assert_eq!(reply.bridge_locked, 9_000 * MICRO_PER_JTM);
         assert_eq!(reply.ceiling, VAULT_OUTSTANDING_CEIL_MICRO);
-        assert_eq!(reply.room, 1_000 * MICRO_PER_JTM);
+        assert_eq!(reply.room, VAULT_OUTSTANDING_CEIL_MICRO - 9_000 * MICRO_PER_JTM);
         assert_eq!(reply.floor, 77);
         assert_eq!(reply.deposits_from_height, Some(970));
         assert_eq!(reply.released_count, 2);
@@ -324,6 +327,34 @@ mod tests {
         assert!(!below.active);
         assert_eq!(below.bridge_locked, 0);
         assert_eq!(below.room, VAULT_OUTSTANDING_CEIL_MICRO);
+    }
+
+    /// D123: `getVaultState` reports the caps of the next block: on a chain
+    /// raising its caps at `c` (the test chain), the ceiling and the window
+    /// cap of before while the next block is below `c`, D123's from it on.
+    #[test]
+    fn d123_get_vault_state_reports_the_caps_of_the_next_block() {
+        use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+        let c = 1_600;
+        let mut raising = rules();
+        raising.vault.legacy = Some(LegacyVaultCaps {
+            raised_at: Some(c),
+            ..TESTNET_LEGACY_VAULT_CAPS
+        });
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.bridge_locked = 9_000 * MICRO_PER_JTM;
+        state.tip = c - 2;
+        let before = vault_state(Some(&state), c - 2, &raising, &[], 0);
+        assert_eq!(
+            (before.ceiling, before.room, before.window_cap),
+            (10_000 * MICRO_PER_JTM, 1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM)
+        );
+        state.tip = c - 1;
+        let from = vault_state(Some(&state), c - 1, &raising, &[], 0);
+        assert_eq!(
+            (from.ceiling, from.room, from.window_cap),
+            (50_000 * MICRO_PER_JTM, 41_000 * MICRO_PER_JTM, 50_000 * MICRO_PER_JTM)
+        );
     }
 
     /// The deposits a block makes: its deposit markers among user outputs.

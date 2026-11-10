@@ -24,7 +24,7 @@ use jetsam_chain::consensus::params::{
 };
 use jetsam_chain::consensus::vault::{
     bridge_deposits_from_height, MAX_DEPOSIT_MICRO, RELEASE_FEE_MICRO, VAULT_ADDRESS,
-    VAULT_OUTSTANDING_CEIL_MICRO,
+    VAULT_OUTSTANDING_CEIL_MICRO, VAULT_RELEASE_WINDOW_CAP_MICRO,
 };
 use serde_json::Value;
 
@@ -170,6 +170,9 @@ fn bridge_constants_match_contract_init_code() {
     assert_eq!(c["SLOW_PER_DEPOSIT"].as_u64(), Some(MAX_DEPOSIT_MICRO));
     assert_eq!(c["OUTSTANDING_CEIL"].as_u64(), Some(VAULT_OUTSTANDING_CEIL_MICRO));
     assert_eq!(c["MAX_BURN_AMOUNT"].as_u64(), Some(MAX_DEPOSIT_MICRO));
+    // D123: all three are the bond, 50 000 JTM; B-2, the largest burn within V6 (inclusive): a release of it is payable.
+    assert_eq!(c["SLOW_PER_DEPOSIT"].as_u64(), Some(50_000_000_000));
+    assert!(c["MAX_BURN_AMOUNT"].as_u64().unwrap() <= VAULT_RELEASE_WINDOW_CAP_MICRO);
     // B-4: the vault no release may pay, a constant of the code itself (a PUSH32 of the init code).
     assert!(
         init.windows(33).any(|w| w[0] == 0x7f && w[1..] == VAULT_ADDRESS.0),

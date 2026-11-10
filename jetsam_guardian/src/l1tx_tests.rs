@@ -150,7 +150,7 @@ fn the_signer_is_local_off_the_rehearsal_and_its_key_is_the_configured_address()
     let addr: [u8; 20] = hex::decode("f39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap().try_into().unwrap();
     let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
     // A5-13: off the rehearsal the priority fee is configured
-    let local = parse(&format!("key_file = {:?}\npriority_fee_wei = 1000000000", k.display().to_string()));
+    let local = parse(&format!("key_file = {:?}\npriority_fee_wei = 1000000", k.display().to_string()));
     for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::PrivateRehearsal] {
         let s = local.open(p, 1, Some(addr), dir.path()).unwrap();
         assert!(matches!(s, L1Tx::Local(_)), "{p}");
@@ -204,11 +204,13 @@ fn a5_13_the_priority_fee_has_a_cap_of_its_own() {
     assert!(p.bump((10, 300)).is_err(), "the tip at its cap");
     assert!(FeePolicy { priority_fee: Some(11), ..p }.check().is_err(), "a configured tip above its cap");
     assert!(p.check().is_ok());
-    assert_eq!(FeePolicy::default().max_priority_fee_per_gas, 10_000_000_000, "10 gwei by default");
+    // E-9: 0.1 gwei by default, adapted to Base (tips over 1 024 blocks on 10/11/2026: Base p99 0.03 gwei, Base Sepolia
+    // p90 0.001 gwei; the base fee 0.005 gwei)
+    assert_eq!(FeePolicy::default().max_priority_fee_per_gas, 100_000_000, "0.1 gwei by default");
 }
 
 /// A5-13: off the private rehearsal a robot's `[signer]` names its priority fee (an L1 endpoint's
-/// `eth_maxPriorityFeePerGas` is never its word there), at most `max_priority_fee_wei` (10 gwei by default):
+/// `eth_maxPriorityFeePerGas` is never its word there), at most `max_priority_fee_wei` (0.1 gwei by default, E-9):
 /// otherwise its signer does not open, for jg-fill and jg-relay alike (`open`, shared). The rehearsal may still take
 /// the endpoint's, under the same cap at each send.
 #[test]
@@ -219,19 +221,55 @@ fn a5_13_off_the_rehearsal_the_priority_fee_is_configured_and_under_its_cap() {
     let addr: [u8; 20] = hex::decode("f39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap().try_into().unwrap();
     let key = format!("key_file = {:?}", k.display().to_string());
     let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
-    assert_eq!(parse(&key).max_priority_fee_wei, 10_000_000_000);
+    assert_eq!(parse(&key).max_priority_fee_wei, 100_000_000);
     for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::OtherNetwork] {
         let e = parse(&key).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
         assert!(e.contains("priority_fee_wei") && e.contains("required"), "{p}: {e}");
-        assert!(parse(&format!("{key}\npriority_fee_wei = 1000000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}");
-        assert!(parse(&format!("{key}\npriority_fee_wei = 10000000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: at the cap");
-        let e = parse(&format!("{key}\npriority_fee_wei = 10000000001")).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
+        assert!(parse(&format!("{key}\npriority_fee_wei = 1000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}");
+        assert!(parse(&format!("{key}\npriority_fee_wei = 100000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: at the cap");
+        let e = parse(&format!("{key}\npriority_fee_wei = 100000001")).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
         assert!(e.contains("max_priority_fee_wei"), "{p}: {e}");
         let raised = format!("{key}\npriority_fee_wei = 20000000000\nmax_priority_fee_wei = 20000000000");
         assert!(parse(&raised).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: a cap raised knowingly");
         assert!(parse(&key).check_fees(p).is_err() && SignerConfig::default().check_fees(p).is_err(), "{p}");
     }
     assert!(parse(&key).open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_ok(), "the rehearsal: the endpoint's tip, capped");
-    assert!(parse(&format!("{key}\npriority_fee_wei = 10000000001")).open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_err(), "above its cap even there");
+    assert!(parse(&format!("{key}\npriority_fee_wei = 100000001")).open(Profile::PrivateRehearsal, 31_337, Some(addr), dir.path()).is_err(), "above its cap even there");
     assert!(SignerConfig::default().check_fees(Profile::PrivateRehearsal).is_ok(), "the rehearsal's endpoint account");
+}
+
+
+/// E-9: the gas of a robot's own transactions over the last 24 h of the L1 clock: a transaction is sent while the gas
+/// used plus its gas limit stays within the budget (inclusive), refused one gas above; the entries older than 24 h
+/// leave the count (and the book).
+#[test]
+fn e9_the_gas_book_counts_the_last_24_hours_of_the_l1_clock() {
+    let mut book = GasBook::default();
+    book.record(1_000, 21_000, 1_000);
+    book.record(5_000, 100_000, 5_000);
+    assert_eq!(book.spent(5_000), 121_000);
+    assert!(book.admits(5_000, 79_000, 200_000));
+    assert!(!book.admits(5_000, 79_001, 200_000));
+    // 24 h after the first: it leaves the count (t + 86 400 > now no more)
+    assert_eq!(book.spent(1_000 + 86_399), 121_000);
+    assert_eq!(book.spent(1_000 + 86_400), 100_000);
+    book.record(90_000, 1, 90_000);
+    assert_eq!(book.used, vec![(5_000, 100_000), (90_000, 1)], "pruned at the record");
+    assert_eq!(GAS_BUDGET_WINDOW_SECS, 86_400);
+}
+
+/// E-9: `[signer] daily_gas_budget` is optional (none: no budget, jg-relay's default); the signer it opens carries it.
+#[test]
+fn e9_the_signer_carries_its_daily_gas_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = write_key(dir.path(), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", 0o600);
+    let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
+    let key = format!("key_file = {:?}\npriority_fee_wei = 1000000", k.display().to_string());
+    assert_eq!(parse(&key).daily_gas_budget, None);
+    let with = parse(&format!("{key}\ndaily_gas_budget = 30000000"));
+    assert_eq!(with.daily_gas_budget, Some(30_000_000));
+    match with.open(crate::Profile::Mainnet, 1, None, dir.path()).unwrap() {
+        L1Tx::Local(s) => assert_eq!(s.gas_budget, Some(30_000_000)),
+        L1Tx::Endpoint { .. } => panic!("a local signer"),
+    }
 }

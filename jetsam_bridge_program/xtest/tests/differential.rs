@@ -42,12 +42,14 @@ fn node_rules() -> VaultRules {
         activation_height: Some(J),
         deposits_from_height: Some(F),
         outstanding_ceil: u64::MAX,
+        legacy: None,
         ..VaultRules::current()
     }
 }
 
+/// D123's largest deposit on both sides (the test clock has no caps of before).
 fn program_rule() -> DepositRule {
-    DepositRule::for_activation(Some(J))
+    DepositRule { legacy: None, ..DepositRule::for_activation(Some(J)) }
 }
 
 // ---------------------------------------------------------------- blocks, with the node's types

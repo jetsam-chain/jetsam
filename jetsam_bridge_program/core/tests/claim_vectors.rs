@@ -47,7 +47,7 @@ fn a_claim_proves_exactly_the_nodes_deposits() {
             let name = v["name"].as_str().unwrap();
             let height = v["height"].as_u64().unwrap();
             let j = v["activation_height"].as_u64().unwrap_or(69_120);
-            let rule = DepositRule { deposits_from_height: v["deposits_from_height"].as_u64(), ..DepositRule::for_activation(Some(j)) };
+            let rule = DepositRule { deposits_from_height: v["deposits_from_height"].as_u64(), legacy: None, ..DepositRule::for_activation(Some(j)) };
             let pages: Vec<Vec<u8>> = v["pages"].as_array().unwrap().iter().map(|p| h(p.as_str().unwrap())).collect();
             let tx_root = h(v["tx_root"].as_str().unwrap());
             let node = &v["node"];

@@ -1480,7 +1480,8 @@ fn check_plain_vault_admission(
     check_plain_vault_transaction(pages, next_height, &st.vault_rules)?;
     if st.vault_rules.active_at(next_height) {
         if let Some(vault) = &st.view.vault {
-            check_vault_deposit_room(pages, vault.bridge_locked, &st.vault_rules)?;
+            // D123: the ceiling of the next block.
+            check_vault_deposit_room(pages, vault.bridge_locked, &st.vault_rules.at(next_height))?;
         }
     }
     Ok(())
@@ -1747,10 +1748,11 @@ fn check_destination_admission(
                     )
                 }
             };
+            // D123: the window cap of the next block.
             check_release_group_paying(
                 &release.payment.pages,
                 &release.release,
-                &st.vault_rules,
+                &st.vault_rules.at(next_height),
                 vault.floor,
                 &payee,
             )
@@ -2905,8 +2907,35 @@ mod tests {
         jetsam_chain::consensus::vault::VaultRules {
             activation_height: Some(CROSSING_J),
             deposits_from_height: Some(CROSSING_J + 8),
+            // D123's caps on every profile (the test chain's caps of before: `d123_*`)
+            legacy: None,
             ..jetsam_chain::consensus::vault::VaultRules::current()
         }
+    }
+
+    /// The armed rules of a chain that raises its caps at `c` (the test chain, D123).
+    fn raising_vault_rules(c: u64) -> jetsam_chain::consensus::vault::VaultRules {
+        use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+        jetsam_chain::consensus::vault::VaultRules {
+            legacy: Some(LegacyVaultCaps {
+                raised_at: Some(c),
+                ..TESTNET_LEGACY_VAULT_CAPS
+            }),
+            ..armed_vault_rules()
+        }
+    }
+
+    fn pool_with_vault_rules(
+        view: ChainView,
+        rules: jetsam_chain::consensus::vault::VaultRules,
+    ) -> AsyncMempool {
+        AsyncMempool::new(
+            view,
+            MempoolConfig::default()
+                .with_client_object_rules(armed_rules())
+                .with_vault_rules(rules),
+        )
+        .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())))
     }
 
     /// One transaction spending the live slot 7 of `input_owner` into
@@ -3125,6 +3154,56 @@ mod tests {
                 opening: CROSSING_J + 8
             })
         );
+    }
+
+    /// D123: admission follows the caps of the next block. On a chain raising
+    /// its caps at `c` (the test chain): V8 refuses a deposit over 10 000 JTM
+    /// in the vault while the next block is below `c`, admits it from `c` on;
+    /// a burn of 3 000 JTM (over the window of before, 2 500) is not a
+    /// payable release shape below `c`, it is from `c` on (it then fails
+    /// later, on its synthetic proof).
+    #[tokio::test]
+    async fn d123_admission_follows_the_caps_of_the_next_block() {
+        use jetsam_chain::consensus::params::MICRO_PER_JTM;
+        use jetsam_chain::consensus::vault::{deposit_marker, VaultError, VAULT_ADDRESS};
+        let c = CROSSING_J + 40;
+        let locked = 10_000 * MICRO_PER_JTM - 2 * MICRO_PER_JTM;
+        let deposit = VaultCase::new(
+            c - 2,
+            Address([0xA5; 32]),
+            &[(VAULT_ADDRESS, 3 * MICRO_PER_JTM), (deposit_marker(&[0x42; 20]), 0)],
+        );
+        let before = pool_with_vault_rules(deposit.view_at(c - 2, locked), raising_vault_rules(c));
+        assert_eq!(
+            vault_error(deposit.submit(&before).await),
+            Some(VaultError::VaultCeilingReached {
+                group: 0,
+                locked,
+                amount: 3 * MICRO_PER_JTM,
+                ceil: 10_000 * MICRO_PER_JTM
+            })
+        );
+        let deposit = VaultCase::new(
+            c - 1,
+            Address([0xA5; 32]),
+            &[(VAULT_ADDRESS, 3 * MICRO_PER_JTM), (deposit_marker(&[0x42; 20]), 0)],
+        );
+        let from = pool_with_vault_rules(deposit.view_at(c - 1, locked), raising_vault_rules(c));
+        assert!(deposit.submit(&from).await.is_ok());
+        let shape = |r: Result<crate::destination::DestinationAdmitted, super::SubmitError>| {
+            matches!(
+                destination_refusal(r),
+                Some(jetsam_chain::consensus::destination::state::DestinationBlockError::Vault(
+                    VaultError::ReleaseShape { group: 0 }
+                ))
+            )
+        };
+        let big = ReleaseCase::new(c - 2, 4, 3_000 * MICRO_PER_JTM, 0);
+        let before = pool_with_vault_rules(big.view_at(c - 2, &[]), raising_vault_rules(c));
+        assert!(shape(big.submit(&before).await), "over the window of before");
+        let big = ReleaseCase::new(c - 1, 4, 3_000 * MICRO_PER_JTM, 0);
+        let from = pool_with_vault_rules(big.view_at(c - 1, &[]), raising_vault_rules(c));
+        assert!(!shape(big.submit(&from).await), "a payable shape from c on");
     }
 
     /// The floor of the release tests: `alloc_counter(J − 1)`.

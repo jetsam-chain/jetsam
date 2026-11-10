@@ -229,9 +229,10 @@ pub fn check_deposit(
                 minimum: rules.min_deposit,
             })
         }
+        // D123: the largest deposit of the next block.
         Err(RuleError::DepositAmount { amount, .. }) => Err(DepositRefusal::AboveMaximum {
             amount,
-            maximum: rules.max_deposit,
+            maximum: rules.at(next_height).max_deposit,
         }),
         // One vault output and one marker whose reserved bytes are zero: the
         // recipient is the only part of the shape that can be wrong (V4-b).

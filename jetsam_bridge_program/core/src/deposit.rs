@@ -19,7 +19,7 @@
 use crate::tx;
 use alloc::vec::Vec;
 
-pub use jetsam_vault_rule::{DepositRule, RuleError, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO, VAULT_ADDRESS};
+pub use jetsam_vault_rule::{DepositRule, LegacyDepositCap, RuleError, MAX_DEPOSIT_MICRO, MIN_DEPOSIT_MICRO, VAULT_ADDRESS};
 use jetsam_vault_rule::Group;
 
 /// J of the v1.7 clock this program is built for: `V1_7_ACTIVATION_HEIGHT` of the node's profile of the
@@ -37,8 +37,13 @@ pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(96);
 pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(69_120);
 #[cfg(all(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))]
 compile_error!("rehearsal-v1-7 and test-clock-j69120 are two clocks");
-/// V4 under this program's clock and the definitive constants (vault, amounts, `F` = [`DEPOSITS_FROM_HEIGHT`]).
-pub const DEPOSIT_RULE: DepositRule = DepositRule { deposits_from_height: DEPOSITS_FROM_HEIGHT, ..DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT) };
+/// V4 under this program's clock and the definitive constants (vault, amounts, `F` = [`DEPOSITS_FROM_HEIGHT`], D123's
+/// largest deposit and the test chain's of before, [`LEGACY_DEPOSIT_CAP`]).
+pub const DEPOSIT_RULE: DepositRule = DepositRule {
+    deposits_from_height: DEPOSITS_FROM_HEIGHT,
+    legacy: LEGACY_DEPOSIT_CAP,
+    ..DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT)
+};
 
 /// A deposit of a block, as the program proves it: its user group, logical txid (`jetsam_vault_rule`'s, the
 /// one the robot advances under, A5-12), recipient, amount.
@@ -176,3 +181,14 @@ pub const DEPOSITS_FROM_HEIGHT: Option<u64> = match V1_7_ACTIVATION_HEIGHT {
 };
 #[cfg(not(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120")))))]
 pub const DEPOSITS_FROM_HEIGHT: Option<u64> = jetsam_vault_rule::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT);
+
+/// D123: the largest deposit of before on this program's clock. On the program's own `testnet` (its guest build does not
+/// hold `jetsam_vault_rule/testnet`), the test chain's 1 000 JTM below its caps height
+/// (`jetsam_vault_rule::TESTNET_CAPS_HEIGHT`, not chosen: every height); otherwise `jetsam_vault_rule`'s rule (a build
+/// holding the node's `jetsam_chain/testnet`: the same; the public network and the rehearsal: none, D123's 50 000 JTM
+/// from J). Changing it, or the caps height, changes the program's key; `jetsam_bridge_xtest` checks it against the
+/// node's.
+#[cfg(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120"))))]
+pub const LEGACY_DEPOSIT_CAP: Option<LegacyDepositCap> = Some(jetsam_vault_rule::TESTNET_LEGACY_DEPOSIT_CAP);
+#[cfg(not(all(feature = "testnet", not(any(feature = "rehearsal-v1-7", feature = "test-clock-j69120")))))]
+pub const LEGACY_DEPOSIT_CAP: Option<LegacyDepositCap> = DepositRule::for_activation(V1_7_ACTIVATION_HEIGHT).legacy;
