@@ -53,17 +53,23 @@ pub const FILL_ALLOWLIST: &[&str] = &[
     "getDepositBlock",
 ];
 
-/// The node methods `jg-relay fast-release` may call: public reads (the tip, the vault's floor and
-/// slots, the payee of a burn, an epoch anchor, slot hints) and the one submission of its intent; nothing
-/// that spends, signs with or reveals a wallet.
+/// The node methods the relay's return over Base may call (`fast-release`, `fast-run`, `light-feed`,
+/// `fast-revoke`): public reads (the tip, the vault's floor and slots, the payee of a burn, the light client's
+/// committees, the fast lane, an epoch anchor, slot hints), the submission of its intents, and one wallet
+/// method, with the node's RPC cookie: the payment of a destination object's marker
+/// (`walletBuildDestinationPayment`, which pays nothing but that marker and the fee). Nothing else that
+/// spends, signs with or reveals a wallet.
 pub const FAST_RELEASE_ALLOWLIST: &[&str] = &[
     "blockCount",
     "getVaultState",
     "getSlotsByOwner",
     "getAdvances",
+    "getDestinationCommittee",
+    "getFastLane",
     "getEpochAnchor",
     "getSlotHints",
     "submitDestinationObject",
+    "walletBuildDestinationPayment",
 ];
 
 /// Tor's default SOCKS port.
@@ -346,6 +352,84 @@ pub fn call_via_bearer(
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// One `GET` of `url` by `egress`, its body read as JSON (a beacon node's REST
+/// API: `Content-Length`, chunked, or to the end of the connection).
+pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Value> {
+    let route = egress.route(url)?;
+    let Target { authority, path, .. } = target(url)?;
+    let mut s = match &route {
+        Route::Resolve(hostport) => {
+            let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
+            TcpStream::connect_timeout(&addr, timeout)?
+        }
+        Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
+        Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
+    };
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    if let Route::Socks { host, port, .. } = &route {
+        socks5_connect(&mut s, host, *port)?;
+    }
+    let head = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(head.as_bytes())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let (head, body) = http_body(&raw).map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+    anyhow::ensure!(
+        head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200"),
+        "HTTP error from {url}: {}",
+        head.lines().next().unwrap_or("")
+    );
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// The head (lower case) and the body of a whole HTTP answer: `Content-Length`
+/// bytes, the chunks of a chunked one, or the rest.
+pub fn http_body(raw: &[u8]) -> anyhow::Result<(String, Vec<u8>)> {
+    let i = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("no HTTP head"))?;
+    let head = String::from_utf8_lossy(&raw[..i]).to_ascii_lowercase();
+    let rest = &raw[i + 4..];
+    if head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked")) {
+        let mut body = Vec::new();
+        let mut at = 0;
+        loop {
+            let line_end = rest[at..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .ok_or_else(|| anyhow::anyhow!("truncated chunk size"))?;
+            let size_text = String::from_utf8_lossy(&rest[at..at + line_end]);
+            let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| anyhow::anyhow!("bad chunk size {size_text}"))?;
+            at += line_end + 2;
+            if size == 0 {
+                break;
+            }
+            let chunk = rest
+                .get(at..at + size)
+                .ok_or_else(|| anyhow::anyhow!("truncated chunk"))?;
+            body.extend_from_slice(chunk);
+            at += size + 2;
+        }
+        return Ok((head, body));
+    }
+    let length = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>()))
+        .transpose()?;
+    let body = match length {
+        Some(len) => rest.get(..len).ok_or_else(|| anyhow::anyhow!("truncated body"))?.to_vec(),
+        None => rest.to_vec(),
+    };
+    Ok((head, body))
+}
+
 /// A node client restricted to `allow`.
 pub struct NodeClient {
     pub url: String,
@@ -394,6 +478,18 @@ impl NodeClient {
             anyhow::bail!("method {method} is not in this client's allow-list");
         }
         call_via(&self.egress, &self.url, &format!("jetsam_{method}"), params, self.timeout)
+    }
+
+    /// [`Self::call`] with the node's RPC cookie, read from `cookie` at every call (it changes at every
+    /// start of the node).
+    pub fn call_with_cookie(&self, method: &str, params: Value, cookie: &std::path::Path) -> anyhow::Result<Value> {
+        if !self.allow.contains(&method) {
+            anyhow::bail!("method {method} is not in this client's allow-list");
+        }
+        let text = std::fs::read_to_string(cookie).map_err(|e| anyhow::anyhow!("node cookie {}: {e}", cookie.display()))?;
+        let text = text.trim();
+        anyhow::ensure!(!text.is_empty(), "node cookie {}: empty", cookie.display());
+        call_via_bearer(&self.egress, &self.url, &format!("jetsam_{method}"), params, self.timeout, Some(text))
     }
 }
 

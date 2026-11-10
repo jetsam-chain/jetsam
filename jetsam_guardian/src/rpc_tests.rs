@@ -347,11 +347,16 @@ fn fast_release_rpc_client_reads_and_submits_its_intent_and_nothing_else() {
         let e = c.call(m, json!([])).unwrap_err().to_string();
         assert!(e.contains("allow-list"), "{m}: {e}");
     }
-    for m in ["getSlotsByOwner", "getAdvances", "getVaultState", "submitDestinationObject"] {
+    for m in ["getSlotsByOwner", "getAdvances", "getVaultState", "getDestinationCommittee", "getFastLane", "submitDestinationObject"] {
         let e = c.call(m, json!([1])).unwrap_err().to_string();
         assert!(!e.contains("allow-list"), "{m}: {e}");
     }
-    assert!(FAST_RELEASE_ALLOWLIST.iter().all(|m| !m.starts_with("wallet") && *m != "stop"));
+    // One wallet method only: the payment of a destination object's marker; one submission.
+    assert_eq!(
+        FAST_RELEASE_ALLOWLIST.iter().filter(|m| m.starts_with("wallet")).collect::<Vec<_>>(),
+        vec![&"walletBuildDestinationPayment"]
+    );
+    assert!(!FAST_RELEASE_ALLOWLIST.contains(&"stop"));
     assert_eq!(FAST_RELEASE_ALLOWLIST.iter().filter(|m| m.starts_with("submit")).count(), 1);
 }
 

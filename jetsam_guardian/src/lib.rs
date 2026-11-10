@@ -42,6 +42,7 @@ pub mod ipc;
 pub mod journal;
 pub mod l1;
 pub mod l1tx;
+pub mod light_feed;
 pub mod observer;
 pub mod relay;
 pub mod relayer;

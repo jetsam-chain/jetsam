@@ -309,7 +309,7 @@ pub fn select_vault_slots(slots: &[VaultSlot], floor: u64, amount: u64) -> Optio
 /// The pages of one logical transaction from `input_owner`: `inputs` eight
 /// per page, `outputs` two per page (each on the slot hint of its rank), the
 /// fee on the first page.
-fn pack_group(
+pub(crate) fn pack_group(
     input_owner: Address,
     inputs: &[VaultSlot],
     outputs: &[(Address, u64)],
@@ -673,7 +673,9 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
         say(&format!("ALERT FAST_RELEASE {line}"));
         anyhow!("fast-release: {line}")
     };
-    let rules = DestinationRules::CONSENSUS;
+    // The rules the return over Base reads by (its anchor and bridge): none
+    // while this build's return-over-Base height is not armed.
+    let rules = DestinationRules::CONSENSUS.effective_at(u64::MAX);
     let params = rules.base_return.base;
     let bridge = rules.bridge.ok_or_else(|| {
         alert("this build has no bridge (L1_BRIDGE unset): nothing to release".into())
