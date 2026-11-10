@@ -1202,3 +1202,17 @@ fn f2_a_heavier_forking_child_locked_at_its_parents_l_is_planned_with_no_deposit
         assert_eq!(s.deposits, deposits_upto(&found, GL, 32), "the parent's tree, unchanged");
     }
 }
+
+/// E-5 (audit 2026-11-10): one node alone may make the relayer drop up to eight blocks, never more, and never the
+/// locked block of a point it knows on its chain; beyond, `min_nodes` nodes must serve the new branch.
+#[test]
+fn a_reorganization_deeper_than_eight_blocks_or_below_a_known_lock_needs_min_nodes() {
+    assert_eq!(MAX_REORG_ONE_NODE, 8);
+    assert!(!reorg_needs_nodes(30, 29, 0), "one block");
+    assert!(!reorg_needs_nodes(30, 22, 0), "eight blocks");
+    assert!(reorg_needs_nodes(30, 21, 0), "nine blocks");
+    assert!(reorg_needs_nodes(30, 5, 0), "twenty-five blocks");
+    assert!(!reorg_needs_nodes(30, 25, 25), "down to a known lock, not below it");
+    assert!(reorg_needs_nodes(30, 24, 25), "below a known lock, two blocks above it are enough");
+    assert!(!reorg_needs_nodes(5, 30, 0), "no block dropped");
+}

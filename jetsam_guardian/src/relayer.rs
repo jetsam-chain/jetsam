@@ -1007,6 +1007,18 @@ pub fn outputs_created(chain: &Chain, height: u64) -> Option<u64> {
     chain.header_at(height)?.alloc_counter.checked_sub(parent.alloc_counter)
 }
 
+/// E-5 (audit 2026-11-10): one node alone makes the relayer drop at most this many blocks of its chain.
+pub const MAX_REORG_ONE_NODE: u64 = 8;
+
+/// E-5: a reorganization of the relayer's chain from its tip `tip` down to the common ancestor `common` that one node
+/// alone may not decide: more than [`MAX_REORG_ONE_NODE`] blocks dropped, or the locked block of a point it knows on
+/// this chain (`locked_floor`, its highest such locked height) dropped. It is followed only when `min_nodes` nodes
+/// serve the new branch (a node stuck on a branch, or lying on `getBlockHash`, would make the relayer forget its
+/// archive's entries above the ancestor: `MissingBody` at every block no node serves any more, then silence).
+pub fn reorg_needs_nodes(tip: u64, common: u64, locked_floor: u64) -> bool {
+    tip.saturating_sub(common) > MAX_REORG_ONE_NODE || common < locked_floor
+}
+
 /// One source of a block body: its name and a reader (`Ok(None)`: it does not serve the block).
 pub type BodySource<'a> = (String, Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>> + 'a>);
 

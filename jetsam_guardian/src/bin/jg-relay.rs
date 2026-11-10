@@ -243,6 +243,27 @@ impl Relay {
         // a node that is only behind agrees up to its tip: nothing is dropped (its lag is no reorganization)
         if common < top {
             let from = self.chain.tip_height();
+            // E-5: deeper than eight blocks, or below a known point's locked block: never on one node's word
+            let floor = self.state.known.values().filter(|k| self.chain.id_at(k.cp.locked_height) == Some(k.cp.locked_block_id)).map(|k| k.cp.locked_height).max().unwrap_or(0);
+            if relayer::reorg_needs_nodes(from, common, floor) {
+                let theirs = self.nodes[i].block_hash(common + 1)?;
+                let mut agree = 0;
+                for n in &mut self.nodes {
+                    if theirs.is_some() && n.block_hash(common + 1).ok().flatten() == theirs {
+                        agree += 1;
+                    }
+                }
+                if agree < self.cfg.min_nodes {
+                    let name = self.cfg.nodes[i].name.clone();
+                    log(&format!(
+                        "ALERT DEEP_REORG_REFUSED node {name}: a reorganization from {from} down to {common} (locked floor {floor}) whose block {} {agree} of the nodes serve, min_nodes = {}: not followed",
+                        common + 1,
+                        self.cfg.min_nodes
+                    ));
+                    self.event(json!({"event": "reorg_refused", "from": from, "to": common, "node": name, "agree": agree}));
+                    anyhow::bail!("node {name}: reorganization to {common} refused");
+                }
+            }
             self.chain.truncate_above(common);
             self.archive.follow(&self.chain);
             self.event(json!({"event": "reorg", "from": from, "to": common, "node": self.cfg.nodes[i].name}));

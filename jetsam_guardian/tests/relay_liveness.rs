@@ -6,11 +6,14 @@
 //!
 //! * E-1: an L1 answer that is not a list of logs, a `CheckpointAccepted` left out of an answer, or an
 //!   `eth_blockNumber` ahead of the endpoint's own chain never makes the relayer lose a point for ever.
+//! * E-5: one node alone (stuck on a branch, or lying on `getBlockHash`) never makes the relayer drop more than
+//!   eight blocks of its chain (and with them its archive's entries); `min_nodes` nodes on the new branch do.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,9 +83,19 @@ fn serve(answer: Answer) -> u16 {
 
 /// A fake node serving the chain `c` (shared: a test may move it to another branch while the relayer runs).
 fn node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>) -> u16 {
-    serve(Arc::new(move |method, params| {
+    watched_node(c).0
+}
+
+/// [`node`], and the highest header it served.
+fn watched_node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>) -> (u16, Arc<AtomicU64>) {
+    let served = Arc::new(AtomicU64::new(0));
+    let seen = served.clone();
+    let port = serve(Arc::new(move |method, params| {
         let c = c.lock().unwrap();
         let h = params[0].as_u64().unwrap_or(u64::MAX);
+        if method == "jetsam_getHeaderByHeight" && c.header_at(h).is_some() {
+            seen.fetch_max(h, Ordering::SeqCst);
+        }
         match method {
             "jetsam_blockCount" => json!({"result": c.tip_height()}),
             "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
@@ -90,7 +103,8 @@ fn node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>) -> u16 {
             "jetsam_getBlock" | "jetsam_getDepositBlock" => json!({"result": null}),
             _ => json!({"error": {"code": -32601, "message": "not in this fake"}}),
         }
-    }))
+    }));
+    (port, served)
 }
 
 fn w64(x: u64) -> [u8; 32] {
@@ -376,4 +390,82 @@ fn jg_relay_never_reads_up_to_a_block_its_endpoint_does_not_serve() {
     assert!(learned, "the point of block 150 is never learned; state {}; log:\n{log}", state(&dir));
     assert!(state(&dir)["logs_to"].as_u64().unwrap_or(u64::MAX) <= 200, "never past the endpoint's chain: {}", state(&dir));
     assert!(log.contains("does not serve block 10000000"), "{log}");
+}
+
+// ---------------------------------------------------------------- E-5
+
+fn reorgs(dir: &Path) -> Vec<(u64, u64)> {
+    std::fs::read_to_string(dir.join("state/events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["event"] == "reorg")
+        .map(|v| (v["from"].as_u64().unwrap_or(0), v["to"].as_u64().unwrap_or(0)))
+        .collect()
+}
+
+/// E-5: node 0 goes over to a short branch forked at 5 (stuck there, or lying): alone, it never makes the relayer
+/// drop the 25 blocks above (its archive's entries with them): an ALERT, the relayer follows its other node. Both
+/// nodes on that branch: it is followed. A reorganization of two blocks by one node alone is followed as before.
+#[test]
+fn one_node_alone_never_makes_jg_relay_drop_more_than_eight_blocks() {
+    use jetsam_guardian::chain::Chain;
+    let a = testkit::chain(30, 1);
+    let mut b = testkit::chain(5, 1);
+    testkit::extend(&mut b, 7, 2, 20);
+    let mut c = b.clone();
+    c.truncate_above(10);
+    testkit::extend(&mut c, 3, 3, 20);
+    let (c0, c1): (Arc<Mutex<Chain>>, Arc<Mutex<Chain>>) = (Arc::new(Mutex::new(a.clone())), Arc::new(Mutex::new(a.clone())));
+    let (p0, served0) = watched_node(c0.clone());
+    let p1 = node(c1.clone());
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (_root, dir) = relay_dir(l1(world), &[p0, p1], 2, "");
+    let relay = spawn(&dir, &[]);
+    let synced = wait_for(30, || served0.load(Ordering::SeqCst) >= 30);
+    // node 0 alone on b: refused, every step
+    *c0.lock().unwrap() = b.clone();
+    let alerted = wait_for(30, || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default().matches("ALERT DEEP_REORG_REFUSED").count() >= 2);
+    let alone = reorgs(&dir);
+    // both nodes on b: followed
+    *c1.lock().unwrap() = b.clone();
+    let followed = wait_for(30, || reorgs(&dir).contains(&(30, 5)));
+    // node 0 alone on c (two blocks): followed
+    *c0.lock().unwrap() = c.clone();
+    let shallow = wait_for(30, || reorgs(&dir).contains(&(12, 10)));
+    stop(relay);
+    let log = std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    assert!(synced, "log:\n{log}");
+    assert_eq!(alone, Vec::<(u64, u64)>::new(), "one node alone dropped blocks; log:\n{log}");
+    assert!(alerted, "log:\n{log}");
+    assert!(followed, "both nodes on the branch: {:?}; log:\n{log}", reorgs(&dir));
+    assert!(shallow, "a reorganization of two blocks: {:?}; log:\n{log}", reorgs(&dir));
+}
+
+/// E-5: below the locked block of a point the relayer knows on its chain (here L = 25), one node alone never makes
+/// it drop blocks, even fewer than eight.
+#[test]
+fn one_node_alone_never_makes_jg_relay_drop_a_known_points_locked_block() {
+    use jetsam_guardian::chain::Chain;
+    let a = testkit::chain(30, 1);
+    let mut d = a.clone();
+    d.truncate_above(23);
+    testkit::extend(&mut d, 3, 4, 20);
+    let cp = Checkpoint { locked_height: 25, locked_block_id: a.id_at(25).unwrap(), ..point() };
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    world.lock().unwrap().logs.push((50, accepted_log(&cp, 50)));
+    let c0: Arc<Mutex<Chain>> = Arc::new(Mutex::new(a.clone()));
+    let (p0, served0) = watched_node(c0.clone());
+    let p1 = node(Arc::new(Mutex::new(a.clone())));
+    let (_root, dir) = relay_dir(l1(world), &[p0, p1], 2, "");
+    let relay = spawn(&dir, &[]);
+    let ready = wait_for(30, || served0.load(Ordering::SeqCst) >= 30 && knows(&dir, &cp));
+    *c0.lock().unwrap() = d;
+    let alerted = wait_for(30, || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default().contains("ALERT DEEP_REORG_REFUSED"));
+    std::thread::sleep(Duration::from_secs(2));
+    stop(relay);
+    let log = std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    assert!(ready, "log:\n{log}");
+    assert_eq!(reorgs(&dir), Vec::<(u64, u64)>::new(), "seven blocks dropped below L = 25 on one node's word; log:\n{log}");
+    assert!(alerted && log.contains("locked floor 25"), "log:\n{log}");
 }
