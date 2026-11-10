@@ -747,5 +747,236 @@ pub fn verify_base_release(
     Ok(base)
 }
 
+// ---------------------------------------------------------------------------
+// The section objects of the return over Base (D107: nodes deduplicated)
+// ---------------------------------------------------------------------------
+
+/// Most distinct nodes one `BaseGameProof` object carries (64-67 measured).
+pub const MAX_GAME_PROOF_NODES: usize = 256;
+/// Longest argument list a game proof carries (776 bytes for type 621).
+pub const MAX_GAME_ARGS_BYTES: usize = 2_048;
+/// Most slot proofs of one contract (the rule reads at most five).
+pub const MAX_CONTRACT_SLOTS: usize = 8;
+/// Bytes of an `OutputRootPreimage` object: version, state root, message
+/// passer storage root, block hash.
+pub const OUTPUT_ROOT_PREIMAGE_BYTES: usize = 128;
+
+/// Why an object's payload is not a Base game proof or an output preimage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseCodecError {
+    Truncated,
+    TrailingBytes,
+    TooManyNodes,
+    NodeTooLong,
+    TooManySlots,
+    ArgsTooLong,
+    /// A node index outside the node table.
+    BadIndex,
+    /// Not the canonical encoding: a node twice in the table, a node no
+    /// proof references, or the table out of first-reference order.
+    NonCanonical,
+}
+
+/// The `BaseGameProof` object payload (D107, nodes deduplicated): the game,
+/// its arguments, the table of the distinct proof nodes in the order the
+/// proofs first reference them, then the five contracts (registry, factory,
+/// game, `SystemConfig`, `SuperchainConfig`), each its account proof and its
+/// slot proofs as lists of indices into the table.
+///
+/// ```text
+/// payload  = game:20 ‖ args_len:u16 ‖ args ‖ nodes:u16 ‖ (len:u16 ‖ node)* ‖ contract{5}
+/// contract = list ‖ slots:u8 ‖ list{slots}
+/// list     = count:u8 ‖ index:u16{count}
+/// ```
+///
+/// Integers little-endian. One encoding per proof: the decoder refuses any
+/// other ([`BaseCodecError::NonCanonical`]).
+pub fn encode_game_proof(proof: &GameProof) -> Vec<u8> {
+    let contracts = game_proof_contracts(proof);
+    let mut table: Vec<&[u8]> = Vec::new();
+    let mut index: std::collections::HashMap<&[u8], u16> = std::collections::HashMap::new();
+    let mut lists: Vec<Vec<u16>> = Vec::new();
+    for contract in contracts {
+        for list in std::iter::once(&contract.account).chain(contract.slots.iter()) {
+            let mut indices = Vec::with_capacity(list.len());
+            for node in list {
+                let at = match index.get(node.as_slice()) {
+                    Some(at) => *at,
+                    None => {
+                        let at = u16::try_from(table.len()).expect("node table fits u16");
+                        table.push(node);
+                        index.insert(node, at);
+                        at
+                    }
+                };
+                indices.push(at);
+            }
+            lists.push(indices);
+        }
+    }
+    let mut out = proof.game.to_vec();
+    out.extend_from_slice(
+        &u16::try_from(proof.args.len())
+            .expect("arguments fit u16")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&proof.args);
+    out.extend_from_slice(
+        &u16::try_from(table.len())
+            .expect("table fits u16")
+            .to_le_bytes(),
+    );
+    for node in &table {
+        out.extend_from_slice(
+            &u16::try_from(node.len())
+                .expect("node fits u16")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(node);
+    }
+    let mut lists = lists.into_iter();
+    let mut put = |out: &mut Vec<u8>| {
+        let indices = lists.next().expect("one list per proof");
+        out.push(u8::try_from(indices.len()).expect("list fits u8"));
+        for at in indices {
+            out.extend_from_slice(&at.to_le_bytes());
+        }
+    };
+    for contract in contracts {
+        put(&mut out);
+        out.push(u8::try_from(contract.slots.len()).expect("slots fit u8"));
+        for _ in &contract.slots {
+            put(&mut out);
+        }
+    }
+    out
+}
+
+/// The five contracts of a game proof, in the order of its object.
+fn game_proof_contracts(proof: &GameProof) -> [&ContractProof; 5] {
+    [
+        &proof.anchor_state_registry,
+        &proof.dispute_game_factory,
+        &proof.game_account,
+        &proof.system_config,
+        &proof.superchain_config,
+    ]
+}
+
+fn take_bytes<'a>(src: &mut &'a [u8], n: usize) -> Result<&'a [u8], BaseCodecError> {
+    if src.len() < n {
+        return Err(BaseCodecError::Truncated);
+    }
+    let (head, tail) = src.split_at(n);
+    *src = tail;
+    Ok(head)
+}
+
+fn take_u16(src: &mut &[u8]) -> Result<usize, BaseCodecError> {
+    Ok(usize::from(u16::from_le_bytes(
+        take_bytes(src, 2)?.try_into().expect("two bytes"),
+    )))
+}
+
+fn take_u8(src: &mut &[u8]) -> Result<usize, BaseCodecError> {
+    Ok(usize::from(take_bytes(src, 1)?[0]))
+}
+
+/// Decode [`encode_game_proof`]; every bound is checked before allocating,
+/// and only the canonical encoding is accepted.
+pub fn decode_game_proof(bytes: &[u8]) -> Result<GameProof, BaseCodecError> {
+    use crate::consensus::vault::{MAX_PROOF_NODES, MAX_PROOF_NODE_BYTES};
+    let mut src = bytes;
+    let game: Address = take_bytes(&mut src, 20)?.try_into().expect("20 bytes");
+    let args_len = take_u16(&mut src)?;
+    if args_len > MAX_GAME_ARGS_BYTES {
+        return Err(BaseCodecError::ArgsTooLong);
+    }
+    let args = take_bytes(&mut src, args_len)?.to_vec();
+    let count = take_u16(&mut src)?;
+    if count > MAX_GAME_PROOF_NODES {
+        return Err(BaseCodecError::TooManyNodes);
+    }
+    let mut table: Vec<&[u8]> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = take_u16(&mut src)?;
+        if len == 0 || len > MAX_PROOF_NODE_BYTES {
+            return Err(BaseCodecError::NodeTooLong);
+        }
+        table.push(take_bytes(&mut src, len)?);
+    }
+    let list = |src: &mut &[u8]| -> Result<Nodes, BaseCodecError> {
+        let len = take_u8(src)?;
+        if len > MAX_PROOF_NODES {
+            return Err(BaseCodecError::TooManyNodes);
+        }
+        (0..len)
+            .map(|_| {
+                let at = take_u16(src)?;
+                table
+                    .get(at)
+                    .map(|node| node.to_vec())
+                    .ok_or(BaseCodecError::BadIndex)
+            })
+            .collect()
+    };
+    let contract = |src: &mut &[u8]| -> Result<ContractProof, BaseCodecError> {
+        let account = list(src)?;
+        let slots = take_u8(src)?;
+        if slots > MAX_CONTRACT_SLOTS {
+            return Err(BaseCodecError::TooManySlots);
+        }
+        Ok(ContractProof {
+            account,
+            slots: (0..slots).map(|_| list(src)).collect::<Result<_, _>>()?,
+        })
+    };
+    let proof = GameProof {
+        game,
+        args,
+        anchor_state_registry: contract(&mut src)?,
+        dispute_game_factory: contract(&mut src)?,
+        game_account: contract(&mut src)?,
+        system_config: contract(&mut src)?,
+        superchain_config: contract(&mut src)?,
+    };
+    if !src.is_empty() {
+        return Err(BaseCodecError::TrailingBytes);
+    }
+    // One encoding per proof: each node once, each referenced, in the order
+    // of first reference.
+    if encode_game_proof(&proof) != bytes {
+        return Err(BaseCodecError::NonCanonical);
+    }
+    Ok(proof)
+}
+
+/// The `OutputRootPreimage` object payload: its four words, in order.
+pub fn encode_output_root_preimage(preimage: &OutputRootPreimage) -> Vec<u8> {
+    [
+        preimage.version,
+        preimage.state_root,
+        preimage.message_passer_storage_root,
+        preimage.block_hash,
+    ]
+    .concat()
+}
+
+/// Decode [`encode_output_root_preimage`]: exactly 128 bytes.
+pub fn decode_output_root_preimage(bytes: &[u8]) -> Result<OutputRootPreimage, BaseCodecError> {
+    match bytes.len().cmp(&OUTPUT_ROOT_PREIMAGE_BYTES) {
+        std::cmp::Ordering::Less => return Err(BaseCodecError::Truncated),
+        std::cmp::Ordering::Greater => return Err(BaseCodecError::TrailingBytes),
+        std::cmp::Ordering::Equal => {}
+    }
+    let word = |i: usize| -> Root { bytes[32 * i..32 * (i + 1)].try_into().expect("32 bytes") };
+    Ok(OutputRootPreimage {
+        version: word(0),
+        state_root: word(1),
+        message_passer_storage_root: word(2),
+        block_hash: word(3),
+    })
+}
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

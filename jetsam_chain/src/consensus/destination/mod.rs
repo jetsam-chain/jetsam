@@ -25,6 +25,7 @@
 //! the guardian objects 0x20..=0x26) is judged by the rules that read it, not
 //! by the wire, which checks only a guardian object's exact size.
 
+pub mod advance;
 pub mod base_read;
 pub mod bls;
 pub mod forks;
@@ -62,6 +63,8 @@ const TAG_COMMITTEE_UPDATE: u8 = 1;
 const TAG_FINALITY_UPDATE: u8 = 2;
 const TAG_BRIDGE_ACCOUNT_PROOF: u8 = 3;
 const TAG_VAULT_RELEASE: u8 = 4;
+const TAG_BASE_GAME_PROOF: u8 = 5;
+const TAG_OUTPUT_ROOT_PREIMAGE: u8 = 6;
 
 /// What a destination object is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -74,6 +77,15 @@ pub enum DestinationObjectKind {
     BridgeAccountProof,
     /// One release from the vault, with its storage proof.
     VaultRelease,
+    /// The return over Base (D107): the proof, under the finalized L1 root,
+    /// that a dispute game of Base is valid
+    /// ([`base_read::encode_game_proof`], nodes deduplicated). Decoded only
+    /// by a build whose return-over-Base height is armed.
+    BaseGameProof,
+    /// The return over Base: the preimage of the game's output root
+    /// ([`base_read::encode_output_root_preimage`]). Decoded only by a build
+    /// whose return-over-Base height is armed.
+    OutputRootPreimage,
     /// A guardian object (codes 0x20..=0x26), judged by
     /// [`crate::consensus::guardian`].
     Guardian(GuardianObjectKind),
@@ -86,6 +98,8 @@ impl DestinationObjectKind {
             Self::FinalityUpdate => TAG_FINALITY_UPDATE,
             Self::BridgeAccountProof => TAG_BRIDGE_ACCOUNT_PROOF,
             Self::VaultRelease => TAG_VAULT_RELEASE,
+            Self::BaseGameProof => TAG_BASE_GAME_PROOF,
+            Self::OutputRootPreimage => TAG_OUTPUT_ROOT_PREIMAGE,
             Self::Guardian(kind) => kind.section_code(),
         }
     }
@@ -96,12 +110,32 @@ impl DestinationObjectKind {
             TAG_FINALITY_UPDATE => Some(Self::FinalityUpdate),
             TAG_BRIDGE_ACCOUNT_PROOF => Some(Self::BridgeAccountProof),
             TAG_VAULT_RELEASE => Some(Self::VaultRelease),
+            TAG_BASE_GAME_PROOF => Some(Self::BaseGameProof),
+            TAG_OUTPUT_ROOT_PREIMAGE => Some(Self::OutputRootPreimage),
             code => match GuardianObjectKind::from_section_code(code) {
                 Some(kind) => Some(Self::Guardian(kind)),
                 None => None,
             },
         }
     }
+}
+
+impl DestinationObjectKind {
+    /// The objects of the return over Base (tags 5 and 6).
+    pub const fn is_base_return(self) -> bool {
+        matches!(self, Self::BaseGameProof | Self::OutputRootPreimage)
+    }
+}
+
+/// Whether this build decodes the objects of the return over Base: only once
+/// its return-over-Base height is armed. A dormant build reads tags 5 and 6
+/// as a build without them does (an unknown tag), so that, until the
+/// operator arms the height, its wire is exactly theirs.
+pub fn base_objects_on_the_wire() -> bool {
+    state::DestinationRules::current()
+        .base_return
+        .activation_height
+        .is_some()
 }
 
 /// One object of the section: its kind and its canonical payload.
@@ -168,6 +202,9 @@ pub fn decode_destination_section(src: &mut &[u8]) -> Result<DestinationSection,
     for _ in 0..count {
         let tag = *take(src, 1)?.first().expect("one byte requested");
         let kind = DestinationObjectKind::from_tag(tag).ok_or(WireError::BadMarker)?;
+        if kind.is_base_return() && !base_objects_on_the_wire() {
+            return Err(WireError::BadMarker);
+        }
         let len = u32::from_le_bytes(take(src, 4)?.try_into().expect("four bytes")) as usize;
         if len == 0 {
             return Err(WireError::NonCanonicalBody);

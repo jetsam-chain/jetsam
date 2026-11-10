@@ -110,6 +110,21 @@ pub const L1_MAINNET: L1Network = L1Network {
     gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
 };
 
+/// Sepolia, the L1 Base Sepolia settles on (the test chain's return over
+/// Base, D94): genesis validators root `0xd8ea…8078`, Fulu at epoch 272 640
+/// (`0x90000075`), Gloas `0x90000076` (measured on two beacon nodes, T0.8;
+/// the Sepolia vectors of the light client's tests read under it).
+pub const L1_SEPOLIA: L1Network = L1Network {
+    genesis_validators_root: [
+        0xd8, 0xea, 0x17, 0x1f, 0x3c, 0x94, 0xae, 0xa2, 0x1e, 0xbc, 0x42, 0xa1, 0xed, 0x61, 0x05,
+        0x2a, 0xcf, 0x3f, 0x92, 0x09, 0xc0, 0x0e, 0x4e, 0xfb, 0xaa, 0xdd, 0xac, 0x09, 0xed, 0x9b,
+        0x80, 0x78,
+    ],
+    fulu_fork_epoch: 272_640,
+    fulu_fork_version: [0x90, 0x00, 0x00, 0x75],
+    gloas_fork_version: [0x90, 0x00, 0x00, 0x76],
+};
+
 /// The rehearsal's synthetic L1 (`rehearsal_l1`, A3-8): genesis validators
 /// root `sha256("jetsam-v17-rehearsal/synthetic-l1/genesis-validators-root")`
 /// (checked by a test), the main network's Fulu epoch and versions. Read only

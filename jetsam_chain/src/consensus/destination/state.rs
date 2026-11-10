@@ -43,26 +43,39 @@ use std::collections::BTreeMap;
 use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
 
+use super::advance::{
+    advance_marker, advance_marker_fields, advance_transfer_marker, advance_transfer_marker_n,
+    release_payee, validate_block_advances, AdvanceBook, AdvanceEffect, AdvanceEntry,
+    AdvanceError, AdvanceRules,
+};
+use super::base_read::{
+    decode_game_proof, decode_output_root_preimage, verify_base_state_root, BaseParams,
+    BaseReturnError,
+};
 use super::bls::{committee_keys, CommitteeKeys};
 use super::forks::{period_of_slot, L1Network};
 use super::l1_read::{verify_bridge_account, verify_withdrawal, L1BridgeParams, L1ReadError};
 use super::light_client::{
-    verify_committee_update, verify_finality_update, KnownCommittee, LightClientError,
+    verify_committee_update, verify_finality_update, FinalizedExecution, KnownCommittee,
+    LightClientError,
 };
 use super::ssz::{LightClientFinalityUpdate, LightClientUpdate, Root};
 use super::DestinationObjectKind;
 use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::params::{
-    v1_7_active_with, CONSENSUS_FINALITY_DEPTH, V1_7_ACTIVATION_HEIGHT,
+    v1_7_active_with, v1_7_base_return_active_with, CONSENSUS_FINALITY_DEPTH,
+    V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT,
 };
 use crate::consensus::vault::{
-    decode_bridge_account_proof, destination_marker_kind, validate_block_vault,
+    decode_bridge_account_proof, destination_marker_kind, validate_block_vault_paying,
     DestinationMarkerKind, ReleasedSet, VaultContext, VaultEffect, VaultError, VaultRelease,
     VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG,
 };
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod base_return_tests;
 
 /// Blocks whose undo a destination state keeps: twice the deepest reorg.
 pub const DESTINATION_UNDO_BLOCKS: u64 = 2 * CONSENSUS_FINALITY_DEPTH;
@@ -155,8 +168,55 @@ pub const L1_BRIDGE: Option<L1BridgeParams> = None;
 #[cfg(feature = "rehearsal-v1-7")]
 pub const L1_BRIDGE: Option<L1BridgeParams> = Some(REHEARSAL_L1_BRIDGE);
 
+/// The L1 the return over Base reads (the L1 its Base network settles on):
+/// the L1's main network for Base's main network.
+#[cfg(not(feature = "testnet"))]
+pub const BASE_RETURN_L1_NETWORK: L1Network = super::forks::L1_MAINNET;
+/// The test chain returns over Base Sepolia (D94, D99), which settles on
+/// Sepolia.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_L1_NETWORK: L1Network = super::forks::L1_SEPOLIA;
+/// **Private builds only**: the rehearsal's synthetic L1 (its return over
+/// Base stays dormant, `V1_7_BASE_RETURN_HEIGHT`).
+#[cfg(feature = "rehearsal-v1-7")]
+pub const BASE_RETURN_L1_NETWORK: L1Network = super::forks::L1_REHEARSAL;
+
+/// The Base contracts the return reads on that L1, pinned (measured
+/// 2026-11-09): Base's main network.
+#[cfg(not(feature = "testnet"))]
+pub const BASE_RETURN_PARAMS: BaseParams = super::base_read::BASE_MAINNET;
+/// The test chain's (and the dormant rehearsal's): Base Sepolia.
+#[cfg(feature = "testnet")]
+pub const BASE_RETURN_PARAMS: BaseParams = super::base_read::BASE_SEPOLIA;
+
+/// The return over Base (D94, D101, D107): its height, the L1 it reads from
+/// that height on, Base's pinned contracts there, the advance. The bridge it
+/// reads under the Base state root is [`DestinationRules::bridge`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseReturnRules {
+    /// [`V1_7_BASE_RETURN_HEIGHT`]: `None` on every profile until armed.
+    pub activation_height: Option<u64>,
+    /// The L1 Base settles on: the light client's network from the height on.
+    pub network: L1Network,
+    pub base: BaseParams,
+    pub advance: AdvanceRules,
+}
+
+impl BaseReturnRules {
+    pub const CONSENSUS: Self = Self {
+        activation_height: V1_7_BASE_RETURN_HEIGHT,
+        network: BASE_RETURN_L1_NETWORK,
+        base: BASE_RETURN_PARAMS,
+        advance: AdvanceRules::CONSENSUS,
+    };
+
+    pub const fn active_at(&self, height: u64) -> bool {
+        v1_7_base_return_active_with(height, self.activation_height)
+    }
+}
+
 /// The destination rules: the v1.7 clock, the L1, its anchor, the bridge
-/// contract, the vault gate.
+/// contract, the vault gate, the return over Base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DestinationRules {
     pub activation_height: Option<u64>,
@@ -164,6 +224,7 @@ pub struct DestinationRules {
     pub anchor: Option<L1Anchor>,
     pub bridge: Option<L1BridgeParams>,
     pub vault: VaultRules,
+    pub base_return: BaseReturnRules,
 }
 
 impl DestinationRules {
@@ -174,7 +235,22 @@ impl DestinationRules {
         anchor: L1_ANCHOR,
         bridge: L1_BRIDGE,
         vault: VaultRules::current(),
+        base_return: BaseReturnRules::CONSENSUS,
     };
+
+    /// The rules a block at `height` is judged by: from the return-over-Base
+    /// height on, the light client reads the L1 Base settles on; below it
+    /// (and under a dormant height), these rules unchanged.
+    pub const fn effective_at(&self, height: u64) -> Self {
+        if self.base_return.active_at(height) {
+            Self {
+                network: self.base_return.network,
+                ..*self
+            }
+        } else {
+            *self
+        }
+    }
 
     /// The rules in force: [`Self::CONSENSUS`]. In this crate's own unit
     /// tests, a test may install other rules on its thread
@@ -237,6 +313,24 @@ pub struct WindowRelease {
     pub amount: u64,
 }
 
+/// What one block did to the advances (the return over Base), kept to undo
+/// it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvanceUndo {
+    /// The advances it made.
+    pub created: Vec<u64>,
+    /// The advances its releases consumed, as they were.
+    pub consumed: Vec<(u64, AdvanceEntry)>,
+    /// The claims it transferred, each with its creditor before.
+    pub transfers: Vec<(u64, Address)>,
+}
+
+impl AdvanceUndo {
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.consumed.is_empty() && self.transfers.is_empty()
+    }
+}
+
 /// What one block did to the state, kept to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestinationUndo {
@@ -246,6 +340,8 @@ pub struct DestinationUndo {
     pub bridge_locked_before: u64,
     /// The committees before it, when it changed them.
     pub committees_before: Option<Vec<CommitteeRef>>,
+    /// What it did to the advances (empty below the return over Base).
+    pub advances: AdvanceUndo,
 }
 
 /// The destination state of a branch after its block `tip` (module docs).
@@ -264,6 +360,8 @@ pub struct DestinationState {
     pub bridge_locked: u64,
     /// The releases of the last window, in chain order.
     pub window: Vec<WindowRelease>,
+    /// The advances not yet consumed (the return over Base; empty below it).
+    pub advances: AdvanceBook,
     /// One per block, the last [`DESTINATION_UNDO_BLOCKS`] at most,
     /// increasing heights ending at `tip` (none for a state installed from
     /// a snapshot: no reorg goes below its boundary).
@@ -293,6 +391,7 @@ impl DestinationState {
             released: ReleasedSet::new(),
             bridge_locked: 0,
             window: Vec::new(),
+            advances: AdvanceBook::new(),
             undo: Vec::new(),
         }
     }
@@ -348,6 +447,7 @@ impl DestinationState {
             });
         }
         let paid: Vec<u64> = effect.vault.releases.iter().map(|(n, _, _)| *n).collect();
+        let advances = self.apply_advances(&effect.advances);
         self.undo.push(DestinationUndo {
             height: effect.height,
             paid: paid.clone(),
@@ -356,6 +456,7 @@ impl DestinationState {
                 .committees_after
                 .as_ref()
                 .map(|_| self.committees.clone()),
+            advances,
         });
         if self.undo.len() as u64 > DESTINATION_UNDO_BLOCKS {
             self.undo.remove(0);
@@ -388,6 +489,41 @@ impl DestinationState {
         Ok(())
     }
 
+    /// A block's effect on the advances, and its undo: the releases consume
+    /// first, then the block's advances are made and its claims transferred
+    /// (a block never does two of these to one `n`).
+    fn apply_advances(&mut self, effect: &AdvanceEffect) -> AdvanceUndo {
+        let mut undo = AdvanceUndo::default();
+        for n in &effect.consumed {
+            if let Some(entry) = self.advances.remove(*n) {
+                undo.consumed.push((*n, entry));
+            }
+        }
+        for (n, entry) in &effect.created {
+            self.advances.insert(*n, *entry);
+            undo.created.push(*n);
+        }
+        for (n, creditor) in &effect.transfers {
+            if let Some(before) = self.advances.set_creditor(*n, *creditor) {
+                undo.transfers.push((*n, before));
+            }
+        }
+        undo
+    }
+
+    /// Undo [`Self::apply_advances`].
+    fn undo_advances(&mut self, undo: &AdvanceUndo) {
+        for (n, before) in undo.transfers.iter().rev() {
+            self.advances.set_creditor(*n, *before);
+        }
+        for n in undo.created.iter().rev() {
+            self.advances.remove(*n);
+        }
+        for (n, entry) in undo.consumed.iter().rev() {
+            self.advances.insert(*n, *entry);
+        }
+    }
+
     /// The state after the block at `height`, from this one at a higher tip:
     /// `None` below J (the branch had no destination state yet).
     pub fn truncate_above(mut self, height: u64) -> Result<Option<Self>, DestinationStateError> {
@@ -411,6 +547,7 @@ impl DestinationState {
             if let Some(committees) = undo.committees_before {
                 self.committees = committees;
             }
+            self.undo_advances(&undo.advances);
             self.window.retain(|r| r.height < undo.height);
             self.tip -= 1;
         }
@@ -443,12 +580,26 @@ impl DestinationState {
                 .filter(|r| r.height >= first)
                 .map(|r| (r.n, r.owner, r.amount))
                 .collect(),
+            advances: self.advances.iter().map(|(n, entry)| (n, *entry)).collect(),
         })
     }
 
-    /// Canonical bytes (version 1, little-endian, counted lists).
+    /// Whether the state holds anything of the advances (the return over
+    /// Base): only then is it encoded as version 2.
+    fn carries_advances(&self) -> bool {
+        !self.advances.is_empty() || self.undo.iter().any(|undo| !undo.advances.is_empty())
+    }
+
+    /// Canonical bytes (little-endian, counted lists): version 1, exactly as
+    /// before the return over Base, while the state holds nothing of the
+    /// advances; version 2, the same then the advances, otherwise.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![DESTINATION_STATE_VERSION];
+        let advanced = self.carries_advances();
+        let mut out = vec![if advanced {
+            DESTINATION_STATE_VERSION_ADVANCES
+        } else {
+            DESTINATION_STATE_VERSION
+        }];
         for word in [self.start, self.floor, self.tip, self.bridge_locked] {
             out.extend_from_slice(&word.to_le_bytes());
         }
@@ -483,14 +634,38 @@ impl DestinationState {
                 }
             }
         }
+        if advanced {
+            self.encode_advances(&mut out);
+        }
         out
+    }
+
+    /// Version 2's tail: the advances by increasing `n`, then each undo's.
+    fn encode_advances(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.advances.len() as u32).to_le_bytes());
+        for (n, entry) in self.advances.iter() {
+            put_advance(n, entry, out);
+        }
+        for undo in &self.undo {
+            put_u64s(&undo.advances.created, out);
+            out.extend_from_slice(&(undo.advances.consumed.len() as u32).to_le_bytes());
+            for (n, entry) in &undo.advances.consumed {
+                put_advance(*n, entry, out);
+            }
+            out.extend_from_slice(&(undo.advances.transfers.len() as u32).to_le_bytes());
+            for (n, before) in &undo.advances.transfers {
+                out.extend_from_slice(&n.to_le_bytes());
+                out.extend_from_slice(&before.0);
+            }
+        }
     }
 
     /// Decode [`Self::encode`]; anything else (version, order, length,
     /// trailing bytes) is refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, DestinationStateError> {
         let mut r = Reader(bytes);
-        if r.u8()? != DESTINATION_STATE_VERSION {
+        let version = r.u8()?;
+        if version != DESTINATION_STATE_VERSION && version != DESTINATION_STATE_VERSION_ADVANCES {
             return Err(DestinationStateError::Malformed);
         }
         let start = r.u64()?;
@@ -541,7 +716,16 @@ impl DestinationState {
                 paid,
                 bridge_locked_before,
                 committees_before,
+                advances: AdvanceUndo::default(),
             });
+        }
+        let mut advances = AdvanceBook::new();
+        if version == DESTINATION_STATE_VERSION_ADVANCES {
+            r.advances(&mut advances, &mut undo)?;
+            // Canonical: version 2 only for a state holding advances.
+            if advances.is_empty() && undo.iter().all(|u| u.advances.is_empty()) {
+                return Err(DestinationStateError::Malformed);
+            }
         }
         if !r.0.is_empty()
             || tip.saturating_add(1) < start
@@ -557,6 +741,7 @@ impl DestinationState {
             released,
             bridge_locked,
             window,
+            advances,
             undo,
         })
     }
@@ -564,6 +749,8 @@ impl DestinationState {
 
 /// Version byte of [`DestinationState::encode`].
 pub const DESTINATION_STATE_VERSION: u8 = 1;
+/// Version byte of a state that holds advances (the return over Base).
+pub const DESTINATION_STATE_VERSION_ADVANCES: u8 = 2;
 
 fn put_u64s(values: &[u64], out: &mut Vec<u8>) {
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
@@ -642,6 +829,69 @@ impl Reader<'_> {
     fn u64s_increasing_or_any(&mut self) -> Result<Vec<u64>, DestinationStateError> {
         self.u64s(false)
     }
+
+    fn address(&mut self) -> Result<Address, DestinationStateError> {
+        Ok(Address(self.take(32)?.try_into().expect("32")))
+    }
+
+    /// One advance: origin, creditor, owner, amount (non-zero).
+    fn advance_entry(&mut self) -> Result<AdvanceEntry, DestinationStateError> {
+        let entry = AdvanceEntry {
+            origin: self.address()?,
+            creditor: self.address()?,
+            owner: self.address()?,
+            amount: self.u64()?,
+        };
+        if entry.amount == 0 {
+            return Err(DestinationStateError::Malformed);
+        }
+        Ok(entry)
+    }
+
+    /// Version 2's tail ([`DestinationState::encode_advances`]) into `book`
+    /// and the undo entries already read.
+    fn advances(
+        &mut self,
+        book: &mut AdvanceBook,
+        undo: &mut [DestinationUndo],
+    ) -> Result<(), DestinationStateError> {
+        let count = self.u32()? as usize;
+        if count > self.0.len() / ADVANCE_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        let mut last: Option<u64> = None;
+        for _ in 0..count {
+            let n = self.u64()?;
+            if last.is_some_and(|last| last >= n) {
+                return Err(DestinationStateError::Malformed);
+            }
+            last = Some(n);
+            let entry = self.advance_entry()?;
+            book.insert(n, entry);
+        }
+        for entry in undo.iter_mut() {
+            entry.advances.created = self.u64s_increasing_or_any()?;
+            let consumed = self.u32()? as usize;
+            if consumed > self.0.len() / ADVANCE_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            for _ in 0..consumed {
+                let n = self.u64()?;
+                let advance = self.advance_entry()?;
+                entry.advances.consumed.push((n, advance));
+            }
+            let transfers = self.u32()? as usize;
+            if transfers > self.0.len() / 40 {
+                return Err(DestinationStateError::Malformed);
+            }
+            for _ in 0..transfers {
+                let n = self.u64()?;
+                let before = self.address()?;
+                entry.advances.transfers.push((n, before));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The committees' keys a node has read, by root (D57). Every entry was
@@ -700,6 +950,8 @@ pub struct DestinationEffect {
     /// The payload of the committee update the block applied, if any (its
     /// next committee's keys, D57).
     pub committee_update: Option<Vec<u8>>,
+    /// What it does to the advances (the return over Base; empty below it).
+    pub advances: AdvanceEffect,
 }
 
 /// Why a block breaks a destination rule.
@@ -736,6 +988,19 @@ pub enum DestinationBlockError {
     CommitteeKeysUnavailable { root: Root },
     /// The state given is not the parent's (a local fault).
     StateNotParent { tip: u64, height: u64 },
+    /// An object of the return over Base below its height.
+    BaseObjectBeforeActivation,
+    /// From the return-over-Base height on, releases without their game
+    /// proof and output root preimage.
+    BaseProofMissing,
+    /// D107: a Base game proof in a block that carries a committee update.
+    GameProofWithCommitteeUpdate,
+    /// The finality update does not give the L1 time of its root.
+    L1TimeUnknown,
+    /// The game or its output root (the return over Base).
+    BaseReturn(BaseReturnError),
+    /// An advance or a transfer of its claim (the return over Base).
+    Advance(AdvanceError),
 }
 
 impl DestinationBlockError {
@@ -745,7 +1010,12 @@ impl DestinationBlockError {
     /// light client, the account proof and the objects read the uncommitted
     /// section; a missing key or state is this node's own fault.
     pub fn condemns_block(&self) -> bool {
-        matches!(self, Self::Vault(error) if error.condemns_block())
+        match self {
+            Self::Vault(error) => error.condemns_block(),
+            // The advances read the committed transactions and the branch.
+            Self::Advance(error) => error.condemns_block(),
+            _ => false,
+        }
     }
 }
 
@@ -776,6 +1046,8 @@ pub fn validate_block_destination(
             height,
         });
     }
+    let rules = &rules.effective_at(height);
+    let over_base = rules.base_return.active_at(height);
     let objects: Vec<_> = block
         .destination
         .iter()
@@ -798,6 +1070,8 @@ pub fn validate_block_destination(
     let committee_update = single(DestinationObjectKind::CommitteeUpdate)?;
     let finality_update = single(DestinationObjectKind::FinalityUpdate)?;
     let account_proof = single(DestinationObjectKind::BridgeAccountProof)?;
+    let game_proof = single(DestinationObjectKind::BaseGameProof)?;
+    let output_preimage = single(DestinationObjectKind::OutputRootPreimage)?;
     let releases = of_kind(DestinationObjectKind::VaultRelease).count();
 
     // The committee update opens the block's one `JTMLCU01` marker.
@@ -815,7 +1089,16 @@ pub fn validate_block_destination(
         (Some(payload), [marker]) if committee_update_marker(payload) == *marker => {}
         _ => return Err(DestinationBlockError::ObjectsDoNotMatchMarkers),
     }
-    if releases == 0 && (finality_update.is_some() || account_proof.is_some()) {
+    let base_objects = game_proof.is_some() || output_preimage.is_some();
+    if base_objects && !over_base {
+        return Err(DestinationBlockError::BaseObjectBeforeActivation);
+    }
+    // D107: the game proof and a committee update never share a block (the
+    // 48 KiB budget holds; a release waits one block per ≈ 27 h).
+    if game_proof.is_some() && committee_update.is_some() {
+        return Err(DestinationBlockError::GameProofWithCommitteeUpdate);
+    }
+    if releases == 0 && (finality_update.is_some() || account_proof.is_some() || base_objects) {
         return Err(DestinationBlockError::UnusedFinality);
     }
     if releases > 0 {
@@ -825,20 +1108,53 @@ pub fn validate_block_destination(
         if finality_update.is_none() || account_proof.is_none() {
             return Err(DestinationBlockError::FinalityMissing);
         }
+        if over_base && (game_proof.is_none() || output_preimage.is_none()) {
+            return Err(DestinationBlockError::BaseProofMissing);
+        }
     }
 
-    // The vault gate, its proofs deferred: every rule but V7.
+    // The vault gate, its proofs deferred: every rule but V7. From the return
+    // over Base on, a release of an advanced burn pays the advance's creditor
+    // (V2 there).
     let mut to_prove: Vec<VaultRelease> = Vec::new();
-    let vault = validate_block_vault(
+    let payee = |release: &VaultRelease| {
+        if over_base {
+            release_payee(&parent.advances, release.n, &release.owner, release.amount)
+        } else {
+            release.owner
+        }
+    };
+    let vault = validate_block_vault_paying(
         block,
         &parent.vault_context(height, &rules.vault),
         &rules.vault,
+        &payee,
         &mut |release| {
             to_prove.push(release.clone());
             Ok(())
         },
     )
     .map_err(DestinationBlockError::Vault)?;
+
+    // The advances and their claims' transfers, then what the releases
+    // consume (the return over Base).
+    let mut advances = AdvanceEffect::default();
+    if over_base {
+        advances = validate_block_advances(
+            block,
+            &parent.advances,
+            &parent.released,
+            &rules.vault,
+            &rules.base_return.advance,
+        )
+        .map_err(DestinationBlockError::Advance)?;
+        advances.consumed = vault
+            .releases
+            .iter()
+            .map(|(n, _, _)| *n)
+            .filter(|n| parent.advances.get(*n).is_some())
+            .collect();
+    }
 
     // The light client: the committee update, then the finality update.
     let mut committees = parent.committees.clone();
@@ -855,15 +1171,31 @@ pub fn validate_block_destination(
     }
 
     if releases > 0 {
-        verify_releases_on_l1(
-            finality_update.expect("checked above"),
-            account_proof.expect("checked above"),
-            &to_prove,
-            &committees,
-            rules,
-            &learned,
-            keys,
-        )?;
+        if over_base {
+            verify_releases_on_base(
+                &BaseReleaseObjects {
+                    finality: finality_update.expect("checked above"),
+                    game_proof: game_proof.expect("checked above"),
+                    output_preimage: output_preimage.expect("checked above"),
+                    account_proof: account_proof.expect("checked above"),
+                },
+                &to_prove,
+                &committees,
+                rules,
+                &learned,
+                keys,
+            )?;
+        } else {
+            verify_releases_on_l1(
+                finality_update.expect("checked above"),
+                account_proof.expect("checked above"),
+                &to_prove,
+                &committees,
+                rules,
+                &learned,
+                keys,
+            )?;
+        }
     }
 
     Ok(DestinationEffect {
@@ -871,6 +1203,7 @@ pub fn validate_block_destination(
         vault,
         committees_after,
         committee_update: committee_update.map(<[u8]>::to_vec),
+        advances,
     })
 }
 
@@ -957,28 +1290,7 @@ pub fn verify_releases_on_l1(
             kind: DestinationObjectKind::FinalityUpdate,
         }
     })?;
-    if committees.is_empty() {
-        return Err(DestinationBlockError::NoCommitteeKnown);
-    }
-    let known: Vec<KnownCommittee> = committees
-        .iter()
-        .map(|committee| {
-            learned
-                .get(&committee.root)
-                .or_else(|| keys.get(&committee.root))
-                .map(|k| KnownCommittee {
-                    period: committee.period,
-                    keys: k.clone(),
-                })
-                .ok_or(DestinationBlockError::CommitteeKeysUnavailable {
-                    root: committee.root,
-                })
-        })
-        .collect::<Result<_, _>>()?;
-    let refs: Vec<&KnownCommittee> = known.iter().collect();
-    let finalized = verify_finality_update(&rules.network, &refs, &finality)
-        .map_err(DestinationBlockError::LightClient)?;
-    let state_root = finalized.execution.state_root;
+    let state_root = finalized_execution(&finality, committees, rules, learned, keys)?.state_root;
     let (account_nodes, genesis_nodes) =
         decode_bridge_account_proof(account_proof).map_err(|_| {
             DestinationBlockError::MalformedObject {
@@ -1009,12 +1321,123 @@ pub fn verify_releases_on_l1(
     Ok(())
 }
 
+/// The finalized L1 execution block of `finality`, signed by one of
+/// `committees` (keys from `learned`, the block's own update, then `keys`).
+fn finalized_execution(
+    finality: &LightClientFinalityUpdate,
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<FinalizedExecution, DestinationBlockError> {
+    if committees.is_empty() {
+        return Err(DestinationBlockError::NoCommitteeKnown);
+    }
+    let known: Vec<KnownCommittee> = committees
+        .iter()
+        .map(|committee| {
+            learned
+                .get(&committee.root)
+                .or_else(|| keys.get(&committee.root))
+                .map(|k| KnownCommittee {
+                    period: committee.period,
+                    keys: k.clone(),
+                })
+                .ok_or(DestinationBlockError::CommitteeKeysUnavailable {
+                    root: committee.root,
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&KnownCommittee> = known.iter().collect();
+    Ok(verify_finality_update(&rules.network, &refs, finality)
+        .map_err(DestinationBlockError::LightClient)?
+        .execution)
+}
+
+/// The objects of a block that releases over Base: the finality update, the
+/// game proof, the output root preimage and the bridge's account proof
+/// (under the Base state root), each a payload.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseReleaseObjects<'a> {
+    pub finality: &'a [u8],
+    pub game_proof: &'a [u8],
+    pub output_preimage: &'a [u8],
+    pub account_proof: &'a [u8],
+}
+
+/// V7 over Base (D101, SPEC retour Base §1-2) for the releases `releases`
+/// (their other rules already checked): the finality update signed by a
+/// committee the branch knows gives a finalized L1 root and its time; under
+/// it, the game is one Base holds valid at that time
+/// (`AnchorStateRegistry.isGameClaimValid`, [`super::base_read`]); its root
+/// claim opens to a Base state root; under that root, the bridge has its
+/// pinned code and genesis, then each release's `withdrawals[n]`.
+///
+/// A pure function of its arguments, as [`verify_releases_on_l1`].
+pub fn verify_releases_on_base(
+    objects: &BaseReleaseObjects<'_>,
+    releases: &[VaultRelease],
+    committees: &[CommitteeRef],
+    rules: &DestinationRules,
+    learned: &CommitteeKeyCache,
+    keys: &CommitteeKeyCache,
+) -> Result<(), DestinationBlockError> {
+    let bridge = rules.bridge.ok_or(DestinationBlockError::BridgeUnset)?;
+    let malformed = |kind| DestinationBlockError::MalformedObject { kind };
+    let finality = LightClientFinalityUpdate::decode_payload(objects.finality)
+        .map_err(|_| malformed(DestinationObjectKind::FinalityUpdate))?;
+    let game = decode_game_proof(objects.game_proof)
+        .map_err(|_| malformed(DestinationObjectKind::BaseGameProof))?;
+    let preimage = decode_output_root_preimage(objects.output_preimage)
+        .map_err(|_| malformed(DestinationObjectKind::OutputRootPreimage))?;
+    let (account_nodes, genesis_nodes) = decode_bridge_account_proof(objects.account_proof)
+        .map_err(|_| malformed(DestinationObjectKind::BridgeAccountProof))?;
+    let finalized = finalized_execution(&finality, committees, rules, learned, keys)?;
+    let l1_time = finalized
+        .timestamp
+        .ok_or(DestinationBlockError::L1TimeUnknown)?;
+    let base = verify_base_state_root(
+        finalized.state_root,
+        l1_time,
+        &rules.base_return.base,
+        &game,
+        &preimage,
+    )
+    .map_err(DestinationBlockError::BaseReturn)?;
+    // V7 under the Base state root, once for the block: the pinned code and
+    // the pinned genesis (A5-8).
+    verify_bridge_account(base.state_root, &bridge, &account_nodes, &genesis_nodes)
+        .map_err(DestinationBlockError::BridgeAccount)?;
+    // V7, each release.
+    for release in releases {
+        verify_withdrawal(
+            base.state_root,
+            &bridge,
+            &account_nodes,
+            release.n,
+            &release.owner.0,
+            release.amount,
+            &release.storage_proof,
+        )
+        .map_err(|error| {
+            DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
+                n: release.n,
+                error,
+            })
+        })?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot (T2.3, I12): the state rebuilt from the markers, no journal
 // ---------------------------------------------------------------------------
 
 /// First bytes of a snapshot's `destination-state.bin`.
 pub const DESTINATION_SNAPSHOT_MAGIC: [u8; 8] = *b"JTMDST01";
+/// First bytes of the file of a state that holds advances (the return over
+/// Base): the version-1 file, then the advances.
+pub const DESTINATION_SNAPSHOT_MAGIC_ADVANCES: [u8; 8] = *b"JTMDST02";
 
 /// Largest `destination-state.bin` a node reads: two committee updates and a
 /// window of releases (4 per block) fit many times over.
@@ -1032,11 +1455,19 @@ pub struct DestinationSnapshotFile {
     /// the window (V6) of the next block reads, in creation order
     /// ([`snapshot_window_start`]).
     pub window_releases: Vec<(u64, Address, u64)>,
+    /// The advances of the state (the return over Base), by increasing `n`:
+    /// each opens its `JTMADV01` marker, its creditor the latest `JTMADT01`
+    /// marker of its `n` (or is its origin).
+    pub advances: Vec<(u64, AdvanceEntry)>,
 }
 
 impl DestinationSnapshotFile {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = DESTINATION_SNAPSHOT_MAGIC.to_vec();
+        let mut out = if self.advances.is_empty() {
+            DESTINATION_SNAPSHOT_MAGIC.to_vec()
+        } else {
+            DESTINATION_SNAPSHOT_MAGIC_ADVANCES.to_vec()
+        };
         out.push(u8::try_from(self.committee_updates.len()).expect("at most two updates"));
         for payload in &self.committee_updates {
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -1048,6 +1479,9 @@ impl DestinationSnapshotFile {
             out.extend_from_slice(&owner.0);
             out.extend_from_slice(&amount.to_le_bytes());
         }
+        if !self.advances.is_empty() {
+            encode_snapshot_advances(&self.advances, &mut out);
+        }
         out
     }
 
@@ -1056,7 +1490,9 @@ impl DestinationSnapshotFile {
             return Err(DestinationStateError::Malformed);
         }
         let mut r = Reader(bytes);
-        if r.take(8)? != DESTINATION_SNAPSHOT_MAGIC {
+        let magic = r.take(8)?;
+        let advanced = magic == DESTINATION_SNAPSHOT_MAGIC_ADVANCES;
+        if magic != DESTINATION_SNAPSHOT_MAGIC && !advanced {
             return Err(DestinationStateError::Malformed);
         }
         let updates = usize::from(r.u8()?);
@@ -1078,13 +1514,62 @@ impl DestinationSnapshotFile {
             let owner = Address(r.take(32)?.try_into().expect("32"));
             window_releases.push((n, owner, r.u64()?));
         }
+        let advances = if advanced {
+            let advances = r.snapshot_advances()?;
+            if advances.is_empty() {
+                return Err(DestinationStateError::Malformed);
+            }
+            advances
+        } else {
+            Vec::new()
+        };
         if !r.0.is_empty() {
             return Err(DestinationStateError::Malformed);
         }
         Ok(Self {
             committee_updates,
             window_releases,
+            advances,
         })
+    }
+}
+
+/// The advances of a snapshot file: `count:u32 ‖ (n:u64 ‖ origin ‖ creditor
+/// ‖ owner ‖ amount:u64)*`, increasing `n`.
+fn encode_snapshot_advances(advances: &[(u64, AdvanceEntry)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(advances.len() as u32).to_le_bytes());
+    for (n, entry) in advances {
+        put_advance(*n, entry, out);
+    }
+}
+
+/// Bytes of one encoded advance: `n`, origin, creditor, owner, amount.
+const ADVANCE_BYTES: usize = 8 + 3 * 32 + 8;
+
+fn put_advance(n: u64, entry: &AdvanceEntry, out: &mut Vec<u8>) {
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&entry.origin.0);
+    out.extend_from_slice(&entry.creditor.0);
+    out.extend_from_slice(&entry.owner.0);
+    out.extend_from_slice(&entry.amount.to_le_bytes());
+}
+
+impl Reader<'_> {
+    /// [`encode_snapshot_advances`].
+    fn snapshot_advances(&mut self) -> Result<Vec<(u64, AdvanceEntry)>, DestinationStateError> {
+        let count = self.u32()? as usize;
+        if count > self.0.len() / ADVANCE_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        let mut advances: Vec<(u64, AdvanceEntry)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let n = self.u64()?;
+            if advances.last().is_some_and(|(last, _)| *last >= n) {
+                return Err(DestinationStateError::Malformed);
+            }
+            advances.push((n, self.advance_entry()?));
+        }
+        Ok(advances)
     }
 }
 
@@ -1112,6 +1597,9 @@ pub struct SnapshotDestinationCheck<'a> {
     bridge_locked: u64,
     release_markers: Vec<(u64, Address)>,
     update_markers: Vec<(u64, Address)>,
+    /// `JTMADV01` and `JTMADT01` slots `(creation_id, owner)`.
+    advance_markers: Vec<(u64, Address)>,
+    transfer_markers: Vec<(u64, Address)>,
 }
 
 impl<'a> SnapshotDestinationCheck<'a> {
@@ -1131,6 +1619,8 @@ impl<'a> SnapshotDestinationCheck<'a> {
             bridge_locked: 0,
             release_markers: Vec::new(),
             update_markers: Vec::new(),
+            advance_markers: Vec::new(),
+            transfer_markers: Vec::new(),
         }
     }
 
@@ -1154,7 +1644,15 @@ impl<'a> SnapshotDestinationCheck<'a> {
             Some(DestinationMarkerKind::LightClientUpdate) => {
                 self.update_markers.push((creation_id, *owner));
             }
-            _ => {}
+            _ => match super::advance::advance_marker_kind(owner) {
+                Some(super::advance::AdvanceMarkerKind::Advance) => {
+                    self.advance_markers.push((creation_id, *owner));
+                }
+                Some(super::advance::AdvanceMarkerKind::Transfer) => {
+                    self.transfer_markers.push((creation_id, *owner));
+                }
+                None => {}
+            },
         }
     }
 
@@ -1255,6 +1753,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 committees.push(CommitteeRef { period, root });
             }
         }
+        let advances = self.rebuild_advances(&alloc_counter)?;
         Ok(DestinationState {
             start,
             floor: self.floor,
@@ -1263,8 +1762,73 @@ impl<'a> SnapshotDestinationCheck<'a> {
             released: self.released,
             bridge_locked: self.bridge_locked,
             window,
+            advances,
             undo: Vec::new(),
         })
+    }
+
+    /// The advances of the boundary (the return over Base): the `JTMADV01`
+    /// markers created from its height on (above the `alloc_counter` of the
+    /// header below it) whose `n` is not paid, each opened by the file, its
+    /// creditor the latest `JTMADT01` marker of its `n` (or its origin).
+    fn rebuild_advances(
+        &self,
+        alloc_counter: &impl Fn(u64) -> Option<u64>,
+    ) -> Result<AdvanceBook, SnapshotDestinationError> {
+        let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
+        let Some(height) = self
+            .rules
+            .base_return
+            .activation_height
+            .filter(|height| *height <= self.tip)
+        else {
+            if !self.file.advances.is_empty() {
+                return Err(mismatch("advances below the return over Base"));
+            }
+            return Ok(AdvanceBook::new());
+        };
+        let below = height.saturating_sub(1);
+        let floor =
+            alloc_counter(below).ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
+        // One advance marker per `n` at most; those of a paid `n` are
+        // consumed.
+        let mut live: BTreeMap<u64, Address> = BTreeMap::new();
+        for (_, marker) in self.advance_markers.iter().filter(|(id, _)| *id > floor) {
+            let (n, _) = advance_marker_fields(marker).expect("an advance marker");
+            if live.insert(n, *marker).is_some() {
+                return Err(mismatch("two advance markers of one withdrawal"));
+            }
+        }
+        live.retain(|n, _| !self.released.contains(*n));
+        if live.len() != self.file.advances.len() {
+            return Err(mismatch("advances do not match their markers"));
+        }
+        let mut book = AdvanceBook::new();
+        for ((n, marker), (file_n, entry)) in live.iter().zip(&self.file.advances) {
+            if n != file_n {
+                return Err(mismatch("advances do not match their markers"));
+            }
+            if advance_marker(*n, &entry.owner, entry.amount, &entry.origin) != *marker {
+                return Err(mismatch("an advance does not open its marker"));
+            }
+            // Its creditor: the latest transfer marker of `n`, else its origin.
+            let latest = self
+                .transfer_markers
+                .iter()
+                .filter(|(id, transfer)| {
+                    *id > floor && advance_transfer_marker_n(transfer) == Some(*n)
+                })
+                .max_by_key(|(id, _)| *id);
+            let creditor_opens = match latest {
+                Some((_, transfer)) => advance_transfer_marker(*n, &entry.creditor) == *transfer,
+                None => entry.creditor == entry.origin,
+            };
+            if !creditor_opens {
+                return Err(mismatch("an advance's creditor does not open its latest transfer"));
+            }
+            book.insert(*n, *entry);
+        }
+        Ok(book)
     }
 }
 

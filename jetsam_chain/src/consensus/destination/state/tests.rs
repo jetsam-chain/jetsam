@@ -34,19 +34,19 @@ use crate::consensus::vault::{encode_proof_nodes, VAULT_RELEASE_WINDOW_BLOCKS};
 
 const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 /// The anchor period: its slots are well inside Fulu on the L1 table.
-const P0: u64 = 2_000;
+pub(super) const P0: u64 = 2_000;
 
 // ---------------------------------------------------------------------------
 // A synthetic signed L1
 // ---------------------------------------------------------------------------
 
 /// A sync committee whose 512 seats are held by 8 keys of this test.
-struct Committee {
+pub(super) struct Committee {
     secrets: Vec<SecretKey>,
     ssz: SyncCommittee,
 }
 
-fn committee(seed: u8) -> Committee {
+pub(super) fn committee(seed: u8) -> Committee {
     let secrets: Vec<SecretKey> = (0..8u8)
         .map(|i| {
             let mut ikm = [7u8; 32];
@@ -69,13 +69,13 @@ fn committee(seed: u8) -> Committee {
     }
 }
 
-fn root_of(c: &Committee) -> Root {
+pub(super) fn root_of(c: &Committee) -> Root {
     c.ssz.hash_tree_root()
 }
 
 /// The nodes of the smallest tree holding `leaves` at their gindices (any
 /// other node zero).
-fn tree(leaves: &[(u64, Root)]) -> HashMap<u64, Root> {
+pub(super) fn tree(leaves: &[(u64, Root)]) -> HashMap<u64, Root> {
     let mut nodes: HashMap<u64, Root> = leaves.iter().copied().collect();
     let mut work: BTreeSet<u64> = leaves.iter().map(|(g, _)| *g).collect();
     while let Some(g) = work.pop_last() {
@@ -91,7 +91,7 @@ fn tree(leaves: &[(u64, Root)]) -> HashMap<u64, Root> {
     nodes
 }
 
-fn branch(nodes: &HashMap<u64, Root>, mut g: u64) -> Vec<Root> {
+pub(super) fn branch(nodes: &HashMap<u64, Root>, mut g: u64) -> Vec<Root> {
     let mut out = Vec::new();
     while g > 1 {
         out.push(nodes.get(&(g ^ 1)).copied().unwrap_or([0u8; 32]));
@@ -102,7 +102,7 @@ fn branch(nodes: &HashMap<u64, Root>, mut g: u64) -> Vec<Root> {
 
 /// A Fulu light-client header at `slot` whose execution header carries
 /// `execution_state_root`, its body root and branch built to match.
-fn lc_header(slot: u64, execution_state_root: Root, state_root: Root) -> LightClientHeader {
+pub(super) fn lc_header(slot: u64, execution_state_root: Root, state_root: Root) -> LightClientHeader {
     let execution = ExecutionPayloadHeader {
         parent_hash: [1; 32],
         fee_recipient: [2; 20],
@@ -139,7 +139,7 @@ fn lc_header(slot: u64, execution_state_root: Root, state_root: Root) -> LightCl
 }
 
 /// The aggregate of the first `participants` seats over the attested header.
-fn sign(signers: &Committee, attested: &BeaconBlockHeader, participants: usize) -> SyncAggregate {
+pub(super) fn sign(signers: &Committee, attested: &BeaconBlockHeader, participants: usize) -> SyncAggregate {
     let domain = sync_committee_domain(
         L1_MAINNET.fulu_fork_version,
         &L1_MAINNET.genesis_validators_root,
@@ -166,7 +166,7 @@ fn sign(signers: &Committee, attested: &BeaconBlockHeader, participants: usize) 
 
 /// An update of period `period` signed by `signers`, proving `next`; the
 /// finalized header carries `execution_state_root`.
-fn committee_update(signers: &Committee, period: u64, next: &Committee) -> LightClientUpdate {
+pub(super) fn committee_update(signers: &Committee, period: u64, next: &Committee) -> LightClientUpdate {
     let base = period * SLOTS_PER_SYNC_COMMITTEE_PERIOD;
     let finalized = lc_header(base + 64, [0x33; 32], [0x44; 32]);
     let state = tree(&[
@@ -188,7 +188,7 @@ fn committee_update(signers: &Committee, period: u64, next: &Committee) -> Light
 
 /// A finality update signed in `period` whose finalized execution state
 /// root is `l1_state_root`.
-fn finality_update(
+pub(super) fn finality_update(
     signers: &Committee,
     period: u64,
     l1_state_root: Root,
@@ -209,12 +209,12 @@ fn finality_update(
 }
 
 /// The anchor update of `anchor`: any update whose next committee is it.
-fn anchor_update(anchor: &Committee) -> LightClientUpdate {
+pub(super) fn anchor_update(anchor: &Committee) -> LightClientUpdate {
     let stranger = committee(0xEE);
     committee_update(&stranger, P0 - 1, anchor)
 }
 
-fn anchored_rules(anchor: &Committee) -> DestinationRules {
+pub(super) fn anchored_rules(anchor: &Committee) -> DestinationRules {
     DestinationRules {
         activation_height: Some(J),
         network: L1_MAINNET,
@@ -224,15 +224,16 @@ fn anchored_rules(anchor: &Committee) -> DestinationRules {
         }),
         bridge: Some(prototype_bridge()),
         vault: crate::consensus::vault::tests::rules(),
+        base_return: BaseReturnRules::CONSENSUS,
     }
 }
 
-fn object(kind: DestinationObjectKind, payload: Vec<u8>) -> DestinationObject {
+pub(super) fn object(kind: DestinationObjectKind, payload: Vec<u8>) -> DestinationObject {
     DestinationObject { kind, payload }
 }
 
 /// A group that pays for a committee update: its marker, from `PAYER`.
-fn update_group(slot_base: u32, payload: &[u8]) -> Vec<jetsam_tx::Transaction> {
+pub(super) fn update_group(slot_base: u32, payload: &[u8]) -> Vec<jetsam_tx::Transaction> {
     logical(
         slot_base,
         PAYER,
@@ -242,7 +243,7 @@ fn update_group(slot_base: u32, payload: &[u8]) -> Vec<jetsam_tx::Transaction> {
 }
 
 /// The block at `height` with these groups and section objects.
-fn block_with(
+pub(super) fn block_with(
     height: u64,
     groups: Vec<Vec<jetsam_tx::Transaction>>,
     objects: Vec<DestinationObject>,
@@ -253,7 +254,7 @@ fn block_with(
 }
 
 /// A state at `tip` (≥ J) with `committees` and the floor 0.
-fn state_at(tip: u64, committees: Vec<CommitteeRef>) -> DestinationState {
+pub(super) fn state_at(tip: u64, committees: Vec<CommitteeRef>) -> DestinationState {
     DestinationState {
         tip,
         committees,
@@ -262,7 +263,7 @@ fn state_at(tip: u64, committees: Vec<CommitteeRef>) -> DestinationState {
     }
 }
 
-fn keys_of(committees: &[&Committee]) -> CommitteeKeyCache {
+pub(super) fn keys_of(committees: &[&Committee]) -> CommitteeKeyCache {
     let mut cache = CommitteeKeyCache::default();
     for c in committees {
         let payload = committee_update(&committee(0xEE), P0 - 1, c).encode_payload();
@@ -501,7 +502,7 @@ fn committee_update_must_open_its_marker() {
 
 /// A block paying release `r` under a finality update of `signers` (period
 /// `period`) whose root holds the bridge account and `withdrawals[r.n]`.
-fn release_block(height: u64, r: &VaultRelease, signers: &Committee, period: u64) -> Block {
+pub(super) fn release_block(height: u64, r: &VaultRelease, signers: &Committee, period: u64) -> Block {
     release_block_under(
         height,
         r,
@@ -763,6 +764,7 @@ fn effect_at(
         },
         committees_after: committees,
         committee_update: None,
+        advances: AdvanceEffect::default(),
     }
 }
 
@@ -1131,6 +1133,7 @@ impl Chain {
                 .filter(|(h, _)| *h >= first)
                 .map(|(_, r)| (r.n, r.owner, r.amount))
                 .collect(),
+            advances: Vec::new(),
         }
     }
 
@@ -1501,6 +1504,7 @@ fn snapshot_with_a_foreign_anchor_update_is_refused() {
     let file = DestinationSnapshotFile {
         committee_updates: vec![foreign],
         window_releases: Vec::new(),
+        advances: Vec::new(),
     };
     assert_eq!(
         chain.install(&file).map(|_| ()),

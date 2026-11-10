@@ -614,6 +614,20 @@ pub fn validate_block_vault(
     rules: &VaultRules,
     prove: &mut dyn FnMut(&VaultRelease) -> Result<(), L1ReadError>,
 ) -> Result<VaultEffect, VaultError> {
+    validate_block_vault_paying(block, ctx, rules, &|release| release.owner, prove)
+}
+
+/// [`validate_block_vault`] where V2 pays each release's first output to
+/// `payee(release)`: its burn's owner, or, from the return over Base on, the
+/// creditor of an advance of exactly that burn
+/// (`destination::advance::release_payee`).
+pub fn validate_block_vault_paying(
+    block: &Block,
+    ctx: &VaultContext<'_>,
+    rules: &VaultRules,
+    payee: &dyn Fn(&VaultRelease) -> Address,
+    prove: &mut dyn FnMut(&VaultRelease) -> Result<(), L1ReadError>,
+) -> Result<VaultEffect, VaultError> {
     let height = block.header.height;
     if !rules.active_at(height) {
         return Ok(VaultEffect {
@@ -757,7 +771,7 @@ pub fn validate_block_vault(
             });
         }
         // V2.
-        if group.payee != release.owner {
+        if group.payee != payee(release) {
             return Err(VaultError::ReleasePaysOtherOwner { group: group.group });
         }
         let expected_paid = release.amount - release_fee;

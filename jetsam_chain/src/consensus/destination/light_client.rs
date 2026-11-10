@@ -37,7 +37,9 @@ use super::forks::{
     epoch_of_slot, period_of_slot, ForkRules, ForkTableError, L1Network, LightClientFormat,
     MIN_SYNC_PARTICIPANTS,
 };
-use super::mpt::{execution_header_number, execution_header_state_root, keccak256};
+use super::mpt::{
+    execution_header_number, execution_header_state_root, execution_header_timestamp, keccak256,
+};
 use super::ssz::{
     is_valid_merkle_branch, merkleize, u64_leaf, BeaconBlockHeader, LightClientExecution,
     LightClientFinalityUpdate, LightClientHeader, LightClientUpdate, Root, SyncAggregate,
@@ -67,6 +69,12 @@ pub struct FinalizedExecution {
     pub block_number: u64,
     pub block_hash: Root,
     pub state_root: Root,
+    /// The execution header's timestamp: the L1 time at which `state_root`
+    /// holds (the return over Base reads the registry's clocks against it;
+    /// under Gloas it is not the beacon slot's). `None` when a Gloas RLP
+    /// header does not carry it as a canonical integer: nothing but the return
+    /// over Base reads it, so such an update is judged as before.
+    pub timestamp: Option<u64>,
 }
 
 /// What a valid finality update proves.
@@ -389,6 +397,7 @@ pub fn verify_finality_update(
             block_number: header.block_number,
             block_hash: header.block_hash,
             state_root: header.state_root,
+            timestamp: Some(header.timestamp),
         },
         LightClientExecution::Gloas { block_hash, .. } => {
             let rlp = update
@@ -405,6 +414,7 @@ pub fn verify_finality_update(
                 block_hash: *block_hash,
                 state_root: execution_header_state_root(rlp)
                     .map_err(|_| LightClientError::ExecutionHeaderMalformed)?,
+                timestamp: execution_header_timestamp(rlp).ok(),
             }
         }
     };

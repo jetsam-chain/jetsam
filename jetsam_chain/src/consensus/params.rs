@@ -635,6 +635,50 @@ pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_7_ACTIVATION);
 /// v1.6 height, on a 32-block transaction epoch boundary.
 pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
 
+/// v1.7, the return over Base (D94, D101, D107, SPEC retour Base): from this
+/// height on, the vault's releases are proven on Base (V7 reads a dispute game
+/// Base holds valid under a finalized L1 root, its output root, then the
+/// bridge under the Base state root), a block carrying a Base game proof
+/// carries no committee update, and the advance (`JTMADV01`) and its claim's
+/// transfer (`JTMADT01`) are rules.
+///
+/// **`None` on every profile** (the public network, the test chain and the
+/// private rehearsal builds): the operator chooses it at deployment. While it
+/// is `None` a node judges every block exactly as a node without this code
+/// (the Base objects do not even decode). Armed, it sits strictly above an
+/// armed [`V1_7_ACTIVATION_HEIGHT`] ([`base_return_schedule_is_valid`]).
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+
+/// Whether the return over Base governs the block at `height`.
+#[inline]
+pub const fn v1_7_base_return_active(height: u64) -> bool {
+    v1_7_base_return_active_with(height, V1_7_BASE_RETURN_HEIGHT)
+}
+
+/// Testable twin of [`v1_7_base_return_active`].
+#[inline]
+pub const fn v1_7_base_return_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// Whether a return-over-Base height may sit beside a v1.7 height: dormant,
+/// or strictly above an armed v1.7 height.
+pub const fn base_return_schedule_is_valid(
+    v1_7_activation: Option<u64>,
+    base_return_activation: Option<u64>,
+) -> bool {
+    match (v1_7_activation, base_return_activation) {
+        (_, None) => true,
+        (Some(v1_7), Some(base_return)) => base_return > v1_7,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    base_return_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT),
+    "V1_7_BASE_RETURN_HEIGHT must be None, or strictly above an armed V1_7_ACTIVATION_HEIGHT"
+);
+
 /// Whether one candidate block height is governed by the v1.7 rules.
 #[inline]
 pub const fn v1_7_active(height: u64) -> bool {
@@ -2600,6 +2644,33 @@ mod tests {
             assert!(REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION);
             assert!(REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS));
         }
+    }
+
+    /// The return over Base (D94, D101, D107) has its own height, dormant on
+    /// every profile until the operator chooses it at deployment: the public
+    /// network, the test chain and the private rehearsal builds alike (a test
+    /// arms it on its own thread through injected rules only).
+    #[test]
+    fn the_base_return_height_is_none_on_every_profile() {
+        assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);
+        assert!(!v1_7_base_return_active(u64::MAX));
+        assert!(base_return_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, None));
+    }
+
+    /// Armed, the return over Base sits strictly above an armed v1.7 height
+    /// (its destination state exists before it); never without v1.7.
+    #[test]
+    fn the_base_return_height_sits_strictly_above_v1_7() {
+        assert!(base_return_schedule_is_valid(None, None));
+        assert!(base_return_schedule_is_valid(Some(8_160), None));
+        assert!(base_return_schedule_is_valid(Some(8_160), Some(8_161)));
+        assert!(base_return_schedule_is_valid(Some(8_160), Some(20_000)));
+        assert!(!base_return_schedule_is_valid(Some(8_160), Some(8_160)));
+        assert!(!base_return_schedule_is_valid(Some(8_160), Some(8_000)));
+        assert!(!base_return_schedule_is_valid(None, Some(8_161)));
+        assert!(v1_7_base_return_active_with(9_000, Some(9_000)));
+        assert!(!v1_7_base_return_active_with(8_999, Some(9_000)));
+        assert!(!v1_7_base_return_active_with(9_000, None));
     }
 
     /// D78: the test chain crosses v1.7 at block 8 160 and not one block

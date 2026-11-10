@@ -1,0 +1,1064 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! The return over Base wired into the destination rules (D101, D107): its
+//! own height (dormant on every profile), V7 read on Base end to end under a
+//! synthetic signed L1 that holds Base's five contracts and a game claiming a
+//! synthetic Base state root, the rule of D107, the section objects on the
+//! wire, the advance through a block, its state, undo, encoding and snapshot.
+
+use super::tests::{
+    anchored_rules, block_with, committee, committee_update, finality_update, keys_of, object,
+    root_of, state_at, update_group, Committee, P0,
+};
+use super::*;
+use crate::consensus::destination::advance::AdvanceRules;
+use crate::consensus::destination::base_read::tests::{synthetic_game_at, Knobs, VALID};
+use crate::consensus::destination::base_read::{
+    encode_game_proof, encode_output_root_preimage, output_root, BaseGameError, GameProof,
+    OutputRootPreimage, BASE_SEPOLIA,
+};
+use crate::consensus::destination::forks::{
+    L1_MAINNET, L1_REHEARSAL, SLOTS_PER_SYNC_COMMITTEE_PERIOD,
+};
+use crate::consensus::destination::l1_read::withdrawal_commitment;
+use crate::consensus::destination::tests::{prototype_bridge, synthetic_bridge_with_genesis};
+use crate::consensus::destination::{
+    decode_destination_section, encode_destination_section, DestinationObject, DestinationSection,
+};
+use crate::consensus::params::MICRO_PER_JTM;
+use crate::consensus::vault::tests::{
+    block_at, logical, release, ALICE, BOB, FEE, HEIGHT, PAYER, RF,
+};
+use crate::consensus::vault::{VAULT_ADDRESS, VAULT_RELEASE_WINDOW_BLOCKS};
+use jetsam_tx::wire::WireError;
+
+const JTM: u64 = MICRO_PER_JTM;
+/// The return over Base armed five blocks below the test height.
+const HB: u64 = HEIGHT - 5;
+/// The L1 time of the test finality updates: the Fulu header of slot
+/// `P0 × 8 192 + 300` carries `slot × 12`.
+const L1_TIME: u64 = (P0 * SLOTS_PER_SYNC_COMMITTEE_PERIOD + 300) * 12;
+/// A game created, then resolved well before that time, after the
+/// retirement.
+const TIMES: (u64, u64, u64) = (100_000_000, 150_000_000, 50_000_000);
+
+fn base_rules(anchor: &Committee) -> DestinationRules {
+    let mut rules = anchored_rules(anchor);
+    rules.base_return = BaseReturnRules {
+        activation_height: Some(HB),
+        network: L1_MAINNET,
+        base: BASE_SEPOLIA,
+        advance: AdvanceRules::CONSENSUS,
+    };
+    rules
+}
+
+fn known(c: &Committee) -> Vec<CommitteeRef> {
+    vec![CommitteeRef {
+        period: P0,
+        root: root_of(c),
+    }]
+}
+
+/// Base for one burn: a Base state root holding the bridge with
+/// `withdrawals[n] = keccak(owner ‖ amount)` and its genesis, the preimage of
+/// its output root, and an L1 state root holding Base's five contracts and a
+/// game claiming that output root.
+struct BaseWorld {
+    l1_root: Root,
+    game: GameProof,
+    preimage: OutputRootPreimage,
+    account: Vec<u8>,
+    storage_proof: Vec<Vec<u8>>,
+}
+
+fn base_world(r: &VaultRelease, knobs: Knobs, times: (u64, u64, u64)) -> BaseWorld {
+    let bridge = prototype_bridge();
+    let l2 = synthetic_bridge_with_genesis(
+        &bridge,
+        r.n,
+        withdrawal_commitment(&r.owner.0, r.amount),
+        Some(bridge.genesis_id),
+    );
+    let preimage = OutputRootPreimage {
+        version: [0u8; 32],
+        state_root: l2.state_root,
+        message_passer_storage_root: [0x4d; 32],
+        block_hash: [0xb1; 32],
+    };
+    let (l1_root, game) = synthetic_game_at(knobs, Some(output_root(&preimage)), times);
+    BaseWorld {
+        l1_root,
+        game,
+        preimage,
+        account: l2.account_payload(),
+        storage_proof: l2.storage_proof,
+    }
+}
+
+/// The section objects of a release over Base, in their usual order: the
+/// finality update, the game proof, the preimage, the account proof.
+fn base_objects(world: &BaseWorld, signers: &Committee) -> Vec<DestinationObject> {
+    vec![
+        object(
+            DestinationObjectKind::FinalityUpdate,
+            finality_update(signers, P0, world.l1_root).encode_payload(),
+        ),
+        object(
+            DestinationObjectKind::BaseGameProof,
+            encode_game_proof(&world.game),
+        ),
+        object(
+            DestinationObjectKind::OutputRootPreimage,
+            encode_output_root_preimage(&world.preimage),
+        ),
+        object(
+            DestinationObjectKind::BridgeAccountProof,
+            world.account.clone(),
+        ),
+    ]
+}
+
+/// A block at `height` releasing `r` over Base, its first output to `payee`.
+fn base_release_block(
+    height: u64,
+    r: &VaultRelease,
+    payee: Address,
+    signers: &Committee,
+    world: &BaseWorld,
+) -> Block {
+    let r = VaultRelease {
+        storage_proof: world.storage_proof.clone(),
+        ..r.clone()
+    };
+    let group = logical(
+        100,
+        VAULT_ADDRESS,
+        &[(payee, r.amount - RF), (r.marker(), 0)],
+        FEE,
+    );
+    let mut b = block_at(height, vec![group], &[r]);
+    let section = b.destination.as_mut().unwrap();
+    for (i, o) in base_objects(world, signers).into_iter().enumerate() {
+        section.objects.insert(i, o);
+    }
+    b
+}
+
+fn drop_kind(b: &Block, kind: DestinationObjectKind) -> Block {
+    let mut b = b.clone();
+    b.destination
+        .as_mut()
+        .unwrap()
+        .objects
+        .retain(|o| o.kind != kind);
+    b
+}
+
+// ---------------------------------------------------------------------------
+// The height and the rules of each profile
+// ---------------------------------------------------------------------------
+
+/// Dormant on every profile; the L1 and the Base network of each profile.
+#[test]
+fn the_return_over_base_is_dormant_and_reads_its_profiles_base() {
+    let rules = DestinationRules::CONSENSUS;
+    assert_eq!(rules.base_return.activation_height, None);
+    assert_eq!(rules.base_return.advance, AdvanceRules::CONSENSUS);
+    assert!(!rules.base_return.active_at(u64::MAX));
+    assert_eq!(rules.effective_at(u64::MAX), rules);
+    #[cfg(not(feature = "testnet"))]
+    {
+        assert_eq!(rules.base_return.network, L1_MAINNET);
+        assert_eq!(
+            rules.base_return.base,
+            crate::consensus::destination::base_read::BASE_MAINNET
+        );
+    }
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        assert_eq!(
+            rules.base_return.network,
+            crate::consensus::destination::forks::L1_SEPOLIA
+        );
+        assert_eq!(rules.base_return.base, BASE_SEPOLIA);
+    }
+    #[cfg(feature = "rehearsal-v1-7")]
+    assert_eq!(rules.base_return.network, L1_REHEARSAL);
+    // Armed, the light client reads the L1 Base settles on from the height on.
+    let armed = DestinationRules {
+        base_return: BaseReturnRules {
+            activation_height: Some(HB),
+            network: L1_REHEARSAL,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    assert_eq!(armed.effective_at(HB - 1), armed);
+    assert_eq!(armed.effective_at(HB).network, L1_REHEARSAL);
+    assert_eq!(
+        DestinationRules {
+            network: armed.network,
+            ..armed.effective_at(HB)
+        },
+        armed
+    );
+}
+
+/// A dormant build reads tags 5 and 6 as an unknown tag (the wire of a build
+/// without them); an armed one decodes them.
+#[test]
+fn the_base_objects_decode_only_once_the_height_is_armed() {
+    let objects = vec![
+        object(DestinationObjectKind::BaseGameProof, vec![1, 2, 3]),
+        object(DestinationObjectKind::OutputRootPreimage, vec![4; 128]),
+    ];
+    for one in &objects {
+        let mut wire = Vec::new();
+        encode_destination_section(
+            &DestinationSection {
+                objects: vec![one.clone()],
+            },
+            &mut wire,
+        );
+        assert_eq!(
+            wire[2],
+            if one.kind == DestinationObjectKind::BaseGameProof {
+                5
+            } else {
+                6
+            }
+        );
+        assert!(!crate::consensus::destination::base_objects_on_the_wire());
+        assert_eq!(
+            decode_destination_section(&mut wire.as_slice()),
+            Err(WireError::BadMarker)
+        );
+        let _armed = test_rules::install(base_rules(&committee(1)));
+        assert!(crate::consensus::destination::base_objects_on_the_wire());
+        assert_eq!(
+            decode_destination_section(&mut wire.as_slice()),
+            Ok(DestinationSection {
+                objects: vec![one.clone()]
+            })
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V7 over Base, end to end
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_release_is_paid_under_a_game_base_holds_valid() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let mut parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    let effect = validate_block_destination(&b, &parent, &rules, &keys).expect("V7 over Base");
+    assert_eq!(effect.vault.releases, vec![(3, ALICE, r.amount)]);
+    assert!(effect.advances.is_empty());
+    parent.apply(&effect, VAULT_RELEASE_WINDOW_BLOCKS).unwrap();
+    assert!(parent.released.contains(3));
+    // Paid once.
+    let again = base_release_block(HEIGHT + 1, &r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&again, &parent, &rules, &keys),
+        Err(DestinationBlockError::Vault(
+            VaultError::ReleaseAlreadyPaid { n: 3 }
+        ))
+    );
+}
+
+#[test]
+fn over_base_a_release_needs_the_game_and_its_output_root() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let full = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    for kind in [
+        DestinationObjectKind::BaseGameProof,
+        DestinationObjectKind::OutputRootPreimage,
+    ] {
+        assert_eq!(
+            validate_block_destination(&drop_kind(&full, kind), &parent, &rules, &keys),
+            Err(DestinationBlockError::BaseProofMissing)
+        );
+    }
+    // The L1 reading of before (no game) is no longer a release.
+    let l1_only = drop_kind(
+        &drop_kind(&full, DestinationObjectKind::BaseGameProof),
+        DestinationObjectKind::OutputRootPreimage,
+    );
+    assert_eq!(
+        validate_block_destination(&l1_only, &parent, &rules, &keys),
+        Err(DestinationBlockError::BaseProofMissing)
+    );
+    // Two of either.
+    for kind in [
+        DestinationObjectKind::BaseGameProof,
+        DestinationObjectKind::OutputRootPreimage,
+    ] {
+        let mut twice = full.clone();
+        let o = twice
+            .destination
+            .as_ref()
+            .unwrap()
+            .objects
+            .iter()
+            .find(|o| o.kind == kind)
+            .unwrap()
+            .clone();
+        twice.destination.as_mut().unwrap().objects.push(o);
+        assert_eq!(
+            validate_block_destination(&twice, &parent, &rules, &keys),
+            Err(DestinationBlockError::TooManyObjects { kind })
+        );
+    }
+    // The Base objects without a release.
+    let mut idle = block_at(HEIGHT, vec![], &[]);
+    idle.destination = Some(DestinationSection {
+        objects: base_objects(&world, &c0),
+    });
+    assert_eq!(
+        validate_block_destination(&idle, &parent, &rules, &keys),
+        Err(DestinationBlockError::UnusedFinality)
+    );
+    for kind in [
+        DestinationObjectKind::BaseGameProof,
+        DestinationObjectKind::OutputRootPreimage,
+    ] {
+        let mut lone = block_at(HEIGHT, vec![], &[]);
+        lone.destination = Some(DestinationSection {
+            objects: base_objects(&world, &c0)
+                .into_iter()
+                .filter(|o| o.kind == kind)
+                .collect(),
+        });
+        assert_eq!(
+            validate_block_destination(&lone, &parent, &rules, &keys),
+            Err(DestinationBlockError::UnusedFinality)
+        );
+    }
+    // Undecodable.
+    for kind in [
+        DestinationObjectKind::BaseGameProof,
+        DestinationObjectKind::OutputRootPreimage,
+    ] {
+        let mut bad = full.clone();
+        for o in &mut bad.destination.as_mut().unwrap().objects {
+            if o.kind == kind {
+                o.payload.push(0);
+            }
+        }
+        assert_eq!(
+            validate_block_destination(&bad, &parent, &rules, &keys),
+            Err(DestinationBlockError::MalformedObject { kind })
+        );
+    }
+}
+
+/// Below the height the objects are refused, and the L1 reading of before
+/// pays as it did.
+#[test]
+fn below_the_height_the_base_objects_are_refused() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HB - 2, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let b = base_release_block(HB - 1, &r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::BaseObjectBeforeActivation)
+    );
+    // The same rules, dormant: the very same refusal of the objects.
+    let dormant = DestinationRules {
+        base_return: BaseReturnRules {
+            activation_height: None,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&b, &parent, &dormant, &keys),
+        Err(DestinationBlockError::BaseObjectBeforeActivation)
+    );
+}
+
+/// D107: a block that carries a committee update carries no game proof.
+#[test]
+fn a_game_proof_never_shares_a_block_with_a_committee_update() {
+    let (c0, c1) = (committee(1), committee(2));
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let update = committee_update(&c0, P0, &c1).encode_payload();
+    let mut b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    b.transactions.extend(update_group(500, &update));
+    b.destination.as_mut().unwrap().objects.insert(
+        0,
+        object(DestinationObjectKind::CommitteeUpdate, update.clone()),
+    );
+    assert_eq!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::GameProofWithCommitteeUpdate)
+    );
+    // The committee update alone in its block is fine, and so is the release
+    // in the next.
+    let alone = block_with(
+        HEIGHT,
+        vec![update_group(500, &update)],
+        vec![object(DestinationObjectKind::CommitteeUpdate, update)],
+    );
+    assert!(validate_block_destination(&alone, &parent, &rules, &keys).is_ok());
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    assert!(validate_block_destination(&b, &parent, &rules, &keys).is_ok());
+}
+
+#[test]
+fn over_base_the_game_must_be_final_at_the_l1_time() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let cases = [
+        // Resolved at the L1 time itself: not final yet (strict).
+        (
+            VALID,
+            (TIMES.0, L1_TIME, TIMES.2),
+            BaseGameError::NotFinalized,
+        ),
+        // Resolved after it.
+        (
+            VALID,
+            (TIMES.0, L1_TIME + 1, TIMES.2),
+            BaseGameError::NotFinalized,
+        ),
+        // Still in progress.
+        (
+            Knobs {
+                status: crate::consensus::destination::base_read::GAME_STATUS_IN_PROGRESS,
+                ..VALID
+            },
+            TIMES,
+            BaseGameError::NotResolved,
+        ),
+        // Blacklisted.
+        (
+            Knobs {
+                blacklisted: true,
+                ..VALID
+            },
+            TIMES,
+            BaseGameError::Blacklisted,
+        ),
+        // Retired.
+        (VALID, (TIMES.0, TIMES.1, TIMES.0), BaseGameError::Retired),
+    ];
+    for (knobs, times, error) in cases {
+        let world = base_world(&r, knobs, times);
+        let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+        assert_eq!(
+            validate_block_destination(&b, &parent, &rules, &keys),
+            Err(DestinationBlockError::BaseReturn(BaseReturnError::Game(
+                error
+            )))
+        );
+    }
+    // Resolved one second before: final.
+    let world = base_world(&r, VALID, (TIMES.0, L1_TIME - 1, TIMES.2));
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    assert!(validate_block_destination(&b, &parent, &rules, &keys).is_ok());
+}
+
+#[test]
+fn over_base_every_link_of_the_chain_is_checked() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let replace = |b: &Block, kind: DestinationObjectKind, payload: Vec<u8>| {
+        let mut b = b.clone();
+        for o in &mut b.destination.as_mut().unwrap().objects {
+            if o.kind == kind {
+                o.payload = payload.clone();
+            }
+        }
+        b
+    };
+    let good = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    // Another preimage than the claim's.
+    let mut other = world.preimage;
+    other.block_hash[0] ^= 1;
+    let b = replace(
+        &good,
+        DestinationObjectKind::OutputRootPreimage,
+        encode_output_root_preimage(&other),
+    );
+    assert_eq!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::BaseReturn(
+            BaseReturnError::OutputRootMismatch
+        ))
+    );
+    // A game proof under another L1 root (the finality update's root holds
+    // another game).
+    let elsewhere = base_world(&release(4, BOB, 5 * JTM), VALID, TIMES);
+    let b = replace(
+        &good,
+        DestinationObjectKind::BaseGameProof,
+        encode_game_proof(&elsewhere.game),
+    );
+    assert!(matches!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::BaseReturn(BaseReturnError::Game(
+            BaseGameError::Read(_)
+        )))
+    ));
+    // The bridge account of another Base root.
+    let b = replace(
+        &good,
+        DestinationObjectKind::BridgeAccountProof,
+        elsewhere.account.clone(),
+    );
+    assert!(matches!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::BridgeAccount(_))
+    ));
+    // Another code pinned for the bridge.
+    let other_code = DestinationRules {
+        bridge: Some(L1BridgeParams {
+            code_hash: [0xcc; 32],
+            ..prototype_bridge()
+        }),
+        ..rules
+    };
+    assert_eq!(
+        validate_block_destination(&good, &parent, &other_code, &keys),
+        Err(DestinationBlockError::BridgeAccount(
+            L1ReadError::CodeHashMismatch
+        ))
+    );
+    // Another amount than the burn: withdrawals[n] holds another commitment.
+    let greedy_r = VaultRelease {
+        amount: r.amount + 1,
+        ..r.clone()
+    };
+    let greedy = base_release_block(HEIGHT, &greedy_r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&greedy, &parent, &rules, &keys),
+        Err(DestinationBlockError::Vault(VaultError::NotProvenOnL1 {
+            n: 3,
+            error: L1ReadError::CommitmentMismatch
+        }))
+    );
+    // Signed by a committee the branch does not know.
+    let b = base_release_block(HEIGHT, &r, ALICE, &committee(9), &world);
+    assert_eq!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::LightClient(
+            LightClientError::BadSignature
+        ))
+    );
+    // Base's other network pinned (another registry): the game is not read.
+    let main = DestinationRules {
+        base_return: BaseReturnRules {
+            base: crate::consensus::destination::base_read::BASE_MAINNET,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    assert!(matches!(
+        validate_block_destination(&good, &parent, &main, &keys),
+        Err(DestinationBlockError::BaseReturn(BaseReturnError::Game(_)))
+    ));
+    // No bridge in the build.
+    let unbridged = DestinationRules {
+        bridge: None,
+        ..rules
+    };
+    assert_eq!(
+        validate_block_destination(&good, &parent, &unbridged, &keys),
+        Err(DestinationBlockError::BridgeUnset)
+    );
+}
+
+/// From the height on the light client reads the L1 Base settles on: an
+/// update signed for another L1 no longer verifies.
+#[test]
+fn over_base_the_light_client_reads_the_l1_base_settles_on() {
+    let c0 = committee(1);
+    let mut rules = base_rules(&c0);
+    rules.base_return.network = L1_REHEARSAL;
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&b, &parent, &rules, &keys),
+        Err(DestinationBlockError::LightClient(
+            LightClientError::BadSignature
+        ))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The advance through a block
+// ---------------------------------------------------------------------------
+
+fn advance_group(
+    slot_base: u32,
+    advancer: Address,
+    n: u64,
+    owner: Address,
+    amount: u64,
+) -> Vec<jetsam_tx::Transaction> {
+    let paid = AdvanceRules::CONSENSUS.min_paid(amount, RF);
+    logical(
+        slot_base,
+        advancer,
+        &[
+            (owner, paid),
+            (
+                crate::consensus::destination::advance::advance_marker(
+                    n, &owner, amount, &advancer,
+                ),
+                0,
+            ),
+        ],
+        FEE,
+    )
+}
+
+/// Below the height an advance-shaped group is an ordinary spend, even one
+/// the rule would refuse: a dormant node judges it as a node without the rule.
+#[test]
+fn below_the_height_an_advance_is_an_ordinary_spend() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let marker = crate::consensus::destination::advance::advance_marker(7, &ALICE, 5 * JTM, &PAYER);
+    let good = vec![advance_group(300, PAYER, 7, ALICE, 5 * JTM)];
+    // Its marker carries value.
+    let bad = vec![logical(300, PAYER, &[(ALICE, 1), (marker, 9)], FEE)];
+    for groups in [good.clone(), bad.clone()] {
+        let parent = state_at(HB - 2, known(&c0));
+        let b = block_at(HB - 1, groups, &[]);
+        let effect = validate_block_destination(&b, &parent, &rules, &keys).expect("plain");
+        assert!(effect.advances.is_empty());
+    }
+    // From the height on, the rule reads it.
+    let parent = state_at(HB - 1, known(&c0));
+    let effect = validate_block_destination(&block_at(HB, good, &[]), &parent, &rules, &keys)
+        .expect("an advance");
+    assert_eq!(effect.advances.created.len(), 1);
+    let mut state = parent.clone();
+    state.apply(&effect, VAULT_RELEASE_WINDOW_BLOCKS).unwrap();
+    assert_eq!(state.advances.outstanding_of(&PAYER), 5 * JTM);
+    let refused = validate_block_destination(&block_at(HB, bad, &[]), &parent, &rules, &keys);
+    assert_eq!(
+        refused,
+        Err(DestinationBlockError::Advance(
+            AdvanceError::MarkerCarriesValue { group: 0 }
+        ))
+    );
+    assert!(refused.unwrap_err().condemns_block());
+}
+
+/// V2 over Base: the release of an advanced burn pays the advance's current
+/// creditor and consumes the advance; a wrong advance is consumed while the
+/// owner is paid.
+#[test]
+fn the_release_of_an_advanced_burn_repays_the_creditor() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let entry = AdvanceEntry {
+        origin: PAYER,
+        creditor: BOB,
+        owner: ALICE,
+        amount: r.amount,
+    };
+    let mut parent = state_at(HEIGHT - 1, known(&c0));
+    parent.advances.insert(3, entry);
+    let to_creditor = base_release_block(HEIGHT, &r, BOB, &c0, &world);
+    let effect =
+        validate_block_destination(&to_creditor, &parent, &rules, &keys).expect("repays BOB");
+    assert_eq!(effect.advances.consumed, vec![3]);
+    assert_eq!(effect.vault.releases, vec![(3, ALICE, r.amount)]);
+    let to_owner = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    assert_eq!(
+        validate_block_destination(&to_owner, &parent, &rules, &keys),
+        Err(DestinationBlockError::Vault(
+            VaultError::ReleasePaysOtherOwner { group: 0 }
+        ))
+    );
+    let mut state = parent.clone();
+    state.apply(&effect, VAULT_RELEASE_WINDOW_BLOCKS).unwrap();
+    assert!(state.advances.is_empty());
+    assert_eq!(state.advances.outstanding_of(&PAYER), 0);
+    // A wrong advance (another amount): the owner is paid, the advance gone.
+    let mut wrong = state_at(HEIGHT - 1, known(&c0));
+    wrong.advances.insert(
+        3,
+        AdvanceEntry {
+            amount: r.amount + 1,
+            ..entry
+        },
+    );
+    let effect = validate_block_destination(&to_owner, &wrong, &rules, &keys).expect("ALICE");
+    assert_eq!(effect.advances.consumed, vec![3]);
+    assert_eq!(
+        validate_block_destination(&to_creditor, &wrong, &rules, &keys),
+        Err(DestinationBlockError::Vault(
+            VaultError::ReleasePaysOtherOwner { group: 0 }
+        ))
+    );
+    // Below the height there is no advance to read: the owner is paid.
+    let dormant = DestinationRules {
+        base_return: BaseReturnRules {
+            activation_height: None,
+            ..rules.base_return
+        },
+        ..rules
+    };
+    let l1_r = release(5, ALICE, 5 * JTM);
+    let l1_block = super::tests::release_block(HEIGHT, &l1_r, &c0, P0);
+    let mut with_entry = state_at(HEIGHT - 1, known(&c0));
+    with_entry.advances.insert(5, entry);
+    let effect = validate_block_destination(&l1_block, &with_entry, &dormant, &keys).expect("L1");
+    assert!(effect.advances.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// State: apply, undo, encoding
+// ---------------------------------------------------------------------------
+
+fn effect(height: u64, advances: AdvanceEffect) -> DestinationEffect {
+    DestinationEffect {
+        height,
+        vault: VaultEffect {
+            bridge_locked_after: 5_000 * JTM,
+            ..VaultEffect::default()
+        },
+        committees_after: None,
+        committee_update: None,
+        advances,
+    }
+}
+
+fn entry_of(origin: Address, owner: Address, amount: u64) -> AdvanceEntry {
+    AdvanceEntry {
+        origin,
+        creditor: origin,
+        owner,
+        amount,
+    }
+}
+
+#[test]
+fn advances_apply_and_undo_with_the_branch() {
+    let base = state_at(HEIGHT - 1, Vec::new());
+    let mut s = base.clone();
+    let a = entry_of(PAYER, ALICE, 5 * JTM);
+    s.apply(
+        &effect(
+            HEIGHT,
+            AdvanceEffect {
+                created: vec![(3, a), (4, entry_of(BOB, ALICE, 2 * JTM))],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    let after_1 = s.clone();
+    assert_eq!(s.advances.get(3), Some(&a));
+    assert_eq!(s.advances.outstanding_of(&PAYER), 5 * JTM);
+    s.apply(
+        &effect(
+            HEIGHT + 1,
+            AdvanceEffect {
+                transfers: vec![(3, BOB)],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    let after_2 = s.clone();
+    assert_eq!(s.advances.get(3).map(|e| e.creditor), Some(BOB));
+    assert_eq!(s.advances.outstanding_of(&PAYER), 5 * JTM);
+    s.apply(
+        &effect(
+            HEIGHT + 2,
+            AdvanceEffect {
+                consumed: vec![3],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    assert_eq!(s.advances.get(3), None);
+    assert_eq!(s.advances.outstanding_of(&PAYER), 0);
+    assert_eq!(s.advances.len(), 1);
+    assert_eq!(
+        s.undo.last().map(|u| u.advances.consumed.clone()),
+        Some(vec![(3, AdvanceEntry { creditor: BOB, ..a })])
+    );
+    // Back one block at a time: exactly the states before.
+    let s = s.truncate_above(HEIGHT + 1).unwrap().unwrap();
+    assert_eq!(s, after_2);
+    let s = s.truncate_above(HEIGHT).unwrap().unwrap();
+    assert_eq!(s, after_1);
+    let s = s.truncate_above(HEIGHT - 1).unwrap().unwrap();
+    assert_eq!(s.advances, base.advances);
+    assert!(s.advances.is_empty());
+}
+
+#[test]
+fn a_state_without_advances_encodes_as_before_and_one_with_them_as_version_2() {
+    let mut s = state_at(HEIGHT - 1, Vec::new());
+    let v1 = s.encode();
+    assert_eq!(v1[0], DESTINATION_STATE_VERSION);
+    assert_eq!(DestinationState::decode(&v1), Ok(s.clone()));
+    s.apply(
+        &effect(
+            HEIGHT,
+            AdvanceEffect {
+                created: vec![(3, entry_of(PAYER, ALICE, 5 * JTM))],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    s.apply(
+        &effect(
+            HEIGHT + 1,
+            AdvanceEffect {
+                transfers: vec![(3, BOB)],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    let v2 = s.encode();
+    assert_eq!(v2[0], DESTINATION_STATE_VERSION_ADVANCES);
+    assert_eq!(DestinationState::decode(&v2), Ok(s.clone()));
+    // The undo alone holds advances (consumed ones): still version 2.
+    s.apply(
+        &effect(
+            HEIGHT + 2,
+            AdvanceEffect {
+                consumed: vec![3],
+                ..AdvanceEffect::default()
+            },
+        ),
+        VAULT_RELEASE_WINDOW_BLOCKS,
+    )
+    .unwrap();
+    assert!(s.advances.is_empty());
+    let v2 = s.encode();
+    assert_eq!(v2[0], DESTINATION_STATE_VERSION_ADVANCES);
+    assert_eq!(DestinationState::decode(&v2), Ok(s.clone()));
+    // Once the undo forgets them: version 1 again, byte for byte the state's
+    // version-1 encoding.
+    let mut plain = s.clone();
+    plain.undo.clear();
+    assert_eq!(plain.encode()[0], DESTINATION_STATE_VERSION);
+    // Version 2 holding nothing of the advances is not canonical.
+    let mut fake = plain.encode();
+    fake[0] = DESTINATION_STATE_VERSION_ADVANCES;
+    fake.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        DestinationState::decode(&fake),
+        Err(DestinationStateError::Malformed)
+    );
+    // Advances out of order, or of no amount.
+    let mut two = state_at(HEIGHT - 1, Vec::new());
+    two.advances.insert(3, entry_of(PAYER, ALICE, 5 * JTM));
+    two.advances.insert(9, entry_of(PAYER, ALICE, 6 * JTM));
+    let bytes = two.encode();
+    assert_eq!(DestinationState::decode(&bytes), Ok(two.clone()));
+    let body = state_at(HEIGHT - 1, Vec::new()).encode().len();
+    let mut swapped = bytes.clone();
+    // count:u32, then 112-byte entries: n (8), origin, creditor, owner, amount.
+    let (a, b) = (body + 4, body + 4 + 112);
+    let first = swapped[a..a + 8].to_vec();
+    let second = swapped[b..b + 8].to_vec();
+    swapped[a..a + 8].copy_from_slice(&second);
+    swapped[b..b + 8].copy_from_slice(&first);
+    assert_eq!(
+        DestinationState::decode(&swapped),
+        Err(DestinationStateError::Malformed)
+    );
+    let mut zero = bytes;
+    zero[a + 8 + 96..a + 112].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        DestinationState::decode(&zero),
+        Err(DestinationStateError::Malformed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot: the advances rebuilt from their markers
+// ---------------------------------------------------------------------------
+
+/// Headers whose `alloc_counter` is `10 × height`: a slot of creation id `x`
+/// was created by the block `⌈x / 10⌉`.
+fn alloc(h: u64) -> Option<u64> {
+    Some(h * 10)
+}
+
+fn snapshot_rules() -> DestinationRules {
+    base_rules(&committee(1))
+}
+
+/// The check of a snapshot at `tip` fed `slots` `(owner, creation_id)`.
+fn install(
+    file: &DestinationSnapshotFile,
+    tip: u64,
+    slots: &[(Address, u64)],
+) -> Result<DestinationState, SnapshotDestinationError> {
+    let rules = snapshot_rules();
+    let floor = alloc(rules.activation_height.unwrap() - 1).unwrap();
+    let mut check = SnapshotDestinationCheck::new(file, tip, floor, rules);
+    for (owner, id) in slots {
+        check.observe_slot(owner, 0, *id);
+    }
+    check.finish(alloc, &mut CommitteeKeyCache::default())
+}
+
+#[test]
+fn a_snapshot_rebuilds_the_advances_from_their_markers() {
+    use crate::consensus::destination::advance::{advance_marker, advance_transfer_marker};
+    let tip = HEIGHT + 20;
+    let a3 = AdvanceEntry {
+        origin: PAYER,
+        creditor: BOB,
+        owner: ALICE,
+        amount: 5 * JTM,
+    };
+    let a4 = entry_of(BOB, ALICE, 2 * JTM);
+    let at = |h: u64| h * 10 - 3;
+    let slots = vec![
+        // Before the return over Base: an ordinary owner then, not an advance.
+        (advance_marker(8, &ALICE, JTM, &PAYER), at(HB - 1)),
+        (advance_marker(3, &ALICE, 5 * JTM, &PAYER), at(HB + 1)),
+        (advance_transfer_marker(3, &PAYER), at(HB + 2)),
+        (advance_transfer_marker(3, &BOB), at(HB + 3)),
+        (advance_marker(4, &ALICE, 2 * JTM, &BOB), at(HB + 3) + 1),
+        // Advanced, then released: consumed.
+        (advance_marker(6, &ALICE, JTM, &PAYER), at(HB + 4)),
+        (release(6, ALICE, JTM).marker(), at(HB + 9)),
+    ];
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: vec![(3, a3), (4, a4)],
+    };
+    // The window of the next block reads the release of block HB + 9.
+    let file = DestinationSnapshotFile {
+        window_releases: vec![(6, ALICE, JTM)],
+        ..file
+    };
+    let state = install(&file, tip, &slots).expect("the advances");
+    assert_eq!(state.advances.get(3), Some(&a3));
+    assert_eq!(state.advances.get(4), Some(&a4));
+    assert_eq!(state.advances.len(), 2);
+    assert_eq!(state.advances.outstanding_of(&PAYER), 5 * JTM);
+    // The file round-trips, as version 2 (JTMDST02).
+    let bytes = file.encode();
+    assert_eq!(&bytes[..8], b"JTMDST02");
+    assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file.clone()));
+    // A file that lies about one of them, or forgets one, or adds one.
+    for advances in [
+        vec![
+            (
+                3,
+                AdvanceEntry {
+                    creditor: PAYER,
+                    ..a3
+                },
+            ),
+            (4, a4),
+        ],
+        vec![(3, AdvanceEntry { owner: BOB, ..a3 }), (4, a4)],
+        vec![(3, AdvanceEntry { origin: BOB, ..a3 }), (4, a4)],
+        vec![
+            (
+                3,
+                AdvanceEntry {
+                    amount: 6 * JTM,
+                    ..a3
+                },
+            ),
+            (4, a4),
+        ],
+        vec![(3, a3)],
+        vec![(3, a3), (4, a4), (6, entry_of(PAYER, ALICE, JTM))],
+        vec![(4, a4), (3, a3)],
+    ] {
+        let lying = DestinationSnapshotFile {
+            advances,
+            ..file.clone()
+        };
+        assert!(matches!(
+            install(&lying, tip, &slots),
+            Err(SnapshotDestinationError::Mismatch { .. })
+        ));
+    }
+    // Two advance markers of one n (no branch makes them): refused.
+    let mut doubled = slots.clone();
+    doubled.push((advance_marker(3, &BOB, 5 * JTM, &PAYER), at(HB + 5)));
+    assert!(install(&file, tip, &doubled).is_err());
+}
+
+#[test]
+fn a_snapshot_file_without_advances_is_the_file_of_before() {
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: vec![(1, ALICE, JTM)],
+        advances: Vec::new(),
+    };
+    let bytes = file.encode();
+    assert_eq!(&bytes[..8], b"JTMDST01");
+    assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file));
+    // A version-2 file with no advance is not canonical.
+    let mut fake = bytes;
+    fake[..8].copy_from_slice(b"JTMDST02");
+    fake.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        DestinationSnapshotFile::decode(&fake),
+        Err(DestinationStateError::Malformed)
+    );
+    // Below the return over Base a file carries none.
+    let early = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: vec![(3, entry_of(PAYER, ALICE, JTM))],
+    };
+    assert!(install(&early, HB - 3, &[]).is_err());
+}

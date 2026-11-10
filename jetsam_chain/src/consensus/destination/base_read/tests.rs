@@ -1010,13 +1010,13 @@ fn mapping(key: &Root, slot: u64) -> Root {
 
 /// Knobs of the synthetic state.
 #[derive(Clone, Copy)]
-struct Knobs {
-    blacklisted: bool,
-    pause_global: u64,
-    pause_portal: u64,
-    respected: bool,
-    status: u8,
-    registered: Option<Address>,
+pub(crate) struct Knobs {
+    pub(crate) blacklisted: bool,
+    pub(crate) pause_global: u64,
+    pub(crate) pause_portal: u64,
+    pub(crate) respected: bool,
+    pub(crate) status: u8,
+    pub(crate) registered: Option<Address>,
 }
 
 const PORTAL: Address = [0x49; 20];
@@ -1025,10 +1025,25 @@ const RESOLVED: u64 = 1_794_252_900;
 const RETIREMENT: u64 = 1_776_392_808;
 
 fn synthetic_game(knobs: Knobs) -> (Root, GameProof) {
+    synthetic_game_at(knobs, None, (CREATED, RESOLVED, RETIREMENT))
+}
+
+/// [`synthetic_game`] with the root claim of its arguments replaced by
+/// `root_claim` (the real game's otherwise), and its clocks `(createdAt,
+/// resolvedAt, retirementTimestamp)`: the L1 state of a game that claims a
+/// synthetic Base state root, for the consensus tests of the return.
+pub(crate) fn synthetic_game_at(
+    knobs: Knobs,
+    root_claim: Option<Root>,
+    (created, resolved, retirement): (u64, u64, u64),
+) -> (Root, GameProof) {
     let c = sep_valid();
     let p = BASE_SEPOLIA;
     let game = address(&c["game"]["address"]);
-    let args = hx(c["game"]["args"].as_str().expect("args"));
+    let mut args = hx(c["game"]["args"].as_str().expect("args"));
+    if let Some(claim) = root_claim {
+        args[0x14..0x34].copy_from_slice(&claim);
+    }
     let uuid = game_uuid(
         621,
         &args[0x14..0x34].try_into().expect("32"),
@@ -1039,17 +1054,17 @@ fn synthetic_game(knobs: Knobs) -> (Root, GameProof) {
     asr0[30] = 0;
     asr0[31] = 2; // _initialized
     let mut retire = [0u8; 32];
-    retire[20..28].copy_from_slice(&RETIREMENT.to_be_bytes());
+    retire[20..28].copy_from_slice(&retirement.to_be_bytes());
     retire[28..].copy_from_slice(&621u32.to_be_bytes());
     let mut game_id = w_addr(&knobs.registered.unwrap_or(game));
     game_id[..4].copy_from_slice(&621u32.to_be_bytes());
-    game_id[4..12].copy_from_slice(&CREATED.to_be_bytes());
+    game_id[4..12].copy_from_slice(&created.to_be_bytes());
     if knobs.registered == Some([0; 20]) {
         game_id = [0; 32];
     }
     let mut state = [0u8; 32];
-    state[24..].copy_from_slice(&CREATED.to_be_bytes());
-    state[16..24].copy_from_slice(&RESOLVED.to_be_bytes());
+    state[24..].copy_from_slice(&created.to_be_bytes());
+    state[16..24].copy_from_slice(&resolved.to_be_bytes());
     state[15] = knobs.status;
     state[14] = 1; // initialized
     state[13] = u8::from(knobs.respected);
@@ -1126,7 +1141,7 @@ fn synthetic_game(knobs: Knobs) -> (Root, GameProof) {
     )
 }
 
-const VALID: Knobs = Knobs {
+pub(crate) const VALID: Knobs = Knobs {
     blacklisted: false,
     pause_global: 0,
     pause_portal: 0,
@@ -1311,5 +1326,219 @@ fn sepolia_test_bridge_under_the_newest_proposal() {
             },
         ),
         Err(BaseReturnError::Game(BaseGameError::NotResolved))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The section objects (D107: the game proof's nodes deduplicated)
+// ---------------------------------------------------------------------------
+
+/// The proof's lists in the order the codec walks them.
+fn lists(p: &GameProof) -> Vec<&Nodes> {
+    let mut out = Vec::new();
+    for c in [
+        &p.anchor_state_registry,
+        &p.dispute_game_factory,
+        &p.game_account,
+        &p.system_config,
+        &p.superchain_config,
+    ] {
+        out.push(&c.account);
+        out.extend(c.slots.iter());
+    }
+    out
+}
+
+fn raw_bytes(p: &GameProof) -> usize {
+    lists(p).iter().flat_map(|l| l.iter()).map(Vec::len).sum()
+}
+
+/// The format of [`encode_game_proof`] written out by hand, with the node
+/// table in the order `order` gives it (the canonical one is first use).
+fn encode_by_hand(p: &GameProof, order: impl Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>>) -> Vec<u8> {
+    let mut table: Vec<Vec<u8>> = Vec::new();
+    for list in lists(p) {
+        for node in list {
+            if !table.contains(node) {
+                table.push(node.clone());
+            }
+        }
+    }
+    let table = order(table);
+    let index = |node: &Vec<u8>| table.iter().position(|t| t == node).expect("in table") as u16;
+    let mut out = p.game.to_vec();
+    out.extend_from_slice(&(p.args.len() as u16).to_le_bytes());
+    out.extend_from_slice(&p.args);
+    out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    for node in &table {
+        out.extend_from_slice(&(node.len() as u16).to_le_bytes());
+        out.extend_from_slice(node);
+    }
+    let put = |out: &mut Vec<u8>, list: &Nodes| {
+        out.push(list.len() as u8);
+        for node in list {
+            out.extend_from_slice(&index(node).to_le_bytes());
+        }
+    };
+    for c in [
+        &p.anchor_state_registry,
+        &p.dispute_game_factory,
+        &p.game_account,
+        &p.system_config,
+        &p.superchain_config,
+    ] {
+        put(&mut out, &c.account);
+        out.push(c.slots.len() as u8);
+        for slot in &c.slots {
+            put(&mut out, slot);
+        }
+    }
+    out
+}
+
+#[test]
+fn the_game_proof_object_round_trips_real_proofs_with_each_node_once() {
+    for (c, params, at_most) in [
+        (sep_valid(), BASE_SEPOLIA, 22_500),
+        (sep_30004(), BASE_SEPOLIA, 22_500),
+        (main_valid(), BASE_MAINNET, 24_000),
+    ] {
+        let proof = game_proof(&c);
+        let bytes = encode_game_proof(&proof);
+        assert_eq!(
+            bytes,
+            encode_by_hand(&proof, |t| t),
+            "the documented format"
+        );
+        assert_eq!(decode_game_proof(&bytes), Ok(proof.clone()));
+        // Each distinct node once (spec §5: ≈ 20.6-22.1 kB of nodes, 64-67).
+        let raw = raw_bytes(&proof);
+        assert!(bytes.len() < raw * 88 / 100, "{} vs {raw}", bytes.len());
+        assert!(bytes.len() <= at_most, "{}", bytes.len());
+        // The decoded proof reads as the original.
+        assert_eq!(
+            read_game_facts(l1_root(&c), &params, &decode_game_proof(&bytes).unwrap()),
+            read_game_facts(l1_root(&c), &params, &proof)
+        );
+    }
+}
+
+#[test]
+fn the_game_proof_object_has_one_encoding() {
+    let proof = game_proof(&sep_valid());
+    let bytes = encode_game_proof(&proof);
+    // Truncated anywhere, or followed by a byte.
+    for cut in [0, 1, 20, 21, 22, 200, bytes.len() / 2, bytes.len() - 1] {
+        assert_eq!(
+            decode_game_proof(&bytes[..cut]),
+            Err(BaseCodecError::Truncated),
+            "cut at {cut}"
+        );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(
+        decode_game_proof(&longer),
+        Err(BaseCodecError::TrailingBytes)
+    );
+    // The table in another order (each list pointing at its nodes): the same
+    // proof, another encoding.
+    let reversed = encode_by_hand(&proof, |mut t| {
+        t.reverse();
+        t
+    });
+    assert_ne!(reversed, bytes);
+    assert_eq!(
+        decode_game_proof(&reversed),
+        Err(BaseCodecError::NonCanonical)
+    );
+    // A node twice in the table, or a node no list references.
+    let table_at = 20 + 2 + proof.args.len();
+    let count = u16::from_le_bytes(bytes[table_at..table_at + 2].try_into().unwrap()) as usize;
+    let mut at = table_at + 2;
+    for _ in 0..count {
+        at += 2 + u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+    }
+    let first_len = u16::from_le_bytes(bytes[table_at + 2..table_at + 4].try_into().unwrap());
+    let first = bytes[table_at + 2..table_at + 4 + usize::from(first_len)].to_vec();
+    for extra in [first.clone(), {
+        let mut other = first.clone();
+        other[3] ^= 0x55;
+        other
+    }] {
+        let mut padded = bytes[..at].to_vec();
+        padded.extend_from_slice(&extra);
+        padded.extend_from_slice(&bytes[at..]);
+        padded[table_at..table_at + 2].copy_from_slice(&((count + 1) as u16).to_le_bytes());
+        assert_eq!(
+            decode_game_proof(&padded),
+            Err(BaseCodecError::NonCanonical)
+        );
+    }
+    // An index past the table.
+    let mut bad = bytes.clone();
+    let first_list = at;
+    assert!(
+        bad[first_list] > 0,
+        "the registry's account proof has nodes"
+    );
+    bad[first_list + 1..first_list + 3].copy_from_slice(&(count as u16).to_le_bytes());
+    assert_eq!(decode_game_proof(&bad), Err(BaseCodecError::BadIndex));
+    // An empty node.
+    let mut empty = bytes[..table_at + 2].to_vec();
+    empty.extend_from_slice(&0u16.to_le_bytes());
+    empty.extend_from_slice(&bytes[table_at + 2..]);
+    empty[table_at..table_at + 2].copy_from_slice(&((count + 1) as u16).to_le_bytes());
+    assert_eq!(decode_game_proof(&empty), Err(BaseCodecError::NodeTooLong));
+}
+
+#[test]
+fn the_game_proof_object_bounds_its_lists() {
+    let mut proof = game_proof(&sep_valid());
+    proof.system_config.slots = vec![vec![vec![1u8; 40]]; MAX_CONTRACT_SLOTS + 1];
+    assert_eq!(
+        decode_game_proof(&encode_by_hand(&proof, |t| t)),
+        Err(BaseCodecError::TooManySlots)
+    );
+    let mut proof = game_proof(&sep_valid());
+    proof.game_account.account = (0..33u8).map(|i| vec![i; 40]).collect();
+    assert_eq!(
+        decode_game_proof(&encode_by_hand(&proof, |t| t)),
+        Err(BaseCodecError::TooManyNodes)
+    );
+    let mut proof = game_proof(&sep_valid());
+    proof.args = vec![7u8; MAX_GAME_ARGS_BYTES + 1];
+    assert_eq!(
+        decode_game_proof(&encode_by_hand(&proof, |t| t)),
+        Err(BaseCodecError::ArgsTooLong)
+    );
+    let mut proof = game_proof(&sep_valid());
+    proof.game_account.account[0] = vec![9u8; 1_025];
+    assert_eq!(
+        decode_game_proof(&encode_by_hand(&proof, |t| t)),
+        Err(BaseCodecError::NodeTooLong)
+    );
+}
+
+#[test]
+fn the_output_root_preimage_object_is_its_four_words() {
+    let c = sep_valid();
+    let p = preimage(&c["l2"]["header"]);
+    let bytes = encode_output_root_preimage(&p);
+    assert_eq!(bytes.len(), OUTPUT_ROOT_PREIMAGE_BYTES);
+    assert_eq!(&bytes[..32], &p.version);
+    assert_eq!(&bytes[32..64], &p.state_root);
+    assert_eq!(&bytes[64..96], &p.message_passer_storage_root);
+    assert_eq!(&bytes[96..], &p.block_hash);
+    assert_eq!(decode_output_root_preimage(&bytes), Ok(p));
+    assert_eq!(
+        decode_output_root_preimage(&bytes[..127]),
+        Err(BaseCodecError::Truncated)
+    );
+    let mut longer = bytes;
+    longer.push(0);
+    assert_eq!(
+        decode_output_root_preimage(&longer),
+        Err(BaseCodecError::TrailingBytes)
     );
 }

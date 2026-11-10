@@ -532,6 +532,13 @@ fn real_catchup_1887_to_1894_then_finality_1895_verifies() {
     assert_eq!(finalized.participants, 507);
     assert_eq!(finalized.execution.block_number, 26_286_014);
     assert_eq!(finalized.execution.state_root, l1_state_root_26286014());
+    // The L1 time of that root: the execution header's timestamp, the one
+    // `eth_getBlockByNumber` returned (the return over Base reads it).
+    assert_eq!(finalized.execution.timestamp, Some(1_793_127_767));
+    assert_eq!(
+        finalized.execution.timestamp,
+        bench()["l1_block"]["timestamp"].as_u64()
+    );
 }
 
 /// Every one of the 8 real updates carries a finalized header of its own
@@ -1376,6 +1383,12 @@ fn gloas_execution_header_rlp_matches_block_hash() {
     assert_eq!(out.participants, 500);
     assert_eq!(out.execution.state_root, h32(SEPOLIA_STATE_ROOT_12007148));
     assert_eq!(out.execution.block_hash, *block_hash);
+    // Under Gloas the L1 time is the RLP header's item 11 (Sepolia block
+    // 12 007 148), never derived from the beacon slot.
+    assert_eq!(out.execution.timestamp, Some(1_793_128_404));
+    // The constants of this test are the build's Sepolia (the L1 Base
+    // Sepolia settles on, the test chain's return over Base).
+    assert_eq!(SEPOLIA, crate::consensus::destination::forks::L1_SEPOLIA);
     // Without its execution header, or with another one, it proves nothing.
     let mut bad = fu.clone();
     bad.execution_rlp = None;

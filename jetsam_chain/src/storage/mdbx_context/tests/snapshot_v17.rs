@@ -700,12 +700,14 @@ fn tampered_destination_state_file_is_refused() {
     extra_release.destination = Some(DestinationSnapshotFile {
         committee_updates: Vec::new(),
         window_releases: vec![(1, Address([0xA1; 32]), 7 * MICRO_PER_JTM)],
+        advances: Vec::new(),
     });
     cases.push(extra_release);
     let mut extra_update = honest.clone();
     extra_update.destination = Some(DestinationSnapshotFile {
         committee_updates: vec![vec![0x5A; 64]],
         window_releases: Vec::new(),
+        advances: Vec::new(),
     });
     cases.push(extra_update);
     let mut missing = honest.clone();

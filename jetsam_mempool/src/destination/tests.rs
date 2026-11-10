@@ -124,6 +124,7 @@ impl SyntheticL1 {
             anchor: Some(self.anchor),
             bridge: Some(self.bridge),
             vault,
+            base_return: jetsam_chain::consensus::destination::state::BaseReturnRules::CONSENSUS,
         }
     }
 
