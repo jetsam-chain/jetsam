@@ -689,6 +689,91 @@ fn a_burn_is_seen_before_the_proposal_block_after_it_is_captured() {
     assert!(report.capture.captured.is_empty() && report.capture.refused.is_empty());
 }
 
+/// An RPC whose blocks and proofs come from a backend `lag` blocks behind
+/// the head it answers (a router: `eth_blockNumber` from one backend, the
+/// rest from another, D159): a block in the last `lag` below that head is
+/// not served yet ("header not found"), and a proof asked of it is recorded
+/// (a block asked before it exists, refused 429).
+struct Behind<'a> {
+    live: &'a LiveBase,
+    lag: u64,
+    early_proofs: Mutex<Vec<u64>>,
+}
+
+impl BaseRpc for Behind<'_> {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let block = match method {
+            "eth_getBlockByNumber" => Some(quantity_of(&params[0])),
+            "eth_getProof" => Some(quantity_of(&params[2])),
+            _ => None,
+        };
+        let head = self.live.head();
+        if let Some(block) = block.filter(|b| *b <= head && head - b < self.lag) {
+            if method == "eth_getProof" {
+                self.early_proofs.lock().unwrap().push(block);
+                bail!("429 too many requests");
+            }
+            bail!("header not found");
+        }
+        self.live.rpc(method, params)
+    }
+}
+
+/// D159 (backlog: the capture must follow the proposal block within seconds,
+/// public windows ≈ 40 s, and never ask a block before it exists: 57 143 063
+/// was, 429), settled by FASTFIX (492eb2c): at the production period
+/// [`CAPTURE_TICK_SECONDS`], Base's pace (5 blocks a second) and the
+/// production schedule, the proposal block is captured at the first tick at
+/// which its RPC serves it — less than one period after — whatever the phase
+/// of the ticks, inside the ≈ 200 blocks (40 s) a public RPC serves; no block
+/// above the head a tick read is asked, and no proof of a block its RPC does
+/// not serve yet (proofs' backend 4 s, 12 s behind the head).
+#[test]
+fn d159_at_the_production_tick_a_proposal_block_is_captured_within_one_period_of_being_served_and_never_asked_before() {
+    const PACE: u64 = 5;
+    const SERVE: u64 = 200;
+    let step = CAPTURE_TICK_SECONDS * PACE;
+    let w = world();
+    for lag in [0, 20, 60] {
+        for phase in 0..step {
+            let live = LiveBase::new(0, u64::MAX / 8, SERVE, 0);
+            let base = Behind { live: &live, lag, early_proofs: Mutex::new(Vec::new()) };
+            let dir = tempfile::tempdir().unwrap();
+            let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+            let state = Mutex::new(RunState {
+                scanned_to: Some(A + 1_000_000),
+                proposal_anchor: Some(A),
+                ..RunState::default()
+            });
+            // the ticks, one period apart, the first less than a period before the proposal block
+            let mut head = A - step + phase;
+            let caught = loop {
+                live.h0.store(head, std::sync::atomic::Ordering::SeqCst);
+                let report = capture_tick(
+                    &base,
+                    &w.bridge,
+                    0,
+                    crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
+                    crate::base_capture::CAPTURE_WINDOW_BLOCKS,
+                    &state,
+                    &state_file,
+                    &captures,
+                    T,
+                )
+                .unwrap();
+                if report.capture.captured.contains(&A) {
+                    break head;
+                }
+                assert!(head < A + SERVE, "lag {lag}, phase {phase}: not captured while a public RPC serves it");
+                head += step;
+            };
+            assert!(caught - A < lag + step, "lag {lag}, phase {phase}: captured {} blocks after it appeared", caught - A);
+            assert!(live.above_head.lock().unwrap().is_empty(), "lag {lag}, phase {phase}: asked above the head {:?}", live.above_head.lock().unwrap());
+            assert!(base.early_proofs.lock().unwrap().is_empty(), "lag {lag}, phase {phase}: proofs asked before served {:?}", base.early_proofs.lock().unwrap());
+        }
+    }
+}
+
 /// Each pass says when it begins and when it ends, how long it took and what
 /// it did, or why it failed (what was done is then kept); the passes stop
 /// when the captures stopped; `once` is one pass.
