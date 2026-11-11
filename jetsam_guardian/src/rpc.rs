@@ -484,25 +484,32 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
     request.extend_from_slice(body);
     s.write_all(&request)?;
     let mut raw = Vec::new();
-    // read the head, then exactly Content-Length bytes (or to the end)
+    // read the head, then exactly Content-Length bytes, or the chunks up to the last one (C-2: the public L1 servers
+    // send their larger answers in chunks), or to the end
     let mut buf = [0u8; 65_536];
-    let (head_end, length) = loop {
+    let (head_end, length, chunked) = loop {
         let n = s.read(&mut buf)?;
         anyhow::ensure!(n > 0 || !raw.is_empty(), "empty answer from {url}");
         raw.extend_from_slice(&buf[..n]);
         if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&raw[..i]).to_ascii_lowercase();
             anyhow::ensure!(head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200"), "HTTP error from {url}: {}", head.lines().next().unwrap_or(""));
+            let chunked = head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
             let length = head
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>()))
                 .transpose()?;
-            break (i + 4, length);
+            break (i + 4, length, chunked);
         }
         anyhow::ensure!(n > 0, "truncated answer from {url}");
     };
     loop {
-        if let Some(len) = length {
+        if chunked {
+            // its last chunk read (no trailer): the answer is whole, whether the server closes or not
+            if raw.ends_with(b"0\r\n\r\n") && http_body(&raw).is_ok() {
+                break;
+            }
+        } else if let Some(len) = length {
             if raw.len() >= head_end + len {
                 raw.truncate(head_end + len);
                 break;
@@ -513,6 +520,10 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
             break;
         }
         raw.extend_from_slice(&buf[..n]);
+    }
+    if chunked {
+        let (_, body) = http_body(&raw).map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+        return Ok(serde_json::from_slice(&body)?);
     }
     Ok(serde_json::from_slice(&raw[head_end..])?)
 }
@@ -557,23 +568,24 @@ pub fn http_body(raw: &[u8]) -> anyhow::Result<(String, Vec<u8>)> {
     if head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked")) {
         let mut body = Vec::new();
         let mut at = 0;
+        // every index checked: an answer cut short, or a chunk size past the end, is an error, never a panic
         loop {
-            let line_end = rest[at..]
+            let tail = rest.get(at..).ok_or_else(|| anyhow::anyhow!("truncated chunk"))?;
+            let line_end = tail
                 .windows(2)
                 .position(|w| w == b"\r\n")
                 .ok_or_else(|| anyhow::anyhow!("truncated chunk size"))?;
-            let size_text = String::from_utf8_lossy(&rest[at..at + line_end]);
+            let size_text = String::from_utf8_lossy(&tail[..line_end]);
             let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
                 .map_err(|_| anyhow::anyhow!("bad chunk size {size_text}"))?;
             at += line_end + 2;
             if size == 0 {
                 break;
             }
-            let chunk = rest
-                .get(at..at + size)
-                .ok_or_else(|| anyhow::anyhow!("truncated chunk"))?;
+            let end = at.checked_add(size).ok_or_else(|| anyhow::anyhow!("bad chunk size {size_text}"))?;
+            let chunk = rest.get(at..end).ok_or_else(|| anyhow::anyhow!("truncated chunk"))?;
             body.extend_from_slice(chunk);
-            at += size + 2;
+            at = end + 2;
         }
         return Ok((head, body));
     }
