@@ -1344,3 +1344,133 @@ fn a_reorganization_deeper_than_eight_blocks_or_below_a_known_lock_needs_min_nod
     assert!(reorg_needs_nodes(30, 24, 25), "below a known lock, two blocks above it are enough");
     assert!(!reorg_needs_nodes(5, 30, 0), "no block dropped");
 }
+
+// ---------------------------------------------------------------- RELFIX2 (D171): bytes a source served are never dropped
+
+/// `raw` with an object no build knows after it (an unknown tag in the object section: the `BadMarker` of the test
+/// chain's relayer on the blocks of the fast lane, D171); its header is `raw`'s.
+fn with_unknown_object(raw: &[u8]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    out.extend_from_slice(&[jetsam_chain::consensus::client_objects::CLIENT_OBJECTS_SECTION_MARKER, 1, 0xff]);
+    out
+}
+
+/// RELFIX2 (D171): every source served block F + 1 and this build could not read it — n0's bytes carry an object it
+/// does not know (`BadMarker`), n1's are the true block, which its rule refuses (a build with a deposit cap below the
+/// chain's, as before D123: its 5 JTM against a 7 JTM deposit) —; the bytes of another block, and bytes without a whole
+/// header, are never kept. This block's bytes are kept, one copy a source, as `Unreadable`: blocking as `Missing`,
+/// durable, never made `Missing` when the nodes prune them; read again by this build: still unreadable; by a build that
+/// knows the chain's rule (an upgrade): recorded as read (its deposit, its body kept), no longer blocking.
+#[test]
+fn relfix2_bytes_served_for_the_block_that_this_build_cannot_read_are_kept_and_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    let b = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM)]);
+    let (raw, id) = raw_and_id(&b);
+    let unknown = with_unknown_object(&raw);
+    let (other, other_id) = raw_and_id(&block_of(F + 1, vec![]));
+    let old = jetsam_chain::consensus::vault::VaultRules { max_deposit: 5 * JTM, ..rules() };
+    // the header check: the block the bytes begin with, whatever follows
+    assert_eq!((served_block_id(&unknown), served_block_id(&other)), (Some(id), Some(other_id)));
+    assert_eq!((served_block_id(&raw[1..]), served_block_id(&raw[..100]), served_block_id(&[])), (None, None, None));
+    let (u, r, o) = (unknown.clone(), raw.clone(), with_unknown_object(&other));
+    let sources: Vec<BodySource> = vec![
+        ("n0 getBlock".into(), Box::new(move || Ok(Some(u.clone())))),
+        ("n1 getBlock".into(), Box::new(move || Ok(Some(r.clone())))),
+        ("n2 getBlock".into(), Box::new(move || Ok(Some(o.clone())))),
+        ("n3 getBlock".into(), Box::new(|| Ok(Some(vec![jetsam_chain::block::BLOCK_WIRE_MARKER, 1, 2])))),
+        ("n0 getDepositBlock".into(), Box::new(|| Ok(None))),
+    ];
+    let why = record_from_sources(&mut ar, F + 1, &id, sources, &old).unwrap_err();
+    assert!(why.contains("BadMarker") && why.contains("refuses"), "{why}");
+    // F + 1 is not on this chain: no header proves it holds no deposit
+    let c = testkit::chain(5, 1);
+    assert!(!ar.record_unserved(&c, F + 1, &id, &why));
+    let Some(Body::Unreadable { block_id, reason, copies }) = ar.index.get(&(F + 1)).cloned() else { panic!("not kept: {:?}", ar.index) };
+    assert_eq!((block_id, reason.contains("BadMarker")), (id, true), "{reason}");
+    assert_eq!(copies.keys().map(String::as_str).collect::<Vec<_>>(), ["n0 getBlock", "n1 getBlock"], "this block's bytes only");
+    let kept = |ar: &Archive| -> Vec<Vec<u8>> { copies.values().map(|c| std::fs::read(ar.unreadable_path(F + 1, &id, c)).unwrap()).collect() };
+    assert_eq!(kept(&ar), vec![unknown.clone(), raw.clone()], "the bytes as served");
+    assert_eq!((ar.missing(), ar.unreadable()), (vec![F + 1], vec![F + 1]), "it blocks as a missing body");
+    assert!(ar.found().is_empty() && ar.body(F + 1).unwrap().is_none());
+    // the nodes prune it (nothing served, a timeout): never made Missing
+    let sources: Vec<BodySource> = vec![("n0 getBlock".into(), Box::new(|| Ok(None))), ("n1 getBlock".into(), Box::new(|| anyhow::bail!("timeout")))];
+    let pruned = record_from_sources(&mut ar, F + 1, &id, sources, &old).unwrap_err();
+    assert!(!ar.record_unserved(&c, F + 1, &id, &pruned));
+    // a source serving other bytes again: one copy a source (its first)
+    let mut again = unknown.clone();
+    again.push(0);
+    let sources: Vec<BodySource> = vec![("n0 getBlock".into(), Box::new(move || Ok(Some(again.clone()))))];
+    assert!(record_from_sources(&mut ar, F + 1, &id, sources, &old).is_err());
+    assert!(matches!(ar.index.get(&(F + 1)), Some(Body::Unreadable { copies: c2, .. }) if *c2 == copies), "{:?}", ar.index);
+    assert_eq!(kept(&ar), vec![unknown.clone(), raw.clone()]);
+    // durable
+    ar.save().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    assert!(matches!(ar.index.get(&(F + 1)), Some(Body::Unreadable { copies: c2, .. }) if *c2 == copies), "{:?}", ar.index);
+    // read again by this build: still unreadable, still blocking
+    let still = ar.read_again(F + 1, &old).unwrap().unwrap_err();
+    assert!(still.contains("BadMarker") && still.contains("refuses"), "{still}");
+    assert_eq!(ar.missing(), vec![F + 1]);
+    // by a build that knows the chain's rule: read (n1's copy; n0's never reads), its deposit, its body kept
+    let (source, found) = ar.read_again(F + 1, &rules()).unwrap().unwrap();
+    assert_eq!((source.as_str(), found.len(), found[0].amount, found[0].recipient), ("n1 getBlock", 1, 7 * JTM, rcpt(0xa1)));
+    assert!(ar.missing().is_empty() && ar.unreadable().is_empty());
+    assert_eq!(ar.found()[&(F + 1)], found);
+    assert_eq!(ar.body(F + 1).unwrap(), Some(raw.clone()));
+    assert_eq!(ar.read_again(F + 1, &rules()), None, "read: nothing to read again");
+}
+
+/// RELFIX2: an unreadable body is settled as a missing one: an operator acknowledges its omission (D41), or a body that
+/// reads replaces it (`import-block` records with [`Archive::record`]); a body served later that reads replaces it.
+#[test]
+fn relfix2_an_unreadable_body_is_acknowledged_imported_or_served_again_as_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    let blocks: Vec<(Vec<u8>, [u8; 32])> = (1..=3).map(|i| raw_and_id(&block_of(F + i, vec![deposit_tx(100, rcpt(i as u8), 7 * JTM)]))).collect();
+    for (i, (raw, id)) in blocks.iter().enumerate() {
+        assert!(ar.keep_unreadable(F + 1 + i as u64, id, &[("n0 getBlock".into(), with_unknown_object(raw))], "BadMarker").unwrap());
+    }
+    // the bytes of another block are never kept, nothing recorded
+    assert!(!ar.keep_unreadable(F + 4, &[4u8; 32], &[("n0 getBlock".into(), blocks[0].0.clone())], "x").unwrap());
+    assert!(!ar.index.contains_key(&(F + 4)));
+    assert_eq!(ar.missing(), vec![F + 1, F + 2, F + 3]);
+    ar.acknowledge(F + 1, "fast lane block, no deposit").unwrap();
+    assert!(matches!(ar.index.get(&(F + 1)), Some(Body::Acknowledged { reason, .. }) if reason == "fast lane block, no deposit"));
+    assert_eq!(ar.record(F + 2, &blocks[1].1, &blocks[1].0, &rules()).unwrap().len(), 1);
+    let (r3, id3) = blocks[2].clone();
+    let sources: Vec<BodySource> = vec![("n1 getDepositBlock".into(), Box::new(move || Ok(Some(r3.clone()))))];
+    assert_eq!(record_from_sources(&mut ar, F + 3, &id3, sources, &rules()).unwrap().0, "n1 getDepositBlock");
+    assert!(ar.missing().is_empty());
+    assert_eq!(ar.found().keys().copied().collect::<Vec<_>>(), vec![F + 2, F + 3]);
+    // the kept bytes stay on disk (as the bodies of a reorganization)
+    let n = std::fs::read_dir(dir.path().join("unreadable")).unwrap().count();
+    assert_eq!(n, 3);
+}
+
+/// RELFIX2: an archive written before `Unreadable` existed (this index is the one 0acb3cc wrote, byte for byte:
+/// a deposit block, a block without deposit, a missing, an acknowledged and a coinbase-only one) opens, reads the same,
+/// and is written back byte for byte; with an unreadable body it is written and read back.
+#[test]
+fn relfix2_an_archive_written_before_unreadable_bodies_opens_and_reads_the_same() {
+    const OLD: &str = r#"{"70561":{"Read":{"block_id":"0xcf28c3801ff6858eafe4a24fb36553b9194fe9f425235c53dcfd7f7975078451","deposits":[{"height":70561,"group":0,"block_id":"0xcf28c3801ff6858eafe4a24fb36553b9194fe9f425235c53dcfd7f7975078451","txid":"0x48f9f7155b6ceb78c1be6f8fb5df2c8e30ebae624f78bc622cd6a85d61359780","recipient":"0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","amount":7000000,"block_ts":1790070561}]}},"70562":{"Read":{"block_id":"0xe7e342ff535da4ae31c77ebe398d61f121dc0f36bb5ba8cb7abd4a6c6a06ee93","deposits":[]}},"70563":{"Missing":{"block_id":"0x0303030303030303030303030303030303030303030303030303030303030303","reason":"rpc a getBlock: not served; rpc b getBlock: not served"}},"70564":{"Acknowledged":{"block_id":"0x0404040404040404040404040404040404040404040404040404040404040404","reason":"body lost, depositors told"}},"70565":{"CoinbaseOnly":{"block_id":"0x0505050505050505050505050505050505050505050505050505050505050505"}}}"#;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.json"), OLD).unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    assert_eq!(ar.index.len(), 5);
+    assert_eq!((ar.missing(), ar.unreadable()), (vec![70_563], vec![]));
+    let found = ar.found();
+    assert_eq!((found.len(), found[&70_561].len(), found[&70_561][0].amount, found[&70_561][0].recipient), (1, 1, 7_000_000, rcpt(0xa1)));
+    assert!(matches!(ar.index.get(&70_562), Some(Body::Read { deposits, .. }) if deposits.is_empty()));
+    assert!(matches!(ar.index.get(&70_564), Some(Body::Acknowledged { reason, .. }) if reason == "body lost, depositors told"));
+    assert_eq!(ar.index.get(&70_565), Some(&Body::CoinbaseOnly { block_id: [5u8; 32] }));
+    ar.save().unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("index.json")).unwrap(), OLD, "written back byte for byte");
+    // a body this build cannot read beside them
+    let (raw, id) = raw_and_id(&block_of(F + 9, vec![]));
+    assert!(ar.keep_unreadable(F + 9, &id, &[("n0 getBlock".into(), with_unknown_object(&raw))], "BadMarker").unwrap());
+    ar.save().unwrap();
+    let again = Archive::open(dir.path()).unwrap();
+    assert_eq!(again.index, ar.index);
+    assert_eq!(again.missing(), vec![70_563, F + 9]);
+}

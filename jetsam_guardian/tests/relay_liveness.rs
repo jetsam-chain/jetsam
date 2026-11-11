@@ -612,3 +612,204 @@ fn jg_relay_holding_a_hot_key_does_not_start_with_its_memory_unlocked_unless_tol
     assert!(ran && code.is_none(), "{code:?}; log:\n{log}");
     assert!(log.contains("memory NOT locked") && !log.contains("does not start"), "{log}");
 }
+
+// ---------------------------------------------------------------- RELFIX2 (D171)
+
+/// A fake node serving the chain `c`, its `getBlock` from `bodies` (height → bytes: a test clears it to prune them),
+/// its `getDepositBlock` nothing (no block of these tests holds a deposit by the node's rule); and the count of its
+/// `getBlock` calls.
+fn body_node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>, bodies: Arc<Mutex<std::collections::HashMap<u64, Vec<u8>>>>) -> (u16, Arc<AtomicU64>) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let seen = calls.clone();
+    let port = serve(Arc::new(move |method, params| {
+        let c = c.lock().unwrap();
+        let h = params[0].as_u64().unwrap_or(u64::MAX);
+        match method {
+            "jetsam_blockCount" => json!({"result": c.tip_height()}),
+            "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
+            "jetsam_getHeaderByHeight" => json!({"result": c.header_at(h).map(|x| x.raw_hex())}),
+            "jetsam_getBlock" => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                json!({"result": bodies.lock().unwrap().get(&h).map(hex::encode)})
+            }
+            "jetsam_getDepositBlock" => json!({"result": null}),
+            _ => json!({"error": {"code": -32601, "message": "not in this fake"}}),
+        }
+    }));
+    (port, calls)
+}
+
+/// The synthetic chain up to `f` (one output a block: its coinbase's), then `header(&chain)` at `f + 1`.
+fn chain_to_then(f: u64, header: impl FnOnce(&jetsam_guardian::chain::Chain) -> jetsam_chain::block_header::BlockHeader) -> jetsam_guardian::chain::Chain {
+    let mut c = testkit::chain(f, 1);
+    let h = header(&c);
+    c.extend(jetsam_guardian::chain::HeaderInfo::from_header(&h)).unwrap();
+    c
+}
+
+/// The header at `c.tip_height() + 1` on `c` committing to `tx_root`, `outputs` live outputs created.
+fn next_header(c: &jetsam_guardian::chain::Chain, tx_root: [u8; 32], outputs: u64) -> jetsam_chain::block_header::BlockHeader {
+    let h = c.tip_height() + 1;
+    jetsam_chain::block_header::BlockHeader {
+        prev_block_hash: c.tip_id(),
+        state_root: [1; 32],
+        tx_root,
+        timestamp: 1_700_000_000 + 180 * h,
+        height: h,
+        miner_address: jetsam_poseidon2b::primitives::Address([7; 32]),
+        nonce: 0,
+        difficulty_target: testkit::target_bits(20),
+        log_slots: 16,
+        active_slot_count: h,
+        alloc_counter: c.header_at(h - 1).unwrap().alloc_counter + outputs,
+    }
+}
+
+/// What the archive's index says of block `h` (its variant), and the files under `<state>/archive` that hold
+/// exactly `bytes`.
+fn archived(dir: &Path, h: u64, bytes: &[u8]) -> (String, Vec<PathBuf>) {
+    let index: Value = std::fs::read_to_string(dir.join("state/archive/index.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let kind = index[h.to_string()].as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_else(|| "none".into());
+    fn walk(p: &Path, bytes: &[u8], out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, bytes, out);
+            } else if std::fs::read(&p).is_ok_and(|b| b == bytes) {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&dir.join("state/archive"), bytes, &mut files);
+    (kind, files)
+}
+
+/// RELFIX2 (D171, the test chain, 2026-11-11): a relayer older than its nodes' rules read the blocks of the fast lane
+/// (9043, 9060) while every node served them and could not decode them (`BadMarker`): MISSING; then the nodes pruned
+/// them (`getBlock` serves the last blocks only, `getDepositBlock` the deposit blocks only) and the relayer stalled 3 h
+/// 40 until an operator acknowledged them — an upgrade could not help, the bytes were gone. The bytes a source served
+/// for the block of the chain (its header's id checked) are never dropped: kept in the archive, as `Unreadable`
+/// (blocking like `Missing`, the same ALERT with its reason), across the prune and a restart; an operator still
+/// acknowledges them.
+#[test]
+fn relfix2_jg_relay_keeps_the_bytes_of_a_block_it_cannot_read_after_the_nodes_prune_them() {
+    if no_v1_7_clock() {
+        return;
+    }
+    let f = built_f().unwrap();
+    let h = f + 1;
+    // block F + 1 created three outputs (its header does not prove it holds no deposit); its body as the nodes serve
+    // it carries an object this build does not know (an unknown tag in the object section: BadMarker)
+    let c = chain_to_then(f, |c| next_header(c, [2; 32], 3));
+    let header = jetsam_chain::block_header::BlockHeader::decode(&mut c.header_at(h).unwrap().raw.as_slice()).unwrap();
+    let mut served = jetsam_chain::block::Block { header, transactions: Vec::new(), client_objects: Vec::new(), destination: None }.to_bytes();
+    served.extend_from_slice(&[jetsam_chain::consensus::client_objects::CLIENT_OBJECTS_SECTION_MARKER, 1, 0xff]);
+    let bodies = Arc::new(Mutex::new(std::collections::HashMap::from([(h, served.clone())])));
+    let chain = Arc::new(Mutex::new(c));
+    let ((p0, calls), (p1, _)) = (body_node(chain.clone(), bodies.clone()), body_node(chain.clone(), bodies.clone()));
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (_root, dir) = relay_dir(l1(world), &[p0, p1], 2, "");
+    let log = || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    let relay = spawn(&dir, &[]);
+    let alerted = wait_for(180, || log().contains(&format!("ALERT MISSING_DEPOSIT_BODY:{h}")));
+    // the nodes prune the body; the relayer asks again (both nodes), then stops (its archive saved)
+    bodies.lock().unwrap().clear();
+    let n = calls.load(Ordering::SeqCst);
+    let retried = wait_for(60, || calls.load(Ordering::SeqCst) >= n + 2);
+    stop(relay);
+    let first = log();
+    assert!(alerted && retried, "log:\n{first}");
+    assert!(first.contains("BadMarker"), "the ALERT gives the reason: {first}");
+    let (kind, kept) = archived(&dir, h, &served);
+    assert!(!kept.is_empty(), "the bytes every node served for block {h} are lost once pruned (archive entry {kind}); log:\n{first}");
+    assert_eq!(kind, "Unreadable", "not Missing: its bytes are in hand");
+    // a restart on the pruned nodes: still kept, still unreadable by this build, still blocking
+    let relay = spawn(&dir, &[]);
+    let n = calls.load(Ordering::SeqCst);
+    let stepped = wait_for(180, || calls.load(Ordering::SeqCst) >= n + 2);
+    stop(relay);
+    let second = log();
+    eprintln!("{}", [first.as_str(), second.as_str()].concat().lines().filter(|l| l.contains("ALERT MISSING_DEPOSIT_BODY") || l.contains("missing (")).collect::<Vec<_>>().join("\n"));
+    let (kind, kept) = archived(&dir, h, &served);
+    assert!(stepped, "log:\n{second}");
+    assert_eq!((kind.as_str(), kept.len()), ("Unreadable", 1), "after a restart; log:\n{second}");
+    assert!(second.contains("1 missing"), "it blocks like a missing body: {second}");
+    // an operator acknowledges it as a missing one
+    let out = Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(dir.join("relay.toml")).args(["acknowledge", &h.to_string(), "fast", "lane", "block"]).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert_eq!(archived(&dir, h, &served).0, "Acknowledged", "{text}");
+}
+
+/// A true block on top of `c`: its coinbase alone (one output), its header committing to it; its bytes and id.
+fn coinbase_block(c: &jetsam_guardian::chain::Chain) -> (Vec<u8>, [u8; 32]) {
+    use jetsam_poseidon2b::primitives::Address;
+    use jetsam_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+    outputs[0] = TxOutput { slot_index: 15_000_000, amount: 1, owner: Address([9; 32]) };
+    let cb = Transaction::new(TxBody {
+        epoch_anchor: [0; 32],
+        fee: 0,
+        input_owner: Address([0; 32]),
+        inputs: [TxInput::dummy(); TX_INPUTS],
+        outputs,
+        validity_bitmap: output_bitmap_bit(0),
+        is_coinbase: true,
+    });
+    let header = next_header(c, jetsam_chain::block::compute_tx_root(std::slice::from_ref(&cb)), 1);
+    let b = jetsam_chain::block::Block { header, transactions: vec![cb], client_objects: Vec::new(), destination: None };
+    (b.to_bytes(), jetsam_chain::consensus::pow::block_id(&b.header))
+}
+
+/// RELFIX2 (D171): the bytes an older build kept unreadable are read again by this build at its start, before its
+/// first step: recorded as read ("read again after upgrade"), no longer blocking, also after the nodes pruned them; an
+/// operator's `import-block` of a body that reads replaces an unreadable one (the relayer stopped).
+#[test]
+fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unreadable() {
+    if no_v1_7_clock() {
+        return;
+    }
+    let f = built_f().unwrap();
+    // F + 1 and F + 2: true blocks, their coinbase alone
+    let mut c = testkit::chain(f, 1);
+    let (raw1, id1) = coinbase_block(&c);
+    c.extend(jetsam_guardian::chain::HeaderInfo::from_raw(&raw1[1..213]).unwrap()).unwrap();
+    let (raw2, id2) = coinbase_block(&c);
+    c.extend(jetsam_guardian::chain::HeaderInfo::from_raw(&raw2[1..213]).unwrap()).unwrap();
+    assert_eq!((c.id_at(f + 1), c.id_at(f + 2)), (Some(id1), Some(id2)));
+    // the nodes pruned them both
+    let bodies = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let chain = Arc::new(Mutex::new(c));
+    let ((p0, _), (p1, _)) = (body_node(chain.clone(), bodies.clone()), body_node(chain.clone(), bodies));
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (_root, dir) = relay_dir(l1(world), &[p0, p1], 2, "");
+    // what an older build kept: F + 1 as served (this build reads it), F + 2 with an object no build knows
+    let mut unknown2 = raw2.clone();
+    unknown2.extend_from_slice(&[jetsam_chain::consensus::client_objects::CLIENT_OBJECTS_SECTION_MARKER, 1, 0xff]);
+    {
+        let mut ar = jetsam_guardian::relayer::Archive::open(&dir.join("state/archive")).unwrap();
+        assert!(ar.keep_unreadable(f + 1, &id1, &[("n0 getBlock".into(), raw1.clone())], "an older build: BadMarker").unwrap());
+        assert!(ar.keep_unreadable(f + 2, &id2, &[("n1 getBlock".into(), unknown2.clone())], "BadMarker").unwrap());
+        ar.save().unwrap();
+    }
+    // an operator imports the true body of F + 2 (the relayer stopped)
+    std::fs::write(dir.join("b2.bin"), &raw2).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(dir.join("relay.toml")).args(["import-block", &(f + 2).to_string()]).arg(dir.join("b2.bin")).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("0 deposits"), "{text}");
+    assert_eq!(archived(&dir, f + 2, &raw2).0, "Read", "{text}");
+    // the relayer starts: F + 1 read again before its first step
+    let relay = spawn(&dir, &[]);
+    let log = || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    let again = wait_for(60, || log().contains(&format!("block {}: body read again after upgrade, at start", f + 1)));
+    let stepped = wait_for(180, || log().contains("ALERT NO_SUBMISSION"));
+    stop(relay);
+    let text = log();
+    eprintln!("{}", text.lines().filter(|l| l.contains("missing") || l.contains("read again")).collect::<Vec<_>>().join("\n"));
+    assert!(again && stepped, "log:\n{text}");
+    assert!(text.contains("1 of them unreadable"), "{text}");
+    assert_eq!(archived(&dir, f + 1, &raw1).0, "Read", "log:\n{text}");
+    assert_eq!(archived(&dir, f + 2, &raw2).0, "Read", "log:\n{text}");
+    assert!(!text.contains("ALERT MISSING_DEPOSIT_BODY"), "{text}");
+}

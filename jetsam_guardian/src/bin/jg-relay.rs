@@ -10,6 +10,9 @@
 //!   nor the next blocks), its deposits taken with the node's rule, the body of every deposit block archived
 //!   and published (`<publish_dir>/blocks/`); a body no source serves verifiable is MISSING (retried): no
 //!   point of this relayer locks it until a source serves it, or an operator imports it or acknowledges it;
+//!   RELFIX2 (D171): a body a source served for the block (its header checked) that this build cannot read is
+//!   UNREADABLE, blocking alike: its bytes kept (`<state_dir>/archive/unreadable/`), read again at every start and
+//!   every retry with this build's rules (an upgraded jg-relay reads them, the nodes may have pruned them);
 //! * every checkpoint the contract accepted (`CheckpointAccepted`: anyone may submit), with its context
 //!   when it is on this chain;
 //! * a point every `cadence_secs` (D-AV3), started `prove_ahead_secs` early (A5-6, 900 s by default), at
@@ -275,13 +278,47 @@ impl Relay {
         Ok(())
     }
 
+    /// The body of block `h` (id `id`) recorded from `source`: its deposits published (the archived body) and said.
+    fn body_recorded(&mut self, h: u64, id: &[u8; 32], source: &str, found: &[jetsam_guardian::fill::FoundDeposit]) {
+        if !found.is_empty() {
+            if let Ok(Some(raw)) = self.archive.body(h) {
+                let _ = std::fs::create_dir_all(self.cfg.publish_dir.join("blocks"));
+                let _ = std::fs::write(self.cfg.publish_dir.join("blocks").join(format!("{h}-{}.bin", hex::encode(id))), &raw);
+            }
+            self.event(json!({"event": "deposit_block", "height": h, "id": hex::encode(id), "deposits": found, "source": source}));
+        }
+    }
+
+    /// RELFIX2 (D171): the kept bytes of the UNREADABLE block `h` read again with this build's rules (`when`: at the
+    /// start, or at a retry); recorded when they read (an upgrade reads what an older build could not). True then.
+    fn read_again(&mut self, h: u64, when: &str) -> bool {
+        let Some(id) = self.archive.index.get(&h).map(relayer::Body::block_id) else { return false };
+        match self.archive.read_again(h, &self.rules) {
+            Some(Ok((source, found))) => {
+                log(&format!("block {h}: body read again after upgrade, {when} (the bytes {source} served, kept while unreadable): {} deposits", found.len()));
+                self.event(json!({"event": "body_read_again", "height": h, "id": hex::encode(id), "deposits": found.len(), "source": source}));
+                self.body_recorded(h, &id, &source, &found);
+                true
+            }
+            Some(Err(reason)) => {
+                if when == "at start" {
+                    log(&format!("block {h}: its kept bytes are still unreadable by this build ({reason}): it still blocks"));
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Every block above F not read yet, and every MISSING one again (a node or a mirror may serve it
-    /// later): its body from any source that serves it verifiable, else MISSING.
+    /// later): its body from any source that serves it verifiable, else MISSING. RELFIX2: or UNREADABLE when a source
+    /// served it (its header checked) and this build cannot read it: its bytes kept, read again at every retry first.
     fn read_bodies(&mut self) {
         let tip = self.chain.tip_height();
         let (mut read, mut retried) = (0, 0);
         for h in self.cfg.deposits_from_height + 1..=tip {
-            let was_missing = matches!(self.archive.index.get(&h), Some(relayer::Body::Missing { .. }));
+            let unreadable = matches!(self.archive.index.get(&h), Some(relayer::Body::Unreadable { .. }));
+            let was_missing = unreadable || matches!(self.archive.index.get(&h), Some(relayer::Body::Missing { .. }));
             if self.archive.index.contains_key(&h) && !was_missing {
                 continue;
             }
@@ -298,6 +335,9 @@ impl Relay {
                 read += 1;
             }
             let Some(id) = self.chain.id_at(h) else { continue };
+            if unreadable && self.read_again(h, "at a retry") {
+                continue;
+            }
             // A5-7: every node's getBlock, then every node's long retention (getDepositBlock), then the
             // archive mirrors; a source that fails never stops the others, nor the blocks above
             let mut sources: Vec<relayer::BodySource> = Vec::new();
@@ -315,13 +355,7 @@ impl Relay {
                     if was_missing {
                         log(&format!("block {h}: body found again ({source})"));
                     }
-                    if !found.is_empty() {
-                        if let Ok(Some(raw)) = self.archive.body(h) {
-                            let _ = std::fs::create_dir_all(self.cfg.publish_dir.join("blocks"));
-                            let _ = std::fs::write(self.cfg.publish_dir.join("blocks").join(format!("{h}-{}.bin", hex::encode(id))), &raw);
-                        }
-                        self.event(json!({"event": "deposit_block", "height": h, "id": hex::encode(id), "deposits": found, "source": source}));
-                    }
+                    self.body_recorded(h, &id, &source, &found);
                 }
                 Err(reason) => {
                     // T7.7 (A5): known without its body only when its header proves it holds no deposit, else MISSING
@@ -332,13 +366,22 @@ impl Relay {
                         }
                         continue;
                     }
+                    // RELFIX2: a source served it (its header checked) and this build cannot read it: its bytes kept
+                    let kept = matches!(self.archive.index.get(&h), Some(relayer::Body::Unreadable { .. }));
                     if !was_missing {
                         let outputs = relayer::outputs_created(&self.chain, h).map_or("an unknown number of".to_string(), |n| n.to_string());
+                        let what = if kept {
+                            "its body as served cannot be read by this build (its bytes are kept and read again at every start and every retry: a jg-relay that reads them unblocks it)"
+                        } else {
+                            "its body is unknown"
+                        };
                         log(&format!(
-                            "ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): its body is unknown and its header does not prove it holds no deposit ({outputs} outputs created, \
+                            "ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): {what} and its header does not prove it holds no deposit ({outputs} outputs created, \
                              the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
                         ));
-                        self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason}));
+                        self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason, "unreadable": kept}));
+                    } else if kept && !unreadable {
+                        log(&format!("block {h}: the bytes a source served for it are kept, unreadable by this build ({reason})"));
                     }
                 }
             }
@@ -739,10 +782,17 @@ impl Relay {
                 }
                 // T7.7 (A4): an unread body says what settles it
                 if let NoSubmission::MissingBody(m) = why {
-                    log(&format!(
-                        "ALERT NO_SUBMISSION MissingBody({m}): the body of block {m} is unknown (no source served it): \
-                         no point locks it until a source serves it, or an operator (jg-relay stopped) imports it (import-block) or acknowledges its omission (acknowledge)"
-                    ));
+                    match self.archive.index.get(&m) {
+                        // RELFIX2: served, unreadable by this build: an upgrade settles it
+                        Some(relayer::Body::Unreadable { reason, .. }) => log(&format!(
+                            "ALERT NO_SUBMISSION MissingBody({m}): the body of block {m} was served and this build cannot read it ({reason}); its bytes are kept \
+                             and read again at every start: a jg-relay that reads them unblocks it, or an operator (jg-relay stopped) imports it (import-block) or acknowledges its omission (acknowledge)"
+                        )),
+                        _ => log(&format!(
+                            "ALERT NO_SUBMISSION MissingBody({m}): the body of block {m} is unknown (no source served it): \
+                             no point locks it until a source serves it, or an operator (jg-relay stopped) imports it (import-block) or acknowledges its omission (acknowledge)"
+                        )),
+                    }
                 }
                 // MustExtendTip: the tip is on this chain with roots that are not ours (A5-4: a new question, noted)
                 if matches!(why, NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
@@ -932,7 +982,7 @@ fn operator(cfg: &RelayConfig, cmd: &[String]) -> anyhow::Result<()> {
             let h: u64 = cmd.get(1).ok_or_else(|| anyhow::anyhow!("import-block <height> <file>"))?.parse()?;
             let raw = std::fs::read(cmd.get(2).ok_or_else(|| anyhow::anyhow!("import-block <height> <file>"))?)?;
             let id = match archive.index.get(&h) {
-                Some(relayer::Body::Missing { block_id, .. }) | Some(relayer::Body::Acknowledged { block_id, .. }) => *block_id,
+                Some(relayer::Body::Missing { block_id, .. }) | Some(relayer::Body::Acknowledged { block_id, .. }) | Some(relayer::Body::Unreadable { block_id, .. }) => *block_id,
                 other => anyhow::bail!("block {h} is not missing ({other:?})"),
             };
             let n = archive.record(h, &id, &raw, &VaultRules::current())?.len();
@@ -1076,7 +1126,15 @@ fn run() -> anyhow::Result<()> {
         }),
     };
     let archive = Archive::open(&cfg.state_dir.join("archive"))?;
-    log(&format!("signer 0x{} ({}), {} checkpoints known, {} bodies archived, {} missing", hex::encode(tx.address()), if matches!(tx, L1Tx::Local(_)) { "local key" } else { "endpoint, TEST" }, state.known.len(), archive.index.len(), archive.missing().len()));
+    log(&format!(
+        "signer 0x{} ({}), {} checkpoints known, {} bodies archived, {} missing ({} of them unreadable by this build, their bytes kept)",
+        hex::encode(tx.address()),
+        if matches!(tx, L1Tx::Local(_)) { "local key" } else { "endpoint, TEST" },
+        state.known.len(),
+        archive.index.len(),
+        archive.missing().len(),
+        archive.unreadable().len()
+    ));
     let events = cfg.state_dir.join("events.jsonl");
     let mut r = Relay {
         bridge: hex0x(&jetsam_guardian::fill::parse20(&cfg.l1_bridge)?),
@@ -1095,6 +1153,11 @@ fn run() -> anyhow::Result<()> {
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
+    // RELFIX2 (D171): every body kept unreadable, read again with this build's rules before the first step
+    let again = r.archive.unreadable().into_iter().filter(|h| r.read_again(*h, "at start")).count();
+    if again > 0 {
+        r.save();
+    }
     while !STOP.load(Ordering::SeqCst) {
         if let Err(e) = r.step() {
             log(&format!("step: {e:#}"));

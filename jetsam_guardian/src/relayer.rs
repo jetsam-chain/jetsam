@@ -31,7 +31,8 @@
 //!   disk, verified (id, `tx_root`). A block read too late is `Missing`: no checkpoint locks it (its
 //!   deposits could never be proven by anyone) until an operator imports its body or acknowledges the
 //!   omission (D41: a person decides, never the program) — unless its header proves it holds no deposit
-//!   (T7.7: it created one output, its coinbase's, [`outputs_created`]).
+//!   (T7.7: it created one output, its coinbase's, [`outputs_created`]). A block served (its header checked) that
+//!   this build cannot read is `Unreadable` (RELFIX2, D171): blocking alike, its bytes kept and read again.
 //! * **Proofs** ([`Prover`]): a command (the prover of the checkpoint program, given the program's input
 //!   file) or, on the private rehearsal only, the TEST mock verifier's simulated proof.
 
@@ -874,12 +875,28 @@ pub enum Body {
         #[serde(with = "crate::checkpoint::hex32")]
         block_id: [u8; 32],
     },
+    /// RELFIX2 (D171): served by a source with this block's header (its id checked, [`served_block_id`]: never the
+    /// bytes of another block), and this build cannot read it (`reason`: a decode error such as `BadMarker`, or the
+    /// node's rule as this build knows it refusing the block: the rules of a newer node). Its bytes are kept, one copy
+    /// a source (`copies`: source → the keccak of its copy, the file [`Archive::unreadable_path`]), and read again
+    /// with the build's rules at every start and every retry ([`Archive::read_again`]). It blocks as `Missing` does,
+    /// until a copy or a source reads, or an operator imports it or acknowledges it.
+    Unreadable {
+        #[serde(with = "crate::checkpoint::hex32")]
+        block_id: [u8; 32],
+        reason: String,
+        copies: BTreeMap<String, String>,
+    },
 }
 
 impl Body {
     pub fn block_id(&self) -> [u8; 32] {
         match self {
-            Body::Read { block_id, .. } | Body::Missing { block_id, .. } | Body::Acknowledged { block_id, .. } | Body::CoinbaseOnly { block_id } => *block_id,
+            Body::Read { block_id, .. }
+            | Body::Missing { block_id, .. }
+            | Body::Acknowledged { block_id, .. }
+            | Body::CoinbaseOnly { block_id }
+            | Body::Unreadable { block_id, .. } => *block_id,
         }
     }
 }
@@ -949,14 +966,73 @@ impl Archive {
             self.index.insert(height, Body::CoinbaseOnly { block_id: *id });
             return true;
         }
+        // RELFIX2: bytes in hand stay in hand (the nodes pruned them meanwhile): never made `Missing`
+        if matches!(self.index.get(&height), Some(Body::Unreadable { block_id, .. }) if block_id == id) {
+            return false;
+        }
         self.record_missing(height, id, reason);
         false
     }
 
-    /// An operator's decision on a `Missing` block: its omission is accepted.
+    /// RELFIX2: where the copy `copy` (its keccak, hex) of the unreadable body of block `height` (id `id`) is kept.
+    pub fn unreadable_path(&self, height: u64, id: &[u8; 32], copy: &str) -> PathBuf {
+        self.dir.join("unreadable").join(format!("{height}-{}-{copy}.bin", hex::encode(id)))
+    }
+
+    /// RELFIX2 (D171): keep `served` (source, bytes), which this build cannot read, for block `height` whose id on the
+    /// relayer's chain is `id`, as `Unreadable` (`reason`), beside the copies kept already: only bytes that carry this
+    /// block's header ([`served_block_id`]), one copy a source (its first), each on disk before the index names it.
+    /// False when none is this block's (nothing recorded).
+    pub fn keep_unreadable(&mut self, height: u64, id: &[u8; 32], served: &[(String, Vec<u8>)], reason: &str) -> anyhow::Result<bool> {
+        let mut copies = match self.index.get(&height) {
+            Some(Body::Unreadable { block_id, copies, .. }) if block_id == id => copies.clone(),
+            _ => BTreeMap::new(),
+        };
+        for (source, raw) in served {
+            if copies.contains_key(source) || served_block_id(raw) != Some(*id) {
+                continue;
+            }
+            let copy = hex::encode(crate::keccak256(raw));
+            let path = self.unreadable_path(height, id, &copy);
+            std::fs::create_dir_all(self.dir.join("unreadable"))?;
+            write_atomic(&path, raw)?;
+            copies.insert(source.clone(), copy);
+        }
+        if copies.is_empty() {
+            return Ok(false);
+        }
+        self.index.insert(height, Body::Unreadable { block_id: *id, reason: reason.to_string(), copies });
+        Ok(true)
+    }
+
+    /// RELFIX2: the kept copies of the `Unreadable` block `height` read again with `rules` (this build's): the first
+    /// that reads is recorded as [`Archive::record`] records a body served (its deposits, its bytes kept when it holds
+    /// one), and the block no longer blocks: `Some(Ok((source, deposits)))`. `Some(Err(reason))`: none reads (its
+    /// reason updated); it stays `Unreadable`. `None`: not an unreadable block.
+    pub fn read_again(&mut self, height: u64, rules: &jetsam_chain::consensus::vault::VaultRules) -> Option<Result<(String, Vec<FoundDeposit>), String>> {
+        let Some(Body::Unreadable { block_id, copies, .. }) = self.index.get(&height).cloned() else { return None };
+        let mut why = Vec::new();
+        for (source, copy) in &copies {
+            let path = self.unreadable_path(height, &block_id, copy);
+            match std::fs::read(&path) {
+                Ok(raw) => match self.record(height, &block_id, &raw, rules) {
+                    Ok(found) => return Some(Ok((source.clone(), found.to_vec()))),
+                    Err(e) => why.push(format!("{source} (kept): {e:#}")),
+                },
+                Err(e) => why.push(format!("{source} (kept, {}): {e}", path.display())),
+            }
+        }
+        let reason = why.join("; ");
+        if let Some(Body::Unreadable { reason: r, .. }) = self.index.get_mut(&height) {
+            r.clone_from(&reason);
+        }
+        Some(Err(reason))
+    }
+
+    /// An operator's decision on a `Missing` (or RELFIX2: `Unreadable`) block: its omission is accepted.
     pub fn acknowledge(&mut self, height: u64, reason: &str) -> anyhow::Result<()> {
         match self.index.get(&height) {
-            Some(Body::Missing { block_id, .. }) => {
+            Some(Body::Missing { block_id, .. }) | Some(Body::Unreadable { block_id, .. }) => {
                 let block_id = *block_id;
                 self.index.insert(height, Body::Acknowledged { block_id, reason: reason.to_string() });
                 Ok(())
@@ -982,9 +1058,14 @@ impl Archive {
             .collect()
     }
 
-    /// The heights whose body is missing and not acknowledged.
+    /// The heights whose body is missing (or RELFIX2: unreadable by this build, blocking alike) and not acknowledged.
     pub fn missing(&self) -> Vec<u64> {
-        self.index.iter().filter(|(_, b)| matches!(b, Body::Missing { .. })).map(|(h, _)| *h).collect()
+        self.index.iter().filter(|(_, b)| matches!(b, Body::Missing { .. } | Body::Unreadable { .. })).map(|(h, _)| *h).collect()
+    }
+
+    /// RELFIX2: the heights whose body this build cannot read (its bytes kept).
+    pub fn unreadable(&self) -> Vec<u64> {
+        self.index.iter().filter(|(_, b)| matches!(b, Body::Unreadable { .. })).map(|(h, _)| *h).collect()
     }
 
     /// The kept body of a deposit block, re-verified against its id.
@@ -1026,7 +1107,8 @@ pub type BodySource<'a> = (String, Box<dyn FnMut() -> anyhow::Result<Option<Vec<
 
 /// A5-7: record the body of block `height` (id `id` on the relayer's chain) from the first of `sources`
 /// that serves bytes the archive verifies (id, `tx_root`, the node's vault rule): a source that fails (an
-/// error, or a corrupt or incomplete body) never stops the others. `Err(reason)` when none does.
+/// error, or a corrupt or incomplete body) never stops the others. `Err(reason)` when none does; RELFIX2 (D171): the
+/// bytes served then for this block (its header) are kept, unreadable by this build ([`Archive::keep_unreadable`]).
 pub fn record_from_sources(
     archive: &mut Archive,
     height: u64,
@@ -1035,17 +1117,36 @@ pub fn record_from_sources(
     rules: &jetsam_chain::consensus::vault::VaultRules,
 ) -> Result<(String, Vec<FoundDeposit>), String> {
     let mut why = Vec::new();
+    let mut unread = Vec::new();
     for (name, mut read) in sources {
         match read() {
             Ok(Some(raw)) => match archive.record(height, id, &raw, rules) {
                 Ok(found) => return Ok((name, found.to_vec())),
-                Err(e) => why.push(format!("{name}: {e:#}")),
+                Err(e) => {
+                    why.push(format!("{name}: {e:#}"));
+                    unread.push((name, raw));
+                }
             },
             Ok(None) => why.push(format!("{name}: not served")),
             Err(e) => why.push(format!("{name}: {e:#}")),
         }
     }
-    Err(if why.is_empty() { "no source".to_string() } else { why.join("; ") })
+    let mut reason = if why.is_empty() { "no source".to_string() } else { why.join("; ") };
+    if let Err(e) = archive.keep_unreadable(height, id, &unread, &reason) {
+        reason.push_str(&format!(" (the bytes served NOT kept: {e:#})"));
+    }
+    Err(reason)
+}
+
+/// RELFIX2: the id of the block whose header the bytes `raw` begin with (the block wire's marker, then the 212 bytes
+/// of a header), whatever follows them; `None` when they do not begin with one.
+pub fn served_block_id(raw: &[u8]) -> Option<[u8; 32]> {
+    let (&marker, mut rest) = raw.split_first()?;
+    if marker != jetsam_chain::block::BLOCK_WIRE_MARKER {
+        return None;
+    }
+    let header = jetsam_chain::block_header::BlockHeader::decode(&mut rest).ok()?;
+    Some(jetsam_chain::consensus::pow::block_id(&header))
 }
 
 /// A5-7: the body of block `height` (id `id`) in an archive mirror `dir` (another archiver's publication
