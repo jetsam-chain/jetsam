@@ -480,6 +480,12 @@ pub fn call_via_bearer(
 /// One `GET` of `url` by `egress`, its body read as JSON (a beacon node's REST
 /// API: `Content-Length`, chunked, or to the end of the connection).
 pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Value> {
+    Ok(serde_json::from_slice(&get_bytes_via(egress, url, timeout)?)?)
+}
+
+/// One `GET` of `url` by `egress`, its body as bytes (`Content-Length`, chunked, or to the end of the
+/// connection): a 200 answer only.
+pub fn get_bytes_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let route = egress.route(url)?;
     let t = target(url)?;
     let mut s = connect(&route, &t, timeout)?;
@@ -496,7 +502,7 @@ pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Re
         "HTTP error from {url}: {}",
         head.lines().next().unwrap_or("")
     );
-    Ok(serde_json::from_slice(&body)?)
+    Ok(body)
 }
 
 /// The head (lower case) and the body of a whole HTTP answer: `Content-Length`

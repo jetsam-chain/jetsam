@@ -8,8 +8,10 @@
 //! Bodies carry `g<i>` and UTC seconds only: no host name, no address, no
 //! time zone.
 //!
-//! Publication points are directories (the rehearsal) the feed is appended
-//! to, `feeds/g<i>/<YYYY-MM-DD>.jsonl`; a guardian writes only there.
+//! Publication points are directories the feed is appended to,
+//! `feeds/g<i>/<YYYY-MM-DD>.jsonl`; a guardian writes only there. Between
+//! machines they travel over Tor, pulled, never pushed (C-2 (a),
+//! [`crate::onion_feed`]); directories alone remain for the private rehearsal.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
