@@ -494,6 +494,9 @@ pub const CAPTURE_TICK_SECONDS: u64 = 10;
 /// try through the router) never delays the capture of a new one.
 pub const CAPTURE_PRIORITY_BLOCKS: u64 = 600;
 
+/// The contradiction search looks among this many newest games (as before).
+pub const CONTRADICTION_WINDOW_GAMES: u64 = 400;
+
 /// What one tick of the captures did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -691,6 +694,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     std::fs::create_dir_all(&captures)?;
     let state_file = dir.join("fast_run.json");
     let parents_file = dir.join("ancestors.json");
+    let games_file = dir.join("games.json");
     let from_block: u64 = flag(args, "--from-block").ok_or_else(usage)?.parse()?;
     let interval: u64 = flag(args, "--interval").map(|i| i.parse()).transpose()?.unwrap_or(60);
     let once = args.iter().any(|a| a == "--once");
@@ -705,6 +709,11 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let mut parents = crate::fast::load_parents(&parents_file).unwrap_or_else(|e| {
         say(&format!("ALERT FAST the parents kept in {} are unreadable ({e:#}): read again", parents_file.display()));
         crate::fast::ParentCache::new()
+    });
+    // The factory's games (address and Base block, they never change): the contradiction search's.
+    let mut games = crate::fast::load_games(&games_file).unwrap_or_else(|e| {
+        say(&format!("ALERT FAST the games kept in {} are unreadable ({e:#}): read again", games_file.display()));
+        crate::fast::GameCache::new()
     });
     say(&format!(
         "relay key 0x{}, bridge 0x{}, {} Base RPCs, state {}, parents of {} games known, captures every {CAPTURE_TICK_SECONDS} s",
@@ -799,6 +808,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 }
             }
             parents.insert(game.game, game.parent);
+            games.insert(index, (game.game, game.l2_block));
             let ancestors = crate::fast::walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |p| {
                 if let Err(e) = crate::fast::store_parents(&parents_file, p) {
                     say(&format!("ALERT FAST the parents not kept in {}: {e:#}", parents_file.display()));
@@ -864,8 +874,36 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         let open_count = open.len();
         if !open.is_empty() {
             let mut valid = None;
-            for index in (0..count).rev().take(400) {
-                let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
+            // Only the games whose Base block was captured, their status read now (in batches); their address and
+            // block are kept. Which one Base holds valid is decided by its proof, as before.
+            let started = Instant::now();
+            let kept = crate::base_capture::captured(&captures)?;
+            let mut stats = crate::fast::WalkStats::default();
+            let known = games.len();
+            let found = crate::fast::captured_games(
+                &l1,
+                &params,
+                count,
+                CONTRADICTION_WINDOW_GAMES,
+                &format!("0x{:x}", l1_block.block_number),
+                &kept,
+                &mut games,
+                &mut stats,
+            );
+            if let Err(e) = crate::fast::store_games(&games_file, &games) {
+                say(&format!("ALERT FAST the games not kept in {}: {e:#}", games_file.display()));
+            }
+            let found = found?;
+            say(&format!(
+                "contradictions: {open_count} fast releases open; {} of the {CONTRADICTION_WINDOW_GAMES} newest games have a capture, \
+                 their status read in {:.1} s ({} requests, {} calls, {} games read)",
+                found.len(),
+                started.elapsed().as_secs_f64(),
+                stats.requests,
+                stats.calls,
+                games.len().saturating_sub(known)
+            ));
+            for game in found {
                 if game.status != jetsam_chain::consensus::destination::base_read::GAME_STATUS_DEFENDER_WINS {
                     continue;
                 }

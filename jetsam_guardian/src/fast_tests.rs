@@ -538,3 +538,172 @@ fn a_refused_batch_is_asked_one_call_at_a_time() {
     assert_eq!((stats.batches_refused, stats.requests, stats.calls), (3, 3 + 242, 242));
     assert_eq!(l1.asked("status").len(), 121);
 }
+
+// ---------------------------------------------------------------------------
+// The contradiction search: the games whose Base block was captured
+// ---------------------------------------------------------------------------
+
+/// Game of index `i` of the mock factory, and its Base block.
+fn game_of(i: u64) -> [u8; 20] {
+    let mut a = [0u8; 20];
+    a[0] = 0x6b;
+    a[12..].copy_from_slice(&i.to_be_bytes());
+    a
+}
+
+fn block_of(i: u64) -> u64 {
+    57_000_000 + 6_000 * i
+}
+
+/// An L1 whose factory holds games `0..count` (`game_of`, `block_of`), all
+/// in progress unless `status` says otherwise; it records each read (what,
+/// index) and each request, and the block tag of every call.
+struct FactoryL1 {
+    status: std::cell::RefCell<BTreeMap<u64, u8>>,
+    asked: std::cell::RefCell<Vec<(&'static str, u64)>>,
+    tags: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    requests: std::cell::Cell<usize>,
+}
+
+impl FactoryL1 {
+    fn new() -> Self {
+        Self {
+            status: Default::default(),
+            asked: Default::default(),
+            tags: Default::default(),
+            requests: Default::default(),
+        }
+    }
+
+    fn answer(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+        assert_eq!(method, "eth_call");
+        self.tags.borrow_mut().insert(params[1].as_str().unwrap().to_string());
+        let to = hex20(params[0]["to"].as_str().unwrap()).unwrap();
+        let data = hex::decode(params[0]["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let hexw = |words: &[[u8; 32]]| json!(format!("0x{}", words.iter().map(hex::encode).collect::<String>()));
+        if to == BASE_SEPOLIA.anchor_state_registry || (to == BASE_SEPOLIA.dispute_game_factory && data[..4] != selector("gameAtIndex(uint256)")) {
+            // What else a whole game's reading asks (gameCount, gameImpls, isGameProper…): never this search.
+            self.asked.borrow_mut().push(("other", 0));
+            return Ok(hexw(&[word_u64(if data[..4] == selector("gameCount()") { 1_000_000 } else { 0 })]));
+        }
+        if to == BASE_SEPOLIA.dispute_game_factory {
+            let i = u64::from_be_bytes(data[28..36].try_into().unwrap());
+            self.asked.borrow_mut().push(("gameAtIndex", i));
+            return Ok(hexw(&[word_u64(621), word_u64(1_700_000_000 + i), word_address(&game_of(i))]));
+        }
+        assert_eq!(to[0], 0x6b, "a game of the factory");
+        let i = u64::from_be_bytes(to[12..].try_into().unwrap());
+        if data[..4] == selector("l2SequenceNumber()") {
+            self.asked.borrow_mut().push(("l2SequenceNumber", i));
+            return Ok(hexw(&[word_u64(block_of(i))]));
+        }
+        if data[..4] == selector("status()") {
+            self.asked.borrow_mut().push(("status", i));
+            let s = self.status.borrow().get(&i).copied().unwrap_or(GAME_STATUS_IN_PROGRESS);
+            return Ok(hexw(&[word_u64(u64::from(s))]));
+        }
+        self.asked.borrow_mut().push(("other", i));
+        Ok(hexw(&[[0u8; 32]]))
+    }
+
+    fn asked(&self, what: &str) -> Vec<u64> {
+        self.asked.borrow().iter().filter(|(w, _)| *w == what).map(|(_, i)| *i).collect()
+    }
+
+    fn forget(&self) {
+        self.asked.borrow_mut().clear();
+        self.requests.set(0);
+    }
+}
+
+impl BaseRpc for FactoryL1 {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.requests.set(self.requests.get() + 1);
+        self.answer(method, &params)
+    }
+
+    fn rpc_batch(&self, calls: &[(&str, Value)]) -> anyhow::Result<Vec<Value>> {
+        self.requests.set(self.requests.get() + 1);
+        calls.iter().map(|(m, p)| self.answer(m, p)).collect()
+    }
+}
+
+/// The search reads each game's address and Base block once (the window's,
+/// in batches), then in EVERY call the status of the games whose block was
+/// captured, and of those only, newest first.
+#[test]
+fn the_contradiction_search_reads_each_captured_games_status_in_every_pass_and_its_game_and_block_once() {
+    let l1 = FactoryL1::new();
+    let kept: std::collections::BTreeSet<u64> = [block_of(999), block_of(995), block_of(990), block_of(500), 1].into();
+    let mut games = GameCache::new();
+    let mut stats = WalkStats::default();
+    let found = captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0xb8c0fd", &kept, &mut games, &mut stats).unwrap();
+    assert_eq!(found.iter().map(|g| g.index).collect::<Vec<_>>(), vec![999, 995, 990], "the window's captured games, newest first");
+    assert!(found.iter().all(|g| g.game == game_of(g.index) && g.l2_block == block_of(g.index) && g.status == GAME_STATUS_IN_PROGRESS));
+    assert_eq!(l1.asked("gameAtIndex"), (600..1_000).rev().collect::<Vec<_>>());
+    assert_eq!(l1.asked("l2SequenceNumber").len(), 400);
+    assert_eq!(l1.asked("status"), vec![999, 995, 990]);
+    assert_eq!(*l1.tags.borrow(), ["0xb8c0fd".to_string()].into(), "every read at the block given");
+    assert!(l1.asked("other").is_empty(), "nothing else of a game is read");
+    assert_eq!(stats.requests, 8 + 8 + 1);
+    assert_eq!(games.len(), 400);
+    // The next pass: no game nor block read again; the statuses read again, now (a game resolved since is seen).
+    l1.forget();
+    l1.status.borrow_mut().insert(995, GAME_STATUS_DEFENDER_WINS);
+    let mut stats = WalkStats::default();
+    let found = captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0xb8c0fd", &kept, &mut games, &mut stats).unwrap();
+    assert!(l1.asked("gameAtIndex").is_empty() && l1.asked("l2SequenceNumber").is_empty());
+    assert_eq!(l1.asked("status"), vec![999, 995, 990]);
+    assert_eq!(found[1].status, GAME_STATUS_DEFENDER_WINS);
+    assert_eq!((stats.requests, l1.requests.get()), (1, 1));
+    // A game resolved for the challenger is seen as well; a new game: only it is read.
+    l1.forget();
+    l1.status.borrow_mut().insert(995, GAME_STATUS_CHALLENGER_WINS);
+    let kept: std::collections::BTreeSet<u64> = kept.into_iter().chain([block_of(1_000)]).collect();
+    let found = captured_games(&l1, &BASE_SEPOLIA, 1_001, 400, "0xb8c0fe", &kept, &mut games, &mut WalkStats::default()).unwrap();
+    assert_eq!(l1.asked("gameAtIndex"), vec![1_000]);
+    assert_eq!(l1.asked("l2SequenceNumber"), vec![1_000]);
+    assert_eq!(found.iter().map(|g| (g.index, g.status)).collect::<Vec<_>>(), vec![
+        (1_000, GAME_STATUS_IN_PROGRESS),
+        (999, GAME_STATUS_IN_PROGRESS),
+        (995, GAME_STATUS_CHALLENGER_WINS),
+        (990, GAME_STATUS_IN_PROGRESS),
+    ]);
+}
+
+/// Many captured games: their statuses in batches of 50; none captured: no
+/// status read at all.
+#[test]
+fn the_captured_games_statuses_are_read_in_batches_and_none_without_a_capture() {
+    let l1 = FactoryL1::new();
+    let mut games = GameCache::new();
+    let none = captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0x1", &Default::default(), &mut games, &mut WalkStats::default()).unwrap();
+    assert!(none.is_empty() && l1.asked("status").is_empty());
+    l1.forget();
+    let kept: std::collections::BTreeSet<u64> = (620..1_000).map(block_of).collect();
+    let mut stats = WalkStats::default();
+    let found = captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0x1", &kept, &mut games, &mut stats).unwrap();
+    assert_eq!(found.len(), 380);
+    assert_eq!(l1.asked("status"), (620..1_000).rev().collect::<Vec<_>>());
+    assert_eq!((stats.requests, stats.calls), (8, 380));
+}
+
+/// The games read are kept across restarts (`games.json`); an unreadable file
+/// is an error (fast-run then reads them again).
+#[test]
+fn the_games_and_their_blocks_are_kept_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("games.json");
+    let l1 = FactoryL1::new();
+    let mut games = GameCache::new();
+    captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0x1", &Default::default(), &mut games, &mut WalkStats::default()).unwrap();
+    store_games(&path, &games).unwrap();
+    let mut back = load_games(&path).unwrap();
+    assert_eq!(back, games);
+    l1.forget();
+    captured_games(&l1, &BASE_SEPOLIA, 1_000, 400, "0x1", &[block_of(999)].into(), &mut back, &mut WalkStats::default()).unwrap();
+    assert!(l1.asked("gameAtIndex").is_empty());
+    assert_eq!(load_games(&dir.path().join("none.json")).unwrap(), GameCache::new());
+    std::fs::write(&path, b"{\"games\": 3}").unwrap();
+    assert!(load_games(&path).is_err());
+}

@@ -676,6 +676,125 @@ pub fn read_ancestors(
     Ok((out, stats))
 }
 
+/// The factory's games the relay read: index → (game, its Base block). The
+/// factory only appends (`gameAtIndex(i)` never changes) and a game's
+/// `l2SequenceNumber()` is an argument of its clone: read once and kept,
+/// across passes and restarts ([`load_games`], [`store_games`]). A game's
+/// status is NEVER kept ([`captured_games`] reads it in every call).
+pub type GameCache = BTreeMap<u64, ([u8; 20], u64)>;
+
+/// Calls per batch of the contradiction search.
+pub const GAME_BATCH: usize = 50;
+
+/// A game whose Base block the relay captured, its status read in this call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedGame {
+    pub index: u64,
+    pub game: [u8; 20],
+    pub l2_block: u64,
+    pub status: u8,
+}
+
+/// The games of the contradiction search, newest first: among the `window`
+/// newest of the `count` the factory holds, those whose Base block is in
+/// `kept` (a capture), each with its status read NOW at the L1 block `tag`.
+/// The game and the Base block of an index not in `games` are read first (in
+/// batches of [`GAME_BATCH`]) and added to it; the statuses are read in
+/// batches too, and only those. Which game Base holds valid is decided by its
+/// proof (`slow_game_under`), never by this reading.
+#[allow(clippy::too_many_arguments)]
+pub fn captured_games(
+    l1: &dyn BaseRpc,
+    params: &BaseParams,
+    count: u64,
+    window: u64,
+    tag: &str,
+    kept: &std::collections::BTreeSet<u64>,
+    games: &mut GameCache,
+    stats: &mut WalkStats,
+) -> anyhow::Result<Vec<CapturedGame>> {
+    let indices: Vec<u64> = (count.saturating_sub(window)..count).rev().collect();
+    let unknown: Vec<u64> = indices.iter().copied().filter(|i| !games.contains_key(i)).collect();
+    for chunk in unknown.chunks(GAME_BATCH) {
+        let at: Vec<([u8; 20], Vec<u8>)> = chunk
+            .iter()
+            .map(|i| {
+                let mut data = selector("gameAtIndex(uint256)").to_vec();
+                data.extend_from_slice(&word_u64(*i));
+                (params.dispute_game_factory, data)
+            })
+            .collect();
+        let addresses = call_many(l1, &at, tag, stats)?
+            .iter()
+            .map(|a| Ok(address_of(&word_at(a, 2)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let asked: Vec<([u8; 20], Vec<u8>)> = addresses
+            .iter()
+            .map(|g| (*g, selector("l2SequenceNumber()").to_vec()))
+            .collect();
+        let blocks = call_many(l1, &asked, tag, stats)?;
+        for ((index, game), block) in chunk.iter().zip(&addresses).zip(&blocks) {
+            games.insert(*index, (*game, u64_of(&word_at(block, 0)?)?));
+        }
+    }
+    let candidates: Vec<(u64, [u8; 20], u64)> = indices
+        .iter()
+        .filter_map(|i| games.get(i).map(|(game, block)| (*i, *game, *block)))
+        .filter(|(_, _, block)| kept.contains(block))
+        .collect();
+    let mut out = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(GAME_BATCH) {
+        let asked: Vec<([u8; 20], Vec<u8>)> = chunk
+            .iter()
+            .map(|(_, game, _)| (*game, selector("status()").to_vec()))
+            .collect();
+        for ((index, game, l2_block), status) in chunk.iter().zip(call_many(l1, &asked, tag, stats)?) {
+            out.push(CapturedGame {
+                index: *index,
+                game: *game,
+                l2_block: *l2_block,
+                status: u64_of(&word_at(&status, 0)?)? as u8,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The games kept in `path` (none when there is no file yet).
+pub fn load_games(path: &Path) -> anyhow::Result<GameCache> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GameCache::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let mut out = GameCache::new();
+    for entry in v["games"]
+        .as_array()
+        .ok_or_else(|| anyhow!("{}: no games", path.display()))?
+    {
+        let index = entry[0].as_u64().ok_or_else(|| anyhow!("{}: a game without index", path.display()))?;
+        let block = entry[2].as_u64().ok_or_else(|| anyhow!("{}: a game without block", path.display()))?;
+        out.insert(index, (hex20(entry[1].as_str().unwrap_or_default())?, block));
+    }
+    Ok(out)
+}
+
+/// Keep `games` in `path` (written then renamed).
+pub fn store_games(path: &Path, games: &GameCache) -> anyhow::Result<()> {
+    let v = json!({
+        "what": "factory index -> (game, l2SequenceNumber()) (never change); no status is kept",
+        "games": games
+            .iter()
+            .map(|(i, (g, b))| json!([i, format!("0x{}", hex::encode(g)), b]))
+            .collect::<Vec<_>>(),
+    });
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// A walk says how far it is every this many ancestors read.
 pub const WALK_LOG_EVERY: usize = 50;
 
