@@ -1804,6 +1804,15 @@ struct Cli {
     #[arg(long)]
     purge_state: bool,
 
+    /// H-2: start a release that arms v1.7 without pinning its crossing on a
+    /// stored chain already past J, accepting that crossing: the ids of blocks
+    /// J − 1 and J (64 hex digits each). Refused unless they are the stored
+    /// chain's own blocks; an ALERT at every start while the release pins
+    /// nothing. Install the release that pins the crossing instead whenever it
+    /// exists.
+    #[arg(long, value_name = "J-1_ID:J_ID")]
+    accept_v1_7_crossing: Option<String>,
+
     /// Check production CPU support and exit without touching node data.
     #[arg(long, exclusive = true)]
     check_hardware: bool,
@@ -2664,28 +2673,84 @@ fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
 /// without those pins, a node can be held by a heavier minority branch of the
 /// old rules (selected by its work, its bodies refused, selected again). Below
 /// J, with both pins, without J or on a profile that needs none, it starts.
+///
+/// D161, the operator's way out, never a default nor silent: `accepted` (from
+/// `--accept-v1-7-crossing <J−1 id>:<J id>`) is checked, on every profile,
+/// against the stored chain's own blocks at J − 1 and J (`stored`): it must
+/// name them, the stored chain must reach J and v1.7 must be armed, or the node
+/// does not start. When it starts an unpinned release this way, the ALERT it
+/// returns is logged at every start; a release that pins the crossing takes
+/// the same ids silently (and refuses others).
 fn refuse_unpinned_v1_7_crossing(
     tip_height: u64,
     j: Option<u64>,
     pins: &[(u64, [u8; 32])],
     required: bool,
-) -> anyhow::Result<()> {
-    let Some(j) = j else {
-        return Ok(());
+    accepted: Option<([u8; 32], [u8; 32])>,
+    stored: &dyn Fn(u64) -> anyhow::Result<Option<[u8; 32]>>,
+) -> anyhow::Result<Option<String>> {
+    let pinned_in = |j: u64| jetsam_chain::consensus::params::v1_7_crossing_pinned_in(pins, Some(j));
+    let Some((before, at)) = accepted else {
+        let Some(j) = j else {
+            return Ok(None);
+        };
+        if !required || tip_height < j || pinned_in(j) {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "this release arms v1.7 at J = {j} but does not pin its crossing (blocks {} and {j}), and the \
+             stored chain already reaches {tip_height}: restarted past J without those pins, a node can be \
+             held by a heavier minority branch of the old rules (audit H-2). Install the release that pins \
+             the crossing, then start again; nothing was changed. Only if that release does not exist yet: \
+             --accept-v1-7-crossing <id of {}>:<id of {j}>, the ids of this chain's own blocks",
+            j - 1,
+            j - 1
+        )
     };
-    if !required
-        || tip_height < j
-        || jetsam_chain::consensus::params::v1_7_crossing_pinned_in(pins, Some(j))
-    {
-        return Ok(());
+    let Some(j) = j else {
+        anyhow::bail!("--accept-v1-7-crossing: this release does not arm v1.7: nothing to accept; start without it")
+    };
+    anyhow::ensure!(
+        tip_height >= j,
+        "--accept-v1-7-crossing: the stored chain does not reach J = {j} (its tip is {tip_height}): nothing to check \
+         the accepted crossing against; start without it"
+    );
+    let (ours_before, ours_at) = (stored(j - 1)?, stored(j)?);
+    anyhow::ensure!(
+        ours_before == Some(before) && ours_at == Some(at),
+        "--accept-v1-7-crossing {}:{} does not match the stored chain (block {} is {}, block {j} is {}): not \
+         started; nothing was changed",
+        hex::encode(before),
+        hex::encode(at),
+        j - 1,
+        ours_before.map(hex::encode).unwrap_or_else(|| "absent".into()),
+        ours_at.map(hex::encode).unwrap_or_else(|| "absent".into()),
+    );
+    if pinned_in(j) {
+        return Ok(None);
     }
-    anyhow::bail!(
-        "this release arms v1.7 at J = {j} but does not pin its crossing (blocks {} and {j}), and the \
-         stored chain already reaches {tip_height}: restarted past J without those pins, a node can be \
-         held by a heavier minority branch of the old rules (audit H-2). Install the release that pins \
-         the crossing, then start again; nothing was changed",
+    Ok(Some(format!(
+        "ALERT V1_7_CROSSING_UNPINNED: this release arms v1.7 at J = {j} and pins nothing at its crossing; started \
+         on the operator's word (--accept-v1-7-crossing {}:{}, the stored chain's own blocks {} and {j}). Install \
+         the release that pins the crossing as soon as it exists",
+        hex::encode(before),
+        hex::encode(at),
         j - 1
-    )
+    )))
+}
+
+/// `--accept-v1-7-crossing`: `<J−1 id>:<J id>`, 64 hex digits each (`0x` allowed).
+fn parse_accepted_v1_7_crossing(text: &str) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    let id = |part: &str| -> anyhow::Result<[u8; 32]> {
+        let part = part.trim().trim_start_matches("0x");
+        anyhow::ensure!(part.len() == 64, "a block id is 64 hex digits");
+        Ok(hex::decode(part)?.try_into().expect("32 bytes"))
+    };
+    let (before, at) = text
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--accept-v1-7-crossing <J-1 id>:<J id>"))?;
+    anyhow::ensure!(!at.contains(':'), "--accept-v1-7-crossing <J-1 id>:<J id>: two ids");
+    Ok((id(before)?, id(at)?))
 }
 
 /// Open the stored chain and hold it against the pinned blocks
@@ -2763,7 +2828,20 @@ fn open_chain_on_pinned_branch(
 
 #[cfg(test)]
 mod v1_7_crossing_pin_tests {
-    use super::refuse_unpinned_v1_7_crossing;
+    use super::{parse_accepted_v1_7_crossing, refuse_unpinned_v1_7_crossing};
+
+    const J: u64 = 69_120;
+    const BEFORE: [u8; 32] = [3; 32];
+    const AT: [u8; 32] = [4; 32];
+
+    /// The stored chain: `BEFORE` at J − 1, `AT` at J, nothing else asked.
+    fn stored(height: u64) -> anyhow::Result<Option<[u8; 32]>> {
+        Ok(match height {
+            h if h == J - 1 => Some(BEFORE),
+            h if h == J => Some(AT),
+            _ => None,
+        })
+    }
 
     /// H-2 (audit 2026-11-10): a release that arms v1.7 but does not pin its crossing (J − 1 and J) does not
     /// start on a stored chain that already reaches J, where its profile needs the crossing pinned (the public
@@ -2771,22 +2849,62 @@ mod v1_7_crossing_pin_tests {
     /// both pins, without J, or on a profile that needs no pin, it starts.
     #[test]
     fn h2_an_armed_release_without_its_crossing_pins_refuses_a_chain_past_j() {
-        let j = 69_120;
+        let j = J;
         let unpinned = [(46_079, [1; 32]), (46_080, [2; 32])];
-        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (j - 1, [3; 32]), (j, [4; 32])];
+        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (j - 1, BEFORE), (j, AT)];
         for tip in [0, j - 1] {
-            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true).is_ok(), "tip {tip} below J");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true, None, &stored).unwrap().is_none(), "tip {tip} below J");
         }
         for tip in [j, j + 1, j + 10_000] {
-            let e = refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true).unwrap_err().to_string();
+            let e = refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true, None, &stored).unwrap_err().to_string();
             assert!(e.contains("69120") && e.contains("69119") && e.contains(&tip.to_string()) && e.contains("pins"), "{e}");
-            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &pinned, true).is_ok(), "pinned, tip {tip}");
-            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, false).is_ok(), "no pin needed, tip {tip}");
-            assert!(refuse_unpinned_v1_7_crossing(tip, None, &unpinned, true).is_ok(), "v1.7 not armed, tip {tip}");
+            assert!(e.contains("--accept-v1-7-crossing"), "the way out is named: {e}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &pinned, true, None, &stored).unwrap().is_none(), "pinned, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, false, None, &stored).unwrap().is_none(), "no pin needed, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, None, &unpinned, true, None, &stored).unwrap().is_none(), "v1.7 not armed, tip {tip}");
         }
         // J − 1 alone, or J alone, is no pinned crossing
-        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &pinned[..3], true).is_err());
-        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &[(j, [4; 32])], true).is_err());
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &pinned[..3], true, None, &stored).is_err());
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &[(j, AT)], true, None, &stored).is_err());
+    }
+
+    /// H-2 (D161): the operator's way out is never a default nor silent: `--accept-v1-7-crossing <J−1 id>:<J id>`
+    /// names the crossing the operator accepts; it starts the unpinned release only if both ids are the stored
+    /// chain's own blocks at J − 1 and J, with an ALERT at every start while the release pins nothing.
+    #[test]
+    fn h2_the_accepted_crossing_starts_an_unpinned_release_only_on_its_own_chain_and_alerts() {
+        let unpinned = [(46_079, [1; 32]), (46_080, [2; 32])];
+        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (J - 1, BEFORE), (J, AT)];
+        for required in [true, false] {
+            let alert = refuse_unpinned_v1_7_crossing(J + 5, Some(J), &unpinned, required, Some((BEFORE, AT)), &stored)
+                .unwrap()
+                .expect("an ALERT, every start");
+            assert!(alert.starts_with("ALERT V1_7_CROSSING_UNPINNED") && alert.contains(&hex::encode(AT)) && alert.contains("69120"), "{alert}");
+        }
+        // another block at J, or at J − 1: refused, whatever the profile
+        for accepted in [(BEFORE, [9; 32]), ([9; 32], AT), (AT, BEFORE)] {
+            for required in [true, false] {
+                let e = refuse_unpinned_v1_7_crossing(J + 5, Some(J), &unpinned, required, Some(accepted), &stored).unwrap_err().to_string();
+                assert!(e.contains("does not match") && e.contains("--accept-v1-7-crossing"), "{e}");
+            }
+        }
+        // nothing to check it against: the stored chain below J, or a release without J
+        let e = refuse_unpinned_v1_7_crossing(J - 1, Some(J), &unpinned, true, Some((BEFORE, AT)), &stored).unwrap_err().to_string();
+        assert!(e.contains("does not reach"), "{e}");
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, None, &unpinned, true, Some((BEFORE, AT)), &stored).is_err());
+        // a release that pins the crossing: the same ids start without an ALERT, others do not start
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, Some(J), &pinned, true, Some((BEFORE, AT)), &stored).unwrap().is_none());
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, Some(J), &pinned, true, Some(([9; 32], AT)), &stored).is_err());
+    }
+
+    #[test]
+    fn h2_the_accepted_crossing_is_two_ids_of_64_hex_digits() {
+        let text = format!("{}:{}", hex::encode(BEFORE), hex::encode(AT));
+        assert_eq!(parse_accepted_v1_7_crossing(&text).unwrap(), (BEFORE, AT));
+        assert_eq!(parse_accepted_v1_7_crossing(&format!("0x{}:0x{}", hex::encode(BEFORE), hex::encode(AT))).unwrap(), (BEFORE, AT));
+        for bad in [String::new(), hex::encode(AT), format!("{}:", hex::encode(BEFORE)), format!("{}:{}", hex::encode(BEFORE), &hex::encode(AT)[..62]), format!("{}:{}:{}", hex::encode(BEFORE), hex::encode(AT), hex::encode(AT)), format!("{}:{}", hex::encode(BEFORE), "zz".repeat(32))] {
+            assert!(parse_accepted_v1_7_crossing(&bad).is_err(), "{bad}");
+        }
     }
 }
 
@@ -3461,12 +3579,27 @@ async fn main() -> anyhow::Result<()> {
         jetsam_chain::consensus::params::HARD_CHECKPOINTS,
     )?;
     let tip_height = ctx.tip_height();
-    refuse_unpinned_v1_7_crossing(
+    let accepted_crossing = cli
+        .accept_v1_7_crossing
+        .as_deref()
+        .map(parse_accepted_v1_7_crossing)
+        .transpose()?;
+    let stored_id = |height: u64| -> anyhow::Result<Option<[u8; 32]>> {
+        Ok(ctx
+            .get_header_from_store(height)
+            .context("read a stored header at the v1.7 crossing")?
+            .map(|header| jetsam_chain::block_header::block_id(&header)))
+    };
+    if let Some(alert) = refuse_unpinned_v1_7_crossing(
         tip_height,
         jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
         jetsam_chain::consensus::params::HARD_CHECKPOINTS,
         jetsam_chain::consensus::params::V1_7_CROSSING_PIN_REQUIRED,
-    )?;
+        accepted_crossing,
+        &stored_id,
+    )? {
+        tracing::error!("{alert}");
+    }
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
     // v1.5 client objects (M3.8): the registered matrices this node holds
@@ -12097,6 +12230,13 @@ async fn handle_p2p_events(
         Ok(restored) => tracing::info!(restored, "divergence verdicts restored from the last run"),
         Err(error) => tracing::warn!(%error, "divergence verdicts of the last run unreadable"),
     }
+    // H-2: the providers whose object bytes failed this node's checks stay out of its object inventory
+    // after a restart, for what is left of their TTL.
+    let restored_quarantine = peer_chain_evidence.object_quarantined_peers(Instant::now());
+    if !restored_quarantine.is_empty() {
+        tracing::info!(restored = restored_quarantine.len(), "object quarantine restored from the last run");
+        rejected_suffix_object_peers.extend(restored_quarantine);
+    }
     let mut branch_warnings = repeated_warnings::RepeatedWarnings::new(
         repeated_warnings::REPEATED_WARNINGS_CAPACITY,
         Instant::now(),
@@ -18680,6 +18820,8 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
+            // H-2: the object quarantine is saved with the verdicts (its TTL from the first time it is noted)
+            peer_chain_evidence.note_object_quarantine(rejected_suffix_object_peers.iter(), now);
             if peer_chain_evidence.take_changed() {
                 if let Err(error) = peer_chain_evidence.save_verdicts(
                     &peer_verdicts_path,

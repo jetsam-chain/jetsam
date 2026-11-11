@@ -139,6 +139,11 @@ pub(crate) struct PeerChainEvidence<H = ()> {
     /// S-1: the height at which the last unverified snapshot plan went
     /// unserved, when it was within direct reach of the local tip.
     unserved_ceiling: Option<Verdict>,
+    /// H-2 (audit 2026-11-10): the providers in the node's object quarantine
+    /// (their exact object bytes failed its checks), with the expiry of the
+    /// record from the first time it was noted: saved with the verdicts so
+    /// that a restart keeps them out of the object inventory.
+    object_quarantine: HashMap<PeerId, Instant>,
     /// A divergence verdict was taken or ended, or a body refused, since
     /// [`Self::take_changed`].
     changed: bool,
@@ -154,6 +159,7 @@ impl<H> Default for PeerChainEvidence<H> {
             validated_points: BTreeMap::new(),
             unserved_boundaries: HashMap::new(),
             unserved_ceiling: None,
+            object_quarantine: HashMap::new(),
             changed: false,
             probe_wanted: HashMap::new(),
             probe_inflight: HashMap::new(),
@@ -214,6 +220,31 @@ impl<H> PeerChainEvidence<H> {
             .min()
     }
 
+    /// H-2: the providers of the node's object quarantine, noted: a new one is
+    /// kept for [`PEER_CHAIN_EVIDENCE_TTL`] from now and marks the verdicts to
+    /// be saved; one already noted keeps its expiry.
+    pub(crate) fn note_object_quarantine<'a>(&mut self, peers: impl IntoIterator<Item = &'a PeerId>, now: Instant) {
+        for peer in peers {
+            if !self.object_quarantine.contains_key(peer) {
+                self.object_quarantine.insert(*peer, now + PEER_CHAIN_EVIDENCE_TTL);
+                self.changed = true;
+            }
+        }
+        if self.object_quarantine.len() > PEER_CHAIN_EVIDENCE_CAPACITY {
+            self.object_quarantine.retain(|_, expires| *expires > now);
+        }
+    }
+
+    /// H-2: the providers whose quarantine record holds at `now` (those
+    /// restored from the last run included).
+    pub(crate) fn object_quarantined_peers(&self, now: Instant) -> HashSet<PeerId> {
+        self.object_quarantine
+            .iter()
+            .filter(|(_, expires)| **expires > now)
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     /// Whether a divergence verdict was taken or ended since the last call.
     pub(crate) fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -258,6 +289,18 @@ impl<H> PeerChainEvidence<H> {
                 body.encoded_len,
             ));
         }
+        // H-2: `objects <peer id> <expiry>`; the reader of a release before it skips these lines (no peer id first).
+        for (peer, expires) in &self.object_quarantine {
+            let left = expires.saturating_duration_since(now);
+            if left.is_zero() {
+                continue;
+            }
+            let expires = (wall_now + left)
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            lines.push_str(&format!("objects {peer} {expires}\n"));
+        }
         let written = path.with_extension("new");
         std::fs::write(&written, lines)?;
         std::fs::rename(&written, path)
@@ -283,6 +326,23 @@ impl<H> PeerChainEvidence<H> {
             .as_secs();
         let mut loaded = 0;
         for line in lines.lines() {
+            if let Some(rest) = line.strip_prefix("objects ") {
+                let mut fields = rest.split_whitespace();
+                let (Some(Ok(peer)), Some(Ok(expires))) =
+                    (fields.next().map(str::parse::<PeerId>), fields.next().map(str::parse::<u64>))
+                else {
+                    continue;
+                };
+                let left = expires
+                    .saturating_sub(wall_now)
+                    .min(PEER_CHAIN_EVIDENCE_TTL.as_secs());
+                if left == 0 {
+                    continue;
+                }
+                self.object_quarantine.insert(peer, now + Duration::from_secs(left));
+                loaded += 1;
+                continue;
+            }
             if let Some(body) = line.strip_prefix("body ") {
                 let Some((body, expires)) = parse_refused_body(body) else {
                     continue;
@@ -936,6 +996,55 @@ mod tests {
         assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL / 2), Some(46_100));
         assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL), None);
         assert!(UNSERVED_CEILING_TTL <= PEER_CHAIN_EVIDENCE_TTL);
+    }
+
+    /// H-2 (audit 2026-11-10): the object quarantine (a provider whose exact
+    /// object bytes failed the transaction/state or terminal checks) lived in
+    /// the process only: a restarted node used that provider's inventory
+    /// again. Noted here, it is saved with the verdicts and comes back with
+    /// what is left of its TTL from the first time it was noted (noting again
+    /// never extends it); the previous release's reader of the file skips its
+    /// lines (they do not start with a peer id).
+    #[test]
+    fn h2_the_object_quarantine_outlives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer-verdicts");
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut before = PeerChainEvidence::<()>::default();
+        let (bad, divergent) = (PeerId::random(), PeerId::random());
+        before.mark_divergent(divergent, 96, now);
+        assert!(before.take_changed());
+        before.note_object_quarantine([&bad], now);
+        assert!(before.take_changed(), "a new provider in quarantine is saved");
+        before.note_object_quarantine([&bad], now + Duration::from_secs(300));
+        assert!(!before.take_changed(), "noted again: nothing new");
+        before.save_verdicts(&path, now, wall).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let peer_lines = text
+            .lines()
+            .filter(|line| line.split_whitespace().next().is_some_and(|first| first.parse::<PeerId>().is_ok()))
+            .count();
+        assert_eq!((text.lines().count(), peer_lines), (2, 1), "{text}");
+
+        let restarted = Instant::now();
+        let ten_minutes = Duration::from_secs(600);
+        let mut after = PeerChainEvidence::<()>::default();
+        assert_eq!(after.load_verdicts(&path, restarted, wall + ten_minutes).unwrap(), 2);
+        assert_eq!(after.object_quarantined_peers(restarted), [bad].into_iter().collect());
+        assert!(after.is_divergent(&divergent, restarted));
+        let left = PEER_CHAIN_EVIDENCE_TTL - ten_minutes;
+        assert!(after.object_quarantined_peers(restarted + left - Duration::from_secs(2)).contains(&bad));
+        assert!(after.object_quarantined_peers(restarted + left + Duration::from_secs(1)).is_empty());
+        // saved again after the restart: what is left, never a fresh TTL
+        after.note_object_quarantine([&bad], restarted);
+        after.save_verdicts(&path, restarted, wall + ten_minutes).unwrap();
+        let mut again = PeerChainEvidence::<()>::default();
+        assert_eq!(again.load_verdicts(&path, restarted, wall + ten_minutes).unwrap(), 2);
+        assert!(again.object_quarantined_peers(restarted + left + Duration::from_secs(1)).is_empty());
+        // past the TTL it does not come back
+        let mut late = PeerChainEvidence::<()>::default();
+        late.load_verdicts(&path, restarted, wall + Duration::from_secs(7_200)).unwrap();
+        assert!(late.object_quarantined_peers(restarted).is_empty());
     }
 
     /// The verdicts lived in memory only. A
