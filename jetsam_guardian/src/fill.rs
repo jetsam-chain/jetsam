@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use jetsam_chain::block::{try_compute_tx_root, validate_block_page_stream, Block};
 use jetsam_chain::block_header::BlockHeader;
 use jetsam_chain::consensus::pow::block_id;
-use jetsam_chain::consensus::vault::{validate_block_vault, ReleasedSet, VaultContext, VaultRules};
+use jetsam_chain::consensus::destination::fast::{fast_release_marker, FastAttestation};
+use jetsam_chain::consensus::destination::DestinationObjectKind;
+use jetsam_chain::consensus::vault::{release_marker_n, validate_block_vault_with, ReleasedSet, VaultContext, VaultRelease, VaultRules};
+use jetsam_poseidon2b::primitives::Address;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
@@ -113,8 +116,8 @@ impl FoundDeposit {
 }
 
 /// The deposits of the block `raw`, which must be the block `expected_id` of the robot's chain and whose
-/// header must commit to its body (`tx_root`), read with the node's own rule `validate_block_vault`
-/// under `rules` (the build's: `VaultRules::current()`).
+/// header must commit to its body (`tx_root`), read with the node's own rule `validate_block_vault_with` (D176: its fast
+/// lane marker and its advance payees, as `destination::state` applies it) under `rules` (the build's: `VaultRules::current()`).
 ///
 /// The branch state of that rule is not known here, so the context is the most permissive one a block of
 /// the chain can need: no withdrawal paid before, nothing released in the window, a floor of 0, and as
@@ -156,7 +159,47 @@ pub fn deposits_in_block(block: &Block, rules: &VaultRules) -> anyhow::Result<Ve
     }
     let released = ReleasedSet::new();
     let ctx = VaultContext { released: &released, released_in_window: 0, bridge_locked: taken, bridge_vault_floor: 0 };
-    let effect = validate_block_vault(block, &ctx, rules, &mut |_| Ok(()))
+    // D176: the rule as the node applies it from the return over Base on (destination::state): a fast release's group
+    // carries the fast lane's marker, committed to the Base block of the block's own attestation; and a release of an
+    // advanced burn pays the advance's creditor, which the branch's advances name and this reading does not hold: the
+    // payee each release group pays is taken (V2 is one more refusal the node made with its real state)
+    let attestations: Vec<&[u8]> = block
+        .destination
+        .iter()
+        .flat_map(|section| section.objects.iter())
+        .filter(|object| object.kind == DestinationObjectKind::FastGameAttestation)
+        .map(|object| object.payload.as_slice())
+        .collect();
+    let attested_l2 = match attestations.as_slice() {
+        [] => None,
+        [payload] => Some(
+            FastAttestation::decode_payload(payload)
+                .map_err(|e| anyhow::anyhow!("block {height}: its fast attestation: {e:?}"))?
+                .statement
+                .l2_block,
+        ),
+        _ => anyhow::bail!("block {height}: {} fast attestations", attestations.len()),
+    };
+    let mut paid: BTreeMap<u64, Address> = BTreeMap::new();
+    for g in &stream.groups {
+        if g.spend.input_owner == rules.vault {
+            let outputs: Vec<Address> = user[usize::from(g.start_page)..g.end_page_exclusive()]
+                .iter()
+                .flat_map(|page| page.body.live_outputs().map(|(_, o)| o.owner))
+                .collect();
+            if let [payee, marker, ..] = outputs.as_slice() {
+                if let Some(n) = release_marker_n(marker) {
+                    paid.insert(n, *payee);
+                }
+            }
+        }
+    }
+    let payee = |release: &VaultRelease| paid.get(&release.n).copied().unwrap_or(release.owner);
+    let marker = |release: &VaultRelease| match attested_l2 {
+        Some(l2_block) => fast_release_marker(release.n, &release.owner, release.amount, l2_block),
+        None => release.marker(),
+    };
+    let effect = validate_block_vault_with(block, &ctx, rules, &payee, &marker, &mut |_| Ok(()))
         .map_err(|e| anyhow::anyhow!("the node's vault rule refuses block {height}: {e:?}"))?;
     effect
         .deposits
