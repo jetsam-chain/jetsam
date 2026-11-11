@@ -24,11 +24,18 @@ use jetsam_chain::consensus::vault::VaultRules;
 /// `D_SLOW`, fixed by its network): 1 h on the test chain, 24 h on the public network.
 const SLOW_LANE_WAIT: &str = if jetsam_chain::consensus::vault::TESTNET_PROFILE { "1 h" } else { "24 h" };
 
+/// D150: how often a checkpoint comes is its relayer operator's setting (jg-relay's `cadence_secs`: 6 600 s
+/// by default, 900 s on the test chain's relayer), never above 6 600 s = the contract's `W_STALL` (7 200 s)
+/// less a 600 s margin, on every network: jg-relay refuses more (`relay::check_cadence`). The help says
+/// "up to" that bound, never a cadence of its own.
+const CHECKPOINT_CADENCE_UP_TO: &str = "1 h 50";
+
 /// The slow lane of a deposit, in the help of `bridge deposit` and in its plan (TN1: its wait is the profile's).
 fn slow_lane() -> String {
     format!(
-        "by the slow lane, at the next checkpoint (about every 1 h 50) then about {SLOW_LANE_WAIT}; or sooner, less \
-         a fee, if an advancer advances it. Deposits left out beyond 22 a day wait; none is lost."
+        "by the slow lane, at the next checkpoint (as often as its relayer's operator sets: up to every \
+         {CHECKPOINT_CADENCE_UP_TO}) then about {SLOW_LANE_WAIT}; or sooner, less a fee, if an advancer advances it. \
+         Deposits left out beyond 22 a day wait; none is lost."
     )
 }
 
@@ -4179,6 +4186,31 @@ mod bridge_tests {
         // the plan printed before a deposit says the same
         let plan = super::slow_lane();
         assert!(plan.contains(want) && !plan.contains(never) && help.contains(&plan), "{plan}");
+    }
+
+    /// D150 (backlog): the help and the plan of a deposit said "about every 1 h 50", the public
+    /// network relayer's default cadence, as a fact; the test chain's relayer runs every 900 s.
+    /// How often a checkpoint comes is its relayer operator's setting: said as such, with the
+    /// bound jg-relay holds every cadence under on every network (6 600 s), "up to", never a
+    /// cadence of its own; the slow lane's wait stays this network's.
+    #[test]
+    fn d150_the_deposit_help_says_the_checkpoint_cadence_is_the_relayer_operators_up_to_its_bound() {
+        let mut cli = Cli::command();
+        let deposit = cli
+            .find_subcommand_mut("bridge")
+            .and_then(|b| b.find_subcommand_mut("deposit"))
+            .expect("bridge deposit");
+        let help = deposit.render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let plan = super::slow_lane();
+        let wait = if jetsam_chain::consensus::vault::TESTNET_PROFILE { "1 h" } else { "24 h" };
+        let want = format!(
+            "at the next checkpoint (as often as its relayer's operator sets: up to every 1 h 50) then about {wait};"
+        );
+        for text in [&help, &plan] {
+            assert!(text.contains(&want) && !text.contains("about every"), "{text}");
+        }
+        assert!(help.contains(&plan), "{help}");
     }
 
     const ONE: u64 = 1_000_000;

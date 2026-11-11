@@ -1057,7 +1057,16 @@ pub fn scan_step(
                 scanned.insert(h, (hex::encode(id), found));
             }
             BodyRead::NotServed => {
-                log(format!("block {h}: no node serves its body (getBlock, getDepositBlock), its deposits are not advanced"));
+                // D144: a block whose header proves it holds no deposit (its coinbase's output only, T7.7) is known
+                // without its body: nothing to say. Any other one: its deposits are unknown, said once.
+                let outputs = crate::relayer::outputs_created(chain, h);
+                if outputs != Some(1) {
+                    let outputs = outputs.map_or("an unknown number of".to_string(), |n| n.to_string());
+                    log(format!(
+                        "block {h}: no node serves its body (getBlock, getDepositBlock) and its header does not prove it holds no \
+                         deposit ({outputs} outputs created, the coinbase's one among them): its deposits are not advanced"
+                    ));
+                }
                 failed.remove(&h);
                 scanned.insert(h, (hex::encode(id), Vec::new()));
             }

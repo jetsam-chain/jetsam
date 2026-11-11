@@ -1954,6 +1954,59 @@ fn e12_the_scan_goes_past_a_block_it_cannot_read_and_reads_it_again() {
     assert_eq!(*asked.borrow(), (1..=8).chain(65..=128).collect::<Vec<_>>(), "8 failed ones again, 64 new ones");
 }
 
+/// D144 (the public test chain, backlog): the scan said "no node serves its body" for every block without a deposit
+/// below the nodes' `getBlock` window (`getDepositBlock` serves only deposit blocks there): noise. A block no source
+/// serves whose header proves it holds no deposit — one output created, its coinbase's (T7.7, the relayer's
+/// `CoinbaseOnly`) — is said nothing; any other one, its deposits unknown, gets one clear line. Only the text changes:
+/// every such block is marked scanned without deposit as before, none read again.
+#[test]
+fn d144_a_block_no_node_serves_is_said_only_when_its_header_does_not_prove_it_holds_no_deposit() {
+    // block 3 created 3 outputs (a deposit's two and the coinbase's), block 5 two: not proven; 1, 2, 4, 6: the coinbase's only
+    let mut c = Chain::from_genesis(testkit::genesis());
+    let mut alloc = 0;
+    for (h, n) in (1u64..).zip([1u64, 1, 3, 1, 2, 1]) {
+        alloc += n;
+        let hd = BlockHeader {
+            prev_block_hash: c.tip_id(),
+            state_root: [1u8; 32],
+            tx_root: [h as u8; 32],
+            timestamp: 1_700_000_000 + 180 * h,
+            height: h,
+            miner_address: Address([7u8; 32]),
+            nonce: 1,
+            difficulty_target: testkit::target_bits(20),
+            log_slots: 16,
+            active_slot_count: h,
+            alloc_counter: alloc,
+        };
+        c.extend(HeaderInfo::from_header(&hd)).unwrap();
+    }
+    let (mut scanned, mut failed) = (BTreeMap::new(), BTreeSet::new());
+    let mut lines = Vec::new();
+    scan_step(&mut scanned, &mut failed, &c, 1, &mut |_, _| BodyRead::NotServed, &mut |l| lines.push(l));
+    assert_eq!(lines.len(), 2, "only blocks 3 and 5 are said: {lines:#?}");
+    for (line, (h, n)) in lines.iter().zip([(3, 3), (5, 2)]) {
+        assert!(
+            line.starts_with(&format!("block {h}: no node serves its body (getBlock, getDepositBlock)"))
+                && line.contains(&format!("its header does not prove it holds no deposit ({n} outputs created"))
+                && line.ends_with("its deposits are not advanced"),
+            "{line}"
+        );
+    }
+    // the guard unchanged: every block marked scanned without deposit, none to read again
+    assert_eq!(scanned.keys().copied().collect::<Vec<_>>(), (1..=6).collect::<Vec<_>>());
+    assert!(scanned.values().all(|(_, d)| d.is_empty()) && failed.is_empty());
+    scan_step(&mut scanned, &mut failed, &c, 1, &mut |_, _| BodyRead::NotServed, &mut |l| lines.push(l));
+    assert_eq!(lines.len(), 2, "said once");
+    // its parent's header not kept (a chain from a trust anchor): not proven, said
+    let mut anchored = Chain::with_anchor(0, c.id_at(0).unwrap(), c.work_at(0).unwrap());
+    anchored.extend(c.header_at(1).unwrap().clone()).unwrap();
+    let mut lines = Vec::new();
+    scan_step(&mut BTreeMap::new(), &mut BTreeSet::new(), &anchored, 1, &mut |_, _| BodyRead::NotServed, &mut |l| lines.push(l));
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].starts_with("block 1: no node serves its body") && lines[0].contains("(an unknown number of outputs created"), "{}", lines[0]);
+}
+
 
 // ---------------------------------------------------------------- D123: the caps are the bond, 50 000 JTM
 
