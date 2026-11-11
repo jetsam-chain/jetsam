@@ -254,17 +254,34 @@ fn l1(world: Arc<Mutex<L1World>>) -> u16 {
     }))
 }
 
-/// A `relay.toml` of the private rehearsal (its clearnet: the loopback) under a fresh directory.
+/// E-10: the deposit height F of this build (`VaultRules::current`), the only one jg-relay starts with.
+fn built_f() -> Option<u64> {
+    jetsam_chain::consensus::vault::VaultRules::current().deposits_from_height
+}
+
+/// E-10: a build without a v1.7 clock (the default profile until J is armed) starts no jg-relay: the tests that run
+/// one return at once there (they run on the test-chain and rehearsal builds).
+fn no_v1_7_clock() -> bool {
+    let none = built_f().is_none();
+    if none {
+        eprintln!("SKIPPED: this build has no v1.7 clock, jg-relay does not start (E-10)");
+    }
+    none
+}
+
+/// A `relay.toml` of the private rehearsal (its clearnet: the loopback) under a fresh directory; F is the build's
+/// (E-10), 128 for a build without one.
 fn relay_dir(l1_port: u16, nodes: &[u16], min_nodes: usize, extra: &str) -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().to_path_buf();
     let nodes: String = nodes.iter().enumerate().map(|(i, p)| format!("[[nodes]]\nname = \"n{i}\"\nrpc = \"http://127.0.0.1:{p}\"\n")).collect();
     let text = format!(
-        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"{}\"\nl1_rpc = \"http://127.0.0.1:{l1_port}\"\ndeposits_from_height = 128\n\
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"{}\"\nl1_rpc = \"http://127.0.0.1:{l1_port}\"\ndeposits_from_height = {}\n\
          state_dir = \"{}\"\npublish_dir = \"{}\"\npoll_secs = 1\nmin_nodes = {min_nodes}\nfrom_address = \"{FROM}\"\n{extra}\n{nodes}\
          [egress]\nmode = \"clearnet\"\n[prover]\nmode = \"mock\"\n",
         hex::encode(testkit::genesis().id),
         BRIDGE,
+        built_f().unwrap_or(128),
         dir.join("state").display(),
         dir.join("publish").display(),
     );
@@ -317,12 +334,43 @@ fn genesis_only() -> u16 {
     node(Arc::new(Mutex::new(jetsam_guardian::chain::Chain::from_genesis(testkit::genesis()))))
 }
 
+// ---------------------------------------------------------------- E-10
+
+/// E-10 (audit 2026-11-10): a jg-relay built with another v1.7 clock than its relay.toml's network (a stale build,
+/// D104: F moved from 9 600 to 8 704) would publish roots that leave deposits out: it does not start, before any
+/// socket, and says why.
+#[test]
+fn e10_jg_relay_built_for_another_deposit_height_does_not_start() {
+    let built = jetsam_chain::consensus::vault::VaultRules::current().deposits_from_height;
+    let other = built.map_or(128, |f| f + 1);
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (l1_port, n0, n1) = (l1(world.clone()), genesis_only(), genesis_only());
+    let (_root, dir) = relay_dir(l1_port, &[n0, n1], 2, "");
+    let text = std::fs::read_to_string(dir.join("relay.toml")).unwrap();
+    let text = text.lines().map(|l| if l.starts_with("deposits_from_height") { format!("deposits_from_height = {other}") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+    std::fs::write(dir.join("other.toml"), format!("{text}\n")).unwrap();
+    let log = std::fs::File::create(dir.join("e10.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(dir.join("other.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    let code = exited(child, 30);
+    let log = std::fs::read_to_string(dir.join("e10.log")).unwrap_or_default();
+    assert_eq!(code, Some(1), "log:\n{log}");
+    assert!(log.contains(&format!("deposits_from_height {other}")) && log.contains("jg-relay does not start"), "{log}");
+    let dialled = {
+        let w = world.lock().unwrap();
+        w.block_number_calls + w.filters.len() as u64
+    };
+    assert_eq!(dialled, 0, "nothing dialled");
+}
+
 // ---------------------------------------------------------------- E-1
 
 /// E-1: an `eth_getLogs` answered `null` (no list) is no "no event": the window is read again, and the point in it
 /// learned. Before: `unwrap_or_default()` made it an empty list and the window was never read again.
 #[test]
 fn jg_relay_reads_a_window_again_after_an_answer_that_is_no_list_of_logs() {
+    if no_v1_7_clock() {
+        return;
+    }
     let cp = point();
     let world = Arc::new(Mutex::new(L1World::new(100)));
     {
@@ -344,6 +392,9 @@ fn jg_relay_reads_a_window_again_after_an_answer_that_is_no_list_of_logs() {
 /// (`topics[1]`) once the contract names it as its tip and it was accepted below the blocks already read.
 #[test]
 fn jg_relay_reads_again_by_its_id_a_point_the_contract_names_that_an_answer_left_out() {
+    if no_v1_7_clock() {
+        return;
+    }
     let cp = point();
     let world = Arc::new(Mutex::new(L1World::new(100)));
     {
@@ -370,6 +421,9 @@ fn jg_relay_reads_again_by_its_id_a_point_the_contract_names_that_an_answer_left
 /// to 10 000 000, kept that as read, and every later point was lost.
 #[test]
 fn jg_relay_never_reads_up_to_a_block_its_endpoint_does_not_serve() {
+    if no_v1_7_clock() {
+        return;
+    }
     let cp = point();
     let world = Arc::new(Mutex::new(L1World::new(100)));
     world.lock().unwrap().lies = vec![10_000_000];
@@ -409,6 +463,9 @@ fn reorgs(dir: &Path) -> Vec<(u64, u64)> {
 /// nodes on that branch: it is followed. A reorganization of two blocks by one node alone is followed as before.
 #[test]
 fn one_node_alone_never_makes_jg_relay_drop_more_than_eight_blocks() {
+    if no_v1_7_clock() {
+        return;
+    }
     use jetsam_guardian::chain::Chain;
     let a = testkit::chain(30, 1);
     let mut b = testkit::chain(5, 1);
@@ -449,6 +506,9 @@ fn one_node_alone_never_makes_jg_relay_drop_more_than_eight_blocks() {
 /// it drop blocks, even fewer than eight.
 #[test]
 fn one_node_alone_never_makes_jg_relay_drop_a_known_points_locked_block() {
+    if no_v1_7_clock() {
+        return;
+    }
     use jetsam_guardian::chain::Chain;
     let a = testkit::chain(30, 1);
     let mut d = a.clone();
@@ -514,6 +574,9 @@ fn exited(mut child: Child, secs: u64) -> Option<i32> {
 /// a hot key (the rehearsal's endpoint account) it starts as before.
 #[test]
 fn jg_relay_holding_a_hot_key_does_not_start_with_its_memory_unlocked_unless_told() {
+    if no_v1_7_clock() {
+        return;
+    }
     let world = Arc::new(Mutex::new(L1World::new(100)));
     let (l1_port, n0, n1) = (l1(world.clone()), genesis_only(), genesis_only());
     let (_root, dir) = relay_dir(l1_port, &[n0, n1], 2, "");

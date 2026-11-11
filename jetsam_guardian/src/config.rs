@@ -49,6 +49,14 @@ pub struct GuardianConfig {
     pub l1_rpc: Option<String>,
     /// Publication points (directories).
     pub publication_points: Vec<PathBuf>,
+    /// C-2 (a) (audit 2026-11-10): where `jg-net` serves its own feed read only, a loopback IP address and port
+    /// (the guardian's Tor onion service points at it): required on a public network.
+    #[serde(default)]
+    pub feed_listen: Option<String>,
+    /// C-2 (a): the feed server of every other guardian, `g<i>` → `http://<56>.onion[:port]`, pulled through Tor:
+    /// required for each of them on a public network.
+    #[serde(default)]
+    pub feed_onions: HashMap<String, String>,
     /// Feed public keys of the 7 guardians, index → hex.
     pub feed_keys: HashMap<String, String>,
     /// Group key and the 5 Feldman commitments (hex).
@@ -76,7 +84,10 @@ pub struct GuardianConfig {
 #[serde(rename_all = "lowercase")]
 pub enum EgressMode {
     /// The default (D60): a source is a loopback IP address (reached
-    /// directly) or a `.onion` address (reached through Tor's SOCKS port);
+    /// directly) or a `.onion` address (reached through Tor's SOCKS port), or
+    /// (C-2, audit 2026-11-10) an `https://` public name, reached through Tor's
+    /// SOCKS port too, the name resolved by Tor and TLS end to end with it (a
+    /// public L1 endpoint without a cleartext relay on the loopback);
     /// anything else refuses to start.
     #[default]
     Onion,
@@ -216,6 +227,52 @@ impl GuardianConfig {
 
     pub fn commitments(&self) -> anyhow::Result<Vec<[u8; 48]>> {
         self.commitments.iter().map(|c| hex48(c)).collect()
+    }
+
+    /// C-2 (a): `jg-net`'s feed transport, the loopback address it serves its feed on and the onion server of
+    /// every other guardian (by index), each reached by [`Self::egress`]. On a public network both are required
+    /// (a `.onion` for every other index of `feed_keys`, never this guardian's own): a publication by
+    /// directories alone would be pushed from this machine's address. The private rehearsal may keep
+    /// directories.
+    pub fn feed_transport(&self) -> anyhow::Result<(Option<std::net::SocketAddr>, Vec<(u32, String)>)> {
+        let fail = |e: String| anyhow::anyhow!("{e}: the guardian does not start (C-2: feeds over Tor, pulled)");
+        let listen = match &self.feed_listen {
+            None => None,
+            Some(text) => {
+                let addr: std::net::SocketAddr = text.parse().map_err(|_| fail(format!("feed_listen {text:?}: an IP address and port")))?;
+                if !addr.ip().is_loopback() {
+                    return Err(fail(format!("feed_listen {text}: a loopback address only (the onion service points at it)")));
+                }
+                Some(addr)
+            }
+        };
+        let keys = self.feed_keys()?;
+        let egress = self.egress()?;
+        let public = self.profile()? != crate::Profile::PrivateRehearsal;
+        let mut peers = Vec::new();
+        for (name, url) in &self.feed_onions {
+            let g: u32 = name.trim_start_matches('g').parse().map_err(|_| fail(format!("feed_onions.{name}: g<index>")))?;
+            if g == self.index || !keys.contains_key(&g) {
+                return Err(fail(format!("feed_onions.g{g}: not another guardian of feed_keys")));
+            }
+            let route = egress.route(url).map_err(|e| fail(format!("feed_onions.g{g} = {url}: {e}")))?;
+            if public && !matches!(&route, crate::rpc::Route::Socks { host, .. } if crate::rpc::is_onion_v3(host)) {
+                return Err(fail(format!("feed_onions.g{g} = {url}: a .onion address on a public network")));
+            }
+            peers.push((g, url.clone()));
+        }
+        peers.sort();
+        if public {
+            if listen.is_none() {
+                return Err(fail("feed_listen is required on a public network".into()));
+            }
+            let mut others: Vec<u32> = keys.keys().copied().filter(|g| *g != self.index).collect();
+            others.sort();
+            if let Some(g) = others.iter().find(|g| !peers.iter().any(|(p, _)| p == *g)) {
+                return Err(fail(format!("feed_onions.g{g} is required on a public network (every other guardian's onion feed)")));
+            }
+        }
+        Ok((listen, peers))
     }
 
     pub fn feed_keys(&self) -> anyhow::Result<HashMap<u32, [u8; 32]>> {

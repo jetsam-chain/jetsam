@@ -1453,11 +1453,13 @@ fn jg_fill_scans_past_a_block_whose_body_no_source_serves_readable() {
 /// point it knows and every mint it saw), before any socket; the file is left as it was.
 #[test]
 fn jg_relay_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
+    // E-10: jg-relay starts only with its build's F (none before J is armed: the default profile does not get here)
+    let Some(f) = jetsam_chain::consensus::vault::VaultRules::current().deposits_from_height else { return };
     let (target, socks) = untouchable();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path();
     let text = format!(
-        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nl1_rpc = \"http://{}:8545\"\ndeposits_from_height = 128\n\
+        "network = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nl1_rpc = \"http://{}:8545\"\ndeposits_from_height = {f}\n\
          state_dir = \"{}\"\npublish_dir = \"{}\"\npoll_secs = 1\n\
          [[nodes]]\nname = \"a\"\nrpc = \"http://{}:19801\"\n[[nodes]]\nname = \"b\"\nrpc = \"http://{}:19801\"\n\
          [egress]\ntor_socks = \"127.0.0.1:{}\"\n[prover]\nmode = \"mock\"\n",
@@ -1478,4 +1480,44 @@ fn jg_relay_does_not_start_on_an_unreadable_state_json_and_dials_nothing() {
     assert!(log.contains("state.json") && log.contains("does not start"), "{log}");
     untouched(&target, &socks, "an unreadable state.json");
     assert_eq!(std::fs::read_to_string(dir.join("state/state.json")).unwrap(), "{\"known\":", "left as it was");
+}
+
+// ---------------------------------------------------------------- C-2 (a): the feeds pulled over Tor, never pushed
+
+/// C-2 (a) (audit 2026-11-10): `jg-net` serves its own feed read only on `feed_listen` and pulls another guardian's
+/// from that guardian's server (the private rehearsal: on the loopback; a public network: its `.onion` through Tor,
+/// `config_tests`), keeping its signed lines in the local publication point.
+#[test]
+fn c2a_jg_net_serves_its_own_feed_and_pulls_another_guardians() {
+    let k2 = FeedKey::from_secret([2u8; 32]);
+    let remote = tempfile::tempdir().unwrap();
+    let day = utc_day(now_unix());
+    let line = jetsam_guardian::feed::sign_line(&k2, &json!({"g": 2, "type": "hb", "t": now_unix()}));
+    let served = feed_path(remote.path(), 2, &day);
+    std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+    std::fs::write(&served, format!("{line}\n")).unwrap();
+    let g2 = jetsam_guardian::onion_feed::serve("127.0.0.1:0", remote.path().to_path_buf()).unwrap();
+    let listen = { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap() };
+    let g = guardian_on(
+        &jetsam_guardian::TESTNET_NETWORK,
+        31_337,
+        &REHEARSAL_BRIDGE,
+        "seed_rpcs = []",
+        &format!("feed_listen = \"{listen}\"\n{CLEARNET}\n[feed_onions]\ng2 = \"http://{g2}\""),
+    );
+    let text = std::fs::read_to_string(&g.config).unwrap();
+    std::fs::write(&g.config, format!("{text}g2 = \"{}\"\n", hex::encode(k2.public()))).unwrap();
+    let net = spawn(env!("CARGO_BIN_EXE_jg-net"), &g, "net");
+    let own = format!("http://{listen}/feeds/g1/{day}.jsonl");
+    let pulled = feed_path(&g.dir.join("pub"), 2, &day);
+    let ok = wait_for(90, || {
+        pulled.exists()
+            && jetsam_guardian::rpc::get_bytes_via(&jetsam_guardian::rpc::Egress::Clearnet, &own, Duration::from_secs(5))
+                .is_ok_and(|b| String::from_utf8_lossy(&b).lines().any(|l| verify_line(l, &[(1, g.feed.public())].into_iter().collect()).is_ok()))
+    });
+    stop(net);
+    let log = std::fs::read_to_string(g.dir.join("net.log")).unwrap_or_default();
+    assert!(ok, "own feed not served or g2's not pulled; jg-net log:\n{log}");
+    assert_eq!(std::fs::read_to_string(&pulled).unwrap(), format!("{line}\n"));
+    assert!(log.contains(&format!("feed served read only on {listen}")) && log.contains("pulling the feeds of 1 guardians"), "{log}");
 }

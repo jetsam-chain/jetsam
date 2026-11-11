@@ -10,6 +10,9 @@
 //! onion only — a loopback IP address directly, a `.onion` name through Tor's
 //! SOCKS5 port, anything else refused before any socket or DNS lookup — or,
 //! in the private rehearsal only, in the clear on its bridge 10.77.0.0/24.
+//! C-2 (audit 2026-11-10): and a public `https://` name through Tor's SOCKS5
+//! port too, the name resolved by Tor, TLS end to end with the server so named
+//! (the web's roots): a public L1 endpoint without a cleartext relay.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -115,7 +118,8 @@ pub enum Route {
     Socks { proxy: SocketAddr, host: String, port: u16 },
 }
 
-/// A `http://host[:port][/path]` URL taken apart (the port defaults to 80).
+/// A `http[s]://host[:port][/path]` URL taken apart (the port defaults to 80,
+/// 443 for `https://`).
 struct Target<'a> {
     /// The host, IPv6 brackets removed.
     host: &'a str,
@@ -123,10 +127,16 @@ struct Target<'a> {
     /// `host[:port]` as written (the `Host` header).
     authority: &'a str,
     path: &'a str,
+    /// `https://`: TLS end to end with `host` (C-2).
+    tls: bool,
 }
 
 fn target(url: &str) -> anyhow::Result<Target<'_>> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| anyhow::anyhow!("only http:// URLs: {url}"))?;
+    let (rest, tls) = match (url.strip_prefix("http://"), url.strip_prefix("https://")) {
+        (Some(rest), _) => (rest, false),
+        (None, Some(rest)) => (rest, true),
+        (None, None) => anyhow::bail!("only http:// and https:// URLs: {url}"),
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -144,9 +154,42 @@ fn target(url: &str) -> anyhow::Result<Target<'_>> {
     anyhow::ensure!(!host.is_empty(), "no host in {url}");
     let port = match port {
         Some(p) => p.parse::<u16>().map_err(|_| anyhow::anyhow!("bad port in {url}"))?,
+        None if tls => 443,
         None => 80,
     };
-    Ok(Target { host, port, authority, path })
+    Ok(Target { host, port, authority, path, tls })
+}
+
+/// C-2: a public DNS name (`label.label…`, letters, digits and inner hyphens, at
+/// least one dot, not an IP address nor a `.onion`): what an https:// source
+/// names for Tor to resolve.
+fn is_public_name(host: &str) -> bool {
+    host.len() <= 253
+        && host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && !host.ends_with(".onion")
+        && host.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The roots an https:// call trusts in a test of this thread, instead of the web's.
+    static TEST_ROOTS: std::cell::RefCell<Option<rustls::RootCertStore>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f` with the https:// calls of this thread trusting `roots` only (the tests' own certificates).
+#[cfg(test)]
+pub(crate) fn with_test_roots<T>(roots: rustls::RootCertStore, f: impl FnOnce() -> T) -> T {
+    TEST_ROOTS.with(|r| *r.borrow_mut() = Some(roots));
+    let out = f();
+    TEST_ROOTS.with(|r| *r.borrow_mut() = None);
+    out
 }
 
 /// `<56 base32 characters>.onion` (a v3 onion service, lower case).
@@ -180,6 +223,16 @@ impl Egress {
                 Ok(Route::Resolve(hostport))
             }
             Egress::Onion { socks } => {
+                if t.tls {
+                    // C-2: a public name through Tor, TLS end to end; never an IP literal nor a .onion in https
+                    anyhow::ensure!(
+                        is_public_name(t.host),
+                        "onion-only egress refuses {url}: https:// is for a public name that Tor resolves (TLS end to end \
+                         with it), not {}",
+                        t.host
+                    );
+                    return Ok(Route::Socks { proxy: *socks, host: t.host.to_string(), port: t.port });
+                }
                 if let Ok(ip) = t.host.parse::<std::net::IpAddr>() {
                     anyhow::ensure!(
                         ip.is_loopback(),
@@ -189,7 +242,8 @@ impl Egress {
                 }
                 anyhow::ensure!(
                     is_onion_v3(t.host),
-                    "onion-only egress refuses {url}: {} is neither a loopback IP address nor a .onion address (no DNS lookup, no direct connection)",
+                    "onion-only egress refuses {url}: {} is neither a loopback IP address nor a .onion address (no DNS lookup, no direct connection; \
+                     a public name only as https://, through Tor)",
                     t.host
                 );
                 Ok(Route::Socks { proxy: *socks, host: t.host.to_string(), port: t.port })
@@ -201,6 +255,7 @@ impl Egress {
                          its bridge {REHEARSAL_BRIDGE} (no name, no lookup)"
                     )
                 };
+                anyhow::ensure!(!t.tls, refused());
                 let ip: std::net::IpAddr = t.host.parse().map_err(|_| refused())?;
                 if ip.is_loopback() {
                     return Ok(Route::Loopback(SocketAddr::new(ip, t.port)));
@@ -264,6 +319,89 @@ fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()
     let mut rest = vec![0u8; bound + 2];
     s.read_exact(&mut rest)?;
     Ok(())
+}
+
+/// The connection of one call: plain TCP, or TLS over it for an `https://`
+/// URL (C-2).
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            // a server that closes without TLS's close_notify: the end (the HTTP framing is checked after)
+            Conn::Tls(s) => match s.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                other => other,
+            },
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// C-2: the client side of TLS: the web's roots (the tests' own in a test), ring.
+fn tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+    #[cfg(test)]
+    let test_roots = TEST_ROOTS.with(|r| r.borrow().clone());
+    #[cfg(not(test))]
+    let test_roots: Option<rustls::RootCertStore> = None;
+    let roots = test_roots.unwrap_or_else(|| webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(std::sync::Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+/// The connection of one call to `t` by `route`: TCP (to Tor's SOCKS port, then
+/// `CONNECT` with the host as a name, when routed so), then for an `https://`
+/// URL the whole TLS handshake with the URL's host, before any byte of the
+/// request (C-2).
+fn connect(route: &Route, t: &Target<'_>, timeout: Duration) -> anyhow::Result<Conn> {
+    let mut s = match route {
+        Route::Resolve(hostport) => {
+            let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
+            TcpStream::connect_timeout(&addr, timeout)?
+        }
+        Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
+        Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
+    };
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    if let Route::Socks { host, port, .. } = route {
+        socks5_connect(&mut s, host, *port)?;
+    }
+    if !t.tls {
+        return Ok(Conn::Plain(s));
+    }
+    let name = rustls::pki_types::ServerName::try_from(t.host.to_string())
+        .map_err(|_| anyhow::anyhow!("{} is not a TLS server name", t.host))?;
+    let mut tls = rustls::ClientConnection::new(tls_config()?, name)?;
+    while tls.is_handshaking() {
+        tls.complete_io(&mut s).map_err(|e| anyhow::anyhow!("TLS with {}: {e}", t.host))?;
+    }
+    Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(tls, s))))
 }
 
 /// One JSON-RPC call to `url` (`http://host:port[/path]`), plain TCP.
@@ -332,22 +470,9 @@ pub fn call_batch_via(egress: &Egress, url: &str, calls: &[(&str, Value)], timeo
 /// POST `body` (JSON) to `url` by `egress`; the answer's JSON.
 fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer: Option<&str>) -> anyhow::Result<Value> {
     let route = egress.route(url)?;
-    let Target { authority, path, .. } = target(url)?;
-    let mut s = match &route {
-        Route::Resolve(hostport) => {
-            let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
-            TcpStream::connect_timeout(&addr, timeout)?
-        }
-        Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
-        Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
-    };
-    s.set_read_timeout(Some(timeout))?;
-    s.set_write_timeout(Some(timeout))?;
-    if let Route::Socks { host, port, .. } = &route {
-        socks5_connect(&mut s, host, *port)?;
-    }
+    let t = target(url)?;
+    let mut s = connect(&route, &t, timeout)?;
+    let Target { authority, path, .. } = t;
     let hostport = authority;
     let auth = bearer.map(|b| format!("Authorization: Bearer {b}\r\n")).unwrap_or_default();
     let head = format!(
@@ -395,23 +520,16 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
 /// One `GET` of `url` by `egress`, its body read as JSON (a beacon node's REST
 /// API: `Content-Length`, chunked, or to the end of the connection).
 pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Value> {
+    Ok(serde_json::from_slice(&get_bytes_via(egress, url, timeout)?)?)
+}
+
+/// One `GET` of `url` by `egress`, its body as bytes (`Content-Length`, chunked, or to the end of the
+/// connection): a 200 answer only.
+pub fn get_bytes_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let route = egress.route(url)?;
-    let Target { authority, path, .. } = target(url)?;
-    let mut s = match &route {
-        Route::Resolve(hostport) => {
-            let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no address for {hostport}"))?;
-            TcpStream::connect_timeout(&addr, timeout)?
-        }
-        Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
-        Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
-    };
-    s.set_read_timeout(Some(timeout))?;
-    s.set_write_timeout(Some(timeout))?;
-    if let Route::Socks { host, port, .. } = &route {
-        socks5_connect(&mut s, host, *port)?;
-    }
+    let t = target(url)?;
+    let mut s = connect(&route, &t, timeout)?;
+    let Target { authority, path, .. } = t;
     let head = format!(
         "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
     );
@@ -424,7 +542,7 @@ pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Re
         "HTTP error from {url}: {}",
         head.lines().next().unwrap_or("")
     );
-    Ok(serde_json::from_slice(&body)?)
+    Ok(body)
 }
 
 /// The head (lower case) and the body of a whole HTTP answer: `Content-Length`

@@ -44,6 +44,12 @@ k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "st
 # and the vault group's spend authorization (the vault's published secret).
 jetsam_mempool = { path = "../jetsam_mempool" }
 jetsam_gkr = { path = "../jetsam_gkr" }
+# C-2 (audit 2026-11-10): https:// through Tor, TLS end to end with the named server (the web's roots); ring as the
+# provider; both already in the offline registry.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.7"
 
 [dev-dependencies]
 tempfile = "3"
+# C-2: a test certificate for the TLS server of the https:// tests (already in the offline registry)
+rcgen = "=0.13.2"

@@ -320,3 +320,42 @@ fn checked_egress_without_a_domain_refuses_clearnet() {
         crate::rpc::Egress::Onion { socks: "127.0.0.1:9050".parse().unwrap() }
     );
 }
+
+// ---- C-2 (a) (audit 2026-11-10): the feeds pulled over Tor, never pushed ----
+
+/// The mainnet fixture (guardian g3, feed keys g1 and g2) with `feed_listen` and `[feed_onions]`.
+fn feeds_on_mainnet(listen: Option<&str>, onions: &[(&str, &str)]) -> String {
+    let listen = listen.map(|l| format!("feed_listen = \"{l}\"\n")).unwrap_or_default();
+    let text = on_mainnet(&onion_sources(TEXT))
+        .replace("\n[feed_keys]\n", &format!("\n{listen}[feed_keys]\ng2 = \"{}\"\n", "22".repeat(32)));
+    let onions: String = onions.iter().map(|(g, url)| format!("{g} = \"{url}\"\n")).collect();
+    if onions.is_empty() { text } else { format!("{text}\n[feed_onions]\n{onions}") }
+}
+
+/// On a public network a guardian serves its feed read-only on the loopback (behind its onion service) and names the
+/// onion server of every other guardian; without them it does not start. The private rehearsal may keep directories.
+#[test]
+fn c2a_a_public_guardian_serves_its_feed_and_pulls_every_other_over_tor() {
+    let (a, b) = (format!("http://{}.onion:8080", "a".repeat(56)), format!("http://{}.onion", "b".repeat(56)));
+    let refused = |text: &str| GuardianConfig::parse(text).unwrap().feed_transport().unwrap_err().to_string();
+    let e = refused(&feeds_on_mainnet(None, &[("g1", &a), ("g2", &b)]));
+    assert!(e.contains("feed_listen") && e.contains("does not start"), "{e}");
+    let e = refused(&feeds_on_mainnet(Some("127.0.0.1:8080"), &[("g2", &b)]));
+    assert!(e.contains("g1") && e.contains("does not start"), "{e}");
+    let ok = GuardianConfig::parse(&feeds_on_mainnet(Some("127.0.0.1:8080"), &[("g1", &a), ("g2", &b)])).unwrap();
+    let (listen, peers) = ok.feed_transport().unwrap();
+    assert_eq!(listen, Some("127.0.0.1:8080".parse().unwrap()));
+    assert_eq!(peers, vec![(1, a.clone()), (2, b.clone())]);
+    for (listen, onions, why) in [
+        ("0.0.0.0:8080", vec![("g1", a.as_str()), ("g2", b.as_str())], "loopback"),
+        ("127.0.0.1:8080", vec![("g1", a.as_str()), ("g2", "http://feeds.example:80")], "g2"),
+        ("127.0.0.1:8080", vec![("g1", a.as_str()), ("g2", "http://127.0.0.1:8081")], ".onion"),
+        ("127.0.0.1:8080", vec![("g1", a.as_str()), ("g2", b.as_str()), ("g3", a.as_str())], "g3"),
+        ("127.0.0.1:8080", vec![("g1", a.as_str()), ("g2", b.as_str()), ("g9", a.as_str())], "g9"),
+    ] {
+        let e = refused(&feeds_on_mainnet(Some(listen), &onions));
+        assert!(e.contains(why) && e.contains("does not start"), "{listen} {onions:?}: {e}");
+    }
+    // the rehearsal: directories alone still start
+    assert_eq!(GuardianConfig::parse(&onion_sources(TEXT)).unwrap().feed_transport().unwrap(), (None, vec![]));
+}

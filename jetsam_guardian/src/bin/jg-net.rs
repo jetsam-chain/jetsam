@@ -13,6 +13,11 @@
 //! The seeds and the L1 are reached by the configured egress (A4-1, D60):
 //! onion only by default — a loopback IP address directly, a `.onion`
 //! address through Tor's SOCKS port; any other source refuses the start.
+//!
+//! C-2 (a) (audit 2026-11-10): the feeds go over Tor, pulled, never pushed:
+//! `jg-net` serves its own feed read only on `feed_listen` (behind its onion
+//! service) and pulls every other guardian's from its `.onion`
+//! (`feed_onions`) into the local publication point, every 60 s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -279,10 +284,40 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config {} sha256 {}", config.display(), hex::encode(digest)));
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?}"));
+    let (feed_listen, feed_peers) = cfg.feed_transport()?;
     let key_hex = std::fs::read_to_string(cfg.state_dir.join("net").join("feed.key"))?;
     let key = FeedKey::from_secret(jetsam_guardian::parse32(key_hex.trim())?);
     let keys = cfg.feed_keys()?;
     anyhow::ensure!(keys.get(&cfg.index) == Some(&key.public()), "the feed key is not the configured one for g{}", cfg.index);
+    // C-2 (a): the local publication point, served read only (behind the onion service) and filled by the pulls
+    let local_point = cfg.publication_points.first().cloned();
+    if let Some(listen) = feed_listen {
+        let root = local_point.clone().ok_or_else(|| anyhow::anyhow!("feed_listen needs a publication point (the local one it serves)"))?;
+        let bound = jetsam_guardian::onion_feed::serve(&listen.to_string(), root)?;
+        log(&format!("feed served read only on {bound} (C-2: behind this guardian's onion service)"));
+    }
+    if let (Some(point), false) = (local_point, feed_peers.is_empty()) {
+        let (egress, keys) = (egress, keys.clone());
+        log(&format!("pulling the feeds of {} guardians over Tor every 60 s", feed_peers.len()));
+        std::thread::spawn(move || {
+            while !STOP.load(Ordering::SeqCst) {
+                let now = now_unix();
+                for (g, url) in &feed_peers {
+                    for day in [utc_day(now), utc_day(now.saturating_sub(86_400))] {
+                        if let Err(e) = jetsam_guardian::onion_feed::pull_feed(&egress, url, *g, &day, &keys, &point, Duration::from_secs(60)) {
+                            log(&format!("feed of g{g} ({day}) not pulled: {e:#}"));
+                        }
+                    }
+                }
+                for _ in 0..300 {
+                    if STOP.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+    }
     let mut inst = [0u8; 16];
     getrandom::getrandom(&mut inst).map_err(|e| anyhow::anyhow!("{e}"))?;
     let domain = cfg.domain()?;

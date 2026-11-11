@@ -427,6 +427,26 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}bogus = 1\n"))).is_err(), "unknown field");
 }
 
+/// E-10 (audit 2026-11-10): the relayer reads the network's deposits with its build's v1.7 clock (`VaultRules::current`,
+/// as `jg-fill`'s `FillConfig::build_matches`): the configuration's F must be the build's; a stale build (D104,
+/// F moved from 9 600 to 8 704) or a build without v1.7 does not start.
+#[test]
+fn e10_a_build_of_another_v1_7_clock_does_not_start() {
+    use jetsam_chain::consensus::vault::VaultRules;
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let c = RelayConfig::parse(&relay_toml(&mainnet, 1, "0x1111111111111111111111111111111111111111", cmd)).unwrap();
+    assert_eq!(c.deposits_from_height, 128);
+    let built = |j: Option<u64>, f: Option<u64>| VaultRules { activation_height: j, deposits_from_height: f, ..VaultRules::current() };
+    assert!(c.build_matches(&built(Some(96), Some(128))).is_ok());
+    for (j, f) in [(Some(96), Some(129)), (Some(96), Some(127)), (None, None)] {
+        let e = c.build_matches(&built(j, f)).unwrap_err().to_string();
+        assert!(e.contains("deposits_from_height 128") && e.contains("v1.7 clock"), "J {j:?} F {f:?}: {e}");
+    }
+    // this build: only where its F is the configuration's
+    assert_eq!(c.build_matches(&VaultRules::current()).is_ok(), VaultRules::current().deposits_from_height == Some(128));
+}
+
 /// A-7 (audit 2026-11-10): the test bridge on Base Sepolia (its verifier, `Sp1RelaySignedTestVerifier`, passes the
 /// relayer's signature of the public values only) is fed this relayer's signatures, the public values still computed
 /// natively first; on no other network nor L1. The empty proofs of before (D103) are refused everywhere.

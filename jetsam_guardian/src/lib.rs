@@ -45,6 +45,7 @@ pub mod l1;
 pub mod l1tx;
 pub mod light_feed;
 pub mod observer;
+pub mod onion_feed;
 pub mod relay;
 pub mod relayer;
 pub mod rpc;
