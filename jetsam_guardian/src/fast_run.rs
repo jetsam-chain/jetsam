@@ -26,6 +26,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use blst::min_pk::SecretKey;
@@ -50,7 +52,7 @@ use jetsam_mempool::destination::{
 };
 use jetsam_poseidon2b::primitives::Address;
 
-use crate::base_capture::{hex20, BaseRpc, Capture, CapturePlan};
+use crate::base_capture::{hex20, BaseRpc, Capture, CapturePlan, PassReport};
 use crate::fast_release::{AssemblyRefusal, Burn};
 
 #[cfg(test)]
@@ -475,11 +477,189 @@ pub fn revoke_cli(args: &[String]) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// The captures, in a thread of their own
+// ---------------------------------------------------------------------------
+
+/// Every this many seconds the captures read Base's head again, in a thread
+/// of their own: a pass, however long (a walk of the ancestors, the
+/// contradictions), never delays them. Public RPCs of Base Sepolia serve
+/// `eth_getProof` about 200 blocks (≈ 40 s) behind their head (measured
+/// 2026-11-10, D159): a proposal block is asked within ≈ 10 s of its
+/// appearance, and again at each tick while it is not captured.
+pub const CAPTURE_TICK_SECONDS: u64 = 10;
+
+/// A proposal block older than this many Base blocks (2 min) that is still
+/// not captured is asked again only while the next proposal block is more
+/// than this many blocks away: a slow retry (an RPC that times out, ≈ 15 s a
+/// try through the router) never delays the capture of a new one.
+pub const CAPTURE_PRIORITY_BLOCKS: u64 = 600;
+
+/// The contradiction search looks among this many newest games (as before).
+pub const CONTRADICTION_WINDOW_GAMES: u64 = 400;
+
+/// What one tick of the captures did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TickReport {
+    /// Base's head (`eth_blockNumber`) the tick read.
+    pub head: u64,
+    /// The burns seen for the first time.
+    pub burns: Vec<BurnSeen>,
+    pub capture: PassReport,
+    /// Old blocks not asked this tick: the next proposal block is near.
+    pub deferred: Vec<u64>,
+}
+
+fn lock(state: &Mutex<RunState>) -> MutexGuard<'_, RunState> {
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One tick of the captures at time `now`: Base's head; the bridge's burns
+/// up to it (kept in `state` and `state_file`); then, once the run knows a
+/// proposal block (`proposal_anchor`), each proposal block of the window
+/// (`interval`, `window`: [`capture_plan`]'s) **at or below that head** not
+/// captured yet, newest first, with the slots of every burn seen up to the
+/// head (a burn is always seen before the proposal block after it is asked);
+/// then the prune. A block above the head is never asked; one older than
+/// [`CAPTURE_PRIORITY_BLOCKS`] is not asked while the next proposal block is
+/// nearer than that (it waits a later tick).
+#[allow(clippy::too_many_arguments)]
+pub fn capture_tick(
+    base: &dyn BaseRpc,
+    bridge: &L1BridgeParams,
+    from_block: u64,
+    interval: u64,
+    window: u64,
+    state: &Mutex<RunState>,
+    state_file: &Path,
+    dir: &Path,
+    now: u64,
+) -> anyhow::Result<TickReport> {
+    let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
+    let mut report = TickReport { head, ..TickReport::default() };
+    let from = lock(state).scanned_to.map_or(from_block, |s| s + 1);
+    if from <= head {
+        let seen = scan_burns(base, &bridge.address, from, head)?;
+        let mut s = lock(state);
+        for b in seen {
+            if s.burns.insert(b.burn.n, b).is_none() {
+                report.burns.push(b);
+            }
+        }
+        s.scanned_to = Some(head);
+        s.store(state_file)?;
+    }
+    let (anchor, burns) = {
+        let s = lock(state);
+        (s.proposal_anchor, s.burns.clone())
+    };
+    let Some(anchor) = anchor else {
+        return Ok(report);
+    };
+    let mut plan = capture_plan(bridge, anchor, &burns);
+    plan.interval = interval;
+    plan.window = window;
+    let kept = crate::base_capture::captured(dir)?;
+    let next = crate::base_capture::proposal_blocks(plan.anchor, plan.interval, head + 1, head + plan.interval).first().copied();
+    let next_is_near = next.is_some_and(|b| b - head <= CAPTURE_PRIORITY_BLOCKS);
+    for block in crate::base_capture::due(plan.anchor, plan.interval, head, plan.window, &kept).into_iter().rev() {
+        if next_is_near && head - block > CAPTURE_PRIORITY_BLOCKS {
+            report.deferred.push(block);
+            continue;
+        }
+        match crate::base_capture::capture_at(base, &plan.address, &plan.slots, block) {
+            Ok(capture) => {
+                crate::base_capture::store(dir, &capture)?;
+                report.capture.captured.push(block);
+            }
+            Err(error) => report.capture.refused.push((block, format!("{error:#}"))),
+        }
+    }
+    report.capture.pruned = crate::base_capture::prune(dir, now)?;
+    Ok(report)
+}
+
+/// Runs `tick` in a thread of its own, one tick every `every` (from the start
+/// of one to the start of the next; at once when one took longer), while
+/// `passes` runs in this thread; `passes` is handed whether the captures
+/// still run (a tick that panicked stops them). The captures stop when
+/// `passes` returns; its result is returned.
+pub fn with_captures<T>(
+    every: Duration,
+    mut tick: impl FnMut() + Send,
+    passes: impl FnOnce(&dyn Fn() -> bool) -> T,
+) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the captures however `passes` ends (a panic too: the scope would wait for them for ever).
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let stop = AtomicBool::new(false);
+    let stop = &stop;
+    std::thread::scope(|s| {
+        let captures = s.spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let started = Instant::now();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut tick)).is_err() {
+                    return;
+                }
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < every {
+                    std::thread::sleep(every.saturating_sub(started.elapsed()).min(Duration::from_millis(100)));
+                }
+            }
+        });
+        let _stop = Stop(stop);
+        let alive = || !captures.is_finished();
+        passes(&alive)
+    })
+}
+
+/// The passes of fast-run, one after the other, `interval` apart (only one
+/// when `once`): each says when it begins and when it ends, with how long it
+/// took and what it did (`pass`'s summary), or why it failed (`on_error`
+/// then keeps what was done; the next pass tries again). Stops when the
+/// captures no longer run.
+pub fn run_passes(
+    say: &dyn Fn(&str),
+    pass: &mut dyn FnMut(u64) -> anyhow::Result<String>,
+    once: bool,
+    interval: Duration,
+    captures_alive: &dyn Fn() -> bool,
+    mut on_error: impl FnMut(),
+) -> anyhow::Result<()> {
+    for number in 1u64.. {
+        if !captures_alive() {
+            bail!("the captures stopped (a tick panicked): fast-run stops, start it again");
+        }
+        let started = Instant::now();
+        say(&format!("pass {number} begins"));
+        match pass(number) {
+            Ok(summary) => say(&format!("pass {number} done in {:.1} s: {summary}", started.elapsed().as_secs_f64())),
+            Err(e) => {
+                say(&format!(
+                    "ALERT FAST_RUN pass {number} failed after {:.1} s: {e:#} (tried again at the next pass; the parents and the game cursor are kept)",
+                    started.elapsed().as_secs_f64()
+                ));
+                on_error();
+            }
+        }
+        if once {
+            break;
+        }
+        std::thread::sleep(interval);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // jg-relay fast-run
 // ---------------------------------------------------------------------------
 
-/// `jg-relay fast-run …`: burns, captures, fast releases and contradictions,
-/// pass after pass.
+/// `jg-relay fast-run …`: burns and captures (their own thread, every
+/// [`CAPTURE_TICK_SECONDS`]), fast releases and contradictions (pass after
+/// pass).
 pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
@@ -510,8 +690,11 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
     };
     let dir = std::path::PathBuf::from(flag(args, "--state-dir").ok_or_else(usage)?);
-    std::fs::create_dir_all(dir.join("captures"))?;
+    let captures = dir.join("captures");
+    std::fs::create_dir_all(&captures)?;
     let state_file = dir.join("fast_run.json");
+    let parents_file = dir.join("ancestors.json");
+    let games_file = dir.join("games.json");
     let from_block: u64 = flag(args, "--from-block").ok_or_else(usage)?.parse()?;
     let interval: u64 = flag(args, "--interval").map(|i| i.parse()).transpose()?.unwrap_or(60);
     let once = args.iter().any(|a| a == "--once");
@@ -521,165 +704,264 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         base_chain_id: rules.base_return.fast.base_chain_id,
         bridge: bridge.address,
     };
-    let mut state = RunState::load(&state_file)?;
-    let mut cache = BTreeMap::new();
+    let state = Mutex::new(RunState::load(&state_file)?);
+    // The ancestors' parents (they never change): kept across passes, failed passes and restarts.
+    let mut parents = crate::fast::load_parents(&parents_file).unwrap_or_else(|e| {
+        say(&format!("ALERT FAST the parents kept in {} are unreadable ({e:#}): read again", parents_file.display()));
+        crate::fast::ParentCache::new()
+    });
+    // The factory's games (address and Base block, they never change): the contradiction search's.
+    let mut games = crate::fast::load_games(&games_file).unwrap_or_else(|e| {
+        say(&format!("ALERT FAST the games kept in {} are unreadable ({e:#}): read again", games_file.display()));
+        crate::fast::GameCache::new()
+    });
     say(&format!(
-        "relay key 0x{}, bridge 0x{}, {} Base RPCs, state {}",
+        "relay key 0x{}, bridge 0x{}, {} Base RPCs, state {}, parents of {} games known, captures every {CAPTURE_TICK_SECONDS} s",
         hex::encode(secret.sk_to_pk().compress()),
         hex::encode(bridge.address),
         bases.len(),
-        state_file.display()
+        state_file.display(),
+        parents.len()
     ));
-    loop {
-        let mut pass = || -> anyhow::Result<()> {
-            // 1. Burns, up to Base's head.
-            let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
-            let from = state.scanned_to.map_or(from_block, |s| s + 1);
-            if from <= head {
-                for seen in scan_burns(base, &bridge.address, from, head)? {
-                    if state.burns.insert(seen.burn.n, seen).is_none() {
+    // Burns and captures (their own thread): what a refused block was told, once per minute at most.
+    let mut refusals: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut failed_ticks = 0u64;
+    let tick = || {
+        let ticked = capture_tick(
+            base,
+            &bridge,
+            from_block,
+            crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
+            crate::base_capture::CAPTURE_WINDOW_BLOCKS,
+            &state,
+            &state_file,
+            &captures,
+            crate::now_unix(),
+        );
+        match ticked {
+            Ok(report) => {
+                failed_ticks = 0;
+                for seen in &report.burns {
+                    say(&format!(
+                        "burn {} of {} µJTM to 0x{} at Base block {}",
+                        seen.burn.n,
+                        seen.burn.amount,
+                        hex::encode(seen.burn.owner.0),
+                        seen.block
+                    ));
+                }
+                let asked = lock(&state).burns.len();
+                for b in &report.capture.captured {
+                    say(&format!("captured the bridge at Base block {b} ({asked} burns asked; Base head {})", report.head));
+                    refusals.remove(b);
+                }
+                for (b, why) in &report.capture.refused {
+                    let tries = refusals.entry(*b).or_insert(0);
+                    *tries += 1;
+                    if *tries == 1 || *tries % 6 == 0 {
                         say(&format!(
-                            "burn {} of {} µJTM to 0x{} at Base block {}",
-                            seen.burn.n,
-                            seen.burn.amount,
-                            hex::encode(seen.burn.owner.0),
-                            seen.block
+                            "ALERT FAST CAPTURE {b}: {why} (try {tries}, Base head {}; tried again every {CAPTURE_TICK_SECONDS} s while in the window)",
+                            report.head
                         ));
                     }
                 }
-                state.scanned_to = Some(head);
+                refusals.retain(|b, _| report.capture.refused.iter().any(|(r, _)| r == b));
             }
-            // 2. The finalized L1 block (a finality update) and the newest game.
-            let finality = crate::light_feed::fetch_finality(&beacon, &l1, crate::light_feed::SEPOLIA_GLOAS_FORK_EPOCH)?;
-            let update = jetsam_chain::consensus::destination::ssz::LightClientFinalityUpdate::decode_payload(&finality)
-                .map_err(|e| anyhow!("{e:?}"))?;
-            let l1_block = jetsam_chain::consensus::destination::light_client::finalized_execution(&update)
-                .map_err(|e| anyhow!("{e:?}"))?;
-            let count = crate::fast::game_count(&l1, &params, l1_block.block_number)?;
-            if state.proposal_anchor.is_none() && count > 0 {
-                state.proposal_anchor = Some(crate::fast::read_game(&l1, &params, count - 1, l1_block.block_number)?.l2_block);
-            }
-            // 3. Captures, at once, of every proposal block in the window.
-            if let Some(anchor) = state.proposal_anchor {
-                let plan = capture_plan(&bridge, anchor, &state.burns);
-                let report = crate::base_capture::capture_pass(base, &plan, head, crate::now_unix(), &dir.join("captures"))?;
-                for b in &report.captured {
-                    say(&format!("captured the bridge at Base block {b} ({} burns asked)", state.burns.len()));
-                }
-                for (b, why) in &report.refused {
-                    say(&format!("ALERT FAST CAPTURE {b}: {why}"));
+            Err(e) => {
+                failed_ticks += 1;
+                if failed_ticks == 1 || failed_ticks % 6 == 0 {
+                    say(&format!("ALERT FAST CAPTURE tick: {e:#} ({failed_ticks} in a row; tried again every {CAPTURE_TICK_SECONDS} s)"));
                 }
             }
-            // 4. Fast releases: each new game signed, each burn its capture holds, sent once.
-            let next = state.next_game.unwrap_or(count.saturating_sub(1));
-            for index in next..count {
-                let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
-                let mut views = Vec::new();
-                for b in &bases {
-                    match crate::fast::read_base(b, game.l2_block) {
-                        Ok(view) => views.push(view),
-                        Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", b.url)),
-                    }
+        }
+    };
+    let mut pass = |_number: u64| -> anyhow::Result<String> {
+        // 1. The finalized L1 block (a finality update) and the newest game.
+        let finality = crate::light_feed::fetch_finality(&beacon, &l1, crate::light_feed::SEPOLIA_GLOAS_FORK_EPOCH)?;
+        let update = jetsam_chain::consensus::destination::ssz::LightClientFinalityUpdate::decode_payload(&finality)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let l1_block = jetsam_chain::consensus::destination::light_client::finalized_execution(&update)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let count = crate::fast::game_count(&l1, &params, l1_block.block_number)?;
+        if lock(&state).proposal_anchor.is_none() && count > 0 {
+            let anchor = crate::fast::read_game(&l1, &params, count - 1, l1_block.block_number)?.l2_block;
+            let mut s = lock(&state);
+            s.proposal_anchor = Some(anchor);
+            s.store(&state_file)?;
+        }
+        // 2. Fast releases: each new game signed, each burn its capture holds, sent once. The cursor is kept
+        //    after each game: a failed pass starts again at the game it failed on.
+        let next = lock(&state).next_game.unwrap_or(count.saturating_sub(1));
+        let advance = |index: u64| -> anyhow::Result<()> {
+            let mut s = lock(&state);
+            s.next_game = Some(index + 1);
+            s.store(&state_file)
+        };
+        let (mut signed, mut released) = (0usize, 0usize);
+        for index in next..count {
+            let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
+            let mut views = Vec::new();
+            for b in &bases {
+                match crate::fast::read_base(b, game.l2_block) {
+                    Ok(view) => views.push(view),
+                    Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", b.url)),
                 }
-                let ancestors = crate::fast::read_ancestors(&l1, &params, game.parent, "latest", crate::now_unix(), &mut cache)?;
-                let statement = match crate::fast::judge(&game, &params, &views, &ancestors, &domain) {
-                    Ok(s) => s,
-                    Err(why) => {
-                        say(&format!("game #{index} not signed: {why}"));
-                        state.next_game = Some(index + 1);
+            }
+            parents.insert(game.game, game.parent);
+            games.insert(index, (game.game, game.l2_block));
+            let ancestors = crate::fast::walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |p| {
+                if let Err(e) = crate::fast::store_parents(&parents_file, p) {
+                    say(&format!("ALERT FAST the parents not kept in {}: {e:#}", parents_file.display()));
+                }
+            })?;
+            let statement = match crate::fast::judge(&game, &params, &views, &ancestors, &domain) {
+                Ok(s) => s,
+                Err(why) => {
+                    say(&format!("game #{index} not signed: {why}"));
+                    advance(index)?;
+                    continue;
+                }
+            };
+            signed += 1;
+            let attestation = crate::fast::sign(&statement, &secret);
+            let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
+                say(&format!("ALERT FAST CAPTURE game #{index}: no capture of its Base block {}", game.l2_block));
+                advance(index)?;
+                continue;
+            };
+            let burns = {
+                let s = lock(&state);
+                let skip: BTreeSet<u64> = s.sent.keys().copied().collect();
+                payable_burns(&s.burns, &capture, &bridge, &skip)
+            };
+            if !burns.is_empty() {
+                let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
+                for burn in burns {
+                    let advances = node.client.call("getAdvances", json!([burn.n, burn.owner.to_bech32(), burn.amount]))?;
+                    if advances["released"].as_bool() == Some(true) {
+                        let mut s = lock(&state);
+                        s.sent.insert(burn.n, crate::now_unix());
+                        s.store(&state_file)?;
                         continue;
                     }
-                };
-                let attestation = crate::fast::sign(&statement, &secret);
-                let Some(capture) = crate::base_capture::load(&dir.join("captures"), game.l2_block)? else {
-                    say(&format!("ALERT FAST CAPTURE game #{index}: no capture of its Base block {}", game.l2_block));
-                    state.next_game = Some(index + 1);
+                    match crate::fast_release::assemble(&finality, &proof, &capture, &burn, &attestation, &rules)
+                        .map_err(|why| anyhow!("{why}"))
+                        .and_then(|objects| crate::fast_release::release_with(&node.client, &rules, &objects, &burn, None))
+                    {
+                        Ok(summary) => {
+                            say(&format!("SENT fast release of burn {} under game #{index}: {summary}", burn.n));
+                            released += 1;
+                            let mut s = lock(&state);
+                            s.sent.insert(burn.n, crate::now_unix());
+                            s.store(&state_file)?;
+                        }
+                        Err(e) => say(&format!("ALERT FAST_RELEASE burn {} game #{index}: {e:#}", burn.n)),
+                    }
+                }
+            }
+            advance(index)?;
+        }
+        // 3. Contradictions: each fast release kept, under the newest game Base holds valid.
+        use crate::light_feed::FeedNode;
+        let lane = node.client.call("getFastLane", json!([]))?;
+        let open: Vec<FastPaid> = {
+            let s = lock(&state);
+            fast_paid_of(&lane)?
+                .into_iter()
+                .filter(|p| !p.contradicted && !s.contradicted.contains(&p.n))
+                .collect()
+        };
+        let open_count = open.len();
+        if !open.is_empty() {
+            let mut valid = None;
+            // Only the games whose Base block was captured, their status read now (in batches); their address and
+            // block are kept. Which one Base holds valid is decided by its proof, as before.
+            let started = Instant::now();
+            let kept = crate::base_capture::captured(&captures)?;
+            let mut stats = crate::fast::WalkStats::default();
+            let known = games.len();
+            let found = crate::fast::captured_games(
+                &l1,
+                &params,
+                count,
+                CONTRADICTION_WINDOW_GAMES,
+                &format!("0x{:x}", l1_block.block_number),
+                &kept,
+                &mut games,
+                &mut stats,
+            );
+            if let Err(e) = crate::fast::store_games(&games_file, &games) {
+                say(&format!("ALERT FAST the games not kept in {}: {e:#}", games_file.display()));
+            }
+            let found = found?;
+            say(&format!(
+                "contradictions: {open_count} fast releases open; {} of the {CONTRADICTION_WINDOW_GAMES} newest games have a capture, \
+                 their status read in {:.1} s ({} requests, {} calls, {} games read)",
+                found.len(),
+                started.elapsed().as_secs_f64(),
+                stats.requests,
+                stats.calls,
+                games.len().saturating_sub(known)
+            ));
+            for game in found {
+                if game.status != jetsam_chain::consensus::destination::base_read::GAME_STATUS_DEFENDER_WINS {
+                    continue;
+                }
+                let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
                     continue;
                 };
-                let skip: BTreeSet<u64> = state.sent.keys().copied().collect();
-                let burns = payable_burns(&state.burns, &capture, &bridge, &skip);
-                if !burns.is_empty() {
-                    let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
-                    for burn in burns {
-                        let advances = node.client.call("getAdvances", json!([burn.n, burn.owner.to_bech32(), burn.amount]))?;
-                        if advances["released"].as_bool() == Some(true) {
-                            state.sent.insert(burn.n, crate::now_unix());
-                            continue;
-                        }
-                        match crate::fast_release::assemble(&finality, &proof, &capture, &burn, &attestation, &rules)
-                            .map_err(|why| anyhow!("{why}"))
-                            .and_then(|objects| crate::fast_release::release_with(&node.client, &rules, &objects, &burn, None))
-                        {
-                            Ok(summary) => {
-                                say(&format!("SENT fast release of burn {} under game #{index}: {summary}", burn.n));
-                                state.sent.insert(burn.n, crate::now_unix());
-                            }
-                            Err(e) => say(&format!("ALERT FAST_RELEASE burn {} game #{index}: {e:#}", burn.n)),
-                        }
-                    }
+                let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
+                if let Ok(valid_game) = slow_game_under(&l1_block, &params, &proof) {
+                    valid = Some((valid_game, proof, capture));
+                    break;
                 }
-                state.next_game = Some(index + 1);
             }
-            // 5. Contradictions: each fast release kept, under the newest game Base holds valid.
-            use crate::light_feed::FeedNode;
-            let lane = node.client.call("getFastLane", json!([]))?;
-            let open: Vec<FastPaid> = fast_paid_of(&lane)?
-                .into_iter()
-                .filter(|p| !p.contradicted && !state.contradicted.contains(&p.n))
-                .collect();
-            if !open.is_empty() {
-                let mut valid = None;
-                for index in (0..count).rev().take(400) {
-                    let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
-                    if game.status != jetsam_chain::consensus::destination::base_read::GAME_STATUS_DEFENDER_WINS {
-                        continue;
-                    }
-                    let Some(capture) = crate::base_capture::load(&dir.join("captures"), game.l2_block)? else {
-                        continue;
-                    };
-                    let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
-                    if let Ok(valid_game) = slow_game_under(&l1_block, &params, &proof) {
-                        valid = Some((valid_game, proof, capture));
-                        break;
-                    }
-                }
-                if let Some((game, proof, capture)) = valid {
-                    for paid in open {
-                        match contradiction_under(&game, &capture, &paid, &bridge) {
-                            Ok(None) => {}
-                            Ok(Some((preimage, account, contradiction))) => {
-                                say(&format!(
-                                    "ALERT FAST CONTRADICTION n {}: Base's final state under game 0x{} holds another word than the burn paid fast",
-                                    paid.n,
-                                    hex::encode(game.game)
-                                ));
-                                let marker = contradiction_marker(&paid, rules.base_return.fast.release_key);
-                                let sent = node.pay_marker(&marker.0).and_then(|payment| {
-                                    contradiction_intent(&contradiction, &finality, &proof, &preimage, account, payment)
-                                }).and_then(|intent| node.submit(&intent));
-                                match sent {
-                                    Ok(admitted) => {
-                                        say(&format!("SENT the contradiction of n {}: {admitted}", paid.n));
-                                        state.contradicted.insert(paid.n);
-                                    }
-                                    Err(e) => say(&format!("ALERT FAST CONTRADICTION n {} not sent: {e:#}", paid.n)),
+            if let Some((game, proof, capture)) = valid {
+                for paid in open {
+                    match contradiction_under(&game, &capture, &paid, &bridge) {
+                        Ok(None) => {}
+                        Ok(Some((preimage, account, contradiction))) => {
+                            say(&format!(
+                                "ALERT FAST CONTRADICTION n {}: Base's final state under game 0x{} holds another word than the burn paid fast",
+                                paid.n,
+                                hex::encode(game.game)
+                            ));
+                            let marker = contradiction_marker(&paid, rules.base_return.fast.release_key);
+                            let sent = node.pay_marker(&marker.0).and_then(|payment| {
+                                contradiction_intent(&contradiction, &finality, &proof, &preimage, account, payment)
+                            }).and_then(|intent| node.submit(&intent));
+                            match sent {
+                                Ok(admitted) => {
+                                    say(&format!("SENT the contradiction of n {}: {admitted}", paid.n));
+                                    let mut s = lock(&state);
+                                    s.contradicted.insert(paid.n);
+                                    s.store(&state_file)?;
                                 }
+                                Err(e) => say(&format!("ALERT FAST CONTRADICTION n {} not sent: {e:#}", paid.n)),
                             }
-                            Err(why) => say(&format!("ALERT FAST CONTRADICTION n {}: {why}", paid.n)),
                         }
+                        Err(why) => say(&format!("ALERT FAST CONTRADICTION n {}: {why}", paid.n)),
                     }
                 }
             }
-            state.store(&state_file)?;
-            Ok(())
-        };
-        if let Err(e) = pass() {
-            say(&format!("ALERT FAST_RUN {e:#} (tried again at the next pass)"));
-            let _ = state.store(&state_file);
         }
-        if once {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_secs(interval));
+        lock(&state).store(&state_file)?;
+        Ok(format!(
+            "L1 finalized block {}, games #{next}..#{count} judged ({signed} signed, {released} sent), {open_count} fast releases open",
+            l1_block.block_number
+        ))
+    };
+    let on_error = || {
+        let _ = lock(&state).store(&state_file);
+    };
+    let every = Duration::from_secs(interval);
+    if once {
+        // One tick of the captures, then one pass, in this thread.
+        let mut tick = tick;
+        tick();
+        return run_passes(&say, &mut pass, true, every, &|| true, on_error);
     }
+    with_captures(Duration::from_secs(CAPTURE_TICK_SECONDS), tick, |captures_alive| {
+        run_passes(&say, &mut pass, false, every, captures_alive, on_error)
+    })
 }

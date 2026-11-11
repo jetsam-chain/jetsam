@@ -45,7 +45,7 @@ use crate::base_capture::{hex20, hex32_of, BaseRpc};
 
 #[cfg(test)]
 #[path = "fast_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Fewest independent Base RPCs a root is recomputed from.
 pub const MIN_BASE_RPCS: usize = 2;
@@ -532,46 +532,357 @@ pub fn read_ancestor(
     ))
 }
 
-/// How long the relay trusts its reading of an ancestor still in progress
-/// (a resolved one's verdict never changes).
-pub const ANCESTOR_REREAD_SECONDS: u64 = 600;
+/// Ancestors read in one JSON-RPC batch (two calls each: `status()` and
+/// `isGameBlacklisted`; a third, `parentAddress()`, for the one whose
+/// parent is not known yet).
+pub const ANCESTOR_BATCH: usize = 50;
 
-/// What the relay keeps of the ancestors it read: the view, the parent, when.
-pub type AncestorCache = BTreeMap<[u8; 20], (AncestorView, [u8; 20], u64)>;
+/// The parents of the games the relay walked. A game's `parentAddress()` is
+/// set when it is created and never changes (an immutable argument of the
+/// clone, in none of its storage slots: measured on game #30 081 of Base
+/// Sepolia), so it is read once and kept, across passes, failed passes and
+/// restarts ([`load_parents`], [`store_parents`]). NOTHING else of an
+/// ancestor is kept: its status and its blacklisting can change, and every
+/// walk reads them again ([`read_ancestors`]).
+pub type ParentCache = BTreeMap<[u8; 20], [u8; 20]>;
 
-/// The ancestors of a game up to the first one resolved `DEFENDER_WINS`
-/// (included), at most [`MAX_ANCESTOR_DEPTH`], read at the L1 block `tag`;
-/// `cache` keeps what was read at `now` (an ancestor in progress is read
-/// again after [`ANCESTOR_REREAD_SECONDS`]).
+/// What one walk did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// Ancestors read (their status and blacklisting, in this walk).
+    pub ancestors: usize,
+    /// Requests sent (a batch is one).
+    pub requests: usize,
+    /// `eth_call`s asked.
+    pub calls: usize,
+    /// Parents read (not known before the walk).
+    pub parents_read: usize,
+    /// Batches the endpoint refused, asked again one call at a time.
+    pub batches_refused: usize,
+}
+
+/// `calls` (`eth_call` objects at the L1 block `tag`) in one batch, or one by
+/// one when the endpoint refuses the batch; their answers' bytes, in order.
+pub fn call_many(
+    rpc: &dyn BaseRpc,
+    calls: &[([u8; 20], Vec<u8>)],
+    tag: &str,
+    stats: &mut WalkStats,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let params: Vec<Value> = calls
+        .iter()
+        .map(|(to, data)| {
+            json!([{"to": format!("0x{}", hex::encode(to)), "data": format!("0x{}", hex::encode(data))}, tag])
+        })
+        .collect();
+    let batch: Vec<(&str, Value)> = params.iter().map(|p| ("eth_call", p.clone())).collect();
+    stats.calls += calls.len();
+    stats.requests += 1;
+    let answers = match rpc.rpc_batch(&batch) {
+        Ok(answers) if answers.len() == calls.len() => answers,
+        _ => {
+            stats.batches_refused += 1;
+            let mut answers = Vec::with_capacity(calls.len());
+            for (method, p) in batch {
+                stats.requests += 1;
+                answers.push(rpc.rpc(method, p)?);
+            }
+            answers
+        }
+    };
+    answers
+        .iter()
+        .map(|v| {
+            let text = v.as_str().ok_or_else(|| anyhow!("eth_call: not bytes"))?;
+            Ok(hex::decode(text.trim_start_matches("0x"))?)
+        })
+        .collect()
+}
+
+/// The ancestors of a game, from its `parent` up to the first one resolved
+/// (`DEFENDER_WINS` or `CHALLENGER_WINS`, included), at most
+/// [`MAX_ANCESTOR_DEPTH`], read at the L1 block `tag`.
+///
+/// **Freshness**: the status and the blacklisting of every ancestor returned
+/// are read in THIS walk (never kept from an earlier one); only the parents
+/// are taken from `parents` (and the ones read added to it). They are read
+/// [`ANCESTOR_BATCH`] at a time along the parents known (a stretch may read
+/// a few games past the one the walk stops at: harmless), one at a time,
+/// with its parent, where no parent is known. `progress` is told after each
+/// ancestor read.
 pub fn read_ancestors(
     l1: &dyn BaseRpc,
     params: &BaseParams,
     parent: [u8; 20],
     tag: &str,
-    now: u64,
-    cache: &mut AncestorCache,
-) -> anyhow::Result<Vec<AncestorView>> {
+    parents: &mut ParentCache,
+    progress: &mut dyn FnMut(&WalkStats, &ParentCache),
+) -> anyhow::Result<(Vec<AncestorView>, WalkStats)> {
+    let mut stats = WalkStats::default();
     let mut out = Vec::new();
     let mut at = parent;
     while at != [0u8; 20] && out.len() < MAX_ANCESTOR_DEPTH {
-        let fresh = |read_at: u64, status: u8| {
-            status != GAME_STATUS_IN_PROGRESS || read_at + ANCESTOR_REREAD_SECONDS > now
-        };
-        let (view, next) = match cache.get(&at) {
-            Some((view, next, read_at)) if fresh(*read_at, view.status) => (*view, *next),
-            _ => {
-                let (view, next) = read_ancestor(l1, params, &at, tag)?;
-                cache.insert(at, (view, next, now));
-                (view, next)
+        // The next stretch: along the parents known, at most a batch.
+        let mut stretch = vec![at];
+        while stretch.len() < ANCESTOR_BATCH && out.len() + stretch.len() < MAX_ANCESTOR_DEPTH {
+            match parents.get(stretch.last().expect("one")) {
+                Some(p) if *p != [0u8; 20] => stretch.push(*p),
+                _ => break,
+            }
+        }
+        let last = *stretch.last().expect("one");
+        // A lone game whose parent is not known (a walk where none is): its parent in the same request.
+        let with_parent = stretch.len() == 1 && !parents.contains_key(&last);
+        let mut calls = Vec::with_capacity(2 * stretch.len() + 1);
+        for game in &stretch {
+            calls.push((*game, selector("status()").to_vec()));
+            let mut data = selector("isGameBlacklisted(address)").to_vec();
+            data.extend_from_slice(&word_address(game));
+            calls.push((params.anchor_state_registry, data));
+        }
+        if with_parent {
+            calls.push((last, selector("parentAddress()").to_vec()));
+        }
+        let answers = call_many(l1, &calls, tag, &mut stats)?;
+        if with_parent {
+            parents.insert(last, address_of(&word_at(&answers[2 * stretch.len()], 0)?));
+            stats.parents_read += 1;
+        }
+        for (i, game) in stretch.iter().enumerate() {
+            let view = AncestorView {
+                game: *game,
+                status: u64_of(&word_at(&answers[2 * i], 0)?)? as u8,
+                blacklisted: u64_of(&word_at(&answers[2 * i + 1], 0)?)? != 0,
+            };
+            out.push(view);
+            stats.ancestors += 1;
+            progress(&stats, parents);
+            if view.status == GAME_STATUS_DEFENDER_WINS || view.status == GAME_STATUS_CHALLENGER_WINS {
+                return Ok((out, stats));
+            }
+        }
+        // The walk goes on past the stretch: the parent of its last game (read now if not known).
+        at = match parents.get(&last) {
+            Some(p) => *p,
+            None => {
+                let answer = call_many(l1, &[(last, selector("parentAddress()").to_vec())], tag, &mut stats)?;
+                let p = address_of(&word_at(&answer[0], 0)?);
+                parents.insert(last, p);
+                stats.parents_read += 1;
+                p
             }
         };
-        out.push(view);
-        if view.status == GAME_STATUS_DEFENDER_WINS || view.status == GAME_STATUS_CHALLENGER_WINS {
-            break;
+    }
+    Ok((out, stats))
+}
+
+/// The factory's games the relay read: index → (game, its Base block). The
+/// factory only appends (`gameAtIndex(i)` never changes) and a game's
+/// `l2SequenceNumber()` is an argument of its clone: read once and kept,
+/// across passes and restarts ([`load_games`], [`store_games`]). A game's
+/// status is NEVER kept ([`captured_games`] reads it in every call).
+pub type GameCache = BTreeMap<u64, ([u8; 20], u64)>;
+
+/// Calls per batch of the contradiction search.
+pub const GAME_BATCH: usize = 50;
+
+/// A game whose Base block the relay captured, its status read in this call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedGame {
+    pub index: u64,
+    pub game: [u8; 20],
+    pub l2_block: u64,
+    pub status: u8,
+}
+
+/// The games of the contradiction search, newest first: among the `window`
+/// newest of the `count` the factory holds, those whose Base block is in
+/// `kept` (a capture), each with its status read NOW at the L1 block `tag`.
+/// The game and the Base block of an index not in `games` are read first (in
+/// batches of [`GAME_BATCH`]) and added to it; the statuses are read in
+/// batches too, and only those. Which game Base holds valid is decided by its
+/// proof (`slow_game_under`), never by this reading.
+#[allow(clippy::too_many_arguments)]
+pub fn captured_games(
+    l1: &dyn BaseRpc,
+    params: &BaseParams,
+    count: u64,
+    window: u64,
+    tag: &str,
+    kept: &std::collections::BTreeSet<u64>,
+    games: &mut GameCache,
+    stats: &mut WalkStats,
+) -> anyhow::Result<Vec<CapturedGame>> {
+    let indices: Vec<u64> = (count.saturating_sub(window)..count).rev().collect();
+    let unknown: Vec<u64> = indices.iter().copied().filter(|i| !games.contains_key(i)).collect();
+    for chunk in unknown.chunks(GAME_BATCH) {
+        let at: Vec<([u8; 20], Vec<u8>)> = chunk
+            .iter()
+            .map(|i| {
+                let mut data = selector("gameAtIndex(uint256)").to_vec();
+                data.extend_from_slice(&word_u64(*i));
+                (params.dispute_game_factory, data)
+            })
+            .collect();
+        let addresses = call_many(l1, &at, tag, stats)?
+            .iter()
+            .map(|a| Ok(address_of(&word_at(a, 2)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let asked: Vec<([u8; 20], Vec<u8>)> = addresses
+            .iter()
+            .map(|g| (*g, selector("l2SequenceNumber()").to_vec()))
+            .collect();
+        let blocks = call_many(l1, &asked, tag, stats)?;
+        for ((index, game), block) in chunk.iter().zip(&addresses).zip(&blocks) {
+            games.insert(*index, (*game, u64_of(&word_at(block, 0)?)?));
         }
-        at = next;
+    }
+    let candidates: Vec<(u64, [u8; 20], u64)> = indices
+        .iter()
+        .filter_map(|i| games.get(i).map(|(game, block)| (*i, *game, *block)))
+        .filter(|(_, _, block)| kept.contains(block))
+        .collect();
+    let mut out = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(GAME_BATCH) {
+        let asked: Vec<([u8; 20], Vec<u8>)> = chunk
+            .iter()
+            .map(|(_, game, _)| (*game, selector("status()").to_vec()))
+            .collect();
+        for ((index, game, l2_block), status) in chunk.iter().zip(call_many(l1, &asked, tag, stats)?) {
+            out.push(CapturedGame {
+                index: *index,
+                game: *game,
+                l2_block: *l2_block,
+                status: u64_of(&word_at(&status, 0)?)? as u8,
+            });
+        }
     }
     Ok(out)
+}
+
+/// The games kept in `path` (none when there is no file yet).
+pub fn load_games(path: &Path) -> anyhow::Result<GameCache> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GameCache::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let mut out = GameCache::new();
+    for entry in v["games"]
+        .as_array()
+        .ok_or_else(|| anyhow!("{}: no games", path.display()))?
+    {
+        let index = entry[0].as_u64().ok_or_else(|| anyhow!("{}: a game without index", path.display()))?;
+        let block = entry[2].as_u64().ok_or_else(|| anyhow!("{}: a game without block", path.display()))?;
+        out.insert(index, (hex20(entry[1].as_str().unwrap_or_default())?, block));
+    }
+    Ok(out)
+}
+
+/// Keep `games` in `path` (written then renamed).
+pub fn store_games(path: &Path, games: &GameCache) -> anyhow::Result<()> {
+    let v = json!({
+        "what": "factory index -> (game, l2SequenceNumber()) (never change); no status is kept",
+        "games": games
+            .iter()
+            .map(|(i, (g, b))| json!([i, format!("0x{}", hex::encode(g)), b]))
+            .collect::<Vec<_>>(),
+    });
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// A walk says how far it is every this many ancestors read.
+pub const WALK_LOG_EVERY: usize = 50;
+
+/// [`read_ancestors`] (at the latest L1 block) with its journal: a line when
+/// the walk of game #`index` begins, one every [`WALK_LOG_EVERY`] ancestors
+/// read, one when it ends (how many, how long, how many requests); `keep` is
+/// handed the parents at each of those lines and at the end, failed or not
+/// (what was read is never lost).
+pub fn walk_ancestors_logged(
+    l1: &dyn BaseRpc,
+    params: &BaseParams,
+    index: u64,
+    parent: [u8; 20],
+    parents: &mut ParentCache,
+    say: &dyn Fn(&str),
+    keep: &mut dyn FnMut(&ParentCache),
+) -> anyhow::Result<Vec<AncestorView>> {
+    let started = std::time::Instant::now();
+    say(&format!(
+        "game #{index}: walking its ancestors from 0x{} ({} parents known)",
+        hex::encode(parent),
+        parents.len()
+    ));
+    let result = read_ancestors(l1, params, parent, "latest", parents, &mut |stats, parents| {
+        if stats.ancestors % WALK_LOG_EVERY == 0 {
+            say(&format!(
+                "game #{index}: {} ancestors read in {:.1} s ({} requests)",
+                stats.ancestors,
+                started.elapsed().as_secs_f64(),
+                stats.requests
+            ));
+            keep(parents);
+        }
+    });
+    keep(parents);
+    let secs = started.elapsed().as_secs_f64();
+    match &result {
+        Ok((views, stats)) => say(&format!(
+            "game #{index}: {} ancestors walked in {secs:.1} s ({} requests, {} calls, {} parents read, {} batches refused), the last {}",
+            views.len(),
+            stats.requests,
+            stats.calls,
+            stats.parents_read,
+            stats.batches_refused,
+            views
+                .last()
+                .map(|v| format!("0x{} status {} blacklisted {}", hex::encode(v.game), v.status, v.blacklisted))
+                .unwrap_or_else(|| "none".into())
+        )),
+        Err(e) => say(&format!("game #{index}: the walk of its ancestors failed after {secs:.1} s: {e:#}")),
+    }
+    result.map(|(views, _)| views)
+}
+
+/// The parents kept in `path` (none when there is no file yet).
+pub fn load_parents(path: &Path) -> anyhow::Result<ParentCache> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ParentCache::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let mut out = ParentCache::new();
+    for pair in v["parents"]
+        .as_array()
+        .ok_or_else(|| anyhow!("{}: no parents", path.display()))?
+    {
+        out.insert(
+            hex20(pair[0].as_str().unwrap_or_default())?,
+            hex20(pair[1].as_str().unwrap_or_default())?,
+        );
+    }
+    Ok(out)
+}
+
+/// Keep `parents` in `path` (written then renamed).
+pub fn store_parents(path: &Path, parents: &ParentCache) -> anyhow::Result<()> {
+    let v = json!({
+        "what": "game -> parentAddress() (never changes); nothing else of an ancestor is kept",
+        "parents": parents
+            .iter()
+            .map(|(g, p)| json!([format!("0x{}", hex::encode(g)), format!("0x{}", hex::encode(p))]))
+            .collect::<Vec<_>>(),
+    });
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// What one Base RPC serves for `l2_block`.
@@ -633,7 +944,8 @@ pub fn dry_run_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
             "fast-dry-run --l1 <url> --base <url> --base <url> [--base <url>…] --bridge <0x…20> --journal <file> \
-             [--games <n newest, 3>] [--key-label <label>] [--watch-seconds <s>] [--capture-dir <dir> --proposal-anchor <L2 block>]"
+             [--games <n newest, 3>] [--key-label <label>] [--watch-seconds <s>] [--capture-dir <dir> --proposal-anchor <L2 block>] \
+             [--parents <file: the ancestors' parents, kept>]"
         )
     };
     let value = |flag: &str| {
@@ -685,7 +997,12 @@ pub fn dry_run_cli(args: &[String]) -> anyhow::Result<()> {
         bases.len(),
         hex::encode(bridge)
     ));
-    let mut cache = BTreeMap::new();
+    // The parents of the ancestors, kept in --parents <file> when given (a later run reads none of them again).
+    let parents_file = value("--parents").map(std::path::PathBuf::from);
+    let mut parents = match &parents_file {
+        Some(path) => load_parents(path)?,
+        None => ParentCache::new(),
+    };
     let mut seen = std::collections::BTreeSet::new();
     let started = crate::now_unix();
     let mut first = true;
@@ -747,14 +1064,14 @@ pub fn dry_run_cli(args: &[String]) -> anyhow::Result<()> {
                         Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", base.url)),
                     }
                 }
-                let ancestors = read_ancestors(
-                    &l1,
-                    &params,
-                    game.parent,
-                    "latest",
-                    crate::now_unix(),
-                    &mut cache,
-                )?;
+                parents.insert(game.game, game.parent);
+                let ancestors = walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |p| {
+                    if let Some(path) = &parents_file {
+                        if let Err(e) = store_parents(path, p) {
+                            say(&format!("ALERT FAST the parents not kept in {}: {e:#}", path.display()));
+                        }
+                    }
+                })?;
                 let verdict =
                     judge(&game, &params, &views, &ancestors, &domain).map(|s| sign(&s, &secret));
                 let mut line = journal_line(index, &game, &verdict);

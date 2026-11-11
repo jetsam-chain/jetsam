@@ -761,15 +761,8 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
             Err(e) => say(&format!("ALERT FAST_RELEASE BASE_RPC {}: {e:#}", base.url)),
         }
     }
-    let mut cache = std::collections::BTreeMap::new();
-    let ancestors = crate::fast::read_ancestors(
-        &l1,
-        &params,
-        game.parent,
-        "latest",
-        crate::now_unix(),
-        &mut cache,
-    )?;
+    let mut parents = crate::fast::ParentCache::new();
+    let ancestors = crate::fast::walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |_| {})?;
     let statement: FastStatement = crate::fast::judge(&game, &params, &views, &ancestors, &domain)
         .map_err(|why| alert(format!("game #{index} not signed: {why}")))?;
     let attestation = crate::fast::sign(&statement, &secret);

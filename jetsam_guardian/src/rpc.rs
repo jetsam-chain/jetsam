@@ -288,9 +288,51 @@ pub fn call_via_bearer(
     timeout: Duration,
     bearer: Option<&str>,
 ) -> anyhow::Result<Value> {
+    let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))?;
+    let v = post_json(egress, url, &body, timeout, bearer)?;
+    if let Some(e) = v.get("error") {
+        anyhow::bail!("{method}: {}", e.get("message").and_then(|m| m.as_str()).unwrap_or(&e.to_string()));
+    }
+    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Several JSON-RPC calls to `url` by `egress` in ONE request (a JSON-RPC
+/// batch): their results, in the order of `calls`. An answer that is not a
+/// list holding exactly one answer per call (matched by `id`), or any call
+/// answered with an error, is an error (the caller may ask the calls one by
+/// one instead).
+pub fn call_batch_via(egress: &Egress, url: &str, calls: &[(&str, Value)], timeout: Duration) -> anyhow::Result<Vec<Value>> {
+    let batch: Vec<Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(id, (method, params))| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+        .collect();
+    let v = post_json(egress, url, &serde_json::to_vec(&batch)?, timeout, None)?;
+    let answers = v.as_array().ok_or_else(|| {
+        let text: String = v.to_string().chars().take(200).collect();
+        anyhow::anyhow!("{url} answered a batch of {} calls with no list: {text}", calls.len())
+    })?;
+    anyhow::ensure!(answers.len() == calls.len(), "{url} answered {} of a batch of {} calls", answers.len(), calls.len());
+    let mut out: Vec<Option<Value>> = vec![None; calls.len()];
+    for a in answers {
+        let id = a.get("id").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok());
+        let slot = id
+            .and_then(|i| out.get_mut(i))
+            .filter(|slot| slot.is_none())
+            .ok_or_else(|| anyhow::anyhow!("{url} answered a batch with an unknown or repeated id: {}", a.get("id").cloned().unwrap_or(Value::Null)))?;
+        if let Some(e) = a.get("error") {
+            let method = calls[id.expect("matched")].0;
+            anyhow::bail!("{method} (in a batch): {}", e.get("message").and_then(|m| m.as_str()).unwrap_or(&e.to_string()));
+        }
+        *slot = Some(a.get("result").cloned().unwrap_or(Value::Null));
+    }
+    Ok(out.into_iter().map(|r| r.expect("every id answered once")).collect())
+}
+
+/// POST `body` (JSON) to `url` by `egress`; the answer's JSON.
+fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer: Option<&str>) -> anyhow::Result<Value> {
     let route = egress.route(url)?;
     let Target { authority, path, .. } = target(url)?;
-    let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))?;
     let mut s = match &route {
         Route::Resolve(hostport) => {
             let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
@@ -312,8 +354,10 @@ pub fn call_via_bearer(
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{auth}\r\n",
         body.len()
     );
-    s.write_all(head.as_bytes())?;
-    s.write_all(&body)?;
+    // The head and the body in one write (one segment where they fit: a server that reads once gets both).
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    s.write_all(&request)?;
     let mut raw = Vec::new();
     // read the head, then exactly Content-Length bytes (or to the end)
     let mut buf = [0u8; 65_536];
@@ -345,11 +389,7 @@ pub fn call_via_bearer(
         }
         raw.extend_from_slice(&buf[..n]);
     }
-    let v: Value = serde_json::from_slice(&raw[head_end..])?;
-    if let Some(e) = v.get("error") {
-        anyhow::bail!("{method}: {}", e.get("message").and_then(|m| m.as_str()).unwrap_or(&e.to_string()));
-    }
-    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    Ok(serde_json::from_slice(&raw[head_end..])?)
 }
 
 /// One `GET` of `url` by `egress`, its body read as JSON (a beacon node's REST

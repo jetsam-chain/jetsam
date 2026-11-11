@@ -72,11 +72,22 @@ pub struct Capture {
 /// The JSON-RPC of Base the capture reads.
 pub trait BaseRpc {
     fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value>;
+
+    /// The calls in one JSON-RPC batch, their results in order. An endpoint
+    /// that takes no batch answers an error (the default), and the caller
+    /// asks them one by one ([`crate::fast::call_many`]).
+    fn rpc_batch(&self, calls: &[(&str, Value)]) -> anyhow::Result<Vec<Value>> {
+        bail!("no JSON-RPC batch here ({} calls)", calls.len())
+    }
 }
 
 impl BaseRpc for crate::l1::L1 {
     fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         crate::l1::L1::rpc(self, method, params)
+    }
+
+    fn rpc_batch(&self, calls: &[(&str, Value)]) -> anyhow::Result<Vec<Value>> {
+        crate::rpc::call_batch_via(&self.egress, &self.url, calls, self.timeout)
     }
 }
 
