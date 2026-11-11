@@ -1143,6 +1143,8 @@ fn run() -> anyhow::Result<()> {
         let mut c = NodeClient::fill(&n.rpc, egress);
         let g = c.header(0)?.ok_or_else(|| anyhow::anyhow!("node {} has no block 0", n.name))?;
         anyhow::ensure!(g.id == domain.network, "node {}'s genesis is not the configured network: jg-relay does not start", n.name);
+        // D171, D176: the node applies this build's activations (its blocks are read as it accepts them), or no start
+        jetsam_guardian::activations::require(&c, &n.name, jetsam_guardian::activations::Scope::All, "jg-relay")?;
         genesis.get_or_insert(g);
         nodes.push(c);
     }

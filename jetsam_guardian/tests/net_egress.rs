@@ -1022,6 +1022,8 @@ fn fill_world_live(stock: Arc<AtomicU64>, chain_id: &'static str, min_age: u64) 
         .map(|sig| format!("0x{}", hex::encode(jetsam_guardian::l1::selector(sig))))
         .collect();
     Arc::new(move |method, params| match method {
+        // D171, D176: nodes of this build
+        "jetsam_getActivations" => json!({"result": jetsam_guardian::activations::this_build()}),
         "jetsam_getHeaderByHeight" if params[0] == json!(0) => json!({"result": raw}),
         "jetsam_getBlockHash" if params[0] == json!(0) => json!({"result": id}),
         "jetsam_blockCount" => json!({"result": 0}),
@@ -1103,6 +1105,60 @@ fn jg_fill_reaches_its_nodes_and_l1_through_tor_only_and_refuses_a_stock_above_i
     assert!(seen.lock().unwrap().iter().all(|(atyp, h, ..)| *atyp == 3 && (*h == n1 || *h == n2 || *h == c)), "every target named, through Tor");
     let journal = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
     assert!(journal.contains("\\\"kind\\\":\\\"start\\\""), "{journal}");
+}
+
+/// D171, D176 for the robot: one of its nodes applies another `F`, or knows no `getActivations` (a node older than this
+/// build): jg-fill does not start, the node and the values named; beside two nodes of its build it starts and reads
+/// them. The robot on the private rehearsal's L1 and clearnet (the loopback), with this build's v1.7 clock; a build
+/// without one does not start before (`jg_fill_reaches_its_nodes_…`).
+#[test]
+fn activ_jg_fill_does_not_start_beside_a_node_whose_activations_are_not_its_builds() {
+    let rules = jetsam_chain::consensus::vault::VaultRules::current();
+    let (Some(j), Some(f)) = (rules.activation_height, rules.deposits_from_height) else {
+        eprintln!("SKIPPED: this build has no v1.7 clock, jg-fill does not start");
+        return;
+    };
+    let built = jetsam_guardian::activations::this_build();
+    // the bridge of this build's robot (its D_SLOW: 24 h, 1 h on the public test chain)
+    let world = || fill_world_on(10_000_000_000, "0x7a69", jetsam_guardian::fill::ADVANCE_MIN_AGE);
+    let node = |activations: Option<Value>| -> (u16, Seen) {
+        let inner = world();
+        fake_http(Arc::new(move |method, params| match (method, &activations) {
+            ("jetsam_getActivations", Some(a)) => json!({"result": a}),
+            ("jetsam_getActivations", None) => json!({"error": {"code": -32601, "message": "Method not found"}}),
+            _ => inner(method, params),
+        }))
+    };
+    let mut other_f = built.clone();
+    other_f["deposits_from_height"] = json!(f + 1);
+    let cases = [
+        ("another F", Some(other_f), vec![format!("deposits_from_height = {}", f + 1), format!("this build {f}")]),
+        ("no getActivations", None, vec!["jetsam_getActivations".to_string(), "update the node".to_string()]),
+        ("this build's", Some(built.clone()), vec![]),
+    ];
+    let lo = |p: u16| format!("http://127.0.0.1:{p}");
+    for (label, activations, want) in cases {
+        let ((n1, seen1), (n2, seen2), (l1, _)) = (node(Some(built.clone())), node(activations), fake_http(world()));
+        let (_root, dir) = fill_dir(&hex::encode(testkit::genesis().id), 31_337, &[lo(n1), lo(n2)], &lo(l1), &format!("{REH_PARAMS}{CLEARNET}\n"));
+        let toml = std::fs::read_to_string(dir.join("fill.toml")).unwrap();
+        let toml = toml.replace("v1_7_height = 96\ndeposits_from_height = 128\n", &format!("v1_7_height = {j}\ndeposits_from_height = {f}\n"));
+        std::fs::write(dir.join("fill.toml"), toml).unwrap();
+        if want.is_empty() {
+            let log = std::fs::File::create(dir.join("fill.log")).unwrap();
+            let robot = Command::new(env!("CARGO_BIN_EXE_jg-fill")).arg("--config").arg(dir.join("fill.toml")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log).spawn().unwrap();
+            let read = |s: &Seen| s.lock().unwrap().iter().any(|(.., m)| m == "jetsam_blockCount");
+            let both = wait_for(60, || read(&seen1) && read(&seen2));
+            stop(robot);
+            let log = std::fs::read_to_string(dir.join("fill.log")).unwrap_or_default();
+            assert!(both && !log.contains("does not start"), "{label}: log:\n{log}");
+            continue;
+        }
+        let (code, log) = exit_of(env!("CARGO_BIN_EXE_jg-fill"), &dir.join("fill.toml"), &dir.join("fill.log"));
+        assert_eq!(code, Some(Some(1)), "{label}: log:\n{log}");
+        assert!(log.contains("node n2: ") && want.iter().all(|w| log.contains(w.as_str())) && log.contains("jg-fill does not start"), "{label}: {log}");
+        assert!(!log.contains("node n1: "), "{label}: n1 is this build's: {log}");
+        assert!(!seen2.lock().unwrap().iter().any(|(.., m)| m == "jetsam_blockCount"), "{label}: the refused node is not used");
+    }
 }
 
 /// N9 (a): the hot key's stock is read again at every step: a refill above `max_stock` while the robot runs pauses

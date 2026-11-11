@@ -402,6 +402,9 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
         let mut c = crate::rpc::NodeClient::fill(&n.rpc, egress);
         let g = c.block_hash(0)?.ok_or_else(|| anyhow!("node {} has no block 0: jg-relay watch does not start", n.name))?;
         ensure!(g == domain.network, "node {}'s genesis is not the configured network: jg-relay watch does not start", n.name);
+        // D171, D176: it reads block ids and no deposit: the network the node applies is this build's (with the check
+        // above, the configured network, the node's chain and this build are one), or no start
+        crate::activations::require(&c, &n.name, crate::activations::Scope::Network, "jg-relay watch")?;
         nodes.push(c);
     }
     let bridge = format!("0x{}", hex::encode(domain.l1_bridge));

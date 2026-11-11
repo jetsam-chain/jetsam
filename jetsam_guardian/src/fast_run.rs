@@ -637,6 +637,12 @@ pub fn run_passes(
         say(&format!("pass {number} begins"));
         match pass(number) {
             Ok(summary) => say(&format!("pass {number} done in {:.1} s: {summary}", started.elapsed().as_secs_f64())),
+            // D171, D176: its node's activations are not this build's: no pass is made with it
+            Err(e) if e.is::<crate::activations::Refusal>() => {
+                say(&format!("ALERT FAST_RUN pass {number}: {e:#}: fast-run stops (start one built from the node's version)"));
+                on_error();
+                return Err(e.context("fast-run stops: its node's activations are not this build's"));
+            }
             Err(e) => {
                 say(&format!(
                     "ALERT FAST_RUN pass {number} failed after {:.1} s: {e:#} (tried again at the next pass; the parents and the game cursor are kept)",
@@ -675,9 +681,6 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         .bridge
         .ok_or_else(|| anyhow!("this build has no bridge on Base (the return over Base is not armed): nothing to run"))?;
     let secret = crate::fast::load_fast_secret(Path::new(&flag(args, "--key").ok_or_else(usage)?))?;
-    if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
-        bail!("the key given is not this build's FAST_RELEASE_KEY");
-    }
     let l1 = crate::l1::L1::new(&flag(args, "--l1").ok_or_else(usage)?);
     let bases: Vec<crate::l1::L1> = flags(args, "--base").iter().map(|u| crate::l1::L1::new(u)).collect();
     let base = bases.first().ok_or_else(usage)?;
@@ -685,10 +688,18 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         url: flag(args, "--beacon").ok_or_else(usage)?,
         egress: crate::rpc::Egress::Clearnet,
     };
+    let node_url = flag(args, "--node").ok_or_else(usage)?;
     let node = crate::light_feed::RelayNode {
-        client: crate::rpc::NodeClient::fast_release(&flag(args, "--node").ok_or_else(usage)?, crate::rpc::Egress::Clearnet),
+        client: crate::rpc::NodeClient::fast_release(&node_url, crate::rpc::Egress::Clearnet),
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
     };
+    // D171, D176: the node's activations are this build's, or fast-run does not start (read first: its first socket);
+    // a node silent at the start is not used before they are read (the captures of Base run whatever it says, as before)
+    let mut node = crate::activations::Checked::new(node, &node_url, crate::activations::Scope::All);
+    node.at_start(|n| &n.client, "fast-run", &say)?;
+    if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
+        bail!("the key given is not this build's FAST_RELEASE_KEY");
+    }
     let dir = std::path::PathBuf::from(flag(args, "--state-dir").ok_or_else(usage)?);
     let captures = dir.join("captures");
     std::fs::create_dir_all(&captures)?;
@@ -835,6 +846,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 payable_burns(&s.burns, &capture, &bridge, &skip)
             };
             if !burns.is_empty() {
+                let node = node.get(|n| &n.client)?;
                 let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
                 for burn in burns {
                     let advances = node.client.call("getAdvances", json!([burn.n, burn.owner.to_bech32(), burn.amount]))?;
@@ -863,6 +875,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         }
         // 3. Contradictions: each fast release kept, under the newest game Base holds valid.
         use crate::light_feed::FeedNode;
+        let node = node.get(|n| &n.client)?;
         let lane = node.client.call("getFastLane", json!([]))?;
         let open: Vec<FastPaid> = {
             let s = lock(&state);

@@ -311,6 +311,16 @@ pub trait JetsamApi {
     #[method(name = "getFastLane")]
     async fn get_fast_lane(&self) -> RpcResult<crate::destination::FastLaneResponse>;
 
+    /// v1.7 (D171, D176): the activations this node applies, read from the
+    /// rules its validation reads (never a copy): its network (genesis
+    /// block id), the v1.5 height, `J`, `F`, the vault and D123's caps
+    /// height, the return over Base (`H`, its bridge, the fast lane's keys),
+    /// the guardian rules' heights and group key. A guardian program compares
+    /// them with its own build's before it uses the node. A read: no cookie.
+    #[method(name = "getActivations")]
+    async fn get_activations(&self)
+        -> RpcResult<jetsam_chain::consensus::activations::Activations>;
+
     #[method(name = "getAdvances")]
     async fn get_advances(
         &self,

@@ -32,7 +32,10 @@
 //! - [`wire_limits`]    — Shared wire/memory/decode DoS caps.
 //! - [`destination`]    — v1.7 destination section (0xC2) and its objects.
 //! - [`vault`]          — v1.7 native gate of the bridge vault (V1-V7).
+//! - [`activations`]    — The activations this build applies, as one record
+//!                        (`jetsam_getActivations`, D171, D176).
 
+pub mod activations;
 pub mod checks;
 pub mod conflict;
 pub mod da_prune;

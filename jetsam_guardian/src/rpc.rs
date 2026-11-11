@@ -38,8 +38,9 @@ pub const OBSERVER_ALLOWLIST: &[&str] = &[
     "getVaultState",
 ];
 
-/// The node methods `jg-fill` may call: the observer's, and the raw block (its deposits are read with
-/// the node's own rule from the bytes, checked against the header).
+/// The node methods `jg-fill` (and the relayer, and its watcher) may call: the observer's, the raw block (its deposits
+/// are read with the node's own rule from the bytes, checked against the header), and the activations the node applies
+/// (D171, D176: read at start, `crate::activations`).
 pub const FILL_ALLOWLIST: &[&str] = &[
     "blockCount",
     "getChainInfo",
@@ -54,11 +55,13 @@ pub const FILL_ALLOWLIST: &[&str] = &[
     "getVaultState",
     "getBlock",
     "getDepositBlock",
+    "getActivations",
 ];
 
 /// The node methods the relay's return over Base may call (`fast-release`, `fast-run`, `light-feed`,
 /// `fast-revoke`): public reads (the tip, the vault's floor and slots, the payee of a burn, the light client's
-/// committees, the fast lane, an epoch anchor, slot hints), the submission of its intents, and one wallet
+/// committees, the fast lane, an epoch anchor, slot hints, the activations the node applies: D171, D176), the
+/// submission of its intents, and one wallet
 /// method, with the node's RPC cookie: the payment of a destination object's marker
 /// (`walletBuildDestinationPayment`, which pays nothing but that marker and the fee). Nothing else that
 /// spends, signs with or reveals a wallet.
@@ -71,6 +74,7 @@ pub const FAST_RELEASE_ALLOWLIST: &[&str] = &[
     "getFastLane",
     "getEpochAnchor",
     "getSlotHints",
+    "getActivations",
     "submitDestinationObject",
     "walletBuildDestinationPayment",
 ];
@@ -648,6 +652,20 @@ impl NodeClient {
             anyhow::bail!("method {method} is not in this client's allow-list");
         }
         call_via(&self.egress, &self.url, &format!("jetsam_{method}"), params, self.timeout)
+    }
+
+    /// [`Self::call`]'s answer as the node gave it: its result, or its JSON-RPC error (code and message). An error only
+    /// when no answer was read (refused by the allow-list, not reached, no HTTP 200, no JSON).
+    pub fn answer(&self, method: &str, params: Value) -> anyhow::Result<Result<Value, (i64, String)>> {
+        if !self.allow.contains(&method) {
+            anyhow::bail!("method {method} is not in this client's allow-list");
+        }
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": format!("jetsam_{method}"), "params": params}))?;
+        let v = post_json(&self.egress, &self.url, &body, self.timeout, None)?;
+        Ok(match v.get("error") {
+            Some(e) => Err((e["code"].as_i64().unwrap_or(0), e["message"].as_str().map_or_else(|| e.to_string(), str::to_string))),
+            None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+        })
     }
 
     /// [`Self::call`] with the node's RPC cookie, read from `cookie` at every call (it changes at every
