@@ -147,6 +147,8 @@ struct Bridge {
     tip: [u8; 32],
     /// `pausedUntil()`.
     paused_until: u64,
+    /// `nodeOf(tip)` answers zeros (a contract that names a tip it does not hold).
+    forget_tip_node: bool,
     pool: Vec<Tx>,
     receipts: HashMap<String, Value>,
     /// Race mode: the pool is mined once two accounts have a transaction in it (or 4 s after the first), A's first.
@@ -240,6 +242,7 @@ fn world(race: bool) -> (Arc<Mutex<Chain>>, Arc<Mutex<Bridge>>, Arc<AtomicBool>)
         genesis: g.id(),
         tip: [0; 32],
         paused_until: 0,
+        forget_tip_node: false,
         pool: Vec::new(),
         receipts: HashMap::new(),
         race,
@@ -330,7 +333,7 @@ fn l1_port(bridge: Arc<Mutex<Bridge>>) -> u16 {
                 } else if data.starts_with(&paused_until) {
                     word_hex(&[w64(b.paused_until)])
                 } else if data.starts_with(&node_of) {
-                    match b.points.get(&arg()) {
+                    match b.points.get(&arg()).filter(|_| !(b.forget_tip_node && arg() == b.tip)) {
                         Some((cp, at)) => word_hex(&[w64(cp.height), w64(cp.deposit_count), w64(1), w64(*at), w64(1), w64(cp.locked_height)]),
                         None => word_hex(&[[0; 32]; 6]),
                     }
@@ -731,4 +734,64 @@ fn a2_a_pause_in_flight_at_a_stop_is_not_run_again_at_the_restart() {
     assert_eq!(after_restart, 1, "a second pause at the restart; log:\n{log}");
     assert!(said, "{:?}; log:\n{log}", lines(&dir.join("alert.out")));
     assert_eq!(lines(&pids).len(), 1, "{log}");
+}
+
+/// A-2: the watcher starts only on its network: a node whose block 0 is another network's (none of its blocks would ever
+/// be the contract's: an incident at every point) stops it before any decision, and says why.
+#[test]
+fn a2_the_watcher_does_not_start_on_a_node_of_another_network() {
+    let (chain, bridge, run) = world(false);
+    let other = Arc::new(Mutex::new(Chain::from_genesis(testkit::header([0; 32], 0, 1_700_000_000, testkit::target_bits(20), 9))));
+    let (n0, n1) = (node(chain.clone()), node(other));
+    let port = l1_port(bridge.clone());
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    watch_toml(dir, port, &[n0, n1], "", &format!("echo paused >> {}", dir.join("pause.out").display()));
+    {
+        let c = chain.lock().unwrap();
+        let p = point_off(&c, 22, 0x66);
+        bridge.lock().unwrap().set_tip(p, l1_clock());
+    }
+    let mut w = spawn(dir, &["watch"], "watch");
+    let exited = wait_for(30, || w.try_wait().unwrap().is_some());
+    if !exited {
+        stop(w);
+    } else {
+        let code = w.wait().unwrap().code();
+        assert_eq!(code, Some(1), "{}", read(&dir.join("watch.log")));
+    }
+    run.store(false, Ordering::SeqCst);
+    let log = read(&dir.join("watch.log"));
+    assert!(exited, "it ran with a node of another network; log:\n{log}");
+    assert!(log.contains("n1's genesis is not the configured network") && log.contains("does not start"), "{log}");
+    assert!(lines(&dir.join("pause.out")).is_empty() && lines(&dir.join("alert.out")).is_empty(), "{log}");
+}
+
+/// A-2: an answer of the contract that is not a tip it holds (`nodeOf(tip)` all zeros: no acceptance, no locked height)
+/// is a read error, never a decision: no pause (block 0 is never the tip's locked block) and no alert of a late point
+/// (its age would be the whole L1 clock).
+#[test]
+fn a2_the_watcher_never_decides_on_a_tip_the_contract_does_not_hold() {
+    let (chain, bridge, run) = world(false);
+    let (n0, n1) = (node(chain.clone()), node(chain.clone()));
+    let port = l1_port(bridge.clone());
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    watch_toml(dir, port, &[n0, n1], "", &format!("echo paused >> {}", dir.join("pause.out").display()));
+    {
+        let c = chain.lock().unwrap();
+        let p = point_off(&c, 22, 0x66);
+        let mut b = bridge.lock().unwrap();
+        b.set_tip(p, l1_clock());
+        b.forget_tip_node = true;
+    }
+    let w = spawn(dir, &["watch"], "watch");
+    let read_refused = wait_for(30, || read(&dir.join("watch.log")).contains("it does not hold"));
+    std::thread::sleep(Duration::from_secs(3));
+    stop(w);
+    run.store(false, Ordering::SeqCst);
+    let log = read(&dir.join("watch.log"));
+    assert!(read_refused, "{log}");
+    assert!(lines(&dir.join("pause.out")).is_empty(), "a pause on a tip the contract does not hold; log:\n{log}");
+    assert!(lines(&dir.join("alert.out")).is_empty(), "{:?}; log:\n{log}", lines(&dir.join("alert.out")));
 }
