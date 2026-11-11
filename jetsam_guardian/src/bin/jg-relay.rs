@@ -20,7 +20,8 @@
 //!   MN-5 refused a point, or the chain's work rate fell below 60 % of the tip's target), proven by
 //!   `[prover]` against the contract's current tip, its block and its locked block (A5-4, N1: a proof made
 //!   against a former tip is void), only
-//!   when `min_nodes` nodes have its tip and its locked block;
+//!   when `min_nodes` nodes have its tip and its locked block; in standby (`standby_after_secs`, A-2: a second
+//!   relayer), only once the contract's newest point is that old on the L1 clock, whatever the cadence;
 //! * every point's deposit tree rebuilt (N2 of the re-audit A5: a submitter may leave whole deposit blocks
 //!   out; C1 of the re-audit n°2: which blocks it gave is in its `CheckpointAccepted`, the tree is rebuilt from
 //!   that list) and such a point extended when it is the tip, an ALERT for each block left out, and before
@@ -37,7 +38,8 @@
 //! Egress (A4-1, D60, D66): nodes and L1 through Tor or on the loopback only (the private rehearsal's
 //! clearnet: its bridge only). Operator commands: `acknowledge <height> <reason>`, `import-block <height>
 //! <file>` (the relayer stopped: refused while it holds `<state_dir>/lock`, T7.7), `print-genesis <locked height>`,
-//! `claim-direct <height> <txid>` (queued for the running relayer).
+//! `claim-direct <height> <txid>` (queued for the running relayer). `jg-relay watch --config <watch.toml>`: the passive
+//! watcher (A-2, `jetsam_guardian::watch`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -156,6 +158,8 @@ struct Relay {
     read_to_time: u64,
     /// E-1: when the points the contract names and this relayer does not know were last read again by their ids.
     reread_at: Option<u64>,
+    /// A-2: the contract's tip this standby relayer last took over from (alerted once each).
+    standby_takeover: Option<[u8; 32]>,
 }
 
 /// E-1: the points the contract names (its tip, its final point) and this relayer does not know are read again by
@@ -926,6 +930,25 @@ impl Relay {
             self.event(json!({"event": "fast_cadence", "on": fast, "work_rate_refused": self.state.work_rate_refused}));
             self.state.fast = fast;
         }
+        // A-2: in standby, a point only once the contract's newest point is standby_after_secs old on the L1 clock,
+        // whatever the cadence; everything above (bodies, points learned, trees, finalizeSlow, claims) went on as usual
+        if let Some(after) = self.cfg.standby_after_secs {
+            let accepted = word_u64(&self.view("nodeOf(bytes32)", &tip_id)?, 3);
+            let age = l1_now.saturating_sub(accepted);
+            if let Some(wait) = relayer::standby_wait(Some(after), accepted, l1_now) {
+                log(&format!("STANDBY: the contract's newest point is {age} s old on the L1 clock, below standby_after_secs {after}: no point from this relayer ({wait} s left)"));
+                return Ok(());
+            }
+            if self.standby_takeover != Some(tip_id) {
+                log(&format!("ALERT STANDBY_TAKEOVER: the contract's newest point {} is {age} s old on the L1 clock (standby_after_secs {after}): this standby relayer submits", hex::encode(tip_id)));
+                self.event(json!({"event": "standby_takeover", "tip": hex::encode(tip_id), "age": age}));
+                self.standby_takeover = Some(tip_id);
+            }
+            if stalled {
+                log("ALERT the contract has stalled (MN-3): a point now");
+            }
+            return self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, tip_locked, l1_now);
+        }
         if due || stalled || fast {
             if stalled {
                 log("ALERT the contract has stalled (MN-3): a point now");
@@ -1056,6 +1079,11 @@ fn run() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("light-anchor") {
         return jetsam_guardian::light_feed::anchor_cli(&args[2..]);
     }
+    // A-2: the passive watcher (no key, sends nothing): the contract's tip against its own nodes, the operator's pause
+    // and alert commands (`watch.toml`, `jetsam_guardian::watch`)
+    if args.get(1).map(String::as_str) == Some("watch") {
+        return jetsam_guardian::watch::watch_cli(&args[2..]);
+    }
     // The fast lane's keys (the relay's, the cold revocation key): a secret from the system's randomness in a
     // file created 0600 (never over another), never printed; its public key printed.
     if args.get(1).map(String::as_str) == Some("fast-keygen") {
@@ -1087,7 +1115,10 @@ fn run() -> anyhow::Result<()> {
     }
     let profile = cfg.profile()?;
     let egress = cfg.egress()?;
-    log(&format!("config sha256 {digest}, {profile}, egress {egress:?}, {} nodes, cadence {} s, prover {}", cfg.nodes.len(), cfg.cadence_secs, cfg.prover.mode));
+    let standby = cfg.standby_after_secs.map_or("standby off".to_string(), |s| {
+        format!("STANDBY standby_after_secs {s}: a point only once the contract's newest point is {s} s old on the L1 clock")
+    });
+    log(&format!("config sha256 {digest}, {profile}, egress {egress:?}, {} nodes, cadence {} s, prover {}, {standby}", cfg.nodes.len(), cfg.cadence_secs, cfg.prover.mode));
     std::fs::create_dir_all(&cfg.state_dir)?;
     std::fs::create_dir_all(&cfg.publish_dir)?;
     // T7.7 (A3): the state directory is this process's for the whole run (an operator's acknowledge or import-block
@@ -1151,6 +1182,7 @@ fn run() -> anyhow::Result<()> {
         trees_at: None,
         read_to_time: 0,
         reread_at: None,
+        standby_takeover: None,
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));

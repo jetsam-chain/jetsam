@@ -491,6 +491,17 @@ pub fn fast_cadence(was_fast: bool, refusal_pending: bool, chain: &Chain, refere
     }
 }
 
+// ---------------------------------------------------------------- A-2: the standby relayer
+
+/// A-2 (audit 2026-11-10): the seconds a relayer in standby (`standby_after_secs` = `after`) still waits before it may
+/// submit, the contract's tip accepted at `tip_accepted_at` and the L1 clock at `l1_now` (both L1 times, never the
+/// host's clock alone); `None` when it may submit now (no standby, or the tip that old).
+pub fn standby_wait(after: Option<u64>, tip_accepted_at: u64, l1_now: u64) -> Option<u64> {
+    let after = after?;
+    let age = l1_now.saturating_sub(tip_accepted_at);
+    (age < after).then(|| after - age)
+}
+
 /// The points to try to finalize (`finalizeSlow`), the highest locked height first: canonical, above the
 /// final point, accepted at least `D_SLOW` ago, with no switch and no freeze (the contract's `pausedUntil`: the
 /// end of the last freeze, or of an early unpause) in the last `D_SLOW`, as `finalizeSlow` requires.
@@ -1634,6 +1645,11 @@ pub struct RelayConfig {
     /// D-AV3: one point every this many seconds of the L1 (≤ `W_STALL − 600`).
     #[serde(default = "default_cadence")]
     pub cadence_secs: u64,
+    /// A-2 (audit 2026-11-10): a second relayer in standby submits a point only once the contract's newest point (its
+    /// tip, `nodeOf(tip).acceptedAt`) is at least this many seconds old on the L1 clock, whatever the cadence; it does
+    /// everything else as usual (bodies, points learned, trees, `finalizeSlow`, claims). Off by default.
+    #[serde(default)]
+    pub standby_after_secs: Option<u64>,
     pub state_dir: PathBuf,
     /// Published for claimers (`final.json`) and provers (`blocks/`).
     pub publish_dir: PathBuf,
@@ -1712,6 +1728,17 @@ impl RelayConfig {
             prove_ahead
         );
         anyhow::ensure!(prove_ahead < c.cadence_secs, "prove_ahead_secs must stay below the cadence");
+        // A-2: a standby point is started at that age; it lands before W_STALL like any other (D-AV3, MN-3)
+        if let Some(s) = c.standby_after_secs {
+            anyhow::ensure!(s > 0, "standby_after_secs = 0 (remove it for no standby)");
+            anyhow::ensure!(
+                s.saturating_add(c.prover.timeout_secs).saturating_add(INCLUSION_SECS) <= crate::relay::W_STALL,
+                "standby_after_secs {s} + [prover] timeout_secs {} + {INCLUSION_SECS} s of inclusion > W_STALL {}: a standby \
+                 point would land after stalled() became true (MN-3)",
+                c.prover.timeout_secs,
+                crate::relay::W_STALL
+            );
+        }
         anyhow::ensure!(c.poll_secs > 0 && c.claims_per_step > 0, "poll_secs and claims_per_step must be positive");
         Ok(c)
     }

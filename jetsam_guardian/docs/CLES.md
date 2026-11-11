@@ -178,6 +178,83 @@ tip's own chain that does not extend the tip is refused, the finality clock does
 honest relayers out of step restarted the 24 h clock. Two relayers then share nothing but the L1: a proof
 made while the other's point landed is void (refused, made again on the new tip).
 
+### A second relayer in standby, and the pause watcher (A-2, audit 2026-11-10)
+
+One relayer alone is a safety assumption: while no point moves the bridge, a branch of a minority of the mining can be
+proven against an old tip. Two pieces close it, with no change of the contract (`submitCheckpoint` is open to anyone).
+
+**The standby relayer.** A second `jg-relay` on another host, through another L1 endpoint, with its own two nodes, its
+own prover and its own hot key, has in its `relay.toml`:
+
+    standby_after_secs = 6000
+
+It submits a point only once the contract's newest point (`nodeOf(tip).acceptedAt`) is at least that old on the L1 clock
+(the latest L1 block's time, or the host's when later, as for the cadence), whatever its own cadence (and whatever
+`stalled()` says by the work rate alone while the first relayer's points still land): while the first
+relayer keeps the bridge moving it sends no point (one line at every step: `STANDBY: the contract's newest point is … s
+old on the L1 clock`), and when the first one falls silent it takes over (`ALERT STANDBY_TAKEOVER`, once per tip). The
+start line says `STANDBY standby_after_secs …`. Everything else runs as usual: it reads and archives every deposit body
+while the nodes serve it, learns every point, rebuilds the trees, publishes `final.json`, sends `finalizeSlow`, the
+claims and the direct claims. Each of these is probed on the pending block before it is signed, so it goes out only when
+the first relayer has not done it yet; a revert that another transaction explains (the tip moved, the deposit minted,
+another point finalized) is never counted towards `HALT_REPEATED_REVERTS`: two relayers never halt each other.
+
+Refused at start: `standby_after_secs = 0`, and any value with `standby_after_secs + [prover] timeout_secs + 60 >
+W_STALL` (7 200 s): its point would land after `stalled()` became true. Off by default (the cadence alone).
+
+Choose it above the latest landing of the first relayer's point, which starts `cadence_secs − prove_ahead_secs` after the
+tip (5 700 s by default) and lands within its `timeout_secs` + 60 s. With a prover of several minutes on both, leave
+room by starting the first one earlier (for example `prove_ahead_secs = 1500`: it starts at 5 100 s and lands by
+6 060 s with `timeout_secs = 900`) and set the standby one at about 6 100 s with `timeout_secs` at most 1 040. Below
+that, the standby relayer may prove while the first one's point lands: its proof is then void and not sent (or, sent in
+the same L1 block, reverted and not counted), which costs a proof, never a halt.
+
+**The watcher.** `jg-relay watch --config <watch.toml>` holds no key and sends nothing. At every `poll_secs` it reads,
+at one L1 block, the contract's tip, the block it locks (`tipLockedBlockId`, at `nodeOf(tip).lockedHeight`) and its
+acceptance, and asks its own nodes which block they hold at that height; it runs the operator's commands, each an argv
+list (never a shell; `{event}` and `{detail}` replaced), in a process group of its own, killed with it past
+`command_timeout_secs`, its output in the watcher's log:
+
+- `pause_command`, when `min_nodes` of its nodes hold another block at that height and fewer hold the contract's (a
+  node behind, silent or failing is no witness; nodes that disagree decide nothing: `ALERT NODES_DISAGREE`): `ALERT
+  TIP_OFF_OUR_CHAIN`, then the pause **once per incident**. An incident lasts until the tip locks a block of this chain
+  again (kept in `<state_dir>/watch.json`, each run counted before it starts: a restart runs no second pause); a run
+  that fails (an exit status other than 0, or the timeout) is tried again 300 s later, 3 runs at most per incident;
+  none while the bridge is frozen already (`pausedUntil` after the L1 clock: an operator's pause, or a run that landed
+  but whose outcome was lost), which counts as paused. Each outcome goes to the alert command: `PAUSED`,
+  `ALREADY_PAUSED`, `PAUSE_FAILED` or `PAUSE_GAVE_UP`. A pause command still running when the watcher stops runs on to
+  its end (its own process group). One pause of 48 h holds every finality clock until 24 h after its end;
+  a second pause in the same incident is a person's decision (`bridge-pause.sh`, within 96 h per 30 days).
+- `alert_command`, when the contract's newest point is more than `alert_after_secs` old on the L1 clock (default
+  6 600 s, at most `W_STALL`): `NO_NEW_POINT`, once per point (an alert command that failed is run again at the next
+  poll); and when the watcher could read neither the contract nor `min_nodes` of its nodes for that long on its own clock:
+  `WATCHER_BLIND`, once until it reads again.
+
+Example (the public test network over Base Sepolia; the endpoints, the hosts and the alert channel are the operator's):
+
+    network = "d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85"
+    l1_chain_id = 84532
+    l1_bridge = "0x5221245DEb99771dd76cCf785fd39a5d4F692254"
+    l1_rpc = "https://<an L1 endpoint other than the relayers'>"
+    state_dir = "/home/jtm/watch"
+    poll_secs = 60
+    alert_after_secs = 6600
+    command_timeout_secs = 1200
+    pause_command = ["/home/jtm/bin/bridge-pause.sh", "--bridge", "0x5221245DEb99771dd76cCf785fd39a5d4F692254",
+                     "--rpc", "<the pause key's L1 endpoint>", "--duration", "48h", "--key", "/home/jtm/keys/pause.key",
+                     "--expect-chain", "84532", "--send"]
+    alert_command = ["/home/jtm/bin/alert", "{event}", "{detail}"]
+    [[nodes]]
+    name = "w-a"
+    rpc = "http://<56 characters>.onion:9711"
+    [[nodes]]
+    name = "w-b"
+    rpc = "http://<56 characters>.onion:9711"
+
+`bridge-pause.sh` sends nothing without `--send` (a dry run exits 0, which the watcher would take for a pause done):
+keep `--send` and `--expect-chain` in `pause_command`. The watcher's host then holds the pause key (it can freeze the
+mint paths within the contract's budget, nothing else).
+
 ## Deposits in no root (re-audit N2, A5-22; C1 of the re-audit n°2)
 
 Anyone may submit a point that leaves whole deposit blocks out (the program allows it; it never lets one

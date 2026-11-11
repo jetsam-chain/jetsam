@@ -702,6 +702,41 @@ fn a5_6_points_are_started_900_s_ahead_by_default() {
     assert_eq!(short.prove_ahead(), 600, "half a short cadence");
 }
 
+/// A-2 (audit 2026-11-10): a second relayer in standby (`standby_after_secs`) submits a point only once the contract's
+/// newest point is that old; off by default (the cadence alone, as before). A value whose point could land after
+/// `W_STALL` (started at that age, proven within `timeout_secs`, included within `INCLUSION_SECS`) is refused at start:
+/// `stalled()` would become true first (MN-3); so is 0.
+#[test]
+fn a2_standby_is_off_by_default_and_never_lets_the_contract_stall() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let parse = |top: &str, prover: &str| RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{top}{cmd}{prover}")));
+    assert_eq!(parse("", "").unwrap().standby_after_secs, None, "off by default");
+    // the default prover timeout (480 s) and the inclusion (60 s): at most 7 200 − 540 = 6 660
+    assert_eq!(parse("standby_after_secs = 6660\n", "").unwrap().standby_after_secs, Some(6_660));
+    let e = parse("standby_after_secs = 6661\n", "").unwrap_err().to_string();
+    assert!(e.contains("W_STALL") && e.contains("stalled()"), "{e}");
+    assert!(parse("standby_after_secs = 7201\n", "").unwrap_err().to_string().contains("W_STALL"), "above W_STALL");
+    assert!(parse("standby_after_secs = 0\n", "").unwrap_err().to_string().contains("standby_after_secs"), "0");
+    // a slower prover leaves less room: 7 200 − 900 − 60 = 6 240
+    assert!(parse("standby_after_secs = 6240\n", "timeout_secs = 900\n").is_ok());
+    assert!(parse("standby_after_secs = 6241\n", "timeout_secs = 900\n").unwrap_err().to_string().contains("stalled()"));
+}
+
+/// A-2: how long a standby relayer still waits before it may submit, from the acceptance of the contract's tip and the
+/// L1 clock (both L1 times); `None`: it may submit (standby off, or the tip that old).
+#[test]
+fn a2_a_standby_relayer_waits_until_the_tip_is_that_old_on_the_l1_clock() {
+    assert_eq!(standby_wait(None, 1_000, 1_001), None, "off: never waits");
+    assert_eq!(standby_wait(Some(6_000), 1_000, 1_000), Some(6_000));
+    assert_eq!(standby_wait(Some(6_000), 1_000, 6_999), Some(1));
+    assert_eq!(standby_wait(Some(6_000), 1_000, 7_000), None, "exactly that old: it submits");
+    assert_eq!(standby_wait(Some(6_000), 1_000, 50_000), None);
+    // a tip dated after the clock read (another endpoint ahead): age 0, the whole wait
+    assert_eq!(standby_wait(Some(6_000), 2_000, 1_000), Some(6_000));
+}
+
 /// A5-7: a source that fails (an error, bytes of another block, a body the rule refuses) never stops the
 /// others; the first verifiable body is recorded; every failure is named when none serves one; a mirror
 /// is read in `blocks/` or bare.

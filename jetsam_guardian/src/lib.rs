@@ -55,6 +55,7 @@ pub mod signer;
 pub mod testkit;
 pub mod threshold;
 pub mod u256;
+pub mod watch;
 pub mod witness;
 
 pub use jetsam_chain::consensus::guardian::{
