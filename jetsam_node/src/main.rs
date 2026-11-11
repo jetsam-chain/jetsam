@@ -9986,6 +9986,36 @@ mod tests {
         assert!(error.to_string().contains("parse node config"));
     }
 
+    /// The default config is written whole beside its path and only then
+    /// linked into place: a first start killed mid-write leaves no truncated
+    /// jetsam.toml that every later start refuses to parse.
+    #[test]
+    fn the_default_config_appears_whole_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("jetsam.toml");
+
+        assert!(super::create_config_whole(&path, b"[rpc]\n").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[rpc]\n");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_config_another_start_created_first_is_never_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("jetsam.toml");
+        std::fs::write(&path, "[network]\n").unwrap();
+
+        assert!(!super::create_config_whole(&path, b"[rpc]\n").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[network]\n");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn sync_mode_uses_guaranteed_object_serving_window_boundary() {
         let retention = jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
@@ -10877,6 +10907,48 @@ mod tests {
         });
         let bytes = captured.0.lock().expect("capture buffer").clone();
         String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    fn rendered_cold_election_close(offered: usize, kept: usize) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_cold_election_refusals(offered, kept);
+        });
+        let bytes = captured.0.lock().expect("capture buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    /// Offers refused when a cold node's election closes used to vanish
+    /// without a line: a node whose every offer was refused there sat silent.
+    #[test]
+    fn a_cold_election_whose_every_offer_is_refused_at_the_close_says_so() {
+        let line = rendered_cold_election_close(2, 0);
+        let body = line.split_once("WARN ").expect("a WARN line").1.trim_end();
+        assert_eq!(
+            body,
+            "jetsam: snapshot election closed with every offer refused at the close; \
+             the next offer opens a new election offered=2 refused=2"
+        );
+    }
+
+    #[test]
+    fn a_cold_election_that_refused_some_offers_at_the_close_counts_them() {
+        let line = rendered_cold_election_close(3, 1);
+        let body = line.split_once("INFO ").expect("an INFO line").1.trim_end();
+        assert_eq!(
+            body,
+            "jetsam: snapshot election closed: offers refused at the close, \
+             electing among the rest offered=3 refused=2 kept=1"
+        );
+    }
+
+    #[test]
+    fn a_cold_election_that_kept_every_offer_adds_no_line() {
+        assert_eq!(rendered_cold_election_close(2, 2), "");
     }
 
     #[test]
@@ -19997,6 +20069,7 @@ async fn handle_p2p_events(
                 };
                 let cold_headers = (!header_dag_faulted).then_some(&header_dag);
                 let tip_authority = *initial_sync_ready.borrow() && snapshot_rebase_hint.is_none();
+                let offered = ballot.len();
                 ballot.retain(|(generation, peer, manifest, rebase_anchor)| {
                     cold_offer_admitted_at_close(
                         *generation,
@@ -20013,6 +20086,7 @@ async fn handle_p2p_events(
                         now,
                     )
                 });
+                log_cold_election_refusals(offered, ballot.len());
                 let offers = ballot
                     .iter()
                     .map(|(_, _, manifest, _)| ColdSnapshotOffer {
@@ -20751,6 +20825,31 @@ struct ColdSnapshotOffer {
     /// At a point of a header chain this node validated, with exactly the
     /// claimed work ([`snapshot_boundary_validated`]).
     validated: bool,
+}
+
+/// What the close of a cold node's election refused: before, offers judged
+/// again at the close and refused there vanished without a line, and a node
+/// whose every offer was refused sat silent until the next offer arrived.
+fn log_cold_election_refusals(offered: usize, kept: usize) {
+    let refused = offered.saturating_sub(kept);
+    if refused == 0 {
+        return;
+    }
+    if kept == 0 {
+        tracing::warn!(
+            offered,
+            refused,
+            "snapshot election closed with every offer refused at the close; \
+             the next offer opens a new election"
+        );
+    } else {
+        tracing::info!(
+            offered,
+            refused,
+            kept,
+            "snapshot election closed: offers refused at the close, electing among the rest"
+        );
+    }
 }
 
 /// Which of the snapshot boundaries offered during a cold node's election
@@ -22609,31 +22708,11 @@ fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(
 
             let encoded =
                 toml::to_string_pretty(defaults).context("serialize default node config")?;
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-
-            match options.open(&expanded) {
-                Ok(mut file) => {
-                    let write_result = file
-                        .write_all(encoded.as_bytes())
-                        .and_then(|()| file.sync_all());
-                    if let Err(error) = write_result {
-                        drop(file);
-                        let _ = std::fs::remove_file(&expanded);
-                        return Err(error).with_context(|| {
-                            format!("write default node config: {}", expanded.display())
-                        });
-                    }
-                    Ok((defaults.clone(), true))
-                }
+            match create_config_whole(&expanded, encoded.as_bytes()) {
+                Ok(true) => Ok((defaults.clone(), true)),
                 // Another node may have created the file after our initial
                 // read. Never overwrite it; load and validate that file.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(false) => {
                     let text = std::fs::read_to_string(&expanded).with_context(|| {
                         format!(
                             "read concurrently created node config: {}",
@@ -22645,13 +22724,49 @@ fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(
                     Ok((config, false))
                 }
                 Err(error) => Err(error)
-                    .with_context(|| format!("create node config: {}", expanded.display())),
+                    .with_context(|| format!("write default node config: {}", expanded.display())),
             }
         }
         Err(error) => {
             Err(error).with_context(|| format!("read node config: {}", expanded.display()))
         }
     }
+}
+
+/// Create `path` holding `bytes` whole, or leave a file already there
+/// untouched (`Ok(false)`). The bytes are written and synced under a name of
+/// this process's own beside it, then hard-linked into place, which refuses
+/// an existing path: a start killed mid-write leaves that staged file, never
+/// a truncated config that every later start refuses to parse, and two
+/// first starts never write into the same file. On a file system without
+/// hard links (FAT, exFAT) it is renamed into place instead, only while
+/// nothing is there.
+fn create_config_whole(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let mut staged_name = std::ffi::OsString::from(".");
+    staged_name.push(path.file_name().unwrap_or_default());
+    staged_name.push(format!(".new-{}", std::process::id()));
+    let staged = path.with_file_name(staged_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let placed = options
+        .open(&staged)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| match std::fs::hard_link(&staged, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(_) if path.exists() => Ok(false),
+            Err(_) => std::fs::rename(&staged, path).map(|()| true),
+        });
+    let _ = std::fs::remove_file(&staged);
+    placed
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
