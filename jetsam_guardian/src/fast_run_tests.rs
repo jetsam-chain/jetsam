@@ -725,3 +725,30 @@ fn each_pass_says_when_it_begins_and_ends_how_long_it_took_and_why_it_failed() {
     run_passes(&|_| *once.lock().unwrap() += 1, &mut |_| Ok(String::new()), true, Duration::ZERO, &|| true, || {}).unwrap();
     assert_eq!(*once.lock().unwrap(), 2);
 }
+
+/// D171, D176: a pass whose node is refused (its activations are not this build's: a `Refusal`, however wrapped) ends
+/// the run, with the reason; a pass that failed on a silent node is tried again, as before.
+#[test]
+fn activ_the_passes_stop_at_a_refused_node_and_go_on_past_a_silent_one() {
+    let lines = Mutex::new(Vec::new());
+    let say = |line: &str| lines.lock().unwrap().push(line.to_string());
+    let errors = Cell::new(0);
+    // a run that would not stop ends at its third pass all the same (its captures said to stop)
+    let passes = Cell::new(0);
+    let mut pass = |n: u64| -> anyhow::Result<String> {
+        passes.set(n);
+        match n {
+            1 => Err(anyhow!("empty answer from http://127.0.0.1:9711")),
+            2 => Err(anyhow::Error::new(crate::activations::Refusal { node: "http://127.0.0.1:9711".into(), reason: "it applies base_return_height = 9999, this build 8982".into() })
+                .context("its activations")),
+            _ => Ok(format!("games #{n}")),
+        }
+    };
+    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &|| passes.get() < 3, || errors.set(errors.get() + 1));
+    let e = format!("{:#}", stopped.unwrap_err());
+    assert!(e.contains("base_return_height = 9999") && e.contains("fast-run stops"), "{e}");
+    let lines = lines.into_inner().unwrap();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines[1].starts_with("ALERT FAST_RUN pass 1 failed after ") && lines[1].contains("tried again"), "{}", lines[1]);
+    assert!(lines[3].starts_with("ALERT FAST_RUN pass 2") && lines[3].contains("base_return_height = 9999") && !lines[3].contains("tried again"), "{}", lines[3]);
+}

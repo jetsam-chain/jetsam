@@ -255,6 +255,40 @@ Example (the public test network over Base Sepolia; the endpoints, the hosts and
 keep `--send` and `--expect-chain` in `pause_command`. The watcher's host then holds the pause key (it can freeze the
 mint paths within the contract's budget, nothing else).
 
+### The nodes' activations, checked at start (D171, D176)
+
+On 11 November 2026 the test chain's relayer and robot stopped twice on fast lane blocks they did not read as their
+nodes accepted them (`BadMarker`, then `ReleasesDoNotMatchMarkers`): their build was older than a rule of their nodes,
+and nothing said so when they started. A node now publishes the activations it applies (`jetsam_getActivations`, a read:
+no cookie), read from the rules its own validation reads (`jetsam_chain::consensus::activations`): its network (the id
+of its genesis block), the v1.5 height, `J` (`v1_7_height`), `F` (`deposits_from_height`), the vault and the height of
+D123's caps, the return over Base (`H`, `base_return_height`; its bridge; the fast lane's relay and revocation keys), the
+guardian rules' heights and group key. Each program compares them with its own build's, read by the same function:
+
+- **The relayer (`jg-relay`) and the robot (`jg-fill`)**: every field, for each configured node, at start, right after
+  the node's block 0 is checked against `network`. A value that differs, a field the node does not publish, a field
+  this build does not know, an error, or no `jetsam_getActivations` at all (a node older than this build: refused as
+  well, fail-closed): the program does not start and names the node and the values, for example
+
+      node n1: it applies deposits_from_height = 8705, this build 8704: … : jg-relay does not start
+      node n1: it publishes no activations (jetsam_getActivations: Method not found): a node older than this build …;
+      update the node (the nodes first, then the guardian programs): jg-fill does not start
+
+  A node that does not answer at start stops them as before (they read each node there).
+- **`jg-relay fast-run`**: every field of its `--node`, at start; refused, it does not start. A node that does not answer
+  at start does not stop it (its captures of Base run whatever the node says, as before): the node is read before its
+  first use (the first fast release, or the contradictions, of a pass; until then such a pass fails and is tried again),
+  and a refusal then stops the run (`ALERT FAST_RUN pass …: … fast-run stops`).
+- **`jg-relay watch`**: the `network` only (it reads block ids, no deposit), for each node, at start; a node without
+  `jetsam_getActivations` is refused too. A node of another v1.7 clock does not stop it. Its check of each node's
+  block 0 against the configured `network` is kept: the configured network, the node's chain and the watcher's build
+  are then one network.
+
+The comparison is made at start only: a node replaced by another build while a program runs is seen at that program's
+next start. Upgrade order: the nodes first (a node of this release answers `jetsam_getActivations`), then each guardian
+program, from a build of the nodes' version and profile. An activation armed on the nodes later (a height, a key, the
+guardians' group key after their ceremony) means the guardian programs are rebuilt with it before their next start.
+
 ## Deposits in no root (re-audit N2, A5-22; C1 of the re-audit n°2)
 
 Anyone may submit a point that leaves whole deposit blocks out (the program allows it; it never lets one

@@ -93,12 +93,19 @@ fn serve(answer: Answer) -> u16 {
     port
 }
 
-/// A fake node serving the chain `c` (shared: it grows while the relayers run).
+/// A fake node serving the chain `c` (shared: it grows while the relayers run), its activations this build's.
 fn node(c: Arc<Mutex<Chain>>) -> u16 {
+    node_with(c, Some(jetsam_guardian::activations::this_build()))
+}
+
+/// [`node`] publishing the activations `activations` (`None`: a node older than `getActivations`, which it does not
+/// know).
+fn node_with(c: Arc<Mutex<Chain>>, activations: Option<Value>) -> u16 {
     serve(Arc::new(move |method, params| {
         let c = c.lock().unwrap();
         let h = params[0].as_u64().unwrap_or(u64::MAX);
         match method {
+            "jetsam_getActivations" if activations.is_some() => json!({"result": activations}),
             "jetsam_blockCount" => json!({"result": c.tip_height()}),
             "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
             "jetsam_getHeaderByHeight" => json!({"result": c.header_at(h).map(|x| x.raw_hex())}),
@@ -794,4 +801,140 @@ fn a2_the_watcher_never_decides_on_a_tip_the_contract_does_not_hold() {
     assert!(read_refused, "{log}");
     assert!(lines(&dir.join("pause.out")).is_empty(), "a pause on a tip the contract does not hold; log:\n{log}");
     assert!(lines(&dir.join("alert.out")).is_empty(), "{:?}; log:\n{log}", lines(&dir.join("alert.out")));
+}
+
+// ---------------------------------------------------------------- D171, D176: the nodes' activations at the start
+
+/// This build's activations with `key` set to `value`.
+fn activations_with(key: &str, value: Value) -> Value {
+    let mut v = jetsam_guardian::activations::this_build();
+    v[key] = value;
+    v
+}
+
+/// `child`'s exit code if it exits within `secs` (else stopped by its PID: `None`).
+fn exit_within(secs: u64, mut child: Child) -> Option<i32> {
+    if wait_for(secs, || child.try_wait().unwrap().is_some()) {
+        child.wait().unwrap().code()
+    } else {
+        stop(child);
+        None
+    }
+}
+
+/// D171, D176: a relayer one of whose nodes applies another `F` or another `H` than its build does not start, and
+/// says which node and which values; nor beside a node older than `getActivations` (fail-closed: update the node).
+/// Nothing is sent to the contract. Beside two nodes of its build it starts (every other relayer test).
+#[test]
+fn activ_the_relayer_does_not_start_beside_a_node_whose_activations_are_not_its_builds() {
+    if no_v1_7_clock() {
+        return;
+    }
+    let (chain, bridge, run) = world(false);
+    let port = l1_port(bridge.clone());
+    let f = built_f().unwrap();
+    let cases = [
+        ("another F", Some(activations_with("deposits_from_height", json!(f + 1))), vec![format!("deposits_from_height = {}", f + 1), format!("this build {f}")]),
+        ("another H", Some(activations_with("base_return_height", json!(77_777))), vec!["base_return_height = 77777".to_string()]),
+        ("no getActivations", None, vec!["jetsam_getActivations".to_string(), "update the node".to_string()]),
+    ];
+    for (label, activations, want) in cases {
+        let (n0, n1) = (node(chain.clone()), node_with(chain.clone(), activations));
+        let (_root, dir) = relay_dir(port, &[n0, n1], A, "");
+        let code = exit_within(30, spawn(&dir, &[], "relay"));
+        let log = read(&dir.join("relay.log"));
+        assert_eq!(code, Some(1), "{label}: it ran; log:\n{log}");
+        assert!(log.contains("node n1: ") && want.iter().all(|w| log.contains(w.as_str())) && log.contains("jg-relay does not start"), "{label}: {log}");
+        assert!(!log.contains("node n0: "), "{label}: n0 is this build's: {log}");
+    }
+    run.store(false, Ordering::SeqCst);
+    assert!(bridge.lock().unwrap().sends.is_empty(), "nothing sent");
+}
+
+/// D171, D176 for the watcher, which reads block ids and no deposit (the network only): a node whose activations name
+/// another network, or a node older than `getActivations`, stops it at its start, the node named, nothing run; a node
+/// of another v1.7 clock does not (the watcher starts and watches).
+#[test]
+fn activ_the_watcher_does_not_start_beside_a_node_of_another_network_or_without_activations() {
+    let (chain, bridge, run) = world(false);
+    let port = l1_port(bridge.clone());
+    let other_network = hex::encode([0x5a; 32]);
+    let cases = [
+        ("another network", Some(activations_with("network", json!(other_network))), vec!["network = ".to_string(), other_network.clone()]),
+        ("no getActivations", None, vec!["jetsam_getActivations".to_string(), "update the node".to_string()]),
+    ];
+    for (label, activations, want) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let (n0, n1) = (node(chain.clone()), node_with(chain.clone(), activations));
+        watch_toml(dir, port, &[n0, n1], "", &format!("echo paused >> {}", dir.join("pause.out").display()));
+        let code = exit_within(30, spawn(dir, &["watch"], "watch"));
+        let log = read(&dir.join("watch.log"));
+        assert_eq!(code, Some(1), "{label}: it ran; log:\n{log}");
+        assert!(log.contains("node n1: ") && want.iter().all(|w| log.contains(w.as_str())) && log.contains("jg-relay watch does not start"), "{label}: {log}");
+        assert!(!log.contains("node n0: "), "{label}: n0 is this build's: {log}");
+        assert!(lines(&dir.join("pause.out")).is_empty() && lines(&dir.join("alert.out")).is_empty(), "{label}: {log}");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let (n0, n1) = (node(chain.clone()), node_with(chain.clone(), Some(activations_with("v1_7_height", json!(123_456)))));
+    watch_toml(dir, port, &[n0, n1], "", &format!("echo paused >> {}", dir.join("pause.out").display()));
+    let code = exit_within(6, spawn(dir, &["watch"], "watch"));
+    run.store(false, Ordering::SeqCst);
+    let log = read(&dir.join("watch.log"));
+    assert_eq!(code, None, "another v1.7 clock does not stop the watcher; log:\n{log}");
+    assert!(log.contains("config sha256") && !log.contains("does not start"), "{log}");
+}
+
+/// D171, D176 for `fast-run` (the test chain's build: the only one with a bridge on Base and a relay key): its node
+/// refused at the start (another `H`, or no `getActivations`) stops it there, the node named, before anything else; a
+/// silent node does not (an ALERT: read before its first use); a node of its build is said so. Past its node, a
+/// throwaway key stops it (not this build's relay key): nothing runs.
+#[test]
+fn activ_fast_run_does_not_start_beside_a_node_whose_activations_are_not_its_builds() {
+    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    if rules.bridge.is_none() || rules.base_return.fast.release_key.is_none() {
+        eprintln!("SKIPPED: this build has no bridge on Base nor relay key, fast-run does not start");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("relay-fast.secret");
+    let out = Command::new(env!("CARGO_BIN_EXE_jg-relay")).args(["fast-keygen", "--out"]).arg(&key).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let fast_run = |node: &str| -> (Option<i32>, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_jg-relay"))
+            .arg("fast-run")
+            .arg("--key")
+            .arg(&key)
+            .args(["--l1", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9"])
+            .args(["--beacon", "http://127.0.0.1:9", "--node", node, "--node-cookie"])
+            .arg(root.path().join("rpc.cookie"))
+            .arg("--state-dir")
+            .arg(root.path().join("fast"))
+            .args(["--from-block", "1"])
+            .output()
+            .unwrap();
+        (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let chain = Arc::new(Mutex::new(Chain::from_genesis(testkit::genesis())));
+    let url = |port: u16| format!("http://127.0.0.1:{port}");
+    for (label, activations, want) in [
+        ("another H", Some(activations_with("base_return_height", json!(77_777))), "base_return_height = 77777"),
+        ("no getActivations", None, "update the node"),
+    ] {
+        let node = url(node_with(chain.clone(), activations));
+        let (code, log) = fast_run(&node);
+        assert_eq!(code, Some(1), "{label}: {log}");
+        assert!(log.contains(&format!("node {node}: ")) && log.contains(want) && log.contains("fast-run does not start"), "{label}: {log}");
+        assert!(!log.contains("FAST_RELEASE_KEY"), "{label}: stopped at its node, before its key: {log}");
+    }
+    let silent = url(TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port());
+    let (code, log) = fast_run(&silent);
+    assert_eq!(code, Some(1), "{log}");
+    assert!(log.contains(&format!("ALERT node {silent} not read at the start")) && log.contains("read before its first use"), "{log}");
+    assert!(log.contains("FAST_RELEASE_KEY") && !log.contains("does not start"), "a silent node does not stop it: {log}");
+    let good = url(node(chain.clone()));
+    let (code, log) = fast_run(&good);
+    assert_eq!(code, Some(1), "{log}");
+    assert!(log.contains(&format!("node {good}: its activations are this build's")) && log.contains("FAST_RELEASE_KEY"), "{log}");
 }

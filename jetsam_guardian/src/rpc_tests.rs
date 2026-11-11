@@ -603,3 +603,15 @@ fn c2_an_https_server_of_another_name_gets_no_request() {
     assert!(call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)).is_err());
     assert!(server.join().unwrap().4.is_empty());
 }
+
+/// D171, D176: the clients of the relayer, the watcher and the robot (`fill`) and of `fast-run` (`fast_release`) read the
+/// node's activations before they use it; the observer's does not need them.
+#[test]
+fn activ_the_clients_of_the_relayer_the_robot_and_fast_run_read_the_activations() {
+    let egress = Egress::onion(DEFAULT_TOR_SOCKS).unwrap();
+    for c in [NodeClient::fill("http://127.0.0.1:9", egress), NodeClient::fast_release("http://127.0.0.1:9", egress)] {
+        let e = c.call("getActivations", json!([])).unwrap_err().to_string();
+        assert!(!e.contains("allow-list"), "{e}");
+    }
+    assert!(FILL_ALLOWLIST.contains(&crate::activations::METHOD) && FAST_RELEASE_ALLOWLIST.contains(&crate::activations::METHOD));
+}

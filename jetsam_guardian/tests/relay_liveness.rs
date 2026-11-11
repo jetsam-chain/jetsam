@@ -97,6 +97,8 @@ fn watched_node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>) -> (u16, Arc<Atomi
             seen.fetch_max(h, Ordering::SeqCst);
         }
         match method {
+            // D171, D176: a node of this build
+            "jetsam_getActivations" => json!({"result": jetsam_guardian::activations::this_build()}),
             "jetsam_blockCount" => json!({"result": c.tip_height()}),
             "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
             "jetsam_getHeaderByHeight" => json!({"result": c.header_at(h).map(|x| x.raw_hex())}),
@@ -625,6 +627,8 @@ fn body_node(c: Arc<Mutex<jetsam_guardian::chain::Chain>>, bodies: Arc<Mutex<std
         let c = c.lock().unwrap();
         let h = params[0].as_u64().unwrap_or(u64::MAX);
         match method {
+            // D171, D176: a node of this build
+            "jetsam_getActivations" => json!({"result": jetsam_guardian::activations::this_build()}),
             "jetsam_blockCount" => json!({"result": c.tip_height()}),
             "jetsam_getBlockHash" => json!({"result": c.id_at(h).map(hex::encode)}),
             "jetsam_getHeaderByHeight" => json!({"result": c.header_at(h).map(|x| x.raw_hex())}),
