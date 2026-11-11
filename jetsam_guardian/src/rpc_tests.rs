@@ -519,6 +519,16 @@ fn fake_tls_tor(
     cert_name: &str,
     result: Value,
 ) -> (std::net::SocketAddr, rustls::RootCertStore, std::thread::JoinHandle<(String, u16, u8, Vec<u8>, String)>) {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+    fake_tls_tor_answering(cert_name, format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body))
+}
+
+/// [`fake_tls_tor`] whose TLS server answers the request with `answer`, a whole HTTP answer (head and body) as is.
+#[allow(clippy::type_complexity)]
+fn fake_tls_tor_answering(
+    cert_name: &str,
+    answer: String,
+) -> (std::net::SocketAddr, rustls::RootCertStore, std::thread::JoinHandle<(String, u16, u8, Vec<u8>, String)>) {
     let ck = rcgen::generate_simple_self_signed(vec![cert_name.to_string()]).unwrap();
     let cert = ck.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
@@ -559,8 +569,7 @@ fn fake_tls_tor(
             }
         }
         if req.contains("\"params\"") {
-            let body = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
-            let _ = write!(tls, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+            let _ = tls.write_all(answer.as_bytes());
             tls.conn.send_close_notify();
             let _ = tls.flush();
         }
@@ -602,4 +611,128 @@ fn c2_an_https_server_of_another_name_gets_no_request() {
     let e = Egress::Onion { socks: proxy };
     assert!(call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)).is_err());
     assert!(server.join().unwrap().4.is_empty());
+}
+
+// ---- C-2 with a real Tor (2026-11-11): the public L1 servers frame their larger answers in chunks ----
+
+/// `body` as an HTTP/1.1 chunked answer (`Transfer-Encoding: chunked`), cut in chunks of `size` bytes, sizes in lower-case
+/// hex as the servers write them (`7f9`, `800`), then the last chunk.
+fn chunked_answer(body: &str, size: usize) -> String {
+    let mut out = String::from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
+    for part in body.as_bytes().chunks(size) {
+        out.push_str(&format!("{:x}\r\n{}\r\n", part.len(), String::from_utf8_lossy(part)));
+    }
+    out.push_str("0\r\n\r\n");
+    out
+}
+
+/// Serves one connection: reads the request up to its JSON body, writes `answer` as is, then keeps the connection
+/// open `hold` before closing it.
+fn serve_raw_once(answer: String, hold: Duration) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut req = String::new();
+        let mut buf = vec![0u8; 65_536];
+        while !req.contains("\"params\"") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the body");
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        s.write_all(answer.as_bytes()).unwrap();
+        std::thread::sleep(hold);
+    });
+    (port, server)
+}
+
+/// C-2, measured with a real Tor and the public Base Sepolia endpoints (2026-11-11): `sepolia.base.org`, onfinality
+/// and publicnode answer `eth_getBlockByNumber` (≈ 2 KB, the watcher's L1 clock) in chunks
+/// (`Transfer-Encoding: chunked`), drpc every answer. A JSON-RPC answer in chunks is read whole, a single call as a
+/// batch; before, its chunk sizes were parsed as JSON ("trailing characters at line 1 column 2").
+#[test]
+fn c2_a_json_rpc_answer_in_chunks_is_read() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"number": "0x36aee3a", "timestamp": "0x6913f1a2", "pad": "x".repeat(3000)}}).to_string();
+    for size in [26, 0x7f9, 0x800, body.len()] {
+        let (port, server) = serve_raw_once(chunked_answer(&body, size), Duration::ZERO);
+        let v = call(&format!("http://127.0.0.1:{port}"), "eth_getBlockByNumber", json!(["latest", false]), Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("chunks of {size}: {e:#}"));
+        assert_eq!(v["timestamp"], json!("0x6913f1a2"), "chunks of {size}");
+        server.join().unwrap();
+    }
+    // both headers: the chunks win (RFC 9112 §6.3), the Content-Length is not believed
+    let both = chunked_answer(&body, 100).replacen("Transfer-Encoding", "Content-Length: 5\r\nTransfer-Encoding", 1);
+    let (port, server) = serve_raw_once(both, Duration::ZERO);
+    let v = call(&format!("http://127.0.0.1:{port}"), "eth_getBlockByNumber", json!(["latest", false]), Duration::from_secs(5)).unwrap();
+    assert_eq!(v["timestamp"], json!("0x6913f1a2"));
+    server.join().unwrap();
+    let batch = r#"[{"jsonrpc":"2.0","id":1,"result":"0x02"},{"jsonrpc":"2.0","id":0,"result":"0x01"}]"#;
+    let (port, server) = serve_raw_once(chunked_answer(batch, 10), Duration::ZERO);
+    let calls = [("eth_call", json!([{"to": "0x01"}, "latest"])), ("eth_chainId", json!([]))];
+    let got = call_batch_via(&Egress::Clearnet, &format!("http://127.0.0.1:{port}"), &calls, Duration::from_secs(5)).unwrap();
+    assert_eq!(got, vec![json!("0x01"), json!("0x02")]);
+    server.join().unwrap();
+}
+
+/// C-2: an https:// answer in chunks through Tor (TLS end to end) is read whole.
+#[test]
+fn c2_an_https_answer_in_chunks_through_tor_is_read() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": "0x14a34"}).to_string();
+    let (proxy, roots, server) = fake_tls_tor_answering("rpc.example.com", chunked_answer(&body, 7));
+    let e = Egress::Onion { socks: proxy };
+    let v = with_test_roots(roots, || call_via(&e, "https://rpc.example.com/", "eth_chainId", json!([]), Duration::from_secs(10)));
+    assert_eq!(v.unwrap(), json!("0x14a34"));
+    server.join().unwrap();
+}
+
+/// C-2: an answer in chunks is over at its last chunk, even when the server keeps the connection open after it: the
+/// call does not wait for the server to close (nor for the read timeout).
+#[test]
+fn c2_a_chunked_answer_ends_at_its_last_chunk_not_when_the_server_closes() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": 7}).to_string();
+    let (port, server) = serve_raw_once(chunked_answer(&body, 5), Duration::from_secs(6));
+    let t = std::time::Instant::now();
+    let v = call(&format!("http://127.0.0.1:{port}"), "eth_chainId", json!([]), Duration::from_secs(20)).unwrap();
+    assert_eq!(v, json!(7));
+    assert!(t.elapsed() < Duration::from_secs(3), "returned after {:?}", t.elapsed());
+    server.join().unwrap();
+}
+
+/// A chunked answer cut short (a chunk without its end, the connection closed) or with an absurd chunk size is an
+/// error, never a panic: `get_bytes_via` (the onion feeds of C-2 (a)) reads whatever a remote server sends.
+#[test]
+fn http_body_refuses_a_cut_or_absurd_chunk_without_panicking() {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for rest in ["5\r\nhello", "5\r\nhel", "5\r\nhello\r", "ffffffffffffffff\r\nx\r\n", "zz\r\nx\r\n0\r\n\r\n", "3\r\nabc\r\n"] {
+        let raw = format!("{head}{rest}");
+        let got = std::panic::catch_unwind(|| http_body(raw.as_bytes()).map(|(_, b)| b));
+        assert!(matches!(got, Ok(Err(_))), "{rest:?}: {got:?}");
+    }
+    assert_eq!(http_body(format!("{head}5\r\nhello\r\n1;x=y\r\n!\r\n0\r\n\r\n").as_bytes()).unwrap().1, b"hello!".to_vec());
+}
+
+/// C-2: a read that happens to end like the last chunk (`…0\r\n` + `\r\n`) does not end a chunked answer: only the
+/// whole decoding does (the server writes the rest a moment later).
+#[test]
+fn c2_a_chunk_that_ends_like_the_last_one_does_not_end_the_answer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut req = String::new();
+        let mut buf = vec![0u8; 65_536];
+        while !req.contains("\"params\"") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the body");
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let first = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":10\r\n";
+        write!(s, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n", first.len()).unwrap();
+        s.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        s.write_all(b"1\r\n}\r\n0\r\n\r\n").unwrap();
+    });
+    let v = call(&format!("http://127.0.0.1:{port}"), "eth_chainId", json!([]), Duration::from_secs(10)).unwrap();
+    assert_eq!(v, json!(10));
+    server.join().unwrap();
 }
