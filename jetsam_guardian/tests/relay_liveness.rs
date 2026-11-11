@@ -762,9 +762,39 @@ fn coinbase_block(c: &jetsam_guardian::chain::Chain) -> (Vec<u8>, [u8; 32]) {
     (b.to_bytes(), jetsam_chain::consensus::pow::block_id(&b.header))
 }
 
+/// A true deposit block on top of `c`: its coinbase, then one page from a payer of `amount` µJTM to the vault with the
+/// marker naming the recipient 0xa1…a1 (three outputs created); its bytes and id.
+fn deposit_block(c: &jetsam_guardian::chain::Chain, amount: u64) -> (Vec<u8>, [u8; 32]) {
+    use jetsam_chain::consensus::vault::{deposit_marker, VAULT_ADDRESS};
+    use jetsam_poseidon2b::primitives::Address;
+    use jetsam_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS};
+    let (raw, _) = coinbase_block(c);
+    let cb = jetsam_chain::block::Block::from_bytes(&raw).unwrap().transactions.remove(0);
+    let mut inputs = [TxInput::dummy(); TX_INPUTS];
+    inputs[0] = TxInput { slot_index: 100, amount: amount + 47_200, creation_id: 1 };
+    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+    outputs[0] = TxOutput { slot_index: 101, amount, owner: VAULT_ADDRESS };
+    outputs[1] = TxOutput { slot_index: 102, amount: 0, owner: deposit_marker(&[0xa1; 20]) };
+    let page = Transaction::new(TxBody {
+        epoch_anchor: [7; 32],
+        fee: 47_200,
+        input_owner: Address([0x51; 32]),
+        inputs,
+        outputs,
+        validity_bitmap: 1 | PAGED_SPEND_START_BIT | output_bitmap_bit(0) | output_bitmap_bit(1) | PAGED_SPEND_END_BIT,
+        is_coinbase: false,
+    });
+    let transactions = vec![cb, page];
+    let header = next_header(c, jetsam_chain::block::compute_tx_root(&transactions), 3);
+    let b = jetsam_chain::block::Block { header, transactions, client_objects: Vec::new(), destination: None };
+    (b.to_bytes(), jetsam_chain::consensus::pow::block_id(&b.header))
+}
+
 /// RELFIX2 (D171): the bytes an older build kept unreadable are read again by this build at its start, before its
 /// first step: recorded as read ("read again after upgrade"), no longer blocking, also after the nodes pruned them; an
-/// operator's `import-block` of a body that reads replaces an unreadable one (the relayer stopped).
+/// operator's `import-block` of a body that reads replaces an unreadable one (the relayer stopped); kept bytes that
+/// could not be read at the start (their file not there yet; a deposit block) are read again at a retry, its deposit
+/// recorded and its body published.
 #[test]
 fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unreadable() {
     if no_v1_7_clock() {
@@ -777,7 +807,9 @@ fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unrea
     c.extend(jetsam_guardian::chain::HeaderInfo::from_raw(&raw1[1..213]).unwrap()).unwrap();
     let (raw2, id2) = coinbase_block(&c);
     c.extend(jetsam_guardian::chain::HeaderInfo::from_raw(&raw2[1..213]).unwrap()).unwrap();
-    assert_eq!((c.id_at(f + 1), c.id_at(f + 2)), (Some(id1), Some(id2)));
+    let (raw3, id3) = deposit_block(&c, 7_000_000);
+    c.extend(jetsam_guardian::chain::HeaderInfo::from_raw(&raw3[1..213]).unwrap()).unwrap();
+    assert_eq!((c.id_at(f + 1), c.id_at(f + 2), c.id_at(f + 3)), (Some(id1), Some(id2), Some(id3)));
     // the nodes pruned them both
     let bodies = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let chain = Arc::new(Mutex::new(c));
@@ -791,8 +823,12 @@ fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unrea
         let mut ar = jetsam_guardian::relayer::Archive::open(&dir.join("state/archive")).unwrap();
         assert!(ar.keep_unreadable(f + 1, &id1, &[("n0 getBlock".into(), raw1.clone())], "an older build: BadMarker").unwrap());
         assert!(ar.keep_unreadable(f + 2, &id2, &[("n1 getBlock".into(), unknown2.clone())], "BadMarker").unwrap());
+        assert!(ar.keep_unreadable(f + 3, &id3, &[("n0 getDepositBlock".into(), raw3.clone())], "BadMarker").unwrap());
         ar.save().unwrap();
     }
+    // F + 3's kept file is not there at the start (a disk not mounted yet)
+    let file3 = archived(&dir, f + 3, &raw3).1.pop().unwrap();
+    std::fs::rename(&file3, dir.join("away.bin")).unwrap();
     // an operator imports the true body of F + 2 (the relayer stopped)
     std::fs::write(dir.join("b2.bin"), &raw2).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_jg-relay")).arg("--config").arg(dir.join("relay.toml")).args(["import-block", &(f + 2).to_string()]).arg(dir.join("b2.bin")).output().unwrap();
@@ -804,12 +840,20 @@ fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unrea
     let log = || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
     let again = wait_for(60, || log().contains(&format!("block {}: body read again after upgrade, at start", f + 1)));
     let stepped = wait_for(180, || log().contains("ALERT NO_SUBMISSION"));
+    let still = log().contains(&format!("block {}: its kept bytes are still unreadable by this build", f + 3));
+    // back: read again at a retry, without a restart
+    std::fs::rename(dir.join("away.bin"), &file3).unwrap();
+    let retried = wait_for(60, || log().contains(&format!("block {}: body read again at a retry", f + 3)));
     stop(relay);
     let text = log();
     eprintln!("{}", text.lines().filter(|l| l.contains("missing") || l.contains("read again")).collect::<Vec<_>>().join("\n"));
-    assert!(again && stepped, "log:\n{text}");
-    assert!(text.contains("1 of them unreadable"), "{text}");
+    assert!(again && stepped && still && retried, "log:\n{text}");
+    assert!(text.contains("2 of them unreadable"), "{text}");
     assert_eq!(archived(&dir, f + 1, &raw1).0, "Read", "log:\n{text}");
+    assert_eq!(archived(&dir, f + 3, &raw3).0, "Read", "log:\n{text}");
+    assert!(text.contains(&format!("block {}: body read again at a retry (the bytes n0 getDepositBlock served, kept while unreadable): 1 deposits", f + 3)), "{text}");
+    let published = dir.join("publish/blocks").join(format!("{}-{}.bin", f + 3, hex::encode(id3)));
+    assert_eq!(std::fs::read(&published).ok(), Some(raw3.clone()), "the deposit body published");
     assert_eq!(archived(&dir, f + 2, &raw2).0, "Read", "log:\n{text}");
     assert!(!text.contains("ALERT MISSING_DEPOSIT_BODY"), "{text}");
 }

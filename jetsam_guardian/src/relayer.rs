@@ -981,15 +981,15 @@ impl Archive {
 
     /// RELFIX2 (D171): keep `served` (source, bytes), which this build cannot read, for block `height` whose id on the
     /// relayer's chain is `id`, as `Unreadable` (`reason`), beside the copies kept already: only bytes that carry this
-    /// block's header ([`served_block_id`]), one copy a source (its first), each on disk before the index names it.
-    /// False when none is this block's (nothing recorded).
+    /// block's header ([`served_block_id`]), one copy a source (its first), none above [`UNREADABLE_COPY_MAX_BYTES`],
+    /// each on disk before the index names it. False when none is this block's (nothing recorded).
     pub fn keep_unreadable(&mut self, height: u64, id: &[u8; 32], served: &[(String, Vec<u8>)], reason: &str) -> anyhow::Result<bool> {
         let mut copies = match self.index.get(&height) {
             Some(Body::Unreadable { block_id, copies, .. }) if block_id == id => copies.clone(),
             _ => BTreeMap::new(),
         };
         for (source, raw) in served {
-            if copies.contains_key(source) || served_block_id(raw) != Some(*id) {
+            if copies.contains_key(source) || raw.len() > UNREADABLE_COPY_MAX_BYTES || served_block_id(raw) != Some(*id) {
                 continue;
             }
             let copy = hex::encode(crate::keccak256(raw));
@@ -1132,11 +1132,18 @@ pub fn record_from_sources(
         }
     }
     let mut reason = if why.is_empty() { "no source".to_string() } else { why.join("; ") };
+    for (name, raw) in unread.iter().filter(|(_, raw)| raw.len() > UNREADABLE_COPY_MAX_BYTES) {
+        reason.push_str(&format!(" ({name}: {} bytes not kept, above {UNREADABLE_COPY_MAX_BYTES})", raw.len()));
+    }
     if let Err(e) = archive.keep_unreadable(height, id, &unread, &reason) {
         reason.push_str(&format!(" (the bytes served NOT kept: {e:#})"));
     }
     Err(reason)
 }
+
+/// RELFIX2: the largest copy of an unreadable body kept (a source never fills the relayer's disk): four times the largest
+/// block this build knows, room for the larger blocks of a newer rule.
+pub const UNREADABLE_COPY_MAX_BYTES: usize = 4 * jetsam_chain::consensus::wire_limits::MAX_V1_7_BLOCK_BYTES;
 
 /// RELFIX2: the id of the block whose header the bytes `raw` begin with (the block wire's marker, then the 212 bytes
 /// of a header), whatever follows them; `None` when they do not begin with one.

@@ -289,19 +289,20 @@ impl Relay {
         }
     }
 
-    /// RELFIX2 (D171): the kept bytes of the UNREADABLE block `h` read again with this build's rules (`when`: at the
-    /// start, or at a retry); recorded when they read (an upgrade reads what an older build could not). True then.
+    /// RELFIX2 (D171): the kept bytes of the UNREADABLE block `h` read again with this build's rules (`when`: "after
+    /// upgrade, at start", or "at a retry"); recorded when they read (an upgrade reads what an older build could not).
+    /// True then.
     fn read_again(&mut self, h: u64, when: &str) -> bool {
         let Some(id) = self.archive.index.get(&h).map(relayer::Body::block_id) else { return false };
         match self.archive.read_again(h, &self.rules) {
             Some(Ok((source, found))) => {
-                log(&format!("block {h}: body read again after upgrade, {when} (the bytes {source} served, kept while unreadable): {} deposits", found.len()));
+                log(&format!("block {h}: body read again {when} (the bytes {source} served, kept while unreadable): {} deposits", found.len()));
                 self.event(json!({"event": "body_read_again", "height": h, "id": hex::encode(id), "deposits": found.len(), "source": source}));
                 self.body_recorded(h, &id, &source, &found);
                 true
             }
             Some(Err(reason)) => {
-                if when == "at start" {
+                if when != "at a retry" {
                     log(&format!("block {h}: its kept bytes are still unreadable by this build ({reason}): it still blocks"));
                 }
                 false
@@ -1154,7 +1155,7 @@ fn run() -> anyhow::Result<()> {
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
     // RELFIX2 (D171): every body kept unreadable, read again with this build's rules before the first step
-    let again = r.archive.unreadable().into_iter().filter(|h| r.read_again(*h, "at start")).count();
+    let again = r.archive.unreadable().into_iter().filter(|h| r.read_again(*h, "after upgrade, at start")).count();
     if again > 0 {
         r.save();
     }

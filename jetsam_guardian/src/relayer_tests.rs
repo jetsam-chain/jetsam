@@ -1474,3 +1474,23 @@ fn relfix2_an_archive_written_before_unreadable_bodies_opens_and_reads_the_same(
     assert_eq!(again.index, ar.index);
     assert_eq!(again.missing(), vec![70_563, F + 9]);
 }
+
+/// RELFIX2: a copy larger than [`UNREADABLE_COPY_MAX_BYTES`] (four times the largest block this build knows) is never
+/// kept, even with this block's header: a source never fills the relayer's disk; one at the bound is kept.
+#[test]
+fn relfix2_a_copy_larger_than_four_of_the_largest_blocks_is_never_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ar = Archive::open(dir.path()).unwrap();
+    let (raw, id) = raw_and_id(&block_of(F + 1, vec![]));
+    assert_eq!(UNREADABLE_COPY_MAX_BYTES, 4 * jetsam_chain::consensus::wire_limits::MAX_V1_7_BLOCK_BYTES);
+    let mut huge = with_unknown_object(&raw);
+    huge.resize(UNREADABLE_COPY_MAX_BYTES + 1, 0);
+    assert!(!ar.keep_unreadable(F + 1, &id, &[("n0 getBlock".into(), huge.clone())], "BadMarker").unwrap());
+    assert!(ar.index.is_empty() && !dir.path().join("unreadable").exists());
+    let h = huge.clone();
+    let sources: Vec<BodySource> = vec![("n0 getBlock".into(), Box::new(move || Ok(Some(h.clone()))))];
+    let why = record_from_sources(&mut ar, F + 1, &id, sources, &rules()).unwrap_err();
+    assert!(why.contains("not kept") && why.contains(&UNREADABLE_COPY_MAX_BYTES.to_string()), "{why}");
+    huge.truncate(UNREADABLE_COPY_MAX_BYTES);
+    assert!(ar.keep_unreadable(F + 1, &id, &[("n0 getBlock".into(), huge)], "BadMarker").unwrap());
+}
