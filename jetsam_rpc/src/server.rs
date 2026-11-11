@@ -3590,6 +3590,12 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn get_activations(
+        &self,
+    ) -> RpcResult<jetsam_chain::consensus::activations::Activations> {
+        Ok(jetsam_chain::consensus::activations::Activations::current())
+    }
+
     async fn get_advances(
         &self,
         n: u64,
@@ -5827,6 +5833,7 @@ mod rpc_access_tests {
         "jetsam_getChainInfo",
         "jetsam_getAdvances",
         "jetsam_getBlock",
+        "jetsam_getActivations",
     ];
     const MINING: &[&str] = &["jetsam_getBlockTemplate", "jetsam_submitBlock"];
     const COOKIE_ONLY: &[&str] = &[
@@ -6096,6 +6103,15 @@ mod rpc_access_tests {
         ]) {
             assert!(!method_needs_cookie(method), "{method}");
         }
+    }
+
+    /// D171, D176: the node has `getActivations` (a method of the handler,
+    /// wire name `jetsam_getActivations`), a read every guardian program
+    /// reaches as it reaches the others: never behind the cookie.
+    #[test]
+    fn the_activations_are_a_read_of_the_handler_open_without_the_cookie() {
+        let _method = <RpcHandler as crate::api::JetsamApiServer>::get_activations;
+        assert!(!method_needs_cookie("jetsam_getActivations"));
     }
 }
 
