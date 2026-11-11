@@ -354,8 +354,10 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{auth}\r\n",
         body.len()
     );
-    s.write_all(head.as_bytes())?;
-    s.write_all(body)?;
+    // The head and the body in one write (one segment where they fit: a server that reads once gets both).
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    s.write_all(&request)?;
     let mut raw = Vec::new();
     // read the head, then exactly Content-Length bytes (or to the end)
     let mut buf = [0u8; 65_536];
