@@ -433,7 +433,14 @@ pub fn call_via_bearer(
     let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))?;
     let v = post_json(egress, url, &body, timeout, bearer)?;
     if let Some(e) = v.get("error") {
-        anyhow::bail!("{method}: {}", e.get("message").and_then(|m| m.as_str()).unwrap_or(&e.to_string()));
+        let message = e.get("message").and_then(|m| m.as_str()).map_or_else(|| e.to_string(), str::to_string);
+        // a revert's data (a custom error's selector and arguments) is kept: the message of a node says only
+        // "execution reverted" (jg-basezk tells a race from a refused proof by it)
+        if let Some(data) = e.get("data").and_then(Value::as_str).filter(|d| d.starts_with("0x")) {
+            let data: String = data.chars().take(522).collect();
+            anyhow::bail!("{method}: {message} (data {data})");
+        }
+        anyhow::bail!("{method}: {message}");
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
