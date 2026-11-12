@@ -1844,4 +1844,73 @@ mod reopened {
         assert_eq!(cases, 2 * 10 * 2 * 2);
         assert!(paid_by_the_block > 0, "the slow release passes the whole rule somewhere");
     }
+
+    /// D188: the fast release of 3 paid BOB's 7 JTM by mistake; a reserve had
+    /// advanced Base's real burn of 3 (OWNER's), and the fast block left that
+    /// advance held. After the contradiction, the template offers the real
+    /// burner's release only when it repays the reserve (V2), and the block
+    /// it builds passes the block rule and consumes the advance; a release
+    /// paying OWNER (twice paid) is neither offered nor accepted.
+    #[test]
+    fn the_template_repays_the_reserve_that_advanced_the_real_burn_of_a_reopened_n() {
+        use jetsam_chain::consensus::destination::advance::{AdvanceEntry, AdvanceKey};
+        const RESERVE: Address = Address([0x5e; 32]);
+        let w = world();
+        let mut parent =
+            w.parent(&[3], &[(3, fast_record(BOB, 7 * MICRO_PER_JTM, true, false))]);
+        let r = &w.burn;
+        parent.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: RESERVE,
+                creditor: RESERVE,
+                owner: r.owner,
+                amount: r.amount,
+            },
+        );
+        let to_owner = w.slow();
+        let to_reserve = ReleaseIntent {
+            payment: page(
+                VAULT_ADDRESS,
+                1_000,
+                &[(RESERVE, r.amount - RELEASE_FEE_MICRO), (r.marker(), 0)],
+                RELEASE_FEE_MICRO,
+            ),
+            ..w.slow()
+        };
+        assert!(w.plan(&parent, vec![to_owner.clone()]).releases.is_empty());
+        let forced = w.plan(&parent, vec![to_reserve.clone()]);
+        assert_eq!(ns(&forced), vec![3], "the reserve repaid");
+        // The same block paying the owner instead: the rule refuses it.
+        let owner_offer = DestinationOffer {
+            releases: vec![to_owner],
+            ..forced.clone()
+        };
+        let owner_block = w.block(&parent, &owner_offer);
+        assert!(matches!(
+            w.check(&owner_block, &parent),
+            Err(DestinationBlockError::Vault(VaultError::ReleasePaysOtherOwner { .. }))
+        ));
+        let effect = w
+            .check(&w.block(&parent, &forced), &parent)
+            .expect("the block rule accepts the template's block");
+        assert_eq!(effect.vault.releases, vec![(3, r.owner, r.amount)]);
+        assert_eq!(effect.advances.consumed, vec![3]);
+        assert_eq!(effect.fast.consumed, vec![3]);
+        let mut after = parent.clone();
+        after
+            .apply(&effect, w.rules.vault.window_blocks)
+            .expect("the next block");
+        assert!(!after.advances.holds_n(3));
+        assert_eq!(after.advances.outstanding_of(&RESERVE), 0);
+        assert!(after
+            .advances
+            .get(&AdvanceKey {
+                n: 3,
+                owner: r.owner,
+                amount: r.amount
+            })
+            .is_none());
+        assert!(w.plan(&after, vec![to_reserve]).releases.is_empty());
+    }
 }
