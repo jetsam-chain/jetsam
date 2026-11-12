@@ -23,6 +23,10 @@
 //!   (`JTMFCT01` paid by the node's wallet).
 //! * **Revocation** (`jg-relay fast-revoke`): the cold key signs the closing
 //!   of this build's relay key; paid by the node's wallet (`JTMFRV01`).
+//! * **Slow releases** ([`crate::slow_release`], `--slow-release`, a dry run
+//!   unless `send`): each burn the fast lane did not pay (its key closed,
+//!   none armed — `--no-fast` — or not done), under the newest game Base
+//!   holds valid, the same one the contradictions read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -669,9 +673,9 @@ pub fn run_passes(
 pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
-            "fast-run --key <relay secret> --l1 <url> --base <url> --base <url> [--base <url>…] --beacon <url> \
+            "fast-run (--key <relay secret> | --no-fast) --l1 <url> --base <url> --base <url> [--base <url>…] --beacon <url> \
              --node <url> --node-cookie <rpc.cookie> --state-dir <dir> --from-block <Base block of the bridge's deployment> \
-             [--interval <s>, 60] [--once]"
+             [--slow-release off|dry-run|send, dry-run] [--interval <s>, 60] [--once]"
         )
     };
     let say = |line: &str| println!("{} jg-relay fast-run {line}", crate::now_unix());
@@ -680,7 +684,20 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let bridge = rules
         .bridge
         .ok_or_else(|| anyhow!("this build has no bridge on Base (the return over Base is not armed): nothing to run"))?;
-    let secret = crate::fast::load_fast_secret(Path::new(&flag(args, "--key").ok_or_else(usage)?))?;
+    // The fast lane's key, or `--no-fast` (a build without FAST_RELEASE_KEY, or a key the branch closed): no game
+    // is signed, the captures, the contradictions and the slow lane run.
+    let secret = match (flag(args, "--key"), args.iter().any(|a| a == "--no-fast")) {
+        (Some(path), false) => Some(crate::fast::load_fast_secret(Path::new(&path))?),
+        (None, true) => None,
+        _ => return Err(usage()),
+    };
+    let slow = crate::slow_release::SlowConfig {
+        mode: flag(args, "--slow-release")
+            .map(|mode| crate::slow_release::SlowMode::parse(&mode))
+            .transpose()?
+            .unwrap_or_default(),
+        ..crate::slow_release::SlowConfig::default()
+    };
     let l1 = crate::l1::L1::new(&flag(args, "--l1").ok_or_else(usage)?);
     let bases: Vec<crate::l1::L1> = flags(args, "--base").iter().map(|u| crate::l1::L1::new(u)).collect();
     let base = bases.first().ok_or_else(usage)?;
@@ -697,8 +714,10 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     // a node silent at the start is not used before they are read (the captures of Base run whatever it says, as before)
     let mut node = crate::activations::Checked::new(node, &node_url, crate::activations::Scope::All);
     node.at_start(|n| &n.client, "fast-run", &say)?;
-    if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
-        bail!("the key given is not this build's FAST_RELEASE_KEY");
+    if let Some(secret) = &secret {
+        if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
+            bail!("the key given is not this build's FAST_RELEASE_KEY");
+        }
     }
     let dir = std::path::PathBuf::from(flag(args, "--state-dir").ok_or_else(usage)?);
     let captures = dir.join("captures");
@@ -706,6 +725,14 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let state_file = dir.join("fast_run.json");
     let parents_file = dir.join("ancestors.json");
     let games_file = dir.join("games.json");
+    // The slow lane's journal: an unreadable one is never taken for an empty one (fast-run does not start).
+    let slow_file = dir.join("slow_release.json");
+    let slow_dry_dir = dir.join("slow-dry-run");
+    let mut slow_journal = match slow.mode {
+        crate::slow_release::SlowMode::Off => crate::slow_release::SlowJournal::default(),
+        _ => crate::slow_release::SlowJournal::load(&slow_file)
+            .map_err(|e| anyhow!("the slow lane's journal {}: {e:#}: fast-run does not start", slow_file.display()))?,
+    };
     let from_block: u64 = flag(args, "--from-block").ok_or_else(usage)?.parse()?;
     let interval: u64 = flag(args, "--interval").map(|i| i.parse()).transpose()?.unwrap_or(60);
     let once = args.iter().any(|a| a == "--once");
@@ -727,12 +754,16 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         crate::fast::GameCache::new()
     });
     say(&format!(
-        "relay key 0x{}, bridge 0x{}, {} Base RPCs, state {}, parents of {} games known, captures every {CAPTURE_TICK_SECONDS} s",
-        hex::encode(secret.sk_to_pk().compress()),
+        "{}, bridge 0x{}, {} Base RPCs, state {}, parents of {} games known, captures every {CAPTURE_TICK_SECONDS} s, slow releases: {:?}",
+        match &secret {
+            Some(secret) => format!("relay key 0x{}", hex::encode(secret.sk_to_pk().compress())),
+            None => "ALERT FAST the fast lane is off (--no-fast): no game is signed".into(),
+        },
         hex::encode(bridge.address),
         bases.len(),
         state_file.display(),
-        parents.len()
+        parents.len(),
+        slow.mode
     ));
     // Burns and captures (their own thread): what a refused block was told, once per minute at most.
     let mut refusals: BTreeMap<u64, u64> = BTreeMap::new();
@@ -809,7 +840,9 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             s.store(&state_file)
         };
         let (mut signed, mut released) = (0usize, 0usize);
-        for index in next..count {
+        // `--no-fast`: no game is signed (the cursor stays where it is).
+        let to_sign = if secret.is_some() { next..count } else { next..next };
+        for index in to_sign {
             let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
             let mut views = Vec::new();
             for b in &bases {
@@ -834,7 +867,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 }
             };
             signed += 1;
-            let attestation = crate::fast::sign(&statement, &secret);
+            let attestation = crate::fast::sign(&statement, secret.as_ref().expect("a key: nothing to sign without one"));
             let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
                 say(&format!("ALERT FAST CAPTURE game #{index}: no capture of its Base block {}", game.l2_block));
                 advance(index)?;
@@ -873,7 +906,8 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             }
             advance(index)?;
         }
-        // 3. Contradictions: each fast release kept, under the newest game Base holds valid.
+        // 3. Contradictions: each fast release kept; 4. slow releases: each burn the fast lane did not pay. Both under
+        //    the newest game Base holds valid (searched once, only when one of them needs it).
         use crate::light_feed::FeedNode;
         let node = node.get(|n| &n.client)?;
         let lane = node.client.call("getFastLane", json!([]))?;
@@ -885,8 +919,30 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 .collect()
         };
         let open_count = open.len();
-        if !open.is_empty() {
-            let mut valid = None;
+        // The slow lane's burns: an error of its own is an alert, never the end of the pass (nor of its contradictions).
+        let mut slow_report = crate::slow_release::SlowPassReport::default();
+        let wanted = {
+            let (burns, fast_sent) = {
+                let s = lock(&state);
+                (s.burns.clone(), s.sent.clone())
+            };
+            crate::slow_release::slow_wanted(
+                &node.client,
+                &burns,
+                &fast_sent,
+                &mut slow_journal,
+                &slow_file,
+                &slow,
+                crate::now_unix(),
+                &mut slow_report,
+            )
+            .unwrap_or_else(|e| {
+                say(&format!("ALERT SLOW_RELEASE the burns not read: {e:#} (tried again at the next pass)"));
+                Vec::new()
+            })
+        };
+        let mut valid = None;
+        if !open.is_empty() || !wanted.is_empty() {
             // Only the games whose Base block was captured, their status read now (in batches); their address and
             // block are kept. Which one Base holds valid is decided by its proof, as before.
             let started = Instant::now();
@@ -908,60 +964,97 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             }
             let found = found?;
             say(&format!(
-                "contradictions: {open_count} fast releases open; {} of the {CONTRADICTION_WINDOW_GAMES} newest games have a capture, \
-                 their status read in {:.1} s ({} requests, {} calls, {} games read)",
+                "contradictions: {open_count} fast releases open; slow lane: {} burns; {} of the {CONTRADICTION_WINDOW_GAMES} newest games \
+                 have a capture, their status read in {:.1} s ({} requests, {} calls, {} games read)",
+                wanted.len(),
                 found.len(),
                 started.elapsed().as_secs_f64(),
                 stats.requests,
                 stats.calls,
                 games.len().saturating_sub(known)
             ));
-            for game in found {
-                if game.status != jetsam_chain::consensus::destination::base_read::GAME_STATUS_DEFENDER_WINS {
-                    continue;
-                }
-                let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
-                    continue;
-                };
-                let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
-                if let Ok(valid_game) = slow_game_under(&l1_block, &params, &proof) {
-                    valid = Some((valid_game, proof, capture));
-                    break;
-                }
-            }
-            if let Some((game, proof, capture)) = valid {
-                for paid in open {
-                    match contradiction_under(&game, &capture, &paid, &bridge) {
-                        Ok(None) => {}
-                        Ok(Some((preimage, account, contradiction))) => {
-                            say(&format!(
-                                "ALERT FAST CONTRADICTION n {}: Base's final state under game 0x{} holds another word than the burn paid fast",
-                                paid.n,
-                                hex::encode(game.game)
-                            ));
-                            let marker = contradiction_marker(&paid, rules.base_return.fast.release_key);
-                            let sent = node.pay_marker(&marker.0).and_then(|payment| {
-                                contradiction_intent(&contradiction, &finality, &proof, &preimage, account, payment)
-                            }).and_then(|intent| node.submit(&intent));
-                            match sent {
-                                Ok(admitted) => {
-                                    say(&format!("SENT the contradiction of n {}: {admitted}", paid.n));
-                                    let mut s = lock(&state);
-                                    s.contradicted.insert(paid.n);
-                                    s.store(&state_file)?;
-                                }
-                                Err(e) => say(&format!("ALERT FAST CONTRADICTION n {} not sent: {e:#}", paid.n)),
+            valid = crate::slow_release::newest_valid_game(
+                &found,
+                &l1_block,
+                &params,
+                &|l2_block: u64| crate::base_capture::load(&captures, l2_block),
+                &mut |game: &[u8; 20]| crate::fast_release::read_game_proof(&l1, &params, game, l1_block.block_number),
+            )?;
+        }
+        if let Some(found) = valid.as_ref().filter(|_| !open.is_empty()) {
+            let (game, proof, capture) = (&found.game, &found.proof, &found.capture);
+            for paid in open {
+                match contradiction_under(game, capture, &paid, &bridge) {
+                    Ok(None) => {}
+                    Ok(Some((preimage, account, contradiction))) => {
+                        say(&format!(
+                            "ALERT FAST CONTRADICTION n {}: Base's final state under game 0x{} holds another word than the burn paid fast",
+                            paid.n,
+                            hex::encode(game.game)
+                        ));
+                        let marker = contradiction_marker(&paid, rules.base_return.fast.release_key);
+                        let sent = node.pay_marker(&marker.0).and_then(|payment| {
+                            contradiction_intent(&contradiction, &finality, proof, &preimage, account, payment)
+                        }).and_then(|intent| node.submit(&intent));
+                        match sent {
+                            Ok(admitted) => {
+                                say(&format!("SENT the contradiction of n {}: {admitted}", paid.n));
+                                let mut s = lock(&state);
+                                s.contradicted.insert(paid.n);
+                                s.store(&state_file)?;
                             }
+                            Err(e) => say(&format!("ALERT FAST CONTRADICTION n {} not sent: {e:#}", paid.n)),
                         }
-                        Err(why) => say(&format!("ALERT FAST CONTRADICTION n {}: {why}", paid.n)),
                     }
+                    Err(why) => say(&format!("ALERT FAST CONTRADICTION n {}: {why}", paid.n)),
                 }
             }
         }
+        // 4. Slow releases (a dry run writes them under <state-dir>/slow-dry-run/ and sends nothing).
+        if !wanted.is_empty() {
+            if let Err(e) = crate::slow_release::slow_release_pass(
+                &node.client,
+                &rules,
+                &wanted,
+                &finality,
+                valid.as_ref(),
+                &mut slow_journal,
+                &slow_file,
+                &slow_dry_dir,
+                &slow,
+                crate::now_unix(),
+                &crate::fast_release::prove_vault_group,
+                &mut slow_report,
+            ) {
+                say(&format!("ALERT SLOW_RELEASE {e:#} (tried again at the next pass)"));
+            }
+        }
+        for (n, why) in slow_report.refused.iter().chain(&slow_report.not_admitted) {
+            say(&format!("ALERT SLOW_RELEASE burn {n}: {why}"));
+        }
+        for n in &slow_report.gave_up {
+            say(&format!(
+                "ALERT SLOW_RELEASE GAVE_UP burn {n}: handed in {} times and never paid; the operator decides",
+                slow.max_attempts
+            ));
+        }
+        for n in &slow_report.never_payable {
+            say(&format!("ALERT SLOW_RELEASE burn {n}: its owner is an advance marker, never payable over Base"));
+        }
+        for n in &slow_report.sent {
+            say(&format!("SENT slow release of burn {n}"));
+        }
+        for n in &slow_report.dry_run {
+            say(&format!(
+                "DRY RUN, NOT SENT: slow release of burn {n} written to {}",
+                slow_dry_dir.join(format!("slow-release-{n}.hex")).display()
+            ));
+        }
         lock(&state).store(&state_file)?;
         Ok(format!(
-            "L1 finalized block {}, games #{next}..#{count} judged ({signed} signed, {released} sent), {open_count} fast releases open",
-            l1_block.block_number
+            "L1 finalized block {}, games #{next}..#{count} judged ({signed} signed, {released} sent), {open_count} fast releases open; {}",
+            l1_block.block_number,
+            slow_report.summary()
         ))
     };
     let on_error = || {

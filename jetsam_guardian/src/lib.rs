@@ -54,6 +54,7 @@ pub mod relayer;
 pub mod rpc;
 pub mod seal;
 pub mod signer;
+pub mod slow_release;
 #[doc(hidden)]
 pub mod testkit;
 pub mod threshold;
