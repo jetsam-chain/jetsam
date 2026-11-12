@@ -23,6 +23,8 @@ fn measured_2026_11_10() -> KeySet {
         zk_range_hash: h32("3d3713d31a8936563bc56791040067131bb3fa3c0ab8b5e65e9c4cc0755b5fdb"),
         zk_aggregate_hash: h32("00d5a43068d7a9d1eac440a790b776c749ae6516c43f1a572226190cef6fd45a"),
         config_hash: h32("12e9c45f19f9817c6d4385fad29e7a70c355502cf0883e76a9a7e478a85d1360"),
+        // AggregateVerifier 0.3.0's FAST_FINALIZATION_DELAY (1 day), read with the keys since B6
+        fast_finalization_delay: 86_400,
     }
 }
 
