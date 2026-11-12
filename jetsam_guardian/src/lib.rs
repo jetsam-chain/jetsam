@@ -30,6 +30,8 @@
 pub mod activations;
 pub mod aggregator;
 pub mod base_capture;
+pub mod basezk;
+pub mod basezk_backend;
 pub mod ceremony;
 pub mod chain;
 pub mod checkpoint;
