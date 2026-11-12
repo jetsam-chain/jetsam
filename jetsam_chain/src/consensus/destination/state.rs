@@ -1462,6 +1462,68 @@ impl std::fmt::Display for DestinationBlockError {
 
 impl std::error::Error for DestinationBlockError {}
 
+/// D130: the `n` a block's slow releases may pay once more — a fast release
+/// contradicted on the branch, or by the block's own contradictions, whose
+/// real burner is not paid yet — each with the fast record its one more
+/// release must not repeat. None in a block that carries a fast release.
+/// The block's paid set is the branch's but these `n` ([`Self::paid_set`]);
+/// [`validate_block_destination`] reads it, and the mempool's admission and
+/// the template read the same for one release at a time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReopenedReleases {
+    records: BTreeMap<u64, FastRecord>,
+}
+
+impl ReopenedReleases {
+    /// Those of a block on a branch whose fast lane is `lane`: none if the
+    /// block carries a fast release (`fast`); else those the branch reopened
+    /// and those of the block's contradictions `contradicted` (their `n`)
+    /// of a fast release the branch holds.
+    pub fn of_block(lane: &FastLaneState, fast: bool, contradicted: &[u64]) -> Self {
+        let mut records = BTreeMap::new();
+        if !fast {
+            for (n, record) in lane.reopened() {
+                records.insert(n, *record);
+            }
+            for n in contradicted {
+                if let Some(record) = lane.records.get(n) {
+                    records.insert(*n, *record);
+                }
+            }
+        }
+        Self { records }
+    }
+
+    /// The paid set the block's vault gate reads (D52): `released` but the
+    /// reopened `n`.
+    pub fn paid_set(&self, released: &ReleasedSet) -> ReleasedSet {
+        let mut paid = released.clone();
+        for n in self.records.keys() {
+            paid.remove(*n);
+        }
+        paid
+    }
+
+    /// The `n` of the block's releases (`(n, owner, amount)`, as the vault
+    /// gate reads them) that pay a reopened `n`'s real burner; refused, one
+    /// that pays the burn the fast lane paid already.
+    pub fn consumed_by(
+        &self,
+        releases: &[(u64, Address, u64)],
+    ) -> Result<Vec<u64>, DestinationBlockError> {
+        let mut consumed = Vec::new();
+        for (n, owner, amount) in releases {
+            if let Some(record) = self.records.get(n) {
+                if record.owner == *owner && record.amount == *amount {
+                    return Err(DestinationBlockError::RepeatsTheFastRecord { n: *n });
+                }
+                consumed.push(*n);
+            }
+        }
+        Ok(consumed)
+    }
+}
+
 /// The destination rules of a block at or above J against its parent's
 /// destination state (`parent`, from [`DestinationState::for_child`]),
 /// with the committee keys `keys` this node holds.
@@ -1602,21 +1664,10 @@ pub fn validate_block_destination(
 
     // The `n` a slow release may pay once more: a fast release contradicted
     // on the branch or by this block, not yet paid to its real burner.
-    let mut reopened: BTreeMap<u64, FastRecord> = BTreeMap::new();
-    if attestation.is_none() {
-        for (n, record) in parent.fast.reopened() {
-            reopened.insert(n, *record);
-        }
-        for contradiction in &contradictions {
-            if let Some(record) = parent.fast.records.get(&contradiction.n) {
-                reopened.insert(contradiction.n, *record);
-            }
-        }
-    }
-    let mut released = parent.released.clone();
-    for n in reopened.keys() {
-        released.remove(*n);
-    }
+    let contradicted: Vec<u64> = contradictions.iter().map(|c| c.n).collect();
+    let reopened =
+        ReopenedReleases::of_block(&parent.fast, attestation.is_some(), &contradicted);
+    let released = reopened.paid_set(&parent.released);
 
     // The vault gate, its proofs deferred: every rule but V7. From the return
     // over Base on, a release of an advanced burn pays the advance's creditor
@@ -1651,15 +1702,7 @@ pub fn validate_block_destination(
     .map_err(DestinationBlockError::Vault)?;
     // The one more release of a contradicted `n` pays another burn than the
     // one the fast lane paid.
-    let mut consumed = Vec::new();
-    for (n, owner, amount) in &vault.releases {
-        if let Some(record) = reopened.get(n) {
-            if record.owner == *owner && record.amount == *amount {
-                return Err(DestinationBlockError::RepeatsTheFastRecord { n: *n });
-            }
-            consumed.push(*n);
-        }
-    }
+    let consumed = reopened.consumed_by(&vault.releases)?;
 
     // The advances and their claims' transfers, then what the releases
     // consume (the return over Base).

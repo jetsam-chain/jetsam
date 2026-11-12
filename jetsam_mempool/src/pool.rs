@@ -487,7 +487,8 @@ impl AsyncMempool {
     /// update, account proof and release group. Checked here: the bytes, the
     /// v1.7 clock of the next block, the transaction against the current
     /// state (fee, epoch anchor, live inputs, empty outputs), a committee
-    /// payment's marker, a release's index unpaid on the branch and its group
+    /// payment's marker, a release's index unpaid in the block's paid set
+    /// (D130: [`crate::destination::ReleaseIntent::check_unpaid`]) and its group
     /// against the vault gate (`check_release_group`); then, outside the
     /// lock, the L1 rules of the block with the committee keys of the view
     /// (A2-M1, [`crate::destination::verify_destination_intent`]: BLS, the
@@ -1813,11 +1814,11 @@ fn check_destination_admission(
             run_admission_checks_with(&payment.pages, spend, st, Admission::ObjectPayment)?;
         }
         DestinationIntent::Release(release) => {
-            if vault.released.contains(release.release.n) {
-                return Err(vault_submit_error(VaultError::ReleaseAlreadyPaid {
-                    n: release.release.n,
-                }));
-            }
+            // D52, D130: the paid set of the block, the branch's but the `n`
+            // a contradiction reopened for one slow release of another burn.
+            release
+                .check_unpaid(&vault.released, &vault.fast)
+                .map_err(destination_submit_error)?;
             // From the return-over-Base height on a release is proven over
             // Base (objects 5 and 6), never before; and it pays the creditor
             // of the advance of exactly its burn, if the branch holds one
@@ -1888,7 +1889,7 @@ fn destination_submit_error(
 }
 
 /// Forget the destination intents the next block can no longer use: all of
-/// them below J; above, releases whose index the branch paid or whose vault
+/// them below J; above, releases its paid set refuses (D52, D130) or whose vault
 /// slots are no longer live as their group spends them, and committee updates
 /// for a period the branch already knows.
 fn prune_destination(st: &mut MempoolState, next_height: u64) {
@@ -1903,7 +1904,7 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
     let view = &st.view;
     let over_base = view.destination_rules.base_return.active_at(next_height);
     let forgotten = st.destination.prune(
-        |n| vault.released.contains(n),
+        |release| release.check_unpaid(&vault.released, &vault.fast).is_err(),
         |release| {
             // Proven for the other side of the return-over-Base height, or
             // paying another than V2 now asks (an advance made meanwhile).
@@ -4717,5 +4718,255 @@ mod tests {
         pool.update_chain_view(over_base_view(to_owner.view_at(tip, &[]), &[(burn.n, advance)]))
             .await;
         assert!(pool.destination_candidates().await.1.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // D130: the `n` a contradiction reopens (the block's paid set)
+    // -----------------------------------------------------------------------
+
+    /// The L2 block of the fast releases of these tests.
+    const FAST_L2: u64 = 56_993_063;
+
+    /// A fast release of 3 (Base's burn `(3, ALICE, 5 JTM)`) the branch
+    /// paid to another burn, BOB's 7 JTM, under a game Base never held valid.
+    fn fast_paid_to_bob(tip: u64) -> jetsam_chain::consensus::destination::fast::FastRecord {
+        jetsam_chain::consensus::destination::fast::FastRecord {
+            owner: BOB,
+            amount: 7_000_000,
+            l2_block: FAST_L2,
+            height: tip - 3,
+            contradicted: false,
+            consumed: false,
+        }
+    }
+
+    /// The view of `case` at `tip` over Base: `paid` paid, and the fast lane
+    /// holding `records`.
+    fn reopened_view(
+        case: &ReleaseCase,
+        tip: u64,
+        paid: &[u64],
+        records: &[(u64, jetsam_chain::consensus::destination::fast::FastRecord)],
+    ) -> ChainView {
+        let mut view = over_base_view(case.view_at(tip, paid), &[]);
+        for (n, record) in records {
+            view.vault.as_mut().unwrap().fast.records.insert(*n, *record);
+        }
+        view
+    }
+
+    /// `case` as a fast release (its group carrying the fast lane's marker of
+    /// [`FAST_L2`], an attestation that decodes).
+    fn as_fast_release(case: &ReleaseCase) -> ReleaseCase {
+        use jetsam_chain::consensus::destination::fast::{
+            fast_release_marker, FastAttestation, FastStatement,
+        };
+        case.with(|r| {
+            let statement = FastStatement {
+                network: jetsam_chain::consensus::guardian::network_id(),
+                l1_chain_id: 1,
+                base_chain_id: 8_453,
+                bridge: [0x1b; 20],
+                game: [0x5e; 20],
+                l2_block: FAST_L2,
+                root_claim: [0x7b; 32],
+            };
+            let mut body = r.payment.pages[0].body.clone();
+            body.outputs[1].owner =
+                fast_release_marker(r.release.n, &r.release.owner, r.release.amount, FAST_L2);
+            r.payment = jetsam_tx::PagedSpendIntent::new(
+                vec![TxPage::new(body).unwrap()],
+                vec![0xA5; 64],
+            )
+            .unwrap();
+            r.fast = Some(
+                FastAttestation {
+                    statement,
+                    signature: [0; 96],
+                }
+                .encode_payload(),
+            );
+        })
+    }
+
+    /// Whether `result` is a refusal of the block's paid set for `n` (D52:
+    /// paid already; D130: a release of a reopened `n` that repeats the
+    /// burn the fast lane paid).
+    fn refused_as_paid(
+        result: &Result<crate::destination::DestinationAdmitted, super::SubmitError>,
+        n: u64,
+    ) -> bool {
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        use jetsam_chain::consensus::vault::VaultError;
+        matches!(
+            result,
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(
+                    E::Vault(VaultError::ReleaseAlreadyPaid { n: a }) | E::RepeatsTheFastRecord { n: a }
+                ),
+            )) if *a == n
+        )
+    }
+
+    /// D130 (RET24 NODEGAP): a fast release contradicted on the branch, its
+    /// real burner not paid yet, reopens its `n` for one slow release of
+    /// another burn: the block's paid set is the branch's but that `n`
+    /// (`validate_block_destination`). The pool admits the real burner's slow
+    /// release over Base and keeps it while the view moves, then forgets it
+    /// once the branch paid it (the record consumed). Refused, as the block
+    /// refuses them: the burn the fast lane paid (the contradicted triplet), a
+    /// second release once the real burner is paid, an `n` whose fast release
+    /// is not contradicted, a fast release of a reopened `n`, and — reopened
+    /// or not — a burn owned by an advance marker.
+    #[tokio::test]
+    async fn over_base_a_contradicted_fast_release_reopens_its_n_for_its_real_burner_once() {
+        use jetsam_chain::consensus::destination::advance::advance_marker;
+        use jetsam_chain::consensus::destination::fast::FastRecord;
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        use jetsam_chain::consensus::vault::VaultError;
+        let tip = BASE_HEIGHT + 5;
+        let base = crate::destination::tests::SyntheticBase::load();
+        let burn = base.release.clone();
+        assert_eq!((burn.n, burn.owner, burn.amount), (3, ALICE, 5_000_000));
+        let real = ReleaseCase::over_base(tip, ALICE);
+        let contradicted = FastRecord {
+            contradicted: true,
+            ..fast_paid_to_bob(tip)
+        };
+        let consumed = FastRecord {
+            consumed: true,
+            ..contradicted
+        };
+        // Admitted, and kept while the view moves (the prune reads the same
+        // paid set as the admission).
+        let view = || reopened_view(&real, tip, &[3], &[(3, contradicted)]);
+        let pool = pool_over(view());
+        assert_eq!(
+            real.submit(&pool).await.expect("the real burner of a reopened n"),
+            crate::destination::DestinationAdmitted::ReleaseOverBase { n: 3 }
+        );
+        pool.update_chain_view(view()).await;
+        pool.on_new_block(&[], tip, view()).await;
+        assert_eq!(pool.destination_candidates().await.1.len(), 1);
+        // The branch paid it (the record consumed): forgotten.
+        pool.update_chain_view(reopened_view(&real, tip, &[3], &[(3, consumed)]))
+            .await;
+        assert!(pool.destination_candidates().await.1.is_empty());
+        // Refused, unheld.
+        let repeat = FastRecord {
+            owner: ALICE,
+            amount: 5_000_000,
+            ..contradicted
+        };
+        let fast = as_fast_release(&real);
+        for (case, records, expected) in [
+            (&real, vec![(3, consumed)], E::Vault(VaultError::ReleaseAlreadyPaid { n: 3 })),
+            (&real, vec![(3, fast_paid_to_bob(tip))], E::Vault(VaultError::ReleaseAlreadyPaid { n: 3 })),
+            (&real, vec![], E::Vault(VaultError::ReleaseAlreadyPaid { n: 3 })),
+            (&real, vec![(3, repeat)], E::RepeatsTheFastRecord { n: 3 }),
+            (&fast, vec![(3, contradicted)], E::Vault(VaultError::ReleaseAlreadyPaid { n: 3 })),
+        ] {
+            let pool = pool_over(reopened_view(case, tip, &[3], &records));
+            assert_eq!(
+                destination_refusal(case.submit(&pool).await),
+                Some(expected),
+                "{records:?}"
+            );
+            assert!(pool.destination_candidates().await.1.is_empty());
+        }
+        // A burn owned by an advance marker: never payable over Base.
+        let tagged = advance_marker(9, &ALICE, 1, &PAYER);
+        let marker_owner = ReleaseCase::over_base_of(
+            tip,
+            jetsam_chain::consensus::vault::VaultRelease {
+                owner: tagged,
+                ..burn.clone()
+            },
+            tagged,
+        );
+        let pool = pool_over(reopened_view(&marker_owner, tip, &[3], &[(3, contradicted)]));
+        assert_eq!(
+            destination_refusal(marker_owner.submit(&pool).await),
+            Some(E::Vault(VaultError::ReleaseShape { group: 0 }))
+        );
+    }
+
+    /// D52, D130, every branch of a small world: the pool refuses a release
+    /// for the paid set exactly when the block does — for an `n` no
+    /// contradiction reopens, exactly when the branch paid it, as before; for
+    /// a reopened `n` (a slow release, its fast record contradicted and not
+    /// consumed) exactly when it repeats the fast record's burn. Another `n`
+    /// reopened changes nothing. (The block's own verdict on the same world
+    /// is `jetsam_miner`'s `the_template_and_the_block_agree_on_every_paid_set`.)
+    #[tokio::test]
+    async fn the_pool_refuses_for_the_paid_set_exactly_what_the_block_refuses() {
+        use jetsam_chain::consensus::destination::fast::FastRecord;
+        let tip = BASE_HEIGHT + 5;
+        let real = ReleaseCase::over_base(tip, ALICE);
+        let fast = as_fast_release(&real);
+        let record = |owner: Address, amount: u64, contradicted: bool, consumed: bool| FastRecord {
+            owner,
+            amount,
+            contradicted,
+            consumed,
+            ..fast_paid_to_bob(tip)
+        };
+        let mut records: Vec<Option<FastRecord>> = vec![None];
+        for (owner, amount) in [(ALICE, 5_000_000), (BOB, 5_000_000), (ALICE, 7_000_000)] {
+            for (contradicted, consumed) in [(false, false), (true, false), (true, true)] {
+                records.push(Some(record(owner, amount, contradicted, consumed)));
+            }
+        }
+        let mut cases = 0;
+        let mut admitted = 0;
+        for paid in [false, true] {
+            for record in &records {
+                for other_reopened in [false, true] {
+                    for (case, is_fast) in [(&real, false), (&fast, true)] {
+                        let mut held = Vec::new();
+                        if let Some(record) = record {
+                            held.push((3, *record));
+                        }
+                        if other_reopened {
+                            held.push((5, record_contradicted_elsewhere(tip)));
+                        }
+                        let ns: &[u64] = if paid { &[3, 5] } else { &[5] };
+                        let pool = pool_over(reopened_view(case, tip, ns, &held));
+                        let result = case.submit(&pool).await;
+                        let reopened = !is_fast && record.is_some_and(|r| r.contradicted && !r.consumed);
+                        let expected = if reopened {
+                            record.is_some_and(|r| (r.owner, r.amount) == (ALICE, 5_000_000))
+                        } else {
+                            paid
+                        };
+                        assert_eq!(
+                            refused_as_paid(&result, 3),
+                            expected,
+                            "paid {paid}, record {record:?}, other {other_reopened}, fast {is_fast}: {result:?}"
+                        );
+                        if !reopened {
+                            // Nothing relaxed for an `n` no contradiction reopens.
+                            assert_eq!(refused_as_paid(&result, 3), paid);
+                        }
+                        cases += 1;
+                        admitted += usize::from(result.is_ok());
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 10 * 2 * 2);
+        // The slow release is admitted wherever the paid set lets it (the
+        // fast one is refused later, for its key).
+        assert!(admitted > 0);
+    }
+
+    /// A fast release of 5 the branch contradicted, its real burner not paid.
+    fn record_contradicted_elsewhere(tip: u64) -> jetsam_chain::consensus::destination::fast::FastRecord {
+        jetsam_chain::consensus::destination::fast::FastRecord {
+            owner: STRANGER,
+            amount: 1_000_000,
+            contradicted: true,
+            ..fast_paid_to_bob(tip)
+        }
     }
 }

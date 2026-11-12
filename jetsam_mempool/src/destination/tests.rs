@@ -579,7 +579,7 @@ fn destination_pool_holds_one_per_period_and_index_within_bounds() {
     pool.hold(base).unwrap();
     assert_eq!(pool.committee_updates().count(), MAX_HELD_COMMITTEE_UPDATES);
 
-    let forgotten = pool.prune(|n| n == 3, |r| r.release.n == 5, Some(period + 1));
+    let forgotten = pool.prune(|r| r.release.n == 3, |r| r.release.n == 5, Some(period + 1));
     assert_eq!(
         forgotten,
         2 + 2,
