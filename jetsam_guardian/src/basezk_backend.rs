@@ -20,6 +20,12 @@
 //!   the session's receipt), which the supervisor sends with its own signer. basectl v1.5.4 has no command that prints
 //!   them: that command is the operator's (a small tool built against base/base).
 //!
+//! * `prove_balance`, `kind = "network"`: the operator's `balance_command` prints the PROVE balance of the stack's
+//!   requester account (basectl reports no price, and the network's auction has no maximum price: the balance going
+//!   down is the only measure of what the proofs cost). basectl has no option to cap a request's price nor its own
+//!   submission's fees; the stack's `MAX_PROOF_RETRIES` (prover-service, 3 by default) should be set to 0 so that only
+//!   the supervisor decides to pay again.
+//!
 //! The submitter's key reaches basectl only as `--private-key-file` (the configured key file): the environment
 //! variable `BASECTL_SUBMITTER_PRIVATE_KEY` is removed from every child's environment.
 
@@ -183,6 +189,14 @@ pub fn parse_submit(out: &str, game: &[u8; 20]) -> anyhow::Result<String> {
     Ok(tx.to_string())
 }
 
+/// H2: the PROVE balance a `balance_command` printed: one finite decimal number, at least 0.
+pub fn parse_balance(out: &str) -> anyhow::Result<f64> {
+    let t = out.trim();
+    let b: f64 = t.parse().map_err(|_| anyhow!("balance_command printed {}: not a decimal number", short(t)))?;
+    ensure!(b.is_finite() && b >= 0.0, "balance_command printed {b}: not a balance");
+    Ok(b)
+}
+
 /// The on-chain proof bytes a `proof_bytes_command` printed: hex (an optional `0x`), the ZK proof type first, then
 /// at least the verifier's 4-byte selector.
 pub fn parse_proof_bytes(out: &str) -> anyhow::Result<Vec<u8>> {
@@ -319,6 +333,14 @@ impl ZkBackend for BasectlBackend {
                 Ok(Delivery::Bytes(parse_proof_bytes(&out)?))
             }
         }
+    }
+
+    fn prove_balance(&mut self) -> anyhow::Result<Option<f64>> {
+        if self.cfg.balance_command.is_empty() {
+            return Ok(None);
+        }
+        let out = self.run(&self.cfg.balance_command, self.cfg.timeout_secs, "balance_command")?;
+        Ok(Some(parse_balance(&out)?))
     }
 }
 

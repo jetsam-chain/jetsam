@@ -29,6 +29,7 @@ fn cfg(kind: BackendKind, delivery: DeliveryMode, basectl: &str) -> BackendConfi
         retry_base_secs: 60,
         retry_max_secs: 3_600,
         alert_after_attempts: 5,
+        balance_command: Vec::new(),
     }
 }
 
@@ -152,6 +153,32 @@ fn proof_bytes_are_hex_of_a_zk_proof() {
     assert!(parse_proof_bytes("0x015a09").is_err(), "no room for the verifier selector");
     assert!(parse_proof_bytes("0xzz").is_err());
     assert!(parse_proof_bytes("").is_err());
+}
+
+#[test]
+fn the_prove_balance_is_one_decimal_number() {
+    assert_eq!(parse_balance(" 1234.5\n").unwrap(), 1234.5);
+    assert_eq!(parse_balance("0").unwrap(), 0.0);
+    for bad in ["", "12 PROVE", "-1", "NaN", "inf", "0x10"] {
+        assert!(parse_balance(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn the_backend_reads_the_prove_balance_with_the_operators_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = dir.path().join("balance");
+    std::fs::write(&cmd, "#!/bin/sh\necho 987.25\n").unwrap();
+    std::fs::set_permissions(&cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut c = cfg(BackendKind::Network, DeliveryMode::ProofBytesCommand, "/unused");
+    let mut b = BasectlBackend::new(c.clone(), FACTORY, "http://127.0.0.1:8545", Some("/k".into()));
+    assert_eq!(b.prove_balance().unwrap(), None, "no balance_command: not known here");
+    c.balance_command = vec![cmd.to_str().unwrap().into()];
+    let mut b = BasectlBackend::new(c.clone(), FACTORY, "http://127.0.0.1:8545", Some("/k".into()));
+    assert_eq!(b.prove_balance().unwrap(), Some(987.25));
+    c.balance_command = vec!["/bin/sh".into(), "-c".into(), "echo nope; exit 3".into()];
+    let mut b = BasectlBackend::new(c, FACTORY, "http://127.0.0.1:8545", Some("/k".into()));
+    assert!(b.prove_balance().is_err());
 }
 
 #[test]
