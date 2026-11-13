@@ -644,6 +644,18 @@ pub enum HoldError {
     NoPeriod,
 }
 
+/// What [`DestinationPool::hold`] changed (NO-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// A key (period, `n`, revocation) the pool did not hold: the next
+    /// template's offer may change.
+    New,
+    /// Another intent for a key held: it replaces the held one.
+    Replaced,
+    /// The very intent held already: nothing changed.
+    Same,
+}
+
 /// A2-M1: the L1 rules of the block for one destination intent, on a branch
 /// that knows `committees` with the keys `keys` this node holds — what
 /// `validate_block_destination` asks of the object beside the vault gate: a
@@ -782,14 +794,51 @@ pub fn check_object_payment_vault(pages: &[TxPage], rules: &VaultRules) -> Resul
     Ok(())
 }
 
+/// NO-1 (audit 13/11): the fast lane's markers of the block rule
+/// (`validate_block_destination`) applied to one transaction that travels
+/// without a fast-lane object — a plain one — offered for the block at
+/// `height`: from the return-over-Base height on, the block counts every
+/// `JTMFCT01` / `JTMFRV01` output among its user groups and asks one
+/// contradiction or revocation object for each, none carrying value, so a
+/// plain transaction carrying one makes every block that carries it refused.
+/// Refused with the block's own error, in its order. Inert below that height
+/// (the rule does not read them there).
+pub fn check_plain_fast_markers(
+    pages: &[TxPage],
+    height: u64,
+    rules: &DestinationRules,
+) -> Result<(), DestinationBlockError> {
+    if !rules.base_return.active_at(height) {
+        return Ok(());
+    }
+    for (_, output) in pages.iter().flat_map(|page| page.body.live_outputs()) {
+        if fast_marker_kind(&output.owner).is_some() {
+            return Err(if output.amount != 0 {
+                DestinationBlockError::FastMarkerCarriesValue
+            } else {
+                DestinationBlockError::FastObjectsDoNotMatchMarkers
+            });
+        }
+    }
+    Ok(())
+}
+
 impl DestinationPool {
     /// Hold `intent` — verified at admission ([`verify_destination_intent`]):
     /// no intent that does not verify is ever held, so none replaces a held
     /// one — replacing the one of the same period or index (the newer proof
     /// wins: a relayer refreshes a release under a later finality update). A
     /// full release pool makes room for a lower index than its largest.
-    pub fn hold(&mut self, intent: DestinationIntent) -> Result<(), HoldError> {
-        match intent {
+    pub fn hold(&mut self, intent: DestinationIntent) -> Result<Held, HoldError> {
+        // NO-2: what the hold changed, for the caller to announce only that.
+        fn change<T: PartialEq>(held: Option<&T>, new: &T) -> Held {
+            match held {
+                Some(held) if held == new => Held::Same,
+                Some(_) => Held::Replaced,
+                None => Held::New,
+            }
+        }
+        let held = match intent {
             DestinationIntent::CommitteeUpdate(update) => {
                 let period = update.next_period().ok_or(HoldError::NoPeriod)?;
                 if !self.committee_updates.contains_key(&period)
@@ -797,7 +846,9 @@ impl DestinationPool {
                 {
                     return Err(HoldError::Full);
                 }
+                let held = change(self.committee_updates.get(&period), &update);
                 self.committee_updates.insert(period, update);
+                held
             }
             DestinationIntent::Release(release) => {
                 let n = release.release.n;
@@ -811,7 +862,9 @@ impl DestinationPool {
                         _ => return Err(HoldError::Full),
                     }
                 }
+                let held = change(self.releases.get(&n), &release);
                 self.releases.insert(n, release);
+                held
             }
             DestinationIntent::FastContradiction(c) => {
                 let n = c.n();
@@ -820,13 +873,17 @@ impl DestinationPool {
                 {
                     return Err(HoldError::Full);
                 }
+                let held = change(self.contradictions.get(&n), &c);
                 self.contradictions.insert(n, c);
+                held
             }
             DestinationIntent::FastRevocation(r) => {
+                let held = change(self.revocation.as_ref(), &r);
                 self.revocation = Some(r);
+                held
             }
-        }
-        Ok(())
+        };
+        Ok(held)
     }
 
     /// Contradictions by increasing `n`.
@@ -889,6 +946,21 @@ impl DestinationPool {
             .retain(|_, release| !paid(release) && !stale(release));
         if let Some(known) = known_period {
             self.committee_updates.retain(|period, _| *period > known);
+        }
+        before - self.len()
+    }
+
+    /// Forget every intent, of any kind, whose transaction `stale` says the
+    /// next block can no longer place (NO-5, NO-7). Returns the number
+    /// forgotten.
+    pub fn forget_payments(&mut self, stale: impl Fn(&PagedSpendIntent) -> bool) -> usize {
+        let before = self.len();
+        self.committee_updates
+            .retain(|_, update| !stale(&update.payment));
+        self.releases.retain(|_, release| !stale(&release.payment));
+        self.contradictions.retain(|_, c| !stale(&c.payment));
+        if self.revocation.as_ref().is_some_and(|r| stale(&r.payment)) {
+            self.revocation = None;
         }
         before - self.len()
     }

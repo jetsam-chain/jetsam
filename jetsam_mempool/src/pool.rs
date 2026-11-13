@@ -583,7 +583,7 @@ impl AsyncMempool {
             }
             DestinationIntent::FastRevocation(_) => DestinationAdmitted::FastRevocation,
         };
-        st.destination.hold(intent).map_err(|error| match error {
+        let held = st.destination.hold(intent).map_err(|error| match error {
             HoldError::Full => SubmitError::Full {
                 capacity: crate::destination::MAX_HELD_RELEASES,
             },
@@ -591,16 +591,24 @@ impl AsyncMempool {
                 SubmitError::MalformedIntent("committee update without a period".into())
             }
         })?;
-        let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
-            release: match admitted {
-                DestinationAdmitted::Release { n }
-                | DestinationAdmitted::ReleaseOverBase { n }
-                | DestinationAdmitted::FastRelease { n } => Some(n),
-                DestinationAdmitted::CommitteeUpdate { .. }
-                | DestinationAdmitted::FastContradiction { .. }
-                | DestinationAdmitted::FastRevocation => None,
-            },
-        });
+        // NO-2: a replay announces nothing; a replacement of a held key is
+        // relayed (a refresh travels) but wakes no miner (the key was
+        // offered already); only a new key may change the next offer.
+        if held == crate::destination::Held::Same {
+            return Ok(admitted);
+        }
+        if held == crate::destination::Held::New {
+            let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
+                release: match admitted {
+                    DestinationAdmitted::Release { n }
+                    | DestinationAdmitted::ReleaseOverBase { n }
+                    | DestinationAdmitted::FastRelease { n } => Some(n),
+                    DestinationAdmitted::CommitteeUpdate { .. }
+                    | DestinationAdmitted::FastContradiction { .. }
+                    | DestinationAdmitted::FastRevocation => None,
+                },
+            });
+        }
         let _ = self.events.send(MempoolEvent::BridgeIntentAdmitted {
             intent_bytes: Arc::from(bytes),
         });
@@ -1030,6 +1038,7 @@ impl AsyncMempool {
         // v1.7: likewise for the vault rule (crossing J, reorg).
         evict_vault_violations(&mut st, next_height, &self.events);
         evict_advance_violations(&mut st, next_height, &self.events);
+        evict_fast_marker_violations(&mut st, next_height, &self.events);
         evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1197,6 +1206,7 @@ impl AsyncMempool {
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
             + evict_advance_violations(&mut st, next_height, &self.events)
+            + evict_fast_marker_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1220,6 +1230,7 @@ impl AsyncMempool {
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
             + evict_advance_violations(&mut st, next_height, &self.events)
+            + evict_fast_marker_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
@@ -1389,8 +1400,10 @@ fn run_admission_checks_with(
     // M-1 (audit 2026-11-10): a group the template builder never places — 256
     // touched segments beside the coinbase's — stayed here unmined, relayed to
     // every node, its fee their floor. Judged by the builder's own predicate,
-    // before any state read.
-    if pool_rules {
+    // before any state read. NO-4 (audit 13/11): an object's payment too — a
+    // committee update re-wrapped in one replaced the honest one and, never
+    // placed, kept every release and contradiction out of the blocks.
+    {
         let group: Vec<jetsam_tx::Transaction> = pages
             .iter()
             .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
@@ -1421,6 +1434,14 @@ fn run_admission_checks_with(
         // bridge opening (V1, V4, V4-d), and V8 against the tip's vault.
         check_plain_vault_admission(pages, st, st.view.tip_height.saturating_add(1))
             .map_err(vault_submit_error)?;
+        // NO-1: no fast-lane marker without its object (the return over
+        // Base on): the block rule would refuse every block carrying it.
+        crate::destination::check_plain_fast_markers(
+            pages,
+            st.view.tip_height.saturating_add(1),
+            &st.view.destination_rules,
+        )
+        .map_err(destination_submit_error)?;
     } else if let Some(owner) = pages
         .iter()
         .map(|page| page.body.input_owner)
@@ -1672,6 +1693,51 @@ fn evict_advance_violations(
         let _ = events.send(MempoolEvent::TxEvicted {
             hash: *hash,
             reason: EvictReason::AdvanceRule,
+        });
+    }
+    refused.len()
+}
+
+/// NO-1: evict every entry carrying a fast-lane marker the block at
+/// `next_height` would refuse ([`crate::destination::check_plain_fast_markers`]):
+/// crossing the return-over-Base height, a reorg. Inert below that height.
+/// Returns the number evicted; the caller rebuilds the slot sets.
+fn evict_fast_marker_violations(
+    st: &mut MempoolState,
+    next_height: u64,
+    events: &broadcast::Sender<MempoolEvent>,
+) -> usize {
+    if !st
+        .view
+        .destination_rules
+        .base_return
+        .active_at(next_height)
+    {
+        return 0;
+    }
+    let refused: Vec<TxBodyHash> = st
+        .pool
+        .iter()
+        .filter(|(_, entry)| {
+            crate::destination::check_plain_fast_markers(
+                &entry.pages,
+                next_height,
+                &st.view.destination_rules,
+            )
+            .is_err()
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in &refused {
+        st.pool.remove(hash);
+        tracing::info!(
+            ?hash,
+            next_height,
+            "tx evicted: no block from the return-over-Base height may carry its fast-lane marker"
+        );
+        let _ = events.send(MempoolEvent::TxEvicted {
+            hash: *hash,
+            reason: EvictReason::FastLaneRule,
         });
     }
     refused.len()
@@ -1945,9 +2011,42 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
         vault.committees.last().map(|committee| committee.period),
     );
     let forgotten = forgotten + st.destination.prune_fast(&vault.fast);
+    // NO-5, NO-7: any intent whose transaction the next block can no longer
+    // place as it is — its epoch anchor no longer accepted, an input no
+    // longer live as it spends it, an output slot filled.
+    let forgotten = forgotten
+        + st
+            .destination
+            .forget_payments(|payment| !payment_still_applies(payment, view));
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
+}
+
+/// NO-5, NO-7: whether the transaction of a held destination intent still
+/// applies to the block after `view`'s tip as admission judged it: its epoch
+/// anchor one that block accepts, every input live as it spends it, every
+/// output slot empty. A slot the view cannot read counts as not applying.
+fn payment_still_applies(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
+    use jetsam_chain::fri_state::SlotValue;
+    let (accepted, generation) = view.accepted_user_epoch_anchors();
+    let Some(first) = payment.pages.first() else {
+        return false;
+    };
+    if !accepted.accepts(first.body.epoch_anchor, generation) {
+        return false;
+    }
+    let owner = first.body.input_owner;
+    payment.pages.iter().all(|page| {
+        page.body.live_inputs().all(|(_, input)| {
+            view.try_slot(input.slot_index).is_ok_and(|slot| {
+                slot == SlotValue::with_owner_fields(input.amount, input.creation_id, owner.as_fields())
+            })
+        }) && page
+            .body
+            .live_outputs()
+            .all(|(_, output)| view.try_slot(output.slot_index).is_ok_and(|slot| slot == SlotValue::EMPTY))
+    })
 }
 
 fn guardian_submit_error(error: jetsam_chain::consensus::guardian::GuardianError) -> SubmitError {
@@ -4117,6 +4216,57 @@ mod tests {
         assert!(relayed_bridge_intents(&mut paid_events).is_empty());
     }
 
+    /// NO-2 (audit 13/11): the miners are woken (and the intent relayed) by
+    /// what changes the next template's offer, not by a replay. The same
+    /// bytes again: accepted as held already, nothing announced, nothing
+    /// relayed. Another intent for a key already held (the same `n`, its
+    /// payment re-wrapped): it replaces the held one and is relayed (a
+    /// relayer's refresh travels), but wakes no miner — the held key was
+    /// already offered.
+    #[tokio::test]
+    async fn a_replayed_destination_intent_is_not_admitted_again() {
+        use crate::destination::DestinationIntent;
+        use crate::event::MempoolEvent;
+        let drain = |events: &mut tokio::sync::broadcast::Receiver<MempoolEvent>| {
+            let (mut woken, mut relayed) = (0, 0);
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    MempoolEvent::DestinationObjectAdmitted { .. } => woken += 1,
+                    MempoolEvent::BridgeIntentAdmitted { .. } => relayed += 1,
+                    _ => {}
+                }
+            }
+            (woken, relayed)
+        };
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        let mut events = pool.subscribe();
+        let bytes = case.intent.encode().unwrap();
+        pool.submit_destination(&bytes).await.expect("a valid release intent");
+        assert_eq!(drain(&mut events), (1, 1), "a new key: woken and relayed");
+        for _ in 0..3 {
+            pool.submit_destination(&bytes)
+                .await
+                .expect("the same bytes: held already");
+        }
+        assert_eq!(drain(&mut events), (0, 0), "a replay: nothing");
+        let DestinationIntent::Release(mut rewrapped) = case.intent.clone() else {
+            unreachable!()
+        };
+        rewrapped.payment =
+            jetsam_tx::PagedSpendIntent::new(rewrapped.payment.pages.clone(), vec![0xA6; 64])
+                .unwrap();
+        let rewrapped = DestinationIntent::Release(rewrapped);
+        pool.submit_destination(&rewrapped.encode().unwrap())
+            .await
+            .expect("the same release re-wrapped");
+        assert_eq!(drain(&mut events), (0, 1), "a replacement: relayed, no miner woken");
+        let (_, held) = pool.destination_candidates().await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].payment.authorization_bytes, vec![0xA6; 64], "the newer one is held");
+    }
+
     /// T2.5: a release intent (object, finality update, account proof, and
     /// the release group spending the vault) is held for the template; the
     /// same group alone is a plain vault spend and is refused; an index the
@@ -4230,6 +4380,215 @@ mod tests {
         view.vault = case.view_at(tip + 1, &[]).vault;
         pool.update_chain_view(view).await;
         assert!(pool.destination_candidates().await.1.is_empty(), "spent");
+    }
+
+    /// NO-4 (audit 13/11): the template builder never places a group that
+    /// touches more than 256 segments beside the coinbase's; the pool refused
+    /// such a plain transaction (M-1) but held it as an object's payment — a
+    /// committee update re-wrapped in one replaced the honest one, was offered
+    /// (so no release, no contradiction rode beside it), never placed, never
+    /// blamed. Every payment is now held to the builder's predicate.
+    #[tokio::test]
+    async fn an_object_payment_no_template_carries_is_refused() {
+        use crate::SubmitError;
+        use jetsam_chain::consensus::destination::state::committee_update_marker;
+        use jetsam_chain::consensus::params::coinbase_creation_id;
+        let tip = CROSSING_J + 20;
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let owner = Address([0xA5; 32]);
+        // log_slots 24: 256 segments of 2^16 slots; the input in segment 0,
+        // one output in each of the 255 others (the last one the marker).
+        let mut state = ChainState::with_log_slots(24);
+        state
+            .state
+            .set_slot(1, SlotValue::with_owner_fields(M1_INPUT, coinbase_creation_id(3), owner.as_fields()))
+            .unwrap();
+        let mut view = view_of(&state, tip);
+        view.vault = Some(crate::view::VaultView {
+            bridge_locked: 0,
+            released: Default::default(),
+            floor: 0,
+            committees: Vec::new(),
+            advances: Default::default(),
+            fast: Default::default(),
+        });
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(&payload)
+            .unwrap()
+            .next_sync_committee
+            .hash_tree_root();
+        view.destination_rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let group = |outputs: &[(u32, Address, u64)], fee: u64| {
+            let page_count = outputs.len().div_ceil(TX_OUTPUTS).max(1);
+            let pages = (0..page_count)
+                .map(|index| {
+                    let mut inputs = [TxInput::dummy(); TX_INPUTS];
+                    let mut bitmap = 0u16;
+                    if index == 0 {
+                        inputs[0] = TxInput {
+                            slot_index: 1,
+                            amount: M1_INPUT,
+                            creation_id: coinbase_creation_id(3),
+                        };
+                        bitmap |= 1 | PAGED_SPEND_START_BIT;
+                    }
+                    if index + 1 == page_count {
+                        bitmap |= PAGED_SPEND_END_BIT;
+                    }
+                    let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+                    for (offset, (slot, owner, amount)) in
+                        outputs.iter().skip(index * TX_OUTPUTS).take(TX_OUTPUTS).enumerate()
+                    {
+                        page_outputs[offset] = TxOutput {
+                            slot_index: *slot,
+                            amount: *amount,
+                            owner: *owner,
+                        };
+                        bitmap |= output_bitmap_bit(offset);
+                    }
+                    TxPage::new(TxBody {
+                        epoch_anchor: view.user_epoch_anchor_id,
+                        fee: if index == 0 { fee } else { 0 },
+                        input_owner: owner,
+                        inputs,
+                        outputs: page_outputs,
+                        validity_bitmap: bitmap,
+                        is_coinbase: false,
+                    })
+                    .unwrap()
+                })
+                .collect();
+            jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap()
+        };
+        let intent_of = |payment| {
+            crate::destination::DestinationIntent::CommitteeUpdate(
+                crate::destination::CommitteeUpdateIntent {
+                    payload: payload.clone(),
+                    payment,
+                },
+            )
+        };
+        // The honest update: two outputs.
+        let fee = m1_consensus_fee(&view, 1, 2);
+        let honest = intent_of(group(&[(2, Address([0x42; 32]), M1_INPUT - fee), (3, marker, 0)], fee));
+        let pool = ReleaseCase::pool_on(view.clone());
+        pool.submit_destination(&honest.encode().unwrap())
+            .await
+            .expect("the honest committee update");
+        // The same update re-wrapped in a payment no template places.
+        let fee = m1_consensus_fee(&view, 1, 255);
+        let mut outputs: Vec<(u32, Address, u64)> =
+            (1..=254u32).map(|segment| (segment << 16, Address([0x42; 32]), 1)).collect();
+        outputs[253].2 = M1_INPUT - fee - 253;
+        outputs.push((255 << 16, marker, 0));
+        let bloated = intent_of(group(&outputs, fee));
+        match pool.submit_destination(&bloated.encode().unwrap()).await {
+            Err(SubmitError::NoTemplateCarries(_)) => {}
+            other => panic!("a payment no template places must be refused, got {other:?}"),
+        }
+        let (updates, _) = pool.destination_candidates().await;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].payment.pages.len(), 1, "the honest one is still held");
+    }
+
+    /// NO-5 (audit 13/11): a held intent whose transaction no longer applies
+    /// to the branch — an output slot a block filled, an input a block spent
+    /// — is forgotten at the view change, whatever its kind (only a release's
+    /// inputs were judged again): offered, it made the destination build of
+    /// every template fail, with no culprit, until its anchor expired.
+    #[tokio::test]
+    async fn a_release_whose_output_slot_was_taken_is_forgotten() {
+        use jetsam_chain::consensus::destination::state::committee_update_marker;
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        // A block filled slot 8, the release group's first output.
+        let mut taken = case.state.clone();
+        taken
+            .state
+            .set_slot(8, SlotValue::with_owner_fields(1, 50, Address([0x77; 32]).as_fields()))
+            .unwrap();
+        let after = ReleaseCase {
+            state: taken,
+            intent: case.intent.clone(),
+            n: case.n,
+        };
+        pool.update_chain_view(after.view_at(tip + 1, &[])).await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "its output slot is taken");
+
+        // A committee update whose payment's input a block spent.
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let paying = VaultCase::new(tip, Address([0xA5; 32]), &[(Address([0x42; 32]), 10), (marker, 0)]);
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(&payload)
+            .unwrap()
+            .next_sync_committee
+            .hash_tree_root();
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let view_of_case = |case: &VaultCase, tip: u64| {
+            let mut view = case.view_at(tip, 0);
+            view.destination_rules = rules;
+            view
+        };
+        let pool = ReleaseCase::pool_on(view_of_case(&paying, tip));
+        let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+            crate::destination::CommitteeUpdateIntent {
+                payload: payload.clone(),
+                payment: paying.intent.clone(),
+            },
+        );
+        pool.submit_destination(&intent.encode().unwrap())
+            .await
+            .expect("a committee update with its payment");
+        pool.update_chain_view(view_of_case(&paying, tip + 1)).await;
+        assert_eq!(pool.destination_candidates().await.0.len(), 1, "still applies");
+        let mut spent = paying.state.clone();
+        spent.state.set_slot(7, SlotValue::EMPTY).unwrap();
+        let spent = VaultCase {
+            state: spent,
+            intent: paying.intent.clone(),
+        };
+        pool.update_chain_view(view_of_case(&spent, tip + 2)).await;
+        assert!(pool.destination_candidates().await.0.is_empty(), "its input is spent");
+    }
+
+    /// NO-7 (audit 13/11): a held intent whose transaction binds an epoch
+    /// anchor the next block no longer accepts is forgotten: never offered,
+    /// it used to hold one of the 64 places until something else removed it
+    /// (64 of them and every later release was refused `Full`).
+    #[tokio::test]
+    async fn destination_intents_with_a_stale_anchor_are_forgotten() {
+        use jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        pool.update_chain_view(case.view_at(tip + 1, &[])).await;
+        assert_eq!(pool.destination_candidates().await.1.len(), 1, "its anchor still accepted");
+        let later = tip + 3 * TX_EPOCH_BLOCKS;
+        let view = case.view_at(later, &[]);
+        let (accepted, generation) = view.accepted_user_epoch_anchors();
+        let anchor = case.intent.payment().pages[0].body.epoch_anchor;
+        assert!(!accepted.accepts(anchor, generation), "the premise: a stale anchor");
+        pool.update_chain_view(view).await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "forgotten");
     }
 
     /// A committee update with the transaction that pays for it (its
@@ -4606,6 +4965,64 @@ mod tests {
         bad.submit(&pool).await.expect("dormant");
         pool.on_new_block(&[], BASE_HEIGHT - 1, bad.view_at(BASE_HEIGHT - 1, 0)).await;
         assert_eq!(pool.len().await, 1);
+    }
+
+    /// NO-1 (audit 13/11): from the return-over-Base height on, the block
+    /// rule counts every fast-lane marker (`JTMFCT01`, `JTMFRV01`) among its
+    /// user groups and asks one object for each, and none may carry value. A
+    /// plain transaction carrying one is a block no miner can make: refused
+    /// at admission, evicted when the next block reaches the height. Below
+    /// the height, or dormant, it is an ordinary spend (the rule does not
+    /// read it), as for a node without this policy.
+    #[tokio::test]
+    async fn over_base_a_plain_transaction_carrying_a_fast_lane_marker_is_refused() {
+        use crate::event::{EvictReason, MempoolEvent};
+        use jetsam_chain::consensus::destination::fast::{
+            FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG,
+        };
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        let tagged = |tag: [u8; 8]| {
+            let mut owner = [0x33u8; 32];
+            owner[..8].copy_from_slice(&tag);
+            Address(owner)
+        };
+        let refusal = |result: Result<jetsam_poseidon2b::primitives::TxBodyHash, super::SubmitError>| match result {
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(error),
+            )) => Some(error),
+            _ => None,
+        };
+        let tip = BASE_HEIGHT;
+        for (outputs, expected) in [
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)], E::FastObjectsDoNotMatchMarkers),
+            (vec![(BOB, 10), (tagged(FAST_REVOCATION_MARKER_TAG), 0)], E::FastObjectsDoNotMatchMarkers),
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 5), (BOB, 10)], E::FastMarkerCarriesValue),
+        ] {
+            let case = VaultCase::new(tip, PAYER, &outputs);
+            let pool = pool_over(over_base_view(case.view_at(tip, 0), &[]));
+            assert_eq!(refusal(case.submit(&pool).await), Some(expected), "{outputs:?}");
+            assert_eq!(pool.len().await, 0);
+        }
+        // Admitted below the height; evicted when the next block reaches it.
+        let before = BASE_HEIGHT - 2;
+        let early = VaultCase::new(before, PAYER, &[(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)]);
+        let pool = pool_over(over_base_view(early.view_at(before, 0), &[]));
+        let mut events = pool.subscribe();
+        let hash = early.submit(&pool).await.expect("below the height: an ordinary spend");
+        pool.on_new_block(&[], BASE_HEIGHT - 1, over_base_view(early.view_at(BASE_HEIGHT - 1, 0), &[]))
+            .await;
+        assert_eq!(pool.len().await, 0, "no block from the height carries it");
+        let mut evicted = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let MempoolEvent::TxEvicted { hash, reason } = event {
+                evicted.push((hash, reason));
+            }
+        }
+        assert_eq!(evicted, vec![(hash, EvictReason::FastLaneRule)]);
+        // Dormant (this build's default rules): an ordinary spend.
+        let dormant = VaultCase::new(tip, PAYER, &[(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)]);
+        let pool = dormant.pool_at(tip, 0);
+        dormant.submit(&pool).await.expect("dormant: an ordinary spend");
     }
 
     /// D101, D107, D114: from the return-over-Base height on, the pool admits
