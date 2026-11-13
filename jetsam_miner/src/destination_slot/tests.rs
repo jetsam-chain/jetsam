@@ -1361,17 +1361,103 @@ mod fast_lane {
             None,
         );
         assert_eq!((offer.releases.len(), offer.contradictions.len()), (1, 1));
-        // Never beside a fast release.
+        // Never beside a fast release: the contradiction goes, the fast
+        // release waits (NO-6).
         let offer = plan_fast(
             &state,
             vec![fast_release(7, 2 * MICRO_PER_JTM, OWNER)],
             vec![contradiction(3, 1)],
             None,
         );
-        assert!(offer.contradictions.is_empty());
+        assert_eq!((offer.releases.len(), offer.contradictions.len()), (0, 1));
         // A record contradicted already: none.
         state.fast.records.get_mut(&3).unwrap().contradicted = true;
         assert!(plan_fast(&state, Vec::new(), vec![contradiction(3, 1)], None).is_empty());
+    }
+
+    /// NO-3 (audit 13/11): a revocation offered keeps every fast release out
+    /// of its block (the block rule refuses a fast release beside the
+    /// revocation of its key: `FastKeyClosed`); slow releases stay beside it.
+    /// Without the revocation, fast releases go as before.
+    #[test]
+    fn the_revocation_goes_first_and_fast_releases_wait() {
+        let state = state_at(J + 20);
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER)],
+            Vec::new(),
+            Some(revocation()),
+        );
+        assert!(offer.revocation.is_some(), "the revocation goes");
+        assert!(offer.releases.is_empty(), "the fast release waits");
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER), base_release(4, 2 * MICRO_PER_JTM, OWNER, 1)],
+            Vec::new(),
+            Some(revocation()),
+        );
+        assert_eq!(ns(&offer), vec![4], "a slow release stays beside it");
+        assert!(offer.revocation.is_some());
+        let offer = plan_fast(&state, vec![fast_release(3, 5 * MICRO_PER_JTM, OWNER)], Vec::new(), None);
+        assert_eq!(ns(&offer), vec![3], "no revocation: the fast release goes");
+    }
+
+    /// NO-6 (audit 13/11): the order is revocation, contradictions, slow
+    /// releases, fast releases. A contradiction of an open record is offered
+    /// even while a fast release, or a slow one read under other Base
+    /// objects, is held (the block rule takes it alone); they wait. Slow
+    /// releases under the same objects go beside it.
+    #[test]
+    fn a_contradiction_goes_before_fast_releases() {
+        let mut state = state_at(J + 20);
+        state.fast.records.insert(
+            3,
+            FastRecord {
+                owner: OWNER,
+                amount: 5 * MICRO_PER_JTM,
+                l2_block: L2,
+                height: J + 5,
+                contradicted: false,
+                consumed: false,
+            },
+        );
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(7, 2 * MICRO_PER_JTM, OWNER)],
+            vec![contradiction(3, 1)],
+            None,
+        );
+        assert_eq!((offer.releases.len(), offer.contradictions.len()), (0, 1));
+        let offer = plan_fast(
+            &state,
+            vec![base_release(7, 2 * MICRO_PER_JTM, OWNER, 2)],
+            vec![contradiction(3, 1)],
+            None,
+        );
+        assert_eq!(
+            (offer.releases.len(), offer.contradictions.len()),
+            (0, 1),
+            "a slow release under other proofs waits"
+        );
+        let offer = plan_fast(
+            &state,
+            vec![base_release(2, 2 * MICRO_PER_JTM, OWNER, 2), base_release(7, 2 * MICRO_PER_JTM, OWNER, 1)],
+            vec![contradiction(3, 1)],
+            None,
+        );
+        assert_eq!(ns(&offer), vec![7], "the slow release under its proofs goes beside it");
+        assert_eq!(offer.contradictions.len(), 1);
+        // With the revocation: all three kinds of the same block.
+        let offer = plan_fast(
+            &state,
+            vec![fast_release(8, 2 * MICRO_PER_JTM, OWNER), base_release(7, 2 * MICRO_PER_JTM, OWNER, 1)],
+            vec![contradiction(3, 1)],
+            Some(revocation()),
+        );
+        assert_eq!(
+            (ns(&offer), offer.contradictions.len(), offer.revocation.is_some()),
+            (vec![7], 1, true)
+        );
     }
 
     /// What a refused block blames of the fast lane.
@@ -1391,13 +1477,26 @@ mod fast_lane {
                 ..Culprits::default()
             }
         );
+        // NO-3: with fast releases offered, the key's faults blame them, not
+        // the revocation (it closes the key in that very block).
         assert_eq!(
             culprits_of(&DestinationBlockError::FastKeyClosed, &offer, &rules),
             Culprits {
                 releases: vec![3],
-                revocation: true,
                 ..Culprits::default()
             }
+        );
+        let alone = DestinationOffer {
+            releases: Vec::new(),
+            ..offer.clone()
+        };
+        assert_eq!(
+            culprits_of(&DestinationBlockError::FastKeyClosed, &alone, &rules),
+            Culprits {
+                revocation: true,
+                ..Culprits::default()
+            },
+            "the revocation alone: its own key closed"
         );
         assert_eq!(
             culprits_of(&DestinationBlockError::FastObjectsDoNotMatchMarkers, &offer, &rules),
@@ -1696,6 +1795,71 @@ mod reopened {
         ) -> Result<DestinationEffect, DestinationBlockError> {
             validate_block_destination(block, parent, &self.rules, &self.keys)
         }
+    }
+
+    /// NO-3 (audit 13/11) through the block rule, with this world's own test
+    /// keys armed: a fast release beside the revocation of its key is refused
+    /// (`FastKeyClosed`: the revocation closes the key in that very block);
+    /// the template now offers the revocation without it, and that block
+    /// passes, closing the key.
+    #[test]
+    fn the_block_of_a_revocation_and_a_held_fast_release_passes_and_closes_the_key() {
+        use blst::min_pk::SecretKey;
+        use jetsam_chain::consensus::destination::fast::{
+            revocation_marker, FastRevocation, FAST_REVOKE_DST,
+        };
+        use jetsam_chain::consensus::destination::mpt::keccak256;
+        use jetsam_mempool::destination::FastRevocationIntent;
+        let key = |label: &str| {
+            let sk = SecretKey::key_gen(&keccak256(label.as_bytes()), &[]).expect("a test key");
+            let pk = sk.sk_to_pk().compress();
+            (sk, pk)
+        };
+        let (cold, cold_pk) = key("jetsam-v17-NO3-TEST-ONLY/cold");
+        let (_, relay_pk) = key("jetsam-v17-NO3-TEST-ONLY/relay");
+        let mut w = world();
+        w.rules.base_return.fast.release_key = Some(relay_pk);
+        w.rules.base_return.fast.revoke_key = Some(cold_pk);
+        let unsigned = FastRevocation {
+            network: jetsam_chain::consensus::guardian::network_id(),
+            key: relay_pk,
+            signature: [0; 96],
+        };
+        let revocation = FastRevocationIntent {
+            payload: FastRevocation {
+                signature: cold.sign(&unsigned.message(), FAST_REVOKE_DST, &[]).compress(),
+                ..unsigned
+            }
+            .encode_payload(),
+            payment: page(PAYER, 4_000, &[(revocation_marker(&relay_pk), 0), (BOB, 5)], 50_000),
+        };
+        let parent = w.parent(&[], &[]);
+        let both = DestinationOffer {
+            releases: vec![w.fast()],
+            revocation: Some(revocation.clone()),
+            ..DestinationOffer::default()
+        };
+        assert_eq!(
+            w.check(&w.block(&parent, &both), &parent).err(),
+            Some(DestinationBlockError::FastKeyClosed),
+            "the premise: the rule refuses them together"
+        );
+        let offer = plan_destination_offer_with(
+            &parent,
+            &w.rules,
+            parent.tip + 1,
+            Vec::new(),
+            vec![w.fast()],
+            Vec::new(),
+            Some(revocation),
+            &|anchor| *anchor == ANCHOR,
+            0,
+        );
+        assert!(offer.releases.is_empty() && offer.revocation.is_some());
+        let effect = w
+            .check(&w.block(&parent, &offer), &parent)
+            .expect("the revocation's block passes");
+        assert_eq!(effect.fast.revoked, Some(relay_pk));
     }
 
     /// NO-1 (audit 13/11), the premise: from the return-over-Base height on,

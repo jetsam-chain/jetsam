@@ -265,10 +265,13 @@ pub fn plan_destination_offer(
 }
 
 /// [`plan_destination_offer`] with the fast lane's intents (from the
-/// return-over-Base height on): the revocation if its key is still open (it
-/// may share a block with a committee update); contradictions of open fast
-/// records, never beside a committee update nor a fast release, under the
-/// Base objects of the releases offered (or of the first contradiction).
+/// return-over-Base height on), in the order revocation, contradictions, slow
+/// releases, fast releases (NO-6): the committee update first when due (it
+/// may share a block with the revocation only); the revocation if its key is
+/// still open; contradictions of open fast records, never beside a committee
+/// update, under the Base objects of the first one; then slow releases under
+/// those objects, and fast releases only when neither the revocation (NO-3:
+/// it closes their key in that very block) nor a contradiction is offered.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_destination_offer_with(
     state: &DestinationState,
@@ -281,11 +284,12 @@ pub fn plan_destination_offer_with(
     anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
     other_objects: usize,
 ) -> DestinationOffer {
-    let mut offer = plan_releases(state, rules, height, committee_updates, releases, anchor_ok, other_objects);
     let budget = MAX_BLOCK_DESTINATION_OBJECTS.saturating_sub(other_objects);
     if !rules.base_return.active_at(height) || rules.bridge.is_none() {
-        return offer;
+        let offer = plan_committee_update(state, rules, committee_updates, anchor_ok, budget);
+        return add_releases(offer, state, rules, height, releases, anchor_ok, budget);
     }
+    let mut offer = plan_committee_update(state, rules, committee_updates, anchor_ok, budget);
     if let Some(revocation) = revocation {
         let open = jetsam_chain::consensus::destination::fast::FastRevocation::decode_payload(
             &revocation.payload,
@@ -299,53 +303,53 @@ pub fn plan_destination_offer_with(
             }
         }
     }
-    if offer.committee_update.is_some()
-        || offer.releases.first().is_some_and(|first| first.fast.is_some())
-    {
-        return offer;
-    }
-    for contradiction in contradictions {
-        let n = contradiction.n();
-        let open = state.fast.records.get(&n).is_some_and(|r| !r.contradicted);
-        if !open || !anchor_of(&contradiction.payment).is_some_and(|a| anchor_ok(&a)) {
-            continue;
-        }
-        let shares = match (offer.releases.first(), offer.contradictions.first()) {
-            (Some(first), _) => {
-                first.finality == contradiction.finality
-                    && first.account_proof == contradiction.account_proof
-                    && first.base.as_ref() == Some(&contradiction.base)
+    if offer.committee_update.is_none() {
+        for contradiction in contradictions {
+            let n = contradiction.n();
+            let open = state.fast.records.get(&n).is_some_and(|r| !r.contradicted);
+            if !open || !anchor_of(&contradiction.payment).is_some_and(|a| anchor_ok(&a)) {
+                continue;
             }
-            (None, Some(first)) => {
+            let shares = offer.contradictions.first().map_or(true, |first| {
                 first.finality == contradiction.finality
                     && first.account_proof == contradiction.account_proof
                     && first.base == contradiction.base
+            });
+            if !shares {
+                continue;
             }
-            (None, None) => true,
-        };
-        if !shares {
-            continue;
-        }
-        let mut candidate = offer.clone();
-        candidate.contradictions.push(contradiction);
-        if candidate.fits(budget) {
-            offer = candidate;
+            let mut candidate = offer.clone();
+            candidate.contradictions.push(contradiction);
+            if candidate.fits(budget) {
+                offer = candidate;
+            }
         }
     }
-    offer
+    let first_contradiction = offer.contradictions.first().cloned();
+    let fast_may_go = offer.revocation.is_none() && first_contradiction.is_none();
+    let releases = releases
+        .into_iter()
+        .filter(|release| release.fast.is_none() || fast_may_go)
+        .filter(|release| {
+            first_contradiction.as_ref().map_or(true, |first| {
+                release.finality == first.finality
+                    && release.account_proof == first.account_proof
+                    && release.base.as_ref() == Some(&first.base)
+            })
+        })
+        .collect();
+    add_releases(offer, state, rules, height, releases, anchor_ok, budget)
 }
 
-/// The committee update and the releases of [`plan_destination_offer`].
-fn plan_releases(
+/// The committee update of [`plan_destination_offer`]: the one the branch
+/// needs next, if it fits.
+fn plan_committee_update(
     state: &DestinationState,
     rules: &DestinationRules,
-    height: u64,
     committee_updates: Vec<CommitteeUpdateIntent>,
-    mut releases: Vec<ReleaseIntent>,
     anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
-    other_objects: usize,
+    budget: usize,
 ) -> DestinationOffer {
-    let budget = MAX_BLOCK_DESTINATION_OBJECTS.saturating_sub(other_objects);
     let mut offer = DestinationOffer::default();
     if let Some(anchor) = rules.anchor {
         let due = state
@@ -361,6 +365,19 @@ fn plan_releases(
             offer.committee_update = None;
         }
     }
+    offer
+}
+
+/// The releases of [`plan_destination_offer`], added to `offer`.
+fn add_releases(
+    mut offer: DestinationOffer,
+    state: &DestinationState,
+    rules: &DestinationRules,
+    height: u64,
+    mut releases: Vec<ReleaseIntent>,
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+    budget: usize,
+) -> DestinationOffer {
     if rules.bridge.is_none() {
         return offer;
     }
@@ -624,14 +641,18 @@ pub fn culprits_of(
         contradictions: vec![n],
         ..Culprits::default()
     };
-    // The fast lane's key or statement: the fast releases and the revocation.
+    // The fast lane's key or statement: the fast releases if any are offered
+    // (NO-3: the revocation closes their key in that very block, it is not
+    // at fault), else the revocation; a retry without the fast releases
+    // still refused blames the revocation then.
+    let fast_released = offer.releases.first().is_some_and(|r| r.fast.is_some());
     let fast_lane = || Culprits {
-        releases: if offer.releases.first().is_some_and(|r| r.fast.is_some()) {
+        releases: if fast_released {
             all_releases()
         } else {
             Vec::new()
         },
-        revocation: offer.revocation.is_some(),
+        revocation: offer.revocation.is_some() && !fast_released,
         ..Culprits::default()
     };
     match error {
