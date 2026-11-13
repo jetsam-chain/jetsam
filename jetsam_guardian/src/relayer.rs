@@ -253,6 +253,49 @@ pub fn mn5_ok(mn: &Mn, at: u64) -> bool {
     u256::mul_ge(&seg, 1_800, &base, 4 * elapsed)
 }
 
+/// M5-2 (audit n°2): the L1 time at which MN-5 is judged when a point is planned: now, the time from the plan to
+/// a proof ready as last measured (`measured_proof_secs`; `timeout_secs` before any measure, never above it), and
+/// the inclusion. With `timeout_secs` alone, a relayer whose proofs are immediate refused itself points the contract
+/// took (11/11: 35 minutes of a window whose margin never reached the 540 s it asked).
+pub fn mn5_planned_at(l1_now: u64, timeout_secs: u64, measured_proof_secs: Option<u64>) -> u64 {
+    l1_now + measured_proof_secs.map_or(timeout_secs, |m| m.min(timeout_secs)) + INCLUSION_SECS
+}
+
+/// M5-2: the last L1 time at which the contract still takes a point of MN values `mn`:
+/// `forkBaseTimestamp + segmentWork × 1 800 / (4 × forkBaseWork)` (rounded down), never before the 1 800 s MN-5
+/// waits (`mn5_ok(mn, t)` exactly for `t` ≤ it).
+pub fn mn5_deadline(mn: &Mn) -> u64 {
+    let grace_end = mn.fork_base_timestamp.saturating_add(MN5_MIN_ELAPSED - 1);
+    if !mn5_ok(mn, grace_end + 1) {
+        return grace_end;
+    }
+    // the largest elapsed `e` with `segmentWork × 1 800 ≥ 4 × forkBaseWork × e` (monotone in `e`), searched up to 2^60
+    let seg = u256::from_be(&mn.segment_work);
+    let base = u256::from_be(&mn.fork_base_work);
+    let (mut ok, mut ko) = (MN5_MIN_ELAPSED, 1u64 << 60);
+    if u256::mul_ge(&seg, 1_800, &base, 4 * ko) {
+        return mn.fork_base_timestamp.saturating_add(ko);
+    }
+    while ko - ok > 1 {
+        let mid = ok + (ko - ok) / 2;
+        if u256::mul_ge(&seg, 1_800, &base, 4 * mid) {
+            ok = mid;
+        } else {
+            ko = mid;
+        }
+    }
+    mn.fork_base_timestamp.saturating_add(ok)
+}
+
+/// M5-2: MN-5's margin at L1 time `at` is below 1.5 (`segmentWork × 1 800 < 1.5 × 4 × forkBaseWork × elapsed`):
+/// alerted when a point is planned, long before a refusal.
+pub fn mn5_margin_low(mn: &Mn, at: u64) -> bool {
+    let elapsed = at.saturating_sub(mn.fork_base_timestamp).max(1);
+    let seg = u256::from_be(&mn.segment_work);
+    let base = u256::from_be(&mn.fork_base_work);
+    !u256::mul_ge(&seg, 2 * 1_800, &base, 3 * 4 * elapsed)
+}
+
 /// A submission the relayer can prove now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
