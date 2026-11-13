@@ -306,8 +306,10 @@ fn file_of(dir: &Path, block: u64) -> std::path::PathBuf {
 pub fn store(dir: &Path, capture: &Capture) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = file_of(dir, capture.block);
-    // FR-8: written whole and synced, then renamed
-    crate::write_atomic(&path, &serde_json::to_vec_pretty(&to_json(capture))?)
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&to_json(capture))?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// The capture of `block`, if kept; a file that is not one is an error.

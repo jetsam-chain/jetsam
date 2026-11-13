@@ -270,8 +270,10 @@ impl RunState {
             "contradiction_tries": self.contradiction_tries.iter().map(|(n, (at, c))| json!([n, at, c])).collect::<Vec<_>>(),
             "settled": self.settled.iter().collect::<Vec<_>>(),
         });
-        // FR-8: written whole and synced, then renamed
-        crate::write_atomic(path, &serde_json::to_vec_pretty(&v)?)
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&v)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 
@@ -716,9 +718,11 @@ pub fn hand_in_revocation(node: &dyn crate::light_feed::FeedNode, revocation: &F
 // FR-7, FR-8 (audit n°2): what fast-run checks before it starts
 // ---------------------------------------------------------------------------
 
-/// FR-7: the Base RPCs of fast-run: at least [`crate::fast::MIN_BASE_RPCS`], none given twice, each on chain `want`
-/// (`eth_chainId`, read by `chain_id`): the second reading of a root is a second source, never the first again.
-pub fn check_base_rpcs(urls: &[String], chain_id: &dyn Fn(&str) -> anyhow::Result<u64>, want: u64) -> anyhow::Result<()> {
+/// FR-7: the Base RPCs of fast-run: at least [`crate::fast::MIN_BASE_RPCS`], none given twice (a second reading of a
+/// root is a second source, never the first again), none on another chain than `want` (`eth_chainId`, read by
+/// `chain_id`): any of these, an error (fast-run does not start). An RPC silent now is no refusal (as a silent node at
+/// the start): the ones to check again are returned, and no root is read from them before they said `want`.
+pub fn check_base_rpcs(urls: &[String], chain_id: &dyn Fn(&str) -> anyhow::Result<u64>, want: u64) -> anyhow::Result<Vec<String>> {
     let min = crate::fast::MIN_BASE_RPCS;
     if urls.len() < min {
         bail!("fast-run needs {min} Base RPCs at least (--base, each another provider), {} given: one is not a second reading", urls.len());
@@ -729,14 +733,24 @@ pub fn check_base_rpcs(urls: &[String], chain_id: &dyn Fn(&str) -> anyhow::Resul
             bail!("the Base RPC {u} is given twice: a second reading of the same source checks nothing");
         }
     }
+    let mut silent = Vec::new();
     for u in urls {
-        match chain_id(u) {
-            Ok(id) if id == want => {}
-            Ok(id) => bail!("the Base RPC {u} is chain {id} (eth_chainId), not {want}"),
-            Err(e) => bail!("the Base RPC {u} did not say its chain (eth_chainId): {e:#}"),
+        match base_chain(chain_id(u), want) {
+            Ok(true) => {}
+            Ok(false) => silent.push(u.clone()),
+            Err(e) => bail!("the Base RPC {u}: {e:#}"),
         }
     }
-    Ok(())
+    Ok(silent)
+}
+
+/// FR-7: one RPC's `eth_chainId` answer: `want` (true), silent (false: checked again later), or another chain (an error).
+pub fn base_chain(answer: anyhow::Result<u64>, want: u64) -> anyhow::Result<bool> {
+    match answer {
+        Ok(id) if id == want => Ok(true),
+        Ok(id) => bail!("it is chain {id} (eth_chainId), not {want}"),
+        Err(_) => Ok(false),
+    }
 }
 
 /// FR-8: fast-run's lock on its state directory (`fast_run.lock`, held while it runs): a second fast-run on the same
@@ -1048,14 +1062,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let base_urls = flags(args, "--base");
     let bases: Vec<crate::l1::L1> = base_urls.iter().map(|u| crate::l1::L1::new(u)).collect();
     let base = bases.first().ok_or_else(usage)?;
-    // FR-7 (audit n°2): two Base RPCs at least, none twice, each on Base's chain; the L1 on the L1's
-    let chain_of = |l: &crate::l1::L1| crate::l1::hex_u64(&l.rpc("eth_chainId", json!([]))?);
-    check_base_rpcs(&base_urls, &|u| chain_of(&bases[base_urls.iter().position(|x| x == u).expect("listed")]), rules.base_return.fast.base_chain_id)
-        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
-    let l1_chain = chain_of(&l1).map_err(|e| anyhow!("the L1 RPC did not say its chain (eth_chainId): {e:#}: fast-run does not start"))?;
-    if l1_chain != rules.base_return.fast.l1_chain_id {
-        bail!("the L1 RPC is chain {l1_chain}, not {}: fast-run does not start", rules.base_return.fast.l1_chain_id);
-    }
+
     let beacon = crate::light_feed::HttpBeacon {
         url: flag(args, "--beacon").ok_or_else(usage)?,
         egress: crate::rpc::Egress::Clearnet,
@@ -1069,6 +1076,21 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     // a node silent at the start is not used before they are read (the captures of Base run whatever it says, as before)
     let mut node = crate::activations::Checked::new(node, &node_url, crate::activations::Scope::All);
     node.at_start(|n| &n.client, "fast-run", &say)?;
+    // FR-7 (audit n°2): two Base RPCs at least, none twice, none on another chain; the L1 not on another chain (after
+    // the node: its activations are read first). A silent one is said, and a Base RPC is used only once it said its chain.
+    let chain_of = |l: &crate::l1::L1| crate::l1::hex_u64(&l.rpc("eth_chainId", json!([]))?);
+    let base_chain_id = rules.base_return.fast.base_chain_id;
+    let silent = check_base_rpcs(&base_urls, &|u| chain_of(&bases[base_urls.iter().position(|x| x == u).expect("listed")]), base_chain_id)
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
+    let mut base_checked: Vec<bool> = base_urls.iter().map(|u| !silent.contains(u)).collect();
+    for u in &silent {
+        say(&format!("ALERT FAST BASE_RPC {u}: its chain not read at the start (eth_chainId): no root read from it before it says {base_chain_id}"));
+    }
+    match base_chain(chain_of(&l1), rules.base_return.fast.l1_chain_id) {
+        Ok(true) => {}
+        Ok(false) => say("ALERT FAST the L1 RPC did not say its chain at the start (eth_chainId)"),
+        Err(e) => bail!("the L1 RPC: {e:#}: fast-run does not start"),
+    }
     if let Some(secret) = &secret {
         if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
             bail!("the key given is not this build's FAST_RELEASE_KEY");
@@ -1217,7 +1239,21 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                     continue;
                 }
                 let mut views = Vec::new();
-                for b in &bases {
+                for (b, checked) in bases.iter().zip(base_checked.iter_mut()) {
+                    // FR-7: a Base RPC silent at the start serves no root before it said its chain
+                    if !*checked {
+                        match base_chain(chain_of(b), base_chain_id) {
+                            Ok(true) => *checked = true,
+                            Ok(false) => {
+                                say(&format!("ALERT FAST BASE_RPC {}: its chain still not read: not used", b.url));
+                                continue;
+                            }
+                            Err(e) => {
+                                say(&format!("ALERT FAST BASE_RPC {}: {e:#}: never used", b.url));
+                                continue;
+                            }
+                        }
+                    }
                     match crate::fast::read_base(b, game.l2_block) {
                         Ok(view) => views.push(view),
                         Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", b.url)),
@@ -1346,7 +1382,12 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             records.iter().filter(|p| !p.contradicted && !s.settled.contains(&p.n)).copied().collect()
         };
         // FR-1: each record not settled yet, its word as each Base RPC serves it now
-        let named: Vec<(&str, &dyn BaseRpc)> = bases.iter().map(|b| (b.url.as_str(), b as &dyn BaseRpc)).collect();
+        let named: Vec<(&str, &dyn BaseRpc)> = bases
+            .iter()
+            .zip(&base_checked)
+            .filter(|(_, checked)| **checked)
+            .map(|(b, _)| (b.url.as_str(), b as &dyn BaseRpc))
+            .collect();
         for line in base_word_alerts(&named, &bridge, &unsettled) {
             if alerted.insert(line.clone()) {
                 say(&line);

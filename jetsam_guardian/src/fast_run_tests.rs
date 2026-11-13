@@ -1218,17 +1218,21 @@ fn fast_run_refuses_one_base_rpc_the_same_url_twice_and_a_wrong_chain_id() {
         }
     };
     let urls = |list: &[&str]| list.iter().map(|u| u.to_string()).collect::<Vec<_>>();
-    assert!(check_base_rpcs(&urls(&["http://127.0.0.1:8550", "http://127.0.0.1:8551"]), &chain, 84_532).is_ok());
+    assert_eq!(check_base_rpcs(&urls(&["http://127.0.0.1:8550", "http://127.0.0.1:8551"]), &chain, 84_532).unwrap(), Vec::<String>::new());
     for (list, why) in [
         (urls(&["http://127.0.0.1:8550"]), "one"),
         (urls(&["http://127.0.0.1:8550", "http://127.0.0.1:8550"]), "twice"),
         (urls(&["http://127.0.0.1:8550", "HTTP://127.0.0.1:8550/"]), "twice"),
         (urls(&["http://127.0.0.1:8550", "http://mainnet.example"]), "chain"),
-        (urls(&["http://127.0.0.1:8550", "http://down.example"]), "chain"),
     ] {
         let e = check_base_rpcs(&list, &chain, 84_532).expect_err(why).to_string();
         assert!(e.to_lowercase().contains(why), "{why}: {e}");
     }
+    // silent at the start (as a silent node): no refusal, but returned: no root is read from it before it says its chain
+    assert_eq!(check_base_rpcs(&urls(&["http://127.0.0.1:8550", "http://down.example"]), &chain, 84_532).unwrap(), vec!["http://down.example".to_string()]);
+    assert_eq!(base_chain(Ok(84_532), 84_532).unwrap(), true);
+    assert_eq!(base_chain(Err(anyhow!("timeout")), 84_532).unwrap(), false);
+    assert!(base_chain(Ok(8_453), 84_532).is_err());
 }
 
 /// FR-8: a second fast-run on the same state directory does not start while the first holds it; once the first ends,
