@@ -1400,8 +1400,10 @@ fn run_admission_checks_with(
     // M-1 (audit 2026-11-10): a group the template builder never places — 256
     // touched segments beside the coinbase's — stayed here unmined, relayed to
     // every node, its fee their floor. Judged by the builder's own predicate,
-    // before any state read.
-    if pool_rules {
+    // before any state read. NO-4 (audit 13/11): an object's payment too — a
+    // committee update re-wrapped in one replaced the honest one and, never
+    // placed, kept every release and contradiction out of the blocks.
+    {
         let group: Vec<jetsam_tx::Transaction> = pages
             .iter()
             .map(|page| jetsam_tx::Transaction::new(page.body.clone()))
@@ -2009,9 +2011,42 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
         vault.committees.last().map(|committee| committee.period),
     );
     let forgotten = forgotten + st.destination.prune_fast(&vault.fast);
+    // NO-5, NO-7: any intent whose transaction the next block can no longer
+    // place as it is — its epoch anchor no longer accepted, an input no
+    // longer live as it spends it, an output slot filled.
+    let forgotten = forgotten
+        + st
+            .destination
+            .forget_payments(|payment| !payment_still_applies(payment, view));
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
+}
+
+/// NO-5, NO-7: whether the transaction of a held destination intent still
+/// applies to the block after `view`'s tip as admission judged it: its epoch
+/// anchor one that block accepts, every input live as it spends it, every
+/// output slot empty. A slot the view cannot read counts as not applying.
+fn payment_still_applies(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
+    use jetsam_chain::fri_state::SlotValue;
+    let (accepted, generation) = view.accepted_user_epoch_anchors();
+    let Some(first) = payment.pages.first() else {
+        return false;
+    };
+    if !accepted.accepts(first.body.epoch_anchor, generation) {
+        return false;
+    }
+    let owner = first.body.input_owner;
+    payment.pages.iter().all(|page| {
+        page.body.live_inputs().all(|(_, input)| {
+            view.try_slot(input.slot_index).is_ok_and(|slot| {
+                slot == SlotValue::with_owner_fields(input.amount, input.creation_id, owner.as_fields())
+            })
+        }) && page
+            .body
+            .live_outputs()
+            .all(|(_, output)| view.try_slot(output.slot_index).is_ok_and(|slot| slot == SlotValue::EMPTY))
+    })
 }
 
 fn guardian_submit_error(error: jetsam_chain::consensus::guardian::GuardianError) -> SubmitError {
@@ -4345,6 +4380,215 @@ mod tests {
         view.vault = case.view_at(tip + 1, &[]).vault;
         pool.update_chain_view(view).await;
         assert!(pool.destination_candidates().await.1.is_empty(), "spent");
+    }
+
+    /// NO-4 (audit 13/11): the template builder never places a group that
+    /// touches more than 256 segments beside the coinbase's; the pool refused
+    /// such a plain transaction (M-1) but held it as an object's payment — a
+    /// committee update re-wrapped in one replaced the honest one, was offered
+    /// (so no release, no contradiction rode beside it), never placed, never
+    /// blamed. Every payment is now held to the builder's predicate.
+    #[tokio::test]
+    async fn an_object_payment_no_template_carries_is_refused() {
+        use crate::SubmitError;
+        use jetsam_chain::consensus::destination::state::committee_update_marker;
+        use jetsam_chain::consensus::params::coinbase_creation_id;
+        let tip = CROSSING_J + 20;
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let owner = Address([0xA5; 32]);
+        // log_slots 24: 256 segments of 2^16 slots; the input in segment 0,
+        // one output in each of the 255 others (the last one the marker).
+        let mut state = ChainState::with_log_slots(24);
+        state
+            .state
+            .set_slot(1, SlotValue::with_owner_fields(M1_INPUT, coinbase_creation_id(3), owner.as_fields()))
+            .unwrap();
+        let mut view = view_of(&state, tip);
+        view.vault = Some(crate::view::VaultView {
+            bridge_locked: 0,
+            released: Default::default(),
+            floor: 0,
+            committees: Vec::new(),
+            advances: Default::default(),
+            fast: Default::default(),
+        });
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(&payload)
+            .unwrap()
+            .next_sync_committee
+            .hash_tree_root();
+        view.destination_rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let group = |outputs: &[(u32, Address, u64)], fee: u64| {
+            let page_count = outputs.len().div_ceil(TX_OUTPUTS).max(1);
+            let pages = (0..page_count)
+                .map(|index| {
+                    let mut inputs = [TxInput::dummy(); TX_INPUTS];
+                    let mut bitmap = 0u16;
+                    if index == 0 {
+                        inputs[0] = TxInput {
+                            slot_index: 1,
+                            amount: M1_INPUT,
+                            creation_id: coinbase_creation_id(3),
+                        };
+                        bitmap |= 1 | PAGED_SPEND_START_BIT;
+                    }
+                    if index + 1 == page_count {
+                        bitmap |= PAGED_SPEND_END_BIT;
+                    }
+                    let mut page_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+                    for (offset, (slot, owner, amount)) in
+                        outputs.iter().skip(index * TX_OUTPUTS).take(TX_OUTPUTS).enumerate()
+                    {
+                        page_outputs[offset] = TxOutput {
+                            slot_index: *slot,
+                            amount: *amount,
+                            owner: *owner,
+                        };
+                        bitmap |= output_bitmap_bit(offset);
+                    }
+                    TxPage::new(TxBody {
+                        epoch_anchor: view.user_epoch_anchor_id,
+                        fee: if index == 0 { fee } else { 0 },
+                        input_owner: owner,
+                        inputs,
+                        outputs: page_outputs,
+                        validity_bitmap: bitmap,
+                        is_coinbase: false,
+                    })
+                    .unwrap()
+                })
+                .collect();
+            jetsam_tx::PagedSpendIntent::new(pages, vec![0xA5; 64]).unwrap()
+        };
+        let intent_of = |payment| {
+            crate::destination::DestinationIntent::CommitteeUpdate(
+                crate::destination::CommitteeUpdateIntent {
+                    payload: payload.clone(),
+                    payment,
+                },
+            )
+        };
+        // The honest update: two outputs.
+        let fee = m1_consensus_fee(&view, 1, 2);
+        let honest = intent_of(group(&[(2, Address([0x42; 32]), M1_INPUT - fee), (3, marker, 0)], fee));
+        let pool = ReleaseCase::pool_on(view.clone());
+        pool.submit_destination(&honest.encode().unwrap())
+            .await
+            .expect("the honest committee update");
+        // The same update re-wrapped in a payment no template places.
+        let fee = m1_consensus_fee(&view, 1, 255);
+        let mut outputs: Vec<(u32, Address, u64)> =
+            (1..=254u32).map(|segment| (segment << 16, Address([0x42; 32]), 1)).collect();
+        outputs[253].2 = M1_INPUT - fee - 253;
+        outputs.push((255 << 16, marker, 0));
+        let bloated = intent_of(group(&outputs, fee));
+        match pool.submit_destination(&bloated.encode().unwrap()).await {
+            Err(SubmitError::NoTemplateCarries(_)) => {}
+            other => panic!("a payment no template places must be refused, got {other:?}"),
+        }
+        let (updates, _) = pool.destination_candidates().await;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].payment.pages.len(), 1, "the honest one is still held");
+    }
+
+    /// NO-5 (audit 13/11): a held intent whose transaction no longer applies
+    /// to the branch — an output slot a block filled, an input a block spent
+    /// — is forgotten at the view change, whatever its kind (only a release's
+    /// inputs were judged again): offered, it made the destination build of
+    /// every template fail, with no culprit, until its anchor expired.
+    #[tokio::test]
+    async fn a_release_whose_output_slot_was_taken_is_forgotten() {
+        use jetsam_chain::consensus::destination::state::committee_update_marker;
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        // A block filled slot 8, the release group's first output.
+        let mut taken = case.state.clone();
+        taken
+            .state
+            .set_slot(8, SlotValue::with_owner_fields(1, 50, Address([0x77; 32]).as_fields()))
+            .unwrap();
+        let after = ReleaseCase {
+            state: taken,
+            intent: case.intent.clone(),
+            n: case.n,
+        };
+        pool.update_chain_view(after.view_at(tip + 1, &[])).await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "its output slot is taken");
+
+        // A committee update whose payment's input a block spent.
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let paying = VaultCase::new(tip, Address([0xA5; 32]), &[(Address([0x42; 32]), 10), (marker, 0)]);
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(&payload)
+            .unwrap()
+            .next_sync_committee
+            .hash_tree_root();
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let view_of_case = |case: &VaultCase, tip: u64| {
+            let mut view = case.view_at(tip, 0);
+            view.destination_rules = rules;
+            view
+        };
+        let pool = ReleaseCase::pool_on(view_of_case(&paying, tip));
+        let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+            crate::destination::CommitteeUpdateIntent {
+                payload: payload.clone(),
+                payment: paying.intent.clone(),
+            },
+        );
+        pool.submit_destination(&intent.encode().unwrap())
+            .await
+            .expect("a committee update with its payment");
+        pool.update_chain_view(view_of_case(&paying, tip + 1)).await;
+        assert_eq!(pool.destination_candidates().await.0.len(), 1, "still applies");
+        let mut spent = paying.state.clone();
+        spent.state.set_slot(7, SlotValue::EMPTY).unwrap();
+        let spent = VaultCase {
+            state: spent,
+            intent: paying.intent.clone(),
+        };
+        pool.update_chain_view(view_of_case(&spent, tip + 2)).await;
+        assert!(pool.destination_candidates().await.0.is_empty(), "its input is spent");
+    }
+
+    /// NO-7 (audit 13/11): a held intent whose transaction binds an epoch
+    /// anchor the next block no longer accepts is forgotten: never offered,
+    /// it used to hold one of the 64 places until something else removed it
+    /// (64 of them and every later release was refused `Full`).
+    #[tokio::test]
+    async fn destination_intents_with_a_stale_anchor_are_forgotten() {
+        use jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        case.submit(&pool).await.expect("admitted");
+        pool.update_chain_view(case.view_at(tip + 1, &[])).await;
+        assert_eq!(pool.destination_candidates().await.1.len(), 1, "its anchor still accepted");
+        let later = tip + 3 * TX_EPOCH_BLOCKS;
+        let view = case.view_at(later, &[]);
+        let (accepted, generation) = view.accepted_user_epoch_anchors();
+        let anchor = case.intent.payment().pages[0].body.epoch_anchor;
+        assert!(!accepted.accepts(anchor, generation), "the premise: a stale anchor");
+        pool.update_chain_view(view).await;
+        assert!(pool.destination_candidates().await.1.is_empty(), "forgotten");
     }
 
     /// A committee update with the transaction that pays for it (its

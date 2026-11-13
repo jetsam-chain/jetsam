@@ -950,6 +950,21 @@ impl DestinationPool {
         before - self.len()
     }
 
+    /// Forget every intent, of any kind, whose transaction `stale` says the
+    /// next block can no longer place (NO-5, NO-7). Returns the number
+    /// forgotten.
+    pub fn forget_payments(&mut self, stale: impl Fn(&PagedSpendIntent) -> bool) -> usize {
+        let before = self.len();
+        self.committee_updates
+            .retain(|_, update| !stale(&update.payment));
+        self.releases.retain(|_, release| !stale(&release.payment));
+        self.contradictions.retain(|_, c| !stale(&c.payment));
+        if self.revocation.as_ref().is_some_and(|r| stale(&r.payment)) {
+            self.revocation = None;
+        }
+        before - self.len()
+    }
+
     /// Forget the releases of `releases` and the committee update bringing
     /// `committee_period` (a template's block was refused for them).
     pub fn forget(&mut self, releases: &[u64], committee_period: Option<u64>) -> usize {
