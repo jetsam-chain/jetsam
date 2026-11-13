@@ -583,7 +583,7 @@ impl AsyncMempool {
             }
             DestinationIntent::FastRevocation(_) => DestinationAdmitted::FastRevocation,
         };
-        st.destination.hold(intent).map_err(|error| match error {
+        let held = st.destination.hold(intent).map_err(|error| match error {
             HoldError::Full => SubmitError::Full {
                 capacity: crate::destination::MAX_HELD_RELEASES,
             },
@@ -591,16 +591,24 @@ impl AsyncMempool {
                 SubmitError::MalformedIntent("committee update without a period".into())
             }
         })?;
-        let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
-            release: match admitted {
-                DestinationAdmitted::Release { n }
-                | DestinationAdmitted::ReleaseOverBase { n }
-                | DestinationAdmitted::FastRelease { n } => Some(n),
-                DestinationAdmitted::CommitteeUpdate { .. }
-                | DestinationAdmitted::FastContradiction { .. }
-                | DestinationAdmitted::FastRevocation => None,
-            },
-        });
+        // NO-2: a replay announces nothing; a replacement of a held key is
+        // relayed (a refresh travels) but wakes no miner (the key was
+        // offered already); only a new key may change the next offer.
+        if held == crate::destination::Held::Same {
+            return Ok(admitted);
+        }
+        if held == crate::destination::Held::New {
+            let _ = self.events.send(MempoolEvent::DestinationObjectAdmitted {
+                release: match admitted {
+                    DestinationAdmitted::Release { n }
+                    | DestinationAdmitted::ReleaseOverBase { n }
+                    | DestinationAdmitted::FastRelease { n } => Some(n),
+                    DestinationAdmitted::CommitteeUpdate { .. }
+                    | DestinationAdmitted::FastContradiction { .. }
+                    | DestinationAdmitted::FastRevocation => None,
+                },
+            });
+        }
         let _ = self.events.send(MempoolEvent::BridgeIntentAdmitted {
             intent_bytes: Arc::from(bytes),
         });
@@ -4171,6 +4179,57 @@ mod tests {
         let mut paid_events = paid.subscribe();
         assert!(case.submit(&paid).await.is_err());
         assert!(relayed_bridge_intents(&mut paid_events).is_empty());
+    }
+
+    /// NO-2 (audit 13/11): the miners are woken (and the intent relayed) by
+    /// what changes the next template's offer, not by a replay. The same
+    /// bytes again: accepted as held already, nothing announced, nothing
+    /// relayed. Another intent for a key already held (the same `n`, its
+    /// payment re-wrapped): it replaces the held one and is relayed (a
+    /// relayer's refresh travels), but wakes no miner — the held key was
+    /// already offered.
+    #[tokio::test]
+    async fn a_replayed_destination_intent_is_not_admitted_again() {
+        use crate::destination::DestinationIntent;
+        use crate::event::MempoolEvent;
+        let drain = |events: &mut tokio::sync::broadcast::Receiver<MempoolEvent>| {
+            let (mut woken, mut relayed) = (0, 0);
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    MempoolEvent::DestinationObjectAdmitted { .. } => woken += 1,
+                    MempoolEvent::BridgeIntentAdmitted { .. } => relayed += 1,
+                    _ => {}
+                }
+            }
+            (woken, relayed)
+        };
+        let tip = CROSSING_J + 20;
+        let case = ReleaseCase::new(tip, 4, 5_000_000, 0);
+        let pool = case.pool_at(tip, &[]);
+        let mut events = pool.subscribe();
+        let bytes = case.intent.encode().unwrap();
+        pool.submit_destination(&bytes).await.expect("a valid release intent");
+        assert_eq!(drain(&mut events), (1, 1), "a new key: woken and relayed");
+        for _ in 0..3 {
+            pool.submit_destination(&bytes)
+                .await
+                .expect("the same bytes: held already");
+        }
+        assert_eq!(drain(&mut events), (0, 0), "a replay: nothing");
+        let DestinationIntent::Release(mut rewrapped) = case.intent.clone() else {
+            unreachable!()
+        };
+        rewrapped.payment =
+            jetsam_tx::PagedSpendIntent::new(rewrapped.payment.pages.clone(), vec![0xA6; 64])
+                .unwrap();
+        let rewrapped = DestinationIntent::Release(rewrapped);
+        pool.submit_destination(&rewrapped.encode().unwrap())
+            .await
+            .expect("the same release re-wrapped");
+        assert_eq!(drain(&mut events), (0, 1), "a replacement: relayed, no miner woken");
+        let (_, held) = pool.destination_candidates().await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].payment.authorization_bytes, vec![0xA6; 64], "the newer one is held");
     }
 
     /// T2.5: a release intent (object, finality update, account proof, and

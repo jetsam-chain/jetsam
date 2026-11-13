@@ -644,6 +644,18 @@ pub enum HoldError {
     NoPeriod,
 }
 
+/// What [`DestinationPool::hold`] changed (NO-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// A key (period, `n`, revocation) the pool did not hold: the next
+    /// template's offer may change.
+    New,
+    /// Another intent for a key held: it replaces the held one.
+    Replaced,
+    /// The very intent held already: nothing changed.
+    Same,
+}
+
 /// A2-M1: the L1 rules of the block for one destination intent, on a branch
 /// that knows `committees` with the keys `keys` this node holds — what
 /// `validate_block_destination` asks of the object beside the vault gate: a
@@ -817,8 +829,16 @@ impl DestinationPool {
     /// one — replacing the one of the same period or index (the newer proof
     /// wins: a relayer refreshes a release under a later finality update). A
     /// full release pool makes room for a lower index than its largest.
-    pub fn hold(&mut self, intent: DestinationIntent) -> Result<(), HoldError> {
-        match intent {
+    pub fn hold(&mut self, intent: DestinationIntent) -> Result<Held, HoldError> {
+        // NO-2: what the hold changed, for the caller to announce only that.
+        fn change<T: PartialEq>(held: Option<&T>, new: &T) -> Held {
+            match held {
+                Some(held) if held == new => Held::Same,
+                Some(_) => Held::Replaced,
+                None => Held::New,
+            }
+        }
+        let held = match intent {
             DestinationIntent::CommitteeUpdate(update) => {
                 let period = update.next_period().ok_or(HoldError::NoPeriod)?;
                 if !self.committee_updates.contains_key(&period)
@@ -826,7 +846,9 @@ impl DestinationPool {
                 {
                     return Err(HoldError::Full);
                 }
+                let held = change(self.committee_updates.get(&period), &update);
                 self.committee_updates.insert(period, update);
+                held
             }
             DestinationIntent::Release(release) => {
                 let n = release.release.n;
@@ -840,7 +862,9 @@ impl DestinationPool {
                         _ => return Err(HoldError::Full),
                     }
                 }
+                let held = change(self.releases.get(&n), &release);
                 self.releases.insert(n, release);
+                held
             }
             DestinationIntent::FastContradiction(c) => {
                 let n = c.n();
@@ -849,13 +873,17 @@ impl DestinationPool {
                 {
                     return Err(HoldError::Full);
                 }
+                let held = change(self.contradictions.get(&n), &c);
                 self.contradictions.insert(n, c);
+                held
             }
             DestinationIntent::FastRevocation(r) => {
+                let held = change(self.revocation.as_ref(), &r);
                 self.revocation = Some(r);
+                held
             }
-        }
-        Ok(())
+        };
+        Ok(held)
     }
 
     /// Contradictions by increasing `n`.
