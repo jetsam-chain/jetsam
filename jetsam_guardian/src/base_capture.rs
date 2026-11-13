@@ -42,8 +42,9 @@ pub const PROPOSAL_INTERVAL_BLOCKS: u64 = 6_000;
 pub const CAPTURE_WINDOW_BLOCKS: u64 = 9_000;
 /// How long a capture is kept: the 5 days a game takes to become final
 /// (`SLOW_FINALIZATION_DELAY`, D101), the ≈ 34 min of its proposal, its L1
-/// finality and a margin: 5 days and 6 hours.
-pub const KEEP_SECONDS: u64 = 5 * 86_400 + 6 * 3_600;
+/// finality, and (FR-5, audit n°2) a resolution late by days: two weeks (the
+/// settled records are no longer captured, so the captures stay small).
+pub const KEEP_SECONDS: u64 = 14 * 86_400;
 
 /// One storage word captured: its slot, value and proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,10 +306,8 @@ fn file_of(dir: &Path, block: u64) -> std::path::PathBuf {
 pub fn store(dir: &Path, capture: &Capture) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = file_of(dir, capture.block);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&to_json(capture))?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    // FR-8: written whole and synced, then renamed
+    crate::write_atomic(&path, &serde_json::to_vec_pretty(&to_json(capture))?)
 }
 
 /// The capture of `block`, if kept; a file that is not one is an error.

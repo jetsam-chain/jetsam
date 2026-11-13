@@ -1007,6 +1007,7 @@ pub fn slow_wanted(
 /// group built from vault slots no other intent of this relay holds, proven
 /// (`prove`), checked ([`verify_slow_intent`]); then, by `cfg.mode`, written
 /// to `dry_dir` or handed to the node after the journal says so on disk.
+/// FR-3 (audit n°2): nor the slots `fast_held` (the fast lane's releases in flight).
 #[allow(clippy::too_many_arguments)]
 pub fn slow_release_pass(
     node: &dyn SlowNode,
@@ -1021,6 +1022,7 @@ pub fn slow_release_pass(
     now: u64,
     prove: &dyn Fn(Vec<TxPage>) -> anyhow::Result<PagedSpendIntent>,
     report: &mut SlowPassReport,
+    fast_held: &BTreeSet<u32>,
 ) -> anyhow::Result<()> {
     if cfg.mode == SlowMode::Off || wanted.is_empty() {
         return Ok(());
@@ -1101,7 +1103,8 @@ pub fn slow_release_pass(
     if hints.len() < 3 * batch.len() {
         bail!("getSlotHints: {} hints for {} groups", hints.len(), batch.len());
     }
-    let mut taken: BTreeSet<u32> = BTreeSet::new();
+    // FR-3 (audit n°2): never the slots of the fast lane's releases in flight either
+    let mut taken: BTreeSet<u32> = fast_held.clone();
     for (i, release) in batch.iter().enumerate() {
         let n = release.n;
         let payee = payees[&n];

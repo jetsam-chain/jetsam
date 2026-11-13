@@ -156,10 +156,33 @@ pub struct RunState {
     pub proposal_anchor: Option<u64>,
     /// The next game index to judge.
     pub next_game: Option<u64>,
-    /// Fast releases sent: `n` → when.
+    /// Fast releases sent: `n` → when (the first time: the slow lane's grace counts from it).
     pub sent: BTreeMap<u64, u64>,
     /// Contradictions sent: `n`.
     pub contradicted: BTreeSet<u64>,
+    /// FR-2 (audit n°2): the game the passes failed to read, and how many times in a row.
+    pub game_failures: Option<(u64, u32)>,
+    /// FR-3 (audit n°2): each fast release handed in, while its burn is not paid: when last, how many times, the
+    /// vault slots its group spends (held from this run's other releases).
+    pub fast_tries: BTreeMap<u64, FastTry>,
+    /// FR-3: the burns the branch says released (`getAdvances`): never handed in again.
+    pub paid: BTreeSet<u64>,
+    /// FR-1 (audit n°2): the `n` of the branch's fast records this run never saw burnt: captured as the burns are
+    /// (their word, an absence, is what contradicts them).
+    pub watched: BTreeSet<u64>,
+    /// FR-1: each contradiction handed in while the branch does not show it: when last, how many times.
+    pub contradiction_tries: BTreeMap<u64, (u64, u32)>,
+    /// FR-5 (audit n°2): the fast records Base's final state confirmed (the contradiction search found the word
+    /// paid under a valid game at or after their block): never contradicted, their slot no longer captured.
+    pub settled: BTreeSet<u64>,
+}
+
+/// FR-3: a fast release handed in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FastTry {
+    pub last: u64,
+    pub count: u32,
+    pub slots: Vec<u32>,
 }
 
 impl RunState {
@@ -181,6 +204,7 @@ impl RunState {
             };
             burns.insert(seen.burn.n, seen);
         }
+        let set = |key: &str| -> BTreeSet<u64> { v[key].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default() };
         let pairs = |key: &str| -> BTreeMap<u64, u64> {
             v[key]
                 .as_array()
@@ -197,10 +221,32 @@ impl RunState {
             proposal_anchor: v["proposal_anchor"].as_u64(),
             next_game: v["next_game"].as_u64(),
             sent: pairs("sent"),
-            contradicted: v["contradicted"]
+            contradicted: set("contradicted"),
+            game_failures: v["game_failures"].as_array().and_then(|p| Some((p.first()?.as_u64()?, u32::try_from(p.get(1)?.as_u64()?).ok()?))),
+            fast_tries: v["fast_tries"]
                 .as_array()
-                .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| {
+                            Some((
+                                t["n"].as_u64()?,
+                                FastTry {
+                                    last: t["last"].as_u64()?,
+                                    count: u32::try_from(t["count"].as_u64()?).ok()?,
+                                    slots: t["slots"].as_array()?.iter().filter_map(|x| u32::try_from(x.as_u64()?).ok()).collect(),
+                                },
+                            ))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
+            paid: set("paid"),
+            watched: set("watched"),
+            contradiction_tries: v["contradiction_tries"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|p| Some((p[0].as_u64()?, (p[1].as_u64()?, u32::try_from(p[2].as_u64()?).ok()?)))).collect())
+                .unwrap_or_default(),
+            settled: set("settled"),
         })
     }
 
@@ -217,21 +263,215 @@ impl RunState {
             "next_game": self.next_game,
             "sent": self.sent.iter().map(|(n, at)| json!([n, at])).collect::<Vec<_>>(),
             "contradicted": self.contradicted.iter().collect::<Vec<_>>(),
+            "game_failures": self.game_failures.map(|(i, c)| json!([i, c])),
+            "fast_tries": self.fast_tries.iter().map(|(n, t)| json!({"n": n, "last": t.last, "count": t.count, "slots": t.slots})).collect::<Vec<_>>(),
+            "paid": self.paid.iter().collect::<Vec<_>>(),
+            "watched": self.watched.iter().collect::<Vec<_>>(),
+            "contradiction_tries": self.contradiction_tries.iter().map(|(n, (at, c))| json!([n, at, c])).collect::<Vec<_>>(),
+            "settled": self.settled.iter().collect::<Vec<_>>(),
         });
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&v)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // FR-8: written whole and synced, then renamed
+        crate::write_atomic(path, &serde_json::to_vec_pretty(&v)?)
     }
+}
+
+// ---------------------------------------------------------------------------
+// FR-1, FR-2, FR-3, FR-4, FR-5 (audit n°2): what the passes decide
+// ---------------------------------------------------------------------------
+
+/// FR-2: passes in a row that fail on one game before it is skipped (with an alert): a burn it would have paid is
+/// paid under the next game (any game whose block is at or after the burn's pays it).
+pub const GAME_READ_TRIES: u32 = 5;
+
+/// FR-2: the pass failed on game `index`; true when it is skipped now (its `GAME_READ_TRIES`-th failure in a row).
+pub fn game_read_failed(state: &mut RunState, index: u64) -> bool {
+    let tries = match state.game_failures {
+        Some((i, c)) if i == index => c + 1,
+        _ => 1,
+    };
+    if tries >= GAME_READ_TRIES {
+        state.game_failures = None;
+        return true;
+    }
+    state.game_failures = Some((index, tries));
+    false
+}
+
+/// FR-3: a fast release admitted and not paid is handed in again this long after (≈ 10 blocks: a release the
+/// mempool lost — its vault slots spent by another, a restart — or left behind).
+pub const FAST_RESEND_SECS: u64 = 1_800;
+/// FR-3: handed in at most this many times, then an alert (the slow lane takes the burn after its grace).
+pub const FAST_MAX_SENDS: u32 = 4;
+
+/// FR-3: what to do with the fast release of burn `n` under a new game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastDue {
+    /// Hand it in (never handed in, or not paid `FAST_RESEND_SECS` after the last time).
+    Send,
+    /// Paid, in flight, or given up already.
+    Wait,
+    /// Handed in `FAST_MAX_SENDS` times and never paid: alerted once, then `Wait`.
+    GiveUp,
+}
+
+/// FR-3: the fast release of burn `n` at `now`.
+pub fn fast_release_due(state: &RunState, n: u64, now: u64) -> FastDue {
+    if state.paid.contains(&n) {
+        return FastDue::Wait;
+    }
+    // a state of the older runs: sent once, at that time
+    let (last, count) = match (state.fast_tries.get(&n), state.sent.get(&n)) {
+        (Some(t), _) => (t.last, t.count),
+        (None, Some(at)) => (*at, 1),
+        (None, None) => return FastDue::Send,
+    };
+    if count > FAST_MAX_SENDS || now < last.saturating_add(FAST_RESEND_SECS) {
+        FastDue::Wait
+    } else if count == FAST_MAX_SENDS {
+        FastDue::GiveUp
+    } else {
+        FastDue::Send
+    }
+}
+
+/// FR-3: the fast release of `n` given up (alerted once): never handed in again.
+pub fn fast_given_up(state: &mut RunState, n: u64) {
+    if let Some(t) = state.fast_tries.get_mut(&n) {
+        t.count = FAST_MAX_SENDS + 1;
+    }
+}
+
+/// FR-3: the fast release of burn `n` was handed in at `now`, its group spending `slots`.
+pub fn fast_handed_in(state: &mut RunState, n: u64, now: u64, slots: Vec<u32>) {
+    state.sent.entry(n).or_insert(now);
+    let t = state.fast_tries.entry(n).or_default();
+    t.last = now;
+    t.count += 1;
+    t.slots = slots;
+}
+
+/// FR-3: the vault slots the fast releases in flight hold, but `n`'s own.
+pub fn fast_held_slots(state: &RunState, n: u64) -> BTreeSet<u32> {
+    state
+        .fast_tries
+        .iter()
+        .filter(|(m, _)| **m != n && !state.paid.contains(m))
+        .flat_map(|(_, t)| t.slots.iter().copied())
+        .collect()
+}
+
+/// FR-1: a contradiction handed in that the branch does not show yet is handed in again this long after (≈ 3 blocks).
+pub const CONTRADICTION_RESEND_SECS: u64 = 600;
+
+/// FR-1: the contradiction of `n` is to be handed in at `now` (never handed in, or not shown by the branch
+/// `CONTRADICTION_RESEND_SECS` after the last time: the fuse is tried until it blows).
+pub fn contradiction_due(state: &RunState, n: u64, now: u64) -> bool {
+    if !state.contradicted.contains(&n) {
+        return true;
+    }
+    // a state of the older runs (sent, no time): at once
+    state.contradiction_tries.get(&n).is_none_or(|(last, _)| now >= last.saturating_add(CONTRADICTION_RESEND_SECS))
+}
+
+/// FR-1: the contradiction of `n` was handed in at `now`.
+pub fn contradiction_handed_in(state: &mut RunState, n: u64, now: u64) {
+    state.contradicted.insert(n);
+    let t = state.contradiction_tries.entry(n).or_insert((now, 0));
+    t.0 = now;
+    t.1 += 1;
+}
+
+/// FR-1: the branch's fast records this run cannot vouch for, said at once (no proof is needed to say it): a record of
+/// an `n` never seen burnt, or of another owner or amount than the burn seen.
+pub fn record_alerts(records: &[FastPaid], burns: &BTreeMap<u64, BurnSeen>) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match burns.get(&r.n) {
+            None => Some(format!(
+                "ALERT FAST_RECORD n {}: the branch paid {} µJTM fast to 0x{} for a burn never seen burnt by this run (Base block {} claimed): revoke the fast key if it is not ours",
+                r.n,
+                r.amount,
+                hex::encode(r.owner.0),
+                r.l2_block
+            )),
+            Some(b) if (b.burn.owner, b.burn.amount) != (r.owner, r.amount) => Some(format!(
+                "ALERT FAST_RECORD n {}: the branch paid {} µJTM fast to 0x{}, the burn seen is {} µJTM to 0x{}: revoke the fast key if it is not ours",
+                r.n,
+                r.amount,
+                hex::encode(r.owner.0),
+                b.burn.amount,
+                hex::encode(b.burn.owner.0)
+            )),
+            Some(_) => None,
+        })
+        .collect()
+}
+
+/// FR-1: the `n` of the open fast records never seen burnt are watched (captured like the burns).
+pub fn watch_records(state: &mut RunState, records: &[FastPaid]) {
+    for r in records {
+        if !r.contradicted && !state.burns.contains_key(&r.n) {
+            state.watched.insert(r.n);
+        }
+    }
+}
+
+/// FR-1: each open fast record's word `withdrawals[n]` as each Base RPC serves it now (`eth_getStorageAt`, latest):
+/// another word than the one paid is said at once, with the RPC that served it (no proof: an alert, not a
+/// contradiction; an RPC that does not answer is said too).
+pub fn base_word_alerts(bases: &[(&str, &dyn BaseRpc)], bridge: &L1BridgeParams, records: &[FastPaid]) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in records {
+        let slot = format!("0x{}", hex::encode(withdrawal_slot(r.n, bridge.withdrawals_slot)));
+        let paid = withdrawal_commitment(&r.owner.0, r.amount);
+        for (name, base) in bases {
+            match base
+                .rpc("eth_getStorageAt", json!([format!("0x{}", hex::encode(bridge.address)), slot, "latest"]))
+                .and_then(|v| word_of(v.as_str().unwrap_or_default()))
+            {
+                Ok(word) if word == paid => {}
+                Ok(word) => out.push(format!(
+                    "ALERT FAST_RECORD n {}: Base ({name}) holds the word 0x{} for it, not the burn paid fast ({} µJTM to 0x{}): revoke the fast key if it is not ours",
+                    r.n,
+                    hex::encode(word),
+                    r.amount,
+                    hex::encode(r.owner.0)
+                )),
+                Err(e) => out.push(format!("ALERT FAST_RECORD n {}: Base ({name}) did not serve its word: {e:#}", r.n)),
+            }
+        }
+    }
+    out
+}
+
+/// FR-4: each tick reads the burns again from this many blocks below the last one scanned (Base, 2 s a block: 30
+/// minutes): a log endpoint late behind the head that answered it never hides a burn.
+pub const BURN_RESCAN_BLOCKS: u64 = 900;
+
+/// FR-4: the burn indices missing below the highest seen (the bridge counts from 1).
+pub fn burn_gaps(burns: &BTreeMap<u64, BurnSeen>) -> Vec<u64> {
+    let top = burns.keys().next_back().copied().unwrap_or(0);
+    (1..top).filter(|n| !burns.contains_key(n)).collect()
+}
+
+/// FR-1, FR-5: the `n` each capture asks: every burn seen and every fast record watched, but those settled.
+pub fn capture_ns(state: &RunState) -> Vec<u64> {
+    let ns: BTreeSet<u64> = state.burns.keys().chain(&state.watched).copied().filter(|n| !state.settled.contains(n)).collect();
+    ns.into_iter().collect()
 }
 
 /// The capture plan of the run: the bridge's `genesisId` and `withdrawals[n]`
 /// of every burn seen, at each proposal block from `anchor`.
 pub fn capture_plan(bridge: &L1BridgeParams, anchor: u64, burns: &BTreeMap<u64, BurnSeen>) -> CapturePlan {
     let ns: Vec<u64> = burns.keys().copied().collect();
+    capture_plan_of(bridge, anchor, &ns)
+}
+
+/// The capture plan of the `n` given (FR-1, FR-5: [`capture_ns`]).
+pub fn capture_plan_of(bridge: &L1BridgeParams, anchor: u64, ns: &[u64]) -> CapturePlan {
     CapturePlan {
         address: bridge.address,
-        slots: crate::base_capture::capture_slots(bridge.genesis_id_slot, bridge.withdrawals_slot, &ns),
+        slots: crate::base_capture::capture_slots(bridge.genesis_id_slot, bridge.withdrawals_slot, ns),
         anchor,
         interval: crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
         window: crate::base_capture::CAPTURE_WINDOW_BLOCKS,
@@ -432,6 +672,88 @@ pub fn revocation_intent(revocation: &FastRevocation, payment: jetsam_tx::PagedS
     .map_err(|e| anyhow!("the intent: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// FR-6 (audit n°2): a revocation signed beforehand, offline
+// ---------------------------------------------------------------------------
+
+/// FR-6: the revocation as a file (its payload, hex): signed once, offline, when the keys are made; whoever holds the
+/// file can close the fast lane (keep it as safe as a key, apart from it).
+pub fn signed_revocation_text(revocation: &FastRevocation) -> String {
+    hex::encode(revocation.encode_payload())
+}
+
+/// FR-6: a revocation read from a file signed beforehand: this network's, closing `release_key` (this build's relay
+/// key), signed by `revoke_key` (this build's cold key); anything else is refused.
+pub fn load_signed_revocation(text: &str, release_key: Option<[u8; KEY_BYTES]>, revoke_key: Option<&[u8; KEY_BYTES]>) -> anyhow::Result<FastRevocation> {
+    let key = release_key.ok_or_else(|| anyhow!("this build has no FAST_RELEASE_KEY: nothing to revoke"))?;
+    let bytes = hex::decode(text.trim().trim_start_matches("0x")).map_err(|e| anyhow!("the revocation file is not hex: {e}"))?;
+    let revocation = FastRevocation::decode_payload(&bytes).map_err(|e| anyhow!("the file is not a revocation: {e:?}"))?;
+    if revocation.network != jetsam_chain::consensus::guardian::network_id() {
+        bail!("the revocation is of another network");
+    }
+    if revocation.key != key {
+        bail!("the revocation closes 0x{}, not this build's FAST_RELEASE_KEY", hex::encode(revocation.key));
+    }
+    jetsam_chain::consensus::destination::fast::verify_revocation(&revocation, revoke_key)
+        .map_err(|e| anyhow!("the revocation does not verify under this build's FAST_REVOKE_KEY: {e:?}"))?;
+    Ok(revocation)
+}
+
+/// FR-6: the revocation handed to `node` (its marker paid by the node's wallet); with `dry_out`, written there and
+/// not sent. What the node answered (or where it was written).
+pub fn hand_in_revocation(node: &dyn crate::light_feed::FeedNode, revocation: &FastRevocation, dry_out: Option<&Path>) -> anyhow::Result<Value> {
+    let marker = jetsam_chain::consensus::destination::fast::revocation_marker(&revocation.key);
+    let payment = node.pay_marker(&marker.0)?;
+    let intent = revocation_intent(revocation, payment)?;
+    if let Some(out) = dry_out {
+        std::fs::write(out, hex::encode(&intent))?;
+        return Ok(json!({"written_to": out.display().to_string()}));
+    }
+    node.submit(&intent)
+}
+
+// ---------------------------------------------------------------------------
+// FR-7, FR-8 (audit n°2): what fast-run checks before it starts
+// ---------------------------------------------------------------------------
+
+/// FR-7: the Base RPCs of fast-run: at least [`crate::fast::MIN_BASE_RPCS`], none given twice, each on chain `want`
+/// (`eth_chainId`, read by `chain_id`): the second reading of a root is a second source, never the first again.
+pub fn check_base_rpcs(urls: &[String], chain_id: &dyn Fn(&str) -> anyhow::Result<u64>, want: u64) -> anyhow::Result<()> {
+    let min = crate::fast::MIN_BASE_RPCS;
+    if urls.len() < min {
+        bail!("fast-run needs {min} Base RPCs at least (--base, each another provider), {} given: one is not a second reading", urls.len());
+    }
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    for (i, u) in urls.iter().enumerate() {
+        if urls[..i].iter().any(|v| norm(v) == norm(u)) {
+            bail!("the Base RPC {u} is given twice: a second reading of the same source checks nothing");
+        }
+    }
+    for u in urls {
+        match chain_id(u) {
+            Ok(id) if id == want => {}
+            Ok(id) => bail!("the Base RPC {u} is chain {id} (eth_chainId), not {want}"),
+            Err(e) => bail!("the Base RPC {u} did not say its chain (eth_chainId): {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// FR-8: fast-run's lock on its state directory (`fast_run.lock`, held while it runs): a second fast-run on the same
+/// state does not start (D163).
+pub fn lock_fast_run_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("fast_run.lock");
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    // SAFETY: flock on a descriptor we own.
+    let r = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if r != 0 {
+        bail!("another fast-run holds {} (the same --state-dir): this one does not start", path.display());
+    }
+    Ok(lock)
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -448,34 +770,58 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
 }
 
 /// `jg-relay fast-revoke --key <cold secret> --node <url> --node-cookie <file> [--dry-run --out <file>]`:
-/// closes this build's relay key.
+/// closes this build's relay key. FR-6 (audit n°2): `--key <cold secret> --sign-only --out <file>` signs it offline
+/// (no node: done once, when the keys are made); `--signed <file> --node <url> --node-cookie <file>` hands that file in
+/// without the cold key (whoever holds the file can close the fast lane: keep it as safe as a key, apart from it).
 pub fn revoke_cli(args: &[String]) -> anyhow::Result<()> {
-    let usage = || anyhow!("fast-revoke --key <cold secret file> --node <url> --node-cookie <rpc.cookie> [--dry-run --out <file>]");
+    let usage = || {
+        anyhow!(
+            "fast-revoke (--key <cold secret file> | --signed <revocation file>) --node <url> --node-cookie <rpc.cookie> [--dry-run --out <file>] \
+             | fast-revoke --key <cold secret file> --sign-only --out <file>"
+        )
+    };
     let say = |line: &str| println!("{} jg-relay fast-revoke {line}", crate::now_unix());
     let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.base_return.fast;
     let key = rules.release_key.ok_or_else(|| anyhow!("this build has no FAST_RELEASE_KEY: nothing to revoke"))?;
-    let cold = crate::fast::load_fast_secret(Path::new(&flag(args, "--key").ok_or_else(usage)?))?;
-    if Some(cold.sk_to_pk().compress()) != rules.revoke_key {
-        bail!("the key given is not this build's FAST_REVOKE_KEY");
+    let revocation = match (flag(args, "--key"), flag(args, "--signed")) {
+        (Some(cold), None) => {
+            let cold = crate::fast::load_fast_secret(Path::new(&cold))?;
+            if Some(cold.sk_to_pk().compress()) != rules.revoke_key {
+                bail!("the key given is not this build's FAST_REVOKE_KEY");
+            }
+            let revocation = revocation_of(&cold, key);
+            jetsam_chain::consensus::destination::fast::verify_revocation(&revocation, rules.revoke_key.as_ref())
+                .map_err(|e| anyhow!("the revocation does not verify: {e:?}"))?;
+            revocation
+        }
+        (None, Some(file)) => load_signed_revocation(&std::fs::read_to_string(&file)?, Some(key), rules.revoke_key.as_ref())
+            .map_err(|e| anyhow!("{file}: {e:#}"))?,
+        _ => return Err(usage()),
+    };
+    if args.iter().any(|a| a == "--sign-only") {
+        if flag(args, "--signed").is_some() {
+            return Err(usage());
+        }
+        let out = flag(args, "--out").ok_or_else(usage)?;
+        let path = Path::new(&out);
+        if path.exists() {
+            bail!("{out} exists: a signed revocation is never written over a file");
+        }
+        crate::write_atomic(path, signed_revocation_text(&revocation).as_bytes())?;
+        say(&format!("SIGNED, NOT SENT: the revocation of 0x{} written to {out} (keep it as safe as a key: it closes the fast lane)", hex::encode(key)));
+        return Ok(());
     }
-    let revocation = revocation_of(&cold, key);
-    jetsam_chain::consensus::destination::fast::verify_revocation(&revocation, rules.revoke_key.as_ref())
-        .map_err(|e| anyhow!("the revocation does not verify: {e:?}"))?;
     let node = crate::light_feed::RelayNode {
         client: crate::rpc::NodeClient::fast_release(&flag(args, "--node").ok_or_else(usage)?, crate::rpc::Egress::Clearnet),
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
     };
-    use crate::light_feed::FeedNode;
-    let marker = jetsam_chain::consensus::destination::fast::revocation_marker(&key);
-    let payment = node.pay_marker(&marker.0)?;
-    let intent = revocation_intent(&revocation, payment)?;
     if args.iter().any(|a| a == "--dry-run") {
         let out = flag(args, "--out").ok_or_else(usage)?;
-        std::fs::write(&out, hex::encode(&intent))?;
+        hand_in_revocation(&node, &revocation, Some(Path::new(&out)))?;
         say(&format!("DRY RUN, NOT SENT: the revocation of 0x{} written to {out}", hex::encode(key)));
         return Ok(());
     }
-    let admitted = node.submit(&intent)?;
+    let admitted = hand_in_revocation(&node, &revocation, None)?;
     say(&format!("SENT the revocation of 0x{}: {admitted}", hex::encode(key)));
     Ok(())
 }
@@ -540,7 +886,7 @@ pub fn capture_tick(
 ) -> anyhow::Result<TickReport> {
     let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
     let mut report = TickReport { head, ..TickReport::default() };
-    let from = lock(state).scanned_to.map_or(from_block, |s| s + 1);
+    let from = lock(state).scanned_to.map_or(from_block, |s| (s + 1).saturating_sub(BURN_RESCAN_BLOCKS).max(from_block));
     if from <= head {
         let seen = scan_burns(base, &bridge.address, from, head)?;
         let mut s = lock(state);
@@ -552,14 +898,14 @@ pub fn capture_tick(
         s.scanned_to = Some(head);
         s.store(state_file)?;
     }
-    let (anchor, burns) = {
+    let (anchor, ns) = {
         let s = lock(state);
-        (s.proposal_anchor, s.burns.clone())
+        (s.proposal_anchor, capture_ns(&s))
     };
     let Some(anchor) = anchor else {
         return Ok(report);
     };
-    let mut plan = capture_plan(bridge, anchor, &burns);
+    let mut plan = capture_plan_of(bridge, anchor, &ns);
     plan.interval = interval;
     plan.window = window;
     let kept = crate::base_capture::captured(dir)?;
@@ -699,8 +1045,17 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         ..crate::slow_release::SlowConfig::default()
     };
     let l1 = crate::l1::L1::new(&flag(args, "--l1").ok_or_else(usage)?);
-    let bases: Vec<crate::l1::L1> = flags(args, "--base").iter().map(|u| crate::l1::L1::new(u)).collect();
+    let base_urls = flags(args, "--base");
+    let bases: Vec<crate::l1::L1> = base_urls.iter().map(|u| crate::l1::L1::new(u)).collect();
     let base = bases.first().ok_or_else(usage)?;
+    // FR-7 (audit n°2): two Base RPCs at least, none twice, each on Base's chain; the L1 on the L1's
+    let chain_of = |l: &crate::l1::L1| crate::l1::hex_u64(&l.rpc("eth_chainId", json!([]))?);
+    check_base_rpcs(&base_urls, &|u| chain_of(&bases[base_urls.iter().position(|x| x == u).expect("listed")]), rules.base_return.fast.base_chain_id)
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
+    let l1_chain = chain_of(&l1).map_err(|e| anyhow!("the L1 RPC did not say its chain (eth_chainId): {e:#}: fast-run does not start"))?;
+    if l1_chain != rules.base_return.fast.l1_chain_id {
+        bail!("the L1 RPC is chain {l1_chain}, not {}: fast-run does not start", rules.base_return.fast.l1_chain_id);
+    }
     let beacon = crate::light_feed::HttpBeacon {
         url: flag(args, "--beacon").ok_or_else(usage)?,
         egress: crate::rpc::Egress::Clearnet,
@@ -720,6 +1075,8 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let dir = std::path::PathBuf::from(flag(args, "--state-dir").ok_or_else(usage)?);
+    // FR-8 (audit n°2, D163): one fast-run per state directory, held until it stops
+    let _lock = lock_fast_run_dir(&dir)?;
     let captures = dir.join("captures");
     std::fs::create_dir_all(&captures)?;
     let state_file = dir.join("fast_run.json");
@@ -765,6 +1122,8 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         parents.len(),
         slow.mode
     ));
+    // FR-1, FR-4: the alerts of the records and of the holes, each said once by this process
+    let mut alerted: BTreeSet<String> = BTreeSet::new();
     // Burns and captures (their own thread): what a refused block was told, once per minute at most.
     let mut refusals: BTreeMap<u64, u64> = BTreeMap::new();
     let mut failed_ticks = 0u64;
@@ -842,81 +1201,162 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         let (mut signed, mut released) = (0usize, 0usize);
         // `--no-fast`: no game is signed (the cursor stays where it is).
         let to_sign = if secret.is_some() { next..count } else { next..next };
-        for index in to_sign {
-            let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
-            let mut views = Vec::new();
-            for b in &bases {
-                match crate::fast::read_base(b, game.l2_block) {
-                    Ok(view) => views.push(view),
-                    Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", b.url)),
-                }
-            }
-            parents.insert(game.game, game.parent);
-            games.insert(index, (game.game, game.l2_block));
-            let ancestors = crate::fast::walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |p| {
-                if let Err(e) = crate::fast::store_parents(&parents_file, p) {
-                    say(&format!("ALERT FAST the parents not kept in {}: {e:#}", parents_file.display()));
-                }
-            })?;
-            let statement = match crate::fast::judge(&game, &params, &views, &ancestors, &domain) {
-                Ok(s) => s,
-                Err(why) => {
-                    say(&format!("game #{index} not signed: {why}"));
+        // FR-3: the slots the slow lane's intents in flight hold (the fast lane's own are in the state)
+        let slow_held = crate::slow_release::held_slots(&slow_journal, u64::MAX);
+        // FR-2 (audit n°2): a failure of this step is said and steps 3 and 4 still run; the game it failed on is tried
+        // again at the next pass, and skipped at its GAME_READ_TRIES-th failure in a row
+        let mut current = None;
+        let step2 = (|| -> anyhow::Result<()> {
+            for index in to_sign {
+                current = Some(index);
+                let game = crate::fast::read_game(&l1, &params, index, l1_block.block_number)?;
+                // FR-2: a game of another type is refused before anything else is read of it
+                if game.game_type != params.game_type {
+                    say(&format!("game #{index} not signed: {}", crate::fast::Refusal::OtherType(game.game_type)));
                     advance(index)?;
                     continue;
                 }
-            };
-            signed += 1;
-            let attestation = crate::fast::sign(&statement, secret.as_ref().expect("a key: nothing to sign without one"));
-            let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
-                say(&format!("ALERT FAST CAPTURE game #{index}: no capture of its Base block {}", game.l2_block));
-                advance(index)?;
-                continue;
-            };
-            let burns = {
-                let s = lock(&state);
-                let skip: BTreeSet<u64> = s.sent.keys().copied().collect();
-                payable_burns(&s.burns, &capture, &bridge, &skip)
-            };
-            if !burns.is_empty() {
-                let node = node.get(|n| &n.client)?;
-                let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
-                for burn in burns {
-                    let advances = node.client.call("getAdvances", json!([burn.n, burn.owner.to_bech32(), burn.amount]))?;
-                    if advances["released"].as_bool() == Some(true) {
-                        let mut s = lock(&state);
-                        s.sent.insert(burn.n, crate::now_unix());
-                        s.store(&state_file)?;
-                        continue;
-                    }
-                    match crate::fast_release::assemble(&finality, &proof, &capture, &burn, &attestation, &rules)
-                        .map_err(|why| anyhow!("{why}"))
-                        .and_then(|objects| crate::fast_release::release_with(&node.client, &rules, &objects, &burn, None))
-                    {
-                        Ok(summary) => {
-                            say(&format!("SENT fast release of burn {} under game #{index}: {summary}", burn.n));
-                            released += 1;
-                            let mut s = lock(&state);
-                            s.sent.insert(burn.n, crate::now_unix());
-                            s.store(&state_file)?;
-                        }
-                        Err(e) => say(&format!("ALERT FAST_RELEASE burn {} game #{index}: {e:#}", burn.n)),
+                let mut views = Vec::new();
+                for b in &bases {
+                    match crate::fast::read_base(b, game.l2_block) {
+                        Ok(view) => views.push(view),
+                        Err(e) => say(&format!("ALERT FAST BASE_RPC {}: {e:#}", b.url)),
                     }
                 }
+                parents.insert(game.game, game.parent);
+                games.insert(index, (game.game, game.l2_block));
+                let ancestors = crate::fast::walk_ancestors_logged(&l1, &params, index, game.parent, &mut parents, &say, &mut |p| {
+                    if let Err(e) = crate::fast::store_parents(&parents_file, p) {
+                        say(&format!("ALERT FAST the parents not kept in {}: {e:#}", parents_file.display()));
+                    }
+                })?;
+                let statement = match crate::fast::judge(&game, &params, &views, &ancestors, &domain) {
+                    Ok(s) => s,
+                    Err(why) => {
+                        say(&format!("game #{index} not signed: {why}"));
+                        advance(index)?;
+                        continue;
+                    }
+                };
+                signed += 1;
+                let attestation = crate::fast::sign(&statement, secret.as_ref().expect("a key: nothing to sign without one"));
+                let Some(capture) = crate::base_capture::load(&captures, game.l2_block)? else {
+                    say(&format!("ALERT FAST CAPTURE game #{index}: no capture of its Base block {}", game.l2_block));
+                    advance(index)?;
+                    continue;
+                };
+                // FR-3: each burn its capture holds whose release is due: never handed in, or handed in and still not
+                // paid FAST_RESEND_SECS later (FAST_MAX_SENDS times at most)
+                let burns: Vec<Burn> = {
+                    let s = lock(&state);
+                    let now = crate::now_unix();
+                    payable_burns(&s.burns, &capture, &bridge, &BTreeSet::new())
+                        .into_iter()
+                        .filter(|b| fast_release_due(&s, b.n, now) != FastDue::Wait)
+                        .collect()
+                };
+                if !burns.is_empty() {
+                    let node = node.get(|n| &n.client)?;
+                    let proof = crate::fast_release::read_game_proof(&l1, &params, &game.game, l1_block.block_number)?;
+                    // FR-3: the slots the groups of this pass took
+                    let mut taken_now: BTreeSet<u32> = BTreeSet::new();
+                    for burn in burns {
+                        let now = crate::now_unix();
+                        let advances = node.client.call("getAdvances", json!([burn.n, burn.owner.to_bech32(), burn.amount]))?;
+                        if advances["released"].as_bool() == Some(true) {
+                            let mut s = lock(&state);
+                            s.sent.entry(burn.n).or_insert(now);
+                            s.paid.insert(burn.n);
+                            s.store(&state_file)?;
+                            continue;
+                        }
+                        let due = fast_release_due(&lock(&state), burn.n, now);
+                        if due == FastDue::GiveUp {
+                            say(&format!(
+                                "ALERT FAST_RELEASE GAVE_UP burn {}: handed in {FAST_MAX_SENDS} times and never paid; the slow lane takes it after its grace",
+                                burn.n
+                            ));
+                            let mut s = lock(&state);
+                            fast_given_up(&mut s, burn.n);
+                            s.store(&state_file)?;
+                            continue;
+                        }
+                        let held: BTreeSet<u32> = fast_held_slots(&lock(&state), burn.n).into_iter().chain(taken_now.iter().copied()).chain(slow_held.iter().copied()).collect();
+                        match crate::fast_release::assemble(&finality, &proof, &capture, &burn, &attestation, &rules)
+                            .map_err(|why| anyhow!("{why}"))
+                            .and_then(|objects| crate::fast_release::release_with_free(&node.client, &rules, &objects, &burn, None, &held))
+                        {
+                            Ok(summary) => {
+                                let slots: Vec<u32> = summary["slots"].as_array().map(|a| a.iter().filter_map(|x| u32::try_from(x.as_u64()?).ok()).collect()).unwrap_or_default();
+                                taken_now.extend(slots.iter().copied());
+                                let mut s = lock(&state);
+                                fast_handed_in(&mut s, burn.n, now, slots);
+                                let times = s.fast_tries.get(&burn.n).map_or(1, |t| t.count);
+                                s.store(&state_file)?;
+                                drop(s);
+                                say(&format!("SENT fast release of burn {} under game #{index} (time {times}): {summary}", burn.n));
+                                released += 1;
+                            }
+                            Err(e) => say(&format!("ALERT FAST_RELEASE burn {} game #{index}: {e:#}", burn.n)),
+                        }
+                    }
+                }
+                advance(index)?;
             }
-            advance(index)?;
+            Ok(())
+        })();
+        match (step2, current) {
+            (Ok(()), _) => lock(&state).game_failures = None,
+            (Err(e), Some(index)) => {
+                let mut s = lock(&state);
+                if game_read_failed(&mut s, index) {
+                    say(&format!(
+                        "ALERT FAST GAME_SKIPPED game #{index}: failed {GAME_READ_TRIES} passes in a row ({e:#}): skipped, its burns wait for the next game"
+                    ));
+                    s.next_game = Some(index + 1);
+                } else {
+                    say(&format!(
+                        "ALERT FAST game #{index}: {e:#} (try {} of {GAME_READ_TRIES}; tried again at the next pass; contradictions and the slow lane go on)",
+                        s.game_failures.map_or(0, |(_, c)| c)
+                    ));
+                }
+                s.store(&state_file)?;
+            }
+            (Err(e), None) => say(&format!("ALERT FAST step 2: {e:#} (contradictions and the slow lane go on)")),
         }
         // 3. Contradictions: each fast release kept; 4. slow releases: each burn the fast lane did not pay. Both under
         //    the newest game Base holds valid (searched once, only when one of them needs it).
         use crate::light_feed::FeedNode;
         let node = node.get(|n| &n.client)?;
         let lane = node.client.call("getFastLane", json!([]))?;
+        let records = fast_paid_of(&lane)?;
+        // FR-1 (audit n°2): every fast record this run cannot vouch for, said at once (no proof needed); the `n` never
+        // seen burnt are captured from the next tick; FR-4: a hole in the burn indices is said
+        let unsettled: Vec<FastPaid> = {
+            let mut s = lock(&state);
+            let mut lines = record_alerts(&records, &s.burns);
+            lines.extend(burn_gaps(&s.burns).into_iter().map(|n| format!("ALERT FAST BURN_GAP n {n}: never seen burnt while a later burn was (a log endpoint behind its head?)")));
+            for line in lines {
+                if alerted.insert(line.clone()) {
+                    say(&line);
+                }
+            }
+            watch_records(&mut s, &records);
+            s.store(&state_file)?;
+            records.iter().filter(|p| !p.contradicted && !s.settled.contains(&p.n)).copied().collect()
+        };
+        // FR-1: each record not settled yet, its word as each Base RPC serves it now
+        let named: Vec<(&str, &dyn BaseRpc)> = bases.iter().map(|b| (b.url.as_str(), b as &dyn BaseRpc)).collect();
+        for line in base_word_alerts(&named, &bridge, &unsettled) {
+            if alerted.insert(line.clone()) {
+                say(&line);
+            }
+        }
+        // FR-1: a contradiction is handed in until the branch shows it (CONTRADICTION_RESEND_SECS apart)
         let open: Vec<FastPaid> = {
             let s = lock(&state);
-            fast_paid_of(&lane)?
-                .into_iter()
-                .filter(|p| !p.contradicted && !s.contradicted.contains(&p.n))
-                .collect()
+            let now = crate::now_unix();
+            unsettled.into_iter().filter(|p| contradiction_due(&s, p.n, now)).collect()
         };
         let open_count = open.len();
         // The slow lane's burns: an error of its own is an alert, never the end of the pass (nor of its contradictions).
@@ -985,6 +1425,12 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             let (game, proof, capture) = (&found.game, &found.proof, &found.capture);
             for paid in open {
                 match contradiction_under(game, capture, &paid, &bridge) {
+                    // FR-5: Base's final state holds the burn paid, at or after its block: settled for good
+                    Ok(None) if game.l2_block_number >= paid.l2_block => {
+                        let mut s = lock(&state);
+                        s.settled.insert(paid.n);
+                        s.store(&state_file)?;
+                    }
                     Ok(None) => {}
                     Ok(Some((preimage, account, contradiction))) => {
                         say(&format!(
@@ -998,10 +1444,12 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                         }).and_then(|intent| node.submit(&intent));
                         match sent {
                             Ok(admitted) => {
-                                say(&format!("SENT the contradiction of n {}: {admitted}", paid.n));
                                 let mut s = lock(&state);
-                                s.contradicted.insert(paid.n);
+                                contradiction_handed_in(&mut s, paid.n, crate::now_unix());
+                                let times = s.contradiction_tries.get(&paid.n).map_or(1, |t| t.1);
                                 s.store(&state_file)?;
+                                drop(s);
+                                say(&format!("SENT the contradiction of n {} (time {times}): {admitted}", paid.n));
                             }
                             Err(e) => say(&format!("ALERT FAST CONTRADICTION n {} not sent: {e:#}", paid.n)),
                         }
@@ -1011,6 +1459,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             }
         }
         // 4. Slow releases (a dry run writes them under <state-dir>/slow-dry-run/ and sends nothing).
+        let fast_held = fast_held_slots(&lock(&state), u64::MAX);
         if !wanted.is_empty() {
             if let Err(e) = crate::slow_release::slow_release_pass(
                 &node.client,
@@ -1025,6 +1474,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 crate::now_unix(),
                 &crate::fast_release::prove_vault_group,
                 &mut slow_report,
+                &fast_held,
             ) {
                 say(&format!("ALERT SLOW_RELEASE {e:#} (tried again at the next pass)"));
             }

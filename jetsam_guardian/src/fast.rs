@@ -459,6 +459,25 @@ pub fn read_game(
     )?;
     let game_type = u64_of(&word_at(&at, 0)?)? as u32;
     let game = address_of(&word_at(&at, 2)?);
+    // FR-2 (audit n°2): a game of another type is read no further (its views are not type 621's: they may revert);
+    // `judge` refuses it `OtherType` and the cursor moves on
+    if game_type != params.game_type {
+        return Ok(GameView {
+            index,
+            count_at_finalized: count,
+            game_type,
+            game,
+            factory_impl: [0; 20],
+            status: 0,
+            proof_count: 0,
+            countered_by: [0; 32],
+            l2_block: 0,
+            root_claim: [0; 32],
+            parent: [0; 20],
+            proper: false,
+            respected: false,
+        });
+    }
     let factory_impl = address_of(&word_at(
         &call(
             l1,
@@ -789,10 +808,8 @@ pub fn store_games(path: &Path, games: &GameCache) -> anyhow::Result<()> {
             .map(|(i, (g, b))| json!([i, format!("0x{}", hex::encode(g)), b]))
             .collect::<Vec<_>>(),
     });
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // FR-8: written whole and synced, then renamed
+    crate::write_atomic(path, &serde_json::to_vec(&v)?)
 }
 
 /// A walk says how far it is every this many ancestors read.
@@ -879,10 +896,8 @@ pub fn store_parents(path: &Path, parents: &ParentCache) -> anyhow::Result<()> {
             .map(|(g, p)| json!([format!("0x{}", hex::encode(g)), format!("0x{}", hex::encode(p))]))
             .collect::<Vec<_>>(),
     });
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // FR-8: written whole and synced, then renamed
+    crate::write_atomic(path, &serde_json::to_vec(&v)?)
 }
 
 /// What one Base RPC serves for `l2_block`.

@@ -306,6 +306,13 @@ pub fn select_vault_slots(slots: &[VaultSlot], floor: u64, amount: u64) -> Optio
     (total >= amount).then_some(picked)
 }
 
+/// FR-3 (audit n°2): [`select_vault_slots`] among the slots none of `taken` (held by this relay's other intents in
+/// flight, or picked earlier in the same pass): two releases never spend the same slot.
+pub fn select_free_vault_slots(slots: &[VaultSlot], floor: u64, amount: u64, taken: &std::collections::BTreeSet<u32>) -> Option<Vec<VaultSlot>> {
+    let free: Vec<VaultSlot> = slots.iter().copied().filter(|s| !taken.contains(&s.slot_index)).collect();
+    select_vault_slots(&free, floor, amount)
+}
+
 /// The pages of one logical transaction from `input_owner`: `inputs` eight
 /// per page, `outputs` two per page (each on the slot hint of its rank), the
 /// fee on the first page.
@@ -813,9 +820,22 @@ pub fn release_with(
     burn: &Burn,
     dry_out: Option<&std::path::Path>,
 ) -> anyhow::Result<Value> {
+    release_with_free(node, rules, objects, burn, dry_out, &Default::default())
+}
+
+/// FR-3 (audit n°2): [`release_with`] whose group spends none of the vault slots `taken` (held by this relay's other
+/// intents in flight); the summary lists the slots it spends (`slots`).
+pub fn release_with_free(
+    node: &crate::rpc::NodeClient,
+    rules: &DestinationRules,
+    objects: &FastReleaseObjects,
+    burn: &Burn,
+    dry_out: Option<&std::path::Path>,
+    taken: &std::collections::BTreeSet<u32>,
+) -> anyhow::Result<Value> {
     let reads = read_node(node, burn, &rules.vault.vault)?;
     let vault_rules = rules.vault.at(reads.tip.saturating_add(1));
-    let inputs = select_vault_slots(&reads.slots, reads.floor, burn.amount)
+    let inputs = select_free_vault_slots(&reads.slots, reads.floor, burn.amount, taken)
         .ok_or_else(|| anyhow!("the vault's slots do not cover {} µJTM", burn.amount))?;
     let (pages, fee) = fast_release_group(
         &objects.release,
@@ -840,6 +860,7 @@ pub fn release_with(
         "payee": reads.payee.to_bech32(),
         "release_fee": fee,
         "vault_inputs": inputs.len(),
+        "slots": inputs.iter().map(|s| s.slot_index).collect::<Vec<_>>(),
         "txid": txid,
         "intent_bytes": intent.len(),
     });
