@@ -36,20 +36,33 @@
 //!   advance's marker, which name it; `t16`: 16 bytes of the tagged byte-hash
 //!   of `(n, owner, amount, A, new_creditor)`), then at most one change output
 //!   to the creditor; at most one per advance and per block, never in a block
-//!   that releases its `n`.
+//!   that releases its `n`, never once `n` is paid.
 //! * **V2 at the release of `n`** — when the branch holds the advance whose
 //!   key is exactly the burn proven, the release pays its current creditor
 //!   `amount − R`; otherwise the burn's owner (a wrong advance loses the
-//!   advancer's money, never the owner's). Either way **every** advance of
-//!   `n` is consumed: the others are lost by their authors and their
-//!   outstanding no longer counts them. No advance expires (D107: a timer
-//!   would take the advancer's money during a pause of Base).
+//!   advancer's money, never the owner's). A slow release then consumes
+//!   **every** advance of `n`: the others are lost by their authors and their
+//!   outstanding no longer counts them.
+//! * **A fast release of `n`** (D188) consumes the advance of exactly the burn
+//!   it pays, if any (its creditor is repaid, its outstanding freed), and no
+//!   other: Base may still contradict that burn, and the advance of the real
+//!   one must then be repaid. The other advances of `n` stay held (and
+//!   counted) until the slow release of the real burner after a
+//!   contradiction (V2 repays the advance of exactly that burn; every advance
+//!   of `n` is consumed), or until the block where the branch forgets the
+//!   fast release, never contradicted, at its horizon (every advance of `n`
+//!   is consumed there: they were wrong). Apart from that, no advance expires
+//!   (D107: a timer would take the advancer's money during a pause of Base).
 //! * **V5** — both markers carry no value, cannot be spent and never appear
 //!   in a system record.
 //!
 //! The markers commit to everything the branch keeps of an advance, so a
 //! snapshot rebuilds the advances from its live slots and a file it can
-//! check, as it does the releases (T2.3, I12).
+//! check, as it does the releases (T2.3, I12). The markers of an `n` whose
+//! fast release the branch remembers, not reconciled, still stand: the file
+//! lists its held advances and the one its fast release repaid (the book's
+//! memory of it, [`AdvanceBook::repaid`]), so that each such marker is opened
+//! by exactly one of them.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -303,6 +316,11 @@ pub struct AdvanceBook {
     by_marker: BTreeMap<[u8; ADVANCE_COMMITMENT_BYTES], AdvanceKey>,
     /// By the advancer's owner bytes.
     outstanding: BTreeMap<[u8; 32], u64>,
+    /// D188: by `n`, the advance a fast release of `n` repaid (consumed: not
+    /// held, not counted; its creditor read as its origin), remembered while
+    /// the other advances of `n` stand, for a snapshot to tell its marker
+    /// from theirs.
+    repaid: BTreeMap<u64, AdvanceEntry>,
 }
 
 impl AdvanceBook {
@@ -337,12 +355,65 @@ impl AdvanceBook {
         self.entries.get(key).map(|entry| (*key, entry))
     }
 
+    /// Nothing held and nothing remembered.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.repaid.is_empty()
     }
 
+    /// The advances held.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Whether a release of `n` has anything of it to consume: an advance
+    /// held, or the memory of the one its fast release repaid.
+    pub fn has_any_of(&self, n: u64) -> bool {
+        self.holds_n(n) || self.repaid.contains_key(&n)
+    }
+
+    /// D188: the advance the fast release of `n` repaid, as remembered.
+    pub fn repaid(&self, n: u64) -> Option<&AdvanceEntry> {
+        self.repaid.get(&n)
+    }
+
+    /// A fast release pays the burn `key`: its advance, if held, is consumed
+    /// and remembered ([`Self::repaid`]); it is returned as it was.
+    pub fn repay(&mut self, key: &AdvanceKey) -> Option<AdvanceEntry> {
+        let entry = self.remove(key)?;
+        self.repaid.insert(
+            key.n,
+            AdvanceEntry {
+                creditor: entry.origin,
+                ..entry
+            },
+        );
+        Some(entry)
+    }
+
+    /// Remember `entry` as the advance the fast release of `n` repaid.
+    pub fn restore_repaid(&mut self, n: u64, entry: AdvanceEntry) {
+        self.repaid.insert(n, entry);
+    }
+
+    /// Forget the memory of the repaid advance of the burn `key`, if it is
+    /// that one.
+    pub fn forget_repaid(&mut self, key: &AdvanceKey) {
+        if self.repaid.get(&key.n).is_some_and(|entry| entry.key(key.n) == *key) {
+            self.repaid.remove(&key.n);
+        }
+    }
+
+    /// What the state's bytes and a snapshot list: the advances held and the
+    /// repaid ones remembered, by increasing key.
+    pub fn listed(&self) -> Vec<(u64, AdvanceEntry)> {
+        let mut out: Vec<(u64, AdvanceEntry)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.n, *entry))
+            .chain(self.repaid.iter().map(|(n, entry)| (*n, *entry)))
+            .collect();
+        out.sort_by_key(|(n, entry)| entry.key(*n));
+        out
     }
 
     /// The advances, by increasing key.
@@ -384,8 +455,9 @@ impl AdvanceBook {
         Some(entry)
     }
 
-    /// Forget every advance of `n` (its release consumes them); they are
-    /// returned by key.
+    /// Forget every advance of `n` (its release consumes them), and the
+    /// memory of the one its fast release repaid; they are returned by key,
+    /// the memory last.
     pub fn remove_n(&mut self, n: u64) -> Vec<AdvanceEntry> {
         let keys: Vec<AdvanceKey> = self
             .entries
@@ -393,7 +465,9 @@ impl AdvanceBook {
             .take_while(|(key, _)| key.n == n)
             .map(|(key, _)| *key)
             .collect();
-        keys.iter().filter_map(|key| self.remove(key)).collect()
+        let mut out: Vec<AdvanceEntry> = keys.iter().filter_map(|key| self.remove(key)).collect();
+        out.extend(self.repaid.remove(&n));
+        out
     }
 
     /// Name `creditor` the creditor of the advance `key`; the previous one.
@@ -404,20 +478,28 @@ impl AdvanceBook {
 }
 
 /// What a block's advance groups do (the releases' consumption is the
-/// block's too, [`AdvanceEffect::consumed`]).
+/// block's too, [`AdvanceEffect::consumed`], [`AdvanceEffect::repaid`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdvanceEffect {
     /// The advances it makes, in group order.
     pub created: Vec<(u64, AdvanceEntry)>,
     /// The claims it transfers: `(advance, new creditor)`, in group order.
     pub transfers: Vec<(AdvanceKey, Address)>,
-    /// The withdrawal indices whose advances its releases consume.
+    /// The withdrawal indices whose every advance it consumes: those of its
+    /// slow releases, and those of the fast releases the branch forgets in it
+    /// (D188).
     pub consumed: Vec<u64>,
+    /// D188: the advances its fast releases repay, each of exactly the burn
+    /// paid (the only advance of its `n` they consume).
+    pub repaid: Vec<AdvanceKey>,
 }
 
 impl AdvanceEffect {
     pub fn is_empty(&self) -> bool {
-        self.created.is_empty() && self.transfers.is_empty() && self.consumed.is_empty()
+        self.created.is_empty()
+            && self.transfers.is_empty()
+            && self.consumed.is_empty()
+            && self.repaid.is_empty()
     }
 }
 
@@ -678,6 +760,11 @@ impl<'a> AdvanceCheck<'a> {
             .book
             .by_marker(&named)
             .ok_or(AdvanceError::NoAdvanceToTransfer { group: index })?;
+        // D188: an advance of a paid `n` the branch still holds (its fast
+        // release not reconciled) has no claim to transfer, as before.
+        if self.released.contains(key.n) {
+            return Err(AdvanceError::NoAdvanceToTransfer { group: index });
+        }
         if entry.transfer_marker(key.n, &payee) != marker {
             return Err(AdvanceError::TransferMarkerMismatch { group: index });
         }

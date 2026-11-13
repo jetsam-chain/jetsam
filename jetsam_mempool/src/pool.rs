@@ -4891,6 +4891,66 @@ mod tests {
         );
     }
 
+    /// D188: the fast release of 3 paid BOB's burn by mistake; a reserve had
+    /// advanced Base's real burn of 3 (ALICE's), and the fast block left that
+    /// advance held. After the contradiction, the pool admits the real
+    /// burner's release only when it repays the reserve (V2), keeps it while
+    /// the view moves, and forgets it once the branch paid it; a release
+    /// paying ALICE (twice paid) is refused, as the block refuses it.
+    #[tokio::test]
+    async fn over_base_the_real_burners_release_repays_the_reserve_that_advanced_it() {
+        use jetsam_chain::consensus::destination::advance::AdvanceEntry;
+        use jetsam_chain::consensus::destination::fast::FastRecord;
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        use jetsam_chain::consensus::vault::VaultError;
+        let tip = BASE_HEIGHT + 5;
+        let burn = crate::destination::tests::SyntheticBase::load().release;
+        let advance = AdvanceEntry {
+            origin: STRANGER,
+            creditor: STRANGER,
+            owner: burn.owner,
+            amount: burn.amount,
+        };
+        let contradicted = FastRecord {
+            contradicted: true,
+            ..fast_paid_to_bob(tip)
+        };
+        let view = |case: &ReleaseCase, record: FastRecord, advances: &[(u64, AdvanceEntry)]| {
+            let mut view = reopened_view(case, tip, &[3], &[(3, record)]);
+            for (n, entry) in advances {
+                view.vault.as_mut().unwrap().advances.insert(*n, *entry);
+            }
+            view
+        };
+        let to_owner = ReleaseCase::over_base(tip, ALICE);
+        let to_reserve = ReleaseCase::over_base(tip, STRANGER);
+        // (The pool's refusal of a group paying another than V2's payee, as
+        // for any advance: `ReleaseShape`.)
+        let pool = pool_over(view(&to_owner, contradicted, &[(3, advance)]));
+        assert_eq!(
+            destination_refusal(to_owner.submit(&pool).await),
+            Some(E::Vault(VaultError::ReleaseShape { group: 0 }))
+        );
+        assert!(pool.destination_candidates().await.1.is_empty());
+        let pool = pool_over(view(&to_reserve, contradicted, &[(3, advance)]));
+        assert_eq!(
+            to_reserve.submit(&pool).await.expect("the reserve repaid"),
+            crate::destination::DestinationAdmitted::ReleaseOverBase { n: 3 }
+        );
+        pool.update_chain_view(view(&to_reserve, contradicted, &[(3, advance)]))
+            .await;
+        pool.on_new_block(&[], tip, view(&to_reserve, contradicted, &[(3, advance)]))
+            .await;
+        assert_eq!(pool.destination_candidates().await.1.len(), 1);
+        // The branch paid it: the record consumed, the advance with it.
+        let consumed = FastRecord {
+            consumed: true,
+            ..contradicted
+        };
+        pool.update_chain_view(view(&to_reserve, consumed, &[])).await;
+        assert!(pool.destination_candidates().await.1.is_empty());
+    }
+
     /// D52, D130, every branch of a small world: the pool refuses a release
     /// for the paid set exactly when the block does — for an `n` no
     /// contradiction reopens, exactly when the branch paid it, as before; for

@@ -436,6 +436,15 @@ impl AdvanceUndo {
     }
 }
 
+/// D188: whether `entry`, an advance of `n`, is the one the fast release of
+/// `n` the lane remembers, not reconciled, repaid: of exactly its burn. Every
+/// other advance of `n` is of another burn.
+fn is_repaid_by(lane: &FastLaneState, n: u64, entry: &AdvanceEntry) -> bool {
+    lane.records.get(&n).is_some_and(|record| {
+        !record.consumed && record.owner == entry.owner && record.amount == entry.amount
+    })
+}
+
 /// What one block did to the state, kept to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestinationUndo {
@@ -611,11 +620,17 @@ impl DestinationState {
     }
 
     /// A block's effect on the advances, and its undo: the releases consume
-    /// first — every advance of each `n` released (D114) — then the block's
-    /// advances are made and its claims transferred (a block never does two
-    /// of these to one `n`).
+    /// first — a fast release the advance of exactly its burn (D188), any
+    /// other every advance of its `n` (D114), as does the block forgetting a
+    /// fast release — then the block's advances are made and its claims
+    /// transferred (a block never does two of these to one `n`).
     fn apply_advances(&mut self, effect: &AdvanceEffect) -> AdvanceUndo {
         let mut undo = AdvanceUndo::default();
+        for key in &effect.repaid {
+            if let Some(entry) = self.advances.repay(key) {
+                undo.consumed.push((key.n, entry));
+            }
+        }
         for n in &effect.consumed {
             for entry in self.advances.remove_n(*n) {
                 undo.consumed.push((*n, entry));
@@ -633,7 +648,12 @@ impl DestinationState {
         undo
     }
 
-    /// Undo [`Self::apply_advances`].
+    /// Undo [`Self::apply_advances`], the fast lane of before already back:
+    /// an advance consumed goes back to the memory of the repaid ones when it
+    /// is that of the burn a fast release still remembered (and not
+    /// reconciled) paid — the block forgot it with the other advances of its
+    /// `n` — and is held again otherwise (the memory of it, made by the block
+    /// that repaid it, forgotten).
     fn undo_advances(&mut self, undo: &AdvanceUndo) {
         for (key, before) in undo.transfers.iter().rev() {
             self.advances.set_creditor(key, *before);
@@ -642,7 +662,12 @@ impl DestinationState {
             self.advances.remove(key);
         }
         for (n, entry) in undo.consumed.iter().rev() {
-            self.advances.insert(*n, *entry);
+            if is_repaid_by(&self.fast, *n, entry) {
+                self.advances.restore_repaid(*n, *entry);
+            } else {
+                self.advances.forget_repaid(&entry.key(*n));
+                self.advances.insert(*n, *entry);
+            }
         }
     }
 
@@ -669,8 +694,9 @@ impl DestinationState {
             if let Some(committees) = undo.committees_before {
                 self.committees = committees;
             }
-            self.undo_advances(&undo.advances);
+            // The fast lane first: the undo of the advances reads it.
             self.fast.undo(&undo.fast);
+            self.undo_advances(&undo.advances);
             self.window.retain(|r| r.height < undo.height);
             self.tip -= 1;
         }
@@ -703,7 +729,7 @@ impl DestinationState {
                 .filter(|r| r.height >= first)
                 .map(|r| (r.n, r.owner, r.amount))
                 .collect(),
-            advances: self.advances.iter().map(|(n, entry)| (n, *entry)).collect(),
+            advances: self.advances.listed(),
             fast: None,
         })
     }
@@ -849,13 +875,16 @@ impl DestinationState {
         }
     }
 
-    /// Version 2's tail: the advances by increasing key `(n, owner, amount)`,
-    /// then each undo's: the keys it made, the advances it consumed, the
-    /// claims it transferred with their creditor before.
+    /// Version 2's tail: the advances by increasing key `(n, owner, amount)`
+    /// — those held and the repaid ones remembered (D188, told apart by the
+    /// fast lane on decoding) — then each undo's: the keys it made, the
+    /// advances it consumed, the claims it transferred with their creditor
+    /// before.
     fn encode_advances(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.advances.len() as u32).to_le_bytes());
-        for (n, entry) in self.advances.iter() {
-            put_advance(n, entry, out);
+        let listed = self.advances.listed();
+        out.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+        for (n, entry) in &listed {
+            put_advance(*n, entry, out);
         }
         for undo in &self.undo {
             out.extend_from_slice(&(undo.advances.created.len() as u32).to_le_bytes());
@@ -937,12 +966,12 @@ impl DestinationState {
                 fast: FastUndo::default(),
             });
         }
-        let mut advances = AdvanceBook::new();
+        let mut listed: Vec<(u64, AdvanceEntry)> = Vec::new();
         if version == DESTINATION_STATE_VERSION_ADVANCES || version == DESTINATION_STATE_VERSION_FAST {
-            r.advances(&mut advances, &mut undo)?;
+            r.advances(&mut listed, &mut undo)?;
             // Canonical: version 2 only for a state holding advances.
             if version == DESTINATION_STATE_VERSION_ADVANCES
-                && advances.is_empty()
+                && listed.is_empty()
                 && undo.iter().all(|u| u.advances.is_empty())
             {
                 return Err(DestinationStateError::Malformed);
@@ -954,6 +983,20 @@ impl DestinationState {
             // Canonical: version 3 only for a state holding the fast lane.
             if fast.is_empty() && undo.iter().all(|u| u.fast.is_empty()) {
                 return Err(DestinationStateError::Malformed);
+            }
+        }
+        // D188: the advance of exactly the burn of a fast release the lane
+        // remembers, not reconciled, is the one it repaid (its creditor is its
+        // origin); every other is held.
+        let mut advances = AdvanceBook::new();
+        for (n, entry) in listed {
+            if is_repaid_by(&fast, n, &entry) {
+                if entry.creditor != entry.origin {
+                    return Err(DestinationStateError::Malformed);
+                }
+                advances.restore_repaid(n, entry);
+            } else {
+                advances.insert(n, entry);
             }
         }
         if !r.0.is_empty()
@@ -1124,8 +1167,11 @@ impl Reader<'_> {
         Ok(key)
     }
 
-    /// Advances by strictly increasing key: into `book`.
-    fn advance_list(&mut self, book: &mut AdvanceBook) -> Result<(), DestinationStateError> {
+    /// Advances by strictly increasing key: into `listed`.
+    fn advance_list(
+        &mut self,
+        listed: &mut Vec<(u64, AdvanceEntry)>,
+    ) -> Result<(), DestinationStateError> {
         let count = self.u32()? as usize;
         if count > self.0.len() / ADVANCE_BYTES {
             return Err(DestinationStateError::Malformed);
@@ -1139,7 +1185,7 @@ impl Reader<'_> {
                 return Err(DestinationStateError::Malformed);
             }
             last = Some(key);
-            book.insert(n, entry);
+            listed.push((n, entry));
         }
         Ok(())
     }
@@ -1249,14 +1295,14 @@ impl Reader<'_> {
         Ok(())
     }
 
-    /// Version 2's tail ([`DestinationState::encode_advances`]) into `book`
+    /// Version 2's tail ([`DestinationState::encode_advances`]) into `listed`
     /// and the undo entries already read.
     fn advances(
         &mut self,
-        book: &mut AdvanceBook,
+        listed: &mut Vec<(u64, AdvanceEntry)>,
         undo: &mut [DestinationUndo],
     ) -> Result<(), DestinationStateError> {
-        self.advance_list(book)?;
+        self.advance_list(listed)?;
         for entry in undo.iter_mut() {
             let created = self.u32()? as usize;
             if created > self.0.len() / ADVANCE_KEY_BYTES {
@@ -1716,12 +1762,28 @@ pub fn validate_block_destination(
             &rules.base_return.advance,
         )
         .map_err(DestinationBlockError::Advance)?;
-        advances.consumed = vault
-            .releases
-            .iter()
-            .map(|(n, _, _)| *n)
-            .filter(|n| parent.advances.holds_n(*n))
-            .collect();
+        if attestation.is_some() {
+            // D188: a fast release consumes the advance of exactly the burn
+            // it pays (V2 repaid its creditor), no other: Base may still
+            // contradict that burn.
+            advances.repaid = vault
+                .releases
+                .iter()
+                .map(|(n, owner, amount)| AdvanceKey {
+                    n: *n,
+                    owner: *owner,
+                    amount: *amount,
+                })
+                .filter(|key| parent.advances.get(key).is_some())
+                .collect();
+        } else {
+            advances.consumed = vault
+                .releases
+                .iter()
+                .map(|(n, _, _)| *n)
+                .filter(|n| parent.advances.has_any_of(*n))
+                .collect();
+        }
     }
 
     // The light client: the committee update, then the finality update.
@@ -1828,6 +1890,13 @@ pub fn validate_block_destination(
             })
             .map(|(n, _)| *n)
             .collect();
+        // D188: the block that forgets a fast release consumes what its `n`
+        // still has of the advances (never contradicted, they were wrong).
+        for n in &fast.expired {
+            if parent.advances.has_any_of(*n) && !advances.consumed.contains(n) {
+                advances.consumed.push(*n);
+            }
+        }
     }
 
     Ok(DestinationEffect {
@@ -2392,7 +2461,9 @@ pub struct DestinationSnapshotFile {
     pub window_releases: Vec<(u64, Address, u64)>,
     /// The advances of the state (the return over Base), by increasing key
     /// `(n, owner, amount)`: each opens its `JTMADV01` marker, its creditor
-    /// the latest `JTMADT01` marker naming it (or is its origin).
+    /// the latest `JTMADT01` marker naming it (or is its origin). With them
+    /// (D188), the advance each fast release the state remembers, not
+    /// reconciled, repaid: its creditor is its origin.
     pub advances: Vec<(u64, AdvanceEntry)>,
     /// From the return-over-Base height on (`JTMDST03`): the fast lane. Its
     /// releases replace `window_releases` (empty then): the window is drawn
@@ -2810,7 +2881,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 committees.push(CommitteeRef { period, root });
             }
         }
-        let advances = self.rebuild_advances(&alloc_counter)?;
+        let advances = self.rebuild_advances(&alloc_counter, &fast)?;
         Ok(DestinationState {
             start,
             floor: self.floor,
@@ -3017,14 +3088,20 @@ impl<'a> SnapshotDestinationCheck<'a> {
     /// The advances of the boundary (the return over Base): the `JTMADV01`
     /// markers created from its height on (above the `alloc_counter` of the
     /// header below it) whose `n` is not paid (the release of `n` consumes
-    /// every advance of it), each opened by exactly one advance of the file;
-    /// its creditor the latest `JTMADT01` marker naming it (by its marker's
-    /// commitment bytes) created after it, or its origin. An advance whose
-    /// marker shares its commitment bytes with a held one is never made, so
-    /// the transfers naming those bytes after it are its own.
+    /// every advance of it), or is paid by a fast release the rebuilt `lane`
+    /// remembers, not reconciled (D188: it consumed one advance at most),
+    /// each opened by exactly one advance of the file. For such an `n`, the
+    /// file's advance of exactly the burn its fast release paid is the one
+    /// that release repaid: it opens its marker exactly, its creditor is its
+    /// origin, and it is remembered, not held. A held one has its creditor
+    /// the latest `JTMADT01` marker naming it (by its marker's commitment
+    /// bytes) created after it, or its origin. An advance whose marker shares
+    /// its commitment bytes with a held one is never made, so the transfers
+    /// naming those bytes after it are its own.
     fn rebuild_advances(
         &self,
         alloc_counter: &impl Fn(u64) -> Option<u64>,
+        lane: &FastLaneState,
     ) -> Result<AdvanceBook, SnapshotDestinationError> {
         let mismatch = |reason| SnapshotDestinationError::Mismatch { reason };
         let Some(height) = self
@@ -3041,26 +3118,20 @@ impl<'a> SnapshotDestinationCheck<'a> {
         let below = height.saturating_sub(1);
         let floor = alloc_counter(below)
             .ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
-        // The live advances' markers, by commitment bytes: `(creation id,
-        // marker)`.
-        let mut live: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], (u64, Address)> =
-            BTreeMap::new();
-        for (id, marker) in self.advance_markers.iter().filter(|(id, _)| *id > floor) {
-            let (n, _) = advance_marker_fields(marker).expect("an advance marker");
-            if self.released.contains(n) {
-                continue;
-            }
-            if live
-                .insert(advance_marker_commitment(marker), (*id, *marker))
-                .is_some()
-            {
-                return Err(mismatch("two live advance markers share their commitment"));
-            }
-        }
-        if live.len() != self.file.advances.len() {
-            return Err(mismatch("advances do not match their markers"));
-        }
+        // The markers whose advances still stand.
+        let stands = |n: u64| {
+            !self.released.contains(n) || lane.records.get(&n).is_some_and(|r| !r.consumed)
+        };
+        let mut standing: Vec<(u64, Address)> = self
+            .advance_markers
+            .iter()
+            .filter(|(id, marker)| {
+                *id > floor && stands(advance_marker_fields(marker).expect("an advance marker").0)
+            })
+            .copied()
+            .collect();
         let mut book = AdvanceBook::new();
+        let mut held: Vec<(u64, AdvanceEntry)> = Vec::with_capacity(self.file.advances.len());
         let mut last: Option<AdvanceKey> = None;
         for (n, entry) in &self.file.advances {
             let key = entry.key(*n);
@@ -3068,6 +3139,37 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 return Err(mismatch("advances out of order"));
             }
             last = Some(key);
+            if !(self.released.contains(*n) && is_repaid_by(lane, *n, entry)) {
+                held.push((*n, *entry));
+                continue;
+            }
+            // D188: the advance the fast release of `n` repaid.
+            let marker = entry.marker(*n);
+            let opened = standing.iter().position(|(_, m)| *m == marker);
+            match opened {
+                Some(at) if entry.creditor == entry.origin => {
+                    standing.swap_remove(at);
+                }
+                _ => return Err(mismatch("a repaid advance does not open its marker")),
+            }
+            book.restore_repaid(*n, *entry);
+        }
+        // The held advances' markers, by commitment bytes: `(creation id,
+        // marker)`.
+        let mut live: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], (u64, Address)> =
+            BTreeMap::new();
+        for (id, marker) in &standing {
+            if live
+                .insert(advance_marker_commitment(marker), (*id, *marker))
+                .is_some()
+            {
+                return Err(mismatch("two live advance markers share their commitment"));
+            }
+        }
+        if live.len() != held.len() {
+            return Err(mismatch("advances do not match their markers"));
+        }
+        for (n, entry) in &held {
             let marker = entry.marker(*n);
             let created = match live.remove(&advance_marker_commitment(&marker)) {
                 Some((id, live_marker)) if live_marker == marker => id,

@@ -498,7 +498,7 @@ fn a_fast_release_counts_in_the_window() {
 }
 
 /// The fast lane repays the reserve as the slow return does: the creditor
-/// of the advance of exactly that burn, and every advance of `n` consumed.
+/// of the advance of exactly that burn, consumed (D188: that one only).
 #[test]
 fn a_fast_release_repays_the_advance_of_the_burn() {
     let l = lane();
@@ -522,7 +522,15 @@ fn a_fast_release_repays_the_advance_of_the_burn() {
     );
     let to_reserve = fast_block(HEIGHT, &r, PAYER, &l.c0, &world, &att);
     let effect = l.check(&to_reserve, &parent).expect("repays the reserve");
-    assert_eq!(effect.advances.consumed, vec![3]);
+    assert!(effect.advances.consumed.is_empty());
+    assert_eq!(
+        effect.advances.repaid,
+        vec![AdvanceKey {
+            n: 3,
+            owner: ALICE,
+            amount: 5 * JTM
+        }]
+    );
     let after = applied(&parent, &effect);
     assert!(!after.advances.holds_n(3));
 }
@@ -1306,4 +1314,466 @@ fn a_snapshot_export_carries_the_releases_of_the_horizon() {
         l.rules.release_retention_at(HB - 1),
         VAULT_RELEASE_WINDOW_BLOCKS
     );
+}
+
+// ---------------------------------------------------------------------------
+// D188: a fast release consumes the advance of exactly its burn, no other
+// ---------------------------------------------------------------------------
+
+/// A reserve that advanced a burn the fast lane did not pay.
+const RESERVE: Address = Address([0x5e; 32]);
+
+/// The lane with a horizon of `blocks`, short enough to reach block by block.
+fn lane_with_horizon(blocks: u64) -> Lane {
+    let mut l = lane();
+    l.rules.base_return.fast.reconcile_blocks = blocks;
+    l
+}
+
+/// The branch after the block `HEIGHT - 1` making the advances `advances`
+/// `(advancer, n, owner, amount)`.
+fn after_advances(l: &Lane, advances: &[(Address, u64, Address, u64)]) -> DestinationState {
+    let parent = state_at(HEIGHT - 2, known(&l.c0));
+    let groups = advances
+        .iter()
+        .enumerate()
+        .map(|(i, (advancer, n, owner, amount))| {
+            advance_group(300 + 20 * i as u32, *advancer, *n, *owner, *amount)
+        })
+        .collect();
+    let b = block_with(HEIGHT - 1, groups, vec![]);
+    applied(&parent, &l.check(&b, &parent).expect("the advances"))
+}
+
+fn key(n: u64, owner: Address, amount: u64) -> AdvanceKey {
+    AdvanceKey { n, owner, amount }
+}
+
+/// The fast block at `HEIGHT` paying `(3, ALICE, 5 JTM)` to `payee`.
+fn fast_alice(l: &Lane, payee: Address) -> Block {
+    let r = release(3, ALICE, 5 * JTM);
+    let world = proposed_world(&r, PROPOSED);
+    fast_block(HEIGHT, &r, payee, &l.c0, &world, &l.attestation(&world))
+}
+
+/// The block `HEIGHT + 1` contradicting the fast release `record` of 3 under
+/// Base's final `withdrawals[3]` = BOB's 7 JTM, and paying that burn to `payee`.
+fn contradiction_paying_bob(l: &Lane, record: &FastRecord, payee: Address) -> Block {
+    let truth = release(3, BOB, 7 * JTM);
+    let world = base_world(&truth, VALID, TIMES);
+    contradiction_block(
+        HEIGHT + 1,
+        l,
+        &world,
+        &[(3, world.storage_proof.clone())],
+        &[entry_for(l, 3, record)],
+        &[(truth.clone(), payee)],
+    )
+}
+
+/// The RET24NODE probe (§6), now a rule: a reserve advanced BOB's real burn;
+/// the fast lane pays ALICE's by mistake. The fast block leaves the reserve's
+/// advance held; after the contradiction the real burner's release repays the
+/// reserve (V2), and a block paying BOB a second time is refused.
+#[test]
+fn d188_a_contradicted_fast_release_leaves_the_real_burns_advance_to_repay_the_reserve() {
+    let l = lane();
+    let parent = after_advances(&l, &[(RESERVE, 3, BOB, 7 * JTM)]);
+    let effect = l.check(&fast_alice(&l, ALICE), &parent).expect("fast");
+    assert!(effect.advances.consumed.is_empty());
+    assert!(effect.advances.repaid.is_empty(), "no advance of ALICE's burn");
+    let after = applied(&parent, &effect);
+    assert_eq!(after.advances.repaid(3), None);
+    assert_eq!(
+        after.advances.get(&key(3, BOB, 7 * JTM)).map(|e| e.creditor),
+        Some(RESERVE)
+    );
+    assert_eq!(after.advances.outstanding_of(&RESERVE), 7 * JTM);
+    let record = effect.fast.created[0].1;
+    assert!(matches!(
+        l.check(&contradiction_paying_bob(&l, &record, BOB), &after),
+        Err(DestinationBlockError::Vault(
+            VaultError::ReleasePaysOtherOwner { .. }
+        ))
+    ));
+    let repaid = l
+        .check(&contradiction_paying_bob(&l, &record, RESERVE), &after)
+        .expect("the reserve repaid");
+    assert_eq!(repaid.vault.releases, vec![(3, BOB, 7 * JTM)]);
+    assert_eq!(repaid.fast.consumed, vec![3]);
+    assert_eq!(repaid.advances.consumed, vec![3]);
+    let end = applied(&after, &repaid);
+    assert!(!end.advances.holds_n(3));
+    assert_eq!(end.advances.outstanding_of(&RESERVE), 0);
+    // Back through both blocks: exactly the states before.
+    let back = end.clone().truncate_above(HEIGHT).unwrap().unwrap();
+    assert_eq!(back, after);
+    assert_eq!(back.truncate_above(HEIGHT - 1).unwrap(), Some(parent));
+}
+
+/// The advance of exactly the burn the fast lane pays is consumed by the fast
+/// block (its creditor repaid, its outstanding freed), as before; another
+/// advance of the same `n` stays held and counted.
+#[test]
+fn d188_a_fast_release_consumes_the_advance_of_exactly_its_burn_and_no_other() {
+    let l = lane();
+    let parent = after_advances(
+        &l,
+        &[(PAYER, 3, ALICE, 5 * JTM), (RESERVE, 3, BOB, 7 * JTM)],
+    );
+    assert!(matches!(
+        l.check(&fast_alice(&l, ALICE), &parent),
+        Err(DestinationBlockError::Vault(
+            VaultError::ReleasePaysOtherOwner { .. }
+        ))
+    ));
+    let effect = l
+        .check(&fast_alice(&l, PAYER), &parent)
+        .expect("repays the advance of exactly the burn");
+    let after = applied(&parent, &effect);
+    assert_eq!(after.advances.get(&key(3, ALICE, 5 * JTM)), None);
+    assert_eq!(after.advances.outstanding_of(&PAYER), 0);
+    assert_eq!(
+        after.advances.get(&key(3, BOB, 7 * JTM)).map(|e| e.origin),
+        Some(RESERVE)
+    );
+    assert_eq!(after.advances.outstanding_of(&RESERVE), 7 * JTM);
+    assert_eq!(after.clone().truncate_above(HEIGHT - 1).unwrap(), Some(parent));
+}
+
+/// Never contradicted, the fast release is forgotten at its horizon, and that
+/// block consumes the other advances of its `n` (they were wrong: their
+/// authors lose them); not one block earlier. The undo, block by block, gives
+/// back exactly each state before.
+#[test]
+fn d188_the_other_advances_of_n_are_consumed_where_its_fast_release_expires() {
+    let l = lane_with_horizon(3);
+    let parent = after_advances(&l, &[(RESERVE, 3, BOB, 7 * JTM)]);
+    let mut states = vec![parent.clone()];
+    let effect = l.check(&fast_alice(&l, ALICE), &parent).expect("fast");
+    states.push(applied(&parent, &effect));
+    for h in HEIGHT + 1..=HEIGHT + 3 {
+        let tip = states.last().unwrap().clone();
+        let effect = l.check(&block_with(h, vec![], vec![]), &tip).expect("empty");
+        if h < HEIGHT + 3 {
+            assert!(effect.fast.expired.is_empty());
+            assert!(effect.advances.consumed.is_empty());
+            assert!(applied(&tip, &effect).advances.holds_n(3));
+        } else {
+            assert_eq!(effect.fast.expired, vec![3]);
+            assert_eq!(effect.advances.consumed, vec![3]);
+        }
+        states.push(applied(&tip, &effect));
+    }
+    let end = states.last().unwrap().clone();
+    assert!(!end.advances.holds_n(3) && end.advances.is_empty());
+    assert_eq!(end.advances.outstanding_of(&RESERVE), 0);
+    assert!(end.fast.records.is_empty());
+    let mut s = end;
+    for before in states.iter().rev().skip(1) {
+        s = s.truncate_above(before.tip).unwrap().unwrap();
+        assert_eq!(&s, before);
+    }
+}
+
+/// What a paid `n` refused before it still refuses with an advance of it
+/// held: a new advance of it, the transfer of a held advance's claim.
+#[test]
+fn d188_a_paid_n_still_refuses_a_new_advance_and_a_transfer_of_a_claim() {
+    let l = lane();
+    let parent = after_advances(&l, &[(RESERVE, 3, BOB, 7 * JTM)]);
+    let effect = l.check(&fast_alice(&l, ALICE), &parent).expect("fast");
+    let after = applied(&parent, &effect);
+    let held = *after.advances.get(&key(3, BOB, 7 * JTM)).expect("held");
+    let transfer = block_with(
+        HEIGHT + 1,
+        vec![logical(
+            400,
+            RESERVE,
+            &[(PAYER, JTM), (held.transfer_marker(3, &PAYER), 0)],
+            FEE,
+        )],
+        vec![],
+    );
+    assert_eq!(
+        l.check(&transfer, &after),
+        Err(DestinationBlockError::Advance(
+            AdvanceError::NoAdvanceToTransfer { group: 0 }
+        ))
+    );
+    let again = block_with(
+        HEIGHT + 1,
+        vec![advance_group(400, PAYER, 3, ALICE, 4 * JTM)],
+        vec![],
+    );
+    assert_eq!(
+        l.check(&again, &after),
+        Err(DestinationBlockError::Advance(
+            AdvanceError::AdvanceOfReleased { n: 3 }
+        ))
+    );
+    // Before the fast release, the same transfer was the reserve's to make.
+    let transfer_before = block_with(
+        HEIGHT,
+        vec![logical(
+            400,
+            RESERVE,
+            &[(PAYER, JTM), (held.transfer_marker(3, &PAYER), 0)],
+            FEE,
+        )],
+        vec![],
+    );
+    assert!(l.check(&transfer_before, &parent).is_ok());
+}
+
+/// One branch of D188, block by block, with every marker it creates
+/// `(owner, creation id)` and its state after each block.
+struct Replay {
+    states: Vec<DestinationState>,
+    slots: Vec<(Address, u64)>,
+}
+
+impl Replay {
+    /// From the advances `advances` (block `HEIGHT - 1`) and the fast release
+    /// of `(3, ALICE, 5 JTM)` paying `payee` (block `HEIGHT`).
+    fn start(l: &Lane, advances: &[(Address, u64, Address, u64)], payee: Address) -> Self {
+        use crate::consensus::destination::advance::advance_marker;
+        let at = |h: u64, i: u64| h * 10 - 9 + i;
+        let parent = after_advances(l, advances);
+        let mut slots: Vec<(Address, u64)> = advances
+            .iter()
+            .enumerate()
+            .map(|(i, (advancer, n, owner, amount))| {
+                (advance_marker(*n, owner, *amount, advancer), at(HEIGHT - 1, i as u64))
+            })
+            .collect();
+        let effect = l.check(&fast_alice(l, payee), &parent).expect("fast");
+        slots.push((effect.fast.created[0].1.marker(3), at(HEIGHT, 0)));
+        let after = applied(&parent, &effect);
+        Self {
+            states: vec![parent, after],
+            slots,
+        }
+    }
+
+    fn tip(&self) -> &DestinationState {
+        self.states.last().unwrap()
+    }
+
+    /// The next block, with the markers it creates.
+    fn push(&mut self, l: &Lane, b: &Block, markers: &[Address]) -> DestinationEffect {
+        let effect = l.check(b, self.tip()).expect("the next block");
+        let h = b.header.height;
+        for (i, marker) in markers.iter().enumerate() {
+            self.slots.push((*marker, h * 10 - 9 + i as u64));
+        }
+        let next = applied(self.tip(), &effect);
+        self.states.push(next);
+        effect
+    }
+
+    fn slots_to(&self, tip: u64) -> Vec<(Address, u64)> {
+        self.slots
+            .iter()
+            .filter(|(_, id)| id.div_ceil(10) <= tip)
+            .copied()
+            .collect()
+    }
+
+    /// Every state from the fast block on: its snapshot export installs, from
+    /// the markers of its branch, to exactly its advances (held and
+    /// remembered), fast records and paid set; its bytes round-trip.
+    fn assert_snapshots_equal_the_replay(&self, l: &Lane) {
+        for state in &self.states[1..] {
+            let file = export(l, state);
+            let bytes = file.encode();
+            assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file.clone()));
+            let rebuilt = install(&l.rules, &file, state.tip, &self.slots_to(state.tip))
+                .unwrap_or_else(|e| panic!("tip {}: {e:?}", state.tip));
+            assert_eq!(rebuilt.advances, state.advances, "tip {}", state.tip);
+            assert_eq!(rebuilt.fast.records, state.fast.records, "tip {}", state.tip);
+            assert_eq!(rebuilt.released, state.released, "tip {}", state.tip);
+            assert_eq!(DestinationState::decode(&state.encode()), Ok(state.clone()));
+        }
+    }
+}
+
+/// D188 through a snapshot and the state's bytes, in the three cases: the
+/// reserve's advance of the real burn held after the fast release, then
+/// repaid after the contradiction; the advance of exactly the burn repaid
+/// (remembered) beside a wrong one held, both gone at the horizon; the
+/// advance of exactly the burn alone (the test chain's case).
+#[test]
+fn d188_a_snapshot_rebuilds_exactly_the_replays_advances() {
+    let l = lane_with_horizon(3);
+    let empty = |h: u64| block_with(h, vec![], vec![]);
+    // The contradiction, and the real burner's release repaying the reserve.
+    let mut a = Replay::start(&l, &[(RESERVE, 3, BOB, 7 * JTM)], ALICE);
+    let record = a.tip().fast.records[&3];
+    let real = contradiction_paying_bob(&l, &record, RESERVE);
+    a.push(
+        &l,
+        &real,
+        &[entry_for(&l, 3, &record).marker(), release(3, BOB, 7 * JTM).marker()],
+    );
+    assert!(a.tip().advances.is_empty());
+    for h in HEIGHT + 2..=HEIGHT + 3 {
+        a.push(&l, &empty(h), &[]);
+    }
+    a.assert_snapshots_equal_the_replay(&l);
+    // The exact advance alone repaid, then Base contradicts: the real
+    // burner (no advance of his) is paid, and the memory goes with it.
+    let mut d = Replay::start(&l, &[(PAYER, 3, ALICE, 5 * JTM)], PAYER);
+    let record = d.tip().fast.records[&3];
+    let effect = d.push(
+        &l,
+        &contradiction_paying_bob(&l, &record, BOB),
+        &[entry_for(&l, 3, &record).marker(), release(3, BOB, 7 * JTM).marker()],
+    );
+    assert_eq!(effect.advances.consumed, vec![3]);
+    assert!(d.tip().advances.is_empty());
+    for h in HEIGHT + 2..=HEIGHT + 3 {
+        d.push(&l, &empty(h), &[]);
+    }
+    d.assert_snapshots_equal_the_replay(&l);
+    let mut s = d.tip().clone();
+    for before in d.states.iter().rev().skip(1) {
+        s = s.truncate_above(before.tip).unwrap().unwrap();
+        assert_eq!(&s, before);
+    }
+    // The exact advance repaid, a wrong one held, to the horizon.
+    for advances in [
+        vec![(PAYER, 3, ALICE, 5 * JTM), (RESERVE, 3, BOB, 7 * JTM)],
+        vec![(PAYER, 3, ALICE, 5 * JTM)],
+    ] {
+        let mut b = Replay::start(&l, &advances, PAYER);
+        assert_eq!(
+            b.tip().advances.repaid(3).map(|e| (e.origin, e.creditor)),
+            Some((PAYER, PAYER))
+        );
+        for h in HEIGHT + 1..=HEIGHT + 3 {
+            b.push(&l, &empty(h), &[]);
+        }
+        assert!(b.tip().advances.is_empty());
+        b.assert_snapshots_equal_the_replay(&l);
+        // The undo, block by block: each state of before, byte for byte.
+        let mut s = b.tip().clone();
+        for before in b.states.iter().rev().skip(1) {
+            s = s.truncate_above(before.tip).unwrap().unwrap();
+            assert_eq!(&s, before);
+            assert_eq!(s.encode(), before.encode());
+        }
+    }
+}
+
+/// A file that hides or invents an advance of a paid `n` whose fast release
+/// is remembered, or passes a held one off as the repaid one, is refused.
+#[test]
+fn d188_a_lying_snapshot_of_a_fast_released_n_is_refused() {
+    let l = lane();
+    let b = Replay::start(
+        &l,
+        &[(PAYER, 3, ALICE, 5 * JTM), (RESERVE, 3, BOB, 7 * JTM)],
+        PAYER,
+    );
+    let state = b.tip();
+    let slots = b.slots_to(state.tip);
+    let file = export(&l, state);
+    let repaid = (3, entry_of_test(PAYER, ALICE, 5 * JTM));
+    let held = (3, entry_of_test(RESERVE, BOB, 7 * JTM));
+    assert_eq!(file.advances, vec![repaid, held]);
+    assert!(install(&l.rules, &file, state.tip, &slots).is_ok());
+    for advances in [
+        // The repaid one forgotten, the held one forgotten.
+        vec![held],
+        vec![repaid],
+        // The repaid one from another advancer, or naming a creditor.
+        vec![(3, entry_of_test(RESERVE, ALICE, 5 * JTM)), held],
+        vec![(3, AdvanceEntry { creditor: BOB, ..repaid.1 }), held],
+        // One more of 3 that no marker opens.
+        vec![repaid, (3, entry_of_test(BOB, ALICE, 6 * JTM)), held],
+    ] {
+        let lying = DestinationSnapshotFile {
+            advances,
+            ..file.clone()
+        };
+        assert!(
+            matches!(
+                install(&l.rules, &lying, state.tip, &slots),
+                Err(SnapshotDestinationError::Mismatch { .. })
+            ),
+            "{:?}",
+            lying.advances
+        );
+    }
+    // Without its exact advance (the fast release paid ALICE herself), a
+    // file claiming one is refused: no such marker.
+    let c = Replay::start(&l, &[(RESERVE, 3, BOB, 7 * JTM)], ALICE);
+    let file = export(&l, c.tip());
+    assert_eq!(file.advances, vec![held]);
+    let claimed = DestinationSnapshotFile {
+        advances: vec![repaid, held],
+        ..file.clone()
+    };
+    assert!(install(&l.rules, &claimed, c.tip().tip, &c.slots_to(c.tip().tip)).is_err());
+    // The state's bytes: the repaid one's creditor is its origin, or the
+    // bytes are refused.
+    let mut odd = state.clone();
+    odd.advances
+        .restore_repaid(3, AdvanceEntry { creditor: BOB, ..repaid.1 });
+    assert_eq!(
+        DestinationState::decode(&odd.encode()),
+        Err(DestinationStateError::Malformed)
+    );
+}
+
+/// The snapshot export of `state` (its committees' updates left out: these
+/// branches create no committee marker).
+fn export(l: &Lane, state: &DestinationState) -> DestinationSnapshotFile {
+    DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        ..state.snapshot_file_at(&l.keys, &l.rules).expect("a file")
+    }
+}
+
+fn entry_of_test(origin: Address, owner: Address, amount: u64) -> AdvanceEntry {
+    AdvanceEntry {
+        origin,
+        creditor: origin,
+        owner,
+        amount,
+    }
+}
+
+/// The advance a fast release repays is remembered with its origin as its
+/// creditor (what a snapshot can check), even after a transfer of its claim;
+/// the state's bytes keep it.
+#[test]
+fn d188_the_repaid_advance_is_remembered_by_its_origin() {
+    let l = lane();
+    let mut parent = state_at(HEIGHT - 1, known(&l.c0));
+    let transferred = AdvanceEntry {
+        origin: PAYER,
+        creditor: BOB,
+        owner: ALICE,
+        amount: 5 * JTM,
+    };
+    parent.advances.insert(3, transferred);
+    let effect = l
+        .check(&fast_alice(&l, BOB), &parent)
+        .expect("repays the creditor");
+    assert_eq!(effect.advances.repaid, vec![key(3, ALICE, 5 * JTM)]);
+    let after = applied(&parent, &effect);
+    assert_eq!(after.advances.get(&key(3, ALICE, 5 * JTM)), None);
+    assert_eq!(after.advances.outstanding_of(&PAYER), 0);
+    assert_eq!(
+        after.advances.repaid(3),
+        Some(&AdvanceEntry {
+            creditor: PAYER,
+            ..transferred
+        })
+    );
+    assert_eq!(DestinationState::decode(&after.encode()), Ok(after.clone()));
+    let back = after.truncate_above(HEIGHT - 1).unwrap().unwrap();
+    assert_eq!(back, parent);
 }
