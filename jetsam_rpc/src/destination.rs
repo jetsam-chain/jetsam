@@ -602,9 +602,11 @@ pub fn destination_payment_marker(marker: &str) -> Result<Address, String> {
 
 /// What `walletBuildAdvance` builds: the advance of the burn `(n, owner,
 /// amount)` by `advancer` paying `paid` (the least the rule allows when
-/// none is given): its outputs before the change — the owner paid, then the
-/// `JTMADV02` marker — and the marker. Refused outside the rule's bounds
-/// (`RELEASE_FEE ≤ amount ≤` the bond, `min_paid ≤ paid ≤ amount`).
+/// none is given), for the block at `height`: its outputs before the change
+/// — the owner paid, then the marker (`JTMADV02`, or `JTMADV03` from the fix
+/// height on, FIXRC ET-1) — and the marker. Refused outside the rule's
+/// bounds (`RELEASE_FEE ≤ amount ≤` the bond, `min_paid ≤ paid ≤ amount`;
+/// under the fix, `n < 2²⁸`).
 pub fn advance_plan(
     n: u64,
     owner: Address,
@@ -612,6 +614,7 @@ pub fn advance_plan(
     paid: Option<u64>,
     advancer: Address,
     rules: &DestinationRules,
+    height: u64,
 ) -> Result<(Vec<([u8; 32], u64)>, Address), String> {
     let fee = rules.vault.release_fee;
     let advance = &rules.base_return.advance;
@@ -626,8 +629,14 @@ pub fn advance_plan(
     if paid < min || paid > amount {
         return Err(format!("an advance of this burn pays {min} to {amount} µJTM, not {paid}"));
     }
-    let marker =
-        jetsam_chain::consensus::destination::advance::advance_marker(n, &owner, amount, &advancer);
+    let marker = jetsam_chain::consensus::destination::advance::advance_marker_of(
+        advance.fixed_at(height),
+        n,
+        &owner,
+        amount,
+        &advancer,
+    )
+    .ok_or_else(|| format!("an advance of this format covers an index below 2^28, not {n}"))?;
     Ok((vec![(owner.0, paid)], marker))
 }
 
@@ -677,19 +686,19 @@ mod fast_lane_tests {
         let min = rules.base_return.advance.min_paid(amount, fee);
         let marker = advance_marker(3, &owner, amount, &advancer);
         assert_eq!(
-            advance_plan(3, owner, amount, None, advancer, &rules),
+            advance_plan(3, owner, amount, None, advancer, &rules, 0),
             Ok((vec![(owner.0, min)], marker))
         );
         assert_eq!(
-            advance_plan(3, owner, amount, Some(amount - fee), advancer, &rules),
+            advance_plan(3, owner, amount, Some(amount - fee), advancer, &rules, 0),
             Ok((vec![(owner.0, amount - fee)], marker))
         );
         // Below the least, above the burn, a burn out of bounds: refused.
-        assert!(advance_plan(3, owner, amount, Some(min - 1), advancer, &rules).is_err());
-        assert!(advance_plan(3, owner, amount, Some(amount + 1), advancer, &rules).is_err());
-        assert!(advance_plan(3, owner, fee - 1, None, advancer, &rules).is_err());
+        assert!(advance_plan(3, owner, amount, Some(min - 1), advancer, &rules, 0).is_err());
+        assert!(advance_plan(3, owner, amount, Some(amount + 1), advancer, &rules, 0).is_err());
+        assert!(advance_plan(3, owner, fee - 1, None, advancer, &rules, 0).is_err());
         let over = rules.base_return.advance.max_amount + 1;
-        assert!(advance_plan(3, owner, over, None, advancer, &rules).is_err());
+        assert!(advance_plan(3, owner, over, None, advancer, &rules, 0).is_err());
     }
 
     #[test]

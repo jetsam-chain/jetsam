@@ -922,6 +922,28 @@ fn released_set_holds_each_paid_index_once() {
     assert!(!set.contains(1 << 60));
 }
 
+/// FIXRC RC-1 (AUDIT-FINAL2): the fast lane's `n` is the relay's word, not a
+/// contract counter; a valid fast release of a far `n` must cost a node no
+/// memory (a bitmap grown to word `n / 64` is 128 GiB for `2⁴⁰`). Same
+/// answers, same order, as for near indices.
+#[test]
+fn a_far_index_costs_no_memory() {
+    let mut set = ReleasedSet::new();
+    assert!(set.insert(1 << 40));
+    assert!(set.insert(u64::MAX));
+    assert!(set.insert(3));
+    assert!(!set.insert(1 << 40), "already paid");
+    assert_eq!(set.len(), 3);
+    assert!(set.contains(1 << 40) && set.contains(u64::MAX) && set.contains(3));
+    assert!(!set.contains((1 << 40) + 1) && !set.contains(4));
+    assert_eq!(set.iter().collect::<Vec<_>>(), vec![3, 1 << 40, u64::MAX]);
+    assert!(set.remove(u64::MAX) && !set.remove(u64::MAX));
+    assert_eq!(set.iter().collect::<Vec<_>>(), vec![3, 1 << 40]);
+    let marker = release(1 << 40, ALICE, MICRO_PER_JTM).marker();
+    let far = ReleasedSet::from_marker_slots([(&marker, 2_000u64)], 1_000);
+    assert_eq!(far.iter().collect::<Vec<_>>(), vec![1 << 40]);
+}
+
 /// The set a node keeps by applying blocks equals the one read back from
 /// the release markers its blocks created (what a snapshot node rebuilds).
 #[test]

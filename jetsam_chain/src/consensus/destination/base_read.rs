@@ -123,6 +123,33 @@ pub struct BaseParams {
     pub finality_delay_seconds: u64,
     /// `PAUSE_EXPIRY` of the `SuperchainConfig` implementation.
     pub pause_expiry_seconds: u64,
+    /// FIXRC RC-3 (AUDIT-FINAL2): later pins, each in force from its height
+    /// on (an update of Base's contracts re-pinned by a release of the nodes
+    /// at a height): the blocks below keep the pins of their time, so the
+    /// history still replays. Empty: these pins for ever. An entry's own
+    /// table is not read (the pins in force keep this one: [`Self::at`] of the
+    /// same height gives them again).
+    pub rotations: &'static [(u64, BaseParams)],
+}
+
+impl BaseParams {
+    /// The pins in force at `height`: the last rotation at or below it, else
+    /// these. Only rotations above the return-over-Base height are meant;
+    /// the first pins must be the base ones.
+    pub const fn at(&self, height: u64) -> Self {
+        let mut found = *self;
+        let mut i = 0;
+        while i < self.rotations.len() {
+            if self.rotations[i].0 <= height {
+                found = BaseParams {
+                    rotations: self.rotations,
+                    ..self.rotations[i].1
+                };
+            }
+            i += 1;
+        }
+        found
+    }
 }
 
 /// Base's main network, read on the L1 on 2026-11-09 (block 26 379 491):
@@ -142,6 +169,7 @@ pub const BASE_MAINNET: BaseParams = BaseParams {
     intermediate_roots: 20,
     finality_delay_seconds: 0,
     pause_expiry_seconds: 7_884_000,
+    rotations: &[],
 };
 
 /// Base Sepolia, read on Sepolia on 2026-11-09 (block 12 099 618): the same
@@ -160,6 +188,7 @@ pub const BASE_SEPOLIA: BaseParams = BaseParams {
     intermediate_roots: 20,
     finality_delay_seconds: 0,
     pause_expiry_seconds: 7_884_000,
+    rotations: &[],
 };
 
 /// One contract read under a state root: its account proof, then the proofs

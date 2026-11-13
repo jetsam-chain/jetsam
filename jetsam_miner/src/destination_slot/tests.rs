@@ -791,6 +791,9 @@ fn object_payment_paying_the_vault_is_refused_at_admission_and_blamed_at_the_tem
 fn base_rules() -> DestinationRules {
     let mut rules = rules();
     rules.base_return.activation_height = Some(J + 1);
+    // FIXRC: the fix not armed (the test clock is above the test chain's fix
+    // height); its own tests arm it.
+    rules.base_return.advance.fix_height = None;
     rules
 }
 
@@ -957,6 +960,53 @@ fn over_base_no_release_shares_a_block_with_a_committee_update() {
 }
 
 /// An advance group: `advancer` advances the burn `(n, owner, amount)`.
+/// FIXRC ET-1, ET-2: from the fix height on the template keeps at most four
+/// advances a block (the highest fees; the others stay for later blocks),
+/// all `JTMADV03`; a `JTMADV02` one is left out (the format of before).
+#[test]
+fn under_the_fix_the_template_keeps_four_advances_of_the_second_format() {
+    use jetsam_chain::consensus::destination::advance::{advance_marker_v3, AdvanceRules};
+    let jtm = MICRO_PER_JTM;
+    let state = state_at(J + 20);
+    let fee = 50_000;
+    let paid = AdvanceRules::CONSENSUS.min_paid(jtm, RELEASE_FEE_MICRO);
+    let mut entries: Vec<PagedSpendIntent> = (0..6u32)
+        .map(|i| {
+            let marker = advance_marker_v3(20 + u64::from(i), &OWNER, jtm, &PAYER).unwrap();
+            page(PAYER, 3_000 + 10 * i, &[(OWNER, paid), (marker, 0)], fee + u64::from(i))
+        })
+        .collect();
+    entries.push(advance_entry(3_100, PAYER, 40, OWNER, jtm, fee + 10));
+    let mut rules = base_rules();
+    rules.base_return.advance.fix_height = Some(J + 21);
+    let kept: Vec<usize> = advances_within_rules(
+        entries.iter().cloned().enumerate().collect::<Vec<_>>(),
+        |(_, e)| e.pages.as_slice(),
+        &DestinationOffer::default(),
+        &state,
+        &rules,
+        J + 21,
+    )
+    .into_iter()
+    .map(|(i, _)| i)
+    .collect();
+    assert_eq!(kept, vec![2, 3, 4, 5]);
+    // A block below the fix: no cap, the format of before.
+    rules.base_return.advance.fix_height = Some(J + 22);
+    let kept: Vec<usize> = advances_within_rules(
+        entries.iter().cloned().enumerate().collect::<Vec<_>>(),
+        |(_, e)| e.pages.as_slice(),
+        &DestinationOffer::default(),
+        &state,
+        &rules,
+        J + 21,
+    )
+    .into_iter()
+    .map(|(i, _)| i)
+    .collect();
+    assert_eq!(kept, vec![0, 1, 2, 3, 4, 5, 6], "below the fix: ordinary spends and a JTMADV02 advance");
+}
+
 fn advance_entry(
     slot: u32,
     advancer: Address,
@@ -1072,6 +1122,7 @@ fn the_template_keeps_only_the_advances_the_block_rule_accepts_together() {
             vec![5],
             &armed.vault,
             &armed.base_return.advance,
+            J + 21,
         );
         for (index, i) in order.iter().enumerate() {
             let pages = &entries[*i].pages;

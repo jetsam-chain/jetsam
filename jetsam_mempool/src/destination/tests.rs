@@ -233,7 +233,12 @@ impl SyntheticBase {
             activation_height: Some(height),
             network: jetsam_chain::consensus::destination::forks::L1_MAINNET,
             base: jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA,
-            advance: jetsam_chain::consensus::destination::advance::AdvanceRules::CONSENSUS,
+            // FIXRC: the fix not armed (the test clock is above the test
+            // chain's fix height); its own tests arm it.
+            advance: jetsam_chain::consensus::destination::advance::AdvanceRules {
+                fix_height: None,
+                ..jetsam_chain::consensus::destination::advance::AdvanceRules::CONSENSUS
+            },
             fast: jetsam_chain::consensus::destination::fast::FastLaneRules::CONSENSUS,
             anchor: None,
             bridge: None,

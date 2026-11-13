@@ -102,7 +102,8 @@ fn activ_a_node_of_this_build_is_accepted() {
 fn activ_every_field_that_differs_refuses_the_node_and_is_named() {
     let built = this_build();
     let keys: Vec<String> = built.as_object().unwrap().keys().cloned().collect();
-    assert_eq!(keys.len(), 13, "{keys:?}");
+    // 14 since FIXRC (`return_fix_height`): a program of before refuses a node of this build at its start.
+    assert_eq!(keys.len(), 14, "{keys:?}");
     for key in &keys {
         let value = other(&built[key]);
         let published = with(key, Some(value.clone()));

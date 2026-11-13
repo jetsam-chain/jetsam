@@ -50,6 +50,18 @@ pub struct Activations {
     pub fast_release_key: Option<String>,
     /// The fast lane's cold revocation key (48 bytes).
     pub fast_revoke_key: Option<String>,
+    /// FIXRC (AUDIT-FINAL2 ET-1, ET-2): from it on, the advance's marker is
+    /// `JTMADV03`, a block makes at most 4 advances and an advance lives
+    /// 14 400 blocks ([`crate::consensus::destination::advance::AdvanceRules`]).
+    pub return_fix_height: Option<u64>,
+    /// FIXRC RC-3: the fast lane's keys by height, when re-armed (absent
+    /// while the keys of `H` are the only ones).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fast_key_rotations: Vec<FastKeyRotationRecord>,
+    /// FIXRC RC-3: the heights from which other pins of Base's contracts are
+    /// in force (absent while the pins of `H` are the only ones).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub base_pin_rotations: Vec<u64>,
     /// The guardian rules' v1.7 height ([`GuardianRules`]).
     pub guardian_height: Option<u64>,
     /// `J_D`: the guardians' delegation height.
@@ -92,11 +104,31 @@ impl Activations {
                 .map(|bridge| hex(&bridge.address)),
             fast_release_key: base_return.fast.release_key.map(|key| hex(&key)),
             fast_revoke_key: base_return.fast.revoke_key.map(|key| hex(&key)),
+            return_fix_height: base_return.advance.fix_height,
+            fast_key_rotations: base_return
+                .fast
+                .rotations
+                .iter()
+                .map(|rotation| FastKeyRotationRecord {
+                    height: rotation.height,
+                    release_key: rotation.release_key.map(|key| hex(&key)),
+                    revoke_key: rotation.revoke_key.map(|key| hex(&key)),
+                })
+                .collect(),
+            base_pin_rotations: base_return.base.rotations.iter().map(|(h, _)| *h).collect(),
             guardian_height: guardian.activation_height,
             delegation_height: guardian.delegation_height,
             guardian_group_key: guardian.group_key.map(|key| hex(&key)),
         }
     }
+}
+
+/// One re-arming of the fast lane (FIXRC RC-3): its height and keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FastKeyRotationRecord {
+    pub height: u64,
+    pub release_key: Option<String>,
+    pub revoke_key: Option<String>,
 }
 
 /// D123's caps height of `vault` ([`Activations::vault_caps_height`]).
@@ -158,6 +190,9 @@ mod tests {
         assert_eq!(a.guardian_height, g.activation_height);
         assert_eq!(a.delegation_height, g.delegation_height);
         assert_eq!(a.guardian_group_key, g.group_key.map(|k| hex_of(&k)));
+        assert_eq!(a.return_fix_height, d.base_return.advance.fix_height);
+        assert_eq!(a.fast_key_rotations.len(), d.base_return.fast.rotations.len());
+        assert_eq!(a.base_pin_rotations.len(), d.base_return.base.rotations.len());
         assert_eq!(a, Activations::of(&d, &c, &g, network_id()));
     }
 
@@ -302,6 +337,11 @@ mod tests {
         assert!(a.fast_revoke_key.is_some() && a.fast_revoke_key != a.fast_release_key);
         assert_eq!(a.vault_caps_height, jetsam_vault_rule::TESTNET_CAPS_HEIGHT);
         assert_eq!(a.guardian_height, Some(8_160));
+        // FIXRC: the fix height (proposed; the operator fixes it at
+        // deployment), no rotation of the keys or the pins.
+        assert_eq!(a.return_fix_height, crate::consensus::params::V1_7_RETURN_FIX_HEIGHT);
+        assert!(a.return_fix_height.is_some_and(|h| h > 10_351));
+        assert!(a.fast_key_rotations.is_empty() && a.base_pin_rotations.is_empty());
     }
 
     /// The public network's record: its genesis, v1.7 dormant (no `J`, `F`,
@@ -328,6 +368,7 @@ mod tests {
             (None, None, None)
         );
         assert_eq!(a.vault_caps_height, Some(0));
+        assert_eq!(a.return_fix_height, None);
     }
 
     /// On the wire: one JSON object of these named fields, heights as
@@ -357,6 +398,7 @@ mod tests {
                 "guardian_group_key",
                 "guardian_height",
                 "network",
+                "return_fix_height",
                 "v1_5_height",
                 "v1_7_height",
                 "vault",
@@ -364,6 +406,22 @@ mod tests {
             ]
         );
         assert_eq!(v["network"], serde_json::json!("cd".repeat(32)));
+        // FIXRC RC-3: a re-arming is published with its height and keys.
+        let mut r = d;
+        r.base_return.fast.rotations = &[crate::consensus::destination::fast::FastKeyRotation {
+            height: 9,
+            release_key: Some([0x01; 48]),
+            revoke_key: None,
+        }];
+        let v = serde_json::to_value(Activations::of(
+            &r,
+            &ClientObjectRules::CONSENSUS,
+            &GuardianRules::consensus(),
+            [0xcd; 32],
+        ))
+        .unwrap();
+        assert_eq!(v["fast_key_rotations"][0]["height"], serde_json::json!(9));
+        assert_eq!(v["fast_key_rotations"][0]["release_key"], serde_json::json!("01".repeat(48)));
         assert_eq!(v["fast_release_key"], serde_json::json!("ab".repeat(48)));
         assert_eq!(v["v1_7_height"], serde_json::json!(d.activation_height));
     }

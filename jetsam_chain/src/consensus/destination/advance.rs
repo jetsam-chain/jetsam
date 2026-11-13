@@ -51,8 +51,21 @@
 //!   contradiction (V2 repays the advance of exactly that burn; every advance
 //!   of `n` is consumed), or until the block where the branch forgets the
 //!   fast release, never contradicted, at its horizon (every advance of `n`
-//!   is consumed there: they were wrong). Apart from that, no advance expires
-//!   (D107: a timer would take the advancer's money during a pause of Base).
+//!   is consumed there: they were wrong). Apart from that, below the fix
+//!   height no advance expires (D107: a timer would take the advancer's money
+//!   during a pause of Base).
+//! * **The fix (FIXRC, AUDIT-FINAL2 ET-1, ET-2)** — from
+//!   [`AdvanceRules::fix_height`] on: the marker is `JTMADV03 ‖ nA ‖ c16`
+//!   (128 bits of commitment, [`advance_marker_v3`]; `JTMADV02`'s 64 bits let
+//!   a snapshot open an advance with another burn after a 2³² search), and
+//!   `JTMADV02` is refused as `JTMADV01` was; a block makes at most
+//!   [`ADVANCE_MAX_PER_BLOCK`] advances; an advance held
+//!   [`ADVANCE_LIFETIME_BLOCKS`] after it was made (one made before the fix:
+//!   after the fix height) is consumed by the block that ends its lifetime,
+//!   lost by its author as a wrong advance (junk advances, a few hundred JTM
+//!   of fees, made every snapshot unservable for ever; D107's pause of Base
+//!   costs an advancer only past 30 days). The advances a branch holds are
+//!   then at most 4 × 14 400.
 //! * **V5** — both markers carry no value, cannot be spent and never appear
 //!   in a system record.
 //!
@@ -105,12 +118,53 @@ const ADVANCE_COMMITMENT_DOMAIN: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANC
 const TRANSFER_COMMITMENT_DOMAIN: &[u8] =
     b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE-CLAIM-TRANSFER/V2";
 
+/// FIXRC (AUDIT-FINAL2 ET-1): the tag of the advance marker made from the
+/// fix height on ([`AdvanceRules::fix_height`]): `JTMADV03 ‖ nA ‖ c16`, where
+/// `nA` packs `n` (28 bits) and the amount (36 bits) in one little-endian
+/// `u64` (`n << 36 | amount`) and `c16` is 16 bytes (128 bits) of the tagged
+/// byte-hash of `(n, owner, amount, A)`: two burns whose markers agree take
+/// 2⁶⁴ hashes to find, not 2³² (the 8 bytes of `JTMADV02`).
+pub const ADVANCE_MARKER_TAG_V3: [u8; 8] = *b"JTMADV03";
+/// The bits of `n` and of the amount a `JTMADV03` marker carries in clear.
+pub const ADVANCE_V3_N_BITS: u32 = 28;
+pub const ADVANCE_V3_AMOUNT_BITS: u32 = 36;
+/// The commitment bytes of a `JTMADV03` marker.
+pub const ADVANCE_V3_COMMITMENT_BYTES: usize = 16;
+/// FIXRC ET-2: the most advances one block makes from the fix height on —
+/// as many as the releases it may carry (V6, `MAX_RELEASES_PER_BLOCK`):
+/// more could never be repaid at that pace.
+pub const ADVANCE_MAX_PER_BLOCK: usize = crate::consensus::vault::MAX_RELEASES_PER_BLOCK;
+/// FIXRC ET-2: the blocks an advance stays held from the fix height on (made
+/// before it: from the fix height), unless its `n` is released before: the
+/// fast lane's horizon, 30 days at 480 blocks a day — Base's five days to
+/// finality and a wide margin for a pause of Base. Past it, its author loses
+/// it, as a wrong advance (V2 then pays the burn's owner).
+pub const ADVANCE_LIFETIME_BLOCKS: u64 = super::fast::FAST_RECONCILE_BLOCKS;
+
+// A JTMADV03 marker carries every burn an advance may cover.
+const _: () = assert!(ADVANCE_V3_N_BITS + ADVANCE_V3_AMOUNT_BITS == 64);
+const _: () = assert!(ADVANCE_MAX_AMOUNT_MICRO < 1 << ADVANCE_V3_AMOUNT_BITS);
+const _: () = assert!(8 + 8 + ADVANCE_V3_COMMITMENT_BYTES == 32);
+
+const ADVANCE_COMMITMENT_DOMAIN_V3: &[u8] = b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE/V3";
+
 /// The advance's parameters; [`AdvanceRules::CONSENSUS`] is this build's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceRules {
     pub max_amount: u64,
     pub max_fee_bps: u64,
     pub outstanding_cap: u64,
+    /// FIXRC (AUDIT-FINAL2 ET-1, ET-2): from this height on, an advance's
+    /// marker is `JTMADV03` (`JTMADV02` refused, as `JTMADV01` was), a block
+    /// makes at most [`Self::max_per_block`] advances and an advance not
+    /// consumed [`Self::lifetime_blocks`] after it was made (made before the
+    /// height: after the height) is consumed, lost by its author. `None`: never
+    /// (a dormant return over Base; arming one needs it,
+    /// `params::V1_7_RETURN_FIX_HEIGHT`). Below it, every block is judged as
+    /// before.
+    pub fix_height: Option<u64>,
+    pub max_per_block: usize,
+    pub lifetime_blocks: u64,
 }
 
 impl AdvanceRules {
@@ -118,7 +172,31 @@ impl AdvanceRules {
         max_amount: ADVANCE_MAX_AMOUNT_MICRO,
         max_fee_bps: ADVANCE_MAX_FEE_BPS,
         outstanding_cap: ADVANCE_OUTSTANDING_CAP_MICRO,
+        fix_height: crate::consensus::params::V1_7_RETURN_FIX_HEIGHT,
+        max_per_block: ADVANCE_MAX_PER_BLOCK,
+        lifetime_blocks: ADVANCE_LIFETIME_BLOCKS,
     };
+
+    /// Whether the fix (ET-1, ET-2) governs the block at `height`.
+    pub const fn fixed_at(&self, height: u64) -> bool {
+        matches!(self.fix_height, Some(fix) if height >= fix)
+    }
+
+    /// The clock an advance's lifetime runs from: its height when made under
+    /// the fix (`made`), else the fix height (an advance of before).
+    pub const fn clock_of(&self, made: Option<u64>) -> Option<u64> {
+        match (made, self.fix_height) {
+            (Some(height), _) => Some(height),
+            (None, fix) => fix,
+        }
+    }
+
+    /// Whether an advance whose clock is `clock` is still held after the
+    /// block at `height` (FIXRC ET-2): the block `clock + lifetime` consumes
+    /// it, last (it may still pay or transfer it).
+    pub const fn held_after(&self, clock: u64, height: u64) -> bool {
+        clock.saturating_add(self.lifetime_blocks) > height
+    }
 
     /// The least an advance of `amount` pays its owner: the burn less the
     /// release fee and at most `max_fee_bps` of it (rounded up).
@@ -131,24 +209,63 @@ impl AdvanceRules {
 /// What a marker of the advance is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdvanceMarkerKind {
+    /// `JTMADV02` (refused from the fix height on: obsolete there).
     Advance,
+    /// FIXRC ET-1: `JTMADV03`, from the fix height on (below it, an ordinary
+    /// owner).
+    AdvanceV3,
     Transfer,
     /// A marker of the format of before (`JTMADV01`, `JTMADT01`).
     Obsolete,
 }
 
 /// The advance marker an owner carries, if any (meaningful only from the
-/// return-over-Base height on).
+/// return-over-Base height on; `JTMADV03` only from the fix height on:
+/// [`advance_marker_kind_at`]).
 pub fn advance_marker_kind(owner: &Address) -> Option<AdvanceMarkerKind> {
     let tag: [u8; 8] = owner.0[..8].try_into().expect("eight bytes");
     match tag {
         ADVANCE_MARKER_TAG => Some(AdvanceMarkerKind::Advance),
+        ADVANCE_MARKER_TAG_V3 => Some(AdvanceMarkerKind::AdvanceV3),
         ADVANCE_TRANSFER_MARKER_TAG => Some(AdvanceMarkerKind::Transfer),
         OBSOLETE_ADVANCE_MARKER_TAG | OBSOLETE_ADVANCE_TRANSFER_MARKER_TAG => {
             Some(AdvanceMarkerKind::Obsolete)
         }
         _ => None,
     }
+}
+
+/// What the rule of the block at `height` reads an owner as (FIXRC ET-1):
+/// below the fix height a `JTMADV03` owner is an ordinary one (as for a node
+/// without the fix); from it on a `JTMADV02` marker is of the format of
+/// before.
+pub fn advance_marker_kind_at(
+    owner: &Address,
+    height: u64,
+    rules: &AdvanceRules,
+) -> Option<AdvanceMarkerKind> {
+    match (advance_marker_kind(owner), rules.fixed_at(height)) {
+        (Some(AdvanceMarkerKind::AdvanceV3), false) => None,
+        (Some(AdvanceMarkerKind::Advance), true) => Some(AdvanceMarkerKind::Obsolete),
+        (kind, _) => kind,
+    }
+}
+
+/// FIXRC ET-1, V5 for `JTMADV03`: from the fix height on, no input may be
+/// owned by one (below it, an ordinary owner, as for a node without the fix).
+pub const fn is_advance_v3_locked_address_at(
+    owner: &Address,
+    height: u64,
+    fix_height: Option<u64>,
+) -> bool {
+    if !matches!(fix_height, Some(fix) if height >= fix) {
+        return false;
+    }
+    let tag = [
+        owner.0[0], owner.0[1], owner.0[2], owner.0[3], owner.0[4], owner.0[5], owner.0[6],
+        owner.0[7],
+    ];
+    matches!(tag, ADVANCE_MARKER_TAG_V3)
 }
 
 /// V5 for the advance's markers: from the return-over-Base height on, no
@@ -192,20 +309,79 @@ pub fn advance_marker(n: u64, owner: &Address, amount: u64, advancer: &Address) 
     Address(out)
 }
 
-/// `(n, amount)` an advance marker carries in clear; `None` for any other
-/// owner.
-pub fn advance_marker_fields(owner: &Address) -> Option<(u64, u64)> {
-    (advance_marker_kind(owner) == Some(AdvanceMarkerKind::Advance)).then(|| {
-        (
-            u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")),
-            u64::from_le_bytes(owner.0[16..24].try_into().expect("eight bytes")),
-        )
-    })
+/// FIXRC ET-1: the `JTMADV03` marker of an advance of the burn `(n, owner,
+/// amount)` by `advancer` (`None` when `n` or the amount does not fit its
+/// clear word: no such advance is made). Same fields as [`advance_marker`],
+/// another domain, 16 bytes of commitment.
+pub fn advance_marker_v3(
+    n: u64,
+    owner: &Address,
+    amount: u64,
+    advancer: &Address,
+) -> Option<Address> {
+    if n >> ADVANCE_V3_N_BITS != 0 || amount >> ADVANCE_V3_AMOUNT_BITS != 0 {
+        return None;
+    }
+    let mut fields = [0u8; 8 + 32 + 8 + 32];
+    fields[..8].copy_from_slice(&n.to_le_bytes());
+    fields[8..40].copy_from_slice(&owner.0);
+    fields[40..48].copy_from_slice(&amount.to_le_bytes());
+    fields[48..].copy_from_slice(&advancer.0);
+    let commitment = poseidon2b_hash_bytes(ADVANCE_COMMITMENT_DOMAIN_V3, &fields);
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&ADVANCE_MARKER_TAG_V3);
+    out[8..16].copy_from_slice(&(n << ADVANCE_V3_AMOUNT_BITS | amount).to_le_bytes());
+    out[16..].copy_from_slice(&commitment[..ADVANCE_V3_COMMITMENT_BYTES]);
+    Some(Address(out))
 }
 
-/// The commitment bytes of an advance marker: what names its advance.
+/// The marker of an advance of the burn `(n, owner, amount)` by `advancer`,
+/// `JTMADV03` when made under the fix (`v3`), else `JTMADV02`.
+pub fn advance_marker_of(
+    v3: bool,
+    n: u64,
+    owner: &Address,
+    amount: u64,
+    advancer: &Address,
+) -> Option<Address> {
+    if v3 {
+        advance_marker_v3(n, owner, amount, advancer)
+    } else {
+        Some(advance_marker(n, owner, amount, advancer))
+    }
+}
+
+/// `(n, amount)` an advance marker (`JTMADV02` or `JTMADV03`) carries in
+/// clear; `None` for any other owner.
+pub fn advance_marker_fields(owner: &Address) -> Option<(u64, u64)> {
+    match advance_marker_kind(owner)? {
+        AdvanceMarkerKind::Advance => Some((
+            u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")),
+            u64::from_le_bytes(owner.0[16..24].try_into().expect("eight bytes")),
+        )),
+        AdvanceMarkerKind::AdvanceV3 => {
+            let word = u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes"));
+            Some((
+                word >> ADVANCE_V3_AMOUNT_BITS,
+                word & ((1 << ADVANCE_V3_AMOUNT_BITS) - 1),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The commitment bytes of an advance marker that name its advance (a
+/// transfer carries them): the 8 last of `JTMADV02`, the 8 first of the 16 of
+/// `JTMADV03`.
 pub fn advance_marker_commitment(marker: &Address) -> [u8; ADVANCE_COMMITMENT_BYTES] {
-    marker.0[24..].try_into().expect("eight bytes")
+    let at = if advance_marker_kind(marker) == Some(AdvanceMarkerKind::AdvanceV3) {
+        16
+    } else {
+        24
+    };
+    marker.0[at..at + ADVANCE_COMMITMENT_BYTES]
+        .try_into()
+        .expect("eight bytes")
 }
 
 /// The marker of the transfer of the claim of the advance of the burn
@@ -217,7 +393,26 @@ pub fn advance_transfer_marker(
     advancer: &Address,
     new_creditor: &Address,
 ) -> Address {
-    let advance = advance_marker(n, owner, amount, advancer);
+    transfer_marker_naming(
+        &advance_marker_commitment(&advance_marker(n, owner, amount, advancer)),
+        n,
+        owner,
+        amount,
+        advancer,
+        new_creditor,
+    )
+}
+
+/// The transfer marker naming the advance whose marker's commitment bytes
+/// are `named` (either format: the transfer's own commitment is the same).
+fn transfer_marker_naming(
+    named: &[u8; ADVANCE_COMMITMENT_BYTES],
+    n: u64,
+    owner: &Address,
+    amount: u64,
+    advancer: &Address,
+    new_creditor: &Address,
+) -> Address {
     let mut fields = [0u8; 8 + 32 + 8 + 32 + 32];
     fields[..8].copy_from_slice(&n.to_le_bytes());
     fields[8..40].copy_from_slice(&owner.0);
@@ -227,7 +422,7 @@ pub fn advance_transfer_marker(
     let commitment = poseidon2b_hash_bytes(TRANSFER_COMMITMENT_DOMAIN, &fields);
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&ADVANCE_TRANSFER_MARKER_TAG);
-    out[8..16].copy_from_slice(&advance_marker_commitment(&advance));
+    out[8..16].copy_from_slice(named);
     out[16..].copy_from_slice(&commitment[..16]);
     Address(out)
 }
@@ -321,6 +516,13 @@ pub struct AdvanceBook {
     /// the other advances of `n` stand, for a snapshot to tell its marker
     /// from theirs.
     repaid: BTreeMap<u64, AdvanceEntry>,
+    /// FIXRC ET-1, ET-2: the height each held advance made under the fix was
+    /// made at (its marker is `JTMADV03`, its lifetime runs from it); an
+    /// advance held without one was made before the fix (`JTMADV02`).
+    made: BTreeMap<AdvanceKey, u64>,
+    /// The held advances by `(made height or 0, key)`: those to consume at
+    /// the end of their lifetime, in order (derived).
+    by_clock: std::collections::BTreeSet<(u64, AdvanceKey)>,
 }
 
 impl AdvanceBook {
@@ -378,8 +580,8 @@ impl AdvanceBook {
 
     /// A fast release pays the burn `key`: its advance, if held, is consumed
     /// and remembered ([`Self::repaid`]); it is returned as it was.
-    pub fn repay(&mut self, key: &AdvanceKey) -> Option<AdvanceEntry> {
-        let entry = self.remove(key)?;
+    pub fn repay(&mut self, key: &AdvanceKey) -> Option<(AdvanceEntry, Option<u64>)> {
+        let (entry, made) = self.take(key)?;
         self.repaid.insert(
             key.n,
             AdvanceEntry {
@@ -387,7 +589,7 @@ impl AdvanceBook {
                 ..entry
             },
         );
-        Some(entry)
+        Some((entry, made))
     }
 
     /// Remember `entry` as the advance the fast release of `n` repaid.
@@ -430,43 +632,128 @@ impl AdvanceBook {
     /// caller never records two advances whose markers share their
     /// commitment bytes (the rule refuses the second).
     pub fn insert(&mut self, n: u64, entry: AdvanceEntry) -> Option<AdvanceEntry> {
+        self.insert_made(n, entry, None)
+    }
+
+    /// [`Self::insert`] of an advance made at `made` under the fix
+    /// (`JTMADV03`), or before it (`None`: `JTMADV02`).
+    pub fn insert_made(
+        &mut self,
+        n: u64,
+        entry: AdvanceEntry,
+        made: Option<u64>,
+    ) -> Option<AdvanceEntry> {
         let key = entry.key(n);
         let previous = self.remove(&key);
         *self.outstanding.entry(entry.origin.0).or_insert(0) += entry.amount;
-        self.by_marker
-            .insert(advance_marker_commitment(&entry.marker(n)), key);
+        if let Some(height) = made {
+            self.made.insert(key, height);
+        }
+        self.by_clock.insert((made.unwrap_or(0), key));
         self.entries.insert(key, entry);
+        if let Some(marker) = self.marker_of(&key) {
+            self.by_marker.insert(advance_marker_commitment(&marker), key);
+        }
         previous
+    }
+
+    /// FIXRC: the height the held advance `key` was made at under the fix;
+    /// `None` for one made before it (or not held).
+    pub fn made(&self, key: &AdvanceKey) -> Option<u64> {
+        self.made.get(key).copied()
+    }
+
+    /// The held advances made under the fix, with their heights, by key.
+    pub fn made_list(&self) -> Vec<(AdvanceKey, u64)> {
+        self.made.iter().map(|(key, height)| (*key, *height)).collect()
+    }
+
+    /// The marker of the held advance `key`: `JTMADV03` when made under the
+    /// fix, else `JTMADV02`.
+    pub fn marker_of(&self, key: &AdvanceKey) -> Option<Address> {
+        let made = self.made.contains_key(key);
+        let entry = self.entries.get(key);
+        let (owner, amount, origin) = match entry {
+            Some(entry) => (entry.owner, entry.amount, entry.origin),
+            None => return None,
+        };
+        advance_marker_of(made, key.n, &owner, amount, &origin)
+    }
+
+    /// The marker of the transfer of the claim of the held advance `key` to
+    /// `new_creditor` (naming its marker, of either format).
+    pub fn transfer_marker_of(&self, key: &AdvanceKey, new_creditor: &Address) -> Option<Address> {
+        let entry = self.entries.get(key)?;
+        let named = advance_marker_commitment(&self.marker_of(key)?);
+        Some(transfer_marker_naming(
+            &named,
+            key.n,
+            &entry.owner,
+            entry.amount,
+            &entry.origin,
+            new_creditor,
+        ))
+    }
+
+    /// FIXRC ET-2: the held advances whose lifetime ends with the block at
+    /// `height` under `rules` (those made before the fix: at the fix height
+    /// plus the lifetime), by clock then key. None below the fix.
+    pub fn expiring(&self, rules: &AdvanceRules, height: u64) -> Vec<AdvanceKey> {
+        let Some(fix) = rules.fix_height.filter(|_| rules.fixed_at(height)) else {
+            return Vec::new();
+        };
+        let Some(last) = height.checked_sub(rules.lifetime_blocks) else {
+            return Vec::new();
+        };
+        let legacy_too = fix <= last;
+        self.by_clock
+            .iter()
+            .take_while(|(clock, _)| *clock <= last)
+            .filter(|(clock, _)| *clock != 0 || legacy_too)
+            .map(|(_, key)| *key)
+            .collect()
     }
 
     /// Forget the advance of the burn `key`.
     pub fn remove(&mut self, key: &AdvanceKey) -> Option<AdvanceEntry> {
+        self.take(key).map(|(entry, _)| entry)
+    }
+
+    /// Forget the advance of the burn `key`; it, and the height it was made at
+    /// under the fix.
+    pub fn take(&mut self, key: &AdvanceKey) -> Option<(AdvanceEntry, Option<u64>)> {
+        let marker = self.marker_of(key);
         let entry = self.entries.remove(key)?;
+        let made = self.made.remove(key);
+        self.by_clock.remove(&(made.unwrap_or(0), *key));
         if let Some(sum) = self.outstanding.get_mut(&entry.origin.0) {
             *sum -= entry.amount;
             if *sum == 0 {
                 self.outstanding.remove(&entry.origin.0);
             }
         }
-        let commitment = advance_marker_commitment(&entry.marker(key.n));
-        if self.by_marker.get(&commitment) == Some(key) {
-            self.by_marker.remove(&commitment);
+        if let Some(marker) = marker {
+            let commitment = advance_marker_commitment(&marker);
+            if self.by_marker.get(&commitment) == Some(key) {
+                self.by_marker.remove(&commitment);
+            }
         }
-        Some(entry)
+        Some((entry, made))
     }
 
     /// Forget every advance of `n` (its release consumes them), and the
-    /// memory of the one its fast release repaid; they are returned by key,
-    /// the memory last.
-    pub fn remove_n(&mut self, n: u64) -> Vec<AdvanceEntry> {
+    /// memory of the one its fast release repaid; they are returned by key
+    /// (each with the height it was made at under the fix), the memory last.
+    pub fn remove_n(&mut self, n: u64) -> Vec<(AdvanceEntry, Option<u64>)> {
         let keys: Vec<AdvanceKey> = self
             .entries
             .range(AdvanceKey::first_of(n)..)
             .take_while(|(key, _)| key.n == n)
             .map(|(key, _)| *key)
             .collect();
-        let mut out: Vec<AdvanceEntry> = keys.iter().filter_map(|key| self.remove(key)).collect();
-        out.extend(self.repaid.remove(&n));
+        let mut out: Vec<(AdvanceEntry, Option<u64>)> =
+            keys.iter().filter_map(|key| self.take(key)).collect();
+        out.extend(self.repaid.remove(&n).map(|entry| (entry, None)));
         out
     }
 
@@ -492,6 +779,12 @@ pub struct AdvanceEffect {
     /// D188: the advances its fast releases repay, each of exactly the burn
     /// paid (the only advance of its `n` they consume).
     pub repaid: Vec<AdvanceKey>,
+    /// FIXRC ET-1: the block's height when the fix governs it: its advances
+    /// are `JTMADV03` and their lifetime runs from it (`None`: `JTMADV02`).
+    pub made_at: Option<u64>,
+    /// FIXRC ET-2: the held advances whose lifetime ends with this block,
+    /// consumed last (their authors lose them), by clock then key.
+    pub expired: Vec<AdvanceKey>,
 }
 
 impl AdvanceEffect {
@@ -500,6 +793,7 @@ impl AdvanceEffect {
             && self.transfers.is_empty()
             && self.consumed.is_empty()
             && self.repaid.is_empty()
+            && self.expired.is_empty()
     }
 }
 
@@ -550,6 +844,8 @@ pub enum AdvanceError {
     TransferredTwice { n: u64 },
     /// A group carries an advance marker of the format of before.
     ObsoleteAdvanceMarker { group: usize },
+    /// FIXRC ET-2: the block makes more advances than the rule's most.
+    TooManyAdvances { group: usize, max: usize },
 }
 
 impl AdvanceError {
@@ -562,8 +858,12 @@ impl AdvanceError {
 /// An owner a release, an advance or a transfer may pay: no marker of any
 /// kind (destination, guardian, client, advance), not the vault, not a
 /// guardian pool.
-fn payable(owner: &Address, vault: &VaultRules) -> bool {
-    advance_marker_kind(owner).is_none() && release_shape_ok(owner, vault.release_fee, vault)
+fn payable(
+    owner: &Address,
+    vault: &VaultRules,
+    kind_at: impl Fn(&Address) -> Option<AdvanceMarkerKind>,
+) -> bool {
+    kind_at(owner).is_none() && release_shape_ok(owner, vault.release_fee, vault)
 }
 
 /// Whether a group's live outputs carry an advance or transfer marker: the
@@ -585,6 +885,8 @@ pub struct AdvanceCheck<'a> {
     released_here: Vec<u64>,
     vault: &'a VaultRules,
     rules: &'a AdvanceRules,
+    /// The block's height (FIXRC: the fix governs it or not).
+    height: u64,
     effect: AdvanceEffect,
     /// What each advancer advances in the block so far.
     advanced_here: BTreeMap<[u8; 32], u64>,
@@ -592,13 +894,14 @@ pub struct AdvanceCheck<'a> {
 
 impl<'a> AdvanceCheck<'a> {
     /// The rule against the branch's advances `book` and paid set `released`,
-    /// for a block that releases `released_here`.
+    /// for the block at `height` that releases `released_here`.
     pub fn new(
         book: &'a AdvanceBook,
         released: &'a ReleasedSet,
         released_here: Vec<u64>,
         vault: &'a VaultRules,
         rules: &'a AdvanceRules,
+        height: u64,
     ) -> Self {
         Self {
             book,
@@ -606,9 +909,19 @@ impl<'a> AdvanceCheck<'a> {
             released_here,
             vault,
             rules,
-            effect: AdvanceEffect::default(),
+            height,
+            effect: AdvanceEffect {
+                made_at: rules.fixed_at(height).then_some(height),
+                ..AdvanceEffect::default()
+            },
             advanced_here: BTreeMap::new(),
         }
+    }
+
+    /// The marker this block's advance of `(n, owner, amount)` by `advancer`
+    /// carries: `JTMADV03` under the fix, else `JTMADV02`.
+    fn marker_here(&self, n: u64, owner: &Address, amount: u64, advancer: &Address) -> Option<Address> {
+        advance_marker_of(self.effect.made_at.is_some(), n, owner, amount, advancer)
     }
 
     /// The next group of the block, `index`-th, spent from `from`, with its
@@ -621,10 +934,12 @@ impl<'a> AdvanceCheck<'a> {
         from: Address,
         outputs: &[(Address, u64)],
     ) -> Result<(), AdvanceError> {
+        let (height, rules) = (self.height, self.rules);
+        let kind_at = |owner: &Address| advance_marker_kind_at(owner, height, rules);
         let markers: Vec<(usize, AdvanceMarkerKind)> = outputs
             .iter()
             .enumerate()
-            .filter_map(|(i, (owner, _))| advance_marker_kind(owner).map(|kind| (i, kind)))
+            .filter_map(|(i, (owner, _))| kind_at(owner).map(|kind| (i, kind)))
             .collect();
         let Some(&(_, first_kind)) = markers.first() else {
             return Ok(());
@@ -642,14 +957,14 @@ impl<'a> AdvanceCheck<'a> {
         }
         let shape_error = |kind| match kind {
             AdvanceMarkerKind::Transfer => AdvanceError::TransferShape { group: index },
-            AdvanceMarkerKind::Advance | AdvanceMarkerKind::Obsolete => {
-                AdvanceError::AdvanceShape { group: index }
-            }
+            AdvanceMarkerKind::Advance
+            | AdvanceMarkerKind::AdvanceV3
+            | AdvanceMarkerKind::Obsolete => AdvanceError::AdvanceShape { group: index },
         };
         // The shape: the payee, the group's one marker, at most one change
         // back to the spender; never spent from the vault.
         let kind = match outputs {
-            [_, (marker, _)] | [_, (marker, _), _] => advance_marker_kind(marker),
+            [_, (marker, _)] | [_, (marker, _), _] => kind_at(marker),
             _ => None,
         };
         let Some(kind) = kind else {
@@ -660,16 +975,16 @@ impl<'a> AdvanceCheck<'a> {
         let marker = outputs[1].0;
         let shape_ok = from != vault.vault
             && markers.len() == 1
-            && payable(&payee, vault)
+            && payable(&payee, vault, kind_at)
             && outputs.get(2).is_none_or(|(change, _)| *change == from);
         if !shape_ok {
             return Err(shape_error(kind));
         }
         match kind {
             AdvanceMarkerKind::Transfer => self.transfer(index, from, payee, marker),
-            AdvanceMarkerKind::Advance | AdvanceMarkerKind::Obsolete => {
-                self.advance(index, from, payee, paid, marker)
-            }
+            AdvanceMarkerKind::Advance
+            | AdvanceMarkerKind::AdvanceV3
+            | AdvanceMarkerKind::Obsolete => self.advance(index, from, payee, paid, marker),
         }
     }
 
@@ -682,7 +997,7 @@ impl<'a> AdvanceCheck<'a> {
         marker: Address,
     ) -> Result<(), AdvanceError> {
         let (n, amount) = advance_marker_fields(&marker).expect("an advance marker");
-        if advance_marker(n, &payee, amount, &from) != marker {
+        if self.marker_here(n, &payee, amount, &from) != Some(marker) {
             return Err(AdvanceError::AdvanceMarkerMismatch { group: index });
         }
         if amount < self.vault.release_fee || amount > self.rules.max_amount {
@@ -719,11 +1034,10 @@ impl<'a> AdvanceCheck<'a> {
         // the same commitment bytes.
         let commitment = advance_marker_commitment(&marker);
         if self.book.by_marker(&commitment).is_some()
-            || self
-                .effect
-                .created
-                .iter()
-                .any(|(m, e)| advance_marker_commitment(&e.marker(*m)) == commitment)
+            || self.effect.created.iter().any(|(m, e)| {
+                self.marker_here(*m, &e.owner, e.amount, &e.origin)
+                    .is_some_and(|made| advance_marker_commitment(&made) == commitment)
+            })
         {
             return Err(AdvanceError::AdvanceMarkerTaken { group: index });
         }
@@ -741,6 +1055,15 @@ impl<'a> AdvanceCheck<'a> {
                 outstanding,
                 amount,
                 cap: self.rules.outstanding_cap,
+            });
+        }
+        // FIXRC ET-2: at most `max_per_block` advances a block (what its
+        // releases could repay at that pace), so that the advances a branch
+        // holds stay bounded with their lifetime.
+        if self.rules.fixed_at(self.height) && self.effect.created.len() >= self.rules.max_per_block {
+            return Err(AdvanceError::TooManyAdvances {
+                group: index,
+                max: self.rules.max_per_block,
             });
         }
         *self.advanced_here.entry(from.0).or_insert(0) += amount;
@@ -765,7 +1088,7 @@ impl<'a> AdvanceCheck<'a> {
         if self.released.contains(key.n) {
             return Err(AdvanceError::NoAdvanceToTransfer { group: index });
         }
-        if entry.transfer_marker(key.n, &payee) != marker {
+        if self.book.transfer_marker_of(&key, &payee) != Some(marker) {
             return Err(AdvanceError::TransferMarkerMismatch { group: index });
         }
         if entry.creditor != from {
@@ -800,6 +1123,7 @@ pub fn validate_block_advances(
     vault: &VaultRules,
     rules: &AdvanceRules,
 ) -> Result<AdvanceEffect, AdvanceError> {
+    let height = block.header.height;
     let stream =
         validate_block_page_stream(&block.transactions).map_err(|_| AdvanceError::PageStream)?;
     let (system, user) = block.transactions.split_at(stream.user_start_index);
@@ -807,7 +1131,7 @@ pub fn validate_block_advances(
     if system
         .iter()
         .flat_map(|record| record.body.live_outputs())
-        .any(|(_, output)| advance_marker_kind(&output.owner).is_some())
+        .any(|(_, output)| advance_marker_kind_at(&output.owner, height, rules).is_some())
     {
         return Err(AdvanceError::MarkerInSystemRecord);
     }
@@ -818,7 +1142,7 @@ pub fn validate_block_advances(
         .flat_map(|page| page.body.live_outputs())
         .filter_map(|(_, output)| release_marker_n(&output.owner))
         .collect();
-    let mut check = AdvanceCheck::new(book, released, released_here, vault, rules);
+    let mut check = AdvanceCheck::new(book, released, released_here, vault, rules, height);
     for (index, group) in stream.groups.iter().enumerate() {
         let pages = &user[usize::from(group.start_page)..group.end_page_exclusive()];
         let outputs: Vec<(Address, u64)> = pages

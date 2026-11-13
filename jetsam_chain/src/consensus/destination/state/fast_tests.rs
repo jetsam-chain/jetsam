@@ -1777,3 +1777,196 @@ fn d188_the_repaid_advance_is_remembered_by_its_origin() {
     let back = after.truncate_above(HEIGHT - 1).unwrap().unwrap();
     assert_eq!(back, parent);
 }
+
+// ---------------------------------------------------------------------------
+// FIXRC (AUDIT-FINAL2 §3.4, §3.5): RC-2, ET-3, RC-3
+// ---------------------------------------------------------------------------
+
+/// RC-2: the honest block "contradiction of 3 + the real burner of 3 paid",
+/// relayed with the uncommitted contradiction object's `n` changed (3 → 4).
+/// The header commits to the marker (`n` = 3 in clear), not to the object:
+/// the refusal must not condemn the block (a re-download serves it right).
+#[test]
+fn a_tampered_contradiction_object_never_condemns_an_honest_block() {
+    let l = lane();
+    let (parent, record) = after_fast_release(&l);
+    let honest = contradiction_paying_bob(&l, &record, BOB);
+    assert!(l.check(&honest, &parent).is_ok(), "the honest block");
+    let world = base_world(&release(3, BOB, 7 * JTM), VALID, TIMES);
+    for n in [4u64, 9] {
+        let tampered = replace(
+            &honest,
+            DestinationObjectKind::FastContradiction,
+            FastContradiction {
+                n,
+                storage_proof: world.storage_proof.clone(),
+            }
+            .encode_payload(),
+        );
+        // Same header, same committed transactions.
+        assert_eq!(tampered.header, honest.header);
+        assert_eq!(tampered.transactions, honest.transactions);
+        let e = l.check(&tampered, &parent).expect_err("tampered");
+        assert!(!e.condemns_block(), "n = {n}: {e:?} condemns an honest block");
+    }
+}
+
+/// ET-3: a node installed from a snapshot exports a snapshot another node
+/// installs — here a boundary whose fast release (`HEIGHT + 2`) is in the
+/// horizon but out of the window (V6) of the next block.
+#[test]
+fn an_installed_state_exports_a_snapshot_another_node_installs() {
+    let l = lane();
+    let rules = l.rules;
+    let at = |h: u64| h * 10 - 3;
+    let fast5 = SnapshotRelease {
+        n: 5,
+        owner: ALICE,
+        amount: 5 * JTM,
+        fast_l2_block: Some(56_993_063),
+    };
+    let slots = vec![(fast5.marker(), at(HEIGHT + 2))];
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: Vec::new(),
+        fast: Some(FastSnapshot {
+            releases: vec![fast5],
+            contradictions: Vec::new(),
+            revocations: Vec::new(),
+        }),
+    };
+    for tip in [HEIGHT + 20, HEIGHT + 2 + VAULT_RELEASE_WINDOW_BLOCKS + 100] {
+        let installed = install(&rules, &file, tip, &slots).expect("the first install");
+        assert_eq!(installed.fast.records[&5].height, HEIGHT + 2);
+        let exported = export(&l, &installed);
+        assert_eq!(exported, file, "tip {tip}: the installed node exports the file it installed");
+        let again = install(&rules, &exported, tip, &slots)
+            .unwrap_or_else(|e| panic!("tip {tip}: the second install: {e:?}"));
+        assert_eq!(again.fast, installed.fast);
+        assert_eq!(again.released, installed.released);
+        assert_eq!(again.released_in_window(tip + 1, VAULT_RELEASE_WINDOW_BLOCKS),
+                   installed.released_in_window(tip + 1, VAULT_RELEASE_WINDOW_BLOCKS));
+    }
+}
+
+/// RC-3: a fast release signed by the relay key of its time stays valid when
+/// the build is re-armed with another key afterwards (history replays); from
+/// the rotation's height the new key signs; a contradiction closes the key
+/// that signed its fast release, not the new one. Base's pins likewise: a
+/// block keeps the pins of its height.
+#[test]
+fn history_signed_by_a_former_key_still_validates_after_rearming() {
+    use crate::consensus::destination::fast::FastKeyRotation;
+    let l = lane();
+    let parent = state_at(HEIGHT - 1, known(&l.c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = proposed_world(&r, PROPOSED);
+    let old = fast_block(HEIGHT, &r, ALICE, &l.c0, &world, &l.attestation(&world));
+    assert!(l.check(&old, &parent).is_ok());
+    // Re-armed from HEIGHT + 5 with a new pair of keys.
+    let (relay2, relay2_pk) = test_key("relay-2");
+    let (_, cold2_pk) = test_key("cold-2");
+    let rotations: &'static [FastKeyRotation] = Box::leak(Box::new([
+        FastKeyRotation {
+            height: HB,
+            release_key: l.rules.base_return.fast.release_key,
+            revoke_key: l.rules.base_return.fast.revoke_key,
+        },
+        FastKeyRotation {
+            height: HEIGHT + 5,
+            release_key: Some(relay2_pk),
+            revoke_key: Some(cold2_pk),
+        },
+    ]));
+    let mut rearmed = l.rules;
+    rearmed.base_return.fast.rotations = rotations;
+    assert!(crate::consensus::destination::fast::fast_rotations_are_valid(
+        rotations,
+        Some(HB),
+        l.rules.base_return.fast.release_key,
+        l.rules.base_return.fast.revoke_key,
+    ));
+    let check = |b: &Block, s: &DestinationState| validate_block_destination(b, s, &rearmed, &l.keys);
+    let effect = check(&old, &parent).expect("the history replays under the table");
+    let after = applied(&parent, &effect);
+    // From HEIGHT + 5: the new key signs; the former one no longer does.
+    let tip = (HEIGHT + 1..HEIGHT + 5).fold(after.clone(), |s, h| {
+        applied(&s, &check(&block_with(h, vec![], vec![]), &s).expect("empty"))
+    });
+    let r9 = release(9, BOB, 2 * JTM);
+    let w9 = proposed_world(&r9, PROPOSED);
+    let by_old = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &l.attestation(&w9));
+    assert_eq!(check(&by_old, &tip), Err(DestinationBlockError::FastBadSignature));
+    let statement = l.statement(&w9);
+    let by_new = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &attest(&relay2, statement));
+    assert!(check(&by_new, &tip).is_ok());
+    // The contradiction of the release of HEIGHT closes the key that signed
+    // it, not the one in force now.
+    let record = after.fast.records[&3];
+    let truth = release(3, BOB, 7 * JTM);
+    let final_world = base_world(&truth, VALID, TIMES);
+    let entry = ContradictionEntry {
+        n: 3,
+        owner: record.owner,
+        amount: record.amount,
+        l2_block: record.l2_block,
+        height: record.height,
+        key: l.rules.base_return.fast.release_key,
+    };
+    let b = contradiction_block(
+        HEIGHT + 5,
+        &l,
+        &final_world,
+        &[(3, final_world.storage_proof.clone())],
+        &[entry],
+        &[],
+    );
+    let effect = check(&b, &tip).expect("the contradiction");
+    assert_eq!(effect.fast.contradicted, vec![entry]);
+    let fused = applied(&tip, &effect);
+    assert!(fused.fast.is_closed(&l.relay_key()));
+    assert!(!fused.fast.is_closed(&relay2_pk));
+    let next = fast_block(
+        HEIGHT + 6,
+        &r9,
+        BOB,
+        &l.c0,
+        &w9,
+        &attest(&relay2, statement),
+    );
+    assert!(check(&next, &fused).is_ok(), "the new key is open");
+    // A contradiction naming the new key is not this record's.
+    let wrong = ContradictionEntry {
+        key: Some(relay2_pk),
+        ..entry
+    };
+    let b = contradiction_block(
+        HEIGHT + 5,
+        &l,
+        &final_world,
+        &[(3, final_world.storage_proof.clone())],
+        &[wrong],
+        &[],
+    );
+    assert_eq!(check(&b, &tip), Err(DestinationBlockError::FastObjectsDoNotMatchMarkers));
+    // Base's pins: other pins from HEIGHT + 5 on. The block of HEIGHT keeps
+    // the pins of its time; at HEIGHT + 5 the old contracts are refused.
+    let mut repinned = l.rules;
+    let other = BaseParams {
+        system_config_impl: [0x77; 20],
+        ..l.rules.base_return.base
+    };
+    repinned.base_return.base.rotations = Box::leak(Box::new([(HEIGHT + 5, other)]));
+    assert!(validate_block_destination(&old, &parent, &repinned, &l.keys).is_ok());
+    let by_old_pins = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &l.attestation(&w9));
+    assert!(matches!(
+        validate_block_destination(&by_old_pins, &tip, &repinned, &l.keys),
+        Err(DestinationBlockError::BaseReturn(BaseReturnError::Game(
+            BaseGameError::UnknownImplementation(_)
+        )))
+    ));
+    // Without a table, the rules a block is judged by are the build's.
+    assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.fast, l.rules.base_return.fast);
+    assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.base, l.rules.base_return.base);
+}

@@ -22,8 +22,13 @@ fn vault() -> VaultRules {
     crate::consensus::vault::tests::rules()
 }
 
+/// The rules of before the fix (FIXRC): the test clock is far above the test
+/// chain's fix height, which these tests do not arm.
 fn rules() -> AdvanceRules {
-    AdvanceRules::CONSENSUS
+    AdvanceRules {
+        fix_height: None,
+        ..AdvanceRules::CONSENSUS
+    }
 }
 
 /// The least an advance of `amount` pays: `amount − R − ⌈1 %⌉`.
