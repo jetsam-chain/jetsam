@@ -1906,7 +1906,7 @@ fn fixall_the_recall_is_idempotent() {
 
 /// (d): nothing changes for a state without an advance to recall: a fast
 /// release that repaid none, a branch without fast release, the return over
-/// Base dormant.
+/// Base dormant, a fast release reconciled (its record consumed).
 #[test]
 fn fixall_the_recall_changes_nothing_without_an_advance() {
     let l = lane();
@@ -1915,10 +1915,21 @@ fn fixall_the_recall_changes_nothing_without_an_advance() {
     let (r, in_place) = replay_and_in_place(&l, &[(PAYER, 3, ALICE, 5 * JTM)], HEIGHT + 1);
     let mut dormant = l.rules;
     dormant.base_return.activation_height = None;
+    // A fast release reconciled: contradicted, the real burner paid (the
+    // memory consumed with it), the repaid advance's marker still live.
+    let mut reconciled = Replay::start(&l, &[(PAYER, 3, ALICE, 5 * JTM)], PAYER);
+    let record = reconciled.tip().fast.records[&3];
+    reconciled.push(
+        &l,
+        &contradiction_paying_bob(&l, &record, BOB),
+        &[entry_for(&l, 3, &record).marker(), release(3, BOB, 7 * JTM).marker()],
+    );
+    assert!(reconciled.tip().fast.records[&3].consumed);
     let cases = [
         (no_advance.tip().clone(), l.rules, no_advance.slots_to(HEIGHT + 1)),
         (state_at(HEIGHT - 1, known(&l.c0)), l.rules, r.slots_to(HEIGHT + 1)),
         (in_place.last().unwrap().clone(), dormant, r.slots_to(HEIGHT + 1)),
+        (reconciled.tip().clone(), l.rules, reconciled.slots_to(HEIGHT + 1)),
     ];
     for (i, (state, rules, slots)) in cases.into_iter().enumerate() {
         let mut s = state.clone();
@@ -1978,12 +1989,14 @@ fn fixall_the_recall_leaves_what_the_live_state_does_not_tell() {
     );
     assert_eq!(&s, in_place.last().unwrap());
     // Markers the install would not count: a coinbase output and one below
-    // the return over Base's floor; the recall goes on as without them.
+    // the return over Base's floor; nor is an advance of another `n` one of
+    // 3; the recall goes on as without them.
     let floor = alloc(l.rules.base_return.activation_height.unwrap() - 1).unwrap();
     let mut live = with_owners(markers);
     let other = advance_marker(3, &BOB, 7 * JTM, &RESERVE);
     live.push((other, coinbase_creation_id(HEIGHT)));
     live.push((other, floor));
+    live.push((advance_marker(4, &BOB, 7 * JTM, &RESERVE), HEIGHT * 10 - 2));
     let mut s = in_place.last().unwrap().clone();
     assert_eq!(
         s.recall_repaid_advances(&l.rules, &live, alloc).map(|f| f.recalled),

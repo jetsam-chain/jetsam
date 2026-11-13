@@ -1136,14 +1136,16 @@ fn a_reopened_store_recalls_the_repaid_advance_from_its_live_slots() {
             let _rules = arm();
             let mut producer = easy_block_context(directory.path());
             let mut bundles = BTreeMap::new();
+            // The advance at 3 (the owner paid, the marker: a page carries
+            // two outputs), then an output of its advancer at 4.
             while producer.tip_height() < 5 {
                 let next = producer.tip_height() + 1;
                 let bundle = if next == 3 {
-                    let mut outputs = vec![(OWNER, MICRO_PER_JTM), (marker, 0)];
-                    if advancer_live {
-                        outputs.push((ADVANCER, MICRO_PER_JTM));
-                    }
-                    let page = spend_page(&producer, &bundles[&1], &outputs);
+                    let page =
+                        spend_page(&producer, &bundles[&1], &[(OWNER, MICRO_PER_JTM), (marker, 0)]);
+                    bundle_with(&mut producer, vec![page])
+                } else if next == 4 && advancer_live {
+                    let page = spend_page(&producer, &bundles[&2], &[(ADVANCER, MICRO_PER_JTM)]);
                     bundle_with(&mut producer, vec![page])
                 } else {
                     test_next_bundle_for_miner(&producer, MINER)

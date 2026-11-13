@@ -537,9 +537,68 @@ impl DestinationState {
         live: &[(Address, u64)],
         alloc_counter: impl Fn(u64) -> Option<u64>,
     ) -> Result<RecalledAdvances, SnapshotDestinationError> {
-        // FIXALL red: not derived yet.
-        let _ = (rules, live, alloc_counter);
-        let out = RecalledAdvances::default();
+        let mut out = RecalledAdvances::default();
+        let Some(height) = rules
+            .base_return
+            .activation_height
+            .filter(|height| *height <= self.tip)
+        else {
+            return Ok(out);
+        };
+        let missing = self.records_without_advances();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let header =
+            |h: u64| alloc_counter(h).ok_or(SnapshotDestinationError::HeaderMissing { height: h });
+        let floor = header(height.saturating_sub(1))?;
+        let fix_floor = rules
+            .base_return
+            .advance
+            .fix_height
+            .filter(|fix| *fix <= self.tip)
+            .map(|fix| header(fix.saturating_sub(1)))
+            .transpose()?;
+        let owners: std::collections::BTreeSet<[u8; 32]> =
+            live.iter().map(|(owner, _)| owner.0).collect();
+        for (n, record) in missing {
+            let markers: Vec<Address> = live
+                .iter()
+                .filter(|(owner, id)| {
+                    !crate::consensus::params::is_coinbase_creation_id(*id)
+                        && advance_marker_counts(owner, *id, floor, fix_floor)
+                        && advance_marker_fields(owner).is_some_and(|(of, _)| of == n)
+                })
+                .map(|(owner, _)| *owner)
+                .collect();
+            let marker = match markers.as_slice() {
+                [] => continue,
+                [marker] => *marker,
+                _ => {
+                    out.left.push((n, "advances of other burns of n"));
+                    continue;
+                }
+            };
+            let entry = |origin: Address| AdvanceEntry {
+                origin,
+                creditor: origin,
+                owner: record.owner,
+                amount: record.amount,
+            };
+            let openers: Vec<Address> = owners
+                .iter()
+                .map(|bytes| Address(*bytes))
+                .filter(|origin| advance_markers_of(n, &entry(*origin)).any(|m| m == marker))
+                .collect();
+            match openers.as_slice() {
+                [origin] => {
+                    self.advances.restore_repaid(n, entry(*origin));
+                    out.recalled.push((n, *origin));
+                }
+                [] => out.left.push((n, "no live owner opens its marker as the burn paid")),
+                _ => out.left.push((n, "several live owners open its marker")),
+            }
+        }
         Ok(out)
     }
 
