@@ -137,6 +137,9 @@ struct State {
     /// A5-13: its own transactions reverted in a row, none explained by a race (`relayer::after_own_receipt`).
     #[serde(default)]
     reverts: u32,
+    /// M5-2 (audit n°2): the seconds from the last plan to its proof ready (MN-5 is judged at now + this + inclusion).
+    #[serde(default)]
+    proof_secs: Option<u64>,
 }
 
 struct Relay {
@@ -775,7 +778,8 @@ impl Relay {
         let known = self.known();
         let missing = self.archive.missing();
         let found = self.archive.found();
-        let at = l1_now + self.cfg.prover.timeout_secs + relayer::INCLUSION_SECS;
+        // M5-2: MN-5 judged when the point lands: now, the proof as last measured (timeout_secs before any), inclusion
+        let at = relayer::mn5_planned_at(l1_now, self.cfg.prover.timeout_secs, self.state.proof_secs);
         // R3-5: no more deposit blocks a point than the signer's max_gas lets its submitCheckpoint carry
         let bound = self.cfg.deposit_blocks_bound();
         let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at, bound) {
@@ -813,6 +817,18 @@ impl Relay {
                 return Ok(());
             }
         };
+        let planned = std::time::Instant::now();
+        // M5-2: the last L1 second the contract takes this point, and MN-5's margin when it lands (alerted below 1.5)
+        let deadline = relayer::mn5_deadline(&s.mn);
+        if relayer::mn5_margin_low(&s.mn, at) {
+            log(&format!(
+                "ALERT MN5_MARGIN: the point T={} over the fork base {} lands with an MN-5 margin below 1.5 (its deadline {deadline}, {} s after it lands): the chain's work rate is falling",
+                s.next.height,
+                s.base,
+                deadline.saturating_sub(at)
+            ));
+            self.event(json!({"event": "mn5_margin_low", "height": s.next.height, "base": s.base, "deadline": deadline, "at": at}));
+        }
         if !self.witnessed(&[(s.next.height, s.next.tip_block_id), (s.next.locked_height, s.next.locked_block_id)]) {
             log(&format!("T={} L={}: fewer than {} nodes have them, no submission", s.next.height, s.next.locked_height, self.cfg.min_nodes));
             return Ok(());
@@ -826,6 +842,7 @@ impl Relay {
         let started = std::time::Instant::now();
         let proof = self.prover.prove(&req)?;
         let proving = started.elapsed().as_secs();
+        self.state.proof_secs = Some(planned.elapsed().as_secs());
         // A5-4, N1: the proof names the tip it was made against (its block and its locked block); another
         // point landed meanwhile: made again
         let now_tip = word(&self.view("tipBlockId()", &[])?, 0);
@@ -834,6 +851,14 @@ impl Relay {
             log(&format!("the bridge tip moved during the proof ({proving} s): this proof is void, planned again at the next step"));
             // N3 (re-audit): the cost of an extension landed first, one proof made again
             self.event(json!({"event": "proof_void_tip_moved", "planned_tip_block": hex::encode(s.bridge_tip_block), "tip_block": hex::encode(now_tip), "proof_secs": proving}));
+            return Ok(());
+        }
+        // M5-2: sent while its deadline is not passed (a later one would revert WorkRateTooLow)
+        let now = self.l1.next_time()?;
+        if now > deadline {
+            log(&format!("ALERT MN5_DEADLINE_PASSED: the proof of T={} came at {now}, after its MN-5 deadline {deadline} ({proving} s of proof): not sent", s.next.height));
+            self.event(json!({"event": "mn5_deadline_passed", "height": s.next.height, "deadline": deadline, "now": now, "proof_secs": proving}));
+            self.state.work_rate_refused = true;
             return Ok(());
         }
         let data = l1::submit_checkpoint(&s.parent, &s.next, s.fork_depth, &s.mn, &s.deposit_blocks, &proof);

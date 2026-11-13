@@ -707,3 +707,52 @@ fn the_games_and_their_blocks_are_kept_across_a_restart() {
     std::fs::write(&path, b"{\"games\": 3}").unwrap();
     assert!(load_games(&path).is_err());
 }
+
+// ---------------------------------------------------------------- FR-2 (audit n°2): a game of another type
+
+/// The factory of Base with game #7 of type 1 (anyone may create one, or Base changes its proof system): its
+/// `proofCount()` and every other view of type 621 revert; the other games are type 621. Records the calls made to
+/// game #7.
+struct ForeignGameL1 {
+    foreign_calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl BaseRpc for ForeignGameL1 {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        assert_eq!(method, "eth_call");
+        let to = hex20(params[0]["to"].as_str().unwrap()).unwrap();
+        let data = hex::decode(params[0]["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let hexw = |words: &[[u8; 32]]| json!(format!("0x{}", words.iter().map(hex::encode).collect::<String>()));
+        if to == BASE_SEPOLIA.dispute_game_factory {
+            if data[..4] == selector("gameCount()") {
+                return Ok(hexw(&[word_u64(10)]));
+            }
+            if data[..4] == selector("gameAtIndex(uint256)") {
+                let i = u64::from_be_bytes(data[28..36].try_into().unwrap());
+                let kind = if i == 7 { 1 } else { 621 };
+                return Ok(hexw(&[word_u64(kind), word_u64(1_700_000_000 + i), word_address(&game_of(i))]));
+            }
+            // gameImpls(type)
+            return Ok(hexw(&[word_address(&[0x11; 20])]));
+        }
+        if to == game_of(7) {
+            self.foreign_calls.borrow_mut().push(hex::encode(&data[..4]));
+            bail!("execution reverted (a view of type 621 on a game of type 1)");
+        }
+        Ok(hexw(&[[0u8; 32]]))
+    }
+}
+
+/// FR-2: a game of another type than 621 is read as such — its type first, nothing of type 621 asked of it — and
+/// refused `OtherType`: never an error that stops the pass at that game for ever.
+#[test]
+fn a_game_of_another_type_is_refused_other_type_and_never_read_as_621() {
+    let l1 = ForeignGameL1 { foreign_calls: Default::default() };
+    let view = read_game(&l1, &BASE_SEPOLIA, 7, 1_000).expect("a game of another type is read, not an error");
+    assert_eq!((view.index, view.game_type, view.count_at_finalized), (7, 1, 10));
+    assert!(l1.foreign_calls.borrow().is_empty(), "nothing of type 621 asked of it: {:?}", l1.foreign_calls.borrow());
+    let domain = StatementDomain { network: [1; 32], l1_chain_id: 11_155_111, base_chain_id: 84_532, bridge: [2; 20] };
+    assert_eq!(judge(&view, &BASE_SEPOLIA, &[], &[], &domain), Err(Refusal::OtherType(1)));
+    // a game of type 621 is still read whole
+    assert_eq!(read_game(&l1, &BASE_SEPOLIA, 6, 1_000).unwrap().game_type, 621);
+}

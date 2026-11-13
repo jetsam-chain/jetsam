@@ -10,7 +10,7 @@
 use super::*;
 use crate::base_capture::{capture_at, capture_pass, load, prune};
 use crate::fast::throwaway_key;
-use crate::fast_release::{bridge_under, pack_group, VaultSlot};
+use crate::fast_release::{bridge_under, pack_group, select_free_vault_slots, VaultSlot};
 use jetsam_chain::consensus::destination::base_read::{decode_game_proof, output_root, decode_output_root_preimage};
 use jetsam_chain::consensus::destination::fast::verify_revocation;
 use jetsam_chain::consensus::vault::{decode_bridge_account_proof, decode_proof_nodes};
@@ -836,4 +836,415 @@ fn activ_the_passes_stop_at_a_refused_node_and_go_on_past_a_silent_one() {
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert!(lines[1].starts_with("ALERT FAST_RUN pass 1 failed after ") && lines[1].contains("tried again"), "{}", lines[1]);
     assert!(lines[3].starts_with("ALERT FAST_RUN pass 2") && lines[3].contains("base_return_height = 9999") && !lines[3].contains("tried again"), "{}", lines[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Audit n°2: FR-1, FR-2, FR-3, FR-4, FR-5
+// ---------------------------------------------------------------------------
+
+/// A record of the branch's fast lane.
+fn record(n: u64, owner: Address, amount: u64) -> FastPaid {
+    FastPaid { n, owner, amount, l2_block: B - 6_000, height: 9_100, contradicted: false }
+}
+
+/// The storage proof, under the synthetic world's bridge account, of the absence of `withdrawals[n]` for the first
+/// `n` from 90 whose path the world's nodes cover (found by trying their sequences: the trie is small).
+fn absent_slot(w: &World) -> (u64, Vec<Vec<u8>>) {
+    let account = read_account(w.preimage.state_root, &w.bridge.address, &w.account).expect("the bridge's account");
+    let mut nodes: Vec<Vec<u8>> = Vec::new();
+    for x in w.genesis.iter().chain(&w.withdrawal) {
+        if !nodes.contains(x) {
+            nodes.push(x.clone());
+        }
+    }
+    let root = nodes.iter().find(|x| keccak256(x) == account.storage_root).expect("the storage root's node").clone();
+    for n in 90..200u64 {
+        let slot = withdrawal_slot(n, w.bridge.withdrawals_slot);
+        let mut paths = vec![vec![root.clone()]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for p in &paths {
+                if read_storage_word(account.storage_root, &slot, p) == Ok([0u8; 32]) {
+                    return (n, p.clone());
+                }
+                for x in &nodes {
+                    let mut q = p.clone();
+                    q.push(x.clone());
+                    next.push(q);
+                }
+            }
+            paths = next;
+        }
+    }
+    panic!("no absence proof among the world's nodes");
+}
+
+/// Base's RPC of the captures (`LiveBase`) that also serves `withdrawals[absent]` (never burnt: an absence).
+struct AbsentToo {
+    live: LiveBase,
+    absent: u64,
+    proof: Vec<Vec<u8>>,
+    keys: Mutex<Vec<[u8; 32]>>,
+}
+
+impl BaseRpc for AbsentToo {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        if method != "eth_getProof" {
+            return self.live.rpc(method, params);
+        }
+        let slot = withdrawal_slot(self.absent, self.live.w.bridge.withdrawals_slot);
+        let keys: Vec<[u8; 32]> = params[1].as_array().unwrap().iter().map(|k| crate::base_capture::hex32_of(k.as_str().unwrap()).unwrap()).collect();
+        self.keys.lock().unwrap().extend(keys.iter().copied());
+        let mut asked = params.clone();
+        asked[1] = json!(keys.iter().filter(|k| **k != slot).map(|k| word_hex(k)).collect::<Vec<_>>());
+        let mut v = self.live.rpc(method, asked)?;
+        if keys.contains(&slot) {
+            v["storageProof"].as_array_mut().unwrap().push(json!({
+                "key": word_hex(&slot), "value": "0x0", "proof": self.proof.iter().map(|x| word_hex(x)).collect::<Vec<_>>()
+            }));
+        }
+        Ok(v)
+    }
+}
+
+/// FR-1: a fast record of an `n` this run never saw burnt (a stolen key and a lying Base: `(n, thief, amount)`) is
+/// alerted at the pass that reads it, without any proof; its slot is captured at the next tick (an absence), and that
+/// capture contradicts it.
+#[test]
+fn a_fast_record_of_an_n_never_seen_burnt_is_alerted_at_once_and_contradicted_as_absent() {
+    let w = world();
+    let (absent, proof) = absent_slot(&w);
+    let thief = record(absent, Address([0x7e; 32]), 50_000_000_000);
+    let honest = record(w.burn.n, w.burn.owner, w.burn.amount);
+    let mut burns = BTreeMap::new();
+    burns.insert(w.burn.n, BurnSeen { burn: w.burn, block: A - 10 });
+    // at once: the record never burnt is said; the honest one is not
+    let alerts = record_alerts(&[honest, thief], &burns);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains(&format!("n {absent}")) && alerts[0].contains("never seen burnt"), "{alerts:?}");
+    // a record of a burn seen, to another owner or of another amount: said too
+    let other = record(w.burn.n, Address([0x7e; 32]), w.burn.amount);
+    assert_eq!(record_alerts(&[other], &burns).len(), 1);
+    assert_eq!(record_alerts(&[record(w.burn.n, w.burn.owner, w.burn.amount + 1)], &burns).len(), 1);
+    // watched: the next tick captures its slot
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let mut s = RunState { scanned_to: Some(A + 1_000), proposal_anchor: Some(A), burns, ..RunState::default() };
+    watch_records(&mut s, &[honest, thief]);
+    assert_eq!(s.watched, BTreeSet::from([absent]));
+    assert!(capture_ns(&s).contains(&absent) && capture_ns(&s).contains(&w.burn.n));
+    let base = AbsentToo { live: LiveBase::new(A + 150, u64::MAX / 8, 200, 0), absent, proof, keys: Mutex::new(Vec::new()) };
+    let state = Mutex::new(s);
+    let report = capture_tick(&base, &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
+    assert_eq!(report.capture.captured, vec![A]);
+    assert!(base.keys.lock().unwrap().contains(&withdrawal_slot(absent, w.bridge.withdrawals_slot)));
+    // under a valid game of that block: the absence contradicts the record
+    let capture = load(&captures, A).unwrap().unwrap();
+    let game = ValidGame { game: [0xaa; 20], l2_block_number: A, root_claim: output_root(&w.preimage) };
+    let (_, _, c) = contradiction_under(&game, &capture, &thief, &w.bridge).expect("reads").expect("a contradiction");
+    assert_eq!(c.n, absent);
+    assert_eq!(contradiction_under(&game, &capture, &honest, &w.bridge), Ok(None));
+}
+
+/// Base RPC that serves `eth_getStorageAt` of the bridge from `words` (zero when absent), or fails.
+struct Words {
+    words: BTreeMap<[u8; 32], [u8; 32]>,
+    fails: bool,
+}
+
+impl BaseRpc for Words {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        assert_eq!(method, "eth_getStorageAt");
+        if self.fails {
+            bail!("429 Too Many Requests");
+        }
+        assert_eq!(params[2], json!("latest"));
+        let slot = crate::base_capture::hex32_of(params[1].as_str().unwrap()).unwrap();
+        Ok(json!(word_hex(&self.words.get(&slot).copied().unwrap_or([0u8; 32]))))
+    }
+}
+
+/// FR-1: each open fast record's word as two Base RPCs serve it now: another word than the one paid (an `n` never
+/// burnt: zero) is said at once, by each RPC; the record Base holds is not; an RPC that fails is said.
+#[test]
+fn a_fast_record_base_does_not_hold_is_alerted_from_each_base_rpc() {
+    let w = world();
+    let slot = withdrawal_slot(w.burn.n, w.bridge.withdrawals_slot);
+    let words = BTreeMap::from([(slot, withdrawal_commitment(&w.burn.owner.0, w.burn.amount))]);
+    let (a, b) = (Words { words: words.clone(), fails: false }, Words { words, fails: false });
+    let honest = record(w.burn.n, w.burn.owner, w.burn.amount);
+    let thief = record(99, Address([0x7e; 32]), 5);
+    let bases: [(&str, &dyn BaseRpc); 2] = [("a", &a), ("b", &b)];
+    assert!(base_word_alerts(&bases, &w.bridge, &[honest]).is_empty());
+    let alerts = base_word_alerts(&bases, &w.bridge, &[honest, thief]);
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(alerts.iter().all(|x| x.contains("n 99")), "{alerts:?}");
+    let down = Words { words: BTreeMap::new(), fails: true };
+    let alerts = base_word_alerts(&[("a", &a), ("down", &down)], &w.bridge, &[honest]);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("down"), "{alerts:?}");
+}
+
+/// FR-1: a contradiction handed in and not shown by the branch (lost by the mempool, a restart) is handed in again
+/// `CONTRADICTION_RESEND_SECS` later, and again, until the branch shows it.
+#[test]
+fn a_contradiction_admitted_but_not_mined_is_handed_in_again() {
+    let mut s = RunState::default();
+    assert!(contradiction_due(&s, 99, 1_000));
+    contradiction_handed_in(&mut s, 99, 1_000);
+    assert!(!contradiction_due(&s, 99, 1_000 + CONTRADICTION_RESEND_SECS - 1));
+    assert!(contradiction_due(&s, 99, 1_000 + CONTRADICTION_RESEND_SECS));
+    contradiction_handed_in(&mut s, 99, 1_000 + CONTRADICTION_RESEND_SECS);
+    assert_eq!(s.contradiction_tries[&99], (1_000 + CONTRADICTION_RESEND_SECS, 2));
+    assert!(contradiction_due(&s, 99, 1_000 + 10 * CONTRADICTION_RESEND_SECS), "no bound: the fuse is tried until it blows");
+    // a state of the older runs (a contradiction sent, no time): handed in again at once
+    let mut old = RunState::default();
+    old.contradicted.insert(7);
+    assert!(contradiction_due(&old, 7, 5));
+}
+
+/// FR-2: a game whose reading fails pass after pass is skipped at its `GAME_READ_TRIES`-th failure in a row (a burn
+/// it would pay is paid under the next game); a failure on another game counts from one again.
+#[test]
+fn a_game_that_fails_pass_after_pass_is_skipped_after_its_tries() {
+    let mut s = RunState::default();
+    for _ in 1..GAME_READ_TRIES {
+        assert!(!game_read_failed(&mut s, 7));
+    }
+    assert!(game_read_failed(&mut s, 7));
+    assert_eq!(s.game_failures, None, "skipped: its count is cleared");
+    assert!(!game_read_failed(&mut s, 8));
+    assert!(!game_read_failed(&mut s, 9));
+    assert_eq!(s.game_failures, Some((9, 1)));
+}
+
+fn slot(i: u32, amount: u64) -> VaultSlot {
+    VaultSlot { slot_index: i, amount, creation_id: 1_000 + u64::from(i) }
+}
+
+/// FR-3: two burns under the same game: the second release's group never takes the slots of the first (in flight),
+/// nor of a slow release the journal holds; each picks the largest free slots.
+#[test]
+fn two_burns_under_one_game_take_disjoint_vault_slots() {
+    let vault = [slot(1, 100), slot(2, 60)];
+    let mut s = RunState::default();
+    let first = select_free_vault_slots(&vault, 0, 10, &fast_held_slots(&s, 10)).unwrap();
+    assert_eq!(first, vec![slot(1, 100)]);
+    fast_handed_in(&mut s, 10, 1_000, first.iter().map(|x| x.slot_index).collect());
+    let held = fast_held_slots(&s, 20);
+    assert_eq!(held, BTreeSet::from([1]));
+    let second = select_free_vault_slots(&vault, 0, 20, &held).unwrap();
+    assert_eq!(second, vec![slot(2, 60)]);
+    // its own slots are not held from itself (a release handed in again may spend them again)
+    assert!(fast_held_slots(&s, 10).is_empty());
+    // once paid, a release holds nothing
+    s.paid.insert(10);
+    assert!(fast_held_slots(&s, 20).is_empty());
+    // nothing free covers it: none
+    assert_eq!(select_free_vault_slots(&vault, 0, 70, &BTreeSet::from([1])), None);
+}
+
+/// FR-3: a fast release admitted and still not paid (its slots spent by another, the mempool lost it) is handed in
+/// again `FAST_RESEND_SECS` after, `FAST_MAX_SENDS` times at most, then given up once (alerted); a paid one never.
+#[test]
+fn a_fast_release_admitted_and_still_unpaid_is_sent_again() {
+    let mut s = RunState::default();
+    assert_eq!(fast_release_due(&s, 4, 1_000), FastDue::Send);
+    fast_handed_in(&mut s, 4, 1_000, vec![1]);
+    assert_eq!(fast_release_due(&s, 4, 1_000 + FAST_RESEND_SECS - 1), FastDue::Wait);
+    assert_eq!(fast_release_due(&s, 4, 1_000 + FAST_RESEND_SECS), FastDue::Send);
+    let mut at = 1_000;
+    for _ in 1..FAST_MAX_SENDS {
+        at += FAST_RESEND_SECS;
+        fast_handed_in(&mut s, 4, at, vec![2]);
+    }
+    assert_eq!(s.sent[&4], 1_000, "the first time is kept: the slow lane's grace counts from it");
+    assert_eq!(fast_release_due(&s, 4, at + FAST_RESEND_SECS), FastDue::GiveUp);
+    // paid: never handed in again
+    s.paid.insert(5);
+    assert_eq!(fast_release_due(&s, 5, 9_999_999), FastDue::Wait);
+    // a state of the older runs (sent, no tries): handed in once at that time
+    let mut old = RunState::default();
+    old.sent.insert(6, 1_000);
+    assert_eq!(fast_release_due(&old, 6, 1_001), FastDue::Wait);
+    assert_eq!(fast_release_due(&old, 6, 1_000 + FAST_RESEND_SECS), FastDue::Send);
+}
+
+/// A log endpoint `lag` blocks behind the head the RPC answers: the burn's log is not served until the head is
+/// `lag` above it.
+struct LateLogs {
+    live: LiveBase,
+    lag: u64,
+}
+
+impl BaseRpc for LateLogs {
+    fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        if method == "eth_getLogs" && self.live.burn_block + self.lag > self.live.head() {
+            return Ok(json!([]));
+        }
+        self.live.rpc(method, params)
+    }
+}
+
+/// FR-4: the log endpoint is 3 blocks behind the head that `eth_blockNumber` gave: the burn of block H−1 is not
+/// served at the tick of head H; a later tick still sees it.
+#[test]
+fn a_burn_the_log_endpoint_served_late_is_still_seen() {
+    let w = world();
+    let h = A + 500;
+    let base = LateLogs { live: LiveBase::new(h, u64::MAX / 8, 200, h - 1), lag: 3 };
+    let dir = tempfile::tempdir().unwrap();
+    let state = Mutex::new(RunState { scanned_to: Some(h - 100), ..RunState::default() });
+    let file = dir.path().join("fast_run.json");
+    let first = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
+    assert!(first.burns.is_empty());
+    base.live.h0.store(h + 10, std::sync::atomic::Ordering::SeqCst);
+    let second = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
+    assert_eq!(second.burns.iter().map(|b| b.burn.n).collect::<Vec<_>>(), vec![w.burn.n]);
+    assert!(BURN_RESCAN_BLOCKS >= 300, "30 minutes of Base at least");
+    // seen once only: a third tick does not report it again
+    assert!(capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap().burns.is_empty());
+}
+
+/// FR-4: a hole in the burn indices (counted from 1) is said.
+#[test]
+fn a_hole_in_the_burn_indices_is_said() {
+    let w = world();
+    let seen = |ns: &[u64]| ns.iter().map(|n| (*n, BurnSeen { burn: Burn { n: *n, ..w.burn }, block: 1 })).collect::<BTreeMap<_, _>>();
+    assert_eq!(burn_gaps(&seen(&[1, 2, 4, 7])), vec![3, 5, 6]);
+    assert!(burn_gaps(&seen(&[1, 2, 3])).is_empty());
+    assert!(burn_gaps(&seen(&[])).is_empty());
+    assert_eq!(burn_gaps(&seen(&[2])), vec![1]);
+}
+
+/// FR-5: a fast record Base's final state confirmed is settled: its slot is no longer captured; the captures are kept
+/// two weeks (a game final in ≈ 121 h whose resolution is late still finds its block's capture).
+#[test]
+fn a_settled_record_is_no_longer_captured_and_captures_are_kept_two_weeks() {
+    let w = world();
+    let mut s = RunState::default();
+    for n in 1..=3 {
+        s.burns.insert(n, BurnSeen { burn: Burn { n, ..w.burn }, block: 1 });
+    }
+    s.watched.insert(9);
+    s.settled.insert(2);
+    assert_eq!(capture_ns(&s), vec![1, 3, 9]);
+    assert!(crate::base_capture::KEEP_SECONDS >= 14 * 86_400);
+}
+
+/// The new memories (FR-1, FR-2, FR-3, FR-5) are kept across a restart; a file of the older runs loads with none.
+#[test]
+fn the_run_remembers_its_tries_watches_and_settled_records_across_a_restart() {
+    let mut state = RunState::default();
+    state.game_failures = Some((30_070, 2));
+    fast_handed_in(&mut state, 4, 1_000, vec![1, 5]);
+    state.paid.insert(3);
+    state.watched.insert(99);
+    contradiction_handed_in(&mut state, 99, 2_000);
+    state.settled.insert(1);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fast_run.json");
+    state.store(&path).unwrap();
+    assert_eq!(RunState::load(&path).unwrap(), state);
+    std::fs::write(&path, br#"{"scanned_to": 5, "burns": [], "sent": [[4, 7]], "contradicted": [9]}"#).unwrap();
+    let old = RunState::load(&path).unwrap();
+    assert_eq!((old.sent.len(), old.contradicted.len(), old.fast_tries.len(), old.game_failures), (1, 1, 0, None));
+}
+
+/// The node a revocation is handed to: it pays the marker (its wallet) and records what it was handed.
+struct RevokeNode {
+    submitted: std::cell::RefCell<Vec<Vec<u8>>>,
+}
+
+impl crate::light_feed::FeedNode for RevokeNode {
+    fn committees(&self) -> anyhow::Result<(Option<u64>, Vec<u64>)> {
+        unreachable!("a revocation reads no committee")
+    }
+    fn pay_marker(&self, marker: &[u8; 32]) -> anyhow::Result<jetsam_tx::PagedSpendIntent> {
+        Ok(payment_carrying(Address(*marker)))
+    }
+    fn submit(&self, intent: &[u8]) -> anyhow::Result<Value> {
+        self.submitted.borrow_mut().push(intent.to_vec());
+        Ok(json!({"admitted": true}))
+    }
+}
+
+/// FR-6: the cold key signs the revocation once, offline (no node); the file is later handed in by a node's wallet
+/// without the cold key; a file of another key, network or signature is refused; a dry run writes it and sends nothing.
+#[test]
+fn a_revocation_signed_offline_is_sent_without_the_cold_key() {
+    let (cold, cold_public) = throwaway_key("cold").unwrap();
+    let (_, relay) = throwaway_key("relay").unwrap();
+    let text = signed_revocation_text(&revocation_of(&cold, relay));
+    drop(cold);
+    let revocation = load_signed_revocation(&text, Some(relay), Some(&cold_public)).expect("the signed file");
+    assert_eq!(revocation.key, relay);
+    let node = RevokeNode { submitted: Default::default() };
+    hand_in_revocation(&node, &revocation, None).expect("handed in");
+    let sent = node.submitted.borrow().clone();
+    assert_eq!(sent.len(), 1);
+    let DestinationIntent::FastRevocation(intent) = DestinationIntent::decode_with(&sent[0], true).expect("decodes") else {
+        panic!("a revocation");
+    };
+    assert_eq!(intent.payload, revocation.encode_payload());
+    // refused: another relay key, another cold key, a bad signature, not a revocation, no key in the build
+    let (_, other) = throwaway_key("other").unwrap();
+    assert!(load_signed_revocation(&text, Some(other), Some(&cold_public)).is_err());
+    assert!(load_signed_revocation(&text, Some(relay), Some(&other)).is_err());
+    let mut bad = hex::decode(&text).unwrap();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert!(load_signed_revocation(&hex::encode(&bad), Some(relay), Some(&cold_public)).is_err());
+    assert!(load_signed_revocation("00ff", Some(relay), Some(&cold_public)).is_err());
+    assert!(load_signed_revocation(&text, None, Some(&cold_public)).is_err());
+    // a dry run: written, not sent
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("revocation.hex");
+    let node = RevokeNode { submitted: Default::default() };
+    hand_in_revocation(&node, &revocation, Some(&out)).unwrap();
+    assert!(node.submitted.borrow().is_empty());
+    assert!(DestinationIntent::decode_with(&hex::decode(std::fs::read_to_string(&out).unwrap().trim()).unwrap(), true).is_ok());
+}
+
+/// FR-7: fast-run refuses fewer than two Base RPCs, the same one twice (also with a trailing slash or another case),
+/// and one on another chain; two distinct ones of the chain are taken.
+#[test]
+fn fast_run_refuses_one_base_rpc_the_same_url_twice_and_a_wrong_chain_id() {
+    let chain = |url: &str| -> anyhow::Result<u64> {
+        match url {
+            u if u.contains("mainnet") => Ok(8_453),
+            u if u.contains("down") => bail!("connection refused"),
+            _ => Ok(84_532),
+        }
+    };
+    let urls = |list: &[&str]| list.iter().map(|u| u.to_string()).collect::<Vec<_>>();
+    assert_eq!(check_base_rpcs(&urls(&["http://127.0.0.1:8550", "http://127.0.0.1:8551"]), &chain, 84_532).unwrap(), Vec::<String>::new());
+    for (list, why) in [
+        (urls(&["http://127.0.0.1:8550"]), "one"),
+        (urls(&["http://127.0.0.1:8550", "http://127.0.0.1:8550"]), "twice"),
+        (urls(&["http://127.0.0.1:8550", "HTTP://127.0.0.1:8550/"]), "twice"),
+        (urls(&["http://127.0.0.1:8550", "http://mainnet.example"]), "chain"),
+    ] {
+        let e = check_base_rpcs(&list, &chain, 84_532).expect_err(why).to_string();
+        assert!(e.to_lowercase().contains(why), "{why}: {e}");
+    }
+    // silent at the start (as a silent node): no refusal, but returned: no root is read from it before it says its chain
+    assert_eq!(check_base_rpcs(&urls(&["http://127.0.0.1:8550", "http://down.example"]), &chain, 84_532).unwrap(), vec!["http://down.example".to_string()]);
+    assert_eq!(base_chain(Ok(84_532), 84_532).unwrap(), true);
+    assert_eq!(base_chain(Err(anyhow!("timeout")), 84_532).unwrap(), false);
+    assert!(base_chain(Ok(8_453), 84_532).is_err());
+}
+
+/// FR-8: a second fast-run on the same state directory does not start while the first holds it; once the first ends,
+/// one may.
+#[test]
+fn a_second_fast_run_on_the_same_state_dir_does_not_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = lock_fast_run_dir(dir.path()).expect("the first");
+    let e = lock_fast_run_dir(dir.path()).expect_err("a second on the same state").to_string();
+    assert!(e.contains("fast_run.lock"), "{e}");
+    // another directory is another run
+    assert!(lock_fast_run_dir(&dir.path().join("other")).is_ok());
+    drop(first);
+    assert!(lock_fast_run_dir(dir.path()).is_ok());
 }

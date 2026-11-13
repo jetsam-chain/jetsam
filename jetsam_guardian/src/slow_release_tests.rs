@@ -373,6 +373,7 @@ impl Run {
             now,
             &dummy_proof,
             &mut report,
+            &BTreeSet::new(),
         )?;
         Ok(report)
     }
@@ -1069,6 +1070,7 @@ fn a_journal_that_cannot_be_written_hands_nothing_in() {
         T,
         &dummy_proof,
         &mut report,
+        &BTreeSet::new(),
     );
     assert!(passed.is_err());
     assert!(run.node.submitted.borrow().is_empty());
@@ -1155,6 +1157,7 @@ fn a_payment_that_is_not_the_checked_group_is_never_handed_in() {
         T,
         &tampered,
         &mut report,
+        &BTreeSet::new(),
     )
     .expect("pass");
     assert_eq!(report.refused.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![3]);

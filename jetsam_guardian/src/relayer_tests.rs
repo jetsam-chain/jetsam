@@ -1529,3 +1529,105 @@ fn relfix2_a_copy_larger_than_four_of_the_largest_blocks_is_never_kept() {
     huge.truncate(UNREADABLE_COPY_MAX_BYTES);
     assert!(ar.keep_unreadable(F + 1, &id, &[("n0 getBlock".into(), huge)], "BadMarker").unwrap());
 }
+
+// ---------------------------------------------------------------- M5-2 (audit n°2): the point the contract would take
+
+/// The real headers 9200..=9246 of the test chain (11/11, read from a node), the chain from 9200 up to the newest
+/// header dated at or before `upto` (what the relayer held then); the bridge genesis's locked height of this chain
+/// is its first header, 9200.
+fn chain_of_11_11(upto: u64) -> Chain {
+    let text = include_str!("../tests/fixtures/mn5-2026-11-11-headers-9200-9246.txt");
+    let mut lines = text.lines().map(|l| {
+        let (h, raw) = l.split_once(' ').unwrap();
+        let x = crate::chain::HeaderInfo::from_hex(raw).unwrap();
+        assert_eq!(x.height, h.parse::<u64>().unwrap());
+        x
+    });
+    let mut c = Chain::from_genesis(lines.next().unwrap());
+    for x in lines.filter(|x| x.timestamp <= upto) {
+        c.extend(x).unwrap();
+    }
+    c
+}
+
+/// 11/11 09:12:05 UTC: the contract's tip is the point of T = 9220 (no deposit), its MN-5 base.
+const B11: u64 = 9_220;
+const GL11: u64 = 9_200;
+
+fn tip_of_11_11(c: &Chain) -> ([u8; 32], HashMap<[u8; 32], Known>) {
+    let cp = honest(c, GL11, B11, &[]).unwrap();
+    let k = Known { cp, parent: [0u8; 32], accepted_at: ts(c, B11) + 300, headers: Known::context_from(&cp, c), ours: true, omitted: Some(Vec::new()), deposit_blocks: Some(Vec::new()) };
+    (cp.id(), HashMap::from([(cp.id(), k)]))
+}
+
+fn plan_11_11(c: &Chain, at: u64) -> Result<Submission, NoSubmission> {
+    let (tip, known) = tip_of_11_11(c);
+    let cum = known[&tip].cp.cum_work;
+    plan(c, &known, &tip, &cum, GL11, &BTreeMap::new(), &[], at)
+}
+
+/// M5-2: at 10:14:57 UTC (block 9233) the contract would take a point until 10:18:14 (197 s of margin). A relayer
+/// that judges MN-5 at "now + its measured proof (30 s) + inclusion" plans it; with `timeout_secs` (480 s) instead
+/// of the measure, it refused itself (what R1 and R2 did from 10:12 to 10:53).
+#[test]
+fn the_point_the_contract_would_take_is_planned() {
+    let now = 1_794_392_097; // 10:14:57 UTC, the timestamp of block 9233
+    let c = chain_of_11_11(now);
+    assert_eq!(c.tip_height(), 9_233);
+    let at = mn5_planned_at(now, 480, Some(30));
+    assert_eq!(at, now + 30 + INCLUSION_SECS);
+    let s = plan_11_11(&c, at).expect("the point the contract takes is planned");
+    assert_eq!((s.base, s.next.height), (B11, 9_233));
+    // before any measure: timeout_secs, as before (a safe start), and the measure never above timeout_secs
+    assert_eq!(mn5_planned_at(now, 480, None), now + 480 + INCLUSION_SECS);
+    assert_eq!(plan_11_11(&c, mn5_planned_at(now, 480, None)), Err(NoSubmission::WorkRateTooLow));
+    assert_eq!(mn5_planned_at(now, 30, Some(1_000)), now + 30 + INCLUSION_SECS);
+}
+
+/// M5-2: the exact deadline of that point, `forkBaseTimestamp + segmentWork × 1 800 / (4 × forkBaseWork)`:
+/// 10:18:14 UTC, the last second MN-5 holds; before the 1 800 s MN-5 waits, those 1 800 s.
+#[test]
+fn the_deadline_is_the_last_second_the_contract_takes_the_point() {
+    let now = 1_794_392_097;
+    let c = chain_of_11_11(now);
+    let s = plan_11_11(&c, now).unwrap();
+    let d = mn5_deadline(&s.mn);
+    assert_eq!(d, ts(&c, B11) + 3_969);
+    assert_eq!(d, 1_794_392_294);
+    assert!(mn5_ok(&s.mn, d) && !mn5_ok(&s.mn, d + 1));
+    // a point sent at its deadline is taken; one second later it is not: sent while the deadline is not passed
+    assert!(now + 90 <= d && d - now == 197);
+    // a segment too light for 1 800 s: the deadline is the end of MN-5's grace
+    let mut light = s.mn;
+    light.segment_work = u256::to_be(&u256::from_u64(1));
+    assert_eq!(mn5_deadline(&light), light.fork_base_timestamp + MN5_MIN_ELAPSED - 1);
+    assert!(mn5_ok(&light, mn5_deadline(&light)) && !mn5_ok(&light, mn5_deadline(&light) + 1));
+}
+
+/// M5-2: the point planned at 10:14:57 has a margin of ≈ 1.03 at its landing: alerted (below 1.5), where the relayer
+/// only alerted after 45 minutes without a point; a margin of 1.5 or more is not alerted.
+#[test]
+fn a_mn5_margin_under_one_and_a_half_is_alerted() {
+    let now = 1_794_392_097;
+    let c = chain_of_11_11(now);
+    let at = now + 90;
+    let s = plan_11_11(&c, at).unwrap();
+    assert!(mn5_margin_low(&s.mn, at));
+    // segmentWork = forkBaseWork × k: the margin is k × 1 800 / (4 × elapsed)
+    let elapsed = at - s.mn.fork_base_timestamp;
+    let base = u256::from_be(&s.mn.fork_base_work);
+    let with = |k: u64| {
+        let mut m = s.mn;
+        let mut w = [0u8; 32];
+        for _ in 0..k {
+            w = u256::add(&w, &base);
+        }
+        m.segment_work = u256::to_be(&w);
+        m
+    };
+    // the smallest k whose margin is at least 1.5: k × 1 800 ≥ 6 × elapsed
+    let k = (6 * elapsed).div_ceil(1_800);
+    assert!(!mn5_margin_low(&with(k), at));
+    assert!(mn5_margin_low(&with(k - 1), at));
+    assert!(!mn5_margin_low(&with(4 * k), at));
+}
