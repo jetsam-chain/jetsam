@@ -53,6 +53,22 @@ fn json_rpc_error_is_an_error() {
     assert!(e.to_string().contains("nope"));
 }
 
+#[test]
+fn json_rpc_error_keeps_the_revert_data() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = s.read(&mut buf).unwrap();
+        // a node's answer to an eth_call that reverts with a custom error: its message names no error, its data does
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted","data":"0x09bde339"}}"#;
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let e = call(&format!("http://127.0.0.1:{port}"), "eth_call", json!([]), Duration::from_secs(5)).unwrap_err().to_string();
+    assert_eq!(e, "eth_call: execution reverted (data 0x09bde339)");
+}
+
 // ---- A4-1 / D60: onion-only egress ----
 
 /// A syntactically valid v3 onion name (56 base32 characters), TEST only.

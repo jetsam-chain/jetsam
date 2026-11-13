@@ -938,3 +938,49 @@ fn activ_fast_run_does_not_start_beside_a_node_whose_activations_are_not_its_bui
     assert_eq!(code, Some(1), "{log}");
     assert!(log.contains(&format!("node {good}: its activations are this build's")) && log.contains("FAST_RELEASE_KEY"), "{log}");
 }
+
+/// RET24 SLOW: `fast-run` takes its relay key or `--no-fast` (the slow lane without the fast one: a build without
+/// FAST_RELEASE_KEY, or a key the branch closed), never both nor neither; `--slow-release` is `off`, `dry-run` (the
+/// default: nothing is sent) or `send`, said at the start. Nodes, Base, the L1 and the beacon closed: one pass, which
+/// fails at its first read (`--once`), nothing sent.
+#[test]
+fn slow_fast_run_takes_a_key_or_no_fast_and_says_its_slow_mode() {
+    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    if rules.bridge.is_none() {
+        eprintln!("SKIPPED: this build has no bridge on Base, fast-run does not start");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("relay-fast.secret");
+    let out = Command::new(env!("CARGO_BIN_EXE_jg-relay")).args(["fast-keygen", "--out"]).arg(&key).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let fast_run = |extra: &[&str]| -> (Option<i32>, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_jg-relay"))
+            .arg("fast-run")
+            .args(extra)
+            .args(["--l1", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9"])
+            .args(["--beacon", "http://127.0.0.1:9", "--node", "http://127.0.0.1:9", "--node-cookie"])
+            .arg(root.path().join("rpc.cookie"))
+            .arg("--state-dir")
+            .arg(root.path().join("fast"))
+            .args(["--from-block", "1", "--once"])
+            .output()
+            .unwrap();
+        (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let key = key.to_str().unwrap();
+    for (label, extra) in [("neither", vec![]), ("both", vec!["--key", key, "--no-fast"])] {
+        let (code, log) = fast_run(&extra);
+        assert_eq!(code, Some(1), "{label}: {log}");
+        assert!(log.contains("(--key <relay secret> | --no-fast)"), "{label}: the usage: {log}");
+    }
+    let (code, log) = fast_run(&["--no-fast", "--slow-release", "maybe"]);
+    assert_eq!(code, Some(1), "{log}");
+    assert!(log.contains("off, dry-run or send"), "{log}");
+    for (extra, mode) in [(vec!["--no-fast"], "DryRun"), (vec!["--no-fast", "--slow-release", "send"], "Send")] {
+        let (code, log) = fast_run(&extra);
+        assert_eq!(code, Some(0), "{log}");
+        assert!(log.contains("the fast lane is off (--no-fast)") && log.contains(&format!("slow releases: {mode}")), "{log}");
+        assert!(log.contains("ALERT FAST_RUN pass 1 failed") && !log.contains("SENT"), "{log}");
+    }
+}

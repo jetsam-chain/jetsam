@@ -1416,3 +1416,501 @@ mod fast_lane {
         assert_eq!(without.releases.len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// D130 (RET24 NODEGAP): the `n` a contradiction reopens, through the template
+// and the block rule
+// ---------------------------------------------------------------------------
+
+/// The template and `validate_block_destination` on one world: the synthetic
+/// signed L1 and Base of `jetsam_mempool`'s tests (`l1_synthetic.txt`,
+/// `base_synthetic.txt`: test keys only; a game Base holds valid at its L1
+/// time, the bridge holding `withdrawals[3]` = `(3, OWNER, 5 JTM)` under the
+/// Base root it claims).
+mod reopened {
+    use super::*;
+    use jetsam_chain::block::Block;
+    use jetsam_chain::block_header::BlockHeader;
+    use jetsam_chain::consensus::destination::advance::AdvanceRules;
+    use jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA;
+    use jetsam_chain::consensus::destination::fast::{
+        fast_release_marker, FastAttestation, FastLaneRules, FastRecord, FastStatement,
+    };
+    use jetsam_chain::consensus::destination::forks::{L1_MAINNET, L1_SEPOLIA};
+    use jetsam_chain::consensus::destination::l1_read::L1BridgeParams;
+    use jetsam_chain::consensus::destination::state::{
+        validate_block_destination, BaseReturnRules, CommitteeKeyCache, DestinationEffect,
+    };
+    use jetsam_chain::consensus::vault::{decode_proof_nodes, VaultRules};
+    use jetsam_mempool::destination::BaseReleaseProofs;
+    use jetsam_tx::Transaction;
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/../jetsam_mempool/src/destination/testdata/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture")
+    }
+
+    fn field(text: &str, key: &str) -> String {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("fixture field {key}"))
+            .to_string()
+    }
+
+    fn bytes(text: &str, key: &str) -> Vec<u8> {
+        hex::decode(field(text, key)).expect("hex")
+    }
+
+    /// The v1.7 height of this world, the return over Base's, the floor.
+    const VJ: u64 = 69_120;
+    const H: u64 = VJ + 1_450;
+    const FLOOR: u64 = 10;
+    /// The L2 block of the fast releases of this world.
+    const L2: u64 = 56_993_063;
+
+    struct World {
+        rules: DestinationRules,
+        keys: CommitteeKeyCache,
+        committee: CommitteeRef,
+        /// Base's final state: `withdrawals[3]`.
+        burn: VaultRelease,
+        finality: Vec<u8>,
+        account_proof: Vec<u8>,
+        base: BaseReleaseProofs,
+    }
+
+    fn world() -> World {
+        let (l1, base) = (fixture("l1_synthetic.txt"), fixture("base_synthetic.txt"));
+        let anchor = L1Anchor {
+            period: field(&l1, "anchor_period").parse().unwrap(),
+            committee_root: bytes(&l1, "anchor_root").try_into().unwrap(),
+        };
+        let mut keys = CommitteeKeyCache::default();
+        assert_eq!(
+            keys.insert_update_payload(&bytes(&l1, "anchor_update")).unwrap(),
+            anchor.committee_root
+        );
+        let vault = VaultRules {
+            activation_height: Some(VJ),
+            deposits_from_height: Some(VJ + 1_440),
+            legacy: None,
+            ..VaultRules::current()
+        };
+        let storage = bytes(&base, "storage_proof");
+        World {
+            rules: DestinationRules {
+                activation_height: Some(VJ),
+                network: L1_SEPOLIA,
+                anchor: Some(anchor),
+                bridge: Some(L1BridgeParams {
+                    address: bytes(&l1, "bridge_address").try_into().unwrap(),
+                    code_hash: bytes(&l1, "bridge_code_hash").try_into().unwrap(),
+                    withdrawals_slot: field(&l1, "bridge_withdrawals_slot").parse().unwrap(),
+                    genesis_id_slot: field(&l1, "bridge_genesis_id_slot").parse().unwrap(),
+                    genesis_id: bytes(&l1, "bridge_genesis_id").try_into().unwrap(),
+                }),
+                vault,
+                base_return: BaseReturnRules {
+                    activation_height: Some(H),
+                    network: L1_MAINNET,
+                    base: BASE_SEPOLIA,
+                    advance: AdvanceRules::CONSENSUS,
+                    fast: FastLaneRules::CONSENSUS,
+                    anchor: None,
+                    bridge: None,
+                },
+            },
+            keys,
+            committee: CommitteeRef {
+                period: anchor.period,
+                root: anchor.committee_root,
+            },
+            burn: VaultRelease {
+                n: field(&base, "release_n").parse().unwrap(),
+                owner: Address(bytes(&base, "release_owner").try_into().unwrap()),
+                amount: field(&base, "release_amount").parse().unwrap(),
+                storage_proof: decode_proof_nodes(&mut storage.as_slice()).expect("storage"),
+            },
+            finality: bytes(&base, "finality"),
+            account_proof: bytes(&base, "account_proof"),
+            base: BaseReleaseProofs {
+                game_proof: bytes(&base, "game_proof"),
+                output_preimage: bytes(&base, "output_preimage"),
+            },
+        }
+    }
+
+    /// The record of a fast release of 3 that paid `(owner, amount)`.
+    fn fast_record(owner: Address, amount: u64, contradicted: bool, consumed: bool) -> FastRecord {
+        FastRecord {
+            owner,
+            amount,
+            l2_block: L2,
+            height: H + 1,
+            contradicted,
+            consumed,
+        }
+    }
+
+    fn header(height: u64) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            tx_root: [0u8; 32],
+            timestamp: height,
+            height,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            difficulty_target: jetsam_chain::consensus::params::GENESIS_TARGET,
+            log_slots: 24,
+            active_slot_count: 1_000,
+            alloc_counter: 0,
+        }
+    }
+
+    fn coinbase() -> Transaction {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 15_000_000,
+            amount: 1,
+            owner: Address([9u8; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    impl World {
+        /// A branch at `H + 5` that knows the anchor committee, has paid
+        /// `paid`, and whose fast lane holds `records`.
+        fn parent(&self, paid: &[u64], records: &[(u64, FastRecord)]) -> DestinationState {
+            let mut state = DestinationState::at_v1_7(VJ, FLOOR);
+            state.tip = H + 5;
+            state.committees = vec![self.committee];
+            state.bridge_locked = 1_000 * MICRO_PER_JTM;
+            for n in paid {
+                state.released.insert(*n);
+            }
+            for (n, record) in records {
+                state.fast.records.insert(*n, *record);
+            }
+            state
+        }
+
+        /// The slow release over Base of Base's burn of 3, its group paying
+        /// its owner (V2: no advance).
+        fn slow(&self) -> ReleaseIntent {
+            let r = &self.burn;
+            ReleaseIntent {
+                payment: page(
+                    VAULT_ADDRESS,
+                    1_000,
+                    &[(r.owner, r.amount - RELEASE_FEE_MICRO), (r.marker(), 0)],
+                    RELEASE_FEE_MICRO,
+                ),
+                release: r.clone(),
+                finality: self.finality.clone(),
+                account_proof: self.account_proof.clone(),
+                base: Some(self.base.clone()),
+                fast: None,
+            }
+        }
+
+        /// The same burn by the fast lane: an attestation that decodes (its
+        /// key and signature are judged after the paid set), its group
+        /// carrying the fast lane's marker.
+        fn fast(&self) -> ReleaseIntent {
+            let r = &self.burn;
+            let statement = FastStatement {
+                network: [0x4e; 32],
+                l1_chain_id: 1,
+                base_chain_id: 8_453,
+                bridge: [0x1b; 20],
+                game: [0x5e; 20],
+                l2_block: L2,
+                root_claim: [0x7b; 32],
+            };
+            ReleaseIntent {
+                payment: page(
+                    VAULT_ADDRESS,
+                    1_000,
+                    &[
+                        (r.owner, r.amount - RELEASE_FEE_MICRO),
+                        (fast_release_marker(r.n, &r.owner, r.amount, L2), 0),
+                    ],
+                    RELEASE_FEE_MICRO,
+                ),
+                fast: Some(
+                    FastAttestation {
+                        statement,
+                        signature: [0; 96],
+                    }
+                    .encode_payload(),
+                ),
+                ..self.slow()
+            }
+        }
+
+        /// What the template offers of `releases` on `state`.
+        fn plan(&self, state: &DestinationState, releases: Vec<ReleaseIntent>) -> DestinationOffer {
+            plan_destination_offer_with(
+                state,
+                &self.rules,
+                state.tip + 1,
+                Vec::new(),
+                releases,
+                Vec::new(),
+                None,
+                &|anchor| *anchor == ANCHOR,
+                0,
+            )
+        }
+
+        /// The block after `state` carrying `offer` as the template makes
+        /// it: a coinbase, the offer's transactions, the section of the
+        /// markers they carry ([`DestinationOffer::section_for`]).
+        fn block(&self, state: &DestinationState, offer: &DestinationOffer) -> Block {
+            let mut transactions = vec![coinbase()];
+            transactions.extend(offer.payment_order());
+            Block {
+                header: header(state.tip + 1),
+                destination: Some(offer.section_for(&transactions)),
+                transactions,
+                client_objects: Vec::new(),
+            }
+        }
+
+        fn check(
+            &self,
+            block: &Block,
+            parent: &DestinationState,
+        ) -> Result<DestinationEffect, DestinationBlockError> {
+            validate_block_destination(block, parent, &self.rules, &self.keys)
+        }
+    }
+
+    /// D130: the fast release of 3 paid BOB's 7 JTM; Base's final state holds
+    /// OWNER's 5 (a contradiction, on the branch). The template offers
+    /// OWNER's slow release of 3, and the block it builds passes the block
+    /// rule (BLS, the game, the bridge, `withdrawals[3]`): OWNER paid, the
+    /// record consumed. Then 3 is paid once: the template leaves it, the
+    /// block refuses it.
+    #[test]
+    fn the_template_pays_the_real_burner_of_a_reopened_n_in_a_block_the_rule_accepts() {
+        let w = world();
+        let parent = w.parent(&[3], &[(3, fast_record(BOB, 7 * MICRO_PER_JTM, true, false))]);
+        let offer = w.plan(&parent, vec![w.slow()]);
+        assert_eq!(ns(&offer), vec![3], "the real burner of the reopened 3");
+        let block = w.block(&parent, &offer);
+        let effect = w
+            .check(&block, &parent)
+            .expect("the block rule accepts the template's block");
+        assert_eq!(effect.vault.releases, vec![(3, w.burn.owner, w.burn.amount)]);
+        assert_eq!(effect.fast.consumed, vec![3]);
+        let mut after = parent.clone();
+        after
+            .apply(&effect, w.rules.vault.window_blocks)
+            .expect("the next block");
+        assert!(after.released.contains(3) && after.fast.records[&3].consumed);
+        // Paid once.
+        assert!(w.plan(&after, vec![w.slow()]).releases.is_empty());
+        assert_eq!(
+            w.check(&w.block(&after, &offer), &after),
+            Err(DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n: 3 }))
+        );
+    }
+
+    /// The template's order and caps hold for a reopened `n` as for any
+    /// other: by increasing `n`, the real burner of the reopened 3 beside 4;
+    /// 5, whose release repeats its fast record, is left (it never becomes
+    /// payable, so it does not stop 6); the window cap of the block bounds
+    /// them all.
+    #[test]
+    fn the_template_offers_a_reopened_n_in_its_place_within_the_caps() {
+        use jetsam_chain::consensus::destination::state::WindowRelease;
+        let amount = 10 * MICRO_PER_JTM;
+        let mut state = state_at(J + 20);
+        for n in [3, 5] {
+            state.released.insert(n);
+        }
+        state.fast.records.insert(3, fast_record(BOB, 7 * MICRO_PER_JTM, true, false));
+        state.fast.records.insert(5, fast_record(OWNER, amount, true, false));
+        let releases = || {
+            (3..=6)
+                .map(|n| base_release(n, amount, OWNER, 7))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ns(&base_plan(&state, &base_rules(), Vec::new(), releases())), vec![3, 4, 6]);
+        // The block's window full: none.
+        let cap = base_rules().vault.at(state.tip + 1).window_cap;
+        state.window.push(WindowRelease {
+            height: state.tip,
+            n: 1,
+            owner: OWNER,
+            amount: cap,
+        });
+        assert!(base_plan(&state, &base_rules(), Vec::new(), releases())
+            .releases
+            .is_empty());
+    }
+
+    /// The burn the fast lane paid, contradicted: the template never offers
+    /// it again; carried anyway, the block refuses it.
+    #[test]
+    fn the_template_never_offers_the_burn_the_fast_lane_paid_and_the_block_refuses_it() {
+        let w = world();
+        let parent = w.parent(&[3], &[(3, fast_record(w.burn.owner, w.burn.amount, true, false))]);
+        assert!(w.plan(&parent, vec![w.slow()]).releases.is_empty());
+        let carried = DestinationOffer {
+            releases: vec![w.slow()],
+            ..DestinationOffer::default()
+        };
+        assert_eq!(
+            w.check(&w.block(&parent, &carried), &parent),
+            Err(DestinationBlockError::RepeatsTheFastRecord { n: 3 })
+        );
+    }
+
+    /// D52, D130, every branch of a small world — the paid set holds 3 or
+    /// not; no fast record of 3, or one of three burns (Base's, another
+    /// owner's, another amount's), open, contradicted or consumed; another
+    /// `n` reopened or not — and a slow and a fast release of Base's burn of
+    /// 3: the template offers it exactly when the block's paid set lets it
+    /// through (the block refuses it with `ReleaseAlreadyPaid` or
+    /// `RepeatsTheFastRecord` exactly when the template leaves it). For an
+    /// `n` no contradiction reopens (a fast release, a record open or
+    /// consumed, none), both say what the branch's paid set alone said
+    /// before: nothing relaxed.
+    #[test]
+    fn the_template_and_the_block_agree_on_every_paid_set() {
+        let w = world();
+        let mut records = vec![None];
+        for (owner, amount) in [
+            (w.burn.owner, w.burn.amount),
+            (BOB, w.burn.amount),
+            (w.burn.owner, 7 * MICRO_PER_JTM),
+        ] {
+            for (contradicted, consumed) in [(false, false), (true, false), (true, true)] {
+                records.push(Some(fast_record(owner, amount, contradicted, consumed)));
+            }
+        }
+        let (mut cases, mut paid_by_the_block) = (0, 0);
+        for paid in [false, true] {
+            for record in &records {
+                for other_reopened in [false, true] {
+                    for release in [w.slow(), w.fast()] {
+                        let mut held: Vec<(u64, FastRecord)> = record.iter().map(|r| (3, *r)).collect();
+                        if other_reopened {
+                            held.push((5, fast_record(CAROL, MICRO_PER_JTM, true, false)));
+                        }
+                        let ns: Vec<u64> = if paid { vec![3, 5] } else { vec![5] };
+                        let parent = w.parent(&ns, &held);
+                        let offered = !w.plan(&parent, vec![release.clone()]).releases.is_empty();
+                        let carried = DestinationOffer {
+                            releases: vec![release.clone()],
+                            ..DestinationOffer::default()
+                        };
+                        let verdict = w.check(&w.block(&parent, &carried), &parent);
+                        let refused = matches!(
+                            verdict,
+                            Err(DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n: 3 }))
+                                | Err(DestinationBlockError::RepeatsTheFastRecord { n: 3 })
+                        );
+                        let what = format!(
+                            "paid {paid}, record {record:?}, other {other_reopened}, fast {}: {verdict:?}",
+                            release.fast.is_some()
+                        );
+                        assert_eq!(offered, !refused, "{what}");
+                        let reopened = release.fast.is_none()
+                            && record.is_some_and(|r| r.contradicted && !r.consumed);
+                        if !reopened {
+                            assert_eq!((offered, refused), (!paid, paid), "nothing relaxed: {what}");
+                        }
+                        paid_by_the_block += usize::from(verdict.is_ok());
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 10 * 2 * 2);
+        assert!(paid_by_the_block > 0, "the slow release passes the whole rule somewhere");
+    }
+
+    /// D188: the fast release of 3 paid BOB's 7 JTM by mistake; a reserve had
+    /// advanced Base's real burn of 3 (OWNER's), and the fast block left that
+    /// advance held. After the contradiction, the template offers the real
+    /// burner's release only when it repays the reserve (V2), and the block
+    /// it builds passes the block rule and consumes the advance; a release
+    /// paying OWNER (twice paid) is neither offered nor accepted.
+    #[test]
+    fn the_template_repays_the_reserve_that_advanced_the_real_burn_of_a_reopened_n() {
+        use jetsam_chain::consensus::destination::advance::{AdvanceEntry, AdvanceKey};
+        const RESERVE: Address = Address([0x5e; 32]);
+        let w = world();
+        let mut parent =
+            w.parent(&[3], &[(3, fast_record(BOB, 7 * MICRO_PER_JTM, true, false))]);
+        let r = &w.burn;
+        parent.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: RESERVE,
+                creditor: RESERVE,
+                owner: r.owner,
+                amount: r.amount,
+            },
+        );
+        let to_owner = w.slow();
+        let to_reserve = ReleaseIntent {
+            payment: page(
+                VAULT_ADDRESS,
+                1_000,
+                &[(RESERVE, r.amount - RELEASE_FEE_MICRO), (r.marker(), 0)],
+                RELEASE_FEE_MICRO,
+            ),
+            ..w.slow()
+        };
+        assert!(w.plan(&parent, vec![to_owner.clone()]).releases.is_empty());
+        let forced = w.plan(&parent, vec![to_reserve.clone()]);
+        assert_eq!(ns(&forced), vec![3], "the reserve repaid");
+        // The same block paying the owner instead: the rule refuses it.
+        let owner_offer = DestinationOffer {
+            releases: vec![to_owner],
+            ..forced.clone()
+        };
+        let owner_block = w.block(&parent, &owner_offer);
+        assert!(matches!(
+            w.check(&owner_block, &parent),
+            Err(DestinationBlockError::Vault(VaultError::ReleasePaysOtherOwner { .. }))
+        ));
+        let effect = w
+            .check(&w.block(&parent, &forced), &parent)
+            .expect("the block rule accepts the template's block");
+        assert_eq!(effect.vault.releases, vec![(3, r.owner, r.amount)]);
+        assert_eq!(effect.advances.consumed, vec![3]);
+        assert_eq!(effect.fast.consumed, vec![3]);
+        let mut after = parent.clone();
+        after
+            .apply(&effect, w.rules.vault.window_blocks)
+            .expect("the next block");
+        assert!(!after.advances.holds_n(3));
+        assert_eq!(after.advances.outstanding_of(&RESERVE), 0);
+        assert!(after
+            .advances
+            .get(&AdvanceKey {
+                n: 3,
+                owner: r.owner,
+                amount: r.amount
+            })
+            .is_none());
+        assert!(w.plan(&after, vec![to_reserve]).releases.is_empty());
+    }
+}

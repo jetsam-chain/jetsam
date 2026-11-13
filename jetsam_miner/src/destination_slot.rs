@@ -375,7 +375,9 @@ fn plan_releases(
         if offer.releases.len() >= rules.vault.max_releases_per_block {
             break;
         }
-        if state.released.contains(release.release.n)
+        // D52, D130: the block's paid set (the branch's, but the `n` a
+        // contradiction reopened for one slow release of another burn).
+        if release.check_unpaid(&state.released, &state.fast).is_err()
             || !anchor_of(&release.payment).is_some_and(|a| anchor_ok(&a))
         {
             continue;

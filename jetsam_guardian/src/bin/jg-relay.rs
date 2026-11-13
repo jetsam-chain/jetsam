@@ -1064,8 +1064,8 @@ fn run() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("fast-release") {
         return jetsam_guardian::fast_release::fast_release_cli(&args[2..]);
     }
-    // The fast lane run for real: burns, captures at once, fast releases, contradictions; and the cold
-    // key's revocation of the relay key.
+    // The fast lane run for real: burns, captures at once, fast releases, contradictions, slow releases of the burns
+    // the fast lane did not pay (a dry run unless `--slow-release send`); and the cold key's revocation of the relay key.
     if args.get(1).map(String::as_str) == Some("fast-run") {
         return jetsam_guardian::fast_run::run_cli(&args[2..]);
     }

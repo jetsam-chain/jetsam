@@ -53,14 +53,14 @@ use jetsam_chain::consensus::destination::state::{
     committee_update_marker, verify_committee_update_payload, verify_fast_contradiction,
     verify_fast_release_intent, verify_fast_revocation, verify_releases_on_base,
     verify_releases_on_l1, BaseReleaseObjects, CommitteeKeyCache, CommitteeRef,
-    DestinationBlockError, DestinationRules,
+    DestinationBlockError, DestinationRules, ReopenedReleases,
 };
 use jetsam_chain::consensus::destination::{
     base_objects_on_the_wire, DestinationObject, DestinationObjectKind,
 };
 use jetsam_chain::consensus::vault::{
-    decode_bridge_account_proof, destination_marker_kind, DestinationMarkerKind, VaultError,
-    VaultRelease, VaultRules,
+    decode_bridge_account_proof, destination_marker_kind, DestinationMarkerKind, ReleasedSet,
+    VaultError, VaultRelease, VaultRules,
 };
 use jetsam_chain::consensus::wire_limits::{
     MAX_DESTINATION_SECTION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
@@ -251,6 +251,28 @@ impl ReleaseIntent {
             kind: DestinationObjectKind::FastGameAttestation,
             payload: payload.clone(),
         })
+    }
+
+    /// D52, D130: what the next block refuses of this release for its paid
+    /// set, on a branch that paid `released` and whose fast lane is `lane` —
+    /// the block's own rule ([`ReopenedReleases`]): its `n` paid, unless a
+    /// contradiction reopened it and this is a slow release of another burn
+    /// than the fast lane paid (once: the record is consumed).
+    pub fn check_unpaid(
+        &self,
+        released: &ReleasedSet,
+        lane: &FastLaneState,
+    ) -> Result<(), DestinationBlockError> {
+        let r = &self.release;
+        let reopened = ReopenedReleases::of_block(lane, self.fast.is_some(), &[]);
+        if reopened.paid_set(released).contains(r.n) {
+            return Err(DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid {
+                n: r.n,
+            }));
+        }
+        reopened
+            .consumed_by(&[(r.n, r.owner, r.amount)])
+            .map(|_| ())
     }
 }
 
@@ -852,19 +874,19 @@ impl DestinationPool {
         self.len() == 0
     }
 
-    /// Forget what a branch no longer needs: releases whose index `paid`
-    /// holds or that `stale` says can no longer be built (inputs spent),
+    /// Forget what a branch no longer needs: releases `paid` says the branch
+    /// paid or that `stale` says can no longer be built (inputs spent),
     /// committee updates for a period at or below `known_period`. Returns
     /// the number forgotten.
     pub fn prune(
         &mut self,
-        paid: impl Fn(u64) -> bool,
+        paid: impl Fn(&ReleaseIntent) -> bool,
         stale: impl Fn(&ReleaseIntent) -> bool,
         known_period: Option<u64>,
     ) -> usize {
         let before = self.len();
         self.releases
-            .retain(|n, release| !paid(*n) && !stale(release));
+            .retain(|_, release| !paid(release) && !stale(release));
         if let Some(known) = known_period {
             self.committee_updates.retain(|period, _| *period > known);
         }

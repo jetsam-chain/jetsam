@@ -30,6 +30,8 @@
 pub mod activations;
 pub mod aggregator;
 pub mod base_capture;
+pub mod basezk;
+pub mod basezk_backend;
 pub mod ceremony;
 pub mod chain;
 pub mod checkpoint;
@@ -52,6 +54,7 @@ pub mod relayer;
 pub mod rpc;
 pub mod seal;
 pub mod signer;
+pub mod slow_release;
 #[doc(hidden)]
 pub mod testkit;
 pub mod threshold;
