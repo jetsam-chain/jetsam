@@ -782,6 +782,35 @@ pub fn check_object_payment_vault(pages: &[TxPage], rules: &VaultRules) -> Resul
     Ok(())
 }
 
+/// NO-1 (audit 13/11): the fast lane's markers of the block rule
+/// (`validate_block_destination`) applied to one transaction that travels
+/// without a fast-lane object — a plain one — offered for the block at
+/// `height`: from the return-over-Base height on, the block counts every
+/// `JTMFCT01` / `JTMFRV01` output among its user groups and asks one
+/// contradiction or revocation object for each, none carrying value, so a
+/// plain transaction carrying one makes every block that carries it refused.
+/// Refused with the block's own error, in its order. Inert below that height
+/// (the rule does not read them there).
+pub fn check_plain_fast_markers(
+    pages: &[TxPage],
+    height: u64,
+    rules: &DestinationRules,
+) -> Result<(), DestinationBlockError> {
+    if !rules.base_return.active_at(height) {
+        return Ok(());
+    }
+    for (_, output) in pages.iter().flat_map(|page| page.body.live_outputs()) {
+        if fast_marker_kind(&output.owner).is_some() {
+            return Err(if output.amount != 0 {
+                DestinationBlockError::FastMarkerCarriesValue
+            } else {
+                DestinationBlockError::FastObjectsDoNotMatchMarkers
+            });
+        }
+    }
+    Ok(())
+}
+
 impl DestinationPool {
     /// Hold `intent` — verified at admission ([`verify_destination_intent`]):
     /// no intent that does not verify is ever held, so none replaces a held

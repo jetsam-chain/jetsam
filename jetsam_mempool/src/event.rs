@@ -81,6 +81,10 @@ pub enum EvictReason {
     /// advance or a transfer of its claim the rule refuses (D107, D114), or
     /// carries an advance marker without being one.
     AdvanceRule,
+    /// From the return-over-Base height on no block may carry it as a plain
+    /// transaction: it carries a fast-lane marker (`JTMFCT01`, `JTMFRV01`)
+    /// without the fast lane's object (NO-1).
+    FastLaneRule,
 }
 
 impl EvictReason {
@@ -125,6 +129,10 @@ impl EvictReason {
                  or a claim transfer the rule refuses (malformed, its burn paid or already \
                  advanced), or carries an advance marker without being one"
             }
+            Self::FastLaneRule => {
+                "from the return-over-Base height no block may carry it alone: it carries \
+                 a fast-lane contradiction or revocation marker without that object"
+            }
         }
     }
 }
@@ -144,6 +152,7 @@ mod tests {
             EvictReason::VaultRule,
             EvictReason::GuardianRule,
             EvictReason::AdvanceRule,
+            EvictReason::FastLaneRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {

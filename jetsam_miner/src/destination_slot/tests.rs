@@ -1698,6 +1698,50 @@ mod reopened {
         }
     }
 
+    /// NO-1 (audit 13/11), the premise: from the return-over-Base height on,
+    /// the block rule refuses a block whose plain transaction carries a
+    /// fast-lane marker without its object (or with value) — the same block
+    /// without it passes. What the pool and the template now keep out
+    /// (`check_plain_fast_markers`) is exactly what the rule refuses.
+    #[test]
+    fn a_plain_transaction_carrying_a_fast_lane_marker_makes_the_block_refused() {
+        use jetsam_chain::consensus::destination::fast::{
+            FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG,
+        };
+        let w = world();
+        let parent = w.parent(&[], &[]);
+        let tagged = |tag: [u8; 8]| {
+            let mut owner = [0x33u8; 32];
+            owner[..8].copy_from_slice(&tag);
+            Address(owner)
+        };
+        let block_with = |outputs: &[(Address, u64)]| {
+            let mut block = w.block(&parent, &DestinationOffer::default());
+            if !outputs.is_empty() {
+                block
+                    .transactions
+                    .extend(page(PAYER, 2_000, outputs, 50_000).pages.iter().map(|p| Transaction::new(p.body.clone())));
+            }
+            block
+        };
+        for (outputs, expected) in [
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 5)], DestinationBlockError::FastObjectsDoNotMatchMarkers),
+            (vec![(tagged(FAST_REVOCATION_MARKER_TAG), 0), (BOB, 5)], DestinationBlockError::FastObjectsDoNotMatchMarkers),
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 5), (BOB, 5)], DestinationBlockError::FastMarkerCarriesValue),
+        ] {
+            let block = block_with(&outputs);
+            assert_eq!(w.check(&block, &parent).err(), Some(expected.clone()));
+            let pages: Vec<TxPage> = page(PAYER, 2_000, &outputs, 50_000).pages;
+            assert_eq!(
+                jetsam_mempool::destination::check_plain_fast_markers(&pages, parent.tip + 1, &w.rules).err(),
+                Some(expected),
+                "the pool's predicate says what the rule says"
+            );
+        }
+        w.check(&block_with(&[(BOB, 5)]), &parent).expect("without the marker: accepted");
+        w.check(&block_with(&[]), &parent).expect("coinbase only: accepted");
+    }
+
     /// D130: the fast release of 3 paid BOB's 7 JTM; Base's final state holds
     /// OWNER's 5 (a contradiction, on the branch). The template offers
     /// OWNER's slow release of 3, and the block it builds passes the block

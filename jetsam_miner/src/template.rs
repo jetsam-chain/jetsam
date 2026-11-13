@@ -645,7 +645,7 @@ impl TemplateBuilder {
                 .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
                 .await
         };
-        let entries: Vec<_> = minable_plain_entries(entries, child_height, &client_rules)
+        let entries: Vec<_> = minable_plain_entries(entries, child_height, &client_rules, &destination_rules)
             .into_iter()
             .filter(|entry| {
                 held_slots.is_empty()
@@ -1130,11 +1130,25 @@ impl TemplateBuilder {
 /// (`check_plain_transaction`, the rule the block is judged by). Inert below
 /// the v1.5 height (review B1: a marker payment admitted for J - 1 reached
 /// the template of J, and every miner proved, sealed and lost the block).
+/// NO-1: nor, from the return-over-Base height on, one carrying a fast-lane
+/// marker without its object (`check_plain_fast_markers`, the block rule's).
 pub(crate) fn minable_plain_entries(
     entries: Vec<jetsam_mempool::SelectedMempoolEntry>,
     child_height: u64,
     rules: &jetsam_chain::consensus::client_objects::ClientObjectRules,
+    destination_rules: &jetsam_chain::consensus::destination::state::DestinationRules,
 ) -> Vec<jetsam_mempool::SelectedMempoolEntry> {
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| {
+            jetsam_mempool::destination::check_plain_fast_markers(
+                &entry.pages,
+                child_height,
+                destination_rules,
+            )
+            .is_ok()
+        })
+        .collect();
     if !rules.active_at(child_height) {
         return entries;
     }
@@ -1457,13 +1471,65 @@ mod tests {
         let plain = selected(b1_page(Address([0xB6; 32]), 900, 100));
         let marker = selected(b1_page(marker_owner(), 900, 100));
         let plain_id = plain.logical_txid;
-        let kept = minable_plain_entries(vec![marker, plain], B1_J, &rules);
+        let kept = minable_plain_entries(vec![marker, plain], B1_J, &rules, &dormant_destination());
         assert_eq!(
             kept.iter().map(|entry| entry.logical_txid).collect::<Vec<_>>(),
             vec![plain_id]
         );
         let marker = selected(b1_page(marker_owner(), 900, 100));
-        assert_eq!(minable_plain_entries(vec![marker], B1_J - 1, &rules).len(), 1);
+        assert_eq!(minable_plain_entries(vec![marker], B1_J - 1, &rules, &dormant_destination()).len(), 1);
+    }
+
+    fn dormant_destination() -> jetsam_chain::consensus::destination::state::DestinationRules {
+        jetsam_chain::consensus::destination::state::DestinationRules {
+            base_return: jetsam_chain::consensus::destination::state::BaseReturnRules {
+                activation_height: None,
+                ..jetsam_chain::consensus::destination::state::DestinationRules::current().base_return
+            },
+            ..jetsam_chain::consensus::destination::state::DestinationRules::current()
+        }
+    }
+
+    /// NO-1 (audit 13/11): a plain entry carrying a fast-lane marker
+    /// (`JTMFCT01`, `JTMFRV01`) — one the pool still holds, its view
+    /// lagging — is never offered to a block from the return-over-Base
+    /// height on (the block rule asks an object for each such marker: every
+    /// block carrying it is refused, and the miner retried the same
+    /// selection forever). Below the height it stays a plain transaction.
+    #[test]
+    fn over_base_the_template_never_offers_a_plain_entry_carrying_a_fast_lane_marker() {
+        use jetsam_chain::consensus::destination::fast::{
+            FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG,
+        };
+        let rules = b1_rules();
+        let base_height = B1_J + 100;
+        let destination = jetsam_chain::consensus::destination::state::DestinationRules {
+            base_return: jetsam_chain::consensus::destination::state::BaseReturnRules {
+                activation_height: Some(base_height),
+                ..dormant_destination().base_return
+            },
+            ..dormant_destination()
+        };
+        let tagged = |tag: [u8; 8]| {
+            let mut owner = [0x33u8; 32];
+            owner[..8].copy_from_slice(&tag);
+            Address(owner)
+        };
+        let entries = || {
+            vec![
+                selected(b1_page(tagged(FAST_CONTRADICTION_MARKER_TAG), 0, 100)),
+                selected(b1_page(Address([0xB6; 32]), 900, 100)),
+                selected(b1_page(tagged(FAST_REVOCATION_MARKER_TAG), 0, 100)),
+            ]
+        };
+        let plain_id = entries()[1].logical_txid;
+        let kept = minable_plain_entries(entries(), base_height, &rules, &destination);
+        assert_eq!(
+            kept.iter().map(|entry| entry.logical_txid).collect::<Vec<_>>(),
+            vec![plain_id]
+        );
+        assert_eq!(minable_plain_entries(entries(), base_height - 1, &rules, &destination).len(), 3);
+        assert_eq!(minable_plain_entries(entries(), base_height, &rules, &dormant_destination()).len(), 3);
     }
 
     /// B1: the template is judged by the client-object rules of block

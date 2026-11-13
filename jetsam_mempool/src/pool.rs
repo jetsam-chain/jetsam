@@ -1030,6 +1030,7 @@ impl AsyncMempool {
         // v1.7: likewise for the vault rule (crossing J, reorg).
         evict_vault_violations(&mut st, next_height, &self.events);
         evict_advance_violations(&mut st, next_height, &self.events);
+        evict_fast_marker_violations(&mut st, next_height, &self.events);
         evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1197,6 +1198,7 @@ impl AsyncMempool {
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
             + evict_advance_violations(&mut st, next_height, &self.events)
+            + evict_fast_marker_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         prune_destination(&mut st, next_height);
         prune_guardian(&mut st, next_height);
@@ -1220,6 +1222,7 @@ impl AsyncMempool {
         let evicted = evict_client_object_violations(&mut st, next_height, &self.events)
             + evict_vault_violations(&mut st, next_height, &self.events)
             + evict_advance_violations(&mut st, next_height, &self.events)
+            + evict_fast_marker_violations(&mut st, next_height, &self.events)
             + evict_guardian_violations(&mut st, next_height, &self.events);
         if evicted > 0 {
             rebuild_slot_sets(&mut st);
@@ -1421,6 +1424,14 @@ fn run_admission_checks_with(
         // bridge opening (V1, V4, V4-d), and V8 against the tip's vault.
         check_plain_vault_admission(pages, st, st.view.tip_height.saturating_add(1))
             .map_err(vault_submit_error)?;
+        // NO-1: no fast-lane marker without its object (the return over
+        // Base on): the block rule would refuse every block carrying it.
+        crate::destination::check_plain_fast_markers(
+            pages,
+            st.view.tip_height.saturating_add(1),
+            &st.view.destination_rules,
+        )
+        .map_err(destination_submit_error)?;
     } else if let Some(owner) = pages
         .iter()
         .map(|page| page.body.input_owner)
@@ -1672,6 +1683,51 @@ fn evict_advance_violations(
         let _ = events.send(MempoolEvent::TxEvicted {
             hash: *hash,
             reason: EvictReason::AdvanceRule,
+        });
+    }
+    refused.len()
+}
+
+/// NO-1: evict every entry carrying a fast-lane marker the block at
+/// `next_height` would refuse ([`crate::destination::check_plain_fast_markers`]):
+/// crossing the return-over-Base height, a reorg. Inert below that height.
+/// Returns the number evicted; the caller rebuilds the slot sets.
+fn evict_fast_marker_violations(
+    st: &mut MempoolState,
+    next_height: u64,
+    events: &broadcast::Sender<MempoolEvent>,
+) -> usize {
+    if !st
+        .view
+        .destination_rules
+        .base_return
+        .active_at(next_height)
+    {
+        return 0;
+    }
+    let refused: Vec<TxBodyHash> = st
+        .pool
+        .iter()
+        .filter(|(_, entry)| {
+            crate::destination::check_plain_fast_markers(
+                &entry.pages,
+                next_height,
+                &st.view.destination_rules,
+            )
+            .is_err()
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in &refused {
+        st.pool.remove(hash);
+        tracing::info!(
+            ?hash,
+            next_height,
+            "tx evicted: no block from the return-over-Base height may carry its fast-lane marker"
+        );
+        let _ = events.send(MempoolEvent::TxEvicted {
+            hash: *hash,
+            reason: EvictReason::FastLaneRule,
         });
     }
     refused.len()
@@ -4606,6 +4662,64 @@ mod tests {
         bad.submit(&pool).await.expect("dormant");
         pool.on_new_block(&[], BASE_HEIGHT - 1, bad.view_at(BASE_HEIGHT - 1, 0)).await;
         assert_eq!(pool.len().await, 1);
+    }
+
+    /// NO-1 (audit 13/11): from the return-over-Base height on, the block
+    /// rule counts every fast-lane marker (`JTMFCT01`, `JTMFRV01`) among its
+    /// user groups and asks one object for each, and none may carry value. A
+    /// plain transaction carrying one is a block no miner can make: refused
+    /// at admission, evicted when the next block reaches the height. Below
+    /// the height, or dormant, it is an ordinary spend (the rule does not
+    /// read it), as for a node without this policy.
+    #[tokio::test]
+    async fn over_base_a_plain_transaction_carrying_a_fast_lane_marker_is_refused() {
+        use crate::event::{EvictReason, MempoolEvent};
+        use jetsam_chain::consensus::destination::fast::{
+            FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG,
+        };
+        use jetsam_chain::consensus::destination::state::DestinationBlockError as E;
+        let tagged = |tag: [u8; 8]| {
+            let mut owner = [0x33u8; 32];
+            owner[..8].copy_from_slice(&tag);
+            Address(owner)
+        };
+        let refusal = |result: Result<jetsam_poseidon2b::primitives::TxBodyHash, super::SubmitError>| match result {
+            Err(super::SubmitError::Consensus(
+                jetsam_chain::consensus::ConsensusError::DestinationBlock(error),
+            )) => Some(error),
+            _ => None,
+        };
+        let tip = BASE_HEIGHT;
+        for (outputs, expected) in [
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)], E::FastObjectsDoNotMatchMarkers),
+            (vec![(BOB, 10), (tagged(FAST_REVOCATION_MARKER_TAG), 0)], E::FastObjectsDoNotMatchMarkers),
+            (vec![(tagged(FAST_CONTRADICTION_MARKER_TAG), 5), (BOB, 10)], E::FastMarkerCarriesValue),
+        ] {
+            let case = VaultCase::new(tip, PAYER, &outputs);
+            let pool = pool_over(over_base_view(case.view_at(tip, 0), &[]));
+            assert_eq!(refusal(case.submit(&pool).await), Some(expected), "{outputs:?}");
+            assert_eq!(pool.len().await, 0);
+        }
+        // Admitted below the height; evicted when the next block reaches it.
+        let before = BASE_HEIGHT - 2;
+        let early = VaultCase::new(before, PAYER, &[(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)]);
+        let pool = pool_over(over_base_view(early.view_at(before, 0), &[]));
+        let mut events = pool.subscribe();
+        let hash = early.submit(&pool).await.expect("below the height: an ordinary spend");
+        pool.on_new_block(&[], BASE_HEIGHT - 1, over_base_view(early.view_at(BASE_HEIGHT - 1, 0), &[]))
+            .await;
+        assert_eq!(pool.len().await, 0, "no block from the height carries it");
+        let mut evicted = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let MempoolEvent::TxEvicted { hash, reason } = event {
+                evicted.push((hash, reason));
+            }
+        }
+        assert_eq!(evicted, vec![(hash, EvictReason::FastLaneRule)]);
+        // Dormant (this build's default rules): an ordinary spend.
+        let dormant = VaultCase::new(tip, PAYER, &[(tagged(FAST_CONTRADICTION_MARKER_TAG), 0), (BOB, 10)]);
+        let pool = dormant.pool_at(tip, 0);
+        dormant.submit(&pool).await.expect("dormant: an ordinary spend");
     }
 
     /// D101, D107, D114: from the return-over-Base height on, the pool admits
