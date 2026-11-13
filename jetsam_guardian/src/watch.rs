@@ -43,6 +43,10 @@ pub struct WatchConfig {
     pub l1_chain_id: u64,
     pub l1_bridge: String,
     pub l1_rpc: String,
+    /// GU-2 (audit n°2): a second L1 endpoint (another provider): the tip must read the same from both before any
+    /// verdict. None by default (one source, as before).
+    #[serde(default)]
+    pub l1_rpc_second: Option<String>,
     /// This watcher's own nodes.
     pub nodes: Vec<crate::fill::NodeSourceConfig>,
     /// The tip's locked block is off this chain only when this many nodes hold another block at its height (and on it
@@ -100,6 +104,10 @@ impl WatchConfig {
         for (i, n) in c.nodes.iter().enumerate() {
             ensure!(!c.nodes[..i].iter().any(|m| m.rpc == n.rpc || m.name == n.name), "nodes[{i}] ({}) is configured twice", n.name);
         }
+        if let Some(second) = &c.l1_rpc_second {
+            let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+            ensure!(norm(second) != norm(&c.l1_rpc), "l1_rpc_second is l1_rpc: a second source must be another endpoint");
+        }
         c.egress()?;
         Ok(c)
     }
@@ -116,7 +124,8 @@ impl WatchConfig {
     pub fn egress(&self) -> anyhow::Result<crate::rpc::Egress> {
         let nodes = self.nodes.iter().enumerate().map(|(i, n)| (format!("nodes[{i}]"), n.rpc.as_str()));
         let l1 = std::iter::once(("l1_rpc".to_string(), self.l1_rpc.as_str()));
-        crate::config::checked_egress(&self.egress, Some(&self.domain()?), nodes.chain(l1))
+        let second = self.l1_rpc_second.iter().map(|u| ("l1_rpc_second".to_string(), u.as_str()));
+        crate::config::checked_egress(&self.egress, Some(&self.domain()?), nodes.chain(l1).chain(second))
     }
 }
 
@@ -141,6 +150,41 @@ pub enum Verdict {
     OffOurChain,
     /// Too few witnesses either way (nodes behind, silent, failing, or disagreeing).
     Unknown,
+    /// GU-1 (audit n°2): `min_nodes` nodes answered that they hold no block at the locked height (it is above their
+    /// tip) and fewer hold the block: a forged proof, or a private branch longer than this chain. An incident once it
+    /// lasts [`ABOVE_TIP_PAUSE_SECS`].
+    AboveOurTip,
+}
+
+/// GU-1: seconds (the host's clock) the tip's locked block may stay above the tip of `min_nodes` nodes before it is an
+/// incident (a pause): ten blocks of the chain, far more than a node's lag behind a locked block (itself ≥ 8 blocks of
+/// work below its point's tip), and well within the 24 h the slow finality leaves.
+pub const ABOVE_TIP_PAUSE_SECS: u64 = 1_800;
+
+/// GU-1: [`locked_verdict`] from what each node answered: `Some(Some(id))` the block it holds at the height,
+/// `Some(None)` none there (the height is above its tip), `None` no answer. Above our tip when `min_nodes` nodes hold
+/// none there and fewer than `min_nodes` hold the locked block.
+pub fn locked_verdict_of(locked_block: &[u8; 32], answers: &[Option<Option<[u8; 32]>>], min_nodes: usize) -> Verdict {
+    let held: Vec<Option<[u8; 32]>> = answers.iter().map(|a| a.flatten()).collect();
+    let verdict = locked_verdict(locked_block, &held, min_nodes);
+    let none_there = answers.iter().filter(|a| matches!(a, Some(None))).count();
+    let ours = held.iter().filter(|h| h.as_ref() == Some(locked_block)).count();
+    if verdict == Verdict::Unknown && none_there >= min_nodes && ours < min_nodes {
+        return Verdict::AboveOurTip;
+    }
+    verdict
+}
+
+/// GU-2 (audit n°2): the tip read from the first L1 endpoint, checked against the second one's when configured
+/// (`l1_rpc_second`): the same point, locked block and locked height, else why not (no pause on one source's word).
+pub fn merge_tips(first: Option<Tip>, second: Option<Option<Tip>>) -> Result<Option<Tip>, String> {
+    let Some(second) = second else { return Ok(first) };
+    let key = |t: &Option<Tip>| t.map(|t| (t.id, t.locked_block, t.locked_height));
+    if key(&first) != key(&second) {
+        let say = |t: &Option<Tip>| t.map_or("no genesis".to_string(), |t| format!("tip 0x{} locking 0x{} at {}", hex::encode(t.id), hex::encode(t.locked_block), t.locked_height));
+        return Err(format!("the two L1 endpoints disagree: {} against {}", say(&first), say(&second)));
+    }
+    Ok(first)
 }
 
 /// The tip's locked block `locked_block` against the blocks the nodes hold at its height (`None`: a node that holds
@@ -180,6 +224,14 @@ pub struct WatchState {
     /// The point whose age was last alerted (hex id): once per point.
     #[serde(default)]
     pub stale_alerted: Option<String>,
+    /// GU-1: since when (host clock) the tip's locked block is above the tip of `min_nodes` nodes.
+    #[serde(default)]
+    pub above_since: Option<u64>,
+    /// GU-1, GU-2: since when (host clock) the verdict is unknown, and whether that was alerted (once per stretch).
+    #[serde(default)]
+    pub unknown_since: Option<u64>,
+    #[serde(default)]
+    pub unknown_alerted: bool,
 }
 
 /// What to run now.
@@ -192,6 +244,40 @@ pub enum Action {
 /// One reading's decisions: the tip `tip` (its locked block judged `verdict`), the L1 clock `l1_now`, the host's `now`.
 pub fn decide(state: &mut WatchState, tip: &Tip, verdict: Verdict, l1_now: u64, now: u64, alert_after: u64) -> Vec<Action> {
     let mut out = Vec::new();
+    // GU-1: a locked block above the tip of min_nodes nodes for ABOVE_TIP_PAUSE_SECS is off our chain; GU-1, GU-2: an
+    // unknown verdict that lasts more than alert_after is said (once per stretch)
+    if verdict == Verdict::Unknown {
+        let since = *state.unknown_since.get_or_insert(now);
+        if !state.unknown_alerted && now.saturating_sub(since) > alert_after {
+            state.unknown_alerted = true;
+            out.push(Action::Alert {
+                event: "VERDICT_UNKNOWN".into(),
+                detail: format!(
+                    "for {} s this watcher cannot say whether the contract's tip 0x{} locks a block of its chain (nodes silent, behind or disagreeing, or its L1 endpoints disagreeing): it can pause nothing",
+                    now - since,
+                    hex::encode(tip.id)
+                ),
+            });
+        }
+    } else {
+        state.unknown_since = None;
+        state.unknown_alerted = false;
+    }
+    let verdict = match verdict {
+        Verdict::AboveOurTip => {
+            let since = *state.above_since.get_or_insert(now);
+            if now.saturating_sub(since) >= ABOVE_TIP_PAUSE_SECS {
+                Verdict::OffOurChain
+            } else {
+                Verdict::AboveOurTip
+            }
+        }
+        Verdict::OnOurChain => {
+            state.above_since = None;
+            Verdict::OnOurChain
+        }
+        other => other,
+    };
     match verdict {
         Verdict::OffOurChain => {
             let i = state.incident.get_or_insert_with(|| Incident {
@@ -218,7 +304,7 @@ pub fn decide(state: &mut WatchState, tip: &Tip, verdict: Verdict, l1_now: u64, 
             }
         }
         Verdict::OnOurChain => state.incident = None,
-        Verdict::Unknown => {}
+        Verdict::Unknown | Verdict::AboveOurTip => {}
     }
     let age = l1_now.saturating_sub(tip.accepted_at);
     let id = hex::encode(tip.id);
@@ -397,6 +483,16 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
     let l1 = crate::l1::L1::via(&cfg.l1_rpc, egress);
     let chain_id = crate::l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
     ensure!(chain_id == cfg.l1_chain_id, "the L1 endpoint is chain {chain_id}, not {}: jg-relay watch does not start", cfg.l1_chain_id);
+    // GU-2: a second L1 source, checked the same way
+    let l1_second = match &cfg.l1_rpc_second {
+        Some(url) => {
+            let l = crate::l1::L1::via(url, egress);
+            let id = crate::l1::hex_u64(&l.rpc("eth_chainId", json!([]))?)?;
+            ensure!(id == cfg.l1_chain_id, "the second L1 endpoint is chain {id}, not {}: jg-relay watch does not start", cfg.l1_chain_id);
+            Some(l)
+        }
+        None => None,
+    };
     let mut nodes = Vec::new();
     for n in &cfg.nodes {
         let mut c = crate::rpc::NodeClient::fill(&n.rpc, egress);
@@ -425,6 +521,19 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
     loop {
         let now = crate::now_unix();
         let read = read_tip(&l1, &bridge).and_then(|t| Ok((t, l1.next_time()?)));
+        // GU-2: with a second L1 source, the tip must read the same from it, else no verdict this round
+        let mut sources_disagree = false;
+        let read = read.and_then(|(t, l1_now)| {
+            let second = l1_second.as_ref().map(|l| read_tip(l, &bridge)).transpose()?;
+            match merge_tips(t, second) {
+                Ok(t) => Ok((t, l1_now)),
+                Err(why) => {
+                    say(&format!("ALERT L1_SOURCES_DISAGREE: {why}: no verdict this round"));
+                    sources_disagree = true;
+                    Ok((t, l1_now))
+                }
+            }
+        });
         match read {
             Ok((None, _)) => {
                 (last_ok, blind) = (now, false);
@@ -445,8 +554,17 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
                 if answers.iter().filter(|a| a.is_some()).count() >= cfg.min_nodes {
                     (last_ok, blind) = (now, false);
                 }
+                // GU-1: a node that holds no block at the locked height is a witness of that (the height is above its tip)
+                let verdict = if sources_disagree { Verdict::Unknown } else { locked_verdict_of(&tip.locked_block, &answers, cfg.min_nodes) };
                 let held: Vec<Option<[u8; 32]>> = answers.into_iter().map(Option::flatten).collect();
-                let verdict = locked_verdict(&tip.locked_block, &held, cfg.min_nodes);
+                if verdict == Verdict::AboveOurTip && state.above_since.is_none() {
+                    say(&format!(
+                        "ALERT TIP_ABOVE_OUR_CHAIN: the contract's tip 0x{} locks height {}, above the tip of {} nodes: an incident if it lasts {ABOVE_TIP_PAUSE_SECS} s",
+                        hex::encode(tip.id),
+                        tip.locked_height,
+                        cfg.min_nodes
+                    ));
+                }
                 if verdict == Verdict::Unknown && held.contains(&Some(tip.locked_block)) && held.iter().any(|h| h.is_some_and(|x| x != tip.locked_block)) {
                     say(&format!("ALERT NODES_DISAGREE on block {}: {held:?}", tip.locked_height));
                 }

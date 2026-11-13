@@ -181,3 +181,97 @@ fn a2_commands_are_argv_never_a_shell_and_bounded_by_their_timeout() {
     assert!(!alive, "the command's own child {pid} outlived its timeout");
     assert!(run_command(&[], Duration::from_secs(1)).is_err(), "no program");
 }
+
+// ---------------------------------------------------------------- GU-1, GU-2 (audit n°2)
+
+/// GU-1: nodes that answer "no block at that height" (the locked height is above their tip) are witnesses of that:
+/// `min_nodes` of them make the tip's locked block above our tip; a node silent is still no witness.
+#[test]
+fn gu1_a_locked_block_above_the_tip_of_min_nodes_nodes_is_seen() {
+    use Verdict::*;
+    let ours = [1u8; 32];
+    let (o, x, none) = (Some(Some(ours)), Some(Some([2u8; 32])), Some(None));
+    assert_eq!(locked_verdict_of(&ours, &[none, none], 2), AboveOurTip);
+    assert_eq!(locked_verdict_of(&ours, &[none, None], 2), Unknown, "a silent node is no witness");
+    assert_eq!(locked_verdict_of(&ours, &[none, o], 2), Unknown);
+    assert_eq!(locked_verdict_of(&ours, &[none, none, o], 2), AboveOurTip, "two of three hold nothing there");
+    assert_eq!(locked_verdict_of(&ours, &[o, o], 2), OnOurChain);
+    assert_eq!(locked_verdict_of(&ours, &[x, x], 2), OffOurChain);
+    assert_eq!(locked_verdict_of(&ours, &[o, o, none, none], 2), OnOurChain, "two hold it: on our chain");
+}
+
+/// GU-1 (audit test): a forged point locks "honest tip + 1 000" (or a 55 % pool's private branch passed the honest
+/// tip): both nodes answer nothing at that height, and the contract's tip changes at every round. Today: nothing.
+/// Expected: once it lasts `ABOVE_TIP_PAUSE_SECS`, an incident and its pause (once); back on our chain: over.
+#[test]
+fn gu1_a_tip_that_locks_above_our_nodes_tip_is_paused_once_it_lasts() {
+    let mut s = WatchState::default();
+    let answers = [Some(None), Some(None)];
+    let mut paused_at = None;
+    for round in 0..8u64 {
+        let now = 1_000 + round * 300;
+        let t = Tip { locked_height: 20_000 + round, ..tip(10 + round as u8, 5_000 + round) };
+        let v = locked_verdict_of(&t.locked_block, &answers, 2);
+        let actions = decide(&mut s, &t, v, 5_100 + round, now, 6_600);
+        if events(&actions).contains(&"pause".to_string()) {
+            assert!(paused_at.is_none(), "one pause");
+            paused_at = Some(now);
+            pause_started(&mut s, now);
+            pause_ended(&mut s, true, "exit status 0");
+        }
+    }
+    assert_eq!(paused_at, Some(1_000 + ABOVE_TIP_PAUSE_SECS));
+    assert!(s.incident.is_some());
+    // the nodes catch up and hold it: over, and the clock starts again
+    let t = tip(30, 9_000);
+    assert!(decide(&mut s, &t, Verdict::OnOurChain, 9_100, 9_000, 6_600).is_empty());
+    assert!(s.incident.is_none() && s.above_since.is_none());
+    // a short stretch above (a node restarting): no pause
+    let mut s = WatchState::default();
+    assert!(decide(&mut s, &t, Verdict::AboveOurTip, 9_100, 100, 6_600).is_empty());
+    assert!(decide(&mut s, &t, Verdict::AboveOurTip, 9_100, 100 + ABOVE_TIP_PAUSE_SECS - 1, 6_600).is_empty());
+    assert!(decide(&mut s, &t, Verdict::OnOurChain, 9_100, 100 + ABOVE_TIP_PAUSE_SECS, 6_600).is_empty());
+    assert!(decide(&mut s, &t, Verdict::AboveOurTip, 9_100, 100 + ABOVE_TIP_PAUSE_SECS + 1, 6_600).is_empty(), "the clock started again");
+}
+
+/// GU-1, GU-2: an unknown verdict that lasts more than `alert_after_secs` (a node of two down, nodes that disagree, two
+/// L1 sources that disagree) is alerted, once per stretch; a verdict again re-arms it.
+#[test]
+fn gu2_an_unknown_verdict_that_lasts_is_alerted_once() {
+    let mut s = WatchState::default();
+    let t = tip(1, 1_000);
+    assert!(decide(&mut s, &t, Verdict::Unknown, 1_100, 10, 6_600).is_empty());
+    assert!(decide(&mut s, &t, Verdict::Unknown, 1_100, 10 + 6_600, 6_600).is_empty(), "not more than alert_after_secs");
+    assert_eq!(events(&decide(&mut s, &t, Verdict::Unknown, 1_100, 10 + 6_601, 6_600)), vec!["VERDICT_UNKNOWN"]);
+    assert!(decide(&mut s, &t, Verdict::Unknown, 1_100, 20_000, 6_600).is_empty(), "once");
+    assert!(decide(&mut s, &t, Verdict::OnOurChain, 1_100, 20_001, 6_600).is_empty());
+    assert!(decide(&mut s, &t, Verdict::Unknown, 1_100, 20_002, 6_600).is_empty());
+    assert_eq!(events(&decide(&mut s, &t, Verdict::Unknown, 1_100, 20_002 + 6_601, 6_600)), vec!["VERDICT_UNKNOWN"], "re-armed");
+    // the state survives a restart
+    let back: WatchState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(back, s);
+    // a watch.json of the older watcher loads
+    let old: WatchState = serde_json::from_str(r#"{"incident": null, "stale_alerted": "ab"}"#).unwrap();
+    assert_eq!((old.above_since, old.unknown_since, old.unknown_alerted), (None, None, false));
+}
+
+/// GU-2: a second L1 endpoint (`l1_rpc_second`, optional: without it, as before): the tip must read the same from both
+/// (point, locked block, locked height), else no verdict on it (no pause on one source's word).
+#[test]
+fn gu2_a_second_l1_source_must_agree_before_any_pause() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let c = WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://127.0.0.1:8546\"\n")).expect("a second L1 endpoint");
+    assert_eq!(c.l1_rpc_second.as_deref(), Some("http://127.0.0.1:8546"));
+    assert_eq!(WatchConfig::parse(&watch_toml(&mainnet, 1, "")).unwrap().l1_rpc_second, None, "none by default: as before");
+    let same = WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://127.0.0.1:8545\"\n")).unwrap_err().to_string();
+    assert!(same.contains("l1_rpc_second"), "{same}");
+    assert!(WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://10.1.2.3:8546\"\n")).is_err(), "checked like l1_rpc");
+    let t = tip(1, 1_000);
+    assert_eq!(merge_tips(Some(t), None), Ok(Some(t)), "no second source");
+    assert_eq!(merge_tips(Some(t), Some(Some(t))), Ok(Some(t)));
+    assert_eq!(merge_tips(None, Some(None)), Ok(None));
+    assert!(merge_tips(Some(t), Some(Some(tip(2, 1_000)))).is_err());
+    assert!(merge_tips(Some(t), Some(Some(Tip { locked_block: [0xcd; 32], ..t }))).is_err());
+    assert!(merge_tips(Some(t), Some(Some(Tip { locked_height: 101, ..t }))).is_err());
+    assert!(merge_tips(Some(t), Some(None)).is_err());
+}
