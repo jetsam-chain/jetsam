@@ -1777,3 +1777,95 @@ fn d188_the_repaid_advance_is_remembered_by_its_origin() {
     let back = after.truncate_above(HEIGHT - 1).unwrap().unwrap();
     assert_eq!(back, parent);
 }
+
+// ---------------------------------------------------------------------------
+// FIXRC (AUDIT-FINAL2 §3.4, §3.5): RC-2, ET-3, RC-3
+// ---------------------------------------------------------------------------
+
+/// RC-2: the honest block "contradiction of 3 + the real burner of 3 paid",
+/// relayed with the uncommitted contradiction object's `n` changed (3 → 4).
+/// The header commits to the marker (`n` = 3 in clear), not to the object:
+/// the refusal must not condemn the block (a re-download serves it right).
+#[test]
+fn a_tampered_contradiction_object_never_condemns_an_honest_block() {
+    let l = lane();
+    let (parent, record) = after_fast_release(&l);
+    let honest = contradiction_paying_bob(&l, &record, BOB);
+    assert!(l.check(&honest, &parent).is_ok(), "the honest block");
+    let world = base_world(&release(3, BOB, 7 * JTM), VALID, TIMES);
+    for n in [4u64, 9] {
+        let tampered = replace(
+            &honest,
+            DestinationObjectKind::FastContradiction,
+            FastContradiction {
+                n,
+                storage_proof: world.storage_proof.clone(),
+            }
+            .encode_payload(),
+        );
+        // Same header, same committed transactions.
+        assert_eq!(tampered.header, honest.header);
+        assert_eq!(tampered.transactions, honest.transactions);
+        let e = l.check(&tampered, &parent).expect_err("tampered");
+        assert!(!e.condemns_block(), "n = {n}: {e:?} condemns an honest block");
+    }
+}
+
+/// ET-3: a node installed from a snapshot exports a snapshot another node
+/// installs — here a boundary whose fast release (`HEIGHT + 2`) is in the
+/// horizon but out of the window (V6) of the next block.
+#[test]
+fn an_installed_state_exports_a_snapshot_another_node_installs() {
+    let l = lane();
+    let rules = l.rules;
+    let at = |h: u64| h * 10 - 3;
+    let fast5 = SnapshotRelease {
+        n: 5,
+        owner: ALICE,
+        amount: 5 * JTM,
+        fast_l2_block: Some(56_993_063),
+    };
+    let slots = vec![(fast5.marker(), at(HEIGHT + 2))];
+    let file = DestinationSnapshotFile {
+        committee_updates: Vec::new(),
+        window_releases: Vec::new(),
+        advances: Vec::new(),
+        fast: Some(FastSnapshot {
+            releases: vec![fast5],
+            contradictions: Vec::new(),
+            revocations: Vec::new(),
+        }),
+    };
+    for tip in [HEIGHT + 20, HEIGHT + 2 + VAULT_RELEASE_WINDOW_BLOCKS + 100] {
+        let installed = install(&rules, &file, tip, &slots).expect("the first install");
+        assert_eq!(installed.fast.records[&5].height, HEIGHT + 2);
+        let exported = export(&l, &installed);
+        assert_eq!(exported, file, "tip {tip}: the installed node exports the file it installed");
+        let again = install(&rules, &exported, tip, &slots)
+            .unwrap_or_else(|e| panic!("tip {tip}: the second install: {e:?}"));
+        assert_eq!(again.fast, installed.fast);
+        assert_eq!(again.released, installed.released);
+        assert_eq!(again.released_in_window(tip + 1, VAULT_RELEASE_WINDOW_BLOCKS),
+                   installed.released_in_window(tip + 1, VAULT_RELEASE_WINDOW_BLOCKS));
+    }
+}
+
+/// RC-3: a fast release signed by the relay key of its time stays valid when
+/// the build is re-armed with another key afterwards (history replays).
+#[test]
+fn history_signed_by_a_former_key_still_validates_after_rearming() {
+    let l = lane();
+    let parent = state_at(HEIGHT - 1, known(&l.c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = proposed_world(&r, PROPOSED);
+    let old = fast_block(HEIGHT, &r, ALICE, &l.c0, &world, &l.attestation(&world));
+    assert!(l.check(&old, &parent).is_ok());
+    // Re-armed with a new key (the only way of this build: the constant).
+    let (_, new_pk) = test_key("relay-2");
+    let mut rearmed = l.rules;
+    rearmed.base_return.fast.release_key = Some(new_pk);
+    assert!(
+        validate_block_destination(&old, &parent, &rearmed, &l.keys).is_ok(),
+        "the history signed by the former key no longer replays"
+    );
+}

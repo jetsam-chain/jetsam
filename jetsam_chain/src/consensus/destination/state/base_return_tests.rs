@@ -1555,3 +1555,51 @@ fn a_snapshot_file_without_advances_is_the_file_of_before() {
     };
     assert!(install(&early, HB - 3, &[]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// FIXRC (AUDIT-FINAL2 §3.5): ET-2
+// ---------------------------------------------------------------------------
+
+/// ET-2: junk advances — a burn of `RELEASE_FEE` paying its owner nothing, of
+/// an `n` no burn will ever have, advanced by the attacker to himself — as
+/// many as 160 blocks take, never make the boundary's snapshot file larger
+/// than what a node reads (else no node can join by snapshot, for ever).
+#[test]
+fn junk_advances_never_make_the_snapshot_unservable() {
+    let c0 = committee(1);
+    let rules = base_rules(&c0);
+    let keys = keys_of(&[&c0]);
+    let mut state = state_at(HB - 1, known(&c0));
+    let mut next = 1_000_000_000_000u64;
+    for h in HB..HB + 160 {
+        let mut per_block = 255u64;
+        loop {
+            let groups = (0..per_block)
+                .map(|i| advance_group(1_000 + 10 * i as u32, PAYER, next + i, PAYER, RF))
+                .collect();
+            let b = block_with(h, groups, vec![]);
+            match validate_block_destination(&b, &state, &rules, &keys) {
+                Ok(effect) => {
+                    state.apply(&effect, rules.release_retention_at(h)).unwrap();
+                    next += per_block;
+                    break;
+                }
+                // The most a block may carry, then.
+                Err(e) => {
+                    assert!(per_block > 4, "{e:?}");
+                    per_block = 4;
+                }
+            }
+        }
+    }
+    let file = state.snapshot_file_at(&keys, &rules).expect("a file");
+    let bytes = file.encode();
+    assert!(
+        bytes.len() <= MAX_DESTINATION_SNAPSHOT_FILE_BYTES,
+        "{} advances: a file of {} bytes, a node reads {}",
+        file.advances.len(),
+        bytes.len(),
+        MAX_DESTINATION_SNAPSHOT_FILE_BYTES
+    );
+    assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file));
+}
