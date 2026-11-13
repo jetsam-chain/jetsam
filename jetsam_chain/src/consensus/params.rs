@@ -659,6 +659,50 @@ pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = Some(8_982);
 #[cfg(feature = "rehearsal-v1-7")]
 pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
 
+/// FIXRC (AUDIT-FINAL2 ET-1, ET-2, 13 November 2026): from this height on,
+/// the advance of the return over Base takes its second format — its marker
+/// `JTMADV03` commits with 128 bits (`JTMADV02`, 64 bits, is refused: a
+/// snapshot could open it with another burn), a block makes at most 4
+/// advances, and an advance not consumed 14 400 blocks after it was made
+/// (one made before this height: after this height) is consumed, lost by its
+/// author (else junk advances make every snapshot unservable for ever).
+/// Below it every block is judged exactly as by a node without the fix
+/// (`4efe6c7`), and every state keeps its bytes.
+///
+/// **`None` on the public network and the private rehearsal** (their return
+/// over Base is dormant; arming it needs this height too, at or below it:
+/// [`return_fix_schedule_is_valid`]). On the test chain: a height the
+/// operator chooses at deployment, above the tip of the day by at least two
+/// days of blocks, every node redeployed before it (proposed 11 520: tip
+/// 10 351 on 13/11 ≈ 17:30 UTC, ≈ 290 to 480 blocks a day). **Easy to move:
+/// this constant only.**
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = None;
+/// The test chain's (proposed; the operator fixes it at deployment).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = Some(11_520);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = None;
+
+/// Whether a fix height may sit beside a return-over-Base height: both
+/// dormant, or both armed with the fix at or above the return.
+pub const fn return_fix_schedule_is_valid(
+    base_return_activation: Option<u64>,
+    fix_activation: Option<u64>,
+) -> bool {
+    match (base_return_activation, fix_activation) {
+        (None, None) => true,
+        (Some(base_return), Some(fix)) => fix >= base_return,
+        _ => false,
+    }
+}
+
+const _: () = assert!(
+    return_fix_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+    "V1_7_RETURN_FIX_HEIGHT must be None with a dormant V1_7_BASE_RETURN_HEIGHT, else armed at or above it"
+);
+
 /// Whether the return over Base governs the block at `height`.
 #[inline]
 pub const fn v1_7_base_return_active(height: u64) -> bool {

@@ -607,7 +607,8 @@ mod tests {
         }
         // Non-canonical annex lists are sealed by no digest.
         let oversized = SnapshotAnnexRef {
-            len: (4 << 20) + 1,
+            len: jetsam_chain::consensus::destination::state::MAX_DESTINATION_SNAPSHOT_FILE_BYTES as u32
+                + 1,
             ..destination
         };
         let empty = SnapshotAnnexRef { len: 0, ..journal };

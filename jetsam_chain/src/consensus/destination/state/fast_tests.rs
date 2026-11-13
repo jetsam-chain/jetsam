@@ -1851,21 +1851,122 @@ fn an_installed_state_exports_a_snapshot_another_node_installs() {
 }
 
 /// RC-3: a fast release signed by the relay key of its time stays valid when
-/// the build is re-armed with another key afterwards (history replays).
+/// the build is re-armed with another key afterwards (history replays); from
+/// the rotation's height the new key signs; a contradiction closes the key
+/// that signed its fast release, not the new one. Base's pins likewise: a
+/// block keeps the pins of its height.
 #[test]
 fn history_signed_by_a_former_key_still_validates_after_rearming() {
+    use crate::consensus::destination::fast::FastKeyRotation;
     let l = lane();
     let parent = state_at(HEIGHT - 1, known(&l.c0));
     let r = release(3, ALICE, 5 * JTM);
     let world = proposed_world(&r, PROPOSED);
     let old = fast_block(HEIGHT, &r, ALICE, &l.c0, &world, &l.attestation(&world));
     assert!(l.check(&old, &parent).is_ok());
-    // Re-armed with a new key (the only way of this build: the constant).
-    let (_, new_pk) = test_key("relay-2");
+    // Re-armed from HEIGHT + 5 with a new pair of keys.
+    let (relay2, relay2_pk) = test_key("relay-2");
+    let (_, cold2_pk) = test_key("cold-2");
+    let rotations: &'static [FastKeyRotation] = Box::leak(Box::new([
+        FastKeyRotation {
+            height: HB,
+            release_key: l.rules.base_return.fast.release_key,
+            revoke_key: l.rules.base_return.fast.revoke_key,
+        },
+        FastKeyRotation {
+            height: HEIGHT + 5,
+            release_key: Some(relay2_pk),
+            revoke_key: Some(cold2_pk),
+        },
+    ]));
     let mut rearmed = l.rules;
-    rearmed.base_return.fast.release_key = Some(new_pk);
-    assert!(
-        validate_block_destination(&old, &parent, &rearmed, &l.keys).is_ok(),
-        "the history signed by the former key no longer replays"
+    rearmed.base_return.fast.rotations = rotations;
+    assert!(crate::consensus::destination::fast::fast_rotations_are_valid(
+        rotations,
+        Some(HB),
+        l.rules.base_return.fast.release_key,
+        l.rules.base_return.fast.revoke_key,
+    ));
+    let check = |b: &Block, s: &DestinationState| validate_block_destination(b, s, &rearmed, &l.keys);
+    let effect = check(&old, &parent).expect("the history replays under the table");
+    let after = applied(&parent, &effect);
+    // From HEIGHT + 5: the new key signs; the former one no longer does.
+    let tip = (HEIGHT + 1..HEIGHT + 5).fold(after.clone(), |s, h| {
+        applied(&s, &check(&block_with(h, vec![], vec![]), &s).expect("empty"))
+    });
+    let r9 = release(9, BOB, 2 * JTM);
+    let w9 = proposed_world(&r9, PROPOSED);
+    let by_old = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &l.attestation(&w9));
+    assert_eq!(check(&by_old, &tip), Err(DestinationBlockError::FastBadSignature));
+    let statement = l.statement(&w9);
+    let by_new = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &attest(&relay2, statement));
+    assert!(check(&by_new, &tip).is_ok());
+    // The contradiction of the release of HEIGHT closes the key that signed
+    // it, not the one in force now.
+    let record = after.fast.records[&3];
+    let truth = release(3, BOB, 7 * JTM);
+    let final_world = base_world(&truth, VALID, TIMES);
+    let entry = ContradictionEntry {
+        n: 3,
+        owner: record.owner,
+        amount: record.amount,
+        l2_block: record.l2_block,
+        height: record.height,
+        key: l.rules.base_return.fast.release_key,
+    };
+    let b = contradiction_block(
+        HEIGHT + 5,
+        &l,
+        &final_world,
+        &[(3, final_world.storage_proof.clone())],
+        &[entry],
+        &[],
     );
+    let effect = check(&b, &tip).expect("the contradiction");
+    assert_eq!(effect.fast.contradicted, vec![entry]);
+    let fused = applied(&tip, &effect);
+    assert!(fused.fast.is_closed(&l.relay_key()));
+    assert!(!fused.fast.is_closed(&relay2_pk));
+    let next = fast_block(
+        HEIGHT + 6,
+        &r9,
+        BOB,
+        &l.c0,
+        &w9,
+        &attest(&relay2, statement),
+    );
+    assert!(check(&next, &fused).is_ok(), "the new key is open");
+    // A contradiction naming the new key is not this record's.
+    let wrong = ContradictionEntry {
+        key: Some(relay2_pk),
+        ..entry
+    };
+    let b = contradiction_block(
+        HEIGHT + 5,
+        &l,
+        &final_world,
+        &[(3, final_world.storage_proof.clone())],
+        &[wrong],
+        &[],
+    );
+    assert_eq!(check(&b, &tip), Err(DestinationBlockError::FastObjectsDoNotMatchMarkers));
+    // Base's pins: other pins from HEIGHT + 5 on. The block of HEIGHT keeps
+    // the pins of its time; at HEIGHT + 5 the old contracts are refused.
+    let mut repinned = l.rules;
+    let other = BaseParams {
+        system_config_impl: [0x77; 20],
+        ..l.rules.base_return.base
+    };
+    repinned.base_return.base.rotations = Box::leak(Box::new([(HEIGHT + 5, other)]));
+    assert!(validate_block_destination(&old, &parent, &repinned, &l.keys).is_ok());
+    let by_old_pins = fast_block(HEIGHT + 5, &r9, BOB, &l.c0, &w9, &l.attestation(&w9));
+    assert!(matches!(
+        validate_block_destination(&by_old_pins, &tip, &repinned, &l.keys),
+        Err(DestinationBlockError::BaseReturn(BaseReturnError::Game(
+            BaseGameError::UnknownImplementation(_)
+        )))
+    ));
+    // Without a table, the rules a block is judged by are the build's.
+    assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.fast, l.rules.base_return.fast);
+    assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.base, l.rules.base_return.base);
 }

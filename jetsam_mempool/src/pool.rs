@@ -1616,6 +1616,7 @@ fn check_advance_admission(
         Vec::new(),
         &st.vault_rules,
         &base_return.advance,
+        next_height,
     )
     .group(0, spend.input_owner, &outputs)
     .map_err(DestinationBlockError::Advance)
@@ -4548,6 +4549,43 @@ mod tests {
         below.submit(&pool).await.expect("an ordinary spend below the height");
         let pool = with_value.pool_at(tip, 0);
         with_value.submit(&pool).await.expect("an ordinary spend while dormant");
+    }
+
+    /// FIXRC ET-1: from the fix height on (the next block's), the pool judges
+    /// an advance as the block does: `JTMADV03` admitted, `JTMADV02` refused
+    /// (the format of before); below it, a `JTMADV03` group is an ordinary
+    /// spend (even one the rule would refuse).
+    #[tokio::test]
+    async fn under_the_fix_the_pool_takes_the_second_format_only() {
+        use jetsam_chain::consensus::destination::advance::{
+            advance_marker, advance_marker_v3, AdvanceError, AdvanceRules,
+        };
+        use jetsam_chain::consensus::vault::RELEASE_FEE_MICRO;
+        let jtm = jetsam_chain::consensus::params::MICRO_PER_JTM;
+        let amount = 10 * jtm;
+        let paid = AdvanceRules::CONSENSUS.min_paid(amount, RELEASE_FEE_MICRO);
+        let v2 = advance_marker(3, &ALICE, amount, &PAYER);
+        let v3 = advance_marker_v3(3, &ALICE, amount, &PAYER).unwrap();
+        let tip = BASE_HEIGHT;
+        let fixed = |case: &VaultCase, fix: u64| {
+            let mut view = over_base_view(case.view_at(tip, 0), &[]);
+            view.destination_rules.base_return.advance.fix_height = Some(fix);
+            pool_over(view)
+        };
+        let new_format = VaultCase::new(tip, PAYER, &[(ALICE, paid), (v3, 0)]);
+        let pool = fixed(&new_format, tip + 1);
+        new_format.submit(&pool).await.expect("JTMADV03 at the fix");
+        assert_eq!(pool.len().await, 1);
+        let old_format = VaultCase::new(tip, PAYER, &[(ALICE, paid), (v2, 0)]);
+        let pool = fixed(&old_format, tip + 1);
+        assert_eq!(
+            advance_refusal(old_format.submit(&pool).await),
+            Some(AdvanceError::ObsoleteAdvanceMarker { group: 0 })
+        );
+        // Below the fix: a JTMADV03 group carrying value is an ordinary spend.
+        let with_value = VaultCase::new(tip, PAYER, &[(ALICE, paid), (v3, 9)]);
+        let pool = fixed(&with_value, tip + 2);
+        with_value.submit(&pool).await.expect("an ordinary spend below the fix");
     }
 
     /// An advance-shaped group admitted below the return-over-Base height is

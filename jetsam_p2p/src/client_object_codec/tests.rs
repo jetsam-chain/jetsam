@@ -482,7 +482,8 @@ async fn snapshot_annex_index_and_chunks_are_checked_on_reception() {
     };
     assert_eq!(beyond.expected_len(), None);
     assert!(request_round_trip(beyond).await.is_err());
-    for len in [0u32, (4 << 20) + 1] {
+    let over = jetsam_chain::consensus::destination::state::MAX_DESTINATION_SNAPSHOT_FILE_BYTES as u32 + 1;
+    for len in [0u32, over] {
         let bad = ClientObjectRequest::SnapshotAnnexIndex(SnapshotAnnexRef {
             kind: SnapshotAnnexKind::DestinationState,
             len,

@@ -49,7 +49,12 @@ pub(super) fn base_rules(anchor: &Committee) -> DestinationRules {
         activation_height: Some(HB),
         network: L1_MAINNET,
         base: BASE_SEPOLIA,
-        advance: AdvanceRules::CONSENSUS,
+        // FIXRC: not armed here (the test clock is far above the test
+        // chain's fix height); the tests of the fix arm it (`fixed_rules`).
+        advance: AdvanceRules {
+            fix_height: None,
+            ..AdvanceRules::CONSENSUS
+        },
         fast: crate::consensus::destination::fast::FastLaneRules::CONSENSUS,
         anchor: None,
         bridge: None,
@@ -1557,41 +1562,64 @@ fn a_snapshot_file_without_advances_is_the_file_of_before() {
 }
 
 // ---------------------------------------------------------------------------
-// FIXRC (AUDIT-FINAL2 §3.5): ET-2
+// FIXRC (AUDIT-FINAL2 §3.5): ET-1, ET-2
 // ---------------------------------------------------------------------------
+
+/// The rules of these tests with the fix armed at `fix`.
+fn fixed_rules(c0: &Committee, fix: u64) -> DestinationRules {
+    let mut rules = base_rules(c0);
+    rules.base_return.advance.fix_height = Some(fix);
+    rules
+}
+
+/// An advance group of the second format (`JTMADV03`).
+fn advance_group_v3(
+    slot_base: u32,
+    advancer: Address,
+    n: u64,
+    owner: Address,
+    amount: u64,
+) -> Vec<jetsam_tx::Transaction> {
+    use crate::consensus::destination::advance::advance_marker_v3;
+    let paid = AdvanceRules::CONSENSUS.min_paid(amount, RF);
+    let marker = advance_marker_v3(n, &owner, amount, &advancer).expect("fits");
+    logical(slot_base, advancer, &[(owner, paid), (marker, 0)], FEE)
+}
 
 /// ET-2: junk advances — a burn of `RELEASE_FEE` paying its owner nothing, of
 /// an `n` no burn will ever have, advanced by the attacker to himself — as
 /// many as 160 blocks take, never make the boundary's snapshot file larger
 /// than what a node reads (else no node can join by snapshot, for ever).
+/// Under the fix a block takes 4 of them (a block of 255 is refused).
 #[test]
 fn junk_advances_never_make_the_snapshot_unservable() {
     let c0 = committee(1);
-    let rules = base_rules(&c0);
+    let rules = fixed_rules(&c0, HB);
     let keys = keys_of(&[&c0]);
     let mut state = state_at(HB - 1, known(&c0));
-    let mut next = 1_000_000_000_000u64;
+    let mut next = 100_000_000u64;
+    let groups = |next: u64, count: u64| -> Vec<Vec<jetsam_tx::Transaction>> {
+        (0..count)
+            .map(|i| advance_group_v3(1_000 + 10 * i as u32, PAYER, next + i, PAYER, RF))
+            .collect()
+    };
+    // 255 in one block: refused at the fifth (the rule is the same at every
+    // height; tried once, a debug build hashes slowly).
+    let e = validate_block_destination(&block_with(HB, groups(next, 255), vec![]), &state, &rules, &keys)
+        .expect_err("255 advances in a block");
+    assert_eq!(
+        e,
+        DestinationBlockError::Advance(AdvanceError::TooManyAdvances { group: 4, max: 4 })
+    );
+    assert!(e.condemns_block());
+    // Then the most a block may carry, 160 blocks long.
     for h in HB..HB + 160 {
-        let mut per_block = 255u64;
-        loop {
-            let groups = (0..per_block)
-                .map(|i| advance_group(1_000 + 10 * i as u32, PAYER, next + i, PAYER, RF))
-                .collect();
-            let b = block_with(h, groups, vec![]);
-            match validate_block_destination(&b, &state, &rules, &keys) {
-                Ok(effect) => {
-                    state.apply(&effect, rules.release_retention_at(h)).unwrap();
-                    next += per_block;
-                    break;
-                }
-                // The most a block may carry, then.
-                Err(e) => {
-                    assert!(per_block > 4, "{e:?}");
-                    per_block = 4;
-                }
-            }
-        }
+        let b = block_with(h, groups(next, 4), vec![]);
+        let effect = validate_block_destination(&b, &state, &rules, &keys).expect("four");
+        state.apply(&effect, rules.release_retention_at(h)).unwrap();
+        next += 4;
     }
+    assert_eq!(state.advances.len(), 640);
     let file = state.snapshot_file_at(&keys, &rules).expect("a file");
     let bytes = file.encode();
     assert!(
@@ -1602,4 +1630,326 @@ fn junk_advances_never_make_the_snapshot_unservable() {
         MAX_DESTINATION_SNAPSHOT_FILE_BYTES
     );
     assert_eq!(DestinationSnapshotFile::decode(&bytes), Ok(file));
+}
+
+/// ET-2: the true worst case of a boundary under the fix — every release of
+/// the horizon (4 a block), the most advances held (4 a block for a
+/// lifetime) beside a memory per fast release, a contradiction per release,
+/// a revocation per key, two committee updates of a full section — is a file
+/// a node reads; one byte more is refused.
+#[test]
+fn the_snapshot_file_bound_holds_the_worst_case() {
+    use crate::consensus::destination::advance::{ADVANCE_LIFETIME_BLOCKS, ADVANCE_MAX_PER_BLOCK};
+    use crate::consensus::destination::fast::FAST_RECONCILE_BLOCKS;
+    use crate::consensus::vault::MAX_RELEASES_PER_BLOCK;
+    let releases = (FAST_RECONCILE_BLOCKS as usize + 1) * MAX_RELEASES_PER_BLOCK;
+    let advances = ADVANCE_MAX_PER_BLOCK * ADVANCE_LIFETIME_BLOCKS as usize + releases;
+    let update = vec![7u8; crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES];
+    let file = DestinationSnapshotFile {
+        committee_updates: vec![update.clone(), update],
+        window_releases: Vec::new(),
+        advances: (0..advances as u64)
+            .map(|n| (n, entry_of(PAYER, ALICE, u64::MAX)))
+            .collect(),
+        fast: Some(FastSnapshot {
+            releases: (0..releases as u64)
+                .map(|n| SnapshotRelease {
+                    n,
+                    owner: ALICE,
+                    amount: JTM,
+                    fast_l2_block: Some(n),
+                })
+                .collect(),
+            contradictions: (0..releases as u64)
+                .map(|n| ContradictionEntry {
+                    n,
+                    owner: ALICE,
+                    amount: JTM,
+                    l2_block: n,
+                    height: n,
+                    key: Some([9; 48]),
+                })
+                .collect(),
+            revocations: vec![[9; 48]; MAX_SNAPSHOT_FAST_KEYS],
+        }),
+    };
+    let bytes = file.encode();
+    assert_eq!(bytes.len(), MAX_DESTINATION_SNAPSHOT_FILE_BYTES);
+    assert!(DestinationSnapshotFile::decode(&bytes).is_ok());
+    let mut over = bytes;
+    over.push(0);
+    assert_eq!(
+        DestinationSnapshotFile::decode(&over),
+        Err(DestinationStateError::Malformed)
+    );
+}
+
+/// ET-2: under the fix a block makes at most 4 advances (the template leaves
+/// the fifth for a later block); below it, as before, any number.
+#[test]
+fn a_block_makes_at_most_four_advances_under_the_fix() {
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let rules = fixed_rules(&c0, HB + 1);
+    let parent = state_at(HB, known(&c0));
+    let five = |v3: bool| {
+        (0..5u64)
+            .map(|i| {
+                if v3 {
+                    advance_group_v3(300 + 20 * i as u32, PAYER, 10 + i, ALICE, JTM)
+                } else {
+                    advance_group(300 + 20 * i as u32, PAYER, 10 + i, ALICE, JTM)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        validate_block_destination(&block_with(HB + 1, five(true), vec![]), &parent, &rules, &keys),
+        Err(DestinationBlockError::Advance(AdvanceError::TooManyAdvances {
+            group: 4,
+            max: 4
+        }))
+    );
+    let four = five(true).into_iter().take(4).collect();
+    let effect = validate_block_destination(&block_with(HB + 1, four, vec![]), &parent, &rules, &keys)
+        .expect("four");
+    assert_eq!((effect.advances.created.len(), effect.advances.made_at), (4, Some(HB + 1)));
+    // Below the fix (the block HB): five, the format of before.
+    let below = state_at(HB - 1, known(&c0));
+    let effect = validate_block_destination(&block_with(HB, five(false), vec![]), &below, &rules, &keys)
+        .expect("five below the fix");
+    assert_eq!((effect.advances.created.len(), effect.advances.made_at), (5, None));
+}
+
+/// ET-1: at the fix height the marker takes its second format: `JTMADV02`
+/// is refused (as `JTMADV01` was), `JTMADV03` is the advance; below it a
+/// `JTMADV03` group is an ordinary spend and its owner is not locked (V5),
+/// exactly as for a node without the fix.
+#[test]
+fn the_advance_marker_takes_its_second_format_at_the_fix_height() {
+    use crate::consensus::client_objects::{is_client_locked_address_at, ClientBatchRules};
+    use crate::consensus::destination::advance::{advance_marker_v3, is_advance_v3_locked_address_at};
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let rules = fixed_rules(&c0, HB + 1);
+    let v3 = vec![advance_group_v3(300, PAYER, 7, ALICE, 5 * JTM)];
+    let v2 = vec![advance_group(300, PAYER, 7, ALICE, 5 * JTM)];
+    let below = state_at(HB - 1, known(&c0));
+    let effect = validate_block_destination(&block_with(HB, v3.clone(), vec![]), &below, &rules, &keys)
+        .expect("an ordinary spend below the fix");
+    assert!(effect.advances.is_empty());
+    assert_eq!(
+        validate_block_destination(&block_with(HB, v2.clone(), vec![]), &below, &rules, &keys)
+            .map(|e| e.advances.created.len()),
+        Ok(1)
+    );
+    let parent = state_at(HB, known(&c0));
+    assert_eq!(
+        validate_block_destination(&block_with(HB + 1, v2, vec![]), &parent, &rules, &keys),
+        Err(DestinationBlockError::Advance(
+            AdvanceError::ObsoleteAdvanceMarker { group: 0 }
+        ))
+    );
+    let effect = validate_block_destination(&block_with(HB + 1, v3, vec![]), &parent, &rules, &keys)
+        .expect("JTMADV03 at the fix");
+    let mut after = parent.clone();
+    after.apply(&effect, VAULT_RELEASE_WINDOW_BLOCKS).unwrap();
+    let key = entry_of(PAYER, ALICE, 5 * JTM).key(7);
+    assert_eq!(after.advances.made(&key), Some(HB + 1));
+    assert_eq!(
+        after.advances.marker_of(&key),
+        advance_marker_v3(7, &ALICE, 5 * JTM, &PAYER)
+    );
+    // V5 for JTMADV03 from the fix height on only.
+    let marker = advance_marker_v3(7, &ALICE, 5 * JTM, &PAYER).unwrap();
+    assert!(!is_advance_v3_locked_address_at(&marker, HB, Some(HB + 1)));
+    assert!(is_advance_v3_locked_address_at(&marker, HB + 1, Some(HB + 1)));
+    assert!(!is_advance_v3_locked_address_at(&marker, u64::MAX, None));
+    let batch = ClientBatchRules::CONSENSUS;
+    assert_eq!(
+        is_client_locked_address_at(&marker, 0, &batch),
+        false,
+        "an ordinary owner far below the fix"
+    );
+    // A transfer of a JTMADV03 advance names its 16-byte commitment's first
+    // 8 bytes and opens as any transfer.
+    let held = *after.advances.get(&key).unwrap();
+    let transfer = after.advances.transfer_marker_of(&key, &BOB).unwrap();
+    assert_eq!(&transfer.0[8..16], &marker.0[16..24]);
+    let b = block_with(
+        HB + 2,
+        vec![logical(400, PAYER, &[(BOB, JTM), (transfer, 0)], FEE)],
+        vec![],
+    );
+    let effect = validate_block_destination(&b, &after, &rules, &keys).expect("a transfer");
+    assert_eq!(effect.advances.transfers, vec![(key, BOB)]);
+    assert_ne!(transfer, held.transfer_marker(7, &BOB), "not the JTMADV02 naming");
+}
+
+/// ET-2 through the branch and a snapshot: an advance of before the fix
+/// (`JTMADV02`) lives until the fix height plus the lifetime, one made under
+/// it (`JTMADV03`) for the lifetime from its block; each is consumed by the
+/// block that ends it (its author's outstanding freed), a transfer before
+/// keeps it; at every height the snapshot export installs, from the branch's
+/// markers, to exactly the replay's advances (with their heights), the state
+/// bytes round-trip, and the undo gives back each state byte for byte.
+#[test]
+fn advances_end_with_their_lifetime_and_a_snapshot_is_the_replay() {
+    use crate::consensus::destination::advance::advance_marker_v3;
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let fix = HB + 2;
+    let mut rules = fixed_rules(&c0, fix);
+    rules.base_return.advance.lifetime_blocks = 3;
+    let at = |h: u64, i: u64| h * 10 - 9 + i;
+    let legacy = entry_of(PAYER, ALICE, 5 * JTM);
+    let made = entry_of(BOB, ALICE, 2 * JTM);
+    // (block, groups, markers it creates)
+    let mut plan: Vec<(u64, Vec<Vec<jetsam_tx::Transaction>>, Vec<Address>)> = vec![
+        (HB, vec![advance_group(300, PAYER, 3, ALICE, 5 * JTM)], vec![legacy.marker(3)]),
+        // Below the fix, a JTMADV03-shaped group is an ordinary spend: its
+        // output is no advance, for the replay as for a snapshot.
+        (
+            HB + 1,
+            vec![advance_group_v3(300, PAYER, 5, ALICE, JTM)],
+            vec![advance_marker_v3(5, &ALICE, JTM, &PAYER).unwrap()],
+        ),
+        (HB + 2, vec![], vec![]),
+        (
+            HB + 3,
+            vec![advance_group_v3(300, BOB, 4, ALICE, 2 * JTM)],
+            vec![advance_marker_v3(4, &ALICE, 2 * JTM, &BOB).unwrap()],
+        ),
+    ];
+    for h in HB + 4..=HB + 8 {
+        plan.push((h, vec![], vec![]));
+    }
+    let mut states = vec![state_at(HB - 1, known(&c0))];
+    let mut slots: Vec<(Address, u64)> = Vec::new();
+    for (h, groups, markers) in plan {
+        let tip = states.last().unwrap().clone();
+        let effect = validate_block_destination(&block_with(h, groups, vec![]), &tip, &rules, &keys)
+            .unwrap_or_else(|e| panic!("block {h}: {e:?}"));
+        let expected: Vec<AdvanceKey> = match h {
+            // The legacy one: clock = the fix height; ends with fix + 3.
+            _ if h == fix + 3 => vec![legacy.key(3)],
+            // The one made at HB + 3: ends with HB + 6.
+            _ if h == HB + 6 => vec![made.key(4)],
+            _ => vec![],
+        };
+        assert_eq!(effect.advances.expired, expected, "block {h}");
+        let mut next = tip.clone();
+        next.apply(&effect, rules.release_retention_at(h)).unwrap();
+        for (i, marker) in markers.iter().enumerate() {
+            slots.push((*marker, at(h, i as u64)));
+        }
+        states.push(next);
+    }
+    let held = |h: u64| states[(h + 1 - HB) as usize].advances.clone();
+    assert!(!held(HB + 1).holds_n(5), "an ordinary output below the fix");
+    assert!(held(fix + 2).get(&legacy.key(3)).is_some());
+    assert!(held(fix + 3).get(&legacy.key(3)).is_none());
+    assert_eq!(held(fix + 3).outstanding_of(&PAYER), 0);
+    assert_eq!(held(HB + 5).made(&made.key(4)), Some(HB + 3));
+    assert!(held(HB + 6).is_empty());
+    assert_eq!(held(HB + 6).outstanding_of(&BOB), 0);
+    // Snapshot = replay, at every height; bytes; undo.
+    for state in &states[1..] {
+        let file = DestinationSnapshotFile {
+            committee_updates: Vec::new(),
+            ..state.snapshot_file_at(&keys, &rules).expect("a file")
+        };
+        let floor = alloc(rules.activation_height.unwrap() - 1).unwrap();
+        let mut check = SnapshotDestinationCheck::new(&file, state.tip, floor, rules);
+        for (owner, id) in slots.iter().filter(|(_, id)| id.div_ceil(10) <= state.tip) {
+            check.observe_slot(owner, 0, *id);
+        }
+        let rebuilt = check
+            .finish(alloc, &mut CommitteeKeyCache::default())
+            .unwrap_or_else(|e| panic!("tip {}: {e:?}", state.tip));
+        assert_eq!(rebuilt.advances, state.advances, "tip {}", state.tip);
+        assert_eq!(DestinationState::decode(&state.encode()), Ok(state.clone()), "tip {}", state.tip);
+        let version = state.encode()[0];
+        let expected = if state.tip >= HB + 3 { DESTINATION_STATE_VERSION_FIX } else { DESTINATION_STATE_VERSION_ADVANCES };
+        if state.tip <= HB + 6 + DESTINATION_UNDO_BLOCKS {
+            assert_eq!(version, expected, "tip {}", state.tip);
+        }
+    }
+    let mut s = states.last().unwrap().clone();
+    for before in states.iter().rev().skip(1) {
+        s = s.truncate_above(before.tip).unwrap().unwrap();
+        assert_eq!(&s, before);
+        assert_eq!(s.encode(), before.encode());
+    }
+}
+
+/// ET-1: two burns of `n` = 7 — owners `a` and `b`, one amount, one advancer
+/// — whose `JTMADV02` markers are the same 32 bytes: a 64-bit collision found
+/// by a parallel rho search of 3 240 207 372 hashes (≈ 2³², 2 h 22 min on 5 cores,
+/// `/opt/jetsam-v17-logs/FIXRC/collide/`). Below the fix a snapshot opens the
+/// advance of `(7, a)` as one of `(7, b)` (the red test of the audit); under the
+/// fix the advance's marker is `JTMADV03` (128 bits): the same lie is refused,
+/// and the honest file installs to the replay's advance.
+const COLLIDING_OWNERS: (Address, Address) = (Address([
+    0xd8, 0x38, 0x82, 0x56, 0x21, 0x66, 0x1b, 0x9f, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+]), Address([
+    0x2c, 0xaa, 0xbf, 0x78, 0x36, 0x58, 0x17, 0xa2, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+]));
+
+#[test]
+fn a_snapshot_cannot_open_an_advance_marker_with_another_burn() {
+    use crate::consensus::destination::advance::{advance_marker, advance_marker_v3};
+    let (a, b) = COLLIDING_OWNERS;
+    assert_ne!(a, b);
+    assert_eq!(
+        advance_marker(7, &a, 5 * JTM, &PAYER),
+        advance_marker(7, &b, 5 * JTM, &PAYER),
+        "the pair collides under JTMADV02"
+    );
+    assert_ne!(advance_marker_v3(7, &a, 5 * JTM, &PAYER), advance_marker_v3(7, &b, 5 * JTM, &PAYER));
+    // The JTMADV03 marker: `n << 36 | amount`, then 16 bytes of the hash of
+    // the four fields under its own domain.
+    let v3 = advance_marker_v3(7, &a, 5 * JTM, &PAYER).unwrap();
+    let mut fields = [0u8; 80];
+    fields[..8].copy_from_slice(&7u64.to_le_bytes());
+    fields[8..40].copy_from_slice(&a.0);
+    fields[40..48].copy_from_slice(&(5 * JTM).to_le_bytes());
+    fields[48..].copy_from_slice(&PAYER.0);
+    let c = jetsam_poseidon2b::native::poseidon2b_hash_bytes(
+        b"JTM/CONSENSUS/V1.7/BASE-RETURN/ADVANCE/V3",
+        &fields,
+    );
+    assert_eq!(&v3.0[..8], b"JTMADV03");
+    assert_eq!(&v3.0[8..16], &(7u64 << 36 | 5 * JTM).to_le_bytes());
+    assert_eq!(&v3.0[16..], &c[..16]);
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let rules = fixed_rules(&c0, HB);
+    // The branch makes the advance of (7, a) under the fix.
+    let parent = state_at(HB, known(&c0));
+    let b1 = block_with(HB + 1, vec![advance_group_v3(300, PAYER, 7, a, 5 * JTM)], vec![]);
+    let effect = validate_block_destination(&b1, &parent, &rules, &keys).expect("the advance");
+    let mut state = parent.clone();
+    state.apply(&effect, rules.release_retention_at(HB + 1)).unwrap();
+    let slots = vec![(advance_marker_v3(7, &a, 5 * JTM, &PAYER).unwrap(), (HB + 1) * 10 - 9)];
+    let install = |advances: Vec<(u64, AdvanceEntry)>| {
+        let file = DestinationSnapshotFile {
+            committee_updates: Vec::new(),
+            window_releases: Vec::new(),
+            advances,
+            fast: Some(FastSnapshot::default()),
+        };
+        let floor = alloc(rules.activation_height.unwrap() - 1).unwrap();
+        let mut check = SnapshotDestinationCheck::new(&file, HB + 1, floor, rules);
+        for (owner, id) in &slots {
+            check.observe_slot(owner, 0, *id);
+        }
+        check.finish(alloc, &mut CommitteeKeyCache::default())
+    };
+    let honest = install(vec![(7, entry_of(PAYER, a, 5 * JTM))]).expect("the honest file");
+    assert_eq!(honest.advances, state.advances);
+    assert!(matches!(
+        install(vec![(7, entry_of(PAYER, b, 5 * JTM))]),
+        Err(SnapshotDestinationError::Mismatch { .. })
+    ));
 }

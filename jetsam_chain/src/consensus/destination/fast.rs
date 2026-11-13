@@ -161,14 +161,38 @@ const _: () = assert!(
 // A snapshot draws the window (V6) out of the releases of the horizon.
 const _: () = assert!(VAULT_RELEASE_WINDOW_BLOCKS <= FAST_RECONCILE_BLOCKS);
 
+/// FIXRC RC-3 (AUDIT-FINAL2): the fast lane's keys from `height` on (a
+/// re-arming after a fuse or a revocation, SPEC §8), as the other
+/// activations: the blocks below `height` keep the keys of their time, so the
+/// history still replays, and a contradiction closes the key that signed its
+/// fast release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FastKeyRotation {
+    pub height: u64,
+    pub release_key: Option<[u8; KEY_BYTES]>,
+    pub revoke_key: Option<[u8; KEY_BYTES]>,
+}
+
+/// This build's rotations: none (the keys of [`FAST_RELEASE_KEY`] and
+/// [`FAST_REVOKE_KEY`] for ever). A re-arming appends one, at a height above
+/// every block of before; when there is one, the first entry is the
+/// return-over-Base height's keys (`fast_rotations_are_valid`).
+pub const FAST_KEY_ROTATIONS: &[FastKeyRotation] = &[];
+
 /// The fast lane's parameters; [`FastLaneRules::CONSENSUS`] is this build's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FastLaneRules {
+    /// The keys in force: the return-over-Base height's in
+    /// [`Self::CONSENSUS`], those of the block's height in the rules a block
+    /// is judged by (`DestinationRules::effective_at`).
     pub release_key: Option<[u8; KEY_BYTES]>,
     pub revoke_key: Option<[u8; KEY_BYTES]>,
     pub reconcile_blocks: u64,
     pub l1_chain_id: u64,
     pub base_chain_id: u64,
+    /// FIXRC RC-3: the keys by height ([`FAST_KEY_ROTATIONS`]); empty: the
+    /// keys above for ever.
+    pub rotations: &'static [FastKeyRotation],
 }
 
 impl FastLaneRules {
@@ -178,8 +202,101 @@ impl FastLaneRules {
         reconcile_blocks: FAST_RECONCILE_BLOCKS,
         l1_chain_id: FAST_L1_CHAIN_ID,
         base_chain_id: FAST_BASE_CHAIN_ID,
+        rotations: FAST_KEY_ROTATIONS,
     };
+
+    /// The rotation in force at `height`: the last one at or below it.
+    const fn rotation_at(&self, height: u64) -> Option<&FastKeyRotation> {
+        let mut found = None;
+        let mut i = 0;
+        while i < self.rotations.len() {
+            if self.rotations[i].height <= height {
+                found = Some(&self.rotations[i]);
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// The relay key in force at `height` (the one that signs its fast
+    /// releases).
+    pub const fn release_key_at(&self, height: u64) -> Option<[u8; KEY_BYTES]> {
+        match self.rotation_at(height) {
+            Some(rotation) => rotation.release_key,
+            None => self.release_key,
+        }
+    }
+
+    /// These rules with the keys in force at `height` (the table kept).
+    pub const fn at(&self, height: u64) -> Self {
+        match self.rotation_at(height) {
+            Some(rotation) => Self {
+                release_key: rotation.release_key,
+                revoke_key: rotation.revoke_key,
+                ..*self
+            },
+            None => *self,
+        }
+    }
 }
+
+/// Whether a rotation table may sit beside the keys of the return-over-Base
+/// height `base_return`: empty; or its first entry is that height with those
+/// keys, the heights strictly increase, and every entry's keys are valid.
+pub const fn fast_rotations_are_valid(
+    rotations: &[FastKeyRotation],
+    base_return: Option<u64>,
+    release: Option<[u8; KEY_BYTES]>,
+    revoke: Option<[u8; KEY_BYTES]>,
+) -> bool {
+    if rotations.is_empty() {
+        return true;
+    }
+    let first = &rotations[0];
+    if !matches!(base_return, Some(h) if h == first.height)
+        || !keys_equal(first.release_key, release)
+        || !keys_equal(first.revoke_key, revoke)
+    {
+        return false;
+    }
+    let mut i = 0;
+    while i < rotations.len() {
+        if !fast_keys_are_valid(rotations[i].release_key, rotations[i].revoke_key)
+            || (i > 0 && rotations[i].height <= rotations[i - 1].height)
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn keys_equal(a: Option<[u8; KEY_BYTES]>, b: Option<[u8; KEY_BYTES]>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            let mut i = 0;
+            while i < KEY_BYTES {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+const _: () = assert!(
+    fast_rotations_are_valid(
+        FAST_KEY_ROTATIONS,
+        crate::consensus::params::V1_7_BASE_RETURN_HEIGHT,
+        FAST_RELEASE_KEY,
+        FAST_REVOKE_KEY
+    ),
+    "FAST_KEY_ROTATIONS: empty, or starting at the return-over-Base height with its keys, by increasing height"
+);
 
 // ---------------------------------------------------------------------------
 // The objects
@@ -499,6 +616,11 @@ impl ContradictionEntry {
         out[16..].copy_from_slice(&commitment[..16]);
         Address(out)
     }
+}
+
+/// The `n` a contradiction's marker carries in clear ([`ContradictionEntry::marker`]).
+pub fn fast_contradiction_marker_n(marker: &Address) -> u64 {
+    u64::from_le_bytes(marker.0[8..16].try_into().expect("eight bytes"))
 }
 
 /// The marker of the group of a revocation of `key`: the tag, then 24 bytes

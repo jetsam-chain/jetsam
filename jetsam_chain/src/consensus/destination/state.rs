@@ -44,16 +44,17 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 use jetsam_poseidon2b::primitives::Address;
 
 use super::advance::{
-    advance_marker_commitment, advance_marker_fields, advance_transfer_marker_advance,
-    release_payee, validate_block_advances, AdvanceBook, AdvanceEffect, AdvanceEntry, AdvanceError,
-    AdvanceKey, AdvanceRules,
+    advance_marker_commitment, advance_marker_fields, advance_marker_kind, advance_marker_of,
+    advance_transfer_marker_advance, release_payee, validate_block_advances, AdvanceBook,
+    AdvanceEffect, AdvanceEntry, AdvanceError, AdvanceKey, AdvanceMarkerKind, AdvanceRules,
 };
 use super::base_read::{
     decode_game_proof, decode_output_root_preimage, judge_game_fast, open_output_root,
     read_game_facts, verify_base_state_root, BaseParams, BaseReturnError, BaseState,
 };
 use super::fast::{
-    fast_marker_kind, fast_release_marker, revocation_marker, verify_attestation,
+    fast_contradiction_marker_n, fast_marker_kind, fast_release_marker, revocation_marker,
+    verify_attestation,
     verify_revocation, ContradictionEntry, FastAttestation, FastContradiction, FastEffect,
     FastLaneRules, FastLaneState, FastMarkerKind, FastRecord, FastRevocation, FastSignatureError,
     FastUndo, KEY_BYTES,
@@ -334,6 +335,13 @@ impl DestinationRules {
                     Some(bridge) => Some(bridge),
                     None => self.bridge,
                 },
+                // FIXRC RC-3: the relay's keys and Base's pins of this height
+                // (unchanged while their tables are empty).
+                base_return: BaseReturnRules {
+                    base: self.base_return.base.at(height),
+                    fast: self.base_return.fast.at(height),
+                    ..self.base_return
+                },
                 ..*self
             }
         } else {
@@ -428,11 +436,32 @@ pub struct AdvanceUndo {
     pub consumed: Vec<(u64, AdvanceEntry)>,
     /// The claims it transferred, each with its creditor before.
     pub transfers: Vec<(AdvanceKey, Address)>,
+    /// FIXRC ET-2: the advances whose lifetime it ended, as they were.
+    pub expired: Vec<(u64, AdvanceEntry)>,
+    /// FIXRC: the height each advance it consumed or ended had been made at
+    /// under the fix (none for one made before the fix, or a memory).
+    pub made: Vec<(AdvanceKey, u64)>,
 }
 
 impl AdvanceUndo {
     pub fn is_empty(&self) -> bool {
-        self.created.is_empty() && self.consumed.is_empty() && self.transfers.is_empty()
+        self.created.is_empty()
+            && self.consumed.is_empty()
+            && self.transfers.is_empty()
+            && self.expired.is_empty()
+            && self.made.is_empty()
+    }
+
+    /// Whether it holds anything of the fix (state version 4).
+    fn carries_fix(&self) -> bool {
+        !self.expired.is_empty() || !self.made.is_empty()
+    }
+
+    fn made_of(&self, key: &AdvanceKey) -> Option<u64> {
+        self.made
+            .iter()
+            .find(|(made, _)| made == key)
+            .map(|(_, height)| *height)
     }
 }
 
@@ -627,22 +656,31 @@ impl DestinationState {
     fn apply_advances(&mut self, effect: &AdvanceEffect) -> AdvanceUndo {
         let mut undo = AdvanceUndo::default();
         for key in &effect.repaid {
-            if let Some(entry) = self.advances.repay(key) {
+            if let Some((entry, made)) = self.advances.repay(key) {
                 undo.consumed.push((key.n, entry));
+                undo.made.extend(made.map(|height| (*key, height)));
             }
         }
         for n in &effect.consumed {
-            for entry in self.advances.remove_n(*n) {
+            for (entry, made) in self.advances.remove_n(*n) {
                 undo.consumed.push((*n, entry));
+                undo.made.extend(made.map(|height| (entry.key(*n), height)));
             }
         }
         for (n, entry) in &effect.created {
-            self.advances.insert(*n, *entry);
+            self.advances.insert_made(*n, *entry, effect.made_at);
             undo.created.push(entry.key(*n));
         }
         for (key, creditor) in &effect.transfers {
             if let Some(before) = self.advances.set_creditor(key, *creditor) {
                 undo.transfers.push((*key, before));
+            }
+        }
+        // FIXRC ET-2: last, the advances whose lifetime ends here.
+        for key in &effect.expired {
+            if let Some((entry, made)) = self.advances.take(key) {
+                undo.expired.push((key.n, entry));
+                undo.made.extend(made.map(|height| (*key, height)));
             }
         }
         undo
@@ -655,6 +693,10 @@ impl DestinationState {
     /// `n` — and is held again otherwise (the memory of it, made by the block
     /// that repaid it, forgotten).
     fn undo_advances(&mut self, undo: &AdvanceUndo) {
+        for (n, entry) in undo.expired.iter().rev() {
+            let key = entry.key(*n);
+            self.advances.insert_made(*n, *entry, undo.made_of(&key));
+        }
         for (key, before) in undo.transfers.iter().rev() {
             self.advances.set_creditor(key, *before);
         }
@@ -665,8 +707,9 @@ impl DestinationState {
             if is_repaid_by(&self.fast, *n, entry) {
                 self.advances.restore_repaid(*n, *entry);
             } else {
-                self.advances.forget_repaid(&entry.key(*n));
-                self.advances.insert(*n, *entry);
+                let key = entry.key(*n);
+                self.advances.forget_repaid(&key);
+                self.advances.insert_made(*n, *entry, undo.made_of(&key));
             }
         }
     }
@@ -788,15 +831,27 @@ impl DestinationState {
         !self.fast.is_empty() || self.undo.iter().any(|undo| !undo.fast.is_empty())
     }
 
+    /// FIXRC: whether the state holds anything of the fix (an advance made
+    /// under it, or an undo that ended or consumed one): only then is it
+    /// encoded as version 4. Every state of a branch below the fix height
+    /// keeps the bytes it had before the fix.
+    fn carries_fix(&self) -> bool {
+        !self.advances.made_list().is_empty()
+            || self.undo.iter().any(|undo| undo.advances.carries_fix())
+    }
+
     /// Canonical bytes (little-endian, counted lists): version 1, exactly as
     /// before the return over Base, while the state holds nothing of the
     /// advances nor of the fast lane; version 2, the same then the advances,
     /// when it holds advances only; version 3, version 2's bytes (the
     /// advances, maybe none) then the fast lane, when it holds the fast lane.
     pub fn encode(&self) -> Vec<u8> {
-        let fast = self.carries_fast();
+        let fix = self.carries_fix();
+        let fast = fix || self.carries_fast();
         let advanced = fast || self.carries_advances();
-        let mut out = vec![if fast {
+        let mut out = vec![if fix {
+            DESTINATION_STATE_VERSION_FIX
+        } else if fast {
             DESTINATION_STATE_VERSION_FAST
         } else if advanced {
             DESTINATION_STATE_VERSION_ADVANCES
@@ -843,7 +898,25 @@ impl DestinationState {
         if fast {
             self.encode_fast(&mut out);
         }
+        if fix {
+            self.encode_fix(&mut out);
+        }
         out
+    }
+
+    /// FIXRC, version 4's tail (after version 3's, its fast lane maybe
+    /// empty): the held advances made under the fix with their heights, by
+    /// key; then each undo's: the advances whose lifetime it ended, the
+    /// heights of those it consumed or ended that were made under the fix.
+    fn encode_fix(&self, out: &mut Vec<u8>) {
+        put_made(&self.advances.made_list(), out);
+        for undo in &self.undo {
+            out.extend_from_slice(&(undo.advances.expired.len() as u32).to_le_bytes());
+            for (n, entry) in &undo.advances.expired {
+                put_advance(*n, entry, out);
+            }
+            put_made(&undo.advances.made, out);
+        }
     }
 
     /// Version 3's tail: the fast records by increasing `n`, the
@@ -911,6 +984,7 @@ impl DestinationState {
         if version != DESTINATION_STATE_VERSION
             && version != DESTINATION_STATE_VERSION_ADVANCES
             && version != DESTINATION_STATE_VERSION_FAST
+            && version != DESTINATION_STATE_VERSION_FIX
         {
             return Err(DestinationStateError::Malformed);
         }
@@ -966,8 +1040,12 @@ impl DestinationState {
                 fast: FastUndo::default(),
             });
         }
+        let fixed = version == DESTINATION_STATE_VERSION_FIX;
         let mut listed: Vec<(u64, AdvanceEntry)> = Vec::new();
-        if version == DESTINATION_STATE_VERSION_ADVANCES || version == DESTINATION_STATE_VERSION_FAST {
+        if version == DESTINATION_STATE_VERSION_ADVANCES
+            || version == DESTINATION_STATE_VERSION_FAST
+            || fixed
+        {
             r.advances(&mut listed, &mut undo)?;
             // Canonical: version 2 only for a state holding advances.
             if version == DESTINATION_STATE_VERSION_ADVANCES
@@ -978,10 +1056,18 @@ impl DestinationState {
             }
         }
         let mut fast = FastLaneState::default();
-        if version == DESTINATION_STATE_VERSION_FAST {
+        if version == DESTINATION_STATE_VERSION_FAST || fixed {
             r.fast(&mut fast, &mut undo)?;
             // Canonical: version 3 only for a state holding the fast lane.
-            if fast.is_empty() && undo.iter().all(|u| u.fast.is_empty()) {
+            if !fixed && fast.is_empty() && undo.iter().all(|u| u.fast.is_empty()) {
+                return Err(DestinationStateError::Malformed);
+            }
+        }
+        let mut made: Vec<(AdvanceKey, u64)> = Vec::new();
+        if fixed {
+            r.fix(&mut made, &mut undo)?;
+            // Canonical: version 4 only for a state holding the fix.
+            if made.is_empty() && undo.iter().all(|u| !u.advances.carries_fix()) {
                 return Err(DestinationStateError::Malformed);
             }
         }
@@ -989,6 +1075,7 @@ impl DestinationState {
         // remembers, not reconciled, is the one it repaid (its creditor is its
         // origin); every other is held.
         let mut advances = AdvanceBook::new();
+        let mut made = made.into_iter().peekable();
         for (n, entry) in listed {
             if is_repaid_by(&fast, n, &entry) {
                 if entry.creditor != entry.origin {
@@ -996,8 +1083,16 @@ impl DestinationState {
                 }
                 advances.restore_repaid(n, entry);
             } else {
-                advances.insert(n, entry);
+                // FIXRC: its height when made under the fix (the list is by
+                // key, as the advances; one only for a held advance).
+                let height = made
+                    .next_if(|(key, _)| *key == entry.key(n))
+                    .map(|(_, height)| height);
+                advances.insert_made(n, entry, height);
             }
+        }
+        if made.next().is_some() {
+            return Err(DestinationStateError::Malformed);
         }
         if !r.0.is_empty()
             || tip.saturating_add(1) < start
@@ -1026,6 +1121,22 @@ pub const DESTINATION_STATE_VERSION: u8 = 1;
 pub const DESTINATION_STATE_VERSION_ADVANCES: u8 = 2;
 /// Version byte of a state that holds the fast lane (the return over Base).
 pub const DESTINATION_STATE_VERSION_FAST: u8 = 3;
+/// FIXRC: version byte of a state that holds anything of the fix (an advance
+/// made under it, or the undo of one): version 3's bytes, then
+/// [`DestinationState::encode_fix`]'s. A build of before refuses it (no
+/// downgrade across the fix height).
+pub const DESTINATION_STATE_VERSION_FIX: u8 = 4;
+
+/// Bytes of one `(advance key, height)`.
+const MADE_BYTES: usize = ADVANCE_KEY_BYTES + 8;
+
+fn put_made(made: &[(AdvanceKey, u64)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(made.len() as u32).to_le_bytes());
+    for (key, height) in made {
+        put_advance_key(key, out);
+        out.extend_from_slice(&height.to_le_bytes());
+    }
+}
 
 /// Bytes of one encoded fast record: `n`, owner, amount, L2 block, height,
 /// flags.
@@ -1291,6 +1402,55 @@ impl Reader<'_> {
                 1 => true,
                 _ => return Err(DestinationStateError::Malformed),
             };
+        }
+        Ok(())
+    }
+
+    /// `(advance key, height)` by strictly increasing key ([`put_made`]).
+    fn made(&mut self) -> Result<Vec<(AdvanceKey, u64)>, DestinationStateError> {
+        let count = self.u32()? as usize;
+        if count > self.0.len() / MADE_BYTES {
+            return Err(DestinationStateError::Malformed);
+        }
+        let mut out: Vec<(AdvanceKey, u64)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = self.advance_key()?;
+            let height = self.u64()?;
+            if out.last().is_some_and(|(last, _)| *last >= key) {
+                return Err(DestinationStateError::Malformed);
+            }
+            out.push((key, height));
+        }
+        Ok(out)
+    }
+
+    /// FIXRC, version 4's tail ([`DestinationState::encode_fix`]).
+    fn fix(
+        &mut self,
+        made: &mut Vec<(AdvanceKey, u64)>,
+        undo: &mut [DestinationUndo],
+    ) -> Result<(), DestinationStateError> {
+        *made = self.made()?;
+        for entry in undo.iter_mut() {
+            let expired = self.u32()? as usize;
+            if expired > self.0.len() / ADVANCE_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            for _ in 0..expired {
+                let n = self.u64()?;
+                let advance = self.advance_entry()?;
+                entry.advances.expired.push((n, advance));
+            }
+            // In the order the block found them (by kind), not by key.
+            let count = self.u32()? as usize;
+            if count > self.0.len() / MADE_BYTES {
+                return Err(DestinationStateError::Malformed);
+            }
+            for _ in 0..count {
+                let key = self.advance_key()?;
+                let height = self.u64()?;
+                entry.advances.made.push((key, height));
+            }
         }
         Ok(())
     }
@@ -1710,7 +1870,15 @@ pub fn validate_block_destination(
 
     // The `n` a slow release may pay once more: a fast release contradicted
     // on the branch or by this block, not yet paid to its real burner.
-    let contradicted: Vec<u64> = contradictions.iter().map(|c| c.n).collect();
+    // FIXRC RC-2: this block's are read from its `JTMFCT01` markers (`n` in
+    // clear, committed by the header), never from the objects (uncommitted,
+    // checked against the markers only later): a relay that alters an
+    // object's `n` must not make the vault gate condemn an honest block. A
+    // valid block's objects open its markers in order: the same `n`.
+    let contradicted: Vec<u64> = fast_markers
+        .iter()
+        .map(fast_contradiction_marker_n)
+        .collect();
     let reopened =
         ReopenedReleases::of_block(&parent.fast, attestation.is_some(), &contradicted);
     let released = reopened.paid_set(&parent.released);
@@ -1897,6 +2065,14 @@ pub fn validate_block_destination(
                 advances.consumed.push(*n);
             }
         }
+        // FIXRC ET-2: the held advances whose lifetime ends with this block
+        // (those its releases did not consume), consumed last.
+        advances.expired = parent
+            .advances
+            .expiring(&rules.base_return.advance, height)
+            .into_iter()
+            .filter(|key| !advances.consumed.contains(&key.n) && !advances.repaid.contains(key))
+            .collect();
     }
 
     Ok(DestinationEffect {
@@ -2160,7 +2336,9 @@ fn check_contradictions(
             amount: record.amount,
             l2_block: record.l2_block,
             height: record.height,
-            key: rules.base_return.fast.release_key,
+            // FIXRC RC-3: the key that signed the fast release (the one in
+            // force at its height), not the block's.
+            key: rules.base_return.fast.release_key_at(record.height),
         };
         if entry.marker() != *marker {
             return Err(DestinationBlockError::FastObjectsDoNotMatchMarkers);
@@ -2443,9 +2621,39 @@ pub const DESTINATION_SNAPSHOT_MAGIC_ADVANCES: [u8; 8] = *b"JTMDST02";
 /// drawn from them), the advances, the contradictions, the revocations.
 pub const DESTINATION_SNAPSHOT_MAGIC_FAST: [u8; 8] = *b"JTMDST03";
 
-/// Largest `destination-state.bin` a node reads: two committee updates and a
-/// window of releases (4 per block) fit many times over.
-pub const MAX_DESTINATION_SNAPSHOT_FILE_BYTES: usize = 4 << 20;
+/// Largest `destination-state.bin` a node reads (FIXRC ET-2: computed on the
+/// true worst case of a boundary the fix governs, no longer 4 MiB, which a
+/// few hundred JTM of junk advances passed for ever): two committee updates
+/// (each within a destination section); every release of the fast lane's
+/// horizon (at most [`crate::consensus::vault::MAX_RELEASES_PER_BLOCK`] a
+/// block, V6), each with its L2 block; the advances held — at most
+/// [`super::advance::ADVANCE_MAX_PER_BLOCK`] made a block, each held
+/// [`super::advance::ADVANCE_LIFETIME_BLOCKS`] at most — and the memories
+/// of the advances the horizon's fast releases repaid (one each, D188); a
+/// contradiction per fast release of the horizon, with its key; a revocation
+/// per key ([`MAX_SNAPSHOT_FAST_KEYS`]). ≈ 23 MB; a node reads it chunk by
+/// chunk (`snapshot_annex`, 1 MiB chunks).
+pub const MAX_DESTINATION_SNAPSHOT_FILE_BYTES: usize = {
+    use crate::consensus::vault::MAX_RELEASES_PER_BLOCK;
+    use super::advance::{ADVANCE_LIFETIME_BLOCKS, ADVANCE_MAX_PER_BLOCK};
+    use super::fast::FAST_RECONCILE_BLOCKS;
+    let releases = (FAST_RECONCILE_BLOCKS as usize + 1) * MAX_RELEASES_PER_BLOCK;
+    let held = ADVANCE_MAX_PER_BLOCK * ADVANCE_LIFETIME_BLOCKS as usize;
+    let committee_updates = 1 + 2 * (4 + crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES);
+    8 + committee_updates
+        + 4
+        + releases * (8 + 32 + 8 + 1 + 8)
+        + 4
+        + (held + releases) * ADVANCE_BYTES
+        + 4
+        + releases * (CONTRADICTION_MIN_BYTES + KEY_BYTES)
+        + 4
+        + MAX_SNAPSHOT_FAST_KEYS * KEY_BYTES
+};
+
+/// The fast lane's relay keys a branch may ever close (FIXRC: the key of the
+/// return-over-Base height and its rotations), at most, for the file's bound.
+pub const MAX_SNAPSHOT_FAST_KEYS: usize = 64;
 
 /// What a snapshot carries beside its UTXO state for the destination state.
 /// Every byte of it is authenticated by markers of that state: nothing is
@@ -2460,8 +2668,9 @@ pub struct DestinationSnapshotFile {
     /// ([`snapshot_window_start`]).
     pub window_releases: Vec<(u64, Address, u64)>,
     /// The advances of the state (the return over Base), by increasing key
-    /// `(n, owner, amount)`: each opens its `JTMADV01` marker, its creditor
-    /// the latest `JTMADT01` marker naming it (or is its origin). With them
+    /// `(n, owner, amount)`: each opens its `JTMADV02` marker (`JTMADV03`
+    /// when made from the fix height on, FIXRC), its creditor the latest
+    /// `JTMADT02` marker naming it (or is its origin). With them
     /// (D188), the advance each fast release the state remembers, not
     /// reconciled, repaid: its creditor is its origin.
     pub advances: Vec<(u64, AdvanceEntry)>,
@@ -2795,7 +3004,10 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 self.update_markers.push((creation_id, *owner));
             }
             _ => match super::advance::advance_marker_kind(owner) {
-                Some(super::advance::AdvanceMarkerKind::Advance) => {
+                Some(
+                    super::advance::AdvanceMarkerKind::Advance
+                    | super::advance::AdvanceMarkerKind::AdvanceV3,
+                ) => {
                     self.advance_markers.push((creation_id, *owner));
                 }
                 Some(super::advance::AdvanceMarkerKind::Transfer) => {
@@ -2998,10 +3210,13 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 "a release of the horizon does not open its marker",
             ],
         )?;
-        let window_first = snapshot_window_start(start, self.tip, self.rules.vault.window_blocks);
+        // FIXRC ET-3: every release of the horizon is kept, not only the
+        // window's (V6 reads the window's alone, `released_in_window`): a full
+        // node keeps them (`release_retention_at`) and exports them, and so
+        // must a node installed here, or its own snapshots miss the releases
+        // between the window and the horizon and are refused for ≈ 30 days.
         let window = opened
             .iter()
-            .filter(|(height, _)| *height >= window_first)
             .map(|(height, r)| WindowRelease {
                 height: *height,
                 n: r.n,
@@ -3085,7 +3300,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
         Ok((window, lane))
     }
 
-    /// The advances of the boundary (the return over Base): the `JTMADV01`
+    /// The advances of the boundary (the return over Base): the advance
     /// markers created from its height on (above the `alloc_counter` of the
     /// header below it) whose `n` is not paid (the release of `n` consumes
     /// every advance of it), or is paid by a fast release the rebuilt `lane`
@@ -3094,10 +3309,18 @@ impl<'a> SnapshotDestinationCheck<'a> {
     /// file's advance of exactly the burn its fast release paid is the one
     /// that release repaid: it opens its marker exactly, its creditor is its
     /// origin, and it is remembered, not held. A held one has its creditor
-    /// the latest `JTMADT01` marker naming it (by its marker's commitment
+    /// the latest `JTMADT02` marker naming it (by its marker's commitment
     /// bytes) created after it, or its origin. An advance whose marker shares
     /// its commitment bytes with a held one is never made, so the transfers
     /// naming those bytes after it are its own.
+    ///
+    /// FIXRC (ET-1, ET-2): a `JTMADV02` marker counts only if created before
+    /// the fix height, a `JTMADV03` one only if created from it on (below it,
+    /// an ordinary owner); an advance opens the marker of its format exactly
+    /// (128 bits of commitment for `JTMADV03`); a held advance whose lifetime
+    /// ended at or below the boundary stands no more (made under the fix:
+    /// from the height of the block that created its marker; before it: from
+    /// the fix height), and one made under the fix is held with that height.
     fn rebuild_advances(
         &self,
         alloc_counter: &impl Fn(u64) -> Option<u64>,
@@ -3115,24 +3338,57 @@ impl<'a> SnapshotDestinationCheck<'a> {
             }
             return Ok(AdvanceBook::new());
         };
-        let below = height.saturating_sub(1);
-        let floor = alloc_counter(below)
-            .ok_or(SnapshotDestinationError::HeaderMissing { height: below })?;
-        // The markers whose advances still stand.
-        let stands = |n: u64| {
+        let header =
+            |h: u64| alloc_counter(h).ok_or(SnapshotDestinationError::HeaderMissing { height: h });
+        let floor = header(height.saturating_sub(1))?;
+        let rules = &self.rules.base_return.advance;
+        // FIXRC: the markers created before the fix height (`JTMADV02`) and
+        // from it on (`JTMADV03`), told apart by their creation ids.
+        let fix = rules.fix_height.filter(|fix| *fix <= self.tip);
+        let fix_floor = fix.map(|fix| header(fix.saturating_sub(1))).transpose()?;
+        let made_height = |id: u64| -> Result<u64, SnapshotDestinationError> {
+            let (mut low, mut high) = (fix.expect("a JTMADV03 marker under the fix"), self.tip);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if header(mid)? >= id {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            Ok(low)
+        };
+        // The markers whose `n` still stands, each with the height it was
+        // made at under the fix.
+        let n_stands = |n: u64| {
             !self.released.contains(n) || lane.records.get(&n).is_some_and(|r| !r.consumed)
         };
-        let mut standing: Vec<(u64, Address)> = self
-            .advance_markers
-            .iter()
-            .filter(|(id, marker)| {
-                *id > floor && stands(advance_marker_fields(marker).expect("an advance marker").0)
-            })
-            .copied()
-            .collect();
+        let mut standing: Vec<(u64, Address, Option<u64>)> = Vec::new();
+        for (id, marker) in &self.advance_markers {
+            let v3 = advance_marker_kind(marker) == Some(AdvanceMarkerKind::AdvanceV3);
+            let counts = match (v3, fix_floor) {
+                (false, None) => *id > floor,
+                (false, Some(fix_floor)) => *id > floor && *id <= fix_floor,
+                (true, Some(fix_floor)) => *id > fix_floor,
+                (true, None) => false,
+            };
+            let (n, _) = advance_marker_fields(marker).expect("an advance marker");
+            if !counts || !n_stands(n) {
+                continue;
+            }
+            let made = if v3 { Some(made_height(*id)?) } else { None };
+            standing.push((*id, *marker, made));
+        }
         let mut book = AdvanceBook::new();
         let mut held: Vec<(u64, AdvanceEntry)> = Vec::with_capacity(self.file.advances.len());
         let mut last: Option<AdvanceKey> = None;
+        // The marker of the advance `entry` of `n`, of either format.
+        fn markers_of(n: u64, entry: &AdvanceEntry) -> impl Iterator<Item = Address> {
+            [false, true]
+                .map(|v3| advance_marker_of(v3, n, &entry.owner, entry.amount, &entry.origin))
+                .into_iter()
+                .flatten()
+        }
         for (n, entry) in &self.file.advances {
             let key = entry.key(*n);
             if last.is_some_and(|last| last >= key) {
@@ -3143,9 +3399,11 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 held.push((*n, *entry));
                 continue;
             }
-            // D188: the advance the fast release of `n` repaid.
-            let marker = entry.marker(*n);
-            let opened = standing.iter().position(|(_, m)| *m == marker);
+            // D188: the advance the fast release of `n` repaid (whatever its
+            // lifetime: the memory lasts as the fast release's record).
+            let opened = standing
+                .iter()
+                .position(|(_, m, _)| markers_of(*n, entry).any(|marker| marker == *m));
             match opened {
                 Some(at) if entry.creditor == entry.origin => {
                     standing.swap_remove(at);
@@ -3154,13 +3412,18 @@ impl<'a> SnapshotDestinationCheck<'a> {
             }
             book.restore_repaid(*n, *entry);
         }
-        // The held advances' markers, by commitment bytes: `(creation id,
-        // marker)`.
-        let mut live: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], (u64, Address)> =
+        // The held advances' markers — their lifetime not over — by
+        // commitment bytes: `(creation id, marker, height made under the fix)`.
+        type Live = (u64, Address, Option<u64>);
+        let mut live: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], Live> =
             BTreeMap::new();
-        for (id, marker) in &standing {
+        for (id, marker, made) in &standing {
+            let clock = rules.clock_of(*made);
+            if clock.is_some_and(|clock| !rules.held_after(clock, self.tip)) {
+                continue;
+            }
             if live
-                .insert(advance_marker_commitment(marker), (*id, *marker))
+                .insert(advance_marker_commitment(marker), (*id, *marker, *made))
                 .is_some()
             {
                 return Err(mismatch("two live advance markers share their commitment"));
@@ -3170,13 +3433,17 @@ impl<'a> SnapshotDestinationCheck<'a> {
             return Err(mismatch("advances do not match their markers"));
         }
         for (n, entry) in &held {
-            let marker = entry.marker(*n);
-            let created = match live.remove(&advance_marker_commitment(&marker)) {
-                Some((id, live_marker)) if live_marker == marker => id,
-                _ => return Err(mismatch("an advance does not open its marker")),
+            let opened = markers_of(*n, entry).find_map(|marker| {
+                live.get(&advance_marker_commitment(&marker))
+                    .filter(|(_, live_marker, _)| *live_marker == marker)
+                    .map(|found| (advance_marker_commitment(&marker), *found))
+            });
+            let Some((named, (created, _, made))) = opened else {
+                return Err(mismatch("an advance does not open its marker"));
             };
+            live.remove(&named);
+            book.insert_made(*n, *entry, made);
             // Its creditor: the latest transfer naming it, after it.
-            let named = advance_marker_commitment(&marker);
             let latest = self
                 .transfer_markers
                 .iter()
@@ -3185,7 +3452,9 @@ impl<'a> SnapshotDestinationCheck<'a> {
                 })
                 .max_by_key(|(id, _)| *id);
             let creditor_opens = match latest {
-                Some((_, transfer)) => entry.transfer_marker(*n, &entry.creditor) == *transfer,
+                Some((_, transfer)) => {
+                    book.transfer_marker_of(&entry.key(*n), &entry.creditor) == Some(*transfer)
+                }
                 None => entry.creditor == entry.origin,
             };
             if !creditor_opens {
@@ -3193,7 +3462,6 @@ impl<'a> SnapshotDestinationCheck<'a> {
                     "an advance's creditor does not open its latest transfer",
                 ));
             }
-            book.insert(*n, *entry);
         }
         Ok(book)
     }

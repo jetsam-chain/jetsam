@@ -25,7 +25,9 @@ fn annex_kinds_have_fixed_codes_names_and_bounds() {
     for code in [0u8, 3, 0xFF] {
         assert_eq!(SnapshotAnnexKind::from_code(code), None);
     }
-    assert_eq!(SnapshotAnnexKind::DestinationState.max_len(), 4 << 20);
+    // FIXRC ET-2: the true worst case of a boundary under the fix (≈ 23 MB,
+    // `MAX_DESTINATION_SNAPSHOT_FILE_BYTES`), no longer 4 MiB.
+    assert_eq!(SnapshotAnnexKind::DestinationState.max_len(), 22_796_937);
     assert_eq!(SnapshotAnnexKind::GuardianJournal.max_len(), 1 << 30);
     assert_eq!(
         SnapshotAnnexKind::DestinationState.file_name(),
@@ -99,7 +101,11 @@ fn annex_references_are_bounded_by_their_kind() {
     );
     let at = SnapshotAnnexRef::of(SnapshotAnnexKind::DestinationState, &over[1..]).unwrap();
     assert!(at.is_admissible());
-    assert_eq!(at.chunk_count(), 4);
+    assert_eq!(
+        at.chunk_count(),
+        MAX_DESTINATION_SNAPSHOT_FILE_BYTES.div_ceil(SNAPSHOT_ANNEX_CHUNK_BYTES)
+    );
+    assert_eq!(at.chunk_count(), 22, "FIXRC ET-2: ≈ 23 MB in 1 MiB chunks");
     for (kind, len) in [
         (SnapshotAnnexKind::DestinationState, 0u32),
         (

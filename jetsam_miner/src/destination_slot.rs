@@ -535,6 +535,7 @@ pub fn advances_within_rules<E>(
         released_here,
         &rules.vault,
         &rules.base_return.advance,
+        height,
     );
     let mut placed: Vec<(u64, [u8; 32], usize)> = entries
         .iter()

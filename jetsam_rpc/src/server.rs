@@ -3802,6 +3802,8 @@ impl JetsamApiServer for RpcHandler {
         let advancer = parse_address_param(&active)?;
         let owner = parse_address_param(&owner)?;
         let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        // FIXRC ET-1: the marker of the block the advance is built for.
+        let next_height = self.chain.read().await.tip_height().saturating_add(1);
         let (payments, marker) = crate::destination::advance_plan(
             n,
             owner,
@@ -3809,6 +3811,7 @@ impl JetsamApiServer for RpcHandler {
             paid_micro_jtm,
             advancer,
             &rules,
+            next_height,
         )
         .map_err(rpc_err)?;
         self.build_marker_payment(payments, marker, fee_micro_jtm).await

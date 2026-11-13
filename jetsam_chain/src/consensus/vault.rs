@@ -171,70 +171,55 @@ pub fn release_marker_n(owner: &Address) -> Option<u64> {
         .then(|| u64::from_le_bytes(owner.0[8..16].try_into().expect("eight bytes")))
 }
 
-/// The withdrawal indices a branch has paid (D52): bit `n` is set when a
+/// The withdrawal indices a branch has paid (D52): `n` is in it when a
 /// release marker carrying `n` is in the branch's UTXO state. Each index costs
-/// a burn on the L1 and is proven there (V7) before it is inserted, so the
-/// bitmap stays as small as the burns are many; reading an index far above
-/// the highest paid one allocates nothing.
+/// a burn on the L1 and is proven there (V7) before it is inserted; a slow
+/// release's `n` is the contract's counter, a fast release's the relay's word
+/// (RETOUR-RAPIDE SPEC §4), which may be any `u64`.
+///
+/// FIXRC RC-1 (AUDIT-FINAL2): a sparse set, one entry per paid index, so that
+/// a far index costs no more than a near one (a bitmap grew to word `n / 64`:
+/// 128 GiB for `2⁴⁰`). The same answers as the bitmap for every index, the
+/// same increasing order: a representation, not a rule (the state's bytes
+/// were the list of the indices already).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReleasedSet {
-    /// Little-endian bitmap; no trailing zero word.
-    words: Vec<u64>,
+    indices: std::collections::BTreeSet<u64>,
 }
 
 impl ReleasedSet {
     pub const fn new() -> Self {
-        Self { words: Vec::new() }
+        Self {
+            indices: std::collections::BTreeSet::new(),
+        }
     }
 
     pub fn contains(&self, n: u64) -> bool {
-        usize::try_from(n / 64)
-            .ok()
-            .and_then(|word| self.words.get(word))
-            .is_some_and(|word| word & (1 << (n % 64)) != 0)
+        self.indices.contains(&n)
     }
 
     /// Mark `n` paid; `false` if it already was.
     pub fn insert(&mut self, n: u64) -> bool {
-        let word = usize::try_from(n / 64).expect("a proven withdrawal index fits memory");
-        if self.words.len() <= word {
-            self.words.resize(word + 1, 0);
-        }
-        let bit = 1 << (n % 64);
-        let fresh = self.words[word] & bit == 0;
-        self.words[word] |= bit;
-        fresh
+        self.indices.insert(n)
     }
 
     /// Mark `n` unpaid (a reorg removed its marker); `false` if it was not
     /// paid.
     pub fn remove(&mut self, n: u64) -> bool {
-        if !self.contains(n) {
-            return false;
-        }
-        let word = (n / 64) as usize;
-        self.words[word] &= !(1 << (n % 64));
-        while self.words.last() == Some(&0) {
-            self.words.pop();
-        }
-        true
+        self.indices.remove(&n)
     }
 
     pub fn len(&self) -> u64 {
-        self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+        self.indices.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.words.is_empty()
+        self.indices.is_empty()
     }
 
     /// The paid indices, increasing.
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        self.words.iter().enumerate().flat_map(|(i, word)| {
-            (0..64u64)
-                .filter(move |bit| word & (1 << bit) != 0)
-                .map(move |bit| i as u64 * 64 + bit)
-        })
+        self.indices.iter().copied()
     }
 
     /// The set a branch's UTXO state shows: the release markers among its
