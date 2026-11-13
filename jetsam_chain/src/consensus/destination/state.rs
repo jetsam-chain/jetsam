@@ -474,6 +474,88 @@ fn is_repaid_by(lane: &FastLaneState, n: u64, entry: &AdvanceEntry) -> bool {
     })
 }
 
+/// Whether the advance marker `marker`, created at `id`, counts at a boundary
+/// whose return-over-Base floor is `floor` and fix floor `fix_floor` (FIXRC:
+/// a `JTMADV02` marker only if created before the fix height, a `JTMADV03`
+/// one only from it on; below it, an ordinary owner).
+fn advance_marker_counts(marker: &Address, id: u64, floor: u64, fix_floor: Option<u64>) -> bool {
+    match (advance_marker_kind(marker), fix_floor) {
+        (Some(AdvanceMarkerKind::Advance), None) => id > floor,
+        (Some(AdvanceMarkerKind::Advance), Some(fix_floor)) => id > floor && id <= fix_floor,
+        (Some(AdvanceMarkerKind::AdvanceV3), Some(fix_floor)) => id > fix_floor,
+        _ => false,
+    }
+}
+
+/// The marker of the advance `entry` of `n`, of either format.
+fn advance_markers_of(n: u64, entry: &AdvanceEntry) -> impl Iterator<Item = Address> {
+    [false, true]
+        .map(|v3| advance_marker_of(v3, n, &entry.owner, entry.amount, &entry.origin))
+        .into_iter()
+        .flatten()
+}
+
+/// FIXALL (D188's transition, D199): what
+/// [`DestinationState::recall_repaid_advances`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecalledAdvances {
+    /// The `n` whose repaid advance it remembered, with its advancer.
+    pub recalled: Vec<(u64, Address)>,
+    /// The `n` it left as they were, and why (the live state does not tell
+    /// the replay's memory for sure).
+    pub left: Vec<(u64, &'static str)>,
+}
+
+impl DestinationState {
+    /// FIXALL (D188's transition, D199): the memory of the advances the fast
+    /// releases repaid ([`AdvanceBook::repaid`]), for a state written by a
+    /// build of before D188 and read by this one (a node updated in place).
+    /// That build consumed every advance of `n` at its fast release and
+    /// remembered none; a replay keeps the one of exactly the burn paid, so
+    /// that a snapshot tells its marker from the others'. Without it, every
+    /// snapshot the node exports is refused (`advances do not match their
+    /// markers`) until the fast release passes the horizon.
+    ///
+    /// Derived from the live state only: for each fast release the lane
+    /// remembers, not reconciled, whose `n` has nothing in the book, the
+    /// advance markers of `n` that count at this boundary (as an install
+    /// counts them, [`SnapshotDestinationCheck`]) among `live` (every live
+    /// slot `(owner, creation id)`). With none, there was no advance: nothing
+    /// to remember. With exactly one, opened as the advance of the burn paid
+    /// (`(n, owner, amount)` of the record) by exactly one advancer among the
+    /// live owners, that advance is remembered, its creditor its origin —
+    /// what the replay remembers, as a snapshot checks it (the marker opens
+    /// it). Anything else is left as it was and said: several markers (the
+    /// replay holds the other burns' advances, which the build of before
+    /// consumed), no live owner or several opening it. Deterministic in the
+    /// live state; idempotent (a remembered `n` has something in the book);
+    /// nothing changes for a lane without such a record. No block rule reads
+    /// the memory: only the state's bytes and its snapshots change.
+    pub fn recall_repaid_advances(
+        &mut self,
+        rules: &DestinationRules,
+        live: &[(Address, u64)],
+        alloc_counter: impl Fn(u64) -> Option<u64>,
+    ) -> Result<RecalledAdvances, SnapshotDestinationError> {
+        // FIXALL red: not derived yet.
+        let _ = (rules, live, alloc_counter);
+        let out = RecalledAdvances::default();
+        Ok(out)
+    }
+
+    /// The fast releases the lane remembers, not reconciled, whose `n` has
+    /// nothing in the book (held or remembered): those
+    /// [`Self::recall_repaid_advances`] looks at. Empty: it reads nothing.
+    pub fn records_without_advances(&self) -> Vec<(u64, FastRecord)> {
+        self.fast
+            .records
+            .iter()
+            .filter(|(n, record)| !record.consumed && !self.advances.has_any_of(**n))
+            .map(|(n, record)| (*n, *record))
+            .collect()
+    }
+}
+
 /// What one block did to the state, kept to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestinationUndo {
@@ -3366,12 +3448,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
         let mut standing: Vec<(u64, Address, Option<u64>)> = Vec::new();
         for (id, marker) in &self.advance_markers {
             let v3 = advance_marker_kind(marker) == Some(AdvanceMarkerKind::AdvanceV3);
-            let counts = match (v3, fix_floor) {
-                (false, None) => *id > floor,
-                (false, Some(fix_floor)) => *id > floor && *id <= fix_floor,
-                (true, Some(fix_floor)) => *id > fix_floor,
-                (true, None) => false,
-            };
+            let counts = advance_marker_counts(marker, *id, floor, fix_floor);
             let (n, _) = advance_marker_fields(marker).expect("an advance marker");
             if !counts || !n_stands(n) {
                 continue;
@@ -3382,13 +3459,6 @@ impl<'a> SnapshotDestinationCheck<'a> {
         let mut book = AdvanceBook::new();
         let mut held: Vec<(u64, AdvanceEntry)> = Vec::with_capacity(self.file.advances.len());
         let mut last: Option<AdvanceKey> = None;
-        // The marker of the advance `entry` of `n`, of either format.
-        fn markers_of(n: u64, entry: &AdvanceEntry) -> impl Iterator<Item = Address> {
-            [false, true]
-                .map(|v3| advance_marker_of(v3, n, &entry.owner, entry.amount, &entry.origin))
-                .into_iter()
-                .flatten()
-        }
         for (n, entry) in &self.file.advances {
             let key = entry.key(*n);
             if last.is_some_and(|last| last >= key) {
@@ -3403,7 +3473,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
             // lifetime: the memory lasts as the fast release's record).
             let opened = standing
                 .iter()
-                .position(|(_, m, _)| markers_of(*n, entry).any(|marker| marker == *m));
+                .position(|(_, m, _)| advance_markers_of(*n, entry).any(|marker| marker == *m));
             match opened {
                 Some(at) if entry.creditor == entry.origin => {
                     standing.swap_remove(at);
@@ -3433,7 +3503,7 @@ impl<'a> SnapshotDestinationCheck<'a> {
             return Err(mismatch("advances do not match their markers"));
         }
         for (n, entry) in &held {
-            let opened = markers_of(*n, entry).find_map(|marker| {
+            let opened = advance_markers_of(*n, entry).find_map(|marker| {
                 live.get(&advance_marker_commitment(&marker))
                     .filter(|(_, live_marker, _)| *live_marker == marker)
                     .map(|found| (advance_marker_commitment(&marker), *found))

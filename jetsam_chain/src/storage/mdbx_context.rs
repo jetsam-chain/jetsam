@@ -741,6 +741,55 @@ impl MdbxChainContext {
         Ok((state, keys))
     }
 
+    /// FIXALL (D188's transition, D199): a destination record written by a
+    /// build of before D188 lacks the memory of the advances its fast
+    /// releases repaid, and every snapshot this node exports would be
+    /// refused by an up-to-date node; the memory is derived from the live
+    /// state ([`DestinationState::recall_repaid_advances`]) and the record of
+    /// the tip rewritten. Nothing is scanned unless a fast release of the
+    /// lane has nothing of its `n` in the book. A header missing leaves the
+    /// state as it was (said); no block rule reads the memory.
+    fn recall_repaid_advances(
+        store: &MdbxStore,
+        state: &mut DestinationState,
+        keys: &CommitteeKeyCache,
+    ) -> Result<(), MdbxContextError> {
+        let rules = DestinationRules::current();
+        if !rules.base_return.active_at(state.tip) || state.records_without_advances().is_empty()
+        {
+            return Ok(());
+        }
+        let live = store.live_slot_owners()?;
+        let alloc_counter = |height: u64| {
+            store
+                .get_header(height)
+                .ok()
+                .flatten()
+                .map(|header| header.alloc_counter)
+        };
+        match state.recall_repaid_advances(&rules, &live, alloc_counter) {
+            Ok(found) => {
+                for (n, reason) in &found.left {
+                    tracing::warn!(n, reason, "D188 transition: repaid advance not recalled");
+                }
+                if !found.recalled.is_empty() {
+                    store.put_destination_record(&encode_destination_record(state, keys))?;
+                    for (n, advancer) in &found.recalled {
+                        tracing::info!(
+                            n,
+                            ?advancer,
+                            "D188 transition: repaid advance recalled from the live state"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "D188 transition: repaid advances not recalled");
+            }
+        }
+        Ok(())
+    }
+
     /// The durable guardian state and undo of the tip whose height is
     /// `tip_height` (nothing under the dormant clock), T3.6.
     fn load_guardian(
@@ -1260,7 +1309,10 @@ impl MdbxChainContext {
         // 6. Use exact persisted cumulative chainwork.
         let tip_chain_work = meta.cumulative_chainwork;
         let client_registry = Self::load_client_registry(&store, tip_height)?;
-        let (destination, committee_keys) = Self::load_destination(&store, tip_height)?;
+        let (mut destination, committee_keys) = Self::load_destination(&store, tip_height)?;
+        if let Some(state) = destination.as_mut() {
+            Self::recall_repaid_advances(&store, state, &committee_keys)?;
+        }
         let (guardian, guardian_undo) = Self::load_guardian(&store, tip_height)?;
 
         Ok(Self {

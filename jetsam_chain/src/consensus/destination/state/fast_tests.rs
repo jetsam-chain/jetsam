@@ -1779,6 +1779,220 @@ fn d188_the_repaid_advance_is_remembered_by_its_origin() {
 }
 
 // ---------------------------------------------------------------------------
+// FIXALL: D188's transition (D199) — a node updated in place recalls the
+// repaid advances from the live state
+// ---------------------------------------------------------------------------
+
+/// The live owners of the D188 branch besides its markers: the advancer's
+/// change (`PAYER`, block `HEIGHT - 1`), the owner paid by the advance
+/// (`ALICE`), another account (`BOB`).
+fn with_owners(markers: Vec<(Address, u64)>) -> Vec<(Address, u64)> {
+    let mut live = markers;
+    live.extend([
+        (PAYER, (HEIGHT - 1) * 10 - 4),
+        (ALICE, (HEIGHT - 1) * 10 - 3),
+        (BOB, HEIGHT * 10 - 4),
+    ]);
+    live
+}
+
+/// The branch of `Replay::start(advances, PAYER)` then empty blocks up to
+/// `tip`, as the replay holds it, and as a node updated in place holds it:
+/// its build of before D188 judged the fast block (`HEIGHT`) — every advance
+/// of 3 consumed, nothing remembered — and the blocks after are judged alike.
+fn replay_and_in_place(
+    l: &Lane,
+    advances: &[(Address, u64, Address, u64)],
+    tip: u64,
+) -> (Replay, Vec<DestinationState>) {
+    let mut r = Replay::start(l, advances, PAYER);
+    let parent = r.states[0].clone();
+    let mut old = l.check(&fast_alice(l, PAYER), &parent).expect("fast");
+    old.advances.repaid.clear();
+    old.advances.consumed = vec![3];
+    let mut in_place = vec![applied(&parent, &old)];
+    for h in HEIGHT + 1..=tip {
+        let b = block_with(h, vec![], vec![]);
+        r.push(l, &b, &[]);
+        let last = in_place.last().unwrap();
+        let effect = l.check(&b, last).expect("the next block");
+        in_place.push(applied(last, &effect));
+    }
+    (r, in_place)
+}
+
+/// (a), (b): the state of a node updated in place has no memory of the
+/// advance its fast release repaid, and the snapshot it exports is refused
+/// (D199: "advances do not match their markers"); recalled from the live
+/// state, it is the replay's state byte for byte (the undo included), its
+/// export is the replay's and installs to the replay's advances, and its undo
+/// brings back the replay's states — below the fix height, and above it with
+/// the `JTMADV02` marker made before it (FIXRC ET-1).
+#[test]
+fn fixall_a_node_updated_in_place_recalls_the_repaid_advance_as_the_replay_holds_it() {
+    for fix_height in [None, Some(HEIGHT + 2)] {
+        let mut l = lane();
+        l.rules.base_return.advance.fix_height = fix_height;
+        let (r, in_place) = replay_and_in_place(&l, &[(PAYER, 3, ALICE, 5 * JTM)], HEIGHT + 3);
+        let parent = &r.states[0];
+        for (replay, before) in r.states[1..].iter().zip(&in_place) {
+            let tip = replay.tip;
+            assert_eq!(before.tip, tip);
+            assert_eq!(before.advances.repaid(3), None, "tip {tip}");
+            assert_ne!(before.encode(), replay.encode(), "tip {tip}");
+            assert_eq!(
+                install(&l.rules, &export(&l, before), tip, &r.slots_to(tip)),
+                Err(SnapshotDestinationError::Mismatch {
+                    reason: "advances do not match their markers"
+                }),
+                "tip {tip}: the export of the node updated in place"
+            );
+            let mut s = before.clone();
+            let found = s
+                .recall_repaid_advances(&l.rules, &with_owners(r.slots_to(tip)), alloc)
+                .unwrap();
+            assert_eq!(
+                found,
+                RecalledAdvances {
+                    recalled: vec![(3, PAYER)],
+                    left: Vec::new(),
+                },
+                "tip {tip}"
+            );
+            assert_eq!(&s, replay, "tip {tip}");
+            assert_eq!(s.encode(), replay.encode(), "tip {tip}");
+            let file = export(&l, &s);
+            assert_eq!(file, export(&l, replay), "tip {tip}");
+            let installed = install(&l.rules, &file, tip, &r.slots_to(tip))
+                .unwrap_or_else(|e| panic!("tip {tip}: {e:?}"));
+            assert_eq!(installed.advances, replay.advances, "tip {tip}");
+            assert_eq!(installed.fast, replay.fast, "tip {tip}");
+            assert_eq!(installed.released, replay.released, "tip {tip}");
+            assert_eq!(
+                s.truncate_above(HEIGHT - 1).unwrap().as_ref(),
+                Some(parent),
+                "tip {tip}: the undo of the recalled state"
+            );
+        }
+    }
+}
+
+/// (c): the recall is idempotent, and leaves a state that has its memory —
+/// replayed, recalled, or installed from a snapshot (ET-3's install) — as it
+/// is; the installed node's own export installs again.
+#[test]
+fn fixall_the_recall_is_idempotent() {
+    let l = lane();
+    let tip = HEIGHT + 2 + VAULT_RELEASE_WINDOW_BLOCKS;
+    let (r, in_place) = replay_and_in_place(&l, &[(PAYER, 3, ALICE, 5 * JTM)], tip);
+    let live = with_owners(r.slots_to(tip));
+    let mut s = in_place.last().unwrap().clone();
+    s.recall_repaid_advances(&l.rules, &live, alloc).unwrap();
+    let mut installed = install(&l.rules, &export(&l, &s), tip, &r.slots_to(tip)).unwrap();
+    assert_eq!(installed.advances, r.tip().advances);
+    for state in [&mut s, &mut r.tip().clone(), &mut installed] {
+        let before = state.clone();
+        assert_eq!(
+            state.recall_repaid_advances(&l.rules, &live, alloc),
+            Ok(RecalledAdvances::default())
+        );
+        assert_eq!(*state, before);
+        assert_eq!(state.encode(), before.encode());
+    }
+    let again = install(&l.rules, &export(&l, &installed), tip, &r.slots_to(tip))
+        .expect("the installed node's export installs");
+    assert_eq!(again.advances, installed.advances);
+}
+
+/// (d): nothing changes for a state without an advance to recall: a fast
+/// release that repaid none, a branch without fast release, the return over
+/// Base dormant.
+#[test]
+fn fixall_the_recall_changes_nothing_without_an_advance() {
+    let l = lane();
+    let mut no_advance = Replay::start(&l, &[], ALICE);
+    no_advance.push(&l, &block_with(HEIGHT + 1, vec![], vec![]), &[]);
+    let (r, in_place) = replay_and_in_place(&l, &[(PAYER, 3, ALICE, 5 * JTM)], HEIGHT + 1);
+    let mut dormant = l.rules;
+    dormant.base_return.activation_height = None;
+    let cases = [
+        (no_advance.tip().clone(), l.rules, no_advance.slots_to(HEIGHT + 1)),
+        (state_at(HEIGHT - 1, known(&l.c0)), l.rules, r.slots_to(HEIGHT + 1)),
+        (in_place.last().unwrap().clone(), dormant, r.slots_to(HEIGHT + 1)),
+    ];
+    for (i, (state, rules, slots)) in cases.into_iter().enumerate() {
+        let mut s = state.clone();
+        assert_eq!(
+            s.recall_repaid_advances(&rules, &with_owners(slots), alloc),
+            Ok(RecalledAdvances::default()),
+            "case {i}"
+        );
+        assert_eq!(s.encode(), state.encode(), "case {i}");
+    }
+}
+
+/// The recall never guesses: another burn's advance of `n` (which the build
+/// of before consumed and the replay holds) or an advancer that owns no live
+/// slot leave the state as it was, said (two live owners opening the marker
+/// would take a 64-bit collision on the advancer: not built here); a marker
+/// the install does not count (made by a coinbase, or below the return over
+/// Base) is not one.
+#[test]
+fn fixall_the_recall_leaves_what_the_live_state_does_not_tell() {
+    use crate::consensus::destination::advance::advance_marker;
+    use crate::consensus::params::coinbase_creation_id;
+    let l = lane();
+    let tip = HEIGHT + 1;
+    // Another burn's advance of 3, held by the replay.
+    let (r, in_place) = replay_and_in_place(
+        &l,
+        &[(PAYER, 3, ALICE, 5 * JTM), (RESERVE, 3, BOB, 7 * JTM)],
+        tip,
+    );
+    assert!(r.tip().advances.get(&key(3, BOB, 7 * JTM)).is_some());
+    let mut s = in_place.last().unwrap().clone();
+    let mut live = with_owners(r.slots_to(tip));
+    live.push((RESERVE, HEIGHT * 10 - 3));
+    assert_eq!(
+        s.recall_repaid_advances(&l.rules, &live, alloc),
+        Ok(RecalledAdvances {
+            recalled: Vec::new(),
+            left: vec![(3, "advances of other burns of n")],
+        })
+    );
+    assert_eq!(&s, in_place.last().unwrap());
+    // The advancer owns no live slot; or a second owner opens the marker.
+    let (r, in_place) = replay_and_in_place(&l, &[(PAYER, 3, ALICE, 5 * JTM)], tip);
+    let markers = r.slots_to(tip);
+    let marker = markers[0].0;
+    assert_eq!(marker, advance_marker(3, &ALICE, 5 * JTM, &PAYER));
+    let without_advancer: Vec<(Address, u64)> =
+        with_owners(markers.clone()).into_iter().filter(|(o, _)| *o != PAYER).collect();
+    let mut s = in_place.last().unwrap().clone();
+    assert_eq!(
+        s.recall_repaid_advances(&l.rules, &without_advancer, alloc),
+        Ok(RecalledAdvances {
+            recalled: Vec::new(),
+            left: vec![(3, "no live owner opens its marker as the burn paid")],
+        })
+    );
+    assert_eq!(&s, in_place.last().unwrap());
+    // Markers the install would not count: a coinbase output and one below
+    // the return over Base's floor; the recall goes on as without them.
+    let floor = alloc(l.rules.base_return.activation_height.unwrap() - 1).unwrap();
+    let mut live = with_owners(markers);
+    let other = advance_marker(3, &BOB, 7 * JTM, &RESERVE);
+    live.push((other, coinbase_creation_id(HEIGHT)));
+    live.push((other, floor));
+    let mut s = in_place.last().unwrap().clone();
+    assert_eq!(
+        s.recall_repaid_advances(&l.rules, &live, alloc).map(|f| f.recalled),
+        Ok(vec![(3, PAYER)])
+    );
+    assert_eq!(&s, r.tip());
+}
+
+// ---------------------------------------------------------------------------
 // FIXRC (AUDIT-FINAL2 §3.4, §3.5): RC-2, ET-3, RC-3
 // ---------------------------------------------------------------------------
 

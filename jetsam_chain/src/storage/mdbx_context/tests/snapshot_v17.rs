@@ -1091,3 +1091,125 @@ fn a_block_above_j_without_its_parents_v1_7_state_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// FIXALL: D188's transition at startup (D199)
+// ---------------------------------------------------------------------------
+
+/// FIXALL (D188's transition, D199): a node updated in place reopens its
+/// store. Its destination record remembers a fast release of 3 and nothing
+/// of the advance that release repaid (its build of before D188 consumed
+/// it); the memory is recalled from the live slots — the `JTMADV02` marker
+/// and an output of its advancer — and the record of the tip rewritten, so
+/// that the snapshot generation of the tip carries it. A second reopening
+/// changes nothing; without the advancer's output nothing is recalled.
+#[test]
+fn a_reopened_store_recalls_the_repaid_advance_from_its_live_slots() {
+    use crate::consensus::destination::advance::{advance_marker, AdvanceEntry, AdvanceRules};
+    use crate::consensus::destination::fast::FastRecord;
+    use crate::consensus::destination::state::{encode_destination_record, BaseReturnRules};
+    const ADVANCER: Address = Address([0x5e; 32]);
+    const OWNER: Address = Address([0xa1; 32]);
+    let amount = 5 * MICRO_PER_JTM;
+    let marker = advance_marker(3, &OWNER, amount, &ADVANCER);
+    let repaid = AdvanceEntry {
+        origin: ADVANCER,
+        creditor: ADVANCER,
+        owner: OWNER,
+        amount,
+    };
+    // The return over Base from the block of the advance (3) on.
+    let with_base = DestinationRules {
+        base_return: BaseReturnRules {
+            activation_height: Some(3),
+            advance: AdvanceRules {
+                fix_height: None,
+                ..AdvanceRules::CONSENSUS
+            },
+            ..armed().base_return
+        },
+        ..armed()
+    };
+    for advancer_live in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let (producer, record) = {
+            let _rules = arm();
+            let mut producer = easy_block_context(directory.path());
+            let mut bundles = BTreeMap::new();
+            while producer.tip_height() < 5 {
+                let next = producer.tip_height() + 1;
+                let bundle = if next == 3 {
+                    let mut outputs = vec![(OWNER, MICRO_PER_JTM), (marker, 0)];
+                    if advancer_live {
+                        outputs.push((ADVANCER, MICRO_PER_JTM));
+                    }
+                    let page = spend_page(&producer, &bundles[&1], &outputs);
+                    bundle_with(&mut producer, vec![page])
+                } else {
+                    test_next_bundle_for_miner(&producer, MINER)
+                };
+                apply(&mut producer, &bundle);
+                bundles.insert(next, bundle);
+            }
+            // The record a node updated in place holds: the fast release of
+            // 3 at 4, nothing of its advance.
+            let mut state = producer.destination_state().unwrap().clone();
+            state.fast.records.insert(
+                3,
+                FastRecord {
+                    owner: OWNER,
+                    amount,
+                    l2_block: 1,
+                    height: 4,
+                    contradicted: false,
+                    consumed: false,
+                },
+            );
+            state.released.insert(3);
+            let record = encode_destination_record(&state, producer.committee_keys());
+            producer.store.put_destination_record_for_test(&record);
+            (producer, record)
+        };
+        let live = producer.store.live_slot_owners().unwrap();
+        let floor = producer.get_header_from_store(2).unwrap().unwrap().alloc_counter;
+        assert!(live.iter().any(|(owner, id)| *owner == marker && *id > floor));
+        assert_eq!(live.iter().any(|(owner, _)| *owner == ADVANCER), advancer_live);
+        drop(producer);
+
+        let _rules = (
+            test_rules::install(with_base),
+            guardian_rules::install(armed_guardians()),
+        );
+        let reopened =
+            MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap())
+                .unwrap();
+        let state = reopened.destination_state().unwrap();
+        let durable = reopened.store.get_destination_record().unwrap().unwrap();
+        if !advancer_live {
+            assert_eq!(state.advances.repaid(3), None);
+            assert_eq!(durable, record, "nothing recalled, nothing written");
+            continue;
+        }
+        assert_eq!(state.advances.repaid(3), Some(&repaid));
+        assert_eq!(state.advances.len(), 0, "remembered, not held");
+        assert_eq!(decode_destination_record(&durable).unwrap().0, *state);
+        assert_ne!(durable, record);
+        let exports = tempfile::tempdir().unwrap();
+        let generation = crate::storage::export_snapshot_boundary_generation(
+            &reopened.store,
+            exports.path(),
+            5,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            annexes_of(&generation).destination.unwrap().advances,
+            vec![(3, repaid)]
+        );
+        drop(reopened);
+        let again =
+            MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap())
+                .unwrap();
+        assert_eq!(again.store.get_destination_record().unwrap().unwrap(), durable);
+    }
+}

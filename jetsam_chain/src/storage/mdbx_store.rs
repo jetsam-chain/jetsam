@@ -2294,6 +2294,33 @@ impl MdbxStore {
         open_guardian_journal(&txn).unwrap().is_some()
     }
 
+    /// FIXALL (D188's transition): replace the destination record of the
+    /// tip with the same state, its memory of the repaid advances recalled at
+    /// startup (`MdbxChainContext::recall_repaid_advances`).
+    pub(crate) fn put_destination_record(&self, bytes: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let table = txn.open_table(Some(T_STATE_META))?;
+        write_destination_record(&txn, &table, DestinationWrite::Put(bytes))?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// FIXALL (D188's transition): every live slot of the durable state as
+    /// `(owner, creation id)`, one stored segment at a time.
+    pub(crate) fn live_slot_owners(
+        &self,
+    ) -> Result<Vec<(jetsam_poseidon2b::primitives::Address, u64)>, StoreError> {
+        let mut out = Vec::new();
+        self.visit_segments(|segment_id, effective_log, columns| {
+            visit_live_owner_records(segment_id, effective_log, &columns, |owner, _, packed| {
+                let (_, creation_id) = unpack_amount_creation_id(jetsam_core::Block128(packed));
+                out.push((jetsam_poseidon2b::primitives::Address(owner), creation_id));
+                Ok(())
+            })
+        })?;
+        Ok(out)
+    }
+
     /// Replace the destination record (a test that needs a state the
     /// default profile's blocks cannot build).
     #[cfg(test)]
