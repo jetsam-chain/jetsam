@@ -654,9 +654,14 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
         anyhow!(
             "fast-release --key <secret file> --l1 <url> --base <url> --base <url> [--base <url>…] --node <url> \
              (--finality <file: hex of the finality update's payload> | --beacon <url>) --game-index <i> --n <n> --owner <address> \
-             --amount <µJTM> [--capture-dir <dir>] [--dry-run --out <file>]"
+             --amount <µJTM> [--capture-dir <dir>] [--dry-run --out <file>] [--gloas-epoch <e>] \
+             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
         )
     };
+    // AN-1 (audit n°2): every source through `jg-relay`'s egress (the loopback directly, the rest through Tor), checked
+    // before anything else: a public address in clear and fast-release does not start
+    let egress = crate::config::robot_egress(args, crate::fast_run::robot_sources(args, &["--l1", "--base", "--node", "--beacon"]))
+        .map_err(|e| anyhow!("{e:#}: fast-release does not start"))?;
     let value = |flag: &str| {
         args.iter()
             .position(|a| a == flag)
@@ -683,6 +688,9 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
     // The rules the return over Base reads by (its anchor and bridge): none
     // while this build's return-over-Base height is not armed.
     let rules = DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    // FR-9 (audit n°2): the L1's Gloas epoch, Sepolia's only on a build whose L1 is Sepolia
+    let gloas = crate::light_feed::gloas_epoch_of(value("--gloas-epoch"), &rules.network)
+        .map_err(|e| anyhow!("{e:#}: fast-release does not start"))?;
     let params = rules.base_return.base;
     let bridge = rules.bridge.ok_or_else(|| {
         alert("this build has no bridge (L1_BRIDGE unset): nothing to release".into())
@@ -704,15 +712,12 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
             ))
         }
     }
-    let l1 = crate::l1::L1::new(&value("--l1").ok_or_else(usage)?);
+    let l1 = crate::l1::L1::via(&value("--l1").ok_or_else(usage)?, egress);
     let bases: Vec<crate::l1::L1> = values("--base")
         .iter()
-        .map(|u| crate::l1::L1::new(u))
+        .map(|u| crate::l1::L1::via(u, egress))
         .collect();
-    let node = crate::rpc::NodeClient::fast_release(
-        &value("--node").ok_or_else(usage)?,
-        crate::rpc::Egress::Clearnet,
-    );
+    let node = crate::rpc::NodeClient::fast_release(&value("--node").ok_or_else(usage)?, egress);
     let index: u64 = value("--game-index").ok_or_else(usage)?.parse()?;
     let burn = Burn {
         n: value("--n").ok_or_else(usage)?.parse()?,
@@ -730,12 +735,9 @@ pub fn fast_release_cli(args: &[String]) -> anyhow::Result<()> {
     let finality = match (value("--finality"), value("--beacon")) {
         (Some(path), _) => crate::base_capture::hex_bytes(std::fs::read_to_string(&path)?.trim())?,
         (None, Some(url)) => crate::light_feed::fetch_finality(
-            &crate::light_feed::HttpBeacon {
-                url,
-                egress: crate::rpc::Egress::Clearnet,
-            },
+            &crate::light_feed::HttpBeacon { url, egress },
             &l1,
-            crate::light_feed::SEPOLIA_GLOAS_FORK_EPOCH,
+            gloas,
         )
         .map_err(|e| alert(format!("no finality update: {e:#}")))?,
         (None, None) => return Err(usage()),

@@ -163,6 +163,8 @@ struct Relay {
     reread_at: Option<u64>,
     /// A-2: the contract's tip this standby relayer last took over from (alerted once each).
     standby_takeover: Option<[u8; 32]>,
+    /// GU-3: each node's steps in a row off the relayer's chain.
+    node_off: Vec<u32>,
 }
 
 /// E-1: the points the contract names (its tip, its final point) and this relayer does not know are read again by
@@ -230,19 +232,47 @@ impl Relay {
         }
     }
 
-    /// The chain from node 0 (another one if it does not answer): common ancestor, then the new headers.
+    /// The chain from every node in turn (GU-3, audit n°2: not only the first that answers — node 0 stuck behind, or on
+    /// a branch the relayer does not follow, no longer holds it back): common ancestor, then the new headers. A node off
+    /// the relayer's chain for [`relayer::NODE_OFF_CHAIN_ALERT_STEPS`] steps in a row is said once. An error only when
+    /// no node could be read.
     fn sync(&mut self) -> anyhow::Result<()> {
         let mut last = None;
+        let mut read = false;
+        self.node_off.resize(self.nodes.len(), 0);
         for i in 0..self.nodes.len() {
-            match self.sync_from(i) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
+            let (on_ours, why) = match self.sync_from(i) {
+                Ok(on_ours) => {
+                    read = true;
+                    (on_ours, String::new())
+                }
+                Err(e) => {
+                    let why = format!(" (last: {e:#})");
+                    last = Some(e);
+                    (false, why)
+                }
+            };
+            let (count, say) = relayer::node_off_chain_step(self.node_off[i], on_ours);
+            self.node_off[i] = count;
+            if say {
+                let name = self.cfg.nodes[i].name.clone();
+                log(&format!(
+                    "ALERT NODE_OFF_OUR_CHAIN node {name}: not on this relayer's chain (tip {}) for {count} steps in a row (behind, on a branch \
+                     not followed, or not answering){why}: it does not count toward min_nodes = {}",
+                    self.chain.tip_height(),
+                    self.cfg.min_nodes
+                ));
+                self.event(json!({"event": "node_off_chain", "node": name, "steps": count, "tip": self.chain.tip_height()}));
             }
+        }
+        if read {
+            return Ok(());
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("no node")))
     }
 
-    fn sync_from(&mut self, i: usize) -> anyhow::Result<()> {
+    /// One node's chain against the relayer's: true when, after it, the node's tip is the relayer's or above it, on it.
+    fn sync_from(&mut self, i: usize) -> anyhow::Result<bool> {
         let n = &mut self.nodes[i];
         let tip = n.tip_height()?;
         let top = self.chain.tip_height().min(tip);
@@ -253,36 +283,56 @@ impl Relay {
         // a node that is only behind agrees up to its tip: nothing is dropped (its lag is no reorganization)
         if common < top {
             let from = self.chain.tip_height();
-            // E-5: deeper than eight blocks, or below a known point's locked block: never on one node's word
+            // GU-3: the node's branch read whole before anything is dropped (its work against the relayer's chain)
+            let mut branch = self.chain.clone();
+            branch.truncate_above(common);
+            for h in common + 1..=tip {
+                let Some(hd) = self.nodes[i].header(h)? else { break };
+                branch.extend(hd)?;
+            }
+            let ours = self.chain.work_at(from).expect("the tip's work");
+            let theirs = branch.work_at(branch.tip_height()).expect("the tip's work");
+            // E-5: deeper than eight blocks, or below a known point's locked block: never on one node's word; GU-3: nor
+            // onto a branch with no more work than the relayer's chain
             let floor = self.state.known.values().filter(|k| self.chain.id_at(k.cp.locked_height) == Some(k.cp.locked_block_id)).map(|k| k.cp.locked_height).max().unwrap_or(0);
-            if relayer::reorg_needs_nodes(from, common, floor) {
-                let theirs = self.nodes[i].block_hash(common + 1)?;
+            if !relayer::reorg_on_one_nodes_word(from, common, floor, &ours, &theirs) {
+                let first = self.nodes[i].block_hash(common + 1)?;
                 let mut agree = 0;
                 for n in &mut self.nodes {
-                    if theirs.is_some() && n.block_hash(common + 1).ok().flatten() == theirs {
+                    if first.is_some() && n.block_hash(common + 1).ok().flatten() == first {
                         agree += 1;
                     }
                 }
                 if agree < self.cfg.min_nodes {
                     let name = self.cfg.nodes[i].name.clone();
-                    log(&format!(
-                        "ALERT DEEP_REORG_REFUSED node {name}: a reorganization from {from} down to {common} (locked floor {floor}) whose block {} {agree} of the nodes serve, min_nodes = {}: not followed",
-                        common + 1,
-                        self.cfg.min_nodes
-                    ));
+                    if relayer::reorg_needs_nodes(from, common, floor) {
+                        log(&format!(
+                            "ALERT DEEP_REORG_REFUSED node {name}: a reorganization from {from} down to {common} (locked floor {floor}) whose block {} {agree} of the nodes serve, min_nodes = {}: not followed",
+                            common + 1,
+                            self.cfg.min_nodes
+                        ));
+                    } else {
+                        log(&format!(
+                            "node {name}: its branch from {common} (tip {}) has no more work than this relayer's chain (tip {from}) and {agree} of the nodes serve its block {}, min_nodes = {}: not followed (GU-3)",
+                            branch.tip_height(),
+                            common + 1,
+                            self.cfg.min_nodes
+                        ));
+                    }
                     self.event(json!({"event": "reorg_refused", "from": from, "to": common, "node": name, "agree": agree}));
                     anyhow::bail!("node {name}: reorganization to {common} refused");
                 }
             }
-            self.chain.truncate_above(common);
+            self.chain = branch;
             self.archive.follow(&self.chain);
             self.event(json!({"event": "reorg", "from": from, "to": common, "node": self.cfg.nodes[i].name}));
+            return Ok(true);
         }
         for h in self.chain.tip_height() + 1..=tip {
             let Some(hd) = self.nodes[i].header(h)? else { break };
             self.chain.extend(hd)?;
         }
-        Ok(())
+        Ok(tip >= self.chain.tip_height())
     }
 
     /// The body of block `h` (id `id`) recorded from `source`: its deposits published (the archived body) and said.
@@ -1210,6 +1260,7 @@ fn run() -> anyhow::Result<()> {
         read_to_time: 0,
         reread_at: None,
         standby_takeover: None,
+        node_off: Vec::new(),
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
