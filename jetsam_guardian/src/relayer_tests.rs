@@ -18,7 +18,7 @@ fn plan(
 ) -> Result<Submission, NoSubmission> {
     let block = known.get(tip).map_or([0u8; 32], |k| k.cp.tip_block_id);
     let locked = known.get(tip).map_or([0u8; 32], |k| k.cp.locked_block_id);
-    plan_submission(c, known, tip, cum, &block, &locked, gl, found, missing, at, deposit_blocks_bound(3_000_000, 25))
+    plan_submission(Mn5Rule::V3Tn1, c, known, tip, cum, &block, &locked, gl, found, missing, at, deposit_blocks_bound(3_000_000, 25))
 }
 
 /// The bridge genesis's locked height of these tests.
@@ -1092,27 +1092,27 @@ fn r3_5_a_point_lists_no_more_deposit_blocks_than_the_signers_max_gas_allows() {
     let (gid, g) = genesis_known(&c30);
     let known = HashMap::from([(gid, g.clone())]);
     let at = ts(&c30, 30) + 60;
-    let s = plan_submission(&c30, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at, 5).unwrap();
+    let s = plan_submission(Mn5Rule::V3Tn1, &c30, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at, 5).unwrap();
     assert_eq!((s.next.height, s.next.locked_height, s.deposit_blocks.clone()), (23, 15, vec![11, 12, 13, 14, 15]));
     assert_eq!(s.next.deposit_count, 5);
     // the next point takes the next five
     let first = Known { cp: s.next, parent: gid, accepted_at: at, headers: Known::context_from(&s.next, &c30), ours: true, omitted: Some(vec![]), deposit_blocks: Some(s.deposit_blocks.clone()) };
     let known2 = HashMap::from([(gid, g.clone()), (s.next.id(), first.clone())]);
-    let s2 = plan_submission(&c30, &known2, &s.next.id(), &s.next.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], at, 5).unwrap();
+    let s2 = plan_submission(Mn5Rule::V3Tn1, &c30, &known2, &s.next.id(), &s.next.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], at, 5).unwrap();
     assert_eq!((s2.parent, s2.next.locked_height, s2.deposit_blocks.clone()), (s.next.id(), 20, vec![16, 17, 18, 19, 20]));
     // the chain at 60 an L1 hour and a half after block 10: the five-block point fails MN-5, said so
     let c60 = testkit::chain(60, 1);
     let at60 = ts(&c60, 60) + 60;
     assert_eq!(
-        plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 5),
+        plan_submission(Mn5Rule::V3Tn1, &c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 5),
         Err(NoSubmission::TooManyDepositBlocks(5))
     );
     // under the default signer's bound: the whole window, its 40 deposit blocks
-    let s = plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let s = plan_submission(Mn5Rule::V3Tn1, &c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert_eq!((s.next.locked_height, s.deposit_blocks.len()), (52, 40));
     // no point at all within the bound (0): said so
     assert_eq!(
-        plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 0),
+        plan_submission(Mn5Rule::V3Tn1, &c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], at60, 0),
         Err(NoSubmission::TooManyDepositBlocks(0))
     );
 }
@@ -1186,7 +1186,7 @@ fn r3_5_a_bounded_point_that_fails_mn5_like_the_whole_window_is_work_rate_too_lo
     let known = HashMap::from([(gid, g.clone())]);
     // 50 blocks of the base's target since block 10 carry 40 % of what it produces in 22 500 s: later, every T fails
     let late = ts(&c60, 10) + 30_000;
-    let plan = |bound: usize| plan_submission(&c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], late, bound);
+    let plan = |bound: usize| plan_submission(Mn5Rule::V3Tn1, &c60, &known, &gid, &g.cp.cum_work, &g.cp.tip_block_id, &g.cp.locked_block_id, GL, &found, &[], late, bound);
     assert_eq!(plan(deposit_blocks_bound(3_000_000, 25)), Err(NoSubmission::WorkRateTooLow));
     assert_eq!(plan(5), Err(NoSubmission::WorkRateTooLow), "bounded, but the whole window fails MN-5 as well");
 }
@@ -1591,17 +1591,18 @@ fn the_deadline_is_the_last_second_the_contract_takes_the_point() {
     let now = 1_794_392_097;
     let c = chain_of_11_11(now);
     let s = plan_11_11(&c, now).unwrap();
-    let d = mn5_deadline(&s.mn);
+    let d = mn5_deadline(Mn5Rule::V3Tn1, &s.mn).expect("V3Tn1 always has one");
     assert_eq!(d, ts(&c, B11) + 3_969);
     assert_eq!(d, 1_794_392_294);
-    assert!(mn5_ok(&s.mn, d) && !mn5_ok(&s.mn, d + 1));
+    assert!(mn5_ok(Mn5Rule::V3Tn1, &s.mn, d) && !mn5_ok(Mn5Rule::V3Tn1, &s.mn, d + 1));
     // a point sent at its deadline is taken; one second later it is not: sent while the deadline is not passed
     assert!(now + 90 <= d && d - now == 197);
     // a segment too light for 1 800 s: the deadline is the end of MN-5's grace
     let mut light = s.mn;
     light.segment_work = u256::to_be(&u256::from_u64(1));
-    assert_eq!(mn5_deadline(&light), light.fork_base_timestamp + MN5_MIN_ELAPSED - 1);
-    assert!(mn5_ok(&light, mn5_deadline(&light)) && !mn5_ok(&light, mn5_deadline(&light) + 1));
+    assert_eq!(mn5_deadline(Mn5Rule::V3Tn1, &light), Some(light.fork_base_timestamp + MN5_MIN_ELAPSED - 1));
+    let dl = mn5_deadline(Mn5Rule::V3Tn1, &light).unwrap();
+    assert!(mn5_ok(Mn5Rule::V3Tn1, &light, dl) && !mn5_ok(Mn5Rule::V3Tn1, &light, dl + 1));
 }
 
 /// M5-2: the point planned at 10:14:57 has a margin of ≈ 1.03 at its landing: alerted (below 1.5), where the relayer
@@ -1612,7 +1613,7 @@ fn a_mn5_margin_under_one_and_a_half_is_alerted() {
     let c = chain_of_11_11(now);
     let at = now + 90;
     let s = plan_11_11(&c, at).unwrap();
-    assert!(mn5_margin_low(&s.mn, at));
+    assert!(mn5_margin_low(Mn5Rule::V3Tn1, &s.mn, at));
     // segmentWork = forkBaseWork × k: the margin is k × 1 800 / (4 × elapsed)
     let elapsed = at - s.mn.fork_base_timestamp;
     let base = u256::from_be(&s.mn.fork_base_work);
@@ -1627,9 +1628,9 @@ fn a_mn5_margin_under_one_and_a_half_is_alerted() {
     };
     // the smallest k whose margin is at least 1.5: k × 1 800 ≥ 6 × elapsed
     let k = (6 * elapsed).div_ceil(1_800);
-    assert!(!mn5_margin_low(&with(k), at));
-    assert!(mn5_margin_low(&with(k - 1), at));
-    assert!(!mn5_margin_low(&with(4 * k), at));
+    assert!(!mn5_margin_low(Mn5Rule::V3Tn1, &with(k), at));
+    assert!(mn5_margin_low(Mn5Rule::V3Tn1, &with(k - 1), at));
+    assert!(!mn5_margin_low(Mn5Rule::V3Tn1, &with(4 * k), at));
 }
 
 // ---------------------------------------------------------------- GU-3 (audit n°2)
@@ -1676,4 +1677,211 @@ fn gu3_a_node_off_the_relayers_chain_is_said_once_after_its_steps() {
         said += u32::from(say);
     }
     assert_eq!((count, said), (NODE_OFF_CHAIN_ALERT_STEPS, 1), "said again after a return to the chain");
+}
+
+// ---------------------------------------------------------------- BRIDGE2 (MN5CT §9): the bridge's own MN-5 rule
+
+/// The MN values of one case of the contract's fixture of the three real stalls (`test/fixtures/
+/// mn5_testnet_stalls.json` of `v3-mn5`, copied as is): an extension (it keeps the tip's locked block).
+fn mn_of_case(case: &serde_json::Value) -> (Mn, u64) {
+    let work = |k: &str| u256::to_be(&u256::from_u64(case[k].as_str().unwrap().parse::<u64>().unwrap()));
+    let mn = Mn {
+        tip_block_work: [0; 32],
+        fork_base_timestamp: case["forkBaseTimestamp"].as_u64().unwrap(),
+        fork_base_work: work("forkBaseWork"),
+        segment_work: work("segmentWork"),
+        max_timestamp: case["maxTimestamp"].as_u64().unwrap(),
+        tip_on_branch: true,
+        locked_on_branch: true,
+    };
+    (mn, case["at"].as_u64().unwrap())
+}
+
+/// S7: the 9 real cases of the three stalls (11/11, 13/11 morning and evening), each judged as each contract
+/// judges it: `V3Tn1` = the deployed bridge's verdict (`acceptedBefore`), `V3Mn5` = the new one's (`acceptedAfter`).
+#[test]
+fn bridge2_mn5_the_real_stalls_are_judged_as_each_contract_judges_them() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/mn5_testnet_stalls.json")).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 9);
+    let mut changed = 0;
+    for case in cases {
+        let (mn, at) = mn_of_case(case);
+        let name = case["name"].as_str().unwrap();
+        assert_eq!(mn5_ok(Mn5Rule::V3Tn1, &mn, at), case["acceptedBefore"].as_bool().unwrap(), "{name} (v3-tn1)");
+        assert_eq!(mn5_ok(Mn5Rule::V3Mn5, &mn, at), case["acceptedAfter"].as_bool().unwrap(), "{name} (v3-mn5)");
+        changed += usize::from(case["acceptedBefore"] != case["acceptedAfter"]);
+    }
+    assert!(changed >= 5, "the new rule takes points the old one refused");
+}
+
+/// A small deterministic generator for the property tests.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// S3, S7: for every L1 time `at`, `mn5_ok(rule, mn, at)` ⇔ no deadline, or `at` ≤ it — on 12 000 draws per rule
+/// (works of every size, `forkBaseWork` up to 2²⁵⁶ − 1, `segmentWork` 0 included, both kinds of branch), at the
+/// deadline, one second after it, and at random times.
+#[test]
+fn bridge2_mn5_the_deadline_is_exactly_the_last_second_a_point_passes() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let word = |seed: &mut u64| -> [u8; 32] {
+        let mut w = [0u8; 32];
+        // a random byte length: small works and works of 256 bits
+        let len = (xorshift(seed) % 33) as usize;
+        for b in w.iter_mut().skip(32 - len) {
+            *b = xorshift(seed) as u8;
+        }
+        w
+    };
+    for rule in [Mn5Rule::V3Tn1, Mn5Rule::V3Mn5] {
+        for draw in 0..12_000u64 {
+            let base_work = match draw % 50 {
+                0 => [0xff; 32],
+                _ => word(&mut seed),
+            };
+            let segment_work = match draw % 37 {
+                0 => [0; 32],
+                _ => word(&mut seed),
+            };
+            if base_work == [0; 32] {
+                continue;
+            }
+            let mn = Mn {
+                tip_block_work: [0; 32],
+                fork_base_timestamp: 1_700_000_000 + xorshift(&mut seed) % 1_000_000,
+                fork_base_work: base_work,
+                segment_work,
+                max_timestamp: 0,
+                tip_on_branch: false,
+                locked_on_branch: xorshift(&mut seed) % 2 == 0,
+            };
+            let deadline = mn5_deadline(rule, &mn);
+            if rule == Mn5Rule::V3Tn1 {
+                assert!(deadline.is_some(), "the rule of before always has one");
+            }
+            if let Some(d) = deadline {
+                assert!(d >= mn.fork_base_timestamp + MN5_MIN_ELAPSED - 1, "{rule:?} {mn:?}");
+                assert!(mn5_ok(rule, &mn, d), "{rule:?} at its deadline {d}: {mn:?}");
+                assert!(!mn5_ok(rule, &mn, d + 1), "{rule:?} one second after its deadline {d}: {mn:?}");
+            }
+            for _ in 0..4 {
+                let at = mn.fork_base_timestamp + xorshift(&mut seed) % 200_000;
+                assert_eq!(mn5_ok(rule, &mn, at), deadline.is_none_or(|d| at <= d), "{rule:?} at {at}: {mn:?}");
+            }
+        }
+    }
+}
+
+/// S3, S7: the exact edges — the grace (1 799 / 1 800 s) under both rules, the cap (21 600 / 21 601 s) and the two β
+/// of `v3-mn5`.
+#[test]
+fn bridge2_mn5_the_edges_of_the_grace_and_the_cap() {
+    let base = 1_794_000_000u64;
+    let mn = |seg: u64, keeps: bool| Mn {
+        tip_block_work: [0; 32],
+        fork_base_timestamp: base,
+        fork_base_work: u256::to_be(&u256::from_u64(1_000)),
+        segment_work: u256::to_be(&u256::from_u64(seg)),
+        max_timestamp: 0,
+        tip_on_branch: false,
+        locked_on_branch: keeps,
+    };
+    // nothing asked before 1 800 s, under both rules, even of an empty segment
+    for rule in [Mn5Rule::V3Tn1, Mn5Rule::V3Mn5] {
+        assert!(mn5_ok(rule, &mn(0, true), base + 1_799));
+        assert!(!mn5_ok(rule, &mn(0, true), base + 1_800));
+        assert_eq!(mn5_deadline(rule, &mn(0, true)), Some(base + 1_799));
+    }
+    // v3-mn5, keeping L: seg × 720 ≥ W × min(e, 21 600); 30 base blocks meet the cap: no deadline, for ever
+    assert_eq!(mn5_deadline(Mn5Rule::V3Mn5, &mn(30_000, true)), None);
+    assert!(mn5_ok(Mn5Rule::V3Mn5, &mn(30_000, true), base + 21_600));
+    assert!(mn5_ok(Mn5Rule::V3Mn5, &mn(30_000, true), base + 21_601));
+    assert!(mn5_ok(Mn5Rule::V3Mn5, &mn(30_000, true), base + 10_000_000));
+    // one unit less: its last second is 21 599 (⌊29 999 × 720 / 1 000⌋)
+    assert_eq!(mn5_deadline(Mn5Rule::V3Mn5, &mn(29_999, true)), Some(base + 21_599));
+    assert!(!mn5_ok(Mn5Rule::V3Mn5, &mn(29_999, true), base + 21_600));
+    // 1/4: five base blocks pass at one hour, the old rule refuses them there
+    assert!(mn5_ok(Mn5Rule::V3Mn5, &mn(5_000, true), base + 3_600));
+    assert!(!mn5_ok(Mn5Rule::V3Mn5, &mn(4_999, true), base + 3_600));
+    assert!(!mn5_ok(Mn5Rule::V3Tn1, &mn(5_000, true), base + 3_600));
+    // a real switch (the tip's locked block left behind): 4/10, capped at 6 h too (48 base blocks)
+    assert!(!mn5_ok(Mn5Rule::V3Mn5, &mn(5_000, false), base + 3_600));
+    assert!(mn5_ok(Mn5Rule::V3Mn5, &mn(8_000, false), base + 3_600));
+    assert_eq!(mn5_deadline(Mn5Rule::V3Mn5, &mn(48_000, false)), None);
+    assert_eq!(mn5_deadline(Mn5Rule::V3Mn5, &mn(47_999, false)), Some(base + 21_599));
+    assert!(!mn5_ok(Mn5Rule::V3Tn1, &mn(48_000, false), base + 21_601));
+    // the rule of before is the 4/10 without a cap whatever the branch
+    assert_eq!(mn5_deadline(Mn5Rule::V3Tn1, &mn(48_000, true)), Some(base + 21_600));
+    assert_eq!(mn5_ok(Mn5Rule::V3Tn1, &mn(8_000, true), base + 3_600), mn5_ok(Mn5Rule::V3Tn1, &mn(8_000, false), base + 3_600));
+}
+
+/// S1, S7: the rule is the bridge's answer to `MN5_MAX_ELAPSED()` — a revert (the getter absent: the bridge of before)
+/// is `V3Tn1`, 21 600 is `V3Mn5`; any other value, no answer (an account without code answers empty) or an endpoint
+/// not read is no rule.
+#[test]
+fn bridge2_mn5_the_rule_is_the_bridges_answer_at_start() {
+    let word = |x: u64| u256::to_be(&u256::from_u64(x)).to_vec();
+    assert_eq!(mn5_rule_of(&Err("eth_call: execution reverted".into())), Ok(Mn5Rule::V3Tn1));
+    assert_eq!(mn5_rule_of(&Err("eth_call: execution reverted (data 0x)".into())), Ok(Mn5Rule::V3Tn1));
+    assert_eq!(mn5_rule_of(&Ok(word(21_600))), Ok(Mn5Rule::V3Mn5));
+    for refused in [Ok(word(21_599)), Ok(word(0)), Ok(word(43_200)), Ok(Vec::new()), Ok([word(21_600), word(0)].concat())] {
+        assert!(mn5_rule_of(&refused).is_err(), "{refused:?}");
+    }
+    assert!(mn5_rule_of(&Err("eth_call: error sending request: connection refused".into())).is_err());
+    assert_eq!(Mn5Rule::V3Mn5.describe(), "MN5 rule v3-mn5 (cap 21600 s, 1/4 keep-L, 4/10 switch)");
+}
+
+/// S6, S7: the real 11/11 with a GPU proof (1 090 s): at 10:12:54 UTC the deployed bridge refuses the point of
+/// T = 9227 over the base 9220 (its relayer did too), the new bridge takes it — and the relayer plans it only under
+/// the new bridge's rule.
+#[test]
+fn bridge2_mn5_the_relayer_plans_by_the_bridges_rule() {
+    let c = chain_of_11_11(1_794_390_884);
+    assert_eq!(c.tip_height(), 9_227);
+    let at = 1_794_391_974;
+    let (tip, known) = tip_of_11_11(&c);
+    let cum = known[&tip].cp.cum_work;
+    let plan_under = |rule| {
+        let (block, locked) = (known[&tip].cp.tip_block_id, known[&tip].cp.locked_block_id);
+        plan_submission(rule, &c, &known, &tip, &cum, &block, &locked, GL11, &BTreeMap::new(), &[], at, deposit_blocks_bound(3_000_000, 25))
+    };
+    assert_eq!(plan_under(Mn5Rule::V3Tn1), Err(NoSubmission::WorkRateTooLow));
+    let s = plan_under(Mn5Rule::V3Mn5).expect("the new bridge takes it");
+    assert_eq!((s.base, s.next.height), (B11, 9_227));
+    assert!(s.mn.locked_on_branch);
+    // its deadline under the new rule is after its landing, the old one's before
+    assert!(mn5_deadline(Mn5Rule::V3Mn5, &s.mn).is_none_or(|d| d >= at));
+    assert!(mn5_deadline(Mn5Rule::V3Tn1, &s.mn).is_some_and(|d| d < at));
+}
+
+/// S4: the margin is judged by the bridge's rule — a point the new bridge takes with room is not alerted where the
+/// rule of before would alert it (and refuse it).
+#[test]
+fn bridge2_mn5_the_margin_follows_the_bridges_rule() {
+    let base = 1_794_000_000u64;
+    let mn = |seg: u64| Mn {
+        tip_block_work: [0; 32],
+        fork_base_timestamp: base,
+        fork_base_work: u256::to_be(&u256::from_u64(1_000)),
+        segment_work: u256::to_be(&u256::from_u64(seg)),
+        max_timestamp: 0,
+        tip_on_branch: false,
+        locked_on_branch: true,
+    };
+    // at 1 h: 1/4 asks 5 blocks; 7.5 blocks is a margin of 1.5 exactly
+    assert!(!mn5_margin_low(Mn5Rule::V3Mn5, &mn(7_500), base + 3_600));
+    assert!(mn5_margin_low(Mn5Rule::V3Mn5, &mn(7_499), base + 3_600));
+    assert!(mn5_margin_low(Mn5Rule::V3Tn1, &mn(7_500), base + 3_600));
+    // past the cap the margin no longer falls: at 48 h it is the margin at 6 h
+    assert_eq!(
+        mn5_margin_low(Mn5Rule::V3Mn5, &mn(45_000), base + 48 * 3_600),
+        mn5_margin_low(Mn5Rule::V3Mn5, &mn(45_000), base + 21_600)
+    );
+    assert!(!mn5_margin_low(Mn5Rule::V3Mn5, &mn(45_000), base + 48 * 3_600));
 }

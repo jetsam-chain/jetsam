@@ -140,6 +140,7 @@ impl World {
                 fast: FastLaneRules::CONSENSUS,
                 anchor: None,
                 bridge: None,
+                bridge_rotations: &[],
             },
         }
         .effective_at(H)

@@ -10,12 +10,14 @@
 //! `base_return_tests`; every key a deterministic test key.
 
 use super::base_return_tests::{
-    advance_group, base_objects, base_release_block, base_rules, base_world, known, BaseWorld, HB,
-    JTM, TIMES,
+    advance_group, base_objects, base_release_block, base_rules, base_world, base_world_on, known,
+    second_bridge, switched, BaseWorld, HB, JTM, SECOND_FIRST_BURN, TIMES,
 };
 use super::tests::{
-    block_with, committee, committee_update, keys_of, object, state_at, update_group, Committee, P0,
+    block_with, committee, committee_update, finality_update, keys_of, object, state_at,
+    update_group, Committee, P0,
 };
+use crate::consensus::destination::tests::prototype_bridge;
 use super::*;
 use crate::consensus::destination::base_read::tests::{Knobs, PROPOSED, VALID};
 use crate::consensus::destination::base_read::{BaseGameError, GAME_STATUS_DEFENDER_WINS};
@@ -2196,4 +2198,137 @@ fn history_signed_by_a_former_key_still_validates_after_rearming() {
     // Without a table, the rules a block is judged by are the build's.
     assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.fast, l.rules.base_return.fast);
     assert_eq!(l.rules.effective_at(HEIGHT + 5).base_return.base, l.rules.base_return.base);
+}
+
+
+// ---------------------------------------------------------------------------
+// BRIDGE2 (D208): the fast lane across the switch to a second bridge
+// ---------------------------------------------------------------------------
+
+/// From the second bridge's height on, a fast release names the second bridge
+/// (its statement), never the first; below it, the first.
+#[test]
+fn bridge2_a_fast_release_names_the_bridge_of_its_blocks_height() {
+    let l = lane();
+    let parent = state_at(HEIGHT - 1, known(&l.c0));
+    let r = release(SECOND_FIRST_BURN, ALICE, 5 * JTM);
+    let world = base_world_on(&second_bridge(), &r, PROPOSED, PROPOSED_TIMES);
+    let naming = |bridge: [u8; 20]| {
+        attest(
+            &l.relay,
+            FastStatement {
+                bridge,
+                ..l.statement(&world)
+            },
+        )
+    };
+    let from = switched(l.rules, HEIGHT);
+    let check = |att: &FastAttestation| {
+        let b = fast_block(HEIGHT, &r, ALICE, &l.c0, &world, att);
+        validate_block_destination(&b, &parent, &from, &l.keys)
+    };
+    assert_eq!(
+        check(&naming(prototype_bridge().address)).map(|_| ()),
+        Err(DestinationBlockError::FastStatementMismatch)
+    );
+    let effect = check(&naming(second_bridge().address)).expect("under the second bridge");
+    assert_eq!(effect.fast.created[0].0, SECOND_FIRST_BURN);
+}
+
+/// A fast release the first bridge paid is never contradicted under the
+/// second one: Base's word there (here another burn's; an absence for the real
+/// contract, whose indices start above) says nothing of that burn. The relay
+/// key is not closed, the record expires at its horizon as before; the same
+/// rule for the mempool (`verify_fast_contradiction`). A fast release the
+/// second bridge paid is contradicted under it as ever.
+#[test]
+fn bridge2_a_fast_release_of_the_first_bridge_is_never_contradicted_under_the_second() {
+    let l = lane();
+    // n = 3 paid fast at HEIGHT under the first bridge.
+    let (parent, record) = after_fast_release(&l);
+    let from = switched(l.rules, HEIGHT + 1);
+    let other = release(3, BOB, 7 * JTM);
+    let world = base_world_on(&second_bridge(), &other, VALID, TIMES);
+    let entry = entry_for(&l, 3, &record);
+    let b = contradiction_block(
+        HEIGHT + 1,
+        &l,
+        &world,
+        &[(3, world.storage_proof.clone())],
+        &[entry],
+        &[],
+    );
+    assert_eq!(
+        validate_block_destination(&b, &parent, &from, &l.keys).map(|_| ()),
+        Err(DestinationBlockError::FastRecordOfAnotherBridge { n: 3 })
+    );
+    let objects = BaseReleaseObjects {
+        finality: &finality_update(&l.c0, P0, world.l1_root).encode_payload(),
+        game_proof: &crate::consensus::destination::base_read::encode_game_proof(&world.game),
+        output_preimage: &crate::consensus::destination::base_read::encode_output_root_preimage(
+            &world.preimage,
+        ),
+        account_proof: &world.account,
+    };
+    let payload = FastContradiction {
+        n: 3,
+        storage_proof: world.storage_proof.clone(),
+    }
+    .encode_payload();
+    assert_eq!(
+        verify_fast_contradiction(
+            &objects,
+            &payload,
+            entry.marker(),
+            &known(&l.c0),
+            &from.effective_at(HEIGHT + 1),
+            &parent.fast,
+            &l.keys,
+            &l.keys,
+        ),
+        Err(DestinationBlockError::FastRecordOfAnotherBridge { n: 3 })
+    );
+    assert!(!parent.fast.is_closed(&l.relay_key()));
+    // Below the switch the same contradiction under the first bridge stands.
+    let first_world = base_world(&other, VALID, TIMES);
+    let below = contradiction_block(
+        HEIGHT + 1,
+        &l,
+        &first_world,
+        &[(3, first_world.storage_proof.clone())],
+        &[entry],
+        &[],
+    );
+    assert!(validate_block_destination(&below, &parent, &switched(l.rules, HEIGHT + 2), &l.keys).is_ok());
+    // A fast release of the second bridge, contradicted under it.
+    let start = state_at(HEIGHT - 1, known(&l.c0));
+    let paid = release(SECOND_FIRST_BURN, ALICE, 5 * JTM);
+    let proposed = base_world_on(&second_bridge(), &paid, PROPOSED, PROPOSED_TIMES);
+    let att = attest(
+        &l.relay,
+        FastStatement {
+            bridge: second_bridge().address,
+            ..l.statement(&proposed)
+        },
+    );
+    let on = switched(l.rules, HEIGHT);
+    let fast = fast_block(HEIGHT, &paid, ALICE, &l.c0, &proposed, &att);
+    let effect = validate_block_destination(&fast, &start, &on, &l.keys).expect("fast, second bridge");
+    let after = applied(&start, &effect);
+    let record2 = effect.fast.created[0].1;
+    let truth = release(SECOND_FIRST_BURN, BOB, 7 * JTM);
+    let truth_world = base_world_on(&second_bridge(), &truth, VALID, TIMES);
+    let entry2 = entry_for(&l, SECOND_FIRST_BURN, &record2);
+    let contradicted = contradiction_block(
+        HEIGHT + 1,
+        &l,
+        &truth_world,
+        &[(SECOND_FIRST_BURN, truth_world.storage_proof.clone())],
+        &[entry2],
+        &[],
+    );
+    let effect = validate_block_destination(&contradicted, &after, &on, &l.keys)
+        .expect("contradicted under its own bridge");
+    assert_eq!(effect.fast.contradicted, vec![entry2]);
+    assert!(applied(&after, &effect).fast.is_closed(&l.relay_key()));
 }

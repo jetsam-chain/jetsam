@@ -58,7 +58,7 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     let mut c135 = full.clone();
     c135.truncate_above(142);
     let at = |c: &Chain| c.header_at(c.tip_height()).unwrap().timestamp + 60;
-    let s1 = relayer::plan_submission(&c135, &known, &gid, &gcp.cum_work, &gcp.tip_block_id, &gcp.locked_block_id, GL, &found, &ar.missing(), at(&c135), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let s1 = relayer::plan_submission(relayer::Mn5Rule::V3Tn1, &c135, &known, &gid, &gcp.cum_work, &gcp.tip_block_id, &gcp.locked_block_id, GL, &found, &ar.missing(), at(&c135), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert_eq!((s1.next.height, s1.next.locked_height, s1.next.deposit_count, s1.fork_depth), (142, 133, 1, 0));
     let r1 = ProofRequest::build(&s1, &known[&gid], &c135, &ar, GL, GL + 1, 32).unwrap();
     assert_eq!(r1.deposit_blocks.len(), 1, "the whole block of the deposit");
@@ -66,7 +66,7 @@ fn the_relayers_own_path_gives_the_checkpoint_program_what_it_proves_on_the_real
     relayer::check_native(&r1).unwrap();
     // the point that extends it, on the chain at 144
     known.insert(s1.next.id(), Known { cp: s1.next, parent: gid, accepted_at: 1, headers: Known::context_from(&s1.next, &c135), ours: true, omitted: Some(s1.omitted.clone()), deposit_blocks: Some(s1.deposit_blocks.clone()) });
-    let s2 = relayer::plan_submission(&full, &known, &s1.next.id(), &s1.next.cum_work, &s1.next.tip_block_id, &s1.next.locked_block_id, GL, &found, &ar.missing(), at(&full), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let s2 = relayer::plan_submission(relayer::Mn5Rule::V3Tn1, &full, &known, &s1.next.id(), &s1.next.cum_work, &s1.next.tip_block_id, &s1.next.locked_block_id, GL, &found, &ar.missing(), at(&full), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert_eq!((s2.parent, s2.next.height, s2.next.locked_height, s2.fork_depth), (s1.next.id(), 144, 136, 0));
     let r2 = ProofRequest::build(&s2, &known[&s1.next.id()], &full, &ar, GL, GL + 1, 32).unwrap();
     assert!(r2.deposit_blocks.is_empty(), "the deposit is the parent's: below its L");
@@ -122,7 +122,7 @@ fn n2_a_point_that_leaves_the_rehearsal_deposit_out_is_extended_and_the_deposit_
     ]);
     assert_eq!(relayer::resolve_trees(&mut known, &found, GL), vec![(a.id(), vec![129])]);
     let at = |c: &Chain| c.header_at(c.tip_height()).unwrap().timestamp + 60;
-    let s = relayer::plan_submission(&full, &known, &a.id(), &a.cum_work, &a.tip_block_id, &a.locked_block_id, GL, &found, &ar.missing(), at(&full), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let s = relayer::plan_submission(relayer::Mn5Rule::V3Tn1, &full, &known, &a.id(), &a.cum_work, &a.tip_block_id, &a.locked_block_id, GL, &found, &ar.missing(), at(&full), relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert_eq!((s.parent, s.fork_depth, s.next.locked_height, s.next.deposit_count, s.omitted.clone()), (a.id(), 0, 136, 0, vec![129]));
     let req = ProofRequest::build(&s, &known[&a.id()], &full, &ar, GL, GL + 1, 32).unwrap();
     assert!(req.deposit_blocks.is_empty(), "the window ]133 ; 136] holds no deposit");

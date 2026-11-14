@@ -62,6 +62,11 @@ pub struct Activations {
     /// in force (absent while the pins of `H` are the only ones).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub base_pin_rotations: Vec<u64>,
+    /// BRIDGE2 (D208): the bridges the return over Base reads after
+    /// `base_return_bridge`, each from its height on, with its pins and its
+    /// first burn index (absent while `base_return_bridge` is the only one).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub base_return_bridge_rotations: Vec<BridgeRotationRecord>,
     /// The guardian rules' v1.7 height ([`GuardianRules`]).
     pub guardian_height: Option<u64>,
     /// `J_D`: the guardians' delegation height.
@@ -116,6 +121,7 @@ impl Activations {
                 })
                 .collect(),
             base_pin_rotations: base_return.base.rotations.iter().map(|(h, _)| *h).collect(),
+            base_return_bridge_rotations: Vec::new(),
             guardian_height: guardian.activation_height,
             delegation_height: guardian.delegation_height,
             guardian_group_key: guardian.group_key.map(|key| hex(&key)),
@@ -129,6 +135,17 @@ pub struct FastKeyRotationRecord {
     pub height: u64,
     pub release_key: Option<String>,
     pub revoke_key: Option<String>,
+}
+
+/// One later bridge of the return over Base (BRIDGE2): its height, its pins
+/// (20 and 32 bytes hex) and its first burn index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BridgeRotationRecord {
+    pub height: u64,
+    pub address: String,
+    pub code_hash: String,
+    pub genesis_id: String,
+    pub first_burn: u64,
 }
 
 /// D123's caps height of `vault` ([`Activations::vault_caps_height`]).
@@ -193,7 +210,59 @@ mod tests {
         assert_eq!(a.return_fix_height, d.base_return.advance.fix_height);
         assert_eq!(a.fast_key_rotations.len(), d.base_return.fast.rotations.len());
         assert_eq!(a.base_pin_rotations.len(), d.base_return.base.rotations.len());
+        assert_eq!(
+            a.base_return_bridge_rotations.len(),
+            d.base_return.bridge_rotations.len()
+        );
         assert_eq!(a, Activations::of(&d, &c, &g, network_id()));
+    }
+
+    /// BRIDGE2: each later bridge is published with its height, its pins and
+    /// its first burn index; none, and the record keeps the fields of before
+    /// (a robot of before reads a node without a second bridge).
+    #[test]
+    fn bridge2_the_later_bridges_are_published_with_their_height_pins_and_first_burn() {
+        use crate::consensus::destination::state::BridgeRotation;
+        let (c, g) = (ClientObjectRules::CONSENSUS, GuardianRules::consensus());
+        let mut d = DestinationRules::CONSENSUS;
+        d.base_return.bridge_rotations = &[];
+        let v = serde_json::to_value(Activations::of(&d, &c, &g, [0; 32])).unwrap();
+        assert!(v.get("base_return_bridge_rotations").is_none());
+        d.base_return.activation_height = Some(1_000);
+        d.base_return.bridge = Some(L1BridgeParams {
+            address: [0x11; 20],
+            code_hash: [0; 32],
+            withdrawals_slot: 9,
+            genesis_id_slot: 13,
+            genesis_id: [0; 32],
+        });
+        d.base_return.bridge_rotations = &[BridgeRotation {
+            height: 2_000,
+            bridge: L1BridgeParams {
+                address: [0x22; 20],
+                code_hash: [0x33; 32],
+                withdrawals_slot: 9,
+                genesis_id_slot: 13,
+                genesis_id: [0x44; 32],
+            },
+            first_burn: 1_000_000,
+        }];
+        let a = Activations::of(&d, &c, &g, [0; 32]);
+        // The bridge of `H` stays the first one; the second is in the table.
+        assert_eq!(a.base_return_bridge, Some("11".repeat(20)));
+        assert_eq!(
+            a.base_return_bridge_rotations,
+            vec![BridgeRotationRecord {
+                height: 2_000,
+                address: "22".repeat(20),
+                code_hash: "33".repeat(32),
+                genesis_id: "44".repeat(32),
+                first_burn: 1_000_000,
+            }]
+        );
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["base_return_bridge_rotations"][0]["height"], serde_json::json!(2_000));
+        assert_eq!(v["base_return_bridge_rotations"][0]["first_burn"], serde_json::json!(1_000_000));
     }
 
     /// Rules a test installs on its thread (other heights, keys, bridge) are
@@ -342,6 +411,22 @@ mod tests {
         assert_eq!(a.return_fix_height, crate::consensus::params::V1_7_RETURN_FIX_HEIGHT);
         assert!(a.return_fix_height.is_some_and(|h| h > 10_351));
         assert!(a.fast_key_rotations.is_empty() && a.base_pin_rotations.is_empty());
+        // BRIDGE2: TN1's bridge from H on, the second bridge from its height.
+        assert_eq!(
+            a.base_return_bridge.as_deref(),
+            Some("5221245deb99771dd76ccf785fd39a5d4f692254")
+        );
+        let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed on the test chain");
+        assert_eq!(a.base_return_bridge_rotations.len(), 1);
+        let second = &a.base_return_bridge_rotations[0];
+        let pinned = crate::consensus::destination::state::BASE_RETURN_BRIDGE2;
+        assert_eq!(
+            (second.height, second.first_burn),
+            (h2, 1_000_000)
+        );
+        assert_eq!(second.address, hex_of(&pinned.address));
+        assert_eq!(second.code_hash, hex_of(&pinned.code_hash));
+        assert_eq!(second.genesis_id, hex_of(&pinned.genesis_id));
     }
 
     /// The public network's record: its genesis, v1.7 dormant (no `J`, `F`,
@@ -369,6 +454,7 @@ mod tests {
         );
         assert_eq!(a.vault_caps_height, Some(0));
         assert_eq!(a.return_fix_height, None);
+        assert!(a.base_return_bridge_rotations.is_empty());
     }
 
     /// On the wire: one JSON object of these named fields, heights as
@@ -377,6 +463,8 @@ mod tests {
     fn the_record_is_one_json_object_of_named_fields() {
         let mut d = DestinationRules::CONSENSUS;
         d.base_return.fast.release_key = Some([0xab; 48]);
+        // BRIDGE2: the test chain's table is published apart (its own test).
+        d.base_return.bridge_rotations = &[];
         let a = Activations::of(
             &d,
             &ClientObjectRules::CONSENSUS,

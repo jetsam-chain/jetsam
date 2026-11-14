@@ -121,7 +121,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     assert_eq!(tip_block, gcp.tip_block_id, "the genesis's block");
     let tip_locked = word(&view(&l1, &bridge, "tipLockedBlockId()", &[]), 0);
     assert_eq!(tip_locked, gcp.locked_block_id, "the genesis's locked block (N1)");
-    let s = relayer::plan_submission(&chain, &known, &gid, &gcp.cum_work, &tip_block, &tip_locked, GL, &found, &[], now(&l1) + 60, relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let s = relayer::plan_submission(relayer::Mn5Rule::V3Tn1, &chain, &known, &gid, &gcp.cum_work, &tip_block, &tip_locked, GL, &found, &[], now(&l1) + 60, relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert_eq!((s.next.locked_height, s.next.deposit_count, s.fork_depth), (52, 3, 0));
     assert!(s.mn.tip_on_branch && s.mn.locked_on_branch, "an extension holds the tip's block and its locked block");
     // C1 (re-audit n°2): the heights of the whole blocks the proof gives, the deposit blocks of ]10 ; 52]
@@ -145,7 +145,7 @@ fn deposit_advance_checkpoint_finality_and_repayment_on_the_real_contract() {
     let mut longer = chain.clone();
     longer.extend(testkit::header(longer.tip_id(), 61, now(&l1) - 60, testkit::target_bits(20), 1)).unwrap();
     let only_genesis = HashMap::from([(gid, known[&gid].clone())]);
-    let third = relayer::plan_submission(&longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], now(&l1) + 60, relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
+    let third = relayer::plan_submission(relayer::Mn5Rule::V3Tn1, &longer, &only_genesis, &gid, &gcp.cum_work, &s.next.tip_block_id, &s.next.locked_block_id, GL, &found, &[], now(&l1) + 60, relayer::deposit_blocks_bound(3_000_000, 25)).unwrap();
     assert!(third.mn.tip_on_branch && third.parent == gid && third.next.height == 61);
     let tpv = public_values(&third.parent, &third.next, 0, anchor_base, &s.next.tip_block_id, &s.next.locked_block_id, &third.mn, &third.deposit_blocks);
     let refused = sender(GENESIS_KEY, &gd).send(&l1, &bridge, &l1::submit_checkpoint(&gid, &third.next, 0, &third.mn, &third.deposit_blocks, &mock_proof(&tpv)), "submitCheckpoint");

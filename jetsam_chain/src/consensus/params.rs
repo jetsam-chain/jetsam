@@ -703,6 +703,46 @@ const _: () = assert!(
     "V1_7_RETURN_FIX_HEIGHT must be None with a dormant V1_7_BASE_RETURN_HEIGHT, else armed at or above it"
 );
 
+/// BRIDGE2 (D208, 14 November 2026): from this height on, the return over
+/// Base reads the test chain's second bridge (`v3-mn5-bridge2`, MN-5 without
+/// a dead end) instead of TN1's, abandoned: the bridge table of
+/// `destination::state` (`BASE_RETURN_BRIDGE_ROTATIONS`). Below it every
+/// block is judged exactly as before (the same bridge, the same pins), so the
+/// history replays; from it on, no release, fast release or contradiction is
+/// judged under the abandoned bridge, and a fast release that bridge paid is
+/// never contradicted under the new one (its record expires at its horizon).
+///
+/// **`None` on the public network and the private rehearsal** (their first
+/// bridge is still to deploy). On the test chain: a height the operator
+/// chooses, every node and every robot redeployed before it (proposed
+/// 12 480 = 26 × 480: tip 10 869 on 14/11 ≈ 19:10 UTC, ≈ 480 blocks a day,
+/// ≈ 3.4 days ahead). **Easy to move: this constant only** (the new bridge's
+/// genesis window ends at it: `depositsFromHeight` of its deployment).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;
+/// The test chain's (proposed; the operator fixes it at deployment).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = Some(12_480);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;
+
+/// Whether a second-bridge height may sit beside a return-over-Base height:
+/// dormant, or strictly above an armed return (the first bridge is read at
+/// least one block).
+pub const fn bridge2_schedule_is_valid(base_return_activation: Option<u64>, bridge2: Option<u64>) -> bool {
+    match (base_return_activation, bridge2) {
+        (_, None) => true,
+        (Some(base_return), Some(h)) => h > base_return,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    bridge2_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT),
+    "V1_7_BRIDGE2_HEIGHT must be None, or strictly above an armed V1_7_BASE_RETURN_HEIGHT"
+);
+
 /// Whether the return over Base governs the block at `height`.
 #[inline]
 pub const fn v1_7_base_return_active(height: u64) -> bool {

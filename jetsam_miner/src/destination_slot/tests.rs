@@ -1808,6 +1808,7 @@ mod reopened {
                     fast: FastLaneRules::CONSENSUS,
                     anchor: None,
                     bridge: None,
+                    bridge_rotations: &[],
                 },
             },
             keys,

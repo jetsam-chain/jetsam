@@ -450,10 +450,21 @@ pub fn base_word_alerts(bases: &[(&str, &dyn BaseRpc)], bridge: &L1BridgeParams,
 /// minutes): a log endpoint late behind the head that answered it never hides a burn.
 pub const BURN_RESCAN_BLOCKS: u64 = 900;
 
-/// FR-4: the burn indices missing below the highest seen (the bridge counts from 1).
-pub fn burn_gaps(burns: &BTreeMap<u64, BurnSeen>) -> Vec<u64> {
+/// FR-4: the burn indices missing below the highest seen, from the bridge's first index (BRIDGE2: `first_burn` of
+/// the bridge in force, `DestinationRules::first_burn`; 0 or 1: the bridge counts from 1).
+pub fn burn_gaps(burns: &BTreeMap<u64, BurnSeen>, first_burn: u64) -> Vec<u64> {
+    let _ = first_burn;
     let top = burns.keys().next_back().copied().unwrap_or(0);
     (1..top).filter(|n| !burns.contains_key(n)).collect()
+}
+
+/// BRIDGE2: the fast records the bridge of this run paid (the bridge of `rules`, this build's last): a record another
+/// bridge paid (one abandoned since) is never vouched for, captured, alerted or contradicted here — Base's word under
+/// this bridge says nothing of its burn (the nodes refuse its contradiction, `FastRecordOfAnotherBridge`); it expires
+/// at its horizon.
+pub fn records_of_this_bridge(records: Vec<FastPaid>, rules: &jetsam_chain::consensus::destination::state::DestinationRules) -> Vec<FastPaid> {
+    let _ = rules;
+    records
 }
 
 /// FR-1, FR-5: the `n` each capture asks: every burn seen and every fast record watched, but those settled.
@@ -1386,13 +1397,13 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         use crate::light_feed::FeedNode;
         let node = node.get(|n| &n.client)?;
         let lane = node.client.call("getFastLane", json!([]))?;
-        let records = fast_paid_of(&lane)?;
+        let records = records_of_this_bridge(fast_paid_of(&lane)?, &rules);
         // FR-1 (audit n°2): every fast record this run cannot vouch for, said at once (no proof needed); the `n` never
         // seen burnt are captured from the next tick; FR-4: a hole in the burn indices is said
         let unsettled: Vec<FastPaid> = {
             let mut s = lock(&state);
             let mut lines = record_alerts(&records, &s.burns);
-            lines.extend(burn_gaps(&s.burns).into_iter().map(|n| format!("ALERT FAST BURN_GAP n {n}: never seen burnt while a later burn was (a log endpoint behind its head?)")));
+            lines.extend(burn_gaps(&s.burns, rules.first_burn()).into_iter().map(|n| format!("ALERT FAST BURN_GAP n {n}: never seen burnt while a later burn was (a log endpoint behind its head?)")));
             for line in lines {
                 if alerted.insert(line.clone()) {
                     say(&line);

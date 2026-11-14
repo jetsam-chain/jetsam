@@ -74,7 +74,7 @@ use super::DestinationObjectKind;
 use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::params::{
     v1_7_active_with, v1_7_base_return_active_with, CONSENSUS_FINALITY_DEPTH,
-    V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT,
+    V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT,
 };
 use crate::consensus::vault::{
     decode_bridge_account_proof, destination_marker_kind, validate_block_vault_with,
@@ -261,6 +261,123 @@ pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
 #[cfg(feature = "rehearsal-v1-7")]
 pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
 
+/// BRIDGE2 (D208): a bridge on Base the return reads from a height on, in
+/// place of the one before (the earlier one abandoned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeRotation {
+    /// The first height whose blocks read `bridge` ([`V1_7_BRIDGE2_HEIGHT`]).
+    pub height: u64,
+    pub bridge: L1BridgeParams,
+    /// The contract's first burn index (`nextBurnIndex` at its deployment,
+    /// bound by its CREATE2 address): above every index the bridges before it
+    /// ever gave, so that no `n` the branch paid, advanced or fast-released
+    /// is ever another burn's. A release under this bridge of a lower `n` is
+    /// refused.
+    pub first_burn: u64,
+}
+
+/// The test chain's second bridge (`v3-mn5-bridge2`): its CREATE2 address and
+/// runtime code hash with its immutables (computed offline, the deployment
+/// replayed on a local fork of Base Sepolia, BRIDGE2), `withdrawals` at slot
+/// 9 and `genesisId` at slot 13 (layout unchanged), its first burn index
+/// 1 000 000. `genesis_id` is its `genesisId()` once its `initGenesis` locked
+/// the locked block of TN1's last point (no deposit TN1 could mint is in its
+/// tree): written here at the switch, with the address and code hash read
+/// again on the deployed contract.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
+    address: [0x2b; 20],
+    code_hash: [0xc2; 32],
+    withdrawals_slot: 9,
+    genesis_id_slot: 13,
+    genesis_id: [0x2e; 32],
+};
+
+/// The bridges the return over Base reads after its first, each from its
+/// height on (BRIDGE2): empty on the public network and the private
+/// rehearsal.
+#[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[];
+/// The test chain's: its second bridge from [`V1_7_BRIDGE2_HEIGHT`] on.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[BridgeRotation {
+    height: match V1_7_BRIDGE2_HEIGHT {
+        Some(h) => h,
+        None => panic!("the test chain arms V1_7_BRIDGE2_HEIGHT with its second bridge"),
+    },
+    bridge: BASE_RETURN_BRIDGE2,
+    first_burn: 1_000_000,
+}];
+
+/// Whether a bridge table may sit beside the return's first bridge `first`,
+/// its height `base_return` and the second-bridge height `bridge2`: empty
+/// with `bridge2` dormant; else its first entry at `bridge2`, the heights
+/// strictly increasing above `base_return`, every bridge's address its own
+/// (none the first's), every first burn index ≥ 1 and not decreasing.
+pub const fn bridge_rotations_are_valid(
+    rotations: &[BridgeRotation],
+    first: Option<L1BridgeParams>,
+    base_return: Option<u64>,
+    bridge2: Option<u64>,
+) -> bool {
+    match bridge2 {
+        None => return rotations.is_empty(),
+        Some(h) => {
+            if rotations.is_empty() || rotations[0].height != h {
+                return false;
+            }
+        }
+    }
+    let Some(base_return) = base_return else {
+        return false;
+    };
+    let mut i = 0;
+    while i < rotations.len() {
+        let r = &rotations[i];
+        if r.height <= base_return || r.first_burn == 0 {
+            return false;
+        }
+        if let Some(first) = first {
+            if addresses_equal(&first.address, &r.bridge.address) {
+                return false;
+            }
+        }
+        let mut j = 0;
+        while j < i {
+            if addresses_equal(&rotations[j].bridge.address, &r.bridge.address) {
+                return false;
+            }
+            j += 1;
+        }
+        if i > 0 && (r.height <= rotations[i - 1].height || r.first_burn < rotations[i - 1].first_burn) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn addresses_equal(a: &[u8; 20], b: &[u8; 20]) -> bool {
+    let mut i = 0;
+    while i < 20 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    bridge_rotations_are_valid(
+        BASE_RETURN_BRIDGE_ROTATIONS,
+        BASE_RETURN_BRIDGE,
+        V1_7_BASE_RETURN_HEIGHT,
+        V1_7_BRIDGE2_HEIGHT
+    ),
+    "BASE_RETURN_BRIDGE_ROTATIONS: empty with a dormant V1_7_BRIDGE2_HEIGHT, else starting at it, above the return, one address per bridge"
+);
+
 /// The return over Base (D94, D101, D107): its height, the L1 it reads from
 /// that height on, Base's pinned contracts there, the advance. From its
 /// height on, its anchor and bridge (when set) take the place of the L1's
@@ -278,6 +395,9 @@ pub struct BaseReturnRules {
     /// [`BASE_RETURN_ANCHOR`], [`BASE_RETURN_BRIDGE`].
     pub anchor: Option<L1Anchor>,
     pub bridge: Option<L1BridgeParams>,
+    /// BRIDGE2: the bridges after `bridge`, each from its height on
+    /// ([`BASE_RETURN_BRIDGE_ROTATIONS`]); empty: `bridge` for ever.
+    pub bridge_rotations: &'static [BridgeRotation],
 }
 
 impl BaseReturnRules {
@@ -289,10 +409,27 @@ impl BaseReturnRules {
         fast: FastLaneRules::CONSENSUS,
         anchor: BASE_RETURN_ANCHOR,
         bridge: BASE_RETURN_BRIDGE,
+        bridge_rotations: BASE_RETURN_BRIDGE_ROTATIONS,
     };
 
     pub const fn active_at(&self, height: u64) -> bool {
         v1_7_base_return_active_with(height, self.activation_height)
+    }
+
+    /// BRIDGE2: the rotation in force at `height` (the last at or below it),
+    /// none while `bridge` is.
+    pub const fn rotation_at(&self, height: u64) -> Option<&BridgeRotation> {
+        let _ = height;
+        None
+    }
+
+    /// BRIDGE2: the bridge the return reads at `height`: the rotation's in
+    /// force, else `bridge` (none: the L1's).
+    pub const fn bridge_at(&self, height: u64) -> Option<L1BridgeParams> {
+        match self.rotation_at(height) {
+            Some(rotation) => Some(rotation.bridge),
+            None => self.bridge,
+        }
     }
 }
 
@@ -362,6 +499,21 @@ impl DestinationRules {
 
     pub const fn active_at(&self, height: u64) -> bool {
         v1_7_active_with(height, self.activation_height)
+    }
+
+    /// BRIDGE2: under these rules (a block's: [`Self::effective_at`]), the
+    /// lowest `n` a release may pay: the first burn index of the rotation
+    /// whose bridge is in force; 0 (no bound) under the return's first bridge.
+    pub fn first_burn(&self) -> u64 {
+        0
+    }
+
+    /// BRIDGE2: under these rules (a block's), whether the fast release a
+    /// branch made at `record_height` was paid under the bridge in force —
+    /// only then may Base's word under it contradict that release.
+    pub fn fast_record_under_this_bridge(&self, record_height: u64) -> bool {
+        let _ = record_height;
+        true
     }
 
     /// The blocks of releases a state keeps after its block at `height`
@@ -1783,6 +1935,13 @@ pub enum DestinationBlockError {
     /// The one more release of a contradicted `n` pays the burn the fast
     /// lane paid already.
     RepeatsTheFastRecord { n: u64 },
+    /// BRIDGE2: a contradiction of a fast release another bridge paid (one
+    /// abandoned since): Base's word under the bridge in force says nothing
+    /// of that burn (an absence there is no contradiction of it).
+    FastRecordOfAnotherBridge { n: u64 },
+    /// BRIDGE2: a release of an `n` below the first burn index of the bridge
+    /// in force (an index the bridges before it gave).
+    BelowTheBridgesFirstBurn { n: u64 },
 }
 
 impl DestinationBlockError {

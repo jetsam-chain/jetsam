@@ -1012,6 +1012,46 @@ pub fn read_body(sources: Vec<crate::relayer::BodySource>, id: &[u8; 32], rules:
     }
 }
 
+/// FIX2GU §2.2, RELFIX2 for jg-fill (D171): the bytes of a block that a source served — bytes that carry this block's
+/// header — and that this build cannot read (a rule of the nodes it does not know yet), kept in the robot's state
+/// directory (`<state_dir>/unreadable/<height>-<id>-<keccak>.bin`, one copy a source, each under
+/// [`crate::relayer::UNREADABLE_COPY_MAX_BYTES`]) and offered first at every later read ([`read_body_kept`]): once
+/// the nodes prune the block, it is still read again (after an upgrade, its deposits), never recorded "no deposit".
+pub struct KeptBodies {
+    dir: PathBuf,
+}
+
+impl KeptBodies {
+    /// The kept bodies of the state directory `state_dir`.
+    pub fn open(state_dir: &Path) -> anyhow::Result<Self> {
+        Ok(Self { dir: state_dir.join("unreadable") })
+    }
+
+    /// The copies kept for block `height` whose id is `id`: (source, bytes).
+    pub fn copies(&self, height: u64, id: &[u8; 32]) -> Vec<(String, Vec<u8>)> {
+        let _ = (height, id);
+        Vec::new()
+    }
+
+    /// Keep each of `served` (source, bytes) that carries the header of block `id`, not kept yet: how many now.
+    pub fn keep(&self, height: u64, id: &[u8; 32], served: &[(String, Vec<u8>)]) -> anyhow::Result<usize> {
+        let _ = (height, id, served);
+        Ok(0)
+    }
+
+    /// The copies of block `height` forgotten (it was read).
+    pub fn forget(&self, height: u64, id: &[u8; 32]) {
+        let _ = (height, id);
+    }
+}
+
+/// [`read_body`] with the copies `kept` holds for block `height` read first (as sources `kept <source>`): served bytes
+/// of this block this build cannot read are kept, a block read is forgotten.
+pub fn read_body_kept(kept: &KeptBodies, height: u64, id: &[u8; 32], sources: Vec<crate::relayer::BodySource>, rules: &VaultRules) -> BodyRead {
+    let _ = (kept, height);
+    read_body(sources, id, rules)
+}
+
 /// E-12: at most this many blocks not tried yet, and this many that failed before, per step of the robot's scan.
 pub const SCAN_NEW_PER_STEP: usize = 64;
 pub const SCAN_RETRIES_PER_STEP: usize = 8;

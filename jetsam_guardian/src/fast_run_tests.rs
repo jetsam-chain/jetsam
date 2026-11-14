@@ -1111,10 +1111,10 @@ fn a_burn_the_log_endpoint_served_late_is_still_seen() {
 fn a_hole_in_the_burn_indices_is_said() {
     let w = world();
     let seen = |ns: &[u64]| ns.iter().map(|n| (*n, BurnSeen { burn: Burn { n: *n, ..w.burn }, block: 1 })).collect::<BTreeMap<_, _>>();
-    assert_eq!(burn_gaps(&seen(&[1, 2, 4, 7])), vec![3, 5, 6]);
-    assert!(burn_gaps(&seen(&[1, 2, 3])).is_empty());
-    assert!(burn_gaps(&seen(&[])).is_empty());
-    assert_eq!(burn_gaps(&seen(&[2])), vec![1]);
+    assert_eq!(burn_gaps(&seen(&[1, 2, 4, 7]), 1), vec![3, 5, 6]);
+    assert!(burn_gaps(&seen(&[1, 2, 3]), 1).is_empty());
+    assert!(burn_gaps(&seen(&[]), 1).is_empty());
+    assert_eq!(burn_gaps(&seen(&[2]), 1), vec![1]);
 }
 
 /// FR-5: a fast record Base's final state confirmed is settled: its slot is no longer captured; the captures are kept
@@ -1334,4 +1334,50 @@ fn fr9_the_return_robots_take_the_gloas_epoch_and_refuse_a_wrong_one_at_the_star
         };
         assert!(e.contains("--gloas-epoch 1: not a Gloas epoch of this L1"), "{name}: {e}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// BRIDGE2 (D208): a run of the second bridge
+// ---------------------------------------------------------------------------
+
+/// BRIDGE2: the second bridge counts from its first index (1 000 000 on the test chain): no hole is said below it
+/// (else every pass would say a million), a hole above it is; a bridge of before (first 0 or 1) as ever.
+#[test]
+fn bridge2_a_hole_is_counted_from_the_bridges_first_index() {
+    let w = world();
+    let seen = |ns: &[u64]| ns.iter().map(|n| (*n, BurnSeen { burn: Burn { n: *n, ..w.burn }, block: 1 })).collect::<BTreeMap<_, _>>();
+    assert!(burn_gaps(&seen(&[1_000_000]), 1_000_000).is_empty());
+    assert!(burn_gaps(&seen(&[1_000_000, 1_000_001]), 1_000_000).is_empty());
+    assert_eq!(burn_gaps(&seen(&[1_000_000, 1_000_003]), 1_000_000), vec![1_000_001, 1_000_002]);
+    assert_eq!(burn_gaps(&seen(&[1_000_002]), 1_000_000), vec![1_000_000, 1_000_001]);
+    assert_eq!(burn_gaps(&seen(&[3]), 0), vec![1, 2]);
+    assert_eq!(burn_gaps(&seen(&[3]), 1), vec![1, 2]);
+}
+
+/// BRIDGE2: a run of the second bridge leaves the fast records the first bridge paid (made below the switch) to their
+/// horizon — never vouched for, captured or contradicted (Base's word under the second bridge says nothing of their
+/// burns, and the nodes refuse such a contradiction); the second bridge's own records are its.
+#[test]
+fn bridge2_a_run_of_the_second_bridge_leaves_the_first_bridges_records() {
+    use jetsam_chain::consensus::destination::l1_read::L1BridgeParams;
+    use jetsam_chain::consensus::destination::state::{BridgeRotation, DestinationRules};
+    let first = L1BridgeParams { address: [0x52; 20], code_hash: [1; 32], withdrawals_slot: 9, genesis_id_slot: 13, genesis_id: [2; 32] };
+    let second = L1BridgeParams { address: [0x2b; 20], ..first };
+    let mut d = DestinationRules::CONSENSUS;
+    d.base_return.activation_height = Some(8_982);
+    d.base_return.bridge = Some(first);
+    d.base_return.bridge_rotations = &[];
+    let table: &'static [BridgeRotation] = Box::leak(Box::new([BridgeRotation { height: 12_480, bridge: second, first_burn: 1_000_000 }]));
+    let paid = |n: u64, height: u64| FastPaid { n, owner: Address([0xa1; 32]), amount: 5_000_000, l2_block: B, height, contradicted: false };
+    let records = vec![paid(1, 9_043), paid(2, 9_060), paid(3, 9_155), paid(1_000_000, 12_500)];
+    // a run of the second bridge (this build's last: `effective_at(u64::MAX)`)
+    let run = DestinationRules { base_return: jetsam_chain::consensus::destination::state::BaseReturnRules { bridge_rotations: table, ..d.base_return }, ..d }
+        .effective_at(u64::MAX);
+    assert_eq!(run.bridge, Some(second));
+    assert_eq!(run.first_burn(), 1_000_000);
+    assert_eq!(records_of_this_bridge(records.clone(), &run), vec![paid(1_000_000, 12_500)]);
+    // a build without a second bridge keeps every record, as before
+    let before = d.effective_at(u64::MAX);
+    assert_eq!(before.bridge, Some(first));
+    assert_eq!(records_of_this_bridge(records.clone(), &before), records);
 }

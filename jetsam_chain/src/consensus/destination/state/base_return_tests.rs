@@ -58,6 +58,7 @@ pub(super) fn base_rules(anchor: &Committee) -> DestinationRules {
         fast: crate::consensus::destination::fast::FastLaneRules::CONSENSUS,
         anchor: None,
         bridge: None,
+        bridge_rotations: &[],
     };
     rules
 }
@@ -82,7 +83,18 @@ pub(super) struct BaseWorld {
 }
 
 pub(super) fn base_world(r: &VaultRelease, knobs: Knobs, times: (u64, u64, u64)) -> BaseWorld {
-    let bridge = prototype_bridge();
+    base_world_on(&prototype_bridge(), r, knobs, times)
+}
+
+/// [`base_world`] for the bridge `bridge` (BRIDGE2: the Base state root holds
+/// that bridge's account only).
+pub(super) fn base_world_on(
+    bridge: &L1BridgeParams,
+    r: &VaultRelease,
+    knobs: Knobs,
+    times: (u64, u64, u64),
+) -> BaseWorld {
+    let bridge = *bridge;
     let l2 = synthetic_bridge_with_genesis(
         &bridge,
         r.n,
@@ -1953,3 +1965,283 @@ fn a_snapshot_cannot_open_an_advance_marker_with_another_burn() {
         Err(SnapshotDestinationError::Mismatch { .. })
     ));
 }
+
+
+// ---------------------------------------------------------------------------
+// BRIDGE2 (D208): the test chain's second bridge, from its height on
+// ---------------------------------------------------------------------------
+
+/// The second bridge of these tests: another address, code and genesis than
+/// [`prototype_bridge`], the same layout.
+pub(super) fn second_bridge() -> L1BridgeParams {
+    L1BridgeParams {
+        address: [0x2b; 20],
+        code_hash: [0xc2; 32],
+        genesis_id: [0x2e; 32],
+        ..prototype_bridge()
+    }
+}
+
+/// Its first burn index in these tests.
+pub(super) const SECOND_FIRST_BURN: u64 = 1_000;
+
+/// `rules` with the second bridge from `h2` on.
+pub(super) fn switched(rules: DestinationRules, h2: u64) -> DestinationRules {
+    let table: &'static [BridgeRotation] = Box::leak(Box::new([BridgeRotation {
+        height: h2,
+        bridge: second_bridge(),
+        first_burn: SECOND_FIRST_BURN,
+    }]));
+    DestinationRules {
+        base_return: BaseReturnRules {
+            bridge_rotations: table,
+            ..rules.base_return
+        },
+        ..rules
+    }
+}
+
+/// `rules` without their bridge table (what a build of before applies).
+fn without_table(rules: DestinationRules) -> DestinationRules {
+    DestinationRules {
+        base_return: BaseReturnRules {
+            bridge_rotations: &[],
+            ..rules.base_return
+        },
+        ..rules
+    }
+}
+
+/// Below the second bridge's height the first one is read, from it on the
+/// second, for ever; the first burn index is the second bridge's from its
+/// height on only.
+#[test]
+fn bridge2_the_return_reads_its_first_bridge_below_the_height_and_the_second_from_it() {
+    let c0 = committee(1);
+    let h2 = HEIGHT + 100;
+    let rules = switched(base_rules(&c0), h2);
+    for h in [HB, HEIGHT, h2 - 1] {
+        assert_eq!(rules.effective_at(h).bridge, Some(prototype_bridge()), "at {h}");
+        assert_eq!(rules.effective_at(h).first_burn(), 0, "at {h}");
+        assert_eq!(rules.base_return.rotation_at(h), None, "at {h}");
+    }
+    for h in [h2, h2 + 1, u64::MAX] {
+        assert_eq!(rules.effective_at(h).bridge, Some(second_bridge()), "at {h}");
+        assert_eq!(rules.effective_at(h).first_burn(), SECOND_FIRST_BURN, "at {h}");
+        assert_eq!(rules.base_return.bridge_at(h), Some(second_bridge()), "at {h}");
+    }
+    // Everything else read at a height is the same on both sides of it.
+    let (below, above) = (rules.effective_at(h2 - 1), rules.effective_at(h2));
+    assert_eq!(
+        DestinationRules {
+            bridge: above.bridge,
+            ..below
+        },
+        above
+    );
+    // Below the return over Base, the table changes nothing either.
+    assert_eq!(rules.effective_at(HB - 1), rules);
+}
+
+/// The history replays: below the second bridge's height every rule a block
+/// is judged by is the one of a build without the table — on these test
+/// rules, and on this build's own rules at every height below its second
+/// bridge (all heights on a profile without one).
+#[test]
+fn bridge2_below_its_height_every_block_is_judged_by_the_rules_of_before() {
+    let c0 = committee(1);
+    let h2 = HEIGHT + 100;
+    let rules = switched(base_rules(&c0), h2);
+    for h in HB - 3..h2 {
+        assert_eq!(
+            without_table(rules.effective_at(h)),
+            without_table(rules).effective_at(h),
+            "at {h}"
+        );
+    }
+    let consensus = DestinationRules::CONSENSUS;
+    let end = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.unwrap_or(20_000);
+    for h in (0..end).chain([end.saturating_sub(1)]) {
+        assert_eq!(
+            without_table(consensus.effective_at(h)),
+            without_table(consensus).effective_at(h),
+            "at {h}"
+        );
+    }
+    if crate::consensus::params::V1_7_BRIDGE2_HEIGHT.is_none() {
+        assert!(consensus.base_return.bridge_rotations.is_empty());
+        assert_eq!(consensus.effective_at(u64::MAX), without_table(consensus).effective_at(u64::MAX));
+    }
+}
+
+/// From the second bridge's height on a release is read under the second
+/// bridge only (the first's account proves nothing then), below it under the
+/// first only.
+#[test]
+fn bridge2_a_release_is_read_under_the_bridge_of_its_blocks_height() {
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(SECOND_FIRST_BURN, ALICE, 5 * JTM);
+    let on_first = base_world(&r, VALID, TIMES);
+    let on_second = base_world_on(&second_bridge(), &r, VALID, TIMES);
+    let first_block = base_release_block(HEIGHT, &r, ALICE, &c0, &on_first);
+    let second_block = base_release_block(HEIGHT, &r, ALICE, &c0, &on_second);
+    // The block at HEIGHT is the second bridge's first.
+    let from = switched(base_rules(&c0), HEIGHT);
+    assert!(matches!(
+        validate_block_destination(&first_block, &parent, &from, &keys),
+        Err(DestinationBlockError::BridgeAccount(_))
+    ));
+    let effect = validate_block_destination(&second_block, &parent, &from, &keys)
+        .expect("under the second bridge");
+    assert_eq!(effect.vault.releases, vec![(SECOND_FIRST_BURN, ALICE, r.amount)]);
+    // The block at HEIGHT is the first bridge's last.
+    let below = switched(base_rules(&c0), HEIGHT + 1);
+    assert!(validate_block_destination(&first_block, &parent, &below, &keys).is_ok());
+    assert!(matches!(
+        validate_block_destination(&second_block, &parent, &below, &keys),
+        Err(DestinationBlockError::BridgeAccount(_))
+    ));
+}
+
+/// Under the second bridge no `n` below its first burn index is paid, even
+/// where its word shows one (an index the first bridge gave: never another
+/// burn's); its first index is.
+#[test]
+fn bridge2_no_index_below_the_second_bridges_first_burn_is_paid_under_it() {
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let from = switched(base_rules(&c0), HEIGHT);
+    for n in [1, 3, SECOND_FIRST_BURN - 1] {
+        let r = release(n, ALICE, 5 * JTM);
+        let world = base_world_on(&second_bridge(), &r, VALID, TIMES);
+        let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+        assert_eq!(
+            validate_block_destination(&b, &parent, &from, &keys).map(|_| ()),
+            Err(DestinationBlockError::BelowTheBridgesFirstBurn { n }),
+            "n = {n}"
+        );
+    }
+    for n in [SECOND_FIRST_BURN, SECOND_FIRST_BURN + 1] {
+        let r = release(n, ALICE, 5 * JTM);
+        let world = base_world_on(&second_bridge(), &r, VALID, TIMES);
+        let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+        assert!(validate_block_destination(&b, &parent, &from, &keys).is_ok(), "n = {n}");
+    }
+    // Under the first bridge, no bound (the blocks of before).
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+    let below = switched(base_rules(&c0), HEIGHT + 1);
+    assert!(validate_block_destination(&b, &parent, &below, &keys).is_ok());
+}
+
+/// The table's own rule: empty with a dormant height; else starting at it,
+/// above the return, each bridge its own address, first burn ≥ 1.
+#[test]
+fn bridge2_the_bridge_table_sits_only_beside_its_height() {
+    let first = Some(prototype_bridge());
+    let rotation = |height, bridge, first_burn| BridgeRotation {
+        height,
+        bridge,
+        first_burn,
+    };
+    let ok = [rotation(900, second_bridge(), 1_000_000)];
+    assert!(bridge_rotations_are_valid(&[], first, Some(800), None));
+    assert!(bridge_rotations_are_valid(&ok, first, Some(800), Some(900)));
+    assert!(!bridge_rotations_are_valid(&ok, first, Some(800), None));
+    assert!(!bridge_rotations_are_valid(&[], first, Some(800), Some(900)));
+    assert!(!bridge_rotations_are_valid(&ok, first, Some(800), Some(901)));
+    assert!(!bridge_rotations_are_valid(&ok, first, Some(900), Some(900)));
+    assert!(!bridge_rotations_are_valid(&ok, first, None, Some(900)));
+    assert!(!bridge_rotations_are_valid(
+        &[rotation(900, prototype_bridge(), 1_000_000)],
+        first,
+        Some(800),
+        Some(900)
+    ));
+    assert!(!bridge_rotations_are_valid(
+        &[rotation(900, second_bridge(), 0)],
+        first,
+        Some(800),
+        Some(900)
+    ));
+    let third = L1BridgeParams {
+        address: [0x3c; 20],
+        ..second_bridge()
+    };
+    let two = [
+        rotation(900, second_bridge(), 1_000_000),
+        rotation(950, third, 2_000_000),
+    ];
+    assert!(bridge_rotations_are_valid(&two, first, Some(800), Some(900)));
+    let back = [
+        rotation(900, second_bridge(), 1_000_000),
+        rotation(900, third, 2_000_000),
+    ];
+    assert!(!bridge_rotations_are_valid(&back, first, Some(800), Some(900)));
+    let same = [
+        rotation(900, second_bridge(), 1_000_000),
+        rotation(950, second_bridge(), 2_000_000),
+    ];
+    assert!(!bridge_rotations_are_valid(&same, first, Some(800), Some(900)));
+}
+
+/// Each profile's table: the test chain's second bridge from its height on
+/// (its pins written at the switch: a deliberate edit of the constant and of
+/// this test), none on the public network and the private rehearsal.
+#[test]
+fn bridge2_the_profiles_bridge_table() {
+    let consensus = DestinationRules::CONSENSUS;
+    assert_eq!(consensus.base_return.bridge_rotations, BASE_RETURN_BRIDGE_ROTATIONS);
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed");
+        assert_eq!(h2, 12_480);
+        assert_eq!(BASE_RETURN_BRIDGE_ROTATIONS.len(), 1);
+        let second = BASE_RETURN_BRIDGE_ROTATIONS[0];
+        assert_eq!((second.height, second.first_burn), (h2, 1_000_000));
+        assert_eq!(second.bridge, BASE_RETURN_BRIDGE2);
+        assert_eq!(
+            BASE_RETURN_BRIDGE2.address.to_vec(),
+            hex(BRIDGE2_ADDRESS_HEX)
+        );
+        assert_eq!(
+            BASE_RETURN_BRIDGE2.code_hash.to_vec(),
+            hex(BRIDGE2_CODE_HASH_HEX)
+        );
+        assert_eq!(
+            BASE_RETURN_BRIDGE2.genesis_id.to_vec(),
+            hex(BRIDGE2_GENESIS_ID_HEX)
+        );
+        assert_eq!((BASE_RETURN_BRIDGE2.withdrawals_slot, BASE_RETURN_BRIDGE2.genesis_id_slot), (9, 13));
+        assert_eq!(consensus.effective_at(h2 - 1).bridge, BASE_RETURN_BRIDGE);
+        assert_eq!(consensus.effective_at(h2).bridge, Some(BASE_RETURN_BRIDGE2));
+        assert_eq!(consensus.effective_at(h2).first_burn(), 1_000_000);
+        // Above the switch decided on 14/11 (tip 10 869) by three days at least.
+        assert!(h2 >= 10_869 + 3 * 480);
+        // The test chain's first bridge gave n = 1, 2, 3 (nextBurnIndex 4).
+        assert!(second.first_burn > 3);
+    }
+    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    {
+        assert!(BASE_RETURN_BRIDGE_ROTATIONS.is_empty());
+        assert_eq!(crate::consensus::params::V1_7_BRIDGE2_HEIGHT, None);
+    }
+}
+
+/// The pins of the test chain's second bridge, as the switch reads them.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE2_ADDRESS_HEX: &str = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b";
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE2_CODE_HASH_HEX: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE2_GENESIS_ID_HEX: &str = "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e";

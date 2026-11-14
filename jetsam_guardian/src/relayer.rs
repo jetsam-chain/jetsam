@@ -242,8 +242,44 @@ pub fn mn_values(chain: &Chain, base: u64, t: u64) -> Option<Mn> {
     })
 }
 
-/// MN-5 at L1 time `at`: `segmentWork × 180 × 10 ≥ 4 × forkBaseWork × elapsed` once `elapsed ≥ 1 800`.
-pub fn mn5_ok(mn: &Mn, at: u64) -> bool {
+/// MN5CT (contract `v3-mn5`, audit n°2 M5-1): the cap on the time MN-5 measures, `MN5_MAX_ELAPSED()` of the bridge.
+pub const MN5_MAX_ELAPSED: u64 = 21_600;
+
+/// BRIDGE2 (MN5CT §9 S1): the rule MN-5 of the bridge this relayer submits to, read from the bridge at start
+/// ([`mn5_rule_of`]): one function judges a point under it ([`mn5_ok`]), the contract's exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mn5Rule {
+    /// TN1's bridge (`v3-tn1`, no `MN5_MAX_ELAPSED()`): `segmentWork × 1 800 ≥ 4 × forkBaseWork × elapsed`, no cap.
+    V3Tn1,
+    /// `v3-mn5`: the elapsed time capped at 6 h; 1/4 of the base's rate for a branch that keeps the tip's locked
+    /// block (`lockedOnBranch`), 4/10 for a real switch.
+    V3Mn5,
+}
+
+impl Mn5Rule {
+    /// The start line of the relayer.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Mn5Rule::V3Tn1 => "MN5 rule v3-tn1 (no cap, 4/10)",
+            Mn5Rule::V3Mn5 => "MN5 rule v3-mn5 (cap 21600 s, 1/4 keep-L, 4/10 switch)",
+        }
+    }
+}
+
+/// BRIDGE2 (MN5CT §9 S1): the rule of the bridge from its answer to `eth_call MN5_MAX_ELAPSED()` (its 32-byte word,
+/// or the error the endpoint answered, as text): a revert (no such getter: the bridge of before) is `V3Tn1`; 21 600
+/// is `V3Mn5`; any other value, an empty answer (no code there), or an error that is no revert (the endpoint not
+/// read) is no rule — the relayer does not start.
+pub fn mn5_rule_of(answer: &Result<Vec<u8>, String>) -> Result<Mn5Rule, String> {
+    let _ = answer;
+    Ok(Mn5Rule::V3Tn1)
+}
+
+/// MN-5 at L1 time `at` under `rule`: nothing is asked before `elapsed` = 1 800 s; then `V3Tn1`:
+/// `segmentWork × 180 × 10 ≥ 4 × forkBaseWork × elapsed`; `V3Mn5`: with `elapsed` capped at 6 h,
+/// `segmentWork × 180 × 4 ≥ forkBaseWork × elapsed` for a branch that keeps the tip's locked block, else the 4/10.
+pub fn mn5_ok(rule: Mn5Rule, mn: &Mn, at: u64) -> bool {
+    let _ = rule;
     if at < mn.fork_base_timestamp + MN5_MIN_ELAPSED {
         return true;
     }
@@ -261,12 +297,19 @@ pub fn mn5_planned_at(l1_now: u64, timeout_secs: u64, measured_proof_secs: Optio
     l1_now + measured_proof_secs.map_or(timeout_secs, |m| m.min(timeout_secs)) + INCLUSION_SECS
 }
 
-/// M5-2: the last L1 time at which the contract still takes a point of MN values `mn`:
-/// `forkBaseTimestamp + segmentWork × 1 800 / (4 × forkBaseWork)` (rounded down), never before the 1 800 s MN-5
-/// waits (`mn5_ok(mn, t)` exactly for `t` ≤ it).
-pub fn mn5_deadline(mn: &Mn) -> u64 {
+/// M5-2, BRIDGE2 (MN5CT §9 S3): the last L1 time at which the contract still takes a point of MN values `mn` under
+/// `rule` (`mn5_ok(rule, mn, t)` exactly for `t` ≤ it), never before the 1 800 s MN-5 waits; `None` when there is
+/// none (`V3Mn5`: the requirement, capped at 6 h, is met there, and it never grows again). `V3Tn1`:
+/// `forkBaseTimestamp + segmentWork × 1 800 / (4 × forkBaseWork)` (rounded down).
+pub fn mn5_deadline(rule: Mn5Rule, mn: &Mn) -> Option<u64> {
+    let _ = rule;
+    Some(mn5_deadline_v3_tn1(mn))
+}
+
+/// [`mn5_deadline`] under `V3Tn1` (M5-2, unchanged).
+fn mn5_deadline_v3_tn1(mn: &Mn) -> u64 {
     let grace_end = mn.fork_base_timestamp.saturating_add(MN5_MIN_ELAPSED - 1);
-    if !mn5_ok(mn, grace_end + 1) {
+    if !mn5_ok(Mn5Rule::V3Tn1, mn, grace_end + 1) {
         return grace_end;
     }
     // the largest elapsed `e` with `segmentWork × 1 800 ≥ 4 × forkBaseWork × e` (monotone in `e`), searched up to 2^60
@@ -287,9 +330,12 @@ pub fn mn5_deadline(mn: &Mn) -> u64 {
     mn.fork_base_timestamp.saturating_add(ok)
 }
 
-/// M5-2: MN-5's margin at L1 time `at` is below 1.5 (`segmentWork × 1 800 < 1.5 × 4 × forkBaseWork × elapsed`):
-/// alerted when a point is planned, long before a refusal.
-pub fn mn5_margin_low(mn: &Mn, at: u64) -> bool {
+/// M5-2, BRIDGE2 (MN5CT §9 S4): MN-5's margin at L1 time `at` under `rule` is below 1.5 — `V3Tn1`:
+/// `segmentWork × 1 800 < 1.5 × 4 × forkBaseWork × elapsed`; `V3Mn5`: `segmentWork × 180 × den < 1.5 × num ×
+/// forkBaseWork × max(min(elapsed, 6 h), 1 800)` with its β = num/den: alerted when a point is planned, long before a
+/// refusal.
+pub fn mn5_margin_low(rule: Mn5Rule, mn: &Mn, at: u64) -> bool {
+    let _ = rule;
     let elapsed = at.saturating_sub(mn.fork_base_timestamp).max(1);
     let seg = u256::from_be(&mn.segment_work);
     let base = u256::from_be(&mn.fork_base_work);
@@ -373,6 +419,7 @@ pub fn on_new_branch(chain: &Chain, parent: &Checkpoint, fork_depth: u8, t: u64,
 /// contract's `tipBlockId` and `tipLockedBlockId` (the block and the locked block of `tip`).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_submission(
+    rule: Mn5Rule,
     chain: &Chain,
     known: &HashMap<[u8; 32], Known>,
     tip: &[u8; 32],
@@ -467,17 +514,17 @@ pub fn plan_submission(
     if mn.max_timestamp > l1_at + MAX_TS_DRIFT {
         return Err(NoSubmission::TimestampAhead);
     }
-    if !mn5_ok(&mn, l1_at) {
+    if !mn5_ok(rule, &mn, l1_at) {
         // T7.7 (A4): an unread body is why when the highest tip the bound alone allows (it locks that body) would pass
         // MN-5 — the operator's to settle, never a misleading WorkRateTooLow
         if let Some(m) = first_missing {
             let free = (t + 1..=chain.tip_height()).rev().find(|u| chain.locked_height(*u).is_some_and(|x| first_over.is_none_or(|o| x < o)));
-            if free.and_then(|u| mn_values(chain, base, u)).is_some_and(|v| mn5_ok(&v, l1_at)) {
+            if free.and_then(|u| mn_values(chain, base, u)).is_some_and(|v| mn5_ok(rule, &v, l1_at)) {
                 return Err(NoSubmission::MissingBody(m));
             }
         }
         // R3-5: the bound is why when the tip the unread bodies alone allow would pass MN-5
-        let bound_is_why = unbounded_t.and_then(|u| mn_values(chain, base, u)).is_some_and(|m| mn5_ok(&m, l1_at));
+        let bound_is_why = unbounded_t.and_then(|u| mn_values(chain, base, u)).is_some_and(|m| mn5_ok(rule, &m, l1_at));
         return Err(if bound_is_why { NoSubmission::TooManyDepositBlocks(max_deposit_blocks) } else { NoSubmission::WorkRateTooLow });
     }
     Ok(Submission {

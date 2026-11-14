@@ -242,6 +242,7 @@ impl SyntheticBase {
             fast: jetsam_chain::consensus::destination::fast::FastLaneRules::CONSENSUS,
             anchor: None,
             bridge: None,
+            bridge_rotations: &[],
         };
         rules
     }

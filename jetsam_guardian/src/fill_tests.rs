@@ -2177,3 +2177,50 @@ fn e9_a_refusal_of_the_gas_budget_is_recognized() {
     assert!(gas_budget_refusal(&format!("{} advanceBatch: not sent", crate::l1tx::GAS_BUDGET_ALERT)));
     assert!(!gas_budget_refusal("reverts: execution reverted"));
 }
+
+/// A source that serves `bytes` (none: not served).
+fn serving(name: &str, bytes: Option<Vec<u8>>) -> crate::relayer::BodySource<'static> {
+    (name.to_string(), Box::new(move || Ok(bytes.clone())) as Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>>>)
+}
+
+/// FIX2GU §2.2 (the defect D171 of jg-relay, in jg-fill): a block whose bytes a node served and an older build could
+/// not read is kept; once the nodes prune it, the scan still reads it from the copy kept — never recorded "no deposit"
+/// — and the build that knows the rule reads its deposit (then the copy is forgotten). Bytes that carry another
+/// block's header are never kept.
+#[test]
+fn relfix2_jg_fill_keeps_the_bytes_of_a_block_it_cannot_read_and_reads_them_again_once_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = KeptBodies::open(dir.path()).unwrap();
+    let b = block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM)]);
+    let (raw, id) = raw_and_id(&b);
+    let other = block_of(F + 1, vec![deposit_tx(101, rcpt(0xb2), 2 * JTM)]);
+    let (other_raw, _) = raw_and_id(&other);
+    let old = VaultRules { max_deposit: 5 * JTM, ..rules() };
+    // 1. served, unreadable by the old build (its rule refuses a 7 JTM deposit): kept, and another block's bytes not
+    let first = read_body_kept(&kept, F + 1, &id, vec![serving("n0 getBlock", Some(raw.clone())), serving("n1 getBlock", Some(other_raw.clone()))], &old);
+    assert!(matches!(first, BodyRead::Failed(_)), "{first:?}");
+    let copies = kept.copies(F + 1, &id);
+    assert_eq!(copies.len(), 1, "the bytes of this block, once");
+    assert_eq!(copies[0].1, raw);
+    // 2. the nodes pruned it: the old build still cannot read it, and it is never "not served"
+    let pruned = read_body_kept(&kept, F + 1, &id, vec![serving("n0 getBlock", None)], &old);
+    assert!(matches!(pruned, BodyRead::Failed(_)), "the bytes once served are kept: {pruned:?}");
+    // (the scan's chain ends at F + 1; its read asks this block's id)
+    let chain = testkit::chain(F + 1, 1);
+    let (mut scanned, mut failed) = (BTreeMap::new(), BTreeSet::new());
+    scan_step(&mut scanned, &mut failed, &chain, F + 1, &mut |h, _| {
+        read_body_kept(&kept, h, &id, vec![serving("n0 getBlock", None)], &old)
+    }, &mut |_| {});
+    assert!(!scanned.contains_key(&(F + 1)) && failed.contains(&(F + 1)), "never recorded with no deposit");
+    // 3. the upgraded build reads its deposit from the copy kept, then forgets it
+    scan_step(&mut scanned, &mut failed, &chain, F + 1, &mut |h, _| {
+        read_body_kept(&kept, h, &id, vec![serving("n0 getBlock", None)], &rules())
+    }, &mut |_| {});
+    assert_eq!(scanned[&(F + 1)].1.len(), 1, "its deposit, read from the copy kept");
+    assert_eq!(scanned[&(F + 1)].1[0].amount, 7 * JTM);
+    assert!(kept.copies(F + 1, &id).is_empty(), "forgotten once read");
+    // a kept copy survives the robot's restart (the directory is the state's)
+    let again = KeptBodies::open(dir.path()).unwrap();
+    assert!(again.keep(F + 1, &id, &[("n0 getBlock".into(), raw.clone())]).unwrap() == 1);
+    assert_eq!(KeptBodies::open(dir.path()).unwrap().copies(F + 1, &id).len(), 1);
+}

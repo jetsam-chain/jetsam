@@ -165,6 +165,8 @@ struct Relay {
     standby_takeover: Option<[u8; 32]>,
     /// GU-3: each node's steps in a row off the relayer's chain.
     node_off: Vec<u32>,
+    /// BRIDGE2 (MN5CT §9 S1): the bridge's MN-5 rule, read from it at start (`MN5_MAX_ELAPSED()`).
+    mn5_rule: relayer::Mn5Rule,
 }
 
 /// E-1: the points the contract names (its tip, its final point) and this relayer does not know are read again by
@@ -832,7 +834,7 @@ impl Relay {
         let at = relayer::mn5_planned_at(l1_now, self.cfg.prover.timeout_secs, self.state.proof_secs);
         // R3-5: no more deposit blocks a point than the signer's max_gas lets its submitCheckpoint carry
         let bound = self.cfg.deposit_blocks_bound();
-        let s = match relayer::plan_submission(&self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at, bound) {
+        let s = match relayer::plan_submission(self.mn5_rule, &self.chain, &known, &tip_id, &tip_cum_work, &tip_block, &tip_locked, gl, &found, &missing, at, bound) {
             Ok(s) => s,
             Err(why) => {
                 // WorkRateTooLow: MN-5 since the fork base; the fast cadence takes over (A5-5)
@@ -868,16 +870,20 @@ impl Relay {
             }
         };
         let planned = std::time::Instant::now();
-        // M5-2: the last L1 second the contract takes this point, and MN-5's margin when it lands (alerted below 1.5)
-        let deadline = relayer::mn5_deadline(&s.mn);
-        if relayer::mn5_margin_low(&s.mn, at) {
+        // M5-2: the last L1 second the contract takes this point (BRIDGE2: none under v3-mn5 when its capped
+        // requirement is met), and MN-5's margin when it lands (alerted below 1.5)
+        let deadline = relayer::mn5_deadline(self.mn5_rule, &s.mn);
+        if relayer::mn5_margin_low(self.mn5_rule, &s.mn, at) {
+            let when = match deadline {
+                Some(d) => format!("its deadline {d}, {} s after it lands", d.saturating_sub(at)),
+                None => "no deadline: the requirement capped at 6 h is met".to_string(),
+            };
             log(&format!(
-                "ALERT MN5_MARGIN: the point T={} over the fork base {} lands with an MN-5 margin below 1.5 (its deadline {deadline}, {} s after it lands): the chain's work rate is falling",
+                "ALERT MN5_MARGIN: the point T={} over the fork base {} lands with an MN-5 margin below 1.5 ({when}): the chain's work rate is falling",
                 s.next.height,
                 s.base,
-                deadline.saturating_sub(at)
             ));
-            self.event(json!({"event": "mn5_margin_low", "height": s.next.height, "base": s.base, "deadline": deadline, "at": at}));
+            self.event(json!({"event": "mn5_margin_low", "height": s.next.height, "base": s.base, "deadline": deadline, "at": at, "rule": self.mn5_rule.describe()}));
         }
         if !self.witnessed(&[(s.next.height, s.next.tip_block_id), (s.next.locked_height, s.next.locked_block_id)]) {
             log(&format!("T={} L={}: fewer than {} nodes have them, no submission", s.next.height, s.next.locked_height, self.cfg.min_nodes));
@@ -905,7 +911,7 @@ impl Relay {
         }
         // M5-2: sent while its deadline is not passed (a later one would revert WorkRateTooLow)
         let now = self.l1.next_time()?;
-        if now > deadline {
+        if let Some(deadline) = deadline.filter(|d| now > *d) {
             log(&format!("ALERT MN5_DEADLINE_PASSED: the proof of T={} came at {now}, after its MN-5 deadline {deadline} ({proving} s of proof): not sent", s.next.height));
             self.event(json!({"event": "mn5_deadline_passed", "height": s.next.height, "deadline": deadline, "now": now, "proof_secs": proving}));
             self.state.work_rate_refused = true;
@@ -1234,6 +1240,12 @@ fn run() -> anyhow::Result<()> {
             encode: relayer::program_input,
         }),
     };
+    // BRIDGE2 (MN5CT §9 S1): MN-5 is judged by the bridge's own rule, read from it (a bridge without the getter: the
+    // rule of before; an unknown answer: no start)
+    let bridge_hex = hex0x(&jetsam_guardian::fill::parse20(&cfg.l1_bridge)?);
+    let mn5_answer = l1.call(&bridge_hex, &l1::selector("MN5_MAX_ELAPSED()")).map_err(|e| format!("{e:#}"));
+    let mn5_rule = relayer::mn5_rule_of(&mn5_answer).map_err(|e| anyhow::anyhow!("the bridge {bridge_hex}: {e}: jg-relay does not start"))?;
+    log(mn5_rule.describe());
     let archive = Archive::open(&cfg.state_dir.join("archive"))?;
     log(&format!(
         "signer 0x{} ({}), {} checkpoints known, {} bodies archived, {} missing ({} of them unreadable by this build, their bytes kept)",
@@ -1261,6 +1273,7 @@ fn run() -> anyhow::Result<()> {
         reread_at: None,
         standby_takeover: None,
         node_off: Vec::new(),
+        mn5_rule,
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));

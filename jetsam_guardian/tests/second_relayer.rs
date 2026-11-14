@@ -285,6 +285,7 @@ fn l1_port(bridge: Arc<Mutex<Bridge>>) -> u16 {
     let (genesis_id, anchor_base, tip, tip_block, tip_locked, final_id, node_of) =
         (hexsel("genesisId()"), hexsel("anchorBase()"), hexsel("tip()"), hexsel("tipBlockId()"), hexsel("tipLockedBlockId()"), hexsel("finalId()"), hexsel("nodeOf(bytes32)"));
     let paused_until = hexsel("pausedUntil()");
+    let mn5_max_elapsed = hexsel("MN5_MAX_ELAPSED()");
     serve(Arc::new(move |method, params| {
         let mut b = bridge.lock().unwrap();
         let block_json = |b: &Bridge, n: u64| json!({"number": format!("0x{n:x}"), "timestamp": format!("0x{:x}", b.blocks[n as usize]), "baseFeePerGas": "0x1"});
@@ -322,6 +323,10 @@ fn l1_port(bridge: Arc<Mutex<Bridge>>) -> u16 {
             }
             "eth_call" => {
                 let data = params[0]["data"].as_str().unwrap_or_default().to_lowercase();
+                // BRIDGE2: a bridge of before (no `MN5_MAX_ELAPSED()`): MN-5 by the rule of before
+                if data.starts_with(&mn5_max_elapsed) {
+                    return json!({"error": {"code": 3, "message": "execution reverted"}});
+                }
                 if params[1] == json!("pending") {
                     return if data.starts_with(&submit) { json!({"result": "0x"}) } else { json!({"error": {"code": 3, "message": "execution reverted: not in this fake"}}) };
                 }

@@ -179,6 +179,7 @@ fn l1(world: Arc<Mutex<L1World>>) -> u16 {
     let sel = |s: &str| format!("0x{}", hex::encode(selector(s)));
     let (genesis_id, anchor_base, tip, tip_block, tip_locked, final_id, node_of) =
         (sel("genesisId()"), sel("anchorBase()"), sel("tip()"), sel("tipBlockId()"), sel("tipLockedBlockId()"), sel("finalId()"), sel("nodeOf(bytes32)"));
+    let mn5_max_elapsed = sel("MN5_MAX_ELAPSED()");
     let cp = point();
     serve(Arc::new(move |method, params| {
         let mut w = world.lock().unwrap();
@@ -230,6 +231,10 @@ fn l1(world: Arc<Mutex<L1World>>) -> u16 {
                     return json!({"error": {"code": 3, "message": "execution reverted: nothing is sent in this fake"}});
                 }
                 let data = params[0]["data"].as_str().unwrap_or_default().to_string();
+                // BRIDGE2: a bridge of before (no `MN5_MAX_ELAPSED()`): the relayer judges MN-5 by the rule of before
+                if data.starts_with(&mn5_max_elapsed) {
+                    return json!({"error": {"code": 3, "message": "execution reverted"}});
+                }
                 let known_tip = w.tip == cp.id();
                 let out = if data.starts_with(&genesis_id) {
                     word_hex(&[[9; 32]])

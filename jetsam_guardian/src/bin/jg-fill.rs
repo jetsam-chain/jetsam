@@ -170,6 +170,9 @@ struct Robot {
     stock_alerted: bool,
     /// E-12: the blocks above F no source served readable (read again, 8 a step).
     scan_failed: BTreeSet<u64>,
+    /// FIX2GU §2.2 (RELFIX2 for jg-fill): the bytes of the blocks served that this build cannot read, kept and read
+    /// first again at every later read (never "no deposit" once the nodes prune them).
+    kept: fill::KeptBodies,
 }
 
 impl Robot {
@@ -247,7 +250,7 @@ impl Robot {
     /// `getDepositBlock`; a block none serves readable is read again later, never the end of the scan.
     fn scan(&mut self) {
         let chain = self.observers[0].chain().clone();
-        let (clients, nodes, rules) = (&self.clients, &self.cfg.nodes, &self.rules);
+        let (clients, nodes, rules, kept) = (&self.clients, &self.cfg.nodes, &self.rules, &self.kept);
         let mut read = |h: u64, id: &[u8; 32]| {
             let mut sources: Vec<jetsam_guardian::relayer::BodySource> = Vec::new();
             for (c, n) in clients.iter().zip(nodes) {
@@ -256,7 +259,7 @@ impl Robot {
             for (c, n) in clients.iter().zip(nodes) {
                 sources.push((format!("{} getDepositBlock", n.name), Box::new(move || c.raw_deposit_block(h))));
             }
-            fill::read_body(sources, id, rules)
+            fill::read_body_kept(kept, h, id, sources, rules)
         };
         fill::scan_step(&mut self.state.scanned, &mut self.scan_failed, &chain, self.cfg.deposits_from_height + 1, &mut read, &mut |m| log(&m));
     }
@@ -845,7 +848,7 @@ fn run() -> anyhow::Result<()> {
     ));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), targets_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), cfg };
+    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), targets_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), kept: fill::KeptBodies::open(&cfg.state_dir)?, cfg };
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }
