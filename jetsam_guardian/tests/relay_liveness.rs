@@ -535,6 +535,58 @@ fn one_node_alone_never_makes_jg_relay_drop_a_known_points_locked_block() {
     assert!(alerted && log.contains("locked floor 25"), "log:\n{log}");
 }
 
+// ---------------------------------------------------------------- GU-3 (audit n°2)
+
+/// GU-3 (audit n°2): the relayer took its chain from node 0 alone whenever node 0 answered. Node 0 stuck behind (on
+/// the relayer's chain) held it there: nothing was read from the other nodes. Node 0 on a lower branch (forked six blocks
+/// below the relayer's tip, less work) made it back off onto that branch on its word, then held it there. Now every node
+/// is read at every step: the relayer follows node 1 up its chain, never takes node 0's lower branch, and says node 0
+/// once it has been off its chain for `NODE_OFF_CHAIN_ALERT_STEPS` steps.
+#[test]
+fn gu3_node_zero_stuck_behind_or_on_a_lower_branch_never_holds_jg_relay_back() {
+    if no_v1_7_clock() {
+        return;
+    }
+    use jetsam_guardian::chain::Chain;
+    let a = testkit::chain(30, 1);
+    let mut a40 = a.clone();
+    testkit::extend(&mut a40, 10, 1, 20);
+    let mut a45 = a40.clone();
+    testkit::extend(&mut a45, 5, 1, 20);
+    let mut behind = a.clone();
+    behind.truncate_above(20);
+    let mut lower = a40.clone();
+    lower.truncate_above(34);
+    testkit::extend(&mut lower, 3, 5, 20);
+    let (c0, c1): (Arc<Mutex<Chain>>, Arc<Mutex<Chain>>) = (Arc::new(Mutex::new(a.clone())), Arc::new(Mutex::new(a.clone())));
+    let (p0, served0) = watched_node(c0.clone());
+    let (p1, served1) = watched_node(c1.clone());
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    let (_root, dir) = relay_dir(l1(world), &[p0, p1], 2, "");
+    let log = || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    let relay = spawn(&dir, &[]);
+    let synced = wait_for(30, || served0.load(Ordering::SeqCst).max(served1.load(Ordering::SeqCst)) >= 30);
+    // node 0 stuck behind, node 1 goes on: the relayer goes on with node 1
+    *c0.lock().unwrap() = behind;
+    *c1.lock().unwrap() = a40.clone();
+    let past_stuck = wait_for(60, || served1.load(Ordering::SeqCst) >= 40);
+    // node 0 on a lower branch forked at 34 (tip 37, the relayer at 40), node 1 goes on: never taken, node 1 followed
+    *c0.lock().unwrap() = lower;
+    let refused = wait_for(60, || log().contains("node n0: its branch from 34"));
+    *c1.lock().unwrap() = a45;
+    let past_lower = wait_for(60, || served1.load(Ordering::SeqCst) >= 45);
+    let said = wait_for(90, || log().contains("ALERT NODE_OFF_OUR_CHAIN node n0"));
+    stop(relay);
+    let text = log();
+    assert!(synced, "log:\n{text}");
+    assert!(past_stuck, "node 0 stuck at 20 held the relayer at 30 (node 1 at 40 never read); log:\n{text}");
+    assert!(refused, "log:\n{text}");
+    assert!(past_lower, "log:\n{text}");
+    assert_eq!(reorgs(&dir), Vec::<(u64, u64)>::new(), "node 0 alone moved the relayer onto a lower branch; log:\n{text}");
+    assert!(said, "node 0 off the relayer's chain is never said; log:\n{text}");
+    assert!(!text.contains("NODE_OFF_OUR_CHAIN node n1"), "node 1 is on the chain: {text}");
+}
+
 // ---------------------------------------------------------------- E-2
 
 /// `bin --config <dir>/relay.toml` (with `args` before `--config`) under a bounded `RLIMIT_MEMLOCK` and without

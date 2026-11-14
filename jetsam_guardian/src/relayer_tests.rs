@@ -1631,3 +1631,49 @@ fn a_mn5_margin_under_one_and_a_half_is_alerted() {
     assert!(mn5_margin_low(&with(k - 1), at));
     assert!(!mn5_margin_low(&with(4 * k), at));
 }
+
+// ---------------------------------------------------------------- GU-3 (audit n°2)
+
+/// GU-3: one node alone moves the relayer only onto a branch with MORE work than its chain, and only a shallow one (E-5):
+/// a node stuck behind on another branch (less work) or level with the relayer's tip (the same work) never does; deep,
+/// or below a known lock, never on one node's word whatever its work. The work is compared as a 256-bit integer.
+#[test]
+fn gu3_one_node_alone_moves_the_relayer_only_onto_a_branch_with_more_work() {
+    let w = u256::from_u64;
+    assert!(!reorg_on_one_nodes_word(30, 24, 0, &w(30), &w(27)), "a lower branch");
+    assert!(!reorg_on_one_nodes_word(30, 29, 0, &w(30), &w(30)), "a branch level with ours");
+    assert!(reorg_on_one_nodes_word(30, 28, 0, &w(30), &w(31)), "two blocks onto more work");
+    assert!(reorg_on_one_nodes_word(30, 22, 0, &w(30), &w(31)), "eight blocks onto more work");
+    assert!(!reorg_on_one_nodes_word(30, 21, 0, &w(30), &w(99)), "nine blocks");
+    assert!(!reorg_on_one_nodes_word(30, 24, 25, &w(30), &w(99)), "below a known lock");
+    let mut high = [0u8; 32];
+    high[31] = 1;
+    let mut low = [0xffu8; 32];
+    low[31] = 0;
+    assert!(reorg_on_one_nodes_word(30, 29, 0, &low, &high));
+    assert!(!reorg_on_one_nodes_word(30, 29, 0, &high, &low));
+}
+
+/// GU-3: a node off the relayer's chain (behind, on a branch it does not follow, silent) is said once, at its
+/// [`NODE_OFF_CHAIN_ALERT_STEPS`]-th step in a row; back on the chain, its count starts again.
+#[test]
+fn gu3_a_node_off_the_relayers_chain_is_said_once_after_its_steps() {
+    let mut count = 0;
+    let mut said = Vec::new();
+    for step in 1..=3 * NODE_OFF_CHAIN_ALERT_STEPS {
+        let (n, say) = node_off_chain_step(count, false);
+        count = n;
+        if say {
+            said.push(step);
+        }
+    }
+    assert_eq!(said, vec![NODE_OFF_CHAIN_ALERT_STEPS], "once");
+    assert_eq!(node_off_chain_step(count, true), (0, false));
+    let (mut count, mut said) = (0, 0);
+    for _ in 0..NODE_OFF_CHAIN_ALERT_STEPS {
+        let (n, say) = node_off_chain_step(count, false);
+        count = n;
+        said += u32::from(say);
+    }
+    assert_eq!((count, said), (NODE_OFF_CHAIN_ALERT_STEPS, 1), "said again after a return to the chain");
+}

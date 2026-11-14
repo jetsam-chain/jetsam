@@ -321,6 +321,41 @@ pub fn checked_egress<'a>(
     Ok(egress)
 }
 
+/// AN-1 (audit n°2): the domain the return-over-Base robots (`fast-run`, `fast-release`, `fast-revoke`, `light-feed`)
+/// work for, from this build: its network, the L1 of its fast lane, its bridge on Base (none: zero). Its profile decides
+/// whether `--egress clearnet` is allowed (the private rehearsal only), as a guardian's `[egress]`.
+pub fn robot_domain() -> crate::Domain {
+    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    crate::Domain {
+        network: jetsam_chain::consensus::guardian::network_id(),
+        l1_chain_id: rules.base_return.fast.l1_chain_id,
+        l1_bridge: rules.bridge.map_or([0u8; 20], |b| b.address),
+    }
+}
+
+/// AN-1 (audit n°2): the egress of a return-over-Base robot, from its command line as `jg-relay`'s `[egress]`
+/// ([`checked_egress`]): `--egress onion|clearnet` (default `onion`) and `--tor-socks <ip:port>` (default
+/// `127.0.0.1:9050`), every URL of `sources` checked before any socket or lookup. The default `onion` keeps the
+/// command lines deployed on the test chain: a loopback IP address (the local routers, the node) is reached
+/// directly, never through Tor (Tor to the loopback would mean nothing); a `.onion`, or an `https://` public name,
+/// through Tor's SOCKS port; anything else (a public IP address or name in clear) and the robot does not start.
+/// `clearnet`: the private rehearsal only (the loopback and its bridge 10.77.0.0/24).
+pub fn robot_egress<'a>(args: &[String], sources: impl IntoIterator<Item = (String, &'a str)>) -> anyhow::Result<crate::rpc::Egress> {
+    let value = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1).cloned());
+    let mode = match value("--egress") {
+        None => EgressMode::Onion,
+        Some(Some(m)) if m == "onion" => EgressMode::Onion,
+        Some(Some(m)) if m == "clearnet" => EgressMode::Clearnet,
+        Some(other) => anyhow::bail!("--egress {}: onion or clearnet", other.unwrap_or_default()),
+    };
+    let tor_socks = match value("--tor-socks") {
+        None => default_tor_socks(),
+        Some(Some(s)) => s,
+        Some(None) => anyhow::bail!("--tor-socks <ip:port>"),
+    };
+    checked_egress(&EgressConfig { mode, tor_socks }, Some(&robot_domain()), sources)
+}
+
 pub fn hex48(text: &str) -> anyhow::Result<[u8; 48]> {
     hex::decode(text.trim().trim_start_matches("0x"))?
         .try_into()

@@ -52,6 +52,31 @@ mod tests;
 /// Sepolia's Gloas epoch (T0.8, measured on two beacon nodes; `config/spec`
 /// `GLOAS_FORK_EPOCH` of both read again 2026-11-10).
 pub const SEPOLIA_GLOAS_FORK_EPOCH: u64 = 353_024;
+/// FR-9 (audit n°2): no Gloas epoch known for this build's L1 (the mainnet's is not scheduled): a Gloas object is then
+/// refused, saying `--gloas-epoch`, never wrapped with another network's epoch ([`format_of`]).
+pub const GLOAS_EPOCH_UNKNOWN: u64 = u64::MAX;
+
+/// The L1 this build's return over Base reads (its light client's network).
+pub fn build_l1_network() -> jetsam_chain::consensus::destination::forks::L1Network {
+    jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX).network
+}
+
+/// FR-9 (audit n°2): the L1's Gloas epoch the robots wrap their light-client objects with: `--gloas-epoch <e>` (`arg`),
+/// which `network`'s fork table must take (after its Fulu epoch); without it, Sepolia's when `network` is Sepolia (the
+/// test chain: the deployed command lines unchanged), else [`GLOAS_EPOCH_UNKNOWN`] (a Fulu object reads, a Gloas one is
+/// refused saying the flag: before, a mainnet build wrapped them with Sepolia's epoch and every intent was refused,
+/// `BadForkEpoch`).
+pub fn gloas_epoch_of(arg: Option<String>, network: &jetsam_chain::consensus::destination::forks::L1Network) -> anyhow::Result<u64> {
+    use jetsam_chain::consensus::destination::forks::L1_SEPOLIA;
+    let Some(text) = arg else {
+        return Ok(if *network == L1_SEPOLIA { SEPOLIA_GLOAS_FORK_EPOCH } else { GLOAS_EPOCH_UNKNOWN });
+    };
+    let epoch: u64 = text.parse().map_err(|_| anyhow!("--gloas-epoch {text}: an epoch number"))?;
+    network
+        .rules(LightClientFormat::Gloas { fork_epoch: epoch })
+        .map_err(|e| anyhow!("--gloas-epoch {epoch}: not a Gloas epoch of this L1 (after its Fulu epoch {}): {e:?}", network.fulu_fork_epoch))?;
+    Ok(epoch)
+}
 /// How long a step posted is not posted again (it may still be on its way
 /// to a block).
 pub const REPOST_SECONDS: u64 = 1_800;
@@ -184,6 +209,11 @@ fn aggregate(a: &Value) -> anyhow::Result<SyncAggregate> {
 pub fn format_of(version: &str, gloas_fork_epoch: u64) -> anyhow::Result<LightClientFormat> {
     match version {
         "electra" | "fulu" => Ok(LightClientFormat::Fulu),
+        // FR-9: never wrapped with an epoch this build does not know for its L1
+        "gloas" if gloas_fork_epoch == GLOAS_EPOCH_UNKNOWN => bail!(
+            "a Gloas light-client object, and this build does not know its L1's Gloas epoch: start the robot with \
+             --gloas-epoch <the L1's GLOAS_FORK_EPOCH>"
+        ),
         "gloas" => Ok(LightClientFormat::Gloas {
             fork_epoch: gloas_fork_epoch,
         }),
@@ -685,12 +715,20 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
 
 /// `jg-relay light-anchor --beacon <url> --committee-beacon <url> --period <p>`.
 pub fn anchor_cli(args: &[String]) -> anyhow::Result<()> {
-    let usage = || anyhow!("light-anchor --beacon <url serving light_client> --committee-beacon <url> --period <p> [--gloas-epoch <e>]");
-    let egress = crate::rpc::Egress::Clearnet;
+    let usage = || {
+        anyhow!(
+            "light-anchor --beacon <url serving light_client> --committee-beacon <url> --period <p> [--gloas-epoch <e>] \
+             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
+        )
+    };
+    // AN-1 (audit n°2): its beacons through `jg-relay`'s egress, checked before anything else
+    let egress = crate::config::robot_egress(args, crate::fast_run::robot_sources(args, &["--beacon", "--committee-beacon"]))
+        .map_err(|e| anyhow!("{e:#}: light-anchor does not start"))?;
     let lc = HttpBeacon { url: flag(args, "--beacon").ok_or_else(usage)?, egress };
     let other = HttpBeacon { url: flag(args, "--committee-beacon").ok_or_else(usage)?, egress };
     let period = flag(args, "--period").ok_or_else(usage)?.parse()?;
-    let gloas = flag(args, "--gloas-epoch").map(|e| e.parse()).transpose()?.unwrap_or(SEPOLIA_GLOAS_FORK_EPOCH);
+    // FR-9 (audit n°2): Sepolia's Gloas epoch only on a build whose L1 is Sepolia
+    let gloas = gloas_epoch_of(flag(args, "--gloas-epoch"), &build_l1_network())?;
     let (period, root) = anchor_of(&lc, &other, period, gloas)?;
     println!("anchor period {period} committee_root 0x{} ({} and {} agree seat by seat)", hex::encode(root), lc.url, other.url);
     Ok(())
@@ -702,10 +740,13 @@ pub fn feed_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
             "light-feed --node <url> --node-cookie <rpc.cookie> --beacon <url> [--beacon <url>] --state <file> \
-             [--gloas-epoch <e>] [--interval <s>, 300] [--once]"
+             [--gloas-epoch <e>] [--interval <s>, 300] [--once] [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
         )
     };
-    let egress = crate::rpc::Egress::Clearnet;
+    // AN-1 (audit n°2): its node and its beacons through `jg-relay`'s egress (the loopback directly, the rest through
+    // Tor), checked before anything else: a public address in clear and light-feed does not start
+    let egress = crate::config::robot_egress(args, crate::fast_run::robot_sources(args, &["--node", "--beacon"]))
+        .map_err(|e| anyhow!("{e:#}: light-feed does not start"))?;
     let node = RelayNode {
         client: crate::rpc::NodeClient::fast_release(&flag(args, "--node").ok_or_else(usage)?, egress),
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
@@ -719,7 +760,8 @@ pub fn feed_cli(args: &[String]) -> anyhow::Result<()> {
     }
     let refs: Vec<&dyn Beacon> = beacons.iter().map(|b| b as &dyn Beacon).collect();
     let state = std::path::PathBuf::from(flag(args, "--state").ok_or_else(usage)?);
-    let gloas = flag(args, "--gloas-epoch").map(|e| e.parse()).transpose()?.unwrap_or(SEPOLIA_GLOAS_FORK_EPOCH);
+    // FR-9 (audit n°2): Sepolia's Gloas epoch only on a build whose L1 is Sepolia
+    let gloas = gloas_epoch_of(flag(args, "--gloas-epoch"), &build_l1_network())?;
     let interval: u64 = flag(args, "--interval").map(|i| i.parse()).transpose()?.unwrap_or(300);
     let once = args.iter().any(|a| a == "--once");
     let say = |line: &str| println!("{} jg-relay light-feed {line}", crate::now_unix());

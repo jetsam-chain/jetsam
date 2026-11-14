@@ -783,6 +783,15 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
         .collect()
 }
 
+/// AN-1: every URL the command line gives after one of `names` (`(flag, url)`), for [`crate::config::robot_egress`].
+pub fn robot_sources<'a>(args: &'a [String], names: &[&str]) -> Vec<(String, &'a str)> {
+    args.iter()
+        .zip(args.iter().skip(1))
+        .filter(|(a, _)| names.contains(&a.as_str()))
+        .map(|(a, url)| (a.clone(), url.as_str()))
+        .collect()
+}
+
 /// `jg-relay fast-revoke --key <cold secret> --node <url> --node-cookie <file> [--dry-run --out <file>]`:
 /// closes this build's relay key. FR-6 (audit n°2): `--key <cold secret> --sign-only --out <file>` signs it offline
 /// (no node: done once, when the keys are made); `--signed <file> --node <url> --node-cookie <file>` hands that file in
@@ -791,10 +800,14 @@ pub fn revoke_cli(args: &[String]) -> anyhow::Result<()> {
     let usage = || {
         anyhow!(
             "fast-revoke (--key <cold secret file> | --signed <revocation file>) --node <url> --node-cookie <rpc.cookie> [--dry-run --out <file>] \
-             | fast-revoke --key <cold secret file> --sign-only --out <file>"
+             | fast-revoke --key <cold secret file> --sign-only --out <file> \
+             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
         )
     };
     let say = |line: &str| println!("{} jg-relay fast-revoke {line}", crate::now_unix());
+    // AN-1 (audit n°2): its node through `jg-relay`'s egress, checked before anything else
+    let egress = crate::config::robot_egress(args, robot_sources(args, &["--node"]))
+        .map_err(|e| anyhow!("{e:#}: fast-revoke does not start"))?;
     let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.base_return.fast;
     let key = rules.release_key.ok_or_else(|| anyhow!("this build has no FAST_RELEASE_KEY: nothing to revoke"))?;
     let revocation = match (flag(args, "--key"), flag(args, "--signed")) {
@@ -826,7 +839,7 @@ pub fn revoke_cli(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let node = crate::light_feed::RelayNode {
-        client: crate::rpc::NodeClient::fast_release(&flag(args, "--node").ok_or_else(usage)?, crate::rpc::Egress::Clearnet),
+        client: crate::rpc::NodeClient::fast_release(&flag(args, "--node").ok_or_else(usage)?, egress),
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
     };
     if args.iter().any(|a| a == "--dry-run") {
@@ -1035,11 +1048,19 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         anyhow!(
             "fast-run (--key <relay secret> | --no-fast) --l1 <url> --base <url> --base <url> [--base <url>…] --beacon <url> \
              --node <url> --node-cookie <rpc.cookie> --state-dir <dir> --from-block <Base block of the bridge's deployment> \
-             [--slow-release off|dry-run|send, dry-run] [--interval <s>, 60] [--once]"
+             [--slow-release off|dry-run|send, dry-run] [--interval <s>, 60] [--once] [--gloas-epoch <e>] \
+             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
         )
     };
     let say = |line: &str| println!("{} jg-relay fast-run {line}", crate::now_unix());
+    // AN-1 (audit n°2): every source through `jg-relay`'s egress (the loopback directly, the rest through Tor), checked
+    // before anything else: a public address in clear and fast-run does not start
+    let egress = crate::config::robot_egress(args, robot_sources(args, &["--l1", "--base", "--beacon", "--node"]))
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
     let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    // FR-9 (audit n°2): the L1's Gloas epoch, Sepolia's only on a build whose L1 is Sepolia
+    let gloas = crate::light_feed::gloas_epoch_of(flag(args, "--gloas-epoch"), &rules.network)
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
     let params = rules.base_return.base;
     let bridge = rules
         .bridge
@@ -1058,18 +1079,18 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             .unwrap_or_default(),
         ..crate::slow_release::SlowConfig::default()
     };
-    let l1 = crate::l1::L1::new(&flag(args, "--l1").ok_or_else(usage)?);
+    let l1 = crate::l1::L1::via(&flag(args, "--l1").ok_or_else(usage)?, egress);
     let base_urls = flags(args, "--base");
-    let bases: Vec<crate::l1::L1> = base_urls.iter().map(|u| crate::l1::L1::new(u)).collect();
+    let bases: Vec<crate::l1::L1> = base_urls.iter().map(|u| crate::l1::L1::via(u, egress)).collect();
     let base = bases.first().ok_or_else(usage)?;
 
     let beacon = crate::light_feed::HttpBeacon {
         url: flag(args, "--beacon").ok_or_else(usage)?,
-        egress: crate::rpc::Egress::Clearnet,
+        egress,
     };
     let node_url = flag(args, "--node").ok_or_else(usage)?;
     let node = crate::light_feed::RelayNode {
-        client: crate::rpc::NodeClient::fast_release(&node_url, crate::rpc::Egress::Clearnet),
+        client: crate::rpc::NodeClient::fast_release(&node_url, egress),
         cookie: flag(args, "--node-cookie").ok_or_else(usage)?.into(),
     };
     // D171, D176: the node's activations are this build's, or fast-run does not start (read first: its first socket);
@@ -1200,7 +1221,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     };
     let mut pass = |_number: u64| -> anyhow::Result<String> {
         // 1. The finalized L1 block (a finality update) and the newest game.
-        let finality = crate::light_feed::fetch_finality(&beacon, &l1, crate::light_feed::SEPOLIA_GLOAS_FORK_EPOCH)?;
+        let finality = crate::light_feed::fetch_finality(&beacon, &l1, gloas)?;
         let update = jetsam_chain::consensus::destination::ssz::LightClientFinalityUpdate::decode_payload(&finality)
             .map_err(|e| anyhow!("{e:?}"))?;
         let l1_block = jetsam_chain::consensus::destination::light_client::finalized_execution(&update)

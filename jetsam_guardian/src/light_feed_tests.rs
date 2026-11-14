@@ -441,3 +441,28 @@ fn an_update_of_another_period_than_asked_is_refused() {
     assert!(fetch_update(&[&WrongPeriod], 1_408, SEPOLIA_GLOAS_FORK_EPOCH).is_err());
     assert!(fetch_update(&[&WrongPeriod], 1_409, SEPOLIA_GLOAS_FORK_EPOCH).is_ok());
 }
+
+/// FR-9 (audit n°2): the Gloas epoch is Sepolia's only when the L1 is Sepolia (the test chain's build: its command lines
+/// unchanged); on another L1 (the mainnet's, its Gloas epoch unscheduled) it is unknown unless given, and a Gloas object
+/// is then refused saying `--gloas-epoch` (before: wrapped with Sepolia's epoch, every intent `BadForkEpoch`), while a
+/// Fulu object reads. A given epoch must be one the L1's fork table takes (after its Fulu epoch, not "never").
+#[test]
+fn fr9_the_gloas_epoch_is_sepolias_only_on_sepolia_and_a_gloas_object_without_one_is_refused() {
+    use jetsam_chain::consensus::destination::forks::L1_MAINNET;
+    assert_eq!(gloas_epoch_of(None, &L1_SEPOLIA).unwrap(), SEPOLIA_GLOAS_FORK_EPOCH);
+    assert_eq!(gloas_epoch_of(None, &L1_MAINNET).unwrap(), GLOAS_EPOCH_UNKNOWN);
+    assert_eq!(gloas_epoch_of(Some("500000".into()), &L1_MAINNET).unwrap(), 500_000);
+    assert_eq!(gloas_epoch_of(Some("353024".into()), &L1_SEPOLIA).unwrap(), 353_024);
+    for bad in ["411392", "1", "x", "18446744073709551615"] {
+        let e = format!("{:#}", gloas_epoch_of(Some(bad.into()), &L1_MAINNET).unwrap_err());
+        assert!(e.contains(&format!("--gloas-epoch {bad}")), "{bad}: {e}");
+    }
+    let e = format!("{:#}", format_of("gloas", GLOAS_EPOCH_UNKNOWN).unwrap_err());
+    assert!(e.contains("--gloas-epoch"), "{e}");
+    assert_eq!(format_of("fulu", GLOAS_EPOCH_UNKNOWN).unwrap(), LightClientFormat::Fulu);
+    assert_eq!(format_of("gloas", 500_000).unwrap(), LightClientFormat::Gloas { fork_epoch: 500_000 });
+    // this build: Sepolia's on the test chain's, unknown on the mainnet's
+    let built = build_l1_network();
+    let want = if built == L1_SEPOLIA { SEPOLIA_GLOAS_FORK_EPOCH } else { GLOAS_EPOCH_UNKNOWN };
+    assert_eq!(gloas_epoch_of(None, &built).unwrap(), want);
+}

@@ -1156,6 +1156,30 @@ pub fn reorg_needs_nodes(tip: u64, common: u64, locked_floor: u64) -> bool {
     tip.saturating_sub(common) > MAX_REORG_ONE_NODE || common < locked_floor
 }
 
+/// GU-3 (audit n°2): a reorganization of the relayer's chain (tip `tip`, cumulative work `ours`) onto one node's branch
+/// from `common` (its tip's cumulative work `theirs`, little-endian) that this node alone decides: a shallow one
+/// ([`reorg_needs_nodes`] false) onto a branch with MORE work than the relayer's chain. A branch with no more work (a
+/// node stuck behind on another branch, or lying on `getBlockHash`) never moves the relayer on its word: before, the
+/// node of index 0 made it back off eight blocks a step down to the last locked block it knew, then held it there.
+pub fn reorg_on_one_nodes_word(tip: u64, common: u64, locked_floor: u64, ours: &[u8; 32], theirs: &[u8; 32]) -> bool {
+    !reorg_needs_nodes(tip, common, locked_floor) && crate::u256::cmp(theirs, ours) == std::cmp::Ordering::Greater
+}
+
+/// GU-3: a node not on the relayer's chain this many steps in a row (behind its tip, on a branch it does not follow,
+/// or not answering) is said once (`ALERT NODE_OFF_OUR_CHAIN`): it no longer holds the relayer back, but it no longer
+/// counts toward `min_nodes` either.
+pub const NODE_OFF_CHAIN_ALERT_STEPS: u32 = 20;
+
+/// GU-3: a node's count of steps off the relayer's chain after one more step (`on_our_chain`: at its sync, its tip is
+/// the relayer's or above it, on it), and whether to say it now (once, on reaching [`NODE_OFF_CHAIN_ALERT_STEPS`]).
+pub fn node_off_chain_step(count: u32, on_our_chain: bool) -> (u32, bool) {
+    if on_our_chain {
+        return (0, false);
+    }
+    let n = count.saturating_add(1);
+    (n, n == NODE_OFF_CHAIN_ALERT_STEPS)
+}
+
 /// One source of a block body: its name and a reader (`Ok(None)`: it does not serve the block).
 pub type BodySource<'a> = (String, Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>> + 'a>);
 
