@@ -85,7 +85,7 @@ use jetsam_poseidon2b::primitives::Address;
 
 use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::params::{v1_7_base_return_active_with, MICRO_PER_JTM};
-use crate::consensus::vault::{release_marker_n, release_shape_ok, ReleasedSet, VaultRules};
+use crate::consensus::vault::{payee_shape_ok, release_marker_n, ReleasedSet, VaultRules};
 
 #[cfg(test)]
 mod tests;
@@ -857,13 +857,14 @@ impl AdvanceError {
 
 /// An owner a release, an advance or a transfer may pay: no marker of any
 /// kind (destination, guardian, client, advance), not the vault, not a
-/// guardian pool.
+/// guardian pool. A block rule: the fast lane's two tags are not refused here
+/// (RC-8, [`payee_shape_ok`]: that would take an activation height).
 fn payable(
     owner: &Address,
     vault: &VaultRules,
     kind_at: impl Fn(&Address) -> Option<AdvanceMarkerKind>,
 ) -> bool {
-    kind_at(owner).is_none() && release_shape_ok(owner, vault.release_fee, vault)
+    kind_at(owner).is_none() && payee_shape_ok(owner, vault.release_fee, vault)
 }
 
 /// Whether a group's live outputs carry an advance or transfer marker: the

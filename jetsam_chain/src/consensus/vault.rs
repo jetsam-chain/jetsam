@@ -986,9 +986,21 @@ pub fn check_plain_vault_transaction(
 /// value), not one of the guardians' two pools, and `RELEASE_FEE ≤ amount ≤`
 /// the window cap. The mempool refuses a release of any other shape at
 /// admission (T2.5); the robots and the CLI check with it. `rules` are those
-/// of the block (D123: [`VaultRules::at`] its height). Node policy: block
-/// validation never calls it.
+/// of the block (D123: [`VaultRules::at`] its height). Node policy: no block
+/// rule reads it (the advance rule reads [`payee_shape_ok`]).
 pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
+    crate::consensus::destination::fast::fast_marker_kind(owner).is_none()
+        && payee_shape_ok(owner, amount, rules)
+}
+
+/// [`release_shape_ok`] but for the fast lane's two tags: the payees the
+/// advance rule accepts (a block rule, `advance::payable`), unchanged since
+/// the return over Base. RC-8: refusing those two tags there too would change
+/// the validity of a block (an advance paying zero to a fast-lane marker the
+/// block's own objects open, accepted today): a block rule, left for an
+/// activation height; every block paying such an owner with value is refused
+/// already (`FastMarkerCarriesValue`, before the advances).
+pub(crate) fn payee_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
     use crate::consensus::client_objects::{
         CLIENT_BATCH_SUBMISSION_MARKER_TAG, CLIENT_REGISTRATION_MARKER_TAG,
         CLIENT_SUBMISSION_MARKER_TAG,
@@ -997,7 +1009,6 @@ pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> boo
     let tag: [u8; 8] = owner.0[..8].try_into().expect("eight bytes");
     let marker = destination_marker_kind(owner).is_some()
         || guardian_marker_kind(owner).is_some()
-        || crate::consensus::destination::fast::fast_marker_kind(owner).is_some()
         || matches!(
             tag,
             CLIENT_REGISTRATION_MARKER_TAG
