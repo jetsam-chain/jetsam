@@ -276,21 +276,35 @@ pub struct BridgeRotation {
     pub first_burn: u64,
 }
 
-/// The test chain's second bridge (`v3-mn5-bridge2`): its CREATE2 address and
-/// runtime code hash with its immutables (computed offline, the deployment
-/// replayed on a local fork of Base Sepolia, BRIDGE2), `withdrawals` at slot
-/// 9 and `genesisId` at slot 13 (layout unchanged), its first burn index
-/// 1 000 000. `genesis_id` is its `genesisId()` once its `initGenesis` locked
+/// The test chain's second bridge (`v3-mn5-bridge2` 6a105fd, profile
+/// `testnet-bridge2`: J 10 880, F 12 480, first burn 1 000 000, TN1's test
+/// verifier and adapters): its CREATE2 address and runtime code hash with its
+/// immutables (the deployment replayed on a local fork of Base Sepolia,
+/// BRIDGE2), `withdrawals` at slot 9 and `genesisId` at slot 13 (layout
+/// unchanged). `genesis_id` is its `genesisId()` once its `initGenesis` locked
 /// the locked block of TN1's last point (no deposit TN1 could mint is in its
-/// tree): written here at the switch, with the address and code hash read
-/// again on the deployed contract.
+/// tree): **the value of the rehearsal on the fork (G = 10 880), to be written
+/// at the switch** from the real `initGenesis`, with the address and code hash
+/// read again on the deployed contract (a deliberate edit of this constant and
+/// of the test that pins it).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
-    address: [0x2b; 20],
-    code_hash: [0xc2; 32],
+    address: [
+        0x2b, 0x98, 0x16, 0x63, 0x47, 0xb1, 0x8c, 0x95, 0xd6, 0x01, 0x53, 0xfa, 0xa8, 0x39, 0xc2,
+        0xb3, 0xf3, 0x6e, 0x30, 0xc1,
+    ],
+    code_hash: [
+        0xb7, 0xf7, 0x5c, 0xac, 0x9f, 0x14, 0x1a, 0x98, 0x18, 0xc1, 0x0f, 0x26, 0x3b, 0xa4, 0x1d,
+        0xd7, 0x8c, 0xe2, 0xd1, 0xdb, 0x8c, 0x3a, 0x61, 0x74, 0x8d, 0x42, 0xcc, 0x95, 0x2b, 0x9f,
+        0xd1, 0x4d,
+    ],
     withdrawals_slot: 9,
     genesis_id_slot: 13,
-    genesis_id: [0x2e; 32],
+    genesis_id: [
+        0xab, 0x09, 0xcc, 0x9c, 0x28, 0x45, 0x48, 0xd4, 0x33, 0x35, 0x00, 0x7e, 0x93, 0x99, 0x02,
+        0x9e, 0x86, 0x31, 0xdc, 0xeb, 0x5e, 0x84, 0xc1, 0x5c, 0x66, 0x5a, 0xd6, 0x64, 0x86, 0xd7,
+        0xd4, 0x0f,
+    ],
 };
 
 /// The bridges the return over Base reads after its first, each from its
@@ -419,8 +433,15 @@ impl BaseReturnRules {
     /// BRIDGE2: the rotation in force at `height` (the last at or below it),
     /// none while `bridge` is.
     pub const fn rotation_at(&self, height: u64) -> Option<&BridgeRotation> {
-        let _ = height;
-        None
+        let mut found = None;
+        let mut i = 0;
+        while i < self.bridge_rotations.len() {
+            if self.bridge_rotations[i].height <= height {
+                found = Some(&self.bridge_rotations[i]);
+            }
+            i += 1;
+        }
+        found
     }
 
     /// BRIDGE2: the bridge the return reads at `height`: the rotation's in
@@ -468,7 +489,8 @@ impl DestinationRules {
                     Some(anchor) => Some(anchor),
                     None => self.anchor,
                 },
-                bridge: match self.base_return.bridge {
+                // BRIDGE2: the bridge of this height (the table's, else the return's).
+                bridge: match self.base_return.bridge_at(height) {
                     Some(bridge) => Some(bridge),
                     None => self.bridge,
                 },
@@ -505,15 +527,29 @@ impl DestinationRules {
     /// lowest `n` a release may pay: the first burn index of the rotation
     /// whose bridge is in force; 0 (no bound) under the return's first bridge.
     pub fn first_burn(&self) -> u64 {
-        0
+        let Some(bridge) = self.bridge else { return 0 };
+        self.base_return
+            .bridge_rotations
+            .iter()
+            .find(|r| r.bridge.address == bridge.address)
+            .map_or(0, |r| r.first_burn)
     }
 
     /// BRIDGE2: under these rules (a block's), whether the fast release a
     /// branch made at `record_height` was paid under the bridge in force —
     /// only then may Base's word under it contradict that release.
     pub fn fast_record_under_this_bridge(&self, record_height: u64) -> bool {
-        let _ = record_height;
-        true
+        let Some(bridge) = self.bridge else { return true };
+        match self.base_return.rotation_at(record_height) {
+            // paid under a later bridge: that one must be in force
+            Some(rotation) => rotation.bridge.address == bridge.address,
+            // paid under the first: no later one may be in force (their addresses are their own)
+            None => !self
+                .base_return
+                .bridge_rotations
+                .iter()
+                .any(|r| r.bridge.address == bridge.address),
+        }
     }
 
     /// The blocks of releases a state keeps after its block at `height`
@@ -2577,7 +2613,7 @@ fn verify_fast_releases_on_base(
         state_root: open_output_root(&game.root_claim, &decoded.preimage)
             .map_err(DestinationBlockError::BaseReturn)?,
     };
-    verify_bridge_reads(&base, &bridge, &decoded, releases)?;
+    verify_bridge_reads(&base, &bridge, rules.first_burn(), &decoded, releases)?;
     Ok(base)
 }
 
@@ -2615,6 +2651,12 @@ fn check_contradictions(
             .ok_or(DestinationBlockError::NoFastRecord { n })?;
         if record.contradicted || entries.iter().any(|e| e.n == n) {
             return Err(DestinationBlockError::AlreadyContradicted { n });
+        }
+        // BRIDGE2: only under the bridge that paid it (an abandoned bridge's
+        // fast release expires at its horizon, never contradicted by another
+        // bridge's word).
+        if !rules.fast_record_under_this_bridge(record.height) {
+            return Err(DestinationBlockError::FastRecordOfAnotherBridge { n });
         }
         if base.l2_block_number < record.l2_block {
             return Err(DestinationBlockError::ContradictionTooEarly { n });
@@ -2838,7 +2880,7 @@ pub fn verify_releases_on_base(
         &decoded.preimage,
     )
     .map_err(DestinationBlockError::BaseReturn)?;
-    verify_bridge_reads(&base, &bridge, &decoded, releases)?;
+    verify_bridge_reads(&base, &bridge, rules.first_burn(), &decoded, releases)?;
     Ok(base)
 }
 
@@ -2877,9 +2919,15 @@ fn decode_base_objects(
 fn verify_bridge_reads(
     base: &BaseState,
     bridge: &L1BridgeParams,
+    first_burn: u64,
     decoded: &DecodedBaseObjects,
     releases: &[VaultRelease],
 ) -> Result<(), DestinationBlockError> {
+    // BRIDGE2: never an index below the bridge's first (the bridges before
+    // it gave those).
+    if let Some(release) = releases.iter().find(|r| r.n < first_burn) {
+        return Err(DestinationBlockError::BelowTheBridgesFirstBurn { n: release.n });
+    }
     verify_bridge_account(
         base.state_root,
         bridge,

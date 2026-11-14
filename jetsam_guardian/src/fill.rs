@@ -994,21 +994,30 @@ pub enum BodyRead {
 /// `getDepositBlock`) that serves bytes the node's rule reads ([`deposits_of_block`]); a source that fails never stops
 /// the others.
 pub fn read_body(sources: Vec<crate::relayer::BodySource>, id: &[u8; 32], rules: &VaultRules) -> BodyRead {
+    read_body_served(sources, id, rules).0
+}
+
+/// [`read_body`], and the bytes served that the rule refused (source, bytes): what [`KeptBodies::keep`] may keep.
+fn read_body_served(sources: Vec<crate::relayer::BodySource>, id: &[u8; 32], rules: &VaultRules) -> (BodyRead, Vec<(String, Vec<u8>)>) {
     let mut why = Vec::new();
+    let mut refused = Vec::new();
     for (name, mut read) in sources {
         match read() {
             Ok(Some(raw)) => match deposits_of_block(&raw, id, rules) {
-                Ok(found) => return BodyRead::Deposits(found),
-                Err(e) => why.push(format!("{name}: {e:#}")),
+                Ok(found) => return (BodyRead::Deposits(found), refused),
+                Err(e) => {
+                    why.push(format!("{name}: {e:#}"));
+                    refused.push((name, raw));
+                }
             },
             Ok(None) => {}
             Err(e) => why.push(format!("{name}: {e:#}")),
         }
     }
     if why.is_empty() {
-        BodyRead::NotServed
+        (BodyRead::NotServed, refused)
     } else {
-        BodyRead::Failed(why.join("; "))
+        (BodyRead::Failed(why.join("; ")), refused)
     }
 }
 
@@ -1027,29 +1036,80 @@ impl KeptBodies {
         Ok(Self { dir: state_dir.join("unreadable") })
     }
 
+    fn prefix(height: u64, id: &[u8; 32]) -> String {
+        format!("{height}-{}-", hex::encode(id))
+    }
+
+    /// The files kept for block `height` whose id is `id`.
+    fn files(&self, height: u64, id: &[u8; 32]) -> Vec<PathBuf> {
+        let prefix = Self::prefix(height, id);
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let mut out: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".bin")))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// The copies kept for block `height` whose id is `id`: (source, bytes).
     pub fn copies(&self, height: u64, id: &[u8; 32]) -> Vec<(String, Vec<u8>)> {
-        let _ = (height, id);
-        Vec::new()
+        self.files(height, id)
+            .into_iter()
+            .filter_map(|p| {
+                let raw = std::fs::read(&p).ok()?;
+                Some((format!("kept {}", p.file_name()?.to_string_lossy()), raw))
+            })
+            .collect()
     }
 
     /// Keep each of `served` (source, bytes) that carries the header of block `id`, not kept yet: how many now.
     pub fn keep(&self, height: u64, id: &[u8; 32], served: &[(String, Vec<u8>)]) -> anyhow::Result<usize> {
-        let _ = (height, id, served);
-        Ok(0)
+        let mut kept = 0;
+        for (_, raw) in served {
+            if raw.len() > crate::relayer::UNREADABLE_COPY_MAX_BYTES || crate::relayer::served_block_id(raw) != Some(*id) {
+                continue;
+            }
+            let path = self.dir.join(format!("{}{}.bin", Self::prefix(height, id), hex::encode(crate::keccak256(raw))));
+            if path.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(&self.dir)?;
+            crate::write_atomic(&path, raw)?;
+            kept += 1;
+        }
+        Ok(kept)
     }
 
     /// The copies of block `height` forgotten (it was read).
     pub fn forget(&self, height: u64, id: &[u8; 32]) {
-        let _ = (height, id);
+        for p in self.files(height, id) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
 /// [`read_body`] with the copies `kept` holds for block `height` read first (as sources `kept <source>`): served bytes
 /// of this block this build cannot read are kept, a block read is forgotten.
 pub fn read_body_kept(kept: &KeptBodies, height: u64, id: &[u8; 32], sources: Vec<crate::relayer::BodySource>, rules: &VaultRules) -> BodyRead {
-    let _ = (kept, height);
-    read_body(sources, id, rules)
+    let mut all: Vec<crate::relayer::BodySource> = kept
+        .copies(height, id)
+        .into_iter()
+        .map(|(name, raw)| (name, Box::new(move || Ok(Some(raw.clone()))) as Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>>>))
+        .collect();
+    all.extend(sources);
+    let (read, unreadable) = read_body_served(all, id, rules);
+    match &read {
+        BodyRead::Deposits(_) => kept.forget(height, id),
+        BodyRead::Failed(why) => {
+            if let Err(e) = kept.keep(height, id, &unreadable) {
+                return BodyRead::Failed(format!("{why}; its bytes not kept ({e:#})"));
+            }
+        }
+        BodyRead::NotServed => {}
+    }
+    read
 }
 
 /// E-12: at most this many blocks not tried yet, and this many that failed before, per step of the robot's scan.

@@ -722,7 +722,8 @@ pub fn culprits_of(
         DestinationBlockError::NoFastRecord { n }
         | DestinationBlockError::AlreadyContradicted { n }
         | DestinationBlockError::ContradictionTooEarly { n }
-        | DestinationBlockError::NotAContradiction { n } => contradiction(*n),
+        | DestinationBlockError::NotAContradiction { n }
+        | DestinationBlockError::FastRecordOfAnotherBridge { n } => contradiction(*n),
         DestinationBlockError::FastKeyUnset
         | DestinationBlockError::FastRevokeKeyUnset
         | DestinationBlockError::FastKeyClosed
@@ -742,7 +743,8 @@ pub fn culprits_of(
             ..Culprits::default()
         },
         DestinationBlockError::Vault(VaultError::NotProvenOnL1 { n, .. })
-        | DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n }) => one(*n),
+        | DestinationBlockError::Vault(VaultError::ReleaseAlreadyPaid { n })
+        | DestinationBlockError::BelowTheBridgesFirstBurn { n } => one(*n),
         DestinationBlockError::LightClient(_) if offer.committee_update.is_some() => update(),
         DestinationBlockError::LightClient(_)
         | DestinationBlockError::BridgeAccount(_)

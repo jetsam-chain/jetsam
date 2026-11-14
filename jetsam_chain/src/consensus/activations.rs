@@ -121,7 +121,17 @@ impl Activations {
                 })
                 .collect(),
             base_pin_rotations: base_return.base.rotations.iter().map(|(h, _)| *h).collect(),
-            base_return_bridge_rotations: Vec::new(),
+            base_return_bridge_rotations: base_return
+                .bridge_rotations
+                .iter()
+                .map(|r| BridgeRotationRecord {
+                    height: r.height,
+                    address: hex(&r.bridge.address),
+                    code_hash: hex(&r.bridge.code_hash),
+                    genesis_id: hex(&r.bridge.genesis_id),
+                    first_burn: r.first_burn,
+                })
+                .collect(),
             guardian_height: guardian.activation_height,
             delegation_height: guardian.delegation_height,
             guardian_group_key: guardian.group_key.map(|key| hex(&key)),

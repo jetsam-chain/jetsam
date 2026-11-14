@@ -165,13 +165,15 @@ struct L1World {
     accepted_at: u64,
     /// The `eth_getLogs` filters seen.
     filters: Vec<Value>,
+    /// BRIDGE2: the bridge's answer to `MN5_MAX_ELAPSED()` (none: a revert, a bridge of before).
+    mn5_max_elapsed: Option<String>,
 }
 
 const T0: u64 = 1_800_000_000;
 
 impl L1World {
     fn new(head: u64) -> Self {
-        Self { head, lies: Vec::new(), block_number_calls: 0, logs: Vec::new(), nulls: 0, drops_unfiltered: false, tip: [0; 32], fin: [0; 32], accepted_at: 0, filters: Vec::new() }
+        Self { head, lies: Vec::new(), block_number_calls: 0, logs: Vec::new(), nulls: 0, drops_unfiltered: false, tip: [0; 32], fin: [0; 32], accepted_at: 0, filters: Vec::new(), mn5_max_elapsed: None }
     }
 }
 
@@ -233,7 +235,10 @@ fn l1(world: Arc<Mutex<L1World>>) -> u16 {
                 let data = params[0]["data"].as_str().unwrap_or_default().to_string();
                 // BRIDGE2: a bridge of before (no `MN5_MAX_ELAPSED()`): the relayer judges MN-5 by the rule of before
                 if data.starts_with(&mn5_max_elapsed) {
-                    return json!({"error": {"code": 3, "message": "execution reverted"}});
+                    return match &w.mn5_max_elapsed {
+                        None => json!({"error": {"code": 3, "message": "execution reverted"}}),
+                        Some(answer) => json!({"result": answer}),
+                    };
                 }
                 let known_tip = w.tip == cp.id();
                 let out = if data.starts_with(&genesis_id) {
@@ -917,4 +922,36 @@ fn relfix2_jg_relay_reads_again_at_its_start_the_bytes_an_older_build_kept_unrea
     assert_eq!(std::fs::read(&published).ok(), Some(raw3.clone()), "the deposit body published");
     assert_eq!(archived(&dir, f + 2, &raw2).0, "Read", "log:\n{text}");
     assert!(!text.contains("ALERT MISSING_DEPOSIT_BODY"), "{text}");
+}
+
+// ---------------------------------------------------------------- BRIDGE2 (MN5CT §9 S1)
+
+/// BRIDGE2: jg-relay judges MN-5 by its bridge's own rule, read at its start (`MN5_MAX_ELAPSED()`): a revert (the
+/// bridge of before, TN1's) is the rule of before, 21 600 the rule of `v3-mn5`, said once at the start; any other
+/// answer is a rule this build does not know: it does not start.
+#[test]
+fn bridge2_jg_relay_reads_its_bridges_mn5_rule_at_start() {
+    if no_v1_7_clock() {
+        return;
+    }
+    let word = |x: u64| format!("0x{:064x}", x);
+    for (answer, says) in [(None, "MN5 rule v3-tn1 (no cap, 4/10)"), (Some(word(21_600)), "MN5 rule v3-mn5 (cap 21600 s, 1/4 keep-L, 4/10 switch)")] {
+        let world = Arc::new(Mutex::new(L1World::new(100)));
+        world.lock().unwrap().mn5_max_elapsed = answer.clone();
+        let (n0, n1) = (genesis_only(), genesis_only());
+        let (_root, dir) = relay_dir(l1(world.clone()), &[n0, n1], 2, "");
+        let relay = spawn(&dir, &[]);
+        let said = wait_for(30, || std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default().contains(says));
+        stop(relay);
+        let log = std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+        assert!(said, "{answer:?}: {log}");
+    }
+    let world = Arc::new(Mutex::new(L1World::new(100)));
+    world.lock().unwrap().mn5_max_elapsed = Some(word(7));
+    let (n0, n1) = (genesis_only(), genesis_only());
+    let (_root, dir) = relay_dir(l1(world.clone()), &[n0, n1], 2, "");
+    let code = exited(spawn(&dir, &[]), 30);
+    let log = std::fs::read_to_string(dir.join("relay.log")).unwrap_or_default();
+    assert_eq!(code, Some(1), "{log}");
+    assert!(log.contains("MN5_MAX_ELAPSED()") && log.contains("jg-relay does not start"), "{log}");
 }

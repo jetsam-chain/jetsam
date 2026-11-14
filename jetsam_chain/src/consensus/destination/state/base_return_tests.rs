@@ -2138,6 +2138,28 @@ fn bridge2_no_index_below_the_second_bridges_first_burn_is_paid_under_it() {
     assert!(validate_block_destination(&b, &parent, &below, &keys).is_ok());
 }
 
+/// A fast release is judged only under the bridge that paid it: under the
+/// rules of a block below the switch, a release made below it (the first
+/// bridge's) and not one made from it; from the switch on, the reverse.
+#[test]
+fn bridge2_a_fast_release_is_judged_only_under_the_bridge_that_paid_it() {
+    let c0 = committee(1);
+    let h2 = HEIGHT + 100;
+    let rules = switched(base_rules(&c0), h2);
+    let (below, above) = (rules.effective_at(h2 - 1), rules.effective_at(h2));
+    for paid_at in [HB, HEIGHT, h2 - 1] {
+        assert!(below.fast_record_under_this_bridge(paid_at), "{paid_at}");
+        assert!(!above.fast_record_under_this_bridge(paid_at), "{paid_at}");
+    }
+    for paid_at in [h2, h2 + 1] {
+        assert!(!below.fast_record_under_this_bridge(paid_at), "{paid_at}");
+        assert!(above.fast_record_under_this_bridge(paid_at), "{paid_at}");
+    }
+    // without a table every fast release is the bridge's, as before
+    let before = base_rules(&c0).effective_at(h2);
+    assert!(before.fast_record_under_this_bridge(HEIGHT) && before.fast_record_under_this_bridge(h2));
+}
+
 /// The table's own rule: empty with a dormant height; else starting at it,
 /// above the return, each bridge its own address, first burn ≥ 1.
 #[test]
@@ -2238,10 +2260,14 @@ fn bridge2_the_profiles_bridge_table() {
     }
 }
 
-/// The pins of the test chain's second bridge, as the switch reads them.
+/// The pins of the test chain's second bridge, as the switch reads them: its
+/// address and code hash (CREATE2 of `v3-mn5-bridge2` 6a105fd, profile
+/// `testnet-bridge2`, the deployment replayed on a fork of Base Sepolia), and
+/// its genesis id **of the rehearsal** (G = 10 880), to be replaced at the
+/// switch by the real `genesisId()`.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_ADDRESS_HEX: &str = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b";
+const BRIDGE2_ADDRESS_HEX: &str = "2b98166347b18c95d60153faa839c2b3f36e30c1";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_CODE_HASH_HEX: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+const BRIDGE2_CODE_HASH_HEX: &str = "b7f75cac9f141a9818c10f263ba41dd78ce2d1db8c3a61748d42cc952b9fd14d";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_GENESIS_ID_HEX: &str = "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e";
+const BRIDGE2_GENESIS_ID_HEX: &str = "ab09cc9c284548d43335007e9399029e8631dceb5e84c15c665ad66486d7d40f";

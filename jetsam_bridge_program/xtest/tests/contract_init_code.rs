@@ -120,8 +120,8 @@ fn bridge_constants_match_contract_init_code() {
     assert_eq!(bytes(&bridge["initCodeHash"]), keccak256(&init));
     assert_eq!(create2(&factory, &bytes(&bridge["salt"]), &init), bytes(&bridge["address"]));
 
-    // The init code ends with abi.encode(Config): eight static words.
-    let config = &init[init.len() - 8 * 32..];
+    // The init code ends with abi.encode(Config): nine static words (BRIDGE2: the first burn index last).
+    let config = &init[init.len() - 9 * 32..];
 
     // Words 0 and 1: the two verifiers are the CREATE2 adapters of the two programs, each
     // creationCode(Sp1OfficialVerifierAdapter) || abi.encode(official verifier, vkey).
@@ -159,12 +159,15 @@ fn bridge_constants_match_contract_init_code() {
     assert_eq!(f, p.planned_f, "the contract's F is the plan's ({})", p.name);
     // Word 5: the network is this profile's genesis block id.
     assert_eq!(word(config, 5), &network_id()[..]);
+    // Word 8 (BRIDGE2): a network's first bridge counts its burns from 1.
+    assert_eq!(as_u64(word(config, 8)), 1, "the first bridge's first burn index");
 
     // The constants of the code deployed from this init code (read back by the contract's test).
     let c = &v["constants"];
     assert_eq!(c["genesisMinLockedHeight"].as_u64(), Some(j));
     assert_eq!(c["depositsFromHeight"].as_u64(), Some(f));
     assert_eq!(c["minBurnAmount"].as_u64(), Some(RELEASE_FEE_MICRO));
+    assert_eq!(c["nextBurnIndex"].as_u64(), Some(1));
     assert_eq!(bytes(&c["jetsamNetwork"]), network_id());
     // C-4 = MAX_DEPOSIT (D28), C-6 = VAULT_OUTSTANDING_CEIL (D45, V8), B-2 = MAX_DEPOSIT (D54).
     assert_eq!(c["SLOW_PER_DEPOSIT"].as_u64(), Some(MAX_DEPOSIT_MICRO));
@@ -193,9 +196,75 @@ fn each_network_has_its_own_init_code_vector() {
         assert_eq!(hex(&bytes(&v["config"]["jetsamNetwork"])), p.network, "{}", p.name);
         assert_eq!(v["config"]["genesisMinLockedHeight"].as_u64(), Some(p.planned_j), "{}", p.name);
         assert_eq!(v["config"]["depositsFromHeight"].as_u64(), Some(p.planned_f), "{}", p.name);
+        assert_eq!(v["config"]["firstBurnIndex"].as_u64(), Some(1), "{}", p.name);
         v
     });
     assert_ne!(m["bridge"]["address"], t["bridge"]["address"]);
     assert_ne!(m["checkpointVerifier"]["vkey"], t["checkpointVerifier"]["vkey"], "one checkpoint program per network");
     assert_eq!(m["factory"], t["factory"]);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// BRIDGE2 (D208): the test chain's second bridge
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The `testnet-bridge2` profile's vector (`init_code_vector.sh testnet-bridge2`, information only like the others:
+/// test keys, an assumed verifier): its Config, read from its own init code, is the second bridge's — the test
+/// chain's genesis, J 10 880, F 12 480 (the genesis window, ending at the nodes' switch height), its burns from
+/// 1 000 000 (above the n = 1, 2, 3 of TN1's bridge) — and its constants say so; checked whatever the profile.
+#[test]
+fn bridge2_the_second_test_bridges_vector_is_its_profiles() {
+    let v: Value = serde_json::from_str(include_str!("fixtures/bridge_init_code_testnet_bridge2.json")).unwrap();
+    assert_eq!(v["profile"].as_str(), Some("testnet-bridge2"));
+    let bridge = &v["bridge"];
+    let init = bytes(&bridge["initCode"]);
+    assert_eq!(bytes(&bridge["salt"]), keccak256(b"jetsam-bridge/v3"));
+    assert_eq!(create2(&bytes(&v["factory"]), &bytes(&bridge["salt"]), &init), bytes(&bridge["address"]));
+    let config = &init[init.len() - 9 * 32..];
+    assert_eq!((as_u64(word(config, 3)), as_u64(word(config, 4)), as_u64(word(config, 8))), (10_880, 12_480, 1_000_000));
+    assert_eq!(hex(word(config, 5)), PROFILES[1].network, "the test chain's genesis");
+    assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
+    let c = &v["constants"];
+    assert_eq!(c["nextBurnIndex"].as_u64(), Some(1_000_000));
+    assert_eq!((c["genesisMinLockedHeight"].as_u64(), c["depositsFromHeight"].as_u64()), (Some(10_880), Some(12_480)));
+    // another bridge than the test chain's first
+    let first: Value = serde_json::from_str(PROFILES[1].vector).unwrap();
+    assert_ne!(first["bridge"]["address"], bridge["address"]);
+}
+
+/// The deployment of the test chain's second bridge (its factory call, replayed on a fork of Base Sepolia: TN1's
+/// test verifier and adapters, TN1's genesis and pause keys) is the bridge the nodes switch to: its CREATE2 address
+/// and code hash are `BASE_RETURN_BRIDGE2`'s, its F is the nodes' switch height, its first burn index the table's,
+/// its network this node's.
+/// (A build without a second bridge, the public network's, has nothing to hold: said, and nothing checked.)
+#[test]
+fn bridge2_the_second_test_bridge_deployed_is_the_one_the_nodes_pin() {
+    use jetsam_chain::consensus::destination::state::BASE_RETURN_BRIDGE_ROTATIONS;
+    use jetsam_chain::consensus::params::V1_7_BRIDGE2_HEIGHT;
+    let Some(second) = BASE_RETURN_BRIDGE_ROTATIONS.first() else {
+        assert_eq!(V1_7_BRIDGE2_HEIGHT, None);
+        eprintln!("SKIPPED: this build has no second bridge");
+        return;
+    };
+    assert_eq!(hex(&network_id()), PROFILES[1].network, "only the test chain has a second bridge");
+    let v: Value = serde_json::from_str(include_str!("fixtures/bridge2_deployment_testnet.json")).unwrap();
+    let init = bytes(&v["initCode"]);
+    assert_eq!(hex(&bytes(&v["factory"])), FACTORY);
+    assert_eq!(bytes(&v["salt"]), keccak256(b"jetsam-bridge/v3"));
+    let address = create2(&bytes(&v["factory"]), &bytes(&v["salt"]), &init);
+    assert_eq!(address, bytes(&v["address"]));
+    assert_eq!(address, second.bridge.address.to_vec(), "the nodes' pinned address");
+    assert_eq!(bytes(&v["codeHash"]), second.bridge.code_hash.to_vec(), "the nodes' pinned code hash");
+    let config = &init[init.len() - 9 * 32..];
+    // TN1's adapters around TN1's relay-signed test verifier (TN1_READY_BRIDGE §3)
+    assert_eq!(hex(&as_address(word(config, 0))), "86bdffedb6b4d709da6a463dcebde4b8e5c2647e");
+    assert_eq!(hex(&as_address(word(config, 1))), "bdcc740d18902103e1434d864a99dad3ca4db938");
+    assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
+    assert_eq!(as_u64(word(config, 3)), 10_880, "the genesis window opens above the TN1 bridge's tip of the day");
+    assert_eq!(Some(as_u64(word(config, 4))), V1_7_BRIDGE2_HEIGHT, "the genesis window ends at the switch height");
+    assert_eq!(word(config, 5), &network_id()[..]);
+    assert_eq!(hex(&as_address(word(config, 6))), "fd9aec19a49b71bd38ecf03e4774afb1b0888317", "TN1's genesis key");
+    assert_eq!(hex(&as_address(word(config, 7))), "60d2f7093181e1a47f54d0b4b30efedc5505eaea", "TN1's pause key");
+    assert_eq!(as_u64(word(config, 8)), second.first_burn, "the table's first burn index");
+    assert_eq!(Some(second.height), V1_7_BRIDGE2_HEIGHT);
 }

@@ -271,22 +271,46 @@ impl Mn5Rule {
 /// is `V3Mn5`; any other value, an empty answer (no code there), or an error that is no revert (the endpoint not
 /// read) is no rule — the relayer does not start.
 pub fn mn5_rule_of(answer: &Result<Vec<u8>, String>) -> Result<Mn5Rule, String> {
-    let _ = answer;
-    Ok(Mn5Rule::V3Tn1)
+    match answer {
+        Ok(word) if word.len() == 32 => {
+            if word.as_slice() == u256::to_be(&u256::from_u64(MN5_MAX_ELAPSED)).as_slice() {
+                Ok(Mn5Rule::V3Mn5)
+            } else {
+                Err(format!("MN5_MAX_ELAPSED() = 0x{}: an MN-5 rule this build does not know", hex::encode(word)))
+            }
+        }
+        Ok(word) => Err(format!("MN5_MAX_ELAPSED() answered {} bytes (no bridge at that address?)", word.len())),
+        Err(e) if e.contains("revert") => Ok(Mn5Rule::V3Tn1),
+        Err(e) => Err(format!("MN5_MAX_ELAPSED() not read ({e})")),
+    }
+}
+
+/// BRIDGE2: β = num/den of `v3-mn5` for `mn`: 1/4 when the branch keeps the tip's locked block, else 4/10.
+fn mn5_beta(mn: &Mn) -> (u64, u64) {
+    if mn.locked_on_branch {
+        (1, 4)
+    } else {
+        (4, 10)
+    }
 }
 
 /// MN-5 at L1 time `at` under `rule`: nothing is asked before `elapsed` = 1 800 s; then `V3Tn1`:
 /// `segmentWork × 180 × 10 ≥ 4 × forkBaseWork × elapsed`; `V3Mn5`: with `elapsed` capped at 6 h,
 /// `segmentWork × 180 × 4 ≥ forkBaseWork × elapsed` for a branch that keeps the tip's locked block, else the 4/10.
 pub fn mn5_ok(rule: Mn5Rule, mn: &Mn, at: u64) -> bool {
-    let _ = rule;
     if at < mn.fork_base_timestamp + MN5_MIN_ELAPSED {
         return true;
     }
     let elapsed = at - mn.fork_base_timestamp;
     let seg = u256::from_be(&mn.segment_work);
     let base = u256::from_be(&mn.fork_base_work);
-    u256::mul_ge(&seg, 1_800, &base, 4 * elapsed)
+    match rule {
+        Mn5Rule::V3Tn1 => u256::mul_ge(&seg, 1_800, &base, 4 * elapsed),
+        Mn5Rule::V3Mn5 => {
+            let (num, den) = mn5_beta(mn);
+            u256::mul_ge(&seg, 180 * den, &base, num * elapsed.min(MN5_MAX_ELAPSED))
+        }
+    }
 }
 
 /// M5-2 (audit n°2): the L1 time at which MN-5 is judged when a point is planned: now, the time from the plan to
@@ -302,8 +326,29 @@ pub fn mn5_planned_at(l1_now: u64, timeout_secs: u64, measured_proof_secs: Optio
 /// none (`V3Mn5`: the requirement, capped at 6 h, is met there, and it never grows again). `V3Tn1`:
 /// `forkBaseTimestamp + segmentWork × 1 800 / (4 × forkBaseWork)` (rounded down).
 pub fn mn5_deadline(rule: Mn5Rule, mn: &Mn) -> Option<u64> {
-    let _ = rule;
-    Some(mn5_deadline_v3_tn1(mn))
+    if rule == Mn5Rule::V3Tn1 {
+        return Some(mn5_deadline_v3_tn1(mn));
+    }
+    let base = mn.fork_base_timestamp;
+    // met at the cap: the requirement never grows again, no deadline
+    if mn5_ok(rule, mn, base.saturating_add(MN5_MAX_ELAPSED)) {
+        return None;
+    }
+    let grace_end = base.saturating_add(MN5_MIN_ELAPSED - 1);
+    if !mn5_ok(rule, mn, grace_end + 1) {
+        return Some(grace_end);
+    }
+    // the largest elapsed `e` in [1 800, 21 600) that passes (monotone in `e` below the cap)
+    let (mut ok, mut ko) = (MN5_MIN_ELAPSED, MN5_MAX_ELAPSED);
+    while ko - ok > 1 {
+        let mid = ok + (ko - ok) / 2;
+        if mn5_ok(rule, mn, base + mid) {
+            ok = mid;
+        } else {
+            ko = mid;
+        }
+    }
+    Some(base + ok)
 }
 
 /// [`mn5_deadline`] under `V3Tn1` (M5-2, unchanged).
@@ -335,7 +380,13 @@ fn mn5_deadline_v3_tn1(mn: &Mn) -> u64 {
 /// forkBaseWork × max(min(elapsed, 6 h), 1 800)` with its β = num/den: alerted when a point is planned, long before a
 /// refusal.
 pub fn mn5_margin_low(rule: Mn5Rule, mn: &Mn, at: u64) -> bool {
-    let _ = rule;
+    if rule == Mn5Rule::V3Mn5 {
+        let x = at.saturating_sub(mn.fork_base_timestamp).clamp(MN5_MIN_ELAPSED, MN5_MAX_ELAPSED);
+        let (num, den) = mn5_beta(mn);
+        let seg = u256::from_be(&mn.segment_work);
+        let base = u256::from_be(&mn.fork_base_work);
+        return !u256::mul_ge(&seg, 2 * 180 * den, &base, 3 * num * x);
+    }
     let elapsed = at.saturating_sub(mn.fork_base_timestamp).max(1);
     let seg = u256::from_be(&mn.segment_work);
     let base = u256::from_be(&mn.fork_base_work);

@@ -453,9 +453,8 @@ pub const BURN_RESCAN_BLOCKS: u64 = 900;
 /// FR-4: the burn indices missing below the highest seen, from the bridge's first index (BRIDGE2: `first_burn` of
 /// the bridge in force, `DestinationRules::first_burn`; 0 or 1: the bridge counts from 1).
 pub fn burn_gaps(burns: &BTreeMap<u64, BurnSeen>, first_burn: u64) -> Vec<u64> {
-    let _ = first_burn;
     let top = burns.keys().next_back().copied().unwrap_or(0);
-    (1..top).filter(|n| !burns.contains_key(n)).collect()
+    (first_burn.max(1)..top).filter(|n| !burns.contains_key(n)).collect()
 }
 
 /// BRIDGE2: the fast records the bridge of this run paid (the bridge of `rules`, this build's last): a record another
@@ -463,8 +462,7 @@ pub fn burn_gaps(burns: &BTreeMap<u64, BurnSeen>, first_burn: u64) -> Vec<u64> {
 /// this bridge says nothing of its burn (the nodes refuse its contradiction, `FastRecordOfAnotherBridge`); it expires
 /// at its horizon.
 pub fn records_of_this_bridge(records: Vec<FastPaid>, rules: &jetsam_chain::consensus::destination::state::DestinationRules) -> Vec<FastPaid> {
-    let _ = rules;
-    records
+    records.into_iter().filter(|r| rules.fast_record_under_this_bridge(r.height)).collect()
 }
 
 /// FR-1, FR-5: the `n` each capture asks: every burn seen and every fast record watched, but those settled.

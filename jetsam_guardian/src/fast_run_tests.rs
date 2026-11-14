@@ -1376,6 +1376,12 @@ fn bridge2_a_run_of_the_second_bridge_leaves_the_first_bridges_records() {
     assert_eq!(run.bridge, Some(second));
     assert_eq!(run.first_burn(), 1_000_000);
     assert_eq!(records_of_this_bridge(records.clone(), &run), vec![paid(1_000_000, 12_500)]);
+    // a run of this build below the switch (the first bridge in force) leaves a record the second bridge paid
+    let below = DestinationRules { base_return: jetsam_chain::consensus::destination::state::BaseReturnRules { bridge_rotations: table, ..d.base_return }, ..d }
+        .effective_at(12_479);
+    assert_eq!(below.bridge, Some(first));
+    assert_eq!(below.first_burn(), 0);
+    assert_eq!(records_of_this_bridge(records.clone(), &below), records[..3].to_vec());
     // a build without a second bridge keeps every record, as before
     let before = d.effective_at(u64::MAX);
     assert_eq!(before.bridge, Some(first));
