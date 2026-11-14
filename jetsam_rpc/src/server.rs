@@ -3561,6 +3561,24 @@ impl JetsamApiServer for RpcHandler {
         }
         let mut reply = vault_state(state, tip, &rules, &deposits, held_releases);
         reply.deposit_heights_unread = unread;
+        // RC-5: what one release can pay today from the vault's slots.
+        if let Some(state) = state {
+            let vault = chain
+                .store
+                .get_verified_utxos_by_owner(&rules.vault.vault.0)
+                .map_err(|e| rpc_err(e.to_string()))?;
+            let slots: Vec<jetsam_chain::consensus::vault::VaultSlotRef> = vault
+                .utxos
+                .into_iter()
+                .map(|utxo| jetsam_chain::consensus::vault::VaultSlotRef {
+                    slot_index: utxo.slot_index,
+                    amount: utxo.amount,
+                    creation_id: utxo.creation_id,
+                })
+                .collect();
+            reply.largest_release =
+                jetsam_chain::consensus::vault::largest_payable_release(&slots, state.floor);
+        }
         Ok(reply)
     }
 

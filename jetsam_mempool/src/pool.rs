@@ -2014,11 +2014,15 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
     let forgotten = forgotten + st.destination.prune_fast(&vault.fast);
     // NO-5, NO-7: any intent whose transaction the next block can no longer
     // place as it is — its epoch anchor no longer accepted, an input no
-    // longer live as it spends it, an output slot filled.
+    // longer live as it spends it, an output slot filled. RC-4: a release
+    // whose anchor alone went stale stays (a burn close to the window cap
+    // waits longer than an anchor lives): the template anchors its vault
+    // group again.
     let forgotten = forgotten
-        + st
-            .destination
-            .forget_payments(|payment| !payment_still_applies(payment, view));
+        + st.destination.forget_payments(
+            |payment| !payment_still_applies(payment, view),
+            |payment| !slots_still_apply(payment, view),
+        );
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
@@ -2029,14 +2033,21 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
 /// anchor one that block accepts, every input live as it spends it, every
 /// output slot empty. A slot the view cannot read counts as not applying.
 fn payment_still_applies(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
-    use jetsam_chain::fri_state::SlotValue;
     let (accepted, generation) = view.accepted_user_epoch_anchors();
+    payment
+        .pages
+        .first()
+        .is_some_and(|first| accepted.accepts(first.body.epoch_anchor, generation))
+        && slots_still_apply(payment, view)
+}
+
+/// [`payment_still_applies`] but for the epoch anchor (RC-4: a release's
+/// vault group is anchored again by the template).
+fn slots_still_apply(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
+    use jetsam_chain::fri_state::SlotValue;
     let Some(first) = payment.pages.first() else {
         return false;
     };
-    if !accepted.accepts(first.body.epoch_anchor, generation) {
-        return false;
-    }
     let owner = first.body.input_owner;
     payment.pages.iter().all(|page| {
         page.body.live_inputs().all(|(_, input)| {

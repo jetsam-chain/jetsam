@@ -238,9 +238,58 @@ fn anchor_of(payment: &PagedSpendIntent) -> Option<[u8; 32]> {
     payment.pages.first().map(|page| page.body.epoch_anchor)
 }
 
-/// RC-4: a release's vault group bound to `anchor`.
-pub fn reanchored(_payment: &PagedSpendIntent, _anchor: [u8; 32]) -> Option<PagedSpendIntent> {
-    None
+/// RC-4: `offer` with each release whose payment binds an anchor the block
+/// refuses (`anchor_ok`) bound to the block's `anchor` ([`reanchored`]); a
+/// release that cannot be leaves the offer.
+pub fn with_releases_anchored(
+    mut offer: DestinationOffer,
+    anchor: [u8; 32],
+    anchor_ok: &dyn Fn(&[u8; 32]) -> bool,
+) -> DestinationOffer {
+    offer.releases = offer
+        .releases
+        .into_iter()
+        .filter_map(|mut release| {
+            if !anchor_of(&release.payment).is_some_and(|a| anchor_ok(&a)) {
+                release.payment = reanchored(&release.payment, anchor)?;
+            }
+            Some(release)
+        })
+        .collect();
+    offer
+}
+
+/// RC-4 (audit 13/11): a release's vault group bound to `anchor` — the same
+/// pages but for their epoch anchor, proven again with the vault's published
+/// secret (`VAULT_SECRET`, as every release group is). A burn close to the
+/// window cap waits for the window longer than an anchor lives (33 to 64
+/// blocks, against 480): the template pays it as soon as the window has room,
+/// whoever handed it in and whether or not they hand it in again. `None` for
+/// a group spent from another owner (its secret is not published).
+pub fn reanchored(payment: &PagedSpendIntent, anchor: [u8; 32]) -> Option<PagedSpendIntent> {
+    use jetsam_chain::consensus::vault::{VAULT_ADDRESS, VAULT_SECRET};
+    if payment.pages.is_empty()
+        || payment.pages.iter().any(|page| page.body.input_owner != VAULT_ADDRESS)
+    {
+        return None;
+    }
+    let pages = payment
+        .pages
+        .iter()
+        .map(|page| {
+            let mut body = page.body.clone();
+            body.epoch_anchor = anchor;
+            TxPage::new(body).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let bundle = jetsam_gkr::prove_paged_spend_authorization(
+        &pages,
+        jetsam_gkr::OwnerAuthWitness::new(jetsam_poseidon2b::primitives::SpendSecret::from_bytes(
+            VAULT_SECRET,
+        )),
+    )
+    .ok()?;
+    PagedSpendIntent::new(pages, bundle.to_bytes().ok()?).ok()
 }
 
 /// What the block at `height` after a branch in `state` offers, from the
@@ -397,11 +446,19 @@ fn add_releases(
         if offer.releases.len() >= rules.vault.max_releases_per_block {
             break;
         }
+        // RC-4: an anchor gone stale (a release waiting for the window lives
+        // longer than an anchor) never skips a release: its group spends
+        // only from the vault, whose secret is published, and the template
+        // anchors it again ([`reanchored`]). Another owner's group cannot be.
+        let anchored = anchor_of(&release.payment).is_some_and(|a| anchor_ok(&a))
+            || release
+                .payment
+                .pages
+                .first()
+                .is_some_and(|page| page.body.input_owner == rules.vault.vault);
         // D52, D130: the block's paid set (the branch's, but the `n` a
         // contradiction reopened for one slow release of another burn).
-        if release.check_unpaid(&state.released, &state.fast).is_err()
-            || !anchor_of(&release.payment).is_some_and(|a| anchor_ok(&a))
-        {
+        if release.check_unpaid(&state.released, &state.fast).is_err() || !anchored {
             continue;
         }
         // Over Base only from its height on, paying what V2 asks there.

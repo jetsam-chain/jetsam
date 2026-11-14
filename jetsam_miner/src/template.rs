@@ -591,6 +591,14 @@ impl TemplateBuilder {
             }
             _ => crate::destination_slot::DestinationOffer::default(),
         };
+        // RC-4: a release offered whose payment binds an anchor this block
+        // refuses (it waited for the window longer than an anchor lives) is
+        // bound to this block's anchor with the vault's published secret.
+        let offer = crate::destination_slot::with_releases_anchored(
+            offer,
+            user_epoch_anchor,
+            &|anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation),
+        );
         let offers_destination = !offer.is_empty();
         // v1.7 guardian slot (T3.7): after the destination objects, in the
         // order of T1.1 §10, within the section's objects and bytes.
@@ -1077,7 +1085,9 @@ pub(crate) struct Selections {
 /// 1. everything held (without the guardian objects if they are refused);
 ///    1b. (A2-M1) without the destination objects a destination refusal
 ///    blames ([`crate::destination_slot::retry_without_culprits`]);
-/// 2. without the destination offer; 3. the mempool's selection alone.
+/// 2. without the destination offer — then (NO-4, NO-5) with the offer's
+///    objects not blamed added back one at a time ([`payment_by_payment`]);
+/// 3. the mempool's selection alone; 4. (NO-1, NO-5) the coinbase alone.
 /// `attempt(txs, with_clients, with_destination, with_guardian)` builds and
 /// judges one block; `on_guardian` and `on_client` hear the refusals of the
 /// guardian and client objects. Returns the block built, if any, and what
@@ -1146,17 +1156,24 @@ pub(crate) fn build_with_fallbacks<T>(
             }
             on_client(&refusal);
             report(&refusal, "with its destination objects: built again without them");
-            // 2. Without the destination offer.
+            // 2. Without the destination offer, then (NO-4, NO-5) with its
+            //    objects added back one by one: a payment that no longer
+            //    applies, or that the rule refuses without blaming an
+            //    object, takes only itself out.
             match attempt(s.txs.clone(), true, false, false) {
-                Ok(built) => return (Some(built), blamed),
+                Ok(built) => {
+                    let left = match &blamed {
+                        Some(culprits) => offer.without(culprits),
+                        None => offer.clone(),
+                    };
+                    let built = payment_by_payment(&left, &s.txs, attempt).unwrap_or(built);
+                    return (Some(built), blamed);
+                }
                 Err(refusal) if s.offers_clients => report(
                     &refusal,
                     "with its held client payments: built again without them",
                 ),
-                Err(refusal) => {
-                    report(&refusal, "at its height");
-                    return (None, blamed);
-                }
+                Err(refusal) => report(&refusal, "at its height"),
             }
         }
         // The held client objects make a block the rules refuse:
@@ -1166,19 +1183,72 @@ pub(crate) fn build_with_fallbacks<T>(
             on_client(&refusal);
             report(&refusal, "with its held client payments: built again without them");
         }
-        Err(refusal) => {
-            report(&refusal, "at its height");
-            return (None, blamed);
+        Err(refusal) => report(&refusal, "at its height"),
+    }
+    // 3. The mempool's selection alone (tried already when no client
+    //    payment is held: it is `txs` then).
+    if s.offers_clients {
+        match attempt(s.mempool_txs.clone(), false, false, false) {
+            Ok(built) => return (Some(built), blamed),
+            Err(refusal) => report(&refusal, "with the mempool's selection alone"),
         }
     }
-    // 3. The mempool's selection alone.
-    match attempt(s.mempool_txs.clone(), false, false, false) {
+    // 4. (NO-1, NO-5) The coinbase alone: never no template — a selection
+    //    the chain template cannot build (a pool whose view is not the
+    //    parent's) would otherwise stop this miner until the pool changes.
+    match attempt(Vec::new(), false, false, false) {
         Ok(built) => (Some(built), blamed),
         Err(refusal) => {
-            report(&refusal, "at its height");
+            report(&refusal, "with the coinbase alone");
             (None, blamed)
         }
     }
+}
+
+/// NO-4, NO-5 (audit 13/11): the block of `txs` with the objects of `offer`
+/// added one at a time — committee update, revocation, contradictions,
+/// releases, in the order the planner made the offer — each kept if the
+/// block with it is built and accepted. The last block accepted with at
+/// least one object, if any.
+fn payment_by_payment<T>(
+    offer: &crate::destination_slot::DestinationOffer,
+    txs: &[jetsam_tx::Transaction],
+    attempt: &mut dyn FnMut(Vec<jetsam_tx::Transaction>, bool, bool, bool) -> Result<T, Refusal>,
+) -> Option<T> {
+    use crate::destination_slot::DestinationOffer;
+    let mut steps: Vec<Box<dyn Fn(&mut DestinationOffer)>> = Vec::new();
+    if let Some(update) = &offer.committee_update {
+        let update = update.clone();
+        steps.push(Box::new(move |o| o.committee_update = Some(update.clone())));
+    }
+    if let Some(revocation) = &offer.revocation {
+        let revocation = revocation.clone();
+        steps.push(Box::new(move |o| o.revocation = Some(revocation.clone())));
+    }
+    for contradiction in &offer.contradictions {
+        let contradiction = contradiction.clone();
+        steps.push(Box::new(move |o| o.contradictions.push(contradiction.clone())));
+    }
+    for release in &offer.releases {
+        let release = release.clone();
+        steps.push(Box::new(move |o| o.releases.push(release.clone())));
+    }
+    let mut kept = DestinationOffer::default();
+    let mut built = None;
+    for step in steps {
+        let mut candidate = kept.clone();
+        step(&mut candidate);
+        let mut block = txs.to_vec();
+        block.extend(candidate.payment_order());
+        match attempt(block, true, true, false) {
+            Ok(accepted) => {
+                kept = candidate;
+                built = Some(accepted);
+            }
+            Err(refusal) => report(&refusal, "with this destination object: built without it"),
+        }
+    }
+    built
 }
 
 /// The mempool entries a block at `child_height` may carry: plain

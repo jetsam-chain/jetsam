@@ -2524,33 +2524,37 @@ fn release_shape_ok_refuses_the_fast_lane_tags() {
     assert!(release_shape_ok(&tagged(*b"JTMF0000"), MICRO_PER_JTM, &rules));
 }
 
-/// RC-5 (audit 13/11), the premise: a release travels in one block, and a
-/// group of 1 021 vault inputs fits no template (the builder's own
-/// predicate, which the mempool admits groups by: `NoTemplateCarries`) while
-/// 1 020 fit. A vault made of small deposits cannot pay a burn the contract
-/// accepted (up to 50 000 JTM) if it takes more than its 1 020 largest slots.
+/// RC-5 (audit 13/11), the premise: a release travels in one group, in one
+/// block. A group of 1 020 vault inputs fits a template (the builder's own
+/// predicate, which the mempool admits groups by); a group of 1 021 is no
+/// PagedSpend at all (`TooManyInputs`). A vault made of small deposits cannot
+/// pay a burn the contract accepted (up to 50 000 JTM) if it takes more than
+/// its 1 020 largest slots.
 #[test]
 fn rc5_a_release_group_of_more_than_1020_vault_inputs_fits_no_template() {
     use crate::consensus::params::BLOCK_MAX_LIVE_INPUTS;
     use crate::consensus::template::group_fits_an_empty_template;
     let r = release(3, ALICE, 1_021 * MICRO_PER_JTM);
-    let fits = |count: usize| {
+    let group = |count: usize| {
         let each = r.amount / count as u64;
         let mut inputs = vec![(each, 2_000u64); count];
         inputs[0].0 += r.amount - each * count as u64;
-        let group = group_with_inputs(
+        group_with_inputs(
             100,
             VAULT_ADDRESS,
             &inputs,
             &[(r.owner, r.amount - RF), (r.marker(), 0)],
             RF,
-        );
-        let facts = jetsam_tx::validate_paged_spend(&pages(group.clone())).unwrap();
-        group_fits_an_empty_template(&group, &facts)
+        )
     };
     assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1_020);
-    assert!(fits(1_020));
-    assert!(!fits(1_021));
+    let largest = group(1_020);
+    let facts = jetsam_tx::validate_paged_spend(&pages(largest.clone())).unwrap();
+    assert!(group_fits_an_empty_template(&largest, &facts));
+    assert!(
+        jetsam_tx::validate_paged_spend(&pages(group(1_021))).is_err(),
+        "1 021 inputs: no PagedSpend"
+    );
 }
 
 fn vault_slots(amounts: &[(u64, usize)], first_id: u64) -> Vec<VaultSlotRef> {

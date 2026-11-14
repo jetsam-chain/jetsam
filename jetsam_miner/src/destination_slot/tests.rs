@@ -226,7 +226,7 @@ fn template_includes_due_committee_update() {
 /// Porte R §3.3: releases by increasing `n` among the payable ones, never
 /// jumping one that waits only for the V6 window; at most four; only those
 /// proven under the same finality update as the first; none without a
-/// bridge in the build; nothing already paid or bound to another anchor.
+/// bridge in the build; nothing already paid (an anchor gone stale: RC-4).
 #[test]
 fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
     let mut state = state_at(J + 600);
@@ -271,8 +271,9 @@ fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
             .collect::<Vec<_>>(),
         vec![2, 3, 4, 5]
     );
-    // Paid, another anchor, another finality: skipped (they cannot be in
-    // this block), not waited for.
+    // Paid, another finality: skipped (they cannot be in this block), not
+    // waited for. Another anchor (RC-4): offered — the template anchors its
+    // vault group again.
     let mut other_finality = finality();
     let last = other_finality.len() - 1;
     other_finality[last] ^= 1;
@@ -295,7 +296,7 @@ fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
             .iter()
             .map(|r| r.release.n)
             .collect::<Vec<_>>(),
-        vec![2, 5]
+        vec![2, 4, 5]
     );
     let no_bridge = DestinationRules {
         bridge: None,
@@ -360,17 +361,31 @@ fn the_template_never_jumps_a_release_whose_anchor_went_stale_while_it_waited() 
     assert_eq!(ns(&offer), vec![3]);
 }
 
-/// RC-4: a stale release's vault group anchored again — the same pages but
-/// for the anchor, proven with the vault's published secret: the proof
-/// verifies against the new pages, as the block verifies it. Only a vault
-/// group (any other owner's secret is not published).
+/// RC-4: the offer as the template mines it — a stale release's vault group
+/// anchored again (the same pages but for the anchor, proven with the
+/// vault's published secret: the proof verifies against the new pages, as
+/// the block verifies it), a release bound to an accepted anchor untouched,
+/// a stale group of another owner (its secret is not published) left out.
 #[test]
 fn a_stale_release_is_anchored_again_with_the_vaults_published_secret() {
-    let release = release(2, 5 * MICRO_PER_JTM);
-    let fresh = reanchored(&release.payment, [0x77; 32]).expect("a vault group");
-    assert_eq!(fresh.pages.len(), release.payment.pages.len());
-    for (new, old) in fresh.pages.iter().zip(&release.payment.pages) {
-        assert_eq!(new.body.epoch_anchor, [0x77; 32]);
+    const NEW: [u8; 32] = [0x77; 32];
+    let mut stale = release(2, 5 * MICRO_PER_JTM);
+    stale.payment.pages[0].body.epoch_anchor = [9u8; 32];
+    let mut foreign = release(3, 5 * MICRO_PER_JTM);
+    foreign.payment.pages[0].body.epoch_anchor = [9u8; 32];
+    foreign.payment.pages[0].body.input_owner = Address([0x51; 32]);
+    let accepted = release(4, 5 * MICRO_PER_JTM);
+    let offer = DestinationOffer {
+        releases: vec![stale.clone(), foreign.clone(), accepted.clone()],
+        ..DestinationOffer::default()
+    };
+    let mined = with_releases_anchored(offer, NEW, &|anchor| *anchor == ANCHOR);
+    assert_eq!(ns(&mined), vec![2, 4], "the foreign stale group left out");
+    assert_eq!(mined.releases[1], accepted, "an accepted anchor: untouched");
+    let fresh = &mined.releases[0].payment;
+    assert_eq!(fresh.pages.len(), stale.payment.pages.len());
+    for (new, old) in fresh.pages.iter().zip(&stale.payment.pages) {
+        assert_eq!(new.body.epoch_anchor, NEW);
         let mut body = new.body.clone();
         body.epoch_anchor = old.body.epoch_anchor;
         assert_eq!(body, old.body, "nothing else changes");
@@ -379,9 +394,7 @@ fn a_stale_release_is_anchored_again_with_the_vaults_published_secret() {
         .expect("a bundle");
     jetsam_gkr::verify_paged_spend_authorization(&fresh.pages, &bundle)
         .expect("the vault's proof verifies against the new pages");
-    let mut foreign = release.payment.clone();
-    foreign.pages[0].body.input_owner = Address([0x51; 32]);
-    assert!(reanchored(&foreign, [0x77; 32]).is_none());
+    assert!(reanchored(&foreign.payment, NEW).is_none());
 }
 
 /// The 0xC2 section holds 32 objects in all (T2.2): what the template adds
