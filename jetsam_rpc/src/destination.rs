@@ -171,6 +171,12 @@ pub struct VaultStateResponse {
     /// Heights of the last 1 024 at or above J whose block this node no
     /// longer retains: their deposits are not in the count.
     pub deposit_heights_unread: u64,
+    /// RC-5 (audit 13/11): the largest burn one release can pay today, from
+    /// the vault's slots (µJTM; `largest_payable_release`: at most its 1 020
+    /// largest slots a release may spend). A burn above it waits until
+    /// releases regroup the vault. 0 below J.
+    #[serde(default)]
+    pub largest_release: u64,
 }
 
 /// The `getVaultState` reply from the tip's destination state (`None` below
@@ -212,6 +218,7 @@ pub fn vault_state(
         deposits_by_height,
         held_releases,
         deposit_heights_unread: 0,
+        largest_release: 0,
     }
 }
 

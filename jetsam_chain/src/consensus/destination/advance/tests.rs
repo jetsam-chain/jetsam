@@ -948,3 +948,34 @@ fn every_advance_refusal_condemns_the_block() {
         assert!(error.condemns_block());
     }
 }
+
+/// RC-8 (audit 13/11): the release predicate of the mempool, the robots and
+/// the CLI (`release_shape_ok`) now refuses the fast lane's two tags; the
+/// payees the advance rule accepts (`payable`, a block rule) are those of
+/// e14789a: refusing those tags there would change which blocks are valid
+/// (an advance paying zero to a fast-lane marker the block's objects open),
+/// a rule for an activation height. Every other payee is judged alike.
+#[test]
+fn rc8_the_advance_rule_keeps_its_payees_while_the_release_predicate_refuses_the_fast_lane_tags() {
+    use crate::consensus::destination::fast::{
+        FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG,
+    };
+    use crate::consensus::vault::release_shape_ok;
+    let tagged = |tag: [u8; 8]| {
+        let mut owner = [0x55u8; 32];
+        owner[..8].copy_from_slice(&tag);
+        Address(owner)
+    };
+    let vault = vault();
+    for tag in [FAST_CONTRADICTION_MARKER_TAG, FAST_REVOCATION_MARKER_TAG] {
+        assert!(payable(&tagged(tag), &vault, advance_marker_kind), "{tag:?}: the block rule of e14789a");
+        assert!(!release_shape_ok(&tagged(tag), vault.release_fee, &vault), "{tag:?}: never released");
+    }
+    for owner in [ALICE, BOB, VAULT_ADDRESS, tagged(*b"JTMVRL01"), tagged(*b"JTMX0000")] {
+        assert_eq!(
+            payable(&owner, &vault, advance_marker_kind),
+            release_shape_ok(&owner, vault.release_fee, &vault),
+            "{owner:?}"
+        );
+    }
+}

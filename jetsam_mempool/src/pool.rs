@@ -2014,11 +2014,15 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
     let forgotten = forgotten + st.destination.prune_fast(&vault.fast);
     // NO-5, NO-7: any intent whose transaction the next block can no longer
     // place as it is — its epoch anchor no longer accepted, an input no
-    // longer live as it spends it, an output slot filled.
+    // longer live as it spends it, an output slot filled. RC-4: a release
+    // whose anchor alone went stale stays (a burn close to the window cap
+    // waits longer than an anchor lives): the template anchors its vault
+    // group again.
     let forgotten = forgotten
-        + st
-            .destination
-            .forget_payments(|payment| !payment_still_applies(payment, view));
+        + st.destination.forget_payments(
+            |payment| !payment_still_applies(payment, view),
+            |payment| !slots_still_apply(payment, view),
+        );
     if forgotten > 0 {
         tracing::debug!(forgotten, "destination intents the branch no longer needs");
     }
@@ -2029,14 +2033,21 @@ fn prune_destination(st: &mut MempoolState, next_height: u64) {
 /// anchor one that block accepts, every input live as it spends it, every
 /// output slot empty. A slot the view cannot read counts as not applying.
 fn payment_still_applies(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
-    use jetsam_chain::fri_state::SlotValue;
     let (accepted, generation) = view.accepted_user_epoch_anchors();
+    payment
+        .pages
+        .first()
+        .is_some_and(|first| accepted.accepts(first.body.epoch_anchor, generation))
+        && slots_still_apply(payment, view)
+}
+
+/// [`payment_still_applies`] but for the epoch anchor (RC-4: a release's
+/// vault group is anchored again by the template).
+fn slots_still_apply(payment: &jetsam_tx::PagedSpendIntent, view: &ChainView) -> bool {
+    use jetsam_chain::fri_state::SlotValue;
     let Some(first) = payment.pages.first() else {
         return false;
     };
-    if !accepted.accepts(first.body.epoch_anchor, generation) {
-        return false;
-    }
     let owner = first.body.input_owner;
     payment.pages.iter().all(|page| {
         page.body.live_inputs().all(|(_, input)| {
@@ -4570,10 +4581,14 @@ mod tests {
         assert!(pool.destination_candidates().await.0.is_empty(), "its input is spent");
     }
 
-    /// NO-7 (audit 13/11): a held intent whose transaction binds an epoch
-    /// anchor the next block no longer accepts is forgotten: never offered,
-    /// it used to hold one of the 64 places until something else removed it
-    /// (64 of them and every later release was refused `Full`).
+    /// NO-7 (audit 13/11), RC-4: a held intent whose transaction binds an
+    /// epoch anchor the next block no longer accepts used to hold one of the
+    /// 64 places, never offered (64 of them and every later release was
+    /// refused `Full`). A release is no longer dead then: its group spends
+    /// only from the vault, whose secret is published, and the template
+    /// anchors it again (RC-4: a burn close to the window cap waits longer
+    /// than an anchor lives) — it stays held, in its place. Any other intent
+    /// is forgotten (`a_committee_update_whose_anchor_went_stale_is_forgotten`).
     #[tokio::test]
     async fn destination_intents_with_a_stale_anchor_are_forgotten() {
         use jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
@@ -4589,7 +4604,77 @@ mod tests {
         let anchor = case.intent.payment().pages[0].body.epoch_anchor;
         assert!(!accepted.accepts(anchor, generation), "the premise: a stale anchor");
         pool.update_chain_view(view).await;
+        assert_eq!(
+            pool.destination_candidates().await.1.len(),
+            1,
+            "a release stays held: the template anchors its vault group again"
+        );
+        // Its input spent meanwhile: no longer buildable, forgotten (NO-5).
+        let mut spent = case.state.clone();
+        spent.state.set_slot(7, SlotValue::EMPTY).unwrap();
+        let after = ReleaseCase {
+            state: spent,
+            intent: case.intent.clone(),
+            n: case.n,
+        };
+        pool.update_chain_view(after.view_at(later + 1, &[])).await;
         assert!(pool.destination_candidates().await.1.is_empty(), "forgotten");
+    }
+
+    /// NO-7: a committee update whose payment binds a stale anchor is
+    /// forgotten (its payment is its author's, which no node can sign again).
+    #[tokio::test]
+    async fn a_committee_update_whose_anchor_went_stale_is_forgotten() {
+        use jetsam_chain::consensus::destination::state::committee_update_marker;
+        use jetsam_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let tip = CROSSING_J + 20;
+        let payload = crate::destination::tests::committee_update_payload();
+        let marker = committee_update_marker(&payload);
+        let case = VaultCase::new(
+            tip,
+            Address([0xA5; 32]),
+            &[(Address([0x42; 32]), 10), (marker, 0)],
+        );
+        let next = jetsam_chain::consensus::destination::ssz::LightClientUpdate::decode_payload(
+            &payload,
+        )
+        .unwrap()
+        .next_sync_committee
+        .hash_tree_root();
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules {
+            activation_height: Some(CROSSING_J),
+            anchor: Some(jetsam_chain::consensus::destination::state::L1Anchor {
+                period: 1_895,
+                committee_root: next,
+            }),
+            vault: armed_vault_rules(),
+            ..jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS
+        };
+        let view_at = |height: u64| {
+            let mut view = case.view_at(height, 0);
+            view.destination_rules = rules;
+            view
+        };
+        let pool = ReleaseCase::pool_on(view_at(tip));
+        let intent = crate::destination::DestinationIntent::CommitteeUpdate(
+            crate::destination::CommitteeUpdateIntent {
+                payload,
+                payment: case.intent.clone(),
+            },
+        );
+        pool.submit_destination(&intent.encode().unwrap())
+            .await
+            .expect("a committee update with its payment");
+        pool.update_chain_view(view_at(tip + 1)).await;
+        assert_eq!(pool.destination_candidates().await.0.len(), 1, "its anchor still accepted");
+        let later = view_at(tip + 3 * TX_EPOCH_BLOCKS);
+        let (accepted, generation) = later.accepted_user_epoch_anchors();
+        assert!(
+            !accepted.accepts(case.intent.pages[0].body.epoch_anchor, generation),
+            "the premise: a stale anchor"
+        );
+        pool.update_chain_view(later).await;
+        assert!(pool.destination_candidates().await.0.is_empty(), "forgotten");
     }
 
     /// A committee update with the transaction that pays for it (its

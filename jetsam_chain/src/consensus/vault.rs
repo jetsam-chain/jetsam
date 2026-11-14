@@ -981,11 +981,26 @@ pub fn check_plain_vault_transaction(
 
 /// Whether a burn `(owner, amount)` has a shape a block can ever pay (the
 /// porte R's causes 1-6): not the vault, not one of the 13 marker tags
-/// (destination, guardians, clients), not one of the guardians' two pools,
-/// and `RELEASE_FEE ≤ amount ≤` the window cap. The mempool refuses a release
-/// of any other shape at admission (T2.5); the CLI warns with it. `rules` are
-/// those of the block (D123: [`VaultRules::at`] its height).
+/// (destination, guardians, clients) nor the fast lane's two (RC-8: from the
+/// return over Base on, the block rule refuses any output carrying one with
+/// value), not one of the guardians' two pools, and `RELEASE_FEE ≤ amount ≤`
+/// the window cap. The mempool refuses a release of any other shape at
+/// admission (T2.5); the robots and the CLI check with it. `rules` are those
+/// of the block (D123: [`VaultRules::at`] its height). Node policy: no block
+/// rule reads it (the advance rule reads [`payee_shape_ok`]).
 pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
+    crate::consensus::destination::fast::fast_marker_kind(owner).is_none()
+        && payee_shape_ok(owner, amount, rules)
+}
+
+/// [`release_shape_ok`] but for the fast lane's two tags: the payees the
+/// advance rule accepts (a block rule, `advance::payable`), unchanged since
+/// the return over Base. RC-8: refusing those two tags there too would change
+/// the validity of a block (an advance paying zero to a fast-lane marker the
+/// block's own objects open, accepted today): a block rule, left for an
+/// activation height; every block paying such an owner with value is refused
+/// already (`FastMarkerCarriesValue`, before the advances).
+pub(crate) fn payee_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> bool {
     use crate::consensus::client_objects::{
         CLIENT_BATCH_SUBMISSION_MARKER_TAG, CLIENT_REGISTRATION_MARKER_TAG,
         CLIENT_SUBMISSION_MARKER_TAG,
@@ -1006,6 +1021,121 @@ pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> boo
         && *owner != REWARD_POOL
         && amount >= rules.release_fee
         && amount <= rules.window_cap
+}
+
+/// RC-5 (audit 13/11): one slot of the vault, as a release group spends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaultSlotRef {
+    pub slot_index: u32,
+    pub amount: u64,
+    pub creation_id: u64,
+}
+
+/// RC-5: the segments a release group's inputs may touch: the template
+/// places a group beside the coinbase within `BLOCK_MAX_DISTINCT_SEGMENTS`
+/// (`template::group_fits_an_empty_template`), the coinbase's segment and
+/// its three outputs' (payee, marker, change) reserved.
+const RELEASE_INPUT_SEGMENTS: usize =
+    crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS - 4;
+
+/// RC-5: the inputs of one release group as they are picked: at most
+/// `BLOCK_MAX_LIVE_INPUTS`, over at most [`RELEASE_INPUT_SEGMENTS`].
+#[derive(Default)]
+struct ReleaseInputs {
+    picked: Vec<VaultSlotRef>,
+    segments: std::collections::BTreeSet<u32>,
+    total: u64,
+}
+
+impl ReleaseInputs {
+    fn full(&self) -> bool {
+        self.picked.len() >= crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
+    }
+
+    /// Adds `slot` if the group still holds it.
+    fn add(&mut self, slot: VaultSlotRef) -> bool {
+        let segment = slot.slot_index >> crate::consensus::params::LOG_SEGMENT_SIZE;
+        if self.full()
+            || (!self.segments.contains(&segment) && self.segments.len() >= RELEASE_INPUT_SEGMENTS)
+        {
+            return false;
+        }
+        self.segments.insert(segment);
+        self.total = self.total.saturating_add(slot.amount);
+        self.picked.push(slot);
+        true
+    }
+}
+
+/// The slots of `slots` a release may spend (V1-b: created after `floor`,
+/// not by a coinbase), largest first.
+fn spendable_largest_first(slots: &[VaultSlotRef], floor: u64) -> Vec<VaultSlotRef> {
+    let mut spendable: Vec<VaultSlotRef> = slots
+        .iter()
+        .copied()
+        .filter(|s| s.creation_id > floor && !is_coinbase_creation_id(s.creation_id))
+        .collect();
+    spendable.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.slot_index.cmp(&b.slot_index)));
+    spendable
+}
+
+/// RC-5: the largest burn one release can pay in one block from the vault
+/// `slots`: the sum of the largest slots a release may spend (V1-b: created
+/// after `floor`, not by a coinbase) that one release group holds as the
+/// template places it — at most `BLOCK_MAX_LIVE_INPUTS` (1 020) of them.
+/// The contract accepts burns up to the window cap: a vault made of small
+/// deposits pays less than its balance in one release.
+pub fn largest_payable_release(slots: &[VaultSlotRef], floor: u64) -> u64 {
+    let mut group = ReleaseInputs::default();
+    for slot in spendable_largest_first(slots, floor) {
+        if group.full() {
+            break;
+        }
+        group.add(slot);
+    }
+    group.total
+}
+
+/// RC-5: the slots a release of `amount` spends from the vault `slots`,
+/// regrouping the vault as it goes: the largest it may spend until `amount`
+/// is covered, then the smallest left while the release fee `R` still pays
+/// for every input ([`VaultRules::release_fee_for`] with three outputs: 929
+/// inputs today), their sum going back to the vault as the group's one
+/// change. The payee receives `amount − R` either way; each release merges
+/// that much of the dust a vault of small deposits is made of, and the burns
+/// one release can pay ([`largest_payable_release`]) grow. `None` if no
+/// release group covers `amount`.
+pub fn release_inputs_regrouping(
+    slots: &[VaultSlotRef],
+    floor: u64,
+    amount: u64,
+    rules: &VaultRules,
+) -> Option<Vec<VaultSlotRef>> {
+    let mut group = ReleaseInputs::default();
+    let mut left = Vec::new();
+    let mut spendable = spendable_largest_first(slots, floor).into_iter();
+    while group.total < amount {
+        let slot = spendable.next()?;
+        if !group.add(slot) {
+            if group.full() {
+                return None;
+            }
+            left.push(slot);
+        }
+    }
+    left.extend(spendable);
+    left.sort_by(|a, b| a.amount.cmp(&b.amount).then(a.slot_index.cmp(&b.slot_index)));
+    let paid_for = (rules
+        .release_fee
+        .saturating_sub(MIN_FEE_BASE + 3 * FEE_PER_OUTPUT)
+        / FEE_PER_INPUT) as usize;
+    for slot in left {
+        if group.picked.len() >= paid_for {
+            break;
+        }
+        group.add(slot);
+    }
+    Some(group.picked)
 }
 
 /// The release group a mempool admits with its release object (T2.5): what

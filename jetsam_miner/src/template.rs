@@ -591,6 +591,14 @@ impl TemplateBuilder {
             }
             _ => crate::destination_slot::DestinationOffer::default(),
         };
+        // RC-4: a release offered whose payment binds an anchor this block
+        // refuses (it waited for the window longer than an anchor lives) is
+        // bound to this block's anchor with the vault's published secret.
+        let offer = crate::destination_slot::with_releases_anchored(
+            offer,
+            user_epoch_anchor,
+            &|anchor: &[u8; 32]| user_epoch_anchors.accepts(*anchor, child_generation),
+        );
         let offers_destination = !offer.is_empty();
         // v1.7 guardian slot (T3.7): after the destination objects, in the
         // order of T1.1 §10, within the section's objects and bytes.
@@ -888,16 +896,10 @@ impl TemplateBuilder {
                 )
                 .map(|_| ())
             };
-            enum Refusal {
-                Build(String),
-                Client(jetsam_chain::consensus::client_objects::ClientObjectError),
-                Destination(jetsam_chain::consensus::destination::state::DestinationBlockError),
-                Guardian(jetsam_chain::consensus::guardian::GuardianError),
-            }
-            let attempt = |txs: Vec<jetsam_tx::Transaction>,
-                           with_clients: bool,
-                           with_destination: bool,
-                           with_guardian: bool| {
+            let mut attempt = |txs: Vec<jetsam_tx::Transaction>,
+                               with_clients: bool,
+                               with_destination: bool,
+                               with_guardian: bool| {
                 let built = build(txs).map_err(|error| Refusal::Build(format!("{error:?}")))?;
                 let slot = judged(&built.0, with_clients).map_err(Refusal::Client)?;
                 let section = judged_destination(&built.0, with_destination, with_guardian)
@@ -905,31 +907,24 @@ impl TemplateBuilder {
                 judged_guardian(&built.0, section.as_ref()).map_err(Refusal::Guardian)?;
                 Ok::<_, Refusal>((built, slot, section))
             };
-            let report = |refusal: &Refusal, what: &str| match refusal {
-                Refusal::Build(error) => tracing::warn!(%error, "template build failed {what}"),
-                Refusal::Client(error) => {
-                    tracing::warn!(%error, "template refused by the client-object rules {what}")
-                }
-                Refusal::Destination(error) => {
-                    tracing::warn!(%error, "template refused by the destination rules {what}")
-                }
-                Refusal::Guardian(error) => {
-                    tracing::warn!(%error, "template refused by the guardian rules {what}")
-                }
+            let selections = Selections {
+                txs: txs.clone(),
+                mempool_txs,
+                destination_txs: destination_txs.clone(),
+                guardian_txs: guardian_txs.clone(),
+                offers_clients,
+                offers_destination,
+                offers_guardian,
             };
-            // 1. Everything held: client payments and the destination offer.
-            let mut everything = txs.clone();
-            everything.extend(destination_txs.iter().cloned());
-            let mut with_guardian = everything.clone();
-            with_guardian.extend(guardian_txs.iter().cloned());
-            let first = match attempt(with_guardian, true, offers_destination, offers_guardian) {
-                Ok(built) => return Some(built),
-                // v1.7 (T3.7): the guardian objects make a block the rules
-                // refuse, or one of their transactions no longer applies:
-                // the block goes out without them, and what the refusal
-                // blames is forgotten.
-                Err(refusal) if offers_guardian => {
-                    if let (Refusal::Guardian(error), Some(parent_state)) = (&refusal, guardian_state)
+            let (built, culprits) = build_with_fallbacks(
+                &selections,
+                offer_ref,
+                &destination_rules.vault,
+                &mut attempt,
+                &mut |refusal| {
+                    // v1.7 (T3.7): what a guardian refusal blames is
+                    // forgotten.
+                    if let (Refusal::Guardian(error), Some(parent_state)) = (refusal, guardian_state)
                     {
                         guardian_blamed = crate::guardian_slot::culprits_of(
                             error,
@@ -940,98 +935,19 @@ impl TemplateBuilder {
                             &guardian_rules,
                         );
                     }
-                    report(
-                        &refusal,
-                        "with its guardian objects: built again without them",
-                    );
-                    attempt(everything, true, offers_destination, false)
-                }
-                Err(refusal) => Err(refusal),
-            };
-            match first {
-                Ok(built) => return Some(built),
-                // The destination objects make a block the rules refuse, or
-                // one of their transactions no longer applies: the block goes
-                // out without them, and what the refusal blames is forgotten.
-                Err(refusal) if offers_destination => {
-                    if let Refusal::Destination(error) = &refusal {
-                        report(
-                            &refusal,
-                            "with its destination objects: built again without the ones it blames",
-                        );
-                        // 1b. (A2-M1) Without what the refusal blames, before
-                        // the whole offer is given up: one bad release no
-                        // longer takes the others out of the block.
-                        let (built, culprits) = crate::destination_slot::retry_without_culprits(
-                            offer_ref,
-                            error,
-                            &destination_rules.vault,
-                            |reduced| {
-                                let mut retry = txs.clone();
-                                retry.extend(reduced.payment_order());
-                                attempt(retry, true, true, false).map_err(|refusal| match refusal {
-                                    Refusal::Destination(error) => Some(error),
-                                    other => {
-                                        report(&other, "without the destination objects it blamed");
-                                        None
-                                    }
-                                })
-                            },
-                        );
-                        blamed = Some(culprits);
-                        if let Some(built) = built {
-                            return Some(built);
-                        }
-                    }
+                },
+                &mut |refusal| {
+                    // An offered batch the client rules refuse is not offered
+                    // again.
                     if let (Refusal::Client(_), Some(batch), Some(source)) =
-                        (&refusal, &offered_batch, &self.client_source)
+                        (refusal, &offered_batch, &self.client_source)
                     {
                         source.forget_batch(&batch.submission);
                     }
-                    report(
-                        &refusal,
-                        "with its destination objects: built again without them",
-                    );
-                    // 2. Without the destination offer.
-                    match attempt(txs.clone(), true, false, false) {
-                        Ok(built) => return Some(built),
-                        Err(refusal) if offers_clients => report(
-                            &refusal,
-                            "with its held client payments: built again without them",
-                        ),
-                        Err(refusal) => {
-                            report(&refusal, "at its height");
-                            return None;
-                        }
-                    }
-                }
-                // The held client objects make a block the rules refuse:
-                // the block goes out without them rather than not at all,
-                // and an offered batch is not offered again.
-                Err(refusal) if offers_clients => {
-                    if let (Refusal::Client(_), Some(batch), Some(source)) =
-                        (&refusal, &offered_batch, &self.client_source)
-                    {
-                        source.forget_batch(&batch.submission);
-                    }
-                    report(
-                        &refusal,
-                        "with its held client payments: built again without them",
-                    );
-                }
-                Err(refusal) => {
-                    report(&refusal, "at its height");
-                    return None;
-                }
-            }
-            // 3. The mempool's selection alone.
-            match attempt(mempool_txs, false, false, false) {
-                Ok(built) => Some(built),
-                Err(refusal) => {
-                    report(&refusal, "at its height");
-                    None
-                }
-            }
+                },
+            );
+            blamed = culprits;
+            built
         });
         if !guardian_blamed.is_empty() {
             self.mempool.forget_guardian(&guardian_blamed).await;
@@ -1123,6 +1039,216 @@ impl TemplateBuilder {
             destination,
         })
     }
+}
+
+/// Why a template's attempt at a block failed: the chain template could not
+/// build it (a group that no longer applies to the parent's state, ...), or
+/// the rules its block is judged by refused it.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    Build(String),
+    Client(jetsam_chain::consensus::client_objects::ClientObjectError),
+    Destination(jetsam_chain::consensus::destination::state::DestinationBlockError),
+    Guardian(jetsam_chain::consensus::guardian::GuardianError),
+}
+
+fn report(refusal: &Refusal, what: &str) {
+    match refusal {
+        Refusal::Build(error) => tracing::warn!(%error, "template build failed {what}"),
+        Refusal::Client(error) => {
+            tracing::warn!(%error, "template refused by the client-object rules {what}")
+        }
+        Refusal::Destination(error) => {
+            tracing::warn!(%error, "template refused by the destination rules {what}")
+        }
+        Refusal::Guardian(error) => {
+            tracing::warn!(%error, "template refused by the guardian rules {what}")
+        }
+    }
+}
+
+/// What a template may put in its block: the mempool's selection with the
+/// held client payments (`txs`), the selection alone, the destination
+/// offer's and the guardian offer's transactions, and whether it offers
+/// client objects, destination objects, guardian objects.
+pub(crate) struct Selections {
+    pub txs: Vec<jetsam_tx::Transaction>,
+    pub mempool_txs: Vec<jetsam_tx::Transaction>,
+    pub destination_txs: Vec<jetsam_tx::Transaction>,
+    pub guardian_txs: Vec<jetsam_tx::Transaction>,
+    pub offers_clients: bool,
+    pub offers_destination: bool,
+    pub offers_guardian: bool,
+}
+
+/// The blocks a template tries, in order, until one is built and accepted:
+/// 1. everything held (without the guardian objects if they are refused);
+///    1b. (A2-M1) without the destination objects a destination refusal
+///    blames ([`crate::destination_slot::retry_without_culprits`]);
+/// 2. without the destination offer — then (NO-4, NO-5) with the offer's
+///    objects not blamed added back one at a time ([`payment_by_payment`]);
+/// 3. the mempool's selection alone; 4. (NO-1, NO-5) the coinbase alone.
+/// `attempt(txs, with_clients, with_destination, with_guardian)` builds and
+/// judges one block; `on_guardian` and `on_client` hear the refusals of the
+/// guardian and client objects. Returns the block built, if any, and what
+/// destination refusals blamed (for the pool to forget).
+pub(crate) fn build_with_fallbacks<T>(
+    s: &Selections,
+    offer: &crate::destination_slot::DestinationOffer,
+    vault_rules: &jetsam_chain::consensus::vault::VaultRules,
+    attempt: &mut dyn FnMut(Vec<jetsam_tx::Transaction>, bool, bool, bool) -> Result<T, Refusal>,
+    on_guardian: &mut dyn FnMut(&Refusal),
+    on_client: &mut dyn FnMut(&Refusal),
+) -> (Option<T>, Option<crate::destination_slot::Culprits>) {
+    let mut blamed = None;
+    // 1. Everything held: client payments and the destination offer.
+    let mut everything = s.txs.clone();
+    everything.extend(s.destination_txs.iter().cloned());
+    let mut with_guardian = everything.clone();
+    with_guardian.extend(s.guardian_txs.iter().cloned());
+    let first = match attempt(with_guardian, true, s.offers_destination, s.offers_guardian) {
+        Ok(built) => return (Some(built), blamed),
+        // v1.7 (T3.7): the guardian objects make a block the rules
+        // refuse, or one of their transactions no longer applies:
+        // the block goes out without them, and what the refusal
+        // blames is forgotten.
+        Err(refusal) if s.offers_guardian => {
+            on_guardian(&refusal);
+            report(&refusal, "with its guardian objects: built again without them");
+            attempt(everything, true, s.offers_destination, false)
+        }
+        Err(refusal) => Err(refusal),
+    };
+    match first {
+        Ok(built) => return (Some(built), blamed),
+        // The destination objects make a block the rules refuse, or
+        // one of their transactions no longer applies: the block goes
+        // out without them, and what the refusal blames is forgotten.
+        Err(refusal) if s.offers_destination => {
+            if let Refusal::Destination(error) = &refusal {
+                report(
+                    &refusal,
+                    "with its destination objects: built again without the ones it blames",
+                );
+                // 1b. (A2-M1) Without what the refusal blames, before
+                // the whole offer is given up: one bad release no
+                // longer takes the others out of the block.
+                let (built, culprits) = crate::destination_slot::retry_without_culprits(
+                    offer,
+                    error,
+                    vault_rules,
+                    |reduced| {
+                        let mut retry = s.txs.clone();
+                        retry.extend(reduced.payment_order());
+                        attempt(retry, true, true, false).map_err(|refusal| match refusal {
+                            Refusal::Destination(error) => Some(error),
+                            other => {
+                                report(&other, "without the destination objects it blamed");
+                                None
+                            }
+                        })
+                    },
+                );
+                blamed = Some(culprits);
+                if let Some(built) = built {
+                    return (Some(built), blamed);
+                }
+            }
+            on_client(&refusal);
+            report(&refusal, "with its destination objects: built again without them");
+            // 2. Without the destination offer, then (NO-4, NO-5) with its
+            //    objects added back one by one: a payment that no longer
+            //    applies, or that the rule refuses without blaming an
+            //    object, takes only itself out.
+            match attempt(s.txs.clone(), true, false, false) {
+                Ok(built) => {
+                    let left = match &blamed {
+                        Some(culprits) => offer.without(culprits),
+                        None => offer.clone(),
+                    };
+                    let built = payment_by_payment(&left, &s.txs, attempt).unwrap_or(built);
+                    return (Some(built), blamed);
+                }
+                Err(refusal) if s.offers_clients => report(
+                    &refusal,
+                    "with its held client payments: built again without them",
+                ),
+                Err(refusal) => report(&refusal, "at its height"),
+            }
+        }
+        // The held client objects make a block the rules refuse:
+        // the block goes out without them rather than not at all,
+        // and an offered batch is not offered again.
+        Err(refusal) if s.offers_clients => {
+            on_client(&refusal);
+            report(&refusal, "with its held client payments: built again without them");
+        }
+        Err(refusal) => report(&refusal, "at its height"),
+    }
+    // 3. The mempool's selection alone (tried already when no client
+    //    payment is held: it is `txs` then).
+    if s.offers_clients {
+        match attempt(s.mempool_txs.clone(), false, false, false) {
+            Ok(built) => return (Some(built), blamed),
+            Err(refusal) => report(&refusal, "with the mempool's selection alone"),
+        }
+    }
+    // 4. (NO-1, NO-5) The coinbase alone: never no template — a selection
+    //    the chain template cannot build (a pool whose view is not the
+    //    parent's) would otherwise stop this miner until the pool changes.
+    match attempt(Vec::new(), false, false, false) {
+        Ok(built) => (Some(built), blamed),
+        Err(refusal) => {
+            report(&refusal, "with the coinbase alone");
+            (None, blamed)
+        }
+    }
+}
+
+/// NO-4, NO-5 (audit 13/11): the block of `txs` with the objects of `offer`
+/// added one at a time — committee update, revocation, contradictions,
+/// releases, in the order the planner made the offer — each kept if the
+/// block with it is built and accepted. The last block accepted with at
+/// least one object, if any.
+fn payment_by_payment<T>(
+    offer: &crate::destination_slot::DestinationOffer,
+    txs: &[jetsam_tx::Transaction],
+    attempt: &mut dyn FnMut(Vec<jetsam_tx::Transaction>, bool, bool, bool) -> Result<T, Refusal>,
+) -> Option<T> {
+    use crate::destination_slot::DestinationOffer;
+    let mut steps: Vec<Box<dyn Fn(&mut DestinationOffer)>> = Vec::new();
+    if let Some(update) = &offer.committee_update {
+        let update = update.clone();
+        steps.push(Box::new(move |o| o.committee_update = Some(update.clone())));
+    }
+    if let Some(revocation) = &offer.revocation {
+        let revocation = revocation.clone();
+        steps.push(Box::new(move |o| o.revocation = Some(revocation.clone())));
+    }
+    for contradiction in &offer.contradictions {
+        let contradiction = contradiction.clone();
+        steps.push(Box::new(move |o| o.contradictions.push(contradiction.clone())));
+    }
+    for release in &offer.releases {
+        let release = release.clone();
+        steps.push(Box::new(move |o| o.releases.push(release.clone())));
+    }
+    let mut kept = DestinationOffer::default();
+    let mut built = None;
+    for step in steps {
+        let mut candidate = kept.clone();
+        step(&mut candidate);
+        let mut block = txs.to_vec();
+        block.extend(candidate.payment_order());
+        match attempt(block, true, true, false) {
+            Ok(accepted) => {
+                kept = candidate;
+                built = Some(accepted);
+            }
+            Err(refusal) => report(&refusal, "with this destination object: built without it"),
+        }
+    }
+    built
 }
 
 /// The mempool entries a block at `child_height` may carry: plain
@@ -1600,6 +1726,95 @@ mod tests {
             check_template_client_objects(&below_j, &[], &parent, &registry, &rules),
             Ok(())
         );
+    }
+
+    /// NO-1, NO-5 (b) (audit 13/11), end to end: a real MDBX store at genesis,
+    /// its template snapshot, a real pool whose view is not the snapshot's
+    /// (it saw a block the miner's parent does not have: the transaction it
+    /// admitted spends a slot that is empty at the parent). The chain
+    /// template cannot build the selection; with nothing else held, the
+    /// template used to be `None` (and the miner retried the same selection
+    /// every second, no block at all). It now mines the coinbase alone.
+    #[tokio::test]
+    async fn a_template_whose_selection_never_builds_mines_the_coinbase_alone() {
+        use jetsam_chain::fri_state::SlotValue;
+        use jetsam_tx::{
+            output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+        };
+        // The template's CPU phase runs on the process pool, as in the node
+        // (unconfigured, the phase itself fails closed: no template).
+        let _ = crate::configure_process_cpu_budget_with_threads(
+            crate::ProcessCpuBudgetMode::ProofOnly,
+            Some(2),
+        );
+        assert!(
+            crate::configured_process_cpu_budget().is_some(),
+            "the premise: the process CPU budget is configured"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx =
+            jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let snapshot = TemplateChainSnapshot::from_context(&mut ctx).expect("a snapshot");
+        assert_eq!(snapshot.parent.height, 0);
+        // The pool's view: the same tip and anchor, slot 7 live (owner 0xA5).
+        let owner = Address([0xA5; 32]);
+        let fee = 1_000_000u64;
+        let amount = 10_000_000u64;
+        let creation = 50u64;
+        let mut seen = ChainState::with_log_slots(6);
+        seen.state
+            .set_slot(7, SlotValue::with_owner_fields(amount + fee, creation, owner.as_fields()))
+            .unwrap();
+        let mut view = jetsam_mempool::ChainView::new(
+            ctx.tip_height,
+            ctx.recent_headers.clone(),
+            1,
+            seen.state,
+        );
+        let anchor = block_id(&snapshot.child_tx_epoch_anchor_header);
+        view.user_epoch_anchor_id = anchor;
+        view.previous_user_epoch_anchor_id = anchor;
+        let pool = AsyncMempool::new(view, jetsam_mempool::MempoolConfig::default())
+            .with_authorization_verification_executor(std::sync::Arc::new(|_task| Ok(())));
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: amount + fee,
+            creation_id: creation,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 8,
+            amount,
+            owner: Address([0xB6; 32]),
+        };
+        let page = jetsam_tx::TxPage::new(TxBody {
+            epoch_anchor: anchor,
+            fee,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        })
+        .unwrap();
+        let intent = jetsam_tx::PagedSpendIntent::new(vec![page], vec![0xA5; 64]).unwrap();
+        let bytes = intent.to_bytes().unwrap();
+        pool.submit(intent, bytes).await.expect("the pool admits it on its view");
+        assert_eq!(
+            pool.select_for_block_at_anchor(25, anchor).await.len(),
+            1,
+            "the premise: the template's selection takes it"
+        );
+        let now = snapshot.parent.timestamp + 10;
+        let template = TemplateBuilder::new(pool.clone())
+            .build_from_snapshot(snapshot, Address([0x61; 32]), now)
+            .await
+            .expect("a template: the coinbase alone");
+        assert_eq!(template.n_user_txs(), 0);
+        assert_eq!(template.parent.height, 0);
+        assert_eq!(pool.len().await, 1, "the pool keeps what it admitted");
     }
 
     #[test]

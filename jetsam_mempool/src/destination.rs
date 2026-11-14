@@ -950,14 +950,20 @@ impl DestinationPool {
         before - self.len()
     }
 
-    /// Forget every intent, of any kind, whose transaction `stale` says the
-    /// next block can no longer place (NO-5, NO-7). Returns the number
-    /// forgotten.
-    pub fn forget_payments(&mut self, stale: impl Fn(&PagedSpendIntent) -> bool) -> usize {
+    /// Forget every intent whose transaction `stale` says the next block can
+    /// no longer place (NO-5, NO-7) — a release, only if `release_stale` says
+    /// so (RC-4: the template anchors a release's vault group again).
+    /// Returns the number forgotten.
+    pub fn forget_payments(
+        &mut self,
+        stale: impl Fn(&PagedSpendIntent) -> bool,
+        release_stale: impl Fn(&PagedSpendIntent) -> bool,
+    ) -> usize {
         let before = self.len();
         self.committee_updates
             .retain(|_, update| !stale(&update.payment));
-        self.releases.retain(|_, release| !stale(&release.payment));
+        self.releases
+            .retain(|_, release| !release_stale(&release.payment));
         self.contradictions.retain(|_, c| !stale(&c.payment));
         if self.revocation.as_ref().is_some_and(|r| stale(&r.payment)) {
             self.revocation = None;
