@@ -321,6 +321,21 @@ pub fn checked_egress<'a>(
     Ok(egress)
 }
 
+/// RED STUB (AN-1): this build's domain for the return robots.
+pub fn robot_domain() -> crate::Domain {
+    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    crate::Domain {
+        network: jetsam_chain::consensus::guardian::network_id(),
+        l1_chain_id: rules.base_return.fast.l1_chain_id,
+        l1_bridge: rules.bridge.map_or([0u8; 20], |b| b.address),
+    }
+}
+
+/// RED STUB (AN-1): e14789a's behaviour, every return robot in clear (`Egress::Clearnet` written in).
+pub fn robot_egress<'a>(_args: &[String], _sources: impl IntoIterator<Item = (String, &'a str)>) -> anyhow::Result<crate::rpc::Egress> {
+    Ok(crate::rpc::Egress::Clearnet)
+}
+
 pub fn hex48(text: &str) -> anyhow::Result<[u8; 48]> {
     hex::decode(text.trim().trim_start_matches("0x"))?
         .try_into()

@@ -52,6 +52,18 @@ mod tests;
 /// Sepolia's Gloas epoch (T0.8, measured on two beacon nodes; `config/spec`
 /// `GLOAS_FORK_EPOCH` of both read again 2026-11-10).
 pub const SEPOLIA_GLOAS_FORK_EPOCH: u64 = 353_024;
+/// RED STUB (FR-9).
+pub const GLOAS_EPOCH_UNKNOWN: u64 = u64::MAX;
+
+/// RED STUB (FR-9): this build's L1.
+pub fn build_l1_network() -> jetsam_chain::consensus::destination::forks::L1Network {
+    jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX).network
+}
+
+/// RED STUB (FR-9): e14789a's behaviour of fast-run, Sepolia's Gloas epoch written in.
+pub fn gloas_epoch_of(_arg: Option<String>, _network: &jetsam_chain::consensus::destination::forks::L1Network) -> anyhow::Result<u64> {
+    Ok(SEPOLIA_GLOAS_FORK_EPOCH)
+}
 /// How long a step posted is not posted again (it may still be on its way
 /// to a block).
 pub const REPOST_SECONDS: u64 = 1_800;

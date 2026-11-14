@@ -1248,3 +1248,90 @@ fn a_second_fast_run_on_the_same_state_dir_does_not_start() {
     drop(first);
     assert!(lock_fast_run_dir(dir.path()).is_ok());
 }
+
+fn args_of(v: &[&str]) -> Vec<String> {
+    v.iter().map(|a| a.to_string()).collect()
+}
+
+/// AN-1 (audit n°2): every robot of the return over Base (`fast-run`, `fast-release`, `fast-revoke`, `light-feed`,
+/// `light-anchor`) sent its calls in clear (`Egress::Clearnet` written in): a public address given is now refused
+/// before any socket and before anything else (its key, its rules, its node), the robot named.
+#[test]
+fn an1_each_return_robot_refuses_a_public_address_in_clear_before_anything_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let public = "http://203.0.113.5:1";
+    let closed = "http://127.0.0.1:9";
+    let missing = dir.path().join("missing").display().to_string();
+    let state = dir.path().join("state").display().to_string();
+    let m = missing.as_str();
+    let cases: Vec<(&str, anyhow::Result<()>)> = vec![
+        (
+            "fast-run",
+            run_cli(&args_of(&[
+                "--key", m, "--l1", public, "--base", closed, "--base", "http://127.0.0.2:9", "--beacon", closed, "--node", closed,
+                "--node-cookie", m, "--state-dir", &state, "--from-block", "1", "--once",
+            ])),
+        ),
+        (
+            "fast-release",
+            crate::fast_release::fast_release_cli(&args_of(&[
+                "--key", m, "--l1", closed, "--base", closed, "--base", public, "--node", closed, "--beacon", closed, "--game-index",
+                "1", "--n", "1", "--owner", "0x00", "--amount", "1",
+            ])),
+        ),
+        ("fast-revoke", revoke_cli(&args_of(&["--signed", m, "--node", public, "--node-cookie", m]))),
+        (
+            "light-feed",
+            crate::light_feed::feed_cli(&args_of(&["--node", closed, "--node-cookie", m, "--beacon", closed, "--beacon", public, "--state", &state, "--once"])),
+        ),
+        ("light-anchor", crate::light_feed::anchor_cli(&args_of(&["--beacon", closed, "--committee-beacon", public, "--period", "1"]))),
+    ];
+    for (name, result) in cases {
+        let e = match result {
+            Ok(()) => panic!("{name} ran with {public} in clear"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains("onion-only egress refuses") && e.contains(public), "{name}: {e}");
+        assert!(e.ends_with(&format!("{name} does not start")), "{name}: {e}");
+    }
+}
+
+/// FR-9 (audit n°2): `fast-run` wrapped its finality updates with Sepolia's Gloas epoch, written in. `fast-run` and
+/// `fast-release` take `--gloas-epoch` (as `light-feed` did), checked at the start against this build's L1 (an epoch
+/// at or before its Fulu epoch is refused, the robot named); the robots of the feed too.
+#[test]
+fn fr9_the_return_robots_take_the_gloas_epoch_and_refuse_a_wrong_one_at_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let closed = "http://127.0.0.1:9";
+    let missing = dir.path().join("missing").display().to_string();
+    let state = dir.path().join("state").display().to_string();
+    let m = missing.as_str();
+    let cases: Vec<(&str, anyhow::Result<()>)> = vec![
+        (
+            "fast-run",
+            run_cli(&args_of(&[
+                "--key", m, "--l1", closed, "--base", closed, "--base", "http://127.0.0.2:9", "--beacon", closed, "--node", closed,
+                "--node-cookie", m, "--state-dir", &state, "--from-block", "1", "--once", "--gloas-epoch", "1",
+            ])),
+        ),
+        (
+            "fast-release",
+            crate::fast_release::fast_release_cli(&args_of(&[
+                "--key", m, "--l1", closed, "--base", closed, "--base", "http://127.0.0.2:9", "--node", closed, "--beacon", closed,
+                "--game-index", "1", "--n", "1", "--owner", "0x00", "--amount", "1", "--gloas-epoch", "1",
+            ])),
+        ),
+        (
+            "light-feed",
+            crate::light_feed::feed_cli(&args_of(&["--node", closed, "--node-cookie", m, "--beacon", closed, "--state", &state, "--once", "--gloas-epoch", "1"])),
+        ),
+        ("light-anchor", crate::light_feed::anchor_cli(&args_of(&["--beacon", closed, "--committee-beacon", closed, "--period", "1", "--gloas-epoch", "1"]))),
+    ];
+    for (name, result) in cases {
+        let e = match result {
+            Ok(()) => panic!("{name} ran with --gloas-epoch 1"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains("--gloas-epoch 1: not a Gloas epoch of this L1"), "{name}: {e}");
+    }
+}

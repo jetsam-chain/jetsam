@@ -783,6 +783,15 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
         .collect()
 }
 
+/// AN-1: every URL the command line gives after one of `names` (`(flag, url)`), for [`crate::config::robot_egress`].
+pub fn robot_sources<'a>(args: &'a [String], names: &[&str]) -> Vec<(String, &'a str)> {
+    args.iter()
+        .zip(args.iter().skip(1))
+        .filter(|(a, _)| names.contains(&a.as_str()))
+        .map(|(a, url)| (a.clone(), url.as_str()))
+        .collect()
+}
+
 /// `jg-relay fast-revoke --key <cold secret> --node <url> --node-cookie <file> [--dry-run --out <file>]`:
 /// closes this build's relay key. FR-6 (audit n°2): `--key <cold secret> --sign-only --out <file>` signs it offline
 /// (no node: done once, when the keys are made); `--signed <file> --node <url> --node-cookie <file>` hands that file in

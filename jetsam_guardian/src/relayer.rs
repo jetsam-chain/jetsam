@@ -1156,6 +1156,19 @@ pub fn reorg_needs_nodes(tip: u64, common: u64, locked_floor: u64) -> bool {
     tip.saturating_sub(common) > MAX_REORG_ONE_NODE || common < locked_floor
 }
 
+/// RED STUB (GU-3): e14789a's behaviour (E-5 only: a shallow reorganization on one node's word, whatever its work).
+pub fn reorg_on_one_nodes_word(tip: u64, common: u64, locked_floor: u64, _ours: &[u8; 32], _theirs: &[u8; 32]) -> bool {
+    !reorg_needs_nodes(tip, common, locked_floor)
+}
+
+/// RED STUB (GU-3).
+pub const NODE_OFF_CHAIN_ALERT_STEPS: u32 = 20;
+
+/// RED STUB (GU-3): e14789a's behaviour, a node off the chain never said.
+pub fn node_off_chain_step(count: u32, _on_our_chain: bool) -> (u32, bool) {
+    (count, false)
+}
+
 /// One source of a block body: its name and a reader (`Ok(None)`: it does not serve the block).
 pub type BodySource<'a> = (String, Box<dyn FnMut() -> anyhow::Result<Option<Vec<u8>>> + 'a>);
 

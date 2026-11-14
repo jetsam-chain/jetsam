@@ -359,3 +359,54 @@ fn c2a_a_public_guardian_serves_its_feed_and_pulls_every_other_over_tor() {
     // the rehearsal: directories alone still start
     assert_eq!(GuardianConfig::parse(&onion_sources(TEXT)).unwrap().feed_transport().unwrap(), (None, vec![]));
 }
+
+/// AN-1 (audit n°2): the egress of the return-over-Base robots is `jg-relay`'s. The command line deployed on the test
+/// chain (`fast-run --l1 http://127.0.0.1:8560 --base …:8548 --base …:8545 --beacon …:8551 --node …:9711`), with no new
+/// flag, starts: onion by default, every source on the loopback reached directly (never through Tor). A public address
+/// in clear (an IP address or a name over http://) is refused before any socket; an https:// public name goes through
+/// Tor; `--tor-socks` must be a loopback address; `--egress` is onion or clearnet, and clearnet is refused on a public
+/// network (this build's).
+#[test]
+fn an1_robot_egress_reaches_the_loopback_directly_and_refuses_a_public_address_in_clear() {
+    use crate::rpc::{Egress, Route};
+    let line = |extra: &[&str]| -> Vec<String> {
+        [
+            "--key", "relay.secret", "--l1", "http://127.0.0.1:8560", "--base", "http://127.0.0.1:8548", "--base",
+            "http://127.0.0.1:8545", "--beacon", "http://127.0.0.1:8551", "--node", "http://127.0.0.1:9711", "--node-cookie",
+            "rpc.cookie", "--state-dir", "fast", "--from-block", "57071077", "--interval", "15",
+        ]
+        .iter()
+        .chain(extra)
+        .map(|a| a.to_string())
+        .collect()
+    };
+    let deployed = line(&[]);
+    let sources = crate::fast_run::robot_sources(&deployed, &["--l1", "--base", "--beacon", "--node"]);
+    assert_eq!(sources.len(), 5, "{sources:?}");
+    let egress = robot_egress(&deployed, sources.clone()).expect("the deployed line starts");
+    assert_eq!(egress, Egress::Onion { socks: "127.0.0.1:9050".parse().unwrap() });
+    for (name, url) in &sources {
+        assert!(matches!(egress.route(url).unwrap(), Route::Loopback(_)), "{name} {url}: the loopback directly");
+    }
+    for public in ["http://203.0.113.5:8545", "http://ethereum-sepolia.example.org", "http://[2001:db8::1]:8545"] {
+        let e = format!("{:#}", robot_egress(&deployed, [("--l1".to_string(), public)]).unwrap_err());
+        assert!(e.contains("onion-only egress refuses") && e.contains(public), "{public}: {e}");
+    }
+    let https = "https://ethereum-sepolia.example.org/v1";
+    let egress = robot_egress(&deployed, [("--l1".to_string(), https)]).unwrap();
+    assert!(matches!(egress.route(https).unwrap(), Route::Socks { .. }), "an https:// public name through Tor");
+    let other = robot_egress(&line(&["--tor-socks", "127.0.0.1:9150"]), []).unwrap();
+    assert_eq!(other, Egress::Onion { socks: "127.0.0.1:9150".parse().unwrap() });
+    assert!(robot_egress(&line(&["--tor-socks", "10.0.0.1:9050"]), []).is_err(), "a SOCKS port off the machine");
+    assert!(robot_egress(&line(&["--tor-socks"]), []).is_err());
+    let e = format!("{:#}", robot_egress(&line(&["--egress", "tor"]), []).unwrap_err());
+    assert!(e.contains("onion or clearnet"), "{e}");
+    assert_eq!(robot_egress(&line(&["--egress", "onion"]), sources.clone()).unwrap(), egress_default());
+    assert!(crate::Profile::of(&robot_domain()).strict(), "this build is a public network's");
+    let e = format!("{:#}", robot_egress(&line(&["--egress", "clearnet"]), sources).unwrap_err());
+    assert!(e.contains("clearnet") && e.contains("refused on"), "{e}");
+}
+
+fn egress_default() -> crate::rpc::Egress {
+    crate::rpc::Egress::onion(crate::rpc::DEFAULT_TOR_SOCKS).unwrap()
+}
