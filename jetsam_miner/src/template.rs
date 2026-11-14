@@ -1742,6 +1742,16 @@ mod tests {
             output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
             PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
         };
+        // The template's CPU phase runs on the process pool, as in the node
+        // (unconfigured, the phase itself fails closed: no template).
+        let _ = crate::configure_process_cpu_budget_with_threads(
+            crate::ProcessCpuBudgetMode::ProofOnly,
+            Some(2),
+        );
+        assert!(
+            crate::configured_process_cpu_budget().is_some(),
+            "the premise: the process CPU budget is configured"
+        );
         let directory = tempfile::tempdir().unwrap();
         let mut ctx =
             jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
