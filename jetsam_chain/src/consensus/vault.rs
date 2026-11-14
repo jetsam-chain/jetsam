@@ -1008,6 +1008,52 @@ pub fn release_shape_ok(owner: &Address, amount: u64, rules: &VaultRules) -> boo
         && amount <= rules.window_cap
 }
 
+/// RC-5 (audit 13/11): one slot of the vault, as a release group spends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaultSlotRef {
+    pub slot_index: u32,
+    pub amount: u64,
+    pub creation_id: u64,
+}
+
+/// RC-5: the largest burn one release can pay in one block from the vault
+/// `slots`: the sum of the largest slots a release may spend (V1-b: created
+/// after `floor`, not by a coinbase) that one release group holds as the
+/// template places it.
+pub fn largest_payable_release(slots: &[VaultSlotRef], floor: u64) -> u64 {
+    slots
+        .iter()
+        .filter(|s| s.creation_id > floor && !is_coinbase_creation_id(s.creation_id))
+        .map(|s| s.amount)
+        .sum()
+}
+
+/// RC-5: the slots a release of `amount` spends from the vault `slots`.
+/// `None` if no release group covers it.
+pub fn release_inputs_regrouping(
+    slots: &[VaultSlotRef],
+    floor: u64,
+    amount: u64,
+    _rules: &VaultRules,
+) -> Option<Vec<VaultSlotRef>> {
+    let mut candidates: Vec<VaultSlotRef> = slots
+        .iter()
+        .copied()
+        .filter(|s| s.creation_id > floor && !is_coinbase_creation_id(s.creation_id))
+        .collect();
+    candidates.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.slot_index.cmp(&b.slot_index)));
+    let mut picked = Vec::new();
+    let mut total = 0u64;
+    for slot in candidates {
+        if total >= amount {
+            break;
+        }
+        total = total.checked_add(slot.amount)?;
+        picked.push(slot);
+    }
+    (total >= amount).then_some(picked)
+}
+
 /// The release group a mempool admits with its release object (T2.5): what
 /// [`validate_block_vault`] asks of one release group, judged alone — the
 /// burn has a payable shape ([`release_shape_ok`]); the group spends only

@@ -313,6 +313,77 @@ fn template_serves_lowest_n_first_and_never_jumps_a_waiting_payable_release() {
     assert!(offer.releases.is_empty());
 }
 
+/// RC-4 (audit 13/11): a burn close to the window cap waits for the window
+/// longer than its payment's epoch anchor lives (33 to 64 blocks, against a
+/// window of 480). Once its anchor went stale it must keep its place: no
+/// larger `n` jumps it while it waits for the window, and once the window
+/// has room it is offered first (the template anchors its vault group again,
+/// [`reanchored`]) — never skipped for its anchor alone.
+#[test]
+fn the_template_never_jumps_a_release_whose_anchor_went_stale_while_it_waited() {
+    let mut state = state_at(J + 600);
+    state
+        .window
+        .push(jetsam_chain::consensus::destination::state::WindowRelease {
+            height: J + 500,
+            n: 1,
+            owner: Address([1; 32]),
+            amount: 49_000 * MICRO_PER_JTM,
+        });
+    state.released.insert(1);
+    let stale = |n: u64, amount: u64| {
+        let mut release = release(n, amount);
+        release.payment.pages[0].body.epoch_anchor = [9u8; 32];
+        release
+    };
+    // n = 2 (1 600 JTM) waits for the window, its anchor stale: n = 3 must
+    // not jump it.
+    let offer = plan(
+        &state,
+        Vec::new(),
+        vec![stale(2, 1_600 * MICRO_PER_JTM), release(3, 5 * MICRO_PER_JTM)],
+    );
+    assert_eq!(ns(&offer), Vec::<u64>::new(), "n = 3 jumped the stale n = 2");
+    // The window has room: n = 2 first, its anchor stale or not.
+    state.window.clear();
+    let offer = plan(
+        &state,
+        Vec::new(),
+        vec![stale(2, 1_600 * MICRO_PER_JTM), release(3, 5 * MICRO_PER_JTM)],
+    );
+    assert_eq!(ns(&offer), vec![2, 3]);
+    // Not a vault group (it could not be anchored again): skipped, not
+    // waited for.
+    let mut foreign = stale(2, 1_600 * MICRO_PER_JTM);
+    foreign.payment.pages[0].body.input_owner = Address([0x51; 32]);
+    let offer = plan(&state, Vec::new(), vec![foreign, release(3, 5 * MICRO_PER_JTM)]);
+    assert_eq!(ns(&offer), vec![3]);
+}
+
+/// RC-4: a stale release's vault group anchored again — the same pages but
+/// for the anchor, proven with the vault's published secret: the proof
+/// verifies against the new pages, as the block verifies it. Only a vault
+/// group (any other owner's secret is not published).
+#[test]
+fn a_stale_release_is_anchored_again_with_the_vaults_published_secret() {
+    let release = release(2, 5 * MICRO_PER_JTM);
+    let fresh = reanchored(&release.payment, [0x77; 32]).expect("a vault group");
+    assert_eq!(fresh.pages.len(), release.payment.pages.len());
+    for (new, old) in fresh.pages.iter().zip(&release.payment.pages) {
+        assert_eq!(new.body.epoch_anchor, [0x77; 32]);
+        let mut body = new.body.clone();
+        body.epoch_anchor = old.body.epoch_anchor;
+        assert_eq!(body, old.body, "nothing else changes");
+    }
+    let bundle = jetsam_gkr::WalletAuthorizationBundle::from_bytes(&fresh.authorization_bytes)
+        .expect("a bundle");
+    jetsam_gkr::verify_paged_spend_authorization(&fresh.pages, &bundle)
+        .expect("the vault's proof verifies against the new pages");
+    let mut foreign = release.payment.clone();
+    foreign.pages[0].body.input_owner = Address([0x51; 32]);
+    assert!(reanchored(&foreign, [0x77; 32]).is_none());
+}
+
 /// The 0xC2 section holds 32 objects in all (T2.2): what the template adds
 /// to the objects already there never takes it over, nor over its byte
 /// budget.
@@ -599,6 +670,59 @@ fn judge(
         Some(r) => Err(Some(not_proven(r.release.n))),
         None => Ok((ns(offer), offer.committee_update.is_some())),
     }
+}
+
+/// NO-4, NO-5 (audit 13/11): a block refused by the destination rule for a
+/// reason that blames no object (here any block carrying the release of 5)
+/// used to lose the whole offer: the template built it without any
+/// destination object. It now tries the offer payment by payment, and the
+/// releases of 4 and 6 go out without 5.
+#[test]
+fn a_destination_refusal_that_blames_nothing_takes_out_only_the_payment_it_is_for() {
+    let offer = plan(
+        &state_at(J + 20),
+        Vec::new(),
+        (4..=6).map(|n| release(n, 5 * MICRO_PER_JTM)).collect(),
+    );
+    assert_eq!(ns(&offer), vec![4, 5, 6]);
+    let carried = |txs: &[jetsam_tx::Transaction]| -> Vec<u64> {
+        offer
+            .releases
+            .iter()
+            .filter(|r| {
+                txs.iter()
+                    .any(|tx| tx.body.live_outputs().any(|(_, o)| Some(o.owner) == r.marker()))
+            })
+            .map(|r| r.release.n)
+            .collect()
+    };
+    let selections = crate::template::Selections {
+        txs: Vec::new(),
+        mempool_txs: Vec::new(),
+        destination_txs: offer.payment_order(),
+        guardian_txs: Vec::new(),
+        offers_clients: false,
+        offers_destination: true,
+        offers_guardian: false,
+    };
+    let (built, blamed) = crate::template::build_with_fallbacks(
+        &selections,
+        &offer,
+        &rules().vault,
+        &mut |txs, _, with_destination, _| {
+            let ns = if with_destination { carried(&txs) } else { Vec::new() };
+            if ns.contains(&5) {
+                // No culprit (`culprits_of`): the refusal names no object.
+                Err(crate::template::Refusal::Destination(DestinationBlockError::UnusedFinality))
+            } else {
+                Ok(ns)
+            }
+        },
+        &mut |_| {},
+        &mut |_| {},
+    );
+    assert_eq!(built, Some(vec![4, 6]));
+    assert!(blamed.as_ref().is_none_or(|b| b.releases.is_empty()), "nothing blamed: {blamed:?}");
 }
 
 /// A2-M1: a block refused for one release is built again without that
@@ -1911,6 +2035,222 @@ mod reopened {
             .check(&w.block(&parent, &offer), &parent)
             .expect("the revocation's block passes");
         assert_eq!(effect.fast.revoked, Some(relay_pk));
+    }
+
+    /// The world's relay key armed with a cold key, and the cold key's
+    /// revocation of it, paid from `PAYER`'s slot 4 000 (NO-3's).
+    fn armed_revocation(w: &mut World) -> jetsam_mempool::destination::FastRevocationIntent {
+        use blst::min_pk::SecretKey;
+        use jetsam_chain::consensus::destination::fast::{
+            revocation_marker, FastRevocation, FAST_REVOKE_DST,
+        };
+        use jetsam_chain::consensus::destination::mpt::keccak256;
+        let key = |label: &str| {
+            let sk = SecretKey::key_gen(&keccak256(label.as_bytes()), &[]).expect("a test key");
+            let pk = sk.sk_to_pk().compress();
+            (sk, pk)
+        };
+        let (cold, cold_pk) = key("jetsam-v17-NO3-TEST-ONLY/cold");
+        let (_, relay_pk) = key("jetsam-v17-NO3-TEST-ONLY/relay");
+        w.rules.base_return.fast.release_key = Some(relay_pk);
+        w.rules.base_return.fast.revoke_key = Some(cold_pk);
+        let unsigned = FastRevocation {
+            network: jetsam_chain::consensus::guardian::network_id(),
+            key: relay_pk,
+            signature: [0; 96],
+        };
+        jetsam_mempool::destination::FastRevocationIntent {
+            payload: FastRevocation {
+                signature: cold.sign(&unsigned.message(), FAST_REVOKE_DST, &[]).compress(),
+                ..unsigned
+            }
+            .encode_payload(),
+            payment: page(PAYER, 4_000, &[(revocation_marker(&relay_pk), 0), (BOB, 5)], 50_000),
+        }
+    }
+
+    /// The template bench (NO-4, NO-5): the chain's real template builder on
+    /// a real chain state (the slots `funded` holds), the block it builds
+    /// judged by the real destination rule against the world's branch at
+    /// `H + 5`, through the template's own sequence of tries
+    /// ([`crate::template::build_with_fallbacks`]).
+    struct Bench {
+        world: World,
+        parent: DestinationState,
+        chain: jetsam_chain::state::ChainState,
+        header: BlockHeader,
+    }
+
+    impl Bench {
+        fn new(world: World, funded: &[(u32, u64, Address)]) -> Self {
+            use jetsam_chain::fri_state::SlotValue;
+            let mut chain = jetsam_chain::state::ChainState::with_log_slots(13);
+            for (slot, amount, owner) in funded {
+                chain
+                    .state
+                    .set_slot(*slot, SlotValue::with_owner_fields(*amount, 50, owner.as_fields()))
+                    .unwrap();
+            }
+            chain.active_slot_count = funded.len() as u64;
+            chain.circulating_supply_micro_jtm = funded.iter().map(|(_, a, _)| u128::from(*a)).sum();
+            let parent = world.parent(&[], &[]);
+            let mut header = jetsam_chain::consensus::genesis_header();
+            header.height = parent.tip;
+            header.state_root = chain.cached_state_root();
+            header.active_slot_count = chain.active_slot_count;
+            header.log_slots = chain.state.log_slots() as u32;
+            Self {
+                world,
+                parent,
+                chain,
+                header,
+            }
+        }
+
+        /// One try of the template: the block of `txs` built, and judged
+        /// with the section `offer` makes of them (or none).
+        fn attempt(
+            &self,
+            offer: &DestinationOffer,
+            txs: Vec<Transaction>,
+            with_destination: bool,
+        ) -> Result<(DestinationSection, usize), crate::template::Refusal> {
+            use crate::template::Refusal;
+            let (inner, _) = jetsam_chain::consensus::template::build_node_owned_block_template(
+                &self.header,
+                &self.chain,
+                &[],
+                txs,
+                Address([0x61; 32]),
+                self.header.timestamp + 1,
+                self.header.difficulty_target,
+            )
+            .map_err(|error| Refusal::Build(format!("{error:?}")))?;
+            let section = if with_destination {
+                offer.section_for(&inner.txs)
+            } else {
+                DestinationSection::default()
+            };
+            let block = Block {
+                header: inner.clone().into_header(0),
+                transactions: inner.all_txs(),
+                client_objects: Vec::new(),
+                destination: Some(section.clone()),
+            };
+            validate_block_destination(&block, &self.parent, &self.world.rules, &self.world.keys)
+                .map_err(Refusal::Destination)?;
+            Ok((section, inner.txs.len()))
+        }
+
+        /// The template's tries on `selections` and `offer`: the block it
+        /// mines (its section, its user pages), if any.
+        fn mine(
+            &self,
+            selections: &crate::template::Selections,
+            offer: &DestinationOffer,
+        ) -> Option<(DestinationSection, usize)> {
+            crate::template::build_with_fallbacks(
+                selections,
+                offer,
+                &self.world.rules.vault,
+                &mut |txs, _, with_destination, _| self.attempt(offer, txs, with_destination),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .0
+        }
+    }
+
+    fn only_destination(offer: &DestinationOffer) -> crate::template::Selections {
+        crate::template::Selections {
+            txs: Vec::new(),
+            mempool_txs: Vec::new(),
+            destination_txs: offer.payment_order(),
+            guardian_txs: Vec::new(),
+            offers_clients: false,
+            offers_destination: true,
+            offers_guardian: false,
+        }
+    }
+
+    /// NO-5 (audit 13/11), through the bench: the template offers Base's
+    /// burn of 3 and the cold key's revocation; the revocation's payment no
+    /// longer applies (its input is not live: spent by a block the pool has
+    /// not seen yet). The chain template cannot build that block and nothing
+    /// is to blame by the destination rule; the template now tries the offer
+    /// payment by payment and mines the release — it used to give up the
+    /// whole offer and mine the block without any destination object.
+    #[test]
+    fn template_bench_a_payment_that_no_longer_applies_takes_only_itself_out() {
+        let mut w = world();
+        let revocation = armed_revocation(&mut w);
+        let release = w.slow();
+        let bench = Bench::new(w, &[(1_000, release.release.amount, VAULT_ADDRESS)]);
+        let offer = plan_destination_offer_with(
+            &bench.parent,
+            &bench.world.rules,
+            bench.parent.tip + 1,
+            Vec::new(),
+            vec![release],
+            Vec::new(),
+            Some(revocation),
+            &|anchor| *anchor == ANCHOR,
+            0,
+        );
+        assert!(offer.revocation.is_some() && ns(&offer) == vec![3], "both offered");
+        assert!(
+            matches!(
+                bench.attempt(&offer, offer.payment_order(), true),
+                Err(crate::template::Refusal::Build(_))
+            ),
+            "the premise: the whole offer does not build"
+        );
+        let without_revocation = DestinationOffer {
+            revocation: None,
+            ..offer.clone()
+        };
+        bench
+            .attempt(&without_revocation, without_revocation.payment_order(), true)
+            .expect("the premise: the release alone builds and passes the rule");
+        let (section, _) = bench
+            .mine(&only_destination(&offer), &offer)
+            .expect("a block is mined");
+        let kinds: Vec<_> = section.objects.iter().map(|o| o.kind).collect();
+        assert!(
+            kinds.contains(&DestinationObjectKind::VaultRelease),
+            "the release is carried: {kinds:?}"
+        );
+        assert!(!kinds.contains(&DestinationObjectKind::FastKeyRevocation));
+    }
+
+    /// NO-1, NO-5 (b), through the bench: a mempool selection the chain
+    /// template cannot build (an input no longer live) and nothing else: the
+    /// template mines the coinbase alone — it used to make no template at all
+    /// (the miner retried the same selection every second).
+    #[test]
+    fn template_bench_a_selection_that_never_builds_leaves_the_coinbase_alone() {
+        let bench = Bench::new(world(), &[]);
+        let stale: Vec<Transaction> = page(PAYER, 2_000, &[(BOB, 5)], 50_000)
+            .pages
+            .iter()
+            .map(|p| Transaction::new(p.body.clone()))
+            .collect();
+        let offer = DestinationOffer::default();
+        assert!(matches!(
+            bench.attempt(&offer, stale.clone(), false),
+            Err(crate::template::Refusal::Build(_))
+        ));
+        let selections = crate::template::Selections {
+            txs: stale.clone(),
+            mempool_txs: stale,
+            destination_txs: Vec::new(),
+            guardian_txs: Vec::new(),
+            offers_clients: false,
+            offers_destination: false,
+            offers_guardian: false,
+        };
+        let (section, user_pages) = bench.mine(&selections, &offer).expect("a block is mined");
+        assert_eq!((section.objects.len(), user_pages), (0, 0), "the coinbase alone");
     }
 
     /// NO-1 (audit 13/11), the premise: from the return-over-Base height on,

@@ -238,6 +238,11 @@ fn anchor_of(payment: &PagedSpendIntent) -> Option<[u8; 32]> {
     payment.pages.first().map(|page| page.body.epoch_anchor)
 }
 
+/// RC-4: a release's vault group bound to `anchor`.
+pub fn reanchored(_payment: &PagedSpendIntent, _anchor: [u8; 32]) -> Option<PagedSpendIntent> {
+    None
+}
+
 /// What the block at `height` after a branch in `state` offers, from the
 /// intents the mempool holds, with `other_objects` already in its section
 /// (module docs). `anchor_ok` says whether a transaction's epoch anchor is
