@@ -205,7 +205,17 @@ fn the_return_over_base_reads_its_profiles_base_from_its_height() {
         assert_eq!(at_h.anchor, BASE_RETURN_ANCHOR);
         assert_eq!(at_h.bridge, BASE_RETURN_BRIDGE);
         assert!(at_h.anchor.is_some() && at_h.bridge.is_some());
-        assert_eq!(rules.effective_at(u64::MAX), at_h);
+        // BRIDGE2: the same rules up to the second bridge's height, its bridge
+        // only from it on (`bridge2_the_profiles_bridge_table`).
+        let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed on the test chain");
+        assert_eq!(rules.effective_at(h2 - 1), at_h);
+        assert_eq!(
+            rules.effective_at(u64::MAX),
+            DestinationRules {
+                bridge: Some(BASE_RETURN_BRIDGE2),
+                ..at_h
+            }
+        );
     }
     #[cfg(not(feature = "testnet"))]
     {
@@ -225,11 +235,13 @@ fn the_return_over_base_reads_its_profiles_base_from_its_height() {
     }
     #[cfg(feature = "rehearsal-v1-7")]
     assert_eq!(rules.base_return.network, L1_REHEARSAL);
-    // Armed, the light client reads the L1 Base settles on from the height on.
+    // Armed, the light client reads the L1 Base settles on from the height on
+    // (BRIDGE2: without the profile's bridge table, tested on its own).
     let armed = DestinationRules {
         base_return: BaseReturnRules {
             activation_height: Some(HB),
             network: L1_REHEARSAL,
+            bridge_rotations: &[],
             ..rules.base_return
         },
         ..rules
@@ -274,6 +286,8 @@ fn the_return_over_base_brings_its_anchor_and_bridge_from_its_height() {
             activation_height: Some(HB),
             anchor: Some(base_anchor),
             bridge: Some(base_bridge),
+            // BRIDGE2: the return's own bridge (the table is tested on its own).
+            bridge_rotations: &[],
             ..DestinationRules::CONSENSUS.base_return
         },
         ..DestinationRules::CONSENSUS

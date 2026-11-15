@@ -73,6 +73,12 @@ fn other(v: &Value) -> Value {
         Value::Null => json!(12_345),
         Value::Number(n) => json!(n.as_u64().unwrap() + 1),
         Value::String(s) => json!(if s.starts_with('0') { s.replacen('0', "1", 1) } else { format!("0{}", &s[1..]) }),
+        // BRIDGE2: a table of later bridges (`base_return_bridge_rotations`): its first one a block later
+        Value::Array(a) if a.first().is_some_and(|r| r["height"].is_u64()) => {
+            let mut a = a.clone();
+            a[0]["height"] = json!(a[0]["height"].as_u64().unwrap() + 1);
+            Value::Array(a)
+        }
         other => panic!("not a field of the activations: {other}"),
     }
 }
@@ -102,8 +108,10 @@ fn activ_a_node_of_this_build_is_accepted() {
 fn activ_every_field_that_differs_refuses_the_node_and_is_named() {
     let built = this_build();
     let keys: Vec<String> = built.as_object().unwrap().keys().cloned().collect();
-    // 14 since FIXRC (`return_fix_height`): a program of before refuses a node of this build at its start.
-    assert_eq!(keys.len(), 14, "{keys:?}");
+    // 14 since FIXRC (`return_fix_height`): a program of before refuses a node of this build at its start; 15 on a
+    // build with a second bridge (BRIDGE2: `base_return_bridge_rotations`, the test chain's).
+    let tables = usize::from(built.get("base_return_bridge_rotations").is_some());
+    assert_eq!(keys.len(), 14 + tables, "{keys:?}");
     for key in &keys {
         let value = other(&built[key]);
         let published = with(key, Some(value.clone()));

@@ -1768,7 +1768,10 @@ fn bridge2_mn5_the_deadline_is_exactly_the_last_second_a_point_passes() {
             if let Some(d) = deadline {
                 assert!(d >= mn.fork_base_timestamp + MN5_MIN_ELAPSED - 1, "{rule:?} {mn:?}");
                 assert!(mn5_ok(rule, &mn, d), "{rule:?} at its deadline {d}: {mn:?}");
-                assert!(!mn5_ok(rule, &mn, d + 1), "{rule:?} one second after its deadline {d}: {mn:?}");
+                // (the rule of before's search stops at 2^60 s: past it, "never" in practice — its code, unchanged)
+                if d - mn.fork_base_timestamp < 1 << 60 {
+                    assert!(!mn5_ok(rule, &mn, d + 1), "{rule:?} one second after its deadline {d}: {mn:?}");
+                }
             }
             for _ in 0..4 {
                 let at = mn.fork_base_timestamp + xorshift(&mut seed) % 200_000;
