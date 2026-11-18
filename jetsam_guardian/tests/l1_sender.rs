@@ -320,9 +320,9 @@ fn m8_an_advance_found_unmined_at_a_recovery_is_cancelled_never_sent_again() {
 }
 
 
-/// E-9: with a daily gas budget, a transaction whose gas limit would take the gas of the last 24 h of the L1 clock
+/// E-9: with a daily gas budget, a transaction whose gas limit would take the gas of the last 24 h (M-3: this host's clock)
 /// above it is refused before anything is signed (the nonce does not move), with the alert; the gas of the mined
-/// ones survives a restart (`gas.json` under the state directory); 24 h of the L1 clock later there is room again.
+/// ones survives a restart (`gas.json` under the state directory); 24 h of the L1 clock later there is still none.
 #[test]
 fn e9_a_daily_gas_budget_refuses_before_signing_and_survives_a_restart() {
     let Some(a) = anvil() else { return };
@@ -347,8 +347,8 @@ fn e9_a_daily_gas_budget_refuses_before_signing_and_survives_a_restart() {
     assert!(again.send(&l1, TARGET, &[], "after a restart").unwrap_err().to_string().contains(GAS_BUDGET_ALERT));
     // without a budget (jg-relay's default) nothing is refused for its gas
     assert!(sender(TEST_KEY_2, dir.path()).send(&l1, TARGET, &[], "no budget").unwrap().status);
-    // 24 h of the L1 clock later, room again
+    // M-3: 24 h of the L1 clock later (the endpoint's word), no room: the window runs on this host's clock
     l1.rpc("evm_increaseTime", json!([86_400])).unwrap();
     l1.rpc("evm_mine", json!([])).unwrap();
-    assert!(again.send(&l1, TARGET, &[], "a day later").unwrap().status);
+    assert!(again.send(&l1, TARGET, &[], "a day later on the L1 clock").unwrap_err().to_string().contains(GAS_BUDGET_ALERT));
 }
