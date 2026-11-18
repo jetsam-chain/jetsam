@@ -750,6 +750,7 @@ pub fn culprits_of(
         | DestinationBlockError::BridgeAccount(_)
         | DestinationBlockError::BaseReturn(_)
         | DestinationBlockError::L1TimeUnknown
+        | DestinationBlockError::BaseReadTooOld { .. }
         | DestinationBlockError::MalformedObject {
             kind:
                 DestinationObjectKind::FinalityUpdate

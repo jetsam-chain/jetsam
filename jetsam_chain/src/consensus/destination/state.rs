@@ -74,7 +74,8 @@ use super::DestinationObjectKind;
 use crate::block::{validate_block_page_stream, Block};
 use crate::consensus::params::{
     v1_7_active_with, v1_7_base_return_active_with, CONSENSUS_FINALITY_DEPTH,
-    V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT,
+    V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT, V1_7_FIXEXT_HEIGHT,
+    BASE_READ_MAX_AGE_SECONDS,
 };
 use crate::consensus::vault::{
     decode_bridge_account_proof, destination_marker_kind, validate_block_vault_with,
@@ -411,6 +412,9 @@ pub struct BaseReturnRules {
     /// BRIDGE2: the bridges after `bridge`, each from its height on
     /// ([`BASE_RETURN_BRIDGE_ROTATIONS`]); empty: `bridge` for ever.
     pub bridge_rotations: &'static [BridgeRotation],
+    /// FIXEXT ([`V1_7_FIXEXT_HEIGHT`]): from it on, Base is read under an L1
+    /// block at most [`BASE_READ_MAX_AGE_SECONDS`] behind the block's time.
+    pub fixext_height: Option<u64>,
 }
 
 impl BaseReturnRules {
@@ -423,10 +427,16 @@ impl BaseReturnRules {
         anchor: BASE_RETURN_ANCHOR,
         bridge: BASE_RETURN_BRIDGE,
         bridge_rotations: BASE_RETURN_BRIDGE_ROTATIONS,
+        fixext_height: V1_7_FIXEXT_HEIGHT,
     };
 
     pub const fn active_at(&self, height: u64) -> bool {
         v1_7_base_return_active_with(height, self.activation_height)
+    }
+
+    /// Whether the FIXEXT rules govern the block at `height`.
+    pub const fn fixext_active_at(&self, height: u64) -> bool {
+        matches!(self.fixext_height, Some(h) if height >= h)
     }
 
     /// BRIDGE2: the rotation in force at `height` (the last at or below it),
@@ -1928,6 +1938,9 @@ pub enum DestinationBlockError {
     GameProofWithCommitteeUpdate,
     /// The finality update does not give the L1 time of its root.
     L1TimeUnknown,
+    /// FIXEXT E-1: Base read under an L1 block older than
+    /// [`BASE_READ_MAX_AGE_SECONDS`] behind the block's time.
+    BaseReadTooOld { l1_time: u64, block_time: u64 },
     /// The game or its output root (the return over Base).
     BaseReturn(BaseReturnError),
     /// An advance or a transfer of its claim (the return over Base).
@@ -2374,6 +2387,11 @@ pub fn validate_block_destination(
                 keys,
             )?;
         }
+    }
+    // FIXEXT E-1: Base read under a recent L1 block (its judgment about the
+    // present, as Base's portal reads it), whatever the lane.
+    if false && proving && over_base && rules.base_return.fixext_active_at(height) {
+        check_base_read_age(finality_update.expect("checked above"), block.header.timestamp)?;
     }
     if over_base {
         // The fast releases past the horizon, but those that wait for their
@@ -2834,6 +2852,28 @@ fn finalized_execution(
     Ok(verify_finality_update(&rules.network, &refs, finality)
         .map_err(DestinationBlockError::LightClient)?
         .execution)
+}
+
+/// FIXEXT E-1: the L1 block the finality update `payload` names is at most
+/// [`BASE_READ_MAX_AGE_SECONDS`] older than `block_time` (a block time behind
+/// the L1's passes).
+fn check_base_read_age(payload: &[u8], block_time: u64) -> Result<(), DestinationBlockError> {
+    let update = LightClientFinalityUpdate::decode_payload(payload).map_err(|_| {
+        DestinationBlockError::MalformedObject {
+            kind: DestinationObjectKind::FinalityUpdate,
+        }
+    })?;
+    let l1_time = super::light_client::finalized_execution(&update)
+        .map_err(DestinationBlockError::LightClient)?
+        .timestamp
+        .ok_or(DestinationBlockError::L1TimeUnknown)?;
+    if block_time.saturating_sub(l1_time) > BASE_READ_MAX_AGE_SECONDS {
+        return Err(DestinationBlockError::BaseReadTooOld {
+            l1_time,
+            block_time,
+        });
+    }
+    Ok(())
 }
 
 /// The objects of a block that releases over Base: the finality update, the

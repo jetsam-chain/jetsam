@@ -59,6 +59,7 @@ pub(super) fn base_rules(anchor: &Committee) -> DestinationRules {
         anchor: None,
         bridge: None,
         bridge_rotations: &[],
+        fixext_height: None,
     };
     rules
 }
@@ -2284,3 +2285,79 @@ const BRIDGE2_ADDRESS_HEX: &str = "7ba0229a5a04cfa5a827be3c749eaf442c1764d4";
 const BRIDGE2_CODE_HASH_HEX: &str = "baad551d9d3b7e2bd7dbde6f0748c13f2b6968dabeab0144c4088e1325c69c75";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 const BRIDGE2_GENESIS_ID_HEX: &str = "93f67b6955f7d4f184cb3333515ad9dfcaca57bb56ae81f62e792be5628a4c5b";
+
+// ---------------------------------------------------------------------------
+// FIXEXT E-1: Base is read under a recent L1 block
+// ---------------------------------------------------------------------------
+
+/// [`base_rules`] with the FIXEXT rules armed at `h`.
+fn fixext_rules(c0: &Committee, h: Option<u64>) -> DestinationRules {
+    let mut rules = base_rules(c0);
+    rules.base_return.fixext_height = h;
+    rules
+}
+
+#[test]
+fn fixext_a_release_reads_base_under_an_l1_block_at_most_six_hours_old() {
+    use crate::consensus::params::BASE_READ_MAX_AGE_SECONDS;
+    let c0 = committee(1);
+    let keys = keys_of(&[&c0]);
+    let parent = state_at(HEIGHT - 1, known(&c0));
+    let r = release(3, ALICE, 5 * JTM);
+    let world = base_world(&r, VALID, TIMES);
+    let at = |timestamp: u64| {
+        let mut b = base_release_block(HEIGHT, &r, ALICE, &c0, &world);
+        b.header.timestamp = timestamp;
+        b
+    };
+    let armed = fixext_rules(&c0, Some(HEIGHT));
+    // At the age bound (inclusive), and with a block time behind the L1's.
+    for timestamp in [L1_TIME + BASE_READ_MAX_AGE_SECONDS, L1_TIME, L1_TIME - 600] {
+        assert!(
+            validate_block_destination(&at(timestamp), &parent, &armed, &keys).is_ok(),
+            "{timestamp}"
+        );
+    }
+    // One second older: refused (a blacklist after that L1 block would be
+    // ignored).
+    let stale = L1_TIME + BASE_READ_MAX_AGE_SECONDS + 1;
+    assert_eq!(
+        validate_block_destination(&at(stale), &parent, &armed, &keys),
+        Err(DestinationBlockError::BaseReadTooOld {
+            l1_time: L1_TIME,
+            block_time: stale,
+        })
+    );
+    // Below its height (and without it), the block of before: accepted.
+    for rules in [fixext_rules(&c0, Some(HEIGHT + 1)), fixext_rules(&c0, None)] {
+        assert!(validate_block_destination(&at(stale), &parent, &rules, &keys).is_ok());
+        assert!(validate_block_destination(&at(L1_TIME + 30 * 86_400), &parent, &rules, &keys).is_ok());
+    }
+}
+
+#[test]
+fn fixext_the_heights_of_each_profile() {
+    use crate::consensus::params::{
+        fixext_schedule_is_valid, V1_7_BASE_RETURN_HEIGHT, V1_7_FIXEXT_HEIGHT,
+    };
+    // Public: the return's own height, never apart from it.
+    assert!(fixext_schedule_is_valid(None, None, true));
+    assert!(fixext_schedule_is_valid(Some(5), Some(5), true));
+    assert!(!fixext_schedule_is_valid(Some(5), Some(6), true));
+    assert!(!fixext_schedule_is_valid(Some(5), None, true));
+    assert!(!fixext_schedule_is_valid(None, Some(5), true));
+    // Elsewhere: dormant, or at or above the return.
+    assert!(fixext_schedule_is_valid(Some(5), None, false));
+    assert!(fixext_schedule_is_valid(Some(5), Some(5), false));
+    assert!(fixext_schedule_is_valid(Some(5), Some(9), false));
+    assert!(!fixext_schedule_is_valid(Some(5), Some(4), false));
+    assert!(!fixext_schedule_is_valid(None, Some(5), false));
+    #[cfg(feature = "testnet")]
+    assert_eq!(V1_7_FIXEXT_HEIGHT, None);
+    #[cfg(not(feature = "testnet"))]
+    assert_eq!(V1_7_FIXEXT_HEIGHT, V1_7_BASE_RETURN_HEIGHT);
+    assert_eq!(
+        DestinationRules::CONSENSUS.base_return.fixext_height,
+        V1_7_FIXEXT_HEIGHT
+    );
+}

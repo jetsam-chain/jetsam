@@ -703,6 +703,66 @@ const _: () = assert!(
     "V1_7_RETURN_FIX_HEIGHT must be None with a dormant V1_7_BASE_RETURN_HEIGHT, else armed at or above it"
 );
 
+/// FIXEXT (external audit of the chain, E-1, F-4): from this height on,
+/// (1) a block that reads Base (a release, a fast release, a contradiction)
+/// reads it under an L1 block at most [`BASE_READ_MAX_AGE_SECONDS`] older
+/// than its own timestamp — `isGameClaimValid` judged (about) at present, as
+/// Base's portal judges it when a withdrawal is finalized, so that a
+/// blacklist, a retirement or a pause of Base's guardian binds the return
+/// within that age instead of the ≈ 54 h two known committees span; (2) the
+/// claim of an advance is not transferred in the block where the advance
+/// ends. Below it every block is judged exactly as before.
+///
+/// **On the public network: the return-over-Base height itself** (its return
+/// is dormant: these rules are part of it from its first block, no height of
+/// their own: [`fixext_schedule_is_valid`] holds them equal). **`None` on the
+/// test chain** until the operator chooses a height above the tip of the day,
+/// every node redeployed before it (a node without it accepts a stale read
+/// the others refuse: a hard fork of the test chain at that height). **Easy
+/// to move: this constant only.**
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = V1_7_BASE_RETURN_HEIGHT;
+/// The test chain's: not chosen.
+#[cfg(feature = "testnet")]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = None;
+
+/// FIXEXT E-1: the oldest L1 block (by its execution timestamp) a block may
+/// read Base under, behind its own timestamp: 6 h. Well above the relayer's
+/// own rebuild of a pending intent (2 h, `jetsam_guardian::slow_release`) and
+/// the L1's finality lag (≈ 13-19 min); far below the two committees' span.
+pub const BASE_READ_MAX_AGE_SECONDS: u64 = 6 * 3_600;
+
+/// Whether a FIXEXT height may sit beside a return-over-Base height: on the
+/// public network equal to it (the rules come with the return); elsewhere
+/// dormant, or at or above an armed return.
+pub const fn fixext_schedule_is_valid(
+    base_return_activation: Option<u64>,
+    fixext: Option<u64>,
+    public: bool,
+) -> bool {
+    match (base_return_activation, fixext) {
+        (None, None) => true,
+        (Some(base_return), Some(h)) => {
+            if public {
+                h == base_return
+            } else {
+                h >= base_return
+            }
+        }
+        (Some(_), None) => !public,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    fixext_schedule_is_valid(
+        V1_7_BASE_RETURN_HEIGHT,
+        V1_7_FIXEXT_HEIGHT,
+        cfg!(not(feature = "testnet"))
+    ),
+    "V1_7_FIXEXT_HEIGHT must equal V1_7_BASE_RETURN_HEIGHT on the public network, else be None or at or above it"
+);
+
 /// BRIDGE2 (D208, 14 November 2026): from this height on, the return over
 /// Base reads the test chain's second bridge (`v3-mn5-bridge2`, MN-5 without
 /// a dead end) instead of TN1's, abandoned: the bridge table of
