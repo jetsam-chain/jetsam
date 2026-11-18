@@ -671,3 +671,20 @@ fn the_observer_tells_its_reorganizations_tip_change_and_branches() {
     assert_eq!(o.tip_changed_at(), T0 + 60);
     assert_eq!(o.facts(), &node.facts);
 }
+
+/// M-6 (external audit 2026-11-18): SG-2's work rate, as `jg-fill` reads it: unknown before its window is covered,
+/// low at 0.3 of the expected rate, fine at it.
+#[test]
+fn m6_the_work_rate_is_read_on_its_own() {
+    let chain = testkit::chain(10, 1);
+    let mut node = FakeNode { facts: facts(&chain), chain: chain.clone(), wrong_hash_at: None, work_offset: false };
+    let mut obs = Observer::new(cfg(&chain), Chain::from_genesis(chain.header_at(0).unwrap().clone())).unwrap();
+    let now = run(&mut obs, &mut node, T0 - 3_000, T0, 180);
+    assert_eq!(obs.work_rate_ok(now), None, "the window not covered");
+    let (warm_obs, _, warm_now) = warm();
+    assert_eq!(warm_obs.work_rate_ok(warm_now), Some(true));
+    let mut node = FakeNode { facts: facts(&chain), chain: chain.clone(), wrong_hash_at: None, work_offset: false };
+    let mut slow = Observer::new(cfg(&chain), Chain::from_genesis(chain.header_at(0).unwrap().clone())).unwrap();
+    let now = run(&mut slow, &mut node, T0 - 8_000, T0, 600);
+    assert_eq!(slow.work_rate_ok(now), Some(false));
+}

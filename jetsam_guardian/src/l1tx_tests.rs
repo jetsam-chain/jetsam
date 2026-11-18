@@ -226,10 +226,10 @@ fn a5_13_off_the_rehearsal_the_priority_fee_is_configured_and_under_its_cap() {
         let e = parse(&key).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
         assert!(e.contains("priority_fee_wei") && e.contains("required"), "{p}: {e}");
         assert!(parse(&format!("{key}\npriority_fee_wei = 1000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}");
-        assert!(parse(&format!("{key}\npriority_fee_wei = 100000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: at the cap");
+        assert!(parse(&format!("{key}\npriority_fee_wei = 25000000")).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: a quarter of the cap (M-4)");
         let e = parse(&format!("{key}\npriority_fee_wei = 100000001")).open(p, 1, Some(addr), dir.path()).unwrap_err().to_string();
         assert!(e.contains("max_priority_fee_wei"), "{p}: {e}");
-        let raised = format!("{key}\npriority_fee_wei = 20000000000\nmax_priority_fee_wei = 20000000000");
+        let raised = format!("{key}\npriority_fee_wei = 20000000000\nmax_priority_fee_wei = 80000000000");
         assert!(parse(&raised).open(p, 1, Some(addr), dir.path()).is_ok(), "{p}: a cap raised knowingly");
         assert!(parse(&key).check_fees(p).is_err() && SignerConfig::default().check_fees(p).is_err(), "{p}");
     }
@@ -272,4 +272,181 @@ fn e9_the_signer_carries_its_daily_gas_budget() {
         L1Tx::Local(s) => assert_eq!(s.gas_budget, Some(30_000_000)),
         L1Tx::Endpoint { .. } => panic!("a local signer"),
     }
+}
+
+/// A local JSON-RPC L1 answering each call with `answer(method, params)` (`Err`: a JSON-RPC error), one request a
+/// connection; its URL.
+fn fake_l1(answer: impl FnMut(&str, &Value) -> Result<Value, String> + Send + 'static) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let answer = std::sync::Arc::new(std::sync::Mutex::new(answer));
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let body = loop {
+                let n = s.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..i]).to_ascii_lowercase();
+                    let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                    if raw.len() >= i + 4 + len {
+                        break Some(raw[i + 4..i + 4 + len].to_vec());
+                    }
+                }
+            };
+            let Some(body) = body else { continue };
+            let req: Value = serde_json::from_slice(&body).unwrap();
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            let out = (answer.lock().unwrap())(&method, &req["params"]);
+            let v = match out {
+                Ok(r) => serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": r}),
+                Err(m) => serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": m}}),
+            };
+            let text = v.to_string();
+            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len()).as_bytes());
+        }
+    });
+    url
+}
+
+fn test_sender(dir: &std::path::Path, policy: FeePolicy) -> Sender {
+    let k = crate::parse32("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let mut s = Sender::new(HotKey::from_bytes(&k).unwrap(), 31_337, policy, dir).unwrap();
+    s.replace_after = std::time::Duration::from_secs(3_600);
+    s.receipt_timeout = std::time::Duration::from_secs(3);
+    s
+}
+
+/// M-4 (external audit 2026-11-18): an advance found unmined at a recovery whose fees cannot be raised by 10 % (its tip
+/// at its cap) is still cancelled — at the caps — and never stops the recovery (before: `bump`'s error, the robot could
+/// neither send nor start until `pending.json` was removed by hand).
+#[test]
+fn m4_an_advance_whose_fees_cannot_be_raised_is_cancelled_at_the_caps_never_a_stuck_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(100), max_priority_fee_per_gas: 100 };
+    let mut s = test_sender(dir.path(), policy);
+    s.cancel_at_recovery = vec!["advanceBatch".into()];
+    let stale = s.tx(5, (100, 1_000), 200_000, "0x1111111111111111111111111111111111111111", "abcd").unwrap().sign(&s.key);
+    let p = Pending {
+        label: "advanceBatch".into(),
+        nonce: 5,
+        sent: vec![(format!("0x{}", hex::encode(stale.hash)), format!("0x{}", hex::encode(&stale.raw)))],
+        fees: (100, 1_000),
+        to: "0x1111111111111111111111111111111111111111".into(),
+        data: "0xabcd".into(),
+        gas_limit: 200_000,
+        sent_at: 1,
+    };
+    std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
+    let cancel: std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>> = Default::default();
+    let seen = cancel.clone();
+    let url = fake_l1(move |m, params| {
+        let sent = seen.lock().unwrap().clone();
+        match m {
+            "eth_sendRawTransaction" => {
+                let raw = hex::decode(params[0].as_str().unwrap().trim_start_matches("0x")).unwrap();
+                let hash = format!("0x{}", hex::encode(crate::keccak256(&raw)));
+                *seen.lock().unwrap() = Some((hash.clone(), raw));
+                Ok(Value::String(hash))
+            }
+            "eth_getTransactionReceipt" => match sent {
+                Some((h, _)) if params[0].as_str() == Some(h.as_str()) => {
+                    Ok(serde_json::json!({"blockNumber": "0x10", "status": "0x1", "gasUsed": "0x5208", "logs": []}))
+                }
+                _ => Ok(Value::Null),
+            },
+            "eth_getTransactionCount" => Ok(Value::String(if sent.is_some() { "0x6" } else { "0x5" }.into())),
+            "eth_getBlockByNumber" => Ok(serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x1"})),
+            other => Err(format!("unexpected {other}")),
+        }
+    });
+    let l1 = crate::l1::L1::new(&url);
+    match s.recover(&l1) {
+        Ok(Recovered::Cancelled(label)) => assert_eq!(label, "advanceBatch"),
+        other => panic!("cancelled at the caps, not {other:?}"),
+    }
+    let (_, raw) = cancel.lock().unwrap().clone().expect("a cancel was sent");
+    let cap = s.tx(5, (100, 1_000), 21_000, &format!("0x{}", hex::encode(s.address())), "").unwrap().sign(&s.key);
+    assert_eq!(raw, cap.raw, "a transfer of 0 to itself at nonce 5, at the caps (100, 1 000)");
+    assert!(s.pending().unwrap().is_none());
+}
+
+/// M-4: off the private rehearsal a configured tip leaves room for its replacements: at most a quarter of its cap
+/// (the deployed test chain's 0.001 gwei under the default 0.1 gwei cap passes).
+#[test]
+fn m4_off_the_rehearsal_a_configured_tip_leaves_room_for_its_replacements() {
+    use crate::Profile;
+    let parse = |t: &str| -> SignerConfig { toml::from_str(t).unwrap() };
+    for p in [Profile::Mainnet, Profile::PublicTestnet, Profile::OtherNetwork] {
+        assert!(parse("priority_fee_wei = 1000000").check_fees(p).is_ok(), "{p}: the deployed tip");
+        assert!(parse("priority_fee_wei = 25000000").check_fees(p).is_ok(), "{p}: a quarter of the cap");
+        let e = parse("priority_fee_wei = 25000001").check_fees(p).unwrap_err().to_string();
+        assert!(e.contains("max_priority_fee_wei") && e.contains("replace"), "{p}: {e}");
+        assert!(parse("priority_fee_wei = 100000000").check_fees(p).is_err(), "{p}: the tip at its cap");
+    }
+    assert!(parse("priority_fee_wei = 100000000").check_fees(Profile::PrivateRehearsal).is_ok(), "the rehearsal: under its cap only");
+}
+
+/// M-3 (external audit 2026-11-18): the daily gas budget runs on this host's clock, never on the L1 endpoint's block
+/// timestamps: an endpoint that dates its blocks two days ahead neither empties the window (a send over the budget is
+/// still refused) nor dates the gas of a mined transaction (kept at this host's time).
+#[test]
+fn m3_the_daily_gas_budget_runs_on_this_hosts_clock_not_on_the_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(1), max_priority_fee_per_gas: 100 };
+    let s = test_sender(dir.path(), policy).with_gas_budget(Some(100_000));
+    let now = crate::now_unix();
+    let ahead = format!("0x{:x}", now + 2 * 86_400);
+    std::fs::write(dir.path().join("gas.json"), serde_json::to_string(&GasBook { used: vec![(now, 90_000)] }).unwrap()).unwrap();
+    let (a1, a2) = (ahead.clone(), ahead.clone());
+    let url = fake_l1(move |m, _| match m {
+        "eth_call" => Ok(Value::String("0x".into())),
+        "eth_estimateGas" => Ok(Value::String("0x5208".into())),
+        "eth_getBlockByNumber" => Ok(serde_json::json!({"timestamp": a1, "baseFeePerGas": "0x1"})),
+        other => Err(format!("unexpected {other}: the budget should have refused")),
+    });
+    let e = format!("{:#}", s.send(&crate::l1::L1::new(&url), "0x1111111111111111111111111111111111111111", &[], "claimDeposit").unwrap_err());
+    assert!(e.contains(GAS_BUDGET_ALERT), "90 000 used an instant ago + 26 250 > 100 000, whatever the endpoint's time: {e}");
+    // a mined transaction found at a recovery: its gas dated by this host
+    let mined = s.tx(0, (1, 3), 21_000, "0x1111111111111111111111111111111111111111", "").unwrap().sign(&s.key);
+    let h = format!("0x{}", hex::encode(mined.hash));
+    let p = Pending { label: "claimDeposit".into(), nonce: 0, sent: vec![(h.clone(), format!("0x{}", hex::encode(&mined.raw)))], fees: (1, 3), to: "0x1111111111111111111111111111111111111111".into(), data: "0x".into(), gas_limit: 21_000, sent_at: now };
+    std::fs::write(&s.pending_path, serde_json::to_string(&p).unwrap()).unwrap();
+    let url = fake_l1(move |m, _| match m {
+        "eth_getTransactionReceipt" => Ok(serde_json::json!({"blockNumber": "0x10", "status": "0x1", "gasUsed": "0x5208", "logs": []})),
+        "eth_getBlockByNumber" => Ok(serde_json::json!({"timestamp": a2, "baseFeePerGas": "0x1"})),
+        other => Err(format!("unexpected {other}")),
+    });
+    assert!(matches!(s.recover(&crate::l1::L1::new(&url)).unwrap(), Recovered::Mined(..)));
+    let book = s.gas_book().unwrap();
+    let (t, g) = *book.used.last().unwrap();
+    assert_eq!(g, 21_000);
+    assert!(t >= now && t <= crate::now_unix(), "dated by this host ({t}), not by the block ({})", now + 2 * 86_400);
+}
+
+/// M-5 (external audit 2026-11-18): a send may be held under a lower share of the daily gas budget (jg-fill's
+/// advances), refused there before anything is signed while the whole budget would admit it.
+#[test]
+fn m5_a_send_within_a_share_of_the_budget_is_refused_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = FeePolicy { gas_margin_pct: 25, max_gas: 1_000_000, max_fee_per_gas: 1_000, priority_fee: Some(1), max_priority_fee_per_gas: 100 };
+    let s = test_sender(dir.path(), policy).with_gas_budget(Some(100_000));
+    std::fs::write(dir.path().join("gas.json"), serde_json::to_string(&GasBook { used: vec![(crate::now_unix(), 50_000)] }).unwrap()).unwrap();
+    let url = fake_l1(move |m, _| match m {
+        "eth_call" => Ok(Value::String("0x".into())),
+        "eth_estimateGas" => Ok(Value::String("0x5208".into())),
+        "eth_getBlockByNumber" => Ok(serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x1"})),
+        other => Err(format!("past the budget: {other}")),
+    });
+    let l1 = crate::l1::L1::new(&url);
+    let e = format!("{:#}", s.send_within(&l1, "0x1111111111111111111111111111111111111111", &[], "advanceBatch", Some(67_000)).unwrap_err());
+    assert!(e.contains(GAS_BUDGET_ALERT), "50 000 + 26 250 > 67 000: {e}");
+    let e = format!("{:#}", s.send(&l1, "0x1111111111111111111111111111111111111111", &[], "claimDeposit").unwrap_err());
+    assert!(!e.contains(GAS_BUDGET_ALERT) && e.contains("past the budget"), "50 000 + 26 250 ≤ 100 000: admitted ({e})");
 }

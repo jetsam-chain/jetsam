@@ -436,25 +436,32 @@ impl Observer {
             return Outcome::no(code);
         }
         // SG-2: work rate over the window, on the guardian's clock
-        let Some((t_s, w_s, target_s)) = self
-            .samples
-            .iter()
-            .rev()
-            .find(|(t, _, _)| *t + th.rate_window <= now)
-            .copied()
-            .filter(|(t, _, _)| now - t <= th.rate_max_span)
-        else {
-            return Outcome::no("RATE_WINDOW_NOT_COVERED");
-        };
-        let w_now = self.chain.work_at(tip).expect("tip");
-        if !rate_ok(&w_now, &w_s, &target_s, now - t_s, th) {
-            return Outcome::no("WORK_RATE_LOW");
+        match self.work_rate_ok(now) {
+            None => return Outcome::no("RATE_WINDOW_NOT_COVERED"),
+            Some(false) => return Outcome::no("WORK_RATE_LOW"),
+            Some(true) => {}
         }
         // SG-17: deposits no more than this node counted
         if kind == StatementKind::Cosign && s.deposit_count > self.deposits_up_to(s.height) {
             return Outcome::no("DEPOSIT_COUNT_IMPLAUSIBLE");
         }
         Outcome::ok()
+    }
+
+    /// SG-2: the work gained over the rate window up to `now` (the guardian's clock) against the target of its start;
+    /// `None` while no sample covers the window (`RATE_WINDOW_NOT_COVERED`). M-6 (external audit 2026-11-18): `jg-fill`
+    /// pauses on it too.
+    pub fn work_rate_ok(&self, now: u64) -> Option<bool> {
+        let th = &self.cfg.thresholds;
+        let (t_s, w_s, target_s) = self
+            .samples
+            .iter()
+            .rev()
+            .find(|(t, _, _)| *t + th.rate_window <= now)
+            .copied()
+            .filter(|(t, _, _)| now - t <= th.rate_max_span)?;
+        let w_now = self.chain.work_at(self.chain.tip_height()).expect("tip");
+        Some(rate_ok(&w_now, &w_s, &target_s, now - t_s, th))
     }
 
     /// SG-4: heights `height − 7 ..= height` seen with their current ids, each

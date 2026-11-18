@@ -270,6 +270,12 @@ impl FeePolicy {
         Ok((prio, base.saturating_mul(2).saturating_add(prio).min(self.max_fee_per_gas)))
     }
 
+    /// M-4 (external audit 2026-11-18): the highest fees this policy may pay, `(tip cap, fee cap)` (the tip within the fee
+    /// cap): a cancellation whose fees cannot be raised by 10 % goes at them.
+    pub fn ceiling(&self) -> (u128, u128) {
+        (self.max_priority_fee_per_gas.min(self.max_fee_per_gas), self.max_fee_per_gas)
+    }
+
     /// The fees of a replacement of a transaction sent with `old`: both raised by 1/8, rounded up, within
     /// their caps (the tip's own, A5-13); refused when a cap leaves less than the 10 % raise the endpoints
     /// require.
@@ -336,7 +342,8 @@ pub struct Sender {
     /// zero-value transfer to the key itself, fees raised) instead of being sent again: what was decided before the
     /// stop may no longer hold (`jg-fill`'s advances: `fill::CANCEL_AT_RECOVERY`). Empty: every one is sent again.
     pub cancel_at_recovery: Vec<String>,
-    /// E-9 (audit 2026-11-10): the gas this key's transactions may use over any 24 h of the L1 clock (`None`: no budget).
+    /// E-9 (audit 2026-11-10): the gas this key's transactions may use over any 24 h of this host's clock (M-3; `None`: no
+    /// budget).
     /// A send whose gas limit would take the gas used in the last 24 h above it is refused before anything is signed
     /// ([`GAS_BUDGET_ALERT`]); the gas of each mined one is kept in `gas.json` beside `pending.json`, across restarts.
     pub gas_budget: Option<u64>,
@@ -344,10 +351,11 @@ pub struct Sender {
 
 /// E-9: the text of a send refused by the daily gas budget (an alert of the caller, never a revert).
 pub const GAS_BUDGET_ALERT: &str = "ALERT GAS_BUDGET";
-/// E-9: the window of the gas budget, L1 seconds.
+/// E-9: the window of the gas budget, seconds of this host's clock (M-3).
 pub const GAS_BUDGET_WINDOW_SECS: u64 = 86_400;
 
-/// E-9: the gas used by a key's mined transactions, `(L1 time of its block, gas used)`, the last 24 h.
+/// E-9: the gas used by a key's mined transactions, `(this host's time its receipt was read, gas used)`, the last 24 h
+/// (M-3: an entry dated ahead of the clock stays counted).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GasBook {
     pub used: Vec<(u64, u64)>,
@@ -415,13 +423,16 @@ impl Sender {
         }
     }
 
-    /// E-9: the gas of a mined transaction of this key, kept (written and synced) when a budget is set.
+    /// E-9: the gas of a mined transaction of this key, kept (written and synced) when a budget is set. M-3 (external
+    /// audit 2026-11-18): dated by this host's clock when its receipt is read, never by its block's timestamp (the L1
+    /// endpoint's word: a day ahead, every entry would leave the window at once).
     fn record_gas(&self, r: &Receipt) -> anyhow::Result<()> {
         if self.gas_budget.is_none() {
             return Ok(());
         }
         let mut book = self.gas_book()?;
-        book.record(r.block_timestamp, r.gas_used, r.block_timestamp);
+        let now = crate::now_unix();
+        book.record(now, r.gas_used, now);
         crate::write_atomic(&self.gas_book_path(), &serde_json::to_vec(&book)?)
     }
 
@@ -519,7 +530,17 @@ impl Sender {
             let mut p = p;
             let label = p.label.clone();
             let own: Vec<String> = p.sent.iter().map(|(h, _)| h.clone()).collect();
-            let fees = self.policy.bump(p.fees)?;
+            // M-4 (external audit 2026-11-18): fees that cannot be raised by 10 % (a tip at its cap, a transaction
+            // replaced up to its caps) never stop the recovery: the cancel goes at the caps; a pool that still holds the
+            // transaction refuses it, and the transaction is waited for (one of its versions, or the cancel, is mined;
+            // a later recovery sends the cancel again)
+            let fees = match self.policy.bump(p.fees) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{} l1tx: the cancel of {label} (nonce {}) goes at the fee caps: {e:#}", crate::now_unix(), p.nonce);
+                    self.policy.ceiling()
+                }
+            };
             let me = hex0x(&self.address());
             let signed = self.tx(p.nonce, fees, 21_000, &me, "")?.sign(&self.key);
             p.sent.push((hex0x(&signed.hash), hex0x(&signed.raw)));
@@ -530,7 +551,9 @@ impl Sender {
             p.gas_limit = 21_000;
             p.sent_at = crate::now_unix();
             self.write_pending(&p)?;
-            self.broadcast(l1, &hex0x(&signed.raw))?;
+            if let Err(e) = self.broadcast(l1, &hex0x(&signed.raw)) {
+                eprintln!("{} l1tx: the cancel of {label} (nonce {}) was not taken ({e:#}): its transaction is waited for", crate::now_unix(), p.nonce);
+            }
             return match self.wait(l1, p)? {
                 Some(r) if own.contains(&r.tx_hash) => Ok(Recovered::Mined(r, label)),
                 Some(_) => Ok(Recovered::Cancelled(label)),
@@ -615,6 +638,12 @@ impl Sender {
     /// reason is the error), a gas estimate above the cap, fees above the cap, too little ether for the
     /// gas. A transaction still pending from before (a stop, a timeout) is settled first.
     pub fn send(&self, l1: &L1, to: &str, data: &[u8], label: &str) -> anyhow::Result<Receipt> {
+        self.send_within(l1, to, data, label, None)
+    }
+
+    /// [`Self::send`] with the daily gas budget lowered to `ceiling` for this call (M-5, external audit 2026-11-18:
+    /// `jg-fill`'s advances spend a share of it only, the rest kept for its own claims); no effect without a budget.
+    pub fn send_within(&self, l1: &L1, to: &str, data: &[u8], label: &str, ceiling: Option<u64>) -> anyhow::Result<Receipt> {
         match self.recover(l1)? {
             Recovered::Nothing => {}
             Recovered::Mined(r, old) => {
@@ -631,14 +660,15 @@ impl Sender {
         let estimate = hex_u64(&l1.rpc("eth_estimateGas", json!([call, "pending"]))?)?;
         let gas_limit = self.policy.gas_limit(estimate)?;
         let latest = l1.rpc("eth_getBlockByNumber", json!(["latest", false]))?;
-        // E-9: within the daily gas budget, its whole gas limit counted, before anything is signed
-        if let Some(budget) = self.gas_budget {
-            let l1_now = hex_u64(&latest["timestamp"])?;
+        // E-9: within the daily gas budget, its whole gas limit counted, before anything is signed; M-3: over 24 h of
+        // this host's clock (the L1 endpoint's timestamps could reset it at every send)
+        if let Some(budget) = self.gas_budget.map(|b| ceiling.map_or(b, |c| c.min(b))) {
+            let now = crate::now_unix();
             let book = self.gas_book()?;
             anyhow::ensure!(
-                book.admits(l1_now, gas_limit, budget),
-                "{GAS_BUDGET_ALERT}: {label} may use {gas_limit} gas, {} used in the last 24 h of the L1 clock, daily_gas_budget {budget}: not sent",
-                book.spent(l1_now)
+                book.admits(now, gas_limit, budget),
+                "{GAS_BUDGET_ALERT}: {label} may use {gas_limit} gas, {} used in the last 24 h of this host's clock, daily_gas_budget {budget}: not sent",
+                book.spent(now)
             );
         }
         let base = quantity(&latest["baseFeePerGas"]).unwrap_or(0);
@@ -712,6 +742,10 @@ fn default_max_priority_fee() -> u64 {
     FeePolicy::default().max_priority_fee_per_gas as u64
 }
 
+/// M-4 (external audit 2026-11-18): off the private rehearsal a configured tip is at most its cap divided by this (room
+/// for ten replacements of 1/8 at the most).
+pub const PRIORITY_FEE_HEADROOM: u64 = 4;
+
 /// How a robot's transactions are signed.
 #[derive(Debug)]
 pub enum L1Tx {
@@ -758,6 +792,16 @@ impl SignerConfig {
         }
         if let Some(p) = self.priority_fee_wei {
             anyhow::ensure!(p <= self.max_priority_fee_wei, "[signer] priority_fee_wei {p} is above max_priority_fee_wei {}", self.max_priority_fee_wei);
+            // M-4 (external audit 2026-11-18): room for the replacements (each raises the tip by 1/8, the endpoints want
+            // 10 %): a tip at its cap could never be replaced, nor its transaction cancelled
+            if profile.strict() {
+                anyhow::ensure!(
+                    p.saturating_mul(PRIORITY_FEE_HEADROOM) <= self.max_priority_fee_wei,
+                    "[signer] priority_fee_wei {p} is above max_priority_fee_wei {} / {PRIORITY_FEE_HEADROOM} on {profile} (M-4: \
+                     no room to replace its transactions)",
+                    self.max_priority_fee_wei
+                );
+            }
         }
         Ok(())
     }
@@ -812,9 +856,30 @@ impl L1Tx {
 
     /// Send a call and wait for its receipt.
     pub fn send(&self, l1: &L1, to: &str, data: &[u8], label: &str) -> anyhow::Result<Receipt> {
+        self.send_within(l1, to, data, label, None)
+    }
+
+    /// [`Sender::send_within`] (`Local` only: the endpoint's TEST account has no budget).
+    pub fn send_within(&self, l1: &L1, to: &str, data: &[u8], label: &str, ceiling: Option<u64>) -> anyhow::Result<Receipt> {
         match self {
-            L1Tx::Local(s) => s.send(l1, to, data, label),
+            L1Tx::Local(s) => s.send_within(l1, to, data, label, ceiling),
             L1Tx::Endpoint { from } => l1.send(&hex0x(from), to, data),
+        }
+    }
+
+    /// F-6: the label of the transaction in flight from an earlier run (`pending.json`), if any (`Local` only).
+    pub fn pending_label(&self) -> Option<String> {
+        match self {
+            L1Tx::Local(s) => s.pending().ok().flatten().map(|p| p.label),
+            L1Tx::Endpoint { .. } => None,
+        }
+    }
+
+    /// M-5: the daily gas budget of this signer (`Local` only).
+    pub fn gas_budget(&self) -> Option<u64> {
+        match self {
+            L1Tx::Local(s) => s.gas_budget,
+            L1Tx::Endpoint { .. } => None,
         }
     }
 }
