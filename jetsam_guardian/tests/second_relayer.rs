@@ -912,6 +912,8 @@ fn activ_fast_run_does_not_start_beside_a_node_whose_activations_are_not_its_bui
             .arg("--key")
             .arg(&key)
             .args(["--l1", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9", "--base", "http://127.0.0.2:9"])
+            // M-10 (external audit of the robots): required on the mainnet's build
+            .args(["--alert-command", "/bin/true"])
             .args(["--beacon", "http://127.0.0.1:9", "--node", node, "--node-cookie"])
             .arg(root.path().join("rpc.cookie"))
             .arg("--state-dir")
@@ -964,6 +966,8 @@ fn slow_fast_run_takes_a_key_or_no_fast_and_says_its_slow_mode() {
             .arg("fast-run")
             .args(extra)
             .args(["--l1", "http://127.0.0.1:9", "--base", "http://127.0.0.1:9", "--base", "http://127.0.0.2:9"])
+            // M-10 (external audit of the robots): required on the mainnet's build
+            .args(["--alert-command", "/bin/true"])
             .args(["--beacon", "http://127.0.0.1:9", "--node", "http://127.0.0.1:9", "--node-cookie"])
             .arg(root.path().join("rpc.cookie"))
             .arg("--state-dir")
