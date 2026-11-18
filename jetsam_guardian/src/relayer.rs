@@ -943,6 +943,56 @@ pub fn after_own_receipt(reverts: u32, status: bool, raced: bool) -> (u32, Optio
     crate::fill::after_receipt(reverts, status)
 }
 
+/// E-1: what one node answered for the blocks a point names (STUB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witness {
+    Holds,
+    Other,
+    Silent,
+}
+
+/// E-1 (STUB: the old veto).
+pub fn witnessed_by(answers: &[Witness], min_nodes: usize) -> bool {
+    !answers.contains(&Witness::Other) && answers.iter().filter(|a| **a == Witness::Holds).count() >= min_nodes
+}
+
+/// E-1 (STUB: one height at a time).
+pub fn common_ancestor(top: u64, agrees: &mut dyn FnMut(u64) -> anyhow::Result<bool>) -> anyhow::Result<u64> {
+    let mut common = top;
+    while common > 0 && !agrees(common)? {
+        common -= 1;
+    }
+    Ok(common)
+}
+
+/// E-1 (c).
+pub const MAX_HEADERS_PER_STEP: u64 = 10_000;
+
+/// E-1 (STUB).
+pub fn headers_to_read(tip: u64, node_tip: u64) -> std::ops::RangeInclusive<u64> {
+    tip + 1..=node_tip
+}
+
+/// M-1 (STUB).
+pub fn admit_header(
+    _c: &Chain,
+    _hd: &crate::chain::HeaderInfo,
+    _s: &jetsam_bridge_program::rules::Schedule,
+    _pow_ok: &mut dyn FnMut(&crate::chain::HeaderInfo) -> bool,
+) -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// M-3.
+pub const MAX_REVERTS_PER_DAY: u32 = 6;
+/// M-3.
+pub const HALT_REVERT_BUDGET: &str = "HALT_REVERT_BUDGET";
+
+/// M-3 (STUB).
+pub fn revert_budget(_times: &mut Vec<u64>, _now: u64) -> Option<&'static str> {
+    None
+}
+
 /// The relayer's latched halt (`<state_dir>/HALT`, its reasons, one a line), if any: while it is there, the relayer
 /// sends nothing (it reads, learns and rebuilds); only an operator removes it (D41).
 pub fn relay_halted(state_dir: &Path) -> Option<String> {
@@ -1836,6 +1886,10 @@ pub struct RelayConfig {
     /// The address of the endpoint's unlocked account (`[signer] mode = "endpoint"`, the rehearsal only).
     pub from_address: Option<String>,
     pub prover: ProverConfig,
+    /// M-10 (external audit 2026-11-18): the operator's external alert, argv (`{event}`, `{detail}` replaced), run on
+    /// the relayer's alerts (never through a shell, bounded); required on the mainnet, none by default elsewhere.
+    #[serde(default)]
+    pub alert_command: Vec<String>,
 }
 
 fn default_min_nodes() -> usize {

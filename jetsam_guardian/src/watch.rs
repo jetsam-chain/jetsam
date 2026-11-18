@@ -232,6 +232,25 @@ pub struct WatchState {
     pub unknown_since: Option<u64>,
     #[serde(default)]
     pub unknown_alerted: bool,
+    /// F-9 (external audit 2026-11-18): the alerts whose command failed, (event, detail), oldest first, sent again.
+    #[serde(default)]
+    pub pending_alerts: Vec<(String, String)>,
+}
+
+/// F-9: alerts kept for a later try at most (the oldest dropped first).
+pub const MAX_PENDING_ALERTS: usize = 32;
+
+/// F-9: the alert `event` did not go out: kept to be sent again (STUB).
+pub fn alert_failed(_state: &mut WatchState, _event: &str, _detail: &str) {}
+
+/// E-2: the blind watchdog (STUB).
+pub fn spawn_blind_watchdog(
+    _last_ok: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    _alert_after: u64,
+    _tick: Duration,
+    _alert: impl Fn(&str, &str) -> bool + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| {})
 }
 
 /// What to run now.

@@ -82,6 +82,15 @@ pub const FAST_RELEASE_ALLOWLIST: &[&str] = &[
 /// Tor's default SOCKS port.
 pub const DEFAULT_TOR_SOCKS: &str = "127.0.0.1:9050";
 
+/// E-2 (external audit 2026-11-18): a whole call — connection, Tor, TLS, request, answer — ends within this many times
+/// its timeout (each read and write is still bounded by the timeout itself): a server that sends one byte at a time
+/// can no longer hold a robot, nor the watcher, for ever.
+pub const CALL_DEADLINE_FACTOR: u32 = 3;
+
+/// E-2: the largest answer read (its head included), 32 MiB: a block (≈ 2 MiB hex at most), a window of logs or a
+/// storage proof fit many times; an answer that says or streams more is refused, never held whole in (locked) memory.
+pub const MAX_ANSWER_BYTES: usize = 32 << 20;
+
 /// How the guardian reaches an RPC (A4-1, D60).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Egress {

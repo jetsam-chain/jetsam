@@ -764,3 +764,109 @@ fn activ_the_clients_of_the_relayer_the_robot_and_fast_run_read_the_activations(
     }
     assert!(FILL_ALLOWLIST.contains(&crate::activations::METHOD) && FAST_RELEASE_ALLOWLIST.contains(&crate::activations::METHOD));
 }
+
+// ---- E-2 (external audit 2026-11-18): a whole call is bounded in time and in bytes ----
+
+/// Serves one connection: reads the request head (and body for a POST), writes `head`, then one byte every `drip`
+/// until the client goes away.
+fn serve_drip_once(head: &'static str, drip: Duration) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut req = String::new();
+        let mut buf = vec![0u8; 65_536];
+        while !req.contains("\r\n\r\n") || (req.starts_with("POST") && !req.contains("\"params\"")) {
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                return;
+            }
+            req.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        if s.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for _ in 0..600 {
+            std::thread::sleep(drip);
+            if s.write_all(b" ").and_then(|()| s.flush()).is_err() {
+                return;
+            }
+        }
+    });
+    (port, server)
+}
+
+/// E-2: a server that sends one byte at a time, each well within the read timeout, no longer holds a call for ever:
+/// the whole call ends within its deadline (CALL_DEADLINE_FACTOR × the timeout), with an error.
+#[test]
+fn e2_a_dripping_server_cannot_hold_a_json_rpc_call_past_its_deadline() {
+    let (port, server) = serve_drip_once("HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n", Duration::from_millis(100));
+    let t = std::time::Instant::now();
+    let e = call(&format!("http://127.0.0.1:{port}"), "eth_chainId", json!([]), Duration::from_secs(1)).unwrap_err();
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(1) * (CALL_DEADLINE_FACTOR + 2), "returned after {took:?}");
+    assert!(format!("{e:#}").contains("deadline"), "{e:#}");
+    server.join().unwrap();
+}
+
+/// E-2: the same for a GET (the beacon feed, the guardians' onion feeds): no `read_to_end` without an end.
+#[test]
+fn e2_a_dripping_server_cannot_hold_a_get_past_its_deadline() {
+    let (port, server) = serve_drip_once("HTTP/1.1 200 OK\r\n\r\n", Duration::from_millis(100));
+    let t = std::time::Instant::now();
+    let e = get_bytes_via(&Egress::Clearnet, &format!("http://127.0.0.1:{port}/x"), Duration::from_secs(1)).unwrap_err();
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(1) * (CALL_DEADLINE_FACTOR + 2), "returned after {took:?}");
+    assert!(format!("{e:#}").contains("deadline"), "{e:#}");
+    server.join().unwrap();
+}
+
+/// E-2: an answer that says it is larger than MAX_ANSWER_BYTES is refused at its head, and one that streams more than
+/// that (no length, or in chunks) is refused once it passes it: never held whole in (locked) memory.
+#[test]
+fn e2_an_answer_larger_than_the_cap_is_refused() {
+    let huge = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_ANSWER_BYTES + 1);
+    let (port, server) = serve_raw_once(huge, Duration::ZERO);
+    let e = call(&format!("http://127.0.0.1:{port}"), "eth_chainId", json!([]), Duration::from_secs(5)).unwrap_err();
+    assert!(format!("{e:#}").contains("larger than"), "{e:#}");
+    server.join().unwrap();
+    for head in ["HTTP/1.1 200 OK\r\n\r\n", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65_536];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(head.as_bytes());
+            let chunk = vec![b'7'; 1 << 20];
+            for _ in 0..(MAX_ANSWER_BYTES >> 20) + 4 {
+                let piece = if head.contains("chunked") { [format!("{:x}\r\n", chunk.len()).into_bytes(), chunk.clone(), b"\r\n".to_vec()].concat() } else { chunk.clone() };
+                if s.write_all(&piece).is_err() {
+                    return;
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        let e = call(&url, "eth_chainId", json!([]), Duration::from_secs(20)).unwrap_err();
+        assert!(format!("{e:#}").contains("larger than"), "{head:?}: {e:#}");
+        server.join().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65_536];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(head.as_bytes());
+            let chunk = vec![b'7'; 1 << 20];
+            for _ in 0..(MAX_ANSWER_BYTES >> 20) + 4 {
+                let piece = if head.contains("chunked") { [format!("{:x}\r\n", chunk.len()).into_bytes(), chunk.clone(), b"\r\n".to_vec()].concat() } else { chunk.clone() };
+                if s.write_all(&piece).is_err() {
+                    return;
+                }
+            }
+        });
+        let e = get_bytes_via(&Egress::Clearnet, &format!("http://127.0.0.1:{port}/x"), Duration::from_secs(20)).unwrap_err();
+        assert!(format!("{e:#}").contains("larger than"), "GET {head:?}: {e:#}");
+        server.join().unwrap();
+    }
+}

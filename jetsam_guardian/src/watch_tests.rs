@@ -1,6 +1,9 @@
 use super::*;
 
 fn watch_toml(network: &str, chain: u64, extra: &str) -> String {
+    // E-3: the mainnet's watcher reads a second L1 endpoint (none given here: the one of each test, or the default one)
+    let second = if network == hex::encode(crate::MAINNET_NETWORK) && !extra.contains("l1_rpc_second") { "l1_rpc_second = \"http://127.0.0.1:8547\"\n" } else { "" };
+    let extra = format!("{second}{extra}");
     format!(
         "network = \"{network}\"\nl1_chain_id = {chain}\nl1_bridge = \"0x1111111111111111111111111111111111111111\"\nl1_rpc = \"http://127.0.0.1:8545\"\n\
          state_dir = \"/tmp/w\"\npause_command = [\"/opt/bridge-pause.sh\", \"--send\"]\nalert_command = [\"/opt/alert\", \"{{event}}\", \"{{detail}}\"]\n{extra}\n\
@@ -262,7 +265,8 @@ fn gu2_a_second_l1_source_must_agree_before_any_pause() {
     let mainnet = hex::encode(crate::MAINNET_NETWORK);
     let c = WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://127.0.0.1:8546\"\n")).expect("a second L1 endpoint");
     assert_eq!(c.l1_rpc_second.as_deref(), Some("http://127.0.0.1:8546"));
-    assert_eq!(WatchConfig::parse(&watch_toml(&mainnet, 1, "")).unwrap().l1_rpc_second, None, "none by default: as before");
+    let testnet = hex::encode(crate::TESTNET_NETWORK);
+    assert_eq!(WatchConfig::parse(&watch_toml(&testnet, 84_532, "")).unwrap().l1_rpc_second, None, "none by default off the mainnet: as before");
     let same = WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://127.0.0.1:8545\"\n")).unwrap_err().to_string();
     assert!(same.contains("l1_rpc_second"), "{same}");
     assert!(WatchConfig::parse(&watch_toml(&mainnet, 1, "l1_rpc_second = \"http://10.1.2.3:8546\"\n")).is_err(), "checked like l1_rpc");
@@ -274,4 +278,103 @@ fn gu2_a_second_l1_source_must_agree_before_any_pause() {
     assert!(merge_tips(Some(t), Some(Some(Tip { locked_block: [0xcd; 32], ..t }))).is_err());
     assert!(merge_tips(Some(t), Some(Some(Tip { locked_height: 101, ..t }))).is_err());
     assert!(merge_tips(Some(t), Some(None)).is_err());
+}
+
+// ---------------------------------------------------------------- external audit 2026-11-18 (E-2, E-3, M-9, F-9)
+
+/// E-3: the two L1 endpoints must also agree on the tip's acceptance time and on `pausedUntil`: one endpoint that says
+/// "frozen" (no pause run) or "a new point" (no NO_NEW_POINT) on its own word gives no verdict.
+#[test]
+fn e3_the_two_l1_sources_must_agree_on_the_freeze_and_the_acceptance_time_too() {
+    let t = tip(1, 1_000);
+    assert_eq!(merge_tips(Some(t), Some(Some(t))), Ok(Some(t)));
+    let e = merge_tips(Some(Tip { paused_until: 90_000, ..t }), Some(Some(t))).unwrap_err();
+    assert!(e.contains("paused"), "{e}");
+    let e = merge_tips(Some(t), Some(Some(Tip { accepted_at: 999, ..t }))).unwrap_err();
+    assert!(e.contains("accepted"), "{e}");
+}
+
+/// E-3: on the mainnet, a second L1 endpoint is required (one lying endpoint must not blind the watcher); the public
+/// test network keeps it optional (its deployed watch.toml has none).
+#[test]
+fn e3_the_mainnet_watcher_requires_a_second_l1_endpoint() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let without = watch_toml(&mainnet, 1, "").replace("l1_rpc_second = \"http://127.0.0.1:8547\"\n", "");
+    let e = WatchConfig::parse(&without).unwrap_err().to_string();
+    assert!(e.contains("l1_rpc_second"), "{e}");
+    assert!(WatchConfig::parse(&watch_toml(&mainnet, 1, "")).is_ok());
+    let testnet = hex::encode(crate::TESTNET_NETWORK);
+    assert!(WatchConfig::parse(&watch_toml(&testnet, 84_532, "")).is_ok(), "the public test network: optional");
+}
+
+/// M-9: a freeze this watcher saw (its pause, or one it found) that ENDS while the tip is still off the chain is alerted
+/// (PAUSE_EXPIRED) and the incident pauses again (its runs counted afresh); a pause whose freeze was never seen is not
+/// taken for an expired one.
+#[test]
+fn m9_a_freeze_that_expires_with_the_tip_still_off_the_chain_is_alerted_and_paused_again() {
+    let mut s = WatchState::default();
+    let t = tip(1, 1_000);
+    assert_eq!(events(&decide(&mut s, &t, Verdict::OffOurChain, 1_100, 10, 6_600)), vec!["pause"]);
+    pause_started(&mut s, 10);
+    assert_eq!(events(&[pause_ended(&mut s, true, "exit status 0")]), vec!["PAUSED"]);
+    // not frozen yet (the pause not mined at this poll): nothing, never an "expiry"
+    assert!(decide(&mut s, &t, Verdict::OffOurChain, 1_150, 70, 6_600).iter().all(|a| !matches!(a, Action::Pause)));
+    let frozen = Tip { paused_until: 1_100 + 172_800, ..t };
+    let quiet = |a: &[Action]| events(a).into_iter().filter(|e| e != "NO_NEW_POINT").collect::<Vec<_>>();
+    assert!(quiet(&decide(&mut s, &frozen, Verdict::OffOurChain, 1_200, 130, 6_600)).is_empty(), "frozen: nothing");
+    assert!(quiet(&decide(&mut s, &frozen, Verdict::OffOurChain, 1_100 + 172_799, 200_000, 6_600)).is_empty(), "still frozen");
+    assert_eq!(quiet(&decide(&mut s, &frozen, Verdict::OffOurChain, 1_100 + 172_800, 200_060, 6_600)), vec!["PAUSE_EXPIRED", "pause"]);
+    assert!(s.incident.as_ref().is_some_and(|i| !i.paused && i.attempts == 0), "{:?}", s.incident);
+    // an operator's freeze found at the incident's start expires the same way
+    let mut s = WatchState::default();
+    assert_eq!(quiet(&decide(&mut s, &frozen, Verdict::OffOurChain, 1_200, 10, 6_600)), vec!["ALREADY_PAUSED"]);
+    assert_eq!(quiet(&decide(&mut s, &frozen, Verdict::OffOurChain, 1_100 + 172_801, 99_000, 6_600)), vec!["PAUSE_EXPIRED", "pause"]);
+    // back on the chain meanwhile: over, nothing
+    let mut s = WatchState::default();
+    decide(&mut s, &frozen, Verdict::OffOurChain, 1_200, 10, 6_600);
+    assert!(quiet(&decide(&mut s, &frozen, Verdict::OnOurChain, 1_100 + 172_801, 99_000, 6_600)).is_empty());
+}
+
+/// F-9: an alert whose command failed is kept (in watch.json) and sent again, oldest first, a bounded queue; the late
+/// point keeps its own re-arm.
+#[test]
+fn f9_an_alert_whose_command_failed_is_kept_and_sent_again() {
+    let mut s = WatchState::default();
+    alert_failed(&mut s, "PAUSED", "d1");
+    alert_failed(&mut s, "PAUSE_FAILED", "d2");
+    s.stale_alerted = Some("ab".into());
+    alert_failed(&mut s, "NO_NEW_POINT", "d3");
+    assert_eq!(s.stale_alerted, None, "the late point is raised again by decide");
+    let back: WatchState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(back.pending_alerts, vec![("PAUSED".to_string(), "d1".to_string()), ("PAUSE_FAILED".to_string(), "d2".to_string())]);
+    for i in 0..(2 * MAX_PENDING_ALERTS) {
+        alert_failed(&mut s, "VERDICT_UNKNOWN", &format!("{i}"));
+    }
+    assert_eq!(s.pending_alerts.len(), MAX_PENDING_ALERTS, "bounded");
+    assert_eq!(s.pending_alerts.last().unwrap().1, format!("{}", 2 * MAX_PENDING_ALERTS - 1), "the newest kept");
+    let old: WatchState = serde_json::from_str(r#"{"incident": null}"#).unwrap();
+    assert!(old.pending_alerts.is_empty(), "an older watch.json loads");
+}
+
+/// E-2: the watcher's blindness is judged by a thread of its own: a read that hangs (a call held by its server) no
+/// longer silences WATCHER_BLIND; said once per blind stretch, again after a read.
+#[test]
+fn e2_the_blind_alert_goes_out_while_the_watchers_loop_hangs() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    let last_ok = Arc::new(AtomicU64::new(crate::now_unix().saturating_sub(10)));
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = said.clone();
+    let _dog = spawn_blind_watchdog(last_ok.clone(), 5, Duration::from_millis(50), move |event: &str, _detail: &str| {
+        sink.lock().unwrap().push(event.to_string());
+        true
+    });
+    // the loop "hangs": last_ok never moves
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(*said.lock().unwrap(), vec!["WATCHER_BLIND".to_string()], "once");
+    last_ok.store(crate::now_unix(), Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(200));
+    last_ok.store(crate::now_unix().saturating_sub(10), Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(said.lock().unwrap().len(), 2, "again after a read");
 }

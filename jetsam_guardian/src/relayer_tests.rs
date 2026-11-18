@@ -396,6 +396,15 @@ fn a_published_final_root_is_read_back_only_when_its_deposits_make_its_root() {
 }
 
 fn relay_toml(network: &str, chain: u64, bridge: &str, extra: &str) -> String {
+    // F-6, M-10 (external audit 2026-11-18): off the rehearsal a first L1 block is named; on the mainnet an alert command
+    let mut more = String::new();
+    if !extra.contains("l1_from_block") {
+        more.push_str("l1_from_block = 1\n");
+    }
+    if network == hex::encode(crate::MAINNET_NETWORK) && !extra.contains("alert_command") {
+        more.push_str("alert_command = [\"/opt/alert\", \"{event}\", \"{detail}\"]\n");
+    }
+    let extra = format!("{more}{extra}");
     format!(
         "network = \"{network}\"\nl1_chain_id = {chain}\nl1_bridge = \"{bridge}\"\nl1_rpc = \"http://127.0.0.1:8545\"\ndeposits_from_height = 128\n\
          state_dir = \"/tmp/x\"\npublish_dir = \"/tmp/y\"\n{extra}\n\
@@ -1887,4 +1896,130 @@ fn bridge2_mn5_the_margin_follows_the_bridges_rule() {
         mn5_margin_low(Mn5Rule::V3Mn5, &mn(45_000), base + 21_600)
     );
     assert!(!mn5_margin_low(Mn5Rule::V3Mn5, &mn(45_000), base + 48 * 3_600));
+}
+
+// ---------------------------------------------------------------- external audit 2026-11-18 (E-1, M-1, M-3, M-10, F-4, F-6)
+
+/// E-1 (a): one node that answers another block no longer vetoes every point: the points go when `min_nodes` nodes
+/// hold them AND more nodes hold them than hold another block there; a tie, or a majority against, never.
+#[test]
+fn e1_one_dissenting_node_among_three_no_longer_vetoes_a_point() {
+    use Witness::*;
+    assert!(witnessed_by(&[Holds, Holds], 2));
+    assert!(!witnessed_by(&[Holds, Other], 2), "two nodes: one against is still no witness");
+    assert!(witnessed_by(&[Holds, Holds, Other], 2), "one liar of three: the majority holds them");
+    assert!(!witnessed_by(&[Holds, Other, Other], 2));
+    assert!(!witnessed_by(&[Holds, Holds, Other, Other], 2), "a tie: never");
+    assert!(!witnessed_by(&[Holds, Silent, Other], 2));
+    assert!(witnessed_by(&[Holds, Holds, Silent], 2));
+    assert!(!witnessed_by(&[Holds, Silent, Silent], 2));
+    assert!(witnessed_by(&[Holds], 1), "the rehearsal's single node");
+    assert!(!witnessed_by(&[Holds, Other], 1), "a tie, even with min_nodes = 1");
+}
+
+/// E-1 (b): the common ancestor of the relayer's chain and a node's is found in a logarithmic number of reads (a
+/// node that answers another hash at every height costs ≈ 2·log2(height) reads, not one per block), and exactly.
+#[test]
+fn e1_the_common_ancestor_is_found_in_logarithmic_reads() {
+    for top in [0u64, 1, 2, 9, 100_000] {
+        for common in [0u64, 1, top / 2, top.saturating_sub(1), top] {
+            if common > top {
+                continue;
+            }
+            let mut reads = 0u32;
+            let got = common_ancestor(top, &mut |h| {
+                reads += 1;
+                assert!(h <= top, "asked {h} above {top}");
+                Ok(h <= common)
+            })
+            .unwrap();
+            assert_eq!(got, common, "top {top}");
+            assert!(reads <= 2 * 64 - (top.max(1)).leading_zeros() * 2 + 2, "top {top}, common {common}: {reads} reads");
+        }
+    }
+    let mut reads = 0;
+    assert_eq!(common_ancestor(100_000, &mut |_| { reads += 1; Ok(false) }).unwrap(), 0, "a node that agrees nowhere: genesis");
+    assert!(reads <= 40, "{reads} reads");
+    assert!(common_ancestor(10, &mut |_| anyhow::bail!("down")).is_err());
+}
+
+/// E-1 (c): at most MAX_HEADERS_PER_STEP headers of one node are read per step, whatever tip it announces.
+#[test]
+fn e1_headers_read_per_node_and_step_are_bounded() {
+    assert_eq!(headers_to_read(100, 120), 101..=120);
+    assert_eq!(headers_to_read(100, 100), 101..=100);
+    assert_eq!(headers_to_read(100, 10_000_000), 101..=100 + MAX_HEADERS_PER_STEP);
+    assert!(MAX_HEADERS_PER_STEP >= 1_000);
+}
+
+fn asert_chain(n: u64, s: &jetsam_bridge_program::rules::Schedule) -> Chain {
+    let mut c = Chain::from_genesis(testkit::header([0u8; 32], 0, 1_700_000_000, jetsam_bridge_program::rules::GENESIS_TARGET, 0));
+    for h in 1..=n {
+        let want = crate::fill::expected_target(&c, h, s).unwrap();
+        c.extend(testkit::header(c.tip_id(), h, 1_700_000_000 + 180 * h, want, 3)).unwrap();
+    }
+    c
+}
+
+/// M-1: the relayer takes a node's header only with the target the nodes' rule (ASERT, the build's schedule) gives it
+/// and a proof of work against it — as jg-fill (E-7) — never a branch of forged, trivial targets on one node's word.
+#[test]
+fn m1_a_header_with_a_forged_target_or_no_proof_of_work_is_not_taken() {
+    let s = jetsam_bridge_program::rules::REHEARSAL;
+    let c = asert_chain(40, &s);
+    let want = crate::fill::expected_target(&c, 41, &s).unwrap();
+    let good = testkit::header(c.tip_id(), 41, 1_700_000_000 + 180 * 41, want, 3);
+    assert_eq!(admit_header(&c, &good, &s, &mut |_| true), Ok(()));
+    assert_eq!(admit_header(&c, &good, &s, &mut |_| false), Err("BAD_PROOF_OF_WORK"));
+    let forged = testkit::header(c.tip_id(), 41, 1_700_000_000 + 180 * 41, jetsam_bridge_program::rules::MAX_TARGET, 3);
+    assert_eq!(admit_header(&c, &forged, &s, &mut |_| true), Err("BAD_TARGET"));
+    let anchored = Chain::with_anchor(40, c.tip_id(), c.work_at(40).unwrap());
+    assert_eq!(admit_header(&anchored, &good, &s, &mut |_| true), Err("BAD_TARGET"), "no target known: never taken");
+}
+
+/// M-3 (relayer side): every revert counts toward a daily bound of its own (the host's clock), raced or not: a provider
+/// that explains each revert by a race no longer burns the key's gas without end.
+#[test]
+fn m3_reverts_explained_by_a_race_are_bounded_per_day_too() {
+    let mut times = Vec::new();
+    for i in 0..MAX_REVERTS_PER_DAY - 1 {
+        assert_eq!(revert_budget(&mut times, 1_000 + i as u64), None);
+    }
+    assert_eq!(revert_budget(&mut times, 2_000), Some(HALT_REVERT_BUDGET));
+    let mut times = vec![1_000; (MAX_REVERTS_PER_DAY - 1) as usize];
+    assert_eq!(revert_budget(&mut times, 1_000 + 86_400), None, "a day later: the old ones are forgotten");
+    assert_eq!(times.len(), 1);
+}
+
+/// F-4: a HALT file that cannot be read (anything but "absent") halts: never "not halted" on an error.
+#[test]
+fn f4_an_unreadable_halt_file_halts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("HALT")).unwrap();
+    let h = relay_halted(dir.path());
+    assert!(h.as_deref().is_some_and(|h| h.contains("HALT_UNREADABLE")), "{h:?}");
+}
+
+/// F-6, M-10: off the rehearsal no point is learned at 0 L1 confirmations nor from L1 block 0 (the whole L1 read
+/// again); the mainnet's relayer has an alert command (argv, its alerts leave the logs); the public test network's
+/// deployed relay.toml (no alert command) still starts.
+#[test]
+fn f6_m10_what_the_public_relayers_config_must_name() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let e = |extra: &str| RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, extra)).unwrap_err().to_string();
+    assert!(e(&format!("l1_confirmations = 0\n{cmd}")).contains("l1_confirmations"));
+    assert!(e(&format!("l1_from_block = 0\n{cmd}")).contains("l1_from_block"));
+    assert!(e(&format!("alert_command = []\n{cmd}")).contains("alert_command"));
+    let ok = RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, cmd)).unwrap();
+    assert_eq!(ok.alert_command, vec!["/opt/alert".to_string(), "{event}".to_string(), "{detail}".to_string()]);
+    let deployed = "network = \"d9d156ee35e725cf6b133216809c1b0f165d1120c9cf42cc2bfeb0ef9031ee85\"\nl1_chain_id = 84532\n\
+        l1_bridge = \"0x7Ba0229A5A04cFA5A827Be3c749EAF442C1764D4\"\nl1_rpc = \"http://127.0.0.1:8545\"\nl1_from_block = 60534248\n\
+        deposits_from_height = 8704\nstate_dir = \"/home/jtm/relay-b2/state\"\npublish_dir = \"/home/jtm/relay-b2/pub\"\ncadence_secs = 900\n\
+        [signer]\nkey_file = \"/home/jtm/keys/relayer.key\"\npriority_fee_wei = 1000000\n[prover]\nmode = \"signed-test\"\ntimeout_secs = 30\n\
+        [[nodes]]\nname = \"vm-a\"\nrpc = \"http://127.0.0.1:9711\"\n[[nodes]]\nname = \"vm-b\"\nrpc = \"http://127.0.0.1:9721\"\n\
+        [[nodes]]\nname = \"epyc1\"\nrpc = \"http://127.0.0.1:9731\"\n";
+    let c = RelayConfig::parse(deployed).expect("the public test network's deployed relay.toml");
+    assert!(c.alert_command.is_empty());
 }
