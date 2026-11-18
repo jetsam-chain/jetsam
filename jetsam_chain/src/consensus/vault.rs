@@ -134,6 +134,12 @@ pub const TESTNET_LEGACY_VAULT_CAPS: LegacyVaultCaps = LegacyVaultCaps {
 // `F_R = J_R + 32` exactly when this crate is built for the rehearsal.
 const _: () = assert!(jetsam_vault_rule::MICRO_PER_JTM == MICRO_PER_JTM);
 const _: () = assert!(jetsam_vault_rule::REHEARSAL_CLOCK == cfg!(feature = "rehearsal-v1-7"));
+// FIXEXT I-4: and this build's profile (V4's caps and opening delay read it),
+// whatever Cargo's feature unification gave the shared rule.
+const _: () = assert!(
+    jetsam_vault_rule::TESTNET_PROFILE
+        == cfg!(all(feature = "testnet", not(feature = "rehearsal-v1-7")))
+);
 // D59: the consensus minimum of a release group has a state-growth term only
 // when it creates more outputs (≤ 3) than it spends inputs, i.e. with one or
 // two inputs; even at the highest pressure (×8) that minimum stays below

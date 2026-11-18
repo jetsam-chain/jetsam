@@ -531,12 +531,14 @@ fn guardian_record_bytes(
         .map(|_| state.map(|state| encode_guardian_record(state, undo)))
 }
 
-/// The guardian state after the block at `height` from one at a higher tip,
-/// by its undo (T3.6): `None` below J; an error when the undo does not reach
-/// back that far.
+/// The guardian state after the block at `height` from the state of the
+/// block `state_tip` (at or above it), by its undo (T3.6): `None` below J; an
+/// error when the undo does not reach back that far (FIXEXT F-8: an empty
+/// undo too, never the tip's state for an ancestor's).
 fn truncate_guardian(
     state: Option<GuardianState>,
     mut undo: Vec<(u64, GuardianUndo)>,
+    state_tip: u64,
     height: u64,
     v1_7_activation: Option<u64>,
 ) -> Result<(Option<GuardianState>, Vec<(u64, GuardianUndo)>), ()> {
@@ -546,7 +548,7 @@ fn truncate_guardian(
     if v1_7_activation.is_none_or(|j| height < j) {
         return Ok((None, Vec::new()));
     }
-    let mut reached = undo.last().map(|(tip, _)| *tip);
+    let mut reached = Some(undo.last().map_or(state_tip, |(tip, _)| *tip));
     while let Some((block, block_undo)) = undo.pop_if(|(block, _)| *block > height) {
         state = block_undo.revert(&state);
         reached = Some(block - 1);
@@ -811,7 +813,7 @@ impl MdbxChainContext {
         };
         let (state, undo) = decode_guardian_record(&bytes)
             .map_err(|_| MdbxContextError::Corrupt("guardian record is malformed"))?;
-        truncate_guardian(Some(state), undo, tip_height, activation).map_err(|_| {
+        truncate_guardian(Some(state), undo, tip_height, tip_height, activation).map_err(|_| {
             MdbxContextError::Corrupt("guardian record cannot be brought back to the tip")
         })
     }
@@ -2761,6 +2763,7 @@ impl MdbxChainContext {
         match truncate_guardian(
             self.guardian.take(),
             std::mem::take(&mut self.guardian_undo),
+            ancestor_height + reorg_depth,
             ancestor_height,
             GuardianRules::current().activation_height,
         ) {
@@ -3665,6 +3668,27 @@ mod tests {
     mod relation_root;
     mod segment_tree_equivalence;
     mod snapshot_v17;
+
+    /// FIXEXT F-8: an empty undo never passes the tip's guardian state off
+    /// as an ancestor's (as `DestinationState::truncate_above` refuses it).
+    #[test]
+    fn fixext_truncate_guardian_refuses_an_ancestor_without_undo() {
+        let state = GuardianState::at_v1_7(0);
+        assert_eq!(
+            truncate_guardian(Some(state.clone()), Vec::new(), 110, 104, Some(100)),
+            Err(())
+        );
+        // The tip itself, below J, or no state: as before.
+        assert_eq!(
+            truncate_guardian(Some(state.clone()), Vec::new(), 110, 110, Some(100)),
+            Ok((Some(state.clone()), Vec::new()))
+        );
+        assert_eq!(
+            truncate_guardian(Some(state), Vec::new(), 110, 99, Some(100)),
+            Ok((None, Vec::new()))
+        );
+        assert_eq!(truncate_guardian(None, Vec::new(), 110, 104, Some(100)), Ok((None, Vec::new())));
+    }
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
         test_next_bundle_for_miner(context, 0x44)
