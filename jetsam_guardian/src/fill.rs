@@ -385,6 +385,14 @@ impl FillParams {
             // D153: on the public test chain the pause follows its slow delay (1 h): a quarter of it, as on the mainnet
             let floor = if profile == crate::Profile::PublicTestnet { TESTNET_SWITCH_PAUSE_FLOOR } else { SWITCH_PAUSE_FLOOR };
             anyhow::ensure!(self.switch_pause_secs >= floor, "switch_pause_secs {} is below {floor} on {profile}", self.switch_pause_secs);
+            // F-6 (external audit 2026-11-18): the other guards within their bounds
+            for (name, value, bound, ceiling) in strict_bounds(self) {
+                if ceiling {
+                    anyhow::ensure!(value <= bound, "{name} {value} is above {bound} on {profile} (F-6)");
+                } else {
+                    anyhow::ensure!(value >= bound, "{name} {value} is below {bound} on {profile} (F-6)");
+                }
+            }
         } else {
             anyhow::ensure!(self.share_halt_pct <= 100, "share_halt_pct {} above 100", self.share_halt_pct);
         }
@@ -532,6 +540,10 @@ pub fn check_bridge_caps(slow_per_deposit: u64, advance_outstanding_cap: u64, ad
     }
     Ok(())
 }
+
+/// F-3 (external audit 2026-11-18): jg-fill's fee cap per gas unless its `[signer]` names another: 10 gwei, ≈ 2 000 ×
+/// Base's base fee of 10/11/2026 (0.005 gwei), well above its spikes; 30 M gas a day at most 0.3 ETH (6 ETH at 200 gwei).
+pub const BASE_MAX_FEE_PER_GAS: u64 = 10_000_000_000;
 
 /// E-9 (audit 2026-11-10): the robot's daily gas budget when `[signer] daily_gas_budget` is not set: 30 M gas per 24 h of
 /// the L1 clock, all its own transactions counted (advances, own claims). 10 full transactions at the default `max_gas`
@@ -901,7 +913,11 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
             // A5-1: its point is accepted, its mint may come less than ADVANCE_MIN_AGE after an advance made now:
             // the fee would go to the recipient; the slow path pays the recipient within 24 h
             Verdict::Refuse("ALREADY_UNDER_A_POINT")
+        } else if d.amount < p.min_advance {
+            // F-1 (external audit 2026-11-18): the configured floor never moves: final
+            Verdict::Refuse("BELOW_MIN_AMOUNT")
         } else if d.amount < min_advance {
+            // the floor of the gas price (one L1 endpoint's word, read at each step): never final
             Verdict::Refuse("BELOW_MIN_ADVANCE")
         } else if l1_now.saturating_sub(d.block_ts) > p.late_after_secs {
             Verdict::Refuse("LATE_SLOW_PATH_NEAR")
@@ -956,8 +972,10 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
 }
 
 /// A5-13: the refusals of [`plan`] that depend on a clock — `l1_now`, the time of the L1 endpoint's latest block,
-/// which may lie (18 h ahead: every deposit `LATE_SLOW_PATH_NEAR`) — never final.
-pub const CLOCK_REFUSALS: [&str; 1] = ["LATE_SLOW_PATH_NEAR"];
+/// which may lie (18 h ahead: every deposit `LATE_SLOW_PATH_NEAR`) — never final. F-1 (external audit 2026-11-18):
+/// nor those that change with the gas price (`BELOW_MIN_ADVANCE`, the endpoint's `eth_gasPrice`: a spike, real or
+/// told, would refuse a deposit for good) or with a window of the robot's clock (`RECIPIENT_CAP`, 24 h).
+pub const CLOCK_REFUSALS: [&str; 3] = ["LATE_SLOW_PATH_NEAR", "BELOW_MIN_ADVANCE", "RECIPIENT_CAP"];
 
 /// A5-13: a decision journaled as `code` (`advance`, `wait:…`, `refuse:…`) that ends the robot's interest in a
 /// deposit (jg-fill reads it no more): a refusal that does not depend on a clock. A clock's refusal is decided
@@ -1226,14 +1244,134 @@ pub fn published_queue(cands: &[Candidate], verdicts: &[Verdict]) -> Vec<serde_j
 }
 
 /// The smallest advance (µJTM): `min_advance`, or `gas_multiple` × the advance's gas cost at
-/// `gas_price_wei`, converted at `wei_per_jtm`, rounded up (study n°3 §2.l).
+/// `gas_price_wei`, converted at `wei_per_jtm`, rounded up (study n°3 §2.l); M-5 (external audit 2026-11-18): and
+/// never an advance whose fee (`fee_bps`) pays less than its gas (at 75 bps, `gas_multiple` 20 left the fee at 0.15 ×
+/// the gas: advances that cost the robot, each spending its daily gas budget).
 pub fn min_advance(p: &FillParams, gas_price_wei: u128, advance_gas: u64, wei_per_jtm: u128) -> u64 {
     if wei_per_jtm == 0 {
         return u64::MAX;
     }
-    let wei = u128::from(p.gas_multiple).saturating_mul(u128::from(advance_gas)).saturating_mul(gas_price_wei);
+    let gas_wei = u128::from(advance_gas).saturating_mul(gas_price_wei);
+    let wei = u128::from(p.gas_multiple).saturating_mul(gas_wei);
     let micro = wei.saturating_mul(1_000_000).div_ceil(wei_per_jtm);
-    p.min_advance.max(u64::try_from(micro).unwrap_or(u64::MAX))
+    // the amount whose fee is the gas: gas × 10 000 / fee_bps (no fee kept: no such floor)
+    let covered = if p.fee_bps == 0 {
+        0
+    } else {
+        gas_wei.saturating_mul(1_000_000).saturating_mul(10_000).div_ceil(wei_per_jtm.saturating_mul(u128::from(p.fee_bps)))
+    };
+    p.min_advance.max(u64::try_from(micro.max(covered)).unwrap_or(u64::MAX))
+}
+
+/// M-5 (external audit 2026-11-18): the advances may spend this share (percent) of the daily gas budget; the rest is
+/// kept for the robot's own claims (minimal deposits advanced by the hundred never leave its repayments unclaimed).
+pub const ADVANCE_BUDGET_PCT: u64 = 67;
+
+/// M-5: the gas the advances may use over 24 h under the daily gas budget `budget`.
+pub fn advance_gas_ceiling(budget: u64) -> u64 {
+    u64::try_from(u128::from(budget) * u128::from(ADVANCE_BUDGET_PCT) / 100).unwrap_or(u64::MAX)
+}
+
+/// M-2 (external audit 2026-11-18): a loss of an advance ([`loss`]) only when the contract says so twice: `first`,
+/// `(advanceOf(key).status, isMinted(txId))` read at ONE pinned L1 block, and `again` read the same way at a later
+/// block (the claim that repays an advance sets both in one transaction: two reads at `latest` may straddle it). An
+/// `again` that cannot be read concludes nothing (asked again at the next step).
+pub fn loss_confirmed(first: (u8, bool), again: &mut dyn FnMut() -> anyhow::Result<(u8, bool)>) -> Option<&'static str> {
+    loss(first.0, first.1)?;
+    let (status, minted) = again().ok()?;
+    loss(status, minted)
+}
+
+/// M-3 (external audit 2026-11-18): this many of the robot's reverted transactions within 24 h of this host's clock —
+/// every one, those another transaction "explains" included (the explanation is the L1 endpoint's word) — halt it,
+/// latched: [`HALT_REVERTS_24H`].
+pub const MAX_REVERTS_24H: usize = 10;
+pub const HALT_REVERTS_24H: &str = "HALT_REVERTS_24H";
+
+/// M-3: a receipt of `status` at host time `now`: its revert kept in `times` (the last 24 h), and the halt when they
+/// reach [`MAX_REVERTS_24H`].
+pub fn reverts_in_a_day(times: &mut Vec<u64>, now: u64, status: bool) -> Option<&'static str> {
+    times.retain(|t| t.saturating_add(86_400) > now);
+    if status {
+        return None;
+    }
+    times.push(now);
+    (times.len() >= MAX_REVERTS_24H).then_some(HALT_REVERTS_24H)
+}
+
+/// F-5 (external audit 2026-11-18): the keys of the advances an `advanceBatch` receipt's logs pay (`Advanced`,
+/// `topics[1]`): those of a transaction found mined after a stop or a timeout are recorded from the contract.
+pub fn advanced_keys(logs: &[serde_json::Value]) -> Vec<[u8; 32]> {
+    logs.iter()
+        .filter(|lg| lg["topics"][0].as_str().is_some_and(|t| t.eq_ignore_ascii_case(crate::l1::TOPIC_ADVANCED)))
+        .filter_map(|lg| lg["topics"][1].as_str().and_then(|k| crate::parse32(k).ok()))
+        .collect()
+}
+
+/// F-5: jg-fill reads no more a deposit decided for good — except a deposit whose key an advance found mined late
+/// pays (`recheck`): read once more, recorded from the contract (`advanceOf(key).advancer` = its hot key).
+pub fn skip_decided(ledger: &Ledger, decided: Option<&str>, key: &[u8; 32], recheck: &std::collections::HashSet<String>) -> bool {
+    if ledger.has(key) {
+        return true;
+    }
+    if recheck.contains(&hex::encode(key)) {
+        return false;
+    }
+    decided.is_some_and(decided_for_good)
+}
+
+/// M-13 (external audit 2026-11-18): the depth of a reorganization the nodes went through while the robot was stopped:
+/// `before`, the `(height, id)` its node's observation kept at the stop, against `chain`, that node's chain read again
+/// at the start (from genesis: no reorganization is seen by the poll). `None`: every height both hold agrees. The depth
+/// counts from the highest height that still agrees (none: below the oldest kept, deeper than they say).
+pub fn reorg_while_stopped(before: &[(u64, [u8; 32])], chain: &Chain) -> Option<u64> {
+    let differs = |(h, id): &(u64, [u8; 32])| chain.id_at(*h).is_some_and(|x| x != *id);
+    let top = before.iter().filter(|e| differs(e)).map(|(h, _)| *h).max()?;
+    let agree = before.iter().filter(|(h, id)| *h < top && chain.id_at(*h) == Some(*id)).map(|(h, _)| *h).max();
+    let low = before.iter().map(|(h, _)| *h).min().unwrap_or(top);
+    Some(top - agree.unwrap_or(low.saturating_sub(1)))
+}
+
+/// M-13: an advance still pending whose block is no longer on `chain` while the block that replaced it is not read yet
+/// (`scanned_id`: the id the scan holds at its height, still the advance's): the robot pauses
+/// (`PAUSE_ADVANCED_BLOCK_UNREAD`) until it is read — then `HALT_ADVANCED_DEPOSIT_LEFT_THE_CHAIN` if the deposit is
+/// nowhere (before, the check was skipped while the replacing block failed to read).
+pub fn advance_block_replaced_unread(a: &Advanced, chain: &Chain, scanned_id: Option<&str>) -> bool {
+    a.status == AdvanceStatus::Pending
+        && chain.id_at(a.height).is_some_and(|id| id != a.block_id)
+        && scanned_id.is_none_or(|id| id == hex::encode(a.block_id))
+}
+
+/// F-6 (external audit 2026-11-18): two node URLs name the same node: equal (case, a trailing `/`), or the same port of
+/// the loopback (`127.0.0.1` and `127.0.0.2`, `localhost`, `[::1]`: one listener may answer all of them).
+pub fn same_node(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    let (a, b) = (norm(a), norm(b));
+    if a == b {
+        return true;
+    }
+    let loopback_port = |u: &str| -> Option<(String, u16)> {
+        let (scheme, rest) = u.split_once("://")?;
+        let authority = rest.split('/').next()?;
+        let (host, port) = authority.rsplit_once(':')?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let lo = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        lo.then(|| (scheme.to_string(), port.parse().ok())).and_then(|(s, p)| Some((s, p?)))
+    };
+    matches!((loopback_port(&a), loopback_port(&b)), (Some(x), Some(y)) if x == y)
+}
+
+/// F-6 (external audit 2026-11-18): off the private rehearsal the robot's guards may be tightened, never loosened past
+/// these: `(name, value, bound, true for a ceiling)`.
+pub fn strict_bounds(p: &FillParams) -> [(&'static str, u64, u64, bool); 6] {
+    [
+        ("max_source_age", p.max_source_age, 600, true),
+        ("halt_reorg_depth", p.halt_reorg_depth, CONFIRMATIONS_FLOOR, true),
+        ("reorg_pause_secs", p.reorg_pause_secs, 300, false),
+        ("grace_secs", p.grace_secs, 300, false),
+        ("tip_max_age", p.tip_max_age, 1_800, true),
+        ("late_after_secs", p.late_after_secs, 64_800, true),
+    ]
 }
 
 /// A loss the robot notes for one of its advances (the contract never writes one, D-AV6): `status` of
@@ -1529,11 +1667,16 @@ impl FillConfig {
         };
         // E-9: the robot always has a daily gas budget (its default unless set)
         c.signer.daily_gas_budget.get_or_insert(DEFAULT_DAILY_GAS_BUDGET);
+        // F-3 (external audit 2026-11-18): the robot pays Base's gas only: the generic fee cap left as it is (200 gwei,
+        // ≈ 40 000 × Base's base fee) becomes Base's
+        if c.signer.max_fee_per_gas_wei == crate::l1tx::FeePolicy::default().max_fee_per_gas as u64 {
+            c.signer.max_fee_per_gas_wei = BASE_MAX_FEE_PER_GAS;
+        }
         c.params.check(profile, max_gas, margin).map_err(|e| anyhow::anyhow!("[params] {e}: jg-fill does not start"))?;
         let budget = c.signer.daily_gas_budget.unwrap_or(DEFAULT_DAILY_GAS_BUDGET);
         anyhow::ensure!(
-            budget >= max_gas,
-            "[signer] daily_gas_budget {budget} is below one transaction at max_gas {max_gas}: jg-fill does not start (E-9)"
+            advance_gas_ceiling(budget) >= max_gas,
+            "[signer] daily_gas_budget {budget}: its {ADVANCE_BUDGET_PCT} % for the advances (M-5) is below one transaction at max_gas {max_gas}: jg-fill does not start (E-9)"
         );
         anyhow::ensure!(
             c.nodes.len() >= c.params.min_nodes,
@@ -1542,8 +1685,9 @@ impl FillConfig {
             c.params.min_nodes
         );
         for (i, n) in c.nodes.iter().enumerate() {
+            // F-6: the same loopback port under two addresses is one node
             anyhow::ensure!(
-                !c.nodes[..i].iter().any(|m| m.rpc == n.rpc || m.name == n.name),
+                !c.nodes[..i].iter().any(|m| same_node(&m.rpc, &n.rpc) || m.name == n.name),
                 "nodes[{i}] ({}) is configured twice: jg-fill does not start",
                 n.name
             );

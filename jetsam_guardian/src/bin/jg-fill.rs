@@ -106,8 +106,9 @@ fn word(data: &[u8], i: usize) -> [u8; 32] {
     data.get(32 * i..32 * i + 32).and_then(|w| w.try_into().ok()).unwrap_or([0u8; 32])
 }
 
+/// I-3 (external audit 2026-11-18): saturated, never truncated (a balance or a cap of 2^64 is not 0).
 fn word_u64(data: &[u8], i: usize) -> u64 {
-    u64::from_be_bytes(word(data, i)[24..].try_into().expect("8"))
+    fill::u64_saturating(&word(data, i))
 }
 
 fn word_addr(data: &[u8], i: usize) -> [u8; 20] {
@@ -141,6 +142,13 @@ struct State {
     /// A5-13: the robot's transactions reverted in a row (advances and own claims; a success resets it).
     #[serde(default)]
     reverts: u32,
+    /// M-3 (external audit 2026-11-18): the host times of its reverted transactions in the last 24 h, every one counted.
+    #[serde(default)]
+    revert_times: Vec<u64>,
+    /// F-5 (external audit 2026-11-18): the keys a late-mined advance of the robot paid: their deposits read again
+    /// (decided for good or not) until the ledger holds them.
+    #[serde(default)]
+    recheck: HashSet<String>,
 }
 
 /// N9: `isMinted` asked at most this many times a step for the deposits locked under the contract's tip (lowest
@@ -173,6 +181,11 @@ struct Robot {
     /// FIX2GU §2.2 (RELFIX2 for jg-fill): the bytes of the blocks served that this build cannot read, kept and read
     /// first again at every later read (never "no deposit" once the nodes prune them).
     kept: fill::KeptBodies,
+    /// M-13 (external audit 2026-11-18): the `(height, id)` each node's observation kept at the last stop, compared once
+    /// with its chain read again (a reorganization while stopped).
+    stopped_ids: Vec<Option<Vec<(u64, [u8; 32])>>>,
+    /// M-13: the reorganizations seen so at the start, `(robot time, depth)`, for the guard.
+    restart_reorgs: Vec<(u64, u64)>,
 }
 
 impl Robot {
@@ -180,6 +193,53 @@ impl Robot {
         let mut data = l1::selector(sig).to_vec();
         data.extend_from_slice(args);
         self.l1.call(&self.bridge, &data)
+    }
+
+    /// M-2: `eth_call` at the L1 block `at` (a quantity).
+    fn view_at(&self, sig: &str, args: &[u8], at: &str) -> anyhow::Result<Vec<u8>> {
+        let mut data = l1::selector(sig).to_vec();
+        data.extend_from_slice(args);
+        let v = self.l1.rpc("eth_call", json!([{"to": self.bridge, "data": hex0x(&data)}, at]))?;
+        Ok(hex::decode(v.as_str().unwrap_or("0x").trim_start_matches("0x"))?)
+    }
+
+    /// M-2 (external audit 2026-11-18): `advanceOf(key)` and `isMinted(txId)` of advance `a` read at ONE L1 block (the
+    /// claim that repays it sets both in one transaction): its status, minted, and the `advanceOf` words.
+    fn repayment_state(&self, a: &Advanced) -> anyhow::Result<(u8, bool, Vec<u8>)> {
+        let at = format!("0x{:x}", l1::hex_u64(&self.l1.rpc("eth_blockNumber", json!([]))?)?);
+        let v = self.view_at("advanceOf(bytes32)", &a.key, &at)?;
+        let minted = word(&self.view_at("isMinted(bytes32)", &a.txid, &at)?, 0)[31] == 1;
+        Ok((word(&v, 2)[31], minted, v))
+    }
+
+    /// F-5 (external audit 2026-11-18): what a stop or a timeout left in flight settled before a send, the keys a
+    /// late-mined advance paid read again (recorded from the contract).
+    fn settle(&mut self, l1_now: u64) -> anyhow::Result<()> {
+        match self.tx.recover(&self.l1)? {
+            Recovered::Nothing => {}
+            Recovered::Mined(r, label) => {
+                log(&format!("the {label} in flight was mined (block {}, status {})", r.block_number, r.status));
+                self.mined_late(&r, &label, l1_now);
+            }
+            Recovered::Dropped(label) => log(&format!("the {label} in flight was dropped (its nonce was used)")),
+            Recovered::Cancelled(label) => log(&format!("the {label} in flight was cancelled, never sent again: its orders are decided again (M8)")),
+        }
+        Ok(())
+    }
+
+    /// F-5: an advance of the robot found mined after its send gave up on it: the deposits it paid are read again.
+    fn mined_late(&mut self, r: &l1::Receipt, label: &str, l1_now: u64) {
+        if !fill::CANCEL_AT_RECOVERY.iter().any(|l| label.starts_with(l)) {
+            return;
+        }
+        let keys = fill::advanced_keys(&r.logs);
+        for k in &keys {
+            self.state.recheck.insert(hex::encode(k));
+        }
+        if !keys.is_empty() {
+            log(&format!("ALERT ADVANCE_MINED_LATE {} advance(s) of {label} (tx {}) mined after their send gave up: read again, recorded from the contract", keys.len(), r.tx_hash));
+            self.journal(json!({"kind": "alert", "reason": "ADVANCE_MINED_LATE", "keys": keys.iter().map(hex::encode).collect::<Vec<_>>(), "l1_tx": r.tx_hash, "l1_t": l1_now}));
+        }
     }
 
     fn balance(&self) -> anyhow::Result<u64> {
@@ -272,7 +332,16 @@ impl Robot {
         let now = now_unix();
         for i in 0..self.clients.len() {
             match self.observers[i].poll(now, &mut self.clients[i]) {
-                Ok(()) if self.observers[i].alarm.is_none() => self.polled_at[i] = now,
+                Ok(()) if self.observers[i].alarm.is_none() => {
+                    self.polled_at[i] = now;
+                    // M-13: once, the ids kept at the stop against the chain read again
+                    if let Some(before) = self.stopped_ids.get_mut(i).and_then(Option::take) {
+                        if let Some(depth) = fill::reorg_while_stopped(&before, self.observers[i].chain()) {
+                            log(&format!("ALERT REORG_WHILE_STOPPED node {}: its chain was reorganized {depth} blocks deep while jg-fill was stopped", self.cfg.nodes[i].name));
+                            self.restart_reorgs.push((now, depth));
+                        }
+                    }
+                }
                 Ok(()) => log(&format!("node {}: {}", self.cfg.nodes[i].name, self.observers[i].alarm.clone().unwrap_or_default())),
                 Err(e) => log(&format!("node {} not read: {e:#}", self.cfg.nodes[i].name)),
             }
@@ -340,7 +409,7 @@ impl Robot {
             self.journal(json!({"kind": "alert", "reason": "PAUSE_STOCK_ABOVE_CAP", "stock": caps.stock, "max_stock": self.cfg.params.max_stock, "l1_t": l1_now}));
         }
         self.stock_alerted = over;
-        let mut reorgs: Vec<(u64, u64)> = self.observers.iter().flat_map(|o| o.reorgs().to_vec()).collect();
+        let mut reorgs: Vec<(u64, u64)> = self.observers.iter().flat_map(|o| o.reorgs().to_vec()).chain(self.restart_reorgs.iter().copied()).collect();
         reorgs.sort_unstable();
         let competing = self
             .observers
@@ -371,6 +440,18 @@ impl Robot {
         }) {
             g.halt.get_or_insert_with(|| format!("HALT_ADVANCED_DEPOSIT_LEFT_THE_CHAIN:{}", hex::encode(a.key)));
         }
+        // M-13: an advance whose block was replaced, the replacing block not read yet: nothing advanced meanwhile
+        if g.pause.is_none() {
+            let chain = self.observers[0].chain();
+            if let Some(a) = self.state.ledger.advances.iter().find(|a| fill::advance_block_replaced_unread(a, chain, self.state.scanned.get(&a.height).map(|(id, _)| id.as_str()))) {
+                g.pause = Some(format!("PAUSE_ADVANCED_BLOCK_UNREAD:{}", hex::encode(a.key)));
+            }
+        }
+        // M-6 (external audit 2026-11-18): the nodes' work rate over the last 2 h (SG-2, the guardians' rule, on this
+        // robot's clock): a branch mined by a minority, every node of the robot eclipsed on it, pauses
+        if g.pause.is_none() && self.observers.iter().any(|o| o.work_rate_ok(now) == Some(false)) {
+            g.pause = Some("PAUSE_WORK_RATE_LOW".into());
+        }
         match (self.halted(), &g.halt) {
             (Some(reason), _) => g.halt = Some(reason),
             (None, Some(reason)) => {
@@ -390,7 +471,7 @@ impl Robot {
         for d in deposits {
             let key = hex::encode(d.key());
             // A5-13: a refusal that depends on the L1 clock is decided again at every step
-            if self.state.ledger.has(&d.key()) || self.state.decided.get(&key).is_some_and(|v| fill::decided_for_good(v)) {
+            if fill::skip_decided(&self.state.ledger, self.state.decided.get(&key).map(String::as_str), &d.key(), &self.state.recheck) {
                 continue;
             }
             let conf = {
@@ -431,6 +512,7 @@ impl Robot {
                         status: AdvanceStatus::Pending,
                     });
                     self.state.decided.insert(key.clone(), "advance".into());
+                    self.state.recheck.remove(&key);
                     self.journal(json!({"kind": "recovered", "key": key, "txid": hex::encode(d.txid), "amount": d.amount, "l1_t": l1_now}));
                     continue;
                 }
@@ -468,6 +550,8 @@ impl Robot {
                 orders.push((c.dep, AdvanceOrder { jetsam_tx_id: c.dep.txid, recipient: c.dep.recipient, amount: c.dep.amount, fee_bps: self.cfg.params.fee_bps, refund_to: self.refund, evidence: ev }, pre));
             }
         }
+        let ledger = &self.state.ledger;
+        self.state.recheck.retain(|k| parse32(k).is_ok_and(|k| !ledger.has(&k)));
         if !orders.is_empty() {
             self.send(&orders, &tip_id, l1_now)?;
         }
@@ -493,6 +577,10 @@ impl Robot {
             }
             return Ok(());
         }
+        // F-5: what a stop or a timeout left in flight, settled here (a late advance read again)
+        self.settle(l1_now)?;
+        // M-5: the advances spend their share of the daily gas budget only
+        let ceiling = self.tx.gas_budget().map(fill::advance_gas_ceiling);
         // A5-11: a batch refused for its gas goes again with half of its orders, down to one; the orders
         // left out are planned again at the next step
         let mut n = orders.len();
@@ -500,7 +588,7 @@ impl Robot {
             let list: Vec<AdvanceOrder> = orders[..n].iter().map(|(_, o, _)| *o).collect();
             // E-6: always advanceBatch (an order paid or minted first is skipped, never a revert)
             let (data, label) = fill::advance_call(&list, seen);
-            match self.tx.send(&self.l1, &self.bridge, &data, label) {
+            match self.tx.send_within(&self.l1, &self.bridge, &data, label, ceiling) {
                 Ok(r) => break (r, list),
                 Err(e) => {
                     let text = format!("{e:#}");
@@ -585,6 +673,10 @@ impl Robot {
     /// relayer's published final root once the contract holds that root final: the deposit of an advance,
     /// the exact tuple, not minted yet. At most 4 per step.
     fn claim_own(&mut self, path: &std::path::Path, l1_now: u64) -> anyhow::Result<()> {
+        // F-6 (external audit 2026-11-18): the dry run sends nothing, its own claims included
+        if self.cfg.dry_run {
+            return Ok(());
+        }
         let Ok(text) = std::fs::read_to_string(path) else { return Ok(()) };
         let (fin, deps) = jetsam_guardian::relayer::read_published_final(&serde_json::from_str(&text)?)?;
         if word(&self.view("isFinalDepositRoot(bytes32)", &fin.deposit_root)?, 0)[31] != 1 {
@@ -598,6 +690,9 @@ impl Robot {
             l1.call(bridge, &data).map(|w| word(&w, 0)[31] == 1).unwrap_or(true)
         };
         let claims = fill::own_claims(&self.state.ledger, &deps, &minted, 4);
+        if !claims.is_empty() {
+            self.settle(l1_now)?;
+        }
         for (d, branch) in claims {
             let Some(a) = self.state.ledger.advances.iter().find(|a| a.txid == d.jetsam_tx_id && a.recipient == d.recipient && a.amount == d.amount).cloned() else { continue };
             match self.tx.send(&self.l1, &self.bridge, &l1::claim_deposit(&d, &fin.deposit_root, &branch), "claimDeposit") {
@@ -636,11 +731,18 @@ impl Robot {
     fn receipt_seen(&mut self, status: bool, raced: bool, l1_now: u64) -> anyhow::Result<bool> {
         let (n, halt) = jetsam_guardian::relayer::after_own_receipt(self.state.reverts, status, raced);
         self.state.reverts = n;
+        // M-3 (external audit 2026-11-18): every revert counts over 24 h of this host's clock, "explained" or not
+        let halt = halt.or(fill::reverts_in_a_day(&mut self.state.revert_times, now_unix(), status));
         if !status {
             log(&format!("transaction reverted ({}; {n} unexplained in a row)", if raced { "another transaction landed first" } else { "unexplained" }));
         }
         let Some(code) = halt else { return Ok(false) };
-        log(&format!("HALT {code}: {} of its transactions reverted in a row (latched in {}; an operator removes it)", fill::MAX_CONSECUTIVE_REVERTS, self.halt_file.display()));
+        log(&format!(
+            "HALT {code}: {} of its transactions reverted in a row, or {} in 24 h (latched in {}; an operator removes it)",
+            fill::MAX_CONSECUTIVE_REVERTS,
+            fill::MAX_REVERTS_24H,
+            self.halt_file.display()
+        ));
         // latched even under another halt (own claims go on under the others): its line is added to the file
         if !self.halted().is_some_and(|h| h.contains(code)) {
             use std::io::Write as _;
@@ -655,7 +757,7 @@ impl Robot {
     fn check_repayments(&mut self, l1_now: u64) -> anyhow::Result<()> {
         // A5-13: latched on repeated reverts, the robot sends nothing until an operator restarts it (the relayer
         // claims its repayments meanwhile)
-        let reverting = self.halted().is_some_and(|h| h.contains(fill::HALT_REPEATED_REVERTS));
+        let reverting = self.halted().is_some_and(|h| h.contains(fill::HALT_REPEATED_REVERTS) || h.contains(fill::HALT_REVERTS_24H));
         if let (Some(path), false) = (self.cfg.relay_final.clone(), reverting) {
             if let Err(e) = self.claim_own(&path, l1_now) {
                 log(&format!("own claims: {e:#}"));
@@ -666,8 +768,8 @@ impl Robot {
             if a.status != AdvanceStatus::Pending {
                 continue;
             }
-            let v = self.view("advanceOf(bytes32)", &a.key)?;
-            let status = word(&v, 2)[31];
+            // M-2: both at one pinned block
+            let (status, minted, v) = self.repayment_state(&a)?;
             let at = word_u64(&v, 5);
             if status == 2 {
                 self.state.ledger.advances[i].status = AdvanceStatus::Repaid;
@@ -682,13 +784,14 @@ impl Robot {
                 self.journal(json!({"kind": "repaid", "key": hex::encode(a.key), "amount": a.amount, "repaid": repaid, "claim_owner": hex0x(&word_addr(&v, 0)), "l1_t": l1_now}));
                 continue;
             }
-            let minted = word(&self.view("isMinted(bytes32)", &a.txid)?, 0)[31] == 1;
             // A5-16: not repaid for long is an alert (once), the advance stays pending, followed and claimed
             if fill::overdue(status, minted, l1_now, at, &self.cfg.params) && self.state.overdue.insert(hex::encode(a.key)) {
                 log(&format!("ALERT key {}: ALERT_NOT_REPAID_72H (still pending, still followed and claimed)", hex::encode(a.key)));
                 self.journal(json!({"kind": "alert", "key": hex::encode(a.key), "reason": "ALERT_NOT_REPAID_72H", "amount": a.amount, "at": at, "l1_t": l1_now}));
             }
-            if let Some(code) = fill::loss(status, minted) {
+            // M-2: a loss read twice, each at one pinned block
+            let lost = fill::loss_confirmed((status, minted), &mut || self.repayment_state(&a).map(|(s, m, _)| (s, m)));
+            if let Some(code) = lost {
                 self.state.ledger.advances[i].status = AdvanceStatus::Lost(code.into());
                 let reason = format!("HALT_ADVANCE_LOST:{code}");
                 log(&format!("LOST key {}: {code}", hex::encode(a.key)));
@@ -820,6 +923,16 @@ fn run() -> anyhow::Result<()> {
     if reopened > 0 {
         log(&format!("{reopened} advance(s) noted LOST_NOT_REPAID_72H by an older robot are pending again (A5-16: an alert, never a loss)"));
     }
+    // M-13: the ids each node's observation kept at the stop
+    let stopped_ids: Vec<Option<Vec<(u64, [u8; 32])>>> = cfg
+        .nodes
+        .iter()
+        .map(|n| {
+            state.observers.get(&n.name).and_then(|v| v["first_seen"].as_array()).map(|a| {
+                a.iter().filter_map(|e| Some((e[0].as_u64()?, parse32(e[1].as_str()?).ok()?))).collect()
+            })
+        })
+        .collect();
     for (o, n) in observers.iter_mut().zip(&cfg.nodes) {
         if let Some(v) = state.observers.get(&n.name) {
             if let Err(e) = o.import_state(v) {
@@ -834,12 +947,26 @@ fn run() -> anyhow::Result<()> {
     let mut tx = cfg.signer.open(cfg.profile()?, chain_id, Some(hot), &cfg.state_dir)?;
     // M8: an advance found unmined at a recovery (here, and before every send) is cancelled, never sent again
     tx.cancel_at_recovery(&fill::CANCEL_AT_RECOVERY);
-    match tx.recover(&l1)? {
-        Recovered::Nothing => {}
-        // an advance mined before the stop is found on the contract (`advanceOf`) and recorded as recovered
-        Recovered::Mined(r, label) => log(&format!("the {label} in flight at the stop was mined (block {}, status {})", r.block_number, r.status)),
-        Recovered::Dropped(label) => log(&format!("the {label} in flight at the stop was dropped (its nonce was used)")),
-        Recovered::Cancelled(label) => log(&format!("the {label} in flight at the stop was cancelled, never sent again: its orders are decided again (M8)")),
+    // F-6 (external audit 2026-11-18): the dry run touches nothing in flight; M-4: a recovery that cannot conclude now
+    // (its transaction still pending) never stops the start: settled again before every send
+    let mut late: Option<(l1::Receipt, String)> = None;
+    if cfg.dry_run {
+        if tx.pending_label().is_some() {
+            log("dry run: a transaction is in flight from an earlier run (pending.json): left as it is");
+        }
+    } else {
+        match tx.recover(&l1) {
+            Ok(Recovered::Nothing) => {}
+            // an advance mined before the stop is found on the contract (`advanceOf`) and recorded as recovered (F-5: its
+            // keys read again whatever was decided for them)
+            Ok(Recovered::Mined(r, label)) => {
+                log(&format!("the {label} in flight at the stop was mined (block {}, status {})", r.block_number, r.status));
+                late = Some((r, label));
+            }
+            Ok(Recovered::Dropped(label)) => log(&format!("the {label} in flight at the stop was dropped (its nonce was used)")),
+            Ok(Recovered::Cancelled(label)) => log(&format!("the {label} in flight at the stop was cancelled, never sent again: its orders are decided again (M8)")),
+            Err(e) => log(&format!("ALERT IN_FLIGHT_NOT_SETTLED: the transaction in flight at the stop is not settled yet ({e:#}): settled again before every send")),
+        }
     }
     log(&format!(
         "signer: {}, daily gas budget {:?} (E-9)",
@@ -848,7 +975,33 @@ fn run() -> anyhow::Result<()> {
     ));
     let halt_file = cfg.state_dir.join("HALT");
     let n = clients.len();
-    let mut r = Robot { l1, tx, bridge, token, hot, refund, rules, clients, observers, polled_at: vec![0; n], pow_ok: HashSet::new(), targets_ok: HashSet::new(), state, journal, halt_file, stock_alerted: false, scan_failed: BTreeSet::new(), kept: fill::KeptBodies::open(&cfg.state_dir)?, cfg };
+    let mut r = Robot {
+        l1,
+        tx,
+        bridge,
+        token,
+        hot,
+        refund,
+        rules,
+        clients,
+        observers,
+        polled_at: vec![0; n],
+        pow_ok: HashSet::new(),
+        targets_ok: HashSet::new(),
+        state,
+        journal,
+        halt_file,
+        stock_alerted: false,
+        scan_failed: BTreeSet::new(),
+        kept: fill::KeptBodies::open(&cfg.state_dir)?,
+        stopped_ids,
+        restart_reorgs: Vec::new(),
+        cfg,
+    };
+    if let Some((receipt, label)) = late {
+        let l1_now = r.l1.now().unwrap_or(0);
+        r.mined_late(&receipt, &label, l1_now);
+    }
     if let Some(h) = r.halted() {
         log(&format!("starting HALTED: {h} (an operator removes {} to resume)", r.halt_file.display()));
     }

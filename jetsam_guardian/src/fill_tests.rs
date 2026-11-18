@@ -548,7 +548,8 @@ fn above_250_jtm_waits_ten_minutes_after_the_eighth_confirmation() {
 
 #[test]
 fn the_minimum_advance_follows_the_gas() {
-    let p = FillParams::default();
+    // no fee kept: the floor of gas_multiple alone (M-5's floor below)
+    let p = FillParams { fee_bps: 0, ..FillParams::default() };
     // 20 × 142 000 gas × 1 gwei = 2.84e15 wei; at 1e15 wei per JTM: 2.84 JTM < 5 JTM
     assert_eq!(min_advance(&p, 1_000_000_000, 142_000, 1_000_000_000_000_000), 5 * JTM);
     // at 10 gwei: 28.4 JTM
@@ -1687,7 +1688,7 @@ fn a5_13_three_reverted_transactions_in_a_row_halt() {
 #[test]
 fn a5_13_a_refusal_that_depends_on_the_l1_clock_is_never_final() {
     assert!(!decided_for_good("refuse:LATE_SLOW_PATH_NEAR"));
-    for code in ["ALREADY_ADVANCED", "ADVANCED_BY_ANOTHER", "ALREADY_MINTED", "ALREADY_UNDER_A_POINT", "BELOW_MIN_ADVANCE", "RECIPIENT_CAP"] {
+    for code in ["ALREADY_ADVANCED", "ADVANCED_BY_ANOTHER", "ALREADY_MINTED", "ALREADY_UNDER_A_POINT", "BELOW_MIN_AMOUNT"] {
         assert!(decided_for_good(&format!("refuse:{code}")), "{code}");
     }
     for code in ["advance", "wait:NOT_CONFIRMED", "wait:LATE_SLOW_PATH_NEAR", ""] {
@@ -1714,7 +1715,7 @@ fn a5_13_a_refusal_that_depends_on_the_l1_clock_is_never_final() {
     }
     assert!(changed > 0, "the L1 clock moved some verdict");
     let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
-    assert!(robot.contains("fill::decided_for_good(") && !robot.contains("starts_with(\"refuse:\")"), "jg-fill skips a deposit on a final decision only");
+    assert!(robot.contains("fill::skip_decided(") && !robot.contains("starts_with(\"refuse:\")"), "jg-fill skips a deposit on a final decision only (F-5: skip_decided, over decided_for_good)");
 }
 
 /// A5-14: `write_atomic` (the robot's `state.json`) replaces the file whole, under a temporary of its own name
@@ -2165,9 +2166,10 @@ fn e9_the_robot_always_has_a_daily_gas_budget() {
     assert_eq!(DEFAULT_DAILY_GAS_BUDGET, 30_000_000);
     let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
     assert_eq!(c.signer.daily_gas_budget, Some(DEFAULT_DAILY_GAS_BUDGET));
-    let set = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 3000000\n")).unwrap();
-    assert_eq!(set.signer.daily_gas_budget, Some(3_000_000));
-    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 2999999\n")).unwrap_err().to_string();
+    // M-5: the advances' share of it (67 %) holds one transaction at max_gas
+    let set = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477613\n")).unwrap();
+    assert_eq!(set.signer.daily_gas_budget, Some(4_477_613));
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477612\n")).unwrap_err().to_string();
     assert!(e.contains("daily_gas_budget") && e.contains("does not start"), "{e}");
 }
 
@@ -2223,4 +2225,166 @@ fn relfix2_jg_fill_keeps_the_bytes_of_a_block_it_cannot_read_and_reads_them_agai
     let again = KeptBodies::open(dir.path()).unwrap();
     assert!(again.keep(F + 1, &id, &[("n0 getBlock".into(), raw.clone())]).unwrap() == 1);
     assert_eq!(KeptBodies::open(dir.path()).unwrap().copies(F + 1, &id).len(), 1);
+}
+
+
+// ---------------------------------------------------------------- external audit 2026-11-18 (jg-fill side)
+
+/// F-1: a refusal that changes with the gas price (`BELOW_MIN_ADVANCE`, the endpoint's `eth_gasPrice`) or with a window
+/// of the robot's clock (`RECIPIENT_CAP`) is never final; below the configured floor (`BELOW_MIN_AMOUNT`) it is.
+#[test]
+fn f1_a_refusal_of_the_gas_price_or_of_a_window_is_never_final() {
+    for code in ["BELOW_MIN_ADVANCE", "RECIPIENT_CAP", "LATE_SLOW_PATH_NEAR"] {
+        assert!(!decided_for_good(&format!("refuse:{code}")), "{code}");
+    }
+    assert!(decided_for_good("refuse:BELOW_MIN_AMOUNT"));
+    let p = FillParams::default();
+    let below_floor = cand(10, 1, 1, p.min_advance - 1);
+    let below_gas = cand(11, 1, 2, p.min_advance + 1);
+    let v = plan(&[below_floor, below_gas], &Ledger::default(), caps(), &open(), NOW, NOW, p.min_advance + 2, &p);
+    assert_eq!(v, vec![Verdict::Refuse("BELOW_MIN_AMOUNT"), Verdict::Refuse("BELOW_MIN_ADVANCE")]);
+}
+
+/// M-5: an advance's fee pays at least its gas (75 bps: the amount ≥ 133.3 × the gas cost), whatever `gas_multiple`;
+/// the advances spend 67 % of the daily gas budget at most, the rest kept for the robot's own claims.
+#[test]
+fn m5_an_advance_fee_pays_its_gas_and_the_claims_keep_a_share_of_the_budget() {
+    let p = FillParams { min_advance: 1, ..FillParams::default() };
+    // 142 000 gas × 1 gwei = 1.42e14 wei = 0.142 JTM at 1e15 wei per JTM: 0.142 / 0.0075 = 18.93… JTM
+    assert_eq!(min_advance(&p, 1_000_000_000, 142_000, 1_000_000_000_000_000), 18_933_334);
+    assert!(min_advance(&p, 1_000_000_000, 142_000, 1_000_000_000_000_000) > 20 * 142_000, "above gas_multiple × the gas");
+    assert_eq!(min_advance(&FillParams { fee_bps: 0, ..p.clone() }, 1_000_000_000, 142_000, 1_000_000_000_000_000), 2_840_000, "no fee: the gas multiple");
+    assert_eq!(ADVANCE_BUDGET_PCT, 67);
+    assert_eq!(advance_gas_ceiling(30_000_000), 20_100_000);
+    assert_eq!(advance_gas_ceiling(u64::MAX), u64::MAX / 100 * 67 + (u64::MAX % 100) * 67 / 100);
+}
+
+/// M-2: an advance is noted lost only when two reads, each at one pinned block, say so: the claim that repays it sets
+/// `status = 2` and `isMinted` in one transaction (status 1 with minted, read at `latest` across it, was a false loss
+/// and a latched halt).
+#[test]
+fn m2_a_loss_is_confirmed_by_a_second_pinned_read() {
+    let mut repaid = || Ok((2u8, true));
+    assert_eq!(loss_confirmed((1, true), &mut repaid), None, "the claim landed between the reads: repaid");
+    let mut still = || Ok((1u8, true));
+    assert_eq!(loss_confirmed((1, true), &mut still), Some("LOST_MINTED_TO_ANOTHER_TUPLE"));
+    let mut silent = || -> anyhow::Result<(u8, bool)> { anyhow::bail!("not read") };
+    assert_eq!(loss_confirmed((1, true), &mut silent), None, "not read again: nothing concluded");
+    let mut never = || -> anyhow::Result<(u8, bool)> { panic!("no second read without a first loss") };
+    assert_eq!(loss_confirmed((1, false), &mut never), None);
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::loss_confirmed(") && !robot.contains("fill::loss(status, minted)"), "jg-fill concludes a loss on two pinned reads");
+}
+
+/// M-3: every revert of the robot counts within 24 h of this host's clock, those "explained" by another transaction
+/// too (the L1 endpoint's word): ten halt it (`HALT_REVERTS_24H`, latched).
+#[test]
+fn m3_ten_reverts_in_a_day_halt_whatever_explains_them() {
+    let mut t = Vec::new();
+    for i in 0..9 {
+        assert_eq!(reverts_in_a_day(&mut t, 1_000 + i, false), None);
+    }
+    assert_eq!(reverts_in_a_day(&mut t, 2_000, true), None, "a success never resets it");
+    assert_eq!(reverts_in_a_day(&mut t, 3_000, false), Some(HALT_REVERTS_24H));
+    let mut t = vec![1_000; 9];
+    assert_eq!(reverts_in_a_day(&mut t, 1_000 + 86_400, false), None, "a day later the old ones left");
+    assert_eq!(t, vec![1_000 + 86_400]);
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::reverts_in_a_day("), "jg-fill counts every revert");
+}
+
+/// F-5: the advances a late-mined `advanceBatch` pays are read from its logs, and their deposits read again (decided
+/// for good or not) to be recorded from the contract.
+#[test]
+fn f5_an_advance_mined_late_is_read_again_from_its_receipt() {
+    let key = [0x42u8; 32];
+    let logs = vec![
+        serde_json::json!({"topics": [crate::l1::TOPIC_ADVANCED.to_uppercase().replace("0X", "0x"), format!("0x{}", hex::encode(key))], "data": "0x"}),
+        serde_json::json!({"topics": [crate::l1::TOPIC_ADVANCE_SKIPPED, format!("0x{}", hex::encode([7u8; 32]))], "data": "0x"}),
+        serde_json::json!({"topics": []}),
+    ];
+    assert_eq!(advanced_keys(&logs), vec![key]);
+    let mut recheck = std::collections::HashSet::new();
+    let l = Ledger::default();
+    assert!(skip_decided(&l, Some("refuse:ALREADY_UNDER_A_POINT"), &key, &recheck));
+    recheck.insert(hex::encode(key));
+    assert!(!skip_decided(&l, Some("refuse:ALREADY_UNDER_A_POINT"), &key, &recheck), "paid by a late advance: read again");
+    assert!(!skip_decided(&l, None, &[1; 32], &recheck));
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::skip_decided(") && robot.contains("fill::advanced_keys("), "jg-fill reads the late advances");
+}
+
+/// M-13: a reorganization the nodes went through while the robot was stopped is seen at its start (the ids its
+/// observation kept against the chain read again), with its depth; and an advance whose block was replaced pauses the
+/// robot until the replacing block is read.
+#[test]
+fn m13_a_reorganization_while_stopped_is_seen_at_the_start() {
+    let c = testkit::chain(40, 1);
+    let kept: Vec<(u64, [u8; 32])> = (20..=40).map(|h| (h, c.id_at(h).unwrap())).collect();
+    assert_eq!(reorg_while_stopped(&kept, &c), None, "the same chain");
+    let mut other = c.clone();
+    other.truncate_above(36);
+    testkit::extend(&mut other, 6, 9, 20);
+    assert_eq!(reorg_while_stopped(&kept, &other), Some(4), "37..=40 replaced: depth 4");
+    let mut behind = c.clone();
+    behind.truncate_above(30);
+    assert_eq!(reorg_while_stopped(&kept, &behind), None, "a node behind is no reorganization");
+    let mut deep = c.clone();
+    deep.truncate_above(5);
+    testkit::extend(&mut deep, 40, 7, 20);
+    assert!(reorg_while_stopped(&kept, &deep).is_some_and(|d| d >= 21), "deeper than the ids kept");
+    // the advance of block 38, replaced
+    let mut a = advanced(1, 1, 7 * JTM, AdvanceStatus::Pending);
+    a.height = 38;
+    a.block_id = c.id_at(38).unwrap();
+    assert!(!advance_block_replaced_unread(&a, &c, Some(&hex::encode(a.block_id))), "still on the chain");
+    assert!(advance_block_replaced_unread(&a, &other, Some(&hex::encode(a.block_id))), "replaced, its replacement not read");
+    assert!(advance_block_replaced_unread(&a, &other, None));
+    assert!(!advance_block_replaced_unread(&a, &other, Some(&hex::encode(other.id_at(38).unwrap()))), "read: the halt rule decides");
+    a.status = AdvanceStatus::Repaid;
+    assert!(!advance_block_replaced_unread(&a, &other, None));
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    assert!(robot.contains("fill::reorg_while_stopped(") && robot.contains("PAUSE_ADVANCED_BLOCK_UNREAD"), "jg-fill applies both");
+}
+
+/// F-6: two nodes on one loopback port are one node; off the private rehearsal the guards are tightened only within
+/// their bounds (the deployed test chain's fill.toml, defaults but for its caps and switch pause, starts).
+#[test]
+fn f6_one_loopback_port_is_one_node_and_the_guards_keep_their_bounds() {
+    assert!(same_node("http://127.0.0.1:9711", "http://127.0.0.2:9711"));
+    assert!(same_node("http://localhost:9711/", "http://127.0.0.1:9711"));
+    assert!(same_node("http://[::1]:9711", "http://127.0.0.1:9711"));
+    assert!(same_node("HTTP://127.0.0.1:9711", "http://127.0.0.1:9711/"));
+    assert!(!same_node("http://127.0.0.1:9711", "http://127.0.0.1:9721"), "the deployed test chain: three tunnels");
+    assert!(!same_node("http://10.77.0.11:19801", "http://10.77.0.12:19801"));
+    let twice = fill_toml(TESTNET, 31_337, REH_BRIDGE, "[egress]\nmode = \"clearnet\"\n", &["http://127.0.0.1:19801", "http://127.0.0.2:19801"], "http://10.77.0.1:18545", "[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n");
+    assert!(FillConfig::parse(&twice).unwrap_err().to_string().contains("twice"));
+    let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
+    let public = |params: &str| {
+        FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], "http://127.0.0.1:8545", &format!("[signer]\npriority_fee_wei = 1000000\n[params]\n{params}")))
+    };
+    assert!(public("switch_pause_secs = 900\nshare_halt_pct = 100\n").is_ok(), "the deployed test chain's");
+    for bad in ["max_source_age = 601", "halt_reorg_depth = 9", "reorg_pause_secs = 299", "grace_secs = 299", "tip_max_age = 1801", "late_after_secs = 64801"] {
+        let e = public(bad).unwrap_err().to_string();
+        assert!(e.contains(bad.split(' ').next().unwrap()) && e.contains("F-6"), "{bad}: {e}");
+    }
+    assert!(public("max_source_age = 600\nhalt_reorg_depth = 8\nreorg_pause_secs = 300\ngrace_secs = 300\ntip_max_age = 1800\nlate_after_secs = 64800").is_ok(), "at the bounds");
+    assert!(FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\nmax_source_age = 5000\n")).is_ok(), "the rehearsal: free");
+}
+
+/// F-3: jg-fill pays Base's gas only: its fee cap is 10 gwei unless its `[signer]` names another.
+#[test]
+fn f3_jg_fill_caps_its_fee_for_base() {
+    let onion = format!("http://jetsamtest{}.onion:19801", "a".repeat(46));
+    let c = |signer: &str| FillConfig::parse(&fill_toml(TESTNET, 11_155_111, REH_BRIDGE, "", &["http://127.0.0.1:19801", &onion], "http://127.0.0.1:8545", &format!("[signer]\npriority_fee_wei = 1000000\n{signer}"))).unwrap();
+    assert_eq!(c("").signer.max_fee_per_gas_wei, 10_000_000_000);
+    assert_eq!(c("max_fee_per_gas_wei = 50000000000\n").signer.max_fee_per_gas_wei, 50_000_000_000, "named: kept");
+}
+
+/// I-3 (in jg-fill): a word that does not fit 64 bits is read saturated, never truncated (a balance of 2^64 is not 0).
+#[test]
+fn i3_jg_fill_reads_its_words_saturated() {
+    let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
+    let body = robot.split("fn word_u64(").nth(1).unwrap().split("\n}").next().unwrap();
+    assert!(body.contains("u64_saturating"), "{body}");
 }
