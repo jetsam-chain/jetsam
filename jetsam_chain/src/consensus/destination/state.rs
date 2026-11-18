@@ -262,6 +262,48 @@ pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
 #[cfg(feature = "rehearsal-v1-7")]
 pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
 
+/// FIXEXT M-2 (external audit of the chain): whether a v1.7 height `j` may be
+/// armed on the public network with these pieces of the return: dormant, or
+/// with the return over Base armed above it (`h`), its bridge and anchor, and
+/// the fast lane's two keys. Without them deposits would open at `F` with no
+/// release and no fast lane (`BridgeUnset`, `AnchorUnset`) until another hard
+/// fork. Checked at compile time on the public profile.
+pub const fn public_arming_is_complete(
+    j: Option<u64>,
+    h: Option<u64>,
+    base_bridge: bool,
+    base_anchor: bool,
+    fast_release_key: bool,
+    fast_revoke_key: bool,
+) -> bool {
+    match (j, h) {
+        (None, _) => true,
+        (Some(j), Some(h)) => h > j && base_bridge && base_anchor && fast_release_key && fast_revoke_key,
+        (Some(_), None) => false,
+    }
+}
+
+// FIXEXT I-1: no profile arms both the L1 anchor (the return over the L1)
+// and the return over Base's (the committees are not reset at H: such a
+// profile's snapshots after H would not install).
+const _: () = assert!(
+    !(L1_ANCHOR.is_some() && BASE_RETURN_ANCHOR.is_some()),
+    "L1_ANCHOR and BASE_RETURN_ANCHOR armed together"
+);
+
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
+const _: () = assert!(
+    public_arming_is_complete(
+        V1_7_ACTIVATION_HEIGHT,
+        V1_7_BASE_RETURN_HEIGHT,
+        BASE_RETURN_BRIDGE.is_some(),
+        BASE_RETURN_ANCHOR.is_some(),
+        super::fast::FAST_RELEASE_KEY.is_some(),
+        super::fast::FAST_REVOKE_KEY.is_some(),
+    ),
+    "V1_7_ACTIVATION_HEIGHT armed on the public network without the return over Base (its height, bridge, anchor) and the fast lane's keys"
+);
+
 /// BRIDGE2 (D208): a bridge on Base the return reads from a height on, in
 /// place of the one before (the earlier one abandoned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2390,7 +2432,7 @@ pub fn validate_block_destination(
     }
     // FIXEXT E-1: Base read under a recent L1 block (its judgment about the
     // present, as Base's portal reads it), whatever the lane.
-    if false && proving && over_base && rules.base_return.fixext_active_at(height) {
+    if proving && over_base && rules.base_return.fixext_active_at(height) {
         check_base_read_age(finality_update.expect("checked above"), block.header.timestamp)?;
     }
     if over_base {
@@ -3807,6 +3849,19 @@ impl<'a> SnapshotDestinationCheck<'a> {
         if live.len() != held.len() {
             return Err(mismatch("advances do not match their markers"));
         }
+        // FIXEXT M-3: the latest transfer of each advance, indexed once (the
+        // transfers are never pruned: a scan per held advance grows as their
+        // product). Among equal ids the last listed, as a scan's `max_by_key`.
+        let mut latest_transfer: BTreeMap<[u8; super::advance::ADVANCE_COMMITMENT_BYTES], (u64, Address)> =
+            BTreeMap::new();
+        for (id, transfer) in &self.transfer_markers {
+            if let Some(advance) = advance_transfer_marker_advance(transfer) {
+                let slot = latest_transfer.entry(advance).or_insert((*id, *transfer));
+                if *id >= slot.0 {
+                    *slot = (*id, *transfer);
+                }
+            }
+        }
         for (n, entry) in &held {
             let opened = advance_markers_of(*n, entry).find_map(|marker| {
                 live.get(&advance_marker_commitment(&marker))
@@ -3818,14 +3873,11 @@ impl<'a> SnapshotDestinationCheck<'a> {
             };
             live.remove(&named);
             book.insert_made(*n, *entry, made);
-            // Its creditor: the latest transfer naming it, after it.
-            let latest = self
-                .transfer_markers
-                .iter()
-                .filter(|(id, transfer)| {
-                    *id > created && advance_transfer_marker_advance(transfer) == Some(named)
-                })
-                .max_by_key(|(id, _)| *id);
+            // Its creditor: the latest transfer naming it, after it (the
+            // latest of all, when it is after it: none after it otherwise).
+            let latest = latest_transfer
+                .get(&named)
+                .filter(|(id, _)| *id > created);
             let creditor_opens = match latest {
                 Some((_, transfer)) => {
                     book.transfer_marker_of(&entry.key(*n), &entry.creditor) == Some(*transfer)

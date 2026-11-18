@@ -676,8 +676,12 @@ pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
 /// days of blocks, every node redeployed before it (proposed 11 520: tip
 /// 10 351 on 13/11 ≈ 17:30 UTC, ≈ 290 to 480 blocks a day). **Easy to move:
 /// this constant only.**
+///
+/// FIXEXT I-3 / F-6: on the public network the return-over-Base height
+/// itself (its return starts fixed: no `JTMADV02` advance, no burst of
+/// expiries at `fix + lifetime`), never apart from it.
 #[cfg(not(feature = "testnet"))]
-pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = None;
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = V1_7_BASE_RETURN_HEIGHT;
 /// The test chain's (proposed; the operator fixes it at deployment).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = Some(11_520);
@@ -703,15 +707,26 @@ const _: () = assert!(
     "V1_7_RETURN_FIX_HEIGHT must be None with a dormant V1_7_BASE_RETURN_HEIGHT, else armed at or above it"
 );
 
-/// FIXEXT (external audit of the chain, E-1, F-4): from this height on,
-/// (1) a block that reads Base (a release, a fast release, a contradiction)
-/// reads it under an L1 block at most [`BASE_READ_MAX_AGE_SECONDS`] older
-/// than its own timestamp — `isGameClaimValid` judged (about) at present, as
-/// Base's portal judges it when a withdrawal is finalized, so that a
-/// blacklist, a retirement or a pause of Base's guardian binds the return
-/// within that age instead of the ≈ 54 h two known committees span; (2) the
-/// claim of an advance is not transferred in the block where the advance
-/// ends. Below it every block is judged exactly as before.
+#[cfg(not(feature = "testnet"))]
+const _: () = assert!(
+    matches!(
+        (V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+        (None, None)
+    ) || matches!(
+        (V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+        (Some(h), Some(f)) if h == f
+    ),
+    "FIXEXT I-3: on the public network V1_7_RETURN_FIX_HEIGHT is V1_7_BASE_RETURN_HEIGHT"
+);
+
+/// FIXEXT (external audit of the chain, E-1): from this height on, a block
+/// that reads Base (a release, a fast release, a contradiction) reads it under
+/// an L1 block at most [`BASE_READ_MAX_AGE_SECONDS`] older than its own
+/// timestamp — `isGameClaimValid` judged (about) at present, as Base's portal
+/// judges it when a withdrawal is finalized, so that a blacklist, a
+/// retirement or a pause of Base's guardian binds the return within that age
+/// instead of the ≈ 54 h two known committees span. Below it every block is
+/// judged exactly as before.
 ///
 /// **On the public network: the return-over-Base height itself** (its return
 /// is dormant: these rules are part of it from its first block, no height of

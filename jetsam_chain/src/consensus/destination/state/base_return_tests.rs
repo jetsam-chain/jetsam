@@ -2361,3 +2361,35 @@ fn fixext_the_heights_of_each_profile() {
         V1_7_FIXEXT_HEIGHT
     );
 }
+
+#[test]
+fn fixext_the_public_network_never_arms_v1_7_without_its_return() {
+    // Dormant: always.
+    assert!(public_arming_is_complete(None, None, false, false, false, false));
+    // Armed: the return above J, its bridge, its anchor, both fast keys.
+    assert!(public_arming_is_complete(Some(960), Some(1_920), true, true, true, true));
+    assert!(!public_arming_is_complete(Some(960), None, true, true, true, true));
+    assert!(!public_arming_is_complete(Some(960), Some(960), true, true, true, true));
+    for missing in 0..4 {
+        let mut pieces = [true; 4];
+        pieces[missing] = false;
+        assert!(!public_arming_is_complete(
+            Some(960),
+            Some(1_920),
+            pieces[0],
+            pieces[1],
+            pieces[2],
+            pieces[3]
+        ));
+    }
+    // The test chain's own arming would pass it (its return is complete).
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert!(public_arming_is_complete(
+        V1_7_ACTIVATION_HEIGHT,
+        V1_7_BASE_RETURN_HEIGHT,
+        BASE_RETURN_BRIDGE.is_some(),
+        BASE_RETURN_ANCHOR.is_some(),
+        crate::consensus::destination::fast::FAST_RELEASE_KEY.is_some(),
+        crate::consensus::destination::fast::FAST_REVOKE_KEY.is_some(),
+    ));
+}
