@@ -527,6 +527,10 @@ pub struct GuardianRules {
     /// FIXEXT E-2: the group keys and their L1 bridges by height
     /// ([`GUARDIAN_KEYS`]); empty: none.
     pub keys: &'static [GuardianKeyEpoch],
+    /// Fail-closed (the mempool's deferral of the pairings, never set in
+    /// consensus): every signature is refused as invalid, after every other
+    /// rule. It can only refuse.
+    pub unusable_keys: bool,
     pub network: [u8; 32],
     pub l1_chain_id: u64,
     pub period: u64,
@@ -557,6 +561,7 @@ impl GuardianRules {
             activation_height: V1_7_ACTIVATION_HEIGHT,
             delegation_height: DELEGATION_ACTIVATION_HEIGHT,
             keys: GUARDIAN_KEYS,
+            unusable_keys: false,
             network: network_id(),
             l1_chain_id: GUARDIAN_L1_CHAIN_ID,
             period: REWARD_PERIOD_BLOCKS,
@@ -567,6 +572,23 @@ impl GuardianRules {
             lab_fund: crate::consensus::development_allocation::LAB_FUND_ADDRESS,
             guardian_reward_owner: GUARDIAN_REWARD_OWNER,
         }
+    }
+
+    /// [`verify_guardian_signature`] under the key of the statement's own
+    /// height (FIXEXT E-2; `KeyUnset` without one, or for bytes that are not a
+    /// statement), `BadGroupKey` under [`Self::unusable_keys`].
+    pub fn verify_signature(
+        &self,
+        statement: &[u8; STATEMENT_BYTES],
+        signature: &[u8; SIGNATURE_BYTES],
+    ) -> Result<(), GuardianSignatureError> {
+        if self.unusable_keys {
+            return Err(GuardianSignatureError::BadGroupKey);
+        }
+        let key = statement::GuardianStatement::decode(statement)
+            .ok()
+            .and_then(|s| self.key_at(s.height));
+        verify_guardian_signature(key.map(|epoch| &epoch.key), statement, signature)
     }
 
     /// FIXEXT E-2: the key in force at `height` (the last entry at or below

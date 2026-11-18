@@ -89,14 +89,27 @@ pub(crate) fn equivocation(i: usize, j: usize) -> GuardianEquivocation {
     }
 }
 
+/// The fixture's key and bridge from genesis (FIXEXT E-2: one table entry).
+fn fixture_keys() -> &'static [jetsam_chain::consensus::guardian::GuardianKeyEpoch] {
+    static KEYS: std::sync::OnceLock<[jetsam_chain::consensus::guardian::GuardianKeyEpoch; 1]> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        [jetsam_chain::consensus::guardian::GuardianKeyEpoch {
+            height: 0,
+            key: fixture_key(),
+            l1_bridge: [0xb7; 20],
+        }]
+    })
+}
+
 pub(crate) fn rules() -> GuardianRules {
     GuardianRules {
         activation_height: Some(J),
         delegation_height: Some(JD),
-        group_key: Some(fixture_key()),
+        keys: fixture_keys(),
+        unusable_keys: false,
         network: values("network")[0].clone().try_into().unwrap(),
         l1_chain_id: 1,
-        l1_bridge: Some([0xb7; 20]),
         period: 16,
         unbonding: 32,
         stake_vault: STAKE_VAULT,
@@ -496,17 +509,20 @@ fn intents_sharing_a_slot_are_not_both_held() {
 fn unusable_key_rules_refuse_on_the_key_without_a_pairing() {
     let (statement, signature) = signed_statements()[0];
     let usable = rules();
-    assert!(usable.verify_signature(&statement, &signature).is_ok());
+    assert!(jetsam_chain::consensus::guardian::verify_guardian_signature(
+        Some(&usable.keys[0].key),
+        &statement,
+        &signature
+    )
+    .is_ok());
     let unusable = unusable_key_rules(&usable);
-    assert_eq!(
-        unusable.verify_signature(&statement, &signature),
-        Err(jetsam_chain::consensus::guardian::GuardianSignatureError::BadGroupKey)
-    );
+    assert!(unusable.unusable_keys);
+    assert!(!usable.unusable_keys);
     let unset = GuardianRules {
-        group_key: None,
+        keys: &[],
         ..usable
     };
-    assert_eq!(unusable_key_rules(&unset).group_key, None);
+    assert!(!unusable_key_rules(&unset).unusable_keys);
 }
 
 // ---------------------------------------------------------------------------

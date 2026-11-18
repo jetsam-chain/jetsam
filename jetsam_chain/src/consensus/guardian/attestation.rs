@@ -67,12 +67,17 @@ pub(crate) fn check_statement_domain(
     Ok(statement)
 }
 
-/// Rule A-10 / Q-5: the signature under the key `key`.
+/// Rule A-10 / Q-5: the signature under the key `key` (refused as invalid
+/// under [`GuardianRules::unusable_keys`]).
 pub(crate) fn check_signature(
     statement: &[u8; STATEMENT_BYTES],
     signature: &[u8; SIGNATURE_BYTES],
     key: &GuardianKeyEpoch,
+    rules: &GuardianRules,
 ) -> Result<(), GuardianError> {
+    if rules.unusable_keys {
+        return Err(GuardianError::InvalidGuardianSignature);
+    }
     verify_guardian_signature(Some(&key.key), statement, signature).map_err(|error| match error {
         GuardianSignatureError::KeyUnset => GuardianError::GuardianKeyUnset,
         GuardianSignatureError::BadGroupKey | GuardianSignatureError::BadSignature => {
@@ -145,6 +150,6 @@ pub fn check_attestation(
         return Err(GuardianError::AttestationNotIncreasing);
     }
     // A-10.
-    check_signature(&attestation.statement, &attestation.signature, key)?;
+    check_signature(&attestation.statement, &attestation.signature, key, rules)?;
     Ok(attested)
 }

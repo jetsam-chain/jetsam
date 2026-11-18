@@ -141,6 +141,7 @@ impl World {
                 anchor: None,
                 bridge: None,
                 bridge_rotations: &[],
+                fixext_height: None,
             },
         }
         .effective_at(H)

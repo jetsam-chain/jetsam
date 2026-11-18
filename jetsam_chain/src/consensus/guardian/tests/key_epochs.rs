@@ -94,7 +94,7 @@ fn fixext_a_rotation_keeps_the_old_attestations_valid_under_the_old_key() {
     // Before the rotation, under the first key and its bridge: accepted,
     // also when included at or after the rotation height (the key of the
     // attested height).
-    let old = attestation_by(&test_secret_key(), &statement_at(&branch, R - 8));
+    let old = attestation_by(&test_secret_key(), &statement_at(&branch, R - 9));
     assert!(judge_at(R - 1, old.clone(), &fresh_state(), &rules).is_ok());
     assert!(judge_at(R + 5, old, &fresh_state(), &rules).is_ok());
     // From the rotation on: the second key, with its own bridge.

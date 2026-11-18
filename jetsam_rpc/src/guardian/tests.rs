@@ -25,10 +25,14 @@ fn rules() -> GuardianRules {
     GuardianRules {
         activation_height: Some(J),
         delegation_height: Some(JD),
-        group_key: Some([0x92; 48]),
+        keys: &[jetsam_chain::consensus::guardian::GuardianKeyEpoch {
+            height: J,
+            key: [0x92; 48],
+            l1_bridge: [0xb7; 20],
+        }],
+        unusable_keys: false,
         network: [0x4e; 32],
         l1_chain_id: 1,
-        l1_bridge: Some([0xb7; 20]),
         period: 16,
         unbonding: 32,
         stake_vault: STAKE_VAULT,

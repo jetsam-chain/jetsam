@@ -174,7 +174,8 @@ pub struct GuardianStateResponse {
     /// `J` and `J_D` of this build.
     pub v1_7_height: Option<u64>,
     pub delegation_height: Option<u64>,
-    /// The guardians' group key, hex, or none.
+    /// The guardians' group key in force at the tip's child (FIXEXT E-2: the
+    /// table's entry of that height), hex, or none.
     pub group_key: Option<String>,
     pub revoked_at: Option<u64>,
     pub last_attested_height: Option<u64>,
@@ -219,7 +220,7 @@ pub fn guardian_state(
         active: v1_7_active_with(next, rules.activation_height),
         v1_7_height: rules.activation_height,
         delegation_height: rules.delegation_height,
-        group_key: rules.group_key.map(hex::encode),
+        group_key: rules.key_at(next).map(|epoch| hex::encode(epoch.key)),
         revoked_at: state.and_then(|state| state.revoked_at),
         last_attested_height: state.and_then(|state| state.last_attested_height),
         attested_period: state.and_then(|state| state.attested_period),

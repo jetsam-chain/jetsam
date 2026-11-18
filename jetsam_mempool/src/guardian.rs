@@ -34,7 +34,7 @@ use jetsam_chain::consensus::guardian::{
     check_group_pool_gate, guardian_body_len_allowed, guardian_marker_kind, GuardianAttestation,
     GuardianBranch, GuardianEquivocation, GuardianError, GuardianGroupFacts, GuardianObject,
     GuardianObjectKind, GuardianPayout, GuardianRules, GuardianState, GuardianStatement,
-    RewardClaim, RewardFund, StakeLock, StakeUnlock, GROUP_KEY_BYTES,
+    RewardClaim, RewardFund, StakeLock, StakeUnlock,
     MAX_DELEGATION_OBJECTS_PER_BLOCK,
 };
 use jetsam_chain::consensus::params::v1_7_active_with;
@@ -304,12 +304,12 @@ pub enum Signatures {
     Defer,
 }
 
-/// `rules` with a group key no signature can verify under: the consensus
-/// checks then run every rule, and fail at the signature on the key itself,
-/// at once, without any pairing. A missing key stays missing (A-2, Q-1).
+/// `rules` whose keys no signature verifies under: the consensus checks
+/// then run every rule, and fail at the signature, at once, without any
+/// pairing. A missing key stays missing (A-2, Q-1).
 pub fn unusable_key_rules(rules: &GuardianRules) -> GuardianRules {
     GuardianRules {
-        group_key: rules.group_key.map(|_| [0u8; GROUP_KEY_BYTES]),
+        unusable_keys: !rules.keys.is_empty(),
         ..*rules
     }
 }
@@ -330,7 +330,7 @@ pub fn apply_guardian_intent(
 ) -> Result<(), GuardianError> {
     check_group_markers(group, height)?;
     check_group_pool_gate(group, Some(object.kind), rules)?;
-    let deferred = signatures == Signatures::Defer && rules.group_key.is_some();
+    let deferred = signatures == Signatures::Defer && !rules.keys.is_empty();
     let judged = if deferred {
         unusable_key_rules(rules)
     } else {
@@ -353,7 +353,7 @@ pub fn apply_guardian_intent(
         }
         GuardianObjectKind::Equivocation => {
             let equivocation = GuardianEquivocation::decode(&object.body)?;
-            match check_equivocation(state, &equivocation, &judged) {
+            match check_equivocation(state, height, &equivocation, &judged) {
                 Ok(()) => {}
                 Err(error) if unsigned(error.clone()) => {}
                 Err(error) => return Err(error),

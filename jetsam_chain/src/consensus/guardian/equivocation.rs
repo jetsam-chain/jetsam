@@ -280,8 +280,8 @@ pub fn check_equivocation(
         }
     }
     // Q-5.
-    check_signature(&equivocation.s1, &equivocation.sig1, key)?;
-    check_signature(&equivocation.s2, &equivocation.sig2, key)?;
+    check_signature(&equivocation.s1, &equivocation.sig1, key, rules)?;
+    check_signature(&equivocation.s2, &equivocation.sig2, key, rules)?;
     Ok(())
 }
 

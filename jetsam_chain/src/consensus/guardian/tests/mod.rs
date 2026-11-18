@@ -88,6 +88,7 @@ pub(crate) fn rules() -> GuardianRules {
         activation_height: Some(J),
         delegation_height: Some(J + 15_360),
         keys: test_keys(),
+        unusable_keys: false,
         network: NETWORK,
         l1_chain_id: L1_CHAIN,
         period: 480,
