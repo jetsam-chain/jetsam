@@ -1571,3 +1571,20 @@ fn m7_an_rpc_silent_at_the_start_is_checked_again_before_use() {
     assert!(checked);
     recheck_chain(&mut checked, || panic!("not asked again"), 11_155_111).unwrap();
 }
+
+/// M-7: the L1 RPC must serve the finalized block the beacon's update names (its state root), as `fast-release`
+/// checks: two sources that must agree before any game fact is read under that block.
+#[test]
+fn m7_the_l1_rpc_serves_the_block_the_finality_update_names() {
+    struct OneBlock([u8; 32]);
+    impl BaseRpc for OneBlock {
+        fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+            assert_eq!(method, "eth_getBlockByNumber");
+            assert_eq!(params[0], json!("0x10"));
+            Ok(json!({"number": "0x10", "stateRoot": format!("0x{}", hex::encode(self.0))}))
+        }
+    }
+    assert!(check_l1_block(&OneBlock([7u8; 32]), 16, &[7u8; 32]).is_ok());
+    let e = check_l1_block(&OneBlock([8u8; 32]), 16, &[7u8; 32]).unwrap_err().to_string();
+    assert!(e.contains("another block"), "{e}");
+}

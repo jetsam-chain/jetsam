@@ -1271,6 +1271,15 @@ pub fn recheck_chain(checked: &mut bool, answer: impl FnOnce() -> anyhow::Result
     }
 }
 
+/// M-7 (external audit of the robots): the L1 RPC serves block `number` with the state root `state_root` the beacon's
+/// finality update names (as `fast-release` checks), or no game fact is read under it this pass.
+pub fn check_l1_block(l1: &dyn BaseRpc, number: u64, state_root: &[u8; 32]) -> anyhow::Result<()> {
+    let served = l1.rpc("eth_getBlockByNumber", json!([format!("0x{number:x}"), false]))?;
+    let root = crate::base_capture::hex32_of(served["stateRoot"].as_str().unwrap_or_default())?;
+    anyhow::ensure!(root == *state_root, "the L1 RPC serves another block {number} than the finality update's (state root 0x{})", hex::encode(root));
+    Ok(())
+}
+
 /// M-7: the host of an RPC URL, lower case, its port kept for the loopback only (the operator's local routers, one
 /// per provider, differ by their port).
 fn source_host(url: &str) -> String {
@@ -1515,6 +1524,8 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             .map_err(|e| anyhow!("{e:?}"))?;
         let l1_block = jetsam_chain::consensus::destination::light_client::finalized_execution(&update)
             .map_err(|e| anyhow!("{e:?}"))?;
+        // M-7: the L1 RPC and the beacon name the same finalized block
+        check_l1_block(&l1, l1_block.block_number, &l1_block.state_root)?;
         let count = crate::fast::game_count(&l1, &params, l1_block.block_number)?;
         if lock(&state).proposal_anchor.is_none() && count > 0 {
             let anchor = crate::fast::read_game(&l1, &params, count - 1, l1_block.block_number)?.l2_block;
