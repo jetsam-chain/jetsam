@@ -2167,9 +2167,9 @@ fn e9_the_robot_always_has_a_daily_gas_budget() {
     let c = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n")).unwrap();
     assert_eq!(c.signer.daily_gas_budget, Some(DEFAULT_DAILY_GAS_BUDGET));
     // M-5: the advances' share of it (67 %) holds one transaction at max_gas
-    let set = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477613\n")).unwrap();
-    assert_eq!(set.signer.daily_gas_budget, Some(4_477_613));
-    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477612\n")).unwrap_err().to_string();
+    let set = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477612\n")).unwrap();
+    assert_eq!(set.signer.daily_gas_budget, Some(4_477_612));
+    let e = FillConfig::parse(&rehearsal("[params]\nshare_halt_pct = 100\nswitch_pause_secs = 300\n[signer]\ndaily_gas_budget = 4477611\n")).unwrap_err().to_string();
     assert!(e.contains("daily_gas_budget") && e.contains("does not start"), "{e}");
 }
 

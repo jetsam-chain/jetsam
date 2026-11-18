@@ -1684,6 +1684,8 @@ impl FillConfig {
             c.nodes.len(),
             c.params.min_nodes
         );
+        // every source's egress first (a name refused before it is compared)
+        c.egress()?;
         for (i, n) in c.nodes.iter().enumerate() {
             // F-6: the same loopback port under two addresses is one node
             anyhow::ensure!(
@@ -1692,7 +1694,6 @@ impl FillConfig {
                 n.name
             );
         }
-        c.egress()?;
         // A5-13: the signer's priority fee, before any socket (its open() checks it again)
         c.signer.check_fees(profile).map_err(|e| anyhow::anyhow!("{e}: jg-fill does not start"))?;
         let hot = parse20(&c.hot_address)?;
