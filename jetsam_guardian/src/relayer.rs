@@ -1991,7 +1991,8 @@ impl RelayConfig {
         anyhow::ensure!(c.min_nodes >= if rehearsal { 1 } else { 2 }, "min_nodes {} below the floor (2 off the rehearsal)", c.min_nodes);
         anyhow::ensure!(c.nodes.len() >= c.min_nodes, "{} nodes configured, min_nodes = {}", c.nodes.len(), c.min_nodes);
         for (i, n) in c.nodes.iter().enumerate() {
-            anyhow::ensure!(!c.nodes[..i].iter().any(|m| m.rpc == n.rpc || m.name == n.name), "nodes[{i}] ({}) is configured twice", n.name);
+            // F-6: the same loopback port twice is one node
+            anyhow::ensure!(!c.nodes[..i].iter().any(|m| crate::fill::same_node(&m.rpc, &n.rpc) || m.name == n.name), "nodes[{i}] ({}) is configured twice", n.name);
         }
         c.egress()?;
         match c.prover.mode.as_str() {
