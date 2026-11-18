@@ -67,10 +67,10 @@ pub fn serve(listen: &str, root: PathBuf) -> anyhow::Result<SocketAddr> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             open.fetch_add(1, Ordering::SeqCst);
-            let (root, open) = (root.clone(), open.clone());
+            let (root, done) = (root.clone(), open.clone());
             let spawned = std::thread::Builder::new().spawn(move || {
                 let _ = answer(stream, &root);
-                open.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_sub(1, Ordering::SeqCst);
             });
             if spawned.is_err() {
                 open.fetch_sub(1, Ordering::SeqCst);
