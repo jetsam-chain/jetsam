@@ -943,60 +943,129 @@ pub fn after_own_receipt(reverts: u32, status: bool, raced: bool) -> (u32, Optio
     crate::fill::after_receipt(reverts, status)
 }
 
-/// E-1: what one node answered for the blocks a point names (STUB).
+/// E-1 (external audit 2026-11-18): what one node answered for the blocks a point names (its tip and its locked block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Witness {
+    /// It holds every one of them.
     Holds,
+    /// It holds another block at one of their heights.
     Other,
+    /// It holds none there, or did not answer.
     Silent,
 }
 
-/// E-1 (STUB: the old veto).
+/// E-1: the points are witnessed when `min_nodes` nodes hold them AND more nodes hold them than hold another block at
+/// one of their heights: one node that answers other hashes no longer vetoes every point (with three nodes, two
+/// outvote it); a tie, or a majority against, never submits — a branch fewer nodes hold is never signed.
 pub fn witnessed_by(answers: &[Witness], min_nodes: usize) -> bool {
-    !answers.contains(&Witness::Other) && answers.iter().filter(|a| **a == Witness::Holds).count() >= min_nodes
+    let holds = answers.iter().filter(|a| **a == Witness::Holds).count();
+    let other = answers.iter().filter(|a| **a == Witness::Other).count();
+    holds >= min_nodes && holds > other
 }
 
-/// E-1 (STUB: one height at a time).
+/// E-1 (b): the highest height ≤ `top` where a node's chain agrees with the relayer's (`agrees(h)`), found by steps
+/// doubling down from `top`, then halving between the last agreement and the first disagreement: ≈ 2·log2(top) reads,
+/// never one per block. Height 0 (the genesis, checked at start) is taken as agreed without a read.
 pub fn common_ancestor(top: u64, agrees: &mut dyn FnMut(u64) -> anyhow::Result<bool>) -> anyhow::Result<u64> {
-    let mut common = top;
-    while common > 0 && !agrees(common)? {
-        common -= 1;
+    if top == 0 || agrees(top)? {
+        return Ok(top);
     }
-    Ok(common)
+    // `hi` disagrees; find an agreeing `lo` below it
+    let (mut hi, mut step) = (top, 1u64);
+    let mut lo = loop {
+        let h = top.saturating_sub(step);
+        if h == 0 || agrees(h)? {
+            break h;
+        }
+        hi = h;
+        step = step.saturating_mul(2);
+    };
+    // lo agrees, hi disagrees, lo < hi
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if agrees(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
 }
 
-/// E-1 (c).
+/// E-1 (c): headers of one node read per step at most (a node that announces a tip far above is followed at this pace,
+/// each header's target and proof of work checked: M-1).
 pub const MAX_HEADERS_PER_STEP: u64 = 10_000;
 
-/// E-1 (STUB).
+/// E-1 (c): the heights to read from a node at `node_tip` above the relayer's tip `tip` this step.
 pub fn headers_to_read(tip: u64, node_tip: u64) -> std::ops::RangeInclusive<u64> {
-    tip + 1..=node_tip
+    tip + 1..=node_tip.min(tip.saturating_add(MAX_HEADERS_PER_STEP))
 }
 
-/// M-1 (STUB).
+/// M-1 (external audit 2026-11-18): the next header `hd` of `c` is taken only with the target the nodes' difficulty rule
+/// gives it (ASERT under the build's schedule `s`, [`crate::fill::expected_target`], as jg-fill's E-7) and a proof of
+/// work against it (`pow_ok`): never a branch of forged targets on one node's word. A target the chain cannot compute
+/// (a chain without the headers it needs) is no target.
 pub fn admit_header(
-    _c: &Chain,
-    _hd: &crate::chain::HeaderInfo,
-    _s: &jetsam_bridge_program::rules::Schedule,
-    _pow_ok: &mut dyn FnMut(&crate::chain::HeaderInfo) -> bool,
+    c: &Chain,
+    hd: &crate::chain::HeaderInfo,
+    s: &jetsam_bridge_program::rules::Schedule,
+    pow_ok: &mut dyn FnMut(&crate::chain::HeaderInfo) -> bool,
 ) -> Result<(), &'static str> {
+    if crate::fill::expected_target(c, hd.height, s) != Some(hd.target) {
+        return Err("BAD_TARGET");
+    }
+    if !pow_ok(hd) {
+        return Err("BAD_PROOF_OF_WORK");
+    }
     Ok(())
 }
 
-/// M-3.
+/// M-13 (external audit 2026-11-18): the relayer's chain as kept in `<state_dir>/chain.bin`: its genesis id, then the
+/// raw headers above it (212 bytes each), in order.
+pub fn chain_to_bytes(c: &Chain) -> Vec<u8> {
+    let mut out = c.id_at(c.base_height()).unwrap_or_default().to_vec();
+    for h in c.base_height() + 1..=c.tip_height() {
+        out.extend_from_slice(&c.header_at(h).expect("within the chain").raw);
+    }
+    out
+}
+
+/// M-13: [`chain_to_bytes`] read back over `genesis`: every id recomputed, every link checked again ([`Chain::extend`]);
+/// an error for a file of another genesis, cut short or corrupt.
+pub fn chain_from_bytes(genesis: crate::chain::HeaderInfo, bytes: &[u8]) -> anyhow::Result<Chain> {
+    let size = jetsam_chain::wire::BLOCK_HEADER_WIRE_SIZE;
+    anyhow::ensure!(bytes.len() >= 32 && (bytes.len() - 32) % size == 0, "a kept chain of {} bytes is not a genesis id and whole headers", bytes.len());
+    anyhow::ensure!(bytes[..32] == genesis.id, "the kept chain is of another genesis");
+    let mut c = Chain::from_genesis(genesis);
+    for raw in bytes[32..].chunks(size) {
+        c.extend(crate::chain::HeaderInfo::from_raw(raw)?)?;
+    }
+    Ok(c)
+}
+
+/// M-3 (external audit 2026-11-18): reverts of the relayer's own transactions in 24 h of the host's clock at most,
+/// raced or not (a provider that explains each revert by a race no longer burns its key's gas without end).
 pub const MAX_REVERTS_PER_DAY: u32 = 6;
-/// M-3.
+/// M-3: the halt latched on reaching [`MAX_REVERTS_PER_DAY`].
 pub const HALT_REVERT_BUDGET: &str = "HALT_REVERT_BUDGET";
 
-/// M-3 (STUB).
-pub fn revert_budget(_times: &mut Vec<u64>, _now: u64) -> Option<&'static str> {
-    None
+/// M-3: one more revert at host time `now` (`times`: the earlier ones, kept 24 h): the halt when the day's count
+/// reaches [`MAX_REVERTS_PER_DAY`].
+pub fn revert_budget(times: &mut Vec<u64>, now: u64) -> Option<&'static str> {
+    times.retain(|t| t.saturating_add(86_400) > now);
+    times.push(now);
+    (times.len() >= MAX_REVERTS_PER_DAY as usize).then_some(HALT_REVERT_BUDGET)
 }
 
 /// The relayer's latched halt (`<state_dir>/HALT`, its reasons, one a line), if any: while it is there, the relayer
 /// sends nothing (it reads, learns and rebuilds); only an operator removes it (D41).
+/// F-4 (external audit 2026-11-18): a file that cannot be read (anything but absent) halts as well.
 pub fn relay_halted(state_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(state_dir.join("HALT")).ok().map(|s| s.trim().to_string())
+    match std::fs::read_to_string(state_dir.join("HALT")) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("HALT_UNREADABLE: {}: {e}", state_dir.join("HALT").display())),
+    }
 }
 
 /// T7.7 (A3, the private rehearsal's "J-RACE"): one process at a time writes a relayer's state directory. The running
@@ -1959,6 +2028,15 @@ impl RelayConfig {
             );
         }
         anyhow::ensure!(c.poll_secs > 0 && c.claims_per_step > 0, "poll_secs and claims_per_step must be positive");
+        // F-6 (external audit 2026-11-18): off the rehearsal, points are learned below the L1's latest, from the
+        // bridge's deployment (not the whole L1 read again)
+        anyhow::ensure!(rehearsal || c.l1_confirmations != Some(0), "l1_confirmations = 0 is refused on {profile}: a short L1 reorganization would teach a point that is gone");
+        anyhow::ensure!(rehearsal || c.l1_from_block > 0, "l1_from_block is required on {profile}: the bridge's deployment block (0 reads the whole L1)");
+        // M-10: the mainnet's relayer alerts outside its logs
+        anyhow::ensure!(
+            profile != crate::Profile::Mainnet || c.alert_command.first().is_some_and(|p| !p.is_empty()),
+            "alert_command is required on {profile}: its alerts (a halt, a refused reorganization, nodes that disagree, steps that fail) must leave the logs"
+        );
         Ok(c)
     }
 

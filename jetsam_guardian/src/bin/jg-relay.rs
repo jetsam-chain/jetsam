@@ -140,6 +140,9 @@ struct State {
     /// M5-2 (audit n°2): the seconds from the last plan to its proof ready (MN-5 is judged at now + this + inclusion).
     #[serde(default)]
     proof_secs: Option<u64>,
+    /// M-3 (external audit 2026-11-18): the host times of its own transactions' reverts in the last 24 h, raced or not.
+    #[serde(default)]
+    revert_times: Vec<u64>,
 }
 
 struct Relay {
@@ -167,13 +170,61 @@ struct Relay {
     node_off: Vec<u32>,
     /// BRIDGE2 (MN5CT §9 S1): the bridge's MN-5 rule, read from it at start (`MN5_MAX_ELAPSED()`).
     mn5_rule: relayer::Mn5Rule,
+    /// M-1: the strict profiles take a node's header only with its ASERT target and its proof of work.
+    check_headers: bool,
+    /// M-1: the ids of the headers whose proof of work was checked.
+    pow_checked: HashSet<[u8; 32]>,
+    /// F-4: a halt whose latch could not be written still holds this process (until it stops).
+    halt_unlatched: Option<String>,
+    /// M-10: when each alert was last sent through the alert command (at most once an hour each).
+    alerted_at: HashMap<String, u64>,
+    /// M-10: steps in a row that ended in an error.
+    failed_steps: u32,
+    /// E-1 (c): the last sync read every header its nodes announced (none left past MAX_HEADERS_PER_STEP).
+    caught_up: bool,
+    /// M-13: the tip id and host time of the chain last kept in `<state_dir>/chain.bin`.
+    chain_kept: ([u8; 32], u64),
 }
+
+/// M-13: the chain is kept at most this often (and at the stop).
+const KEEP_CHAIN_EVERY_SECS: u64 = 600;
+
+/// M-10: the same alert goes through the alert command at most this often (every one is in the log).
+const ALERT_REPEAT_SECS: u64 = 3_600;
+/// M-10: steps in a row ending in an error before it is alerted.
+const FAILED_STEPS_ALERT: u32 = 10;
 
 /// E-1: the points the contract names (its tip, its final point) and this relayer does not know are read again by
 /// their ids at most this often.
 const REREAD_EVERY_SECS: u64 = 600;
 
 impl Relay {
+    /// M-10 (external audit 2026-11-18): an alert, in the log and through the operator's `alert_command` (argv, no
+    /// shell, run apart and bounded: the relayer never waits for it), the same event at most once an hour.
+    fn alert(&mut self, event: &str, detail: &str) {
+        log(&format!("ALERT {event}: {detail}"));
+        if self.cfg.alert_command.is_empty() {
+            return;
+        }
+        let now = now_unix();
+        if self.alerted_at.get(event).is_some_and(|t| now < t + ALERT_REPEAT_SECS) {
+            return;
+        }
+        self.alerted_at.insert(event.to_string(), now);
+        let argv = jetsam_guardian::watch::substitute(&self.cfg.alert_command, &[("{event}", event), ("{detail}", detail)]);
+        let event = event.to_string();
+        std::thread::spawn(move || match jetsam_guardian::watch::run_command(&argv, Duration::from_secs(300)) {
+            Ok(st) if st.success() => {}
+            Ok(st) => log(&format!("ALERT ALERT_COMMAND_FAILED {event}: {st}")),
+            Err(e) => log(&format!("ALERT ALERT_COMMAND_FAILED {event}: {e:#}")),
+        });
+    }
+
+    /// F-4: the latched halt, or one this process could not latch.
+    fn halted(&self) -> Option<String> {
+        relayer::relay_halted(&self.cfg.state_dir).or_else(|| self.halt_unlatched.clone())
+    }
+
     fn event(&self, mut v: Value) {
         use std::io::Write;
         if let Some(o) = v.as_object_mut() {
@@ -200,22 +251,47 @@ impl Relay {
     /// `<state_dir>/HALT`: it then sends nothing until an operator removes the file (D41).
     /// True when the halt is reached now (the caller sends nothing more).
     fn receipt_seen(&mut self, label: &str, status: bool, raced: bool) -> bool {
-        let (n, halt) = relayer::after_own_receipt(self.state.reverts, status, raced);
+        let (n, mut halt) = relayer::after_own_receipt(self.state.reverts, status, raced);
         self.state.reverts = n;
         if !status {
             log(&format!("{label} reverted ({}; {n} unexplained in a row)", if raced { "another transaction landed first" } else { "unexplained" }));
+            // M-3: every revert counts toward a daily bound of the host's clock, raced or not
+            if let Some(code) = relayer::revert_budget(&mut self.state.revert_times, now_unix()) {
+                halt = halt.or(Some(code));
+            }
         }
         let Some(code) = halt else { return false };
+        let why = if code == relayer::HALT_REVERT_BUDGET {
+            // counted afresh once an operator removes the halt
+            self.state.revert_times.clear();
+            format!("{} of its transactions reverted in 24 h, races included", relayer::MAX_REVERTS_PER_DAY)
+        } else {
+            format!("{} of its transactions reverted in a row", jetsam_guardian::fill::MAX_CONSECUTIVE_REVERTS)
+        };
         match relayer::latch_relay_halt(&self.cfg.state_dir, code) {
-            Ok(()) => log(&format!(
-                "HALT {code}: {} of its transactions reverted in a row (latched in {}; an operator removes it)",
-                jetsam_guardian::fill::MAX_CONSECUTIVE_REVERTS,
-                self.cfg.state_dir.join("HALT").display()
-            )),
-            Err(e) => log(&format!("HALT {code} NOT LATCHED: {e:#}")),
+            Ok(()) => self.alert("HALT", &format!("{code}: {why} (latched in {}; an operator removes it)", self.cfg.state_dir.join("HALT").display())),
+            Err(e) => {
+                // F-4: not written, it still holds this process
+                self.halt_unlatched = Some(code.to_string());
+                self.alert("HALT", &format!("{code}: {why}; NOT LATCHED ({e:#}): it holds this process until it stops"));
+            }
         }
         self.event(json!({"event": "halt", "reason": code}));
         true
+    }
+
+    /// M-13 (external audit 2026-11-18): the chain kept in `<state_dir>/chain.bin` (`force`: at the stop), when its tip
+    /// moved, at most every KEEP_CHAIN_EVERY_SECS: a restart reads only what came since, not every header from the genesis.
+    fn keep_chain(&mut self, force: bool) {
+        let now = now_unix();
+        let tip = self.chain.tip_id();
+        if tip == self.chain_kept.0 || (!force && now < self.chain_kept.1 + KEEP_CHAIN_EVERY_SECS) {
+            return;
+        }
+        match jetsam_guardian::write_atomic(&self.cfg.state_dir.join("chain.bin"), &relayer::chain_to_bytes(&self.chain)) {
+            Ok(()) => self.chain_kept = (tip, now),
+            Err(e) => log(&format!("chain.bin not written: {e:#}")),
+        }
     }
 
     fn save(&self) {
@@ -238,9 +314,10 @@ impl Relay {
     /// a branch the relayer does not follow, no longer holds it back): common ancestor, then the new headers. A node off
     /// the relayer's chain for [`relayer::NODE_OFF_CHAIN_ALERT_STEPS`] steps in a row is said once. An error only when
     /// no node could be read.
-    fn sync(&mut self) -> anyhow::Result<()> {
+    fn sync(&mut self) -> anyhow::Result<bool> {
         let mut last = None;
         let mut read = false;
+        self.caught_up = true;
         self.node_off.resize(self.nodes.len(), 0);
         for i in 0..self.nodes.len() {
             let (on_ours, why) = match self.sync_from(i) {
@@ -258,38 +335,64 @@ impl Relay {
             self.node_off[i] = count;
             if say {
                 let name = self.cfg.nodes[i].name.clone();
-                log(&format!(
-                    "ALERT NODE_OFF_OUR_CHAIN node {name}: not on this relayer's chain (tip {}) for {count} steps in a row (behind, on a branch \
+                let detail = format!(
+                    "node {name}: not on this relayer's chain (tip {}) for {count} steps in a row (behind, on a branch \
                      not followed, or not answering){why}: it does not count toward min_nodes = {}",
                     self.chain.tip_height(),
                     self.cfg.min_nodes
-                ));
+                );
+                self.alert("NODE_OFF_OUR_CHAIN", &detail);
                 self.event(json!({"event": "node_off_chain", "node": name, "steps": count, "tip": self.chain.tip_height()}));
             }
         }
         if read {
-            return Ok(());
+            return Ok(self.caught_up);
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("no node")))
     }
 
+}
+
+/// M-1: the next header of `chain` from a node, its target and proof of work checked on the strict profiles (`check`;
+/// `cache`: the ids whose proof of work was checked).
+fn admit(check: bool, cache: &mut HashSet<[u8; 32]>, chain: &Chain, hd: &HeaderInfo) -> anyhow::Result<()> {
+        if !check {
+            return Ok(());
+        }
+        let mut pow = |h: &HeaderInfo| {
+            if cache.contains(&h.id) {
+                return true;
+            }
+            let mut src = h.raw.as_slice();
+            let ok = jetsam_chain::block_header::BlockHeader::decode(&mut src).ok().is_some_and(|b| jetsam_chain::consensus::pow::validate_pow(&b).is_ok());
+            if ok {
+                cache.insert(h.id);
+            }
+            ok
+        };
+        relayer::admit_header(chain, hd, &jetsam_bridge_program::rules::PRODUCTION, &mut pow)
+            .map_err(|why| anyhow::anyhow!("header {} (0x{}) refused: {why}", hd.height, hex::encode(hd.id)))
+}
+
+impl Relay {
+
     /// One node's chain against the relayer's: true when, after it, the node's tip is the relayer's or above it, on it.
     fn sync_from(&mut self, i: usize) -> anyhow::Result<bool> {
-        let n = &mut self.nodes[i];
-        let tip = n.tip_height()?;
+        let tip = self.nodes[i].tip_height()?;
         let top = self.chain.tip_height().min(tip);
-        let mut common = top;
-        while common > 0 && n.block_hash(common)? != self.chain.id_at(common) {
-            common -= 1;
-        }
+        // E-1 (b): found in ≈ 2·log2(top) reads, never one per block
+        let (n, chain) = (&mut self.nodes[i], &self.chain);
+        let common = relayer::common_ancestor(top, &mut |h| Ok(n.block_hash(h)? == chain.id_at(h)))?;
         // a node that is only behind agrees up to its tip: nothing is dropped (its lag is no reorganization)
         if common < top {
             let from = self.chain.tip_height();
             // GU-3: the node's branch read whole before anything is dropped (its work against the relayer's chain)
             let mut branch = self.chain.clone();
             branch.truncate_above(common);
-            for h in common + 1..=tip {
+            // E-1 (c), M-1: a bounded number of headers, each one's target and proof of work checked
+            for h in relayer::headers_to_read(common, tip) {
                 let Some(hd) = self.nodes[i].header(h)? else { break };
+                admit(self.check_headers, &mut self.pow_checked, &branch, &hd)?;
                 branch.extend(hd)?;
             }
             let ours = self.chain.work_at(from).expect("the tip's work");
@@ -308,11 +411,12 @@ impl Relay {
                 if agree < self.cfg.min_nodes {
                     let name = self.cfg.nodes[i].name.clone();
                     if relayer::reorg_needs_nodes(from, common, floor) {
-                        log(&format!(
-                            "ALERT DEEP_REORG_REFUSED node {name}: a reorganization from {from} down to {common} (locked floor {floor}) whose block {} {agree} of the nodes serve, min_nodes = {}: not followed",
+                        let detail = format!(
+                            "node {name}: a reorganization from {from} down to {common} (locked floor {floor}) whose block {} {agree} of the nodes serve, min_nodes = {}: not followed",
                             common + 1,
                             self.cfg.min_nodes
-                        ));
+                        );
+                        self.alert("DEEP_REORG_REFUSED", &detail);
                     } else {
                         log(&format!(
                             "node {name}: its branch from {common} (tip {}) has no more work than this relayer's chain (tip {from}) and {agree} of the nodes serve its block {}, min_nodes = {}: not followed (GU-3)",
@@ -330,9 +434,16 @@ impl Relay {
             self.event(json!({"event": "reorg", "from": from, "to": common, "node": self.cfg.nodes[i].name}));
             return Ok(true);
         }
-        for h in self.chain.tip_height() + 1..=tip {
+        // E-1 (c), M-1: a bounded number of headers a step, each one's target and proof of work checked
+        let range = relayer::headers_to_read(self.chain.tip_height(), tip);
+        let capped = *range.end() < tip;
+        for h in range {
             let Some(hd) = self.nodes[i].header(h)? else { break };
+            admit(self.check_headers, &mut self.pow_checked, &self.chain, &hd)?;
             self.chain.extend(hd)?;
+        }
+        if capped && self.chain.tip_height() < tip {
+            self.caught_up = false;
         }
         Ok(tip >= self.chain.tip_height())
     }
@@ -435,10 +546,13 @@ impl Relay {
                         } else {
                             "its body is unknown"
                         };
-                        log(&format!(
-                            "ALERT MISSING_DEPOSIT_BODY:{h} ({reason}): {what} and its header does not prove it holds no deposit ({outputs} outputs created, \
-                             the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
-                        ));
+                        self.alert(
+                            "MISSING_DEPOSIT_BODY",
+                            &format!(
+                                "{h} ({reason}): {what} and its header does not prove it holds no deposit ({outputs} outputs created, \
+                                 the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
+                            ),
+                        );
                         self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason, "unreadable": kept}));
                     } else if kept && !unreadable {
                         log(&format!("block {h}: the bytes a source served for it are kept, unreadable by this build ({reason})"));
@@ -579,26 +693,37 @@ impl Relay {
         }
     }
 
-    /// `min_nodes` nodes have block `id` at `h` and none another one there.
+    /// E-1 (external audit 2026-11-18): `min_nodes` nodes have block `id` at `h`, and more nodes have them than have
+    /// another block at one of those heights ([`relayer::witnessed_by`]): one node that answers other hashes no longer
+    /// vetoes every point (it is alerted); a tie or a majority against submits nothing.
     fn witnessed(&mut self, points: &[(u64, [u8; 32])]) -> bool {
-        let mut agree = 0;
+        let mut answers = Vec::new();
         for n in &mut self.nodes {
-            let mut all = true;
+            let mut w = relayer::Witness::Holds;
             for (h, id) in points {
                 match n.block_hash(*h) {
                     Ok(Some(x)) if x == *id => {}
                     Ok(Some(_)) => {
-                        log(&format!("ALERT NODES_DISAGREE at {h}: no submission"));
-                        return false;
+                        w = relayer::Witness::Other;
+                        break;
                     }
-                    _ => all = false,
+                    _ => w = relayer::Witness::Silent,
                 }
             }
-            if all {
-                agree += 1;
+            answers.push(w);
+        }
+        let ok = relayer::witnessed_by(&answers, self.cfg.min_nodes);
+        let dissent: Vec<String> =
+            answers.iter().zip(&self.cfg.nodes).filter(|(w, _)| **w == relayer::Witness::Other).map(|(_, n)| n.name.clone()).collect();
+        if !dissent.is_empty() {
+            let at: Vec<u64> = points.iter().map(|(h, _)| *h).collect();
+            if ok {
+                self.alert("NODE_DISSENTS", &format!("nodes {dissent:?} hold other blocks at {at:?} than the majority of this relayer's nodes ({answers:?}): outvoted, the point goes"));
+            } else {
+                self.alert("NODES_DISAGREE", &format!("at {at:?}: {answers:?} (nodes {dissent:?} hold other blocks): no submission"));
             }
         }
-        agree >= self.cfg.min_nodes
+        ok
     }
 
     fn finalize(&mut self, fin_id: &[u8; 32], final_locked: u64, last_switch: u64, paused_until: u64, l1_now: u64) -> anyhow::Result<()> {
@@ -857,7 +982,7 @@ impl Relay {
                 }
                 // MustExtendTip: the tip is on this chain with roots that are not ours (A5-4: a new question, noted)
                 if matches!(why, NoSubmission::NoParentOnThisChain | NoSubmission::NotHeavier | NoSubmission::WorkRateTooLow | NoSubmission::MustExtendTip) {
-                    log(&format!("ALERT NO_SUBMISSION {why:?}"));
+                    self.alert("NO_SUBMISSION", &format!("{why:?}"));
                 }
                 if let NoSubmission::TooManyDepositBlocks(n) = why {
                     log(&format!(
@@ -912,7 +1037,7 @@ impl Relay {
         // M5-2: sent while its deadline is not passed (a later one would revert WorkRateTooLow)
         let now = self.l1.next_time()?;
         if let Some(deadline) = deadline.filter(|d| now > *d) {
-            log(&format!("ALERT MN5_DEADLINE_PASSED: the proof of T={} came at {now}, after its MN-5 deadline {deadline} ({proving} s of proof): not sent", s.next.height));
+            self.alert("MN5_DEADLINE_PASSED", &format!("the proof of T={} came at {now}, after its MN-5 deadline {deadline} ({proving} s of proof): not sent", s.next.height));
             self.event(json!({"event": "mn5_deadline_passed", "height": s.next.height, "deadline": deadline, "now": now, "proof_secs": proving}));
             self.state.work_rate_refused = true;
             return Ok(());
@@ -954,8 +1079,13 @@ impl Relay {
     }
 
     fn step(&mut self) -> anyhow::Result<()> {
-        self.sync()?;
+        let caught_up = self.sync()?;
         self.read_bodies();
+        if !caught_up {
+            // E-1 (c): headers left past MAX_HEADERS_PER_STEP: nothing decided on a chain still being read
+            log(&format!("syncing: this relayer's chain is at {}, its nodes announce more (read {} headers a step): nothing sent this step", self.chain.tip_height(), relayer::MAX_HEADERS_PER_STEP));
+            return Ok(());
+        }
         let genesis = word(&self.view("genesisId()", &[])?, 0);
         if genesis == [0u8; 32] {
             log("waiting for the bridge genesis (installed once by the genesis key)");
@@ -984,7 +1114,7 @@ impl Relay {
         let l1_now = self.l1.next_time()?;
         // A5-13: latched on repeated reverts, the relayer reads, learns, rebuilds, publishes and queues, and sends
         // nothing (checked again after each phase that sends)
-        let halted = |s: &Self| relayer::relay_halted(&s.cfg.state_dir);
+        let halted = |s: &Self| s.halted();
         if let Some(h) = halted(self) {
             log(&format!("HALTED ({}): nothing is sent until an operator removes {}", h.replace('\n', ", "), self.cfg.state_dir.join("HALT").display()));
         }
@@ -1021,18 +1151,18 @@ impl Relay {
                 return Ok(());
             }
             if self.standby_takeover != Some(tip_id) {
-                log(&format!("ALERT STANDBY_TAKEOVER: the contract's newest point {} is {age} s old on the L1 clock (standby_after_secs {after}): this standby relayer submits", hex::encode(tip_id)));
+                self.alert("STANDBY_TAKEOVER", &format!("the contract's newest point {} is {age} s old on the L1 clock (standby_after_secs {after}): this standby relayer submits", hex::encode(tip_id)));
                 self.event(json!({"event": "standby_takeover", "tip": hex::encode(tip_id), "age": age}));
                 self.standby_takeover = Some(tip_id);
             }
             if stalled {
-                log("ALERT the contract has stalled (MN-3): a point now");
+                self.alert("STALLED", "the contract has stalled (MN-3): a point now");
             }
             return self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, tip_locked, l1_now);
         }
         if due || stalled || fast {
             if stalled {
-                log("ALERT the contract has stalled (MN-3): a point now");
+                self.alert("STALLED", "the contract has stalled (MN-3): a point now");
             }
             self.submit(gl, anchor_base, tip_id, tip_cum_work, tip_block, tip_locked, l1_now)?;
         }
@@ -1257,13 +1387,31 @@ fn run() -> anyhow::Result<()> {
         archive.unreadable().len()
     ));
     let events = cfg.state_dir.join("events.jsonl");
+    // M-13: the chain kept at the last run, read back (every id and link checked again), else from the genesis; the
+    // first sync then reads only what changed since (a reorganization meanwhile included: the same rules)
+    let genesis = genesis.ok_or_else(|| anyhow::anyhow!("no node"))?;
+    let chain = match std::fs::read(cfg.state_dir.join("chain.bin")) {
+        Ok(bytes) => match relayer::chain_from_bytes(genesis.clone(), &bytes) {
+            Ok(c) => {
+                log(&format!("chain kept at the last run read back: tip {}", c.tip_height()));
+                c
+            }
+            Err(e) => {
+                log(&format!("chain.bin not used ({e:#}): read again from the genesis"));
+                Chain::from_genesis(genesis)
+            }
+        },
+        Err(_) => Chain::from_genesis(genesis),
+    };
+    // M-1: off the private rehearsal (synthetic headers), every header taken carries its ASERT target and its proof of work
+    let check_headers = profile.strict();
     let mut r = Relay {
         bridge: hex0x(&jetsam_guardian::fill::parse20(&cfg.l1_bridge)?),
         l1,
         tx,
         rules: VaultRules::current(),
         nodes,
-        chain: Chain::from_genesis(genesis.ok_or_else(|| anyhow::anyhow!("no node"))?),
+        chain,
         archive,
         state,
         prover,
@@ -1274,6 +1422,13 @@ fn run() -> anyhow::Result<()> {
         standby_takeover: None,
         node_off: Vec::new(),
         mn5_rule,
+        check_headers,
+        pow_checked: HashSet::new(),
+        halt_unlatched: None,
+        alerted_at: HashMap::new(),
+        failed_steps: 0,
+        caught_up: true,
+        chain_kept: ([0u8; 32], 0),
         cfg,
     };
     r.event(json!({"event": "start", "config_sha256": digest, "signer": hex0x(&r.tx.address()), "prover": r.prover.name()}));
@@ -1283,10 +1438,19 @@ fn run() -> anyhow::Result<()> {
         r.save();
     }
     while !STOP.load(Ordering::SeqCst) {
-        if let Err(e) = r.step() {
-            log(&format!("step: {e:#}"));
+        match r.step() {
+            Ok(()) => r.failed_steps = 0,
+            Err(e) => {
+                log(&format!("step: {e:#}"));
+                // M-10: steps that keep failing leave the log
+                r.failed_steps += 1;
+                if r.failed_steps % FAILED_STEPS_ALERT == 0 {
+                    r.alert("STEPS_FAILING", &format!("{} steps in a row ended in an error, the last: {e:#}", r.failed_steps));
+                }
+            }
         }
         r.save();
+        r.keep_chain(false);
         for _ in 0..(r.cfg.poll_secs * 5) {
             if STOP.load(Ordering::SeqCst) {
                 break;
@@ -1295,6 +1459,7 @@ fn run() -> anyhow::Result<()> {
         }
     }
     r.save();
+    r.keep_chain(true);
     log("stopped");
     Ok(())
 }

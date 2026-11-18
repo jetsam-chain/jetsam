@@ -2023,3 +2023,21 @@ fn f6_m10_what_the_public_relayers_config_must_name() {
     let c = RelayConfig::parse(deployed).expect("the public test network's deployed relay.toml");
     assert!(c.alert_command.is_empty());
 }
+
+/// M-13 (external audit 2026-11-18): the relayer's chain is kept across a restart (its raw headers above the genesis):
+/// read back whole, every link and id checked again; a file of another genesis, cut short or corrupt is no chain.
+#[test]
+fn m13_the_relayers_chain_is_kept_across_a_restart() {
+    let c = testkit::chain(50, 1);
+    let bytes = chain_to_bytes(&c);
+    let back = chain_from_bytes(testkit::genesis(), &bytes).unwrap();
+    assert_eq!((back.tip_height(), back.tip_id(), back.work_at(50)), (50, c.tip_id(), c.work_at(50)));
+    let other = testkit::header([0u8; 32], 0, 1_700_000_001, testkit::target_bits(20), 9);
+    assert!(chain_from_bytes(other, &bytes).is_err(), "another genesis");
+    assert!(chain_from_bytes(testkit::genesis(), &bytes[..bytes.len() - 1]).is_err(), "cut short");
+    let mut bad = bytes.clone();
+    let last = bad.len() - 20;
+    bad[last] ^= 1;
+    assert!(chain_from_bytes(testkit::genesis(), &bad).is_err(), "corrupt");
+    assert_eq!(chain_from_bytes(testkit::genesis(), &chain_to_bytes(&testkit::chain(0, 1))).unwrap().tip_height(), 0);
+}
