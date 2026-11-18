@@ -26,6 +26,13 @@ use crate::rpc::Egress;
 /// Bound on a request head read by the server.
 const MAX_REQUEST_HEAD: usize = 4_096;
 
+/// F-10 (external audit of the robots): seconds a connection may take to send its whole request head, however it
+/// trickles its bytes (the deadline is over the request, not each read).
+pub const REQUEST_DEADLINE_SECS: u64 = 10;
+
+/// F-10: connections served at once at most (each in a thread of its own); one more waits for a free place.
+pub const MAX_CONNECTIONS: usize = 32;
+
 /// The guardian index and the day of a request path `/feeds/g<i>/<YYYY-MM-DD>.jsonl`; `None` for any other.
 pub fn feed_request_path(path: &str) -> Option<(u32, String)> {
     let rest = path.strip_prefix("/feeds/g")?;
@@ -44,15 +51,30 @@ pub fn feed_request_path(path: &str) -> Option<(u32, String)> {
 }
 
 /// Serve the feeds under `root` read only on `listen` (a loopback IP address and port, `:0` for any free one),
-/// one thread for the life of the process; the address bound. Off the loopback: refused, nothing bound.
+/// one thread for the life of the process that accepts, and one thread per connection (F-10: a slow client holds
+/// no other reader back; [`MAX_CONNECTIONS`] at once); the address bound. Off the loopback: refused, nothing bound.
 pub fn serve(listen: &str, root: PathBuf) -> anyhow::Result<SocketAddr> {
     let addr: SocketAddr = listen.parse().map_err(|_| anyhow::anyhow!("feed_listen {listen:?}: an IP address and port"))?;
     anyhow::ensure!(addr.ip().is_loopback(), "feed_listen {listen}: a loopback address only (the onion service points at it)");
     let listener = TcpListener::bind(addr)?;
     let bound = listener.local_addr()?;
+    let root = std::sync::Arc::new(root);
+    let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
         for stream in listener.incoming().flatten() {
-            let _ = answer(stream, &root);
+            while open.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            open.fetch_add(1, Ordering::SeqCst);
+            let (root, open) = (root.clone(), open.clone());
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let _ = answer(stream, &root);
+                open.fetch_sub(1, Ordering::SeqCst);
+            });
+            if spawned.is_err() {
+                open.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     });
     Ok(bound)
@@ -60,11 +82,17 @@ pub fn serve(listen: &str, root: PathBuf) -> anyhow::Result<SocketAddr> {
 
 /// One request on `s`: its head read (bounded), then one answer, then the connection closed.
 fn answer(mut s: TcpStream, root: &Path) -> std::io::Result<()> {
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    s.set_write_timeout(Some(Duration::from_secs(10)))?;
+    // F-10: one deadline over the whole request head, each read bounded by what is left of it
+    let deadline = std::time::Instant::now() + Duration::from_secs(REQUEST_DEADLINE_SECS);
+    s.set_write_timeout(Some(Duration::from_secs(REQUEST_DEADLINE_SECS)))?;
     let mut head = Vec::new();
     let mut buf = [0u8; 1_024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < MAX_REQUEST_HEAD {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline"));
+        }
+        s.set_read_timeout(Some(left))?;
         let n = s.read(&mut buf)?;
         if n == 0 {
             break;

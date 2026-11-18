@@ -111,11 +111,57 @@ fn derive(passphrase: &[u8], salt: &[u8; 16], cost: KdfCost) -> anyhow::Result<Z
     Ok(out)
 }
 
-/// Open a sealed machine key (a wrong passphrase fails).
-pub fn open_machine_key(blob: &[u8], passphrase: &[u8]) -> anyhow::Result<MachineKey> {
+/// M-12 (external audit of the robots): the KDF cost a sealed machine key names (its header), before any derivation.
+pub fn sealed_cost(blob: &[u8]) -> anyhow::Result<KdfCost> {
     anyhow::ensure!(blob.len() == 5 + 12 + 16 + 12 + 32 + 16 && &blob[..5] == MACHINE_MAGIC, "not a sealed machine key");
     let u = |i: usize| u32::from_be_bytes(blob[i..i + 4].try_into().expect("4"));
-    let cost = KdfCost { m_kib: u(5), t: u(9), p: u(13) };
+    Ok(KdfCost { m_kib: u(5), t: u(9), p: u(13) })
+}
+
+/// M-12: off the private rehearsal a machine key sealed below the production cost (`--test-kdf`, a passphrase an
+/// offline search breaks in no time) is refused: the machine does not start with it.
+pub fn check_machine_key_cost(blob: &[u8], profile: crate::Profile) -> anyhow::Result<()> {
+    let c = sealed_cost(blob)?;
+    let p = KdfCost::PRODUCTION;
+    if profile.strict() && (c.m_kib < p.m_kib || c.t < p.t) {
+        anyhow::bail!(
+            "the machine key is sealed with a TEST cost (argon2id {} KiB, {} passes; production {} KiB, {} passes): refused on {profile}, \
+             seal a new one without --test-kdf",
+            c.m_kib,
+            c.t,
+            p.m_kib,
+            p.t
+        );
+    }
+    Ok(())
+}
+
+/// M-12: `bytes` written to a NEW file `path` (never over one, never through a symbolic link), created 0600 whatever
+/// the umask, synced with its directory: a secret at rest is its owner's alone.
+pub fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("{}: {e} (never written over a file already there)", path.display()))?;
+    // the mode asked is masked by the umask at creation: set it again on the descriptor
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| anyhow::anyhow!("{}: sync: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Open a sealed machine key (a wrong passphrase fails).
+pub fn open_machine_key(blob: &[u8], passphrase: &[u8]) -> anyhow::Result<MachineKey> {
+    let cost = sealed_cost(blob)?;
     let salt: [u8; 16] = blob[17..33].try_into().expect("16");
     let nonce = &blob[33..45];
     let k = derive(passphrase, &salt, cost)?;

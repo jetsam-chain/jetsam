@@ -175,6 +175,9 @@ pub struct RunState {
     /// FR-5 (audit n°2): the fast records Base's final state confirmed (the contradiction search found the word
     /// paid under a valid game at or after their block): never contradicted, their slot no longer captured.
     pub settled: BTreeSet<u64>,
+    /// M-8 (external audit of the robots): the burns the slow lane paid (its journal): final, nothing left to contradict,
+    /// their slot no longer captured.
+    pub final_slow: BTreeSet<u64>,
 }
 
 /// FR-3: a fast release handed in.
@@ -186,11 +189,15 @@ pub struct FastTry {
 }
 
 impl RunState {
+    /// F-4 (external audit of the robots): none yet is a fresh start; a file present but unreadable is an error (never
+    /// taken for an empty one: every burn seen and every release handed in would be forgotten).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Ok(Self::default());
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => bail!("{}: {e}: unreadable, never taken for an empty state", path.display()),
         };
-        let v: Value = serde_json::from_str(&text)?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("{}: {e}: unreadable, never taken for an empty state", path.display()))?;
         let mut burns = BTreeMap::new();
         for b in v["burns"].as_array().cloned().unwrap_or_default() {
             let owner = crate::base_capture::hex32_of(b["owner"].as_str().unwrap_or_default())?;
@@ -247,6 +254,7 @@ impl RunState {
                 .map(|a| a.iter().filter_map(|p| Some((p[0].as_u64()?, (p[1].as_u64()?, u32::try_from(p[2].as_u64()?).ok()?)))).collect())
                 .unwrap_or_default(),
             settled: set("settled"),
+            final_slow: set("final_slow"),
         })
     }
 
@@ -269,11 +277,10 @@ impl RunState {
             "watched": self.watched.iter().collect::<Vec<_>>(),
             "contradiction_tries": self.contradiction_tries.iter().map(|(n, (at, c))| json!([n, at, c])).collect::<Vec<_>>(),
             "settled": self.settled.iter().collect::<Vec<_>>(),
+            "final_slow": self.final_slow.iter().collect::<Vec<_>>(),
         });
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&v)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // F-4: written and synced, then renamed (its directory synced): a crash leaves the old state or the new one
+        crate::write_atomic(path, &serde_json::to_vec_pretty(&v)?)
     }
 }
 
@@ -465,9 +472,16 @@ pub fn records_of_this_bridge(records: Vec<FastPaid>, rules: &jetsam_chain::cons
     records.into_iter().filter(|r| rules.fast_record_under_this_bridge(r.height)).collect()
 }
 
-/// FR-1, FR-5: the `n` each capture asks: every burn seen and every fast record watched, but those settled.
+/// FR-1, FR-5: the `n` each capture asks: every burn seen and every fast record watched, but those settled; M-8: nor
+/// those the slow lane paid (final).
 pub fn capture_ns(state: &RunState) -> Vec<u64> {
-    let ns: BTreeSet<u64> = state.burns.keys().chain(&state.watched).copied().filter(|n| !state.settled.contains(n)).collect();
+    let ns: BTreeSet<u64> = state
+        .burns
+        .keys()
+        .chain(&state.watched)
+        .copied()
+        .filter(|n| !state.settled.contains(n) && !state.final_slow.contains(n))
+        .collect();
     ns.into_iter().collect()
 }
 
@@ -741,6 +755,10 @@ pub fn check_base_rpcs(urls: &[String], chain_id: &dyn Fn(&str) -> anyhow::Resul
         if urls[..i].iter().any(|v| norm(v) == norm(u)) {
             bail!("the Base RPC {u} is given twice: a second reading of the same source checks nothing");
         }
+        // M-7 (external audit of the robots): two paths or keys of one host are one provider
+        if let Some(v) = urls[..i].iter().find(|v| source_host(v) == source_host(u)) {
+            bail!("the Base RPCs {v} and {u} are on one host ({}): one provider is not a second reading", source_host(u));
+        }
     }
     let mut silent = Vec::new();
     for u in urls {
@@ -899,18 +917,20 @@ fn lock(state: &Mutex<RunState>) -> MutexGuard<'_, RunState> {
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// One tick of the captures at time `now`: Base's head; the bridge's burns
-/// up to it (kept in `state` and `state_file`); then, once the run knows a
+/// One tick of the captures at time `now`: Base's head (the first of `bases` that answers); the bridge's burns
+/// up to it, F-2: the union of what every one of `bases` serves (one that leaves a burn out hides it from no one; an
+/// error only when none answers), kept in `state` and `state_file`; then, once the run knows a
 /// proposal block (`proposal_anchor`), each proposal block of the window
 /// (`interval`, `window`: [`capture_plan`]'s) **at or below that head** not
 /// captured yet, newest first, with the slots of every burn seen up to the
 /// head (a burn is always seen before the proposal block after it is asked);
 /// then the prune. A block above the head is never asked; one older than
 /// [`CAPTURE_PRIORITY_BLOCKS`] is not asked while the next proposal block is
-/// nearer than that (it waits a later tick).
+/// nearer than that (it waits a later tick). F-2: a block is captured from the
+/// first of `bases` that serves it.
 #[allow(clippy::too_many_arguments)]
 pub fn capture_tick(
-    base: &dyn BaseRpc,
+    bases: &[&dyn BaseRpc],
     bridge: &L1BridgeParams,
     from_block: u64,
     interval: u64,
@@ -920,11 +940,40 @@ pub fn capture_tick(
     dir: &Path,
     now: u64,
 ) -> anyhow::Result<TickReport> {
-    let head = crate::l1::hex_u64(&base.rpc("eth_blockNumber", json!([]))?)?;
+    anyhow::ensure!(!bases.is_empty(), "no Base RPC");
+    let mut last = None;
+    let mut head = None;
+    for b in bases {
+        match b.rpc("eth_blockNumber", json!([])).and_then(|v| crate::l1::hex_u64(&v)) {
+            Ok(h) => {
+                head = Some(h);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let Some(head) = head else { return Err(last.expect("one base at least")) };
     let mut report = TickReport { head, ..TickReport::default() };
     let from = lock(state).scanned_to.map_or(from_block, |s| (s + 1).saturating_sub(BURN_RESCAN_BLOCKS).max(from_block));
     if from <= head {
-        let seen = scan_burns(base, &bridge.address, from, head)?;
+        let mut seen: Vec<BurnSeen> = Vec::new();
+        let mut read = false;
+        for b in bases {
+            match scan_burns(*b, &bridge.address, from, head) {
+                Ok(burns) => {
+                    read = true;
+                    for x in burns {
+                        if !seen.iter().any(|y| y.burn.n == x.burn.n) {
+                            seen.push(x);
+                        }
+                    }
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if !read {
+            return Err(last.expect("one base at least"));
+        }
         let mut s = lock(state);
         for b in seen {
             if s.burns.insert(b.burn.n, b).is_none() {
@@ -952,12 +1001,21 @@ pub fn capture_tick(
             report.deferred.push(block);
             continue;
         }
-        match crate::base_capture::capture_at(base, &plan.address, &plan.slots, block) {
-            Ok(capture) => {
-                crate::base_capture::store(dir, &capture)?;
-                report.capture.captured.push(block);
+        let mut why = Vec::new();
+        let mut done = false;
+        for b in bases {
+            match crate::base_capture::capture_at(*b, &plan.address, &plan.slots, block) {
+                Ok(capture) => {
+                    crate::base_capture::store(dir, &capture)?;
+                    report.capture.captured.push(block);
+                    done = true;
+                    break;
+                }
+                Err(error) => why.push(format!("{error:#}")),
             }
-            Err(error) => report.capture.refused.push((block, format!("{error:#}"))),
+        }
+        if !done {
+            report.capture.refused.push((block, why.join(" ; ")));
         }
     }
     report.capture.pruned = crate::base_capture::prune(dir, now)?;
@@ -972,9 +1030,13 @@ pub fn capture_tick(
 pub fn with_captures<T>(
     every: Duration,
     mut tick: impl FnMut() + Send,
-    passes: impl FnOnce(&dyn Fn() -> bool) -> T,
+    passes: impl FnOnce(&dyn Fn() -> bool, &dyn Fn() -> Option<Duration>) -> T,
 ) -> T {
     use std::sync::atomic::{AtomicBool, Ordering};
+    // E-2 (external audit of the robots): when the tick under way started (None between two ticks): a tick that hangs
+    // is not a tick that ended, and the passes say it
+    let running: Mutex<Option<Instant>> = Mutex::new(None);
+    let running = &running;
     /// Stops the captures however `passes` ends (a panic too: the scope would wait for them for ever).
     struct Stop<'a>(&'a AtomicBool);
     impl Drop for Stop<'_> {
@@ -988,7 +1050,10 @@ pub fn with_captures<T>(
         let captures = s.spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let started = Instant::now();
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut tick)).is_err() {
+                *running.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
+                let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut tick));
+                *running.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                if ticked.is_err() {
                     return;
                 }
                 while !stop.load(Ordering::SeqCst) && started.elapsed() < every {
@@ -998,7 +1063,8 @@ pub fn with_captures<T>(
         });
         let _stop = Stop(stop);
         let alive = || !captures.is_finished();
-        passes(&alive)
+        let busy = || running.lock().unwrap_or_else(|p| p.into_inner()).map(|t| t.elapsed());
+        passes(&alive, &busy)
     })
 }
 
@@ -1007,21 +1073,34 @@ pub fn with_captures<T>(
 /// took and what it did (`pass`'s summary), or why it failed (`on_error`
 /// then keeps what was done; the next pass tries again). Stops when the
 /// captures no longer run.
+#[allow(clippy::too_many_arguments)]
 pub fn run_passes(
     say: &dyn Fn(&str),
     pass: &mut dyn FnMut(u64) -> anyhow::Result<String>,
     once: bool,
     interval: Duration,
     captures_alive: &dyn Fn() -> bool,
+    captures_busy: &dyn Fn() -> Option<Duration>,
     mut on_error: impl FnMut(),
 ) -> anyhow::Result<()> {
+    let (mut failing, mut stalled) = (0u32, false);
     for number in 1u64.. {
         if !captures_alive() {
             bail!("the captures stopped (a tick panicked): fast-run stops, start it again");
         }
+        // E-2: a capture tick that hangs is said (once per stall)
+        if let Some(line) = stall_alert(captures_busy(), Duration::from_secs(CAPTURE_STALL_SECS), &mut stalled) {
+            say(&line);
+        }
         let started = Instant::now();
         say(&format!("pass {number} begins"));
-        match pass(number) {
+        let result = pass(number);
+        failing = if result.is_ok() { 0 } else { failing.saturating_add(1) };
+        // M-10: passes failing in a row, said once per streak
+        if failing == FAILED_PASSES_ALERT {
+            say(&format!("ALERT FAST_RUN_FAILING: {failing} passes in a row failed (the last: {:#})", result.as_ref().err().expect("failed")));
+        }
+        match result {
             Ok(summary) => say(&format!("pass {number} done in {:.1} s: {summary}", started.elapsed().as_secs_f64())),
             // D171, D176: its node's activations are not this build's: no pass is made with it
             Err(e) if e.is::<crate::activations::Refusal>() => {
@@ -1046,6 +1125,178 @@ pub fn run_passes(
 }
 
 // ---------------------------------------------------------------------------
+// External audit of the robots (FIXEXT): M-10 alerts, E-2 stalled captures, M-7 rechecks
+// ---------------------------------------------------------------------------
+
+/// E-2: seconds a capture tick may run before it is said stalled (a tick is a few calls; ten minutes is a hang).
+pub const CAPTURE_STALL_SECS: u64 = 600;
+
+/// M-10: passes failing in a row before it is alerted.
+pub const FAILED_PASSES_ALERT: u32 = 3;
+
+/// M-10: the same alert line goes to the alert command once in this many seconds at most.
+pub const ALERT_REPEAT_SECS: u64 = 3_600;
+
+/// M-10: each run of the alert command is killed with its process group past this.
+pub const ALERT_COMMAND_TIMEOUT_SECS: u64 = 120;
+
+/// E-2: the alert of a capture tick that has run `busy` (None: no tick under way) past `limit`, once per stall
+/// (`alerted`, cleared once the tick ends).
+pub fn stall_alert(busy: Option<Duration>, limit: Duration, alerted: &mut bool) -> Option<String> {
+    match busy {
+        Some(b) if b > limit => {
+            if *alerted {
+                return None;
+            }
+            *alerted = true;
+            Some(format!(
+                "ALERT FAST CAPTURES_STALLED: the capture tick has run for {} s (more than {} s: an RPC that hangs?): no burn is read and no Base block captured meanwhile",
+                b.as_secs(),
+                limit.as_secs()
+            ))
+        }
+        Some(_) => None,
+        None => {
+            *alerted = false;
+            None
+        }
+    }
+}
+
+/// M-10 (external audit of the robots): the event of a line of fast-run that needs a person — the alert command's
+/// `{event}` — or `None` (the log only).
+pub fn alert_event(line: &str) -> Option<&'static str> {
+    let line = line.trim_start();
+    if !line.starts_with("ALERT ") {
+        return None;
+    }
+    if line.starts_with("ALERT FAST CONTRADICTION") {
+        Some("FAST_CONTRADICTION")
+    } else if line.starts_with("ALERT FAST_RECORD") {
+        Some("FAST_RECORD")
+    } else if line.contains("GAVE_UP") {
+        Some("GAVE_UP")
+    } else if line.starts_with("ALERT FAST_RUN_FAILING") {
+        Some("FAST_RUN_FAILING")
+    } else if line.starts_with("ALERT FAST_RUN pass") && line.contains("fast-run stops") {
+        Some("FAST_RUN_STOPPED")
+    } else if line.starts_with("ALERT FAST CAPTURES_STALLED") {
+        Some("CAPTURES_STALLED")
+    } else if line.starts_with("ALERT FAST BURN_GAP") {
+        Some("BURN_GAP")
+    } else if line.contains("HALT") {
+        Some("HALT")
+    } else {
+        None
+    }
+}
+
+/// M-10: how the alert command's argv is run (the real one: a thread of its own, `watch::run_command`, bounded).
+pub type AlertRunner = Box<dyn Fn(Vec<String>) + Send + Sync>;
+
+/// M-10: the operator's alert command (argv, never a shell; `{event}` and `{detail}` replaced), run for each line
+/// [`alert_event`] names, each line once in [`ALERT_REPEAT_SECS`] at most.
+pub struct Alerter {
+    pub argv: Vec<String>,
+    run: AlertRunner,
+    sent: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Alerter {
+    pub fn new(argv: Vec<String>, run: AlertRunner) -> Self {
+        Self { argv, run, sent: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// The real runner: the command in a thread of its own (neither the passes nor the captures wait for it), killed
+    /// with its process group past [`ALERT_COMMAND_TIMEOUT_SECS`]; a failure said on standard error.
+    pub fn spawning() -> AlertRunner {
+        Box::new(|argv: Vec<String>| {
+            std::thread::spawn(move || match crate::watch::run_command(&argv, Duration::from_secs(ALERT_COMMAND_TIMEOUT_SECS)) {
+                Ok(st) if st.success() => {}
+                Ok(st) => eprintln!("{} jg-relay fast-run ALERT ALERT_COMMAND_FAILED: {st}", crate::now_unix()),
+                Err(e) => eprintln!("{} jg-relay fast-run ALERT ALERT_COMMAND_FAILED: {e:#}", crate::now_unix()),
+            });
+        })
+    }
+
+    /// `line` said at `now`: the alert command run when it needs a person and was not run for it in the last hour.
+    pub fn on_line(&self, line: &str, now: u64) {
+        let Some(event) = alert_event(line) else { return };
+        {
+            let mut sent = self.sent.lock().unwrap_or_else(|p| p.into_inner());
+            sent.retain(|_, at| now < at.saturating_add(ALERT_REPEAT_SECS));
+            if sent.contains_key(line) {
+                return;
+            }
+            sent.insert(line.to_string(), now);
+        }
+        (self.run)(crate::watch::substitute(&self.argv, &[("{event}", event), ("{detail}", line)]));
+    }
+}
+
+/// M-10: the alert command of the command line: `--alert-command <program>` and its arguments `--alert-arg <a>` (each
+/// in turn; `{event} {detail}` when none); `None` without one. Required on the mainnet's build (a contradiction or a
+/// fast record not ours must reach a person, not a log).
+pub fn alerter_of(args: &[String], network: &[u8; 32], run: AlertRunner) -> anyhow::Result<Option<Alerter>> {
+    let Some(program) = flag(args, "--alert-command") else {
+        if *network == crate::MAINNET_NETWORK {
+            bail!("fast-run on the mainnet needs --alert-command <program> [--alert-arg <a>]… (M-10: a contradiction must reach a person)");
+        }
+        return Ok(None);
+    };
+    anyhow::ensure!(!program.trim().is_empty(), "--alert-command is empty");
+    let mut argv = vec![program];
+    let extra = flags(args, "--alert-arg");
+    if extra.is_empty() {
+        argv.extend(["{event}".to_string(), "{detail}".to_string()]);
+    } else {
+        argv.extend(extra);
+    }
+    Ok(Some(Alerter::new(argv, run)))
+}
+
+/// M-7 (external audit of the robots): an RPC silent at the start (its chain not read) is used only once it said
+/// `want`: `answer` (its `eth_chainId`) asked again at each use until then; an error while it does not (another
+/// chain, or still silent: not used).
+pub fn recheck_chain(checked: &mut bool, answer: impl FnOnce() -> anyhow::Result<u64>, want: u64) -> anyhow::Result<()> {
+    if *checked {
+        return Ok(());
+    }
+    match base_chain(answer(), want)? {
+        true => {
+            *checked = true;
+            Ok(())
+        }
+        false => bail!("its chain still not read (eth_chainId): not used before it says {want}"),
+    }
+}
+
+/// M-7: the host of an RPC URL, lower case, its port kept for the loopback only (the operator's local routers, one
+/// per provider, differ by their port).
+fn source_host(url: &str) -> String {
+    let rest = url.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a).to_ascii_lowercase();
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, after)) => (h.to_string(), after.strip_prefix(':').unwrap_or("").to_string()),
+            None => (v6.to_string(), String::new()),
+        },
+        None => match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (authority.clone(), String::new()),
+        },
+    };
+    let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        format!("{host}:{port}")
+    } else {
+        host
+    }
+}
+
+// ---------------------------------------------------------------------------
 // jg-relay fast-run
 // ---------------------------------------------------------------------------
 
@@ -1058,10 +1309,19 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             "fast-run (--key <relay secret> | --no-fast) --l1 <url> --base <url> --base <url> [--base <url>…] --beacon <url> \
              --node <url> --node-cookie <rpc.cookie> --state-dir <dir> --from-block <Base block of the bridge's deployment> \
              [--slow-release off|dry-run|send, dry-run] [--interval <s>, 60] [--once] [--gloas-epoch <e>] \
-             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050]"
+             [--egress onion|clearnet, onion] [--tor-socks <ip:port>, 127.0.0.1:9050] \
+             [--alert-command <program> [--alert-arg <a>]…, required on the mainnet]"
         )
     };
-    let say = |line: &str| println!("{} jg-relay fast-run {line}", crate::now_unix());
+    // M-10 (external audit of the robots): the lines that need a person go to the operator's alert command too
+    let alerter = alerter_of(args, &jetsam_chain::consensus::guardian::network_id(), Alerter::spawning())
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
+    let say = |line: &str| {
+        println!("{} jg-relay fast-run {line}", crate::now_unix());
+        if let Some(a) = &alerter {
+            a.on_line(line, crate::now_unix());
+        }
+    };
     // AN-1 (audit n°2): every source through `jg-relay`'s egress (the loopback directly, the rest through Tor), checked
     // before anything else: a public address in clear and fast-run does not start
     let egress = crate::config::robot_egress(args, robot_sources(args, &["--l1", "--base", "--beacon", "--node"]))
@@ -1091,7 +1351,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let l1 = crate::l1::L1::via(&flag(args, "--l1").ok_or_else(usage)?, egress);
     let base_urls = flags(args, "--base");
     let bases: Vec<crate::l1::L1> = base_urls.iter().map(|u| crate::l1::L1::via(u, egress)).collect();
-    let base = bases.first().ok_or_else(usage)?;
+    anyhow::ensure!(!bases.is_empty(), "{}", usage());
 
     let beacon = crate::light_feed::HttpBeacon {
         url: flag(args, "--beacon").ok_or_else(usage)?,
@@ -1112,15 +1372,22 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let base_chain_id = rules.base_return.fast.base_chain_id;
     let silent = check_base_rpcs(&base_urls, &|u| chain_of(&bases[base_urls.iter().position(|x| x == u).expect("listed")]), base_chain_id)
         .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
-    let mut base_checked: Vec<bool> = base_urls.iter().map(|u| !silent.contains(u)).collect();
+    // F-2: shared with the captures' thread (a Base RPC is used there too only once it said its chain)
+    let base_checked: Vec<std::sync::atomic::AtomicBool> = base_urls.iter().map(|u| (!silent.contains(u)).into()).collect();
+    let checked_now = |i: usize| base_checked[i].load(std::sync::atomic::Ordering::SeqCst);
     for u in &silent {
         say(&format!("ALERT FAST BASE_RPC {u}: its chain not read at the start (eth_chainId): no root read from it before it says {base_chain_id}"));
     }
-    match base_chain(chain_of(&l1), rules.base_return.fast.l1_chain_id) {
-        Ok(true) => {}
-        Ok(false) => say("ALERT FAST the L1 RPC did not say its chain at the start (eth_chainId)"),
+    let l1_chain_id = rules.base_return.fast.l1_chain_id;
+    // M-7: an L1 RPC silent at the start is asked again before each pass, never used before it said its chain
+    let mut l1_checked = match base_chain(chain_of(&l1), l1_chain_id) {
+        Ok(true) => true,
+        Ok(false) => {
+            say("ALERT FAST the L1 RPC did not say its chain at the start (eth_chainId): not used before it does");
+            false
+        }
         Err(e) => bail!("the L1 RPC: {e:#}: fast-run does not start"),
-    }
+    };
     if let Some(secret) = &secret {
         if Some(secret.sk_to_pk().compress()) != rules.base_return.fast.release_key {
             bail!("the key given is not this build's FAST_RELEASE_KEY");
@@ -1179,9 +1446,20 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     // Burns and captures (their own thread): what a refused block was told, once per minute at most.
     let mut refusals: BTreeMap<u64, u64> = BTreeMap::new();
     let mut failed_ticks = 0u64;
+    let mut rotation = 0usize;
     let tick = || {
+        // F-2: every Base RPC that said its chain, the first one rotating from tick to tick (one that hangs or lies on
+        // its head is not the first for ever); the burns from all of them
+        let ready: Vec<&dyn BaseRpc> = (0..bases.len()).map(|k| (k + rotation) % bases.len()).filter(|i| checked_now(*i)).map(|i| &bases[i] as &dyn BaseRpc).collect();
+        rotation = rotation.wrapping_add(1);
+        if ready.is_empty() {
+            if rotation % 6 == 1 {
+                say("ALERT FAST CAPTURE tick: no Base RPC has said its chain yet (eth_chainId): nothing read");
+            }
+            return;
+        }
         let ticked = capture_tick(
-            base,
+            &ready,
             &bridge,
             from_block,
             crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
@@ -1229,6 +1507,8 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         }
     };
     let mut pass = |_number: u64| -> anyhow::Result<String> {
+        // M-7: the L1 RPC is used only once it said its chain
+        recheck_chain(&mut l1_checked, || chain_of(&l1), l1_chain_id).map_err(|e| anyhow!("the L1 RPC {}: {e:#}", l1.url))?;
         // 1. The finalized L1 block (a finality update) and the newest game.
         let finality = crate::light_feed::fetch_finality(&beacon, &l1, gloas)?;
         let update = jetsam_chain::consensus::destination::ssz::LightClientFinalityUpdate::decode_payload(&finality)
@@ -1269,11 +1549,11 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                     continue;
                 }
                 let mut views = Vec::new();
-                for (b, checked) in bases.iter().zip(base_checked.iter_mut()) {
+                for (b, checked) in bases.iter().zip(base_checked.iter()) {
                     // FR-7: a Base RPC silent at the start serves no root before it said its chain
-                    if !*checked {
+                    if !checked.load(std::sync::atomic::Ordering::SeqCst) {
                         match base_chain(chain_of(b), base_chain_id) {
-                            Ok(true) => *checked = true,
+                            Ok(true) => checked.store(true, std::sync::atomic::Ordering::SeqCst),
                             Ok(false) => {
                                 say(&format!("ALERT FAST BASE_RPC {}: its chain still not read: not used", b.url));
                                 continue;
@@ -1408,6 +1688,14 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 }
             }
             watch_records(&mut s, &records);
+            // M-8: a burn the branch paid in an earlier pass with no fast record of it (the slow lane's) is final: its
+            // slot no longer captured
+            let recorded: BTreeSet<u64> = records.iter().map(|p| p.n).collect();
+            for (n, e) in &slow_journal.entries {
+                if matches!(e.status, crate::slow_release::SlowStatus::Paid { .. }) && !recorded.contains(n) && !s.sent.contains_key(n) && !s.watched.contains(n) {
+                    s.final_slow.insert(*n);
+                }
+            }
             s.store(&state_file)?;
             records.iter().filter(|p| !p.contradicted && !s.settled.contains(&p.n)).copied().collect()
         };
@@ -1415,7 +1703,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         let named: Vec<(&str, &dyn BaseRpc)> = bases
             .iter()
             .zip(&base_checked)
-            .filter(|(_, checked)| **checked)
+            .filter(|(_, checked)| checked.load(std::sync::atomic::Ordering::SeqCst))
             .map(|(b, _)| (b.url.as_str(), b as &dyn BaseRpc))
             .collect();
         for line in base_word_alerts(&named, &bridge, &unsettled) {
@@ -1586,9 +1874,9 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
         // One tick of the captures, then one pass, in this thread.
         let mut tick = tick;
         tick();
-        return run_passes(&say, &mut pass, true, every, &|| true, on_error);
+        return run_passes(&say, &mut pass, true, every, &|| true, &|| None, on_error);
     }
-    with_captures(Duration::from_secs(CAPTURE_TICK_SECONDS), tick, |captures_alive| {
-        run_passes(&say, &mut pass, false, every, captures_alive, on_error)
+    with_captures(Duration::from_secs(CAPTURE_TICK_SECONDS), tick, |captures_alive, captures_busy| {
+        run_passes(&say, &mut pass, false, every, captures_alive, captures_busy, on_error)
     })
 }

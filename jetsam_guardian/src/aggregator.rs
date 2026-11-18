@@ -127,6 +127,26 @@ pub fn archive(dir: &Path, entry: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// M-11 (external audit of the robots): the signer of `jg-aggregate`'s L1 transactions (`initGenesis`, `finalizeFast`,
+/// `proveEquivocation`), as the robots' ([`crate::l1tx::SignerConfig::open`]): off the private rehearsal its own hot
+/// key (`[signer] key_file`, 0600), never an account the L1 endpoint holds unlocked (anyone who reaches that endpoint
+/// would spend it); on the rehearsal, as before, the endpoint's account `l1_from` when no key is given. `domain`
+/// (`network`, `l1_chain_id`, `l1_bridge`) is required: without it the program cannot tell the rehearsal, and does not
+/// start. `l1_from`, when given with a local key, must be the key's address. The write-ahead under `state_dir`.
+pub fn open_l1_signer(
+    domain: Option<&crate::Domain>,
+    l1_from: Option<&str>,
+    signer: &crate::l1tx::SignerConfig,
+    state_dir: &Path,
+) -> anyhow::Result<crate::l1tx::L1Tx> {
+    let domain = domain.ok_or_else(|| {
+        anyhow::anyhow!("the L1 actions need the domain (network, l1_chain_id and l1_bridge): without it the private rehearsal cannot be told, and no unlocked account is used")
+    })?;
+    let profile = crate::Profile::of(domain);
+    let address = l1_from.map(crate::fill::parse20).transpose()?;
+    signer.open(profile, domain.l1_chain_id, address, state_dir)
+}
+
 #[cfg(test)]
 #[path = "aggregator_tests.rs"]
 mod tests;

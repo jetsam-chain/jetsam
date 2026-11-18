@@ -195,12 +195,20 @@ impl Signer {
 
     /// A verdict of `jg-observe`.
     pub fn put_observer_verdict(&mut self, v: Verdict) {
-        self.verdicts_o.insert(v.statement_hash, v);
+        Self::keep(&mut self.verdicts_o, v, self.cfg.verdict_max_age);
     }
 
     /// A verdict of `jg-net`.
     pub fn put_witness_verdict(&mut self, v: Verdict) {
-        self.verdicts_w.insert(v.statement_hash, v);
+        Self::keep(&mut self.verdicts_w, v, self.cfg.verdict_max_age);
+    }
+
+    /// F-8 (external audit of the robots): `v` kept, and every verdict too old to be used against it dropped (older than
+    /// `max_age` before it): the verdicts, their headers with them, never grow in the signer's locked memory.
+    fn keep(verdicts: &mut HashMap<[u8; 32], Verdict>, v: Verdict, max_age: u64) {
+        let newest = v.at_unix;
+        verdicts.retain(|_, old| old.at_unix.saturating_add(max_age) >= newest);
+        verdicts.insert(v.statement_hash, v);
     }
 
     /// `(T_max, id(T_max))`.

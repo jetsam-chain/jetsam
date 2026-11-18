@@ -31,6 +31,7 @@ use jetsam_guardian::checkpoint::Checkpoint;
 use jetsam_guardian::config::{checked_egress, hex48, EgressConfig};
 use jetsam_guardian::feed::{utc_day, verify_line};
 use jetsam_guardian::l1::{self, L1};
+use jetsam_guardian::l1tx::{L1Tx, Recovered, SignerConfig};
 use jetsam_guardian::rpc::{call_via, call_via_bearer, Egress};
 use jetsam_guardian::{now_unix, GuardianStatement};
 use jetsam_chain::consensus::guardian::GuardianEquivocation;
@@ -87,6 +88,10 @@ struct AggConfig {
     /// configuration says otherwise, as for `jg-net`.
     #[serde(default)]
     egress: EgressConfig,
+    /// M-11 (external audit of the robots): how its L1 transactions are signed (`[signer]`, as the robots'): its own
+    /// hot key off the private rehearsal (`key_file`, 0600); the endpoint's unlocked `l1_from` on the rehearsal only.
+    #[serde(default)]
+    signer: SignerConfig,
 }
 
 fn yes() -> bool {
@@ -107,6 +112,8 @@ struct Agg {
     seen_lines: HashSet<[u8; 32]>,
     /// How `l1_rpc` and `robot_rpc` are reached (checked at start).
     egress: Egress,
+    /// M-11: the signer of its L1 transactions (none when it sends none).
+    tx: Option<L1Tx>,
 }
 
 impl Agg {
@@ -214,7 +221,7 @@ impl Agg {
         if !self.cfg.submit_l1 {
             return;
         }
-        let (Some(url), Some(from), Some(bridge)) = (&self.cfg.l1_rpc, &self.cfg.l1_from, &self.cfg.l1_bridge) else { return };
+        let (Some(url), Some(bridge), Some(tx)) = (&self.cfg.l1_rpc, &self.cfg.l1_bridge, &self.tx) else { return };
         let l1 = L1::via(url, self.egress);
         let mut keep = Vec::new();
         // only the newest co-signature needs a finalization: its roots cover the older ones
@@ -239,7 +246,7 @@ impl Agg {
             } else {
                 ("finalizeFast", l1::finalize_fast(&cp, na, &sig256))
             };
-            match l1.send(from, bridge, &data) {
+            match tx.send(&l1, bridge, &data, fname) {
                 Ok(r) => {
                     log(&format!("{fname} h={} status {} gas {} L1 block {} ts {}", gs.height, r.status, r.gas_used, r.block_number, r.block_timestamp));
                     self.event(json!({"t": now_unix(), "event": fname, "status": r.status, "gas": r.gas_used, "l1_ts": r.block_timestamp,
@@ -358,8 +365,8 @@ impl Agg {
                     self.event(json!({"t": now_unix(), "event": "equivocation_jetsam", "result": format!("{r:?}")}));
                     log(&format!("equivocation to Jetsam: {r:?}"));
                 }
-                if let (Some(url), Some(from), Some(bridge)) = (&self.cfg.l1_rpc, &self.cfg.l1_from, &self.cfg.l1_bridge) {
-                    let r = L1::via(url, self.egress).send(from, bridge, &l1::prove_equivocation(&body, &hints));
+                if let (Some(url), Some(bridge), Some(tx)) = (&self.cfg.l1_rpc, &self.cfg.l1_bridge, &self.tx) {
+                    let r = tx.send(&L1::via(url, self.egress), bridge, &l1::prove_equivocation(&body, &hints), "proveEquivocation");
                     match r {
                         Ok(rc) => {
                             log(&format!("proveEquivocation status {} gas {}", rc.status, rc.gas_used));
@@ -393,15 +400,19 @@ fn domain_of(v: &Value) -> Option<jetsam_guardian::Domain> {
 /// The egress of `l1_rpc` and `robot_rpc`, both checked (D66); the domain,
 /// when the configuration gives all three of its words, decides whether
 /// `clearnet` may be used.
-fn egress_of(cfg: &AggConfig) -> anyhow::Result<Egress> {
-    let domain = match (&cfg.network, cfg.l1_chain_id, &cfg.l1_bridge) {
+fn domain_of_config(cfg: &AggConfig) -> anyhow::Result<Option<jetsam_guardian::Domain>> {
+    Ok(match (&cfg.network, cfg.l1_chain_id, &cfg.l1_bridge) {
         (Some(network), Some(l1_chain_id), Some(bridge)) => Some(jetsam_guardian::Domain {
             network: jetsam_guardian::parse32(network)?,
             l1_chain_id,
             l1_bridge: dec::<20>(bridge).ok_or_else(|| anyhow::anyhow!("l1_bridge: 20 bytes of hex"))?,
         }),
         _ => None,
-    };
+    })
+}
+
+fn egress_of(cfg: &AggConfig) -> anyhow::Result<Egress> {
+    let domain = domain_of_config(cfg)?;
     let l1 = cfg.l1_rpc.iter().map(|url| ("l1_rpc".to_string(), url.as_str()));
     let robot = cfg.robot_rpc.iter().map(|url| ("robot_rpc".to_string(), url.as_str()));
     checked_egress(&cfg.egress, domain.as_ref(), l1.chain(robot))
@@ -417,6 +428,35 @@ fn run() -> anyhow::Result<()> {
     let cfg: AggConfig = toml::from_str(&std::fs::read_to_string(&config)?)?;
     let egress = egress_of(&cfg).map_err(|e| anyhow::anyhow!("{e:#}: jg-aggregate does not start"))?;
     log(&format!("egress {egress:?}"));
+    // M-11 (external audit of the robots): its L1 transactions signed by its own key off the private rehearsal, never by
+    // an unlocked account of the endpoint; the key held hardened as the robots' (E-2, A5-15)
+    std::fs::create_dir_all(&cfg.archive_dir)?;
+    let tx = match (&cfg.l1_rpc, &cfg.l1_bridge) {
+        (Some(url), Some(_)) if cfg.submit_l1 || cfg.watch_equivocations => {
+            let domain = domain_of_config(&cfg)?;
+            let tx = jetsam_guardian::aggregator::open_l1_signer(domain.as_ref(), cfg.l1_from.as_deref(), &cfg.signer, &cfg.archive_dir)
+                .map_err(|e| anyhow::anyhow!("{e:#}: jg-aggregate does not start"))?;
+            if let L1Tx::Local(_) = &tx {
+                let h = jetsam_guardian::harden::harden();
+                anyhow::ensure!(h.dumpable_off && h.core_off, "the process cannot be hardened: jg-aggregate does not start");
+                let allow = args.iter().any(|a| a == jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY);
+                if let Some(alert) = jetsam_guardian::harden::memory_gate(&h, true, allow).map_err(|e| anyhow::anyhow!("{e:#}: jg-aggregate does not start"))? {
+                    log(&alert);
+                }
+                let l1 = L1::via(url, egress);
+                let want = domain.map_or(0, |d| d.l1_chain_id);
+                let id = l1::hex_u64(&l1.rpc("eth_chainId", json!([]))?)?;
+                anyhow::ensure!(id == want, "the L1 endpoint is chain {id}, not {want}: jg-aggregate does not start");
+                match tx.recover(&l1)? {
+                    Recovered::Nothing => {}
+                    other => log(&format!("the transaction in flight at the stop: {other:?}")),
+                }
+            }
+            log(&format!("L1 signer 0x{} ({})", hex::encode(tx.address()), if matches!(tx, L1Tx::Local(_)) { "local key" } else { "endpoint, TEST" }));
+            Some(tx)
+        }
+        _ => None,
+    };
     let group_key = hex48(&cfg.group_key)?;
     let commitments = cfg.commitments.iter().map(|c| hex48(c)).collect::<anyhow::Result<Vec<_>>>()?;
     let keys = cfg
@@ -437,6 +477,7 @@ fn run() -> anyhow::Result<()> {
         last_refusal: HashMap::new(),
         seen_lines: HashSet::new(),
         egress,
+        tx,
     };
     // the archive is the memory of a restarted aggregator: nothing is combined or archived twice
     if let Ok(text) = std::fs::read_to_string(a.cfg.archive_dir.join("signatures.jsonl")) {

@@ -725,7 +725,9 @@ fn jg_aggregate_reaches_its_l1_and_robot_through_the_socks_port_only() {
     std::fs::write(cookie.path(), "robot-cookie\n").unwrap();
     let (_root, dir) = aggregator(
         &format!(
-            "l1_rpc = \"http://{c}:8545\"\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://{r}:19751\"\nrobot_cookie = \"{}\"",
+            // M-11: the L1 actions need the domain (here the private rehearsal's L1: the endpoint's account, as before)
+            "l1_rpc = \"http://{c}:8545\"\nnetwork = \"{}\"\nl1_chain_id = 31337\nl1_bridge = \"0x{}\"\nrobot_rpc = \"http://{r}:19751\"\nrobot_cookie = \"{}\"",
+            "ab".repeat(32),
             hex::encode(BRIDGE),
             cookie.path().display()
         ),
