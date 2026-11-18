@@ -714,15 +714,17 @@ const _: () = assert!(
 ///
 /// **`None` on the public network and the private rehearsal** (their first
 /// bridge is still to deploy). On the test chain: a height the operator
-/// chooses, every node and every robot redeployed before it (proposed
-/// 12 480 = 26 × 480: tip 10 869 on 14/11 ≈ 19:10 UTC, ≈ 480 blocks a day,
-/// ≈ 3.4 days ahead). **Easy to move: this constant only** (the new bridge's
-/// genesis window ends at it: `depositsFromHeight` of its deployment).
+/// chooses, every node and every robot redeployed before it (first proposed
+/// 12 480, passed on 18/11 without a switch; now 13 440 = 14 × 960: tip
+/// 12 623 on 18/11 ≈ 10:20 UTC, ≈ 3 min a block, ≈ 20/11 03:30 UTC).
+/// **Easy to move: this constant and the bridge it reads** (the new bridge's
+/// genesis window ends at it: `depositsFromHeight` of its deployment, a
+/// constructor argument, hence its address).
 #[cfg(not(feature = "testnet"))]
 pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;
 /// The test chain's (proposed; the operator fixes it at deployment).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = Some(12_480);
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = Some(13_440);
 /// The private rehearsal's: dormant.
 #[cfg(feature = "rehearsal-v1-7")]
 pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;

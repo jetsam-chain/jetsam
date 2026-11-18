@@ -2241,7 +2241,7 @@ fn bridge2_the_profiles_bridge_table() {
                 .collect()
         };
         let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed");
-        assert_eq!(h2, 12_480);
+        assert_eq!(h2, 13_440);
         assert_eq!(BASE_RETURN_BRIDGE_ROTATIONS.len(), 1);
         let second = BASE_RETURN_BRIDGE_ROTATIONS[0];
         assert_eq!((second.height, second.first_burn), (h2, 1_000_000));
@@ -2262,8 +2262,8 @@ fn bridge2_the_profiles_bridge_table() {
         assert_eq!(consensus.effective_at(h2 - 1).bridge, BASE_RETURN_BRIDGE);
         assert_eq!(consensus.effective_at(h2).bridge, Some(BASE_RETURN_BRIDGE2));
         assert_eq!(consensus.effective_at(h2).first_burn(), 1_000_000);
-        // Above the switch decided on 14/11 (tip 10 869) by three days at least.
-        assert!(h2 >= 10_869 + 3 * 480);
+        // Above the tip of the re-target (18/11, 12 623) by a day at least.
+        assert!(h2 >= 12_623 + 480);
         // The test chain's first bridge gave n = 1, 2, 3 (nextBurnIndex 4).
         assert!(second.first_burn > 3);
     }
@@ -2275,13 +2275,13 @@ fn bridge2_the_profiles_bridge_table() {
 }
 
 /// The pins of the test chain's second bridge, as the switch reads them: its
-/// address and code hash (CREATE2 of `v3-mn5-bridge2` 6a105fd, profile
+/// address and code hash (CREATE2 of `v3-mn5-bridge2b`, profile
 /// `testnet-bridge2`, the deployment replayed on a fork of Base Sepolia), and
-/// its genesis id **of the rehearsal** (G = 10 880), to be replaced at the
+/// its genesis id **of the rehearsal** (G = J = 12 640), to be replaced at the
 /// switch by the real `genesisId()`.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_ADDRESS_HEX: &str = "2b98166347b18c95d60153faa839c2b3f36e30c1";
+const BRIDGE2_ADDRESS_HEX: &str = "7ba0229a5a04cfa5a827be3c749eaf442c1764d4";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_CODE_HASH_HEX: &str = "b7f75cac9f141a9818c10f263ba41dd78ce2d1db8c3a61748d42cc952b9fd14d";
+const BRIDGE2_CODE_HASH_HEX: &str = "baad551d9d3b7e2bd7dbde6f0748c13f2b6968dabeab0144c4088e1325c69c75";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_GENESIS_ID_HEX: &str = "ab09cc9c284548d43335007e9399029e8631dceb5e84c15c665ad66486d7d40f";
+const BRIDGE2_GENESIS_ID_HEX: &str = "248dbae0d0fd1707f1bf066ffd7d197916de58b73536c6f72f344ae65e4f33a7";

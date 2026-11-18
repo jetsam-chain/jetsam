@@ -210,7 +210,7 @@ fn each_network_has_its_own_init_code_vector() {
 
 /// The `testnet-bridge2` profile's vector (`init_code_vector.sh testnet-bridge2`, information only like the others:
 /// test keys, an assumed verifier): its Config, read from its own init code, is the second bridge's — the test
-/// chain's genesis, J 10 880, F 12 480 (the genesis window, ending at the nodes' switch height), its burns from
+/// chain's genesis, J 12 640, F 13 440 (the genesis window, ending at the nodes' switch height), its burns from
 /// 1 000 000 (above the n = 1, 2, 3 of TN1's bridge) — and its constants say so; checked whatever the profile.
 #[test]
 fn bridge2_the_second_test_bridges_vector_is_its_profiles() {
@@ -221,12 +221,12 @@ fn bridge2_the_second_test_bridges_vector_is_its_profiles() {
     assert_eq!(bytes(&bridge["salt"]), keccak256(b"jetsam-bridge/v3"));
     assert_eq!(create2(&bytes(&v["factory"]), &bytes(&bridge["salt"]), &init), bytes(&bridge["address"]));
     let config = &init[init.len() - 9 * 32..];
-    assert_eq!((as_u64(word(config, 3)), as_u64(word(config, 4)), as_u64(word(config, 8))), (10_880, 12_480, 1_000_000));
+    assert_eq!((as_u64(word(config, 3)), as_u64(word(config, 4)), as_u64(word(config, 8))), (12_640, 13_440, 1_000_000));
     assert_eq!(hex(word(config, 5)), PROFILES[1].network, "the test chain's genesis");
     assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
     let c = &v["constants"];
     assert_eq!(c["nextBurnIndex"].as_u64(), Some(1_000_000));
-    assert_eq!((c["genesisMinLockedHeight"].as_u64(), c["depositsFromHeight"].as_u64()), (Some(10_880), Some(12_480)));
+    assert_eq!((c["genesisMinLockedHeight"].as_u64(), c["depositsFromHeight"].as_u64()), (Some(12_640), Some(13_440)));
     // another bridge than the test chain's first
     let first: Value = serde_json::from_str(PROFILES[1].vector).unwrap();
     assert_ne!(first["bridge"]["address"], bridge["address"]);
@@ -260,7 +260,7 @@ fn bridge2_the_second_test_bridge_deployed_is_the_one_the_nodes_pin() {
     assert_eq!(hex(&as_address(word(config, 0))), "86bdffedb6b4d709da6a463dcebde4b8e5c2647e");
     assert_eq!(hex(&as_address(word(config, 1))), "bdcc740d18902103e1434d864a99dad3ca4db938");
     assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
-    assert_eq!(as_u64(word(config, 3)), 10_880, "the genesis window opens above the TN1 bridge's tip of the day");
+    assert_eq!(as_u64(word(config, 3)), 12_640, "the genesis window opens above the TN1 bridge's locked tip of the day");
     assert_eq!(Some(as_u64(word(config, 4))), V1_7_BRIDGE2_HEIGHT, "the genesis window ends at the switch height");
     assert_eq!(word(config, 5), &network_id()[..]);
     assert_eq!(hex(&as_address(word(config, 6))), "fd9aec19a49b71bd38ecf03e4774afb1b0888317", "TN1's genesis key");
