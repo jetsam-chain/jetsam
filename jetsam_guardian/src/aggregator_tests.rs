@@ -133,3 +133,41 @@ fn aggregator_restored_from_its_archive_does_not_sign_twice() {
     assert_eq!(again.add(&s, 1, 1, &partial_sign(&d.shares[0], &m), 10), Added::AlreadyComplete);
     assert_eq!(again.completed().count(), 1);
 }
+
+/// M-11 (external audit of the robots): `jg-aggregate`'s L1 transactions (`initGenesis`, `finalizeFast`,
+/// `proveEquivocation`) are signed by its own hot key off the private rehearsal, never by an account the L1 endpoint
+/// holds unlocked; with no domain configured it cannot tell, and does not start.
+#[test]
+fn aggregator_l1_signer_is_a_local_key_off_the_rehearsal() {
+    use crate::l1tx::{L1Tx, SignerConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let from = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    let rehearsal = crate::Domain { network: [0xab; 32], l1_chain_id: crate::REHEARSAL_L1_CHAIN_ID, l1_bridge: [1u8; 20] };
+    let mainnet = crate::Domain { network: crate::MAINNET_NETWORK, l1_chain_id: 8453, l1_bridge: [1u8; 20] };
+    let testnet = crate::Domain { network: crate::TESTNET_NETWORK, l1_chain_id: 84_532, l1_bridge: [1u8; 20] };
+    // the rehearsal as before: the endpoint's unlocked account named by l1_from
+    match open_l1_signer(Some(&rehearsal), Some(from), &SignerConfig::default(), dir.path()).unwrap() {
+        L1Tx::Endpoint { from: a } => assert_eq!(hex::encode(a), from[2..].to_ascii_lowercase()),
+        other => panic!("{other:?}"),
+    }
+    // no domain: refused (it cannot tell the rehearsal)
+    let e = open_l1_signer(None, Some(from), &SignerConfig::default(), dir.path()).unwrap_err().to_string();
+    assert!(e.contains("network") && e.contains("l1_chain_id"), "{e}");
+    for d in [&mainnet, &testnet] {
+        // no key: refused, the endpoint's account never used
+        let e = open_l1_signer(Some(d), Some(from), &SignerConfig::default(), dir.path()).unwrap_err().to_string();
+        assert!(e.contains("key_file"), "{e}");
+        let endpoint = SignerConfig { mode: Some("endpoint".into()), ..SignerConfig::default() };
+        let e = open_l1_signer(Some(d), Some(from), &endpoint, dir.path()).unwrap_err().to_string();
+        assert!(e.contains("refused"), "{e}");
+    }
+    // a local key (0600) on the public test network: its own sender
+    use std::os::unix::fs::PermissionsExt;
+    let key = dir.path().join("agg.key");
+    std::fs::write(&key, "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let local = SignerConfig { key_file: Some(key), priority_fee_wei: Some(1_000_000), ..SignerConfig::default() };
+    assert!(matches!(open_l1_signer(Some(&testnet), None, &local, dir.path()).unwrap(), L1Tx::Local(_)));
+    // l1_from, when given, must be the key's address
+    assert!(open_l1_signer(Some(&testnet), Some(from), &local, dir.path()).is_err());
+}

@@ -612,3 +612,22 @@ fn signer_halts_on_operator_or_net_halt_and_persists_it() {
     let again = reopen(dir.path(), 1);
     assert_eq!(again.halted(), Some("SECOND_INSTANCE"));
 }
+
+/// F-8 (external audit of the robots): the verdicts are kept no longer than they can be used (`verdict_max_age`): a
+/// signer fed for weeks does not grow in its locked memory.
+#[test]
+fn signer_forgets_the_verdicts_older_than_their_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = testkit::chain(40, 1);
+    let mut sg = signer(dir.path(), &chain, 1);
+    let max = cfg().verdict_max_age;
+    for i in 0..50u64 {
+        let v = |at: u64| Verdict { statement_hash: [i as u8; 32], ok: true, code: "OK".into(), at_unix: at, headers: vec![] };
+        sg.put_observer_verdict(v(NOW + i * (max + 1)));
+        sg.put_witness_verdict(v(NOW + i * (max + 1)));
+    }
+    assert!(sg.verdicts_o.len() <= 2 && sg.verdicts_w.len() <= 2, "{} / {}", sg.verdicts_o.len(), sg.verdicts_w.len());
+    // a fresh one is kept and used
+    let s = att(&chain, 16);
+    sign_ok(&mut sg, &chain, &s);
+}

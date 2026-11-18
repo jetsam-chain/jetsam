@@ -85,3 +85,53 @@ fn c2a_a_pulled_feed_keeps_the_lines_signed_by_its_guardian_only() {
     assert!(pull_feed(&egress, "http://10.1.2.3:80", 2, day, &keys, local.path(), Duration::from_secs(5)).is_err());
     assert!(!feed_path(local.path(), 4, day).exists());
 }
+
+/// F-10 (external audit of the robots): a slow client that knows the onion holds no other reader back (one thread per
+/// connection), and is cut off at a deadline over its whole request, however it trickles its bytes.
+#[test]
+fn f10_a_slow_client_never_holds_the_feed_back() {
+    let root = tempfile::tempdir().unwrap();
+    let day = "2026-11-11";
+    let path = feed_path(root.path(), 2, day);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "line one\n").unwrap();
+    let addr = serve("127.0.0.1:0", root.path().to_path_buf()).unwrap();
+    // two slow clients: connected, one byte, then silent
+    let mut slow: Vec<std::net::TcpStream> = (0..2)
+        .map(|_| {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.write_all(b"G").unwrap();
+            s
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let ok = get(addr, &format!("GET /feeds/g2/{day}.jsonl HTTP/1.1\r\n\r\n"));
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    assert!(started.elapsed() < Duration::from_secs(3), "the reader waited {:?} behind the slow clients", started.elapsed());
+    // a client trickling a byte every second is cut off at the request deadline, well before its 4 KiB
+    let s = &mut slow[0];
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let started = std::time::Instant::now();
+    let mut closed = false;
+    while started.elapsed() < Duration::from_secs(30) {
+        if s.write_all(b"E").is_err() {
+            closed = true;
+            break;
+        }
+        let mut b = [0u8; 64];
+        match s.read(&mut b) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed && started.elapsed() <= Duration::from_secs(REQUEST_DEADLINE_SECS + 3), "cut off after {:?}", started.elapsed());
+}

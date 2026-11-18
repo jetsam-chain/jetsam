@@ -401,7 +401,7 @@ fn jg_sign_sockets_answer_only_their_configured_uids() {
         let out = Command::new(env!("CARGO_BIN_EXE_jg-keys"))
             .args(["machine-init", "--state"])
             .arg(r.join(format!("g{i}")))
-            .args(["--generation", "1", "--passphrase-fd", "0", "--test-kdf"])
+            .args(["--generation", "1", "--passphrase-fd", "0", "--test-kdf", "--private-rehearsal"])
             .stdin(std::fs::File::open(&pass).unwrap())
             .output()
             .unwrap();
