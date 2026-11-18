@@ -305,7 +305,7 @@ fn socks_reply(code: u8) -> &'static str {
 
 /// SOCKS5 (RFC 1928) on `s`: no authentication, `CONNECT host:port` with the
 /// host as a domain name (address type 3), the reply consumed whole.
-fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+fn socks5_connect(s: &mut Bounded, host: &str, port: u16) -> anyhow::Result<()> {
     s.write_all(&[5, 1, 0])?;
     let mut choice = [0u8; 2];
     s.read_exact(&mut choice)?;
@@ -334,11 +334,49 @@ fn socks5_connect(s: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()
     Ok(())
 }
 
+/// E-2: the TCP stream of one call, every read and write bounded by the call's timeout AND by what is left of its
+/// whole deadline (an error once it is passed): Tor's handshake, TLS's and the answer's bytes alike.
+struct Bounded {
+    s: TcpStream,
+    per_io: Duration,
+    deadline: std::time::Instant,
+}
+
+impl Bounded {
+    /// The timeout of the next read or write, or the error of a passed deadline.
+    fn next_io(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the call's whole deadline passed"));
+        }
+        Ok(left.min(self.per_io))
+    }
+}
+
+impl Read for Bounded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let t = self.next_io()?;
+        self.s.set_read_timeout(Some(t))?;
+        self.s.read(buf)
+    }
+}
+
+impl Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let t = self.next_io()?;
+        self.s.set_write_timeout(Some(t))?;
+        self.s.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.s.flush()
+    }
+}
+
 /// The connection of one call: plain TCP, or TLS over it for an `https://`
 /// URL (C-2).
 enum Conn {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(Bounded),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Bounded>>),
 }
 
 impl Read for Conn {
@@ -389,8 +427,8 @@ fn tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
 /// `CONNECT` with the host as a name, when routed so), then for an `https://`
 /// URL the whole TLS handshake with the URL's host, before any byte of the
 /// request (C-2).
-fn connect(route: &Route, t: &Target<'_>, timeout: Duration) -> anyhow::Result<Conn> {
-    let mut s = match route {
+fn connect(route: &Route, t: &Target<'_>, timeout: Duration, deadline: std::time::Instant) -> anyhow::Result<Conn> {
+    let s = match route {
         Route::Resolve(hostport) => {
             let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport.as_str())?
                 .next()
@@ -400,8 +438,7 @@ fn connect(route: &Route, t: &Target<'_>, timeout: Duration) -> anyhow::Result<C
         Route::Loopback(addr) | Route::Bridge(addr) => TcpStream::connect_timeout(addr, timeout)?,
         Route::Socks { proxy, .. } => TcpStream::connect_timeout(proxy, timeout)?,
     };
-    s.set_read_timeout(Some(timeout))?;
-    s.set_write_timeout(Some(timeout))?;
+    let mut s = Bounded { s, per_io: timeout, deadline };
     if let Route::Socks { host, port, .. } = route {
         socks5_connect(&mut s, host, *port)?;
     }
@@ -487,11 +524,30 @@ pub fn call_batch_via(egress: &Egress, url: &str, calls: &[(&str, Value)], timeo
     Ok(out.into_iter().map(|r| r.expect("every id answered once")).collect())
 }
 
-/// POST `body` (JSON) to `url` by `egress`; the answer's JSON.
+/// E-2: the deadline of a whole call of `timeout` starting now ([`CALL_DEADLINE_FACTOR`]).
+fn call_deadline(timeout: Duration) -> std::time::Instant {
+    std::time::Instant::now() + timeout.saturating_mul(CALL_DEADLINE_FACTOR)
+}
+
+/// E-2: an I/O error of a call, said as a passed deadline when it is one.
+fn io_error(url: &str, e: std::io::Error, deadline: std::time::Instant) -> anyhow::Error {
+    if std::time::Instant::now() >= deadline || e.kind() == std::io::ErrorKind::TimedOut && e.to_string().contains("deadline") {
+        anyhow::anyhow!("{url}: the call's whole deadline passed ({e})")
+    } else {
+        anyhow::anyhow!("{url}: {e}")
+    }
+}
+
+/// POST `body` (JSON) to `url` by `egress`; the answer's JSON. E-2: within the call's deadline, and no more than
+/// [`MAX_ANSWER_BYTES`] read.
 fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer: Option<&str>) -> anyhow::Result<Value> {
+    let deadline = call_deadline(timeout);
     let route = egress.route(url)?;
     let t = target(url)?;
-    let mut s = connect(&route, &t, timeout)?;
+    let mut s = connect(&route, &t, timeout, deadline).map_err(|e| match e.downcast::<std::io::Error>() {
+        Ok(io) => io_error(url, io, deadline),
+        Err(e) => e,
+    })?;
     let Target { authority, path, .. } = t;
     let hostport = authority;
     let auth = bearer.map(|b| format!("Authorization: Bearer {b}\r\n")).unwrap_or_default();
@@ -502,13 +558,14 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
     // The head and the body in one write (one segment where they fit: a server that reads once gets both).
     let mut request = head.into_bytes();
     request.extend_from_slice(body);
-    s.write_all(&request)?;
+    s.write_all(&request).map_err(|e| io_error(url, e, deadline))?;
     let mut raw = Vec::new();
     // read the head, then exactly Content-Length bytes, or the chunks up to the last one (C-2: the public L1 servers
     // send their larger answers in chunks), or to the end
     let mut buf = [0u8; 65_536];
+    let too_large = |n: usize| anyhow::anyhow!("{url}: an answer larger than {MAX_ANSWER_BYTES} bytes ({n} or more): refused");
     let (head_end, length, chunked) = loop {
-        let n = s.read(&mut buf)?;
+        let n = s.read(&mut buf).map_err(|e| io_error(url, e, deadline))?;
         anyhow::ensure!(n > 0 || !raw.is_empty(), "empty answer from {url}");
         raw.extend_from_slice(&buf[..n]);
         if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -519,9 +576,17 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>()))
                 .transpose()?;
+            if let Some(len) = length.filter(|_| !chunked) {
+                if len.saturating_add(i + 4) > MAX_ANSWER_BYTES {
+                    return Err(too_large(len));
+                }
+            }
             break (i + 4, length, chunked);
         }
         anyhow::ensure!(n > 0, "truncated answer from {url}");
+        if raw.len() > MAX_ANSWER_BYTES {
+            return Err(too_large(raw.len()));
+        }
     };
     loop {
         if chunked {
@@ -535,11 +600,14 @@ fn post_json(egress: &Egress, url: &str, body: &[u8], timeout: Duration, bearer:
                 break;
             }
         }
-        let n = s.read(&mut buf)?;
+        let n = s.read(&mut buf).map_err(|e| io_error(url, e, deadline))?;
         if n == 0 {
             break;
         }
         raw.extend_from_slice(&buf[..n]);
+        if raw.len() > MAX_ANSWER_BYTES {
+            return Err(too_large(raw.len()));
+        }
     }
     if chunked {
         let (_, body) = http_body(&raw).map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
@@ -557,16 +625,29 @@ pub fn get_json_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Re
 /// One `GET` of `url` by `egress`, its body as bytes (`Content-Length`, chunked, or to the end of the
 /// connection): a 200 answer only.
 pub fn get_bytes_via(egress: &Egress, url: &str, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    // E-2: within the call's deadline, no more than MAX_ANSWER_BYTES
+    let deadline = call_deadline(timeout);
     let route = egress.route(url)?;
     let t = target(url)?;
-    let mut s = connect(&route, &t, timeout)?;
+    let mut s = connect(&route, &t, timeout, deadline).map_err(|e| match e.downcast::<std::io::Error>() {
+        Ok(io) => io_error(url, io, deadline),
+        Err(e) => e,
+    })?;
     let Target { authority, path, .. } = t;
     let head = format!(
         "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
     );
-    s.write_all(head.as_bytes())?;
+    s.write_all(head.as_bytes()).map_err(|e| io_error(url, e, deadline))?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw)?;
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = s.read(&mut buf).map_err(|e| io_error(url, e, deadline))?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        anyhow::ensure!(raw.len() <= MAX_ANSWER_BYTES, "{url}: an answer larger than {MAX_ANSWER_BYTES} bytes ({} or more): refused", raw.len());
+    }
     let (head, body) = http_body(&raw).map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
     anyhow::ensure!(
         head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200"),
