@@ -104,6 +104,11 @@ impl WatchConfig {
         for (i, n) in c.nodes.iter().enumerate() {
             ensure!(!c.nodes[..i].iter().any(|m| m.rpc == n.rpc || m.name == n.name), "nodes[{i}] ({}) is configured twice", n.name);
         }
+        // E-3 (external audit 2026-11-18): one lying L1 endpoint must not blind the mainnet's watcher
+        ensure!(
+            c.l1_rpc_second.is_some() || c.profile()? != crate::Profile::Mainnet,
+            "l1_rpc_second is required on the mainnet: a second L1 endpoint, at another provider (one endpoint alone could hide a tip off the chain, or say the bridge is frozen)"
+        );
         if let Some(second) = &c.l1_rpc_second {
             let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
             ensure!(norm(second) != norm(&c.l1_rpc), "l1_rpc_second is l1_rpc: a second source must be another endpoint");
@@ -177,11 +182,24 @@ pub fn locked_verdict_of(locked_block: &[u8; 32], answers: &[Option<Option<[u8; 
 
 /// GU-2 (audit n°2): the tip read from the first L1 endpoint, checked against the second one's when configured
 /// (`l1_rpc_second`): the same point, locked block and locked height, else why not (no pause on one source's word).
+/// E-3 (external audit 2026-11-18): and the same acceptance time and freeze (`pausedUntil`): one endpoint alone no
+/// longer says "frozen already" (no pause run) nor "a new point" (no late-point alert).
 pub fn merge_tips(first: Option<Tip>, second: Option<Option<Tip>>) -> Result<Option<Tip>, String> {
     let Some(second) = second else { return Ok(first) };
-    let key = |t: &Option<Tip>| t.map(|t| (t.id, t.locked_block, t.locked_height));
+    let key = |t: &Option<Tip>| t.map(|t| (t.id, t.locked_block, t.locked_height, t.accepted_at, t.paused_until));
     if key(&first) != key(&second) {
-        let say = |t: &Option<Tip>| t.map_or("no genesis".to_string(), |t| format!("tip 0x{} locking 0x{} at {}", hex::encode(t.id), hex::encode(t.locked_block), t.locked_height));
+        let say = |t: &Option<Tip>| {
+            t.map_or("no genesis".to_string(), |t| {
+                format!(
+                    "tip 0x{} locking 0x{} at {}, accepted at {}, paused until {}",
+                    hex::encode(t.id),
+                    hex::encode(t.locked_block),
+                    t.locked_height,
+                    t.accepted_at,
+                    t.paused_until
+                )
+            })
+        };
         return Err(format!("the two L1 endpoints disagree: {} against {}", say(&first), say(&second)));
     }
     Ok(first)
@@ -214,6 +232,10 @@ pub struct Incident {
     pub last_attempt: u64,
     /// The pause command ended well (exit status 0).
     pub paused: bool,
+    /// M-9 (external audit 2026-11-18): the end (L1 time) of the freeze seen while the incident counts as paused (0:
+    /// none seen yet); once the L1 clock passes it with the incident still open, the freeze expired.
+    #[serde(default)]
+    pub frozen_until: u64,
 }
 
 /// What the watcher keeps across a restart (`<state_dir>/watch.json`).
@@ -240,17 +262,42 @@ pub struct WatchState {
 /// F-9: alerts kept for a later try at most (the oldest dropped first).
 pub const MAX_PENDING_ALERTS: usize = 32;
 
-/// F-9: the alert `event` did not go out: kept to be sent again (STUB).
-pub fn alert_failed(_state: &mut WatchState, _event: &str, _detail: &str) {}
+/// F-9: the alert `event` did not go out: kept to be sent again at the next poll (the oldest dropped past
+/// [`MAX_PENDING_ALERTS`]); a late point's alert is raised again by [`decide`] instead (its point re-armed).
+pub fn alert_failed(state: &mut WatchState, event: &str, detail: &str) {
+    if event == "NO_NEW_POINT" {
+        state.stale_alerted = None;
+        return;
+    }
+    state.pending_alerts.push((event.to_string(), detail.to_string()));
+    let over = state.pending_alerts.len().saturating_sub(MAX_PENDING_ALERTS);
+    state.pending_alerts.drain(..over);
+}
 
-/// E-2: the blind watchdog (STUB).
+/// E-2 (external audit 2026-11-18): WATCHER_BLIND judged by a thread of its own, every `tick`: the loop stores the host
+/// time of its last good read in `last_ok`; past `alert_after` without one, `alert` runs (once per blind stretch, again
+/// if it failed) even while the loop hangs on a call.
 pub fn spawn_blind_watchdog(
-    _last_ok: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    _alert_after: u64,
-    _tick: Duration,
-    _alert: impl Fn(&str, &str) -> bool + Send + 'static,
+    last_ok: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    alert_after: u64,
+    tick: Duration,
+    alert: impl Fn(&str, &str) -> bool + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(|| {})
+    std::thread::spawn(move || {
+        let (mut blind, mut seen) = (false, last_ok.load(std::sync::atomic::Ordering::SeqCst));
+        loop {
+            let ok = last_ok.load(std::sync::atomic::Ordering::SeqCst);
+            if ok != seen {
+                (seen, blind) = (ok, false);
+            }
+            if let Some(Action::Alert { event, detail }) = blind_alert(ok, crate::now_unix(), alert_after, &mut blind) {
+                if !alert(&event, &detail) {
+                    blind = false;
+                }
+            }
+            std::thread::sleep(tick);
+        }
+    })
 }
 
 /// What to run now.
@@ -307,10 +354,25 @@ pub fn decide(state: &mut WatchState, tip: &Tip, verdict: Verdict, l1_now: u64, 
                 attempts: 0,
                 last_attempt: 0,
                 paused: false,
+                frozen_until: 0,
             });
+            // M-9: a freeze this incident saw ended and the tip is still off the chain: said, and paused again
+            if i.paused && l1_now < tip.paused_until {
+                i.frozen_until = i.frozen_until.max(tip.paused_until);
+            } else if i.paused && i.frozen_until > 0 && l1_now >= i.frozen_until && l1_now >= tip.paused_until {
+                out.push(Action::Alert {
+                    event: "PAUSE_EXPIRED".into(),
+                    detail: format!(
+                        "the freeze ended at {} (L1 time) and the contract's tip 0x{} still locks block 0x{} at {}, not on this watcher's chain: the slow finality runs again; pausing again (within the contract's budget)",
+                        i.frozen_until, i.tip, i.locked_block, i.locked_height
+                    ),
+                });
+                (i.paused, i.attempts, i.last_attempt, i.frozen_until) = (false, 0, 0, 0);
+            }
             if !i.paused && l1_now < tip.paused_until {
                 // frozen already (an operator's pause, or a run whose outcome was lost): no run charged for nothing
                 i.paused = true;
+                i.frozen_until = tip.paused_until;
                 out.push(Action::Alert {
                     event: "ALREADY_PAUSED".into(),
                     detail: format!(
@@ -536,9 +598,23 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
         state.incident
     ));
     let timeout = Duration::from_secs(cfg.command_timeout_secs);
-    let (mut last_ok, mut blind) = (crate::now_unix(), false);
+    // E-2: blindness is judged by a thread of its own (a call that hangs no longer silences it)
+    let last_ok = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(crate::now_unix()));
+    let dog_cfg = cfg.clone();
+    let _watchdog = spawn_blind_watchdog(last_ok.clone(), cfg.alert_after_secs, Duration::from_secs(cfg.poll_secs), move |event, detail| alert(&dog_cfg, event, detail));
+    let read_ok = |now: u64| last_ok.store(now, std::sync::atomic::Ordering::SeqCst);
+    // M-10: the stretches already alerted through the alert command (once each)
+    let (mut sources_alerted, mut nodes_alerted) = (false, false);
     loop {
         let now = crate::now_unix();
+        // F-9: the alerts whose command failed, sent again first (a few a poll: a failing command never holds the
+        // watcher long)
+        let retry: Vec<(String, String)> = state.pending_alerts.drain(..state.pending_alerts.len().min(4)).collect();
+        for (event, detail) in retry {
+            if !alert(&cfg, &event, &detail) {
+                alert_failed(&mut state, &event, &detail);
+            }
+        }
         let read = read_tip(&l1, &bridge).and_then(|t| Ok((t, l1.next_time()?)));
         // GU-2: with a second L1 source, the tip must read the same from it, else no verdict this round
         let mut sources_disagree = false;
@@ -547,7 +623,13 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
             match merge_tips(t, second) {
                 Ok(t) => Ok((t, l1_now)),
                 Err(why) => {
-                    say(&format!("ALERT L1_SOURCES_DISAGREE: {why}: no verdict this round"));
+                    let detail = format!("{why}: no verdict this round");
+                    if sources_alerted {
+                        say(&format!("ALERT L1_SOURCES_DISAGREE: {detail}"));
+                    } else {
+                        // M-10: once per stretch through the alert command
+                        sources_alerted = alert(&cfg, "L1_SOURCES_DISAGREE", &detail);
+                    }
                     sources_disagree = true;
                     Ok((t, l1_now))
                 }
@@ -555,7 +637,7 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
         });
         match read {
             Ok((None, _)) => {
-                (last_ok, blind) = (now, false);
+                read_ok(now);
                 say("waiting for the bridge genesis");
             }
             Ok((Some(tip), l1_now)) => {
@@ -570,37 +652,59 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
                         }
                     })
                     .collect();
+                if !sources_disagree {
+                    sources_alerted = false;
+                }
                 if answers.iter().filter(|a| a.is_some()).count() >= cfg.min_nodes {
-                    (last_ok, blind) = (now, false);
+                    read_ok(now);
                 }
                 // GU-1: a node that holds no block at the locked height is a witness of that (the height is above its tip)
                 let verdict = if sources_disagree { Verdict::Unknown } else { locked_verdict_of(&tip.locked_block, &answers, cfg.min_nodes) };
                 let held: Vec<Option<[u8; 32]>> = answers.into_iter().map(Option::flatten).collect();
+                // M-10 (external audit 2026-11-18): these go out through the alert command too, not only to the log
+                let mut said: Vec<(&str, String)> = Vec::new();
                 if verdict == Verdict::AboveOurTip && state.above_since.is_none() {
-                    say(&format!(
-                        "ALERT TIP_ABOVE_OUR_CHAIN: the contract's tip 0x{} locks height {}, above the tip of {} nodes: an incident if it lasts {ABOVE_TIP_PAUSE_SECS} s",
-                        hex::encode(tip.id),
-                        tip.locked_height,
-                        cfg.min_nodes
+                    said.push((
+                        "TIP_ABOVE_OUR_CHAIN",
+                        format!(
+                            "the contract's tip 0x{} locks height {}, above the tip of {} nodes: an incident if it lasts {ABOVE_TIP_PAUSE_SECS} s",
+                            hex::encode(tip.id),
+                            tip.locked_height,
+                            cfg.min_nodes
+                        ),
                     ));
                 }
-                if verdict == Verdict::Unknown && held.contains(&Some(tip.locked_block)) && held.iter().any(|h| h.is_some_and(|x| x != tip.locked_block)) {
+                let nodes_disagree = verdict == Verdict::Unknown && held.contains(&Some(tip.locked_block)) && held.iter().any(|h| h.is_some_and(|x| x != tip.locked_block));
+                if nodes_disagree && !nodes_alerted {
+                    said.push(("NODES_DISAGREE", format!("on block {}: {held:?}", tip.locked_height)));
+                    nodes_alerted = true;
+                } else if nodes_disagree {
                     say(&format!("ALERT NODES_DISAGREE on block {}: {held:?}", tip.locked_height));
+                } else if verdict != Verdict::Unknown {
+                    nodes_alerted = false;
                 }
                 let was_open = state.incident.is_some();
                 let actions = decide(&mut state, &tip, verdict, l1_now, now, cfg.alert_after_secs);
                 match (was_open, state.incident.is_some()) {
-                    (false, true) => say(&format!(
-                        "ALERT TIP_OFF_OUR_CHAIN: the contract's tip 0x{} locks block 0x{} at {}, which {} nodes do not hold: an incident",
-                        hex::encode(tip.id),
-                        hex::encode(tip.locked_block),
-                        tip.locked_height,
-                        cfg.min_nodes
+                    (false, true) => said.push((
+                        "TIP_OFF_OUR_CHAIN",
+                        format!(
+                            "the contract's tip 0x{} locks block 0x{} at {}, which {} nodes do not hold: an incident",
+                            hex::encode(tip.id),
+                            hex::encode(tip.locked_block),
+                            tip.locked_height,
+                            cfg.min_nodes
+                        ),
                     )),
                     (true, false) => say(&format!("the contract's tip 0x{} locks a block of this chain again (L={}): incident over", hex::encode(tip.id), tip.locked_height)),
                     _ => {}
                 }
                 save(&state_path, &state);
+                for (event, detail) in said {
+                    if !alert(&cfg, event, &detail) {
+                        alert_failed(&mut state, event, &detail);
+                    }
+                }
                 for a in actions {
                     match a {
                         Action::Pause => {
@@ -616,13 +720,17 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
                             say(&format!("pause command ended: {outcome}"));
                             if let Action::Alert { event, detail } = pause_ended(&mut state, ok, &outcome) {
                                 save(&state_path, &state);
-                                alert(&cfg, &event, &detail);
+                                // F-9: kept and sent again when its command fails
+                                if !alert(&cfg, &event, &detail) {
+                                    alert_failed(&mut state, &event, &detail);
+                                }
                             }
                         }
                         Action::Alert { event, detail } => {
-                            // an alert that did not go out is raised again at the next poll
-                            if !alert(&cfg, &event, &detail) && event == "NO_NEW_POINT" {
-                                state.stale_alerted = None;
+                            // F-9: an alert that did not go out is sent again at the next poll (a late point: raised
+                            // again by decide)
+                            if !alert(&cfg, &event, &detail) {
+                                alert_failed(&mut state, &event, &detail);
                             }
                         }
                     }
@@ -631,11 +739,7 @@ pub fn watch_cli(args: &[String]) -> anyhow::Result<()> {
             }
             Err(e) => say(&format!("read: {e:#}")),
         }
-        if let Some(Action::Alert { event, detail }) = blind_alert(last_ok, now, cfg.alert_after_secs, &mut blind) {
-            if !alert(&cfg, &event, &detail) {
-                blind = false;
-            }
-        }
+        save(&state_path, &state);
         std::thread::sleep(Duration::from_secs(cfg.poll_secs));
     }
 }
