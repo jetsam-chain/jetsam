@@ -71,8 +71,17 @@ pub struct Activations {
     pub guardian_height: Option<u64>,
     /// `J_D`: the guardians' delegation height.
     pub delegation_height: Option<u64>,
-    /// The guardians' group key (48 bytes), none until a ceremony arms it.
+    /// The guardians' group key (48 bytes), none until a ceremony arms it:
+    /// the first of `guardian_keys`.
     pub guardian_group_key: Option<String>,
+    /// FIXEXT E-2: the guardians' keys by height, each with the L1 bridge its
+    /// attestations name (absent while there is none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guardian_keys: Vec<GuardianKeyRecord>,
+    /// FIXEXT (E-1): from it on, Base is read under a recent L1 block (absent
+    /// while dormant; on the public network, `base_return_height`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixext_height: Option<u64>,
 }
 
 impl Activations {
@@ -134,7 +143,17 @@ impl Activations {
                 .collect(),
             guardian_height: guardian.activation_height,
             delegation_height: guardian.delegation_height,
-            guardian_group_key: guardian.group_key.map(|key| hex(&key)),
+            guardian_group_key: guardian.keys.first().map(|epoch| hex(&epoch.key)),
+            guardian_keys: guardian
+                .keys
+                .iter()
+                .map(|epoch| GuardianKeyRecord {
+                    height: epoch.height,
+                    key: hex(&epoch.key),
+                    l1_bridge: hex(&epoch.l1_bridge),
+                })
+                .collect(),
+            fixext_height: base_return.fixext_height,
         }
     }
 }
@@ -145,6 +164,15 @@ pub struct FastKeyRotationRecord {
     pub height: u64,
     pub release_key: Option<String>,
     pub revoke_key: Option<String>,
+}
+
+/// One guardian key (FIXEXT E-2): its height, key (48 bytes) and L1 bridge
+/// (20 bytes).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GuardianKeyRecord {
+    pub height: u64,
+    pub key: String,
+    pub l1_bridge: String,
 }
 
 /// One later bridge of the return over Base (BRIDGE2): its height, its pins
@@ -216,7 +244,9 @@ mod tests {
         );
         assert_eq!(a.guardian_height, g.activation_height);
         assert_eq!(a.delegation_height, g.delegation_height);
-        assert_eq!(a.guardian_group_key, g.group_key.map(|k| hex_of(&k)));
+        assert_eq!(a.guardian_group_key, g.keys.first().map(|k| hex_of(&k.key)));
+        assert_eq!(a.guardian_keys.len(), g.keys.len());
+        assert_eq!(a.fixext_height, d.base_return.fixext_height);
         assert_eq!(a.return_fix_height, d.base_return.advance.fix_height);
         assert_eq!(a.fast_key_rotations.len(), d.base_return.fast.rotations.len());
         assert_eq!(a.base_pin_rotations.len(), d.base_return.base.rotations.len());
@@ -308,7 +338,11 @@ mod tests {
         let mut g = GuardianRules::consensus();
         g.activation_height = Some(321);
         g.delegation_height = Some(640);
-        g.group_key = Some([0x09; 48]);
+        g.keys = &[crate::consensus::guardian::GuardianKeyEpoch {
+            height: 321,
+            key: [0x09; 48],
+            l1_bridge: [0x0a; 20],
+        }];
         let _g = guardian_rules::install(g);
 
         let a = Activations::current();
@@ -329,6 +363,14 @@ mod tests {
             (Some(321), Some(640))
         );
         assert_eq!(a.guardian_group_key, Some("09".repeat(48)));
+        assert_eq!(
+            a.guardian_keys,
+            vec![GuardianKeyRecord {
+                height: 321,
+                key: "09".repeat(48),
+                l1_bridge: "0a".repeat(20),
+            }]
+        );
     }
 
     /// The bridge the return over Base reads from `H` on: its own, else the

@@ -117,19 +117,68 @@ pub const REHEARSAL_GUARDIAN_GROUP_KEY: [u8; GROUP_KEY_BYTES] = [
     0x9f, 0x2e, 0xc7, 0x11, 0xa6, 0x1b, 0x7e, 0x5d, 0x75, 0xd9, 0xc8, 0x7c, 0xd9, 0x22, 0x2e, 0x57,
 ];
 
-/// The public network's group key: none until the mainnet ceremony (T8.1).
-/// While it is `None`, every attestation and every equivocation is refused.
+/// FIXEXT E-2 (external audit of the chain): one group key and the L1 bridge
+/// its attestations name, in force from `height` on (until the next entry's).
+/// The key of an attestation is the one of its attested height; the key of
+/// an equivocation is the one in force at the block that carries it (its
+/// statements must be of that key). A revocation closes the keys in force at
+/// or before its block, never a later entry: a rotation is a new entry at a
+/// height above the tip of the day, every node redeployed before it, and the
+/// blocks below it keep their key (a node syncing from genesis or replaying a
+/// snapshot's journal reads each object under the key of its height).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardianKeyEpoch {
+    pub height: u64,
+    pub key: [u8; GROUP_KEY_BYTES],
+    pub l1_bridge: [u8; 20],
+}
+
+/// Whether a key table may sit beside a v1.7 height: empty, or every entry at
+/// or above an armed v1.7 height, in strictly increasing height. A key and its
+/// bridge are armed together (one entry), never without a height.
+pub const fn guardian_keys_schedule_is_valid(
+    keys: &[GuardianKeyEpoch],
+    v1_7_activation: Option<u64>,
+) -> bool {
+    let mut i = 0;
+    while i < keys.len() {
+        match v1_7_activation {
+            Some(j) if keys[i].height >= j => {}
+            _ => return false,
+        }
+        if i > 0 && keys[i].height <= keys[i - 1].height {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The public network's group keys: none until the mainnet ceremony (T8.1).
+/// While the table is empty, every attestation and every equivocation is
+/// refused.
 #[cfg(not(feature = "testnet"))]
-pub const GUARDIAN_GROUP_KEY: Option<[u8; GROUP_KEY_BYTES]> = None;
+pub const GUARDIAN_KEYS: &[GuardianKeyEpoch] = &[];
 
-/// The test chain's group key: none until its own ceremony (P9). Declared per
-/// profile, so that setting one can never set the other.
+/// The test chain's group keys: none until its own ceremony (P9). Declared
+/// per profile, so that setting one can never set the other.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const GUARDIAN_GROUP_KEY: Option<[u8; GROUP_KEY_BYTES]> = None;
+pub const GUARDIAN_KEYS: &[GuardianKeyEpoch] = &[];
 
-/// **Private builds only** (`rehearsal-v1-7`): the test key.
+/// **Private builds only** (`rehearsal-v1-7`): the test key and the synthetic
+/// L1's bridge, from the rehearsal's v1.7 height (no guardian object is read
+/// below it).
 #[cfg(feature = "rehearsal-v1-7")]
-pub const GUARDIAN_GROUP_KEY: Option<[u8; GROUP_KEY_BYTES]> = Some(REHEARSAL_GUARDIAN_GROUP_KEY);
+pub const GUARDIAN_KEYS: &[GuardianKeyEpoch] = &[GuardianKeyEpoch {
+    height: crate::consensus::params::REHEARSAL_V1_7_ACTIVATION,
+    key: REHEARSAL_GUARDIAN_GROUP_KEY,
+    l1_bridge: crate::consensus::destination::state::REHEARSAL_L1_BRIDGE.address,
+}];
+
+const _: () = assert!(
+    guardian_keys_schedule_is_valid(GUARDIAN_KEYS, V1_7_ACTIVATION_HEIGHT),
+    "GUARDIAN_KEYS: each entry at or above V1_7_ACTIVATION_HEIGHT, in strictly increasing height"
+);
 
 // ---------------------------------------------------------------------------
 // The L1 domain a Jetsam attestation must name
@@ -475,10 +524,11 @@ pub(crate) mod test_rules {
 pub struct GuardianRules {
     pub activation_height: Option<u64>,
     pub delegation_height: Option<u64>,
-    pub group_key: Option<[u8; GROUP_KEY_BYTES]>,
+    /// FIXEXT E-2: the group keys and their L1 bridges by height
+    /// ([`GUARDIAN_KEYS`]); empty: none.
+    pub keys: &'static [GuardianKeyEpoch],
     pub network: [u8; 32],
     pub l1_chain_id: u64,
-    pub l1_bridge: Option<[u8; 20]>,
     pub period: u64,
     pub unbonding: u64,
     pub stake_vault: Address,
@@ -506,10 +556,9 @@ impl GuardianRules {
         Self {
             activation_height: V1_7_ACTIVATION_HEIGHT,
             delegation_height: DELEGATION_ACTIVATION_HEIGHT,
-            group_key: GUARDIAN_GROUP_KEY,
+            keys: GUARDIAN_KEYS,
             network: network_id(),
             l1_chain_id: GUARDIAN_L1_CHAIN_ID,
-            l1_bridge: GUARDIAN_L1_BRIDGE,
             period: REWARD_PERIOD_BLOCKS,
             unbonding: UNBONDING_DELAY_BLOCKS,
             stake_vault: STAKE_VAULT,
@@ -520,12 +569,17 @@ impl GuardianRules {
         }
     }
 
-    /// [`verify_guardian_signature`] under this rule set's key.
-    pub fn verify_signature(
-        &self,
-        statement: &[u8; STATEMENT_BYTES],
-        signature: &[u8; SIGNATURE_BYTES],
-    ) -> Result<(), GuardianSignatureError> {
-        verify_guardian_signature(self.group_key.as_ref(), statement, signature)
+    /// FIXEXT E-2: the key in force at `height` (the last entry at or below
+    /// it), none below the first.
+    pub fn key_at(&self, height: u64) -> Option<&'static GuardianKeyEpoch> {
+        let keys: &'static [GuardianKeyEpoch] = self.keys;
+        keys.iter().rev().find(|epoch| epoch.height <= height)
+    }
+
+    /// FIXEXT E-2: whether the revocation `revoked_at` (the height of the
+    /// block that applied an equivocation) closes `epoch`: a key in force at
+    /// or before that block, never a later one.
+    pub fn is_revoked(revoked_at: Option<u64>, epoch: &GuardianKeyEpoch) -> bool {
+        revoked_at.is_some_and(|at| at >= epoch.height)
     }
 }

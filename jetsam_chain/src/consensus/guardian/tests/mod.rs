@@ -26,6 +26,7 @@ use crate::consensus::pow::block_id;
 mod attestation;
 mod constants;
 mod equivocation;
+mod key_epochs;
 mod persistence;
 mod properties;
 mod reward;
@@ -70,14 +71,25 @@ pub(crate) fn test_group_key() -> [u8; 48] {
     test_secret_key().sk_to_pk().compress()
 }
 
+/// The test key and [`BRIDGE`], in force from genesis (FIXEXT E-2: one entry).
+pub(crate) fn test_keys() -> &'static [GuardianKeyEpoch] {
+    static KEYS: std::sync::OnceLock<[GuardianKeyEpoch; 1]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        [GuardianKeyEpoch {
+            height: 0,
+            key: test_group_key(),
+            l1_bridge: BRIDGE,
+        }]
+    })
+}
+
 pub(crate) fn rules() -> GuardianRules {
     GuardianRules {
         activation_height: Some(J),
         delegation_height: Some(J + 15_360),
-        group_key: Some(test_group_key()),
+        keys: test_keys(),
         network: NETWORK,
         l1_chain_id: L1_CHAIN,
-        l1_bridge: Some(BRIDGE),
         period: 480,
         unbonding: 960,
         stake_vault: STAKE_VAULT,

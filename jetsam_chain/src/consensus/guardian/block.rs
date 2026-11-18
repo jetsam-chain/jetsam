@@ -156,6 +156,9 @@ pub enum GuardianError {
     AttestationNotIncreasing,
     /// A-10 / Q-5.
     InvalidGuardianSignature,
+    /// FIXEXT E-2: an equivocation's statement of another key than the one in
+    /// force at its block.
+    StatementOfAnotherKey,
     /// Q-4: `s1 < s2` does not hold (identical statements included).
     EquivocationNotCanonical,
     /// Q-6: rule byte, witnesses or length.
@@ -460,7 +463,7 @@ pub fn apply_block_guardian(
             }
             GuardianObjectKind::Equivocation => {
                 let equivocation = GuardianEquivocation::decode(&object.body)?;
-                check_equivocation(&next, &equivocation, rules)?;
+                check_equivocation(&next, ctx.height, &equivocation, rules)?;
                 apply_equivocation(&mut next, ctx.height);
             }
             GuardianObjectKind::StakeLock => {
