@@ -166,7 +166,7 @@ fn aggregator_l1_signer_is_a_local_key_off_the_rehearsal() {
     let key = dir.path().join("agg.key");
     std::fs::write(&key, "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80\n").unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let local = SignerConfig { key_file: Some(key), priority_fee_wei: Some(1_000_000), ..SignerConfig::default() };
+    let local = SignerConfig { key_file: Some(key), priority_fee_wei: Some(1_000_000), max_priority_fee_wei: 100_000_000, max_gas: 1_000_000, max_fee_per_gas_wei: 1_000_000_000, gas_margin_pct: 20, ..SignerConfig::default() };
     assert!(matches!(open_l1_signer(Some(&testnet), None, &local, dir.path()).unwrap(), L1Tx::Local(_)));
     // l1_from, when given, must be the key's address
     assert!(open_l1_signer(Some(&testnet), Some(from), &local, dir.path()).is_err());

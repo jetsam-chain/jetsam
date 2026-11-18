@@ -1322,6 +1322,14 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
              [--alert-command <program> [--alert-arg <a>]…, required on the mainnet]"
         )
     };
+    // AN-1 (audit n°2): every source through `jg-relay`'s egress (the loopback directly, the rest through Tor), checked
+    // before anything else: a public address in clear and fast-run does not start
+    let egress = crate::config::robot_egress(args, robot_sources(args, &["--l1", "--base", "--beacon", "--node"]))
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
+    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
+    // FR-9 (audit n°2): the L1's Gloas epoch, Sepolia's only on a build whose L1 is Sepolia
+    let gloas = crate::light_feed::gloas_epoch_of(flag(args, "--gloas-epoch"), &rules.network)
+        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
     // M-10 (external audit of the robots): the lines that need a person go to the operator's alert command too
     let alerter = alerter_of(args, &jetsam_chain::consensus::guardian::network_id(), Alerter::spawning())
         .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
@@ -1331,14 +1339,6 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             a.on_line(line, crate::now_unix());
         }
     };
-    // AN-1 (audit n°2): every source through `jg-relay`'s egress (the loopback directly, the rest through Tor), checked
-    // before anything else: a public address in clear and fast-run does not start
-    let egress = crate::config::robot_egress(args, robot_sources(args, &["--l1", "--base", "--beacon", "--node"]))
-        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
-    let rules = jetsam_chain::consensus::destination::state::DestinationRules::CONSENSUS.effective_at(u64::MAX);
-    // FR-9 (audit n°2): the L1's Gloas epoch, Sepolia's only on a build whose L1 is Sepolia
-    let gloas = crate::light_feed::gloas_epoch_of(flag(args, "--gloas-epoch"), &rules.network)
-        .map_err(|e| anyhow!("{e:#}: fast-run does not start"))?;
     let params = rules.base_return.base;
     let bridge = rules
         .bridge
