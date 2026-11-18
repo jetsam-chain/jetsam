@@ -2038,6 +2038,10 @@ fn m13_the_relayers_chain_is_kept_across_a_restart() {
     let mut bad = bytes.clone();
     let last = bad.len() - 20;
     bad[last] ^= 1;
-    assert!(chain_from_bytes(testkit::genesis(), &bad).is_err(), "corrupt");
+    assert!(chain_from_bytes(testkit::genesis(), &bad).is_err(), "corrupt tip id");
+    let mut bad = bytes.clone();
+    let in_last_header = bytes.len() - 32 - 20;
+    bad[in_last_header] ^= 1;
+    assert!(chain_from_bytes(testkit::genesis(), &bad).is_err(), "corrupt last header");
     assert_eq!(chain_from_bytes(testkit::genesis(), &chain_to_bytes(&testkit::chain(0, 1))).unwrap().tip_height(), 0);
 }

@@ -1020,13 +1020,14 @@ pub fn admit_header(
     Ok(())
 }
 
-/// M-13 (external audit 2026-11-18): the relayer's chain as kept in `<state_dir>/chain.bin`: its genesis id, then the
-/// raw headers above it (212 bytes each), in order.
+/// M-13 (external audit 2026-11-18): the relayer's chain as kept in `<state_dir>/chain.bin`: its genesis id, the raw
+/// headers above it (212 bytes each) in order, then its tip id (a corrupt last header is seen too).
 pub fn chain_to_bytes(c: &Chain) -> Vec<u8> {
     let mut out = c.id_at(c.base_height()).unwrap_or_default().to_vec();
     for h in c.base_height() + 1..=c.tip_height() {
         out.extend_from_slice(&c.header_at(h).expect("within the chain").raw);
     }
+    out.extend_from_slice(&c.tip_id());
     out
 }
 
@@ -1034,12 +1035,14 @@ pub fn chain_to_bytes(c: &Chain) -> Vec<u8> {
 /// an error for a file of another genesis, cut short or corrupt.
 pub fn chain_from_bytes(genesis: crate::chain::HeaderInfo, bytes: &[u8]) -> anyhow::Result<Chain> {
     let size = jetsam_chain::wire::BLOCK_HEADER_WIRE_SIZE;
-    anyhow::ensure!(bytes.len() >= 32 && (bytes.len() - 32) % size == 0, "a kept chain of {} bytes is not a genesis id and whole headers", bytes.len());
+    anyhow::ensure!(bytes.len() >= 64 && (bytes.len() - 64) % size == 0, "a kept chain of {} bytes is not a genesis id, whole headers and a tip id", bytes.len());
     anyhow::ensure!(bytes[..32] == genesis.id, "the kept chain is of another genesis");
+    let (headers, tip) = bytes[32..].split_at(bytes.len() - 64);
     let mut c = Chain::from_genesis(genesis);
-    for raw in bytes[32..].chunks(size) {
+    for raw in headers.chunks(size) {
         c.extend(crate::chain::HeaderInfo::from_raw(raw)?)?;
     }
+    anyhow::ensure!(c.tip_id()[..] == *tip, "the kept chain's last header is not its tip");
     Ok(c)
 }
 
