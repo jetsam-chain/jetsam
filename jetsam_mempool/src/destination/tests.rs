@@ -243,6 +243,7 @@ impl SyntheticBase {
             anchor: None,
             bridge: None,
             bridge_rotations: &[],
+            fixext_height: None,
         };
         rules
     }
