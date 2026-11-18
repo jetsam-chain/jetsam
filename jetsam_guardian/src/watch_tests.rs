@@ -378,3 +378,11 @@ fn e2_the_blind_alert_goes_out_while_the_watchers_loop_hangs() {
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(said.lock().unwrap().len(), 2, "again after a read");
 }
+
+/// F-6 (external audit 2026-11-18): the watcher's two nodes on the same loopback port are one node.
+#[test]
+fn f6_the_watchers_same_loopback_port_twice_is_one_node() {
+    let testnet = hex::encode(crate::TESTNET_NETWORK);
+    let text = watch_toml(&testnet, 84_532, "").replace("http://127.0.0.1:19721", "http://127.0.0.2:19711/");
+    assert!(WatchConfig::parse(&text).unwrap_err().to_string().contains("twice"));
+}

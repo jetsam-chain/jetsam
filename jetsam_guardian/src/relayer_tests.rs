@@ -2045,3 +2045,13 @@ fn m13_the_relayers_chain_is_kept_across_a_restart() {
     assert!(chain_from_bytes(testkit::genesis(), &bad).is_err(), "corrupt last header");
     assert_eq!(chain_from_bytes(testkit::genesis(), &chain_to_bytes(&testkit::chain(0, 1))).unwrap().tip_height(), 0);
 }
+
+/// F-6 (external audit 2026-11-18): two node entries on the same loopback port (127.0.0.1 and 127.0.0.2) are one node:
+/// they never make min_nodes = 2 alone.
+#[test]
+fn f6_the_same_loopback_port_twice_is_one_node() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let text = relay_toml(&mainnet, 1, "0x1111111111111111111111111111111111111111", cmd).replace("http://127.0.0.1:19721", "http://127.0.0.2:19711");
+    assert!(RelayConfig::parse(&text).unwrap_err().to_string().contains("twice"));
+}
