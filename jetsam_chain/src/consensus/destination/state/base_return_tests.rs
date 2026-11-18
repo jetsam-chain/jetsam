@@ -2276,12 +2276,11 @@ fn bridge2_the_profiles_bridge_table() {
 
 /// The pins of the test chain's second bridge, as the switch reads them: its
 /// address and code hash (CREATE2 of `v3-mn5-bridge2b`, profile
-/// `testnet-bridge2`, the deployment replayed on a fork of Base Sepolia), and
-/// its genesis id **of the rehearsal** (G = J = 12 640), to be replaced at the
-/// switch by the real `genesisId()`.
+/// `testnet-bridge2`, deployed on Base Sepolia on 18/11, block 60 534 248), and
+/// its real genesis id (`initGenesis` at G = 12 782, read back on the contract).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 const BRIDGE2_ADDRESS_HEX: &str = "7ba0229a5a04cfa5a827be3c749eaf442c1764d4";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 const BRIDGE2_CODE_HASH_HEX: &str = "baad551d9d3b7e2bd7dbde6f0748c13f2b6968dabeab0144c4088e1325c69c75";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-const BRIDGE2_GENESIS_ID_HEX: &str = "248dbae0d0fd1707f1bf066ffd7d197916de58b73536c6f72f344ae65e4f33a7";
+const BRIDGE2_GENESIS_ID_HEX: &str = "93f67b6955f7d4f184cb3333515ad9dfcaca57bb56ae81f62e792be5628a4c5b";

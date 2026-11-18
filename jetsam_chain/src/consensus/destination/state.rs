@@ -283,10 +283,9 @@ pub struct BridgeRotation {
 /// BRIDGE2B), `withdrawals` at slot 9 and `genesisId` at slot 13 (layout
 /// unchanged). `genesis_id` is its `genesisId()` once its `initGenesis` locked
 /// the locked block of TN1's last point (no deposit TN1 could mint is in its
-/// tree): **the value of the rehearsal on the fork (G = J = 12 640), to be written
-/// at the switch** from the real `initGenesis`, with the address and code hash
-/// read again on the deployed contract (a deliberate edit of this constant and
-/// of the test that pins it).
+/// tree): the real `initGenesis` of 18/11 on Base Sepolia (G = 12 782, the locked
+/// height of TN1's last point; tx 0x4ece9925…7747), read back with the address and
+/// code hash on the deployed contract.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
     address: [
@@ -301,9 +300,9 @@ pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
     withdrawals_slot: 9,
     genesis_id_slot: 13,
     genesis_id: [
-        0x24, 0x8d, 0xba, 0xe0, 0xd0, 0xfd, 0x17, 0x07, 0xf1, 0xbf, 0x06, 0x6f, 0xfd, 0x7d, 0x19,
-        0x79, 0x16, 0xde, 0x58, 0xb7, 0x35, 0x36, 0xc6, 0xf7, 0x2f, 0x34, 0x4a, 0xe6, 0x5e, 0x4f,
-        0x33, 0xa7,
+        0x93, 0xf6, 0x7b, 0x69, 0x55, 0xf7, 0xd4, 0xf1, 0x84, 0xcb, 0x33, 0x33, 0x51, 0x5a, 0xd9,
+        0xdf, 0xca, 0xca, 0x57, 0xbb, 0x56, 0xae, 0x81, 0xf6, 0x2e, 0x79, 0x2b, 0xe5, 0x62, 0x8a,
+        0x4c, 0x5b,
     ],
 };
 
